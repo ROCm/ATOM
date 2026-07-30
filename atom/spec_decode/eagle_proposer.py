@@ -65,6 +65,12 @@ class EagleProposer(Drafter):
                 "MTP draft index_share_for_mtp_iteration enabled: "
                 "step 0 computes indexer top-k, steps 1+ reuse the buffer."
             )
+        # Step 0 is fed the target's post-final-norm hidden, so steps 1+ must be
+        # fed the draft's post-final-norm hidden too. Only drafts that can hand
+        # it back do so; the rest keep the previous behaviour.
+        self._recycle_postnorm = self._draft_argmax_fused and getattr(
+            self.model, "returns_postnorm_hidden", False
+        )
 
     def _resolve_mtp_k(self) -> int:
         return self.speculative_config.num_speculative_tokens or 0
@@ -288,7 +294,12 @@ class EagleProposer(Drafter):
                 )
                 # Distributed argmax (all-gather [N, 2] not [N, vocab]) when the
                 # draft supports it; token-identical to compute_logits().argmax().
-                if self._draft_argmax_fused:
+                recycled_hidden = sample_hidden_states
+                if self._recycle_postnorm:
+                    new_draft_ids, recycled_hidden = self.model.compute_draft_token(
+                        sample_hidden_states, return_normed=True
+                    )
+                elif self._draft_argmax_fused:
                     new_draft_ids = self.model.compute_draft_token(sample_hidden_states)
                 else:
                     logits = self.model.compute_logits(sample_hidden_states)
@@ -393,7 +404,7 @@ class EagleProposer(Drafter):
                         slot_mapping[:] = kv_indices[kv_indptr[1 : bs + 1] - 1]
 
                     input_ids = new_draft_ids
-                    hidden_states = sample_hidden_states
+                    hidden_states = recycled_hidden
 
         # self.runner.debug(f"final {draft_token_ids=}")
         # [batch_size, mtp_k]

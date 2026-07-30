@@ -194,7 +194,8 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         self,
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
-    ) -> torch.Tensor:
+        return_normed: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Greedy draft token via distributed argmax over the TP-sharded vocab —
         avoids all-gathering the full [N, vocab] logits every draft step.
 
@@ -202,11 +203,19 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         rank's logit shard to (max_val, global_idx) and all-gathers only [N, 2]
         instead of the O(vocab) logits. Token-identical to
         compute_logits(...).argmax(-1).
+
+        ``return_normed`` also hands back the post-final-norm hidden the next
+        draft step must consume. shared_head.norm is the MTP layer's counterpart
+        of the backbone's final norm, and its per-channel weight is not
+        idempotent, so recycling the pre-norm hidden feeds the draft an
+        off-distribution input and costs acceptance. It is already materialized
+        here, so returning it is free.
         """
         current_step_idx = spec_step_idx % self.num_mtp_layers
         mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
         normed = mtp_layer.shared_head(hidden_states)
-        return mtp_layer.shared_head.head.compute_argmax_token(normed)
+        token = mtp_layer.shared_head.head.compute_argmax_token(normed)
+        return (token, normed) if return_normed else token
 
     def set_skip_topk(self, skip: bool) -> None:
         """Toggle ``skip_topk`` on MTP sparse-attention layers.
@@ -246,6 +255,10 @@ class DeepSeekMultiTokenPredictor(nn.Module):
 
 @support_torch_compile
 class DeepSeekMTP(nn.Module):
+
+    # compute_draft_token(return_normed=True) can hand back the post-final-norm
+    # hidden, so EagleProposer recycles that into the next draft step.
+    returns_postnorm_hidden = True
 
     def __init__(self, atom_config: Config, prefix: str = ""):
         super().__init__()
@@ -336,7 +349,8 @@ class DeepSeekMTP(nn.Module):
         self,
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
-    ) -> torch.Tensor:
+        return_normed: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Distributed greedy argmax for the MTP draft rollout (GLM-5.2).
 
         EagleProposer picks this over compute_logits().argmax(-1) when present
@@ -344,7 +358,9 @@ class DeepSeekMTP(nn.Module):
         [N, vocab] logits — it all-gathers only the packed [N, 2] per-rank
         reductions. See DeepSeekMultiTokenPredictor.compute_draft_token.
         """
-        return self.model.compute_draft_token(hidden_states, spec_step_idx)
+        return self.model.compute_draft_token(
+            hidden_states, spec_step_idx, return_normed=return_normed
+        )
 
     def set_skip_topk(self, skip: bool) -> None:
         self.model.set_skip_topk(skip)
