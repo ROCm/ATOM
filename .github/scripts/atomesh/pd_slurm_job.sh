@@ -8,6 +8,7 @@ set -euo pipefail
 REPO_ROOT="${GITHUB_WORKSPACE:-$(pwd)}"
 SCRIPT_PATH="${REPO_ROOT}/.github/scripts/atomesh/pd_server_atom.sh"
 JOB_ID="${SLURM_JOB_ID:-${SPUR_JOB_ID:-local}}"
+CURRENT_USER="$(id -un 2>/dev/null || id -u)"
 RUN_DIR="${LOG_ROOT}/slurm_job-${JOB_ID}"
 
 mkdir -p "${RUN_DIR}"
@@ -29,6 +30,8 @@ allow = (
     "OSL",
     "CONC_LIST",
     "BENCH_",
+    "BENCHMARK_KIND",
+    "AIPERF_",
     "RANDOM_RANGE_RATIO",
     "REQUEST_RATE",
     "WAIT_",
@@ -39,9 +42,12 @@ allow = (
     "KV_CACHE_DTYPE",
     "BLOCK_SIZE",
     "MEM_FRACTION",
+    "ENABLE_PREFIX_CACHING",
     "MAX_MODEL_LEN",
     "MAX_NUM_SEQS",
+    "DECODE_MAX_NUM_SEQS",
     "MAX_NUM_BATCHED_TOKENS",
+    "DECODE_MAX_NUM_BATCHED_TOKENS",
     "ONLINE_QUANT_CONFIG",
     "HF_OVERRIDES",
     # Preserve FlyDSL cache overrides for non-root Spur containers.
@@ -82,7 +88,7 @@ run_container_rank() {
   local container="atomesh-${ATOMESH_CELL_ID}-${JOB_ID}-${rank}"
   local rank_dir="${RUN_DIR}/rank-${rank}"
   local bin_dir="${RUN_DIR}/bin"
-  local video_gid render_gid host_ionic
+  local video_gid render_gid host_ionic nccl_socket_ifname
 
   mkdir -p "${rank_dir}"
   mkdir -p "${bin_dir}"
@@ -103,6 +109,10 @@ EOF
   video_gid="$(getent group video 2>/dev/null | cut -d: -f3 || true)"
   render_gid="$(getent group render 2>/dev/null | cut -d: -f3 || true)"
   host_ionic="$(readlink -f /usr/lib/x86_64-linux-gnu/libionic.so.1 2>/dev/null || true)"
+  nccl_socket_ifname="${NCCL_SOCKET_IFNAME:-}"
+  if [[ -z "${nccl_socket_ifname}" && -d /sys/class/net/eth1 ]]; then
+    nccl_socket_ifname="eth1"
+  fi
 
   docker rm -f "${container}" >/dev/null 2>&1 || true
   docker pull "${DOCKER_IMAGE}"
@@ -126,8 +136,8 @@ EOF
     -e PREFILL_TP_SIZE="${PREFILL_TP}"
     -e DECODE_TP_SIZE="${DECODE_TP}"
     -e RUN_DIR="/run_logs/slurm_job-${JOB_ID}"
-    -e USER="$(id -un)"
-    -e LOGNAME="$(id -un)"
+    -e USER="${CURRENT_USER}"
+    -e LOGNAME="${CURRENT_USER}"
     -e HOME="/tmp/atomesh-home-${JOB_ID}-${rank}"
     -e XDG_CACHE_HOME="/tmp/atomesh-cache-${JOB_ID}-${rank}"
     -e TORCHINDUCTOR_CACHE_DIR="/tmp/atomesh-cache-${JOB_ID}-${rank}/torchinductor"
@@ -137,7 +147,6 @@ EOF
     # read-only for the Slurm uid required by Spur's Docker template.
     -e FLYDSL_RUNTIME_CACHE_DIR="/tmp/atomesh-cache-${JOB_ID}-${rank}/flydsl"
     -e NCCL_NET_PLUGIN=none
-    -e NCCL_SOCKET_IFNAME=eth1
     -e NCCL_IB_HCA=ionic_0,ionic_1,ionic_2,ionic_3,ionic_4,ionic_5,ionic_6,ionic_7
     -e NCCL_IB_GID_INDEX=1
     -e NCCL_CROSS_NIC=0
@@ -157,10 +166,12 @@ EOF
 
   [[ -n "${video_gid}" ]] && docker_args+=(--group-add "${video_gid}")
   [[ -n "${render_gid}" ]] && docker_args+=(--group-add "${render_gid}")
+  [[ -n "${nccl_socket_ifname}" ]] && docker_args+=(-e NCCL_SOCKET_IFNAME="${nccl_socket_ifname}")
   [[ -n "${host_ionic}" && -e "${host_ionic}" ]] && docker_args+=(-v "${host_ionic}:/usr/lib/x86_64-linux-gnu/libionic.so.1:ro")
   [[ -e /usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so ]] && docker_args+=(-v /usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so:/usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so:ro)
   [[ -e /etc/libibverbs.d/ionic.driver ]] && docker_args+=(-v /etc/libibverbs.d/ionic.driver:/etc/libibverbs.d/ionic.driver:ro)
   [[ -d /it-share ]] && docker_args+=(-v /it-share:/it-share)
+  [[ -d /shared_nfs ]] && docker_args+=(-v /shared_nfs:/shared_nfs)
 
   docker_args+=(
     "${DOCKER_IMAGE}"
@@ -256,8 +267,9 @@ EOF
   return 0
 }
 
-if run_spur_job; then
-  exit 0
+if [[ -n "${SPUR_TASK_OFFSET:-}" || -n "${SPUR_PEER_NODES:-}" ]]; then
+  run_spur_job
+  exit $?
 fi
 
 mapfile -t ALLOC_NODES < <(scontrol show hostnames "$SLURM_JOB_NODELIST")

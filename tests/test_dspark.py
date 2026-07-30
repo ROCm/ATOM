@@ -11,7 +11,23 @@ from atom.models.deepseek_v4_dspark import (
     DSparkConfidenceHead,
     DSparkMarkovHead,
     _dspark_block_sparse_attention,
+    _dspark_block_topk_idxs,
 )
+
+
+def _block_attn(q, kv, attn_sink, valid_target, scale):
+    """Block attention with the gather indices the block plan would supply.
+
+    Production builds ``topk_idxs`` once per block in ``_build_block_plan`` and
+    shares it across stages; these tests exercise a single call, so they derive
+    it the same way here.
+    """
+    B, T = q.shape[0], q.shape[1]
+    W = kv.shape[1] - T
+    topk_idxs = _dspark_block_topk_idxs(B, T, W, valid_target, q.device)
+    return _dspark_block_sparse_attention(
+        q, kv, attn_sink, valid_target, topk_idxs, scale
+    )
 
 
 def test_markov_head_shapes_and_factorization():
@@ -141,22 +157,56 @@ def test_speculative_config_mtp_not_misrouted_to_dspark():
     assert hf.architectures == ["DeepseekV4MTPModel"]
 
 
-def test_block_sparse_attention_is_block_causal():
-    # A draft query at position t must not attend to draft positions > t.
+def test_block_sparse_attention_is_bidirectional_within_block():
+    # The block is decoded in one parallel pass, so every draft query position
+    # sees every draft KV column, including ones after itself.
     B, T, H, D, W = 1, 4, 2, 8, 3
     torch.manual_seed(0)
     q = torch.randn(B, T, H, D)
     kv = torch.randn(B, W + T, D)
     sink = torch.zeros(H)
     valid_target = torch.ones(B, W, dtype=torch.bool)
-    out_full = _dspark_block_sparse_attention(q, kv, sink, valid_target, D**-0.5)
-    # Zero out the last draft KV row; position 0..T-2 outputs must be unchanged
-    # (block-causal: they never see the last draft column), position T-1 changes.
+    out_full = _block_attn(q, kv, sink, valid_target, D**-0.5)
+    # Perturb the LAST draft KV row: every position, not just the last, must move.
     kv2 = kv.clone()
     kv2[:, -1] = 0.0
-    out2 = _dspark_block_sparse_attention(q, kv2, sink, valid_target, D**-0.5)
-    torch.testing.assert_close(out_full[:, :-1], out2[:, :-1], rtol=1e-4, atol=1e-4)
-    assert not torch.allclose(out_full[:, -1], out2[:, -1])
+    out2 = _block_attn(q, kv2, sink, valid_target, D**-0.5)
+    for t in range(T):
+        assert not torch.allclose(
+            out_full[:, t], out2[:, t]
+        ), f"draft position {t} did not see the last draft column (causal leak)"
+    # Symmetrically, perturbing the FIRST draft column must move every position.
+    kv3 = kv.clone()
+    kv3[:, W] = 0.0
+    out3 = _block_attn(q, kv3, sink, valid_target, D**-0.5)
+    for t in range(T):
+        assert not torch.allclose(out_full[:, t], out3[:, t])
+
+
+def test_block_topk_idxs_encode_the_same_mask_as_the_torch_path():
+    # The torch fallback ignores topk_idxs and production honours only
+    # topk_idxs, so nothing else pins the two encodings together. Assert the
+    # gather indices directly — drift is invisible on CPU otherwise.
+    B, T, W = 2, 4, 5
+    valid_target = torch.ones(B, W, dtype=torch.bool)
+    valid_target[0, :2] = False  # request 0 has two unpopulated window slots
+    idxs = _dspark_block_topk_idxs(B, T, W, valid_target, torch.device("cpu"))
+    assert idxs.shape == (B, T, W + T)
+    assert idxs.dtype == torch.int32
+    win, draft = idxs[..., :W], idxs[..., W:]
+    for b in range(B):
+        for m in range(T):
+            # Window half: the slot's own index where valid, -1 where not.
+            expected_win = torch.where(
+                valid_target[b],
+                torch.arange(W, dtype=torch.int32),
+                torch.full((W,), -1, dtype=torch.int32),
+            )
+            torch.testing.assert_close(win[b, m], expected_win)
+            # Draft half: the WHOLE block, every query row, never masked.
+            torch.testing.assert_close(
+                draft[b, m], W + torch.arange(T, dtype=torch.int32)
+            )
 
 
 def test_block_sparse_attention_respects_window_validity():
@@ -169,12 +219,12 @@ def test_block_sparse_attention_respects_window_validity():
     all_valid = torch.ones(B, W, dtype=torch.bool)
     some_valid = all_valid.clone()
     some_valid[:, -2:] = False  # invalidate 2 window slots
-    o_all = _dspark_block_sparse_attention(q, kv, sink, all_valid, D**-0.5)
-    o_some = _dspark_block_sparse_attention(q, kv, sink, some_valid, D**-0.5)
+    o_all = _block_attn(q, kv, sink, all_valid, D**-0.5)
+    o_some = _block_attn(q, kv, sink, some_valid, D**-0.5)
     # Changing which window slots are valid must change the output.
     assert not torch.allclose(o_all, o_some)
     # But masking out slots that were already absent (none) is a no-op.
-    o_again = _dspark_block_sparse_attention(q, kv, sink, some_valid, D**-0.5)
+    o_again = _block_attn(q, kv, sink, some_valid, D**-0.5)
     torch.testing.assert_close(o_some, o_again, rtol=1e-5, atol=1e-5)
 
 
@@ -186,8 +236,8 @@ def test_block_sparse_attention_sink_absorbs_probability():
     q = torch.randn(B, T, H, D)
     kv = torch.randn(B, W + T, D)
     valid = torch.ones(B, W, dtype=torch.bool)
-    o_no_sink = _dspark_block_sparse_attention(q, kv, torch.tensor([-30.0]), valid, 1.0)
-    o_big_sink = _dspark_block_sparse_attention(q, kv, torch.tensor([30.0]), valid, 1.0)
+    o_no_sink = _block_attn(q, kv, torch.tensor([-30.0]), valid, 1.0)
+    o_big_sink = _block_attn(q, kv, torch.tensor([30.0]), valid, 1.0)
     assert o_big_sink.abs().sum() < o_no_sink.abs().sum()
 
 

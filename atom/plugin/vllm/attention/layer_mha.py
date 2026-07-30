@@ -926,22 +926,13 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         assert self.attn_type == AttentionType.DECODER
         block_size = vllm_config.cache_config.block_size
         # `self.sliding_window` uses -1 (not None) as the "no sliding window"
-        # sentinel (see __init__: per_layer_sliding_window or -1, and the
-        # `!= -1` / `> 0` guards throughout this layer). Only emit a
-        # SlidingWindowSpec for a *real* window (> 0); otherwise emit
-        # FullAttentionSpec. This matches native vLLM, where a non-windowed
-        # layer keeps sliding_window=None and registers FullAttentionSpec.
+        # sentinel. Only emit a SlidingWindowSpec for a *real* window (> 0); 
+        # otherwise emit FullAttentionSpec.
         #
-        # This matters for speculative decoding: the Eagle3 draft has no
-        # sliding window, so it must be a FullAttentionSpec. MLAAttentionSpec
-        # (M3's sparse indexer cache) subclasses FullAttentionSpec, so a spec
-        # set of {full/sparse target, full draft} stays uniform-type and vLLM
-        # allocates a separate KV tensor per layer. A SlidingWindowSpec draft is
-        # NOT a FullAttentionSpec subclass, which breaks uniformity and drops M3
-        # onto the hybrid/general allocator; with a single draft layer that
-        # collapses group_size to 1 and packs every layer into one shared
-        # KVCacheTensor, aliasing the dense and sparse layouts and corrupting the
-        # KV cache.
+        # As Eagle3 draft has no sliding window, it must be a FullAttentionSpec.
+        # MLAAttentionSpec (M3's sparse indexer cache) subclasses FullAttentionSpec,
+        # so a spec set of {full/sparse target, full draft} stays uniform-type and 
+        # vLLM allocates a separate KV tensor per layer.
         if self.sliding_window is not None and self.sliding_window > 0:
             return SlidingWindowSpec(
                 block_size=block_size,

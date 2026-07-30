@@ -91,6 +91,13 @@ class EngineArgs:
             "--model", type=str, default="Qwen/Qwen3-0.6B", help="Model name or path."
         )
         parser.add_argument(
+            "--served-model-name",
+            type=str,
+            default=None,
+            help="Override the model name returned by the API. "
+            "If not specified, defaults to the --model value.",
+        )
+        parser.add_argument(
             "--trust-remote-code",
             action="store_true",
             help="Trust remote code when loading model.",
@@ -152,10 +159,12 @@ class EngineArgs:
         parser.add_argument(
             "--index-cache-dtype",
             "--index_cache_dtype",
-            choices=["bf16", "fp8"],
+            choices=["bf16", "fp8", "fp4"],
             type=str,
             default=None,
-            help="Index cache type. Defaults to --kv_cache_dtype.",
+            help="Index cache type. Defaults to --kv_cache_dtype. 'fp4' selects "
+            "the DeepSeek-V4 FP4 CSA indexer (gfx950 only; falls back to fp8 "
+            "elsewhere).",
         )
         parser.add_argument(
             "--block-size", type=int, default=16, help="KV cache block size."
@@ -263,7 +272,10 @@ class EngineArgs:
             "--draft-model",
             type=str,
             default=None,
-            help="Path to external Eagle3 draft model. Required when --method eagle3.",
+            help="Path to a standalone draft-model checkpoint. Required when "
+            "--method eagle3; optional for --method dspark (needed for the "
+            "DFlash-backbone drafts such as Kimi-K3-DSpark, omitted for "
+            "V4-Pro-DSpark which ships inside the target checkpoint).",
         )
         parser.add_argument(
             "--max-num-batched-tokens",
@@ -480,18 +492,18 @@ class EngineArgs:
             method = kwargs.pop("method")
             num_spec_tokens = kwargs.pop("num_speculative_tokens")
             draft_model = kwargs.pop("draft_model")
-            if method == "eagle3":
-                kwargs["speculative_config"] = SpeculativeConfig(
-                    method=method,
-                    model=draft_model,
-                    num_speculative_tokens=num_spec_tokens,
+            if method == "eagle3" and not draft_model:
+                raise ValueError("--draft-model is required when --method eagle3.")
+            if draft_model and method == "mtp":
+                raise ValueError(
+                    "--draft-model is not supported with --method mtp: the MTP "
+                    "draft is loaded from the target checkpoint."
                 )
-            else:
-                kwargs["speculative_config"] = SpeculativeConfig(
-                    method=method,
-                    model=self.model,
-                    num_speculative_tokens=num_spec_tokens,
-                )
+            kwargs["speculative_config"] = SpeculativeConfig(
+                method=method,
+                model=draft_model or self.model,
+                num_speculative_tokens=num_spec_tokens,
+            )
         else:
             kwargs.pop("method")
             kwargs.pop("num_speculative_tokens")

@@ -804,8 +804,8 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         attn_metadata,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         assert isinstance(q, torch.Tensor)
-        if self.head_repeat_factor > 1:
-            q = q.repeat_interleave(self.head_repeat_factor, dim=1)
+        original_num_heads = q.shape[1]
+        q = self._pad_query_heads(q)
         B = q.shape[0]
         num_heads_q = q.shape[1]
         o = torch.empty(
@@ -892,10 +892,12 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         )
         if do_fold:
             o = o.view(ori_total_s, ori_nhead, -1)
-        if self.head_repeat_factor > 1:
-            o = o[:, :: self.head_repeat_factor, :]
-            if lse is not None:
+        o = self._restore_query_heads(o, original_num_heads)
+        if lse is not None:
+            if self.head_repeat_factor > 1:
                 lse = lse[:, :: self.head_repeat_factor]
+            elif self.head_pad > 0:
+                lse = lse[:, :original_num_heads]
         return o, lse
 
     def forward_impl(

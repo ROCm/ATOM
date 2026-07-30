@@ -5,6 +5,23 @@ from vllm.v1.attention.backends.mla.prefill.base import MLAPrefillBackend
 from atom.model_ops.minimax_m3.sparse_attn import SPARSE_BLOCK_SIZE
 
 
+def _indexes_kv_by_block_stride_for_backend(backend_cls) -> bool:
+    try:
+        kv_cache_stride_order = backend_cls.get_kv_cache_stride_order(
+            include_num_layers_dimension=False
+        )
+        layered_kv_cache_stride_order = backend_cls.get_kv_cache_stride_order(
+            include_num_layers_dimension=True
+        )
+    except (AttributeError, NotImplementedError):
+        return False
+
+    if len(layered_kv_cache_stride_order) != len(kv_cache_stride_order) + 1:
+        return False
+
+    return layered_kv_cache_stride_order[0] != 0
+
+
 class AiterMhaBackendForVllm:
     """vLLM-facing MHA backend surface for ATOM attention layers."""
 
@@ -87,6 +104,10 @@ class AiterMhaBackendForVllm:
         return None
 
     @classmethod
+    def indexes_kv_by_block_stride(cls) -> bool:
+        return _indexes_kv_by_block_stride_for_backend(cls)
+
+    @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
         return [64, 128, 256]
 
@@ -141,6 +162,24 @@ class AiterMlaBackendForVllm:
         return (num_blocks, block_size, head_size)
 
     @classmethod
+    def get_kv_cache_block_dim(
+        cls,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> int:
+        sentinel = 1234567
+        shape = cls.get_kv_cache_shape(
+            sentinel,
+            block_size,
+            num_kv_heads,
+            head_size,
+            cache_dtype_str=cache_dtype_str,
+        )
+        return shape.index(sentinel)
+
+    @classmethod
     def is_mla(cls) -> bool:
         return True
 
@@ -165,6 +204,10 @@ class AiterMlaBackendForVllm:
         include_num_layers_dimension: bool = False,
     ) -> tuple[int, ...]:
         return (1, 0, 2, 3) if include_num_layers_dimension else (0, 1, 2)
+
+    @classmethod
+    def indexes_kv_by_block_stride(cls) -> bool:
+        return _indexes_kv_by_block_stride_for_backend(cls)
 
     @staticmethod
     def get_builder_cls() -> type:
@@ -192,7 +235,6 @@ class AtomAiterMLAPrefillBackend(MLAPrefillBackend):
 
     def __init__(
         self,
-        layer,
         num_heads: int,
         scale: float,
         kv_lora_rank: int,
@@ -200,6 +242,7 @@ class AtomAiterMLAPrefillBackend(MLAPrefillBackend):
         qk_rope_head_dim: int,
         v_head_dim: int,
         vllm_config,
+        layer=None,
     ) -> None:
         super().__init__(
             num_heads=num_heads,
@@ -212,7 +255,33 @@ class AtomAiterMLAPrefillBackend(MLAPrefillBackend):
         )
         self._layer = layer
 
-    def run_prefill_new_tokens(self, q, k, v, return_softmax_lse):
+    def clone(self):
+        return self.__class__(
+            num_heads=self.num_heads,
+            scale=self.scale,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            v_head_dim=self.v_head_dim,
+            vllm_config=self.vllm_config,
+            layer=self._layer,
+        )
+
+    def run_prefill_new_tokens(
+        self,
+        q,
+        k,
+        v,
+        return_softmax_lse,
+        out=None,
+        output_scale=None,
+    ):
+        if self._layer is None:
+            raise RuntimeError("ATOM MLA prefill backend is not bound to a layer.")
+        if out is not None or output_scale is not None:
+            raise NotImplementedError(
+                "ATOM MLA prefill does not support fused quantized output."
+            )
         return self._layer._run_prefill_new_tokens(
             self._prefill_metadata,
             q,
@@ -222,6 +291,8 @@ class AtomAiterMLAPrefillBackend(MLAPrefillBackend):
         )
 
     def run_prefill_context_chunk(self, chunk_idx: int, q, k, v):
+        if self._layer is None:
+            raise RuntimeError("ATOM MLA prefill backend is not bound to a layer.")
         return self._layer._run_prefill_context_chunk(
             self._prefill_metadata,
             chunk_idx,
@@ -399,13 +470,22 @@ class MiniMaxM3SparseAttentionBackend:
             raise ValueError(
                 f"MiniMax-M3 sparse block size must be {SPARSE_BLOCK_SIZE}."
             )
-        return (2, num_blocks, block_size, num_kv_heads, head_size)
+        return (num_blocks, 2, block_size, num_kv_heads, head_size)
 
     @staticmethod
     def get_kv_cache_stride_order(
         include_num_layers_dimension: bool = False,
     ) -> tuple[int, ...]:
-        raise NotImplementedError
+        if include_num_layers_dimension:
+            raise NotImplementedError
+        # Keep the logical block dimension first so vLLM does not normalize this
+        # cache together with the block-first index cache. Physically place K/V
+        # first so each cache remains contiguous for the page-16 ASM kernels.
+        return (1, 0, 2, 3, 4)
+
+    @classmethod
+    def indexes_kv_by_block_stride(cls) -> bool:
+        return _indexes_kv_by_block_stride_for_backend(cls)
 
     @staticmethod
     def get_impl_cls():

@@ -122,7 +122,6 @@ class LLMEngine:
                     "ATOM_TBO_PREFILL_TOKEN_SPLIT is ignored under PCP: TBO "
                     "prefill uses request-boundary balanced grouping."
                 )
-        self.rquest_ids = set()
         self.io_processor = InputOutputProcessor(
             config, self.tokenizer, config.kv_cache_block_size
         )
@@ -380,6 +379,7 @@ class InputOutputProcessor:
                 "qwen3_next",
                 "qwen3_5_text",
                 "qwen3_5_moe_text",
+                "kimi_linear",
                 "deepseek_v4",
             }
         )

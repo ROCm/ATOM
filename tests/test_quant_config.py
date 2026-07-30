@@ -755,3 +755,27 @@ class TestConvenienceProperties:
         assert qcfg.quant_type == QuantType.per_Token
         assert qcfg.quant_dtype == FP8
         assert qcfg.is_dynamic is True
+
+
+def test_get_hf_config_restores_qwen3_next_full_attention_interval(monkeypatch):
+    hf = FakeHFConfig(model_type="qwen3_next")
+    config_dict = {
+        "model_type": "qwen3_next",
+        "full_attention_interval": 4,
+    }
+    config_class = MagicMock()
+    config_class.from_pretrained.return_value = hf
+    monkeypatch.setattr(
+        _m.PretrainedConfig,
+        "get_config_dict",
+        staticmethod(lambda _model: (config_dict, {})),
+    )
+    monkeypatch.setattr(
+        _m.AutoConfig,
+        "for_model",
+        MagicMock(return_value=config_class),
+    )
+
+    result = _m.get_hf_config("Qwen/Qwen3-Next-80B-A3B-Thinking")
+
+    assert result.full_attention_interval == 4

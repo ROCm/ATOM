@@ -188,7 +188,13 @@ class DPSyncResult:
     # ``dspark_shape`` was passed in (DSpark active + DP). Folded into this
     # packed all_gather so DSpark's graph-shape sync no longer needs its own
     # separate all_reduce (halves the per-step DP round-trips).
-    dspark_shape_max: Optional[tuple[int, int, int]] = None
+    dspark_shape_max: tuple[int, int, int] | None = None
+    # True iff EVERY DP rank is running a dummy forward this step (AND-reduce of
+    # per-rank is_dummy). Used to gate DSpark cudagraph dummy-replay: an all-dummy
+    # step has no real rank replaying to rendezvous with, so all ranks must stay
+    # eager (vLLM never runs an all-idle forward). Only meaningful when
+    # ``dspark_shape`` was passed (DSpark + DP); False otherwise.
+    any_dummy: bool = False
 
 
 def sync_dp_metadata(
@@ -201,7 +207,8 @@ def sync_dp_metadata(
     local_meets_min_tokens: bool = False,
     local_can_split: bool = False,
     local_ub_tokens: tuple[int, int] = (0, 0),
-    dspark_shape: Optional[tuple[int, int, int]] = None,
+    dspark_shape: tuple[int, int, int] | None = None,
+    local_is_dummy: bool = False,
 ) -> DPSyncResult:
     """Single packed DP all_gather over all per-rank scalars a decode/prefill
     step needs synchronized: DP token padding, the prefill fan-out, the
@@ -231,14 +238,15 @@ def sync_dp_metadata(
 
     Gate: ``active = OR(meets_min_tokens) AND AND(can_split) AND uniform``.
 
-    ``dspark_shape`` folds DSpark's per-step graph-shape sync (formerly a
-    standalone all_reduce in ``_dspark_sync_graph_shape_dp``) into this same
+    ``dspark_shape`` folds DSpark's per-step graph-shape sync (the DP-MAX of
+    (q, decode_bs, total_tokens) from ``_dspark_local_shape``) into this same
     packed all_gather. It is global-config gated (DSpark on + DP), so every
     rank appends the same 3 fields and the payload stays symmetric.
     """
     tbo_fields = 6 if tbo_on else 2
     dspark_on = dspark_shape is not None
-    n_fields = tbo_fields + (3 if dspark_on else 0)
+    # +1 extra DSpark field: per-rank is_dummy (OR-reduced -> any_dummy).
+    n_fields = tbo_fields + (4 if dspark_on else 0)
     local = torch.zeros(n_fields, dtype=torch.int32, device="cpu")
     local[0] = num_input_tokens
     local[1] = 1 if is_prefill else 0
@@ -251,6 +259,7 @@ def sync_dp_metadata(
         local[tbo_fields + 0] = dspark_shape[0]
         local[tbo_fields + 1] = dspark_shape[1]
         local[tbo_fields + 2] = dspark_shape[2]
+        local[tbo_fields + 3] = 1 if local_is_dummy else 0
 
     gathered = [
         torch.empty(n_fields, dtype=torch.int32, device="cpu") for _ in range(dp_size)
@@ -284,13 +293,16 @@ def sync_dp_metadata(
                 int(sync[5].max()),
             )
 
-    dspark_shape_max: Optional[tuple[int, int, int]] = None
+    dspark_shape_max: tuple[int, int, int] | None = None
+    any_dummy = False
     if dspark_on:
         dspark_shape_max = (
             int(sync[tbo_fields + 0].max()),
             int(sync[tbo_fields + 1].max()),
             int(sync[tbo_fields + 2].max()),
         )
+        # OR-reduce: True if ANY rank is a dummy this step.
+        any_dummy = bool(sync[tbo_fields + 3].any())
 
     return DPSyncResult(
         num_tokens_across_dp=num_tokens_across_dp,
@@ -298,12 +310,46 @@ def sync_dp_metadata(
         tbo_collective_active=tbo_collective_active,
         ub_max_tokens_across_dp=ub_max_tokens_across_dp,
         dspark_shape_max=dspark_shape_max,
+        any_dummy=any_dummy,
     )
 
 
 _THREAD_ID_TO_CONTEXT: dict[int, int] = {}
 _CURRENT_CONTEXTS: list["TBOContext | None"] = []
 _NUM_UBATCHES: int = 2
+
+# Per-ubatch independent pynccl TP communicators for the pure-TP all_reduce
+# overlap (see `tbo_all_reduce`).
+_TBO_TP_UBATCH_COMMS: "list | None" = None
+
+
+def tbo_get_ubatch_tp_comm(ubatch_id: int):
+    """Return this ubatch's dedicated pynccl TP communicator, building the pair
+    lazily on first use. Returns None if TP world size == 1 (no AR needed)."""
+    global _TBO_TP_UBATCH_COMMS
+    if _TBO_TP_UBATCH_COMMS is not None:
+        return _TBO_TP_UBATCH_COMMS[ubatch_id]
+
+    from aiter.dist.device_communicators.communicator_pynccl import (
+        PyNcclCommunicator,
+    )
+    from aiter.dist.parallel_state import get_tp_group
+
+    tp = get_tp_group()
+    if tp.world_size == 1:
+        _TBO_TP_UBATCH_COMMS = [None] * _NUM_UBATCHES
+        return None
+
+    # One independent communicator per ubatch. Construction runs a warmup
+    # all_reduce (a collective), so every rank must build the same number in the
+    # same order — guaranteed here because all ranks run TBO in lockstep and hit
+    # this on the same forward. Bound to the TP cpu_group (non-NCCL backend),
+    # exactly like the shared pynccl_comm.
+    comms = []
+    for _ in range(_NUM_UBATCHES):
+        comms.append(PyNcclCommunicator(group=tp.cpu_group, device=tp.device))
+    _TBO_TP_UBATCH_COMMS = comms
+    return _TBO_TP_UBATCH_COMMS[ubatch_id]
 
 
 class TBOContext:
