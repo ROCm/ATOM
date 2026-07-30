@@ -1105,13 +1105,15 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # swa_block_table — window-freeing leaves only the live tail (the last
         # ~128-token block) as non-(-1) entries, so only that gets transferred.
         # FP8 2buf KV registers NoPE and RoPE SWA pools as separate regions.
-        nope_swa_bpb = self.block_size * self.head_dim * elem_classical
         for layer_id in range(self.num_layers):
             uv = runner.v4_unified_kv[layer_id]
+            nope_swa_bpb = (
+                self.block_size * self.head_dim * uv.element_size()
+            )
             swa_block_regions.append(
                 KVTransferRegion(
                     uv.data_ptr(),
-                    swa_pages * self.head_dim * elem_classical,
+                    swa_pages * self.head_dim * uv.element_size(),
                     nope_swa_bpb,
                 )
             )
