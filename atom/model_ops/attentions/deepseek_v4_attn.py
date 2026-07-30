@@ -1107,9 +1107,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # FP8 2buf KV registers NoPE and RoPE SWA pools as separate regions.
         for layer_id in range(self.num_layers):
             uv = runner.v4_unified_kv[layer_id]
-            nope_swa_bpb = (
-                self.block_size * self.head_dim * uv.element_size()
-            )
+            nope_swa_bpb = self.block_size * self.head_dim * uv.element_size()
             swa_block_regions.append(
                 KVTransferRegion(
                     uv.data_ptr(),
