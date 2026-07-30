@@ -357,7 +357,7 @@ def build_cell(
         "random_range_ratio": str(benchmark_cfg.get("random_range_ratio", 0.8)),
         "request_rate": str(benchmark_cfg.get("request_rate", "inf")),
         "num_prompts_multiplier": int(benchmark_cfg.get("num_prompts_multiplier", 10)),
-        "wait_server_timeout": int(benchmark_cfg.get("wait_server_timeout", 2500)),
+        "wait_server_timeout": int(benchmark_cfg.get("wait_server_timeout", 5000)),
         "wait_router_timeout": int(benchmark_cfg.get("wait_router_timeout", 300)),
         "benchmark": benchmark_cfg,
         "runner": runner_cfg,
