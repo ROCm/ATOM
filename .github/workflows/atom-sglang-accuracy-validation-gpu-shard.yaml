@@ -225,26 +225,39 @@ jobs:
           if [ -d "$MODEL_CACHE_ROOT" ]; then
             MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_ROOT}:${MODEL_MOUNT_PATH}"
             MODEL_CACHE_DESC="${MODEL_CACHE_ROOT} (host mount)"
-            HF_CACHE_ROOT="${MODEL_CACHE_ROOT}/.cache/huggingface"
           else
             MODEL_CACHE_DESC="container-local ${MODEL_CACHE_ROOT} (no host cache mount)"
           fi
 
-          if [ -z "$HF_CACHE_ROOT" ]; then
-            for candidate in /mnt/raid0/huggingface /data/huggingface /shared/data/WRH/huggingface; do
-              parent="$(dirname "$candidate")"
-              if [ -d "$parent" ] && [ -w "$parent" ]; then
-                HF_CACHE_ROOT="$candidate"
-                break
-              fi
-            done
-          fi
+          try_hf_cache_root() {
+            local candidate="$1"
+            local parent
+            [ -n "$candidate" ] || return 1
+            parent="$(dirname "$candidate")"
+            [ -d "$parent" ] || return 1
+            if mkdir -p "$candidate" 2>/dev/null; then
+              HF_CACHE_ROOT="$candidate"
+              return 0
+            fi
+            echo "Warning: HuggingFace cache candidate is not writable: ${candidate}"
+            return 1
+          }
+
+          for candidate in \
+            "${MODEL_CACHE_ROOT}/.cache/huggingface" \
+            /mnt/raid0/huggingface \
+            /data/huggingface \
+            /shared/data/WRH/huggingface; do
+            if try_hf_cache_root "$candidate"; then
+              break
+            fi
+          done
 
           if [ -z "$HF_CACHE_ROOT" ]; then
             HF_CACHE_ROOT="${RUNNER_TEMP:-${GITHUB_WORKSPACE:-$PWD}}/huggingface"
+            mkdir -p "$HF_CACHE_ROOT"
           fi
           HF_CACHE_MOUNT="-v ${HF_CACHE_ROOT}:/hf-cache"
-          mkdir -p "$HF_CACHE_ROOT"
           echo "Using HuggingFace cache root: ${HF_CACHE_ROOT}"
           df -h "$HF_CACHE_ROOT" || true
 

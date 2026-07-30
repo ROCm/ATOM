@@ -20,7 +20,7 @@ on:
     # TW weekend nightly at 21:00 Beijing time (13:00 UTC).
     - cron: '0 13 * * 6'
     - cron: '0 13 * * 0'
-    # Spur nightly at 00:10 Beijing time (16:10 UTC).
+    # Spur Agentic Trace nightly at 00:10 Beijing time (16:10 UTC).
     - cron: '10 16 * * *'
   workflow_dispatch:
     inputs:
@@ -43,7 +43,18 @@ on:
         default: ''
         type: string
       case_names:
-        description: 'Overrides model_names. Comma-separated: ds-v4-1p1d-tp8-smoke,ds-v4-1p1d-tp8,ds-v4-1p1d-dpa-tp8,ds-v4-2p1d-dpa-tp8,glm-52-mxfp4-1p1d-tp4,glm-52-mxfp4-1p1d-tp8,kimi-k25-1p1d-tp4,kimi-k25-1p1d-tp4-tp8,kimi-k25-2p1d-tp4,kimi-k25-1p2d-tp4,minimax-m3-fp4-1p1d-tp4,minimax-m3-fp4-2p1d-dpa-tp4,minimax-m3-fp4-1p1d-tp4-eagle3,minimax-m3-fp4-2p1d-dpa-tp4-eagle3,minimax-m3-fp8-1p1d-tp4,minimax-m3-fp8-2p1d-dpa-tp4,minimax-m3-fp8-1p1d-tp4-eagle3,minimax-m3-fp8-2p1d-dpa-tp4-eagle3'
+        description: >-
+          Overrides model_names. Comma-separated:
+          ds-v4-1p1d-tp8-smoke,ds-v4-1p1d-tp8,ds-v4-1p1d-dpa-tp8,ds-v4-2p1d-dpa-tp8,
+          glm-52-mxfp4-1p1d-tp4,glm-52-mxfp4-1p1d-tp8,
+          glm-52-mxfp4-1p1d-tp4-agentic-1m-c1,glm-52-mxfp4-1p1d-tp4-agentic-1m-c2,
+          glm-52-mxfp4-1p1d-tp4-agentic-1m-c4,glm-52-mxfp4-1p1d-tp4-agentic-1m-c8,
+          glm-52-mxfp4-1p1d-tp4-agentic-1m-c48,
+          kimi-k25-1p1d-tp4,kimi-k25-1p1d-tp4-tp8,kimi-k25-2p1d-tp4,kimi-k25-1p2d-tp4,
+          minimax-m3-fp4-1p1d-tp4,minimax-m3-fp4-2p1d-dpa-tp4,
+          minimax-m3-fp4-1p1d-tp4-eagle3,minimax-m3-fp4-2p1d-dpa-tp4-eagle3,
+          minimax-m3-fp8-1p1d-tp4,minimax-m3-fp8-2p1d-dpa-tp4,
+          minimax-m3-fp8-1p1d-tp4-eagle3,minimax-m3-fp8-2p1d-dpa-tp4-eagle3
         required: false
         default: ''
         type: string
@@ -224,6 +235,7 @@ jobs:
           RUN_ALL_MODELS: ${{ github.event_name == 'workflow_dispatch' && inputs.run_all_models || github.event_name != 'workflow_dispatch' }}
           MODEL_NAMES: ${{ github.event_name == 'workflow_dispatch' && inputs.model_names || '' }}
           CASE_NAMES: ${{ github.event_name == 'workflow_dispatch' && inputs.case_names || '' }}
+          BENCHMARK_KIND_FILTER: ${{ github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'aiperf_agentic' || '' }}
           ATOMESH_IMAGE: ${{ steps.image.outputs.image }}
           ATOMESH_BENCHMARK_CONCURRENCY: ${{ github.event_name == 'workflow_dispatch' && inputs.benchmark_concurrency || '' }}
           ATOMESH_EVAL_CONCURRENCY: ${{ github.event_name == 'workflow_dispatch' && inputs.eval_concurrency || '' }}
@@ -247,6 +259,7 @@ jobs:
             --suite "$SUITE" \
             ${MODEL_NAME:+--model "$MODEL_NAME"} \
             ${CASE_NAME:+--case "$CASE_NAME"} \
+            ${BENCHMARK_KIND_FILTER:+--benchmark-kind "$BENCHMARK_KIND_FILTER"} \
             ${ATOMESH_IMAGE:+--image "$ATOMESH_IMAGE"} \
             ${ATOMESH_BENCHMARK_CONCURRENCY:+--benchmark-concurrency "$ATOMESH_BENCHMARK_CONCURRENCY"} \
             ${ATOMESH_EVAL_CONCURRENCY:+--eval-concurrency "$ATOMESH_EVAL_CONCURRENCY"} \

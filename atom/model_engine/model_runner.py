@@ -89,6 +89,7 @@ support_model_arch_dict = {
     "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MultimodalModel",
     "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MoeMultimodalModel",
     "KimiK25ForConditionalGeneration": "atom.models.kimi_k25.KimiK25ForCausalLM",
+    "KimiK3ForConditionalGeneration": "atom.models.kimi_k3.KimiK3ForCausalLM",
     "MiniMaxM2ForCausalLM": "atom.models.minimax_m2.MiniMaxM2ForCausalLM",
     "MiMoV2ForCausalLM": "atom.models.mimo_v2.MiMoV2ForCausalLM",
     "MiMoV2FlashForCausalLM": "atom.models.mimo_v2.MiMoV2ForCausalLM",
@@ -686,6 +687,8 @@ class ModelRunner:
         self.use_mla = self.is_deepseek_mla()
         self.use_gdn = self.is_qwen_next()
         self.use_v4 = self.is_deepseek_v4()
+        self.use_kimi_mla = self.is_kimi_linear()
+
         rope_parameters = getattr(self.hf_text_config, "rope_parameters", None) or {}
         self.use_mrope = "mrope_section" in rope_parameters
         self.is_deepseek_v32 = (
@@ -721,6 +724,7 @@ class ModelRunner:
             use_mla=self.use_mla,
             use_gdn=self.use_gdn,
             use_v4=self.use_v4,
+            use_kimi_mla=self.use_kimi_mla,
         )
         use_spec = bool(self.config.speculative_config) and get_pp_group().is_last_rank
         self.num_spec_tokens = (
@@ -908,6 +912,9 @@ class ModelRunner:
         ):
             return True
         return False
+
+    def is_kimi_linear(self) -> bool:
+        return getattr(self.hf_text_config, "model_type", None) == "kimi_linear"
 
     def is_deepseek_v4(self) -> bool:
         # NOTE: `hf_text_config.model_type` reads "deepseek_v3" for V4 because
