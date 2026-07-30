@@ -166,7 +166,7 @@ EOF
     -v /data:/data
   )
 
-  if [[ "${rank}" -eq 0 && "${EVAL_TASK:-}" == "swebench_lite" ]]; then
+  if [[ "${rank}" -eq 0 && "${EVAL_TASK:-}" == "swebench_lite" && ( "${RUN_EVAL:-false}" == "true" || "${RUN_EVAL:-false}" == "1" ) ]]; then
     if [[ ! -S /var/run/docker.sock ]]; then
       echo "ERROR: local SWE-bench Lite requires /var/run/docker.sock" >&2
       return 2
@@ -410,7 +410,7 @@ srun \
     docker rm -f "${container}" >/dev/null 2>&1 || true
     docker pull "'"${DOCKER_IMAGE}"'"
     nested_docker_args=()
-    if [[ "${rank}" -eq 0 && "${EVAL_TASK:-}" == "swebench_lite" ]]; then
+    if [[ "${rank}" -eq 0 && "${EVAL_TASK:-}" == "swebench_lite" && ( "${RUN_EVAL:-false}" == "true" || "${RUN_EVAL:-false}" == "1" ) ]]; then
       if [[ ! -S /var/run/docker.sock ]]; then
         echo "ERROR: local SWE-bench Lite requires /var/run/docker.sock" >&2
         exit 2

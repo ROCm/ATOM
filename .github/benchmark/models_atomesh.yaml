@@ -197,7 +197,6 @@ models:
         - &glm52_agentic_tp4_tp4
           name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c1
           topology: 1p1d
-          display_topology: 1P1D-TP4-agentic
           pd_worker_layout: multi_node
           nodes: "${ATOMESH_1P1D_NODES}"
           isl: [1048576]
@@ -246,15 +245,6 @@ models:
             service_profile_configure_timeout: 1800
             wait_server_timeout: 4500
             wait_router_timeout: 600
-          accuracy:
-            task: swebench_lite
-            threshold: 0.50
-            agent_workers: 16
-            agent_step_limit: 150
-            agent_timeout: 21600
-            score_timeout: 7200
-            max_workers: 4
-            instance_timeout: 900
           run_eval: false
 
         - <<: *glm52_agentic_tp4_tp4
@@ -272,6 +262,15 @@ models:
         - <<: *glm52_agentic_tp4_tp4
           name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c48
           concurrency: [48]
+          accuracy:
+            task: swebench_lite
+            threshold: 0.50
+            agent_workers: 16
+            agent_step_limit: 150
+            agent_timeout: 21600
+            score_timeout: 7200
+            max_workers: 4
+            instance_timeout: 900
           eval_concurrency: [48]
           run_eval: true
           runner:
@@ -281,7 +280,6 @@ models:
           <<: *glm52_agentic_tp4_tp4
           name: glm-52-mxfp4-1p1d-tp8-dpa-agentic-lmcache-1m-c48
           topology: 1p1d_dpa
-          display_topology: 1P1D-DPA-TP8
           concurrency: [48]
           prefill:
             workers: 1
@@ -311,7 +309,6 @@ models:
         - <<: *glm52_agentic_lmcache
           name: glm-52-mxfp4-1p1d-tp4-pcp2-agentic-lmcache-1m-c48
           topology: 1p1d-tp4-pcp2
-          display_topology: 1P1D-PCP2-TP4-TP8
           pd_worker_layout: multi_node
           concurrency: [48]
           prefill:

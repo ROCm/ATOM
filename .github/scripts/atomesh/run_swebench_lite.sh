@@ -332,12 +332,6 @@ cleanup_nested_containers() {
   if [[ "${#container_ids[@]}" -gt 0 ]]; then
     "${DOCKER_EXECUTABLE}" rm -f "${container_ids[@]}" >/dev/null 2>&1 || true
   fi
-  mapfile -t container_ids < <(
-    "${DOCKER_EXECUTABLE}" ps -aq --filter "name=${RUN_ID}" 2>/dev/null
-  )
-  if [[ "${#container_ids[@]}" -gt 0 ]]; then
-    "${DOCKER_EXECUTABLE}" rm -f "${container_ids[@]}" >/dev/null 2>&1 || true
-  fi
   return "${rc}"
 }
 trap cleanup_nested_containers EXIT
