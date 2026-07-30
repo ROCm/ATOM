@@ -603,16 +603,23 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase):
         )
 
 
+_TEXT_ONLY_WEIGHTS_MAPPING = {
+    "model.language_model.": "language_model.model.",
+    "lm_head.": "language_model.lm_head.",
+}
+
+_TEXT_ONLY_QUANT_EXCLUDE_NAME_MAPPING = {
+    "model.language_model.": "model.",
+}
+
+_TEXT_ONLY_SKIP_WEIGHT_PREFIXES = ["model.visual."]
+
+
 class Qwen3_5ForConditionalGenerationTextOnly(nn.Module):
     packed_modules_mapping = _QWEN3_5_PACKED_MODULES_MAPPING
-    weights_mapping = {
-        "model.language_model.": "language_model.model.",
-        "lm_head.": "language_model.lm_head.",
-    }
-    quant_exclude_name_mapping = {
-        "model.language_model.": "model.",
-    }
-    skip_weight_prefixes = ["model.visual."]
+    weights_mapping = _TEXT_ONLY_WEIGHTS_MAPPING
+    quant_exclude_name_mapping = _TEXT_ONLY_QUANT_EXCLUDE_NAME_MAPPING
+    skip_weight_prefixes = _TEXT_ONLY_SKIP_WEIGHT_PREFIXES
 
     def __init__(self, atom_config: Config, prefix: str = ""):
         super().__init__()
