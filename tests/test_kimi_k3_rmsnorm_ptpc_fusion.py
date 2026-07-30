@@ -275,3 +275,74 @@ def test_root_config_rebuild_reapplies_packed_quant_name_mapping():
     remap_at = source.index("self.quant_config.remap_layer_name(")
     assert remap_at > rebuild_at
     assert "packed_modules_mapping=self.packed_modules_mapping" in source
+
+
+# ---------------------------------------------------------------------------
+# Dual-stream MoE (shared-expert GEMMs overlap the routed path)
+# ---------------------------------------------------------------------------
+
+
+def test_moe_defines_single_dual_and_routed_forward_methods():
+    names = {
+        node.name
+        for node in _class("KimiSparseMoeBlock").body
+        if isinstance(node, ast.FunctionDef)
+    }
+    assert {
+        "routed_expert_forward",
+        "single_stream_moe_forward",
+        "dual_stream_moe_forward",
+    } <= names
+
+
+def test_moe_forward_dispatches_through_custom_op_when_dual_stream():
+    source = _method_source("KimiSparseMoeBlock", "forward")
+
+    assert "if self._use_dual_stream:" in source
+    assert (
+        "torch.ops.aiter.maybe_dual_stream_forward(hidden_states, self.prefix)"
+        in source
+    )
+    assert "return self.single_stream_moe_forward(hidden_states)" in source
+
+
+def test_moe_dual_stream_gate_requires_shared_experts_and_alt_stream():
+    init_source = _method_source("KimiSparseMoeBlock", "__init__")
+
+    assert "self._use_dual_stream = False" in init_source
+    assert (
+        "if self.shared_experts is not None and self.alt_stream is not None:"
+        in init_source
+    )
+    assert "envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0 and not tbo_active" in (
+        init_source
+    )
+    # Registered by prefix so the Dynamo-opaque op can look the module back up.
+    assert "cc.static_forward_context[self.prefix] = self" in init_source
+
+
+def test_moe_dual_stream_keeps_all_reduces_serial_on_main_stream():
+    source = _method_source("KimiSparseMoeBlock", "dual_stream_moe_forward")
+
+    # Only the shared-expert GEMM runs on the alt stream; no collective inside it.
+    assert "alt.wait_stream(current)" in source
+    assert "with torch.cuda.stream(alt):" in source
+    with_at = source.index("with torch.cuda.stream(alt):")
+    join_at = source.index("current.wait_stream(alt)")
+    alt_block = source[with_at:join_at]
+    assert "self.shared_experts(identity)" in alt_block
+    assert "tensor_model_parallel_all_reduce(" not in alt_block
+    # Both all_reduces sit after the streams re-join, serial on the main stream.
+    assert source.count("tensor_model_parallel_all_reduce(") == 2
+    assert source.rindex("tensor_model_parallel_all_reduce(") > join_at
+
+
+def test_alt_stream_threaded_through_decoder_and_created_in_model():
+    decoder_init = _method_source("KimiDecoderLayer", "__init__")
+    assert "alt_stream: torch.cuda.Stream | None = None" in decoder_init
+    assert "alt_stream=alt_stream" in decoder_init
+
+    model_init = _method_source("KimiLinearModel", "__init__")
+    assert 'if getattr(config, "num_shared_experts", 0):' in model_init
+    assert "self.alt_stream = torch.cuda.Stream()" in model_init
+    assert "alt_stream=_alt_stream" in model_init

@@ -22,6 +22,11 @@ from einops import rearrange
 from torch import nn
 
 from atom.config import Config, QuantizationConfig, get_current_atom_config
+
+# Side-effect import: registers `torch.ops.aiter.maybe_dual_stream_forward`, the
+# Dynamo-opaque custom op that dispatches the MoE between single- and dual-stream
+# forwards (shared with deepseek_v2/v4). Imported for the registration only.
+from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.model_ops.attention_mla import MLAModules
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
@@ -51,7 +56,7 @@ from atom.models.utils import (
     maybe_prefix,
 )
 from atom.quant_spec import should_skip_online_quant
-from atom.utils import mark_spliting_op
+from atom.utils import envs, mark_spliting_op
 from atom.utils.decorators import support_torch_compile
 from atom.utils.forward_context import get_forward_context
 
@@ -274,10 +279,12 @@ class KimiSparseMoeBlock(nn.Module):
         config,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        alt_stream: torch.cuda.Stream | None = None,
     ):
         super().__init__()
         self.config = config
         self.prefix = prefix
+        self.alt_stream = alt_stream
         self.hidden_dim = config.hidden_size
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_token
@@ -371,11 +378,30 @@ class KimiSparseMoeBlock(nn.Module):
                 else None
             )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self._forward_impl(hidden_states)
+        # Dual-stream gate: overlap the shared-expert GEMMs (on alt_stream) with
+        # the routed-expert path (on the main stream). Only meaningful when a
+        # shared branch exists and an alt_stream was threaded in. TBO already
+        # provides its own overlap, so the two are mutually exclusive.
+        self._use_dual_stream = False
+        if self.shared_experts is not None and self.alt_stream is not None:
+            tbo_active = get_current_atom_config().enable_tbo
+            if envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0 and not tbo_active:
+                self._use_dual_stream = True
+        if self._use_dual_stream:
+            # Register self so `maybe_dual_stream_forward` can look this module up
+            # by prefix from static_forward_context (the op is Dynamo-opaque).
+            cc = get_current_atom_config().compilation_config
+            cc.static_forward_context[self.prefix] = self
 
-    def _forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        identity = hidden_states
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self._use_dual_stream:
+            return torch.ops.aiter.maybe_dual_stream_forward(hidden_states, self.prefix)
+        return self.single_stream_moe_forward(hidden_states)
+
+    def routed_expert_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Routed-expert path only. For the latent MoE this includes the routed
+        all-reduce (required before the nonlinear routed_expert_norm); the shared
+        branch is handled by the caller."""
         router_logits = self.gate(hidden_states)
         routed_input = (
             self.routed_expert_down_proj(hidden_states)
@@ -394,6 +420,12 @@ class KimiSparseMoeBlock(nn.Module):
             if self.routed_expert_norm is not None:
                 routed_output = self.routed_expert_norm(routed_output)
             routed_output = self.routed_expert_up_proj(routed_output)
+        return routed_output
+
+    def single_stream_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        identity = hidden_states
+        routed_output = self.routed_expert_forward(hidden_states)
+        if self.use_latent_moe:
             if self.shared_experts is not None:
                 # Shared branch is TP-partial (down_proj is row-parallel); reduce
                 # it separately and add to the already-full routed output.
@@ -407,6 +439,32 @@ class KimiSparseMoeBlock(nn.Module):
         # over their sum is correct.
         if self.shared_experts is not None:
             routed_output = routed_output + self.shared_experts(identity)
+        if self.tp_size > 1:
+            routed_output = tensor_model_parallel_all_reduce(routed_output)
+        return routed_output
+
+    def dual_stream_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Shared-expert GEMMs run on alt_stream, overlapping the routed path on the
+        # main stream. Both all_reduces stay serial on the main stream: the single
+        # TP communicator (get_tp_group()) cannot service two concurrent
+        # collectives without an RCCL deadlock/corruption hazard.
+        identity = hidden_states
+        current = torch.cuda.current_stream()
+        alt = self.alt_stream
+        alt.wait_stream(current)
+        with torch.cuda.stream(alt):
+            # GEMM only — NO all_reduce inside the alt-stream block.
+            shared_output = self.shared_experts(identity)
+        routed_output = self.routed_expert_forward(hidden_states)
+        current.wait_stream(alt)
+        if self.use_latent_moe:
+            # shared branch is TP-partial; reduce it now on the main stream, after
+            # the routed AR completed — one collective at a time on the TP comm.
+            if self.tp_size > 1:
+                shared_output = tensor_model_parallel_all_reduce(shared_output)
+            return routed_output + shared_output
+        # Non-latent: shared has no AR yet; single deferred AR over the sum.
+        routed_output = routed_output + shared_output
         if self.tp_size > 1:
             routed_output = tensor_model_parallel_all_reduce(routed_output)
         return routed_output
@@ -1068,6 +1126,7 @@ class KimiDecoderLayer(nn.Module):
         atom_config: Config,
         prefix: str,
         layer_num: int = 0,
+        alt_stream: torch.cuda.Stream | None = None,
     ):
         super().__init__()
         config = _text_config(atom_config.hf_config)
@@ -1095,6 +1154,7 @@ class KimiDecoderLayer(nn.Module):
                 config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.block_sparse_moe",
+                alt_stream=alt_stream,
             )
         else:
             self.mlp = KimiMLP(
@@ -1285,12 +1345,21 @@ class KimiLinearModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
+        # Shared second stream for dual-stream MoE (shared-expert GEMMs overlap the
+        # routed path). Created once and threaded into every decoder layer; only
+        # used when the model has shared experts.
+        self.alt_stream = None
+        if getattr(config, "num_shared_experts", 0):
+            self.alt_stream = torch.cuda.Stream()
+        _alt_stream = self.alt_stream
+
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix, layer_num=None: KimiDecoderLayer(
                 atom_config,
                 prefix=prefix,
                 layer_num=layer_num or 0,
+                alt_stream=_alt_stream,
             ),
             prefix=f"{prefix}.layers",
             layer_num_offset=0,
