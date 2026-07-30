@@ -216,6 +216,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # defaults off. Pipelining only pays off at small T, which takes the split
     # path anyway, so 1 costs no measurable throughput.
     "ATOM_K3_ATTN_RES_NS": lambda: int(os.getenv("ATOM_K3_ATTN_RES_NS", "1") or "1"),
+    # Sub-batch size for the Kimi-K3 routed-MoE block. The gfx1250 grouped MoE +
+    # MXFP4 latent projections are only numerically correct at small M: a large
+    # prefill either OOB-faults (contiguous-M path) or silently returns wrong
+    # values (non-contiguous path). The block is per-token independent, so
+    # splitting into <=N-token sub-batches is numerically identical and keeps
+    # every kernel at a correct M. 0 (default) = no splitting; gfx1250 needs 128.
+    "ATOM_K3_MOE_CHUNK": lambda: int(os.getenv("ATOM_K3_MOE_CHUNK", "0") or "0"),
     # --- Attention Backend ---
     # Use unified_attention (flash-style) for MHA paged/prefill attention instead
     # of pa_decode_gluon. Set to 1 to enable the unified_attention path.

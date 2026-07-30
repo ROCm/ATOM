@@ -51,7 +51,7 @@ from atom.models.utils import (
     make_layers,
     maybe_prefix,
 )
-from atom.utils import mark_spliting_op
+from atom.utils import envs, mark_spliting_op
 from atom.utils.decorators import support_torch_compile
 from atom.utils.forward_context import get_forward_context
 
@@ -276,6 +276,9 @@ class KimiSparseMoeBlock(nn.Module):
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_token
         self.tp_size = get_tensor_model_parallel_world_size()
+        # Read once here rather than per forward: the MoE block sits on the
+        # decode hot path, once per layer per step.
+        self.moe_chunk = envs.ATOM_K3_MOE_CHUNK
         self.use_latent_moe = (
             getattr(config, "routed_expert_hidden_size", None) is not None
         )
@@ -366,6 +369,23 @@ class KimiSparseMoeBlock(nn.Module):
             )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # gfx1250 work-around (REQUIRED for correctness, not just stability): the
+        # grouped MoE + MXFP4 latent projections are only numerically correct at
+        # small M there -- at large prefill M the contiguous-M path OOB-faults AND
+        # the non-contiguous path returns coherent-but-wrong values (gsm8k 0.0).
+        # The MoE block is per-token independent, so splitting a large prefill
+        # into <=chunk sub-batches is numerically identical and gives every
+        # kernel a small, correct M. Whole-prompt prefill is preserved (MLA still
+        # sees the full batch). Off by default (ATOM_K3_MOE_CHUNK=0); remove once
+        # the gfx1250 MoE kernel is fixed at large M.
+        chunk = self.moe_chunk
+        n = hidden_states.shape[0]
+        if chunk > 0 and n > chunk:
+            outs = [
+                self._forward_impl(hidden_states[i : i + chunk])
+                for i in range(0, n, chunk)
+            ]
+            return torch.cat(outs, dim=0)
         return self._forward_impl(hidden_states)
 
     def _forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
