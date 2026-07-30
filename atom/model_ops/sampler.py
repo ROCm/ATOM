@@ -73,6 +73,14 @@ class Sampler(nn.Module):
         Returns:
             Sampled token IDs (num_tokens,)
         """
+        # ``prepare_sample`` preserves a CPU-side greedy flag before it clamps
+        # zero temperatures to ``SAMPLER_EPS`` for GPU kernels.  Honour that
+        # flag before either sampling path: without this, a request with
+        # ``temperature=0`` and no top-k/top-p filters reaches Gumbel-max with
+        # epsilon temperature instead of taking the documented argmax path.
+        if all_greedy:
+            return logits.argmax(dim=-1).to(torch.int)
+
         # No Top-K Top-P parameters, perform temperature-based sampling
         if not self._needs_filtering(top_ks, top_ps):
             return self._temperature_sample(
