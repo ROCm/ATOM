@@ -2216,8 +2216,6 @@ class ModelRunner:
             # Context default — otherwise single-GPU/TP-only decode would
             # be forced into eager and lose the CUDAGraph decode path.
             self._dspark_decode_replay = True
-            # No DP sync here: leave the EPLB prefill hint unset so the gate
-            # self-computes over the migration group (or uses the local flag).
             self._eplb_any_rank_has_prefill = None
             return (
                 num_input_tokens,

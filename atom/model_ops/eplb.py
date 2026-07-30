@@ -2592,8 +2592,7 @@ if _EPLB_HAS_TRITON:
         bin_idx = tl.where(in_range, phys, num_physical).to(tl.int32)
         hist = tl.histogram(bin_idx, NUM_BINS)
         bins = tl.arange(0, NUM_BINS)
-        hmask = (bins < num_physical) & (hist > 0)
-        tl.atomic_add(load_ptr + bins, hist, mask=hmask)
+        tl.atomic_add(load_ptr + bins, hist, mask=bins < num_physical)
 
 
 def eplb_map_and_record_fused(layer: Any, topk_ids: torch.Tensor) -> torch.Tensor:
