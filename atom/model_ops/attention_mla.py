@@ -239,6 +239,7 @@ def _ds32_store_kv(
         BLOCK=512,
     )
 
+
 if False:
     try:
         from aiter.ops.triton.fused_gemm_a8w8_blockscale_split_cat import (
@@ -571,9 +572,7 @@ class MLAAttention(nn.Module):
                     f"{dtype}, got {None if tensor is None else (tensor.shape, tensor.dtype, tensor.stride())}."
                 )
 
-    def _ds32_quantize_nope(
-        self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def _ds32_quantize_nope(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Quantize a 512-wide MLA latent to MXFP8 with per-1x32 E8M0 scales."""
         shape = x.shape
         if shape[-1] != _DS32_NOPE_DIM:
