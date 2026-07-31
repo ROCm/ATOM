@@ -3,6 +3,7 @@
 """Inference-only MiMo-V2 MTP (Multi-Token Prediction) model."""
 
 import re
+from typing import ClassVar
 
 import torch
 from torch import nn
@@ -317,7 +318,12 @@ class MiMoV2MTP(nn.Module):
         return self.lm_head.compute_argmax_token(hidden_states)
 
     _MTP_PATTERN = re.compile(r"model\.mtp\.layers\.(\d+)\.")
-    _PREDICTOR_KEYS = {"enorm", "hnorm", "eh_proj", "final_layernorm"}
+    _PREDICTOR_KEYS: ClassVar[set[str]] = {
+        "enorm",
+        "hnorm",
+        "eh_proj",
+        "final_layernorm",
+    }
 
     def remap_mtp_weight_name(self, name: str) -> str | None:
         """Remap checkpoint MTP weight names to model parameter names.
