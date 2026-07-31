@@ -19,7 +19,7 @@ Caller contract (per op): the module registered at `layer_name` must expose
 the methods listed in each op's docstring.
 
 Currently registered:
-  - torch.ops.aiter.maybe_dual_stream_forward — V2/V3.2/V4 MoE
+  - torch.ops.aiter.maybe_dual_stream_forward — V2/V3.2/V4/K3 MoE
   - torch.ops.aiter.indexer_score_topk       — V4 sparse indexer
 """
 
@@ -30,7 +30,7 @@ from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 
 # ---------------------------------------------------------------------------
-# Dual-stream MoE dispatch (V2 / V3.2 / V4)
+# Dual-stream MoE dispatch (V2 / V3.2 / V4 / K3)
 # ---------------------------------------------------------------------------
 #
 # Caller contract (the MoE module looked up by `layer_name`):

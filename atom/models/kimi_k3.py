@@ -498,26 +498,53 @@ class KimiSparseMoeBlock(nn.Module):
         return routed_output
 
     def dual_stream_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # Shared-expert GEMMs run on alt_stream, overlapping the routed path on the
-        # main stream. Both all_reduces stay serial on the main stream: the single
-        # TP communicator (get_tp_group()) cannot service two concurrent
-        # collectives without an RCCL deadlock/corruption hazard.
-        identity = hidden_states
+        # Shared-expert GEMMs run on alt_stream while the routed path runs on the
+        # current stream. The latent path preserves routed AR -> shared AR order
+        # on the single TP communicator while overlapping shared AR with routed
+        # post-AR work.
         current = torch.cuda.current_stream()
         alt = self.alt_stream
         alt.wait_stream(current)
-        routed_output = self.routed_expert_forward(hidden_states)
-        with torch.cuda.stream(alt):
-            # GEMM only — NO all_reduce inside the alt-stream block.
-            shared_output = self.shared_experts(identity)
-        current.wait_stream(alt)
+
         if self.use_latent_moe:
-            # shared branch is TP-partial; reduce it now on the main stream, after
-            # the routed AR completed — one collective at a time on the TP comm.
+            router_logits = self.gate(hidden_states)
+            routed_input = self.routed_expert_down_proj(hidden_states)
+            routed_output = self.experts(routed_input, router_logits)
+        else:
+            routed_output = self.routed_expert_forward(hidden_states)
+
+        with torch.cuda.stream(alt):
+            shared_output = self.shared_experts(hidden_states)
+
+        if self.use_latent_moe:
             if self.tp_size > 1:
-                shared_output = tensor_model_parallel_all_reduce(shared_output)
+                routed_output = tensor_model_parallel_all_reduce(routed_output)
+
+                # Record the dependency while routed AR is the current-stream
+                # tail, excluding the routed post-work enqueued below.
+                alt.wait_stream(current)
+
+            if self.routed_expert_norm is not None:
+                routed_output = self.routed_expert_norm(routed_output)
+            if isinstance(routed_output, tuple):
+                routed_output, routed_output_scale = routed_output
+                routed_output = self.routed_expert_up_proj(
+                    routed_output,
+                    x_scale=routed_output_scale,
+                )
+            else:
+                routed_output = self.routed_expert_up_proj(routed_output)
+
+            if self.tp_size > 1:
+                with torch.cuda.stream(alt):
+                    shared_output = tensor_model_parallel_all_reduce(shared_output)
+
+            current.wait_stream(alt)
+            shared_output.record_stream(current)
             return routed_output + shared_output
+
         # Non-latent: shared has no AR yet; single deferred AR over the sum.
+        current.wait_stream(alt)
         routed_output = routed_output + shared_output
         if self.tp_size > 1:
             routed_output = tensor_model_parallel_all_reduce(routed_output)
