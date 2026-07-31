@@ -28,7 +28,11 @@ from atom.distributed.pcp_utils import (
     pcp_round_robin_query_indices,
 )
 from atom.model_engine.scheduler import ScheduledBatch
-from atom.model_ops.attention_mla import _MLA_MIN_HEADS, MLAAttention
+from atom.model_ops.attention_mla import (
+    _DS32_CACHE_BYTES,
+    _MLA_MIN_HEADS,
+    MLAAttention,
+)
 from atom.utils import CpuGpuBuffer, envs
 from atom.utils.block_convert import (
     kv_indices_generate_triton,
@@ -158,11 +162,26 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         config = model_runner.config
         hf_config = config.hf_config
         # `self.num_attention_heads` set by CommonAttentionBuilder.__init__.
-        self.padded_num_attention_heads = max(self.num_attention_heads, _MLA_MIN_HEADS)
         self.is_sparse = model_runner.is_deepseek_v32
         self.index_topk = hf_config.index_topk if self.is_sparse else -1
         self.dtype_kv = dtypes.d_dtypes[config.kv_cache_dtype]
         self.dtype_q = self.dtype_kv
+        # Keep cache allocation and metadata in sync with MLAAttention:
+        # DS32 is DPA-specific; PCP-only retains the legacy MLA cache layout.
+        self.use_ds32 = (
+            config.enable_dp_attention
+            and self.is_sparse
+            and self.dtype_kv == dtypes.fp8
+            and getattr(hf_config, "model_type", None) == "glm_moe_dsa"
+            and getattr(hf_config, "kv_lora_rank", None) == 512
+            and getattr(hf_config, "qk_rope_head_dim", None) == 64
+        )
+        min_mla_heads = (
+            128
+            if self.use_ds32
+            else _MLA_MIN_HEADS
+        )
+        self.padded_num_attention_heads = max(self.num_attention_heads, min_mla_heads)
 
         self.dcp_world_size = get_dcp_world_size()
         self.dcp_rank = get_dcp_rank()
@@ -833,7 +852,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         total_num_layers = runner._get_total_num_layers()
         kv_dtype_size = dtypes.d_dtypes[config.kv_cache_dtype].itemsize
 
-        block_bytes = total_num_layers * runner.block_size * 576 * kv_dtype_size
+        kv_entry_bytes = _DS32_CACHE_BYTES if self.use_ds32 else 576 * kv_dtype_size
+        block_bytes = total_num_layers * runner.block_size * kv_entry_bytes
         if runner.is_deepseek_v32:
             index_dim = hf_config.index_head_dim + 4
             aligned_index_dim = ((index_dim + 15) // 16) * 16
@@ -859,16 +879,34 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         config = runner.config
         hf_config = config.hf_config
         total_num_layers = runner._get_total_num_layers()
-        out: dict = {
-            "kv_cache": torch.zeros(
+        if self.use_ds32:
+            cache_prefix = (
                 total_num_layers,
                 runner.num_physical_kvcache_blocks,
                 runner.physical_block_size,
-                576,
-                dtype=dtypes.d_dtypes[config.kv_cache_dtype],
-                device="cuda",
-            ),
-        }
+            )
+            out: dict = {
+                "kv_cache": torch.zeros(
+                    *cache_prefix, 512, dtype=dtypes.fp8, device="cuda"
+                ),
+                "kv_scale_cache": torch.zeros(
+                    *cache_prefix, 16, dtype=torch.uint8, device="cuda"
+                ),
+                "kv_rope_cache": torch.zeros(
+                    *cache_prefix, 64, dtype=torch.bfloat16, device="cuda"
+                ),
+            }
+        else:
+            out = {
+                "kv_cache": torch.zeros(
+                    total_num_layers,
+                    runner.num_physical_kvcache_blocks,
+                    runner.physical_block_size,
+                    576,
+                    dtype=dtypes.d_dtypes[config.kv_cache_dtype],
+                    device="cuda",
+                ),
+            }
         if runner.is_deepseek_v32:
             # Align last dimension to 16 bytes for fp8 (1 byte per element)
             # to avoid unaligned memory access in torch inductor.
@@ -905,11 +943,17 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             return None
 
         runner = self.model_runner
-        kv_cache = runner.kv_cache[layer_id].view(
-            runner.num_physical_kvcache_blocks * runner.physical_block_size,
-            1,
-            576,
+        num_slots = (
+            runner.num_physical_kvcache_blocks * runner.physical_block_size
         )
+        if self.use_ds32:
+            kv_cache = runner.kv_cache[layer_id].view(num_slots, 512)
+            kv_scale = runner.kv_scale_cache[layer_id].view(num_slots, 16)
+            kv_rope = runner.kv_rope_cache[layer_id].view(num_slots, 64)
+        else:
+            kv_cache = runner.kv_cache[layer_id].view(num_slots, 1, 576)
+            kv_scale = None
+            kv_rope = None
         module.max_model_len = runner.config.max_model_len
         if runner.is_deepseek_v32 and module.indexer is not None:
             # Use aligned dimension to avoid memory copy in torch inductor
@@ -925,8 +969,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         return KVCacheTensor(
             layer_num=layer_id,
             k_cache=kv_cache,
-            v_cache=None,
-            k_scale=None,
+            v_cache=kv_rope,
+            k_scale=kv_scale,
             v_scale=None,
             index_cache=index_cache,
         )
@@ -953,6 +997,20 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     unit_bytes=bpb,
                 )
             )
+
+        if self.use_ds32:
+            for cache_name in ("kv_scale_cache", "kv_rope_cache"):
+                cache = getattr(runner, cache_name)
+                for layer_id in range(cache.shape[0]):
+                    t = cache[layer_id]
+                    bpb = t.stride(0) * t.element_size() * self.block_ratio
+                    block_regions.append(
+                        KVTransferRegion(
+                            base_addr=t.data_ptr(),
+                            total_bytes=t.numel() * t.element_size(),
+                            unit_bytes=bpb,
+                        )
+                    )
 
         if hasattr(runner, "index_cache"):
             for layer_id in range(runner.index_cache.shape[0]):
