@@ -709,14 +709,6 @@ class LinearBase(nn.Module):
         }
 
     def process_weights_after_loading(self):
-        # Empty fused shell: a container module already folded this Linear's
-        # weight into a sibling and released the storage (weight.data =
-        # new_empty(0)) -- e.g. KDA b_proj / f_a_proj, whose weights
-        # KimiKDAAttention.process_weights_after_loading concatenates into in_proj.
-        # Such a shell is never called at runtime, so skip all post-load work.
-        # In particular this avoids online-requantizing a 0-element weight (which
-        # would be wasted work, misreport in the online-quant summary, and can
-        # produce degenerate scale tensors).
         if self.weight.numel() == 0:
             return
         # Re-quantize before process_weights if online quantization is enabled
