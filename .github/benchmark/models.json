@@ -318,37 +318,37 @@
           "conc_max": 256
         },
         {
-          "label": "DSpark5",
-          "suffix": "-dspark5",
+          "label": "DSpark7",
+          "suffix": "-dspark7",
           "path": "deepseek-ai/DeepSeek-V4-Pro-DSpark",
-          "extra_args": "--method dspark --num-speculative-tokens 5 --cudagraph-mode PIECEWISE --dspark-config '{\"confidence_schedule\": true, \"ragged\": true, \"ragged_graph_sizes\": \"6\"}'",
+          "extra_args": "--method dspark --num-speculative-tokens 7 --cudagraph-mode PIECEWISE --dspark-config '{\"confidence_schedule\": true, \"ragged\": true, \"ragged_graph_sizes\": \"8\"}'",
           "bench_args": "--use-chat-template",
           "conc_min": 4,
           "conc_max": 256
         },
         {
-          "label": "DPA DSpark5",
-          "suffix": "-dpa-dspark5",
+          "label": "DPA DSpark7",
+          "suffix": "-dpa-dspark7",
           "path": "deepseek-ai/DeepSeek-V4-Pro-DSpark",
-          "extra_args": "--method dspark --num-speculative-tokens 5 --cudagraph-mode PIECEWISE --enable-dp-attention --dspark-config '{\"confidence_schedule\": true, \"ragged\": true, \"ragged_graph_sizes\": \"6\"}'",
+          "extra_args": "--method dspark --num-speculative-tokens 7 --cudagraph-mode PIECEWISE --enable-dp-attention --dspark-config '{\"confidence_schedule\": true, \"ragged\": true, \"ragged_graph_sizes\": \"8\"}'",
           "bench_args": "--use-chat-template",
           "conc_min": 64,
           "conc_max": 256
         },
         {
-          "label": "DSpark5 FULL",
-          "suffix": "-dspark5-full",
+          "label": "DSpark7 FULL",
+          "suffix": "-dspark7-full",
           "path": "deepseek-ai/DeepSeek-V4-Pro-DSpark",
-          "extra_args": "--method dspark --num-speculative-tokens 5 --cudagraph-mode FULL --dspark-config '{\"confidence_schedule\": true, \"ragged\": true, \"ragged_graph_sizes\": \"6\"}'",
+          "extra_args": "--method dspark --num-speculative-tokens 7 --cudagraph-mode FULL --dspark-config '{\"confidence_schedule\": true, \"ragged\": true, \"ragged_graph_sizes\": \"8\"}'",
           "bench_args": "--use-chat-template",
           "conc_min": 4,
           "conc_max": 256
         },
         {
-          "label": "DPA DSpark5 FULL",
-          "suffix": "-dpa-dspark5-full",
+          "label": "DPA DSpark7 FULL",
+          "suffix": "-dpa-dspark7-full",
           "path": "deepseek-ai/DeepSeek-V4-Pro-DSpark",
-          "extra_args": "--method dspark --num-speculative-tokens 5 --cudagraph-mode FULL --enable-dp-attention --dspark-config '{\"confidence_schedule\": true, \"ragged\": true, \"ragged_graph_sizes\": \"6\"}'",
+          "extra_args": "--method dspark --num-speculative-tokens 7 --cudagraph-mode FULL --enable-dp-attention --dspark-config '{\"confidence_schedule\": true, \"ragged\": true, \"ragged_graph_sizes\": \"8\"}'",
           "bench_args": "--use-chat-template",
           "conc_min": 64,
           "conc_max": 256
