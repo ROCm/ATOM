@@ -822,7 +822,10 @@ class KimiKDAAttention(nn.Module):
         f_a = fused_in[..., 4 * lp + nlh : 4 * lp + nlh + hd].contiguous()
         gate = self.f_b_proj(f_a)
         gate = rearrange(gate, "t (h d) -> 1 t h d", d=self.head_dim)
-        out = hidden_states.new_empty(
+        # Full CUDA-graph decode compacts recurrent metadata to real requests,
+        # so no kernel program writes the padded tail rows. Keep those rows
+        # neutral instead of exposing stale allocator contents downstream.
+        out = hidden_states.new_zeros(
             (num_actual_tokens, self.num_local_heads, self.head_dim)
         )
 

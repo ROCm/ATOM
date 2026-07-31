@@ -118,10 +118,6 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             )
             # Skip if state index is invalid (PAD_SLOT_ID = -1)
             if state_idx < 0:
-                # CUDA-graph padding rows are still consumed by downstream
-                # layers. Define their recurrence output instead of exposing
-                # stale allocator contents from the caller's output buffer.
-                tl.store(p_o, 0.0, mask=mask_v)
                 return
             p_h0 = h0 + state_idx * stride_init_state_token
         else:
