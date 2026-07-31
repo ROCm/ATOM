@@ -804,13 +804,12 @@ class LinearBase(nn.Module):
                     self, "needs_preshuffled_weight", False
                 ):
                     need_shuffle = True
-            if need_shuffle:
-                if self.weight.dim() == 2:
-                    # a8w8 (per_Token fp8) bpreshuffle needs an N-tile-aligned
-                    # output; pad a misaligned fused N (e.g. KDA in_proj) before
-                    # shuffling so the padded rows land in the shuffled layout too.
-                    self._maybe_pad_a8w8_preshuffle_output()
-                    shuffle_weights(self.weight)
+            if need_shuffle and self.weight.dim() == 2:
+                # a8w8 (per_Token fp8) bpreshuffle needs an N-tile-aligned
+                # output; pad a misaligned fused N (e.g. KDA in_proj) before
+                # shuffling so the padded rows land in the shuffled layout too.
+                self._maybe_pad_a8w8_preshuffle_output()
+                shuffle_weights(self.weight)
                 # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
         # shuffle weight scale once so no reshuffling for every gemm
         if self.quant_type == QuantType.per_1x32 and (
