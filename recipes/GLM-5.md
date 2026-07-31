@@ -6,12 +6,12 @@
 
 Here is the support matrix for GLM-5.2 across different hardware platforms:
 
-| Hardware | Data Type | Model | Parallelism | MTP Support | Recipe Section |
-| --- | --- | --- | --- | --- | --- |
-| MI355 | FP4 | [amd/GLM-5.2-MXFP4](https://huggingface.co/amd/GLM-5.2-MXFP4) | TP4 | ✅ | [MI355 FP4](#mi355-fp4) |
-| MI355 | FP8 | [zai-org/GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) | TP4 | ✅ | [MI355 FP8](#mi355-fp8) |
-| MI300X | FP8 | [zai-org/GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) | TP8 | ✅ | [MI300X / MI308X FP8](#mi300x-mi308x-fp8) |
-| MI308X | FP8 | [zai-org/GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) | TP8 | ✅ | [MI300X / MI308X FP8](#mi300x-mi308x-fp8) |
+| Hardware | Data Type | Model | Parallelism | MTP Support | DPA Support | Recipe Section |
+| --- | --- | --- | --- | --- | --- | --- |
+| MI355 | FP4 | [amd/GLM-5.2-MXFP4](https://huggingface.co/amd/GLM-5.2-MXFP4) | TP4 | ✅ | ✅ TP4/TP8 | [MI355 FP4](#mi355-fp4) |
+| MI355 | FP8 | [zai-org/GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) | TP4 | ✅ | ⚠️ Not validated | [MI355 FP8](#mi355-fp8) |
+| MI300X | FP8 | [zai-org/GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) | TP8 | ✅ | ❌ | [MI300X / MI308X FP8](#mi300x-mi308x-fp8) |
+| MI308X | FP8 | [zai-org/GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) | TP8 | ✅ | ❌ | [MI300X / MI308X FP8](#mi300x-mi308x-fp8) |
 
 ## Preparing environment
 Pull the latest docker from https://hub.docker.com/r/rocm/atom-dev/ :
@@ -45,6 +45,50 @@ python -m atom.entrypoints.openai_server \
   --online_quant_config '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "*.mlp.gate", "*expert*"]}' \
   -tp $TP 2>&1 | tee server.log &
 ```
+
+#### GLM-5.2 MXFP4 with DPA
+
+The native ATOM backend supports GLM-5.2 MXFP4 with Data Parallel Attention (DPA) and an FP8 KV cache on MI355/gfx950.
+
+Use `-tp 4` or `-tp 8` for the validated TP4 and TP8 configurations:
+
+```bash
+MODEL_PATH=amd/GLM-5.2-MXFP4
+
+python3 -m atom.entrypoints.openai_server \
+  --model ${MODEL_PATH} \
+  --host 0.0.0.0 \
+  --trust-remote-code \
+  --kv_cache_dtype fp8 \
+  --block-size 16 \
+  --gpu-memory-utilization 0.9 \
+  --online_quant_config \
+    '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","*expert*"]}' \
+  --server-port 8010 \
+  -tp <4-or-8> \
+  --max-num-seqs 512 \
+  --enable-dp-attention \
+  --attn-prefill-chunk-size 131072 \
+  --long-prefill-token-threshold 131072
+```
+
+The full 1319-sample GSM8K 20-shot evaluation with 65 concurrent requests produced the following results:
+
+TP4 + DPA:
+
+|Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
+|-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
+|gsm8k|      3|flexible-extract|    20|exact_match|↑  |0.9265|±  |0.0072|
+|     |       |strict-match    |    20|exact_match|↑  |0.9280|±  |0.0071|
+
+TP8 + DPA:
+
+|Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
+|-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
+|gsm8k|      3|flexible-extract|    20|exact_match|↑  |0.9340|±  |0.0068|
+|     |       |strict-match    |    20|exact_match|↑  |0.9363|±  |0.0067|
+
+DPA cannot currently be combined with PCP. PCP-only continues to use the existing MLA/PCP path.
 
 #### GLM-5.2 MXFP4 MTP Server
 
