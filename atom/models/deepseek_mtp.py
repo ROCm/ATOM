@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import Optional, Union
 
 import torch
-import torch.nn as nn
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
+from torch import nn
+from transformers import DeepseekV2Config, DeepseekV3Config, PretrainedConfig
+
 from atom.config import Config, QuantizationConfig
 from atom.model_ops.embed_head import (
     ParallelLMHead,
@@ -15,11 +16,10 @@ from atom.model_ops.layernorm import RMSNorm, fused_dual_rmsnorm_cat
 from atom.model_ops.linear import ReplicatedLinear
 from atom.model_ops.moe import FusedMoE
 from atom.models.utils import IntermediateTensors
-
 from atom.utils.decorators import support_torch_compile
-from transformers import DeepseekV2Config, DeepseekV3Config, PretrainedConfig
 
 from .deepseek_v2 import (
+    ENABLE_ALLREDUCE_RMSNORM_FUSION,
     DeepseekV2DecoderLayer,
     _can_fuse_indexer_wk_weights_proj,
     use_replicated_vocab_embed,
@@ -32,7 +32,7 @@ class SharedHead(nn.Module):
         self,
         config: PretrainedConfig,
         prefix: str,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__()
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -53,7 +53,7 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         atom_config: Config,
         prefix: str,
         layer_idx: int,
-        alt_stream: Optional[torch.cuda.Stream] = None,
+        alt_stream: torch.cuda.Stream | None = None,
     ) -> None:
         super().__init__()
 
@@ -110,8 +110,15 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         hidden_states, residual = self.mtp_block(
             positions=positions, hidden_states=hidden_states, residual=None
         )
-        # mtp always has input_layernorm fused_allreduce off
-        hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        # mtp_block's mlp is built with `reduce_results=not fuse_ar_input_norm`
+        # (deepseek_v2.py), where fuse_ar_input_norm is the fusion env and is NOT
+        # overridden for is_mtp_block. So the mlp leaves an un-reduced TP partial
+        # sum only when the fusion is ON -- normally the NEXT layer's fused
+        # input_layernorm completes it, but the MTP block is last, so we do it
+        # here. With the fusion OFF the mlp already reduced internally, and
+        # reducing again scales the block output by tp_size.
+        if ENABLE_ALLREDUCE_RMSNORM_FUSION:
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states
 
@@ -127,7 +134,7 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         config = atom_config.hf_config
         self.mtp_start_layer_idx = config.num_hidden_layers
         self.num_mtp_layers = config.num_nextn_predict_layers
-        self.alt_stream: Optional[torch.cuda.Stream] = (
+        self.alt_stream: torch.cuda.Stream | None = (
             torch.cuda.Stream()
             if torch.cuda.is_available()
             and getattr(config, "n_shared_experts", None) is not None
@@ -365,8 +372,8 @@ class DeepSeekMTP(nn.Module):
 
 
 def get_spec_layer_idx_from_weight_name(
-    config: Union[DeepseekV2Config, DeepseekV3Config], weight_name: str
-) -> Optional[int]:
+    config: DeepseekV2Config | DeepseekV3Config, weight_name: str
+) -> int | None:
     if (
         hasattr(config, "num_nextn_predict_layers")
         and config.num_nextn_predict_layers > 0
