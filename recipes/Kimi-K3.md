@@ -30,7 +30,8 @@ python -m atom.entrypoints.openai_server \
   --max-num-batched-tokens 16384 \
   --gpu-memory-utilization 0.93 \
   --block-size 128 \
-  --no-enable_prefix_caching
+  --no-enable_prefix_caching \
+  --online_quant_config '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "*self_attn.[qkv]_conv1d*", "*block_sparse_moe.experts*", "*block_sparse_moe.routed_expert_*", "*vision_tower*", "*mm_projector*"]}'
 ```
 
 Kimi full-attention layers use true MLA with a compressed latent KV cache. Aiter MLA is selected by default; `ATOM_USE_TRITON_MLA=1` selects the Triton MLA implementation when that configuration has been validated.
