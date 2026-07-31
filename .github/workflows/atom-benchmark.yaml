@@ -58,6 +58,10 @@ on:
         description: "Benchmark Llama-3.3-70B-Instruct-MXFP4"
         type: boolean
         default: true
+      dspark-test:
+        description: "Benchmark DeepSeek-V4-Pro DSpark Test (MTP1 + DSpark k=5, TP/DPA, PIECEWISE/FULL)"
+        type: boolean
+        default: true
       extra_args:
         description: "Extra arguments to pass to the ATOM server"
         type: string
