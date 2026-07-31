@@ -10,10 +10,10 @@ import pickle
 import queue
 import weakref
 from threading import Lock, Thread
-from typing import List, Optional
 
 import zmq
 import zmq.asyncio
+
 from atom.config import Config
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.sequence import Sequence
@@ -38,7 +38,10 @@ class CoreManager:
     def __init__(self, config: Config):
         self.label = "Engine Core Mgr"
         self._closed = False  # Track whether already closed
+        pp_size = config.pipeline_parallel_size
+        self.pp_size = pp_size
         if config.enable_dp_attention:
+            assert pp_size == 1, "Pipeline parallel + DP-attention is not supported yet"
             self.local_engine_count = (
                 config.tensor_parallel_size * config.parallel_config.data_parallel_size
             )
@@ -48,9 +51,22 @@ class CoreManager:
             config.parallel_config.data_parallel_size = self.local_engine_count
             config.tensor_parallel_size = 1
         else:
-            self.local_engine_count = config.parallel_config.data_parallel_size
+            dp_size = config.parallel_config.data_parallel_size
+            assert not (
+                pp_size > 1 and dp_size > 1
+            ), "Pipeline parallel combined with data parallel is not supported yet."
+            # One EngineCore per (dp_rank, pp_rank) stage.
+            self.local_engine_count = dp_size * pp_size
+        # Inter-stage ZMQ channels (head<->downstream metadata, last->head
+        # tokens), shared across the single dp group. PP+DP would need per-group
+        # sets — deferred with the assertion above.
+        self.pp_meta_addrs = []
+        self.pp_token_addr = ""
+        if pp_size > 1:
+            self.pp_meta_addrs = [get_open_zmq_ipc_path() for _ in range(pp_size)]
+            self.pp_token_addr = get_open_zmq_ipc_path()
         self.ctx = zmq.Context(io_threads=2)
-        self.outputs_queue = queue.Queue[List[Sequence]]()
+        self.outputs_queue = queue.Queue[list[Sequence]]()
         self.stream_outputs_queue = queue.Queue()
         self.utility_response_queue = queue.Queue()
         self._seq_id_to_callback = {}
@@ -94,16 +110,23 @@ class CoreManager:
         local_dp_ranks = []
 
         try:
-            for dp_rank in range(self.local_engine_count):
+            for engine_index in range(self.local_engine_count):
+                dp_rank = engine_index // self.pp_size
+                pp_rank = engine_index % self.pp_size
                 logger.info(
-                    f"{self.label}: Creating EngineCore for DP rank {dp_rank}/{self.local_engine_count}"
+                    f"{self.label}: Creating EngineCore engine {engine_index}"
+                    f" (dp={dp_rank}, pp={pp_rank}) of {self.local_engine_count}"
                 )
 
-                # Create config for this DP rank
+                # Create config for this (dp, pp) stage
                 import copy
 
                 rank_config = copy.deepcopy(config)
                 rank_config.parallel_config.data_parallel_rank = dp_rank
+                rank_config.parallel_config.pipeline_parallel_rank = pp_rank
+                if self.pp_size > 1:
+                    rank_config.parallel_config.pp_meta_addrs = self.pp_meta_addrs
+                    rank_config.parallel_config.pp_token_addr = self.pp_token_addr
 
                 engine_core_process, addresses, local_dp_rank = launch_engine_core(
                     rank_config, dp_rank
@@ -285,6 +308,20 @@ class CoreManager:
                                 logger.debug(
                                     f"{self.label}: Cleaned up callback for finished sequence {seq_id}"
                                 )
+                        # Batched stream dispatch: the per-seq callbacks only buffer
+                        # their chunks into a thread-local; flush the whole step's
+                        # buffer into the per-request asyncio queues now (one
+                        # call_soon_threadsafe per loop). Resolved lazily by the API
+                        # server to avoid the api_server <-> engine_core_mgr import
+                        # cycle. No-op when no streaming request is in flight.
+                        if self._flush_stream_batch_fn is not None:
+                            try:
+                                self._flush_stream_batch_fn()
+                            except Exception as e:
+                                logger.warning(
+                                    f"{self.label}: flush_stream_batch failed: {e}",
+                                    exc_info=True,
+                                )
                     elif request_type == EngineCoreRequestType.UTILITY_RESPONSE:
                         self.utility_response_queue.put_nowait(data)
                     elif request_type == EngineCoreRequestType.ADD:
@@ -335,7 +372,7 @@ class CoreManager:
                 break
             await self.async_output_queue.put(seqs)
 
-    async def get_output_async(self) -> List[Sequence]:
+    async def get_output_async(self) -> list[Sequence]:
         if not self.async_output_queue:
             raise RuntimeError("Engine async mode not enabled")
 
@@ -410,7 +447,7 @@ class CoreManager:
 
         logger.info(f"{self.label}: All EngineCores shut down")
 
-    def add_request(self, seqs: List[Sequence]):
+    def add_request(self, seqs: list[Sequence]):
         logger.debug(
             f"{self.label}: Add request, sequence ids: {[seq.id for seq in seqs]}"
         )
@@ -419,7 +456,18 @@ class CoreManager:
             if seq.stream_callback is not None:
                 self._seq_id_to_callback[seq.id] = seq.stream_callback
                 seq.stream_callback = None
-        if self.local_engine_count == 1:
+        if self.pp_size > 1:
+            # Pipeline parallel (dp=1): requests enter only at stage 0, which
+            # drives the pipeline downstream.
+            logger.debug(f"{self.label}: Add {len(seqs)} requests to PP head 0")
+            self.input_sockets[0].send_multipart(
+                [
+                    self.engine_core_identities[0],
+                    pickle.dumps((EngineCoreRequestType.ADD, seqs)),
+                ],
+                copy=False,
+            )
+        elif self.local_engine_count == 1:
             # Single DP rank, send all requests
             logger.debug(f"{self.label}: Add {len(seqs)} requests to DP rank 0")
             self.input_sockets[0].send_multipart(
@@ -432,7 +480,7 @@ class CoreManager:
         else:
             self._dispatch_to_dp_ranks(seqs)
 
-    def _resolve_and_validate_hints(self, seqs: List[Sequence]) -> List[Optional[int]]:
+    def _resolve_and_validate_hints(self, seqs: list[Sequence]) -> list[int | None]:
         """Resolve every seq's explicit ``data_parallel_rank`` hint and validate
         the whole batch, once.
 
@@ -444,7 +492,7 @@ class CoreManager:
         of a batch cannot leave earlier siblings charged-but-undispatched (a
         permanent in-flight-load leak).
         """
-        hints: List[Optional[int]] = []
+        hints: list[int | None] = []
         for seq in seqs:
             raw = getattr(seq, "data_parallel_rank", None)
             hint = None if raw is None else int(raw)
@@ -456,7 +504,7 @@ class CoreManager:
             hints.append(hint)
         return hints
 
-    def _dispatch_to_dp_ranks(self, seqs: List[Sequence]) -> None:
+    def _dispatch_to_dp_ranks(self, seqs: list[Sequence]) -> None:
         """Route a batch across DP ranks and send each rank its sub-batch.
 
         Honors an explicit ``data_parallel_rank`` hint; otherwise picks a rank
@@ -744,7 +792,7 @@ class CoreManager:
                     f"{self.label}: Error sending shutdown to DP rank {dp_rank}: {e}"
                 )
 
-    def get_output(self) -> List[Sequence]:
+    def get_output(self) -> list[Sequence]:
         seqs = self.outputs_queue.get()
         if isinstance(seqs, BaseException):
             raise seqs
@@ -894,7 +942,7 @@ class DisaggCoreManager(CoreManager):
         decode_input_addr = get_open_zmq_ipc_path()
         decode_output_addr = get_open_zmq_ipc_path()
 
-        from atom.model_engine.engine_core import PrefillEngineCore, DecodeEngineCore
+        from atom.model_engine.engine_core import DecodeEngineCore, PrefillEngineCore
 
         prefill_proc = multiprocessing.Process(
             target=PrefillEngineCore.run_engine,
@@ -1023,7 +1071,7 @@ class DisaggCoreManager(CoreManager):
                     f"{self.label}: process {idx} sent SHUTDOWN during initialization"
                 )
 
-    def add_request(self, seqs: List[Sequence]):
+    def add_request(self, seqs: list[Sequence]):
         """Fan-out: send every new sequence to BOTH prefill and decode."""
         logger.debug(f"{self.label}: fan-out {len(seqs)} seqs to prefill and decode")
         # Register stream callbacks before sending (decode will produce output).
