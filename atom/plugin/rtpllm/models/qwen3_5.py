@@ -1,6 +1,8 @@
 import json
 import logging
 import os
+import sys
+from contextlib import contextmanager
 from typing import Any
 
 import torch
@@ -466,9 +468,28 @@ class ATOMQwen35Moe(BaseModel):
     """Qwen3.5-MoE model class that starts ATOM runtime in rtp-llm."""
 
     @staticmethod
+    def _get_external_packages_from_args() -> list[str]:
+        option_name = "--external_model_packages"
+        argv = sys.argv[1:]
+        raw_value = ""
+
+        for idx, token in enumerate(argv):
+            if token == option_name:
+                if idx + 1 < len(argv) and not argv[idx + 1].startswith("-"):
+                    raw_value = argv[idx + 1]
+                break
+            if token.startswith(f"{option_name}="):
+                raw_value = token.split("=", 1)[1]
+                break
+
+        if not raw_value:
+            return []
+        return [item.strip() for item in raw_value.split(",") if item.strip()]
+
+    @staticmethod
     def _is_external_plugin_mode() -> bool:
-        modules = os.getenv("RTP_LLM_EXTERNAL_MODEL_PACKAGES", "")
-        return "atom.plugin.rtpllm.models" in modules
+        target = "atom.plugin.rtpllm.models"
+        return target in ATOMQwen35Moe._get_external_packages_from_args()
 
     @staticmethod
     def get_weight_cls():

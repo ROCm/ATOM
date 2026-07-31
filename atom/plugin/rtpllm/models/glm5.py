@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from typing import Any
 
 import torch
@@ -573,9 +574,28 @@ class ATOMGlm5Moe(DeepSeekV2):
     """GLM5 model class that starts ATOM runtime in rtp-llm plugin mode."""
 
     @staticmethod
+    def _get_external_packages_from_args() -> list[str]:
+        option_name = "--external_model_packages"
+        argv = sys.argv[1:]
+        raw_value = ""
+
+        for idx, token in enumerate(argv):
+            if token == option_name:
+                if idx + 1 < len(argv) and not argv[idx + 1].startswith("-"):
+                    raw_value = argv[idx + 1]
+                break
+            if token.startswith(f"{option_name}="):
+                raw_value = token.split("=", 1)[1]
+                break
+
+        if not raw_value:
+            return []
+        return [item.strip() for item in raw_value.split(",") if item.strip()]
+
+    @staticmethod
     def _is_external_plugin_mode() -> bool:
-        modules = os.getenv("RTP_LLM_EXTERNAL_MODEL_PACKAGES", "")
-        return "atom.plugin.rtpllm.models" in modules
+        target = "atom.plugin.rtpllm.models"
+        return target in ATOMGlm5Moe._get_external_packages_from_args()
 
     @classmethod
     def _create_config(cls, ckpt_path: str):
