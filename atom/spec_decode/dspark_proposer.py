@@ -557,6 +557,14 @@ class DSparkProposer(Drafter):
         # rebuilt per forward, the same reason `is_draft` above is not restored.
         forward_context.context.is_prefill = False
 
+        # NON-CAUSAL BLOCK: the DSpark block is trained bidirectionally -- every
+        # one of the T draft positions attends the whole block, not just its
+        # causal prefix. The asm/seg MLA decode kernels hard-code a causal mask,
+        # so flag this pass for the triton MLA decode kernel with causal=False
+        # (see attention_mla._forward_decode). Not restored, same rationale as
+        # is_prefill above: the metadata is rebuilt per target forward.
+        forward_context.attn_metadata.mla_non_causal = True
+
         dtype_q = self._blk_dtype_q
         if dtype_q is None:
             dtype_q, final = self._resolve_dtype_q(forward_context)

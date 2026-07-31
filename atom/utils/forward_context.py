@@ -404,6 +404,14 @@ class AttentionMetaData:
     num_cached_tokens: torch.Tensor | None = None
     seq_starts: torch.Tensor | None = None
 
+    # Non-causal MLA attention. Set by the DSpark block drafter for its single
+    # T-query block pass: the block is trained bidirectionally, so every draft
+    # position must attend the whole block, not just its causal prefix. Routes
+    # the decode to the triton MLA kernel with causal=False (the asm/seg decode
+    # paths hard-code a causal mask). Default False leaves every other path
+    # causal.
+    mla_non_causal: bool = False
+
     def __init__(
         self,
         cu_seqlens_q: torch.Tensor | None = None,
@@ -435,7 +443,9 @@ class AttentionMetaData:
         total_kv: int | None = None,
         num_cached_tokens: torch.Tensor | None = None,
         seq_starts: torch.Tensor | None = None,
+        mla_non_causal: bool = False,
     ):
+        self.mla_non_causal = mla_non_causal
         self.has_cached = has_cached
         self.total_kv = total_kv
         self.num_cached_tokens = num_cached_tokens

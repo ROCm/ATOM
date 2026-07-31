@@ -1036,7 +1036,37 @@ class MLAAttention(nn.Module):
 
         final_lse = None
 
-        if envs.ATOM_USE_TRITON_MLA and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
+        if getattr(attn_metadata, "mla_non_causal", False):
+            # DSpark block drafter: one non-causal T-query block pass. The block
+            # is trained bidirectionally, so every draft position attends the
+            # whole block, not just its causal prefix. The asm/seg decode kernels
+            # hard-code a causal mask, so this pass is routed to the triton MLA
+            # decode kernel with causal=False. The proposer built block_tables /
+            # context_lens / cu_seqlens_q against the standard paged block_size,
+            # which is exactly the (non-shuffled) layout this kernel reads.
+            d = self.kv_lora_rank + self.qk_rope_head_dim
+            block_size = get_current_atom_config().kv_cache_block_size
+            num_token_slots = kv_c_and_k_pe_cache.shape[0]
+            num_blocks = num_token_slots // block_size
+            # [num_token_slots, 1, d] -> [num_blocks, block_size, num_kv_heads=1, d]
+            kv_buffer = kv_c_and_k_pe_cache.view(num_blocks, block_size, 1, d)
+            triton_shuffle_mla_decode_fwd(
+                q,  # [num_tokens, num_query_heads, kv_lora_rank + qk_rope_head_dim]
+                kv_buffer,
+                o,
+                attn_metadata.cu_seqlens_q,
+                attn_metadata.context_lens,  # seqused_k
+                int(attn_metadata.max_seqlen_k),  # max_seqlen_kv
+                attn_metadata.block_tables,  # [bs, max_num_blocks_per_seq] (logical)
+                self.scale,
+                self.kv_lora_rank,
+                self.qk_rope_head_dim,
+                False,  # causal — DSpark block is bidirectional
+                self._q_scale,  # q_descale
+                self._k_scale,  # kv_descale
+                shuffled_kv_cache=False,
+            )
+        elif envs.ATOM_USE_TRITON_MLA and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
             # Shuffled block_size=64 Triton/Gluon MLA decode kernel.
             kv_buffer = self._shuffled_kv_view(kv_c_and_k_pe_cache)
             triton_shuffle_mla_decode_fwd(
