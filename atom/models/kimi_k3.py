@@ -22,7 +22,12 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 from einops import rearrange
 from torch import nn
 
-from atom.config import Config, QuantizationConfig, get_current_atom_config
+from atom.config import (
+    SSM_STATE_KERNEL_CHUNK,
+    Config,
+    QuantizationConfig,
+    get_current_atom_config,
+)
 from atom.model_ops.attention_mla import MLAModules
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
@@ -777,6 +782,52 @@ class KimiKDAAttention(nn.Module):
         # and preserves the same chunk-KDA forward semantics.
         return chunk_kda(**kwargs, disable_recompute=True)
 
+    def _run_kda_paged(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        ssm_state: torch.Tensor,
+        state_indices: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        h0_mask: torch.Tensor | None,
+    ):
+        """KDA prefill that reads and writes the state pool by slot.
+
+        Same math as ``_run_kda`` — verified bit-exact against
+        ``fla.ops.kda.chunk_kda`` — but the pool is indexed in-kernel, so the
+        gather before and scatter after both disappear and the per-chunk
+        states come back for the SSM state cache to slice checkpoints from.
+
+        ``dst_indices == state_indices``: a prefill chunk advances its own
+        runtime slot in place, which is safe (each program owns one column
+        slice of one slot).
+        """
+        from atom.model_ops.fla_ops.chunk_kda import chunk_kda_paged
+
+        return chunk_kda_paged(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            # fp32 for the same reason as _run_kda: a bf16 sigmoid erodes the
+            # delta-rule write strength across 71 KDA layers.
+            beta=beta.float(),
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+            initial_state=ssm_state,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
+            state_indices=state_indices,
+            dst_indices=state_indices,
+            h0_mask=h0_mask,
+            safe_gate=self._kda_gate_lower_bound is not None,
+            lower_bound=self._kda_gate_lower_bound,
+            return_intermediate_states=True,
+        )
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Route through the opaque custom op so torch.compile splits the graph
         # here instead of tracing the stateful recurrence in _forward_impl.
@@ -847,28 +898,66 @@ class KimiKDAAttention(nn.Module):
             q = rearrange(q, "t (h d) -> 1 t h d", d=self.head_dim)
             k = rearrange(k, "t (h d) -> 1 t h d", d=self.head_dim)
             v = rearrange(v, "t (h d) -> 1 t h d", d=self.head_dim)
-            # Fused masked gather: ssm_state[state_indices] with fresh
-            # sequences (~has_initial_state) written as zeros in one pass,
-            # replacing the gather + separate zero-write.
-            from atom.model_ops.kimi_k3 import gather_kda_initial_state
+            ckpt = getattr(gdn_metadata, "ssm_checkpoints", None)
+            if ckpt is None:
+                # Fused masked gather: ssm_state[state_indices] with fresh
+                # sequences (~has_initial_state) written as zeros in one pass,
+                # replacing the gather + separate zero-write.
+                from atom.model_ops.kimi_k3 import gather_kda_initial_state
 
-            initial = gather_kda_initial_state(
-                ssm_state, state_indices, gdn_metadata.has_initial_state
-            )
-            kda_out, last_state = self._run_kda(
-                q,
-                k,
-                v,
-                gate,
-                beta,
-                initial,
-                query_start_loc,
-                True,
-            )
-            # last_state already has ssm_state's dtype (fla preserves the
-            # initial_state dtype; the gathered initial is allocated as such),
-            # so no .to() cast is needed.
-            ssm_state[state_indices] = last_state
+                initial = gather_kda_initial_state(
+                    ssm_state, state_indices, gdn_metadata.has_initial_state
+                )
+                kda_out, last_state = self._run_kda(
+                    q,
+                    k,
+                    v,
+                    gate,
+                    beta,
+                    initial,
+                    query_start_loc,
+                    True,
+                )
+                # last_state already has ssm_state's dtype (fla preserves the
+                # initial_state dtype; the gathered initial is allocated as
+                # such), so no .to() cast is needed.
+                ssm_state[state_indices] = last_state
+            else:
+                # SSM state cache active: index the pool directly. `dst ==
+                # src` (a prefill chunk advances its own runtime slot in
+                # place), which removes the gather AND the scatter above, and
+                # hands back the per-chunk states so interior checkpoints can
+                # be sliced out without a second forward.
+                kda_out, _, h = self._run_kda_paged(
+                    q,
+                    k,
+                    v,
+                    gate,
+                    beta,
+                    ssm_state,
+                    state_indices,
+                    query_start_loc,
+                    gdn_metadata.has_initial_state,
+                )
+                if h is not None:
+                    from atom.model_ops.fla_ops.state_checkpoint import (
+                        write_state_checkpoints,
+                    )
+
+                    write_state_checkpoints(
+                        h,
+                        ssm_state,
+                        mixed_qkv,
+                        conv_state,
+                        ckpt["rows"],
+                        ckpt["slots"],
+                        ckpt["offs"],
+                        ckpt["is_end"],
+                        ckpt["runtime"],
+                        gdn_metadata.ssm_chunk_offsets,
+                        query_start_loc,
+                        SSM_STATE_KERNEL_CHUNK,
+                    )
             out.copy_(kda_out.squeeze(0))
         elif gdn_metadata.num_decodes > 0:
             # Slice the per-token cache-slot indices once (used for both the

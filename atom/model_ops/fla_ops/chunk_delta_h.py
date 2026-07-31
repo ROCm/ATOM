@@ -18,6 +18,40 @@ from .utils import use_cuda_graph
 NUM_WARPS = [2, 4, 8, 16]
 
 
+@triton.jit
+def _load_h0_block(p, STATE_V_FIRST: tl.constexpr):
+    """Load one h0 block into the kernel's [64, BV] accumulator orientation.
+
+    A v-first pointer describes a [BV, 64] tile, so it needs one transpose to
+    match. Factored out because the load appears four times (one per 64-wide
+    K sub-block) and the branch must stay identical across all of them.
+    """
+    b = tl.load(p, boundary_check=(0, 1)).to(tl.float32)
+    if STATE_V_FIRST:
+        b = tl.trans(b)
+    return b
+
+
+@triton.jit
+def _store_ht_block(
+    ht,
+    b,
+    k_off,
+    i_v,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BV: tl.constexpr,
+    STATE_V_FIRST: tl.constexpr,
+):
+    """Store one [64, BV] accumulator block into ht, in either layout."""
+    if STATE_V_FIRST:
+        p = tl.make_block_ptr(ht, (V, K), (K, 1), (i_v * BV, k_off), (BV, 64), (0, 1))
+        tl.store(p, tl.trans(b).to(p.dtype.element_ty), boundary_check=(0, 1))
+    else:
+        p = tl.make_block_ptr(ht, (K, V), (V, 1), (k_off, i_v * BV), (64, BV), (1, 0))
+        tl.store(p, b.to(p.dtype.element_ty), boundary_check=(0, 1))
+
+
 @triton.heuristics(
     {
         "USE_G": lambda args: args["g"] is not None,
@@ -49,7 +83,7 @@ NUM_WARPS = [2, 4, 8, 16]
         for num_stages in [2, 3, 4]
         for BV in [32, 64]
     ],
-    key=["H", "K", "V", "BT"],
+    key=["H", "K", "V", "BT", "STATE_V_FIRST"],
     # With `dst_indices`, `ht` aliases `h0` (both are the state pool, and the
     # destination slot may be the source slot). Autotuning re-runs the kernel
     # once per config, so without this each trial would consume the previous
@@ -92,6 +126,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     IS_PAGED_STATE: tl.constexpr,
     IS_PAGED_DST: tl.constexpr,
     USE_INITIAL_STATE_MASK: tl.constexpr,
+    STATE_V_FIRST: tl.constexpr,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
@@ -158,46 +193,68 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         load_h0 = tl.load(h0_mask + i_n).to(tl.int1)
 
     # load initial state
+    #
+    # STATE_V_FIRST selects the element layout of h0/ht: [V, K] (Kimi KDA,
+    # which passes `state_v_first=True`) versus [K, V] (GDN). Only the pointer
+    # differs — the accumulators stay [64, BV] either way, and a `[V, K]`
+    # block read with strides (K, 1) and order (0, 1) lands transposed into
+    # the same registers. fla instead flips the accumulators, which forces the
+    # whole recurrence to branch; this keeps the branch at the two endpoints.
     if USE_INITIAL_STATE and load_h0:
-        p_h0_1 = tl.make_block_ptr(h0, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0))
-        b_h1 += tl.load(p_h0_1, boundary_check=(0, 1)).to(tl.float32)
+        if STATE_V_FIRST:
+            p_h0_1 = tl.make_block_ptr(
+                h0, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (0, 1)
+            )
+        else:
+            p_h0_1 = tl.make_block_ptr(
+                h0, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0)
+            )
+        b_h1 += _load_h0_block(p_h0_1, STATE_V_FIRST)
         if K > 64:
-            p_h0_2 = tl.make_block_ptr(
-                h0, (K, V), (V, 1), (64, i_v * BV), (64, BV), (1, 0)
-            )
-            b_h2 += tl.load(p_h0_2, boundary_check=(0, 1)).to(tl.float32)
+            if STATE_V_FIRST:
+                p_h0_2 = tl.make_block_ptr(
+                    h0, (V, K), (K, 1), (i_v * BV, 64), (BV, 64), (0, 1)
+                )
+            else:
+                p_h0_2 = tl.make_block_ptr(
+                    h0, (K, V), (V, 1), (64, i_v * BV), (64, BV), (1, 0)
+                )
+            b_h2 += _load_h0_block(p_h0_2, STATE_V_FIRST)
         if K > 128:
-            p_h0_3 = tl.make_block_ptr(
-                h0, (K, V), (V, 1), (128, i_v * BV), (64, BV), (1, 0)
-            )
-            b_h3 += tl.load(p_h0_3, boundary_check=(0, 1)).to(tl.float32)
+            if STATE_V_FIRST:
+                p_h0_3 = tl.make_block_ptr(
+                    h0, (V, K), (K, 1), (i_v * BV, 128), (BV, 64), (0, 1)
+                )
+            else:
+                p_h0_3 = tl.make_block_ptr(
+                    h0, (K, V), (V, 1), (128, i_v * BV), (64, BV), (1, 0)
+                )
+            b_h3 += _load_h0_block(p_h0_3, STATE_V_FIRST)
         if K > 192:
-            p_h0_4 = tl.make_block_ptr(
-                h0, (K, V), (V, 1), (192, i_v * BV), (64, BV), (1, 0)
-            )
-            b_h4 += tl.load(p_h0_4, boundary_check=(0, 1)).to(tl.float32)
+            if STATE_V_FIRST:
+                p_h0_4 = tl.make_block_ptr(
+                    h0, (V, K), (K, 1), (i_v * BV, 192), (BV, 64), (0, 1)
+                )
+            else:
+                p_h0_4 = tl.make_block_ptr(
+                    h0, (K, V), (V, 1), (192, i_v * BV), (64, BV), (1, 0)
+                )
+            b_h4 += _load_h0_block(p_h0_4, STATE_V_FIRST)
 
     # main recurrence
+    #
+    # The per-chunk buffer `h` follows the SAME layout as h0/ht. It has to:
+    # the SSM state cache slices an interior checkpoint straight out of `h`
+    # into a state slot (see fla_ops/state_checkpoint.py), so a mismatch here
+    # would store every fork checkpoint transposed.
     for i_t in range(NT):
-        p_h1 = tl.make_block_ptr(
-            h + i_t * stride_h, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0)
-        )
-        tl.store(p_h1, b_h1.to(p_h1.dtype.element_ty), boundary_check=(0, 1))
+        _store_ht_block(h + i_t * stride_h, b_h1, 0, i_v, K, V, BV, STATE_V_FIRST)
         if K > 64:
-            p_h2 = tl.make_block_ptr(
-                h + i_t * stride_h, (K, V), (V, 1), (64, i_v * BV), (64, BV), (1, 0)
-            )
-            tl.store(p_h2, b_h2.to(p_h2.dtype.element_ty), boundary_check=(0, 1))
+            _store_ht_block(h + i_t * stride_h, b_h2, 64, i_v, K, V, BV, STATE_V_FIRST)
         if K > 128:
-            p_h3 = tl.make_block_ptr(
-                h + i_t * stride_h, (K, V), (V, 1), (128, i_v * BV), (64, BV), (1, 0)
-            )
-            tl.store(p_h3, b_h3.to(p_h3.dtype.element_ty), boundary_check=(0, 1))
+            _store_ht_block(h + i_t * stride_h, b_h3, 128, i_v, K, V, BV, STATE_V_FIRST)
         if K > 192:
-            p_h4 = tl.make_block_ptr(
-                h + i_t * stride_h, (K, V), (V, 1), (192, i_v * BV), (64, BV), (1, 0)
-            )
-            tl.store(p_h4, b_h4.to(p_h4.dtype.element_ty), boundary_check=(0, 1))
+            _store_ht_block(h + i_t * stride_h, b_h4, 192, i_v, K, V, BV, STATE_V_FIRST)
 
         p_w = tl.make_block_ptr(
             w, (T, K), (stride_w, 1), (i_t * BT, 0), (BT, 64), (1, 0)
@@ -309,24 +366,16 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             b_k = tl.load(p_k, boundary_check=(0, 1))
             b_h4 += tl.dot(b_k, b_v)
     # epilogue
+    # Mirror of the h0 load: v-first stores a [BV, 64] tile, so the [64, BV]
+    # accumulator is transposed on the way out.
     if STORE_FINAL_STATE:
-        p_ht = tl.make_block_ptr(ht, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0))
-        tl.store(p_ht, b_h1.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
+        _store_ht_block(ht, b_h1, 0, i_v, K, V, BV, STATE_V_FIRST)
         if K > 64:
-            p_ht = tl.make_block_ptr(
-                ht, (K, V), (V, 1), (64, i_v * BV), (64, BV), (1, 0)
-            )
-            tl.store(p_ht, b_h2.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
+            _store_ht_block(ht, b_h2, 64, i_v, K, V, BV, STATE_V_FIRST)
         if K > 128:
-            p_ht = tl.make_block_ptr(
-                ht, (K, V), (V, 1), (128, i_v * BV), (64, BV), (1, 0)
-            )
-            tl.store(p_ht, b_h3.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
+            _store_ht_block(ht, b_h3, 128, i_v, K, V, BV, STATE_V_FIRST)
         if K > 192:
-            p_ht = tl.make_block_ptr(
-                ht, (K, V), (V, 1), (192, i_v * BV), (64, BV), (1, 0)
-            )
-            tl.store(p_ht, b_h4.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
+            _store_ht_block(ht, b_h4, 192, i_v, K, V, BV, STATE_V_FIRST)
 
 
 def chunk_gated_delta_rule_fwd_h(
@@ -343,6 +392,8 @@ def chunk_gated_delta_rule_fwd_h(
     state_indices: torch.Tensor | None = None,
     dst_indices: torch.Tensor | None = None,
     h0_mask: torch.Tensor | None = None,
+    state_v_first: bool = False,
+    chunk_indices: torch.LongTensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # This kernel is slightly different from fla to support Q/K with different head numbers.
     # In fla, Q/K always have the same head number, so Hg is always equal to H.
@@ -350,11 +401,11 @@ def chunk_gated_delta_rule_fwd_h(
     H = u.shape[-2]
     BT = chunk_size
 
-    chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, chunk_size)
-        if cu_seqlens is not None
-        else None
-    )
+    # `chunk_indices` is a pure function of (cu_seqlens, chunk_size); callers
+    # that already built it (chunk_kda) pass it in rather than pay for it
+    # again per layer.
+    if chunk_indices is None and cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
     # N: the actual number of sequences in the batch with either equal or variable lengths
     if cu_seqlens is None:
         N, NT, chunk_offsets = B, triton.cdiv(T, BT), None
@@ -366,7 +417,7 @@ def chunk_gated_delta_rule_fwd_h(
         )
     assert K <= 256, "current kernel does not support head dimension larger than 256."
 
-    h = k.new_empty(B, NT, H, K, V)
+    h = k.new_empty(B, NT, H, *((V, K) if state_v_first else (K, V)))
     if state_indices is not None:
         assert (
             initial_state is not None
@@ -396,8 +447,14 @@ def chunk_gated_delta_rule_fwd_h(
         assert output_final_state, "dst_indices is meaningless without a final state"
         final_state = initial_state
     else:
+        # Element layout follows the caller's state convention: KDA keeps
+        # [V, K], GDN [K, V]. `h` is unaffected — it is only ever read back
+        # through the same convention that wrote it.
+        tail = (V, K) if state_v_first else (K, V)
         final_state = (
-            k.new_empty(N, H, K, V, dtype=torch.float32) if output_final_state else None
+            k.new_empty(N, H, *tail, dtype=torch.float32)
+            if output_final_state
+            else None
         )
 
     v_new = torch.empty_like(u) if save_new_value else None
@@ -420,6 +477,7 @@ def chunk_gated_delta_rule_fwd_h(
         state_indices=state_indices,
         dst_indices=dst_indices,
         h0_mask=h0_mask,
+        STATE_V_FIRST=state_v_first,
         T=T,
         H=H,
         Hg=Hg,

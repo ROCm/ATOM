@@ -579,7 +579,6 @@ class GDNStateMixin:
             self.prepare_block_tables(batch)
 
         query_start_loc = attn_metadata.cu_seqlens_q
-        context_lens_tensor = torch.zeros(batch.total_seqs_num_prefill).cuda()
         nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
         if not self.use_spec_decode or is_prefill:
             self.prepare_state_indices(batch, with_spec=False)
