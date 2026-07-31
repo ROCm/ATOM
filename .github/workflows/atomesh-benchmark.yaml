@@ -17,13 +17,11 @@ on:
       - '.github/scripts/atomesh/**'
       - '.github/workflows/atomesh-benchmark.yaml'
   schedule:
-    # TW weekend nightly at 21:00 Beijing time (13:00 UTC).
-    - cron: '0 13 * * 6'
-    - cron: '0 13 * * 0'
-    # TW nightly for DeepSeek and GLM-Agentic cases only at 00:00 Beijing time (16:00 UTC).
-    - cron: '0 16 * * *'
-    # Spur MI350X nightly at 00:10 Beijing time (16:10 UTC).
-    # - cron: '10 16 * * *'
+    # TW weekday nightly for DeepSeek and GLM-Agentic at 00:00 Beijing time.
+    # Sunday-Thursday 16:00 UTC corresponds to Monday-Friday 00:00 Beijing time.
+    - cron: '0 16 * * 0-4'
+    # TW weekly nightly at Saturday 00:00 Beijing time (Friday 16:00 UTC).
+    - cron: '0 16 * * 5'
   workflow_dispatch:
     inputs:
       suite:
@@ -270,12 +268,12 @@ jobs:
             fi
           fi
 
-          if [[ "${GITHUB_EVENT_NAME}" == "schedule" && "${EVENT_SCHEDULE}" == "0 17 * * *" ]]; then
+          if [[ "${GITHUB_EVENT_NAME}" == "schedule" && "${EVENT_SCHEDULE}" == "0 16 * * 0-4" ]]; then
             ATOMESH_SLURM_ACCOUNT=amd-frameworks \
             ATOMESH_SLURM_PARTITION=amd-frameworks \
             ATOMESH_SLURM_SUBMIT_RUNNER=atomesh-cicd \
-            ATOMESH_1P1D_NODES=mia1-p02-g42,mia1-p02-g44,mia1-p02-g47 \
-            ATOMESH_2P1D_NODES=mia1-p02-g42,mia1-p02-g44,mia1-p02-g47 \
+            ATOMESH_1P1D_NODES=mia1-p02-g42,mia1-p02-g44 \
+            ATOMESH_2P1D_NODES=mia1-p02-g42,mia1-p02-g44 \
               python3 .github/scripts/atomesh/pd_matrix.py \
               --suite nightly \
               --model DeepSeek-V4-Pro \
@@ -310,9 +308,77 @@ jobs:
               output.write(f"matrix_json={json.dumps(matrix, separators=(',', ':'))}\n")
               output.write(f"has_matrix={'true' if matrix['include'] else 'false'}\n")
           print(
-              "Scheduled TW nightly matrix: "
+              "Scheduled TW weekday nightly matrix: "
               f"{len(deepseek)} DeepSeek case(s), {len(glm_agentic)} GLM agentic case(s)"
           )
+          PY
+          elif [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
+            ATOMESH_SLURM_ACCOUNT=amd-frameworks \
+            ATOMESH_SLURM_PARTITION=amd-frameworks \
+            ATOMESH_SLURM_SUBMIT_RUNNER=atomesh-cicd \
+            ATOMESH_1P1D_NODES=mia1-p01-g36,mia1-p01-g43,mia1-p02-g42,mia1-p02-g44,mia1-p02-g47 \
+            ATOMESH_2P1D_NODES=mia1-p01-g36,mia1-p01-g43,mia1-p02-g42,mia1-p02-g44,mia1-p02-g47 \
+              python3 .github/scripts/atomesh/pd_matrix.py \
+              --suite nightly \
+              ${ATOMESH_IMAGE:+--image "$ATOMESH_IMAGE"} \
+              --output atomesh-matrix.json
+
+            python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          matrix_path = Path("atomesh-matrix.json")
+          matrix = json.loads(matrix_path.read_text(encoding="utf-8"))
+
+          glm_nodes = ["mia1-p01-g36", "mia1-p01-g43"]
+          ds_nodes = ["mia1-p02-g42", "mia1-p02-g44"]
+          model_nodes_by_count = {
+              1: ["mia1-p02-g47"],
+              2: ["mia1-p01-g36", "mia1-p01-g43"],
+              3: ["mia1-p02-g42", "mia1-p02-g44", "mia1-p02-g47"],
+          }
+
+          for cell in matrix.get("include", []):
+              model = cell["model"]
+              layout = cell["pd_worker_layout"]
+              prefill_workers = int(cell["service"]["prefill"].get("workers", 1))
+              decode_workers = int(cell["service"]["decode"].get("workers", 1))
+              if layout == "single_node":
+                  num_nodes = 1
+              elif layout == "prefill_single_node":
+                  num_nodes = 1 + decode_workers
+              elif layout == "decode_single_node":
+                  num_nodes = prefill_workers + 1
+              else:
+                  num_nodes = prefill_workers + decode_workers
+
+              if model == "GLM-5.2-MXFP4":
+                  if num_nodes > len(glm_nodes):
+                      raise ValueError(f"{cell['name']} needs {num_nodes} GLM nodes")
+                  nodes = glm_nodes[:num_nodes]
+              elif model == "DeepSeek-V4-Pro":
+                  if num_nodes > len(ds_nodes):
+                      raise ValueError(f"{cell['name']} needs {num_nodes} DeepSeek nodes")
+                  nodes = ds_nodes[:num_nodes]
+              elif model == "Kimi-K2.5-MXFP4" or model.startswith("MiniMax-"):
+                  if num_nodes not in model_nodes_by_count:
+                      raise ValueError(f"{cell['name']} has unsupported node count {num_nodes}")
+                  nodes = model_nodes_by_count[num_nodes]
+              else:
+                  raise ValueError(f"No scheduled node mapping for model {model}")
+
+              cell["nodes"] = nodes
+              cell["num_nodes"] = num_nodes
+              slurm_group = "amd-tw" if set(nodes).issubset(glm_nodes) else "amd-frameworks"
+              cell["runner"]["slurm_account"] = slurm_group
+              cell["runner"]["slurm_partition"] = slurm_group
+              print(f"Scheduled {cell['name']}: nodes={','.join(nodes)} slurm={slurm_group}")
+
+          matrix_path.write_text(json.dumps(matrix, indent=2), encoding="utf-8")
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+              output.write(f"matrix_json={json.dumps(matrix, separators=(',', ':'))}\n")
+              output.write(f"has_matrix={'true' if matrix.get('include') else 'false'}\n")
           PY
           else
             python3 .github/scripts/atomesh/pd_matrix.py \
