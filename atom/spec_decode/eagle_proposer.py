@@ -288,11 +288,12 @@ class EagleProposer(Drafter):
                 )
                 # Every draft model EagleProposer can build implements this --
                 # the DSpark archs in support_draft_model_arch_dict do not, but
-                # they are DSparkProposer's and never reach this loop. Some do
-                # the argmax distributed (all-gathering [N, 2] instead of the
-                # full [N, vocab] logits); the rest do
-                # compute_logits().argmax(-1) internally. Token-identical either
-                # way, so the choice belongs to the model, not to this loop.
+                # they are DSparkProposer's and never reach this loop. All of
+                # them reduce per vocab shard and all-gather only [N, 2] rather
+                # than the full [N, vocab] logits, which is token-identical to
+                # compute_logits().argmax(-1) here because is_draft suppresses
+                # the LM head's prefill last-token slice. How the ids are
+                # produced stays the model's business, not this loop's.
                 new_draft_ids = self.model.compute_draft_ids(sample_hidden_states)
                 draft_token_ids[:, i] = new_draft_ids
 

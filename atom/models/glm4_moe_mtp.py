@@ -147,16 +147,28 @@ class Glm4MoeMultiTokenPredictor(nn.Module):
             current_step_idx,
         )
 
+    def _mtp_layer(self, spec_step_idx: int) -> Glm4MoeMultiTokenPredictorLayer:
+        current_step_idx = spec_step_idx % self.num_mtp_layers
+        return self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
+
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
-        current_step_idx = spec_step_idx % self.num_mtp_layers
-        mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
         # Already post-final-norm (shared_head.norm runs at the end of
         # Glm4MoeMultiTokenPredictorLayer.forward), so this is a bare LM head.
-        return mtp_layer.shared_head.head(hidden_states)
+        return self._mtp_layer(spec_step_idx).shared_head.head(hidden_states)
+
+    def compute_draft_ids(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        # Same bare-LM-head input as compute_logits, but reduced per vocab shard
+        # so only [N, 2] crosses TP instead of the full [N, vocab].
+        head = self._mtp_layer(spec_step_idx).shared_head.head
+        return head.compute_argmax_token(hidden_states)
 
 
 @support_torch_compile
@@ -214,7 +226,10 @@ class Glm4MoeMTP(nn.Module):
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
-        """Greedy draft token ids.
+        """Greedy draft token ids via distributed argmax — only [N, 2] is
+        all-gathered instead of the full [N, vocab] logits. Token-identical to
+        compute_logits(...).argmax(-1): plugin mode skips the LM head's prefill
+        last-token slice outright, so both see the same rows.
 
         Reached through the vLLM plugin's ``get_top_tokens``, not through
         EagleProposer -- Glm4MoeMTPModel is absent from
@@ -222,7 +237,7 @@ class Glm4MoeMTP(nn.Module):
         this class. The plugin calls it unconditionally, though, so the method
         has to exist.
         """
-        return self.compute_logits(hidden_states, spec_step_idx).argmax(dim=-1)
+        return self.model.compute_draft_ids(hidden_states, spec_step_idx)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales

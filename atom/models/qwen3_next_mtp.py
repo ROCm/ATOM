@@ -207,8 +207,14 @@ class Qwen3NextMTP(nn.Module):
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
-        """Greedy draft token ids, called once per step by EagleProposer."""
-        return self.compute_logits(hidden_states, spec_step_idx).argmax(dim=-1)
+        """Greedy draft token ids via distributed argmax — each rank reduces its
+        own vocab shard and only [N, 2] is all-gathered, instead of the full
+        [N, vocab] that compute_logits() would gather. Token-identical to
+        compute_logits(...).argmax(-1): the draft path never hits the LM head's
+        prefill last-token slice (is_draft is set for the whole propose loop),
+        so both see the same rows.
+        """
+        return self.lm_head.compute_argmax_token(hidden_states)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales

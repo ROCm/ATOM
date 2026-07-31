@@ -1029,15 +1029,11 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         ``compute_draft_ids``, which returns ``[N]`` int64 token ids and is
         token-identical to ``compute_logits(...).argmax(-1)``.
 
-        How much that actually saves depends on the arch. ``DeepSeekMTP`` and
-        ``Eagle3LlamaModel`` reduce each rank's logit shard to
-        ``(max_val, global_idx)`` and all-gather only ``[N, 2]`` -- the
-        ``O(2*tp)`` behaviour vLLM enables this flag for. The rest
-        (``DeepseekV4MTP``, ``Qwen3NextMTP``, ``Qwen3_5MTP``, ``MiMoV2MTP``,
-        ``Eagle3DeepseekMLAModel``, ``Glm4MoeMTP``) still go through the full
-        ``[N, vocab]`` all-gather inside ``compute_logits``. Correct either way,
-        but on those the flag buys nothing; giving them a cheap path means
-        routing them at ``ParallelLMHead.compute_argmax_token`` too.
+        Every arch delivers the ``O(2*tp)`` behaviour vLLM enables this flag
+        for: each rank reduces its own logit shard to ``(max_val, global_idx)``
+        and only ``[N, 2]`` is all-gathered, via
+        ``ParallelLMHead.compute_argmax_token``. Nothing here falls back to the
+        full ``[N, vocab]`` all-gather.
         """
         if getattr(self, "_is_deepseek_v4_mtp", False):
             hidden_states = _deepseek_v4_mtp_unflatten_hidden_states(

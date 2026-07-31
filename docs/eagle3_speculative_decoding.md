@@ -83,13 +83,18 @@ def compute_draft_ids(self, hidden_states: torch.Tensor) -> torch.Tensor: ...  #
 
 The propose loop calls it once per draft step, unconditionally — there is no
 capability probe, so a draft model missing it raises `AttributeError` mid
-rollout. Two implementations exist and are token-identical:
+rollout.
 
-- `compute_logits(hidden_states).argmax(-1)` — the default, all-gathers the full
-  `[N, vocab]` logits.
-- `lm_head.compute_argmax_token(hidden_states)` — each rank reduces its own vocab
-  shard and only `[N, 2]` is all-gathered. Used by `DeepSeekMTP` and
-  `Eagle3LlamaModel`; preferred where the head supports it.
+Every implementation routes through `ParallelLMHead.compute_argmax_token`: each
+rank reduces its own vocab shard to `(max_val, global_idx)` and only `[N, 2]` is
+all-gathered, instead of the `[N, vocab]` that `compute_logits` would gather.
+This is token-identical to `compute_logits(hidden_states).argmax(-1)` — the
+values compared are the same logits, ties break to the lowest global index, and
+the LM head's prefill last-token slice never fires on this path (`is_draft` is
+set for the whole propose loop; plugin mode skips the slice outright). Models
+whose readout is more than a bare head (`DeepseekV4MTP`'s hc_head + norm, the
+EAGLE 3.1 `norm_output=False` norm) apply that prefix identically in both
+methods.
 
 The DSpark archs are exempt: `DSparkProposer` drafts a whole block per forward
 and never enters this loop.

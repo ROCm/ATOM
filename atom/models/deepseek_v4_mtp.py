@@ -171,6 +171,21 @@ class DeepseekV4MTPModel(nn.Module):
         idx = spec_step_idx % len(self.mtp)
         return self.mtp[idx](hidden_states, positions, input_ids)
 
+    def _head_input(
+        self,
+        hidden_states: torch.Tensor,  # [num_tokens, hc, dim]  pre-hc_head residual
+        spec_step_idx: int,
+    ) -> tuple[MTPBlock, torch.Tensor]:  # block, [num_tokens, dim]
+        """Everything between the un-reduced residual stack and the LM head:
+        hc_head reduce + the block's own final RMSNorm. Each MTP block has its
+        own `hc_head_fn/base/scale` and own `norm` (the LM head itself is
+        target-shared via `share_with_target`)."""
+        blk = self.mtp[spec_step_idx % len(self.mtp)]
+        x = blk.head.hc_head(
+            hidden_states, blk.hc_head_fn, blk.hc_head_scale, blk.hc_head_base
+        )  # [num_tokens, dim]
+        return blk, blk.norm(x)
+
     def compute_logits(
         self,
         hidden_states: torch.Tensor,  # [num_tokens, hc, dim]  pre-hc_head residual
@@ -178,15 +193,19 @@ class DeepseekV4MTPModel(nn.Module):
     ) -> torch.Tensor:  # [bs, vocab]
         """Mirror `DeepseekV4ForCausalLM.compute_logits`: hc_head + RMSNorm +
         LM head all here so MTPBlock.forward can return the un-reduced
-        residual stack. Each MTP block has its own `hc_head_fn/base/scale`
-        and own `norm` (the LM head is target-shared via `share_with_target`)."""
-        idx = spec_step_idx % len(self.mtp)
-        blk = self.mtp[idx]
-        x = blk.head.hc_head(
-            hidden_states, blk.hc_head_fn, blk.hc_head_scale, blk.hc_head_base
-        )  # [num_tokens, dim]
-        x = blk.norm(x)
+        residual stack."""
+        blk, x = self._head_input(hidden_states, spec_step_idx)
         return blk.head.get_logits(x)
+
+    def compute_draft_ids(
+        self,
+        hidden_states: torch.Tensor,  # [num_tokens, hc, dim]  pre-hc_head residual
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:  # [num_tokens] int64
+        """Same reduce + norm as compute_logits, but the argmax runs per vocab
+        shard so only [N, 2] crosses TP instead of the full [N, vocab]."""
+        blk, x = self._head_input(hidden_states, spec_step_idx)
+        return blk.head.compute_argmax_token(x)
 
 
 class DeepseekV4MTP(nn.Module):
@@ -301,8 +320,12 @@ class DeepseekV4MTP(nn.Module):
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
-        """Greedy draft token ids, called once per step by EagleProposer."""
-        return self.compute_logits(hidden_states, spec_step_idx).argmax(dim=-1)
+        """Greedy draft token ids via distributed argmax — only [N, 2] crosses
+        TP instead of the full [N, vocab]. Token-identical to
+        compute_logits(...).argmax(-1): the draft path never hits the LM head's
+        prefill last-token slice (is_draft is set for the whole propose loop),
+        so both see the same rows."""
+        return self.model.compute_draft_ids(hidden_states, spec_step_idx)
 
     def share_with_target(self, target_base: nn.Module, loaded: set[str]) -> None:
         """Bind embed/head on each MTPBlock to the already-loaded target's
