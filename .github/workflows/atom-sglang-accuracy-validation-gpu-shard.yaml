@@ -190,6 +190,8 @@ jobs:
           cache_roots=(
             /mnt/dcgpuval
             /shared/data/WRH/models
+            /shared_nfs/models
+            /shared_nfs
             /mnt/raid0/pretrained_model
             /data/pretrained_model
             /data/models
@@ -249,6 +251,8 @@ jobs:
 
           for candidate in \
             "${MODEL_CACHE_ROOT}/.cache/huggingface" \
+            /shared_nfs/.cache/huggingface \
+            /shared_nfs/huggingface \
             /mnt/raid0/huggingface \
             /data/huggingface \
             /shared/data/WRH/huggingface; do
