@@ -3033,9 +3033,7 @@ class ModelRunner:
                         else self.forward_vars["positions"].gpu[:num_tokens_pad]
                     )
                     forward_context.cudagraph_runtime_mode = (
-                        CUDAGraphMode.PIECEWISE
-                        if _captured
-                        else CUDAGraphMode.NONE
+                        CUDAGraphMode.PIECEWISE if _captured else CUDAGraphMode.NONE
                     )
                     forward_context.batch_descriptor = BatchDescriptor(
                         num_tokens=num_tokens_pad
