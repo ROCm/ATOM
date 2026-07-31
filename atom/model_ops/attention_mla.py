@@ -197,6 +197,7 @@ def _ds32_store_kv(
         BLOCK=512,
     )
 
+
 if False:
     try:
         from aiter.ops.triton.fused_gemm_a8w8_blockscale_split_cat import (
@@ -363,11 +364,7 @@ class MLAAttention(nn.Module):
             and mla_modules.kv_lora_rank == _DS32_NOPE_DIM
             and mla_modules.qk_rope_head_dim == _DS32_ROPE_DIM
         )
-        min_mla_heads = (
-            128
-            if self.use_ds32
-            else _MLA_MIN_HEADS
-        )
+        min_mla_heads = 128 if self.use_ds32 else _MLA_MIN_HEADS
         self.padded_num_heads = max(num_heads, min_mla_heads)
         self.head_repeat_factor = 1
         self.head_pad = 0
@@ -518,9 +515,7 @@ class MLAAttention(nn.Module):
                     f"{dtype}, got {None if tensor is None else (tensor.shape, tensor.dtype, tensor.stride())}."
                 )
 
-    def _ds32_quantize_nope(
-        self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def _ds32_quantize_nope(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Quantize a 512-wide MLA latent to MXFP8 with per-1x32 E8M0 scales."""
         shape = x.shape
         if shape[-1] != _DS32_NOPE_DIM:
