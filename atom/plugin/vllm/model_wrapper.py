@@ -573,7 +573,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         return chain
 
     def _expose_spec_decode_attrs(self) -> None:
-        """ Bridge the extra nesting level between vLLM and ATOM for spec decode.
+        """Bridge the extra nesting level between vLLM and ATOM for spec decode.
 
         vLLM reads embed_tokens / embedding / layers at ``wrapper.model.<attr>``
         and the head at ``wrapper.lm_head``. ATOM nests these under one or more
