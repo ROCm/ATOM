@@ -172,11 +172,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             and getattr(hf_config, "kv_lora_rank", None) == 512
             and getattr(hf_config, "qk_rope_head_dim", None) == 64
         )
-        min_mla_heads = (
-            128
-            if self.use_ds32
-            else _MLA_MIN_HEADS
-        )
+        min_mla_heads = 128 if self.use_ds32 else _MLA_MIN_HEADS
         self.padded_num_attention_heads = max(self.num_attention_heads, min_mla_heads)
 
         self.dcp_world_size = get_dcp_world_size()
@@ -862,9 +858,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             return None
 
         runner = self.model_runner
-        num_slots = (
-            runner.num_physical_kvcache_blocks * runner.physical_block_size
-        )
+        num_slots = runner.num_physical_kvcache_blocks * runner.physical_block_size
         if self.use_ds32:
             kv_cache = runner.kv_cache[layer_id].view(num_slots, 512)
             kv_scale = runner.kv_scale_cache[layer_id].view(num_slots, 16)
