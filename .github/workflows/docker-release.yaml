@@ -58,8 +58,8 @@ on:
         description: "Build OOT vLLM image for manual runs (scheduled nightly runs always build OOT; default enabled so manual releases also publish OOT)"
         type: boolean
         default: true
-      oot_tag_suffix:
-        description: "Optional suffix appended to the OOT vLLM nightly tag for manual runs. Example: custom -> rocm/atom-dev:vllm-v<version>-nightly_<date>-custom. When set, vllm-latest is not updated."
+      oot_custom_tag:
+        description: "Exact Docker tag for the OOT vLLM image in manual runs (e.g. 'vllm-0.25.1-rc1'). Produces rocm/atom-dev:<oot_custom_tag>. When set, the nightly tag and vllm-latest update are skipped."
         default: ""
       build_sglang_image:
         description: "Build SGLang+ATOM image for manual runs (scheduled nightly runs always build SGLang+ATOM; default enabled so manual releases also publish SGLang+ATOM)"
@@ -137,7 +137,7 @@ jobs:
           echo "AITER_COMMIT: ${{ inputs.aiter_commit || env.AITER_COMMIT }}"
           echo "RCCL_REPO: ${{ inputs.rccl_repo || env.RCCL_REPO }}"
           echo "RCCL_BRANCH: ${{ inputs.rccl_branch || env.RCCL_BRANCH }}"
-          echo "OOT_TAG_SUFFIX: ${{ inputs.oot_tag_suffix || '' }}"
+          echo "OOT_CUSTOM_TAG: ${{ inputs.oot_custom_tag || '' }}"
           echo "SGLANG_TAG_SUFFIX: ${{ inputs.sglang_tag_suffix || '' }}"
           echo "CUSTOM_TAG: ${{ inputs.custom_tag || '' }}"
           echo "SGLANG_REPO: ${{ inputs.sglang_repo || env.SGLANG_REPO }}"
@@ -287,23 +287,24 @@ jobs:
         run: |
           set -euo pipefail
           VLLM_VER="${VLLM_VERSION}"
-          OOT_TAG_SUFFIX="${{ inputs.oot_tag_suffix || '' }}"
-          OOT_TAG="vllm-v${VLLM_VER}-nightly_$(date +%Y%m%d)"
+          OOT_CUSTOM_TAG="${{ inputs.oot_custom_tag || '' }}"
           OOT_LATEST_TAG="vllm-latest"
-          if [ -n "${OOT_TAG_SUFFIX}" ]; then
-            if [[ ! "${OOT_TAG_SUFFIX}" =~ ^[A-Za-z0-9_.-]+$ ]]; then
-              echo "Invalid oot_tag_suffix '${OOT_TAG_SUFFIX}'. Allowed characters: letters, numbers, '.', '_' and '-'."
+          if [ -n "${OOT_CUSTOM_TAG}" ]; then
+            if [[ ! "${OOT_CUSTOM_TAG}" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+              echo "Invalid oot_custom_tag '${OOT_CUSTOM_TAG}'. Allowed characters: letters, numbers, '.', '_' and '-'."
               exit 1
             fi
-            OOT_TAG="${OOT_TAG}-${OOT_TAG_SUFFIX}"
+            OOT_TAG="${OOT_CUSTOM_TAG}"
+          else
+            OOT_TAG="vllm-v${VLLM_VER}-nightly_$(date +%Y%m%d)"
           fi
           docker tag atom_oot_release:ci rocm/atom-dev:${OOT_TAG}
           docker push rocm/atom-dev:${OOT_TAG}
-          if [ -z "${OOT_TAG_SUFFIX}" ]; then
+          if [ -z "${OOT_CUSTOM_TAG}" ]; then
             docker tag atom_oot_release:ci rocm/atom-dev:${OOT_LATEST_TAG}
             docker push rocm/atom-dev:${OOT_LATEST_TAG}
           else
-            echo "Custom OOT tag suffix '${OOT_TAG_SUFFIX}' provided; skipping rocm/atom-dev:${OOT_LATEST_TAG} update."
+            echo "Custom OOT tag '${OOT_CUSTOM_TAG}' provided; skipping rocm/atom-dev:${OOT_LATEST_TAG} update."
           fi
 
       - name: Build SGLang Docker image
