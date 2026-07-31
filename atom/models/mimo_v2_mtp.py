@@ -5,7 +5,6 @@
 import re
 
 import torch
-from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from torch import nn
 
 from atom.config import Config
@@ -156,8 +155,20 @@ class MiMoV2MTPPredictorLayer(nn.Module):
         hidden_states, residual = self.mtp_block(
             positions=positions, hidden_states=hidden_states, residual=None
         )
-        # MTP always has fused_allreduce off, do explicit all-reduce
-        hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        # No all-reduce here: MiMoV2MTPLayer returns self.mlp(...) and that mlp
+        # is built with reduce_results=True (:52), as is the attention's o_proj
+        # (mimo_v2.py:258), so every TP partial sum inside the block has already
+        # been reduced. Both of the block's layernorms are fused_allreduce=False,
+        # so nothing is deferred out to here either.
+        #
+        # The explicit all_reduce this replaces was unconditionally wrong at
+        # tp > 1 -- the block output came out as residual + tp_size * mlp_out.
+        # Its comment ("MTP always has fused_allreduce off") named the wrong
+        # flag: fused_allreduce governs whether a NORM absorbs a pending reduce,
+        # while what decides if one is pending here is reduce_results, and that
+        # is hard-coded True. Unlike the DeepSeek MTP block, whose mlp uses
+        # `reduce_results=not fuse_ar_input_norm`, there was no setting under
+        # which this was correct.
         hidden_states = residual + hidden_states
 
         # Apply final layernorm
