@@ -30,7 +30,7 @@ except ImportError:
     concat_and_cache_mla_seg = None
     fused_qk_rope_concat_and_cache_mla_seg = None
 from aiter.dist.parallel_state import get_dp_group
-from aiter.mla import mla_decode_fwd, mla_prefill_fwd
+from aiter.mla import mla_decode_fwd, mla_decode_fwd_ds32, mla_prefill_fwd
 from aiter.ops.triton.attention.mla import (
     mla_decode_fwd as triton_shuffle_mla_decode_fwd,
 )
@@ -105,6 +105,9 @@ if fused_qk_rope_concat_and_cache_mla_seg is not None:
     )
 mla_prefill_fwd = mark_trace(mla_prefill_fwd, prefix="mla_prefill", torch_compile=False)
 mla_decode_fwd = mark_trace(mla_decode_fwd, prefix="mla_decode", torch_compile=False)
+mla_decode_fwd_ds32 = mark_trace(
+    mla_decode_fwd_ds32, prefix="mla_decode_ds32", torch_compile=False
+)
 
 # Shuffled-KV (block_size=64) Triton/Gluon MLA kernels, gated by
 # ATOM_USE_TRITON_MLA and ATOM_USE_TRITON_MLA_SHUFFLE_KV:. Write kernels mirror the aiter
@@ -162,6 +165,78 @@ _MLA_Q_OUT_PADDED_DIM = 768
 # Dims the fused seg kernels are compiled against (KV_LORA / PE_DIM constexprs).
 _MLA_SEG_KV_LORA_RANK = 512
 _MLA_SEG_PE_DIM = 64
+_DS32_NOPE_DIM = 512
+_DS32_ROPE_DIM = 64
+_DS32_SCALE_DIM = _DS32_NOPE_DIM // 32
+_DS32_CACHE_BYTES = _DS32_NOPE_DIM + _DS32_SCALE_DIM + _DS32_ROPE_DIM * 2
+
+
+@triton.jit
+def _ds32_store_kv_kernel(
+    k_nope,
+    k_scale,
+    k_rope,
+    cache_nope,
+    cache_scale,
+    cache_rope,
+    slot_mapping,
+    stride_kn_t,
+    stride_ks_t,
+    stride_kr_t,
+    stride_cn_t,
+    stride_cs_t,
+    stride_cr_t,
+    NOPE_DIM: tl.constexpr,
+    SCALE_DIM: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK)
+    slot = tl.load(slot_mapping + token_idx)
+    valid_slot = slot >= 0
+
+    nope_mask = valid_slot & (offsets < NOPE_DIM)
+    nope = tl.load(k_nope + token_idx * stride_kn_t + offsets, mask=nope_mask)
+    tl.store(cache_nope + slot * stride_cn_t + offsets, nope, mask=nope_mask)
+
+    scale_mask = valid_slot & (offsets < SCALE_DIM)
+    scale = tl.load(k_scale + token_idx * stride_ks_t + offsets, mask=scale_mask)
+    tl.store(cache_scale + slot * stride_cs_t + offsets, scale, mask=scale_mask)
+
+    rope_mask = valid_slot & (offsets < ROPE_DIM)
+    rope = tl.load(k_rope + token_idx * stride_kr_t + offsets, mask=rope_mask)
+    tl.store(cache_rope + slot * stride_cr_t + offsets, rope, mask=rope_mask)
+
+
+def _ds32_store_kv(
+    k_nope: torch.Tensor,
+    k_scale: torch.Tensor,
+    k_rope: torch.Tensor,
+    cache_nope: torch.Tensor,
+    cache_scale: torch.Tensor,
+    cache_rope: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> None:
+    _ds32_store_kv_kernel[(k_nope.shape[0],)](
+        k_nope,
+        k_scale,
+        k_rope,
+        cache_nope,
+        cache_scale,
+        cache_rope,
+        slot_mapping.flatten(),
+        k_nope.stride(0),
+        k_scale.stride(0),
+        k_rope.stride(0),
+        cache_nope.stride(0),
+        cache_scale.stride(0),
+        cache_rope.stride(0),
+        NOPE_DIM=_DS32_NOPE_DIM,
+        SCALE_DIM=_DS32_SCALE_DIM,
+        ROPE_DIM=_DS32_ROPE_DIM,
+        BLOCK=512,
+    )
 
 if False:
     try:
@@ -466,6 +541,164 @@ class MLAAttention(nn.Module):
         if self.head_pad > 0:
             return output[:, : (num_heads or self.num_heads), ...].contiguous()
         return output
+
+    def _validate_ds32_caches(
+        self,
+        kv_nope: torch.Tensor,
+        kv_scale: torch.Tensor,
+        kv_rope: torch.Tensor,
+    ) -> None:
+        """Verify the three independent cache buffers match the DS32 ABI."""
+        expected = (
+            (kv_nope, dtypes.fp8, _DS32_NOPE_DIM, "NoPE"),
+            (kv_scale, torch.uint8, _DS32_SCALE_DIM, "scale"),
+            (kv_rope, torch.bfloat16, _DS32_ROPE_DIM, "RoPE"),
+        )
+        for tensor, dtype, width, name in expected:
+            if (
+                tensor is None
+                or tensor.dtype != dtype
+                or tensor.ndim != 2
+                or tensor.shape[1] != width
+                or tensor.stride() != (width, 1)
+            ):
+                raise RuntimeError(
+                    f"DS32 {name} cache must be contiguous [slots, {width}] "
+                    f"{dtype}, got {None if tensor is None else (tensor.shape, tensor.dtype, tensor.stride())}."
+                )
+
+    def _ds32_quantize_nope(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Quantize a 512-wide MLA latent to MXFP8 with per-1x32 E8M0 scales."""
+        shape = x.shape
+        if shape[-1] != _DS32_NOPE_DIM:
+            raise RuntimeError(f"DS32 NoPE dimension must be 512, got {shape[-1]}.")
+        x_fp8, scale = get_hip_quant(QuantType.per_1x32)(
+            x.reshape(-1, _DS32_NOPE_DIM),
+            quant_dtype=dtypes.fp8,
+            scale_type=dtypes.fp8_e8m0,
+            shuffle=False,
+        )
+        x_fp8 = x_fp8.view(*shape)
+        scale = scale.view(torch.uint8).view(*shape[:-1], _DS32_SCALE_DIM)
+        return x_fp8, scale
+
+    def _write_ds32_kv_cache(
+        self,
+        k_nope: torch.Tensor,
+        k_rope: torch.Tensor,
+        kv_nope: torch.Tensor,
+        kv_scale: torch.Tensor,
+        kv_rope: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        """Quantize and store new KV entries in the three DS32 cache buffers."""
+        self._validate_ds32_caches(kv_nope, kv_scale, kv_rope)
+        k_nope_fp8, k_scale = self._ds32_quantize_nope(
+            k_nope.reshape(-1, _DS32_NOPE_DIM)
+        )
+        _ds32_store_kv(
+            k_nope_fp8,
+            k_scale,
+            k_rope.reshape(-1, _DS32_ROPE_DIM).to(torch.bfloat16),
+            kv_nope,
+            kv_scale,
+            kv_rope,
+            slot_mapping,
+        )
+
+    def _forward_ds32(
+        self,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        q_scale: torch.Tensor,
+        kv_nope: torch.Tensor,
+        kv_scale: torch.Tensor,
+        kv_rope: torch.Tensor,
+        attn_metadata: AttentionMetaData,
+        *,
+        is_prefill: bool,
+    ) -> torch.Tensor:
+        """Run DS32 sparse MLA with mode-specific persistent work metadata."""
+        # This path requires sparse top-k KV indices and currently supports
+        # single-token decode only; multi-token decode is the MTP case.
+        if not self.is_sparse_mla:
+            raise RuntimeError("DS32 is only used by sparse MLA.")
+        if not is_prefill and attn_metadata.max_seqlen_q > 1:
+            raise RuntimeError("DS32 MTP verification is not enabled in phase 1.")
+
+        # Adapt GLM's query-head count to the DS32 kernel contract. Apply the
+        # same transformation to values and their corresponding block scales.
+        num_heads_q = q_nope.shape[1]
+        q_nope = self._pad_query_heads(q_nope)
+        q_rope = self._pad_query_heads(q_rope).to(torch.bfloat16)
+        q_scale = self._pad_query_heads(q_scale)
+        self._validate_ds32_caches(kv_nope, kv_scale, kv_rope)
+
+        # Prefill and decode use different query indptr and persistent
+        # work/reduction metadata, while sharing sparse KV page metadata.
+        if is_prefill:
+            qo_indptr = attn_metadata.sparse_cu_seqlens_q
+            kv_indptr = attn_metadata.sparse_kv_indptr
+            kv_indices = self.sparse_kv_indices_buffer
+            kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens
+            work_meta_data = attn_metadata.sparse_prefill_work_meta_data
+            work_indptr = attn_metadata.sparse_prefill_work_indptr
+            work_info_set = attn_metadata.sparse_prefill_work_info_set
+            reduce_indptr = attn_metadata.sparse_prefill_reduce_indptr
+            reduce_final_map = attn_metadata.sparse_prefill_reduce_final_map
+            reduce_partial_map = attn_metadata.sparse_prefill_reduce_partial_map
+        else:
+            qo_indptr = attn_metadata.cu_seqlens_q
+            kv_indptr = attn_metadata.sparse_kv_indptr
+            kv_indices = self.sparse_kv_indices_buffer
+            kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens
+            work_meta_data = attn_metadata.work_meta_data
+            work_indptr = attn_metadata.work_indptr
+            work_info_set = attn_metadata.work_info_set
+            reduce_indptr = attn_metadata.reduce_indptr
+            reduce_final_map = attn_metadata.reduce_final_map
+            reduce_partial_map = attn_metadata.reduce_partial_map
+
+        if kv_indices is None:
+            raise RuntimeError("DS32 sparse KV indices are not bound.")
+
+        # The kernel returns one 512-wide compressed value latent per query
+        # head; V-up and output projections are applied after head restoration.
+        output = torch.empty(
+            q_nope.shape[0],
+            q_nope.shape[1],
+            _DS32_NOPE_DIM,
+            dtype=torch.bfloat16,
+            device=q_nope.device,
+        )
+        mla_decode_fwd_ds32(
+            q_nope,
+            q_rope,
+            kv_nope,
+            kv_rope,
+            output,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            1,
+            page_size=1,
+            nhead_kv=1,
+            sm_scale=self.scale,
+            num_kv_splits=16,
+            work_meta_data=work_meta_data,
+            work_indptr=work_indptr,
+            work_info_set=work_info_set,
+            reduce_indptr=reduce_indptr,
+            reduce_final_map=reduce_final_map,
+            reduce_partial_map=reduce_partial_map,
+            q_scale=q_scale,
+            kv_scale=kv_scale,
+        )
+        output = self._restore_query_heads(output, num_heads_q)
+        return self._v_up_proj_and_o_proj(output)
 
     def _seg_kv_cache_view(self, kv_cache: torch.Tensor) -> torch.Tensor:
         """Reshape the KV cache buffer into the page-level flat seg layout
@@ -1627,7 +1860,10 @@ class MLAAttention(nn.Module):
             output = torch.empty(output_shape, dtype=output_dtype, device=q.device)
             return output
         kv_cache_data = forward_context.kv_cache_data
-        kv_cache = kv_cache_data[f"layer_{self.layer_num}"].k_cache
+        layer_cache = kv_cache_data[f"layer_{self.layer_num}"]
+        kv_cache = layer_cache.k_cache
+        ds32_kv_scale = layer_cache.k_scale if self.use_ds32 else None
+        ds32_kv_rope = layer_cache.v_cache if self.use_ds32 else None
 
         if context.is_prefill and not use_prefill_mla:
             prefill_q = self.q_proj(q, x_scale=q_scale).view(
@@ -1637,7 +1873,18 @@ class MLAAttention(nn.Module):
             self.rotary_emb(positions, prefill_q_pe, k_rope)
 
             if kv_cache.numel() > 0:
-                if envs.ATOM_USE_TRITON_MLA and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
+                if self.use_ds32:
+                    # DS32 stores the compressed NoPE latent, its E8M0 block
+                    # scales, and the RoPE component in independent buffers.
+                    self._write_ds32_kv_cache(
+                        k_nope,
+                        k_rope,
+                        kv_cache,
+                        ds32_kv_scale,
+                        ds32_kv_rope,
+                        attn_metadata.slot_mapping,
+                    )
+                elif envs.ATOM_USE_TRITON_MLA and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
                     shuffled_cache = self._shuffled_kv_view(kv_cache)
                     triton_cat_and_cache_mla(
                         k_nope.view(-1, self.num_kv_heads, self.kv_lora_rank),
@@ -1693,6 +1940,35 @@ class MLAAttention(nn.Module):
                 )
         else:
             q_nope, q_rope = self._q_proj_and_k_up_proj(q, x_scale=q_scale)
+
+            if self.use_ds32:
+                # DS32 flow:
+                # - Apply RoPE and quantize the 512-wide query latent.
+                # - Write NoPE, scale, and RoPE to independent KV caches.
+                # - Run sparse attention, then V-up and output projection.
+                self.rotary_emb(positions, q_rope, k_rope)
+                q_nope_fp8, q_nope_scale = self._ds32_quantize_nope(q_nope)
+
+                if kv_cache.numel() > 0:
+                    self._write_ds32_kv_cache(
+                        k_nope,
+                        k_rope,
+                        kv_cache,
+                        ds32_kv_scale,
+                        ds32_kv_rope,
+                        attn_metadata.slot_mapping,
+                    )
+
+                return self._forward_ds32(
+                    q_nope_fp8,
+                    q_rope,
+                    q_nope_scale,
+                    kv_cache,
+                    ds32_kv_scale,
+                    ds32_kv_rope,
+                    attn_metadata,
+                    is_prefill=context.is_prefill,
+                )
 
             # ---- Prefill Context Parallel --------------------------------
             # q is this rank's 1/pcp queries, so q_out is naturally 1/pcp. But
