@@ -1,234 +1,8 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1785473430175,
+  "lastUpdate": 1785475410381,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
-      {
-        "commit": {
-          "author": {
-            "name": "Lingpeng Jin",
-            "username": "valarLip",
-            "email": "103567126+valarLip@users.noreply.github.com"
-          },
-          "committer": {
-            "name": "GitHub",
-            "username": "web-flow",
-            "email": "noreply@github.com"
-          },
-          "id": "dd64a5f1ae818fd81bec48d8b087d175c68f446f",
-          "message": "fix(dsv4): align TBO v4_batch_id_per_token buffer to int32 (#1526)\n\nThe ubatch (TBO) allocation of v4_batch_id_per_token was int64 while the\nnon-ubatch allocation was already int32. The staged numpy array is int32\n(np.full(..., dtype=np.int32)) and _stage() asserts arr.dtype == buffer.dtype,\nso serving with --enable-tbo hit the dtype-mismatch assertion the moment it\nstaged batch_id_per_token. Make the ubatch buffer int32 to match the array,\nthe non-ubatch buffer, and the downstream int32 consumers.\n\nint32 is correct here: batch_id is used as a PyTorch advanced index\n(cu_committed_gpu[batch_id_per_token_gpu]), which accepts int32, and the\ndownstream kernels (deepgemm_fp8_paged_mqa_logits, top_k_per_row_decode,\nflydsl SWA scatter) all want / tolerate int32.\n\nAlso fix two stale docs that contradicted the code:\n- _stage docstring said \"Auto-casts dtype\" but the body asserts dtype equality.\n- A comment claimed \"int64 batch_id is mandated by PyTorch fancy indexing\".",
-          "timestamp": "2026-07-09T13:59:56Z",
-          "url": "https://github.com/ROCm/ATOM/commit/dd64a5f1ae818fd81bec48d8b087d175c68f446f"
-        },
-        "date": 1783647941610,
-        "tool": "customBiggerIsBetter",
-        "benches": [
-          {
-            "name": "ATOM-vLLM::DeepSeek-R1-0528-MXFP4 TP8 accuracy (GSM8K)",
-            "value": 0.9409,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29041305257 | Threshold: 0.93 | Baseline: 0.93 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | Docker: rocm/atom-dev:vllm-v0.22.0-nightly_20260709 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.934 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4"
-          },
-          {
-            "name": "ATOM-vLLM::DeepSeek-R1-FP8 DP8+EP8 accuracy (GSM8K)",
-            "value": 0.3533,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29041305257 | Threshold: 0.93 | Baseline: 0.93 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | Docker: rocm/atom-dev:vllm-v0.22.0-nightly_20260709 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.2889 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
-          },
-          {
-            "name": "ATOM-vLLM::DeepSeek-R1-FP8 TP8 accuracy (GSM8K)",
-            "value": 0.9484,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29041305257 | Threshold: 0.93 | Baseline: 0.93 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | Docker: rocm/atom-dev:vllm-v0.22.0-nightly_20260709 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9447 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
-          },
-          {
-            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8 MTP TP4 accuracy (GSM8K)",
-            "value": 0.9515,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29041305257 | Threshold: 0.93 | Docker: rocm/atom-dev:vllm-v0.22.0-nightly_20260709 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9507 | fewshot: 20 | Model: /models/deepseek-ai/DeepSeek-V3.2"
-          },
-          {
-            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8 PTPC TP4 accuracy (GSM8K)",
-            "value": 0.9507,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29041305257 | Threshold: 0.93 | Docker: rocm/atom-dev:vllm-v0.22.0-nightly_20260709 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9507 | fewshot: 20 | Model: /models/DeepSeek-V3.2-mtp-ptpc"
-          },
-          {
-            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8 TP4 accuracy (GSM8K)",
-            "value": 0.9538,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29041305257 | Threshold: 0.93 | Docker: rocm/atom-dev:vllm-v0.22.0-nightly_20260709 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9522 | fewshot: 20 | Model: /models/deepseek-ai/DeepSeek-V3.2"
-          },
-          {
-            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8 TP8 accuracy (GSM8K)",
-            "value": 0.9484,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29041305257 | Threshold: 0.93 | Baseline: 0.956 | BaselineModel: deepseek-ai/DeepSeek-V3.2 | BaselineNote: 20-shot gsm8k reference from DeepSeek-V3.2 usage docs; nightly uses 20-shot to exercise sparse MLA. | Docker: rocm/atom-dev:vllm-v0.22.0-nightly_20260709 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9492 | fewshot: 20 | Model: /models/deepseek-ai/DeepSeek-V3.2"
-          },
-          {
-            "name": "ATOM-vLLM::DeepSeek-V4-Pro TP8 accuracy (GSM8K)",
-            "value": 0.95,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29041305257 | Threshold: 0.94 | Baseline: 0.94 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: 20-shot GSM8K local-completions coverage aligned with launch.sh/lm_eval.sh. | Docker: rocm/atom-dev:vllm-v0.22.0-nightly_20260709 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.95 | fewshot: 20 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
-          },
-          {
-            "name": "ATOM-vLLM::GLM-4.7-FP8 MTP TP4 accuracy (GSM8K)",
-            "value": 0.9424,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29041305257 | Threshold: 0.92 | Docker: rocm/atom-dev:vllm-v0.22.0-nightly_20260709 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9401 | fewshot: 3 | Model: /models/zai-org/GLM-4.7-FP8"
-          },
-          {
-            "name": "ATOM-vLLM::GLM-4.7-FP8 MTP TP8 accuracy (GSM8K)",
-            "value": 0.9378,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29041305257 | Threshold: 0.92 | Docker: rocm/atom-dev:vllm-v0.22.0-nightly_20260709 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9363 | fewshot: 3 | Model: /models/zai-org/GLM-4.7-FP8"
-          },
-          {
-            "name": "ATOM-vLLM::GLM-4.7-FP8 TP4 accuracy (GSM8K)",
-            "value": 0.9492,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29041305257 | Threshold: 0.92 | Docker: rocm/atom-dev:vllm-v0.22.0-nightly_20260709 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9469 | fewshot: 3 | Model: /models/zai-org/GLM-4.7-FP8"
-          },
-          {
-            "name": "ATOM-vLLM::GLM-4.7-FP8 TP8 accuracy (GSM8K)",
-            "value": 0.9363,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29041305257 | Threshold: 0.92 | Baseline: 0.9386 | BaselineModel: zai-org/GLM-4.7-FP8 | Docker: rocm/atom-dev:vllm-v0.22.0-nightly_20260709 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9371 | fewshot: 3 | Model: /models/zai-org/GLM-4.7-FP8"
-          },
-          {
-            "name": "ATOM-vLLM::GLM-5.1-FP8 TP8 accuracy (GSM8K)",
-            "value": 0.9515,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29041305257 | Threshold: 0.88 | Baseline: 0.9545 | BaselineModel: zai-org/GLM-5.1 | BaselineNote: CI uses 3-shot, not comparable to HF 5-shot baseline | Docker: rocm/atom-dev:vllm-v0.22.0-nightly_20260709 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9515 | fewshot: 20 | Model: /models/zai-org/GLM-5.1-FP8"
-          },
-          {
-            "name": "ATOM-vLLM::GLM-5.2-MXFP4 TP4 accuracy (GSM8K)",
-            "value": 0.9303,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29041305257 | Threshold: 0.92 | Baseline: 0.9447 | BaselineModel: zai-org/GLM-5.2-FP8 | BaselineNote: 20-shot GSM8K local-completions coverage for GLM-5.2-MXFP4 IndexShare; threshold/baseline follow GLM-5.2-FP8 until MXFP4 CI baseline is calibrated. | Docker: rocm/atom-dev:vllm-v0.22.0-nightly_20260709 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9303 | fewshot: 20 | Model: /models/GLM-5.2-MXFP4"
-          },
-          {
-            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4 TP4 accuracy (GSM8K)",
-            "value": 0.9204,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29041305257 | Threshold: 0.9 | Docker: rocm/atom-dev:vllm-v0.22.0-nightly_20260709 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9189 | fewshot: 3 | Model: /models/Kimi-K2-Thinking-MXFP4-AttnFP8"
-          },
-          {
-            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4 TP8 accuracy (GSM8K)",
-            "value": 0.9295,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29041305257 | Threshold: 0.9 | Baseline: 0.9 | BaselineModel: amd/Kimi-K2-Thinking-MXFP4 | Docker: rocm/atom-dev:vllm-v0.22.0-nightly_20260709 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.928 | fewshot: 3 | Model: /models/Kimi-K2-Thinking-MXFP4-AttnFP8"
-          },
-          {
-            "name": "ATOM-vLLM::Kimi-K2.5-MXFP4 TP4 accuracy (GSM8K)",
-            "value": 0.9386,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29041305257 | Threshold: 0.92 | Docker: rocm/atom-dev:vllm-v0.22.0-nightly_20260709 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9386 | fewshot: 3 | Model: /models/Kimi-K2.5-MXFP4-AttnFP8"
-          },
-          {
-            "name": "ATOM-vLLM::Kimi-K2.5-MXFP4 TP8 accuracy (GSM8K)",
-            "value": 0.931,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29041305257 | Threshold: 0.93 | Baseline: 0.93 | BaselineModel: amd/Kimi-K2.5-MXFP4 | BaselineNote: Reference value from recipes/atom_vllm/Kimi-K2.5.md | Docker: rocm/atom-dev:vllm-v0.22.0-nightly_20260709 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9287 | fewshot: 3 | Model: /models/Kimi-K2.5-MXFP4-AttnFP8"
-          },
-          {
-            "name": "ATOM-vLLM::Llama-3.1-8B-Instruct TP1 accuracy (GSM8K)",
-            "value": 0.7513,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29041305257 | Threshold: 0.73 | Baseline: 0.75 | BaselineModel: meta-llama/Llama-3.1-8B-Instruct | BaselineNote: Threshold aligned with existing 8B Llama baseline used in CI (3-shot GSM8K). | Docker: rocm/atom-dev:vllm-v0.22.0-nightly_20260709 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.6626 | fewshot: 3 | Model: /models/Llama-3.1-8B-Instruct"
-          },
-          {
-            "name": "ATOM-vLLM::Meta-Llama-3.1-405B-Instruct-FP8 TP8 accuracy (GSM8K)",
-            "value": 0.9439,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29041305257 | Threshold: 0.93 | Baseline: 0.91 | BaselineModel: Meta-Llama-3.1-405B-Instruct-FP8/ | BaselineNote: Threshold aligned with workflow matrix target for TP8 gsm8k (3-shot). | Docker: rocm/atom-dev:vllm-v0.22.0-nightly_20260709 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9181 | fewshot: 3 | Model: /models/Meta-Llama-3.1-405B-Instruct-FP8"
-          },
-          {
-            "name": "ATOM-vLLM::MiniMax-M2.5 TP2 accuracy (GSM8K)",
-            "value": 0.931,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29041305257 | Threshold: 0.92 | Docker: rocm/atom-dev:vllm-v0.22.0-nightly_20260709 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9287 | fewshot: 3 | Model: /models/MiniMaxAI/MiniMax-M2.5"
-          },
-          {
-            "name": "ATOM-vLLM::MiniMax-M2.5 TP4 accuracy (GSM8K)",
-            "value": 0.9287,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29041305257 | Threshold: 0.92 | Docker: rocm/atom-dev:vllm-v0.22.0-nightly_20260709 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.928 | fewshot: 3 | Model: /models/MiniMaxAI/MiniMax-M2.5"
-          },
-          {
-            "name": "ATOM-vLLM::Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8 accuracy (GSM8K)",
-            "value": 0.8992,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29041305257 | Threshold: 0.87 | Baseline: 0.87 | BaselineModel: Qwen/Qwen3-235B-A22B-Instruct-2507 | Docker: rocm/atom-dev:vllm-v0.22.0-nightly_20260709 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.8893 | fewshot: 3 | Model: /models/Qwen/Qwen3-235B-A22B-Instruct-2507-FP8"
-          },
-          {
-            "name": "ATOM-vLLM::Qwen3-Next-80B-A3B-Instruct-FP8 TP1 accuracy (GSM8K)",
-            "value": 0.8135,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29041305257 | Threshold: 0.81 | Docker: rocm/atom-dev:vllm-v0.22.0-nightly_20260709 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.7218 | fewshot: 3 | Model: /models/Qwen/Qwen3-Next-80B-A3B-Instruct-FP8"
-          },
-          {
-            "name": "ATOM-vLLM::Qwen3-Next-80B-A3B-Instruct-FP8 TP2 accuracy (GSM8K)",
-            "value": 0.8165,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29041305257 | Threshold: 0.81 | Docker: rocm/atom-dev:vllm-v0.22.0-nightly_20260709 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.7309 | fewshot: 3 | Model: /models/Qwen/Qwen3-Next-80B-A3B-Instruct-FP8"
-          },
-          {
-            "name": "ATOM-vLLM::Qwen3-Next-80B-A3B-Instruct-FP8 TP4 accuracy (GSM8K)",
-            "value": 0.8226,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29041305257 | Threshold: 0.81 | Baseline: 0.76 | BaselineModel: Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 | Docker: rocm/atom-dev:vllm-v0.22.0-nightly_20260709 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.7309 | fewshot: 3 | Model: /models/Qwen/Qwen3-Next-80B-A3B-Instruct-FP8"
-          },
-          {
-            "name": "ATOM-vLLM::Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1 accuracy (GSM8K)",
-            "value": 0.8188,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29041305257 | Threshold: 0.8 | Docker: rocm/atom-dev:vllm-v0.22.0-nightly_20260709 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.7301 | fewshot: 3 | Model: /models/Qwen/Qwen3-Next-80B-A3B-Instruct-FP8"
-          },
-          {
-            "name": "ATOM-vLLM::Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4 accuracy (GSM8K)",
-            "value": 0.8173,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29041305257 | Threshold: 0.8 | Baseline: 0.81 | BaselineModel: Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 | BaselineNote: Qwen3-Next-80B-A3B-Instruct-FP8 baseline with TP4 (no MTP) as proxy; needs CI measurement for MTP-specific baseline | Docker: rocm/atom-dev:vllm-v0.22.0-nightly_20260709 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.7293 | fewshot: 3 | Model: /models/Qwen/Qwen3-Next-80B-A3B-Instruct-FP8"
-          },
-          {
-            "name": "ATOM-vLLM::Qwen3.5-397B-A17B TP8 accuracy (GSM8K)",
-            "value": 0.8681,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29041305257 | Threshold: 0.83 | Baseline: 0.83 | BaselineModel: Qwen/Qwen3.5-397B-A17B | Docker: rocm/atom-dev:vllm-v0.22.0-nightly_20260709 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.8529 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-397B-A17B"
-          },
-          {
-            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-FP8 TP4 accuracy (GSM8K)",
-            "value": 0.8779,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29041305257 | Threshold: 0.83 | Docker: rocm/atom-dev:vllm-v0.22.0-nightly_20260709 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.8613 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-397B-A17B-FP8"
-          },
-          {
-            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4 TP4 accuracy (GSM8K)",
-            "value": 0.8438,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29041305257 | Threshold: 0.83 | Baseline: 0.82 | BaselineModel: Qwen/Qwen3-235B-A22B-Instruct-2507 | BaselineNote: Using Qwen3-235B baseline as proxy; needs CI measurement for Qwen3.5 specific baseline | Docker: rocm/atom-dev:vllm-v0.22.0-nightly_20260709 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.8302 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-397B-A17B-MXFP4"
-          },
-          {
-            "name": "ATOM-vLLM::gpt-oss-120b TP1 accuracy (GSM8K)",
-            "value": 0.9083,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29041305257 | Threshold: 0.88 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | Docker: rocm/atom-dev:vllm-v0.22.0-nightly_20260709 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.3192 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
-          },
-          {
-            "name": "ATOM-vLLM::gpt-oss-120b TP2 accuracy (GSM8K)",
-            "value": 0.8863,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29041305257 | Threshold: 0.88 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | Docker: rocm/atom-dev:vllm-v0.22.0-nightly_20260709 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.4375 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
-          },
-          {
-            "name": "ATOM-vLLM::gpt-oss-120b TP8 accuracy (GSM8K)",
-            "value": 0.8772,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29041305257 | Threshold: 0.88 | Docker: rocm/atom-dev:vllm-v0.22.0-nightly_20260709 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.4094 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
-          }
-        ]
-      },
       {
         "commit": {
           "author": {
@@ -368845,6 +368619,1408 @@ window.BENCHMARK_DATA = {
           },
           {
             "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=16 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=32 throughput (tok/s)",
+            "value": 1546.36,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 13802.07,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=32 TTFT (ms)",
+            "value": 922.67,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=32 TPOT (ms)",
+            "value": 19.2,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=32 Accept Length (tok/fwd)",
+            "value": 3.88,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=32 Acceptance Rate (%)",
+            "value": 57.52,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=32 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=32 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=4 throughput (tok/s)",
+            "value": 475.45,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 4264.89,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=4 TTFT (ms)",
+            "value": 435.56,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=4 TPOT (ms)",
+            "value": 7.67,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=4 Accept Length (tok/fwd)",
+            "value": 3.6,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=4 Acceptance Rate (%)",
+            "value": 52.08,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=4 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=4 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=64 throughput (tok/s)",
+            "value": 1898.13,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 17073.15,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=64 TTFT (ms)",
+            "value": 1410.51,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=64 TPOT (ms)",
+            "value": 31.58,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=64 Accept Length (tok/fwd)",
+            "value": 3.94,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=64 Acceptance Rate (%)",
+            "value": 58.81,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=64 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=64 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=8 throughput (tok/s)",
+            "value": 750.73,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 6665.07,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=8 TTFT (ms)",
+            "value": 485.98,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=8 TPOT (ms)",
+            "value": 9.64,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=8 Accept Length (tok/fwd)",
+            "value": 3.92,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=8 Acceptance Rate (%)",
+            "value": 58.33,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=8 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=8 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=128 throughput (tok/s)",
+            "value": 2145.45,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 19362.86,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=128 TTFT (ms)",
+            "value": 2370.05,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=128 TPOT (ms)",
+            "value": 56.1,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=128 Accept Length (tok/fwd)",
+            "value": 1.83,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=128 Acceptance Rate (%)",
+            "value": 82.89,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=128 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=128 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=16 throughput (tok/s)",
+            "value": 962.77,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 8685.7,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=16 TTFT (ms)",
+            "value": 604.11,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=16 TPOT (ms)",
+            "value": 15.42,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=16 Accept Length (tok/fwd)",
+            "value": 1.84,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=16 Acceptance Rate (%)",
+            "value": 83.54,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=16 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=16 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=256 throughput (tok/s)",
+            "value": 2414.96,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 21720.28,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=256 TTFT (ms)",
+            "value": 4397.22,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=256 TPOT (ms)",
+            "value": 99.6,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=256 Accept Length (tok/fwd)",
+            "value": 1.84,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=256 Acceptance Rate (%)",
+            "value": 84,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=256 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=256 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=32 throughput (tok/s)",
+            "value": 1307.36,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 11686.91,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=32 TTFT (ms)",
+            "value": 847.47,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=32 TPOT (ms)",
+            "value": 22.85,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=32 Accept Length (tok/fwd)",
+            "value": 1.81,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=32 Acceptance Rate (%)",
+            "value": 81.37,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=32 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=32 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=4 throughput (tok/s)",
+            "value": 356.77,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 3206.21,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=4 TTFT (ms)",
+            "value": 454.5,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=4 TPOT (ms)",
+            "value": 10.34,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=4 Accept Length (tok/fwd)",
+            "value": 1.83,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=4 Acceptance Rate (%)",
+            "value": 83.12,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=4 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=4 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=64 throughput (tok/s)",
+            "value": 1732.53,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 15611.66,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=64 TTFT (ms)",
+            "value": 1290.48,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=64 TPOT (ms)",
+            "value": 34.88,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=64 Accept Length (tok/fwd)",
+            "value": 1.83,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=64 Acceptance Rate (%)",
+            "value": 82.7,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=64 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=64 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=8 throughput (tok/s)",
+            "value": 615.71,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 5475.36,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=8 TTFT (ms)",
+            "value": 448.68,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=8 TPOT (ms)",
+            "value": 12.22,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=8 Accept Length (tok/fwd)",
+            "value": 1.84,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=8 Acceptance Rate (%)",
+            "value": 83.84,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=8 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test MTP1 8192/1024 c=8 _tp",
+            "value": 8,
+            "unit": ""
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "ZhangLirong",
+            "username": "ZhangLirong-amd",
+            "email": "lirzhang@amd.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "da1be98ea9ec54c9e7ea673fdd7d600ae833765b",
+          "message": "Update atom-benchmark.yaml",
+          "timestamp": "2026-07-31T03:19:49Z",
+          "url": "https://github.com/ROCm/ATOM/commit/da1be98ea9ec54c9e7ea673fdd7d600ae833765b"
+        },
+        "date": 1785475382255,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 8192/1024 c=128 throughput (tok/s)",
+            "value": 2764.26,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 24906.68,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 8192/1024 c=128 TTFT (ms)",
+            "value": 6836.4,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 8192/1024 c=128 TPOT (ms)",
+            "value": 32.54,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 8192/1024 c=128 Accept Length (tok/fwd)",
+            "value": 3.85,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 8192/1024 c=128 Acceptance Rate (%)",
+            "value": 57.08,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 8192/1024 c=128 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 8192/1024 c=128 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 8192/1024 c=256 throughput (tok/s)",
+            "value": 3812.6,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 34236.76,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 8192/1024 c=256 TTFT (ms)",
+            "value": 8070.73,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 8192/1024 c=256 TPOT (ms)",
+            "value": 51.3,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 8192/1024 c=256 Accept Length (tok/fwd)",
+            "value": 3.93,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 8192/1024 c=256 Acceptance Rate (%)",
+            "value": 58.66,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 8192/1024 c=256 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 8192/1024 c=256 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 8192/1024 c=64 throughput (tok/s)",
+            "value": 1836.5,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 16520.62,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 8192/1024 c=64 TTFT (ms)",
+            "value": 6458.02,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 8192/1024 c=64 TPOT (ms)",
+            "value": 22.7,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 8192/1024 c=64 Accept Length (tok/fwd)",
+            "value": 3.85,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 8192/1024 c=64 Acceptance Rate (%)",
+            "value": 56.97,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 8192/1024 c=64 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 8192/1024 c=64 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 FULL 8192/1024 c=128 throughput (tok/s)",
+            "value": 3349.24,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 FULL 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 30179.02,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 FULL 8192/1024 c=128 TTFT (ms)",
+            "value": 6508.52,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 FULL 8192/1024 c=128 TPOT (ms)",
+            "value": 28.91,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 FULL 8192/1024 c=128 Accept Length (tok/fwd)",
+            "value": 4.07,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 FULL 8192/1024 c=128 Acceptance Rate (%)",
+            "value": 61.35,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 FULL 8192/1024 c=128 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 FULL 8192/1024 c=128 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 FULL 8192/1024 c=256 throughput (tok/s)",
+            "value": 4222.97,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 FULL 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 37921.31,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 FULL 8192/1024 c=256 TTFT (ms)",
+            "value": 8085.69,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 FULL 8192/1024 c=256 TPOT (ms)",
+            "value": 49.52,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 FULL 8192/1024 c=256 Accept Length (tok/fwd)",
+            "value": 4.14,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 FULL 8192/1024 c=256 Acceptance Rate (%)",
+            "value": 62.76,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 FULL 8192/1024 c=256 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 FULL 8192/1024 c=256 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 FULL 8192/1024 c=64 throughput (tok/s)",
+            "value": 1932.8,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 FULL 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 17389.99,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 FULL 8192/1024 c=64 TTFT (ms)",
+            "value": 7011.34,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 FULL 8192/1024 c=64 TPOT (ms)",
+            "value": 23.48,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 FULL 8192/1024 c=64 Accept Length (tok/fwd)",
+            "value": 3.69,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 FULL 8192/1024 c=64 Acceptance Rate (%)",
+            "value": 53.72,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 FULL 8192/1024 c=64 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA DSpark5 FULL 8192/1024 c=64 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA MTP1 8192/1024 c=128 throughput (tok/s)",
+            "value": 2985.6,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA MTP1 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 26945.81,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA MTP1 8192/1024 c=128 TTFT (ms)",
+            "value": 5541.93,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA MTP1 8192/1024 c=128 TPOT (ms)",
+            "value": 35.52,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA MTP1 8192/1024 c=128 Accept Length (tok/fwd)",
+            "value": 1.83,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA MTP1 8192/1024 c=128 Acceptance Rate (%)",
+            "value": 82.83,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA MTP1 8192/1024 c=128 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA MTP1 8192/1024 c=128 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA MTP1 8192/1024 c=256 throughput (tok/s)",
+            "value": 3886.94,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA MTP1 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 34959.96,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA MTP1 8192/1024 c=256 TTFT (ms)",
+            "value": 7006.13,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA MTP1 8192/1024 c=256 TPOT (ms)",
+            "value": 56.54,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA MTP1 8192/1024 c=256 Accept Length (tok/fwd)",
+            "value": 1.84,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA MTP1 8192/1024 c=256 Acceptance Rate (%)",
+            "value": 83.99,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA MTP1 8192/1024 c=256 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA MTP1 8192/1024 c=256 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA MTP1 8192/1024 c=64 throughput (tok/s)",
+            "value": 2036.09,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA MTP1 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 18347.04,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA MTP1 8192/1024 c=64 TTFT (ms)",
+            "value": 4609.33,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA MTP1 8192/1024 c=64 TPOT (ms)",
+            "value": 24.99,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA MTP1 8192/1024 c=64 Accept Length (tok/fwd)",
+            "value": 1.83,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA MTP1 8192/1024 c=64 Acceptance Rate (%)",
+            "value": 82.56,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA MTP1 8192/1024 c=64 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DPA MTP1 8192/1024 c=64 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=128 throughput (tok/s)",
+            "value": 2100.21,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 18928.81,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=128 TTFT (ms)",
+            "value": 2368,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=128 TPOT (ms)",
+            "value": 56.58,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=128 Accept Length (tok/fwd)",
+            "value": 3.41,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=128 Acceptance Rate (%)",
+            "value": 48.22,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=128 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=128 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=16 throughput (tok/s)",
+            "value": 724.15,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 6523.08,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=16 TTFT (ms)",
+            "value": 671.38,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=16 TPOT (ms)",
+            "value": 20.45,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=16 Accept Length (tok/fwd)",
+            "value": 3.45,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=16 Acceptance Rate (%)",
+            "value": 48.92,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=16 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=16 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=256 throughput (tok/s)",
+            "value": 2332.52,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 20948.61,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=256 TTFT (ms)",
+            "value": 4137.47,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=256 TPOT (ms)",
+            "value": 102.98,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=256 Accept Length (tok/fwd)",
+            "value": 3.36,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=256 Acceptance Rate (%)",
+            "value": 47.25,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=256 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=256 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=32 throughput (tok/s)",
+            "value": 1128.12,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 10070.6,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=32 TTFT (ms)",
+            "value": 890.52,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=32 TPOT (ms)",
+            "value": 26.13,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=32 Accept Length (tok/fwd)",
+            "value": 3.32,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=32 Acceptance Rate (%)",
+            "value": 46.37,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=32 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=32 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=4 throughput (tok/s)",
+            "value": 216.1,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 1939.47,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=4 TTFT (ms)",
+            "value": 466.73,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=4 TPOT (ms)",
+            "value": 17.8,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=4 Accept Length (tok/fwd)",
+            "value": 3.38,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=4 Acceptance Rate (%)",
+            "value": 47.54,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=4 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=4 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=64 throughput (tok/s)",
+            "value": 1630.19,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 14669.04,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=64 TTFT (ms)",
+            "value": 1354.47,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=64 TPOT (ms)",
+            "value": 35.9,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=64 Accept Length (tok/fwd)",
+            "value": 3.37,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=64 Acceptance Rate (%)",
+            "value": 47.42,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=64 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=64 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=8 throughput (tok/s)",
+            "value": 382.22,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 3394.21,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=8 TTFT (ms)",
+            "value": 538.28,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=8 TPOT (ms)",
+            "value": 18.73,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=8 Accept Length (tok/fwd)",
+            "value": 3.4,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=8 Acceptance Rate (%)",
+            "value": 48.07,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=8 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 8192/1024 c=8 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=128 throughput (tok/s)",
+            "value": 2252.66,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 20295.25,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=128 TTFT (ms)",
+            "value": 2431.35,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=128 TPOT (ms)",
+            "value": 53.18,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=128 Accept Length (tok/fwd)",
+            "value": 3.96,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=128 Acceptance Rate (%)",
+            "value": 59.26,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=128 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=128 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=16 throughput (tok/s)",
+            "value": 1111.75,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 10013.91,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=16 TTFT (ms)",
+            "value": 609.78,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=16 TPOT (ms)",
+            "value": 13.22,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=16 Accept Length (tok/fwd)",
+            "value": 3.89,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=16 Acceptance Rate (%)",
+            "value": 57.71,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=16 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=16 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=256 throughput (tok/s)",
+            "value": 2456.32,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 22056.4,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=256 TTFT (ms)",
+            "value": 4267.47,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=256 TPOT (ms)",
+            "value": 98.46,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=256 Accept Length (tok/fwd)",
+            "value": 3.76,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=256 Acceptance Rate (%)",
+            "value": 55.13,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30601456667 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607301400"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=256 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro-DSpark-Test DSpark5 FULL 8192/1024 c=256 _tp",
             "value": 8,
             "unit": ""
           },
