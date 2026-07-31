@@ -63,6 +63,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_TRITON_MOE_DECODE": lambda: os.getenv("ATOM_USE_TRITON_MOE_DECODE", "0")
     == "1",
     "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
+    # --- HiSparse (DSA decode HBM offload) ---
+    # Master switch. When on (and the model is sparse/DSA), decode-phase MLA
+    # attention reads a fixed-size GPU hot buffer swapped in per step from a CPU
+    # pinned cold pool, instead of the full GPU KV cache.
+    "ATOM_HISPARSE_ENABLE": lambda: os.getenv("ATOM_HISPARSE_ENABLE", "0") == "1",
+    # Per-request resident hot tokens (H). The hot buffer holds H+1 slots/request.
+    "ATOM_HISPARSE_HOT_BUFFER_SIZE": lambda: int(
+        os.getenv("ATOM_HISPARSE_HOT_BUFFER_SIZE", "8192")
+    ),
     # --- Kernel Fusion Toggles ---
     # fused_compress_attn: switch between Triton (default historical) and a
     # flydsl drop-in for V4-Pro Compressor (Main BF16 + Indexer FP8) paths.

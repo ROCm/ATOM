@@ -4,18 +4,17 @@
 import inspect
 import logging
 from dataclasses import dataclass
-from typing import List, Optional, Type
 
 import numpy as np
 import torch
 import triton
-from atom.utils import envs
 from aiter import (
     decode_update_mla_metadata_v1,
     dtypes,
     get_mla_metadata_info_v1,
     get_mla_metadata_v1,
 )
+
 from atom.distributed.pcp_utils import (
     get_pcp_world_size,
     pcp_is_enabled,
@@ -25,7 +24,7 @@ from atom.distributed.pcp_utils import (
 )
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import _MLA_MIN_HEADS, MLAAttention
-from atom.utils import CpuGpuBuffer
+from atom.utils import CpuGpuBuffer, envs
 from atom.utils.block_convert import (
     kv_indices_generate_triton,
     mtp_prepare_decode_mla_kernel,
@@ -75,18 +74,18 @@ class MLAChunkContextMetadata:
     iteration); only `[:total_tokens[c]]` is valid for chunk c.
     """
 
-    kv_indptr: List[torch.Tensor]
-    kv_indices: List[torch.Tensor]
-    cu_seqlens_k: List[torch.Tensor]
-    total_tokens: List[int]
-    max_seqlen_k: List[int]
+    kv_indptr: list[torch.Tensor]
+    kv_indices: list[torch.Tensor]
+    cu_seqlens_k: list[torch.Tensor]
+    total_tokens: list[int]
+    max_seqlen_k: list[int]
     num_chunks: int
     k_workspace: torch.Tensor
     v_workspace: torch.Tensor
     # Block-granular CSR per chunk for the shuffled-KV gather (block_size=64
     # blocks instead of token slots). None for the plain token-slot layout.
-    shuffle_kv_block_indptr: Optional[List[torch.Tensor]] = None
-    shuffle_kv_block_indices: Optional[List[torch.Tensor]] = None
+    shuffle_kv_block_indptr: list[torch.Tensor] | None = None
+    shuffle_kv_block_indices: list[torch.Tensor] | None = None
 
 
 def cdiv(a, b):
@@ -99,11 +98,11 @@ class AiterMLABackend(AttentionBackend):
         return "ROCM_AITER_MLA"
 
     @staticmethod
-    def get_builder_cls() -> Type["AiterMLAMetadataBuilder"]:
+    def get_builder_cls() -> type["AiterMLAMetadataBuilder"]:
         return AiterMLAMetadataBuilder
 
     @staticmethod
-    def get_impl_cls() -> Type["MLAAttention"]:
+    def get_impl_cls() -> type["MLAAttention"]:
         return MLAAttention
 
 
@@ -135,6 +134,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self.padded_num_attention_heads = max(self.num_attention_heads, _MLA_MIN_HEADS)
         self.is_sparse = model_runner.is_deepseek_v32
         self.index_topk = hf_config.index_topk if self.is_sparse else -1
+        self.hisparse_enabled = envs.ATOM_HISPARSE_ENABLE and self.is_sparse
         self.dtype_kv = dtypes.d_dtypes[config.kv_cache_dtype]
         self.dtype_q = self.dtype_kv
 
@@ -307,8 +307,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # Allocated outside any per-step scope so a single buffer is shared
         # across all chunks and layers.
         self.attn_prefill_chunk_size = config.attn_prefill_chunk_size
-        self.k_chunk_workspace: Optional[torch.Tensor] = None
-        self.v_chunk_workspace: Optional[torch.Tensor] = None
+        self.k_chunk_workspace: torch.Tensor | None = None
+        self.v_chunk_workspace: torch.Tensor | None = None
         if self.attn_prefill_chunk_size > 0:
             qk_head_dim = hf_config.qk_nope_head_dim + hf_config.qk_rope_head_dim
             v_head_dim = hf_config.v_head_dim
@@ -785,6 +785,43 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 dtype=dtypes.fp8,
                 device="cuda",
             )
+        if self.hisparse_enabled:
+            from atom.hisparse.coordinator import HiSparseCoordinator
+            from atom.models.deepseek_v2 import set_hisparse_topk_buffer
+
+            hot = envs.ATOM_HISPARSE_HOT_BUFFER_SIZE
+            # The MLA kernel reads every selected top-k in one step, so all
+            # index_topk tokens must fit resident simultaneously.
+            assert hot >= self.index_topk, (
+                f"ATOM_HISPARSE_HOT_BUFFER_SIZE ({hot}) must be >= index_topk "
+                f"({self.index_topk}); hot buffer cannot hold a full top-k set."
+            )
+            # HiSparse translates to per-token hot-buffer rows and reads the hot
+            # buffer as page_size=1; the seg/triton MLA layouts are incompatible.
+            assert envs.ATOM_MLA_PAGE_SIZE == 1 and not envs.ATOM_USE_TRITON_MLA, (
+                "HiSparse requires ATOM_MLA_PAGE_SIZE=1 and non-triton MLA "
+                "(page_size=1 sparse decode path)."
+            )
+            out["hisparse_coordinator"] = HiSparseCoordinator(
+                num_layers=total_num_layers,
+                max_num_seqs=config.max_num_seqs,
+                hot_buffer_size=envs.ATOM_HISPARSE_HOT_BUFFER_SIZE,
+                max_context_len=config.max_model_len,
+                kv_dim=576,
+                kv_dtype=dtypes.d_dtypes[config.kv_cache_dtype],
+                device="cuda",
+            )
+            # Shared logical-top-k side-channel buffer (one per decode query
+            # token), written by the indexer op and read by the coordinator.
+            topk_buf = torch.empty(
+                self.max_num_batched_tokens,
+                self.index_topk,
+                dtype=torch.int32,
+                device="cuda",
+            )
+            out["hisparse_topk_buffer"] = topk_buf
+            out["hisparse_coordinator"].topk_buffer = topk_buf
+            set_hisparse_topk_buffer(topk_buf)
         return out
 
     def build_kv_cache_tensor(self, layer_id: int, module):
@@ -821,6 +858,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 runner.aligned_index_dim,
             )
         module.kv_cache = kv_cache
+        coord = getattr(runner, "hisparse_coordinator", None)
+        if coord is not None:
+            # The MLAAttention (where _forward_decode + _hisparse_coord live) is
+            # module.impl; module.base_attention is an unrelated None default.
+            impl = getattr(module, "impl", None)
+            if impl is not None and hasattr(impl, "_hisparse_coord"):
+                impl._hisparse_coord = coord
+                impl._hisparse_layer_id = layer_id
         return KVCacheTensor(
             layer_num=layer_id,
             k_cache=kv_cache,
@@ -1039,7 +1084,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
     def _build_mla_chunk_meta(
         self, batch: ScheduledBatch, bs: int
-    ) -> Optional[MLAChunkContextMetadata]:
+    ) -> MLAChunkContextMetadata | None:
         """Build per-chunk slices of the cached prefix.
 
         Chunks the cached-prefix tokens along the GLOBAL token axis (not the
@@ -1064,7 +1109,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         # Per-seq absolute slot id for every cached token, in seq order, then
         # concatenated into a single global slot array of length total_cached.
-        per_seq_slots: List[np.ndarray] = []
+        per_seq_slots: list[np.ndarray] = []
         for i in range(bs):
             cached_len = int(cached_lens[i])
             if cached_len == 0:
@@ -1083,11 +1128,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         seq_offsets = np.zeros(bs + 1, dtype=np.int64)
         np.cumsum(cached_lens, out=seq_offsets[1:])
 
-        kv_indptr_list: List[torch.Tensor] = []
-        kv_indices_list: List[torch.Tensor] = []
-        cu_seqlens_k_list: List[torch.Tensor] = []
-        total_tokens_list: List[int] = []
-        max_seqlen_k_list: List[int] = []
+        kv_indptr_list: list[torch.Tensor] = []
+        kv_indices_list: list[torch.Tensor] = []
+        cu_seqlens_k_list: list[torch.Tensor] = []
+        total_tokens_list: list[int] = []
+        max_seqlen_k_list: list[int] = []
 
         for c in range(num_chunks):
             g_start = c * chunk_size
@@ -1472,6 +1517,35 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.sparse_kv_last_page_lens = var[
                 "sparse_kv_last_page_lens"
             ].gpu[:bs]
+
+        # HiSparse: per-query-token stable cold-pool slot (CPU; consumed by the
+        # coordinator's CPU miss-detect). Set only on real decode steps where all
+        # batch requests are already staged (forward -> stage -> prepare order).
+        coord = getattr(self.model_runner, "hisparse_coordinator", None)
+        if (
+            coord is not None
+            and self.is_sparse
+            and not batch.is_dummy_run
+            and all(coord.is_registered(rid) for rid in batch.req_ids)
+        ):
+            n_tok = bs * max_seqlen_q if max_seqlen_q > 1 else bs
+            slots = torch.zeros(n_tok, dtype=torch.int32)
+            # logical position of each query token (the position written this step)
+            token_pos = torch.zeros(n_tok, dtype=torch.int64)
+            per_seq = [coord.slot_for_req(rid) for rid in batch.req_ids]
+            for s in range(scheduled_bs):
+                ctx_s = int(context_lens[s])
+                if max_seqlen_q > 1:
+                    sl = slice(s * max_seqlen_q, (s + 1) * max_seqlen_q)
+                    slots[sl] = per_seq[s]
+                    token_pos[sl] = torch.arange(
+                        ctx_s - max_seqlen_q, ctx_s, dtype=torch.int64
+                    )
+                else:
+                    slots[s] = per_seq[s]
+                    token_pos[s] = ctx_s - 1
+            attn_metadata.hisparse_req_slots = slots
+            attn_metadata.hisparse_token_pos = token_pos
 
         # Use bs (graph_bs) >= 2 instead of scheduled_bs >= 2 to avoid accuracy issue:
         if self.model_runner.config.enable_tbo_decode and bs >= 2:

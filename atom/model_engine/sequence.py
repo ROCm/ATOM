@@ -110,6 +110,9 @@ class Sequence:
         self.stop_strings = sampling_params.stop_strings
         self.stop_token_sequences = stop_token_sequences or []
         self.is_first_decode = False
+        # HiSparse: stable coordinator slot for this request's cold-pool region,
+        # assigned on first decode, -1 while unassigned. See atom/hisparse/.
+        self.hisparse_req_slot = -1
         # Set to True by Scheduler.postprocess after BlockManager.hash_blocks
         # has registered the prompt blocks for prefix caching. The trigger has
         # to be per-seq because in deferred-output mode the prefill step's
