@@ -106,6 +106,13 @@ class FusedMoeWeightScaleSupported(Enum):
     BLOCK = "block"
 
 
+# Saturating magnitude for the synthetic logits. The picked/unpicked gap after
+# sigmoid (or softmax / sqrtsoftplus) then swamps a router correction bias, which
+# is added to the score before top-k. sigmoid caps that gap at 1.0, so a bias
+# spread wider than 1.0 can still reorder the selection.
+_FAKE_EPLB_LOGIT = 10.0
+
+
 @lru_cache(maxsize=1)
 def init_balance_router_logits(
     n_routed_experts: int,
@@ -113,50 +120,54 @@ def init_balance_router_logits(
     ep_size: int = 1,
     dp_size: int = 1,
     dp_rank: int = 0,
+    n_group: int = 1,
+    topk_group: int = 1,
     dtype: torch.dtype = torch.bfloat16,
     max_num_tokens: int = 32768,
 ):
-    # Build synthetic router logits whose argmax-topk is balanced BOTH across
-    # experts and across EP ranks. ATOM uses contiguous expert->rank sharding
-    # (rank r owns experts [r*L, (r+1)*L), L = E // ep_size). We lay every
-    # (token, choice) pair onto a single flat position p = t * topk + j and walk
-    # the expert ring with no gaps: rank = p % ep_size, slot = (p // ep_size) % L.
-    # Because successive positions advance the rank by one with no overlap, each
-    # token's topk experts land on distinct ranks (and distinct experts), and the
-    # ranks stay balanced as soon as T * topk is a multiple of ep_size -- which
-    # holds far sooner than the per-row rotation would (small decode batches
-    # included).
+    # Synthetic router logits whose top-k is balanced across both experts and EP
+    # ranks. ATOM shards experts contiguously (rank r owns [r*L, (r+1)*L), with
+    # L = E // ep_size), so we walk one flat ring: position p = t * topk + j takes
+    # rank p % ep_size and slot (p // ep_size) % L. Consecutive positions step the
+    # rank by one, so a token's experts land on distinct ranks and rank load stays
+    # even at any batch size -- down to single-token decode, unlike a per-row
+    # rotation.
     #
-    # router_logits is replaced per-device BEFORE the MoE gather, so the axis we
-    # must interleave on is the TOKEN-SHARD axis, i.e. DP (dp_size / dp_rank),
-    # NOT EP. With DP-attention each DP group owns a distinct token slice, while
-    # TP ranks inside a DP group share the same tokens -- so devices in the same
-    # DP group must use the SAME table (same dp_rank) and only different DP groups
-    # get offset via t = dp_rank + i * dp_size. This tiles the expert ring across
-    # DP groups so the aggregated all2all load covers dp_size * n token patterns
-    # instead of n. Pure TP-attn + EP has dp_size == 1, so every device shares one
-    # table and identical tokens route identically, as required.
+    # t = dp_rank + i * dp_size rather than plain i: the table is substituted per
+    # device before the MoE gather, so the axis to interleave on is the token-shard
+    # axis, which is DP. TP ranks inside a DP group see the same tokens and must
+    # share one table; pure TP-attn + EP collapses to dp_size == 1.
     device = "cuda"
     E = n_routed_experts
-    if ep_size <= 1:
-        # No EP: rank-balance is trivial; keep pure expert-balance via a rolling
-        # window of topk consecutive experts per token.
-        stride = E + topk
-        max_num_tokens_pad = (max_num_tokens + stride - 1) // stride * stride
-        padded = torch.zeros((max_num_tokens_pad, E), dtype=dtype, device=device)
-        padded.view(-1, stride)[:, :topk] = 1.0
-        return padded[:max_num_tokens].contiguous()
+    L = max(1, E // ep_size)  # experts per rank; a remainder is left unused
+    t = dp_rank + torch.arange(max_num_tokens, device=device) * dp_size  # (T,)
 
-    router_logits = torch.zeros((max_num_tokens, E), dtype=dtype, device=device)
-    L = E // ep_size  # experts per rank (remainder experts are left unused)
-    i = torch.arange(max_num_tokens, device=device).unsqueeze(1)  # (T, 1)
-    j = torch.arange(topk, device=device).unsqueeze(0)  # (1, topk)
-    t = dp_rank + i * dp_size  # this DP group's slice of the global token axis
-    p = t * topk + j  # flat position on the expert ring
-    rank = p % ep_size
-    slot = (p // ep_size) % L
-    expert_ids = rank * L + slot  # (T, topk)
-    router_logits.scatter_(1, expert_ids, 1.0)
+    if n_group > 1 and 0 < topk_group < n_group and topk % topk_group == 0:
+        # Group-limited routing (DeepSeek): every group but topk_group of n_group
+        # is masked out before top-k, so a ring laid across all groups loses the
+        # choices that fall in the masked ones. Run it inside a rotating set of
+        # groups instead, and inside each group across the EP ranks that group
+        # spans. A token can only reach topk_group groups by construction, so rank
+        # load evens out over ceil(n_group / topk_group) tokens, not at T == 1.
+        gs = E // n_group  # experts per group
+        rg = max(1, gs // L)  # EP ranks spanned by one group
+        sub = gs // rg  # experts per (group, rank) pair
+        c = topk // topk_group  # choices placed in each selected group
+        m = torch.arange(topk_group, device=device).view(1, -1, 1)
+        k = torch.arange(c, device=device).view(1, 1, -1)
+        q = t.view(-1, 1, 1) * topk_group + m  # position on the group ring
+        p = (q // n_group) * c + k  # visits to that group so far
+        slot = (p % rg) * sub + (p // rg) % sub
+        expert_ids = ((q % n_group) * gs + slot).reshape(max_num_tokens, topk)
+    else:
+        j = torch.arange(topk, device=device).unsqueeze(0)
+        p = t.unsqueeze(1) * topk + j
+        expert_ids = (p % ep_size) * L + (p // ep_size) % L  # (T, topk)
+
+    router_logits = torch.full(
+        (max_num_tokens, E), -_FAKE_EPLB_LOGIT, dtype=dtype, device=device
+    )
+    router_logits.scatter_(1, expert_ids, _FAKE_EPLB_LOGIT)
     return router_logits
 
 
@@ -2717,6 +2728,8 @@ class FusedMoE(torch.nn.Module):
                 self.ep_size if self.use_ep else 1,
                 self.dp_size if _dp_shard else 1,
                 self.dp_rank if _dp_shard else 0,
+                (self.num_expert_group or 1) if self.use_grouped_topk else 1,
+                (self.topk_group or 1) if self.use_grouped_topk else 1,
                 torch.get_default_dtype(),
                 atom_config.max_num_batched_tokens,
             )
