@@ -672,9 +672,7 @@ class KimiKDAAttention(nn.Module):
         # whole forward (or nothing), so there is no such seam and the original
         # whole-mixer boundary is left untouched. Resolved once here so the
         # branch in forward() is a constant for dynamo.
-        cudagraph_mode = getattr(
-            atom_config.compilation_config, "cudagraph_mode", None
-        )
+        cudagraph_mode = getattr(atom_config.compilation_config, "cudagraph_mode", None)
         self._narrow_split = bool(
             hasattr(cudagraph_mode, "requires_piecewise_compilation")
             and cudagraph_mode.requires_piecewise_compilation()
@@ -998,9 +996,7 @@ class KimiKDAAttention(nn.Module):
         # pieces read. core is [tokens, nlh*hd] and contiguous, so the view is
         # free. The pad tail is left undefined on purpose -- see the allocation
         # site for why nothing downstream can observe it.
-        out = core[:num_actual_tokens].view(
-            num_actual_tokens, self.num_local_heads, hd
-        )
+        out = core[:num_actual_tokens].view(num_actual_tokens, self.num_local_heads, hd)
 
         conv_weights = self.conv_weight
         state_indices = gdn_metadata.non_spec_state_indices_tensor
