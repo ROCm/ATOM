@@ -6,20 +6,18 @@ actual draft core to ATOM's `DeepSeekMTP`.
 """
 
 import copy
-import contextlib
 import logging
 import os
 import re
-from typing import Iterable, Optional, Tuple
+from collections.abc import Iterable
 
 import torch
-from torch import nn
-
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
+from torch import nn
 
 from atom.config import QuantizationConfig as AtomQuantizationConfig
 from atom.config import SpeculativeConfig
@@ -134,7 +132,7 @@ class DeepseekV3ForCausalLMNextN(nn.Module):
     def __init__(
         self,
         config,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         del prefix
@@ -202,12 +200,12 @@ class DeepseekV3ForCausalLMNextN(nn.Module):
         )
 
         with plugin_runtime_scope(framework="sglang", atom_config=self.atom_config):
+            from atom.models.deepseek_mtp import DeepSeekMTP
             from atom.plugin.register import (
                 init_aiter_dist,
                 register_ops_to_sglang,
                 set_attn_cls,
             )
-            from atom.models.deepseek_mtp import DeepSeekMTP
 
             register_ops_to_sglang(atom_config=self.atom_config)
             set_attn_cls()
@@ -232,7 +230,7 @@ class DeepseekV3ForCausalLMNextN(nn.Module):
     ) -> None:
         del config, draft_model_path, use_standalone_draft
         if not getattr(self, "_is_glm_moe_dsa_nextn", False):
-            return None
+            return
 
         # GLM-5.x quant configs name the DSA indexer projection as
         # `indexers_proj`; ATOM's shared DSA/MTP module uses `indexer.weights_proj`.
@@ -246,7 +244,7 @@ class DeepseekV3ForCausalLMNextN(nn.Module):
                     "indexers_proj": "indexer.weights_proj",
                 },
             )
-        return None
+        return
 
     def _mtp_layers(self):
         return list(self.model.model.layers.values())
@@ -388,9 +386,11 @@ class DeepseekV3ForCausalLMNextN(nn.Module):
 
             if self.pp_group.is_last_rank:
                 hidden_states = runtime.trim_output(hidden_states)
-                wrapper_mode = os.environ.get(
-                    "ATOM_GLM52_MTP_WRAPPER_MODE", "current"
-                ).strip().lower()
+                wrapper_mode = (
+                    os.environ.get("ATOM_GLM52_MTP_WRAPPER_MODE", "current")
+                    .strip()
+                    .lower()
+                )
                 if wrapper_mode not in ("current", "pr1578"):
                     raise ValueError(
                         "ATOM_GLM52_MTP_WRAPPER_MODE must be 'current' or "
@@ -412,7 +412,7 @@ class DeepseekV3ForCausalLMNextN(nn.Module):
                 )
             return hidden_states
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         del weights
         from atom.model_loader.loader import load_model
 

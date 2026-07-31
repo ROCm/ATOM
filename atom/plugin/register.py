@@ -1,21 +1,23 @@
+# ruff: noqa: BLE001
+
 import logging
 import os
 
-from atom.models.qwen3 import Qwen3ForCausalLM
-from atom.models.qwen3_moe import Qwen3MoeForCausalLM
-from atom.models.glm4_moe import Glm4MoeForCausalLM
+from atom.config import Config
 from atom.models.deepseek_v2 import DeepseekV3ForCausalLM, GlmMoeDsaForCausalLM
+from atom.models.glm4_moe import Glm4MoeForCausalLM
 from atom.models.minimax_m2 import MiniMaxM2ForCausalLM
 from atom.models.minimax_m3 import (
     MiniMaxM3SparseForCausalLM,
     MiniMaxM3SparseForConditionalGeneration,
 )
+from atom.models.qwen3 import Qwen3ForCausalLM
 from atom.models.qwen3_5 import (
-    Qwen3_5MoeForConditionalGenerationTextOnly,
     Qwen3_5ForConditionalGenerationTextOnly,
+    Qwen3_5MoeForConditionalGenerationTextOnly,
 )
-from atom.config import Config
-from atom.plugin.prepare import is_vllm, is_sglang, is_rtpllm
+from atom.models.qwen3_moe import Qwen3MoeForCausalLM
+from atom.plugin.prepare import is_rtpllm, is_sglang, is_vllm
 
 logger = logging.getLogger("atom")
 
@@ -35,12 +37,12 @@ _ATOM_SUPPORTED_MODELS = {
 
 if is_sglang():
     from atom.models.deepseek_v4 import DeepseekV4ForCausalLM
-    from atom.models.qwen3_next import Qwen3NextForCausalLM
+    from atom.models.kimi_k25 import KimiK25ForCausalLM
     from atom.models.qwen3_5 import (
         Qwen3_5ForCausalLM,
         Qwen3_5MoeForCausalLM,
     )
-    from atom.models.kimi_k25 import KimiK25ForCausalLM
+    from atom.models.qwen3_next import Qwen3NextForCausalLM
 
     _ATOM_SUPPORTED_MODELS.update(
         {
@@ -66,18 +68,19 @@ def _register_custom_attention_to_sglang() -> None:
     name to inject ATOMAttnBackendForSgl without modifying sglang source.
     """
     import sglang.srt.layers.attention.aiter_backend as sglang_aiter_backend
-
     from sglang.srt.layers.attention.attention_registry import (
         register_attention_backend,
+    )
+
+    from atom.plugin.sglang.attention_backend.deepseek_v4_backend import (
+        ATOMDeepseekV4BackendForSgl,
     )
     from atom.plugin.sglang.attention_backend.full_attention.full_attention_backend import (
         ATOMAttnBackendForSgl,
     )
-    from atom.plugin.sglang.attention_backend.deepseek_v4_backend import (
-        ATOMDeepseekV4BackendForSgl,
-    )
     from atom.plugin.sglang.attention_backend.glm52_dsa_backend import (
         ATOMGLM52DSABackendForSgl,
+        install_upstream_glm52_graph_metadata_adapter,
     )
     from atom.plugin.sglang.runtime import is_glm52_dsa_config
 
@@ -95,9 +98,7 @@ def _register_custom_attention_to_sglang() -> None:
     def create_glm52_backend(runner):
         is_draft_worker = bool(getattr(runner, "is_draft_worker", False))
         backend_cls = (
-            ATOMAttnBackendForSgl
-            if is_draft_worker
-            else ATOMGLM52DSABackendForSgl
+            ATOMAttnBackendForSgl if is_draft_worker else ATOMGLM52DSABackendForSgl
         )
         return backend_cls(runner)
 
@@ -130,6 +131,8 @@ def _register_custom_attention_to_sglang() -> None:
 
         return NativeSparseAttnBackend(runner)
 
+    install_upstream_glm52_graph_metadata_adapter()
+
 
 def _patch_sglang_dsv4_draft_backends() -> None:
     """Route hard-coded speculative factories to ATOM-owned backends.
@@ -145,6 +148,7 @@ def _patch_sglang_dsv4_draft_backends() -> None:
 
     try:
         from sglang.srt.speculative.draft_utils import DraftBackendFactory
+
         from atom.plugin.sglang.attention_backend.deepseek_v4_backend import (
             ATOMDeepseekV4BackendForSgl,
         )
@@ -197,7 +201,8 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
             EAGLEDraftExtendCudaGraphRunner,
         )
         from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
-        from atom.plugin.sglang.glm52_mtp.common import (
+
+        from atom.plugin.sglang.glm52_dsa_bridge import (
             GLM52_GRAPH_SEQ_LEN_CAPACITY,
         )
     except Exception as exc:
@@ -249,11 +254,15 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
         except Exception:
             return False
 
+    def _is_dsv4_or_glm52_nextn_runner(runner) -> bool:
+        return _is_dsv4_nextn_runner(runner) or _is_glm52_nextn_runner(runner)
+
+    def _is_dsv4_or_glm52_runner(runner) -> bool:
+        return _is_dsv4_runner(runner) or _is_glm52_runner(runner)
+
     def _uses_glm52_generic_draft_frontend(runner) -> bool:
         model = getattr(runner, "model", None)
-        return bool(
-            getattr(model, "_atom_glm52_uses_generic_draft_frontend", False)
-        )
+        return bool(getattr(model, "_atom_glm52_uses_generic_draft_frontend", False))
 
     def _is_dsv4_runner(runner) -> bool:
         try:
@@ -342,7 +351,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                 else None
             )
             try:
-                should_cap = _is_dsv4_runner(model_runner) and bool(
+                should_cap = _is_dsv4_or_glm52_runner(model_runner) and bool(
                     getattr(
                         getattr(model_runner, "spec_algorithm", None),
                         "is_speculative",
@@ -378,6 +387,19 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
     can_run_method = (
         "can_run_graph" if hasattr(CudaGraphRunner, "can_run_graph") else "can_run"
     )
+    uses_new_graph_api = hasattr(EAGLEDraftCudaGraphRunner, "execute")
+
+    def _graph_can_run(runner, forward_batch) -> bool:
+        method = getattr(runner, "can_run_graph", None)
+        if method is None:
+            method = runner.can_run
+        return bool(method(forward_batch))
+
+    def _graph_execute(runner, forward_batch):
+        method = getattr(runner, "execute", None)
+        if method is None:
+            method = runner.replay
+        return method(forward_batch)
 
     if not getattr(CudaGraphRunner, "_atom_dsv4_spec_can_run_patched", False):
         original_can_run = getattr(CudaGraphRunner, can_run_method)
@@ -385,11 +407,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
         def can_run(self, forward_batch):
             try:
                 model_runner = getattr(self, "model_runner", None)
-                hf_config = getattr(
-                    getattr(model_runner, "model_config", None), "hf_config", None
-                )
-                arches = getattr(hf_config, "architectures", None) or []
-                is_dsv4 = any("DeepseekV4" in str(arch) for arch in arches)
+                is_supported_model = _is_dsv4_or_glm52_runner(model_runner)
                 mode = getattr(forward_batch, "forward_mode", None)
                 is_target_verify = bool(
                     getattr(mode, "is_target_verify", lambda: False)()
@@ -399,9 +417,13 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                         include_v2=True
                     )
                 )
-                if is_dsv4 and is_target_verify and not _target_verify_graph_enabled():
+                if (
+                    is_supported_model
+                    and is_target_verify
+                    and not _target_verify_graph_enabled()
+                ):
                     return False
-                if is_dsv4 and is_draft_extend:
+                if is_supported_model and is_draft_extend:
                     return False
                 if _is_glm52_runner(model_runner) and is_target_verify:
                     seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
@@ -411,7 +433,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                     max_graph_seq_len = GLM52_GRAPH_SEQ_LEN_CAPACITY
                     if max_seq_len > max_graph_seq_len:
                         return False
-            except Exception:
+            except Exception:  # noqa: S110
                 pass
             return original_can_run(self, forward_batch)
 
@@ -422,47 +444,51 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
         draft_replay_method = (
             "execute" if hasattr(EAGLEDraftCudaGraphRunner, "execute") else "replay"
         )
-        draft_internal_method = (
-            "_execute" if hasattr(EAGLEDraftCudaGraphRunner, "_execute") else "_replay"
+        original_draft_replay = getattr(EAGLEDraftCudaGraphRunner, draft_replay_method)
+        draft_internal_method = next(
+            (
+                name
+                for name in ("_execute", "_replay")
+                if hasattr(EAGLEDraftCudaGraphRunner, name)
+            ),
+            None,
         )
-        original_draft_replay = getattr(
-            EAGLEDraftCudaGraphRunner, draft_replay_method
-        )
-        original_draft_replay_graph = getattr(
-            EAGLEDraftCudaGraphRunner, draft_internal_method
-        )
+        if draft_internal_method is not None:
+            original_draft_replay_graph = getattr(
+                EAGLEDraftCudaGraphRunner, draft_internal_method
+            )
 
-        def _replay(self, forward_batch):
-            model_runner = getattr(self, "model_runner", None)
-            if _is_glm52_nextn_runner(model_runner) and not _uses_glm52_generic_draft_frontend(
-                model_runner
-            ):
-                from atom.plugin.sglang.runtime.forward_context import (
-                    stage_glm52_draft_decode_graph_metadata,
-                )
-
-                original_batch_size = forward_batch.batch_size
-                original_out_cache_loc = forward_batch.out_cache_loc
-                graph_bs = int(self.bs)
-                forward_batch.batch_size = graph_bs
-                forward_batch.out_cache_loc = self.buffers.out_cache_loc[
-                    : graph_bs * self.topk * self.speculative_num_steps
-                ]
-                try:
-                    stage_glm52_draft_decode_graph_metadata(
-                        forward_batch,
-                        speculative_num_steps=self.speculative_num_steps,
-                        topk=self.topk,
+            def _replay(self, forward_batch):
+                model_runner = getattr(self, "model_runner", None)
+                if _is_glm52_nextn_runner(
+                    model_runner
+                ) and not _uses_glm52_generic_draft_frontend(model_runner):
+                    from atom.plugin.sglang.runtime.forward_context import (
+                        stage_glm52_draft_decode_graph_metadata,
                     )
-                finally:
-                    forward_batch.batch_size = original_batch_size
-                    forward_batch.out_cache_loc = original_out_cache_loc
-            return original_draft_replay_graph(self, forward_batch)
 
-        setattr(EAGLEDraftCudaGraphRunner, draft_internal_method, _replay)
+                    original_batch_size = forward_batch.batch_size
+                    original_out_cache_loc = forward_batch.out_cache_loc
+                    graph_bs = int(self.bs)
+                    forward_batch.batch_size = graph_bs
+                    forward_batch.out_cache_loc = self.buffers.out_cache_loc[
+                        : graph_bs * self.topk * self.speculative_num_steps
+                    ]
+                    try:
+                        stage_glm52_draft_decode_graph_metadata(
+                            forward_batch,
+                            speculative_num_steps=self.speculative_num_steps,
+                            topk=self.topk,
+                        )
+                    finally:
+                        forward_batch.batch_size = original_batch_size
+                        forward_batch.out_cache_loc = original_out_cache_loc
+                return original_draft_replay_graph(self, forward_batch)
+
+            setattr(EAGLEDraftCudaGraphRunner, draft_internal_method, _replay)
 
         def replay(self, forward_batch):
-            if not _is_dsv4_nextn_runner(getattr(self, "model_runner", None)):
+            if not _is_dsv4_or_glm52_nextn_runner(getattr(self, "model_runner", None)):
                 return original_draft_replay(self, forward_batch)
             if _env_flag("ATOM_SGLANG_V4_DISABLE_DRAFT_CG"):
                 raise RuntimeError(
@@ -523,15 +549,15 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                 output = runner.output_buffers.get(bs)
                 logits = getattr(output, "next_token_logits", None)
                 expected = bs * num_draft_tokens
-                if logits is None or int(logits.shape[0]) < expected:
-                    return False
-                return True
+                return logits is not None and int(logits.shape[0]) >= expected
             except Exception:
                 return False
 
         def can_run(self, forward_batch):
             model_runner = getattr(self, "model_runner", None)
             if _is_glm52_nextn_runner(model_runner):
+                if not _draft_extend_graph_enabled(model_runner):
+                    return False
                 base_can_run = bool(original_extend_can_run(self, forward_batch))
                 seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
                 if seq_lens_cpu is None or len(seq_lens_cpu) == 0:
@@ -548,6 +574,10 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
         def replay(self, forward_batch):
             model_runner = getattr(self, "model_runner", None)
             if _is_glm52_nextn_runner(model_runner):
+                if not _draft_extend_graph_enabled(model_runner):
+                    raise RuntimeError(
+                        "GLM-5.2 draft-extend cuda graph replay was disabled"
+                    )
                 return original_extend_replay(self, forward_batch)
             if not _is_dsv4_nextn_runner(model_runner):
                 return original_extend_replay(self, forward_batch)
@@ -647,6 +677,8 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                 )
                 if not is_glm52 and not is_dsv4:
                     return original_draft_extend_for_decode(self, batch, batch_result)
+                if is_glm52 and uses_new_graph_api:
+                    return original_draft_extend_for_decode(self, batch, batch_result)
                 if is_dsv4 and draft_extend_graph_runner is None:
                     return original_draft_extend_for_decode(self, batch, batch_result)
 
@@ -713,11 +745,11 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
 
                 can_cuda_graph = (
                     use_draft_extend_graph_runner is not None
-                    and use_draft_extend_graph_runner.can_run(forward_batch)
+                    and _graph_can_run(use_draft_extend_graph_runner, forward_batch)
                 )
                 if can_cuda_graph:
-                    draft_logits_output = use_draft_extend_graph_runner.replay(
-                        forward_batch
+                    draft_logits_output = _graph_execute(
+                        use_draft_extend_graph_runner, forward_batch
                     )
                 else:
                     draft_logits_output = self.draft_runner.forward(
@@ -768,7 +800,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                     selected_hidden_states,
                 )
                 return None
-            except Exception:
+            except Exception:  # noqa: TRY203
                 raise
 
         EagleDraftWorker._draft_extend_for_decode = _draft_extend_for_decode
@@ -793,15 +825,52 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                         backend.get_cuda_graph_seq_len_fill_value = (
                             lambda value=GLM52_GRAPH_SEQ_LEN_CAPACITY: value
                         )
-            ret = original_init_cuda_graphs(self)
+            skip_all_draft_graphs = (
+                _env_flag("ATOM_SGLANG_V4_DISABLE_DRAFT_CG")
+                and not _draft_extend_graph_enabled(draft_runner)
+                and _is_dsv4_or_glm52_nextn_runner(draft_runner)
+            )
+            original_capture_cuda_graphs = None
+            if skip_all_draft_graphs:
+                original_capture_cuda_graphs = self._capture_cuda_graphs
+                self._capture_cuda_graphs = lambda: None
+            original_draft_extend_backend = None
+            hide_draft_extend_backend = (
+                not _draft_extend_graph_enabled(draft_runner)
+                and getattr(self, "draft_extend_attn_backend", None) is not None
+            )
+            if hide_draft_extend_backend:
+                original_draft_extend_backend = self.draft_extend_attn_backend
+                self.draft_extend_attn_backend = None
+            try:
+                ret = original_init_cuda_graphs(self)
+            finally:
+                if hide_draft_extend_backend:
+                    self.draft_extend_attn_backend = original_draft_extend_backend
+                if original_capture_cuda_graphs is not None:
+                    self._capture_cuda_graphs = original_capture_cuda_graphs
             try:
                 if _env_flag(
                     "ATOM_SGLANG_V4_DISABLE_DRAFT_CG"
-                ) and _is_dsv4_nextn_runner(getattr(self, "draft_runner", None)):
+                ) and _is_dsv4_or_glm52_nextn_runner(
+                    getattr(self, "draft_runner", None)
+                ):
                     self.cuda_graph_runner = None
+                supports_plugin_graph = _is_dsv4_or_glm52_nextn_runner(
+                    getattr(self, "draft_runner", None)
+                )
                 if (
-                    self.cuda_graph_runner_for_draft_extend is None
-                    and _is_dsv4_nextn_runner(getattr(self, "draft_runner", None))
+                    getattr(self, "cuda_graph_runner_for_draft_extend", None)
+                    is not None
+                    and supports_plugin_graph
+                    and not _draft_extend_graph_enabled(
+                        getattr(self, "draft_runner", None)
+                    )
+                ):
+                    self.cuda_graph_runner_for_draft_extend = None
+                if (
+                    getattr(self, "cuda_graph_runner_for_draft_extend", None) is None
+                    and supports_plugin_graph
                     and not self.server_args.disable_cuda_graph
                     and _draft_extend_graph_enabled(getattr(self, "draft_runner", None))
                     and self.draft_extend_attn_backend is not None
@@ -845,7 +914,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                             and original_cuda_graph_bs is not None
                         ):
                             server_args.cuda_graph_bs = original_cuda_graph_bs
-                elif _is_dsv4_nextn_runner(getattr(self, "draft_runner", None)):
+                elif supports_plugin_graph:
                     self.cuda_graph_runner_for_draft_extend = None
             except Exception as exc:
                 logger.warning(
@@ -862,6 +931,18 @@ def _patch_sglang_eagle_v2_draft_argmax() -> None:
     """Use ATOM draft distributed argmax for SGLang EAGLE topk=1 drafting."""
     if os.getenv("ATOM_SGLANG_DRAFT_ARGMAX", "1").lower() in ("0", "false", "no"):
         return
+    try:
+        from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
+            EAGLEDraftCudaGraphRunner,
+        )
+    except Exception as exc:
+        logger.debug("Skip patching SGLang EAGLE draft argmax: %s", exc)
+        return
+
+    if hasattr(EAGLEDraftCudaGraphRunner, "execute"):
+        logger.info("Use upstream SGLang ROCm-safe EAGLE draft selection")
+        return
+
     try:
         import torch
         from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
@@ -949,9 +1030,7 @@ def _patch_sglang_eagle_v2_draft_argmax() -> None:
             forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
             forward_batch._atom_use_draft_argmax = use_argmax
             spec_info.hidden_states = hidden_states
-            is_glm52_draft = _is_glm52_nextn_runner(
-                getattr(self, "draft_runner", None)
-            )
+            is_glm52_draft = _is_glm52_nextn_runner(getattr(self, "draft_runner", None))
             if is_glm52_draft:
                 set_draft_decode_sub_step(forward_batch, i)
 

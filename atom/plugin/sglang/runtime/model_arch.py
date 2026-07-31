@@ -176,12 +176,12 @@ def _bind_glm52_dsa_cache_views(model: Any, runtime: Any) -> None:
 
     from atom.plugin.sglang.glm52_dsa_bridge import (
         bind_glm52_dsa_cache_views,
-        maybe_get_glm52_dsa_pools_from_sglang_backend,
+    )
+    from atom.plugin.sglang.runtime.attention_backend_resolver import (
+        resolve_sglang_runtime,
     )
 
-    token_to_kv_pool, _ = maybe_get_glm52_dsa_pools_from_sglang_backend(
-        runtime.forward_batch
-    )
+    token_to_kv_pool = resolve_sglang_runtime(runtime.forward_batch).token_to_kv_pool
     if not bind_glm52_dsa_cache_views(model, token_to_kv_pool):
         raise RuntimeError("GLM-5.2 SGLang DSA KV pool is not initialized")
 

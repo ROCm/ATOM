@@ -264,9 +264,11 @@ class _AtomCausalLMBaseForSglang(nn.Module):
                         and bool(getattr(mode, "is_target_verify", lambda: False)())
                         and torch.is_tensor(hidden_states)
                     ):
-                        rows = hidden_states[
-                            : min(4, int(hidden_states.shape[0]))
-                        ].detach().float()
+                        rows = (
+                            hidden_states[: min(4, int(hidden_states.shape[0]))]
+                            .detach()
+                            .float()
+                        )
                         logger.info(
                             "[GLM52_HIDDEN_DEBUG] post_model shape=%s norm=%s absmax=%s",
                             tuple(hidden_states.shape),

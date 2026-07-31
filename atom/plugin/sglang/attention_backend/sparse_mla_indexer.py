@@ -1,18 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+# ruff: noqa: BLE001
+
 """SGLang plugin sparse MLA indexer support for DeepSeek-V3.2."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import logging
 import os
 import re
-from typing import Optional
+from dataclasses import dataclass
 
 import numpy as np
 import torch
+import triton
+import triton.language as tl
 from aiter import (
     cp_gather_indexer_k_quant_cache,
     dtypes,
@@ -26,12 +29,9 @@ from aiter import (
 from aiter.mla import mla_decode_fwd
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
-import triton
-import triton.language as tl
 
+from atom.plugin.sglang.glm52_dsa_bridge import GLM52_GRAPH_SEQ_LEN_CAPACITY
 from atom.utils.custom_register import direct_register_custom_op
-from atom.plugin.sglang.glm52_mtp.common import GLM52_GRAPH_SEQ_LEN_CAPACITY
-
 
 logger = logging.getLogger("atom")
 
@@ -45,11 +45,18 @@ def _is_stream_capturing() -> bool:
 
 def _is_graph_warmup_or_capture() -> bool:
     try:
-        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+        from sglang.srt.model_executor.runner_utils import get_is_capture_mode
 
         return bool(get_is_capture_mode())
-    except Exception:
-        return _is_stream_capturing()
+    except ImportError:
+        try:
+            from sglang.srt.model_executor.cuda_graph_runner import (
+                get_is_capture_mode,
+            )
+
+            return bool(get_is_capture_mode())
+        except ImportError:
+            return _is_stream_capturing()
 
 
 @triton.jit
@@ -154,9 +161,7 @@ def _build_graph_block_table_kernel(
     mask = block_offset < max_num_blocks
     req_id = tl.load(req_pool_indices_ptr + batch_id)
     token_slot = tl.load(
-        req_to_token_ptr
-        + req_id * req_to_token_stride0
-        + block_offset * PAGE_SIZE,
+        req_to_token_ptr + req_id * req_to_token_stride0 + block_offset * PAGE_SIZE,
         mask=mask,
         other=0,
     )
@@ -238,8 +243,12 @@ def _parse_layer_id_from_indexer_prefix(prefix: str) -> int:
 
 
 def _is_draft_extend_v2(forward_batch) -> bool:
+    forward_mode = forward_batch.forward_mode
+    is_draft_extend_v2 = getattr(forward_mode, "is_draft_extend_v2", None)
+    if is_draft_extend_v2 is not None:
+        return bool(is_draft_extend_v2())
     return bool(
-        getattr(forward_batch.forward_mode, "is_draft_extend", lambda **kwargs: False)(
+        getattr(forward_mode, "is_draft_extend", lambda **kwargs: False)(
             include_v2=True
         )
     )
@@ -282,7 +291,9 @@ def _build_mtp_spec_query_ranges(
         raise RuntimeError("MTP sparse MLA requires tokens_per_req > 0")
     positions = getattr(forward_batch, "positions", None)
     if positions is None:
-        positions = getattr(getattr(forward_batch, "spec_info", None), "positions", None)
+        positions = getattr(
+            getattr(forward_batch, "spec_info", None), "positions", None
+        )
     if torch.is_tensor(positions) and int(positions.numel()) >= bs * tokens_per_req:
         prefix_lens = positions[: bs * tokens_per_req : tokens_per_req].to(
             dtype=torch.int32
@@ -314,7 +325,9 @@ def _mtp_eager_context_lens(forward_batch) -> torch.Tensor | None:
         return None
     positions = getattr(forward_batch, "positions", None)
     if positions is None:
-        positions = getattr(getattr(forward_batch, "spec_info", None), "positions", None)
+        positions = getattr(
+            getattr(forward_batch, "spec_info", None), "positions", None
+        )
     if torch.is_tensor(positions) and int(positions.numel()) >= bs * tokens_per_req:
         prefix_lens = positions[: bs * tokens_per_req : tokens_per_req].to(
             dtype=torch.int32
@@ -361,7 +374,7 @@ def _maybe_apply_pcp_query_split(
         )
 
         pcp_size = get_pcp_world_size()
-    except Exception:  # noqa: BLE001
+    except Exception:
         pcp_size = 1
 
     if pcp_size <= 1:
@@ -440,7 +453,8 @@ def _build_sglang_query_ranges(forward_batch) -> tuple[torch.Tensor, torch.Tenso
 
 def _build_sglang_block_table(forward_batch, page_size: int) -> torch.Tensor:
     req_pool_indices = forward_batch.req_pool_indices
-    req_to_token = forward_batch.req_to_token_pool.req_to_token
+    _, req_to_token_pool = _resolve_sglang_pools(forward_batch)
+    req_to_token = req_to_token_pool.req_to_token
     token_table = req_to_token[req_pool_indices, :]
     if not forward_batch.forward_mode.is_decode_or_idle():
         token_table = token_table.clone()
@@ -498,6 +512,15 @@ def _build_sglang_block_table(forward_batch, page_size: int) -> torch.Tensor:
     return (token_table[:, ::page_size] // page_size).to(dtype=torch.int32).contiguous()
 
 
+def _resolve_sglang_pools(forward_batch):
+    from atom.plugin.sglang.runtime.attention_backend_resolver import (
+        resolve_sglang_runtime,
+    )
+
+    runtime = resolve_sglang_runtime(forward_batch)
+    return runtime.token_to_kv_pool, runtime.req_to_token_pool
+
+
 def _build_sparse_req_id_per_token_for_sglang(
     forward_batch,
     device: torch.device,
@@ -548,12 +571,12 @@ class SparseMLAKernelMetadata:
     kv_indices: torch.Tensor
     last_page_len: torch.Tensor
     use_fast_metadata: bool
-    work_metadata: Optional[torch.Tensor] = None
-    work_indptr: Optional[torch.Tensor] = None
-    work_info_set: Optional[torch.Tensor] = None
-    reduce_indptr: Optional[torch.Tensor] = None
-    reduce_final_map: Optional[torch.Tensor] = None
-    reduce_partial_map: Optional[torch.Tensor] = None
+    work_metadata: torch.Tensor | None = None
+    work_indptr: torch.Tensor | None = None
+    work_info_set: torch.Tensor | None = None
+    reduce_indptr: torch.Tensor | None = None
+    reduce_final_map: torch.Tensor | None = None
+    reduce_partial_map: torch.Tensor | None = None
 
 
 @dataclass
@@ -572,12 +595,12 @@ class SparseMLAGraphBuffers:
     kv_indptr: torch.Tensor
     kv_indices: torch.Tensor
     last_page_len: torch.Tensor
-    work_metadata: Optional[torch.Tensor]
-    work_indptr: Optional[torch.Tensor]
-    work_info_set: Optional[torch.Tensor]
-    reduce_indptr: Optional[torch.Tensor]
-    reduce_final_map: Optional[torch.Tensor]
-    reduce_partial_map: Optional[torch.Tensor]
+    work_metadata: torch.Tensor | None
+    work_indptr: torch.Tensor | None
+    work_info_set: torch.Tensor | None
+    reduce_indptr: torch.Tensor | None
+    reduce_final_map: torch.Tensor | None
+    reduce_partial_map: torch.Tensor | None
 
 
 @dataclass
@@ -607,7 +630,11 @@ def _get_or_create_sparse_mla_indexer_graph_buffers(
     page_size: int,
     head_dim: int,
 ) -> SparseMLAIndexerGraphBuffers:
-    backend = getattr(forward_batch, "attn_backend", None)
+    from atom.plugin.sglang.runtime.attention_backend_resolver import (
+        resolve_sglang_runtime,
+    )
+
+    backend = resolve_sglang_runtime(forward_batch).attn_backend
     store = getattr(backend, "_atom_sparse_mla_indexer_graph_buffers", None)
     if store is None:
         raise RuntimeError(
@@ -617,7 +644,11 @@ def _get_or_create_sparse_mla_indexer_graph_buffers(
     tokens_per_req = _mtp_spec_tokens_per_req(forward_batch)
     num_tokens = int(forward_batch.input_ids.shape[0])
     context_capacity = GLM52_GRAPH_SEQ_LEN_CAPACITY + tokens_per_req
-    if batch_size <= 0 or tokens_per_req <= 0 or batch_size * tokens_per_req != num_tokens:
+    if (
+        batch_size <= 0
+        or tokens_per_req <= 0
+        or batch_size * tokens_per_req != num_tokens
+    ):
         raise RuntimeError(
             "Sparse MLA indexer graph requires fixed bs * tokens_per_req rows: "
             f"batch_size={batch_size}, tokens_per_req={tokens_per_req}, "
@@ -677,9 +708,10 @@ def _prepare_sparse_mla_indexer_graph_buffers(
     buffers: SparseMLAIndexerGraphBuffers,
     forward_batch,
 ) -> None:
-    req_to_token = forward_batch.req_to_token_pool.req_to_token
+    token_to_kv_pool, req_to_token_pool = _resolve_sglang_pools(forward_batch)
+    req_to_token = req_to_token_pool.req_to_token
     max_num_blocks = int(buffers.block_table.shape[1])
-    page_size = int(forward_batch.token_to_kv_pool.page_size)
+    page_size = int(token_to_kv_pool.page_size)
     block_n = 128
     _build_graph_block_table_kernel[
         (buffers.batch_size, triton.cdiv(max_num_blocks, block_n))
@@ -726,9 +758,7 @@ def _allocate_sparse_mla_graph_buffers(
     output_dtype: torch.dtype,
     output_dim: int,
 ) -> SparseMLAGraphBuffers:
-    max_num_tokens = int(
-        getattr(backend, "_atom_sparse_mla_graph_max_num_tokens", 0)
-    )
+    max_num_tokens = int(getattr(backend, "_atom_sparse_mla_graph_max_num_tokens", 0))
     if num_tokens > max_num_tokens:
         raise RuntimeError(
             "Sparse MLA graph token count exceeds backend capacity: "
@@ -740,7 +770,11 @@ def _allocate_sparse_mla_graph_buffers(
             "Sparse MLA graph batch size exceeds backend capacity: "
             f"batch_size={batch_size}, capacity={max_bs}"
         )
-    if batch_size <= 0 or tokens_per_req <= 0 or batch_size * tokens_per_req != num_tokens:
+    if (
+        batch_size <= 0
+        or tokens_per_req <= 0
+        or batch_size * tokens_per_req != num_tokens
+    ):
         raise RuntimeError(
             "Sparse MLA graph requires a fixed bs * tokens_per_req layout: "
             f"batch_size={batch_size}, tokens_per_req={tokens_per_req}, "
@@ -760,8 +794,7 @@ def _allocate_sparse_mla_graph_buffers(
         fast_mode=True,
     )
     work_buffers = [
-        torch.empty(size, dtype=dtype, device=q.device)
-        for size, dtype in buffer_specs
+        torch.empty(size, dtype=dtype, device=q.device) for size, dtype in buffer_specs
     ]
     return SparseMLAGraphBuffers(
         batch_size=batch_size,
@@ -783,18 +816,12 @@ def _allocate_sparse_mla_graph_buffers(
         block_table=torch.empty(
             (batch_size, max_num_blocks), dtype=torch.int32, device=q.device
         ),
-        qo_indptr=torch.arange(
-            num_tokens + 1, dtype=torch.int32, device=q.device
-        ),
-        kv_indptr=torch.empty(
-            num_tokens + 1, dtype=torch.int32, device=q.device
-        ),
+        qo_indptr=torch.arange(num_tokens + 1, dtype=torch.int32, device=q.device),
+        kv_indptr=torch.empty(num_tokens + 1, dtype=torch.int32, device=q.device),
         kv_indices=torch.empty(
             num_tokens * topk_tokens, dtype=torch.int32, device=q.device
         ),
-        last_page_len=torch.ones(
-            num_tokens, dtype=torch.int32, device=q.device
-        ),
+        last_page_len=torch.ones(num_tokens, dtype=torch.int32, device=q.device),
         work_metadata=work_buffers[0],
         work_indptr=work_buffers[1],
         work_info_set=work_buffers[2],
@@ -818,10 +845,14 @@ def _get_or_create_sparse_mla_graph_buffers(
     num_heads: int,
     output_dtype: torch.dtype,
     output_dim: int,
-) -> Optional[SparseMLAGraphBuffers]:
+) -> SparseMLAGraphBuffers | None:
     if not _is_graph_warmup_or_capture():
         return None
-    backend = getattr(forward_batch, "attn_backend", None)
+    from atom.plugin.sglang.runtime.attention_backend_resolver import (
+        resolve_sglang_runtime,
+    )
+
+    backend = resolve_sglang_runtime(forward_batch).attn_backend
     store = getattr(backend, "_atom_sparse_mla_graph_buffers", None)
     if store is None:
         raise RuntimeError(
@@ -844,7 +875,8 @@ def _get_or_create_sparse_mla_graph_buffers(
         if _is_stream_capturing():
             raise RuntimeError(
                 "Sparse MLA graph bucket was not allocated during warmup: "
-                f"tokens={num_tokens}, topk={topk_tokens}"
+                f"owner={type(backend).__name__}, tokens={num_tokens}, "
+                f"topk={topk_tokens}, available_keys={list(store)}"
             )
         buffers = _allocate_sparse_mla_graph_buffers(
             backend=backend,
@@ -887,12 +919,11 @@ def _prepare_sparse_mla_graph_metadata(
             f"num_tokens={num_tokens}"
         )
     buffers.q.copy_(q)
-    req_to_token = forward_batch.req_to_token_pool.req_to_token
+    _, req_to_token_pool = _resolve_sglang_pools(forward_batch)
+    req_to_token = req_to_token_pool.req_to_token
     max_num_blocks = int(buffers.block_table.shape[1])
     block_n = 128
-    _build_graph_block_table_kernel[
-        (batch_size, triton.cdiv(max_num_blocks, block_n))
-    ](
+    _build_graph_block_table_kernel[(batch_size, triton.cdiv(max_num_blocks, block_n))](
         forward_batch.req_pool_indices,
         req_to_token,
         buffers.block_table,
@@ -984,15 +1015,14 @@ def _prepare_sparse_mla_kernel_metadata(
     """Build eager sparse MLA metadata only from the current SGLang batch/pools."""
     num_tokens = int(q.shape[0])
     topk_tokens = int(topk_indices.shape[1])
-    allocator_page_size = int(
-        getattr(forward_batch.token_to_kv_pool, "page_size", 1)
-    )
+    token_to_kv_pool, _ = _resolve_sglang_pools(forward_batch)
+    allocator_page_size = int(getattr(token_to_kv_pool, "page_size", 1))
     req_id_per_token = _build_sparse_req_id_per_token_for_sglang(
         forward_batch, q.device
     )
-    block_table = _build_sglang_block_table(
-        forward_batch, allocator_page_size
-    ).to(dtype=torch.int32)
+    block_table = _build_sglang_block_table(forward_batch, allocator_page_size).to(
+        dtype=torch.int32
+    )
 
     seq_len = (topk_indices != -1).sum(dim=-1).to(dtype=torch.int32)
     kv_indptr = torch.empty((num_tokens + 1,), dtype=torch.int32, device=q.device)
@@ -1047,8 +1077,7 @@ def _prepare_sparse_mla_kernel_metadata(
         fast_mode=True,
     )
     buffers = [
-        torch.empty(size, dtype=dtype, device=q.device)
-        for size, dtype in buffer_specs
+        torch.empty(size, dtype=dtype, device=q.device) for size, dtype in buffer_specs
     ]
     (
         metadata.work_metadata,
@@ -1092,24 +1121,26 @@ def forward_sparse_mla_for_sglang(
     forward_batch,
     topk_indices: torch.Tensor,
     save_kv_cache: bool = True,
-    input_dtype: Optional[torch.dtype] = None,
-    q_scale: Optional[torch.Tensor] = None,
+    input_dtype: torch.dtype | None = None,
+    q_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """ATOM sparse MLA path for SGLang DeepSeek-V3.2."""
+    token_to_kv_pool, _ = _resolve_sglang_pools(forward_batch)
     if save_kv_cache and k is not None:
         assert v is not None
-        forward_batch.token_to_kv_pool.set_kv_buffer(
-            layer, forward_batch.out_cache_loc, k, v
-        )
+        token_to_kv_pool.set_kv_buffer(layer, forward_batch.out_cache_loc, k, v)
 
     q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
     num_tokens = q.shape[0]
     topk_indices = topk_indices[:num_tokens]
     output_dtype = input_dtype or torch.bfloat16
-    k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-    align_fp8_q = os.environ.get(
-        "ATOM_SGLANG_SPARSE_MLA_ALIGN_FP8_Q", "0"
-    ).lower() in ("1", "true", "yes", "on")
+    k_buffer = token_to_kv_pool.get_key_buffer(layer.layer_id)
+    align_fp8_q = os.environ.get("ATOM_SGLANG_SPARSE_MLA_ALIGN_FP8_Q", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
     graph_mode = _is_graph_warmup_or_capture()
     fixed_graph_phase = bool(
         forward_batch.forward_mode.is_decode_or_idle()
@@ -1128,9 +1159,7 @@ def forward_sparse_mla_for_sglang(
             q_descale = getattr(layer, "q_scale", None)
         if q_descale is None:
             q_descale = getattr(layer, "k_scale", None)
-    allocator_page_size = int(
-        getattr(forward_batch.token_to_kv_pool, "page_size", 1)
-    )
+    allocator_page_size = int(getattr(token_to_kv_pool, "page_size", 1))
     graph_buffers = None
     if use_fixed_graph_buffers:
         backend = getattr(forward_batch, "attn_backend", None)
@@ -1220,7 +1249,7 @@ def sparse_attn_indexer_sglang_plugin_mode(
     k: torch.Tensor,
     weights: torch.Tensor,
     quant_block_size: int,
-    scale_fmt: Optional[str],
+    scale_fmt: str | None,
     topk_tokens: int,
     head_dim: int,
     max_model_len: int,
@@ -1243,8 +1272,10 @@ def sparse_attn_indexer_sglang_plugin_mode(
     if forward_batch is None or forward_batch.forward_mode.is_idle():
         return torch.zeros_like(weights, dtype=torch.float32)
 
-    token_to_kv_pool = forward_batch.token_to_kv_pool
-    if not hasattr(token_to_kv_pool, "get_index_k_with_scale_buffer"):
+    token_to_kv_pool, _ = _resolve_sglang_pools(forward_batch)
+    if token_to_kv_pool is None or not hasattr(
+        token_to_kv_pool, "get_index_k_with_scale_buffer"
+    ):
         raise RuntimeError(
             "[SGL+ATOM] DeepSeek-V3.2 sparse MLA requires SGLang NSA KV pool "
             "with index_k_with_scale_buffer support."
@@ -1320,7 +1351,7 @@ def sparse_attn_indexer_sglang_plugin_mode(
                 f"{bs} token rows, got q={q_fp8.shape[0]}, weights={weights.shape[0]}. "
                 "This usually means TP-scattered indexer inputs were not gathered."
             )
-        from atom.plugin.sglang.glm52_mtp.common import resolve_indexer_seq_lens
+        from atom.plugin.sglang.glm52_dsa_bridge import resolve_indexer_seq_lens
 
         seq_lens_i32 = resolve_indexer_seq_lens(forward_batch, bs)
         padded_q_fp8 = q_fp8[:bs].reshape(bs, 1, *q_fp8.shape[1:])
@@ -1409,7 +1440,7 @@ def sparse_attn_indexer_sglang_fake(
     k: torch.Tensor,
     weights: torch.Tensor,
     quant_block_size: int,
-    scale_fmt: Optional[str],
+    scale_fmt: str | None,
     topk_tokens: int,
     head_dim: int,
     max_model_len: int,
