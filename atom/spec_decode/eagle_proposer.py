@@ -286,13 +286,12 @@ class EagleProposer(Drafter):
                     if i == 0
                     else ret_hidden_states
                 )
-                # Distributed argmax (all-gather [N, 2] not [N, vocab]) when the
-                # draft supports it; token-identical to compute_logits().argmax().
-                if self._draft_argmax_fused:
-                    new_draft_ids = self.model.compute_draft_token(sample_hidden_states)
-                else:
-                    logits = self.model.compute_logits(sample_hidden_states)
-                    new_draft_ids = logits.argmax(dim=-1)
+                # Every draft model implements this. Some do the argmax
+                # distributed (all-gathering [N, 2] instead of the full
+                # [N, vocab] logits); the rest fall back to
+                # compute_logits().argmax(-1) internally. Token-identical either
+                # way, so the choice belongs to the model, not to this loop.
+                new_draft_ids = self.model.compute_draft_ids(sample_hidden_states)
                 draft_token_ids[:, i] = new_draft_ids
 
                 if i < self.mtp_k - 1:

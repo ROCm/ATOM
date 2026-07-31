@@ -5,8 +5,9 @@
 import re
 
 import torch
-import torch.nn as nn
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
+from torch import nn
+
 from atom.config import Config
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import RMSNorm
@@ -289,6 +290,14 @@ class MiMoV2MTP(nn.Module):
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
         return self.lm_head(hidden_states)
+
+    def compute_draft_ids(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        """Greedy draft token ids, called once per step by EagleProposer."""
+        return self.compute_logits(hidden_states, spec_step_idx).argmax(dim=-1)
 
     _MTP_PATTERN = re.compile(r"model\.mtp\.layers\.(\d+)\.")
     _PREDICTOR_KEYS = {"enorm", "hnorm", "eh_proj", "final_layernorm"}

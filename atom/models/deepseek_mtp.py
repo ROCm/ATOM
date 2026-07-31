@@ -216,12 +216,12 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
         return mtp_layer.shared_head.head(hidden_states)
 
-    def compute_draft_token(
+    def compute_draft_ids(
         self,
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
-        """Greedy draft token via distributed argmax over the TP-sharded vocab —
+        """Greedy draft token ids via distributed argmax over the TP-sharded vocab —
         avoids all-gathering the full [N, vocab] logits every draft step.
 
         Mirrors compute_logits() (same norm + shared head), but reduces each
@@ -359,19 +359,20 @@ class DeepSeekMTP(nn.Module):
     ) -> torch.Tensor | None:
         return self.model.compute_logits(hidden_states, spec_step_idx)
 
-    def compute_draft_token(
+    def compute_draft_ids(
         self,
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
         """Distributed greedy argmax for the MTP draft rollout (GLM-5.2).
 
-        EagleProposer picks this over compute_logits().argmax(-1) when present
-        (``_draft_argmax_fused``), so the draft never all-gathers the full
-        [N, vocab] logits — it all-gathers only the packed [N, 2] per-rank
-        reductions. See DeepSeekMultiTokenPredictor.compute_draft_token.
+        Every draft model implements compute_draft_ids; this one does the argmax
+        distributed rather than via compute_logits().argmax(-1), so the draft
+        never all-gathers the full [N, vocab] logits — only the packed [N, 2]
+        per-rank reductions. Token-identical either way. See
+        DeepSeekMultiTokenPredictor.compute_draft_ids.
         """
-        return self.model.compute_draft_token(hidden_states, spec_step_idx)
+        return self.model.compute_draft_ids(hidden_states, spec_step_idx)
 
     def set_skip_topk(self, skip: bool) -> None:
         self.model.set_skip_topk(skip)

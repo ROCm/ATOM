@@ -1026,7 +1026,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         vLLM's ``LLMBaseProposer._greedy_sample`` calls this (when
         ``use_local_argmax_reduction`` is enabled) in place of
         ``compute_logits(...).argmax(-1)``. Bridge it to ATOM's distributed
-        greedy argmax (``compute_draft_token``): each rank reduces its logit
+        greedy argmax (``compute_draft_ids``): each rank reduces its logit
         shard to ``(max_val, global_idx)`` and only ``[N, 2]`` is all-gathered
         instead of the full ``[N, vocab]`` logits. Token-identical to
         ``compute_logits(...).argmax(-1)``; returns ``[N]`` int64 token ids.
@@ -1035,7 +1035,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             hidden_states = _deepseek_v4_mtp_unflatten_hidden_states(
                 hidden_states, self.model
             )
-        return self.model.compute_draft_token(hidden_states)
+        return self.model.compute_draft_ids(hidden_states)
 
 
 class ATOMForCausalLM(ATOMModelBase, VllmModelForTextGeneration): ...

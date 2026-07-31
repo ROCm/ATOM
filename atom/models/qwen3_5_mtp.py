@@ -5,8 +5,9 @@
 import re
 
 import torch
-import torch.nn as nn
 from aiter.dist.parallel_state import get_tp_group
+from torch import nn
+
 from atom.config import Config
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.linear import ColumnParallelLinear
@@ -17,6 +18,7 @@ from atom.models.qwen3_5 import (
     get_qwen3_5_text_config,
 )
 from atom.models.utils import IntermediateTensors
+
 from .utils import maybe_prefix
 
 
@@ -195,7 +197,15 @@ class Qwen3_5MTP(nn.Module):
     ) -> torch.Tensor | None:
         return self.lm_head(hidden_states)
 
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:  # noqa: D401
+    def compute_draft_ids(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        """Greedy draft token ids, called once per step by EagleProposer."""
+        return self.compute_logits(hidden_states, spec_step_idx).argmax(dim=-1)
+
+    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
         return FusedMoE.make_expert_params_mapping(

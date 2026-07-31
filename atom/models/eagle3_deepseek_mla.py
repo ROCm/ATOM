@@ -33,6 +33,8 @@ pattern as `eagle3_llama.Eagle3LlamaModel` for backward compat.
 import torch
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.rotary_embedding import get_rope
+from torch import nn
+
 from atom.config import Config
 from atom.model_ops.attention_mla import MLAModules
 from atom.model_ops.base_attention import Attention
@@ -45,7 +47,6 @@ from atom.model_ops.linear import (
     RowParallelLinear,
 )
 from atom.models.deepseek_v2 import yarn_get_mscale
-from torch import nn
 
 
 class Eagle3DeepseekMLAAttention(nn.Module):
@@ -380,3 +381,7 @@ class Eagle3DeepseekMLAModel(nn.Module):
         if not self.norm_output:
             hidden_states = self.norm(hidden_states)
         return self.lm_head(hidden_states)
+
+    def compute_draft_ids(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Greedy draft token ids, called once per step by EagleProposer."""
+        return self.compute_logits(hidden_states).argmax(dim=-1)

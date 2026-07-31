@@ -202,6 +202,14 @@ class Qwen3NextMTP(nn.Module):
     ) -> torch.Tensor | None:
         return self.lm_head(hidden_states)
 
+    def compute_draft_ids(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        """Greedy draft token ids, called once per step by EagleProposer."""
+        return self.compute_logits(hidden_states, spec_step_idx).argmax(dim=-1)
+
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)

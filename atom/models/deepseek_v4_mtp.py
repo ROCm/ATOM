@@ -27,8 +27,6 @@ Mirrors the V2/V3 + Qwen MTP convention:
      - output is `[N, dim]` post-(MTP block + its own hc_head + norm)
 """
 
-from typing import Optional
-
 import torch
 from torch import nn
 
@@ -97,8 +95,8 @@ class MTPBlock(Block):
         self.hc_head_base = atom_parameter(torch.empty(hc_mult, dtype=torch.float32))
         self.hc_head_scale = atom_parameter(torch.empty(1, dtype=torch.float32))
         # Externally-assigned by the wrapper (shared with the target).
-        self.embed: Optional[nn.Module] = None
-        self.head: Optional[ParallelHead] = None
+        self.embed: nn.Module | None = None
+        self.head: ParallelHead | None = None
 
     def forward(
         self,
@@ -295,8 +293,16 @@ class DeepseekV4MTP(nn.Module):
         self,
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         return self.model.compute_logits(hidden_states, spec_step_idx)
+
+    def compute_draft_ids(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        """Greedy draft token ids, called once per step by EagleProposer."""
+        return self.compute_logits(hidden_states, spec_step_idx).argmax(dim=-1)
 
     def share_with_target(self, target_base: nn.Module, loaded: set[str]) -> None:
         """Bind embed/head on each MTPBlock to the already-loaded target's
