@@ -358,6 +358,33 @@ class ScheduledBatch:
             dtype=np.int32,
         )
 
+        # Per-seq: does the seq's per-req cache slot already hold its OWN
+        # recurrent state? Consumed by GDNAttentionMetadataBuilder to build
+        # `has_initial_state`, which tells the conv/SSM kernels to seed this
+        # chunk from the previous chunk instead of restarting from zero.
+        # Index-aligned with the other per-seq arrays above.
+        self.has_recurrent_state = np.asarray(
+            [seq.has_recurrent_state for seq in seqs.values()], dtype=bool
+        )
+
+        # SSM state cache, per seq.
+        #   state_load_slots: checkpoint slot to seed this seq's runtime slot
+        #     from before its first forward (-1 = no prefix-cache hit).
+        #   state_save_all: every checkpoint the seq has reserved, as
+        #     (slot, position) — a request may hold both a fork checkpoint and
+        #     a prompt-end anchor. Only positions INTERIOR to a step need
+        #     copying; one at a step's end is already in the slot, because the
+        #     chunk kernel writes its final state there directly.
+        # Plain int32 arrays: cheap on the common path, and ScheduledBatch is
+        # pickled to every TP worker each step.
+        self.state_load_slots = np.asarray(
+            [seq.state_load_slot for seq in seqs.values()], dtype=np.int32
+        )
+        self.state_save_all = [
+            list(zip(seq.state_save_slots, seq.state_save_positions))
+            for seq in seqs.values()
+        ]
+
         # Compute token offsets: prefill uses num_cached_tokens, decode uses existing formula
         self.scheduled_tokens = np.empty(total_tokens_num, dtype=np.int32)
         pos = 0
@@ -1490,6 +1517,14 @@ class Scheduler:
                 seq.num_tokens,
                 seq.num_compressed_hit_blocks * self.block_manager.block_size,
             )
+            # Piggyback the SSM state cache on the same interval so its hit
+            # rate is visible next to the KV hit rate it gates. Silent
+            # degradation is the failure mode that matters here: vLLM's
+            # #45238 was a 0%-hit-rate collapse with nothing in the logs and
+            # TTFT quietly doubling.
+            pool = self.block_manager.state_cache
+            if pool is not None and self.cache_stats.total_requests % 100 == 0:
+                pool.log_summary()
         num_batched_tokens += chunk
         seq.status = SequenceStatus.RUNNING
         seq.type = SequenceType.PREFILL
@@ -1687,6 +1722,19 @@ class Scheduler:
                 # multiple steps (hash_blocks clips to fully-filled blocks).
                 self.block_manager.hash_blocks(seq, chunk)
                 seq.num_cached_tokens += chunk
+                # This chunk's forward advanced the recurrent state in the
+                # seq's per-req slot, so the NEXT chunk must seed from it
+                # rather than restarting the recurrence from zero. Set after
+                # the forward, never at admission — see
+                # Sequence.has_recurrent_state for why num_cached_tokens is
+                # not a safe proxy.
+                if seq.has_per_req_cache and chunk > 0:
+                    seq.has_recurrent_state = True
+                # State cache: publish whatever checkpoints this step's
+                # forward passed through, and release the entry it resumed
+                # from. One hook so the scheduler carries no state-cache
+                # policy.
+                self.block_manager.on_prefill_step_done(seq)
                 # chunked-prefill: reclaim SWA blocks that just fell out of
                 # the window, using the computed-so-far length
                 # (num_cached_tokens). Bounds peak SWA to ~window during prefill

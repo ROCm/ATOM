@@ -28,6 +28,14 @@ from atom.utils.distributed.utils import stateless_init_torch_distributed_proces
 
 logger = logging.getLogger("atom")
 
+# Internal chunk size of the linear-attention (GDN / delta-rule) kernels.
+# Recurrent state can be checkpointed and replayed BIT-EXACTLY only at
+# multiples of this value. Measured on fla 0.5.2 (MI300X, bf16, realistic
+# inputs): splitting a sequence at a multiple of 64 and replaying the tail via
+# `initial_state` reproduces the full-sequence output and final state with 0.0
+# error; off-grid splits are correct but only to ~3e-3 (below bf16 eps).
+SSM_STATE_KERNEL_CHUNK = 64
+
 
 @dataclass
 class KVCacheTensor:
@@ -1304,6 +1312,11 @@ class Config:
     index_cache_dtype: str | None = None
     enable_prefix_caching: bool = True
     enable_chunked_prefill: bool = True
+    # Recurrent-state (SSM/conv) checkpoint cache for linear-attention models.
+    # See atom/model_engine/state_cache.py. Off by default (experimental).
+    enable_ssm_state_cache: bool = False
+    ssm_state_cache_granularity: int = 64
+    ssm_state_cache_slots: int = 0
     port: int = 8006
     torch_profiler_dir: str | None = field(
         default_factory=lambda: envs.ATOM_TORCH_PROFILER_DIR
@@ -1617,6 +1630,39 @@ class Config:
             v4_block_size = 256
             if self.kv_cache_block_size != v4_block_size:
                 self.kv_cache_block_size = v4_block_size
+
+        # SSM state cache. Validated LAST: kv_cache_block_size may have just
+        # been rewritten above, and an earlier check would validate a stale
+        # value.
+        if self.enable_ssm_state_cache:
+            g = self.ssm_state_cache_granularity
+            if g <= 0:
+                raise ValueError(
+                    f"ssm_state_cache_granularity ({g}) must be positive."
+                )
+            if g % self.kv_cache_block_size != 0:
+                # A checkpoint position must be a KV block boundary, or
+                # "KV hit >= position" cannot be expressed and the state and
+                # KV caches cannot be kept consistent.
+                raise ValueError(
+                    f"ssm_state_cache_granularity ({g}) must be a multiple of "
+                    f"kv_cache_block_size ({self.kv_cache_block_size})."
+                )
+            if g % SSM_STATE_KERNEL_CHUNK != 0:
+                # Split-and-replay via initial_state is bit-exact ONLY on the
+                # kernel's internal chunk grid (measured on fla 0.5.2:
+                # 0.0 error at multiples of 64, ~3e-3 off-grid).
+                raise ValueError(
+                    f"ssm_state_cache_granularity ({g}) must be a multiple of "
+                    f"the linear-attention kernel chunk size "
+                    f"({SSM_STATE_KERNEL_CHUNK}); state checkpoints are only "
+                    f"bit-exact on that grid."
+                )
+            if self.ssm_state_cache_slots < 0:
+                raise ValueError(
+                    f"ssm_state_cache_slots ({self.ssm_state_cache_slots}) "
+                    f"must be >= 0 (0 = auto)."
+                )
 
     def compute_hash(self) -> str:
         """

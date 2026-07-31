@@ -6,7 +6,6 @@
 # The original source code was licensed under the MIT license and included
 # the following copyright notice:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
-# ruff: noqa: E501
 import warnings
 
 import torch
@@ -37,6 +36,9 @@ def chunk_gated_delta_rule_fwd(
     output_final_state: bool,
     cu_seqlens: torch.LongTensor | None = None,
     o: torch.Tensor | None = None,
+    state_indices: torch.Tensor | None = None,
+    dst_indices: torch.Tensor | None = None,
+    h0_mask: torch.Tensor | None = None,
 ):
     B, T = q.shape[0], q.shape[1]
     Hv = g.shape[2]
@@ -89,6 +91,9 @@ def chunk_gated_delta_rule_fwd(
         initial_state=initial_state,
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
+        state_indices=state_indices,
+        dst_indices=dst_indices,
+        h0_mask=h0_mask,
     )
     o = chunk_fwd_o(
         q=q,
@@ -100,13 +105,27 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
         o=o,
     )
-    if SUPPRESS_LEVEL < 3:
-        return g, o, A, final_state, None, None, None
-    elif SUPPRESS_LEVEL >= 3:
-        return g, o, A, final_state, w, h, v_new
+    # `h` is the recurrent state at EVERY chunk boundary —
+    # [B, NT, H, K, V], where h[:, j] is the state after j*chunk_size tokens.
+    # Always returned: the SSM state cache reads checkpoints straight out of
+    # it, which is what lets a checkpoint be taken at an interior position
+    # without splitting the prefill into two forward passes. The kernel
+    # computes it regardless, so returning it costs nothing.
+    return g, o, A, final_state, (w if SUPPRESS_LEVEL >= 3 else None), h, v_new
 
 
 class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
+    # Per-chunk recurrent states from the most recent forward, for the SSM
+    # state cache (see `pop_last_intermediate_states`). Overwritten every
+    # call; the consumer reads it immediately after its own forward.
+    #
+    # Only captured when `dst_indices` is set, i.e. when the caller is ATOM's
+    # paged state path and will actually pop it. `h` is large (33 MB at
+    # T=8192, H=8, K=V=128) and callers that never pop — the vLLM, SGLang and
+    # rtpllm plugins all call through the legacy gather/scatter signature —
+    # would otherwise pin one indefinitely after their last forward.
+    last_h = None
+
     @staticmethod
     @input_guard
     @torch.amp.custom_fwd(device_type="cuda")
@@ -123,6 +142,9 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         cu_seqlens: torch.LongTensor | None = None,
         use_qk_l2norm_in_kernel: bool = False,
         o: torch.Tensor | None = None,
+        state_indices: torch.Tensor | None = None,
+        dst_indices: torch.Tensor | None = None,
+        h0_mask: torch.Tensor | None = None,
     ):
         if use_qk_l2norm_in_kernel:
             q = l2norm_fwd(q)
@@ -142,9 +164,17 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
             o=o,
+            state_indices=state_indices,
+            dst_indices=dst_indices,
+            h0_mask=h0_mask,
         )
         ctx.scale = scale
         ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
+        # Per-chunk states, for the SSM state cache. Parked on the module so
+        # the (fixed) 2-tuple return contract stays intact for every existing
+        # caller, including the vLLM and rtpllm plugins. Captured only for the
+        # paged path that pops it — see the `last_h` declaration.
+        ChunkGatedDeltaRuleFunction.last_h = h if dst_indices is not None else None
         # Skip the dtype cast when it's a no-op so the caller's buffer is
         # the literal returned tensor (preserves the inplace contract).
         if o.dtype != q.dtype:
@@ -166,6 +196,9 @@ def chunk_gated_delta_rule(
     head_first: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     o: torch.Tensor | None = None,
+    state_indices: torch.Tensor | None = None,
+    dst_indices: torch.Tensor | None = None,
+    h0_mask: torch.Tensor | None = None,
 ):
     r"""
     Args:
@@ -272,7 +305,23 @@ def chunk_gated_delta_rule(
                 f"The batch size is expected to be 1 rather than {q.shape[0]} when using `cu_seqlens`."
                 f"Please flatten variable-length inputs before processing."
             )
-        if initial_state is not None and initial_state.shape[0] != len(cu_seqlens) - 1:
+        # With `state_indices` the initial state is the whole per-request POOL
+        # addressed by slot, so its leading dim is the pool size, not the
+        # batch size. The index array is what must match the batch.
+        if dst_indices is not None and len(dst_indices) != len(cu_seqlens) - 1:
+            raise ValueError(
+                f"dst_indices must have one entry per sequence: "
+                f"{len(cu_seqlens) - 1} rather than {len(dst_indices)}."
+            )
+        if state_indices is not None:
+            if len(state_indices) != len(cu_seqlens) - 1:
+                raise ValueError(
+                    f"state_indices must have one entry per sequence: "
+                    f"{len(cu_seqlens) - 1} rather than {len(state_indices)}."
+                )
+        elif (
+            initial_state is not None and initial_state.shape[0] != len(cu_seqlens) - 1
+        ):
             raise ValueError(
                 f"The number of initial states is expected to be equal to the number of input sequences, "
                 f"i.e., {len(cu_seqlens) - 1} rather than {initial_state.shape[0]}."
@@ -308,7 +357,29 @@ def chunk_gated_delta_rule(
         cu_seqlens,
         use_qk_l2norm_in_kernel,
         o,
+        state_indices,
+        dst_indices,
+        h0_mask,
     )
     if head_first:
         o = rearrange(o, "b t h ... -> b h t ...")
     return o, final_state
+
+
+def pop_last_intermediate_states():
+    """Per-chunk recurrent states from the most recent chunked GDN forward.
+
+    ``h[:, j]`` is the state after ``j * chunk_size`` tokens, so the SSM state
+    cache can take a checkpoint at any chunk-aligned interior position without
+    splitting the prefill into two forward passes.
+
+    Not bit-exact: ``h`` is stored in the input dtype (bf16) while the
+    recurrence carries fp32 internally, so a checkpoint read from it is
+    pre-rounded. Measured (T=512, resume at 256) against an output of absmax
+    0.065: re-run resume 0.0 maxdiff, captured-``h`` resume 1.2e-4 (~0.19 %).
+
+    Consumes the reference so a later caller cannot read a stale tensor.
+    """
+    h = ChunkGatedDeltaRuleFunction.last_h
+    ChunkGatedDeltaRuleFunction.last_h = None
+    return h

@@ -93,6 +93,9 @@ class EngineCore:
             config.num_per_req_cache_groups = block_info.get(
                 "num_per_req_cache_groups", 0
             )
+            # SSM state cache slot count is computed in the runner subprocess;
+            # propagate so BlockManager (built below) sees the same value.
+            config.ssm_state_cache_slots = block_info.get("ssm_state_cache_slots", 0)
             # paged-SWA: propagate SWA pool sizing from the runner subprocess
             # so BlockManager (built in Scheduler below) sees the same value as
             # the runner's attn builder (else swa_enabled=False vs the SWA pool).

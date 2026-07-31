@@ -1594,7 +1594,29 @@ class ModelRunner:
         max_per_req_cache_slots = (
             config.max_num_seqs * slots_per_req if per_req_cache_bytes > 0 else 0
         )
-        per_req_cache_tensor_bytes = max_per_req_cache_slots * per_req_cache_bytes
+        # SSM state cache: extra checkpoint slots appended to the same tensor.
+        # Sized from the layer-count ratio unless overridden. One checkpoint
+        # costs exactly one per-req slot, so budget a fixed share of the KV
+        # budget for them and convert to a slot count.
+        num_state_cache_slots = 0
+        if getattr(config, "enable_ssm_state_cache", False) and per_req_cache_bytes > 0:
+            override = int(getattr(config, "ssm_state_cache_slots", 0) or 0)
+            if override > 0:
+                num_state_cache_slots = override
+            else:
+                # MUST be deterministic across TP ranks: the scheduler hands
+                # out one slot index for all of them, so a rank that sized its
+                # tensor smaller would index out of bounds. `available_for_kv`
+                # is derived from live free memory and differs per rank
+                # (measured: 2809 / 2810 / 2812 slots on 8 ranks), so it cannot
+                # be used here. Scale off max_num_seqs instead — a pure
+                # function of config, identical everywhere.
+                num_state_cache_slots = max(1, config.max_num_seqs // 2)
+            config.ssm_state_cache_slots = num_state_cache_slots
+
+        per_req_cache_tensor_bytes = (
+            max_per_req_cache_slots + num_state_cache_slots
+        ) * per_req_cache_bytes
         available_for_pool = available_for_kv - per_req_cache_tensor_bytes
         if available_for_pool <= 0:
             # Minimum gpu_memory_utilization that makes the budget just cover the
@@ -1801,6 +1823,12 @@ class ModelRunner:
             "num_per_req_cache_groups": (
                 config.max_num_seqs if per_req_cache_bytes > 0 else 0
             ),
+            # get_num_blocks runs in the RUNNER subprocess; only this dict
+            # crosses back. Setting config.ssm_state_cache_slots above is
+            # invisible to the engine process that builds BlockManager, and
+            # the failure is silent (pool disabled, zero hits, no error) —
+            # the same trap documented for num_swa_blocks below.
+            "ssm_state_cache_slots": num_state_cache_slots,
             # paged-SWA: get_num_blocks runs in the RUNNER subprocess, so its
             # config.num_swa_blocks isn't visible to the engine process that
             # builds BlockManager. Propagate via block_info (mirrors the
