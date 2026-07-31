@@ -71,6 +71,7 @@ prefill = service.get("prefill", {})
 decode = service.get("decode", {})
 router = service.get("router", {})
 server_args = cell.get("server_args", {})
+benchmark = cell.get("benchmark", {})
 accuracy = cell.get("accuracy", {})
 
 def shell_value(value):
@@ -89,6 +90,20 @@ def csv_value(value):
 
 def q(value):
     return shlex.quote(str(shell_value(value)))
+
+slurm_submit_runner = runner.get("slurm_submit_runner", "atomesh-cicd")
+spur_controller_addr = runner.get("spur_controller_addr")
+if slurm_submit_runner == "atomesh-cicd-crusoe-mi355":
+    default_spur_accounting_addr = "http://crs-m2m-cpu-spur-005.crusoe.amd.com:6819"
+else:
+    default_spur_accounting_addr = "http://134.199.196.72:6819"
+if not spur_controller_addr:
+    if slurm_submit_runner == "atomesh-cicd-crusoe-mi355":
+        spur_controller_addr = "http://crs-m2m-cpu-spur-005.crusoe.amd.com:6817"
+    else:
+        spur_controller_addr = os.environ.get(
+            "SPUR_CONTROLLER_ADDR", "http://134.199.196.72:6817"
+        )
 
 exports = {
     "ATOMESH_CELL_ID": cell["id"],
@@ -109,6 +124,41 @@ exports = {
     "RANDOM_RANGE_RATIO": cell["random_range_ratio"],
     "REQUEST_RATE": cell["request_rate"],
     "BENCH_NUM_PROMPTS_MULTIPLIER": cell["num_prompts_multiplier"],
+    "BENCHMARK_KIND": benchmark.get("kind", "random"),
+    "AIPERF_DIR": benchmark.get("aiperf_dir", ""),
+    "AIPERF_VENV": benchmark.get("aiperf_venv", ""),
+    "AIPERF_COMMIT": benchmark.get("aiperf_commit", ""),
+    "AIPERF_SCENARIO": benchmark.get("scenario", ""),
+    "AIPERF_PUBLIC_DATASET": benchmark.get("public_dataset", ""),
+    "AIPERF_MAX_CONTEXT_LENGTH": benchmark.get("max_context_length", ""),
+    "AIPERF_NUM_DATASET_ENTRIES": benchmark.get("num_dataset_entries", ""),
+    "AIPERF_BENCHMARK_DURATION": benchmark.get("benchmark_duration", ""),
+    "AIPERF_AGENTIC_CACHE_WARMUP_DURATION": benchmark.get(
+        "agentic_cache_warmup_duration", ""
+    ),
+    "AIPERF_WARMUP_GRACE_PERIOD": benchmark.get("warmup_grace_period", ""),
+    "AIPERF_TRAJECTORY_START_MIN_RATIO": benchmark.get(
+        "trajectory_start_min_ratio", ""
+    ),
+    "AIPERF_TRAJECTORY_START_MAX_RATIO": benchmark.get(
+        "trajectory_start_max_ratio", ""
+    ),
+    "AIPERF_FAILED_REQUEST_THRESHOLD": benchmark.get("failed_request_threshold", ""),
+    "AIPERF_SLICE_DURATION": benchmark.get("slice_duration", ""),
+    "AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT": benchmark.get(
+        "cancel_drain_timeout", ""
+    ),
+    "AIPERF_HTTP_TCP_USER_TIMEOUT": benchmark.get("http_tcp_user_timeout", ""),
+    "AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES": benchmark.get(
+        "dataset_weka_live_assistant_responses", ""
+    ),
+    "AIPERF_DATASET_CONFIGURATION_TIMEOUT": benchmark.get(
+        "dataset_configuration_timeout", ""
+    ),
+    "AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT": benchmark.get(
+        "service_profile_configure_timeout", ""
+    ),
+    "AIPERF_UNSAFE_OVERRIDE": benchmark.get("unsafe_override", ""),
     "WAIT_SERVER_TIMEOUT": cell["wait_server_timeout"],
     "WAIT_ROUTER_TIMEOUT": cell["wait_router_timeout"],
     "PREFILL_WORKERS": prefill.get("workers", 1),
@@ -127,10 +177,16 @@ exports = {
     "KV_CACHE_DTYPE": server_args.get("kv_cache_dtype", "fp8"),
     "BLOCK_SIZE": server_args.get("block_size", 16),
     "MEM_FRACTION": server_args.get("gpu_memory_utilization", 0.85),
+    "ENABLE_PREFIX_CACHING": str(
+        server_args.get("enable_prefix_caching", False)
+    ).lower(),
     "MAX_MODEL_LEN": server_args.get("max_model_len", ""),
     "MAX_NUM_SEQS": server_args.get("max_num_seqs", 256),
     "DECODE_MAX_NUM_SEQS": server_args.get("decode_max_num_seqs", ""),
     "MAX_NUM_BATCHED_TOKENS": server_args.get("max_num_batched_tokens", ""),
+    "DECODE_MAX_NUM_BATCHED_TOKENS": server_args.get(
+        "decode_max_num_batched_tokens", ""
+    ),
     "ONLINE_QUANT_CONFIG": server_args.get("online_quant_config", ""),
     "HF_OVERRIDES": server_args.get("hf_overrides", ""),
     "SPEC_METHOD": server_args.get("method", ""),
@@ -152,20 +208,17 @@ exports = {
     "EVAL_CONCURRENCY": csv_value(
         accuracy.get("concurrency") or cell.get("concurrency", [])
     ),
-    "SLURM_SUBMIT_RUNNER": runner.get("slurm_submit_runner", "atomesh-cicd"),
+    "SLURM_SUBMIT_RUNNER": slurm_submit_runner,
     "SLURM_ACCOUNT": runner.get("slurm_account", "amd-frameworks"),
     "SLURM_PARTITION": runner.get("slurm_partition", "amd-frameworks"),
     "SLURM_CPUS_PER_TASK": runner.get("cpus_per_task", 114),
     "SLURM_GPUS_PER_NODE": runner.get("gpus_per_node", 8),
     "SLURM_TIME_LIMIT": runner.get("time_limit", "06:00:00"),
     "SLURM_LOG_ROOT": runner.get("log_root", "/it-share/ATOMESH_LOG/"),
-    "SPUR_CONTROLLER_ADDR": runner.get(
-        "spur_controller_addr",
-        os.environ.get("SPUR_CONTROLLER_ADDR", "http://134.199.196.72:6817"),
-    ),
+    "SPUR_CONTROLLER_ADDR": spur_controller_addr,
     "SPUR_ACCOUNTING_ADDR": runner.get(
         "spur_accounting_addr",
-        os.environ.get("SPUR_ACCOUNTING_ADDR", "http://134.199.196.72:6819"),
+        os.environ.get("SPUR_ACCOUNTING_ADDR", default_spur_accounting_addr),
     ),
 }
 
@@ -182,10 +235,11 @@ PY
 )"
 
 export RESULT_DIR
-CURRENT_USER="$(id -un)"
+CURRENT_USER="$(id -un 2>/dev/null || id -u)"
 SLURM_LOG_ROOT="${SLURM_LOG_ROOT//\$\{USER\}/${CURRENT_USER}}"
 SLURM_LOG_ROOT="${SLURM_LOG_ROOT//\$USER/${CURRENT_USER}}"
 export LOG_ROOT="${SLURM_LOG_ROOT%/}/${ATOMESH_CELL_ID}-${GITHUB_RUN_ID:-local}-$(date +%Y%m%d%H%M%S)"
+export SLURM_JOB_NAME="${ATOMESH_CELL_ID}-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
 if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
   export SLURM_OUTPUT="/tmp/atomesh-%j.out"
   export SLURM_ERROR="/tmp/atomesh-%j.err"
@@ -194,6 +248,10 @@ else
   export SLURM_ERROR="${LOG_ROOT}/slurm-%j.err"
 fi
 SLURM_LOG_POLL_INTERVAL="${SLURM_LOG_POLL_INTERVAL:-30}"
+USES_SPUR_CONTROLLER=0
+if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-crusoe-mi355" ]]; then
+  USES_SPUR_CONTROLLER=1
+fi
 
 echo "=== ATOMesh benchmark cell ==="
 echo "cell=${ATOMESH_CELL_ID}"
@@ -201,9 +259,12 @@ echo "model=${MODEL_NAME}"
 echo "topology=${DISPLAY_TOPOLOGY}"
 echo "nodes=${NODE_LIST}"
 echo "isl=${ISL_LIST} osl=${OSL} concurrency=${CONC_LIST}"
+echo "slurm_job_name=${SLURM_JOB_NAME}"
 echo "log_root=${LOG_ROOT}"
-if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
+if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
   echo "spur_controller=${SPUR_CONTROLLER_ADDR}"
+fi
+if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
   echo "spur_accounting=${SPUR_ACCOUNTING_ADDR}"
 fi
 
@@ -230,7 +291,7 @@ mkdir -p "${LOG_ROOT}"
 if ! command -v sbatch >/dev/null 2>&1; then
   echo "ERROR: sbatch not found; use --dry-run on non-Slurm runners" >&2
   echo "PATH=${PATH}" >&2
-  echo "host=$(hostname) user=$(id -un)" >&2
+  echo "host=$(hostname) user=${CURRENT_USER}" >&2
   for candidate in /usr/local/slurm-24.05.5.1/bin/sbatch /usr/bin/sbatch /etc/alternatives/sbatch; do
     if [[ -e "${candidate}" || -L "${candidate}" ]]; then
       printf '%s -> %s\n' "${candidate}" "$(readlink -f "${candidate}" 2>/dev/null || true)" >&2
@@ -240,23 +301,50 @@ if ! command -v sbatch >/dev/null 2>&1; then
   exit 127
 fi
 
+run_scancel() {
+  local -a scancel_cmd=(scancel)
+  if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
+    scancel_cmd+=(--controller "${SPUR_CONTROLLER_ADDR}")
+  fi
+  scancel_cmd+=("$@")
+
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "${SLURM_SCANCEL_TIMEOUT_SECONDS:-8}" "${scancel_cmd[@]}" || true
+  else
+    "${scancel_cmd[@]}" || true
+  fi
+}
+
+scancel_slurm_job_by_name() {
+  if [[ -z "${SLURM_JOB_NAME:-}" ]]; then
+    return 0
+  fi
+
+  echo "=== cancelling Slurm job by name ${SLURM_JOB_NAME} user=${CURRENT_USER} ===" >&2
+  run_scancel --user "${CURRENT_USER}" --name "${SLURM_JOB_NAME}"
+}
+
 scancel_slurm_job() {
   local reason="$1"
-  if [[ "${SLURM_JOB_ACTIVE}" != "1" || -z "${JOB_ID}" || "${SCANCEL_SENT}" == "1" ]]; then
+  if [[ "${SCANCEL_SENT}" == "1" ]]; then
+    return 0
+  fi
+  if [[ "${SLURM_JOB_ACTIVE}" != "1" && -z "${JOB_ID}" && -z "${SLURM_JOB_NAME:-}" ]]; then
     return 0
   fi
 
   SCANCEL_SENT=1
-  echo "=== cancelling Slurm job ${JOB_ID}: ${reason} ===" >&2
   if command -v scancel >/dev/null 2>&1; then
-    if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
-      scancel --controller "${SPUR_CONTROLLER_ADDR}" "${JOB_ID}" || true
+    if [[ -n "${JOB_ID}" ]]; then
+      echo "=== cancelling Slurm job ${JOB_ID}: ${reason} ===" >&2
+      run_scancel "${JOB_ID}"
+      wait_for_slurm_cancel "${JOB_ID}" "TERM" || true
     else
-      scancel "${JOB_ID}" || true
+      echo "=== cancelling Slurm job before id was recorded: ${reason} ===" >&2
+      scancel_slurm_job_by_name
     fi
-    wait_for_slurm_cancel "${JOB_ID}" "TERM" || true
   else
-    echo "WARNING: scancel not found; unable to cancel Slurm job ${JOB_ID}" >&2
+    echo "WARNING: scancel not found; unable to cancel Slurm job ${JOB_ID:-${SLURM_JOB_NAME:-unknown}}" >&2
   fi
 }
 
@@ -264,7 +352,7 @@ slurm_job_in_queue() {
   local job_id="$1"
   local squeue_cmd=(squeue)
 
-  if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
+  if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
     squeue_cmd+=(--controller "${SPUR_CONTROLLER_ADDR}")
   fi
 
@@ -280,11 +368,7 @@ wait_for_slurm_cancel() {
   while slurm_job_in_queue "${job_id}"; do
     if [[ "$(date +%s)" -ge "${deadline}" ]]; then
       echo "=== Slurm job ${job_id} still queued after ${initial_signal}; sending KILL ===" >&2
-      if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
-        scancel --controller "${SPUR_CONTROLLER_ADDR}" --signal=KILL "${job_id}" || true
-      else
-        scancel --signal=KILL "${job_id}" || true
-      fi
+      run_scancel --signal=KILL "${job_id}"
       kill_deadline=$(( $(date +%s) + ${SLURM_CANCEL_KILL_WAIT_SECONDS:-30} ))
       while slurm_job_in_queue "${job_id}" && [[ "$(date +%s)" -lt "${kill_deadline}" ]]; do
         sleep 5
@@ -322,7 +406,7 @@ on_cancel() {
 
 on_exit() {
   local rc=$?
-  if [[ "${rc}" -ne 0 ]]; then
+  if [[ "${rc}" -ne 0 && "${SLURM_JOB_ACTIVE}" == "1" ]]; then
     scancel_slurm_job "exiting rc=${rc}"
   fi
 }
@@ -342,52 +426,62 @@ set_slurm_job_log_paths() {
 }
 
 write_slurm_cancel_helper() {
-  local job_id="$1"
+  local job_id="${1:-}"
   local helper="${RESULT_DIR}/${ATOMESH_CELL_ID}.slurm-cancel.sh"
 
-  if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
-    cat > "${helper}" <<EOF
+  {
+    cat <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-job_id="${job_id}"
-job_in_queue() {
-  command -v squeue >/dev/null 2>&1 || return 1
-  [[ -n "\$(squeue --controller "${SPUR_CONTROLLER_ADDR}" -h -j "\${job_id}" 2>/dev/null)" ]]
-}
-if command -v scancel >/dev/null 2>&1; then
-  scancel --controller "${SPUR_CONTROLLER_ADDR}" "\${job_id}" || true
-  deadline=\$(( \$(date +%s) + \${SLURM_CANCEL_WAIT_SECONDS:-60} ))
-  while job_in_queue; do
-    if [[ "\$(date +%s)" -ge "\${deadline}" ]]; then
-      scancel --controller "${SPUR_CONTROLLER_ADDR}" --signal=KILL "\${job_id}" || true
-      break
-    fi
-    sleep 5
-  done
-fi
 EOF
-  else
-    cat > "${helper}" <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-job_id="${job_id}"
-job_in_queue() {
-  command -v squeue >/dev/null 2>&1 || return 1
-  [[ -n "\$(squeue -h -j "\${job_id}" 2>/dev/null)" ]]
-}
-if command -v scancel >/dev/null 2>&1; then
-  scancel "\${job_id}" || true
-  deadline=\$(( \$(date +%s) + \${SLURM_CANCEL_WAIT_SECONDS:-60} ))
-  while job_in_queue; do
-    if [[ "\$(date +%s)" -ge "\${deadline}" ]]; then
-      scancel --signal=KILL "\${job_id}" || true
-      break
-    fi
-    sleep 5
-  done
-fi
-EOF
+    printf 'job_id=%q\n' "${job_id}"
+    printf 'job_name=%q\n' "${SLURM_JOB_NAME}"
+    printf 'current_user=%q\n' "${CURRENT_USER}"
+    printf 'controller=%q\n' "${SPUR_CONTROLLER_ADDR}"
+    printf 'uses_spur=%q\n' "${USES_SPUR_CONTROLLER}"
+    cat <<'EOF'
+
+run_scancel() {
+  command -v scancel >/dev/null 2>&1 || return 0
+  local -a cmd=(scancel)
+  if [[ "${uses_spur}" == "1" ]]; then
+    cmd+=(--controller "${controller}")
   fi
+  cmd+=("$@")
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "${SLURM_SCANCEL_TIMEOUT_SECONDS:-8}" "${cmd[@]}" || true
+  else
+    "${cmd[@]}" || true
+  fi
+}
+
+job_id_in_queue() {
+  [[ -n "${job_id}" ]] || return 1
+  command -v squeue >/dev/null 2>&1 || return 1
+  local -a cmd=(squeue)
+  if [[ "${uses_spur}" == "1" ]]; then
+    cmd+=(--controller "${controller}")
+  fi
+  [[ -n "$("${cmd[@]}" -h -j "${job_id}" 2>/dev/null)" ]]
+}
+
+if [[ -n "${job_id}" ]]; then
+  run_scancel "${job_id}"
+  deadline=$(( $(date +%s) + ${SLURM_CANCEL_WAIT_SECONDS:-60} ))
+  while job_id_in_queue; do
+    if [[ "$(date +%s)" -ge "${deadline}" ]]; then
+      run_scancel --signal=KILL "${job_id}"
+      break
+    fi
+    sleep 5
+  done
+elif [[ -n "${job_name}" ]]; then
+  run_scancel --user "${current_user}" --name "${job_name}"
+  sleep "${SLURM_CANCEL_NAME_KILL_DELAY_SECONDS:-5}"
+  run_scancel --signal=KILL --user "${current_user}" --name "${job_name}"
+fi
+EOF
+  } > "${helper}"
   chmod +x "${helper}"
 }
 
@@ -437,7 +531,7 @@ monitor_slurm_job() {
   ERR_LINE=0
   SPUR_SHARED_LOG_LINES=()
 
-  if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
+  if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
     squeue_cmd+=(--controller "${SPUR_CONTROLLER_ADDR}")
   fi
 
@@ -470,7 +564,7 @@ read_slurm_exit_code() {
     return 0
   fi
 
-  if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
+  if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
     sacct_line="$(sacct --accounting "${SPUR_ACCOUNTING_ADDR}" --brief --noheader 2>/dev/null | awk -v job_id="${job_id}" '$1 == job_id { print $2 "|" $3; exit }' || true)"
   else
     sacct_line="$(sacct -j "${job_id}" -X -n -P -o State,ExitCode 2>/dev/null | awk -F'|' 'NF { print; exit }' || true)"
@@ -502,7 +596,7 @@ if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
   SUBMIT_SCRIPT="${LOG_ROOT}/submit-${ATOMESH_CELL_ID}.sbatch.sh"
   cat > "${SUBMIT_SCRIPT}" <<EOF
 #!/usr/bin/env bash
-#SBATCH --job-name=${ATOMESH_CELL_ID}
+#SBATCH --job-name=${SLURM_JOB_NAME}
 #SBATCH --nodes=${NUM_NODES}
 #SBATCH --ntasks-per-node=1
 #SBATCH --exclusive
@@ -521,21 +615,39 @@ EOF
     printf 'exec %q\n' "${JOB_SCRIPT}"
   } >> "${SUBMIT_SCRIPT}"
   chmod +x "${SUBMIT_SCRIPT}"
-  SBATCH_CMD=(sbatch --controller "${SPUR_CONTROLLER_ADDR}" "${SUBMIT_SCRIPT}")
+  SBATCH_CMD=(sbatch --controller "${SPUR_CONTROLLER_ADDR}" --export=ALL "${SUBMIT_SCRIPT}")
 else
   SBATCH_CMD=(
     sbatch
     --parsable
     --exclusive
-    --account "${SLURM_ACCOUNT}"
-    --partition "${SLURM_PARTITION}"
+    --export=ALL 
+    --job-name "${SLURM_JOB_NAME}"
+  )
+  if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
+    SBATCH_CMD+=(--controller "${SPUR_CONTROLLER_ADDR}")
+  fi
+  if [[ -n "${SLURM_ACCOUNT}" ]]; then
+    SBATCH_CMD+=(--account "${SLURM_ACCOUNT}")
+  fi
+  if [[ -n "${SLURM_PARTITION}" ]]; then
+    SBATCH_CMD+=(--partition "${SLURM_PARTITION}")
+  fi
+  if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-crusoe-mi355" ]]; then
+    SBATCH_CMD+=(-q amd-burst-qos)
+  fi
+  SBATCH_CMD+=(
     --nodes "${NUM_NODES}"
     --ntasks "${NUM_NODES}"
     --ntasks-per-node 1
     --cpus-per-task "${SLURM_CPUS_PER_TASK}"
     --gres "gpu:${SLURM_GPUS_PER_NODE}"
     --time "${SLURM_TIME_LIMIT}"
-    --nodelist "${NODE_LIST}"
+  )
+  if [[ -n "${NODE_LIST}" ]]; then
+    SBATCH_CMD+=(--nodelist "${NODE_LIST}")
+  fi
+  SBATCH_CMD+=(
     --output "${SLURM_OUTPUT}"
     --error "${SLURM_ERROR}"
     "${JOB_SCRIPT}"
@@ -545,6 +657,7 @@ fi
 echo "=== submitting Slurm job ==="
 printf ' %q' "${SBATCH_CMD[@]}"
 echo
+write_slurm_cancel_helper ""
 
 set +e
 SBATCH_OUTPUT="$("${SBATCH_CMD[@]}")"
@@ -558,10 +671,10 @@ if [[ "${SBATCH_RC}" -ne 0 ]]; then
 fi
 
 JOB_ID="$(parse_sbatch_job_id "${SBATCH_OUTPUT}")"
+SLURM_JOB_ACTIVE=1
 echo "${JOB_ID}" | tee "${RESULT_DIR}/${ATOMESH_CELL_ID}.slurm-job-id"
 write_slurm_cancel_helper "${JOB_ID}"
 
-SLURM_JOB_ACTIVE=1
 set_slurm_job_log_paths "${JOB_ID}"
 monitor_slurm_job "${JOB_ID}"
 read_slurm_exit_code "${JOB_ID}"

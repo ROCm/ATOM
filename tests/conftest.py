@@ -2,13 +2,14 @@
 # Shared fixtures and module stubs for ATOM unit tests.
 # Must be imported before any atom.* module to avoid triggering heavy imports.
 
-import importlib
-import importlib.util
-import importlib.machinery
-import sys
-import os
-import types
+import enum
 import hashlib
+import importlib
+import importlib.machinery
+import importlib.util
+import os
+import sys
+import types
 from itertools import count
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -27,6 +28,9 @@ if ATOM_ROOT not in sys.path:
 _atom_pkg = types.ModuleType("atom")
 _atom_pkg.__path__ = [os.path.join(ATOM_ROOT, "atom")]
 _atom_pkg.__package__ = "atom"
+# arg_utils does `from atom import LLMEngine`; stub it so the import resolves
+# without running atom/__init__.py (which pulls in zmq / GPU init).
+_atom_pkg.LLMEngine = MagicMock()
 sys.modules["atom"] = _atom_pkg
 
 # ── 3. Stub `atom.config` to avoid HuggingFace / torch heavy imports ──────
@@ -37,8 +41,6 @@ _atom_config.__package__ = "atom.config"
 
 class _StubConfig:
     """Placeholder so `from atom.config import Config` doesn't fail."""
-
-    pass
 
 
 class _StubKVCacheTensor:
@@ -51,8 +53,6 @@ class _StubKVCacheTensor:
 
 class _StubParallelConfig:
     """Placeholder for ParallelConfig."""
-
-    pass
 
 
 class _StubEPLBConfig:
@@ -88,10 +88,23 @@ class _StubAtomConfig:
     eplb_config = _StubEPLBConfig()
 
 
+class _StubCUDAGraphMode(enum.Enum):
+    """Mirror the real enum members so arg_utils' `CUDAGraphMode[name]` works."""
+
+    NONE = 0
+    PIECEWISE = 1
+    FULL = 2
+
+
 _atom_config.Config = _StubConfig
 _atom_config.KVCacheTensor = _StubKVCacheTensor
 _atom_config.ParallelConfig = _StubParallelConfig
 _atom_config.EPLBConfig = _StubEPLBConfig
+_atom_config.CUDAGraphMode = _StubCUDAGraphMode
+# Config dataclasses arg_utils imports; tests only need them constructible.
+_atom_config.CompilationConfig = MagicMock(side_effect=lambda **kw: MagicMock(**kw))
+_atom_config.SpeculativeConfig = MagicMock(side_effect=lambda **kw: MagicMock(**kw))
+_atom_config.DSparkConfig = MagicMock(side_effect=lambda **kw: MagicMock(**kw))
 # Present so tests can monkeypatch it (raising=True) and so EPLB code paths that
 # call it without a patch get usable defaults.
 _atom_config.get_current_atom_config = lambda: _StubAtomConfig()
@@ -144,10 +157,10 @@ if importlib.util.find_spec("xxhash") is None:
 
 # ── 6. Now safe to import atom submodules ──────────────────────────────────
 
-from atom.sampling_params import SamplingParams  # noqa: E402
-from atom.model_engine.sequence import Sequence  # noqa: E402
-from atom.model_engine.block_manager import BlockManager  # noqa: E402
-from atom.model_engine.scheduler import Scheduler  # noqa: E402
+from atom.model_engine.block_manager import BlockManager
+from atom.model_engine.scheduler import Scheduler
+from atom.model_engine.sequence import Sequence
+from atom.sampling_params import SamplingParams
 
 # ── 7. MockConfig ──────────────────────────────────────────────────────────
 
@@ -169,24 +182,25 @@ class MockConfig:
     """
 
     def __init__(self, **overrides):
-        defaults = dict(
-            kv_cache_block_size=4,
-            num_kvcache_blocks=10,
-            enable_prefix_caching=False,
-            enable_chunked_prefill=True,
-            max_num_seqs=4,
-            max_num_batched_tokens=64,
-            long_prefill_token_threshold=0,
-            max_model_len=64,
-            bos_token_id=1,
-            eos_token_id=2,
-            stop_token_ids=[],
-            scheduler_delay_factor=0.0,
-            speculative_config=None,
+        defaults = {
+            "kv_cache_block_size": 4,
+            "num_kvcache_blocks": 10,
+            "enable_prefix_caching": False,
+            "enable_chunked_prefill": True,
+            "max_num_seqs": 4,
+            "max_num_batched_tokens": 64,
+            "long_prefill_token_threshold": 0,
+            "decode_context_parallel_size": 1,
+            "max_model_len": 64,
+            "bos_token_id": 1,
+            "eos_token_id": 2,
+            "stop_token_ids": [],
+            "scheduler_delay_factor": 0.0,
+            "speculative_config": None,
             # Scheduler.__init__ reads config.hf_config.architectures for V4
             # SWA-warmup detection; a non-V4 stub keeps that path inert.
-            hf_config=_MockHFConfig(),
-        )
+            "hf_config": _MockHFConfig(),
+        }
         defaults.update(overrides)
         for k, v in defaults.items():
             setattr(self, k, v)

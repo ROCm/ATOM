@@ -154,45 +154,110 @@ jobs:
           MODEL_CACHE_DESC=""
           MODEL_MOUNT_PATH="/models"
           HF_CACHE_ROOT=""
+          MODEL_PATH="${{ matrix.model_path }}"
 
-          if [ -d "/mnt/dcgpuval" ]; then
-            MODEL_CACHE_ROOT="/mnt/dcgpuval"
-          elif [ -d "/shared/data/WRH/models" ]; then
-            MODEL_CACHE_ROOT="/shared/data/WRH/models"
-          elif [ -d "/mnt/raid0/pretrained_model" ]; then
-            MODEL_CACHE_ROOT="/mnt/raid0/pretrained_model"
-          elif [ -d "/data/pretrained_model" ]; then
-            MODEL_CACHE_ROOT="/data/pretrained_model"
-          elif [ -d "/data/models" ]; then
-            MODEL_CACHE_ROOT="/data/models"
-          else
-            MODEL_CACHE_ROOT="/mnt/raid0/pretrained_model"
-            echo "Warning: Neither /mnt/raid0/pretrained_model nor /data/pretrained_model nor /shared/data/WRH/models nor /data/models exists on runner; using container-local ${MODEL_CACHE_ROOT}."
+          model_dir_is_complete() {
+            local model_dir="$1"
+            [ -f "${model_dir}/config.json" ] || return 1
+            MODEL_DIR="${model_dir}" python3 - <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          model_dir = Path(os.environ["MODEL_DIR"])
+          index_path = model_dir / "model.safetensors.index.json"
+          if not index_path.exists():
+              sys.exit(0)
+
+          try:
+              weight_map = json.loads(index_path.read_text()).get("weight_map", {})
+          except Exception as exc:
+              print(f"Invalid safetensors index under {model_dir}: {exc}")
+              sys.exit(1)
+
+          expected = {Path(path).name for path in weight_map.values()}
+          present = {path.name for path in model_dir.glob("*.safetensors")}
+          missing = sorted(expected - present)
+          if missing:
+              shown = ", ".join(missing[:10])
+              suffix = "" if len(missing) <= 10 else f" ... and {len(missing) - 10} more"
+              print(f"Missing safetensors shards under {model_dir}: {shown}{suffix}")
+              sys.exit(1)
+          PY
+          }
+
+          cache_roots=(
+            /mnt/dcgpuval
+            /shared/data/WRH/models
+            /mnt/raid0/pretrained_model
+            /data/pretrained_model
+            /data/models
+          )
+
+          first_existing_root=""
+          for candidate in "${cache_roots[@]}"; do
+            if [ ! -d "$candidate" ]; then
+              continue
+            fi
+            if [ -z "$first_existing_root" ]; then
+              first_existing_root="$candidate"
+            fi
+            if model_dir_is_complete "${candidate}/${MODEL_PATH}"; then
+              MODEL_CACHE_ROOT="$candidate"
+              break
+            fi
+            if [ -f "${candidate}/${MODEL_PATH}/config.json" ]; then
+              echo "Warning: Found incomplete local model under ${candidate}/${MODEL_PATH}; trying next cache root."
+            fi
+          done
+
+          if [ -z "$MODEL_CACHE_ROOT" ]; then
+            if [ -n "$first_existing_root" ]; then
+              MODEL_CACHE_ROOT="$first_existing_root"
+              echo "No complete local model found for ${MODEL_PATH}; using ${MODEL_CACHE_ROOT} for download/cache."
+            else
+              MODEL_CACHE_ROOT="/mnt/raid0/pretrained_model"
+              echo "Warning: No shared model cache root exists on runner; using container-local ${MODEL_CACHE_ROOT}."
+            fi
           fi
 
           if [ -d "$MODEL_CACHE_ROOT" ]; then
             MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_ROOT}:${MODEL_MOUNT_PATH}"
             MODEL_CACHE_DESC="${MODEL_CACHE_ROOT} (host mount)"
-            HF_CACHE_ROOT="${MODEL_CACHE_ROOT}/.cache/huggingface"
           else
             MODEL_CACHE_DESC="container-local ${MODEL_CACHE_ROOT} (no host cache mount)"
           fi
 
-          if [ -z "$HF_CACHE_ROOT" ]; then
-            for candidate in /mnt/raid0/huggingface /data/huggingface /shared/data/WRH/huggingface; do
-              parent="$(dirname "$candidate")"
-              if [ -d "$parent" ] && [ -w "$parent" ]; then
-                HF_CACHE_ROOT="$candidate"
-                break
-              fi
-            done
-          fi
+          try_hf_cache_root() {
+            local candidate="$1"
+            local parent
+            [ -n "$candidate" ] || return 1
+            parent="$(dirname "$candidate")"
+            [ -d "$parent" ] || return 1
+            if mkdir -p "$candidate" 2>/dev/null; then
+              HF_CACHE_ROOT="$candidate"
+              return 0
+            fi
+            echo "Warning: HuggingFace cache candidate is not writable: ${candidate}"
+            return 1
+          }
+
+          for candidate in \
+            "${MODEL_CACHE_ROOT}/.cache/huggingface" \
+            /mnt/raid0/huggingface \
+            /data/huggingface \
+            /shared/data/WRH/huggingface; do
+            if try_hf_cache_root "$candidate"; then
+              break
+            fi
+          done
 
           if [ -z "$HF_CACHE_ROOT" ]; then
             HF_CACHE_ROOT="${RUNNER_TEMP:-${GITHUB_WORKSPACE:-$PWD}}/huggingface"
+            mkdir -p "$HF_CACHE_ROOT"
           fi
           HF_CACHE_MOUNT="-v ${HF_CACHE_ROOT}:/hf-cache"
-          mkdir -p "$HF_CACHE_ROOT"
           echo "Using HuggingFace cache root: ${HF_CACHE_ROOT}"
           df -h "$HF_CACHE_ROOT" || true
 
@@ -328,12 +393,36 @@ jobs:
           if $CONTAINER_ENGINE exec \
             -e MODEL_DIR="$model_dir" \
             "$CONTAINER_NAME" \
-            bash -lc '[ -f "$MODEL_DIR/config.json" ]'; then
+            bash -lc '
+              set -euo pipefail
+              [ -f "$MODEL_DIR/config.json" ]
+              python3 - <<'"'"'PY'"'"'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          model_dir = Path(os.environ["MODEL_DIR"])
+          index_path = model_dir / "model.safetensors.index.json"
+          if not index_path.exists():
+              sys.exit(0)
+
+          weight_map = json.loads(index_path.read_text()).get("weight_map", {})
+          expected = {Path(path).name for path in weight_map.values()}
+          present = {path.name for path in model_dir.glob("*.safetensors")}
+          missing = sorted(expected - present)
+          if missing:
+              shown = ", ".join(missing[:10])
+              suffix = "" if len(missing) <= 10 else f" ... and {len(missing) - 10} more"
+              print(f"Missing safetensors shards under {model_dir}: {shown}{suffix}")
+              sys.exit(1)
+          PY
+            '; then
             echo "Resolved local model path: ${model_dir}"
             echo "SGLANG_MODEL_AVAILABLE_LOCALLY=true" >> "$GITHUB_ENV"
             echo "SGLANG_RESOLVED_MODEL_PATH=${model_dir}" >> "$GITHUB_ENV"
           else
-            echo "Local model path not found for ${{ matrix.model_path }} under ${model_dir}."
+            echo "Complete local model path not found for ${{ matrix.model_path }} under ${model_dir}."
             echo "SGLANG_MODEL_AVAILABLE_LOCALLY=false" >> "$GITHUB_ENV"
           fi
 
@@ -364,6 +453,31 @@ jobs:
                   use_model_lock="false"
                 fi
 
+                model_dir_is_complete() {
+                  [ -f "$MODEL_DIR/config.json" ] || return 1
+                  python3 - <<'"'"'PY'"'"'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          model_dir = Path(os.environ["MODEL_DIR"])
+          index_path = model_dir / "model.safetensors.index.json"
+          if not index_path.exists():
+              sys.exit(0)
+
+          weight_map = json.loads(index_path.read_text()).get("weight_map", {})
+          expected = {Path(path).name for path in weight_map.values()}
+          present = {path.name for path in model_dir.glob("*.safetensors")}
+          missing = sorted(expected - present)
+          if missing:
+              shown = ", ".join(missing[:10])
+              suffix = "" if len(missing) <= 10 else f" ... and {len(missing) - 10} more"
+              print(f"Model under {model_dir} is missing safetensors shards: {shown}{suffix}")
+              sys.exit(1)
+          PY
+                }
+
                 download_model() {
                   if [ -f "$MODEL_DIR/config.json" ]; then
                     echo "Model directory exists without a completion marker under ${MODEL_DIR}; validating download"
@@ -373,11 +487,17 @@ jobs:
 
                   rm -f "$completion_flag"
                   hf download "$MODEL_PATH" --local-dir "$MODEL_DIR"
+                  model_dir_is_complete
                   touch "$completion_flag"
                 }
 
                 if [ -f "$completion_flag" ]; then
-                  echo "Model already exists under ${MODEL_DIR}; skip download"
+                  if model_dir_is_complete; then
+                    echo "Model already exists under ${MODEL_DIR}; skip download"
+                  else
+                    echo "Completion marker exists but model is incomplete under ${MODEL_DIR}; redownloading"
+                    download_model
+                  fi
                 elif [ "$use_model_lock" != "true" ]; then
                   echo "Baremetal runner ${RUNNER_NAME} detected; skipping shared model download lock"
                   download_model
@@ -392,9 +512,12 @@ jobs:
                     exit 1
                   fi
 
-                  if [ -f "$completion_flag" ]; then
+                  if [ -f "$completion_flag" ] && model_dir_is_complete; then
                     echo "Model became available under ${MODEL_DIR} while waiting for the lock; skip download"
                   else
+                    if [ -f "$completion_flag" ]; then
+                      echo "Completion marker exists after lock but model is incomplete under ${MODEL_DIR}; redownloading"
+                    fi
                     download_model
                   fi
                 fi
