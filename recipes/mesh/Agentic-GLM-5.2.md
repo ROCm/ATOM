@@ -320,6 +320,36 @@ router before every point so each measurement begins with fresh HBM and LMCache
 state. The repository's nightly configuration models every layout/concurrency
 combination as an independent job for the same reason.
 
+## Agentic Accuracy (SWE-bench Lite)
+
+Agentic accuracy does not use the fixed-sequence GSM8K evaluator. The c48
+nightly case runs ATOM's local SWE-bench Lite agentic evaluation after the
+performance trace:
+
+- `princeton-nlp/SWE-bench_Lite`, full 300-instance test split.
+- 16 local `mini-swe-agent==2.4.5` workers with a 150-step limit.
+- Local Docker sandboxes and official `swebench==4.1.0` scoring.
+- Accuracy is `resolved / submitted` from `exact_match,resolved`.
+- The current CI threshold is `0.50`.
+
+The same ATOM-owned runner can be invoked manually while the model router is
+available:
+
+```bash
+bash .github/scripts/atomesh/run_swebench_lite.sh \
+  --output-dir /tmp/swebench-lite \
+  --model-name GLM-5.2-MXFP4 \
+  --api-model /mnt/models/GLM-5.2-MXFP4 \
+  --api-base http://127.0.0.1:8000/v1 \
+  --run-id glm52-local
+```
+
+Only c48 runs the full accuracy suite so the five performance jobs do not
+duplicate the same 300-instance evaluation. Rank 0 receives the host Docker
+socket and CLI for this step; no Modal credentials or InferenceX checkout is
+required. Plan for roughly 120 GB of reusable Docker image storage and at least
+16 GB of free memory on the evaluation node.
+
 For a short functional smoke test, use:
 
 ```bash
