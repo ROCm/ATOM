@@ -1,20 +1,18 @@
-"""vLLM-specific DeepSeek MTP model extensions."""
+"""vLLM-specific DeepSeek MTP model extensions.
 
-import torch
+DEPRECATED -- this module no longer adds anything to the native model and is
+safe to delete. It used to carry ``get_recycle_hidden``, which re-applied
+``shared_head.norm`` so vLLM could recycle the post-final-norm hidden into the
+next MTP step. That norm now runs at the end of
+``DeepSeekMultiTokenPredictorLayer.forward``, so the model's own output is
+already the state to recycle and the override became a duplicate of
+``SharedHead.norm``.
 
-from atom.models.deepseek_mtp import DeepSeekMTP as DeepSeekMTPBase
+``_ATOM_MODEL_REGISTRY`` maps ``DeepSeekMTPModel`` straight to
+``atom.models.deepseek_mtp:DeepSeekMTP`` again, matching how every other MTP
+arch is registered. The re-export below only keeps stale imports working.
+"""
 
+from atom.models.deepseek_mtp import DeepSeekMTP
 
-class DeepSeekMTP(DeepSeekMTPBase):
-    """Adapt the native DeepSeek MTP model to vLLM's recycle-state contract."""
-
-    def get_recycle_hidden(
-        self,
-        hidden_states: torch.Tensor,
-        spec_step_idx: int = 0,
-    ) -> torch.Tensor:
-        current_step_idx = spec_step_idx % self.model.num_mtp_layers
-        mtp_layer = self.model.layers[
-            str(self.model.mtp_start_layer_idx + current_step_idx)
-        ]
-        return mtp_layer.shared_head(hidden_states)
+__all__ = ["DeepSeekMTP"]
