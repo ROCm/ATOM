@@ -69,9 +69,30 @@ hidden_for_logits, hidden_for_next_step = model(input_ids, positions, hidden_sta
   otherwise identical to `hidden_for_logits`. This is what the propose loop
   feeds back as `hidden_states` on the next speculative step.
 
-`EagleProposer.propose()` (`atom/spec_decode/eagle.py`) unpacks the tuple via
-`isinstance(model_out, tuple)`, so legacy drafters returning a single tensor
-continue to work without changes.
+`EagleProposer.propose()` (`atom/spec_decode/eagle_proposer.py`) unpacks the
+tuple via `isinstance(model_out, tuple)`, so legacy drafters returning a single
+tensor continue to work without changes.
+
+### `compute_draft_ids`
+
+Every draft model `EagleProposer` can build must also implement:
+
+```python
+def compute_draft_ids(self, hidden_states: torch.Tensor) -> torch.Tensor: ...  # [N] int64
+```
+
+The propose loop calls it once per draft step, unconditionally — there is no
+capability probe, so a draft model missing it raises `AttributeError` mid
+rollout. Two implementations exist and are token-identical:
+
+- `compute_logits(hidden_states).argmax(-1)` — the default, all-gathers the full
+  `[N, vocab]` logits.
+- `lm_head.compute_argmax_token(hidden_states)` — each rank reduces its own vocab
+  shard and only `[N, 2]` is all-gathered. Used by `DeepSeekMTP` and
+  `Eagle3LlamaModel`; preferred where the head supports it.
+
+The DSpark archs are exempt: `DSparkProposer` drafts a whole block per forward
+and never enters this loop.
 
 ## Usage
 

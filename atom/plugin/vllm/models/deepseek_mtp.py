@@ -8,7 +8,7 @@ next MTP step. That norm now runs at the end of
 already the state to recycle and the override became a duplicate of
 ``SharedHead.norm``.
 
-``_ATOM_MODEL_REGISTRY`` maps ``DeepSeekMTPModel`` straight to
+``_ATOM_MODEL_CLASSES`` maps ``DeepSeekMTPModel`` straight to
 ``atom.models.deepseek_mtp:DeepSeekMTP`` again, matching how every other MTP
 arch is registered. The re-export below only keeps stale imports working.
 """

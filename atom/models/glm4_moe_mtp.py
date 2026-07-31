@@ -90,10 +90,14 @@ class Glm4MoeMultiTokenPredictorLayer(nn.Module):
         # the all-reduce to the *next* layer's fused input_layernorm. The MTP
         # block is the last layer, so there is no next layer to complete it --
         # shared_head.norm completes it instead: its fused branch fires on
-        # exactly the same condition (fused_allreduce AND tp_size > 1) and folds
-        # all-reduce + residual-add + norm into one kernel. When the fusion is
-        # off the MoE already reduced internally and the norm just does the add,
-        # so neither path double-reduces.
+        # exactly the same condition (fused_allreduce AND tp_size > 1). When the
+        # fusion is off the MoE already reduced internally and the norm just
+        # does the add, so neither path double-reduces.
+        #
+        # See the matching comment in deepseek_mtp.py: on the fused branch aiter
+        # only collapses this into a single kernel below its own size gate, and
+        # falls back to all_reduce + a separate norm above it. Numerically
+        # equivalent either way; only the launch count differs.
         hidden_states, _ = self.shared_head.norm(hidden_states, residual)
         return hidden_states
 
@@ -204,6 +208,21 @@ class Glm4MoeMTP(nn.Module):
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
         return self.model.compute_logits(hidden_states, spec_step_idx)
+
+    def compute_draft_ids(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        """Greedy draft token ids.
+
+        Reached through the vLLM plugin's ``get_top_tokens``, not through
+        EagleProposer -- Glm4MoeMTPModel is absent from
+        ``support_draft_model_arch_dict``, so the native drafter cannot build
+        this class. The plugin calls it unconditionally, though, so the method
+        has to exist.
+        """
+        return self.compute_logits(hidden_states, spec_step_idx).argmax(dim=-1)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales

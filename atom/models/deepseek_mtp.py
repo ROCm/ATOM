@@ -128,10 +128,17 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         # mtp_block's mlp is built with `reduce_results=not fuse_ar_input_norm`
         # (deepseek_v2.py), so it leaves an un-reduced TP partial sum exactly
         # when ENABLE_ALLREDUCE_RMSNORM_FUSION is on -- the same condition that
-        # makes shared_head.norm take RMSNorm's fused branch and fold
-        # all-reduce + residual-add + norm into one kernel. With the fusion off
-        # the mlp already reduced and the norm just does the add. Neither path
-        # needs an explicit all-reduce here, and neither double-reduces.
+        # makes shared_head.norm take RMSNorm's fused branch. With the fusion
+        # off the mlp already reduced and the norm just does the add. Neither
+        # path needs an explicit all-reduce here, and neither double-reduces.
+        #
+        # On the fused branch aiter MAY collapse all-reduce + residual-add +
+        # norm into one kernel, but only under its own size gate
+        # (communicator_cuda.py: n <= 16384, total_bytes < 64 MiB, world_size
+        # != 6) -- roughly 4681 tokens at hidden 7168 bf16. Above that, and at
+        # TP=6, it falls back to all_reduce + a separate Triton RMSNorm. The
+        # fallback is numerically equivalent, so only the launch count differs,
+        # and the draft's step-0 prefill is usually on the fallback side of it.
         #
         # The unconditional all_reduce this replaces was wrong for
         # ENABLE_ALLREDUCE_RMSNORM_FUSION=0: the mlp had already reduced, so the
@@ -224,12 +231,12 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         """Greedy draft token ids via distributed argmax over the TP-sharded vocab —
         avoids all-gathering the full [N, vocab] logits every draft step.
 
-        Mirrors compute_logits() (same norm + shared head), but reduces each
-        rank's logit shard to (max_val, global_idx) and all-gathers only [N, 2]
-        instead of the O(vocab) logits. Token-identical to
+        Feeds the same shared head as compute_logits (and, like it, takes an
+        already post-final-norm ``hidden_states`` -- shared_head.norm runs at the
+        end of DeepSeekMultiTokenPredictorLayer.forward), but reduces each rank's
+        logit shard to (max_val, global_idx) and all-gathers only [N, 2] instead
+        of the O(vocab) logits. Token-identical to
         compute_logits(...).argmax(-1).
-
-        Like compute_logits, ``hidden_states`` is already post-final-norm.
         """
         current_step_idx = spec_step_idx % self.num_mtp_layers
         mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]

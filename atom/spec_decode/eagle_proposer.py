@@ -286,9 +286,11 @@ class EagleProposer(Drafter):
                     if i == 0
                     else ret_hidden_states
                 )
-                # Every draft model implements this. Some do the argmax
-                # distributed (all-gathering [N, 2] instead of the full
-                # [N, vocab] logits); the rest fall back to
+                # Every draft model EagleProposer can build implements this --
+                # the DSpark archs in support_draft_model_arch_dict do not, but
+                # they are DSparkProposer's and never reach this loop. Some do
+                # the argmax distributed (all-gathering [N, 2] instead of the
+                # full [N, vocab] logits); the rest do
                 # compute_logits().argmax(-1) internally. Token-identical either
                 # way, so the choice belongs to the model, not to this loop.
                 new_draft_ids = self.model.compute_draft_ids(sample_hidden_states)
