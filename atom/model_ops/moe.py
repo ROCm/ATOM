@@ -1621,6 +1621,8 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
             inter_dim=self.intermediate_size,
             experts=global_num_experts,
             topk=top_k,
+            # todo decode use graph_bs for perf
+            mtpr=self.moe.max_num_tokens,
             quant="a8w4",
         )
 
