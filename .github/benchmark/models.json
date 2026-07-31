@@ -288,6 +288,72 @@
       "env_vars": "",
       "config": { "tp": 1, "kv_cache_dtype": "fp8" },
       "variants": [{ "label": "", "suffix": "", "conc_max": 256 }]
+    },
+    {
+      "display": "DeepSeek-V4-Pro-DSpark-Test",
+      "path": "deepseek-ai/DeepSeek-V4-Pro",
+      "prefix": "dspark-test",
+      "runner": "atom-mi355-8gpu.predownload",
+      "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1",
+      "config": {
+        "tp": 8,
+        "kv_cache_dtype": "fp8",
+        "extra_args": "--no-enable_prefix_caching"
+      },
+      "variants": [
+        {
+          "label": "MTP1",
+          "suffix": "-mtp1",
+          "extra_args": "--method mtp --num-speculative-tokens 1",
+          "bench_args": "--use-chat-template",
+          "conc_min": 4,
+          "conc_max": 256
+        },
+        {
+          "label": "DPA MTP1",
+          "suffix": "-dpa-mtp1",
+          "extra_args": "--method mtp --num-speculative-tokens 1 --enable-dp-attention",
+          "bench_args": "--use-chat-template",
+          "conc_min": 64,
+          "conc_max": 256
+        },
+        {
+          "label": "DSpark5",
+          "suffix": "-dspark5",
+          "path": "deepseek-ai/DeepSeek-V4-Pro-DSpark",
+          "extra_args": "--method dspark --num-speculative-tokens 5 --cudagraph-mode PIECEWISE --dspark-config '{\"confidence_schedule\": true, \"ragged\": true, \"ragged_graph_sizes\": \"6\"}'",
+          "bench_args": "--use-chat-template",
+          "conc_min": 4,
+          "conc_max": 256
+        },
+        {
+          "label": "DPA DSpark5",
+          "suffix": "-dpa-dspark5",
+          "path": "deepseek-ai/DeepSeek-V4-Pro-DSpark",
+          "extra_args": "--method dspark --num-speculative-tokens 5 --cudagraph-mode PIECEWISE --enable-dp-attention --dspark-config '{\"confidence_schedule\": true, \"ragged\": true, \"ragged_graph_sizes\": \"6\"}'",
+          "bench_args": "--use-chat-template",
+          "conc_min": 64,
+          "conc_max": 256
+        },
+        {
+          "label": "DSpark5 FULL",
+          "suffix": "-dspark5-full",
+          "path": "deepseek-ai/DeepSeek-V4-Pro-DSpark",
+          "extra_args": "--method dspark --num-speculative-tokens 5 --cudagraph-mode FULL --dspark-config '{\"confidence_schedule\": true, \"ragged\": true, \"ragged_graph_sizes\": \"6\"}'",
+          "bench_args": "--use-chat-template",
+          "conc_min": 4,
+          "conc_max": 256
+        },
+        {
+          "label": "DPA DSpark5 FULL",
+          "suffix": "-dpa-dspark5-full",
+          "path": "deepseek-ai/DeepSeek-V4-Pro-DSpark",
+          "extra_args": "--method dspark --num-speculative-tokens 5 --cudagraph-mode FULL --enable-dp-attention --dspark-config '{\"confidence_schedule\": true, \"ragged\": true, \"ragged_graph_sizes\": \"6\"}'",
+          "bench_args": "--use-chat-template",
+          "conc_min": 64,
+          "conc_max": 256
+        }
+      ]
     }
   ]
 }
