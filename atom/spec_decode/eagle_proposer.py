@@ -222,8 +222,10 @@ class EagleProposer(Drafter):
         if draft_uses_mha:
             attn_metadata.slot_mapping = var["slot_mapping"].gpu[: len(input_ids)]
             attn_metadata.block_tables = var["block_tables"].gpu[:bs]
-        else:
-            # Make MLA draft slot_mapping == q rows.
+        elif attn_metadata.slot_mapping is not None:
+            # Make MLA draft slot_mapping == q rows. DeepSeek-V4 uses
+            # block_tables + context_lens (slot_mapping is None) — nothing to
+            # size, so skip instead of subscripting None.
             attn_metadata.slot_mapping = attn_metadata.slot_mapping[: len(input_ids)]
 
         # Backends that expose flat per-seq kv_indices/kv_indptr (MLA, MHA)
