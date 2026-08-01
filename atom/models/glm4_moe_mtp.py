@@ -1,19 +1,15 @@
-from typing import Optional
-
 import torch
-import torch.nn as nn
-from aiter.dist.communication_op import tensor_model_parallel_all_reduce
-from aiter.dist.parallel_state import get_tp_group
+from torch import nn
+from transformers import PretrainedConfig
+
 from atom.config import Config, QuantizationConfig
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.moe import FusedMoE
 from atom.models.utils import IntermediateTensors
 from atom.utils.decorators import support_torch_compile
-from transformers import PretrainedConfig
 
 from .deepseek_mtp import rewrite_spec_layer_name
-
 from .glm4_moe import (
     ENABLE_ALLREDUCE_RMSNORM_FUSION,
     Glm4MoeDecoderLayer,
@@ -27,19 +23,25 @@ class SharedHead(nn.Module):
         self,
         config: PretrainedConfig,
         prefix: str,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__()
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # Output norm of the MTP layer -- see the matching comment in
+        # atom/models/deepseek_mtp.py SharedHead. Applied at the end of
+        # Glm4MoeMultiTokenPredictorLayer.forward so the hidden recycled into
+        # the next draft step is post-final-norm, and so it can absorb the
+        # MoE's pending all-reduce plus the residual-add into one kernel.
+        self.norm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION,
+        )
         self.head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
             quant_config=quant_config,
             prefix=maybe_prefix(prefix, "head"),
         )
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.norm(hidden_states)
 
 
 class Glm4MoeMultiTokenPredictorLayer(nn.Module):
@@ -62,8 +64,6 @@ class Glm4MoeMultiTokenPredictorLayer(nn.Module):
             atom_config=atom_config,
             prefix=prefix,
         )
-
-        self.tp_size = get_tp_group().world_size
 
     def forward(
         self,
@@ -89,14 +89,16 @@ class Glm4MoeMultiTokenPredictorLayer(nn.Module):
         # final MoE down_proj output as an un-reduced TP partial sum, deferring
         # the all-reduce to the *next* layer's fused input_layernorm. The MTP
         # block is the last layer, so there is no next layer to complete it --
-        # we must reduce explicitly here (mirrors DeepSeek/MiMo MTP). When the
-        # fusion is off the MoE already reduced internally, so adding one here
-        # would double-reduce; hence the gate. No extra communication is
-        # introduced versus a correct fused path (the reduce is required either
-        # way), so performance is preserved.
-        if ENABLE_ALLREDUCE_RMSNORM_FUSION and self.tp_size > 1:
-            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-        hidden_states = residual + hidden_states
+        # shared_head.norm completes it instead: its fused branch fires on
+        # exactly the same condition (fused_allreduce AND tp_size > 1). When the
+        # fusion is off the MoE already reduced internally and the norm just
+        # does the add, so neither path double-reduces.
+        #
+        # See the matching comment in deepseek_mtp.py: on the fused branch aiter
+        # only collapses this into a single kernel below its own size gate, and
+        # falls back to all_reduce + a separate norm above it. Numerically
+        # equivalent either way; only the launch count differs.
+        hidden_states, _ = self.shared_head.norm(hidden_states, residual)
         return hidden_states
 
 
@@ -145,15 +147,28 @@ class Glm4MoeMultiTokenPredictor(nn.Module):
             current_step_idx,
         )
 
+    def _mtp_layer(self, spec_step_idx: int) -> Glm4MoeMultiTokenPredictorLayer:
+        current_step_idx = spec_step_idx % self.num_mtp_layers
+        return self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
+
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
-        current_step_idx = spec_step_idx % self.num_mtp_layers
-        mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
-        logits = mtp_layer.shared_head.head(mtp_layer.shared_head(hidden_states))
-        return logits
+        # Already post-final-norm (shared_head.norm runs at the end of
+        # Glm4MoeMultiTokenPredictorLayer.forward), so this is a bare LM head.
+        return self._mtp_layer(spec_step_idx).shared_head.head(hidden_states)
+
+    def compute_draft_ids(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        # Same bare-LM-head input as compute_logits, but reduced per vocab shard
+        # so only [N, 2] crosses TP instead of the full [N, vocab].
+        head = self._mtp_layer(spec_step_idx).shared_head.head
+        return head.compute_argmax_token(hidden_states)
 
 
 @support_torch_compile
@@ -205,6 +220,24 @@ class Glm4MoeMTP(nn.Module):
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
         return self.model.compute_logits(hidden_states, spec_step_idx)
+
+    def compute_draft_ids(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        """Greedy draft token ids via distributed argmax — only [N, 2] is
+        all-gathered instead of the full [N, vocab] logits. Token-identical to
+        compute_logits(...).argmax(-1): plugin mode skips the LM head's prefill
+        last-token slice outright, so both see the same rows.
+
+        Reached through the vLLM plugin's ``get_top_tokens``, not through
+        EagleProposer -- Glm4MoeMTPModel is absent from
+        ``support_draft_model_arch_dict``, so the native drafter cannot build
+        this class. The plugin calls it unconditionally, though, so the method
+        has to exist.
+        """
+        return self.model.compute_draft_ids(hidden_states, spec_step_idx)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales
