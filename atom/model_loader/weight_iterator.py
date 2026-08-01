@@ -8,6 +8,7 @@ gate has no AITER build, and the shard-skipping logic here is worth covering
 against real files.
 """
 
+import atexit
 import concurrent.futures
 import itertools
 import json
@@ -108,10 +109,27 @@ def _node_local_rank() -> tuple[int, int]:
     return 0, 1
 
 
+# Set when prefetching is no longer useful -- the load finished, or the process
+# is exiting. `ThreadPoolExecutor`'s workers are not daemon threads and are
+# joined by `concurrent.futures`' own atexit hook, so the `daemon=True` on the
+# thread below cannot by itself keep a failed load from blocking process exit
+# behind an in-flight multi-GB read. The read loop has to bail out on its own.
+_prefetch_stop = threading.Event()
+
+# Registered after `concurrent.futures.thread` imported (and registered
+# `_python_exit`), so LIFO ordering runs this first and the reads are already
+# unwinding by the time the executor is joined.
+atexit.register(_prefetch_stop.set)
+
+
 def _read_whole_file(path: str, block_size: int) -> None:
-    """Read `path` sequentially so the kernel caches it, discarding the data."""
+    """Read `path` sequentially so the kernel caches it, discarding the data.
+
+    Abandons the file as soon as `_prefetch_stop` is set: the pages read so far
+    stay cached, and warming the rest is worthless once nobody is loading.
+    """
     with open(path, "rb") as f:
-        while f.read(block_size):
+        while not _prefetch_stop.is_set() and f.read(block_size):
             pass
 
 
@@ -133,6 +151,12 @@ def _start_prefetch(files: list[str], num_threads: int, block_size: int) -> None
     mine = files[rank::local_world]
     if not mine:
         return
+    # A thread count of zero is the obvious way to try to switch this off, and
+    # `ThreadPoolExecutor` rejects it -- from inside the detached thread below,
+    # where it would surface only as a bare traceback. `ATOM_LOADER_PREFETCH`
+    # is the documented off switch; treat 0 as "as few as possible" instead.
+    num_threads = max(1, num_threads)
+    _prefetch_stop.clear()
 
     def _run() -> None:
         started = time.perf_counter()
@@ -156,7 +180,7 @@ def _start_prefetch(files: list[str], num_threads: int, block_size: int) -> None
                         # the loader still reads the shard itself.
                         logger.debug("Prefetch failed: %s", e)
                     nxt = next(remaining, None)
-                    if nxt is not None:
+                    if nxt is not None and not _prefetch_stop.is_set():
                         pending.add(pool.submit(_read_whole_file, nxt, block_size))
         logger.info(
             "Checkpoint prefetch finished: %d/%d shards in %.1fs",
@@ -251,6 +275,20 @@ def safetensors_weights_iterator(
         desc=f"Loading safetensors shards[{model_name_or_path}]",
         disable=not enable_tqdm,
     )
+    try:
+        yield from _iter_shards(iters, disable_mmap, prefetching, wants)
+    finally:
+        # Whether the caller drained this or abandoned it, nothing is going to
+        # read these files again, so stop warming the cache for them. Without
+        # this a load that raises leaves the prefetcher streaming the rest of
+        # the checkpoint and the process cannot exit until it finishes.
+        _prefetch_stop.set()
+
+
+def _iter_shards(
+    iters, disable_mmap: bool, prefetching: bool, wants: Callable[[str], bool] | None
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Yield every wanted tensor of each shard, in the order given."""
     for st_file in iters:
         # Advise kernel for sequential read-ahead (mmap optimization)
         if (
