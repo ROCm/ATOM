@@ -27,6 +27,7 @@ from atom.config import (
     QuantizationConfig,
     get_current_atom_config,
 )
+from atom.distributed.pcp_utils import plugin_attn_cp_enabled
 from atom.model_loader.weight_utils import set_weight_attrs
 from atom.model_ops.base_config import QuantizeMethodBase
 from atom.model_ops.eplb import eplb_map_and_record_fused
@@ -176,6 +177,7 @@ class FusedMoEParallelConfig:
         pcp_merge = (
             envs.ATOM_PCP_MOE_MERGE
             and get_prefill_context_model_parallel_world_size() > 1
+            and not plugin_attn_cp_enabled()
         )
         if pcp_merge:
             pcp_size = get_prefill_context_model_parallel_world_size()

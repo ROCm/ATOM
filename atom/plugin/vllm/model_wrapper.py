@@ -841,6 +841,14 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             input_ids = None
             inputs_embeds = intermediate_tensors["hidden_states"]
 
+        if getattr(self.atom_config, "vllm_attn_cp", False):
+            from atom.plugin.vllm.attention.cp_gather import (
+                reset_cp_gather_pipeline,
+                stable_cp_owner_key,
+            )
+
+            reset_cp_gather_pipeline(stable_cp_owner_key(self.atom_config))
+
         # pass positions from vLLM to OOT execution path via vLLM's per-forward context
         if is_forward_context_available():
             forward_context = get_vllm_forward_context()
@@ -949,6 +957,24 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             return hidden_states, recycle_hidden
 
         return hidden_states
+
+    def __del__(self):
+        atom_config = getattr(self, "atom_config", None)
+        if atom_config is None or not getattr(atom_config, "vllm_attn_cp", False):
+            return
+        try:
+            from atom.models.deepseek_v2 import unregister_plugin_cp_modules
+            from atom.plugin.vllm.attention.cp_gather import (
+                close_cp_gather_owner,
+                stable_cp_owner_key,
+            )
+
+            owner_key = stable_cp_owner_key(atom_config)
+            unregister_plugin_cp_modules(owner_key)
+            close_cp_gather_owner(owner_key)
+        except Exception:
+            # Interpreter/distributed shutdown may have already removed modules.
+            pass
 
     def load_weights(
         self,

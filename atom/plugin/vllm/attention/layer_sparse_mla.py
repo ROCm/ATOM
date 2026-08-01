@@ -12,8 +12,12 @@ forward_impl_sparse handles everything end-to-end: RoPE, KV cache
 write, Q absorption, topk index conversion, sparse kernel, V up-projection.
 """
 
-import torch
+import logging
+from typing import Optional
 
+import torch
+import triton
+import triton.language as tl
 from aiter import (
     cp_gather_indexer_k_quant_cache,
     dtypes,
@@ -27,12 +31,6 @@ from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 from atom.plugin.prepare import is_vllm
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
-
-import triton
-import triton.language as tl
-
-from typing import Optional
-import logging
 
 logger = logging.getLogger("atom")
 
@@ -273,6 +271,8 @@ def sparse_attn_indexer_plugin_mode(
     try:
         from vllm.forward_context import (
             get_forward_context as get_vllm_forward_context,
+        )
+        from vllm.forward_context import (
             is_forward_context_available as is_vllm_ctx_available,
         )
 
@@ -301,6 +301,20 @@ def sparse_attn_indexer_plugin_mode(
             f"{k_cache_prefix!r}. The indexer cannot populate paged_kv_indices."
         )
     slot_mapping = indexer_meta.slot_mapping
+    if bool(getattr(indexer_meta, "pcp_split", False)):
+        n_real = int(slot_mapping.numel())
+        if k.shape[0] < n_real or positions.shape[0] < n_real:
+            raise RuntimeError(
+                "CP indexer gather returned fewer rows than the real token count: "
+                f"k={k.shape[0]}, positions={positions.shape[0]}, slots={n_real}"
+            )
+        k = k[:n_real]
+        positions = positions[:n_real]
+    if k.shape[0] != slot_mapping.numel():
+        raise RuntimeError(
+            "Indexer cache write requires one K row per slot: "
+            f"k={k.shape[0]}, slots={slot_mapping.numel()}"
+        )
     has_decode = indexer_meta.num_decodes > 0
     has_prefill = indexer_meta.num_prefills > 0
     num_decode_tokens = indexer_meta.num_decode_tokens
@@ -382,6 +396,11 @@ def sparse_attn_indexer_plugin_mode(
             # kernel's per-row column indices need no remapping.
             total_committed = int(chunk.total_seq_lens)
             total_rows = chunk.token_end - chunk.token_start
+            # CP round-robin ownership may leave a prefill chunk empty on this
+            # rank. Avoid range(..., step=0); there are no logits/top-k rows to
+            # produce for the chunk.
+            if total_rows <= 0:
+                continue
             if (
                 budget_bytes > 0
                 and total_committed > 0
@@ -432,6 +451,7 @@ def sparse_attn_indexer_plugin_mode(
                     logits.stride(1),
                     topk_tokens,
                 )
+
 
     if has_decode:
         decode_metadata = indexer_meta.decode
@@ -503,12 +523,36 @@ def sparse_attn_indexer_plugin_mode(
                 unpacked_topk_indices
             )
 
+    # The metadata builder owns a persistent top-k buffer per GPU ubatch. DBO may
+    # execute multiple ubatches concurrently, so the module-level argument can refer
+    # to a different builder's buffer. Resolve the buffer paired with this forward's
+    # sparse metadata and write exactly where the same ubatch's MLA will read.
+    current_paged_kv_indices = sparse_meta.paged_kv_indices
+    convert_req_ids = sparse_meta.req_id_per_token
+    convert_indptr = sparse_meta.paged_kv_indptr
+    convert_output = current_paged_kv_indices
+    if bool(getattr(sparse_meta, "pcp_split", False)):
+        owned_rows = sparse_meta.pcp_owned_global_rows
+        if owned_rows is None:
+            raise RuntimeError("CP sparse metadata is missing owned rows")
+        n_real = int(indexer_meta.slot_mapping.numel())
+        real_owned_rows = owned_rows[owned_rows < n_real]
+        topk_for_sparse = topk_indices.index_select(
+            0, real_owned_rows.to(topk_indices.device, dtype=torch.long)
+        )
+        n_real_owned = int(real_owned_rows.numel())
+        convert_req_ids = convert_req_ids[:n_real_owned]
+        convert_indptr = convert_indptr[: n_real_owned + 1]
+        packed_end = int(convert_indptr[-1].item())
+        convert_output = convert_output[:packed_end]
+    else:
+        topk_for_sparse = topk_indices[: indexer_meta.num_actual_tokens]
     triton_convert_req_index_to_global_index(
-        sparse_meta.req_id_per_token.to(dtype=torch.int32),
+        convert_req_ids.to(dtype=torch.int32),
         sparse_meta.block_table.to(dtype=torch.int32),
-        topk_indices[: sparse_meta.num_actual_tokens].to(dtype=torch.int32),
-        sparse_meta.paged_kv_indptr,
-        sparse_kv_indices_buffer,
+        topk_for_sparse.to(dtype=torch.int32),
+        convert_indptr,
+        convert_output,
         BLOCK_SIZE=sparse_meta.block_size,
         NUM_TOPK_TOKENS=sparse_meta.topk_tokens,
     )

@@ -5,7 +5,7 @@ import logging
 
 import aiter
 import torch
-from aiter import dtypes, fused_qk_rope_concat_and_cache_mla
+from aiter import concat_and_cache_mla, dtypes, fused_qk_rope_concat_and_cache_mla
 from aiter.mla import mla_decode_fwd
 from aiter.ops.triton import (
     batched_gemm_a16wfp4 as _fp4_bmm_module,
@@ -266,6 +266,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
 
         self.model_layer_name = model_layer_name
         self.layer_name = layer_name
+        self.layer_num = int(layer_num)
         self.head_size = self.kv_lora_rank + self.qk_rope_head_dim
         self.attn_type = AttentionType.DECODER
         self.attn_backend = self.attn_backend_cls
@@ -350,6 +351,13 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
             self.head_repeat_factor = self.padded_num_heads // self.num_heads
             self._is_sparse_mla = True
         self.q_pad_num_heads = getattr(self, "q_pad_num_heads", None)
+        # Reuse-TP-as-CP runtime weight gather (set by setup_cp_weight_gather from
+        # the model layer). Default off: plain sharded TP for every batch.
+        self._cp_attn = False
+        self._cp_num_heads_full = self.num_heads
+        self._cp_tp_size = 1
+        self._cp_hidden_size = self.num_heads * self.v_head_dim
+        self._cp_wk_wv_head_dim = 0
         _register_vllm_static_forward_context(self)
 
         atom_static_context = atom_config.compilation_config.static_forward_context
@@ -359,6 +367,149 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
             atom_static_context["positions"] = torch.zeros(
                 max_num_tokens, dtype=torch.int64, device="cuda"
             )
+
+    def setup_cp_weight_gather(
+        self, attn_cp, num_heads_full, tp_size, hidden_size
+    ) -> None:
+        """Wire reuse-TP-as-CP runtime weight gather for this attention op.
+
+        Called once at construction from the model layer. When ``attn_cp`` and
+        ``tp_size > 1`` this op participates in CP: prefill/mixed batches gather the
+        full-head q_b/W_K/W_V/o_proj on demand (see forward_impl_cp), plain decode
+        runs the sharded weights. MTP / non-CP layers pass ``attn_cp=False``.
+        """
+        self._cp_attn = bool(attn_cp) and int(tp_size) > 1
+        self._cp_num_heads_full = int(num_heads_full)
+        self._cp_tp_size = int(tp_size)
+        self._cp_hidden_size = int(hidden_size)
+        if self._cp_attn:
+            from atom.plugin.vllm.attention.cp_gather import (
+                register_cp_attn_layer,
+                stable_cp_owner_key,
+            )
+
+            register_cp_attn_layer(
+                self, owner_id=stable_cp_owner_key(get_current_atom_config())
+            )
+
+    def _cp_bind_full_head_weights(self, gw):
+        """Context manager: transiently rebind this op's per-head attributes and
+        absorbed BMM weights to the gathered FULL-head set so the shared
+        forward_impl_sparse runs full-head attention, then restore. Runs inside the
+        Dynamo-opaque CP op on the compute stream for prefill/mixed only (never
+        cudagraph-captured), so the rebind is invisible to torch.compile.
+        """
+        import contextlib
+
+        from atom.model_ops.attention_mla import _MLA_MIN_HEADS
+
+        @contextlib.contextmanager
+        def _ctx():
+            saved = (
+                self.num_heads,
+                self.W_K,
+                self.W_K_scale,
+                self.W_V,
+                self.W_V_scale,
+                getattr(self, "padded_num_heads", self.num_heads),
+                getattr(self, "head_repeat_factor", 1),
+                self.q_pad_num_heads,
+            )
+            try:
+                self.num_heads = gw.num_heads_full
+                self.W_K, self.W_K_scale = gw.wk, gw.wk_scale
+                self.W_V, self.W_V_scale = gw.wv, gw.wv_scale
+                self.padded_num_heads = max(gw.num_heads_full, _MLA_MIN_HEADS)
+                self.head_repeat_factor = self.padded_num_heads // gw.num_heads_full
+                # Full heads need no q-head padding (the sharded decode kernel may).
+                self.q_pad_num_heads = None
+                yield
+            finally:
+                (
+                    self.num_heads,
+                    self.W_K,
+                    self.W_K_scale,
+                    self.W_V,
+                    self.W_V_scale,
+                    self.padded_num_heads,
+                    self.head_repeat_factor,
+                    self.q_pad_num_heads,
+                ) = saved
+
+        return _ctx()
+
+    def forward_impl_cp(self, query, kv_c_normed, k_pe, kv_cache, attn_metadata, q_scale):
+        """Reuse-TP-as-CP attention for CP layers. Does q_proj + attention + o_proj
+        INSIDE this Dynamo-opaque op so the split path can project/absorb with the
+        gathered FULL-head weights.
+
+          * pcp_split (prefill/mixed): gather full q_b/W_K/W_V/o_proj, run full-head
+            token-parallel attention on this rank's 1/cp query shard (shared
+            forward_impl_sparse pcp branch), then a LOCAL o_proj (no all-reduce).
+          * else (plain decode): sharded q_proj -> sharded attention -> sharded
+            o_proj + a manual TP all-reduce, i.e. the classic TP path.
+        """
+        from atom.plugin.vllm.attention.cp_gather import (
+            get_gathered_weights,
+            release_gathered_weights,
+        )
+
+        pcp = bool(getattr(attn_metadata, "pcp_split", False))
+        n_tokens = query.shape[0]
+
+        if pcp:
+            gw = get_gathered_weights(self)
+            try:
+                q = self.q_proj.forward_full(
+                    query, q_scale, gw.qb_weight, gw.qb_scale, gw.qb_out_size
+                )
+                q = q.view(-1, gw.num_heads_full, self.qk_head_dim)
+                if self.calculate_kv_scales:
+                    self.calc_kv_scales(q, kv_c_normed, k_pe)
+                # attn_out dtype MUST match the activation dtype (bf16) so the downstream
+                # o_proj fp8 quant kernel gets a supported input -- NOT get_default_dtype()
+                # (fp32), which faults the kernel.
+                attn_out = torch.empty(
+                    (n_tokens, gw.num_heads_full * self.v_head_dim),
+                    dtype=q.dtype,
+                    device=query.device,
+                )
+                with self._cp_bind_full_head_weights(gw):
+                    self.forward_impl_sparse(
+                        q, kv_c_normed, k_pe, kv_cache, attn_metadata, attn_out
+                    )
+                return self.o_proj.forward_full(
+                    attn_out, None, gw.o_weight, gw.o_scale, gw.o_out_size
+                )
+            finally:
+                # Always release the double-buffer slot, including kernel failures.
+                # The next forward resets layer ownership before any slot is reused.
+                release_gathered_weights(self)
+
+        # Plain decode: classic sharded TP. o_proj is built with reduce_results=False
+        # under CP, so reduce manually here with the SAME call o_proj would use
+        # internally (see LinearBase.forward -> aiter get_tp_group().all_reduce with
+        # ca_fp8_quant), keeping decode bit-identical to plain TP.
+        from aiter.dist.parallel_state import get_tp_group
+
+        q = self.q_proj(query, q_scale)
+        q = q.view(-1, self.num_heads, self.qk_head_dim)
+        if self.calculate_kv_scales:
+            self.calc_kv_scales(q, kv_c_normed, k_pe)
+        # dtype=q.dtype (bf16), see note above; forward_impl carries the profile-run
+        # (attn_metadata is None) guard and dispatches to the sparse impl.
+        attn_out = torch.empty(
+            (n_tokens, self.num_heads * self.v_head_dim),
+            dtype=q.dtype,
+            device=query.device,
+        )
+        self.forward_impl(
+            q, kv_c_normed, k_pe, kv_cache, attn_metadata=attn_metadata, output=attn_out
+        )
+        out = self.o_proj(attn_out)
+        if self._cp_tp_size > 1:
+            out = get_tp_group().all_reduce(out, ca_fp8_quant=False)
+        return out
 
     @property
     def impl(self):
@@ -1293,6 +1444,10 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         sparse_meta = attn_metadata
 
         num_actual_toks = sparse_meta.num_actual_tokens
+        # Plugin reuse-TP-as-CP: this rank holds 1/cp round-robin owned queries
+        # (num_actual_toks == n_owned) but still writes the FULL replicated KV.
+        # Mirrors native MLAAttention.forward_impl PCP block.
+        pcp = bool(getattr(sparse_meta, "pcp_split", False))
 
         # Inputs and outputs may be padded for CUDA graphs
         output_padded = output
@@ -1313,7 +1468,39 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                 "positions"
             ]
 
-        positions = positions[:num_actual_toks]
+        if pcp:
+            from atom.distributed.pcp_utils import (
+                get_pcp_world_size,
+                pcp_allgather_rerange,
+                pcp_pad_dense,
+                pcp_pad_len,
+                pcp_round_robin_split,
+            )
+
+            pcp_ws = get_pcp_world_size()
+            n_real = sparse_meta.slot_mapping.shape[0]
+            if positions.shape[0] < n_real:
+                raise RuntimeError(
+                    "CP positions do not cover the real flattened token rows: "
+                    f"positions={positions.shape[0]}, real_tokens={n_real}"
+                )
+            # PIECEWISE graph buckets may pad the positions buffer. Only the first
+            # common.num_actual_tokens rows are request-major real tokens; row_map
+            # padding is appended separately by pcp_pad_dense below.
+            positions_full = positions[:n_real]
+            if positions_full.shape[0] != n_real:
+                raise RuntimeError("CP positions slice disagrees with token row map")
+            n_pad = pcp_pad_len(n_real, pcp_ws) - n_real
+            # Owned (round-robin) positions rope the owned q and the owned k_pe;
+            # the full replicated k-cache is completed with a single all-gather
+            # after the fused kernel (see the `if pcp` write block below).
+            positions = pcp_round_robin_split(
+                pcp_pad_dense(positions_full, n_pad), pcp_ws
+            )[:num_actual_toks]
+            write_slot_mapping = sparse_meta.slot_mapping_owned
+        else:
+            positions = positions[:num_actual_toks]
+            write_slot_mapping = sparse_meta.slot_mapping
         fp8_attention = self.kv_cache_dtype.startswith("fp8")
         if fp8_attention:
             from vllm.platforms import current_platform
@@ -1369,16 +1556,17 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
             device=ql_nope.device,
         )
         if kv_cache.numel() > 0:
+            kv_cache_view = kv_cache.view(
+                kv_cache.shape[0], -1, self.kv_lora_rank + self.qk_rope_head_dim
+            )
             fused_qk_rope_concat_and_cache_mla(
                 ql_nope,
                 q_pe,
                 k_c_normed,
                 k_pe.squeeze(1),
-                kv_cache.view(
-                    kv_cache.shape[0], -1, self.kv_lora_rank + self.qk_rope_head_dim
-                ),
+                kv_cache_view,
                 q_out,
-                sparse_meta.slot_mapping,
+                write_slot_mapping,
                 self._k_scale,
                 self._q_scale,
                 positions,
@@ -1387,6 +1575,34 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                 is_neox=self.rotary_emb.is_neox_style,
                 is_nope_first=True,
             )
+            if pcp:
+                # Complete the FULL replicated k-cache with a SINGLE all-gather.
+                # The fused kernel above read the RAW owned k as const inputs (it
+                # writes roped K to the owned cache slots + Q into q_out, never back
+                # to k_pe/kv_c), so k_pe is still un-roped here. Rope THIS rank's
+                # 1/cp owned k_pe in place (owned positions), pack it with the
+                # rope-free owned kv_c into one [n_owned, kv_lora + pe] tensor,
+                # all-gather+rerange to the full sequence, then write every real
+                # slot (overwriting the fused kernel's throwaway owned-slot write).
+                # Roping the owned shard before the gather (instead of the whole
+                # gathered sequence on every rank) keeps the rope at 1/cp, and
+                # merging kv_c + k_pe halves the collective count (one 576-wide
+                # all-gather vs two). concat_and_cache_mla consumes the gathered
+                # nope/pe as plain column slices: it honours stride(0) and the
+                # feature dim stays unit-stride, so no split/contiguous copy is
+                # needed on the write side.
+                self.rotary_emb(positions, k_pe, torch.empty_like(k_pe))
+                kv_full = pcp_allgather_rerange(
+                    torch.cat([k_c_normed, k_pe.squeeze(1)], dim=-1), pcp_ws
+                )[:n_real]
+                concat_and_cache_mla(
+                    kv_full[:, : self.kv_lora_rank],
+                    kv_full[:, self.kv_lora_rank :],
+                    kv_cache,
+                    sparse_meta.slot_mapping.flatten(),
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    scale=self._k_scale,
+                )
 
         if self.head_repeat_factor > 1:
             q_out = q_out.repeat_interleave(self.head_repeat_factor, dim=1)
@@ -1399,8 +1615,18 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         return output_padded
 
     def calc_kv_scales(self, q, kv_c_normed, k_pe):
-        self._q_scale.copy_(torch.abs(q).max() / self.q_range)
+        q_abs_max = torch.abs(q).max()
         kv_abs_max = torch.abs(kv_c_normed).max()
+        if self._cp_attn and self._cp_tp_size > 1:
+            # Split ranks observe different query/KV shards. Calibrate one shared
+            # scale from the global maxima so the full-KV cache is rank-consistent.
+            import torch.distributed as dist
+            from vllm.distributed.parallel_state import get_tp_group
+
+            group = get_tp_group().device_group
+            dist.all_reduce(q_abs_max, op=dist.ReduceOp.MAX, group=group)
+            dist.all_reduce(kv_abs_max, op=dist.ReduceOp.MAX, group=group)
+        self._q_scale.copy_(q_abs_max / self.q_range)
         self._k_scale.copy_(kv_abs_max / self.k_range)
         self._v_scale.copy_(kv_abs_max / self.v_range)
         self._q_scale_float = self._q_scale.item()
@@ -1420,6 +1646,21 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
     ):
         kv_c_normed = key
         k_pe = value
+        if self._cp_attn:
+            # Reuse-TP-as-CP layers route q_proj + attention + o_proj through a
+            # single Dynamo-opaque op so the split (prefill/mixed) path can project
+            # and absorb with the gathered FULL-head weights and the unsplit (decode)
+            # path stays on sharded TP. Branching on self._cp_attn (a construction
+            # constant) is torch.compile-safe; the runtime pcp_split branch lives
+            # inside the opaque op.
+            return torch.ops.aiter.atom_vllm_mla_attention_cp(
+                query,
+                kv_c_normed,
+                k_pe,
+                self.layer_name,
+                self._cp_hidden_size,
+                q_scale,
+            )
         q = self.q_proj(query, q_scale)
         q = q.view(-1, self.num_heads, self.qk_head_dim)
         if self.calculate_kv_scales:
