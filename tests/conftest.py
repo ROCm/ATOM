@@ -1,19 +1,19 @@
 # SPDX-License-Identifier: MIT
-# Shared fixtures for ATOM unit tests, and stand-ins for the third-party
-# packages a plain CPU runner does not have.
+# Shared fixtures for ATOM unit tests.
 #
-# Only *external* packages are stubbed, and only when genuinely missing. No
-# `atom.*` module is faked: a unit test imports the same class the engine
-# imports, so it cannot pass against an API the engine no longer has.
+# Nothing here fakes a module. Tests import the same classes the engine
+# imports, so a test cannot pass against an API the engine no longer has --
+# which is what happened while this file hand-built stand-ins for `atom` and
+# `atom.config`: the copy lost `CompilationLevel`, and four test modules
+# silently stopped running on every machine.
+#
+# `atom.config` no longer needs the AITER build to import (`atom.quant_spec`
+# resolves its two AITER handles on first use), and every other third-party
+# import here is a declared dependency, so a plain CPU runner has them.
 
-import hashlib
-import importlib
-import importlib.util
 import sys
-import types
 from itertools import count
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -23,61 +23,14 @@ ATOM_ROOT = str(Path(__file__).resolve().parent.parent)
 if ATOM_ROOT not in sys.path:
     sys.path.insert(0, ATOM_ROOT)
 
-# ── 2. Stub AITER when it is absent ───────────────────────────────────────
-# The unit gate runs on a plain CPU runner with no AITER build. Only the
-# *external* boundary is stubbed: `atom.config` and friends are imported for
-# real, so a test exercises the same class the engine does.
-#
-# Stubbing internal modules instead is what this replaced, and it rotted --
-# the hand-written `atom.config` stand-in silently lost `CompilationLevel`,
-# and because the modules that import it are guarded by a broad try/except
-# that skips the whole file, four GPU kernel test modules stopped running on
-# every machine, blaming a circular import that never existed.
-#
-# `atom.config` reaches exactly two AITER attributes (`QuantType` and
-# `utility.dtypes.d_dtypes`); MagicMock covers them and anything added later.
-
-if importlib.util.find_spec("aiter") is None:
-    for _mod_name in ("aiter", "aiter.utility", "aiter.utility.dtypes"):
-        sys.modules[_mod_name] = MagicMock()
-
-# ── 3. Stub zmq / zmq.asyncio if not installed ────────────────────────────
-
-if importlib.util.find_spec("zmq") is None:
-    for _mod_name in ("zmq", "zmq.asyncio"):
-        sys.modules[_mod_name] = MagicMock()
-
-# ── 4. Stub xxhash with a hashlib-based fallback ──────────────────────────
-
-if importlib.util.find_spec("xxhash") is None:
-    _xxhash_mod = types.ModuleType("xxhash")
-
-    class _XXH64:
-        def __init__(self):
-            self._h = hashlib.sha256()
-
-        def update(self, data):
-            if isinstance(data, (bytes, bytearray, memoryview)):
-                self._h.update(data)
-            else:
-                raise TypeError(
-                    f"expected bytes-like object, got {type(data).__name__}"
-                )
-
-        def intdigest(self):
-            return int.from_bytes(self._h.digest()[:8], "little")
-
-    _xxhash_mod.xxh64 = _XXH64
-    sys.modules["xxhash"] = _xxhash_mod
-
-# ── 5. Import atom submodules ──────────────────────────────────
+# ── 2. Import atom submodules ──────────────────────────────────────────────
 
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import Sequence
 from atom.sampling_params import SamplingParams
 
-# ── 6. MockConfig ──────────────────────────────────────────────────────────
+# ── 3. MockConfig ──────────────────────────────────────────────────────────
 
 
 class _MockHFConfig:
@@ -121,7 +74,7 @@ class MockConfig:
             setattr(self, k, v)
 
 
-# ── 7. Fixtures ────────────────────────────────────────────────────────────
+# ── 4. Fixtures ────────────────────────────────────────────────────────────
 
 
 @pytest.fixture
