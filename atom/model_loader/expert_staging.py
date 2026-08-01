@@ -79,6 +79,11 @@ class StagingEntry:
     name: str
     filled: set[tuple[int, str]] = field(default_factory=set)
     lock: threading.Lock = field(default_factory=threading.Lock)
+    # Set by `decline` when it takes this entry off the table. A thread that
+    # was mid-arrival at that moment reads it and writes its own region back,
+    # because `decline`'s flush could not have covered a region that had not
+    # landed yet. Written and read under the pool lock, never the entry lock.
+    disowned: bool = False
 
     @property
     def complete(self) -> bool:
@@ -180,7 +185,7 @@ class ExpertStagingPool:
 
         if entry is None:
             entry = self._get_or_create_entry(param, moe, full_param_name)
-            if entry is None:  # declined while we were allocating
+            if entry is None:  # declined before this arrival could publish one
                 self._direct_load(
                     param, full_param_name, shard_id, global_expert_id, loaded_weight
                 )
@@ -210,12 +215,21 @@ class ExpertStagingPool:
         with entry.lock:
             entry.filled.add((local_eid, shard_id))
             complete = entry.complete
-        if complete:
-            with self._lock:
-                claimed = self._entries.pop(pid, None) is entry
-            if claimed:
-                with entry.lock:
-                    moe.flush_staged(param, entry.staging, entry.filled)
+        # Two ways this thread owes the write-back. `claimed` is the ordinary
+        # one: this arrival was the last, so it takes the entry and flushes it.
+        # `disowned` is the race -- `decline` took the entry while this thread
+        # was still working on it, either during the allocation above (it skips
+        # the flush entirely while `staging` is None) or between the copy and
+        # the `filled.add` (it flushes a `filled` set this region is missing
+        # from). Either way the region is lost unless we write it back here,
+        # which is safe: the path that declined writes only regions the pool
+        # never staged, so the two never touch the same bytes.
+        with self._lock:
+            claimed = complete and self._entries.pop(pid, None) is entry
+            disowned = entry.disowned
+        if claimed or disowned:
+            with entry.lock:
+                moe.flush_staged(param, entry.staging, entry.filled)
 
     def decline(self, param: torch.nn.Parameter) -> None:
         """Hand this parameter over to another loader path.
@@ -229,8 +243,12 @@ class ExpertStagingPool:
         with self._lock:
             self._declined.add(pid)
             entry = self._entries.pop(pid, None)
+            if entry is not None:
+                entry.disowned = True
         # `staging is None` means the entry was published but no arrival ever
         # materialized its buffer, so there is nothing staged to write back.
+        # An arrival still in flight will notice `disowned` and write its own
+        # region back once it lands.
         if entry is not None and entry.staging is not None:
             with entry.lock:
                 entry.moe.flush_staged(param, entry.staging, entry.filled)
