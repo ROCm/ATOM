@@ -62,6 +62,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
     "ATOM_USE_TRITON_MOE_DECODE": lambda: os.getenv("ATOM_USE_TRITON_MOE_DECODE", "0")
     == "1",
+    # Run the routed-expert GEMMs through the Triton a8w4 path *inside* the EP
+    # modular kernel (between mori dispatch and combine). Separate from
+    # ATOM_USE_TRITON_MOE, whose branches short-circuit apply() before EP runs.
+    "ATOM_USE_TRITON_MOE_EP": lambda: os.getenv("ATOM_USE_TRITON_MOE_EP", "0") == "1",
+    # Trim the mori receive buffer during PREFILL too. Without it, prefill keeps
+    # the full (mbt * ep_size) buffer -- measured M=131072 for ~400 real rows,
+    # which the Triton EP path then multiplies by topk into an ~11 GB per-layer
+    # intermediate. Off by default: the trim bound must be an upper bound on
+    # received rows or it silently drops tokens.
+    "ATOM_EP_TRIM_PREFILL": lambda: os.getenv("ATOM_EP_TRIM_PREFILL", "0") == "1",
     "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
     # --- Kernel Fusion Toggles ---
     # fused_compress_attn: switch between Triton (default historical) and a

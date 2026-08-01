@@ -897,6 +897,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         else:
             self.use_triton_decode = False
 
+        # Triton a8w4 for the routed experts *inside* the EP modular kernel.
+        # Unlike use_triton_decode (GGUU), this path is GUGU: interleaved gate/up
+        # is the a8w4 kernel's native layout, which is what lets the SwiGLU fuse
+        # into GEMM1's write-back. So it *requires* ATOM_MOE_GU_ITLV=1 -- the
+        # recipe value -- rather than forbidding it.
+        self.use_triton_ep = envs.ATOM_USE_TRITON_MOE_EP and self.is_guinterleave
+
         # EPLB owns logical-to-physical routing, load recording, and live expert
         # migration. The Triton forward paths bypass that routing flow, and their
         # weight layout is not migration-safe, so EPLB must use the standard path
@@ -904,6 +911,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if getattr(get_current_atom_config(), "eplb_enable", False):
             self.use_triton = False
             self.use_triton_decode = False
+            self.use_triton_ep = False
 
     def create_weights(
         self,
@@ -1110,30 +1118,40 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w2_swizzle_layout = w2_swizzle_layout
             return
 
-        if self.use_triton_decode:
-            # Triton decode is GGUU-only (gate/up separated). Snapshot only the
-            # raw SCALES (small) before the FlyDSL shuffle overwrites them — the
-            # decode WEIGHTS are a zero-copy view of the FlyDSL-shuffled weight
-            # (built below), so they share storage and don't double weight memory.
+        if self.use_triton_decode or self.use_triton_ep:
+            # Snapshot only the raw SCALES (small) before the FlyDSL shuffle
+            # overwrites them — the a8w4 WEIGHTS are a zero-copy view of the
+            # FlyDSL-shuffled weight (built below), so they share storage and
+            # don't double weight memory. These snapshots are pre-interleave;
+            # the GUGU block below interleaves them to match its weights.
             orig_w13_weight_scale = layer.w13_weight_scale.data.clone()
             orig_w2_weight_scale = layer.w2_weight_scale.data.clone()
 
         # shuffle weight (arch-aware: gfx1250 does the GUGU row interleave +
         # WMMA tile shuffle internally, other archs use the lane-level path)
-        layer.w13_weight.data = moe_shuffle_weight(
-            layer.w13_weight,
-            experts_cnt=self.num_experts,
-            is_guinterleave=self.is_guinterleave,
-            gate_up=True,
-        )
-        layer.w2_weight.data = moe_shuffle_weight(
-            layer.w2_weight,
-            experts_cnt=self.num_experts,
-            is_guinterleave=self.is_guinterleave,
-            gate_up=False,
-        )
-        layer.w13_weight.is_shuffled = True
-        layer.w2_weight.is_shuffled = True
+        #
+        # use_triton_ep on a non-gfx1250 arch leaves the weight UNSHUFFLED: the
+        # aiter triton a8w4 kernel consumes a plain (E, K, N) weight there
+        # (preshuffled=False), and there is no view that turns the lane-level
+        # shuffle into that layout -- reinterpreting it produces silently wrong
+        # numerics rather than an error. Scales are still shuffled below, since
+        # shuffle_scale_moe is the layout the kernel wants on every arch.
+        skip_weight_shuffle = self.use_triton_ep and not self.is_gfx1250
+        if not skip_weight_shuffle:
+            layer.w13_weight.data = moe_shuffle_weight(
+                layer.w13_weight,
+                experts_cnt=self.num_experts,
+                is_guinterleave=self.is_guinterleave,
+                gate_up=True,
+            )
+            layer.w2_weight.data = moe_shuffle_weight(
+                layer.w2_weight,
+                experts_cnt=self.num_experts,
+                is_guinterleave=self.is_guinterleave,
+                gate_up=False,
+            )
+            layer.w13_weight.is_shuffled = True
+            layer.w2_weight.is_shuffled = True
 
         # On gfx1250, GUGU interleaves stage1 bias rows to [g0, u0, g1, u1, ...].
         if self.is_gfx1250 and self.is_guinterleave and layer.w13_bias is not None:
@@ -1178,6 +1196,98 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
             # Arch -> SWIZZLE_MX_SCALE label decision lives in aiter, not here.
             # GGUU keeps gate/up separated, so no interleave on the decode scales.
+            (
+                layer.w13_weight_scale_a8w4,
+                layer.w13_swizzle_layout_a8w4,
+            ) = shuffle_scale_moe(w13_scale_for_a8w4, return_layout=True)
+            (
+                layer.w2_weight_scale_a8w4,
+                layer.w2_swizzle_layout_a8w4,
+            ) = shuffle_scale_moe(w2_scale_for_a8w4, return_layout=True)
+
+        if self.use_triton_ep:
+            # GUGU (interleaved [g0,u0,g1,u1,...]) a8w4 tensors for the Triton
+            # experts inside the EP modular kernel. Kept separate from the
+            # use_triton_decode/GGUU block above because the two layouts differ,
+            # and because use_triton_ep must NOT set use_triton_decode -- that
+            # flag makes apply() return early on decode steps, which would skip
+            # dispatch/combine and silently drop the all-to-all under EP.
+            from aiter.ops.triton.utils.shuffle import (
+                moe_weight_decode_view,
+                shuffle_scale_moe,
+            )
+
+            # WEIGHTS: on non-gfx1250 the weight shuffle above was skipped, so
+            # these are the plain (E, K, N) tensors the triton a8w4 kernel wants
+            # with preshuffled=False. Do NOT route them through
+            # moe_weight_decode_view: that view assumes the gfx1250 WMMA tile
+            # arrangement, and applying it to a lane-level-shuffled (or
+            # unshuffled) tensor silently scrambles the weights.
+            #
+            # The GUGU row interleave still has to happen for apply_swiglu=True
+            # (_swiglu splits reshape(M, N//2, 2), i.e. adjacent gate/up pairs).
+            # On gfx1250 moe_shuffle_weight did it; here we do it explicitly.
+            if self.is_gfx1250:
+                layer.w13_weight_preshuffled = moe_weight_decode_view(
+                    layer.w13_weight.data
+                )
+                layer.w2_weight_preshuffled = moe_weight_decode_view(
+                    layer.w2_weight.data
+                )
+            else:
+                # create_weights stores (E, N, K_packed) -- N (= 2 * intermediate)
+                # is dim 1, exactly what interleave_gate_up_rows permutes. Do NOT
+                # transpose first: that would put K on dim 1 and interleave the K
+                # axis instead, leaving gate/up untouched.
+                # Triton's canonicalize_dtype has no entry for
+                # float4_e2m1fn_x2 (KeyError at kernel launch), and the kernel
+                # itself static_asserts w.dtype == tl.uint8. Same .view(uint8)
+                # ATOM already does for _swizzle_mxfp4 on the non-EP path.
+                w13_unshuffled = layer.w13_weight.data
+                if w13_unshuffled.dtype != torch.uint8:
+                    w13_unshuffled = w13_unshuffled.view(torch.uint8)
+                assert w13_unshuffled.shape[1] == 2 * self.intermediate_size, (
+                    "expected w13_weight (E, 2*intermediate, K_packed) so dim 1 is "
+                    f"the gate/up axis, got {tuple(w13_unshuffled.shape)}"
+                )
+                if self.is_guinterleave:
+                    w13_unshuffled = interleave_gate_up_rows(w13_unshuffled)
+                # moe_gemm_a8w4 wants (E, K, N) column-major (it asserts
+                # w.stride(-2) == 1), same as _swizzle_mxfp4 prepares for the
+                # non-EP triton path. The transpose of a contiguous (E, N, K)
+                # gives exactly that, so hand over the view -- calling
+                # .contiguous() here would make stride(-2) == K and trip it.
+                w2_unshuffled = layer.w2_weight.data
+                if w2_unshuffled.dtype != torch.uint8:
+                    w2_unshuffled = w2_unshuffled.view(torch.uint8)
+                layer.w13_weight_preshuffled = w13_unshuffled.transpose(-2, -1)
+                layer.w2_weight_preshuffled = w2_unshuffled.transpose(-2, -1)
+
+            # SCALES: the snapshots are pre-interleave, so interleave w13's rows
+            # to match its weights before the a8w4 swizzle. Reusing aiter's own
+            # helper keeps the row order identical to moe_shuffle_scale's GUGU
+            # path rather than re-deriving it here. w2 has no gate/up split.
+            w13_scale_for_a8w4 = orig_w13_weight_scale
+            if self.is_guinterleave:
+                # interleave_gate_up_rows permutes dim 1, so this is only correct
+                # if the snapshot is (E, N, K // 32) with N == 2 * intermediate.
+                # If dim 1 were K // 32 instead, the interleave would permute the
+                # K axis and silently degrade numerics rather than fail -- so
+                # assert the layout instead of trusting it.
+                assert orig_w13_weight_scale.ndim == 3, (
+                    "expected a 3-D (E, N, K//32) w13 scale, got shape "
+                    f"{tuple(orig_w13_weight_scale.shape)}"
+                )
+                assert orig_w13_weight_scale.shape[1] == 2 * self.intermediate_size, (
+                    "w13 a8w4 scale dim 1 must be N = 2 * intermediate_size "
+                    f"({2 * self.intermediate_size}) for the GUGU row interleave, "
+                    f"but got shape {tuple(orig_w13_weight_scale.shape)}. If dim 1 "
+                    "is K//32 the interleave must move after the transpose."
+                )
+                w13_scale_for_a8w4 = interleave_gate_up_rows(w13_scale_for_a8w4)
+            w13_scale_for_a8w4 = w13_scale_for_a8w4.transpose(-2, -1)
+            w2_scale_for_a8w4 = orig_w2_weight_scale.transpose(-2, -1)
+
             (
                 layer.w13_weight_scale_a8w4,
                 layer.w13_swizzle_layout_a8w4,
@@ -1400,6 +1510,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             e_score_correction_bias=e_score_correction_bias,
             fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
         )
+
+        # dummy_x_kernel[(1, )](x, x.shape[0], x.shape[1])
+
         a1_scale = getattr(layer, "w13_input_scale", None)
         a2_scale = getattr(layer, "w2_input_scale", None)
         moe_extra_args = {
@@ -1415,6 +1528,37 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             moe_extra_args["linear_beta"] = getattr(
                 layer, "activation_situ_linear_beta", None
             )
+
+        # EP + Triton: the Triton branches earlier in apply() return before the
+        # modular kernel runs, so they can never coexist with dispatch/combine.
+        # Instead hand the a8w4 tensors to the modular kernel, which swaps them
+        # in for flydsl fused_moe *between* dispatch and combine. Requires the
+        # a8w4 weight prep (w13_weight_preshuffled et al) to have run at load.
+        if self.use_triton_ep and self.using_modular_kernel:
+            # Falling back to flydsl fused_moe here would be silently WRONG, not
+            # merely slow: use_triton_ep skips the FlyDSL weight shuffle in
+            # process_weights_after_loading, so layer.w{13,2}_weight are
+            # unshuffled and fused_moe would read them as if they were. Fail
+            # loudly instead of emitting garbage tokens.
+            assert getattr(layer, "w13_weight_preshuffled", None) is not None, (
+                "use_triton_ep is on but the a8w4 weights were never prepared; "
+                "flydsl fused_moe cannot be used as a fallback because the "
+                "FlyDSL weight shuffle was skipped for this layer."
+            )
+            moe_extra_args["triton_experts"] = {
+                "w13_weight": layer.w13_weight_preshuffled,
+                "w2_weight": layer.w2_weight_preshuffled,
+                "w13_scale": layer.w13_weight_scale_a8w4,
+                "w2_scale": layer.w2_weight_scale_a8w4,
+                "w13_swizzle_layout": layer.w13_swizzle_layout_a8w4,
+                "w2_swizzle_layout": layer.w2_swizzle_layout_a8w4,
+                "a13_scale": getattr(layer, "w13_input_scale", None),
+                "a2_scale": getattr(layer, "w2_input_scale", None),
+                "w1_bias": getattr(layer, "w13_bias", None),
+                "w2_bias": getattr(layer, "w2_bias", None),
+                "swiglu_limit": getattr(layer, "swiglu_limit", 10.0),
+            }
+
         if self.fused_experts is None:
             return fused_moe(
                 x,
