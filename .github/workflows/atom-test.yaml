@@ -387,10 +387,12 @@ jobs:
         # prompts. The timeout is what turns the hang it guards against into a
         # failure rather than a stuck runner.
         timeout-minutes: 30
+        env:
+          MODEL_EXTRA_ARGS: ${{ matrix.extraArgs }}
         run: |
           # Run the inference and capture output
           set -euo pipefail
-          
+
           echo ""
           echo "========== Running test =========="
 
@@ -408,15 +410,18 @@ jobs:
           rocm-smi --showpids
           docker ps -a
           echo "========= End runner debug logs ==============="
-          docker exec "$CONTAINER_NAME" bash -lc "
-            set -euo pipefail
-            python3 -m atom.examples.simple_inference \
-              --model \"$model_path\" \
-              ${{ matrix.extraArgs }} \
-              --temperature 0 \
-            | grep -E '^Prompt: |^Completion:'
-          " > atom_test_output.txt
-          
+          # Pipe via stdin so container bash parses the shell quoting in
+          # extraArgs, exactly as the accuracy step below does. Interpolating
+          # it into a double-quoted `bash -lc "…"` instead lets the *host*
+          # shell strip the inner quotes first, so single-quoted JSON such as
+          # --hf-overrides '{"use_index_cache": true}' arrives as
+          # '{use_index_cache: true}' and argparse rejects it. Four of the
+          # PR-level models carry JSON in extraArgs.
+          echo "python3 -m atom.examples.simple_inference \
+            --model $model_path $MODEL_EXTRA_ARGS --temperature 0" \
+            | docker exec -i "$CONTAINER_NAME" bash -l \
+            | grep -E '^Prompt: |^Completion:' > atom_test_output.txt
+
           echo ""
           echo "========== Showing test output below =========="
           cat atom_test_output.txt
