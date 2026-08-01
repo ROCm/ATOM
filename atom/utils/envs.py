@@ -200,6 +200,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # with that many threads; set to 1 to fall back to the original sequential
     # per-expert path.
     "ATOM_LOADER_NUM_THREADS": lambda: int(os.getenv("ATOM_LOADER_NUM_THREADS", "16")),
+    # Warm the page cache with a background sequential reader instead of
+    # leaving it to demand faults through the mmap. Measured on a local NVMe:
+    # the fault-driven pattern sustains 3.2 GB/s where the device does 6.9 and
+    # a single sequential reader alone reaches 6.06, so the gap is the access
+    # pattern rather than queue depth. Off by default -- the win depends on the
+    # storage, and on a warm cache the reader is pure overhead.
+    "ATOM_LOADER_PREFETCH": lambda: (
+        os.getenv("ATOM_LOADER_PREFETCH", "false").lower() == "true"
+    ),
+    # Shards read concurrently by the prefetcher. Kept small: the device here
+    # saturates at 2 streams, and every thread also competes with the loader.
+    "ATOM_LOADER_PREFETCH_THREADS": lambda: int(
+        os.getenv("ATOM_LOADER_PREFETCH_THREADS", "4")
+    ),
+    "ATOM_LOADER_PREFETCH_BLOCK_MB": lambda: int(
+        os.getenv("ATOM_LOADER_PREFETCH_BLOCK_MB", "16")
+    ),
     # Fail loading when the checkpoint does not deliver every routed expert of
     # a fused MoE parameter. On by default: the alternative is a model that
     # loads happily with some expert slots left at their init values, which

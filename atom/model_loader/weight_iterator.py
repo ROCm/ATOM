@@ -8,9 +8,13 @@ gate has no AITER build, and the shard-skipping logic here is worth covering
 against real files.
 """
 
+import concurrent.futures
+import itertools
 import json
 import logging
 import os
+import threading
+import time
 from collections.abc import Callable, Generator
 from glob import glob
 
@@ -24,6 +28,7 @@ from atom.model_loader.weight_utils import (
     download_weights_from_hf,
     filter_duplicate_safetensors_files,
 )
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -70,6 +75,131 @@ def _shard_tensor_names(st_file: str) -> list[str] | None:
     return [name for name in header if name != "__metadata__"]
 
 
+def _node_local_rank() -> tuple[int, int]:
+    """This process's rank and world size *within its node*.
+
+    Page cache is per node, so a prefetch split has to be node-local: splitting
+    by global rank would hand each node only 1/world of the shards and leave
+    the rest of that node's checkpoint to be faulted in on demand.
+
+    Falls back to ``(0, 1)`` -- every rank prefetches everything -- whenever the
+    node layout cannot be established. That errs the safe way: duplicate reads
+    are absorbed by the shared page cache, whereas over-estimating the node
+    count would silently leave part of the checkpoint unprefetched.
+    """
+    env_rank, env_size = os.environ.get("LOCAL_RANK"), os.environ.get(
+        "LOCAL_WORLD_SIZE"
+    )
+    if env_rank is not None and env_size is not None:
+        try:
+            return int(env_rank), max(1, int(env_size))
+        except ValueError:
+            pass
+    if not torch.distributed.is_initialized():
+        return 0, 1
+    world = torch.distributed.get_world_size()
+    try:
+        visible = torch.cuda.device_count()
+    except Exception:  # noqa: BLE001
+        visible = 0
+    if visible and world <= visible:
+        # Every rank fits on this node's GPUs, so global rank is node-local.
+        return torch.distributed.get_rank(), world
+    return 0, 1
+
+
+def _read_whole_file(path: str, block_size: int) -> None:
+    """Read `path` sequentially so the kernel caches it, discarding the data."""
+    with open(path, "rb") as f:
+        while f.read(block_size):
+            pass
+
+
+def _start_prefetch(files: list[str], num_threads: int, block_size: int) -> None:
+    """Warm the page cache for this rank's share of `files`, in the background.
+
+    A plain sequential ``read()`` rather than ``posix_fadvise(WILLNEED)``:
+    WILLNEED is a hint the kernel may drop, and for a 350 GiB checkpoint it
+    drops most of it, leaving the real work to demand faults through the mmap.
+    Measured on a local NVMe here, that fault pattern sustains 3.2 GB/s while
+    the device does 6.9 GB/s and even a *single* sequential reader reaches
+    6.06 GB/s -- so the gap is the access pattern, not queue depth, and a
+    sequential reader is exactly what closes it.
+
+    Detached on purpose: loading starts immediately and rides whatever is
+    already cached instead of waiting for the whole checkpoint.
+    """
+    rank, local_world = _node_local_rank()
+    mine = files[rank::local_world]
+    if not mine:
+        return
+
+    def _run() -> None:
+        started = time.perf_counter()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as pool:
+            remaining = iter(mine)
+            pending = {
+                pool.submit(_read_whole_file, p, block_size)
+                for p in itertools.islice(remaining, num_threads)
+            }
+            # Bounded window: the point is to stay ahead of the loader, not to
+            # queue every shard at once and compete with it for bandwidth.
+            while pending:
+                done, pending = concurrent.futures.wait(
+                    pending, return_when=concurrent.futures.FIRST_COMPLETED
+                )
+                for fut in done:
+                    try:
+                        fut.result()
+                    except OSError as e:
+                        # A prefetch failure costs speed, never correctness:
+                        # the loader still reads the shard itself.
+                        logger.debug("Prefetch failed: %s", e)
+                    nxt = next(remaining, None)
+                    if nxt is not None:
+                        pending.add(pool.submit(_read_whole_file, nxt, block_size))
+        logger.info(
+            "Checkpoint prefetch finished: %d/%d shards in %.1fs",
+            len(mine),
+            len(files),
+            time.perf_counter() - started,
+        )
+
+    logger.info(
+        "Prefetching %d/%d shards into page cache in the background "
+        "(node-local rank %d of %d, %d threads, %d MiB blocks)",
+        len(mine),
+        len(files),
+        rank,
+        local_world,
+        num_threads,
+        block_size // (1024 * 1024),
+    )
+    threading.Thread(target=_run, name="ckpt-prefetch", daemon=True).start()
+
+
+def _shards_worth_reading(
+    files: list[str], wants: Callable[[str], bool] | None
+) -> list[str]:
+    """Drop shards holding nothing the caller wants, by header alone.
+
+    A drafter load reads the target's checkpoint to pick out the MTP block --
+    typically one shard out of dozens -- so this is what keeps both the loader
+    and the prefetcher off the other 98%.
+
+    A shard whose header cannot be read is kept: the real reader should produce
+    the real diagnostic, not a fast path whose only job is to skip files.
+    """
+    if wants is None:
+        return files
+    kept = []
+    for st_file in files:
+        names = _shard_tensor_names(st_file)
+        if names is None or any(map(wants, names)):
+            kept.append(st_file)
+    return kept
+
+
 def safetensors_weights_iterator(
     model_name_or_path: str,
     disable_mmap: bool = False,
@@ -93,9 +223,22 @@ def safetensors_weights_iterator(
     hf_weights_files = filter_duplicate_safetensors_files(
         glob(os.path.join(path, "*.safetensors")), path, SAFE_WEIGHTS_INDEX_NAME
     )
+    hf_weights_files = _shards_worth_reading(sorted(hf_weights_files), wants)
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
+
+    # The prefetcher and the WILLNEED hint do the same job, and doing both is
+    # worse than either: the hint asks the kernel to read-ahead 350 GiB of
+    # random-ish ranges while the prefetcher is streaming the same files
+    # sequentially, so they compete for the same device.
+    prefetching = envs.ATOM_LOADER_PREFETCH and not disable_mmap
+    if prefetching:
+        _start_prefetch(
+            hf_weights_files,
+            envs.ATOM_LOADER_PREFETCH_THREADS,
+            envs.ATOM_LOADER_PREFETCH_BLOCK_MB * 1024 * 1024,
+        )
 
     iters = tqdm(
         hf_weights_files,
@@ -103,16 +246,8 @@ def safetensors_weights_iterator(
         disable=not enable_tqdm,
     )
     for st_file in iters:
-        if wants is not None:
-            names = _shard_tensor_names(st_file)
-            if names is not None and not any(map(wants, names)):
-                # Nothing in this shard is wanted -- do not read it. Loading a
-                # drafter reads the target's checkpoint to pick out the MTP
-                # block, which is typically one shard out of dozens.
-                continue
-
         # Advise kernel for sequential read-ahead (mmap optimization)
-        if not disable_mmap and hasattr(os, "posix_fadvise"):
+        if not prefetching and not disable_mmap and hasattr(os, "posix_fadvise"):
             try:
                 fd = os.open(st_file, os.O_RDONLY)
                 file_size = os.fstat(fd).st_size
