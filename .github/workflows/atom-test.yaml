@@ -226,7 +226,10 @@ jobs:
           fi
 
       - name: Run offline inference
-        timeout-minutes: 30
+        # An 8B model loads and answers a handful of prompts in a couple of
+        # minutes. This bound is the guard: the failure it exists to catch is a
+        # hang, and a hang should cost minutes rather than most of an hour.
+        timeout-minutes: 15
         run: |
           set -euo pipefail
           if [ -d "/models" ]; then
