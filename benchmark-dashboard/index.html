@@ -557,9 +557,6 @@ function parseAtomeshSummaryRows(markdown) {
     const totalTputPerGpu = parseAtomeshNumber(raw.totaltoksgpu);
     const outputTputPerGpu = parseAtomeshNumber(raw.outputtoksgpu);
     const interactivity = parseAtomeshNumber(raw.interactivity);
-    const gsm8k = parseAtomeshNumber(raw.gsm8k);
-    const accuracyScore = parseAtomeshNumber(raw.accuracy) ?? gsm8k;
-    const accuracyTask = raw.accuracytask || (Number.isFinite(gsm8k) ? 'gsm8k' : '');
     return {
       id: `atomesh-summary-${idx}`,
       backend: ATOMESH_DATA.backend,
@@ -580,11 +577,7 @@ function parseAtomeshSummaryRows(markdown) {
       ttftMs: parseAtomeshNumber(raw.ttftms),
       tpotMs: parseAtomeshNumber(raw.tpotms),
       e2eMs: parseAtomeshNumber(raw.e2ems),
-      accuracyTask,
-      accuracyMetric: accuracyTask === 'gsm8k' ? 'flexible-extract' : '',
-      accuracyScore,
-      accuracyRaw: raw.accuracy || raw.gsm8k || '--',
-      gsm8k,
+      gsm8k: parseAtomeshNumber(raw.gsm8k),
       gsm8kRaw: raw.gsm8k || '--',
       runUrl: ATOMESH_DATA.runUrl,
       status: Number.isFinite(interactivity) && Number.isFinite(totalTputPerGpu ?? outputTputPerGpu) ? 'completed' : 'incomplete',
@@ -627,8 +620,6 @@ function atomeshPointRow(point, meta, idx) {
   const totalTputPerGpu = atomeshPointNumber(point, 'tput_per_gpu');
   const outputTputPerGpu = atomeshPointNumber(point, 'output_tput_per_gpu');
   const gsm8k = atomeshPointNumber(point, 'gsm8k');
-  const accuracyScore = atomeshPointNumber(point, 'accuracy_score') ?? gsm8k;
-  const accuracyTask = point.accuracy_task || (Number.isFinite(gsm8k) ? 'gsm8k' : '');
   return {
     id: point.run_id || `atomesh-point-${idx}`,
     backend: ATOMESH_DATA.backend,
@@ -649,15 +640,6 @@ function atomeshPointRow(point, meta, idx) {
     ttftMs: atomeshPointNumber(point, 'ttft_ms'),
     tpotMs: atomeshPointNumber(point, 'tpot_ms'),
     e2eMs: atomeshPointNumber(point, 'e2el_ms'),
-    accuracyTask,
-    accuracyMetric: point.accuracy_metric || '',
-    accuracyScore,
-    accuracyRaw: point.accuracy_score_raw || (Number.isFinite(accuracyScore) ? accuracyScore.toFixed(4) : '--'),
-    accuracyStrict: atomeshPointNumber(point, 'accuracy_strict'),
-    accuracyResolved: atomeshPointNumber(point, 'accuracy_resolved'),
-    accuracyTotal: atomeshPointNumber(point, 'accuracy_total'),
-    accuracyThreshold: atomeshPointNumber(point, 'accuracy_threshold'),
-    accuracyFewshot: atomeshPointNumber(point, 'accuracy_fewshot'),
     gsm8k,
     gsm8kRaw: Number.isFinite(gsm8k) ? gsm8k.toFixed(4) : '--',
     runUrl: point.run_url || meta.runUrl || '',
@@ -3615,24 +3597,6 @@ function atomeshRunCell(row) {
   return href ? `<a href="${escHTML(href)}" target="_blank" rel="noopener noreferrer">view</a>` : '—';
 }
 
-function atomeshAccuracyTaskLabel(task) {
-  const normalized = String(task || '').toLowerCase();
-  if (normalized === 'swebench_lite') return 'SWE-bench Lite';
-  if (normalized === 'gsm8k') return 'GSM8K';
-  return task || 'Accuracy';
-}
-
-function atomeshAccuracyValue(row) {
-  return parseAtomeshNumber(row?.accuracyScore);
-}
-
-function atomeshAccuracyRaw(row) {
-  const value = atomeshAccuracyValue(row);
-  return row?.accuracyRaw && row.accuracyRaw !== '--'
-    ? row.accuracyRaw
-    : (Number.isFinite(value) ? value.toFixed(4) : '—');
-}
-
 function renderAtomeshKPICards() {
   const row = document.getElementById('kpi-row');
   const totalRows = atomeshRows();
@@ -3640,8 +3604,7 @@ function renderAtomeshKPICards() {
   const completed = atomeshCompletedCases();
   const best = completed.reduce((max, c) => !max || c.totalTputPerGpu > max.totalTputPerGpu ? c : max, null);
   const bestInteractivity = completed.reduce((max, c) => !max || c.interactivity > max.interactivity ? c : max, null);
-  const acc = rows.find(c => Number.isFinite(atomeshAccuracyValue(c)));
-  const accValue = atomeshAccuracyValue(acc);
+  const acc = rows.find(c => c.gsm8k != null);
   row.innerHTML = `
     <div class="kpi-group">
       <div class="kpi-card">
@@ -3668,8 +3631,8 @@ function renderAtomeshKPICards() {
       </div>
       <div class="kpi-card clickable" id="atomesh-acc-card" title="Click to view accuracy">
         <div class="kpi-label">Accuracy</div>
-        <div class="kpi-value">${acc ? (accValue * 100).toFixed(1) : '—'} <span class="kpi-unit">${acc ? '%' : ''}</span></div>
-        <div class="kpi-sub">${acc ? `${atomeshAccuracyTaskLabel(acc.accuracyTask)} · c=${acc.concurrency}` : 'No accuracy result'}</div>
+        <div class="kpi-value">${acc ? (acc.gsm8k * 100).toFixed(1) : '—'} <span class="kpi-unit">${acc ? '%' : ''}</span></div>
+        <div class="kpi-sub">${acc ? `GSM8K · c=${acc.concurrency}` : 'No GSM8K markdown value'}</div>
       </div>
     </div>`;
   const accCard = document.getElementById('atomesh-acc-card');
@@ -3749,7 +3712,7 @@ function renderAtomeshPerformanceTab() {
     <th>Backend</th><th>Model</th><th>Topology</th><th>ISL/OSL</th><th class="num">Conc</th>
     <th class="num">Interactivity</th><th class="num">Total tok/s</th><th class="num">Input tok/s</th><th class="num">Output tok/s</th>
     <th class="num">Total tok/s/GPU</th><th class="num">Input tok/s/GPU</th><th class="num">Output tok/s/GPU</th>
-    <th class="num">TTFT ms</th><th class="num">TPOT ms</th><th class="num">E2E ms</th><th class="num">Accuracy</th><th>Run</th>
+    <th class="num">TTFT ms</th><th class="num">TPOT ms</th><th class="num">E2E ms</th><th class="num">GSM8K</th><th>Run</th>
   </tr></thead><tbody>`;
   rows.forEach((c, idx) => {
     html += `<tr data-atomesh-row="${idx}" style="cursor:pointer">
@@ -3768,7 +3731,7 @@ function renderAtomeshPerformanceTab() {
       <td class="num">${c.ttftMs != null ? fmtNum(c.ttftMs, 2) : '—'}</td>
       <td class="num">${c.tpotMs != null ? fmtNum(c.tpotMs, 2) : '—'}</td>
       <td class="num">${c.e2eMs != null ? fmtNum(c.e2eMs, 2) : '—'}</td>
-      <td class="num">${Number.isFinite(atomeshAccuracyValue(c)) ? `${escHTML(atomeshAccuracyTaskLabel(c.accuracyTask))} ${escHTML(atomeshAccuracyRaw(c))}` : '—'}</td>
+      <td class="num">${escHTML(c.gsm8kRaw || '—')}</td>
       <td>${atomeshRunCell(c)}</td>
     </tr>`;
   });
@@ -3800,7 +3763,7 @@ function renderAtomeshPerformanceTab() {
             label: item => [
               ` Interactivity: ${fmtNum(item.parsed.x, 2)} tok/s/user`,
               ` Total tok/s/GPU: ${fmtNum(item.parsed.y, 2)}`,
-              ` ${atomeshAccuracyTaskLabel(item.raw.row.accuracyTask)}: ${atomeshAccuracyRaw(item.raw.row)}`,
+              ` GSM8K: ${item.raw.row.gsm8kRaw || '—'}`,
             ],
             afterBody: () => '\nClick for details',
           }},
@@ -3964,20 +3927,14 @@ function renderAtomeshAccuracyHistoryChart(row, canvasId) {
   const existing = Chart.getChart(canvas);
   if (existing) existing.destroy();
   const model = atomeshDisplayModel(row);
-  const task = row.accuracyTask || 'accuracy';
-  const taskLabel = atomeshAccuracyTaskLabel(task);
-  const allModelRows = atomeshHistoryRows().filter(h =>
-    atomeshDisplayModel(h) === model
-    && (h.accuracyTask || 'accuracy') === task
-    && Number.isFinite(atomeshAccuracyValue(h))
-  );
+  const allModelRows = atomeshHistoryRows().filter(h => atomeshDisplayModel(h) === model && Number.isFinite(parseAtomeshNumber(h.gsm8k)));
   const exactRows = allModelRows.filter(h =>
     h.islOsl === row.islOsl
     && h.concurrency === row.concurrency
     && (h.hardware || 'unknown') === (row.hardware || 'unknown')
   );
   const chartRows = exactRows.length ? exactRows : allModelRows;
-  const points = dedupeAtomeshHistoryByDay(chartRows, 'accuracyScore');
+  const points = dedupeAtomeshHistoryByDay(chartRows, 'gsm8k');
   if (!points.length) return;
   const color = getModelColor(ATOMESH_DATA.backend, model);
 
@@ -3986,7 +3943,7 @@ function renderAtomeshAccuracyHistoryChart(row, canvasId) {
     data: {
       labels: points.map(p => localDay(p.date)),
       datasets: [{
-        label: `${taskLabel} accuracy`,
+        label: 'GSM8K accuracy',
         data: points.map(p => p.value * 100),
         borderColor: color.border,
         backgroundColor: color.bg,
@@ -4032,44 +3989,37 @@ function renderAtomeshAccuracyHistoryChart(row, canvasId) {
 function renderAtomeshAccuracyTab() {
   const container = document.getElementById('tab-accuracy');
   destroyChartsIn(container);
-  const rows = filteredAtomeshRows().filter(c => Number.isFinite(atomeshAccuracyValue(c)));
+  const rows = filteredAtomeshRows().filter(c => c.gsm8k != null);
   if (!rows.length) {
-    container.innerHTML = '<div class="chart-empty">No accuracy row matches the current ATOMesh filters.</div>';
+    container.innerHTML = '<div class="chart-empty">No GSM8K row matches the current ATOMesh filters.</div>';
     return;
   }
-  const taskLabels = [...new Set(rows.map(c => atomeshAccuracyTaskLabel(c.accuracyTask)))];
   let html = `<div class="section-container"><div class="section-header">
-    <span class="section-title">ATOMesh Accuracy (${taskLabels.map(escHTML).join(', ')})</span>
+    <span class="section-title">ATOMesh Accuracy (GSM8K)</span>
     <span style="font-size:11px;color:var(--text-tertiary);overflow-wrap:anywhere">source: benchmark-action data.js</span>
   </div>
   <div class="table-watermark"><div class="table-watermark-scroll"><table class="perf-table"><thead><tr>
     <th>Backend</th><th>Model</th><th>Topology</th><th>ISL/OSL</th><th class="num">Conc</th>
-    <th>Task</th><th>Metric</th><th class="num">Score</th><th class="num">Resolved</th>
-    <th class="num">Strict-Match</th><th class="num">Threshold</th><th class="num">Margin</th>
-    <th class="num">Fewshot</th><th>Last Tested</th><th>Run</th>
+    <th class="num">Flexible-Extract</th><th class="num">Strict-Match</th><th class="num">Baseline</th>
+    <th class="num">Recovery</th><th class="num">Threshold</th><th class="num">Margin</th>
+    <th class="num">Trend</th><th class="num">Fewshot</th><th>Last Tested</th><th>Run</th>
   </tr></thead><tbody>`;
   rows.forEach((c, idx) => {
     const canvasId = `atomesh-acc-history-${idx}`;
-    const score = atomeshAccuracyValue(c);
-    const threshold = parseAtomeshNumber(c.accuracyThreshold);
-    const margin = Number.isFinite(threshold) ? score - threshold : null;
-    const resolved = Number.isFinite(c.accuracyResolved) && Number.isFinite(c.accuracyTotal)
-      ? `${c.accuracyResolved}/${c.accuracyTotal}`
-      : '—';
     html += `<tr data-atomesh-acc-row="${idx}" style="cursor:pointer">
       <td style="white-space:nowrap;font-weight:600">${escHTML(ATOMESH_DATA.backend)}</td>
       <td class="model-name" style="color:${getModelColor(ATOMESH_DATA.backend, c.model).text}">${escHTML(c.model)}</td>
       <td>${escHTML(c.sourceTopology || c.topology)}</td>
       <td>${escHTML(c.islOsl)}</td>
       <td class="num">${c.concurrency}</td>
-      <td>${escHTML(atomeshAccuracyTaskLabel(c.accuracyTask))}</td>
-      <td>${escHTML(c.accuracyMetric || '—')}</td>
-      <td class="num"><strong>${escHTML(atomeshAccuracyRaw(c))}</strong></td>
-      <td class="num">${resolved}</td>
-      <td class="num">${Number.isFinite(c.accuracyStrict) ? fmtNum(c.accuracyStrict, 4) : '—'}</td>
-      <td class="num">${Number.isFinite(threshold) ? fmtNum(threshold, 4) : '—'}</td>
-      <td class="num">${Number.isFinite(margin) ? `<span class="${margin >= 0 ? 'trend-up' : 'trend-down'}">${margin >= 0 ? '+' : ''}${fmtNum(margin, 4)}</span>` : '—'}</td>
-      <td class="num">${Number.isFinite(c.accuracyFewshot) ? c.accuracyFewshot : '—'}</td>
+      <td class="num"><strong>${escHTML(c.gsm8kRaw || '—')}</strong></td>
+      <td class="num">--</td>
+      <td class="num">--</td>
+      <td class="num">--</td>
+      <td class="num">--</td>
+      <td class="num">--</td>
+      <td class="num">--</td>
+      <td class="num">--</td>
       <td>${fmtDate(c.date || ATOMESH_DATA.updatedAt)}</td>
       <td>${atomeshRunCell(c)}</td>
     </tr>`;
@@ -4077,7 +4027,7 @@ function renderAtomeshAccuracyTab() {
       <td colspan="15">
         <div class="detail-inner">
           <div class="chart-card hero" style="margin:0">
-            <h3>${escHTML(c.model)} — ${escHTML(atomeshAccuracyTaskLabel(c.accuracyTask))} Accuracy History</h3>
+            <h3>${escHTML(c.model)} — GSM8K Accuracy History</h3>
             <div class="chart-wrap"><canvas id="${canvasId}"></canvas></div>
           </div>
         </div>
