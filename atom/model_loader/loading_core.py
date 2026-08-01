@@ -11,7 +11,9 @@ AITER build, and `loader.py` imports AITER at module level.
 """
 
 import concurrent.futures
+import contextlib
 import logging
+import time
 from collections.abc import Callable, Iterable
 
 import torch
@@ -27,6 +29,18 @@ from atom.model_loader.weight_names import (
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
+
+
+def rank_tag() -> str:
+    """`rank_N` for log lines, or `rank_?` before the process group exists.
+
+    Mirrors how `weight_iterator` reads the rank: diagnostics must never be the
+    thing that breaks a load, and single-process tools have no group at all.
+    """
+    with contextlib.suppress(Exception):
+        if torch.distributed.is_initialized():
+            return f"rank_{torch.distributed.get_rank()}"
+    return "rank_?"
 
 
 def load_weights_into_model(
@@ -172,6 +186,14 @@ def load_weights_into_model(
             rewritten[ckpt_name] = rewriter.rewrite(ckpt_name)
         return rewritten[ckpt_name] is not None
 
+    # Phase timings. The caller reports one aggregate number for the whole load,
+    # which cannot tell "the disk is slow" from "the per-tensor dispatch is
+    # slow" -- and those have opposite fixes. With a thread pool the read loop
+    # races ahead of the work it queues, so a small `read+queue` next to a large
+    # `drain` locates the cost in the workers rather than in the read.
+    num_tensors = 0
+    t_read = t_drain = t_flush = 0.0
+
     try:
         disable_mmap = envs.ATOM_DISABLE_MMAP
         # Reject by name before the tensor is materialized. A drafter load reads
@@ -179,6 +201,7 @@ def load_weights_into_model(
         # can be skipped without being read at all. Under `--load_dummy` nothing
         # is loaded, so nothing is wanted -- and the rewriter, which is allowed
         # to raise on a checkpoint it cannot map, is never consulted.
+        _t0 = time.perf_counter()
         for name, weight_tensor in weights_iterator(
             model_name_or_path,
             disable_mmap,
@@ -193,11 +216,15 @@ def load_weights_into_model(
             if name is None:
                 continue
             dispatcher.dispatch(_orig_ckpt_name, name, weight_tensor)
+            num_tensors += 1
+        t_read = time.perf_counter() - _t0
 
+        _t0 = time.perf_counter()
         if executor is not None:
             # Drain all tasks (surfacing errors) before the safety flush.
             for future in concurrent.futures.as_completed(futures):
                 future.result()
+        t_drain = time.perf_counter() - _t0
 
         loaded_weights_record = dispatcher.loaded_weights_record
         dropped_ckpt_keys = dispatcher.dropped_ckpt_keys
@@ -207,7 +234,9 @@ def load_weights_into_model(
         # routed base experts. The per-parameter check further down is too
         # coarse to see this -- it only knows whether a parameter was touched
         # at all -- so report it while the (slot, shard) detail is still around.
+        _t0 = time.perf_counter()
         staging_report = staging_pool.flush_pending()
+        t_flush = time.perf_counter() - _t0
         if staging_report.incomplete:
             detail = "\n  ".join(staging_report.incomplete)
             message = (
@@ -224,6 +253,19 @@ def load_weights_into_model(
     finally:
         if executor is not None:
             executor.shutdown(wait=True)
+
+    # Every rank logs its own line: the spread between ranks is itself one of
+    # the things these numbers exist to explain.
+    logger.info(
+        "[%s] load phases: read+queue %.2fs (%d tensors) | drain %.2fs | "
+        "staging flush %.2fs | threads %d",
+        rank_tag(),
+        t_read,
+        num_tensors,
+        t_drain,
+        t_flush,
+        num_threads,
+    )
 
     _report_coverage(
         loaded_weights_record=loaded_weights_record,
