@@ -217,6 +217,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_LOADER_PREFETCH_BLOCK_MB": lambda: int(
         os.getenv("ATOM_LOADER_PREFETCH_BLOCK_MB", "16")
     ),
+    # Hint the kernel to read each shard ahead. Historically unconditional, and
+    # under suspicion: the read loop runs far ahead of the workers, so the hint
+    # is issued for the whole checkpoint within seconds, and asking for 350 GiB
+    # of read-ahead may cost more in kernel bookkeeping than it saves. Exposed
+    # so that cost can be measured on its own rather than inferred. Ignored
+    # when prefetching, which supersedes it.
+    "ATOM_LOADER_FADVISE": lambda: (
+        os.getenv("ATOM_LOADER_FADVISE", "true").lower() == "true"
+    ),
     # Fail loading when the checkpoint does not deliver every routed expert of
     # a fused MoE parameter. On by default: the alternative is a model that
     # loads happily with some expert slots left at their init values, which

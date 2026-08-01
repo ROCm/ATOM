@@ -223,7 +223,7 @@ def safetensors_weights_iterator(
     hf_weights_files = filter_duplicate_safetensors_files(
         glob(os.path.join(path, "*.safetensors")), path, SAFE_WEIGHTS_INDEX_NAME
     )
-    hf_weights_files = _shards_worth_reading(sorted(hf_weights_files), wants)
+    hf_weights_files = _shards_worth_reading(hf_weights_files, wants)
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
@@ -234,6 +234,12 @@ def safetensors_weights_iterator(
     # sequentially, so they compete for the same device.
     prefetching = envs.ATOM_LOADER_PREFETCH and not disable_mmap
     if prefetching:
+        # Sort only now, and read in the same order below. `glob` returns
+        # directory order, which is stable enough within one run but is not a
+        # promise, and the ranks must agree exactly or the stride partition
+        # leaves shards unclaimed. Reading in that same order also keeps the
+        # loader trailing the prefetchers instead of racing ahead of them.
+        hf_weights_files = sorted(hf_weights_files)
         _start_prefetch(
             hf_weights_files,
             envs.ATOM_LOADER_PREFETCH_THREADS,
@@ -247,7 +253,12 @@ def safetensors_weights_iterator(
     )
     for st_file in iters:
         # Advise kernel for sequential read-ahead (mmap optimization)
-        if not prefetching and not disable_mmap and hasattr(os, "posix_fadvise"):
+        if (
+            not prefetching
+            and envs.ATOM_LOADER_FADVISE
+            and not disable_mmap
+            and hasattr(os, "posix_fadvise")
+        ):
             try:
                 fd = os.open(st_file, os.O_RDONLY)
                 file_size = os.fstat(fd).st_size
