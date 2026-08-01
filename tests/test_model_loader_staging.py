@@ -31,7 +31,7 @@ import safetensors.torch
 import torch
 from torch import nn
 
-from atom.model_loader.expert_staging import ExpertStagingPool
+from atom.model_loader.expert_staging import ExpertStagingPool, _cpu_zeroable
 from atom.model_loader.loading_core import load_weights_into_model
 from atom.model_loader.weight_iterator import (
     _shard_tensor_names,
@@ -536,6 +536,41 @@ class StagingBufferAllocationTest(unittest.TestCase):
         self.assertEqual(staging.dtype, torch.uint8)
         self.assertEqual(staging.shape, param.data.shape)
         self.assertEqual(int(staging.sum()), 0, "staging buffer must be zeroed")
+
+    @unittest.skipUnless(hasattr(torch, "float4_e2m1fn_x2"), "torch has no fp4x2 dtype")
+    def test_packed_dtype_allocates_exactly_one_buffer(self):
+        """The doomed first allocation must not happen.
+
+        Finding the raw-byte fallback by allocating with the packed dtype and
+        letting `zero_` raise costs a full host allocation per parameter --
+        pinned host memory allocates at ~4 GB/s cold, and on DeepSeek-R1 MXFP4
+        every routed-expert parameter is packed. That discarded buffer
+        profiled as ~40% of the loader worker pool's time.
+        """
+        param = nn.Parameter(
+            torch.empty((4, self.NUMEL // 4), dtype=torch.float4_e2m1fn_x2),
+            requires_grad=False,
+        )
+        # The dtype probe allocates too, and is cached; warm it first so the
+        # count below sees only the staging allocation.
+        _cpu_zeroable(param.data.dtype)
+
+        dtypes_allocated = []
+        real_empty = torch.empty
+
+        def counting_empty(*args, **kwargs):
+            dtypes_allocated.append(kwargs.get("dtype"))
+            return real_empty(*args, **kwargs)
+
+        with unittest.mock.patch.object(torch, "empty", counting_empty):
+            staging = ExpertStagingPool._allocate_staging(param)
+
+        self.assertEqual(staging.dtype, torch.uint8)
+        self.assertEqual(
+            dtypes_allocated,
+            [torch.uint8],
+            "packed params must go straight to a raw-byte buffer",
+        )
 
 
 class DrafterSkipsUnwantedTensorsTest(unittest.TestCase):
