@@ -49,6 +49,12 @@ from transformers import Qwen3Config
 
 from atom.model_loader.loader import load_model_in_plugin_mode
 from atom.models.utils import maybe_prefix
+from atom.utils import envs
+
+
+ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = (
+    envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
+)
 
 
 class Qwen3Attention(nn.Module):
@@ -105,6 +111,18 @@ class Qwen3Attention(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
         )
+        if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
+            cos, sin = self.rotary_emb.cos_cache, self.rotary_emb.sin_cache
+            joint_cache = torch.cat((cos, sin), dim=-1)
+            self.rotary_emb.register_buffer(
+                "cos_sin_cache",
+                joint_cache.view(joint_cache.size(0), self.head_dim),
+                persistent=False,
+            )
+
+        self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+
         self.attn = Attention(
             num_heads=self.num_heads,
             head_dim=self.head_dim,
@@ -116,9 +134,9 @@ class Qwen3Attention(nn.Module):
             rotary_emb=self.rotary_emb,
             config=atom_config,
             prefix=f"{prefix}.attn",
+            q_norm=self.q_norm if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION else None,
+            k_norm=self.k_norm if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION else None,
         )
-        self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-        self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
     def forward(
         self,
@@ -129,10 +147,19 @@ class Qwen3Attention(nn.Module):
         qkv = self.qkv_proj(hidden_states)
         q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-
-        o = self.attn(q, k, v, positions, **model_kwargs)
+        if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
+            o = self.attn(
+                query=q,
+                key=k,
+                value=v,
+                positions=positions,
+                q_scale=None,
+                qkv=qkv,
+            )
+        else:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+            o = self.attn(q, k, v, positions, **model_kwargs)
         output = self.o_proj(o)
         return output
 
