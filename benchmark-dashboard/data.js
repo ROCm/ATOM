@@ -1,234 +1,8 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1785613371496,
+  "lastUpdate": 1785616593720,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
-      {
-        "commit": {
-          "author": {
-            "name": "ZhangLirong",
-            "username": "ZhangLirong-amd",
-            "email": "lirzhang@amd.com"
-          },
-          "committer": {
-            "name": "ZhangLirong-amd",
-            "username": "ZhangLirong-amd",
-            "email": "Lirong.Zhang@amd.com"
-          },
-          "id": "e6f577c4ea689029ba69d04727ba8b16c7ca4a30",
-          "message": "fix(scheduler): gate prefill on full batch to protect decode (#1437)\n\n* fix(scheduler): gate prefill on full batch to protect decode\n\nHold new prefills until the waiting queue can fill max_num_batched_tokens,\nelse keep decoding. Prevents fast 补发 from firing under-full prefills that\npreempt decode and drop it out of cudagraph. Tail-escape and pass-budget\nvalves avoid starvation.\n\n* style: black format\n\n* fix(scheduler): gate dense-batch prefill hold to DP>1 only\n\nThe prefill dense-batch gate only helps cross-DP rank alignment. Disable\nit when data_parallel_size<=1 so single-GPU/TP-only runs keep the legacy\nprefill-first behavior (no added TTFT).\n\n---------\n\nCo-authored-by: ZhangLirong-amd <ZhangLirong@amd.com>",
-          "timestamp": "2026-07-03T14:17:52Z",
-          "url": "https://github.com/ROCm/ATOM/commit/e6f577c4ea689029ba69d04727ba8b16c7ca4a30"
-        },
-        "date": 1783755329439,
-        "tool": "customBiggerIsBetter",
-        "benches": [
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DPA 1024/1024 c=1024 throughput (tok/s)",
-            "value": 12471.76,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29140635338 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607101554"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DPA 1024/1024 c=1024 Total Tput (tok/s)",
-            "value": 24942.78,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29140635338 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607101554"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DPA 1024/1024 c=1024 TTFT (ms)",
-            "value": 3467.35,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29140635338 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607101554"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DPA 1024/1024 c=1024 TPOT (ms)",
-            "value": 75.69,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29140635338 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607101554"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DPA 1024/1024 c=1024 _gpu_count",
-            "value": 8,
-            "unit": ""
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DPA 1024/1024 c=1024 _tp",
-            "value": 8,
-            "unit": ""
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DPA 8192/1024 c=1024 throughput (tok/s)",
-            "value": 4987.87,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29140635338 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607101554"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DPA 8192/1024 c=1024 Total Tput (tok/s)",
-            "value": 44881.66,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29140635338 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607101554"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DPA 8192/1024 c=1024 TTFT (ms)",
-            "value": 64451.68,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29140635338 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607101554"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DPA 8192/1024 c=1024 TPOT (ms)",
-            "value": 135.66,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29140635338 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607101554"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DPA 8192/1024 c=1024 _gpu_count",
-            "value": 8,
-            "unit": ""
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DPA 8192/1024 c=1024 _tp",
-            "value": 8,
-            "unit": ""
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 1024/1024 c=1024 throughput (tok/s)",
-            "value": 11995.43,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29140635338 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607101554"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 1024/1024 c=1024 Total Tput (tok/s)",
-            "value": 23987.81,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29140635338 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607101554"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 1024/1024 c=1024 TTFT (ms)",
-            "value": 4257.21,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29140635338 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607101554"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 1024/1024 c=1024 TPOT (ms)",
-            "value": 78.55,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29140635338 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607101554"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 1024/1024 c=1024 _gpu_count",
-            "value": 8,
-            "unit": ""
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 1024/1024 c=1024 _tp",
-            "value": 8,
-            "unit": ""
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=1024 throughput (tok/s)",
-            "value": 4970.82,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29140635338 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607101554"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=1024 Total Tput (tok/s)",
-            "value": 44684.67,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29140635338 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607101554"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=1024 TTFT (ms)",
-            "value": 12560.28,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29140635338 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607101554"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=1024 TPOT (ms)",
-            "value": 190.04,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29140635338 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607101554"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=1024 _gpu_count",
-            "value": 8,
-            "unit": ""
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=1024 _tp",
-            "value": 8,
-            "unit": ""
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DPA TBO 1024/1024 c=1024 throughput (tok/s)",
-            "value": 11393.05,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29140635338 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607101554"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DPA TBO 1024/1024 c=1024 Total Tput (tok/s)",
-            "value": 22785.43,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29140635338 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607101554"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DPA TBO 1024/1024 c=1024 TTFT (ms)",
-            "value": 10561.47,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29140635338 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607101554"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DPA TBO 1024/1024 c=1024 TPOT (ms)",
-            "value": 78.2,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29140635338 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607101554"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DPA TBO 1024/1024 c=1024 _gpu_count",
-            "value": 8,
-            "unit": ""
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DPA TBO 1024/1024 c=1024 _tp",
-            "value": 8,
-            "unit": ""
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DPA TBO 8192/1024 c=1024 throughput (tok/s)",
-            "value": 5530.91,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29140635338 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607101554"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DPA TBO 8192/1024 c=1024 Total Tput (tok/s)",
-            "value": 49767.94,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29140635338 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607101554"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DPA TBO 8192/1024 c=1024 TTFT (ms)",
-            "value": 45452.87,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29140635338 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607101554"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DPA TBO 8192/1024 c=1024 TPOT (ms)",
-            "value": 135.31,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29140635338 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202607101554"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DPA TBO 8192/1024 c=1024 _gpu_count",
-            "value": 8,
-            "unit": ""
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DPA TBO 8192/1024 c=1024 _tp",
-            "value": 8,
-            "unit": ""
-          }
-        ]
-      },
       {
         "commit": {
           "author": {
@@ -362558,6 +362332,202 @@ window.BENCHMARK_DATA = {
             "name": "ATOM-SGLang::Qwen3.5-35B-A3B-PTPC-FP8 MI308 8192/1024 c=64 _tp",
             "value": 1,
             "unit": ""
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Lingpeng Jin",
+            "username": "valarLip",
+            "email": "103567126+valarLip@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "767212315a4b6de0e951f9e4c36974e66cd47be1",
+          "message": "fix(engine): offline output thread dies on the first streamed token (#1768)\n\n* fix(engine): give both core managers one shared-state initialiser\n\n`DisaggCoreManager` spawns its engines differently and so cannot run\n`CoreManager.__init__`. It hand-copied the field block instead, and the copy\ndrifted: `_flush_stream_batch_fn` was added to the copy and to the API server\nthat assigns it, but never to the base class.\n\nNothing failed loudly. The server path assigns the hook before the first\nrequest and the disagg path had it from the copy, so only the offline\nentrypoint was left with neither. There the output thread raised\n\n    AttributeError: 'CoreManager' object has no attribute '_flush_stream_batch_fn'\n\non the first streamed token and died. The engine kept producing tokens that\nnobody collected, `simple_inference` blocked forever, and the nightly Docker\nsmoke test reported it a day later as a 60-minute step timeout.\n\nExtract `_init_shared_state()` and have both constructors call it, so there is\none place to add the next such field. Only `pp_*` (read solely by this class's\nspawn loop, and `DisaggCoreManager` overrides the one method that touches it)\nand the post-spawn tail stay per-class.\n\nThe tests pin the invariant rather than the single field: whatever\n`process_outputs_socket` reads off `self` -- discovered from the source, so a\nnewly added read is covered the day it lands -- both managers must provide.\n\n* test: import the real atom modules instead of hand-written stand-ins\n\n`tests/conftest.py` replaced `atom` and `atom.config` in `sys.modules` with\nhand-built module objects, so unit tests ran against a parallel API that\nnobody updated. It rotted: the stand-in lost `CompilationLevel`, and because\nthe modules that import it are guarded by a broad try/except that skips the\nwhole file, four test modules stopped running -- on every machine, not just\nCI -- while reporting a circular import that does not exist. One of them,\n`test_dspark_swa_fp8_2buff`, has two real tests that now run again.\n\nThe stand-ins existed because `import atom.config` was expensive: Python\nimports a package before its submodule, and `atom/__init__.py` eagerly\nimported `LLMEngine`, so reading a dataclass pulled in zmq, the model runner\nand AITER. Resolve `LLMEngine` on attribute access instead (PEP 562);\n`SamplingParams` and `prepare_model_for_sglang` stay eager, as both cost only\ndataclasses, logging and typing. `import atom.config` now loads no engine\nmodule at all, and `from atom import LLMEngine` is unchanged for callers.\n\nThat leaves AITER as the only thing a plain CPU runner lacks, and the config\nchain reaches exactly two of its attributes (`QuantType` and\n`utility.dtypes.d_dtypes`). Stub that -- an external boundary, conditionally,\nnext to the existing zmq and xxhash stubs -- and drop all four internal ones;\nthe `forward_context` and `custom_register` stand-ins turned out to be\nunnecessary too.\n\n* ci: run offline inference on the PR gate\n\nBoth the simple-inference step and its golden comparison were `if: false`, so\nthe offline entrypoint was exercised only by the nightly Docker release. That\nis how a bug that killed its output thread reached main: the accuracy test\ndrives the server over HTTP, and the two do not share the path that hands\ntokens back to the caller.\n\nEnable the inference step for every model in the matrix. Completing is the\nassertion -- the output is printed but not diffed, which is what the failure\nmode calls for (the bug hung, it did not produce wrong text) and what removes\nthe need for a per-model golden file. Only one such file was ever checked in,\nwhich is why the comparison was disabled wholesale when the matrix moved to\nmodels_accuracy.json; drop that step rather than leave it dead a second time.\n\nThe step timeout is what turns the hang this guards against into a failure\ninstead of a stuck runner.\n\n* refactor(config): drop the import-time AITER dependency, and every test stub\n\n`atom/config.py` reached AITER for two things: `QuantType.No` when a\ncheckpoint carries no quantization config, and one return annotation. Because\nPython imports a package before its submodule, that put a GPU kernel build\nbehind `import atom.<anything>` -- so the unit suite replaced `atom.config`\nwith a hand-written stand-in, which then drifted from the real class and\nsilently stopped four test modules from running anywhere.\n\n`atom.quant_spec` now resolves `QuantType` and `d_dtypes` on first use instead\nof at import. The handles return the genuine AITER objects, so values compare\nand behave exactly as before; only the lookup moves. Deferring the import is\nnot enough on its own -- three places evaluated those names while the module\nbody ran, and each had to move with it:\n\n  - the `LayerQuantConfig.quant_type` default (class creation) -> default_factory\n  - `_QSCHEME_TO_QUANT_TYPE` (module level) -> a cached function\n  - `GenericParser._QTYPE_PATTERNS` (class body) -> the same\n\n`config.py` then needs neither: the one runtime use has an exact equivalent in\n`LayerQuantConfig.no_quant()`, and the annotation moves under `TYPE_CHECKING`.\n\nWith that, `tests/conftest.py` fakes nothing at all. The zmq and xxhash stubs\nwent too -- both are declared dependencies in pyproject.toml, so their\n`find_spec(...) is None` guard could never fire.\n\n`test_quant_config.py` installed its AITER stand-ins only while it exec'd the\nmodule body, which no longer covers a first-use lookup; it now binds the\nhandles before dropping them. Deliberately not left in `sys.modules`: a\nlingering fake `aiter` satisfies `pytest.importorskip(\"aiter\")` in the other\ntest modules, and whether it did would depend on collection order.\n\nSimulating the CPU gate (aiter blocked at the meta-path):\n\n    before   839 passed, 16 skipped, 0 failed\n    after    846 passed, 14 skipped, 0 failed\n\nand on a GPU host, 895/6 -> 902/2. The 2 remaining failures\n(`test_mxfp4_moe_has_bias`) are pre-existing on main.\n\n* fix(ci): keep JSON in extraArgs intact for the simple-inference step\n\n`${{ matrix.extraArgs }}` was interpolated into a double-quoted\n`bash -lc \"…\"`, so the *host* shell stripped the inner quotes before the\ncontainer ever saw them: `--hf-overrides '{\"use_index_cache\": true}'` arrived\nas `'{use_index_cache: true}'`, which argparse rejects as JSON. Four of the 13\nPR-level models carry JSON there, and more of the full matrix do via\n--eplb-config, --dspark-config and --online_quant_config.\n\nPass it through an env var and pipe the command over stdin, which is what the\naccuracy step below already does for the same reason.\n\n* style: annotate GenericParser._DTYPE_PATTERNS as ClassVar\n\nRUF012. The dict is unchanged; moving _QTYPE_PATTERNS out from under it\nbrought it into the reviewdog diff context, which is what surfaced this.\n\n* fix(v4): import QuantType from aiter, not through atom.config\n\nMoving `QuantType` under `TYPE_CHECKING` in `atom/config.py` bound nothing at\nrun time, and `deepseek_v4.py` was the one module importing it *through* the\nconfig hub rather than from `aiter` directly:\n\n    ImportError: cannot import name 'QuantType' from 'atom.config'\n\nEvery other model file already does `from aiter import QuantType`, and this\none imports four other aiter modules anyway, so it matches them now.\n\nNothing caught this. `atom/models/*` needs the AITER build, so the CPU gate\nnever imports it, and a broken re-export surfaces only when someone loads that\nmodel on a GPU host. The new test closes that: it walks the tree for\n`from atom.config import X` and checks each name against what config.py binds\nat its top level -- `TYPE_CHECKING` blocks deliberately excluded, since that\nis the distinction that broke here. Pure AST, imports nothing, so it runs on\nthe gate that cannot import the modules it protects. It fails with\n`atom/models/deepseek_v4.py:52 imports 'QuantType'` against the broken tree.\n\n* Revert \"ci: run offline inference on the PR gate\" and its quoting fix\n\nWrong shape: it bolted simple_inference onto all 13 accuracy matrix jobs\nrather than guarding the docker-build path, which is where the smoke test\nthat actually caught the bug lives. Restores atom-test.yaml to main; the\nguard lands as its own job instead.\n\n* ci: smoke-test offline inference on every PR\n\nThe offline entrypoint was exercised only by the nightly Docker release, which\nruns it once after building the image. That is how a bug that killed its\noutput thread reached main: it surfaced a day later, as a 60-minute step\ntimeout. The accuracy matrix is not a substitute -- it drives the server over\nHTTP, and the two do not share the code that hands tokens back to the caller.\n\nA standalone job now runs `simple_inference` once, on\nMeta-Llama-3-8B-Instruct. It is deliberately outside `ci-gate`, which only\nopens on an approval or a ci:* label, so this really does run per PR; the\nmodel is the same one the nightly smoke test uses and the smallest in the\nmatrix.\n\nCompleting is the assertion -- the failure mode is a hang or a crash, not\nwrong text, so there is no golden file to maintain per model, and the step\ntimeout is what turns a hang into a failure instead of a stuck runner. One\nsmall model exercises this code path as well as thirteen would, and the job\nreuses the existing setup-gpu-container action rather than rebuilding the\nrelease image, which takes up to three hours.\n\n* ci: bound the smoke inference step at 15 minutes\n\nAn 8B model loads and answers a few prompts in a couple of minutes, and the\nfailure this step exists to catch is a hang. 15 minutes leaves ample headroom\nwhile keeping a hang from burning a GPU runner for half an hour.",
+          "timestamp": "2026-08-01T15:07:22Z",
+          "url": "https://github.com/ROCm/ATOM/commit/767212315a4b6de0e951f9e4c36974e66cd47be1"
+        },
+        "date": 1785616566499,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-FP4 TP4 accuracy (GSM8K)",
+            "value": 0.0038,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30707890267 | Threshold: 0.91 | BaselineModel: amd/DeepSeek-R1-0528-MXFP4-v2 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.15.post1-nightly_20260730 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.0 | fewshot: 3 | Model: /models/amd/DeepSeek-R1-0528-MXFP4-v2"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-FP4 TP4 DP4 EP4 accuracy (GSM8K)",
+            "value": 0.0068,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30707890267 | Threshold: 0.91 | BaselineModel: amd/DeepSeek-R1-0528-MXFP4-v2 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.15.post1-nightly_20260730 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.0 | fewshot: 3 | Model: /models/amd/DeepSeek-R1-0528-MXFP4-v2"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-FP4 TP8 accuracy (GSM8K)",
+            "value": 0.9386,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30707890267 | Threshold: 0.93 | BaselineModel: amd/DeepSeek-R1-0528-MXFP4-v2 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.15.post1-nightly_20260730 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9303 | fewshot: 3 | Model: /models/amd/DeepSeek-R1-0528-MXFP4-v2"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-FP4 TP8 DP8 EP8 accuracy (GSM8K)",
+            "value": 0.0099,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30707890267 | Threshold: 0.91 | BaselineModel: amd/DeepSeek-R1-0528-MXFP4-v2 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.15.post1-nightly_20260730 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.0 | fewshot: 3 | Model: /models/amd/DeepSeek-R1-0528-MXFP4-v2"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-FP4 TP8 MTP3 accuracy (GSM8K)",
+            "value": 0.9325,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30707890267 | Threshold: 0.93 | BaselineModel: amd/DeepSeek-R1-0528-MXFP4-v2 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.15.post1-nightly_20260730 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9287 | fewshot: 3 | Model: /models/amd/DeepSeek-R1-0528-MXFP4-v2"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-FP8 TP4 accuracy (GSM8K)",
+            "value": 0.0159,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30707890267 | Threshold: 0.91 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.15.post1-nightly_20260730 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.0 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-FP8 TP4 Online Quant accuracy (GSM8K)",
+            "value": 0.0061,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30707890267 | Threshold: 0.91 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: Online quant coverage based on the DeepSeek-R1-FP8 TP4 SGLang accuracy validation target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.15.post1-nightly_20260730 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.0 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-R1-FP8 TP8 accuracy (GSM8K)",
+            "value": 0.9454,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30707890267 | Threshold: 0.93 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.15.post1-nightly_20260730 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9424 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-V3.2-FP8 TP4 accuracy (GSM8K)",
+            "value": 0.9484,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30707890267 | Threshold: 0.9 | BaselineModel: deepseek-ai/DeepSeek-V3.2 | BaselineNote: Threshold aligned with SGLang plugin gsm8k validation for DeepSeek-V3.2 FP8 KV cache. | Docker: rocm/atom-dev:sglang-v0.5.15.post1-nightly_20260730 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9492 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V3.2"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-V3.2-FP8 TP4 DP4 EP4 accuracy (GSM8K)",
+            "value": 0.9439,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30707890267 | Threshold: 0.9 | BaselineModel: deepseek-ai/DeepSeek-V3.2 | BaselineNote: Threshold aligned with SGLang plugin gsm8k validation for DeepSeek-V3.2 FP8 KV cache with DP attention and EP4. | Docker: rocm/atom-dev:sglang-v0.5.15.post1-nightly_20260730 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9439 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V3.2"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-V3.2-FP8 TP8 accuracy (GSM8K)",
+            "value": 0.9484,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30707890267 | Threshold: 0.9 | BaselineModel: deepseek-ai/DeepSeek-V3.2 | BaselineNote: Threshold aligned with SGLang plugin gsm8k validation for DeepSeek-V3.2 FP8 KV cache. | Docker: rocm/atom-dev:sglang-v0.5.15.post1-nightly_20260730 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9484 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V3.2"
+          },
+          {
+            "name": "ATOM-SGLang::DeepSeek-V3.2-FP8 TP8 DP8 EP8 accuracy (GSM8K)",
+            "value": 0.9447,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30707890267 | Threshold: 0.9 | BaselineModel: deepseek-ai/DeepSeek-V3.2 | BaselineNote: Threshold aligned with SGLang plugin gsm8k validation for DeepSeek-V3.2 FP8 KV cache with TP8, DP attention, and EP8. | Docker: rocm/atom-dev:sglang-v0.5.15.post1-nightly_20260730 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9454 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V3.2"
+          },
+          {
+            "name": "ATOM-SGLang::GLM-5.2-FP8 TP4 accuracy (GSM8K)",
+            "value": 0.9393,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30707890267 | Threshold: 0.92 | BaselineModel: zai-org/GLM-5.2-FP8 | BaselineNote: 5-shot GSM8K local-completions coverage for GLM-5.2-FP8 IndexShare using the SGLang-ATOM recipe server command. | Docker: rocm/atom-dev:sglang-v0.5.15.post1-nightly_20260730 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9386 | fewshot: 5 | Model: /models/zai-org/GLM-5.2-FP8"
+          },
+          {
+            "name": "ATOM-SGLang::GLM-5.2-FP8 TP4 PCP2 accuracy (GSM8K)",
+            "value": 0.9424,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30707890267 | Threshold: 0.92 | BaselineModel: zai-org/GLM-5.2-FP8 | BaselineNote: GLM-5.2-FP8 SGLang world-size 4 with ATOM effective TP2 x PCP2; threshold follows the TP4 5-shot GSM8K baseline until PCP measurements are collected. | Docker: rocm/atom-dev:sglang-v0.5.15.post1-nightly_20260730 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9431 | fewshot: 5 | Model: /models/zai-org/GLM-5.2-FP8"
+          },
+          {
+            "name": "ATOM-SGLang::GLM-5.2-MXFP4 TP4 accuracy (GSM8K)",
+            "value": 0.928,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30707890267 | Threshold: 0.92 | BaselineModel: amd/GLM-5.2-MXFP4 | BaselineNote: 5-shot GSM8K local-completions coverage for GLM-5.2-MXFP4 IndexShare using the SGLang-ATOM recipe server command. | Docker: rocm/atom-dev:sglang-v0.5.15.post1-nightly_20260730 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9272 | fewshot: 5 | Model: /models/amd/GLM-5.2-MXFP4"
+          },
+          {
+            "name": "ATOM-SGLang::Kimi-K2.6-MXFP4 TP4 accuracy (GSM8K)",
+            "value": 0.9356,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30707890267 | Threshold: 0.91 | BaselineModel: amd/Kimi-K2.6-MXFP4 | BaselineNote: HF model card reports Kimi-K2.6-MXFP4 GSM8K flexible-extract=0.9325; threshold leaves headroom for SGLang CI noise. | Docker: rocm/atom-dev:sglang-v0.5.15.post1-nightly_20260730 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9356 | fewshot: 3 | Model: /models/amd/Kimi-K2.6-MXFP4"
+          },
+          {
+            "name": "ATOM-SGLang::Kimi-K2.6-MXFP4 TP8 accuracy (GSM8K)",
+            "value": 0.9363,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30707890267 | Threshold: 0.91 | BaselineModel: amd/Kimi-K2.6-MXFP4 | BaselineNote: TP8 coverage for the Kimi-K2.6-MXFP4 SGLang accuracy validation target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.15.post1-nightly_20260730 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9371 | fewshot: 3 | Model: /models/amd/Kimi-K2.6-MXFP4"
+          },
+          {
+            "name": "ATOM-SGLang::MI308 DeepSeek-V4-Flash accuracy (GSM8K)",
+            "value": 0.8317,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30707890267 | Threshold: 0.94 | BaselineModel: sgl-project/DeepSeek-V4-Flash-FP8 | BaselineNote: MI308 SGLang DeepSeek-V4-Flash coverage uses the FP8 checkpoint to avoid the MXFP4 MoE loading path on gfx942; refresh baseline after nightly measurements land. | Docker: rocm/atom-dev:sglang-v0.5.15.post1-nightly_20260730 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.7786 | fewshot: 5 | Model: /models/sgl-project/DeepSeek-V4-Flash-FP8"
+          },
+          {
+            "name": "ATOM-SGLang::MI308 GLM-5.2-FP8 TP8 accuracy (GSM8K)",
+            "value": 0.9477,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30707890267 | Threshold: 0.93 | BaselineModel: zai-org/GLM-5.2-FP8 | BaselineNote: 5-shot GSM8K local-completions coverage for GLM-5.2-FP8 IndexShare on MI308 using the SGLang-ATOM recipe server command. | Docker: rocm/atom-dev:sglang-v0.5.15.post1-nightly_20260730 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.9477 | fewshot: 5 | Model: /models/zai-org/GLM-5.2-FP8"
+          },
+          {
+            "name": "ATOM-SGLang::MI308 Qwen3-32B-FP8 TP8 accuracy (GSM8K)",
+            "value": 0.8764,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30707890267 | Threshold: 0.8 | BaselineModel: Qwen/Qwen3-32B-FP8 | BaselineNote: Adds max_gen_toks=1024 for the MI308 CI gsm8k path to avoid truncating Qwen3-32B reasoning output. | Docker: rocm/atom-dev:sglang-v0.5.15.post1-nightly_20260730 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.8954 | fewshot: 3 | Model: /models/Qwen/Qwen3-32B-FP8"
+          },
+          {
+            "name": "ATOM-SGLang::MI308 Qwen3.5-35B-A3B-FP8 TP1 accuracy (GSM8K)",
+            "value": 0.84,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30707890267 | Threshold: 0.76 | BaselineModel: Qwen/Qwen3.5-35B-A3B-FP8 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.15.post1-nightly_20260730 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.8249 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-35B-A3B-FP8"
+          },
+          {
+            "name": "ATOM-SGLang::MI308 Qwen3.5-35B-A3B-PTPC-FP8 TP1 accuracy (GSM8K)",
+            "value": 0.8484,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30707890267 | Threshold: 0.76 | BaselineModel: amd/Qwen3.5-35B-A3B-PTPC-FP8 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.15.post1-nightly_20260730 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.8347 | fewshot: 3 | Model: /models/amd/Qwen3.5-35B-A3B-PTPC-FP8"
+          },
+          {
+            "name": "ATOM-SGLang::MI308 Qwen3.5-397B-A17B-FP8 TP4 accuracy (GSM8K)",
+            "value": 0.8704,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30707890267 | Threshold: 0.83 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.15.post1-nightly_20260730 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.8552 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-397B-A17B-FP8"
+          },
+          {
+            "name": "ATOM-SGLang::MI308 Qwen3.5-397B-A17B-FP8 TP8 accuracy (GSM8K)",
+            "value": 0.865,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30707890267 | Threshold: 0.83 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.15.post1-nightly_20260730 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.8537 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-397B-A17B-FP8"
+          },
+          {
+            "name": "ATOM-SGLang::MiniMax-M3-MXFP4 TP4 accuracy (GSM8K)",
+            "value": 0.9363,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30707890267 | Threshold: 0.93 | BaselineModel: amd/MiniMax-M3-MXFP4 | BaselineNote: SGLang-ATOM MiniMax-M3-MXFP4 TP4 measured on GSM8K benchmark. | Docker: rocm/atom-dev:sglang-v0.5.15.post1-nightly_20260730 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9371 | fewshot: 5 | Model: /models/amd/MiniMax-M3-MXFP4"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B TP2 accuracy (GSM8K)",
+            "value": 0.8719,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30707890267 | Threshold: 0.83 | BaselineModel: Qwen/Qwen3.5-35B-A3B | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.15.post1-nightly_20260730 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.856 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-35B-A3B"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-35B-A3B-FP8 TP2 accuracy (GSM8K)",
+            "value": 0.8127,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30707890267 | Threshold: 0.76 | BaselineModel: Qwen/Qwen3.5-35B-A3B-FP8 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.15.post1-nightly_20260730 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.8014 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-35B-A3B-FP8"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 TP4 accuracy (GSM8K)",
+            "value": 0.862,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30707890267 | Threshold: 0.83 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.15.post1-nightly_20260730 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.8453 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-397B-A17B-FP8"
+          },
+          {
+            "name": "ATOM-SGLang::Qwen3.5-397B-A17B-FP8 TP8 accuracy (GSM8K)",
+            "value": 0.8764,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30707890267 | Threshold: 0.83 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.15.post1-nightly_20260730 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.859 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-397B-A17B-FP8"
           }
         ]
       }
