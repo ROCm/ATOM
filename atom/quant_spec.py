@@ -19,7 +19,7 @@ import importlib
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 
@@ -339,7 +339,7 @@ class GenericParser(QuantConfigParser):
     """Fallback parser that uses heuristics for compressed-tensors, etc."""
 
     # Regex patterns for identifying quantization types from config keys/values
-    _DTYPE_PATTERNS = {
+    _DTYPE_PATTERNS: ClassVar[dict[str, str]] = {
         r"fp8|float8": "fp8",
         r"fp4|float4|mxfp4": "fp4x2",
         r"int8|w8a8": "int8",
