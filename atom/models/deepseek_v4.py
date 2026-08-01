@@ -100,11 +100,13 @@ from atom.model_ops.v4_kernels import (
     FP4_MQA_BLOCK_K,
     FP4_MQA_PARALLEL_UNIT_NUM,
     CompressPlan,
+    capture_compressor_boundary,
     csa_translate_pack,
     fp4_indexer_enabled,
     fused_compress_attn,
     inverse_rope_inplace,
     qk_norm_rope_maybe_quant,
+    restore_compressor_boundary,
     scale_indexer_weights,
     sparse_attn_v4_paged_decode,
     sparse_attn_v4_paged_prefill,
@@ -1159,6 +1161,22 @@ class Compressor(nn.Module):
             scatter_kv_cache = self.kv_cache
             scatter_block_tables = block_tables
             scatter_kv_cache_rope = self.kv_cache_rope if main_2buff_fp8 else None
+        # CSA prefix-state restore (native prefix cache, no arena): before the
+        # fused kernel reads the ring, reseed the last `tail` rows at the hit
+        # boundary from the terminal cached block's snapshot (indexed by physical
+        # SWA page). No-op unless the feature is on (_csa_owner set) and this fwd
+        # carries a restore plan (only the first suffix chunk of a prefix hit).
+        # Runs BEFORE fused so the B-side overlap is exact, not a fresh zero/-inf
+        # ring. Order mirrors update_compressor_states being AFTER fused.
+        _csa_owner = getattr(self, "_csa_owner", None)
+        if _csa_owner is not None and plan.restore_boundary_plan_gpu is not None:
+            restore_compressor_boundary(
+                self.boundary_kv,
+                self.boundary_score,
+                self.kv_state,
+                self.score_state,
+                restore_plan=plan.restore_boundary_plan_gpu,
+            )
         fused_compress_attn(
             kv_in=kv,
             score_in=score,
@@ -1209,6 +1227,29 @@ class Compressor(nn.Module):
             overlap=overlap,
             prefix=f"{self.prefix}.update_compressor_states",
         )
+        # CSA prefix-state capture: after the ring is committed for this fwd,
+        # snapshot the last `tail` ring rows of each finalized block into the
+        # boundary pool, keyed by the block's physical SWA page
+        # (plan.csa_page_tables_gpu == the staged swa_block_tables). The score
+        # snapshot fuses +ape to match the live ring bit-for-bit. No-op unless the
+        # feature is on and this prefill produced boundary rows; skipped during
+        # warmup (block_tables None).
+        if (
+            _csa_owner is not None
+            and block_tables is not None
+            and plan.capture_boundary_plan_gpu is not None
+        ):
+            capture_compressor_boundary(
+                kv,
+                score,
+                self.ape,
+                self.boundary_kv,
+                self.boundary_score,
+                capture_plan=plan.capture_boundary_plan_gpu,
+                block_tables=plan.csa_page_tables_gpu,
+                block_size=_V4_BLOCK_SIZE,
+                ratio=ratio,
+            )
 
 
 class Indexer(nn.Module):

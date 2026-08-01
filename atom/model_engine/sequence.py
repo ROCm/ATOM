@@ -97,6 +97,11 @@ class Sequence:
         # -1 = unallocated. The slot indexes into the per-req cache tensors
         # owned by ModelRunner (e.g. mamba_k_cache for GDN).
         self.per_req_cache_group = -1
+        # DeepSeek-V4 CSA prefix-state cache: physical SWA page of the terminal
+        # cached block on a prefix hit (the boundary snapshot source). -1 = no
+        # restore this fwd. One-shot: set at allocate(), consumed by the first
+        # suffix forward, cleared to -1 in scheduler.postprocess().
+        self.csa_boundary_state_block_id = -1
         self.temperature = sampling_params.temperature
         self.top_k = sampling_params.top_k
         self.top_p = sampling_params.top_p

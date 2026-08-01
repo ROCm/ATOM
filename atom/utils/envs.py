@@ -101,6 +101,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Pairs with a larger SWA pool (swa_pool_num_blocks) so freed-but-cached
     # blocks survive until replay. Costs ~compressed-pool-magnitude SWA memory.
     "ATOM_SWA_FULL_RETAIN": lambda: (os.getenv("ATOM_SWA_FULL_RETAIN", "0") == "1"),
+    # DeepSeek-V4 CSA prefix-state cache (native prefix cache, no arena): on a
+    # prefix hit, restore the CSA compressor ring's boundary state (last `ratio`
+    # rows before the hit boundary) from a snapshot instead of recomputing it.
+    # The snapshot rides the SWA block's physical page (captured every prefill,
+    # restored on the first suffix chunk), so it needs SWA retention
+    # (ATOM_SWA_FULL_RETAIN=1 or ATOM_SWA_RETENTION_INTERVAL>0) for the source
+    # block to survive to the next request. Default 0 (recompute, unchanged).
+    "ATOM_V4_CSA_PREFIX_STATE_CACHE": lambda: (
+        os.getenv("ATOM_V4_CSA_PREFIX_STATE_CACHE", "0") == "1"
+    ),
     # DeepSeek-V4 paged-SWA full-retain: fraction of the KV budget given to the
     # SWA tail pool (the rest goes to the compressed pool). One SWA block is ~7x
     # the bytes of one compressed block, so a 1:1 mirror starves the compressed

@@ -63,6 +63,19 @@ class CompressPlan:
     # `indexer_k_quant_and_cache`. None for empty fwds.
     compress_plan_cpu: np.ndarray | None = None  # [num_compress, 4] int32 or None
 
+    # ---- CSA prefix-state boundary snapshot (ratio-4 plan only; None otherwise).
+    # capture: snapshot the last `tail` ring rows of each finalized block into the
+    #   boundary pool, keyed by the terminal block's physical SWA page
+    #   (`csa_page_tables_gpu`, == the staged swa_block_tables). Built every prefill.
+    # restore: on a prefix hit, reseed the fresh ring from the terminal cached
+    #   block's snapshot. Built only for seqs with a live source. Both main and the
+    #   indexer-inner compressor share these plans / page table; they differ only
+    #   in the per-module boundary_{kv,score} tensors.
+    capture_boundary_plan_gpu: torch.Tensor | None = None  # [num_capture, 4] int32
+    num_capture_boundary: int = 0
+    csa_page_tables_gpu: torch.Tensor | None = None  # [bs, max_blocks] physical SWA
+    restore_boundary_plan_gpu: torch.Tensor | None = None  # [num_restore, 4] int32
+
 
 def make_compress_plans(
     extend_lens_cpu: np.ndarray,
@@ -285,3 +298,89 @@ def make_compress_plans(
             compress_plan_cpu=compress_plan if n_compress > 0 else None,
         )
     return out
+
+
+def make_capture_boundary_plan(
+    extend_lens_cpu: np.ndarray,
+    context_lens_cpu: np.ndarray,
+    *,
+    block_size: int,
+    device,
+    tail: int = 4,
+) -> Tuple[torch.Tensor, int]:
+    """Build the CSA boundary-capture plan for one prefill fwd.
+
+    Selects every extend token whose absolute position is in the last ``tail``
+    slots of its KV block (``position % block_size >= block_size - tail``) — the
+    B-4..B-1 rows the terminal-block snapshot needs. Row layout matches the
+    capture kernel: ``(ragged_id, batch_id, position, -1)``.
+
+    Args mirror ``make_compress_plans`` (per-seq extend/context lengths); the
+    per-token position/batch/ragged arrays are reconstructed the same way.
+
+    Returns ``(plan_gpu [num_capture, 4] int32, num_capture)``. Empty fwds give a
+    ``[0, 4]`` tensor.
+    """
+    extend_lens_cpu = np.ascontiguousarray(extend_lens_cpu, dtype=np.int32)
+    context_lens_cpu = np.ascontiguousarray(context_lens_cpu, dtype=np.int32)
+    bs = len(extend_lens_cpu)
+    total = int(extend_lens_cpu.sum())
+    if total == 0 or bs == 0:
+        return torch.zeros((0, 4), dtype=torch.int32, device=device), 0
+    batch_ids = np.repeat(np.arange(bs, dtype=np.int32), extend_lens_cpu)
+    ragged_ids = np.arange(total, dtype=np.int32)
+    cu_extend = np.empty(bs + 1, dtype=np.int32)
+    cu_extend[0] = 0
+    np.cumsum(extend_lens_cpu, out=cu_extend[1:])
+    prefix_lens = context_lens_cpu - extend_lens_cpu
+    positions = prefix_lens[batch_ids] + (ragged_ids - cu_extend[batch_ids])
+    mask = (positions % block_size) >= (block_size - tail)
+    n = int(mask.sum())
+    if n == 0:
+        return torch.zeros((0, 4), dtype=torch.int32, device=device), 0
+    rows = np.stack(
+        [
+            ragged_ids[mask],
+            batch_ids[mask],
+            positions[mask],
+            np.full(n, -1, dtype=np.int32),
+        ],
+        axis=1,
+    ).astype(np.int32)
+    return torch.from_numpy(rows).to(device, non_blocking=True), n
+
+
+def make_restore_boundary_plan(
+    source_block_ids: np.ndarray,
+    state_slots: np.ndarray,
+    boundary_lens: np.ndarray,
+    *,
+    device,
+) -> Tuple[torch.Tensor, int]:
+    """Build the CSA boundary-restore plan for one prefill fwd.
+
+    One row per sequence with a live snapshot source (``source_block_id >= 0``):
+    ``(source_phys_block, state_slot, boundary_B, -1)``. ``boundary_B`` is the
+    128-aligned hit boundary (= that seq's cached-token count / prefix length).
+    Sequences without a source are dropped (not sentinel-padded — prefill is
+    eager, so a tight grid is fine).
+
+    Returns ``(plan_gpu [num_restore, 4] int32, num_restore)``.
+    """
+    source_block_ids = np.ascontiguousarray(source_block_ids, dtype=np.int32)
+    state_slots = np.ascontiguousarray(state_slots, dtype=np.int32)
+    boundary_lens = np.ascontiguousarray(boundary_lens, dtype=np.int32)
+    keep = source_block_ids >= 0
+    n = int(keep.sum())
+    if n == 0:
+        return torch.zeros((0, 4), dtype=torch.int32, device=device), 0
+    rows = np.stack(
+        [
+            source_block_ids[keep],
+            state_slots[keep],
+            boundary_lens[keep],
+            np.full(n, -1, dtype=np.int32),
+        ],
+        axis=1,
+    ).astype(np.int32)
+    return torch.from_numpy(rows).to(device, non_blocking=True), n
