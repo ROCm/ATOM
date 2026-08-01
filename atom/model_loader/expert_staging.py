@@ -70,7 +70,10 @@ class StagingEntry:
     """One in-flight fused parameter's staging buffer and its filled regions."""
 
     param: torch.nn.Parameter
-    staging: torch.Tensor
+    # None until the first arrival materializes it: the entry is published
+    # before its buffer exists so concurrent first-arrivals for one parameter
+    # share one allocation. See `ExpertStagingPool._ensure_staging`.
+    staging: torch.Tensor | None
     moe: Any
     expected: int
     name: str
@@ -113,13 +116,10 @@ class ExpertStagingPool:
         self._batchable: dict[int, bool] = {}
         # Staging-allocation accounting, reported once at flush time. Pinning
         # host memory runs at ~4 GB/s, so a buffer built and then dropped is
-        # not free; `_discarded_*` is how much of that the allocation race
-        # costs, which is deliberately tolerated (see `_get_or_create_entry`).
+        # not free -- these counts are how that would show up.
         self._alloc_count = 0
         self._alloc_bytes = 0
         self._alloc_seconds = 0.0
-        self._discarded_count = 0
-        self._discarded_bytes = 0
 
     def is_batchable(self, param: torch.nn.Parameter, full_param_name: str) -> bool:
         """Whether arrivals for this parameter should go through the pool."""
@@ -186,6 +186,9 @@ class ExpertStagingPool:
                 )
                 return
 
+        # An entry read straight from the table may have been published by
+        # another thread that has not finished allocating its buffer yet.
+        self._ensure_staging(entry)
         staged = moe.stage_expert_weight(
             param=param,
             staging=entry.staging,
@@ -226,7 +229,9 @@ class ExpertStagingPool:
         with self._lock:
             self._declined.add(pid)
             entry = self._entries.pop(pid, None)
-        if entry is not None:
+        # `staging is None` means the entry was published but no arrival ever
+        # materialized its buffer, so there is nothing staged to write back.
+        if entry is not None and entry.staging is not None:
             with entry.lock:
                 entry.moe.flush_staged(param, entry.staging, entry.filled)
 
@@ -243,16 +248,16 @@ class ExpertStagingPool:
         report = StagingReport()
         for entry in pending:
             with entry.lock:
-                entry.moe.flush_staged(entry.param, entry.staging, entry.filled)
+                if entry.staging is not None:
+                    entry.moe.flush_staged(entry.param, entry.staging, entry.filled)
                 report.incomplete.append(entry.missing_description())
+        # One allocation per batched parameter is the floor. A count above it
+        # means buffers are being built and dropped again.
         logger.info(
-            "Staging buffers: %d allocated (%.1f GiB, %.2fs pinning), "
-            "%d dropped to allocation races (%.1f GiB)",
+            "Staging buffers: %d allocated (%.1f GiB, %.2fs pinning)",
             self._alloc_count,
             self._alloc_bytes / 1024**3,
             self._alloc_seconds,
-            self._discarded_count,
-            self._discarded_bytes / 1024**3,
         )
         return report
 
@@ -260,36 +265,53 @@ class ExpertStagingPool:
 
     def _get_or_create_entry(self, param, moe, name: str) -> StagingEntry | None:
         pid = id(param)
-        # Allocate outside the lock, and speculatively: concurrent first
-        # arrivals for one parameter each build a buffer and all but one are
-        # dropped, which looks wasteful and is -- 341 of 573 buffers on
-        # DeepSeek-R1 MXFP4. Publishing the entry first and letting one thread
-        # allocate while the others wait removes that waste and measured
-        # *worse*: it idles fifteen workers at every new parameter, and on a
-        # cold cache those workers are what keeps the device busy (cold load
-        # 154s -> 183s). Wasted host bandwidth is the cheaper of the two.
-        t0 = time.perf_counter()
-        staging = self._allocate_staging(param)
-        alloc_seconds = time.perf_counter() - t0
-        candidate = StagingEntry(
-            param=param,
-            staging=staging,
-            moe=moe,
-            expected=moe.expected_batched_arrivals(param),
-            name=name,
-        )
-        nbytes = staging.numel() * staging.element_size()
         with self._lock:
-            self._alloc_count += 1
-            self._alloc_bytes += nbytes
-            self._alloc_seconds += alloc_seconds
             if pid in self._declined:
                 return None
-            winner = self._entries.setdefault(pid, candidate)
-            if winner is not candidate:
-                self._discarded_count += 1
-                self._discarded_bytes += nbytes
-            return winner
+            entry = self._entries.get(pid)
+            if entry is None:
+                entry = StagingEntry(
+                    param=param,
+                    staging=None,
+                    moe=moe,
+                    expected=moe.expected_batched_arrivals(param),
+                    name=name,
+                )
+                self._entries[pid] = entry
+        self._ensure_staging(entry)
+        return entry
+
+    def _ensure_staging(self, entry: StagingEntry) -> None:
+        """Materialize `entry`'s buffer once, whichever thread gets here first.
+
+        The alternative -- allocate first, publish second -- lets every
+        concurrent first-arrival for one parameter build a parameter-sized
+        pinned buffer so that one of them can be kept (341 of 573 buffers on
+        DeepSeek-R1 MXFP4). Waiting here instead idles the other workers for
+        the length of one allocation, which is only the better trade while
+        something else is keeping the device fed: with `ATOM_LOADER_PREFETCH`
+        off, those idle workers were the ones driving the cold read and the
+        load went 154s -> 183s. With prefetch on -- the default -- the reader
+        owns that job and this is worth ~5s of warm load.
+
+        Deliberately outside the pool lock: pinning host memory runs at
+        ~4 GB/s, so holding the pool lock across it would serialize every layer
+        against every other. The entry's own lock only orders the threads that
+        want this one parameter.
+        """
+        if entry.staging is not None:
+            return
+        with entry.lock:
+            if entry.staging is not None:
+                return
+            t0 = time.perf_counter()
+            staging = self._allocate_staging(entry.param)
+            elapsed = time.perf_counter() - t0
+            entry.staging = staging
+        with self._lock:
+            self._alloc_count += 1
+            self._alloc_bytes += staging.numel() * staging.element_size()
+            self._alloc_seconds += elapsed
 
     @staticmethod
     def _allocate_staging(param: torch.nn.Parameter) -> torch.Tensor:
