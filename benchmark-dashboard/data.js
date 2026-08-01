@@ -1,171 +1,8 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1785604442676,
+  "lastUpdate": 1785605242709,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
-      {
-        "commit": {
-          "author": {
-            "email": "Perry.Zhang@amd.com",
-            "name": "PerryZhang01",
-            "username": "PerryZhang01"
-          },
-          "committer": {
-            "email": "noreply@github.com",
-            "name": "GitHub",
-            "username": "web-flow"
-          },
-          "distinct": true,
-          "id": "79d5a9c5903fc74d99a66d5ae4edaaa4a6a6a337",
-          "message": "[fix](acc): fix gpt-oss tp8 accuracy (#1521)\n\nCo-authored-by: perzhang <perzhang@amd.com>",
-          "timestamp": "2026-07-11T12:05:06+08:00",
-          "tree_id": "5bbb8d1169407629093fe5eb4d14d7234e7f1921",
-          "url": "https://github.com/ROCm/ATOM/commit/79d5a9c5903fc74d99a66d5ae4edaaa4a6a6a337"
-        },
-        "date": 1783747422160,
-        "tool": "customBiggerIsBetter",
-        "benches": [
-          {
-            "name": "ATOM::DeepSeek-R1-0528 MTP accuracy (GSM8K)",
-            "value": 0.9462,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29139039080 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: Same base model as DeepSeek-R1-0528 FP8 | Docker: rocm/atom-dev:nightly_202607101554 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9439 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
-          },
-          {
-            "name": "ATOM::DeepSeek-R1-0528 MTP MTP acceptance (%)",
-            "value": 64.27,
-            "unit": "%",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29139039080 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: Same base model as DeepSeek-R1-0528 FP8 | Docker: rocm/atom-dev:nightly_202607101554 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9439 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
-          },
-          {
-            "name": "ATOM::DeepSeek-R1-0528 MTP avg toks/fwd (tok/fwd)",
-            "value": 2.93,
-            "unit": "tok/fwd"
-          },
-          {
-            "name": "ATOM::DeepSeek-R1-0528-FP4 accuracy (GSM8K)",
-            "value": 0.9431,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29139039080 | Threshold: 0.93 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (deepseek-ai/DeepSeek-R1-0528 is natively FP8) | Docker: rocm/atom-dev:nightly_202607101554 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9356 | fewshot: 3 | Model: /models/amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4"
-          },
-          {
-            "name": "ATOM::DeepSeek-R1-0528-FP4 MTP accuracy (GSM8K)",
-            "value": 0.9356,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29139039080 | Threshold: 0.93 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (deepseek-ai/DeepSeek-R1-0528 is natively FP8) | Docker: rocm/atom-dev:nightly_202607101554 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.931 | fewshot: 3 | Model: /models/amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4"
-          },
-          {
-            "name": "ATOM::DeepSeek-R1-0528-FP4 MTP MTP acceptance (%)",
-            "value": 35.97,
-            "unit": "%",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29139039080 | Threshold: 0.93 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (deepseek-ai/DeepSeek-R1-0528 is natively FP8) | Docker: rocm/atom-dev:nightly_202607101554 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.931 | fewshot: 3 | Model: /models/amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4"
-          },
-          {
-            "name": "ATOM::DeepSeek-R1-0528-FP4 MTP avg toks/fwd (tok/fwd)",
-            "value": 2.08,
-            "unit": "tok/fwd"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro accuracy (GSM8K)",
-            "value": 0.9538,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29139039080 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Full-eval (1319 samples) 3-shot flexible-extract = 0.9522 ± 0.0059 | Docker: rocm/atom-dev:nightly_202607101554 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.953 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro MTP accuracy (GSM8K)",
-            "value": 0.953,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29139039080 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202607101554 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9538 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro MTP MTP acceptance (%)",
-            "value": 64.57,
-            "unit": "%",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29139039080 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202607101554 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9538 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro MTP avg toks/fwd (tok/fwd)",
-            "value": 2.94,
-            "unit": "tok/fwd"
-          },
-          {
-            "name": "ATOM::Kimi-K2.7-Code-MXFP4 accuracy (GSM8K)",
-            "value": 0.9477,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29139039080 | Threshold: 0.92 | Baseline: 0.9409 | BaselineModel: moonshotai/Kimi-K2.7-Code | BaselineNote: Kimi-K2.7-Code-MXFP4 native ATOM coverage; threshold inherited from Kimi-K2.5-MXFP4 until CI baseline is refreshed. | Docker: rocm/atom-dev:nightly_202607101554 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9469 | fewshot: 3 | Model: /models/amd/Kimi-K2.7-Code-MXFP4"
-          },
-          {
-            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4-Preview accuracy (GSM8K)",
-            "value": 0.9151,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29139039080 | Threshold: 0.88 | Baseline: 0.9 | BaselineModel: meta-llama/Llama-3.3-70B-Instruct | BaselineNote: HF page inaccessible; needs CI measurement of baseline | Docker: rocm/atom-dev:nightly_202607101554 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.6422 | fewshot: 3 | Model: /models/amd/Llama-3.3-70B-Instruct-MXFP4-Preview"
-          },
-          {
-            "name": "ATOM::Meta-Llama-3-8B-Instruct accuracy (GSM8K)",
-            "value": 0.74,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29139039080 | Threshold: 0.73 | Baseline: 0.75 | BaselineModel: meta-llama/Meta-Llama-3-8B-Instruct | BaselineNote: HF reports 0.796 but 8-shot CoT; CI uses 3-shot, not comparable | Docker: rocm/atom-dev:nightly_202607101554 | GPU: AMD Instinct MI355X | VRAM: 252GB | ROCm: 7.2.4 | strict-match: 0.74 | fewshot: 3 | Model: /models/meta-llama/Meta-Llama-3-8B-Instruct"
-          },
-          {
-            "name": "ATOM::MiniMax-M3-MXFP4 accuracy (GSM8K)",
-            "value": 0.953,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29139039080 | Threshold: 0.93 | Baseline: 0.9363 | BaselineModel: amd/MiniMax-M3-MXFP4 | BaselineNote: FP4 M3 tp8. GSM8K 5-shot chat (apply_chat_template + fewshot_as_multiturn, num_concurrent=32, max_gen_toks=16384) | Docker: rocm/atom-dev:nightly_202607101554 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9538 | fewshot: 5 | Model: /models/amd/MiniMax-M3-MXFP4"
-          },
-          {
-            "name": "ATOM::Qwen3-235B-A22B-Instruct-2507-FP8 accuracy (GSM8K)",
-            "value": 0.903,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29139039080 | Threshold: 0.87 | Baseline: 0.909 | BaselineModel: Qwen/Qwen3-235B-A22B-Instruct-2507 | BaselineNote: HF: amd/Qwen3-235B-A22B-Instruct-2507-MXFP4 card shows baseline=0.909 | Docker: rocm/atom-dev:nightly_202607101554 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.8779 | fewshot: 3 | Model: /models/Qwen/Qwen3-235B-A22B-Instruct-2507-FP8"
-          },
-          {
-            "name": "ATOM::Qwen3-Next-80B-A3B-Thinking accuracy (GSM8K)",
-            "value": 0.7005,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29139039080 | Threshold: 0.65 | Baseline: 0.69 | BaselineModel: Qwen/Qwen3-Next-80B-A3B-Thinking | BaselineNote: No public GSM8K baseline; HF card has no GSM8K | Docker: rocm/atom-dev:nightly_202607101554 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.8036 | fewshot: 3 | Model: /models/Qwen/Qwen3-Next-80B-A3B-Thinking"
-          },
-          {
-            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP accuracy (GSM8K)",
-            "value": 0.8704,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29139039080 | Threshold: 0.85 | Baseline: 0.9538 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: Same base model as Qwen3.5-397B-A17B-FP8; MTP3 | Docker: rocm/atom-dev:nightly_202607101554 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.8544 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-397B-A17B-FP8"
-          },
-          {
-            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP MTP acceptance (%)",
-            "value": 84.77,
-            "unit": "%",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29139039080 | Threshold: 0.85 | Baseline: 0.9538 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: Same base model as Qwen3.5-397B-A17B-FP8; MTP3 | Docker: rocm/atom-dev:nightly_202607101554 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.8544 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-397B-A17B-FP8"
-          },
-          {
-            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP avg toks/fwd (tok/fwd)",
-            "value": 3.54,
-            "unit": "tok/fwd"
-          },
-          {
-            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 MTP accuracy (GSM8K)",
-            "value": 0.8469,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29139039080 | Threshold: 0.835 | Baseline: 0.9538 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: CI baseline=0.8605. HF card reports 0.9538 but uses chat API with reasoning_parser | Docker: rocm/atom-dev:nightly_202607101554 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.8355 | fewshot: 3 | Model: /models/amd/Qwen3.5-397B-A17B-MXFP4"
-          },
-          {
-            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 MTP MTP acceptance (%)",
-            "value": 84.54,
-            "unit": "%",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29139039080 | Threshold: 0.835 | Baseline: 0.9538 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: CI baseline=0.8605. HF card reports 0.9538 but uses chat API with reasoning_parser | Docker: rocm/atom-dev:nightly_202607101554 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.8355 | fewshot: 3 | Model: /models/amd/Qwen3.5-397B-A17B-MXFP4"
-          },
-          {
-            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 MTP avg toks/fwd (tok/fwd)",
-            "value": 3.54,
-            "unit": "tok/fwd"
-          },
-          {
-            "name": "ATOM::gpt-oss-120b accuracy (GSM8K)",
-            "value": 0.8832,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29139039080 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202607101554 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.3798 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
-          }
-        ]
-      },
       {
         "commit": {
           "author": {
@@ -360075,6 +359912,2374 @@ window.BENCHMARK_DATA = {
             "value": 0.8749,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30708009463 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202608011517 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.3624 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Lingpeng Jin",
+            "username": "valarLip",
+            "email": "103567126+valarLip@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "767212315a4b6de0e951f9e4c36974e66cd47be1",
+          "message": "fix(engine): offline output thread dies on the first streamed token (#1768)\n\n* fix(engine): give both core managers one shared-state initialiser\n\n`DisaggCoreManager` spawns its engines differently and so cannot run\n`CoreManager.__init__`. It hand-copied the field block instead, and the copy\ndrifted: `_flush_stream_batch_fn` was added to the copy and to the API server\nthat assigns it, but never to the base class.\n\nNothing failed loudly. The server path assigns the hook before the first\nrequest and the disagg path had it from the copy, so only the offline\nentrypoint was left with neither. There the output thread raised\n\n    AttributeError: 'CoreManager' object has no attribute '_flush_stream_batch_fn'\n\non the first streamed token and died. The engine kept producing tokens that\nnobody collected, `simple_inference` blocked forever, and the nightly Docker\nsmoke test reported it a day later as a 60-minute step timeout.\n\nExtract `_init_shared_state()` and have both constructors call it, so there is\none place to add the next such field. Only `pp_*` (read solely by this class's\nspawn loop, and `DisaggCoreManager` overrides the one method that touches it)\nand the post-spawn tail stay per-class.\n\nThe tests pin the invariant rather than the single field: whatever\n`process_outputs_socket` reads off `self` -- discovered from the source, so a\nnewly added read is covered the day it lands -- both managers must provide.\n\n* test: import the real atom modules instead of hand-written stand-ins\n\n`tests/conftest.py` replaced `atom` and `atom.config` in `sys.modules` with\nhand-built module objects, so unit tests ran against a parallel API that\nnobody updated. It rotted: the stand-in lost `CompilationLevel`, and because\nthe modules that import it are guarded by a broad try/except that skips the\nwhole file, four test modules stopped running -- on every machine, not just\nCI -- while reporting a circular import that does not exist. One of them,\n`test_dspark_swa_fp8_2buff`, has two real tests that now run again.\n\nThe stand-ins existed because `import atom.config` was expensive: Python\nimports a package before its submodule, and `atom/__init__.py` eagerly\nimported `LLMEngine`, so reading a dataclass pulled in zmq, the model runner\nand AITER. Resolve `LLMEngine` on attribute access instead (PEP 562);\n`SamplingParams` and `prepare_model_for_sglang` stay eager, as both cost only\ndataclasses, logging and typing. `import atom.config` now loads no engine\nmodule at all, and `from atom import LLMEngine` is unchanged for callers.\n\nThat leaves AITER as the only thing a plain CPU runner lacks, and the config\nchain reaches exactly two of its attributes (`QuantType` and\n`utility.dtypes.d_dtypes`). Stub that -- an external boundary, conditionally,\nnext to the existing zmq and xxhash stubs -- and drop all four internal ones;\nthe `forward_context` and `custom_register` stand-ins turned out to be\nunnecessary too.\n\n* ci: run offline inference on the PR gate\n\nBoth the simple-inference step and its golden comparison were `if: false`, so\nthe offline entrypoint was exercised only by the nightly Docker release. That\nis how a bug that killed its output thread reached main: the accuracy test\ndrives the server over HTTP, and the two do not share the path that hands\ntokens back to the caller.\n\nEnable the inference step for every model in the matrix. Completing is the\nassertion -- the output is printed but not diffed, which is what the failure\nmode calls for (the bug hung, it did not produce wrong text) and what removes\nthe need for a per-model golden file. Only one such file was ever checked in,\nwhich is why the comparison was disabled wholesale when the matrix moved to\nmodels_accuracy.json; drop that step rather than leave it dead a second time.\n\nThe step timeout is what turns the hang this guards against into a failure\ninstead of a stuck runner.\n\n* refactor(config): drop the import-time AITER dependency, and every test stub\n\n`atom/config.py` reached AITER for two things: `QuantType.No` when a\ncheckpoint carries no quantization config, and one return annotation. Because\nPython imports a package before its submodule, that put a GPU kernel build\nbehind `import atom.<anything>` -- so the unit suite replaced `atom.config`\nwith a hand-written stand-in, which then drifted from the real class and\nsilently stopped four test modules from running anywhere.\n\n`atom.quant_spec` now resolves `QuantType` and `d_dtypes` on first use instead\nof at import. The handles return the genuine AITER objects, so values compare\nand behave exactly as before; only the lookup moves. Deferring the import is\nnot enough on its own -- three places evaluated those names while the module\nbody ran, and each had to move with it:\n\n  - the `LayerQuantConfig.quant_type` default (class creation) -> default_factory\n  - `_QSCHEME_TO_QUANT_TYPE` (module level) -> a cached function\n  - `GenericParser._QTYPE_PATTERNS` (class body) -> the same\n\n`config.py` then needs neither: the one runtime use has an exact equivalent in\n`LayerQuantConfig.no_quant()`, and the annotation moves under `TYPE_CHECKING`.\n\nWith that, `tests/conftest.py` fakes nothing at all. The zmq and xxhash stubs\nwent too -- both are declared dependencies in pyproject.toml, so their\n`find_spec(...) is None` guard could never fire.\n\n`test_quant_config.py` installed its AITER stand-ins only while it exec'd the\nmodule body, which no longer covers a first-use lookup; it now binds the\nhandles before dropping them. Deliberately not left in `sys.modules`: a\nlingering fake `aiter` satisfies `pytest.importorskip(\"aiter\")` in the other\ntest modules, and whether it did would depend on collection order.\n\nSimulating the CPU gate (aiter blocked at the meta-path):\n\n    before   839 passed, 16 skipped, 0 failed\n    after    846 passed, 14 skipped, 0 failed\n\nand on a GPU host, 895/6 -> 902/2. The 2 remaining failures\n(`test_mxfp4_moe_has_bias`) are pre-existing on main.\n\n* fix(ci): keep JSON in extraArgs intact for the simple-inference step\n\n`${{ matrix.extraArgs }}` was interpolated into a double-quoted\n`bash -lc \"…\"`, so the *host* shell stripped the inner quotes before the\ncontainer ever saw them: `--hf-overrides '{\"use_index_cache\": true}'` arrived\nas `'{use_index_cache: true}'`, which argparse rejects as JSON. Four of the 13\nPR-level models carry JSON there, and more of the full matrix do via\n--eplb-config, --dspark-config and --online_quant_config.\n\nPass it through an env var and pipe the command over stdin, which is what the\naccuracy step below already does for the same reason.\n\n* style: annotate GenericParser._DTYPE_PATTERNS as ClassVar\n\nRUF012. The dict is unchanged; moving _QTYPE_PATTERNS out from under it\nbrought it into the reviewdog diff context, which is what surfaced this.\n\n* fix(v4): import QuantType from aiter, not through atom.config\n\nMoving `QuantType` under `TYPE_CHECKING` in `atom/config.py` bound nothing at\nrun time, and `deepseek_v4.py` was the one module importing it *through* the\nconfig hub rather than from `aiter` directly:\n\n    ImportError: cannot import name 'QuantType' from 'atom.config'\n\nEvery other model file already does `from aiter import QuantType`, and this\none imports four other aiter modules anyway, so it matches them now.\n\nNothing caught this. `atom/models/*` needs the AITER build, so the CPU gate\nnever imports it, and a broken re-export surfaces only when someone loads that\nmodel on a GPU host. The new test closes that: it walks the tree for\n`from atom.config import X` and checks each name against what config.py binds\nat its top level -- `TYPE_CHECKING` blocks deliberately excluded, since that\nis the distinction that broke here. Pure AST, imports nothing, so it runs on\nthe gate that cannot import the modules it protects. It fails with\n`atom/models/deepseek_v4.py:52 imports 'QuantType'` against the broken tree.\n\n* Revert \"ci: run offline inference on the PR gate\" and its quoting fix\n\nWrong shape: it bolted simple_inference onto all 13 accuracy matrix jobs\nrather than guarding the docker-build path, which is where the smoke test\nthat actually caught the bug lives. Restores atom-test.yaml to main; the\nguard lands as its own job instead.\n\n* ci: smoke-test offline inference on every PR\n\nThe offline entrypoint was exercised only by the nightly Docker release, which\nruns it once after building the image. That is how a bug that killed its\noutput thread reached main: it surfaced a day later, as a 60-minute step\ntimeout. The accuracy matrix is not a substitute -- it drives the server over\nHTTP, and the two do not share the code that hands tokens back to the caller.\n\nA standalone job now runs `simple_inference` once, on\nMeta-Llama-3-8B-Instruct. It is deliberately outside `ci-gate`, which only\nopens on an approval or a ci:* label, so this really does run per PR; the\nmodel is the same one the nightly smoke test uses and the smallest in the\nmatrix.\n\nCompleting is the assertion -- the failure mode is a hang or a crash, not\nwrong text, so there is no golden file to maintain per model, and the step\ntimeout is what turns a hang into a failure instead of a stuck runner. One\nsmall model exercises this code path as well as thirteen would, and the job\nreuses the existing setup-gpu-container action rather than rebuilding the\nrelease image, which takes up to three hours.\n\n* ci: bound the smoke inference step at 15 minutes\n\nAn 8B model loads and answers a few prompts in a couple of minutes, and the\nfailure this step exists to catch is a hang. 15 minutes leaves ample headroom\nwhile keeping a hang from burning a GPU runner for half an hour.",
+          "timestamp": "2026-08-01T15:07:22Z",
+          "url": "https://github.com/ROCm/ATOM/commit/767212315a4b6de0e951f9e4c36974e66cd47be1"
+        },
+        "date": 1785605209903,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=4 throughput (tok/s)",
+            "value": 603.09,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=4 Total Tput (tok/s)",
+            "value": 1212.07,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=4 TTFT (ms)",
+            "value": 149.2,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=4 TPOT (ms)",
+            "value": 6.33,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=4 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=8 throughput (tok/s)",
+            "value": 910.91,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=8 Total Tput (tok/s)",
+            "value": 1815.1,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=8 TTFT (ms)",
+            "value": 175.46,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=8 TPOT (ms)",
+            "value": 8.41,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=8 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=8 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/8192 c=16 throughput (tok/s)",
+            "value": 1699.14,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/8192 c=16 Total Tput (tok/s)",
+            "value": 1912.31,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/8192 c=16 TTFT (ms)",
+            "value": 207.13,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/8192 c=16 TPOT (ms)",
+            "value": 9.18,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/8192 c=16 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/8192 c=16 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 8192/1024 c=256 throughput (tok/s)",
+            "value": 1950.99,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 17553.85,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 8192/1024 c=256 TTFT (ms)",
+            "value": 11256.36,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 8192/1024 c=256 TPOT (ms)",
+            "value": 117.67,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 8192/1024 c=256 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 8192/1024 c=256 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 8192/1024 c=32 throughput (tok/s)",
+            "value": 1305.16,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 11671.15,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 8192/1024 c=32 TTFT (ms)",
+            "value": 1320.42,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 8192/1024 c=32 TPOT (ms)",
+            "value": 22.67,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 8192/1024 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 8192/1024 c=32 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 8192/1024 c=4 throughput (tok/s)",
+            "value": 499.6,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 4491.07,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 8192/1024 c=4 TTFT (ms)",
+            "value": 572.27,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 8192/1024 c=4 TPOT (ms)",
+            "value": 7.25,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 8192/1024 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 8192/1024 c=4 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 8192/1024 c=512 throughput (tok/s)",
+            "value": 1966,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 8192/1024 c=512 Total Tput (tok/s)",
+            "value": 17694.17,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 8192/1024 c=512 TTFT (ms)",
+            "value": 124692.44,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 8192/1024 c=512 TPOT (ms)",
+            "value": 120,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 8192/1024 c=512 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 8192/1024 c=512 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=128 throughput (tok/s)",
+            "value": 3007.53,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=128 Total Tput (tok/s)",
+            "value": 6021.66,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=128 TTFT (ms)",
+            "value": 468.91,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=128 TPOT (ms)",
+            "value": 41,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=128 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=128 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=16 throughput (tok/s)",
+            "value": 804.42,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=16 Total Tput (tok/s)",
+            "value": 1617.41,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=16 TTFT (ms)",
+            "value": 176.56,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=16 TPOT (ms)",
+            "value": 19.3,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=16 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=16 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=256 throughput (tok/s)",
+            "value": 4257.42,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=256 Total Tput (tok/s)",
+            "value": 8510.73,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=256 TTFT (ms)",
+            "value": 770.04,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=256 TPOT (ms)",
+            "value": 57.99,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=256 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=256 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=32 throughput (tok/s)",
+            "value": 1188.26,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=32 Total Tput (tok/s)",
+            "value": 2372.75,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=32 TTFT (ms)",
+            "value": 225,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=32 TPOT (ms)",
+            "value": 26.11,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=32 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=4 throughput (tok/s)",
+            "value": 291.97,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=4 Total Tput (tok/s)",
+            "value": 586.79,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=4 TTFT (ms)",
+            "value": 126.21,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=4 TPOT (ms)",
+            "value": 13.14,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=4 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=512 throughput (tok/s)",
+            "value": 5491.71,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=512 Total Tput (tok/s)",
+            "value": 10978.36,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=512 TTFT (ms)",
+            "value": 1403.32,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=512 TPOT (ms)",
+            "value": 89.97,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=512 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=512 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=64 throughput (tok/s)",
+            "value": 1978.99,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=64 Total Tput (tok/s)",
+            "value": 3958.86,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=64 TTFT (ms)",
+            "value": 303.77,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=64 TPOT (ms)",
+            "value": 31.18,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=64 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=8 throughput (tok/s)",
+            "value": 508.75,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=8 Total Tput (tok/s)",
+            "value": 1013.74,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=8 TTFT (ms)",
+            "value": 154.21,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=8 TPOT (ms)",
+            "value": 15.24,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=8 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/1024 c=8 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/8192 c=128 throughput (tok/s)",
+            "value": 3451.89,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/8192 c=128 Total Tput (tok/s)",
+            "value": 3883.96,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/8192 c=128 TTFT (ms)",
+            "value": 431.22,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/8192 c=128 TPOT (ms)",
+            "value": 36.03,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/8192 c=128 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/8192 c=128 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/8192 c=16 throughput (tok/s)",
+            "value": 834.13,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/8192 c=16 Total Tput (tok/s)",
+            "value": 938.78,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/8192 c=16 TTFT (ms)",
+            "value": 173.82,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/8192 c=16 TPOT (ms)",
+            "value": 18.7,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/8192 c=16 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/8192 c=16 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/8192 c=256 throughput (tok/s)",
+            "value": 5189.79,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/8192 c=256 Total Tput (tok/s)",
+            "value": 5837.74,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/8192 c=256 TTFT (ms)",
+            "value": 706.79,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/8192 c=256 TPOT (ms)",
+            "value": 47.88,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/8192 c=256 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/8192 c=256 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/8192 c=32 throughput (tok/s)",
+            "value": 1245.83,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/8192 c=32 Total Tput (tok/s)",
+            "value": 1400.52,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/8192 c=32 TTFT (ms)",
+            "value": 215.27,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/8192 c=32 TPOT (ms)",
+            "value": 25.08,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/8192 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/8192 c=32 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/8192 c=4 throughput (tok/s)",
+            "value": 300.41,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/8192 c=4 Total Tput (tok/s)",
+            "value": 338.75,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/8192 c=4 TTFT (ms)",
+            "value": 130.03,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/8192 c=4 TPOT (ms)",
+            "value": 13.09,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/8192 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/8192 c=4 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/8192 c=8 throughput (tok/s)",
+            "value": 509.13,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/8192 c=8 Total Tput (tok/s)",
+            "value": 572.94,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/8192 c=8 TTFT (ms)",
+            "value": 139.61,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/8192 c=8 TPOT (ms)",
+            "value": 15.3,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/8192 c=8 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 1024/8192 c=8 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 8192/1024 c=16 throughput (tok/s)",
+            "value": 611.64,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 5519.92,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 8192/1024 c=16 TTFT (ms)",
+            "value": 747.97,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 8192/1024 c=16 TPOT (ms)",
+            "value": 24.67,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 8192/1024 c=16 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 8192/1024 c=16 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 8192/1024 c=64 throughput (tok/s)",
+            "value": 1172.9,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 10572.22,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 8192/1024 c=64 TTFT (ms)",
+            "value": 1700.52,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 8192/1024 c=64 TPOT (ms)",
+            "value": 51.86,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 8192/1024 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::DeepSeek-V3.2-FP8-PTPC-tp4 8192/1024 c=64 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.2-MXFP4-tp4 1024/1024 c=32 throughput (tok/s)",
+            "value": 1423,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.2-MXFP4-tp4 1024/1024 c=32 Total Tput (tok/s)",
+            "value": 2841.49,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.2-MXFP4-tp4 1024/1024 c=32 TTFT (ms)",
+            "value": 228.7,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.2-MXFP4-tp4 1024/1024 c=32 TPOT (ms)",
+            "value": 21.72,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.2-MXFP4-tp4 1024/1024 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.2-MXFP4-tp4 1024/1024 c=32 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.2-MXFP4-tp4 1024/1024 c=64 throughput (tok/s)",
+            "value": 2183.31,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.2-MXFP4-tp4 1024/1024 c=64 Total Tput (tok/s)",
+            "value": 4367.6,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.2-MXFP4-tp4 1024/1024 c=64 TTFT (ms)",
+            "value": 281.27,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.2-MXFP4-tp4 1024/1024 c=64 TPOT (ms)",
+            "value": 28.25,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.2-MXFP4-tp4 1024/1024 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.2-MXFP4-tp4 1024/1024 c=64 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.2-MXFP4-tp4 1024/1024 c=8 throughput (tok/s)",
+            "value": 508.24,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.2-MXFP4-tp4 1024/1024 c=8 Total Tput (tok/s)",
+            "value": 1012.73,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.2-MXFP4-tp4 1024/1024 c=8 TTFT (ms)",
+            "value": 169.56,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.2-MXFP4-tp4 1024/1024 c=8 TPOT (ms)",
+            "value": 15.25,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.2-MXFP4-tp4 1024/1024 c=8 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.2-MXFP4-tp4 1024/1024 c=8 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.2-MXFP4-tp4 1024/8192 c=64 throughput (tok/s)",
+            "value": 2474.81,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.2-MXFP4-tp4 1024/8192 c=64 Total Tput (tok/s)",
+            "value": 2783.81,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.2-MXFP4-tp4 1024/8192 c=64 TTFT (ms)",
+            "value": 265.79,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.2-MXFP4-tp4 1024/8192 c=64 TPOT (ms)",
+            "value": 25.1,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.2-MXFP4-tp4 1024/8192 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.2-MXFP4-tp4 1024/8192 c=64 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.2-MXFP4-tp4 8192/1024 c=128 throughput (tok/s)",
+            "value": 1762.33,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.2-MXFP4-tp4 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 15910.48,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.2-MXFP4-tp4 8192/1024 c=128 TTFT (ms)",
+            "value": 2459.28,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.2-MXFP4-tp4 8192/1024 c=128 TPOT (ms)",
+            "value": 68.96,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.2-MXFP4-tp4 8192/1024 c=128 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.2-MXFP4-tp4 8192/1024 c=128 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.2-MXFP4-tp4 8192/1024 c=4 throughput (tok/s)",
+            "value": 286.47,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.2-MXFP4-tp4 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 2575.23,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.2-MXFP4-tp4 8192/1024 c=4 TTFT (ms)",
+            "value": 401.16,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.2-MXFP4-tp4 8192/1024 c=4 TPOT (ms)",
+            "value": 13.19,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.2-MXFP4-tp4 8192/1024 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::GLM-5.2-MXFP4-tp4 8192/1024 c=4 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=128 throughput (tok/s)",
+            "value": 3696.05,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=128 Total Tput (tok/s)",
+            "value": 7400.22,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=128 TTFT (ms)",
+            "value": 281.56,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=128 TPOT (ms)",
+            "value": 33.55,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=128 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=128 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=16 throughput (tok/s)",
+            "value": 1128.14,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=16 Total Tput (tok/s)",
+            "value": 2268.3,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=16 TTFT (ms)",
+            "value": 122.68,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=16 TPOT (ms)",
+            "value": 13.76,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=16 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=16 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=256 throughput (tok/s)",
+            "value": 5468.13,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=256 Total Tput (tok/s)",
+            "value": 10930.98,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=256 TTFT (ms)",
+            "value": 452.25,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=256 TPOT (ms)",
+            "value": 45.32,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=256 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=256 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=32 throughput (tok/s)",
+            "value": 1694.75,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=32 Total Tput (tok/s)",
+            "value": 3384.15,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=32 TTFT (ms)",
+            "value": 148.62,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=32 TPOT (ms)",
+            "value": 18.31,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=32 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=4 throughput (tok/s)",
+            "value": 407.98,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=4 Total Tput (tok/s)",
+            "value": 819.95,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=4 TTFT (ms)",
+            "value": 97.41,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=4 TPOT (ms)",
+            "value": 9.4,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=4 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=512 throughput (tok/s)",
+            "value": 7659.58,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=512 Total Tput (tok/s)",
+            "value": 15312.1,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=512 TTFT (ms)",
+            "value": 786.41,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=512 TPOT (ms)",
+            "value": 64.67,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=512 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=512 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=64 throughput (tok/s)",
+            "value": 2510.33,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=64 Total Tput (tok/s)",
+            "value": 5021.8,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=64 TTFT (ms)",
+            "value": 194.21,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=64 TPOT (ms)",
+            "value": 24.69,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=64 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=8 throughput (tok/s)",
+            "value": 725.42,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=8 Total Tput (tok/s)",
+            "value": 1445.48,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=8 TTFT (ms)",
+            "value": 106.48,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=8 TPOT (ms)",
+            "value": 10.69,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=8 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/1024 c=8 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=128 throughput (tok/s)",
+            "value": 3925.51,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=128 Total Tput (tok/s)",
+            "value": 4416.85,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=128 TTFT (ms)",
+            "value": 268.49,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=128 TPOT (ms)",
+            "value": 31.79,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=128 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=128 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=16 throughput (tok/s)",
+            "value": 1166.56,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=16 Total Tput (tok/s)",
+            "value": 1312.92,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=16 TTFT (ms)",
+            "value": 122.33,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=16 TPOT (ms)",
+            "value": 13.36,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=16 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=16 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=256 throughput (tok/s)",
+            "value": 5651.18,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=256 Total Tput (tok/s)",
+            "value": 6356.74,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=256 TTFT (ms)",
+            "value": 433.34,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=256 TPOT (ms)",
+            "value": 44.09,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=256 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=256 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=32 throughput (tok/s)",
+            "value": 1763.74,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=32 Total Tput (tok/s)",
+            "value": 1982.72,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=32 TTFT (ms)",
+            "value": 138.53,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=32 TPOT (ms)",
+            "value": 17.72,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=32 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=4 throughput (tok/s)",
+            "value": 409.75,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=4 Total Tput (tok/s)",
+            "value": 462.04,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=4 TTFT (ms)",
+            "value": 100.01,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=4 TPOT (ms)",
+            "value": 9.59,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=4 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=512 throughput (tok/s)",
+            "value": 7632.19,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=512 Total Tput (tok/s)",
+            "value": 8586.64,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=512 TTFT (ms)",
+            "value": 822.7,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=512 TPOT (ms)",
+            "value": 65.46,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=512 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=512 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=64 throughput (tok/s)",
+            "value": 2653.25,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=64 Total Tput (tok/s)",
+            "value": 2984.54,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=64 TTFT (ms)",
+            "value": 187.98,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=64 TPOT (ms)",
+            "value": 23.48,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=64 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=8 throughput (tok/s)",
+            "value": 721.96,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=8 Total Tput (tok/s)",
+            "value": 812.45,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=8 TTFT (ms)",
+            "value": 105.58,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=8 TPOT (ms)",
+            "value": 10.78,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=8 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 1024/8192 c=8 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=128 throughput (tok/s)",
+            "value": 2335.49,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 21084.95,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=128 TTFT (ms)",
+            "value": 1391.39,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=128 TPOT (ms)",
+            "value": 52.46,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=128 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=128 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=16 throughput (tok/s)",
+            "value": 949.64,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 8570.25,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=16 TTFT (ms)",
+            "value": 356.58,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=16 TPOT (ms)",
+            "value": 15.96,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=16 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=16 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=256 throughput (tok/s)",
+            "value": 2907.46,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 26159.66,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=256 TTFT (ms)",
+            "value": 2558.03,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=256 TPOT (ms)",
+            "value": 84.12,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=256 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=256 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=32 throughput (tok/s)",
+            "value": 1342.52,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 12005.24,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=32 TTFT (ms)",
+            "value": 502.42,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=32 TPOT (ms)",
+            "value": 22.73,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=32 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=4 throughput (tok/s)",
+            "value": 376.32,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 3382.85,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=4 TTFT (ms)",
+            "value": 226.02,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=4 TPOT (ms)",
+            "value": 10.13,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=4 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=512 throughput (tok/s)",
+            "value": 3173.17,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=512 Total Tput (tok/s)",
+            "value": 28558.78,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=512 TTFT (ms)",
+            "value": 17114.48,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=512 TPOT (ms)",
+            "value": 140.52,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=512 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=512 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=64 throughput (tok/s)",
+            "value": 1807.04,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 16288.29,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=64 TTFT (ms)",
+            "value": 798.33,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=64 TPOT (ms)",
+            "value": 33.94,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=64 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=8 throughput (tok/s)",
+            "value": 642.41,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 5714.55,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=8 TTFT (ms)",
+            "value": 278.34,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=8 TPOT (ms)",
+            "value": 11.94,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=8 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.7-MXFP4-tp4 8192/1024 c=8 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=128 throughput (tok/s)",
+            "value": 4591.71,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=128 Total Tput (tok/s)",
+            "value": 9193.51,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=128 TTFT (ms)",
+            "value": 326.37,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=128 TPOT (ms)",
+            "value": 26.93,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=128 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=128 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=16 throughput (tok/s)",
+            "value": 1400.82,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=16 Total Tput (tok/s)",
+            "value": 2816.56,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=16 TTFT (ms)",
+            "value": 145.71,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=16 TPOT (ms)",
+            "value": 11.03,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=16 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=16 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=256 throughput (tok/s)",
+            "value": 6461.36,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=256 Total Tput (tok/s)",
+            "value": 12916.48,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=256 TTFT (ms)",
+            "value": 529.86,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=256 TPOT (ms)",
+            "value": 38.3,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=256 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=256 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=32 throughput (tok/s)",
+            "value": 2186.26,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=32 Total Tput (tok/s)",
+            "value": 4365.6,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=32 TTFT (ms)",
+            "value": 166.44,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=32 TPOT (ms)",
+            "value": 14.13,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=32 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=4 throughput (tok/s)",
+            "value": 491.62,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=4 Total Tput (tok/s)",
+            "value": 988.05,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=4 TTFT (ms)",
+            "value": 118.49,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=4 TPOT (ms)",
+            "value": 7.76,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=4 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=512 throughput (tok/s)",
+            "value": 8351.75,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=512 Total Tput (tok/s)",
+            "value": 16695.81,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=512 TTFT (ms)",
+            "value": 966.54,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=512 TPOT (ms)",
+            "value": 59.29,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=512 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=512 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=64 throughput (tok/s)",
+            "value": 3223.65,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=64 Total Tput (tok/s)",
+            "value": 6448.76,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=64 TTFT (ms)",
+            "value": 230.37,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=64 TPOT (ms)",
+            "value": 19.13,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=64 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=8 throughput (tok/s)",
+            "value": 892.16,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=8 Total Tput (tok/s)",
+            "value": 1777.73,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=8 TTFT (ms)",
+            "value": 131.62,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=8 TPOT (ms)",
+            "value": 8.64,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=8 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 1024/1024 c=8 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=128 throughput (tok/s)",
+            "value": 2881.3,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 26012.64,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=128 TTFT (ms)",
+            "value": 1712.14,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=128 TPOT (ms)",
+            "value": 41.95,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=128 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=128 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=16 throughput (tok/s)",
+            "value": 1165,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 10513.83,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=16 TTFT (ms)",
+            "value": 404.34,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=16 TPOT (ms)",
+            "value": 12.91,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=16 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=16 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=256 throughput (tok/s)",
+            "value": 3238.99,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 29142.54,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=256 TTFT (ms)",
+            "value": 3294.62,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=256 TPOT (ms)",
+            "value": 74.66,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=256 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=256 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=32 throughput (tok/s)",
+            "value": 1729.49,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 15465.63,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=32 TTFT (ms)",
+            "value": 574.76,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=32 TPOT (ms)",
+            "value": 17.42,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=32 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=4 throughput (tok/s)",
+            "value": 464.36,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 4174.3,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=4 TTFT (ms)",
+            "value": 227.67,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=4 TPOT (ms)",
+            "value": 8.16,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=4 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=512 throughput (tok/s)",
+            "value": 3341.15,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=512 Total Tput (tok/s)",
+            "value": 30070.58,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=512 TTFT (ms)",
+            "value": 7376.88,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=512 TPOT (ms)",
+            "value": 144.18,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=512 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=512 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=64 throughput (tok/s)",
+            "value": 2306.5,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 20790.29,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=64 TTFT (ms)",
+            "value": 975.46,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=64 TPOT (ms)",
+            "value": 26.21,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=64 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=8 throughput (tok/s)",
+            "value": 812.12,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 7224.17,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=8 TTFT (ms)",
+            "value": 300.36,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=8 TPOT (ms)",
+            "value": 9.35,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30645961336 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:vllm-v0.25.1-nightly_20260730"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=8 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-MXFP4-tp4 8192/1024 c=8 _tp",
+            "value": 4,
+            "unit": ""
           }
         ]
       }
