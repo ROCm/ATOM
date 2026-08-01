@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Tests for atom/model_engine/block_manager.py — public API only
 
-from atom.model_engine.block_manager import BlockManager
+from types import SimpleNamespace
+
 from conftest import MockConfig
+
+from atom.model_engine.block_manager import BlockManager
 
 # ── compute_hash ───────────────────────────────────────────────────────────
 
@@ -367,12 +370,16 @@ _MC = MockConfig
 
 
 def _swa_bm(num_blocks=10, num_swa=10, bs=4, window=8, prefix=True):
+    # Sizing publishes per-class entry counts; the window itself comes from
+    # the model config, exactly as in production.
     return BlockManager(
         _MC(
             num_kvcache_blocks=num_blocks,
-            num_swa_blocks=num_swa,
+            pool_entries={"swa": num_swa},
             kv_cache_block_size=bs,
-            swa_window_size=window,
+            hf_config=SimpleNamespace(
+                architectures=["LlamaForCausalLM"], sliding_window=window
+            ),
             enable_prefix_caching=prefix,
         )
     )

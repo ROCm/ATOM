@@ -98,7 +98,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # prefix hits can reuse the middle SWA blocks (agentic branch/replay reuse) —
     # the live sliding-window free is UNCHANGED (out-of-window refs still released
     # each chunk/decode; freed blocks stay hash+KV resident until overwritten).
-    # Pairs with a larger SWA pool (swa_pool_num_blocks) so freed-but-cached
+    # Pairs with a larger SWA pool (see swa_pool in sub_pool_specs) so freed-but-cached
     # blocks survive until replay. Costs ~compressed-pool-magnitude SWA memory.
     "ATOM_SWA_FULL_RETAIN": lambda: (os.getenv("ATOM_SWA_FULL_RETAIN", "0") == "1"),
     # DeepSeek-V4 paged-SWA full-retain: fraction of the KV budget given to the

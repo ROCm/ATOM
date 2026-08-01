@@ -8,6 +8,7 @@ import numpy as np
 import torch
 from aiter.dist.parallel_state import get_tp_group
 
+from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_gdn import GatedDeltaNet
 from atom.utils import CpuGpuBuffer
@@ -18,6 +19,7 @@ from .aiter_attention import (
     AiterBackend,
     kv_indices_generate_triton,
 )
+from .sub_pool_spec import SubPoolSpec, page_pool, state_pool
 
 
 class GDNAttentionBackend(AiterBackend):
@@ -77,11 +79,11 @@ class GDNStateMixin:
         model_runner,
     ):
         # Hybrid model layer-counting state (formerly set as a side effect
-        # inside ModelRunner._compute_block_bytes' qwen_next branch).
+        # inside the qwen_next branch of the KV sizing path).
         # Promoted to runner attributes here so all consumers
         # (build_kv_cache_tensor, allocate_kv_cache_tensors, the per-req
         # cache hooks) can read them as `self.model_runner.<name>` without
-        # a hidden ordering dependency on _compute_block_bytes being
+        # a hidden ordering dependency on the KV sizing path being
         # called first.
         hf = model_runner.config.hf_config
         if getattr(hf, "model_type", None) == "kimi_linear":
@@ -241,25 +243,33 @@ class GDNStateMixin:
             self.model_runner.num_spec_tokens,
         )
 
-    def compute_per_req_cache_bytes(self) -> int:
-        """GDN: conv_state + temporal_state, summed over all GDN layers."""
+    def state_spec(self) -> SubPoolSpec:
+        """The GDN state pool: conv_state + temporal_state over all GDN
+        layers, with one extra slot per speculative token for rollback.
+
+        Concrete builders splice this into their `sub_pool_specs()` alongside
+        whatever paged KV pool they own.
+        """
         shape_k, shape_v = self._state_shape_for_runner()
         dt_k, dt_v = self._state_dtypes()
         per_layer = (
             math.prod(shape_k) * dt_k.itemsize + math.prod(shape_v) * dt_v.itemsize
         )
-        return self.model_runner.num_gdn_attn_state * per_layer
+        return state_pool(
+            STATE_SLOT_CLASS,
+            self.model_runner.num_gdn_attn_state * per_layer,
+            entries_per_req=1 + self.num_spec,
+        )
 
-    def slots_per_req(self) -> int:
-        """GDN reserves one extra slot per speculative token for rollback."""
-        return 1 + self.num_spec
-
-    def allocate_per_req_cache(self, num_slots: int) -> dict[str, torch.Tensor]:
+    def allocate_per_req_cache(
+        self, entries: dict[str, int]
+    ) -> dict[str, torch.Tensor]:
         """Allocate mamba_k_cache / mamba_v_cache.
 
         Names preserved for backward compat with `attention_gdn.py` which
         accesses them as `model_runner.mamba_{k,v}_cache`.
         """
+        num_slots = entries.get(STATE_SLOT_CLASS, 0)
         shape_k, shape_v = self._state_shape_for_runner()
         dt_k, dt_v = self._state_dtypes()
         n = self.model_runner.num_gdn_attn_state
@@ -506,10 +516,10 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
 
     reorder_batch_threshold: int = 1
 
-    def compute_block_bytes(self) -> int:
-        """GDN hybrid: only full-attention layer slots contribute paged KV
-        bytes (linear-attention layers' state lives in the per-request
-        cache pool, accounted separately via compute_per_req_cache_bytes).
+    def sub_pool_specs(self) -> list[SubPoolSpec]:
+        """GDN hybrid: a paged KV pool holding ONLY the full-attention layer
+        slots, plus the per-request state pool for the linear-attention
+        layers (`GDNStateMixin.state_spec`).
         """
         from aiter import dtypes
 
@@ -533,7 +543,7 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         )
         # kv_scale: [2, n_full, blocks, num_kv_heads, block_size] fp32
         block_bytes += 2 * n_full * num_kv_heads * runner.physical_block_size * 4
-        return block_bytes
+        return [page_pool(block_bytes), self.state_spec()]
 
     def allocate_kv_cache_tensors(
         self, num_kv_heads: int, num_draft_layers: int

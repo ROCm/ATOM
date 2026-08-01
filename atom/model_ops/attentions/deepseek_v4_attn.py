@@ -55,11 +55,18 @@ from atom.distributed.pcp_utils import (
     pcp_reindex_ragged,
     pcp_round_robin_query_indices,
 )
+from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.scheduler import ScheduledBatch
+from atom.model_engine.swa_pool import SWA_POOL_CLASS
 from atom.model_ops.attentions.backends import (
     AttentionBackend,
     AttentionMetadataBuilder,
     CommonAttentionBuilder,
+)
+from atom.model_ops.attentions.sub_pool_spec import (
+    SubPoolSpec,
+    page_pool,
+    state_pool,
 )
 from atom.model_ops.v4_kernels import (
     FP4_MQA_BLOCK_K,
@@ -69,7 +76,7 @@ from atom.model_ops.v4_kernels import (
     write_v4_paged_decode_indices,
     write_v4_paged_prefill_indices,
 )
-from atom.utils import CpuGpuBuffer
+from atom.utils import CpuGpuBuffer, envs
 from atom.utils.forward_context import (
     AttentionMetaData,
     AttnState,
@@ -373,7 +380,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # on gfx950 / gfx1250. On any other arch, transparently fall back to a
         # bf16 KV cache instead of hard-failing. Flipping self._kv_fp8 here (before
         # the *_dtype attrs are read) keeps the whole V4 path consistent: pool
-        # sizing (compute_block_bytes / swa_block_bytes_per_layer), quant_mode,
+        # sizing (sub_pool_specs / swa_block_bytes_per_layer), quant_mode,
         # and module.kv_fp8 (build_kv_cache_tensor) all key off self._kv_fp8 /
         # these dtype attrs. Sync model_runner.kv_cache_dtype (and the shared
         # config) so any generic reader / log line agrees.
@@ -497,8 +504,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     # AttentionMetadataBuilder hooks (per-request cache abstraction).    #
     # ------------------------------------------------------------------ #
 
-    def compute_per_req_cache_bytes(self) -> int:
-        """Bytes for ONE request's state cache across all layers.
+    def _per_req_state_bytes(self) -> int:
+        """Bytes for ONE request's compressor state across all layers.
 
         State cache contents (paper §3.6.1):
           - SWA segment: [n_win, head_dim] BF16, every layer.
@@ -523,22 +530,22 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         """paged-SWA: bytes of ONE SWA physical block for ONE layer
         (full-resolution, ratio-1 = block_size tokens x head_dim x classical
         elem). Single source for the per-layer SWA block size, reused by both
-        `swa_pool_block_bytes` and the KV-transfer region stride."""
+        `_swa_block_bytes` and the KV-transfer region stride."""
         b = self.block_size * self.head_dim * self._swa_dtype.itemsize
         if self._kv_fp8:
             # 2buff: parallel bf16 rope pool [block_size, rope_head_dim].
             b += self.block_size * self.rope_head_dim * self._rope_dtype.itemsize
         return b
 
-    def swa_pool_block_bytes(self) -> int:
+    def _swa_block_bytes(self) -> int:
         """paged-SWA: bytes of ONE SWA physical block across all layers
-        (full-resolution, ratio-1). This is exactly the SWA term that
-        `compute_block_bytes` adds; the budget moves it to a separate
-        `num_swa_blocks`-sized pool instead of charging it per compressed block."""
+        (full-resolution, ratio-1)."""
         return self.num_layers * self.swa_block_bytes_per_layer()
 
-    def swa_pool_num_blocks(self, max_num_seqs: int, max_model_len: int) -> int:
-        """Size the windowed SWA pool (vLLM-aligned; chunked-prefill freeing).
+    def swa_blocks_per_req(self) -> int:
+        """SWA pool blocks ONE request retains (vLLM-aligned; chunked-prefill
+        freeing). The pool size is this times `max_num_seqs`, plus the flat
+        slide-boundary margin declared in `sub_pool_specs`.
 
         With chunk-boundary SWA window-freeing + incremental allocation
         (SlidingWindowPool.ensure_for_tokens / free_after_prefill_chunk, driven by
@@ -559,12 +566,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         ceil(max_model_len/bs) (e.g. 1024 → ~66 blocks at 131072/8192/128/128).
         """
         bs = self.block_size
-        # NOTE: full-retain (ATOM_SWA_FULL_RETAIN) does NOT size the pool here.
-        # It sizes num_swa_blocks == num_kvcache_blocks from the shared memory
-        # budget in ModelRunner._compute_kv_budget (lockstep with the compressed
-        # pool), which is memory-bounded. Sizing on max_model_len here would
-        # explode to ~TB at DSV4's 1M max_position_embeddings. This method is only
-        # consulted for the default (window-only) pool below.
+        # NOTE: full-retain (ATOM_SWA_FULL_RETAIN) does NOT enter here. It is a
+        # retention share taken off the leftover budget, declared as
+        # `retention_budget_frac` in `sub_pool_specs` and added ON TOP of this
+        # per-request floor. Keeping the two apart is what makes shrinking the
+        # share unable to starve a live window — and it keeps this method
+        # memory-independent: sizing retention on max_model_len here would
+        # explode to ~TB at DSV4's 1M max_position_embeddings.
         # per_decode uses win_with_spec (= window + max_spec_steps), not window
         # alone: under MTP each decoding seq writes up to `max_spec_steps` draft
         # tokens into the SWA pool before the next window-free, so its peak
@@ -579,19 +587,26 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # ~per_decode SWA blocks as a decoding seq, already covered by the
         # per-seq term. The old fat `one_prefill` term (a full
         # max_num_batched_tokens chunk's SWA, ~128 blocks) is dead under
-        # window-only — dropped. `+ 64` keeps a slide-boundary safety margin.
-        return max_num_seqs * per_decode + 64
+        # window-only — dropped. The slide-boundary safety margin is a flat
+        # term on the class, declared as `extra_entries` in `sub_pool_specs`.
+        return per_decode
 
-    def slots_per_req(self) -> int:
-        # State cache is one slot per req regardless of MTP. The MTP draft
-        # lookahead bytes are absorbed into per-slot SWA size via
-        # `win_with_spec` (above), not into a slots_per_req multiplier.
-        return 1
+    @property
+    def num_swa_blocks(self) -> int:
+        """Entries sizing gave the SWA class this backend declared."""
+        return self.model_runner.pool_plan.entries.get(SWA_POOL_CLASS, 0)
 
-    def compute_block_bytes(self) -> int:
-        """Per-V4-block bytes for the three classical KV pools.
+    @property
+    def num_state_slots(self) -> int:
+        """Entries sizing gave the compressor-state class."""
+        return self.model_runner.pool_plan.entries.get(STATE_SLOT_CLASS, 0)
 
-        Each V4 block (block_size=256 original tokens) stores per layer:
+    def sub_pool_specs(self) -> list[SubPoolSpec]:
+        """Two pools, three entry classes: paged compressed KV, plus a
+        window-freed SWA class and the compressor ring, both per-request.
+
+        Per-V4-block bytes for the paged class. Each V4 block
+        (block_size=256 original tokens) stores per layer:
           - CSA Main:   k1=64 entries × head_dim BF16
           - CSA Indexer: k1=64 entries × aligned_index_dim bytes FP8
                         (= ((index_head_dim + 4 + 15) // 16) * 16 — 16-byte
@@ -614,23 +629,49 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         else:
             csa_idx_per_block = self.k1_csa * self._aligned_index_dim  # fp8 = 1B
         hca_main_per_block = self.k2_hca * self.head_dim * elem_classical
-        # paged-SWA: the sliding-window KV is content-addressed, one full-
-        # resolution (ratio-1) entry per original token in EVERY layer, so each
-        # block carries `block_size * head_dim` of SWA per layer. This term
-        # is charged here but the budget (model_runner.get_num_blocks) strips it
-        # back out into the separate window-freed num_swa_blocks pool.
-        swa_per_block = self.block_size * self.head_dim * elem_classical
         if self._kv_fp8:
-            # 2buff: parallel bf16 rope pool per compress entry AND per SWA token.
+            # 2buff: parallel bf16 rope pool per compress entry.
             elem_rope = self._rope_dtype.itemsize
             csa_main_per_block += self.k1_csa * self.rope_head_dim * elem_rope
             hca_main_per_block += self.k2_hca * self.rope_head_dim * elem_rope
-            swa_per_block += self.block_size * self.rope_head_dim * elem_rope
-        return (
+        compressed_block_bytes = (
             len(self.csa_layers) * (csa_main_per_block + csa_idx_per_block)
             + len(self.hca_layers) * hca_main_per_block
-            + self.num_layers * swa_per_block
         )
+        # paged-SWA is its own entry class rather than a term on the
+        # compressed block, so its bytes are declared directly instead of
+        # being charged per compressed block and stripped back out. It sits in
+        # the STATE pool because its size tracks concurrency, not history —
+        # `swa_blocks_per_req() * max_num_seqs` — even though it is
+        # block-table addressed and shared across requests.
+        # ATOM_SWA_FULL_RETAIN keeps blocks that have slid out of the window
+        # for cross-request reuse; that share sits ON TOP OF the per-request
+        # floor, so shrinking the fraction can never starve a live window.
+        return [
+            page_pool(compressed_block_bytes),
+            state_pool(
+                SWA_POOL_CLASS,
+                self._swa_block_bytes(),
+                entries_per_req=self.swa_blocks_per_req(),
+                # Slide-boundary safety margin, empirically 64 blocks for the
+                # pool as a whole: `swa_blocks_per_req` is the steady-state
+                # window, and seqs transiently exceed it while a window slides
+                # across a block boundary. Flat rather than per-request because
+                # the transients do not all land on the same step.
+                extra_entries=64,
+                retention_budget_frac=(
+                    min(0.9, max(1e-3, envs.ATOM_SWA_TAIL_BUDGET_FRAC))
+                    if envs.ATOM_SWA_FULL_RETAIN
+                    else 0.0
+                ),
+            ),
+            # One slot per request regardless of MTP: the draft lookahead is
+            # absorbed into `win_with_spec` (the SWA per-request block count),
+            # so it never multiplies the compressor ring.
+            state_pool(
+                STATE_SLOT_CLASS, self._per_req_state_bytes(), entries_per_req=1
+            ),
+        ]
 
     def allocate_kv_cache_tensors(
         self, num_kv_heads: int, num_draft_layers: int
@@ -678,7 +719,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             ),
         }
 
-    def allocate_per_req_cache(self, num_slots: int) -> dict[str, object]:
+    def allocate_per_req_cache(self, entries: dict[str, int]) -> dict[str, object]:
         """Allocate per-layer `unified_kv` + Compressor state caches.
 
         Per-layer `unified_kv` layout (decode-time paged_decode kernel reads
@@ -703,6 +744,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         Total bytes match the pre-Phase-A layout (SWA + CSA Main + HCA Main
         bytes redistributed across per-layer tensors; no extra overhead).
         """
+        num_slots = entries.get(STATE_SLOT_CLASS, 0)
         assert self._swa_dtype == self._classical_dtype, (
             "unified_kv requires SWA dtype == classical KV dtype "
             f"(got SWA={self._swa_dtype}, classical={self._classical_dtype}). "
@@ -715,7 +757,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         n_hca = len(self.hca_layers)
         # paged-SWA: SWA lives in its own num_swa_blocks pool, content-
         # addressed by swa_block_tables. Size = num_swa_blocks * block_size.
-        swa_pages = self.model_runner.num_swa_blocks * self.block_size
+        swa_pages = self.num_swa_blocks * self.block_size
         head_dim = self.head_dim
         dtype = self._swa_dtype
 
@@ -840,7 +882,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         num_blocks = self.model_runner.num_physical_kvcache_blocks
         # paged-SWA: SWA region is the separate num_swa_blocks pool,
         # content-addressed by swa_block_tables.
-        swa_pages = self.model_runner.num_swa_blocks * self.block_size
+        swa_pages = self.num_swa_blocks * self.block_size
 
         if isinstance(module, _V4Attention):
             # DSpark draft layer: fp8 target KV cache. DSpark's block attention runs bf16.
@@ -1040,12 +1082,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             # region). No transfer is active, so skip building regions.
             return None
 
-        num_slots = runner.max_per_req_cache_slots
+        num_slots = self.num_state_slots
         # paged-SWA: SWA lives in a SEPARATE num_swa_blocks pool at the head
         # of unified_kv ([0, swa_pages)); the compress tail follows. The SWA
         # region is emitted below as swa_block_regions (keyed by
         # seq.swa_block_table, only the live window is transferred).
-        swa_pages = self.model_runner.num_swa_blocks * self.block_size
+        swa_pages = self.num_swa_blocks * self.block_size
         elem_classical = self._classical_dtype.itemsize
         elem_fp32 = 4
 
@@ -1533,10 +1575,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         / ``num_reject_tokens`` are MLA-specific knobs and are ignored — V4
         handles rollback once in ``prepare_decode``.
         """
-        # `max_per_req_cache_slots` is set inside `model_runner.get_num_blocks`
-        # AFTER `warmup_model`. During warmup we no-op — warmup discards
-        # draft output anyway, and the verify-shape attn_metadata stays valid.
-        if not getattr(self.model_runner, "max_per_req_cache_slots", 0):
+        # Sub-pool sizing runs in `model_runner.get_num_blocks`, AFTER
+        # `warmup_model`, so the state class has no entries yet during warmup.
+        # No-op there — warmup discards draft output anyway, and the
+        # verify-shape attn_metadata stays valid.
+        if not self.num_state_slots:
             return {}
         assert self._mtp_layers_are_swa_only, (
             "prepare_mtp_decode fast path only supports SWA-only MTP layers "
@@ -2740,7 +2783,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         win = self.window_size  # per-token max SWA prefix slots
         # paged-SWA: SWA region = num_swa_blocks*block_size rows (separate
         # pool); this boundary offsets the HCA compress section in unified_kv.
-        swa_pages = self.model_runner.num_swa_blocks * self.block_size
+        swa_pages = self.num_swa_blocks * self.block_size
 
         T = total_tokens
 
@@ -2997,16 +3040,17 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         index_topk = self.index_topk
         T = total_tokens
         # warmup_model runs BEFORE allocate_kv_cache binds the paged pool
-        # (max_per_req_cache_slots not set yet, unified_kv is a 1-page
-        # placeholder). V4Attention.forward detects `is_dummy_run` and
+        # (sub-pool sizing has not run, so the state class is still empty and
+        # unified_kv is a 1-page placeholder). V4Attention.forward detects
+        # `is_dummy_run` and
         # short-circuits the sparse_attn dispatch entirely, so we don't need
         # valid prefix/extend indices during warmup.
-        num_slots = getattr(self.model_runner, "max_per_req_cache_slots", 0)
+        num_slots = self.num_state_slots
         if num_slots == 0:
             return
         # paged-SWA: SWA region = num_swa_blocks*block_size (separate pool),
         # boundary into the HCA compress section of unified_kv.
-        swa_pages = self.model_runner.num_swa_blocks * self.block_size
+        swa_pages = self.num_swa_blocks * self.block_size
         var = self.model_runner.forward_vars
 
         # ----- CPU numpy: per-token counts + indptrs -----
@@ -3272,7 +3316,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     ):
         """Build `[scheduled_bs]` int32 tensor of per-request state-cache slots.
 
-        With slots_per_req() == 1, slot index == per_req_cache_group. This
+        The state class declares `entries_per_req=1`, so slot index ==
+        per_req_cache_group. This
         is what V4 forward uses to index `swa_kv` and `Compressor.kv_state`
         (the per-request state pool, distinct from the per-token paged-KV
         `slot_mapping`).

@@ -8,13 +8,14 @@ from collections import Counter
 from dataclasses import fields
 from typing import Any, Dict, List, Optional, Union
 
+from transformers import AutoTokenizer, PreTrainedTokenizerFast
+
 from atom.config import Config
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
 from atom.model_engine.multimodal import get_mrope_input_positions
 from atom.model_engine.sequence import Sequence
 from atom.sampling_params import SamplingParams
 from atom.utils import envs
-from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 logger = logging.getLogger("atom")
 
@@ -370,7 +371,7 @@ class InputOutputProcessor:
 
         Read by Sequence-construction (here) AND by ModelRunner's startup
         sanity check, which asserts that any model whose attention builder
-        returns `compute_per_req_cache_bytes() > 0` has its model_type
+        declares a per-request state sub-pool has its model_type
         registered here. Adding a new stateful-attention model means
         adding its model_type to this set.
         """

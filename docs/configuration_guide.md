@@ -64,8 +64,8 @@ Defined in `atom/config.py`. The root dataclass that the engine consumes.
 |---|---|---|
 | `hf_config` | `PretrainedConfig` | Loaded automatically via `get_hf_config(model)` |
 | `generation_config` | `GenerationConfig` | Loaded automatically via `get_generation_config(model)` |
-| `per_req_cache_equiv_blocks` | `int` | Number of KV cache block equivalents reserved per request for the per-request stateful-attention cache (currently GDN recurrent state; future stateful attentions plug in via `AttentionMetadataBuilder.compute_per_req_cache_bytes()`); computed by `ModelRunner.get_num_blocks()` |
-| `num_per_req_cache_groups` | `int` | Number of per-request slot groups available (= `max_num_seqs` for stateful-attention models, 0 otherwise); computed by `ModelRunner.get_num_blocks()` |
+| `pool_entries` | `dict[str, int]` | Entries sized for each cache class the attention builders declared via `AttentionMetadataBuilder.sub_pool_specs()` — the paged KV blocks, plus per-request STATE classes (GDN recurrent state, the DeepSeek-V4 compressor ring and sliding-window pool). Computed by `ModelRunner.get_num_blocks()` in the runner subprocess and carried to the engine process, where each consumer looks up the class it declared |
+| `pool_entries_per_req` | `dict[str, int]` | Per-request multiplicity of each class, so a consumer can turn an entry count into a request count (`entries // entries_per_req`); same origin as `pool_entries` |
 
 ## Compilation configuration (`CompilationConfig`)
 

@@ -6,6 +6,11 @@ from collections import OrderedDict, deque
 from atom.model_engine.kv_block import Block
 from atom.model_engine.sequence import Sequence
 
+# Name of the sub-pool sizing class this pool is fed from. Owned here, not in
+# the sizing layer: a backend that wants a sliding-window pool imports this to
+# declare its spec, and this pool reads the count back under the same key.
+SWA_POOL_CLASS = "swa"
+
 
 class SlidingWindowPool:
     """Content-addressed sliding-window KV block pool (DeepSeek-V4 SWA).

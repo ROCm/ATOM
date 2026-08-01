@@ -15,9 +15,9 @@ from atom.distributed.kv_events import (
     BlockStored,
     KVCacheEvent,
 )
-from atom.model_engine.kv_block import Block
+from atom.model_engine.kv_block import STATE_SLOT_CLASS, Block
 from atom.model_engine.sequence import Sequence
-from atom.model_engine.swa_pool import SlidingWindowPool
+from atom.model_engine.swa_pool import SWA_POOL_CLASS, SlidingWindowPool
 from atom.utils import envs
 
 
@@ -78,11 +78,20 @@ class BlockManager:
         # state). The backing tensor is pre-allocated by ModelRunner sized
         # to max_num_seqs and excluded from `num_kvcache_blocks` at sizing
         # time, so admission only needs a free slot index from this list.
-        # Each slot group contains slots_per_req() contiguous tensor indices
-        # (1 for stateless / + num_spec for spec-decoding-aware variants).
-        num_per_req_cache_groups: int = getattr(config, "num_per_req_cache_groups", 0)
+        # Sizing published `entries` per cache class plus the per-request
+        # multiplicity the declaring backend asked for (1 for a single
+        # committed state, + num_spec where a rollback slot per speculated
+        # token is kept). One group is what a single request occupies, i.e.
+        # `entries // entries_per_req` contiguous tensor indices.
+        pool_entries: dict = getattr(config, "pool_entries", None) or {}
+        pool_per_req: dict = getattr(config, "pool_entries_per_req", None) or {}
+        state_entries = int(pool_entries.get(STATE_SLOT_CLASS, 0))
+        state_per_req = int(pool_per_req.get(STATE_SLOT_CLASS, 1)) or 1
+        # Total capacity, kept so callers can tell "all slots busy" (transient)
+        # from "no slots were ever created" (permanent).
+        self.num_per_req_cache_groups = state_entries // state_per_req
         self.free_per_req_cache_groups: list[int] = list(
-            range(num_per_req_cache_groups)
+            range(self.num_per_req_cache_groups)
         )
 
         # Sliding-window KV pool (DeepSeek-V4). A separate content-addressed pool
@@ -93,9 +102,20 @@ class BlockManager:
         # byte-identical. See atom/model_engine/swa_pool.py.
         _spec = getattr(config, "speculative_config", None)
         _mtp_k = int(getattr(_spec, "num_speculative_tokens", 0) or 0) if _spec else 0
+        _swa_blocks = int(pool_entries.get(SWA_POOL_CLASS, 0))
+        _window = int(
+            getattr(getattr(config, "hf_config", None), "sliding_window", 0) or 0
+        )
+        # A backend only declares the SWA class for a windowed architecture, so
+        # the window has to be in hf_config. Fail here rather than let the pool
+        # come up enabled with window=0, which frees every block immediately.
+        assert not _swa_blocks or _window > 0, (
+            f"sub-pool {SWA_POOL_CLASS!r} was sized to {_swa_blocks} blocks but "
+            "hf_config has no sliding_window"
+        )
         self.swa = SlidingWindowPool(
-            num_blocks=getattr(config, "num_swa_blocks", 0),
-            window=getattr(config, "swa_window_size", 0),
+            num_blocks=_swa_blocks,
+            window=_window if _swa_blocks else 0,
             block_size=block_size,
             max_num_batched_tokens=getattr(config, "max_num_batched_tokens", 0),
             mtp_k=_mtp_k,
@@ -301,10 +321,10 @@ class BlockManager:
         seq.num_cached_tokens = num_cached_blocks * self._hash_block_size()
 
         # Per-request cache: claim one slot index from the pre-allocated
-        # state tensor (e.g. GDN mamba_k_cache, V4 compressor state + SWA
-        # ring). The state tensor's memory was already excluded from
-        # `num_kvcache_blocks` in ModelRunner._compute_kv_budget(), so
-        # admitting a seq adds no further paged-block cost. The slot cap
+        # state tensor (e.g. GDN mamba_k_cache, the V4 compressor ring). The
+        # state class took its bytes before the paged class was sized in
+        # ModelRunner.get_num_blocks(), so admitting a seq adds no further
+        # paged-block cost. The slot cap
         # (`free_per_req_cache_groups` size = `max_num_seqs`) is the sole
         # admission bound for state cache.
         if seq.has_per_req_cache:

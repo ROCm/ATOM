@@ -228,28 +228,30 @@ class BlockManager:
         self.used_block_ids: set[int] = set()
         self.enable_prefix_caching = config.enable_prefix_caching
         
-        # Per-request cache: per-request slot pool + equiv-block accounting.
-        # Used by attention types whose state lives outside the paged KV pool
-        # (currently GDN recurrent state; future stateful attentions plug in
-        # via AttentionMetadataBuilder.compute_per_req_cache_bytes()).
-        # Each slot group contains (1+num_spec) contiguous tensor indices.
-        self.per_req_cache_equiv_blocks: int = getattr(
-            config, "per_req_cache_equiv_blocks", 0
-        )
-        num_per_req_cache_groups: int = getattr(config, "num_per_req_cache_groups", 0)
+        # Per-request cache slot pool. Used by attention types whose state
+        # lives outside the paged KV pool (GDN recurrent state, the
+        # DeepSeek-V4 compressor ring); they declare it as a STATE entry
+        # class via AttentionMetadataBuilder.sub_pool_specs().
+        # One group = one request = `entries_per_req` contiguous tensor
+        # indices (1, or 1+num_spec where a rollback slot per speculated
+        # token is kept).
+        pool_entries: dict = getattr(config, "pool_entries", None) or {}
+        pool_per_req: dict = getattr(config, "pool_entries_per_req", None) or {}
+        state_entries = int(pool_entries.get(STATE_SLOT_CLASS, 0))
+        state_per_req = int(pool_per_req.get(STATE_SLOT_CLASS, 1)) or 1
+        self.num_per_req_cache_groups = state_entries // state_per_req
         self.free_per_req_cache_groups: list[int] = list(
-            range(num_per_req_cache_groups)
+            range(self.num_per_req_cache_groups)
         )
-        # seq_id → list of accounting block_ids (memory bookkeeping only)
-        self.per_req_cache_accounting: dict[int, list[int]] = {}
 ```
 
 The block pool is pre-allocated at startup. `free_block_ids` is a deque for O(1) pop/push, `used_block_ids` tracks active blocks, and `hash_to_block_id` maps content hashes to block IDs for prefix caching.
 
-**Per-Request Cache Pools (Stateful-Attention Models):** For models whose attention type maintains per-request state outside the paged KV pool (currently GDN: Qwen3-Next, Qwen3.5; future: DeepseekV4 ring buffer + compressor state, etc.):
-- `free_per_req_cache_groups` — list of available per-request slot group indices (0 to `num_per_req_cache_groups - 1`). Each group corresponds to one request and contains `1 + num_speculative_tokens` contiguous tensor slot indices.
-- `per_req_cache_accounting` — maps sequence ID to a list of equivalent block IDs used for memory accounting. The unified pool manages both KV cache blocks and per-request state through dynamic competition; per-request memory is accounted for as block equivalents.
-- `per_req_cache_equiv_blocks` — number of KV cache block equivalents reserved per request for its per-request cache (computed from `AttentionMetadataBuilder.compute_per_req_cache_bytes() / block_bytes`).
+**Per-Request Cache Pools (Stateful-Attention Models):** For models whose attention type maintains per-request state outside the paged KV pool (GDN: Qwen3-Next, Qwen3.5, Kimi-Linear; DeepSeek-V4's compressor ring):
+- `free_per_req_cache_groups` — list of available per-request slot group indices (0 to `num_per_req_cache_groups - 1`). Each group corresponds to one request and contains `entries_per_req` contiguous tensor slot indices (1 for a single committed state, `1 + num_speculative_tokens` where a rollback slot per speculated token is kept).
+- `num_per_req_cache_groups` — total capacity, so callers can tell "all slots busy" (transient) from "no slots were ever created" (permanent).
+
+The state class costs no paged blocks at admission time: sizing reserves every STATE class's floor before the paged class is sized (see [`sub_pool_spec.py`](../atom/model_ops/attentions/sub_pool_spec.py)), so a sequence only needs a free slot index. Because that floor is exactly `max_num_seqs` requests' worth, the slot pool never binds before `max_num_seqs` does.
 
 ### Allocation (`allocate`)
 
@@ -270,9 +272,7 @@ def allocate(self, seq: Sequence):
 
 **Per-request cache allocation (if `seq.has_per_req_cache`):**
 
-1. Allocates `per_req_cache_equiv_blocks` accounting blocks from the free pool (for memory accounting only).
-2. Stores these block IDs in `per_req_cache_accounting[seq.id]` to track per-request memory usage.
-3. Pops one slot group index from `free_per_req_cache_groups` and assigns it to `seq.per_req_cache_group` (per-request state indexing into the builder-allocated tensors).
+Pops one slot group index from `free_per_req_cache_groups` and assigns it to `seq.per_req_cache_group` (per-request state indexing into the builder-allocated tensors). No paged blocks are involved — the state class's bytes were already taken out of the budget at sizing time.
 
 ### Deallocation (`deallocate`)
 
@@ -288,10 +288,6 @@ def deallocate(self, seq: Sequence):
     seq.num_cached_tokens = 0
     seq.block_table.clear()
     if seq.has_per_req_cache and seq.per_req_cache_group >= 0:
-        for block_id in self.per_req_cache_accounting.pop(seq.id, []):
-            block = self.blocks[block_id]
-            block.ref_count = 0  # accounting blocks bypass ref-counting
-            self._deallocate_block(block_id)
         self.free_per_req_cache_groups.append(seq.per_req_cache_group)
         seq.per_req_cache_group = -1
 ```
@@ -300,26 +296,26 @@ def deallocate(self, seq: Sequence):
 
 **Per-request cache deallocation (if `seq.has_per_req_cache`):**
 
-1. Releases all accounting blocks for this sequence from `per_req_cache_accounting[seq.id]` directly (bypassing ref-counting, as they are internal to the accounting system).
-2. Returns the slot group index `seq.per_req_cache_group` to `free_per_req_cache_groups` for reuse.
-3. Clears `seq.per_req_cache_group` to `-1` to mark it as released.
+1. Returns the slot group index `seq.per_req_cache_group` to `free_per_req_cache_groups` for reuse.
+2. Clears `seq.per_req_cache_group` to `-1` to mark it as released.
 
 ### Can-allocate and can-append checks
 
 ```python
-def can_allocate(self, seq: Sequence) -> bool:
-    per_req_cache_cost = (
-        self.per_req_cache_equiv_blocks if seq.has_per_req_cache else 0
-    )
-    per_req_cache_slot_ok = (
-        (not seq.has_per_req_cache) or len(self.free_per_req_cache_groups) > 0
-    )
+def can_allocate(self, seq: Sequence) -> int:
+    """Return the number of cache-hit blocks (>=0) if seq fits, else -1."""
+    # State cache has its own reservation; admission only needs a free slot
+    # index, not extra paged blocks.
+    if seq.has_per_req_cache and not self.free_per_req_cache_groups:
+        return -1
     if not self.enable_prefix_caching:
-        return (
-            len(self.free_block_ids_set) >= seq.num_blocks + per_req_cache_cost
-            and per_req_cache_slot_ok
-        )
-    # ... (prefix caching dry-run logic with per_req_cache_cost included)
+        if len(self.free_block_ids_set) < self._dcp_num_blocks(len(seq)):
+            return -1
+        # SWA admission: only the per-request windowed peak, not the whole
+        # prompt. No-op when the sliding-window pool is disabled.
+        if not self.swa.has_free(self.swa.admission_blocks(seq)):
+            return -1
+    # ... (prefix caching dry-run returns the contiguous hit-block count)
 
 def can_append(self, seq: Sequence, num_new_tokens: int = 1) -> bool:
     seq_len = len(seq)
@@ -330,8 +326,8 @@ def can_append(self, seq: Sequence, num_new_tokens: int = 1) -> bool:
 ```
 
 - `can_allocate` checks that:
-  - Enough free KV blocks exist for the full sequence (`seq.num_blocks + per_req_cache_cost` accounting blocks for per-request state if applicable).
-  - At least one per-request cache slot group is available if the sequence has `has_per_req_cache=True`.
+  - Enough free KV blocks exist for the full sequence, and (for windowed architectures) enough sliding-window blocks for its windowed peak.
+  - At least one per-request cache slot group is available if the sequence has `has_per_req_cache=True`. Per-request state costs no paged blocks — its bytes were reserved ahead of the paged pool at sizing time.
   
 - `can_append` checks whether a decode step needs a new block. Calculates the required block count given `num_new_tokens` (typically `mtp_k + 1` for speculative decode) and returns whether enough free blocks remain.
 

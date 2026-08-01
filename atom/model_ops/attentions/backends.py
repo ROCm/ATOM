@@ -3,7 +3,7 @@
 
 import logging
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Dict, Generic, Optional, Type, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, Optional, TypeVar
 
 if TYPE_CHECKING:
     from atom.kv_transfer.disaggregation.types import KVTransferTensors
@@ -16,6 +16,7 @@ from torch import nn
 from atom.distributed.dcp_utils import get_dcp_rank, get_dcp_world_size
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import MLAModules
+from atom.model_ops.attentions.sub_pool_spec import SubPoolSpec
 from atom.utils import CpuGpuBuffer
 from atom.utils.forward_context import AttentionMetaData, AttnState
 from atom.utils.tbo.ubatch_splitting import (
@@ -32,7 +33,7 @@ T = TypeVar("T", bound="BroadcastableModelInput")
 class BroadcastableModelInput(ABC):
 
     @abstractmethod
-    def as_broadcastable_tensor_dict(self) -> Dict[str, Any]:
+    def as_broadcastable_tensor_dict(self) -> dict[str, Any]:
         """
         Extract broadcastable fields. Override for fields that require some
         custom deserialization.
@@ -42,8 +43,8 @@ class BroadcastableModelInput(ABC):
     @classmethod
     @abstractmethod
     def from_broadcasted_tensor_dict(
-        cls: Type[T],
-        tensor_dict: Dict[str, Any],
+        cls: type[T],
+        tensor_dict: dict[str, Any],
         attn_backend: Optional["AttentionBackend"] = None,
     ) -> T:
         """
@@ -68,11 +69,11 @@ class AttentionBackend(ABC):
 
     @staticmethod
     @abstractmethod
-    def get_builder_cls() -> Type["AttentionMetadataBuilder"]:
+    def get_builder_cls() -> type["AttentionMetadataBuilder"]:
         raise NotImplementedError
 
     @staticmethod
-    def get_impl_cls() -> Type["AttentionImpl"]:
+    def get_impl_cls() -> type["AttentionImpl"]:
         return AttentionImpl
 
 
@@ -101,47 +102,37 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         raise NotImplementedError
 
     # ------------------------------------------------------------------ #
-    # Per-request cache (model-managed state outside the paged KV pool). #
+    # Cache sizing — one byte currency for every cache class.             #
     # ------------------------------------------------------------------ #
-    # Used by attention types that maintain per-request stateful buffers
-    # which do not fit the paged KV cache model — e.g. GDN recurrent state,
-    # DeepseekV4 ring buffer + compressor state. ModelRunner queries these
-    # methods at startup to size the per-request slot pool, deduct its
-    # bytes from the KV pool budget, and allocate the underlying tensors.
-    #
-    # Stateless attentions (standard MHA / MLA) leave the defaults:
-    # `compute_per_req_cache_bytes()` returns 0, `allocate_per_req_cache()`
-    # returns an empty dict, so no per-req pool is allocated.
 
-    def compute_per_req_cache_bytes(self) -> int:
-        """Total bytes (across all attention layers) for ONE request's
-        per-request cache.
+    def sub_pool_specs(self) -> list[SubPoolSpec]:
+        """Every cache class this attention type needs, expressed in bytes.
 
-        ModelRunner multiplies this by `max_num_seqs * slots_per_req()` to
-        size the per-req cache tensors and deduct that memory from the KV
-        pool budget.
+        One `SubPoolSpec` per class: paged token KV, a window-freed SWA pool,
+        a per-request recurrent/compressor state pool. ModelRunner feeds the
+        list to `plan_pools` to turn a byte budget into entry counts, so the
+        runner never needs to know which architecture it is sizing.
+
+        Specs sharing a `name` are one sub-pool — their `entry_bytes` sum and
+        they share an entry index space. That is how a heterogeneous Eagle3
+        draft KV pool rides the target model's block ids.
+
+        Default is empty: a builder that owns no cache (e.g. a draft builder
+        with no KV of its own) contributes nothing to the budget.
         """
-        return 0
+        return []
 
-    def slots_per_req(self) -> int:
-        """Number of contiguous slot indices one request occupies.
+    def allocate_per_req_cache(
+        self, entries: dict[str, int]
+    ) -> dict[str, "torch.Tensor"]:
+        """Allocate this backend's per-request state tensors.
 
-        Default = 1 (single committed state, no speculative lookahead).
-        GDN-style attentions override with `1 + model_runner.num_spec_tokens`
-        because their state-update kernel reserves one extra slot per
-        speculated token for rollback on rejection. Override only if the
-        attention has a different lookahead layout.
-        """
-        return 1
-
-    def allocate_per_req_cache(self, num_slots: int) -> dict[str, "torch.Tensor"]:
-        """Allocate per-request cache tensors.
-
-        Called by ModelRunner.allocate_kv_cache() once `num_slots` is known.
-        Builder returns a dict mapping attribute name → tensor; ModelRunner
-        does `setattr(self, name, tensor)` so model layers can access them
-        as `model_runner.<name>` (preserving existing names like
-        `mamba_k_cache` / `mamba_v_cache`).
+        Called by ModelRunner.allocate_kv_cache() with the entry count sizing
+        assigned to every cache class. The builder indexes the classes it
+        declared in `sub_pool_specs` — the runner does not know their names.
+        Returns a dict mapping attribute name → tensor; ModelRunner does
+        `setattr(self, name, tensor)` so model layers can reach them as
+        `model_runner.<name>` (preserving existing names like `mamba_k_cache`).
         """
         return {}
 
@@ -157,44 +148,6 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         not been allocated yet.
         """
         return None
-
-    def compute_block_bytes(self) -> int:
-        """Per-block bytes contributed by this attention type's primary KV
-        tensors (kv_cache + kv_scale + any side caches like the V3.2
-        indexer cache).
-
-        Mirror of `allocate_kv_cache_tensors`: used by ModelRunner
-        get_num_blocks() to size the unified pool BEFORE any tensor is
-        allocated, so the budget math sees the same per-block cost the
-        builder will actually allocate. Per-request cache bytes are NOT
-        included here — they're accounted for via
-        `compute_per_req_cache_bytes()`.
-
-        Default returns 0 (no primary KV pool).
-        """
-        return 0
-
-    # ------------------------------------------------------------------ #
-    # Paged sliding-window (SWA) pool — a separate, window-freed KV pool  #
-    # some attention types carve out of the main KV budget.              #
-    # ------------------------------------------------------------------ #
-    # ModelRunner queries these at startup to decide, model-agnostically,
-    # whether to reserve a `num_swa_blocks`-sized SWA pool and deduct its
-    # bytes from the main (compressed) KV pool. A builder that returns >0
-    # from `swa_pool_block_bytes()` opts into the pool; the default 0 means
-    # no separate SWA pool (standard attentions keep all KV in one pool).
-    # This keeps the arch-specific decision inside the builder, not in the
-    # runner.
-
-    def swa_pool_block_bytes(self) -> int:
-        """Bytes of ONE physical SWA-pool block across all attention layers,
-        or 0 (default) if this attention type has no separate paged-SWA pool."""
-        return 0
-
-    def swa_pool_num_blocks(self, max_num_seqs: int, max_model_len: int) -> int:
-        """Number of blocks to reserve for the paged-SWA pool, or 0 (default).
-        Only consulted when `swa_pool_block_bytes()` > 0."""
-        return 0
 
     def allocate_kv_cache_tensors(
         self, num_kv_heads: int, num_draft_layers: int
@@ -236,9 +189,9 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         `base_linear_attention` and delegates `base_attention` MHA modules
         to its `AiterAttentionMetadataBuilder` parent).
 
-        Default returns None for unknown module types.
+        Default: unknown module types get no tensor.
         """
-        return None
+        return
 
 
 class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
@@ -541,7 +494,7 @@ class AttentionImpl(nn.Module):
         num_heads: int,
         head_size: int,
         scale: float,
-        num_kv_heads: Optional[int] = None,
+        num_kv_heads: int | None = None,
         kv_cache_dtype: str = "auto",
         layer_num: int = 0,
         mla_modules: MLAModules = None,

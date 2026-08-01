@@ -42,6 +42,13 @@ from atom.model_engine.run_labels import build_run_label
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 from atom.model_loader.loader import load_model
+from atom.model_ops.attentions.sub_pool_spec import (
+    InsufficientPoolBudget,
+    Pool,
+    PoolPlan,
+    SubPoolSpec,
+    plan_pools,
+)
 from atom.model_ops.eplb import (
     initialize_eplb_runtime,
     with_eplb_forward_monitor,
@@ -805,6 +812,11 @@ class ModelRunner:
             model_runner=self
         )
         self.physical_block_size = self.attn_metadata_builder.block_size
+        # Sub-pool sizing needs a memory profile, so it cannot run until after
+        # warmup. Install the empty plan now: `warmup_model` below drives the
+        # builder through paths that ask for their entry counts, and those must
+        # read 0 ("no pool yet") rather than trip over a missing attribute.
+        self.pool_plan = PoolPlan.empty()
         # Sanity-check: any builder that allocates a per-request cache must
         # have its model_type listed in `InputOutputProcessor`'s
         # `per_req_cache_model_types` set; otherwise sequences will be
@@ -812,14 +824,14 @@ class ModelRunner:
         # never assign them a slot, and the builder will silently read
         # tensor[-1] on first decode. Catch the misconfiguration up front
         # rather than producing wrong outputs at inference time.
-        if self.attn_metadata_builder.compute_per_req_cache_bytes() > 0:
+        if self._has_state_pool():
             from atom.model_engine.llm_engine import InputOutputProcessor as _IOProc
 
             mt = self.config.hf_config.model_type
             known = _IOProc._per_req_cache_model_types()
             assert mt in known, (
                 f"Attention builder {type(self.attn_metadata_builder).__name__} "
-                f"reports per_req_cache_bytes>0 but model_type={mt!r} is not in "
+                f"declares a per-request state pool but model_type={mt!r} is not in "
                 f"InputOutputProcessor.per_req_cache_model_types ({sorted(known)}). "
                 "Add it to the set or sequences will not be assigned slots "
                 "(silent corruption)."
@@ -1445,21 +1457,25 @@ class ModelRunner:
             total += getattr(draft_hf, "num_nextn_predict_layers", 1)
         return total
 
-    def _compute_block_bytes(self):
-        """Per-block bytes for the unified KV pool budget.
+    def _sub_pool_specs(self) -> list[SubPoolSpec]:
+        """Cache-class declarations from every builder attached to this runner.
 
-        Sum across all attention builders attached to this runner: the
-        target builder always, plus an optional `eagle3_draft_builder`
-        when a heterogeneous spec-decode draft owns its own KV pool. Each
-        builder knows its own tensor layout (MLA 576-dim packed, GDN-hybrid
+        The target builder always, plus an optional `eagle3_draft_builder`
+        when a heterogeneous spec-decode draft owns its own KV. Each builder
+        knows its own tensor layout (MLA 576-dim packed, GDN-hybrid
         full-attn-only, MiMo-V2 per-layer-type, standard MHA split-K/V,
-        Eagle3 independent MHA). Per-request cache bytes are accounted
-        for separately via `compute_per_req_cache_bytes()`.
+        Eagle3 independent MHA); the runner only sums bytes. Specs sharing a
+        name merge in `plan_pools`, which is how the draft KV joins the
+        target's block ids instead of forming a second pool.
         """
-        block_bytes = self.attn_metadata_builder.compute_block_bytes()
+        specs = list(self.attn_metadata_builder.sub_pool_specs())
         if hasattr(self, "eagle3_draft_builder"):
-            block_bytes += self.eagle3_draft_builder.compute_block_bytes()
-        return block_bytes
+            specs += self.eagle3_draft_builder.sub_pool_specs()
+        return specs
+
+    def _has_state_pool(self) -> bool:
+        """Whether any attached builder declares a per-request STATE class."""
+        return any(s.pool is Pool.STATE for s in self._sub_pool_specs())
 
     def _estimate_cudagraph_overhead(self):
         """Estimate GPU memory consumed by CUDA graph capture.
@@ -1583,30 +1599,28 @@ class ModelRunner:
 
         torch.set_default_device("cpu")
 
-        block_bytes = self._compute_block_bytes()
+        specs = self._sub_pool_specs()
 
-        # Per-request cache (e.g. GDN recurrent state, future DeepseekV4 ring
-        # buffer + compressor state): deduct its tensor memory from the KV
-        # pool budget. The actual layout / shape is owned by the attention
-        # builder; ModelRunner only does sizing math.
-        per_req_cache_bytes = self.attn_metadata_builder.compute_per_req_cache_bytes()
-        slots_per_req = self.attn_metadata_builder.slots_per_req()
-        max_per_req_cache_slots = (
-            config.max_num_seqs * slots_per_req if per_req_cache_bytes > 0 else 0
-        )
-        per_req_cache_tensor_bytes = max_per_req_cache_slots * per_req_cache_bytes
-        available_for_pool = available_for_kv - per_req_cache_tensor_bytes
-        if available_for_pool <= 0:
+        # Sub-pool sizing is pure arithmetic over the byte budget — see
+        # atom/model_ops/attentions/sub_pool_spec.py. STATE classes (GDN
+        # recurrent state, the V4 compressor ring, the V4 sliding window) take
+        # their floor first because a request cannot run without them; the
+        # PAGE class absorbs the rest. Which classes exist, and what they are
+        # called, is the backend's business — the runner sizes them and
+        # publishes the counts, then every consumer looks up the class it
+        # declared itself.
+        try:
+            plan = plan_pools(specs, available_for_kv, config.max_num_seqs)
+        except InsufficientPoolBudget as exc:
             # Minimum gpu_memory_utilization that makes the budget just cover the
-            # per-request cache tensor (available_for_kv_budget ==
-            # per_req_cache_tensor_bytes). Rounded UP to the next 0.01 so the
-            # printed value is actually sufficient, not the exact threshold.
-            min_util = (non_kv_overhead + per_req_cache_tensor_bytes) / total
+            # per-request pools. Rounded UP to the next 0.01 so the printed value
+            # is actually sufficient, not the exact threshold.
+            min_util = (non_kv_overhead + exc.reserved_bytes) / total
             min_util_hint = math.ceil(min_util * 100) / 100
             base_msg = (
                 f"Per-request cache tensor "
-                f"({per_req_cache_tensor_bytes / (1 << 30):.2f}GB for "
-                f"{max_per_req_cache_slots} slots) exceeds available KV budget "
+                f"({exc.reserved_bytes / (1 << 30):.2f}GB for "
+                f"{exc.entries} slots) exceeds available KV budget "
                 f"({available_for_kv / (1 << 30):.2f}GB) at "
                 f"--gpu-memory-utilization {config.gpu_memory_utilization:.2f}."
             )
@@ -1632,101 +1646,35 @@ class ModelRunner:
                     f"(would need {min_util:.2f}); reduce --max-num-seqs "
                     f"(currently {config.max_num_seqs}) or free GPU memory."
                 )
-            raise RuntimeError(base_msg + fix_msg)
-        per_req_cache_equiv_blocks = (
-            math.ceil(per_req_cache_bytes / block_bytes)
-            if per_req_cache_bytes > 0
-            else 0
-        )
-
-        # Store for BlockManager and allocate_kv_cache.
-        # Note the distinction:
-        #   - per_req_cache_equiv_blocks: block-equivalents charged to the
-        #     unified pool per request (memory accounting)
-        #   - num_per_req_cache_groups: BlockManager free-list size; one
-        #     group == one request occupies `slots_per_req` contiguous
-        #     tensor slots
-        #   - max_per_req_cache_slots (runner-only): TENSOR slot dimension
-        #     == groups × slots_per_req (groups != slots in general)
-        config.per_req_cache_equiv_blocks = per_req_cache_equiv_blocks
-        config.num_per_req_cache_groups = (
-            config.max_num_seqs if per_req_cache_bytes > 0 else 0
-        )
-        self.max_per_req_cache_slots = max_per_req_cache_slots
-
-        # paged-SWA: some attention backends carve a SEPARATE windowed/prefix-
-        # cached SWA pool out of the KV budget. The SWA bytes that
-        # `compute_block_bytes` charges per compressed block move into a
-        # `num_swa_blocks`-sized pool (window-freed, so far smaller than the
-        # compressed pool), and the freed budget grows `num_kvcache_blocks`.
-        # Whether this applies is a builder capability — `swa_pool_block_bytes()`
-        # returns >0 only for backends with a separate SWA pool — so the runner
-        # stays model-agnostic (no architecture check here). Under
-        # PD/disaggregation the SWA pool is transferred per-request by
-        # seq.swa_block_table (only the live window, i.e. the last ~128-token
-        # block); see get_kv_transfer_tensors.
-        b = self.attn_metadata_builder
-        swa_block_bytes = b.swa_pool_block_bytes()
-        if swa_block_bytes > 0:
-            # block_bytes (from _compute_block_bytes) currently includes the SWA
-            # term; strip it so the compressed pool is sized on compressed bytes.
-            compressed_block_bytes = block_bytes - swa_block_bytes
-            if envs.ATOM_SWA_FULL_RETAIN:
-                # Full-retain: give the SWA tail pool a small fraction `f` of the
-                # budget; the rest stays with the compressed pool. One SWA block is
-                # ~7x the bytes of one compressed block, so a 1:1 mirror
-                # (num_swa == num_kvcache) starves the compressed prefix index
-                # (measured: 298k -> 36.8k blocks -> hit rate collapsed). A small
-                # f keeps compressed near full while retaining the hot-boundary
-                # tail working set (LRU-evicted, same eviction discipline as
-                # vLLM's FreeKVCacheBlockQueue). Memory-bounded regardless of
-                # max_model_len. Live SWA footprint stays ~window/seq (window-free
-                # is kept); the tail pool holds lazily-freed-but-cached tails.
-                f = min(0.9, max(1e-3, envs.ATOM_SWA_TAIL_BUDGET_FRAC))
-                swa_budget = int(available_for_pool * f)
-                compressed_budget = available_for_pool - swa_budget
-                num_swa_blocks = swa_budget // swa_block_bytes
-                num_kvcache_blocks = compressed_budget // compressed_block_bytes
-                swa_reserved = num_swa_blocks * swa_block_bytes
-                logger.info(
-                    f"paged-SWA full-retain: tail_budget_frac={f:.3f}, "
-                    f"swa_budget={swa_budget / (1 << 30):.2f}GB, "
-                    f"compressed_budget={compressed_budget / (1 << 30):.2f}GB"
-                )
-            else:
-                num_swa_blocks = b.swa_pool_num_blocks(
-                    config.max_num_seqs, config.max_model_len
-                )
-                swa_reserved = num_swa_blocks * swa_block_bytes
-                num_kvcache_blocks = max(
-                    0, (available_for_pool - swa_reserved) // compressed_block_bytes
-                )
-            config.num_swa_blocks = int(num_swa_blocks)
-            config.swa_window_size = int(
-                getattr(hf_config, "sliding_window", 128) or 128
-            )
-            self.num_swa_blocks = int(num_swa_blocks)
-            logger.info(
-                f"paged-SWA pool: num_swa_blocks={num_swa_blocks}, "
-                f"swa_block_bytes={swa_block_bytes}, "
-                f"swa_reserved={swa_reserved / (1 << 30):.2f}GB, "
-                f"compressed_block_bytes={compressed_block_bytes}, "
-                f"num_kvcache_blocks={num_kvcache_blocks}"
-            )
-        else:
-            config.num_swa_blocks = 0
-            config.swa_window_size = 0
-            self.num_swa_blocks = 0
-            num_kvcache_blocks = available_for_pool // block_bytes
+            raise RuntimeError(base_msg + fix_msg) from exc
 
         # PP stages compute different block counts; block ids must be valid on
-        # every stage's KV tensor, so reduce to the global minimum.
+        # every stage's KV tensor, so reduce to the global minimum. Fold the
+        # result back into the plan before publishing anything: the plan is the
+        # single source for every entry count, so it must never disagree with
+        # the number the pool is actually built at.
+        num_kvcache_blocks = plan.paged_entries
         if config.pipeline_parallel_size > 1 and torch.distributed.is_initialized():
             t = torch.tensor(
                 [num_kvcache_blocks], dtype=torch.int64, device=self.device
             )
             torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN)
             num_kvcache_blocks = int(t.item())
+            plan = plan.with_paged_entries(num_kvcache_blocks)
+
+        block_bytes = plan.entry_bytes[plan.paged_class]
+        # The whole plan travels to the engine process; BlockManager, the
+        # sliding-window pool and the attention builder each index it by the
+        # class name they declared. Nothing here needs to know those names.
+        self.pool_plan = plan
+        config.pool_entries = dict(plan.entries)
+        config.pool_entries_per_req = dict(plan.entries_per_req)
+        for name in sorted(plan.entries):
+            logger.info(
+                f"sub-pool {name}: entries={plan.entries[name]}, "
+                f"entry_bytes={plan.entry_bytes[name]}, "
+                f"reserved={plan.reserved_bytes[name] / (1 << 30):.2f}GB"
+            )
 
         logger.info(
             f"Memory budget: total_gpu={total / (1 << 30):.2f}GB, "
@@ -1741,27 +1689,16 @@ class ModelRunner:
             f"block_bytes={block_bytes}, "
             f"num_kvcache_blocks={num_kvcache_blocks}"
         )
-        if per_req_cache_bytes > 0:
-            logger.info(
-                f"Per-req cache pool: bytes_per_slot="
-                f"{per_req_cache_bytes / (1 << 20):.2f}MB, "
-                f"max_slots={max_per_req_cache_slots}, "
-                f"tensor_total={per_req_cache_tensor_bytes / (1 << 30):.2f}GB, "
-                f"equiv_blocks_per_req={per_req_cache_equiv_blocks}, "
-                f"pool_blocks={num_kvcache_blocks}"
-            )
-
         # Concurrent-capacity table: at each context-length percentage of
         # max_model_len, how many requests can simultaneously hold their
-        # KV in the pool. Per-req block usage = ceil(ctx_len/block_size);
-        # per-req state cache is in its own pre-allocated tensor (already
-        # excluded from `num_kvcache_blocks` at sizing time), so it adds
-        # no per-block cost. Concurrency is also capped by
-        # max_per_req_cache_slots (state buffer slot count).
+        # KV in the pool. Per-req block usage = ceil(ctx_len/block_size).
+        # STATE classes sit in their own reservation (already excluded from
+        # the paged count at sizing time), so they add no per-block cost and
+        # never bind either: sizing reserves every STATE floor at exactly
+        # `max_num_seqs` requests' worth, so the request cap is max_num_seqs
+        # and the paged pool is the only thing that can run out first.
         max_model_len = config.max_model_len
-        cap = (
-            max_per_req_cache_slots if per_req_cache_bytes > 0 else config.max_num_seqs
-        )
+        cap = config.max_num_seqs
         pct_lines = []
         for pct in (10, 30, 50, 70, 90, 100):
             ctx = max(1, max_model_len * pct // 100)
@@ -1795,19 +1732,15 @@ class ModelRunner:
             f"safety={safety_margin / (1 << 30):.2f}GB, "
             f"free={free / (1 << 30):.2f}GB)"
         )
+        # get_num_blocks runs in the RUNNER subprocess, so nothing it writes
+        # to `config` is visible to the engine process that builds
+        # BlockManager. Ship the whole per-class entry table across instead of
+        # a hand-picked field per architecture; consumers over there look up
+        # the class they declared.
         return {
             "num_kvcache_blocks": num_kvcache_blocks,
-            "per_req_cache_equiv_blocks": per_req_cache_equiv_blocks,
-            "num_per_req_cache_groups": (
-                config.max_num_seqs if per_req_cache_bytes > 0 else 0
-            ),
-            # paged-SWA: get_num_blocks runs in the RUNNER subprocess, so its
-            # config.num_swa_blocks isn't visible to the engine process that
-            # builds BlockManager. Propagate via block_info (mirrors the
-            # per_req_cache fields) so BlockManager.swa_enabled matches the
-            # attn builder's SWA pool.
-            "num_swa_blocks": int(getattr(config, "num_swa_blocks", 0)),
-            "swa_window_size": int(getattr(config, "swa_window_size", 0)),
+            "pool_entries": dict(plan.entries),
+            "pool_entries_per_req": dict(plan.entries_per_req),
         }
 
     def allocate_kv_cache(self, num_kvcache_blocks):
@@ -1890,12 +1823,11 @@ class ModelRunner:
         # `{"mamba_k_cache": ..., "mamba_v_cache": ...}`; for stateless
         # attentions it returns an empty dict (no-op). Tensors are setattr'd
         # on `self` so model layers can access them as `model_runner.<name>`.
-        if self.max_per_req_cache_slots > 0:
-            per_req_tensors = self.attn_metadata_builder.allocate_per_req_cache(
-                self.max_per_req_cache_slots
-            )
-            for name, tensor in per_req_tensors.items():
-                setattr(self, name, tensor)
+        per_req_tensors = self.attn_metadata_builder.allocate_per_req_cache(
+            self.pool_plan.entries
+        )
+        for name, tensor in per_req_tensors.items():
+            setattr(self, name, tensor)
 
         # Build KVCacheConfig
         # lirong TODO: This is a simple solution to build KVCacheConfig,
@@ -1991,25 +1923,14 @@ class ModelRunner:
         # buffers + SWA window prefix embedded in unified_kv). The budget
         # math in `get_num_blocks()` reserves both separately, so the cross-
         # check must mirror that — otherwise it spuriously fires for any
-        # backend with non-zero `compute_per_req_cache_bytes()` (V4, GDN).
+        # backend that declares a per-request state pool (V4, GDN).
         post_alloc = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         actual_kv_bytes = post_alloc - pre_alloc
-        # paged-SWA: SWA moved to its own num_swa_blocks pool, so the
-        # compressed pool is sized on (block_bytes - swa_block_bytes); add the
-        # SWA pool separately. (non-V4 → num_swa_blocks=0, reduces to the
-        # original formula.)
-        _nswa = getattr(self, "num_swa_blocks", 0)
-        _swa_bb = (
-            self.attn_metadata_builder.swa_pool_block_bytes()
-            if _nswa > 0 and hasattr(self.attn_metadata_builder, "swa_pool_block_bytes")
-            else 0
-        )
-        expected_kv_bytes = (
-            (self._compute_block_bytes() - _swa_bb) * num_kvcache_blocks
-            + _swa_bb * _nswa
-            + self.attn_metadata_builder.compute_per_req_cache_bytes()
-            * self.max_per_req_cache_slots
-        )
+        # Each sub-pool contributes `entry_bytes × entries`. The counts come
+        # straight from the sizing plan — which already absorbed the pipeline-
+        # parallel reconciliation — so this mirrors the budget by construction
+        # rather than re-deriving it.
+        expected_kv_bytes = self.pool_plan.total_reserved_bytes
         if expected_kv_bytes > 0:
             diff_pct = abs(actual_kv_bytes - expected_kv_bytes) / expected_kv_bytes
             # 3% threshold: budget formula matches allocation exactly, but the
