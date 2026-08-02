@@ -33,8 +33,8 @@ Caller (per-seq loop) gets `cu_compress_cpu` for slicing the kernel's flat
 output `[num_compress, head_dim]` back to per-seq chunks.
 """
 
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable, Tuple
 
 import numpy as np
 import torch
@@ -80,7 +80,7 @@ class CompressPlan:
 def make_compress_plans(
     extend_lens_cpu: np.ndarray,
     context_lens_cpu: np.ndarray,
-    unique_ratios_overlap: Iterable[Tuple[int, bool]],
+    unique_ratios_overlap: Iterable[tuple[int, bool]],
     *,
     plan_buffers: dict,
     graph_bs: int | None = None,
@@ -307,7 +307,7 @@ def make_capture_boundary_plan(
     block_size: int,
     device,
     tail: int = 4,
-) -> Tuple[torch.Tensor, int]:
+) -> tuple[torch.Tensor, int]:
     """Build the CSA boundary-capture plan for one prefill fwd.
 
     Selects every extend token whose absolute position is in the last ``tail``
@@ -356,7 +356,7 @@ def make_restore_boundary_plan(
     boundary_lens: np.ndarray,
     *,
     device,
-) -> Tuple[torch.Tensor, int]:
+) -> tuple[torch.Tensor, int]:
     """Build the CSA boundary-restore plan for one prefill fwd.
 
     One row per sequence with a live snapshot source (``source_block_id >= 0``):

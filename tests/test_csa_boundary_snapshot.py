@@ -37,7 +37,7 @@ if not torch.cuda.is_available():
         pytest.skip("CSA snapshot kernels require a GPU", allow_module_level=True)
     raise SystemExit("CSA snapshot kernels require a GPU")
 
-from atom.model_ops.v4_kernels.state_writes import (  # noqa: E402
+from atom.model_ops.v4_kernels.state_writes import (
     capture_compressor_boundary,
     capture_compressor_boundary_reference,
     restore_compressor_boundary,
