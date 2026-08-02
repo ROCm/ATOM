@@ -17,6 +17,7 @@ from atom.distributed.kv_events import (
 )
 from atom.model_engine.kv_block import STATE_SLOT_CLASS, Block
 from atom.model_engine.sequence import Sequence
+from atom.model_engine.state_pool import StateCheckpointPool
 from atom.model_engine.swa_pool import SWA_POOL_CLASS, SlidingWindowPool
 from atom.utils import envs
 
@@ -90,8 +91,29 @@ class BlockManager:
         # Total capacity, kept so callers can tell "all slots busy" (transient)
         # from "no slots were ever created" (permanent).
         self.num_per_req_cache_groups = state_entries // state_per_req
-        self.free_per_req_cache_groups: list[int] = list(
+        # FIFO, matching `free_block_ids`: a group handed back keeps its content
+        # and may still be indexed as a state checkpoint, so hand-out order must
+        # be least-recently-freed first or every checkpoint is evicted by the
+        # next admission. `_pop_state_group` performs the lazy eviction.
+        self.free_per_req_cache_groups: deque[int] = deque(
             range(self.num_per_req_cache_groups)
+        )
+        # Content index over the free groups above (see StateCheckpointPool):
+        # a state checkpoint IS a free group whose content is still valid, so
+        # this pool holds no capacity of its own and never blocks admission.
+        self.state = StateCheckpointPool(
+            self.num_per_req_cache_groups, enabled=self.enable_prefix_caching
+        )
+        # Minimum tokens the forward after a fork must cover for the new group
+        # to come out self-contained (see AttentionBackend.min_fork_tokens).
+        # 0 = the backend cannot fork, so nothing is ever published and every
+        # hit on a stateful model shrinks to 0.
+        self.state_min_fork_tokens = int(
+            getattr(config, "state_min_fork_tokens", 0) or 0
+        )
+        # Hash blocks between checkpoints (--state-checkpoint-interval).
+        self.state_checkpoint_interval = max(
+            0, int(getattr(config, "state_checkpoint_interval", 0) or 0)
         )
 
         # Sliding-window KV pool (DeepSeek-V4). A separate content-addressed pool
@@ -144,6 +166,42 @@ class BlockManager:
                 self.free_block_ids_set.discard(block_id)
                 return block_id
         raise AssertionError("No free blocks available")
+
+    def _pop_state_group(self) -> int:
+        """Hand out a per-request state group, evicting its checkpoint if any.
+
+        The state twin of `_pop_free_block`: groups sit in the FIFO carrying
+        whatever the last owner left in them, and re-allocation — not the free
+        — is the eviction event.
+        """
+        group = self.free_per_req_cache_groups.popleft()
+        self.state.invalidate(group)
+        return group
+
+    def _claim_state_group(self, group: int) -> None:
+        """Claim one specific free group — a checkpoint the caller looked up.
+
+        Linear in the free list, unlike `_pop_state_group`. That is deliberate:
+        the queue stays the single source of truth for "how many groups are
+        free", which admission and every caller of `len()` rely on. The scan is
+        bounded by max_num_seqs and runs once per resuming request, against a
+        `can_allocate` that already hashed every block of the prompt.
+        """
+        self.free_per_req_cache_groups.remove(group)
+
+    def _release_state_group(self, group: int) -> None:
+        self.free_per_req_cache_groups.append(group)
+
+    def release_state_pins(self) -> None:
+        """Return the previous step's fork sources to the free list.
+
+        Called once per engine step before scheduling. A fork source is read by
+        the forward that was already issued when it is handed out again, and the
+        next owner's forward is issued after that one on the same stream, so
+        stream ordering covers the overlap.
+        """
+        for group in self.state.take_pins():
+            self._release_state_group(group)
 
     def _allocate_block(self, block_id: int) -> Block:
         block = self.blocks[block_id]
@@ -198,6 +256,53 @@ class BlockManager:
         hbs = self.hash_block_size
         return seq.token_ids[i * hbs : (i + 1) * hbs]
 
+    def _state_bounded_hit(
+        self, seq: Sequence, hit: int, block_hashes: list[int]
+    ) -> int:
+        """Shrink `hit` to the rightmost boundary with a resumable state."""
+        if not (seq.has_per_req_cache and self.state.enabled):
+            return hit
+        hbs = self._hash_block_size()
+        min_fork = self.state_min_fork_tokens
+
+        def forkable(boundary: int) -> bool:
+            # The resumed forward reads the checkpoint and writes a fresh group;
+            # it must cover enough tokens to leave that group self-contained.
+            return seq.num_tokens - boundary * hbs >= min_fork
+
+        return self.state.bounded_hit(hit, block_hashes, forkable)
+
+    def _gated_hit(
+        self, seq: Sequence, compressed_hit: int, block_hashes: list[int]
+    ) -> int:
+        """Rightmost boundary that satisfies the SWA and state gates together.
+
+        Both gates answer "the rightmost boundary <= X that I accept", and
+        neither is monotone in the other, so they cannot be applied in series:
+        the largest SWA-complete boundary need not carry a state checkpoint, and
+        walking back to one that does can land on a boundary whose trailing SWA
+        window is gone. `allocate` then calls `swa.claim_cached` for a hash the
+        SWA pool never promised — which is exactly the guarantee that method's
+        docstring asks the caller for.
+
+        So alternate: take the SWA boundary, ask the state index for the nearest
+        checkpoint at or below it, re-ask SWA about that one, and repeat. Each
+        round strictly decreases the candidate, so it terminates; with either
+        gate disabled the first round already agrees and returns.
+        """
+        boundary = self.swa.bounded_hit(seq, compressed_hit, block_hashes)
+        while boundary > 0:
+            with_state = self._state_bounded_hit(seq, boundary, block_hashes)
+            if with_state == 0:
+                return 0
+            if with_state == boundary:
+                return boundary  # already SWA-approved this round
+            swa_ok = self.swa.bounded_hit(seq, with_state, block_hashes)
+            if swa_ok == with_state:
+                return with_state
+            boundary = swa_ok
+        return 0
+
     def can_allocate(self, seq: Sequence) -> int:
         """Return number of cache-hit blocks (>=0) if seq fits, else -1.
 
@@ -245,8 +350,14 @@ class BlockManager:
         # SlidingWindowManager; simple-hybrid one pass). Reduces compressed_hit
         # → num_cached_blocks so we never reuse a block whose in-window SWA is
         # gone (#1417), while out-of-window front blocks (SWA-freed) don't block
-        # the hit.
-        num_cached_blocks = self.swa.bounded_hit(seq, compressed_hit, block_hashes)
+        # the hit —
+        # plus step 3, the per-request state: neither the SSM recurrent state nor
+        # the V4 compressor ring can be rebuilt from cached blocks — the cache
+        # holds the compressor's output, the state is its rolling input window —
+        # so a boundary is only resumable where somebody published the state.
+        # `_gated_hit` settles the two gates jointly; neither can be applied to
+        # the other's answer.
+        num_cached_blocks = self._gated_hit(seq, compressed_hit, block_hashes)
         # Instrumentation: record the pre-gate compressed hit so CacheStats can
         # separate reuse lost to the SWA tail gate (compressed_hit -
         # num_cached_blocks) from reuse lost to compressed eviction.
@@ -328,7 +439,49 @@ class BlockManager:
         # (`free_per_req_cache_groups` size = `max_num_seqs`) is the sole
         # admission bound for state cache.
         if seq.has_per_req_cache:
-            seq.per_req_cache_group = self.free_per_req_cache_groups.pop()
+            self._attach_state_group(seq, h if num_cached_blocks > 0 else -1)
+
+    def _attach_state_group(self, seq: Sequence, hit_hash: int) -> None:
+        """Give `seq` a state group, resuming from a checkpoint when one exists.
+
+        `hit_hash` is the content hash of the last reused block (-1 for a cold
+        start). `can_allocate` already shrank the hit to a boundary that carries
+        a checkpoint, so a lookup miss here just means the pool is off.
+
+        Resuming forks: the checkpoint stays published and the request writes a
+        fresh group, so a second request hitting the same prefix still finds it.
+        When no second group is free the request adopts the checkpoint instead
+        — still correct, the state is exactly the one it wanted, it just spends
+        the checkpoint rather than sharing it.
+
+        A checkpoint is read-only, so several requests in one step may fork off
+        the same one. The first takes it off the free list and the pin covers
+        every reader until `release_state_pins`; a later one in that same step
+        finds it already pinned and only needs a group to write into. Adopting
+        is then off the table — the pin means someone else's forward still has
+        to read it.
+        """
+        src = self.state.lookup(hit_hash) if hit_hash != -1 else -1
+        if src < 0:
+            seq.per_req_cache_group = self._pop_state_group()
+            seq.state_fork_src = -1
+            return
+        shared = self.state.is_pinned(src)
+        if not shared:
+            self._claim_state_group(src)
+        if self.free_per_req_cache_groups:
+            seq.per_req_cache_group = self._pop_state_group()
+            seq.state_fork_src = src
+            # Held off the free list until the forward that reads it is issued.
+            self.state.pin(src)
+            return
+        # `can_allocate` admitted this seq against a non-empty free list and
+        # nothing else has run since, so the list can only be empty here if this
+        # seq itself just took the last group — which is `src`, unshared.
+        assert not shared, "no group to fork into and the source is being read"
+        self.state.invalidate(src)
+        seq.per_req_cache_group = src
+        seq.state_fork_src = -1
 
     def hash_blocks(
         self, seq: Sequence, num_new_tokens: int, start_tokens: int | None = None
@@ -383,6 +536,93 @@ class BlockManager:
                     self.block_size,
                 )
             )
+        if self.is_state_publish_pos(seq, base + num_new_tokens):
+            self._publish_state_checkpoint(seq, h)
+
+    def cancel_state_fork(self, seq: Sequence) -> bool:
+        """Undo a pending fork by adopting its source group.
+
+        Called when the forward that was going to carry the fork turns out too
+        short to fill a fresh group (`min_fork_tokens`). Both flavours collapse
+        to the same move — take the source over and spend its checkpoint:
+        a resume becomes the non-sharing hit, a publish becomes no publish at
+        all.
+
+        Returns False when the source cannot be taken over because another
+        request in this same step forks off it too: adopting means writing into
+        a group that request's forward still has to read. The caller keeps the
+        fork instead and must not shorten the forward below `min_fork_tokens`.
+        """
+        src = seq.state_fork_src
+        if src < 0:
+            return True
+        if self.state.pin_count(src) > 1:
+            return False
+        self._release_state_group(seq.per_req_cache_group)
+        self.state.invalidate(src)
+        if self.state.is_pinned(src):
+            self.state.unpin(src)  # resume source: was held off the free list
+        else:
+            self._claim_state_group(src)  # publish source: was handed back
+        seq.per_req_cache_group = src
+        seq.state_fork_src = -1
+        return True
+
+    def state_publish_limit(self, seq: Sequence) -> int:
+        """Rightmost token position this seq may checkpoint at, 0 for none.
+
+        The last hash-block boundary that still leaves `min_fork_tokens` of
+        prompt to forward: publishing hands the group away, and the forward
+        right after has to fill the replacement by itself.
+        """
+        if not (seq.has_per_req_cache and self.state.enabled):
+            return 0
+        if self.state_min_fork_tokens <= 0:
+            return 0
+        hbs = self._hash_block_size()
+        limit = ((seq.num_prompt_tokens - self.state_min_fork_tokens) // hbs) * hbs
+        return max(limit, 0)
+
+    def is_state_publish_pos(self, seq: Sequence, pos: int) -> bool:
+        """Whether a forward ending at `pos` should checkpoint its state.
+
+        A ladder of resume points, one every `state_checkpoint_interval` hash
+        blocks, plus `state_publish_limit` itself — the rightmost point is the
+        one a same-prompt hit lands on, so it is published whatever the interval
+        says. Publishing is capacity-neutral (the group handed away is replaced
+        by one from the free list), but each one does bump a stale checkpoint
+        out of the free-list tail, which is what the interval is there to pace.
+        Interval 0 keeps only the limit.
+
+        The position must be exact. The group holds state as of the forward's
+        last token, so a forward that overshoots a boundary is ahead of the hash
+        it would be filed under; the scheduler cuts prefill chunks to land here,
+        and a path that doesn't simply publishes nothing.
+        """
+        hbs = self._hash_block_size()
+        limit = self.state_publish_limit(seq)
+        if not (0 < pos <= limit) or pos % hbs:
+            return False
+        if pos == limit:
+            return True
+        interval = self.state_checkpoint_interval
+        return interval > 0 and (pos // hbs) % interval == 0
+
+    def _publish_state_checkpoint(self, seq: Sequence, h: int) -> None:
+        """Hand the seq's state group to the checkpoint index under hash `h`.
+
+        The request moves to a fresh group; the next forward reads the published
+        one and writes the new one, which is why a published group is never
+        written again. Best-effort: with no free group the seq simply keeps
+        writing its own and no checkpoint is taken.
+        """
+        old = seq.per_req_cache_group
+        if old < 0 or not self.free_per_req_cache_groups:
+            return
+        seq.per_req_cache_group = self._pop_state_group()
+        seq.state_fork_src = old
+        self._release_state_group(old)
+        self.state.publish(h, old)
 
     def deallocate(self, seq: Sequence):
         for block_id in reversed(seq.block_table):
@@ -396,8 +636,12 @@ class BlockManager:
         seq.num_cached_tokens = 0
         seq.block_table.clear()
         if seq.has_per_req_cache and seq.per_req_cache_group >= 0:
-            self.free_per_req_cache_groups.append(seq.per_req_cache_group)
+            # Only the group the seq was writing. A checkpoint it published is
+            # already back on the free list under the state index, and a fork
+            # source it borrowed is returned by `release_state_pins`.
+            self._release_state_group(seq.per_req_cache_group)
             seq.per_req_cache_group = -1
+            seq.state_fork_src = -1
 
     def can_append(self, seq: Sequence, num_new_tokens: int = 1) -> bool:
         seq_len = len(seq)

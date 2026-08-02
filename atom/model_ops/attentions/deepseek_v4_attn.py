@@ -128,7 +128,7 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     """
 
     # ----- CPU mirrors (avoid GPU→CPU `.item()` / `.tolist()` syncs) -----
-    state_slot_mapping_cpu: Any | None = None
+    state_slot_out_cpu: Any | None = None
     """[bs] np.int32 — per-seq state cache slot id (host copy)."""
     n_committed_csa_per_seq_cpu: Any | None = None
     """[bs] np.int32 — `ctx_len // 4` (CSA committed K per seq). Built once
@@ -141,9 +141,17 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     seq). Same lifecycle as `n_committed_csa_per_seq_cpu`."""
 
     # ----- Per-seq GPU scalars (single-source-of-truth, shared by kernels) -----
-    state_slot_mapping: torch.Tensor | None = None
-    """[bs] int32 GPU — per-seq state cache slot. Shared by swa_write +
-    Compressor + paged-decode kernels (looked up via batch_id_per_token)."""
+    state_slot_out: torch.Tensor | None = None
+    """[bs] int32 GPU — per-seq state cache slot this fwd WRITES. Shared by
+    swa_write + Compressor + paged-decode kernels (looked up via
+    batch_id_per_token)."""
+    state_slot_in: torch.Tensor | None = None
+    """[bs] int32 GPU — per-seq state cache slot this fwd READS its incoming
+    compressor ring from. Equal in value to `state_slot_out` except on the one
+    forward carrying a state fork, but always its OWN buffer: the decode path
+    replays a CUDAGraph with this pointer baked in at capture, so aliasing it to
+    `state_slot_out` when nothing forked would make the distinction unreplayable
+    the moment one does."""
     n_committed_csa_per_seq: torch.Tensor | None = None
     """[bs] int32 GPU — RAW `ctx_len // 4` per-seq committed count. Consumed
     by the indexer (cast to long inline) AND by csa_translate_pack
@@ -539,6 +547,25 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         budget and the allocation cannot drift apart.
         """
         return entry_bytes_for(self._state_fields())
+
+    def min_fork_tokens(self) -> int:
+        """Tokens the forward carrying a state fork must cover.
+
+        A compression boundary reads the ring only for the `K-1` absolute
+        positions before this forward's first token (`window_len = K -
+        min(j+1, K)` in `compress_plan.py`), and a forward writes the ring for
+        the last `K_pool == K` positions it covers. So a fork forward of `n`
+        tokens leaves the new group self-contained for the next one exactly
+        when `n >= K - 1`.
+
+        Reported as the widest ring (`K_pool + ring_extra`, HCA's 128 + spec
+        slack) rather than that exact bound: it is the same number the shapes
+        are built from, and the slack it adds is rounded away by the block
+        alignment of the publish points anyway. The `ring_extra` rows
+        themselves need no filling — they are aliasing room for rejected
+        speculative writes, written and abandoned, never read back as state.
+        """
+        return max(self.csa_main_state_shape[0], self.hca_main_state_shape[0])
 
     def swa_block_bytes_per_layer(self) -> int:
         """paged-SWA: bytes of ONE SWA physical block for ONE layer
@@ -1577,7 +1604,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # Pre-populated by the verify-forward `prepare_decode` and kept alive
         # across eagle.propose; assert for the static checker.
         assert attn_metadata.context_lens is not None
-        assert attn_metadata.state_slot_mapping is not None
+        assert attn_metadata.state_slot_out is not None
         win = self.window_size  # SWA prefix max per token
 
         # ----- GPU-side SWA indptr math (no CPU numpy, no D2H) -----
@@ -1652,7 +1679,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
     def prepare_decode(self, batch: ScheduledBatch, bs: int):
         """V4-style decode prep: populates positions, cu_seqlens_q,
-        block_tables, and state_slot_mapping.
+        block_tables, and state_slot_out.
 
         Uses stream overlap (like AiterMLAMetadataBuilder) to hide H2D
         latency behind CPU numpy work: basic H2D copies fire on
@@ -1736,6 +1763,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             state_slot_np = np.zeros(scheduled_bs, dtype=np.int32)
         ss_buf = var["v4_meta_state_slot_groups"]
         ss_buf.np[:scheduled_bs] = state_slot_np
+        si_buf = var["v4_meta_state_slot_in"]
+        si_buf.np[:scheduled_bs] = self._state_slot_in_np(
+            batch, scheduled_bs, state_slot_np
+        )
 
         # ---- fire H2D on prep_stream ----
         # NB: this runs inside attn_metadata_builder.build(), BEFORE
@@ -1753,6 +1784,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             # separate num_swa_blocks pool.
             swa_bt_gpu = var["swa_block_tables"].copy_to_gpu(scheduled_bs)
             state_slot_gpu = ss_buf.copy_to_gpu(scheduled_bs)
+            state_slot_in_gpu = si_buf.copy_to_gpu(scheduled_bs)
 
         # ---- CPU numpy work, overlapped with prep_stream H2D ----
         # RAGGED: per-seq extend lengths (else uniform max_seqlen_q). compress
@@ -1786,8 +1818,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             context_lens=context_lens_gpu,
             state=AttnState.DECODE,
         )
-        attn_metadata.state_slot_mapping = state_slot_gpu
-        attn_metadata.state_slot_mapping_cpu = state_slot_np
+        attn_metadata.state_slot_out = state_slot_gpu
+        attn_metadata.state_slot_in = state_slot_in_gpu
+        attn_metadata.state_slot_out_cpu = state_slot_np
         attn_metadata.compress_plans = compress_plans
         attn_metadata.swa_block_tables = swa_bt_gpu
         # DSpark RAGGED: pass per-seq verify lengths + full_q to the (rectangular-
@@ -1833,6 +1866,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 max_seqlen_q=max_seqlen_q,
                 context_lens_np=context_lens_np,
                 state_slot_np=state_slot_np,
+                state_slot_in_np=si_buf.np[:scheduled_bs],
                 positions_np=positions_np,
             )
 
@@ -1846,6 +1880,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         max_seqlen_q: int,
         context_lens_np: np.ndarray,
         state_slot_np: np.ndarray,
+        state_slot_in_np: np.ndarray,
         positions_np: np.ndarray,
     ) -> None:
         """Split a decode batch into two micro-batches (by request) and build
@@ -1912,6 +1947,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             state_slot_np_ub = (
                 var[f"{p}v4_meta_state_slot_groups"].np[:padded_bs].copy()
             )
+            ub_state_in_np = state_slot_in_np[req_start : req_start + ub_real_reqs]
+            if len(ub_state_in_np) < ub_real_reqs:
+                ub_state_in_np = np.zeros(ub_real_reqs, dtype=np.int32)
+            var[f"{p}v4_meta_state_slot_in"].np[:ub_real_reqs] = ub_state_in_np
+            var[f"{p}v4_meta_state_slot_in"].np[ub_real_reqs:padded_bs] = 0
 
             var[f"{p}block_tables"].np[:ub_real_reqs] = var["block_tables"].np[
                 req_start : req_start + ub_real_reqs
@@ -1975,8 +2015,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 context_lens=context_lens_gpu,
                 state=AttnState.DECODE,
             )
-            attn_metadata.state_slot_mapping = state_slot_gpu
-            attn_metadata.state_slot_mapping_cpu = state_slot_np_ub
+            attn_metadata.state_slot_out = state_slot_gpu
+            attn_metadata.state_slot_in = var[f"{p}v4_meta_state_slot_in"].copy_to_gpu(
+                padded_bs
+            )
+            attn_metadata.state_slot_out_cpu = state_slot_np_ub
             attn_metadata.compress_plans = compress_plans
             attn_metadata.swa_block_tables = swa_block_tables_gpu
 
@@ -2014,7 +2057,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
     def prepare_prefill(self, batch: ScheduledBatch):
         """V4 prefill prep: extends parent to always populate block_tables
-        and state_slot_mapping.
+        and state_slot_out.
 
         The parent only emits block_tables when has_cached (prefix cache hit);
         V4 always needs block_tables because Compressor scatters compressed
@@ -2041,17 +2084,20 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.swa_block_tables = self._populate_swa_block_tables(
                 batch, scheduled_bs
             )
-        state_slot_gpu, state_slot_np = self._populate_state_slot_mapping(
+        state_slot_gpu, state_slot_np = self._populate_state_slot_mappings(
             batch, scheduled_bs, return_cpu=True
         )
-        attn_metadata.state_slot_mapping = state_slot_gpu
+        attn_metadata.state_slot_out = state_slot_gpu
+        attn_metadata.state_slot_in = self._populate_state_slot_in(
+            batch, scheduled_bs, state_slot_np
+        )
         # PR-A Phase 2 CPU mirrors (generic, not V4-specific). The parent
         # populated forward_vars CPU buffers; read them back as numpy slices.
         var = self.model_runner.forward_vars
         sum_scheduled_tokens = batch.total_tokens_num_prefill
         positions_np = np.asarray(var["positions"].np[:sum_scheduled_tokens])
         cu_seqlens_q_np = np.asarray(var["cu_seqlens_q"].np[: scheduled_bs + 1])
-        attn_metadata.state_slot_mapping_cpu = state_slot_np
+        attn_metadata.state_slot_out_cpu = state_slot_np
         # `start_pos_per_seq` = position of FIRST token of each seq in this fwd.
         # Only consumed by `_build_paged_prefill_meta` below; not stashed on
         # attn_metadata (no other reader, no inter-fwd reuse).
@@ -2081,7 +2127,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self._attach_v4_per_fwd_meta(
             attn_metadata,
             extend_lens_np,  # = cu_seqlens_q[1:] - cu_seqlens_q[:bs]
-            attn_metadata.state_slot_mapping_cpu,
+            attn_metadata.state_slot_out_cpu,
             scheduled_bs,
             sum_scheduled_tokens,
         )
@@ -2101,7 +2147,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             cu_seqlens_q_np,
             extend_lens_np,
             start_pos_per_seq_np,
-            attn_metadata.state_slot_mapping_cpu,
+            attn_metadata.state_slot_out_cpu,
             scheduled_bs,
             sum_scheduled_tokens,
         )
@@ -2290,12 +2336,14 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         ub_num_reqs = rs.stop - rs.start
         ub_num_tokens = ts.stop - ts.start
 
-        if src.state_slot_mapping is not None:
-            ub_attn.state_slot_mapping = src.state_slot_mapping[rs]
-        if src.state_slot_mapping_cpu is not None:
-            ub_attn.state_slot_mapping_cpu = src.state_slot_mapping_cpu[rs]
+        if src.state_slot_out is not None:
+            ub_attn.state_slot_out = src.state_slot_out[rs]
+        if src.state_slot_in is not None:
+            ub_attn.state_slot_in = src.state_slot_in[rs]
+        if src.state_slot_out_cpu is not None:
+            ub_attn.state_slot_out_cpu = src.state_slot_out_cpu[rs]
         # paged-SWA: slice this ubatch's SWA block-table rows (parallel to the
-        # compressed block_tables / state_slot_mapping). split_attn_metadata is
+        # compressed block_tables / state_slot_out). split_attn_metadata is
         # V4-agnostic and leaves ub_attn.swa_block_tables=None, so set it from the
         # parent's rows here — otherwise _build_paged_prefill_meta reads None and
         # crashes. Row i == local req i, matching the ubatch's rebuilt
@@ -2342,7 +2390,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self._attach_v4_per_fwd_meta(
             ub_attn,
             extend_lens_np,  # ubatch's per-seq token counts
-            ub_attn.state_slot_mapping_cpu,
+            ub_attn.state_slot_out_cpu,
             ub_num_reqs,
             ub_num_tokens,
             buf_prefix_ubatch=p,
@@ -2370,7 +2418,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             ub_cu,
             extend_lens_np,
             ub_start_pos_per_seq_np,
-            ub_attn.state_slot_mapping_cpu,
+            ub_attn.state_slot_out_cpu,
             ub_num_reqs,
             ub_num_tokens,
             positions_gpu=ub_positions_gpu,
@@ -2460,10 +2508,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         ub.indexer_meta = src.indexer_meta
 
         # ---- per-seq DSV4 fields sliced by request ----
-        if src.state_slot_mapping is not None:
-            ub.state_slot_mapping = src.state_slot_mapping[rs0:rs1].contiguous()
-        if src.state_slot_mapping_cpu is not None:
-            ub.state_slot_mapping_cpu = src.state_slot_mapping_cpu[rs0:rs1]
+        if src.state_slot_out is not None:
+            ub.state_slot_out = src.state_slot_out[rs0:rs1].contiguous()
+        if src.state_slot_in is not None:
+            ub.state_slot_in = src.state_slot_in[rs0:rs1].contiguous()
+        if src.state_slot_out_cpu is not None:
+            ub.state_slot_out_cpu = src.state_slot_out_cpu[rs0:rs1]
         if src.n_committed_csa_per_seq is not None:
             ub.n_committed_csa_per_seq = src.n_committed_csa_per_seq[
                 rs0:rs1
@@ -2564,7 +2614,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self,
         attn_metadata: AttentionMetaData_DSV4,
         token_num_per_seq,
-        state_slot_mapping_cpu,
+        state_slot_out_cpu,
         scheduled_bs: int,
         total_tokens: int,
         *,
@@ -2574,7 +2624,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     ) -> None:
         """Hoist per-fwd, layer-invariant metadata used by every V4 layer.
 
-        These tensors only depend on `positions`, `cu_seqlens_q`, `state_slot_mapping`
+        These tensors only depend on `positions`, `cu_seqlens_q`, `state_slot_out`
         and `window_size` — none of which change across layers — so building
         them once per fwd saves ~64 redundant constructions for V4-Pro.
 
@@ -2586,13 +2636,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
           - `attn_metadata.n_committed_csa_per_seq`: [bs] int32 per-seq
             `ctx_len // 4` (shared by csa_translate_pack + indexer; kernels
             do their own `min(., index_topk)` clamp via mask).
-          - `attn_metadata.state_slot_mapping`: [bs] int32 GPU view of
+          - `attn_metadata.state_slot_out`: [bs] int32 GPU view of
             per-seq state cache slot (already set by prepare_*; passed
             through unchanged here).
 
         Caller contract: `scheduled_bs >= 1` and `total_tokens >= 1`.
         warmup_model + dummy_run paths both enforce these via min-1 fallbacks
-        (model_runner.warmup_model:1003-1011, _populate_state_slot_mapping
+        (model_runner.warmup_model:1003-1011, _populate_state_slot_mappings
         zeros-fill); CG capture uses graph_bs >= 1 too.
         """
         # state is set by the caller at AttentionMetaData_DSV4 construction
@@ -2697,7 +2747,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self._attach_v4_paged_decode_meta(
             attn_metadata=attn_metadata,
             token_num_per_seq=token_num_per_seq,
-            state_slot_mapping_cpu=state_slot_mapping_cpu,
+            state_slot_out_cpu=state_slot_out_cpu,
             scheduled_bs=scheduled_bs,
             total_tokens=total_tokens,
             padded_total_tokens=padded_total_tokens,
@@ -2708,7 +2758,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self,
         attn_metadata,
         token_num_per_seq,
-        state_slot_mapping_cpu,
+        state_slot_out_cpu,
         scheduled_bs: int,
         total_tokens: int,
         padded_total_tokens: int | None = None,
@@ -2756,9 +2806,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         if attn_metadata.state is not AttnState.DECODE:
             return  # prefill: only kv_indices_prefix_* are built downstream
 
-        if len(state_slot_mapping_cpu) < scheduled_bs:
+        if len(state_slot_out_cpu) < scheduled_bs:
             # Defensive carve-out: caller asserted DECODE but
-            # state_slot_mapping is incomplete. Flip state to PREFILL_NATIVE.
+            # state_slot_out is incomplete. Flip state to PREFILL_NATIVE.
             attn_metadata.state = AttnState.PREFILL_NATIVE
             return
 
@@ -2937,7 +2987,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # swa_write / indexer outside the is_pure_decode branch).
         # is_pure_decode was set by the caller at AttentionMetaData_DSV4
         # construction time; we only flip it (True→False) above when the
-        # warmup carve-out fires (incomplete state_slot_mapping_cpu).
+        # warmup carve-out fires (incomplete state_slot_out_cpu).
         attn_metadata.kv_indices_swa = swa_indices_gpu[: int(swa_indptr_np[T])]
         attn_metadata.kv_indices_csa = csa_indices_gpu[: int(csa_indptr_np[T])]
         attn_metadata.kv_indices_hca = hca_indices_gpu  # already exact len
@@ -2970,7 +3020,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         cu_seqlens_q_np: np.ndarray,
         token_num_per_seq: np.ndarray,
         start_pos_per_seq_np: np.ndarray,
-        state_slot_mapping_cpu: np.ndarray,
+        state_slot_out_cpu: np.ndarray,
         scheduled_bs: int,
         total_tokens: int,
         *,
@@ -3128,7 +3178,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # paged-SWA: SWA-prefix offsets index the separate SWA pool via
         # swa_block_tables; HCA still uses the compressed block_tables.
         swa_block_tables_gpu = attn_metadata.swa_block_tables[:scheduled_bs]
-        state_slot_per_seq_gpu = attn_metadata.state_slot_mapping[:scheduled_bs]
+        state_slot_per_seq_gpu = attn_metadata.state_slot_out[:scheduled_bs]
         # batch_id_per_token is int32 in storage (accepted by PyTorch
         # advanced-indexing and the fused flydsl SWA scatter); the kernel uses
         # tl.load which is dtype-agnostic.
@@ -3294,7 +3344,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                     swa_np[i, : len(bt)] = [max(0, b) for b in bt]
         return var["swa_block_tables"].copy_to_gpu(scheduled_bs)
 
-    def _populate_state_slot_mapping(
+    def _populate_state_slot_mappings(
         self, batch: ScheduledBatch, scheduled_bs: int, return_cpu: bool = False
     ):
         """Build `[scheduled_bs]` int32 tensor of per-request state-cache slots.
@@ -3323,6 +3373,37 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         if return_cpu:
             return gpu, groups_np
         return gpu
+
+    @staticmethod
+    def _state_slot_in_np(
+        batch: ScheduledBatch, scheduled_bs: int, out_np: np.ndarray
+    ) -> np.ndarray:
+        """Per-seq read slot: the fork source where set, else the write slot."""
+        srcs = getattr(batch, "state_fork_srcs", None)
+        if not srcs or len(srcs) < scheduled_bs:
+            return out_np
+        src_np = np.asarray(srcs[:scheduled_bs], dtype=np.int32)
+        return np.where(src_np >= 0, src_np, out_np)
+
+    def _populate_state_slot_in(
+        self, batch: ScheduledBatch, scheduled_bs: int, out_np: np.ndarray
+    ) -> torch.Tensor:
+        """Read-side slot per seq: the fork source where set, else the write slot.
+
+        A fork means the seq reads the state group it published (or resumed
+        from) and writes a fresh one, for this forward only; `BlockManager`
+        decides, the scheduler ships the pairing as `state_fork_srcs` and clears
+        it after one batch.
+
+        Always staged into its own buffer, even when nothing forked. The values
+        are then identical to `state_slot_out`, but the buffer is not — decode
+        replays a CUDAGraph that captured this pointer, so it has to be the same
+        address on every step.
+        """
+        return self._stage(
+            "v4_meta_state_slot_in",
+            self._state_slot_in_np(batch, scheduled_bs, out_np),
+        )
 
     def build_for_cudagraph_capture(
         self, bs: int, max_q_len: int | None = None
@@ -3397,6 +3478,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         var["swa_block_tables"].np[:bs] = block_tables_np
         swa_bt_gpu = var["swa_block_tables"].copy_to_gpu(bs)
         state_slot_gpu = self._stage("v4_meta_state_slot_groups", state_slot_np)
+        # Read side captured from its own persistent buffer: replay-time
+        # prepare_decode refills it, so a fork can change the values without
+        # invalidating the graph.
+        state_slot_in_gpu = self._stage("v4_meta_state_slot_in", state_slot_np)
 
         # Synthetic decode batch: start_pos = win > 0 and uniform
         # max_q_len tokens per seq, so is_pure_decode is True by
@@ -3415,8 +3500,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             context_lens=context_lens_gpu,
             state=AttnState.DECODE,
         )
-        attn_metadata.state_slot_mapping = state_slot_gpu
-        attn_metadata.state_slot_mapping_cpu = state_slot_np
+        attn_metadata.state_slot_out = state_slot_gpu
+        attn_metadata.state_slot_in = state_slot_in_gpu
+        attn_metadata.state_slot_out_cpu = state_slot_np
         attn_metadata.swa_block_tables = swa_bt_gpu
 
         # DSpark TRUE-FLAT graph: capture must take the same ragged indexer branch
@@ -3449,7 +3535,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self._attach_v4_per_fwd_meta(
             attn_metadata,
             extend_lens_np,  # = np.full(bs, max_q_len) — synthetic uniform decode batch
-            attn_metadata.state_slot_mapping_cpu,
+            attn_metadata.state_slot_out_cpu,
             bs,
             total_tokens,
             padded_bs=bs,
@@ -3514,12 +3600,16 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # potential future reuse if a V4-side MLA kernel needs paged KV indices.
         bufs["kv_indptr"] = CpuGpuBuffer(bs + 1, **i32)
 
-        # _attach_v4_per_fwd_meta + _populate_state_slot_mapping.
+        # _attach_v4_per_fwd_meta + _populate_state_slot_mappings.
         # state_slot is staged ONCE into v4_meta_state_slot_groups (set by
-        # `_populate_state_slot_mapping`); attn_metadata.state_slot_mapping
+        # `_populate_state_slot_mappings`); attn_metadata.state_slot_out
         # exposes that GPU view to all downstream consumers (no second
         # H2D-staged copy).
         bufs["v4_meta_state_slot_groups"] = CpuGpuBuffer(bs, **i32)
+        # Read side of the compressor ring (`_populate_state_slot_in`). Its own
+        # buffer on every path, forked or not, so the captured decode graph sees
+        # a stable address.
+        bufs["v4_meta_state_slot_in"] = CpuGpuBuffer(bs, **i32)
 
         # Phase B: paged-decode index buffers (consumed by Phase C/E).
         # Sized to worst-case decode shape `T = max_bs * (1 + max_spec_steps)`
@@ -3703,6 +3793,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
             # V4 decode metadata buffers.
             bufs[f"{p}v4_meta_state_slot_groups"] = CpuGpuBuffer(bs, **i32)
+            bufs[f"{p}v4_meta_state_slot_in"] = CpuGpuBuffer(bs, **i32)
             bufs[f"{p}v4_kv_indices_swa"] = CpuGpuBuffer(T_dec * win, **i32)
             bufs[f"{p}v4_kv_indices_csa"] = CpuGpuBuffer(
                 T_dec * (win + self.index_topk), **i32

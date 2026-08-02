@@ -240,18 +240,39 @@ class BlockManager:
         state_entries = int(pool_entries.get(STATE_SLOT_CLASS, 0))
         state_per_req = int(pool_per_req.get(STATE_SLOT_CLASS, 1)) or 1
         self.num_per_req_cache_groups = state_entries // state_per_req
-        self.free_per_req_cache_groups: list[int] = list(
+        self.free_per_req_cache_groups: deque[int] = deque(
             range(self.num_per_req_cache_groups)
+        )
+        self.state = StateCheckpointPool(
+            self.num_per_req_cache_groups, enabled=self.enable_prefix_caching
         )
 ```
 
 The block pool is pre-allocated at startup. `free_block_ids` is a deque for O(1) pop/push, `used_block_ids` tracks active blocks, and `hash_to_block_id` maps content hashes to block IDs for prefix caching.
 
 **Per-Request Cache Pools (Stateful-Attention Models):** For models whose attention type maintains per-request state outside the paged KV pool (GDN: Qwen3-Next, Qwen3.5, Kimi-Linear; DeepSeek-V4's compressor ring):
-- `free_per_req_cache_groups` — list of available per-request slot group indices (0 to `num_per_req_cache_groups - 1`). Each group corresponds to one request and contains `entries_per_req` contiguous tensor slot indices (1 for a single committed state, `1 + num_speculative_tokens` where a rollback slot per speculated token is kept).
+- `free_per_req_cache_groups` — FIFO of available per-request slot group indices (0 to `num_per_req_cache_groups - 1`). Each group corresponds to one request and contains `entries_per_req` contiguous tensor slot indices (1 for a single committed state, `1 + num_speculative_tokens` where a rollback slot per speculated token is kept).
 - `num_per_req_cache_groups` — total capacity, so callers can tell "all slots busy" (transient) from "no slots were ever created" (permanent).
+- `state` — a [`StateCheckpointPool`](../atom/model_engine/state_pool.py) indexing free groups whose content is still a valid state snapshot. See **State checkpoints** below.
 
 The state class costs no paged blocks at admission time: sizing reserves every STATE class's floor before the paged class is sized (see [`sub_pool_spec.py`](../atom/model_ops/attentions/sub_pool_spec.py)), so a sequence only needs a free slot index. Because that floor is exactly `max_num_seqs` requests' worth, the slot pool never binds before `max_num_seqs` does.
+
+### State checkpoints (stateful-attention prefix caching)
+
+Neither the GDN recurrent state nor the V4 compressor ring can be rebuilt from cached KV blocks — the cache holds the compressor's *output*, the state is its rolling *input* window. So for a stateful model a prefix-cache hit is only resumable at a boundary where some earlier request saved its state, and `can_allocate` gates on that as a third shrink, chained after the SWA one:
+
+```
+num_cached_blocks = swa.bounded_hit(...)          # trailing window present?
+num_cached_blocks = state.bounded_hit(...)        # a checkpoint at this boundary?
+```
+
+Chained rather than `min()`-ed: the answer has to satisfy both gates, and the largest boundary the SWA gate allows need not carry a checkpoint.
+
+**Checkpoints cost no capacity.** A checkpoint *is* a group sitting on the free list with its content intact, indexed by the content hash of the last block it covers — the same lazy-eviction model the block pool uses, where hand-out (`_pop_state_group`), not free, is the eviction event. The pool therefore never holds a group back, and under full concurrency the checkpoint set drains on its own.
+
+**Publishing forks.** At a publish position the request hands its group to the index and takes a fresh one; for exactly one forward it then reads the published group and writes the new one (`state_slot_in` / `state_slot_out` in the V4 metadata, `non_spec_state_indices_in_tensor` / `non_spec_state_indices_tensor` for GDN). A published group is never written again, which is what makes it safe to share. Resuming from a checkpoint is the same move in reverse; when no second group is free the request adopts the checkpoint instead, spending it rather than sharing it.
+
+**Where checkpoints land.** Every `--state-checkpoint-interval` hash blocks, plus `state_publish_limit` (the rightmost boundary that still leaves `min_fork_tokens` of prompt to forward, since the forward after a fork must fill the new group by itself). `AttentionBackend.min_fork_tokens()` reports that width — the widest compressor ring for V4, `conv_kernel_dim - 1` for GDN; `0` means the backend cannot fork, and every hit on its models shrinks to 0. The scheduler aligns prefill chunks to these positions (`_finalize_prefill_chunk`), because `hash_blocks` publishes only on an exact match: a forward that overshoots a boundary holds state ahead of the hash it would be filed under.
 
 ### Allocation (`allocate`)
 
@@ -272,7 +293,7 @@ def allocate(self, seq: Sequence):
 
 **Per-request cache allocation (if `seq.has_per_req_cache`):**
 
-Pops one slot group index from `free_per_req_cache_groups` and assigns it to `seq.per_req_cache_group` (per-request state indexing into the builder-allocated tensors). No paged blocks are involved — the state class's bytes were already taken out of the budget at sizing time.
+Pops one slot group index from `free_per_req_cache_groups` and assigns it to `seq.per_req_cache_group` (per-request state indexing into the builder-allocated tensors). No paged blocks are involved — the state class's bytes were already taken out of the budget at sizing time. When the hit landed on a state checkpoint, the group holding it is claimed as `seq.state_fork_src` instead and the request writes a fresh group for one forward.
 
 ### Deallocation (`deallocate`)
 
@@ -559,7 +580,8 @@ class Sequence:
 | `num_cached_tokens` | `int` | Tokens served from prefix cache |
 | `block_table` | `list[int]` | Ordered list of block IDs assigned to this sequence |
 | `has_per_req_cache` | `bool` | Whether the model's attention type maintains per-request state outside the paged KV pool (set at sequence init; True for GDN-based models, future stateful attentions) |
-| `per_req_cache_group` | `int` | Per-request stateful-attention slot group index (assigned by BlockManager during allocation, `-1` if unallocated) |
+| `per_req_cache_group` | `int` | Per-request stateful-attention slot group index the sequence WRITES (assigned by BlockManager during allocation, `-1` if unallocated) |
+| `state_fork_src` | `int` | Group the next forward READS its incoming state from when a state fork is pending; `-1` (read == write) otherwise. Set by BlockManager on publish/resume, cleared by the scheduler once a batch has carried it |
 | `last_token` | `int` | Most recently appended token ID |
 | `temperature` | `float` | Sampling temperature (from `SamplingParams`) |
 | `max_tokens` | `int` | Max completion tokens (from `SamplingParams`, default 64) |

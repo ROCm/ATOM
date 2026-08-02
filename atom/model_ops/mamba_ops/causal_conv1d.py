@@ -7,7 +7,6 @@
 
 import numpy as np
 import torch
-
 import triton
 import triton.language as tl
 
@@ -26,6 +25,8 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     cache_indices_ptr,  # (batch, n_blocks + padding) The second dimension contains
     # the block indices relevant for each sequence
     # plus potential 0-padding at the beginning and at the end
+    cache_indices_in_ptr,  # same shape — cache slots the INITIAL state is read
+    # from. Equal to cache_indices_ptr unless the caller forked the state.
     has_initial_states_ptr,
     query_start_loc_ptr,
     batch_ptr,
@@ -75,6 +76,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     v_start_dim = k_dim_size * 2
     conv_states_ptr = initial_states_ptr
     conv_state_indices_ptr = cache_indices_ptr
+    conv_state_in_indices_ptr = cache_indices_in_ptr
     stride_conv_state_seq = stride_istate_seq
     stride_conv_state_dim = stride_istate_dim
     stride_conv_state_tok = stride_istate_token
@@ -154,16 +156,31 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
 
     # cache_idx
     conv_states_input_coord = tl.load(
-        conv_state_indices_ptr + idx_seq * stride_cache_indices + conv_state_init_index
+        conv_state_in_indices_ptr
+        + idx_seq * stride_cache_indices
+        + conv_state_init_index
     ).to(tl.int64)
 
     if USE_PAD_SLOT:  # noqa
         if conv_states_input_coord == pad_slot_id:
             # not processing as this is not the actual sequence
             return
+    # Read side. Equals the write side unless the caller forked the state, so
+    # every STORE below must go through `conv_states_out_base` instead — writing
+    # through this one would leave the fork's destination untouched and clobber
+    # the source the caller is still holding.
     conv_states_base = (
         conv_states_ptr
         + (conv_states_input_coord * stride_conv_state_seq)
+        + (idx_feats * stride_conv_state_dim)
+    )  # [BLOCK_N,]
+    # Write side: the slot this sequence's final state belongs in.
+    conv_states_output_coord = tl.load(
+        conv_state_indices_ptr + idx_seq * stride_cache_indices + current_last_index
+    ).to(tl.int64)
+    conv_states_out_base = (
+        conv_states_ptr
+        + (conv_states_output_coord * stride_conv_state_seq)
         + (idx_feats * stride_conv_state_dim)
     )  # [BLOCK_N,]
 
@@ -239,24 +256,11 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
             loaded_x = tl.load(x_ptrs, mask_x, 0.0)
             idx_tokens_conv = tl.arange(0, NP2_STATELEN)  # [BLOCK_M]
 
-            # Compute the offset where the last block should be written in the conv_states
-            conv_states_output_coord = tl.load(
-                conv_state_indices_ptr
-                + idx_seq * stride_cache_indices
-                + current_last_index
-            ).to(tl.int64)
-
+            # The last block goes to the write slot, hoisted above.
             conv_states_ptrs_target = (
-                conv_states_ptr
-                + (conv_states_output_coord * stride_conv_state_seq)  # Offset from seq
-                + (idx_feats * stride_conv_state_dim)
-            )[
-                None, :
-            ] + (  # [BLOCK_N,]
-                idx_tokens_conv * stride_conv_state_tok
-            )[
-                :, None
-            ]
+                conv_states_out_base[None, :]
+                + (idx_tokens_conv * stride_conv_state_tok)[:, None]
+            )
 
             mask = (idx_tokens_conv < state_len)[:, None] & (idx_feats < dim)[None, :]
             tl.debug_barrier()  #  NOTE: use this due to bug in Triton compiler
@@ -299,7 +303,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
                     mask, conv_state, loaded_x
                 )  # BUG in 'tl.where'  which requires a barrier before this
                 conv_states_ptrs_target = (
-                    conv_states_base
+                    conv_states_out_base
                     + (idx_tokens_conv * stride_conv_state_tok)[:, None]
                 )  # [BLOCK_M, BLOCK_N]
                 mask = (idx_tokens_conv < state_len)[:, None] & (idx_feats < dim)[
@@ -326,7 +330,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
                 new_conv_state = tl.load(x_ptrs, mask_x, 0.0)
 
                 conv_states_ptrs_target = (
-                    conv_states_base
+                    conv_states_out_base
                     + (idx_tokens_conv * stride_conv_state_tok)[:, None]
                 )  # [BLOCK_M, BLOCK_N]
                 mask = (idx_tokens_conv < state_len)[:, None] & (idx_feats < dim)[
@@ -518,6 +522,7 @@ def causal_conv1d_fn(
     k_dim_size: int,
     v_dim_size: int,
     cache_indices: torch.Tensor | None = None,
+    cache_indices_in: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
     activation: str | None = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
@@ -556,6 +561,12 @@ def causal_conv1d_fn(
     cache_indices: (batch)  int32
         indicates the corresponding state index,
         like so: conv_state = conv_states[cache_indices[batch_id]]
+    cache_indices_in: (batch) int32, optional
+        same shape as cache_indices, giving the slot the INITIAL state is READ
+        from when that differs from the slot the final state is written to — a
+        state fork, where the request resumes from a published checkpoint (or
+        publishes its current group) and must not write over it. Defaults to
+        cache_indices, i.e. the usual read-modify-write in place.
     has_initial_state: (batch) bool
         indicates whether should the kernel take the current state as initial
         state for the calculations
@@ -754,6 +765,7 @@ def causal_conv1d_fn(
         bias,
         conv_states,
         cache_indices,
+        cache_indices if cache_indices_in is None else cache_indices_in,
         has_initial_state,
         query_start_loc,
         batch_ptr,
@@ -859,7 +871,6 @@ def _causal_conv1d_update_kernel(
     USE_PAD_SLOT: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    # ruff: noqa: E501
     idx_seq = tl.program_id(0)
     if idx_seq >= batch:
         return

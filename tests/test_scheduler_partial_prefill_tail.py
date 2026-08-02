@@ -13,10 +13,17 @@ the end:
 
     IndexError: index N is out of bounds for axis 0 with size N
 
-The fix re-queues skipped partial prefills at the TAIL (``extend``), so they
-never occupy position 0 and the new decode seqs stay contiguous from 0 (safe
-``[new | deferred]`` slice path). This test drives the real
-``Scheduler.schedule()`` and asserts the skipped partial lands at the tail.
+The original fix re-queued skipped partial prefills at the TAIL (``extend``),
+so they never occupy position 0 and the new decode seqs stay contiguous from 0
+(safe ``[new | deferred]`` slice path). That kept the compacted array
+accidentally aligned rather than making it aligned; any other way of putting a
+draft-less sequence ahead of a drafted one brings the same IndexError back — or,
+short of the end of the array, silently feeds one sequence another's drafts.
+
+``ScheduledBatch`` now builds the array with one row per sequence in batch
+order, zero-filled where a sequence has no drafts, so alignment no longer
+depends on queue position. Both properties are tested here: the tail placement
+(still the intended scheduling behaviour) and the alignment itself.
 """
 
 from types import SimpleNamespace
@@ -85,3 +92,58 @@ class TestSkippedPartialPrefillGoesToTail:
         assert (
             ids[0] != s_partial.id
         ), f"partial {s_partial.id} must NOT be pinned at running head (order {ids})"
+
+
+class TestSpecDraftRowsAlignToBatchOrder:
+    """The array must be indexable by batch position, gaps included."""
+
+    def _batch(self, seqs, drafts, mtp_k=3):
+        from atom.model_engine.scheduler import ScheduledBatch
+
+        return ScheduledBatch(
+            seqs={s.id: s for s in seqs},
+            num_scheduled_tokens=[mtp_k + 1] * len(seqs),
+            total_tokens_num=(mtp_k + 1) * len(seqs),
+            total_tokens_num_decode=(mtp_k + 1) * len(seqs),
+            total_seqs_num=len(seqs),
+            total_seqs_num_decode=len(seqs),
+            num_spec_step=mtp_k,
+            scheduled_spec_decode_tokens=drafts,
+        )
+
+    def test_draftless_sequence_leaves_a_zero_row_in_place(self, seq_factory):
+        import numpy as np
+
+        mtp_k = 3
+        seqs = []
+        for _ in range(3):
+            s = seq_factory([1, 2, 3, 4])
+            s.num_cached_tokens = s.num_prompt_tokens
+            s.append_token(99)
+            seqs.append(s)
+        # Middle sequence just came off prefill: no drafts proposed for it yet.
+        drafts = {
+            seqs[0].id: np.array([11, 12, 13], dtype=np.int32),
+            seqs[2].id: np.array([31, 32, 33], dtype=np.int32),
+        }
+
+        rows = self._batch(seqs, drafts, mtp_k).scheduled_spec_decode_tokens
+
+        assert rows.shape == (3, mtp_k)
+        assert list(rows[0]) == [11, 12, 13]
+        assert list(rows[1]) == [0, 0, 0]  # the gap stays a gap
+        assert list(rows[2]) == [31, 32, 33]  # NOT shifted up into row 1
+
+    def test_no_drafts_at_all_still_gives_one_row_per_sequence(self, seq_factory):
+        mtp_k = 3
+        seqs = []
+        for _ in range(2):
+            s = seq_factory([1, 2, 3, 4])
+            s.num_cached_tokens = s.num_prompt_tokens
+            s.append_token(99)
+            seqs.append(s)
+
+        rows = self._batch(seqs, {}, mtp_k).scheduled_spec_decode_tokens
+
+        assert rows.shape == (2, mtp_k)
+        assert not rows.any()

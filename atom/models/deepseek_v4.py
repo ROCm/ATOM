@@ -1027,7 +1027,8 @@ class Compressor(nn.Module):
         self,
         x: torch.Tensor,  # [num_tokens, dim]
         plan: "CompressPlan",
-        state_slot_mapping: torch.Tensor,  # [bs] int32
+        state_slot_in: torch.Tensor,  # [bs] int32
+        state_slot_out: torch.Tensor,  # [bs] int32
         block_tables: torch.Tensor | None = None,  # [bs, max_blocks_per_seq] int32
     ) -> None:
         """Batched plan-style compress: one fused kernel call for the whole
@@ -1060,7 +1061,12 @@ class Compressor(nn.Module):
             x:           [num_tokens, dim] flat ragged batch hidden state.
             plan:        CompressPlan from attn_metadata.compress_plans[ratio]
                          (or a synthetic bs=1 plan during warmup).
-            state_slot_mapping: [bs] int32 — per-seq state cache slot.
+            state_slot_in:  [bs] int32 — state group each seq READS its incoming
+                         ring from. Differs from `state_slot_out` only on the
+                         forward after a state fork (resuming from a published
+                         checkpoint, or publishing one), where the incoming ring
+                         belongs to a group that must not be written.
+            state_slot_out: [bs] int32 — state group each seq WRITES its ring to.
             block_tables: [bs, max_blocks_per_seq] int32 — physical block IDs
                          per seq; None during warmup (skips kv_cache scatter).
                          Required for the Indexer FP8 path (slot resolution).
@@ -1090,7 +1096,7 @@ class Compressor(nn.Module):
         # projected `combined` back to full sequence order before compression,
         # mirroring SGLang's compute_kv_score (all-gather kv_score after the
         # projection, before the cross-token compress). The plan /
-        # state_slot_mapping passed to fused_compress_attn are full-sequence
+        # state_slot_out passed to fused_compress_attn are full-sequence
         # (never split in the builder), so they match the gathered `combined`.
         if _pcp_active():
             from atom.utils.tbo.ubatching import (
@@ -1165,7 +1171,7 @@ class Compressor(nn.Module):
             kv_state=self.kv_state,
             score_state=self.score_state,
             plan=plan,
-            state_slot_mapping=state_slot_mapping,
+            state_slot_mapping=state_slot_in,
             ape=self.ape,
             rms_weight=self.norm.weight,
             rms_eps=self.norm.eps,
@@ -1204,7 +1210,7 @@ class Compressor(nn.Module):
             self.kv_state,
             self.score_state,
             write_plan=plan.write_plan_gpu,
-            state_slot_mapping=state_slot_mapping,
+            state_slot_mapping=state_slot_out,
             ratio=ratio,
             overlap=overlap,
             prefix=f"{self.prefix}.update_compressor_states",
@@ -2496,7 +2502,7 @@ class DeepseekV4Attention(nn.Module):
         self.wo_a.need_normalize_e4m3fn_to_e4m3fnuz = False
 
     def maybe_compressors_async(
-        self, x, plan, state_slot_mapping, block_tables
+        self, x, plan, state_slot_in, state_slot_out, block_tables
     ) -> bool:
         """Fire Compressor(s) on side streams, return immediately.
 
@@ -2523,7 +2529,8 @@ class DeepseekV4Attention(nn.Module):
                     self.compressor(
                         x,
                         plan=plan,
-                        state_slot_mapping=state_slot_mapping,
+                        state_slot_in=state_slot_in,
+                        state_slot_out=state_slot_out,
                         block_tables=block_tables,
                     )
             if has_indexer:
@@ -2531,7 +2538,8 @@ class DeepseekV4Attention(nn.Module):
                     self.indexer.compressor(
                         x,
                         plan=plan,
-                        state_slot_mapping=state_slot_mapping,
+                        state_slot_in=state_slot_in,
+                        state_slot_out=state_slot_out,
                         block_tables=block_tables,
                     )
         else:
@@ -2539,14 +2547,16 @@ class DeepseekV4Attention(nn.Module):
                 self.compressor(
                     x,
                     plan=plan,
-                    state_slot_mapping=state_slot_mapping,
+                    state_slot_in=state_slot_in,
+                    state_slot_out=state_slot_out,
                     block_tables=block_tables,
                 )
             if has_indexer:
                 self.indexer.compressor(
                     x,
                     plan=plan,
-                    state_slot_mapping=state_slot_mapping,
+                    state_slot_in=state_slot_in,
+                    state_slot_out=state_slot_out,
                     block_tables=block_tables,
                 )
         return use_async_compress
@@ -2692,7 +2702,8 @@ class DeepseekV4Attention(nn.Module):
         self.maybe_compressors_async(
             x,
             plan_for_layer,
-            attn_md.state_slot_mapping,
+            attn_md.state_slot_in,
+            attn_md.state_slot_out,
             attn_md.block_tables,
         )
 
@@ -2774,7 +2785,7 @@ class DeepseekV4Attention(nn.Module):
         # ===== Per-fwd metadata (built once in prepare_prefill/decode). =====
         # All per-fwd state read once. Production prepare_decode/prefill
         # always populates these; warmup goes through the same path
-        # (`_populate_state_slot_mapping` falls back to slot 0).
+        # (`_populate_state_slot_mappings` falls back to slot 0).
         # Cast to V4 typed metadata so V4-specific attribute access (v4_*,
         # compress_plans, ...) is well-typed for pyright.
         attn_md = cast("AttentionMetaData_DSV4", fc.attn_metadata)
@@ -2783,7 +2794,8 @@ class DeepseekV4Attention(nn.Module):
         # paged-SWA: swa_write targets the separate SWA pool via
         # swa_block_tables (always populated for V4).
         swa_block_tables_gpu = attn_md.swa_block_tables
-        state_slot_mapping = attn_md.state_slot_mapping
+        state_slot_in = attn_md.state_slot_in
+        state_slot_out = attn_md.state_slot_out
         plan_for_layer = compress_plans[ratio] if ratio else None
 
         # ===== Compressor launch =====
@@ -2798,7 +2810,7 @@ class DeepseekV4Attention(nn.Module):
             )
         else:
             use_async_compress = self.maybe_compressors_async(
-                x, plan_for_layer, state_slot_mapping, block_tables_gpu
+                x, plan_for_layer, state_slot_in, state_slot_out, block_tables_gpu
             )
         is_decode = attn_md.state is AttnState.DECODE
         # Single kernel fuses per-head Q RMSNorm (weightless) + KV RMSNorm
@@ -2810,7 +2822,7 @@ class DeepseekV4Attention(nn.Module):
         # swa_write are still bf16.
         # Decode folds the SWA cache-write into qk_norm_rope_maybe_quant: the
         # post-norm/rope KV row is written into swa_kv[slot, pos%cache, :]
-        # (slot = state_slot_mapping[batch_id_per_token[t]]). The flydsl path
+        # (slot = state_slot_out[batch_id_per_token[t]]). The flydsl path
         # fuses it into the kernel launch; the Triton fallback emits a separate
         # swa_write internally — either way the bridge owns the SWA write, so
         # no backend dispatch is needed here. Prefill writes its in-chunk SWA
@@ -2953,8 +2965,8 @@ class DeepseekV4Attention(nn.Module):
             #   - sparse_attn's extend source must be the FULL extend K so each
             #     1/W query can attend the whole in-chunk SWA window.
             # So all-gather the extend K back to full order; positions/
-            # cu_seqlens_q/state_slot_mapping for the SWA write stay full
-            # (cu_seqlens_q / state_slot_mapping are per-seq, never split;
+            # cu_seqlens_q/state_slot_out for the SWA write stay full
+            # (cu_seqlens_q / state_slot_out are per-seq, never split;
             # positions_full comes from the forward context which holds the
             # pre-split copy).
             #

@@ -312,6 +312,15 @@ class ScheduledBatch:
             for seq in seqs.values()
             if seq.has_per_req_cache and seq.per_req_cache_group >= 0
         ]
+        # Read-side twin of the above, positionally aligned with it: the group
+        # this forward takes its incoming state from. Differs only on the one
+        # forward after a state fork; -1 elsewhere, which attention backends
+        # read as "same as the write group".
+        self.state_fork_srcs = [
+            seq.state_fork_src
+            for seq in seqs.values()
+            if seq.has_per_req_cache and seq.per_req_cache_group >= 0
+        ]
         self.top_ks = np.asarray([seq.top_k for seq in seqs.values()], dtype=np.int32)
         self.top_ps = np.asarray([seq.top_p for seq in seqs.values()], dtype=np.float32)
         # True if any seq in the batch is a fan-out child (SamplingParams.n>1)
@@ -372,9 +381,24 @@ class ScheduledBatch:
             pos += num
 
         if num_spec_step > 0 and scheduled_spec_decode_tokens is not None:
-            self.scheduled_spec_decode_tokens = np.asarray(
-                list(scheduled_spec_decode_tokens.values()), dtype=np.int32
+            # One row per sequence, in batch order, zero-filled where a sequence
+            # has no drafts yet — which is every sequence entering decode
+            # straight off its own prefill. The caller's dict is keyed by
+            # request id and only holds sequences that DO have drafts, so
+            # densifying it with `list(...values())` drops those rows and shifts
+            # every later one onto the wrong sequence. Consumers index this by
+            # batch position (`prepare_input_ids`), not by request id, so that
+            # shift silently feeds one sequence another's draft tokens, and
+            # raises IndexError once the array is short enough.
+            self.scheduled_spec_decode_tokens = np.zeros(
+                (len(seqs), num_spec_step), dtype=np.int32
             )
+            for i, req_id in enumerate(self.req_ids):
+                drafts = scheduled_spec_decode_tokens.get(req_id)
+                if drafts is None or drafts.size == 0:
+                    continue
+                width = min(drafts.size, num_spec_step)
+                self.scheduled_spec_decode_tokens[i, :width] = drafts[:width]
         self.block_tables = [
             seq.block_table for seq in seqs.values() if seq.block_table
         ]
@@ -927,6 +951,9 @@ class Scheduler:
         decoding already-running sequences.
         """
         self._schedule_tick += 1
+        # Fork sources borrowed by the previous batch: its forward has been
+        # issued, so they can go back on the free list (see release_state_pins).
+        self.block_manager.release_state_pins()
         scheduled_seqs = {}
         num_seqs_prefill = 0
         num_batched_tokens = 0
@@ -983,6 +1010,7 @@ class Scheduler:
                     remaining = self.long_prefill_token_threshold
                 budget_remaining = self.max_num_batched_tokens - num_batched_tokens
                 chunk = min(remaining, budget_remaining)
+                chunk = self._finalize_prefill_chunk(seq, seq.num_cached_tokens, chunk)
                 if chunk <= 0:
                     break
                 num_batched_tokens += chunk
@@ -1061,6 +1089,7 @@ class Scheduler:
                 if chunk is None:
                     self.waiting.appendleft(seq)
                     break
+                chunk = self._finalize_prefill_chunk(seq, seq.num_cached_tokens, chunk)
                 self._assert_positive_prefill_chunk(
                     chunk, num_new_tokens, budget_remaining
                 )
@@ -1139,6 +1168,7 @@ class Scheduler:
             )
 
             chunk = self._adjust_prefill_chunk_after_alloc(seq, chunk)
+            chunk = self._finalize_prefill_chunk(seq, seq.num_cached_tokens, chunk)
 
             self._assert_positive_prefill_chunk(chunk, num_new_tokens, budget_remaining)
             num_seqs_prefill, num_batched_tokens = self._schedule_prefill_seq(
@@ -1220,6 +1250,7 @@ class Scheduler:
                 num_cached_tokens=num_cached_tokens_list,
                 is_final_chunk=is_final_chunk,
             )
+            self._consume_state_forks(scheduled_seqs)
 
             if self.advance_on_schedule:
                 # Advance after batch build (so the batch keeps pre-advance
@@ -1338,7 +1369,20 @@ class Scheduler:
             remote_kv_block_ids=sorted(remote_kv_blocks) if remote_kv_blocks else [],
             remote_kv_seq_blocks=remote_kv_seq_blocks,
         )
+        self._consume_state_forks(scheduled_seqs)
         return (decode_batch, scheduled_seqs)
+
+    @staticmethod
+    def _consume_state_forks(scheduled_seqs: dict[int, Sequence]) -> None:
+        """Clear the fork flags the batch just snapshotted.
+
+        A fork describes one forward: the batch carries `state_fork_src`, and
+        every later batch for the same seq must read and write the same group
+        again. Cleared here rather than in the batch constructor so the snapshot
+        stays free of side effects on Sequence.
+        """
+        for seq in scheduled_seqs.values():
+            seq.state_fork_src = -1
 
     # -- Remote KV / offload admission helpers ------------------------------
     def _resolve_waiting_remote_kv(
@@ -1462,6 +1506,41 @@ class Scheduler:
         if num_new_tokens > budget_remaining and num_batched_tokens > 0:
             return None
         return num_new_tokens
+
+    def _finalize_prefill_chunk(self, seq: Sequence, start: int, chunk: int) -> int:
+        """Align a prefill chunk to the state checkpoint boundary and vet forks.
+
+        Two jobs, both about `BlockManager`'s state checkpoints:
+
+        1. A checkpoint can only be taken where a forward ends exactly on a
+           publish position — otherwise the group holds state ahead of the hash
+           it would be filed under. So land chunks on that grid (every
+           `state_checkpoint_interval` hash blocks, plus `state_publish_limit`
+           itself), shortening at most to the previous grid point. Chunks that
+           reach past the limit are cut at it; chunks beyond it are left alone,
+           since nothing more will be published there.
+        2. The forward carrying a fork has to fill the request's new group by
+           itself. If the budget left a chunk too short for that, drop the fork
+           rather than the request — unless the source is shared with another
+           request forking off it this step, which rules out taking it over. Then
+           the fork stays and the chunk is held at `min_fork_tokens` instead;
+           `can_allocate` only offered a resumable boundary with that many
+           prompt tokens behind it, so the tokens are there to forward.
+
+        No-op for models without per-request state (`limit == 0`).
+        """
+        bm = self.block_manager
+        limit = bm.state_publish_limit(seq)
+        if limit:
+            end = min(start + chunk, limit)
+            stride = bm.hash_block_size * bm.state_checkpoint_interval
+            target = end if end == limit else (end - end % stride if stride else 0)
+            if target > start:
+                chunk = target - start
+        if seq.state_fork_src >= 0 and chunk < bm.state_min_fork_tokens:
+            if not bm.cancel_state_fork(seq):
+                chunk = bm.state_min_fork_tokens
+        return chunk
 
     @staticmethod
     def _assert_positive_prefill_chunk(

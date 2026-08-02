@@ -137,6 +137,25 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         """
         return {}
 
+    def min_fork_tokens(self) -> int:
+        """Tokens the forward after a state fork must cover, 0 = no fork support.
+
+        A fork hands the old state group to the checkpoint index and points the
+        request at a fresh one, reading the old and writing the new for exactly
+        one forward. That forward has to leave the new group self-contained:
+        every position the NEXT forward reads must have been written into it,
+        because a single read index cannot span the old group and the new one.
+
+        So the boundary is only forkable if the following forward covers at
+        least this many tokens — the full read window plus whatever slack the
+        backend's ring carries. `BlockManager` walks a publish/hit point back to
+        the previous block boundary until the condition holds.
+
+        0 (default) means the backend has no forkable state; the checkpoint
+        index stays empty and prefix hits shrink to 0 for its models.
+        """
+        return 0
+
     def get_kv_transfer_tensors(self) -> "KVTransferTensors | None":
         """Return RDMA transfer regions for PD disaggregation.
 

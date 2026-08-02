@@ -57,6 +57,10 @@ class GDNAttentionMetadata:
     non_spec_state_indices_tensor: torch.Tensor | None = (
         None  # shape: [batch - num_spec_decodes,]
     )
+    # Slots the incoming state is READ from, when a state fork makes that differ
+    # from `non_spec_state_indices_tensor`. Same tensor otherwise; None on the
+    # spec path, which never carries a fork.
+    non_spec_state_indices_in_tensor: torch.Tensor | None = None
     spec_sequence_masks: torch.Tensor | None = None  # shape: [batch,]
     spec_token_indx: torch.Tensor | None = None
     non_spec_token_indx: torch.Tensor | None = None
@@ -135,6 +139,14 @@ class GDNStateMixin:
             device=self.device,
         )
         self.non_spec_state_indices_tensor = CpuGpuBuffer(
+            (self.max_bs,),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        # Read side of a state fork. Only the prefill path can carry one (a
+        # fork is always followed by at least `min_fork_tokens` prompt tokens),
+        # so the spec/decode index buffers have no counterpart.
+        self.non_spec_state_indices_in_tensor = CpuGpuBuffer(
             (self.max_bs,),
             dtype=torch.int32,
             device=self.device,
@@ -243,6 +255,17 @@ class GDNStateMixin:
             self.model_runner.num_spec_tokens,
         )
 
+    def min_fork_tokens(self) -> int:
+        """Tokens the forward carrying a state fork must cover.
+
+        The recurrent state is rewritten whole by any forward, so the binding
+        constraint is the conv state: it holds the last `conv_kernel_dim - 1`
+        tokens, and a forward shorter than that would leave the request's new
+        group holding a window the old group still owns part of.
+        """
+        conv_state_shape, _ = self._state_shape_for_runner()
+        return conv_state_shape[0]
+
     def state_spec(self) -> SubPoolSpec:
         """The GDN state pool: conv_state + temporal_state over all GDN
         layers, with one extra slot per speculative token for rollback.
@@ -284,15 +307,28 @@ class GDNStateMixin:
 
     def prepare_state_indices(self, batch: ScheduledBatch, with_spec: bool = False):
         non_spec_state_indices = self.non_spec_state_indices_tensor.np
+        non_spec_state_indices_in = self.non_spec_state_indices_in_tensor.np
         spec_state_indices = self.spec_state_indices_tensor.np
         slots_per_group = 1 + self.num_spec
+        fork_srcs = getattr(batch, "state_fork_srcs", None) or ()
+        assert not (with_spec and any(s >= 0 for s in fork_srcs)), (
+            "state fork on the spec-decode path: spec_state_indices_tensor has "
+            "no read-side counterpart (BlockManager only forks onto prefill)"
+        )
         for idx, slot_group in enumerate(batch.per_req_cache_groups):
             non_spec_state_indices[idx] = 0
+            non_spec_state_indices_in[idx] = 0
             spec_state_indices[idx] = 0
             base = slot_group * slots_per_group
 
             if not with_spec:
                 non_spec_state_indices[idx] = base
+                # A forked seq reads the group it published (or resumed from)
+                # and writes the fresh one for this forward only.
+                src = fork_srcs[idx] if idx < len(fork_srcs) else -1
+                non_spec_state_indices_in[idx] = (
+                    src * slots_per_group if src >= 0 else base
+                )
             else:
                 spec_state_indices[idx, : 1 + self.num_spec] = np.arange(
                     base, base + 1 + self.num_spec
@@ -323,9 +359,7 @@ class GDNStateMixin:
         if prepare_block_tables:
             self.prepare_block_tables(batch)
 
-        context_lens_tensor = attn_metadata.context_lens
         query_start_loc = attn_metadata.cu_seqlens_q
-        context_lens_tensor = torch.zeros(batch.total_seqs_num_prefill).cuda()
         nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
         if not self.use_spec_decode or is_prefill:
             self.prepare_state_indices(batch, with_spec=False)
@@ -334,6 +368,12 @@ class GDNStateMixin:
             spec_state_indices_tensor = None
             non_spec_state_indices_tensor = (
                 self.non_spec_state_indices_tensor.copy_to_gpu(num_reqs)
+            )
+            # Always its own buffer, never aliased to the write tensor: this
+            # branch also serves non-spec decode, which runs from a captured
+            # CUDAGraph where the argument address is baked in at capture.
+            non_spec_state_indices_in_tensor = (
+                self.non_spec_state_indices_in_tensor.copy_to_gpu(num_reqs)
             )
             spec_query_start_loc = None
             non_spec_query_start_loc = query_start_loc
@@ -360,6 +400,7 @@ class GDNStateMixin:
                 num_reqs
             )
             non_spec_state_indices_tensor = None
+            non_spec_state_indices_in_tensor = None
             spec_query_start_loc = query_start_loc
             non_spec_query_start_loc = None
             num_accepted_tokens = self.num_accepted_tokens[:num_reqs]
@@ -371,7 +412,20 @@ class GDNStateMixin:
             num_prefill_tokens = 0
 
         if num_prefills > 0:
-            has_initial_state = context_lens_tensor > 0
+            # Tokens already folded into each request's state before this
+            # forward: earlier prefill chunks, or a resumed state checkpoint.
+            # It has to be the chunk's START offset — `attn_metadata`'s
+            # `context_lens` is the END (cached + scheduled) and would claim an
+            # incoming state on a cold first chunk, making the recurrence start
+            # from whatever the recycled state group still held. The backend
+            # leaves `num_cached_tokens` None when no row has any, which is the
+            # same all-False answer.
+            cached = attn_metadata.num_cached_tokens
+            has_initial_state = (
+                cached[:num_prefills] > 0
+                if cached is not None
+                else torch.zeros(num_prefills, dtype=torch.bool, device=self.device)
+            )
             nums_dict, batch_ptr, token_chunk_offset_ptr = (
                 compute_causal_conv1d_metadata(non_spec_query_start_loc)
             )
@@ -391,6 +445,7 @@ class GDNStateMixin:
             non_spec_query_start_loc=non_spec_query_start_loc,
             spec_state_indices_tensor=spec_state_indices_tensor,
             non_spec_state_indices_tensor=non_spec_state_indices_tensor,
+            non_spec_state_indices_in_tensor=non_spec_state_indices_in_tensor,
             spec_sequence_masks=spec_sequence_masks,
             spec_token_indx=spec_token_indx,
             non_spec_token_indx=non_spec_token_indx,
@@ -448,6 +503,7 @@ class GDNStateMixin:
             gdn_metadata.num_accepted_tokens = self.num_accepted_tokens[:num_decodes]
         else:
             self.non_spec_state_indices_tensor.gpu[num_decodes:].fill_(PAD_SLOT_ID)
+            self.non_spec_state_indices_in_tensor.gpu[num_decodes:].fill_(PAD_SLOT_ID)
 
             self.non_spec_query_start_loc[: num_decodes + 1].copy_(
                 gdn_metadata.non_spec_query_start_loc[: num_decodes + 1],
@@ -501,6 +557,9 @@ class GDNStateMixin:
                 non_spec_state_indices_tensor=self.non_spec_state_indices_tensor.gpu[
                     :bs
                 ],
+                non_spec_state_indices_in_tensor=(
+                    self.non_spec_state_indices_in_tensor.gpu[:bs]
+                ),
                 spec_sequence_masks=None,
                 spec_token_indx=None,
                 non_spec_token_indx=None,

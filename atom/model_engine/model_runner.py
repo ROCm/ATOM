@@ -394,7 +394,14 @@ class tokenIDProcessor:
         ]
         self.input_ids.copy_to_gpu(total_tokens_prefill)
 
-        self.prev_rejected_num, self.prev_bonus_num = self.recv_mtp_status_async()
+        # The MTP status queue is filled in postprocess but drained here, so a
+        # step whose postprocess is skipped must not drain it: `forward()` bails
+        # before postprocess when the batch produces no output (every prefill in
+        # it is a middle chunk), and the status it popped belongs to the batch
+        # whose deferred tokens the NEXT output-producing step will surface.
+        # Draining it here would hand that step `num_rejected=None`.
+        if batch.produces_output():
+            self.prev_rejected_num, self.prev_bonus_num = self.recv_mtp_status_async()
 
         # TODO: remove this when we support mixed prefill and decode in one batch
         if total_reqs_prefill > 0:
@@ -1669,6 +1676,7 @@ class ModelRunner:
         self.pool_plan = plan
         config.pool_entries = dict(plan.entries)
         config.pool_entries_per_req = dict(plan.entries_per_req)
+        config.state_min_fork_tokens = self.attn_metadata_builder.min_fork_tokens()
         for name in sorted(plan.entries):
             logger.info(
                 f"sub-pool {name}: entries={plan.entries[name]}, "
@@ -1741,6 +1749,7 @@ class ModelRunner:
             "num_kvcache_blocks": num_kvcache_blocks,
             "pool_entries": dict(plan.entries),
             "pool_entries_per_req": dict(plan.entries_per_req),
+            "state_min_fork_tokens": config.state_min_fork_tokens,
         }
 
     def allocate_kv_cache(self, num_kvcache_blocks):
