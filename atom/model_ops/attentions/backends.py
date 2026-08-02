@@ -122,17 +122,18 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         """
         return []
 
-    def allocate_per_req_cache(
-        self, entries: dict[str, int]
-    ) -> dict[str, "torch.Tensor"]:
-        """Allocate this backend's per-request state tensors.
+    def allocate_per_req_cache(self, entries: dict[str, int]) -> dict[str, object]:
+        """Allocate this backend's per-request state.
 
         Called by ModelRunner.allocate_kv_cache() with the entry count sizing
         assigned to every cache class. The builder indexes the classes it
         declared in `sub_pool_specs` — the runner does not know their names.
-        Returns a dict mapping attribute name → tensor; ModelRunner does
-        `setattr(self, name, tensor)` so model layers can reach them as
+        Returns a dict mapping attribute name → value; ModelRunner does
+        `setattr(self, name, value)` so model layers can reach them as
         `model_runner.<name>` (preserving existing names like `mamba_k_cache`).
+        Values are usually tensors, but a backend may also publish the object
+        that owns them — DeepSeek-V4 publishes its `StateArena` alongside the
+        per-layer views so the PD path can address a whole entry.
         """
         return {}
 

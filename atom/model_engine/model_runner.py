@@ -1821,13 +1821,13 @@ class ModelRunner:
         # Per-request cache allocation (model-agnostic, delegated to the
         # attention metadata builder). For GDN this returns
         # `{"mamba_k_cache": ..., "mamba_v_cache": ...}`; for stateless
-        # attentions it returns an empty dict (no-op). Tensors are setattr'd
+        # attentions it returns an empty dict (no-op). Values are setattr'd
         # on `self` so model layers can access them as `model_runner.<name>`.
-        per_req_tensors = self.attn_metadata_builder.allocate_per_req_cache(
+        per_req_state = self.attn_metadata_builder.allocate_per_req_cache(
             self.pool_plan.entries
         )
-        for name, tensor in per_req_tensors.items():
-            setattr(self, name, tensor)
+        for name, value in per_req_state.items():
+            setattr(self, name, value)
 
         # Build KVCacheConfig
         # lirong TODO: This is a simple solution to build KVCacheConfig,
@@ -1935,9 +1935,9 @@ class ModelRunner:
             diff_pct = abs(actual_kv_bytes - expected_kv_bytes) / expected_kv_bytes
             # 3% threshold: budget formula matches allocation exactly, but the
             # measured `post_alloc - pre_alloc` includes allocator alignment
-            # (round to 256 B / 16 MiB segments) and ephemeral init buffers
-            # from `_zero_state` / `_neg_inf_state` views, accounting for ~2%
-            # noise on multi-GiB pools. Lower thresholds spuriously fire.
+            # (round to 256 B / 16 MiB segments) and whatever transient the
+            # builders touch while initializing their pools, accounting for
+            # ~2% noise on multi-GiB pools. Lower thresholds spuriously fire.
             if diff_pct > 0.03:
                 logger.warning(
                     f"KV cache allocation mismatch: "

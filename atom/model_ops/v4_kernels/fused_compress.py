@@ -51,16 +51,13 @@ from `unified_kv` (Main) or the FP8 indexer pool, not from the kernel
 return).
 """
 
-from typing import Optional
-
 import torch
 import triton
 import triton.language as tl
 
-from atom.utils.decorators import mark_trace
-
 from atom.model_ops.v4_kernels.compress_plan import CompressPlan
 from atom.utils import envs
+from atom.utils.decorators import mark_trace
 
 # Optional flydsl path (aiter ROCm kernels). Falls back to Triton when
 # unavailable. HCA = compress + norm_rope_scatter 2-kernel split for
@@ -587,7 +584,11 @@ def fused_compress_attn(
     # fused wkv_gate output). Inner column stride must be 1 — kernel uses
     # `+ d` for the BLOCK_D offset.
     assert kv_in.stride(-1) == 1 and score_in.stride(-1) == 1
-    assert kv_state.is_contiguous() and score_state.is_contiguous()
+    # State slot / ring strides are passed to the kernel, so the states may be
+    # strided views — they are slices of a per-request arena where the slot
+    # stride is the whole entry, not this field alone. Only the innermost dim
+    # has to be unit stride: the kernel addresses it as `col_off + d`.
+    assert kv_state.stride(-1) == 1 and score_state.stride(-1) == 1
     assert ape.is_contiguous() and rms_weight.is_contiguous()
     has_bt = block_tables is not None
     if has_bt:
