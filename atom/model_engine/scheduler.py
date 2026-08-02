@@ -197,8 +197,9 @@ class CacheStats:
         return num / den if den > 0 else 0.0
 
     def _log(self) -> None:
-        # compressed = pre-SWA-gate prefix hit; cached = post-gate (admitted).
-        # (compressed - cached) is reuse lost to a missing SWA tail; (full -
+        # compressed = pre-gate prefix hit; cached = post-gate (admitted).
+        # (compressed - cached) is reuse the gates declined — a missing SWA tail
+        # or, on a stateful model, no state checkpoint at that boundary; (full -
         # compressed) is reuse lost to compressed eviction / no logical reuse.
         iv_hit = self._rate(self._interval_cached_tokens, self._interval_full_tokens)
         iv_comp = self._rate(
@@ -212,7 +213,7 @@ class CacheStats:
             f"[Cache Stats Interval] Reqs: {self._interval_requests}, "
             f"Cached/Total: {self._interval_cached_tokens}/{self._interval_full_tokens}, "
             f"Hit: {iv_hit:.2%}, Compressed-hit: {iv_comp:.2%}, "
-            f"Lost-to-SWA-gate: {iv_gate:.2%}"
+            f"Lost-to-gates: {iv_gate:.2%}"
         )
         tot_comp = self._rate(self.total_compressed_tokens, self.total_full_tokens)
         tot_gate = self._rate(
@@ -223,7 +224,7 @@ class CacheStats:
             f"[Cache Stats         ] Reqs: {self.total_requests}, "
             f"Cached/Total: {self.total_cached_tokens}/{self.total_full_tokens}, "
             f"Hit: {self.hit_rate:.2%}, Compressed-hit: {tot_comp:.2%}, "
-            f"Lost-to-SWA-gate: {tot_gate:.2%}"
+            f"Lost-to-gates: {tot_gate:.2%}"
         )
 
 
@@ -1515,10 +1516,10 @@ class Scheduler:
         1. A checkpoint can only be taken where a forward ends exactly on a
            publish position — otherwise the group holds state ahead of the hash
            it would be filed under. So land chunks on that grid (every
-           `state_checkpoint_interval` hash blocks, plus `state_publish_limit`
-           itself), shortening at most to the previous grid point. Chunks that
-           reach past the limit are cut at it; chunks beyond it are left alone,
-           since nothing more will be published there.
+           `state_checkpoint_interval_tokens`, up to `state_publish_limit`),
+           shortening at most to the previous grid point. Chunks that reach past
+           the limit are cut at it; chunks beyond it are left alone, since
+           nothing more will be published there.
         2. The forward carrying a fork has to fill the request's new group by
            itself. If the budget left a chunk too short for that, drop the fork
            rather than the request — unless the source is shared with another
@@ -1527,14 +1528,16 @@ class Scheduler:
            `can_allocate` only offered a resumable boundary with that many
            prompt tokens behind it, so the tokens are there to forward.
 
-        No-op for models without per-request state (`limit == 0`).
+        No-op for models without per-request state, and for any prompt shorter
+        than one checkpoint interval (`limit == 0`).
         """
         bm = self.block_manager
         limit = bm.state_publish_limit(seq)
         if limit:
             end = min(start + chunk, limit)
-            stride = bm.hash_block_size * bm.state_checkpoint_interval
-            target = end if end == limit else (end - end % stride if stride else 0)
+            # `limit` is itself a multiple of the interval, so a chunk cut at it
+            # needs no special case.
+            target = end - end % bm.state_checkpoint_interval_tokens
             if target > start:
                 chunk = target - start
         if seq.state_fork_src >= 0 and chunk < bm.state_min_fork_tokens:

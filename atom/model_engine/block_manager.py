@@ -111,9 +111,21 @@ class BlockManager:
         self.state_min_fork_tokens = int(
             getattr(config, "state_min_fork_tokens", 0) or 0
         )
-        # Hash blocks between checkpoints (--state-checkpoint-interval).
-        self.state_checkpoint_interval = max(
-            0, int(getattr(config, "state_checkpoint_interval", 0) or 0)
+        # Tokens between checkpoints (--state-checkpoint-interval-tokens).
+        self.state_checkpoint_interval_tokens = max(
+            0, int(getattr(config, "state_checkpoint_interval_tokens", 0) or 0)
+        )
+        # A checkpoint is filed under the content hash of the last block it
+        # covers, so a publish position that isn't a hash-block boundary can
+        # never be looked up — the ladder would publish into a void.
+        assert not (
+            self.state.enabled
+            and self.state_checkpoint_interval_tokens
+            and self.state_checkpoint_interval_tokens % self.hash_block_size
+        ), (
+            f"--state-checkpoint-interval-tokens="
+            f"{self.state_checkpoint_interval_tokens} must be a multiple of the "
+            f"prefix-cache hash block size {self.hash_block_size}"
         )
 
         # Sliding-window KV pool (DeepSeek-V4). A separate content-addressed pool
@@ -571,42 +583,43 @@ class BlockManager:
     def state_publish_limit(self, seq: Sequence) -> int:
         """Rightmost token position this seq may checkpoint at, 0 for none.
 
-        The last hash-block boundary that still leaves `min_fork_tokens` of
-        prompt to forward: publishing hands the group away, and the forward
+        The last rung of the interval ladder that still leaves `min_fork_tokens`
+        of prompt to forward: publishing hands the group away, and the forward
         right after has to fill the replacement by itself.
+
+        0 means this seq never publishes — including every prompt shorter than
+        one interval, which is the point: a workload whose prompts all fit under
+        the interval pays nothing for a feature it would never hit.
         """
         if not (seq.has_per_req_cache and self.state.enabled):
             return 0
         if self.state_min_fork_tokens <= 0:
             return 0
-        hbs = self._hash_block_size()
-        limit = ((seq.num_prompt_tokens - self.state_min_fork_tokens) // hbs) * hbs
-        return max(limit, 0)
+        interval = self.state_checkpoint_interval_tokens
+        if interval <= 0:
+            return 0
+        forkable = seq.num_prompt_tokens - self.state_min_fork_tokens
+        return max((forkable // interval) * interval, 0)
 
     def is_state_publish_pos(self, seq: Sequence, pos: int) -> bool:
         """Whether a forward ending at `pos` should checkpoint its state.
 
-        A ladder of resume points, one every `state_checkpoint_interval` hash
-        blocks, plus `state_publish_limit` itself — the rightmost point is the
-        one a same-prompt hit lands on, so it is published whatever the interval
-        says. Publishing is capacity-neutral (the group handed away is replaced
-        by one from the free list), but each one does bump a stale checkpoint
-        out of the free-list tail, which is what the interval is there to pace.
-        Interval 0 keeps only the limit.
+        A ladder of resume points, one every `state_checkpoint_interval_tokens`
+        of context, up to `state_publish_limit`. Publishing is capacity-neutral
+        (the group handed away is replaced by one from the free list), but each
+        one costs the publisher an extra forward — the prompt gets cut at the
+        rung — so the interval is what keeps that cost amortized instead of
+        per-request.
 
         The position must be exact. The group holds state as of the forward's
-        last token, so a forward that overshoots a boundary is ahead of the hash
-        it would be filed under; the scheduler cuts prefill chunks to land here,
+        last token, so a forward that overshoots a rung is ahead of the hash it
+        would be filed under; the scheduler cuts prefill chunks to land here,
         and a path that doesn't simply publishes nothing.
         """
-        hbs = self._hash_block_size()
         limit = self.state_publish_limit(seq)
-        if not (0 < pos <= limit) or pos % hbs:
+        if not (0 < pos <= limit):
             return False
-        if pos == limit:
-            return True
-        interval = self.state_checkpoint_interval
-        return interval > 0 and (pos // hbs) % interval == 0
+        return pos % self.state_checkpoint_interval_tokens == 0
 
     def _publish_state_checkpoint(self, seq: Sequence, h: int) -> None:
         """Hand the seq's state group to the checkpoint index under hash `h`.

@@ -41,7 +41,7 @@ Defined in `atom/config.py`. The root dataclass that the engine consumes.
 | `num_kvcache_blocks` | `int` | `-1` | Number of KV cache blocks (`-1` = auto) |
 | `kv_cache_dtype` | `str` | `"bf16"` | KV cache data type (`"bf16"` or `"fp8"`) |
 | `enable_prefix_caching` | `bool` | `False` | Enable prefix caching to reuse KV blocks across requests sharing the same prefix |
-| `state_checkpoint_interval` | `int` | `8` | For models with per-request state (DeepSeek-V4 compressor ring, GDN recurrent state): publish a state checkpoint every N hash blocks of prefill, so a later prefix hit can resume there. `0` keeps only the last eligible boundary of each prompt. See the state-checkpoint section of the [scheduling & KV cache guide](scheduling_kv_cache_guide.md) |
+| `state_checkpoint_interval_tokens` | `int` | `8192` | For models with per-request state (DeepSeek-V4 compressor ring, GDN recurrent state): publish a state checkpoint every N tokens of context, so a later prefix hit can resume there. A prompt shorter than N publishes nothing. Must be a multiple of the prefix-cache hash block size; `0` disables checkpoints. See the state-checkpoint section of the [scheduling & KV cache guide](scheduling_kv_cache_guide.md) |
 | `port` | `int` | `8006` | Engine internal communication port |
 | `torch_profiler_dir` | `str \| None` | `os.getenv("ATOM_TORCH_PROFILER_DIR", None)` | Directory for saving PyTorch profiler traces; creates the directory if it does not exist |
 | `compilation_config` | `CompilationConfig` | `CompilationConfig()` | Compilation and CUDA graph settings (see Section 2) |
@@ -367,7 +367,7 @@ all flags via `add_cli_args()` and converts them into a `Config` via
 | `--method` | | `str` | `None` | Speculative method; choices: `mtp` |
 | `--num-speculative-tokens` | | `int` | `1` | Number of speculative tokens per iteration |
 | `--max-num-batched-tokens` | | `int` | `16384` | Maximum number of tokens to batch in the async engine |
-| `--state-checkpoint-interval` | | `int` | `8` | Hash blocks between per-request state checkpoints; `0` = only the last eligible boundary per prompt. Also quantizes prefill chunk boundaries, since a checkpoint is only valid where a forward ends exactly on one |
+| `--state-checkpoint-interval-tokens` | | `int` | `8192` | Tokens between per-request state checkpoints; must be a multiple of the prefix-cache hash block size, `0` disables them. Prompts shorter than one interval publish nothing, which is what keeps the feature free on workloads that never reuse a prefix. Also quantizes prefill chunk boundaries, since a checkpoint is only valid where a forward ends exactly on one |
 | `--max-num-seqs` | | `int` | `512` | Maximum number of sequences to batch together |
 | `--gpu-memory-utilization` | | `float` | `0.9` | Fraction of GPU memory to use (0.0 — 1.0) |
 | `--scheduler-delay-factor` | | `float` | `0.0` | Delay factor multiplied by previous prompt latency before scheduling next prompt |

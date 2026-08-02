@@ -13,9 +13,11 @@
 # checkpoints must never reduce the number of admissible requests, and the
 # eviction event is hand-out, not free.
 
+import pytest
 from conftest import MockConfig
 
 from atom.model_engine.block_manager import BlockManager
+from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import Sequence
 from atom.model_engine.state_pool import StateCheckpointPool
 
@@ -38,7 +40,7 @@ def ckpt_config(**overrides):
         speculative_config=None,
         pool_entries={"state": 4},
         state_min_fork_tokens=MIN_FORK,
-        state_checkpoint_interval=1,
+        state_checkpoint_interval_tokens=BLOCK,
     )
     defaults.update(overrides)
     return MockConfig(**defaults)
@@ -289,8 +291,8 @@ class TestForkLifecycle:
         assert len(bm.state.hash_to_group) == 3
         assert bm.state.lookup(boundary_hash(bm, seq)) >= 0  # the rightmost one
 
-    def test_interval_thins_the_ladder_but_keeps_the_limit(self):
-        bm = BlockManager(ckpt_config(state_checkpoint_interval=3))
+    def test_interval_thins_the_ladder(self):
+        bm = BlockManager(ckpt_config(state_checkpoint_interval_tokens=3 * BLOCK))
         seq = stateful_seq(list(range(40)))
         limit = bm.state_publish_limit(seq)
         published = [
@@ -298,18 +300,37 @@ class TestForkLifecycle:
             for pos in range(BLOCK, limit + BLOCK, BLOCK)
             if bm.is_state_publish_pos(seq, pos)
         ]
-        # Every third block, and the limit whatever the interval says.
-        assert published == [3 * BLOCK, 6 * BLOCK, limit]
+        # 40 tokens, 8 reserved for the fork forward: rungs at 12 and 24, and
+        # the limit is the last rung rather than the last block boundary (32).
+        assert limit == 6 * BLOCK
+        assert published == [3 * BLOCK, 6 * BLOCK]
 
-    def test_interval_zero_keeps_only_the_limit(self):
-        bm = BlockManager(ckpt_config(state_checkpoint_interval=0))
+    def test_interval_zero_publishes_nothing(self):
+        bm = BlockManager(ckpt_config(state_checkpoint_interval_tokens=0))
         seq = stateful_seq(list(range(40)))
-        limit = bm.state_publish_limit(seq)
-        assert limit > 0
-        assert bm.is_state_publish_pos(seq, limit)
+        assert bm.state_publish_limit(seq) == 0
         assert not any(
-            bm.is_state_publish_pos(seq, pos) for pos in range(BLOCK, limit, BLOCK)
+            bm.is_state_publish_pos(seq, pos) for pos in range(BLOCK, 40, BLOCK)
         )
+
+    def test_prompt_shorter_than_the_interval_publishes_nothing(self):
+        """The zero-cost case: no reuse to be had, so no forward is spent.
+
+        A prompt that cannot even reach one rung must not be cut, or every
+        request on a short-prompt workload pays an extra forward for a
+        checkpoint nothing will ever hit.
+        """
+        bm = BlockManager(ckpt_config(state_checkpoint_interval_tokens=8 * BLOCK))
+        seq = stateful_seq(list(range(30)))  # 30 < 8 * BLOCK
+        assert bm.state_publish_limit(seq) == 0
+        run_prompt(bm, seq)
+        assert not bm.state.hash_to_group
+        assert seq.state_fork_src == -1
+
+    def test_interval_must_divide_the_hash_block_size(self):
+        """A rung off the block grid has no content hash to be filed under."""
+        with pytest.raises(AssertionError, match="must be a multiple"):
+            BlockManager(ckpt_config(state_checkpoint_interval_tokens=BLOCK + 1))
 
     def test_hit_never_lands_where_swa_cannot_follow(self):
         """The two gates settle jointly; neither is applied to the other's answer.
@@ -423,3 +444,32 @@ class TestForkLifecycle:
         assert src not in bm.free_per_req_cache_groups
         bm.release_state_pins()
         assert src in bm.free_per_req_cache_groups
+
+
+# ── The scheduler side: what a checkpoint costs the publisher ──────────────
+
+
+class TestPrefillChunkAlignment:
+    """`_finalize_prefill_chunk` cuts a prompt only where a rung is reachable.
+
+    Every cut is an extra forward for the publisher, so the interval's whole
+    job is to keep that off prompts too short to have anything to publish.
+    """
+
+    def test_prompt_shorter_than_the_interval_is_not_cut(self):
+        sched = Scheduler(ckpt_config(state_checkpoint_interval_tokens=8 * BLOCK))
+        seq = stateful_seq(list(range(30)))  # 30 < 8 * BLOCK
+        assert sched._finalize_prefill_chunk(seq, 0, 30) == 30
+
+    def test_chunk_stops_at_the_rung(self):
+        sched = Scheduler(ckpt_config(state_checkpoint_interval_tokens=3 * BLOCK))
+        seq = stateful_seq(list(range(40)))
+        limit = sched.block_manager.state_publish_limit(seq)
+        assert limit == 24
+        # A whole-prompt chunk is cut at the last rung...
+        assert sched._finalize_prefill_chunk(seq, 0, 40) == limit
+        # ...one that ends between rungs is pulled back to the one below...
+        assert sched._finalize_prefill_chunk(seq, 0, 20) == 3 * BLOCK
+        # ...and one starting past the limit is left whole, since nothing more
+        # will be published there.
+        assert sched._finalize_prefill_chunk(seq, limit, 16) == 16

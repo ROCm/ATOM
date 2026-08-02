@@ -50,7 +50,7 @@ class EngineArgs:
     max_num_batched_tokens: int = 16384
     long_prefill_token_threshold: int = 0
     attn_prefill_chunk_size: int = 16384
-    state_checkpoint_interval: int = 8
+    state_checkpoint_interval_tokens: int = 8192
     enable_chunked_prefill: bool = True
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
@@ -313,16 +313,17 @@ class EngineArgs:
             ),
         )
         parser.add_argument(
-            "--state-checkpoint-interval",
+            "--state-checkpoint-interval-tokens",
             type=int,
-            default=8,
+            default=8192,
             help=(
                 "For models with per-request state (DeepSeek-V4 compressor "
                 "ring, GDN recurrent state), publish a state checkpoint every "
-                "N hash blocks of prefill so a later prefix hit can resume "
-                "there. Larger N means fewer, coarser resume points and less "
-                "churn in the state group pool; 0 keeps only the last eligible "
-                "boundary of each prompt. Prefill chunks are aligned to these "
+                "N tokens of context so a later prefix hit can resume there. "
+                "A prompt shorter than N publishes nothing, which is what keeps "
+                "the feature free on workloads that never reuse a prefix. Must "
+                "be a multiple of the prefix-cache hash block size; 0 disables "
+                "checkpoints entirely. Prefill chunks are aligned to these "
                 "positions, so this also quantizes chunk boundaries."
             ),
         )

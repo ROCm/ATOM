@@ -1285,10 +1285,10 @@ class Config:
     max_num_batched_tokens: int = 16384
     long_prefill_token_threshold: int = 0
     attn_prefill_chunk_size: int = 16384
-    # Publish a per-request state checkpoint every N hash blocks of prefill;
-    # 0 = only the last eligible boundary of each prompt. See
-    # BlockManager.is_state_publish_pos.
-    state_checkpoint_interval: int = 8
+    # Tokens between per-request state checkpoints; 0 = never publish. Must be
+    # a multiple of the prefix-cache hash block size (asserted in BlockManager).
+    # See BlockManager.is_state_publish_pos.
+    state_checkpoint_interval_tokens: int = 8192
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
     max_model_len: int | None = None
