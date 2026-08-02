@@ -13,6 +13,10 @@ PORT="${2:-8000}"
 NUM_FEWSHOT="${3:-5}"
 NUM_CONCURRENT="${NUM_CONCURRENT:-65}"
 LIMIT="${LIMIT:-}"  # set LIMIT=50 to run only first 50 samples
+GEN_KWARGS="${GEN_KWARGS:-}"  # e.g. max_gen_toks=2048 for reasoning models
+# Set to a directory to also dump per-sample prompts/generations, so two runs
+# can be diffed question by question instead of only by the headline score.
+LOG_SAMPLES_DIR="${LOG_SAMPLES_DIR:-}"
 BASE_URL="http://localhost:${PORT}/v1/completions"
 OUTPUT_DIR="/app/logs_claude"
 LOG_FILE="${OUTPUT_DIR}/gsm8k_eval.log"
@@ -48,9 +52,25 @@ if [ -n "$LIMIT" ]; then
     LIMIT_ARG=(--limit "$LIMIT")
 fi
 
+SAMPLES_ARG=()
+if [ -n "$LOG_SAMPLES_DIR" ]; then
+    mkdir -p "$LOG_SAMPLES_DIR"
+    SAMPLES_ARG=(--log_samples --output_path "$LOG_SAMPLES_DIR")
+fi
+
+# Reasoning models emit a thinking block before the answer, so gsm8k's default
+# max_gen_toks=256 truncates mid-thought and scores near zero regardless of
+# correctness. Raise it for those: GEN_KWARGS="max_gen_toks=2048".
+GEN_KWARGS_ARG=()
+if [ -n "$GEN_KWARGS" ]; then
+    GEN_KWARGS_ARG=(--gen_kwargs "$GEN_KWARGS")
+fi
+
 lm_eval --model local-completions \
     --model_args "model=${MODEL},base_url=${BASE_URL},num_concurrent=${NUM_CONCURRENT},max_retries=3,tokenized_requests=False,trust_remote_code=True" \
     --tasks gsm8k \
     --num_fewshot "$NUM_FEWSHOT" \
     "${LIMIT_ARG[@]}" \
+    "${SAMPLES_ARG[@]}" \
+    "${GEN_KWARGS_ARG[@]}" \
     2>&1 | tee -a "${LOG_FILE}"
