@@ -80,6 +80,13 @@ class Sequence:
         self.num_prompt_tokens = len(token_ids)
         self.num_rejected = 0
         self.num_cached_tokens = 0
+        # Tokens whose blocks are registered in the prefix cache: through the
+        # prompt as chunks finalize, then on through decode as generated blocks
+        # fill (BlockManager.hash_decode_blocks). Distinct from
+        # `num_cached_tokens`, which means "KV computed" and stops at the
+        # prompt; this means "content hash published". They part ways the moment
+        # generation starts.
+        self.num_hashed_tokens = 0
         self.num_compressed_hit_blocks = 0
         self.prefix_cache_hit_tokens = 0
         # True iff this seq is mid-prefill (chunked prefill produced KV for

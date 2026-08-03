@@ -613,6 +613,53 @@ class TestPrefixCaching:
             )
         )
 
+    def test_generated_blocks_feed_the_next_turn(self, seq_factory):
+        """Multi-turn reuse: turn 2's prompt is turn 1's prompt plus its answer.
+
+        Exercises the postprocess call site, where the committed length is the
+        only thing separating a finalized block from one the next step may still
+        rewrite.
+        """
+        sched = Scheduler(
+            MockConfig(
+                enable_prefix_caching=True,
+                kv_cache_block_size=4,
+                num_kvcache_blocks=40,
+                max_num_seqs=4,
+                max_num_batched_tokens=256,
+                max_model_len=64,
+            )
+        )
+        prompt = [1, 3, 4, 5, 6, 7, 8, 9]  # 2 whole blocks
+        seq1 = seq_factory(prompt, sampling_params=SamplingParams(max_tokens=64))
+        sched.add(seq1)
+        batch, _ = sched.schedule()  # prefill
+
+        generated = list(range(100, 112))  # 3 more blocks
+        for token in generated:
+            sched.postprocess(
+                list(sched.running),
+                ScheduledBatchOutput(
+                    req_ids=[seq1.id],
+                    token_ids=[(token,)],
+                    num_rejected=None,
+                    num_bonus=None,
+                    draft_token_ids=None,
+                ),
+                batch=batch,
+            )
+            batch, _ = sched.schedule()  # next decode step
+
+        assert seq1.token_ids == prompt + generated
+        assert seq1.num_hashed_tokens == 20
+
+        followup = seq_factory(prompt + generated)
+        sched.add(followup)
+        batch2, _ = sched.schedule()
+        # 20 tokens, 5 blocks; the last is never reused so 16 tokens are cached
+        # and only the final block's 4 tokens get forwarded.
+        assert batch2.total_tokens_num_prefill == 4
+
     def test_prefix_cache_reduces_token_count(self, seq_factory):
         """After a first request populates the cache, a second request sharing
         the same prefix should only schedule the non-cached tokens."""

@@ -511,3 +511,122 @@ class TestM2WindowFreeing:
         # Every compressed block stays held (no -1 sentinels, all in used set).
         assert all(b >= 0 for b in seq.block_table)
         assert all(b in bm.used_block_ids for b in seq.block_table)
+
+
+# ── decode-side block hashing ──────────────────────────────────────────────
+
+
+class TestDecodeBlockHashing:
+    """Generated blocks must enter the prefix cache, not just prompt blocks.
+
+    The multi-turn case: turn 2's prompt is turn 1's prompt plus turn 1's
+    answer. Hashing only the prompt caps every follow-up hit at the original
+    prompt length, no matter how much of the conversation is still resident.
+    """
+
+    BS = 4
+
+    def _bm(self, **overrides):
+        cfg = {
+            "num_kvcache_blocks": 100,
+            "kv_cache_block_size": self.BS,
+            "enable_prefix_caching": True,
+            "max_model_len": 256,
+        }
+        cfg.update(overrides)
+        return BlockManager(MockConfig(**cfg))
+
+    def _run_turn(self, bm, seq, generated):
+        """Prefill `seq`, then append `generated` and hash what filled up."""
+        bm.allocate(seq, bm.can_allocate(seq))
+        bm.hash_blocks(seq, seq.num_prompt_tokens - seq.num_cached_tokens)
+        for token in generated:
+            seq.append_token(token)
+            bm.may_append(seq)
+        bm.hash_decode_blocks(seq, seq.num_tokens)
+
+    def test_followup_turn_reuses_the_generated_blocks(self, seq_factory):
+        bm = self._bm()
+        prompt = list(range(8))  # 2 blocks
+        generated = list(range(100, 112))  # 3 more blocks
+        self._run_turn(bm, seq_factory(prompt), generated)
+
+        # Turn 2 replays the whole conversation as its prompt: 20 tokens, 5
+        # blocks. can_allocate never hands back the last block (the seq has to
+        # forward something), so a full hit is 4.
+        followup = seq_factory(prompt + generated)
+        assert bm.can_allocate(followup) == 4
+
+    def test_prompt_only_hashing_would_stop_at_the_prompt(self, seq_factory):
+        """Pins what the fix buys: without it the hit stops at 2 blocks."""
+        bm = self._bm()
+        prompt = list(range(8))
+        generated = list(range(100, 112))
+        seq = seq_factory(prompt)
+        bm.allocate(seq, bm.can_allocate(seq))
+        bm.hash_blocks(seq, seq.num_prompt_tokens)
+        for token in generated:
+            seq.append_token(token)
+            bm.may_append(seq)
+        # Deliberately skip hash_decode_blocks — the pre-fix behaviour.
+        followup = seq_factory(prompt + generated)
+        assert bm.can_allocate(followup) == 2
+
+    def test_uncommitted_tail_is_not_hashed(self, seq_factory):
+        """Only whole blocks below the committed watermark may be published.
+
+        The speculative-decoding hazard: tokens above the committed length can
+        still be rewritten next step, and their KV with them.
+        """
+        bm = self._bm()
+        prompt = list(range(8))
+        seq = seq_factory(prompt)
+        bm.allocate(seq, bm.can_allocate(seq))
+        bm.hash_blocks(seq, seq.num_prompt_tokens)
+        for token in range(100, 112):
+            seq.append_token(token)
+            bm.may_append(seq)
+        # Commit only the first generated block; the rest is still in flight.
+        bm.hash_decode_blocks(seq, 12)
+        assert seq.num_hashed_tokens == 12
+
+        followup = seq_factory(prompt + list(range(100, 112)))
+        assert bm.can_allocate(followup) == 3  # 2 prompt + 1 committed
+
+    def test_watermark_advances_past_the_prompt_boundary_block(self, seq_factory):
+        """The block straddling prompt-end is hashed once generation fills it."""
+        bm = self._bm()
+        prompt = list(range(10))  # 2 whole blocks + 2 tokens
+        seq = seq_factory(prompt)
+        bm.allocate(seq, bm.can_allocate(seq))
+        bm.hash_blocks(seq, seq.num_prompt_tokens)
+        assert seq.num_hashed_tokens == 8  # block 2 is half full
+
+        for token in range(100, 106):
+            seq.append_token(token)
+            bm.may_append(seq)
+        bm.hash_decode_blocks(seq, seq.num_tokens)
+        assert seq.num_hashed_tokens == 16
+
+    def test_deallocate_clears_the_watermark(self, seq_factory):
+        bm = self._bm()
+        seq = seq_factory(list(range(8)))
+        bm.allocate(seq, bm.can_allocate(seq))
+        bm.hash_blocks(seq, seq.num_prompt_tokens)
+        assert seq.num_hashed_tokens == 8
+        bm.deallocate(seq)
+        # Preemption frees through here and re-prefills from scratch; a stale
+        # watermark would make hash_decode_blocks index a block table that no
+        # longer exists.
+        assert seq.num_hashed_tokens == 0
+
+    def test_no_op_without_prefix_caching(self, seq_factory):
+        bm = self._bm(enable_prefix_caching=False)
+        seq = seq_factory(list(range(8)))
+        bm.allocate(seq, bm.can_allocate(seq))
+        for token in range(100, 108):
+            seq.append_token(token)
+            bm.may_append(seq)
+        bm.hash_decode_blocks(seq, seq.num_tokens)
+        assert seq.num_hashed_tokens == 0
+        assert not bm.hash_to_block_id

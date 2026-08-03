@@ -521,6 +521,9 @@ class BlockManager:
         end = (base + num_new_tokens) // hbs
         if start >= end:
             return
+        # Watermark for the decode-side continuation, maintained here so every
+        # prefill path feeds it without knowing about it.
+        seq.num_hashed_tokens = max(seq.num_hashed_tokens, end * hbs)
         h = self.blocks[seq.block_table[start - 1]].hash if start > 0 else -1
         record = self._event_log is not None
         store_run_parent: int | None = h if h != -1 else None
@@ -550,6 +553,30 @@ class BlockManager:
             )
         if self.is_state_publish_pos(seq, base + num_new_tokens):
             self._publish_state_checkpoint(seq, h)
+
+    def hash_decode_blocks(self, seq: Sequence, committed_len: int) -> None:
+        """Register hashes for generated blocks filled up to `committed_len`.
+
+        `may_append` allocates decode blocks without hashing them: at allocation
+        time their tokens have not been sampled, and under speculative decoding
+        part of what the forward writes is about to be rejected. Neither holds
+        by the time the caller has a committed length — one taken after
+        acceptance and after any stop-sequence truncation.
+
+        `committed_len` is therefore a hard line, not a hint. Below it a block's
+        last write came from an accepted token, so its content and its KV agree;
+        above it the next step may still rewrite both. Hashing past it would
+        publish a content hash over KV that a later request goes on to reuse.
+
+        Without this the prefix cache indexes prompt blocks only, and a
+        follow-up turn — previous prompt plus previous answer — matches nothing
+        beyond the original prompt.
+        """
+        if not self.enable_prefix_caching:
+            return
+        base = seq.num_hashed_tokens
+        if committed_len > base:
+            self.hash_blocks(seq, committed_len - base, start_tokens=base)
 
     def cancel_state_fork(self, seq: Sequence) -> bool:
         """Undo a pending fork by adopting its source group.
@@ -647,6 +674,9 @@ class BlockManager:
             seq
         )  # release SWA blocks + clear swa_block_table (no-op if disabled)
         seq.num_cached_tokens = 0
+        # The block table is gone, so nothing of this seq is hashed any more.
+        # Covers preemption too, which frees through here and re-prefills.
+        seq.num_hashed_tokens = 0
         seq.block_table.clear()
         if seq.has_per_req_cache and seq.per_req_cache_group >= 0:
             # Only the group the seq was writing. A checkpoint it published is

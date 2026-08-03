@@ -2039,6 +2039,12 @@ class Scheduler:
                 keep = stop_at_idx + 1 + (1 if injected_t0 is not None else 0)
                 new_tokens = new_tokens[:keep]
 
+            # Publish prefix-cache hashes for generated blocks this step filled.
+            # `num_tokens` is the committed length — placeholders, rejected
+            # drafts and any post-stop tail have all been subtracted above — and
+            # that is exactly the line hash_decode_blocks must not cross.
+            self.block_manager.hash_decode_blocks(seq, num_tokens)
+
             # Prepare stream output
             if stream_output_queue is not None and new_tokens:
                 if self.kv_connector is not None and leave_reason is not None:
