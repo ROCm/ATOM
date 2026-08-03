@@ -18,12 +18,14 @@ import binascii
 import io
 import json
 import logging
+import os
 import time
 import urllib.request
 import uuid
 from asyncio import AbstractEventLoop
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple  # noqa: UP035
+from typing import Any, Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
@@ -137,7 +139,7 @@ async def _logged_stream(
 def _build_sampling_params(
     temperature: float,
     max_tokens: int,
-    stop_strings: Optional[List[str]],
+    stop_strings: list[str] | None,
     ignore_eos: bool,
     top_k: int = -1,
     top_p: float = 1.0,
@@ -218,7 +220,7 @@ def _validate_sequence_context_length(seq) -> None:
     )
 
 
-def _has_multimodal_content(messages: List[Any]) -> bool:
+def _has_multimodal_content(messages: list[Any]) -> bool:
     for message in messages:
         content = getattr(message, "content", None)
         if not isinstance(content, list):
@@ -257,12 +259,12 @@ def _get_multimodal_processor():
 
 
 def _prepare_multimodal_inputs(
-    messages: List[Any],
-    chat_template_kwargs: Dict[str, Any],
-) -> Tuple[List[int], Dict[str, Any]]:
+    messages: list[Any],
+    chat_template_kwargs: dict[str, Any],
+) -> tuple[list[int], dict[str, Any]]:
     mm_processor = _get_multimodal_processor()
-    processor_messages: List[Dict[str, Any]] = []
-    images: List[Image.Image] = []
+    processor_messages: list[dict[str, Any]] = []
+    images: list[Image.Image] = []
 
     for message in messages:
         content = getattr(message, "content", None)
@@ -270,8 +272,8 @@ def _prepare_multimodal_inputs(
             processor_messages.append({"role": message.role, "content": content or ""})
             continue
 
-        image_parts: List[Dict[str, Any]] = []
-        text_parts: List[str] = []
+        image_parts: list[dict[str, Any]] = []
+        text_parts: list[str] = []
         for part in content:
             if not isinstance(part, dict):
                 continue
@@ -398,20 +400,18 @@ async def generate_async(
     prompt: str,
     sampling_params: SamplingParams,
     request_id: str,
-    kv_transfer_params: Optional[Dict[str, Any]] = None,
-    data_parallel_rank: Optional[int] = None,
-) -> AsyncGenerator[Dict[str, Any], None]:
+    kv_transfer_params: dict[str, Any] | None = None,
+    data_parallel_rank: int | None = None,
+) -> AsyncGenerator[dict[str, Any], None]:
     """Generate text asynchronously for non-streaming requests."""
-    global engine, tokenizer
-
     token_queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
 
     started_at = time.time()
-    first_token_at: Optional[float] = None
-    last_token_at: Optional[float] = None
-    all_token_ids: List[int] = []
-    finish_reason: Optional[str] = None
+    first_token_at: float | None = None
+    last_token_at: float | None = None
+    all_token_ids: list[int] = []
+    finish_reason: str | None = None
     seq = None
     kv_transfer_output_meta_info = None
     num_cached_tokens_seen = 0
@@ -520,22 +520,20 @@ async def generate_async(
 
 
 async def generate_async_multimodal(
-    token_ids: List[int],
-    multimodal_data: Dict[str, Any],
+    token_ids: list[int],
+    multimodal_data: dict[str, Any],
     sampling_params: SamplingParams,
     request_id: str,
-) -> AsyncGenerator[Dict[str, Any], None]:
+) -> AsyncGenerator[dict[str, Any], None]:
     """Generate text asynchronously for one multimodal request."""
-    global engine, tokenizer
-
     token_queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
 
     started_at = time.time()
-    first_token_at: Optional[float] = None
-    last_token_at: Optional[float] = None
-    all_token_ids: List[int] = []
-    finish_reason: Optional[str] = None
+    first_token_at: float | None = None
+    last_token_at: float | None = None
+    all_token_ids: list[int] = []
+    finish_reason: str | None = None
     seq = None
 
     def completion_callback(request_output: RequestOutput):
@@ -617,13 +615,13 @@ async def generate_async_multimodal(
 
 
 async def generate_async_fanout(
-    prompt_or_tokens: str | List[int],
+    prompt_or_tokens: str | list[int],
     sampling_params: SamplingParams,
     request_id: str,
-    kv_transfer_params: Optional[Dict[str, Any]] = None,
-    multimodal_data: Optional[Dict[str, Any]] = None,
-    data_parallel_rank: Optional[int] = None,
-) -> List[Dict[str, Any]]:
+    kv_transfer_params: dict[str, Any] | None = None,
+    multimodal_data: dict[str, Any] | None = None,
+    data_parallel_rank: int | None = None,
+) -> list[dict[str, Any]]:
     """Non-streaming n>1 path: fan out N siblings and await all of them.
 
     Returns a list of per-sibling output dicts in the same shape as
@@ -639,10 +637,10 @@ async def generate_async_fanout(
     loop = asyncio.get_running_loop()
 
     started_at = time.time()
-    per_tokens: List[List[int]] = [[] for _ in range(n)]
-    per_first_token_at: List[Optional[float]] = [None] * n
-    per_last_token_at: List[Optional[float]] = [None] * n
-    per_finish_reason: List[Optional[str]] = [None] * n
+    per_tokens: list[list[int]] = [[] for _ in range(n)]
+    per_first_token_at: list[float | None] = [None] * n
+    per_last_token_at: list[float | None] = [None] * n
+    per_finish_reason: list[str | None] = [None] * n
     finished = [False] * n
 
     def make_callback(idx: int):
@@ -721,7 +719,7 @@ async def generate_async_fanout(
             engine.io_processor.requests.pop(_seq.id, None)
 
     finished_at = time.time()
-    outputs: List[Dict[str, Any]] = []
+    outputs: list[dict[str, Any]] = []
     for i in range(n):
         num_tokens_output = len(per_tokens[i])
         ttft = (
@@ -767,12 +765,12 @@ def validate_model(requested_model: Optional[str]) -> None:
 
 
 async def setup_streaming_request(
-    prompt_or_tokens: str | List[int],
+    prompt_or_tokens: str | list[int],
     sampling_params: SamplingParams,
     request_id: str,
-    kv_transfer_params: Optional[Dict[str, Any]] = None,
-    multimodal_data: Optional[Dict[str, Any]] = None,
-) -> Tuple[int, asyncio.Queue, int]:
+    kv_transfer_params: dict[str, Any] | None = None,
+    multimodal_data: dict[str, Any] | None = None,
+) -> tuple[int, asyncio.Queue, int]:
     """Set up a streaming request with the engine.
 
     Returns ``(seq_id, stream_queue, num_prompt_tokens)``. ``num_prompt_tokens``
@@ -955,12 +953,12 @@ async def _run_nonstream_with_disconnect(agen, raw_request, request_id):
 
 
 async def setup_streaming_request_fanout(
-    prompt_or_tokens: str | List[int],
+    prompt_or_tokens: str | list[int],
     sampling_params: SamplingParams,
     request_id: str,
-    kv_transfer_params: Optional[Dict[str, Any]] = None,
-    multimodal_data: Optional[Dict[str, Any]] = None,
-) -> Tuple[List[int], asyncio.Queue, int]:
+    kv_transfer_params: dict[str, Any] | None = None,
+    multimodal_data: dict[str, Any] | None = None,
+) -> tuple[list[int], asyncio.Queue, int]:
     """Fan-out variant of :func:`setup_streaming_request`.
 
     Creates ``sampling_params.n`` sibling sequences sharing one output
@@ -1783,6 +1781,16 @@ def main():
         help="Server port (note: --port is used for internal engine communication)",
     )
     parser.add_argument(
+        "--chat-template",
+        type=str,
+        default=None,
+        help=(
+            "Override the tokenizer's chat template. "
+            "Accepts a file path to a Jinja template or an inline Jinja string. "
+            "Useful for base models that have no built-in chat_template."
+        ),
+    )
+    parser.add_argument(
         "--default-chat-template-kwargs",
         type=str,
         default=None,
@@ -1815,6 +1823,15 @@ def main():
 
     logger.info(f"Loading tokenizer from {args.model}...")
     tokenizer = _load_tokenizer(args.model, args.trust_remote_code)
+    if args.chat_template:
+        if os.path.isfile(args.chat_template):
+            with open(args.chat_template, "r", encoding="utf-8") as f:
+                tokenizer.chat_template = f.read()
+            logger.info(f"Loaded chat template from file: {args.chat_template}")
+        else:
+            tokenizer.chat_template = args.chat_template
+            logger.info("Using inline chat template from --chat-template argument")
+
     model_name = args.served_model_name if args.served_model_name else args.model
     custom_message_encoder = load_custom_message_encoder(args.model)
 
