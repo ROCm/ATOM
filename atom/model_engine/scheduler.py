@@ -243,10 +243,10 @@ class ThroughputStats:
 
     __slots__ = (
         "engine_index",
-        "log_interval_s",
         "last_log_time",
-        "num_prompt_tokens",
+        "log_interval_s",
         "num_generation_tokens",
+        "num_prompt_tokens",
     )
 
     def __init__(self, engine_index: int = 0, log_interval_s: float = 10.0):
@@ -265,7 +265,7 @@ class ThroughputStats:
         num_running_reqs: int,
         num_waiting_reqs: int,
         kv_usage: float,
-        prefix_cache_hit_rate: Optional[float],
+        prefix_cache_hit_rate: float | None,
     ) -> None:
         now = time.monotonic()
         elapsed = now - self.last_log_time
@@ -681,7 +681,7 @@ class Scheduler:
             if parallel_cfg is not None
             else None
         )
-        self.throughput_stats: Optional[ThroughputStats] = (
+        self.throughput_stats: ThroughputStats | None = (
             ThroughputStats(engine_index=dp_rank or 0)
             if config.enable_log_stats
             else None
