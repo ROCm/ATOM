@@ -1785,40 +1785,46 @@ def triton_convert_req_index_to_global_index(
 def _filter_and_convert_dcp_index_kernel(
     qo_indptr,  # int32 [num_requests + 1]
     global_kv_indptr,  # int32 [num_requests + 1] -- GLOBAL context (column range)
-    local_kv_indptr,  # int32 [num_requests + 1] -- local-shard token counts
     page_kv_indptr,  # int32 [num_requests + 1] -- output offsets (sparse_kv_indptr)
-    local_kv_indices,  # int32 [total_local_kv] -- local-shard physical slots per token
+    block_table,  # int32 [num_req, max_num_blocks_per_req] -- logical(global) blocks
     token_indices_ptr,  # int32 [num_tokens, NUM_TOPK_TOKENS] -- GLOBAL top-k positions
     out_kv_indices,  # int32 [>= page_kv_indptr[-1]]
     # DCP params
     DCP_RANK: tl.constexpr,
     DCP_WORLD: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,  # runner (physical) block size
     # shapes
     NUM_TOPK_TOKENS: tl.constexpr,
     BLOCK_N: tl.constexpr,
     # strides (elements)
     ti_stride0,
     ti_stride1,
+    bt_stride0: tl.int64,
+    bt_stride1: tl.constexpr,
 ):
-    # DCP interleave=1: global position g is owned by rank g % W and lives at
-    # local position g // W on that rank. token_indices holds GLOBAL positions
-    # (the indexer scored the full sequence via all-gathered logits). For each
-    # top-k column: keep it only if this rank owns it, map global->local, then
-    # gather the local-shard physical slot; write -1 otherwise (the sparse decode
-    # kernel masks -1 out). The per-request output length is unchanged (global
-    # clip), so no compaction / dynamic indptr is needed.
+    # DCP round-robin (interleave=1): a GLOBAL position g is owned by rank
+    # ``g % W``; on the owner rank its physical slot follows the round-robin
+    # (virtual-block) layout used by _dcp_round_robin_slot / ATOM PR #847:
+    #     vbs  = PAGE_SIZE * W
+    #     slot = block_table[req, g // vbs] * PAGE_SIZE + (g % vbs) // W
+    # token_indices holds GLOBAL positions (the indexer scored the full sequence
+    # via all-gathered logits). Non-owned / out-of-range columns -> -1 (the sparse
+    # decode kernel masks -1 out). The per-request output length is unchanged
+    # (global clip), so no compaction / dynamic indptr is needed. NOTE: we compute
+    # the slot from block_table directly (like vLLM) rather than gathering from a
+    # precomputed kv_indices -- the DCP round-robin per-token slot array does not
+    # exist on the sparse path (dense reads via block_tables in-kernel).
     batch_id = tl.program_id(0)
     tile_id = tl.program_id(1)
     indice_id = tile_id * BLOCK_N + tl.arange(0, BLOCK_N)
 
     g_kv_start = tl.load(global_kv_indptr + batch_id)
     g_kv_len = tl.load(global_kv_indptr + batch_id + 1) - g_kv_start
-    l_kv_start = tl.load(local_kv_indptr + batch_id)
-    l_kv_len = tl.load(local_kv_indptr + batch_id + 1) - l_kv_start
     out_kv_start = tl.load(page_kv_indptr + batch_id)
     qo_start = tl.load(qo_indptr + batch_id)
     qo_end = tl.load(qo_indptr + batch_id + 1)
 
+    vbs = PAGE_SIZE * DCP_WORLD
     # Columns within [0, min(global_ctx, topk)) carry a real top-k position.
     col_valid = (indice_id < g_kv_len) & (indice_id < NUM_TOPK_TOKENS)
 
@@ -1827,15 +1833,17 @@ def _filter_and_convert_dcp_index_kernel(
         tok = tl.load(ti_ptr, mask=col_valid, other=-1)  # GLOBAL position
 
         owned = (tok % DCP_WORLD) == DCP_RANK
-        local_idx = tok // DCP_WORLD
-        idx_valid = col_valid & (tok >= 0) & owned & (local_idx < l_kv_len)
+        idx_valid = col_valid & (tok >= 0) & owned
 
-        out_val = tl.load(
-            local_kv_indices + l_kv_start + local_idx,
+        block_id = tok // vbs
+        inblock_offset = (tok % vbs) // DCP_WORLD
+        physical_block = tl.load(
+            block_table + batch_id * bt_stride0 + block_id * bt_stride1,
             mask=idx_valid,
-            other=-1,
+            other=0,
         )
-        out_val = tl.where(idx_valid, out_val, -1)
+        slot = physical_block * PAGE_SIZE + inblock_offset
+        out_val = tl.where(idx_valid, slot, -1)
 
         out_ptr_ij = out_kv_indices + out_kv_start + indice_id
         # Write the whole valid-column span (owned -> slot, non-owned -> -1) so
@@ -1846,28 +1854,30 @@ def _filter_and_convert_dcp_index_kernel(
 def triton_filter_and_convert_dcp_index(
     qo_indptr: torch.Tensor,  # int32 [num_requests + 1]
     global_kv_indptr: torch.Tensor,  # int32 [num_requests + 1]
-    local_kv_indptr: torch.Tensor,  # int32 [num_requests + 1]
     page_kv_indptr: torch.Tensor,  # int32 [num_requests + 1] (sparse_kv_indptr)
-    local_kv_indices: torch.Tensor,  # int32 [total_local_kv]
+    block_table: torch.Tensor,  # int32 [num_req, max_num_blocks_per_req] logical
     token_indices: torch.Tensor,  # int32 [num_tokens, NUM_TOPK_TOKENS] GLOBAL pos
     dcp_rank: int,
     dcp_world_size: int,
+    block_size: int,  # runner (physical) block size == PAGE_SIZE
     NUM_TOPK_TOKENS: int = 2048,
     BLOCK_N: int = 128,
     out: Optional[torch.Tensor] = None,
 ):
-    """DCP (interleave=1) filter + de-interleave of global top-k positions.
+    """DCP (interleave=1) filter + round-robin localize of global top-k positions.
 
     ``token_indices[token_id, indice_id]`` is a GLOBAL token position selected by
     the indexer (scored over the full sequence via all-gathered logits). This
-    rank keeps a position ``g`` only if ``g % W == dcp_rank``, maps it to its
-    local shard slot ``local_kv_indices[local_kv_start + g // W]``, and writes
-    ``-1`` for every non-owned / out-of-range column. ``page_kv_indptr`` (the
+    rank keeps a position ``g`` only if ``g % W == dcp_rank`` and maps it to its
+    physical slot via the round-robin (virtual-block) layout, computed directly
+    from ``block_table`` (like vLLM):
+        vbs  = block_size * W
+        slot = block_table[req, g // vbs] * block_size + (g % vbs) // W
+    Non-owned / out-of-range columns become ``-1``. ``page_kv_indptr`` (the
     global-clip ``sparse_kv_indptr``) is unchanged, so the output region length
     per request is identical to the non-DCP path; the decode kernel masks the
     ``-1`` sentinels.
     """
-    assert local_kv_indices.dtype == torch.int32
     assert token_indices.dtype == torch.int32
     assert token_indices.shape[1] == NUM_TOPK_TOKENS
     assert NUM_TOPK_TOKENS % BLOCK_N == 0, (
@@ -1875,38 +1885,41 @@ def triton_filter_and_convert_dcp_index(
         f"BLOCK_N ({BLOCK_N})"
     )
     assert 0 <= dcp_rank < dcp_world_size
+    assert out is not None, "sparse_kv_indices_buffer (out) is required"
 
     num_batch = global_kv_indptr.shape[0] - 1
     tiles_per_row = NUM_TOPK_TOKENS // BLOCK_N
 
     qo_indptr_c = qo_indptr.contiguous()
     global_kv_indptr_c = global_kv_indptr.contiguous()
-    local_kv_indptr_c = local_kv_indptr.contiguous()
     page_kv_indptr_c = page_kv_indptr.contiguous()
-    local_kv_indices_c = local_kv_indices.contiguous()
+    block_table_c = block_table.contiguous()
     token_indices_c = token_indices.contiguous()
 
     # out is the preallocated sparse_kv_indices_buffer; the kernel writes only
     # within [0, page_kv_indptr[-1]) via out_kv_start, so use it directly.
-    new_kv_indices = out if out is not None else torch.empty_like(local_kv_indices_c)
+    new_kv_indices = out
 
     ti_stride0, ti_stride1 = token_indices_c.stride()
+    bt_stride0, bt_stride1 = block_table_c.stride()
     grid = (num_batch, tiles_per_row)
 
     _filter_and_convert_dcp_index_kernel[grid](
         qo_indptr_c,
         global_kv_indptr_c,
-        local_kv_indptr_c,
         page_kv_indptr_c,
-        local_kv_indices_c,
+        block_table_c,
         token_indices_c,
         new_kv_indices,
         dcp_rank,
         dcp_world_size,
+        block_size,
         NUM_TOPK_TOKENS,
         BLOCK_N,
         ti_stride0,
         ti_stride1,
+        bt_stride0,
+        bt_stride1,
     )
     return new_kv_indices
 
