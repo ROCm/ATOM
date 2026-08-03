@@ -7,35 +7,35 @@ from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
+from conftest import MockConfig
 
 from atom.model_engine.scheduler import (
+    EngineStats,
     ScheduledBatch,
-    Scheduler,
     ScheduledBatchOutput,
-    SpecStats,
+    Scheduler,
 )
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 from atom.sampling_params import SamplingParams
-from conftest import MockConfig
 
-# ── SpecStats ──────────────────────────────────────────────────────────────
+# ── EngineStats (spec section) ──────────────────────────────────────────────
 
 
 class TestSpecStats:
     def test_no_division_by_zero_with_valid_mtp_k(self):
-        """SpecStats with mtp_k >= 1 must not raise on update()."""
-        stats = SpecStats(mtp_k=1)
+        """Spec section with mtp_k >= 1 must not raise on record_spec()."""
+        stats = EngineStats(use_spec=True, mtp_k=1)
         # Should not raise ZeroDivisionError
-        stats.update(num_accepted_tokens=1)
-        stats.update(num_accepted_tokens=2)
+        stats.record_spec(num_accepted_tokens=1)
+        stats.record_spec(num_accepted_tokens=2)
 
     def test_update_accumulates_draft_tokens(self):
-        stats = SpecStats(mtp_k=2)
-        stats.update(num_accepted_tokens=1)
+        stats = EngineStats(use_spec=True, mtp_k=2)
+        stats.record_spec(num_accepted_tokens=1)
         assert stats.total_draft_tokens == 2
 
     def test_acceptance_rate_zero_when_no_updates(self):
-        stats = SpecStats(mtp_k=3)
+        stats = EngineStats(use_spec=True, mtp_k=3)
         assert stats.acceptance_rate == 0.0
 
 

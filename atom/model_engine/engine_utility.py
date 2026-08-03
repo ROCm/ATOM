@@ -272,8 +272,8 @@ class EngineUtilityHandler:
 
     def _handle_get_mtp_stats(self, args: dict):
         """Print MTP statistics to log (fire-and-forget)."""
-        if self.scheduler is not None and self.scheduler.spec_stats is not None:
-            self.scheduler.spec_stats._log()
+        if self.scheduler is not None and self.scheduler.engine_stats is not None:
+            self.scheduler.engine_stats.log_spec_stats()
         else:
             logger.info(
                 "\n[MTP Stats] No MTP statistics available "
@@ -282,11 +282,10 @@ class EngineUtilityHandler:
 
     def _handle_get_mtp_statistics(self, args: dict):
         """Return structured MTP statistics via UTILITY_RESPONSE."""
-        if self.scheduler is None or self.scheduler.spec_stats is None:
+        if self.scheduler is None or self.scheduler.engine_stats is None:
             result = {"enabled": False}
         else:
-            result = self.scheduler.spec_stats.get_statistics()
-            result["enabled"] = True
+            result = self.scheduler.engine_stats.get_spec_statistics()
         self.output_queue.put_nowait(
             ("UTILITY_RESPONSE", {"cmd": "get_mtp_statistics", "result": result})
         )
