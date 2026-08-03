@@ -1,7 +1,6 @@
 import json
 from pathlib import Path
 
-
 REPO = Path(__file__).resolve().parent.parent
 CATALOG = REPO / ".github" / "benchmark" / "sglang_models_accuracy.json"
 WORKFLOW = REPO / ".github" / "workflows" / "atom-sglang-accuracy-validation.yaml"
@@ -31,9 +30,7 @@ def _workflow_block(model_name: str) -> str:
 
 def _workflow_args(model_name: str) -> str:
     block = _workflow_block(model_name).splitlines()
-    args_line = next(
-        line for line in block[1:] if '"extra_args":' in line
-    )
+    args_line = next(line for line in block[1:] if '"extra_args":' in line)
     return args_line
 
 
