@@ -72,6 +72,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # intermediate. Off by default: the trim bound must be an upper bound on
     # received rows or it silently drops tokens.
     "ATOM_EP_TRIM_PREFILL": lambda: os.getenv("ATOM_EP_TRIM_PREFILL", "0") == "1",
+    # TEMPORARY: which EP routing prep+sort implementation to use.
+    #   0 = ep_sort_routing_v0 -- 3 kernels, per-CTA partial histogram + scan +
+    #       arithmetic scatter. No mesh. Scattered stores.
+    #   1 = ep_sort_routing_v1 -- 2 kernels, mirrors flydsl's opus_moe_sorting:
+    #       an [expert, token] mesh, then a per-expert walk emitting contiguous
+    #       runs. Trades memory for coalesced stores and no rank arithmetic.
+    #   2 = ep_sort_routing_v2 -- v0 with the scatter and ExptData stages fused
+    #       into one launch, split by CTA index like aiter's
+    #       _combined_routing_fused. 2 launches instead of 4.
+    # Remove once one wins on both gfx950 and gfx1250.
+    "ATOM_EP_SORT_VERSION": lambda: int(os.getenv("ATOM_EP_SORT_VERSION", "0")),
     "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
     # --- Kernel Fusion Toggles ---
     # fused_compress_attn: switch between Triton (default historical) and a
