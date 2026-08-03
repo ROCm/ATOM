@@ -1424,6 +1424,28 @@ class Config:
     # use plain separate streams with no CU masking.
     disagg_constrained: bool = False
 
+    @property
+    def tp_world_size(self) -> int:
+        """Number of TP worker processes actually launched.
+
+        `tensor_parallel_size` is the *logical* width -- how many shards every
+        weight is cut into. Under `--fake-eplb` on a box with fewer visible
+        devices than `-tp`, only the first `tp_world_size` of those shards get
+        a process, reproducing the first N devices of the larger deployment.
+        See `atom/distributed/simulated_tp.py`.
+
+        Gated on `fake_eplb` because such a run's output is garbage anyway;
+        without it, an oversized `-tp` keeps raising in ModelRunner instead of
+        silently running smaller. A property, not a field: `enable_dp_attention`
+        rewrites `tensor_parallel_size` after Config is built.
+        """
+        tp = self.tensor_parallel_size
+        if not self.fake_eplb:
+            return tp
+        # Does not create a CUDA context, so it is safe in the parent process.
+        visible = torch.cuda.device_count()
+        return visible if 0 < visible < tp else tp
+
     def _set_cudagraph_sizes(self):
         if self.compilation_config.cudagraph_capture_sizes:
             self.graph_bs = self.compilation_config.cudagraph_capture_sizes

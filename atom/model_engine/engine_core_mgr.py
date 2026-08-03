@@ -907,8 +907,10 @@ def launch_engine_core(config: Config, dp_rank: int = 0):
     # EngineCore subclass would otherwise have to thread through.
     config.parallel_config.control_address = control_address
 
+    # tp_world_size: the GPUs this DP rank really occupies.
     logger.info(
-        f"Creating EngineCore process: DP rank {dp_rank}, will use GPUs {dp_rank * config.tensor_parallel_size} to {(dp_rank + 1) * config.tensor_parallel_size - 1}"
+        f"Creating EngineCore process: DP rank {dp_rank}, will use GPUs "
+        f"{dp_rank * config.tp_world_size} to {(dp_rank + 1) * config.tp_world_size - 1}"
     )
 
     process = multiprocessing.Process(
