@@ -498,10 +498,10 @@ class KimiSparseMoeBlock(nn.Module):
         return routed_output
 
     def dual_stream_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # Shared-expert GEMMs run on alt_stream while the routed path runs on the
-        # current stream. The latent path preserves routed AR -> shared AR order
-        # on the single TP communicator while overlapping shared AR with routed
-        # post-AR work.
+        # Queue routed pre-AR work first on the current stream, then run the
+        # shared-expert path on alt_stream. The latent path keeps both all-reduces
+        # on their respective streams while preserving shared AR -> routed AR
+        # order on the single TP communicator.
         current = torch.cuda.current_stream()
         alt = self.alt_stream
         alt.wait_stream(current)
@@ -515,14 +515,13 @@ class KimiSparseMoeBlock(nn.Module):
 
         with torch.cuda.stream(alt):
             shared_output = self.shared_experts(hidden_states)
+            if self.use_latent_moe and self.tp_size > 1:
+                shared_output = tensor_model_parallel_all_reduce(shared_output)
 
         if self.use_latent_moe:
             if self.tp_size > 1:
+                current.wait_stream(alt)
                 routed_output = tensor_model_parallel_all_reduce(routed_output)
-
-                # Record the dependency while routed AR is the current-stream
-                # tail, excluding the routed post-work enqueued below.
-                alt.wait_stream(current)
 
             if self.routed_expert_norm is not None:
                 routed_output = self.routed_expert_norm(routed_output)
@@ -535,11 +534,8 @@ class KimiSparseMoeBlock(nn.Module):
             else:
                 routed_output = self.routed_expert_up_proj(routed_output)
 
-            if self.tp_size > 1:
-                with torch.cuda.stream(alt):
-                    shared_output = tensor_model_parallel_all_reduce(shared_output)
-
-            current.wait_stream(alt)
+            if self.tp_size == 1:
+                current.wait_stream(alt)
             shared_output.record_stream(current)
             return routed_output + shared_output
 
