@@ -11,6 +11,7 @@ from typing import Any
 import torch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
+from atom.models.utils import IntermediateTensors
 from atom.plugin.sglang.runtime.context import bind_current_forward_batch
 
 logger = logging.getLogger("atom.plugin.sglang.runtime.forward_context")
@@ -86,6 +87,8 @@ def _materialize_atom_dummy_forward(
 
 
 def _trim_hidden_states_for_output(hidden_states, num_tokens: int):
+    if isinstance(hidden_states, IntermediateTensors):
+        return hidden_states[:num_tokens]
     if torch.is_tensor(hidden_states):
         return hidden_states[:num_tokens]
     if isinstance(hidden_states, tuple):
