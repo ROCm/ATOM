@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1785603770850,
+  "lastUpdate": 1785781682214,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -1159,6 +1159,51 @@ window.BENCHMARK_DATA = {
             "value": 0.8878,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30708073611 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202608011517 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.3017 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "gbyu-amd",
+            "username": "gbyu-amd",
+            "email": "Guanbao.Yu@amd.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "2da53fb2abe1e415d229bfb62a7152f33cfc6b74",
+          "message": "[fix] bunch of fixes to pass Kimi-K3 KVV  (#1727)\n\n* Port Kimi-K3 serving support onto main's registry parser framework\n\nRe-implement K3 OpenAI-serving support on top of main's refactored\ntool_parser registry and dialect-driven reasoning engine, replacing the\npre-refactor scaffolding.\n\nTool parsing:\n- Add KimiK3Parser (tool_parser/kimi_k3_tool_parser.py) implementing the\n  <|open|>call tool=\"...\" channel format. K3 carries per-argument\n  type=\"...\" on the wire, so it self-coerces without the request schema;\n  it buffers the whole output and parses at flush since K3 interleaves\n  think/response/tools sections.\n- Register K3 first in registry._DETECT_ORDER and sniff_stream (its\n  channel tokens are disjoint from every other format and it strips its\n  own framing from plain answers).\n\nReasoning:\n- Restore dialect-driven reasoning (reasoning.py + reasoning_dialects.py)\n  with CHANNEL_* tokens and ReasoningFilter.starts_thinking so a prompt\n  that begins mid-thought seeds the streaming filter's thinking state.\n\nProtocol / serving:\n- protocol.py: add response_format, reasoning_effort, thinking fields;\n  preserve dynamically-declared \"tools\" through to_template_dict.\n- serving_chat.py: normalize engine finish reasons (stop_<id> -> stop,\n  max_tokens -> length); honor tool_choice=\"none\" (drop tool calls) and\n  thread tool_choice / starts_thinking through streaming + non-streaming.\n- api_server.py: validate tools / tool_choice / response_format shape;\n  resolve thinking/effort (thinking > reasoning_effort precedence) and\n  forward response_format / tool_choice / thinking into the chat template.\n\n* style: apply black formatting to K3 serving changes\n\nCollapse over-conservative multi-line raise ValueError() calls in the\nchat request validation helpers to single lines (black, 88 cols).\n\n* style: satisfy ruff (pyupgrade) within PR diff context\n\nCI runs ruff via reviewdog in diff_context mode, which flags findings on\nchanged lines *and* their surrounding context. Modernize type annotations\n(UP006/UP007/UP035/UP045) in protocol.py and serving_chat.py so no ruff\nfinding lands inside the PR diff context, and suppress the intentional\nTRY004 on validator ValueErrors in api_server.py (ValueError is required\nso the handler maps to HTTP 400, not 500).\n\n* refactor: move K3 chat request validation/thinking out of api_server\n\napi_server.py is the ASGI wiring layer, not a home for chat-specific\nutilities. Move validate_chat_request / resolve_thinking (and their\nprivate helpers _validate_one_tool / _validate_tool_list and the\ntool-name/effort/tool-choice constants) into serving_chat.py, which\nalready owns the chat request/response helpers and imports both protocol\nand reasoning. api_server now imports the two public entry points and\ndrops its now-unused `re` import. Behavior is unchanged.\n\n* refactor: relocate constants out of serving_chat request-validation\n\nserving_chat.py is the generic chat handler and should not hardcode\nmodel-specific or spec-level constants:\n\n- _K3_TEMPLATE_EFFORTS (model-specific) becomes a per-dialect\n  ReasoningDialect.template_efforts field in reasoning_dialects.py, and\n  reasoning.py derives VALID_TEMPLATE_EFFORTS as the union across loaded\n  dialects (mirroring the existing marker-table derivation). This keeps\n  all model-specific knowledge in the dialect registry, matching the\n  module's \"add a model = add one entry\" design.\n- TOOL_CHOICE_VALUES and TOOL_NAME_RE (generic OpenAI spec, not\n  model-specific) move to protocol.py alongside the other request-spec\n  constants.\n\nserving_chat now imports these; its `re` import is dropped. Behavior\nunchanged.",
+          "timestamp": "2026-08-03T16:54:13Z",
+          "url": "https://github.com/ROCm/ATOM/commit/2da53fb2abe1e415d229bfb62a7152f33cfc6b74"
+        },
+        "date": 1785781654277,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP accuracy (GSM8K)",
+            "value": 0.953,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30834224935 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202608021516 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9538 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP MTP acceptance (%)",
+            "value": 64.55,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30834224935 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202608021516 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9538 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP avg toks/fwd (tok/fwd)",
+            "value": 2.94,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOMesh::Meta-Llama-3-8B-Instruct accuracy (GSM8K)",
+            "value": 0.7566,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/30834224935 | Threshold: 0.73 | Baseline: 0.75 | BaselineModel: meta-llama/Meta-Llama-3-8B-Instruct | BaselineNote: HF reports 0.796 but 8-shot CoT; CI uses 3-shot, not comparable | Docker: rocm/atom-dev:nightly_202608021516 | GPU: AMD Instinct MI355X | VRAM: 252GB | ROCm: 7.2.4 | strict-match: 0.7551 | fewshot: 3 | Model: /models/meta-llama/Meta-Llama-3-8B-Instruct"
           }
         ]
       }
