@@ -523,7 +523,10 @@ stream_spur_shared_logs_once() {
   [[ -d "${run_dir}" ]] || return 0
 
   shopt -s nullglob
-  for log_file in "${run_dir}"/rank-*/container.log "${run_dir}"/logs/*.log; do
+  for log_file in \
+    "${run_dir}"/rank-*/container*.log \
+    "${run_dir}"/logs/*.log \
+    "${run_dir}"/logs/*/*.log; do
     rel_path="${log_file#"${run_dir}/"}"
     current_line="${SPUR_SHARED_LOG_LINES[${log_file}]:-0}"
     SPUR_SHARED_LOG_LINES["${log_file}"]="$(stream_file_lines "${log_file}" "[spur:${rel_path}] " "${current_line}")"

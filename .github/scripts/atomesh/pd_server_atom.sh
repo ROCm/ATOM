@@ -46,6 +46,50 @@ PREFILL_DP_MASTER_PORT="${PREFILL_DP_MASTER_PORT:-29500}"
 PREFILL_DP_BASE_PORT="${PREFILL_DP_BASE_PORT:-29600}"
 DECODE_DP_MASTER_PORT="${DECODE_DP_MASTER_PORT:-29700}"
 DECODE_DP_BASE_PORT="${DECODE_DP_BASE_PORT:-29800}"
+ATOMESH_EXECUTION_PHASE="${ATOMESH_EXECUTION_PHASE:-combined}"
+ATOMESH_SERVICE_PORT_OFFSET="${ATOMESH_SERVICE_PORT_OFFSET:-0}"
+case "${ATOMESH_EXECUTION_PHASE}" in
+  combined|benchmark|eval) ;;
+  *)
+    echo "ERROR: unsupported ATOMESH_EXECUTION_PHASE=${ATOMESH_EXECUTION_PHASE}" >&2
+    exit 2
+    ;;
+esac
+if [[ ! "${ATOMESH_SERVICE_PORT_OFFSET}" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: ATOMESH_SERVICE_PORT_OFFSET must be a non-negative integer" >&2
+  exit 2
+fi
+PREFILL_PORT=$((PREFILL_PORT + ATOMESH_SERVICE_PORT_OFFSET))
+DECODE_PORT=$((DECODE_PORT + ATOMESH_SERVICE_PORT_OFFSET))
+ROUTER_PORT=$((ROUTER_PORT + ATOMESH_SERVICE_PORT_OFFSET))
+PROMETHEUS_PORT=$((PROMETHEUS_PORT + ATOMESH_SERVICE_PORT_OFFSET))
+HANDSHAKE_PORT=$((HANDSHAKE_PORT + ATOMESH_SERVICE_PORT_OFFSET))
+PREFILL_DP_MASTER_PORT=$((PREFILL_DP_MASTER_PORT + ATOMESH_SERVICE_PORT_OFFSET))
+PREFILL_DP_BASE_PORT=$((PREFILL_DP_BASE_PORT + ATOMESH_SERVICE_PORT_OFFSET))
+DECODE_DP_MASTER_PORT=$((DECODE_DP_MASTER_PORT + ATOMESH_SERVICE_PORT_OFFSET))
+DECODE_DP_BASE_PORT=$((DECODE_DP_BASE_PORT + ATOMESH_SERVICE_PORT_OFFSET))
+validate_shifted_port() {
+  local name="$1"
+  local value="${!name}"
+  if (( value < 1 || value > 65535 )); then
+    echo "ERROR: ${name}=${value} is outside the valid TCP/UDP port range" >&2
+    exit 2
+  fi
+}
+for shifted_port_name in \
+  PREFILL_PORT \
+  DECODE_PORT \
+  ROUTER_PORT \
+  PROMETHEUS_PORT \
+  HANDSHAKE_PORT \
+  PREFILL_DP_MASTER_PORT \
+  PREFILL_DP_BASE_PORT \
+  DECODE_DP_MASTER_PORT \
+  DECODE_DP_BASE_PORT; do
+  validate_shifted_port "${shifted_port_name}"
+done
+unset shifted_port_name
+unset -f validate_shifted_port
 USE_EXPLICIT_DP_PORTS=0
 if [[ "${SINGLE_NODE_PD}" == "1" || "${PREFILL_SINGLE_NODE_PD}" == "1" || "${DECODE_SINGLE_NODE_PD}" == "1" ]]; then
   USE_EXPLICIT_DP_PORTS=1
@@ -141,8 +185,16 @@ AIPERF_UNSAFE_OVERRIDE="${AIPERF_UNSAFE_OVERRIDE:-}"
 PREFILL_KV_TRANSFER_CONFIG="${PREFILL_KV_TRANSFER_CONFIG:-}"
 DECODE_KV_TRANSFER_CONFIG="${DECODE_KV_TRANSFER_CONFIG:-}"
 
-export ATOM_TORCH_PROFILER_DIR="${ATOM_TORCH_PROFILER_DIR:-${RUN_DIR}/online_quant/rank-${NODE_RANK}}"
-mkdir -p "${RUN_DIR}"/{logs,benchmark_results,eval_results} "${ATOM_TORCH_PROFILER_DIR}"
+default_profiler_dir="${RUN_DIR}/online_quant/rank-${NODE_RANK}"
+if [[ "${ATOMESH_EXECUTION_PHASE}" != "combined" ]]; then
+  default_profiler_dir="${RUN_DIR}/online_quant/${ATOMESH_EXECUTION_PHASE}/rank-${NODE_RANK}"
+fi
+export ATOM_TORCH_PROFILER_DIR="${ATOM_TORCH_PROFILER_DIR:-${default_profiler_dir}}"
+RUNTIME_LOG_DIR="${RUN_DIR}/logs"
+if [[ "${ATOMESH_EXECUTION_PHASE}" != "combined" ]]; then
+  RUNTIME_LOG_DIR="${RUNTIME_LOG_DIR}/${ATOMESH_EXECUTION_PHASE}"
+fi
+mkdir -p "${RUNTIME_LOG_DIR}" "${RUN_DIR}"/{benchmark_results,eval_results} "${ATOM_TORCH_PROFILER_DIR}"
 
 role_tp="${PREFILL_TP_SIZE}"
 if [[ "${PREFILL_SINGLE_NODE_PD}" == "1" && "${NODE_RANK}" -gt 0 ]]; then
@@ -154,6 +206,7 @@ if [[ -z "${HIP_VISIBLE_DEVICES:-}" ]]; then
   export HIP_VISIBLE_DEVICES="$(seq -s, 0 "$((role_tp - 1))")"
 fi
 rm -rf /root/.cache/atom/* 2>/dev/null || true
+echo "[runtime] phase=${ATOMESH_EXECUTION_PHASE} service_port_offset=${ATOMESH_SERVICE_PORT_OFFSET}"
 echo "[runtime] HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES}"
 
 dump_launch_info() {
@@ -446,9 +499,14 @@ cleanup_processes() {
 }
 
 write_metadata() {
-  cat > "${RUN_DIR}/metadata-rank-${NODE_RANK}.json" <<EOF
+  local metadata_file="${RUN_DIR}/metadata-rank-${NODE_RANK}.json"
+  if [[ "${ATOMESH_EXECUTION_PHASE}" != "combined" ]]; then
+    metadata_file="${RUN_DIR}/metadata-rank-${NODE_RANK}-${ATOMESH_EXECUTION_PHASE}.json"
+  fi
+  cat > "${metadata_file}" <<EOF
 {
   "rank": ${NODE_RANK},
+  "execution_phase": "${ATOMESH_EXECUTION_PHASE}",
   "host": "${host_name}",
   "ip": "${host_ip}",
   "model": "${MODEL_NAME}",
@@ -499,7 +557,7 @@ start_prefill() {
     ${PREFILL_SERVER_ARGS}
   )
   dump_launch_info "PREFILL" "${prefill_cmd[@]}"
-  start_logged_process server_pid "${RUN_DIR}/logs/${log_name}.log" env "${prefill_cache_env[@]}" "${prefill_dp_env[@]}" "${prefill_cmd[@]}"
+  start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${prefill_cache_env[@]}" "${prefill_dp_env[@]}" "${prefill_cmd[@]}"
 }
 
 start_decode() {
@@ -552,7 +610,7 @@ start_decode() {
     ${DECODE_SERVER_ARGS}
   )
   dump_launch_info "DECODE" "${decode_cmd[@]}"
-  start_logged_process server_pid "${RUN_DIR}/logs/${log_name}.log" env "${decode_cache_env[@]}" "${decode_dp_env[@]}" "${decode_cmd[@]}"
+  start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${decode_cache_env[@]}" "${decode_dp_env[@]}" "${decode_cmd[@]}"
 }
 
 start_router() {
@@ -589,7 +647,7 @@ start_router() {
     --prometheus-port "${PROMETHEUS_PORT}"
   )
   dump_launch_info "ROUTER" "${router_cmd[@]}"
-  start_logged_process router_pid "${RUN_DIR}/logs/router.log" "${router_cmd[@]}"
+  start_logged_process router_pid "${RUNTIME_LOG_DIR}/router.log" "${router_cmd[@]}"
 }
 
 run_benchmark() {
@@ -995,6 +1053,14 @@ PY
 }
 
 run_benchmark_and_eval() {
+  if [[ "${ATOMESH_EXECUTION_PHASE}" == "benchmark" ]]; then
+    run_benchmark
+    return
+  fi
+  if [[ "${ATOMESH_EXECUTION_PHASE}" == "eval" ]]; then
+    run_eval
+    return
+  fi
   if [[ "${BENCHMARK_KIND}" == "aiperf_agentic" \
     && "${EVAL_TASK}" == "swebench_lite" \
     && ( "${RUN_EVAL}" == "true" || "${RUN_EVAL}" == "1" ) ]]; then
