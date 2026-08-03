@@ -7,16 +7,16 @@ from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
+from conftest import MockConfig
 
 from atom.model_engine.scheduler import (
     ScheduledBatch,
-    Scheduler,
     ScheduledBatchOutput,
+    Scheduler,
     SpecStats,
 )
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 from atom.sampling_params import SamplingParams
-from conftest import MockConfig
 
 # ── SpecStats ──────────────────────────────────────────────────────────────
 
@@ -129,20 +129,48 @@ class TestSchedule:
         assert len(sched.running) <= sched.max_num_seqs
 
     def test_prefill_respects_max_batched_tokens(self, seq_factory):
+        # Budgets here are multiples of the 64-token chunk alignment: a leftover
+        # under one aligned unit is deliberately not scheduled at all (see
+        # Scheduler._align_truncated_chunk), so a 6-token budget would pack one
+        # seq, not two, and prove nothing about the budget being respected.
         sched = Scheduler(
             MockConfig(
-                max_num_batched_tokens=6,
+                max_num_batched_tokens=192,
+                max_model_len=1024,
                 num_kvcache_blocks=100,
                 enable_chunked_prefill=True,
             )
         )
-        sched.add(seq_factory([1, 2, 3, 4]))  # 4 tokens
-        sched.add(seq_factory([5, 6, 7, 8]))  # 4 tokens total, but only 2 fit in budget
+        sched.add(seq_factory(list(range(128))))
+        sched.add(seq_factory(list(range(200, 328))))  # only 64 fit in budget
         batch, _ = sched.schedule()
-        # Chunked prefill: seq2 gets a 2-token chunk (budget 6-4=2)
         assert batch.total_seqs_num_prefill == 2
-        assert batch.total_tokens_num_prefill == 6
-        assert list(batch.num_scheduled_tokens) == [4, 2]
+        assert batch.total_tokens_num_prefill == 192
+        assert list(batch.num_scheduled_tokens) == [128, 64]
+
+    def test_budget_sliver_is_left_for_the_next_step(self, seq_factory):
+        """Chunk alignment must not manufacture its own tail.
+
+        Flooring seq 2's chunk to the block grid frees the remainder, and
+        handing that remainder to seq 3 splits seq 3's prefill for nothing — it
+        lands in the same later step either way, one forward worse off and off
+        the block grid. Production saw a 16384-token budget go out as
+        `..., 640, 10`.
+        """
+        sched = Scheduler(
+            MockConfig(
+                max_num_batched_tokens=200,
+                max_model_len=1024,
+                num_kvcache_blocks=400,
+                enable_chunked_prefill=True,
+            )
+        )
+        for start in (0, 200, 400):
+            sched.add(seq_factory(list(range(start, start + 128))))
+        batch, _ = sched.schedule()
+        # 200 - 128 = 72 for seq 2, floored to 64; the freed 8 stays unspent.
+        assert list(batch.num_scheduled_tokens) == [128, 64]
+        assert batch.total_tokens_num_prefill == 192
 
     def test_chunked_prefill_splits_prompt_across_steps(self, seq_factory):
         sched = Scheduler(
@@ -511,17 +539,18 @@ class TestLongPrefillTokenThreshold:
         """budget < threshold → chunk is bounded by budget, not threshold."""
         sched = Scheduler(
             MockConfig(
-                num_kvcache_blocks=100,
+                num_kvcache_blocks=400,
                 kv_cache_block_size=4,
-                max_num_batched_tokens=10,
-                long_prefill_token_threshold=8,
+                max_model_len=1024,
+                max_num_batched_tokens=192,
+                long_prefill_token_threshold=128,
                 enable_chunked_prefill=True,
             )
         )
-        sched.add(seq_factory(list(range(20))))  # capped at 8
-        sched.add(seq_factory(list(range(20, 40))))  # budget left = 2
+        sched.add(seq_factory(list(range(320))))  # capped at the threshold, 128
+        sched.add(seq_factory(list(range(400, 720))))  # budget left = 64
         batch, _ = sched.schedule()
-        assert list(batch.num_scheduled_tokens) == [8, 2]
+        assert list(batch.num_scheduled_tokens) == [128, 64]
 
     def test_ignored_when_chunked_prefill_disabled(self, seq_factory):
         """No chunked prefill → threshold is a no-op (full prompt or reject)."""

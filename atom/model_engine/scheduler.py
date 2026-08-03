@@ -1010,8 +1010,13 @@ class Scheduler:
                 if 0 < self.long_prefill_token_threshold < remaining:
                     remaining = self.long_prefill_token_threshold
                 budget_remaining = self.max_num_batched_tokens - num_batched_tokens
-                chunk = min(remaining, budget_remaining)
-                chunk = self._finalize_prefill_chunk(seq, seq.num_cached_tokens, chunk)
+                chunk = self._chunked_prefill_size(
+                    remaining, budget_remaining, num_batched_tokens
+                )
+                if chunk:
+                    chunk = self._finalize_prefill_chunk(
+                        seq, seq.num_cached_tokens, chunk
+                    )
                 if chunk <= 0:
                     break
                 num_batched_tokens += chunk
@@ -1493,17 +1498,38 @@ class Scheduler:
         )
         self.running.append(seq)
 
+    def _chunked_prefill_size(
+        self, num_new_tokens: int, budget_remaining: int, num_batched_tokens: int
+    ) -> int:
+        """Tokens to forward this step, or 0 to leave the request for the next.
+
+        A chunk cut short by the budget is floored onto the block grid. When
+        what's left is under one aligned unit the answer is 0: that sliver buys
+        the request nothing — it needs a later step to finish either way — so
+        all it does is split the prefill into an extra forward, off the grid.
+        Flooring is also what frees the remainder the sliver is made of, so
+        without the 0 case the alignment manufactures its own tail; a
+        16384-token budget was going out as `..., 640, 10`.
+
+        Never 0 for an empty batch: something has to go out each step, or a
+        `max_num_batched_tokens` below the alignment would stall forever.
+        """
+        chunk = min(num_new_tokens, budget_remaining)
+        if chunk >= num_new_tokens:
+            return chunk
+        aligned = chunk - chunk % max(self.block_manager.block_size, 64)
+        return aligned or (0 if num_batched_tokens else chunk)
+
     def _prefill_chunk_for_budget(
         self, num_new_tokens: int, budget_remaining: int, num_batched_tokens: int
     ) -> int | None:
         if self.enable_chunked_prefill:
-            chunk = min(num_new_tokens, budget_remaining)
-            if chunk < num_new_tokens:
-                align = max(self.block_manager.block_size, 64)
-                aligned = (chunk // align) * align
-                if aligned > 0:
-                    chunk = aligned
-            return chunk
+            return (
+                self._chunked_prefill_size(
+                    num_new_tokens, budget_remaining, num_batched_tokens
+                )
+                or None
+            )
         if num_new_tokens > budget_remaining and num_batched_tokens > 0:
             return None
         return num_new_tokens
