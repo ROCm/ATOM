@@ -37,6 +37,7 @@ from atom.distributed.pp_comm import (
     commit_pp_send_work,
     recv_intermediate_tensors,
 )
+from atom.distributed.simulated_tp import apply_simulated_tp, reject_simulated_tp
 from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.model_engine.run_labels import build_run_label
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
@@ -607,9 +608,14 @@ class ModelRunner:
         self.block_size = config.kv_cache_block_size
         self.kv_cache_dtype = config.kv_cache_dtype
         self.enforce_eager = config.enforce_eager
+        # world_size: the logical TP width, i.e. how many shards each weight is
+        # cut into -- what the KV-head math below divides by.
+        # tp_world_size: how many of those shards have a process.
+        # They differ only under simulated TP.
         self.world_size = config.tensor_parallel_size
+        self.tp_world_size = config.tp_world_size
         self.rank = rank
-        self.label = f"Model Runner{rank}/{self.world_size}"
+        self.label = f"Model Runner{rank}/{self.tp_world_size}"
         self.hf_text_config = get_hf_text_config(hf_config)
         if self.hf_text_config.model_type in ["llama"] and self.config.torch_dtype in [
             torch.bfloat16,
@@ -893,7 +899,8 @@ class ModelRunner:
         dp_rank_local = config.parallel_config.data_parallel_rank_local or 0
         pp_rank = config.parallel_config.pipeline_parallel_rank
         pp_size = config.pipeline_parallel_size
-        stage_span = config.tensor_parallel_size * config.prefill_context_parallel_size
+        # tp_world_size: how many GPUs this stage actually occupies.
+        stage_span = config.tp_world_size * config.prefill_context_parallel_size
         engine_index = dp_rank_local * pp_size + pp_rank
         local_device_rank = engine_index * stage_span + rank
         num_gpus = torch.cuda.device_count()
@@ -916,9 +923,12 @@ class ModelRunner:
             config.parallel_config.data_parallel_master_ip,
             config.parallel_config.data_parallel_base_port,
         )
+        # Both branches handle simulated TP: the PP path only to reject it,
+        # since it would otherwise deadlock on a group sized for absent ranks.
         if config.pipeline_parallel_size > 1:
             from atom.distributed.pp_comm import init_pp_aware_dist_env
 
+            reject_simulated_tp(config, "pipeline parallel")
             dp_size = config.parallel_config.data_parallel_size
             world_size = dp_size * pp_size * stage_span
             dp_rank = config.parallel_config.data_parallel_rank
@@ -934,8 +944,10 @@ class ModelRunner:
                 prefill_context_model_parallel_size=config.prefill_context_parallel_size,
             )
         else:
+            # The group spans the devices that exist; apply_simulated_tp then
+            # makes it *report* the logical width so layers shard that many ways.
             init_dist_env(
-                config.tensor_parallel_size,
+                config.tp_world_size,
                 rankID=rank,
                 backend="nccl",
                 distributed_init_method=distributed_init_method,
@@ -946,6 +958,7 @@ class ModelRunner:
                     config, "decode_context_parallel_size", 1
                 ),
             )
+            apply_simulated_tp(config)
 
     def _make_buffer(
         self, *size: int | torch.SymInt, dtype: torch.dtype, numpy: bool = True
@@ -4197,7 +4210,7 @@ class RapidServeModelRunner(ModelRunner):
 
         if self.rank != 0:
             return None
-        paths = [self._disagg_rank_file_path(tag, r) for r in range(self.world_size)]
+        paths = [self._disagg_rank_file_path(tag, r) for r in range(self.tp_world_size)]
         deadline = time.monotonic() + 120  # 2 min timeout
         while time.monotonic() < deadline:
             if all(os.path.exists(p) for p in paths):
@@ -4223,7 +4236,9 @@ class RapidServeModelRunner(ModelRunner):
         self._disagg_write_rank_file("weights", handles)
         paths = self._disagg_collect_rank_files("weights")
         if paths is not None:
-            logger.info(f"ModelRunner rank 0: all {self.world_size} weight files ready")
+            logger.info(
+                f"ModelRunner rank 0: all {self.tp_world_size} weight files ready"
+            )
         return paths  # non-None only for rank 0
 
     def import_model_weight_ipc_handles(self, paths: list[str]) -> bool:
@@ -4276,7 +4291,7 @@ class RapidServeModelRunner(ModelRunner):
         paths = self._disagg_collect_rank_files("kvcache")
         if paths is not None:
             logger.info(
-                f"ModelRunner rank 0: all {self.world_size} kvcache files ready"
+                f"ModelRunner rank 0: all {self.tp_world_size} kvcache files ready"
             )
         return paths  # non-None only for rank 0
 

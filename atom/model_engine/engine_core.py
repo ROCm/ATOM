@@ -77,9 +77,11 @@ class EngineCore:
             # stage's slice = tp x pcp. Pipeline parallelism spans *separate*
             # EngineCores (one per stage, spawned by CoreManager), not extra
             # workers inside a single EngineCore — so pp does NOT multiply here.
+            # tp_world_size, not tensor_parallel_size: under simulated TP only
+            # the first tp_world_size shards get a process.
             self.runner_mgr = AsyncIOProcManager(
                 self._finalizer,
-                config.tensor_parallel_size * config.prefill_context_parallel_size,
+                config.tp_world_size * config.prefill_context_parallel_size,
                 config.runner_qualname,
                 config,
             )
@@ -127,9 +129,8 @@ class EngineCore:
 
         self.kv_transfer_enabled = bool(config.kv_transfer_config)
         if self.kv_transfer_enabled:
-            self.kv_aggregator = KVOutputAggregator(
-                world_size=config.tensor_parallel_size
-            )
+            # Physical: one output per launched worker, else this waits forever.
+            self.kv_aggregator = KVOutputAggregator(world_size=config.tp_world_size)
 
         self.utility_handler = EngineUtilityHandler(
             self.runner_mgr,
