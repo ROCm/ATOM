@@ -1160,9 +1160,7 @@ def _validate_chat_request(request: ChatCompletionRequest) -> None:
                 raise ValueError("tool_choice object must have type 'function'")
             fn = tool_choice.get("function")
             if not isinstance(fn, dict) or not isinstance(fn.get("name"), str):
-                raise ValueError(
-                    "tool_choice.function.name must be a string"
-                )
+                raise ValueError("tool_choice.function.name must be a string")
             # A named tool_choice must reference a declared tool.
             names = {
                 t["function"]["name"]
@@ -1170,9 +1168,7 @@ def _validate_chat_request(request: ChatCompletionRequest) -> None:
                 if isinstance(t, dict) and isinstance(t.get("function"), dict)
             }
             if fn["name"] not in names:
-                raise ValueError(
-                    f"tool_choice names unknown tool: {fn['name']}"
-                )
+                raise ValueError(f"tool_choice names unknown tool: {fn['name']}")
         else:
             raise ValueError("tool_choice must be a string or an object")
 
@@ -1188,9 +1184,7 @@ def _validate_chat_request(request: ChatCompletionRequest) -> None:
         if rf_type == "json_schema":
             js = rf.get("json_schema")
             if not isinstance(js, dict) or not isinstance(js.get("schema"), dict):
-                raise ValueError(
-                    "response_format.json_schema.schema must be an object"
-                )
+                raise ValueError("response_format.json_schema.schema must be an object")
 
 
 # ---- Endpoints ----
