@@ -31,7 +31,11 @@ import torch
 # import torch.distributed as dist
 from aiter.dist.parallel_state import get_tp_group
 from aiter.rotary_embedding import get_rope
+from torch import nn
+from transformers import Qwen3Config
+
 from atom.config import Config
+from atom.model_loader.loader import load_model_in_plugin_mode
 from atom.model_ops.activation import SiluAndMul
 
 # from atom.model_ops.attention import Attention
@@ -43,14 +47,9 @@ from atom.model_ops.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from atom.utils.decorators import support_torch_compile
-from torch import nn
-from transformers import Qwen3Config
-
-from atom.model_loader.loader import load_model_in_plugin_mode
 from atom.models.utils import maybe_prefix
 from atom.utils import envs
-
+from atom.utils.decorators import support_torch_compile
 
 ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = (
     envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
