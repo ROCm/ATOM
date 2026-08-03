@@ -1284,6 +1284,15 @@ class MLAAttention(nn.Module):
             num_kv_splits = (
                 16 if use_persistent_mode else max(1, 16 // self.dcp_world_size)
             )
+            # sparse + DCP: each rank owns only a tiny slice of the global top-k
+            # (the rest are -1 sentinels). Splitting that tiny masked region across
+            # >1 kv_splits can leave a split with zero valid tokens -> its partial
+            # o is uninitialized and lse=-inf, and the flash-decoding combine does
+            # o*exp(lse-max) = NaN*0 = NaN (confirmed: local-o/lse NaN on ranks
+            # whose owned tokens all land in one split). Force a single split so no
+            # split is ever empty. See DCP/DCP_Sparse_MLA.md §3.8.
+            if self.is_sparse_mla and self.dcp_world_size > 1:
+                num_kv_splits = 1
 
             # TODO refactor this
             if envs.ATOM_MLA_PAGE_SIZE is not None:
@@ -1623,13 +1632,55 @@ class MLAAttention(nn.Module):
             elif self.dcp_world_size > 1:
                 # DCP decode: AllGather Q on the head dim, decode locally with LSE,
                 # then combine partial outputs across ranks (AG LSE + correct + RS).
+                import os as _os
+
+                _ddbg = _os.environ.get("ATOM_DSA_DCP_DBG")
+
+                def _dstat(tag, t=None):
+                    if not _ddbg:
+                        return
+                    torch.cuda.synchronize()
+                    if t is None:
+                        print(
+                            f"[DSA-DEC r{self.dcp_rank}] {tag} "
+                            f"sparse={self.is_sparse_mla}",
+                            flush=True,
+                        )
+                        return
+                    tf = t.float()
+                    print(
+                        f"[DSA-DEC r{self.dcp_rank}] {tag} sparse={self.is_sparse_mla} "
+                        f"shape={tuple(t.shape)} absum={tf.abs().sum().item():.4f} "
+                        f"nan={int(tf.isnan().sum())} inf={int(tf.isinf().sum())} "
+                        f"min={tf.min().item():.4f} max={tf.max().item():.4f}",
+                        flush=True,
+                    )
+
                 q_out = self.dcp_group.all_gather(q_out, dim=1)
                 o, lse = self._forward_decode(
                     q_out, kv_cache, attn_metadata, return_lse=True
                 )
+                _dstat("local-o", o)
+                _dstat("local-lse", lse)
+                if _ddbg and self.is_sparse_mla:
+                    # Method C verify: does lse go garbage while the sparse region
+                    # still has valid (>=0) slots? -> lse path can't handle -1.
+                    torch.cuda.synchronize()
+                    _sk = int(attn_metadata.sparse_kv_indptr[1])
+                    _reg = self.sparse_kv_indices_buffer[:_sk]
+                    _vc = int((_reg >= 0).sum())
+                    print(
+                        f"[DSA-VERIFY r{self.dcp_rank}] req0 region_len={_sk} "
+                        f"valid_count={_vc} region={_reg[:16].tolist()} "
+                        f"lse0_heads={[round(x,3) for x in lse[0, :8].float().tolist()]} "
+                        f"lse_nan={int(torch.isnan(lse).sum())} "
+                        f"lse_zero={int((lse == 0).sum())} o_nan={int(torch.isnan(o).sum())}",
+                        flush=True,
+                    )
                 from atom.model_ops.dcp_ops import cp_lse_ag_out_rs
 
                 o = cp_lse_ag_out_rs(o, lse, self.dcp_group, ctx=self._cp_triton_ctx)
+                _dstat("merged-o", o)
                 output = self._v_up_proj_and_o_proj(o)
             else:
                 output = self._forward_decode(q_out, kv_cache, attn_metadata)
