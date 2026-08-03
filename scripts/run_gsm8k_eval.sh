@@ -17,7 +17,23 @@ GEN_KWARGS="${GEN_KWARGS:-}"  # e.g. max_gen_toks=2048 for reasoning models
 # Set to a directory to also dump per-sample prompts/generations, so two runs
 # can be diffed question by question instead of only by the headline score.
 LOG_SAMPLES_DIR="${LOG_SAMPLES_DIR:-}"
-BASE_URL="http://localhost:${PORT}/v1/completions"
+# CHAT=1 drives /v1/chat/completions with the model's own chat template and the
+# few-shot examples as real turns. Required for thinking models: in completion
+# mode they see a raw 3-shot text prompt whose examples answer directly, so
+# whether they open a <think> block at all is unconstrained — measured on
+# Qwen3.5, 220/300 questions skipped thinking and 80/300 thought, the latter
+# running 8x longer and often truncating. That split is a coin flip any tiny
+# numeric perturbation can move, which puts ~2.5pp of swing on the score. Chat
+# mode also routes the thinking block into `reasoning_content`, leaving
+# `content` (what lm_eval grades) free of it.
+CHAT="${CHAT:-}"
+if [ -n "$CHAT" ]; then
+    MODEL_TYPE="local-chat-completions"
+    BASE_URL="http://localhost:${PORT}/v1/chat/completions"
+else
+    MODEL_TYPE="local-completions"
+    BASE_URL="http://localhost:${PORT}/v1/completions"
+fi
 OUTPUT_DIR="/app/logs_claude"
 LOG_FILE="${OUTPUT_DIR}/gsm8k_eval.log"
 
@@ -66,11 +82,17 @@ if [ -n "$GEN_KWARGS" ]; then
     GEN_KWARGS_ARG=(--gen_kwargs "$GEN_KWARGS")
 fi
 
-lm_eval --model local-completions \
+CHAT_ARG=()
+if [ -n "$CHAT" ]; then
+    CHAT_ARG=(--apply_chat_template --fewshot_as_multiturn)
+fi
+
+lm_eval --model "$MODEL_TYPE" \
     --model_args "model=${MODEL},base_url=${BASE_URL},num_concurrent=${NUM_CONCURRENT},max_retries=3,tokenized_requests=False,trust_remote_code=True" \
     --tasks gsm8k \
     --num_fewshot "$NUM_FEWSHOT" \
     "${LIMIT_ARG[@]}" \
     "${SAMPLES_ARG[@]}" \
     "${GEN_KWARGS_ARG[@]}" \
+    "${CHAT_ARG[@]}" \
     2>&1 | tee -a "${LOG_FILE}"
