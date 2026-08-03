@@ -256,15 +256,20 @@ class GDNStateMixin:
         )
 
     def min_fork_tokens(self) -> int:
-        """Tokens the forward carrying a state fork must cover.
+        """Tokens the forward carrying a state fork must cover: one.
 
-        The recurrent state is rewritten whole by any forward, so the binding
-        constraint is the conv state: it holds the last `conv_kernel_dim - 1`
-        tokens, and a forward shorter than that would leave the request's new
-        group holding a window the old group still owns part of.
+        Both halves of the GDN state come out of a forward self-contained at any
+        length. The recurrent state is rewritten whole, and every write path in
+        `causal_conv1d` stores the full `state_len` window to the output slot —
+        the short-chunk paths get there by loading the previous window from the
+        *input* slot, shifting left and appending x — so the new group stops
+        depending on the old one the moment the forward returns.
+
+        Reading the state layout alone suggests `conv_kernel_dim - 1` instead,
+        on the theory that a shorter forward leaves the new group holding a
+        window the old group still owns part of. The kernel closes that gap.
         """
-        conv_state_shape, _ = self._state_shape_for_runner()
-        return conv_state_shape[0]
+        return 1
 
     def state_spec(self) -> SubPoolSpec:
         """The GDN state pool: conv_state + temporal_state over all GDN

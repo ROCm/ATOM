@@ -283,6 +283,9 @@ class GatedDeltaNet(nn.Module):
                 conv_state_indices=non_spec_state_indices_tensor[
                     : gdn_metadata.num_actual_tokens
                 ],
+                conv_state_indices_in=non_spec_state_indices_in_tensor[
+                    : gdn_metadata.num_actual_tokens
+                ],
                 validate_data=True,
             )
         else:
@@ -379,6 +382,7 @@ class GatedDeltaNet(nn.Module):
                         v=value_non_spec,
                         initial_state=ssm_state,
                         ssm_state_indices=non_spec_state_indices_tensor,
+                        ssm_state_indices_in=non_spec_state_indices_in_tensor,
                         use_qk_l2norm_in_kernel=True,
                     )
                 )
@@ -396,6 +400,7 @@ class GatedDeltaNet(nn.Module):
                             : gdn_metadata.num_decodes + 1
                         ],
                         ssm_state_indices=non_spec_state_indices_tensor,
+                        ssm_state_indices_in=non_spec_state_indices_in_tensor,
                         use_qk_l2norm_in_kernel=True,
                     )
                 )

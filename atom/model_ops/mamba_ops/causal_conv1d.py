@@ -824,6 +824,12 @@ def _causal_conv1d_update_kernel(
     bias_ptr,
     conv_state_ptr,
     conv_state_indices_ptr,
+    # Read side. The same tensor as `conv_state_indices_ptr` unless the caller
+    # forked the state — a request resuming from a checkpoint reads the
+    # published slot and writes a fresh one, for this forward only. The pad
+    # sentinel is read from here but gates the store below, so the two arrays
+    # must carry `pad_slot_id` at the same rows.
+    conv_state_indices_in_ptr,
     num_accepted_tokens_ptr,
     query_start_loc_ptr,  # (batch + 1)
     block_idx_last_scheduled_token,  # (batch,)
@@ -900,7 +906,7 @@ def _causal_conv1d_update_kernel(
 
     # cache_idx
     conv_states_input_coord = tl.load(
-        conv_state_indices_ptr + idx_seq * stride_state_indices + conv_state_init
+        conv_state_indices_in_ptr + idx_seq * stride_state_indices + conv_state_init
     ).to(tl.int64)
 
     if USE_PAD_SLOT:  # noqa
@@ -1195,6 +1201,7 @@ def causal_conv1d_update(
     bias: torch.Tensor | None = None,
     activation: bool | str | None = None,
     conv_state_indices: torch.Tensor | None = None,
+    conv_state_indices_in: torch.Tensor | None = None,
     num_accepted_tokens: torch.Tensor | None = None,
     query_start_loc: torch.Tensor | None = None,
     max_query_len: int = -1,
@@ -1218,6 +1225,11 @@ def causal_conv1d_update(
         If not None, the conv_state is a larger tensor along the batch dim,
         and we are selecting the batch coords specified by conv_state_indices.
         Useful for a continuous batching scenario.
+    conv_state_indices_in: (batch,), dtype int32
+        Read-side counterpart of conv_state_indices, same shape and stride.
+        Differs from it only for a request resuming a state checkpoint, which
+        reads the published slot and writes a fresh one for this forward.
+        Defaults to conv_state_indices, i.e. the ordinary in-place update.
     block_idx_last_scheduled_token: (batch,), dtype int32
         The pointer into conv_state_indices, where the last cache block to be filled is located.
     initial_state_idx: (batch,), dtype int32
@@ -1314,6 +1326,17 @@ def causal_conv1d_update(
     stride_state_indices = (
         conv_state_indices.stride(0) if conv_state_indices is not None else 0
     )
+    # One stride serves both index tensors, so the read side has to be laid out
+    # exactly like the write side. Callers build them from the same buffer
+    # shape; assert rather than silently index the fork source wrong.
+    if conv_state_indices_in is None:
+        conv_state_indices_in = conv_state_indices
+    else:
+        assert (
+            conv_state_indices is not None
+            and conv_state_indices_in.shape == conv_state_indices.shape
+            and conv_state_indices_in.stride() == conv_state_indices.stride()
+        ), "conv_state_indices_in must match conv_state_indices in shape and stride"
     if num_accepted_tokens is not None:
         state_len = width - 1 + (seqlen - 1)  # effective state_len needed
     else:
@@ -1333,6 +1356,7 @@ def causal_conv1d_update(
         bias,
         conv_state,
         conv_state_indices,
+        conv_state_indices_in,
         num_accepted_tokens,
         query_start_loc,
         block_idx_last_scheduled_token,
