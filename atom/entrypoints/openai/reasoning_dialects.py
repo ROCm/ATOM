@@ -55,12 +55,16 @@ class ReasoningDialect:
     - ``think_end_marker``: the marker that ends the reasoning channel.
     - ``split``: whole-response separator returning ``SplitResult`` or ``None``
       if this dialect does not apply to the text.
+    - ``template_efforts``: reasoning-effort levels this model's chat template
+      accepts (e.g. K3's ``low``/``high``/``max``); empty when the model has no
+      effort control.
     """
 
     prompt_open_marker: str
     output_open_marker: str | None
     think_end_marker: str
     split: Callable[[str], SplitResult | None]
+    template_efforts: frozenset[str] = frozenset()
 
 
 # --- Structured-channel dialect ---
@@ -136,6 +140,7 @@ DIALECTS: tuple[ReasoningDialect, ...] = (
         output_open_marker=None,  # template-injected; not emitted in output
         think_end_marker=CHANNEL_THINK_END,
         split=_split_channel,
+        template_efforts=frozenset({"low", "high", "max"}),  # Kimi-K3
     ),
     # Generic <think>...</think> (K2/DeepSeek/Qwen3/MiniMax/...)
     ReasoningDialect(

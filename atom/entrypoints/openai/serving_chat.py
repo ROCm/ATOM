@@ -6,7 +6,6 @@
 import asyncio
 import json
 import logging
-import re
 import time
 from collections.abc import AsyncGenerator
 from typing import Any
@@ -14,10 +13,16 @@ from typing import Any
 from .protocol import (
     CHAT_COMPLETION_CHUNK_OBJECT,
     STREAM_DONE_MESSAGE,
+    TOOL_CHOICE_VALUES,
+    TOOL_NAME_RE,
     ChatCompletionRequest,
     ChatCompletionResponse,
 )
-from .reasoning import ReasoningFilter, separate_reasoning
+from .reasoning import (
+    VALID_TEMPLATE_EFFORTS,
+    ReasoningFilter,
+    separate_reasoning,
+)
 from .tool_parser import ToolCallStreamParser, parse_tool_calls
 
 logger = logging.getLogger("atom")
@@ -26,11 +31,6 @@ logger = logging.getLogger("atom")
 # ============================================================================
 # Request validation & thinking control
 # ============================================================================
-
-# Effort levels the K3 chat template understands; anything else is not forwarded.
-_K3_TEMPLATE_EFFORTS = {"low", "high", "max"}
-_TOOL_CHOICE_VALUES = {"auto", "none", "required"}
-_TOOL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
 
 
 def resolve_thinking(request: ChatCompletionRequest) -> tuple[bool, str | None]:
@@ -53,7 +53,7 @@ def resolve_thinking(request: ChatCompletionRequest) -> tuple[bool, str | None]:
         effort = thinking.get("effort")
     elif request.reasoning_effort is not None:
         effort = request.reasoning_effort
-    if effort not in _K3_TEMPLATE_EFFORTS:
+    if effort not in VALID_TEMPLATE_EFFORTS:
         effort = None
     return enabled, effort
 
@@ -68,9 +68,9 @@ def _validate_one_tool(tool: Any, index: int) -> None:
     if not isinstance(fn, dict):
         raise ValueError(f"tools[{index}].function must be an object")  # noqa: TRY004
     name = fn.get("name")
-    if not isinstance(name, str) or not _TOOL_NAME_RE.match(name):
+    if not isinstance(name, str) or not TOOL_NAME_RE.match(name):
         raise ValueError(
-            f"tools[{index}].function.name must match {_TOOL_NAME_RE.pattern}"
+            f"tools[{index}].function.name must match {TOOL_NAME_RE.pattern}"
         )
 
 
@@ -99,9 +99,9 @@ def validate_chat_request(request: ChatCompletionRequest) -> None:
     tool_choice = request.tool_choice
     if tool_choice is not None:
         if isinstance(tool_choice, str):
-            if tool_choice not in _TOOL_CHOICE_VALUES:
+            if tool_choice not in TOOL_CHOICE_VALUES:
                 raise ValueError(
-                    f"tool_choice string must be one of {sorted(_TOOL_CHOICE_VALUES)}"
+                    f"tool_choice string must be one of {sorted(TOOL_CHOICE_VALUES)}"
                 )
         elif isinstance(tool_choice, dict):
             if tool_choice.get("type") != "function":

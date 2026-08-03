@@ -23,6 +23,10 @@ _REASONING_OPEN_MARKERS = tuple(d.prompt_open_marker for d in DIALECTS)
 _OUTPUT_OPEN_MARKERS = tuple(
     d.output_open_marker for d in DIALECTS if d.output_open_marker
 )
+# Reasoning-effort levels accepted across all loaded dialects' chat templates.
+# resolve_thinking() clamps a request's effort to this set before forwarding it,
+# so an effort no template understands is never passed through.
+VALID_TEMPLATE_EFFORTS = frozenset().union(*(d.template_efforts for d in DIALECTS))
 
 
 def prompt_starts_in_reasoning(prompt: str) -> bool:

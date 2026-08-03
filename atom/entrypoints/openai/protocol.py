@@ -4,6 +4,7 @@
 """Pydantic request/response models for the OpenAI-compatible API."""
 
 import json
+import re
 import time
 from typing import Any
 
@@ -21,6 +22,11 @@ CHAT_COMPLETION_OBJECT = "chat.completion"
 CHAT_COMPLETION_CHUNK_OBJECT = "chat.completion.chunk"
 TEXT_COMPLETION_OBJECT = "text_completion"
 STREAM_DONE_MESSAGE = "data: [DONE]\n\n"
+
+# Valid OpenAI ``tool_choice`` string values and the function-name constraint.
+# Spec-level (not model-specific): the same for every model served.
+TOOL_CHOICE_VALUES = frozenset({"auto", "none", "required"})
+TOOL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
 
 
 # ============================================================================
