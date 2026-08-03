@@ -1086,7 +1086,7 @@ _TOOL_CHOICE_VALUES = {"auto", "none", "required"}
 _TOOL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
 
 
-def _resolve_thinking(request: ChatCompletionRequest) -> tuple[bool, Optional[str]]:
+def _resolve_thinking(request: ChatCompletionRequest) -> tuple[bool, str | None]:
     """Resolve (enabled, effort) from the request's thinking / reasoning_effort.
 
     ``thinking`` (extra_body) takes precedence over ``reasoning_effort``.
@@ -1113,12 +1113,13 @@ def _resolve_thinking(request: ChatCompletionRequest) -> tuple[bool, Optional[st
 
 def _validate_one_tool(tool: Any, index: int) -> None:
     if not isinstance(tool, dict):
-        raise ValueError(f"tools[{index}] must be an object")
+        # ValueError (not TypeError) so the handler maps it to HTTP 400.
+        raise ValueError(f"tools[{index}] must be an object")  # noqa: TRY004
     if tool.get("type") != "function":
         raise ValueError(f"tools[{index}].type must be 'function'")
     fn = tool.get("function")
     if not isinstance(fn, dict):
-        raise ValueError(f"tools[{index}].function must be an object")
+        raise ValueError(f"tools[{index}].function must be an object")  # noqa: TRY004
     name = fn.get("name")
     if not isinstance(name, str) or not _TOOL_NAME_RE.match(name):
         raise ValueError(
@@ -1130,7 +1131,7 @@ def _validate_tool_list(tools: Any) -> None:
     if tools is None:
         return
     if not isinstance(tools, list):
-        raise ValueError("tools must be an array")
+        raise ValueError("tools must be an array")  # noqa: TRY004
     seen: set[str] = set()
     for i, tool in enumerate(tools):
         _validate_one_tool(tool, i)
@@ -1160,7 +1161,9 @@ def _validate_chat_request(request: ChatCompletionRequest) -> None:
                 raise ValueError("tool_choice object must have type 'function'")
             fn = tool_choice.get("function")
             if not isinstance(fn, dict) or not isinstance(fn.get("name"), str):
-                raise ValueError("tool_choice.function.name must be a string")
+                raise ValueError(  # noqa: TRY004
+                    "tool_choice.function.name must be a string"
+                )
             # A named tool_choice must reference a declared tool.
             names = {
                 t["function"]["name"]

@@ -5,7 +5,7 @@
 
 import json
 import time
-from typing import Any, Dict, List, Optional, Union
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -92,7 +92,7 @@ class ChatMessage(BaseModel):
     """Represents a single chat message."""
 
     role: str
-    content: Union[str, List[Dict[str, Any]], None] = None
+    content: str | list[dict[str, Any]] | None = None
 
     model_config = ConfigDict(extra="allow")
 
@@ -109,13 +109,13 @@ class ChatMessage(BaseModel):
                 parts.append(part.get("text", ""))
         return "\n".join(parts)
 
-    def to_template_dict(self) -> Dict[str, Any]:
+    def to_template_dict(self) -> dict[str, Any]:
         """Convert to dict for chat template, preserving tool-related fields.
 
         Returns a dict with role, content, and any extra fields (tool_calls,
         tool_call_id, name, reasoning_content, tools) that the chat template needs.
         """
-        d: Dict[str, Any] = {"role": self.role, "content": self.get_content_text()}
+        d: dict[str, Any] = {"role": self.role, "content": self.get_content_text()}
         # Preserve extra fields needed by chat templates (e.g. Kimi-K2/K3).
         # "tools" carries K3 dynamically-loaded tools declared inside a system
         # message; encoding_k3.build_chat_segments renders them per-message.
@@ -135,38 +135,36 @@ class ChatCompletionRequest(BaseModel):
 
     model_config = {"extra": "ignore"}
 
-    model: Optional[str] = None
-    messages: Optional[List[ChatMessage]] = None
-    prompt: Optional[List[ChatMessage]] = None  # Accept 'prompt' as alias
-    temperature: Optional[float] = DEFAULT_TEMPERATURE
-    top_k: Optional[int] = DEFAULT_TOP_K
-    top_p: Optional[float] = DEFAULT_TOP_P
-    max_tokens: Optional[int] = DEFAULT_MAX_TOKENS
-    max_completion_tokens: Optional[int] = None
-    stop: Optional[List[str]] = None
-    ignore_eos: Optional[bool] = False
-    stream: Optional[bool] = False
-    seed: Optional[int] = None
-    chat_template_kwargs: Optional[Dict[str, Any]] = None
+    model: str | None = None
+    messages: list[ChatMessage] | None = None
+    prompt: list[ChatMessage] | None = None  # Accept 'prompt' as alias
+    temperature: float | None = DEFAULT_TEMPERATURE
+    top_k: int | None = DEFAULT_TOP_K
+    top_p: float | None = DEFAULT_TOP_P
+    max_tokens: int | None = DEFAULT_MAX_TOKENS
+    max_completion_tokens: int | None = None
+    stop: list[str] | None = None
+    ignore_eos: bool | None = False
+    stream: bool | None = False
+    seed: int | None = None
+    chat_template_kwargs: dict[str, Any] | None = None
     # Tool calling
-    tools: Optional[List[Dict[str, Any]]] = None
-    tool_choice: Optional[Any] = (
-        None  # "auto", "none", "required", or {function: {name}}
-    )
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: Any | None = None  # "auto", "none", "required", or {function: {name}}
     # Structured output: {"type": "text"|"json_object"|"json_schema", ...}
-    response_format: Optional[Dict[str, Any]] = None
-    reasoning_effort: Optional[str] = None  # "low"|"high"|"max"
+    response_format: dict[str, Any] | None = None
+    reasoning_effort: str | None = None  # "low"|"high"|"max"
     # K3 thinking control (sent by clients via extra_body):
     # {"type": "enabled"|"disabled", "keep": "all", "effort": "low"|"high"|"max"}.
     # Without this field pydantic (extra="ignore") silently drops it, so effort
     # never reaches the template and the streaming reasoning gate never fires.
-    thinking: Optional[Dict[str, Any]] = None
+    thinking: dict[str, Any] | None = None
     # Accepted for compatibility, not actively used:
-    presence_penalty: Optional[float] = 0.0
-    frequency_penalty: Optional[float] = 0.0
-    n: Optional[int] = 1
+    presence_penalty: float | None = 0.0
+    frequency_penalty: float | None = 0.0
+    n: int | None = 1
     # Optional KV-transfer metadata for P/D disaggregation.
-    kv_transfer_params: Optional[Dict[str, Any]] = None
+    kv_transfer_params: dict[str, Any] | None = None
 
     def get_max_tokens(self) -> int:
         """Return the effective generation cap for OpenAI chat requests."""
@@ -176,7 +174,7 @@ class ChatCompletionRequest(BaseModel):
             return self.max_tokens
         return DEFAULT_MAX_TOKENS
 
-    def get_messages(self) -> List[ChatMessage]:
+    def get_messages(self) -> list[ChatMessage]:
         """Get messages from either 'messages' or 'prompt' field."""
         if self.messages is not None:
             return self.messages
@@ -191,21 +189,21 @@ class CompletionRequest(BaseModel):
 
     model_config = {"extra": "ignore"}
 
-    model: Optional[str] = None
+    model: str | None = None
     prompt: str
-    temperature: Optional[float] = DEFAULT_TEMPERATURE
-    top_k: Optional[int] = DEFAULT_TOP_K
-    top_p: Optional[float] = DEFAULT_TOP_P
-    max_tokens: Optional[int] = DEFAULT_MAX_TOKENS
-    max_completion_tokens: Optional[int] = None
-    stop: Optional[List[str]] = None
-    ignore_eos: Optional[bool] = False
-    stream: Optional[bool] = False
+    temperature: float | None = DEFAULT_TEMPERATURE
+    top_k: int | None = DEFAULT_TOP_K
+    top_p: float | None = DEFAULT_TOP_P
+    max_tokens: int | None = DEFAULT_MAX_TOKENS
+    max_completion_tokens: int | None = None
+    stop: list[str] | None = None
+    ignore_eos: bool | None = False
+    stream: bool | None = False
     # Optional KV-transfer metadata for P/D disaggregation.
-    kv_transfer_params: Optional[Dict[str, Any]] = None
+    kv_transfer_params: dict[str, Any] | None = None
     # Optional DPA routing hint inserted by atomesh for DP-aware workers.
-    data_parallel_rank: Optional[int] = None
-    n: Optional[int] = 1
+    data_parallel_rank: int | None = None
+    n: int | None = 1
 
     def get_max_tokens(self) -> int:
         """Return the effective generation cap for completion requests."""
@@ -228,9 +226,9 @@ class ChatCompletionResponse(BaseModel):
     object: str = CHAT_COMPLETION_OBJECT
     created: int
     model: str
-    choices: List[Dict[str, Any]]
-    usage: Dict[str, Any]
-    kv_transfer_params: Optional[Dict[str, Any]] = None
+    choices: list[dict[str, Any]]
+    usage: dict[str, Any]
+    kv_transfer_params: dict[str, Any] | None = None
 
     model_config = ConfigDict(extra="allow")
 
@@ -242,10 +240,10 @@ class CompletionResponse(BaseModel):
     object: str = TEXT_COMPLETION_OBJECT
     created: int
     model: str
-    choices: List[Dict[str, Any]]
-    usage: Dict[str, Any]
+    choices: list[dict[str, Any]]
+    usage: dict[str, Any]
     # Optional KV-transfer metadata returned for P/D disaggregation.
-    kv_transfer_params: Optional[Dict[str, Any]] = None
+    kv_transfer_params: dict[str, Any] | None = None
 
 
 class ModelCard(BaseModel):
@@ -261,10 +259,10 @@ class ModelList(BaseModel):
     """Response for /v1/models endpoint."""
 
     object: str = "list"
-    data: List[ModelCard] = Field(default_factory=list)
+    data: list[ModelCard] = Field(default_factory=list)
 
 
 class ErrorResponse(BaseModel):
     """OpenAI-format error response."""
 
-    error: Dict[str, Any]
+    error: dict[str, Any]

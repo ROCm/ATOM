@@ -7,7 +7,8 @@ import asyncio
 import json
 import logging
 import time
-from typing import Any, AsyncGenerator, Dict, List, Optional
+from collections.abc import AsyncGenerator
+from typing import Any
 
 from .protocol import (
     CHAT_COMPLETION_CHUNK_OBJECT,
@@ -20,7 +21,7 @@ from .tool_parser import ToolCallStreamParser, parse_tool_calls
 logger = logging.getLogger("atom")
 
 
-def _normalize_finish_reason(finish_reason: Optional[str]) -> Optional[str]:
+def _normalize_finish_reason(finish_reason: str | None) -> str | None:
     """Map engine finish reasons to the OpenAI-standard vocabulary.
 
     The engine may report an EOS stop as ``"stop_<token_id>"`` (the raw id of
@@ -42,9 +43,9 @@ def _normalize_finish_reason(finish_reason: Optional[str]) -> Optional[str]:
 def create_chat_chunk(
     request_id: str,
     model: str,
-    delta: Optional[Dict[str, Any]] = None,
-    finish_reason: Optional[str] = None,
-    usage: Optional[Dict] = None,
+    delta: dict[str, Any] | None = None,
+    finish_reason: str | None = None,
+    usage: dict | None = None,
     index: int = 0,
 ) -> str:
     """Create a chat completion chunk in SSE format.
@@ -209,11 +210,11 @@ async def stream_chat_response(
 
 def _build_chat_choice(
     raw_text: str,
-    finish_reason: Optional[str],
+    finish_reason: str | None,
     index: int = 0,
     tools=None,
     tool_choice=None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Build one entry of ``choices[...]`` from a raw output string.
 
     Factored out of :func:`build_chat_response` so multi-sample responses
@@ -228,7 +229,7 @@ def _build_chat_choice(
     if tool_choice == "none":
         tool_calls = []
 
-    message: Dict[str, Any] = {"role": "assistant", "content": content}
+    message: dict[str, Any] = {"role": "assistant", "content": content}
     if reasoning_content is not None:
         message["reasoning_content"] = reasoning_content
     if tool_calls:
@@ -248,7 +249,7 @@ def build_chat_response(
     request_id: str,
     model: str,
     raw_text: str,
-    final_output: Dict[str, Any],
+    final_output: dict[str, Any],
     tools=None,
     tool_choice=None,
 ) -> ChatCompletionResponse:
@@ -291,7 +292,7 @@ def build_chat_response(
 def build_chat_response_multi(
     request_id: str,
     model: str,
-    final_outputs: List[Dict[str, Any]],
+    final_outputs: list[dict[str, Any]],
     tools=None,
     tool_choice=None,
 ) -> ChatCompletionResponse:
@@ -346,7 +347,7 @@ async def stream_chat_response_fanout(
     request_id: str,
     model: str,
     shared_queue: asyncio.Queue,
-    seq_ids: List[int],
+    seq_ids: list[int],
     num_prompt_tokens: int,
     cleanup_fn,
     tools=None,
