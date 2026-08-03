@@ -29,11 +29,17 @@ def test_glm52_pool_lookup_falls_back_to_sglang_attention_backend():
         req_to_token_pool=req_pool,
     )
     runtime_mod = _package("atom.plugin.sglang.runtime")
+    resolver_mod = ModuleType("atom.plugin.sglang.runtime.attention_backend_resolver")
+    resolver_mod.resolve_sglang_runtime = lambda forward_batch=None: SimpleNamespace(
+        token_to_kv_pool=token_pool,
+        req_to_token_pool=req_pool,
+    )
     model_arch_mod = ModuleType("atom.plugin.sglang.runtime.model_arch")
     model_arch_mod.is_glm52_dsa_config = lambda config: True
 
     fake_modules = {
         "atom.plugin.sglang.runtime": runtime_mod,
+        "atom.plugin.sglang.runtime.attention_backend_resolver": resolver_mod,
         "atom.plugin.sglang.runtime.model_arch": model_arch_mod,
         "aiter": aiter_mod,
         "sglang": _package("sglang"),

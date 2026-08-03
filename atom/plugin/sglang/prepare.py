@@ -74,6 +74,8 @@ def prepare_model(config: Any):
     from atom.plugin.sglang.runtime import get_model_arch_spec
 
     model_adapter = get_model_arch_spec(model_arch)
+    if model_adapter.prepare_draft_model_config is not None:
+        model_adapter.prepare_draft_model_config(atom_config, config)
     if model_adapter.prepare_config is not None:
         model_adapter.prepare_config(atom_config, model_arch)
     else:

@@ -396,12 +396,11 @@ class DeepseekV3ForCausalLMNextN(nn.Module):
                         "ATOM_GLM52_MTP_WRAPPER_MODE must be 'current' or "
                         f"'pr1578', got {wrapper_mode!r}"
                     )
-                normed_hidden = self._first_mtp_layer().shared_head(hidden_states)
                 if wrapper_mode == "pr1578":
                     logits_hidden = hidden_states
                     hidden_states_before_norm = None
                 else:
-                    logits_hidden = normed_hidden
+                    logits_hidden = hidden_states
                     hidden_states_before_norm = _incoming_hidden_for_chain
                 return self.logits_processor(
                     input_ids,

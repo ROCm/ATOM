@@ -499,6 +499,7 @@ def _build_minimax_m3_metadata(
         positions,
         token_to_kv_pool=token_to_kv_pool,
         req_to_token_pool=req_to_token_pool,
+        max_model_len=int(atom_config.max_model_len),
     )
 
 
@@ -555,6 +556,36 @@ def _build_deepseek_v4_metadata(forward_batch: ForwardBatch, positions: torch.Te
     return attn_metadata
 
 
+def _build_eagle3_llama_metadata(
+    atom_config: Any, forward_batch: ForwardBatch, positions: torch.Tensor
+):
+    hf_config = getattr(atom_config, "hf_config", None)
+    if _is_dummy_forward(forward_batch) or hf_config is None:
+        return None
+
+    from atom.plugin.sglang.eagle3_llama_bridge import (
+        build_atom_eagle3_attention_metadata_from_sglang,
+        is_eagle3_llama_config,
+        maybe_get_eagle3_pools_from_sglang_batch,
+    )
+
+    if not is_eagle3_llama_config(hf_config):
+        return None
+
+    token_to_kv_pool, req_to_token_pool = maybe_get_eagle3_pools_from_sglang_batch(
+        forward_batch
+    )
+    if token_to_kv_pool is None or req_to_token_pool is None:
+        return None
+
+    return build_atom_eagle3_attention_metadata_from_sglang(
+        forward_batch,
+        positions,
+        token_to_kv_pool=token_to_kv_pool,
+        req_to_token_pool=req_to_token_pool,
+    )
+
+
 def _set_atom_forward_context(
     atom_config: Any,
     forward_batch: ForwardBatch,
@@ -582,11 +613,11 @@ def _set_atom_forward_context(
         )
         max_seqlen_q = max(1, draft_token_num)
     elif is_draft_extend:
-        from atom.plugin.sglang.glm52_dsa_bridge import _draft_extend_token_num
+        from atom.plugin.sglang.glm52_dsa_bridge import draft_extend_token_num
 
         max_seqlen_q = max(
             1,
-            _draft_extend_token_num(
+            draft_extend_token_num(
                 forward_batch, positions, int(forward_batch.batch_size)
             ),
         )
@@ -622,6 +653,18 @@ def _set_atom_forward_context(
         except Exception as exc:
             raise RuntimeError(
                 "Failed to build ATOM DeepSeek-V4 metadata for SGLang"
+            ) from exc
+
+    if attn_metadata is None:
+        try:
+            attn_metadata = _build_eagle3_llama_metadata(
+                atom_config,
+                forward_batch,
+                positions,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to build ATOM EAGLE3 draft metadata for SGLang"
             ) from exc
 
     if attn_metadata is None:

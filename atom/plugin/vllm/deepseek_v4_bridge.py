@@ -571,14 +571,11 @@ def _bind_compressor_state(
         nb, k1, aligned_dim = kv_cache.shape
         block_fp32_stride = (k1 * aligned_dim) // 4
         scale_fp32_offset = (k1 * head_dim) // 4
-        compressor.cache_scale = (
-            kv_cache.view(torch.float32)
-            .view(-1)
-            .as_strided(
-                size=(nb, k1),
-                stride=(block_fp32_stride, 1),
-                storage_offset=scale_fp32_offset,
-            )
+        kv_cache_f32 = kv_cache.view(torch.float32)
+        compressor.cache_scale = kv_cache_f32.view(-1).as_strided(
+            size=(nb, k1),
+            stride=(block_fp32_stride, 1),
+            storage_offset=kv_cache_f32.storage_offset() + scale_fp32_offset,
         )
     else:
         compressor.cache_scale = None
@@ -588,6 +585,10 @@ def _bind_compressor_state(
     # "main_2buff_fp8" with a parallel bf16 RoPE pool bound via `kv_cache_rope`.
     compressor.kv_cache_rope = kv_cache_rope
     compressor.write_mode = write_mode
+    if is_indexer:
+        compressor.quant_mode = "per_row_fp8"
+    else:
+        compressor.quant_mode = "group_fp8" if kv_cache_rope is not None else "none"
 
 
 def _v4_max_spec_steps(vllm_config) -> int:
