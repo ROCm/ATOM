@@ -6,6 +6,7 @@
 import asyncio
 import json
 import logging
+import re
 import time
 from collections.abc import AsyncGenerator
 from typing import Any
@@ -13,12 +14,127 @@ from typing import Any
 from .protocol import (
     CHAT_COMPLETION_CHUNK_OBJECT,
     STREAM_DONE_MESSAGE,
+    ChatCompletionRequest,
     ChatCompletionResponse,
 )
 from .reasoning import ReasoningFilter, separate_reasoning
 from .tool_parser import ToolCallStreamParser, parse_tool_calls
 
 logger = logging.getLogger("atom")
+
+
+# ============================================================================
+# Request validation & thinking control
+# ============================================================================
+
+# Effort levels the K3 chat template understands; anything else is not forwarded.
+_K3_TEMPLATE_EFFORTS = {"low", "high", "max"}
+_TOOL_CHOICE_VALUES = {"auto", "none", "required"}
+_TOOL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
+
+
+def resolve_thinking(request: ChatCompletionRequest) -> tuple[bool, str | None]:
+    """Resolve (enabled, effort) from the request's thinking / reasoning_effort.
+
+    ``thinking`` (extra_body) takes precedence over ``reasoning_effort``.
+    Thinking is disabled when ``thinking.type == "disabled"`` or
+    ``reasoning_effort == "none"``. Effort is only returned when it is one of
+    the values the template understands.
+    """
+    thinking = request.thinking or {}
+    enabled = True
+    if isinstance(thinking, dict) and thinking.get("type") == "disabled":
+        enabled = False
+    if request.reasoning_effort == "none":
+        enabled = False
+
+    effort = None
+    if isinstance(thinking, dict) and thinking.get("effort") is not None:
+        effort = thinking.get("effort")
+    elif request.reasoning_effort is not None:
+        effort = request.reasoning_effort
+    if effort not in _K3_TEMPLATE_EFFORTS:
+        effort = None
+    return enabled, effort
+
+
+def _validate_one_tool(tool: Any, index: int) -> None:
+    if not isinstance(tool, dict):
+        # ValueError (not TypeError) so the handler maps it to HTTP 400.
+        raise ValueError(f"tools[{index}] must be an object")  # noqa: TRY004
+    if tool.get("type") != "function":
+        raise ValueError(f"tools[{index}].type must be 'function'")
+    fn = tool.get("function")
+    if not isinstance(fn, dict):
+        raise ValueError(f"tools[{index}].function must be an object")  # noqa: TRY004
+    name = fn.get("name")
+    if not isinstance(name, str) or not _TOOL_NAME_RE.match(name):
+        raise ValueError(
+            f"tools[{index}].function.name must match {_TOOL_NAME_RE.pattern}"
+        )
+
+
+def _validate_tool_list(tools: Any) -> None:
+    if tools is None:
+        return
+    if not isinstance(tools, list):
+        raise ValueError("tools must be an array")  # noqa: TRY004
+    seen: set[str] = set()
+    for i, tool in enumerate(tools):
+        _validate_one_tool(tool, i)
+        name = tool["function"]["name"]
+        if name in seen:
+            raise ValueError(f"duplicate tool name: {name}")
+        seen.add(name)
+
+
+def validate_chat_request(request: ChatCompletionRequest) -> None:
+    """Validate tool / tool_choice / response_format shape before dispatch.
+
+    Raises ``ValueError`` (surfaced as HTTP 400) on malformed input so the
+    engine is never handed a request the chat template cannot render.
+    """
+    _validate_tool_list(request.tools)
+
+    tool_choice = request.tool_choice
+    if tool_choice is not None:
+        if isinstance(tool_choice, str):
+            if tool_choice not in _TOOL_CHOICE_VALUES:
+                raise ValueError(
+                    f"tool_choice string must be one of {sorted(_TOOL_CHOICE_VALUES)}"
+                )
+        elif isinstance(tool_choice, dict):
+            if tool_choice.get("type") != "function":
+                raise ValueError("tool_choice object must have type 'function'")
+            fn = tool_choice.get("function")
+            if not isinstance(fn, dict) or not isinstance(fn.get("name"), str):
+                raise ValueError(  # noqa: TRY004
+                    "tool_choice.function.name must be a string"
+                )
+            # A named tool_choice must reference a declared tool.
+            names = {
+                t["function"]["name"]
+                for t in (request.tools or [])
+                if isinstance(t, dict) and isinstance(t.get("function"), dict)
+            }
+            if fn["name"] not in names:
+                raise ValueError(f"tool_choice names unknown tool: {fn['name']}")
+        else:
+            raise ValueError("tool_choice must be a string or an object")
+
+    rf = request.response_format
+    if rf is not None:
+        if not isinstance(rf, dict):
+            raise ValueError("response_format must be an object")
+        rf_type = rf.get("type")
+        if rf_type not in ("text", "json_object", "json_schema"):
+            raise ValueError(
+                "response_format.type must be 'text', 'json_object', or 'json_schema'"
+            )
+        if rf_type == "json_schema":
+            js = rf.get("json_schema")
+            if not isinstance(js, dict) or not isinstance(js.get("schema"), dict):
+                raise ValueError("response_format.json_schema.schema must be an object")
 
 
 def _normalize_finish_reason(finish_reason: str | None) -> str | None:
