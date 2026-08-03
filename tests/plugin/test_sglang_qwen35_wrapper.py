@@ -101,6 +101,12 @@ def _make_fake_modules() -> dict[str, ModuleType]:
                 {},
             ),
         ),
+        "atom.plugin.sglang.runtime": _module(
+            "atom.plugin.sglang.runtime",
+            SGLangForwardBatchMetadata=object,
+            SGLangPluginRuntime=object,
+            plugin_runtime_scope=lambda **_kwargs: None,
+        ),
         "atom.plugin.sglang.models.base_model_wrapper": _module(
             "atom.plugin.sglang.models.base_model_wrapper",
             SGLangForwardBatchMetadata=type(
