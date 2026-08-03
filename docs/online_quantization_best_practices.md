@@ -18,8 +18,13 @@ covers *which* configuration to pick and in what order to try them.
 >   strategy and only adjust the *format* to what the hardware accelerates.
 > - **Beyond load-time quantization:** the reasoning about which layers tolerate
 >   quantization and which do not applies equally when you are searching for an
->   offline quantization recipe. The conservative-to-aggressive progression
->   carries over directly.
+>   offline recipe with Quark, so the conservative-to-aggressive progression
+>   below carries over directly. Load-time quantization is plain
+>   round-to-nearest, so it is the cheaper way to find the layer assignment; once
+>   you have settled on one, Quark can push the same recipe further with
+>   accuracy-recovery techniques such as rotation and SmoothQuant. See
+>   [Online vs. offline quantization](./online_quantization_guide.md#online-vs-offline-quantization)
+>   for when to make that switch.
 
 ## Recap of the three fields
 
