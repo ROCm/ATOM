@@ -72,6 +72,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_HISPARSE_HOT_BUFFER_SIZE": lambda: int(
         os.getenv("ATOM_HISPARSE_HOT_BUFFER_SIZE", "8192")
     ),
+    # Use the fused GPU swap kernel (miss-detect + LRU + swap + translate, no host
+    # sync, CUDAGraph-capturable). Off falls back to the Phase-0 reference path
+    # (eager, host-synced) for bisection. MTP verify always uses the reference.
+    "ATOM_HISPARSE_FUSED": lambda: os.getenv("ATOM_HISPARSE_FUSED", "1") == "1",
     # --- Kernel Fusion Toggles ---
     # fused_compress_attn: switch between Triton (default historical) and a
     # flydsl drop-in for V4-Pro Compressor (Main BF16 + Indexer FP8) paths.

@@ -2,8 +2,8 @@
 # GLM-5.2 PP4×TP1 Prefill + TP4 Decode (PD) with HiSparse ENABLED on decode.
 #
 # Same topology as start_glm52_pp4pd.sh, but the DECODE node runs:
-#   - eager (--level 0): HiSparse Phase-0 CPU miss-detect syncs top-k D2H each
-#     step, which is illegal inside a CUDAGraph. No --cudagraph-mode.
+#   - --level 3 CUDAGraph: the fused GPU hot path (ATOM_HISPARSE_FUSED=1) is
+#     sync-free and reads fixed-address metadata, so it captures/replays.
 #   - small --max-num-seqs / --max-model-len: the cold pool is sized
 #     max_num_seqs × max_model_len × num_layers × 576B; defaults would OOM.
 #   - ATOM_HISPARSE_ENABLE=1 (decode node only).
@@ -51,8 +51,8 @@ nohup python -m atom.entrypoints.openai_server \
   --kv-transfer-config "{\"kv_role\":\"kv_producer\",\"kv_connector\":\"mooncake\",\"handshake_port\":$HANDSHAKE_PORT,\"proxy_ip\":\"127.0.0.1\"}" \
   > /tmp/prefill.log 2>&1 &
 
-# ── decode: TP4 on GPU 4-7, EAGER + HiSparse ────────────────────────
-echo ">>> Starting decode (TP4, eager, HiSparse) on GPU 4-7 ..."
+# ── decode: TP4 on GPU 4-7, CUDAGraph (level 3) + HiSparse ──────────
+echo ">>> Starting decode (TP4, level 3 CUDAGraph, HiSparse) on GPU 4-7 ..."
 AITER_LOG_LEVEL=WARNING \
 AITER_QUICK_REDUCE_QUANTIZATION=INT4 \
 AITER_USE_FLYDSL_MOE_SORTING=1 \
@@ -61,7 +61,7 @@ ATOM_HISPARSE_HOT_BUFFER_SIZE=$HS_HOT_BUFFER_SIZE \
 HIP_VISIBLE_DEVICES=4,5,6,7 \
 nohup python -m atom.entrypoints.openai_server \
   --model "$MODEL" --server-port "$DECODE_PORT" --trust-remote-code \
-  -tp 4 --level 0 \
+  -tp 4 --level 3 \
   --max-num-seqs $HS_MAX_NUM_SEQS --max-model-len $HS_MAX_MODEL_LEN \
   --kv_cache_dtype fp8 --gpu-memory-utilization 0.85 \
   --enable_prefix_caching \

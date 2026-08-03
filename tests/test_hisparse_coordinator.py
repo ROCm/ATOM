@@ -9,6 +9,7 @@ bookkeeping, and the coordinator is built with ``device='cpu'`` so no HIP kernel
 compiles. Data-movement correctness is left to on-GPU validation.
 """
 
+import pytest
 import torch
 
 from atom.hisparse.coordinator import _EMPTY, HiSparseCoordinator
@@ -197,6 +198,82 @@ def test_sync_active_releases_departed_requests():
     assert c.is_registered(11)
     assert not c.is_registered(10) and not c.is_registered(12)
     assert sorted(c._free_slots) == sorted(set(range(4)) - {c.slot_for_req(11)})
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="fused swap kernel needs a GPU + aiter"
+)
+def test_fused_swap_data_movement_matches_cold_pool():
+    """End-to-end fused path: every translated hot row holds its top-k's cold KV.
+
+    Eviction policy is free to differ from the reference; the observable invariant
+    is that after swap-in the hot buffer row each top-k resolves to contains the
+    cold-pool data for that logical token.
+    """
+    dev = "cuda"
+    L, R, H, C, D = 1, 1, 4, 32, 8
+    c = HiSparseCoordinator(
+        num_layers=L,
+        max_num_seqs=R,
+        hot_buffer_size=H,
+        max_context_len=C,
+        kv_dim=D,
+        kv_dtype=torch.bfloat16,
+        device=dev,
+    )
+    for t in range(C):  # cold pool row for token t is the constant t
+        c.cold_pool[0, t] = torch.full((D,), float(t), dtype=torch.bfloat16)
+    c.acquire(req_id=1, context_len=10)  # -> slot 0
+    c.load_initial_hot_set(0, 10)
+
+    K = 3
+    for step in ([9, 8, 7], [6, 9, 5], [9, 8, 4], [3, 2, 1]):
+        topk = torch.tensor([step], dtype=torch.int32, device=dev)
+        indptr = torch.tensor([0, K], dtype=torch.int32, device=dev)
+        req_slots = torch.tensor([0], dtype=torch.int32, device=dev)
+        out = torch.zeros(K, dtype=torch.int32, device=dev)
+        c.swap_in_for_layer_fused(0, topk, indptr, req_slots, out)
+        torch.cuda.synchronize()
+        for k, tok in enumerate(step):
+            row = c.hot_buffer[0, int(out[k].item())].float()
+            expected = torch.full((D,), float(tok), device=dev).float()
+            assert torch.allclose(row, expected), (step, k, tok, row[0].item())
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="fused backup kernel needs a GPU + aiter"
+)
+def test_fused_backup_makes_new_token_resident():
+    dev = "cuda"
+    L, R, H, C, D = 1, 1, 4, 32, 8
+    c = HiSparseCoordinator(
+        num_layers=L,
+        max_num_seqs=R,
+        hot_buffer_size=H,
+        max_context_len=C,
+        kv_dim=D,
+        kv_dtype=torch.bfloat16,
+        device=dev,
+    )
+    c.acquire(req_id=1, context_len=5)
+    c.load_initial_hot_set(0, 5)
+    # A fresh token at logical pos 5 lives at physical slot 5 of the layer cache.
+    layer_kv = torch.zeros(64, D, dtype=torch.bfloat16, device=dev)
+    layer_kv[5] = torch.full((D,), 42.0, dtype=torch.bfloat16)
+    c.backup_new_tokens_fused(
+        0,
+        layer_kv,
+        torch.tensor([5], dtype=torch.int32, device=dev),  # src slot
+        torch.tensor([0], dtype=torch.int32, device=dev),  # req slot
+        torch.tensor([5], dtype=torch.int32, device=dev),  # logical pos
+    )
+    torch.cuda.synchronize()
+    slot = int(c.token_to_slot[0, 0, 5].item())
+    assert slot >= 0
+    assert torch.allclose(
+        c.hot_buffer[0, slot].float(), torch.full((D,), 42.0, device=dev).float()
+    )
+    assert torch.allclose(c.cold_pool[0, 5].float(), torch.full((D,), 42.0).float())
 
 
 def test_mtp_multi_token_batch_translate():

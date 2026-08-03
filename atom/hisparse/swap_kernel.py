@@ -1,36 +1,47 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-"""JIT-compiled HIP gather kernel for HiSparse swap-in.
+"""HiSparse swap-in kernels — thin shim over the aiter ``module_hisparse_swap`` op.
 
-A single GPU kernel gathers scattered top-k tokens directly from pinned host
-memory (cold pool) into the GPU hot buffer over PCIe/XGMI — no staging buffer,
-no cudaMemcpy. One wavefront64 copies one token's ``item_size_bytes`` word-wise,
-mirroring SGLang's ``transfer_item_warp`` (ROCm branch) in ``hisparse.cuh``.
+The fused decode hot path (miss-detect + LRU evict + swap + translate) and the
+new-token backup live in aiter (``aiter/csrc/py_itfs_cu/hisparse_swap_kernels.cu``),
+JIT-compiled and cached on first call. This module re-exports the four ops so the
+coordinator imports from one place, and keeps a ``load_inline`` fallback for the
+two simple functions (device-pointer translation + plain gather) when the aiter
+build is unavailable.
 
 On this platform ``XNACK`` is disabled (``gfx950 ... xnack-``), so a GPU kernel
-cannot dereference a raw host VA — it faults. The cold-pool pinned tensor must
-first be translated with ``hipHostGetDevicePointer`` and the returned
-device-mapped pointer passed to the kernel. ``host_get_device_pointer`` exposes
-that translation; the coordinator caches the result once per cold-pool tensor.
+cannot dereference a raw host VA. Cold-pool pointers must be translated with
+``host_get_device_pointer`` (``hipHostGetDevicePointer``) and the mapped pointer
+passed to the kernels; the coordinator caches the result once per cold pool.
 """
 
 import torch
 
-_SWAP_MODULE = None  # None = not attempted, False = unavailable, else module
+_FALLBACK_MODULE = None  # None = not attempted, False = unavailable, else module
 
 
-# Written in CUDA idiom; torch's cpp_extension runs hipify on ROCm, translating
-# cuda* -> hip* (including cudaHostGetDevicePointer -> hipHostGetDevicePointer).
+def _aiter():
+    """Return the aiter hisparse ops module, or None if aiter is unavailable."""
+    try:
+        import aiter
+
+        return aiter
+    except ImportError:
+        return None
+
+
+# Fallback: the Phase-0 load_inline gather (device-ptr translation + plain gather).
+# Only used if aiter cannot be imported. Written in CUDA idiom; torch's
+# cpp_extension runs hipify on ROCm (cuda* -> hip*).
 _HIP_SOURCE = r"""
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
 #include <cstdint>
 
-constexpr int WARP_SIZE = 64;  // wavefront64 on gfx950
+constexpr int WARP_SIZE = 64;
 
-// Word-wise warp copy, mirrors transfer_item_warp (ROCm branch) in hisparse.cuh
 __device__ __forceinline__ void transfer_item_warp(
     int lane_id, const void* __restrict__ src_addr,
     void* __restrict__ dst_addr, int64_t item_size_bytes) {
@@ -40,7 +51,7 @@ __device__ __forceinline__ void transfer_item_warp(
   const auto* src_words = reinterpret_cast<const uint64_t*>(src);
   auto* dst_words = reinterpret_cast<uint64_t*>(dst);
   for (int64_t i = lane_id; i < word_count; i += WARP_SIZE) {
-    dst_words[i] = src_words[i];  // reads pinned HOST memory over the bus
+    dst_words[i] = src_words[i];
   }
   const int64_t tail = word_count * (int64_t)sizeof(uint64_t);
   for (int64_t i = tail + lane_id; i < item_size_bytes; i += WARP_SIZE) {
@@ -48,12 +59,9 @@ __device__ __forceinline__ void transfer_item_warp(
   }
 }
 
-// One warp per miss token. host_cache is a device-mapped host pointer.
 __global__ void hisparse_gather_kernel(
-    const char* __restrict__ host_cache,   // device-mapped pinned host memory
-    char* __restrict__ device_buffer,      // device HBM
-    const int32_t* __restrict__ src_locs,  // scattered host token slots
-    const int32_t* __restrict__ dst_locs,  // scattered device buffer slots
+    const char* __restrict__ host_cache, char* __restrict__ device_buffer,
+    const int32_t* __restrict__ src_locs, const int32_t* __restrict__ dst_locs,
     int num_misses, int64_t item_size_bytes) {
   const int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
   const int lane_id = threadIdx.x % WARP_SIZE;
@@ -66,9 +74,6 @@ __global__ void hisparse_gather_kernel(
   }
 }
 
-// Translate a pinned host allocation to a device-mapped pointer (int64 VA).
-// xnack- environment: the kernel faults on a raw host VA, so callers must feed
-// the mapped pointer this returns instead of tensor.data_ptr().
 int64_t host_get_device_pointer(at::Tensor pinned_host_tensor) {
   TORCH_CHECK(pinned_host_tensor.is_pinned(),
               "host_get_device_pointer: tensor must be pinned host memory");
@@ -81,25 +86,13 @@ int64_t host_get_device_pointer(at::Tensor pinned_host_tensor) {
 }
 
 void hisparse_swap_in(
-    int64_t host_cache_dev_ptr,  // from host_get_device_pointer
-    at::Tensor device_buffer,    // CUDA, contiguous, row = item_size_bytes
-    at::Tensor src_locs,         // CUDA int32 [num_misses]
-    at::Tensor dst_locs,         // CUDA int32 [num_misses]
-    int64_t item_size_bytes) {
+    int64_t host_cache_dev_ptr, at::Tensor device_buffer,
+    at::Tensor src_locs, at::Tensor dst_locs, int64_t item_size_bytes) {
   const int num_misses = (int)src_locs.numel();
   if (num_misses == 0) return;
-  TORCH_CHECK(device_buffer.is_cuda(), "device_buffer must be CUDA");
-  TORCH_CHECK(src_locs.is_cuda() && dst_locs.is_cuda(),
-              "src_locs/dst_locs must be CUDA");
-  TORCH_CHECK(src_locs.scalar_type() == at::kInt &&
-                  dst_locs.scalar_type() == at::kInt,
-              "src_locs/dst_locs must be int32");
-  TORCH_CHECK(dst_locs.numel() == num_misses, "src/dst length mismatch");
-
   const char* host_cache = reinterpret_cast<const char*>(host_cache_dev_ptr);
   char* dev_buf = reinterpret_cast<char*>(device_buffer.data_ptr());
-
-  const int block = 256;  // 4 warps/block
+  const int block = 256;
   const int grid = (num_misses * WARP_SIZE + block - 1) / block;
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   hisparse_gather_kernel<<<dim3(grid), dim3(block), 0, stream>>>(
@@ -108,12 +101,6 @@ void hisparse_swap_in(
 }
 """
 
-
-# Explicit pybind glue (main.cpp, host c++). We bind the functions ourselves
-# instead of via load_inline's `functions=` (which routes through
-# torch::wrap_pybind_function and injects a cross-arg device guard that rejects
-# our int-pointer + device-tensor signature). Forward-declare the definitions
-# that live in the hipcc-compiled cuda_sources.
 _CPP_GLUE = r"""
 #include <torch/extension.h>
 #include <cstdint>
@@ -128,32 +115,33 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 """
 
 
-def _get_swap_module():
-    """Lazily JIT-compile the HIP swap kernel. Returns the module or None."""
-    global _SWAP_MODULE
-    if _SWAP_MODULE is not None:
-        return _SWAP_MODULE or None
-
+def _fallback():
+    """Lazily JIT-compile the load_inline fallback module (or None)."""
+    global _FALLBACK_MODULE
+    if _FALLBACK_MODULE is not None:
+        return _FALLBACK_MODULE or None
     from torch.utils.cpp_extension import load_inline
 
-    _SWAP_MODULE = load_inline(
-        name="atom_hisparse_swap",
+    _FALLBACK_MODULE = load_inline(
+        name="atom_hisparse_swap_fallback",
         cpp_sources=[_CPP_GLUE],
         cuda_sources=[_HIP_SOURCE],
         with_cuda=True,
         verbose=False,
     )
-    return _SWAP_MODULE
+    return _FALLBACK_MODULE
 
 
 def host_get_device_pointer(pinned_host_tensor: torch.Tensor) -> int:
     """Translate a pinned host tensor to a device-mapped pointer (int VA).
 
-    Required before feeding a cold-pool pointer to :func:`hisparse_swap_in` on
-    this xnack- platform. Cache the result — the mapping is stable for the
-    lifetime of the allocation.
+    Required before feeding a cold-pool pointer to the swap kernels on this
+    xnack- platform. Cache the result — the mapping is stable for the allocation.
     """
-    return _get_swap_module().host_get_device_pointer(pinned_host_tensor)
+    a = _aiter()
+    if a is not None:
+        return a.hisparse_host_get_device_pointer(pinned_host_tensor)
+    return _fallback().host_get_device_pointer(pinned_host_tensor)
 
 
 def hisparse_swap_in(
@@ -163,21 +151,104 @@ def hisparse_swap_in(
     dst_locs: torch.Tensor,
     item_size_bytes: int,
 ) -> None:
-    """Gather scattered tokens from pinned host cold pool into the GPU hot buffer.
+    """Gather scattered tokens from the pinned host cold pool into the hot buffer.
 
-    One wavefront64 per miss token, word-wise copy. Launches on the current HIP
-    stream (CUDAGraph-capturable: fixed device_buffer address, no allocation).
-
-    Args:
-        host_cache_dev_ptr: device-mapped pointer for one layer's cold pool,
-            from :func:`host_get_device_pointer`.
-        device_buffer: one layer's GPU hot buffer, contiguous, each row spanning
-            ``item_size_bytes``.
-        src_locs: int32 CUDA tensor of cold-pool token slots to read.
-        dst_locs: int32 CUDA tensor of hot-buffer slots to write (paired with
-            ``src_locs``).
-        item_size_bytes: bytes per token per layer (kv_dim * dtype.itemsize).
+    One wavefront64 per miss token, word-wise copy, on the current HIP stream.
     """
-    _get_swap_module().hisparse_swap_in(
-        host_cache_dev_ptr, device_buffer, src_locs, dst_locs, item_size_bytes
+    a = _aiter()
+    if a is not None:
+        a.hisparse_swap_in(
+            host_cache_dev_ptr,
+            device_buffer,
+            src_locs.to(torch.int32),
+            dst_locs.to(torch.int32),
+            item_size_bytes,
+        )
+        return
+    _fallback().hisparse_swap_in(
+        host_cache_dev_ptr,
+        device_buffer,
+        src_locs.to(torch.int32),
+        dst_locs.to(torch.int32),
+        item_size_bytes,
+    )
+
+
+def hisparse_swap_and_translate(
+    cold_pool_dev_ptr: int,
+    hot_buffer: torch.Tensor,
+    topk_logical: torch.Tensor,
+    indptr: torch.Tensor,
+    req_slots: torch.Tensor,
+    slot_token: torch.Tensor,
+    last_used: torch.Tensor,
+    token_to_slot: torch.Tensor,
+    recency: torch.Tensor,
+    out_translated: torch.Tensor,
+    item_size_bytes: int,
+    hot_slots: int,
+    cold_depth: int,
+    topk: int,
+) -> None:
+    """Fused per-layer decode hot path (aiter). See the aiter op for semantics."""
+    a = _aiter()
+    if a is None:
+        raise RuntimeError(
+            "hisparse_swap_and_translate requires the aiter module_hisparse_swap "
+            "op; aiter could not be imported."
+        )
+    a.hisparse_swap_and_translate(
+        cold_pool_dev_ptr,
+        hot_buffer,
+        topk_logical,
+        indptr,
+        req_slots,
+        slot_token,
+        last_used,
+        token_to_slot,
+        recency,
+        out_translated,
+        item_size_bytes,
+        hot_slots,
+        cold_depth,
+        topk,
+    )
+
+
+def hisparse_backup_new_token(
+    cold_pool_dev_ptr: int,
+    hot_buffer: torch.Tensor,
+    layer_kv: torch.Tensor,
+    src_slots: torch.Tensor,
+    req_slots: torch.Tensor,
+    logical_pos: torch.Tensor,
+    slot_token: torch.Tensor,
+    last_used: torch.Tensor,
+    token_to_slot: torch.Tensor,
+    recency: torch.Tensor,
+    item_size_bytes: int,
+    hot_slots: int,
+    cold_depth: int,
+) -> None:
+    """Batched new-token backup for one layer (aiter). See the aiter op."""
+    a = _aiter()
+    if a is None:
+        raise RuntimeError(
+            "hisparse_backup_new_token requires the aiter module_hisparse_swap "
+            "op; aiter could not be imported."
+        )
+    a.hisparse_backup_new_token(
+        cold_pool_dev_ptr,
+        hot_buffer,
+        layer_kv,
+        src_slots,
+        req_slots,
+        logical_pos,
+        slot_token,
+        last_used,
+        token_to_slot,
+        recency,
+        item_size_bytes,
+        hot_slots,
+        cold_depth,
     )

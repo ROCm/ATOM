@@ -357,6 +357,16 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 dtype=torch.int32,
                 device=self.device,
             )
+            # HiSparse per-query-token metadata as fixed-address buffers so the
+            # fused hot path reads them under a captured CUDAGraph (a fresh
+            # per-step .to("cuda") would bind a stale address at replay). Stored
+            # in the kernel's int32 domain so the dispatcher reads them directly.
+            self._hisparse_req_slots = CpuGpuBuffer(
+                self.max_num_batched_tokens, **i32_kwargs
+            )
+            self._hisparse_token_pos = CpuGpuBuffer(
+                self.max_num_batched_tokens, **i32_kwargs
+            )
 
         # Per-ubatch buffers for CUDAGraph TBO
         if config.enable_tbo:
@@ -1529,23 +1539,31 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             and all(coord.is_registered(rid) for rid in batch.req_ids)
         ):
             n_tok = bs * max_seqlen_q if max_seqlen_q > 1 else bs
-            slots = torch.zeros(n_tok, dtype=torch.int32)
-            # logical position of each query token (the position written this step)
-            token_pos = torch.zeros(n_tok, dtype=torch.int64)
+            slots = self._hisparse_req_slots.np
+            # logical position of each query token (the position written this step).
+            # -1 marks graph-padding query tokens so the fused backup kernel skips
+            # them (they would otherwise corrupt request slot 0's cold pool).
+            pos = self._hisparse_token_pos.np
+            slots[:n_tok] = 0
+            pos[:n_tok] = -1
             per_seq = [coord.slot_for_req(rid) for rid in batch.req_ids]
             for s in range(scheduled_bs):
                 ctx_s = int(context_lens[s])
                 if max_seqlen_q > 1:
                     sl = slice(s * max_seqlen_q, (s + 1) * max_seqlen_q)
                     slots[sl] = per_seq[s]
-                    token_pos[sl] = torch.arange(
-                        ctx_s - max_seqlen_q, ctx_s, dtype=torch.int64
-                    )
+                    pos[sl] = np.arange(ctx_s - max_seqlen_q, ctx_s, dtype=np.int32)
                 else:
                     slots[s] = per_seq[s]
-                    token_pos[s] = ctx_s - 1
-            attn_metadata.hisparse_req_slots = slots
-            attn_metadata.hisparse_token_pos = token_pos
+                    pos[s] = ctx_s - 1
+            # Copy into the fixed-address GPU buffers (pinned staging, non-blocking)
+            # so the captured fused hot path reads fresh values on every replay.
+            attn_metadata.hisparse_req_slots = self._hisparse_req_slots.copy_to_gpu(
+                n_tok
+            )
+            attn_metadata.hisparse_token_pos = self._hisparse_token_pos.copy_to_gpu(
+                n_tok
+            )
 
         # Use bs (graph_bs) >= 2 instead of scheduled_bs >= 2 to avoid accuracy issue:
         if self.model_runner.config.enable_tbo_decode and bs >= 2:

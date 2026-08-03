@@ -990,6 +990,52 @@ class MLAAttention(nn.Module):
         sparse_kv_indptr: torch.Tensor,
         hs_slots: torch.Tensor,
     ) -> torch.Tensor:
+        """Dispatch to the fused GPU hot path, or the reference path for MTP/debug.
+
+        The fused path (default on GPU, single query token per request) runs the
+        whole per-layer step — new-token backup, miss-detect, LRU evict, swap-in,
+        translate — in two aiter kernels with no host sync (CUDAGraph-capturable).
+        MTP verify (``max_seqlen_q > 1``), CPU, or ``ATOM_HISPARSE_FUSED=0`` fall
+        back to the Phase-0 reference, which is always correct.
+        """
+        coord = self._hisparse_coord
+        layer_id = self._hisparse_layer_id
+        n = int(sparse_kv_indptr.shape[0]) - 1
+
+        use_fused = (
+            coord.hot_buffer.is_cuda
+            and envs.ATOM_HISPARSE_FUSED
+            and attn_metadata.max_seqlen_q == 1
+        )
+        if use_fused:
+            # req_slots / token_pos / indptr already live in the kernel's int32
+            # domain as fixed-address persistent buffers — slice (a view, no
+            # allocation) so the captured graph stays capture-stable.
+            req_slots = hs_slots[:n]
+            src_slots = attn_metadata.slot_mapping[:n].to(torch.int32)
+            logical_pos = attn_metadata.hisparse_token_pos[:n]
+            topk = coord.topk_buffer[:n]
+            indptr = sparse_kv_indptr[: n + 1]
+            # Backup the current token first so the indexer can select its own
+            # position, then swap in the top-k and translate in place.
+            coord.backup_new_tokens_fused(
+                layer_id, kv_layer, src_slots, req_slots, logical_pos
+            )
+            coord.swap_in_for_layer_fused(
+                layer_id, topk, indptr, req_slots, self.sparse_kv_indices_buffer
+            )
+            return coord.hot_buffer[layer_id].unsqueeze(1).unsqueeze(1)
+        return self._hisparse_reference_swap(
+            kv_layer, attn_metadata, sparse_kv_indptr, hs_slots
+        )
+
+    def _hisparse_reference_swap(
+        self,
+        kv_layer: torch.Tensor,
+        attn_metadata: AttentionMetaData,
+        sparse_kv_indptr: torch.Tensor,
+        hs_slots: torch.Tensor,
+    ) -> torch.Tensor:
         """Make this layer's hot buffer hold the selected top-k, translate indices.
 
         Per decode query token: (1) back up the just-written current-token KV

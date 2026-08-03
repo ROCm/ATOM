@@ -85,13 +85,24 @@ class HiSparseCoordinator:
         # a raw host VA faults). Filled lazily on first swap.
         self._cold_dev_ptr: list[int | None] = [None] * num_layers
 
-        # Per (layer, request, slot) bookkeeping — CPU, small (4 bytes/slot).
+        # Per (layer, request, slot) bookkeeping. Lives on ``device`` so the
+        # fused swap kernel reads/writes it without any host sync; the pure-Python
+        # reference path (CPU tests, debug bisection) uses the same tensors.
         # slot_token: logical token ID resident in each hot slot (-1 empty).
-        self.slot_token = torch.full((num_layers, R, H1), _EMPTY, dtype=torch.int32)
+        self.slot_token = torch.full(
+            (num_layers, R, H1), _EMPTY, dtype=torch.int32, device=self.device
+        )
         # last_used: recency tick per slot (-1 empty); LRU victim = smallest.
-        self.last_used = torch.full((num_layers, R, H1), _EMPTY, dtype=torch.int64)
+        self.last_used = torch.full(
+            (num_layers, R, H1), _EMPTY, dtype=torch.int64, device=self.device
+        )
         # token_to_slot: reverse map logical token -> hot slot (-1 not resident).
-        self.token_to_slot = torch.full((num_layers, R, C), _EMPTY, dtype=torch.int32)
+        self.token_to_slot = torch.full(
+            (num_layers, R, C), _EMPTY, dtype=torch.int32, device=self.device
+        )
+        # Per-request monotonic recency counter for the fused kernel (the GPU
+        # analogue of ``self._tick``); advanced on-device per swap/backup.
+        self.recency = torch.zeros(R, dtype=torch.int64, device=self.device)
 
         # Per-request context length (logical tokens currently staged).
         self.context_len = torch.zeros(max_num_seqs, dtype=torch.int64)
@@ -133,6 +144,7 @@ class HiSparseCoordinator:
         self.slot_token[:, req_slot, :] = _EMPTY
         self.last_used[:, req_slot, :] = _EMPTY
         self.token_to_slot[:, req_slot, :] = _EMPTY
+        self.recency[req_slot] = 0
         return req_slot
 
     def unregister_request(self, req_slot: int) -> None:
@@ -239,9 +251,14 @@ class HiSparseCoordinator:
         if h == 0:
             return
         start_tok = num_tokens - h  # most-recent window
-        tokens = torch.arange(start_tok, num_tokens, dtype=torch.int32)
-        slots = torch.arange(h, dtype=torch.int32)  # hot slots 0..h-1
+        tokens = torch.arange(
+            start_tok, num_tokens, dtype=torch.int32, device=self.device
+        )
+        slots = torch.arange(h, dtype=torch.int32, device=self.device)  # hot 0..h-1
         self._tick += 1
+        # Seed the fused kernel's recency so its on-device ticks continue strictly
+        # above the initial hot set (all initial tokens share this baseline tick).
+        self.recency[req_slot] = self._tick
         cold_base = self._cold_base(req_slot)
         hot_base = self._hot_base(req_slot)
         for layer_id in range(self.num_layers):
@@ -250,8 +267,8 @@ class HiSparseCoordinator:
             self.last_used[layer_id, req_slot, :h] = self._tick
             self.token_to_slot[layer_id, req_slot, start_tok:num_tokens] = slots
             # data movement: cold[cold_base+tok] -> hot[hot_base+slot]
-            src = (cold_base + tokens).to(self.device)
-            dst = (hot_base + slots).to(self.device)
+            src = cold_base + tokens
+            dst = hot_base + slots
             self._run_swap(layer_id, src, dst)
 
     # ------------------------------------------------------------------
@@ -381,6 +398,78 @@ class HiSparseCoordinator:
             src_locs.to(torch.int32),
             dst_locs.to(torch.int32),
             self.item_size_bytes,
+        )
+
+    # ------------------------------------------------------------------
+    # fused GPU hot path (production) — no host sync, CUDAGraph-capturable
+    # ------------------------------------------------------------------
+    def swap_in_for_layer_fused(
+        self,
+        layer_id: int,
+        topk_logical: torch.Tensor,
+        indptr: torch.Tensor,
+        req_slots: torch.Tensor,
+        out_translated: torch.Tensor,
+    ) -> None:
+        """Fused miss-detect + LRU evict + swap-in + translate for one layer.
+
+        All arguments are GPU tensors; the kernel does its own per-request work so
+        the launch shape is fixed. ``topk_logical`` is ``[n, K]`` (logical top-k per
+        decode query token), ``indptr`` bounds each query token's run in
+        ``out_translated`` (hot-buffer absolute rows written in place). Requires one
+        query token per request (non-MTP); MTP uses the reference path.
+        """
+        from atom.hisparse.swap_kernel import hisparse_swap_and_translate
+
+        host_ptr = self._ensure_cold_dev_ptr(layer_id)
+        hisparse_swap_and_translate(
+            host_ptr,
+            self.hot_buffer[layer_id],
+            topk_logical,
+            indptr,
+            req_slots,
+            self.slot_token[layer_id],
+            self.last_used[layer_id],
+            self.token_to_slot[layer_id],
+            self.recency,
+            out_translated,
+            self.item_size_bytes,
+            self.padded_hot_size,
+            self.max_context_len,
+            topk_logical.shape[1],
+        )
+
+    def backup_new_tokens_fused(
+        self,
+        layer_id: int,
+        layer_kv: torch.Tensor,
+        src_slots: torch.Tensor,
+        req_slots: torch.Tensor,
+        logical_pos: torch.Tensor,
+    ) -> None:
+        """Persist every decode query token's freshly written KV for one layer.
+
+        ``layer_kv`` is this layer's KV cache flattened to ``[num_slots, kv_dim]``;
+        ``src_slots[i]`` is the physical row of query token ``i`` (its slot_mapping
+        entry). Writes cold pool at ``logical_pos[i]`` and a fresh hot slot. All GPU.
+        """
+        from atom.hisparse.swap_kernel import hisparse_backup_new_token
+
+        host_ptr = self._ensure_cold_dev_ptr(layer_id)
+        hisparse_backup_new_token(
+            host_ptr,
+            self.hot_buffer[layer_id],
+            layer_kv.reshape(-1, self.kv_dim),
+            src_slots,
+            req_slots,
+            logical_pos,
+            self.slot_token[layer_id],
+            self.last_used[layer_id],
+            self.token_to_slot[layer_id],
+            self.recency,
+            self.item_size_bytes,
+            self.padded_hot_size,
+            self.max_context_len,
         )
 
     # ------------------------------------------------------------------
