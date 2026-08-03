@@ -62,6 +62,7 @@ def chunk_kda_paged(
     Returns ``(o, final_state, h)``. ``h`` is the per-chunk intermediates the
     state cache slices interior checkpoints from, or None when not requested.
     """
+    from fla.modules.l2norm import l2norm_fwd
     from fla.ops.common.gate import fused_beta_sigmoid
     from fla.ops.gla.chunk import chunk_gla_fwd_o_gk
     from fla.ops.kda.chunk_intra import chunk_kda_fwd_intra
@@ -76,6 +77,15 @@ def chunk_kda_paged(
         if cu_seqlens is not None
         else None
     )
+
+    # `use_qk_l2norm_in_kernel=True` upstream, and the model passes it on the
+    # non-paged path. ChunkKDAFunction.forward applies this BEFORE
+    # chunk_kda_fwd, so reusing fla's stages directly means doing it here —
+    # omitting it is silent: q/k just carry their raw magnitudes into the
+    # delta rule and every prefill under the state cache is wrong by ~27%
+    # relative, with no error anywhere.
+    q, _ = l2norm_fwd(q)
+    k, _ = l2norm_fwd(k)
 
     # Gate activation + chunk cumsum, fused as the model expects
     # (`use_gate_in_kernel=True` in KimiKDAAttention._run_kda).

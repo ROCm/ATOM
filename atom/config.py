@@ -36,6 +36,38 @@ logger = logging.getLogger("atom")
 # error; off-grid splits are correct but only to ~3e-3 (below bf16 eps).
 SSM_STATE_KERNEL_CHUNK = 64
 
+# Model types whose layers carry a linear-attention recurrence and so implement
+# the state-checkpoint machinery in `gdn_attn.GDNStateMixin`. Drives the SSM
+# state cache auto-enable in `Config.__post_init__`.
+#
+# Narrower than `InputOutputProcessor._per_req_cache_model_types()`, which also
+# covers per-request state that is not a recurrence and cannot be checkpointed.
+# Every entry here must also appear in that set, or its sequences get no state
+# slot at all; `tests/test_ssm_state_cache_sizing.py` pins the containment.
+LINEAR_ATTENTION_MODEL_TYPES = frozenset(
+    {
+        "qwen3_next",
+        "qwen3_5_text",
+        "qwen3_5_moe_text",
+        "kimi_linear",
+    }
+)
+
+
+def is_linear_attention_config(hf_config: PretrainedConfig) -> bool:
+    """Whether this model's layers carry a linear-attention recurrence.
+
+    Checks `text_config` as well as the root: multimodal wrappers keep the
+    linear-attention `model_type` on the text sub-config, and `get_hf_config`
+    does not reliably copy `model_type` up to the root.
+    """
+    for cfg in (hf_config, getattr(hf_config, "text_config", None)):
+        if cfg is None:
+            continue
+        if getattr(cfg, "model_type", None) in LINEAR_ATTENTION_MODEL_TYPES:
+            return True
+    return False
+
 
 @dataclass
 class KVCacheTensor:
@@ -1313,9 +1345,20 @@ class Config:
     enable_prefix_caching: bool = True
     enable_chunked_prefill: bool = True
     # Recurrent-state (SSM/conv) checkpoint cache for linear-attention models.
-    # See atom/model_engine/state_cache.py. Off by default (experimental).
+    # See atom/model_engine/state_cache.py.
+    #
+    # Derived in `__post_init__`, not configurable: on for a linear-attention
+    # model when prefix caching is on and the KV block size divides
+    # SSM_STATE_KERNEL_CHUNK. --no-enable_prefix_caching turns it off.
     enable_ssm_state_cache: bool = False
-    ssm_state_cache_granularity: int = 64
+    # Fraction of the KV capacity remaining after the per-request runtime state
+    # tensor to spend on recurrent-state checkpoints. A ratio rather than a
+    # slot count because a checkpoint holds a whole-model state snapshot, so
+    # the memory a given count costs is model-specific.
+    ssm_state_cache_ratio: float = 0.3
+    # Derived from `ssm_state_cache_ratio`, not configurable. Computed in the
+    # runner subprocess (ModelRunner.get_num_blocks) and returned via
+    # block_info, so reading it before then yields 0.
     ssm_state_cache_slots: int = 0
     port: int = 8006
     torch_profiler_dir: str | None = field(
@@ -1403,6 +1446,18 @@ class Config:
                 ]
             elif len(cuda_graph_sizes) > 1:
                 self.graph_bs = cuda_graph_sizes
+
+    @property
+    def ssm_state_cache_granularity(self) -> int:
+        """Token grid state checkpoints land on. Not configurable.
+
+        Split-and-replay through a checkpoint is bit-exact only on the
+        linear-attention kernel's chunk grid, and any coarser multiple of it is
+        a subset of that grid's positions -- so it can only lose prefix hits,
+        never gain one. That leaves `SSM_STATE_KERNEL_CHUNK` as the sole good
+        value, hence a property rather than a flag.
+        """
+        return SSM_STATE_KERNEL_CHUNK
 
     def __post_init__(self):
         if self.index_cache_dtype is None:
@@ -1631,37 +1686,48 @@ class Config:
             if self.kv_cache_block_size != v4_block_size:
                 self.kv_cache_block_size = v4_block_size
 
-        # SSM state cache. Validated LAST: kv_cache_block_size may have just
-        # been rewritten above, and an earlier check would validate a stale
+        # SSM state cache. Resolved LAST: kv_cache_block_size may have just been
+        # rewritten above, and an earlier check would decide against a stale
         # value.
+        #
+        # The cache is a precondition of prefix caching on a linear-attention
+        # model, not a companion to it: BlockManager.can_allocate declines every
+        # KV hit for such a model unless the pool is there to clamp the hit to a
+        # published checkpoint. So derive it rather than making the user pair
+        # two flags.
+        if self.enable_prefix_caching and is_linear_attention_config(self.hf_config):
+            # Two requirements, one check: block_size > 64 floors `blocks_per_
+            # ckpt` to 0 (nothing is ever checkpointed), and a block size that
+            # does not divide the grid puts checkpoint positions off the KV
+            # block boundaries the hit length is expressed in.
+            bs = self.kv_cache_block_size
+            if bs <= SSM_STATE_KERNEL_CHUNK and SSM_STATE_KERNEL_CHUNK % bs == 0:
+                logger.info(
+                    "Linear-attention model (%s) with prefix caching: enabling "
+                    "the SSM state cache, which is what makes a prefix hit "
+                    "legal for a recurrent model.",
+                    getattr(self.hf_config, "model_type", "?"),
+                )
+                self.enable_ssm_state_cache = True
+            else:
+                # Warn rather than raise: the run stays correct, it just gets no
+                # prefix reuse.
+                logger.warning(
+                    "Linear-attention model (%s) with prefix caching, but "
+                    "--block-size %d does not divide the kernel chunk grid "
+                    "(%d), so the SSM state cache cannot be enabled and "
+                    "every prefix hit will be declined (correct, but no "
+                    "reuse). Use --block-size 16, 32, or 64 to get it.",
+                    getattr(self.hf_config, "model_type", "?"),
+                    bs,
+                    SSM_STATE_KERNEL_CHUNK,
+                )
+
         if self.enable_ssm_state_cache:
-            g = self.ssm_state_cache_granularity
-            if g <= 0:
+            if not 0.0 < self.ssm_state_cache_ratio <= 1.0:
                 raise ValueError(
-                    f"ssm_state_cache_granularity ({g}) must be positive."
-                )
-            if g % self.kv_cache_block_size != 0:
-                # A checkpoint position must be a KV block boundary, or
-                # "KV hit >= position" cannot be expressed and the state and
-                # KV caches cannot be kept consistent.
-                raise ValueError(
-                    f"ssm_state_cache_granularity ({g}) must be a multiple of "
-                    f"kv_cache_block_size ({self.kv_cache_block_size})."
-                )
-            if g % SSM_STATE_KERNEL_CHUNK != 0:
-                # Split-and-replay via initial_state is bit-exact ONLY on the
-                # kernel's internal chunk grid (measured on fla 0.5.2:
-                # 0.0 error at multiples of 64, ~3e-3 off-grid).
-                raise ValueError(
-                    f"ssm_state_cache_granularity ({g}) must be a multiple of "
-                    f"the linear-attention kernel chunk size "
-                    f"({SSM_STATE_KERNEL_CHUNK}); state checkpoints are only "
-                    f"bit-exact on that grid."
-                )
-            if self.ssm_state_cache_slots < 0:
-                raise ValueError(
-                    f"ssm_state_cache_slots ({self.ssm_state_cache_slots}) "
-                    f"must be >= 0 (0 = auto)."
+                    f"ssm_state_cache_ratio ({self.ssm_state_cache_ratio}) "
+                    f"must be in (0, 1]."
                 )
 
     def compute_hash(self) -> str:

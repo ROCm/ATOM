@@ -41,6 +41,10 @@ def _copy_checkpoints_kernel(
     runtime_slots,  # [T] the row's runtime slot, the source when is_end
     chunk_offsets,  # [N + 1] first chunk index of each sequence in `h`
     cu_seqlens,  # [N + 1] first token of each sequence in `x`
+    stride_x_t,  # row (token) stride of `x`; NOT D — see write_state_checkpoints
+    stride_cd_s,  # conv_dst slot stride
+    stride_cd_d,  # conv_dst channel stride
+    stride_cd_l,  # conv_dst window-position stride
     HKV: tl.constexpr,  # H * K * V, one full recurrent state
     D: tl.constexpr,
     STATE_LEN: tl.constexpr,
@@ -86,9 +90,11 @@ def _copy_checkpoints_kernel(
         d = (i_blk - NBLK_SSM) * BLOCK + tl.arange(0, BLOCK)
         dmask = d < D
         for j in tl.static_range(STATE_LEN):
-            cv = tl.load(x + (end - STATE_LEN + j) * D + d, mask=dmask, other=0.0)
+            cv = tl.load(
+                x + (end - STATE_LEN + j) * stride_x_t + d, mask=dmask, other=0.0
+            )
             tl.store(
-                conv_dst + slot * D * STATE_LEN + d * STATE_LEN + j,
+                conv_dst + slot * stride_cd_s + d * stride_cd_d + j * stride_cd_l,
                 cv.to(conv_dst.dtype.element_ty),
                 mask=dmask,
             )
@@ -120,12 +126,20 @@ def write_state_checkpoints(
     intermediates (an interior position), 1 reads ``runtime_slots[i]`` (a
     position at the end of the row's tokens, which is only ever in the runtime
     slot). The conv half is the same window slice either way.
+
+    Neither conv tensor may be assumed contiguous, so the conv half indexes by
+    real strides. ``conv_state`` reaches us as a ``transpose(-1, -2)`` view of a
+    ``[slots, state_len, D]`` allocation, and ``x`` is a column slice of the
+    fused in-projection whose row stride is the *fused* width, not ``D``.
+    Deriving either from the shape writes a correctly-shaped checkpoint out of
+    the wrong bytes, which nothing downstream can detect.
     """
     n = rows.numel()
     if n == 0:
         return
     hkv = ssm_state.stride(0)
     d, state_len = conv_state.shape[1], conv_state.shape[2]
+    assert x.stride(-1) == 1, "conv input must be contiguous along the feature dim"
     BLOCK = 1024
     nblk_ssm = triton.cdiv(hkv, BLOCK)
     grid = (n, nblk_ssm + triton.cdiv(d, BLOCK))
@@ -141,6 +155,10 @@ def write_state_checkpoints(
         runtime_slots,
         chunk_offsets,
         cu_seqlens,
+        x.stride(0),
+        conv_state.stride(0),
+        conv_state.stride(1),
+        conv_state.stride(2),
         HKV=hkv,
         D=d,
         STATE_LEN=state_len,

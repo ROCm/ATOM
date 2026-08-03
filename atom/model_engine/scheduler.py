@@ -1523,7 +1523,8 @@ class Scheduler:
             # #45238 was a 0%-hit-rate collapse with nothing in the logs and
             # TTFT quietly doubling.
             pool = self.block_manager.state_cache
-            if pool is not None and self.cache_stats.total_requests % 100 == 0:
+            interval = envs.ATOM_SSM_STATE_CACHE_LOG_INTERVAL
+            if pool is not None and self.cache_stats.total_requests % interval == 0:
                 pool.log_summary()
         num_batched_tokens += chunk
         seq.status = SequenceStatus.RUNNING

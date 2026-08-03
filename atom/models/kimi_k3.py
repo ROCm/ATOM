@@ -761,7 +761,7 @@ class KimiKDAAttention(nn.Module):
             # Keep beta in fp32: fla computes b = sigmoid(beta) in-kernel with
             # use_beta_sigmoid_in_kernel, and triton's sigmoid follows the input
             # dtype -- a bf16 beta yields a bf16 write strength, which erodes the
-            # delta-rule state update across the 71 KDA layers (measured gsm8k
+            # delta-rule state update across the 69 KDA layers (measured gsm8k
             # regression). b_proj stays bf16; only this reduction is widened.
             "beta": beta.float(),
             "A_log": self.A_log,
@@ -813,7 +813,7 @@ class KimiKDAAttention(nn.Module):
             v=v,
             g=g,
             # fp32 for the same reason as _run_kda: a bf16 sigmoid erodes the
-            # delta-rule write strength across 71 KDA layers.
+            # delta-rule write strength across 69 KDA layers.
             beta=beta.float(),
             A_log=self.A_log,
             dt_bias=self.dt_bias,

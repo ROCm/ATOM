@@ -43,9 +43,7 @@ class EngineArgs:
     data_parallel_size: int = 1
     enforce_eager: bool = False
     enable_prefix_caching: bool = True
-    enable_ssm_state_cache: bool = False
-    ssm_state_cache_granularity: int = 64
-    ssm_state_cache_slots: int = 0
+    ssm_state_cache_ratio: float = 0.3
     port: int = 8006
     kv_cache_dtype: str = "bf16"
     index_cache_dtype: Optional[str] = None
@@ -153,34 +151,21 @@ class EngineArgs:
             action=argparse.BooleanOptionalAction,
             default=True,
             help="Enable prefix caching (default: enabled). "
-            "Use --no-enable_prefix_caching to disable.",
+            "Use --no-enable_prefix_caching to disable. On a linear-attention "
+            "model this also enables the SSM state cache, which requires "
+            "--block-size to divide 64; with any other block size prefix hits "
+            "are declined and a warning is logged.",
         )
         parser.add_argument(
-            "--enable_ssm_state_cache",
-            action=argparse.BooleanOptionalAction,
-            default=False,
-            help="Cache recurrent (SSM/conv) state checkpoints for linear-"
-            "attention models (Qwen3-Next / Qwen3.5 / Kimi KDA) so a shared "
-            "prompt prefix can resume the recurrence instead of replaying it. "
-            "Without this, such models cannot take a paged-KV prefix hit at "
-            "all (the recurrence would never see the cached prefix). "
-            "Experimental; default: disabled.",
-        )
-        parser.add_argument(
-            "--ssm_state_cache_granularity",
-            type=int,
-            default=64,
-            help="Token alignment for state checkpoints (default: 64). Must "
-            "be a multiple of the KV block size AND of the linear-attention "
-            "kernel's chunk size; split-and-replay is bit-exact only on that "
-            "grid.",
-        )
-        parser.add_argument(
-            "--ssm_state_cache_slots",
-            type=int,
-            default=0,
-            help="Number of state-checkpoint slots. 0 = auto-size from the "
-            "memory budget.",
+            "--ssm_state_cache_ratio",
+            type=float,
+            default=0.3,
+            help="Fraction of the KV capacity remaining after the per-request "
+            "runtime state tensor to spend on recurrent-state checkpoints "
+            "(default: 0.3). Only used when the SSM state cache is on. Larger "
+            "values retain more checkpoints for cross-request reuse and leave "
+            "less for the paged KV pool; raise it if the state cache stats "
+            "line shows evictions close to writes.",
         )
         parser.add_argument(
             "--port",
