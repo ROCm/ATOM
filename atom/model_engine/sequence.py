@@ -78,11 +78,8 @@ class Sequence:
         self.num_prompt_tokens = len(token_ids)
         self.num_rejected = 0
         self.num_cached_tokens = 0
-        # Instrumentation: compressed-prefix hash hit (blocks) BEFORE the SWA
-        # bounded_hit gate, recorded by BlockManager.can_allocate. The gap
-        # against the admitted num_cached_blocks is the reuse lost to a missing
-        # SWA tail (vs lost to compressed eviction). See CacheStats.
         self.num_compressed_hit_blocks = 0
+        self.prefix_cache_hit_tokens = 0
         # True iff this seq is mid-prefill (chunked prefill produced KV for
         # some prompt tokens but not all). Maintained by the scheduler:
         # set in postprocess when an advance leaves prompt tokens remaining,
@@ -139,6 +136,10 @@ class Sequence:
         # kv_transfer params
         self.kv_transfer_params = kv_transfer_params
         self.kv_transfer_params_output = None
+        if kv_transfer_params:
+            self.prefix_cache_hit_tokens = kv_transfer_params.get(
+                "prefix_cache_hit_tokens", 0
+            )
 
         self.prefix_cache_hit_tokens = (kv_transfer_params or {}).get(
             "prefix_cache_hit_tokens", 0

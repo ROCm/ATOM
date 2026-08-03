@@ -163,6 +163,95 @@ jobs:
               print(f"  {enabled} {m['model_name']:<43} {m.get('test_level','?'):<10} {m['runner']}")
           PY
 
+  offline-smoke-test:
+    # Ungated on purpose: this runs on every PR, unlike the accuracy matrix
+    # behind `ci-gate`, which only opens on an approval or a ci:* label.
+    #
+    # It guards the path the nightly Docker release smoke-tests after it builds
+    # the image -- the offline entrypoint. The accuracy job is not a substitute:
+    # it drives the server over HTTP, and the two do not share the code that
+    # hands tokens back to the caller. A bug that killed the offline output
+    # thread reached main and showed up a day later, as a 60-minute timeout in
+    # the nightly.
+    #
+    # Completing is the assertion. The failure it exists to catch is a hang or
+    # a crash, not wrong text, so there is no golden file to keep per model --
+    # and one small model exercises that code path as well as thirteen do.
+    name: Offline inference smoke test
+    runs-on: linux-atom-mi35x-1
+    timeout-minutes: 45
+    env:
+      CONTAINER_NAME: atom_smoke_test
+      SMOKE_MODEL: meta-llama/Meta-Llama-3-8B-Instruct
+      # Matches this model's entry in models_accuracy.json.
+      SMOKE_EXTRA_ARGS: --kv_cache_dtype fp8 --gpu-memory-utilization 0.3
+    steps:
+      - name: Kill stale containers
+        run: |
+          docker ps -aq -f "name=${CONTAINER_NAME}" | xargs -r docker rm -f || true
+
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+
+      - name: Docker Login
+        uses: ./.github/actions/docker-auth
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Start CI container
+        uses: ./.github/actions/setup-gpu-container
+        with:
+          container-name: ${{ env.CONTAINER_NAME }}
+          base-image: ${{ env.ATOM_BASE_IMAGE }}
+          runner: linux-atom-mi35x-1
+          hf-token: ${{ secrets.AMD_HF_TOKEN }}
+          network-host: "true"
+
+      - name: Download model
+        timeout-minutes: 30
+        env:
+          HF_TOKEN: ${{ secrets.AMD_HF_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -d "/models" ]; then
+            docker exec \
+              -e HF_TOKEN="${HF_TOKEN:-}" \
+              -e MODEL_ID="${SMOKE_MODEL}" \
+              -e TARGET_DIR="/models/${SMOKE_MODEL}" \
+              "$CONTAINER_NAME" \
+              bash -lc 'bash /workspace/.github/scripts/download_model_with_lock.sh "$MODEL_ID" "$TARGET_DIR"'
+          else
+            echo "No /models mount; simple_inference will fetch from the hub."
+          fi
+
+      - name: Run offline inference
+        # An 8B model loads and answers a handful of prompts in a couple of
+        # minutes. This bound is the guard: the failure it exists to catch is a
+        # hang, and a hang should cost minutes rather than most of an hour.
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          if [ -d "/models" ]; then
+            model_path="/models/${SMOKE_MODEL}"
+          else
+            model_path="${SMOKE_MODEL}"
+          fi
+          echo "Model path: $model_path"
+          # Piped over stdin so the container's shell parses any quoting in the
+          # extra args itself; interpolating them into `bash -lc "..."` lets the
+          # host shell strip inner quotes first.
+          echo "python3 -m atom.examples.simple_inference \
+            --model $model_path $SMOKE_EXTRA_ARGS --temperature 0" \
+            | docker exec -i "$CONTAINER_NAME" bash -l | tee smoke_output.txt
+          grep -qE '^(Prompt|Completion):' smoke_output.txt \
+            || { echo "::error::simple_inference produced no completions"; exit 1; }
+
+      - name: Clean Up
+        if: always()
+        run: |
+          docker ps -aq -f "name=${CONTAINER_NAME}" | xargs -r docker rm -f || true
+
   atom-test:
     needs: [ci-gate, download_aiter_wheel, load-test-models]
     name: Accuracy

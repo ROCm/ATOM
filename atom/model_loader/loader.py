@@ -23,7 +23,7 @@ if "F8_E8M0" not in safetensors.torch._TYPES and hasattr(torch, "float8_e8m0fnu"
 
 from aiter.dist.parallel_state import get_tp_group
 
-from atom.model_loader.loading_core import load_weights_into_model
+from atom.model_loader.loading_core import load_weights_into_model, rank_tag
 from atom.model_loader.weight_iterator import (
     safetensors_weights_iterator,
 )
@@ -325,8 +325,17 @@ def load_model(
                 full_name = f"{module_name}.{param_name}" if module_name else param_name
                 loaded_weights_record.add(prefix + full_name)
 
-    if has_online_quant:
-        pp_elapsed = time.perf_counter() - pp_start
+    # Post-processing (AITER shuffle/swizzle, per-quant-method hooks) runs inside
+    # the load time the caller reports, so it is timed unconditionally: without
+    # this line a shuffle-dominated load is indistinguishable from a slow read.
+    pp_elapsed = time.perf_counter() - pp_start
+    if not has_online_quant:
+        logger.info(
+            "[%s] Weight post-processing done: %.2f seconds",
+            rank_tag(),
+            pp_elapsed,
+        )
+    else:
         oq_layers = []
         raw_online_quant_config = None
         for _, module in model.named_modules():
@@ -338,7 +347,9 @@ def load_model(
                 if qc is not None and hasattr(qc, "online_quant_config_raw"):
                     raw_online_quant_config = qc.online_quant_config_raw
         logger.info(
-            "Weight post-processing done: %.2f seconds, " "%d layers online-quantized",
+            "[%s] Weight post-processing done: %.2f seconds, "
+            "%d layers online-quantized",
+            rank_tag(),
             pp_elapsed,
             len(oq_layers),
         )

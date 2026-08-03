@@ -70,79 +70,10 @@ if use_triton_gemm():
         logger.warning(f"Triton fused GEMM split_cat not available: {e}")
 
 
-def reorg_kvcache(
-    allgatered_kv_c_normed: torch.Tensor,
-    allgatered_k_pe: torch.Tensor,
-    padded_local_chunk_seq_lens_lst: list[int],
-    local_context_lens_allranks: list[list[int]],
-    sum_seq_len: int,
-    max_seq_len: int,
-    chunk_size: int,
-    chunk_idx: int,
-    toks: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    reorg and unpad kvcache after cp local gather to tp layout for attn kernel.
-    e.g.
-    allgatered_kv_c_normed = [T0_0, T0_1, T0_2, T0_3, T1_0, T1_1, ...,
-                              T0_4, T0_5, pad, pad, T1_2, pad, ...]
-    -> reorganized_kv_c_normed = [T0_0, T0_1, T0_2, T0_3, T0_4, T0_5,
-                                  T1_0, T1_1, T1_2, ...]
-    Args:
-        padded_local_chunk_seq_lens_lst: local chunk context lengths
-            under current CP rank.
-        local_context_lens_allranks: local context lengths on each CP rank.
-        sum_seq_len: the sum of cp_chunk_seq_lens_lst.
-        max_seq_len: the max value of cp_chunk_seq_lens_lst.
-        chunk_size: the local padded max context chunk from
-            chunked_context_metadata building.
-        chunk_idx: chunk idx of chunked_prefill.
-        toks: the number of tokens for local gather cache.
-    """
-    kv_c_segments = []
-    k_pe_segments = []
-    src_token_idx = 0
-    max_seq_len_check = 0
-    for padded_local_chunk_seq_len, local_context_lens in zip(
-        padded_local_chunk_seq_lens_lst, local_context_lens_allranks
-    ):
-        cur_seq_len = 0
-        for rank, local_context_len in enumerate(local_context_lens):
-            # Note(qcs): We split the context into multiple chunks,
-            # depending on the size of the workspace.
-            # local_context in dcp0:   |-----------------|
-            # local_context in dcp1:   |--------------|
-            # n*padded_local_chunk:    |-----|-----|-----|
-            # local_chunk_len in dcp1: |-----|-----|--|
-            # so we need update the last chunk length in dcp1.
-            local_chunk_len = min(
-                max(0, local_context_len - chunk_idx * chunk_size),
-                padded_local_chunk_seq_len,
-            )
-            if local_chunk_len != 0:
-                kv_c_segment = allgatered_kv_c_normed[
-                    rank * toks
-                    + src_token_idx : rank * toks
-                    + src_token_idx
-                    + local_chunk_len
-                ]
-                k_pe_segment = allgatered_k_pe[
-                    rank * toks
-                    + src_token_idx : rank * toks
-                    + src_token_idx
-                    + local_chunk_len
-                ]
-                kv_c_segments.append(kv_c_segment)
-                k_pe_segments.append(k_pe_segment)
-                cur_seq_len += local_chunk_len
-        max_seq_len_check = max(max_seq_len_check, cur_seq_len)
-        src_token_idx += padded_local_chunk_seq_len
-    reorganized_kv_c_normed = torch.cat(kv_c_segments, dim=0)
-    reorganized_k_pe = torch.cat(k_pe_segments, dim=0)
-    assert reorganized_kv_c_normed.shape[0] == sum_seq_len
-    assert reorganized_k_pe.shape[0] == sum_seq_len
-    assert max_seq_len_check == max_seq_len
-    return reorganized_kv_c_normed, reorganized_k_pe
+# reorg_kvcache lives in atom.model_ops.dcp_ops so both the plugin and the
+# server-mode MLA path share one implementation (server must not import from
+# the plugin/vLLM tree). Re-exported here to keep the original call sites.
+from atom.model_ops.dcp_ops import reorg_kvcache
 
 
 @triton.jit
@@ -481,7 +412,10 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         k_scale,
         dcp_world_size,
     ):
-        assert k_scale is None, "DCP not support scaled kvcache now."
+        # The gather branch keys off `self.kv_cache_dtype` (fp8 -> dequantizing
+        # gather, else same-dtype cp_gather), matching vLLM's is_quantized_kv_cache
+        # check. `k_scale` (== self._k_scale) is the per-tensor dequant scale, used
+        # only on the fp8 branch.
         assert attn_metadata.prefill is not None
         prefill_metadata = attn_metadata.prefill
         assert prefill_metadata.chunked_context is not None
@@ -499,18 +433,40 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         from vllm.distributed.parallel_state import get_dcp_group
         from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 
+        is_quantized_kv = self.kv_cache_dtype.startswith("fp8")
         for i in range(iters):
             toks = prefill_metadata.chunked_context.seq_tot[i]
-            ops.cp_gather_cache(
-                src_cache=kv_c_and_k_pe_cache,
-                dst=workspace,
-                block_table=prefill_metadata.block_table,
-                cu_seq_lens=prefill_metadata.chunked_context.padded_local_cu_seq_lens[
-                    i
-                ],
-                batch_size=attn_metadata.num_prefills,
-                seq_starts=prefill_metadata.chunked_context.starts[i],
-            )
+            if is_quantized_kv:
+                # fp8 / quantized KV: dequant *during* the gather into the (bf16)
+                # workspace (matches vLLM upstream and the non-DCP
+                # _compute_prefill_context), so the cross-rank all_gather below
+                # runs on already-dequantized bf16 data.
+                ops.gather_and_maybe_dequant_cache(
+                    src_cache=kv_c_and_k_pe_cache,
+                    dst=workspace,
+                    block_table=prefill_metadata.block_table,
+                    cu_seq_lens=prefill_metadata.chunked_context.padded_local_cu_seq_lens[
+                        i
+                    ],
+                    token_to_seq=prefill_metadata.chunked_context.padded_local_token_to_seq[
+                        i
+                    ],
+                    num_tokens=toks,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    scale=k_scale,
+                    seq_starts=prefill_metadata.chunked_context.starts[i],
+                )
+            else:
+                ops.cp_gather_cache(
+                    src_cache=kv_c_and_k_pe_cache,
+                    dst=workspace,
+                    block_table=prefill_metadata.block_table,
+                    cu_seq_lens=prefill_metadata.chunked_context.padded_local_cu_seq_lens[
+                        i
+                    ],
+                    batch_size=attn_metadata.num_prefills,
+                    seq_starts=prefill_metadata.chunked_context.starts[i],
+                )
             # workspace
             # |------- N tokens --------|--------- N*dcp_size tokens ----------|
             # |<- use for loca_gather ->|<--------- use for allgather -------->|
@@ -768,7 +724,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                         q,
                         kv_c_and_k_pe_cache,
                         attn_metadata,
-                        k_scale=None,
+                        k_scale,
                         dcp_world_size=self.dcp_world_size,
                     )
                 )
@@ -818,11 +774,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
 
         kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
 
-        # DCP decode needs LSE from mla_decode_fwd; persistent mode does not
-        # return it, so disable persistent mode whenever DCP is active.
-        use_persistent_mode = attn_metadata.decode.use_persistent_metadata and not (
-            self.dcp_world_size > 1
-        )
+        use_persistent_mode = attn_metadata.decode.use_persistent_metadata
         if not use_persistent_mode:
             work_meta_data = None
             work_indptr = None
@@ -1090,60 +1042,43 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                 )
 
             if decode_only:
-                if self.dcp_world_size > 1:
-                    # DCP workaround: aiter.fused_qk_rope_concat_and_cache_mla
-                    # has DCP bug: slot_idx < 0 causes early return,
-                    # skipping Q RoPE and q_out write.
-                    # Split into separate RoPE + concat + cache write.
-                    self.rotary_emb(positions, decode_q_pe, k_pe)
-                    decode_q = torch.cat([decode_ql_nope, decode_q_pe], dim=-1)
-                    if kv_cache.numel() > 0:
-                        aiter.concat_and_cache_mla(
-                            k_c_normed,
-                            k_pe.squeeze(1),
-                            kv_cache.view(
-                                kv_cache.shape[0],
-                                -1,
-                                self.kv_lora_rank + self.qk_rope_head_dim,
-                            ),
-                            attn_metadata.slot_mapping.flatten(),
-                            kv_cache_dtype=self.kv_cache_dtype,
-                            scale=self._k_scale,
-                        )
-                else:
-                    decode_q = torch.empty(
-                        (
-                            decode_ql_nope.shape[0],
-                            self.num_heads,
-                            self.kv_lora_rank + self.qk_rope_head_dim,
-                        ),
-                        dtype=(
-                            dtypes.fp8
-                            if self.kv_cache_dtype.startswith("fp8")
-                            else self.dtype
-                        ),
-                        device=decode_ql_nope.device,
-                    )
-                    aiter.fused_qk_rope_concat_and_cache_mla(
-                        decode_ql_nope,
-                        decode_q_pe,
-                        k_c_normed,
-                        k_pe.squeeze(1),
-                        kv_cache.view(
-                            kv_cache.shape[0],
-                            -1,
-                            self.kv_lora_rank + self.qk_rope_head_dim,
-                        ),
-                        decode_q,
-                        attn_metadata.slot_mapping,
-                        self._k_scale,
-                        self._q_scale,
-                        positions,
-                        self.rotary_emb.cos_cache,
-                        self.rotary_emb.sin_cache,
-                        is_neox=self.rotary_emb.is_neox_style,
-                        is_nope_first=True,
-                    )
+                decode_q = torch.empty(
+                    (
+                        decode_ql_nope.shape[0],
+                        self.num_heads,
+                        self.kv_lora_rank + self.qk_rope_head_dim,
+                    ),
+                    dtype=(
+                        dtypes.fp8
+                        if self.kv_cache_dtype.startswith("fp8")
+                        else self.dtype
+                    ),
+                    device=decode_ql_nope.device,
+                )
+                aiter.fused_qk_rope_concat_and_cache_mla(
+                    decode_ql_nope,
+                    decode_q_pe,
+                    k_c_normed,
+                    k_pe.squeeze(1),
+                    kv_cache.view(
+                        kv_cache.shape[0],
+                        -1,
+                        self.kv_lora_rank + self.qk_rope_head_dim,
+                    ),
+                    decode_q,
+                    attn_metadata.slot_mapping,
+                    self._k_scale,
+                    self._q_scale,
+                    positions,
+                    self.rotary_emb.cos_cache,
+                    self.rotary_emb.sin_cache,
+                    is_neox=self.rotary_emb.is_neox_style,
+                    is_nope_first=True,
+                    # DCP: q_out is head all-gathered, so every rank must compute
+                    # Q RoPE for all tokens (incl. slot=-1 non-owned). Non-DCP
+                    # keeps the default (early-return on padded tokens).
+                    compute_all_q_rope=self.dcp_world_size > 1,
+                )
             else:
                 if fp8_attention:
                     assert decode_ql_nope.shape[0] == decode_q_pe.shape[0]
@@ -1177,8 +1112,9 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                     decode_q = (decode_ql_nope, decode_q_pe)
                     decode_q = torch.cat(decode_q, dim=-1)
             if self.dcp_world_size > 1:
-                assert not fp8_attention, "DCP not support fp8 kvcache now."
-                # decode_q do allgather in head dim.
+                # decode_q is fp8 when fp8_attention (produced by the fused
+                # kernel); the head-dim all-gather is copy-only, so an fp8
+                # payload is safe (unlike an fp8 all-reduce).
                 decode_q = get_dcp_group().all_gather(decode_q, dim=1)
 
             # call decode attn
@@ -1386,6 +1322,9 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                 self.rotary_emb.sin_cache,
                 is_neox=self.rotary_emb.is_neox_style,
                 is_nope_first=True,
+                # DCP: compute Q RoPE for all tokens (q_out is head all-gathered);
+                # non-DCP keeps the default early-return on slot=-1 padded tokens.
+                compute_all_q_rope=self.dcp_world_size > 1,
             )
 
         if self.head_repeat_factor > 1:
