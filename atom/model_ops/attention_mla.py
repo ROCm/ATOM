@@ -43,6 +43,7 @@ from torch import nn
 
 from atom.config import get_current_atom_config
 from atom.distributed.dcp_utils import (
+    dcp_persistent_supported,
     get_dcp_group,
     get_dcp_rank,
     get_dcp_world_size,
@@ -329,6 +330,11 @@ class MLAAttention(nn.Module):
             self.dcp_group = None
             self.dcp_rank = 0
             self._cp_triton_ctx = None
+
+        # Whether DCP decode can run in persistent mode on this GPU (gfx950 has
+        # the lse persistent kernel, gfx942 does not — see dcp_utils). Cached
+        # once here to avoid a per-forward get_gfx() (graph-break).
+        self.dcp_persistent_supported = dcp_persistent_supported()
 
     def _pad_query_heads(self, q: torch.Tensor) -> torch.Tensor:
         if self.head_repeat_factor > 1:
@@ -1239,11 +1245,10 @@ class MLAAttention(nn.Module):
                     paged_kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens
 
             dp_size = get_dp_group().world_size
-            # DCP needs the per-token LSE (return_lse); the persistent
-            # reduce path doesn't emit it, so fall back to the non-persistent
-            # decode when LSE is requested.
-            use_persistent_mode = not (dp_size > 1) and not return_lse
+            use_persistent_mode = not (dp_size > 1)
             if envs.ATOM_MLA_PAGE_SIZE > 1:
+                use_persistent_mode = False
+            if self.dcp_world_size > 1 and not self.dcp_persistent_supported:
                 use_persistent_mode = False
 
             # Sparse layers in MTP verify use separate persistent metadata
@@ -1273,13 +1278,42 @@ class MLAAttention(nn.Module):
                 reduce_final_map = attn_metadata.reduce_final_map
                 reduce_partial_map = attn_metadata.reduce_partial_map
 
-            num_kv_splits = max(1, 16 // self.dcp_world_size)
+            # persistent lets metadata (reduce_partial_map) drive the split, so
+            # 16 is inert; the non-persistent fallback (gfx942 DCP) still needs
+            # the DCP-scaled split to keep the fp32 `logits` small (CUDA-graph OOM).
+            num_kv_splits = (
+                16 if use_persistent_mode else max(1, 16 // self.dcp_world_size)
+            )
 
             # TODO refactor this
             if envs.ATOM_MLA_PAGE_SIZE is not None:
                 page_size = envs.ATOM_MLA_PAGE_SIZE
             else:
                 page_size = 1
+
+            # DCP + MTP (max_q_len>1): KV is round-robin sharded across ranks, so
+            # the intra-block causal mask must be applied on GLOBAL positions
+            # g(j)=j*W+r. Pass the cprr params (g_kv_indptr + cp world/rank) so the
+            # kernel selects the cprr variant and masks correctly. qlen=1 keeps the
+            # plain path (single query sees all local KV -> no mask needed).
+            cp_world_size = 1
+            cp_rank = 0
+            g_kv_indptr = None
+            if self.dcp_world_size > 1 and max_q_len > 1:
+                # cprr kernel is bf16-only (no fp8 cprr kernel on gfx950).
+                if self.kv_cache_dtype == "fp8":
+                    raise NotImplementedError(
+                        "MTP + DCP (max_q_len>1) requires bf16 KV cache: the "
+                        "round-robin CP (cprr) MLA kernel has no fp8 variant. "
+                        "Use --kv_cache_dtype bf16, or disable DCP/MTP for fp8."
+                    )
+                cp_world_size = self.dcp_world_size
+                cp_rank = self.dcp_rank
+                g_kv_indptr = getattr(attn_metadata, "g_kv_indptr", None)
+                assert g_kv_indptr is not None, (
+                    "MTP+DCP decode requires attn_metadata.g_kv_indptr; the "
+                    "metadata builder / cudagraph-capture path must set it."
+                )
 
             seg_kv_buffer_4d = kv_buffer.view(-1, page_size, 1, q.shape[-1])
             _, final_lse = mla_decode_fwd(
@@ -1293,8 +1327,7 @@ class MLAAttention(nn.Module):
                 max_q_len,
                 page_size=page_size,
                 # The seg/asm decode path runs with a single kv split; the
-                # original (page_size=1) persistent path keeps 16 splits, scaled
-                # down by dcp_world_size when DCP shards KV across ranks.
+                # page_size=1 persistent path keeps 16 splits (metadata-derived).
                 num_kv_splits=None if self.use_seg_mla else num_kv_splits,
                 sm_scale=self.scale,
                 work_meta_data=work_meta_data,
@@ -1306,6 +1339,9 @@ class MLAAttention(nn.Module):
                 q_scale=self._q_scale,
                 kv_scale=self._k_scale,
                 return_lse=return_lse,
+                g_kv_indptr=g_kv_indptr,
+                cp_world_size=cp_world_size,
+                cp_rank=cp_rank,
             )
 
         o = self._restore_query_heads(o, num_heads_q)
