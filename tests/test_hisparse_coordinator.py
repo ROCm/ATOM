@@ -303,3 +303,151 @@ def test_mtp_multi_token_batch_translate():
     assert out_translated[3].item() == hot_base + 3
     assert out_translated[4].item() == hot_base + 0
     assert c.token_to_slot[0, 0, 50].item() >= 0
+
+
+# --- Stage C: IndexShare group prefetch --------------------------------------
+
+
+def test_prefetch_group_structure():
+    """Anchor/shared grouping is derived correctly from the layer pattern.
+
+    Pattern mirrors GLM-5.2: leading fulls with no shared layers, then repeating
+    [full, shared, shared, shared] groups. Structure is built regardless of the
+    ATOM_HISPARSE_PREFETCH env (the enable gate is separate), so this needs no GPU.
+    """
+    # layers: 0,1,2 full (no group); 3=full anchors 4,5,6; 7=full anchors 8,9,10
+    shared = [False, False, False, False, True, True, True, False, True, True, True]
+    c = HiSparseCoordinator(
+        num_layers=len(shared),
+        max_num_seqs=2,
+        hot_buffer_size=4,
+        max_context_len=32,
+        kv_dim=8,
+        kv_dtype=torch.bfloat16,
+        device="cpu",
+        index_topk=4,
+        shared_index_layers=shared,
+    )
+    assert c._prefetch_groups == {3: [4, 5, 6], 7: [8, 9, 10]}
+    assert c._anchor_of[5] == 3 and c._anchor_of[9] == 7
+    assert c._anchor_of[0] == 0 and c._anchor_of[3] == 3  # non-shared: self
+    assert c._prefetch_slot[4] == 0 and c._prefetch_slot[6] == 2
+    assert c._prefetch_slot[8] == 0 and c._prefetch_slot[10] == 2
+    assert c._is_shared[4] and not c._is_shared[3]
+
+
+def test_prefetch_disabled_by_default():
+    """Without the env, prefetch is inert and the layer-role queries are False."""
+    shared = [False, True, True]
+    c = HiSparseCoordinator(
+        num_layers=3,
+        max_num_seqs=1,
+        hot_buffer_size=4,
+        max_context_len=16,
+        kv_dim=8,
+        kv_dtype=torch.bfloat16,
+        device="cpu",
+        index_topk=4,
+        shared_index_layers=shared,
+    )
+    assert c.enable_prefetch is False
+    assert c.is_prefetch_anchor(0) is False
+    assert c.is_shared_layer(1) is False
+
+
+def test_prefetch_bad_pattern_rejected():
+    """A shared layer with no preceding anchor is a config error."""
+    with pytest.raises(AssertionError):
+        HiSparseCoordinator(
+            num_layers=2,
+            max_num_seqs=1,
+            hot_buffer_size=4,
+            max_context_len=16,
+            kv_dim=8,
+            kv_dtype=torch.bfloat16,
+            device="cpu",
+            index_topk=4,
+            shared_index_layers=[True, False],
+        )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="prefetch path needs a GPU + aiter"
+)
+def test_prefetch_matches_per_layer_fused(monkeypatch):
+    """The IndexShare prefetch path is bit-identical to per-layer synchronous swap.
+
+    A group's shared layers evolve in lockstep with their anchor, so replaying the
+    anchor's plan + assigned-slot backup must produce the same hot buffer and the
+    same translated indices as running the full fused kernel on every layer.
+    """
+    monkeypatch.setenv("ATOM_HISPARSE_PREFETCH", "1")
+    dev = "cuda"
+    L, R, H, C, D, K = 3, 1, 4, 32, 8, 3
+    shared = [False, True, True]  # layer 0 anchors 1, 2
+
+    def build(shared_layers):
+        c = HiSparseCoordinator(
+            num_layers=L,
+            max_num_seqs=R,
+            hot_buffer_size=H,
+            max_context_len=C,
+            kv_dim=D,
+            kv_dtype=torch.bfloat16,
+            device=dev,
+            index_topk=K,
+            shared_index_layers=shared_layers,
+        )
+        for layer in range(L):  # distinct per-layer cold data: 100*layer + tok
+            for t in range(C):
+                c.cold_pool[layer, t] = torch.full(
+                    (D,), float(100 * layer + t), dtype=torch.bfloat16
+                )
+        c.acquire(req_id=1, context_len=10)
+        c.load_initial_hot_set(0, 10)
+        return c
+
+    ref = build(None)  # prefetch disabled -> per-layer fused every layer
+    pre = build(shared)  # prefetch enabled -> anchor records, shared replay
+    assert pre.enable_prefetch and not ref.enable_prefetch
+
+    req_slots = torch.tensor([0], dtype=torch.int32, device=dev)
+    indptr = torch.tensor([0, K], dtype=torch.int32, device=dev)
+    # A fresh token at logical pos 10 sits at physical slot 10 of each layer cache.
+    layer_kv = [torch.zeros(64, D, dtype=torch.bfloat16, device=dev) for _ in range(L)]
+    for layer in range(L):
+        layer_kv[layer][10] = torch.full(
+            (D,), float(1000 + layer), dtype=torch.bfloat16
+        )
+    src = torch.tensor([10], dtype=torch.int32, device=dev)
+    pos = torch.tensor([10], dtype=torch.int32, device=dev)
+    topk = torch.tensor([[10, 8, 3]], dtype=torch.int32, device=dev)
+
+    # Reference: full fused (backup + swap+translate) on every layer.
+    ref_tr = []
+    for layer in range(L):
+        out = torch.zeros(K, dtype=torch.int32, device=dev)
+        ref.backup_new_tokens_fused(layer, layer_kv[layer], src, req_slots, pos)
+        ref.swap_in_for_layer_fused(layer, topk, indptr, req_slots, out)
+        ref_tr.append(out.clone())
+    torch.cuda.synchronize()
+
+    # Prefetch: anchor records + fires the group; shared layers replay + backup.
+    anchor_out = torch.zeros(K, dtype=torch.int32, device=dev)
+    pre.backup_new_tokens_fused(0, layer_kv[0], src, req_slots, pos)
+    pre.swap_in_for_layer_fused(
+        0, topk, indptr, req_slots, anchor_out, record_plan=True
+    )
+    pre.prefetch_group(0, req_slots)
+    for layer in (1, 2):
+        pre.backup_into_assigned_fused(layer, 0, layer_kv[layer], src, req_slots, pos)
+        pre.wait_prefetch(layer)
+    torch.cuda.synchronize()
+
+    # Translate is shared across the group -> identical to the anchor's.
+    assert torch.equal(anchor_out, ref_tr[0])
+    # Each layer's hot buffer holds the same KV under both paths.
+    for layer in range(L):
+        assert torch.allclose(
+            pre.hot_buffer[layer].float(), ref.hot_buffer[layer].float()
+        ), layer

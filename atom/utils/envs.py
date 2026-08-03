@@ -76,6 +76,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # sync, CUDAGraph-capturable). Off falls back to the Phase-0 reference path
     # (eager, host-synced) for bisection. MTP verify always uses the reference.
     "ATOM_HISPARSE_FUSED": lambda: os.getenv("ATOM_HISPARSE_FUSED", "1") == "1",
+    # IndexShare prefetch (Stage C): overlap a full-layer group's shared-layer KV
+    # swap-in with compute on a side stream. Off (default) keeps per-layer
+    # synchronous swap-in. Auto-disabled under pipeline parallelism / spec decode.
+    "ATOM_HISPARSE_PREFETCH": lambda: os.getenv("ATOM_HISPARSE_PREFETCH", "0") == "1",
     # --- Kernel Fusion Toggles ---
     # fused_compress_attn: switch between Triton (default historical) and a
     # flydsl drop-in for V4-Pro Compressor (Main BF16 + Indexer FP8) paths.

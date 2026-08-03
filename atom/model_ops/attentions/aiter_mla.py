@@ -819,6 +819,28 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 "HiSparse requires ATOM_MLA_PAGE_SIZE=1 and non-triton MLA "
                 "(page_size=1 sparse decode path)."
             )
+            # IndexShare prefetch (GLM-5.2): a "shared" layer reuses its anchor's
+            # top-k, so the anchor's swap plan overlaps its shared layers' gather
+            # on a side stream. Unsupported under PP (config indexer_types is
+            # global; local layer ids don't map) or speculative decode — fall back
+            # to per-layer synchronous swap-in there.
+            shared_index_layers = None
+            pp_size = getattr(config, "pipeline_parallel_size", 1)
+            has_spec = bool(getattr(config, "speculative_config", None))
+            if pp_size == 1 and not has_spec:
+                from atom.models.deepseek_v2 import _should_skip_index_topk
+
+                shared_index_layers = [
+                    _should_skip_index_topk(hf_config, f"model.layers.{i}.self_attn")
+                    for i in range(total_num_layers)
+                ]
+                if not any(shared_index_layers):
+                    shared_index_layers = None
+            elif envs.ATOM_HISPARSE_PREFETCH:
+                logger.warning(
+                    "HiSparse IndexShare prefetch is unsupported under pipeline "
+                    "parallelism / speculative decode; using synchronous swap-in."
+                )
             out["hisparse_coordinator"] = HiSparseCoordinator(
                 num_layers=total_num_layers,
                 max_num_seqs=config.max_num_seqs,
@@ -827,6 +849,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 kv_dim=576,
                 kv_dtype=dtypes.d_dtypes[config.kv_cache_dtype],
                 device="cuda",
+                index_topk=self.index_topk,
+                shared_index_layers=shared_index_layers,
             )
             # Shared logical-top-k side-channel buffer (one per decode query
             # token), written by the indexer op and read by the coordinator.

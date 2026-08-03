@@ -26,6 +26,8 @@ import logging
 
 import torch
 
+from atom.utils import envs
+
 logger = logging.getLogger("atom")
 
 _EMPTY = -1  # sentinel for empty slot / non-resident token
@@ -56,6 +58,8 @@ class HiSparseCoordinator:
         kv_dim: int,
         kv_dtype: torch.dtype,
         device: torch.device | str = "cuda",
+        index_topk: int | None = None,
+        shared_index_layers: list[bool] | None = None,
     ):
         self.num_layers = num_layers
         self.max_num_seqs = max_num_seqs
@@ -129,6 +133,128 @@ class HiSparseCoordinator:
             self.cold_pool.numel() * self.cold_pool.element_size() / 1e9,
             self.hot_buffer.numel() * self.hot_buffer.element_size() / 1e9,
         )
+
+        self._init_prefetch(index_topk, shared_index_layers)
+
+    # ------------------------------------------------------------------
+    # IndexShare group prefetch (Stage C)
+    # ------------------------------------------------------------------
+    def _init_prefetch(
+        self, index_topk: int | None, shared_index_layers: list[bool] | None
+    ) -> None:
+        """Build the IndexShare prefetch groups, swap stream, events, plan buffers.
+
+        A "shared" layer reuses its anchor (the most recent non-shared layer)
+        top-k, so the anchor's swap plan is valid for every layer in the group.
+        Within a group the per-request slot bookkeeping evolves identically across
+        layers (same top-k, same current position, identical seed), so the anchor
+        records its miss plan once and each shared layer replays the identical IO
+        on a side stream, overlapping the intervening compute.
+        """
+        self._is_shared = list(shared_index_layers or [False] * self.num_layers)
+        assert len(self._is_shared) == self.num_layers, (
+            f"shared_index_layers length {len(self._is_shared)} "
+            f"!= num_layers {self.num_layers}"
+        )
+
+        self._prefetch_groups: dict[int, list[int]] = {}
+        self._anchor_of = list(range(self.num_layers))
+        self._prefetch_slot = [0] * self.num_layers
+        anchor = None
+        for i, is_shared in enumerate(self._is_shared):
+            if not is_shared:
+                anchor = i
+            else:
+                assert anchor is not None, (
+                    f"shared-index layer {i} has no preceding anchor layer; "
+                    "the model's index-topk pattern is invalid"
+                )
+                g = self._prefetch_groups.setdefault(anchor, [])
+                self._prefetch_slot[i] = len(g)
+                self._anchor_of[i] = anchor
+                g.append(i)
+
+        self.enable_prefetch = (
+            bool(self._prefetch_groups) and envs.ATOM_HISPARSE_PREFETCH
+        )
+        if not self.enable_prefetch:
+            return
+
+        assert index_topk is not None, "index_topk required for HiSparse prefetch"
+        self._prefetch_topk = index_topk
+        max_group = max(len(g) for g in self._prefetch_groups.values())
+        self.prefetch_stream = torch.cuda.Stream()
+        self._prefetch_events = [torch.cuda.Event() for _ in range(max_group)]
+        R = self.max_num_seqs
+        # Miss plan recorded by the current anchor, replayed by its shared layers.
+        # Indexed by decode query token (0..n-1); one group is live at a time.
+        self._plan_miss_tok = torch.zeros(
+            (R, index_topk), dtype=torch.int32, device=self.device
+        )
+        self._plan_miss_slot = torch.zeros(
+            (R, index_topk), dtype=torch.int32, device=self.device
+        )
+        self._plan_miss_count = torch.zeros((R,), dtype=torch.int32, device=self.device)
+        logger.info(
+            "HiSparse: IndexShare prefetch enabled; %d anchor group(s), "
+            "%d shared layer(s) of %d total, max group size %d.",
+            len(self._prefetch_groups),
+            sum(self._is_shared),
+            self.num_layers,
+            max_group,
+        )
+
+    def is_prefetch_anchor(self, layer_id: int) -> bool:
+        """True if this layer computes a top-k that shared layers will reuse."""
+        return self.enable_prefetch and layer_id in self._prefetch_groups
+
+    def is_shared_layer(self, layer_id: int) -> bool:
+        """True if this layer reuses its anchor's top-k (skip its own indexer)."""
+        return self.enable_prefetch and self._is_shared[layer_id]
+
+    def anchor_of(self, layer_id: int) -> int:
+        """The anchor layer whose top-k / slot table this layer shares."""
+        return self._anchor_of[layer_id]
+
+    def prefetch_group(self, anchor_layer: int, req_slots: torch.Tensor) -> None:
+        """Issue every shared layer's swap-in on the side stream (from the anchor).
+
+        The anchor already recorded its miss plan; each shared layer replays it
+        into its own hot buffer with a pure copy kernel, overlapping the compute
+        of the anchor and the layers between it and each shared layer.
+        """
+        group = self._prefetch_groups.get(anchor_layer)
+        if not group:
+            return
+        from atom.hisparse.swap_kernel import hisparse_copy_planned
+
+        n = int(req_slots.shape[0])
+        topk = self._prefetch_topk
+        cur = torch.cuda.current_stream()
+        self.prefetch_stream.wait_stream(cur)
+        with torch.cuda.stream(self.prefetch_stream):
+            for skip in group:
+                host_ptr = self._ensure_cold_dev_ptr(skip)
+                hisparse_copy_planned(
+                    host_ptr,
+                    self.hot_buffer[skip],
+                    req_slots,
+                    self._plan_miss_tok[:n],
+                    self._plan_miss_slot[:n],
+                    self._plan_miss_count[:n],
+                    self.item_size_bytes,
+                    self.padded_hot_size,
+                    self.max_context_len,
+                    topk,
+                )
+                self._prefetch_events[self._prefetch_slot[skip]].record(
+                    self.prefetch_stream
+                )
+
+    def wait_prefetch(self, shared_layer: int) -> None:
+        """Block the current stream on this shared layer's prefetched swap-in."""
+        ev = self._prefetch_events[self._prefetch_slot[shared_layer]]
+        ev.wait(torch.cuda.current_stream())
 
     # ------------------------------------------------------------------
     # request lifecycle
@@ -410,6 +536,7 @@ class HiSparseCoordinator:
         indptr: torch.Tensor,
         req_slots: torch.Tensor,
         out_translated: torch.Tensor,
+        record_plan: bool = False,
     ) -> None:
         """Fused miss-detect + LRU evict + swap-in + translate for one layer.
 
@@ -418,10 +545,39 @@ class HiSparseCoordinator:
         decode query token), ``indptr`` bounds each query token's run in
         ``out_translated`` (hot-buffer absolute rows written in place). Requires one
         query token per request (non-MTP); MTP uses the reference path.
+
+        When ``record_plan`` is set (an IndexShare anchor), the kernel also records
+        the per-query-token miss list it computed into the coordinator's plan
+        buffers so the anchor's shared layers can replay the identical IO.
         """
+        host_ptr = self._ensure_cold_dev_ptr(layer_id)
+        if record_plan:
+            from atom.hisparse.swap_kernel import hisparse_swap_and_translate_record
+
+            n = int(req_slots.shape[0])
+            hisparse_swap_and_translate_record(
+                host_ptr,
+                self.hot_buffer[layer_id],
+                topk_logical,
+                indptr,
+                req_slots,
+                self.slot_token[layer_id],
+                self.last_used[layer_id],
+                self.token_to_slot[layer_id],
+                self.recency,
+                out_translated,
+                self._plan_miss_tok[:n],
+                self._plan_miss_slot[:n],
+                self._plan_miss_count[:n],
+                self.item_size_bytes,
+                self.padded_hot_size,
+                self.max_context_len,
+                topk_logical.shape[1],
+            )
+            return
+
         from atom.hisparse.swap_kernel import hisparse_swap_and_translate
 
-        host_ptr = self._ensure_cold_dev_ptr(layer_id)
         hisparse_swap_and_translate(
             host_ptr,
             self.hot_buffer[layer_id],
@@ -437,6 +593,38 @@ class HiSparseCoordinator:
             self.padded_hot_size,
             self.max_context_len,
             topk_logical.shape[1],
+        )
+
+    def backup_into_assigned_fused(
+        self,
+        layer_id: int,
+        anchor_layer: int,
+        layer_kv: torch.Tensor,
+        src_slots: torch.Tensor,
+        req_slots: torch.Tensor,
+        logical_pos: torch.Tensor,
+    ) -> None:
+        """Backup a shared layer's new token into the anchor-assigned hot slot.
+
+        The anchor's swap already assigned ``logical_pos`` a hot slot in the shared
+        (anchor's) slot table; this writes this layer's freshly generated KV into
+        that same slot and the cold pool. Data only — no LRU/recency mutation, so
+        the group's shared slot table stays authoritative on the anchor.
+        """
+        from atom.hisparse.swap_kernel import hisparse_backup_into_assigned
+
+        host_ptr = self._ensure_cold_dev_ptr(layer_id)
+        hisparse_backup_into_assigned(
+            host_ptr,
+            self.hot_buffer[layer_id],
+            layer_kv.reshape(-1, self.kv_dim),
+            src_slots,
+            req_slots,
+            logical_pos,
+            self.token_to_slot[anchor_layer],
+            self.item_size_bytes,
+            self.padded_hot_size,
+            self.max_context_len,
         )
 
     def backup_new_tokens_fused(

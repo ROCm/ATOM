@@ -1017,14 +1017,36 @@ class MLAAttention(nn.Module):
             logical_pos = attn_metadata.hisparse_token_pos[:n]
             topk = coord.topk_buffer[:n]
             indptr = sparse_kv_indptr[: n + 1]
-            # Backup the current token first so the indexer can select its own
-            # position, then swap in the top-k and translate in place.
+            if coord.is_shared_layer(layer_id):
+                # IndexShare shared layer: its historical top-k gather was
+                # prefetched on the side stream when the anchor's plan landed.
+                # Back up only this layer's current token into the anchor-assigned
+                # slot, wait for the prefetch, and reuse the anchor's translate
+                # (sparse_kv_indices_buffer is the one shared _sparse_kv_indices_gpu).
+                anchor = coord.anchor_of(layer_id)
+                coord.backup_into_assigned_fused(
+                    layer_id, anchor, kv_layer, src_slots, req_slots, logical_pos
+                )
+                coord.wait_prefetch(layer_id)
+                return coord.hot_buffer[layer_id].unsqueeze(1).unsqueeze(1)
+            # Anchor / non-shared layer: back up the current token first so the
+            # indexer can select its own position, then swap in the top-k and
+            # translate in place. An anchor also records its miss plan and issues
+            # the group's shared-layer swap-ins on the side stream.
+            record_plan = coord.is_prefetch_anchor(layer_id)
             coord.backup_new_tokens_fused(
                 layer_id, kv_layer, src_slots, req_slots, logical_pos
             )
             coord.swap_in_for_layer_fused(
-                layer_id, topk, indptr, req_slots, self.sparse_kv_indices_buffer
+                layer_id,
+                topk,
+                indptr,
+                req_slots,
+                self.sparse_kv_indices_buffer,
+                record_plan=record_plan,
             )
+            if record_plan:
+                coord.prefetch_group(layer_id, req_slots)
             return coord.hot_buffer[layer_id].unsqueeze(1).unsqueeze(1)
         return self._hisparse_reference_swap(
             kv_layer, attn_metadata, sparse_kv_indptr, hs_slots
