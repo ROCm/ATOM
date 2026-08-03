@@ -303,6 +303,9 @@ class ScheduledBatch:
         num_spec_step: Number of speculative decode steps (0 = disabled).
         scheduled_spec_decode_tokens: Draft token IDs per request for
             speculative decoding (must not use a mutable default).
+        state_copy_pairs: (src, dst) per-request state groups this batch's
+            forward must duplicate before running (`BlockManager
+            .state_copies_for_batch`).
     """
 
     def __init__(
@@ -324,6 +327,7 @@ class ScheduledBatch:
         remote_kv_seq_blocks: dict[int, list[int]] | None = None,
         num_cached_tokens: list[int] | None = None,
         is_final_chunk: list[bool] | None = None,
+        state_copy_pairs: list[tuple[int, int]] | None = None,
     ):
         if scheduled_spec_decode_tokens is None:
             scheduled_spec_decode_tokens = {}
@@ -359,6 +363,13 @@ class ScheduledBatch:
             for seq in seqs.values()
             if seq.has_per_req_cache and seq.per_req_cache_group >= 0
         ]
+        # (src, dst) state groups this batch's forward must duplicate before it
+        # runs — the copy twin of `state_fork_srcs`, for backends that checkpoint
+        # by copying. Not per-seq: a copy is between two pool slots and needs no
+        # alignment with anything else on the batch. Passed in rather than read
+        # off the seqs because both halves (checkpoint taken, checkpoint resumed
+        # from) accumulate in the pool during this pass.
+        self.state_copy_pairs = state_copy_pairs or []
         self.top_ks = np.asarray([seq.top_k for seq in seqs.values()], dtype=np.int32)
         self.top_ps = np.asarray([seq.top_p for seq in seqs.values()], dtype=np.float32)
         # True if any seq in the batch is a fan-out child (SamplingParams.n>1)
@@ -989,8 +1000,8 @@ class Scheduler:
         decoding already-running sequences.
         """
         self._schedule_tick += 1
-        # Fork sources borrowed by the previous batch: its forward has been
-        # issued, so they can go back on the free list (see release_state_pins).
+        # Sources borrowed by the previous batch: its forward has been issued,
+        # so they can go back on the free list (see release_state_pins).
         self.block_manager.release_state_pins()
         scheduled_seqs = {}
         num_seqs_prefill = 0
@@ -1292,6 +1303,7 @@ class Scheduler:
                 connector_meta_output=connector_meta_output,
                 num_cached_tokens=num_cached_tokens_list,
                 is_final_chunk=is_final_chunk,
+                state_copy_pairs=self.block_manager.state_copies_for_batch(),
             )
             self._consume_state_forks(scheduled_seqs)
 
@@ -1411,6 +1423,7 @@ class Scheduler:
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             remote_kv_block_ids=sorted(remote_kv_blocks) if remote_kv_blocks else [],
             remote_kv_seq_blocks=remote_kv_seq_blocks,
+            state_copy_pairs=self.block_manager.state_copies_for_batch(),
         )
         self._consume_state_forks(scheduled_seqs)
         return (decode_batch, scheduled_seqs)
@@ -1608,21 +1621,31 @@ class Scheduler:
 
         0 means "do not checkpoint here", for any of three reasons:
 
-        - the request stops on this step, so there is no next forward to fork
-          into the group a checkpoint would hand away;
-        - speculative decode runs the state kernels down the spec path, whose
-          index tensor has no read-side counterpart (see
-          `GDNAttentionMetadataBuilder.prepare_state_indices`), so a fork must
-          never reach it. Checkpointing during *prefill* stays safe on the same
-          models: `min_fork_tokens` guarantees prompt is left over, and prompt
-          always forwards down the non-spec path;
+        - the request stops on this step, so there is nothing after it: no
+          forward to fork into the group a checkpoint would hand away, and no
+          batch to issue a copy on either;
         - the seq is still on its prompt, where the prefill call site has
-          already decided using the prompt's own remainder.
+          already decided using the prompt's own remainder;
+        - speculative decode, for a class that checkpoints by forking. Two
+          reasons, and either is enough. The spec path's state index has no
+          read-side counterpart (see
+          `GDNAttentionMetadataBuilder.prepare_state_indices`), so a fork must
+          never reach it. And a spec step commits `1 + accepted_drafts` tokens,
+          which is what a fork's successor actually gets — the rest is rolled
+          back and re-forwarded — so no promise made here can be kept.
+          Checkpointing during *prefill* stays safe on the same models:
+          `min_fork_tokens` guarantees prompt is left over, and prompt always
+          forwards down the non-spec path.
+
+        A class that checkpoints by copying is bound by none of that: the
+        destination is complete when the copy lands, so any decode step will do.
 
         Otherwise plain decode carries exactly one token, and whether that is
         enough to fill a fresh group is the backend's `min_fork_tokens` to say.
         """
-        if finished or self.mtp_k or seq.type != SequenceType.DECODE:
+        if finished or seq.type != SequenceType.DECODE:
+            return 0
+        if self.mtp_k and self.block_manager.state.transfer.forks:
             return 0
         return 1
 

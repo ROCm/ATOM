@@ -125,6 +125,14 @@ class Sequence:
         # exactly one forward. -1 = read and write the same group, the case for
         # every step in between.
         self.state_fork_src = -1
+        # Content hash of a boundary this seq's last forward landed on and whose
+        # state is worth keeping, for state classes that checkpoint by copying
+        # (`StateGroupPool.checkpoint`). The copy needs a forward to issue it, so
+        # the intent outlives the step that formed it; `StateGroupPool.take_copies`
+        # turns it into a destination group and a copy pair when the next batch
+        # is built.
+        # -1 = nothing pending, which is also what `deallocate` restores.
+        self.pending_checkpoint = -1
         self.temperature = sampling_params.temperature
         self.top_k = sampling_params.top_k
         self.top_p = sampling_params.top_p

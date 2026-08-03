@@ -1676,7 +1676,11 @@ class ModelRunner:
         self.pool_plan = plan
         config.pool_entries = dict(plan.entries)
         config.pool_entries_per_req = dict(plan.entries_per_req)
-        config.state_min_fork_tokens = self.attn_metadata_builder.min_fork_tokens()
+        # Two scalars rather than the StateTransfer itself: this travels to the
+        # engine process in a plain dict, where `StateGroupPool` rebuilds it.
+        transfer = self.attn_metadata_builder.state_transfer()
+        config.state_transfer_kind = transfer.kind
+        config.state_fork_tokens = transfer.fork_tokens
         for name in sorted(plan.entries):
             logger.info(
                 f"sub-pool {name}: entries={plan.entries[name]}, "
@@ -1749,7 +1753,8 @@ class ModelRunner:
             "num_kvcache_blocks": num_kvcache_blocks,
             "pool_entries": dict(plan.entries),
             "pool_entries_per_req": dict(plan.entries_per_req),
-            "state_min_fork_tokens": config.state_min_fork_tokens,
+            "state_transfer_kind": config.state_transfer_kind,
+            "state_fork_tokens": config.state_fork_tokens,
         }
 
     def allocate_kv_cache(self, num_kvcache_blocks):

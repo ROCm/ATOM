@@ -57,6 +57,7 @@ from atom.distributed.pcp_utils import (
 )
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.scheduler import ScheduledBatch
+from atom.model_engine.state_pool import StateTransfer
 from atom.model_engine.swa_pool import SWA_POOL_CLASS
 from atom.model_ops.attentions.backends import (
     AttentionBackend,
@@ -548,24 +549,40 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         """
         return entry_bytes_for(self._state_fields())
 
-    def min_fork_tokens(self) -> int:
-        """Tokens the forward carrying a state fork must cover.
+    def state_transfer(self) -> StateTransfer:
+        """A copy: one request's compressor state is one contiguous entry.
 
-        A compression boundary reads the ring only for the `K-1` absolute
-        positions before this forward's first token (`window_len = K -
-        min(j+1, K)` in `compress_plan.py`), and a forward writes the ring for
-        the last `K_pool == K` positions it covers. So a fork forward of `n`
-        tokens leaves the new group self-contained for the next one exactly
-        when `n >= K - 1`.
+        `StateArena` already lays a request's whole compressor state out as one
+        byte range (`entry(i)`), which is what makes the duplicate a single
+        `copy_` — see `copy_state_entries`.
 
-        Reported as the widest ring (`K_pool + ring_extra`, HCA's 128 + spec
-        slack) rather than that exact bound: it is the same number the shapes
-        are built from, and the slack it adds is rounded away by the block
-        alignment of the publish points anyway. The `ring_extra` rows
-        themselves need no filling — they are aliasing room for rejected
-        speculative writes, written and abandoned, never read back as state.
+        A fork would also work on a prompt and would move no bytes, but it binds
+        the forward after the checkpoint: that forward has to leave the fresh
+        group self-contained, which takes `K - ratio` = 4 *committed* tokens for
+        the overlapping CSA ring (0 for HCA). A decode step commits
+        `1 + accepted_drafts`, and acceptance is not knowable when the
+        checkpoint has to be decided — nor recoverable afterwards, since by then
+        the state is split across two groups and a single read index spans
+        neither. So a fork can never checkpoint a decode boundary, and this
+        model's reuse is multi-turn, where the boundary worth keeping is exactly
+        the one generation ends on.
+
+        Arithmetic for both numbers, replayed from `compress_plan.py`:
+        `/app/logs_claude/verify_v4_min_fork.py`.
         """
-        return max(self.csa_main_state_shape[0], self.hca_main_state_shape[0])
+        return StateTransfer.copy()
+
+    def copy_state_entries(self, pairs: list[tuple[int, int]]) -> None:
+        """Duplicate whole compressor entries, one `copy_` per pair.
+
+        The whole entry rather than just the rows a resumer reads (the CSA ring's
+        trailing `K - ratio` = 4, HCA's none): the entry is contiguous and those
+        rows are not, so 4 rows would cost 84 strided copies against this one,
+        and the launch overhead alone would exceed the bandwidth saved.
+        """
+        arena = self.model_runner.v4_state_arena
+        for src, dst in pairs:
+            arena.entry(dst).copy_(arena.entry(src))
 
     def swa_block_bytes_per_layer(self) -> int:
         """paged-SWA: bytes of ONE SWA physical block for ONE layer

@@ -19,7 +19,7 @@ from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.sequence import Sequence
 from atom.model_engine.state_cache import StateCache
-from atom.model_engine.state_pool import StateGroupPool
+from atom.model_engine.state_pool import StateGroupPool, StateTransfer
 from atom.model_engine.swa_pool import SWA_POOL_CLASS, SlidingWindowPool
 
 
@@ -101,7 +101,10 @@ class BlockManager:
         # valid, so it holds no capacity of its own and never blocks admission.
         self.state = StateGroupPool(
             self.num_per_req_cache_groups,
-            min_fork_tokens=int(getattr(config, "state_min_fork_tokens", 0) or 0),
+            transfer=StateTransfer.from_config(
+                getattr(config, "state_transfer_kind", "none") or "none",
+                int(getattr(config, "state_fork_tokens", 0) or 0),
+            ),
             hash_block_size=self.hash_block_size,
             enabled=self.enable_prefix_caching,
         )
@@ -161,14 +164,24 @@ class BlockManager:
         return h.intdigest()
 
     def release_state_pins(self) -> None:
-        """Return the previous step's fork sources to the free list.
+        """Return the previous step's resume sources to the free list.
 
-        Called once per engine step before scheduling. A fork source is read by
-        the forward that was already issued when it is handed out again, and the
-        next owner's forward is issued after that one on the same stream, so
-        stream ordering covers the overlap.
+        Called once per engine step before scheduling. A source is read by the
+        forward that was already issued when it is handed out again — read
+        directly under a fork, copied out of under a copy — and the next owner's
+        forward is issued after that one on the same stream, so stream ordering
+        covers the overlap either way.
         """
         self.state.release_pins()
+
+    def state_copies_for_batch(self) -> list[tuple[int, int]]:
+        """State copies the batch now being built has to issue before its
+        forward — checkpoints being kept and checkpoints being resumed from.
+
+        Must be called with the batch already decided; see
+        `StateGroupPool.take_copies`. Always empty for a forking backend.
+        """
+        return self.state.take_copies()
 
     def _record_evicted(self, h: int) -> None:
         """Report a hash the pool just dropped, as a KV event."""
@@ -398,18 +411,21 @@ class BlockManager:
         start). `can_allocate` already shrank the hit to a boundary that carries
         a checkpoint, so a lookup miss here just means the pool is off.
 
-        Resuming forks: the checkpoint stays indexed and the request writes a
-        fresh group, so a second request hitting the same prefix still finds it.
-        When no second group is free the request adopts the checkpoint instead
-        — still correct, the state is exactly the one it wanted, it just spends
-        the checkpoint rather than sharing it.
+        Resuming shares: the checkpoint stays indexed and the request gets a
+        group of its own, so a second request hitting the same prefix still
+        finds it. How the state reaches that group is the backend's
+        `StateTransfer` — a fork reads the checkpoint for one forward, a copy is
+        handed the bytes — and the two differ by one line here. When no second
+        group is free the request adopts the checkpoint instead: still correct,
+        the state is exactly the one it wanted, it just spends the checkpoint
+        rather than sharing it, and under either mechanism it needs nothing.
 
-        A checkpoint is read-only, so several requests in one step may fork off
-        the same one. The first takes it off the free list and the pin covers
-        every reader until `release_state_pins`; a later one in that same step
-        finds it already pinned and only needs a group to write into. Adopting
-        is then off the table — the pin means someone else's forward still has
-        to read it.
+        A checkpoint is read-only, so several requests in one step may resume
+        off the same one. The first takes it off the free list and the pin
+        covers every reader until `release_state_pins`; a later one in that same
+        step finds it already pinned and only needs a group to write into.
+        Adopting is then off the table — the pin means someone else's forward
+        still has to read it, or copy out of it.
         """
         src = self.state.lookup(hit_hash) if hit_hash != -1 else -1
         if src < 0:
@@ -420,15 +436,19 @@ class BlockManager:
         if not shared:
             self.state.claim(src)
         if self.state.has_free():
-            seq.per_req_cache_group = self.state.pop()
-            seq.state_fork_src = src
+            dst = self.state.pop()
+            seq.per_req_cache_group = dst
+            if self.state.transfer.copies:
+                self.state.record_copy(src, dst)
+            else:
+                seq.state_fork_src = src
             # Held off the free list until the forward that reads it is issued.
             self.state.pin(src)
             return
         # `can_allocate` admitted this seq against a non-empty free list and
         # nothing else has run since, so the list can only be empty here if this
         # seq itself just took the last group — which is `src`, unshared.
-        assert not shared, "no group to fork into and the source is being read"
+        assert not shared, "no group to resume into and the source is being read"
         self.state.invalidate(src)
         seq.per_req_cache_group = src
         seq.state_fork_src = -1
@@ -714,6 +734,9 @@ class BlockManager:
         # Likewise the demand: it describes one admission against one cache
         # state, and a re-admitted seq gets a fresh answer from `can_allocate`.
         seq.checkpoint_demand_pos = 0
+        # An uncommitted checkpoint describes state in a group that is about to
+        # go back on the free list, so the intent dies with it.
+        self.state.forget_pending(seq)
         seq.block_table.clear()
         if seq.has_per_req_cache and seq.per_req_cache_group >= 0:
             # Only the group the seq was writing. A checkpoint it took is

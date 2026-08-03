@@ -15,6 +15,7 @@ from torch import nn
 
 from atom.distributed.dcp_utils import get_dcp_rank, get_dcp_world_size
 from atom.model_engine.scheduler import ScheduledBatch
+from atom.model_engine.state_pool import StateTransfer
 from atom.model_ops.attention_mla import MLAModules
 from atom.model_ops.attentions.sub_pool_spec import SubPoolSpec
 from atom.utils import CpuGpuBuffer
@@ -137,24 +138,47 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         """
         return {}
 
-    def min_fork_tokens(self) -> int:
-        """Tokens the forward after a state fork must cover, 0 = no fork support.
+    def state_transfer(self) -> StateTransfer:
+        """How this backend hands one request's state to another group.
 
-        A fork hands the old state group to the checkpoint index and points the
-        request at a fresh one, reading the old and writing the new for exactly
-        one forward. That forward has to leave the new group self-contained:
-        every position the NEXT forward reads must have been written into it,
-        because a single read index cannot span the old group and the new one.
+        A checkpoint is a second group holding the state as of some boundary, so
+        every backend with per-request state has to say how one gets there.
+        There are three answers and `StateGroupPool` runs whichever it is told:
 
-        So the boundary is only forkable if the following forward covers at
-        least this many tokens — the full read window plus whatever slack the
-        backend's ring carries. `BlockManager` walks a publish/hit point back to
-        the previous block boundary until the condition holds.
+        `StateTransfer.fork(n)` — the state rolls and is not one range to
+        duplicate, so the old group goes to the index and the request takes a
+        fresh one, reading the old and writing the new for exactly one forward.
+        That forward has to leave the new group self-contained (a single read
+        index cannot span both), which takes `n` *committed* tokens.
+        `BlockManager` walks a checkpoint/hit point back to the previous block
+        boundary until it fits.
 
-        0 (default) means the backend has no forkable state; the checkpoint
-        index stays empty and prefix hits shrink to 0 for its models.
+        `StateTransfer.copy()` — one request's state is a contiguous byte range,
+        so the index gets a duplicate and the owner is left alone. No forward is
+        bound and no boundary is disqualified for lack of room, which is what
+        makes a decode boundary checkpointable at all: a decode step commits
+        `1 + accepted_drafts` tokens and acceptance is not knowable when the
+        checkpoint has to be decided. The backend must implement
+        `copy_state_entries`.
+
+        `StateTransfer.none()` (default) — no per-request state, or none that can
+        be handed over; the checkpoint index stays empty and prefix hits shrink
+        to 0 for its models.
         """
-        return 0
+        return StateTransfer.none()
+
+    def copy_state_entries(self, pairs: list[tuple[int, int]]) -> None:
+        """Copy each `(src, dst)` group's whole per-request state, src → dst.
+
+        Issued by `build` before the forward, on the compute stream, so a copy
+        lands after the forward that produced its source and before the one that
+        consumes its destination. Only backends declaring `StateTransfer.copy()`
+        are ever asked.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} declared a copy state transfer but does not "
+            "implement copy_state_entries"
+        )
 
     def get_kv_transfer_tensors(self) -> "KVTransferTensors | None":
         """Return RDMA transfer regions for PD disaggregation.
@@ -500,6 +524,14 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         )
 
     def build(self, batch: ScheduledBatch, bs: int):
+        # State checkpoints the scheduler decided on ride the batch as group
+        # pairs and are copied here, on the compute stream, before the forward.
+        # This is the one place every path — prefill, decode, dummy, DP-sync, PP
+        # microbatch, TBO — passes through exactly once per batch, which is what
+        # makes "each copy is issued once per rank" true by construction rather
+        # than by inspection of every prepare_* variant.
+        if batch.state_copy_pairs:
+            self.copy_state_entries(batch.state_copy_pairs)
         is_prefill = batch.total_tokens_num_prefill > 0
         if is_prefill:
             return self.prepare_prefill(batch)

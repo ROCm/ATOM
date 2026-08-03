@@ -30,10 +30,13 @@ class StateCache(Protocol):
 
       immutable   a filled SWA block is never written again, so keeping it is
                   one extra ref; a reader shares it and needs nothing else.
-      rolling     the compressor ring / GDN recurrence is still being written by
-                  its owner, so keeping it means handing it over and taking a
-                  fresh one; the reader forks, and the forward right after the
-                  hand-over has to refill the replacement by itself.
+      copyable    the DeepSeek-V4 compressor entry is a contiguous byte range,
+                  so keeping it is a duplicate handed to the index and the owner
+                  is never disturbed; the reader is handed a duplicate too.
+      rolling     GDN recurrence is still being written by its owner and is not
+                  one range to duplicate, so keeping it means handing it over
+                  and taking a fresh one; the reader forks, and the forward
+                  right after the hand-over has to refill the replacement.
 
     `successor_room` is that property, quantified — and it is the only thing the
     ladder needs to know about a class, which is why the rest of the difference
@@ -48,13 +51,13 @@ class StateCache(Protocol):
     #: Tokens the forward *after* a checkpoint must carry for that checkpoint to
     #: come out whole. Three regimes, one comparison:
     #:
-    #:   0     immutable — nothing is handed over, so no successor is needed.
+    #:   0     immutable or copyable — nothing is handed over, so no successor
+    #:         is needed.
     #:   n>0   rolling — the successor has to refill the replacement group, and
-    #:         this is how much of it that takes.
+    #:         this is how many committed tokens that takes.
     #:   inf   the class cannot be checkpointed at all, so no position ever
-    #:         qualifies. Distinct from 0: the attention backend API spells
-    #:         "no forkable state" as `min_fork_tokens() == 0`, which is the
-    #:         opposite end of this scale, and is decoded where it enters.
+    #:         qualifies. Distinct from 0, and a backend says which by declaring
+    #:         a `StateTransfer` rather than a bare token count.
     successor_room: float
 
     def applies(self, seq: Sequence) -> bool:

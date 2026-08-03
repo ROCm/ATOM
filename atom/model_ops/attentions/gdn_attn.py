@@ -10,6 +10,7 @@ from aiter.dist.parallel_state import get_tp_group
 
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.scheduler import ScheduledBatch
+from atom.model_engine.state_pool import StateTransfer
 from atom.model_ops.attention_gdn import GatedDeltaNet
 from atom.utils import CpuGpuBuffer
 from atom.utils.forward_context import AttentionMetaData, Context
@@ -255,8 +256,8 @@ class GDNStateMixin:
             self.model_runner.num_spec_tokens,
         )
 
-    def min_fork_tokens(self) -> int:
-        """Tokens the forward carrying a state fork must cover: one.
+    def state_transfer(self) -> StateTransfer:
+        """A fork whose successor forward need only carry one token.
 
         Both halves of the GDN state come out of a forward self-contained at any
         length. The recurrent state is rewritten whole, and every write path in
@@ -268,8 +269,12 @@ class GDNStateMixin:
         Reading the state layout alone suggests `conv_kernel_dim - 1` instead,
         on the theory that a shorter forward leaves the new group holding a
         window the old group still owns part of. The kernel closes that gap.
+
+        A fork rather than a copy because the state is two per-family tensors
+        rather than one contiguous entry, so there is no single range to
+        duplicate — and at one token the fork binds almost nothing anyway.
         """
-        return 1
+        return StateTransfer.fork(1)
 
     def state_spec(self) -> SubPoolSpec:
         """The GDN state pool: conv_state + temporal_state over all GDN
