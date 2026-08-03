@@ -44,11 +44,11 @@ class Sequence:
         self,
         token_ids: list[int],
         block_size: int,
-        sampling_params=SamplingParams(),
-        stop_token_sequences: list[list[int]] = None,
+        sampling_params: SamplingParams | None = None,
+        stop_token_sequences: list[list[int]] | None = None,
         stream_callback: Callable[[Any], None] | None = None,
         id=None,
-        kv_transfer_params: dict = None,
+        kv_transfer_params: dict | None = None,
         num_draft_tokens: int = 0,
         has_per_req_cache: bool = False,
         needs_independent_noise: bool = False,
@@ -59,6 +59,10 @@ class Sequence:
         mrope_positions: np.ndarray | None = None,
         mrope_position_delta: int = 0,
     ):
+        # Built here rather than as a default argument: one instance shared by
+        # every defaulting Sequence would be a mutable default in all but name.
+        if sampling_params is None:
+            sampling_params = SamplingParams()
         self.block_size = block_size
         self.id = id or next(Sequence.counter)
         self.external_request_id = request_id

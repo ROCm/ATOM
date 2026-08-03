@@ -31,23 +31,23 @@ MIN_FORK = 8
 
 
 def ckpt_config(**overrides):
-    defaults = dict(
-        kv_cache_block_size=BLOCK,
-        num_kvcache_blocks=200,
-        enable_prefix_caching=True,
-        max_num_seqs=4,
-        max_num_batched_tokens=256,
-        max_model_len=256,
-        bos_token_id=1,
-        eos_token_id=2,
-        stop_token_ids=[],
-        scheduler_delay_factor=0.0,
-        speculative_config=None,
-        pool_entries={"state": 4},
-        state_transfer_kind="fork",
-        state_fork_tokens=MIN_FORK,
-        state_checkpoint_interval_tokens=BLOCK,
-    )
+    defaults = {
+        "kv_cache_block_size": BLOCK,
+        "num_kvcache_blocks": 200,
+        "enable_prefix_caching": True,
+        "max_num_seqs": 4,
+        "max_num_batched_tokens": 256,
+        "max_model_len": 256,
+        "bos_token_id": 1,
+        "eos_token_id": 2,
+        "stop_token_ids": [],
+        "scheduler_delay_factor": 0.0,
+        "speculative_config": None,
+        "pool_entries": {"state": 4},
+        "state_transfer_kind": "fork",
+        "state_fork_tokens": MIN_FORK,
+        "state_checkpoint_interval_tokens": BLOCK,
+    }
     defaults.update(overrides)
     return MockConfig(**defaults)
 

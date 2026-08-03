@@ -28,8 +28,9 @@ depends on queue position. Both properties are tested here: the tail placement
 
 from types import SimpleNamespace
 
-from atom.model_engine.scheduler import Scheduler
 from conftest import MockConfig
+
+from atom.model_engine.scheduler import Scheduler
 
 
 def _spec_config(k=3):

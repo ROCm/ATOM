@@ -752,11 +752,10 @@ class BlockManager:
         ebs = self._effective_block_size()
         needed_blocks = (seq_len + num_new_tokens + ebs - 1) // ebs
         new_blocks_needed = max(0, needed_blocks - current_blocks)
-        if not self.kv.has_free(new_blocks_needed):
-            return False
-        if not self.swa.has_free(new_blocks_needed):  # True when SWA disabled
-            return False
-        return True
+        # `swa.has_free` is True when the sliding window is disabled.
+        return self.kv.has_free(new_blocks_needed) and self.swa.has_free(
+            new_blocks_needed
+        )
 
     def may_append(self, seq: Sequence, num_new_tokens: int = 1):
         # Note: in disaggregated (P/D) mode the scheduler skips this call on

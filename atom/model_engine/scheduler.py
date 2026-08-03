@@ -968,17 +968,20 @@ class Scheduler:
         # currently in use → seq with has_per_req_cache=True can never enter.
         # "No slots ever existed" is the permanent case, distinguished from
         # "all busy" by the pool's total capacity.
-        if seq.has_per_req_cache and not bm.state.has_free():
-            # All slots are currently in-use OR no slots were ever created.
-            # The schedule loop handles "currently full" by waiting; only
-            # warn for the permanent "never created" case.
-            if bm.num_per_req_cache_groups == 0:
-                logger.warning(
-                    "Request %s will never be scheduled: needs per-req cache "
-                    "slot but no slots were allocated (max_num_seqs=0 for "
-                    "this model type).",
-                    seq.id,
-                )
+        # An empty free list means either "all slots in use" — which the
+        # schedule loop handles by waiting — or "no slots were ever created",
+        # the permanent case, and only that one is worth warning about.
+        if (
+            seq.has_per_req_cache
+            and not bm.state.has_free()
+            and bm.num_per_req_cache_groups == 0
+        ):
+            logger.warning(
+                "Request %s will never be scheduled: needs per-req cache "
+                "slot but no slots were allocated (max_num_seqs=0 for "
+                "this model type).",
+                seq.id,
+            )
 
     def take_rejected(self) -> list[Sequence]:
         """Pop and return any seqs the prefill scheduler dropped because
@@ -1611,9 +1614,14 @@ class Scheduler:
         target = bm.checkpoint_cut(seq, start, start + chunk)
         if target:
             chunk = target - start
-        if seq.state_fork_src >= 0 and chunk < bm.state.min_fork_tokens:
-            if not bm.cancel_state_fork(seq):
-                chunk = bm.state.min_fork_tokens
+        # `cancel_state_fork` runs only when the first two hold, and returning
+        # False is what leaves the fork in place — hence holding the chunk open.
+        if (
+            seq.state_fork_src >= 0
+            and chunk < bm.state.min_fork_tokens
+            and not bm.cancel_state_fork(seq)
+        ):
+            chunk = bm.state.min_fork_tokens
         return chunk
 
     def _checkpoint_room(self, seq: Sequence, finished: bool) -> int:
