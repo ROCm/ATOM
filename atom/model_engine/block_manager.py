@@ -213,7 +213,11 @@ class BlockManager:
         return seq.token_ids[i * hbs : (i + 1) * hbs]
 
     def _gated_hit(
-        self, seq: Sequence, compressed_hit: int, block_hashes: list[int]
+        self,
+        seq: Sequence,
+        compressed_hit: int,
+        block_hashes: list[int],
+        assume_checkpointed: bool = False,
     ) -> int:
         """Rightmost boundary every Pool.STATE class can resume from.
 
@@ -230,12 +234,22 @@ class BlockManager:
         each round either terminates or strictly decreases; 0 is absorbing.
         Classes that do not apply are the identity, so a build with one class
         settles on the first round.
+
+        `assume_checkpointed` passes straight through to every class, giving the
+        joint counterfactual: not "the answer minus one class's gate" but "the
+        answer if every ladder were dense". A boundary the other classes decline
+        anyway is one no checkpoint would rescue.
         """
         boundary = compressed_hit
         while boundary > 0:
             settled = True
             for cache in self.state_caches:
-                accepted = cache.resumable_hit(seq, boundary, block_hashes)
+                accepted = cache.resumable_hit(
+                    seq,
+                    boundary,
+                    block_hashes,
+                    assume_checkpointed=assume_checkpointed,
+                )
                 if accepted != boundary:
                     boundary = accepted
                     settled = False
@@ -300,10 +314,16 @@ class BlockManager:
         # `_gated_hit` settles the two gates jointly; neither can be applied to
         # the other's answer.
         num_cached_blocks = self._gated_hit(seq, compressed_hit, block_hashes)
-        # Instrumentation: record the pre-gate compressed hit so CacheStats can
-        # separate reuse lost to the SWA tail gate (compressed_hit -
-        # num_cached_blocks) from reuse lost to compressed eviction.
+        # Instrumentation: the pre-gate hit, so CacheStats can separate reuse
+        # the gates declined (compressed_hit - num_cached_blocks) from reuse
+        # lost to compressed eviction (everything above compressed_hit).
         seq.num_compressed_hit_blocks = compressed_hit
+        self._record_checkpoint_demand(
+            seq,
+            hit=num_cached_blocks,
+            compressed_hit=compressed_hit,
+            block_hashes=block_hashes,
+        )
         # Free-pool demand: blocks we actually reuse minus those already used
         # (shared ref); blocks we drop from the hit become fresh → counted.
         num_new_blocks = self._n_hash_blocks(seq)
@@ -570,6 +590,49 @@ class BlockManager:
             return 0
         return max(int((seq.num_prompt_tokens - room) // interval) * interval, 0)
 
+    def _record_checkpoint_demand(
+        self, seq: Sequence, hit: int, compressed_hit: int, block_hashes: list[int]
+    ) -> None:
+        """Ask the hit counterfactually, and turn the gap into a rung.
+
+        Whenever the gates cut a hit short, the same question is worth asking a
+        second time with every ladder dense: how far would it have reached? What
+        that recovers is reuse being declined only because nobody checkpointed
+        there. What it does not recover is gone whatever anybody stores. The two
+        land in `num_wanted_hit_blocks` (which `CacheStats` splits the declined
+        reuse by) and `checkpoint_demand_pos` (which the ladder acts on).
+
+        The demand is a rung of this seq's own, off the interval grid, and the
+        seq that found the gap is the one best placed to fill it: it collects
+        none of that reuse and has to compute the prefix regardless.
+
+        Decided here, with both numbers in hand, rather than by the readers:
+        `hit` survives only as `seq.num_cached_tokens`, which the scheduler
+        advances as chunks land — under pipeline parallelism it is already past
+        this chunk by the time `hash_blocks` runs, so a reader comparing against
+        it would drop the demand on exactly the forward that was cut for it.
+
+        Demand under one interval is dropped, which is what keeps the property
+        `checkpoint_limit` states. The position satisfies
+        `num_prompt_tokens - pos >= successor_room` by construction, so one
+        interval of demand implies `checkpoint_limit > 0`: a workload keeping no
+        checkpoints today gains no chunk cuts from this, not one. It also
+        filters the shape where a shared prefix is a template header and every
+        checkpoint is invalidated by the next admission — there each request
+        would pay for a cut and none would collect.
+        """
+        wanted = (
+            self._gated_hit(seq, compressed_hit, block_hashes, assume_checkpointed=True)
+            if hit < compressed_hit
+            else hit
+        )
+        interval = self.state_checkpoint_interval_tokens
+        pos = wanted * self.hash_block_size
+        seq.num_wanted_hit_blocks = wanted
+        seq.checkpoint_demand_pos = (
+            pos if interval and pos >= interval and wanted > hit else 0
+        )
+
     def checkpoint_cut(self, seq: Sequence, start: int, end: int) -> int:
         """Latest ladder position in `(start, end]`, or 0 if there is none.
 
@@ -581,10 +644,15 @@ class BlockManager:
         limit = self.checkpoint_limit(seq)
         if not limit:
             return 0
-        end = min(end, limit)
         # `limit` is itself a multiple of the interval, so a chunk cut at it
         # needs no special case.
-        target = end - end % self.state_checkpoint_interval_tokens
+        rung = min(end, limit)
+        rung -= rung % self.state_checkpoint_interval_tokens
+        # A demand is not capped by `limit`: `limit` is the last position on the
+        # *grid* that leaves the widest class its room, and a demand carries
+        # that room by construction — it can sit to the right of the last rung.
+        demand = seq.checkpoint_demand_pos
+        target = max(rung, demand if demand <= end else 0)
         return target if target > start else 0
 
     def checkpointers_at(
@@ -614,9 +682,16 @@ class BlockManager:
         last token, so a forward that overshoots a rung is ahead of the hash it
         would be filed under; the scheduler cuts prefill chunks to land here,
         and a path that doesn't simply keeps nothing.
+
+        On top of the grid sits at most one rung of this seq's own,
+        `checkpoint_demand_pos` — a boundary this seq was denied for want of a
+        checkpoint (`_record_checkpoint_demand`). `checkpoint_cut` reads the
+        same field, so the cut and the keep cannot drift apart.
         """
         interval = self.state_checkpoint_interval_tokens
-        if interval <= 0 or pos <= 0 or pos % interval:
+        if interval <= 0 or pos <= 0:
+            return []
+        if pos % interval and pos != seq.checkpoint_demand_pos:
             return []
         if next_forward_tokens is None:
             next_forward_tokens = seq.num_prompt_tokens - pos
@@ -636,6 +711,9 @@ class BlockManager:
         # The block table is gone, so nothing of this seq is hashed any more.
         # Covers preemption too, which frees through here and re-prefills.
         seq.num_hashed_tokens = 0
+        # Likewise the demand: it describes one admission against one cache
+        # state, and a re-admitted seq gets a fresh answer from `can_allocate`.
+        seq.checkpoint_demand_pos = 0
         seq.block_table.clear()
         if seq.has_per_req_cache and seq.per_req_cache_group >= 0:
             # Only the group the seq was writing. A checkpoint it took is

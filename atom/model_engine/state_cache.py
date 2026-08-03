@@ -61,12 +61,24 @@ class StateCache(Protocol):
         """Whether this class gates or checkpoints anything for `seq`."""
         ...
 
-    def resumable_hit(self, seq: Sequence, hit: int, block_hashes: list[int]) -> int:
+    def resumable_hit(
+        self,
+        seq: Sequence,
+        hit: int,
+        block_hashes: list[int],
+        assume_checkpointed: bool = False,
+    ) -> int:
         """Largest boundary `L <= hit` (in blocks) this class can resume from.
 
         Scanned right-to-left so the hit is cut as little as possible. 0 is
         always valid — a request starting from scratch needs no prior state.
         Identity when the class does not apply.
+
+        `assume_checkpointed` asks the counterfactual instead: the answer this
+        class would give if a checkpoint sat at every boundary. Whatever still
+        cuts the hit under that assumption is a limit no amount of
+        checkpointing can lift, which is what separates reuse worth arranging a
+        checkpoint for from reuse that is simply gone.
         """
         ...
 

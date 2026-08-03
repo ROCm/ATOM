@@ -140,11 +140,13 @@ class CacheStats:
         "_interval_compressed_tokens",
         "_interval_full_tokens",
         "_interval_requests",
+        "_interval_wanted_tokens",
         "_log_interval",
         "total_cached_tokens",
         "total_compressed_tokens",
         "total_full_tokens",
         "total_requests",
+        "total_wanted_tokens",
     )
 
     def __init__(self, log_interval: int = 100):
@@ -152,29 +154,46 @@ class CacheStats:
         self.total_requests: int = 0
         self.total_cached_tokens: int = 0
         self.total_full_tokens: int = 0
-        # Pre-SWA-gate compressed-prefix hit tokens. total - cached separates
-        # reuse lost to the SWA tail gate from reuse lost to compressed eviction.
+        # Pre-gate compressed-prefix hit tokens. compressed - cached is reuse
+        # the Pool.STATE gates declined; full - compressed is reuse lost to
+        # compressed eviction or never there.
         self.total_compressed_tokens: int = 0
+        # Where the gates would have landed with every state ladder dense. It
+        # sits between cached and compressed and splits the declined reuse in
+        # two: below it a checkpoint was missing, above it nothing would have
+        # helped. Without the split "declined" is one number and whether
+        # demand-driven checkpointing applies to a workload is unfalsifiable.
+        self.total_wanted_tokens: int = 0
         self._interval_requests: int = 0
         self._interval_cached_tokens: int = 0
         self._interval_full_tokens: int = 0
         self._interval_compressed_tokens: int = 0
+        self._interval_wanted_tokens: int = 0
 
     def update(
         self,
         num_cached_tokens: int,
         num_full_tokens: int,
-        num_compressed_tokens: int = 0,
+        num_compressed_tokens: int,
+        num_wanted_tokens: int,
     ) -> None:
-        """Record cache stats for one prefill sequence."""
+        """Record cache stats for one prefill sequence.
+
+        All four are required because the reported rates are differences
+        between them: `cached <= wanted <= compressed <= full`. A defaulted
+        argument would silently report a negative rate rather than a missing
+        one.
+        """
         self.total_requests += 1
         self.total_cached_tokens += num_cached_tokens
         self.total_full_tokens += num_full_tokens
         self.total_compressed_tokens += num_compressed_tokens
+        self.total_wanted_tokens += num_wanted_tokens
         self._interval_requests += 1
         self._interval_cached_tokens += num_cached_tokens
         self._interval_full_tokens += num_full_tokens
         self._interval_compressed_tokens += num_compressed_tokens
+        self._interval_wanted_tokens += num_wanted_tokens
 
         if self.total_requests % self._log_interval == 0:
             self._log()
@@ -191,40 +210,58 @@ class CacheStats:
         self._interval_cached_tokens = 0
         self._interval_full_tokens = 0
         self._interval_compressed_tokens = 0
+        self._interval_wanted_tokens = 0
 
     @staticmethod
     def _rate(num: int, den: int) -> float:
         return num / den if den > 0 else 0.0
 
     def _log(self) -> None:
-        # compressed = pre-gate prefix hit; cached = post-gate (admitted).
-        # (compressed - cached) is reuse the gates declined — a missing SWA tail
-        # or, on a stateful model, no state checkpoint at that boundary; (full -
-        # compressed) is reuse lost to compressed eviction / no logical reuse.
-        iv_hit = self._rate(self._interval_cached_tokens, self._interval_full_tokens)
-        iv_comp = self._rate(
-            self._interval_compressed_tokens, self._interval_full_tokens
-        )
-        iv_gate = self._rate(
-            self._interval_compressed_tokens - self._interval_cached_tokens,
+        # compressed = pre-gate prefix hit; cached = post-gate (admitted); the
+        # two differ by what the Pool.STATE gates declined, and `wanted` splits
+        # that difference where it matters:
+        #   Lost-to-checkpoint  wanted - cached, reuse a checkpoint at that
+        #                       boundary would have delivered. What the demand
+        #                       rung goes after; expected to fall toward 0 on a
+        #                       workload with a genuinely shared prefix.
+        #   Lost-unrecoverable  compressed - wanted, declined for a reason no
+        #                       checkpoint touches: the SWA tail is gone, or the
+        #                       boundary is too near the prompt's end to fork.
+        # (full - compressed) is the rest: compressed eviction, or no reuse.
+        self._log_line(
+            "Interval",
+            self._interval_requests,
+            self._interval_cached_tokens,
+            self._interval_compressed_tokens,
+            self._interval_wanted_tokens,
             self._interval_full_tokens,
         )
-        logger.info(
-            f"[Cache Stats Interval] Reqs: {self._interval_requests}, "
-            f"Cached/Total: {self._interval_cached_tokens}/{self._interval_full_tokens}, "
-            f"Hit: {iv_hit:.2%}, Compressed-hit: {iv_comp:.2%}, "
-            f"Lost-to-gates: {iv_gate:.2%}"
-        )
-        tot_comp = self._rate(self.total_compressed_tokens, self.total_full_tokens)
-        tot_gate = self._rate(
-            self.total_compressed_tokens - self.total_cached_tokens,
+        self._log_line(
+            "        ",
+            self.total_requests,
+            self.total_cached_tokens,
+            self.total_compressed_tokens,
+            self.total_wanted_tokens,
             self.total_full_tokens,
         )
+
+    @classmethod
+    def _log_line(
+        cls,
+        label: str,
+        reqs: int,
+        cached: int,
+        compressed: int,
+        wanted: int,
+        full: int,
+    ) -> None:
         logger.info(
-            f"[Cache Stats         ] Reqs: {self.total_requests}, "
-            f"Cached/Total: {self.total_cached_tokens}/{self.total_full_tokens}, "
-            f"Hit: {self.hit_rate:.2%}, Compressed-hit: {tot_comp:.2%}, "
-            f"Lost-to-gates: {tot_gate:.2%}"
+            f"[Cache Stats {label}] Reqs: {reqs}, "
+            f"Cached/Total: {cached}/{full}, "
+            f"Hit: {cls._rate(cached, full):.2%}, "
+            f"Compressed-hit: {cls._rate(compressed, full):.2%}, "
+            f"Lost-to-checkpoint: {cls._rate(wanted - cached, full):.2%}, "
+            f"Lost-unrecoverable: {cls._rate(compressed - wanted, full):.2%}"
         )
 
 
@@ -1541,7 +1578,8 @@ class Scheduler:
 
         1. A checkpoint can only be kept where a forward ends exactly on a rung
            of the ladder — otherwise the state is ahead of the hash it would be
-           filed under. So land chunks on that grid, shortening at most to the
+           filed under. So land chunks on that grid (plus, at most once, a
+           position this seq itself was seen to want), shortening to the
            previous rung; `BlockManager.checkpoint_cut` owns the arithmetic, so
            that it cannot drift from the rule deciding what actually gets kept.
         2. The forward carrying a fork has to fill the request's new group by
@@ -1608,10 +1646,15 @@ class Scheduler:
     ) -> tuple[int, int]:
         num_seqs_prefill += 1
         if self.cache_stats:
+            # Hit counts are in hash blocks — one block_table entry spans
+            # `block_size * dcp_world_size` tokens — so scaling by block_size
+            # would under-report by the DCP factor.
+            hbs = self.block_manager.hash_block_size
             self.cache_stats.update(
                 seq.num_cached_tokens,
                 seq.num_tokens,
-                seq.num_compressed_hit_blocks * self.block_manager.block_size,
+                seq.num_compressed_hit_blocks * hbs,
+                seq.num_wanted_hit_blocks * hbs,
             )
         num_batched_tokens += chunk
         seq.status = SequenceStatus.RUNNING

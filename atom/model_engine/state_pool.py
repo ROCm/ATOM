@@ -111,7 +111,13 @@ class StateGroupPool:
         return self.enabled and seq.has_per_req_cache
 
     # ------------------------------- lookup -------------------------------- #
-    def resumable_hit(self, seq, hit: int, block_hashes: list[int]) -> int:
+    def resumable_hit(
+        self,
+        seq,
+        hit: int,
+        block_hashes: list[int],
+        assume_checkpointed: bool = False,
+    ) -> int:
         """Shrink a compressed-prefix hit to the nearest recoverable boundary.
 
         Returns the largest `L <= hit` such that a checkpoint exists for the
@@ -127,12 +133,16 @@ class StateGroupPool:
 
         Without this a hit hands the resumed forward a group freshly popped off
         the free list and it reads the previous occupant's state.
+
+        `assume_checkpointed` drops the index lookup and keeps the fork test,
+        which is the counterfactual the protocol describes: this class's ladder
+        made dense, leaving only what a checkpoint could not have fixed.
         """
         if not self.applies(seq):
             return hit
         hbs = self.hash_block_size
         for i in range(hit - 1, -1, -1):
-            if block_hashes[i] not in self.hash_to_group:
+            if not assume_checkpointed and block_hashes[i] not in self.hash_to_group:
                 continue
             if seq.num_tokens - (i + 1) * hbs >= self.min_fork_tokens:
                 return i + 1

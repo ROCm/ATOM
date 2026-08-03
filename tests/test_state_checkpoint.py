@@ -20,7 +20,7 @@ import pytest
 from conftest import MockConfig
 
 from atom.model_engine.block_manager import BlockManager
-from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
+from atom.model_engine.scheduler import CacheStats, ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import Sequence, SequenceType
 from atom.model_engine.state_cache import StateCache
 from atom.model_engine.state_pool import StateGroupPool
@@ -72,6 +72,32 @@ def publish_at_boundary(bm: BlockManager, seq: Sequence) -> int:
     assert boundary > 0
     bm.hash_blocks(seq, boundary - seq.num_cached_tokens)
     return boundary_hash(bm, seq)
+
+
+def run_prompt_on_the_ladder(bm: BlockManager, seq: Sequence) -> list[int]:
+    """Admit `seq`, then forward its prompt on the ladder."""
+    bm.allocate(seq, bm.can_allocate(seq))
+    return forward_on_the_ladder(bm, seq)
+
+
+def forward_on_the_ladder(bm: BlockManager, seq: Sequence) -> list[int]:
+    """Forward an admitted seq's remaining prompt, cutting where the ladder says.
+
+    What the scheduler does minus the token budget: each chunk runs to the end
+    of the prompt unless `checkpoint_cut` pulls it back. Returns the positions
+    it was cut at, which is the cost side of every checkpoint kept.
+    """
+    cuts = []
+    while seq.num_cached_tokens < seq.num_prompt_tokens:
+        start = seq.num_cached_tokens
+        chunk = seq.num_prompt_tokens - start
+        target = bm.checkpoint_cut(seq, start, start + chunk)
+        if target:
+            chunk = target - start
+            cuts.append(target)
+        bm.hash_blocks(seq, chunk, start_tokens=start)
+        seq.num_cached_tokens = start + chunk
+    return cuts
 
 
 def boundary_hash(bm: BlockManager, seq: Sequence) -> int:
@@ -362,14 +388,18 @@ class TestForkLifecycle:
         hashes = [1000 + i for i in range(9)]
         for group, boundary in enumerate(published):
             bm.state._index(hashes[boundary - 1], group)
-        bm.swa.resumable_hit = lambda s, p, h, _a=approved: min(p, _a)
+        bm.swa.resumable_hit = (
+            lambda s, p, h, assume_checkpointed=False, _a=approved: min(p, _a)
+        )
 
         assert bm._gated_hit(seq, 9, hashes) == approved
 
         # Now SWA only accepts 4: the rightmost checkpoint (5) is out of reach,
         # so the answer must fall back to 2 rather than stay at 5 or become 4.
         approved = 4
-        bm.swa.resumable_hit = lambda s, p, h, _a=approved: min(p, _a)
+        bm.swa.resumable_hit = (
+            lambda s, p, h, assume_checkpointed=False, _a=approved: min(p, _a)
+        )
         assert bm._gated_hit(seq, 9, hashes) == 2
 
     def test_no_boundary_when_the_backend_cannot_fork(self):
@@ -728,7 +758,7 @@ class TestGatedHitFixpoint:
         hashes = [1000 + i for i in range(9)]
         for group, boundary in enumerate([2, 5]):
             bm.state._index(hashes[boundary - 1], group)
-        bm.swa.resumable_hit = lambda s, p, h: min(p, 4)
+        bm.swa.resumable_hit = lambda s, p, h, assume_checkpointed=False: min(p, 4)
 
         answer = bm._gated_hit(seq, 9, hashes)
         for cache in bm.state_caches:
@@ -740,8 +770,176 @@ class TestGatedHitFixpoint:
         hashes = [1000 + i for i in range(9)]
         for group, boundary in enumerate([2, 5]):
             bm.state._index(hashes[boundary - 1], group)
-        bm.swa.resumable_hit = lambda s, p, h: min(p, 4)
+        bm.swa.resumable_hit = lambda s, p, h, assume_checkpointed=False: min(p, 4)
 
         forward = bm._gated_hit(seq, 9, hashes)
         bm.state_caches = tuple(reversed(bm.state_caches))
         assert bm._gated_hit(seq, 9, hashes) == forward
+
+
+# ── Demand-driven checkpoints ──────────────────────────────────────────────
+
+
+INTERVAL = 4 * BLOCK
+PROMPT = list(range(44))  # 11 blocks; last never reused, so 10 are hittable
+
+
+def demand_config(**overrides):
+    """A grid too coarse to cover the prompt, so demand has room to show.
+
+    `INTERVAL` of 16 over a 4-token hash block puts rungs at 16 and 32, while
+    the fork test allows a checkpoint as far right as 36 — the gap between
+    those two is what a demand rung fills.
+    """
+    overrides.setdefault("state_checkpoint_interval_tokens", INTERVAL)
+    overrides.setdefault("pool_entries", {"state": 8})
+    overrides.setdefault("max_num_seqs", 8)
+    return ckpt_config(**overrides)
+
+
+class TestDemandDrivenCheckpoints:
+    """A rung placed where a request was seen to want one.
+
+    The interval is a guess about where reuse will resume; the requests know.
+    Whenever the state gates cut a hit short, `can_allocate` asks the same
+    question again with every ladder assumed dense, and the gap between the two
+    answers is reuse being declined only for want of a checkpoint. The request
+    that finds the gap is the one that pays for it — it collects none of that
+    reuse and has to compute the prefix anyway.
+    """
+
+    def test_the_gap_becomes_a_rung_off_the_grid(self):
+        bm = BlockManager(demand_config())
+        run_prompt_on_the_ladder(bm, stateful_seq(PROMPT))
+
+        second = stateful_seq(PROMPT)
+        assert bm.can_allocate(second) == 8  # the grid's last rung, 32 tokens
+        assert second.num_wanted_hit_blocks == 9  # what a checkpoint would give
+        assert second.checkpoint_demand_pos == 36
+        # Off the grid, and to the right of the last rung the grid offers: the
+        # demand carries its own fork room, so `limit` does not cap it.
+        assert 36 % INTERVAL
+        assert bm.checkpoint_limit(second) == 32
+
+    def test_the_third_request_finds_what_the_second_was_missing(self):
+        """Self-limiting: nothing to want, want it once, want nothing again."""
+        bm = BlockManager(demand_config())
+
+        first = stateful_seq(PROMPT)
+        assert run_prompt_on_the_ladder(bm, first) == [32]  # the grid alone
+        assert first.checkpoint_demand_pos == 0  # nothing was cached to fall short
+
+        second = stateful_seq(PROMPT)
+        bm.allocate(second, bm.can_allocate(second))
+        assert second.num_cached_tokens == 32  # the grid got it this far...
+        assert second.checkpoint_demand_pos == 36  # ...one block short of the rest
+        assert forward_on_the_ladder(bm, second) == [36]  # one cut, for the gap
+
+        third = stateful_seq(PROMPT)
+        bm.allocate(third, bm.can_allocate(third))
+        assert third.num_cached_tokens == 36
+        assert third.checkpoint_demand_pos == 0  # nothing left to want
+        assert forward_on_the_ladder(bm, third) == []
+
+    def test_reuse_another_class_declines_is_not_charged_to_the_ladder(self):
+        """The counterfactual keeps every other gate applied.
+
+        A boundary whose sliding window is gone stays out of reach however
+        densely the ring is checkpointed, so it must not buy a cut. Attributing
+        the whole gap to the ladder would have every request pay for a
+        checkpoint the next one still cannot use.
+        """
+        bm = BlockManager(demand_config())
+        run_prompt_on_the_ladder(bm, stateful_seq(PROMPT))
+        bm.swa.resumable_hit = lambda s, p, h, assume_checkpointed=False: min(p, 8)
+
+        second = stateful_seq(PROMPT)
+        assert bm.can_allocate(second) == 8
+        assert second.num_compressed_hit_blocks == 10  # 2 blocks declined...
+        assert second.num_wanted_hit_blocks == 8  # ...none of it recoverable
+        assert second.checkpoint_demand_pos == 0
+
+    def test_demand_under_one_interval_costs_nothing(self):
+        """`checkpoint_limit`'s promise, from the other side.
+
+        A demand of at least one interval implies a limit above zero, because
+        the demand carries `successor_room` behind it by construction. So a
+        workload keeping no checkpoints today cannot start paying for cuts —
+        the threshold is what makes that statable rather than probable.
+        """
+        bm = BlockManager(demand_config())
+        short = list(range(16))  # under one interval
+        run_prompt_on_the_ladder(bm, stateful_seq(short))
+
+        second = stateful_seq(short)
+        assert bm.can_allocate(second) == 0
+        assert second.num_wanted_hit_blocks == 2  # a checkpoint at 8 would land
+        assert bm.checkpoint_limit(second) == 0  # but this prompt keeps none
+        assert second.checkpoint_demand_pos == 0
+        assert run_prompt_on_the_ladder(bm, second) == []
+
+    def test_the_demand_is_cut_and_kept_at_the_same_position(self):
+        """The cut and the keep read the same call, so they cannot drift."""
+        bm = BlockManager(demand_config())
+        run_prompt_on_the_ladder(bm, stateful_seq(PROMPT))
+        seq = stateful_seq(PROMPT)
+        bm.allocate(seq, bm.can_allocate(seq))
+        assert seq.checkpoint_demand_pos == 36
+
+        n = len(PROMPT)
+        cuts = {bm.checkpoint_cut(seq, pos - 1, pos) for pos in range(1, n + 1)}
+        rungs = {pos for pos in range(1, n + 1) if bm.checkpointers_at(seq, pos)}
+        assert cuts - {0} == rungs == {16, 32, 36}
+
+    def test_a_recorded_demand_is_always_a_position_something_keeps(self):
+        """Otherwise the cut is an extra forward that stores nothing.
+
+        The demand comes out of the same fork test the ladder applies, on the
+        same request, so it satisfies `successor_room` by construction. Swept
+        rather than argued, because the two derivations sit in different files.
+        """
+        for n in range(20, 60, 3):
+            bm = BlockManager(demand_config())
+            tokens = list(range(1000 * n, 1000 * n + n))
+            run_prompt_on_the_ladder(bm, stateful_seq(tokens))
+            seq = stateful_seq(tokens)
+            bm.allocate(seq, bm.can_allocate(seq))
+            demand = seq.checkpoint_demand_pos
+            assert not demand or bm.checkpointers_at(seq, demand), n
+
+    def test_a_stateless_model_records_no_demand(self):
+        bm = BlockManager(demand_config(pool_entries={}, state_min_fork_tokens=0))
+        cold = Sequence(PROMPT, BLOCK, has_per_req_cache=False)
+        run_prompt_on_the_ladder(bm, cold)
+        warm = Sequence(PROMPT, BLOCK, has_per_req_cache=False)
+        assert bm.can_allocate(warm) == 10  # nothing was gating it
+        assert warm.checkpoint_demand_pos == 0
+
+
+class TestCacheStatsAttribution:
+    """Splitting declined reuse into the part a checkpoint reaches and the rest.
+
+    One number for both makes "does demand-driven checkpointing apply to this
+    workload" unfalsifiable, which is the whole reason the counterfactual is
+    computed outside the tests.
+    """
+
+    def test_the_split_accounts_for_every_declined_token(self):
+        stats = CacheStats(log_interval=10**6)
+        stats.update(32, 44, 40, 36)
+        lost_to_checkpoint = stats.total_wanted_tokens - stats.total_cached_tokens
+        lost_hard = stats.total_compressed_tokens - stats.total_wanted_tokens
+        assert lost_to_checkpoint == 4
+        assert lost_hard == 4
+        assert lost_to_checkpoint + lost_hard == 40 - 32
+
+    def test_hit_tokens_are_counted_in_hash_blocks(self):
+        """Under DCP one block_table entry spans `dcp` blocks of tokens."""
+        sched = Scheduler(demand_config(decode_context_parallel_size=2))
+        assert sched.block_manager.hash_block_size == 2 * BLOCK
+        seq = stateful_seq(PROMPT)
+        seq.num_compressed_hit_blocks = 3
+        seq.num_wanted_hit_blocks = 2
+        sched._schedule_prefill_seq(seq, 44, {}, [], 0, 0)
+        assert sched.cache_stats.total_compressed_tokens == 3 * 2 * BLOCK
+        assert sched.cache_stats.total_wanted_tokens == 2 * 2 * BLOCK

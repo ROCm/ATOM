@@ -108,7 +108,13 @@ class SlidingWindowPool:
         cap = self.tail_blocks + 1
         return min(cap, seq.num_blocks)
 
-    def resumable_hit(self, seq: Sequence, P: int, block_hashes: list[int]) -> int:
+    def resumable_hit(
+        self,
+        seq: Sequence,
+        P: int,
+        block_hashes: list[int],
+        assume_checkpointed: bool = False,
+    ) -> int:
         """Prefix-cache gate (vLLM SlidingWindowManager, simple-hybrid one pass).
         Given the compressed prefix length `P` and each block's content hash,
         return the largest boundary `L <= P` whose trailing window
@@ -126,7 +132,12 @@ class SlidingWindowPool:
         Falls through to the length of a contiguous run ending at block 0 (0 if
         block 0 is absent): covers short prompts (P < tail_blocks, whole prefix
         within one window) and vLLM's partial-hit case; the boundary's window then
-        spans [0, L) which is present, so it stays safe. Disabled → return P."""
+        spans [0, L) which is present, so it stays safe. Disabled → return P.
+
+        `assume_checkpointed` is inert here: this class keeps no checkpoints, so
+        a dense ladder is still an empty one and what it declines it declines
+        either way. That is the whole point of asking every class — a boundary
+        this pool cannot serve is not worth checkpointing the ring at."""
         if not self.enabled:
             return P
         need = self.tail_blocks
