@@ -397,11 +397,11 @@ jobs:
         run: |
           if docker info > /dev/null 2>&1; then
             CONTAINER_ENGINE=docker
-          elif command -v podman > /dev/null 2>&1; then
+          elif podman info > /dev/null 2>&1; then
             CONTAINER_ENGINE=podman
           else
-            echo "ERROR: Neither docker nor podman is available on this runner."
-            exit 1
+            echo "Neither docker nor podman is available; skipping container-based workspace cleanup."
+            exit 0
           fi
 
           echo "=== Cleaning up containers on $(hostname) with ${CONTAINER_ENGINE} ==="
