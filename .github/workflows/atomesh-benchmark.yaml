@@ -97,16 +97,10 @@ on:
         default: ''
         type: string
       atomesh_1p1d_nodes:
-        description: 'ATOMesh 1P1D node pair'
+        description: 'ATOMesh 1P1D node pair, comma-separated (or auto)'
         required: false
         default: auto
-        type: choice
-        options:
-          - auto
-          - mia1-p02-g42,mia1-p02-g44
-          - mia1-p02-g42,mia1-p02-g47
-          - mia1-p02-g44,mia1-p02-g47
-          - mia1-p01-g36,mia1-p01-g43
+        type: string
       atomesh_2p1d_nodes:
         description: 'ATOMesh 2P1D nodes'
         required: false
