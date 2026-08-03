@@ -1414,6 +1414,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             ),
             "swiglu_limit": getattr(layer, "swiglu_limit", 0.0),
         }
+        if activation == ActivationType.Situv2:
+            moe_extra_args["beta"] = getattr(layer, "activation_situ_beta", None)
+            moe_extra_args["linear_beta"] = getattr(
+                layer, "activation_situ_linear_beta", None
+            )
         if self.fused_experts is None:
             return fused_moe(
                 x,
@@ -2568,6 +2573,14 @@ class FusedMoE(torch.nn.Module):
         self.scoring_func = scoring_func
         self.e_score_correction_bias = e_score_correction_bias
         self.activation = activation
+        if config is not None:
+            self.activation_situ_beta = getattr(config, "activation_situ_beta", None)
+            self.activation_situ_linear_beta = getattr(
+                config, "activation_situ_linear_beta", None
+            )
+        else:
+            self.activation_situ_beta = None
+            self.activation_situ_linear_beta = None
 
         self.use_chunked = get_dp_group().world_size > 1
 
@@ -3010,6 +3023,9 @@ class FusedMoE(torch.nn.Module):
     @staticmethod
     def _copy_quant_storage(dst: torch.Tensor, src: torch.Tensor) -> None:
         """Copy quantized tensors without numeric conversion of byte formats."""
+        if src.device.type == "cpu" and not src.is_contiguous():
+            src = src.contiguous()
+
         if dst.dtype == dtypes.fp4x2:
             dst.view(torch.uint8).copy_(src.view(torch.uint8))
             return

@@ -1021,11 +1021,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         runner = self.model_runner
         if not hasattr(runner, "v4_unified_kv"):
             return None
-        if self._kv_fp8:
-            # PD disaggregation with 2buff fp8 KV cache is not yet supported:
-            # the byte-region math below assumes a single unified pool and
-            # ignores the parallel rope pool. Disable KV transfer for fp8.
-            return None
 
         # `get_kv_transfer_tensors` is called unconditionally on every
         # `allocate_kv_cache` (not just under disagg); returning None means
@@ -1075,6 +1070,26 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             else:
                 continue
             block_regions.append(KVTransferRegion(compress_base, compress_total, bpb))
+            if self._kv_fp8:
+                rope = runner.v4_unified_kv_rope[layer_id]
+                if rope is None:
+                    raise RuntimeError(
+                        "DeepSeek-V4 fp8 KV transfer requires a parallel RoPE pool"
+                    )
+                rope_prefix_bytes = swa_pages * self.rope_head_dim * rope.element_size()
+                rope_total = rope.numel() * rope.element_size() - rope_prefix_bytes
+                rope_bpb = (
+                    self.k1_csa * self.rope_head_dim * rope.element_size()
+                    if ratio == 4
+                    else self.k2_hca * self.rope_head_dim * rope.element_size()
+                )
+                block_regions.append(
+                    KVTransferRegion(
+                        rope.data_ptr() + rope_prefix_bytes,
+                        rope_total,
+                        rope_bpb,
+                    )
+                )
 
         # Block regions: CSA Indexer KV (FP8)
         for pos in range(len(self.csa_layers)):
@@ -1089,17 +1104,33 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # block_table). Emit it as swa_block_regions so the connector keys it by
         # swa_block_table — window-freeing leaves only the live tail (the last
         # ~128-token block) as non-(-1) entries, so only that gets transferred.
-        # block b's SWA lives at uv[0] + b*block_size*head_dim*elem.
-        swa_block_bytes = self.swa_block_bytes_per_layer()
+        # FP8 2buf KV registers NoPE and RoPE SWA pools as separate regions.
         for layer_id in range(self.num_layers):
             uv = runner.v4_unified_kv[layer_id]
+            nope_swa_bpb = self.block_size * self.head_dim * uv.element_size()
             swa_block_regions.append(
                 KVTransferRegion(
                     uv.data_ptr(),
-                    swa_pages * self.head_dim * elem_classical,
-                    swa_block_bytes,
+                    swa_pages * self.head_dim * uv.element_size(),
+                    nope_swa_bpb,
                 )
             )
+            if self._kv_fp8:
+                rope = runner.v4_unified_kv_rope[layer_id]
+                if rope is None:
+                    raise RuntimeError(
+                        "DeepSeek-V4 fp8 SWA transfer requires a parallel RoPE pool"
+                    )
+                rope_swa_bpb = (
+                    self.block_size * self.rope_head_dim * rope.element_size()
+                )
+                swa_block_regions.append(
+                    KVTransferRegion(
+                        rope.data_ptr(),
+                        swa_pages * self.rope_head_dim * rope.element_size(),
+                        rope_swa_bpb,
+                    )
+                )
 
         # Staging pool for compressor states (not in slot_regions — managed
         # separately by the connector with pool acquire/release).

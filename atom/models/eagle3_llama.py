@@ -18,6 +18,8 @@ Weight keys map directly to model attribute paths; no key rewriting needed.
 import torch
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.rotary_embedding import get_rope
+from torch import nn
+
 from atom.config import Config
 from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.base_attention import Attention
@@ -39,7 +41,6 @@ from atom.model_ops.linear import (
 )
 from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
-from torch import nn
 
 # AR+RMSNorm fusion: when on (default), RowParallel o_proj/down_proj skip their
 # own all-reduce (reduce_results=False) and the downstream RMSNorm fuses
@@ -482,9 +483,9 @@ class Eagle3LlamaModel(nn.Module):
             hidden_states = self.norm(hidden_states)
         return self.lm_head(hidden_states)
 
-    def compute_draft_token(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Greedy draft token via distributed argmax — avoids all-gathering the
-        full [N, vocab] logits every draft step. Token-identical to
+    def compute_draft_ids(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Greedy draft token ids via distributed argmax — avoids all-gathering
+        the full [N, vocab] logits every draft step. Token-identical to
         compute_logits(...).argmax(-1); norm handling mirrors compute_logits.
         """
         if not self.norm_output:

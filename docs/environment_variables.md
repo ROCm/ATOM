@@ -46,6 +46,10 @@ no wall-clock skew). See `atom/model_engine/prefill_delayer.py`. Active only whe
 | **ATOM_DISABLE_MMAP** | bool | false | If set to `true`, disable memory-mapped file loading for model weights. Useful in containerized environments where mmap may cause issues. |
 | **ATOM_LOADER_NUM_THREADS** | int | 16 | Worker threads for weight loading. `>1` (default `16`) enables the batched parallel loader (routed expert weights staged in a CPU buffer, flushed with a single H2D copy when every routed expert of that parameter has arrived) with that many threads; set to `1` to fall back to the original sequential per-expert path. Raise on high-core hosts if loading is CPU-bound. |
 | **ATOM_LOADER_STRICT_COVERAGE** | bool | `true` | Fail loading when a fused MoE parameter does not receive every routed expert from the checkpoint. Set to `false` to downgrade to a warning and load anyway, leaving those expert slots at their init values — useful when bringing up a checkpoint known to be partial, misleading otherwise (the symptom is an accuracy drop much later). |
+| **ATOM_LOADER_PREFETCH** | bool | `true` | Warm the page cache by reading this rank's share of the checkpoint sequentially on a background thread, instead of leaving it to demand faults through the mmap. The fault pattern sustains ~3.2 GB/s on a local NVMe that a single sequential reader drives at 6.06 GB/s, so this is an access-pattern fix, not a queue-depth one. Measured on DeepSeek-R1 MXFP4 (350 GiB, TP=4): cold load 154s → 69s. Set to `false` to restore demand faulting. Has no effect when `ATOM_DISABLE_MMAP=true`. |
+| **ATOM_LOADER_PREFETCH_THREADS** | int | 4 | Concurrent sequential readers used by the prefetcher. The device saturates at ~2 streams, so raising this mostly adds contention with the loader; `0` is clamped to `1` (use `ATOM_LOADER_PREFETCH=false` to switch prefetching off). |
+| **ATOM_LOADER_PREFETCH_BLOCK_MB** | int | 16 | Read block size for the prefetcher, in MiB. |
+| **ATOM_LOADER_FADVISE** | bool | `false` | Issue `posix_fadvise(SEQUENTIAL\|WILLNEED)` per shard before reading it. Off by default and ignored while `ATOM_LOADER_PREFETCH` is on: `WILLNEED` is a hint the kernel drops for most of a 350 GiB checkpoint, and running both makes the kernel read ahead over random-ish ranges while the prefetcher streams the same files, so the two compete for the device. Only useful with prefetching disabled. |
 
 ## Plugin mode
 
@@ -78,11 +82,11 @@ no wall-clock skew). See `atom/model_engine/prefill_delayer.py`. Active only whe
 | **ATOM_ENABLE_DS_QKNORM_QUANT_FUSION** | bool | 1 (true) | If set to `1`, fuse QK norm with quantization in MLA attention module. |
 | **ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD** | int | 1024 | Upper bound on MoE token count (`num_tokens` in the MoE forward) for using the dual-stream path: shared experts on a secondary CUDA stream while routed experts run on the default stream. If `num_tokens` exceeds this value, that forward uses single-stream MoE instead. Set to `0` to disable dual-stream setup entirely (no alt stream, no `maybe_dual_stream_forward` registration). |
 
-### Qwen3-MoE style
+### Qwen3 style
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| **ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION** | bool | 0 (false) | If set to `1`, fuse QK norm, RoPE, and cache quantization into one kernel. **Enable this for Qwen3-MoE models for better performance.** |
+| **ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION** | bool | 0 (false) | If set to `1`, fuse QK norm, RoPE, and cache quantization into one kernel for Qwen3 dense and MoE models. |
 
 ### Llama-style
 
