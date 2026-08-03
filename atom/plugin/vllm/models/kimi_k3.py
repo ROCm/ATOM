@@ -10,7 +10,10 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
 )
-from vllm.model_executor.models.interfaces import IsHybrid
+from vllm.model_executor.models.interfaces import (
+    IsHybrid,
+    SupportsMambaPrefixCaching,
+)
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
@@ -162,7 +165,7 @@ class KimiK3ForCausalLM(KimiK3ForCausalLMBase):
             kimi_k3_base.KimiKDAAttention = original_kda_cls
 
 
-class KimiK3ForCausalLMVllm(ATOMMoEForCausalLM, IsHybrid):
+class KimiK3ForCausalLMVllm(ATOMMoEForCausalLM, IsHybrid, SupportsMambaPrefixCaching):
     @classmethod
     def get_mamba_state_dtype_from_config(
         cls,
