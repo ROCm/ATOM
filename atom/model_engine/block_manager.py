@@ -554,19 +554,20 @@ class BlockManager:
         if self.is_state_publish_pos(seq, base + num_new_tokens):
             self._publish_state_checkpoint(seq, h)
 
-    def hash_decode_blocks(self, seq: Sequence, committed_len: int) -> None:
-        """Register hashes for generated blocks filled up to `committed_len`.
+    def hash_decode_blocks(self, seq: Sequence, committed_kv_len: int) -> None:
+        """Register hashes for generated blocks filled up to `committed_kv_len`.
 
         `may_append` allocates decode blocks without hashing them: at allocation
         time their tokens have not been sampled, and under speculative decoding
-        part of what the forward writes is about to be rejected. Neither holds
-        by the time the caller has a committed length — one taken after
-        acceptance and after any stop-sequence truncation.
+        part of what the forward writes is about to be rejected.
 
-        `committed_len` is therefore a hard line, not a hint. Below it a block's
-        last write came from an accepted token, so its content and its KV agree;
-        above it the next step may still rewrite both. Hashing past it would
-        publish a content hash over KV that a later request goes on to reuse.
+        `committed_kv_len` counts the tokens for which neither still applies —
+        id final, KV computed — and is a hard line, not a hint. It stops short
+        of any token no forward has read yet: that token's KV slot is written
+        by the next forward, and a block published over an unwritten slot hands
+        a later request KV that may never arrive at all (the seq can finish
+        first). Prefill's `hash_blocks` draws the same line from its own side,
+        at `num_cached_tokens + chunk`.
 
         Without this the prefix cache indexes prompt blocks only, and a
         follow-up turn — previous prompt plus previous answer — matches nothing
@@ -575,8 +576,8 @@ class BlockManager:
         if not self.enable_prefix_caching:
             return
         base = seq.num_hashed_tokens
-        if committed_len > base:
-            self.hash_blocks(seq, committed_len - base, start_tokens=base)
+        if committed_kv_len > base:
+            self.hash_blocks(seq, committed_kv_len - base, start_tokens=base)
 
     def cancel_state_fork(self, seq: Sequence) -> bool:
         """Undo a pending fork by adopting its source group.

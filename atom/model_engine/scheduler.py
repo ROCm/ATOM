@@ -2040,10 +2040,17 @@ class Scheduler:
                 new_tokens = new_tokens[:keep]
 
             # Publish prefix-cache hashes for generated blocks this step filled.
-            # `num_tokens` is the committed length — placeholders, rejected
-            # drafts and any post-stop tail have all been subtracted above — and
-            # that is exactly the line hash_decode_blocks must not cross.
-            self.block_manager.hash_decode_blocks(seq, num_tokens)
+            # `num_tokens` is the committed *content* length — placeholders,
+            # rejected drafts and any post-stop tail have all been subtracted
+            # above — but a block may only be hashed once its KV exists, and
+            # the two lines differ by the output mode. Deferred output patches
+            # ids one step late, so every token counted here has already been
+            # through a forward. Undeferred output appends the id the forward
+            # that just ran sampled, and no forward has read that token: its KV
+            # slot is written by the next one.
+            self.block_manager.hash_decode_blocks(
+                seq, num_tokens - (0 if is_deferred_out else 1)
+            )
 
             # Prepare stream output
             if stream_output_queue is not None and new_tokens:

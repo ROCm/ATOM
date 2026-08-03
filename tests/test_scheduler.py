@@ -616,9 +616,9 @@ class TestPrefixCaching:
     def test_generated_blocks_feed_the_next_turn(self, seq_factory):
         """Multi-turn reuse: turn 2's prompt is turn 1's prompt plus its answer.
 
-        Exercises the postprocess call site, where the committed length is the
-        only thing separating a finalized block from one the next step may still
-        rewrite.
+        Exercises the postprocess call site, where the committed KV length is
+        the only thing separating a finalized block from one the next step may
+        still rewrite.
         """
         sched = Scheduler(
             MockConfig(
@@ -651,6 +651,22 @@ class TestPrefixCaching:
             batch, _ = sched.schedule()  # next decode step
 
         assert seq1.token_ids == prompt + generated
+        # 20 tokens on the seq, but token 20 was sampled this step and no
+        # forward has written its KV — the block it closes stays unhashed until
+        # the next step consumes it.
+        assert seq1.num_hashed_tokens == 16
+
+        sched.postprocess(
+            list(sched.running),
+            ScheduledBatchOutput(
+                req_ids=[seq1.id],
+                token_ids=[(112,)],
+                num_rejected=None,
+                num_bonus=None,
+                draft_token_ids=None,
+            ),
+            batch=batch,
+        )
         assert seq1.num_hashed_tokens == 20
 
         followup = seq_factory(prompt + generated)
@@ -659,6 +675,56 @@ class TestPrefixCaching:
         # 20 tokens, 5 blocks; the last is never reused so 16 tokens are cached
         # and only the final block's 4 tokens get forwarded.
         assert batch2.total_tokens_num_prefill == 4
+
+    def test_deferred_output_hashes_up_to_the_committed_length(self, seq_factory):
+        """The same KV line, reached from the other side of the output lag.
+
+        Deferred output patches sampled ids one step late and appends its
+        placeholder after hashing, so the committed length it hands over
+        already excludes the token still in flight. Subtracting one there —
+        correct for undeferred output, see the test above — would leave every
+        generated block a step behind for the whole run.
+        """
+        sched = Scheduler(
+            MockConfig(
+                enable_prefix_caching=True,
+                kv_cache_block_size=4,
+                num_kvcache_blocks=40,
+                max_num_seqs=4,
+                max_num_batched_tokens=256,
+                max_model_len=64,
+            )
+        )
+        prompt = [1, 3, 4, 5, 6, 7, 8, 9]  # 2 whole blocks
+        seq1 = seq_factory(prompt, sampling_params=SamplingParams(max_tokens=64))
+        sched.add(seq1)
+        batch, _ = sched.schedule()  # prefill
+
+        def step(token_ids):
+            nonlocal batch
+            sched.postprocess(
+                list(sched.running),
+                ScheduledBatchOutput(
+                    req_ids=[seq1.id] if token_ids else [],
+                    token_ids=[token_ids] if token_ids else [],
+                    num_rejected=np.zeros(1, dtype=np.int32),
+                    num_bonus=np.zeros(1, dtype=np.int32),
+                    draft_token_ids=None,
+                    is_deferred_out=True,
+                ),
+                batch=batch,
+            )
+            batch, _ = sched.schedule()
+
+        # The prefill step returns nothing; its sampled token surfaces next.
+        step(())
+        for token in range(100, 108):
+            step((token,))
+
+        # Every id that surfaced was sampled by a forward that has since run
+        # again, so all eight are backed by KV: 16 tokens, 4 whole blocks. A
+        # blanket subtract-one would stop at 12 and stay a block behind.
+        assert seq1.num_hashed_tokens == 16
 
     def test_prefix_cache_reduces_token_count(self, seq_factory):
         """After a first request populates the cache, a second request sharing
