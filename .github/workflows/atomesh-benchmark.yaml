@@ -17,13 +17,10 @@ on:
       - '.github/scripts/atomesh/**'
       - '.github/workflows/atomesh-benchmark.yaml'
   schedule:
-    # TW weekend nightly at 21:00 Beijing time (13:00 UTC).
-    - cron: '0 13 * * 6'
-    - cron: '0 13 * * 0'
     # TW nightly for DeepSeek and GLM-Agentic cases only at 00:00 Beijing time (16:00 UTC).
-    - cron: '0 16 * * *'
+    - cron: '0 16 * * 5'
     # Spur MI350X nightly at 00:10 Beijing time (16:10 UTC).
-    # - cron: '10 16 * * *'
+    - cron: '10 16 * * *'
   workflow_dispatch:
     inputs:
       suite:
@@ -270,7 +267,7 @@ jobs:
             fi
           fi
 
-          if [[ "${GITHUB_EVENT_NAME}" == "schedule" && "${EVENT_SCHEDULE}" == "0 17 * * *" ]]; then
+          if [[ "${GITHUB_EVENT_NAME}" == "schedule" && "${EVENT_SCHEDULE}" == "0 16 * * 5" ]]; then
             ATOMESH_SLURM_ACCOUNT=amd-frameworks \
             ATOMESH_SLURM_PARTITION=amd-frameworks \
             ATOMESH_SLURM_SUBMIT_RUNNER=atomesh-cicd \
