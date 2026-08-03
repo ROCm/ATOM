@@ -20,6 +20,25 @@ from .tool_parser import ToolCallStreamParser, parse_tool_calls
 logger = logging.getLogger("atom")
 
 
+def _normalize_finish_reason(finish_reason: Optional[str]) -> Optional[str]:
+    """Map engine finish reasons to the OpenAI-standard vocabulary.
+
+    The engine may report an EOS stop as ``"stop_<token_id>"`` (the raw id of
+    the stop token that fired, e.g. ``"stop_163586"``). OpenAI clients only
+    understand ``"stop"``/``"length"``/``"tool_calls"``, so anything that is
+    not a recognized value collapses to ``"stop"``.
+    """
+    if finish_reason is None:
+        return None
+    if finish_reason in ("stop", "length", "tool_calls"):
+        return finish_reason
+    if finish_reason in ("max_tokens", "max_new_tokens"):
+        return "length"
+    if finish_reason.startswith("stop"):
+        return "stop"
+    return "stop"
+
+
 def create_chat_chunk(
     request_id: str,
     model: str,
@@ -60,6 +79,8 @@ async def stream_chat_response(
     num_prompt_tokens: int,
     cleanup_fn,
     tools=None,
+    tool_choice=None,
+    starts_thinking: bool = False,
 ) -> AsyncGenerator[str, None]:
     """Generate streaming chat completion response with reasoning and tool calls.
 
@@ -75,7 +96,7 @@ async def stream_chat_response(
     num_tokens_input = num_prompt_tokens
     num_tokens_output = 0
     num_cached_tokens = 0
-    reasoning_filter = ReasoningFilter()
+    reasoning_filter = ReasoningFilter(starts_thinking=starts_thinking)
     tool_parser = ToolCallStreamParser(tools=tools)
     has_tool_calls = False
 
@@ -122,14 +143,14 @@ async def stream_chat_response(
                             yield create_chat_chunk(
                                 request_id, model, delta={"content": data}
                             )
-                        elif event_type == "tool_call_start":
+                        elif event_type == "tool_call_start" and tool_choice != "none":
                             has_tool_calls = True
                             yield create_chat_chunk(
                                 request_id,
                                 model,
                                 delta={"tool_calls": [data]},
                             )
-                        elif event_type == "tool_call_args":
+                        elif event_type == "tool_call_args" and tool_choice != "none":
                             yield create_chat_chunk(
                                 request_id,
                                 model,
@@ -143,12 +164,12 @@ async def stream_chat_response(
                         yield create_chat_chunk(
                             request_id, model, delta={"content": data}
                         )
-                    elif event_type == "tool_call_start":
+                    elif event_type == "tool_call_start" and tool_choice != "none":
                         has_tool_calls = True
                         yield create_chat_chunk(
                             request_id, model, delta={"tool_calls": [data]}
                         )
-                    elif event_type == "tool_call_args":
+                    elif event_type == "tool_call_args" and tool_choice != "none":
                         yield create_chat_chunk(
                             request_id, model, delta={"tool_calls": [data]}
                         )
@@ -191,6 +212,7 @@ def _build_chat_choice(
     finish_reason: Optional[str],
     index: int = 0,
     tools=None,
+    tool_choice=None,
 ) -> Dict[str, Any]:
     """Build one entry of ``choices[...]`` from a raw output string.
 
@@ -201,13 +223,20 @@ def _build_chat_choice(
     reasoning_content, content_with_tools = separate_reasoning(raw_text)
     content, tool_calls = parse_tool_calls(content_with_tools, tools)
 
+    # tool_choice="none" forbids tool calls: any the model emitted anyway are
+    # dropped so they never surface in the response.
+    if tool_choice == "none":
+        tool_calls = []
+
     message: Dict[str, Any] = {"role": "assistant", "content": content}
     if reasoning_content is not None:
         message["reasoning_content"] = reasoning_content
     if tool_calls:
         message["tool_calls"] = [tc.to_dict() for tc in tool_calls]
 
-    effective_finish_reason = "tool_calls" if tool_calls else finish_reason
+    effective_finish_reason = (
+        "tool_calls" if tool_calls else _normalize_finish_reason(finish_reason)
+    )
     return {
         "index": index,
         "message": message,
@@ -221,6 +250,7 @@ def build_chat_response(
     raw_text: str,
     final_output: Dict[str, Any],
     tools=None,
+    tool_choice=None,
 ) -> ChatCompletionResponse:
     """Build a non-streaming chat completion response (single choice)."""
     response = ChatCompletionResponse(
@@ -229,7 +259,11 @@ def build_chat_response(
         model=model,
         choices=[
             _build_chat_choice(
-                raw_text, final_output["finish_reason"], index=0, tools=tools
+                raw_text,
+                final_output["finish_reason"],
+                index=0,
+                tools=tools,
+                tool_choice=tool_choice,
             )
         ],
         usage={
@@ -259,6 +293,7 @@ def build_chat_response_multi(
     model: str,
     final_outputs: List[Dict[str, Any]],
     tools=None,
+    tool_choice=None,
 ) -> ChatCompletionResponse:
     """Build a non-streaming response with one choice per fan-out sibling.
 
@@ -270,7 +305,13 @@ def build_chat_response_multi(
     """
     assert final_outputs, "build_chat_response_multi requires at least one output"
     choices = [
-        _build_chat_choice(out["text"], out["finish_reason"], index=i, tools=tools)
+        _build_chat_choice(
+            out["text"],
+            out["finish_reason"],
+            index=i,
+            tools=tools,
+            tool_choice=tool_choice,
+        )
         for i, out in enumerate(final_outputs)
     ]
     prompt_tokens = final_outputs[0]["num_tokens_input"]
