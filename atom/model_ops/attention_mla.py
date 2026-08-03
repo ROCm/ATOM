@@ -1008,11 +1008,12 @@ class MLAAttention(nn.Module):
             and attn_metadata.max_seqlen_q == 1
         )
         if use_fused:
-            # req_slots / token_pos / indptr already live in the kernel's int32
-            # domain as fixed-address persistent buffers — slice (a view, no
-            # allocation) so the captured graph stays capture-stable.
+            # req_slots / token_pos / src_slots / indptr all live in the kernel's
+            # int32 domain as fixed-address persistent buffers — slice (a view, no
+            # allocation) so the kernels the FULL decode CUDAGraph records read
+            # fresh per-step values at replay, never a capture-frozen transient.
             req_slots = hs_slots[:n]
-            src_slots = attn_metadata.slot_mapping[:n].to(torch.int32)
+            src_slots = attn_metadata.hisparse_src_slots[:n]
             logical_pos = attn_metadata.hisparse_token_pos[:n]
             topk = coord.topk_buffer[:n]
             indptr = sparse_kv_indptr[: n + 1]

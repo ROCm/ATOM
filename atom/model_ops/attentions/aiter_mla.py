@@ -367,6 +367,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             self._hisparse_token_pos = CpuGpuBuffer(
                 self.max_num_batched_tokens, **i32_kwargs
             )
+            # Physical KV row of each decode query token (slot_mapping cast to
+            # int32). A fixed-address buffer refilled in place every step: the
+            # backup kernel is recorded into the FULL decode CUDAGraph, so replay
+            # must read fresh values here, not a capture-frozen .to(int32).
+            self._hisparse_src_slots = torch.zeros(
+                self.max_num_batched_tokens, dtype=torch.int32, device=self.device
+            )
 
         # Per-ubatch buffers for CUDAGraph TBO
         if config.enable_tbo:
@@ -1564,6 +1571,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.hisparse_token_pos = self._hisparse_token_pos.copy_to_gpu(
                 n_tok
             )
+            # src_slots: cast slot_mapping (int64) into the fixed int32 buffer in
+            # place (GPU cast, on the current stream before the graph replays).
+            self._hisparse_src_slots[:n_tok].copy_(attn_metadata.slot_mapping[:n_tok])
+            attn_metadata.hisparse_src_slots = self._hisparse_src_slots[:n_tok]
 
         # Use bs (graph_bs) >= 2 instead of scheduled_bs >= 2 to avoid accuracy issue:
         if self.model_runner.config.enable_tbo_decode and bs >= 2:
@@ -1797,6 +1808,21 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             attn_matadata.sparse_kv_last_page_lens = var[
                 "sparse_kv_last_page_lens"
             ].gpu[:bs]
+
+        # HiSparse: trip the fused hot path during capture so its backup + swap
+        # kernels are recorded into the FULL decode graph. sparse_kv_indptr is
+        # zeroed here and token_pos is -1, so both kernels early-return during the
+        # capture-time run (no state mutation, no cold-pool access); replay refills
+        # these fixed buffers with real values and the recorded kernels do the work.
+        coord = getattr(self.model_runner, "hisparse_coordinator", None)
+        if coord is not None and self.is_sparse and max_q_len == 1:
+            self._hisparse_req_slots.np[:bs] = 0
+            self._hisparse_token_pos.np[:bs] = -1
+            attn_matadata.hisparse_req_slots = self._hisparse_req_slots.copy_to_gpu(bs)
+            attn_matadata.hisparse_token_pos = self._hisparse_token_pos.copy_to_gpu(bs)
+            self._hisparse_src_slots[:bs].zero_()
+            attn_matadata.hisparse_src_slots = self._hisparse_src_slots[:bs]
+
         positions = var["positions"].copy_to_gpu(sum_tokens)
         context = Context(
             positions=positions, is_prefill=False, batch_size=bs, graph_bs=bs
