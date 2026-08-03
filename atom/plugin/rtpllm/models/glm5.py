@@ -599,10 +599,7 @@ class ATOMGlm5Moe(DeepSeekV2):
 
     @classmethod
     def _create_config(cls, ckpt_path: str):
-        config = super()._create_config(ckpt_path)
-        # ATOM sparse MLA reads the FP8 KV cache through aiter's 576-token layout.
-        config.attn_config.mla_use_aiter_fp8_layout = True
-        return config
+        return super()._create_config(ckpt_path)
 
     def support_cuda_graph(self) -> bool:
         if os.getenv("ENABLE_CUDA_GRAPH", "1") == "0":
