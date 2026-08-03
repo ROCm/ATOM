@@ -322,7 +322,7 @@ combination as an independent job for the same reason.
 
 ## Agentic Accuracy (SWE-bench Lite)
 
-Agentic accuracy does not use the fixed-sequence GSM8K evaluator. The c48
+Agentic accuracy does not use the fixed-sequence GSM8K evaluator. The c1
 nightly case runs ATOM's local SWE-bench Lite agentic evaluation after the
 performance trace:
 
@@ -334,7 +334,7 @@ performance trace:
 
 For manual validation in a local container, follow the procedure below.
 
-Only c48 runs the full accuracy suite so the five performance jobs do not
+Only c1 runs the full accuracy suite so the five performance jobs do not
 duplicate the same 300-instance evaluation. Rank 0 receives the host Docker
 socket and CLI for this step; no Modal credentials or InferenceX checkout is
 required. Plan for roughly 120 GB of reusable Docker image storage and at least
