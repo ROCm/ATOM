@@ -378,9 +378,61 @@ jobs:
           name: atomesh-benchmark-matrix
           path: atomesh-matrix.json
 
+  cleanup-slurm-jobs:
+    name: Clean Slurm jobs on ${{ matrix.id }}
+    needs: [load-config]
+    if: >-
+      needs.load-config.outputs.has_matrix == 'true'
+      && (
+        github.event_name == 'schedule'
+        || (github.event_name == 'workflow_dispatch' && inputs.run_model_benchmark)
+      )
+    runs-on: ${{ matrix.runner.slurm_submit_runner }}
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJson(needs.load-config.outputs.matrix_json) }}
+    steps:
+      - name: Cancel existing jobs on benchmark nodes
+        env:
+          NODES: ${{ join(matrix.nodes, ',') }}
+          SLURM_SUBMIT_RUNNER: ${{ matrix.runner.slurm_submit_runner }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
+            echo "Slurm job cleanup is disabled for ${SLURM_SUBMIT_RUNNER}; skipping."
+            exit 0
+          fi
+
+          if [[ -z "${NODES}" ]]; then
+            echo "No explicit benchmark nodes were selected; skipping Slurm job cleanup."
+            exit 0
+          fi
+
+          squeue_cmd=(squeue)
+          scancel_cmd=(scancel)
+          if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-crusoe-mi355" ]]; then
+            controller="http://crs-m2m-cpu-spur-005.crusoe.amd.com:6817"
+            squeue_cmd+=(--controller "${controller}")
+            scancel_cmd+=(--controller "${controller}")
+          fi
+
+          echo "=== Checking all users' Slurm jobs on ${NODES} ==="
+          job_ids="$("${squeue_cmd[@]}" --noheader --nodelist "${NODES}" --format="%A" | sort -u)"
+          if [[ -z "${job_ids}" ]]; then
+            echo "No existing Slurm jobs found on ${NODES}."
+            exit 0
+          fi
+
+          echo "Cancelling Slurm jobs on ${NODES}:"
+          printf '%s\n' "${job_ids}"
+          mapfile -t job_id_list <<< "${job_ids}"
+          "${scancel_cmd[@]}" "${job_id_list[@]}"
+
   run-model-benchmark:
     name: ${{ matrix.id }}
-    needs: [load-config]
+    needs: [load-config, cleanup-slurm-jobs]
     if: >-
       needs.load-config.outputs.has_matrix == 'true'
       && (
@@ -393,29 +445,6 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJson(needs.load-config.outputs.matrix_json) }}
     steps:
-      - name: Clean up containers and workspace
-        run: |
-          if docker info > /dev/null 2>&1; then
-            CONTAINER_ENGINE=docker
-          elif podman info > /dev/null 2>&1; then
-            CONTAINER_ENGINE=podman
-          else
-            echo "Neither docker nor podman is available; skipping container-based workspace cleanup."
-            exit 0
-          fi
-
-          echo "=== Cleaning up containers on $(hostname) with ${CONTAINER_ENGINE} ==="
-          containers=$($CONTAINER_ENGINE ps -q)
-          if [ -n "$containers" ]; then
-            $CONTAINER_ENGINE kill $containers || true
-          fi
-          $CONTAINER_ENGINE run --rm \
-            -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
-            -w /workspace \
-            --privileged \
-            docker.io/rocm/pytorch:latest \
-            bash -lc "shopt -s dotglob && ls -la /workspace/ && rm -rf /workspace/*" || true
-
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
 
