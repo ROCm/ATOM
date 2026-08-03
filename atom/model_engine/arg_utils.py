@@ -52,6 +52,7 @@ class EngineArgs:
     attn_prefill_chunk_size: int = 16384
     state_checkpoint_interval_tokens: int = 8192
     enable_chunked_prefill: bool = True
+    enable_log_stats: bool = True
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
     gpu_memory_utilization: float = 0.9
@@ -348,6 +349,14 @@ class EngineArgs:
             default=True,
             help="Enable chunked prefill (default: enabled). "
             "Use --no-enable_chunked_prefill to disable.",
+        )
+        parser.add_argument(
+            "--enable-log-stats",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="Log periodic engine throughput/scheduler status "
+            "(running/waiting reqs, KV cache usage, prefix cache hit rate; "
+            "default: enabled). Use --no-enable-log-stats to disable.",
         )
         parser.add_argument(
             "--max-num-seqs",

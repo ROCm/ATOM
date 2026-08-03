@@ -280,6 +280,73 @@ class CacheStats:
         )
 
 
+class ThroughputStats:
+    """Periodically logs an engine-status summary line (running/waiting
+    requests, KV cache usage, prefix cache hit rate, prompt/generation
+    throughput), mirroring vLLM's ``LoggingStatLogger`` console output:
+
+        Engine 000: Avg prompt throughput: 254.4 tokens/s, Avg generation
+        throughput: 0.3 tokens/s, Running: 6 reqs, Waiting: 0 reqs, GPU KV
+        cache usage: 0.0%, Prefix cache hit rate: 0.0%
+
+    Token counts accumulate across ``schedule()`` calls; the log line (and
+    the counter reset) fires once ``log_interval_s`` wall-clock seconds have
+    elapsed since the last one, regardless of activity level.
+    """
+
+    __slots__ = (
+        "engine_index",
+        "log_interval_s",
+        "last_log_time",
+        "num_prompt_tokens",
+        "num_generation_tokens",
+    )
+
+    def __init__(self, engine_index: int = 0, log_interval_s: float = 10.0):
+        self.engine_index = engine_index
+        self.log_interval_s = log_interval_s
+        self.last_log_time = time.monotonic()
+        self.num_prompt_tokens = 0
+        self.num_generation_tokens = 0
+
+    def update(self, num_prompt_tokens: int, num_generation_tokens: int) -> None:
+        self.num_prompt_tokens += num_prompt_tokens
+        self.num_generation_tokens += num_generation_tokens
+
+    def maybe_log(
+        self,
+        num_running_reqs: int,
+        num_waiting_reqs: int,
+        kv_usage: float,
+        prefix_cache_hit_rate: Optional[float],
+    ) -> None:
+        now = time.monotonic()
+        elapsed = now - self.last_log_time
+        if elapsed < self.log_interval_s:
+            return
+        prompt_throughput = self.num_prompt_tokens / elapsed
+        generation_throughput = self.num_generation_tokens / elapsed
+        hit_rate_pct = (
+            0.0 if prefix_cache_hit_rate is None else prefix_cache_hit_rate * 100
+        )
+        logger.info(
+            "Engine %03d: Avg prompt throughput: %.1f tokens/s, "
+            "Avg generation throughput: %.1f tokens/s, Running: %d reqs, "
+            "Waiting: %d reqs, GPU KV cache usage: %.1f%%, "
+            "Prefix cache hit rate: %.1f%%",
+            self.engine_index,
+            prompt_throughput,
+            generation_throughput,
+            num_running_reqs,
+            num_waiting_reqs,
+            kv_usage * 100,
+            hit_rate_pct,
+        )
+        self.last_log_time = now
+        self.num_prompt_tokens = 0
+        self.num_generation_tokens = 0
+
+
 def _optimal_cu_fraction(
     decode_batch: int, prefill_waiting_tokens: int
 ) -> float | None:
@@ -711,6 +778,11 @@ class Scheduler:
             if parallel_cfg is not None
             else None
         )
+        self.throughput_stats: Optional[ThroughputStats] = (
+            ThroughputStats(engine_index=dp_rank or 0)
+            if config.enable_log_stats
+            else None
+        )
         if kv_events_cfg is not None and kv_events_cfg.enable:
             self.kv_event_publisher: _EventPublisher = _make_publisher(
                 enabled=True,
@@ -793,6 +865,25 @@ class Scheduler:
         if total <= 0:
             return 0.0
         return bm.kv.num_used / total
+
+    def _record_throughput(
+        self, num_prompt_tokens: int = 0, num_generation_tokens: int = 0
+    ) -> None:
+        """Feed this tick's token counts into `ThroughputStats` and emit the
+        periodic engine-status log line once `log_interval_s` has elapsed.
+        No-op when `--no-enable-log-stats` disabled the tracker."""
+        stats = self.throughput_stats
+        if stats is None:
+            return
+        stats.update(num_prompt_tokens, num_generation_tokens)
+        stats.maybe_log(
+            num_running_reqs=len(self.running),
+            num_waiting_reqs=len(self.waiting),
+            kv_usage=self._kv_usage(),
+            prefix_cache_hit_rate=(
+                self.cache_stats.hit_rate if self.cache_stats is not None else None
+            ),
+        )
 
     def _waiting_new_token_count(self) -> int:
         """Sum of new (uncached) tokens across the ADMITTABLE waiting queue,
@@ -1078,6 +1169,7 @@ class Scheduler:
             delayer_allows = True
 
         if not self.running and not self.waiting:
+            self._record_throughput()
             return None
 
         # ---- Phase 1: resume partial prefills from running ----
@@ -1322,6 +1414,7 @@ class Scheduler:
             connector_meta_output = None
             if self.kv_connector is not None:
                 connector_meta_output = self.kv_connector.build_connector_meta()
+            self._record_throughput(num_prompt_tokens=total_tokens_num_prefill)
 
             # Freeze, per seq, whether this chunk finishes the prompt. Uses the
             # pre-advance offsets so it is correct whether or not schedule-time
@@ -1492,6 +1585,7 @@ class Scheduler:
             ),
         )
         self._consume_state_forks(scheduled_seqs)
+        self._record_throughput(num_generation_tokens=total_tokens_num_decode)
         return (decode_batch, scheduled_seqs)
 
     @staticmethod
