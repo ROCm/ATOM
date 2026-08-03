@@ -542,49 +542,94 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
     # Attributes whose writes on the outer model must propagate to the
     # inner model so vLLM's weight-sharing reaches the forward path.
     _WEIGHT_SHARED_ATTRS = frozenset({"embed_tokens", "embedding", "lm_head"})
+    # Attribute names under which ATOM models nest their inner backbone. Walked
+    # in order at each level to build the inner-model chain. To support a model
+    # that nests under a new name, add it here.
+    _INNER_MODEL_ATTRS = ("model", "language_model")
+
+    def _inner_model_chain(self, outer: nn.Module) -> list[nn.Module]:
+        """`outer` followed by each nested backbone, deepest last.
+
+        ATOM models nest their language backbone at different names and depths:
+          - flat EAGLE3 draft (Eagle3LlamaModel): depth 0, attrs on `outer`
+          - MTP draft / text-only target: depth 1, under `.model`
+          - VL target (MiniMax-M3 ...TextOnly): depth 2,
+            `.language_model` then `.model`
+        Walking `_INNER_MODEL_ATTRS` at each level yields a single chain that
+        covers all of them, so a wanted attribute can be found wherever it lives.
+        """
+        chain: list[nn.Module] = []
+        node: nn.Module | None = outer
+        seen: set[int] = set()
+        while node is not None and id(node) not in seen:
+            seen.add(id(node))
+            chain.append(node)
+            nxt = None
+            for name in self._INNER_MODEL_ATTRS:
+                cand = getattr(node, name, None)
+                if isinstance(cand, nn.Module) and id(cand) not in seen:
+                    nxt = cand
+                    break
+            node = nxt
+        return chain
 
     def _expose_spec_decode_attrs(self) -> None:
         """Bridge the extra nesting level between vLLM and ATOM for spec decode.
 
-        ATOM wraps the HF model with one extra level:
-          vLLM sees:  wrapper.model  (DeepSeekMTP)
-          forward uses:              .model (DeepSeekMultiTokenPredictor)
+        vLLM reads embed_tokens / embedding / layers at ``wrapper.model.<attr>``
+        and the head at ``wrapper.lm_head``. ATOM nests these under one or more
+        backbone levels (see `_inner_model_chain`), so mirror the first holder
+        found in the chain onto the paths vLLM reads.
 
-        vLLM's EagleSpeculator reads/writes embed_tokens, lm_head, layers on
-        the outer model.  The forward path reads them from the inner model.
-
-        We need two things:
-        1. Mirror inner → outer so vLLM can discover the attrs.
-        2. When vLLM later *replaces* embed_tokens / lm_head with shared
-           target-model weights, propagate the write to the inner model
-           so the forward path picks up the shared tensor.
+        Draft vs target differ in one way:
+        - Draft/MTP: vLLM *replaces* embed_tokens / lm_head with shared target
+          weights, so register real submodules (`setattr`) and install a
+          `__setattr__` hook that propagates those writes down to the inner
+          module the forward path reads from.
+        - Target: vLLM only *reads* these attrs, so mirror them as plain aliases
+          (`object.__setattr__`) that stay invisible to the module tree and the
+          weight loader — no ownership change, no sync hook.
         """
         model = self.model
-        inner = getattr(model, "model", None)
-        if inner is None:
-            if hasattr(model, "lm_head") and not hasattr(self, "lm_head"):
-                self.lm_head = model.lm_head
-            return
+        chain = self._inner_model_chain(model)
+        inner = chain[1] if len(chain) > 1 else None
+        is_draft = self.is_spec_draft_model
+        put = setattr if is_draft else object.__setattr__
 
-        # ATOM DeepSeek-V4 names these shared modules `embed` / `head`, while
-        # vLLM's generic MTP proposer expects `embedding` / `lm_head`.
-        if not hasattr(model, "embedding") and hasattr(inner, "embed"):
-            model.embedding = inner.embed
-        if not hasattr(model, "lm_head") and hasattr(inner, "head"):
-            model.lm_head = inner.head
+        def first_holder(attr: str) -> nn.Module | None:
+            for node in chain:
+                if hasattr(node, attr):
+                    return node
+            return None
 
-        # (1) Mirror: make attrs visible on the outer model for vLLM discovery.
+        # ATOM DeepSeek-V4 names these shared modules `embed` / `head` on its
+        # immediate backbone child, while vLLM's generic MTP proposer expects
+        # `embedding` / `lm_head` on the outer model.
+        if inner is not None:
+            if not hasattr(model, "embedding") and hasattr(inner, "embed"):
+                put(model, "embedding", inner.embed)
+            if not hasattr(model, "lm_head") and hasattr(inner, "head"):
+                put(model, "lm_head", inner.head)
+
+        # (1) Mirror backbone attrs onto the outer model, and the head onto self.
         for attr in (*self._WEIGHT_SHARED_ATTRS, "layers"):
-            if not hasattr(model, attr) and hasattr(inner, attr):
-                setattr(model, attr, getattr(inner, attr))
+            if not hasattr(model, attr):
+                holder = first_holder(attr)
+                if holder is not None and holder is not model:
+                    put(model, attr, getattr(holder, attr))
 
-        if not hasattr(self, "lm_head") and hasattr(model, "lm_head"):
-            self.lm_head = model.lm_head
+        if not hasattr(self, "lm_head"):
+            holder = first_holder("lm_head")
+            if holder is not None:
+                put(self, "lm_head", holder.lm_head)
 
-        # (2) Propagate: future writes on the outer model sync to the inner
-        #     model.  We create a one-off subclass so the hook only affects
-        #     this particular draft-model instance, not the base class.
-        #     Create the one-off subclass only once
+        # (2) Draft only: propagate vLLM's later writes on the outer model down
+        #     to the inner module the forward path reads from. Create the one-off
+        #     subclass only once, and only when there is an inner level to sync.
+        if not is_draft:
+            return
+        if inner is None:
+            return
         if getattr(model, "_atom_vllm_shared_attr_sync_patched", False):
             return
         shared = self._WEIGHT_SHARED_ATTRS

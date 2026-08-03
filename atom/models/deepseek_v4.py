@@ -31,6 +31,7 @@ import aiter
 import torch
 import torch.nn.functional as F
 from aiter import (
+    QuantType,
     cp_gather_indexer_k_quant_cache,
     dtypes,
     rope_rotate_activation,
@@ -53,7 +54,6 @@ from atom.config import (
     Config,
     LayerQuantConfig,
     QuantizationConfig,
-    QuantType,
     get_current_atom_config,
 )
 from atom.distributed.pcp_utils import (

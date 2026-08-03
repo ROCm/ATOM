@@ -199,6 +199,37 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # with that many threads; set to 1 to fall back to the original sequential
     # per-expert path.
     "ATOM_LOADER_NUM_THREADS": lambda: int(os.getenv("ATOM_LOADER_NUM_THREADS", "16")),
+    # Warm the page cache with a background sequential reader instead of
+    # leaving it to demand faults through the mmap. Measured on a local NVMe:
+    # the fault-driven pattern sustains 3.2 GB/s where the device does 6.9 and
+    # a single sequential reader alone reaches 6.06, so the gap is the access
+    # pattern rather than queue depth. On DeepSeek-R1 MXFP4 (350 GiB, TP=4)
+    # this takes a cold load from ~156s to ~68s and leaves the warm case
+    # slightly better too, so it is on by default; turn it off for storage
+    # where a second sequential reader competes with the loader instead of
+    # feeding it.
+    "ATOM_LOADER_PREFETCH": lambda: (
+        os.getenv("ATOM_LOADER_PREFETCH", "true").lower() == "true"
+    ),
+    # Shards read concurrently by the prefetcher. Kept small: the device here
+    # saturates at 2 streams, and every thread also competes with the loader.
+    "ATOM_LOADER_PREFETCH_THREADS": lambda: int(
+        os.getenv("ATOM_LOADER_PREFETCH_THREADS", "4")
+    ),
+    "ATOM_LOADER_PREFETCH_BLOCK_MB": lambda: int(
+        os.getenv("ATOM_LOADER_PREFETCH_BLOCK_MB", "16")
+    ),
+    # Hint the kernel to read each shard ahead. Off by default because it never
+    # paid for itself once measured on its own: the read loop runs far ahead of
+    # the workers, so WILLNEED is issued for the whole checkpoint within
+    # seconds, and asking for 350 GiB of read-ahead is bookkeeping the kernel
+    # largely discards. Cold load 193.0s vs 194.2s -- no effect; warm load
+    # 27.3s vs 42.8s -- 15.5s of pure overhead. Kept as a switch rather than
+    # deleted so the behaviour can be restored on storage that behaves
+    # differently. Ignored when prefetching, which supersedes it.
+    "ATOM_LOADER_FADVISE": lambda: (
+        os.getenv("ATOM_LOADER_FADVISE", "false").lower() == "true"
+    ),
     # Fail loading when the checkpoint does not deliver every routed expert of
     # a fused MoE parameter. On by default: the alternative is a model that
     # loads happily with some expert slots left at their init values, which
