@@ -222,6 +222,11 @@ class EagleProposer(Drafter):
         if draft_uses_mha:
             attn_metadata.slot_mapping = var["slot_mapping"].gpu[: len(input_ids)]
             attn_metadata.block_tables = var["block_tables"].gpu[:bs]
+        elif attn_metadata.slot_mapping is not None:
+            # Make MLA draft slot_mapping == q rows. DeepSeek-V4 uses
+            # block_tables + context_lens (slot_mapping is None) — nothing to
+            # size, so skip instead of subscripting None.
+            attn_metadata.slot_mapping = attn_metadata.slot_mapping[: len(input_ids)]
 
         # Backends that expose flat per-seq kv_indices/kv_indptr (MLA, MHA)
         # wire them through eagle's mid-step block; V4 has block_tables +
@@ -392,7 +397,19 @@ class EagleProposer(Drafter):
                         attn_metadata.__dict__[k] = v
                     if has_flat_kv and "slot_mapping" not in workinfos:
                         # MLA/MHA path: slot derived from flat kv_indices.
-                        slot_mapping[:] = kv_indices[kv_indptr[1 : bs + 1] - 1]
+                        raw_slots = kv_indices[kv_indptr[1 : bs + 1] - 1]
+                        builder = self.runner.attn_metadata_builder
+                        if getattr(builder, "dcp_world_size", 1) > 1:
+                            # DCP round-robin: only rank (context_len-1) % W owns
+                            # this draft token; other ranks' kv_indptr didn't grow,
+                            # so raw_slots would point at a stale slot. Emit -1.
+                            ctx = attn_metadata.context_lens[:bs]
+                            owned = (
+                                (ctx - 1) % builder.dcp_world_size
+                            ) == builder.dcp_rank
+                            slot_mapping[:] = torch.where(owned, raw_slots, -1)
+                        else:
+                            slot_mapping[:] = raw_slots
 
                     input_ids = new_draft_ids
                     hidden_states = sample_hidden_states
