@@ -108,29 +108,6 @@ class TestPlanPools:
         plan = plan_pools(specs, available_bytes=100_000, max_num_seqs=8)
         assert plan.entries[ENTRY_SWA] == 8 * 3 + 64
 
-    def test_opportunistic_share_sits_on_top_of_the_floor(self):
-        """The retention share must never eat into the per-request
-        floor — that is the whole reason it is expressed as an extra."""
-        floor_only = plan_pools(
-            [page_pool(100), state_pool(ENTRY_SWA, 100, entries_per_req=3)],
-            available_bytes=1_000_000,
-            max_num_seqs=8,
-        )
-        with_share = plan_pools(
-            [
-                page_pool(100),
-                state_pool(
-                    ENTRY_SWA, 100, entries_per_req=3, retention_budget_frac=0.25
-                ),
-            ],
-            available_bytes=1_000_000,
-            max_num_seqs=8,
-        )
-        assert floor_only.entries[ENTRY_SWA] == 24
-        assert with_share.entries[ENTRY_SWA] > 24
-        # ...and the paged pool shrinks by exactly what the share took.
-        assert with_share.entries[ENTRY_KV] < floor_only.entries[ENTRY_KV]
-
     def test_paged_pool_floors_at_zero_rather_than_going_negative(self):
         specs = [page_pool(1_000_000), state_pool(ENTRY_STATE, 100, entries_per_req=1)]
         plan = plan_pools(specs, available_bytes=10_000, max_num_seqs=8)
@@ -173,13 +150,7 @@ class TestPlanIsTheSingleSourceOfCounts:
 
     SPECS: ClassVar = [
         page_pool(4096),
-        state_pool(
-            ENTRY_SWA,
-            8192,
-            entries_per_req=2,
-            extra_entries=64,
-            retention_budget_frac=0.25,
-        ),
+        state_pool(ENTRY_SWA, 8192, entries_per_req=2, extra_entries=64),
         state_pool(ENTRY_STATE, 65536, entries_per_req=1),
     ]
 
@@ -187,10 +158,9 @@ class TestPlanIsTheSingleSourceOfCounts:
         return plan_pools(self.SPECS, available_bytes=8 * GIB, max_num_seqs=128)
 
     def test_reserved_bytes_is_exactly_what_gets_allocated(self):
-        """Including for a class holding a retention share: the sub-entry
-        remainder of the share goes back to the budget instead of being
-        reserved and never allocated, or the runner's allocation cross-check
-        would drift by up to one entry per class."""
+        """The runner cross-checks its allocation against these numbers, so a
+        class whose reserved bytes drift from `count * entry_bytes` would make
+        that check fire on a pool that is in fact correct."""
         plan = self._plan()
         for name, count in plan.entries.items():
             assert plan.reserved_bytes[name] == count * plan.entry_bytes[name]
@@ -226,8 +196,6 @@ def _pre_spec_arithmetic(
     per_decode: int,
     available: int,
     max_num_seqs: int,
-    full_retain: bool,
-    tail_frac: float,
 ):
     """The sizing expression as it stood before `plan_pools` existed.
 
@@ -241,18 +209,11 @@ def _pre_spec_arithmetic(
         raise InsufficientPoolBudget(tensor_bytes, available, max_num_seqs)
     if swa_block_bytes > 0:
         compressed_block_bytes = block_bytes - swa_block_bytes
-        if full_retain:
-            f = min(0.9, max(1e-3, tail_frac))
-            swa_budget = int(available_for_pool * f)
-            num_swa = swa_budget // swa_block_bytes
-            num_kv = (available_for_pool - swa_budget) // compressed_block_bytes
-        else:
-            num_swa = max_num_seqs * per_decode + 64
-            num_kv = max(
-                0,
-                (available_for_pool - num_swa * swa_block_bytes)
-                // compressed_block_bytes,
-            )
+        num_swa = max_num_seqs * per_decode + 64
+        num_kv = max(
+            0,
+            (available_for_pool - num_swa * swa_block_bytes) // compressed_block_bytes,
+        )
     else:
         num_swa = 0
         num_kv = available_for_pool // block_bytes
@@ -268,8 +229,6 @@ def _spec_arithmetic(
     per_decode: int,
     available: int,
     max_num_seqs: int,
-    full_retain: bool,
-    tail_frac: float,
 ):
     specs = [page_pool(block_bytes - swa_block_bytes)]
     if swa_block_bytes > 0:
@@ -279,9 +238,6 @@ def _spec_arithmetic(
                 swa_block_bytes,
                 entries_per_req=per_decode,
                 extra_entries=64,
-                retention_budget_frac=(
-                    min(0.9, max(1e-3, tail_frac)) if full_retain else 0.0
-                ),
             )
         )
     if per_req_bytes:
@@ -308,9 +264,8 @@ _SEQ_COUNTS = [1, 64, 256, 512]
 
 
 class TestParityWithPreSpecArithmetic:
-    """On every budget that yields a usable pool, the default (non-full-retain)
-    path is bit-identical to the arithmetic the runner used before this
-    refactor.
+    """On every budget that yields a usable pool, `plan_pools` is bit-identical
+    to the arithmetic the runner used before this refactor.
 
     Budgets too small to serve are the one exception, and only in which error
     surfaces — see `test_unservable_budget_fails_either_way`.
@@ -329,8 +284,6 @@ class TestParityWithPreSpecArithmetic:
             "per_decode": per_decode,
             "available": available,
             "max_num_seqs": max_num_seqs,
-            "full_retain": False,
-            "tail_frac": 0.2,
         }
         try:
             expected = _pre_spec_arithmetic(**kwargs)
@@ -364,8 +317,6 @@ class TestParityWithPreSpecArithmetic:
             "per_decode": per_decode,
             "available": available,
             "max_num_seqs": max_num_seqs,
-            "full_retain": False,
-            "tail_frac": 0.2,
         }
         try:
             old_kv, _ = _pre_spec_arithmetic(**kwargs)
@@ -375,47 +326,6 @@ class TestParityWithPreSpecArithmetic:
             pytest.skip("budget is servable; covered by the parity test")
         with pytest.raises(InsufficientPoolBudget):
             _spec_arithmetic(**kwargs)
-
-
-class TestFullRetainIsIntentionallyDifferent:
-    """Retain-everything used to be sized as a pure fraction of the budget,
-    which could hand out fewer SWA blocks than the live windows require. The
-    spec form adds the fraction ON TOP of the per-request floor, so the
-    counts differ by design."""
-
-    SHAPE: ClassVar[dict] = {
-        "block_bytes": (1 << 20) + (7 << 20),
-        "swa_block_bytes": 7 << 20,
-        "per_req_bytes": 12_210 << 10,
-        "slots_per_req": 1,
-        "per_decode": 3,
-        "available": 137 * GIB,
-        "max_num_seqs": 256,
-        "full_retain": True,
-    }
-
-    def test_spec_form_never_provisions_below_the_floor(self):
-        for frac in (0.001, 0.05, 0.2, 0.9):
-            kw = {**self.SHAPE, "tail_frac": frac}
-            _, new_swa = _spec_arithmetic(**kw)
-            floor = kw["max_num_seqs"] * kw["per_decode"] + 64
-            assert new_swa >= floor, f"frac={frac} starved the per-request floor"
-
-    def test_the_old_form_could_starve_the_floor(self):
-        """Pins the motivation: at a small fraction the pre-spec expression
-        under-provisions, which is the bug the reclassification removes."""
-        kw = {**self.SHAPE, "tail_frac": 0.001}
-        _, old_swa = _pre_spec_arithmetic(**kw)
-        floor = kw["max_num_seqs"] * kw["per_decode"] + 64
-        assert old_swa < floor
-
-    def test_spec_form_grows_with_the_fraction(self):
-        counts = [
-            _spec_arithmetic(**{**self.SHAPE, "tail_frac": f})[1]
-            for f in (0.05, 0.2, 0.5)
-        ]
-        assert counts == sorted(counts)
-        assert counts[0] < counts[-1]
 
 
 class TestEagle3SharesTheTargetBlockIds:

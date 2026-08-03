@@ -68,20 +68,11 @@ class SubPoolSpec:
     # per-request term. What it covers is the declaring backend's business.
     entries_per_req: int = 0
     extra_entries: int = 0
-    # STATE only. A share of what is left after every floor is met, handed to
-    # this class so it can retain entries past their owning request for
-    # cross-request reuse. It sits ON TOP OF the floor, never instead of it,
-    # so shrinking it can never starve a live request. This is the static
-    # stand-in for what the shared pool will do dynamically — retained entries
-    # borrowing free bytes and giving them back under pressure.
-    retention_budget_frac: float = 0.0
 
     def __post_init__(self):
         if self.pool is Pool.STATE and self.entries_per_req < 1:
             raise ValueError(f"{self.name}: STATE entries need entries_per_req >= 1")
-        if self.pool is Pool.PAGE and (
-            self.entries_per_req or self.extra_entries or self.retention_budget_frac
-        ):
+        if self.pool is Pool.PAGE and (self.entries_per_req or self.extra_entries):
             raise ValueError(f"{self.name}: PAGE entries are sized from the remainder")
 
 
@@ -102,17 +93,9 @@ def state_pool(
     *,
     entries_per_req: int,
     extra_entries: int = 0,
-    retention_budget_frac: float = 0.0,
 ) -> SubPoolSpec:
     """A per-request state entry class."""
-    return SubPoolSpec(
-        Pool.STATE,
-        name,
-        entry_bytes,
-        entries_per_req,
-        extra_entries,
-        retention_budget_frac,
-    )
+    return SubPoolSpec(Pool.STATE, name, entry_bytes, entries_per_req, extra_entries)
 
 
 @dataclass(frozen=True)
@@ -199,12 +182,10 @@ def merge_specs(specs: list[SubPoolSpec]) -> dict[str, SubPoolSpec]:
             prev.pool,
             prev.entries_per_req,
             prev.extra_entries,
-            prev.retention_budget_frac,
         ) != (
             spec.pool,
             spec.entries_per_req,
             spec.extra_entries,
-            spec.retention_budget_frac,
         ):
             raise ValueError(
                 f"entry class {spec.name!r} declared twice with different "
@@ -216,7 +197,6 @@ def merge_specs(specs: list[SubPoolSpec]) -> dict[str, SubPoolSpec]:
             prev.entry_bytes + spec.entry_bytes,
             spec.entries_per_req,
             spec.extra_entries,
-            spec.retention_budget_frac,
         )
     return merged
 
@@ -249,20 +229,6 @@ def plan_pools(
             available_bytes=available_bytes,
             entries=sum(entries.values()),
         )
-
-    # Retention shares come out of the post-floor budget, so a fraction means
-    # "of what is left to page with", not "of the whole GPU".
-    pageable = remaining
-    for name, spec in state.items():
-        if spec.retention_budget_frac <= 0.0:
-            continue
-        extra_entries = int(pageable * spec.retention_budget_frac) // spec.entry_bytes
-        entries[name] += extra_entries
-        # Charge whole entries only. The sub-entry remainder of the share goes
-        # back to the budget instead of being reserved and never allocated, so
-        # `reserved_bytes` always equals what the pool actually costs.
-        reserved[name] += extra_entries * spec.entry_bytes
-        remaining -= extra_entries * spec.entry_bytes
 
     paged = [n for n, s in merged.items() if s.pool is Pool.PAGE]
     if len(paged) > 1:

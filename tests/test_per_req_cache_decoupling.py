@@ -57,11 +57,11 @@ class TestBlockManagerPerReqCacheSlots:
     def test_disabled_no_slots(self):
         """Stateless config: no slots allocated, behaves like before."""
         bm = BlockManager(MockConfig(num_kvcache_blocks=50))
-        assert len(bm.free_per_req_cache_groups) == 0
+        assert len(bm.state.free_groups) == 0
 
     def test_enabled_has_slots(self):
         bm = BlockManager(per_req_cache_config())
-        assert len(bm.free_per_req_cache_groups) == 8
+        assert len(bm.state.free_groups) == 8
 
     def test_allocate_assigns_slot(self):
         bm = BlockManager(per_req_cache_config())
@@ -69,7 +69,7 @@ class TestBlockManagerPerReqCacheSlots:
         bm.allocate(seq)
         assert seq.per_req_cache_group >= 0
         assert seq.per_req_cache_group < 8
-        assert len(bm.free_per_req_cache_groups) == 7
+        assert len(bm.state.free_groups) == 7
 
     def test_allocate_claims_slot_no_extra_blocks(self):
         """Stateful allocate claims a slot and deducts ONLY its KV blocks.
@@ -78,23 +78,23 @@ class TestBlockManagerPerReqCacheSlots:
         stateful seq costs no extra paged blocks beyond its own KV blocks.
         """
         bm = BlockManager(per_req_cache_config())
-        initial_free = len(bm.free_block_ids_set)
+        initial_free = bm.kv.num_free
         seq = stateful_seq([1, 2, 3, 4])  # 1 KV block
         bm.allocate(seq)
         # Only the 1 KV block is deducted — no equiv-block competition.
-        assert len(bm.free_block_ids_set) == initial_free - 1
+        assert bm.kv.num_free == initial_free - 1
         assert seq.per_req_cache_group >= 0
-        assert len(bm.free_per_req_cache_groups) == 7
+        assert len(bm.state.free_groups) == 7
 
     def test_deallocate_returns_slot_and_blocks(self):
         bm = BlockManager(per_req_cache_config())
-        initial_free = len(bm.free_block_ids_set)
+        initial_free = bm.kv.num_free
         seq = stateful_seq([1, 2, 3, 4])
         bm.allocate(seq)
         bm.deallocate(seq)
         assert seq.per_req_cache_group == -1
-        assert len(bm.free_block_ids_set) == initial_free
-        assert len(bm.free_per_req_cache_groups) == 8
+        assert bm.kv.num_free == initial_free
+        assert len(bm.state.free_groups) == 8
 
     def test_can_allocate_checks_both_kv_and_slot(self):
         """can_allocate must check KV blocks AND per-req cache slots."""
@@ -119,11 +119,11 @@ class TestBlockManagerPerReqCacheSlots:
     def test_plain_seq_ignores_per_req_cache(self):
         """Stateless sequence should not consume per-req cache slots."""
         bm = BlockManager(per_req_cache_config())
-        initial_slots = len(bm.free_per_req_cache_groups)
+        initial_slots = len(bm.state.free_groups)
         seq = plain_seq([1, 2, 3, 4])
         bm.allocate(seq)
         assert seq.per_req_cache_group == -1
-        assert len(bm.free_per_req_cache_groups) == initial_slots
+        assert len(bm.state.free_groups) == initial_slots
 
     def test_multiple_allocate_deallocate(self):
         """Allocate and deallocate multiple stateful sequences."""
@@ -135,12 +135,12 @@ class TestBlockManagerPerReqCacheSlots:
             slots.add(seq.per_req_cache_group)
         # All 8 slots used
         assert len(slots) == 8
-        assert len(bm.free_per_req_cache_groups) == 0
+        assert len(bm.state.free_groups) == 0
 
         # Deallocate all
         for seq in seqs:
             bm.deallocate(seq)
-        assert len(bm.free_per_req_cache_groups) == 8
+        assert len(bm.state.free_groups) == 8
 
     def test_slot_reuse_after_dealloc(self):
         """Freed slots can be reused."""
@@ -151,11 +151,11 @@ class TestBlockManagerPerReqCacheSlots:
         s2 = stateful_seq([5, 6, 7, 8])
         bm.allocate(s1)
         bm.allocate(s2)
-        assert len(bm.free_per_req_cache_groups) == 0
+        assert len(bm.state.free_groups) == 0
 
         slot1 = s1.per_req_cache_group
         bm.deallocate(s1)
-        assert len(bm.free_per_req_cache_groups) == 1
+        assert len(bm.state.free_groups) == 1
 
         s3 = stateful_seq([9, 10, 11, 12])
         bm.allocate(s3)
@@ -171,14 +171,14 @@ class TestBlockManagerPerReqCacheSlots:
         # A long plain sequence (16 tokens → 4 KV blocks) consumes KV only.
         long_seq = plain_seq(list(range(16)))
         bm.allocate(long_seq)
-        assert len(bm.free_block_ids_set) == 16
-        assert len(bm.free_per_req_cache_groups) == 8  # slots untouched
+        assert bm.kv.num_free == 16
+        assert len(bm.state.free_groups) == 8  # slots untouched
         # A small stateful seq admits: needs 1 KV block (well within 16) + 1 slot.
         small = stateful_seq([1, 2, 3, 4])
         assert bm.can_allocate(small) >= 0
         bm.allocate(small)
-        assert len(bm.free_block_ids_set) == 15  # only its 1 KV block
-        assert len(bm.free_per_req_cache_groups) == 7  # one slot claimed
+        assert bm.kv.num_free == 15  # only its 1 KV block
+        assert len(bm.state.free_groups) == 7  # one slot claimed
 
 
 # ── Sequence: per_req_cache_group field ──────────────────────────────────────
@@ -295,10 +295,10 @@ class TestSchedulerPerReqCacheIntegration:
         sched.add(seq)
         sched.schedule()
         assert seq.per_req_cache_group >= 0
-        initial_slots = len(sched.block_manager.free_per_req_cache_groups)
+        initial_slots = len(sched.block_manager.state.free_groups)
         sched.preempt(seq)
         assert seq.per_req_cache_group == -1
-        assert len(sched.block_manager.free_per_req_cache_groups) == initial_slots + 1
+        assert len(sched.block_manager.state.free_groups) == initial_slots + 1
 
     def test_slot_exhaustion_blocks_prefill(self):
         """When all per-req cache slots are used, new stateful requests wait."""

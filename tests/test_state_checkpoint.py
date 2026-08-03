@@ -3,7 +3,7 @@
 #
 # Neither the GDN recurrent state nor the V4 compressor ring can be rebuilt
 # from cached KV blocks, so a prefix hit is only resumable at a boundary where
-# some earlier request published its state. `StateCheckpointPool` indexes those
+# some earlier request published its state. `StateGroupPool` indexes those
 # boundaries and `BlockManager` shrinks the hit to the rightmost one — without
 # it, a hit hands the resumed forward a group straight off the free list and it
 # reads the previous occupant's state.
@@ -13,6 +13,7 @@
 # checkpoints must never reduce the number of admissible requests, and the
 # eviction event is hand-out, not free.
 
+from math import isinf
 from types import SimpleNamespace
 
 import pytest
@@ -21,7 +22,9 @@ from conftest import MockConfig
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import Sequence, SequenceType
-from atom.model_engine.state_pool import StateCheckpointPool
+from atom.model_engine.state_cache import StateCache
+from atom.model_engine.state_pool import StateGroupPool
+from atom.model_engine.swa_pool import SlidingWindowPool
 
 BLOCK = 4
 MIN_FORK = 8
@@ -65,7 +68,7 @@ def publish_at_boundary(bm: BlockManager, seq: Sequence) -> int:
     hit = bm.can_allocate(seq)
     assert hit >= 0
     bm.allocate(seq, hit)
-    boundary = bm.state_publish_limit(seq)
+    boundary = bm.checkpoint_limit(seq)
     assert boundary > 0
     bm.hash_blocks(seq, boundary - seq.num_cached_tokens)
     return boundary_hash(bm, seq)
@@ -73,64 +76,74 @@ def publish_at_boundary(bm: BlockManager, seq: Sequence) -> int:
 
 def boundary_hash(bm: BlockManager, seq: Sequence) -> int:
     """Content hash of the last block before this seq's checkpoint boundary."""
-    last = bm.state_publish_limit(seq) // bm.hash_block_size - 1
-    return bm.blocks[seq.block_table[last]].hash
+    last = bm.checkpoint_limit(seq) // bm.hash_block_size - 1
+    return bm.kv.block(seq.block_table[last]).hash
 
 
-# ── StateCheckpointPool in isolation ───────────────────────────────────────
+# ── StateGroupPool in isolation ────────────────────────────────────────────
+
+
+def idx_seq(num_tokens: int = 1000):
+    """The two Sequence fields `resumable_hit` reads, and nothing else."""
+    return SimpleNamespace(num_tokens=num_tokens, has_per_req_cache=True)
 
 
 class TestPoolIndex:
 
     def test_disabled_is_identity(self):
-        pool = StateCheckpointPool(0)
-        assert pool.bounded_hit(5, [1, 2, 3, 4, 5]) == 5
+        pool = StateGroupPool(0)
+        assert pool.resumable_hit(idx_seq(), 5, [1, 2, 3, 4, 5]) == 5
         assert pool.lookup(1) == -1
 
-    def test_bounded_hit_picks_rightmost_checkpoint(self):
-        pool = StateCheckpointPool(4)
-        pool.publish(10, 0)
-        pool.publish(30, 1)
+    def test_resumable_hit_picks_rightmost_checkpoint(self):
+        pool = StateGroupPool(4, min_fork_tokens=1, hash_block_size=1)
+        pool._index(10, 0)
+        pool._index(30, 1)
         # hashes for blocks 0..4; checkpoints exist after block 0 and block 2
-        assert pool.bounded_hit(5, [10, 20, 30, 40, 50]) == 3
+        assert pool.resumable_hit(idx_seq(), 5, [10, 20, 30, 40, 50]) == 3
 
-    def test_bounded_hit_zero_when_nothing_published(self):
-        pool = StateCheckpointPool(4)
-        assert pool.bounded_hit(5, [10, 20, 30, 40, 50]) == 0
+    def test_resumable_hit_zero_when_nothing_published(self):
+        pool = StateGroupPool(4, min_fork_tokens=1, hash_block_size=1)
+        assert pool.resumable_hit(idx_seq(), 5, [10, 20, 30, 40, 50]) == 0
 
-    def test_bounded_hit_respects_forkable_predicate(self):
-        pool = StateCheckpointPool(4)
-        pool.publish(10, 0)
-        pool.publish(30, 1)
-        # The rightmost boundary (3) is rejected, so the scan walks back to 1.
-        assert pool.bounded_hit(5, [10, 20, 30, 40, 50], lambda L: L < 3) == 1
+    def test_resumable_hit_walks_back_when_the_fork_has_no_room(self):
+        pool = StateGroupPool(4, min_fork_tokens=4, hash_block_size=1)
+        pool._index(10, 0)
+        pool._index(30, 1)
+        # One token per block, five in the seq: the rightmost checkpoint
+        # (boundary 3) leaves only 2 tokens to forward, short of the 4 a fork
+        # needs, so the scan walks back to boundary 1, which leaves 4.
+        assert pool.resumable_hit(idx_seq(5), 5, [10, 20, 30, 40, 50]) == 1
 
     def test_invalidate_drops_both_directions(self):
-        pool = StateCheckpointPool(4)
-        pool.publish(10, 2)
+        pool = StateGroupPool(4)
+        pool._index(10, 2)
         pool.invalidate(2)
         assert pool.lookup(10) == -1
         # A later invalidate of the same group must not delete a new tenant.
-        pool.publish(10, 3)
+        pool._index(10, 3)
         pool.invalidate(2)
         assert pool.lookup(10) == 3
 
     def test_republishing_a_hash_orphans_the_old_group(self):
-        pool = StateCheckpointPool(4)
-        pool.publish(10, 1)
-        pool.publish(10, 2)
+        pool = StateGroupPool(4)
+        pool._index(10, 1)
+        pool._index(10, 2)
         assert pool.lookup(10) == 2
         # Group 1 no longer backs hash 10; invalidating it leaves 2 indexed.
         pool.invalidate(1)
         assert pool.lookup(10) == 2
 
     def test_pins_drain_once(self):
-        pool = StateCheckpointPool(4)
+        pool = StateGroupPool(4)
+        pool.free_groups.clear()  # every group out with a request
         pool.pin(1)
         pool.pin(3)
         assert pool.is_pinned(1)
-        assert pool.take_pins() == [1, 3]
-        assert pool.take_pins() == []
+        pool.release_pins()
+        assert list(pool.free_groups) == [1, 3]
+        pool.release_pins()  # idempotent: a drained pin is not freed twice
+        assert list(pool.free_groups) == [1, 3]
         assert not pool.is_pinned(1)
 
 
@@ -162,7 +175,7 @@ class TestHitShrink:
         bm = BlockManager(ckpt_config())
         first = stateful_seq(list(range(40)))
         publish_at_boundary(bm, first)
-        boundary = bm.state_publish_limit(first)
+        boundary = bm.checkpoint_limit(first)
 
         second = stateful_seq(list(range(40)))
         assert bm.can_allocate(second) * bm.hash_block_size == boundary
@@ -198,12 +211,12 @@ class TestCapacity:
         # point is that neither outcome costs a group.
         assert bm.state.hash_to_group
         # Every group is back, so the pool admits its full concurrency.
-        assert len(bm.free_per_req_cache_groups) == 4
+        assert len(bm.state.free_groups) == 4
         for i in range(4):
             seq = stateful_seq(list(range(900 + 20 * i, 920 + 20 * i)))
             assert bm.can_allocate(seq) >= 0
             bm.allocate(seq, 0)
-        assert len(bm.free_per_req_cache_groups) == 0
+        assert len(bm.state.free_groups) == 0
 
     def test_handout_evicts_the_checkpoint_it_lands_on(self):
         bm = BlockManager(ckpt_config())
@@ -212,7 +225,7 @@ class TestCapacity:
         group = bm.state.lookup(h)
         bm.deallocate(first)
         # Drain the queue until the checkpoint's group comes back around.
-        while bm.free_per_req_cache_groups:
+        while bm.state.free_groups:
             seq = stateful_seq(list(range(900, 920)))
             bm.allocate(seq, 0)
             if seq.per_req_cache_group == group:
@@ -226,7 +239,7 @@ class TestCapacity:
         first = stateful_seq(list(range(40)))
         h = publish_at_boundary(bm, first)
         group = bm.state.lookup(h)
-        assert len(bm.free_per_req_cache_groups) == 1
+        assert len(bm.state.free_groups) == 1
 
         second = stateful_seq(list(range(40)))
         bm.allocate(second, bm.can_allocate(second))
@@ -248,7 +261,7 @@ class TestForkLifecycle:
         hit = bm.can_allocate(seq)
         bm.allocate(seq, hit)
         before = seq.per_req_cache_group
-        boundary = bm.state_publish_limit(seq)
+        boundary = bm.checkpoint_limit(seq)
         bm.hash_blocks(seq, boundary - seq.num_cached_tokens)
         assert seq.per_req_cache_group != before
         assert seq.state_fork_src == before
@@ -259,26 +272,26 @@ class TestForkLifecycle:
         seq = stateful_seq(list(range(40)))
         bm.allocate(seq, bm.can_allocate(seq))
         group = seq.per_req_cache_group
-        bm.hash_blocks(seq, bm.state_publish_limit(seq) + BLOCK)
+        bm.hash_blocks(seq, bm.checkpoint_limit(seq) + BLOCK)
         assert seq.per_req_cache_group == group
         assert not bm.state.hash_to_group
 
     def test_boundary_leaves_room_for_the_fork_forward(self):
         bm = BlockManager(ckpt_config())
         seq = stateful_seq(list(range(40)))
-        boundary = bm.state_publish_limit(seq)
+        boundary = bm.checkpoint_limit(seq)
         assert boundary % bm.hash_block_size == 0
         assert seq.num_prompt_tokens - boundary >= MIN_FORK
 
     def test_every_block_boundary_up_to_the_limit_qualifies(self):
         bm = BlockManager(ckpt_config())
         seq = stateful_seq(list(range(40)))
-        limit = bm.state_publish_limit(seq)
-        assert bm.is_state_publish_pos(seq, BLOCK)
-        assert bm.is_state_publish_pos(seq, limit)
-        assert not bm.is_state_publish_pos(seq, limit + BLOCK)  # no room to fork
-        assert not bm.is_state_publish_pos(seq, BLOCK + 2)  # not block aligned
-        assert not bm.is_state_publish_pos(seq, 0)
+        limit = bm.checkpoint_limit(seq)
+        assert bm.checkpointers_at(seq, BLOCK)
+        assert bm.checkpointers_at(seq, limit)
+        assert not bm.checkpointers_at(seq, limit + BLOCK)  # no room to fork
+        assert not bm.checkpointers_at(seq, BLOCK + 2)  # not block aligned
+        assert not bm.checkpointers_at(seq, 0)
 
     def test_chunked_prefill_leaves_a_ladder_of_checkpoints(self):
         """Intermediate boundaries publish too — the CPU-offload resume points."""
@@ -296,11 +309,11 @@ class TestForkLifecycle:
     def test_interval_thins_the_ladder(self):
         bm = BlockManager(ckpt_config(state_checkpoint_interval_tokens=3 * BLOCK))
         seq = stateful_seq(list(range(40)))
-        limit = bm.state_publish_limit(seq)
+        limit = bm.checkpoint_limit(seq)
         published = [
             pos
             for pos in range(BLOCK, limit + BLOCK, BLOCK)
-            if bm.is_state_publish_pos(seq, pos)
+            if bm.checkpointers_at(seq, pos)
         ]
         # 40 tokens, 8 reserved for the fork forward: rungs at 12 and 24, and
         # the limit is the last rung rather than the last block boundary (32).
@@ -310,10 +323,8 @@ class TestForkLifecycle:
     def test_interval_zero_publishes_nothing(self):
         bm = BlockManager(ckpt_config(state_checkpoint_interval_tokens=0))
         seq = stateful_seq(list(range(40)))
-        assert bm.state_publish_limit(seq) == 0
-        assert not any(
-            bm.is_state_publish_pos(seq, pos) for pos in range(BLOCK, 40, BLOCK)
-        )
+        assert bm.checkpoint_limit(seq) == 0
+        assert not any(bm.checkpointers_at(seq, pos) for pos in range(BLOCK, 40, BLOCK))
 
     def test_prompt_shorter_than_the_interval_publishes_nothing(self):
         """The zero-cost case: no reuse to be had, so no forward is spent.
@@ -324,7 +335,7 @@ class TestForkLifecycle:
         """
         bm = BlockManager(ckpt_config(state_checkpoint_interval_tokens=8 * BLOCK))
         seq = stateful_seq(list(range(30)))  # 30 < 8 * BLOCK
-        assert bm.state_publish_limit(seq) == 0
+        assert bm.checkpoint_limit(seq) == 0
         run_prompt(bm, seq)
         assert not bm.state.hash_to_group
         assert seq.state_fork_src == -1
@@ -337,7 +348,7 @@ class TestForkLifecycle:
     def test_hit_never_lands_where_swa_cannot_follow(self):
         """The two gates settle jointly; neither is applied to the other's answer.
 
-        `swa.bounded_hit` promises the rightmost boundary whose trailing window
+        `swa.resumable_hit` promises the rightmost boundary whose trailing window
         is present. Shrinking that answer to a checkpoint boundary can land
         somewhere SWA never approved, and `allocate` would then claim an SWA
         hash the pool never promised.
@@ -350,36 +361,36 @@ class TestForkLifecycle:
         bm.state.hash_to_group = {}
         hashes = [1000 + i for i in range(9)]
         for group, boundary in enumerate(published):
-            bm.state.publish(hashes[boundary - 1], group)
-        bm.swa.bounded_hit = lambda s, p, h, _a=approved: min(p, _a)
+            bm.state._index(hashes[boundary - 1], group)
+        bm.swa.resumable_hit = lambda s, p, h, _a=approved: min(p, _a)
 
         assert bm._gated_hit(seq, 9, hashes) == approved
 
         # Now SWA only accepts 4: the rightmost checkpoint (5) is out of reach,
         # so the answer must fall back to 2 rather than stay at 5 or become 4.
         approved = 4
-        bm.swa.bounded_hit = lambda s, p, h, _a=approved: min(p, _a)
+        bm.swa.resumable_hit = lambda s, p, h, _a=approved: min(p, _a)
         assert bm._gated_hit(seq, 9, hashes) == 2
 
     def test_no_boundary_when_the_backend_cannot_fork(self):
         bm = BlockManager(ckpt_config(state_min_fork_tokens=0))
         seq = stateful_seq(list(range(40)))
-        assert bm.state_publish_limit(seq) == 0
-        assert not bm.is_state_publish_pos(seq, 16)
+        assert bm.checkpoint_limit(seq) == 0
+        assert not bm.checkpointers_at(seq, 16)
 
     def test_cancel_adopts_the_source_and_returns_the_new_group(self):
         bm = BlockManager(ckpt_config())
         seq = stateful_seq(list(range(40)))
         bm.allocate(seq, bm.can_allocate(seq))
         source = seq.per_req_cache_group
-        bm.hash_blocks(seq, bm.state_publish_limit(seq) - seq.num_cached_tokens)
-        free_after_publish = len(bm.free_per_req_cache_groups)
+        bm.hash_blocks(seq, bm.checkpoint_limit(seq) - seq.num_cached_tokens)
+        free_after_publish = len(bm.state.free_groups)
 
         bm.cancel_state_fork(seq)
         assert seq.per_req_cache_group == source
         assert seq.state_fork_src == -1
         assert not bm.state.hash_to_group
-        assert len(bm.free_per_req_cache_groups) == free_after_publish
+        assert len(bm.state.free_groups) == free_after_publish
 
     def test_two_resumers_in_one_step_share_the_checkpoint(self):
         # A checkpoint is read-only, so a second request hitting the same prefix
@@ -400,9 +411,9 @@ class TestForkLifecycle:
         assert len(groups) == len(resumers)
         assert src not in groups
         # However many read it, the group goes back exactly once.
-        before = len(bm.free_per_req_cache_groups)
+        before = len(bm.state.free_groups)
         bm.release_state_pins()
-        assert len(bm.free_per_req_cache_groups) == before + 1
+        assert len(bm.state.free_groups) == before + 1
 
     def test_cancel_refuses_to_adopt_a_shared_source(self):
         bm = BlockManager(ckpt_config())
@@ -435,7 +446,7 @@ class TestForkLifecycle:
         assert not bm.state.is_pinned(src)
         # The pin must not also hand the group back — it has an owner now.
         bm.release_state_pins()
-        assert src not in bm.free_per_req_cache_groups
+        assert src not in bm.state.free_groups
 
     def test_pinned_source_returns_to_the_free_list_next_step(self):
         bm = BlockManager(ckpt_config())
@@ -443,9 +454,9 @@ class TestForkLifecycle:
         src = bm.state.lookup(publish_at_boundary(bm, first))
         second = stateful_seq(list(range(40)))
         bm.allocate(second, bm.can_allocate(second))
-        assert src not in bm.free_per_req_cache_groups
+        assert src not in bm.state.free_groups
         bm.release_state_pins()
-        assert src in bm.free_per_req_cache_groups
+        assert src in bm.state.free_groups
 
 
 # ── The scheduler side: what a checkpoint costs the publisher ──────────────
@@ -466,7 +477,7 @@ class TestPrefillChunkAlignment:
     def test_chunk_stops_at_the_rung(self):
         sched = Scheduler(ckpt_config(state_checkpoint_interval_tokens=3 * BLOCK))
         seq = stateful_seq(list(range(40)))
-        limit = sched.block_manager.state_publish_limit(seq)
+        limit = sched.block_manager.checkpoint_limit(seq)
         assert limit == 24
         # A whole-prompt chunk is cut at the last rung...
         assert sched._finalize_prefill_chunk(seq, 0, 40) == limit
@@ -512,7 +523,7 @@ class TestDecodePointPublishing:
         self._generate_to(bm, seq, 3 * BLOCK)
         assert seq.per_req_cache_group != group
         assert seq.state_fork_src == group
-        assert bm.state.lookup(bm.blocks[seq.block_table[2]].hash) == group
+        assert bm.state.lookup(bm.kv.block(seq.block_table[2]).hash) == group
 
     def test_a_backend_needing_a_long_fork_never_publishes_mid_generation(self):
         """Self-gating: no `min_fork` special case, the number decides.
@@ -558,7 +569,7 @@ class TestDecodePointPublishing:
         assert bm.can_allocate(followup) == 3
         bm.allocate(followup, 3)
         assert followup.state_fork_src == bm.state.lookup(
-            bm.blocks[seq.block_table[2]].hash
+            bm.kv.block(seq.block_table[2]).hash
         )
 
 
@@ -574,16 +585,16 @@ class TestDecodePublishGate:
         return seq
 
     def test_plain_decode_offers_its_one_token(self):
-        assert self._sched()._state_publish_room(self._decoding_seq(), False) == 1
+        assert self._sched()._checkpoint_room(self._decoding_seq(), False) == 1
 
     def test_finishing_request_offers_nothing(self):
-        assert self._sched()._state_publish_room(self._decoding_seq(), True) == 0
+        assert self._sched()._checkpoint_room(self._decoding_seq(), True) == 0
 
     def test_a_seq_still_on_its_prompt_offers_nothing(self):
         """Prefill decides with the prompt's own remainder, not with this."""
         seq = stateful_seq(list(range(40)))
         seq.type = SequenceType.PREFILL
-        assert self._sched()._state_publish_room(seq, False) == 0
+        assert self._sched()._checkpoint_room(seq, False) == 0
 
     def test_speculative_decode_offers_nothing(self):
         """A fork must never reach the spec path — it has no read-side index.
@@ -595,10 +606,8 @@ class TestDecodePublishGate:
         sched = self._sched(
             speculative_config=SimpleNamespace(num_speculative_tokens=3)
         )
-        assert sched._state_publish_room(self._decoding_seq(), False) == 0
-        assert (
-            sched.block_manager.state_publish_limit(stateful_seq(list(range(40)))) > 0
-        )
+        assert sched._checkpoint_room(self._decoding_seq(), False) == 0
+        assert sched.block_manager.checkpoint_limit(stateful_seq(list(range(40)))) > 0
 
     def test_postprocess_carries_the_room_to_a_real_checkpoint(self):
         """End to end: generation alone leaves a resume point behind.
@@ -610,7 +619,7 @@ class TestDecodePublishGate:
         sched = self._sched()
         bm = sched.block_manager
         seq = stateful_seq(list(range(BLOCK)))
-        assert bm.state_publish_limit(seq) == 0
+        assert bm.checkpoint_limit(seq) == 0
         sched.add(seq)
         batch, _ = sched.schedule()
 
@@ -630,9 +639,109 @@ class TestDecodePublishGate:
             batch, _ = sched.schedule()
             forks.extend(s for s in batch.state_fork_srcs if s >= 0)
 
-        published = bm.state.lookup(bm.blocks[seq.block_table[1]].hash)
+        published = bm.state.lookup(bm.kv.block(seq.block_table[1]).hash)
         assert published >= 0
         # The seq moved off the group it gave away, and the forward right after
         # the publish was told to read it.
         assert seq.per_req_cache_group != published
         assert forks == [published]
+
+
+# ── One ladder, two state classes ──────────────────────────────────────────
+#
+# SWA and the compressor ring are both `Pool.STATE` (sub_pool_spec.py): both
+# scale with in-flight requests, both can keep a boundary resumable, both can
+# veto a hit. They differ only in mutability, and `successor_room` is that
+# difference quantified — which is all the ladder knows about either.
+
+
+def swa_pool(**overrides):
+    kwargs = {"num_blocks": 64, "window": 16, "block_size": BLOCK, "mtp_k": 0}
+    kwargs.update(overrides)
+    return SlidingWindowPool(**kwargs)
+
+
+class TestStateCacheProtocol:
+
+    def test_both_classes_satisfy_the_protocol(self):
+        assert isinstance(swa_pool(), StateCache)
+        assert isinstance(StateGroupPool(4), StateCache)
+
+    def test_a_class_that_keeps_nothing_reports_inf(self):
+        """`inf` is what stops the ladder cutting chunks for a class in vain.
+
+        The window pool only ever materializes the trailing window, so no older
+        boundary has anything left to hold on to; reporting 0 would have the
+        scheduler cut prefill chunks at every rung for a class that stores
+        nothing there — cost with no reuse.
+        """
+        assert isinf(swa_pool().successor_room)
+        assert isinf(StateGroupPool(4, min_fork_tokens=0).successor_room)
+
+    def test_the_limit_follows_the_class_that_reaches_furthest(self):
+        """The smallest room reaches furthest right; a larger one must not cap it."""
+        bm = BlockManager(ckpt_config())
+        seq = stateful_seq(list(range(40)))
+        assert bm.checkpoint_limit(seq) == 32  # the ring alone: 40 - MIN_FORK
+        bm.swa.enabled = True
+        bm.swa.successor_room = 0
+        assert bm.checkpoint_limit(seq) == 40
+
+    def test_backend_zero_means_the_opposite_end_of_the_scale(self):
+        """`min_fork_tokens() == 0` is the backend API's 'no forkable state'."""
+        assert isinf(StateGroupPool(4, min_fork_tokens=0).successor_room)
+        assert StateGroupPool(4, min_fork_tokens=7).successor_room == 7
+
+    def test_the_immutable_class_qualifies_where_the_rolling_one_cannot(self):
+        bm = BlockManager(ckpt_config())
+        seq = stateful_seq(list(range(40)))
+        # A rung one token from the end: the ring has no room to hand over, an
+        # immutable class needs none.
+        pos = seq.num_prompt_tokens - BLOCK
+        assert bm.state not in bm.checkpointers_at(seq, pos)
+        bm.swa.enabled = True
+        bm.swa.successor_room = 0
+        assert bm.checkpointers_at(seq, pos) == [bm.swa]
+
+    def test_cut_and_ladder_agree_position_for_position(self):
+        """The chunk is cut where — and only where — something gets kept."""
+        bm = BlockManager(ckpt_config())
+        seq = stateful_seq(list(range(40)))
+        cuts = {
+            bm.checkpoint_cut(seq, pos - 1, pos)
+            for pos in range(1, seq.num_prompt_tokens + 1)
+        }
+        rungs = {
+            pos
+            for pos in range(1, seq.num_prompt_tokens + 1)
+            if bm.checkpointers_at(seq, pos)
+        }
+        assert cuts - {0} == rungs
+
+
+class TestGatedHitFixpoint:
+
+    def test_the_answer_is_accepted_by_every_class(self):
+        """What a fixpoint means, asserted directly rather than by construction."""
+        bm = BlockManager(ckpt_config())
+        seq = stateful_seq(list(range(40)))
+        hashes = [1000 + i for i in range(9)]
+        for group, boundary in enumerate([2, 5]):
+            bm.state._index(hashes[boundary - 1], group)
+        bm.swa.resumable_hit = lambda s, p, h: min(p, 4)
+
+        answer = bm._gated_hit(seq, 9, hashes)
+        for cache in bm.state_caches:
+            assert cache.resumable_hit(seq, answer, hashes) == answer
+
+    def test_order_between_classes_does_not_change_the_answer(self):
+        bm = BlockManager(ckpt_config())
+        seq = stateful_seq(list(range(40)))
+        hashes = [1000 + i for i in range(9)]
+        for group, boundary in enumerate([2, 5]):
+            bm.state._index(hashes[boundary - 1], group)
+        bm.swa.resumable_hit = lambda s, p, h: min(p, 4)
+
+        forward = bm._gated_hit(seq, 9, hashes)
+        bm.state_caches = tuple(reversed(bm.state_caches))
+        assert bm._gated_hit(seq, 9, hashes) == forward

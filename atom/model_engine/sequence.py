@@ -108,7 +108,7 @@ class Sequence:
         self.per_req_cache_group = -1
         # Group the NEXT forward reads its incoming state from, when that is not
         # the group it writes (`per_req_cache_group`). Set by BlockManager on a
-        # state fork — resuming from a checkpoint, or publishing one — and
+        # state fork — resuming from a checkpoint, or taking one — and
         # cleared by the scheduler once a batch has carried it, so it describes
         # exactly one forward. -1 = read and write the same group, the case for
         # every step in between.

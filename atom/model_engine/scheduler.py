@@ -718,10 +718,10 @@ class Scheduler:
         BlockManager bookkeeping; cheap (no traversal of seq tables).
         """
         bm = self.block_manager
-        total = len(bm.blocks)
+        total = bm.kv.num_blocks
         if total <= 0:
             return 0.0
-        return len(bm.used_block_ids) / total
+        return bm.kv.num_used / total
 
     def _waiting_new_token_count(self) -> int:
         """Sum of new (uncached) tokens across the ADMITTABLE waiting queue,
@@ -891,7 +891,7 @@ class Scheduler:
                 f"enable chunked prefill, or shorten the prompt."
             )
         bm = self.block_manager
-        total_blocks = len(bm.blocks)
+        total_blocks = bm.kv.num_blocks
         if seq.num_blocks > total_blocks:
             return (
                 f"needs {seq.num_blocks} KV blocks for {num_tokens} input tokens "
@@ -918,9 +918,9 @@ class Scheduler:
         bm = self.block_manager
         # No slots ever allocated (max_num_seqs=0 effectively) AND no slots
         # currently in use → seq with has_per_req_cache=True can never enter.
-        # We check the slot list length below; "no slots ever existed" is the
-        # permanent case, distinguished by the pool's total capacity.
-        if seq.has_per_req_cache and len(bm.free_per_req_cache_groups) == 0:
+        # "No slots ever existed" is the permanent case, distinguished from
+        # "all busy" by the pool's total capacity.
+        if seq.has_per_req_cache and not bm.state.has_free():
             # All slots are currently in-use OR no slots were ever created.
             # The schedule loop handles "currently full" by waiting; only
             # warn for the permanent "never created" case.
@@ -1539,39 +1539,33 @@ class Scheduler:
 
         Two jobs, both about `BlockManager`'s state checkpoints:
 
-        1. A checkpoint can only be taken where a forward ends exactly on a
-           publish position — otherwise the group holds state ahead of the hash
-           it would be filed under. So land chunks on that grid (every
-           `state_checkpoint_interval_tokens`, up to `state_publish_limit`),
-           shortening at most to the previous grid point. Chunks that reach past
-           the limit are cut at it; chunks beyond it are left alone, since
-           nothing more will be published there.
+        1. A checkpoint can only be kept where a forward ends exactly on a rung
+           of the ladder — otherwise the state is ahead of the hash it would be
+           filed under. So land chunks on that grid, shortening at most to the
+           previous rung; `BlockManager.checkpoint_cut` owns the arithmetic, so
+           that it cannot drift from the rule deciding what actually gets kept.
         2. The forward carrying a fork has to fill the request's new group by
            itself. If the budget left a chunk too short for that, drop the fork
            rather than the request — unless the source is shared with another
            request forking off it this step, which rules out taking it over. Then
            the fork stays and the chunk is held at `min_fork_tokens` instead;
            `can_allocate` only offered a resumable boundary with that many
-           prompt tokens behind it, so the tokens are there to forward.
+           prompt tokens behind it, so the tokens are there to forward. Only the
+           rolling state class forks, so this job asks it directly.
 
         No-op for models without per-request state, and for any prompt shorter
-        than one checkpoint interval (`limit == 0`).
+        than one checkpoint interval.
         """
         bm = self.block_manager
-        limit = bm.state_publish_limit(seq)
-        if limit:
-            end = min(start + chunk, limit)
-            # `limit` is itself a multiple of the interval, so a chunk cut at it
-            # needs no special case.
-            target = end - end % bm.state_checkpoint_interval_tokens
-            if target > start:
-                chunk = target - start
-        if seq.state_fork_src >= 0 and chunk < bm.state_min_fork_tokens:
+        target = bm.checkpoint_cut(seq, start, start + chunk)
+        if target:
+            chunk = target - start
+        if seq.state_fork_src >= 0 and chunk < bm.state.min_fork_tokens:
             if not bm.cancel_state_fork(seq):
-                chunk = bm.state_min_fork_tokens
+                chunk = bm.state.min_fork_tokens
         return chunk
 
-    def _state_publish_room(self, seq: Sequence, finished: bool) -> int:
+    def _checkpoint_room(self, seq: Sequence, finished: bool) -> int:
         """Tokens the forward after this one carries, for `hash_decode_blocks`.
 
         0 means "do not checkpoint here", for any of three reasons:
@@ -1581,7 +1575,7 @@ class Scheduler:
         - speculative decode runs the state kernels down the spec path, whose
           index tensor has no read-side counterpart (see
           `GDNAttentionMetadataBuilder.prepare_state_indices`), so a fork must
-          never reach it. Publishing during *prefill* stays safe on the same
+          never reach it. Checkpointing during *prefill* stays safe on the same
           models: `min_fork_tokens` guarantees prompt is left over, and prompt
           always forwards down the non-spec path;
         - the seq is still on its prompt, where the prefill call site has
@@ -1895,7 +1889,7 @@ class Scheduler:
             # postprocess sees idx=None and skips this seq (above). By the
             # time the prefill output surfaces, the next step's schedule has
             # already flipped seq.type to DECODE — the old PREFILL gate never
-            # fires and `hash_to_block_id` stays empty for prompt blocks (HBM
+            # fires and the content index stays empty for prompt blocks (HBM
             # prefix cache silently dead). The flag gate fires once per seq
             # at the first postprocess with idx.
             #
@@ -2074,7 +2068,7 @@ class Scheduler:
             self.block_manager.hash_decode_blocks(
                 seq,
                 num_tokens - (0 if is_deferred_out else 1),
-                next_forward_tokens=self._state_publish_room(
+                next_forward_tokens=self._checkpoint_room(
                     seq, leave_reason is not None
                 ),
             )
@@ -2266,7 +2260,7 @@ class Scheduler:
             parent_block_hash: int | None = None
             prev_hash: int | None = None
             for i, block_id in enumerate(seq.block_table):
-                blk = bm.blocks[block_id]
+                blk = bm.kv.block(block_id)
                 if blk.hash == -1:
                     continue
                 if i < num_cached_blocks:
@@ -2757,7 +2751,7 @@ class DecodeScheduler(Scheduler):
                 seq = self.running.popleft()
                 # logger.warning("decode state: waiting=%d prefill_waiting=%d prefill_done=%d running=%d free_blocks=%d",
                 #     len(self.waiting), len(self.prefill_waiting), len(self.prefill_done),
-                #     len(self.running), len(self.block_manager.free_block_ids_set))
+                #     len(self.running), self.block_manager.kv.num_free)
                 while not self.block_manager.can_append(seq, self.mtp_k + 1):
                     logger.warning("Cannot allocate")
                     if self.running:

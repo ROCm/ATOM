@@ -318,8 +318,9 @@ class EngineArgs:
             default=8192,
             help=(
                 "For models with per-request state (DeepSeek-V4 compressor "
-                "ring, GDN recurrent state), publish a state checkpoint every "
-                "N tokens of context so a later prefix hit can resume there. "
+                "ring and sliding window, GDN recurrent state), keep a state "
+                "checkpoint every N tokens of context so a later prefix hit "
+                "can resume there. "
                 "A prompt shorter than N publishes nothing, which is what keeps "
                 "the feature free on workloads that never reuse a prefix. Must "
                 "be a multiple of the prefix-cache hash block size; 0 disables "

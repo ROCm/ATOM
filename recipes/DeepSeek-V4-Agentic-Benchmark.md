@@ -157,8 +157,7 @@ exec podman run --rm --name "atom_agentic_${RUN_LABEL}" \
   -e MODEL_PATH=/data/amd_int/models/DeepSeek-V4-Pro -e TP=8 -e EP_SIZE=1 \
   -e CONC="$CONC" -e DURATION="$DURATION" -e PORT=18080 \
   -e MAX_NUM_SEQS=96 -e GPU_MEMORY_UTILIZATION=0.9 -e KV_CACHE_DTYPE=fp8 \
-  -e ATOM_SWA_FULL_RETAIN=1 -e ATOM_SWA_RETENTION_INTERVAL=32768 \
-  -e ATOM_SWA_CHECKPOINT_FRAC=0.5 -e ATOM_DEBUG_PREFIX_HITS=1 \
+  -e ATOM_DEBUG_PREFIX_HITS=1 \
   -e RESULT_DIR="/workspace/results/$RUN_LABEL" -e RESULT_FILENAME="$RUN_LABEL" \
   -e AGENTIC_OUTPUT_DIR="/workspace/results/$RUN_LABEL" \
   -e INFMAX_CONTAINER_WORKSPACE=/inferencex \
@@ -207,12 +206,17 @@ aiperf profile --scenario inferencex-agentx-mvp \
   --output-artifact-dir "$RESULT_DIR/aiperf_artifacts"
 ```
 
-### Step 3 — one-line invocation (exactly what produced the PR1640 row)
+### Step 3 — one-line invocation
+
+The PR1640 row was produced with `ATOM_SWA_FULL_RETAIN=1
+ATOM_SWA_RETENTION_INTERVAL=32768 ATOM_SWA_CHECKPOINT_FRAC=0.5` on top of the
+below. That SWA full-retain mode has since been removed, so this recipe now
+runs the default window-only path and will not reproduce that row exactly.
+
 ```bash
 ATOM_IMAGE=docker.io/rocm/atom-dev:latest \
 ATOM_SOURCE_OVERRIDE=$PWD/ATOM \
 GPU_MEMORY_UTILIZATION=0.9 KV_CACHE_DTYPE=fp8 \
-ATOM_SWA_FULL_RETAIN=1 ATOM_SWA_RETENTION_INTERVAL=32768 ATOM_SWA_CHECKPOINT_FRAC=0.5 \
 ATOM_DEBUG_PREFIX_HITS=1 \
 RUN_LABEL=atom_pr1640_agentic_fp8_tp8_c48_mem90_int32k_$(date +%Y%m%d) \
 bash ./run_atom_agentic.sh full

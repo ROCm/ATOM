@@ -81,7 +81,7 @@ from atom.model_ops.v4_kernels import (
     write_v4_paged_decode_indices,
     write_v4_paged_prefill_indices,
 )
-from atom.utils import CpuGpuBuffer, envs
+from atom.utils import CpuGpuBuffer
 from atom.utils.forward_context import (
     AttentionMetaData,
     AttnState,
@@ -607,13 +607,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         ceil(max_model_len/bs) (e.g. 1024 → ~66 blocks at 131072/8192/128/128).
         """
         bs = self.block_size
-        # NOTE: full-retain (ATOM_SWA_FULL_RETAIN) does NOT enter here. It is a
-        # retention share taken off the leftover budget, declared as
-        # `retention_budget_frac` in `sub_pool_specs` and added ON TOP of this
-        # per-request floor. Keeping the two apart is what makes shrinking the
-        # share unable to starve a live window — and it keeps this method
-        # memory-independent: sizing retention on max_model_len here would
-        # explode to ~TB at DSV4's 1M max_position_embeddings.
         # per_decode uses win_with_spec (= window + max_spec_steps), not window
         # alone: under MTP each decoding seq writes up to `max_spec_steps` draft
         # tokens into the SWA pool before the next window-free, so its peak
@@ -685,9 +678,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # the STATE pool because its size tracks concurrency, not history —
         # `swa_blocks_per_req() * max_num_seqs` — even though it is
         # block-table addressed and shared across requests.
-        # ATOM_SWA_FULL_RETAIN keeps blocks that have slid out of the window
-        # for cross-request reuse; that share sits ON TOP OF the per-request
-        # floor, so shrinking the fraction can never starve a live window.
         return [
             page_pool(compressed_block_bytes),
             state_pool(
@@ -700,11 +690,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 # across a block boundary. Flat rather than per-request because
                 # the transients do not all land on the same step.
                 extra_entries=64,
-                retention_budget_frac=(
-                    min(0.9, max(1e-3, envs.ATOM_SWA_TAIL_BUDGET_FRAC))
-                    if envs.ATOM_SWA_FULL_RETAIN
-                    else 0.0
-                ),
             ),
             # One slot per request regardless of MTP: the draft lookahead is
             # absorbed into `win_with_spec` (the SWA per-request block count),

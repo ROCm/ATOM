@@ -1285,9 +1285,10 @@ class Config:
     max_num_batched_tokens: int = 16384
     long_prefill_token_threshold: int = 0
     attn_prefill_chunk_size: int = 16384
-    # Tokens between per-request state checkpoints; 0 = never publish. Must be
-    # a multiple of the prefix-cache hash block size (asserted in BlockManager).
-    # See BlockManager.is_state_publish_pos.
+    # Tokens between rungs of the state-checkpoint ladder, shared by every
+    # Pool.STATE class; 0 = no ladder. Must be a multiple of the prefix-cache
+    # hash block size (asserted in BlockManager). See
+    # BlockManager.checkpointers_at.
     state_checkpoint_interval_tokens: int = 8192
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512

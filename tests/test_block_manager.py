@@ -187,7 +187,7 @@ class TestCanAllocateWithPrefixCaching:
     def test_can_allocate_accounts_for_cache_hits(self, seq_factory):
         """can_allocate must charge BOTH the cache-miss block AND the
         cache-hit-on-free-pool block to the free-block budget, because the
-        cached block still has to be claimed out of free_block_ids_set."""
+        cached block still has to be claimed off the free list."""
         cfg = MockConfig(
             num_kvcache_blocks=4, kv_cache_block_size=4, enable_prefix_caching=True
         )
@@ -227,7 +227,7 @@ class TestCanAllocateWithPrefixCaching:
 class TestHashTableCleanup:
     def test_stale_hash_entries_evicted_on_reuse(self, seq_factory):
         """When a cached block is reused for a different hash, the old
-        hash_to_block_id entry should be cleaned up."""
+        content-hash entry should be cleaned up."""
         cfg = MockConfig(
             num_kvcache_blocks=2, kv_cache_block_size=4, enable_prefix_caching=True
         )
@@ -235,7 +235,7 @@ class TestHashTableCleanup:
         s1 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
         bm.allocate(s1)
         bm.hash_blocks(s1, s1.num_tokens - s1.num_cached_tokens)
-        h1 = bm.blocks[s1.block_table[0]].hash
+        h1 = bm.kv.block(s1.block_table[0]).hash
         bm.deallocate(s1)
 
         # Allocate with completely different tokens — should overwrite blocks
@@ -243,10 +243,10 @@ class TestHashTableCleanup:
         bm.allocate(s2)
         bm.hash_blocks(s2, s2.num_tokens - s2.num_cached_tokens)
         # Old hash should no longer point to a valid block
-        assert bm.hash_to_block_id.get(h1) != s2.block_table[0]
+        assert bm.kv.lookup(h1) != s2.block_table[0]
 
     def test_hash_table_bounded_growth(self, seq_factory):
-        """hash_to_block_id should not grow beyond num_kvcache_blocks."""
+        """The content index should not grow beyond num_kvcache_blocks."""
         cfg = MockConfig(
             num_kvcache_blocks=4, kv_cache_block_size=4, enable_prefix_caching=True
         )
@@ -258,7 +258,7 @@ class TestHashTableCleanup:
             if n >= 0:
                 bm.allocate(seq, n)
                 bm.deallocate(seq)
-        assert len(bm.hash_to_block_id) <= cfg.num_kvcache_blocks
+        assert bm.kv.num_indexed <= cfg.num_kvcache_blocks
 
 
 # ── can_append with multi-token decode (speculative decoding) ────────────
@@ -355,13 +355,13 @@ class TestPrefixCachingEdgeCases:
         bm.allocate(s2)
         assert s2.num_cached_tokens == 0
 
-    def test_free_block_ids_set_consistent(self, block_manager, seq_factory):
-        """free_block_ids_set stays consistent through allocate/deallocate."""
+    def test_free_count_consistent(self, block_manager, seq_factory):
+        """The free count stays consistent through allocate/deallocate."""
         s1 = seq_factory([1, 2, 3, 4])
         block_manager.allocate(s1)
-        initial_free = len(block_manager.free_block_ids_set)
+        initial_free = block_manager.kv.num_free
         block_manager.deallocate(s1)
-        assert len(block_manager.free_block_ids_set) == initial_free + 1
+        assert block_manager.kv.num_free == initial_free + 1
 
 
 # ── M2 paged-SWA dual pool ───────────────────────────────────────────────────
@@ -407,7 +407,7 @@ class TestM2DualSwaPool:
         assert all(s < 0 for s in seq.swa_block_table)
         bm.swa.ensure_for_tokens(seq, 0, len(toks))
         # After ensure, the touched logical blocks hold real disjoint phys ids.
-        assert all(s in bm.swa.used_block_ids for s in seq.swa_block_table)
+        assert all(bm.swa.pool.is_used(s) for s in seq.swa_block_table)
 
     def test_windowonly_prefill_no_cross_request_swa_reuse(self, seq_factory):
         # Window-only prefill writes/publishes SWA only for the trailing
@@ -433,7 +433,7 @@ class TestM2DualSwaPool:
         # reused cached blocks share the SAME swa phys ids as s1.
         for i in range(n2):
             assert s2.swa_block_table[i] == s1.swa_block_table[i]
-            assert bm.swa.blocks[s2.swa_block_table[i]].ref_count >= 2
+            assert bm.swa.pool.block(s2.swa_block_table[i]).ref_count >= 2
 
     def test_intersection_stops_hit_when_swa_evicted(self, seq_factory):
         bm = _swa_bm()
@@ -442,10 +442,11 @@ class TestM2DualSwaPool:
         bm.allocate(s1, bm.can_allocate(s1))
         bm.hash_blocks(s1, len(toks))
         bm.deallocate(s1)
-        # Manually evict the SWA hash for block 0 (simulate window-free/evict)
-        # while leaving the compressed hash intact → hit must stop at block 0.
+        # Hand block 0's SWA slot out for other content — the real eviction
+        # event — while leaving the compressed hash intact → hit must stop at
+        # block 0.
         h0 = BlockManager.compute_hash(toks[0:4])
-        bm.swa.hash_to_block_id.pop(h0, None)
+        bm.swa.pool.allocate(bm.swa.pool.lookup(h0))
         s2 = seq_factory(toks)
         n2 = bm.can_allocate(s2)
         assert n2 == 0  # compressed block 0 cached but SWA gone → no reuse
@@ -459,7 +460,7 @@ class TestM2DualSwaPool:
         used_swa = {s for s in seq.swa_block_table if s >= 0}
         bm.deallocate(seq)
         assert seq.swa_block_table == []
-        assert used_swa and used_swa.issubset(bm.swa.free_block_ids_set)
+        assert used_swa and not any(bm.swa.pool.is_used(s) for s in used_swa)
 
     def test_swa_pool_exhaustion(self, seq_factory):
         # SWA pool smaller than compressed → admission bounded by SWA pool.
@@ -484,7 +485,7 @@ class TestM2WindowFreeing:
         assert set(freed) == {0, 1, 2, 3}, f"freed={freed}"
         # trailing blocks (in window) still held
         kept = [s for s in seq.swa_block_table if s >= 0]
-        assert all(s in bm.swa.used_block_ids for s in kept)
+        assert all(bm.swa.pool.is_used(s) for s in kept)
         # live SWA footprint bounded ~ window/bs (+ slack), not full seq length.
         assert len(kept) <= window // bs + 2
 
@@ -493,12 +494,12 @@ class TestM2WindowFreeing:
         bm = _swa_bm(num_blocks=40, num_swa=40, bs=bs, window=window, prefix=False)
         seq = seq_factory(list(range(1, 9)))
         bm.allocate(seq, bm.can_allocate(seq))
-        free0 = len(bm.swa.free_block_ids_set)
+        free0 = bm.swa.pool.num_free
         for t in range(8, 30):
             seq.append_token(1000 + t)
             bm.may_append(seq)
         # Many SWA blocks were allocated then window-freed → free pool recovered.
-        assert len(bm.swa.free_block_ids_set) > free0 - (window // bs + 3)
+        assert bm.swa.pool.num_free > free0 - (window // bs + 3)
 
     def test_compressed_untouched_by_window_freeing(self, seq_factory):
         bs, window = 4, 8
@@ -510,7 +511,7 @@ class TestM2WindowFreeing:
             bm.may_append(seq)
         # Every compressed block stays held (no -1 sentinels, all in used set).
         assert all(b >= 0 for b in seq.block_table)
-        assert all(b in bm.used_block_ids for b in seq.block_table)
+        assert all(bm.kv.is_used(b) for b in seq.block_table)
 
 
 # ── decode-side block hashing ──────────────────────────────────────────────
@@ -629,4 +630,4 @@ class TestDecodeBlockHashing:
             bm.may_append(seq)
         bm.hash_decode_blocks(seq, seq.num_tokens)
         assert seq.num_hashed_tokens == 0
-        assert not bm.hash_to_block_id
+        assert not bm.kv.num_indexed

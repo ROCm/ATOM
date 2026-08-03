@@ -41,7 +41,7 @@ Defined in `atom/config.py`. The root dataclass that the engine consumes.
 | `num_kvcache_blocks` | `int` | `-1` | Number of KV cache blocks (`-1` = auto) |
 | `kv_cache_dtype` | `str` | `"bf16"` | KV cache data type (`"bf16"` or `"fp8"`) |
 | `enable_prefix_caching` | `bool` | `False` | Enable prefix caching to reuse KV blocks across requests sharing the same prefix |
-| `state_checkpoint_interval_tokens` | `int` | `8192` | For models with per-request state (DeepSeek-V4 compressor ring, GDN recurrent state): publish a state checkpoint every N tokens of context, so a later prefix hit can resume there. A prompt shorter than N publishes nothing. Must be a multiple of the prefix-cache hash block size; `0` disables checkpoints. See the state-checkpoint section of the [scheduling & KV cache guide](scheduling_kv_cache_guide.md) |
+| `state_checkpoint_interval_tokens` | `int` | `8192` | For models with per-request state (DeepSeek-V4 compressor ring, GDN recurrent state): keep a state checkpoint every N tokens of context, so a later prefix hit can resume there. A prompt shorter than N checkpoints nothing. Must be a multiple of the prefix-cache hash block size; `0` disables checkpoints. See the state-checkpoint section of the [scheduling & KV cache guide](scheduling_kv_cache_guide.md) |
 | `port` | `int` | `8006` | Engine internal communication port |
 | `torch_profiler_dir` | `str \| None` | `os.getenv("ATOM_TORCH_PROFILER_DIR", None)` | Directory for saving PyTorch profiler traces; creates the directory if it does not exist |
 | `compilation_config` | `CompilationConfig` | `CompilationConfig()` | Compilation and CUDA graph settings (see Section 2) |
