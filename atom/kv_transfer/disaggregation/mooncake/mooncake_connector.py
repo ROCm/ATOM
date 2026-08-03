@@ -23,15 +23,18 @@ import msgpack
 import msgspec
 import torch
 import zmq
+from aiter.dist.parallel_state import get_dp_group, get_tp_group
 
 from atom.config import Config
-from atom.kv_transfer.disaggregation.port_offset import (
-    consumer_region_indices,
-    side_channel_port_offset as _port_offset,
-)
 from atom.kv_transfer.disaggregation.base import (
     KVConnectorBase,
     KVConnectorSchedulerBase,
+)
+from atom.kv_transfer.disaggregation.port_offset import (
+    consumer_region_indices,
+)
+from atom.kv_transfer.disaggregation.port_offset import (
+    side_channel_port_offset as _port_offset,
 )
 from atom.kv_transfer.disaggregation.types import (
     ConnectorMetadata,
@@ -42,7 +45,6 @@ from atom.model_engine.sequence import Sequence
 from atom.models.utils import get_pp_indices
 from atom.utils import get_open_port, make_zmq_path, zmq_socket_ctx
 from atom.utils.network import get_ip
-from aiter.dist.parallel_state import get_dp_group, get_tp_group
 
 logger = logging.getLogger("atom")
 
@@ -434,6 +436,13 @@ class MooncakeConnector(KVConnectorBase):
         )
         self.is_consumer = not self.is_producer
 
+        # HiSparse RDMA-direct: set in register_kv_caches when the consumer's KV
+        # regions point at the paged host cold pool. Defaults keep every other path
+        # (producer, non-HiSparse consumer, early register return) inert.
+        self._hisparse_coord = None
+        self._hisparse_direct = False
+        self._hisparse_page_size = 0
+
         # Networking config
         self.http_port = kv_transfer_config.get("http_port", 8000)
         self.request_address = f"{self.local_ip}:{self.http_port}"
@@ -644,6 +653,26 @@ class MooncakeConnector(KVConnectorBase):
             offset += chunk
         return sizes
 
+    def _hisparse_remap_dst(
+        self, req_id: ReqId, local_block_ids: list[int]
+    ) -> list[int]:
+        """Reserve host pages for an RDMA-direct request; return host page dst ids.
+
+        Acquires the HiSparse slot + one host page per logical block, then maps each
+        logical block to its cold-pool host page id (the producer writes
+        ``cold_base + page*bpb`` with ``bpb == page_size*item``, landing the block in
+        that page). Runs at recv, off the decode hot path, so the D2H read is fine.
+        """
+        import torch
+
+        coord = self._hisparse_coord
+        page = self._hisparse_page_size
+        n_blocks = len(local_block_ids)
+        slot = coord.acquire_at_recv(req_id, n_blocks * page)
+        idx = torch.arange(n_blocks, dtype=torch.long, device=coord.device) * page
+        host_pages = (coord.req_to_host_pool[slot, idx] // page).tolist()
+        return [int(p) for p in host_pages]
+
     def register_kv_caches(
         self,
         kv_caches: dict[str, Any],
@@ -663,6 +692,19 @@ class MooncakeConnector(KVConnectorBase):
         from atom.kv_transfer.disaggregation.types import KVTransferTensors
 
         tt: KVTransferTensors = transfer_tensors
+
+        # HiSparse RDMA-direct (consumer only): the KV block_regions already point
+        # at the pinned paged host cold pool (built by the MLA builder), so MR
+        # registration and base-addr advertisement below target host memory with no
+        # further change. The coordinator handle drives per-request page allocation
+        # and dst_block_id remapping in start_load_kv.
+        self._hisparse_coord = getattr(tt, "hisparse_coordinator", None)
+        self._hisparse_direct = (
+            self._hisparse_coord is not None and not self.is_producer
+        )
+        self._hisparse_page_size = (
+            self._hisparse_coord.host_page_size if self._hisparse_direct else 0
+        )
 
         self._has_slot_regions = (
             len(tt.slot_regions) > 0 or tt.staging_region is not None
@@ -885,7 +927,23 @@ class MooncakeConnector(KVConnectorBase):
                 or off >= len(remote_block_ids)
             ):
                 off = 0
-            dst_block_ids = meta.local_block_ids[off:]
+            if self._hisparse_direct:
+                # RDMA-direct: prefill writes straight into this request's paged
+                # host cold pool. Reserve a HiSparse slot + host pages, then remap
+                # the decode block ids to host page ids so producer's dst_base +
+                # db*bpb lands each logical block in its cold-pool page (page_size ==
+                # block_size, so bpb matches). Force a full transfer (off=0): the
+                # cold pool has no locally-cached prefix to reuse (first version).
+                #
+                # The index_cache stays on GPU and is addressed by scheduler block
+                # ids, not host page ids. Send the original GPU block ids separately
+                # so the producer can use them for index regions.
+                off = 0
+                dst_block_ids = self._hisparse_remap_dst(req_id, meta.local_block_ids)
+                dst_index_block_ids = meta.local_block_ids
+            else:
+                dst_block_ids = meta.local_block_ids[off:]
+                dst_index_block_ids = None
             src_block_ids = remote_block_ids[off:]
 
             # Build the (stage-independent) write_request payload once.
@@ -906,6 +964,9 @@ class MooncakeConnector(KVConnectorBase):
                 "consumer_tp_size": self.tp_size,
                 "write_nonce": write_nonce,
             }
+            if dst_index_block_ids is not None:
+                request_body["dst_index_block_ids"] = dst_index_block_ids
+                request_body["num_kv_block_regions"] = self._num_local_layers
 
             consumer_staging_pool_idx = -1
             if self._has_slot_regions:
@@ -979,8 +1040,15 @@ class MooncakeConnector(KVConnectorBase):
 
             self._pending_recv.add(req_id)
             # Only the delta blocks are RDMA-written, so only they need fencing;
-            # the reused prefix blocks are already coherent.
-            self._pending_recv_blocks[req_id] = list(dst_block_ids)
+            # the reused prefix blocks are already coherent. RDMA-direct writes the
+            # KV into pinned host cold pool (no GPU fence needed, host page ids must
+            # not be fed to the fence kernel), but the index_cache IS on GPU and its
+            # blocks DO need fencing.
+            if self._hisparse_direct:
+                if dst_index_block_ids is not None:
+                    self._pending_recv_blocks[req_id] = list(dst_index_block_ids)
+            else:
+                self._pending_recv_blocks[req_id] = list(dst_block_ids)
             if meta.local_slot_index >= 0:
                 self._pending_recv_slots[req_id] = (
                     meta.local_slot_index,
@@ -1313,6 +1381,8 @@ class MooncakeConnector(KVConnectorBase):
     ) -> bool:
         """Block-only RDMA transfer (MHA, MLA, and other block-indexed backends)."""
         consumer_base_addrs = request_data["consumer_base_addrs"]
+        dst_index_block_ids = request_data.get("dst_index_block_ids")
+        num_kv_block_regions = request_data.get("num_kv_block_regions", 0)
 
         src_addrs: list[int] = []
         dst_addrs: list[int] = []
@@ -1321,10 +1391,15 @@ class MooncakeConnector(KVConnectorBase):
         num_regions = len(self.kv_caches_base_addr)
         cmap = self._consumer_region_map(num_regions)
         for region_idx in range(num_regions):
+            cidx = cmap[region_idx]
             src_base = self.kv_caches_base_addr[region_idx]
-            dst_base = consumer_base_addrs[cmap[region_idx]]
+            dst_base = consumer_base_addrs[cidx]
             bpb = self._per_block_bytes_list[region_idx]
-            for sb, db in zip(src_block_ids, dst_block_ids):
+            if dst_index_block_ids is not None and cidx >= num_kv_block_regions:
+                region_dst_ids = dst_index_block_ids
+            else:
+                region_dst_ids = dst_block_ids
+            for sb, db in zip(src_block_ids, region_dst_ids):
                 src_addrs.append(src_base + sb * bpb)
                 dst_addrs.append(dst_base + db * bpb)
                 sizes.append(bpb)
@@ -1366,6 +1441,10 @@ class MooncakeConnector(KVConnectorBase):
         consumer_swa_block_bpb = request_data.get("consumer_swa_block_bpb", [])
         dst_swa_block_ids = request_data.get("dst_swa_block_ids", [])
         src_swa_block_ids = prefill_data.get("swa_block_ids", [])
+        # RDMA-direct: the consumer's KV block regions use host page ids
+        # (dst_block_ids) but its index_cache regions use GPU block ids.
+        dst_index_block_ids = request_data.get("dst_index_block_ids")
+        num_kv_block_regions = request_data.get("num_kv_block_regions", 0)
 
         # ---- Phase 1: Block transfer ----
         block_src: list[int] = []
@@ -1376,7 +1455,11 @@ class MooncakeConnector(KVConnectorBase):
         for region_idx, (src_base, bpb) in enumerate(self._block_regions):
             cidx = block_cmap[region_idx]
             dst_base = consumer_block_addrs[cidx]
-            for sb, db in zip(src_block_ids, dst_block_ids):
+            if dst_index_block_ids is not None and cidx >= num_kv_block_regions:
+                region_dst_ids = dst_index_block_ids
+            else:
+                region_dst_ids = dst_block_ids
+            for sb, db in zip(src_block_ids, region_dst_ids):
                 block_src.append(src_base + sb * bpb)
                 block_dst.append(dst_base + db * consumer_block_bpb[cidx])
                 block_sizes.append(bpb)

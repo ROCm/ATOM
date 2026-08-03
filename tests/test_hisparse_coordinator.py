@@ -200,6 +200,179 @@ def test_sync_active_releases_departed_requests():
     assert sorted(c._free_slots) == sorted(set(range(4)) - {c.slot_for_req(11)})
 
 
+# --- Stage D: paged host pool (RDMA-direct) allocator -------------------------
+
+
+def _make_paged(max_num_seqs=2, hot=4, max_ctx=48, kv_dim=8, ratio=8, page=16):
+    return HiSparseCoordinator(
+        num_layers=1,
+        max_num_seqs=max_num_seqs,
+        hot_buffer_size=hot,
+        max_context_len=max_ctx,
+        kv_dim=kv_dim,
+        kv_dtype=torch.bfloat16,
+        device="cpu",
+        rdma_direct=True,
+        host_to_device_ratio=ratio,
+        page_size=page,
+    )
+
+
+def test_paged_alloc_pages_contiguous_within_page():
+    c = _make_paged(page=16)
+    slot = c.acquire(req_id=1, context_len=20)
+    c.alloc_host_pages(slot, 0, 20)  # 20 tokens -> 2 pages (page-rounded to 32)
+    assert c._req_host_alloc_len[slot] == 32
+    row = c.req_to_host_pool[slot]
+    # Each 16-token page is contiguous: slot value = page_base + offset.
+    for pstart in (0, 16):
+        base = int(row[pstart].item())
+        assert base % 16 == 0  # page-aligned host slot
+        assert row[pstart : pstart + 16].tolist() == list(range(base, base + 16))
+    # The two pages are distinct.
+    assert int(row[0].item()) // 16 != int(row[16].item()) // 16
+    # Unbacked logical positions stay -1.
+    assert int(row[32].item()) == _EMPTY
+
+
+def test_paged_alloc_growth_and_free_recycles_pages():
+    c = _make_paged(page=16)
+    free0 = len(c._free_host_pages)
+    slot = c.acquire(req_id=1, context_len=10)
+    c.alloc_host_pages(slot, 0, 10)  # 1 page
+    assert len(c._free_host_pages) == free0 - 1
+    c.grow_host_for_new_tokens([slot], [16])  # crosses into a 2nd page
+    assert c._req_host_alloc_len[slot] == 32
+    assert len(c._free_host_pages) == free0 - 2
+    c.release(req_id=1)  # frees pages + clears table row
+    assert len(c._free_host_pages) == free0
+    assert torch.all(c.req_to_host_pool[slot] == _EMPTY)
+
+
+def test_sync_active_protects_reqs_awaiting_first_decode():
+    # A request acquired at recv (slot + host pages reserved) whose prompt KV is
+    # still transferring is absent from the decode batch. sync_active must not
+    # reclaim it, or its pages vanish before the first decode (concurrency crash).
+    c = _make_paged(max_num_seqs=4, ratio=8, page=16)
+    c.acquire_at_recv(req_id=100, num_tokens=20)  # in-flight recv
+    slot = c.slot_for_req(100)
+    alloc_len = c._req_host_alloc_len[slot]
+    assert alloc_len > 0
+    assert 100 in c._awaiting_first_decode
+    # Other requests decode; the in-flight request is not in their batches.
+    c.sync_active([200])
+    c.sync_active([201])
+    assert c.is_registered(100), "recv-window request wrongly released"
+    assert c._req_host_alloc_len[slot] == alloc_len
+    # Once the first decode has run (tracked by leaving _awaiting_first_decode),
+    # the request is a normal batch member and sync_active may reclaim it.
+    c._awaiting_first_decode.discard(100)  # first decode reached (GPU hot-load)
+    c.sync_active([200])  # 100 has genuinely left the batch now
+    assert not c.is_registered(100)
+
+
+def test_release_clears_awaiting_first_decode():
+    # A request aborted during recv (released before first decode) must drop out
+    # of the protection set, otherwise its slot leaks forever.
+    c = _make_paged(max_num_seqs=4, ratio=8, page=16)
+    c.acquire_at_recv(req_id=100, num_tokens=20)
+    assert 100 in c._awaiting_first_decode
+    c.release(100)
+    assert 100 not in c._awaiting_first_decode
+    assert not c.is_registered(100)
+
+
+def test_paged_alloc_exhaustion_raises():
+    # ratio=1 -> host_tokens = 1 * R(1) * H1(5) = 5 -> 1 page of 16 slots.
+    c = _make_paged(max_num_seqs=1, hot=4, ratio=1, page=16)
+    slot = c.acquire(req_id=1, context_len=16)
+    c.alloc_host_pages(slot, 0, 16)  # consumes the only page
+    with pytest.raises(RuntimeError, match="host pool exhausted"):
+        c.grow_host_for_new_tokens([slot], [16])  # needs a 2nd page, none free
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="fused swap kernel needs a GPU + aiter"
+)
+def test_paged_fused_swap_matches_token_data():
+    """RDMA-direct paged path: the table-lookup gather returns each top-k's KV.
+
+    Mirrors test_fused_swap_data_movement_matches_cold_pool but with the paged host
+    pool: token t's KV lives at host slot req_to_host_pool[slot][t] (not row t), so a
+    correct kernel must indirect through the table.
+    """
+    dev = "cuda"
+    L, R, H, C, D = 1, 1, 4, 48, 8
+    c = HiSparseCoordinator(
+        num_layers=L,
+        max_num_seqs=R,
+        hot_buffer_size=H,
+        max_context_len=C,
+        kv_dim=D,
+        kv_dtype=torch.bfloat16,
+        device=dev,
+        rdma_direct=True,
+        host_to_device_ratio=8,
+        page_size=16,
+    )
+    slot = c.acquire(req_id=1, context_len=10)
+    c.alloc_host_pages(slot, 0, 10)  # back logical 0..9 (host slots may be scattered)
+    for t in range(10):  # token t's KV -> value t, written at its host slot
+        hs = int(c.req_to_host_pool[slot, t].item())
+        c.cold_pool[0, hs] = torch.full((D,), float(t), dtype=torch.bfloat16)
+    c.load_initial_hot_set(slot, 10)
+
+    K = 3
+    for step in ([9, 8, 7], [6, 9, 5], [9, 8, 4], [3, 2, 1]):
+        topk = torch.tensor([step], dtype=torch.int32, device=dev)
+        indptr = torch.tensor([0, K], dtype=torch.int32, device=dev)
+        req_slots = torch.tensor([slot], dtype=torch.int32, device=dev)
+        out = torch.zeros(K, dtype=torch.int32, device=dev)
+        c.swap_in_for_layer_fused(0, topk, indptr, req_slots, out)
+        torch.cuda.synchronize()
+        for k, tok in enumerate(step):
+            row = c.hot_buffer[0, int(out[k].item())].float()
+            expected = torch.full((D,), float(tok), device=dev).float()
+            assert torch.allclose(row, expected), (step, k, tok, row[0].item())
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="fused backup kernel needs a GPU + aiter"
+)
+def test_paged_fused_backup_writes_via_table():
+    dev = "cuda"
+    L, R, H, C, D = 1, 1, 4, 48, 8
+    c = HiSparseCoordinator(
+        num_layers=L,
+        max_num_seqs=R,
+        hot_buffer_size=H,
+        max_context_len=C,
+        kv_dim=D,
+        kv_dtype=torch.bfloat16,
+        device=dev,
+        rdma_direct=True,
+        host_to_device_ratio=8,
+        page_size=16,
+    )
+    slot = c.acquire(req_id=1, context_len=5)
+    c.alloc_host_pages(slot, 0, 5)
+    c.load_initial_hot_set(slot, 5)
+    c.grow_host_for_new_tokens([slot], [5])  # back logical pos 5 before the backup
+    layer_kv = torch.zeros(64, D, dtype=torch.bfloat16, device=dev)
+    layer_kv[5] = torch.full((D,), 42.0, dtype=torch.bfloat16)
+    c.backup_new_tokens_fused(
+        0,
+        layer_kv,
+        torch.tensor([5], dtype=torch.int32, device=dev),
+        torch.tensor([slot], dtype=torch.int32, device=dev),
+        torch.tensor([5], dtype=torch.int32, device=dev),
+    )
+    torch.cuda.synchronize()
+    assert int(c.token_to_slot[0, slot, 5].item()) >= 0
+    hs = int(c.req_to_host_pool[slot, 5].item())
+    assert torch.allclose(c.cold_pool[0, hs].float(), torch.full((D,), 42.0).float())
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="fused swap kernel needs a GPU + aiter"
 )

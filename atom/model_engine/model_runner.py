@@ -3324,6 +3324,14 @@ class ModelRunner:
         coord.sync_active(req_ids)
         for i, rid in enumerate(req_ids):
             if coord.is_registered(rid):
+                # RDMA-direct: the slot + host pages were acquired at recv by the
+                # connector and prefill RDMA'd the prompt straight into the cold
+                # pool. Only the first hot-buffer preload is deferred to here (KV is
+                # in the cold pool by the first decode step).
+                if coord.rdma_direct:
+                    ctx = int(batch.context_lens[i])
+                    n_new = int(batch.num_scheduled_tokens[i])
+                    coord.maybe_first_hot_load(rid, ctx - n_new)
                 continue
             ctx = int(batch.context_lens[i])
             n_new = int(batch.num_scheduled_tokens[i])

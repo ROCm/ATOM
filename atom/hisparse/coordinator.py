@@ -60,6 +60,9 @@ class HiSparseCoordinator:
         device: torch.device | str = "cuda",
         index_topk: int | None = None,
         shared_index_layers: list[bool] | None = None,
+        rdma_direct: bool = False,
+        host_to_device_ratio: int = 8,
+        page_size: int = 16,
     ):
         self.num_layers = num_layers
         self.max_num_seqs = max_num_seqs
@@ -75,11 +78,38 @@ class HiSparseCoordinator:
         R = max_num_seqs
         C = max_context_len
 
-        # CPU cold pool: [num_layers, R * C, kv_dim], pinned so the swap kernel
-        # can gather from it directly (via a device-mapped pointer, see below).
-        self.cold_pool = torch.zeros(
-            (num_layers, R * C, kv_dim), dtype=kv_dtype, pin_memory=True
-        )
+        # RDMA-direct (Stage D): the cold pool is a paged shared host pool, RDMA'd
+        # into directly by prefill and addressed through the req_to_host_pool table
+        # (host memory scales with actual sequence length). Off: the dense
+        # per-request cold pool [num_layers, R*C, kv_dim] (unchanged from Phase 0).
+        self.rdma_direct = bool(rdma_direct)
+        self.host_page_size = page_size
+
+        if self.rdma_direct:
+            # Table stride: max logical positions per request, padded to a whole
+            # number of pages so a request's page-crossing stays page-aligned.
+            self.table_stride = ((C + page_size - 1) // page_size) * page_size
+            # Shared host pool sized as a multiple of the GPU hot-buffer total
+            # capacity; requests allocate pages on demand from a common free pool.
+            host_tokens = host_to_device_ratio * R * H1
+            self.num_host_pages = max(1, (host_tokens + page_size - 1) // page_size)
+            num_host_slots = self.num_host_pages * page_size
+            self.cold_pool = torch.zeros(
+                (num_layers, num_host_slots, kv_dim), dtype=kv_dtype, pin_memory=True
+            )
+            # req_to_host_pool: logical token -> flat host slot (-1 = unallocated).
+            self.req_to_host_pool = torch.full(
+                (R, self.table_stride), _EMPTY, dtype=torch.int32, device=self.device
+            )
+            self._free_host_pages: list[int] = list(range(self.num_host_pages))
+            self._req_pages: dict[int, list[int]] = {}
+            self._req_host_alloc_len = [0] * R
+        else:
+            # CPU cold pool: [num_layers, R * C, kv_dim], pinned so the swap kernel
+            # can gather from it directly (via a device-mapped pointer, see below).
+            self.cold_pool = torch.zeros(
+                (num_layers, R * C, kv_dim), dtype=kv_dtype, pin_memory=True
+            )
         # GPU hot buffer: [num_layers, R * H1, kv_dim].
         self.hot_buffer = torch.zeros(
             (num_layers, R * H1, kv_dim), dtype=kv_dtype, device=self.device
@@ -88,6 +118,20 @@ class HiSparseCoordinator:
         # Device-mapped cold-pool pointer per layer (xnack- needs the translation;
         # a raw host VA faults). Filled lazily on first swap.
         self._cold_dev_ptr: list[int | None] = [None] * num_layers
+
+        # Paged-host translation table (req_to_host_pool): logical token -> host
+        # slot, consulted by the swap kernels when RDMA-direct paging is active.
+        # ``None`` (default) means the cold pool is the dense per-request layout
+        # (row = req_slot*max_context_len + logical); the kernels then receive an
+        # empty tensor + stride 0 and fall back to dense addressing, byte-identical
+        # to the pre-paging path. Wired to a real table by the RDMA-direct setup.
+        self._empty_host_locs = torch.empty(0, dtype=torch.int32, device=self.device)
+        if self.rdma_direct:
+            self._host_cache_locs: torch.Tensor | None = self.req_to_host_pool
+            self._host_stride = self.table_stride
+        else:
+            self._host_cache_locs = None
+            self._host_stride = 0
 
         # Per (layer, request, slot) bookkeeping. Lives on ``device`` so the
         # fused swap kernel reads/writes it without any host sync; the pure-Python
@@ -117,6 +161,16 @@ class HiSparseCoordinator:
         # step) and the free-slot pool.
         self._reqid_to_slot: dict[int, int] = {}
         self._free_slots: list[int] = list(range(max_num_seqs))
+        # RDMA-direct: request ids whose hot buffer has been preloaded from the
+        # (RDMA-filled) cold pool. The slot is acquired at recv by the connector,
+        # but the hot load must wait for the first decode (KV is in the cold pool
+        # by then); this tracks which acquired requests still need that first load.
+        self._hot_loaded: set = set()
+        # RDMA-direct: request ids acquired at recv (slot + host pages reserved,
+        # prompt KV being RDMA'd in) that have not yet reached their first decode.
+        # sync_active must NOT reclaim these — they are absent from the decode batch
+        # only because their transfer is still in flight, not because they finished.
+        self._awaiting_first_decode: set = set()
 
         # Monotonic recency tick, advanced each swap/backup.
         self._tick = 0
@@ -242,6 +296,8 @@ class HiSparseCoordinator:
                     self._plan_miss_tok[:n],
                     self._plan_miss_slot[:n],
                     self._plan_miss_count[:n],
+                    self._host_locs_arg(),
+                    self._host_stride,
                     self.item_size_bytes,
                     self.padded_hot_size,
                     self.max_context_len,
@@ -280,6 +336,8 @@ class HiSparseCoordinator:
         self.slot_token[:, req_slot, :] = _EMPTY
         self.last_used[:, req_slot, :] = _EMPTY
         self.token_to_slot[:, req_slot, :] = _EMPTY
+        if self.rdma_direct:
+            self.free_host_pages(req_slot)
 
     # ------------------------------------------------------------------
     # request-id (stable) management — worker-side, keyed by ScheduledBatch ids
@@ -305,8 +363,40 @@ class HiSparseCoordinator:
         self.register_request(slot, context_len)
         return slot
 
+    def acquire_at_recv(self, req_id: int, num_tokens: int) -> int:
+        """Reserve a slot + host pages for an inbound request (RDMA-direct).
+
+        Called by the connector before it asks the producer to RDMA the prompt KV
+        straight into this request's freshly allocated host pages. The hot buffer
+        is preloaded later, on the request's first decode (see maybe_first_hot_load).
+        """
+        assert self.rdma_direct
+        slot = self.acquire(req_id, num_tokens)
+        self.alloc_host_pages(slot, 0, num_tokens)
+        self._awaiting_first_decode.add(req_id)
+        return slot
+
+    def maybe_first_hot_load(self, req_id: int, present: int) -> None:
+        """Preload the hot buffer for an RDMA-direct request on its first decode.
+
+        Idempotent per request id: the prompt KV is already in the cold pool (RDMA),
+        so this just seeds the resident hot set from it once.
+        """
+        if not self.rdma_direct or req_id in self._hot_loaded:
+            return
+        slot = self._reqid_to_slot.get(req_id)
+        if slot is None:
+            return
+        self.load_initial_hot_set(slot, present)
+        self._hot_loaded.add(req_id)
+        # First decode reached: the request is now a normal decode-batch member,
+        # so sync_active may reclaim it once it leaves the batch.
+        self._awaiting_first_decode.discard(req_id)
+
     def release(self, req_id: int) -> None:
         """Free the slot held by a request id (idempotent)."""
+        self._hot_loaded.discard(req_id)
+        self._awaiting_first_decode.discard(req_id)
         slot = self._reqid_to_slot.pop(req_id, None)
         if slot is None:
             return
@@ -319,15 +409,102 @@ class HiSparseCoordinator:
         Decode requests are scheduled every step until they finish, so a
         registered id absent from the current batch has completed (or been
         preempted — it will re-stage cleanly on return).
+
+        RDMA-direct exception: a request acquired at recv whose prompt KV is still
+        being transferred is not yet in any decode batch. Skip those (tracked in
+        ``_awaiting_first_decode``) so their reserved slot + host pages survive the
+        recv window; they become reclaimable once their first decode runs.
         """
         active = set(active_req_ids)
         for req_id in list(self._reqid_to_slot.keys()):
-            if req_id not in active:
+            if req_id not in active and req_id not in self._awaiting_first_decode:
                 self.release(req_id)
 
     # ------------------------------------------------------------------
     # cold-pool addressing
     # ------------------------------------------------------------------
+    def _host_locs_arg(self) -> torch.Tensor:
+        """Tensor to pass the swap kernels as ``host_cache_locs``.
+
+        Returns the paged translation table when RDMA-direct paging is active, or
+        a persistent empty tensor otherwise (kernel sees stride 0 -> nullptr ->
+        dense ``req_slot*cold_depth + logical`` addressing, unchanged from Phase 0).
+        """
+        return (
+            self._host_cache_locs
+            if self._host_cache_locs is not None
+            else self._empty_host_locs
+        )
+
+    # ------------------------------------------------------------------
+    # paged host pool (RDMA-direct)
+    # ------------------------------------------------------------------
+    def alloc_host_pages(self, req_slot: int, start_pos: int, num_tokens: int) -> None:
+        """Back logical ``[start_pos, start_pos+num_tokens)`` with host pool pages.
+
+        Allocates whole pages on demand from the shared free pool and records each
+        logical token's flat host slot in ``req_to_host_pool`` (slots within a page
+        are contiguous, so an RDMA block write lands in one page). Growth is
+        contiguous: ``start_pos`` must not exceed the request's already-backed
+        length. Raises if the shared pool is exhausted (admission back-pressure).
+        """
+        assert self.rdma_direct
+        if num_tokens <= 0:
+            return
+        page = self.host_page_size
+        allocated_len = self._req_host_alloc_len[req_slot]
+        end_pos = start_pos + num_tokens
+        assert start_pos <= allocated_len, (
+            f"non-contiguous host alloc: start_pos={start_pos} > "
+            f"allocated_len={allocated_len} (req_slot={req_slot})"
+        )
+        page_end = ((end_pos + page - 1) // page) * page
+        if page_end <= allocated_len:
+            return
+        num_new_pages = (page_end - allocated_len) // page
+        if len(self._free_host_pages) < num_new_pages:
+            raise RuntimeError(
+                f"HiSparse host pool exhausted: need {num_new_pages} pages, "
+                f"{len(self._free_host_pages)} free (num_host_pages="
+                f"{self.num_host_pages}); raise ATOM_HISPARSE_HOST_TO_DEVICE_RATIO "
+                "or lower concurrency"
+            )
+        new_pages = [self._free_host_pages.pop() for _ in range(num_new_pages)]
+        self._req_pages.setdefault(req_slot, []).extend(new_pages)
+        # Flat host slots for the newly backed logical range, page-contiguous.
+        slots = torch.empty(page_end - allocated_len, dtype=torch.int32)
+        off = torch.arange(page, dtype=torch.int32)
+        for i, p in enumerate(new_pages):
+            slots[i * page : (i + 1) * page] = p * page + off
+        self.req_to_host_pool[req_slot, allocated_len:page_end] = slots.to(self.device)
+        self._req_host_alloc_len[req_slot] = page_end
+
+    def free_host_pages(self, req_slot: int) -> None:
+        """Return a request's host pages to the shared free pool and clear its row."""
+        if not self.rdma_direct:
+            return
+        pages = self._req_pages.pop(req_slot, None)
+        if pages:
+            self._free_host_pages.extend(pages)
+        self.req_to_host_pool[req_slot].fill_(_EMPTY)
+        self._req_host_alloc_len[req_slot] = 0
+
+    def grow_host_for_new_tokens(
+        self, req_slots: list[int], positions: list[int]
+    ) -> None:
+        """Ensure each decode query token's logical position has a backing host slot.
+
+        Called eagerly before the forward each step so the fused backup kernel can
+        write cold pool at ``req_to_host_pool[r][pos]`` (the table update is a fixed-
+        address scatter on an already-allocated tensor, so the captured forward that
+        follows reads it correctly).
+        """
+        if not self.rdma_direct:
+            return
+        for r, pos in zip(req_slots, positions):
+            if pos >= 0:
+                self.alloc_host_pages(r, pos, 1)
+
     def _cold_base(self, req_slot: int) -> int:
         return req_slot * self.max_context_len
 
@@ -361,7 +538,13 @@ class HiSparseCoordinator:
         ``token_phys_slots[i]`` is the physical slot (``block*block_size+offset``)
         of logical token ``i`` in the flattened per-layer cache. The cold pool
         stores tokens densely by logical position.
+
+        RDMA-direct: the prompt KV was written straight into the host pool by
+        prefill (first version forces a full transfer, off=0), so there is nothing
+        to stage from the GPU — this is a no-op.
         """
+        if self.rdma_direct:
+            return
         phys = token_phys_slots[:num_tokens].to(gpu_kv_cache.device, dtype=torch.long)
         base = self._cold_base(req_slot)
         for layer_id in range(self.num_layers):
@@ -385,16 +568,20 @@ class HiSparseCoordinator:
         # Seed the fused kernel's recency so its on-device ticks continue strictly
         # above the initial hot set (all initial tokens share this baseline tick).
         self.recency[req_slot] = self._tick
-        cold_base = self._cold_base(req_slot)
         hot_base = self._hot_base(req_slot)
+        if self.rdma_direct:
+            # Paged: the cold-pool source rows are the host slots the RDMA wrote to,
+            # read from the translation table (populated at admit by alloc_host_pages).
+            src = self.req_to_host_pool[req_slot, start_tok:num_tokens]
+        else:
+            src = self._cold_base(req_slot) + tokens
+        dst = hot_base + slots
         for layer_id in range(self.num_layers):
             # bookkeeping
             self.slot_token[layer_id, req_slot, :h] = tokens
             self.last_used[layer_id, req_slot, :h] = self._tick
             self.token_to_slot[layer_id, req_slot, start_tok:num_tokens] = slots
-            # data movement: cold[cold_base+tok] -> hot[hot_base+slot]
-            src = cold_base + tokens
-            dst = hot_base + slots
+            # data movement: cold[src] -> hot[hot_base+slot]
             self._run_swap(layer_id, src, dst)
 
     # ------------------------------------------------------------------
@@ -569,6 +756,8 @@ class HiSparseCoordinator:
                 self._plan_miss_tok[:n],
                 self._plan_miss_slot[:n],
                 self._plan_miss_count[:n],
+                self._host_locs_arg(),
+                self._host_stride,
                 self.item_size_bytes,
                 self.padded_hot_size,
                 self.max_context_len,
@@ -589,6 +778,8 @@ class HiSparseCoordinator:
             self.token_to_slot[layer_id],
             self.recency,
             out_translated,
+            self._host_locs_arg(),
+            self._host_stride,
             self.item_size_bytes,
             self.padded_hot_size,
             self.max_context_len,
@@ -622,6 +813,8 @@ class HiSparseCoordinator:
             req_slots,
             logical_pos,
             self.token_to_slot[anchor_layer],
+            self._host_locs_arg(),
+            self._host_stride,
             self.item_size_bytes,
             self.padded_hot_size,
             self.max_context_len,
@@ -655,6 +848,8 @@ class HiSparseCoordinator:
             self.last_used[layer_id],
             self.token_to_slot[layer_id],
             self.recency,
+            self._host_locs_arg(),
+            self._host_stride,
             self.item_size_bytes,
             self.padded_hot_size,
             self.max_context_len,
@@ -676,8 +871,12 @@ class HiSparseCoordinator:
         high recency (it will likely be selected next step).
         """
         assert logical_pos < self.max_context_len
-        cold_base = self._cold_base(req_slot)
-        self.cold_pool[layer_id, cold_base + logical_pos].copy_(
+        if self.rdma_direct:
+            self.alloc_host_pages(req_slot, logical_pos, 1)
+            cold_row = int(self.req_to_host_pool[req_slot, logical_pos].item())
+        else:
+            cold_row = self._cold_base(req_slot) + logical_pos
+        self.cold_pool[layer_id, cold_row].copy_(
             new_token_kv.reshape(self.kv_dim).to(self.cold_pool.dtype)
         )
         self._tick += 1

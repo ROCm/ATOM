@@ -28,6 +28,8 @@ HANDSHAKE_PORT=6301
 HS_MAX_NUM_SEQS=${HS_MAX_NUM_SEQS:-16}
 HS_MAX_MODEL_LEN=${HS_MAX_MODEL_LEN:-4096}
 HS_HOT_BUFFER_SIZE=${HS_HOT_BUFFER_SIZE:-8192}   # must be >= index_topk (2048)
+# Stage D: RDMA KV straight into the paged host cold pool (skip GPU->cold copy).
+HS_RDMA_DIRECT=${HS_RDMA_DIRECT:-0}
 
 # ── cleanup ──────────────────────────────────────────────────────────
 pkill -f openai_server 2>/dev/null || true
@@ -58,6 +60,7 @@ AITER_QUICK_REDUCE_QUANTIZATION=INT4 \
 AITER_USE_FLYDSL_MOE_SORTING=1 \
 ATOM_HISPARSE_ENABLE=1 \
 ATOM_HISPARSE_HOT_BUFFER_SIZE=$HS_HOT_BUFFER_SIZE \
+ATOM_HISPARSE_RDMA_DIRECT=$HS_RDMA_DIRECT \
 HIP_VISIBLE_DEVICES=4,5,6,7 \
 nohup python -m atom.entrypoints.openai_server \
   --model "$MODEL" --server-port "$DECODE_PORT" --trust-remote-code \

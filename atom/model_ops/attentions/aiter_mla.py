@@ -851,6 +851,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 device="cuda",
                 index_topk=self.index_topk,
                 shared_index_layers=shared_index_layers,
+                rdma_direct=envs.ATOM_HISPARSE_RDMA_DIRECT,
+                host_to_device_ratio=envs.ATOM_HISPARSE_HOST_TO_DEVICE_RATIO,
+                page_size=self.model_runner.block_size,
             )
             # Shared logical-top-k side-channel buffer (one per decode query
             # token), written by the indexer op and read by the coordinator.
@@ -925,11 +928,22 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         if not hasattr(runner, "kv_cache"):
             return None
 
+        # HiSparse RDMA-direct: point the KV block regions at the pinned paged
+        # host cold pool so prefill RDMAs straight into it (one host page per
+        # logical block; page_size == block_size so the producer's db*bpb math is
+        # unchanged). The index cache stays on GPU (the indexer needs it resident).
+        coord = getattr(runner, "hisparse_coordinator", None)
+        rdma_direct = coord is not None and getattr(coord, "rdma_direct", False)
+
         block_regions: list[KVTransferRegion] = []
         num_layers = runner.kv_cache.shape[0]
         for layer_id in range(num_layers):
-            t = runner.kv_cache[layer_id]
-            bpb = t.stride(0) * t.element_size() * self.block_ratio
+            if rdma_direct:
+                t = coord.cold_pool[layer_id]  # [num_host_slots, kv_dim] pinned host
+                bpb = coord.host_page_size * coord.item_size_bytes
+            else:
+                t = runner.kv_cache[layer_id]
+                bpb = t.stride(0) * t.element_size() * self.block_ratio
             block_regions.append(
                 KVTransferRegion(
                     base_addr=t.data_ptr(),
@@ -954,6 +968,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             block_regions=block_regions,
             slot_regions=[],
             num_blocks=runner.config.num_kvcache_blocks,
+            hisparse_coordinator=coord if rdma_direct else None,
         )
 
     def prepare_prefill(self, batch: ScheduledBatch):
@@ -1584,9 +1599,16 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     sl = slice(s * max_seqlen_q, (s + 1) * max_seqlen_q)
                     slots[sl] = per_seq[s]
                     pos[sl] = np.arange(ctx_s - max_seqlen_q, ctx_s, dtype=np.int32)
+                    # MTP uses the reference path, whose backup_new_token allocates
+                    # host pages itself; nothing to grow here.
                 else:
                     slots[s] = per_seq[s]
                     pos[s] = ctx_s - 1
+                    # RDMA-direct fused path: back this token's logical position with
+                    # a host page before the fused backup writes cold pool at
+                    # req_to_host_pool[r][pos] (eager, pre-forward -> capture-safe).
+                    if coord.rdma_direct:
+                        coord.alloc_host_pages(int(per_seq[s]), ctx_s - 1, 1)
             # Copy into the fixed-address GPU buffers (pinned staging, non-blocking)
             # so the captured fused hot path reads fresh values on every replay.
             attn_metadata.hisparse_req_slots = self._hisparse_req_slots.copy_to_gpu(
