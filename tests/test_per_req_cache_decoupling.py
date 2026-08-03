@@ -23,20 +23,20 @@ from atom.model_engine.sequence import Sequence
 
 def per_req_cache_config(**overrides):
     """Config with per-request cache slot management enabled."""
-    defaults = dict(
-        kv_cache_block_size=4,
-        num_kvcache_blocks=100,
-        enable_prefix_caching=False,
-        max_num_seqs=8,
-        max_num_batched_tokens=256,
-        max_model_len=256,
-        bos_token_id=1,
-        eos_token_id=2,
-        stop_token_ids=[],
-        scheduler_delay_factor=0.0,
-        speculative_config=None,
-        pool_entries={"state": 8},  # max 8 concurrent stateful requests
-    )
+    defaults = {
+        "kv_cache_block_size": 4,
+        "num_kvcache_blocks": 100,
+        "enable_prefix_caching": False,
+        "max_num_seqs": 8,
+        "max_num_batched_tokens": 256,
+        "max_model_len": 256,
+        "bos_token_id": 1,
+        "eos_token_id": 2,
+        "stop_token_ids": [],
+        "scheduler_delay_factor": 0.0,
+        "speculative_config": None,
+        "pool_entries": {"state": 8},  # max 8 concurrent stateful requests
+    }
     defaults.update(overrides)
     return MockConfig(**defaults)
 
