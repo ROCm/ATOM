@@ -496,7 +496,11 @@ class BlockManager:
         seq.state_fork_src = -1
 
     def hash_blocks(
-        self, seq: Sequence, num_new_tokens: int, start_tokens: int | None = None
+        self,
+        seq: Sequence,
+        num_new_tokens: int,
+        start_tokens: int | None = None,
+        next_forward_tokens: int | None = None,
     ) -> None:
         """Register hashes for blocks finalized by the most recent step.
 
@@ -512,6 +516,9 @@ class BlockManager:
         `start_tokens` overrides the token offset the range starts at. Pipeline-
         parallel schedule-time advancement already bumped seq.num_cached_tokens
         past this chunk, so the head passes the chunk's pre-advance offset here.
+
+        `next_forward_tokens` reaches `is_state_publish_pos`; see there. Left
+        unset it reads the prompt's remainder, which is the prefill answer.
         """
         if not self.enable_prefix_caching:
             return
@@ -551,10 +558,12 @@ class BlockManager:
                     self.block_size,
                 )
             )
-        if self.is_state_publish_pos(seq, base + num_new_tokens):
+        if self.is_state_publish_pos(seq, base + num_new_tokens, next_forward_tokens):
             self._publish_state_checkpoint(seq, h)
 
-    def hash_decode_blocks(self, seq: Sequence, committed_kv_len: int) -> None:
+    def hash_decode_blocks(
+        self, seq: Sequence, committed_kv_len: int, next_forward_tokens: int = 0
+    ) -> None:
         """Register hashes for generated blocks filled up to `committed_kv_len`.
 
         `may_append` allocates decode blocks without hashing them: at allocation
@@ -572,12 +581,21 @@ class BlockManager:
         Without this the prefix cache indexes prompt blocks only, and a
         follow-up turn — previous prompt plus previous answer — matches nothing
         beyond the original prompt.
+
+        `next_forward_tokens` reaches `is_state_publish_pos`; see there. It
+        defaults to "no next forward", i.e. hash but never checkpoint, so a
+        caller opts into decode-point publishing rather than out of it.
         """
         if not self.enable_prefix_caching:
             return
         base = seq.num_hashed_tokens
         if committed_kv_len > base:
-            self.hash_blocks(seq, committed_kv_len - base, start_tokens=base)
+            self.hash_blocks(
+                seq,
+                committed_kv_len - base,
+                start_tokens=base,
+                next_forward_tokens=next_forward_tokens,
+            )
 
     def cancel_state_fork(self, seq: Sequence) -> bool:
         """Undo a pending fork by adopting its source group.
@@ -609,15 +627,16 @@ class BlockManager:
         return True
 
     def state_publish_limit(self, seq: Sequence) -> int:
-        """Rightmost token position this seq may checkpoint at, 0 for none.
+        """Rightmost prompt position this seq may checkpoint at, 0 for none.
 
-        The last rung of the interval ladder that still leaves `min_fork_tokens`
-        of prompt to forward: publishing hands the group away, and the forward
-        right after has to fill the replacement by itself.
+        `is_state_publish_pos` solved for prefill: the last rung of the interval
+        ladder that still leaves `min_fork_tokens` of prompt to forward. Kept as
+        its own method because the scheduler needs the bound up front, to cut
+        prefill chunks so they land on the ladder.
 
-        0 means this seq never publishes — including every prompt shorter than
-        one interval, which is the point: a workload whose prompts all fit under
-        the interval pays nothing for a feature it would never hit.
+        0 means this seq never publishes off its prompt — including every prompt
+        shorter than one interval, which is the point: a workload whose prompts
+        all fit under the interval pays nothing for a feature it would never hit.
         """
         if not (seq.has_per_req_cache and self.state.enabled):
             return 0
@@ -629,25 +648,41 @@ class BlockManager:
         forkable = seq.num_prompt_tokens - self.state_min_fork_tokens
         return max((forkable // interval) * interval, 0)
 
-    def is_state_publish_pos(self, seq: Sequence, pos: int) -> bool:
+    def is_state_publish_pos(
+        self, seq: Sequence, pos: int, next_forward_tokens: int | None = None
+    ) -> bool:
         """Whether a forward ending at `pos` should checkpoint its state.
 
         A ladder of resume points, one every `state_checkpoint_interval_tokens`
-        of context, up to `state_publish_limit`. Publishing is capacity-neutral
-        (the group handed away is replaced by one from the free list), but each
-        one costs the publisher an extra forward — the prompt gets cut at the
-        rung — so the interval is what keeps that cost amortized instead of
-        per-request.
+        of context. Publishing is capacity-neutral (the group handed away is
+        replaced by one from the free list), but each one costs the publisher an
+        extra forward — the prompt gets cut at the rung — so the interval is what
+        keeps that cost amortized instead of per-request.
+
+        `next_forward_tokens` is how many tokens the forward right after this one
+        carries, and gates the whole thing: publishing hands the group away, so
+        that forward has to fill the replacement by itself (`min_fork_tokens`).
+        Unset means the prompt's remainder, the prefill answer; decode passes
+        one. Everything else follows from that one number — a backend needing a
+        long fork (V4's ring, 131) simply never qualifies mid-generation, and a
+        request stopping on this step passes 0 and never publishes a checkpoint
+        nothing will ever fork from.
 
         The position must be exact. The group holds state as of the forward's
         last token, so a forward that overshoots a rung is ahead of the hash it
         would be filed under; the scheduler cuts prefill chunks to land here,
         and a path that doesn't simply publishes nothing.
         """
-        limit = self.state_publish_limit(seq)
-        if not (0 < pos <= limit):
+        if not (seq.has_per_req_cache and self.state.enabled):
             return False
-        return pos % self.state_checkpoint_interval_tokens == 0
+        interval = self.state_checkpoint_interval_tokens
+        if interval <= 0 or self.state_min_fork_tokens <= 0:
+            return False
+        if next_forward_tokens is None:
+            next_forward_tokens = seq.num_prompt_tokens - pos
+        if next_forward_tokens < self.state_min_fork_tokens:
+            return False
+        return pos > 0 and pos % interval == 0
 
     def _publish_state_checkpoint(self, seq: Sequence, h: int) -> None:
         """Hand the seq's state group to the checkpoint index under hash `h`.

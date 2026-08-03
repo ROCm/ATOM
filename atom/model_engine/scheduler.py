@@ -1571,6 +1571,29 @@ class Scheduler:
                 chunk = bm.state_min_fork_tokens
         return chunk
 
+    def _state_publish_room(self, seq: Sequence, finished: bool) -> int:
+        """Tokens the forward after this one carries, for `hash_decode_blocks`.
+
+        0 means "do not checkpoint here", for any of three reasons:
+
+        - the request stops on this step, so there is no next forward to fork
+          into the group a checkpoint would hand away;
+        - speculative decode runs the state kernels down the spec path, whose
+          index tensor has no read-side counterpart (see
+          `GDNAttentionMetadataBuilder.prepare_state_indices`), so a fork must
+          never reach it. Publishing during *prefill* stays safe on the same
+          models: `min_fork_tokens` guarantees prompt is left over, and prompt
+          always forwards down the non-spec path;
+        - the seq is still on its prompt, where the prefill call site has
+          already decided using the prompt's own remainder.
+
+        Otherwise plain decode carries exactly one token, and whether that is
+        enough to fill a fresh group is the backend's `min_fork_tokens` to say.
+        """
+        if finished or self.mtp_k or seq.type != SequenceType.DECODE:
+            return 0
+        return 1
+
     @staticmethod
     def _assert_positive_prefill_chunk(
         chunk: int, num_new_tokens: int, budget_remaining: int
@@ -2049,7 +2072,11 @@ class Scheduler:
             # that just ran sampled, and no forward has read that token: its KV
             # slot is written by the next one.
             self.block_manager.hash_decode_blocks(
-                seq, num_tokens - (0 if is_deferred_out else 1)
+                seq,
+                num_tokens - (0 if is_deferred_out else 1),
+                next_forward_tokens=self._state_publish_room(
+                    seq, leave_reason is not None
+                ),
             )
 
             # Prepare stream output

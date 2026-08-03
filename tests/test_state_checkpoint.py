@@ -13,12 +13,14 @@
 # checkpoints must never reduce the number of admissible requests, and the
 # eviction event is hand-out, not free.
 
+from types import SimpleNamespace
+
 import pytest
 from conftest import MockConfig
 
 from atom.model_engine.block_manager import BlockManager
-from atom.model_engine.scheduler import Scheduler
-from atom.model_engine.sequence import Sequence
+from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
+from atom.model_engine.sequence import Sequence, SequenceType
 from atom.model_engine.state_pool import StateCheckpointPool
 
 BLOCK = 4
@@ -473,3 +475,164 @@ class TestPrefillChunkAlignment:
         # ...and one starting past the limit is left whole, since nothing more
         # will be published there.
         assert sched._finalize_prefill_chunk(seq, limit, 16) == 16
+
+
+# ── Checkpoints past the prompt ────────────────────────────────────────────
+
+
+class TestDecodePointPublishing:
+    """The same ladder, walked by generation instead of by prompt.
+
+    A long answer crosses rungs the prompt never reached, and a follow-up turn
+    replaying the conversation wants to resume from them. What decides whether a
+    rung is usable there is the same number as in prefill — how many tokens the
+    next forward carries — except that number is now 1, which is why the
+    backends split: GDN fills a fresh group from one token, V4's ring needs 131.
+    """
+
+    def _generate_to(self, bm, seq, end, room=1):
+        """Append tokens one at a time, hashing at each committed KV length."""
+        while seq.num_tokens < end:
+            seq.append_token(500 + seq.num_tokens)
+            bm.may_append(seq)
+            bm.hash_decode_blocks(seq, seq.num_tokens, next_forward_tokens=room)
+
+    def _prompt_of_10(self, bm):
+        """A prompt that ends between rungs, so prefill publishes nothing."""
+        seq = stateful_seq(list(range(10)))
+        run_prompt(bm, seq)
+        assert not bm.state.hash_to_group
+        return seq
+
+    def test_a_rung_past_the_prompt_publishes(self):
+        bm = BlockManager(ckpt_config(state_min_fork_tokens=1))
+        seq = self._prompt_of_10(bm)
+        group = seq.per_req_cache_group
+
+        self._generate_to(bm, seq, 3 * BLOCK)
+        assert seq.per_req_cache_group != group
+        assert seq.state_fork_src == group
+        assert bm.state.lookup(bm.blocks[seq.block_table[2]].hash) == group
+
+    def test_a_backend_needing_a_long_fork_never_publishes_mid_generation(self):
+        """Self-gating: no `min_fork` special case, the number decides.
+
+        One decode token cannot fill a group that needs `MIN_FORK` of them, so
+        the rung is simply not a publish position for this backend.
+        """
+        bm = BlockManager(ckpt_config())  # state_min_fork_tokens=MIN_FORK
+        seq = self._prompt_of_10(bm)
+        group = seq.per_req_cache_group
+
+        self._generate_to(bm, seq, 4 * BLOCK)
+        assert seq.per_req_cache_group == group
+        assert not bm.state.hash_to_group
+
+    def test_no_publish_on_the_step_that_finishes_the_request(self):
+        """Nothing will fork from it, and the fresh group would go straight back."""
+        bm = BlockManager(ckpt_config(state_min_fork_tokens=1))
+        seq = self._prompt_of_10(bm)
+        group = seq.per_req_cache_group
+
+        self._generate_to(bm, seq, 3 * BLOCK, room=0)
+        assert seq.per_req_cache_group == group
+        assert not bm.state.hash_to_group
+
+    def test_blocks_are_still_hashed_where_no_checkpoint_is_taken(self):
+        """Prefix caching and state checkpoints are separate gates."""
+        bm = BlockManager(ckpt_config())
+        seq = self._prompt_of_10(bm)
+        self._generate_to(bm, seq, 3 * BLOCK)
+        assert seq.num_hashed_tokens == 3 * BLOCK
+
+    def test_followup_turn_resumes_from_a_generated_rung(self):
+        """The payoff: turn 2 reuses KV *and* the state that goes with it."""
+        bm = BlockManager(ckpt_config(state_min_fork_tokens=1))
+        seq = self._prompt_of_10(bm)
+        self._generate_to(bm, seq, 4 * BLOCK)
+
+        followup = stateful_seq(seq.token_ids[: 4 * BLOCK])
+        # can_allocate never hands back the last block — the seq has to forward
+        # something — so the hit caps at 3, which is exactly where generation
+        # left a checkpoint.
+        assert bm.can_allocate(followup) == 3
+        bm.allocate(followup, 3)
+        assert followup.state_fork_src == bm.state.lookup(
+            bm.blocks[seq.block_table[2]].hash
+        )
+
+
+class TestDecodePublishGate:
+    """`Scheduler._state_publish_room`: who is allowed to checkpoint at decode."""
+
+    def _sched(self, **overrides):
+        return Scheduler(ckpt_config(state_min_fork_tokens=1, **overrides))
+
+    def _decoding_seq(self):
+        seq = stateful_seq(list(range(40)))
+        seq.type = SequenceType.DECODE
+        return seq
+
+    def test_plain_decode_offers_its_one_token(self):
+        assert self._sched()._state_publish_room(self._decoding_seq(), False) == 1
+
+    def test_finishing_request_offers_nothing(self):
+        assert self._sched()._state_publish_room(self._decoding_seq(), True) == 0
+
+    def test_a_seq_still_on_its_prompt_offers_nothing(self):
+        """Prefill decides with the prompt's own remainder, not with this."""
+        seq = stateful_seq(list(range(40)))
+        seq.type = SequenceType.PREFILL
+        assert self._sched()._state_publish_room(seq, False) == 0
+
+    def test_speculative_decode_offers_nothing(self):
+        """A fork must never reach the spec path — it has no read-side index.
+
+        Prefill publishing stays live on the same models: `min_fork_tokens`
+        keeps prompt behind every rung, and prompt forwards down the non-spec
+        path.
+        """
+        sched = self._sched(
+            speculative_config=SimpleNamespace(num_speculative_tokens=3)
+        )
+        assert sched._state_publish_room(self._decoding_seq(), False) == 0
+        assert (
+            sched.block_manager.state_publish_limit(stateful_seq(list(range(40)))) > 0
+        )
+
+    def test_postprocess_carries_the_room_to_a_real_checkpoint(self):
+        """End to end: generation alone leaves a resume point behind.
+
+        A four-token prompt is too short for a rung of its own, so anything in
+        the index at the end got there from a decode step, and the fork it
+        raised has to be seen by the batch that follows.
+        """
+        sched = self._sched()
+        bm = sched.block_manager
+        seq = stateful_seq(list(range(BLOCK)))
+        assert bm.state_publish_limit(seq) == 0
+        sched.add(seq)
+        batch, _ = sched.schedule()
+
+        forks = []
+        for token in range(500, 505):
+            sched.postprocess(
+                list(sched.running),
+                ScheduledBatchOutput(
+                    req_ids=[seq.id],
+                    token_ids=[(token,)],
+                    num_rejected=None,
+                    num_bonus=None,
+                    draft_token_ids=None,
+                ),
+                batch=batch,
+            )
+            batch, _ = sched.schedule()
+            forks.extend(s for s in batch.state_fork_srcs if s >= 0)
+
+        published = bm.state.lookup(bm.blocks[seq.block_table[1]].hash)
+        assert published >= 0
+        # The seq moved off the group it gave away, and the forward right after
+        # the publish was told to read it.
+        assert seq.per_req_cache_group != published
+        assert forks == [published]
