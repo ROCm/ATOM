@@ -1179,7 +1179,7 @@ def build_decode_metadata(
 
     out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
     if torch.is_tensor(out_cache_loc):
-        slot_mapping = out_cache_loc[: int(out_cache_loc.numel())]
+        slot_mapping = out_cache_loc[:bs]
     else:
         slot_mapping = torch.zeros(bs, dtype=torch.int32, device=device)
     slot_mapping = slot_mapping.to(dtype=torch.int32)

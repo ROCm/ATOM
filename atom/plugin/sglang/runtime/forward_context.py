@@ -307,11 +307,16 @@ def _build_glm52_dsa_metadata(
     is_target_verify = bool(
         getattr(forward_batch.forward_mode, "is_target_verify", lambda: False)()
     )
+    is_plain_decode = (
+        forward_batch.forward_mode.is_decode_or_idle() and not is_draft_decode
+    )
     attn_metadata = (
         getattr(forward_batch, "atom_glm52_graph_metadata", None)
-        if is_target_verify
+        if is_target_verify or is_plain_decode
         else None
     )
+    if attn_metadata is None and is_plain_decode:
+        attn_metadata = getattr(backend, "atom_glm52_graph_metadata", None)
     if attn_metadata is None and is_target_verify and is_capture_batch:
         batch_backend = getattr(forward_batch, "attn_backend", None)
         attn_metadata = getattr(batch_backend, "atom_glm52_graph_metadata", None)
