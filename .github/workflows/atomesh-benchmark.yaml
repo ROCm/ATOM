@@ -378,29 +378,6 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJson(needs.load-config.outputs.matrix_json) }}
     steps:
-      - name: Clean up containers and workspace
-        run: |
-          if docker info > /dev/null 2>&1; then
-            CONTAINER_ENGINE=docker
-          elif command -v podman > /dev/null 2>&1; then
-            CONTAINER_ENGINE=podman
-          else
-            echo "ERROR: Neither docker nor podman is available on this runner."
-            exit 1
-          fi
-
-          echo "=== Cleaning up containers on $(hostname) with ${CONTAINER_ENGINE} ==="
-          containers=$($CONTAINER_ENGINE ps -q)
-          if [ -n "$containers" ]; then
-            $CONTAINER_ENGINE kill $containers || true
-          fi
-          $CONTAINER_ENGINE run --rm \
-            -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
-            -w /workspace \
-            --privileged \
-            docker.io/rocm/pytorch:latest \
-            bash -lc "shopt -s dotglob && ls -la /workspace/ && rm -rf /workspace/*" || true
-
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
 

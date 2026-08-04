@@ -3362,51 +3362,56 @@ class ModelRunner:
         """Set up the per-bs CUDA graph capture profiler (profiles in place).
 
         Profiles the capture phase as graphs are captured and writes one trace
-        per batch size, per rank (``bs_<bs>_rank<rank>.json.gz``). Enabled on
-        every rank when a torch profiler dir is set and mark-trace is on.
+        per (batch size, q-bucket), per rank
+        (``bs_<bs>_q_<max_q_len>_rank<rank>.json.gz``). Enabled on every rank
+        when a torch profiler dir is set and mark-trace is on.
         """
         self._capture_profile_enabled = (
             self.profiler_dir is not None and self.mark_trace
         )
         if self._capture_profile_enabled:
-            self._profile_bs_idx = 0
+            enable_detailed_profiling = envs.ATOM_PROFILER_MORE
+            self._capture_trace_tag = None
             self.capture_traces_dir = os.path.join(self.profiler_dir, "capture_traces")
             os.makedirs(self.capture_traces_dir, exist_ok=True)
-            logger.info(f"{self.label}: Starting CUDA graph capture profiler...")
+            logger.info(
+                "%s: Starting CUDA graph capture profiler (detailed=%s)...",
+                self.label,
+                enable_detailed_profiling,
+            )
 
             def on_trace_ready(prof):
-                # Invariant: exactly two prof.step() calls happen per captured
-                # batch size (schedule wait=1 + active=1, repeat=0), so
-                # on_trace_ready fires once per bs, in self.graph_bs order.
-                # This is a profiling-only diagnostic; log-and-skip rather than
-                # assert so a cadence mismatch can never abort CUDA-graph
-                # capture at server startup (and isn't stripped under python -O).
-                if self._profile_bs_idx >= len(self.graph_bs):
-                    logger.warning(
-                        "capture profiler fired %d times but only %d batch "
-                        "sizes were captured; skipping extra trace. Check the "
-                        "prof.step() cadence in capture_cudagraph.",
-                        self._profile_bs_idx + 1,
-                        len(self.graph_bs),
-                    )
+                # The window is named from the tag the capture loop stashes
+                # before each prof.step(), not from a step counter: batch sizes
+                # are skipped (_piecewise_skip_capture) and repeated (once per
+                # q-bucket), so any index into self.graph_bs drifts out of sync
+                # with what was actually captured.
+                #
+                # A cleared tag means this is the trailing window that opens
+                # after the last step() and closes at __exit__ — it holds only
+                # post-loop bookkeeping, so there is nothing worth writing.
+                tag = self._capture_trace_tag
+                if tag is None:
                     return
-                bs = self.graph_bs[self._profile_bs_idx]
                 trace_file = os.path.join(
-                    self.capture_traces_dir, f"bs_{bs}_rank{self.rank}.json.gz"
+                    self.capture_traces_dir, f"{tag}_rank{self.rank}.json.gz"
                 )
                 prof.export_chrome_trace(trace_file)
-                logger.info(f"Saved trace for bs={bs} to {trace_file}")
-                self._profile_bs_idx += 1
+                logger.info(f"Saved capture trace for {tag} to {trace_file}")
 
             self.capture_profiler = torch_profiler.profile(
                 activities=[
                     torch_profiler.ProfilerActivity.CUDA,
                     torch_profiler.ProfilerActivity.CPU,
                 ],
-                schedule=torch_profiler.schedule(wait=1, warmup=0, active=1, repeat=0),
-                record_shapes=True,
-                with_stack=True,
-                profile_memory=False,
+                # wait=0: recording from __enter__, and every step() closes one
+                # window and immediately opens the next, so each iteration of the
+                # capture loop lands in its own file with nothing dropped between
+                # them (wait>0 would silently skip alternate batch sizes).
+                schedule=torch_profiler.schedule(wait=0, warmup=0, active=1, repeat=0),
+                record_shapes=enable_detailed_profiling,
+                with_stack=enable_detailed_profiling,
+                profile_memory=enable_detailed_profiling,
                 on_trace_ready=on_trace_ready,
             )
         else:
@@ -3775,6 +3780,11 @@ class ModelRunner:
                     num_tokens = bs * max_q_len
                     if _piecewise and self._piecewise_skip_capture(num_tokens):
                         continue
+                    # Names the capture trace this iteration will export. Set
+                    # after the skip above so a skipped bs never claims a file;
+                    # its handful of Python statements just fold into the next
+                    # iteration's window.
+                    self._capture_trace_tag = f"bs_{bs}_q_{max_q_len}"
                     # Use a simple, safe position pattern for capture.
                     self.forward_vars["positions"].np[:num_tokens] = (
                         np.arange(num_tokens, dtype=np.int64) % max_q_len
@@ -3830,8 +3840,6 @@ class ModelRunner:
                     outputs[:num_tokens] = model_output
                     if self.logits_in_graph:
                         self.model.compute_logits(outputs[:num_tokens])
-                    if prof is not None:
-                        prof.step()
 
                     if _piecewise:
                         # PIECEWISE: no manual whole-forward graph; the compiled
@@ -3843,6 +3851,13 @@ class ModelRunner:
                         fc.cudagraph_runtime_mode = CUDAGraphMode.NONE
                         fc.batch_descriptor = None
                         self._piecewise_captured_tokens.add(num_tokens)
+                        if prof is not None:
+                            # Drain before closing the window so this bs's
+                            # kernels land in this bs's file. Profiling-only —
+                            # the unprofiled PIECEWISE path stays sync-free.
+                            torch.cuda.synchronize()
+                            prof.step()
+                            self._capture_trace_tag = None
                         continue
 
                     # Capture
@@ -3884,9 +3899,13 @@ class ModelRunner:
                     self.graphs[(bs, max_q_len)] = graph
                     if self.logits_in_graph and ubatch_slices is None:
                         self.graph_logits[(bs, max_q_len)] = graph_logits
+                    torch.cuda.synchronize()
+                    # After the sync: the warmup forward's kernels must have
+                    # completed before the window closes, or they spill into the
+                    # next bs's file.
                     if prof is not None:
                         prof.step()
-                    torch.cuda.synchronize()
+                        self._capture_trace_tag = None
         self.graph_bs.sort(reverse=False)
 
         # PIECEWISE: sorted 1D num_tokens buckets for run_model's round_up_1d(Σ)
