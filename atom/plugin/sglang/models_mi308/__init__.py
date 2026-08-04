@@ -13,7 +13,6 @@ from atom.plugin.sglang import models as _base_models
 # Reuse the shared adapter package path so MI308 gets the same registrations,
 # while keeping the MI308 block-layout hook isolated to this external package.
 __path__ = list(_base_models.__path__)
-__all__ = getattr(_base_models, "__all__", ())
 
 
 def _install_mi308_dsv4_block_layout() -> None:
