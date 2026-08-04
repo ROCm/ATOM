@@ -1,7 +1,36 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+#
+# This file contains code adapted from the flash-linear-attention project
+# (fla/ops/attnres/fused.py). The original source code was licensed under the
+# MIT license and included the following copyright notice:
+# Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
+# For a list of all contributors, visit:
+#   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
-"""Fused attention-residual operations for Kimi-K3."""
+"""Fused attention-residual operations for Kimi-K3.
+
+The algorithm is flash-linear-attention's ``fused_attnres``
+(``fla/ops/attnres/fused.py``, MIT; read against fla 0.5.2), which is what the
+reference KDA model calls -- see ``fla/models/kda/modeling_kda.py:135``.
+Attention Residuals: https://arxiv.org/abs/2603.15031
+
+Four deliberate divergences from that reference:
+
+* ``residuals`` is a Sequence of separate ``[..., D]`` tensors there; here it is
+  one packed ``[T, B, H]`` block_residual plus ``prefix_sum`` read as the final
+  candidate. Not just cheaper -- their pointer-table gather cannot run on ROCm
+  at all (details at the ``Adapted from FLA`` note in the kernel body).
+* the caller's ``prefix_sum = prefix_sum + ...`` adds are folded into the last
+  candidate's on-load (``DO_ADD``/``DO_ADD2``), which fla leaves to the caller.
+  That fold is what lets the decoder layers defer their FFN and routed/shared
+  expert adds across the layer boundary.
+* ``score_weight`` arrives pre-multiplied: fla passes ``query`` and
+  ``rms_weight`` separately, while ``AttnRes`` folds their product once at load
+  time (see ``AttnRes.process_weights_after_loading``).
+* forward only -- ATOM is inference-only, so there is no bwd and no
+  ``checkpoint_level`` counterpart.
+"""
 
 from __future__ import annotations
 
@@ -72,10 +101,10 @@ if _HAS_TRITON:
         # Cost is registers: BD = next_pow2(H) floats of accumulator, 32 KB of VGPR
         # at H=7168, plus the [BL, BD] tile. BL is kept small for that reason.
         #
-        # Adapted from FLA's fused_attnres (fla/ops/attnres/fused.py, MIT).
-        # Theirs gathers from a tuple of separate residual tensors via a pointer
-        # table; ours indexes one contiguous [T, B, H] block_residual, which is
-        # both cheaper and necessary here -- the pointer-table form miscompiles on
+        # Adapted from FLA's fused_attnres (see the module docstring). Theirs
+        # gathers from a tuple of separate residual tensors via a pointer table;
+        # ours indexes one contiguous [T, B, H] block_residual, which is both
+        # cheaper and necessary here -- the pointer-table form miscompiles on
         # ROCm (TritonAMDGPUCanonicalizePointers rejects arith.select on
         # tensor<Nx!tt.ptr>), so their kernel cannot run on this backend at all.
         #
@@ -94,13 +123,13 @@ if _HAS_TRITON:
         # re-reading it per tile would undo the single-pass property.
         ps = tl.load(ps_ptr + t * stride_ps_t + o_d, mask=m_d, other=0.0).to(tl.float32)
         if DO_ADD:
-            ps += tl.load(
-                hs_ptr + t * stride_hs_t + o_d, mask=m_d, other=0.0
-            ).to(tl.float32)
+            ps += tl.load(hs_ptr + t * stride_hs_t + o_d, mask=m_d, other=0.0).to(
+                tl.float32
+            )
         if DO_ADD2:
-            ps += tl.load(
-                hs2_ptr + t * stride_hs2_t + o_d, mask=m_d, other=0.0
-            ).to(tl.float32)
+            ps += tl.load(hs2_ptr + t * stride_hs2_t + o_d, mask=m_d, other=0.0).to(
+                tl.float32
+            )
         if WRITE_PREF:
             tl.store(
                 pref_ptr + t * stride_pref_t + o_d,
