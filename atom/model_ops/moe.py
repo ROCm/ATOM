@@ -901,11 +901,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # migration. The Triton forward paths bypass that routing flow, and their
         # weight layout is not migration-safe, so EPLB must use the standard path
         # even when no redundant experts are configured.
-        try:
-            eplb_enable = get_current_atom_config().eplb_enable
-        except AssertionError:
-            eplb_enable = False
-        if eplb_enable:
+        if getattr(get_current_atom_config(), "eplb_enable", False):
             self.use_triton = False
             self.use_triton_decode = False
 
