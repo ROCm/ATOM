@@ -998,7 +998,11 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
     ):
         self.total_tokens = (
             self.model_config.max_model_len
-            * self.vllm_config.scheduler_config.max_num_partial_prefills
+            * getattr(
+                self.vllm_config.scheduler_config,
+                "max_num_partial_prefills",
+                1,
+            )
         )
         attn_metadata = self.build(
             common_prefix_len=0, common_attn_metadata=common_attn_metadata
@@ -2110,8 +2114,9 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
             from vllm.utils.platform_utils import num_compute_units
         except ImportError:
             from vllm.utils.platform_utils import get_cu_count as num_compute_units
-        from vllm.v1.worker.cp_utils import get_total_cp_world_size
         from vllm.utils.math_utils import cdiv
+        from vllm.v1.worker.cp_utils import get_kv_cache_shard_count
+
         from atom.models.utils import extract_layer_index
 
         assert isinstance(config, VllmConfig)
@@ -2179,7 +2184,7 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
         )
         max_num_blocks_per_req = cdiv(
             self.vllm_config.model_config.max_model_len,
-            self.kv_cache_spec.block_size * get_total_cp_world_size(),
+            self.kv_cache_spec.block_size * get_kv_cache_shard_count(),
         )
         self.expanded_block_table_buffer = torch.zeros(
             (
@@ -2264,8 +2269,13 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
 
         prefill_metadata = None
         if num_prefills > 0:
+            # vLLM 0.26 provides a host-resident upper bound that is exact for
+            # prefill rows. Avoid the deprecated seq_lens_cpu property, whose
+            # fallback performs an implicit device-to-host synchronization.
+            seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
+            assert seq_lens_cpu is not None
             chunk_seq_ids = split_prefill_chunks(
-                common_attn_metadata.seq_lens_cpu[num_decodes:],
+                seq_lens_cpu[num_decodes:],
                 self.max_prefill_buffer_size,
                 request_offset=num_decodes,
             )
@@ -2274,7 +2284,7 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
                     reqs_start,
                     reqs_end,
                     query_start_loc_cpu,
-                    common_attn_metadata.seq_lens_cpu,
+                    seq_lens_cpu,
                     common_attn_metadata.block_table_tensor,
                 )
                 for reqs_start, reqs_end in chunk_seq_ids
