@@ -4,7 +4,15 @@
 """Attention-residual mixing layer (Kimi-K3).
 
 The layer wrapper lives here; the Triton kernel it dispatches lives in
-``atom.model_ops.kimi_k3.attention_residual``.
+``atom.model_ops.kimi_k3.attention_residual``, which follows
+flash-linear-attention's ``fused_attnres`` (that module's docstring lists the
+deltas). Attention Residuals: https://arxiv.org/abs/2603.15031
+
+This wrapper mirrors how the reference KDA layer drives that op
+(``fla/models/kda/modeling_kda.py``): ``proj`` and ``norm`` here are its
+``attn_res_proj``/``attn_res_norm``, and ``out_norm`` is its ``attn_norm``,
+which fla passes as ``output_rms_weight`` -- hence the result coming back
+already normed rather than the caller norming it.
 """
 
 from __future__ import annotations
