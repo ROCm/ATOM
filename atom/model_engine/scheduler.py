@@ -610,6 +610,31 @@ class Scheduler:
 
         self._num_parked_remote_kv: int = 0
 
+        # SparseKV host cold-pool admission back-pressure (decode/consumer side).
+        # The worker keeps every resident request's full KV in a paged host pool
+        # sized ratio × max_num_seqs × (hot+1) tokens (NOT by max_model_len), so
+        # the agentic trace's many long contexts can exhaust it. Mirror the pool's
+        # page budget here so admission DEFERS a request when it would not fit,
+        # instead of the worker's alloc_host_pages raising and killing the runner.
+        # Usage is RECOMPUTED from live state each schedule (see
+        # _sparsekv_pages_in_use) rather than tracked incrementally — a mirror dict
+        # drifts across the PD lifecycle (park / load-complete / abort / preempt)
+        # and undercounts, letting the worker over-commit and crash.
+        self._sparsekv_enabled: bool = bool(envs.ATOM_SPARSEKV_ENABLE)
+        if self._sparsekv_enabled:
+            self._sparsekv_page: int = self.block_manager.block_size
+            host_tokens = (
+                envs.ATOM_SPARSEKV_HOST_TO_DEVICE_RATIO
+                * self.max_num_seqs
+                * (envs.ATOM_SPARSEKV_HOT_BUFFER_SIZE + 1)
+            )
+            num_host_pages = max(
+                1, (host_tokens + self._sparsekv_page - 1) // self._sparsekv_page
+            )
+            # Admittable budget = pool minus per-slot decode-growth headroom.
+            reserve = envs.ATOM_SPARSEKV_ADMIT_RESERVE_PAGES * self.max_num_seqs
+            self._sparsekv_admit_pages: int = max(1, num_host_pages - reserve)
+
         # Under PP the head keeps pp_size batches in flight, so schedule() must
         # advance chunked-prefill progress itself rather than defer it to
         # postprocess, else back-to-back schedules re-issue the same chunk.
@@ -850,6 +875,24 @@ class Scheduler:
             self._warn_if_unschedulable(seq)
         self.waiting.extend(seqs)
 
+    def _sparsekv_pages_in_use(self) -> int:
+        """Host cold-pool pages currently committed to resident SparseKV requests.
+
+        Recomputed from live state (self-correcting, no drift): every running
+        request holds ceil(num_tokens/page) pages in the cold pool, and every
+        request whose remote-KV recv is in flight (WAITING_FOR_REMOTE_KVS) has
+        already reserved that many at acquire_at_recv. num_tokens grows with
+        decode, so this also tracks per-step growth of running requests.
+        """
+        page = self._sparsekv_page
+        total = 0
+        for s in self.running:
+            total += (s.num_tokens + page - 1) // page
+        for s in self.waiting:
+            if s.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
+                total += (s.num_tokens + page - 1) // page
+        return total
+
     def _unschedulable_reason(self, seq: Sequence) -> str | None:
         """Return a human-readable reason if `seq` is permanently unschedulable.
 
@@ -899,6 +942,15 @@ class Scheduler:
                 f"raise --gpu-memory-utilization. (Per-req state cache lives in "
                 f"its own pre-allocated tensor and does not consume pool blocks.)"
             )
+        if self._sparsekv_enabled:
+            need = (num_tokens + self._sparsekv_page - 1) // self._sparsekv_page
+            if need > self._sparsekv_admit_pages:
+                return (
+                    f"needs {need} SparseKV host cold-pool pages for {num_tokens} "
+                    f"tokens > admittable pool pages={self._sparsekv_admit_pages}. "
+                    f"Raise ATOM_SPARSEKV_HOST_TO_DEVICE_RATIO / lower "
+                    f"ATOM_SPARSEKV_ADMIT_RESERVE_PAGES, or shorten the prompt."
+                )
         return None
 
     def _warn_if_unschedulable(self, seq: Sequence) -> None:
@@ -1047,6 +1099,11 @@ class Scheduler:
                 num_scheduled_tokens.append(chunk)
 
         # ---- Phase 2: new requests from waiting ----
+        # SparseKV back-pressure budget for this cycle: pages already held by
+        # resident + in-flight-recv requests. Incremented per admission below.
+        sparsekv_pages_used = (
+            self._sparsekv_pages_in_use() if self._sparsekv_enabled else 0
+        )
         while (
             delayer_allows
             and (self.delay_factor <= 0 or self._passed_delay(time.time()))
@@ -1080,6 +1137,7 @@ class Scheduler:
             # Re-check here (not just at submit) since pool state may change.
             unschedulable = self._unschedulable_reason(seq)
             if unschedulable is not None:
+                self._uncount_inflight_load(seq)
                 seq.status = SequenceStatus.FINISHED
                 seq.leave_reason = f"unschedulable: {unschedulable}"
                 self._rejected.append(seq)
@@ -1135,6 +1193,29 @@ class Scheduler:
             ):
                 self.waiting.appendleft(seq)
                 break
+
+            # SparseKV host cold-pool back-pressure: a remote-load request will
+            # allocate ceil(num_tokens/page) host pages at recv. If the pool can't
+            # fit it, DEFER so it retries as resident requests finish and free
+            # pages — instead of the worker's alloc_host_pages raising and killing
+            # the runner. Requeue as plain WAITING (appendleft + break, mirroring
+            # the concurrency gate above) so it re-enters this admission path next
+            # cycle and re-evaluates. Do NOT use _park_for_remote_load here: no KV
+            # transfer has been registered yet, so WAITING_FOR_REMOTE_KVS would
+            # trap the request forever (nothing ever completes its recv).
+            # Oversized-for-pool prompts are dropped by _unschedulable_reason, so a
+            # deferred request always eventually fits — no deadlock.
+            if self._sparsekv_enabled and needs_remote_load:
+                need = (seq.num_tokens + self._sparsekv_page - 1) // self._sparsekv_page
+                if sparsekv_pages_used + need > self._sparsekv_admit_pages:
+                    self.waiting.appendleft(seq)
+                    break
+                # Count this admission so later iterations in THIS cycle see it
+                # (the request parks into skipped_waiting_requests, not yet visible
+                # to _sparsekv_pages_in_use until re-added to self.waiting next
+                # cycle). If a later can_allocate fails and breaks, the local tally
+                # is simply discarded and recomputed next cycle — no drift.
+                sparsekv_pages_used += need
 
             # Probe cache hits FIRST so budget check sees the real
             # (post-prefix-cache) remaining token count. V4 SWA correctness is
@@ -1353,8 +1434,7 @@ class Scheduler:
                 seq.is_first_decode = False
 
         total_tokens_num_decode = sum(num_scheduled_tokens)
-        if num_seqs_decode > self._peak_decode_batch:
-            self._peak_decode_batch = num_seqs_decode
+        self._peak_decode_batch = max(self._peak_decode_batch, num_seqs_decode)
 
         if scheduled_seqs:
             self.running.extendleft(reversed(scheduled_seqs.values()))
