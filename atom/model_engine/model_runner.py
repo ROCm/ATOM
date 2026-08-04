@@ -3315,10 +3315,63 @@ class ModelRunner:
 
     @torch.inference_mode()
     @with_eplb_forward_monitor
+    def _sparsekv_token_phys_slots(self, block_table, positions):
+        """Physical KV-cache slots for logical ``positions`` given a block table."""
+        bs = self.block_size
+        bt = torch.as_tensor(block_table, dtype=torch.long)
+        pos = torch.as_tensor(positions, dtype=torch.long)
+        return bt[pos // bs] * bs + (pos % bs)
+
+    def _sparsekv_stage_and_sync(self, batch: ScheduledBatch) -> None:
+        """Stage newly-arrived decode requests into the cold pool + hot buffer.
+
+        Worker-side, keyed by the stable ``batch.req_ids``: registers each request
+        not yet seen (copying its prompt KV GPU->cold pool and preloading the hot
+        set) and releases requests that have left the batch. Runs before
+        prepare_inputs so the per-token slot metadata resolves.
+        """
+        coord = getattr(self, "sparsekv_coordinator", None)
+        if coord is None or batch.is_dummy_run:
+            return
+        # Decode-only: skip prefill / chunked-prefill batches (their KV is not yet
+        # complete). A request's first decode step stages its full prompt. On a
+        # mixed batch we simply don't stage here; prepare_decode then falls back to
+        # the full-KV path for any unregistered req (always correct in Phase 0).
+        if batch.total_tokens_num_prefill > 0:
+            return
+        req_ids = batch.req_ids
+        coord.sync_active(req_ids)
+        for i, rid in enumerate(req_ids):
+            if coord.is_registered(rid):
+                # RDMA-direct: the slot + host pages were acquired at recv by the
+                # connector and prefill RDMA'd the prompt straight into the cold
+                # pool. Only the first hot-buffer preload is deferred to here (KV is
+                # in the cold pool by the first decode step).
+                if coord.rdma_direct:
+                    ctx = int(batch.context_lens[i])
+                    n_new = int(batch.num_scheduled_tokens[i])
+                    coord.maybe_first_hot_load(rid, ctx - n_new)
+                continue
+            ctx = int(batch.context_lens[i])
+            n_new = int(batch.num_scheduled_tokens[i])
+            present = ctx - n_new  # KV already in cache (prompt + prior decodes)
+            if present <= 0:
+                # No prior KV to stage yet — do NOT register (an empty registration
+                # would block staging on the later real decode step). Skip; this
+                # req falls back to full-KV decode until it has staged KV.
+                continue
+            slot = coord.acquire(rid, present)
+            phys = self._sparsekv_token_phys_slots(
+                batch.block_tables[i], range(present)
+            )
+            coord.stage_kv_to_cold_pool(slot, self.kv_cache, phys, present)
+            coord.load_initial_hot_set(slot, present)
+
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
         # Rotate to this microbatch's slot before prepare_inputs writes buffers.
         if not batch.is_dummy_run:
             self._advance_forward_vars()
+        self._sparsekv_stage_and_sync(batch)
         (
             input_ids,
             temperatures,

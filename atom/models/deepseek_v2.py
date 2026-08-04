@@ -1344,6 +1344,22 @@ class DeepseekV32IndexerCache(nn.Module):
         self.dtype = dtype
 
 
+# SparseKV (DSA decode HBM offload) side-channel. When enabled the coordinator
+# registers a shared buffer here; the indexer stashes the decode logical top-k
+# into it so miss-detect runs in the logical domain (design doc Appendix A).
+# None (default) => SparseKV off, one branch-not-taken per indexer call, no cost.
+# One shared buffer for all layers, mirroring `_sparse_kv_indices_gpu`: each full
+# indexer layer overwrites it and every (full + IndexShare) layer's sparse-MLA
+# reads the governing full layer's selection.
+_SPARSEKV_TOPK_LOGICAL: torch.Tensor | None = None
+
+
+def set_sparsekv_topk_buffer(buf: torch.Tensor | None) -> None:
+    """Register (or clear) the SparseKV logical-top-k side-channel buffer."""
+    global _SPARSEKV_TOPK_LOGICAL
+    _SPARSEKV_TOPK_LOGICAL = buf
+
+
 def sparse_attn_indexer(
     hidden_states: torch.Tensor,
     k_cache_prefix: str,
@@ -1594,6 +1610,12 @@ def sparse_attn_indexer(
             logits.stride(0),
             logits.stride(1),
         )
+        if _SPARSEKV_TOPK_LOGICAL is not None:
+            # Stash the logical top-k (per decode query token) before it is
+            # translated to physical KV slots. The coordinator reads this to
+            # miss-detect against the resident hot set.
+            n = topk_indices_decode.shape[0]
+            _SPARSEKV_TOPK_LOGICAL[:n].copy_(topk_indices_decode)
         if attn_metadata.max_seqlen_q > 1:
             triton_gather_kv_indices_sparse(
                 attn_metadata.sparse_kv_indptr,
@@ -1614,6 +1636,7 @@ def sparse_attn_indexer(
                 NUM_TOPK_TOKENS=topk_tokens,
                 out=sparse_kv_indices_buffer,
             )
+
     return weights
 
 

@@ -4,7 +4,7 @@
 import logging
 from dataclasses import dataclass
 from functools import partial as functools_partial
-from typing import Optional, Protocol
+from typing import Protocol
 
 import torch
 import triton
@@ -44,7 +44,6 @@ from torch import nn
 from atom.config import get_current_atom_config
 from atom.distributed.dcp_utils import (
     dcp_persistent_supported,
-    get_dcp_group,
     get_dcp_rank,
     get_dcp_world_size,
 )
@@ -171,17 +170,17 @@ if is_rocm_aiter_fp4bmm_enabled():
 class MLAModules:
     """Modules used in MLA."""
 
-    q_lora_rank: Optional[int]
+    q_lora_rank: int | None
     kv_lora_rank: int
     qk_nope_head_dim: int
     qk_rope_head_dim: int
     qk_head_dim: int
     v_head_dim: int
     rotary_emb: torch.nn.Module
-    q_proj: Optional[torch.nn.Module]
+    q_proj: torch.nn.Module | None
     kv_b_proj: torch.nn.Module
     o_proj: torch.nn.Module
-    indexer: Optional[torch.nn.Module]
+    indexer: torch.nn.Module | None
     # Model-level sparse flag. A v3.2 / GLM-5.2 model runs sparse MLA on ALL its
     # layers. GLM-5.2 IndexShare "shared" layers carry no indexer module yet must
     # still run sparse attention (reusing the prior "full" layer's top-k), so
@@ -321,6 +320,8 @@ class MLAAttention(nn.Module):
         # reduce-scatter. Disabled (world_size==1) unless -dcp is set.
         self.dcp_world_size = get_dcp_world_size()
         if self.dcp_world_size > 1:
+            from aiter.dist.parallel_state import get_dcp_group
+
             from atom.model_ops.dcp_ops import CPTritonContext
 
             self.dcp_group = get_dcp_group()
@@ -335,6 +336,11 @@ class MLAAttention(nn.Module):
         # the lse persistent kernel, gfx942 does not — see dcp_utils). Cached
         # once here to avoid a per-forward get_gfx() (graph-break).
         self.dcp_persistent_supported = dcp_persistent_supported()
+
+        # SparseKV: set by aiter_mla.build_kv_cache_tensor when enabled. None =>
+        # normal full-KV decode (default). See atom/sparsekv/coordinator.py.
+        self._sparsekv_coord = None
+        self._sparsekv_layer_id = -1
 
     def _pad_query_heads(self, q: torch.Tensor) -> torch.Tensor:
         if self.head_repeat_factor > 1:
@@ -596,8 +602,8 @@ class MLAAttention(nn.Module):
         cu_seqlens_k: torch.Tensor,
         k_out: torch.Tensor,
         v_out: torch.Tensor,
-        shuffle_kv_block_indptr: Optional[torch.Tensor] = None,
-        shuffle_kv_block_indices: Optional[torch.Tensor] = None,
+        shuffle_kv_block_indptr: torch.Tensor | None = None,
+        shuffle_kv_block_indices: torch.Tensor | None = None,
     ) -> None:
         weight = self.kv_b_proj.weight
         if envs.ATOM_USE_TRITON_MLA and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
@@ -709,10 +715,6 @@ class MLAAttention(nn.Module):
         chunked_out: torch.Tensor | None = None
         chunked_lse: torch.Tensor | None = None
         if getattr(chunk_meta, "is_dcp", False):
-            # DCP: the cached context KV is sharded (interleaved) across ranks,
-            # so the per-chunk gather becomes gather-local -> AllGather ->
-            # reorg -> kv_b_proj. The rest of the merge logic below
-            # is identical to the non-DCP path.
             chunked_out, chunked_lse = self._dcp_compute_prefill_context(
                 prefill_q, kv_cache, attn_metadata, chunk_meta
             )
@@ -1136,6 +1138,126 @@ class MLAAttention(nn.Module):
         # [num_token_slots, 1, d] -> [num_blocks, block_size, d] -> [.., 1, ..]
         return kv_cache.view(num_blocks, block_size, d).unsqueeze(1)
 
+    def _sparsekv_swap_and_translate(
+        self,
+        kv_layer: torch.Tensor,
+        attn_metadata: AttentionMetaData,
+        sparse_kv_indptr: torch.Tensor,
+        hs_slots: torch.Tensor,
+    ) -> torch.Tensor:
+        """Dispatch to the fused GPU hot path, or the reference path for MTP/debug.
+
+        The fused path (default on GPU, single query token per request) runs the
+        whole per-layer step — new-token backup, miss-detect, LRU evict, swap-in,
+        translate — in two aiter kernels with no host sync (CUDAGraph-capturable).
+        MTP verify (``max_seqlen_q > 1``), CPU, or ``ATOM_SPARSEKV_FUSED=0`` fall
+        back to the Phase-0 reference, which is always correct.
+        """
+        coord = self._sparsekv_coord
+        layer_id = self._sparsekv_layer_id
+        n = int(sparse_kv_indptr.shape[0]) - 1
+
+        use_fused = (
+            coord.hot_buffer.is_cuda
+            and envs.ATOM_SPARSEKV_FUSED
+            and attn_metadata.max_seqlen_q == 1
+        )
+        if use_fused:
+            # req_slots / token_pos / src_slots / indptr all live in the kernel's
+            # int32 domain as fixed-address persistent buffers — slice (a view, no
+            # allocation) so the kernels the FULL decode CUDAGraph records read
+            # fresh per-step values at replay, never a capture-frozen transient.
+            req_slots = hs_slots[:n]
+            src_slots = attn_metadata.sparsekv_src_slots[:n]
+            logical_pos = attn_metadata.sparsekv_token_pos[:n]
+            topk = coord.topk_buffer[:n]
+            indptr = sparse_kv_indptr[: n + 1]
+            if coord.is_shared_layer(layer_id):
+                # IndexShare shared layer: its historical top-k gather was
+                # prefetched on the side stream when the anchor's plan landed.
+                # Back up only this layer's current token into the anchor-assigned
+                # slot, wait for the prefetch, and reuse the anchor's translate
+                # (sparse_kv_indices_buffer is the one shared _sparse_kv_indices_gpu).
+                anchor = coord.anchor_of(layer_id)
+                coord.backup_into_assigned_fused(
+                    layer_id, anchor, kv_layer, src_slots, req_slots, logical_pos
+                )
+                coord.wait_prefetch(layer_id)
+                return coord.hot_buffer[layer_id].unsqueeze(1).unsqueeze(1)
+            # Anchor / non-shared layer: back up the current token first so the
+            # indexer can select its own position, then swap in the top-k and
+            # translate in place. An anchor also records its miss plan and issues
+            # the group's shared-layer swap-ins on the side stream.
+            record_plan = coord.is_prefetch_anchor(layer_id)
+            coord.backup_new_tokens_fused(
+                layer_id, kv_layer, src_slots, req_slots, logical_pos
+            )
+            coord.swap_in_for_layer_fused(
+                layer_id,
+                topk,
+                indptr,
+                req_slots,
+                self.sparse_kv_indices_buffer,
+                record_plan=record_plan,
+            )
+            if record_plan:
+                coord.prefetch_group(layer_id, req_slots)
+            return coord.hot_buffer[layer_id].unsqueeze(1).unsqueeze(1)
+        return self._sparsekv_reference_swap(
+            kv_layer, attn_metadata, sparse_kv_indptr, hs_slots
+        )
+
+    def _sparsekv_reference_swap(
+        self,
+        kv_layer: torch.Tensor,
+        attn_metadata: AttentionMetaData,
+        sparse_kv_indptr: torch.Tensor,
+        hs_slots: torch.Tensor,
+    ) -> torch.Tensor:
+        """Make this layer's hot buffer hold the selected top-k, translate indices.
+
+        Per decode query token: (1) back up the just-written current-token KV
+        (already in ``kv_layer`` at ``slot_mapping``) into cold pool + hot buffer
+        so the indexer can select its own position; (2) miss-detect the logical
+        top-k (side-channel buffer) against the resident hot set and swap misses
+        in from the CPU cold pool; (3) rewrite ``sparse_kv_indices_buffer`` in
+        place to hot-buffer rows. Returns the hot buffer shaped like the full KV
+        cache view so ``mla_decode_fwd`` reads it with the translated indices.
+
+        Eager-only (Phase 0): the CPU miss-detect syncs top-k D2H, which is
+        illegal inside a CUDAGraph. Run with ``--level 0``.
+        """
+        coord = self._sparsekv_coord
+        layer_id = self._sparsekv_layer_id
+        n = int(sparse_kv_indptr.shape[0]) - 1  # decode query tokens
+        req_slots = hs_slots[:n].to("cpu").tolist()
+        token_pos = attn_metadata.sparsekv_token_pos[:n].to("cpu").tolist()
+        slot_map = attn_metadata.slot_mapping[:n].to("cpu").tolist()
+        indptr_cpu = sparse_kv_indptr[: n + 1].to("cpu")
+        kv_flat = kv_layer.reshape(-1, coord.kv_dim)
+
+        # (1) current-token backup — its KV is already in this layer's cache.
+        for j in range(n):
+            if int(indptr_cpu[j + 1]) <= int(indptr_cpu[j]):
+                continue  # padding query token
+            phys = slot_map[j]
+            if phys < 0:
+                continue
+            coord.backup_new_token(req_slots[j], layer_id, kv_flat[phys], token_pos[j])
+
+        # (2)+(3) miss-detect + swap + translate (in place).
+        topk_cpu = coord.topk_buffer[:n].to("cpu")
+        topk_per_req = [topk_cpu[i] for i in range(n)]
+        coord.swap_in_for_layer(
+            layer_id=layer_id,
+            batch_req_slots=req_slots,
+            topk_per_req=topk_per_req,
+            out_translated=self.sparse_kv_indices_buffer,
+            out_indptr=sparse_kv_indptr,
+        )
+        # [M, 576] -> [M, 1, 1, 576] to match kv_c_and_k_pe_cache.unsqueeze(2).
+        return coord.hot_buffer[layer_id].unsqueeze(1).unsqueeze(1)
+
     def _forward_decode(
         self,
         q: torch.Tensor,
@@ -1243,6 +1365,21 @@ class MLAAttention(nn.Module):
                     paged_kv_indptr = attn_metadata.sparse_kv_indptr
                     paged_kv_indices = self.sparse_kv_indices_buffer
                     paged_kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens
+
+                # SparseKV: swap the selected top-k KV in from the CPU cold pool,
+                # translate sparse_kv_indices_buffer (in place) to hot-buffer rows,
+                # and read the hot buffer instead of the full KV cache. Inert
+                # unless the coordinator is bound AND the per-token stable req-slot
+                # mapping is present in metadata (else normal full-KV decode).
+                if self._sparsekv_coord is not None:
+                    hs_slots = getattr(attn_metadata, "sparsekv_req_slots", None)
+                    if hs_slots is not None:
+                        kv_buffer = self._sparsekv_swap_and_translate(
+                            kv_c_and_k_pe_cache,
+                            attn_metadata,
+                            paged_kv_indptr,
+                            hs_slots,
+                        )
 
             dp_size = get_dp_group().world_size
             use_persistent_mode = not (dp_size > 1)
@@ -1399,7 +1536,7 @@ class MLAAttention(nn.Module):
         k_nope: torch.Tensor,
         k_rope: torch.Tensor,
         positions: torch.Tensor = None,
-        q_scale: Optional[torch.Tensor] = None,
+        q_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # kv_cache = self.kv_cache
         forward_context: ForwardContext = get_forward_context()
@@ -1644,7 +1781,7 @@ class MLAAttention(nn.Module):
         kv_cache: torch.Tensor = None,
         attn_metadata=None,
         positions: torch.Tensor = None,
-        q_scale: Optional[torch.Tensor] = None,
+        q_scale: torch.Tensor | None = None,
         output: torch.Tensor = None,
         **kwargs,
     ) -> torch.Tensor:
@@ -1722,7 +1859,7 @@ def triton_convert_req_index_to_global_index(
     BLOCK_SIZE: int = 1,  # page_block_size = 1 for now
     NUM_TOPK_TOKENS: int = 2048,
     BLOCK_N: int = 128,  # tile width along columns
-    out: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
 ):
     """
     out[token_id, indice_id] =
@@ -1851,7 +1988,7 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
     PAGE_SIZE: int = 1,
     NUM_TOPK_TOKENS: int = 2048,
     BLOCK_N: int = 1024,  # tile width along columns
-    out: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
 ):
 
     assert topk_indices.shape[1] == NUM_TOPK_TOKENS
@@ -1951,7 +2088,7 @@ def triton_gather_kv_indices_sparse(
     kv_indptr: torch.Tensor,
     NUM_TOPK_TOKENS: int = 2048,
     BLOCK_N: int = 1024,
-    out: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
 ):
     assert topk_indices.shape[1] == NUM_TOPK_TOKENS
     assert NUM_TOPK_TOKENS % BLOCK_N == 0

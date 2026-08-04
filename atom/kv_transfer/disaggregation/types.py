@@ -11,8 +11,9 @@ KV output aggregator.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # Type aliases
@@ -50,6 +51,11 @@ class KVTransferTensors:
     staging_pool_size: int = 0
     gather_slot: Callable[[int, int], None] | None = None
     scatter_slot: Callable[[int, int], None] | None = None
+    # SparseKV RDMA-direct (Stage D): on the decode consumer, the block_regions
+    # for KV already point at the pinned paged host cold pool. The connector uses
+    # this handle to allocate host pages per request and remap dst_block_ids to
+    # host page ids so prefill RDMAs straight into the cold pool. None otherwise.
+    sparsekv_coordinator: object | None = None
 
 
 @dataclass
