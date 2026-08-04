@@ -1,0 +1,4 @@
+<|open|>message role="system" type="thinking-effort"<|sep|>`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), supported values include `low`, `medium`, `high`, and `max`.
+Now the system is invoked with `thinking_effort=max`.<|close|>message<|sep|><|end_of_msg|>{%- for message in messages -%}
+<|open|>message role="{{ message['role'] }}"<|sep|>{%- if message['role'] == 'assistant' -%}<|open|>think<|sep|><|close|>think<|sep|><|open|>response<|sep|>{{ message['content'] }}<|close|>response<|sep|>{%- else -%}{{ message['content'] }}{%- endif -%}<|close|>message<|sep|><|end_of_msg|>{%- endfor -%}
+{%- if add_generation_prompt -%}<|open|>message role="assistant"<|sep|><|open|>think<|sep|>{%- endif -%}
