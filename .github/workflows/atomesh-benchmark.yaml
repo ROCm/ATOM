@@ -440,7 +440,10 @@ jobs:
           echo "Cancelling Slurm jobs on ${NODES}:"
           printf '%s\n' "${job_ids}"
           mapfile -t job_id_list <<< "${job_ids}"
-          "${scancel_cmd[@]}" "${job_id_list[@]}"
+          for job_id in "${job_id_list[@]}"; do
+            "${scancel_cmd[@]}" "${job_id}"
+            echo "Finished cancelling Slurm job ${job_id}."
+          done
 
       - name: Print benchmark config
         env:
