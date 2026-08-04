@@ -516,6 +516,8 @@
         "--mem-fraction-static 0.8",
         "--context-length 32768",
         "--max-running-requests 128",
+        "--chunked-prefill-size 32768",
+        "--max-prefill-tokens 32768",
         "--model-loader-extra-config '{\"online_quant_config\":{\"global_quant_config\":\"ptpc_fp8\",\"exclude_layer\":[\"lm_head\",\"model.embed_tokens\",\"vision_tower\",\"multi_modal_projector\",\"patch_merge_mlp\",\"*block_sparse_moe\"]}}'",
         "--json-model-override-args '{\"use_index_cache\":true,\"index_topk_freq\":4}'",
         "--kv-cache-dtype fp8_e4m3",
