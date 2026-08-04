@@ -52,6 +52,19 @@ def test_kimi_k3_temporal_state_uses_fp32():
         """)
 
 
+def test_kimi_k3_is_plugin_supported_multimodal():
+    from atom.config import (
+        _MULTIMODAL_MODEL_TYPES,
+        _PLUGIN_SUPPORTED_MULTIMODAL_MODELS,
+    )
+
+    # kimi_k3 must be a known multimodal type AND opted into plugin-mode
+    # pass-through, so get_hf_config keeps vision_config instead of stripping
+    # to text_config.
+    assert "kimi_k3" in _MULTIMODAL_MODEL_TYPES
+    assert "kimi_k3" in _PLUGIN_SUPPORTED_MULTIMODAL_MODELS
+
+
 def test_dense_mla_decode_pads_small_head_count():
     _run_without_test_stubs("""
         from types import SimpleNamespace
