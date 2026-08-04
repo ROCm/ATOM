@@ -127,8 +127,8 @@ async scheduling on:
 ```text
 |Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
 |-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
-|gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9522|±  |0.0059|
-|     |       |strict-match    |     5|exact_match|↑  |0.9522|±  |0.0059|
+|gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9545|±  |0.0057|
+|     |       |strict-match    |     5|exact_match|↑  |0.9538|±  |0.0058|
 ```
 
 Verification always emits the target-greedy token, so drafting is accuracy
@@ -136,19 +136,26 @@ neutral. The target alone scores `0.9553 ± 0.0057` under the same harness and
 concurrency (see [Kimi-K3](./Kimi-K3.md)); the two are within each other's error
 bars.
 
+Check the run for `TimeoutError` before reporting a number. A run that hits the
+`local-completions` client timeout retries the request, and the retry both
+doubles the server's work and re-generates the answer under a different batch
+composition — enough numeric difference to flip a chain of thought that was
+already marginal. One such run here read `0.9424` while its acceptance figures
+stayed normal, which is the tell: DSpark was fine and the harness was not.
+
 ### Acceptance
 
-Aggregated over the same run — 36,338 verify forwards, 254,366 drafted tokens:
+Aggregated over the same run — 36,119 verify forwards, 252,833 drafted tokens:
 
-- **Mean accepted length: 3.772 tokens/forward** — 1 verified token plus 2.77
+- **Mean accepted length: 3.777 tokens/forward** — 1 verified token plus 2.78
   accepted draft tokens.
-- **Acceptance rate: 39.6%** — accepted draft tokens / total drafted tokens.
+- **Acceptance rate: 39.7%** — accepted draft tokens / total drafted tokens.
 
 Per-position acceptance rate across the 7-token block:
 
 ```text
 position   |    1  |    2  |    3  |    4  |    5  |    6  |    7
-rate       | 0.923 | 0.775 | 0.600 | 0.440 | 0.032 | 0.001 | 0.000
+rate       | 0.923 | 0.774 | 0.602 | 0.442 | 0.034 | 0.002 | 0.000
 ```
 
 The collapse after position 4 is the cost of causal drafting: the block's tail
