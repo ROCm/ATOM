@@ -695,21 +695,20 @@ def _bind_compressor_state(
             raise ValueError("indexer compressor binding requires explicit head_dim")
         block_fp32_stride = (k1 * aligned_dim) // 4
         scale_fp32_offset = (k1 * head_dim) // 4
-        compressor.cache_scale = (
-            kv_cache.view(torch.float32)
-            .view(-1)
-            .as_strided(
-                size=(nb, k1),
-                stride=(block_fp32_stride, 1),
-                storage_offset=scale_fp32_offset,
-            )
+        kv_cache_f32 = kv_cache.view(torch.float32)
+        compressor.cache_scale = kv_cache_f32.view(-1).as_strided(
+            size=(nb, k1),
+            stride=(block_fp32_stride, 1),
+            storage_offset=kv_cache_f32.storage_offset() + scale_fp32_offset,
         )
         compressor.write_mode = "indexer_fp8"
+        compressor.quant_mode = "per_row_fp8"
     else:
         compressor.cache_scale = None
         compressor.write_mode = (
             "main_2buff_fp8" if kv_cache_rope is not None else "bf16"
         )
+        compressor.quant_mode = "group_fp8" if kv_cache_rope is not None else "none"
 
 
 def _iter_deepseek_v4_cache_blocks(model):

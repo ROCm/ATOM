@@ -600,6 +600,22 @@ class CpuGpuBuffer:
             return self.cpu.copy_(self.gpu, non_blocking=True)
         return self.cpu[:n].copy_(self.gpu[:n], non_blocking=True)
 
+    def clone(self) -> "CpuGpuBuffer":
+        """Allocate an independent buffer with the same shape/dtype/device and
+        copy over the current cpu+gpu contents (preserves one-time inits like
+        arange/zeros). Used to build per-in-flight-slot metadata rings so
+        concurrent pipeline microbatches never share a staging buffer."""
+        new = CpuGpuBuffer(
+            *self.cpu.shape,
+            dtype=self.cpu.dtype,
+            device=self.gpu.device,
+            pin_memory=self.cpu.is_pinned(),
+            with_numpy=hasattr(self, "np"),
+        )
+        new.cpu.copy_(self.cpu)
+        new.gpu.copy_(self.gpu)
+        return new
+
 
 context_manager = None
 torch_compile_start_time: float = 0.0

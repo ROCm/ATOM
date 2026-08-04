@@ -1781,17 +1781,15 @@ class IndexerWkWeightsProjLinear(MergedReplicatedLinear):
         super().weight_loader(param, loaded_weight, loaded_shard_id)
 
     def process_weights_after_loading(self):
-        if self._wk_pending_weight is not None or (
-            self._wk_pending_scale is not None and not self._wk_loaded
-        ):
-            raise RuntimeError(
-                "Incomplete FP8 indexer.wk load: both weight and weight_scale "
-                "are required before building wk_weights_proj."
-            )
         if not self._wk_loaded:
-            raise RuntimeError(
-                "Missing indexer.wk load before building wk_weights_proj."
-            )
+            if self._wk_pending_weight is not None or (
+                self._wk_pending_scale is not None
+            ):
+                raise RuntimeError(
+                    "Incomplete FP8 indexer.wk load: both weight and weight_scale "
+                    "are required before building wk_weights_proj."
+                )
+            return
         super().process_weights_after_loading()
 
 
@@ -1937,7 +1935,7 @@ class Indexer(nn.Module):
                 quant_config=None,
                 prefix=f"{prefix}.weights_proj",
             )
-        self.k_norm = LayerNorm(self.head_dim, eps=1e-6)
+        self.k_norm = LayerNorm(self.head_dim, eps=1e-6, dtype=torch.float32)
         self.softmax_scale = self.head_dim**-0.5
         self._weights_scale = self.softmax_scale * self.n_head**-0.5
 

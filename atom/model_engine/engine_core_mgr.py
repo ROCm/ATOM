@@ -10,10 +10,10 @@ import pickle
 import queue
 import weakref
 from threading import Lock, Thread
-from typing import List, Optional
 
 import zmq
 import zmq.asyncio
+
 from atom.config import Config
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.sequence import Sequence
@@ -35,25 +35,35 @@ DP_LB_DEFAULT = "least_requests"
 
 
 class CoreManager:
-    def __init__(self, config: Config):
-        self.label = "Engine Core Mgr"
+    def _init_shared_state(
+        self, config: Config, *, label: str, local_engine_count: int
+    ) -> None:
+        """Every field the inherited methods touch, before any engine is spawned.
+
+        Subclasses spawn their engines differently and so cannot run this
+        class's ``__init__`` -- but they inherit its output threads, ``close()``
+        and DP-load bookkeeping, all of which read the fields set here. This is
+        the one place to add another such field.
+
+        It exists because the alternative was tried: ``DisaggCoreManager`` used
+        to hand-copy this block, and the copy drifted. ``_flush_stream_batch_fn``
+        was added to the copy and to the API server that assigns it, but not to
+        this class -- so the offline entrypoint, which is the one path that
+        neither initialises nor assigns it, had its output thread die on the
+        first streamed token and hung until CI timed out an hour later.
+        """
+        self.label = label
         self._closed = False  # Track whether already closed
-        if config.enable_dp_attention:
-            self.local_engine_count = (
-                config.tensor_parallel_size * config.parallel_config.data_parallel_size
-            )
-            logger.info(
-                f"Enable dp attention, using {self.local_engine_count} data parallel ranks"
-            )
-            config.parallel_config.data_parallel_size = self.local_engine_count
-            config.tensor_parallel_size = 1
-        else:
-            self.local_engine_count = config.parallel_config.data_parallel_size
+        self.local_engine_count = local_engine_count
         self.ctx = zmq.Context(io_threads=2)
-        self.outputs_queue = queue.Queue[List[Sequence]]()
+        self.outputs_queue = queue.Queue[list[Sequence]]()
         self.stream_outputs_queue = queue.Queue()
         self.utility_response_queue = queue.Queue()
         self._seq_id_to_callback = {}
+        # Batched stream-flush hook, resolved lazily by the API server (avoids
+        # an api_server <-> engine_core_mgr import cycle). Stays None on every
+        # path that never streams, which the output thread checks for.
+        self._flush_stream_batch_fn = None
         self.engine_core_processes = []
         self.input_sockets = []
         self.output_sockets = []
@@ -67,6 +77,9 @@ class CoreManager:
         self._rank_rotation_cursor = 0
 
         # --- DP request load balancing (see _select_dp_rank_locked) ---
+        # A subclass may fan out through its own add_request() and never charge
+        # load at all, but the inherited output thread still calls
+        # _release_seq_load() on every finished sequence, so these MUST exist.
         # Strategy: "round_robin" | "least_requests" | "least_tokens" (validated
         # at the CLI by argparse choices=DP_LB_STRATEGIES).
         self._dp_lb_strategy = config.dp_load_balance
@@ -78,12 +91,46 @@ class CoreManager:
         # on dispatch, decremented on finish/abort. Guarded by _lb_lock because
         # dispatch runs on the request thread while release runs on the per-rank
         # output threads.
-        self._rank_reqs = [0] * self.local_engine_count
-        self._rank_tokens = [0] * self.local_engine_count
+        self._rank_reqs = [0] * local_engine_count
+        self._rank_tokens = [0] * local_engine_count
         # seq_id -> (dp_rank, req_cost, tok_cost) so release subtracts exactly
         # what dispatch added, and only for ranks that were actually charged.
         self._seq_load = {}
         self._lb_lock = Lock()
+
+    def __init__(self, config: Config):
+        pp_size = config.pipeline_parallel_size
+        self.pp_size = pp_size
+        if config.enable_dp_attention:
+            assert pp_size == 1, "Pipeline parallel + DP-attention is not supported yet"
+            local_engine_count = (
+                config.tensor_parallel_size * config.parallel_config.data_parallel_size
+            )
+            logger.info(
+                f"Enable dp attention, using {local_engine_count} data parallel ranks"
+            )
+            config.parallel_config.data_parallel_size = local_engine_count
+            config.tensor_parallel_size = 1
+        else:
+            dp_size = config.parallel_config.data_parallel_size
+            assert not (
+                pp_size > 1 and dp_size > 1
+            ), "Pipeline parallel combined with data parallel is not supported yet."
+            # One EngineCore per (dp_rank, pp_rank) stage.
+            local_engine_count = dp_size * pp_size
+        # Inter-stage ZMQ channels (head<->downstream metadata, last->head
+        # tokens), shared across the single dp group. PP+DP would need per-group
+        # sets — deferred with the assertion above. Not shared state: only this
+        # class's spawn loop reads them.
+        self.pp_meta_addrs = []
+        self.pp_token_addr = ""
+        if pp_size > 1:
+            self.pp_meta_addrs = [get_open_zmq_ipc_path() for _ in range(pp_size)]
+            self.pp_token_addr = get_open_zmq_ipc_path()
+
+        self._init_shared_state(
+            config, label="Engine Core Mgr", local_engine_count=local_engine_count
+        )
 
         import torch
 
@@ -94,16 +141,23 @@ class CoreManager:
         local_dp_ranks = []
 
         try:
-            for dp_rank in range(self.local_engine_count):
+            for engine_index in range(self.local_engine_count):
+                dp_rank = engine_index // self.pp_size
+                pp_rank = engine_index % self.pp_size
                 logger.info(
-                    f"{self.label}: Creating EngineCore for DP rank {dp_rank}/{self.local_engine_count}"
+                    f"{self.label}: Creating EngineCore engine {engine_index}"
+                    f" (dp={dp_rank}, pp={pp_rank}) of {self.local_engine_count}"
                 )
 
-                # Create config for this DP rank
+                # Create config for this (dp, pp) stage
                 import copy
 
                 rank_config = copy.deepcopy(config)
                 rank_config.parallel_config.data_parallel_rank = dp_rank
+                rank_config.parallel_config.pipeline_parallel_rank = pp_rank
+                if self.pp_size > 1:
+                    rank_config.parallel_config.pp_meta_addrs = self.pp_meta_addrs
+                    rank_config.parallel_config.pp_token_addr = self.pp_token_addr
 
                 engine_core_process, addresses, local_dp_rank = launch_engine_core(
                     rank_config, dp_rank
@@ -285,6 +339,20 @@ class CoreManager:
                                 logger.debug(
                                     f"{self.label}: Cleaned up callback for finished sequence {seq_id}"
                                 )
+                        # Batched stream dispatch: the per-seq callbacks only buffer
+                        # their chunks into a thread-local; flush the whole step's
+                        # buffer into the per-request asyncio queues now (one
+                        # call_soon_threadsafe per loop). Resolved lazily by the API
+                        # server to avoid the api_server <-> engine_core_mgr import
+                        # cycle. No-op when no streaming request is in flight.
+                        if self._flush_stream_batch_fn is not None:
+                            try:
+                                self._flush_stream_batch_fn()
+                            except Exception as e:
+                                logger.warning(
+                                    f"{self.label}: flush_stream_batch failed: {e}",
+                                    exc_info=True,
+                                )
                     elif request_type == EngineCoreRequestType.UTILITY_RESPONSE:
                         self.utility_response_queue.put_nowait(data)
                     elif request_type == EngineCoreRequestType.ADD:
@@ -335,7 +403,7 @@ class CoreManager:
                 break
             await self.async_output_queue.put(seqs)
 
-    async def get_output_async(self) -> List[Sequence]:
+    async def get_output_async(self) -> list[Sequence]:
         if not self.async_output_queue:
             raise RuntimeError("Engine async mode not enabled")
 
@@ -410,7 +478,7 @@ class CoreManager:
 
         logger.info(f"{self.label}: All EngineCores shut down")
 
-    def add_request(self, seqs: List[Sequence]):
+    def add_request(self, seqs: list[Sequence]):
         logger.debug(
             f"{self.label}: Add request, sequence ids: {[seq.id for seq in seqs]}"
         )
@@ -419,7 +487,18 @@ class CoreManager:
             if seq.stream_callback is not None:
                 self._seq_id_to_callback[seq.id] = seq.stream_callback
                 seq.stream_callback = None
-        if self.local_engine_count == 1:
+        if self.pp_size > 1:
+            # Pipeline parallel (dp=1): requests enter only at stage 0, which
+            # drives the pipeline downstream.
+            logger.debug(f"{self.label}: Add {len(seqs)} requests to PP head 0")
+            self.input_sockets[0].send_multipart(
+                [
+                    self.engine_core_identities[0],
+                    pickle.dumps((EngineCoreRequestType.ADD, seqs)),
+                ],
+                copy=False,
+            )
+        elif self.local_engine_count == 1:
             # Single DP rank, send all requests
             logger.debug(f"{self.label}: Add {len(seqs)} requests to DP rank 0")
             self.input_sockets[0].send_multipart(
@@ -432,7 +511,7 @@ class CoreManager:
         else:
             self._dispatch_to_dp_ranks(seqs)
 
-    def _resolve_and_validate_hints(self, seqs: List[Sequence]) -> List[Optional[int]]:
+    def _resolve_and_validate_hints(self, seqs: list[Sequence]) -> list[int | None]:
         """Resolve every seq's explicit ``data_parallel_rank`` hint and validate
         the whole batch, once.
 
@@ -444,7 +523,7 @@ class CoreManager:
         of a batch cannot leave earlier siblings charged-but-undispatched (a
         permanent in-flight-load leak).
         """
-        hints: List[Optional[int]] = []
+        hints: list[int | None] = []
         for seq in seqs:
             raw = getattr(seq, "data_parallel_rank", None)
             hint = None if raw is None else int(raw)
@@ -456,7 +535,7 @@ class CoreManager:
             hints.append(hint)
         return hints
 
-    def _dispatch_to_dp_ranks(self, seqs: List[Sequence]) -> None:
+    def _dispatch_to_dp_ranks(self, seqs: list[Sequence]) -> None:
         """Route a batch across DP ranks and send each rank its sub-batch.
 
         Honors an explicit ``data_parallel_rank`` hint; otherwise picks a rank
@@ -744,7 +823,7 @@ class CoreManager:
                     f"{self.label}: Error sending shutdown to DP rank {dp_rank}: {e}"
                 )
 
-    def get_output(self) -> List[Sequence]:
+    def get_output(self) -> list[Sequence]:
         seqs = self.outputs_queue.get()
         if isinstance(seqs, BaseException):
             raise seqs
@@ -894,7 +973,7 @@ class DisaggCoreManager(CoreManager):
         decode_input_addr = get_open_zmq_ipc_path()
         decode_output_addr = get_open_zmq_ipc_path()
 
-        from atom.model_engine.engine_core import PrefillEngineCore, DecodeEngineCore
+        from atom.model_engine.engine_core import DecodeEngineCore, PrefillEngineCore
 
         prefill_proc = multiprocessing.Process(
             target=PrefillEngineCore.run_engine,
@@ -915,53 +994,15 @@ class DisaggCoreManager(CoreManager):
             },
         )
 
-        # Initialise the base class fields that close() and other methods use,
-        # without calling super().__init__() (which would spawn its own processes).
-        self.label = "DisaggCoreManager"
-        self._closed = False
-        self.local_engine_count = 2  # prefill + decode
-        self.ctx = zmq.Context(io_threads=2)
-        self.outputs_queue = queue.Queue()
-        self.stream_outputs_queue = queue.Queue()
-        self.utility_response_queue = queue.Queue()
-        self._seq_id_to_callback = {}
-        # Batched stream-flush hook, resolved lazily (avoids import cycle).
-        self._flush_stream_batch_fn = None
-        self.engine_core_processes = []
-        self.input_sockets = []
-        self.output_sockets = []
-        self.engine_core_identities = []
-        self.shutdown_paths = []
-        self.output_threads = []
-        # Fair-rotation cursor, advanced once per selection. round_robin picks the
-        # rank directly (cursor % n); the load-aware strategies use it only to seed
-        # the argmin start offset so fully-tied ranks rotate instead of always
-        # resolving to rank 0.
-        self._rank_rotation_cursor = 0
-
-        # --- DP request load balancing (see _select_dp_rank_locked) ---
-        # DisaggCoreManager fans out via its own add_request() and never routes
-        # through _dispatch_to_dp_ranks, so load is never charged and _seq_load
-        # stays empty. But the inherited output thread still calls
-        # _release_seq_load() on every finished sequence, so these fields MUST
-        # exist or the output thread dies on the first finish and responses stop.
-        # Strategy: "round_robin" | "least_requests" | "least_tokens" (validated
-        # at the CLI by argparse choices=DP_LB_STRATEGIES).
-        self._dp_lb_strategy = config.dp_load_balance
-        # Token-equivalent weight of one in-flight request for "least_tokens".
-        # Read once here: this is a construction-time config value (CoreManager
-        # is built after env/args are finalized), not a runtime-tunable knob.
-        self._dp_lb_req_equiv = envs.ATOM_DP_LB_REQ_EQUIV
-        # Authoritative in-flight load per rank, maintained locally: incremented
-        # on dispatch, decremented on finish/abort. Guarded by _lb_lock because
-        # dispatch runs on the request thread while release runs on the per-rank
-        # output threads.
-        self._rank_reqs = [0] * self.local_engine_count
-        self._rank_tokens = [0] * self.local_engine_count
-        # seq_id -> (dp_rank, req_cost, tok_cost) so release subtracts exactly
-        # what dispatch added, and only for ranks that were actually charged.
-        self._seq_load = {}
-        self._lb_lock = Lock()
+        # Set up the inherited state without running CoreManager.__init__,
+        # which would spawn its own engines the base way. This manager fans out
+        # through its own add_request() and never charges DP load, but the
+        # inherited output thread still releases it on every finished sequence.
+        self._init_shared_state(
+            config,
+            label="DisaggCoreManager",
+            local_engine_count=2,  # prefill + decode
+        )
 
         import weakref
 
@@ -1023,7 +1064,7 @@ class DisaggCoreManager(CoreManager):
                     f"{self.label}: process {idx} sent SHUTDOWN during initialization"
                 )
 
-    def add_request(self, seqs: List[Sequence]):
+    def add_request(self, seqs: list[Sequence]):
         """Fan-out: send every new sequence to BOTH prefill and decode."""
         logger.debug(f"{self.label}: fan-out {len(seqs)} seqs to prefill and decode")
         # Register stream callbacks before sending (decode will produce output).

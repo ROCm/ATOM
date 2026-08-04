@@ -38,6 +38,7 @@ class EngineArgs:
     trust_remote_code: bool = False
     tensor_parallel_size: int = 1
     decode_context_parallel_size: int = 1
+    pipeline_parallel_size: int = 1
     prefill_context_parallel_size: int = 1
     data_parallel_size: int = 1
     enforce_eager: bool = False
@@ -108,6 +109,14 @@ class EngineArgs:
             type=int,
             default=1,
             help="Tensor parallel size.",
+        )
+        parser.add_argument(
+            "--pipeline-parallel-size",
+            "-pp",
+            type=int,
+            default=1,
+            help="Pipeline parallel size. Splits the model's layers across "
+            "stages (world = tp x pp x pcp).",
         )
         parser.add_argument(
             "--prefill-context-parallel-size",
@@ -272,7 +281,10 @@ class EngineArgs:
             "--draft-model",
             type=str,
             default=None,
-            help="Path to external Eagle3 draft model. Required when --method eagle3.",
+            help="Path to a standalone draft-model checkpoint. Required when "
+            "--method eagle3; optional for --method dspark (needed for the "
+            "DFlash-backbone drafts such as Kimi-K3-DSpark, omitted for "
+            "V4-Pro-DSpark which ships inside the target checkpoint).",
         )
         parser.add_argument(
             "--max-num-batched-tokens",
@@ -489,18 +501,18 @@ class EngineArgs:
             method = kwargs.pop("method")
             num_spec_tokens = kwargs.pop("num_speculative_tokens")
             draft_model = kwargs.pop("draft_model")
-            if method == "eagle3":
-                kwargs["speculative_config"] = SpeculativeConfig(
-                    method=method,
-                    model=draft_model,
-                    num_speculative_tokens=num_spec_tokens,
+            if method == "eagle3" and not draft_model:
+                raise ValueError("--draft-model is required when --method eagle3.")
+            if draft_model and method == "mtp":
+                raise ValueError(
+                    "--draft-model is not supported with --method mtp: the MTP "
+                    "draft is loaded from the target checkpoint."
                 )
-            else:
-                kwargs["speculative_config"] = SpeculativeConfig(
-                    method=method,
-                    model=self.model,
-                    num_speculative_tokens=num_spec_tokens,
-                )
+            kwargs["speculative_config"] = SpeculativeConfig(
+                method=method,
+                model=draft_model or self.model,
+                num_speculative_tokens=num_spec_tokens,
+            )
         else:
             kwargs.pop("method")
             kwargs.pop("num_speculative_tokens")
