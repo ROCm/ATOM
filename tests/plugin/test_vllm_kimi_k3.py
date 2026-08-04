@@ -65,6 +65,43 @@ def test_kimi_k3_is_plugin_supported_multimodal():
     assert "kimi_k3" in _PLUGIN_SUPPORTED_MULTIMODAL_MODELS
 
 
+def test_kimi_k3_inner_conditional_generation_class():
+    _run_without_test_stubs("""
+        from vllm.models.kimi_k3 import (
+            KimiK3ForConditionalGeneration as vLLMKimiK3,
+        )
+        from atom.plugin.vllm.models.kimi_k3 import (
+            KimiK3ForCausalLM,
+            KimiK3ForConditionalGeneration_,
+        )
+
+        # Inner class subclasses the upstream multimodal model so it inherits
+        # embed_multimodal / media parsing / vision-tower forward.
+        assert issubclass(KimiK3ForConditionalGeneration_, vLLMKimiK3)
+
+        # ATOM plugin loading + expert routing entry points exist.
+        assert hasattr(KimiK3ForConditionalGeneration_, "load_weights")
+        assert hasattr(KimiK3ForConditionalGeneration_, "get_expert_mapping")
+
+        # Weight mapper collapses the double language_model nesting and renames
+        # the projector layers.
+        mapper = KimiK3ForConditionalGeneration_.hf_to_atom_mapper
+        assert mapper.orig_to_new_prefix["language_model."] == (
+            "language_model.language_model."
+        )
+        assert mapper.orig_to_new_prefix["mm_projector.proj.0"] == (
+            "mm_projector.linear_1"
+        )
+        assert mapper.orig_to_new_prefix["mm_projector.proj.2"] == (
+            "mm_projector.linear_2"
+        )
+
+        # Language-model wrapper exposes embed_input_ids for vLLM multimodal
+        # discovery.
+        assert hasattr(KimiK3ForCausalLM, "embed_input_ids")
+        """)
+
+
 def test_dense_mla_decode_pads_small_head_count():
     _run_without_test_stubs("""
         from types import SimpleNamespace

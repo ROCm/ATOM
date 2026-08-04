@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import torch
+from torch import nn
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context as get_vllm_forward_context
 from vllm.model_executor.layers.mamba.abstract import MambaBase
@@ -11,9 +12,25 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
 )
 from vllm.model_executor.models.interfaces import IsHybrid
+from vllm.model_executor.models.kimi_k25_vit import (
+    KimiK25MultiModalProjector,
+    MoonViT3dPretrainedModel,
+)
+from vllm.model_executor.models.vision import is_vit_use_data_parallel
+from vllm.models.kimi_k3 import (
+    KimiK3ForConditionalGeneration as vLLMKimiK3,
+)
+from vllm.models.kimi_k3.common.mm_preprocess import (
+    KimiK3DummyInputsBuilder,
+    KimiK3MultiModalProcessor,
+    KimiK3ProcessingInfo,
+)
+from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
+from atom.config import Config, QuantizationConfig
+from atom.model_loader.loader import WeightsMapper, load_model_in_plugin_mode
 from atom.models import kimi_k3 as kimi_k3_base
 from atom.models.kimi_k3 import (
     KimiK3ForCausalLM as KimiK3ForCausalLMBase,
@@ -22,6 +39,7 @@ from atom.models.kimi_k3 import (
     KimiKDAAttention,
     _normalize_kimi_config,
 )
+from atom.models.utils import maybe_prefix
 from atom.plugin.vllm.model_wrapper import ATOMMoEForCausalLM
 from atom.utils.forward_context import get_forward_context as get_atom_forward_context
 
@@ -166,6 +184,100 @@ class KimiK3ForCausalLM(KimiK3ForCausalLMBase):
             super().__init__(*args, **kwargs)
         finally:
             kimi_k3_base.KimiKDAAttention = original_kda_cls
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        # Required by vLLM SupportsMultiModal.get_language_model discovery.
+        return self.get_input_embeddings(input_ids)
+
+
+@MULTIMODAL_REGISTRY.register_processor(
+    KimiK3MultiModalProcessor,
+    info=KimiK3ProcessingInfo,
+    dummy_inputs=KimiK3DummyInputsBuilder,
+)
+class KimiK3ForConditionalGeneration_(vLLMKimiK3):
+    hf_to_atom_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            # ATOM nests language_model.language_model (ATOM KimiK3ForCausalLM
+            # wraps KimiLinearForCausalLM); checkpoint stores language_model.model.
+            "language_model.": "language_model.language_model.",
+            "mm_projector.proj.0": "mm_projector.linear_1",
+            "mm_projector.proj.2": "mm_projector.linear_2",
+        }
+    )
+
+    def __init__(self, atom_config: Config, prefix: str = "model"):
+        # Protocols have no __init__; skip vLLMKimiK3.__init__ (it would build
+        # vLLM's KimiLinear language model) and set up nn.Module directly.
+        nn.Module.__init__(self)
+        hf_config = getattr(atom_config, "hf_config", None)
+        assert hf_config is not None, "hf_config is not found in atom_config"
+        vision_config = hf_config.vision_config
+        self.config = hf_config
+        self.atom_config = atom_config
+
+        vllm_config = atom_config.plugin_config.vllm_config
+        quant_config = vllm_config.quant_config
+        atom_quant_config = atom_config.quant_config
+        multimodal_config = vllm_config.model_config.multimodal_config
+        self.multimodal_config = multimodal_config
+        self.use_data_parallel = is_vit_use_data_parallel(
+            vision_config.num_attention_heads
+        )
+
+        with self._mark_tower_model(vllm_config, "image"):
+            self.vision_tower = MoonViT3dPretrainedModel(
+                vision_config,
+                quant_config=self._maybe_ignore_quant_config(
+                    quant_config,
+                    atom_quant_config.exclude_layers or [],
+                    "vision_tower",
+                ),
+                prefix=maybe_prefix(prefix, "vision_tower"),
+            )
+            self.mm_projector = KimiK25MultiModalProjector(
+                config=vision_config,
+                use_data_parallel=self.use_data_parallel,
+                quant_config=self._maybe_ignore_quant_config(
+                    quant_config,
+                    atom_quant_config.exclude_layers or [],
+                    "mm_projector",
+                ),
+                prefix=maybe_prefix(prefix, "mm_projector"),
+            )
+
+        self.quant_config = quant_config
+        with self._mark_language_model(vllm_config):
+            self.language_model = KimiK3ForCausalLM(
+                atom_config=atom_config,
+                prefix=maybe_prefix(prefix, "language_model"),
+            )
+
+        self.make_empty_intermediate_tensors = (
+            self.language_model.make_empty_intermediate_tensors
+        )
+        self.media_placeholder = self.config.media_placeholder_token_id
+
+    def _maybe_ignore_quant_config(self, quant_config, exclude_layers, layer_name: str):
+        for exclude_layer in exclude_layers:
+            if QuantizationConfig._matches_exclude(
+                layer_name, exclude_layer, check_contains=True
+            ):
+                return None
+        return quant_config
+
+    def load_weights(self, weights):
+        # weights generator is discarded; ATOM loads from disk in plugin mode.
+        # prefix="model." because ATOMModelBase constructs this as `.model`.
+        return load_model_in_plugin_mode(
+            model=self,
+            config=self.atom_config,
+            prefix="model.",
+            weights_mapper=self.hf_to_atom_mapper,
+        )
+
+    def get_expert_mapping(self):
+        return self.language_model.get_expert_mapping()
 
 
 class KimiK3ForCausalLMVllm(ATOMMoEForCausalLM, IsHybrid):
