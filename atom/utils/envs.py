@@ -73,8 +73,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FUSED_COMPRESS_USE_FLYDSL": lambda: os.getenv(
         "ATOM_FUSED_COMPRESS_USE_FLYDSL", "auto"
     ).lower(),
-    # QK-norm-rope-cache-quant fusion for Qwen3-MoE; disabled by default.
-    # Enable for Qwen3-MoE to get better performance.
+    # QK-norm-rope-cache-quant fusion for Qwen3 dense and MoE; disabled by default.
     "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION", "0") == "1"
     ),
@@ -200,6 +199,37 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # with that many threads; set to 1 to fall back to the original sequential
     # per-expert path.
     "ATOM_LOADER_NUM_THREADS": lambda: int(os.getenv("ATOM_LOADER_NUM_THREADS", "16")),
+    # Warm the page cache with a background sequential reader instead of
+    # leaving it to demand faults through the mmap. Measured on a local NVMe:
+    # the fault-driven pattern sustains 3.2 GB/s where the device does 6.9 and
+    # a single sequential reader alone reaches 6.06, so the gap is the access
+    # pattern rather than queue depth. On DeepSeek-R1 MXFP4 (350 GiB, TP=4)
+    # this takes a cold load from ~156s to ~68s and leaves the warm case
+    # slightly better too, so it is on by default; turn it off for storage
+    # where a second sequential reader competes with the loader instead of
+    # feeding it.
+    "ATOM_LOADER_PREFETCH": lambda: (
+        os.getenv("ATOM_LOADER_PREFETCH", "true").lower() == "true"
+    ),
+    # Shards read concurrently by the prefetcher. Kept small: the device here
+    # saturates at 2 streams, and every thread also competes with the loader.
+    "ATOM_LOADER_PREFETCH_THREADS": lambda: int(
+        os.getenv("ATOM_LOADER_PREFETCH_THREADS", "4")
+    ),
+    "ATOM_LOADER_PREFETCH_BLOCK_MB": lambda: int(
+        os.getenv("ATOM_LOADER_PREFETCH_BLOCK_MB", "16")
+    ),
+    # Hint the kernel to read each shard ahead. Off by default because it never
+    # paid for itself once measured on its own: the read loop runs far ahead of
+    # the workers, so WILLNEED is issued for the whole checkpoint within
+    # seconds, and asking for 350 GiB of read-ahead is bookkeeping the kernel
+    # largely discards. Cold load 193.0s vs 194.2s -- no effect; warm load
+    # 27.3s vs 42.8s -- 15.5s of pure overhead. Kept as a switch rather than
+    # deleted so the behaviour can be restored on storage that behaves
+    # differently. Ignored when prefetching, which supersedes it.
+    "ATOM_LOADER_FADVISE": lambda: (
+        os.getenv("ATOM_LOADER_FADVISE", "false").lower() == "true"
+    ),
     # Fail loading when the checkpoint does not deliver every routed expert of
     # a fused MoE parameter. On by default: the alternative is a model that
     # loads happily with some expert slots left at their init values, which
@@ -315,7 +345,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ragged_graph_sizes, q_buckets, disable_sps_calib) are no longer env vars.
     # They are configured via --dspark-config (JSON dict) and carried in
     # config.dspark (see atom/config.py DSparkConfig). See
-    # recipes/DeepSeek-V4-DSpark.md.
+    # recipes/DSpark.md.
     # --- PrefillDelayer (cross-DP prefill alignment) ---
     # Master switch; default on. Set "0" to disable construction.
     # The delayer is a prefill COALESCER: it holds back prefill admission under
@@ -409,6 +439,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_CRASH_ON_NUMA_BIND_FAILURE": lambda: (
         os.getenv("ATOM_CRASH_ON_NUMA_BIND_FAILURE", "0") == "1"
     ),
+    # PP-boundary hidden_states/residual are TP-replicated; when on, each rank
+    # sends only its 1/tp_size slice and the receiver all-gathers, cutting PP
+    # link traffic by tp_size. Default on; set "0" for full-tensor sends.
+    "ATOM_PP_SEND_ALLGATHER": lambda: os.getenv("ATOM_PP_SEND_ALLGATHER", "1") == "1",
 }
 
 

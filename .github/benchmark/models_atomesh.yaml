@@ -11,7 +11,7 @@ defaults:
     random_range_ratio: 0.8
     request_rate: inf
     num_prompts_multiplier: 10
-    wait_server_timeout: 2500
+    wait_server_timeout: 5000
     wait_router_timeout: 300
   env:
     common:
@@ -52,8 +52,6 @@ models:
       common:
         AITER_BF16_FP8_MOE_BOUND: "0"
         ATOM_MOE_GU_ITLV: "1"
-        GPU_MAX_HW_QUEUES: "5"
-        ATOM_CPU_AFFINITY: "1"
       prefill: {}
       decode: {}
     server:
@@ -61,8 +59,9 @@ models:
         trust_remote_code: true
         kv_cache_dtype: fp8
         block_size: 16
+        enable_prefix_caching: false
         gpu_memory_utilization: 0.85
-        max_num_seqs: 256
+        max_num_seqs: 512
         extra_args: ""
     suites:
       smoke:
@@ -90,6 +89,10 @@ models:
           topology: 1p1d_dpa
           pd_worker_layout: multi_node
           nodes: "${ATOMESH_1P1D_NODES}"
+          env:
+            prefill:
+              GPU_MAX_HW_QUEUES: "5"
+              ATOM_NUMA_BIND: "1"         
           isl: [8192]
           osl: 1024
           concurrency: [256, 512]
@@ -100,28 +103,73 @@ models:
           decode:
             workers: 1
             tp: 8
-            extra_args: "--enable-dp-attention --enable-tbo"
+            extra_args: "--enable-dp-attention"
           benchmark:
             wait_server_timeout: 4500
 
-        - name: ds-v4-2p1d-dpa-tp8
-          topology: 2p1d_dpa
+        - name: ds-v4-1p1d-tp8-mtp3
+          topology: 1p1d_mtp3
           pd_worker_layout: multi_node
-          nodes: "${ATOMESH_2P1D_NODES}"
+          nodes: "${ATOMESH_1P1D_NODES}"
           isl: [8192]
           osl: 1024
-          concurrency: [256, 512, 1024, 2048]
+          concurrency: [1, 2, 4, 8, 16, 32, 64, 128]
           prefill:
-            workers: 2
+            workers: 1
             tp: 8
-            extra_args: "--enable-dp-attention --enable-tbo"
+            extra_args: "--method mtp --num-speculative-tokens 3"
           decode:
             workers: 1
             tp: 8
-            extra_args: "--enable-dp-attention --enable-tbo"
+            extra_args: "--method mtp --num-speculative-tokens 3"
           benchmark:
             wait_server_timeout: 4500
           run_eval: true
+
+        - name: ds-v4-1p1d-dpa-tp8-mtp1
+          topology: 1p1d_dpa_mtp1
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          env:
+            prefill:
+              GPU_MAX_HW_QUEUES: "5"
+              ATOM_NUMA_BIND: "1"
+          isl: [8192]
+          osl: 1024
+          concurrency: [256, 512]
+          prefill:
+            workers: 1
+            tp: 8
+            extra_args: "--method mtp --num-speculative-tokens 1 --enable-dp-attention --enable-tbo"
+          decode:
+            workers: 1
+            tp: 8
+            extra_args: "--method mtp --num-speculative-tokens 1 --enable-dp-attention"
+          benchmark:
+            wait_server_timeout: 4500
+
+        # - name: ds-v4-2p1d-dpa-tp8
+        #   topology: 2p1d_dpa
+        #   pd_worker_layout: multi_node
+        #   nodes: "${ATOMESH_2P1D_NODES}"
+        #   env:
+        #     prefill:
+        #       GPU_MAX_HW_QUEUES: "5"
+        #       ATOM_NUMA_BIND: "1"
+        #   isl: [8192]
+        #   osl: 1024
+        #   concurrency: [256, 512, 1024, 2048]
+        #   prefill:
+        #     workers: 2
+        #     tp: 8
+        #     extra_args: "--enable-dp-attention --enable-tbo"
+        #   decode:
+        #     workers: 1
+        #     tp: 8
+        #     extra_args: "--enable-dp-attention"
+        #   benchmark:
+        #     wait_server_timeout: 4500
+        #   run_eval: true
 
     accuracy:
       task: gsm8k
@@ -142,6 +190,7 @@ models:
       common_args:
         trust_remote_code: true
         kv_cache_dtype: fp8
+        enable_prefix_caching: false
         gpu_memory_utilization: 0.8
         max_num_batched_tokens: 16384
         max_model_len: 16384
@@ -192,10 +241,9 @@ models:
 
         # Keep each AgentX concurrency in its own job so every measurement starts
         # from a fresh ATOM service instead of inheriting HBM prefix-cache state.
-        - &glm52_agentic_tp8_tp8
-          name: glm-52-mxfp4-1p1d-tp8-agentic-1m-c1
+        - &glm52_agentic_tp4_tp4
+          name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c1
           topology: 1p1d
-          display_topology: 1P1D-TP8-agentic
           pd_worker_layout: multi_node
           nodes: "${ATOMESH_1P1D_NODES}"
           isl: [1048576]
@@ -215,10 +263,10 @@ models:
               online_quant_config: '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","*expert*"]}'
           prefill:
             workers: 1
-            tp: 8
+            tp: 4
           decode:
             workers: 1
-            tp: 8
+            tp: 4
             cudagraph: none
           env:
             decode:
@@ -246,31 +294,6 @@ models:
             wait_router_timeout: 600
           run_eval: false
 
-        - <<: *glm52_agentic_tp8_tp8
-          name: glm-52-mxfp4-1p1d-tp8-agentic-1m-c2
-          concurrency: [2]
-
-        - <<: *glm52_agentic_tp8_tp8
-          name: glm-52-mxfp4-1p1d-tp8-agentic-1m-c4
-          concurrency: [4]
-
-        - <<: *glm52_agentic_tp8_tp8
-          name: glm-52-mxfp4-1p1d-tp8-agentic-1m-c8
-          concurrency: [8]
-
-        - &glm52_agentic_tp4_tp4
-          <<: *glm52_agentic_tp8_tp8
-          name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c1
-          display_topology: 1P1D-TP4-agentic
-          pd_worker_layout: multi_node
-          prefill:
-            workers: 1
-            tp: 4
-          decode:
-            workers: 1
-            tp: 4
-            cudagraph: none
-
         - <<: *glm52_agentic_tp4_tp4
           name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c2
           concurrency: [2]
@@ -283,39 +306,64 @@ models:
           name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c8
           concurrency: [8]
 
-        - &glm52_agentic_tp4_tp8
-          <<: *glm52_agentic_tp8_tp8
-          name: glm-52-mxfp4-1p1d-tp4-tp8-agentic-1m-c1
-          display_topology: 1P1D-TP4-TP8-agentic
+        - <<: *glm52_agentic_tp4_tp4
+          name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c48
+          concurrency: [48]
+
+        - &glm52_agentic_lmcache
+          <<: *glm52_agentic_tp4_tp4
+          name: glm-52-mxfp4-1p1d-tp8-dpa-agentic-lmcache-1m-c48
+          topology: 1p1d_dpa
+          concurrency: [48]
           prefill:
             workers: 1
-            tp: 4
-
-        - <<: *glm52_agentic_tp4_tp8
-          name: glm-52-mxfp4-1p1d-tp4-tp8-agentic-1m-c2
-          concurrency: [2]
-
-        - <<: *glm52_agentic_tp4_tp8
-          name: glm-52-mxfp4-1p1d-tp4-tp8-agentic-1m-c4
-          concurrency: [4]
-
-        - <<: *glm52_agentic_tp4_tp8
-          name: glm-52-mxfp4-1p1d-tp4-tp8-agentic-1m-c8
-          concurrency: [8]
-
-        - <<: *glm52_agentic_tp8_tp8
-          name: glm-52-mxfp4-1p2d-tp4-agentic-1m-c2
-          topology: 1p2d
-          display_topology: 1P2D-TP4-agentic
-          pd_worker_layout: decode_single_node
-          concurrency: [2]
-          prefill:
-            workers: 1
-            tp: 4
+            tp: 8
+            extra_args: >-
+              --enable-dp-attention
+              --enable-tbo
+              --attn-prefill-chunk-size 131072
+              --long-prefill-token-threshold 131072
           decode:
-            workers: 2
-            tp: 4
+            workers: 1
+            tp: 8
             cudagraph: none
+            extra_args: "--enable-dp-attention --enable-tbo"
+          env: &glm52_agentic_lmcache_env
+            common: &glm52_agentic_lmcache_common_env
+              PYTHONHASHSEED: "0"
+            prefill: &glm52_agentic_lmcache_prefill_env
+              LMCACHE_LOCAL_CPU: "True"
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "200"
+              LMCACHE_CHUNK_SIZE: "256"
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":6301},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
+            decode: &glm52_agentic_lmcache_decode_env
+              MAX_JOBS: "16"
+
+        - <<: *glm52_agentic_lmcache
+          name: glm-52-mxfp4-1p1d-tp4-pcp2-agentic-lmcache-1m-c48
+          topology: 1p1d-tp4-pcp2
+          pd_worker_layout: multi_node
+          concurrency: [48]
+          prefill:
+            workers: 1
+            tp: 4
+            extra_args: >-
+              --prefill-context-parallel-size 2
+              --attn-prefill-chunk-size 131072
+              --long-prefill-token-threshold 131072
+          decode:
+            workers: 1
+            tp: 8
+            cudagraph: none
+          env:
+            common:
+              <<: *glm52_agentic_lmcache_common_env
+            prefill:
+              <<: *glm52_agentic_lmcache_prefill_env
+              HIP_VISIBLE_DEVICES: "0,1,2,3,4,5,6,7"
+            decode:
+              <<: *glm52_agentic_lmcache_decode_env
 
     accuracy:
       task: gsm8k
@@ -340,6 +388,7 @@ models:
         trust_remote_code: true
         kv_cache_dtype: fp8
         block_size: 16
+        enable_prefix_caching: false
         gpu_memory_utilization: 0.9
         max_num_seqs: 256
         max_num_batched_tokens: 32768
@@ -469,6 +518,7 @@ models:
         trust_remote_code: true
         kv_cache_dtype: fp8
         block_size: 128
+        enable_prefix_caching: false
         gpu_memory_utilization: 0.8
         max_model_len: 32768
         max_num_seqs: 256
@@ -608,6 +658,7 @@ models:
         trust_remote_code: true
         kv_cache_dtype: fp8
         block_size: 128
+        enable_prefix_caching: false
         gpu_memory_utilization: 0.8
         max_model_len: 32768
         max_num_seqs: 256
