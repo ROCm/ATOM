@@ -1,21 +1,20 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-"""SparseKV coordinator: CPU cold pool + GPU hot buffer for DSA decode.
+"""SparseKV coordinator: paged CPU cold pool + GPU hot buffer for DSA decode.
 
 GLM-5.2 (DSA) decode only reads the indexer's top-k tokens each step, but the
 full KV cache otherwise occupies GPU HBM. SparseKV keeps the complete KV in a
-CPU pinned cold pool and only a fixed-size hot buffer per request on the GPU.
-Each decode step, for every layer: miss-detect the top-k against the resident
-hot set, evict the least-recently-used slots, swap the missing tokens in from
-the cold pool, and translate the top-k into hot-buffer slots so MLA attention
-reads the hot buffer.
+paged shared CPU pinned cold pool and only a fixed-size hot buffer per request
+on the GPU. Each decode step, for every layer: miss-detect the top-k against
+the resident hot set, evict the least-recently-used slots, swap the missing
+tokens in from the cold pool, and translate the top-k into hot-buffer slots so
+MLA attention reads the hot buffer.
 
 Index domain is LOGICAL: miss-detect runs on the indexer's per-request logical
 top-k positions (``0..context_len``), not physical paged-KV slots. The cold pool
-is stored densely by logical position; ``translate`` maps logical top-k to hot
-slots. This matches the design doc Appendix A experiments (per-token LRU on
-logical top-k indices).
+is a paged shared host pool addressed via ``req_to_host_pool``; ``translate``
+maps logical top-k to hot-buffer slots.
 
 The pure bookkeeping (miss-detect + LRU allocate + translate) is separated from
 the GPU data movement so it is testable without a GPU. Only :meth:`swap_in_for_layer`
@@ -60,7 +59,6 @@ class SparseKVCoordinator:
         device: torch.device | str = "cuda",
         index_topk: int | None = None,
         shared_index_layers: list[bool] | None = None,
-        rdma_direct: bool = False,
         host_to_device_ratio: int = 8,
         page_size: int = 16,
     ):
@@ -78,38 +76,27 @@ class SparseKVCoordinator:
         R = max_num_seqs
         C = max_context_len
 
-        # RDMA-direct (Stage D): the cold pool is a paged shared host pool, RDMA'd
-        # into directly by prefill and addressed through the req_to_host_pool table
-        # (host memory scales with actual sequence length). Off: the dense
-        # per-request cold pool [num_layers, R*C, kv_dim] (unchanged from Phase 0).
-        self.rdma_direct = bool(rdma_direct)
         self.host_page_size = page_size
 
-        if self.rdma_direct:
-            # Table stride: max logical positions per request, padded to a whole
-            # number of pages so a request's page-crossing stays page-aligned.
-            self.table_stride = ((C + page_size - 1) // page_size) * page_size
-            # Shared host pool sized as a multiple of the GPU hot-buffer total
-            # capacity; requests allocate pages on demand from a common free pool.
-            host_tokens = host_to_device_ratio * R * H1
-            self.num_host_pages = max(1, (host_tokens + page_size - 1) // page_size)
-            num_host_slots = self.num_host_pages * page_size
-            self.cold_pool = torch.zeros(
-                (num_layers, num_host_slots, kv_dim), dtype=kv_dtype, pin_memory=True
-            )
-            # req_to_host_pool: logical token -> flat host slot (-1 = unallocated).
-            self.req_to_host_pool = torch.full(
-                (R, self.table_stride), _EMPTY, dtype=torch.int32, device=self.device
-            )
-            self._free_host_pages: list[int] = list(range(self.num_host_pages))
-            self._req_pages: dict[int, list[int]] = {}
-            self._req_host_alloc_len = [0] * R
-        else:
-            # CPU cold pool: [num_layers, R * C, kv_dim], pinned so the swap kernel
-            # can gather from it directly (via a device-mapped pointer, see below).
-            self.cold_pool = torch.zeros(
-                (num_layers, R * C, kv_dim), dtype=kv_dtype, pin_memory=True
-            )
+        # Table stride: max logical positions per request, padded to a whole
+        # number of pages so a request's page-crossing stays page-aligned.
+        self.table_stride = ((C + page_size - 1) // page_size) * page_size
+        # Shared host pool sized as a multiple of the GPU hot-buffer total
+        # capacity; requests allocate pages on demand from a common free pool.
+        host_tokens = host_to_device_ratio * R * H1
+        self.num_host_pages = max(1, (host_tokens + page_size - 1) // page_size)
+        num_host_slots = self.num_host_pages * page_size
+        self.cold_pool = torch.zeros(
+            (num_layers, num_host_slots, kv_dim), dtype=kv_dtype, pin_memory=True
+        )
+        # req_to_host_pool: logical token -> flat host slot (-1 = unallocated).
+        self.req_to_host_pool = torch.full(
+            (R, self.table_stride), _EMPTY, dtype=torch.int32, device=self.device
+        )
+        self._free_host_pages: list[int] = list(range(self.num_host_pages))
+        self._req_pages: dict[int, list[int]] = {}
+        self._req_host_alloc_len = [0] * R
+
         # GPU hot buffer: [num_layers, R * H1, kv_dim].
         self.hot_buffer = torch.zeros(
             (num_layers, R * H1, kv_dim), dtype=kv_dtype, device=self.device
@@ -119,19 +106,11 @@ class SparseKVCoordinator:
         # a raw host VA faults). Filled lazily on first swap.
         self._cold_dev_ptr: list[int | None] = [None] * num_layers
 
-        # Paged-host translation table (req_to_host_pool): logical token -> host
-        # slot, consulted by the swap kernels when RDMA-direct paging is active.
-        # ``None`` (default) means the cold pool is the dense per-request layout
-        # (row = req_slot*max_context_len + logical); the kernels then receive an
-        # empty tensor + stride 0 and fall back to dense addressing, byte-identical
-        # to the pre-paging path. Wired to a real table by the RDMA-direct setup.
+        # Paged-host translation table: logical token -> host slot, consulted by
+        # the swap kernels to indirect through the page table.
         self._empty_host_locs = torch.empty(0, dtype=torch.int32, device=self.device)
-        if self.rdma_direct:
-            self._host_cache_locs: torch.Tensor | None = self.req_to_host_pool
-            self._host_stride = self.table_stride
-        else:
-            self._host_cache_locs = None
-            self._host_stride = 0
+        self._host_cache_locs: torch.Tensor | None = self.req_to_host_pool
+        self._host_stride = self.table_stride
 
         # Per (layer, request, slot) bookkeeping. Lives on ``device`` so the
         # fused swap kernel reads/writes it without any host sync; the pure-Python
@@ -336,8 +315,7 @@ class SparseKVCoordinator:
         self.slot_token[:, req_slot, :] = _EMPTY
         self.last_used[:, req_slot, :] = _EMPTY
         self.token_to_slot[:, req_slot, :] = _EMPTY
-        if self.rdma_direct:
-            self.free_host_pages(req_slot)
+        self.free_host_pages(req_slot)
 
     # ------------------------------------------------------------------
     # request-id (stable) management — worker-side, keyed by ScheduledBatch ids
@@ -370,7 +348,6 @@ class SparseKVCoordinator:
         straight into this request's freshly allocated host pages. The hot buffer
         is preloaded later, on the request's first decode (see maybe_first_hot_load).
         """
-        assert self.rdma_direct
         slot = self.acquire(req_id, num_tokens)
         self.alloc_host_pages(slot, 0, num_tokens)
         self._awaiting_first_decode.add(req_id)
@@ -382,7 +359,7 @@ class SparseKVCoordinator:
         Idempotent per request id: the prompt KV is already in the cold pool (RDMA),
         so this just seeds the resident hot set from it once.
         """
-        if not self.rdma_direct or req_id in self._hot_loaded:
+        if req_id in self._hot_loaded:
             return
         slot = self._reqid_to_slot.get(req_id)
         if slot is None:
@@ -448,7 +425,6 @@ class SparseKVCoordinator:
         contiguous: ``start_pos`` must not exceed the request's already-backed
         length. Raises if the shared pool is exhausted (admission back-pressure).
         """
-        assert self.rdma_direct
         if num_tokens <= 0:
             return
         page = self.host_page_size
@@ -481,8 +457,6 @@ class SparseKVCoordinator:
 
     def free_host_pages(self, req_slot: int) -> None:
         """Return a request's host pages to the shared free pool and clear its row."""
-        if not self.rdma_direct:
-            return
         pages = self._req_pages.pop(req_slot, None)
         if pages:
             self._free_host_pages.extend(pages)
@@ -499,14 +473,9 @@ class SparseKVCoordinator:
         address scatter on an already-allocated tensor, so the captured forward that
         follows reads it correctly).
         """
-        if not self.rdma_direct:
-            return
         for r, pos in zip(req_slots, positions):
             if pos >= 0:
                 self.alloc_host_pages(r, pos, 1)
-
-    def _cold_base(self, req_slot: int) -> int:
-        return req_slot * self.max_context_len
 
     def _hot_base(self, req_slot: int) -> int:
         return req_slot * self.padded_hot_size
@@ -532,27 +501,21 @@ class SparseKVCoordinator:
         token_phys_slots: torch.Tensor,
         num_tokens: int,
     ) -> None:
-        """Copy a request's full KV from the GPU cache into the CPU cold pool.
+        """Copy a request's full KV from the GPU cache into the paged cold pool.
 
         ``gpu_kv_cache`` is ``[num_layers, num_blocks, block_size, kv_dim]``.
         ``token_phys_slots[i]`` is the physical slot (``block*block_size+offset``)
-        of logical token ``i`` in the flattened per-layer cache. The cold pool
-        stores tokens densely by logical position.
-
-        RDMA-direct: the prompt KV was written straight into the host pool by
-        prefill (first version forces a full transfer, off=0), so there is nothing
-        to stage from the GPU — this is a no-op.
+        of logical token ``i`` in the flattened per-layer cache. Allocates host
+        pages for the logical range and scatters into the paged pool via
+        ``req_to_host_pool``.
         """
-        if self.rdma_direct:
-            return
+        self.alloc_host_pages(req_slot, 0, num_tokens)
         phys = token_phys_slots[:num_tokens].to(gpu_kv_cache.device, dtype=torch.long)
-        base = self._cold_base(req_slot)
+        host_slots = self.req_to_host_pool[req_slot, :num_tokens].to(torch.long)
         for layer_id in range(self.num_layers):
             layer_cache = gpu_kv_cache[layer_id].reshape(-1, self.kv_dim)
             gathered = layer_cache.index_select(0, phys)  # [num_tokens, kv_dim]
-            self.cold_pool[layer_id, base : base + num_tokens].copy_(
-                gathered, non_blocking=False
-            )
+            self.cold_pool[layer_id, host_slots] = gathered.to(self.cold_pool.dtype)
 
     def load_initial_hot_set(self, req_slot: int, num_tokens: int) -> None:
         """Preload the most recent min(H, num_tokens) tokens into the hot buffer."""
@@ -569,12 +532,7 @@ class SparseKVCoordinator:
         # above the initial hot set (all initial tokens share this baseline tick).
         self.recency[req_slot] = self._tick
         hot_base = self._hot_base(req_slot)
-        if self.rdma_direct:
-            # Paged: the cold-pool source rows are the host slots the RDMA wrote to,
-            # read from the translation table (populated at admit by alloc_host_pages).
-            src = self.req_to_host_pool[req_slot, start_tok:num_tokens]
-        else:
-            src = self._cold_base(req_slot) + tokens
+        src = self.req_to_host_pool[req_slot, start_tok:num_tokens]
         dst = hot_base + slots
         for layer_id in range(self.num_layers):
             # bookkeeping
@@ -608,7 +566,7 @@ class SparseKVCoordinator:
         """
         self._tick += 1
         tick = self._tick
-        cold_base = self._cold_base(req_slot)
+        host_locs = self.req_to_host_pool[req_slot]
         hot_base = self._hot_base(req_slot)
 
         topk = topk_logical.to(torch.int64)
@@ -651,7 +609,7 @@ class SparseKVCoordinator:
             self.slot_token[layer_id, req_slot, chosen] = miss_tokens_i32
             self.last_used[layer_id, req_slot, chosen] = tick
             self.token_to_slot[layer_id, req_slot, miss_tokens] = chosen_i32
-            src_locs = (cold_base + miss_tokens_i32).to(torch.int32)
+            src_locs = host_locs[miss_tokens].to(torch.int32)
             dst_locs = (hot_base + chosen_i32).to(torch.int32)
 
         # translate every top-k entry to its (now-resident) hot ABSOLUTE row
@@ -871,11 +829,8 @@ class SparseKVCoordinator:
         high recency (it will likely be selected next step).
         """
         assert logical_pos < self.max_context_len
-        if self.rdma_direct:
-            self.alloc_host_pages(req_slot, logical_pos, 1)
-            cold_row = int(self.req_to_host_pool[req_slot, logical_pos].item())
-        else:
-            cold_row = self._cold_base(req_slot) + logical_pos
+        self.alloc_host_pages(req_slot, logical_pos, 1)
+        cold_row = int(self.req_to_host_pool[req_slot, logical_pos].item())
         self.cold_pool[layer_id, cold_row].copy_(
             new_token_kv.reshape(self.kv_dim).to(self.cold_pool.dtype)
         )

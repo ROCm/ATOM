@@ -72,27 +72,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_SPARSEKV_HOT_BUFFER_SIZE": lambda: int(
         os.getenv("ATOM_SPARSEKV_HOT_BUFFER_SIZE", "8192")
     ),
-    # Use the fused GPU swap kernel (miss-detect + LRU + swap + translate, no host
-    # sync, CUDAGraph-capturable). Off falls back to the Phase-0 reference path
-    # (eager, host-synced) for bisection. MTP verify always uses the reference.
-    "ATOM_SPARSEKV_FUSED": lambda: os.getenv("ATOM_SPARSEKV_FUSED", "1") == "1",
     # IndexShare prefetch (Stage C): overlap a full-layer group's shared-layer KV
     # swap-in with compute on a side stream. Off (default) keeps per-layer
     # synchronous swap-in. Auto-disabled under pipeline parallelism / spec decode.
     "ATOM_SPARSEKV_PREFETCH": lambda: os.getenv("ATOM_SPARSEKV_PREFETCH", "0") == "1",
-    # RDMA-direct (Stage D): on the PD decode node, register the pinned host cold
-    # pool as the RDMA target so prefill writes KV straight into it, skipping the
-    # GPU->cold staging copy. Switches the cold pool from the dense per-request
-    # layout to a paged shared host pool addressed via a req_to_host_pool table
-    # (so host memory scales with actual sequence length, not max_num_seqs ×
-    # max_model_len). Off (default) keeps the dense cold pool, byte-identical.
-    "ATOM_SPARSEKV_RDMA_DIRECT": lambda: os.getenv("ATOM_SPARSEKV_RDMA_DIRECT", "0")
-    == "1",
     # Paged host cold-pool capacity as a multiple of the GPU hot-buffer total
-    # capacity (max_num_seqs × (hot_buffer_size+1)), SGLang host_to_device_ratio
-    # style. The shared host pool holds this many tokens; requests allocate pages
-    # on demand and admission back-pressures when the pool is full. Only used when
-    # ATOM_SPARSEKV_RDMA_DIRECT=1.
+    # capacity (max_num_seqs × (hot_buffer_size+1)). The shared host pool holds
+    # this many tokens; requests allocate pages on demand and admission
+    # back-pressures when the pool is full.
     "ATOM_SPARSEKV_HOST_TO_DEVICE_RATIO": lambda: int(
         os.getenv("ATOM_SPARSEKV_HOST_TO_DEVICE_RATIO", "8")
     ),

@@ -1145,23 +1145,18 @@ class MLAAttention(nn.Module):
         sparse_kv_indptr: torch.Tensor,
         hs_slots: torch.Tensor,
     ) -> torch.Tensor:
-        """Dispatch to the fused GPU hot path, or the reference path for MTP/debug.
+        """Dispatch to the fused GPU hot path, or the reference path for MTP.
 
-        The fused path (default on GPU, single query token per request) runs the
-        whole per-layer step — new-token backup, miss-detect, LRU evict, swap-in,
+        The fused path (GPU, single query token per request) runs the whole
+        per-layer step — new-token backup, miss-detect, LRU evict, swap-in,
         translate — in two aiter kernels with no host sync (CUDAGraph-capturable).
-        MTP verify (``max_seqlen_q > 1``), CPU, or ``ATOM_SPARSEKV_FUSED=0`` fall
-        back to the Phase-0 reference, which is always correct.
+        MTP verify (``max_seqlen_q > 1``) falls back to the reference path.
         """
         coord = self._sparsekv_coord
         layer_id = self._sparsekv_layer_id
         n = int(sparse_kv_indptr.shape[0]) - 1
 
-        use_fused = (
-            coord.hot_buffer.is_cuda
-            and envs.ATOM_SPARSEKV_FUSED
-            and attn_metadata.max_seqlen_q == 1
-        )
+        use_fused = coord.hot_buffer.is_cuda and attn_metadata.max_seqlen_q == 1
         if use_fused:
             # req_slots / token_pos / src_slots / indptr all live in the kernel's
             # int32 domain as fixed-address persistent buffers — slice (a view, no

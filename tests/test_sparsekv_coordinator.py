@@ -15,7 +15,7 @@ import torch
 from atom.sparsekv.coordinator import _EMPTY, SparseKVCoordinator
 
 
-def _make(num_layers=1, max_num_seqs=2, hot=4, max_ctx=32, kv_dim=8):
+def _make(num_layers=1, max_num_seqs=2, hot=4, max_ctx=32, kv_dim=8, ratio=8, page=16):
     return SparseKVCoordinator(
         num_layers=num_layers,
         max_num_seqs=max_num_seqs,
@@ -24,6 +24,8 @@ def _make(num_layers=1, max_num_seqs=2, hot=4, max_ctx=32, kv_dim=8):
         kv_dim=kv_dim,
         kv_dtype=torch.bfloat16,
         device="cpu",
+        host_to_device_ratio=ratio,
+        page_size=page,
     )
 
 
@@ -57,10 +59,12 @@ def test_all_hit_no_swap():
 def test_cold_start_all_miss():
     c = _make(hot=4)
     c.register_request(0, 10)
+    c.alloc_host_pages(0, 0, 10)
     topk = torch.tensor([1, 2, 3], dtype=torch.int32)
     src, dst, tr = c.plan_swap_for_request(0, 0, topk)
     # all three are misses, land in empty slots
-    assert sorted(src.tolist()) == [c._cold_base(0) + t for t in [1, 2, 3]]
+    expected = sorted(int(c.req_to_host_pool[0, t].item()) for t in [1, 2, 3])
+    assert sorted(src.tolist()) == expected
     assert src.numel() == 3 and dst.numel() == 3
     # every top-k entry now resolves to a resident hot slot
     for t in [1, 2, 3]:
@@ -68,8 +72,9 @@ def test_cold_start_all_miss():
 
 
 def test_lru_eviction_picks_stale():
-    c = _make(hot=3)  # 3 + 1 padded = 4 physical slots
+    c = _make(hot=3, max_ctx=32)  # 3 + 1 padded = 4 physical slots
     c.register_request(0, 20)
+    c.alloc_host_pages(0, 0, 21)
     # fill all 4 slots with tokens 10,11,12,13 at increasing recency
     for i, tok in enumerate([10, 11, 12, 13]):
         c.slot_token[0, 0, i] = tok
@@ -85,8 +90,9 @@ def test_lru_eviction_picks_stale():
 
 
 def test_hit_refreshes_recency_protects_from_eviction():
-    c = _make(hot=3)
+    c = _make(hot=3, max_ctx=32)
     c.register_request(0, 20)
+    c.alloc_host_pages(0, 0, 21)
     for i, tok in enumerate([10, 11, 12, 13]):
         c.slot_token[0, 0, i] = tok
         c.last_used[0, 0, i] = i + 1
@@ -116,6 +122,7 @@ def test_padding_entries_ignored():
 def test_duplicate_topk_tokens_dedup_misses():
     c = _make()
     c.register_request(0, 10)
+    c.alloc_host_pages(0, 0, 10)
     topk = torch.tensor([3, 3, 3], dtype=torch.int32)
     src, dst, tr = c.plan_swap_for_request(0, 0, topk)
     assert src.numel() == 1  # deduped to a single swap
@@ -127,6 +134,7 @@ def test_duplicate_topk_tokens_dedup_misses():
 def test_request_lifecycle_reset():
     c = _make()
     c.register_request(0, 10)
+    c.alloc_host_pages(0, 0, 10)
     _seed_resident(c, 0, 0, [1, 2, 3])
     c.unregister_request(0)
     assert not c.slot_active[0].item()
@@ -134,6 +142,7 @@ def test_request_lifecycle_reset():
     assert (c.token_to_slot[:, 0, :] == _EMPTY).all()
     # re-register reuses the slot cleanly
     c.register_request(0, 5)
+    c.alloc_host_pages(0, 0, 5)
     topk = torch.tensor([1], dtype=torch.int32)
     src, _, _ = c.plan_swap_for_request(0, 0, topk)
     assert src.numel() == 1  # token 1 no longer resident -> miss
@@ -142,6 +151,7 @@ def test_request_lifecycle_reset():
 def test_per_layer_independent_state():
     c = _make(num_layers=2)
     c.register_request(0, 10)
+    c.alloc_host_pages(0, 0, 10)
     _seed_resident(c, 0, 0, [7])  # resident only in layer 0
     topk = torch.tensor([7], dtype=torch.int32)
     src0, _, _ = c.plan_swap_for_request(0, 0, topk)
@@ -157,8 +167,9 @@ def test_backup_new_token_makes_resident():
     c.backup_new_token(req_slot=0, layer_id=0, new_token_kv=kv, logical_pos=10)
     assert c.token_to_slot[0, 0, 10].item() >= 0
     assert c.context_len[0].item() == 11
-    # cold pool row written
-    row = c.cold_pool[0, c._cold_base(0) + 10]
+    # cold pool row written (via paged host pool)
+    cold_row = int(c.req_to_host_pool[0, 10].item())
+    row = c.cold_pool[0, cold_row]
     assert torch.allclose(row.float(), torch.ones_like(row.float()))
 
 
@@ -200,21 +211,18 @@ def test_sync_active_releases_departed_requests():
     assert sorted(c._free_slots) == sorted(set(range(4)) - {c.slot_for_req(11)})
 
 
-# --- Stage D: paged host pool (RDMA-direct) allocator -------------------------
+# --- paged host pool allocator ------------------------------------------------
 
 
 def _make_paged(max_num_seqs=2, hot=4, max_ctx=48, kv_dim=8, ratio=8, page=16):
-    return SparseKVCoordinator(
+    return _make(
         num_layers=1,
         max_num_seqs=max_num_seqs,
-        hot_buffer_size=hot,
-        max_context_len=max_ctx,
+        hot=hot,
+        max_ctx=max_ctx,
         kv_dim=kv_dim,
-        kv_dtype=torch.bfloat16,
-        device="cpu",
-        rdma_direct=True,
-        host_to_device_ratio=ratio,
-        page_size=page,
+        ratio=ratio,
+        page=page,
     )
 
 
@@ -295,11 +303,10 @@ def test_paged_alloc_exhaustion_raises():
     not torch.cuda.is_available(), reason="fused swap kernel needs a GPU + aiter"
 )
 def test_paged_fused_swap_matches_token_data():
-    """RDMA-direct paged path: the table-lookup gather returns each top-k's KV.
+    """Paged path: the table-lookup gather returns each top-k's KV.
 
-    Mirrors test_fused_swap_data_movement_matches_cold_pool but with the paged host
-    pool: token t's KV lives at host slot req_to_host_pool[slot][t] (not row t), so a
-    correct kernel must indirect through the table.
+    Token t's KV lives at host slot req_to_host_pool[slot][t], so a correct kernel
+    must indirect through the page table.
     """
     dev = "cuda"
     L, R, H, C, D = 1, 1, 4, 48, 8
@@ -311,7 +318,6 @@ def test_paged_fused_swap_matches_token_data():
         kv_dim=D,
         kv_dtype=torch.bfloat16,
         device=dev,
-        rdma_direct=True,
         host_to_device_ratio=8,
         page_size=16,
     )
@@ -350,7 +356,6 @@ def test_paged_fused_backup_writes_via_table():
         kv_dim=D,
         kv_dtype=torch.bfloat16,
         device=dev,
-        rdma_direct=True,
         host_to_device_ratio=8,
         page_size=16,
     )
@@ -393,11 +398,15 @@ def test_fused_swap_data_movement_matches_cold_pool():
         kv_dim=D,
         kv_dtype=torch.bfloat16,
         device=dev,
+        host_to_device_ratio=8,
+        page_size=16,
     )
+    slot = c.acquire(req_id=1, context_len=10)  # -> slot 0
+    c.alloc_host_pages(slot, 0, C)
     for t in range(C):  # cold pool row for token t is the constant t
-        c.cold_pool[0, t] = torch.full((D,), float(t), dtype=torch.bfloat16)
-    c.acquire(req_id=1, context_len=10)  # -> slot 0
-    c.load_initial_hot_set(0, 10)
+        hs = int(c.req_to_host_pool[slot, t].item())
+        c.cold_pool[0, hs] = torch.full((D,), float(t), dtype=torch.bfloat16)
+    c.load_initial_hot_set(slot, 10)
 
     K = 3
     for step in ([9, 8, 7], [6, 9, 5], [9, 8, 4], [3, 2, 1]):
@@ -427,9 +436,12 @@ def test_fused_backup_makes_new_token_resident():
         kv_dim=D,
         kv_dtype=torch.bfloat16,
         device=dev,
+        host_to_device_ratio=8,
+        page_size=16,
     )
-    c.acquire(req_id=1, context_len=5)
-    c.load_initial_hot_set(0, 5)
+    req_slot = c.acquire(req_id=1, context_len=5)
+    c.alloc_host_pages(req_slot, 0, 6)
+    c.load_initial_hot_set(req_slot, 5)
     # A fresh token at logical pos 5 lives at physical slot 5 of the layer cache.
     layer_kv = torch.zeros(64, D, dtype=torch.bfloat16, device=dev)
     layer_kv[5] = torch.full((D,), 42.0, dtype=torch.bfloat16)
@@ -437,16 +449,17 @@ def test_fused_backup_makes_new_token_resident():
         0,
         layer_kv,
         torch.tensor([5], dtype=torch.int32, device=dev),  # src slot
-        torch.tensor([0], dtype=torch.int32, device=dev),  # req slot
+        torch.tensor([req_slot], dtype=torch.int32, device=dev),  # req slot
         torch.tensor([5], dtype=torch.int32, device=dev),  # logical pos
     )
     torch.cuda.synchronize()
-    slot = int(c.token_to_slot[0, 0, 5].item())
+    slot = int(c.token_to_slot[0, req_slot, 5].item())
     assert slot >= 0
     assert torch.allclose(
         c.hot_buffer[0, slot].float(), torch.full((D,), 42.0, device=dev).float()
     )
-    assert torch.allclose(c.cold_pool[0, 5].float(), torch.full((D,), 42.0).float())
+    hs = int(c.req_to_host_pool[req_slot, 5].item())
+    assert torch.allclose(c.cold_pool[0, hs].float(), torch.full((D,), 42.0).float())
 
 
 def test_mtp_multi_token_batch_translate():
@@ -454,6 +467,7 @@ def test_mtp_multi_token_batch_translate():
     c = _make(hot=8, max_ctx=64)
     c._run_swap = lambda *a, **k: None  # CPU test: skip the GPU gather kernel
     c.register_request(0, 40)
+    c.alloc_host_pages(0, 0, 51)
     _seed_resident(c, 0, 0, [30, 31, 32, 33])
     # two query tokens, each with its own 3-wide top-k run
     out_translated = torch.zeros(6, dtype=torch.int32)
@@ -570,14 +584,18 @@ def test_prefetch_matches_per_layer_fused(monkeypatch):
             device=dev,
             index_topk=K,
             shared_index_layers=shared_layers,
+            host_to_device_ratio=8,
+            page_size=16,
         )
+        slot = c.acquire(req_id=1, context_len=10)
+        c.alloc_host_pages(slot, 0, C)
         for layer in range(L):  # distinct per-layer cold data: 100*layer + tok
             for t in range(C):
-                c.cold_pool[layer, t] = torch.full(
+                hs = int(c.req_to_host_pool[slot, t].item())
+                c.cold_pool[layer, hs] = torch.full(
                     (D,), float(100 * layer + t), dtype=torch.bfloat16
                 )
-        c.acquire(req_id=1, context_len=10)
-        c.load_initial_hot_set(0, 10)
+        c.load_initial_hot_set(slot, 10)
         return c
 
     ref = build(None)  # prefetch disabled -> per-layer fused every layer

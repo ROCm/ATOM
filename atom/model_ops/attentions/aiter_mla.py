@@ -916,7 +916,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 device="cuda",
                 index_topk=self.index_topk,
                 shared_index_layers=shared_index_layers,
-                rdma_direct=envs.ATOM_SPARSEKV_RDMA_DIRECT,
                 host_to_device_ratio=envs.ATOM_SPARSEKV_HOST_TO_DEVICE_RATIO,
                 page_size=self.model_runner.block_size,
             )
@@ -993,17 +992,16 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         if not hasattr(runner, "kv_cache"):
             return None
 
-        # SparseKV RDMA-direct: point the KV block regions at the pinned paged
-        # host cold pool so prefill RDMAs straight into it (one host page per
-        # logical block; page_size == block_size so the producer's db*bpb math is
+        # SparseKV: point the KV block regions at the pinned paged host cold
+        # pool so prefill RDMAs straight into it (one host page per logical
+        # block; page_size == block_size so the producer's db*bpb math is
         # unchanged). The index cache stays on GPU (the indexer needs it resident).
         coord = getattr(runner, "sparsekv_coordinator", None)
-        rdma_direct = coord is not None and getattr(coord, "rdma_direct", False)
 
         block_regions: list[KVTransferRegion] = []
         num_layers = runner.kv_cache.shape[0]
         for layer_id in range(num_layers):
-            if rdma_direct:
+            if coord is not None:
                 t = coord.cold_pool[layer_id]  # [num_host_slots, kv_dim] pinned host
                 bpb = coord.host_page_size * coord.item_size_bytes
             else:
@@ -1033,7 +1031,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             block_regions=block_regions,
             slot_regions=[],
             num_blocks=runner.config.num_kvcache_blocks,
-            sparsekv_coordinator=coord if rdma_direct else None,
+            sparsekv_coordinator=coord,
         )
 
     def prepare_prefill(self, batch: ScheduledBatch):
@@ -1848,11 +1846,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 else:
                     slots[s] = per_seq[s]
                     pos[s] = ctx_s - 1
-                    # RDMA-direct fused path: back this token's logical position with
-                    # a host page before the fused backup writes cold pool at
-                    # req_to_host_pool[r][pos] (eager, pre-forward -> capture-safe).
-                    if coord.rdma_direct:
-                        coord.alloc_host_pages(int(per_seq[s]), ctx_s - 1, 1)
+                    coord.alloc_host_pages(int(per_seq[s]), ctx_s - 1, 1)
             # Copy into the fixed-address GPU buffers (pinned staging, non-blocking)
             # so the captured fused hot path reads fresh values on every replay.
             attn_metadata.sparsekv_req_slots = self._sparsekv_req_slots.copy_to_gpu(
