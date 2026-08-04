@@ -1030,7 +1030,7 @@ def main() -> None:
     else:
         print(f"  batch size: {batch_size}")
     print(f"  query len: {q_len if q_len is not None else '?'}")
-    print("")
+    print()
     print("Matching capture graph:")
     print(f"  name: {graph.get('name')}")
     print(f"  ts: {graph.get('ts'):.3f}")
