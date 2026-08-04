@@ -441,8 +441,17 @@ jobs:
           printf '%s\n' "${job_ids}"
           mapfile -t job_id_list <<< "${job_ids}"
           for job_id in "${job_id_list[@]}"; do
-            "${scancel_cmd[@]}" "${job_id}"
-            echo "Finished cancelling Slurm job ${job_id}."
+            if timeout 60s "${scancel_cmd[@]}" "${job_id}"; then
+              echo "Finished cancelling Slurm job ${job_id}."
+            else
+              status=$?
+              if [[ "${status}" -eq 124 ]]; then
+                echo "ERROR: Timed out after 60 seconds cancelling Slurm job ${job_id}." >&2
+              else
+                echo "ERROR: Failed cancelling Slurm job ${job_id} with exit code ${status}." >&2
+              fi
+              exit "${status}"
+            fi
           done
 
       - name: Print benchmark config
