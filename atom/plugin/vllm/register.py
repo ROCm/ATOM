@@ -155,6 +155,14 @@ def register_platform() -> Optional[str]:
 
     _register_hf_configs()
     _register_mxfp8_quantization_config()
+    # DeepSeek-V4's packed proxy arena cannot immediately recycle block ids;
+    # install the targeted scheduler-side queue-order compatibility patch before
+    # any KVCacheManager is constructed.
+    from atom.plugin.vllm.deepseek_v4_prefix_patch import (
+        apply_vllm_v4_block_reuse_patch,
+    )
+
+    apply_vllm_v4_block_reuse_patch()
 
     # return the ATOM platform to vllm
     return "atom.plugin.vllm.platform.ATOMPlatform"
@@ -243,6 +251,13 @@ def register_model() -> None:
         return
 
     _set_plugin_mode()
+    # The general-plugin hook runs in the EngineCore process that owns the
+    # scheduler/KVCacheManager; install this here as well as in the platform hook.
+    from atom.plugin.vllm.deepseek_v4_prefix_patch import (
+        apply_vllm_v4_block_reuse_patch,
+    )
+
+    apply_vllm_v4_block_reuse_patch()
 
     from atom.plugin.vllm.gdn_backend import register_gdn_attention_backend
 

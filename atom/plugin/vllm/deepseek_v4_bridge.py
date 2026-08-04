@@ -513,6 +513,8 @@ class AtomDeepseekV4ProxyAttention(nn.Module, AttentionLayerBase):
     def __init__(self, prefix: str = ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME):
         super().__init__()
         self.prefix = prefix
+        self._atom_v4_proxy_layer = True
+        self._atom_v4_profiling_kv_cache = False
         self.kv_cache = torch.tensor([])
         self.impl = nn.Identity()
 
@@ -536,6 +538,11 @@ def register_deepseek_v4_proxy_layer(
     vllm_config,
     layer_name: str = ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME,
 ) -> AtomDeepseekV4ProxyAttention:
+    from atom.plugin.vllm.deepseek_v4_prefix_patch import (
+        apply_vllm_v4_profile_cache_patch,
+    )
+
+    apply_vllm_v4_profile_cache_patch()
     sfc = vllm_config.compilation_config.static_forward_context
     existing = sfc.get(layer_name)
     if isinstance(existing, AtomDeepseekV4ProxyAttention):
@@ -584,10 +591,10 @@ def _bind_compressor_state(
         )
     else:
         compressor.cache_scale = None
-    # #1600 contract: Compressor.forward selects its scatter path from
-    # `write_mode` (was: sniff kv_cache.dtype). The indexer-inner cache is always
-    # fp8 -> "indexer_fp8"; CSA/HCA Main is "bf16" or, under the fp8 2buff layout,
-    # "main_2buff_fp8" with a parallel bf16 RoPE pool bound via `kv_cache_rope`.
+    # Compressor.forward selects its scatter path from `quant_mode`. Keep the
+    # legacy write_mode attribute too for integrations that still consume it.
+    # The indexer-inner cache is per-row fp8; CSA/HCA Main is unquantized or,
+    # under the fp8 2buff layout, group-fp8 with a parallel bf16 RoPE pool.
     compressor.kv_cache_rope = kv_cache_rope
     compressor.write_mode = write_mode
     if is_indexer:
@@ -780,6 +787,8 @@ def bind_deepseek_v4_proxy_cache_views(
     if proxy is None or not isinstance(proxy, AtomDeepseekV4ProxyAttention):
         return False
     if not isinstance(proxy.kv_cache, torch.Tensor) or proxy.kv_cache.numel() == 0:
+        return False
+    if proxy._atom_v4_profiling_kv_cache:
         return False
     ptr = proxy.kv_cache.untyped_storage().data_ptr()
     if getattr(model, "_atom_vllm_v4_proxy_cache_ptr", None) == ptr:
@@ -1940,11 +1949,23 @@ def atom_deepseek_v4_forward_context(
         common_attn_metadata = get_deepseek_v4_proxy_metadata_from_vllm_context(
             proxy_layer_name
         )
-    # Fast path: the proxy metadata builder already built the ATOM metadata into
-    # persistent buffers (outside any captured region) and attached it. This is
-    # the only path that is CUDA/HIP-graph safe -- the captured forward merely
-    # reads it. The per-slot reset was already applied in build().
-    attn_metadata = getattr(common_attn_metadata, "atom_v4_md", None)
+    if force_dummy:
+        # vLLM 0.26 captures throwaway graphs while profiling memory with a
+        # deliberately minimal KV cache. V4 attention short-circuits when
+        # Context.is_dummy_run is set, so avoid building real metadata here:
+        # that fallback allocates and copies tensors, which HIP forbids inside
+        # stream capture.
+        attn_metadata = SimpleNamespace(
+            state=SimpleNamespace(value="profile"),
+            in_hipgraph=False,
+        )
+    else:
+        # Fast path: the proxy metadata builder already built the ATOM metadata
+        # into persistent buffers (outside any captured region) and attached it.
+        # This is the only path that is CUDA/HIP-graph safe -- the captured
+        # forward merely reads it. The per-slot reset was already applied in
+        # build().
+        attn_metadata = getattr(common_attn_metadata, "atom_v4_md", None)
     if attn_metadata is None:
         # Fallback (profiling / dummy / standalone, before the proxy cache is
         # bound): build inline with fresh tensors. Never captured.
@@ -1974,10 +1995,11 @@ def atom_deepseek_v4_forward_context(
             reset_slots = getattr(attn_metadata, "reset_slots", None)
             if reset_slots:
                 reset_deepseek_v4_state_slots(state_model, reset_slots)
-    in_hipgraph = bool(getattr(attn_metadata, "in_hipgraph", False)) or (
-        _is_vllm_decode_graph_phase(attn_metadata, atom_config)
+    in_hipgraph = not force_dummy and (
+        bool(getattr(attn_metadata, "in_hipgraph", False))
+        or _is_vllm_decode_graph_phase(attn_metadata, atom_config)
     )
-    is_prefill = attn_metadata.state.value.startswith("prefill")
+    is_prefill = not force_dummy and attn_metadata.state.value.startswith("prefill")
     batch_size = int(
         getattr(common_attn_metadata, "num_reqs", 0)
         or (input_ids.shape[0] if input_ids is not None else 0)
