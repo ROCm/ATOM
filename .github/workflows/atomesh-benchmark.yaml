@@ -399,6 +399,7 @@ jobs:
           SLURM_SUBMIT_RUNNER: ${{ matrix.runner.slurm_submit_runner }}
         run: |
           set -euo pipefail
+          export PATH="/usr/local/slurm-24.05.5.1/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
 
           if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
             echo "Slurm job cleanup is disabled for ${SLURM_SUBMIT_RUNNER}; skipping."
@@ -409,6 +410,13 @@ jobs:
             echo "No explicit benchmark nodes were selected; skipping Slurm job cleanup."
             exit 0
           fi
+
+          for command_name in squeue scancel; do
+            if ! command -v "${command_name}" >/dev/null 2>&1; then
+              echo "ERROR: ${command_name} not found on $(hostname). PATH=${PATH}" >&2
+              exit 127
+            fi
+          done
 
           squeue_cmd=(squeue)
           scancel_cmd=(scancel)
