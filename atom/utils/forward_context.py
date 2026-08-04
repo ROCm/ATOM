@@ -11,7 +11,7 @@ from typing import Any, Union
 import numpy as np
 import torch
 
-from atom.config import Config, KVCacheTensor, ParallelConfig
+from atom.config import Config, CUDAGraphMode, KVCacheTensor, ParallelConfig
 
 
 class AttnState(Enum):
@@ -598,6 +598,57 @@ def get_forward_context() -> ForwardContext:
         "Please use `set_forward_context` to set the forward context."
     )
     return _forward_context
+
+
+def _normalize_cudagraph_runtime_mode(mode: Any) -> CUDAGraphMode | None:
+    """Normalize a frontend runtime mode to ATOM's concrete enum.
+
+    Frontends own their graph dispatch and therefore use distinct enum
+    classes.  Match by name rather than value so their enum layouts can evolve
+    independently.  Composite configuration modes are deliberately rejected:
+    a forward context must describe the concrete NONE/PIECEWISE/FULL decision
+    for the current batch.
+    """
+    name = mode if isinstance(mode, str) else getattr(mode, "name", None)
+    if name not in {"NONE", "PIECEWISE", "FULL"}:
+        return None
+    return CUDAGraphMode[name]
+
+
+def get_current_cudagraph_runtime_mode() -> CUDAGraphMode:
+    """Return the concrete graph mode for the active model forward.
+
+    In vLLM plugin mode graph capture/replay is owned by vLLM, so its forward
+    context is authoritative.  Native ATOM records the same decision on its
+    own ForwardContext.  An unavailable/unknown context is treated as NONE:
+    eager dual-stream execution is valid, and some vLLM runners expose NONE
+    while a whole-model FULL graph is being captured.  Replay does not execute
+    this Python dispatcher.
+    """
+    from atom.plugin import is_vllm
+
+    if is_vllm():
+        try:
+            from vllm.forward_context import (
+                get_forward_context as get_vllm_forward_context,
+            )
+            from vllm.forward_context import (
+                is_forward_context_available,
+            )
+
+            if is_forward_context_available():
+                mode = _normalize_cudagraph_runtime_mode(
+                    get_vllm_forward_context().cudagraph_runtime_mode
+                )
+                if mode is not None:
+                    return mode
+        except (ImportError, AttributeError, AssertionError):
+            pass
+
+    mode = _normalize_cudagraph_runtime_mode(
+        getattr(get_forward_context(), "cudagraph_runtime_mode", None)
+    )
+    return mode if mode is not None else CUDAGraphMode.NONE
 
 
 def set_forward_context(
