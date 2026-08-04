@@ -12,11 +12,13 @@ from typing import Any
 import torch
 
 from atom.config import KVCacheTensor, get_current_atom_config
-from atom.model_ops.attention_gdn import GatedDeltaNet
+from atom.model_ops.attention_gdn import GatedDeltaNet, fused_gdn_gating
 from atom.model_ops.attentions.gdn_attn import (
     GDNAttentionMetadata,
     compute_causal_conv1d_metadata,
 )
+from atom.model_ops.fla_ops import fused_recurrent_gated_delta_rule
+from atom.model_ops.mamba_ops.causal_conv1d import causal_conv1d_update
 from atom.utils.forward_context import (
     AttentionMetaData,
     Context,
@@ -29,6 +31,138 @@ from atom.utils.forward_context import (
 logger = logging.getLogger(__name__)
 
 
+class SGLangGatedDeltaNet(GatedDeltaNet):
+    """Run ATOM GDN stepwise while filling SGLang's verify snapshots."""
+
+    def forward(
+        self,
+        mixed_qkv: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        core_attn_out: torch.Tensor,
+        layer_name: str,
+    ) -> torch.Tensor:
+        from atom.plugin.sglang.runtime import get_current_forward_batch
+
+        forward_batch = get_current_forward_batch()
+        if (
+            forward_batch is None
+            or not forward_batch.forward_mode.is_target_verify()
+        ):
+            return super().forward(
+                mixed_qkv, b, a, core_attn_out, layer_name
+            )
+
+        attn_backend = SGLangGDNForwardContext._resolve_attn_backend(
+            forward_batch
+        )
+        if attn_backend is None:
+            raise RuntimeError(
+                "ATOM Qwen3.5 TARGET_VERIFY requires an active SGLang "
+                "attention backend."
+            )
+        linear_backend = SGLangGDNForwardContext._linear_attn_backend(
+            attn_backend
+        )
+        if getattr(linear_backend, "forward_metadata", None) is None:
+            raise RuntimeError(
+                "ATOM Qwen3.5 TARGET_VERIFY requires initialized SGLang "
+                "GDN metadata."
+            )
+        req_to_token_pool = getattr(linear_backend, "req_to_token_pool", None)
+        if req_to_token_pool is None:
+            raise RuntimeError(
+                "ATOM Qwen3.5 TARGET_VERIFY requires the SGLang mamba pool."
+            )
+        layer_cache = req_to_token_pool.mamba2_layer_cache(self.layer_num)
+        if not hasattr(layer_cache, "intermediate_ssm") or not hasattr(
+            layer_cache, "intermediate_conv_window"
+        ):
+            raise RuntimeError(
+                "ATOM Qwen3.5 TARGET_VERIFY requires speculative GDN "
+                "intermediate-state buffers."
+            )
+
+        draft_token_num = int(forward_batch.spec_info.draft_token_num)
+        bs = int(forward_batch.batch_size)
+        cache_indices = linear_backend.forward_metadata.mamba_cache_indices[:bs]
+        query_start_loc = torch.arange(
+            bs + 1,
+            dtype=torch.int32,
+            device=mixed_qkv.device,
+        )
+        conv_states = layer_cache.conv[0]
+        ssm_states = layer_cache.temporal
+        conv_before = conv_states[cache_indices].clone()
+        ssm_before = ssm_states[cache_indices].clone()
+        mixed_blocks = mixed_qkv.view(bs, draft_token_num, -1)
+        a_blocks = a.view(bs, draft_token_num, -1)
+        b_blocks = b.view(bs, draft_token_num, -1)
+        output_blocks = core_attn_out.view(
+            bs, draft_token_num, *core_attn_out.shape[1:]
+        )
+        conv_weights = self.conv1d.weight.view(
+            self.conv1d.weight.size(0), self.conv1d.weight.size(-1)
+        )
+
+        try:
+            for step in range(draft_token_num):
+                query, key, value = causal_conv1d_update(
+                    mixed_blocks[:, step, :].contiguous(),
+                    conv_states,
+                    conv_weights,
+                    self.num_k_heads * self.head_k_dim // self.tp_size,
+                    self.num_v_heads * self.head_v_dim // self.tp_size,
+                    self.conv1d.bias,
+                    self.activation,
+                    conv_state_indices=cache_indices,
+                    validate_data=True,
+                )
+                query = query.view(
+                    1, bs, self.num_k_heads // self.tp_size, self.head_k_dim
+                )
+                key = key.view(
+                    1, bs, self.num_k_heads // self.tp_size, self.head_k_dim
+                )
+                value = value.view(
+                    1, bs, self.num_v_heads // self.tp_size, self.head_v_dim
+                )
+                g, beta = fused_gdn_gating(
+                    self.A_log,
+                    a_blocks[:, step, :],
+                    b_blocks[:, step, :],
+                    self.dt_bias,
+                )
+                step_output, _ = fused_recurrent_gated_delta_rule(
+                    q=query,
+                    k=key,
+                    v=value,
+                    g=g,
+                    beta=beta,
+                    initial_state=ssm_states,
+                    inplace_final_state=True,
+                    cu_seqlens=query_start_loc,
+                    ssm_state_indices=cache_indices,
+                    use_qk_l2norm_in_kernel=True,
+                )
+                output_blocks[:, step].copy_(step_output.squeeze(0))
+                layer_cache.intermediate_ssm[:bs, step].copy_(
+                    ssm_states[cache_indices]
+                )
+                layer_cache.intermediate_conv_window[0][:bs, step].copy_(
+                    conv_states[cache_indices]
+                )
+        finally:
+            conv_states[cache_indices] = conv_before
+            ssm_states[cache_indices] = ssm_before
+
+        if core_attn_out.shape != output_blocks.view_as(core_attn_out).shape:
+            raise RuntimeError(
+                "ATOM GDN TARGET_VERIFY produced an incompatible output shape."
+            )
+        return core_attn_out
+
+
 class GDNAttentionBackend:
     @staticmethod
     def get_name() -> str:
@@ -36,7 +170,7 @@ class GDNAttentionBackend:
 
     @staticmethod
     def get_impl_cls() -> type[GatedDeltaNet]:
-        return GatedDeltaNet
+        return SGLangGatedDeltaNet
 
 
 @dataclass(frozen=True)
@@ -44,7 +178,7 @@ class SGLangGDNForwardContext:
     """Precomputed ATOM forward-context state derived from SGLang metadata."""
 
     forward_batch: Any
-    gdn_metadata: GDNAttentionMetadata
+    gdn_metadata: GDNAttentionMetadata | None
     kv_cache_data: dict[str, KVCacheTensor]
     context: Context
     num_tokens: int
@@ -125,9 +259,17 @@ class SGLangGDNForwardContext:
     def _build_context(forward_batch: Any) -> tuple[Context, int]:
         mode = forward_batch.forward_mode
         is_prefill = mode.is_prefill()
-        num_tokens = (
-            forward_batch.seq_lens_sum if mode.is_extend() else forward_batch.batch_size
-        )
+        if mode.is_extend():
+            num_tokens = forward_batch.seq_lens_sum
+        elif mode.is_target_verify():
+            positions = forward_batch.positions
+            num_tokens = int(
+                positions.shape[-1]
+                if positions.ndim == 2
+                else positions.shape[0]
+            )
+        else:
+            num_tokens = forward_batch.batch_size
         return (
             Context(
                 positions=forward_batch.positions,
@@ -148,9 +290,9 @@ class SGLangGDNForwardContext:
 
         mode = forward_batch.forward_mode
         if mode.is_target_verify():
-            logger.warning(
-                "SGLang GDN forward context: TARGET_VERIFY is not supported; GDN metadata skipped."
-            )
+            # SGLangGatedDeltaNet fills SGLang's transactional snapshots using
+            # ATOM's stepwise kernels. Keep the outer ATOM context active for
+            # MoE, norms and collectives without native GDN metadata.
             return None
 
         device = fm.query_start_loc.device
@@ -231,7 +373,10 @@ class SGLangGDNForwardContext:
         cls._patch_forward_batch_pools(forward_batch, attn_backend)
         linear_backend = cls._linear_attn_backend(attn_backend)
         gdn_metadata = cls._build_gdn_metadata(forward_batch, linear_backend)
-        if gdn_metadata is None:
+        if (
+            gdn_metadata is None
+            and not forward_batch.forward_mode.is_target_verify()
+        ):
             return None
 
         kv_cache_data = cls._build_kv_cache_tensors(forward_batch, attn_backend)
