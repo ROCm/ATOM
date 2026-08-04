@@ -9,7 +9,7 @@ from dataclasses import fields
 from typing import Any, Dict, List, Optional, Union
 
 from atom.config import Config
-from atom.model_engine.engine_core_mgr import CoreManager
+from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
 from atom.model_engine.multimodal import get_mrope_input_positions
 from atom.model_engine.sequence import Sequence
 from atom.sampling_params import SamplingParams
@@ -122,11 +122,13 @@ class LLMEngine:
                     "ATOM_TBO_PREFILL_TOKEN_SPLIT is ignored under PCP: TBO "
                     "prefill uses request-boundary balanced grouping."
                 )
-        self.rquest_ids = set()
         self.io_processor = InputOutputProcessor(
             config, self.tokenizer, config.kv_cache_block_size
         )
-        self.core_mgr = CoreManager(config)
+        if config.enable_rapidserve:
+            self.core_mgr = DisaggCoreManager(config)
+        else:
+            self.core_mgr = CoreManager(config)
         self._step_lock = None
         self._pending_results = {}
         import json
@@ -377,6 +379,7 @@ class InputOutputProcessor:
                 "qwen3_next",
                 "qwen3_5_text",
                 "qwen3_5_moe_text",
+                "kimi_linear",
                 "deepseek_v4",
             }
         )

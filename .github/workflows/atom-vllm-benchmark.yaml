@@ -7,8 +7,8 @@ concurrency:
 
 on:
   schedule:
-    # Daily at 00:30 Beijing (16:30 UTC previous day): run the same model set every day.
-    - cron: '30 16 * * *'
+    # Mon/Wed/Fri at 23:30 Beijing (15:30 UTC).
+    - cron: '30 15 * * 1,3,5'
   workflow_dispatch:
     inputs:
       benchmark_client:
@@ -341,18 +341,24 @@ jobs:
           BENCHMARK_CLIENT="${INPUT_BENCHMARK_CLIENT:-InferenceMax bench}"
 
           mapfile -t VLLM_MET < <(python3 - <<'PY'
-          import re
           from pathlib import Path
 
-          text = Path(".github/workflows/docker-release.yaml").read_text(encoding="utf-8")
-          commit_match = re.search(r'^\s*VLLM_COMMIT:\s*"([^"]+)"', text, re.MULTILINE)
-          version_match = re.search(r'^\s*VLLM_VERSION:\s*"([^"]+)"', text, re.MULTILINE)
+          config = {}
+          for line in Path("atom/plugin/vllm/vllm-version.env").read_text(
+              encoding="utf-8"
+          ).splitlines():
+              key, separator, value = line.partition("=")
+              if separator and key:
+                  config[key] = value
 
-          if not commit_match or not version_match:
-              raise SystemExit("Failed to read VLLM_COMMIT/VLLM_VERSION from .github/workflows/docker-release.yaml")
+          try:
+              print(config["VLLM_COMMIT"])
+              print(config["VLLM_VERSION"])
+          except KeyError as error:
+              raise SystemExit(
+                  f"Missing {error.args[0]} in atom/plugin/vllm/vllm-version.env"
+              ) from error
 
-          print(commit_match.group(1))
-          print(version_match.group(1))
           PY
           )
 
@@ -428,7 +434,7 @@ jobs:
             printf -- '\nBecause an explicit `oot_image` input was provided, this run uses that image directly and skips branch-based rebuild logic.\n' \
               >> "$GITHUB_STEP_SUMMARY"
           elif [[ "${REBUILD_OOT_IMAGE}" == "true" ]]; then
-            printf -- '- Base image: `%s`\n- vLLM version: `%s`\n- vLLM commit: `%s`\n- vLLM source: `.github/workflows/docker-release.yaml`\n' \
+            printf -- '- Base image: `%s`\n- vLLM version: `%s`\n- vLLM commit: `%s`\n- vLLM source: `atom/plugin/vllm/vllm-version.env`\n' \
               "${OOT_BASE_IMAGE}" \
               "${SELECTED_VLLM_VERSION}" \
               "${SELECTED_VLLM_COMMIT}" >> "$GITHUB_STEP_SUMMARY"
@@ -1170,7 +1176,10 @@ jobs:
         run: |
           MODEL_CACHE_MOUNT=""
           MODEL_CACHE_DESC="container-local /models (no host cache mount)"
-          if [ -d "/it-share/models" ]; then
+          if [ -d "/shared_nfs/huggingface_models" ]; then
+            MODEL_CACHE_MOUNT="-v /shared_nfs/huggingface_models:/models"
+            MODEL_CACHE_DESC="/shared_nfs/huggingface_models (shared host path)"
+          elif [ -d "/it-share/models" ]; then
             MODEL_CACHE_MOUNT="-v /it-share/models:/models"
             MODEL_CACHE_DESC="/it-share/models (shared host path)"
           elif [ -d "/models" ]; then
@@ -1236,6 +1245,8 @@ jobs:
           model_dir="${MODEL_PATH}"
           if [[ "${model_dir}" = /models/* ]]; then
             model_dir="/models/${model_dir#/models/}"
+          elif [[ "${model_dir}" = /shared_nfs/huggingface_models/* ]]; then
+            model_dir="/models/${model_dir#/shared_nfs/huggingface_models/}"
           elif [[ "${model_dir}" = /it-share/models/* ]]; then
             model_dir="/models/${model_dir#/it-share/models/}"
           elif [[ "${model_dir}" = /data/models/* ]]; then
@@ -1271,6 +1282,8 @@ jobs:
           model_dir="${MODEL_PATH}"
           if [[ "${model_dir}" = /models/* ]]; then
             model_dir="/models/${model_dir#/models/}"
+          elif [[ "${model_dir}" = /shared_nfs/huggingface_models/* ]]; then
+            model_dir="/models/${model_dir#/shared_nfs/huggingface_models/}"
           elif [[ "${model_dir}" = /it-share/models/* ]]; then
             model_dir="/models/${model_dir#/it-share/models/}"
           elif [[ "${model_dir}" = /data/models/* ]]; then

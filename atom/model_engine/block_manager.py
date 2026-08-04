@@ -5,6 +5,7 @@ from collections import deque
 
 import numpy as np
 import xxhash
+
 from atom.config import Config
 from atom.distributed.kv_events import (
     MEDIUM_GPU,
@@ -51,8 +52,17 @@ class BlockManager:
         num_blocks = config.num_kvcache_blocks
         assert num_blocks > 0
         self.block_size = block_size
+        self.dcp_world_size = config.decode_context_parallel_size
+        # dcp_rank is always 0 here: BlockManager runs only on the scheduler
+        # (rank 0). DCP rank is used only to compute local token counts for
+        # memory reservation; the actual per-rank routing is done in the workers.
+        self.dcp_rank = 0
+        # Prefix-cache hashing / reuse granularity: under DCP one block_table
+        # entry maps to a virtual block of `block_size * dcp_world_size` global
+        # tokens (see _hash_block_size). == block_size when DCP is off.
+        self.hash_block_size = self.block_size * self.dcp_world_size
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
-        self.hash_to_block_id: dict[int, int] = dict()
+        self.hash_to_block_id: dict[int, int] = {}
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         self.free_block_ids_set: set[int] = set(range(num_blocks))
         self.used_block_ids: set[int] = set()
@@ -137,6 +147,37 @@ class BlockManager:
         self.free_block_ids.append(block_id)
         self.free_block_ids_set.add(block_id)
 
+    def _dcp_num_blocks(self, seq_len: int) -> int:
+        if self.dcp_world_size <= 1:
+            return (seq_len + self.block_size - 1) // self.block_size
+        from atom.model_ops.dcp_ops import get_dcp_local_seq_lens
+
+        local_len = get_dcp_local_seq_lens(
+            np.array([seq_len]), self.dcp_world_size, self.dcp_rank
+        )[0]
+        return int((local_len + self.block_size - 1) // self.block_size)
+
+    def _effective_block_size(self):
+        return self.block_size * self.dcp_world_size
+
+    # --- Prefix-cache block accounting granularity ---------------------------
+    # Under DCP one entry of `block_table` maps to a VIRTUAL block spanning
+    # `block_size * dcp_world_size` consecutive global tokens (each rank stores
+    # its `block_size` interleaved tokens in that physical block). So prefix
+    # cache hashing / reuse must be done per virtual block, not per physical
+    # block — otherwise the logical block index runs past the (dcp-shrunk)
+    # block_table. For dcp_world_size == 1 this reduces to the physical size.
+    def _hash_block_size(self) -> int:
+        return self.hash_block_size
+
+    def _n_hash_blocks(self, seq: Sequence) -> int:
+        hbs = self.hash_block_size
+        return (len(seq) + hbs - 1) // hbs
+
+    def _hash_block_tokens(self, seq: Sequence, i: int) -> list[int]:
+        hbs = self.hash_block_size
+        return seq.token_ids[i * hbs : (i + 1) * hbs]
+
     def can_allocate(self, seq: Sequence) -> int:
         """Return number of cache-hit blocks (>=0) if seq fits, else -1.
 
@@ -156,7 +197,7 @@ class BlockManager:
         if seq.has_per_req_cache and not self.free_per_req_cache_groups:
             return -1
         if not self.enable_prefix_caching:
-            if len(self.free_block_ids_set) < seq.num_blocks:
+            if len(self.free_block_ids_set) < self._dcp_num_blocks(len(seq)):
                 return -1
             # SWA admission: only the per-request windowed peak (filled
             # incrementally + window-freed), not the whole prompt. No-op / True
@@ -170,8 +211,8 @@ class BlockManager:
         h = -1
         compressed_hit = 0
         block_hashes: list[int] = []
-        for i in range(seq.num_blocks - 1):
-            token_ids = seq.block(i)
+        for i in range(self._n_hash_blocks(seq) - 1):
+            token_ids = self._hash_block_tokens(seq, i)
             h = self.compute_hash(token_ids, h)
             block_id = self.hash_to_block_id.get(h, -1)
             if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
@@ -192,7 +233,7 @@ class BlockManager:
         seq.num_compressed_hit_blocks = compressed_hit
         # Free-pool demand: blocks we actually reuse minus those already used
         # (shared ref); blocks we drop from the hit become fresh → counted.
-        num_new_blocks = seq.num_blocks
+        num_new_blocks = self._n_hash_blocks(seq)
         for i in range(num_cached_blocks):
             if self.hash_to_block_id[block_hashes[i]] in self.used_block_ids:
                 num_new_blocks -= 1
@@ -229,7 +270,7 @@ class BlockManager:
         swa_hit_start = max(0, num_cached_blocks - self.swa.tail_blocks)
         h = -1
         for i in range(num_cached_blocks):
-            token_ids = seq.block(i)
+            token_ids = self._hash_block_tokens(seq, i)
             h = self.compute_hash(token_ids, h)
             block_id = self.hash_to_block_id[h]
             block = self.blocks[block_id]
@@ -248,7 +289,7 @@ class BlockManager:
                 self.swa.alloc_placeholder(seq)  # out of window: never read → -1
             else:
                 self.swa.claim_cached(seq, h, token_ids)  # trailing window: reuse
-        for _ in range(num_cached_blocks, seq.num_blocks):
+        for _ in range(num_cached_blocks, self._dcp_num_blocks(len(seq))):
             block_id = self._pop_free_block()
             self._allocate_block(block_id)
             seq.block_table.append(block_id)
@@ -257,7 +298,7 @@ class BlockManager:
             # window slots before each forward, free_after_prefill_chunk releases
             # out-of-window ones.
             self.swa.alloc_placeholder(seq)
-        seq.num_cached_tokens = num_cached_blocks * self.block_size
+        seq.num_cached_tokens = num_cached_blocks * self._hash_block_size()
 
         # Per-request cache: claim one slot index from the pre-allocated
         # state tensor (e.g. GDN mamba_k_cache, V4 compressor state + SWA
@@ -269,7 +310,9 @@ class BlockManager:
         if seq.has_per_req_cache:
             seq.per_req_cache_group = self.free_per_req_cache_groups.pop()
 
-    def hash_blocks(self, seq: Sequence, num_new_tokens: int) -> None:
+    def hash_blocks(
+        self, seq: Sequence, num_new_tokens: int, start_tokens: int | None = None
+    ) -> None:
         """Register hashes for blocks finalized by the most recent step.
 
         Called from scheduler.postprocess() after the forward completes, so a
@@ -280,11 +323,17 @@ class BlockManager:
         Caller passes `num_new_tokens` = tokens forwarded in this step. For
         single-shot prefill that's `seq.num_tokens - seq.num_cached_tokens`;
         chunked prefill will pass the per-chunk count.
+
+        `start_tokens` overrides the token offset the range starts at. Pipeline-
+        parallel schedule-time advancement already bumped seq.num_cached_tokens
+        past this chunk, so the head passes the chunk's pre-advance offset here.
         """
         if not self.enable_prefix_caching:
             return
-        start = seq.num_cached_tokens // self.block_size
-        end = (seq.num_cached_tokens + num_new_tokens) // self.block_size
+        hbs = self._hash_block_size()
+        base = seq.num_cached_tokens if start_tokens is None else start_tokens
+        start = base // hbs
+        end = (base + num_new_tokens) // hbs
         if start >= end:
             return
         h = self.blocks[seq.block_table[start - 1]].hash if start > 0 else -1
@@ -294,7 +343,7 @@ class BlockManager:
         store_run_tokens: list[int] = []
         for i in range(start, end):
             block = self.blocks[seq.block_table[i]]
-            token_ids = seq.block(i)
+            token_ids = self._hash_block_tokens(seq, i)
             h = self.compute_hash(token_ids, h)
             block.update(h, token_ids)
             self.hash_to_block_id[h] = block.block_id
@@ -333,9 +382,8 @@ class BlockManager:
     def can_append(self, seq: Sequence, num_new_tokens: int = 1) -> bool:
         seq_len = len(seq)
         current_blocks = len(seq.block_table)
-        needed_blocks = (
-            seq_len + num_new_tokens + self.block_size - 1
-        ) // self.block_size
+        ebs = self._effective_block_size()
+        needed_blocks = (seq_len + num_new_tokens + ebs - 1) // ebs
         new_blocks_needed = max(0, needed_blocks - current_blocks)
         if len(self.free_block_ids_set) < new_blocks_needed:
             return False
@@ -352,8 +400,9 @@ class BlockManager:
         # Check if we need to allocate a new block
         # When len(seq) % block_size == 1, we need a new block for the next token
         # When block_size == 1, every token needs a new block
-        if 0 < seq_len % self.block_size <= num_new_tokens or self.block_size == 1:
-            needed_blocks = (seq_len + self.block_size - 1) // self.block_size
+        ebs = self._effective_block_size()
+        if 0 < seq_len % ebs <= num_new_tokens or ebs == 1:
+            needed_blocks = (seq_len + ebs - 1) // ebs
             while len(block_table) < needed_blocks:
                 # Decode-generated blocks: token not finalized yet (depends on
                 # sampling / speculative verification), so we cannot compute a

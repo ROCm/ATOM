@@ -374,6 +374,9 @@ def perf_point(
         "timestamp": timestamp,
         "source": "ATOMesh",
         "client_bench": "inferencemax bench",
+        "benchmark_kind": string_value(payload.get("benchmark_kind")) or None,
+        "scenario": string_value(payload.get("scenario")) or None,
+        "public_dataset": string_value(payload.get("public_dataset")) or None,
         "model": string_value(
             payload.get("benchmark_model_name"), fields.get("model"), default="unknown"
         ),

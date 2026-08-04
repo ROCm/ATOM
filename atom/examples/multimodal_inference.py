@@ -9,8 +9,9 @@ from transformers import AutoProcessor
 
 from atom import SamplingParams
 from atom.model_engine.arg_utils import EngineArgs
+from atom.utils.arg_parser import FlexibleArgumentParser
 
-parser = argparse.ArgumentParser(
+parser = FlexibleArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description=(
         "Generic image+text multimodal offline inference using the native ATOM engine.\n"

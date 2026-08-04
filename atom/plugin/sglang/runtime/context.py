@@ -5,7 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import ClassVar, Optional, Union
+from typing import Any, ClassVar, Optional, Union
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 
@@ -26,6 +26,21 @@ def bind_current_forward_batch(forward_batch: Optional[ForwardBatch]):
         yield
     finally:
         _current_forward_batch.reset(token)
+
+
+def is_draft_extend_mode(forward_mode: Any, include_v2: bool = False) -> bool:
+    """Return whether ``forward_mode`` is a SGLang draft-extend mode."""
+    is_draft_extend = getattr(forward_mode, "is_draft_extend", None)
+    if is_draft_extend is not None:
+        try:
+            return bool(is_draft_extend(include_v2=include_v2))
+        except TypeError:
+            if bool(is_draft_extend()):
+                return True
+
+    return include_v2 and bool(
+        getattr(forward_mode, "is_draft_extend_v2", lambda: False)()
+    )
 
 
 @contextmanager

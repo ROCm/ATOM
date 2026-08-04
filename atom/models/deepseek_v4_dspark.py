@@ -41,6 +41,7 @@ Checkpoint layout (DeepSeek-V4-Pro-DSpark):
   (embed + lm_head are shared with the target via share_with_target)
 """
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -103,13 +104,16 @@ class DSparkConfidenceHead(nn.Module):
 
         c_k = sigma( w^T [ h_k ; W1[x_{k-1}] ] )
 
-    Input is the concatenation of the backbone hidden state ``h_k`` (dim) and the
-    Markov embedding ``W1[x_{k-1}]`` (rank), so the projection weight has shape
+    Input is the concatenation of ``h_k`` (dim) and the Markov embedding
+    ``W1[x_{k-1}]`` (rank), so the projection weight has shape
     ``[1, hidden + rank]`` (checkpoint: confidence_head.proj.weight [1, 7680]).
 
-    The raw sigmoid output is the per-position conditional acceptance estimate.
-    Phase 2 applies Sequential Temperature Scaling (STS) on the cumulative
-    product before feeding the hardware-aware scheduler.
+    ``h_k`` is the PRE-norm mHC head reduction, not the post-norm tensor the LM
+    head consumes; feeding the normed one miscalibrates every score.
+
+    The sigmoid lives here rather than in the caller (as in the reference):
+    VerifyScheduler consumes ``c_k`` as an absolute probability, so the (0, 1)
+    range is part of this module's contract.
     """
 
     def __init__(self, hidden_size: int, rank: int):
@@ -120,7 +124,7 @@ class DSparkConfidenceHead(nn.Module):
         self, hidden_states: torch.Tensor, markov_embeds: torch.Tensor
     ) -> torch.Tensor:
         """Args:
-            hidden_states: [*, hidden]  backbone hidden h_k.
+            hidden_states: [*, hidden]  PRE-norm mHC head reduction h_k.
             markov_embeds: [*, rank]    W1[x_{k-1}].
         Returns:
             confidence: [*]  sigmoid survival probability in (0, 1).
@@ -187,7 +191,7 @@ def _fake_fp8_e4m3_inplace(x: torch.Tensor, block_size: int = 64) -> None:
             "DSpark fake-FP8 block size must divide the last dim: "
             f"{x.shape[-1]} % {block_size} != 0."
         )
-    view = x.reshape(-1, x.shape[-1] // block_size, block_size)
+    view = x.view(-1, x.shape[-1] // block_size, block_size)
     amax = view.abs().amax(dim=-1, keepdim=True).clamp_min(1.0e-4)
     scale = torch.exp2(torch.ceil(torch.log2(amax / 448.0)))
     quant = torch.clamp(view / scale, -448.0, 448.0).to(torch.float8_e4m3fn)
@@ -202,27 +206,73 @@ def _apply_dspark_kv_qat_(kv: torch.Tensor, rope_dim: int) -> None:
 def _dspark_block_topk_idxs(
     B: int, T: int, W: int, valid_target: torch.Tensor, device
 ) -> torch.Tensor:
-    """Encode the (window-validity + block-causal) attention mask as gather
-    indices into the combined ``[window ++ draft]`` KV (length ``W+T``).
+    """Encode the window-validity attention mask as gather indices into the
+    combined ``[window ++ draft]`` KV (length ``W+T``).
 
     For draft query position ``m`` (0..T-1) the attended columns are:
       * every VALID rolling-window slot  -> global index ``w`` (0..W-1)
-      * draft-block slots ``0..m``       -> global index ``W + j``  (block-causal)
-    All other entries are ``-1`` (the fused sparse_attn kernel skips them).
+      * EVERY draft-block slot           -> global index ``W + j`` (j = 0..T-1)
+    Invalid window slots are ``-1`` (the fused sparse_attn kernel skips them).
+
+    Attention inside the draft block is BIDIRECTIONAL: the block is decoded in
+    one parallel pass, so position is carried by RoPE, not by a causal mask.
 
     Returns: topk_idxs [B, T, W+T] int32, suitable for ``sparse_attn``.
     """
+    # Built int32 end to end: the index ramps start as int32 so the `cat` lands
+    # directly in the output dtype. Defaulting to int64 and casting afterwards
+    # would materialize the full [B, T, W+T] block twice (once int64, once int32).
+    #
     # Window columns: keep the global slot index where valid, else -1. Same for
     # every draft position m -> broadcast over T.
-    win_idx = torch.arange(W, device=device)
+    win_idx = torch.arange(W, device=device, dtype=torch.int32)
     win_cols = torch.where(valid_target, win_idx.view(1, W), win_idx.new_full((1,), -1))
     win_cols = win_cols.view(B, 1, W).expand(B, T, W)  # [B, T, W]
-    # Draft columns: block-causal. position m attends draft j<=m -> index W+j.
-    j = torch.arange(T, device=device)
-    causal = j.view(1, T) <= j.view(T, 1)  # [T(m), T(j)]
-    draft_cols = torch.where(causal, (W + j).view(1, T), j.new_full((1,), -1))
-    draft_cols = draft_cols.view(1, T, T).expand(B, T, T)  # [B, T, T]
-    return torch.cat([win_cols, draft_cols], dim=-1).to(torch.int32)  # [B, T, W+T]
+    # Draft columns: every query row attends the WHOLE block -> index W+j.
+    j = torch.arange(T, device=device, dtype=torch.int32)
+    draft_cols = (W + j).view(1, 1, T).expand(B, T, T)  # [B, T, T]
+    return torch.cat([win_cols, draft_cols], dim=-1)  # [B, T, W+T] int32
+
+
+@dataclass(frozen=True)
+class _DSparkBlockPlan:
+    """Per-block invariants shared by every DSpark stage.
+
+    ``dspark_attention`` runs once per stage, but these three tensors depend only
+    on ``(positions, T, W)`` — never on stage weights — so they are built once per
+    ``forward_spec`` and reused. Recomputing them per stage rebuilt the
+    ``[B, T, W+T]`` gather-index block once per stage for identical values.
+    """
+
+    draft_pos: torch.Tensor  # [B, T]      anchor+1 .. anchor+T
+    valid_target: torch.Tensor  # [B, W]      rolling-window slot validity
+    topk_idxs: torch.Tensor  # [B, T, W+T] sparse_attn gather indices
+
+
+def _build_block_plan(
+    positions: torch.Tensor,  # [B] anchor position per request
+    T: int,  # draft width
+    W: int,  # rolling window size
+    is_dummy_run: bool,
+) -> _DSparkBlockPlan:
+    """Build the per-block invariants once for the whole DSpark backbone."""
+    B = positions.shape[0]
+    device = positions.device
+    offsets = torch.arange(1, T + 1, device=device, dtype=positions.dtype)
+    draft_pos = positions.view(B, 1) + offsets.view(1, T)
+    if is_dummy_run:
+        # warmup runs BEFORE allocate_kv_cache: no window is bound yet, so every
+        # slot is invalid (the draft output is discarded anyway).
+        valid_target = torch.zeros(B, W, dtype=torch.bool, device=device)
+    else:
+        # slot s valid iff its absolute position (anchor-(W-1)+s) >= 0.
+        slot_ids = torch.arange(W, device=device).view(1, W)
+        valid_target = slot_ids >= (W - 1) - positions.view(B, 1)
+    return _DSparkBlockPlan(
+        draft_pos=draft_pos,
+        valid_target=valid_target,
+        topk_idxs=_dspark_block_topk_idxs(B, T, W, valid_target, device),
+    )
 
 
 def _dspark_block_sparse_attention_torch(
@@ -245,11 +295,9 @@ def _dspark_block_sparse_attention_torch(
     neg_inf = torch.finfo(scores.dtype).min
     # Window slots: valid_target [B, W] -> [B, 1, 1, W].
     win_mask = valid_target.view(B, 1, 1, W)
-    # Draft-block slots: block-causal, position t attends to draft cols <= t.
-    # block_causal[t, s] = (s <= t).
-    draft_cols = torch.arange(T, device=q.device)
-    block_causal = draft_cols.view(1, T) <= draft_cols.view(T, 1)  # [T, T]
-    block_mask = block_causal.view(1, 1, T, T).expand(B, 1, T, T)
+    # Draft-block slots: bidirectional — every draft position attends the whole
+    # block (see _dspark_block_topk_idxs; the block is decoded in parallel).
+    block_mask = q.new_ones(1, 1, T, T, dtype=torch.bool).expand(B, 1, T, T)
     full_mask = torch.cat([win_mask.expand(B, 1, T, W), block_mask], dim=-1)
     scores = scores.masked_fill(~full_mask, neg_inf)
     # Attention sink: one extra always-on column per head with zero value.
@@ -266,20 +314,23 @@ def _dspark_block_sparse_attention(
     kv: torch.Tensor,  # [B, W + T, D]  (window target-KV ++ draft-block KV)
     attn_sink: torch.Tensor,  # [H]
     valid_target: torch.Tensor,  # [B, W] bool: which window slots hold real KV
+    topk_idxs: torch.Tensor,  # [B, T, W+T] int32 gather indices (from the block plan)
     scale: float,
 ) -> torch.Tensor:  # [B, T, H, D]
     """Per-block attention over (rolling target window ++ draft block).
 
     DSpark is MQA: a single shared KV head broadcast to all H query heads. Each
     draft query position t attends to all valid target-window slots plus the
-    draft-block KV up to and including its own position (block-causal), with a
-    per-head attention sink contributing to the softmax denominator only.
+    ENTIRE draft-block KV (bidirectional within the block), with a per-head
+    attention sink contributing to the softmax denominator only.
 
-    The (window-validity + block-causal) mask is encoded as gather indices and
+    The window-validity mask is encoded as gather indices
+    (``topk_idxs``, built once per block by :func:`_build_block_plan`) and
     dispatched to ATOM's fused flash ``sparse_attn`` (Triton + torch fallback,
     both sink+MQA aware and tuned for head_dim>=256). This avoids materializing
     the [B,H,T,W+T] fp32 score matrix. Set ``ATOM_DSPARK_ATTN_TORCH=1`` to force
-    the plain-torch reference above.
+    the plain-torch reference above (it re-derives the mask from
+    ``valid_target`` and ignores ``topk_idxs``).
     """
     import os
 
@@ -289,17 +340,16 @@ def _dspark_block_sparse_attention(
         )
     from atom.model_ops.sparse_attn_v4 import sparse_attn
 
-    B, T, _, _ = q.shape
-    W = kv.shape[1] - T
-    topk_idxs = _dspark_block_topk_idxs(B, T, W, valid_target, q.device)
     # sparse_attn requires matching fp16/bf16 dtypes for q and kv; sink is fp32.
-    return sparse_attn(
-        q.contiguous(),
-        kv.to(q.dtype).contiguous(),
-        attn_sink.float(),
-        topk_idxs,
-        scale,
+    # Asserted rather than cast: q and kv reach here from different sources (the
+    # qk-norm/RoPE output vs the [paged window ++ draft block] concat), so a
+    # mismatch is a real bug — a silent `.to()` would hide it behind a per-step
+    # GPU copy.
+    assert kv.dtype == q.dtype, (
+        f"DSpark block attention needs matching q/kv dtypes, "
+        f"got q={q.dtype} kv={kv.dtype}."
     )
+    return sparse_attn(q, kv, attn_sink.float(), topk_idxs, scale)
 
 
 # ---------------------------------------------------------------------------
@@ -307,8 +357,9 @@ def _dspark_block_sparse_attention(
 #
 # These reuse the DeepSeek-V4 decoder layer machinery (attention linears, MoE,
 # mHC) but run a DSpark-specific attention path: a private rolling target-KV
-# window (size = sliding_window) plus the draft-block KV, dense block-causal
-# attention with an attention sink, and a BF16 inverse-RoPE output projection.
+# window (size = sliding_window) plus the draft-block KV, dense attention that
+# is bidirectional within the draft block, with an attention sink, and a BF16
+# inverse-RoPE output projection.
 #
 # GPU-VERIFY: every method below that touches aiter / V4 attention submodules
 # must be validated on an MI3xx device against the reference DSpark outputs.
@@ -318,17 +369,20 @@ def _dspark_block_sparse_attention(
 # Heavy ATOM imports are deferred to module load only when the real engine pulls
 # this in (unit tests import the heads/helpers above without these).
 try:
-    from atom.models.deepseek_v4 import (  # noqa: E402
+    from atom.model_ops.layernorm import RMSNorm
+    from atom.model_ops.linear import ReplicatedLinear
+    from atom.model_ops.v4_kernels.qk_norm_rope_maybe_quant import (
+        qk_norm_rope_maybe_quant,
+    )
+    from atom.model_ops.v4_kernels.state_writes import (
+        dspark_paged_window_gather,
+        swa_write,
+    )
+    from atom.models.deepseek_v4 import (
         Block,
         DeepseekV4Args,
         HCState,
         make_v4_quant_config,
-    )
-    from atom.model_ops.layernorm import RMSNorm  # noqa: E402
-    from atom.model_ops.linear import ReplicatedLinear  # noqa: E402
-    from atom.model_ops.v4_kernels.state_writes import (  # noqa: E402
-        dspark_paged_window_gather,
-        swa_write,
     )
 
     _ATOM_V4_AVAILABLE = True
@@ -425,8 +479,11 @@ class DSparkLayer(Block):  # type: ignore[misc]
     def _compute_main_kv(
         self, main_x: torch.Tensor, positions: torch.Tensor
     ) -> torch.Tensor:
-        """Project one target hidden state per request into a rolling-window KV
-        row (post kv_norm + RoPE + QAT). main_x: [B, dim] -> [B, head_dim].
+        """Project target hidden states into rolling-window KV rows (post
+        kv_norm + RoPE + QAT). main_x: [T, dim] -> [T, head_dim].
+
+        ``positions`` is the caller's padded forward buffer and may be longer
+        than ``main_x``; only its first T entries are used.
 
         The NoPE lanes are fake-quantized through fp8 E4M3 (DSpark QAT numerics)
         then stored bf16 — matching the QAT-trained draft's expected KV values."""
@@ -443,7 +500,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
         # rope_dim == 0 doesn't turn `[..., -rope_dim:]` into the whole head
         # (-0 == 0).
         if rope_dim:
-            a.rotary_emb.forward(positions.reshape(-1), kv[..., -rope_dim:])
+            a.rotary_emb.forward(positions.view(-1)[: kv.shape[0]], kv[..., -rope_dim:])
         _apply_dspark_kv_qat_(kv, rope_dim)
         return kv.view(-1, a.head_dim)
 
@@ -451,22 +508,21 @@ class DSparkLayer(Block):  # type: ignore[misc]
         self,
         main_x: torch.Tensor,  # [T, dim]  target hidden(s)
         positions: torch.Tensor,  # [T]
-        cache_indices: torch.Tensor,  # [B]  per-req state slot (unused: paged)
-        cu_seqlens_q: torch.Tensor | None = None,  # [B+1]; None => one row/req
-        write_per_batch: int = 1,
+        cu_seqlens_q: torch.Tensor,  # [B+1] int32 per-req spans into main_x
+        write_per_batch: int,
     ) -> None:
-        """Write target-KV row(s) into each request's rolling window (pos % window).
+        """Write target-KV rows into each request's rolling window.
 
-        Two modes:
-          * decode (default): main_x is [B, dim], one anchor token per request.
-            ``cu_seqlens_q`` is the identity ramp and ``write_per_batch=1``.
-          * prefill warmup: main_x is the flat [T, dim] ragged batch of all
-            scheduled tokens; ``cu_seqlens_q`` ([B+1]) delimits per-request
-            spans and ``write_per_batch = min(max_seqlen, window)`` so the last
-            ``min(seq_len, window)`` tokens of every request seed the window.
-            Without this, a request's first draft (right after prefill) sees an
-            almost-empty window and rejects early; warming it lifts first-block
-            acceptance to the steady-state level.
+        ``main_x`` is the flat [T, dim] ragged batch of every scheduled token and
+        ``cu_seqlens_q`` ([B+1]) delimits the per-request spans; the last
+        ``min(seq_len, write_per_batch)`` rows of each span are written. Callers
+        pass ``write_per_batch = window_size``, which covers a prefill tail and a
+        decode verify span alike.
+
+        Every scheduled row is written on every step: the window must hold a row
+        for every position it spans, and the read side gathers slots by absolute
+        position regardless of whether they were ever written. See
+        :meth:`DSparkProposer.propose` for why writing rejected rows is safe.
 
         PAGED-SWA: the draft window KV now lives in the shared paged pool
         (``self.attn.swa_kv``, this draft layer's slice of ``unified_kv``),
@@ -474,10 +530,8 @@ class DSparkLayer(Block):  # type: ignore[misc]
         (#1417). ``swa_write`` is the same cudagraph-safe Triton kernel the target
         uses: it derives all indices in-kernel from ``cu_seqlens_q`` +
         ``positions`` (no advanced-index buffer-mutation, no ``.item()`` sync), so
-        it graph-replays correctly. ``cache_indices`` (the per-req state slot) is
-        no longer used for the write — the physical destination comes from
-        ``swa_block_tables`` — but is kept in the signature for the read side /
-        callers that still pass it.
+        it graph-replays correctly. The physical destination comes entirely from
+        ``swa_block_tables``, so no per-request state slot is needed here.
         """
         from atom.utils.forward_context import get_forward_context
 
@@ -491,15 +545,26 @@ class DSparkLayer(Block):  # type: ignore[misc]
         attn_md = fc.attn_metadata
         a = self.attn
         main_kv = self._compute_main_kv(main_x, positions)  # [T, head_dim]
-        main_kv = main_kv.to(a.swa_kv.dtype).contiguous()
-        if cu_seqlens_q is None:
-            B = main_kv.shape[0]
-            cu_seqlens_q = torch.arange(B + 1, device=main_kv.device, dtype=torch.int32)
+        # The SWA pool is allocated bf16 for DSpark draft layers regardless of the
+        # target's kv_cache_dtype, while main_kv carries the model dtype — two
+        # independent sources. Assert instead of casting so a mismatch surfaces
+        # here rather than as a silent per-step copy (or a silently reinterpreted
+        # store inside the swa_write kernel, which has no dtype guard).
+        # `raise`, not `assert`: a bare assert vanishes under `python -O`, and
+        # swa_write has no dtype guard, so the mismatch would become a silently
+        # reinterpreted store.
+        if main_kv.dtype != a.swa_kv.dtype:
+            raise TypeError(
+                f"DSpark draft KV dtype {main_kv.dtype} != SWA pool dtype "
+                f"{a.swa_kv.dtype}. The draft pool is allocated bf16 "
+                "unconditionally; a non-bf16 --dtype needs that allocation "
+                "widened, not a cast here."
+            )
         B = cu_seqlens_q.shape[0] - 1
         swa_write(
             main_kv,  # [T, head_dim]
-            positions.to(torch.int32),  # [T]
-            cu_seqlens_q.to(torch.int32),  # [B+1] per-req spans
+            positions,  # [T] int64
+            cu_seqlens_q,  # [B+1] int32, per-req spans
             attn_md.swa_block_tables[:B],  # [B, max_blocks]
             a.swa_kv,  # [num_pages, head_dim]
             a.swa_block_size,
@@ -510,12 +575,12 @@ class DSparkLayer(Block):  # type: ignore[misc]
         self,
         x: torch.Tensor,  # [B, T, dim]  per-block hidden (post attn_norm)
         positions: torch.Tensor,  # [B]  anchor position per request
-        cache_indices: torch.Tensor,  # [B]
+        plan: "_DSparkBlockPlan",  # per-block invariants, shared across stages
     ) -> torch.Tensor:  # [B, T, dim]
         """Block attention over (rolling target window ++ draft block KV)."""
         a = self.attn
         B, T, _ = x.shape
-        flat = x.reshape(B * T, -1)
+        flat = x.view(B * T, -1)
         qr_kv = _linear_out(a.wqkv_a(flat))
         qr, kv = torch.split(qr_kv, [a.q_lora_rank, a.head_dim], dim=-1)
         # q_norm runs in fused_quant mode: it returns (qr_fp8, qr_scale) so the
@@ -526,46 +591,52 @@ class DSparkLayer(Block):  # type: ignore[misc]
             q = _linear_out(a.wq_b(qr_q, x_scale=qr_scale))
         else:
             q = _linear_out(a.wq_b(qr_normed))
-        q = q.view(B * T, a.n_local_heads, a.head_dim)
-        # Per-head Q RMSNorm (weightless), matching the V4 reference.
-        q = q * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + a.eps).to(
-            q.dtype
-        )
-        kv = a.kv_norm(kv).view(B * T, 1, a.head_dim)
+        # q stays 2-D [B*T, H*D], kv 2-D [B*T, D] — the fused kernel wants 2-D.
 
-        # Draft positions: anchor+1 .. anchor+T.
-        draft_pos = positions.view(B, 1) + torch.arange(
-            1, T + 1, device=x.device, dtype=positions.dtype
-        ).view(1, T)
+        # Draft positions (anchor+1 .. anchor+T) come from the shared block plan.
+        draft_pos = plan.draft_pos
         rope_dim = a.rope_head_dim
-        dp_flat = draft_pos.reshape(-1)
-        # RoPE via the shared aiter fused kernel (rope_cached_positions_2c, GPT-J
-        # interleaved = the draft's former hand-rolled triton layout). In-place on
-        # the rope-slice of q and kv together; both are fresh local tensors. Guard
-        # rope_dim > 0 so rope_dim == 0 doesn't turn `[..., -rope_dim:]` into the
-        # whole head.
-        if rope_dim:
-            a.rotary_emb.forward(dp_flat, q[..., -rope_dim:], kv[..., -rope_dim:])
+        # Per-head weightless Q RMSNorm + weighted KV RMSNorm + GPT-J RoPE in ONE
+        # fused kernel — the same `qk_norm_rope_maybe_quant` the V4 target runs
+        # every layer (bf16 path: quant off, no SWA fusion — DSpark scatters its
+        # window separately). Replaces the draft's hand-written weightless Q-norm
+        # + kv_norm + the `rotary_emb.forward` (_V4RoPE) RoPE launch. `kv` is
+        # passed PRE-norm; the kernel applies kv_norm.weight internally.
+        qkn = qk_norm_rope_maybe_quant(
+            q,
+            kv,
+            a.kv_norm.weight,
+            a.rotary_emb.cos_cache,
+            a.rotary_emb.sin_cache,
+            draft_pos.view(-1),
+            a.n_local_heads,
+            a.head_dim,
+            rope_dim,
+            a.eps,
+            quant_q=False,
+            quant_k=False,
+            prefix=f"{a.layer_name}.dspark_qk_norm_rope",
+        )
+        q = qkn.q_sa.view(B, T, a.n_local_heads, a.head_dim)
+        kv = qkn.kv.view(B * T, 1, a.head_dim)
         _apply_dspark_kv_qat_(kv, rope_dim)
-        q = q.view(B, T, a.n_local_heads, a.head_dim)
         kv = kv.view(B, T, a.head_dim)
 
-        # Assemble [window ++ draft block] KV and the window-validity mask.
+        # Assemble the [window ++ draft block] KV. The window-validity mask and
+        # gather indices are stage-invariant and come from the block plan; only
+        # the KV gather is per-stage (each stage owns its own swa_kv slice).
         # PAGED-SWA: gather the dense [B, W, head_dim] rolling window from the
         # shared paged pool (this draft layer's swa_kv slice), addressed by
-        # swa_block_tables — the same content-addressing the write used. Window
-        # slot s holds absolute position (anchor-(W-1)+s); slots with p < 0 are
-        # unfilled and masked out.
+        # swa_block_tables — the same content-addressing the write used.
         from atom.utils.forward_context import get_forward_context
 
         fc = get_forward_context()
         W = self.window_size
         if fc.context.is_dummy_run:
             # warmup runs BEFORE allocate_kv_cache → swa_kv / swa_block_tables
-            # unbound. All-zero, all-invalid window so the forward still
-            # compiles at shape (draft output is discarded).
+            # unbound. All-zero window so the forward still compiles at shape
+            # (draft output is discarded).
             window_kv = kv.new_zeros(B, W, a.head_dim)
-            valid_target = torch.zeros(B, W, dtype=torch.bool, device=x.device)
         else:
             attn_md = fc.attn_metadata
             window_kv = dspark_paged_window_gather(
@@ -575,23 +646,25 @@ class DSparkLayer(Block):  # type: ignore[misc]
                 W,
                 a.swa_block_size,
             )  # [B, W, head_dim]
-            # slot s valid iff abs position (anchor-(W-1)+s) >= 0.
-            slot_ids = torch.arange(W, device=x.device).view(1, W)
-            valid_target = slot_ids >= (W - 1) - positions.view(B, 1)
         all_kv = torch.cat([window_kv, kv], dim=1)  # [B, W+T, head_dim]
 
         out = _dspark_block_sparse_attention(
-            q, all_kv, a.attn_sink[: a.n_local_heads], valid_target, a.softmax_scale
+            q,
+            all_kv,
+            a.attn_sink[: a.n_local_heads],
+            plan.valid_target,
+            plan.topk_idxs,
+            a.softmax_scale,
         )  # [B, T, n_heads, head_dim]
 
         # Output projection: mirror DeepseekV4Attention.forward_impl's output
         # stage exactly (deepseek_v4.py:1922-1930): inverse-RoPE on the rope
         # lanes, grouped output-LoRA einsum with the BF16 wo_a weight, then wo_b.
         # GPU-VERIFY: numerics validated against the V4 reference output stage.
-        o = out.reshape(B * T, a.n_local_heads, a.head_dim).contiguous()
+        o = out.view(B * T, a.n_local_heads, a.head_dim)
         rope_dim = a.rope_head_dim
         # Remove the absolute-position contribution carried in via value-side RoPE.
-        a.rotary_emb.inverse(draft_pos.reshape(-1), o[..., -rope_dim:])
+        a.rotary_emb.inverse(draft_pos.view(-1), o[..., -rope_dim:])
         o = o.view(B * T, a.n_local_groups, -1)
         wo_a = a.wo_a.weight.view(a.n_local_groups, a.o_lora_rank, -1)
         o = torch.einsum("sgd,grd->sgr", o, wo_a)
@@ -602,7 +675,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
         self,
         x: torch.Tensor,  # [B, T, hc, dim] (stage 0) or [B, T, dim]
         positions: torch.Tensor,  # [B]
-        cache_indices: torch.Tensor,  # [B]
+        plan: "_DSparkBlockPlan",  # per-block invariants, shared across stages
         hc_state: "HCState | None",
     ):
         """Run one DSpark stage over a [B, T] block, returning updated hc_state.
@@ -614,7 +687,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
         T = x.shape[1]
         # ----- Attention sub-layer with mHC mixing -----
         if hc_state is None:
-            residual = x.reshape(B * T, self.hc_mult, x.shape[-1])
+            residual = x.view(B * T, self.hc_mult, x.shape[-1])
             hc_state = HCState(
                 residual=residual, post_mix=None, comb_mix=None, x_prev=None
             )
@@ -627,8 +700,8 @@ class DSparkLayer(Block):  # type: ignore[misc]
             self.norm_eps,
         )
         attn_in = hc_state.x_prev.view(B, T, -1)
-        attn_out = self.dspark_attention(attn_in, positions, cache_indices)
-        hc_state.x_prev = attn_out.reshape(B * T, -1)
+        attn_out = self.dspark_attention(attn_in, positions, plan)
+        hc_state.x_prev = attn_out.view(B * T, -1)
         # ----- FFN sub-layer with mHC mixing -----
         hc_state = self.fuse_hc(
             hc_state,
@@ -649,7 +722,7 @@ class DeepseekV4DSpark(nn.Module):
     namespace via the standard load_model path with spec_decode=True) and shares
     ``embed`` / ``head`` with the target through ``share_with_target``.
 
-    The EagleProposer drives drafting through ``forward_spec``: a single parallel
+    The DSparkProposer drives drafting through ``forward_spec``: a single parallel
     backbone pass produces base logits, then ``forward_head`` runs the sequential
     Markov loop to sample the block left-to-right and emit confidence scores.
     """
@@ -679,15 +752,22 @@ class DeepseekV4DSpark(nn.Module):
         self.args = DeepseekV4Args.from_hf_config(self.hf_config)
         self.args.quant_config = make_v4_quant_config(
             self.hf_config,
+            # Target parity (deepseek_v4.py): without model_path the
+            # wo_a-is-BF16-on-disk probe returns False, and a ckpt shipping BF16
+            # wo_a would give the draft FP8+scale params and garbage attention.
+            model_path=getattr(config, "model", None),
             online_quant_config=getattr(config, "online_quant_config", None),
         )
         self.atom_config.quant_config = self.args.quant_config
 
-        self.block_size = int(getattr(self.hf_config, "dspark_block_size"))
-        self.markov_rank = int(getattr(self.hf_config, "dspark_markov_rank"))
-        self.noise_token_id = int(getattr(self.hf_config, "dspark_noise_token_id"))
+        self.block_size = int(self.hf_config.dspark_block_size)
+        # Rolling target-KV window width. Exposed on the wrapper (top level) so the
+        # proposer never reaches through `self.model.model.mtp[0]` to read it.
+        self.window_size = int(self.args.window_size)
+        self.markov_rank = int(self.hf_config.dspark_markov_rank)
+        self.noise_token_id = int(self.hf_config.dspark_noise_token_id)
         self.target_layer_ids = tuple(
-            int(i) for i in getattr(self.hf_config, "dspark_target_layer_ids")
+            int(i) for i in self.hf_config.dspark_target_layer_ids
         )
         # Number of DSpark backbone stages = number of mtp.{i}.* blocks actually
         # present in the checkpoint (3 for V4-Pro-DSpark). num_nextn_predict_layers
@@ -756,29 +836,30 @@ class DeepseekV4DSpark(nn.Module):
         self,
         main_hidden,
         positions,
-        cache_indices,
-        cu_seqlens_q=None,
-        write_per_batch: int = 1,
+        cu_seqlens_q,
+        write_per_batch: int,
     ) -> None:
         """Populate every stage's rolling target-KV window from target hidden.
 
-        Decode: one anchor row per request (defaults). Prefill warmup: pass the
-        flat ragged batch with ``cu_seqlens_q`` + ``write_per_batch`` so the last
-        ``min(seq_len, window)`` tokens of each request seed the window.
+        Pass the flat ragged batch of all scheduled tokens with the real
+        ``cu_seqlens_q`` and ``write_per_batch = window_size``. See
+        :meth:`DSparkLayer.precompute_context_kv`.
         """
         self.model.precompute_context_kv(
-            main_hidden, positions, cache_indices, cu_seqlens_q, write_per_batch
+            main_hidden, positions, cu_seqlens_q, write_per_batch
         )
 
     def forward_spec(
         self,
         input_ids: torch.Tensor,  # [B]  anchor token per request (x0)
-        main_hidden: torch.Tensor,  # [B, dim*len(target_layers)] concat target hidden
         positions: torch.Tensor,  # [B]  anchor position per request
-        cache_indices: torch.Tensor,  # [B] rows into the rolling KV cache
         num_draft: "int | None" = None,  # draft width (defaults to block_size)
     ):
         """One DSpark draft block: parallel backbone + sequential Markov head.
+
+        Takes no target hidden: the target context reaches the block through the
+        rolling KV window, which ``precompute_context_kv`` must have populated
+        for this step beforehand.
 
         ``num_draft`` selects the draft width; when the verify horizon
         (num_speculative_tokens) exceeds ``dspark_block_size`` the caller passes
@@ -788,9 +869,7 @@ class DeepseekV4DSpark(nn.Module):
             draft_token_ids: [B, num_draft]
             confidence: [B, num_draft]
         """
-        return self.model.forward_spec(
-            input_ids, main_hidden, positions, cache_indices, num_draft=num_draft
-        )
+        return self.model.forward_spec(input_ids, positions, num_draft=num_draft)
 
 
 class _DSparkInner(nn.Module):
@@ -839,9 +918,8 @@ class _DSparkInner(nn.Module):
         self,
         main_hidden,
         positions,
-        cache_indices,
-        cu_seqlens_q=None,
-        write_per_batch: int = 1,
+        cu_seqlens_q,
+        write_per_batch: int,
     ) -> None:
         # Stage 0 owns main_proj/main_norm; project once, reuse the rolling-KV
         # write per stage (each stage has its own kv cache + attn linears).
@@ -850,33 +928,42 @@ class _DSparkInner(nn.Module):
         main_x = stage0.main_norm(main_x)
         for layer in self.mtp:
             layer.precompute_context_kv(
-                main_x, positions, cache_indices, cu_seqlens_q, write_per_batch
+                main_x, positions, cu_seqlens_q, write_per_batch
             )
 
-    def forward_spec(
-        self, input_ids, main_hidden, positions, cache_indices, num_draft=None
-    ):
+    def forward_spec(self, input_ids, positions, num_draft=None):
         B = input_ids.shape[0]
         # Draft width defaults to the training block size but may be widened up to
         # the rolling window when num_speculative_tokens > block_size (the weights
         # are draft-width-agnostic; positions past the block size are RoPE-
         # extrapolated). Cap at window_size so the [window ++ draft] KV stays sane.
         T = int(num_draft) if num_draft is not None else self.block_size
-        stage0 = self.mtp[0]
-        # Inject target context: project concat target hidden -> dim, norm.
-        main_x = stage0.main_proj(main_hidden)
-        main_x = stage0.main_norm(main_x)  # [B, dim]  (used as rolling-KV source)
+        # No main_proj here: the target context reaches the draft block through
+        # the rolling KV window (written by precompute_context_kv and gathered in
+        # each stage's attention), not through this forward's activations.
 
         # Build the draft block input ids: [anchor, noise, noise, ...].
         draft_ids = input_ids.new_full((B, T), self.noise_token_id)
         draft_ids[:, 0] = input_ids
-        x = self.embed(draft_ids.reshape(-1)).view(B, T, -1)  # [B, T, dim]
+        x = self.embed(draft_ids.view(-1)).view(B, T, -1)  # [B, T, dim]
         x = x.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)  # [B, T, hc, dim]
+
+        # Per-block invariants (draft positions, window validity, gather indices)
+        # depend only on (positions, T, W), so build them once and share across
+        # every stage instead of recomputing them inside each stage's attention.
+        from atom.utils.forward_context import get_forward_context
+
+        plan = _build_block_plan(
+            positions,
+            T,
+            self.mtp[0].window_size,
+            get_forward_context().context.is_dummy_run,
+        )
 
         # ----- Parallel backbone: run all stages over the block in one pass ---
         hc_state = None
         for layer in self.mtp:
-            hc_state = layer.forward_block(x, positions, cache_indices, hc_state)
+            hc_state = layer.forward_block(x, positions, plan, hc_state)
             x = hc_state.x_prev.view(B, T, -1)  # stage output feeds next stage
 
         # ----- Final mHC reduction + norm -> base logits (parallel) ----------
@@ -887,22 +974,26 @@ class _DSparkInner(nn.Module):
             hc_state.x_prev, residual, hc_state.post_mix, hc_state.comb_mix
         )  # [B*T, hc, dim]
         # Sigmoid-gated mHC head reduction to [B*T, dim] (reuse target head math).
-        hidden = self.head.hc_head(
+        # `norm` applies to the LM head input only: the confidence head takes the
+        # PRE-norm reduction (matching the reference).
+        hc_hidden = self.head.hc_head(
             reduced, last.hc_head_fn, last.hc_head_scale, last.hc_head_base
-        )
-        hidden = last.norm(hidden).view(B, T, -1)  # [B, T, dim]
-        base_logits = self.head.get_logits(hidden.reshape(B * T, -1)).view(
+        )  # [B*T, dim]
+        base_logits = self.head.get_logits(last.norm(hc_hidden)).view(
             B, T, -1
         )  # [B, T, vocab]
 
         # ----- Sequential Markov head: sample the block left-to-right ---------
-        return self.forward_head(base_logits, hidden, input_ids)
+        return self.forward_head(base_logits, hc_hidden.view(B, T, -1), input_ids)
 
-    def forward_head(self, base_logits, hidden, anchor_ids):
+    def forward_head(self, base_logits, hc_hidden, anchor_ids):
         """Apply the Markov transition bias position-by-position and sample.
 
         paper Eq.5:  logits_k <- U_k + B(x_{k-1}, .) ;  x_k <- sample(logits_k)
         Confidence:  c_k = sigma(proj([h_k ; W1[x_{k-1}]]))
+
+        ``hc_hidden`` is the PRE-norm mHC reduction [B, T, dim] (the confidence
+        head's ``h_k``); ``base_logits`` came from the post-norm tensor.
         """
         B, T, _ = base_logits.shape
         last = self.mtp[-1]
@@ -917,6 +1008,6 @@ class _DSparkInner(nn.Module):
             )  # greedy (temp handled upstream)
             markov_embeds.append(m_embed)
         confidence = last.confidence_head(
-            hidden, torch.stack(markov_embeds, dim=1)
+            hc_hidden, torch.stack(markov_embeds, dim=1)
         )  # [B, T]
         return out_ids[:, 1:], confidence

@@ -194,6 +194,11 @@ RUN pip show atom || true
 
 RUN pip install --no-cache-dir msgpack msgspec quart
 
+# flash-linear-attention (import name `fla`): Kimi-K3 KDA prefill uses
+# fla.ops.kda.chunk_kda. Its only core dep is einops (already present); torch and
+# triton sit behind extras, so this does NOT touch the image's ROCm torch/triton.
+RUN pip install --no-cache-dir flash-linear-attention==0.5.2 fla-core==0.5.2
+
 # atomesh: install the binary produced by the ATOM package build hook to /usr/local/bin
 RUN echo "========== Install atomesh binary ==========" && \
     cd /app/ATOM/atom/mesh && \
@@ -244,8 +249,9 @@ RUN if [ "${INSTALL_SA_AIPERF}" = "1" ]; then \
         git clone https://github.com/SemiAnalysisAI/aiperf.git /opt/aiperf && \
         cd /opt/aiperf && \
         git checkout "${SA_AIPERF_COMMIT}" && \
+        sed -i '/^[[:space:]]*"transformers @ git+/d' pyproject.toml && \
+        ! grep -q '^[[:space:]]*"transformers @ git+' pyproject.toml && \
         "${VENV_PYTHON}" -m pip install -e . && \
-        "${VENV_PYTHON}" -m pip install --no-cache-dir "transformers==5.2.0" && \
         "${VENV_PYTHON}" -c "import transformers; print(f'transformers.__version__ = {transformers.__version__}')" && \
         "${VENV_PYTHON}" -m pip show aiperf || true && \
         command -v aiperf && aiperf --help >/dev/null; \
