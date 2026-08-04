@@ -51,33 +51,69 @@ _V2_IMPORTED = False
 
 
 def _import_v2() -> None:
+    """Bind the v2 op-layer, preferring aiter's vendored copy.
+
+    Two copies exist. aiter vendors the op-layer plus its FlyDSL kernels
+    (aiter.ops.flydsl.dispatch_combine_v2) and is the only one carrying the
+    gemm2-fused combine, since that mode is a contract between the op and
+    aiter's gemm2 epilogue. mori ships its own copy and stays the fallback; only
+    the cco communication substrate (mori.cco) is required from mori either way.
+    """
     global EpDispatchCombineConfig, EpDispatchCombineOp, _V2_IMPORTED
     if _V2_IMPORTED:
         return
     if not MORI_AVAILABLE:
         raise ImportError("mori is required for MoriV2PrepareAndFinalize")
     try:
-        from mori.ops.dispatch_combine_v2.dispatch_combine_op import (  # type: ignore
+        from aiter.ops.flydsl.dispatch_combine_v2 import (  # type: ignore
             EpDispatchCombineConfig as _Cfg,
             EpDispatchCombineOp as _Op,
         )
     except ImportError:
-        # Older mori shipped dispatch_combine_v2 as loose test-only modules with
-        # no __init__.py, importing each other by top-level name -- they only
-        # resolve with their own directory on sys.path.
-        v2_dir = os.path.join(
-            os.path.dirname(mori.__file__), "ops", "dispatch_combine_v2"
-        )
-        if v2_dir not in sys.path:
-            sys.path.insert(0, v2_dir)
-        from dispatch_combine_op import (  # type: ignore  # noqa: E402
-            EpDispatchCombineConfig as _Cfg,
-            EpDispatchCombineOp as _Op,
-        )
+        try:
+            from mori.ops.dispatch_combine_v2.dispatch_combine_op import (  # type: ignore
+                EpDispatchCombineConfig as _Cfg,
+                EpDispatchCombineOp as _Op,
+            )
+        except ImportError:
+            # Older mori shipped dispatch_combine_v2 as loose test-only modules
+            # with no __init__.py, importing each other by top-level name --
+            # they only resolve with their own directory on sys.path.
+            v2_dir = os.path.join(
+                os.path.dirname(mori.__file__), "ops", "dispatch_combine_v2"
+            )
+            if v2_dir not in sys.path:
+                sys.path.insert(0, v2_dir)
+            from dispatch_combine_op import (  # type: ignore  # noqa: E402
+                EpDispatchCombineConfig as _Cfg,
+                EpDispatchCombineOp as _Op,
+            )
 
     EpDispatchCombineConfig = _Cfg
     EpDispatchCombineOp = _Op
     _V2_IMPORTED = True
+
+
+def _resolve_combine_mode() -> str:
+    """"scatter_fused" when ATOM_MORI_V2_FUSED is on and the op-layer supports it.
+
+    Falls back to plain gather with a warning rather than failing to serve, so an
+    environment whose op-layer predates the fused mode still starts.
+    """
+    from atom.utils import envs as _atom_envs
+
+    if not _atom_envs.ATOM_MORI_V2_FUSED:
+        return "gather"
+    _import_v2()
+    # is_fused only exists on the aiter-vendored config; mori's copy has no
+    # gemm2-fused mode and would reject the combine_mode outright.
+    if not hasattr(EpDispatchCombineConfig, "is_fused"):
+        logger.warning(
+            "[MORI-V2] ATOM_MORI_V2_FUSED=1 but the available v2 op-layer has no "
+            "gemm2-fused combine; falling back to gather."
+        )
+        return "gather"
+    return "scatter_fused"
 
 
 @lru_cache(maxsize=1)
@@ -122,6 +158,7 @@ def init_mori_v2_op(
     num_local_experts: int,
     num_experts_per_token: int,
     data_type_itemsize: int,
+    combine_mode: str = "gather",
 ) -> Any:
     """Create (and cache) a dispatch_combine_v2 op bound to the EP cco comm."""
     _import_v2()
@@ -149,20 +186,20 @@ def init_mori_v2_op(
         num_experts_per_rank=num_local_experts,
         num_experts_per_token=num_experts_per_token,
         data_type=data_type,
-        combine_mode="gather",
-        quant_type="none",
+        combine_mode=combine_mode,
     )
     op = EpDispatchCombineOp(cfg, comm)
     comm.barrier()
     logger.info(
         "[MORI-V2] Created dispatch_combine_v2 op: ep_rank=%d ep_size=%d "
-        "hidden=%d num_local_experts=%d topk=%d M=%d",
+        "hidden=%d num_local_experts=%d topk=%d M=%d combine=%s",
         ep_rank,
         ep_size,
         hidden_dim,
         num_local_experts,
         num_experts_per_token,
         max_num_inp_token_per_rank,
+        combine_mode,
     )
     return op
 
@@ -186,6 +223,10 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         self.num_dispatchers_ = num_dispatchers
         # Routing handle stashed between prepare() and finalize() of one forward.
         self._routing = None
+        self.is_fused = bool(getattr(mori_v2_op.cfg, "is_fused", False))
+        # gemm2 epilogue handles, refreshed per prepare() (the reverse map is
+        # per-routing). Read by the modular kernel between prepare and finalize.
+        self._ep_scatter_kwargs: dict = {}
 
     @property
     def activation_format(self) -> mk.FusedMoEActivationFormat:
@@ -232,6 +273,7 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         )
         self._routing = routing
         total_recv = int(total_recv_t.item())
+        self._ep_scatter_kwargs = self._make_ep_scatter_kwargs(routing)
 
         # aiter FlyDSL kernels must not read cco symmetric VMM memory: clone the
         # dispatched tokens/routing out of the arena window before the GEMM.
@@ -253,6 +295,34 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             dispatch_weights,
         )
 
+    def _make_ep_scatter_kwargs(self, routing) -> dict:
+        """fused_moe kwargs that let the gemm2 epilogue P2P-write its weighted
+        per-(token,k) results straight into the peers' combine staging.
+
+        Empty unless the op runs combine_mode="scatter_fused". The staging must be
+        zeroed first: gemm2 only writes the (token,k) slots whose expert survived
+        dispatch, and the dropped ones have to read 0 in the combine sum.
+        """
+        if not self.is_fused:
+            return {}
+        self._op.zero_fused_staging()
+        params = self._op.ep_scatter_params()
+        return dict(
+            ep_scatter=True,
+            ep_arena_handle=params["ep_arena_handle"],
+            ep_comb_inp_off=params["ep_comb_inp_off"],
+            ep_wire_nbytes=params["ep_wire_nbytes"],
+            ep_rank=params["ep_rank"],
+            ep_max_tok=params["ep_max_tok"],
+            ep_topk=params["ep_topk"],
+            # recv-slot -> origin token, so gemm2 knows where each result lands.
+            ep_tis=routing.disp_tok_id_to_src_tok_id_local,
+        )
+
+    def ep_scatter_kwargs(self) -> dict:
+        """Extra fused_moe kwargs for this forward (empty when not fused)."""
+        return self._ep_scatter_kwargs
+
     def finalize(
         self,
         output: torch.Tensor,
@@ -264,8 +334,11 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         # topk_ids here is the ORIGINAL (pre-dispatch) routing, so shape[0] == ct.
         num_token = topk_ids.shape[0]
         assert self._routing is not None, "finalize() called before prepare()"
+        # Fused: gemm2 already wrote the results into the peers' staging, so
+        # combine() ignores fused_expert_output and only barriers + sums.
         out, _ = self._op.combine(fused_expert_output, routing=self._routing)
         self._routing = None
+        self._ep_scatter_kwargs = {}
         return out[:num_token]
 
 
@@ -273,6 +346,11 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
     """Modular kernel for the v2 path: prepare() already trims to the exact
     received-token count, so skip the graph_bs-based dead-tail trim (which would
     otherwise cut valid rows)."""
+
+    def _extra_fused_moe_kwargs(self) -> dict:
+        pf = self.prepare_finalize
+        getter = getattr(pf, "ep_scatter_kwargs", None)
+        return getter() if getter is not None else {}
 
     def _maybe_trim_dispatch_output(
         self,
@@ -302,6 +380,7 @@ def make_mori_v2_prepare_finalize(moe, all2all_manager) -> MoriV2PrepareAndFinal
         num_local_experts=moe.num_experts // all2all_manager.world_size,
         num_experts_per_token=moe.experts_per_token,
         data_type_itemsize=moe.in_dtype.itemsize,
+        combine_mode=_resolve_combine_mode(),
     )
     return MoriV2PrepareAndFinalize(
         op,
