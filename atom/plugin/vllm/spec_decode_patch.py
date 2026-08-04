@@ -95,18 +95,21 @@ def _patch_dspark_causal_draft() -> None:
     vLLM's DSpark speculator pins drafting to non-causal: every block position
     attends to the whole block. ``mla_decode_fwd`` masks tail-aligned-causally
     whatever it is asked for, so getting that upper triangle means merging a
-    second partial attention in by log-sum-exp -- and no aiter decode kernel
-    hands back an LSE we could rely on at serving batch sizes. The persistent
-    kernel leaves ``final_lse`` at FLT_MAX for part of the batch once sequence
-    lengths vary, and routing around it to the split-KV kernel did not hold up
-    end to end at 64 concurrency.
+    second partial attention in by log-sum-exp.
 
     ATOM's native DSpark never merges: the block pass just takes what the
-    kernel gives, so position ``i`` sees ``context + block[:i+1]``. That costs
-    the block's tail -- positions 5-7 are almost never accepted, so acceptance
-    lands near 3.9 rather than 4.7 -- but it needs no LSE at all. Causal
-    drafting is a first-class DFlash mode here, so matching native is just
-    flipping the flag the DSpark subclass pins off, for the Kimi-K3 draft only.
+    kernel gives, so position ``i`` sees ``context + block[:i+1]``. Matching it
+    keeps one drafting semantics across both engines, and it needs no LSE at
+    all. The cost is the block's tail -- positions 5-7 are almost never
+    accepted, so acceptance lands near 3.8. Causal drafting is a first-class
+    DFlash mode here, so matching native is just flipping the flag the DSpark
+    subclass pins off, for the Kimi-K3 draft only.
+
+    Non-causal is a possible follow-up rather than a dead end: the persistent
+    decode kernel does return a usable LSE on gfx950 -- DCP merges cross-rank
+    on it -- so the merge is buildable. The split-KV kernel is the one to avoid,
+    its stage2 reduce leaving ``final_lse`` untouched for a request whose valid
+    split count collapses, which is what a large batch produces.
     """
     try:
         from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator

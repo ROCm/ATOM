@@ -59,17 +59,21 @@ it, and 7 is the validated setting.
 vLLM's DSpark speculator drafts **non-causally**: every position in the block
 attends to the whole block. ATOM's `mla_decode_fwd` masks tail-aligned-causally
 whatever it is asked for, so producing that upper triangle means merging a
-second partial attention in by log-sum-exp — and no aiter decode kernel hands
-back an LSE that holds up at serving batch sizes (the persistent kernel leaves
-`final_lse` at `FLT_MAX` for part of the batch once sequence lengths vary).
+second partial attention in by log-sum-exp.
 
-The plugin therefore flips the draft to **causal** for the `K3DSparkModel`
+The plugin instead flips the draft to **causal** for the `K3DSparkModel`
 architecture only, matching what ATOM's native DSpark has always done: position
-`i` sees `context + block[:i+1]`. That costs the block's tail — the last three
-of the seven positions contribute almost no accepted tokens — so acceptance
-lands near 3.8 rather than the non-causal ceiling, and it needs no LSE at all.
-Nothing else in the DSpark path changes, and no other model's drafting is
-touched.
+`i` sees `context + block[:i+1]`. One drafting semantics across both engines,
+and no merge to build. That costs the block's tail — the last three of the seven
+positions contribute almost no accepted tokens — so acceptance lands near 3.8
+rather than the non-causal ceiling. Nothing else in the DSpark path changes, and
+no other model's drafting is touched.
+
+Non-causal remains open as a follow-up. The persistent decode kernel does return
+a usable LSE on gfx950 — DCP merges cross-rank on it — so the merge is
+buildable; it is the split-KV kernel that is not usable here, its stage2 reduce
+leaving `final_lse` untouched for any request whose valid split count collapses,
+which is exactly what a large batch produces.
 
 ### Separate bf16 draft KV cache
 
