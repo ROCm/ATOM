@@ -73,6 +73,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the gfx1250-capable path. Only takes effect when the mori all2all path is
     # active (dp_size>1 + expert-parallel + mori installed).
     "ATOM_MORI_V2": lambda: os.getenv("ATOM_MORI_V2", "0") == "1",
+    # gemm2-fused EP combine (v2 combine_mode="scatter_fused"): the a8w4 grouped
+    # gemm2 epilogue P2P-writes its weighted per-(token,k) results straight into
+    # the peers' combine staging, so combine only barriers + sums. Requires the
+    # aiter-vendored v2 op-layer and the a8w4 (fp8 act + mxfp4 weight) path;
+    # ignored unless ATOM_MORI_V2 is on.
+    "ATOM_MORI_V2_FUSED": lambda: os.getenv("ATOM_MORI_V2_FUSED", "0") == "1",
     "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
     # --- Kernel Fusion Toggles ---
     # fused_compress_attn: switch between Triton (default historical) and a
