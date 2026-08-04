@@ -2229,7 +2229,7 @@ class ModelRunner:
             num_input_tokens = max_tokens
         # else: variable-length path — each rank keeps its own token count.
 
-        self._dspark_decode_replay = dp_uniform_decode and not sync.any_dummy
+        self._dspark_decode_replay = dp_uniform_decode
 
         return (
             num_input_tokens,
@@ -2536,7 +2536,7 @@ class ModelRunner:
             _dspark_shape_max,
         ) = preprocessed
         # NOTE: self._dspark_decode_replay is set inside _preprocess (it needs
-        # sync.any_dummy), so it's already current here for build()/run_model.
+        # the DP sync result), so it's already current here for build()/run_model.
 
         # Precompute the flat replay token count once here (before attn build +
         # run_model) so the attn builder's positions padding matches it.
@@ -3018,7 +3018,6 @@ class ModelRunner:
                     num_tokens_pad, real_tokens, _captured = (
                         self._piecewise_replay_shape(batch, graph_bs, max_q_len)
                     )
-                    _is_dummy = batch is not None and batch.is_dummy_run
                     # Pad tail to a legal vocab id / position (builder fills to
                     # graph_cap >= num_tokens_pad, so a no-op safety net).
                     if num_tokens_pad > real_tokens:
@@ -3034,9 +3033,7 @@ class ModelRunner:
                         else self.forward_vars["positions"].gpu[:num_tokens_pad]
                     )
                     forward_context.cudagraph_runtime_mode = (
-                        CUDAGraphMode.PIECEWISE
-                        if (not _is_dummy and _captured)
-                        else CUDAGraphMode.NONE
+                        CUDAGraphMode.PIECEWISE if _captured else CUDAGraphMode.NONE
                     )
                     forward_context.batch_descriptor = BatchDescriptor(
                         num_tokens=num_tokens_pad
@@ -3476,10 +3473,12 @@ class ModelRunner:
 
         Mirrors the ragged branch of ``_piecewise_replay_shape``: the smallest
         captured q-divisible num_tokens bucket >= the (DP-max) real token total.
-        None for non-ragged / non-piecewise / dummy / prefill / no-match."""
+        None for non-ragged / non-piecewise / prefill / no-match.
+
+        Dummy batches are INCLUDED: a DP-lockstep dummy rank must pad to the same
+        flat token count as the real ranks or it cannot replay alongside them."""
         if (
             batch is None
-            or batch.is_dummy_run
             or batch.total_tokens_num_prefill > 0
             or not self._piecewise_cg_active()
             or not self._piecewise_sorted_tokens
@@ -3512,10 +3511,8 @@ class ModelRunner:
         [0:total] tokens, the [total:pad] tail is masked. Non-spec (or DP) uses
         the rectangular bucket num_tokens == bs.
         """
-        is_dummy = batch is not None and batch.is_dummy_run
         use_ragged_bucket = (
             batch is not None
-            and not is_dummy
             and self._piecewise_sorted_tokens
             and hasattr(self, "drafter")
         )
@@ -3528,8 +3525,9 @@ class ModelRunner:
             )
             buckets = self._piecewise_sorted_tokens
             q = int(max_q_len)
-            # Pick the q-divisible bucket N; replay only when all-real (see
-            # _dspark_decode_replay -- any dummy this step -> everyone eager).
+            # Pick the q-divisible bucket N. q is num_spec_query_tokens, already
+            # quantized to a captured bucket by _dspark_apply_ragged, so the
+            # divisibility test is satisfiable by construction.
             _replay = bool(getattr(self, "_dspark_decode_replay", False))
             for b in buckets:
                 if b >= real_tokens and q > 0 and b % q == 0:

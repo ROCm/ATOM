@@ -46,6 +46,7 @@ from .protocol import (
     ModelCard,
     ModelList,
 )
+from .reasoning import prompt_starts_in_reasoning
 from .serving_anthropic import (
     AnthropicMessagesRequest,
     anthropic_to_openai_messages,
@@ -62,8 +63,10 @@ from .serving_anthropic import (
 from .serving_chat import (
     build_chat_response,
     build_chat_response_multi,
+    resolve_thinking,
     stream_chat_response,
     stream_chat_response_fanout,
+    validate_chat_request,
 )
 from .serving_completion import (
     build_completion_response,
@@ -1087,11 +1090,24 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
     validate_model(request.model)
 
     try:
+        validate_chat_request(request)
         messages = request.get_messages()
 
         merged_kwargs = dict(default_chat_template_kwargs)
         if request.chat_template_kwargs:
             merged_kwargs.update(request.chat_template_kwargs)
+        # Forward K3 template controls the chat template needs but that pydantic
+        # does not otherwise thread through: structured-output response_format,
+        # a string tool_choice ("auto"/"none"/"required"), and thinking/effort.
+        if request.response_format is not None:
+            merged_kwargs["response_format"] = request.response_format
+        if isinstance(request.tool_choice, str):
+            merged_kwargs["tool_choice"] = request.tool_choice
+        if request.thinking is not None or request.reasoning_effort is not None:
+            _th_enabled, _th_effort = resolve_thinking(request)
+            merged_kwargs["thinking"] = _th_enabled
+            if _th_effort is not None:
+                merged_kwargs["thinking_effort"] = _th_effort
 
         effective_n = _coerce_n(request.n, request.temperature)
         sampling_params = _build_sampling_params(
@@ -1127,6 +1143,12 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 tools=request.tools,
                 **merged_kwargs,
             )
+
+        # The K3 template may inject the opening reasoning marker into the prompt
+        # itself; if so the stream begins mid-thought and the ReasoningFilter must
+        # start in the thinking state. Multimodal inputs are pre-tokenized ids, so
+        # this only applies to the text path.
+        _starts_thinking = (not is_multimodal) and prompt_starts_in_reasoning(prompt)
 
         # Streaming
         if request.stream:
@@ -1167,6 +1189,8 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     num_prompt_tokens,
                     cleanup_streaming_request,
                     tools=request.tools,
+                    tool_choice=request.tool_choice,
+                    starts_thinking=_starts_thinking,
                 )
             return StreamingResponse(
                 _logged_stream(gen, request_id),
@@ -1189,7 +1213,11 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             if not outputs:
                 raise RuntimeError("No output generated")
             resp = build_chat_response_multi(
-                request_id, model_name, outputs, tools=request.tools
+                request_id,
+                model_name,
+                outputs,
+                tools=request.tools,
+                tool_choice=request.tool_choice,
             )
         elif is_multimodal:
             final_output = await _run_nonstream_with_disconnect(
@@ -1210,6 +1238,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 final_output["text"],
                 final_output,
                 tools=request.tools,
+                tool_choice=request.tool_choice,
             )
         elif effective_n > 1:
             outputs = await _race_disconnect(
@@ -1225,7 +1254,11 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             if not outputs:
                 raise RuntimeError("No output generated")
             resp = build_chat_response_multi(
-                request_id, model_name, outputs, tools=request.tools
+                request_id,
+                model_name,
+                outputs,
+                tools=request.tools,
+                tool_choice=request.tool_choice,
             )
         else:
             final_output = await _run_nonstream_with_disconnect(
@@ -1246,6 +1279,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 final_output["text"],
                 final_output,
                 tools=request.tools,
+                tool_choice=request.tool_choice,
             )
         _log_request_event("response", request_id, resp.model_dump())
         return resp
