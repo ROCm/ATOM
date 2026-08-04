@@ -1356,6 +1356,11 @@ class Config:
     load_dummy: str | None = None
     enable_expert_parallel: bool = False
     fake_eplb: bool = False
+    # Width the MoE shards experts for when DP-attention simulates a deployment
+    # wider than the box (set by CoreManager); 0 = not simulating.
+    # `parallel_config.data_parallel_size` stays the real rank count, since it
+    # sizes the process group and the token collectives.
+    dp_logical_size: int = 0
     master_addr: str = "127.0.0.1"
     graph_bs: list[int] | None = None
     enable_dp_attention: bool = False
