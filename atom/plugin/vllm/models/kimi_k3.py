@@ -109,6 +109,13 @@ class KimiKDAAttentionVllm(KimiKDAAttention, MambaBase):
         self._atom_cache = SimpleNamespace(k_cache=None, v_cache=None)
         self._atom_kv_cache_data = {f"layer_{self.layer_num}": self._atom_cache}
 
+    def process_weights_after_loading(self, *args, **kwargs) -> None:
+        # Newer vLLM (model_loader/utils.py) calls
+        # process_weights_after_loading(model_config.dtype) on every
+        # AttentionLayerBase; native KimiKDAAttention takes no argument. Absorb
+        # the extra positional so KDA post-load folding still runs.
+        return super().process_weights_after_loading()
+
     def get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
         return _get_k3_state_dtype(self.vllm_config)
 
@@ -273,6 +280,17 @@ class KimiK3ForConditionalGeneration_(vLLMKimiK3):
             self.language_model.make_empty_intermediate_tensors
         )
         self.media_placeholder = self.config.media_placeholder_token_id
+
+        # load_model reads packed_modules_mapping / weights_mapping off the top
+        # model (this inner class), but the KDA-aware fusion is only known at the
+        # nested language model's instance level: KimiK3ForCausalLM sets
+        # packed_modules_mapping = _kda_packed_modules_mapping(kimi_kda_layers)
+        # (fuses self_attn.{q,k,v,g}_proj -> in_proj) and carries the
+        # compressed-tensors weight_packed->weight rename. Surface both here so
+        # the plugin loader applies them (the class-level packed_modules_mapping
+        # kept for ATOMModelBase's pre-init quant remap has an empty KDA list).
+        self.packed_modules_mapping = self.language_model.packed_modules_mapping
+        self.weights_mapping = self.language_model.weights_mapping
 
     def _maybe_ignore_quant_config(
         self, quant_config: Any, exclude_layers: list[str], layer_name: str
