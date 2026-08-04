@@ -26,7 +26,11 @@ pip install -e /path/to/ATOM --no-deps
 ## Launch
 
 ```bash
-MODEL=/path/to/Kimi-K3
+ATOM_ROOT=/path/to/ATOM
+MODEL=/data/amd_int/models/Kimi-K3
+CHAT_TEMPLATE=.github/scripts/kimi_k3_chat_template.jinja
+
+cd "${ATOM_ROOT}"
 
 export AITER_LOG_LEVEL=WARNING
 export ATOM_LOADER_USE_THREADPOOL=1
@@ -53,7 +57,8 @@ vllm serve "${MODEL}" \
     --gpu-memory-utilization 0.93 \
     --block-size 128 \
     --no-enable-prefix-caching \
-    --no-async-scheduling \
+    --async-scheduling \
+    --chat-template "${CHAT_TEMPLATE}" \
     --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE"}'
 ```
 
@@ -68,27 +73,34 @@ reconstructed from the paged MLA cache alone.
 ## Smoke test
 
 ```bash
-curl http://127.0.0.1:8000/v1/completions \
+curl http://127.0.0.1:8000/v1/chat/completions \
     -H "Content-Type: application/json" \
-    -d '{
-      "model": "/path/to/Kimi-K3",
-      "prompt": "Question: What is 17 + 25? Answer:",
-      "max_tokens": 32,
-      "temperature": 0
-    }'
+    -d "{
+      \"model\": \"${MODEL}\",
+      \"messages\": [
+        {
+          \"role\": \"user\",
+          \"content\": \"Question: What is 17 + 25? Answer:\"
+        }
+      ],
+      \"max_tokens\": 32,
+      \"temperature\": 0
+    }"
 ```
 
-The deterministic response starts with `42`.
+The deterministic response gives the answer `42`.
 
 ## Accuracy validation
 
 ```bash
 lm_eval \
-    --model local-completions \
-    --model_args "model=${MODEL},base_url=http://localhost:8000/v1/completions,num_concurrent=64,max_retries=3,tokenized_requests=False,trust_remote_code=True" \
+    --model local-chat-completions \
+    --apply_chat_template \
+    --fewshot_as_multiturn \
+    --model_args "model=${MODEL},base_url=http://localhost:8000/v1/chat/completions,num_concurrent=65,max_retries=1,max_gen_toks=2048,tokenized_requests=False,trust_remote_code=True" \
     --tasks gsm8k \
     --num_fewshot 5 \
-    --output_path /app/logs_claude/kimi_k3_vllm_graph_clean_gsm8k
+    --output_path /tmp/kimi_k3_gsm8k_chat
 ```
 
 Validated on the full 1319-example GSM8K test set with TP8 and
@@ -97,12 +109,12 @@ Validated on the full 1319-example GSM8K test set with TP8 and
 ```text
 |Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
 |-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
-|gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9553|±  |0.0057|
-|     |       |strict-match    |     5|exact_match|↑  |0.9553|±  |0.0057|
+|gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9591|±  |0.0055|
+|     |       |strict-match    |     5|exact_match|↑  |0.9598|±  |0.0054|
 ```
 
-Raw result JSON is written below
-`/app/logs_claude/kimi_k3_vllm_graph_clean_gsm8k/`.
+Raw result JSON is written below `/tmp/kimi_k3_gsm8k_chat/`. The CI
+accuracy threshold is `0.95`.
 
 Use a freshly started server for each reported accuracy run, matching the
 native Kimi-K3 validation protocol. Back-to-back evaluations on a warm server
@@ -112,5 +124,5 @@ are not used as baselines for this model.
 
 - Text generation only; the vision tower and multimodal projector are skipped.
 - TP8 on MI355/gfx950 is the validated deployment.
-- Prefix caching and asynchronous scheduling are disabled.
+- Prefix caching is disabled; asynchronous scheduling is enabled.
 - Speculative decoding is not enabled for this model.

@@ -35,6 +35,7 @@ on:
           - Kimi-K2-Thinking-MXFP4 TP8
           - Kimi-K2.5-MXFP4 TP4
           - Kimi-K2.5-MXFP4 TP8
+          - Kimi-K3 TP8
           - DeepSeek-R1-FP8 TP8
           - DeepSeek-R1-FP8 DP8+EP8
           - DeepSeek-R1-0528-MXFP4 TP8
@@ -83,6 +84,7 @@ on:
           - Kimi-K2-Thinking-MXFP4 TP8
           - Kimi-K2.5-MXFP4 TP4
           - Kimi-K2.5-MXFP4 TP8
+          - Kimi-K3 TP8
           - DeepSeek-R1-FP8 TP8
           - DeepSeek-R1-FP8 DP8+EP8
           - DeepSeek-R1-0528-MXFP4 TP8
@@ -131,6 +133,7 @@ on:
           - Kimi-K2-Thinking-MXFP4 TP8
           - Kimi-K2.5-MXFP4 TP4
           - Kimi-K2.5-MXFP4 TP8
+          - Kimi-K3 TP8
           - DeepSeek-R1-FP8 TP8
           - DeepSeek-R1-FP8 DP8+EP8
           - DeepSeek-R1-0528-MXFP4 TP8
@@ -179,6 +182,7 @@ on:
           - Kimi-K2-Thinking-MXFP4 TP8
           - Kimi-K2.5-MXFP4 TP4
           - Kimi-K2.5-MXFP4 TP8
+          - Kimi-K3 TP8
           - DeepSeek-R1-FP8 TP8
           - DeepSeek-R1-FP8 DP8+EP8
           - DeepSeek-R1-0528-MXFP4 TP8
@@ -227,6 +231,7 @@ on:
           - Kimi-K2-Thinking-MXFP4 TP8
           - Kimi-K2.5-MXFP4 TP4
           - Kimi-K2.5-MXFP4 TP8
+          - Kimi-K3 TP8
           - DeepSeek-R1-FP8 TP8
           - DeepSeek-R1-FP8 DP8+EP8
           - DeepSeek-R1-0528-MXFP4 TP8
@@ -275,6 +280,7 @@ on:
           - Kimi-K2-Thinking-MXFP4 TP8
           - Kimi-K2.5-MXFP4 TP4
           - Kimi-K2.5-MXFP4 TP8
+          - Kimi-K3 TP8
           - DeepSeek-R1-FP8 TP8
           - DeepSeek-R1-FP8 DP8+EP8
           - DeepSeek-R1-0528-MXFP4 TP8
@@ -323,6 +329,7 @@ on:
           - Kimi-K2-Thinking-MXFP4 TP8
           - Kimi-K2.5-MXFP4 TP4
           - Kimi-K2.5-MXFP4 TP8
+          - Kimi-K3 TP8
           - DeepSeek-R1-FP8 TP8
           - DeepSeek-R1-FP8 DP8+EP8
           - DeepSeek-R1-0528-MXFP4 TP8
@@ -371,6 +378,7 @@ on:
           - Kimi-K2-Thinking-MXFP4 TP8
           - Kimi-K2.5-MXFP4 TP4
           - Kimi-K2.5-MXFP4 TP8
+          - Kimi-K3 TP8
           - DeepSeek-R1-FP8 TP8
           - DeepSeek-R1-FP8 DP8+EP8
           - DeepSeek-R1-0528-MXFP4 TP8
@@ -974,6 +982,9 @@ jobs:
             MODEL_CACHE_ROOT="/it-share/models"
           elif [ -d "/models" ]; then
             MODEL_CACHE_ROOT="/models"
+          elif [ -d "/data/amd_int/models" ]; then
+            MODEL_CACHE_ROOT="/data/amd_int/models"
+            MODEL_MOUNT_PATH="/data/amd_int/models"
           elif [ -d "/data/models" ]; then
             MODEL_CACHE_ROOT="/data/models"
           fi
@@ -983,6 +994,11 @@ jobs:
             MODEL_CACHE_DESC="${MODEL_CACHE_ROOT} (shared host path)"
           else
             echo "No shared host model cache found; using container-local ${MODEL_MOUNT_PATH}."
+          fi
+
+          if [ -d "/data/amd_int/models" ] && [[ "${MODEL_CACHE_MOUNT}" != *"/data/amd_int/models:/data/amd_int/models"* ]]; then
+            MODEL_CACHE_MOUNT="${MODEL_CACHE_MOUNT:+${MODEL_CACHE_MOUNT} }-v /data/amd_int/models:/data/amd_int/models"
+            MODEL_CACHE_DESC="${MODEL_CACHE_DESC}; /data/amd_int/models (Kimi-K3 host path)"
           fi
 
           echo "Using model cache backend: ${MODEL_CACHE_DESC}"
@@ -1066,7 +1082,8 @@ jobs:
           import os
           from pathlib import Path
 
-          model_path = os.environ["MODEL_PATH"].strip().strip("/")
+          raw_model_path = os.environ["MODEL_PATH"].strip()
+          model_path = raw_model_path.strip("/")
           normalized = model_path.rstrip("/")
           basename = Path(normalized).name
 
@@ -1158,6 +1175,8 @@ jobs:
           }
 
           candidates = []
+          if Path(raw_model_path).is_absolute():
+              candidates.append(raw_model_path.rstrip("/"))
           if normalized:
               candidates.append(f"/models/{normalized}")
           if basename:
@@ -1200,7 +1219,12 @@ jobs:
         if: ${{ steps.validation-window.outputs.should_run == 'true' }}
         run: |
           set -euo pipefail
-          model_dir="${MODEL_MOUNT_PATH}/${{ matrix.model_path }}"
+          configured_model_path="${{ matrix.model_path }}"
+          if [[ "${configured_model_path}" = /* ]]; then
+            model_dir="${configured_model_path}"
+          else
+            model_dir="${MODEL_MOUNT_PATH}/${configured_model_path}"
+          fi
           if [ "${OOT_MODEL_AVAILABLE_LOCALLY:-false}" = "true" ]; then
             echo "Using local model path ${OOT_RESOLVED_MODEL_PATH}; skip download."
             exit 0
@@ -1272,7 +1296,10 @@ jobs:
             echo "Using previously resolved local model path: ${OOT_RESOLVED_MODEL_PATH}"
             exit 0
           fi
-          if [ -n "${MODEL_CACHE_MOUNT}" ]; then
+          if [[ "${{ matrix.model_path }}" = /* ]]; then
+            echo "OOT_RESOLVED_MODEL_PATH=${{ matrix.model_path }}" >> "$GITHUB_ENV"
+            echo "Using absolute model path: ${{ matrix.model_path }}"
+          elif [ -n "${MODEL_CACHE_MOUNT}" ]; then
             echo "OOT_RESOLVED_MODEL_PATH=${MODEL_MOUNT_PATH}/${{ matrix.model_path }}" >> "$GITHUB_ENV"
             echo "Using mounted model path: ${MODEL_MOUNT_PATH}/${{ matrix.model_path }}"
           else
