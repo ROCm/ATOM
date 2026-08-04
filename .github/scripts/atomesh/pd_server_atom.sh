@@ -127,6 +127,14 @@ has_cli_flag() {
   [[ " ${args} " == *" ${flag} "* ]]
 }
 
+is_agentic_dpa() {
+  [[ "${BENCHMARK_KIND}" == "aiperf_agentic" ]] \
+    && {
+      has_cli_flag "${PREFILL_EXTRA_SERVER_ARGS}" "--enable-dp-attention" \
+        || has_cli_flag "${DECODE_EXTRA_SERVER_ARGS}" "--enable-dp-attention"
+    }
+}
+
 ISL_LIST="${ISL_LIST:-8192}"
 OSL="${OSL:-1024}"
 CONC_LIST="${CONC_LIST:-4,8}"
@@ -625,14 +633,21 @@ start_router() {
       ;;
   esac
 
+  local router_policy="${ROUTER_POLICY}"
   local -a router_rank_mapping_args=()
   if [[ "${ATOM_PD_RANK_MAPPING_POLICY}" != "none" ]] \
     && has_cli_flag "${PREFILL_EXTRA_SERVER_ARGS}" "--enable-dp-attention" \
     && has_cli_flag "${DECODE_EXTRA_SERVER_ARGS}" "--enable-dp-attention"; then
     router_rank_mapping_args=(
       --atom-pd-rank-mapping-policy "${ATOM_PD_RANK_MAPPING_POLICY}"
-      --dp-aware
     )
+  fi
+  local -a router_dp_aware_args=()
+  if is_agentic_dpa; then
+    router_policy="dp_sticky"
+    router_dp_aware_args=(--dp-aware)
+  elif [[ "${#router_rank_mapping_args[@]}" -gt 0 ]]; then
+    router_dp_aware_args=(--dp-aware)
   fi
   local -a router_cmd=(
     /usr/local/bin/atomesh launch
@@ -641,8 +656,9 @@ start_router() {
     --pd-disaggregation
     "${prefill_args[@]}"
     "${decode_args[@]}"
-    --policy "${ROUTER_POLICY}"
+    --policy "${router_policy}"
     "${router_rank_mapping_args[@]}"
+    "${router_dp_aware_args[@]}"
     --backend atom
     --log-level info
     --disable-circuit-breaker
@@ -802,6 +818,12 @@ PY
 
 run_aiperf_agentic_benchmark() {
   ensure_aiperf
+
+  if is_agentic_dpa; then
+    export AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID=true
+  else
+    unset AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID
+  fi
 
   local safe_model="${MODEL_NAME//\//-}"
   local -a server_metrics_args=(--server-metrics)
