@@ -296,7 +296,7 @@ models:
           accuracy:
             task: swebench_lite
             threshold: 0.50
-            agent_workers: 16
+            agent_workers: 32
             agent_step_limit: 150
             case_timeout: 3600
             agent_timeout: 21600
