@@ -47,6 +47,15 @@ if (
 
 from atom.model_ops.moe import MoEActivationQuant
 
+# aiter's shuffle_scale_moe only implements the native preshuffled FP4
+# tensor-core scale layout for CDNA4 (gfx950) and gfx1250 -- other archs
+# (e.g. gfx942/MI300X, which has no such hardware layout to shuffle for)
+# aren't handled and fall through with an UnboundLocalError. The Triton
+# MXFP4 GEMM kernels already have a complete, arch-general fallback for
+# swizzle_mx_scale=None (unshuffled row-major scale reads), so archs outside
+# this set skip the shuffle entirely rather than calling into it.
+_MXFP4_SWIZZLE_CAPABLE_ARCHS = {"gfx950", "gfx1250"}
+
 
 def _swizzle_mxfp4(
     w1,
@@ -62,8 +71,10 @@ def _swizzle_mxfp4(
 ):
     """Weight swizzle for mxfp4 moe, used for aiter triton mxfp4 moe kernels.
 
-    The arch -> SWIZZLE_MX_SCALE label decision lives in aiter
-    (``shuffle_scale_moe(..., return_layout=True)``), so this stays arch-agnostic.
+    Only archs in ``_MXFP4_SWIZZLE_CAPABLE_ARCHS`` have a native preshuffled
+    FP4 tensor-core scale layout for ``shuffle_scale_moe`` to produce; other
+    archs (e.g. gfx942) skip the shuffle and run the kernels' arch-general
+    ``swizzle_mx_scale=None`` (unshuffled) path instead.
     """
     assert envs.ATOM_USE_TRITON_GEMM or envs.ATOM_USE_TRITON_MOE
 
@@ -73,14 +84,16 @@ def _swizzle_mxfp4(
     w2_triton_layout = w2.transpose(-2, -1)
     w2_scale_triton_layout = w2_scale.transpose(-2, -1)
 
-    if N_1 % 32 == 0 and K_1 % (32 * 8) == 0:
+    can_swizzle = get_arch() in _MXFP4_SWIZZLE_CAPABLE_ARCHS
+
+    if can_swizzle and N_1 % 32 == 0 and K_1 % (32 * 8) == 0:
         w1_scale_triton_layout, w1_swizzle_layout = shuffle_scale_moe(
             w1_scale_triton_layout, return_layout=True
         )
     else:
         w1_swizzle_layout = None
 
-    if N_2 % 32 == 0 and K_2 % (32 * 8) == 0:
+    if can_swizzle and N_2 % 32 == 0 and K_2 % (32 * 8) == 0:
         w2_scale_triton_layout, w2_swizzle_layout = shuffle_scale_moe(
             w2_scale_triton_layout, return_layout=True
         )

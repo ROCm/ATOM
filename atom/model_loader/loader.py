@@ -214,7 +214,7 @@ def initialize_dummy_weights(model: nn.Module, mode: str) -> None:
                 data.zero_()
             else:  # 1D norm weight etc.
                 data.fill_(1.0)
-        elif dt in (torch.float8_e4m3fn, torch.float8_e5m2):
+        elif dt in (torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2):
             data.fill_(1.0)  # fp8 packed weight
         else:  # fp4x2 packed weight, viewable as uint8
             data.view(torch.uint8).fill_(_FP4_UNIT_BYTE)
