@@ -113,14 +113,41 @@ class ATOMMiniMaxM3SGLangKVPool:
             layer_id: idx for idx, layer_id in enumerate(self._sparse_layers)
         }
         index_dim = _m3_index_dim(hf_config)
-        self.index_k_buffer = [
-            torch.empty(
-                (self.size + self.page_size, 1, index_dim),
-                dtype=index_dtype,
-                device=self.device,
+        # SGLang v0.5.15 may allocate the native MiniMax sparse index cache in
+        # the model dtype (for example, BF16) even when the main KV cache uses
+        # FP8. ATOM's FP8 sparse-cache kernels only accept FP8 values or their
+        # uint8 storage representation, so reuse the native cache only when its
+        # concrete tensor dtype is compatible; otherwise allocate an ATOM-owned
+        # index cache below with the requested dtype.
+        requested_index_is_fp8 = _is_fp8_dtype(index_dtype)
+
+        def index_dtype_is_compatible(buffer: torch.Tensor) -> bool:
+            return buffer.dtype == index_dtype or (
+                requested_index_is_fp8
+                and (buffer.dtype == torch.uint8 or _is_fp8_dtype(buffer.dtype))
             )
-            for _ in self._sparse_layers
-        ]
+
+        self._reuse_main_index_cache = False
+        if hasattr(main_pool, "get_index_k_buffer"):
+            try:
+                self._reuse_main_index_cache = all(
+                    index_dtype_is_compatible(main_pool.get_index_k_buffer(layer_id))
+                    for layer_id in self._sparse_layers
+                )
+            except (AttributeError, RuntimeError, ValueError):
+                self._reuse_main_index_cache = False
+        self.index_k_buffer = (
+            []
+            if self._reuse_main_index_cache
+            else [
+                torch.empty(
+                    (self.size + self.page_size, 1, index_dim),
+                    dtype=index_dtype,
+                    device=self.device,
+                )
+                for _ in self._sparse_layers
+            ]
+        )
         self.k_scale_buffer = []
         self.v_scale_buffer = []
         if use_fp8_scales:
@@ -173,6 +200,8 @@ class ATOMMiniMaxM3SGLangKVPool:
         )
 
     def get_index_k_buffer(self, layer_id: int) -> torch.Tensor:
+        if self._reuse_main_index_cache:
+            return self.main_pool.get_index_k_buffer(layer_id)
         mapped = self._sparse_layer_mapping.get(int(layer_id))
         if mapped is None:
             raise ValueError(f"MiniMax-M3 layer {layer_id} has no index-K cache")
@@ -262,7 +291,7 @@ def install_minimax_m3_pool_patch() -> None:
         if not _is_m3_runner(self):
             return
         pool = getattr(self, "token_to_kv_pool", None)
-        if pool is None or hasattr(pool, "get_index_k_buffer"):
+        if pool is None or hasattr(pool, "get_kv_scale_buffer"):
             return
         use_fp8_scales = _is_fp8_dtype(self.kv_cache_dtype) or str(
             self.kv_cache_dtype
@@ -337,6 +366,35 @@ def _extend_lens(forward_batch, positions: torch.Tensor, bs: int) -> torch.Tenso
     )
 
 
+def _is_target_verify(forward_batch) -> bool:
+    return bool(
+        getattr(forward_batch.forward_mode, "is_target_verify", lambda: False)()
+    )
+
+
+def _target_verify_lens(
+    forward_batch,
+    positions: torch.Tensor,
+    bs: int,
+    seq_lens: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    spec_info = getattr(forward_batch, "spec_info", None)
+    if spec_info is None:
+        raise RuntimeError("MiniMax-M3 target_verify requires speculative metadata")
+    draft_num = int(getattr(spec_info, "draft_token_num", 0) or 0)
+    if draft_num <= 0:
+        # Keep this robust for future SGLang variants that expose only the flat
+        # token tensor shape.
+        draft_num = max(1, int(positions.numel()) // max(1, bs))
+    query_lens = torch.full(
+        (bs,),
+        draft_num,
+        dtype=torch.int32,
+        device=positions.device,
+    )
+    return seq_lens + query_lens, query_lens, draft_num
+
+
 def _build_block_table(
     forward_batch,
     req_to_token_pool,
@@ -361,15 +419,15 @@ def _build_block_table(
         prefix_lens = seq_lens - extend_lens
         out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
         if out_cache_loc is not None:
-            offset = 0
-            for req_idx in range(bs):
-                prefix_len = int(prefix_lens[req_idx].item())
-                query_len = int(extend_lens[req_idx].item())
-                if query_len > 0:
-                    token_table[req_idx, prefix_len : prefix_len + query_len] = (
-                        out_cache_loc[offset : offset + query_len]
-                    )
-                offset += query_len
+            columns = torch.arange(token_table.shape[1], device=token_table.device)
+            rel_pos = columns.unsqueeze(0) - prefix_lens.unsqueeze(1)
+            mask = (rel_pos >= 0) & (rel_pos < extend_lens.unsqueeze(1))
+            query_offsets = torch.cumsum(extend_lens, dim=0) - extend_lens
+            src_idx = query_offsets.unsqueeze(1) + rel_pos
+            max_src_idx = max(int(out_cache_loc.numel()) - 1, 0)
+            src_idx = src_idx.clamp_min(0).clamp_max(max_src_idx).to(torch.long)
+            src_values = out_cache_loc.gather(0, src_idx.reshape(-1)).view_as(src_idx)
+            token_table = torch.where(mask, src_values, token_table)
 
     return (
         (token_table[:, : max_blocks * page_size : page_size] // page_size)
@@ -384,16 +442,71 @@ def build_atom_minimax_m3_attention_metadata_from_sglang(
     *,
     token_to_kv_pool,
     req_to_token_pool,
+    max_model_len: int,
 ):
     from atom.utils.forward_context import AttentionMetaData
 
     page_size = _page_size(token_to_kv_pool)
     bs = int(forward_batch.batch_size)
     seq_lens = _seq_lens(forward_batch, bs)
-    is_prefill = bool(
-        getattr(forward_batch.forward_mode, "is_prefill", lambda: False)()
-    )
+    forward_mode = forward_batch.forward_mode
+    is_prefill = bool(getattr(forward_mode, "is_prefill", lambda: False)())
+    is_target_verify = _is_target_verify(forward_batch)
     max_context_len = int(req_to_token_pool.req_to_token.shape[1])
+
+    if is_target_verify:
+        seq_lens, query_lens, tokens_per_req = _target_verify_lens(
+            forward_batch,
+            positions,
+            bs,
+            seq_lens,
+        )
+        out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
+        if not torch.is_tensor(out_cache_loc):
+            raise RuntimeError("MiniMax-M3 target_verify requires out_cache_loc")
+
+        # Keep a full model-length block table so its shape matches CUDA graph
+        # capture and native ATOM. In eager mode, use the live context maximum
+        # for max_seqlen_k, matching native ATOM target verify.
+        block_table_max_seq_len = min(max_context_len, max_model_len)
+        max_seq_len = (
+            block_table_max_seq_len
+            if _is_stream_capturing()
+            else (int(seq_lens.max().item()) if bs else 0)
+        )
+        block_table = _build_block_table(
+            forward_batch,
+            req_to_token_pool,
+            seq_lens=seq_lens,
+            extend_lens=query_lens,
+            page_size=page_size,
+            max_seq_len=block_table_max_seq_len,
+        )
+        slot_mapping = out_cache_loc[: bs * tokens_per_req].to(dtype=torch.int64)
+        sparse_md = make_sparse_decode_metadata(
+            seq_lens=seq_lens,
+            block_table=block_table,
+            slot_mapping=slot_mapping,
+            max_seq_len=max_seq_len,
+            max_query_len=tokens_per_req,
+        )
+        cu_q = torch.arange(
+            0,
+            bs * tokens_per_req + 1,
+            tokens_per_req,
+            dtype=torch.int32,
+            device=positions.device,
+        )
+        metadata = AttentionMetaData(
+            cu_seqlens_q=cu_q,
+            max_seqlen_q=tokens_per_req,
+            max_seqlen_k=max_seq_len,
+            slot_mapping=slot_mapping,
+            context_lens=seq_lens,
+            block_tables=block_table,
+        )
+        metadata.sparse_attention_metadata = sparse_md
+        return metadata
 
     if is_prefill:
         extend_lens = _extend_lens(forward_batch, positions, bs)

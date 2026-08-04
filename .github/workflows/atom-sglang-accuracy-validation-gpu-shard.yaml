@@ -190,6 +190,8 @@ jobs:
           cache_roots=(
             /mnt/dcgpuval
             /shared/data/WRH/models
+            /shared_nfs/models
+            /shared_nfs
             /mnt/raid0/pretrained_model
             /data/pretrained_model
             /data/models
@@ -217,8 +219,11 @@ jobs:
               MODEL_CACHE_ROOT="$first_existing_root"
               echo "No complete local model found for ${MODEL_PATH}; using ${MODEL_CACHE_ROOT} for download/cache."
             else
-              MODEL_CACHE_ROOT="/mnt/raid0/pretrained_model"
-              echo "Warning: No shared model cache root exists on runner; using container-local ${MODEL_CACHE_ROOT}."
+              echo "ERROR: No shared model cache root exists on runner."
+              echo "Refusing to use a container-local or runner-temp model cache for ${MODEL_PATH}."
+              echo "Expected one of:"
+              printf ' - %s\n' "${cache_roots[@]}"
+              exit 1
             fi
           fi
 
@@ -226,7 +231,8 @@ jobs:
             MODEL_CACHE_MOUNT="-v ${MODEL_CACHE_ROOT}:${MODEL_MOUNT_PATH}"
             MODEL_CACHE_DESC="${MODEL_CACHE_ROOT} (host mount)"
           else
-            MODEL_CACHE_DESC="container-local ${MODEL_CACHE_ROOT} (no host cache mount)"
+            echo "ERROR: Selected model cache root does not exist: ${MODEL_CACHE_ROOT}"
+            exit 1
           fi
 
           try_hf_cache_root() {
@@ -245,6 +251,8 @@ jobs:
 
           for candidate in \
             "${MODEL_CACHE_ROOT}/.cache/huggingface" \
+            /shared_nfs/.cache/huggingface \
+            /shared_nfs/huggingface \
             /mnt/raid0/huggingface \
             /data/huggingface \
             /shared/data/WRH/huggingface; do
@@ -254,8 +262,9 @@ jobs:
           done
 
           if [ -z "$HF_CACHE_ROOT" ]; then
-            HF_CACHE_ROOT="${RUNNER_TEMP:-${GITHUB_WORKSPACE:-$PWD}}/huggingface"
-            mkdir -p "$HF_CACHE_ROOT"
+            echo "ERROR: No writable shared HuggingFace cache root found."
+            echo "Refusing to fall back to RUNNER_TEMP/GITHUB_WORKSPACE because MI355 models can exceed local runner disk."
+            exit 1
           fi
           HF_CACHE_MOUNT="-v ${HF_CACHE_ROOT}:/hf-cache"
           echo "Using HuggingFace cache root: ${HF_CACHE_ROOT}"

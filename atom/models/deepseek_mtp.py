@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import Optional, Union
 
 import torch
-import torch.nn as nn
-from aiter.dist.communication_op import tensor_model_parallel_all_reduce
+from torch import nn
+from transformers import DeepseekV2Config, DeepseekV3Config, PretrainedConfig
+
 from atom.config import Config, QuantizationConfig
 from atom.model_ops.embed_head import (
     ParallelLMHead,
@@ -15,11 +15,10 @@ from atom.model_ops.layernorm import RMSNorm, fused_dual_rmsnorm_cat
 from atom.model_ops.linear import ReplicatedLinear
 from atom.model_ops.moe import FusedMoE
 from atom.models.utils import IntermediateTensors
-
 from atom.utils.decorators import support_torch_compile
-from transformers import DeepseekV2Config, DeepseekV3Config, PretrainedConfig
 
 from .deepseek_v2 import (
+    ENABLE_ALLREDUCE_RMSNORM_FUSION,
     DeepseekV2DecoderLayer,
     _can_fuse_indexer_wk_weights_proj,
     use_replicated_vocab_embed,
@@ -32,19 +31,27 @@ class SharedHead(nn.Module):
         self,
         config: PretrainedConfig,
         prefix: str,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__()
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # Output norm of the MTP layer -- the draft's counterpart of the
+        # backbone's final norm. Applied at the end of
+        # DeepSeekMultiTokenPredictorLayer.forward rather than deferred to
+        # compute_logits, so the hidden recycled into the next draft step is
+        # post-final-norm, matching what the target hands draft step 0. On the
+        # fused path it also absorbs mtp_block's pending all-reduce and
+        # residual-add into a single kernel (mirrors Eagle3LlamaModel.norm).
+        self.norm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION,
+        )
         self.head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
             quant_config=quant_config,
             prefix=maybe_prefix(prefix, "head"),
         )
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.norm(hidden_states)
 
 
 class DeepSeekMultiTokenPredictorLayer(nn.Module):
@@ -53,7 +60,7 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         atom_config: Config,
         prefix: str,
         layer_idx: int,
-        alt_stream: Optional[torch.cuda.Stream] = None,
+        alt_stream: torch.cuda.Stream | None = None,
     ) -> None:
         super().__init__()
 
@@ -94,6 +101,14 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         inputs_embeds: torch.Tensor,
         spec_step_index: int = 0,
     ) -> torch.Tensor:
+        """Returns the POST-final-norm hidden of this MTP layer.
+
+        Draft step 0 is fed the target's post-final-norm hidden, so every later
+        step must be fed this. Returning the pre-norm block output instead would
+        skip shared_head.norm: RMSNorm's rescale is idempotent but its
+        per-channel weight is not, so the draft would consume an input the layer
+        was never trained on and the error would compound down the draft chain.
+        """
         assert inputs_embeds is not None
         # Fused enorm(inputs_embeds) ++ hnorm(previous_hidden_states) in a single
         # Triton launch (folds the two RMSNorms + the torch.cat; enorm and hnorm
@@ -110,9 +125,25 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         hidden_states, residual = self.mtp_block(
             positions=positions, hidden_states=hidden_states, residual=None
         )
-        # mtp always has input_layernorm fused_allreduce off
-        hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-        hidden_states = residual + hidden_states
+        # mtp_block's mlp is built with `reduce_results=not fuse_ar_input_norm`
+        # (deepseek_v2.py), so it leaves an un-reduced TP partial sum exactly
+        # when ENABLE_ALLREDUCE_RMSNORM_FUSION is on -- the same condition that
+        # makes shared_head.norm take RMSNorm's fused branch. With the fusion
+        # off the mlp already reduced and the norm just does the add. Neither
+        # path needs an explicit all-reduce here, and neither double-reduces.
+        #
+        # On the fused branch aiter MAY collapse all-reduce + residual-add +
+        # norm into one kernel, but only under its own size gate
+        # (communicator_cuda.py: n <= 16384, total_bytes < 64 MiB, world_size
+        # != 6) -- roughly 4681 tokens at hidden 7168 bf16. Above that, and at
+        # TP=6, it falls back to all_reduce + a separate Triton RMSNorm. The
+        # fallback is numerically equivalent, so only the launch count differs,
+        # and the draft's step-0 prefill is usually on the fallback side of it.
+        #
+        # The unconditional all_reduce this replaces was wrong for
+        # ENABLE_ALLREDUCE_RMSNORM_FUSION=0: the mlp had already reduced, so the
+        # MTP output came out scaled by tp_size. Default is 1, hence unnoticed.
+        hidden_states, _ = self.shared_head.norm(hidden_states, residual)
         return hidden_states
 
 
@@ -127,7 +158,7 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         config = atom_config.hf_config
         self.mtp_start_layer_idx = config.num_hidden_layers
         self.num_mtp_layers = config.num_nextn_predict_layers
-        self.alt_stream: Optional[torch.cuda.Stream] = (
+        self.alt_stream: torch.cuda.Stream | None = (
             torch.cuda.Stream()
             if torch.cuda.is_available()
             and getattr(config, "n_shared_experts", None) is not None
@@ -185,28 +216,31 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
+        """``hidden_states`` is already post-final-norm (shared_head.norm runs at
+        the end of DeepSeekMultiTokenPredictorLayer.forward), so this is a bare
+        LM head -- norming again here would double-norm."""
         current_step_idx = spec_step_idx % self.num_mtp_layers
         mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
-        logits = mtp_layer.shared_head.head(mtp_layer.shared_head(hidden_states))
-        return logits
+        return mtp_layer.shared_head.head(hidden_states)
 
-    def compute_draft_token(
+    def compute_draft_ids(
         self,
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
-        """Greedy draft token via distributed argmax over the TP-sharded vocab —
+        """Greedy draft token ids via distributed argmax over the TP-sharded vocab —
         avoids all-gathering the full [N, vocab] logits every draft step.
 
-        Mirrors compute_logits() (same norm + shared head), but reduces each
-        rank's logit shard to (max_val, global_idx) and all-gathers only [N, 2]
-        instead of the O(vocab) logits. Token-identical to
+        Feeds the same shared head as compute_logits (and, like it, takes an
+        already post-final-norm ``hidden_states`` -- shared_head.norm runs at the
+        end of DeepSeekMultiTokenPredictorLayer.forward), but reduces each rank's
+        logit shard to (max_val, global_idx) and all-gathers only [N, 2] instead
+        of the O(vocab) logits. Token-identical to
         compute_logits(...).argmax(-1).
         """
         current_step_idx = spec_step_idx % self.num_mtp_layers
         mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
-        normed = mtp_layer.shared_head(hidden_states)
-        return mtp_layer.shared_head.head.compute_argmax_token(normed)
+        return mtp_layer.shared_head.head.compute_argmax_token(hidden_states)
 
     def set_skip_topk(self, skip: bool) -> None:
         """Toggle ``skip_topk`` on MTP sparse-attention layers.
@@ -332,19 +366,20 @@ class DeepSeekMTP(nn.Module):
     ) -> torch.Tensor | None:
         return self.model.compute_logits(hidden_states, spec_step_idx)
 
-    def compute_draft_token(
+    def compute_draft_ids(
         self,
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
         """Distributed greedy argmax for the MTP draft rollout (GLM-5.2).
 
-        EagleProposer picks this over compute_logits().argmax(-1) when present
-        (``_draft_argmax_fused``), so the draft never all-gathers the full
-        [N, vocab] logits — it all-gathers only the packed [N, 2] per-rank
-        reductions. See DeepSeekMultiTokenPredictor.compute_draft_token.
+        Every draft model implements compute_draft_ids; this one does the argmax
+        distributed rather than via compute_logits().argmax(-1), so the draft
+        never all-gathers the full [N, vocab] logits — only the packed [N, 2]
+        per-rank reductions. Token-identical either way. See
+        DeepSeekMultiTokenPredictor.compute_draft_ids.
         """
-        return self.model.compute_draft_token(hidden_states, spec_step_idx)
+        return self.model.compute_draft_ids(hidden_states, spec_step_idx)
 
     def set_skip_topk(self, skip: bool) -> None:
         self.model.set_skip_topk(skip)
@@ -365,8 +400,8 @@ class DeepSeekMTP(nn.Module):
 
 
 def get_spec_layer_idx_from_weight_name(
-    config: Union[DeepseekV2Config, DeepseekV3Config], weight_name: str
-) -> Optional[int]:
+    config: DeepseekV2Config | DeepseekV3Config, weight_name: str
+) -> int | None:
     if (
         hasattr(config, "num_nextn_predict_layers")
         and config.num_nextn_predict_layers > 0
