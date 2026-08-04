@@ -43,7 +43,7 @@ from atom.kv_transfer.disaggregation.types import (
 )
 from atom.model_engine.sequence import Sequence
 from atom.models.utils import get_pp_indices
-from atom.utils import get_open_port, make_zmq_path, zmq_socket_ctx
+from atom.utils import envs, get_open_port, make_zmq_path, zmq_socket_ctx
 from atom.utils.network import get_ip
 
 logger = logging.getLogger("atom")
@@ -338,6 +338,13 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             if (
                 not getattr(seq, "swa_block_table", None)
                 and not getattr(seq, "has_per_req_cache", False)
+                # SparseKV keeps the full context in the host cold pool, not the
+                # paged GPU KV cache, so the decode node's "reused-local" GPU
+                # prefix blocks do NOT hold valid full-context KV. The block-delta
+                # path would leave the reused-local cold-pool region unpopulated
+                # (garbage/OOB on the swap gather). Force a full transfer — same
+                # rule the comment above applies to the other stateful backends.
+                and not envs.ATOM_SPARSEKV_ENABLE
                 and self.block_size > 0
             ):
                 num_computed_blocks = seq.num_cached_tokens // self.block_size
