@@ -11,7 +11,7 @@ from typing import Any, Union
 import numpy as np
 import torch
 
-from atom.config import CUDAGraphMode, Config, KVCacheTensor, ParallelConfig
+from atom.config import Config, CUDAGraphMode, KVCacheTensor, ParallelConfig
 
 
 class AttnState(Enum):
