@@ -20,13 +20,20 @@ const SESSION_REASSIGNMENT_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug)]
 struct StickyAssignment {
-    worker_url: String,
+    worker: WorkerIdentity,
     last_access: Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkerIdentity {
+    url: String,
+    dp_rank: Option<usize>,
 }
 
 #[derive(Debug)]
 pub struct DpStickyPolicy {
-    /// Session ID -> worker URL. URLs remain valid when a worker slice is reordered.
+    /// Session ID -> worker identity. The DP rank distinguishes logical workers
+    /// that share a common endpoint URL.
     assignments: DashMap<String, StickyAssignment>,
 }
 
@@ -37,12 +44,25 @@ impl DpStickyPolicy {
         }
     }
 
-    fn healthy_worker_for_url(workers: &[Arc<dyn Worker>], url: &str) -> Option<usize> {
+    fn worker_identity(worker: &Arc<dyn Worker>) -> WorkerIdentity {
+        WorkerIdentity {
+            url: worker.url().to_string(),
+            dp_rank: worker.dp_rank(),
+        }
+    }
+
+    fn healthy_worker_for_identity(
+        workers: &[Arc<dyn Worker>],
+        identity: &WorkerIdentity,
+    ) -> Option<usize> {
         workers
             .iter()
             .enumerate()
             .find(|(_, worker)| {
-                worker.url() == url && worker.is_healthy() && worker.circuit_breaker().can_execute()
+                worker.url() == identity.url
+                    && worker.dp_rank() == identity.dp_rank
+                    && worker.is_healthy()
+                    && worker.circuit_breaker().can_execute()
             })
             .map(|(index, _)| index)
     }
@@ -71,7 +91,8 @@ impl DpStickyPolicy {
             assignment.last_access = now;
 
             if !is_expired {
-                if let Some(index) = Self::healthy_worker_for_url(workers, &assignment.worker_url) {
+                if let Some(index) = Self::healthy_worker_for_identity(workers, &assignment.worker)
+                {
                     return Some(index);
                 }
             }
@@ -81,21 +102,21 @@ impl DpStickyPolicy {
         // selection establishes a replacement affinity.
         self.assignments.remove(session_id);
         let selected_index = Self::select_low_load_worker(workers)?;
-        let selected_url = workers[selected_index].url().to_string();
+        let selected_worker = Self::worker_identity(&workers[selected_index]);
 
         match self.assignments.entry(session_id.to_string()) {
             Entry::Occupied(mut entry) => {
                 let existing_index = {
                     let assignment = entry.get_mut();
                     assignment.last_access = now;
-                    Self::healthy_worker_for_url(workers, &assignment.worker_url)
+                    Self::healthy_worker_for_identity(workers, &assignment.worker)
                 };
 
                 if let Some(index) = existing_index {
                     Some(index)
                 } else {
                     entry.insert(StickyAssignment {
-                        worker_url: selected_url,
+                        worker: selected_worker,
                         last_access: now,
                     });
                     Some(selected_index)
@@ -103,7 +124,7 @@ impl DpStickyPolicy {
             }
             Entry::Vacant(slot) => {
                 slot.insert(StickyAssignment {
-                    worker_url: selected_url,
+                    worker: selected_worker,
                     last_access: now,
                 });
                 Some(selected_index)
@@ -140,7 +161,7 @@ impl LoadBalancingPolicy for DpStickyPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{BasicWorkerBuilder, WorkerType};
+    use crate::core::{BasicWorkerBuilder, DPAwareWorkerBuilder, WorkerType};
 
     fn workers() -> Vec<Arc<dyn Worker>> {
         ["http://worker-1:8000", "http://worker-2:8000"]
@@ -151,6 +172,15 @@ mod tests {
                         .worker_type(WorkerType::Regular)
                         .build(),
                 ) as Arc<dyn Worker>
+            })
+            .collect()
+    }
+
+    fn dp_workers() -> Vec<Arc<dyn Worker>> {
+        (0..2)
+            .map(|rank| {
+                Arc::new(DPAwareWorkerBuilder::new("http://worker:8000", rank, 2).build())
+                    as Arc<dyn Worker>
             })
             .collect()
     }
@@ -175,6 +205,21 @@ mod tests {
         for _ in 0..10 {
             assert_eq!(policy.select_worker(&workers, &info).await, Some(selected));
         }
+    }
+
+    #[tokio::test]
+    async fn session_id_stays_on_the_same_dp_rank() {
+        let policy = DpStickyPolicy::new();
+        let workers = dp_workers();
+        let headers = headers("session-1");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+
+        workers[0].increment_load();
+        assert_eq!(policy.select_worker(&workers, &info).await, Some(1));
+        assert_eq!(policy.select_worker(&workers, &info).await, Some(1));
     }
 
     #[tokio::test]
