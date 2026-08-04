@@ -1595,7 +1595,14 @@ class ModelRunner:
             config.max_num_seqs * slots_per_req if per_req_cache_bytes > 0 else 0
         )
         per_req_cache_tensor_bytes = max_per_req_cache_slots * per_req_cache_bytes
-        available_for_pool = available_for_kv - per_req_cache_tensor_bytes
+        # GPU memory the backend reserves outside the paged pool (e.g. SparseKV's
+        # hot buffer + decode scratch): deduct before sizing the pool so those
+        # allocations, which happen later in allocate_kv_cache_tensors, do not
+        # overcommit HBM.
+        gpu_reserved_bytes = self.attn_metadata_builder.compute_gpu_reserved_bytes()
+        available_for_pool = (
+            available_for_kv - per_req_cache_tensor_bytes - gpu_reserved_bytes
+        )
         if available_for_pool <= 0:
             # Minimum gpu_memory_utilization that makes the budget just cover the
             # per-request cache tensor (available_for_kv_budget ==
@@ -1718,6 +1725,22 @@ class ModelRunner:
             config.swa_window_size = 0
             self.num_swa_blocks = 0
             num_kvcache_blocks = available_for_pool // block_bytes
+            # SparseKV: the paged pool holds only the indexer's index_cache (the
+            # MLA KV lives in the host cold pool + GPU hot buffer). Size it to
+            # cover exactly the cold pool's logical capacity — matching
+            # SparseKVCoordinator's page count — so the HBM freed by dropping the
+            # full MLA pool stays freed rather than being refilled by a larger
+            # index_cache. Still capped by the VRAM budget above.
+            if getattr(self.attn_metadata_builder, "sparsekv_enabled", False):
+                page = config.kv_cache_block_size
+                padded_hot = envs.ATOM_SPARSEKV_HOT_BUFFER_SIZE + 1
+                host_tokens = (
+                    envs.ATOM_SPARSEKV_HOST_TO_DEVICE_RATIO
+                    * config.max_num_seqs
+                    * padded_hot
+                )
+                cold_pool_pages = max(1, (host_tokens + page - 1) // page)
+                num_kvcache_blocks = min(num_kvcache_blocks, cold_pool_pages)
 
         # PP stages compute different block counts; block ids must be valid on
         # every stage's KV tensor, so reduce to the global minimum.
@@ -3352,6 +3375,19 @@ class ModelRunner:
             present = ctx - n_new  # KV already in cache (prompt + prior decodes)
             if present <= 0:
                 continue
+            # RDMA-direct decode node: every request is pre-registered at recv
+            # (acquire_at_recv) with its prompt KV RDMA'd straight into the host
+            # cold pool, so it takes the is_registered branch above. This staging
+            # path reads the full prompt out of self.kv_cache — which no longer
+            # exists as a full paged pool (it is now the compact decode scratch),
+            # so reaching here means the RDMA-direct assumption was violated.
+            raise RuntimeError(
+                "SparseKV: request "
+                f"{rid} reached decode unregistered; the full-KV GPU staging "
+                "path (stage_kv_to_cold_pool) is unavailable once the paged MLA "
+                "pool is dropped. Prompt KV must arrive via RDMA-direct into the "
+                "cold pool (acquire_at_recv)."
+            )
             slot = coord.acquire(rid, present)
             phys = self._sparsekv_token_phys_slots(
                 batch.block_tables[i], range(present)

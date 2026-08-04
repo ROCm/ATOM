@@ -3,7 +3,7 @@
 
 import logging
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Dict, Generic, Optional, Type, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, Optional, TypeVar
 
 if TYPE_CHECKING:
     from atom.kv_transfer.disaggregation.types import KVTransferTensors
@@ -32,7 +32,7 @@ T = TypeVar("T", bound="BroadcastableModelInput")
 class BroadcastableModelInput(ABC):
 
     @abstractmethod
-    def as_broadcastable_tensor_dict(self) -> Dict[str, Any]:
+    def as_broadcastable_tensor_dict(self) -> dict[str, Any]:
         """
         Extract broadcastable fields. Override for fields that require some
         custom deserialization.
@@ -42,8 +42,8 @@ class BroadcastableModelInput(ABC):
     @classmethod
     @abstractmethod
     def from_broadcasted_tensor_dict(
-        cls: Type[T],
-        tensor_dict: Dict[str, Any],
+        cls: type[T],
+        tensor_dict: dict[str, Any],
         attn_backend: Optional["AttentionBackend"] = None,
     ) -> T:
         """
@@ -68,11 +68,11 @@ class AttentionBackend(ABC):
 
     @staticmethod
     @abstractmethod
-    def get_builder_cls() -> Type["AttentionMetadataBuilder"]:
+    def get_builder_cls() -> type["AttentionMetadataBuilder"]:
         raise NotImplementedError
 
     @staticmethod
-    def get_impl_cls() -> Type["AttentionImpl"]:
+    def get_impl_cls() -> type["AttentionImpl"]:
         return AttentionImpl
 
 
@@ -174,6 +174,17 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         """
         return 0
 
+    def compute_gpu_reserved_bytes(self) -> int:
+        """GPU-resident bytes this backend allocates OUTSIDE the paged KV pool
+        (not covered by compute_block_bytes / per-req cache), which ModelRunner
+        must deduct from the pool budget up front.
+
+        Example: SparseKV's GPU hot buffer + per-step decode scratch, allocated
+        in allocate_kv_cache_tensors alongside (not per-block within) the pool.
+        Default 0.
+        """
+        return 0
+
     # ------------------------------------------------------------------ #
     # Paged sliding-window (SWA) pool — a separate, window-freed KV pool  #
     # some attention types carve out of the main KV budget.              #
@@ -238,7 +249,7 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
 
         Default returns None for unknown module types.
         """
-        return None
+        return
 
 
 class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
@@ -541,7 +552,7 @@ class AttentionImpl(nn.Module):
         num_heads: int,
         head_size: int,
         scale: float,
-        num_kv_heads: Optional[int] = None,
+        num_kv_heads: int | None = None,
         kv_cache_dtype: str = "auto",
         layer_num: int = 0,
         mla_modules: MLAModules = None,

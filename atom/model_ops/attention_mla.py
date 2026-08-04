@@ -1227,7 +1227,10 @@ class MLAAttention(nn.Module):
         n = int(sparse_kv_indptr.shape[0]) - 1  # decode query tokens
         req_slots = hs_slots[:n].to("cpu").tolist()
         token_pos = attn_metadata.sparsekv_token_pos[:n].to("cpu").tolist()
-        slot_map = attn_metadata.slot_mapping[:n].to("cpu").tolist()
+        # Read from the compact scratch rows (src_slots = 0..n-1), matching the
+        # SparseKV KV write target; slot_mapping is the real paged slot reserved
+        # for the indexer and would overflow the small scratch here.
+        slot_map = attn_metadata.sparsekv_src_slots[:n].to("cpu").tolist()
         indptr_cpu = sparse_kv_indptr[: n + 1].to("cpu")
         kv_flat = kv_layer.reshape(-1, coord.kv_dim)
 
@@ -1552,6 +1555,18 @@ class MLAAttention(nn.Module):
         kv_cache_data = forward_context.kv_cache_data
         kv_cache = kv_cache_data[f"layer_{self.layer_num}"].k_cache
 
+        # SparseKV: kv_cache is the compact per-step decode scratch, sized for
+        # decode query tokens only. A prefill write uses the real paged
+        # slot_mapping and would index the scratch out of bounds. SparseKV is a
+        # decode-only feature (prompt KV arrives via RDMA-direct into the cold
+        # pool; the DecodeScheduler never emits a prefill batch), so a prefill
+        # here means a misconfiguration — fail loudly rather than corrupt HBM.
+        assert self._sparsekv_coord is None or not context.is_prefill, (
+            "SparseKV: a prefill forward reached MLAAttention with the compact "
+            "decode scratch as kv_cache. SparseKV is decode-only; enable it only "
+            "on the PD decode node (RDMA-direct prompt ingestion)."
+        )
+
         if context.is_prefill and not use_prefill_mla:
             prefill_q = self.q_proj(q, x_scale=q_scale).view(
                 -1, self.num_heads, self.qk_head_dim
@@ -1640,6 +1655,31 @@ class MLAAttention(nn.Module):
                 write_slot_mapping = attn_metadata.slot_mapping_owned
             else:
                 write_slot_mapping = attn_metadata.slot_mapping
+
+            # SparseKV decode: kv_cache is the compact per-step scratch, so the
+            # fused KV write must target the compact scratch rows (src_slots =
+            # 0..n-1), not the real paged slot_mapping (which stays reserved for
+            # the indexer's full-length index_cache write). The coordinator then
+            # backs each scratch row up into the hot buffer + host cold pool.
+            # There is no full paged pool to fall back to, so src_slots MUST be
+            # present on every SparseKV decode step (requests are pre-registered
+            # at recv under RDMA-direct); a real paged slot here would overflow
+            # the scratch, so fail loudly rather than corrupt memory.
+            if self._sparsekv_coord is not None and not context.is_prefill:
+                # int64 compact scratch rows (the aiter write kernel reads
+                # slot_mapping as int64; the int32 sparsekv_src_slots is for the
+                # backup kernel only — see aiter_mla._sparsekv_write_slots).
+                sparsekv_write_slots = getattr(
+                    attn_metadata, "sparsekv_write_slots", None
+                )
+                assert sparsekv_write_slots is not None, (
+                    "SparseKV: kv_cache is the compact decode scratch but "
+                    "attn_metadata.sparsekv_write_slots is unset — every decode "
+                    "request must be registered with the coordinator before its "
+                    "first decode (RDMA-direct acquire_at_recv). Full-KV fallback "
+                    "is not available once the paged MLA pool is dropped."
+                )
+                write_slot_mapping = sparsekv_write_slots
 
             if self.use_seg_mla:
                 # Seg path: allocate q_out with a padded last dim so each head row

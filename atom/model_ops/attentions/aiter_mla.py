@@ -398,6 +398,16 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             self._sparsekv_src_slots = torch.zeros(
                 self.max_num_batched_tokens, dtype=torch.int32, device=self.device
             )
+            # Compact scratch rows for the fused MLA KV write. The aiter write
+            # kernel (fuse_qk_rope_concat_and_cache_mla) reads slot_mapping as
+            # int64 (const long*), so this MUST be int64 — passing the int32
+            # _sparsekv_src_slots there makes the kernel misread pairs of int32
+            # as one huge int64 and write out of bounds. Same values as
+            # _sparsekv_src_slots (0..n-1); separate only in dtype. Fixed-address
+            # so the captured write kernel reads fresh values at replay.
+            self._sparsekv_write_slots = torch.zeros(
+                self.max_num_batched_tokens, dtype=torch.int64, device=self.device
+            )
 
         # Per-ubatch buffers for CUDAGraph TBO
         if config.enable_tbo:
@@ -810,6 +820,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         DeepSeek-V3.2 sparse variant adds an indexer cache contribution
         for every bound layer, including draft/MTP layers.
+
+        SparseKV: the full 576-dim paged MLA pool is not allocated (the KV
+        lives in the host cold pool + GPU hot buffer); only the indexer's
+        index_cache is paged, so the per-block budget drops the 576 term and
+        keeps the indexer term. num_kvcache_blocks then sizes index_cache.
         """
         runner = self.model_runner
         config = runner.config
@@ -817,7 +832,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         total_num_layers = runner._get_total_num_layers()
         kv_dtype_size = dtypes.d_dtypes[config.kv_cache_dtype].itemsize
 
-        block_bytes = total_num_layers * runner.block_size * 576 * kv_dtype_size
+        if self.sparsekv_enabled:
+            block_bytes = 0
+        else:
+            block_bytes = total_num_layers * runner.block_size * 576 * kv_dtype_size
         if runner.is_deepseek_v32:
             index_dim = hf_config.index_head_dim + 4
             aligned_index_dim = ((index_dim + 15) // 16) * 16
@@ -828,6 +846,56 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 * dtypes.fp8.itemsize
             )
         return block_bytes
+
+    def compute_gpu_reserved_bytes(self) -> int:
+        """SparseKV GPU-resident memory allocated alongside (not within) the
+        paged pool. Deducted from the KV pool budget by ModelRunner.get_num_blocks
+        so the index_cache sizing does not overcommit HBM. 0 when SparseKV is off.
+
+        Mirrors the cuda tensors allocated later for SparseKV: the coordinator
+        hot buffer + bookkeeping (SparseKVCoordinator.__init__) and the per-step
+        decode scratch + top-k side-channel (allocate_kv_cache_tensors). The cold
+        pool is pinned HOST memory and is intentionally excluded.
+        """
+        if not self.sparsekv_enabled:
+            return 0
+        runner = self.model_runner
+        config = runner.config
+        L = runner._get_total_num_layers()
+        R = config.max_num_seqs
+        C = config.max_model_len
+        H1 = envs.ATOM_SPARSEKV_HOT_BUFFER_SIZE + 1  # padded hot slots/request
+        page = config.kv_cache_block_size
+        table_stride = ((C + page - 1) // page) * page
+        kv_dtype_size = dtypes.d_dtypes[config.kv_cache_dtype].itemsize
+        i32 = 4
+        i64 = 8
+
+        # Hot buffer [L, R*H1, 576] + decode scratch [L, max_num_batched_tokens, 576].
+        hot_bytes = L * R * H1 * 576 * kv_dtype_size
+        scratch_bytes = L * self.max_num_batched_tokens * 576 * kv_dtype_size
+        # Coordinator bookkeeping (coordinator.py): token_to_slot [L,R,C] dominates
+        # and scales with max_model_len — the very term SparseKV keeps off the GPU
+        # for KV, so it must be accounted here. Plus req_to_host_pool [R,stride],
+        # slot_token/last_used [L,R,H1], recency [R].
+        token_to_slot_bytes = L * R * C * i32
+        req_to_host_pool_bytes = R * table_stride * i32
+        slot_token_bytes = L * R * H1 * i32
+        last_used_bytes = L * R * H1 * i64
+        recency_bytes = R * i64
+        # Top-k side-channel buffer [max_num_batched_tokens, index_topk] int32.
+        topk_buf_bytes = self.max_num_batched_tokens * self.index_topk * i32
+
+        return (
+            hot_bytes
+            + scratch_bytes
+            + token_to_slot_bytes
+            + req_to_host_pool_bytes
+            + slot_token_bytes
+            + last_used_bytes
+            + recency_bytes
+            + topk_buf_bytes
+        )
 
     def allocate_kv_cache_tensors(
         self, num_kv_heads: int, num_draft_layers: int
@@ -843,16 +911,36 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         config = runner.config
         hf_config = config.hf_config
         total_num_layers = runner._get_total_num_layers()
-        out: dict = {
-            "kv_cache": torch.zeros(
-                total_num_layers,
-                runner.num_physical_kvcache_blocks,
-                runner.physical_block_size,
-                576,
-                dtype=dtypes.d_dtypes[config.kv_cache_dtype],
-                device="cuda",
-            ),
-        }
+        if self.sparsekv_enabled:
+            # SparseKV keeps the full MLA KV in the host cold pool + GPU hot
+            # buffer (see SparseKVCoordinator below); the paged 576-dim pool is
+            # never read for attention. Allocate only a compact per-step decode
+            # scratch (one row per in-flight decode query token) as the fused KV
+            # write target; the coordinator then backs it up into hot + cold.
+            # The indexer's index_cache stays full-length (top-k scans the whole
+            # sequence every step, so it must be GPU-resident).
+            scratch_rows = runner.max_num_batched_tokens
+            out: dict = {
+                "kv_cache": torch.zeros(
+                    total_num_layers,
+                    scratch_rows,
+                    1,
+                    576,
+                    dtype=dtypes.d_dtypes[config.kv_cache_dtype],
+                    device="cuda",
+                ),
+            }
+        else:
+            out = {
+                "kv_cache": torch.zeros(
+                    total_num_layers,
+                    runner.num_physical_kvcache_blocks,
+                    runner.physical_block_size,
+                    576,
+                    dtype=dtypes.d_dtypes[config.kv_cache_dtype],
+                    device="cuda",
+                ),
+            }
         if runner.is_deepseek_v32:
             # Align last dimension to 16 bytes for fp8 (1 byte per element)
             # to avoid unaligned memory access in torch inductor.
@@ -952,11 +1040,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             return None
 
         runner = self.model_runner
-        kv_cache = runner.kv_cache[layer_id].view(
-            runner.num_physical_kvcache_blocks * runner.physical_block_size,
-            1,
-            576,
-        )
+        # SparseKV: kv_cache is the compact decode scratch [scratch_rows, 1, 576];
+        # otherwise the full paged pool [num_physical_blocks, physical_block, 576].
+        # Derive the flat row count from the tensor so both layouts view correctly.
+        layer_kv = runner.kv_cache[layer_id]
+        kv_cache = layer_kv.view(layer_kv.shape[0] * layer_kv.shape[1], 1, 576)
         module.max_model_len = runner.config.max_model_len
         if runner.is_deepseek_v32 and module.indexer is not None:
             # Use aligned dimension to avoid memory copy in torch inductor
@@ -1855,10 +1943,20 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.sparsekv_token_pos = self._sparsekv_token_pos.copy_to_gpu(
                 n_tok
             )
-            # src_slots: cast slot_mapping (int64) into the fixed int32 buffer in
-            # place (GPU cast, on the current stream before the graph replays).
-            self._sparsekv_src_slots[:n_tok].copy_(attn_metadata.slot_mapping[:n_tok])
+            # src_slots: compact scratch rows 0..n_tok-1 (one per decode query
+            # token). SparseKV replaces the full paged MLA pool with a per-step
+            # scratch, so the fused KV write lands each query token at its scratch
+            # row and the coordinator backs it up from that same row into hot +
+            # cold. slot_mapping itself stays the real paged slot (the indexer's
+            # full-length index_cache write still uses it). Fixed-address in-place
+            # fill so the captured hot path reads fresh values on every replay.
+            compact = torch.arange(
+                n_tok, dtype=torch.int64, device=self._sparsekv_src_slots.device
+            )
+            self._sparsekv_src_slots[:n_tok].copy_(compact)  # int32, for backup
+            self._sparsekv_write_slots[:n_tok].copy_(compact)  # int64, for KV write
             attn_metadata.sparsekv_src_slots = self._sparsekv_src_slots[:n_tok]
+            attn_metadata.sparsekv_write_slots = self._sparsekv_write_slots[:n_tok]
 
         # Use bs (graph_bs) >= 2 instead of scheduled_bs >= 2 to avoid accuracy issue:
         if self.model_runner.config.enable_tbo_decode and bs >= 2:
@@ -2153,8 +2251,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             self._sparsekv_token_pos.np[:bs] = -1
             attn_matadata.sparsekv_req_slots = self._sparsekv_req_slots.copy_to_gpu(bs)
             attn_matadata.sparsekv_token_pos = self._sparsekv_token_pos.copy_to_gpu(bs)
-            self._sparsekv_src_slots[:bs].zero_()
+            compact = torch.arange(
+                bs, dtype=torch.int64, device=self._sparsekv_src_slots.device
+            )
+            self._sparsekv_src_slots[:bs].copy_(compact)  # int32, for backup
+            self._sparsekv_write_slots[:bs].copy_(compact)  # int64, for KV write
             attn_matadata.sparsekv_src_slots = self._sparsekv_src_slots[:bs]
+            attn_matadata.sparsekv_write_slots = self._sparsekv_write_slots[:bs]
 
         positions = var["positions"].copy_to_gpu(sum_tokens)
         context = Context(
