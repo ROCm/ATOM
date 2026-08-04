@@ -21,6 +21,7 @@ LIMIT="${EVAL_LIMIT:-}"
 VENV="${SWEBENCH_VENV:-/tmp/atomesh-swebench-venv-${SLURM_JOB_ID:-local}}"
 AGENT_WORKERS="${SWEBENCH_AGENT_WORKERS:-16}"
 AGENT_STEP_LIMIT="${SWEBENCH_AGENT_STEP_LIMIT:-150}"
+CASE_TIMEOUT="${SWEBENCH_CASE_TIMEOUT:-3600}"
 AGENT_TIMEOUT="${SWEBENCH_AGENT_TIMEOUT:-21600}"
 AGENT_EXIT_GRACE="${SWEBENCH_AGENT_EXIT_GRACE:-300}"
 AGENT_CMD_TIMEOUT="${SWEBENCH_AGENT_CMD_TIMEOUT:-300}"
@@ -131,6 +132,7 @@ positive_integer() {
 
 positive_integer "SWEBENCH_AGENT_WORKERS" "${AGENT_WORKERS}"
 positive_integer "SWEBENCH_AGENT_STEP_LIMIT" "${AGENT_STEP_LIMIT}"
+positive_integer "SWEBENCH_CASE_TIMEOUT" "${CASE_TIMEOUT}"
 positive_integer "SWEBENCH_AGENT_TIMEOUT" "${AGENT_TIMEOUT}"
 positive_integer "SWEBENCH_AGENT_EXIT_GRACE" "${AGENT_EXIT_GRACE}"
 positive_integer "SWEBENCH_AGENT_CMD_TIMEOUT" "${AGENT_CMD_TIMEOUT}"
@@ -225,6 +227,7 @@ fi
   "${API_BASE}" \
   "${API_MODEL_ARG}" \
   "${AGENT_STEP_LIMIT}" \
+  "${CASE_TIMEOUT}" \
   "${AGENT_CMD_TIMEOUT}" \
   "${AGENT_RUNTIME_TIMEOUT}" \
   "${AGENT_PULL_TIMEOUT}" \
@@ -241,6 +244,7 @@ from minisweagent.config import builtin_config_dir
     api_base,
     model_name,
     step_limit,
+    case_timeout,
     command_timeout,
     runtime_timeout,
     pull_timeout,
@@ -271,6 +275,7 @@ config["agent"]["instance_template"] = (
 )
 config["agent"]["step_limit"] = step_limit_int
 config["agent"]["cost_limit"] = 0.0
+config["agent"]["wall_time_limit_seconds"] = int(case_timeout)
 
 environment = config["environment"]
 environment.update(
@@ -344,6 +349,7 @@ fi
 export MSWEA_COST_TRACKING=ignore_errors
 echo "[swebench] generating ${EXPECTED_INSTANCES} SWE-bench Lite predictions"
 echo "[swebench] agent workers=${AGENT_WORKERS} step_limit=${AGENT_STEP_LIMIT}"
+echo "[swebench] case_timeout=${CASE_TIMEOUT}s generation_timeout=${AGENT_TIMEOUT}s"
 
 "${MINI_EXTRA}" swebench \
   -c "${CONFIG_PATH}" \

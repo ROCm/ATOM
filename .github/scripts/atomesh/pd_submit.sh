@@ -211,6 +211,7 @@ exports = {
     "EVAL_THRESHOLD": "" if accuracy.get("threshold") is None else accuracy.get("threshold"),
     "SWEBENCH_AGENT_WORKERS": "" if accuracy.get("agent_workers") is None else accuracy.get("agent_workers"),
     "SWEBENCH_AGENT_STEP_LIMIT": "" if accuracy.get("agent_step_limit") is None else accuracy.get("agent_step_limit"),
+    "SWEBENCH_CASE_TIMEOUT": "" if accuracy.get("case_timeout") is None else accuracy.get("case_timeout"),
     "SWEBENCH_AGENT_TIMEOUT": "" if accuracy.get("agent_timeout") is None else accuracy.get("agent_timeout"),
     "SWEBENCH_SCORE_TIMEOUT": "" if accuracy.get("score_timeout") is None else accuracy.get("score_timeout"),
     "SWEBENCH_MAX_WORKERS": "" if accuracy.get("max_workers") is None else accuracy.get("max_workers"),

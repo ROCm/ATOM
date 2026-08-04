@@ -396,6 +396,7 @@ def build_cell(
             "threshold": accuracy_cfg.get("threshold"),
             "agent_workers": accuracy_cfg.get("agent_workers"),
             "agent_step_limit": accuracy_cfg.get("agent_step_limit"),
+            "case_timeout": accuracy_cfg.get("case_timeout"),
             "agent_timeout": accuracy_cfg.get("agent_timeout"),
             "score_timeout": accuracy_cfg.get("score_timeout"),
             "max_workers": accuracy_cfg.get("max_workers"),

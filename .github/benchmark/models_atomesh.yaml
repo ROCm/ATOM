@@ -298,6 +298,7 @@ models:
             threshold: 0.50
             agent_workers: 16
             agent_step_limit: 150
+            case_timeout: 3600
             agent_timeout: 21600
             score_timeout: 7200
             max_workers: 4
