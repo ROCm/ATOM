@@ -5,7 +5,6 @@ import argparse
 import logging
 import json
 from dataclasses import dataclass, fields
-from typing import List, Optional
 
 from atom import LLMEngine
 from atom.config import (
@@ -20,7 +19,7 @@ from atom.model_engine.engine_core_mgr import DP_LB_DEFAULT, DP_LB_STRATEGIES
 logger = logging.getLogger("atom")
 
 
-def parse_size_list(size_str: str) -> List[int]:
+def parse_size_list(size_str: str) -> list[int]:
     """Parse a string representation of a list into a Python list."""
     import ast
 
@@ -45,9 +44,9 @@ class EngineArgs:
     enable_prefix_caching: bool = True
     port: int = 8006
     kv_cache_dtype: str = "bf16"
-    index_cache_dtype: Optional[str] = None
+    index_cache_dtype: str | None = None
     block_size: int = 16
-    max_model_len: Optional[int] = None
+    max_model_len: int | None = None
     max_num_batched_tokens: int = 16384
     long_prefill_token_threshold: int = 0
     attn_prefill_chunk_size: int = 16384
@@ -58,32 +57,32 @@ class EngineArgs:
     cudagraph_capture_sizes: str = "[1,2,4,8,16,32,48,64,128,256]"
     level: int = 3
     cudagraph_mode: str = "FULL"
-    load_dummy: Optional[str] = None
+    load_dummy: str | None = None
     enable_expert_parallel: bool = False
-    torch_profiler_dir: Optional[str] = None
+    torch_profiler_dir: str | None = None
     enable_dp_attention: bool = False
     dp_load_balance: str = DP_LB_DEFAULT
-    enable_tbo: Optional[str] = None
-    all2all_backend: Optional[str] = None
+    enable_tbo: str | None = None
+    all2all_backend: str | None = None
     moe_backend: str = "standard"
-    method: Optional[str] = None
+    method: str | None = None
     num_speculative_tokens: int = 1
     kv_transfer_config: str = "{}"
-    draft_model: Optional[str] = None
+    draft_model: str | None = None
     mark_trace: bool = False
     enable_rapidserve: bool = False
-    disagg_prefill_max_num_seqs: Optional[int] = None
+    disagg_prefill_max_num_seqs: int | None = None
     disagg_constrained: bool = False
-    online_quant_config: Optional[dict] = None
-    hf_overrides: Optional[dict] = None
-    dspark_config: Optional[dict] = None
+    online_quant_config: dict | None = None
+    hf_overrides: dict | None = None
+    dspark_config: dict | None = None
 
     def __post_init__(self) -> None:
         if self.index_cache_dtype is None:
             self.index_cache_dtype = self.kv_cache_dtype
 
     eplb_enable: bool = False
-    eplb_config: Optional[dict] = None
+    eplb_config: dict | None = None
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
