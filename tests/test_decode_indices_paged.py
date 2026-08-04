@@ -101,11 +101,12 @@ def test_window_start_maps_to_its_ring_row(indices):
     assert int(indices["ref"]["swa_indices"][start]) == expected
 
 
-# --- HCA compress paged offsets at k2_hca > 1 -------------------------------
+# --- HCA compress paged offsets with more than one row per block ----------
 # Regression for the HCA paged-gather bug. With V4 block_size=256 and ratio=128
-# each physical block packs k2_hca=2 HCA entries, so entry e -> block
-# block_tables[bid, e//k2], slot e%k2 -> swa_pages + phys*k2 + s. The pre-fix
-# math used swa_pages + block_tables[bid, e] (i.e. assumed k2 == 1) and read the
+# each physical block packs hca_rows_per_block=2 HCA entries, so entry e -> block
+# block_tables[bid, e // rows], slot e % rows -> swa_pages + phys*rows + slot.
+# The pre-fix math used swa_pages + block_tables[bid, e] (i.e. assumed one row
+# per block) and read the
 # wrong blocks.
 _BT = np.array([[5, 9, 13, 17], [2, 6, 10, 14]], dtype=np.int32)  # [bs, blocks]
 _ENTRY = np.array([0, 1, 2, 3, 0, 1, 2], dtype=np.int64)  # seq0: 4, seq1: 3
@@ -114,17 +115,20 @@ _SWA_PAGES = 10_000
 
 
 def test_hca_compress_offsets_are_block_packed():
-    k2 = 2
-    got = hca_compress_paged_offsets(_ENTRY, _BID, _BT, _SWA_PAGES, k2)
+    hca_rows_per_block = 2
+    got = hca_compress_paged_offsets(_ENTRY, _BID, _BT, _SWA_PAGES, hca_rows_per_block)
     expected = np.array(
         [
-            _SWA_PAGES + int(_BT[b][e // k2]) * k2 + e % k2
+            _SWA_PAGES
+            + int(_BT[b][e // hca_rows_per_block]) * hca_rows_per_block
+            + e % hca_rows_per_block
             for e, b in zip(_ENTRY.tolist(), _BID.tolist())
         ],
         dtype=np.int32,
     )
     assert np.array_equal(got, expected), (
-        f"k2={k2} decode HCA compress offset wrong (the HCA paged-gather bug)\n"
+        f"rows_per_block={hca_rows_per_block} decode HCA compress offset wrong "
+        f"(the HCA paged-gather bug)\n"
         f"got={got.tolist()}\nexp={expected.tolist()}"
     )
 
@@ -135,4 +139,6 @@ def test_hca_compress_offsets_reduce_to_legacy_at_k2_one():
         [_SWA_PAGES + int(_BT[b][e]) for e, b in zip(_ENTRY.tolist(), _BID.tolist())],
         dtype=np.int32,
     )
-    assert np.array_equal(got, expected), "k2==1 must equal legacy swa_pages + bt"
+    assert np.array_equal(
+        got, expected
+    ), "hca_rows_per_block==1 must equal legacy swa_pages + bt"

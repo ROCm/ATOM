@@ -40,26 +40,27 @@ from atom.utils.decorators import mark_trace
 
 
 def hca_compress_paged_offsets(
-    entry_idx, bid_per_entry, block_tables_np, swa_pages, k2_hca
+    entry_idx, bid_per_entry, block_tables_np, swa_pages, hca_rows_per_block
 ):
     """HCA compress entry -> unified paged row (numpy, decode index build).
 
-    The compressor packs ``k2_hca = block_size // hca_ratio`` HCA compress entries
-    per physical block (cache view ``[num_blocks, k2_hca, head_dim]``): entry ``e``
-    lives in physical block ``block_tables[bid, e // k2_hca]`` at slot
-    ``e % k2_hca``, so its unified row is ``swa_pages + phys * k2_hca + slot``.
-    (Reduces to ``swa_pages + block_tables[bid, e]`` at ``k2_hca == 1``.)
+    The compressor packs ``hca_rows_per_block = block_size // hca_ratio`` rows
+    per physical block (cache view ``[num_blocks, hca_rows_per_block,
+    head_dim]``): entry ``e`` lives in physical block ``block_tables[bid, e //
+    hca_rows_per_block]`` at slot ``e % hca_rows_per_block``, so its unified row
+    is ``swa_pages + phys * hca_rows_per_block + slot``. (Reduces to
+    ``swa_pages + block_tables[bid, e]`` when there is one row per block.)
 
     ``entry_idx`` / ``bid_per_entry`` are int arrays of equal length; returns an
     int32 array of the same length. Shared by ``_attach_v4_paged_decode_meta`` and
     covered by ``tests/test_decode_indices_paged.py`` so the packing stays correct
-    for V4 ``block_size=256`` (``k2_hca=2``).
+    for V4 ``block_size=256`` (``hca_rows_per_block=2``).
     """
-    blk = entry_idx // k2_hca
-    slot = entry_idx % k2_hca
-    return (swa_pages + block_tables_np[bid_per_entry, blk] * k2_hca + slot).astype(
-        np.int32
-    )
+    blk = entry_idx // hca_rows_per_block
+    slot = entry_idx % hca_rows_per_block
+    return (
+        swa_pages + block_tables_np[bid_per_entry, blk] * hca_rows_per_block + slot
+    ).astype(np.int32)
 
 
 @triton.jit

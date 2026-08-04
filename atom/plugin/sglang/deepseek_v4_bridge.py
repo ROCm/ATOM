@@ -75,9 +75,13 @@ def _resolve_v4_index_topk(model: Any = None, proxy_pool: Any = None) -> int:
     return value
 
 
-def _aligned_index_dim(index_head_dim: int) -> int:
-    # extra 4 bytes for scale, then 16-byte alignment.
-    return ((int(index_head_dim) + 4 + 15) // 16) * 16
+def _index_row_bytes(index_head_dim: int) -> int:
+    # `index_head_dim` FP8 bytes plus a 4-byte fp32 scale. Data and scale are
+    # two REGIONS inside a block, not interleaved per row, so the alignment
+    # that matters is the block stride (`rows_per_block * this`), not this
+    # value. Rounding it up to a multiple of 16 pays the rounding once per row
+    # instead of once per block — 1.5% of the KV pool for nothing.
+    return int(index_head_dim) + 4
 
 
 def _layer_counts(compress_ratios) -> tuple[list[int], int, int, int]:
@@ -230,7 +234,7 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
                 f"{self.qk_nope_head_dim}/{self.qk_rope_head_dim}"
             )
         self.indexer_head_dim = int(indexer_head_dim)
-        self.index_dim = _aligned_index_dim(self.indexer_head_dim)
+        self.index_dim = _index_row_bytes(self.indexer_head_dim)
         self.compression_ratios = [int(r) for r in compression_ratios]
         self.stage_ratios = self.compression_ratios[self.start_layer : self.end_layer]
         self.full_to_swa_index_mapping: torch.Tensor | None = None
@@ -690,17 +694,17 @@ def _bind_compressor_state(
     compressor.kv_cache = kv_cache
     compressor.kv_cache_rope = kv_cache_rope
     if is_indexer:
-        nb, k1, aligned_dim = kv_cache.shape
+        nb, csa_rows_per_block, index_row_bytes = kv_cache.shape
         if head_dim is None:
             raise ValueError("indexer compressor binding requires explicit head_dim")
-        block_fp32_stride = (k1 * aligned_dim) // 4
-        scale_fp32_offset = (k1 * head_dim) // 4
+        block_fp32_stride = (csa_rows_per_block * index_row_bytes) // 4
+        scale_fp32_offset = (csa_rows_per_block * head_dim) // 4
         # storage_offset is ABSOLUTE and `kv_cache` is a slice of the pool's
         # raw arena, so its own offset has to be added or every layer's
         # cache_scale aliases the first layer's. Mirrors `deepseek_v4_attn.py`.
         flat_f32 = kv_cache.view(torch.float32).view(-1)
         compressor.cache_scale = flat_f32.as_strided(
-            size=(nb, k1),
+            size=(nb, csa_rows_per_block),
             stride=(block_fp32_stride, 1),
             storage_offset=flat_f32.storage_offset() + scale_fp32_offset,
         )

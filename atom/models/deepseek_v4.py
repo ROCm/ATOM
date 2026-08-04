@@ -122,7 +122,7 @@ logger = logging.getLogger(__name__)
 # Classical KV cache scatter / gather helpers (PR3-pre2c-B).
 #
 # Each V4 block (block_size=2*lcm(m, m')=256 original tokens) holds k_per_block
-# compressed entries per layer (k1=64 for CSA, k2=2 for HCA). Compressor.forward
+# compressed rows per layer (64 for CSA, 2 for HCA). Compressor.forward
 # scatters newly-compressed entries into block-table-indexed slots; sparse_attn
 # input gathers all committed entries up to the current position.
 #
@@ -133,7 +133,8 @@ logger = logging.getLogger(__name__)
 
 # V4 paper §3.6.1: classical-KV block_size = a multiple of lcm(m, m'). For
 # V4-Pro / V4-Flash lcm(4, 128) = 128; we use 2*lcm = 256 original tokens so
-# k1_csa = 256/4 = 64 (the FP4 indexer kernels need kv_block_size=64). Kept as
+# a CSA layer keeps 256/4 = 64 rows per block (the FP4 indexer kernels need
+# kv_block_size=64). Kept as
 # a constant so Compressor code does not need to import the builder. MUST match
 # DeepseekV4AttentionMetadataBuilder.block_size and config.kv_cache_block_size.
 _V4_BLOCK_SIZE: int = 256
@@ -1292,7 +1293,8 @@ class Indexer(nn.Module):
             prefix=f"{prefix}.compressor",
         )
         # PR3-pre2c-B: Indexer.kv_cache is bound by the V4 attention builder
-        # to a `[num_blocks, k1, head_dim]` per-CSA-layer view of the global
+        # to a `[num_blocks, csa_rows_per_block, head_dim]` per-CSA-layer view
+        # of the global
         # `csa_idx_kv` classical KV pool. The 1-slot register_buffer below is
         # a warmup fallback (warmup runs before allocate_kv_cache); it is
         # setattr-replaced post-binding and GC'd. Same pattern as Compressor's
@@ -1754,7 +1756,7 @@ class Indexer(nn.Module):
         )  # [bs, next_n, n_heads, head_dim] fp8
         kv_cache_4d = self.kv_cache.unsqueeze(
             -2
-        )  # [num_blocks, k1_csa, 1, head_dim+scale_dim] uint8
+        )  # [num_blocks, csa_rows_per_block, 1, head_dim+scale_dim] uint8
         # Per-fwd write-once GPU scratch — no CPU mirror, no cross-fwd state.
         # Under CUDAGraph capture, torch allocates from the graph's private
         # memory pool and the address is stable across replays at this
@@ -1775,7 +1777,7 @@ class Indexer(nn.Module):
             n_committed_per_seq_gpu,  # int32, sized [bs] (staged in builder)
             block_tables,
             self._max_model_len_idx,
-            KVBlockSize=self.kv_cache.size(1),  # k1_csa = 64
+            KVBlockSize=self.kv_cache.size(1),  # csa_rows_per_block = 64
             Preshuffle=True,
         )
         # Per-fwd write-once int32 scratch. Kernel writes exactly `index_topk`
@@ -1847,16 +1849,18 @@ class Indexer(nn.Module):
         # budget-chunking (below) rarely fires. Must match the width the
         # precomputed schedule (full_cta_info) was built with.
         max_seq_len = indexer_meta["fp4_prefill_max_seq_len"]
-        kv_block_size = self.kv_cache.size(3)  # k1_csa = 64
+        kv_block_size = self.kv_cache.size(3)  # csa_rows_per_block = 64
         # The packed-dword scale readers in pa_mqa_logits_fp4* require N_PHYS==1
         # (NTPW=4 N-tiles share one physical block), i.e. kv_block_size == 64
-        # (TILES_PER_BLOCK = 64/MFMA_N(16) = 4 = NTPW). block_size=256 → k1_csa=64
+        # (TILES_PER_BLOCK = 64/MFMA_N(16) = 4 = NTPW). block_size=256 gives
+        # 64 CSA rows per block, which
         # satisfies this; guard so an unsupported block size fails loudly here
         # instead of reading scales with the wrong interleave.
         assert kv_block_size == 64, (
-            f"FP4 indexer requires kv_block_size (k1_csa) == 64 for the packed "
+            f"FP4 indexer requires kv_block_size (CSA rows per block) == 64 "
+            f"for the packed "
             f"N_PHYS==1 mqa-logits readers, got {kv_block_size}. Set V4 "
-            f"block_size=256 (k1_csa=block_size//4)."
+            f"block_size=256 (CSA rows per block = block_size // 4)."
         )
 
         def _score(chunk_start, chunk_end, rs, re):
@@ -1969,16 +1973,18 @@ class Indexer(nn.Module):
         q_4d = q_fp4.view(bs, next_n, self.n_heads, self.head_dim // 2)
         q_scale_6d = q_scale.view(bs, next_n, k_tiles, 4, 16, qs_pad)
         max_seq_len = self._max_model_len_idx
-        kv_block_size = self.kv_cache.size(3)  # k1_csa = 64
+        kv_block_size = self.kv_cache.size(3)  # csa_rows_per_block = 64
         # The packed-dword scale readers in pa_mqa_logits_fp4* require N_PHYS==1
         # (NTPW=4 N-tiles share one physical block), i.e. kv_block_size == 64
-        # (TILES_PER_BLOCK = 64/MFMA_N(16) = 4 = NTPW). block_size=256 → k1_csa=64
+        # (TILES_PER_BLOCK = 64/MFMA_N(16) = 4 = NTPW). block_size=256 gives
+        # 64 CSA rows per block, which
         # satisfies this; guard so an unsupported block size fails loudly here
         # instead of reading scales with the wrong interleave.
         assert kv_block_size == 64, (
-            f"FP4 indexer requires kv_block_size (k1_csa) == 64 for the packed "
+            f"FP4 indexer requires kv_block_size (CSA rows per block) == 64 "
+            f"for the packed "
             f"N_PHYS==1 mqa-logits readers, got {kv_block_size}. Set V4 "
-            f"block_size=256 (k1_csa=block_size//4)."
+            f"block_size=256 (CSA rows per block = block_size // 4)."
         )
 
         # Precomputed schedule from the metadata builder (always present on the
@@ -2095,13 +2101,14 @@ class Indexer(nn.Module):
         # Fixed logits width → static `[padded, W]` shape (CG-capturable), same as
         # the rectangular decode path.
         max_seq_len = self._max_model_len_idx
-        kv_block_size = self.kv_cache.size(3)  # k1_csa = 64
+        kv_block_size = self.kv_cache.size(3)  # csa_rows_per_block = 64
         # Same N_PHYS==1 packed-dword-scale contract as the other FP4 paths
         # (see `_score_topk_decode_fp4`): fail loudly on an unsupported block size.
         assert kv_block_size == 64, (
-            f"FP4 indexer requires kv_block_size (k1_csa) == 64 for the packed "
+            f"FP4 indexer requires kv_block_size (CSA rows per block) == 64 "
+            f"for the packed "
             f"N_PHYS==1 mqa-logits readers, got {kv_block_size}. Set V4 "
-            f"block_size=256 (k1_csa=block_size//4)."
+            f"block_size=256 (CSA rows per block = block_size // 4)."
         )
 
         # Write-once, NOT -inf-filled: passing the precomputed `cta_info`/`n_ctas`

@@ -23,8 +23,9 @@ PR3-pre2c-B (this revision): classical KV cache (compressed entries) moved
                    under the block_table per paper §3.6.1. Three pools allocated
                    (csa_main_kv / csa_idx_kv / hca_main_kv), shape
                    `[num_blocks, n_layers_of_type, k, head_dim]`. block_size =
-                   2*lcm(m, m') = 256 original tokens (k1_csa=64 so the FP4
-                   indexer kernels run N_PHYS=1). Compressor + Indexer
+                   2*lcm(m, m') = 256 original tokens, so a CSA layer keeps 64
+                   rows per block and the FP4 indexer kernels run N_PHYS=1.
+                   Compressor + Indexer
                    .kv_cache attributes bound to per-layer pool slices.
 PR3-main:   multi-sequence dispatch (slot=0 -> per-seq slot).
 
@@ -321,10 +322,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     Inherits CommonAttentionBuilder for the standard prefill/decode prep
     (slot_mapping, block_tables, cu_seqlens). `block_size` is 2*lcm(m, m') =
     256 (V4-Pro: m=4 CSA, m'=128 HCA), a multiple of lcm so each classical KV
-    cache block still holds an integral number of compressed entries per layer
-    (k1=block_size/m=64 CSA, k2=block_size/m'=2 HCA). We use 2*lcm (not lcm)
-    because the FP4 paged-MQA-logits indexer kernels require the indexer
-    kv_block_size (= k1_csa) to be 64 for N_PHYS=1. Must equal
+    cache block still holds an integral number of compressed rows per layer
+    (block_size/m = 64 for CSA, block_size/m' = 2 for HCA). We use 2*lcm (not
+    lcm) because the FP4 paged-MQA-logits indexer kernels require the indexer
+    kv_block_size (= the CSA row count) to be 64 for N_PHYS=1. Must equal
     `config.kv_cache_block_size` (config.py forces the same value for V4).
     """
 
@@ -375,11 +376,15 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # max-density ratio (1 indexer slot per 4 source tokens).
         self.max_model_len_idx = model_runner.config.max_model_len // 4
 
-        # Classical KV pool geometry. block_size=256 original tokens means
-        # each V4 block holds k1=256/4=64 CSA entries and k2=256/128=2 HCA
-        # entries per layer (paper §3.6.1; block_size is a multiple of lcm).
-        self.k1_csa = self.block_size // 4  # = 64
-        self.k2_hca = self.block_size // 128  # = 2
+        # Classical KV pool geometry. block_size=256 original tokens means one
+        # V4 block compresses to 256/4=64 rows in a CSA layer and 256/128=2 rows
+        # in an HCA layer (paper §3.6.1; block_size is a multiple of lcm).
+        self.csa_rows_per_block = self.block_size // 4  # = 64
+        self.hca_rows_per_block = self.block_size // 128  # = 2
+        self._rows_per_block = {
+            4: self.csa_rows_per_block,
+            128: self.hca_rows_per_block,
+        }
 
         self._state_dtype = torch.float32  # fp32 required for softmax-pool
         # KV cache dtype gate. fp8 → 2buff native layout (nope fp8 in a 512B
@@ -415,16 +420,30 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             self._swa_dtype = torch.bfloat16  # SWA window matches KV dtype
             self._classical_dtype = torch.bfloat16  # CSA / HCA Main KV is BF16
             self._rope_dtype = torch.bfloat16  # unused in bf16 path (symmetry)
-        # CSA Indexer cache is FP8 + 4-byte fp32 scale per row, aligned to 16
-        # bytes (matches V3.2 sparse MLA pattern; avoids torch inductor
-        # unaligned-access slowdowns). Written by `indexer_k_quant_and_cache`,
-        # read by `cp_gather_indexer_k_quant_cache`.
-        self._aligned_index_dim = ((self.index_head_dim + 4 + 15) // 16) * 16
+        # CSA Indexer cache: `index_head_dim` FP8 bytes plus a 4-byte fp32
+        # scale per row. Data and scale sit in two REGIONS inside a block, NOT
+        # interleaved per row: `[rows*index_head_dim data][rows*4 scale]`. All
+        # three consumers address it that way — fused_compress.py (write),
+        # cache_kernels.cu:1638/1651 (cp_gather_indexer_k_quant_cache), and
+        # pa_mqa_logits.py:493-500 (deepgemm_fp8_paged_mqa_logits).
+        #
+        # So the alignment that matters is the BLOCK stride, and 64 * 132 =
+        # 8448 = 16 * 528 is already 16-byte aligned. Rounding this per-row
+        # value up to a multiple of 16 instead pays the 12-byte rounding once
+        # per row rather than once per block: 768 B per block per CSA layer,
+        # 1.5% of the whole KV pool.
+        self._index_row_bytes = self.index_head_dim + 4
+        indexer_block_bytes = self.csa_rows_per_block * self._index_row_bytes
+        assert indexer_block_bytes % 16 == 0, (
+            f"indexer block stride {indexer_block_bytes} B "
+            f"({self.csa_rows_per_block} rows x {self._index_row_bytes} B) must "
+            "be 16-byte aligned: the FP8 data region is read with dwordx4 loads"
+        )
 
         # Opt-in FP4 indexer cache (gfx950). When set, the CSA Indexer KV is
         # stored as packed FP4 E2M1 + per-group(32) e8m0 scale in the
         # `pa_mqa_logits_fp4` preshuffle layout (data
-        # [NB, k_tiles, 4, k1, 16] uint8 + scale [NB, k_tiles, 4, k1] uint8)
+        # [NB, k_tiles, 4, rows, 16] uint8 + scale [NB, k_tiles, 4, rows] uint8)
         # written by `fused_compress_attn(quant_mode="fp4")`. The scoring path
         # auto-detects FP4 via `kv_cache.dtype == uint8`. Default (fp8) → the
         # existing FP8 (+fp32 scale) path is byte-identical.
@@ -659,39 +678,47 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         """Entries sizing gave the compressor-state class."""
         return self.model_runner.pool_plan.entries.get(STATE_SLOT_CLASS, 0)
 
+    def rows_per_block(self, compress_ratio: int) -> int:
+        """Rows one V4 block compresses to in a layer of this ratio.
+
+        0 for a dense layer (ratio 0), which keeps no compressed KV at all —
+        callers use that as the "skip this layer" signal.
+        """
+        return self._rows_per_block.get(compress_ratio, 0)
+
     def sub_pool_specs(self) -> list[SubPoolSpec]:
         """Two pools, three entry classes: paged compressed KV, plus a
         window-freed SWA class and the compressor ring, both per-request.
 
         Per-V4-block bytes for the paged class. Each V4 block
         (block_size=256 original tokens) stores per layer:
-          - CSA Main:   k1=64 entries × head_dim BF16
-          - CSA Indexer: k1=64 entries × aligned_index_dim bytes FP8
-                        (= ((index_head_dim + 4 + 15) // 16) * 16 — 16-byte
-                        alignment matches V3.2 sparse MLA index cache and
-                        avoids unaligned-access slowdowns in torch inductor.
-                        FP8 quantized data + 4-byte fp32 scale interleaved
-                        per row; written by `indexer_k_quant_and_cache`,
-                        read by `cp_gather_indexer_k_quant_cache`).
-          - HCA Main:   k2=2 entries × head_dim BF16
+          - CSA Main:    64 rows × head_dim BF16
+          - CSA Indexer: 64 rows × (index_head_dim + 4) bytes FP8. Data and
+                         scale are two REGIONS inside the block, not
+                         interleaved per row: `[rows*index_head_dim FP8]`
+                         then `[rows*4 fp32 scale]`. Written by
+                         `indexer_k_quant_and_cache`, read by
+                         `cp_gather_indexer_k_quant_cache` and
+                         `deepgemm_fp8_paged_mqa_logits`.
+          - HCA Main:     2 rows × head_dim BF16
         """
         elem_classical = self._classical_dtype.itemsize  # fp8 = 1 or bf16 = 2
-        csa_main_per_block = self.k1_csa * self.head_dim * elem_classical
+        csa_rows = self.csa_rows_per_block
+        hca_rows = self.hca_rows_per_block
+        csa_main_per_block = csa_rows * self.head_dim * elem_classical
         if self._indexer_fp4:
-            # FP4: packed data (k_tiles*4*k1*16 bytes) + e8m0 scale
-            # (k_tiles*4*k1 bytes) per block, in two separate uint8 pools.
-            csa_idx_per_block = (
-                self._idx_k_tiles * 4 * self.k1_csa * 16
-                + self._idx_k_tiles * 4 * self.k1_csa
-            )
+            # FP4: packed data (k_tiles*4*rows*16 bytes) + e8m0 scale
+            # (k_tiles*4*rows bytes) per block, in two separate uint8 pools.
+            fp4_groups = self._idx_k_tiles * 4 * csa_rows
+            csa_idx_per_block = fp4_groups * 16 + fp4_groups
         else:
-            csa_idx_per_block = self.k1_csa * self._aligned_index_dim  # fp8 = 1B
-        hca_main_per_block = self.k2_hca * self.head_dim * elem_classical
+            csa_idx_per_block = csa_rows * self._index_row_bytes  # fp8 = 1 B/elem
+        hca_main_per_block = hca_rows * self.head_dim * elem_classical
         if self._kv_fp8:
             # 2buff: parallel bf16 rope pool per compress entry.
             elem_rope = self._rope_dtype.itemsize
-            csa_main_per_block += self.k1_csa * self.rope_head_dim * elem_rope
-            hca_main_per_block += self.k2_hca * self.rope_head_dim * elem_rope
+            csa_main_per_block += csa_rows * self.rope_head_dim * elem_rope
+            hca_main_per_block += hca_rows * self.rope_head_dim * elem_rope
         compressed_block_bytes = (
             len(self.csa_layers) * (csa_main_per_block + csa_idx_per_block)
             + len(self.hca_layers) * hca_main_per_block
@@ -729,9 +756,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         Only the CSA Indexer FP8 cache stays as a standalone batched tensor
         — it lives in its own dtype (FP8 + fp32 scale) and is consumed by
         `cp_gather_indexer_k_quant_cache`, not the sparse-attn kernel.
-        Layer-major axis order `[n_csa, NB, k1, aligned_dim]` so each
-        per-CSA slice `pool[pos]` is contiguous in storage; the kernel
-        infers `block_size` from `kv_cache.shape[1]`.
+        Layer-major axis order `[n_csa, NB, csa_rows_per_block,
+        index_row_bytes]` so each per-CSA slice `pool[pos]` is contiguous in
+        storage; the kernel infers `block_size` from `kv_cache.shape[1]`.
         """
         runner = self.model_runner
         device = runner.device
@@ -744,19 +771,19 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             kt = self._idx_k_tiles
             return {
                 "v4_csa_idx_kv": torch.zeros(
-                    (n_csa, num_blocks, kt, 4, self.k1_csa, 16),
+                    (n_csa, num_blocks, kt, 4, self.csa_rows_per_block, 16),
                     dtype=torch.uint8,
                     device=device,
                 ),
                 "v4_csa_idx_kv_scale": torch.zeros(
-                    (n_csa, num_blocks, kt, 4, self.k1_csa),
+                    (n_csa, num_blocks, kt, 4, self.csa_rows_per_block),
                     dtype=torch.uint8,
                     device=device,
                 ),
             }
         return {
             "v4_csa_idx_kv": torch.zeros(
-                (n_csa, num_blocks, self.k1_csa, self._aligned_index_dim),
+                (n_csa, num_blocks, self.csa_rows_per_block, self._index_row_bytes),
                 dtype=dtypes.fp8,
                 device=device,
             ),
@@ -782,8 +809,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         `[swa_pages, ..)` are compress), with
         `swa_pages = num_slots * win_with_spec`:
             Dense layer: [swa_pages,           head_dim]
-            CSA   layer: [swa_pages + NB*k1,   head_dim]
-            HCA   layer: [swa_pages + NB*k2,   head_dim]
+            CSA   layer: [swa_pages + NB*csa_rows_per_block,   head_dim]
+            HCA   layer: [swa_pages + NB*hca_rows_per_block,   head_dim]
 
         `build_kv_cache_tensor` slices per-layer views to bind into
         `attn.swa_kv` (SWA portion) and `compressor.kv_cache` (compress
@@ -818,12 +845,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         ratios = self.compress_ratios
 
         def _pages(layer_id: int) -> int:
-            ratio = ratios[layer_id]
-            if ratio == 4:
-                return swa_pages + num_blocks * self.k1_csa
-            if ratio == 128:
-                return swa_pages + num_blocks * self.k2_hca
-            return swa_pages  # Dense: SWA ring only
+            # Dense layers compress to 0 rows, leaving just the SWA ring.
+            rows = self.rows_per_block(ratios[layer_id])
+            return swa_pages + num_blocks * rows
 
         # Every per-request pool is carved from ONE allocation. Each group is
         # planned on its own and shifted by what precedes it, which is exact
@@ -983,13 +1007,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             # Indexer.kv_cache — CSA Indexer compressed pool, per CSA layer.
             # prefix: "layers.<L>.attn.indexer"
             #
-            # Shape MUST stay [NB, k1_csa, aligned_dim] (3D, block_size dim
-            # explicit) because `cp_gather_indexer_k_quant_cache` infers
-            # block_size from `kv_cache.shape[1]` to compute
+            # Shape MUST stay [NB, csa_rows_per_block, index_row_bytes] (3D,
+            # row-count dim explicit) because `cp_gather_indexer_k_quant_cache`
+            # infers block_size from `kv_cache.shape[1]` to compute
             # `physical_block * block_size + slot_in_block`. Flattening to
-            # [NB*k1, 1, aligned_dim] makes the kernel see block_size=1 and
-            # OOB-index block_table. Matches V3.2's [num_blocks, block_size,
-            # head_dim] layout (deepseek_v2.py:1049).
+            # [NB*rows, 1, index_row_bytes] makes the kernel see block_size=1
+            # and OOB-index block_table. Matches V3.2's [num_blocks,
+            # block_size, head_dim] layout (deepseek_v2.py:1049).
             layer_id_from_prefix = int(module.prefix.split(".")[1])
             pos = self.layer_id_to_csa_pos[layer_id_from_prefix]
             module.kv_cache = runner.v4_csa_idx_kv[pos]
@@ -1019,8 +1043,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 module.kv_state = runner.v4_csa_idx_kv_state[pos]
                 module.score_state = runner.v4_csa_idx_score_state[pos]
                 # Inner compressor writes target the SAME storage as the
-                # outer Indexer.kv_cache (csa_idx_kv). Same [NB, k1_csa,
-                # aligned_dim] FP8 shape — `Compressor.forward` resolves
+                # outer Indexer.kv_cache (csa_idx_kv). Same 3-D FP8 shape
+                # — `Compressor.forward` resolves
                 # slot via block_table+ci internally (no flat slot_mapping
                 # needed; matches CSA Main's path).
                 idx_kv = runner.v4_csa_idx_kv[pos]
@@ -1032,18 +1056,17 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                     module.cache_scale = runner.v4_csa_idx_kv_scale[pos]
                 else:
                     # FP8 quant path: bind a strided fp32 view of the per-block
-                    # scale region. Layout per block: [k1*head_dim FP8 region]
-                    # then [k1 fp32 scale region] then padding (cache_kernels.cu
-                    # :1209-1239). Strides expressed in fp32 elements.
-                    nb, k1, aligned_dim = idx_kv.shape
+                    # scale region. Layout per block: [rows*head_dim FP8] then
+                    # [rows fp32 scale], exactly filling the block
+                    # (cache_kernels.cu:1209-1239). Strides in fp32 elements.
+                    nb, rows, row_bytes = idx_kv.shape
                     head_dim = self.index_head_dim
+                    block_bytes = rows * row_bytes
                     assert (
-                        k1 * aligned_dim
-                    ) % 4 == 0, (
-                        f"per-block bytes ({k1 * aligned_dim}) must be 4-aligned"
-                    )
-                    block_fp32_stride = (k1 * aligned_dim) // 4
-                    scale_fp32_offset = (k1 * head_dim) // 4
+                        block_bytes % 4 == 0
+                    ), f"per-block bytes ({block_bytes}) must be 4-aligned"
+                    block_fp32_stride = block_bytes // 4
+                    scale_fp32_offset = (rows * head_dim) // 4
                     # `as_strided(storage_offset=...)` is ABSOLUTE in the underlying
                     # storage, NOT relative to `idx_kv`. Since idx_kv =
                     # v4_csa_idx_kv[pos] carries its own storage_offset (pos *
@@ -1055,7 +1078,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                     # tensor (v4_csa_idx_kv_scale[pos]).
                     idx_kv_f32 = idx_kv.view(torch.float32)
                     module.cache_scale = idx_kv_f32.view(-1).as_strided(
-                        size=(nb, k1),
+                        size=(nb, rows),
                         stride=(block_fp32_stride, 1),
                         storage_offset=idx_kv_f32.storage_offset() + scale_fp32_offset,
                     )
@@ -1070,16 +1093,16 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 # CSA Main compressed pool now lives in the tail of the
                 # owning layer's `unified_kv`. Compressor.forward writes via
                 # `kv_cache[block_id, slot_in_block, :] = entry`, so we hand
-                # it the standard [num_blocks, k1, head_dim] view.
+                # it the standard [num_blocks, rows, head_dim] view.
                 num_blocks = runner.num_physical_kvcache_blocks
                 unified = runner.v4_unified_kv[layer_id_from_prefix]
                 module.kv_cache = unified[swa_pages:].view(
-                    num_blocks, self.k1_csa, self.head_dim
+                    num_blocks, self.csa_rows_per_block, self.head_dim
                 )
                 if self._kv_fp8:
                     rope = runner.v4_unified_kv_rope[layer_id_from_prefix]
                     module.kv_cache_rope = rope[swa_pages:].view(
-                        num_blocks, self.k1_csa, self.rope_head_dim
+                        num_blocks, self.csa_rows_per_block, self.rope_head_dim
                     )
                     module.quant_mode = "group_fp8"
                 else:
@@ -1092,12 +1115,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 num_blocks = runner.num_physical_kvcache_blocks
                 unified = runner.v4_unified_kv[layer_id_from_prefix]
                 module.kv_cache = unified[swa_pages:].view(
-                    num_blocks, self.k2_hca, self.head_dim
+                    num_blocks, self.hca_rows_per_block, self.head_dim
                 )
                 if self._kv_fp8:
                     rope = runner.v4_unified_kv_rope[layer_id_from_prefix]
                     module.kv_cache_rope = rope[swa_pages:].view(
-                        num_blocks, self.k2_hca, self.rope_head_dim
+                        num_blocks, self.hca_rows_per_block, self.rope_head_dim
                     )
                     module.quant_mode = "group_fp8"
                 else:
@@ -1161,13 +1184,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             )
             if compress_total <= 0:
                 continue
-            ratio = self.compress_ratios[layer_id]
-            if ratio == 4:
-                bpb = self.k1_csa * self.head_dim * elem_classical
-            elif ratio == 128:
-                bpb = self.k2_hca * self.head_dim * elem_classical
-            else:
+            rows = self.rows_per_block(self.compress_ratios[layer_id])
+            if not rows:  # dense layer: SWA ring only, no compress region
                 continue
+            bpb = rows * self.head_dim * elem_classical
             block_regions.append(KVTransferRegion(compress_base, compress_total, bpb))
             if self._kv_fp8:
                 rope = runner.v4_unified_kv_rope[layer_id]
@@ -1177,11 +1197,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                     )
                 rope_prefix_bytes = swa_pages * self.rope_head_dim * rope.element_size()
                 rope_total = rope.numel() * rope.element_size() - rope_prefix_bytes
-                rope_bpb = (
-                    self.k1_csa * self.rope_head_dim * rope.element_size()
-                    if ratio == 4
-                    else self.k2_hca * self.rope_head_dim * rope.element_size()
-                )
+                rope_bpb = rows * self.rope_head_dim * rope.element_size()
                 block_regions.append(
                     KVTransferRegion(
                         rope.data_ptr() + rope_prefix_bytes,
@@ -1193,7 +1209,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # Block regions: CSA Indexer KV (FP8)
         for pos in range(len(self.csa_layers)):
             t = runner.v4_csa_idx_kv[pos]
-            bpb = self.k1_csa * self._aligned_index_dim
+            bpb = self.csa_rows_per_block * self._index_row_bytes
             block_regions.append(
                 KVTransferRegion(t.data_ptr(), t.numel() * t.element_size(), bpb)
             )
@@ -2934,15 +2950,16 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             # write_v4_paged_decode_indices.
             write_pos = hca_indptr_np[token_indices] + entry_offsets
             bid_expanded = batch_id_per_token_np[token_indices]
-            # Each physical block packs k2_hca HCA compress entries (compressor
-            # cache view [num_blocks, k2_hca, head_dim]); shared with the prefill
-            # kernel + regression test via hca_compress_paged_offsets.
+            # Each physical block packs hca_rows_per_block rows (compressor
+            # cache view [num_blocks, hca_rows_per_block, head_dim]); shared
+            # with the prefill kernel + regression test via
+            # hca_compress_paged_offsets.
             hca_indices_np[write_pos] = hca_compress_paged_offsets(
                 entry_offsets,
                 bid_expanded,
                 block_tables_np_full,
                 swa_pages,
-                self.k2_hca,
+                self.hca_rows_per_block,
             )
         # Stage to GPU (HCA compress section at head; SWA prefix scattered below).
         hca_indices_gpu = self._stage(
@@ -3236,7 +3253,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             win=win,
             cache_size=self.win_with_spec,
             swa_pages=swa_pages,
-            k2_hca=self.k2_hca,
+            hca_rows_per_block=self.hca_rows_per_block,
         )
 
         # ----- skip_prefix_len_csa: per-token SWA prefix length -----

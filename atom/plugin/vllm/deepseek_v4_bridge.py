@@ -90,10 +90,13 @@ def deepseek_v4_draft_proxy_layer_name(hf_config) -> str:
     )
 
 
-def _aligned_index_dim(index_head_dim: int) -> int:
-    # extra 4 Bytes for scale.
-    # 16 Bytes aligned.
-    return ((index_head_dim + 4 + 15) // 16) * 16
+def _index_row_bytes(index_head_dim: int) -> int:
+    # `index_head_dim` FP8 bytes plus a 4-byte fp32 scale. Data and scale are
+    # two REGIONS inside a block, not interleaved per row, so the alignment
+    # that matters is the block stride (`rows_per_block * this`), not this
+    # value. Rounding it up to a multiple of 16 pays the rounding once per row
+    # instead of once per block — 1.5% of the KV pool for nothing.
+    return index_head_dim + 4
 
 
 def _layer_counts(hf_config) -> tuple[list[int], int, int, int]:
@@ -109,7 +112,7 @@ def _classical_block_bytes(hf_config, kv_fp8: bool = False) -> int:
     head_dim = int(getattr(hf_config, "head_dim", 512))
     rope_head_dim = _v4_rope_head_dim(hf_config)
     index_head_dim = int(getattr(hf_config, "index_head_dim", 128))
-    index_dim = _aligned_index_dim(index_head_dim)
+    index_dim = _index_row_bytes(index_head_dim)
     # NoPE(+RoPE) payload bytes per classical entry; fp8 splits into a fp8 NoPE
     # pool + a bf16 RoPE pool (see _v4_entry_bytes). Indexer is always fp8 and
     # unchanged by the 2buff layout.
@@ -197,7 +200,7 @@ def slice_deepseek_v4_proxy_cache_views(
         assert csa_layer_count is not None and hca_layer_count is not None
         compress_ratios = [4] * csa_layer_count + [128] * hca_layer_count
     ratios = [int(r) for r in compress_ratios]
-    index_dim = _aligned_index_dim(index_head_dim)
+    index_dim = _index_row_bytes(index_head_dim)
     physical = proxy_kv_cache.permute(1, 0, 2, 3, 4)
     if not physical.is_contiguous():
         raise ValueError("DeepSeek V4 proxy cache must be block-major contiguous")
@@ -567,15 +570,15 @@ def _bind_compressor_state(
     )
     compressor.kv_cache = kv_cache
     if is_indexer:
-        nb, k1, aligned_dim = kv_cache.shape
-        block_fp32_stride = (k1 * aligned_dim) // 4
-        scale_fp32_offset = (k1 * head_dim) // 4
+        nb, csa_rows_per_block, index_row_bytes = kv_cache.shape
+        block_fp32_stride = (csa_rows_per_block * index_row_bytes) // 4
+        scale_fp32_offset = (csa_rows_per_block * head_dim) // 4
         # storage_offset is ABSOLUTE and `kv_cache` is a view into vLLM's proxy
         # pool, so its own offset has to be added or every layer's cache_scale
         # aliases the first layer's. Mirrors `deepseek_v4_attn.py`.
         flat_f32 = kv_cache.view(torch.float32).view(-1)
         compressor.cache_scale = flat_f32.as_strided(
-            size=(nb, k1),
+            size=(nb, csa_rows_per_block),
             stride=(block_fp32_stride, 1),
             storage_offset=flat_f32.storage_offset() + scale_fp32_offset,
         )

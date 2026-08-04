@@ -125,15 +125,16 @@ def test_prefix_window_start_maps_to_its_ring_row(two_seq):
     assert int(two_seq["ref"]["prefix_swa_indices"][start]) == expected
 
 
-# --- k2_hca > 1 coverage ----------------------------------------------------
+# --- coverage for more than one HCA row per block -------------------------
 # Regression for the HCA paged-gather bug. With V4 block_size=256, ratio=128 the
-# compressor packs k2_hca = block_size // ratio = 2 HCA entries per physical
-# block (cache view [num_blocks, k2_hca, D]), so entry e -> block
-# block_tables[bid, e // k2] at slot e % k2 -> row swa_pages + phys*k2 + slot.
-# The pre-fix gather emitted swa_pages + block_tables[bid, e] (assumed k2 == 1)
-# and silently read the wrong blocks. block_size=16, ratio=8 -> k2=2 mirrors
+# compressor packs hca_rows_per_block = block_size // ratio = 2 HCA entries per physical
+# block (cache view [num_blocks, hca_rows_per_block, D]), so entry e -> block
+# block_tables[bid, e // rows] at slot e % rows -> row swa_pages + phys*rows +
+# slot. The pre-fix gather emitted swa_pages + block_tables[bid, e] (assumed one
+# row per block) and silently read the wrong blocks. block_size=16, ratio=8
+# gives 2 rows per block, which mirrors
 # 256 // 128 at a size the test can enumerate.
-K2 = 16 // 8
+HCA_ROWS_PER_BLOCK = 16 // 8
 _BT_K2 = [5, 9, 13, 17, 21, 25, 29, 33]
 
 
@@ -164,7 +165,7 @@ def _run_k2(fn, out_hca):
         cache_size=CACHE_SIZE,
         swa_pages=SWA_PAGES,
         hca_ratio=8,
-        k2_hca=K2,
+        hca_rows_per_block=HCA_ROWS_PER_BLOCK,
     )
     return out_hca
 
@@ -180,18 +181,26 @@ def hca_k2():
 
 def test_hca_k2_kernel_matches_reference(hca_k2):
     ref, ker = hca_k2
-    assert torch.equal(ker, ref), f"k2={K2} HCA kernel != ref\nref={ref}\nker={ker}"
+    assert torch.equal(
+        ker, ref
+    ), f"rows_per_block={HCA_ROWS_PER_BLOCK} HCA kernel != ref\nref={ref}\nker={ker}"
 
 
 def test_hca_k2_offsets_are_block_packed(hca_k2):
     """Independent oracle: where the compressor actually writes entry e."""
     _, ker = hca_k2
     oracle = torch.tensor(
-        [SWA_PAGES + _BT_K2[e // K2] * K2 + e % K2 for e in range(4)],
+        [
+            SWA_PAGES
+            + _BT_K2[e // HCA_ROWS_PER_BLOCK] * HCA_ROWS_PER_BLOCK
+            + e % HCA_ROWS_PER_BLOCK
+            for e in range(4)
+        ],
         dtype=torch.int32,
         device=DEV,
     )
     assert torch.equal(ker, oracle), (
-        f"k2={K2} HCA compress offset wrong (the HCA paged-gather bug)\n"
+        f"rows_per_block={HCA_ROWS_PER_BLOCK} HCA compress offset wrong "
+        f"(the HCA paged-gather bug)\n"
         f"got={ker.tolist()}\nexp={oracle.tolist()}"
     )
