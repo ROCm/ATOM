@@ -1623,6 +1623,7 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
             topk=top_k,
             # todo decode use graph_bs for perf
             mtpr=self.moe.max_num_tokens,
+            swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
             quant="a8w4",
         )
 

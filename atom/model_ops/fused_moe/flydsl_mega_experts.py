@@ -48,6 +48,7 @@ _MEGA_BUILD_DBG = False
 def _os_env(k):
     return os.environ.get(k, "<unset>")
 
+
 def build_mega_weights(layer) -> None:
     """From ATOM's RAW (pre-atom-shuffle) mxfp4 w13/w2 + e8m0 scales, build the
     MegaMoEV2-layout weights and stash on the layer. Must run BEFORE atom's own
@@ -97,12 +98,28 @@ def get_or_build_mega_moe(
     topk,
     quant,
     mtpr,
+    swiglu_limit,
     w1,
     w1_scale,
     w2,
     w2_scale,
 ):
-    key = (rank, world_size, model_dim, inter_dim, experts, topk, quant, mtpr)
+    # swiglu_limit belongs in the key: aiter bakes the clamp into the GEMM1
+    # kernel at trace time (gemm_util.py `if self._swiglu_limit <= 0`), so two
+    # layers with different limits cannot share one instance. Without it in the
+    # key they would silently reuse whichever limit was built first -- wrong
+    # numerics, no error.
+    key = (
+        rank,
+        world_size,
+        model_dim,
+        inter_dim,
+        experts,
+        topk,
+        quant,
+        mtpr,
+        swiglu_limit,
+    )
     m = _MEGA_CACHE.get(key)
     if m is None:
         from aiter.ops.flydsl.kernels.mega_moe import MegaMoEV2
@@ -123,6 +140,7 @@ def get_or_build_mega_moe(
                 w2=w2,
                 w2_scale=w2_scale,
                 max_tok_per_rank=mtpr,
+                swiglu_limit=swiglu_limit,
             )
         _MEGA_CACHE[key] = m
 
@@ -154,6 +172,7 @@ def run_mega_moe(
     experts: int,
     topk: int,
     mtpr: int,
+    swiglu_limit: float,
     quant: str = "a8w4",
 ) -> torch.Tensor:
     """Replace EP experts with MegaMoEV2. x: [tokens, model_dim] bf16 (this rank's
@@ -161,8 +180,12 @@ def run_mega_moe(
     [tokens, model_dim] bf16."""
     from aiter.dist.parallel_state import get_ep_group
 
-    ep = get_ep_group()
-    rank, world = int(ep.rank_in_group), int(ep.world_size)
+    # Do NOT "simplify" this to get_ep_group().rank_in_group / .world_size.
+    # Reading device_communicator.all2all_manager is load-bearing: that property
+    # lazily constructs the all2all manager, and building MoriAll2AllManager is
+    # what initializes the mori symmetric shmem heap.
+    am = get_ep_group().device_communicator.all2all_manager
+    rank, world = int(am.rank), int(am.world_size)
 
     run_tokens = int(x.shape[0])
     if run_tokens > mtpr:
@@ -184,6 +207,7 @@ def run_mega_moe(
         topk=topk,
         quant=quant,
         mtpr=mtpr,
+        swiglu_limit=float(swiglu_limit),
         w1=layer._mega_w1,
         w1_scale=layer._mega_w1_scale,
         w2=layer._mega_w2,
@@ -192,7 +216,6 @@ def run_mega_moe(
 
     wts = topk_weights.to(torch.float32).contiguous()
     ids = topk_ids.to(torch.int32).contiguous()
-    swiglu_limit = float(getattr(layer, "swiglu_limit", 0.0))
 
     # FULL CUDAGraph replays the captured token capacity, while cu_seqlens_q[-1]
     # is updated to the real packed-prefix length on every replay. Keep Mega's
@@ -221,10 +244,7 @@ def run_mega_moe(
         ids = ids.masked_fill(token_rows[:, None] >= valid_tokens, invalid_expert_id)
 
     with torch.inference_mode(False), torch.no_grad():
-        out = mega.forward(
-            x.contiguous(),
-            wts,
-            ids,
-            swiglu_limit=swiglu_limit,
-        )
+        # swiglu_limit is NOT a forward arg -- it is baked into the instance at
+        # construction (see the cache key above).
+        out = mega.forward(x.contiguous(), wts, ids)
     return out
