@@ -27,8 +27,37 @@ def test_kimi_k3_plugin_registries_are_synchronized():
         == "atom.plugin.vllm.models.kimi_k3:KimiK3ForCausalLMVllm"
     )
     assert (
-        _ATOM_MODEL_CLASSES[arch] == "atom.plugin.vllm.models.kimi_k3:KimiK3ForCausalLM"
+        _ATOM_MODEL_CLASSES[arch]
+        == "atom.plugin.vllm.models.kimi_k3:KimiK3ForConditionalGeneration_"
     )
+
+
+def test_kimi_k3_outer_is_multimodal_and_hybrid():
+    _run_without_test_stubs("""
+        from vllm.model_executor.models.interfaces import IsHybrid
+
+        from atom.plugin.vllm.model_wrapper import ATOMForConditionalGeneration
+        from atom.plugin.vllm.models.kimi_k3 import KimiK3ForCausalLMVllm
+
+        mro = KimiK3ForCausalLMVllm.__mro__
+        # Multimodal via ATOMForConditionalGeneration; hybrid state retained.
+        assert ATOMForConditionalGeneration in mro
+        assert IsHybrid in mro
+
+        # Image placeholder matches the checkpoint token.
+        assert (
+            KimiK3ForCausalLMVllm.get_placeholder_str("image", 0)
+            == "<|kimi_image_placeholder|>"
+        )
+
+        # Hybrid mamba-state entry points survive the base-class change.
+        for name in (
+            "get_mamba_state_dtype_from_config",
+            "get_mamba_state_shape_from_config",
+            "get_mamba_state_copy_func",
+        ):
+            assert hasattr(KimiK3ForCausalLMVllm, name)
+        """)
 
 
 def test_kimi_k3_temporal_state_uses_fp32():

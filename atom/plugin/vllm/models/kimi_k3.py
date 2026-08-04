@@ -40,7 +40,7 @@ from atom.models.kimi_k3 import (
     _normalize_kimi_config,
 )
 from atom.models.utils import maybe_prefix
-from atom.plugin.vllm.model_wrapper import ATOMMoEForCausalLM
+from atom.plugin.vllm.model_wrapper import ATOMForConditionalGeneration
 from atom.utils.forward_context import get_forward_context as get_atom_forward_context
 
 
@@ -280,7 +280,21 @@ class KimiK3ForConditionalGeneration_(vLLMKimiK3):
         return self.language_model.get_expert_mapping()
 
 
-class KimiK3ForCausalLMVllm(ATOMMoEForCausalLM, IsHybrid):
+@MULTIMODAL_REGISTRY.register_processor(
+    KimiK3MultiModalProcessor,
+    info=KimiK3ProcessingInfo,
+    dummy_inputs=KimiK3DummyInputsBuilder,
+)
+class KimiK3ForCausalLMVllm(ATOMForConditionalGeneration, IsHybrid):
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
+        if modality == "image":
+            return "<|kimi_image_placeholder|>"
+        raise ValueError(f"Unsupported modality: {modality}")
+
+    def load_weights(self, weights):
+        return self.model.load_weights(weights)
+
     @classmethod
     def get_mamba_state_dtype_from_config(
         cls,
