@@ -3,6 +3,8 @@ import logging
 
 logger = logging.getLogger("atom")
 
+_K3_DSPARK_ARCH = "K3DSparkModel"
+
 
 def _patch_eagle3_model_type_checks() -> None:
     # vLLM's V1 EAGLE proposer SpecDecodeBaseProposer.propose() has an explicit
@@ -11,8 +13,9 @@ def _patch_eagle3_model_type_checks() -> None:
     # through the ATOMModelBase wrapper, so patch the type checks to accept the
     # ATOMModelBase wrapper
     try:
-        from atom.plugin.vllm.model_wrapper import ATOMModelBase
         import vllm.v1.spec_decode.llm_base_proposer as llm_base_proposer
+
+        from atom.plugin.vllm.model_wrapper import ATOMModelBase
     except Exception:
         logger.warning(
             "vLLM plugin: failed to patch vLLM V1 EAGLE3 proposer type checks. "
@@ -37,6 +40,100 @@ def _patch_eagle3_model_type_checks() -> None:
 
     setattr(llm_base_proposer, "_atom_eagle3_model_types_patched", True)
     logger.info("ATOM plugin: patched vLLM EAGLE3 proposer type checks.")
+
+
+def _patch_dspark_standalone_draft_config() -> None:
+    """Keep the Kimi-K3 DSpark draft from being rewritten into a DeepSeek-V4 one.
+
+    vLLM assumes every DSpark draft other than Qwen3's ships inside a
+    DeepSeek-V4 target checkpoint, so it overwrites the draft's ``model_type``
+    and ``architectures`` to match. Kimi-K3-DSpark is its own checkpoint with
+    its own architecture, and the rewrite makes the config unresolvable.
+
+    The rewrite is always followed by ``update_arch_()``, which is where the
+    new names are first acted on, so undoing it there catches it before
+    anything downstream can observe it. The rewrite touches nothing else, so
+    the config shim class still identifies the draft.
+    """
+    try:
+        from vllm.config.speculative import SpeculativeConfig
+
+        from atom.plugin.vllm.register import K3DSparkConfig
+    except Exception:
+        logger.warning(
+            "vLLM plugin: failed to patch SpeculativeConfig for standalone "
+            "DSpark drafts. This can happen with an incompatible vLLM version."
+        )
+        return
+
+    original_update_arch = SpeculativeConfig.update_arch_
+    if getattr(original_update_arch, "_atom_dspark_draft_arch_patched", False):
+        return
+
+    @functools.wraps(original_update_arch)
+    def patched_update_arch(self):
+        hf_config = getattr(self.draft_model_config, "hf_config", None)
+        if isinstance(hf_config, K3DSparkConfig) and hf_config.architectures != [
+            _K3_DSPARK_ARCH
+        ]:
+            hf_config.model_type = K3DSparkConfig.model_type
+            hf_config.architectures = [_K3_DSPARK_ARCH]
+            logger.info(
+                "ATOM plugin: kept standalone DSpark draft architecture %s.",
+                _K3_DSPARK_ARCH,
+            )
+        return original_update_arch(self)
+
+    patched_update_arch._atom_dspark_draft_arch_patched = True
+    SpeculativeConfig.update_arch_ = patched_update_arch
+    logger.info("ATOM plugin: patched SpeculativeConfig for standalone DSpark drafts.")
+
+
+def _patch_dspark_causal_draft() -> None:
+    """Draft the Kimi-K3 DSpark block causally, the way ATOM's own DSpark does.
+
+    vLLM's DSpark speculator pins drafting to non-causal: every block position
+    attends to the whole block. ``mla_decode_fwd`` masks tail-aligned-causally
+    whatever it is asked for, so getting that upper triangle means merging a
+    second partial attention in by log-sum-exp -- and no aiter decode kernel
+    hands back an LSE we could rely on at serving batch sizes. The persistent
+    kernel leaves ``final_lse`` at FLT_MAX for part of the batch once sequence
+    lengths vary, and routing around it to the split-KV kernel did not hold up
+    end to end at 64 concurrency.
+
+    ATOM's native DSpark never merges: the block pass just takes what the
+    kernel gives, so position ``i`` sees ``context + block[:i+1]``. That costs
+    the block's tail -- positions 5-7 are almost never accepted, so acceptance
+    lands near 3.9 rather than 4.7 -- but it needs no LSE at all. Causal
+    drafting is a first-class DFlash mode here, so matching native is just
+    flipping the flag the DSpark subclass pins off, for the Kimi-K3 draft only.
+    """
+    try:
+        from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+    except ImportError:
+        return
+
+    original_init = DSparkSpeculator.__init__
+    if getattr(original_init, "_atom_dspark_causal_patched", False):
+        return
+
+    @functools.wraps(original_init)
+    def wrapped_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        hf_config = getattr(self.draft_model_config, "hf_config", None)
+        if _K3_DSPARK_ARCH not in (getattr(hf_config, "architectures", None) or ()):
+            return
+        # Read by init_cudagraph_manager() and by every draft attention
+        # metadata build, both of which run after __init__.
+        self.dflash_causal = True
+        logger.info(
+            "ATOM plugin: drafting the %s block causally, matching ATOM's "
+            "native DSpark attention path.",
+            _K3_DSPARK_ARCH,
+        )
+
+    setattr(wrapped_init, "_atom_dspark_causal_patched", True)
+    DSparkSpeculator.__init__ = wrapped_init
 
 
 def _get_attn_backend_block_size(backend) -> int:
@@ -488,6 +585,46 @@ def _patch_vllm_draft_positions_on_metadata() -> None:
     )
 
 
+class _KernelUnitBlockTables:
+    """``BlockTables`` whose ``block_sizes`` are the kernel's, not the manager's.
+
+    ``BlockTables`` stores block ids in *kernel* blocks: it expands each
+    manager block into ``block_size // kernel_block_size`` of them
+    (`append_block_ids`). The DFlash speculator turns those ids back into slots
+    with ``block_id * block_sizes[gid] + offset``, which only lands on the right
+    slot while the two sizes agree -- they do for vLLM's own backends, but
+    ATOM's MLA kernels page by the token (kernel block size 1), so the manager's
+    size overshoots by that ratio and the draft writes past its pool.
+    """
+
+    def __init__(self, block_tables):
+        self._block_tables = block_tables
+        self.block_sizes = list(block_tables.kernel_block_sizes)
+
+    def __getattr__(self, name):
+        return getattr(self._block_tables, name)
+
+
+def _patch_vllm_dflash_kernel_block_units() -> None:
+    try:
+        from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+    except ImportError:
+        return
+
+    original_set_attn = DFlashSpeculator.set_attn
+    if getattr(original_set_attn, "_atom_kernel_block_units_patched", False):
+        return
+
+    @functools.wraps(original_set_attn)
+    def wrapped_set_attn(self, model_state, kv_cache_config, block_tables):
+        if list(block_tables.kernel_block_sizes) != list(block_tables.block_sizes):
+            block_tables = _KernelUnitBlockTables(block_tables)
+        return original_set_attn(self, model_state, kv_cache_config, block_tables)
+
+    setattr(wrapped_set_attn, "_atom_kernel_block_units_patched", True)
+    DFlashSpeculator.set_attn = wrapped_set_attn
+
+
 def _patch_vllm_deepseek_v4_mtp_first_pass_inputs() -> None:
     from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
 
@@ -537,10 +674,15 @@ def _patch_vllm_deepseek_v4_mtp_first_pass_inputs() -> None:
 
 def apply_vllm_spec_decode_patch() -> None:
     """Patch vLLM speculative decoding for ATOM metadata compatibility."""
+    _patch_dspark_standalone_draft_config()
+    _patch_dspark_causal_draft()
     _patch_vllm_llm_base_model_sharing()
     _patch_vllm_draft_kv_group_validation()
     _patch_vllm_draft_positions_on_metadata()
+    _patch_vllm_dflash_kernel_block_units()
     _patch_vllm_deepseek_v4_mtp_first_pass_inputs()
+
+    from vllm.v1.spec_decode.eagle import SpecDecodeBaseProposer
 
     from atom.plugin.vllm.attention.metadata import (
         AiterMhaMetadataForVllm,
@@ -551,7 +693,6 @@ def apply_vllm_spec_decode_patch() -> None:
     from atom.utils.forward_context import (
         AttentionMetaData as AtomAttentionMetaData,
     )
-    from vllm.v1.spec_decode.eagle import SpecDecodeBaseProposer
 
     _patch_eagle3_model_type_checks()
     _patch_heterogeneous_eagle3_kv_cache()
