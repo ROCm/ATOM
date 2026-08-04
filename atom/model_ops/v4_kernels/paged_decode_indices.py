@@ -64,8 +64,7 @@ def hca_compress_paged_offsets(
 
 @triton.jit
 def _v4_paged_decode_indices_kernel(
-    block_tables_ptr,  # [bs, max_blocks] int32 — logical→physical block
-    block_tables_stride,  # = max_blocks (row stride)
+    state_slot_per_seq_ptr,  # [bs] int32 — per-request SWA ring slot
     batch_id_per_token_ptr,  # [T+pad] int — sentinel -1 in pad tail
     positions_ptr,  # [T+pad] int — global token position
     swa_indptr_ptr,  # [T+1] int32 — ragged SWA-prefix cumsum
@@ -74,7 +73,7 @@ def _v4_paged_decode_indices_kernel(
     swa_indices_ptr,  # [swa_total] int32, output
     csa_indices_ptr,  # [csa_total] int32, output (writes SWA-prefix segment only)
     hca_indices_ptr,  # [hca_total] int32, output (writes SWA-prefix segment only)
-    block_size,  # paged-SWA: tokens per block (= V4 block_size, 128)
+    cache_size,  # SWA ring slots per request (= win_with_spec)
     win: tl.constexpr,  # window_size — max SWA prefix slots
     BLOCK_N: tl.constexpr,  # next_pow2(win)
 ):
@@ -92,8 +91,7 @@ def _v4_paged_decode_indices_kernel(
         # slice tail (indptr[t+1] - n) so the compress section fills the head.
         for i in range(n):
             abs_pos = pos - n + 1 + i
-            phys = block_tables[bid, abs_pos // block_size]
-            paged = phys * block_size + abs_pos % block_size
+            paged = slot * cache_size + abs_pos % cache_size
             swa_indices[swa_indptr[t+1] - n + i] = paged
             csa_indices[csa_indptr[t+1] - n + i] = paged
             hca_indices[hca_indptr[t+1] - n + i] = paged
@@ -117,14 +115,11 @@ def _v4_paged_decode_indices_kernel(
     i = tl.arange(0, BLOCK_N)
     mask = i < n
     abs_pos = pos - n + 1 + i  # ∈ [0, pos] for valid i
-    # paged-SWA: content-address each window position via block_tables
-    # (same physical block as the compressed cache → prefix-cache hits read
-    # the original request's SWA, not a stale ring). issue #1417.
-    blk = abs_pos // block_size
-    phys = tl.load(
-        block_tables_ptr + bid * block_tables_stride + blk, mask=mask, other=0
-    )
-    paged = phys * block_size + abs_pos % block_size
+    # Ring: `n <= win <= cache_size`, and the newest position this request has
+    # written is `pos` (plus its drafts), so every `abs_pos` here is inside the
+    # ring's last lap.
+    slot = tl.load(state_slot_per_seq_ptr + bid)
+    paged = slot * cache_size + abs_pos % cache_size
 
     tl.store(swa_indices_ptr + swa_end - n + i, paged, mask=mask)
     tl.store(csa_indices_ptr + csa_end - n + i, paged, mask=mask)
@@ -134,7 +129,7 @@ def _v4_paged_decode_indices_kernel(
 @mark_trace
 def write_v4_paged_decode_indices(
     *,
-    block_tables: torch.Tensor,
+    state_slot_per_seq: torch.Tensor,
     batch_id_per_token: torch.Tensor,
     positions: torch.Tensor,
     swa_indptr: torch.Tensor,
@@ -145,7 +140,7 @@ def write_v4_paged_decode_indices(
     hca_indices: torch.Tensor,
     T: int,
     win: int,
-    block_size: int,
+    cache_size: int,
     prefix: str = "",
 ) -> None:
     """In-place fill SWA / CSA / HCA window-prefix offsets via a single
@@ -153,13 +148,13 @@ def write_v4_paged_decode_indices(
     + `index_copy_` chain. All inputs are persistent forward_vars buffers —
     no allocator churn.
 
-    paged-SWA: SWA offsets are content-addressed via `block_tables`
-    (`block_tables[bid, abs_pos//block_size]*block_size + abs_pos%block_size`),
+    SWA offsets are ring-addressed via the request's state slot
+    (`state_slot_per_seq[bid] * cache_size + abs_pos % cache_size`),
     same physical block as the compressed cache — so prefix-cache hits read the
     original request's SWA, not a stale per-request ring (issue #1417).
 
-    Args (all GPU tensors except T/win/block_size):
-      block_tables:        [bs, MB] int32 — logical→physical block.
+    Args (all GPU tensors except T/win/cache_size):
+      state_slot_per_seq:  [bs] int32 — per-request SWA ring slot.
       batch_id_per_token:  [>=T]  int   — token→seq map; -1 sentinel skipped.
       positions:           [>=T]  int   — global token position
                                    (forward_vars["positions"]); used to derive
@@ -184,12 +179,12 @@ def write_v4_paged_decode_indices(
                                    caller via numpy fill.
       T:                   int — number of real tokens (grid size).
       win:                 int — SWA window size (typically 128 for V4-Pro).
-      block_size:          int — tokens per block (= V4 block_size, 128);
-                                 stride into the paged SWA region.
+      cache_size:          int — SWA ring slots per request
+                                 (= ``win_with_spec``); the ring modulus.
     """
     if T == 0:
         return
-    assert block_tables.dim() == 2
+    assert state_slot_per_seq.dim() == 1
     assert batch_id_per_token.dim() == 1 and batch_id_per_token.shape[0] >= T
     assert positions.dim() == 1 and positions.shape[0] >= T
     assert swa_indptr.dim() == 1 and swa_indptr.shape[0] >= T + 1
@@ -201,8 +196,7 @@ def write_v4_paged_decode_indices(
 
     BLOCK_N = triton.next_power_of_2(win)
     _v4_paged_decode_indices_kernel[(T,)](
-        block_tables,
-        block_tables.stride(0),
+        state_slot_per_seq,
         batch_id_per_token,
         positions,
         swa_indptr,
@@ -211,7 +205,7 @@ def write_v4_paged_decode_indices(
         swa_indices,
         csa_indices,
         hca_indices,
-        block_size,
+        cache_size,
         win=win,
         BLOCK_N=BLOCK_N,
     )
@@ -219,7 +213,7 @@ def write_v4_paged_decode_indices(
 
 def write_v4_paged_decode_indices_reference(
     *,
-    block_tables: torch.Tensor,
+    state_slot_per_seq: torch.Tensor,
     batch_id_per_token: torch.Tensor,
     positions: torch.Tensor,
     swa_indptr: torch.Tensor,
@@ -230,11 +224,11 @@ def write_v4_paged_decode_indices_reference(
     hca_indices: torch.Tensor,
     T: int,
     win: int,
-    block_size: int,
+    cache_size: int,
 ) -> None:
-    """Pure-PyTorch reference equivalent of `write_v4_paged_decode_indices`
-    (paged-SWA). For unit tests and bisect verification. Mirrors the kernel:
-    per-token ragged-packed write, content-addressed via block_tables.
+    """Pure-PyTorch reference equivalent of `write_v4_paged_decode_indices`.
+    For unit tests and bisect verification. Mirrors the kernel:
+    per-token ragged-packed write, ring-addressed via the state slot.
     """
     if T == 0:
         return
@@ -252,8 +246,8 @@ def write_v4_paged_decode_indices_reference(
         b = int(bid[t].item())
         i_arr = torch.arange(n, device=positions.device, dtype=torch.long)
         abs_pos = p - n + 1 + i_arr  # [n]
-        phys = block_tables[b, abs_pos // block_size].long()
-        paged = (phys * block_size + abs_pos % block_size).to(torch.int32)
+        slot = int(state_slot_per_seq[b])
+        paged = (slot * cache_size + abs_pos % cache_size).to(torch.int32)
         # SWA prefix segment at the slice TAIL (compress section fills the head).
         swa_end = int(swa_indptr[t + 1].item())
         csa_end = int(csa_indptr[t + 1].item())

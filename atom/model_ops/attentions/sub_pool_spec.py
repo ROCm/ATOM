@@ -9,23 +9,23 @@ There are exactly two pools, distinguished by what their size scales with:
   Pool.STATE  scales with in-flight requests, not with sequence length. The
               sliding window, the DeepSeek-V4 compressor ring, GDN/Mamba
               recurrent state. Classification follows the scaling, not the
-              addressing: the SWA pool is block-table addressed yet its size
-              is literally `max_num_seqs * blocks_per_req + slack`.
+              addressing: what puts a class in STATE is that its total is
+              `max_num_seqs * per_req`, whatever the rows are indexed by.
 
 A pool is a budget region, not a single entry size. Inside one pool there can
 be several **entry classes**, each with its own index space, its own bytes
-per entry, and — in the STATE pool — its own per-request multiplicity. SWA
-blocks and compressor rings live in the same pool and are counted separately;
-collapsing them into one entry size would make the two counts unrecoverable.
+per entry, and — in the STATE pool — its own per-request multiplicity. The
+sliding-window ring and the compressor ring live in the same pool and are
+counted separately; collapsing them into one entry size would make the two
+counts unrecoverable.
 
 Entry classes are keyed by name. Two specs with the same name are the same
 index space, so their `entry_bytes` add — that is how an Eagle3 draft KV pool
 rides the target model's block ids, and how DeepSeek-V4's indexer cache rides
 the same block table as its main compressed KV. Two specs with different names
 are different index spaces even inside one pool and keep separate counts: the
-sliding window is block-table addressed at `per_decode` blocks per request
-while the compressor ring is slot addressed at one per request, so they can
-never share a count.
+sliding-window ring is `win_with_spec` rows per request while the compressor
+ring is one entry per request, so they can never share a count.
 
 This module deliberately defines no *architecture* vocabulary. A name is owned
 by whatever consumes the count — `swa_pool.py` names the sliding-window class,
@@ -35,8 +35,8 @@ not an architecture's: it is the allocation regime itself, since PAGE is by
 construction a single shared index space that every contributor adds bytes to.
 
 Cross-request sharing is a property of the cache layer above, not of this
-sizing. Every STATE entry class is shareable (SWA blocks are content-addressed
-today; compressor rings become so once they are published at checkpoints).
+sizing. A STATE entry class is shared by copying it into the resuming
+request's slot at a checkpoint, not by two requests pointing at one entry.
 What is reserved here is the floor an in-flight request cannot run without;
 retained-and-shared entries live in the same region and compete for the rest.
 """

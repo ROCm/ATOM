@@ -42,9 +42,9 @@ class KVTransferTensors:
     slot_regions: list[KVTransferRegion]
     num_blocks: int
     num_slots: int = 0
-    # paged-SWA: SWA lives in a SEPARATE pool addressed by seq.swa_block_table
-    # (not the compressed block_table), so these regions are transferred keyed by
-    # swa_block_table — only the live window (last ~128-token block) per request.
+    # The sliding window is a per-request ring, not part of the compressed
+    # block_table, so it gets its own regions keyed by the request's state
+    # slot. `unit_bytes` is one whole ring.
     swa_block_regions: list[KVTransferRegion] = field(default_factory=list)
     staging_region: KVTransferRegion | None = None
     staging_pool_size: int = 0
@@ -122,8 +122,8 @@ class ReqMeta:
     remote_tp_size: int = 0
     transfer_id: int = 0
     local_slot_index: int = -1
-    # paged-SWA: parallel block ids into the SEPARATE SWA pool. Empty for
-    # non-V4 backends. -1 entries are window-freed and skipped by the transfer.
+    # The request's SWA ring slot, as a one-element list so it zips with the
+    # region loop like block ids do. Empty for backends with no SWA state.
     local_swa_block_ids: list[int] = field(default_factory=list)
     remote_swa_block_ids: list[int] = field(default_factory=list)
 

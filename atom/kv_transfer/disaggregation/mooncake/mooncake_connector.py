@@ -75,6 +75,25 @@ PREFILL_LOOKUP_TIMEOUT = 60
 PREFILL_LOOKUP_POLL_INTERVAL = 0.01
 
 
+def _swa_ring_ids(seq) -> list[int]:
+    """The ids the SWA region transfer is keyed by: this request's ring slot.
+
+    A sliding window used to be its own content-addressed block pool, so the
+    key was a list of block ids and window-freeing left only the live tail
+    non-sentinel. It is a per-request ring now: one slot, whose whole
+    `win_with_spec` rows are the transfer unit (see the backend's
+    `swa_block_regions`, whose `unit_bytes` is a full ring).
+
+    Returns `[]` when no slot is assigned, which is every request on a backend
+    with no per-request state and is what makes the SWA transfer inert there.
+    Whether an empty list is legitimate depends on whether the backend emitted
+    any SWA regions at all, which only the connector knows -- see the guard at
+    the transfer site.
+    """
+    slot = getattr(seq, "per_req_cache_group", -1)
+    return [int(slot)] if slot is not None and slot >= 0 else []
+
+
 def _ib_device_exists(device_name: str) -> bool:
     return os.path.exists(f"/sys/class/infiniband/{device_name}")
 
@@ -284,7 +303,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
                 request_id=req_id,
                 local_block_ids=block_ids,
                 kv_transfer_params=req.kv_transfer_params,
-                local_swa_block_ids=list(getattr(req, "swa_block_table", []) or []),
+                local_swa_block_ids=_swa_ring_ids(req),
             )
 
         # Producer side: pass completed prefill block_ids to worker
@@ -295,7 +314,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
                 request_id=req_id,
                 local_block_ids=block_ids,
                 kv_transfer_params=req.kv_transfer_params,
-                local_swa_block_ids=list(getattr(req, "swa_block_table", []) or []),
+                local_swa_block_ids=_swa_ring_ids(req),
             )
 
         if self._reqs_need_recv or self._reqs_need_save:
@@ -361,10 +380,9 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             "do_remote_prefill": True,
             "do_remote_decode": False,
             "remote_block_ids": seq.block_table.copy(),
-            # paged-SWA: the consumer's SWA-pool block ids (separate pool);
-            # the producer keys the SWA region transfer by these. Empty for
-            # backends without a separate SWA pool.
-            "remote_swa_block_ids": list(getattr(seq, "swa_block_table", []) or []),
+            # The consumer's SWA ring slot; the producer keys the SWA region
+            # transfer by it. Empty for backends with no SWA state.
+            "remote_swa_block_ids": _swa_ring_ids(seq),
             "remote_engine_id": self.engine_id,
             "remote_host": self.host_ip,
             "remote_port": self.handshake_port,
@@ -521,8 +539,8 @@ class MooncakeConnector(KVConnectorBase):
         self._has_slot_regions: bool = False
         # (base_addr, bytes_per_block) per region
         self._block_regions: list[tuple[int, int]] = []
-        # paged-SWA: SWA pool regions, keyed by seq.swa_block_table (separate
-        # from the compressed block_table above); (base_addr, bytes_per_swa_block)
+        # SWA ring regions, keyed by the request's state slot (not by the
+        # compressed block_table above); (base_addr, bytes_per_ring)
         self._swa_block_regions: list[tuple[int, int]] = []
         # (base_addr, bytes_per_slot) per region
         self._slot_regions: list[tuple[int, int]] = []
@@ -666,7 +684,7 @@ class MooncakeConnector(KVConnectorBase):
 
         # Populate block/slot region lists for transfer offset computation
         self._block_regions = [(r.base_addr, r.unit_bytes) for r in tt.block_regions]
-        # paged-SWA: SWA pool regions, transferred by seq.swa_block_table.
+        # SWA ring regions, transferred one whole ring per state slot.
         self._swa_block_regions = [
             (r.base_addr, r.unit_bytes) for r in tt.swa_block_regions
         ]
@@ -894,7 +912,7 @@ class MooncakeConnector(KVConnectorBase):
                             b for b, _ in self._block_regions
                         ],
                         "consumer_block_bpb": [bpb for _, bpb in self._block_regions],
-                        # paged-SWA: separate SWA pool, keyed by swa_block_table
+                        # SWA ring, keyed by state slot
                         "dst_swa_block_ids": meta.local_swa_block_ids,
                         "consumer_swa_block_base_addrs": [
                             b for b, _ in self._swa_block_regions
@@ -1310,7 +1328,7 @@ class MooncakeConnector(KVConnectorBase):
         consumer_slot_bps = request_data["consumer_slot_bps"]
         dst_slot = request_data["dst_slot_index"]
         src_slot = prefill_data["slot_index"]
-        # paged-SWA: separate SWA pool, keyed by swa_block_table.
+        # SWA ring, keyed by state slot.
         consumer_swa_block_addrs = request_data.get("consumer_swa_block_base_addrs", [])
         consumer_swa_block_bpb = request_data.get("consumer_swa_block_bpb", [])
         dst_swa_block_ids = request_data.get("dst_swa_block_ids", [])
@@ -1330,9 +1348,21 @@ class MooncakeConnector(KVConnectorBase):
                 block_dst.append(dst_base + db * consumer_block_bpb[cidx])
                 block_sizes.append(bpb)
 
-        # paged-SWA: transfer the SWA pool by swa_block_table. Window-freed
-        # entries carry -1 on either side → skipped, so only the live window
-        # (the last ~128-token block per request) crosses the wire.
+        # Transfer the SWA ring, one whole ring per state slot. Unlike the
+        # block pool this replaced there is nothing to skip: a ring has no
+        # freed entries, so every row of a live slot crosses the wire.
+        #
+        # A backend that registered SWA regions but sent no slot would transfer
+        # zero rows and the resuming side would decode against an empty window
+        # -- exactly the failure #1417 was about, and silent. The two facts
+        # only meet here, so this is where it has to be caught.
+        if self._swa_block_regions and not (src_swa_block_ids and dst_swa_block_ids):
+            raise RuntimeError(
+                f"backend registered {len(self._swa_block_regions)} SWA ring "
+                f"regions but the transfer carries no state slot "
+                f"(src={src_swa_block_ids}, dst={dst_swa_block_ids}); the "
+                "resuming request would read an empty sliding window"
+            )
         swa_cmap = self._consumer_region_map(len(self._swa_block_regions))
         for region_idx, (src_base, bpb) in enumerate(self._swa_block_regions):
             cidx = swa_cmap[region_idx]

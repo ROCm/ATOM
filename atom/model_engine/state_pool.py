@@ -87,9 +87,8 @@ class StateGroupPool:
 
     A *group* is what one request occupies in the pre-allocated state tensor:
     `entries // entries_per_req` contiguous indices (GDN conv+ssm, the
-    DeepSeek-V4 compressor ring). This pool owns the free list, so it is the
-    single answer to "can one more request be admitted" — the twin of
-    `SlidingWindowPool` owning its blocks.
+    DeepSeek-V4 compressor ring and sliding window). This pool owns the free
+    list, so it is the single answer to "can one more request be admitted".
 
     A per-request state cannot be rebuilt from cached KV blocks: the cache holds
     the compressor's *output*, the state is its rolling *input* window. So a

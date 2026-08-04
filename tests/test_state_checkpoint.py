@@ -13,7 +13,7 @@
 # checkpoints must never reduce the number of admissible requests, and the
 # eviction event is hand-out, not free.
 
-from math import isinf
+from math import inf, isinf
 from types import SimpleNamespace
 
 import pytest
@@ -24,7 +24,6 @@ from atom.model_engine.scheduler import CacheStats, ScheduledBatchOutput, Schedu
 from atom.model_engine.sequence import Sequence, SequenceType
 from atom.model_engine.state_cache import StateCache
 from atom.model_engine.state_pool import StateGroupPool, StateTransfer
-from atom.model_engine.swa_pool import SlidingWindowPool
 
 BLOCK = 4
 MIN_FORK = 8
@@ -387,24 +386,19 @@ class TestForkLifecycle:
         bm = BlockManager(ckpt_config())
         seq = stateful_seq(list(range(40)))
         published = [2, 5]  # checkpoint boundaries, in blocks
-        approved = 5  # the only boundary SWA accepts
 
         bm.state.hash_to_group = {}
         hashes = [1000 + i for i in range(9)]
         for group, boundary in enumerate(published):
             bm.state._index(hashes[boundary - 1], group)
-        bm.swa.resumable_hit = (
-            lambda s, p, h, assume_checkpointed=False, _a=approved: min(p, _a)
-        )
+        # A second class that accepts at most 5 — exactly the rightmost
+        # checkpoint, so the fixpoint should settle there.
+        bm.state_caches = (*bm.state_caches, StubStateCache(cap=5))
+        assert bm._gated_hit(seq, 9, hashes) == 5
 
-        assert bm._gated_hit(seq, 9, hashes) == approved
-
-        # Now SWA only accepts 4: the rightmost checkpoint (5) is out of reach,
+        # Now it accepts only 4: the rightmost checkpoint (5) is out of reach,
         # so the answer must fall back to 2 rather than stay at 5 or become 4.
-        approved = 4
-        bm.swa.resumable_hit = (
-            lambda s, p, h, assume_checkpointed=False, _a=approved: min(p, _a)
-        )
+        bm.state_caches = (bm.state_caches[0], StubStateCache(cap=4))
         assert bm._gated_hit(seq, 9, hashes) == 2
 
     def test_no_boundary_when_the_backend_cannot_fork(self):
@@ -837,18 +831,44 @@ class TestDecodePublishGate:
         assert forks == [published]
 
 
-# ── One ladder, two state classes ──────────────────────────────────────────
+# ── One ladder, N state classes ────────────────────────────────────────────
 #
-# SWA and the compressor ring are both `Pool.STATE` (sub_pool_spec.py): both
-# scale with in-flight requests, both can keep a boundary resumable, both can
-# veto a hit. They differ only in mutability, and `successor_room` is that
-# difference quantified — which is all the ladder knows about either.
+# The ladder treats `Pool.STATE` classes as a set: each scales with in-flight
+# requests, each can keep a boundary resumable, each can veto a hit. They differ
+# only in mutability, and `successor_room` is that difference quantified — which
+# is all the ladder knows about any of them.
+#
+# There is one real class today (the compressor ring; the sliding window became
+# a per-request ring carried by the checkpoint and left the protocol). These
+# tests use a stub for the second member on purpose: the multi-class behaviour
+# is a property of the ladder, not of whichever classes happen to exist, and it
+# has to keep working for the next one to arrive (GDN, once it stops forking).
+# Testing it through a real second class would make these tests hostage to that
+# class's own lifecycle — which is exactly what happened when it was SWA.
+
+
+class StubStateCache:
+    """Minimal `StateCache`: a fixed room and a hit it can be told to cap."""
+
+    def __init__(self, successor_room=inf, cap=None, enabled=True):
+        self.successor_room = successor_room
+        self.enabled = enabled
+        self._cap = cap
+
+    def applies(self, seq):
+        return self.enabled
+
+    def resumable_hit(self, seq, P, block_hashes, assume_checkpointed=False):
+        return P if self._cap is None else min(P, self._cap)
+
+    def checkpoint(self, seq, boundary_blocks, h):
+        pass
 
 
 def swa_pool(**overrides):
-    kwargs = {"num_blocks": 64, "window": 16, "block_size": BLOCK, "mtp_k": 0}
-    kwargs.update(overrides)
-    return SlidingWindowPool(**kwargs)
+    """A second state class for the protocol tests. Named for what it stands in
+    for historically; its behaviour is the stub's, not any real pool's."""
+    return StubStateCache(**overrides)
 
 
 class TestStateCacheProtocol:
@@ -873,8 +893,7 @@ class TestStateCacheProtocol:
         bm = BlockManager(ckpt_config())
         seq = stateful_seq(list(range(40)))
         assert bm.checkpoint_limit(seq) == 32  # the ring alone: 40 - MIN_FORK
-        bm.swa.enabled = True
-        bm.swa.successor_room = 0
+        bm.state_caches = (*bm.state_caches, StubStateCache(successor_room=0))
         assert bm.checkpoint_limit(seq) == 40
 
     def test_the_three_transfers_land_on_three_different_rooms(self):
@@ -907,9 +926,8 @@ class TestStateCacheProtocol:
         # immutable class needs none.
         pos = seq.num_prompt_tokens - BLOCK
         assert bm.state not in bm.checkpointers_at(seq, pos)
-        bm.swa.enabled = True
-        bm.swa.successor_room = 0
-        assert bm.checkpointers_at(seq, pos) == [bm.swa]
+        bm.state_caches = (*bm.state_caches, StubStateCache(successor_room=0))
+        assert bm.checkpointers_at(seq, pos) == [bm.state_caches[-1]]
 
     def test_cut_and_ladder_agree_position_for_position(self):
         """The chunk is cut where — and only where — something gets kept."""
@@ -936,7 +954,7 @@ class TestGatedHitFixpoint:
         hashes = [1000 + i for i in range(9)]
         for group, boundary in enumerate([2, 5]):
             bm.state._index(hashes[boundary - 1], group)
-        bm.swa.resumable_hit = lambda s, p, h, assume_checkpointed=False: min(p, 4)
+        bm.state_caches = (*bm.state_caches, StubStateCache(cap=4))
 
         answer = bm._gated_hit(seq, 9, hashes)
         for cache in bm.state_caches:
@@ -948,7 +966,7 @@ class TestGatedHitFixpoint:
         hashes = [1000 + i for i in range(9)]
         for group, boundary in enumerate([2, 5]):
             bm.state._index(hashes[boundary - 1], group)
-        bm.swa.resumable_hit = lambda s, p, h, assume_checkpointed=False: min(p, 4)
+        bm.state_caches = (*bm.state_caches, StubStateCache(cap=4))
 
         forward = bm._gated_hit(seq, 9, hashes)
         bm.state_caches = tuple(reversed(bm.state_caches))
@@ -1029,7 +1047,7 @@ class TestDemandDrivenCheckpoints:
         """
         bm = BlockManager(demand_config())
         run_prompt_on_the_ladder(bm, stateful_seq(PROMPT))
-        bm.swa.resumable_hit = lambda s, p, h, assume_checkpointed=False: min(p, 8)
+        bm.state_caches = (*bm.state_caches, StubStateCache(cap=8))
 
         second = stateful_seq(PROMPT)
         assert bm.can_allocate(second) == 8

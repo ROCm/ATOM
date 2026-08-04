@@ -451,11 +451,6 @@ class ScheduledBatch:
         self.block_tables = [
             seq.block_table for seq in seqs.values() if seq.block_table
         ]
-        # paged-SWA: parallel SWA block table (independent physical pool;
-        # -1 sentinels for window-freed blocks). Same filter as block_tables.
-        self.swa_block_tables = [
-            seq.swa_block_table for seq in seqs.values() if seq.block_table
-        ]
         self.last_block_num_tokens = [
             _seq.last_block_num_tokens for _seq in seqs.values()
         ]
@@ -1211,12 +1206,6 @@ class Scheduler:
             )
 
             if needs_remote_load:
-                # PD: the consumer runs no prefill forward (so ensure_swa is
-                # never called) and its first may_append is skipped. Materialize
-                # the trailing-window SWA blocks now — matching the producer's
-                # post-free swa_block_table positions — so the RDMA transfer has
-                # real dst slots to write the sliding-window KV into.
-                self.block_manager.swa.materialize_window(seq, seq.num_prompt_tokens)
                 self._park_for_remote_load(seq, skipped_waiting_requests)
                 continue
 
@@ -1259,17 +1248,6 @@ class Scheduler:
         total_tokens_num_prefill = sum(num_scheduled_tokens)
 
         if num_seqs_prefill > 0:
-            # chunked-prefill: materialize the SWA pool blocks this chunk's
-            # tokens touch BEFORE the forward writes SWA. allocate() left uncached
-            # SWA slots as -1 placeholders; fill the current chunk's logical
-            # range in-place (out-of-window blocks are freed in postprocess after
-            # num_cached_tokens advances). scheduled_seqs / num_scheduled_tokens
-            # are index-aligned; all seqs here are PREFILL.
-            if self.block_manager.swa_enabled:
-                for seq, chunk in zip(scheduled_seqs.values(), num_scheduled_tokens):
-                    self.block_manager.swa.ensure_for_tokens(
-                        seq, seq.num_cached_tokens, chunk
-                    )
             num_cached_tokens_list = [
                 seq.num_cached_tokens for seq in scheduled_seqs.values()
             ]
@@ -1884,11 +1862,6 @@ class Scheduler:
                 # multiple steps (hash_blocks clips to fully-filled blocks).
                 self.block_manager.hash_blocks(seq, chunk)
                 seq.num_cached_tokens += chunk
-                # chunked-prefill: reclaim SWA blocks that just fell out of
-                # the window, using the computed-so-far length
-                # (num_cached_tokens). Bounds peak SWA to ~window during prefill
-                # instead of waiting for the first decode step's may_append.
-                self.block_manager.swa.free_after_prefill_chunk(seq)
                 # Prefill is partial until the whole PROMPT's KV is computed.
                 # Compare against num_prompt_tokens, not num_tokens: once a
                 # completion token is appended (this step's sampled token, or an

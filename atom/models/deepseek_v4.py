@@ -2774,10 +2774,9 @@ class DeepseekV4Attention(nn.Module):
         if fc.context.is_dummy_run or os.environ.get("ATOM_V4_BYPASS_ATTN") == "1":
             return x.new_zeros((x.shape[0], self.n_local_heads * self.head_dim))
         num_tokens = x.size(0)
-        # paged-SWA: swa_kv is now the flat [num_blocks*block_size, head_dim]
-        # content-addressed region; block_size (not a ring cache_size) is the
-        # paging stride.
-        swa_block_size = self.swa_block_size
+        # swa_kv is the flat [num_slots * cache_size, head_dim] ring region at
+        # the head of unified_kv; cache_size is the per-request ring stride.
+        swa_cache_size = self.swa_cache_size
         ratio = self.compress_ratio
         rd = self.rope_head_dim
 
@@ -2790,9 +2789,6 @@ class DeepseekV4Attention(nn.Module):
         attn_md = cast("AttentionMetaData_DSV4", fc.attn_metadata)
         compress_plans = attn_md.compress_plans
         block_tables_gpu = attn_md.block_tables
-        # paged-SWA: swa_write targets the separate SWA pool via
-        # swa_block_tables (always populated for V4).
-        swa_block_tables_gpu = attn_md.swa_block_tables
         state_slot_in = attn_md.state_slot_in
         state_slot_out = attn_md.state_slot_out
         plan_for_layer = compress_plans[ratio] if ratio else None
@@ -2829,17 +2825,10 @@ class DeepseekV4Attention(nn.Module):
         # For decode, write_per_batch (= min(max_seqlen_q, cache_size)) >=
         # tokens-per-seq, so the fused per-token scatter (gated on batch_id>=0)
         # covers exactly the tokens the old standalone swa_write did.
-        # paged-SWA: do NOT fuse the SWA write into qk_norm_rope_maybe_quant.
-        # The fused (flydsl, aiter) path scatters into a per-request ring
-        # (swa_kv[slot, pos%cache]); paged content-addressing needs the
-        # block_tables-based swa_write below instead. Pass swa_kv=None so neither
-        # the flydsl nor the Triton-fallback fused write fires.
-        # Decode FUSES the paged (content-addressed) SWA cache-write into the
-        # qk_norm_rope launch via swa_block_tables — this drops a separate
-        # _swa_write_kernel launch per layer (profiling showed the standalone
-        # write + its 11k launches were the paged-SWA decode overhead vs the
-        # old ring-fused path). The flydsl kernel writes
-        #   swa_kv[block_tables[bid, pos//bs]*bs + pos%bs] = kv_out[t]
+        # Decode FUSES the SWA ring write into the qk_norm_rope launch — this
+        # drops a separate _swa_write_kernel launch per layer. The flydsl kernel
+        # writes
+        #   swa_kv[state_slot_out[bid] * cs + pos % cs] = kv_out[t]
         # for every token (gated on batch_id>=0), matching the standalone
         # swa_write exactly. Decode has no ordering hazard (unlike prefill,
         # which writes its in-chunk SWA tail AFTER sparse_attn so chunked
@@ -2848,8 +2837,8 @@ class DeepseekV4Attention(nn.Module):
         # separate post-attn swa_write below.
         # Fused per-head weightless Q RMSNorm + weighted KV RMSNorm + GPT-J RoPE,
         # dispatching on the kv-cache layout inside the wrapper (fp8 2buff ↔ bf16)
-        # so this call site is branch-free. Decode FUSES the paged
-        # (content-addressed) SWA cache-write into the launch via swa_block_tables
+        # so this call site is branch-free. Decode FUSES the SWA ring write
+        # into the launch
         # (bf16: flydsl swa_kv; fp8: aiter swa_nope/rope buffers — each K row
         # scattered into its SWA pool, batch_id<0 skips CG-pad), running before the
         # decode attention reads the window (no ordering hazard). Prefill passes
@@ -2874,12 +2863,21 @@ class DeepseekV4Attention(nn.Module):
             quant_k=False,
             fp8_2buff=self.kv_fp8,
             batch_id_per_token=attn_md.batch_id_per_token if is_decode else None,
-            swa_block_tables=swa_block_tables_gpu if is_decode else None,
-            swa_block_size=swa_block_size if is_decode else None,
+            # The ring's destination row. Under the paged predecessor this came
+            # from `swa_block_tables`, so the slot never had to reach the fused
+            # write; a ring addresses by slot, so it does.
+            state_slot_mapping=state_slot_out if is_decode else None,
+            swa_cache_size=swa_cache_size if is_decode else None,
             # bf16 SWA fusion (flydsl kernel / Triton fallback):
             swa_kv=self.swa_kv if (is_decode and not self.kv_fp8) else None,
             swa_cu_seqlens_q=attn_md.cu_seqlens_q if is_decode else None,
-            swa_write_per_batch=attn_md.max_seqlen_q if is_decode else None,
+            # Capped at the ring: two tokens of one seq beyond `swa_cache_size`
+            # apart map to the same row. `1 + mtp_k <= win_with_spec` holds by
+            # construction at decode, so the min only documents the invariant —
+            # except on a spec model whose max_seqlen_q bucket is padded wider.
+            swa_write_per_batch=(
+                min(attn_md.max_seqlen_q, swa_cache_size) if is_decode else None
+            ),
             # fp8 2buff SWA fusion (aiter group-quant launch):
             swa_nope_scale_buff=self.swa_kv if (is_decode and self.kv_fp8) else None,
             swa_rope_buff=self.swa_kv_rope if (is_decode and self.kv_fp8) else None,
@@ -3078,13 +3076,13 @@ class DeepseekV4Attention(nn.Module):
                 kv_full,
                 positions_full,
                 attn_md.cu_seqlens_q,
-                swa_block_tables_gpu,
+                state_slot_out,
                 self.swa_kv,
-                swa_block_size,
+                swa_cache_size,
                 # Window-only: persist just the chunk's trailing `window` tokens
-                # — see the OPT note above. Pairs with
-                # SlidingWindowPool.ensure_for_tokens materializing only those
-                # blocks, so every dst block here is valid.
+                # — see the OPT note above. A ring holds exactly the last
+                # `swa_cache_size` writes, so persisting more would only
+                # overwrite what this same call just wrote.
                 # K source is the PCP all-gathered full extend K (k_*_full); off
                 # PCP it falls back to qkn.k_packed/k_rope (single-rank identical).
                 min(self.window_size, attn_md.max_seqlen_q),

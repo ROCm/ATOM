@@ -30,7 +30,6 @@ ops anyway.
 """
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
 
 import torch
 import triton
@@ -63,14 +62,14 @@ class QKNormRopeOut:
       - ``k_rope``   [T, 1, 64]  bf16 — rotated K-PE.
     """
 
-    q_sa: Optional[torch.Tensor] = None
-    kv: Optional[torch.Tensor] = None
-    q_scale: Optional[torch.Tensor] = None
-    kv_scale: Optional[torch.Tensor] = None
-    q_packed: Optional[torch.Tensor] = None
-    q_rope: Optional[torch.Tensor] = None
-    k_packed: Optional[torch.Tensor] = None
-    k_rope: Optional[torch.Tensor] = None
+    q_sa: torch.Tensor | None = None
+    kv: torch.Tensor | None = None
+    q_scale: torch.Tensor | None = None
+    kv_scale: torch.Tensor | None = None
+    q_packed: torch.Tensor | None = None
+    q_rope: torch.Tensor | None = None
+    k_packed: torch.Tensor | None = None
+    k_rope: torch.Tensor | None = None
 
 
 # Lazy-imported flydsl path (optional dependency). Set to None when flydsl
@@ -354,16 +353,14 @@ def _qk_norm_rope_maybe_quant_bf16(
     eps: float,
     quant_q: bool = False,
     quant_k: bool = False,
-    swa_kv: Optional[torch.Tensor] = None,
-    state_slot_mapping: Optional[torch.Tensor] = None,
-    batch_id_per_token: Optional[torch.Tensor] = None,
-    swa_cu_seqlens_q: Optional[torch.Tensor] = None,
-    swa_cache_size: Optional[int] = None,
-    swa_write_per_batch: Optional[int] = None,
-    swa_block_tables: Optional[torch.Tensor] = None,
-    swa_block_size: Optional[int] = None,
+    swa_kv: torch.Tensor | None = None,
+    state_slot_mapping: torch.Tensor | None = None,
+    batch_id_per_token: torch.Tensor | None = None,
+    swa_cu_seqlens_q: torch.Tensor | None = None,
+    swa_cache_size: int | None = None,
+    swa_write_per_batch: int | None = None,
     prefix: str = "",
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Fused per-token RMSNorm + GPT-J interleaved RoPE (+ optional FP8 quant).
 
     Args:
@@ -465,6 +462,16 @@ def _qk_norm_rope_maybe_quant_bf16(
         # post-norm/rope KV row into swa_kv[slot, pos % cache_size, :] in the
         # same launch (slot = state_slot_mapping[batch_id_per_token[t]]),
         # replacing a separate swa_write launch. BF16 only (quant_k off).
+        #
+        # flydsl's ring path reads the ring geometry off the tensor shape and
+        # so wants `[num_slots, cache_size, D]`, while `swa_write` below takes
+        # the same bytes flat. Callers pass the flat region (it is a contiguous
+        # prefix of `unified_kv`), so reshape here rather than making every
+        # caller carry two views of one buffer.
+        if swa_kv is not None and swa_kv.dim() == 2:
+            if swa_cache_size is None:
+                raise ValueError("swa_kv requires swa_cache_size")
+            swa_kv = swa_kv.view(-1, swa_cache_size, swa_kv.shape[-1])
         return flydsl_qk_norm_rope_quant(
             q,
             kv,
@@ -481,8 +488,6 @@ def _qk_norm_rope_maybe_quant_bf16(
             swa_kv=swa_kv,
             state_slot_mapping=state_slot_mapping,
             batch_id_per_token=batch_id_per_token,
-            swa_block_tables=swa_block_tables,
-            swa_block_size=swa_block_size,
         )
 
     q_scale = (
@@ -561,35 +566,18 @@ def _qk_norm_rope_maybe_quant_bf16(
                 "swa_kv requested on the Triton fallback path requires "
                 "swa_cu_seqlens_q and swa_write_per_batch"
             )
-        if swa_block_tables is not None:
-            # paged / content-addressed: same standalone swa_write the caller
-            # would otherwise run, but here so the bridge owns the write on
-            # both backends. block_tables + block_size instead of ring slot.
-            if swa_block_size is None:
-                raise ValueError("paged swa_kv fallback requires swa_block_size")
-            swa_write(
-                kv_out,
-                positions,
-                swa_cu_seqlens_q,
-                swa_block_tables,
-                swa_kv,
-                swa_block_size,
-                swa_write_per_batch,
-                prefix=f"{prefix}.swa_write" if prefix else "",
-            )
-        else:
-            if swa_cache_size is None:
-                raise ValueError("ring swa_kv fallback requires swa_cache_size")
-            swa_write(
-                kv_out,
-                positions,
-                swa_cu_seqlens_q,
-                state_slot_mapping,
-                swa_kv,
-                swa_cache_size,
-                swa_write_per_batch,
-                prefix=f"{prefix}.swa_write" if prefix else "",
-            )
+        if swa_cache_size is None:
+            raise ValueError("swa_kv fallback requires swa_cache_size")
+        swa_write(
+            kv_out,
+            positions,
+            swa_cu_seqlens_q,
+            state_slot_mapping,
+            swa_kv,
+            swa_cache_size,
+            swa_write_per_batch,
+            prefix=f"{prefix}.swa_write" if prefix else "",
+        )
 
     return q_out, kv_out, q_scale, kv_scale
 
@@ -608,19 +596,17 @@ def qk_norm_rope_maybe_quant(
     eps: float,
     quant_q: bool = False,
     quant_k: bool = False,
-    swa_kv: Optional[torch.Tensor] = None,
-    state_slot_mapping: Optional[torch.Tensor] = None,
-    batch_id_per_token: Optional[torch.Tensor] = None,
-    swa_cu_seqlens_q: Optional[torch.Tensor] = None,
-    swa_cache_size: Optional[int] = None,
-    swa_write_per_batch: Optional[int] = None,
-    swa_block_tables: Optional[torch.Tensor] = None,
-    swa_block_size: Optional[int] = None,
+    swa_kv: torch.Tensor | None = None,
+    state_slot_mapping: torch.Tensor | None = None,
+    batch_id_per_token: torch.Tensor | None = None,
+    swa_cu_seqlens_q: torch.Tensor | None = None,
+    swa_cache_size: int | None = None,
+    swa_write_per_batch: int | None = None,
     prefix: str = "",
     *,
     fp8_2buff: bool = False,
-    swa_nope_scale_buff: Optional[torch.Tensor] = None,
-    swa_rope_buff: Optional[torch.Tensor] = None,
+    swa_nope_scale_buff: torch.Tensor | None = None,
+    swa_rope_buff: torch.Tensor | None = None,
 ) -> QKNormRopeOut:
     """Per-token RMSNorm + GPT-J RoPE, dispatching on the kv-cache layout.
 
@@ -638,8 +624,8 @@ def qk_norm_rope_maybe_quant(
       weighted KV RMSNorm + GPT-J RoPE + 1x64 e8m0 fp8 group-quant into the
       native 2buff layout (NoPE-fp8 [.,512] + RoPE-bf16 [.,64]) consumed by op4
       (prefill) / op5 (decode) with no requant. The decode path additionally
-      fuses the paged SWA scatter into the same launch via ``swa_nope_scale_buff``
-      / ``swa_rope_buff`` + ``swa_block_tables`` / ``swa_block_size`` /
+      fuses the SWA ring scatter into the same launch via ``swa_nope_scale_buff``
+      / ``swa_rope_buff`` / ``state_slot_mapping`` / ``swa_cache_size`` /
       ``batch_id_per_token`` (pass ``None`` for prefill, which scatters its
       window tail post-attention). Returns a :class:`QKNormRopeOut` with
       ``q_packed`` / ``q_rope`` / ``k_packed`` / ``k_rope`` populated.
@@ -666,8 +652,6 @@ def qk_norm_rope_maybe_quant(
             swa_cu_seqlens_q=swa_cu_seqlens_q,
             swa_cache_size=swa_cache_size,
             swa_write_per_batch=swa_write_per_batch,
-            swa_block_tables=swa_block_tables,
-            swa_block_size=swa_block_size,
             prefix=prefix,
         )
         return QKNormRopeOut(q_sa=q_out, kv=kv_out, q_scale=q_scale, kv_scale=kv_scale)
@@ -704,8 +688,13 @@ def qk_norm_rope_maybe_quant(
         scale_dtype="e8m0",
         swa_nope_scale_buff=swa_nope_scale_buff,
         swa_rope_buff=swa_rope_buff,
-        swa_block_tables=swa_block_tables,
-        swa_block_size=swa_block_size,
+        # Ring addressing: `slot*cache_size + pos%cache_size`. `swa_state_slot`
+        # is what selects it over the block-table path, and `swa_block_size`
+        # carries the ring's cache_size there. A degenerate block table cannot
+        # stand in: its block index grows with position, so a long context runs
+        # past the table and the write is silently dropped.
+        swa_state_slot=state_slot_mapping,
+        swa_block_size=swa_cache_size,
         batch_id_per_token=batch_id_per_token,
     )
     return QKNormRopeOut(
@@ -726,7 +715,7 @@ def qk_norm_rope_maybe_quant_reference(
     eps: float,
     quant_q: bool = False,
     quant_k: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Pure-torch reference. Matches the kernel modulo bf16 reduction-order
     noise. Performs RMSNorm (Q weightless, KV weighted), then a manual GPT-J
     interleaved RoPE on the tail ``rope_head_dim``, then optional per-row
@@ -810,7 +799,7 @@ def qk_norm_rope_maybe_quant_fp8_2buff(
     head_dim: int,
     rope_head_dim: int,
     eps: float,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compile-safe Triton fp8 2buff Q/K: per-head weightless Q RMSNorm +
     weighted KV RMSNorm + GPT-J RoPE (bf16), then per-64-elt-tile e8m0 fp8 quant
     of the NoPE half + 2buff pack (RoPE tail kept bf16).

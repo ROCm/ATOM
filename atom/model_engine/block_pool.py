@@ -10,13 +10,12 @@ from atom.model_engine.kv_block import Block
 class BlockPool:
     """Paged blocks with ref counts and a content-addressed index.
 
-    Two instances exist: the compressed KV blocks `BlockManager` owns, and the
-    sliding-window blocks `SlidingWindowPool` owns. They are separate index
-    spaces over separate tensors — `sub_pool_spec.py` will not even let them
-    share a count — but the bookkeeping has to be *identical*, because both are
-    addressed by the same chained content hash. A prefix hit is a joint claim
-    on the two, so a divergence in when either drops a hash would let one pool
-    promise a boundary the other cannot honour.
+    `BlockManager` owns the one instance, over the compressed KV blocks. This
+    was split out when a second pool existed — the sliding window was its own
+    content-addressed block pool, driven in lockstep with this one — and is
+    kept separate because the class it serves is a whole mechanism (free list,
+    hash index, lazy eviction) rather than a helper of the manager. The window
+    is a per-request ring now; see `swa_pool.py`.
 
     Eviction is lazy: a freed block keeps its hash and contents until its slot
     is handed out for something else, so a later request can still claim a
