@@ -2,7 +2,6 @@ import json
 import logging
 import os
 import sys
-from contextlib import contextmanager
 from typing import Any
 
 import torch
@@ -376,9 +375,13 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
         _kv_tags = list(getattr(kv_cache, "group_tags", None) or []) if kv_cache else []
         _kv_tag = _kv_tags[0] if _kv_tags else "full"
         if kv_cache is not None and hasattr(kv_cache, "get_seq_size_per_block"):
-            _ks = int(kv_cache.get_kernel_seq_size_per_block(_kv_tag)) or int(kv_cache.get_seq_size_per_block(_kv_tag))
+            _ks = int(kv_cache.get_kernel_seq_size_per_block(_kv_tag)) or int(
+                kv_cache.get_seq_size_per_block(_kv_tag)
+            )
         else:
-            _ks = int(getattr(kv_cache, "kernel_seq_size_per_block", 0)) or int(getattr(kv_cache, "seq_size_per_block", 0))
+            _ks = int(getattr(kv_cache, "kernel_seq_size_per_block", 0)) or int(
+                getattr(kv_cache, "seq_size_per_block", 0)
+            )
         kernel_seq_size_per_block = _ks or 1
         max_blocks = (
             int(max_seq_len) + kernel_seq_size_per_block - 1
@@ -655,7 +658,7 @@ class ATOMQwen35Moe(BaseModel):
         old_default_dtype = torch.get_default_dtype()
         try:
             old_default_device = torch.get_default_device()
-        except Exception:
+        except AttributeError:
             old_default_device = None
 
         # rtp-llm plugin mode bypasses ATOM ModelRunner, so we need to align

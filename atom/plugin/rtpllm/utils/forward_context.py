@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Dict, Iterator, Tuple
+from typing import Any
 
 import torch
 from aiter import dtypes
@@ -125,13 +126,13 @@ class RTPForwardContext:
     rtp_attn_inputs: Any
     rtp_seq_size_per_block: int
     rtp_kernel_seq_size_per_block: int
-    kv_cache_data: Dict[str, KVCacheTensor]
-    state_indices_cache: Dict[tuple[int, bool], torch.Tensor]
-    layer_group_map: Dict[int, int]
+    kv_cache_data: dict[str, KVCacheTensor]
+    state_indices_cache: dict[tuple[int, bool], torch.Tensor]
+    layer_group_map: dict[int, int]
     context: Context
     num_tokens: int
-    mla_layer_map: Dict[int, Any]
-    LayerMaps = tuple[Dict[int, GatedDeltaNet], Dict[int, Any], Dict[int, Any]]
+    mla_layer_map: dict[int, Any]
+    LayerMaps = tuple[dict[int, GatedDeltaNet], dict[int, Any], dict[int, Any]]
 
     @staticmethod
     def _non_empty_int32(
@@ -154,21 +155,23 @@ class RTPForwardContext:
             getattr(attn_inputs, "cu_seqlens", None),
             device=device,
         )
-        if cu_seqlens is not None and cu_seqlens.numel() > 1:
+        if (
+            cu_seqlens is not None
+            and cu_seqlens.numel() > 1
             # Decode steps may carry placeholder [0, 0] cu_seqlens from upper layers.
             # Only trust cu_seqlens when it represents non-empty query tokens.
             # In cuda-graph capture the .item() host-sync would abort capture
             # (see rtp+atom_graph.md §2.4); under capture we always fall through
             # to the input_lengths-based path below.
-            if not torch.cuda.is_current_stream_capturing() and bool(
-                (cu_seqlens[-1] > 0).item()
+            and not torch.cuda.is_current_stream_capturing()
+            and bool((cu_seqlens[-1] > 0).item())
+        ):
+            if (
+                input_lengths is not None
+                and cu_seqlens.numel() >= input_lengths.numel() + 1
             ):
-                if (
-                    input_lengths is not None
-                    and cu_seqlens.numel() >= input_lengths.numel() + 1
-                ):
-                    return cu_seqlens[: input_lengths.numel() + 1]
-                return cu_seqlens
+                return cu_seqlens[: input_lengths.numel() + 1]
+            return cu_seqlens
 
         is_prefill = bool(getattr(attn_inputs, "is_prefill", False))
         if is_prefill:
@@ -434,7 +437,7 @@ class RTPForwardContext:
         ).contiguous()
 
     @staticmethod
-    def _build_layer_group_map(attn_inputs: Any) -> Dict[int, int]:
+    def _build_layer_group_map(attn_inputs: Any) -> dict[int, int]:
         layer_to_group = getattr(attn_inputs, "kv_cache_layer_to_group", None)
         if layer_to_group is None or int(layer_to_group.numel()) == 0:
             return {}
@@ -456,7 +459,7 @@ class RTPForwardContext:
         *,
         attn_inputs: Any,
         layer_num: int | None,
-        layer_group_map: Dict[int, int] | None = None,
+        layer_group_map: dict[int, int] | None = None,
     ) -> int:
         by_group = getattr(
             attn_inputs, "kv_cache_kernel_block_id_device_by_group", None
@@ -477,8 +480,8 @@ class RTPForwardContext:
         device: torch.device,
         seq_size_per_block: int,
         layer_num: int,
-        state_indices_cache: Dict[tuple[int, bool], torch.Tensor] | None = None,
-        layer_group_map: Dict[int, int] | None = None,
+        state_indices_cache: dict[tuple[int, bool], torch.Tensor] | None = None,
+        layer_group_map: dict[int, int] | None = None,
     ) -> torch.Tensor:
         group_id = RTPForwardContext._resolve_group_id(
             attn_inputs=attn_inputs,
@@ -507,8 +510,8 @@ class RTPForwardContext:
         *,
         seq_size_per_block: int,
         num_tokens: int,
-        state_indices_cache: Dict[tuple[int, bool], torch.Tensor] | None = None,
-        layer_group_map: Dict[int, int] | None = None,
+        state_indices_cache: dict[tuple[int, bool], torch.Tensor] | None = None,
+        layer_group_map: dict[int, int] | None = None,
     ) -> GDNAttentionMetadata:
         block_table = getattr(attn_inputs, "kv_cache_kernel_block_id_device", None)
         if block_table is None or block_table.numel() == 0:
@@ -996,7 +999,7 @@ class RTPForwardContext:
             )
         out_buf = cg_bufs.get("indexer_block_table_i32")
         if not isinstance(out_buf, torch.Tensor):
-            raise RuntimeError(
+            raise TypeError(
                 "RTP plugin capture requires prewarmed indexer_block_table_i32."
             )
         block_ratio = int(seq_size_per_block // kernel_seq_size_per_block)
@@ -1322,9 +1325,9 @@ class RTPForwardContext:
 
     @staticmethod
     def collect_layer_maps(model: Any) -> LayerMaps:
-        gdn_layer_map: Dict[int, GatedDeltaNet] = {}
-        full_attn_layer_map: Dict[int, Any] = {}
-        mla_layer_map: Dict[int, Any] = {}
+        gdn_layer_map: dict[int, GatedDeltaNet] = {}
+        full_attn_layer_map: dict[int, Any] = {}
+        mla_layer_map: dict[int, Any] = {}
         rtp_attention_cls: type[Any] | None = None
         rtp_mla_attention_cls: type[Any] | None = None
         try:
@@ -1379,7 +1382,7 @@ class RTPForwardContext:
     def _build_kv_cache_tensors(
         runtime: Any,
         layer_maps: LayerMaps,
-    ) -> Dict[str, KVCacheTensor]:
+    ) -> dict[str, KVCacheTensor]:
         if runtime.kv_cache is None:
             raise ValueError("RTP plugin requires initialized kv_cache for ATOM model.")
 
@@ -1388,7 +1391,7 @@ class RTPForwardContext:
         if not gdn_layer_map and not full_attn_layer_map and not mla_layer_map:
             return {}
 
-        cache_tensors: Dict[str, KVCacheTensor] = {}
+        cache_tensors: dict[str, KVCacheTensor] = {}
 
         # Build GDN cache views from RTP LayerKVCache flat buffers.
         for layer_num, gdn_layer in gdn_layer_map.items():
@@ -1451,7 +1454,7 @@ class RTPForwardContext:
         # Build full-attn cache references from RTP LayerKVCache.
         # Keep raw RTP layout here (no reshape/repack) and normalize layout
         # in the rtpllm attention patch at call time.
-        for layer_num in full_attn_layer_map.keys():
+        for layer_num in full_attn_layer_map:
             layer_key = f"layer_{layer_num}"
             if layer_key in cache_tensors:
                 continue
@@ -1478,7 +1481,7 @@ class RTPForwardContext:
             )
         # Build MLA cache references separately from full attention. MLA adapters
         # own their kv_cache pointer and refresh it in bind() for every forward.
-        for layer_num in mla_layer_map.keys():
+        for layer_num in mla_layer_map:
             layer_key = f"layer_{layer_num}"
             if layer_key in cache_tensors:
                 continue
@@ -1507,7 +1510,7 @@ class RTPForwardContext:
     def _kv_cache_signature(
         runtime: Any,
         layer_maps: LayerMaps,
-    ) -> Tuple[Any, ...]:
+    ) -> tuple[Any, ...]:
         if runtime.kv_cache is None:
             return ("no_kv_cache",)
         gdn_layer_map, full_attn_layer_map, mla_layer_map = layer_maps
@@ -1552,7 +1555,7 @@ class RTPForwardContext:
         layer_maps: LayerMaps | None = None,
         cg_max_seq_len: int = 0,
         cg_bufs: dict | None = None,
-    ) -> "RTPForwardContext":
+    ) -> RTPForwardContext:
         attn_inputs = getattr(inputs, "attention_inputs", None)
         if attn_inputs is None:
             raise ValueError(
@@ -1571,10 +1574,12 @@ class RTPForwardContext:
             kernel_seq_size_per_block = int(_kv.get_kernel_seq_size_per_block(_tag))
         else:
             seq_size_per_block = int(getattr(_kv, "seq_size_per_block", 0))
-            kernel_seq_size_per_block = int(getattr(_kv, "kernel_seq_size_per_block", 0))
+            kernel_seq_size_per_block = int(
+                getattr(_kv, "kernel_seq_size_per_block", 0)
+            )
         if kernel_seq_size_per_block <= 0:
             kernel_seq_size_per_block = int(seq_size_per_block)
-        state_indices_cache: Dict[tuple[int, bool], torch.Tensor] = {}
+        state_indices_cache: dict[tuple[int, bool], torch.Tensor] = {}
         resolved_layer_maps = layer_maps or cls.collect_layer_maps(model)
         gdn_layer_map, _, _ = resolved_layer_maps
         layer_group_map_signature = cls._layer_group_map_signature(attn_inputs)
@@ -1651,7 +1656,7 @@ class RTPForwardContext:
         )
 
     @classmethod
-    def _resolve_mla_layer_map(cls, layer_maps: LayerMaps) -> Dict[int, Any]:
+    def _resolve_mla_layer_map(cls, layer_maps: LayerMaps) -> dict[int, Any]:
         del cls, layer_maps
         return {}
 
@@ -1687,12 +1692,12 @@ class RTPForwardContext:
                 device=kv_cache_base.device,
                 dtype=dtypes.fp8,
             )
-            setattr(cache_owner, "_rtp_indexer_kv_cache", cached)
+            cache_owner._rtp_indexer_kv_cache = cached
         return cached
 
     @staticmethod
     def _attach_mla_layer_caches(
-        forward_context: "RTPForwardContext",
+        forward_context: RTPForwardContext,
     ) -> tuple[list[tuple[Any, str, Any]], list[tuple[list[Any], int, Any]]]:
         restore_attrs: list[tuple[Any, str, Any]] = []
         restore_indices: list[tuple[list[Any], int, Any]] = []
@@ -1859,7 +1864,7 @@ class RTPForwardMLAContext(RTPForwardContext):
     @classmethod
     def _resolve_mla_layer_map(
         cls, layer_maps: RTPForwardContext.LayerMaps
-    ) -> Dict[int, Any]:
+    ) -> dict[int, Any]:
         del cls
         return layer_maps[2]
 
@@ -1868,8 +1873,7 @@ class RTPForwardMLAContext(RTPForwardContext):
 class RTPForwardQwen35HybridContext(RTPForwardContext):
     @staticmethod
     def _build_seq_lens(attn_inputs: Any, *, device: torch.device) -> torch.Tensor:
-        """Qwen3.5 decode-cudagraph compatible seq_lens priority.
-        """
+        """Qwen3.5 decode-cudagraph compatible seq_lens priority."""
         input_lengths = RTPForwardContext._non_empty_int32(
             getattr(attn_inputs, "input_lengths", None),
             device=device,

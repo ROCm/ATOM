@@ -23,14 +23,14 @@ RTPForwardContext = None
 
 
 class _NoopWeightManager:
-    def update(self, req):  # noqa: ANN001
+    def update(self, req):
         return None
 
 
 class _NoopModelWeightsLoader:
     _py_eplb = None
 
-    def load_lora_weights(self, adapter_name, lora_path, device):  # noqa: ANN001
+    def load_lora_weights(self, adapter_name, lora_path, device):
         logger.warning(
             "No-op model_weights_loader received load_lora_weights(%s, %s, %s); "
             "external plugin mode uses ATOM model weights path only.",
@@ -38,13 +38,12 @@ class _NoopModelWeightsLoader:
             lora_path,
             device,
         )
-        return None
 
 
 class _ATOMGlm5AttnPyObj:
     """Container returned to RTP CudaGraphRunner for replay-time hooks."""
 
-    def __init__(self, runtime: "_ATOMGlm5MoeRuntime") -> None:
+    def __init__(self, runtime: _ATOMGlm5MoeRuntime) -> None:
         self._runtime = runtime
         self.is_cuda_graph = False
         self._rtp_mla_layers: list[Any] = []
@@ -97,7 +96,7 @@ class _ATOMGlm5AttnPyObj:
     def fmha_params(self):
         return None
 
-    def prepare_cuda_graph(self, attn_inputs) -> None:  # noqa: ANN001
+    def prepare_cuda_graph(self, attn_inputs) -> None:
         for layer in self._rtp_mla_layers:
             prepare = getattr(layer, "prepare_cuda_graph", None)
             if callable(prepare):
@@ -200,12 +199,16 @@ class _ATOMGlm5MoeRuntime(GptModelBase):
             _raw_seq = int(kv_cache.get_seq_size_per_block(_kv_tag))
             _raw_kseq = int(kv_cache.get_kernel_seq_size_per_block(_kv_tag))
         else:
-            _raw_seq = int(getattr(kv_cache, "seq_size_per_block", 0)) if kv_cache else 0
-            _raw_kseq = int(getattr(kv_cache, "kernel_seq_size_per_block", 0)) if kv_cache else 0
+            _raw_seq = (
+                int(getattr(kv_cache, "seq_size_per_block", 0)) if kv_cache else 0
+            )
+            _raw_kseq = (
+                int(getattr(kv_cache, "kernel_seq_size_per_block", 0))
+                if kv_cache
+                else 0
+            )
         seq_size_per_block = (
-            _raw_seq
-            or int(os.getenv("SEQ_SIZE_PER_BLOCK", "0") or 0)
-            or 1
+            _raw_seq or int(os.getenv("SEQ_SIZE_PER_BLOCK", "0") or 0) or 1
         )
         kernel_seq_size_per_block = (
             _raw_kseq
@@ -521,9 +524,7 @@ class _ATOMGlm5MoeRuntime(GptModelBase):
                     )
         return positions
 
-    def forward(
-        self, inputs: PyModelInputs, fmha_impl=None
-    ) -> PyModelOutputs:  # noqa: ANN001
+    def forward(self, inputs: PyModelInputs, fmha_impl=None) -> PyModelOutputs:
         is_cuda_graph = bool(getattr(fmha_impl, "is_cuda_graph", False))
         if is_cuda_graph:
             inputs.attention_inputs.is_cuda_graph = True
@@ -756,7 +757,7 @@ class ATOMGlm5Moe(DeepSeekV2):
         old_default_dtype = torch.get_default_dtype()
         try:
             old_default_device = torch.get_default_device()
-        except Exception:
+        except AttributeError:
             old_default_device = None
 
         torch.set_default_device(target_device)
