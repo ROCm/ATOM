@@ -10,12 +10,12 @@ runtime below; dense layers use vLLM's Triton custom-op backend after applying
 MiniMax-M3's q/k norm + RoPE transform.
 """
 
-from typing import Optional
-
 import aiter
 import torch
 from aiter import dtypes
 from torch import nn
+from vllm.forward_context import get_forward_context
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 
 from atom.config import get_current_atom_config
 from atom.model_ops.minimax_m3.sparse_attn import (
@@ -31,8 +31,6 @@ from atom.plugin.vllm.attention.layer_common import (
     _register_vllm_static_forward_context,
 )
 from atom.utils import mark_spliting_op
-from vllm.forward_context import get_forward_context
-from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 
 _MINIMAX_M3_TOPK_CACHE_STATE: dict = {}
 
@@ -75,8 +73,8 @@ class MiniMaxM3SparseIndexerCache(nn.Module, AttentionLayerBase):
         head_dim: int,
         kv_cache_dtype: str,
     ) -> None:
-        from vllm.v1.attention.backend import AttentionType
         from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+        from vllm.v1.attention.backend import AttentionType
 
         super().__init__()
         atom_config = get_current_atom_config()
@@ -140,19 +138,19 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
         head_dim: int,
         scale: float,
         num_kv_heads: int,
-        alibi_slopes: Optional[list[float]] = None,
+        alibi_slopes: list[float] | None = None,
         kv_cache_dtype: str = "bf16",
         layer_num: int = 0,
         use_mla: bool = False,
-        rotary_emb: Optional[nn.Module] = None,
-        prefix: Optional[str] = None,
-        q_norm: Optional[nn.Module] = None,
-        k_norm: Optional[nn.Module] = None,
+        rotary_emb: nn.Module | None = None,
+        prefix: str | None = None,
+        q_norm: nn.Module | None = None,
+        k_norm: nn.Module | None = None,
         cache_config=None,
         quant_config=None,
-        index_q_norm: Optional[nn.Module] = None,
-        index_k_norm: Optional[nn.Module] = None,
-        index_rotary_emb: Optional[nn.Module] = None,
+        index_q_norm: nn.Module | None = None,
+        index_k_norm: nn.Module | None = None,
+        index_rotary_emb: nn.Module | None = None,
         index_q_size: int = 0,
         index_head_dim: int = 0,
         topk: int = 0,
@@ -670,8 +668,8 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
     def _forward_with_output(
         self,
         qkv: torch.Tensor,
-        positions: Optional[torch.Tensor] = None,
-        output: Optional[torch.Tensor] = None,
+        positions: torch.Tensor | None = None,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         main_metadata, index_metadata = self._metadata_for_layer()
         num_tokens = qkv.shape[0]
@@ -714,9 +712,9 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        positions: Optional[torch.Tensor] = None,
-        q_scale: Optional[torch.Tensor] = None,
-        qkv: Optional[torch.Tensor] = None,
+        positions: torch.Tensor | None = None,
+        q_scale: torch.Tensor | None = None,
+        qkv: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         del query, key, value, q_scale, kwargs
@@ -741,14 +739,14 @@ class MiniMaxM3DenseAttentionForVllm(nn.Module, AttentionLayerBase):
         head_dim: int,
         scale: float,
         num_kv_heads: int,
-        alibi_slopes: Optional[list[float]] = None,
+        alibi_slopes: list[float] | None = None,
         kv_cache_dtype: str = "bf16",
         layer_num: int = 0,
         use_mla: bool = False,
-        rotary_emb: Optional[nn.Module] = None,
-        prefix: Optional[str] = None,
-        q_norm: Optional[nn.Module] = None,
-        k_norm: Optional[nn.Module] = None,
+        rotary_emb: nn.Module | None = None,
+        prefix: str | None = None,
+        q_norm: nn.Module | None = None,
+        k_norm: nn.Module | None = None,
         cache_config=None,
         quant_config=None,
         **kwargs,
@@ -777,9 +775,9 @@ class MiniMaxM3DenseAttentionForVllm(nn.Module, AttentionLayerBase):
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             cache_dtype, vllm_config.model_config
         )
-        self.calculate_kv_scales = (
-            cache_config.calculate_kv_scales if cache_config is not None else False
-        )
+        # vLLM #49389 removed CacheConfig.calculate_kv_scales; tolerate both the
+        # older (field present) and newer (field removed) vLLM via getattr.
+        self.calculate_kv_scales = getattr(cache_config, "calculate_kv_scales", False)
         self.quant_config = None
         self.kv_cache = torch.tensor([])
         self.has_sink = False
@@ -876,9 +874,9 @@ class MiniMaxM3DenseAttentionForVllm(nn.Module, AttentionLayerBase):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        positions: Optional[torch.Tensor] = None,
-        q_scale: Optional[torch.Tensor] = None,
-        qkv: Optional[torch.Tensor] = None,
+        positions: torch.Tensor | None = None,
+        q_scale: torch.Tensor | None = None,
+        qkv: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         del query, key, value, q_scale, kwargs

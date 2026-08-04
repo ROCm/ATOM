@@ -1,10 +1,13 @@
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import aiter
 import torch
 from aiter import dtypes, fused_qk_norm_rope_cache_quant_shuffle
 from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
 from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
+from torch import nn
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+
 from atom.config import get_current_atom_config
 from atom.model_ops.attention_mla import MLAModules
 from atom.model_ops.base_attention import (
@@ -17,8 +20,6 @@ from atom.plugin.vllm.attention.layer_common import (
     _register_vllm_static_forward_context,
 )
 from atom.utils import envs
-from torch import nn
-from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 
 if TYPE_CHECKING:
     from atom.plugin.vllm.attention.metadata import (
@@ -82,13 +83,13 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         kv_cache_dtype="bf16",
         layer_num=0,
         use_mla: bool = False,
-        mla_modules: Optional[MLAModules] = None,
-        sinks: Optional[nn.Parameter] = None,
-        per_layer_sliding_window: Optional[int] = None,
-        rotary_emb: Optional[torch.nn.Module] = None,
-        prefix: Optional[str] = None,
-        q_norm: Optional[torch.nn.Module] = None,
-        k_norm: Optional[torch.nn.Module] = None,
+        mla_modules: MLAModules | None = None,
+        sinks: nn.Parameter | None = None,
+        per_layer_sliding_window: int | None = None,
+        rotary_emb: torch.nn.Module | None = None,
+        prefix: str | None = None,
+        q_norm: torch.nn.Module | None = None,
+        k_norm: torch.nn.Module | None = None,
         **kwargs,
     ):
         from vllm.v1.attention.backend import AttentionType
@@ -101,9 +102,9 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         cache_dtype = (
             cache_config.cache_dtype if cache_config is not None else kv_cache_dtype
         )
-        calculate_kv_scales = (
-            cache_config.calculate_kv_scales if cache_config is not None else False
-        )
+        # vLLM #49389 removed CacheConfig.calculate_kv_scales; tolerate both the
+        # older (field present) and newer (field removed) vLLM via getattr.
+        calculate_kv_scales = getattr(cache_config, "calculate_kv_scales", False)
 
         self.head_size_v = head_dim
         self.attn_type = AttentionType.DECODER
@@ -180,7 +181,7 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         key: torch.Tensor,
         value: torch.Tensor,
         positions: torch.Tensor = None,
-        q_scale: Optional[torch.Tensor] = None,
+        q_scale: torch.Tensor | None = None,
         qkv: torch.Tensor = None,
         **kwargs,
     ):
@@ -516,8 +517,6 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
             high_precision=0,
         )
 
-        return
-
     def extend_for_sliding_window(
         self,
         attn_metadata: "AiterMhaMetadataForVllm",
@@ -528,8 +527,8 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         cu_seqlens_q: torch.Tensor,
         max_seqlen_q: int,
         block_table: torch.Tensor,
-        k_scale: Optional[torch.Tensor],
-        v_scale: Optional[torch.Tensor],
+        k_scale: torch.Tensor | None,
+        v_scale: torch.Tensor | None,
     ):
         assert attn_metadata.extend_metadata is not None
         assert attn_metadata.extend_metadata.chunk_context_metadata is not None
@@ -602,8 +601,8 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         min_seqlen_q: int,
         block_table: torch.Tensor,
         slot_mapping: torch.Tensor,
-        k_scale: Optional[torch.Tensor],
-        v_scale: Optional[torch.Tensor],
+        k_scale: torch.Tensor | None,
+        v_scale: torch.Tensor | None,
     ):
         from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 
@@ -749,6 +748,8 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         if position is None:
             from vllm.forward_context import (
                 get_forward_context as get_vllm_forward_context,
+            )
+            from vllm.forward_context import (
                 is_forward_context_available,
             )
 
