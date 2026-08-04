@@ -570,11 +570,15 @@ class SparseKVCoordinator:
         hot_base = self._hot_base(req_slot)
 
         topk = topk_logical.to(torch.int64)
-        # A position is valid only if in-range; anything < 0 or beyond the cold
-        # pool depth is padding/garbage and is ignored (mirrors the sparse gather
-        # kernel's ``pos < req_kv_len`` guard). Clamp so the gather never faults.
-        valid = (topk >= 0) & (topk < self.max_context_len)
+        # A position is valid only if in-range AND backed by an allocated cold-pool
+        # page. Anything < 0, beyond the cold pool depth, or outside the request's
+        # allocated range (``req_to_host_pool == -1``) is padding/garbage and is
+        # ignored (mirrors the sparse gather kernel's ``pos < req_kv_len`` guard).
+        # Without the backed check an in-range-but-unallocated position resolves to
+        # host row -1 and the gather faults. Clamp so the lookup never faults.
         clamped = topk.clamp(min=0, max=self.max_context_len - 1)
+        backed = host_locs[clamped] >= 0
+        valid = (topk >= 0) & (topk < self.max_context_len) & backed
 
         tts = self.token_to_slot[layer_id, req_slot]  # [C]
         slots_for_topk = tts[clamped].to(torch.int64)  # [-1 if miss]
