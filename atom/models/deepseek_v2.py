@@ -1378,6 +1378,8 @@ def sparse_attn_indexer(
     max_model_len: int,
     total_seq_lens: int,
     sparse_kv_indices_buffer: torch.Tensor,
+    dcp_sparse_kv_indptr_buffer: torch.Tensor,
+    dcp_owned_counts_buffer: torch.Tensor,
     k_norm_weight: torch.Tensor,
     k_norm_bias: torch.Tensor,
     k_norm_eps: float,
@@ -1606,19 +1608,6 @@ def sparse_attn_indexer(
                 "qlen=1 decode only (MTP verify is Phase 2)."
             )
             dcp_rank = get_dcp_rank()
-            import os as _os
-
-            _dbg = _os.environ.get("ATOM_DSA_DCP_DBG")
-
-            def _mark(tag, **kv):
-                if _dbg:
-                    torch.cuda.synchronize()
-                    print(
-                        f"[DSA-DCP r{dcp_rank}] {tag} "
-                        + " ".join(f"{k}={v}" for k, v in kv.items()),
-                        flush=True,
-                    )
-
             g_ctx = decode_metadata.context_lens
             base = g_ctx // dcp_world_size
             # round-robin (interleave=1) local length: base + 1 for the ranks
@@ -1629,16 +1618,6 @@ def sparse_attn_indexer(
             l_max = (max_model_len + dcp_world_size - 1) // dcp_world_size
             local_logits = torch.empty(
                 [num_rows, l_max], dtype=torch.float32, device="cuda"
-            )
-            _mark(
-                "pre-deepgemm",
-                kv_cache=tuple(kv_cache.shape),
-                block_tables=tuple(attn_metadata.block_tables.shape),
-                bt_max=int(attn_metadata.block_tables.max()),
-                local_ctx_max=int(local_ctx.max()),
-                l_max=l_max,
-                num_rows=num_rows,
-                blk=runner_block_size,
             )
             deepgemm_fp8_paged_mqa_logits(
                 padded_q_fp8_decode_tokens,
@@ -1651,19 +1630,16 @@ def sparse_attn_indexer(
                 KVBlockSize=runner_block_size,
                 Preshuffle=True,
             )
-            _mark("post-deepgemm")
             # [num_rows, l_max] -> all-gather dim0 -> [W, num_rows, l_max]
             gathered = get_dcp_group().all_gather(
                 local_logits.contiguous(), dim=0
             ).reshape(dcp_world_size, num_rows, l_max)
-            _mark("post-allgather")
             # interleave to global order: out[q, j*W + r] = gathered[r, q, j]
             logits = (
                 gathered.permute(1, 2, 0)
                 .reshape(num_rows, l_max * dcp_world_size)[:, :max_model_len]
                 .contiguous()
             )
-            _mark("post-interleave")
         else:
             logits = torch.empty(
                 [num_rows, max_model_len], dtype=torch.float32, device="cuda"
@@ -1702,39 +1678,24 @@ def sparse_attn_indexer(
             )
         elif dcp_world_size > 1:
             # topk_indices now hold GLOBAL positions. Keep only this rank's owned
-            # tokens (p % W == r), de-interleave (p // W), and gather the local
-            # main-KV slot; non-owned columns become -1 (masked by the sparse
-            # decode kernel). sparse_kv_indptr stays the global-clip length, so
-            # the per-request region size is unchanged (no compaction needed).
-            _mark(
-                "pre-filter (post-topk)",
-                topk_min=int(topk_indices.min()),
-                topk_max=int(topk_indices.max()),
-                g_kv_indptr_last=int(attn_metadata.g_kv_indptr[batch_size]),
-                sparse_kv_indptr_last=int(attn_metadata.sparse_kv_indptr[batch_size]),
-            )
+            # tokens (p % W == r), de-interleave (p // W), map to the local
+            # main-KV slot, and COMPACT them to the front -- non-owned positions
+            # are dropped, not marked with -1, because holes break aiter's lse
+            # output (DCP/DCP_Sparse_MLA.md ch.4-5). The compacted per-request
+            # lengths are written into dcp_sparse_kv_indptr_buffer for this
+            # layer's attention to consume.
             triton_filter_and_convert_dcp_index(
                 attn_metadata.cu_seqlens_q,
                 attn_metadata.g_kv_indptr,
-                attn_metadata.sparse_kv_indptr,
                 attn_metadata.block_tables,
                 topk_indices,
                 dcp_rank,
                 dcp_world_size,
                 runner_block_size,
+                out_kv_indptr=dcp_sparse_kv_indptr_buffer,
+                owned_counts=dcp_owned_counts_buffer,
                 NUM_TOPK_TOKENS=topk_tokens,
                 out=sparse_kv_indices_buffer,
-            )
-            _sk = int(attn_metadata.sparse_kv_indptr[batch_size])
-            _mark(
-                "post-filter",
-                written=sparse_kv_indices_buffer[:_sk].tolist(),
-                written_max=(
-                    int(sparse_kv_indices_buffer[:_sk].max()) if _sk > 0 else -1
-                ),
-                bt_dtype=str(attn_metadata.block_tables.dtype),
-                bt_sample=attn_metadata.block_tables[0, :4].tolist(),
-                kv_cache_slots=kv_cache.shape[0] * kv_cache.shape[1],
             )
         else:
             triton_convert_req_index_to_global_index(
@@ -1763,6 +1724,8 @@ def sparse_attn_indexer_fake(
     max_model_len: int,
     total_seq_lens: int,
     sparse_kv_indices_buffer: torch.Tensor,
+    dcp_sparse_kv_indptr_buffer: torch.Tensor,
+    dcp_owned_counts_buffer: torch.Tensor,
     k_norm_weight: torch.Tensor,
     k_norm_bias: torch.Tensor,
     k_norm_eps: float,
@@ -1787,7 +1750,14 @@ def sparse_attn_indexer_fake(
 direct_register_custom_op(
     op_name="sparse_attn_indexer",
     op_func=sparse_attn_indexer,
-    mutates_args=["sparse_kv_indices_buffer"],
+    # The DCP compact path rewrites the per-layer offsets/counts alongside the
+    # indices, so both must be declared or inductor may reorder the MLA read
+    # ahead of this write (same hazard as sparse_kv_indices_buffer).
+    mutates_args=[
+        "sparse_kv_indices_buffer",
+        "dcp_sparse_kv_indptr_buffer",
+        "dcp_owned_counts_buffer",
+    ],
     fake_impl=sparse_attn_indexer_fake,
 )
 
@@ -2083,6 +2053,13 @@ class Indexer(nn.Module):
         # register_metadata_builder("indexer_attn_metadata", self.k_cache.get_attn_backend().get_builder_cls())
 
         self.sparse_kv_indices_buffer = torch.empty(0, dtype=torch.int32, device="cuda")
+        # DCP compact offsets/counts; rebound by the MLA metadata builder to the
+        # shared per-runner buffers (aiter_mla.py). Empty placeholders keep the
+        # custom-op signature valid when DCP is off.
+        self.dcp_sparse_kv_indptr_buffer = torch.empty(
+            0, dtype=torch.int32, device="cuda"
+        )
+        self.dcp_owned_counts_buffer = torch.empty(0, dtype=torch.int32, device="cuda")
         atom_config.compilation_config.static_forward_context[prefix] = self
 
         # Rope module used by `forward_impl` (and the `indexer_with_output`
@@ -2208,6 +2185,8 @@ class Indexer(nn.Module):
             self.max_model_len,
             self.max_total_seq_len,
             self.sparse_kv_indices_buffer,
+            self.dcp_sparse_kv_indptr_buffer,
+            self.dcp_owned_counts_buffer,
             self.k_norm.weight,
             self.k_norm.bias,
             self.k_norm.eps,

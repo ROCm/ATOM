@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+import os
 from dataclasses import dataclass
 from functools import partial as functools_partial
 from typing import Optional, Protocol
@@ -335,6 +336,11 @@ class MLAAttention(nn.Module):
         # the lse persistent kernel, gfx942 does not — see dcp_utils). Cached
         # once here to avoid a per-forward get_gfx() (graph-break).
         self.dcp_persistent_supported = dcp_persistent_supported()
+
+        # Compacted per-layer sparse offsets for DCP decode; rebound by the
+        # metadata builder to the shared buffer (see aiter_mla.py).
+        self.dcp_sparse_kv_indptr_buffer = None
+        self.dcp_owned_counts_buffer = None
 
     def _pad_query_heads(self, q: torch.Tensor) -> torch.Tensor:
         if self.head_repeat_factor > 1:
@@ -1243,12 +1249,28 @@ class MLAAttention(nn.Module):
                     paged_kv_indptr = attn_metadata.sparse_kv_indptr
                     paged_kv_indices = self.sparse_kv_indices_buffer
                     paged_kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens
+                    if self.dcp_world_size > 1:
+                        # DCP compacts each rank's owned top-k to the front, so
+                        # the region length is shorter than the global clip and
+                        # varies per layer. The indexer just rewrote these
+                        # offsets for this layer (§5.3).
+                        paged_kv_indptr = self.dcp_sparse_kv_indptr_buffer
 
             dp_size = get_dp_group().world_size
             use_persistent_mode = not (dp_size > 1)
             if envs.ATOM_MLA_PAGE_SIZE > 1:
                 use_persistent_mode = False
             if self.dcp_world_size > 1 and not self.dcp_persistent_supported:
+                use_persistent_mode = False
+            # sparse + DCP compacts the per-rank top-k (§5.1), which makes the
+            # sparse region length depend on the *per-layer* selection. The
+            # persistent work/reduce metadata is built once per step from
+            # sparse_kv_indptr (aiter_mla.set_mla_persistent_worker_buffers), so
+            # it cannot describe a length that changes layer to layer -- the
+            # timing simply does not line up. Run non-persistent until either the
+            # metadata build moves per-layer or aiter grows a per-request valid
+            # length (§5.5).
+            if self.is_sparse_mla and self.dcp_world_size > 1:
                 use_persistent_mode = False
 
             # Sparse layers in MTP verify use separate persistent metadata
@@ -1284,15 +1306,16 @@ class MLAAttention(nn.Module):
             num_kv_splits = (
                 16 if use_persistent_mode else max(1, 16 // self.dcp_world_size)
             )
-            # sparse + DCP: each rank owns only a tiny slice of the global top-k
-            # (the rest are -1 sentinels). Splitting that tiny masked region across
-            # >1 kv_splits can leave a split with zero valid tokens -> its partial
-            # o is uninitialized and lse=-inf, and the flash-decoding combine does
-            # o*exp(lse-max) = NaN*0 = NaN (confirmed: local-o/lse NaN on ranks
-            # whose owned tokens all land in one split). Force a single split so no
-            # split is ever empty. See DCP/DCP_Sparse_MLA.md §3.8.
-            if self.is_sparse_mla and self.dcp_world_size > 1:
-                num_kv_splits = 1
+            # NOTE (§5.2): sparse + DCP used to force num_kv_splits=1 here, because
+            # a -1-padded fixed-length region made aiter's stage2 believe every
+            # split held tokens and one of them could be all sentinels -> NaN. That
+            # forcing then hit a second problem: num_kv_splits==1 sends aiter's
+            # stage2 down its copy-through fast path (FINAL_OUT, aiter/mla.py:74),
+            # which never stores Final_lse, so return_lse handed back an untouched
+            # torch.empty buffer. Compaction removes both: cur_kv_seq_len is now the
+            # true (small) owned count, so stage2's own
+            # min(splits, cdiv(seq_len, mgc)) clamp skips the empty splits, and
+            # num_kv_splits>1 keeps it on the reduce path that writes the lse.
 
             # TODO refactor this
             if envs.ATOM_MLA_PAGE_SIZE is not None:
@@ -1632,55 +1655,13 @@ class MLAAttention(nn.Module):
             elif self.dcp_world_size > 1:
                 # DCP decode: AllGather Q on the head dim, decode locally with LSE,
                 # then combine partial outputs across ranks (AG LSE + correct + RS).
-                import os as _os
-
-                _ddbg = _os.environ.get("ATOM_DSA_DCP_DBG")
-
-                def _dstat(tag, t=None):
-                    if not _ddbg:
-                        return
-                    torch.cuda.synchronize()
-                    if t is None:
-                        print(
-                            f"[DSA-DEC r{self.dcp_rank}] {tag} "
-                            f"sparse={self.is_sparse_mla}",
-                            flush=True,
-                        )
-                        return
-                    tf = t.float()
-                    print(
-                        f"[DSA-DEC r{self.dcp_rank}] {tag} sparse={self.is_sparse_mla} "
-                        f"shape={tuple(t.shape)} absum={tf.abs().sum().item():.4f} "
-                        f"nan={int(tf.isnan().sum())} inf={int(tf.isinf().sum())} "
-                        f"min={tf.min().item():.4f} max={tf.max().item():.4f}",
-                        flush=True,
-                    )
+                from atom.model_ops.dcp_ops import cp_lse_ag_out_rs
 
                 q_out = self.dcp_group.all_gather(q_out, dim=1)
                 o, lse = self._forward_decode(
                     q_out, kv_cache, attn_metadata, return_lse=True
                 )
-                _dstat("local-o", o)
-                _dstat("local-lse", lse)
-                if _ddbg and self.is_sparse_mla:
-                    # Method C verify: does lse go garbage while the sparse region
-                    # still has valid (>=0) slots? -> lse path can't handle -1.
-                    torch.cuda.synchronize()
-                    _sk = int(attn_metadata.sparse_kv_indptr[1])
-                    _reg = self.sparse_kv_indices_buffer[:_sk]
-                    _vc = int((_reg >= 0).sum())
-                    print(
-                        f"[DSA-VERIFY r{self.dcp_rank}] req0 region_len={_sk} "
-                        f"valid_count={_vc} region={_reg[:16].tolist()} "
-                        f"lse0_heads={[round(x,3) for x in lse[0, :8].float().tolist()]} "
-                        f"lse_nan={int(torch.isnan(lse).sum())} "
-                        f"lse_zero={int((lse == 0).sum())} o_nan={int(torch.isnan(o).sum())}",
-                        flush=True,
-                    )
-                from atom.model_ops.dcp_ops import cp_lse_ag_out_rs
-
                 o = cp_lse_ag_out_rs(o, lse, self.dcp_group, ctx=self._cp_triton_ctx)
-                _dstat("merged-o", o)
                 output = self._v_up_proj_and_o_proj(o)
             else:
                 output = self._forward_decode(q_out, kv_cache, attn_metadata)
@@ -1833,21 +1814,55 @@ def triton_convert_req_index_to_global_index(
 
 
 @triton.jit
-def _filter_and_convert_dcp_index_kernel(
+def _count_owned_dcp_kernel(
     qo_indptr,  # int32 [num_requests + 1]
     global_kv_indptr,  # int32 [num_requests + 1] -- GLOBAL context (column range)
-    page_kv_indptr,  # int32 [num_requests + 1] -- output offsets (sparse_kv_indptr)
+    token_indices_ptr,  # int32 [num_tokens, NUM_TOPK_TOKENS] -- GLOBAL top-k positions
+    out_counts,  # int32 [num_requests] -- owned top-k count per request
+    DCP_RANK: tl.constexpr,
+    DCP_WORLD: tl.constexpr,
+    NUM_TOPK_TOKENS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    ti_stride0,
+    ti_stride1,
+):
+    """Pass 1 of the compacting DCP filter: how many of the global top-k
+    positions does this rank own, per request? Its exclusive cumsum gives the
+    compacted output offsets used by ``_compact_filter_dcp_kernel``.
+
+    qlen==1 only (DCP + sparse + MTP is rejected upstream), so each request has
+    exactly one query token.
+    """
+    batch_id = tl.program_id(0)
+    g_kv_start = tl.load(global_kv_indptr + batch_id)
+    g_kv_len = tl.load(global_kv_indptr + batch_id + 1) - g_kv_start
+    token_id = tl.load(qo_indptr + batch_id)
+
+    count = 0
+    for tile_start in range(0, NUM_TOPK_TOKENS, BLOCK_N):
+        indice_id = tile_start + tl.arange(0, BLOCK_N)
+        col_valid = (indice_id < g_kv_len) & (indice_id < NUM_TOPK_TOKENS)
+        ti_ptr = token_indices_ptr + token_id * ti_stride0 + indice_id * ti_stride1
+        tok = tl.load(ti_ptr, mask=col_valid, other=-1)
+        owned = col_valid & (tok >= 0) & ((tok % DCP_WORLD) == DCP_RANK)
+        count += tl.sum(owned.to(tl.int32))
+
+    tl.store(out_counts + batch_id, count)
+
+
+@triton.jit
+def _compact_filter_dcp_kernel(
+    qo_indptr,  # int32 [num_requests + 1]
+    global_kv_indptr,  # int32 [num_requests + 1] -- GLOBAL context (column range)
+    out_kv_indptr,  # int32 [num_requests + 1] -- COMPACTED offsets (cumsum of pass 1)
     block_table,  # int32 [num_req, max_num_blocks_per_req] -- logical(global) blocks
     token_indices_ptr,  # int32 [num_tokens, NUM_TOPK_TOKENS] -- GLOBAL top-k positions
-    out_kv_indices,  # int32 [>= page_kv_indptr[-1]]
-    # DCP params
+    out_kv_indices,  # int32 [>= out_kv_indptr[-1]]
     DCP_RANK: tl.constexpr,
     DCP_WORLD: tl.constexpr,
     PAGE_SIZE: tl.constexpr,  # runner (physical) block size
-    # shapes
     NUM_TOPK_TOKENS: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    # strides (elements)
     ti_stride0,
     ti_stride1,
     bt_stride0: tl.int64,
@@ -1859,32 +1874,39 @@ def _filter_and_convert_dcp_index_kernel(
     #     vbs  = PAGE_SIZE * W
     #     slot = block_table[req, g // vbs] * PAGE_SIZE + (g % vbs) // W
     # token_indices holds GLOBAL positions (the indexer scored the full sequence
-    # via all-gathered logits). Non-owned / out-of-range columns -> -1 (the sparse
-    # decode kernel masks -1 out). The per-request output length is unchanged
-    # (global clip), so no compaction / dynamic indptr is needed. NOTE: we compute
-    # the slot from block_table directly (like vLLM) rather than gathering from a
-    # precomputed kv_indices -- the DCP round-robin per-token slot array does not
-    # exist on the sparse path (dense reads via block_tables in-kernel).
+    # via all-gathered logits). This rank keeps ONLY the positions it owns and
+    # writes them COMPACTED to the front of its region -- no -1 holes. Holes are
+    # exactly what breaks aiter's lse path (immediate fault on the persistent
+    # kernel, silently unwritten lse on the split-KV one); see
+    # DCP/DCP_Sparse_MLA.md §4.11/§4.13.
+    #
+    # Compaction is order-preserving (tl.cumsum within a tile plus a running
+    # offset across tiles) rather than atomic-allocated like vLLM, so the KV
+    # order -- and hence the floating-point accumulation order -- is
+    # deterministic run to run, which the dcp=1 vs dcp=N comparison relies on.
+    #
+    # NOTE: the slot is computed from block_table directly (like vLLM) rather
+    # than gathered from a precomputed kv_indices -- the DCP round-robin
+    # per-token slot array does not exist on the sparse path (dense reads go
+    # through block_tables in-kernel).
     batch_id = tl.program_id(0)
-    tile_id = tl.program_id(1)
-    indice_id = tile_id * BLOCK_N + tl.arange(0, BLOCK_N)
 
     g_kv_start = tl.load(global_kv_indptr + batch_id)
     g_kv_len = tl.load(global_kv_indptr + batch_id + 1) - g_kv_start
-    out_kv_start = tl.load(page_kv_indptr + batch_id)
-    qo_start = tl.load(qo_indptr + batch_id)
-    qo_end = tl.load(qo_indptr + batch_id + 1)
+    out_kv_start = tl.load(out_kv_indptr + batch_id)
+    token_id = tl.load(qo_indptr + batch_id)
 
     vbs = PAGE_SIZE * DCP_WORLD
-    # Columns within [0, min(global_ctx, topk)) carry a real top-k position.
-    col_valid = (indice_id < g_kv_len) & (indice_id < NUM_TOPK_TOKENS)
+    written = 0
+    for tile_start in range(0, NUM_TOPK_TOKENS, BLOCK_N):
+        indice_id = tile_start + tl.arange(0, BLOCK_N)
+        # Columns within [0, min(global_ctx, topk)) carry a real top-k position.
+        col_valid = (indice_id < g_kv_len) & (indice_id < NUM_TOPK_TOKENS)
 
-    for token_id in range(qo_start, qo_end):
         ti_ptr = token_indices_ptr + token_id * ti_stride0 + indice_id * ti_stride1
         tok = tl.load(ti_ptr, mask=col_valid, other=-1)  # GLOBAL position
 
-        owned = (tok % DCP_WORLD) == DCP_RANK
-        idx_valid = col_valid & (tok >= 0) & owned
+        idx_valid = col_valid & (tok >= 0) & ((tok % DCP_WORLD) == DCP_RANK)
 
         block_id = tok // vbs
         inblock_offset = (tok % vbs) // DCP_WORLD
@@ -1894,28 +1916,30 @@ def _filter_and_convert_dcp_index_kernel(
             other=0,
         )
         slot = physical_block * PAGE_SIZE + inblock_offset
-        out_val = tl.where(idx_valid, slot, -1)
 
-        out_ptr_ij = out_kv_indices + out_kv_start + indice_id
-        # Write the whole valid-column span (owned -> slot, non-owned -> -1) so
-        # the decode kernel sees a fixed-length region with -1 sentinels.
-        tl.store(out_ptr_ij, out_val, mask=col_valid)
+        # Exclusive prefix sum of the owned mask -> destination inside this tile.
+        owned_i32 = idx_valid.to(tl.int32)
+        dst = written + tl.cumsum(owned_i32, axis=0) - owned_i32
+        tl.store(out_kv_indices + out_kv_start + dst, slot, mask=idx_valid)
+        written += tl.sum(owned_i32)
 
 
 def triton_filter_and_convert_dcp_index(
     qo_indptr: torch.Tensor,  # int32 [num_requests + 1]
     global_kv_indptr: torch.Tensor,  # int32 [num_requests + 1]
-    page_kv_indptr: torch.Tensor,  # int32 [num_requests + 1] (sparse_kv_indptr)
     block_table: torch.Tensor,  # int32 [num_req, max_num_blocks_per_req] logical
     token_indices: torch.Tensor,  # int32 [num_tokens, NUM_TOPK_TOKENS] GLOBAL pos
     dcp_rank: int,
     dcp_world_size: int,
     block_size: int,  # runner (physical) block size == PAGE_SIZE
+    out_kv_indptr: torch.Tensor,  # int32 [num_requests + 1] COMPACTED, written here
+    owned_counts: torch.Tensor,  # int32 [>= num_requests] scratch for pass 1
     NUM_TOPK_TOKENS: int = 2048,
     BLOCK_N: int = 128,
     out: Optional[torch.Tensor] = None,
 ):
-    """DCP (interleave=1) filter + round-robin localize of global top-k positions.
+    """DCP (interleave=1) filter + round-robin localize of global top-k positions,
+    **compacting** each rank's owned slots to the front of its region.
 
     ``token_indices[token_id, indice_id]`` is a GLOBAL token position selected by
     the indexer (scored over the full sequence via all-gathered logits). This
@@ -1924,10 +1948,18 @@ def triton_filter_and_convert_dcp_index(
     from ``block_table`` (like vLLM):
         vbs  = block_size * W
         slot = block_table[req, g // vbs] * block_size + (g % vbs) // W
-    Non-owned / out-of-range columns become ``-1``. ``page_kv_indptr`` (the
-    global-clip ``sparse_kv_indptr``) is unchanged, so the output region length
-    per request is identical to the non-DCP path; the decode kernel masks the
-    ``-1`` sentinels.
+
+    Non-owned positions are **dropped**, not marked: the kept slots are packed
+    contiguously (original top-k order preserved) and ``out_kv_indptr`` is
+    rewritten to the resulting per-request lengths. This replaces the earlier
+    "fixed length + -1 sentinel" layout, whose holes broke aiter's lse output
+    (see DCP/DCP_Sparse_MLA.md ch.4-5). Because the kept count depends on the
+    per-layer top-k selection, ``out_kv_indptr`` is layer-dependent and must be
+    recomputed on every call -- it cannot feed the once-per-step persistent
+    metadata, which is why sparse+DCP runs non-persistent for now (§5.1).
+
+    The 8 ranks' kept sets are disjoint and their union is exactly the global
+    top-k, which is what makes the downstream ``cp_lse_ag_out_rs`` merge valid.
     """
     assert token_indices.dtype == torch.int32
     assert token_indices.shape[1] == NUM_TOPK_TOKENS
@@ -1939,29 +1971,51 @@ def triton_filter_and_convert_dcp_index(
     assert out is not None, "sparse_kv_indices_buffer (out) is required"
 
     num_batch = global_kv_indptr.shape[0] - 1
-    tiles_per_row = NUM_TOPK_TOKENS // BLOCK_N
 
     qo_indptr_c = qo_indptr.contiguous()
     global_kv_indptr_c = global_kv_indptr.contiguous()
-    page_kv_indptr_c = page_kv_indptr.contiguous()
     block_table_c = block_table.contiguous()
     token_indices_c = token_indices.contiguous()
 
-    # out is the preallocated sparse_kv_indices_buffer; the kernel writes only
-    # within [0, page_kv_indptr[-1]) via out_kv_start, so use it directly.
-    new_kv_indices = out
-
     ti_stride0, ti_stride1 = token_indices_c.stride()
     bt_stride0, bt_stride1 = block_table_c.stride()
-    grid = (num_batch, tiles_per_row)
+    grid = (num_batch,)
 
-    _filter_and_convert_dcp_index_kernel[grid](
+    # Pass 1: per-request count of owned top-k positions.
+    counts = owned_counts[:num_batch]
+    _count_owned_dcp_kernel[grid](
         qo_indptr_c,
         global_kv_indptr_c,
-        page_kv_indptr_c,
+        token_indices_c,
+        counts,
+        dcp_rank,
+        dcp_world_size,
+        NUM_TOPK_TOKENS,
+        BLOCK_N,
+        ti_stride0,
+        ti_stride1,
+    )
+
+    # Exclusive cumsum -> compacted offsets. Written in place so the caller's
+    # tensor (and anything already holding a view of it) sees the update.
+    # dtype=int32 keeps the accumulation in int32 (torch would promote integral
+    # cumsum to int64 by default, which the kernels' int32 pointers reject).
+    # zero_() rather than `out_kv_indptr[0] = 0`: assigning a Python scalar goes
+    # through a host->device copy, which HIP rejects while a graph is capturing
+    # (hipErrorStreamCaptureUnsupported). Everything here must stay device-side.
+    out_kv_indptr[:1].zero_()
+    torch.cumsum(
+        counts, dim=0, dtype=torch.int32, out=out_kv_indptr[1 : num_batch + 1]
+    )
+
+    # Pass 2: write the owned slots packed to the front of each region.
+    _compact_filter_dcp_kernel[grid](
+        qo_indptr_c,
+        global_kv_indptr_c,
+        out_kv_indptr,
         block_table_c,
         token_indices_c,
-        new_kv_indices,
+        out,
         dcp_rank,
         dcp_world_size,
         block_size,
@@ -1972,7 +2026,7 @@ def triton_filter_and_convert_dcp_index(
         bt_stride0,
         bt_stride1,
     )
-    return new_kv_indices
+    return out
 
 
 @triton.jit
