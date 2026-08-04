@@ -213,11 +213,11 @@ def _ep_scatter_body(
     N_BINS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """Kernel B's body, factored out so v0 and v2 share one implementation.
+    """Kernel B's body: the atomic-free scatter into expert-sorted order.
 
-    Takes `pid` as an argument rather than reading `tl.program_id(0)`, because in
-    v2 this occupies the upper part of a wider grid and must be shifted down by
-    the expt_data CTA count.
+    Takes `pid` as an argument rather than reading `tl.program_id(0)`, because it
+    occupies the upper part of v2's wider grid and must be shifted down by the
+    expt_data CTA count.
 
     Deterministic, atomic-free scatter into expert-sorted order.
 
@@ -257,35 +257,6 @@ def _ep_scatter_body(
     tl.store(ScatterIndx + idx, pos.to(tl.int32), mask=mask)
     w = tl.load(DispatchWeights + idx, mask=mask, other=0.0)
     tl.store(GateScal + pos, w.to(tl.float32), mask=mask)
-
-
-@triton.jit
-def _ep_scatter_kernel(
-    ExptIndx,
-    DispatchWeights,
-    CtaBase,
-    Hist,
-    GatherIndx,
-    ScatterIndx,
-    GateScal,
-    n_gates,
-    N_BINS: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    """v0 Kernel B: one CTA per gate block. See `_ep_scatter_body`."""
-    _ep_scatter_body(
-        tl.program_id(0),
-        ExptIndx,
-        DispatchWeights,
-        CtaBase,
-        Hist,
-        GatherIndx,
-        ScatterIndx,
-        GateScal,
-        n_gates,
-        N_BINS=N_BINS,
-        BLOCK=BLOCK,
-    )
 
 
 @triton.jit
@@ -404,7 +375,7 @@ def _ep_mesh_build_kernel(
     walks a single row and emits a contiguous run, so it needs no rank arithmetic
     and its stores coalesce. flydsl calls this `p_expert_mesh` [expert, tokens].
 
-    The trade versus v0: E-fold redundant reads of DispatchIds/ExpertMap, in
+    The trade versus v2: E-fold redundant reads of DispatchIds/ExpertMap, in
     exchange for exact per-expert counts with no atomics and no cross-CTA
     histogram barrier (each program owns a row, so `Hist[e]` is just its own
     count). The row is written in full including zeros, so no memset is needed.
@@ -413,8 +384,8 @@ def _ep_mesh_build_kernel(
     holds one slot per (expert, token) cell, so if a token named the same expert
     twice the second write overwrites the first and that gate is silently dropped
     (measured: hist 27 vs 28 on synthetic duplicate ids). Real topk selects
-    distinct experts, and v0 has no such constraint because each gate is
-    independent -- so if a router ever emits duplicates, v0 is the correct path.
+    distinct experts, and v2 has no such constraint because each gate is
+    independent -- so if a router ever emits duplicates, v2 is the correct path.
     flydsl's decode mesh is `int` rather than `unsigned char`, which would allow a
     per-slot bitmask instead; worth revisiting if duplicates are ever possible.
 
@@ -460,8 +431,8 @@ def _ep_mesh_scatter_kernel(
 
     Grid is (E,). Each program redundantly cumsums the E-element histogram to get
     its own base (48 elements, cheaper than a separate buffer + launch -- the same
-    reason v0's scatter recomputes `bin_base`), then walks its mesh row and emits
-    a CONTIGUOUS run of GatherIndx/GateScal. That contiguity is what v0 lacks:
+    reason v2's scatter recomputes `bin_base`), then walks its mesh row and emits
+    a CONTIGUOUS run of GatherIndx/GateScal. That contiguity is what v2 lacks:
     there a CTA's 256 gates scatter to up to 49 distant regions.
 
     Dead gates never appear in the mesh, so their ScatterIndx entry is left at the
@@ -490,74 +461,6 @@ def _ep_mesh_scatter_kernel(
         run += tl.sum(hit.to(tl.int32), 0)
 
 
-def ep_sort_routing_v0(
-    dispatch_weights,
-    dispatch_ids,
-    expert_map,
-    num_local_experts,
-    num_local_tokens,
-    M,
-    topk,
-    n_gates,
-):
-    """No-mesh prep+sort: 3 kernels, atomic-free, arithmetic scatter.
-
-    A  : gating + per-CTA private histogram (one-hot reduction, no atomics)
-    A' : per-bin exclusive scan down the CTA axis -> per-(CTA, bin) write cursor
-    B  : pos = bin_base[e] + cta_base[c][e] + rank, then scatter
-
-    Measured 61.8 ms over 1769 launches on gfx950 (2.7% of kernel time). B is the
-    outlier at 17.0 us/launch vs ~6 us for the rest: it recomputes `rank` from a
-    one-hot cumsum, and its stores hit up to 49 distant regions per CTA.
-    """
-    device = dispatch_ids.device
-    sentinel = num_local_experts
-    GATE_BLOCK = 256
-    n_bins = triton.next_power_of_2(sentinel + 1)
-    n_ctas = triton.cdiv(n_gates, GATE_BLOCK)
-
-    gate_valid = torch.empty(n_gates, dtype=torch.int32, device=device)
-    expt_indx = torch.empty(n_gates, dtype=torch.int32, device=device)
-    partial_hist = torch.empty((n_ctas, n_bins), dtype=torch.int32, device=device)
-    _ep_gate_prep_kernel[(n_ctas,)](
-        dispatch_ids,
-        expert_map,
-        num_local_tokens,
-        gate_valid,
-        expt_indx,
-        partial_hist,
-        n_gates,
-        expert_map.numel(),
-        TOPK=topk,
-        SENTINEL=sentinel,
-        N_BINS=n_bins,
-        BLOCK=GATE_BLOCK,
-    )
-
-    cta_base = torch.empty_like(partial_hist)
-    hist_full = torch.empty(n_bins, dtype=torch.int32, device=device)
-    _ep_scan_partials_kernel[(n_bins,)](
-        partial_hist, cta_base, hist_full, n_ctas, N_BINS=n_bins, C_BLOCK=128
-    )
-
-    topk_indx = torch.empty(n_gates, dtype=torch.int32, device=device)
-    gate_indx = torch.empty(n_gates, dtype=torch.int32, device=device)
-    gate_scal = torch.empty(n_gates, dtype=torch.float32, device=device)
-    _ep_scatter_kernel[(n_ctas,)](
-        expt_indx,
-        dispatch_weights,
-        cta_base,
-        hist_full,
-        topk_indx,
-        gate_indx,
-        gate_scal,
-        n_gates,
-        N_BINS=n_bins,
-        BLOCK=GATE_BLOCK,
-    )
-    return hist_full, topk_indx, gate_indx, gate_scal, gate_valid
-
-
 def ep_sort_routing_v1(
     dispatch_weights,
     dispatch_ids,
@@ -577,7 +480,7 @@ def ep_sort_routing_v1(
 
     Costs an (E, M) uint8 mesh and E-fold redundant reads of dispatch_ids, and
     buys coalesced stores plus no rank arithmetic -- the two things that make
-    flydsl's sort 9.4 ms where v0's is 30 ms.
+    flydsl's sort 9.4 ms where the no-mesh scatter's is 30 ms.
     """
     device = dispatch_ids.device
     E = num_local_experts
@@ -630,7 +533,7 @@ def ep_sort_routing_v2(
     n_gates,
     expt_data_bufs,
 ):
-    """v0 with the scatter and ExptData stages fused: 2 kernels instead of 4.
+    """No-mesh prep+sort with the scatter and ExptData stages fused: 3 kernels.
 
     A  : gating + per-CTA private histogram          (grid: n_ctas)
     A' : per-bin exclusive scan down the CTA axis    (grid: N_BINS)
@@ -643,10 +546,10 @@ def ep_sort_routing_v2(
     `_combined_routing_fused` layout without needing its barrier.
 
     `expt_data_bufs` is the tuple `_compute_expt_data_internal` returns; the
-    caller allocates it (it is allocation-only and version-independent) so v0/v1
-    can keep launching the standalone `_expt_data_only_kernel` unchanged.
+    caller allocates it (it is allocation-only and version-independent) so v1 can
+    keep launching the standalone `_expt_data_only_kernel` unchanged.
 
-    Returns the same 5-tuple as v0/v1; the ExptData buffers are filled in place.
+    Returns the same 5-tuple as v1; the ExptData buffers are filled in place.
     """
     device = dispatch_ids.device
     sentinel = num_local_experts
@@ -785,6 +688,7 @@ def routing_from_dispatched(
     )
 
     version = envs.ATOM_EP_SORT_VERSION
+    assert version in (1, 2), f"ATOM_EP_SORT_VERSION must be 1 or 2, got {version}"
     if version == 2:
         hist_full, topk_indx, gate_indx, gate_scal, gate_valid = ep_sort_routing_v2(
             dispatch_weights,
@@ -799,8 +703,7 @@ def routing_from_dispatched(
         )
         hist = hist_full[:num_local_experts]
     else:
-        sort_fn = ep_sort_routing_v1 if version == 1 else ep_sort_routing_v0
-        hist_full, topk_indx, gate_indx, gate_scal, gate_valid = sort_fn(
+        hist_full, topk_indx, gate_indx, gate_scal, gate_valid = ep_sort_routing_v1(
             dispatch_weights,
             dispatch_ids,
             expert_map,

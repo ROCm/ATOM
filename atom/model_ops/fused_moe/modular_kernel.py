@@ -413,6 +413,35 @@ class FusedMoEModularKernel(torch.nn.Module):
             expert_tokens_meta,
         )
 
+        # TEMPORARY: capture for _test/bench_ep_moe.py. No-op unless
+        # ATOM_EP_MOE_DUMP_DIR is set; delete with ep_moe_dump.py.
+        from atom.model_ops.fused_moe.ep_moe_dump import maybe_dump_dispatched
+
+        maybe_dump_dispatched(
+            dispatch_a1,
+            dispatch_scale,
+            dispatch_ids,
+            dispatch_weights,
+            expert_tokens_meta.expert_num_tokens,
+            expert_map,
+            expert_mask,
+            local_num_experts,
+            w1,
+            w2,
+            {
+                "activation": activation,
+                "quant_type": quant_type,
+                "global_num_experts": global_num_experts,
+                "hidden_pad": hidden_pad,
+                "intermediate_pad": intermediate_pad,
+                "apply_router_weight_on_input": apply_router_weight_on_input,
+                "gate_mode": (moe_extra_args or {}).get("gate_mode"),
+                "swiglu_limit": (moe_extra_args or {}).get("swiglu_limit"),
+                "w1_scale": w1_scale,
+                "w2_scale": w2_scale,
+            },
+        )
+
         # aiter fused_moe expects a *binary* (0/1) expert_mask in this slot, not
         # the index-style expert_map (which carries -1 sentinels for non-local
         # experts). Passing expert_map here makes moe_sorting mis-classify

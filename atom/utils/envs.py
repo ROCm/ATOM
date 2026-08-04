@@ -73,16 +73,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # received rows or it silently drops tokens.
     "ATOM_EP_TRIM_PREFILL": lambda: os.getenv("ATOM_EP_TRIM_PREFILL", "0") == "1",
     # TEMPORARY: which EP routing prep+sort implementation to use.
-    #   0 = ep_sort_routing_v0 -- 3 kernels, per-CTA partial histogram + scan +
-    #       arithmetic scatter. No mesh. Scattered stores.
-    #   1 = ep_sort_routing_v1 -- 2 kernels, mirrors flydsl's opus_moe_sorting:
+    #   1 = ep_sort_routing_v1 -- 3 kernels, mirrors flydsl's opus_moe_sorting:
     #       an [expert, token] mesh, then a per-expert walk emitting contiguous
-    #       runs. Trades memory for coalesced stores and no rank arithmetic.
-    #   2 = ep_sort_routing_v2 -- v0 with the scatter and ExptData stages fused
-    #       into one launch, split by CTA index like aiter's
-    #       _combined_routing_fused. 2 launches instead of 4.
-    # Remove once one wins on both gfx950 and gfx1250.
-    "ATOM_EP_SORT_VERSION": lambda: int(os.getenv("ATOM_EP_SORT_VERSION", "0")),
+    #       runs. Trades memory for coalesced stores and no rank arithmetic, but
+    #       the mesh build costs E-fold redundant reads and scales badly with M
+    #       (21x from M=384 to M=16384 -- see _test/bench_ep_moe.py).
+    #   2 = ep_sort_routing_v2 -- no mesh: per-CTA partial histogram + scan +
+    #       arithmetic scatter, with the scatter and ExptData stages fused into
+    #       one launch split by CTA index (aiter's _combined_routing_fused
+    #       layout). 3 kernels, fastest at every measured shape. DEFAULT.
+    # Both are bit-exact against each other through the full MoE. The former v0
+    # (unfused scatter + standalone ExptData) was removed once v2 matched it
+    # bit-for-bit and beat it at every shape.
+    # Remove this knob once one wins on both gfx950 and gfx1250.
+    "ATOM_EP_SORT_VERSION": lambda: int(os.getenv("ATOM_EP_SORT_VERSION", "2")),
     "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
     # --- Kernel Fusion Toggles ---
     # fused_compress_attn: switch between Triton (default historical) and a
