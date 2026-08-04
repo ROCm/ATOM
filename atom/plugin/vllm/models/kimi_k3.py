@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from typing import Any, ClassVar
 
 import torch
 from torch import nn
@@ -205,6 +206,21 @@ class KimiK3ForConditionalGeneration_(vLLMKimiK3):
             "mm_projector.proj.2": "mm_projector.linear_2",
         }
     )
+    # ATOMModelBase.__init__ reads these off the inner model class to drive
+    # quant remapping. This inner subclasses vLLM's upstream MM class (not the
+    # native K3 class), so the attributes must be declared explicitly or the
+    # fused-projection remap and exclude translation silently no-op on a
+    # quantized checkpoint. Suffix-based and nesting-agnostic, so reuse native.
+    packed_modules_mapping = KimiK3ForCausalLMBase.packed_modules_mapping
+    # Native K3's exclude values use NO `model.` prefix (identity-style, relative
+    # to the inner-class root). This inner adds ONE extra `language_model.` level
+    # because self.language_model is the ATOM KimiK3ForCausalLM, which itself
+    # nests a KimiLinearForCausalLM at .language_model — so text-layer paths are
+    # language_model.language_model.model.* / .lm_head.
+    quant_exclude_name_mapping: ClassVar[dict[str, str]] = {
+        "language_model.model.": "language_model.language_model.model.",
+        "language_model.lm_head": "language_model.language_model.lm_head",
+    }
 
     def __init__(self, atom_config: Config, prefix: str = "model"):
         # Protocols have no __init__; skip vLLMKimiK3.__init__ (it would build
@@ -258,7 +274,9 @@ class KimiK3ForConditionalGeneration_(vLLMKimiK3):
         )
         self.media_placeholder = self.config.media_placeholder_token_id
 
-    def _maybe_ignore_quant_config(self, quant_config, exclude_layers, layer_name: str):
+    def _maybe_ignore_quant_config(
+        self, quant_config: Any, exclude_layers: list[str], layer_name: str
+    ):
         for exclude_layer in exclude_layers:
             if QuantizationConfig._matches_exclude(
                 layer_name, exclude_layer, check_contains=True

@@ -128,6 +128,18 @@ def test_kimi_k3_inner_conditional_generation_class():
         # Language-model wrapper exposes embed_input_ids for vLLM multimodal
         # discovery.
         assert hasattr(KimiK3ForCausalLM, "embed_input_ids")
+
+        # Quant-remap attributes must be present (ATOMModelBase reads them off
+        # the inner class); missing them silently corrupts a quantized ckpt.
+        packed = KimiK3ForConditionalGeneration_.packed_modules_mapping
+        assert packed, "packed_modules_mapping must be non-empty"
+
+        excl = KimiK3ForConditionalGeneration_.quant_exclude_name_mapping
+        assert excl, "quant_exclude_name_mapping must be non-empty"
+        # Values carry the doubled language_model. prefix for the extra nesting
+        # (inner.language_model = ATOM KimiK3ForCausalLM -> KimiLinearForCausalLM).
+        for value in excl.values():
+            assert value.startswith("language_model.language_model."), value
         """)
 
 
