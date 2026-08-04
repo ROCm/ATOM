@@ -689,6 +689,40 @@ jobs:
             exit 0
           fi
 
+      - name: Check SGLANG MTP acceptance rate
+        if: ${{ success() && matrix.mtp_accept_threshold != '' }}
+        env:
+          MTP_ACCEPTANCE_THRESHOLD: ${{ matrix.mtp_accept_threshold }}
+        run: |
+          set -euo pipefail
+          result_file=$(ls -1t atom_sglang_accuracy_results/*.json 2>/dev/null | head -n 1)
+          if [ -z "$result_file" ] || [ ! -f "$result_file" ]; then
+            echo "ERROR: No results JSON file found for MTP acceptance check."
+            exit 2
+          fi
+
+          read -r acceptance_rate accept_length < <(python3 - "$result_file" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as f:
+              metadata = json.load(f).get("atom_ci_metadata", {})
+          print(metadata.get("mtp_acceptance_rate", ""), metadata.get("mtp_accept_length", ""))
+          PY
+          )
+          if [ -z "$acceptance_rate" ]; then
+            echo "FAIL: mtp_acceptance_rate is missing; speculative decoding metrics were not emitted."
+            exit 1
+          fi
+
+          threshold_percent=$(awk -v threshold="$MTP_ACCEPTANCE_THRESHOLD" 'BEGIN {printf "%.2f", threshold * 100}')
+          echo "MTP acceptance rate: ${acceptance_rate}% (threshold ${threshold_percent}%); accept length: ${accept_length}"
+          if awk -v value="$acceptance_rate" -v threshold="$MTP_ACCEPTANCE_THRESHOLD" 'BEGIN {exit !((value / 100) < threshold)}'; then
+            echo "MTP acceptance gate FAILED: ${acceptance_rate}% < ${threshold_percent}%"
+            exit 1
+          fi
+          echo "MTP acceptance gate PASSED."
+
       - name: Collect summary
         if: success()
         run: |

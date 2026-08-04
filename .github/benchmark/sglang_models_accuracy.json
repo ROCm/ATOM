@@ -23,6 +23,7 @@
     "lm_eval_num_fewshot": 5,
     "lm_eval_num_concurrent": 8,
     "accuracy_threshold": 0.94,
+    "mtp_accept_threshold": 0.8,
     "accuracy_baseline": null,
     "accuracy_baseline_model": "deepseek-ai/DeepSeek-V4-Pro",
     "_baseline_note": "DeepSeek V4-Pro MTP1 follows the V4-Pro TP8 GSM8K 5-shot threshold while enabling EAGLE speculative decoding."
@@ -37,6 +38,7 @@
     "lm_eval_num_fewshot": 5,
     "lm_eval_num_concurrent": 8,
     "accuracy_threshold": 0.94,
+    "mtp_accept_threshold": 0.55,
     "accuracy_baseline": 0.9507,
     "accuracy_baseline_model": "deepseek-ai/DeepSeek-V4-Pro",
     "_baseline_note": "DeepSeek V4-Pro MTP3 full GSM8K validation measured flexible-extract = 0.9507 ± 0.0060 with EAGLE speculative decoding."
@@ -131,6 +133,7 @@
     "lm_eval_use_chat_completions": "1",
     "lm_eval_extra_model_args": "max_gen_toks=16384",
     "accuracy_threshold": 0.93,
+    "mtp_accept_threshold": 0.35,
     "accuracy_baseline": null,
     "accuracy_baseline_model": "MiniMaxAI/MiniMax-M3-MXFP8 + Inferact/MiniMax-M3-EAGLE3",
     "_baseline_note": "SGLang-ATOM MiniMax-M3-MXFP8 TP4 with EAGLE3 speculative decoding; threshold follows the existing MiniMax-M3 GSM8K validation target."
@@ -287,6 +290,7 @@
     "runner": "atom-plugin-acc-validation-runner-sgl",
     "test_level": "nightly",
     "accuracy_threshold": 0.93,
+    "mtp_accept_threshold": 0.5,
     "accuracy_baseline": null,
     "accuracy_baseline_model": "amd/DeepSeek-R1-0528-MXFP4-v2",
     "_baseline_note": "Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k."
@@ -299,6 +303,7 @@
     "runner": "atom-plugin-acc-validation-runner-sgl",
     "test_level": "nightly",
     "accuracy_threshold": 0.93,
+    "mtp_accept_threshold": 0.75,
     "accuracy_baseline": null,
     "accuracy_baseline_model": "amd/DeepSeek-R1-0528-MXFP4-v2",
     "_baseline_note": "Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k."
