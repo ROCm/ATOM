@@ -194,13 +194,21 @@ class _ATOMGlm5MoeRuntime(GptModelBase):
         device = self._get_model_device()
         dtype = self._get_model_dtype()
         kv_cache = getattr(self, "kv_cache", None)
+        _kv_tags = list(getattr(kv_cache, "group_tags", None) or []) if kv_cache else []
+        _kv_tag = _kv_tags[0] if _kv_tags else "full"
+        if kv_cache is not None and hasattr(kv_cache, "get_seq_size_per_block"):
+            _raw_seq = int(kv_cache.get_seq_size_per_block(_kv_tag))
+            _raw_kseq = int(kv_cache.get_kernel_seq_size_per_block(_kv_tag))
+        else:
+            _raw_seq = int(getattr(kv_cache, "seq_size_per_block", 0)) if kv_cache else 0
+            _raw_kseq = int(getattr(kv_cache, "kernel_seq_size_per_block", 0)) if kv_cache else 0
         seq_size_per_block = (
-            int(getattr(kv_cache, "seq_size_per_block", 0))
+            _raw_seq
             or int(os.getenv("SEQ_SIZE_PER_BLOCK", "0") or 0)
             or 1
         )
         kernel_seq_size_per_block = (
-            int(getattr(kv_cache, "kernel_seq_size_per_block", 0))
+            _raw_kseq
             or int(os.getenv("KERNEL_SEQ_SIZE_PER_BLOCK", "0") or 0)
             or seq_size_per_block
         )

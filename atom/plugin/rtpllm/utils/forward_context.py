@@ -1563,10 +1563,15 @@ class RTPForwardContext:
             raise ValueError(
                 "RTP plugin requires initialized kv_cache for forward context."
             )
-        seq_size_per_block = int(getattr(runtime.kv_cache, "seq_size_per_block", 0))
-        kernel_seq_size_per_block = int(
-            getattr(runtime.kv_cache, "kernel_seq_size_per_block", 0)
-        )
+        _kv = runtime.kv_cache
+        _tags = list(getattr(_kv, "group_tags", None) or []) or ["full"]
+        _tag = _tags[0]
+        if hasattr(_kv, "get_seq_size_per_block"):
+            seq_size_per_block = int(_kv.get_seq_size_per_block(_tag))
+            kernel_seq_size_per_block = int(_kv.get_kernel_seq_size_per_block(_tag))
+        else:
+            seq_size_per_block = int(getattr(_kv, "seq_size_per_block", 0))
+            kernel_seq_size_per_block = int(getattr(_kv, "kernel_seq_size_per_block", 0))
         if kernel_seq_size_per_block <= 0:
             kernel_seq_size_per_block = int(seq_size_per_block)
         state_indices_cache: Dict[tuple[int, bool], torch.Tensor] = {}
@@ -1665,7 +1670,10 @@ class RTPForwardContext:
         if index_dim <= 4:
             return None
         aligned_dim = ((index_dim + 15) // 16) * 16
-        num_tokens = int(kv_cache_base.shape[0]) * block_size
+        # kv_cache_base may be shaped as [physical_blocks, seq_per_block, dim] or
+        # [kernel_blocks, kernel_seq, dim] depending on the rtp-llm version.
+        # shape[0] * shape[1] always equals total token slots regardless of granularity.
+        num_tokens = int(kv_cache_base.shape[0]) * int(kv_cache_base.shape[1])
         cached = getattr(cache_owner, "_rtp_indexer_kv_cache", None)
         expected_shape = (num_tokens, 1, aligned_dim)
         if (
