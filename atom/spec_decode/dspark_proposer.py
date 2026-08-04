@@ -241,17 +241,22 @@ class DSparkProposer(Drafter):
                 residual = block.hc_post(x_prev, residual, post, comb)
             return residual.mean(dim=1)
 
-        # Kimi-K3: (prefix_sum, pending_add, block_residual). ATOM's port defers
-        # the FFN residual add across the layer boundary so the next layer can
-        # fuse it into apply_attn_res; the HF reference adds it before returning
+        # Kimi-K3: (prefix_sum, pending_add, pending_add2, block_residual). ATOM's
+        # port defers the FFN residual add across the layer boundary so the next
+        # layer can fuse it into apply_attn_res, and an MoE layer defers its routed
+        # and shared expert outputs SEPARATELY (pending_add2) so that fold absorbs
+        # their sum too. The HF reference adds all of it before returning
         # (`prefix_sum = prefix_sum + hidden_states`), and THAT sum is what
         # transformers records and what the draft was trained on. So add it back.
-        # `pending_add` is None on the layers that already folded it in.
+        # Both pendings are None on the layers that already folded them in.
         if isinstance(output, tuple):
-            carrier, pending = output[0], output[1]
+            carrier = output[0]
             if carrier is None:
                 return None
-            return carrier if pending is None else carrier + pending
+            for pending in output[1:-1]:
+                if pending is not None:
+                    carrier = carrier + pending
+            return carrier
 
         # Plain residual stream (no special bookkeeping).
         return output
