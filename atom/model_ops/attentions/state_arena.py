@@ -46,8 +46,30 @@ import torch
 _ALIGN = 256
 
 
-def _round_up(n: int, to: int = _ALIGN) -> int:
+def _align_up(n: int, to: int = _ALIGN) -> int:
     return -(-n // to) * to
+
+
+def plan_regions(sizes: list[int]) -> tuple[list[int], int]:
+    """Byte offsets for regions packed back to back in one allocation.
+
+    Returns `(offsets, total)`. Both the offsets and `total` are `_ALIGN`-
+    aligned, so `plan_regions(a) + plan_regions(b)` shifted by `a`'s total
+    lays out exactly as `plan_regions(a + b)` would — plan groups separately
+    and concatenate rather than slicing one flat result positionally. An
+    empty list plans to `([], 0)`, so an absent group needs no special case.
+
+    Lives beside the arena because `_ALIGN` does: whoever carves the arena out
+    of a shared allocation has to place every other region on the boundary the
+    arena's own fields assume.
+    """
+    offsets: list[int] = []
+    offset = 0
+    for nbytes in sizes:
+        offset = _align_up(offset)
+        offsets.append(offset)
+        offset += nbytes
+    return offsets, _align_up(offset)
 
 
 @dataclass(frozen=True)
@@ -85,8 +107,8 @@ def entry_bytes_for(fields: list[StateField]) -> int:
     """
     total = 0
     for field in fields:
-        total = _round_up(total) + field.bytes_per_entry
-    return _round_up(total)
+        total = _align_up(total) + field.bytes_per_entry
+    return _align_up(total)
 
 
 class StateArena:
@@ -102,6 +124,7 @@ class StateArena:
         fields: list[StateField],
         entries: int,
         device,
+        buf: torch.Tensor | None = None,
     ):
         if not fields:
             raise ValueError("a state arena needs at least one field")
@@ -116,7 +139,7 @@ class StateArena:
         offset = 0
         self._offsets: dict[str, int] = {}
         for field in self.fields:
-            offset = _round_up(offset)
+            offset = _align_up(offset)
             self._offsets[field.name] = offset
             offset += field.bytes_per_entry
 
@@ -124,9 +147,30 @@ class StateArena:
         # Zeroed, not `empty`: alignment padding falls outside every field
         # view, and an entry is copied whole by checkpointing and RDMA, so
         # uninitialized padding would travel. One memset at startup.
-        self.buf = torch.zeros(
-            entries * self.entry_bytes, dtype=torch.uint8, device=device
-        )
+        #
+        # `buf` lets a caller carve the arena out of a larger allocation it also
+        # carves the paged pools from, so the two are one contiguous region
+        # whose internal boundary can move. It must already be zeroed for the
+        # same reason. Owning the allocation stays the default — the tests and
+        # any single-pool backend construct arenas standalone.
+        want = entries * self.entry_bytes
+        if buf is None:
+            self.buf = torch.zeros(want, dtype=torch.uint8, device=device)
+        else:
+            if buf.dtype is not torch.uint8 or buf.numel() != want:
+                raise ValueError(
+                    f"buf must be {want} uint8 elements, got {buf.numel()} "
+                    f"{buf.dtype}"
+                )
+            if not buf.is_contiguous():
+                raise ValueError("buf must be contiguous")
+            if buf.storage_offset() % _ALIGN:
+                raise ValueError(
+                    f"buf must start on a {_ALIGN}B boundary, got storage "
+                    f"offset {buf.storage_offset()}: field views retype the "
+                    "buffer, which needs the offset to divide every itemsize"
+                )
+            self.buf = buf
         for field in self.fields:
             self.view(field.name).fill_(field.fill)
 
@@ -144,9 +188,13 @@ class StateArena:
         """
         field = self._by_name[name]
         itemsize = field.dtype.itemsize
-        # `buf` starts at storage offset 0, so byte offsets convert to element
-        # offsets by plain division. `_ALIGN` is a multiple of every itemsize,
-        # which is what makes that division exact.
+        # `as_strided`'s storage_offset is ABSOLUTE, so `typed`'s own offset
+        # has to be added: omit it and a carved arena addresses from the front
+        # of the host allocation and writes through whatever precedes it. An
+        # owned buffer sits at offset 0, which is what hides this.
+        #
+        # Byte offsets convert to element offsets by plain division: `_ALIGN`
+        # is a multiple of every itemsize, which is what makes that exact.
         typed = self.buf.view(field.dtype)
         inner: tuple[int, ...] = ()
         acc = 1
@@ -156,7 +204,7 @@ class StateArena:
         return typed.as_strided(
             (field.layers, self.entries) + field.shape,
             (field.per_layer_numel, self.entry_bytes // itemsize) + inner,
-            self._offsets[field.name] // itemsize,
+            typed.storage_offset() + self._offsets[field.name] // itemsize,
         )
 
     def entry(self, index: int) -> torch.Tensor:

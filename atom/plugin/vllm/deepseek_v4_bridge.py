@@ -570,14 +570,14 @@ def _bind_compressor_state(
         nb, k1, aligned_dim = kv_cache.shape
         block_fp32_stride = (k1 * aligned_dim) // 4
         scale_fp32_offset = (k1 * head_dim) // 4
-        compressor.cache_scale = (
-            kv_cache.view(torch.float32)
-            .view(-1)
-            .as_strided(
-                size=(nb, k1),
-                stride=(block_fp32_stride, 1),
-                storage_offset=scale_fp32_offset,
-            )
+        # storage_offset is ABSOLUTE and `kv_cache` is a view into vLLM's proxy
+        # pool, so its own offset has to be added or every layer's cache_scale
+        # aliases the first layer's. Mirrors `deepseek_v4_attn.py`.
+        flat_f32 = kv_cache.view(torch.float32).view(-1)
+        compressor.cache_scale = flat_f32.as_strided(
+            size=(nb, k1),
+            stride=(block_fp32_stride, 1),
+            storage_offset=flat_f32.storage_offset() + scale_fp32_offset,
         )
     else:
         compressor.cache_scale = None

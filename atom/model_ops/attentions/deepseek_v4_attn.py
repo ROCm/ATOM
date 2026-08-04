@@ -68,6 +68,7 @@ from atom.model_ops.attentions.state_arena import (
     StateArena,
     StateField,
     entry_bytes_for,
+    plan_regions,
 )
 from atom.model_ops.attentions.sub_pool_spec import (
     SubPoolSpec,
@@ -762,7 +763,19 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         }
 
     def allocate_per_req_cache(self, entries: dict[str, int]) -> dict[str, object]:
-        """Allocate per-layer `unified_kv` + Compressor state caches.
+        """Carve per-layer `unified_kv` + Compressor state out of one allocation.
+
+        One `torch.zeros` holds every per-request pool, in this order:
+
+            [layer 0 .. layer N-1]  unified pools
+            [rope 0  .. rope N-1]   parallel RoPE pools, fp8 KV only
+            [arena]                 compressor state, one entry per request
+
+        `plan_regions` places them, so each starts on the boundary the arena's
+        own fields assume. Carving produces views indistinguishable from
+        standalone `torch.zeros` in shape, stride and dtype; what the single
+        allocation buys is that the KV/state boundary can move later without
+        freeing either side, which is why `StateArena` is entry-major.
 
         Per-layer `unified_kv` layout (decode-time paged_decode kernel reads
         a single base ptr; offsets `[0, swa_pages)` are the SWA ring,
@@ -812,19 +825,54 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 return swa_pages + num_blocks * self.k2_hca
             return swa_pages  # Dense: SWA ring only
 
+        # Every per-request pool is carved from ONE allocation. Each group is
+        # planned on its own and shifted by what precedes it, which is exact
+        # because `plan_regions` aligns its total too; the fp8-only RoPE group
+        # plans to nothing when absent, so there is no branch on the layout.
+        rope_dtype = self._rope_dtype
+        kv_offsets, kv_bytes = plan_regions(
+            [_pages(i) * head_dim * dtype.itemsize for i in range(self.num_layers)]
+        )
+        rope_offsets, rope_bytes = plan_regions(
+            [
+                _pages(i) * self.rope_head_dim * rope_dtype.itemsize
+                for i in range(self.num_layers)
+            ]
+            if self._kv_fp8
+            else []
+        )
+        arena_offset = kv_bytes + rope_bytes
+        # Recomputed rather than taken from the arena, which does not exist
+        # yet; `StateArena` rejects a `buf` whose size disagrees, so the two
+        # expressions cannot drift silently.
+        arena_bytes = entry_bytes_for(self._state_fields()) * num_slots
+
+        # Zeroed once, which is also what `StateArena`'s `buf` contract asks
+        # for. Nothing holds the pool but the carved views — they keep the
+        # allocation alive, so it must not be dropped from any of them.
+        per_req_pool = torch.zeros(
+            arena_offset + arena_bytes, dtype=torch.uint8, device=device
+        )
+
+        def _carve(start: int, rows: int, width: int, elem: torch.dtype):
+            end = start + rows * width * elem.itemsize
+            return per_req_pool[start:end].view(elem).view(rows, width)
+
+        # Per-layer unified pool: SWA ring prefix + (CSA/HCA) compress tail.
         unified_kv: list[torch.Tensor] = [
-            torch.zeros((_pages(i), head_dim), dtype=dtype, device=device)
+            _carve(kv_offsets[i], _pages(i), head_dim, dtype)
             for i in range(self.num_layers)
         ]
         # 2buff fp8: parallel rope pool per layer — same page count, width
         # rope_head_dim, dtype bf16 (rope is never quantized). bf16 builds keep
-        # rope inline in unified_kv and allocate nothing here.
+        # rope inline in unified_kv and carve nothing here.
         unified_kv_rope: list[torch.Tensor | None] = (
             [
-                torch.zeros(
-                    (_pages(i), self.rope_head_dim),
-                    dtype=self._rope_dtype,
-                    device=device,
+                _carve(
+                    kv_bytes + rope_offsets[i],
+                    _pages(i),
+                    self.rope_head_dim,
+                    rope_dtype,
                 )
                 for i in range(self.num_layers)
             ]
@@ -836,7 +884,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # Same per-layer views the kernels bound before; the difference is
         # that a slot's whole state is now one contiguous byte range instead
         # of six pieces spread across six allocations.
-        arena = StateArena(self._state_fields(), num_slots, device)
+        arena = StateArena(
+            self._state_fields(),
+            num_slots,
+            device,
+            buf=per_req_pool[arena_offset : arena_offset + arena_bytes],
+        )
 
         # ---- RDMA staging pool, only allocated in PD disaggregation mode --
         is_pd = bool(getattr(self.model_runner.config, "kv_transfer_config", None))

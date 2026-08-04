@@ -10,6 +10,7 @@ per-entry byte range that checkpointing and RDMA use. Everything runs on CPU
 """
 
 import math
+from itertools import pairwise
 
 import pytest
 import torch
@@ -18,6 +19,7 @@ from atom.model_ops.attentions.state_arena import (
     StateArena,
     StateField,
     entry_bytes_for,
+    plan_regions,
 )
 
 # Shaped after DeepSeek-V4's compressor state, scaled down: three families,
@@ -176,6 +178,120 @@ class TestMixedDtypes:
         assert arena.view("k")[1, 2].eq(1.5).all()
         assert arena.view("v")[1, 2].eq(2.5).all()
         assert arena.view("k")[1, 1].eq(0).all()
+
+
+class TestPlanRegions:
+    """Packing for the one allocation every per-request pool is carved from.
+
+    Kept here rather than beside the V4 backend so it runs without importing
+    AITER. That matters most for the fp8 shape: it carves a RoPE pool per
+    layer on top of the unified pools, and cannot be exercised end to end
+    while the fused fp8 SWA write is paged-only.
+    """
+
+    def test_regions_are_aligned_disjoint_and_in_order(self):
+        sizes = [1, 255, 256, 257, 4096, 3]
+        offsets, total = plan_regions(sizes)
+        assert len(offsets) == len(sizes)
+        for off in offsets:
+            assert off % 256 == 0
+        for (a, n), b in zip(zip(offsets, sizes), offsets[1:]):
+            assert a + n <= b, "region overruns the next one"
+        assert offsets[-1] + sizes[-1] <= total
+        assert total % 256 == 0
+
+    def test_total_is_alignable_so_plans_concatenate(self):
+        a, total_a = plan_regions([100, 200])
+        b, total_b = plan_regions([300])
+        joint, total_joint = plan_regions([100, 200, 300])
+        assert joint[:2] == a
+        assert joint[2] == total_a + b[0]
+        assert total_joint == total_a + total_b
+
+    def test_empty_plan(self):
+        assert plan_regions([]) == ([], 0)
+
+    def test_zero_sized_region_still_gets_an_offset(self):
+        offsets, _ = plan_regions([256, 0, 256])
+        assert len(offsets) == 3
+        assert offsets[1] == offsets[2] == 256
+
+    @pytest.mark.parametrize("with_rope", [False, True])
+    def test_v4_shaped_layout(self, with_rope):
+        """bf16 carves one region per layer plus the arena; fp8 carves two."""
+        layers, head_dim, rope_dim = 4, 512, 64
+        pages = [1000, 1000, 5000, 3000]
+        sizes = [p * head_dim * 2 for p in pages]
+        if with_rope:
+            sizes += [p * rope_dim * 2 for p in pages]
+        arena_bytes = entry_bytes_for(V4_LIKE) * 7
+        sizes.append(arena_bytes)
+
+        offsets, total = plan_regions(sizes)
+        kv = offsets[:layers]
+        rope = offsets[layers : 2 * layers] if with_rope else []
+        arena = offsets[-1]
+
+        assert len(rope) == (layers if with_rope else 0)
+        # The arena must clear every pool, which is the invariant that broke
+        # when `StateArena.view()` addressed from the host allocation's base.
+        assert arena >= max(o + s for o, s in zip(offsets[:-1], sizes[:-1]))
+        assert arena + arena_bytes <= total
+        assert all(a < b for a, b in pairwise(kv))
+
+
+class TestCarvedBuf:
+    """An arena carved out of a larger buffer must stay inside its slice.
+
+    `view()` reaches the storage through `as_strided`, whose storage_offset is
+    absolute; an owned buffer sits at offset 0, so forgetting to add the
+    slice's own offset is invisible until someone passes `buf`. What it costs
+    when it is not caught: every field view starts at the front of the host
+    allocation and the arena writes through whatever was carved before it.
+    """
+
+    @staticmethod
+    def _carve(head_bytes: int, entries: int = 5):
+        want = entry_bytes_for(V4_LIKE) * entries
+        host = torch.zeros(head_bytes + want, dtype=torch.uint8)
+        arena = StateArena(V4_LIKE, entries, device="cpu", buf=host[head_bytes:])
+        return host, arena
+
+    def test_views_start_inside_the_slice_not_at_the_host_base(self):
+        host, arena = self._carve(4096)
+        for field in V4_LIKE:
+            offset = arena.view(field.name).data_ptr() - host.data_ptr()
+            assert offset >= 4096, (
+                f"{field.name} view starts {4096 - offset} bytes before the "
+                "arena — it is addressing from the host allocation's base"
+            )
+
+    def test_head_of_the_host_allocation_is_untouched(self):
+        head_bytes = 4096
+        host, arena = self._carve(head_bytes)
+        host[:head_bytes] = 0xAB
+        for field in V4_LIKE:
+            arena.view(field.name).fill_(1.0)
+        assert bool((host[:head_bytes] == 0xAB).all()), (
+            "writing through the field views modified memory carved before " "the arena"
+        )
+
+    def test_rejects_a_misaligned_slice(self):
+        want = entry_bytes_for(V4_LIKE) * 2
+        host = torch.zeros(8 + want, dtype=torch.uint8)
+        with pytest.raises(ValueError, match="boundary"):
+            StateArena(V4_LIKE, 2, device="cpu", buf=host[8:])
+
+    def test_carved_and_owned_agree_field_for_field(self):
+        _, carved = self._carve(4096)
+        owned = build()
+        for field in V4_LIKE:
+            c, o = carved.view(field.name), owned.view(field.name)
+            assert c.shape == o.shape
+            assert c.stride() == o.stride()
+            assert c.data_ptr() - carved.buf.data_ptr() == (
+                o.data_ptr() - owned.buf.data_ptr()
+            )
 
 
 class TestRejectsBadFieldLists:
