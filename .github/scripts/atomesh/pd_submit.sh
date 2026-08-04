@@ -133,8 +133,11 @@ exports = {
     "AIPERF_MAX_CONTEXT_LENGTH": benchmark.get("max_context_length", ""),
     "AIPERF_NUM_DATASET_ENTRIES": benchmark.get("num_dataset_entries", ""),
     "AIPERF_BENCHMARK_DURATION": benchmark.get("benchmark_duration", ""),
-    "AIPERF_AGENTIC_CACHE_WARMUP_DURATION": benchmark.get(
-        "agentic_cache_warmup_duration", ""
+    "AIPERF_WARMUP_REQUESTS_PER_LANE": benchmark.get(
+        "warmup_requests_per_lane", ""
+    ),
+    "AIPERF_TRACE_IDLE_GAP_CAP_SECONDS": benchmark.get(
+        "trace_idle_gap_cap_seconds", ""
     ),
     "AIPERF_WARMUP_GRACE_PERIOD": benchmark.get("warmup_grace_period", ""),
     "AIPERF_TRAJECTORY_START_MIN_RATIO": benchmark.get(

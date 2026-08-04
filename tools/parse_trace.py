@@ -51,7 +51,12 @@ def model_name_from_trace(path: str) -> str | None:
     return prefix or None
 
 
-def find_capture_trace(run_trace: str) -> str | None:
+def find_legacy_capture_trace(run_trace: str) -> str | None:
+    """Locate the single whole-phase capture trace, if one is lying around.
+
+    Superseded by the per-(bs, q-bucket) files under ``capture_traces/``; kept
+    so traces captured before the split still parse.
+    """
     model_name = model_name_from_trace(run_trace)
     if not model_name:
         return None
@@ -63,6 +68,50 @@ def find_capture_trace(run_trace: str) -> str | None:
         if os.path.abspath(candidate) != run_abs:
             return candidate
     return None
+
+
+def resolve_capture_trace(run_trace: str, graph_bs: int, q_len: int | None) -> str:
+    """Return the capture trace holding the graph this decode replayed.
+
+    Capture is written one file per (batch size, q-bucket) into
+    ``{run_trace_dir}/capture_traces/``, so the batch size now selects the
+    *file* instead of a span inside one combined trace.
+    """
+    capture_dir = os.path.join(os.path.dirname(run_trace) or ".", "capture_traces")
+    if not os.path.isdir(capture_dir):
+        legacy = find_legacy_capture_trace(run_trace)
+        if legacy is not None:
+            return legacy
+        raise RuntimeError(
+            f"No {capture_dir} directory and no legacy capture trace next to "
+            f"{run_trace}. Re-run with --mark-trace, or pass --capture-trace."
+        )
+
+    def matching(q: str) -> list[str]:
+        pattern = os.path.join(capture_dir, f"bs_{graph_bs}_q_{q}_rank*.json.gz")
+        return sorted(glob(pattern))
+
+    # Prefer the exact q-bucket; fall back to any bucket for this batch size so
+    # a label without a usable tok= field still resolves when it is unambiguous.
+    candidates = matching(str(q_len)) if q_len is not None else []
+    if not candidates:
+        candidates = matching("*")
+    if len(candidates) == 1:
+        return candidates[0]
+    if candidates:
+        names = ", ".join(os.path.basename(path) for path in candidates)
+        raise RuntimeError(
+            f"Multiple capture traces match bs={graph_bs} in {capture_dir} "
+            f"({names}); pass --capture-trace to choose one."
+        )
+    available = sorted(
+        os.path.basename(path)
+        for path in glob(os.path.join(capture_dir, "bs_*_rank*.json.gz"))
+    )
+    raise RuntimeError(
+        f"No capture trace for bs={graph_bs} in {capture_dir}. "
+        f"Present: {', '.join(available) if available else '(none)'}"
+    )
 
 
 def find_first_decode(events: list[dict[str, Any]]) -> dict[str, Any]:
@@ -81,13 +130,33 @@ def find_first_decode(events: list[dict[str, Any]]) -> dict[str, Any]:
     return decodes[0]
 
 
-def decode_batch_size(decode_event: dict[str, Any]) -> int:
-    match = re.search(r"bs=(\d+)", str(decode_event.get("name", "")))
+def decode_batch_sizes(decode_event: dict[str, Any]) -> tuple[int, int]:
+    """Return ``(scheduled_bs, graph_bs)`` from a decode label.
+
+    ``build_run_label`` writes ``bs=<real>/<graph>`` when the CUDAGraph replays
+    a padded batch. Capture files are named after the *graph* size, so the two
+    must not be conflated when picking one.
+    """
+    match = re.search(r"bs=(\d+)(?:/(\d+))?", str(decode_event.get("name", "")))
     if not match:
         raise RuntimeError(
             f"Could not parse batch size from {decode_event.get('name')!r}"
         )
-    return int(match.group(1))
+    scheduled = int(match.group(1))
+    return scheduled, int(match.group(2)) if match.group(2) else scheduled
+
+
+def decode_query_len(decode_event: dict[str, Any], scheduled_bs: int) -> int | None:
+    """Query tokens per request — 1, or ``mtp_k + 1`` under spec decode.
+
+    Selects the q-bucket among the capture files. ``None`` when the label
+    carries no ``tok=`` field that divides evenly by the batch size.
+    """
+    match = re.search(r"tok=(\d+)", str(decode_event.get("name", "")))
+    if not match or scheduled_bs <= 0:
+        return None
+    q_len, remainder = divmod(int(match.group(1)), scheduled_bs)
+    return q_len if remainder == 0 and q_len > 0 else None
 
 
 def find_cpu_capture_graphs(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -115,14 +184,28 @@ def find_capture_graph_for_bs(
     for graph in graphs:
         if graph.get("name") == target_name:
             return graph
-    raise RuntimeError(f"No {target_name} found in capture trace.")
+    present = ", ".join(sorted({str(graph.get("name")) for graph in graphs}))
+    raise RuntimeError(f"No {target_name} in capture trace; it holds: {present}")
 
 
 def warmup_window_for_graph(
     capture_events: list[dict[str, Any]], target_graph: dict[str, Any]
 ) -> tuple[float, float]:
-    """Return [previous_capture_graph_end, target_capture_graph_start)."""
-    start = 0.0
+    """Return [previous_capture_graph_end, target_capture_graph_start).
+
+    A per-batch-size capture file holds a single ``capture_graph_bs_*`` span, so
+    the window opens at the first event in the file and runs to that span — the
+    whole file up to the capture, which is exactly the warmup forward. The scan
+    over preceding spans only matters for a legacy combined trace, where every
+    batch size shares one file.
+
+    The floor is the earliest event rather than 0.0 so the window duration stays
+    a duration; timestamps here are absolute, so 0.0 would report the epoch.
+    """
+    start = min(
+        (float(event["ts"]) for event in capture_events if event.get("ph") == "X"),
+        default=0.0,
+    )
     for graph in find_cpu_capture_graphs(capture_events):
         if graph is target_graph:
             return start, float(target_graph["ts"])
@@ -579,6 +662,10 @@ def build_grouped_breakdown_rows(
     row for a layer group is the average time for that operator position across
     layers in the group.  Non-layer and unmatched rows are aggregated by
     module/kernel/stream.
+
+    ``time_us`` is therefore per-layer while the decode window it is reported
+    against covers every layer, so each row also carries the ``layer_count`` its
+    average was taken over — multiply the two to get the share of the forward.
     """
     layer_rows: dict[int, list[dict[str, Any]]] = {}
     non_layer_accum: dict[tuple[str, str, int], tuple[float, int]] = {}
@@ -622,6 +709,7 @@ def build_grouped_breakdown_rows(
             grouped.append(
                 {
                     "layer_group": "non_layer",
+                    "layer_count": 1,
                     "module": module,
                     "kernel": kernel,
                     "stream_no": stream_no,
@@ -660,6 +748,7 @@ def build_grouped_breakdown_rows(
             grouped.append(
                 {
                     "layer_group": label,
+                    "layer_count": layer_count,
                     "module": module,
                     "kernel": kernel,
                     "stream_no": stream_no,
@@ -675,6 +764,7 @@ def build_grouped_breakdown_rows(
         grouped.append(
             {
                 "layer_group": label,
+                "layer_count": layer_count,
                 "module": "__group_total__",
                 "kernel": "GROUP TOTAL",
                 "stream_no": "",
@@ -689,6 +779,7 @@ def build_grouped_breakdown_rows(
         grouped.append(
             {
                 "layer_group": "unmatched",
+                "layer_count": 1,
                 "module": "<unmatched>",
                 "kernel": kernel,
                 "stream_no": stream_no,
@@ -703,11 +794,12 @@ def build_grouped_breakdown_rows(
 
 DECODE_BREAKDOWN_HEADER = [
     "layer_group",
+    "layer_count",
     "module/tag",
     "kernel",
     "stream_id",
-    "time_us",
-    "percent_of_full_decode_forward",
+    "time_us_per_layer",
+    "percent_of_decode",
 ]
 XLSX_KERNEL_DISPLAY_LIMIT = 120
 
@@ -715,12 +807,21 @@ XLSX_KERNEL_DISPLAY_LIMIT = 120
 def decode_breakdown_values(
     rows: list[dict[str, Any]], full_decode_us: float
 ) -> list[list[Any]]:
+    """Flatten breakdown rows into sheet rows.
+
+    ``time_us`` is one layer's average, so it is scaled back up by
+    ``layer_count`` before dividing by the whole-forward window — the percent
+    column is what the group costs the decode, not what one of its layers does.
+    """
     values: list[list[Any]] = []
     for row in rows:
-        percent = row["time_us"] / full_decode_us * 100.0 if full_decode_us > 0 else 0.0
+        layer_count = int(row.get("layer_count", 1))
+        group_us = float(row["time_us"]) * layer_count
+        percent = group_us / full_decode_us * 100.0 if full_decode_us > 0 else 0.0
         values.append(
             [
                 row["layer_group"],
+                layer_count,
                 row["module"],
                 row["kernel"],
                 row["stream_no"],
@@ -740,32 +841,40 @@ def write_decode_csv(path: str, values: list[list[Any]]) -> None:
         prev_module: str | None = None
         for row in values:
             layer_group = str(row[0])
-            module = str(row[1])
-            display_layer_group = "" if layer_group == prev_layer_group else layer_group
-            display_module = (
-                ""
-                if layer_group == prev_layer_group and module == prev_module
-                else module
-            )
+            module = str(row[2])
+            repeats_group = layer_group == prev_layer_group
+            display_layer_group = "" if repeats_group else layer_group
+            display_layer_count = "" if repeats_group else row[1]
+            display_module = "" if repeats_group and module == prev_module else module
             writer.writerow(
                 [
                     display_layer_group,
+                    display_layer_count,
                     display_module,
-                    row[2],
                     row[3],
-                    f"{row[4]:.3f}",
-                    f"{row[5]:.6f}",
+                    row[4],
+                    f"{row[5]:.3f}",
+                    f"{row[6]:.3f}",
                 ]
             )
             prev_layer_group = layer_group
             prev_module = module
 
 
-def merge_same_value_runs(ws: Any, column: int, start_row: int, end_row: int) -> None:
+def merge_same_value_runs(
+    ws: Any, column: int, start_row: int, end_row: int, key_column: int | None = None
+) -> None:
+    """Merge runs of equal cells in *column*.
+
+    ``key_column`` defines the run boundaries when they must not be taken from
+    *column* itself — layer_count repeats across unrelated groups, so it merges
+    on the layer_group runs instead of its own.
+    """
+    key_column = key_column or column
     run_start = start_row
-    prev_value = ws.cell(row=start_row, column=column).value
+    prev_value = ws.cell(row=start_row, column=key_column).value
     for row in range(start_row + 1, end_row + 2):
-        value = ws.cell(row=row, column=column).value if row <= end_row else None
+        value = ws.cell(row=row, column=key_column).value if row <= end_row else None
         if value != prev_value:
             if prev_value not in (None, "") and row - run_start > 1:
                 ws.merge_cells(
@@ -790,12 +899,12 @@ def write_decode_xlsx(path: str, values: list[list[Any]]) -> None:
     ws.append(DECODE_BREAKDOWN_HEADER)
     for value_row in values:
         display_row = list(value_row)
-        kernel = str(display_row[2])
+        kernel = str(display_row[3])
         if len(kernel) > XLSX_KERNEL_DISPLAY_LIMIT:
-            display_row[2] = kernel[: XLSX_KERNEL_DISPLAY_LIMIT - 3] + "..."
+            display_row[3] = kernel[: XLSX_KERNEL_DISPLAY_LIMIT - 3] + "..."
         ws.append(display_row)
         if len(kernel) > XLSX_KERNEL_DISPLAY_LIMIT:
-            ws.cell(row=ws.max_row, column=3).comment = Comment(kernel, "ATOM")
+            ws.cell(row=ws.max_row, column=4).comment = Comment(kernel, "ATOM")
 
     ws.freeze_panes = "A2"
     for cell in ws[1]:
@@ -804,43 +913,49 @@ def write_decode_xlsx(path: str, values: list[list[Any]]) -> None:
 
     end_row = ws.max_row
     if end_row >= 2:
+        # Column 3 (module) merges only within a run of the same layer_group,
+        # so it is keyed on the pair rather than merged on its own.
         module_run_start = 2
-        prev_key = (ws.cell(row=2, column=1).value, ws.cell(row=2, column=2).value)
+        prev_key = (ws.cell(row=2, column=1).value, ws.cell(row=2, column=3).value)
         for row in range(3, end_row + 2):
             key = (
                 ws.cell(row=row, column=1).value if row <= end_row else None,
-                ws.cell(row=row, column=2).value if row <= end_row else None,
+                ws.cell(row=row, column=3).value if row <= end_row else None,
             )
             if key != prev_key:
                 if prev_key[1] not in (None, "") and row - module_run_start > 1:
                     ws.merge_cells(
                         start_row=module_run_start,
-                        start_column=2,
+                        start_column=3,
                         end_row=row - 1,
-                        end_column=2,
+                        end_column=3,
                     )
                 module_run_start = row
                 prev_key = key
 
+        # layer_count first: merging a column blanks every cell but its
+        # top-left, so column 1 has to stay intact while it is used as the key.
+        merge_same_value_runs(ws, 2, 2, end_row, key_column=1)
         merge_same_value_runs(ws, 1, 2, end_row)
 
     for row in ws.iter_rows(min_row=2):
-        is_total_row = row[2].value == "GROUP TOTAL"
+        is_total_row = row[3].value == "GROUP TOTAL"
         for cell in row:
             cell.alignment = Alignment(vertical="top", wrap_text=True)
             if is_total_row:
                 cell.font = Font(bold=True)
                 cell.fill = PatternFill("solid", fgColor="FFF2CC")
-        row[4].number_format = "0.000"
-        row[5].number_format = "0.000000"
+        row[5].number_format = "0.000"
+        row[6].number_format = "0.000"
 
     widths = {
         1: 24,
-        2: 72,
+        2: 12,
         3: 72,
-        4: 10,
-        5: 12,
-        6: 28,
+        4: 72,
+        5: 10,
+        6: 16,
+        7: 18,
     }
     for col, width in widths.items():
         ws.column_dimensions[get_column_letter(col)].width = width
@@ -888,16 +1003,18 @@ def main() -> None:
     args = parser.parse_args()
 
     run_events = load_events(args.run_trace)
-    capture_trace = args.capture_trace or find_capture_trace(args.run_trace)
-    if capture_trace is None:
-        raise RuntimeError(
-            "Could not auto-discover capture trace; pass --capture-trace."
-        )
+
+    # The batch size selects which capture file to open, so it has to be read
+    # from the run trace first.
+    decode = find_first_decode(run_events)
+    batch_size, graph_batch_size = decode_batch_sizes(decode)
+    q_len = decode_query_len(decode, batch_size)
+    capture_trace = args.capture_trace or resolve_capture_trace(
+        args.run_trace, graph_batch_size, q_len
+    )
     capture_events = load_events(capture_trace)
 
-    decode = find_first_decode(run_events)
-    batch_size = decode_batch_size(decode)
-    graph = find_capture_graph_for_bs(capture_events, batch_size)
+    graph = find_capture_graph_for_bs(capture_events, graph_batch_size)
     warmup_start, warmup_end = warmup_window_for_graph(capture_events, graph)
     counts = count_events_in_window(capture_events, warmup_start, warmup_end)
 
@@ -908,8 +1025,12 @@ def main() -> None:
     print(f"  name: {decode.get('name')}")
     print(f"  ts: {decode.get('ts'):.3f}")
     print(f"  dur: {decode.get('dur'):.3f}")
-    print(f"  batch size: {batch_size}")
-    print("")
+    if graph_batch_size != batch_size:
+        print(f"  batch size: {batch_size} (padded to graph bs={graph_batch_size})")
+    else:
+        print(f"  batch size: {batch_size}")
+    print(f"  query len: {q_len if q_len is not None else '?'}")
+    print()
     print("Matching capture graph:")
     print(f"  name: {graph.get('name')}")
     print(f"  ts: {graph.get('ts'):.3f}")
