@@ -79,7 +79,15 @@ def prepare_model(config: Any):
     else:
         _remap_quant_config_for_sglang_plugin(atom_config, model_cls)
 
-    register_ops_to_sglang(atom_config=atom_config)
+    # Qwen3-Next/Qwen3.5 model layers are already written against SGLang's
+    # RadixAttention contract. Keep SGLang's native attention backend so
+    # speculative TARGET_VERIFY uses its proven metadata/cache path.
+    if model_arch not in {
+        "Qwen3NextForCausalLM",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+    }:
+        register_ops_to_sglang(atom_config=atom_config)
     set_attn_cls()
 
     # Init aiter dist for using aiter custom collective ops.

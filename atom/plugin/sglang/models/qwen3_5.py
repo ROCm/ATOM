@@ -138,8 +138,17 @@ def _forward_qwen35_decoder_stack(
     intermediate_tensors: IntermediateTensors | None = None,
     inputs_embeds: torch.Tensor | None = None,
     input_deepstack_embeds: torch.Tensor | None = None,
-) -> torch.Tensor | IntermediateTensors:
-    if input_deepstack_embeds is None or input_deepstack_embeds.numel() == 0:
+    dflash_capture_points: tuple[int, ...] = (),
+) -> (
+    torch.Tensor
+    | IntermediateTensors
+    | tuple[torch.Tensor, list[torch.Tensor]]
+):
+    has_deepstack = (
+        input_deepstack_embeds is not None
+        and input_deepstack_embeds.numel() > 0
+    )
+    if not has_deepstack and not dflash_capture_points:
         return decoder_stack(
             input_ids,
             positions,
@@ -159,16 +168,25 @@ def _forward_qwen35_decoder_stack(
         residual = intermediate_tensors["residual"]
 
     hs = decoder_stack.config.hidden_size
+    capture_points = set(dflash_capture_points)
+    aux_hidden_states: list[torch.Tensor] = []
     for local_i, layer in enumerate(
         decoder_stack.layers[decoder_stack.start_layer : decoder_stack.end_layer]
     ):
-        hidden_states, residual = layer(positions, hidden_states, residual)
         layer_num = decoder_stack.start_layer + local_i
-        if (
-            input_deepstack_embeds is not None
-            and input_deepstack_embeds.numel() > 0
-            and layer_num < 3
-        ):
+        if layer_num in capture_points:
+            # SGLang captures the previous layer's post-residual stream at the
+            # next layer entrance. Clone because ATOM fused norms may update the
+            # residual buffer in place during this layer.
+            captured = (
+                hidden_states
+                if residual is None
+                else hidden_states + residual
+            )
+            aux_hidden_states.append(captured.clone())
+
+        hidden_states, residual = layer(positions, hidden_states, residual)
+        if has_deepstack and layer_num < 3:
             sep = hs * layer_num
             hidden_states.add_(input_deepstack_embeds[:, sep : sep + hs])
 
@@ -177,6 +195,8 @@ def _forward_qwen35_decoder_stack(
             {"hidden_states": hidden_states, "residual": residual}
         )
     hidden_states, _ = decoder_stack.norm(hidden_states, residual)
+    if aux_hidden_states:
+        return hidden_states, aux_hidden_states
     return hidden_states
 
 
@@ -220,6 +240,7 @@ def _get_qwen35_language_model_stack_cls(
             self.make_empty_intermediate_tensors = (
                 atom_lm.make_empty_intermediate_tensors
             )
+            self.dflash_capture_points: tuple[int, ...] = ()
             # Keep a strong reference to the full ATOM LM without registering it
             # as another submodule tree, so parameter names still flow through
             # the SGLang wrapper's expected `model.*` / `lm_head.*` prefixes.
@@ -263,6 +284,33 @@ def _get_qwen35_language_model_stack_cls(
         def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
             return self.model.embed_input_ids(input_ids)
 
+        def set_dflash_layers_to_capture(
+            self, layers_to_capture: list[int]
+        ) -> None:
+            pp_group = _aiter_pp_group()
+            if getattr(pp_group, "world_size", 1) != 1:
+                raise ValueError("ATOM Qwen3.5 DFLASH currently requires PP1.")
+            if bool(getattr(self.atom_config, "enable_dp_attention", False)):
+                raise ValueError(
+                    "ATOM Qwen3.5 DFLASH currently does not support DP attention."
+                )
+
+            capture_points = tuple(int(layer) for layer in layers_to_capture)
+            if tuple(sorted(set(capture_points))) != capture_points:
+                raise ValueError(
+                    "DFLASH capture points must be sorted and unique, "
+                    f"got {capture_points}."
+                )
+            if any(
+                layer < self.start_layer or layer >= self.end_layer
+                for layer in capture_points
+            ):
+                raise ValueError(
+                    "DFLASH capture point is outside the local decoder stack: "
+                    f"points={capture_points}, range=[{self.start_layer}, {self.end_layer})."
+                )
+            self.dflash_capture_points = capture_points
+
         def forward(
             self,
             input_ids: torch.Tensor | None,
@@ -303,6 +351,7 @@ def _get_qwen35_language_model_stack_cls(
                         intermediate_tensors=intermediate_tensors,
                         inputs_embeds=inputs_embeds,
                         input_deepstack_embeds=input_deepstack_embeds,
+                        dflash_capture_points=self.dflash_capture_points,
                     )
             if isinstance(out, IntermediateTensors):
                 return PPProxyTensors(dict(out.tensors))
