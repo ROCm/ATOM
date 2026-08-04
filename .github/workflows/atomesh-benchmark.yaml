@@ -378,8 +378,8 @@ jobs:
           name: atomesh-benchmark-matrix
           path: atomesh-matrix.json
 
-  cleanup-slurm-jobs:
-    name: Clean Slurm jobs on ${{ matrix.id }}
+  run-model-benchmark:
+    name: ${{ matrix.id }}
     needs: [load-config]
     if: >-
       needs.load-config.outputs.has_matrix == 'true'
@@ -388,11 +388,15 @@ jobs:
         || (github.event_name == 'workflow_dispatch' && inputs.run_model_benchmark)
       )
     runs-on: ${{ matrix.runner.slurm_submit_runner }}
+    timeout-minutes: 420
     strategy:
       fail-fast: false
       max-parallel: 1
       matrix: ${{ fromJson(needs.load-config.outputs.matrix_json) }}
     steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+
       - name: Cancel existing jobs on benchmark nodes
         env:
           NODES: ${{ join(matrix.nodes, ',') }}
@@ -437,24 +441,6 @@ jobs:
           printf '%s\n' "${job_ids}"
           mapfile -t job_id_list <<< "${job_ids}"
           "${scancel_cmd[@]}" "${job_id_list[@]}"
-
-  run-model-benchmark:
-    name: ${{ matrix.id }}
-    needs: [load-config, cleanup-slurm-jobs]
-    if: >-
-      needs.load-config.outputs.has_matrix == 'true'
-      && (
-        github.event_name == 'schedule'
-        || (github.event_name == 'workflow_dispatch' && inputs.run_model_benchmark)
-      )
-    runs-on: ${{ matrix.runner.slurm_submit_runner }}
-    timeout-minutes: 420
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJson(needs.load-config.outputs.matrix_json) }}
-    steps:
-      - name: Checkout ATOM repo
-        uses: actions/checkout@v6
 
       - name: Print benchmark config
         env:
