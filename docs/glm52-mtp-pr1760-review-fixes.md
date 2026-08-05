@@ -120,6 +120,13 @@ deepseek_v2_moe_pcp_merge_forward
 
 This occurs before an external request and after ordinary PCP process-group
 startup, so PCP2 cannot yet be considered end-to-end supported on this SGLang
-container. The server was stopped and GPUs released. The remaining fix is to
-align the PCP MoE-merge dispatch with the SGLang NSA context-parallel layout
-used by this version, then rerun the long-prefill request.
+container. The server was stopped and GPUs released.
+
+An A/B comparison confirms this is a regression in the current PR branch, not
+the container or checkpoint: the pre-PR baseline `188ff2dd`, launched with the
+same container, model, eight GPUs, environment, and PCP arguments, completed
+the same 64-token warmup plus a 30,720-token prefill request successfully
+(2.21 s E2E). The current branch crashes during its own 64-token warmup decode.
+The remaining fix is to identify which GLM SGLang bridge state change after
+`188ff2dd` corrupts the subsequent PCP decode/MoE dispatch, then rerun this
+same A/B gate.
