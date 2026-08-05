@@ -170,6 +170,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_GDN_DECODE_LOSSY_FAST": lambda: (
         os.getenv("ATOM_ENABLE_GDN_DECODE_LOSSY_FAST", "0").lower() == "1"
     ),
+    # SGLang DFLASH target verify: fold the per-draft-step SSM recurrent loop
+    # into a single kernel launch by addressing SGLang's intermediate_ssm buffer
+    # as a flat slot pool through a 2D ssm_state_indices table. Bit-identical to
+    # the loop (tests/plugin/test_gdn_target_verify_batched_equiv.py); it also
+    # removes the live-state snapshot/restore, since the batched call only ever
+    # writes into the per-step slots. Off by default until the end-to-end
+    # accuracy and CUDA-graph runs are signed off.
+    "ATOM_ENABLE_GDN_SPEC_VERIFY_BATCHED_SSM": lambda: (
+        os.getenv("ATOM_ENABLE_GDN_SPEC_VERIFY_BATCHED_SSM", "0").lower() == "1"
+    ),
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT": lambda: (
         os.getenv("ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT", "1") == "1"
     ),

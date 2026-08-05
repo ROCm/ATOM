@@ -19,6 +19,7 @@ from atom.model_ops.attentions.gdn_attn import (
 )
 from atom.model_ops.fla_ops import fused_recurrent_gated_delta_rule
 from atom.model_ops.mamba_ops.causal_conv1d import causal_conv1d_update
+from atom.utils import envs
 from atom.utils.forward_context import (
     AttentionMetaData,
     Context,
@@ -45,25 +46,16 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
         from atom.plugin.sglang.runtime import get_current_forward_batch
 
         forward_batch = get_current_forward_batch()
-        if (
-            forward_batch is None
-            or not forward_batch.forward_mode.is_target_verify()
-        ):
-            return super().forward(
-                mixed_qkv, b, a, core_attn_out, layer_name
-            )
+        if forward_batch is None or not forward_batch.forward_mode.is_target_verify():
+            return super().forward(mixed_qkv, b, a, core_attn_out, layer_name)
 
-        attn_backend = SGLangGDNForwardContext._resolve_attn_backend(
-            forward_batch
-        )
+        attn_backend = SGLangGDNForwardContext._resolve_attn_backend(forward_batch)
         if attn_backend is None:
             raise RuntimeError(
                 "ATOM Qwen3.5 TARGET_VERIFY requires an active SGLang "
                 "attention backend."
             )
-        linear_backend = SGLangGDNForwardContext._linear_attn_backend(
-            attn_backend
-        )
+        linear_backend = SGLangGDNForwardContext._linear_attn_backend(attn_backend)
         if getattr(linear_backend, "forward_metadata", None) is None:
             raise RuntimeError(
                 "ATOM Qwen3.5 TARGET_VERIFY requires initialized SGLang "
@@ -93,8 +85,6 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
         )
         conv_states = layer_cache.conv[0]
         ssm_states = layer_cache.temporal
-        conv_before = conv_states[cache_indices].clone()
-        ssm_before = ssm_states[cache_indices].clone()
         mixed_blocks = mixed_qkv.view(bs, draft_token_num, -1)
         a_blocks = a.view(bs, draft_token_num, -1)
         b_blocks = b.view(bs, draft_token_num, -1)
@@ -104,6 +94,29 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
         conv_weights = self.conv1d.weight.view(
             self.conv1d.weight.size(0), self.conv1d.weight.size(-1)
         )
+
+        if envs.ATOM_ENABLE_GDN_SPEC_VERIFY_BATCHED_SSM:
+            self._verify_batched_ssm(
+                layer_cache=layer_cache,
+                conv_states=conv_states,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                mixed_blocks=mixed_blocks,
+                a_blocks=a_blocks,
+                b_blocks=b_blocks,
+                output_blocks=output_blocks,
+                conv_weights=conv_weights,
+                bs=bs,
+                draft_token_num=draft_token_num,
+            )
+            if core_attn_out.shape != output_blocks.view_as(core_attn_out).shape:
+                raise RuntimeError(
+                    "ATOM GDN TARGET_VERIFY produced an incompatible output shape."
+                )
+            return core_attn_out
+
+        conv_before = conv_states[cache_indices].clone()
+        ssm_before = ssm_states[cache_indices].clone()
 
         try:
             for step in range(draft_token_num):
@@ -121,9 +134,7 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
                 query = query.view(
                     1, bs, self.num_k_heads // self.tp_size, self.head_k_dim
                 )
-                key = key.view(
-                    1, bs, self.num_k_heads // self.tp_size, self.head_k_dim
-                )
+                key = key.view(1, bs, self.num_k_heads // self.tp_size, self.head_k_dim)
                 value = value.view(
                     1, bs, self.num_v_heads // self.tp_size, self.head_v_dim
                 )
@@ -146,9 +157,7 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
                     use_qk_l2norm_in_kernel=True,
                 )
                 output_blocks[:, step].copy_(step_output.squeeze(0))
-                layer_cache.intermediate_ssm[:bs, step].copy_(
-                    ssm_states[cache_indices]
-                )
+                layer_cache.intermediate_ssm[:bs, step].copy_(ssm_states[cache_indices])
                 layer_cache.intermediate_conv_window[0][:bs, step].copy_(
                     conv_states[cache_indices]
                 )
@@ -161,6 +170,159 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
                 "ATOM GDN TARGET_VERIFY produced an incompatible output shape."
             )
         return core_attn_out
+
+    def _spec_ssm_slot_table(
+        self, bs: int, draft_token_num: int, device: torch.device
+    ) -> torch.Tensor:
+        """`[bs, draft]` table into the flat `intermediate_ssm` slot pool.
+
+        Cached per shape and filled in place: CUDA graph replay requires the
+        tensor address to stay put across iterations.
+        """
+        cache = getattr(self, "_spec_slot_table_cache", None)
+        if cache is None:
+            cache = {}
+            self._spec_slot_table_cache = cache
+        key = (bs, draft_token_num, device)
+        table = cache.get(key)
+        if table is None:
+            table = torch.arange(bs, device=device, dtype=torch.int32).unsqueeze(
+                1
+            ) * draft_token_num + torch.arange(
+                draft_token_num, device=device, dtype=torch.int32
+            ).unsqueeze(
+                0
+            )
+            cache[key] = table
+        return table
+
+    def _verify_batched_ssm(
+        self,
+        *,
+        layer_cache: Any,
+        conv_states: torch.Tensor,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        mixed_blocks: torch.Tensor,
+        a_blocks: torch.Tensor,
+        b_blocks: torch.Tensor,
+        output_blocks: torch.Tensor,
+        conv_weights: torch.Tensor,
+        bs: int,
+        draft_token_num: int,
+    ) -> None:
+        """Target verify with the SSM recurrent folded into one kernel launch.
+
+        The conv update stays stepwise (its per-step windows still go through
+        SGLang's dense `intermediate_conv_window` contract), but its projected
+        q/k/v are accumulated and handed to a single
+        `fused_recurrent_gated_delta_rule` call. That call addresses
+        `intermediate_ssm` as a flat `[slot * step]` pool via a 2D index table,
+        so every per-step state lands where SGLang's
+        `fused_mamba_state_scatter_with_mask` expects it -- and the live SSM
+        state is never written, which is why only conv needs snapshot/restore
+        here.
+
+        Equivalence with the stepwise loop is covered bit-for-bit by
+        tests/plugin/test_gdn_target_verify_batched_equiv.py.
+        """
+        num_k_heads = self.num_k_heads // self.tp_size
+        num_v_heads = self.num_v_heads // self.tp_size
+        num_tokens = bs * draft_token_num
+
+        query_all = mixed_blocks.new_empty(
+            (bs, draft_token_num, num_k_heads * self.head_k_dim)
+        )
+        key_all = mixed_blocks.new_empty(
+            (bs, draft_token_num, num_k_heads * self.head_k_dim)
+        )
+        value_all = mixed_blocks.new_empty(
+            (bs, draft_token_num, num_v_heads * self.head_v_dim)
+        )
+
+        conv_before = conv_states[cache_indices].clone()
+        try:
+            for step in range(draft_token_num):
+                query, key, value = causal_conv1d_update(
+                    mixed_blocks[:, step, :].contiguous(),
+                    conv_states,
+                    conv_weights,
+                    self.num_k_heads * self.head_k_dim // self.tp_size,
+                    self.num_v_heads * self.head_v_dim // self.tp_size,
+                    self.conv1d.bias,
+                    self.activation,
+                    conv_state_indices=cache_indices,
+                    validate_data=True,
+                )
+                query_all[:, step] = query
+                key_all[:, step] = key
+                value_all[:, step] = value
+                layer_cache.intermediate_conv_window[0][:bs, step].copy_(
+                    conv_states[cache_indices]
+                )
+        finally:
+            conv_states[cache_indices] = conv_before
+
+        g, beta = fused_gdn_gating(
+            self.A_log,
+            a_blocks.reshape(num_tokens, -1),
+            b_blocks.reshape(num_tokens, -1),
+            self.dt_bias,
+        )
+
+        # intermediate_ssm[:, step] is indexed by batch position (see SGLang's
+        # fused_mamba_state_scatter_with_mask: src[:, i, step_indices[i]]), so
+        # slot = i * draft_token_num + step over the flattened per-layer view.
+        pool = layer_cache.intermediate_ssm
+        if not pool.is_contiguous():
+            raise RuntimeError(
+                "ATOM GDN batched TARGET_VERIFY requires a contiguous "
+                "intermediate_ssm buffer."
+            )
+        flat_pool = pool.view(pool.shape[0] * pool.shape[1], *pool.shape[2:])
+        slot_table = self._spec_ssm_slot_table(bs, draft_token_num, mixed_blocks.device)
+        # The kernel loads h0 once, before its internal step loop, so seeding
+        # step 0's slot with the live state and letting step 0 overwrite that
+        # same slot is safe.
+        pool[:bs, 0] = ssm_states[cache_indices]
+
+        cu_seqlens = self._spec_cu_seqlens(bs, draft_token_num, mixed_blocks.device)
+        block_output, _ = fused_recurrent_gated_delta_rule(
+            q=query_all.view(1, num_tokens, num_k_heads, self.head_k_dim),
+            k=key_all.view(1, num_tokens, num_k_heads, self.head_k_dim),
+            v=value_all.view(1, num_tokens, num_v_heads, self.head_v_dim),
+            g=g,
+            beta=beta,
+            initial_state=flat_pool,
+            inplace_final_state=True,
+            cu_seqlens=cu_seqlens,
+            ssm_state_indices=slot_table,
+            use_qk_l2norm_in_kernel=True,
+        )
+        output_blocks.copy_(
+            block_output.view(bs, draft_token_num, *output_blocks.shape[2:])
+        )
+
+    def _spec_cu_seqlens(
+        self, bs: int, draft_token_num: int, device: torch.device
+    ) -> torch.Tensor:
+        """`[bs + 1]` block boundaries, cached for CUDA graph address stability."""
+        cache = getattr(self, "_spec_cu_seqlens_cache", None)
+        if cache is None:
+            cache = {}
+            self._spec_cu_seqlens_cache = cache
+        key = (bs, draft_token_num, device)
+        cu_seqlens = cache.get(key)
+        if cu_seqlens is None:
+            cu_seqlens = torch.arange(
+                0,
+                (bs + 1) * draft_token_num,
+                draft_token_num,
+                device=device,
+                dtype=torch.int32,
+            )
+            cache[key] = cu_seqlens
+        return cu_seqlens
 
 
 class GDNAttentionBackend:
@@ -264,9 +426,7 @@ class SGLangGDNForwardContext:
         elif mode.is_target_verify():
             positions = forward_batch.positions
             num_tokens = int(
-                positions.shape[-1]
-                if positions.ndim == 2
-                else positions.shape[0]
+                positions.shape[-1] if positions.ndim == 2 else positions.shape[0]
             )
         else:
             num_tokens = forward_batch.batch_size
@@ -373,10 +533,7 @@ class SGLangGDNForwardContext:
         cls._patch_forward_batch_pools(forward_batch, attn_backend)
         linear_backend = cls._linear_attn_backend(attn_backend)
         gdn_metadata = cls._build_gdn_metadata(forward_batch, linear_backend)
-        if (
-            gdn_metadata is None
-            and not forward_batch.forward_mode.is_target_verify()
-        ):
+        if gdn_metadata is None and not forward_batch.forward_mode.is_target_verify():
             return None
 
         kv_cache_data = cls._build_kv_cache_tensors(forward_batch, attn_backend)
