@@ -1694,6 +1694,20 @@ async def get_mtp_stats():
         )
 
 
+@app.get("/debug/cache_stats")
+async def get_cache_stats():
+    """Return cumulative prefix-cache reuse statistics."""
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Engine is not initialized")
+    try:
+        return engine.get_cache_statistics()
+    except Exception as e:
+        logger.exception("Failed to get cache statistics")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to get cache statistics: {e}"
+        ) from e
+
+
 def _resolve_kv_transfer_role(kv_cfg: dict) -> tuple[str | None, int]:
     kv_role = kv_cfg.get("kv_role")
     handshake_port = kv_cfg.get("handshake_port", 6301)

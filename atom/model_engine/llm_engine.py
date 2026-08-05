@@ -338,6 +338,58 @@ class LLMEngine:
             },
         }
 
+    def get_cache_statistics(self, timeout: float = 30.0) -> dict[str, Any]:
+        """Return aggregated prefix-cache statistics across DP ranks.
+
+        The four rates are the ones `[Cache Stats]` logs, recomputed from
+        summed counters rather than averaged: ranks admit different numbers of
+        tokens, so the mean of their rates is not the rate of their union.
+
+        `cached <= wanted <= compressed <= full` by construction, which is what
+        makes the differences below meaningful:
+          hit                 reuse actually admitted
+          compressed_hit      reuse the prefix index held, before the
+                              per-request state classes had their say
+          lost_to_checkpoint  declined only because no checkpoint existed at
+                              that boundary — what a denser ladder recovers
+          lost_unrecoverable  declined for a reason no checkpoint touches
+        """
+        responses = self.core_mgr.broadcast_utility_command_sync(
+            "get_cache_statistics", timeout=timeout
+        )
+        rank_stats = [
+            resp.get("result", resp)
+            for resp in responses
+            if resp.get("result", resp).get("enabled", False)
+        ]
+        totals = {
+            key: sum(int(stats.get(key, 0)) for stats in rank_stats)
+            for key in (
+                "requests",
+                "cached_tokens",
+                "compressed_tokens",
+                "wanted_tokens",
+                "full_tokens",
+            )
+        }
+        full = totals["full_tokens"]
+
+        def rate(num: int) -> float:
+            return num / full if full else 0.0
+
+        return {
+            "enabled": bool(rank_stats),
+            **totals,
+            "hit": rate(totals["cached_tokens"]),
+            "compressed_hit": rate(totals["compressed_tokens"]),
+            "lost_to_checkpoint": rate(
+                totals["wanted_tokens"] - totals["cached_tokens"]
+            ),
+            "lost_unrecoverable": rate(
+                totals["compressed_tokens"] - totals["wanted_tokens"]
+            ),
+        }
+
 
 class InputOutputProcessor:
 

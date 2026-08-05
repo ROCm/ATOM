@@ -205,6 +205,21 @@ class CacheStats:
             return 0.0
         return self.total_cached_tokens / self.total_full_tokens
 
+    def get_statistics(self) -> dict:
+        """Counters, not rates — the caller derives those.
+
+        Every rate this class reports is a ratio of two of these totals, and a
+        rate cannot be aggregated across DP ranks that saw different token
+        counts. Handing back the counts keeps the merge a sum.
+        """
+        return {
+            "requests": self.total_requests,
+            "cached_tokens": self.total_cached_tokens,
+            "compressed_tokens": self.total_compressed_tokens,
+            "wanted_tokens": self.total_wanted_tokens,
+            "full_tokens": self.total_full_tokens,
+        }
+
     def _reset_interval(self) -> None:
         self._interval_requests = 0
         self._interval_cached_tokens = 0
