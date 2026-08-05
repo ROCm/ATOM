@@ -55,6 +55,7 @@ on:
           - GLM-5.2 FP8 TP4
           - GLM-5.2 FP8 TP4 PCP2
           - GLM-5.2 FP4 TP4
+          - GLM-5.2 FP4 TP4 MTP3
           - MiniMax-M3-MXFP4 TP4
           - MiniMax-M3-MXFP8 EAGLE3 TP4 MTP3
       model_mi308:
@@ -672,6 +673,7 @@ jobs:
               "GLM-5.2 FP8 TP4": "glm-5-2-fp8-tp4",
               "GLM-5.2 FP8 TP4 PCP2": "glm-5-2-fp8-tp4-pcp2",
               "GLM-5.2 FP4 TP4": "glm-5-2-fp4-tp4",
+              "GLM-5.2 FP4 TP4 MTP3": "glm-5-2-fp4-tp4-mtp3",
               "MiniMax-M3-MXFP4 TP4": "minimax-m3-mxfp4-tp4",
               "MiniMax-M3-MXFP8 EAGLE3 TP4 MTP3": "minimax-m3-mxfp8-eagle3-tp4-mtp3",
               "MI308 Qwen3.5-397B-A17B-FP8 TP4": "qwen3-5-397b-a17b-fp8-tp4-mi308",
@@ -704,6 +706,7 @@ jobs:
               "glm-5-2-fp8-tp4",
               "glm-5-2-fp8-tp4-pcp2",
               "glm-5-2-fp4-tp4",
+              "glm-5-2-fp4-tp4-mtp3",
               "minimax-m3-mxfp4-tp4",
           ]
           OOB_P1_PREFIX_ORDER = [

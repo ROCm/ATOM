@@ -8,7 +8,7 @@ Here is the support matrix for GLM-5.2 across different hardware platforms:
 
 | Hardware | Data Type | Model | Parallelism | MTP Support | Recipe Section |
 | --- | --- | --- | --- | --- | --- |
-| MI355 | FP4 | [amd/GLM-5.2-MXFP4](https://huggingface.co/amd/GLM-5.2-MXFP4) | TP4 | ✅ | [MI355 FP4](#mi355-fp4) |
+| MI355 | FP4 | [amd/GLM-5.2-MXFP4](https://huggingface.co/amd/GLM-5.2-MXFP4) | TP4 | ✅ | [MI355 FP4 MTP](#mi355-fp4-mtp) |
 | MI355 | FP8 | [zai-org/GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) | TP4 | ✅ | [MI355 FP8](#mi355-fp8) |
 | MI300X | FP8 | [zai-org/GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) | TP8 | ✅ | [MI300X / MI308X FP8](#mi300x-mi308x-fp8) |
 | MI308X | FP8 | [zai-org/GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) | TP8 | ✅ | [MI300X / MI308X FP8](#mi300x-mi308x-fp8) |
@@ -56,6 +56,53 @@ python3 -m sglang.launch_server \
     --kv-cache-dtype fp8_e4m3 \
     --model-loader-extra-config "${MODEL_LOADER_EXTRA_CONFIG}" \
     2>&1 | tee glm-server-mxfp4-tp4-sglang.log
+```
+
+<a id="mi355-fp4-mtp"></a>
+
+#### GLM-5.2 MXFP4 MTP3 Server
+
+GLM-5.2 uses its checkpoint MTP layers through SGLang EAGLE speculative decoding.
+
+```bash
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export AITER_USE_FLYDSL_MOE_SORTING=1
+export SGLANG_USE_AITER=1
+export SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
+export SGLANG_OPT_USE_TOPK_V2=false
+export ATOM_LOADER_NUM_THREADS=1 ATOM_REPLICATE_VOCAB_EMBED=1
+export ATOM_GLM52_MTP_FUSED_INPUT=1 ATOM_GLM52_MTP_WRAPPER_MODE=current
+export ATOM_SGLANG_V4_ENABLE_TARGET_VERIFY_CG=1
+export ATOM_SGLANG_V4_DISABLE_TARGET_VERIFY_CG=0
+export ATOM_SGLANG_V4_DISABLE_DRAFT_CG=0
+export ATOM_SGLANG_V4_ENABLE_DRAFT_EXTEND_CG=1
+export ATOM_SGLANG_V4_DISABLE_DRAFT_EXTEND_CG=0
+
+MODEL_PATH=amd/GLM-5.2-MXFP4
+TP=4
+MODEL_LOADER_EXTRA_CONFIG='{"online_quant_config":{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","*expert*"]}}'
+
+python3 -m sglang.launch_server \
+    --model-path "${MODEL_PATH}" \
+    --host localhost \
+    --port 8015 \
+    --trust-remote-code \
+    --tp-size "${TP}" \
+    --mem-fraction-static 0.8 \
+    --disable-radix-cache \
+    --max-running-requests 256 \
+    --cuda-graph-backend-decode full \
+    --cuda-graph-backend-prefill disabled \
+    --cuda-graph-max-bs-decode 256 \
+    --enable-return-hidden-states \
+    --kv-cache-dtype fp8_e4m3 \
+    --model-loader-extra-config "${MODEL_LOADER_EXTRA_CONFIG}" \
+    --speculative-algorithm EAGLE \
+    --speculative-draft-attention-backend aiter \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 4 \
+    2>&1 | tee glm-server-mxfp4-mtp3-tp4-sglang.log
 ```
 
 <a id="mi355-fp8"></a>
