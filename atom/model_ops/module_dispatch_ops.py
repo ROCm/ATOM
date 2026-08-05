@@ -43,13 +43,7 @@ from atom.utils.forward_context import get_current_cudagraph_runtime_mode
 # threshold from `envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD`.
 
 
-def maybe_dual_stream_forward(
-    hidden_states: torch.Tensor,
-    layer_name: str,
-) -> torch.Tensor:
-    self = get_current_atom_config().compilation_config.static_forward_context[
-        layer_name
-    ]
+def _dual_stream_now(self, hidden_states: torch.Tensor) -> bool:
     threshold = envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
     num_tokens = hidden_states.shape[0]
     # Under TBO the two micro-batches already overlap on separate threads
@@ -62,13 +56,22 @@ def maybe_dual_stream_forward(
     is_piecewise_cudagraph = (
         get_current_cudagraph_runtime_mode() == CUDAGraphMode.PIECEWISE
     )
-
-    if (
+    return (
         self._use_dual_stream
         and 0 < num_tokens <= threshold
         and not tbo_active()
         and not is_piecewise_cudagraph
-    ):
+    )
+
+
+def maybe_dual_stream_forward(
+    hidden_states: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    self = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    if _dual_stream_now(self, hidden_states):
         return self.dual_stream_moe_forward(hidden_states)
     return self.single_stream_moe_forward(hidden_states)
 
@@ -88,6 +91,56 @@ direct_register_custom_op(
     # functionalization pass into inserting defensive input clones.
     mutates_args=(),
     fake_impl=_maybe_dual_stream_forward_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+# Kimi-K3 variant: same dispatch, but the MoE hands its routed and shared
+# outputs back unsummed so the next layer's attn_res kernel can fold both into
+# its on-load. V2/V3.2/V4 still want the single-tensor op above.
+#
+# The return is a list, not a pair: infer_schema only understands Tensor,
+# Tensor[] and scalars, so `Tensor?` in a tuple is not expressible. Length is
+# 2 when the shared output is deferred and 1 when it is not — decided by
+# `defers_shared_add()`, which is config-only, so it is fixed for a given
+# module and both the fake impl and the caller can rely on it.
+#
+# Caller contract (additionally to the one above):
+#   - `single_stream_moe_forward` / `dual_stream_moe_forward` return
+#     `(routed, shared)`
+#   - `defers_shared_add() -> bool`
+
+
+def maybe_dual_stream_moe_pair(
+    hidden_states: torch.Tensor,
+    layer_name: str,
+) -> list[torch.Tensor]:
+    self = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    if _dual_stream_now(self, hidden_states):
+        routed, shared = self.dual_stream_moe_forward(hidden_states)
+    else:
+        routed, shared = self.single_stream_moe_forward(hidden_states)
+    return [routed] if shared is None else [routed, shared]
+
+
+def _maybe_dual_stream_moe_pair_fake(
+    hidden_states: torch.Tensor,
+    layer_name: str,
+) -> list[torch.Tensor]:
+    self = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    n = 2 if self.defers_shared_add() else 1
+    return [torch.empty_like(hidden_states) for _ in range(n)]
+
+
+direct_register_custom_op(
+    op_name="maybe_dual_stream_moe_pair",
+    op_func=maybe_dual_stream_moe_pair,
+    mutates_args=(),
+    fake_impl=_maybe_dual_stream_moe_pair_fake,
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
 
