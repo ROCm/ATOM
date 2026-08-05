@@ -6,7 +6,6 @@ from torch.profiler import record_function
 
 from atom.spec_decode.drafter import AuxCaptureSpec, Drafter
 from atom.spec_decode.dspark_verify import VerifyScheduler
-from atom.utils import envs
 from atom.utils.block_convert import kv_indices_generate_triton
 from atom.utils.forward_context import get_forward_context
 
@@ -331,11 +330,7 @@ class DSparkProposer(Drafter):
         # Not clamped by max_seqlen_q the way the V4 target clamps its own
         # swa_write — that was tried and measured worse (GSM8K 0.936/0.941 vs
         # 0.942-0.950), so the over-provisioned grid stays.
-        write_per_batch = (
-            int(attn_metadata.max_seqlen_q)
-            if envs.ATOM_SWA_FULL_RETAIN
-            else int(self.model.window_size) + int(self.mtp_k)
-        )
+        write_per_batch = int(self.model.window_size) + int(self.mtp_k)
         with record_function(f"dspark_ctx_kv[bs={bs} tok={main_hidden_all.shape[0]}]"):
             self.model.precompute_context_kv(
                 main_hidden_all,

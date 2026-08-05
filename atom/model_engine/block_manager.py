@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from collections import deque
+from math import inf, isinf
 
 import numpy as np
 import xxhash
@@ -15,10 +15,12 @@ from atom.distributed.kv_events import (
     BlockStored,
     KVCacheEvent,
 )
-from atom.model_engine.kv_block import Block
+from atom.model_engine.block_pool import BlockPool
+from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.sequence import Sequence
-from atom.model_engine.swa_pool import SlidingWindowPool
-from atom.utils import envs
+from atom.model_engine.state_cache import StateCache
+from atom.model_engine.state_pool import StateGroupPool, StateTransfer
+from atom.model_engine.swa_pool import SWA_POOL_CLASS, SlidingWindowPool
 
 
 def _make_block_stored(
@@ -61,11 +63,6 @@ class BlockManager:
         # entry maps to a virtual block of `block_size * dcp_world_size` global
         # tokens (see _hash_block_size). == block_size when DCP is off.
         self.hash_block_size = self.block_size * self.dcp_world_size
-        self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
-        self.hash_to_block_id: dict[int, int] = {}
-        self.free_block_ids: deque[int] = deque(range(num_blocks))
-        self.free_block_ids_set: set[int] = set(range(num_blocks))
-        self.used_block_ids: set[int] = set()
         self.enable_prefix_caching = config.enable_prefix_caching
 
         kv_events = getattr(config, "kv_events_config", None)
@@ -73,16 +70,55 @@ class BlockManager:
         self._event_log: list[KVCacheEvent] | None = (
             [] if self._events_enabled else None
         )
+        # The compressed KV blocks. Same class the sliding window uses for its
+        # own index space — hash eviction has to happen at the same moment in
+        # both or a prefix hit could be honoured by one pool and not the other.
+        self.kv = BlockPool(num_blocks, on_evict=self._record_evicted)
         # Per-request cache slot pool. Used by attention types with a
         # stateful per-request buffer (GDN recurrent state, V4 compressor
         # state). The backing tensor is pre-allocated by ModelRunner sized
         # to max_num_seqs and excluded from `num_kvcache_blocks` at sizing
         # time, so admission only needs a free slot index from this list.
-        # Each slot group contains slots_per_req() contiguous tensor indices
-        # (1 for stateless / + num_spec for spec-decoding-aware variants).
-        num_per_req_cache_groups: int = getattr(config, "num_per_req_cache_groups", 0)
-        self.free_per_req_cache_groups: list[int] = list(
-            range(num_per_req_cache_groups)
+        # Sizing published `entries` per cache class plus the per-request
+        # multiplicity the declaring backend asked for (1 for a single
+        # committed state, + num_spec where a rollback slot per speculated
+        # token is kept). One group is what a single request occupies, i.e.
+        # `entries // entries_per_req` contiguous tensor indices.
+        pool_entries: dict = getattr(config, "pool_entries", None) or {}
+        pool_per_req: dict = getattr(config, "pool_entries_per_req", None) or {}
+        state_entries = int(pool_entries.get(STATE_SLOT_CLASS, 0))
+        state_per_req = int(pool_per_req.get(STATE_SLOT_CLASS, 1)) or 1
+        # Total capacity, kept so callers can tell "all slots busy" (transient)
+        # from "no slots were ever created" (permanent).
+        self.num_per_req_cache_groups = state_entries // state_per_req
+        # Tokens between rungs of the checkpoint ladder, shared by every
+        # Pool.STATE class (--state-checkpoint-interval-tokens).
+        self.state_checkpoint_interval_tokens = max(
+            0, int(getattr(config, "state_checkpoint_interval_tokens", 0) or 0)
+        )
+        # The rolling state class: per-request groups plus a content index over
+        # the free ones. A checkpoint IS a free group whose content is still
+        # valid, so it holds no capacity of its own and never blocks admission.
+        self.state = StateGroupPool(
+            self.num_per_req_cache_groups,
+            transfer=StateTransfer.from_config(
+                getattr(config, "state_transfer_kind", "none") or "none",
+                int(getattr(config, "state_fork_tokens", 0) or 0),
+            ),
+            hash_block_size=self.hash_block_size,
+            enabled=self.enable_prefix_caching,
+        )
+        # A checkpoint is filed under the content hash of the last block it
+        # covers, so a rung that isn't a hash-block boundary can never be looked
+        # up — the ladder would checkpoint into a void.
+        assert not (
+            self.state.enabled
+            and self.state_checkpoint_interval_tokens
+            and self.state_checkpoint_interval_tokens % self.hash_block_size
+        ), (
+            f"--state-checkpoint-interval-tokens="
+            f"{self.state_checkpoint_interval_tokens} must be a multiple of the "
+            f"prefix-cache hash block size {self.hash_block_size}"
         )
 
         # Sliding-window KV pool (DeepSeek-V4). A separate content-addressed pool
@@ -93,16 +129,27 @@ class BlockManager:
         # byte-identical. See atom/model_engine/swa_pool.py.
         _spec = getattr(config, "speculative_config", None)
         _mtp_k = int(getattr(_spec, "num_speculative_tokens", 0) or 0) if _spec else 0
-        self.swa = SlidingWindowPool(
-            num_blocks=getattr(config, "num_swa_blocks", 0),
-            window=getattr(config, "swa_window_size", 0),
-            block_size=block_size,
-            max_num_batched_tokens=getattr(config, "max_num_batched_tokens", 0),
-            mtp_k=_mtp_k,
-            full_retain=envs.ATOM_SWA_FULL_RETAIN,
-            retention_interval=envs.ATOM_SWA_RETENTION_INTERVAL,
-            checkpoint_frac=envs.ATOM_SWA_CHECKPOINT_FRAC,
+        _swa_blocks = int(pool_entries.get(SWA_POOL_CLASS, 0))
+        _window = int(
+            getattr(getattr(config, "hf_config", None), "sliding_window", 0) or 0
         )
+        # A backend only declares the SWA class for a windowed architecture, so
+        # the window has to be in hf_config. Fail here rather than let the pool
+        # come up enabled with window=0, which frees every block immediately.
+        assert not _swa_blocks or _window > 0, (
+            f"sub-pool {SWA_POOL_CLASS!r} was sized to {_swa_blocks} blocks but "
+            "hf_config has no sliding_window"
+        )
+        self.swa = SlidingWindowPool(
+            num_blocks=_swa_blocks,
+            window=_window if _swa_blocks else 0,
+            block_size=block_size,
+            mtp_k=_mtp_k,
+        )
+        # Every Pool.STATE class. Order is a performance detail only: both
+        # `_gated_hit` and the ladder treat the classes as a set, so the answer
+        # is the same whichever one speaks first.
+        self.state_caches: tuple[StateCache, ...] = (self.swa, self.state)
 
     @property
     def swa_enabled(self) -> bool:
@@ -116,36 +163,36 @@ class BlockManager:
         h.update(np.array(token_ids).tobytes())
         return h.intdigest()
 
-    def _pop_free_block(self) -> int:
-        """Pop the next available free block id from the FIFO queue (lazy cleanup)."""
-        while self.free_block_ids:
-            block_id = self.free_block_ids.popleft()
-            if block_id in self.free_block_ids_set:
-                self.free_block_ids_set.discard(block_id)
-                return block_id
-        raise AssertionError("No free blocks available")
+    def release_state_pins(self) -> None:
+        """Return the previous step's resume sources to the free list.
 
-    def _allocate_block(self, block_id: int) -> Block:
-        block = self.blocks[block_id]
-        assert block.ref_count == 0
-        # Evict stale hash entry before resetting. ATOM's eviction is lazy:
-        # blocks sit in the free queue with their hash intact until the slot
-        # is re-allocated, so this point — not `deallocate()` — is the true
-        # eviction event.
-        if block.hash != -1 and self.hash_to_block_id.get(block.hash) == block_id:
-            del self.hash_to_block_id[block.hash]
-            if self._event_log is not None:
-                self._event_log.append(_make_block_removed([block.hash]))
-        block.reset()
-        self.free_block_ids_set.discard(block_id)
-        self.used_block_ids.add(block_id)
-        return self.blocks[block_id]
+        Called once per engine step before scheduling. A source is read by the
+        forward that was already issued when it is handed out again — read
+        directly under a fork, copied out of under a copy — and the next owner's
+        forward is issued after that one on the same stream, so stream ordering
+        covers the overlap either way.
+        """
+        self.state.release_pins()
 
-    def _deallocate_block(self, block_id: int):
-        assert self.blocks[block_id].ref_count == 0
-        self.used_block_ids.remove(block_id)
-        self.free_block_ids.append(block_id)
-        self.free_block_ids_set.add(block_id)
+    def state_copies_for_batch(self) -> list[tuple[int, int]]:
+        """State copies the batch now being built has to issue before its
+        forward — checkpoints being kept and checkpoints being resumed from.
+
+        Must be called with the batch already decided; see
+        `StateGroupPool.take_copies`. Always empty for a forking backend.
+        """
+        return self.state.take_copies()
+
+    def _record_evicted(self, h: int) -> None:
+        """Report a hash the pool just dropped, as a KV event."""
+        if self._event_log is not None:
+            self._event_log.append(_make_block_removed([h]))
+
+    def _fresh_block(self) -> int:
+        """Take a block for content this step is about to compute."""
+        block_id = self.kv.pop()
+        self.kv.allocate(block_id)
+        return block_id
 
     def _dcp_num_blocks(self, seq_len: int) -> int:
         if self.dcp_world_size <= 1:
@@ -178,6 +225,53 @@ class BlockManager:
         hbs = self.hash_block_size
         return seq.token_ids[i * hbs : (i + 1) * hbs]
 
+    def _gated_hit(
+        self,
+        seq: Sequence,
+        compressed_hit: int,
+        block_hashes: list[int],
+        assume_checkpointed: bool = False,
+    ) -> int:
+        """Rightmost boundary every Pool.STATE class can resume from.
+
+        Each class answers "the rightmost boundary <= X that I accept", and no
+        class is monotone in another's answer, so they cannot be applied in
+        series: the largest SWA-complete boundary need not carry a state
+        checkpoint, and walking back to one that does can land on a boundary
+        whose trailing SWA window is gone. `allocate` then calls
+        `swa.claim_cached` for a hash the SWA pool never promised — which is
+        exactly the guarantee that method's docstring asks the caller for.
+
+        So run to a fixpoint: keep passing the candidate around the classes
+        until a full round changes nothing. Every answer is <= its input, so
+        each round either terminates or strictly decreases; 0 is absorbing.
+        Classes that do not apply are the identity, so a build with one class
+        settles on the first round.
+
+        `assume_checkpointed` passes straight through to every class, giving the
+        joint counterfactual: not "the answer minus one class's gate" but "the
+        answer if every ladder were dense". A boundary the other classes decline
+        anyway is one no checkpoint would rescue.
+        """
+        boundary = compressed_hit
+        while boundary > 0:
+            settled = True
+            for cache in self.state_caches:
+                accepted = cache.resumable_hit(
+                    seq,
+                    boundary,
+                    block_hashes,
+                    assume_checkpointed=assume_checkpointed,
+                )
+                if accepted != boundary:
+                    boundary = accepted
+                    settled = False
+                    if boundary == 0:
+                        return 0
+            if settled:
+                break
+        return boundary
+
     def can_allocate(self, seq: Sequence) -> int:
         """Return number of cache-hit blocks (>=0) if seq fits, else -1.
 
@@ -194,10 +288,10 @@ class BlockManager:
         # State cache (mamba / V4 compressor ring) has its own pre-allocated
         # tensor; admission only needs a free slot index, not extra paged
         # blocks. See `allocate()` for the budget reasoning.
-        if seq.has_per_req_cache and not self.free_per_req_cache_groups:
+        if seq.has_per_req_cache and not self.state.has_free():
             return -1
         if not self.enable_prefix_caching:
-            if len(self.free_block_ids_set) < self._dcp_num_blocks(len(seq)):
+            if not self.kv.has_free(self._dcp_num_blocks(len(seq))):
                 return -1
             # SWA admission: only the per-request windowed peak (filled
             # incrementally + window-freed), not the whole prompt. No-op / True
@@ -214,8 +308,8 @@ class BlockManager:
         for i in range(self._n_hash_blocks(seq) - 1):
             token_ids = self._hash_block_tokens(seq, i)
             h = self.compute_hash(token_ids, h)
-            block_id = self.hash_to_block_id.get(h, -1)
-            if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
+            block_id = self.kv.lookup(h)
+            if block_id == -1 or self.kv.block(block_id).token_ids != token_ids:
                 break
             block_hashes.append(h)
             compressed_hit += 1
@@ -225,19 +319,31 @@ class BlockManager:
         # SlidingWindowManager; simple-hybrid one pass). Reduces compressed_hit
         # → num_cached_blocks so we never reuse a block whose in-window SWA is
         # gone (#1417), while out-of-window front blocks (SWA-freed) don't block
-        # the hit.
-        num_cached_blocks = self.swa.bounded_hit(seq, compressed_hit, block_hashes)
-        # Instrumentation: record the pre-gate compressed hit so CacheStats can
-        # separate reuse lost to the SWA tail gate (compressed_hit -
-        # num_cached_blocks) from reuse lost to compressed eviction.
+        # the hit —
+        # plus step 3, the per-request state: neither the SSM recurrent state nor
+        # the V4 compressor ring can be rebuilt from cached blocks — the cache
+        # holds the compressor's output, the state is its rolling input window —
+        # so a boundary is only resumable where somebody checkpointed the state.
+        # `_gated_hit` settles the two gates jointly; neither can be applied to
+        # the other's answer.
+        num_cached_blocks = self._gated_hit(seq, compressed_hit, block_hashes)
+        # Instrumentation: the pre-gate hit, so CacheStats can separate reuse
+        # the gates declined (compressed_hit - num_cached_blocks) from reuse
+        # lost to compressed eviction (everything above compressed_hit).
         seq.num_compressed_hit_blocks = compressed_hit
+        self._record_checkpoint_demand(
+            seq,
+            hit=num_cached_blocks,
+            compressed_hit=compressed_hit,
+            block_hashes=block_hashes,
+        )
         # Free-pool demand: blocks we actually reuse minus those already used
         # (shared ref); blocks we drop from the hit become fresh → counted.
         num_new_blocks = self._n_hash_blocks(seq)
         for i in range(num_cached_blocks):
-            if self.hash_to_block_id[block_hashes[i]] in self.used_block_ids:
+            if self.kv.is_used(self.kv.lookup(block_hashes[i])):
                 num_new_blocks -= 1
-        if len(self.free_block_ids_set) < num_new_blocks:
+        if not self.kv.has_free(num_new_blocks):
             return -1
         # SWA new-block demand is bounded by the windowed peak (filled
         # incrementally + window-freed), not the full new-block count. No-op /
@@ -272,27 +378,15 @@ class BlockManager:
         for i in range(num_cached_blocks):
             token_ids = self._hash_block_tokens(seq, i)
             h = self.compute_hash(token_ids, h)
-            block_id = self.hash_to_block_id[h]
-            block = self.blocks[block_id]
-            if block_id in self.used_block_ids:
-                block.ref_count += 1
-            else:
-                # Cache hit on a free-pool block — claim without _allocate_block
-                # (whose reset() would evict the hash entry and destroy the
-                # cache for everyone).
-                assert block.ref_count == 0
-                block.ref_count = 1
-                self.free_block_ids_set.discard(block_id)
-                self.used_block_ids.add(block_id)
+            block_id = self.kv.lookup(h)
+            self.kv.claim(block_id)
             seq.block_table.append(block_id)
             if i < swa_hit_start:
                 self.swa.alloc_placeholder(seq)  # out of window: never read → -1
             else:
                 self.swa.claim_cached(seq, h, token_ids)  # trailing window: reuse
         for _ in range(num_cached_blocks, self._dcp_num_blocks(len(seq))):
-            block_id = self._pop_free_block()
-            self._allocate_block(block_id)
-            seq.block_table.append(block_id)
+            seq.block_table.append(self._fresh_block())
             # Uncached blocks: -1 placeholder keeps swa_block_table the same
             # length as block_table; ensure_for_tokens fills the current chunk's
             # window slots before each forward, free_after_prefill_chunk releases
@@ -301,17 +395,70 @@ class BlockManager:
         seq.num_cached_tokens = num_cached_blocks * self._hash_block_size()
 
         # Per-request cache: claim one slot index from the pre-allocated
-        # state tensor (e.g. GDN mamba_k_cache, V4 compressor state + SWA
-        # ring). The state tensor's memory was already excluded from
-        # `num_kvcache_blocks` in ModelRunner._compute_kv_budget(), so
-        # admitting a seq adds no further paged-block cost. The slot cap
-        # (`free_per_req_cache_groups` size = `max_num_seqs`) is the sole
+        # state tensor (e.g. GDN mamba_k_cache, the V4 compressor ring). The
+        # state class took its bytes before the paged class was sized in
+        # ModelRunner.get_num_blocks(), so admitting a seq adds no further
+        # paged-block cost. The slot cap
+        # (the state pool's free list, size = `max_num_seqs`) is the sole
         # admission bound for state cache.
         if seq.has_per_req_cache:
-            seq.per_req_cache_group = self.free_per_req_cache_groups.pop()
+            self._attach_state_group(seq, h if num_cached_blocks > 0 else -1)
+
+    def _attach_state_group(self, seq: Sequence, hit_hash: int) -> None:
+        """Give `seq` a state group, resuming from a checkpoint when one exists.
+
+        `hit_hash` is the content hash of the last reused block (-1 for a cold
+        start). `can_allocate` already shrank the hit to a boundary that carries
+        a checkpoint, so a lookup miss here just means the pool is off.
+
+        Resuming shares: the checkpoint stays indexed and the request gets a
+        group of its own, so a second request hitting the same prefix still
+        finds it. How the state reaches that group is the backend's
+        `StateTransfer` — a fork reads the checkpoint for one forward, a copy is
+        handed the bytes — and the two differ by one line here. When no second
+        group is free the request adopts the checkpoint instead: still correct,
+        the state is exactly the one it wanted, it just spends the checkpoint
+        rather than sharing it, and under either mechanism it needs nothing.
+
+        A checkpoint is read-only, so several requests in one step may resume
+        off the same one. The first takes it off the free list and the pin
+        covers every reader until `release_state_pins`; a later one in that same
+        step finds it already pinned and only needs a group to write into.
+        Adopting is then off the table — the pin means someone else's forward
+        still has to read it, or copy out of it.
+        """
+        src = self.state.lookup(hit_hash) if hit_hash != -1 else -1
+        if src < 0:
+            seq.per_req_cache_group = self.state.pop()
+            seq.state_fork_src = -1
+            return
+        shared = self.state.is_pinned(src)
+        if not shared:
+            self.state.claim(src)
+        if self.state.has_free():
+            dst = self.state.pop()
+            seq.per_req_cache_group = dst
+            if self.state.transfer.copies:
+                self.state.record_copy(src, dst)
+            else:
+                seq.state_fork_src = src
+            # Held off the free list until the forward that reads it is issued.
+            self.state.pin(src)
+            return
+        # `can_allocate` admitted this seq against a non-empty free list and
+        # nothing else has run since, so the list can only be empty here if this
+        # seq itself just took the last group — which is `src`, unshared.
+        assert not shared, "no group to resume into and the source is being read"
+        self.state.invalidate(src)
+        seq.per_req_cache_group = src
+        seq.state_fork_src = -1
 
     def hash_blocks(
-        self, seq: Sequence, num_new_tokens: int, start_tokens: int | None = None
+        self,
+        seq: Sequence,
+        num_new_tokens: int,
+        start_tokens: int | None = None,
+        next_forward_tokens: int | None = None,
     ) -> None:
         """Register hashes for blocks finalized by the most recent step.
 
@@ -327,6 +474,9 @@ class BlockManager:
         `start_tokens` overrides the token offset the range starts at. Pipeline-
         parallel schedule-time advancement already bumped seq.num_cached_tokens
         past this chunk, so the head passes the chunk's pre-advance offset here.
+
+        `next_forward_tokens` reaches `checkpointers_at`; see there. Left
+        unset it reads the prompt's remainder, which is the prefill answer.
         """
         if not self.enable_prefix_caching:
             return
@@ -336,17 +486,18 @@ class BlockManager:
         end = (base + num_new_tokens) // hbs
         if start >= end:
             return
-        h = self.blocks[seq.block_table[start - 1]].hash if start > 0 else -1
+        # Watermark for the decode-side continuation, maintained here so every
+        # prefill path feeds it without knowing about it.
+        seq.num_hashed_tokens = max(seq.num_hashed_tokens, end * hbs)
+        h = self.kv.block(seq.block_table[start - 1]).hash if start > 0 else -1
         record = self._event_log is not None
         store_run_parent: int | None = h if h != -1 else None
         store_run_hashes: list[int] = []
         store_run_tokens: list[int] = []
         for i in range(start, end):
-            block = self.blocks[seq.block_table[i]]
             token_ids = self._hash_block_tokens(seq, i)
             h = self.compute_hash(token_ids, h)
-            block.update(h, token_ids)
-            self.hash_to_block_id[h] = block.block_id
+            self.kv.publish(seq.block_table[i], h, token_ids)
             # Publish the parallel SWA block under the same content hash so
             # cross-request hits can reuse its sliding-window KV (no-op when SWA
             # disabled or the slot is a -1 window-freed sentinel).
@@ -363,21 +514,237 @@ class BlockManager:
                     self.block_size,
                 )
             )
+        for cache in self.checkpointers_at(
+            seq, base + num_new_tokens, next_forward_tokens
+        ):
+            cache.checkpoint(seq, end, h)
+
+    def hash_decode_blocks(
+        self, seq: Sequence, committed_kv_len: int, next_forward_tokens: int = 0
+    ) -> None:
+        """Register hashes for generated blocks filled up to `committed_kv_len`.
+
+        `may_append` allocates decode blocks without hashing them: at allocation
+        time their tokens have not been sampled, and under speculative decoding
+        part of what the forward writes is about to be rejected.
+
+        `committed_kv_len` counts the tokens for which neither still applies —
+        id final, KV computed — and is a hard line, not a hint. It stops short
+        of any token no forward has read yet: that token's KV slot is written
+        by the next forward, and a block published over an unwritten slot hands
+        a later request KV that may never arrive at all (the seq can finish
+        first). Prefill's `hash_blocks` draws the same line from its own side,
+        at `num_cached_tokens + chunk`.
+
+        Without this the prefix cache indexes prompt blocks only, and a
+        follow-up turn — previous prompt plus previous answer — matches nothing
+        beyond the original prompt.
+
+        `next_forward_tokens` reaches `checkpointers_at`; see there. It
+        defaults to "no next forward", i.e. hash but never checkpoint, so a
+        caller opts into decode-point checkpointing rather than out of it.
+        """
+        if not self.enable_prefix_caching:
+            return
+        base = seq.num_hashed_tokens
+        if committed_kv_len > base:
+            self.hash_blocks(
+                seq,
+                committed_kv_len - base,
+                start_tokens=base,
+                next_forward_tokens=next_forward_tokens,
+            )
+
+    def cancel_state_fork(self, seq: Sequence) -> bool:
+        """Undo a pending fork by adopting its source group.
+
+        Called when the forward that was going to carry the fork turns out too
+        short to fill a fresh group (`min_fork_tokens`). Both flavours collapse
+        to the same move — take the source over and spend its checkpoint:
+        a resume becomes the non-sharing hit, a checkpoint becomes no
+        checkpoint at all.
+
+        Returns False when the source cannot be taken over because another
+        request in this same step forks off it too: adopting means writing into
+        a group that request's forward still has to read. The caller keeps the
+        fork instead and must not shorten the forward below `min_fork_tokens`.
+        """
+        src = seq.state_fork_src
+        if src < 0:
+            return True
+        if self.state.pin_count(src) > 1:
+            return False
+        self.state.release(seq.per_req_cache_group)
+        self.state.invalidate(src)
+        if self.state.is_pinned(src):
+            self.state.unpin(src)  # resume source: was held off the free list
+        else:
+            self.state.claim(src)  # checkpoint source: was handed back
+        seq.per_req_cache_group = src
+        seq.state_fork_src = -1
+        return True
+
+    def checkpoint_limit(self, seq: Sequence) -> int:
+        """Rightmost prompt position any state class may checkpoint at, 0 none.
+
+        `checkpointers_at` solved for prefill: the last rung of the ladder that
+        still leaves the widest-reaching class its `successor_room` of prompt to
+        forward. Kept as its own method because the scheduler needs the bound up
+        front, to cut prefill chunks so they land on the ladder.
+
+        0 means this seq checkpoints nothing off its prompt — including every
+        prompt shorter than one interval, which is the point: a workload whose
+        prompts all fit under the interval pays nothing for a feature it would
+        never hit.
+        """
+        interval = self.state_checkpoint_interval_tokens
+        if interval <= 0:
+            return 0
+        # The smallest room reaches furthest right, and `inf` — no class can
+        # checkpoint this seq at all — falls out as 0 without a special case.
+        room = min(
+            (c.successor_room for c in self.state_caches if c.applies(seq)),
+            default=inf,
+        )
+        if isinf(room):
+            return 0
+        return max(int((seq.num_prompt_tokens - room) // interval) * interval, 0)
+
+    def _record_checkpoint_demand(
+        self, seq: Sequence, hit: int, compressed_hit: int, block_hashes: list[int]
+    ) -> None:
+        """Ask the hit counterfactually, and turn the gap into a rung.
+
+        Whenever the gates cut a hit short, the same question is worth asking a
+        second time with every ladder dense: how far would it have reached? What
+        that recovers is reuse being declined only because nobody checkpointed
+        there. What it does not recover is gone whatever anybody stores. The two
+        land in `num_wanted_hit_blocks` (which `CacheStats` splits the declined
+        reuse by) and `checkpoint_demand_pos` (which the ladder acts on).
+
+        The demand is a rung of this seq's own, off the interval grid, and the
+        seq that found the gap is the one best placed to fill it: it collects
+        none of that reuse and has to compute the prefix regardless.
+
+        Decided here, with both numbers in hand, rather than by the readers:
+        `hit` survives only as `seq.num_cached_tokens`, which the scheduler
+        advances as chunks land — under pipeline parallelism it is already past
+        this chunk by the time `hash_blocks` runs, so a reader comparing against
+        it would drop the demand on exactly the forward that was cut for it.
+
+        Demand under one interval is dropped, which is what keeps the property
+        `checkpoint_limit` states. The position satisfies
+        `num_prompt_tokens - pos >= successor_room` by construction, so one
+        interval of demand implies `checkpoint_limit > 0`: a workload keeping no
+        checkpoints today gains no chunk cuts from this, not one. It also
+        filters the shape where a shared prefix is a template header and every
+        checkpoint is invalidated by the next admission — there each request
+        would pay for a cut and none would collect.
+        """
+        wanted = (
+            self._gated_hit(seq, compressed_hit, block_hashes, assume_checkpointed=True)
+            if hit < compressed_hit
+            else hit
+        )
+        interval = self.state_checkpoint_interval_tokens
+        pos = wanted * self.hash_block_size
+        seq.num_wanted_hit_blocks = wanted
+        seq.checkpoint_demand_pos = (
+            pos if interval and pos >= interval and wanted > hit else 0
+        )
+
+    def checkpoint_cut(self, seq: Sequence, start: int, end: int) -> int:
+        """Latest ladder position in `(start, end]`, or 0 if there is none.
+
+        What a prefill chunk is cut at so its forward lands exactly on a rung.
+        The counterpart of `checkpointers_at`, which decides what a forward
+        ending there keeps: the two have to agree position for position, so the
+        grid arithmetic lives here rather than at the scheduler's call site.
+        """
+        limit = self.checkpoint_limit(seq)
+        if not limit:
+            return 0
+        # `limit` is itself a multiple of the interval, so a chunk cut at it
+        # needs no special case.
+        rung = min(end, limit)
+        rung -= rung % self.state_checkpoint_interval_tokens
+        # A demand is not capped by `limit`: `limit` is the last position on the
+        # *grid* that leaves the widest class its room, and a demand carries
+        # that room by construction — it can sit to the right of the last rung.
+        demand = seq.checkpoint_demand_pos
+        target = max(rung, demand if demand <= end else 0)
+        return target if target > start else 0
+
+    def checkpointers_at(
+        self, seq: Sequence, pos: int, next_forward_tokens: int | None = None
+    ) -> list[StateCache]:
+        """State classes that should keep a checkpoint at `pos`, in class order.
+
+        A ladder of resume points, one every `state_checkpoint_interval_tokens`
+        of context, shared by every class. Keeping one is capacity-neutral for a
+        rolling class (the group handed away is replaced from the free list) and
+        capacity-bounded for an immutable one (an LRU-capped pin), but either
+        way it costs the *keeper* an extra forward — its prompt gets cut at the
+        rung — so the interval is what keeps that cost amortized instead of
+        per-request.
+
+        `next_forward_tokens` is how many tokens the forward right after this
+        one carries, and is what each class's `successor_room` is compared
+        against. Unset means the prompt's remainder, the prefill answer; decode
+        passes one. Everything else follows from that one number — a class
+        needing a long hand-over (V4's ring, 131) simply never qualifies
+        mid-generation, one that hands nothing over (a retaining SWA pool, 0)
+        always does, one that cannot keep a checkpoint at all (`inf`) never
+        does, and a request stopping on this step passes 0 and keeps nothing
+        that nothing will ever resume from.
+
+        The position must be exact. A checkpoint holds state as of the forward's
+        last token, so a forward that overshoots a rung is ahead of the hash it
+        would be filed under; the scheduler cuts prefill chunks to land here,
+        and a path that doesn't simply keeps nothing.
+
+        On top of the grid sits at most one rung of this seq's own,
+        `checkpoint_demand_pos` — a boundary this seq was denied for want of a
+        checkpoint (`_record_checkpoint_demand`). `checkpoint_cut` reads the
+        same field, so the cut and the keep cannot drift apart.
+        """
+        interval = self.state_checkpoint_interval_tokens
+        if interval <= 0 or pos <= 0:
+            return []
+        if pos % interval and pos != seq.checkpoint_demand_pos:
+            return []
+        if next_forward_tokens is None:
+            next_forward_tokens = seq.num_prompt_tokens - pos
+        return [
+            c
+            for c in self.state_caches
+            if c.applies(seq) and next_forward_tokens >= c.successor_room
+        ]
 
     def deallocate(self, seq: Sequence):
         for block_id in reversed(seq.block_table):
-            block = self.blocks[block_id]
-            block.ref_count -= 1
-            if block.ref_count == 0:
-                self._deallocate_block(block_id)
+            self.kv.free(block_id)
         self.swa.release(
             seq
         )  # release SWA blocks + clear swa_block_table (no-op if disabled)
         seq.num_cached_tokens = 0
+        # The block table is gone, so nothing of this seq is hashed any more.
+        # Covers preemption too, which frees through here and re-prefills.
+        seq.num_hashed_tokens = 0
+        # Likewise the demand: it describes one admission against one cache
+        # state, and a re-admitted seq gets a fresh answer from `can_allocate`.
+        seq.checkpoint_demand_pos = 0
+        # An uncommitted checkpoint describes state in a group that is about to
+        # go back on the free list, so the intent dies with it.
+        self.state.forget_pending(seq)
         seq.block_table.clear()
         if seq.has_per_req_cache and seq.per_req_cache_group >= 0:
-            self.free_per_req_cache_groups.append(seq.per_req_cache_group)
+            # Only the group the seq was writing. A checkpoint it took is
+            # already back on the free list under the state index, and a fork
+            # source it borrowed is returned by `release_state_pins`.
+            self.state.release(seq.per_req_cache_group)
             seq.per_req_cache_group = -1
+            seq.state_fork_src = -1
 
     def can_append(self, seq: Sequence, num_new_tokens: int = 1) -> bool:
         seq_len = len(seq)
@@ -385,11 +752,10 @@ class BlockManager:
         ebs = self._effective_block_size()
         needed_blocks = (seq_len + num_new_tokens + ebs - 1) // ebs
         new_blocks_needed = max(0, needed_blocks - current_blocks)
-        if len(self.free_block_ids_set) < new_blocks_needed:
-            return False
-        if not self.swa.has_free(new_blocks_needed):  # True when SWA disabled
-            return False
-        return True
+        # `swa.has_free` is True when the sliding window is disabled.
+        return self.kv.has_free(new_blocks_needed) and self.swa.has_free(
+            new_blocks_needed
+        )
 
     def may_append(self, seq: Sequence, num_new_tokens: int = 1):
         # Note: in disaggregated (P/D) mode the scheduler skips this call on
@@ -407,9 +773,7 @@ class BlockManager:
                 # Decode-generated blocks: token not finalized yet (depends on
                 # sampling / speculative verification), so we cannot compute a
                 # correct hash here.  Just allocate the block without hashing.
-                block_id = self._pop_free_block()
-                self._allocate_block(block_id)
-                block_table.append(block_id)
+                block_table.append(self._fresh_block())
                 self.swa.append_new(seq)  # lockstep SWA block (no-op if disabled)
         # Reclaim SWA blocks that just fell out of the window (no-op if disabled).
         self.swa.free_out_of_window(seq, len(seq))
@@ -428,11 +792,7 @@ class BlockManager:
         admin APIs. Does NOT touch blocks currently held by live sequences —
         they remain valid via their block_table refs, just unhashable for
         future requests."""
-        self.hash_to_block_id.clear()
-        for block in self.blocks:
-            if block.ref_count == 0:
-                block.hash = -1
-                block.token_ids = []
+        self.kv.clear_index()
         if self._event_log is not None:
             self._event_log.append(_make_all_cleared())
 
