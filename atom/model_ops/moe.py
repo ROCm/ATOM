@@ -27,6 +27,7 @@ from atom.config import (
     Config,
     QuantizationConfig,
     get_current_atom_config,
+    parse_fake_eplb_layout,
 )
 from atom.model_loader.weight_utils import set_weight_attrs
 from atom.model_ops.base_config import QuantizeMethodBase
@@ -163,6 +164,52 @@ def init_balance_router_logits(
         j = torch.arange(topk, device=device).unsqueeze(0)
         p = t.unsqueeze(1) * topk + j
         expert_ids = (p % ep_size) * L + (p // ep_size) % L  # (T, topk)
+
+    router_logits = torch.full(
+        (max_num_tokens, E), -_FAKE_EPLB_LOGIT, dtype=dtype, device=device
+    )
+    router_logits.scatter_(1, expert_ids, _FAKE_EPLB_LOGIT)
+    return router_logits
+
+
+@lru_cache(maxsize=1)
+def init_block_router_logits(
+    n_routed_experts: int,
+    topk: int,
+    ep_size: int,
+    block_size: int = 16,
+    dtype: torch.dtype = torch.bfloat16,
+    max_num_tokens: int = 32768,
+):
+    """Synthetic logits that send whole runs of rows to one EP rank.
+
+    The ring spreads a token's choices over `topk` ranks, which is what a real
+    router does however well balanced it is. This walks runs of `block_size`
+    rows round-robin over the ranks instead, so a row is dispatched once rather
+    than `topk` times. Per-rank and per-expert counts are unchanged; only
+    locality is -- an upper bound on balance *plus* locality, which no real
+    router reaches.
+
+    Rank and index-within-rank are functions of the row number alone, so like
+    the ring this is one table that callers slice.
+
+    `block_size` sets the smallest batch that still comes out even: counts are
+    equal once the batch is a multiple of `block_size * ep_size`, and below
+    that the last ranks get nothing. Lower it for short decode steps.
+    """
+    device = "cuda"
+    E = n_routed_experts
+    L = max(1, E // ep_size)  # experts per rank
+    cycle = block_size * ep_size
+    i = torch.arange(max_num_tokens, device=device)
+    # Rank owning this row, and its index within that rank's own stream of
+    # rows. The ring then walks that rank's L experts, so the rows it receives
+    # spread evenly over them.
+    rank = (i // block_size) % ep_size
+    rank_idx = (i // cycle) * block_size + (i % block_size)
+    j = torch.arange(topk, device=device).unsqueeze(0)
+    p = rank_idx.unsqueeze(1) * topk + j
+    expert_ids = rank.unsqueeze(1) * L + p % L
 
     router_logits = torch.full(
         (max_num_tokens, E), -_FAKE_EPLB_LOGIT, dtype=dtype, device=device
@@ -2761,21 +2808,39 @@ class FusedMoE(torch.nn.Module):
         # when DP-attention actually shards tokens per DP group; otherwise every
         # device sees the same tokens and must share one table (dp_size=1).
         _dp_shard = self.use_ep and atom_config.enable_dp_attention
-        self.balance_router_logits = (
-            init_balance_router_logits(
-                self.global_num_experts,
-                top_k,
-                self.ep_size if self.use_ep else 1,
-                self.dp_size if _dp_shard else 1,
-                self.dp_rank if _dp_shard else 0,
-                (self.num_expert_group or 1) if self.use_grouped_topk else 1,
-                (self.topk_group or 1) if self.use_grouped_topk else 1,
-                torch.get_default_dtype(),
-                atom_config.max_num_batched_tokens,
-            )
-            if atom_config.fake_eplb
-            else None
+        _layout, _block = parse_fake_eplb_layout(
+            getattr(atom_config, "fake_eplb_layout", "ring")
         )
+        if _layout == "block" and atom_config.fake_eplb and self.use_grouped_topk:
+            raise ValueError(
+                "--fake-eplb-layout block does not support group-limited "
+                "routing: a run confined to one EP rank's experts cannot also "
+                "satisfy the top-k group mask."
+            )
+        # Either layout is one table that forward slices to the batch.
+        self.balance_router_logits = None
+        if atom_config.fake_eplb:
+            if _layout == "block":
+                self.balance_router_logits = init_block_router_logits(
+                    self.global_num_experts,
+                    top_k,
+                    self.ep_size if self.use_ep else 1,
+                    _block,
+                    torch.get_default_dtype(),
+                    atom_config.max_num_batched_tokens,
+                )
+            else:
+                self.balance_router_logits = init_balance_router_logits(
+                    self.global_num_experts,
+                    top_k,
+                    self.ep_size if self.use_ep else 1,
+                    self.dp_size if _dp_shard else 1,
+                    self.dp_rank if _dp_shard else 0,
+                    (self.num_expert_group or 1) if self.use_grouped_topk else 1,
+                    (self.topk_group or 1) if self.use_grouped_topk else 1,
+                    torch.get_default_dtype(),
+                    atom_config.max_num_batched_tokens,
+                )
 
     def process_weights_after_loading(self):
         self._online_quant()
