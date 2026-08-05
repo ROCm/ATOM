@@ -441,8 +441,6 @@ jobs:
           echo "Cancelling Slurm jobs on ${NODES}:"
           printf '%s\n' "${job_ids}"
           mapfile -t job_id_list <<< "${job_ids}"
-          echo "Parsed Slurm job ID list:"
-          printf '  %s\n' "${job_id_list[@]}"
           for job_id in "${job_id_list[@]}"; do
             if timeout 60s "${scancel_cmd[@]}" "${job_id}"; then
               echo "Finished cancelling Slurm job ${job_id}."
