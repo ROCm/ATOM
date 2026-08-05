@@ -7,8 +7,10 @@ process group (from aiter's parallel state), mirroring ``pcp_utils.py``. This
 keeps the ``getattr(config, "decode_context_parallel_size", 1)`` + ``get_dcp_group``
 boilerplate out of the attention / metadata-builder ``__init__``s.
 
-Scope: ATOM native (server) mode only. The vLLM plugin resolves its DCP world
-size / group from ``vllm.distributed`` instead and does not use this module.
+Scope: the DCP world-size / group wrappers are ATOM native (server) mode only —
+the vLLM plugin resolves those from ``vllm.distributed`` instead. The
+platform-capability query ``dcp_persistent_supported()`` is the one exception:
+it is arch-based (not distributed-access) and shared by both native and plugin.
 
 The DCP compute / communication primitives (``cp_lse_ag_out_rs``, ``reorg_kvcache``,
 ``dcp_gather_compressed_kv``, ...) live in ``atom.model_ops.dcp_ops``; this module is
@@ -44,3 +46,18 @@ def get_dcp_group():
 def get_dcp_rank() -> int:
     """This rank's position within the DCP group (0 when DCP is disabled)."""
     return get_dcp_group().rank_in_group if dcp_is_enabled() else 0
+
+
+def dcp_persistent_supported() -> bool:
+    """Whether DCP decode can run in *persistent* mode on this GPU.
+
+    Persistent DCP needs an lse-emitting ASM decode kernel (per-token
+    ``return_lse`` for the cross-rank merge); only gfx950 ships those — gfx942
+    has no bf16 lse persistent kernel — so DCP must stay non-persistent
+    elsewhere (lse then comes from the triton stage2 reduce). Platform-capability
+    query shared by native and the vLLM plugin; cache the result once per
+    ``__init__`` to avoid a per-forward ``get_gfx()`` (graph-break).
+    """
+    from aiter.jit.utils.chip_info import get_gfx
+
+    return get_gfx() == "gfx950"

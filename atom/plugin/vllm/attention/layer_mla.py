@@ -774,11 +774,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
 
         kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
 
-        # DCP decode needs LSE from mla_decode_fwd; persistent mode does not
-        # return it, so disable persistent mode whenever DCP is active.
-        use_persistent_mode = (
-            attn_metadata.decode.use_persistent_metadata and self.dcp_world_size <= 1
-        )
+        use_persistent_mode = attn_metadata.decode.use_persistent_metadata
         if not use_persistent_mode:
             work_meta_data = None
             work_indptr = None

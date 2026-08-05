@@ -35,6 +35,7 @@ _ATOM_SUPPORTED_MODELS = {
 
 if is_sglang():
     from atom.models.deepseek_v4 import DeepseekV4ForCausalLM
+    from atom.models.eagle3_llama import Eagle3LlamaModel
     from atom.models.kimi_k25 import KimiK25ForCausalLM
     from atom.models.qwen3_5 import (
         Qwen3_5ForCausalLM,
@@ -57,6 +58,10 @@ if is_sglang():
             "KimiK25ForConditionalGeneration": KimiK25ForCausalLM,
         }
     )
+    _ATOM_SUPPORTED_DRAFT_MODELS = {
+        "LlamaForCausalLMEagle3": Eagle3LlamaModel,
+    }
+    _ATOM_SUPPORTED_MODELS.update(_ATOM_SUPPORTED_DRAFT_MODELS)
 
 
 def _register_custom_attention_to_sglang() -> None:
@@ -178,6 +183,78 @@ def _patch_sglang_dsv4_draft_backends() -> None:
     DraftBackendFactory._create_dsv4_prefill_backend = _create_atom_dsv4_prefill_backend
     DraftBackendFactory._atom_dsv4_draft_backend_patched = True
     logger.info("Patched SGLang DSV4 speculative draft backends to ATOM")
+
+
+def _patch_sglang_mtp_total_accept_rate_logging() -> None:
+    """Log cumulative SGLang speculative acceptance statistics."""
+
+    if os.getenv("ATOM_SGLANG_MTP_LOG", "0") != "1":
+        return
+
+    try:
+        from sglang.srt.managers.scheduler import Scheduler
+    except Exception:  # noqa: BLE001 - optional across SGLang versions
+        return
+
+    # SGLang <= 0.5.12 exposes reporting and counters directly on Scheduler.
+    # In 0.5.15 they moved to SchedulerMetricsReporter.
+    if hasattr(Scheduler, "report_decode_stats"):
+        stats_owner_cls = Scheduler
+    else:
+        try:
+            from sglang.srt.managers.scheduler_components.metrics_reporter import (
+                SchedulerMetricsReporter,
+            )
+        except Exception:  # noqa: BLE001 - optional across SGLang versions
+            return
+        stats_owner_cls = SchedulerMetricsReporter
+
+    if getattr(stats_owner_cls, "_atom_spec_stats_logging_patched", False):
+        return
+
+    original_report_decode_stats = stats_owner_cls.report_decode_stats
+    stats_logger = logging.getLogger("atom.plugin.sglang.spec_stats")
+
+    def report_decode_stats(self, *args, **kwargs):
+        total_forward_ct_before = int(
+            getattr(self, "spec_total_num_forward_ct", 0) or 0
+        )
+        ret = original_report_decode_stats(self, *args, **kwargs)
+        scheduler = getattr(self, "scheduler", self)
+        if scheduler.spec_algorithm.is_none():
+            return ret
+
+        total_forward_ct = int(getattr(self, "spec_total_num_forward_ct", 0) or 0)
+        total_accept_tokens = int(getattr(self, "spec_total_num_accept_tokens", 0) or 0)
+        # The original method updates lifetime counters only at
+        # decode_log_interval. Avoid repeating the same cumulative snapshot on
+        # every decode iteration between reporting intervals.
+        if total_forward_ct <= total_forward_ct_before:
+            return ret
+
+        draft_per_round = (
+            int(scheduler.server_args.speculative_num_draft_tokens) - 1
+            if getattr(scheduler.server_args, "speculative_num_draft_tokens", None)
+            else int(getattr(scheduler.server_args, "speculative_num_steps", 0) or 0)
+        )
+        accepted_drafts = total_accept_tokens - total_forward_ct
+        total_draft_tokens = total_forward_ct * max(draft_per_round, 0)
+        accept_rate = (
+            accepted_drafts / total_draft_tokens if total_draft_tokens > 0 else 0.0
+        )
+
+        stats_logger.info(
+            "[MTP Stats         ] Average toks/fwd: %.2f, "
+            "Accepted/Total Draft tokens: %d/%d, Acceptance rate: %.2f%%",
+            total_accept_tokens / total_forward_ct,
+            accepted_drafts,
+            total_draft_tokens,
+            accept_rate * 100.0,
+        )
+        return ret
+
+    stats_owner_cls.report_decode_stats = report_decode_stats
+    stats_owner_cls._atom_spec_stats_logging_patched = True
 
 
 def _patch_sglang_dsv4_spec_cuda_graph() -> None:
@@ -590,8 +667,14 @@ def register_ops_to_sglang(atom_config: Config) -> None:
     """
     Register custom ops to sglang, including attention
     """
+    from atom.plugin.sglang.eagle3_llama_bridge import (
+        patch_sglang_eagle3_runtime_compat,
+    )
+
     _register_custom_attention_to_sglang()
     _patch_sglang_dsv4_draft_backends()
+    _patch_sglang_mtp_total_accept_rate_logging()
+    patch_sglang_eagle3_runtime_compat()
     _patch_sglang_dsv4_spec_cuda_graph()
 
 

@@ -158,7 +158,6 @@ class Drafter(abc.ABC):
             support_draft_model_arch_dict[draft_hf.architectures[0]]
         )
         self.model = self._build_draft_model(model_class)
-        self._draft_argmax_fused = hasattr(self.model, "compute_draft_token")
 
         # Drafter-owned aux capture state (armed by arm_aux_capture).
         self._captures_aux = False

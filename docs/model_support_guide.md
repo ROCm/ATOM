@@ -50,7 +50,7 @@ ATOM resolves the HuggingFace `architectures` field from a model's `config.json`
 
 - **Architecture:** Dense transformer with Grouped-Query Attention (GQA).
 - **Layer structure:** `Qwen3DecoderLayer` containing `Qwen3Attention` + `Qwen3MLP`.
-- **Attention:** `QKVParallelLinear` for fused QKV projection, per-head QK RMSNorm (`q_norm`, `k_norm`), RoPE, `RowParallelLinear` for output projection.
+- **Attention:** `QKVParallelLinear` for fused QKV projection, per-head QK RMSNorm (`q_norm`, `k_norm`), RoPE, `RowParallelLinear` for output projection. Supports QK norm + RoPE + cache + quant fusion when `ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION` is set.
 - **MLP:** `MergedColumnParallelLinear` for gate+up projection, SiLU activation, `RowParallelLinear` for down projection.
 - **Normalization:** RMSNorm on input and post-attention.
 
@@ -98,7 +98,7 @@ ATOM resolves the HuggingFace `architectures` field from a model's `config.json`
 ### DeepSeek MTP (`DeepSeekMTP`)
 
 - **Architecture:** Multi-Token Prediction draft model for speculative decoding.
-- **Layer structure:** `DeepSeekMultiTokenPredictor` containing one or more `DeepSeekMultiTokenPredictorLayer`, each with `enorm` (embedding norm), `hnorm` (hidden state norm), `eh_proj` (linear projection joining embedded+hidden), `mtp_block` (a `DeepseekV2DecoderLayer`), and a `SharedHead` (norm + LM head).
+- **Layer structure:** `DeepSeekMultiTokenPredictor` containing one or more `DeepSeekMultiTokenPredictorLayer`, each with `enorm` (embedding norm), `hnorm` (hidden state norm), `eh_proj` (linear projection joining embedded+hidden), `mtp_block` (a `DeepseekV2DecoderLayer`), and a `SharedHead` (norm + LM head; the norm runs at the end of the layer's `forward`, see below).
 - **Usage:** Not registered in `support_model_arch_dict`. Loaded separately with `spec_decode=True` in `load_model()`, which invokes `rewrite_spec_layer_name()` to remap MTP weight names (e.g., adding `.mtp_block.` prefix for transformer layer weights, remapping `embed_tokens` to top-level).
 - **MTP layers start** at `config.num_hidden_layers` (i.e., the layer indices following the main model layers).
 
@@ -358,7 +358,7 @@ Multi-Token Prediction (MTP) models serve as lightweight draft models for specul
 
 **DeepSeekMTP** (`DeepSeekMTP`):
 - Each `DeepSeekMultiTokenPredictorLayer` takes the previous hidden state and the next token's embedding, normalizes both (`enorm`, `hnorm`), concatenates them, and passes through a linear projection (`eh_proj`) followed by a standard `DeepseekV2DecoderLayer`.
-- The `SharedHead` provides per-layer norm + LM head for logit computation (one shared head per MTP layer).
+- The `SharedHead` provides a per-layer norm + LM head (one shared head per MTP layer). The norm is applied at the **end of the layer's `forward`**, not in `compute_logits`: draft step 0 consumes the target's post-final-norm hidden, so steps 1+ must consume the draft's post-final-norm hidden too. `compute_logits` / `compute_draft_ids` therefore take an already-normed input and are a bare head.
 - For FP4 quantized main models, MTP blocks fall back to non-FP4 quantization config to maintain draft model accuracy.
 
 **Qwen3NextMTP** (`Qwen3NextMTP`):

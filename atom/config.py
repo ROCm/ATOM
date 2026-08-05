@@ -9,10 +9,9 @@ import os
 import re
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
-from aiter import QuantType
 from torch.distributed import ProcessGroup, ReduceOp
 from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 
@@ -25,6 +24,11 @@ from atom.quant_spec import (
 )
 from atom.utils import envs, get_open_port
 from atom.utils.distributed.utils import stateless_init_torch_distributed_process_group
+
+if TYPE_CHECKING:
+    # Annotation only. Importing AITER here would put a GPU kernel build behind
+    # `import atom.config`, which is what `atom.quant_spec` defers on purpose.
+    from aiter import QuantType
 
 logger = logging.getLogger("atom")
 
@@ -290,9 +294,7 @@ class QuantizationConfig:
         self.hf_quant_config = getattr(config, "quantization_config", None)
 
         if self.hf_quant_config is None:
-            self.global_spec = LayerQuantConfig(
-                quant_type=QuantType.No, quant_dtype=self.torch_dtype
-            )
+            self.global_spec = LayerQuantConfig.no_quant(self.torch_dtype)
             self.layer_pattern_specs = []
             self.exclude_layers = []
             self.quant_method = ""
@@ -379,7 +381,7 @@ class QuantizationConfig:
     # -- convenience properties (delegate to global_spec) ---------------------
 
     @property
-    def quant_type(self) -> QuantType:
+    def quant_type(self) -> "QuantType":
         return self.global_spec.quant_type
 
     @property
