@@ -381,7 +381,7 @@ class BlockManager:
         but later requests cannot discover it through ``can_allocate()`` and
         repeatedly load the same prefix from CPU.
 
-        Only complete, block-aligned loaded blocks are published. Existing
+        Only complete, hash-block-aligned loaded blocks are published. Existing
         canonical mappings win: concurrent requests may load the same prefix
         into different physical blocks, and replacing the canonical mapping
         would make its eventual eviction remove the wrong cache entry.
@@ -393,18 +393,19 @@ class BlockManager:
         end_token = min(int(end_token), int(seq.num_prompt_tokens))
         if end_token <= start_token:
             return 0
-        if start_token % self.block_size != 0:
+        hbs = self._hash_block_size()
+        if start_token % hbs != 0:
             logger.warning(
                 "Cannot publish offload prefix with unaligned start: "
-                "seq=%s start=%d block_size=%d",
+                "seq=%s start=%d hash_block_size=%d",
                 seq.id,
                 start_token,
-                self.block_size,
+                hbs,
             )
             return 0
 
-        start_block = start_token // self.block_size
-        end_block = end_token // self.block_size
+        start_block = start_token // hbs
+        end_block = end_token // hbs
         if end_block <= start_block:
             return 0
         if end_block > len(seq.block_table):
@@ -433,7 +434,7 @@ class BlockManager:
 
         indexed_tokens = 0
         for i in range(start_block, end_block):
-            token_ids = seq.block(i)
+            token_ids = self._hash_block_tokens(seq, i)
             block_id = seq.block_table[i]
             block = self.blocks[block_id]
             block_hash = self.compute_hash(token_ids, parent_hash)
@@ -477,7 +478,7 @@ class BlockManager:
                         )
                     )
 
-            indexed_tokens += self.block_size
+            indexed_tokens += hbs
             parent_hash = block_hash
 
         return indexed_tokens
