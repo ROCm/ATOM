@@ -2,8 +2,8 @@
 //!
 //! Requests carrying `X-Session-ID` are pinned to the first healthy worker
 //! selected for that session. New sessions and requests without a session ID
-//! use minimum-load balancing. A stale mapping is removed and reassigned when
-//! its worker is no longer healthy or the session has been idle for too long.
+//! use minimum-load balancing. A stale mapping is replaced when its worker is
+//! no longer healthy or the session has been idle for too long.
 
 use std::{
     sync::Arc,
@@ -88,19 +88,16 @@ impl DpStickyPolicy {
         if let Some(mut assignment) = self.assignments.get_mut(session_id) {
             let is_expired = now.saturating_duration_since(assignment.last_access)
                 > SESSION_REASSIGNMENT_IDLE_TIMEOUT;
-            assignment.last_access = now;
 
             if !is_expired {
                 if let Some(index) = Self::healthy_worker_for_identity(workers, &assignment.worker)
                 {
+                    assignment.last_access = now;
                     return Some(index);
                 }
             }
         }
 
-        // The assigned worker was removed or became unhealthy. The next
-        // selection establishes a replacement affinity.
-        self.assignments.remove(session_id);
         let selected_index = Self::select_low_load_worker(workers)?;
         let selected_worker = Self::worker_identity(&workers[selected_index]);
 
@@ -108,8 +105,21 @@ impl DpStickyPolicy {
             Entry::Occupied(mut entry) => {
                 let existing_index = {
                     let assignment = entry.get_mut();
-                    assignment.last_access = now;
-                    Self::healthy_worker_for_identity(workers, &assignment.worker)
+                    let is_expired = now.saturating_duration_since(assignment.last_access)
+                        > SESSION_REASSIGNMENT_IDLE_TIMEOUT;
+
+                    if !is_expired {
+                        if let Some(index) =
+                            Self::healthy_worker_for_identity(workers, &assignment.worker)
+                        {
+                            assignment.last_access = now;
+                            Some(index)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
                 };
 
                 if let Some(index) = existing_index {
