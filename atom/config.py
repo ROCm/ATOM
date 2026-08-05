@@ -32,6 +32,32 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("atom")
 
+FAKE_EPLB_DEFAULT_BLOCK = 16
+
+
+def parse_fake_eplb_layout(spec: str) -> tuple[str, int]:
+    """`ring` | `block` | `block:<rows>` -> (kind, rows per run).
+
+    One value rather than two flags: the run length only means anything for
+    `block`, and a separate flag would make `ring` plus a length look valid.
+    """
+    kind, _, rows = str(spec).strip().partition(":")
+    kind = kind.lower()
+    if kind not in ("ring", "block"):
+        raise ValueError(
+            f"--fake-eplb-layout: expected 'ring', 'block' or 'block:<rows>', "
+            f"got {spec!r}"
+        )
+    if not rows:
+        return kind, FAKE_EPLB_DEFAULT_BLOCK
+    if kind != "block":
+        raise ValueError(f"--fake-eplb-layout: 'ring' takes no run length: {spec!r}")
+    if not rows.isdigit() or int(rows) < 1:
+        raise ValueError(
+            f"--fake-eplb-layout: run length must be a positive integer, got {spec!r}"
+        )
+    return kind, int(rows)
+
 
 @dataclass
 class KVCacheTensor:
@@ -1356,6 +1382,8 @@ class Config:
     load_dummy: str | None = None
     enable_expert_parallel: bool = False
     fake_eplb: bool = False
+    # "ring" | "block" | "block:<rows>"; see parse_fake_eplb_layout.
+    fake_eplb_layout: str = "ring"
     # Width the MoE shards experts for when DP-attention simulates a deployment
     # wider than the box (set by CoreManager); 0 = not simulating.
     # `parallel_config.data_parallel_size` stays the real rank count, since it
@@ -1502,6 +1530,8 @@ class Config:
             )
 
         assert 1 <= self.tensor_parallel_size <= 8
+        # Reject a bad spec at startup rather than on the first forward.
+        parse_fake_eplb_layout(self.fake_eplb_layout)
         if self.decode_context_parallel_size > 1:
             assert self.tensor_parallel_size % self.decode_context_parallel_size == 0, (
                 f"tp_size ({self.tensor_parallel_size}) must be divisible by "
