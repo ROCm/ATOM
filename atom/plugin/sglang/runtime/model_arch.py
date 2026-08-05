@@ -32,6 +32,8 @@ class SGLangModelAdapterSpec:
 
     wrapper_binds_gdn_context: bool = False
     uses_context_only_forward: bool = False
+    uses_text_config: bool = False
+    load_weights_prefix: str = "model."
     # SGLang initializes atom_config from the target ServerArgs but passes a
     # draft-local HF config to the external draft model. This early hook lets
     # adapters preserve target metadata and switch to the draft config before
@@ -68,6 +70,67 @@ def _prepare_kimi_k25_config(atom_config: Any, model_arch: str) -> None:
     )
 
     remap_kimi_k25_quant_config_for_sglang_plugin(atom_config, model_arch)
+
+
+def _prepare_kimi_k3_config(atom_config: Any, model_arch: str) -> None:
+    del model_arch
+    from atom.models.kimi_k3 import (
+        KimiK3ForCausalLM,
+        _kda_packed_modules_mapping,
+        _normalize_kimi_config,
+        _text_config,
+    )
+
+    text_config = _text_config(atom_config.hf_config)
+    _normalize_kimi_config(text_config)
+    # K3's SGLang bridge allocates a 128-token hybrid pool.  True MLA uses
+    # ATOM_MLA_PAGE_SIZE=1 with that pool rather than segmented MLA (page 64).
+    atom_config.kv_cache_block_size = 128
+    quant_config = getattr(atom_config, "quant_config", None)
+    if quant_config is not None:
+        quant_config.remap_layer_name(
+            atom_config.hf_config,
+            packed_modules_mapping=_kda_packed_modules_mapping(
+                text_config.kimi_kda_layers
+            ),
+            quant_exclude_name_mapping=KimiK3ForCausalLM.quant_exclude_name_mapping,
+        )
+
+
+def _kimi_k3_construction_context():
+    from atom.plugin.sglang.kimi_k3_bridge import (
+        kimi_k3_native_attention_construction,
+    )
+
+    return kimi_k3_native_attention_construction()
+
+
+def _bind_kimi_k3_cache_views(model: Any, runtime: Any) -> None:
+    from atom.plugin.sglang.attention_backend.attention_gdn import (
+        SGLangGDNForwardContext,
+    )
+    from atom.plugin.sglang.kimi_k3_bridge import (
+        bind_kimi_k3_cache_views,
+        maybe_get_kimi_k3_pools,
+    )
+    from atom.utils.forward_context import get_forward_context, set_kv_cache_data
+
+    token_to_kv_pool, _ = maybe_get_kimi_k3_pools(runtime.forward_batch)
+    if not bind_kimi_k3_cache_views(model, token_to_kv_pool):
+        raise RuntimeError("Kimi-K3 SGLang KV pool is not initialized")
+
+    attn_backend = SGLangGDNForwardContext._resolve_attn_backend(runtime.forward_batch)
+    linear_backend = SGLangGDNForwardContext._linear_attn_backend(attn_backend)
+    gdn_cache = SGLangGDNForwardContext._build_kv_cache_tensors(
+        runtime.forward_batch, linear_backend
+    )
+    if not gdn_cache:
+        raise RuntimeError("Kimi-K3 SGLang GDN state cache is not initialized")
+    ctx = get_forward_context()
+    kv_cache_data = dict(ctx.kv_cache_data or {})
+    kv_cache_data.update(gdn_cache)
+    set_kv_cache_data(kv_cache_data)
+    ctx.kv_cache_data = kv_cache_data
 
 
 def _prepare_minimax_m3_config(atom_config: Any, model_arch: str) -> None:
@@ -310,6 +373,14 @@ MODEL_ADAPTER_SPECS = {
         prepare_config=_prepare_kimi_k25_config,
         install_adapters=_install_deepseek_mla_adapters,
     ),
+    "KimiK3ForConditionalGeneration": SGLangModelAdapterSpec(
+        uses_context_only_forward=True,
+        uses_text_config=True,
+        load_weights_prefix="",
+        prepare_config=_prepare_kimi_k3_config,
+        construction_context=_kimi_k3_construction_context,
+        bind_cache_views=_bind_kimi_k3_cache_views,
+    ),
     "Qwen3ForCausalLM": SGLangModelAdapterSpec(),
     "Qwen3MoeForCausalLM": SGLangModelAdapterSpec(),
     "Qwen3NextForCausalLM": SGLangModelAdapterSpec(
@@ -360,6 +431,7 @@ MODEL_ARCH_SPECS = {
         "DeepseekV3ForCausalLM",
         "DeepseekV32ForCausalLM",
         GLM52_DSA_ARCH,
+        "KimiK3ForConditionalGeneration",
         "Qwen3ForCausalLM",
         "Qwen3MoeForCausalLM",
         "Qwen3NextForCausalLM",
