@@ -41,7 +41,8 @@ vllm serve "${MODEL}" \
     --port 8000 \
     --tensor-parallel-size 8 \
     --trust-remote-code \
-    --no-enable-prefix-caching \
+    --enable-prefix-caching \
+    --mamba-cache-mode align \
     --kv-cache-dtype fp8 \
     --max-num-seqs 64 \
     --max-num-batched-tokens 16384 \
@@ -50,9 +51,8 @@ vllm serve "${MODEL}" \
     --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE"}' \
     --enable-auto-tool-choice \
     --tool-call-parser kimi_k3 \
-    --reasoning-parser kimi_k3 
-
-  # --online_quant_config '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "*self_attn.[qkv]_conv1d*", "*block_sparse_moe.experts*", "*block_sparse_moe.routed_expert_*", "*vision_tower*", "*mm_projector*"]}' \
+    --reasoning-parser kimi_k3 \
+    --additional-config '{"online_quant_config": {"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "*self_attn.[qkv]_conv1d*", "*block_sparse_moe.experts*", "*block_sparse_moe.routed_expert_*", "*vision_tower*", "*mm_projector*"]}}'
 ```
 
 The plugin keeps KDA temporal state in fp32, registers every KDA layer through
@@ -60,8 +60,11 @@ vLLM's hybrid/Mamba cache contract, and uses ATOM's MLA backend for full
 attention. vLLM may increase the physical attention block size so its MLA and
 KDA pages have equal byte size; this is expected.
 
-Prefix caching must stay disabled because KDA recurrent state cannot be
-reconstructed from the paged MLA cache alone.
+Prefix caching needs `--mamba-cache-mode align`. KDA recurrent state cannot be
+reconstructed from the paged MLA cache alone, so the two have to agree on
+block boundaries before a prefix hit can be reused; without that mode prefix
+caching has to stay off. Leaving it off makes any long-shared-prefix benchmark
+meaningless — every request re-prefills the whole prompt.
 
 ## Smoke test
 
@@ -110,5 +113,5 @@ are not used as baselines for this model.
 
 - Text generation only; the vision tower and multimodal projector are skipped.
 - TP8 on MI355/gfx950 is the validated deployment.
-- Prefix caching and asynchronous scheduling are disabled.
+- Prefix caching is on via `--mamba-cache-mode align`; async scheduling is off.
 - Speculative decoding is not enabled for this model.
