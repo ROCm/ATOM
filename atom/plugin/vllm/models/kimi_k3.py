@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from typing import Any, ClassVar
 
 import torch
+from aiter.dist.parallel_state import get_pp_group
 from torch import nn
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context as get_vllm_forward_context
@@ -265,59 +266,48 @@ class KimiKDAAttentionVllm(KimiKDAAttention, MambaBase):
         return output
 
 
-def _aux_hidden_state_tap(original_forward, sink: list, slot: int):
-    """Record the hidden state entering a layer, then run it unchanged.
+def _k3_residual_stream(
+    hidden_states: torch.Tensor,
+    pending_add: torch.Tensor | None,
+    pending_add2: torch.Tensor | None,
+) -> torch.Tensor:
+    """The plain residual stream at a layer boundary.
 
-    ``pending_add`` carries a residual the native loop defers to the next
-    layer, so the value actually entering this layer is the sum of the two.
+    A Kimi-K3 layer hands its FFN output back unapplied, and an MoE layer hands
+    its shared-expert output back separately again, so the next layer's attn_res
+    kernel can fold both into its on-load. The residual stream a drafter is
+    trained on is the sum, which is how the native layer's
+    ``aux_hidden_state()`` and the native pipeline-parallel tail both
+    reconstruct it. Each addend is None on a layer that already folded it in.
     """
-
-    def forward(positions, hidden_states, block_residual=None, pending_add=None):
-        sink[slot] = (
-            hidden_states if pending_add is None else hidden_states + pending_add
-        )
-        return original_forward(
-            positions, hidden_states, block_residual, pending_add=pending_add
-        )
-
-    return forward
+    if pending_add is not None:
+        hidden_states = hidden_states + pending_add
+    if pending_add2 is not None:
+        hidden_states = hidden_states + pending_add2
+    return hidden_states
 
 
 class KimiLinearModelVllm(kimi_k3_base.KimiLinearModel):
     """Native Kimi-K3 body that can also emit Eagle3/DSpark auxiliary states.
 
-    The DSpark draft is trained on the outputs of five target layers. Those are
-    collected by tapping the chosen layers once, when the layer set is
-    configured, rather than by restating the native forward -- whose deferred
-    residual and attention-residual bookkeeping is easy to get subtly wrong and
-    would silently drift from the original.
+    The DSpark draft is trained on five of the target's layer outputs. They are
+    collected inline in the layer loop, into a local list, the way every ATOM
+    and vLLM target that feeds a drafter does it. Collecting them from wrapped
+    layer ``forward``s instead splits this function across a Dynamo graph
+    break, and ATOM's compile backend accepts exactly one graph.
+
+    ``aux_hidden_state_layers`` indexes the residual stream, not the layers:
+    entry ``i`` is the stream entering layer ``i``, i.e. the reference model's
+    ``output.hidden_states[i]``. vLLM resolves the draft's ``target_layer_ids``
+    into that space by adding one before handing them over.
     """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.aux_hidden_state_layers: tuple[int, ...] = ()
-        # One slot per layer, allocated once. The taps close over this list, so
-        # replacing it would leave them writing somewhere nothing reads --
-        # including inside an already-traced graph.
-        self._aux_hidden_states: list[torch.Tensor | None] = [None] * len(self.layers)
 
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
-        for layer in self.layers:
-            original = layer.__dict__.pop("_atom_aux_untapped_forward", None)
-            if original is not None:
-                layer.forward = original
-
         self.aux_hidden_state_layers = tuple(layers)
-        # Fixed slots rather than appends: the collection order then matches the
-        # configured layer order no matter how the taps fire.
-        for slot in range(len(self._aux_hidden_states)):
-            self._aux_hidden_states[slot] = None
-        for slot, idx in enumerate(self.aux_hidden_state_layers):
-            layer = self.layers[idx]
-            layer._atom_aux_untapped_forward = layer.forward
-            layer.forward = _aux_hidden_state_tap(
-                layer.forward, self._aux_hidden_states, slot
-            )
 
     def forward(
         self,
@@ -330,24 +320,60 @@ class KimiLinearModelVllm(kimi_k3_base.KimiLinearModel):
         # dynamic token dimension by binding these argument names, and a
         # *args/**kwargs override would silently compile the model at a single
         # static shape.
-        hidden_states = super().forward(
-            input_ids, positions, intermediate_tensors, inputs_embeds
-        )
         if not self.aux_hidden_state_layers:
-            return hidden_states
-        if isinstance(hidden_states, IntermediateTensors):
-            return hidden_states
-        collected = self._aux_hidden_states[: len(self.aux_hidden_state_layers)]
-        missing = [
-            self.aux_hidden_state_layers[i]
-            for i, h in enumerate(collected)
-            if h is None
-        ]
-        if missing:
-            raise RuntimeError(
-                f"Kimi-K3 aux hidden states were not produced by layers {missing}."
+            return super().forward(
+                input_ids, positions, intermediate_tensors, inputs_embeds
             )
-        return hidden_states, collected
+
+        if get_pp_group().is_first_rank:
+            hidden_states = (
+                inputs_embeds
+                if inputs_embeds is not None
+                else self.embed_tokens(input_ids)
+            )
+            block_residual = (
+                hidden_states.new_zeros(
+                    hidden_states.shape[0], 0, hidden_states.shape[1]
+                )
+                if getattr(self.config, "attn_res_block_size", None) is not None
+                else None
+            )
+        else:
+            assert intermediate_tensors is not None
+            hidden_states = intermediate_tensors["hidden_states"]
+            block_residual = intermediate_tensors["block_residual"]
+
+        aux_hidden_states: list[torch.Tensor] = []
+        pending_add = pending_add2 = None
+        for idx in range(self.start_layer, self.end_layer):
+            if idx in self.aux_hidden_state_layers:
+                aux_hidden_states.append(
+                    _k3_residual_stream(hidden_states, pending_add, pending_add2)
+                )
+            hidden_states, pending_add, pending_add2, block_residual = self.layers[idx](
+                positions,
+                hidden_states,
+                block_residual,
+                pending_add=pending_add,
+                pending_add2=pending_add2,
+            )
+
+        if not get_pp_group().is_last_rank:
+            hidden_states = _k3_residual_stream(
+                hidden_states, pending_add, pending_add2
+            )
+            return IntermediateTensors(
+                {"hidden_states": hidden_states, "block_residual": block_residual}
+            )
+
+        if self.end_layer in self.aux_hidden_state_layers:
+            aux_hidden_states.append(
+                _k3_residual_stream(hidden_states, pending_add, pending_add2)
+            )
+        hidden_states, _ = self.output_attn_res(
+            hidden_states, block_residual, pending_add, pending_add2
+        )
+        return hidden_states, aux_hidden_states
 
 
 class KimiK3ForCausalLM(KimiK3ForCausalLMBase):
@@ -388,7 +414,11 @@ class KimiK3ForCausalLM(KimiK3ForCausalLMBase):
         self.language_model.model.set_aux_hidden_state_layers(layers)
 
     def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
-        """Fallback only; the DSpark checkpoint names its own target layers."""
+        """Fallback only; the DSpark checkpoint names its own target layers.
+
+        ATOM's server-mode name: ATOMModelBase re-exposes it to vLLM as
+        ``get_eagle3_default_aux_hidden_state_layers``.
+        """
         num_layers = len(self.language_model.model.layers)
         return (2, num_layers // 2, num_layers - 3)
 
