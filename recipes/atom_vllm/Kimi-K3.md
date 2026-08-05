@@ -52,7 +52,8 @@ vllm serve "${MODEL}" \
     --max-num-batched-tokens 16384 \
     --gpu-memory-utilization 0.93 \
     --block-size 128 \
-    --no-enable-prefix-caching \
+    --enable-prefix-caching \
+    --mamba-cache-mode align \
     --no-async-scheduling \
     --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE"}'
 ```
@@ -62,8 +63,21 @@ vLLM's hybrid/Mamba cache contract, and uses ATOM's MLA backend for full
 attention. vLLM may increase the physical attention block size so its MLA and
 KDA pages have equal byte size; this is expected.
 
-Prefix caching must stay disabled because KDA recurrent state cannot be
-reconstructed from the paged MLA cache alone.
+Prefix caching runs in `align` mamba-cache mode. The plugin marks Kimi-K3 with
+vLLM's `SupportsMambaPrefixCaching` contract, so vLLM reuses cached MLA prefixes
+while the KDA layers recompute their recurrent state over the cached prefix from
+a single per-sequence state slot (align keeps the sequence-end block only, so
+there are no interior KDA checkpoints to reuse). This is always correct and
+speeds up the attention half of the prefill; the KDA half is still recomputed.
+
+`align` mode requires chunked prefill (on by default) and `--block-size` must be
+`<= --max-num-batched-tokens`; both hold for the configuration above. Leaving
+`--mamba-cache-mode` unset selects `none`, which retains a single working state
+slot and provides no cross-request prefix reuse.
+
+`--mamba-cache-mode all` (per-block KDA state checkpointing, enabling KDA reuse
+at interior block boundaries) is not yet validated for Kimi-K3 and should not be
+used in production.
 
 ## Smoke test
 
@@ -112,5 +126,6 @@ are not used as baselines for this model.
 
 - Text generation only; the vision tower and multimodal projector are skipped.
 - TP8 on MI355/gfx950 is the validated deployment.
-- Prefix caching and asynchronous scheduling are disabled.
+- Prefix caching runs in `align` mamba-cache mode; `all` mode is not yet
+  validated. Asynchronous scheduling is disabled.
 - Speculative decoding is not enabled for this model.
