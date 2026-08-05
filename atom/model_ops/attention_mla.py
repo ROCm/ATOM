@@ -30,7 +30,7 @@ except ImportError:
     concat_and_cache_mla_seg = None
     fused_qk_rope_concat_and_cache_mla_seg = None
 from aiter.dist.parallel_state import get_dp_group
-from aiter.mla import mla_decode_fwd, mla_decode_fwd_ds32, mla_prefill_fwd
+from aiter.mla import mla_decode_fwd, mla_prefill_fwd
 from aiter.ops.triton.attention.mla import (
     mla_decode_fwd as triton_shuffle_mla_decode_fwd,
 )
@@ -85,9 +85,19 @@ if fused_qk_rope_concat_and_cache_mla_seg is not None:
     )
 mla_prefill_fwd = mark_trace(mla_prefill_fwd, prefix="mla_prefill", torch_compile=False)
 mla_decode_fwd = mark_trace(mla_decode_fwd, prefix="mla_decode", torch_compile=False)
-mla_decode_fwd_ds32 = mark_trace(
-    mla_decode_fwd_ds32, prefix="mla_decode_ds32", torch_compile=False
-)
+_mla_decode_fwd_ds32 = None
+
+
+def _get_mla_decode_fwd_ds32():
+    global _mla_decode_fwd_ds32
+    if _mla_decode_fwd_ds32 is None:
+        from aiter.mla import mla_decode_fwd_ds32
+
+        _mla_decode_fwd_ds32 = mark_trace(
+            mla_decode_fwd_ds32, prefix="mla_decode_ds32", torch_compile=False
+        )
+    return _mla_decode_fwd_ds32
+
 
 # Shuffled-KV (block_size=64) Triton/Gluon MLA kernels, gated by
 # ATOM_USE_TRITON_MLA and ATOM_USE_TRITON_MLA_SHUFFLE_KV:. Write kernels mirror the aiter
@@ -322,6 +332,7 @@ class MLAAttention(nn.Module):
             and mla_modules.kv_lora_rank == _DS32_NOPE_DIM
             and mla_modules.qk_rope_head_dim == _DS32_ROPE_DIM
         )
+        self.mla_decode_fwd_ds32 = _get_mla_decode_fwd_ds32() if self.use_ds32 else None
         min_mla_heads = 128 if self.use_ds32 else _MLA_MIN_HEADS
         self.padded_num_heads = max(num_heads, min_mla_heads)
         self.head_repeat_factor = 1
@@ -569,7 +580,7 @@ class MLAAttention(nn.Module):
             dtype=torch.bfloat16,
             device=q_nope.device,
         )
-        mla_decode_fwd_ds32(
+        self.mla_decode_fwd_ds32(
             q_nope,
             q_rope,
             kv_nope,
