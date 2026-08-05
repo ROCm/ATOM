@@ -229,6 +229,13 @@ class DSparkProposer(Drafter):
         Returning ``None`` skips the capture for this call (the base hook
         treats it as "nothing to record").
         """
+        # A target that bookkeeps its residual stream in a non-obvious way can
+        # own the reconstruction itself; preferred, since it then changes in
+        # lockstep with that layer's forward(). Kimi-K3 does this.
+        own = getattr(block, "aux_hidden_state", None)
+        if own is not None:
+            return own(output)
+
         # DeepSeek-V4: an HCState carrying the multi-hidden-connection residual
         # [N, hc, dim]; the aux tensor is its mean over the hc axis.
         if hasattr(output, "residual"):
@@ -242,22 +249,20 @@ class DSparkProposer(Drafter):
                 residual = block.hc_post(x_prev, residual, post, comb)
             return residual.mean(dim=1)
 
-        # Kimi-K3: (prefix_sum, pending_add, pending_add2, block_residual). ATOM's
-        # port defers the FFN residual add across the layer boundary so the next
-        # layer can fuse it into apply_attn_res, and an MoE layer defers its routed
-        # and shared expert outputs SEPARATELY (pending_add2) so that fold absorbs
-        # their sum too. The HF reference adds all of it before returning
-        # (`prefix_sum = prefix_sum + hidden_states`), and THAT sum is what
-        # transformers records and what the draft was trained on. So add it back.
-        # Both pendings are None on the layers that already folded them in.
+        # A tuple means the layer carries residual bookkeeping we cannot
+        # interpret from here -- which component is the residual stream, and
+        # which are deferred addends, is that layer's private convention (K3
+        # returns four tensors, three of which must be summed). Guessing would
+        # feed the draft a silently wrong aux tensor, so require the target to
+        # say. Fail loudly instead.
         if isinstance(output, tuple):
-            carrier = output[0]
-            if carrier is None:
-                return None
-            for pending in output[1:-1]:
-                if pending is not None:
-                    carrier = carrier + pending
-            return carrier
+            raise TypeError(
+                f"{type(block).__name__}.forward returns a "
+                f"{len(output)}-tuple but the layer defines no "
+                "`aux_hidden_state(output)`. A drafter cannot reconstruct the "
+                "post-layer hidden state from an unknown tuple convention -- "
+                "add that method to the layer (see KimiDecoderLayer)."
+            )
 
         # Plain residual stream (no special bookkeeping).
         return output
