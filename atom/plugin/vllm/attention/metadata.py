@@ -1,4 +1,5 @@
 import logging
+import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -29,6 +30,10 @@ logger = logging.getLogger("atom")
 
 _PARTITION_SIZE_ROCM = 256
 _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
+
+# aiter's persistent MLA work plan, matching ATOM's native decode settings.
+_MLA_FAST_MODE = True
+_MLA_MAX_SPLIT_PER_BATCH = 16
 
 
 def get_aiter_kv_cache_dtype(config) -> torch.dtype:
@@ -1011,6 +1016,11 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
 class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
     """vLLM-only dense MLA metadata builder."""
 
+    # Multi-token (speculative verify) decode batches are uniform in shape, so
+    # they replay from a full decode graph. vLLM takes the minimum support
+    # across every attention backend, and anything below UNIFORM_BATCH here
+    # downgrades the whole model -- the target's verify included -- to
+    # piecewise.
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
     reorder_batch_threshold = 1
     query_len_support = QueryLenSupport.UNIFORM
@@ -1086,6 +1096,44 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         )
         self.qo_indptr = torch.zeros(max_num_reqs + 1, dtype=torch.int32, device=device)
 
+        # split_decodes_and_prefills routes every request whose query length is
+        # within reorder_batch_threshold to _build_decode, so that threshold is
+        # the widest query the persistent work descriptors below ever have to
+        # hold. It covers the speculative verify, and under parallel drafting
+        # it also covers short prompts, whose prefill lands in the decode split.
+        # Sizing the descriptors for a 1-token decode while
+        # _set_mla_persistent_worker_buffers fills them at the real width
+        # overflows the plan, and the persistent kernel then spins forever on a
+        # work queue whose indptr disagrees with its work set.
+        self.max_qo_len_capacity = self.reorder_batch_threshold
+
+        # The plan aiter asks for is not monotonic in the query length -- bf16
+        # wants the doubled one from 5 to 7 and the small one again at 8 -- so
+        # take the worst case over every length a step can present.
+        _infos = [
+            get_mla_metadata_info_v1(
+                max_num_reqs,
+                qo_len,
+                self.persistent_num_heads,
+                self.dtype_q,
+                self.dtype_kv,
+                is_sparse=False,
+                fast_mode=_MLA_FAST_MODE,
+                max_split_per_batch=_MLA_MAX_SPLIT_PER_BATCH,
+            )
+            for qo_len in range(1, self.max_qo_len_capacity + 1)
+        ]
+
+        def _largest(slot: int):
+            return max(
+                (info[slot] for info in _infos),
+                key=lambda size_and_type: math.prod(
+                    (size_and_type[0],)
+                    if isinstance(size_and_type[0], int)
+                    else size_and_type[0]
+                ),
+            )
+
         (
             (work_meta_data_size, work_meta_data_type),
             (work_indptr_size, work_indptr_type),
@@ -1093,14 +1141,13 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
             (reduce_indptr_size, reduce_indptr_type),
             (reduce_final_map_size, reduce_final_map_type),
             (reduce_partial_map_size, reduce_partial_map_type),
-        ) = get_mla_metadata_info_v1(
-            max_num_reqs,
-            1,
-            self.persistent_num_heads,
-            self.dtype_q,
-            self.dtype_kv,
-            is_sparse=False,
-            fast_mode=True,
+        ) = (
+            _largest(0),
+            _largest(1),
+            _largest(2),
+            _largest(3),
+            _largest(4),
+            _largest(5),
         )
 
         self.mla_persistent_metadata = {
@@ -1173,8 +1220,8 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
             "kv_granularity": max(self.block_size, 16),
             "max_seqlen_qo": max_q_len,
             "uni_seqlen_qo": max_q_len,
-            "fast_mode": 1,
-            "max_split_per_batch": 16,
+            "fast_mode": int(_MLA_FAST_MODE),
+            "max_split_per_batch": _MLA_MAX_SPLIT_PER_BATCH,
         }
         var = self.mla_persistent_metadata
         work_meta_data = var["work_meta_data"]
@@ -1224,18 +1271,39 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         device = self.device
         num_reqs = seq_lens_device.size(0)
 
+        # Slicing past the end silently truncates, which would hand the metadata
+        # kernel a bs it has no indptr entries for and wedge the persistent kernel.
+        assert num_reqs + 1 <= self.paged_kv_indptr.numel(), (
+            f"decode batch of {num_reqs} requests exceeds the MLA metadata "
+            f"capacity of {self.paged_kv_indptr.numel() - 1}"
+        )
+
         paged_kv_last_page_len = self.paged_kv_last_page_len[:num_reqs]
 
+        qo_len = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+        max_qo_len = qo_len.max().item() if qo_len.numel() > 0 else 1
+
+        # A full decode graph replays at the request count it was captured on,
+        # so vLLM pads the batch with slots that carry no query rows and no
+        # sequence. The persistent work plan is laid out for a uniform query
+        # length, and those empty slots leave the kernel waiting on partials
+        # nothing ever produces. Hand the padding one page of KV and its full
+        # share of query rows, the same shape the graph was captured on -- the
+        # rows it computes land in padded output slots nothing reads. Single
+        # token decode already does this via the arange below, which is why it
+        # replays from a full graph today.
+        num_padded_slots = int((qo_len == 0).sum()) if max_qo_len > 1 else 0
+        seq_lens_for_pages = (
+            seq_lens_device.clamp(min=1) if num_padded_slots else seq_lens_device
+        )
+
         torch.cumsum(
-            seq_lens_device,
+            seq_lens_for_pages,
             dim=0,
             dtype=torch.int32,
             out=self.paged_kv_indptr[1 : 1 + num_reqs],
         )
         paged_kv_indptr = self.paged_kv_indptr[: 1 + num_reqs]
-
-        qo_len = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
-        max_qo_len = qo_len.max().item() if qo_len.numel() > 0 else 1
 
         kv_indices_generate_triton(
             block_table_tensor,
@@ -1264,6 +1332,18 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
                     self.qo_indptr[num_reqs + 1 :] = num_reqs
                 self._qo_indptr_arange_ready = True
                 self._qo_indptr_arange_n = num_reqs
+        elif num_padded_slots:
+            self._qo_indptr_arange_ready = False
+            torch.arange(
+                0,
+                (num_reqs + 1) * max_qo_len,
+                max_qo_len,
+                dtype=torch.int32,
+                device=device,
+                out=self.qo_indptr[: num_reqs + 1],
+            )
+            if 1 + num_reqs < self.qo_indptr.shape[0]:
+                self.qo_indptr[1 + num_reqs :] = num_reqs * max_qo_len
         else:
             self._qo_indptr_arange_ready = False
             self.qo_indptr[: 1 + num_reqs].copy_(
@@ -1284,6 +1364,14 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
             and not self.dcp_persistent_supported
         ):
             use_persistent_metadata = False
+        # Overflowing the work descriptors wedges the persistent kernel in a
+        # spin that no timeout recovers from, so fail loudly instead. Falling
+        # back to the non-persistent kernel is not an option: asm_mla.cu rejects
+        # gqa_ratio=16 fp8 decode with qo_len > 4 outside persistent mode.
+        assert not use_persistent_metadata or max_qo_len <= self.max_qo_len_capacity, (
+            f"decode query length {max_qo_len} exceeds the persistent MLA "
+            f"work-descriptor capacity {self.max_qo_len_capacity}"
+        )
         if use_persistent_metadata:
             ctx_mla_ps = self._set_mla_persistent_worker_buffers(
                 num_reqs,
