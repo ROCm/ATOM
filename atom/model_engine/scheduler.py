@@ -138,9 +138,11 @@ class CacheStats:
     __slots__ = (
         "_interval_cached_tokens",
         "_interval_compressed_tokens",
+        "_interval_evicted_base",
         "_interval_full_tokens",
         "_interval_requests",
         "_log_interval",
+        "block_manager",
         "total_cached_tokens",
         "total_compressed_tokens",
         "total_full_tokens",
@@ -159,6 +161,10 @@ class CacheStats:
         self._interval_cached_tokens: int = 0
         self._interval_full_tokens: int = 0
         self._interval_compressed_tokens: int = 0
+        # Set by Scheduler so the interval log can report pool occupancy and the
+        # eviction count that drives cross-turn misses.
+        self.block_manager = None
+        self._interval_evicted_base: int = 0
 
     def update(
         self,
@@ -225,6 +231,19 @@ class CacheStats:
             f"Hit: {self.hit_rate:.2%}, Compressed-hit: {tot_comp:.2%}, "
             f"Lost-to-SWA-gate: {tot_gate:.2%}"
         )
+        if self.block_manager is not None:
+            occ = self.block_manager.pool_occupancy()
+            evicted_iv = occ["evicted_total"] - self._interval_evicted_base
+            self._interval_evicted_base = occ["evicted_total"]
+            total = occ["total"] or 1
+            logger.info(
+                f"[Cache Pool          ] "
+                f"used {occ['used']} ({occ['used'] / total:.0%}), "
+                f"free {occ['free']} ({occ['free'] / total:.0%}), "
+                f"retained-cache {occ['retained']}, "
+                f"evicted this interval {evicted_iv} "
+                f"(total {occ['evicted_total']})"
+            )
 
 
 def _optimal_cu_fraction(
@@ -563,10 +582,15 @@ class Scheduler:
         self.cache_stats: CacheStats | None = (
             CacheStats() if config.enable_prefix_caching else None
         )
+        if self.cache_stats is not None:
+            self.cache_stats.block_manager = self.block_manager
         self.profile_active = False
         # Cache the env flag once (env vars are fixed at process start) so the
         # per-iteration compute_detailed_aggregates never pays an os.getenv.
         self._detailed_annotation_enabled = envs.ATOM_ENABLE_DETAILED_ANNOTATION
+        self._log_prefix_cache_per_req = envs.ATOM_LOG_PREFIX_CACHE_PER_REQ
+        self._per_req_evicted_base = 0
+        self._last_pool_log_time = 0.0
 
         self.enable_chunked_prefill = config.enable_chunked_prefill
         # V4 SWA correctness on a prefix-cache hit is now handled entirely in
@@ -939,6 +963,21 @@ class Scheduler:
         self._promote_ready_remote_kv_requests()
         self._park_ready_offload_partial_prefills()
 
+        # Node-agnostic pool/eviction heartbeat: fires on BOTH prefill and decode
+        # (unlike CacheStats, which only logs on prefill admissions), so decode-side
+        # eviction is observable. Time-throttled; gated by the per-req log flag.
+        if self._log_prefix_cache_per_req and self.block_manager.enable_prefix_caching:
+            now = time.time()
+            if now - self._last_pool_log_time >= 30.0:
+                self._last_pool_log_time = now
+                occ = self.block_manager.pool_occupancy()
+                total = occ["total"] or 1
+                logger.info(
+                    f"[Cache Pool Tick] used {occ['used']} ({occ['used'] * 100 // total}%), "
+                    f"free {occ['free']}, retained-cache {occ['retained']}, "
+                    f"evicted total {occ['evicted_total']}"
+                )
+
         # should_allow_prefill() runs a cross-DP all_reduce and MUST be called
         # every tick on every rank for lockstep — hence before the early-return.
         if self.prefill_delayer is not None:
@@ -1119,6 +1158,9 @@ class Scheduler:
                 seq.prefix_cache_hit_tokens = (
                     num_cached_blocks * self.block_manager.block_size
                 )
+
+            if self._log_prefix_cache_per_req:
+                self._log_prefix_cache_admission(seq, num_cached_blocks)
 
             self._notify_connector_after_prefill_alloc(seq)
 
@@ -1472,6 +1514,25 @@ class Scheduler:
         assert chunk > 0, (
             f"chunk must be positive: {chunk=}, "
             f"{num_new_tokens=}, {budget_remaining=}"
+        )
+
+    def _log_prefix_cache_admission(
+        self, seq: Sequence, num_cached_blocks: int
+    ) -> None:
+        """One line per admitted prefill request: its prefix hit plus the pool
+        state and blocks evicted since the previous admission. Gated by
+        ATOM_LOG_PREFIX_CACHE_PER_REQ (off by default; noisy at high QPS)."""
+        bs = self.block_manager.block_size
+        cached = num_cached_blocks * bs
+        prompt = seq.num_tokens
+        occ = self.block_manager.pool_occupancy()
+        evicted_delta = occ["evicted_total"] - self._per_req_evicted_base
+        self._per_req_evicted_base = occ["evicted_total"]
+        logger.info(
+            f"[Prefix Req] req {seq.id}: prompt {prompt}, cached {cached} "
+            f"({cached / prompt if prompt else 0:.1%}), "
+            f"free {occ['free']}, retained-cache {occ['retained']}, "
+            f"evicted-since-last-req {evicted_delta}"
         )
 
     def _schedule_prefill_seq(
@@ -2112,9 +2173,43 @@ class Scheduler:
 
         logger.debug("KV transfer finished for seq %s, ready for scheduling.", seq.id)
 
-        if self.block_manager.kv_events_enabled:
-            bm = self.block_manager
-            num_cached_blocks = seq.num_cached_tokens // bm.block_size
+        # Publish the received prompt blocks into the local prefix cache so the
+        # NEXT turn on this decode node matches this prefix and pulls only the
+        # delta. Hashes full blocks (reused local-hit + RDMA-received); the decode
+        # node never runs a prefill forward for these requests, so this is the
+        # only place their prompt blocks get hashed. Runs on the consumer only.
+        bm = self.block_manager
+        prefix_caching = getattr(bm, "enable_prefix_caching", False)
+        kv_events = bm.kv_events_enabled
+        if not (prefix_caching or kv_events):
+            return True
+
+        num_cached_blocks = seq.num_cached_tokens // bm.block_size
+        # PD consumer only: the decode node received the FULL prompt KV via RDMA,
+        # so hashing every prompt block for next-turn reuse is correct. The
+        # offload/LMCache wake path shares this method but only has a PREFIX
+        # loaded — its suffix KV is not computed until the resume prefill runs and
+        # is hashed by postprocess() — so registering here would publish garbage
+        # hashes for the uncomputed suffix.
+        if prefix_caching and not self._connector_flag("is_offload"):
+            registered = bm.register_received_prefix(seq)
+            if self._log_prefix_cache_per_req and registered:
+                bs = bm.block_size
+                logger.info(
+                    "[PD Incremental] req %s: prompt %d blocks, reused-local %d "
+                    "(%d tok), delta-received %d (%d tok)",
+                    seq.id,
+                    registered,
+                    num_cached_blocks,
+                    num_cached_blocks * bs,
+                    max(0, registered - num_cached_blocks),
+                    max(0, registered - num_cached_blocks) * bs,
+                )
+
+        # Emit BlockStored(REMOTE) for the delta blocks (beyond the locally
+        # reused prefix) so external KV-cache consumers can track remote-resident
+        # blocks. Hashes are now published above, so the chain is walkable.
+        if kv_events:
             remote_hashes: list[int] = []
             remote_tokens: list[int] = []
             parent_block_hash: int | None = None
@@ -2132,7 +2227,7 @@ class Scheduler:
                 remote_tokens.extend(blk.token_ids)
                 prev_hash = blk.hash
             if remote_hashes:
-                self.block_manager.record_remote_store(
+                bm.record_remote_store(
                     block_hashes=remote_hashes,
                     token_ids=remote_tokens,
                     parent_block_hash=parent_block_hash,
