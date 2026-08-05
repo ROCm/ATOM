@@ -15,7 +15,8 @@ class BlockPool:
     content-addressed block pool, driven in lockstep with this one — and is
     kept separate because the class it serves is a whole mechanism (free list,
     hash index, lazy eviction) rather than a helper of the manager. The window
-    is a per-request ring now; see `swa_pool.py`.
+    is a per-request ring sharing a slot with the compressor state now; see
+    `v4_pool_geometry.py`.
 
     Eviction is lazy: a freed block keeps its hash and contents until its slot
     is handed out for something else, so a later request can still claim a

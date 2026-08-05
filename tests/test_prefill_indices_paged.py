@@ -18,6 +18,12 @@ if not torch.cuda.is_available():
         allow_module_level=True,
     )
 
+from atom.model_ops.attentions.v4_pool_geometry import (
+    CSA_RATIO,
+    DENSE_RATIO,
+    UnifiedPoolGeometry,
+)
+from atom.model_ops.attentions.v4_pool_geometry import HCA_RATIO as HCA_POOL_RATIO
 from atom.model_ops.v4_kernels.paged_prefill_indices import (
     write_v4_paged_prefill_indices,
     write_v4_paged_prefill_indices_reference,
@@ -26,8 +32,13 @@ from atom.model_ops.v4_kernels.paged_prefill_indices import (
 DEV = "cuda"
 WIN = 8
 CACHE_SIZE = 11  # SWA ring slots per request
-HCA_RATIO = 8
-SWA_PAGES = 10_000
+HCA_RATIO = 8  # causal-cap ratio, independent of the pool's class ratios
+RATIOS = [DENSE_RATIO, CSA_RATIO, HCA_POOL_RATIO, CSA_RATIO, HCA_POOL_RATIO]
+# block_size 256 puts 2 HCA rows in a block, which is what HCA_ROWS_PER_BLOCK
+# below exercises; the pool's own ratios stay the real ones.
+GEOMETRY = UnifiedPoolGeometry(
+    RATIOS, num_blocks=40, num_slots=4, ring_slots=CACHE_SIZE, block_size=256
+)
 
 
 def _indptr(counts, n):
@@ -84,8 +95,7 @@ def two_seq():
             block_tables=block_tables,
             T=total,
             win=WIN,
-            cache_size=CACHE_SIZE,
-            swa_pages=SWA_PAGES,
+            geometry=GEOMETRY,
             hca_ratio=HCA_RATIO,
             **ptrs,
             **bufs,
@@ -119,8 +129,8 @@ def test_kernel_matches_reference(two_seq, section):
 
 def test_prefix_window_start_maps_to_its_ring_row(two_seq):
     """seq1's first token is pos=16, so its window opens at swa_low=9. That entry
-    must be the ring row for pos 9, not a block-table lookup."""
-    expected = two_seq["slot"] * CACHE_SIZE + 9 % CACHE_SIZE
+    must be the row the geometry gives for pos 9, not a block-table lookup."""
+    expected = GEOMETRY.window_params(DENSE_RATIO).index(two_seq["slot"], 9)
     start = int(two_seq["ptrs"]["prefix_swa_indptr"][5])  # token 5 == seq1's first
     assert int(two_seq["ref"]["prefix_swa_indices"][start]) == expected
 
@@ -129,12 +139,9 @@ def test_prefix_window_start_maps_to_its_ring_row(two_seq):
 # Regression for the HCA paged-gather bug. With V4 block_size=256, ratio=128 the
 # compressor packs hca_rows_per_block = block_size // ratio = 2 HCA entries per physical
 # block (cache view [num_blocks, hca_rows_per_block, D]), so entry e -> block
-# block_tables[bid, e // rows] at slot e % rows -> row swa_pages + phys*rows +
-# slot. The pre-fix gather emitted swa_pages + block_tables[bid, e] (assumed one
-# row per block) and silently read the wrong blocks. block_size=16, ratio=8
-# gives 2 rows per block, which mirrors
-# 256 // 128 at a size the test can enumerate.
-HCA_ROWS_PER_BLOCK = 16 // 8
+# block_tables[bid, e // rows] at row e % rows -> phys*envelope_rows + row. The
+# pre-fix gather assumed one row per block and silently read the wrong blocks.
+HCA_ROWS_PER_BLOCK = 256 // 128
 _BT_K2 = [5, 9, 13, 17, 21, 25, 29, 33]
 
 
@@ -162,8 +169,7 @@ def _run_k2(fn, out_hca):
         prefix_hca_indices=out_hca,
         T=1,
         win=WIN,
-        cache_size=CACHE_SIZE,
-        swa_pages=SWA_PAGES,
+        geometry=GEOMETRY,
         hca_ratio=8,
         hca_rows_per_block=HCA_ROWS_PER_BLOCK,
     )
@@ -191,8 +197,7 @@ def test_hca_k2_offsets_are_block_packed(hca_k2):
     _, ker = hca_k2
     oracle = torch.tensor(
         [
-            SWA_PAGES
-            + _BT_K2[e // HCA_ROWS_PER_BLOCK] * HCA_ROWS_PER_BLOCK
+            _BT_K2[e // HCA_ROWS_PER_BLOCK] * GEOMETRY.envelope_rows
             + e % HCA_ROWS_PER_BLOCK
             for e in range(4)
         ],

@@ -38,15 +38,28 @@ Per-token quantities (kernel-computed from inputs; mirror the formulas in
   extend_count[t]       = min(token_pos_in_chunk[t] + 1, win)
   prefix_swa_count[t]   = max(chunk_start[bid] - swa_low[t], 0)
 
-Per-token paged offset for SWA prefix entries (matches the stride/modulo
-used by `swa_write` and `_attach_v4_paged_decode_meta`):
-  paged[t,k] = state_slot[bid] * cache_size + ((swa_low[t] + k) % cache_size)
+Per-token pool row for SWA prefix entries (the same formula `swa_write` and
+`_attach_v4_paged_decode_meta` use, from `pool_index.window_row`):
+  row[t,k] = window.index(state_slot[bid], swa_low[t] + k)
+one `window` per compress class, since the three output buffers each serve one
+class and the classes interleave their windows by different layer strides.
 """
 
 import torch
 import triton
 import triton.language as tl
 
+from atom.model_ops.attentions.v4_pool_geometry import (
+    CSA_RATIO,
+    DENSE_RATIO,
+    HCA_RATIO,
+    UnifiedPoolGeometry,
+)
+from atom.model_ops.v4_kernels.pool_index import (
+    compress_row,
+    window_constexprs,
+    window_row,
+)
 from atom.utils.decorators import mark_trace
 
 
@@ -74,11 +87,25 @@ def _v4_paged_prefill_indices_kernel(
     prefix_hca_indices_ptr,
     # Constants.
     win: tl.constexpr,
-    cache_size,  # SWA ring slots per request (= win_with_spec)
-    swa_pages,  # num_slots * cache_size — boundary into the HCA compress section
+    dense_ring_start,  # per-class window bases; the only terms the boundary moves
+    csa_ring_start,
+    hca_ring_start,
     HCA_RATIO: tl.constexpr,  # HCA compress ratio (128) for per-token causal cap
     HCA_ROWS_PER_BLOCK: tl.constexpr,  # HCA rows per block (block_size // HCA_RATIO)
+    ENVELOPE_ROWS: tl.constexpr,  # rows one block occupies across all layers
     BLOCK_N: tl.constexpr,  # next_pow2(win) — covers SWA prefix and extend segments
+    DENSE_RING_SLOTS: tl.constexpr,
+    DENSE_SLOT_ROWS: tl.constexpr,
+    DENSE_RING_STRIDE: tl.constexpr,
+    DENSE_RUN_ROWS: tl.constexpr,
+    CSA_RING_SLOTS: tl.constexpr,
+    CSA_SLOT_ROWS: tl.constexpr,
+    CSA_RING_STRIDE: tl.constexpr,
+    CSA_RUN_ROWS: tl.constexpr,
+    HCA_RING_SLOTS: tl.constexpr,
+    HCA_SLOT_ROWS: tl.constexpr,
+    HCA_RING_STRIDE: tl.constexpr,
+    HCA_RUN_ROWS: tl.constexpr,
 ):
     """One program per token. Writes four per-token segments:
 
@@ -125,10 +152,10 @@ def _v4_paged_prefill_indices_kernel(
     ext_start_row = cu_q + token_pos_in_chunk - extend_count + 1
     tl.store(extend_indices_ptr + ext_base + i, ext_start_row + i, mask=ext_mask)
 
-    # ---- SWA prefix ring offsets: written to all three prefix buffers ----
-    #   paged = state_slot_per_seq[bid] * cache_size + gp % cache_size,
+    # ---- SWA prefix rows: written to all three prefix buffers ----
+    #   row = window.index(state_slot_per_seq[bid], gp) for that buffer's class,
     #   gp = swa_low + k, k in [0, prefix_swa_count)
-    # `prefix_swa_count <= win - 1 < cache_size` (it is `chunk_start - swa_low`
+    # `prefix_swa_count <= win - 1 < ring_slots` (it is `chunk_start - swa_low`
     # and `swa_low >= pos - win + 1 >= chunk_start - win + 1`), so every position
     # this reads is inside the ring's last lap. That bound is what lets a ring
     # serve chunked prefill at all — the in-chunk part comes from the extend
@@ -138,8 +165,19 @@ def _v4_paged_prefill_indices_kernel(
     swa_mask = i < prefix_swa_count
     global_pos = swa_low + i
     swa_slot = tl.load(state_slot_per_seq_ptr + bid)
-    paged = swa_slot * cache_size + (global_pos % cache_size)
-    tl.store(prefix_swa_indices_ptr + swa_base_swa + i, paged, mask=swa_mask)
+    tl.store(
+        prefix_swa_indices_ptr + swa_base_swa + i,
+        window_row(
+            swa_slot,
+            global_pos,
+            dense_ring_start,
+            DENSE_RING_SLOTS,
+            DENSE_SLOT_ROWS,
+            DENSE_RING_STRIDE,
+            DENSE_RUN_ROWS,
+        ),
+        mask=swa_mask,
+    )
     # CSA buffer: the SWA prefix goes at the slice TAIL. `csa_translate_pack`
     # writes the CSA topk section at the slice HEAD
     # `[indptr[t], indptr[t]+valid_k)` (valid_k = slice_len - prefix_swa_count),
@@ -150,17 +188,39 @@ def _v4_paged_prefill_indices_kernel(
     # prefill writer, corrupting chunked-prefill CSA slices (prefix_swa_count>0).
     csa_end = tl.load(prefix_csa_indptr_ptr + t + 1)
     csa_tail_base = csa_end - prefix_swa_count
-    tl.store(prefix_csa_indices_ptr + csa_tail_base + i, paged, mask=swa_mask)
-    tl.store(prefix_hca_indices_ptr + swa_base_hca + i, paged, mask=swa_mask)
+    tl.store(
+        prefix_csa_indices_ptr + csa_tail_base + i,
+        window_row(
+            swa_slot,
+            global_pos,
+            csa_ring_start,
+            CSA_RING_SLOTS,
+            CSA_SLOT_ROWS,
+            CSA_RING_STRIDE,
+            CSA_RUN_ROWS,
+        ),
+        mask=swa_mask,
+    )
+    tl.store(
+        prefix_hca_indices_ptr + swa_base_hca + i,
+        window_row(
+            swa_slot,
+            global_pos,
+            hca_ring_start,
+            HCA_RING_SLOTS,
+            HCA_SLOT_ROWS,
+            HCA_RING_STRIDE,
+            HCA_RUN_ROWS,
+        ),
+        mask=swa_mask,
+    )
 
     # ---- HCA compress section: HCA entry k -> paged offset for k in [0, n_hca) ----
     # Written at offset prefix_swa_count past the SWA prefix segment in HCA buffer.
     # Each physical block packs HCA_ROWS_PER_BLOCK rows (block_size // ratio),
     # matching the compressor's cache view [num_blocks, HCA_ROWS_PER_BLOCK,
     # head_dim]: entry k lives in physical block
-    # block_tables[bid, k // HCA_ROWS_PER_BLOCK] at slot k % HCA_ROWS_PER_BLOCK,
-    # so its unified row is swa_pages + phys * HCA_ROWS_PER_BLOCK + slot.
-    # (With one row per block this reduces to swa_pages + block_tables[bid, k].)
+    # block_tables[bid, k // HCA_ROWS_PER_BLOCK] at row k % HCA_ROWS_PER_BLOCK.
     hca_dst_base = swa_base_hca + prefix_swa_count
     # block_tables row stride is `bt_stride_bs` int32 elements (== max_num_blocks_per_seq).
     bt_row_base = bid * bt_stride_bs
@@ -172,7 +232,7 @@ def _v4_paged_prefill_indices_kernel(
         bt = tl.load(block_tables_ptr + bt_row_base + blk, mask=hca_mask, other=0)
         tl.store(
             prefix_hca_indices_ptr + hca_dst_base + k,
-            swa_pages + bt * HCA_ROWS_PER_BLOCK + slot,
+            compress_row(bt, slot, ENVELOPE_ROWS),
             mask=hca_mask,
         )
 
@@ -197,8 +257,7 @@ def write_v4_paged_prefill_indices(
     prefix_hca_indices: torch.Tensor,
     T: int,
     win: int,
-    cache_size: int,
-    swa_pages: int,
+    geometry: UnifiedPoolGeometry,
     hca_ratio: int = 128,
     hca_rows_per_block: int = 1,
     prefix: str = "",
@@ -249,9 +308,9 @@ def write_v4_paged_prefill_indices(
       prefix_hca_indices:        ``[hca_total]`` int OUT — fully written.
       T:                         int — token count (grid size).
       win:                       int — SWA window size (per-token SWA cap).
-      cache_size:                int — ``win + max_spec_steps`` (ring slots per req
-                                  and modulo for paged offset).
-      swa_pages:                 int — ``num_slots * cache_size`` boundary in unified_kv.
+      geometry:                  the pool's `UnifiedPoolGeometry`; supplies one
+                                  `WindowParams` per compress class plus the
+                                  envelope stride the compress section needs.
     """
     if T == 0:
         return
@@ -272,6 +331,9 @@ def write_v4_paged_prefill_indices(
     ):
         assert idx.dim() == 1
 
+    dense = geometry.window_params(DENSE_RATIO)
+    csa = geometry.window_params(CSA_RATIO)
+    hca = geometry.window_params(HCA_RATIO)
     BLOCK_N = triton.next_power_of_2(win)
     _v4_paged_prefill_indices_kernel[(T,)](
         positions,
@@ -291,11 +353,16 @@ def write_v4_paged_prefill_indices(
         prefix_csa_indices,
         prefix_hca_indices,
         win=win,
-        cache_size=cache_size,
-        swa_pages=swa_pages,
+        dense_ring_start=dense.ring_start,
+        csa_ring_start=csa.ring_start,
+        hca_ring_start=hca.ring_start,
         HCA_RATIO=hca_ratio,
         HCA_ROWS_PER_BLOCK=hca_rows_per_block,
+        ENVELOPE_ROWS=geometry.envelope_rows,
         BLOCK_N=BLOCK_N,
+        **window_constexprs(dense, "DENSE_"),
+        **window_constexprs(csa, "CSA_"),
+        **window_constexprs(hca, "HCA_"),
     )
 
 
@@ -318,8 +385,7 @@ def write_v4_paged_prefill_indices_reference(
     prefix_hca_indices: torch.Tensor,
     T: int,
     win: int,
-    cache_size: int,
-    swa_pages: int,
+    geometry: UnifiedPoolGeometry,
     hca_ratio: int = 128,
     hca_rows_per_block: int = 1,
 ) -> None:
@@ -333,6 +399,9 @@ def write_v4_paged_prefill_indices_reference(
     """
     if T == 0:
         return
+    dense = geometry.window_params(DENSE_RATIO)
+    csa = geometry.window_params(CSA_RATIO)
+    hca = geometry.window_params(HCA_RATIO)
     bid_cpu = bid_per_token[:T].cpu().tolist()
     pos_cpu = positions[:T].cpu().tolist()
     cs_per_seq_cpu = chunk_start_per_seq.cpu().tolist()
@@ -373,31 +442,38 @@ def write_v4_paged_prefill_indices_reference(
         sb_swa = swa_indptr_cpu[t]
         sb_hca = hca_indptr_cpu[t]
         if prefix_swa_count > 0:
-            global_pos = torch.arange(
-                swa_low,
-                swa_low + prefix_swa_count,
-                device=device,
-                dtype=prefix_swa_indices.dtype,
-            )
+            global_pos = range(swa_low, swa_low + prefix_swa_count)
             slot = int(state_slot_per_seq[bid])
-            paged = slot * cache_size + (global_pos % cache_size)
-            prefix_swa_indices[sb_swa : sb_swa + prefix_swa_count] = paged
+
+            def rows(params, buf, positions=global_pos, s=slot):
+                return torch.tensor(
+                    [params.index(s, p) for p in positions],
+                    dtype=buf.dtype,
+                    device=device,
+                )
+
+            prefix_swa_indices[sb_swa : sb_swa + prefix_swa_count] = rows(
+                dense, prefix_swa_indices
+            )
             # CSA: SWA prefix at the slice TAIL (head holds the CSA topk section
             # filled by csa_translate_pack). See the kernel comment above.
             csa_end = csa_indptr_cpu[t + 1]
-            prefix_csa_indices[csa_end - prefix_swa_count : csa_end] = paged
-            prefix_hca_indices[sb_hca : sb_hca + prefix_swa_count] = paged
+            prefix_csa_indices[csa_end - prefix_swa_count : csa_end] = rows(
+                csa, prefix_csa_indices
+            )
+            prefix_hca_indices[sb_hca : sb_hca + prefix_swa_count] = rows(
+                hca, prefix_hca_indices
+            )
 
         # HCA compress: entry k lives in physical block
-        # block_tables[bid, k // hca_rows_per_block] at slot
-        # k % hca_rows_per_block, so its unified row is
-        # swa_pages + phys * hca_rows_per_block + slot.
+        # block_tables[bid, k // hca_rows_per_block] at row
+        # k % hca_rows_per_block.
         if n_hca > 0:
             ks = torch.arange(n_hca, device=device)
             blk = (ks // hca_rows_per_block).cpu()
-            slot = (ks % hca_rows_per_block).to(prefix_hca_indices.dtype)
+            row = (ks % hca_rows_per_block).to(prefix_hca_indices.dtype)
             bt = block_tables_cpu[bid, blk].to(device).to(prefix_hca_indices.dtype)
             hca_dst = sb_hca + prefix_swa_count
             prefix_hca_indices[hca_dst : hca_dst + n_hca] = (
-                swa_pages + bt * hca_rows_per_block + slot
+                bt * geometry.envelope_rows + row
             )

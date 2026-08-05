@@ -19,6 +19,7 @@ from atom.model_ops.attentions.state_arena import (
     StateArena,
     StateField,
     entry_bytes_for,
+    plan_field_planes,
     plan_regions,
 )
 
@@ -307,3 +308,108 @@ class TestRejectsBadFieldLists:
         ]
         with pytest.raises(ValueError, match="duplicate field names"):
             StateArena(dup, 4, device="cpu")
+
+
+# ── An arena strided by something bigger than itself ───────────────────────
+#
+# When the compressor state moves into the front of a slot in a shared plane,
+# consecutive entries are a slot apart rather than an entry apart, and only
+# the top of the index range belongs to the pool — the rest of the plane is
+# compressed blocks.
+
+
+class TestSlotStride:
+    def build(self, entries=5, live=None, stride=None):
+        stride = stride or (entry_bytes_for(V4_LIKE) + 4 * 256)
+        return StateArena(
+            V4_LIKE, entries, device="cpu", slot_stride=stride, live_entries=live
+        )
+
+    def test_entries_land_one_stride_apart(self):
+        arena = self.build()
+        starts = [
+            arena.view("csa_main_kv")[0, i].storage_offset() * 4
+            for i in range(arena.entries)
+        ]
+        assert [b - a for a, b in pairwise(starts)] == [arena.slot_stride] * 4
+
+    def test_an_entry_is_still_its_own_contiguous_range(self):
+        arena = self.build()
+        arena.view("hca_main_kv")[:, 2] = 7.0
+        assert arena.entry(2).view(torch.float32).eq(7.0).any()
+        assert not arena.entry(3).view(torch.float32).eq(7.0).any()
+
+    def test_the_gap_between_entries_is_never_written(self):
+        """It belongs to whatever else shares the plane — blocks, in V4."""
+        arena = self.build()
+        stride, size = arena.slot_stride, arena.entry_bytes
+        for i in range(arena.entries - 1):
+            gap = arena.buf[i * stride + size : (i + 1) * stride]
+            assert gap.numel() > 0 and not gap.any()
+
+    def test_only_the_live_tail_is_initialized(self):
+        """A pool that grows takes the next index DOWN, so the live entries are
+        the top of the range. Filling the rest would write over the blocks the
+        boundary has not given up yet."""
+        arena = self.build(entries=5, live=2)
+        score = arena.view("csa_main_score")
+        assert torch.isinf(score[:, 3:]).all()
+        assert (score[:, :3] == 0).all()
+
+    def test_a_stride_under_one_entry_is_rejected(self):
+        with pytest.raises(ValueError, match="under the"):
+            StateArena(V4_LIKE, 2, device="cpu", slot_stride=256)
+
+    def test_a_misaligned_stride_is_rejected(self):
+        with pytest.raises(ValueError, match="multiple of"):
+            StateArena(
+                V4_LIKE, 2, device="cpu", slot_stride=entry_bytes_for(V4_LIKE) + 8
+            )
+
+
+class TestPlanFieldPlanes:
+    """Splitting the fields across planes of differing row width.
+
+    A slot reserves the same row count in every plane, so what it costs is set
+    by whichever plane its share overflows first.
+    """
+
+    def rows_used(self, groups, widths):
+        return [-(-entry_bytes_for(g) // w) if g else 0 for g, w in zip(groups, widths)]
+
+    def test_one_plane_takes_everything(self):
+        groups, rows = plan_field_planes(V4_LIKE, [512])
+        assert groups == [V4_LIKE]
+        assert rows == -(-entry_bytes_for(V4_LIKE) // 512)
+
+    def test_two_planes_beat_one_of_the_same_total_width(self):
+        """640 B of row split 512/128 holds a slot in fewer rows than 512 alone
+        — which is the whole reason the state goes in the row space at all."""
+        _, wide_only = plan_field_planes(V4_LIKE, [512])
+        _, split = plan_field_planes(V4_LIKE, [512, 128])
+        assert split < wide_only
+
+    def test_every_field_lands_in_exactly_one_plane(self):
+        groups, _ = plan_field_planes(V4_LIKE, [512, 128])
+        placed = [f.name for g in groups for f in g]
+        assert sorted(placed) == sorted(f.name for f in V4_LIKE)
+
+    def test_the_answer_is_the_best_of_every_assignment(self):
+        widths = [512, 128]
+        groups, rows = plan_field_planes(V4_LIKE, widths)
+        assert max(self.rows_used(groups, widths)) == rows
+        for code in range(2 ** len(V4_LIKE)):
+            trial = [[], []]
+            for bit, field in enumerate(V4_LIKE):
+                trial[(code >> bit) & 1].append(field)
+            assert max(self.rows_used(trial, widths)) >= rows
+
+    def test_field_order_inside_a_plane_is_the_declared_one(self):
+        groups, _ = plan_field_planes(V4_LIKE, [512, 128])
+        for group in groups:
+            names = [f.name for f in group]
+            assert names == [f.name for f in V4_LIKE if f.name in names]
+
+    def test_a_row_space_with_no_planes_is_rejected(self):
+        with pytest.raises(ValueError, match="at least one plane"):
+            plan_field_planes(V4_LIKE, [])

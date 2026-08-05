@@ -1050,16 +1050,22 @@ class StubStateCache:
         pass
 
 
-def swa_pool(**overrides):
-    """A second state class for the protocol tests. Named for what it stands in
-    for historically; its behaviour is the stub's, not any real pool's."""
+def second_class(**overrides):
+    """A second state class for the protocol tests.
+
+    A stub rather than a real one: multi-class behaviour is a property of the
+    ladder, not of whichever class happens to exist beside `StateGroupPool`,
+    and testing it through a real one made these tests hostage to that class's
+    lifetime — which is how they broke when the sliding window stopped being a
+    pool of its own.
+    """
     return StubStateCache(**overrides)
 
 
 class TestStateCacheProtocol:
 
     def test_both_classes_satisfy_the_protocol(self):
-        assert isinstance(swa_pool(), StateCache)
+        assert isinstance(second_class(), StateCache)
         assert isinstance(StateGroupPool(4), StateCache)
 
     def test_a_class_that_keeps_nothing_reports_inf(self):
@@ -1070,7 +1076,7 @@ class TestStateCacheProtocol:
         scheduler cut prefill chunks at every rung for a class that stores
         nothing there — cost with no reuse.
         """
-        assert isinf(swa_pool().successor_room)
+        assert isinf(second_class().successor_room)
         assert isinf(StateGroupPool(4, StateTransfer.none()).successor_room)
 
     def test_the_limit_follows_the_class_that_reaches_furthest(self):

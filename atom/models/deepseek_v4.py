@@ -1298,7 +1298,7 @@ class Indexer(nn.Module):
         # `csa_idx_kv` classical KV pool. The 1-slot register_buffer below is
         # a warmup fallback (warmup runs before allocate_kv_cache); it is
         # setattr-replaced post-binding and GC'd. Same pattern as Compressor's
-        # kv_state in pre2a / Attention.swa_kv in pre2c-A.
+        # kv_state in pre2a / Attention.swa_plane in pre2c-A.
         self.register_buffer(
             "kv_cache",
             torch.zeros(
@@ -2387,21 +2387,23 @@ class DeepseekV4Attention(nn.Module):
             self.indexer = None
 
         # ----- KV cache splitting (paper §3.6.1) -----
-        # State cache (per-request slot, in per_req_cache pool):
-        #   `swa_kv`: [num_slots, n_win, head_dim] — most recent n_win window.
-        #   Bound by DeepseekV4AttentionMetadataBuilder.build_kv_cache_tensor()
-        #   after allocate_kv_cache. The 1-slot register_buffer below is a
-        #   warmup fallback (warmup runs before allocate_kv_cache); after
-        #   binding it is setattr-replaced with the per_req_cache pool slice
-        #   `[max_num_seqs, n_win, head_dim]` and the original buffer is GC'd.
+        # Per-request sliding window: `swa_plane` is this layer's view of the
+        # shared KV plane and `swa_window` (a `WindowParams`) is where in it a
+        # request's rows are. Both are bound by
+        # `DeepseekV4AttentionMetadataBuilder.build_kv_cache_tensor` after
+        # allocate_kv_cache. The 1-row register_buffer below is a warmup
+        # fallback (warmup runs before allocate_kv_cache); after binding it is
+        # setattr-replaced with the plane view and the original buffer is GC'd.
         # `unified_kv` (paged_decode/paged_prefill base) is NOT pre-registered
         # — V4Attention.forward short-circuits the sparse_attn dispatch on
         # `is_dummy_run` so warmup never reads it.
         self.register_buffer(
-            "swa_kv",
-            torch.zeros(1, args.window_size, self.head_dim),
+            "swa_plane",
+            torch.zeros(args.window_size, self.head_dim),
             persistent=False,
         )
+        self.swa_plane_rope = None
+        self.swa_window = None
         # Classical KV cache (paper §3.6.1) lives entirely in the global
         # `csa_main_kv` / `hca_main_kv` pool (allocated by the V4 attention
         # builder as `[num_blocks, n_layers, k_per_block, head_dim]`).
@@ -2452,7 +2454,7 @@ class DeepseekV4Attention(nn.Module):
         # Frozen bool: when KV cache dtype is fp8, route writes/attention to the
         # native 2buff fp8 path (compute-only 2buff quant, op4 fp8 prefill, op5
         # asm decode). Dynamo specializes on this constant so the bf16 path
-        # traces unchanged. The rope buffers (swa_kv_rope / unified_kv_rope) are
+        # traces unchanged. The rope planes (swa_plane_rope / unified_kv_rope) are
         # bound onto the module by DeepseekV4AttentionMetadataBuilder.
         self.kv_fp8 = atom_config.kv_cache_dtype == "fp8"
 
@@ -2781,9 +2783,10 @@ class DeepseekV4Attention(nn.Module):
         if fc.context.is_dummy_run or os.environ.get("ATOM_V4_BYPASS_ATTN") == "1":
             return x.new_zeros((x.shape[0], self.n_local_heads * self.head_dim))
         num_tokens = x.size(0)
-        # swa_kv is the flat [num_slots * cache_size, head_dim] ring region at
-        # the head of unified_kv; cache_size is the per-request ring stride.
-        swa_cache_size = self.swa_cache_size
+        # `swa_plane` is this layer's whole view of the KV plane; `swa_window`
+        # says where in it a request's window rows are. They are not a prefix:
+        # a class interleaves its layers' windows by the layer stride the
+        # compress side forces, so a row is a formula, not a slice.
         ratio = self.compress_ratio
         rd = self.rope_head_dim
 
@@ -2815,6 +2818,11 @@ class DeepseekV4Attention(nn.Module):
                 x, plan_for_layer, state_slot_in, state_slot_out, block_tables_gpu
             )
         is_decode = attn_md.state is AttnState.DECODE
+        swa_dest_rows = (
+            attn_md.swa_dest_rows[ratio]
+            if (is_decode and attn_md.swa_dest_rows is not None)
+            else None
+        )
         # Single kernel fuses per-head Q RMSNorm (weightless) + KV RMSNorm
         # (weighted) + GPT-J interleaved RoPE on the tail rd dims. Dispatches
         # to flydsl when the shape matches (V4-Pro is always V4-Pro shape →
@@ -2822,34 +2830,17 @@ class DeepseekV4Attention(nn.Module):
         # from 4 (1.12×) to 32k (1.04×); used for both decode and prefill.
         # Optional FP8 quant outputs left off — downstream sparse_attn /
         # swa_write are still bf16.
-        # Decode folds the SWA cache-write into qk_norm_rope_maybe_quant: the
-        # post-norm/rope KV row is written into swa_kv[slot, pos%cache, :]
-        # (slot = state_slot_out[batch_id_per_token[t]]). The flydsl path
-        # fuses it into the kernel launch; the Triton fallback emits a separate
-        # swa_write internally — either way the bridge owns the SWA write, so
-        # no backend dispatch is needed here. Prefill writes its in-chunk SWA
-        # tail after sparse_attn, so it passes swa_kv=None and never fuses.
-        # For decode, write_per_batch (= min(max_seqlen_q, cache_size)) >=
-        # tokens-per-seq, so the fused per-token scatter (gated on batch_id>=0)
-        # covers exactly the tokens the old standalone swa_write did.
-        # Decode FUSES the SWA ring write into the qk_norm_rope launch — this
-        # drops a separate _swa_write_kernel launch per layer. The flydsl kernel
-        # writes
-        #   swa_kv[state_slot_out[bid] * cs + pos % cs] = kv_out[t]
-        # for every token (gated on batch_id>=0), matching the standalone
-        # swa_write exactly. Decode has no ordering hazard (unlike prefill,
-        # which writes its in-chunk SWA tail AFTER sparse_attn so chunked
-        # prefix reads see prior-chunk contents), so writing here (before the
-        # decode attention reads the window) is safe. Prefill → swa_kv=None,
-        # separate post-attn swa_write below.
-        # Fused per-head weightless Q RMSNorm + weighted KV RMSNorm + GPT-J RoPE,
-        # dispatching on the kv-cache layout inside the wrapper (fp8 2buff ↔ bf16)
-        # so this call site is branch-free. Decode FUSES the SWA ring write
-        # into the launch
-        # (bf16: flydsl swa_kv; fp8: aiter swa_nope/rope buffers — each K row
-        # scattered into its SWA pool, batch_id<0 skips CG-pad), running before the
-        # decode attention reads the window (no ordering hazard). Prefill passes
-        # swa_*=None and scatters its window tail post-attn below.
+        #
+        # Decode FUSES the window write into this launch, dropping a separate
+        # `_swa_write_kernel` per layer. Each token's post-norm/rope K row is
+        # scattered to `attn_md.swa_dest_rows[ratio][t]` (batch_id<0 skips the
+        # CG pad) — bf16 through the flydsl kernel over `swa_kv`, fp8
+        # through the aiter group-quant launch over the two `swa_*_buff` pools.
+        #
+        # Decode has no ordering hazard, so writing before the attention reads
+        # the window is safe. Prefill does — chunked prefix reads must see the
+        # PRIOR chunk — so it passes `swa_*=None` and scatters its window tail
+        # after sparse_attn below.
         #
         # bf16 → qkn.q_sa / qkn.kv populated; fp8 2buff → qkn.q_packed / qkn.q_rope
         # / qkn.k_packed / qkn.k_rope populated (the 2buff layout nope-fp8 [.,512] +
@@ -2870,24 +2861,18 @@ class DeepseekV4Attention(nn.Module):
             quant_k=False,
             fp8_2buff=self.kv_fp8,
             batch_id_per_token=attn_md.batch_id_per_token if is_decode else None,
-            # The ring's destination row. Under the paged predecessor this came
-            # from `swa_block_tables`, so the slot never had to reach the fused
-            # write; a ring addresses by slot, so it does.
-            state_slot_mapping=state_slot_out if is_decode else None,
-            swa_cache_size=swa_cache_size if is_decode else None,
+            # Where each token's own KV row goes, built once per forward for
+            # this layer's compress class. The fused write takes the row rather
+            # than the slot because a window row is no longer `slot * cs +
+            # pos % cs` — it interleaves by the class's layer stride, which is
+            # arithmetic that belongs to `v4_pool_geometry`, not to a kernel in
+            # another repository.
+            swa_dest_rows=swa_dest_rows,
             # bf16 SWA fusion (flydsl kernel / Triton fallback):
-            swa_kv=self.swa_kv if (is_decode and not self.kv_fp8) else None,
-            swa_cu_seqlens_q=attn_md.cu_seqlens_q if is_decode else None,
-            # Capped at the ring: two tokens of one seq beyond `swa_cache_size`
-            # apart map to the same row. `1 + mtp_k <= win_with_spec` holds by
-            # construction at decode, so the min only documents the invariant —
-            # except on a spec model whose max_seqlen_q bucket is padded wider.
-            swa_write_per_batch=(
-                min(attn_md.max_seqlen_q, swa_cache_size) if is_decode else None
-            ),
+            swa_kv=self.swa_plane if (is_decode and not self.kv_fp8) else None,
             # fp8 2buff SWA fusion (aiter group-quant launch):
-            swa_nope_scale_buff=self.swa_kv if (is_decode and self.kv_fp8) else None,
-            swa_rope_buff=self.swa_kv_rope if (is_decode and self.kv_fp8) else None,
+            swa_nope_scale_buff=self.swa_plane if (is_decode and self.kv_fp8) else None,
+            swa_rope_buff=self.swa_plane_rope if (is_decode and self.kv_fp8) else None,
             prefix=f"{self.layer_name}.qk_norm_rope_maybe_quant",
         )
         if _V4_USE_REF_QUANT and not self.kv_fp8:
@@ -3084,18 +3069,18 @@ class DeepseekV4Attention(nn.Module):
                 positions_full,
                 attn_md.cu_seqlens_q,
                 state_slot_out,
-                self.swa_kv,
-                swa_cache_size,
+                self.swa_plane,
+                self.swa_window,
                 # Window-only: persist just the chunk's trailing `window` tokens
-                # — see the OPT note above. A ring holds exactly the last
-                # `swa_cache_size` writes, so persisting more would only
+                # — see the OPT note above. A request's windows hold exactly its
+                # last `ring_slots` writes, so persisting more would only
                 # overwrite what this same call just wrote.
                 # K source is the PCP all-gathered full extend K (k_*_full); off
                 # PCP it falls back to qkn.k_packed/k_rope (single-rank identical).
                 min(self.window_size, attn_md.max_seqlen_q),
                 k_packed=k_packed_full,
                 k_rope=k_rope_full,
-                swa_region_rope=self.swa_kv_rope,
+                pool_rope=self.swa_plane_rope,
                 prefix=f"{self.layer_name}.swa_write",
             )
 
@@ -3130,8 +3115,7 @@ class DeepseekV4Attention(nn.Module):
           block_idx_in_seq = topk_local // csa_block_capacity
           slot_in_block    = topk_local %  csa_block_capacity
           physical_block   = block_tables[batch_id_per_token[t], block_idx_in_seq]
-          paged_offset     = swa_pages + physical_block * csa_block_capacity
-                             + slot_in_block
+          row              = physical_block * envelope_rows + slot_in_block
 
         Fully fused into one triton kernel — no [T, index_topk] intermediates,
         no PyTorch fancy index. CG sentinel (batch_id=-1) and OOB clamp are
@@ -3181,7 +3165,7 @@ class DeepseekV4Attention(nn.Module):
             attn_md.batch_id_per_token,
             skip_buf,
             kv_indices,
-            swa_pages=attn_md.swa_pages,
+            envelope_rows=attn_md.envelope_rows,
             csa_block_capacity=csa_block_capacity,
             window_size=window_size,
             prefix=f"{self.layer_name}.csa_translate_pack",

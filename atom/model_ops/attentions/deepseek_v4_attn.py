@@ -59,22 +59,28 @@ from atom.distributed.pcp_utils import (
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.state_pool import StateTransfer
-from atom.model_engine.swa_pool import SWA_POOL_CLASS
 from atom.model_ops.attentions.backends import (
     AttentionBackend,
     AttentionMetadataBuilder,
     CommonAttentionBuilder,
 )
 from atom.model_ops.attentions.state_arena import (
+    SplitStateArena,
     StateArena,
     StateField,
-    entry_bytes_for,
+    plan_field_planes,
     plan_regions,
 )
 from atom.model_ops.attentions.sub_pool_spec import (
     SubPoolSpec,
     page_pool,
     state_pool,
+)
+from atom.model_ops.attentions.v4_pool_geometry import (
+    CSA_RATIO,
+    DENSE_RATIO,
+    HCA_RATIO,
+    UnifiedPoolGeometry,
 )
 from atom.model_ops.v4_kernels import (
     FP4_MQA_BLOCK_K,
@@ -93,6 +99,15 @@ from atom.utils.forward_context import (
 )
 
 logger = logging.getLogger("atom")
+
+# Per-compress-class buffer holding, for each decode token, the plane row its
+# own KV goes to. One per class because a class interleaves its layers' windows
+# by its own stride, so the same token lands somewhere different in each.
+_DEST_ROW_BUFFERS = {
+    DENSE_RATIO: "v4_swa_dest_dense",
+    CSA_RATIO: "v4_swa_dest_csa",
+    HCA_RATIO: "v4_swa_dest_hca",
+}
 
 # ---------------------------------------------------------------------------
 # Typed metadata surface for V4. The base AttentionMetaData class is shared
@@ -213,9 +228,15 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     kv_indptr_hca: torch.Tensor | None = None
     """[padded_T+1] int32 GPU — packed cumsum of per-token HCA kv_len
     (= `min(positions[t]+1, win) + n_committed_hca[bid]`). Padded tail = last value."""
-    swa_pages: int = 0
-    """Boundary in `unified_kv`: index < swa_pages → SWA region; index >=
-    swa_pages → compress region. `num_slots * win_with_spec`."""
+    envelope_rows: int = 0
+    """Rows one V4 block takes across every layer of the pool — the stride from
+    one block's compressed rows to the next in a layer's view of a plane. What
+    `csa_translate_pack` turns a physical block id into a row with."""
+    swa_dest_rows: dict[int, torch.Tensor] | None = None
+    """{compress ratio: [padded_T] int32 GPU} — the plane row each decode token's
+    own KV goes to, in a layer of that class. Handed to the fused SWA write so
+    the row formula lives in one place; decode-only (prefill scatters its window
+    tail through `swa_write`, which derives the row itself)."""
 
     # ----- Native 2buff fp8 per-token paged-decode index tensors -----
     # Feed the aiter asm decode kernel `mla_decode_fwd_v4_nm` (op5), which treats
@@ -513,6 +534,27 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # `swa_write` modulo, and the ring-index modulo `cs` in the V4
         # paged-decode index-write kernel.
         self.win_with_spec = self.window_size + self.max_spec_steps
+        # How the compressor state divides between the planes, and what that
+        # costs a slot in rows. Settled here because the row space is built
+        # from it and sizing prices a slot before either count exists.
+        self._arena_planes, arena_rows = plan_field_planes(
+            self._state_fields(), self._plane_row_widths()
+        )
+        # The row space both KV planes materialize (see `v4_pool_geometry`).
+        # Built at capacity zero: sizing has to price a block and a request
+        # before either count exists, and both prices are counts of rows, which
+        # the split does not change. `allocate_per_req_cache` replaces this with
+        # the same layout at the split sizing chose. Nothing dereferences an
+        # address before then — warmup runs first and `DeepseekV4Attention`
+        # short-circuits on `is_dummy_run`.
+        self.pool_geometry = UnifiedPoolGeometry(
+            self.compress_ratios,
+            num_blocks=0,
+            num_slots=0,
+            ring_slots=self.win_with_spec,
+            block_size=self.block_size,
+            arena_rows=arena_rows,
+        )
         # Worst-case HCA per-token committed compress count
         # (= max_model_len // 128 for V4-Pro = 8192 at 1M context).
         self.max_committed_hca = model_runner.config.max_model_len // 128
@@ -526,7 +568,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
         self._ubatch_decode_meta: list | None = None
         # Filled on the first checkpoint copy — the pools do not exist yet here.
-        self._swa_views: list[list[torch.Tensor]] | None = None
+        self._slot_view_cache: list[list[torch.Tensor]] | None = None
 
     @property
     def prep_stream(self):
@@ -559,14 +601,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             StateField("hca_main_score", n_hca, self.hca_main_state_shape, dt, neg_inf),
         ]
 
-    def _per_req_state_bytes(self) -> int:
-        """Bytes for ONE request's compressor state across all layers.
-
-        Derived from the same field list the arena is built from, so the byte
-        budget and the allocation cannot drift apart.
-        """
-        return entry_bytes_for(self._state_fields())
-
     def state_transfer(self) -> StateTransfer:
         """A copy: one request's compressor state is one contiguous entry.
 
@@ -591,29 +625,23 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         return StateTransfer.copy()
 
     def copy_state_entries(self, pairs: list[tuple[int, int]]) -> None:
-        """Duplicate a request's whole per-request state: compressor + SWA ring.
+        """Duplicate a request's whole per-request state: compressor + windows.
 
-        The compressor half is one `copy_` per pair — the whole entry rather than
-        just the rows a resumer reads (the CSA ring's trailing `K - ratio` = 4,
-        HCA's none), because the entry is contiguous and those rows are not, so 4
-        rows would cost 84 strided copies against this one.
+        One range per plane, and a plane is all there is: a slot holds the
+        compressor state and then every layer's windows, contiguously, so the
+        two halves of a request's state copy as one slice. Copying the state
+        whole rather than just the rows a resumer reads (the CSA ring's
+        trailing `K - ratio` = 4, HCA's none) is what makes that true — those
+        rows are scattered, and picking them out would cost 84 strided copies
+        against this one.
 
-        The SWA half cannot join that copy: the ring lives at the head of each
-        layer's `unified_kv`, which is laid out layer-major, while an arena entry
-        is request-major. So it is `num_layers` slices per pair, batched into one
-        launch by `_foreach_copy_`.
-
-        **The SWA half is what makes the ring safe.** A private ring is exactly
-        what #1417 removed, because a request resuming a cached prefix had never
-        written that prefix into its own ring. Reinstating the ring is only
+        **The window half is what makes the private ring safe.** A per-request
+        ring is exactly what #1417 removed, because a request resuming a cached
+        prefix had never written that prefix into its own. Reinstating it is only
         correct because the checkpoint carries the window across — drop this and
         the bug returns, silently, as garbage attention over the reused prefix.
         """
-        arena = self.model_runner.v4_state_arena
-        for src, dst in pairs:
-            arena.entry(dst).copy_(arena.entry(src))
-
-        views = self._swa_slot_views()
+        views = self._slot_views()
         dsts, srcs = [], []
         for src, dst in pairs:
             dsts += views[dst]
@@ -621,57 +649,36 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         if dsts:
             torch._foreach_copy_(dsts, srcs)
 
-    def _swa_slot_views(self) -> list[list[torch.Tensor]]:
-        """Per-slot lists of every layer's ring rows, built once.
+    def _slot_views(self) -> list[list[torch.Tensor]]:
+        """Per-group views of that request's whole slot in each plane.
 
-        `_foreach_copy_` wants lists of tensors, and slicing them per call is
-        what dominates: measured at 41 layers x 2 pools, building the slices for
-        one pair costs 133 us against 29 us for the copy itself, and it is host
-        time on the batch-construction path. A slot's rows are at a fixed
-        address for the pool's whole life, so the views are built on first use
-        and indexed thereafter (0.2 us per pair).
-
-        This is also why the layout mismatch underneath — the ring is layer-major
-        in `unified_kv`, an arena entry is request-major, so one `copy_` cannot
-        span both — is not worth fixing: it costs one extra kernel launch, an
-        order of magnitude less than what precomputing already removes.
+        Built once: a slot's rows are at a fixed address for the pool's whole
+        life, and `_foreach_copy_` wants lists, so re-slicing per call would put
+        host time on the batch-construction path for nothing.
         """
-        if self._swa_views is None:
-            cs = self.win_with_spec
-            pools = [
-                layer
-                for pool in (
-                    self.model_runner.v4_unified_kv,
-                    self.model_runner.v4_unified_kv_rope,
-                )
-                for layer in pool
-                if layer is not None  # bf16 build has no parallel rope pool
+        if self._slot_view_cache is None:
+            geo = self.pool_geometry
+            self._slot_view_cache = [
+                [
+                    plane[slice(*geo.slot_span(geo.physical_slot(g)))]
+                    for plane in self._kv_planes()
+                ]
+                for g in range(self.num_state_slots)
             ]
-            self._swa_views = [
-                [p[i * cs : (i + 1) * cs] for p in pools]
-                for i in range(self.num_state_slots)
-            ]
-        return self._swa_views
+        return self._slot_view_cache
 
-    def swa_row_bytes_per_layer(self) -> int:
-        """Bytes ONE SWA ring row costs in ONE layer (one token at full
-        resolution). Single source for the per-layer SWA stride, reused by the
-        per-request ring size and the KV-transfer region stride."""
-        b = self.head_dim * self._swa_dtype.itemsize
-        if self._kv_fp8:
-            # 2buff: parallel bf16 rope pool [., rope_head_dim].
-            b += self.rope_head_dim * self._rope_dtype.itemsize
-        return b
+    def nope_row_bytes(self) -> int:
+        """Bytes one row costs in the NoPE plane (fp8-packed or bf16)."""
+        return self.head_dim * self._classical_dtype.itemsize
 
-    def _swa_ring_bytes(self) -> int:
-        """Bytes ONE request's SWA ring costs across all layers.
+    def rope_row_bytes(self) -> int:
+        """Bytes one row costs in the RoPE plane; 0 on a bf16 build, which
+        keeps RoPE inline in the NoPE row and has no second plane."""
+        return self.rope_head_dim * self._rope_dtype.itemsize if self._kv_fp8 else 0
 
-        `win_with_spec` rows, not a block count: the window is local, so a
-        request never needs history older than its own last `win_with_spec`
-        writes. Cross-request reuse comes from the checkpoint copy, not from
-        sharing rows.
-        """
-        return self.num_layers * self.win_with_spec * self.swa_row_bytes_per_layer()
+    def plane_row_bytes(self) -> int:
+        """What one row of the shared row space costs across both planes."""
+        return self.nope_row_bytes() + self.rope_row_bytes()
 
     @property
     def num_state_slots(self) -> int:
@@ -686,62 +693,72 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         """
         return self._rows_per_block.get(compress_ratio, 0)
 
-    def sub_pool_specs(self) -> list[SubPoolSpec]:
-        """Two pools, three entry classes: paged compressed KV, plus a
-        window-freed SWA class and the compressor ring, both per-request.
+    def _indexer_block_bytes(self) -> int:
+        """Bytes one V4 block costs in the CSA Indexer pool, all CSA layers.
 
-        Per-V4-block bytes for the paged class. Each V4 block
-        (block_size=256 original tokens) stores per layer:
-          - CSA Main:    64 rows × head_dim BF16
-          - CSA Indexer: 64 rows × (index_head_dim + 4) bytes FP8. Data and
-                         scale are two REGIONS inside the block, not
-                         interleaved per row: `[rows*index_head_dim FP8]`
-                         then `[rows*4 fp32 scale]`. Written by
-                         `indexer_k_quant_and_cache`, read by
-                         `cp_gather_indexer_k_quant_cache` and
-                         `deepgemm_fp8_paged_mqa_logits`.
-          - HCA Main:     2 rows × head_dim BF16
+        The indexer is the one classical pool outside the shared row space: it
+        addresses `(block, row)` in its own dtype with a runtime block stride,
+        so it never has to agree with anyone else's row width.
         """
-        elem_classical = self._classical_dtype.itemsize  # fp8 = 1 or bf16 = 2
-        csa_rows = self.csa_rows_per_block
-        hca_rows = self.hca_rows_per_block
-        csa_main_per_block = csa_rows * self.head_dim * elem_classical
         if self._indexer_fp4:
-            # FP4: packed data (k_tiles*4*rows*16 bytes) + e8m0 scale
-            # (k_tiles*4*rows bytes) per block, in two separate uint8 pools.
-            fp4_groups = self._idx_k_tiles * 4 * csa_rows
-            csa_idx_per_block = fp4_groups * 16 + fp4_groups
+            # Packed E2M1 data (16 B per group of 32) plus one e8m0 scale byte,
+            # in the two uint8 pools `pa_mqa_logits_fp4` reads.
+            groups = self._idx_k_tiles * 4 * self.csa_rows_per_block
+            per_layer = groups * 16 + groups
         else:
-            csa_idx_per_block = csa_rows * self._index_row_bytes  # fp8 = 1 B/elem
-        hca_main_per_block = hca_rows * self.head_dim * elem_classical
-        if self._kv_fp8:
-            # 2buff: parallel bf16 rope pool per compress entry.
-            elem_rope = self._rope_dtype.itemsize
-            csa_main_per_block += csa_rows * self.rope_head_dim * elem_rope
-            hca_main_per_block += hca_rows * self.rope_head_dim * elem_rope
-        compressed_block_bytes = (
-            len(self.csa_layers) * (csa_main_per_block + csa_idx_per_block)
-            + len(self.hca_layers) * hca_main_per_block
-        )
-        # The SWA ring is its own entry class rather than a term on the
-        # compressed block, so its bytes are declared directly instead of
-        # being charged per compressed block and stripped back out. It sits in
-        # the STATE pool because its size tracks concurrency, not history —
-        # `max_num_seqs * win_with_spec` rows per layer.
+            # Data and scale are two REGIONS inside the block, not interleaved
+            # per row: `[rows*index_head_dim FP8]` then `[rows*4 fp32 scale]`.
+            # Written by `indexer_k_quant_and_cache`, read by
+            # `cp_gather_indexer_k_quant_cache` and
+            # `deepgemm_fp8_paged_mqa_logits`.
+            per_layer = self.csa_rows_per_block * self._index_row_bytes
+        return len(self.csa_layers) * per_layer
+
+    def sub_pool_specs(self) -> list[SubPoolSpec]:
+        """Two entry classes: a paged block, and a request's slot.
+
+        Both are counted in rows of the shared row space and priced by
+        `pool_geometry` — an envelope for a block, a slot for a request — and
+        both counts are independent of how the pool is split, which is what
+        lets sizing quote them before it has chosen a split.
+
+        The slot is one class rather than two even though it holds two
+        unrelated things, the compressor state and the sliding windows. They
+        are allocated and given up together and no request can have one without
+        the other, so pricing them apart would only invite a split that cannot
+        happen. One slot per request regardless of MTP: the draft lookahead is
+        absorbed into `win_with_spec` rather than multiplying anything.
+
+        No flat margin on the slot: a ring cannot transiently exceed itself the
+        way a block-addressed window could while sliding across a boundary, and
+        there is no admission-vs-materialization gap to cushion — a slot exists
+        for its request's whole life.
+        """
+        geo = self.pool_geometry
+        row_bytes = self.plane_row_bytes()
         return [
-            page_pool(compressed_block_bytes),
-            # One ring per request. No flat margin: a ring cannot transiently
-            # exceed itself the way a block-addressed window could while sliding
-            # across a boundary, and there is no admission-vs-materialization
-            # gap to cushion — the ring exists for the request's whole life.
-            state_pool(SWA_POOL_CLASS, self._swa_ring_bytes(), entries_per_req=1),
-            # One slot per request regardless of MTP: the draft lookahead is
-            # absorbed into `win_with_spec` (the SWA per-request block count),
-            # so it never multiplies the compressor ring.
-            state_pool(
-                STATE_SLOT_CLASS, self._per_req_state_bytes(), entries_per_req=1
-            ),
+            page_pool(geo.block_bytes(row_bytes) + self._indexer_block_bytes()),
+            state_pool(STATE_SLOT_CLASS, geo.slot_bytes(row_bytes), entries_per_req=1),
         ]
+
+    def _plane_row_widths(self) -> list[int]:
+        """Bytes one row costs in each plane this build has.
+
+        Two on fp8 (packed NoPE and bf16 RoPE), one on bf16, which keeps RoPE
+        inline in the NoPE row. The single answer to how many planes there are:
+        sizing, the carve, the compressor state's split and the checkpoint copy
+        all count them from here, so none of them can disagree.
+        """
+        return [w for w in (self.nope_row_bytes(), self.rope_row_bytes()) if w]
+
+    def _kv_planes(self) -> list[torch.Tensor]:
+        """The allocated plane tensors, in the order `_plane_row_widths` lists."""
+        runner = self.model_runner
+        planes = [
+            p for p in (runner.v4_kv_plane, runner.v4_kv_plane_rope) if p is not None
+        ]
+        assert len(planes) == len(self._plane_row_widths())
+        return planes
 
     def allocate_kv_cache_tensors(
         self, num_kv_heads: int, num_draft_layers: int
@@ -790,41 +807,38 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         }
 
     def allocate_per_req_cache(self, entries: dict[str, int]) -> dict[str, object]:
-        """Carve per-layer `unified_kv` + Compressor state out of one allocation.
+        """Carve the two KV planes + the compressor arena out of one allocation.
 
         One `torch.zeros` holds every per-request pool, in this order:
 
-            [layer 0 .. layer N-1]  unified pools
-            [rope 0  .. rope N-1]   parallel RoPE pools, fp8 KV only
-            [arena]                 compressor state, one entry per request
+            [NoPE plane]  plane_rows x head_dim, fp8-packed or bf16
+            [RoPE plane]  plane_rows x rope_head_dim, bf16, fp8 KV only
+            [arena]       compressor state, one entry per request
 
         `plan_regions` places them, so each starts on the boundary the arena's
-        own fields assume. Carving produces views indistinguishable from
-        standalone `torch.zeros` in shape, stride and dtype; what the single
-        allocation buys is that the KV/state boundary can move later without
-        freeing either side, which is why `StateArena` is entry-major.
+        own fields assume.
 
-        Per-layer `unified_kv` layout (decode-time paged_decode kernel reads
-        a single base ptr; offsets `[0, swa_pages)` are the SWA ring,
-        `[swa_pages, ..)` are compress), with
-        `swa_pages = num_slots * win_with_spec`:
-            Dense layer: [swa_pages,           head_dim]
-            CSA   layer: [swa_pages + NB*csa_rows_per_block,   head_dim]
-            HCA   layer: [swa_pages + NB*hca_rows_per_block,   head_dim]
+        Both planes materialize the SAME row space (`v4_pool_geometry`): row `I`
+        is one token at one layer in both, which is what a single `kv_indices`
+        buffer feeding two pools means. Compressed blocks grow from row 0 and a
+        request's windows are numbered back from the last row, so neither side's
+        address mentions where the other stops — the split is a pair of host-side
+        counters and moving it re-carves nothing.
 
-        `build_kv_cache_tensor` slices per-layer views to bind into
-        `attn.swa_kv` (SWA portion) and `compressor.kv_cache` (compress
-        portion, reshaped to [num_blocks, k_per_block, head_dim]). The full
-        unified pool is also bound as `attn.unified_kv` for the paged_decode
-        dispatch.
+        A layer's view is its base row to the end of the plane. Views therefore
+        OVERLAP, and every one of them reaches both regions through one base
+        pointer. That is the point: `layer_base_row` cancels the layer term out
+        of both address formulas, so one index buffer serves a whole compress
+        class.
 
         Compressor state comes from a `StateArena` instead of six standalone
         tensors: the per-layer views are unchanged in shape and dtype, but a
         request's whole state is one contiguous byte range, which is what
-        checkpointing, entry relocation and RDMA all need.
+        checkpointing, entry relocation and RDMA all need. It stays out of the
+        row space because it is not organized by rows.
 
         Everything is setattr'd onto ModelRunner; `v4_unified_kv` is a list
-        of per-layer tensors (length `num_layers`).
+        of per-layer views (length `num_layers`).
         """
         num_slots = entries.get(STATE_SLOT_CLASS, 0)
         assert self._swa_dtype == self._classical_dtype, (
@@ -835,84 +849,68 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
         device = self.model_runner.device
         num_blocks = self.model_runner.num_physical_kvcache_blocks
-        # SWA is a per-request ring at the head of every layer's pool:
-        # `num_slots * win_with_spec` rows, addressed by the request's slot.
-        swa_pages = self.num_state_slots * self.win_with_spec
         head_dim = self.head_dim
         dtype = self._swa_dtype
-
-        # Per-layer unified_kv: SWA ring prefix + (CSA/HCA) compress tail.
-        ratios = self.compress_ratios
-
-        def _pages(layer_id: int) -> int:
-            # Dense layers compress to 0 rows, leaving just the SWA ring.
-            rows = self.rows_per_block(ratios[layer_id])
-            return swa_pages + num_blocks * rows
-
-        # Every per-request pool is carved from ONE allocation. Each group is
-        # planned on its own and shifted by what precedes it, which is exact
-        # because `plan_regions` aligns its total too; the fp8-only RoPE group
-        # plans to nothing when absent, so there is no branch on the layout.
         rope_dtype = self._rope_dtype
-        kv_offsets, kv_bytes = plan_regions(
-            [_pages(i) * head_dim * dtype.itemsize for i in range(self.num_layers)]
-        )
-        rope_offsets, rope_bytes = plan_regions(
-            [
-                _pages(i) * self.rope_head_dim * rope_dtype.itemsize
-                for i in range(self.num_layers)
-            ]
-            if self._kv_fp8
-            else []
-        )
-        arena_offset = kv_bytes + rope_bytes
-        # Recomputed rather than taken from the arena, which does not exist
-        # yet; `StateArena` rejects a `buf` whose size disagrees, so the two
-        # expressions cannot drift silently.
-        arena_bytes = entry_bytes_for(self._state_fields()) * num_slots
+
+        # The layout at the split sizing chose. Everything below — and every
+        # index formula any kernel evaluates — reads its offsets from here.
+        geo = self.pool_geometry.with_capacity(num_blocks, num_slots)
+        self.pool_geometry = geo
+
+        row_widths = self._plane_row_widths()
+        offsets, total_bytes = plan_regions([geo.plane_bytes(w) for w in row_widths])
 
         # Zeroed once, which is also what `StateArena`'s `buf` contract asks
         # for. Nothing holds the pool but the carved views — they keep the
         # allocation alive, so it must not be dropped from any of them.
-        per_req_pool = torch.zeros(
-            arena_offset + arena_bytes, dtype=torch.uint8, device=device
+        per_req_pool = torch.zeros(total_bytes, dtype=torch.uint8, device=device)
+
+        def _plane(start: int, width: int, elem: torch.dtype) -> torch.Tensor:
+            end = start + geo.plane_rows * width * elem.itemsize
+            return per_req_pool[start:end].view(elem).view(geo.plane_rows, width)
+
+        kv_plane = _plane(offsets[0], head_dim, dtype)
+        # 2buff fp8: a second plane of the same rows at the RoPE width, bf16
+        # (RoPE is never quantized). bf16 builds keep RoPE inline in the NoPE
+        # row and have no second plane.
+        kv_plane_rope = (
+            _plane(offsets[1], self.rope_head_dim, rope_dtype) if self._kv_fp8 else None
         )
 
-        def _carve(start: int, rows: int, width: int, elem: torch.dtype):
-            end = start + rows * width * elem.itemsize
-            return per_req_pool[start:end].view(elem).view(rows, width)
-
-        # Per-layer unified pool: SWA ring prefix + (CSA/HCA) compress tail.
+        # A plain slice, not `as_strided`: the base row is a row count into the
+        # plane, and letting torch derive the storage offset is what keeps it
+        # from being confused with an absolute one.
         unified_kv: list[torch.Tensor] = [
-            _carve(kv_offsets[i], _pages(i), head_dim, dtype)
-            for i in range(self.num_layers)
+            kv_plane[geo.layer_base_row(i) :] for i in range(self.num_layers)
         ]
-        # 2buff fp8: parallel rope pool per layer — same page count, width
-        # rope_head_dim, dtype bf16 (rope is never quantized). bf16 builds keep
-        # rope inline in unified_kv and carve nothing here.
         unified_kv_rope: list[torch.Tensor | None] = (
-            [
-                _carve(
-                    kv_bytes + rope_offsets[i],
-                    _pages(i),
-                    self.rope_head_dim,
-                    rope_dtype,
-                )
-                for i in range(self.num_layers)
-            ]
-            if self._kv_fp8
+            [kv_plane_rope[geo.layer_base_row(i) :] for i in range(self.num_layers)]
+            if kv_plane_rope is not None
             else [None] * self.num_layers
         )
 
-        # ---- Compressor state: one arena, one entry per request -------------
-        # Same per-layer views the kernels bound before; the difference is
-        # that a slot's whole state is now one contiguous byte range instead
-        # of six pieces spread across six allocations.
-        arena = StateArena(
-            self._state_fields(),
-            num_slots,
-            device,
-            buf=per_req_pool[arena_offset : arena_offset + arena_bytes],
+        # ---- Compressor state: the front rows of every slot ----------------
+        # Same per-layer views the kernels bound before. What changed is where
+        # they live: a slot's state now sits in the planes with that request's
+        # windows, so the bytes are on the elastic line rather than in a region
+        # sized once at startup. Each plane holds the fields `plan_field_planes`
+        # gave it, strided by the whole slot; only the top `num_slots`
+        # positions are the pool's, and the rest of the plane is blocks.
+        arena = SplitStateArena(
+            [
+                StateArena(
+                    fields,
+                    geo.slot_positions,
+                    device,
+                    buf=per_req_pool[start : start + geo.plane_bytes(row_bytes)],
+                    slot_stride=geo.slot_rows * row_bytes,
+                    live_entries=num_slots,
+                )
+                for fields, start, row_bytes in zip(
+                    self._arena_planes, offsets, row_widths, strict=True
+                )
+            ]
         )
 
         # ---- RDMA staging pool, only allocated in PD disaggregation mode --
@@ -931,6 +929,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
         return {
             "v4_state_arena": arena,
+            "v4_kv_plane": kv_plane,
+            "v4_kv_plane_rope": kv_plane_rope,
             "v4_unified_kv": unified_kv,
             "v4_unified_kv_rope": unified_kv_rope,
             "v4_csa_main_kv_state": arena.view("csa_main_kv"),
@@ -943,6 +943,25 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             "v4_state_pool_size": pool_size,
             "v4_state_slot_stride": state_slot_stride,
         }
+
+    def _compress_block_view(
+        self, plane: torch.Tensor, layer_id: int, width: int
+    ) -> torch.Tensor:
+        """A layer's compressed rows as `[num_blocks, block_rows, width]`.
+
+        Reached by reshaping the plane's envelope region rather than by
+        `as_strided`, so the storage offset stays torch's to derive — the one
+        arithmetic this repo has got wrong three times (`storage_offset` is
+        absolute, and a plane view is never at offset zero).
+        """
+        geo = self.pool_geometry
+        base = geo.layer_base_row(layer_id)
+        rows = geo.layer_class(layer_id).block_rows
+        num_blocks = self.model_runner.num_physical_kvcache_blocks
+        envelopes = plane[: num_blocks * geo.envelope_rows]
+        return envelopes.view(num_blocks, geo.envelope_rows, width)[
+            :, base : base + rows
+        ]
 
     def build_kv_cache_tensor(self, layer_id: int, module):
         """Bind V4 modules' state-cache + classical-cache views.
@@ -963,44 +982,54 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         from atom.models.deepseek_v4 import Indexer as _V4Indexer
 
         runner = self.model_runner
-        num_blocks = self.model_runner.num_physical_kvcache_blocks
-        # SWA region: one `win_with_spec`-row ring per request slot.
-        swa_pages = self.num_state_slots * self.win_with_spec
+        geo = self.pool_geometry
 
         if isinstance(module, _V4Attention):
-            # DSpark draft layer: fp8 target KV cache. DSpark's block attention runs bf16.
-            if getattr(module, "dspark_draft", False):
-                module.swa_kv = torch.zeros(
-                    (swa_pages, self.head_dim),
-                    dtype=torch.bfloat16,
+            # A DSpark draft layer is already a dense layer of the shared row
+            # space — the ratio list carries it and every slot reserves its rows
+            # — so it takes the ordinary path below and costs no allocation of
+            # its own. The one thing that can keep it out is the plane's dtype:
+            # its block attention runs bf16, and under an fp8 pool the reserved
+            # rows are the wrong shape for it and go unused.
+            draft_dtype = getattr(module, "dspark_draft_dtype", None)
+            if draft_dtype is not None and draft_dtype is not self._swa_dtype:
+                # The same slots the target pool has, in a plane of their own.
+                # Going through the geometry rather than writing
+                # `slot * cs + pos % cs` here keeps the draft's window addressed
+                # by the same expression as every other window.
+                draft = UnifiedPoolGeometry.windows_only(geo)
+                module.swa_plane = torch.zeros(
+                    (draft.plane_rows, self.head_dim),
+                    dtype=draft_dtype,
                     device=self.model_runner.device,
                 )
-                module.swa_cache_size = self.win_with_spec
+                module.swa_window = draft.window_params(DENSE_RATIO)
                 module.kv_fp8 = False
                 module.unified_kv = None
                 module.unified_kv_rope = None
-                module.swa_kv_rope = None
+                module.swa_plane_rope = None
                 return None
-            # Bind both:
-            #   - `attn.unified_kv`: the full per-layer pool (paged_decode reads).
-            #   - `attn.swa_kv`: the flat [num_slots*win_with_spec, head_dim]
-            #     SWA ring region. Indexed by
-            #     `state_slot_out[bid] * win_with_spec + pos % win_with_spec`.
+            # `unified_kv` is this layer's view of the plane — its base row to
+            # the plane's end, so it reaches both the compressed blocks and the
+            # windows through one base pointer. `swa_plane` is the same view:
+            # the window rows are interleaved through the entry region, not a
+            # prefix, so what a window write needs is the view plus the class's
+            # `WindowParams`, not a slice.
             unified = runner.v4_unified_kv[module.layer_id]
             module.unified_kv = unified
-            module.swa_kv = unified[:swa_pages]
-            module.swa_cache_size = self.win_with_spec
+            module.swa_plane = unified
+            module.swa_window = geo.window_params(self.compress_ratios[module.layer_id])
             module.kv_fp8 = self._kv_fp8
             if self._kv_fp8:
-                # 2buff: parallel bf16 rope pool, same paged layout. swa_kv_rope
-                # is the flat [swa_pages, rope_head_dim] SWA region; unified_kv_rope
-                # the full pool (asm decode op5 reads it).
+                # 2buff: the second plane, same rows at the RoPE width. A row
+                # index means the same token in both (asm decode op5 reads them
+                # with one index buffer).
                 rope = runner.v4_unified_kv_rope[module.layer_id]
                 module.unified_kv_rope = rope
-                module.swa_kv_rope = rope[:swa_pages]
+                module.swa_plane_rope = rope
             else:
                 module.unified_kv_rope = None
-                module.swa_kv_rope = None
+                module.swa_plane_rope = None
             return None
 
         if isinstance(module, _V4Indexer):
@@ -1086,41 +1115,32 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 # kv_cache_dtype); it has no separate rope pool.
                 module.quant_mode = "fp4" if self._indexer_fp4 else "per_row_fp8"
                 module.kv_cache_rope = None
-            elif ratio == 4:
-                pos = self.layer_id_to_csa_pos[layer_id_from_prefix]
-                module.kv_state = runner.v4_csa_main_kv_state[pos]
-                module.score_state = runner.v4_csa_main_score_state[pos]
-                # CSA Main compressed pool now lives in the tail of the
-                # owning layer's `unified_kv`. Compressor.forward writes via
-                # `kv_cache[block_id, slot_in_block, :] = entry`, so we hand
-                # it the standard [num_blocks, rows, head_dim] view.
-                num_blocks = runner.num_physical_kvcache_blocks
-                unified = runner.v4_unified_kv[layer_id_from_prefix]
-                module.kv_cache = unified[swa_pages:].view(
-                    num_blocks, self.csa_rows_per_block, self.head_dim
+            elif ratio in (CSA_RATIO, HCA_RATIO):
+                table = (
+                    self.layer_id_to_csa_pos
+                    if ratio == CSA_RATIO
+                    else self.layer_id_to_hca_pos
                 )
-                if self._kv_fp8:
-                    rope = runner.v4_unified_kv_rope[layer_id_from_prefix]
-                    module.kv_cache_rope = rope[swa_pages:].view(
-                        num_blocks, self.csa_rows_per_block, self.rope_head_dim
-                    )
-                    module.quant_mode = "group_fp8"
+                pos = table[layer_id_from_prefix]
+                if ratio == CSA_RATIO:
+                    module.kv_state = runner.v4_csa_main_kv_state[pos]
+                    module.score_state = runner.v4_csa_main_score_state[pos]
                 else:
-                    module.kv_cache_rope = None
-                    module.quant_mode = "none"
-            elif ratio == 128:
-                pos = self.layer_id_to_hca_pos[layer_id_from_prefix]
-                module.kv_state = runner.v4_hca_main_kv_state[pos]
-                module.score_state = runner.v4_hca_main_score_state[pos]
-                num_blocks = runner.num_physical_kvcache_blocks
-                unified = runner.v4_unified_kv[layer_id_from_prefix]
-                module.kv_cache = unified[swa_pages:].view(
-                    num_blocks, self.hca_rows_per_block, self.head_dim
+                    module.kv_state = runner.v4_hca_main_kv_state[pos]
+                    module.score_state = runner.v4_hca_main_score_state[pos]
+                # `Compressor.forward` writes `kv_cache[block, row, :] = entry`,
+                # so it wants a [num_blocks, rows, width] view. This layer's
+                # rows are a run inside every envelope, so the view is strided
+                # by the envelope and the writes are scattered — which is what
+                # `fused_compress` already takes `kv_cache.stride(0)/(1)` for.
+                module.kv_cache = self._compress_block_view(
+                    runner.v4_kv_plane, layer_id_from_prefix, self.head_dim
                 )
                 if self._kv_fp8:
-                    rope = runner.v4_unified_kv_rope[layer_id_from_prefix]
-                    module.kv_cache_rope = rope[swa_pages:].view(
-                        num_blocks, self.hca_rows_per_block, self.rope_head_dim
+                    module.kv_cache_rope = self._compress_block_view(
+                        runner.v4_kv_plane_rope,
+                        layer_id_from_prefix,
+                        self.rope_head_dim,
                     )
                     module.quant_mode = "group_fp8"
                 else:
@@ -1157,6 +1177,14 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 "KV transfer (disaggregated serving) is not supported with "
                 "--index_cache_dtype fp4 yet (FP4 indexer scale pool unmapped)."
             )
+        if is_pd and getattr(runner.config, "pipeline_parallel_size", 1) > 1:
+            raise NotImplementedError(
+                "DeepSeek-V4 KV transfer registers one region per plane, "
+                "covering every layer at once, so there is no per-layer region "
+                "list for `_consumer_region_map` to shift by `start_layer`. "
+                "Pipeline parallelism with disaggregated serving needs the "
+                "region map keyed by something other than the layer index."
+            )
         if self._indexer_fp4:
             # Single-node FP4 indexer: the FP8 region map below references the
             # absent fp8 idx pool (`v4_csa_idx_kv` is uint8 here, no scale
@@ -1164,47 +1192,33 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             return None
 
         num_slots = self.num_state_slots
-        # SWA is a per-request ring at the head of unified_kv
-        # ([0, swa_pages)); the compress tail follows. The ring is emitted
-        # below as swa_block_regions, keyed by the request's state slot.
-        swa_pages = self.num_state_slots * self.win_with_spec
-        elem_classical = self._classical_dtype.itemsize
+        geo = self.pool_geometry
         elem_fp32 = 4
 
         block_regions: list[KVTransferRegion] = []
         swa_block_regions: list[KVTransferRegion] = []
         slot_regions: list[KVTransferRegion] = []
 
-        # Block regions: compress tail per layer
-        for layer_id in range(self.num_layers):
-            uv = runner.v4_unified_kv[layer_id]
-            compress_base = uv.data_ptr() + swa_pages * self.head_dim * elem_classical
-            compress_total = (
-                uv.numel() * elem_classical - swa_pages * self.head_dim * elem_classical
-            )
-            if compress_total <= 0:
-                continue
-            rows = self.rows_per_block(self.compress_ratios[layer_id])
-            if not rows:  # dense layer: SWA ring only, no compress region
-                continue
-            bpb = rows * self.head_dim * elem_classical
-            block_regions.append(KVTransferRegion(compress_base, compress_total, bpb))
-            if self._kv_fp8:
-                rope = runner.v4_unified_kv_rope[layer_id]
-                if rope is None:
-                    raise RuntimeError(
-                        "DeepSeek-V4 fp8 KV transfer requires a parallel RoPE pool"
-                    )
-                rope_prefix_bytes = swa_pages * self.rope_head_dim * rope.element_size()
-                rope_total = rope.numel() * rope.element_size() - rope_prefix_bytes
-                rope_bpb = rows * self.rope_head_dim * rope.element_size()
-                block_regions.append(
-                    KVTransferRegion(
-                        rope.data_ptr() + rope_prefix_bytes,
-                        rope_total,
-                        rope_bpb,
-                    )
+        # One region per plane, not per layer. A block's compressed rows are one
+        # envelope — every layer of it, contiguous — so the transfer unit the
+        # connector already zips over (`base + id * unit_bytes`, `unit_bytes`
+        # long) describes it exactly, and a layer no longer needs a region of
+        # its own. Under the layer-major predecessor a layer's rows for a block
+        # were the contiguous thing and the envelope was the strided one.
+        #
+        # A stage that holds a subset of the layers still holds whole envelopes
+        # of that subset, so its plane is its own; `_consumer_region_map`'s
+        # per-layer alignment has nothing left to align, which is why PP is
+        # rejected below.
+        planes = list(zip(self._kv_planes(), self._plane_row_widths(), strict=True))
+        for plane, row_bytes in planes:
+            block_regions.append(
+                KVTransferRegion(
+                    plane.data_ptr(),
+                    runner.num_physical_kvcache_blocks * geo.block_bytes(row_bytes),
+                    geo.block_bytes(row_bytes),
                 )
+            )
 
         # Block regions: CSA Indexer KV (FP8)
         for pos in range(len(self.csa_layers)):
@@ -1214,43 +1228,25 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 KVTransferRegion(t.data_ptr(), t.numel() * t.element_size(), bpb)
             )
 
-        # SWA region [0, swa_pages) is a per-request ring, so the transfer unit
-        # is a whole ring and the "block id" the connector zips over is the
-        # request's state slot. The connector arithmetic is unchanged
-        # (`base + id * unit_bytes`); only what an id means is.
+        # A request's state is one slot per plane — again every layer at once —
+        # and the id the connector zips over is its pool group.
         #
-        # A ring has no window-freeing and no sentinel entries: every one of a
-        # slot's `win_with_spec` rows travels. That is also why this cannot ride
-        # the compressor arena's slot_regions — the ring lives in `unified_kv`,
-        # which is layer-major, while an arena entry is request-major.
-        #
-        # FP8 2buf KV registers NoPE and RoPE SWA pools as separate regions.
-        for layer_id in range(self.num_layers):
-            uv = runner.v4_unified_kv[layer_id]
-            nope_swa_bpb = self.win_with_spec * self.head_dim * uv.element_size()
+        # A slot has no window-freeing and no sentinel rows: every row of a live
+        # one travels. `reverse_indexed` is what the geometry's numbering costs
+        # here: the pool hands out positions from the top down so that growing
+        # it never relocates one, which puts group `g` at
+        # `base + (num_slots - 1 - g) * unit` rather than `base + g * unit`.
+        slot_start, _ = geo.slot_span(num_slots - 1) if num_slots else (0, 0)
+        for plane, row_bytes in planes:
+            unit = geo.slot_bytes(row_bytes)
             swa_block_regions.append(
                 KVTransferRegion(
-                    uv.data_ptr(),
-                    swa_pages * self.head_dim * uv.element_size(),
-                    nope_swa_bpb,
+                    plane.data_ptr() + slot_start * row_bytes,
+                    num_slots * unit,
+                    unit,
+                    reverse_indexed=True,
                 )
             )
-            if self._kv_fp8:
-                rope = runner.v4_unified_kv_rope[layer_id]
-                if rope is None:
-                    raise RuntimeError(
-                        "DeepSeek-V4 fp8 SWA transfer requires a parallel RoPE pool"
-                    )
-                rope_swa_bpb = (
-                    self.win_with_spec * self.rope_head_dim * rope.element_size()
-                )
-                swa_block_regions.append(
-                    KVTransferRegion(
-                        rope.data_ptr(),
-                        swa_pages * self.rope_head_dim * rope.element_size(),
-                        rope_swa_bpb,
-                    )
-                )
 
         # Staging pool for compressor states (not in slot_regions — managed
         # separately by the connector with pool acquire/release).
@@ -1266,8 +1262,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 pool.numel() * elem_fp32,
                 stride * elem_fp32,
             )
-            gather_slot = self._make_gather_slot(pool, stride, runner.v4_state_arena)
-            scatter_slot = self._make_scatter_slot(pool, stride, runner.v4_state_arena)
+            gather_slot = self._make_gather_slot(
+                pool, stride, runner.v4_state_arena, self.pool_geometry
+            )
+            scatter_slot = self._make_scatter_slot(
+                pool, stride, runner.v4_state_arena, self.pool_geometry
+            )
 
         return KVTransferTensors(
             block_regions=block_regions,
@@ -1688,26 +1688,28 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         batch_id_per_token = attn_metadata.cu_seqlens_q[:bs]
 
         # ----- Kernel: write SWA prefix paged offsets -----
-        # `write_v4_paged_decode_indices` writes to swa/csa/hca indices in
-        # one pass. For SWA-only MTP we alias csa/hca slots to swa so the
-        # kernel writes the same value three times to swa_indices_buf —
-        # redundant ~bs*win stores (~8 KB at V4-Pro bs=64, win=128), saves
-        # building two extra unused indptr buffers.
+        # MTP layers are dense, so only the dense class's buffer is asked for;
+        # the other two are switched off. They used to be aliased onto this same
+        # buffer because all three classes named the same row, which stopped
+        # being true when the window started interleaving by class.
         swa_indices_buf = var["v4_kv_indices_swa"].gpu
+        dest_rows = self._dest_row_buffers()
         write_v4_paged_decode_indices(
             state_slot_per_seq=attn_metadata.state_slot_out[:bs],
             batch_id_per_token=batch_id_per_token,
             positions=positions,
             swa_indptr=swa_indptr,
-            csa_indptr=swa_indptr,
-            hca_indptr=swa_indptr,
+            csa_indptr=None,
+            hca_indptr=None,
             swa_indices=swa_indices_buf,
-            csa_indices=swa_indices_buf,
-            hca_indices=swa_indices_buf,
+            csa_indices=None,
+            hca_indices=None,
+            dest_rows=dest_rows,
             T=bs,
             win=win,
-            cache_size=self.win_with_spec,
+            geometry=self.pool_geometry,
         )
+        attn_metadata.swa_dest_rows = dest_rows
 
         # ----- Publish on attn_metadata for V4Attention.forward -----
         # MTP layer is ratio=0 → reads kv_indices_swa + kv_indptr_swa only.
@@ -1816,11 +1818,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # Inline block_tables CPU fill (H2D deferred to prep_stream).
         self.prepare_block_tables(batch)
 
-        state_slot_np = np.asarray(
-            batch.per_req_cache_groups[:scheduled_bs], dtype=np.int32
-        )
-        if len(state_slot_np) < scheduled_bs:
-            state_slot_np = np.zeros(scheduled_bs, dtype=np.int32)
+        group_np = np.asarray(batch.per_req_cache_groups[:scheduled_bs], dtype=np.int32)
+        if len(group_np) < scheduled_bs:
+            group_np = np.zeros(scheduled_bs, dtype=np.int32)
+        state_slot_np = self._physical_slots(group_np)
         ss_buf = var["v4_meta_state_slot_groups"]
         ss_buf.np[:scheduled_bs] = state_slot_np
         si_buf = var["v4_meta_state_slot_in"]
@@ -2181,7 +2182,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # Two-source paged_prefill index buffers (extend + per-ratio prefix).
         # Eager-only — direct H2D, no forward_vars staging required. Sets
         # attn_metadata.{kv_indices,kv_indptr}_{extend,prefix_swa,prefix_csa,prefix_hca}
-        # plus skip_prefix_len_csa and swa_pages.
+        # plus skip_prefix_len_csa and envelope_rows.
         self._build_paged_prefill_meta(
             attn_metadata,
             positions_np,
@@ -2586,7 +2587,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             ub.batch_id_per_token = torch.where(bid >= 0, bid - rs0, bid)
         if src.skip_prefix_len_csa is not None:
             ub.skip_prefix_len_csa = src.skip_prefix_len_csa[gts:gte].contiguous()
-        ub.swa_pages = src.swa_pages
+        ub.envelope_rows = src.envelope_rows
 
         # ---- compress_plans: group's GLOBAL per-request (compressor all-gathers
         # the group to full order). Built from global cu / context_lens slices. ----
@@ -2824,7 +2825,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                                + CPU-side actual_swa_count cumsum here)
 
         Skipped when state is not DECODE. The Phase-B fields
-        (kv_indices_*, kv_indptr_*, swa_pages) stay at their dataclass
+        (kv_indices_*, kv_indptr_*, envelope_rows) stay at their dataclass
         defaults for prefill batches; downstream V4Attention.forward branches
         on state and reads prefill-mode buffers (kv_indices_prefix_*) instead.
         """
@@ -2842,9 +2843,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
         var = self.model_runner.forward_vars
         win = self.window_size  # per-token max SWA prefix slots
-        # SWA region = num_slots * win_with_spec rows; this boundary offsets
-        # the HCA compress section in unified_kv.
-        swa_pages = self.num_state_slots * self.win_with_spec
+        envelope_rows = self.pool_geometry.envelope_rows
 
         T = total_tokens
 
@@ -2958,7 +2957,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 entry_offsets,
                 bid_expanded,
                 block_tables_np_full,
-                swa_pages,
+                envelope_rows,
                 self.hca_rows_per_block,
             )
         # Stage to GPU (HCA compress section at head; SWA prefix scattered below).
@@ -2976,6 +2975,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # also fixes that, see skill `debug-agent-locate-kernel`).
         swa_indices_gpu = var[f"{buf_prefix_ubatch}v4_kv_indices_swa"].gpu
         csa_indices_gpu = var[f"{buf_prefix_ubatch}v4_kv_indices_csa"].gpu
+        dest_rows = self._dest_row_buffers(buf_prefix_ubatch)
         write_v4_paged_decode_indices(
             # The slot array must come from the SAME buffer set as
             # batch_id_per_token. In a TBO ubatch the latter holds LOCAL req
@@ -2997,10 +2997,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             swa_indices=swa_indices_gpu,
             csa_indices=csa_indices_gpu,
             hca_indices=hca_indices_gpu,
+            dest_rows=dest_rows,
             T=T,
             win=win,
-            cache_size=self.win_with_spec,
+            geometry=self.pool_geometry,
         )
+        attn_metadata.swa_dest_rows = dest_rows
 
         # `skip_prefix_len_csa` is no longer materialized on the decode path —
         # `csa_translate_pack` is invoked with `window_size = self.window_size`
@@ -3024,7 +3026,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.kv_indptr_swa = swa_indptr_gpu
         attn_metadata.kv_indptr_csa = csa_indptr_gpu
         attn_metadata.kv_indptr_hca = hca_indptr_gpu
-        attn_metadata.swa_pages = swa_pages
+        attn_metadata.envelope_rows = envelope_rows
 
         # Per-token paged-decode index tensors for the fp8 asm decode kernel. The
         # kernel sees N = q_packed.shape[0] = T_pad (padded decode grid). Both
@@ -3091,7 +3093,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
           - kv_indices_prefix_csa / kv_indptr_prefix_csa  (CSA, CSA section UNINIT)
           - kv_indices_prefix_hca / kv_indptr_prefix_hca  (HCA, fully filled)
           - skip_prefix_len_csa = prefix_swa_count_per_token (per-token)
-          - swa_pages
+          - envelope_rows
         """
         assert scheduled_bs >= 1 and total_tokens >= 1, (
             "scheduled_bs and total_tokens must be positive for prefill meta "
@@ -3111,9 +3113,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         num_slots = self.num_state_slots
         if num_slots == 0:
             return
-        # SWA region = num_slots * win_with_spec rows,
-        # boundary into the HCA compress section of unified_kv.
-        swa_pages = self.num_state_slots * self.win_with_spec
+        envelope_rows = self.pool_geometry.envelope_rows
         var = self.model_runner.forward_vars
 
         # ----- CPU numpy: per-token counts + indptrs -----
@@ -3251,8 +3251,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             prefix_hca_indices=hca_indices,
             T=T,
             win=win,
-            cache_size=self.win_with_spec,
-            swa_pages=swa_pages,
+            geometry=self.pool_geometry,
             hca_rows_per_block=self.hca_rows_per_block,
         )
 
@@ -3276,7 +3275,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.kv_indices_prefix_hca = hca_indices[:hca_total]
         attn_metadata.kv_indptr_prefix_hca = hca_indptr
         attn_metadata.skip_prefix_len_csa = skip_csa_gpu
-        attn_metadata.swa_pages = swa_pages
+        attn_metadata.envelope_rows = envelope_rows
 
     def _build_compress_plans(
         self,
@@ -3378,21 +3377,35 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # state reads, fresh writes overwrite warmup pollution).
         if len(groups_np) < scheduled_bs:
             groups_np = np.zeros(scheduled_bs, dtype=np.int32)
-        gpu = self._stage("v4_meta_state_slot_groups", groups_np)
+        slots_np = self._physical_slots(groups_np)
+        gpu = self._stage("v4_meta_state_slot_groups", slots_np)
         if return_cpu:
-            return gpu, groups_np
+            return gpu, slots_np
         return gpu
 
-    @staticmethod
     def _state_slot_in_np(
-        batch: ScheduledBatch, scheduled_bs: int, out_np: np.ndarray
+        self, batch: ScheduledBatch, scheduled_bs: int, out_np: np.ndarray
     ) -> np.ndarray:
-        """Per-seq read slot: the fork source where set, else the write slot."""
+        """Per-seq read slot: the fork source where set, else the write slot.
+
+        `out_np` is already in plane positions; the fork sources arrive as pool
+        groups and are converted here, so one index space comes out.
+        """
         srcs = getattr(batch, "state_fork_srcs", None)
         if not srcs or len(srcs) < scheduled_bs:
             return out_np
         src_np = np.asarray(srcs[:scheduled_bs], dtype=np.int32)
-        return np.where(src_np >= 0, src_np, out_np)
+        return np.where(src_np >= 0, self._physical_slots(src_np), out_np)
+
+    def _physical_slots(self, groups: np.ndarray) -> np.ndarray:
+        """Pool groups as the plane positions every kernel addresses by.
+
+        The two run in opposite directions — see
+        `UnifiedPoolGeometry.physical_slot` — and this is the only crossing.
+        Everything downstream speaks positions: both planes' windows, the
+        compressor state's strided view, and the DSpark draft's plane.
+        """
+        return np.int32(self.pool_geometry.slot_positions - 1) - groups
 
     def _populate_state_slot_in(
         self, batch: ScheduledBatch, scheduled_bs: int, out_np: np.ndarray
@@ -3633,6 +3646,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         bufs["v4_kv_indptr_swa"] = CpuGpuBuffer(T_dec + 1, **i32)
         bufs["v4_kv_indptr_csa"] = CpuGpuBuffer(T_dec + 1, **i32)
         bufs["v4_kv_indptr_hca"] = CpuGpuBuffer(T_dec + 1, **i32)
+        # Where each decode token's own KV row goes, one buffer per compress
+        # class. The fused SWA write reads these rather than deriving the row,
+        # so the window layout stays inside this repo (see
+        # `write_v4_paged_decode_indices`).
+        for name in _DEST_ROW_BUFFERS.values():
+            bufs[name] = CpuGpuBuffer(T_dec, **i32)
 
         # Per-token paged-decode index tensors for the fp8 asm decode kernel
         # (`mla_decode_fwd_v4_nm`, page_size=1). Values are CONSTANT — they
@@ -3795,6 +3814,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             bufs[f"{p}v4_kv_indptr_swa"] = CpuGpuBuffer(T_dec + 1, **i32)
             bufs[f"{p}v4_kv_indptr_csa"] = CpuGpuBuffer(T_dec + 1, **i32)
             bufs[f"{p}v4_kv_indptr_hca"] = CpuGpuBuffer(T_dec + 1, **i32)
+            for name in _DEST_ROW_BUFFERS.values():
+                bufs[f"{p}{name}"] = CpuGpuBuffer(T_dec, **i32)
             bufs[f"{p}v4_n_committed_csa_per_seq"] = CpuGpuBuffer(bs, **i32)
             bufs[f"{p}v4_batch_id_per_token"] = CpuGpuBuffer(mnbt, **i32)
             bufs[f"{p}v4_indexer_cu_committed"] = CpuGpuBuffer(bs + 1, **i32)
@@ -3811,6 +3832,14 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 wbuf.copy_to_gpu()
                 bufs[f"{p}v4_compress_plan_{ratio}"] = cbuf
                 bufs[f"{p}v4_write_plan_{ratio}"] = wbuf
+
+    def _dest_row_buffers(self, buf_prefix_ubatch: str = "") -> dict[int, torch.Tensor]:
+        """The per-class destination-row buffers for this (ubatch's) forward."""
+        var = self.model_runner.forward_vars
+        return {
+            ratio: var[f"{buf_prefix_ubatch}{name}"].gpu
+            for ratio, name in _DEST_ROW_BUFFERS.items()
+        }
 
     def _stage(self, name: str, arr) -> torch.Tensor:
         """Write numpy `arr` into `forward_vars[name]` (CpuGpuBuffer) and
@@ -3837,28 +3866,47 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         return buf.copy_to_gpu(n)
 
     @staticmethod
-    def _make_gather_slot(buf: torch.Tensor, stride: int, arena: StateArena):
+    def _make_gather_slot(
+        buf: torch.Tensor,
+        stride: int,
+        arena: SplitStateArena,
+        geo: UnifiedPoolGeometry,
+    ):
         """Callable copying one request's state → the staging buffer.
 
-        The arena entry is already the layout the staging slot wants, so this
-        is one contiguous copy. The staging hop itself only survives because
-        the connector registers `buf` rather than the arena; registering the
-        arena directly retires both this and the pool.
+        One copy per plane, concatenated in plane order, which is the order the
+        staging slot is defined to hold them in — `_make_scatter_slot` is the
+        only reader and undoes exactly this. The staging hop itself only
+        survives because the connector registers `buf` rather than the planes;
+        registering them directly retires both this and the pool.
         """
         assert stride == arena.entry_bytes // buf.dtype.itemsize
 
         def gather_slot(compute_slot: int, pool_idx: int) -> None:
+            slot = geo.physical_slot(compute_slot)
             dst = pool_idx * stride
-            buf[dst : dst + stride] = arena.entry(compute_slot).view(buf.dtype)
+            for part in arena.arenas:
+                width = part.entry_bytes // buf.dtype.itemsize
+                buf[dst : dst + width] = part.entry(slot).view(buf.dtype)
+                dst += width
 
         return gather_slot
 
     @staticmethod
-    def _make_scatter_slot(buf: torch.Tensor, stride: int, arena: StateArena):
+    def _make_scatter_slot(
+        buf: torch.Tensor,
+        stride: int,
+        arena: SplitStateArena,
+        geo: UnifiedPoolGeometry,
+    ):
         """Callable copying the staging buffer → one request's state."""
 
         def scatter_slot(compute_slot: int, pool_idx: int) -> None:
             src = pool_idx * stride
-            arena.entry(compute_slot).view(buf.dtype).copy_(buf[src : src + stride])
+            slot = geo.physical_slot(compute_slot)
+            for part in arena.arenas:
+                width = part.entry_bytes // buf.dtype.itemsize
+                part.entry(slot).view(buf.dtype).copy_(buf[src : src + width])
+                src += width
 
         return scatter_slot

@@ -28,9 +28,8 @@ sliding-window ring is `win_with_spec` rows per request while the compressor
 ring is one entry per request, so they can never share a count.
 
 This module deliberately defines no *architecture* vocabulary. A name is owned
-by whatever consumes the count — `swa_pool.py` names the sliding-window class,
-`kv_block.py` names the per-request slot class — and the backend that declares
-the spec imports it from there. The one name defined here, `PAGED_CLASS`, is
+by whatever consumes the count — `kv_block.py` names the per-request slot
+class — and the backend that declares the spec imports it from there. The one name defined here, `PAGED_CLASS`, is
 not an architecture's: it is the allocation regime itself, since PAGE is by
 construction a single shared index space that every contributor adds bytes to.
 

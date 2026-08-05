@@ -17,6 +17,7 @@ import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict
 from typing import Any
 
 import msgpack
@@ -38,6 +39,7 @@ from atom.kv_transfer.disaggregation.port_offset import (
 )
 from atom.kv_transfer.disaggregation.types import (
     ConnectorMetadata,
+    KVTransferRegion,
     ReqId,
     TransferId,
 )
@@ -539,9 +541,11 @@ class MooncakeConnector(KVConnectorBase):
         self._has_slot_regions: bool = False
         # (base_addr, bytes_per_block) per region
         self._block_regions: list[tuple[int, int]] = []
-        # SWA ring regions, keyed by the request's state slot (not by the
-        # compressed block_table above); (base_addr, bytes_per_ring)
-        self._swa_block_regions: list[tuple[int, int]] = []
+        # Sliding-window regions, keyed by the request's state slot (not by the
+        # compressed block_table above). Kept whole rather than as
+        # `(base, unit)` because a window region may be reverse-indexed, and
+        # `KVTransferRegion.unit_addr` is the only place that knows.
+        self._swa_block_regions: list[KVTransferRegion] = []
         # (base_addr, bytes_per_slot) per region
         self._slot_regions: list[tuple[int, int]] = []
         self._gather_slot = None
@@ -684,10 +688,8 @@ class MooncakeConnector(KVConnectorBase):
 
         # Populate block/slot region lists for transfer offset computation
         self._block_regions = [(r.base_addr, r.unit_bytes) for r in tt.block_regions]
-        # SWA ring regions, transferred one whole ring per state slot.
-        self._swa_block_regions = [
-            (r.base_addr, r.unit_bytes) for r in tt.swa_block_regions
-        ]
+        # Window regions, transferred one whole entry per state slot.
+        self._swa_block_regions = list(tt.swa_block_regions)
         self._slot_regions = [(r.base_addr, r.unit_bytes) for r in tt.slot_regions]
 
         self.kv_caches_base_addr = [r.base_addr for r in tt.block_regions]
@@ -912,13 +914,12 @@ class MooncakeConnector(KVConnectorBase):
                             b for b, _ in self._block_regions
                         ],
                         "consumer_block_bpb": [bpb for _, bpb in self._block_regions],
-                        # SWA ring, keyed by state slot
+                        # SWA ring, keyed by state slot. The whole region
+                        # travels, not just its base: a reverse-indexed one
+                        # needs its extent to place slot 0.
                         "dst_swa_block_ids": meta.local_swa_block_ids,
-                        "consumer_swa_block_base_addrs": [
-                            b for b, _ in self._swa_block_regions
-                        ],
-                        "consumer_swa_block_bpb": [
-                            bpb for _, bpb in self._swa_block_regions
+                        "consumer_swa_block_regions": [
+                            asdict(r) for r in self._swa_block_regions
                         ],
                         "consumer_slot_base_addrs": [b for b, _ in self._slot_regions],
                         "consumer_slot_bps": [bps for _, bps in self._slot_regions],
@@ -1329,8 +1330,10 @@ class MooncakeConnector(KVConnectorBase):
         dst_slot = request_data["dst_slot_index"]
         src_slot = prefill_data["slot_index"]
         # SWA ring, keyed by state slot.
-        consumer_swa_block_addrs = request_data.get("consumer_swa_block_base_addrs", [])
-        consumer_swa_block_bpb = request_data.get("consumer_swa_block_bpb", [])
+        consumer_swa_regions = [
+            KVTransferRegion(**r)
+            for r in request_data.get("consumer_swa_block_regions", [])
+        ]
         dst_swa_block_ids = request_data.get("dst_swa_block_ids", [])
         src_swa_block_ids = prefill_data.get("swa_block_ids", [])
 
@@ -1364,15 +1367,14 @@ class MooncakeConnector(KVConnectorBase):
                 "resuming request would read an empty sliding window"
             )
         swa_cmap = self._consumer_region_map(len(self._swa_block_regions))
-        for region_idx, (src_base, bpb) in enumerate(self._swa_block_regions):
-            cidx = swa_cmap[region_idx]
-            dst_base = consumer_swa_block_addrs[cidx]
+        for region_idx, src_region in enumerate(self._swa_block_regions):
+            dst_region = consumer_swa_regions[swa_cmap[region_idx]]
             for sb, db in zip(src_swa_block_ids, dst_swa_block_ids):
                 if sb < 0 or db < 0:
                     continue
-                block_src.append(src_base + sb * bpb)
-                block_dst.append(dst_base + db * consumer_swa_block_bpb[cidx])
-                block_sizes.append(bpb)
+                block_src.append(src_region.unit_addr(sb))
+                block_dst.append(dst_region.unit_addr(db))
+                block_sizes.append(src_region.unit_bytes)
 
         logger.info(
             "[PRODUCER] block RDMA: req=%s, %d regions × %d blocks, " "total_bytes=%d",

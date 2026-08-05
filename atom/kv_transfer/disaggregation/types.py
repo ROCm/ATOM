@@ -11,8 +11,9 @@ KV output aggregator.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # Type aliases
@@ -34,6 +35,16 @@ class KVTransferRegion:
     base_addr: int
     total_bytes: int
     unit_bytes: int  # bytes per block (block-indexed) or per slot (slot-indexed)
+    # Unit `i` sits at `base_addr + total_bytes - (i+1) * unit_bytes` instead of
+    # `base_addr + i * unit_bytes`. A pool that numbers its units back from its
+    # end does so to keep adding one from relocating the rest; the region map
+    # has to know, because both ends compute an address from the same id.
+    reverse_indexed: bool = False
+
+    def unit_addr(self, index: int) -> int:
+        if self.reverse_indexed:
+            return self.base_addr + self.total_bytes - (index + 1) * self.unit_bytes
+        return self.base_addr + index * self.unit_bytes
 
 
 @dataclass

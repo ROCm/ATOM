@@ -17,6 +17,12 @@ if not torch.cuda.is_available():
         allow_module_level=True,
     )
 
+from atom.model_ops.attentions.v4_pool_geometry import (
+    CSA_RATIO,
+    DENSE_RATIO,
+    HCA_RATIO,
+    UnifiedPoolGeometry,
+)
 from atom.model_ops.v4_kernels import hca_compress_paged_offsets
 from atom.model_ops.v4_kernels.paged_decode_indices import (
     write_v4_paged_decode_indices,
@@ -27,13 +33,20 @@ DEV = "cuda"
 WIN = 8
 CACHE_SIZE = 11  # ring slots per request; prime-ish to expose the modulo
 BS = 3
-# One decode token per seq (T == BS); positions vary so n = min(pos+1, win) and
+RATIOS = [DENSE_RATIO, CSA_RATIO, HCA_RATIO, CSA_RATIO, HCA_RATIO, DENSE_RATIO]
+GEOMETRY = UnifiedPoolGeometry(
+    RATIOS, num_blocks=4, num_slots=6, ring_slots=CACHE_SIZE, block_size=256
+)
+# One decode token per seq plus a CG-pad token, whose `-1` batch id is the only
+# thing keeping every consumer off it. Positions vary so n = min(pos+1, win) and
 # windows span multiple blocks (exercises per-window-position block lookup).
-POSITIONS = [5, 20, 13]
+POSITIONS = [5, 20, 13, 7]
+BATCH_ID = [0, 1, 2, -1]
+T = len(BATCH_ID)
 # Non-identity slots: a bug that indexes by batch id would still pass on arange.
 SLOTS = [3, 0, 4]
-CSA_HEAD = [3, 0, 5]
-HCA_HEAD = [1, 2, 0]
+CSA_HEAD = [3, 0, 5, 0]
+HCA_HEAD = [1, 2, 0, 0]
 
 
 @pytest.fixture(scope="module")
@@ -41,18 +54,21 @@ def indices():
     """Run kernel and reference over one shared decode batch."""
     torch.manual_seed(0)
     positions = torch.tensor(POSITIONS, dtype=torch.int32, device=DEV)
-    batch_id_per_token = torch.arange(BS, dtype=torch.int32, device=DEV)
+    batch_id_per_token = torch.tensor(BATCH_ID, dtype=torch.int32, device=DEV)
     slots = torch.tensor(SLOTS, dtype=torch.int32, device=DEV)
     n_per = torch.minimum(positions + 1, torch.full_like(positions, WIN)).tolist()
 
     def indptr(heads):
+        # A pad token gets a zero-length slice, exactly as the CPU builders
+        # give it.
         v = [0]
-        for t in range(BS):
-            v.append(v[-1] + heads[t] + n_per[t])
+        for t in range(T):
+            live = BATCH_ID[t] >= 0
+            v.append(v[-1] + (heads[t] + n_per[t] if live else 0))
         return torch.tensor(v, dtype=torch.int32, device=DEV)
 
     ptrs = {
-        "swa_indptr": indptr([0] * BS),
+        "swa_indptr": indptr([0] * T),
         "csa_indptr": indptr(CSA_HEAD),
         "hca_indptr": indptr(HCA_HEAD),
     }
@@ -66,17 +82,22 @@ def indices():
             )
             for name, p in ptrs.items()
         }
+        dest = {
+            r: torch.full((T,), -7, dtype=torch.int32, device=DEV)
+            for r in (DENSE_RATIO, CSA_RATIO, HCA_RATIO)
+        }
         fn(
             state_slot_per_seq=slots,
             batch_id_per_token=batch_id_per_token,
             positions=positions,
-            T=BS,
+            dest_rows=dest,
+            T=T,
             win=WIN,
-            cache_size=CACHE_SIZE,
+            geometry=GEOMETRY,
             **ptrs,
             **bufs,
         )
-        return bufs
+        return {**bufs, "dest": dest}
 
     ref = run(write_v4_paged_decode_indices_reference)
     ker = run(write_v4_paged_decode_indices)
@@ -94,33 +115,70 @@ def test_kernel_matches_reference(indices, section):
 
 
 def test_window_start_maps_to_its_ring_row(indices):
-    """seq1 pos=20, n=win=8 -> window [13..20]; its first entry must be the ring
-    row for pos 13, not a block-table lookup."""
-    expected = SLOTS[1] * CACHE_SIZE + 13 % CACHE_SIZE
+    """seq1 pos=20, n=win=8 -> window [13..20]; its first entry must be the row
+    the geometry gives for pos 13, not a block-table lookup."""
+    expected = GEOMETRY.window_params(DENSE_RATIO).index(SLOTS[1], 13)
     start = int(indices["ptrs"]["swa_indptr"][1])  # seq1 slice (swa head == 0)
     assert int(indices["ref"]["swa_indices"][start]) == expected
+
+
+@pytest.mark.parametrize("ratio", [DENSE_RATIO, CSA_RATIO, HCA_RATIO])
+def test_destination_row_is_the_last_of_this_token_own_window(indices, ratio):
+    """The fused SWA write takes the row from here rather than deriving it, so
+    it has to be the same row the token's own window position resolves to —
+    otherwise the write and the read disagree by exactly one layout change."""
+    ker = indices["ker"]["dest"][ratio]
+    assert torch.equal(ker, indices["ref"]["dest"][ratio])
+    params = GEOMETRY.window_params(ratio)
+    for t in range(T):
+        b = int(BATCH_ID[t])
+        if b < 0:
+            # Left at the sentinel the fixture pre-filled: this buffer is
+            # defined only where the batch id is, and every consumer gates on
+            # the same batch id rather than on the row.
+            assert int(ker[t]) == -7, f"token {t} is CG-pad; nothing may write it"
+            continue
+        assert int(ker[t]) == params.index(SLOTS[b], int(POSITIONS[t])), f"token {t}"
+
+
+def test_the_three_buffers_disagree_by_class(indices):
+    """The buffers used to carry one shared value per token. They must not now:
+    each serves a different compress class, whose window rows are interleaved by
+    that class's own layer stride."""
+    start = int(indices["ptrs"]["swa_indptr"][1])
+    csa_start = int(indices["ptrs"]["csa_indptr"][1]) + CSA_HEAD[1]
+    hca_start = int(indices["ptrs"]["hca_indptr"][1]) + HCA_HEAD[1]
+    swa_row = int(indices["ker"]["swa_indices"][start])
+    csa_row = int(indices["ker"]["csa_indices"][csa_start])
+    hca_row = int(indices["ker"]["hca_indices"][hca_start])
+    assert len({swa_row, csa_row, hca_row}) == 3, (swa_row, csa_row, hca_row)
+    for ratio, row in (
+        (DENSE_RATIO, swa_row),
+        (CSA_RATIO, csa_row),
+        (HCA_RATIO, hca_row),
+    ):
+        assert row == GEOMETRY.window_params(ratio).index(SLOTS[1], 13)
 
 
 # --- HCA compress paged offsets with more than one row per block ----------
 # Regression for the HCA paged-gather bug. With V4 block_size=256 and ratio=128
 # each physical block packs hca_rows_per_block=2 HCA entries, so entry e -> block
-# block_tables[bid, e // rows], slot e % rows -> swa_pages + phys*rows + slot.
-# The pre-fix math used swa_pages + block_tables[bid, e] (i.e. assumed one row
-# per block) and read the
-# wrong blocks.
+# block_tables[bid, e // rows] at row e % rows -> phys*envelope_rows + row.
+# The pre-fix math assumed one row per block and read the wrong blocks.
 _BT = np.array([[5, 9, 13, 17], [2, 6, 10, 14]], dtype=np.int32)  # [bs, blocks]
 _ENTRY = np.array([0, 1, 2, 3, 0, 1, 2], dtype=np.int64)  # seq0: 4, seq1: 3
 _BID = np.array([0, 0, 0, 0, 1, 1, 1], dtype=np.int64)
-_SWA_PAGES = 10_000
+_ENVELOPE_ROWS = 10_000
 
 
 def test_hca_compress_offsets_are_block_packed():
     hca_rows_per_block = 2
-    got = hca_compress_paged_offsets(_ENTRY, _BID, _BT, _SWA_PAGES, hca_rows_per_block)
+    got = hca_compress_paged_offsets(
+        _ENTRY, _BID, _BT, _ENVELOPE_ROWS, hca_rows_per_block
+    )
     expected = np.array(
         [
-            _SWA_PAGES
-            + int(_BT[b][e // hca_rows_per_block]) * hca_rows_per_block
+            int(_BT[b][e // hca_rows_per_block]) * _ENVELOPE_ROWS
             + e % hca_rows_per_block
             for e, b in zip(_ENTRY.tolist(), _BID.tolist())
         ],
@@ -133,12 +191,15 @@ def test_hca_compress_offsets_are_block_packed():
     )
 
 
-def test_hca_compress_offsets_reduce_to_legacy_at_k2_one():
-    got = hca_compress_paged_offsets(_ENTRY, _BID, _BT, _SWA_PAGES, 1)
+def test_one_row_per_block_reduces_to_the_block_stride():
+    got = hca_compress_paged_offsets(_ENTRY, _BID, _BT, _ENVELOPE_ROWS, 1)
     expected = np.array(
-        [_SWA_PAGES + int(_BT[b][e]) for e, b in zip(_ENTRY.tolist(), _BID.tolist())],
+        [
+            int(_BT[b][e]) * _ENVELOPE_ROWS
+            for e, b in zip(_ENTRY.tolist(), _BID.tolist())
+        ],
         dtype=np.int32,
     )
     assert np.array_equal(
         got, expected
-    ), "hca_rows_per_block==1 must equal legacy swa_pages + bt"
+    ), "with one row per block an entry is just its block's first row"

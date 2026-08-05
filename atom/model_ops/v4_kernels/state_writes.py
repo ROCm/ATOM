@@ -9,13 +9,14 @@ inside the kernel — no `.item()` syncs.
 
 Currently implemented:
 - `swa_write`: writes the LAST `min(tok_n_b, write_per_batch)` tokens of
-  every seq `b ∈ [0, bs)` into `swa_region[state_slot_per_seq[b] * cache_size +
-  positions[src] % cache_size, :] = kv[src, :]`. `src_id` is derived inside
-  the kernel from `cu_seqlens_q + row_in_batch` — no shared per-token
+  every seq `b ∈ [0, bs)` into `pool[window.index(slot, positions[src])] =
+  kv[src, :]`, where `window` is the layer's class's `WindowParams` and the
+  row formula lives in `v4_pool_geometry`. `src_id` is derived inside the
+  kernel from `cu_seqlens_q + row_in_batch` — no shared per-token
   `write_indices` GPU buffer (which had a DMA-tear race when the next fwd's
-  CPU rewrite landed mid-H2D). `cache_size = window_size + max_spec_steps`
-  — for non-MTP this reduces to `window_size`; for MTP-k draft tokens get
-  their own ring slots separate from the verified token's slot.
+  CPU rewrite landed mid-H2D). The ring holds `window_size + max_spec_steps`
+  positions — for non-MTP that reduces to `window_size`; for MTP-k draft
+  tokens get their own ring slots separate from the verified token's slot.
 - `update_compressor_states`: unified in-place update of Compressor's
   per-request `kv_state` + `score_state` ring buffers, covering both prefill
   (B-side overlap context + tail) and decode (every token at `pos % STATE_SIZE`
@@ -36,11 +37,13 @@ Caller contract (`swa_write`):
                         derived inside the kernel as `cu_seqlens_q[i+1] -
                         cu_seqlens_q[i]`.
 - `state_slot_per_seq`  [bs] int — `state_slot_mapping_gpu_i32`.
-- `swa_region`          [num_slots * cache_size, head_dim] in-place ring pool.
-- `cache_size`          int ring-slot count = `window_size + max_spec_steps`
-                        (e.g. 128 + 0 = 128 non-MTP; 128 + 1 = 129 MTP-1).
+- `pool`                [rows, head_dim] this layer's whole plane view,
+                        written in place.
+- `window`              `WindowParams` for this layer's compress class; carries
+                        the ring size `window_size + max_spec_steps` (e.g.
+                        128 + 0 = 128 non-MTP; 128 + 1 = 129 MTP-1).
 - `write_per_batch`     int — max tokens to write per seq this fwd
-                        (= `min(max_q_len, cache_size)`). Used as Triton
+                        (= `min(max_q_len, window.ring_slots)`). Used as Triton
                         `constexpr` for grid sizing.
 
 Grid = `(bs, write_per_batch)`; each program writes one (seq, row-in-seq)
@@ -55,6 +58,12 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.model_ops.attentions.v4_pool_geometry import WindowParams
+from atom.model_ops.v4_kernels.pool_index import (
+    row_offset,
+    window_constexprs,
+    window_row,
+)
 from atom.utils.decorators import mark_trace
 
 
@@ -64,12 +73,16 @@ def _swa_write_kernel(
     positions_ptr,  # [T] int — full positions
     cu_seqlens_q_ptr,  # [bs+1] int — per-seq cumulative seqlens
     state_slot_per_seq_ptr,  # [bs] int — state_slot_mapping_gpu_i32
-    swa_region_ptr,  # [num_slots * cache_size, head_dim] SWA region of unified_kv
-    swa_region_row_stride,  # = head_dim
+    pool_ptr,  # this layer's whole unified-pool view, [rows, head_dim]
+    pool_row_stride,  # = head_dim
     head_dim,
-    cache_size,
+    ring_start,
     WRITE_PER_BATCH: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    RING_SLOTS: tl.constexpr,
+    SLOT_ROWS: tl.constexpr,
+    RING_STRIDE: tl.constexpr,
+    RUN_ROWS: tl.constexpr,
 ):
     """SWA ring write. 2D grid `(bs, WRITE_PER_BATCH)`. Program `(b, r)`
     writes the `r`-th of the last-N tokens of seq `b`, where
@@ -79,8 +92,8 @@ def _swa_write_kernel(
     `src_id = cu_seqlens_q[b+1] - N + r` — selects directly from `kv` /
     `positions` with NO shared GPU index buffer (no DMA race window).
 
-    The destination is this request's own ring slot:
-        dst_row = slot * cache_size + (pos % cache_size)
+    The destination is this request's own ring slot, `window_row(slot, pos)`
+    — an index into this layer's view, which spans the whole pool.
 
     A private ring is what #1417 replaced with `block_tables` addressing,
     because a request resuming someone else's cached prefix had never written
@@ -105,7 +118,9 @@ def _swa_write_kernel(
 
     pos = tl.load(positions_ptr + src_id)
     slot = tl.load(state_slot_per_seq_ptr + batch_idx)
-    dst_row = slot * cache_size + (pos % cache_size)
+    dst_row = window_row(
+        slot, pos, ring_start, RING_SLOTS, SLOT_ROWS, RING_STRIDE, RUN_ROWS
+    )
 
     d_offsets = tl.arange(0, BLOCK_D)
     d_mask = d_offsets < head_dim
@@ -114,7 +129,7 @@ def _swa_write_kernel(
         kv_ptr + src_id * head_dim + d_offsets,
         mask=d_mask,
     )
-    dst = swa_region_ptr + dst_row * swa_region_row_stride + d_offsets
+    dst = pool_ptr + row_offset(dst_row, pool_row_stride) + d_offsets
     tl.store(dst, src, mask=d_mask)
 
 
@@ -124,35 +139,36 @@ def swa_write(
     positions: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     state_slot_per_seq: torch.Tensor,
-    swa_region: torch.Tensor,
-    cache_size: int,
+    pool: torch.Tensor,
+    window: WindowParams,
     write_per_batch: int,
     *,
     k_packed: torch.Tensor | None = None,
     k_rope: torch.Tensor | None = None,
-    swa_region_rope: torch.Tensor | None = None,
+    pool_rope: torch.Tensor | None = None,
     prefix: str = "",
 ) -> None:
     """SWA ring in-place write, dispatching on the kv-cache layout.
 
-    Native 2buff fp8 (``swa_region_rope`` provided): the op-quantized extend K
-    comes in as ``k_packed`` (fp8 NoPE) + ``k_rope`` (bf16 RoPE tail), in the
+    Native 2buff fp8 (``pool_rope`` provided): the op-quantized extend K comes
+    in as ``k_packed`` (fp8 NoPE) + ``k_rope`` (bf16 RoPE tail), in the
     ``[T, *]`` or ``[T, 1, *]`` layout produced by the quant kernel; delegates to
-    :func:`swa_write_2buff_prepacked`, which scatters both into their paged pools
-    (``swa_region`` = NoPE pool, ``swa_region_rope`` = RoPE pool) — a pure
-    dtype-agnostic copy, no requant. The bf16 ``kv`` arg is unused on this path
-    (the caller may pass ``None``).
+    :func:`swa_write_2buff_prepacked`, which scatters both into their planes
+    (``pool`` = NoPE, ``pool_rope`` = RoPE) — a pure dtype-agnostic copy, no
+    requant. The bf16 ``kv`` arg is unused on this path (the caller may pass
+    ``None``).
 
     Otherwise (bf16): for the last `min(tok_n_b, write_per_batch)` tokens of
     every seq `b ∈ [0, bs)` this fwd
     (`tok_n_b = cu_seqlens_q[b+1] - cu_seqlens_q[b]`,
-    `bs = state_slot_per_seq.shape[0]`), write `kv[r]` into that request's ring:
-        swa_region[slot * cache_size + pos % cache_size, :] = kv[r, :]
+    `bs = state_slot_per_seq.shape[0]`), write `kv[r]` into that request's
+    window at `window.index(slot, pos)`.
 
-    `cache_size = window + max_spec_steps`, not `window`: a spec round writes the
-    verified token plus `max_spec_steps` drafts at consecutive positions, and a
-    ring sized `window` would alias the drafts onto `[p_0-window+1 .. p_0]` —
-    the verified query at `p_0` would then read future tokens.
+    The ring holds `window.ring_slots = window_size + max_spec_steps` positions,
+    not `window_size`: a spec round writes the verified token plus
+    `max_spec_steps` drafts at consecutive positions, and a ring sized
+    `window_size` would alias the drafts onto `[p_0-window_size+1 .. p_0]` — the
+    verified query at `p_0` would then read future tokens.
 
     Args:
         kv: [T, head_dim] per-fwd KV (BF16). bf16 path only; `T = cu_seqlens_q[bs]`.
@@ -164,30 +180,32 @@ def swa_write(
         state_slot_per_seq: [bs] int32 — per-request state slot
             (`state_slot_mapping_gpu_i32`). Its `shape[0]` is the grid X dim and
             source-of-truth for `bs`.
-        swa_region: [num_slots * cache_size, head_dim] SWA region of `unified_kv`
-            (= `unified_kv[:swa_pages]`).
-        cache_size: ring slots per request (= `win_with_spec`).
-        write_per_batch: `min(max_q_len, cache_size)` — max tokens written per
-            seq this fwd (grid y dim, kernel `constexpr`).
+        pool: [rows, head_dim] — this layer's whole view of the NoPE plane, not
+            just its window part. Rows come from `window.index`, which addresses
+            the plane relative to this view's base.
+        window: this layer's compress class's `WindowParams`
+            (`UnifiedPoolGeometry.window_params`).
+        write_per_batch: `min(max_q_len, window.ring_slots)` — max tokens written
+            per seq this fwd (grid y dim, kernel `constexpr`).
         k_packed: [T, 512] or [T, 1, 512] fp8 NoPE extend K — fp8 2buff path only.
         k_rope: [T, rope_head_dim] or [T, 1, rope_head_dim] bf16 RoPE tail — fp8
             2buff path only.
-        swa_region_rope: [num_slots * cache_size, rope_head_dim] bf16 RoPE pool —
-            presence selects the fp8 2buff path.
+        pool_rope: [rows, rope_head_dim] bf16 RoPE plane view — presence selects
+            the fp8 2buff path.
     """
-    if swa_region_rope is not None:
+    if pool_rope is not None:
         # fp8 2buff: scatter the op-quantized extend K (k_packed/k_rope) into both
-        # paged SWA pools. Flatten the [T, 1, *] quant-kernel views to [T, *]; the
-        # bf16 `kv` source is unused here.
+        # planes. Flatten the [T, 1, *] quant-kernel views to [T, *]; the bf16
+        # `kv` source is unused here.
         swa_write_2buff_prepacked(
             k_packed.view(k_packed.shape[0], -1),
             k_rope.view(k_rope.shape[0], -1),
             positions,
             cu_seqlens_q,
             state_slot_per_seq,
-            swa_region,
-            swa_region_rope,
-            cache_size,
+            pool,
+            pool_rope,
+            window,
             write_per_batch,
         )
         return
@@ -198,18 +216,19 @@ def swa_write(
     ), f"state_slot_per_seq must be [bs], got {state_slot_per_seq.shape}"
     bs = state_slot_per_seq.shape[0]
     assert cu_seqlens_q.dim() == 1 and cu_seqlens_q.shape[0] >= bs + 1
-    assert swa_region.dim() == 2, f"swa_region must be [P, D], got {swa_region.shape}"
+    assert pool.dim() == 2, f"pool must be [rows, D], got {pool.shape}"
     T, head_dim = kv.shape
     assert positions.shape[0] >= T, f"positions {positions.shape[0]} < kv T={T}"
-    assert swa_region.shape[1] == head_dim
-    assert kv.is_contiguous() and swa_region.is_contiguous()
+    assert pool.shape[1] == head_dim
+    assert kv.is_contiguous() and pool.is_contiguous()
     assert (
         bs > 0 and write_per_batch > 0
     ), f"bs={bs}, write_per_batch={write_per_batch} must be positive"
-    assert write_per_batch <= cache_size, (
-        f"write_per_batch={write_per_batch} exceeds the ring ({cache_size}): two "
-        "tokens of the SAME seq would map to one row and race. Paged addressing "
-        "was injective on position and needed no cap; a ring is not."
+    assert write_per_batch <= window.ring_slots, (
+        f"write_per_batch={write_per_batch} exceeds the ring "
+        f"({window.ring_slots}): two tokens of the SAME seq would map to one row "
+        "and race. Paged addressing was injective on position and needed no cap; "
+        "a ring is not."
     )
 
     # head_dim is small (e.g. 64-128 for V4 SWA layer), so a single Triton
@@ -222,12 +241,13 @@ def swa_write(
         positions,
         cu_seqlens_q,
         state_slot_per_seq,
-        swa_region,
-        swa_region.stride(0),
+        pool,
+        pool.stride(0),
         head_dim,
-        cache_size,
+        window.ring_start,
         WRITE_PER_BATCH=write_per_batch,
         BLOCK_D=BLOCK_D,
+        **window_constexprs(window),
     )
 
 
@@ -236,8 +256,8 @@ def swa_write_reference(
     positions: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     state_slot_per_seq: torch.Tensor,
-    swa_region: torch.Tensor,
-    cache_size: int,
+    pool: torch.Tensor,
+    window: WindowParams,
     write_per_batch: int,
 ) -> None:
     """Pure-PyTorch reference equivalent of `swa_write` (ring). For tests.
@@ -245,7 +265,9 @@ def swa_write_reference(
     Mirrors the kernel: for each seq `b ∈ [0, bs)`
     (`bs = state_slot_per_seq.shape[0]`), take the last
     `min(cu_seqlens_q[b+1] - cu_seqlens_q[b], write_per_batch)` rows of `kv`
-    for that seq and write them at `slot * cache_size + pos % cache_size`.
+    for that seq and write them at `window.index(slot, pos)`. The row comes from
+    the geometry rather than from a second copy of the formula, so this checks
+    the kernel's transcription and not its author's memory.
     """
     bs = state_slot_per_seq.shape[0]
     cu_cpu = cu_seqlens_q[: bs + 1].tolist()
@@ -260,10 +282,104 @@ def swa_write_reference(
             cu_end - write_n, cu_end, dtype=torch.long, device=kv.device
         )
         src_kv = kv[src_ids]
-        src_pos = positions[src_ids].to(torch.long)
+        src_pos = positions[src_ids].tolist()
         slot = int(state_slot_per_seq[b])
-        dst_row = slot * cache_size + (src_pos % cache_size)
-        swa_region[dst_row] = src_kv
+        dst_row = torch.tensor(
+            [window.index(slot, int(p)) for p in src_pos],
+            dtype=torch.long,
+            device=kv.device,
+        )
+        pool[dst_row] = src_kv
+
+
+@triton.jit
+def _swa_scatter_rows_kernel(
+    kv_ptr,  # [T, head_dim]
+    dest_row_ptr,  # [T] int32 — plane row for this token
+    batch_id_per_token_ptr,  # [T] int — -1 on CG-pad tokens
+    pool_ptr,  # [rows, head_dim] this layer's plane view
+    pool_row_stride,
+    head_dim,
+    BLOCK_D: tl.constexpr,
+):
+    t = tl.program_id(0)
+    dst_row = tl.load(dest_row_ptr + t)
+    bid = tl.load(batch_id_per_token_ptr + t)
+    if dst_row < 0 or bid < 0:
+        return
+    d = tl.arange(0, BLOCK_D)
+    m = d < head_dim
+    tl.store(
+        pool_ptr + row_offset(dst_row, pool_row_stride) + d,
+        tl.load(kv_ptr + t * head_dim + d, mask=m),
+        mask=m,
+    )
+
+
+@mark_trace
+def swa_scatter_rows(
+    kv: torch.Tensor,
+    dest_rows: torch.Tensor,
+    batch_id_per_token: torch.Tensor,
+    pool: torch.Tensor,
+    *,
+    k_packed: torch.Tensor | None = None,
+    k_rope: torch.Tensor | None = None,
+    pool_rope: torch.Tensor | None = None,
+    prefix: str = "",
+) -> None:
+    """Write each token's KV to a row the caller already chose.
+
+    The decode counterpart of :func:`swa_write`. Decode knows every token's
+    destination before the layers run — one row per compress class, built once
+    by `write_v4_paged_decode_indices` — so the row need not be re-derived 41
+    times, and the fused write in the norm/RoPE kernel can take the same array
+    instead of carrying the window's geometry into another repo.
+
+    Args:
+        kv:        [T, head_dim] — bf16 path.
+        dest_rows: [>=T] int32 — plane row per token.
+        batch_id_per_token: [>=T] int — `-1` on CG-pad tokens, which are
+                   skipped. The same gate the fused writes apply, so a padded
+                   replay writes nothing whichever backend ran.
+        pool:      [rows, head_dim] this layer's NoPE plane view.
+        k_packed / k_rope / pool_rope: the fp8 2buff triple, as in `swa_write`.
+    """
+    if pool_rope is not None:
+        assert k_packed is not None and k_rope is not None
+        flat = (t.reshape(t.shape[0], -1) for t in (k_packed, k_rope))
+        nope, rope = flat
+        swa_scatter_rows(nope, dest_rows, batch_id_per_token, pool)
+        swa_scatter_rows(rope, dest_rows, batch_id_per_token, pool_rope)
+        return
+    assert kv.dim() == 2 and pool.dim() == 2
+    assert kv.shape[1] == pool.shape[1]
+    T = kv.shape[0]
+    if T == 0:
+        return
+    assert dest_rows.shape[0] >= T and batch_id_per_token.shape[0] >= T
+    head_dim = kv.shape[1]
+    _swa_scatter_rows_kernel[(T,)](
+        kv.contiguous(),
+        dest_rows,
+        batch_id_per_token,
+        pool,
+        pool.stride(0),
+        head_dim,
+        BLOCK_D=triton.next_power_of_2(head_dim),
+    )
+
+
+def swa_scatter_rows_reference(
+    kv: torch.Tensor,
+    dest_rows: torch.Tensor,
+    batch_id_per_token: torch.Tensor,
+    pool: torch.Tensor,
+) -> None:
+    """Pure-torch equivalent of :func:`swa_scatter_rows` (bf16 path)."""
+    T = kv.shape[0]
+    live = (dest_rows[:T] >= 0) & (batch_id_per_token[:T] >= 0)
+    pool[dest_rows[:T][live].long()] = kv[live]
 
 
 def swa_write_2buff_prepacked(
@@ -272,9 +388,9 @@ def swa_write_2buff_prepacked(
     positions: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     state_slot_per_seq: torch.Tensor,
-    swa_region_nope: torch.Tensor,
-    swa_region_rope: torch.Tensor,
-    cache_size: int,
+    pool_nope: torch.Tensor,
+    pool_rope: torch.Tensor,
+    window: WindowParams,
     write_per_batch: int,
 ) -> None:
     """Native 2buff fp8 SWA ring write: scatter of the LAST
@@ -285,18 +401,18 @@ def swa_write_2buff_prepacked(
     is a pure dtype-agnostic scatter (reuses :func:`swa_write` once per pool);
     NO torch quantization happens here.
 
-    Both pools are the flat ring regions of ``unified_kv`` / ``unified_kv_rope``
-    (``[num_slots * cache_size, D]``), addressed identically:
-    ``swa_region[slot * cache_size + pos % cache_size]``. The two must stay in
-    lockstep — a query reads the same row from both.
+    Both planes are this layer's views of ``unified_kv`` / ``unified_kv_rope``
+    and take the SAME row index, ``window.index(slot, pos)`` — that is what a
+    shared `kv_indices` buffer means, and why the two planes materialize one row
+    space rather than sharing an envelope.
 
     Args:
         k_packed:        [T, 512] fp8 — quantized K nope + inline e8m0 scale + pad.
         k_rope:          [T, 64]  bf16 — rotated K-PE (not quantized).
         state_slot_per_seq: [bs] int32 — per-request state slot.
-        swa_region_nope: [num_slots * cache_size, 512] fp8 ring pool (2buff nope).
-        swa_region_rope: [num_slots * cache_size, 64]  bf16 ring pool (rope).
-        cache_size:      ring slots per request (= ``win_with_spec``).
+        pool_nope:       [rows, 512] fp8 NoPE plane view for this layer.
+        pool_rope:       [rows, 64]  bf16 RoPE plane view for this layer.
+        window:          this layer's class's ``WindowParams``.
         (other args as :func:`swa_write`.)
     """
     from atom.model_ops.v4_kernels.v4_quant import V4_DIM_QK_PACKED, V4_DIM_ROPE
@@ -307,16 +423,16 @@ def swa_write_2buff_prepacked(
     assert (
         k_rope.dim() == 2 and k_rope.shape[1] == V4_DIM_ROPE
     ), f"k_rope must be [T,{V4_DIM_ROPE}] bf16, got {tuple(k_rope.shape)}"
-    assert swa_region_nope.dim() == 2 and swa_region_nope.shape[1] == V4_DIM_QK_PACKED
-    assert swa_region_rope.dim() == 2 and swa_region_rope.shape[1] == V4_DIM_ROPE
+    assert pool_nope.dim() == 2 and pool_nope.shape[1] == V4_DIM_QK_PACKED
+    assert pool_rope.dim() == 2 and pool_rope.shape[1] == V4_DIM_ROPE
 
     swa_write(
         k_packed.contiguous(),
         positions,
         cu_seqlens_q,
         state_slot_per_seq,
-        swa_region_nope,
-        cache_size,
+        pool_nope,
+        window,
         write_per_batch,
     )
     swa_write(
@@ -324,8 +440,8 @@ def swa_write_2buff_prepacked(
         positions,
         cu_seqlens_q,
         state_slot_per_seq,
-        swa_region_rope,
-        cache_size,
+        pool_rope,
+        window,
         write_per_batch,
     )
 
@@ -408,16 +524,20 @@ def _update_compressor_states_kernel(
     sc_v = tl.load(score_ptr + ragged_id * score_row_stride + d, mask=m).to(tl.float32)
     ape_v = tl.load(ape_ptr + ring_idx_ape * dim + d, mask=m).to(tl.float32)
 
+    # 64 bits on the slot term, which is not optional: the compressor state
+    # lives at the front of a slot in the shared plane, so consecutive slots
+    # are a whole slot apart and the product runs the length of the pool. At
+    # 152 GB that is 17x past what a 32-bit multiply holds, and it wraps
+    # silently. `dst` and `d` stay inside one entry and need no widening.
+    kv_slot_base = row_offset(slot, kv_state_slot_stride)
+    score_slot_base = row_offset(slot, score_state_slot_stride)
     tl.store(
-        kv_state_ptr + slot * kv_state_slot_stride + dst * kv_state_pos_stride + d,
+        kv_state_ptr + kv_slot_base + dst * kv_state_pos_stride + d,
         kv_v,
         mask=m,
     )
     tl.store(
-        score_state_ptr
-        + slot * score_state_slot_stride
-        + dst * score_state_pos_stride
-        + d,
+        score_state_ptr + score_slot_base + dst * score_state_pos_stride + d,
         sc_v + ape_v,
         mask=m,
     )
@@ -550,7 +670,7 @@ def update_compressor_states_reference(
 # === DSpark rolling window gather (read side of the SWA ring) =============
 # DSpark's block drafter attends `[rolling target window ++ draft block]`. The
 # window KV lives in the shared pool (`unified_kv`, draft layer slice bound as
-# `attn.swa_kv`), ring-addressed by the request's state slot exactly like the V4
+# `attn.swa_plane`), addressed by the request's state slot exactly like the V4
 # target SWA. The block-sparse attention still wants a DENSE `[B, W, D]`
 # window tensor (it concatenates the in-forward draft KV and runs `sparse_attn`),
 # so this kernel materialises that window from the pool.
@@ -560,26 +680,31 @@ def update_compressor_states_reference(
 # (the caller's `valid_target` mask drops them; we zero them here so a stray read
 # is harmless). Filled slots map to the pool via the same addressing as the
 # write:
-#     src_row = state_slot_per_seq[b] * cache_size + (p % cache_size)
+#     src_row = window.index(state_slot_per_seq[b], p)
 #
-# `window <= cache_size` is a hard precondition, asserted below: the draft's
-# `window_size` and the target's `win_with_spec` come from different configs,
-# and a wider draft window would silently read rows the ring already recycled.
+# `draft_window <= window.ring_slots` is a hard precondition, asserted below:
+# the draft's `window_size` and the target's `win_with_spec` come from different
+# configs, and a wider draft window would silently read rows the ring already
+# recycled.
 
 
 @triton.jit
 def _dspark_paged_window_gather_kernel(
-    swa_region_ptr,  # [num_slots*cache_size, head_dim] flat SWA ring pool
-    swa_region_row_stride,  # = head_dim
+    pool_ptr,  # this layer's whole unified-pool view, [rows, head_dim]
+    pool_row_stride,  # = head_dim
     state_slot_per_seq_ptr,  # [B] int32 per-request ring slot
     anchor_pos_ptr,  # [B] int — per-seq anchor absolute position
     out_ptr,  # [B, W, head_dim] dense window output
     out_seq_stride,  # = W * head_dim
     out_slot_stride,  # = head_dim
     head_dim,
-    cache_size,
+    ring_start,
     W: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    RING_SLOTS: tl.constexpr,
+    SLOT_ROWS: tl.constexpr,
+    RING_STRIDE: tl.constexpr,
+    RUN_ROWS: tl.constexpr,
 ):
     """2D grid `(B, W)`. Program `(b, s)` gathers window slot `s` of seq `b`
     from the paged pool into `out[b, s, :]`. Unfilled slots (`p < 0`) write 0."""
@@ -603,92 +728,91 @@ def _dspark_paged_window_gather_kernel(
         return
 
     slot = tl.load(state_slot_per_seq_ptr + b)
-    src_row = slot * cache_size + (p % cache_size)
+    src_row = window_row(
+        slot, p, ring_start, RING_SLOTS, SLOT_ROWS, RING_STRIDE, RUN_ROWS
+    )
     src = tl.load(
-        swa_region_ptr + src_row * swa_region_row_stride + d_offsets,
+        pool_ptr + row_offset(src_row, pool_row_stride) + d_offsets,
         mask=d_mask,
     )
     tl.store(out_base + d_offsets, src, mask=d_mask)
 
 
 def dspark_paged_window_gather(
-    swa_region: torch.Tensor,  # [num_slots*cache_size, D] ring pool (attn.swa_kv)
+    pool: torch.Tensor,  # [rows, D] this layer's plane view (attn.unified_kv)
     state_slot_per_seq: torch.Tensor,  # [B] int32 per-request ring slot
     anchor_pos: torch.Tensor,  # [B] int — anchor absolute position per seq
-    window: int,
-    cache_size: int,
-) -> torch.Tensor:  # [B, window, head_dim]
-    """Materialise the dense `[B, W, head_dim]` rolling window from the SWA
-    ring, addressed by the state slot (mirrors `swa_write`). Slot `s` holds
-    absolute position `anchor_pos[b] - (W-1) + s`; `p < 0` slots are zeroed.
+    draft_window: int,
+    window: WindowParams,
+) -> torch.Tensor:  # [B, draft_window, head_dim]
+    """Materialise the dense `[B, W, head_dim]` rolling window from the pool,
+    addressed by the state slot (mirrors `swa_write`). Slot `s` holds absolute
+    position `anchor_pos[b] - (W-1) + s`; `p < 0` slots are zeroed.
     """
-    assert swa_region.dim() == 2, f"swa_region must be [P, D], got {swa_region.shape}"
+    assert pool.dim() == 2, f"pool must be [rows, D], got {pool.shape}"
     assert (
         state_slot_per_seq.dim() == 1
     ), f"state_slot_per_seq must be [B], got {state_slot_per_seq.shape}"
-    assert window <= cache_size, (
-        f"rolling window {window} exceeds the SWA ring ({cache_size} slots): the "
-        "oldest slot the window needs has already been overwritten. The draft's "
-        "`window_size` and the target's `win_with_spec` are separate configs."
+    assert draft_window <= window.ring_slots, (
+        f"rolling window {draft_window} exceeds the SWA ring "
+        f"({window.ring_slots} slots): the oldest slot the window needs has "
+        "already been overwritten. The draft's `window_size` and the target's "
+        "`win_with_spec` are separate configs."
     )
     B = state_slot_per_seq.shape[0]
-    head_dim = swa_region.shape[1]
+    head_dim = pool.shape[1]
     assert anchor_pos.shape[0] >= B
-    assert swa_region.is_contiguous()
+    assert pool.is_contiguous()
 
-    out = torch.zeros(
-        B, window, head_dim, device=swa_region.device, dtype=swa_region.dtype
-    )
-    if B == 0 or window == 0:
+    out = torch.zeros(B, draft_window, head_dim, device=pool.device, dtype=pool.dtype)
+    if B == 0 or draft_window == 0:
         return out
     BLOCK_D = triton.next_power_of_2(head_dim)
-    grid = (B, window)
+    grid = (B, draft_window)
     _dspark_paged_window_gather_kernel[grid](
-        swa_region,
-        swa_region.stride(0),
+        pool,
+        pool.stride(0),
         state_slot_per_seq,
         anchor_pos.to(torch.int32),
         out,
         out.stride(0),
         out.stride(1),
         head_dim,
-        cache_size,
-        W=window,
+        window.ring_start,
+        W=draft_window,
         BLOCK_D=BLOCK_D,
+        **window_constexprs(window),
     )
     return out
 
 
 def dspark_paged_window_gather_reference(
-    swa_region: torch.Tensor,
+    pool: torch.Tensor,
     state_slot_per_seq: torch.Tensor,
     anchor_pos: torch.Tensor,
-    window: int,
-    cache_size: int,
+    draft_window: int,
+    window: WindowParams,
 ) -> torch.Tensor:
     """Pure-torch reference for `dspark_paged_window_gather` (unit tests)."""
     B = state_slot_per_seq.shape[0]
-    _, head_dim = swa_region.shape
-    out = torch.zeros(
-        B, window, head_dim, device=swa_region.device, dtype=swa_region.dtype
-    )
+    _, head_dim = pool.shape
+    out = torch.zeros(B, draft_window, head_dim, device=pool.device, dtype=pool.dtype)
     for b in range(B):
         anchor = int(anchor_pos[b].item())
-        for s in range(window):
-            p = anchor - (window - 1) + s
+        for s in range(draft_window):
+            p = anchor - (draft_window - 1) + s
             if p < 0:
                 continue
             slot = int(state_slot_per_seq[b])
-            src_row = slot * cache_size + (p % cache_size)
-            out[b, s] = swa_region[src_row]
+            out[b, s] = pool[window.index(slot, p)]
     return out
 
 
 # === DSpark paged window gather — native 2buff fp8 variant =================
 # fp8 KV cache stores the rolling target window in the SAME 2buff layout as the
 # V4 target: NoPE lanes fp8-quantized (per-64-elt e8m0 tile scale, inline in the
-# 512B `swa_region_nope` row) + RoPE lanes bf16 in a parallel `swa_region_rope`
-# pool, both ring-addressed by the request's state slot. DSpark's block
+# 512B `pool_nope` row) + RoPE lanes bf16 in a parallel `pool_rope` plane, both
+# ring-addressed by the request's state slot. DSpark's block
 # attention wants a DENSE bf16 `[B, W, head_dim]` window, so this kernel gathers
 # BOTH pools and dequantizes the NoPE half on the fly (fp8_val * 2^(B-127)),
 # concatenating the bf16 RoPE tail — a fused analog of
@@ -697,9 +821,9 @@ def dspark_paged_window_gather_reference(
 
 @triton.jit
 def _dspark_paged_window_gather_2buff_kernel(
-    nope_fp8_ptr,  # [num_slots*cache_size, 512] fp8 (NoPE 448 | dup-e8m0-scale 14 | pad 50)
+    nope_fp8_ptr,  # [rows, 512] fp8 plane view (NoPE 448 | dup-e8m0-scale 14 | pad 50)
     nope_u8_ptr,  # same buffer, uint8 view — reads the e8m0 scale bytes
-    rope_ptr,  # [num_slots*cache_size, ROPE] bf16
+    rope_ptr,  # [rows, ROPE] bf16 plane view
     nope_row_stride,  # = 512
     rope_row_stride,  # = ROPE
     state_slot_per_seq_ptr,  # [B] int32 per-request ring slot
@@ -707,13 +831,17 @@ def _dspark_paged_window_gather_2buff_kernel(
     out_ptr,  # [B, W, NOPE+ROPE] bf16 dense window
     out_seq_stride,  # = W * (NOPE+ROPE)
     out_slot_stride,  # = NOPE+ROPE
-    cache_size,
+    ring_start,
     W: tl.constexpr,
     NOPE: tl.constexpr,  # 448
     ROPE: tl.constexpr,  # 64
     TILE: tl.constexpr,  # 64
     NUM_TILES: tl.constexpr,  # 7
     PACK_OFF_SCALE: tl.constexpr,  # 448
+    RING_SLOTS: tl.constexpr,
+    SLOT_ROWS: tl.constexpr,
+    RING_STRIDE: tl.constexpr,
+    RUN_ROWS: tl.constexpr,
 ):
     """2D grid `(B, W)`. Program `(b, s)` gathers + dequantizes window slot `s`
     of seq `b` into `out[b, s, :]` (bf16). Unfilled slots (`p < 0`) write 0."""
@@ -739,36 +867,37 @@ def _dspark_paged_window_gather_2buff_kernel(
         return
 
     slot = tl.load(state_slot_per_seq_ptr + b)
-    src_row = slot * cache_size + (p % cache_size)
+    src_row = window_row(
+        slot, p, ring_start, RING_SLOTS, SLOT_ROWS, RING_STRIDE, RUN_ROWS
+    )
 
     # NoPE: per-64-elt tile fp8 dequant. e8m0 byte B decodes to 2^(B-127); B==0
     # is the all-zero-tile sentinel -> scale 0.0 (mirrors _e8m0_to_fp32_pow2).
     for t in tl.static_range(NUM_TILES):
         cols = t * TILE + d_tile
-        x = tl.load(nope_fp8_ptr + src_row * nope_row_stride + cols).to(tl.float32)
-        byte = tl.load(
-            nope_u8_ptr + src_row * nope_row_stride + PACK_OFF_SCALE + 2 * t
-        ).to(tl.int32)
+        nope_base = row_offset(src_row, nope_row_stride)
+        x = tl.load(nope_fp8_ptr + nope_base + cols).to(tl.float32)
+        byte = tl.load(nope_u8_ptr + nope_base + PACK_OFF_SCALE + 2 * t).to(tl.int32)
         scale = tl.where(byte > 0, tl.exp2((byte - 127).to(tl.float32)), 0.0)
         tl.store(out_base + cols, (x * scale).to(out_ptr.dtype.element_ty))
 
     # RoPE tail: bf16 passthrough.
-    r = tl.load(rope_ptr + src_row * rope_row_stride + r_cols)
+    r = tl.load(rope_ptr + row_offset(src_row, rope_row_stride) + r_cols)
     tl.store(out_base + NOPE + r_cols, r.to(out_ptr.dtype.element_ty))
 
 
 def dspark_paged_window_gather_2buff(
-    swa_region_nope: torch.Tensor,  # [num_slots*cache_size, 512] fp8
-    swa_region_rope: torch.Tensor,  # [num_slots*cache_size, rope_dim] bf16
+    pool_nope: torch.Tensor,  # [rows, 512] fp8 plane view
+    pool_rope: torch.Tensor,  # [rows, rope_dim] bf16 plane view
     state_slot_per_seq: torch.Tensor,  # [B] int32 per-request ring slot
     anchor_pos: torch.Tensor,  # [B] int
-    window: int,
-    cache_size: int,
-) -> torch.Tensor:  # [B, window, V4_DIM_QK] bf16
+    draft_window: int,
+    window: WindowParams,
+) -> torch.Tensor:  # [B, draft_window, V4_DIM_QK] bf16
     """Materialise + dequantize the dense bf16 `[B, W, 512]` rolling window from
-    the native 2buff fp8 SWA ring pools (NoPE fp8 + RoPE bf16), addressed by the
-    state slot (mirrors `swa_write_2buff_prepacked`). Slot `s` holds absolute
-    position `anchor_pos[b] - (W-1) + s`; `p < 0` slots are zeroed.
+    the two 2buff planes (NoPE fp8 + RoPE bf16), addressed by the state slot
+    (mirrors `swa_write_2buff_prepacked`). Slot `s` holds absolute position
+    `anchor_pos[b] - (W-1) + s`; `p < 0` slots are zeroed.
     """
     from atom.model_ops.v4_kernels.v4_quant import (
         V4_DIM_NOPE,
@@ -780,61 +909,60 @@ def dspark_paged_window_gather_2buff(
         V4_TILE,
     )
 
-    assert (
-        swa_region_nope.dim() == 2 and swa_region_nope.shape[1] == V4_DIM_QK_PACKED
-    ), (
-        f"swa_region_nope must be [P,{V4_DIM_QK_PACKED}] fp8, "
-        f"got {tuple(swa_region_nope.shape)}"
+    assert pool_nope.dim() == 2 and pool_nope.shape[1] == V4_DIM_QK_PACKED, (
+        f"pool_nope must be [rows,{V4_DIM_QK_PACKED}] fp8, "
+        f"got {tuple(pool_nope.shape)}"
     )
-    assert swa_region_rope.dim() == 2 and swa_region_rope.shape[1] == V4_DIM_ROPE, (
-        f"swa_region_rope must be [P,{V4_DIM_ROPE}] bf16, "
-        f"got {tuple(swa_region_rope.shape)}"
+    assert pool_rope.dim() == 2 and pool_rope.shape[1] == V4_DIM_ROPE, (
+        f"pool_rope must be [rows,{V4_DIM_ROPE}] bf16, " f"got {tuple(pool_rope.shape)}"
     )
     assert (
         state_slot_per_seq.dim() == 1
     ), f"state_slot_per_seq must be [B], got {state_slot_per_seq.shape}"
-    assert window <= cache_size, (
-        f"rolling window {window} exceeds the SWA ring ({cache_size} slots): the "
-        "oldest slot the window needs has already been overwritten. The draft's "
-        "`window_size` and the target's `win_with_spec` are separate configs."
+    assert draft_window <= window.ring_slots, (
+        f"rolling window {draft_window} exceeds the SWA ring "
+        f"({window.ring_slots} slots): the oldest slot the window needs has "
+        "already been overwritten. The draft's `window_size` and the target's "
+        "`win_with_spec` are separate configs."
     )
-    assert swa_region_nope.is_contiguous() and swa_region_rope.is_contiguous()
+    assert pool_nope.is_contiguous() and pool_rope.is_contiguous()
     B = state_slot_per_seq.shape[0]
     out = torch.empty(
-        B, window, V4_DIM_QK, device=swa_region_nope.device, dtype=torch.bfloat16
+        B, draft_window, V4_DIM_QK, device=pool_nope.device, dtype=torch.bfloat16
     )
-    if B == 0 or window == 0:
+    if B == 0 or draft_window == 0:
         return out
-    grid = (B, window)
+    grid = (B, draft_window)
     _dspark_paged_window_gather_2buff_kernel[grid](
-        swa_region_nope,
-        swa_region_nope.view(torch.uint8),
-        swa_region_rope,
-        swa_region_nope.stride(0),
-        swa_region_rope.stride(0),
+        pool_nope,
+        pool_nope.view(torch.uint8),
+        pool_rope,
+        pool_nope.stride(0),
+        pool_rope.stride(0),
         state_slot_per_seq,
         anchor_pos.to(torch.int32),
         out,
         out.stride(0),
         out.stride(1),
-        cache_size,
-        W=window,
+        window.ring_start,
+        W=draft_window,
         NOPE=V4_DIM_NOPE,
         ROPE=V4_DIM_ROPE,
         TILE=V4_TILE,
         NUM_TILES=V4_NUM_TILES,
         PACK_OFF_SCALE=V4_PACK_OFF_SCALE,
+        **window_constexprs(window),
     )
     return out
 
 
 def dspark_paged_window_gather_2buff_reference(
-    swa_region_nope: torch.Tensor,
-    swa_region_rope: torch.Tensor,
+    pool_nope: torch.Tensor,
+    pool_rope: torch.Tensor,
     state_slot_per_seq: torch.Tensor,
     anchor_pos: torch.Tensor,
-    window: int,
-    cache_size: int,
+    draft_window: int,
+    window: WindowParams,
 ) -> torch.Tensor:
     """Pure-torch reference for `dspark_paged_window_gather_2buff` (unit tests):
     gather each 2buff pool with the single-pool reference, then dequantize.
@@ -842,9 +970,9 @@ def dspark_paged_window_gather_2buff_reference(
     from atom.model_ops.v4_kernels.v4_quant import dequantize_v4_2buff_to_bf16
 
     nope = dspark_paged_window_gather_reference(
-        swa_region_nope, state_slot_per_seq, anchor_pos, window, cache_size
+        pool_nope, state_slot_per_seq, anchor_pos, draft_window, window
     )  # [B, W, 512] fp8
     rope = dspark_paged_window_gather_reference(
-        swa_region_rope, state_slot_per_seq, anchor_pos, window, cache_size
+        pool_rope, state_slot_per_seq, anchor_pos, draft_window, window
     )  # [B, W, rope] bf16
     return dequantize_v4_2buff_to_bf16(nope, rope)

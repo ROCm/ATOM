@@ -254,11 +254,13 @@ The block pool is pre-allocated at startup. [`BlockPool`](../atom/model_engine/b
 
 #### Sliding window: a ring, not a pool
 
-DeepSeek-V4's sliding window is a per-request ring at the head of every layer's `unified_kv`, `win_with_spec = window + max_spec_steps` rows per request slot, addressed as
+DeepSeek-V4's sliding window is a per-request ring inside that request's **slot** — a fixed run of rows at the high end of the shared row space, holding its compressor state and then every layer's window. `win_with_spec = window + max_spec_steps` positions are addressable per layer, and one formula serves every layer of a compress class ([`v4_pool_geometry.py`](../atom/model_ops/attentions/v4_pool_geometry.py)):
 
 ```
-row = state_slot_out[bid] * win_with_spec + pos % win_with_spec
+row = slot * slot_rows + ring_start + (q // ring_stride) * run_rows + q % ring_stride
 ```
+
+where `q = pos % win_with_spec`. The layer term is not in it: a layer's view is anchored at its own base row, which is what lets one index buffer serve the whole class.
 
 It was a content-addressed block pool until this change, which is worth writing down because the choice is not obvious and it is not permanent. **The question is where reuse comes from: a block pool reuses by sharing rows, a ring reuses by copying them.** Everything else follows.
 
@@ -267,6 +269,7 @@ Sharing rows was the only mechanism available before per-request state could be 
 What the ring buys:
 
 - **Memory is sized in tokens, not blocks.** A block-addressed window straddling a boundary occupies `ceil(win/block)+1` blocks — at V4's 128-token window and 256-token block that is 512 tokens of full-resolution KV to hold 128. Measured on V4-Flash-DSpark tp2: the SWA sub-pool went 4.04 GB → 0.92 GB (fp8) and 6.47 GB → 1.58 GB (bf16), all of it returned to the paged pool as ~3,100 more blocks.
+- **It shares a slot with the compressor state, so both are one entry class.** They are allocated and given up together and no request can have one without the other; pricing them apart would only invite a split that cannot happen. It also collapses a checkpoint copy to one range per plane.
 - **The pool itself disappears** — free list, content index, window-freeing walk, per-request block table, `-1` out-of-window sentinels, and the admission term that had to account for all of it.
 - **The bound is constructed, not measured.** The block pool carried a flat 64-block cushion because admission checked free blocks per request without reserving them, while materialization for the whole scheduling pass happened later. A ring is allocated with the request's state slot and cannot transiently exceed itself.
 - **It stops gating prefix hits.** A block-addressed window vetoed any boundary whose trailing window was not resident. In the cache-stats line that veto is visible as `Lost-unrecoverable`; it moved to `Lost-to-checkpoint` (0.32% on V4-Flash-DSpark GSM8K) — the same reuse, now recoverable.
