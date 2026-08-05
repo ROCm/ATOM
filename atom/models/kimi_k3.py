@@ -609,12 +609,15 @@ class KimiFullAttention(nn.Module):
 
         rope_parameters = getattr(config, "rope_parameters", None) or {}
         rope_theta = rope_parameters.get("rope_theta") or 10000.0
+        # max_position_embeddings field only exists in the text config
+        _text_max_pos = getattr(config, "max_position_embeddings", None)
+        rope_max_position = int(
+            _text_max_pos or getattr(atom_config, "max_model_len", None) or 16384
+        )
         self.rotary_emb = _NoPositionalRotaryEmbedding(
             head_size=self.qk_rope_head_dim,
             rotary_dim=self.qk_rope_head_dim,
-            max_position_embeddings=int(
-                getattr(atom_config, "max_model_len", None) or 16384
-            ),
+            max_position_embeddings=rope_max_position,
             base=rope_theta,
         )
         mla_modules = MLAModules(
