@@ -117,11 +117,11 @@ models:
           prefill:
             workers: 1
             tp: 8
-            extra_args: "--method mtp --speculative-tokens 3"
+            extra_args: "--method mtp --num-speculative-tokens 3"
           decode:
             workers: 1
             tp: 8
-            extra_args: "--method mtp --speculative-tokens 3"
+            extra_args: "--method mtp --num-speculative-tokens 3"
           benchmark:
             wait_server_timeout: 4500
           run_eval: true
@@ -140,11 +140,11 @@ models:
           prefill:
             workers: 1
             tp: 8
-            extra_args: "--method mtp --speculative-tokens 1 --enable-dp-attention --enable-tbo"
+            extra_args: "--method mtp --num-speculative-tokens 1 --enable-dp-attention --enable-tbo"
           decode:
             workers: 1
             tp: 8
-            extra_args: "--method mtp --speculative-tokens 1 --enable-dp-attention"
+            extra_args: "--method mtp --num-speculative-tokens 1 --enable-dp-attention"
           benchmark:
             wait_server_timeout: 4500
 
@@ -271,13 +271,14 @@ models:
                 MAX_JOBS: "16"
             benchmark:
               kind: aiperf_agentic
-              aiperf_commit: 0d2aa0572ac685943d38c580675c4a61023581d3
+              aiperf_commit: b7b16cf851885567988a643282266bce74e34437
               scenario: inferencex-agentx-mvp
               public_dataset: semianalysis_cc_traces_weka_062126
               max_context_length: 1048576
               num_dataset_entries: 393
               benchmark_duration: 3600
-              agentic_cache_warmup_duration: 600
+              warmup_requests_per_lane: 10
+              trace_idle_gap_cap_seconds: 300
               warmup_grace_period: 1800
               trajectory_start_min_ratio: 0.25
               trajectory_start_max_ratio: 0.75

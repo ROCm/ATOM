@@ -209,7 +209,7 @@ Prepare an isolated AIPerf environment if one is not already available:
 ```bash
 export AIPERF_DIR=${AIPERF_DIR:-/workspace/codes/aiperf}
 export AIPERF_VENV=${AIPERF_VENV:-/workspace/venvs/aiperf-sa}
-export SA_AIPERF_COMMIT=${SA_AIPERF_COMMIT:-0d2aa0572ac685943d38c580675c4a61023581d3}
+export SA_AIPERF_COMMIT=${SA_AIPERF_COMMIT:-b7b16cf851885567988a643282266bce74e34437}
 
 mkdir -p "$(dirname "${AIPERF_DIR}")" "$(dirname "${AIPERF_VENV}")"
 if [[ ! -d "${AIPERF_DIR}/.git" ]]; then
@@ -241,7 +241,8 @@ export PUBLIC_DATASET=${PUBLIC_DATASET:-semianalysis_cc_traces_weka_062126}
 
 export CONCURRENCY=${CONCURRENCY:-1}
 export BENCHMARK_DURATION=${BENCHMARK_DURATION:-3600}
-export AGENTIC_CACHE_WARMUP_DURATION=${AGENTIC_CACHE_WARMUP_DURATION:-600}
+export WARMUP_REQUESTS_PER_LANE=${WARMUP_REQUESTS_PER_LANE:-10}
+export TRACE_IDLE_GAP_CAP_SECONDS=${TRACE_IDLE_GAP_CAP_SECONDS:-300}
 export WARMUP_GRACE_PERIOD=${WARMUP_GRACE_PERIOD:-1800}
 export MAX_CONTEXT_LENGTH=${MAX_CONTEXT_LENGTH:-1048576}
 export NUM_DATASET_ENTRIES=${NUM_DATASET_ENTRIES:-393}
@@ -254,6 +255,7 @@ export SLICE_DURATION=${SLICE_DURATION:-1.0}
 export AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES=0
 export AIPERF_DATASET_CONFIGURATION_TIMEOUT=1800
 export AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT=1800
+export AIPERF_UI_REALTIME_METRICS_ENABLED=true
 export AIPERF_HTTP_TCP_USER_TIMEOUT=900000
 export AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT=300
 
@@ -280,10 +282,12 @@ mkdir -p "${OUTPUT_DIR}"
   --concurrency "${CONCURRENCY}" \
   --benchmark-duration "${BENCHMARK_DURATION}" \
   --random-seed "${RANDOM_SEED}" \
+  --stats-interval 30 \
   --failed-request-threshold "${FAILED_REQUEST_THRESHOLD}" \
   --trajectory-start-min-ratio "${TRAJECTORY_START_MIN_RATIO}" \
   --trajectory-start-max-ratio "${TRAJECTORY_START_MAX_RATIO}" \
-  --agentic-cache-warmup-duration "${AGENTIC_CACHE_WARMUP_DURATION}" \
+  --warmup-requests-per-lane "${WARMUP_REQUESTS_PER_LANE}" \
+  --trace-idle-gap-cap-seconds "${TRACE_IDLE_GAP_CAP_SECONDS}" \
   --warmup-grace-period "${WARMUP_GRACE_PERIOD}" \
   --use-server-token-count \
   --no-gpu-telemetry \
@@ -345,7 +349,7 @@ For a short AIPerf functional smoke test (not SWE-bench), use:
 ```bash
 export CONCURRENCY=1
 export BENCHMARK_DURATION=20
-export AGENTIC_CACHE_WARMUP_DURATION=1
+export WARMUP_REQUESTS_PER_LANE=1
 export NUM_DATASET_ENTRIES=39
 export TRAJECTORY_START_MAX_RATIO=0.25
 
