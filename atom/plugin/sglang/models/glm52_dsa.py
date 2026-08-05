@@ -23,8 +23,8 @@ logger = logging.getLogger(__name__)
 def _patch_aiter_flat_fmoe_for_glm52_mi308() -> None:
     """Keep GLM-5.2 from selecting gfx950-only flat FMOE kernels on MI308."""
     try:
-        import aiter.fused_moe as fused_moe
-    except Exception:  # noqa: BLE001 - best-effort plugin compatibility patch.
+        from aiter import fused_moe
+    except Exception:
         logger.debug(
             "Failed to import aiter.fused_moe for GLM-5.2 patch", exc_info=True
         )
