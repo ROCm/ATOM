@@ -162,15 +162,199 @@ class TestPoolIndex:
 
     def test_pins_drain_once(self):
         pool = StateGroupPool(4)
-        pool.free_groups.clear()  # every group out with a request
+        while pool.has_free():  # every group out with a request
+            pool.pop()
         pool.pin(1)
         pool.pin(3)
         assert pool.is_pinned(1)
         pool.release_pins()
-        assert list(pool.free_groups) == [1, 3]
+        assert pool.num_free() == 2
+        assert pool.is_free(1) and pool.is_free(3)
         pool.release_pins()  # idempotent: a drained pin is not freed twice
-        assert list(pool.free_groups) == [1, 3]
+        assert pool.num_free() == 2
         assert not pool.is_pinned(1)
+
+
+# ── The free list is two halves: vacant, and checkpoints in LRU order ──────
+#
+# Splitting them is what lets the pool shrink from the top without spending
+# whatever happens to sit there. Vacant is drawn from first and packs towards
+# index 0; checkpoints are spent oldest-first, wherever they are.
+
+
+def drain(pool):
+    """Hand out every group, as if that many requests were running."""
+    while pool.has_free():
+        pool.pop()
+
+
+class TestFreeListHalves:
+    def test_a_vacant_group_is_spent_before_any_checkpoint(self):
+        """The single release-ordered queue this replaced got this wrong.
+
+        Group 0 is checkpointed and handed back first, group 1 is handed back
+        after it carrying nothing. In release order 0 comes out first and the
+        checkpoint dies while a group with nothing to lose waits behind it.
+        """
+        pool = StateGroupPool(4)
+        drain(pool)
+        pool.release(0)
+        pool._index(10, 0)
+        pool.release(1)
+
+        assert pool.pop() == 1
+        assert pool.lookup(10) == 0
+
+    def test_admission_packs_towards_index_zero(self):
+        pool = StateGroupPool(4)
+        drain(pool)
+        for group in (3, 1, 2):
+            pool.release(group)
+        assert [pool.pop() for _ in range(3)] == [1, 2, 3]
+
+    def test_checkpoints_are_spent_least_recently_used_first(self):
+        pool = StateGroupPool(4)
+        drain(pool)
+        for group, h in ((0, 10), (1, 11), (2, 12)):
+            pool.release(group)
+            pool._index(h, group)
+
+        assert pool.pop() == 0
+        assert pool.pop() == 1
+
+    def test_resuming_from_a_checkpoint_refreshes_it(self):
+        """Reuse has to count as use or the hottest checkpoint dies first.
+
+        `claim` deliberately leaves the hash in place, so the group comes back
+        through `release` still checkpointed — and lands at the LRU tail.
+        """
+        pool = StateGroupPool(4)
+        drain(pool)
+        for group, h in ((0, 10), (1, 11)):
+            pool.release(group)
+            pool._index(h, group)
+
+        pool.claim(0)  # a resumer reads the oldest checkpoint
+        pool.pin(0)
+        pool.release_pins()
+
+        assert pool.pop() == 1  # 11 is now the older of the two
+        assert pool.lookup(10) == 0
+
+    def test_republishing_a_hash_returns_the_orphan_to_the_vacant_half(self):
+        pool = StateGroupPool(4)
+        drain(pool)
+        pool.release(0)
+        pool._index(10, 0)
+        pool.release(1)
+        pool._index(10, 1)  # group 0 no longer backs anything
+
+        assert pool.pop() == 0  # vacant again, so it goes before the checkpoint
+        assert pool.lookup(10) == 1
+
+
+class TestShrinking:
+    def test_a_vacant_top_costs_nothing(self):
+        pool = StateGroupPool(4)
+        out = pool.retire_top()
+        assert (out.retired, out.relocated_to) == (3, -1)
+        assert pool.num_groups == 3
+        assert not pool.is_free(3)
+
+    def test_a_live_top_moves_into_the_lowest_vacant_group(self):
+        pool = StateGroupPool(4)
+        drain(pool)
+        pool.release(2)  # only group 2 is free; 3 is held by a request
+
+        out = pool.retire_top()
+        assert (out.retired, out.relocated_to, out.held_checkpoint) == (3, 2, False)
+        assert pool.num_groups == 3
+
+    def test_shrinking_spends_the_oldest_checkpoint_not_the_top_one(self):
+        """The whole reason `retire_top` relocates instead of just dropping.
+
+        A group's index records the concurrency high-water mark when it was
+        handed out and is never refreshed by use, so the hottest checkpoint can
+        sit at the top. Retiring by index alone would spend it and leave one
+        nothing has touched in minutes.
+        """
+        pool = StateGroupPool(4)
+        drain(pool)
+        for group, h in ((0, 10), (3, 13)):
+            pool.release(group)
+            pool._index(h, group)
+        pool.claim(3)  # 13 is hot: someone just resumed from it
+        pool.pin(3)
+        pool.release_pins()
+
+        out = pool.retire_top()
+
+        assert out.retired == 3 and out.held_checkpoint
+        assert out.relocated_to == 0
+        assert pool.lookup(13) == 0  # the hot one survived, at a new address
+        assert pool.lookup(10) == -1  # the cold one is what we spent
+        assert pool.num_groups == 3
+
+    def test_the_top_is_spent_when_it_is_itself_the_oldest(self):
+        pool = StateGroupPool(2)
+        drain(pool)
+        pool.release(1)
+        pool._index(13, 1)
+
+        out = pool.retire_top()
+        assert (out.retired, out.relocated_to, out.held_checkpoint) == (1, -1, True)
+        assert pool.lookup(13) == -1
+
+    def test_a_pinned_top_is_refused_rather_than_moved(self):
+        """It is being read by the in-flight step; the pin drains next pass."""
+        pool = StateGroupPool(4)
+        drain(pool)
+        pool.pin(3)
+        assert pool.retire_top() is None
+        assert pool.num_groups == 4
+
+    def test_a_live_top_with_nowhere_to_go_is_refused(self):
+        pool = StateGroupPool(4)
+        drain(pool)
+        assert pool.retire_top() is None
+        assert pool.num_groups == 4
+
+    def test_growing_adds_groups_at_the_top(self):
+        pool = StateGroupPool(2)
+        drain(pool)
+        pool.extend(2)
+        assert pool.num_groups == 4
+        assert [pool.pop() for _ in range(2)] == [2, 3]
+
+    def test_the_vacant_heap_does_not_grow_without_bound(self):
+        """Taking a hash while vacant leaves an entry behind; churn compacts.
+
+        Nothing observable depends on this, which is why it is asserted
+        directly: on a long-lived server the stale entries otherwise outnumber
+        the live ones by the number of checkpoints ever taken.
+        """
+        pool = StateGroupPool(4)
+        for round_ in range(200):
+            group = pool.pop()
+            pool.release(group)
+            pool._index(round_, group)  # promotes it, stranding a heap entry
+            pool.claim(group)
+            pool.group_hash[group] = -1
+            pool.release(group)
+        assert len(pool._vacant) <= 2 * pool.num_groups + 2
+
+    def test_regrowing_a_retired_index_reuses_its_hash_slot(self):
+        """Not appending a second one, which would shift every index above it."""
+        pool = StateGroupPool(3)
+        assert pool.retire_top().retired == 2
+        pool.extend(1)
+
+        assert pool.num_groups == 3
+        assert len(pool.group_hash) == 3
+        drain(pool)
+        pool.release(2)
+        pool._index(12, 2)
+        assert pool.lookup(12) == 2
 
 
 # ── BlockManager: the hit is shrunk to a resumable boundary ────────────────
@@ -241,12 +425,12 @@ class TestCapacity:
         # point is that neither outcome costs a group.
         assert bm.state.hash_to_group
         # Every group is back, so the pool admits its full concurrency.
-        assert len(bm.state.free_groups) == 4
+        assert bm.state.num_free() == 4
         for i in range(4):
             seq = stateful_seq(list(range(900 + 20 * i, 920 + 20 * i)))
             assert bm.can_allocate(seq) >= 0
             bm.allocate(seq, 0)
-        assert len(bm.state.free_groups) == 0
+        assert bm.state.num_free() == 0
 
     def test_handout_evicts_the_checkpoint_it_lands_on(self):
         bm = BlockManager(ckpt_config())
@@ -255,7 +439,7 @@ class TestCapacity:
         group = bm.state.lookup(h)
         bm.deallocate(first)
         # Drain the queue until the checkpoint's group comes back around.
-        while bm.state.free_groups:
+        while bm.state.has_free():
             seq = stateful_seq(list(range(900, 920)))
             bm.allocate(seq, 0)
             if seq.per_req_cache_group == group:
@@ -269,7 +453,7 @@ class TestCapacity:
         first = stateful_seq(list(range(40)))
         h = publish_at_boundary(bm, first)
         group = bm.state.lookup(h)
-        assert len(bm.state.free_groups) == 1
+        assert bm.state.num_free() == 1
 
         second = stateful_seq(list(range(40)))
         bm.allocate(second, bm.can_allocate(second))
@@ -413,13 +597,13 @@ class TestForkLifecycle:
         bm.allocate(seq, bm.can_allocate(seq))
         source = seq.per_req_cache_group
         bm.hash_blocks(seq, bm.checkpoint_limit(seq) - seq.num_cached_tokens)
-        free_after_publish = len(bm.state.free_groups)
+        free_after_publish = bm.state.num_free()
 
         bm.cancel_state_fork(seq)
         assert seq.per_req_cache_group == source
         assert seq.state_fork_src == -1
         assert not bm.state.hash_to_group
-        assert len(bm.state.free_groups) == free_after_publish
+        assert bm.state.num_free() == free_after_publish
 
     def test_two_resumers_in_one_step_share_the_checkpoint(self):
         # A checkpoint is read-only, so a second request hitting the same prefix
@@ -440,9 +624,9 @@ class TestForkLifecycle:
         assert len(groups) == len(resumers)
         assert src not in groups
         # However many read it, the group goes back exactly once.
-        before = len(bm.state.free_groups)
+        before = bm.state.num_free()
         bm.release_state_pins()
-        assert len(bm.state.free_groups) == before + 1
+        assert bm.state.num_free() == before + 1
 
     def test_cancel_refuses_to_adopt_a_shared_source(self):
         bm = BlockManager(ckpt_config())
@@ -475,7 +659,7 @@ class TestForkLifecycle:
         assert not bm.state.is_pinned(src)
         # The pin must not also hand the group back — it has an owner now.
         bm.release_state_pins()
-        assert src not in bm.state.free_groups
+        assert not bm.state.is_free(src)
 
     def test_pinned_source_returns_to_the_free_list_next_step(self):
         bm = BlockManager(ckpt_config())
@@ -483,9 +667,9 @@ class TestForkLifecycle:
         src = bm.state.lookup(publish_at_boundary(bm, first))
         second = stateful_seq(list(range(40)))
         bm.allocate(second, bm.can_allocate(second))
-        assert src not in bm.state.free_groups
+        assert not bm.state.is_free(src)
         bm.release_state_pins()
-        assert src in bm.state.free_groups
+        assert bm.state.is_free(src)
 
 
 # ── The scheduler side: what a checkpoint costs the publisher ──────────────
@@ -567,7 +751,7 @@ class TestCopyLifecycle:
         assert got_src == src and dst != src
         assert bm.state.lookup(h) == dst
         # Capacity-neutral: the destination went straight back on the free list.
-        assert dst in bm.state.free_groups
+        assert bm.state.is_free(dst)
         assert not bm.state_copies_for_batch()  # drained once, not twice
 
     def test_a_request_freed_before_the_commit_indexes_nothing(self):
@@ -586,7 +770,8 @@ class TestCopyLifecycle:
         bm = BlockManager(copy_config())
         seq = self._admitted(bm)
         bm.hash_blocks(seq, bm.checkpoint_limit(seq) - seq.num_cached_tokens)
-        bm.state.free_groups.clear()
+        while bm.state.has_free():
+            bm.state.pop()
 
         # committed by state_copies_for_batch()
         assert not bm.state.hash_to_group
@@ -639,7 +824,7 @@ class TestCopyLifecycle:
         first = self._admitted(bm)
         bm.hash_blocks(first, bm.checkpoint_limit(first) - first.num_cached_tokens)
         # Leave exactly one group: the admission takes it, the checkpoint yields.
-        while len(bm.state.free_groups) > 1:
+        while bm.state.num_free() > 1:
             bm.state.pop()
 
         newcomer = stateful_seq(list(range(40)))
