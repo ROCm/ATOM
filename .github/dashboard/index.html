@@ -696,20 +696,27 @@ function buildAtomeshBenchmarkRows(data) {
       const parsed = parseAtomeshPerfPointExtra(bench.extra);
       if (!parsed?.point || parsed.point.source !== 'ATOMesh') continue;
       const row = atomeshPointRow(parsed.point, parsed.meta, idx++);
-      const key = `${row.backend}|${row.hardware}|${row.model}|${row.topology}|${row.islOsl}|${row.concurrency}`;
+      const nextRow = {
+        ...row,
+        commit: run.commit,
+        runDay,
+        cid7,
+        date: row.date || run.date || 0,
+      };
+      const key = `${nextRow.backend}|${nextRow.hardware}|${nextRow.model}|${nextRow.topology}|${nextRow.islOsl}|${nextRow.concurrency}`;
       const current = rowsByKey[key];
       if (!current) {
-        rowsByKey[key] = { ...row, commit: run.commit, runDay, cid7 };
+        rowsByKey[key] = nextRow;
         continue;
       }
       if (current.runDay !== runDay || current.cid7 !== cid7) continue;
       const currentScore = atomeshPointScore(current);
-      const nextScore = atomeshPointScore(row);
+      const nextScore = atomeshPointScore(nextRow);
       if (
         (Number.isFinite(nextScore) && (!Number.isFinite(currentScore) || nextScore > currentScore))
-        || (nextScore === currentScore && (row.date || 0) > (current.date || 0))
+        || (nextScore === currentScore && nextRow.date > (current.date || 0))
       ) {
-        rowsByKey[key] = { ...row, commit: run.commit, runDay, cid7 };
+        rowsByKey[key] = nextRow;
       }
     }
   }
@@ -4070,7 +4077,7 @@ function renderAtomeshAccuracyTab() {
       <td class="num">${Number.isFinite(threshold) ? fmtNum(threshold, 4) : '—'}</td>
       <td class="num">${Number.isFinite(margin) ? `<span class="${margin >= 0 ? 'trend-up' : 'trend-down'}">${margin >= 0 ? '+' : ''}${fmtNum(margin, 4)}</span>` : '—'}</td>
       <td class="num">${Number.isFinite(c.accuracyFewshot) ? c.accuracyFewshot : '—'}</td>
-      <td>${fmtDate(c.date || ATOMESH_DATA.updatedAt)}</td>
+      <td>${c.date ? fmtDate(c.date) : '—'}</td>
       <td>${atomeshRunCell(c)}</td>
     </tr>`;
     html += `<tr class="detail-row" data-atomesh-acc-detail="${idx}">
