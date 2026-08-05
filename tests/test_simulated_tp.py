@@ -23,6 +23,10 @@ LOGICAL = 4
 PHYSICAL = 1
 
 
+def _unpatched(*args, **kwargs):
+    raise AssertionError("collective was not replaced by _patch_group")
+
+
 @pytest.fixture
 def group():
     """A stub TP coordinator backed by a real single-rank gloo group."""
@@ -41,8 +45,9 @@ def group():
         rank_in_group=0,
         ranks=[0],
         world_size=PHYSICAL,
-        # Reduction over the ranks that exist; with one rank, the identity.
-        all_reduce=lambda t: t,
+        # Raises so the tests below prove the patch replaced it: a lone rank has
+        # no communicator to dispatch to.
+        all_reduce=_unpatched,
     )
     _patch_group(grp, LOGICAL, PHYSICAL)
     yield grp
@@ -53,6 +58,14 @@ def group():
 def test_world_size_reports_logical(group):
     # The one number every shard-size computation in the tree reads.
     assert group.world_size == LOGICAL
+
+
+def test_all_reduce_is_identity_on_a_lone_rank(group):
+    # PHYSICAL == 1: no peers, and no device communicator was ever built, so
+    # the patch must answer locally instead of dispatching.
+    x = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+
+    assert group.all_reduce(x) is x
 
 
 @pytest.mark.parametrize("dim", [0, 1, -1])

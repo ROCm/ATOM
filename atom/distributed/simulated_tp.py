@@ -18,6 +18,10 @@ the real group and pad the absent ranks with zeros.
 Shapes stay right for every caller; values do not (an all-reduce over half the
 shards is half a sum). Hence the `--fake-eplb` gate, which already means "this
 run's output is garbage, I am measuring kernels".
+
+This goes all the way down to one device, where every collective degenerates to
+a local op -- one card then runs rank 0 of a TP8 deployment, holding 1/8 of each
+weight and computing exactly what that rank would.
 """
 
 import logging
@@ -88,10 +92,8 @@ def _reject_unsupported(config: "Config", logical: int, physical: int) -> None:
 
     if not config.fake_eplb:
         _reject("requires --fake-eplb")
-    if physical < 2:
-        # No `world_size == 1` shortcut fires once world_size reads as logical,
-        # so a 1-rank group takes an all-reduce path with no communicator.
-        _reject("needs at least 2 devices")
+    if physical < 1:
+        _reject("needs at least one device")
     if config.pipeline_parallel_size > 1:
         # next_rank/prev_rank index `ranks` by (rank ± 1) % world_size.
         _reject("does not support pipeline parallel")
@@ -132,9 +134,13 @@ def _patch_group(group, logical: int, physical: int) -> None:
         flat = torch.zeros(
             (logical * rows,) + rest, dtype=input_.dtype, device=input_.device
         )
-        torch.distributed.all_gather_into_tensor(
-            flat[: physical * rows], input_, group=device_group
-        )
+        if physical == 1:
+            # Nothing to talk to; the one shard that exists is this rank's.
+            flat[:rows].copy_(input_)
+        else:
+            torch.distributed.all_gather_into_tensor(
+                flat[: physical * rows], input_, group=device_group
+            )
         shape = list(input_.shape)
         shape[dim] *= logical
         return flat.view((logical, rows) + rest).movedim(0, dim).reshape(shape)
@@ -148,9 +154,12 @@ def _patch_group(group, logical: int, physical: int) -> None:
         gather_list = (
             [torch.empty_like(input_) for _ in range(physical)] if is_dst else None
         )
-        torch.distributed.gather(
-            input_, gather_list, dst=group.ranks[dst], group=device_group
-        )
+        if physical == 1:
+            gather_list[0].copy_(input_)
+        else:
+            torch.distributed.gather(
+                input_, gather_list, dst=group.ranks[dst], group=device_group
+            )
         if not is_dst:
             return None
         absent = [torch.zeros_like(input_) for _ in range(logical - physical)]
@@ -177,6 +186,13 @@ def _patch_group(group, logical: int, physical: int) -> None:
     group.gather = _gather
     group.reduce_scatter_tensor = _reduce_scatter_tensor
     group.reduce_scatter = _reduce_scatter
+    if physical == 1:
+        # A lone rank has no peers and, because GroupCoordinator only builds a
+        # device communicator for world_size > 1, no communicator either -- and
+        # the `world_size == 1` shortcut that used to cover that stops firing
+        # once world_size reads as logical. Summing the one shard that exists
+        # is the identity, so say so rather than dispatching.
+        group.all_reduce = lambda input_, *a, **kw: input_
     # Last: the wrappers close over the real sizes.
     group.simulated_tp_physical_world_size = physical
     group.world_size = logical
