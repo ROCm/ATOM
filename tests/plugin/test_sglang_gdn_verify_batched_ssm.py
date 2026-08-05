@@ -82,16 +82,26 @@ def _make_layer_cache(bs: int, draft: int, gen: torch.Generator):
             device="cuda",
             dtype=torch.float32,
         ),
-        intermediate_conv_window=[
-            torch.zeros(
-                NUM_SLOTS,
-                draft,
-                CONV_DIM,
-                STATE_LEN,
-                device="cuda",
-                dtype=torch.bfloat16,
-            )
-        ],
+        intermediate_conv_window=[_dedup_conv_window_view(NUM_SLOTS, draft)],
+    )
+
+
+def _dedup_conv_window_view(num_slots: int, draft: int) -> torch.Tensor:
+    """SGLang's deduplicated sliding-window intermediate_conv_window, per layer.
+
+    One shared [slot, dim, D + K - 2] physical row exposed as an overlapping
+    [slot, D, dim, K - 1] view; see MambaPool.__init__ in SGLang's
+    memory_pool.py. Production on ROCm always takes this layout for DFLASH
+    (linear draft chain), so the tests must exercise it rather than the dense
+    fallback.
+    """
+    shared_win = draft + STATE_LEN - 1
+    phys = torch.zeros(
+        num_slots, CONV_DIM, shared_win, device="cuda", dtype=torch.bfloat16
+    )
+    return phys.as_strided(
+        (num_slots, draft, CONV_DIM, STATE_LEN),
+        (phys.stride(0), phys.stride(2), phys.stride(1), phys.stride(2)),
     )
 
 
@@ -125,7 +135,7 @@ def _make_impl(gen: torch.Generator) -> SGLangGatedDeltaNet:
     return impl
 
 
-def _run_once(bs: int, draft: int, batched: bool, monkeypatch):
+def _run_once(bs: int, draft: int, batched: bool, monkeypatch, conv_batched=False):
     gen = torch.Generator(device="cuda")
     gen.manual_seed(20260804)
 
@@ -179,6 +189,9 @@ def _run_once(bs: int, draft: int, batched: bool, monkeypatch):
 
     monkeypatch.setenv(
         "ATOM_ENABLE_GDN_SPEC_VERIFY_BATCHED_SSM", "1" if batched else "0"
+    )
+    monkeypatch.setenv(
+        "ATOM_ENABLE_GDN_SPEC_VERIFY_BATCHED_CONV", "1" if conv_batched else "0"
     )
     with bind_current_forward_batch(forward_batch):
         out = impl.forward(mixed_qkv, b, a, core_attn_out, f"layers.{LAYER_NUM}")
@@ -243,3 +256,140 @@ def test_batched_path_is_actually_taken(monkeypatch):
 
     assert loop_calls == 8, f"stepwise path should call the kernel 8x, got {loop_calls}"
     assert batched_calls == 1, f"batched path should call it once, got {batched_calls}"
+
+
+# --------------------------------------------------------------------------
+# Batched conv (Step 2): recovering SGLang's physical wide-window buffer
+# --------------------------------------------------------------------------
+def _sglang_dedup_conv_window(num_slots: int, draft: int):
+    """Replicate SGLang's deduplicated intermediate_conv_window allocation.
+
+    Mirrors MambaPool.__init__ (memory_pool.py): one shared
+    [layer, slot, dim, D + K - 2] physical buffer plus an overlapping
+    as_strided view of logical shape [layer, slot, D, dim, K - 1].
+    """
+    shared_win = draft + STATE_LEN - 1
+    phys = torch.zeros(
+        1, num_slots, CONV_DIM, shared_win, device="cuda", dtype=torch.bfloat16
+    )
+    view = phys.as_strided(
+        (phys.shape[0], phys.shape[1], draft, CONV_DIM, STATE_LEN),
+        (
+            phys.stride(0),
+            phys.stride(1),
+            phys.stride(3),
+            phys.stride(2),
+            phys.stride(3),
+        ),
+    )
+    return phys, view
+
+
+@pytest.mark.parametrize("draft", [4, 8, 16])
+def test_conv_window_phys_recovery_matches_allocation(draft: int):
+    """The stride-based recovery must return the same storage SGLang allocated."""
+    phys, view = _sglang_dedup_conv_window(NUM_SLOTS, draft)
+    recovered = SGLangGatedDeltaNet._spec_conv_window_phys(view[0], draft)
+
+    assert recovered is not None
+    assert recovered.shape == phys[0].shape
+    assert recovered.stride() == phys[0].stride()
+    marker = torch.randn(CONV_DIM, device="cuda", dtype=torch.bfloat16)
+    recovered[3, :, 2] = marker
+    torch.testing.assert_close(phys[0, 3, :, 2], marker, rtol=0, atol=0)
+    # And the logical view must see it as step 2's window column 0.
+    torch.testing.assert_close(view[0, 3, 2, :, 0], marker, rtol=0, atol=0)
+
+
+def test_conv_window_phys_recovery_rejects_dense_layout():
+    """SGLang uses a dense per-step layout on NPU/CPU and for EAGLE tree verify;
+    the recovery must decline it so the caller keeps the stepwise conv path."""
+    dense = torch.zeros(
+        NUM_SLOTS, 8, CONV_DIM, STATE_LEN, device="cuda", dtype=torch.bfloat16
+    )
+    assert SGLangGatedDeltaNet._spec_conv_window_phys(dense, 8) is None
+
+
+def test_conv_window_phys_recovery_rejects_wrong_draft_len():
+    _phys, view = _sglang_dedup_conv_window(NUM_SLOTS, 8)
+    assert SGLangGatedDeltaNet._spec_conv_window_phys(view[0], 16) is None
+
+
+@pytest.mark.parametrize("draft", [4, 8, 16])
+@pytest.mark.parametrize("bs", [1, 3])
+def test_batched_conv_and_ssm_match_stepwise_loop(bs: int, draft: int, monkeypatch):
+    """Folding the conv update in too must leave the whole contract unchanged."""
+    loop = _run_once(bs, draft, batched=False, monkeypatch=monkeypatch)
+    both = _run_once(
+        bs, draft, batched=True, monkeypatch=monkeypatch, conv_batched=True
+    )
+
+    torch.testing.assert_close(both["out"], loop["out"], rtol=0, atol=0)
+    torch.testing.assert_close(
+        both["intermediate_ssm"], loop["intermediate_ssm"], rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        both["intermediate_conv"], loop["intermediate_conv"], rtol=0, atol=0
+    )
+    # The wide-window call only reads the live conv state.
+    torch.testing.assert_close(both["conv_live"], both["conv_before"], rtol=0, atol=0)
+    torch.testing.assert_close(both["ssm_live"], both["ssm_before"], rtol=0, atol=0)
+
+
+def test_batched_conv_path_is_actually_taken(monkeypatch):
+    """With both flags on, the conv kernel must be called once, not once per
+    draft step -- otherwise a silent fallback would make the equivalence test
+    above pass without exercising the new path."""
+    import atom.plugin.sglang.attention_backend.attention_gdn as gdn_mod
+
+    calls = {"n": 0}
+    real = gdn_mod.causal_conv1d_update
+
+    def counting(*args, **kwargs):
+        calls["n"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(gdn_mod, "causal_conv1d_update", counting)
+
+    _run_once(3, 8, batched=True, monkeypatch=monkeypatch, conv_batched=False)
+    stepwise_calls = calls["n"]
+    calls["n"] = 0
+    _run_once(3, 8, batched=True, monkeypatch=monkeypatch, conv_batched=True)
+    batched_calls = calls["n"]
+
+    assert stepwise_calls == 8, f"stepwise conv should run 8x, got {stepwise_calls}"
+    assert batched_calls == 1, f"batched conv should run once, got {batched_calls}"
+
+
+def test_batched_conv_falls_back_on_dense_layout(monkeypatch):
+    """A dense intermediate_conv_window must silently degrade to the stepwise
+    conv path and still produce identical results."""
+    import atom.plugin.sglang.attention_backend.attention_gdn as gdn_mod
+
+    dense_cache_holder = {}
+
+    def dense(num_slots: int, draft: int) -> torch.Tensor:
+        dense_cache_holder["used"] = True
+        return torch.zeros(
+            num_slots, draft, CONV_DIM, STATE_LEN, device="cuda", dtype=torch.bfloat16
+        )
+
+    loop = _run_once(3, 8, batched=False, monkeypatch=monkeypatch)
+
+    monkeypatch.setitem(globals(), "_dedup_conv_window_view", dense)
+    calls = {"n": 0}
+    real_conv = gdn_mod.causal_conv1d_update
+
+    def counting(*args, **kwargs):
+        calls["n"] += 1
+        return real_conv(*args, **kwargs)
+
+    monkeypatch.setattr(gdn_mod, "causal_conv1d_update", counting)
+    fallback = _run_once(3, 8, batched=True, monkeypatch=monkeypatch, conv_batched=True)
+
+    assert dense_cache_holder.get("used") is True
+    assert calls["n"] == 8, f"dense layout must stay stepwise, got {calls['n']} calls"
+    torch.testing.assert_close(fallback["out"], loop["out"], rtol=0, atol=0)
+    torch.testing.assert_close(
+        fallback["intermediate_ssm"], loop["intermediate_ssm"], rtol=0, atol=0
+    )

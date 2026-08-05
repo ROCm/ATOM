@@ -31,6 +31,9 @@ from atom.utils.forward_context import (
 
 logger = logging.getLogger(__name__)
 
+# Emit the dense-conv-window fallback warning once, not once per layer per step.
+_WARNED_DENSE_CONV_WINDOW = False
+
 
 class SGLangGatedDeltaNet(GatedDeltaNet):
     """Run ATOM GDN stepwise while filling SGLang's verify snapshots."""
@@ -213,55 +216,83 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
     ) -> None:
         """Target verify with the SSM recurrent folded into one kernel launch.
 
-        The conv update stays stepwise (its per-step windows still go through
-        SGLang's dense `intermediate_conv_window` contract), but its projected
-        q/k/v are accumulated and handed to a single
-        `fused_recurrent_gated_delta_rule` call. That call addresses
+        The projected q/k/v of the whole draft block are handed to a single
+        `fused_recurrent_gated_delta_rule` call that addresses
         `intermediate_ssm` as a flat `[slot * step]` pool via a 2D index table,
         so every per-step state lands where SGLang's
-        `fused_mamba_state_scatter_with_mask` expects it -- and the live SSM
-        state is never written, which is why only conv needs snapshot/restore
-        here.
+        `fused_mamba_state_scatter_with_mask` expects it. The live SSM state is
+        never written, so it needs no snapshot/restore.
+
+        The conv update is folded too when
+        `ATOM_ENABLE_GDN_SPEC_VERIFY_BATCHED_CONV` is set and SGLang handed out
+        its deduplicated sliding-window `intermediate_conv_window`; otherwise it
+        stays stepwise and its q/k/v are accumulated instead.
 
         Equivalence with the stepwise loop is covered bit-for-bit by
-        tests/plugin/test_gdn_target_verify_batched_equiv.py.
+        tests/plugin/test_gdn_target_verify_batched_equiv.py and
+        tests/plugin/test_sglang_gdn_verify_batched_ssm.py.
         """
         num_k_heads = self.num_k_heads // self.tp_size
         num_v_heads = self.num_v_heads // self.tp_size
         num_tokens = bs * draft_token_num
+        k_dim = num_k_heads * self.head_k_dim
+        v_dim = num_v_heads * self.head_v_dim
 
-        query_all = mixed_blocks.new_empty(
-            (bs, draft_token_num, num_k_heads * self.head_k_dim)
-        )
-        key_all = mixed_blocks.new_empty(
-            (bs, draft_token_num, num_k_heads * self.head_k_dim)
-        )
-        value_all = mixed_blocks.new_empty(
-            (bs, draft_token_num, num_v_heads * self.head_v_dim)
-        )
+        conv_phys = None
+        if envs.ATOM_ENABLE_GDN_SPEC_VERIFY_BATCHED_CONV:
+            conv_phys = self._spec_conv_window_phys(
+                layer_cache.intermediate_conv_window[0], draft_token_num
+            )
 
-        conv_before = conv_states[cache_indices].clone()
-        try:
-            for step in range(draft_token_num):
-                query, key, value = causal_conv1d_update(
-                    mixed_blocks[:, step, :].contiguous(),
-                    conv_states,
-                    conv_weights,
-                    self.num_k_heads * self.head_k_dim // self.tp_size,
-                    self.num_v_heads * self.head_v_dim // self.tp_size,
-                    self.conv1d.bias,
-                    self.activation,
-                    conv_state_indices=cache_indices,
-                    validate_data=True,
-                )
-                query_all[:, step] = query
-                key_all[:, step] = key
-                value_all[:, step] = value
-                layer_cache.intermediate_conv_window[0][:bs, step].copy_(
-                    conv_states[cache_indices]
-                )
-        finally:
-            conv_states[cache_indices] = conv_before
+        if conv_phys is not None:
+            # One wide-window spec call. ATOM writes
+            # [history2..historyM, draft1..draftN] -- exactly the physical row
+            # behind SGLang's dedup view, so every per-step window materialises
+            # for free and the live conv state is only read, never written.
+            state_len = conv_states.shape[-1]
+            conv_phys[:bs, :, :state_len] = conv_states[cache_indices]
+            query_all, key_all, value_all = causal_conv1d_update(
+                mixed_blocks.reshape(num_tokens, -1),
+                conv_phys,
+                conv_weights,
+                k_dim,
+                v_dim,
+                self.conv1d.bias,
+                self.activation,
+                conv_state_indices=self._spec_conv_slot_table(bs, mixed_blocks.device),
+                num_accepted_tokens=self._spec_conv_accepted(bs, mixed_blocks.device),
+                query_start_loc=self._spec_cu_seqlens(
+                    bs, draft_token_num, mixed_blocks.device
+                ),
+                max_query_len=draft_token_num,
+                validate_data=False,
+            )
+        else:
+            query_all = mixed_blocks.new_empty((bs, draft_token_num, k_dim))
+            key_all = mixed_blocks.new_empty((bs, draft_token_num, k_dim))
+            value_all = mixed_blocks.new_empty((bs, draft_token_num, v_dim))
+            conv_before = conv_states[cache_indices].clone()
+            try:
+                for step in range(draft_token_num):
+                    query, key, value = causal_conv1d_update(
+                        mixed_blocks[:, step, :].contiguous(),
+                        conv_states,
+                        conv_weights,
+                        k_dim,
+                        v_dim,
+                        self.conv1d.bias,
+                        self.activation,
+                        conv_state_indices=cache_indices,
+                        validate_data=True,
+                    )
+                    query_all[:, step] = query
+                    key_all[:, step] = key
+                    value_all[:, step] = value
+                    layer_cache.intermediate_conv_window[0][:bs, step].copy_(
+                        conv_states[cache_indices]
+                    )
+            finally:
+                conv_states[cache_indices] = conv_before
 
         g, beta = fused_gdn_gating(
             self.A_log,
@@ -302,6 +333,85 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
         output_blocks.copy_(
             block_output.view(bs, draft_token_num, *output_blocks.shape[2:])
         )
+
+    @staticmethod
+    def _spec_conv_window_phys(
+        window_view: torch.Tensor, draft_token_num: int
+    ) -> torch.Tensor | None:
+        """Recover the physical wide-window buffer behind SGLang's dedup view.
+
+        SGLang stores the conv intermediates for a linear draft chain as one
+        shared `[slot, dim, D + K - 2]` row per (layer, slot) and exposes an
+        overlapping `as_strided` view of logical shape `[slot, D, dim, K - 1]`
+        with `view[s, t, d, w] = phys[s, d, t + w]` (see `MambaPool.__init__`
+        and `conv_window_dedup_enabled` in SGLang's memory_pool.py). That
+        physical row is exactly what ATOM's spec `causal_conv1d_update` writes,
+        so recovering it lets one call replace the whole per-step loop.
+
+        Returns ``None`` when the view is *not* that dedup layout -- SGLang
+        falls back to a dense per-step layout on NPU/CPU and for EAGLE tree
+        verify -- so the caller keeps the stepwise conv path.
+        """
+        if window_view.ndim != 4:
+            return None
+        num_slots, draft, dim, win = window_view.shape
+        if draft != draft_token_num:
+            return None
+        shared_win = draft + win - 1
+        stride_slot, stride_step, stride_dim, stride_win = window_view.stride()
+        # Dedup layout aliases the step and window axes onto the shared-window
+        # axis (both stride 1) and gives the dim axis the shared-window pitch.
+        if (
+            stride_step != 1
+            or stride_win != 1
+            or stride_dim != shared_win
+            or stride_slot != dim * shared_win
+        ):
+            global _WARNED_DENSE_CONV_WINDOW
+            if not _WARNED_DENSE_CONV_WINDOW:
+                _WARNED_DENSE_CONV_WINDOW = True
+                logger.warning(
+                    "SGLang intermediate_conv_window is not the deduplicated "
+                    "sliding-window layout (shape=%s stride=%s); falling back "
+                    "to the stepwise conv path for DFLASH target verify.",
+                    tuple(window_view.shape),
+                    tuple(window_view.stride()),
+                )
+            return None
+        return window_view.as_strided(
+            (num_slots, dim, shared_win),
+            (dim * shared_win, shared_win, 1),
+            window_view.storage_offset(),
+        )
+
+    def _spec_conv_slot_table(self, bs: int, device: torch.device) -> torch.Tensor:
+        """`[bs, 1]` conv slot table; row i is batch position i, matching
+        SGLang's `fused_conv_window_scatter_with_mask` source indexing."""
+        cache = getattr(self, "_spec_conv_slot_cache", None)
+        if cache is None:
+            cache = {}
+            self._spec_conv_slot_cache = cache
+        key = (bs, device)
+        table = cache.get(key)
+        if table is None:
+            table = torch.arange(bs, device=device, dtype=torch.int32).reshape(bs, 1)
+            cache[key] = table
+        return table
+
+    def _spec_conv_accepted(self, bs: int, device: torch.device) -> torch.Tensor:
+        """`num_accepted_tokens` of all ones: the conv kernel reads its initial
+        history from column `num_accepted_tokens - 1`, and verify always starts
+        from the committed live state seeded at column 0."""
+        cache = getattr(self, "_spec_conv_accepted_cache", None)
+        if cache is None:
+            cache = {}
+            self._spec_conv_accepted_cache = cache
+        key = (bs, device)
+        accepted = cache.get(key)
+        if accepted is None:
+            accepted = torch.ones(bs, device=device, dtype=torch.int32)
+            cache[key] = accepted
+        return accepted
 
     def _spec_cu_seqlens(
         self, bs: int, draft_token_num: int, device: torch.device
