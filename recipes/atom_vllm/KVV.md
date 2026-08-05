@@ -3,6 +3,22 @@
 Env: local vLLM for Kimi-K3 at `http://localhost:8000/v1`.
 Two Python envs: `/opt/venv` (pytest + BEAM), project `.venv` (inspect-ai benchmarks).
 
+Per-suite flags follow the **authoritative README examples**: only
+`tests/tool_call_json_schema/` passes `--thinking` (and runs parallel with
+retries); `params`/`k3_features`/`prompt_tokens` do **not** pass `--thinking`.
+Several `k3_features` and `tool_call_json_schema` tests use
+`@pytest.mark.flaky(reruns=...)`, so `pytest-rerunfailures` must be installed
+or those retries are silently skipped.
+
+### Prerequisites (in `/opt/venv`)
+```bash
+/opt/venv/bin/pip install tblib pytest-xdist pytest-rerunfailures
+```
+- `tblib` — required by `tests/conftest.py` (import fails without it).
+- `pytest-xdist` — provides `-n 4` (parallel) for the tool-call schema suite.
+- `pytest-rerunfailures` — provides `--reruns` and activates the in-repo
+  `@pytest.mark.flaky` decorators.
+
 ## Clone KVV
 
 ```bash
@@ -43,13 +59,19 @@ cd ~/Kimi-Vendor-Verifier
 ```
 
 ## 4. tests/tool_call_json_schema/
+Authoritative README invocation: thinking on, parallel (`-n 4`), and retries
+(`--reruns 3`) to absorb stochastic tool-emission flakiness.
 
 ```bash
 cd ~/Kimi-Vendor-Verifier
-/opt/venv/bin/pytest tests/tool_call_json_schema/ \
+/opt/venv/bin/pytest -n 4 tests/tool_call_json_schema/ \
   --base-url http://localhost:8000/v1 --api-key EMPTY \
   --smoke-model "/workspace/shared/data/amd_int/models/Kimi-K3" \
-  --think-mode opensource
+  --think-mode opensource \
+  --thinking \
+  --reruns 3 --reruns-delay 2 \
+  --tool-json-report=reports/rerun_50228/tool-call-schema-report.json \
+  -ra
 ```
 
 ## 5. OCRBench
