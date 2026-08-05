@@ -98,6 +98,14 @@ class TestCreateChatChunk:
         data = json.loads(chunk_str[6:])
         assert data["choices"][0]["delta"] == {}
 
+    def test_role_chunk_includes_empty_content(self):
+        chunk_str = create_chat_chunk(
+            "req-1", "model", delta={"role": "assistant", "content": ""}
+        )
+        data = json.loads(chunk_str[6:])
+        assert data["choices"][0]["delta"]["role"] == "assistant"
+        assert data["choices"][0]["delta"]["content"] == ""
+
     def test_finish_reason(self):
         chunk_str = create_chat_chunk("req-1", "model", finish_reason="stop")
         data = json.loads(chunk_str[6:])
