@@ -13,9 +13,8 @@ def _patch_eagle3_model_type_checks() -> None:
     # through the ATOMModelBase wrapper, so patch the type checks to accept the
     # ATOMModelBase wrapper
     try:
-        import vllm.v1.spec_decode.llm_base_proposer as llm_base_proposer
-
         from atom.plugin.vllm.model_wrapper import ATOMModelBase
+        import vllm.v1.spec_decode.llm_base_proposer as llm_base_proposer
     except Exception:
         logger.warning(
             "vLLM plugin: failed to patch vLLM V1 EAGLE3 proposer type checks. "
@@ -59,7 +58,7 @@ def _patch_dspark_standalone_draft_config() -> None:
         from vllm.config.speculative import SpeculativeConfig
 
         from atom.plugin.vllm.register import K3DSparkConfig
-    except Exception:
+    except ImportError:
         logger.warning(
             "vLLM plugin: failed to patch SpeculativeConfig for standalone "
             "DSpark drafts. This can happen with an incompatible vLLM version."
@@ -135,7 +134,7 @@ def _patch_dspark_causal_draft() -> None:
             _K3_DSPARK_ARCH,
         )
 
-    setattr(wrapped_init, "_atom_dspark_causal_patched", True)
+    wrapped_init._atom_dspark_causal_patched = True
     DSparkSpeculator.__init__ = wrapped_init
 
 
@@ -624,7 +623,7 @@ def _patch_vllm_dflash_kernel_block_units() -> None:
             block_tables = _KernelUnitBlockTables(block_tables)
         return original_set_attn(self, model_state, kv_cache_config, block_tables)
 
-    setattr(wrapped_set_attn, "_atom_kernel_block_units_patched", True)
+    wrapped_set_attn._atom_kernel_block_units_patched = True
     DFlashSpeculator.set_attn = wrapped_set_attn
 
 
