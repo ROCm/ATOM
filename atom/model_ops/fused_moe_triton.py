@@ -1125,6 +1125,13 @@ def triton_kernel_fused_experts_a8w4_silu_gugu(
     swiglu_limit: float = 10.0,
     apply_router_weight_on_input: bool = False,
     gate_valid: torch.Tensor | None = None,
+    # None = pick by arch (preshuffled only on gfx1250, where the gluon kernel
+    # supports it). Overridable so the two weight layouts can be A/B'd from one
+    # process: preshuffle is a pure layout change, so the same source weights
+    # through either path must agree numerically, which is what validates
+    # process_weights_after_loading's is_gfx1250 branch without needing a
+    # reference implementation.
+    preshuffled: bool | None = None,
 ) -> torch.Tensor:
     """A8W4 MoE for SiLU models, GUGU (interleaved ``[gate, up]``).
 
@@ -1151,7 +1158,9 @@ def triton_kernel_fused_experts_a8w4_silu_gugu(
 
     # Only gfx1250's gluon kernel consumes the WMMA-preshuffled weight; the
     # CDNA triton kernel takes a plain (E, K, N) weight.
-    _preshuffled = get_arch() == "gfx1250"
+    _preshuffled = (
+        (get_arch() == "gfx1250") if preshuffled is None else bool(preshuffled)
+    )
 
     x_fp8, x_scale = downcast_to_mxfp(hidden_states, torch.float8_e4m3fn, axis=-1)
 
