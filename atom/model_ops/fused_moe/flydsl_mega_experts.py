@@ -216,33 +216,6 @@ def run_mega_moe(
 
     wts = topk_weights.to(torch.float32).contiguous()
     ids = topk_ids.to(torch.int32).contiguous()
-
-    # FULL CUDAGraph replays the captured token capacity, while cu_seqlens_q[-1]
-    # is updated to the real packed-prefix length on every replay. Keep Mega's
-    # graph-sized tensors/API unchanged, but replace the padding rows' routes
-    # with an out-of-range expert sentinel before Mega dispatch sees them.
-    # This is intentionally an ATOM-side experiment; Mega already drops expert
-    # ids outside [0, total_experts).
-    fc = get_forward_context()
-    if (
-        fc.in_hipgraph
-        and not fc.context.is_prefill
-        and fc.attn_metadata is not None
-        and fc.attn_metadata.cu_seqlens_q is not None
-    ):
-        # Derived from the global physical expert count, so it is out of range
-        # by construction (valid ids are [0, experts)).
-        invalid_expert_id = experts + 1
-        valid_tokens = fc.attn_metadata.cu_seqlens_q[-1:]
-        row_key = (ids.device, ids.shape[0])
-        token_rows = _MEGA_ROUTE_ROWS.get(row_key)
-        if token_rows is None:
-            token_rows = torch.arange(
-                ids.shape[0], device=ids.device, dtype=valid_tokens.dtype
-            )
-            _MEGA_ROUTE_ROWS[row_key] = token_rows
-        ids = ids.masked_fill(token_rows[:, None] >= valid_tokens, invalid_expert_id)
-
     with torch.inference_mode(False), torch.no_grad():
         # swiglu_limit is NOT a forward arg -- it is baked into the instance at
         # construction (see the cache key above).
