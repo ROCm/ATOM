@@ -26,6 +26,7 @@ from atom.models.deepseek_v2 import (
     _mxfp4_activation_quant_layout,
 )
 from atom.models.utils import maybe_prefix
+from atom.plugin.sglang.models.kv_cache_utils import is_fp8_kv_cache_dtype
 
 try:
     from sglang.srt.model_executor.runner import get_is_capture_mode
@@ -291,7 +292,7 @@ def init_sgl_attrs(
     attn.alt_stream = None
     attn.kv_cache_dtype = kv_cache_dtype
     attn.use_fused_qk_rope_concat_and_cache_mla = (
-        kv_cache_dtype == "fp8_e4m3" or _use_aiter_gfx95
+        is_fp8_kv_cache_dtype(kv_cache_dtype) or _use_aiter_gfx95
     )
     attn.current_sgl_plugin_attn_path = None
     attn.w_kc, attn.w_vc = None, None

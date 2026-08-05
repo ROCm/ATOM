@@ -290,7 +290,7 @@ export ATOM_DISABLE_VLLM_PLUGIN=1
 | Variable | Type | Default | Description |
 |---|---|---|---|
 | `ATOM_DISABLE_VLLM_PLUGIN` | bool | `0` (false) | Set to `1` to disable the entire ATOM vLLM plugin (platform + model registration). vLLM runs in pure ROCm mode. |
-| `ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION` | bool | `0` (false) | Enable QK-norm + RoPE + cache + quant fusion in attention. Recommended for Qwen3-MoE models. |
+| `ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION` | bool | `0` (false) | Enable QK-norm + RoPE + cache + quant fusion for Qwen3 dense and MoE models. |
 
 ### Online quantization
 
