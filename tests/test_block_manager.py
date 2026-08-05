@@ -510,3 +510,58 @@ class TestDecodeBlockHashing:
         bm.hash_decode_blocks(seq, seq.num_tokens)
         assert seq.num_hashed_tokens == 0
         assert not bm.kv.num_indexed
+
+    def test_freed_swa_slot_returned_to_pool(self, seq_factory):
+        bs, window = 4, 8
+        bm = _swa_bm(num_blocks=40, num_swa=40, bs=bs, window=window, prefix=False)
+        seq = seq_factory(list(range(1, 9)))
+        bm.allocate(seq, bm.can_allocate(seq))
+        free0 = len(bm.swa.free_block_ids_set)
+        for t in range(8, 30):
+            seq.append_token(1000 + t)
+            bm.may_append(seq)
+        # Many SWA blocks were allocated then window-freed → free pool recovered.
+        assert len(bm.swa.free_block_ids_set) > free0 - (window // bs + 3)
+
+    def test_compressed_untouched_by_window_freeing(self, seq_factory):
+        bs, window = 4, 8
+        bm = _swa_bm(num_blocks=40, num_swa=40, bs=bs, window=window, prefix=False)
+        seq = seq_factory(list(range(1, 9)))
+        bm.allocate(seq, bm.can_allocate(seq))
+        for t in range(8, 24):
+            seq.append_token(1000 + t)
+            bm.may_append(seq)
+        # Every compressed block stays held (no -1 sentinels, all in used set).
+        assert all(b >= 0 for b in seq.block_table)
+        assert all(b in bm.used_block_ids for b in seq.block_table)
+
+
+# ── register_received_prefix (PD consumer) ─────────────────────────────────
+
+
+class TestRegisterReceivedPrefix:
+    def test_registers_full_prompt_blocks_enabling_next_turn_hit(
+        self, block_manager_prefix, seq_factory
+    ):
+        bm = block_manager_prefix
+        # PD consumer: a remote-prefill request whose full prompt KV arrived via
+        # RDMA. It never ran a prefill forward, so its blocks are unhashed until
+        # register_received_prefix publishes them.
+        a = seq_factory(list(range(1, 13)))  # 12 tokens, bs=4 -> 3 full blocks
+        bm.allocate(a)
+        registered = bm.register_received_prefix(a)
+        assert registered == 3
+        # Next turn with the same prefix now hits locally (last block excluded).
+        b = seq_factory(list(range(1, 13)))
+        assert bm.can_allocate(b) == 2
+
+    def test_noop_without_prefix_caching(self, block_manager, seq_factory):
+        a = seq_factory(list(range(1, 13)))
+        block_manager.allocate(a)
+        assert block_manager.register_received_prefix(a) == 0
+
+    def test_excludes_trailing_partial_block(self, block_manager_prefix, seq_factory):
+        bm = block_manager_prefix
+        a = seq_factory(list(range(1, 11)))  # 10 tokens, bs=4 -> 2 full + partial
+        bm.allocate(a)
+        assert bm.register_received_prefix(a) == 2
