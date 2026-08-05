@@ -535,3 +535,34 @@ class TestM2WindowFreeing:
         # Every compressed block stays held (no -1 sentinels, all in used set).
         assert all(b >= 0 for b in seq.block_table)
         assert all(b in bm.used_block_ids for b in seq.block_table)
+
+
+# ── register_received_prefix (PD consumer) ─────────────────────────────────
+
+
+class TestRegisterReceivedPrefix:
+    def test_registers_full_prompt_blocks_enabling_next_turn_hit(
+        self, block_manager_prefix, seq_factory
+    ):
+        bm = block_manager_prefix
+        # PD consumer: a remote-prefill request whose full prompt KV arrived via
+        # RDMA. It never ran a prefill forward, so its blocks are unhashed until
+        # register_received_prefix publishes them.
+        a = seq_factory(list(range(1, 13)))  # 12 tokens, bs=4 -> 3 full blocks
+        bm.allocate(a)
+        registered = bm.register_received_prefix(a)
+        assert registered == 3
+        # Next turn with the same prefix now hits locally (last block excluded).
+        b = seq_factory(list(range(1, 13)))
+        assert bm.can_allocate(b) == 2
+
+    def test_noop_without_prefix_caching(self, block_manager, seq_factory):
+        a = seq_factory(list(range(1, 13)))
+        block_manager.allocate(a)
+        assert block_manager.register_received_prefix(a) == 0
+
+    def test_excludes_trailing_partial_block(self, block_manager_prefix, seq_factory):
+        bm = block_manager_prefix
+        a = seq_factory(list(range(1, 11)))  # 10 tokens, bs=4 -> 2 full + partial
+        bm.allocate(a)
+        assert bm.register_received_prefix(a) == 2
