@@ -154,6 +154,30 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION", "1") == "1"
     ),
+    # DSpark block sampling: replace the Markov head's
+    #   bias = W1[x] @ W2.float().t() ; argmax(base_logits + bias)
+    # with one fused Triton kernel (atom/model_ops/dspark_markov_sample.py).
+    # The unfused spelling casts the whole [V, r] W2 table to fp32 INSIDE the
+    # T-iteration loop (~252MB of traffic per iteration for a table that never
+    # changes) and materializes two [B, V] fp32 tensors per iteration (42MB
+    # each at B=64, V=163840) that only an argmax ever reads. The fused path
+    # keeps W2 bf16, adds the base logits in the GEMM epilogue and reduces to
+    # ids in registers, so W2 is read exactly once per block position and no
+    # [B, V] intermediate exists. Applies to ATOM's native K3/V4 DSpark
+    # samplers and, via spec_decode_patch, to the GREEDY branch of vLLM's
+    # DSparkSpeculator._sample_sequential -- probabilistic drafting needs the
+    # real logits for gumbel_sample and keeps the unfused path.
+    # Default OFF: the bias GEMV moves from an fp32 matmul over an fp32 copy of
+    # W2 to bf16 MFMA with an fp32 accumulator. Every product is exact in fp32
+    # either way, so the result is equal to the reference up to accumulation
+    # order -- but "no argmax flips on a last-ulp tie" is an empirical claim,
+    # and this could not be validated on hardware when it was written. Turn on
+    # only after a GSM8K acceptance-length parity run. Read once when the
+    # Markov head is built and once when the vLLM patch is installed, so it
+    # must be set before the server starts.
+    "ATOM_DSPARK_FUSED_MARKOV_SAMPLE": lambda: (
+        os.getenv("ATOM_DSPARK_FUSED_MARKOV_SAMPLE", "0") == "1"
+    ),
     # Replicate the vocab embedding on every TP rank (full table per rank, purely
     # local lookup) instead of TP-sharding it — eliminates the post-embedding
     # all-reduce. Applies to BOTH the main/target model and the speculative draft
