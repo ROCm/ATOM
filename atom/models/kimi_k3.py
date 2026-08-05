@@ -784,8 +784,12 @@ class KimiKDAAttention(nn.Module):
 
     def _forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
         fwd_ctx = get_forward_context()
-        gdn_metadata = getattr(fwd_ctx.attn_metadata, "gdn_metadata", None)
-        if gdn_metadata is None:
+        kda_metadata = getattr(fwd_ctx.attn_metadata, "kda_metadata", None)
+        if kda_metadata is None:
+            # Native ATOM/SGLang integrations still expose the shared legacy
+            # field. vLLM 0.26+ uses the dedicated KDA metadata adapter.
+            kda_metadata = getattr(fwd_ctx.attn_metadata, "gdn_metadata", None)
+        if kda_metadata is None:
             return hidden_states.new_zeros(hidden_states.shape)
 
         cache = fwd_ctx.kv_cache_data[f"layer_{self.layer_num}"]
@@ -794,7 +798,7 @@ class KimiKDAAttention(nn.Module):
         if conv_state.size(1) != self.local_proj_size * 3:
             conv_state = conv_state.transpose(-1, -2)
 
-        num_actual_tokens = gdn_metadata.num_actual_tokens
+        num_actual_tokens = kda_metadata.num_actual_tokens
         hidden_states = hidden_states[:num_actual_tokens]
         # Single fused in-proj GEMM producing [q | k | v | g]; slice out each
         # part. `out_gate` is the KDA output gate consumed at o_norm below
@@ -827,22 +831,22 @@ class KimiKDAAttention(nn.Module):
         )
 
         conv_weights = self.conv_weight
-        state_indices = gdn_metadata.non_spec_state_indices_tensor
-        query_start_loc = gdn_metadata.non_spec_query_start_loc
+        state_indices = kda_metadata.non_spec_state_indices_tensor
+        query_start_loc = kda_metadata.non_spec_query_start_loc
 
-        if gdn_metadata.num_prefills > 0:
+        if kda_metadata.num_prefills > 0:
             q, k, v = causal_conv1d_fn(
                 mixed_qkv.transpose(0, 1),
                 conv_weights,
                 None,
                 activation=self.activation,
                 conv_states=conv_state,
-                has_initial_state=gdn_metadata.has_initial_state,
+                has_initial_state=kda_metadata.has_initial_state,
                 cache_indices=state_indices,
                 query_start_loc=query_start_loc,
                 k_dim_size=self.local_proj_size,
                 v_dim_size=self.local_proj_size,
-                metadata=gdn_metadata,
+                metadata=kda_metadata,
             )
             q = rearrange(q, "t (h d) -> 1 t h d", d=self.head_dim)
             k = rearrange(k, "t (h d) -> 1 t h d", d=self.head_dim)
@@ -853,7 +857,7 @@ class KimiKDAAttention(nn.Module):
             from atom.model_ops.kimi_k3 import gather_kda_initial_state
 
             initial = gather_kda_initial_state(
-                ssm_state, state_indices, gdn_metadata.has_initial_state
+                ssm_state, state_indices, kda_metadata.has_initial_state
             )
             kda_out, last_state = self._run_kda(
                 q,
@@ -870,7 +874,7 @@ class KimiKDAAttention(nn.Module):
             # so no .to() cast is needed.
             ssm_state[state_indices] = last_state
             out.copy_(kda_out.squeeze(0))
-        elif gdn_metadata.num_decodes > 0:
+        elif kda_metadata.num_decodes > 0:
             # Slice the per-token cache-slot indices once (used for both the
             # conv update and the fused recurrence below).
             decode_state_indices = state_indices[:num_actual_tokens]
@@ -907,17 +911,17 @@ class KimiKDAAttention(nn.Module):
                 o=out,
                 initial_state=ssm_state,
                 inplace_final_state=True,
-                cu_seqlens=query_start_loc[: gdn_metadata.num_decodes + 1],
+                cu_seqlens=query_start_loc[: kda_metadata.num_decodes + 1],
                 ssm_state_indices=decode_state_indices,
                 use_qk_l2norm_in_kernel=True,
                 is_kda=True,
                 lower_bound=self._kda_gate_lower_bound,
             )
-        elif gdn_metadata.num_spec_decodes > 0:
+        elif kda_metadata.num_spec_decodes > 0:
             # Speculative-decode pass
-            spec_state_indices = gdn_metadata.spec_state_indices_tensor
-            spec_query_start_loc = gdn_metadata.spec_query_start_loc
-            num_accepted_tokens = gdn_metadata.num_accepted_tokens
+            spec_state_indices = kda_metadata.spec_state_indices_tensor
+            spec_query_start_loc = kda_metadata.spec_query_start_loc
+            num_accepted_tokens = kda_metadata.num_accepted_tokens
             q, k, v = causal_conv1d_update(
                 mixed_qkv,
                 conv_state,
@@ -929,7 +933,7 @@ class KimiKDAAttention(nn.Module):
                 # First reserved slot per seq holds the resume state; the kernel
                 # walks forward via num_accepted_tokens + query_start_loc.
                 conv_state_indices=spec_state_indices[:, 0][
-                    : gdn_metadata.num_spec_decodes
+                    : kda_metadata.num_spec_decodes
                 ],
                 num_accepted_tokens=num_accepted_tokens,
                 query_start_loc=spec_query_start_loc,
@@ -950,7 +954,7 @@ class KimiKDAAttention(nn.Module):
                 o=out,
                 initial_state=ssm_state,
                 inplace_final_state=True,
-                cu_seqlens=spec_query_start_loc[: gdn_metadata.num_spec_decodes + 1],
+                cu_seqlens=spec_query_start_loc[: kda_metadata.num_spec_decodes + 1],
                 # 2D [bs, 1+num_spec]: per-token snapshot slots. Paired with
                 # num_accepted_tokens the kernel reads the resume state from
                 # slot[num_accepted-1] and writes a snapshot after each token.
