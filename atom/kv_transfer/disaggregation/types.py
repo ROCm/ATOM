@@ -11,8 +11,9 @@ KV output aggregator.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # Type aliases
@@ -50,6 +51,11 @@ class KVTransferTensors:
     staging_pool_size: int = 0
     gather_slot: Callable[[int, int], None] | None = None
     scatter_slot: Callable[[int, int], None] | None = None
+    # SparseKV RDMA-direct (Stage D): on the decode consumer, the block_regions
+    # for KV already point at the pinned paged host cold pool. The connector uses
+    # this handle to allocate host pages per request and remap dst_block_ids to
+    # host page ids so prefill RDMAs straight into the cold pool. None otherwise.
+    sparsekv_coordinator: object | None = None
 
 
 @dataclass
@@ -122,6 +128,10 @@ class ReqMeta:
     remote_tp_size: int = 0
     transfer_id: int = 0
     local_slot_index: int = -1
+    # PD incremental transfer: leading prompt blocks the decode node already
+    # holds from a prior turn's prefix cache. Both sides skip these — only
+    # block_ids[num_computed_blocks:] cross the wire. 0 = full transfer.
+    num_computed_blocks: int = 0
     # paged-SWA: parallel block ids into the SEPARATE SWA pool. Empty for
     # non-V4 backends. -1 entries are window-freed and skipped by the transfer.
     local_swa_block_ids: list[int] = field(default_factory=list)
@@ -192,6 +202,7 @@ class ConnectorMetadata:
             ),
             transfer_id=kv_transfer_params.get("transfer_id", 0),
             local_slot_index=kv_transfer_params.get("local_slot_index", -1),
+            num_computed_blocks=kv_transfer_params.get("num_computed_blocks", 0),
         )
 
     def add_new_req_to_save(

@@ -4,7 +4,6 @@
 import inspect
 import logging
 from dataclasses import dataclass
-from typing import List, Optional, Type
 
 import numpy as np
 import torch
@@ -80,11 +79,11 @@ class MLAChunkContextMetadata:
     iteration); only `[:total_tokens[c]]` is valid for chunk c.
     """
 
-    kv_indptr: List[torch.Tensor]
-    kv_indices: List[torch.Tensor]
-    cu_seqlens_k: List[torch.Tensor]
-    total_tokens: List[int]
-    max_seqlen_k: List[int]
+    kv_indptr: list[torch.Tensor]
+    kv_indices: list[torch.Tensor]
+    cu_seqlens_k: list[torch.Tensor]
+    total_tokens: list[int]
+    max_seqlen_k: list[int]
     num_chunks: int
     k_workspace: torch.Tensor
     v_workspace: torch.Tensor
@@ -92,26 +91,11 @@ class MLAChunkContextMetadata:
     # blocks instead of token slots). None for the plain token-slot layout.
     shuffle_kv_block_indptr: list[torch.Tensor] | None = None
     shuffle_kv_block_indices: list[torch.Tensor] | None = None
-    # --- DCP (Decode Context Parallel) prefill fields ---
-    # Present only when dcp_world_size > 1. The cached context KV is sharded
-    # (interleaved) across DCP ranks, so per chunk each rank gathers its local
-    # compressed KV via `local_slot_ids`, AllGathers, and `reorg_kvcache`
-    # rebuilds the per-sequence contiguous layout. `cu_seqlens_k` above then
-    # holds the GLOBAL per-seq chunk lengths (post-reorg) for flash attention.
     is_dcp: bool = False
-    # Per chunk: absolute slot ids of this rank's local cached tokens, laid out
-    # per-seq contiguous and padded to `padded_local_chunk_seq_lens` (so every
-    # rank's AllGather block has identical `seq_tot` tokens).
     local_slot_ids: list[torch.Tensor] | None = None
-    # Per chunk: per-seq padded local chunk length (list[list[int]]).
     padded_local_chunk_seq_lens: list[list[int]] | None = None
-    # Per seq: real local context length on each rank (list[list[int]]), shared
-    # across chunks; used by reorg to drop padding.
     local_context_lens_allranks: list[list[int]] | None = None
-    # Per chunk: number of local tokens per rank in the AllGather block (== sum
-    # of that chunk's padded_local_chunk_seq_lens).
     seq_tot: list[int] | None = None
-    # Local padded max context chunk size (local tokens per seq per chunk).
     chunk_size: int | None = None
 
 
@@ -125,11 +109,11 @@ class AiterMLABackend(AttentionBackend):
         return "ROCM_AITER_MLA"
 
     @staticmethod
-    def get_builder_cls() -> Type["AiterMLAMetadataBuilder"]:
+    def get_builder_cls() -> type["AiterMLAMetadataBuilder"]:
         return AiterMLAMetadataBuilder
 
     @staticmethod
-    def get_impl_cls() -> Type["MLAAttention"]:
+    def get_impl_cls() -> type["MLAAttention"]:
         return MLAAttention
 
 
@@ -161,6 +145,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self.padded_num_attention_heads = max(self.num_attention_heads, _MLA_MIN_HEADS)
         self.is_sparse = model_runner.is_deepseek_v32
         self.index_topk = hf_config.index_topk if self.is_sparse else -1
+        self.sparsekv_enabled = envs.ATOM_SPARSEKV_ENABLE and self.is_sparse
         self.dtype_kv = dtypes.d_dtypes[config.kv_cache_dtype]
         self.dtype_q = self.dtype_kv
 
@@ -346,8 +331,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # Allocated outside any per-step scope so a single buffer is shared
         # across all chunks and layers.
         self.attn_prefill_chunk_size = config.attn_prefill_chunk_size
-        self.k_chunk_workspace: Optional[torch.Tensor] = None
-        self.v_chunk_workspace: Optional[torch.Tensor] = None
+        self.k_chunk_workspace: torch.Tensor | None = None
+        self.v_chunk_workspace: torch.Tensor | None = None
         if self.attn_prefill_chunk_size > 0:
             qk_head_dim = hf_config.qk_nope_head_dim + hf_config.qk_rope_head_dim
             v_head_dim = hf_config.v_head_dim
@@ -395,6 +380,23 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 self.max_num_batched_tokens,
                 dtype=torch.int32,
                 device=self.device,
+            )
+            # SparseKV per-query-token metadata as fixed-address buffers so the
+            # fused hot path reads them under a captured CUDAGraph (a fresh
+            # per-step .to("cuda") would bind a stale address at replay). Stored
+            # in the kernel's int32 domain so the dispatcher reads them directly.
+            self._sparsekv_req_slots = CpuGpuBuffer(
+                self.max_num_batched_tokens, **i32_kwargs
+            )
+            self._sparsekv_token_pos = CpuGpuBuffer(
+                self.max_num_batched_tokens, **i32_kwargs
+            )
+            # Physical KV row of each decode query token (slot_mapping cast to
+            # int32). A fixed-address buffer refilled in place every step: the
+            # backup kernel is recorded into the FULL decode CUDAGraph, so replay
+            # must read fresh values here, not a capture-frozen .to(int32).
+            self._sparsekv_src_slots = torch.zeros(
+                self.max_num_batched_tokens, dtype=torch.int32, device=self.device
             )
 
         # Per-ubatch buffers for CUDAGraph TBO
@@ -865,6 +867,69 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 dtype=dtypes.fp8,
                 device="cuda",
             )
+        if self.sparsekv_enabled:
+            from atom.models.deepseek_v2 import set_sparsekv_topk_buffer
+            from atom.sparsekv.coordinator import SparseKVCoordinator
+
+            hot = envs.ATOM_SPARSEKV_HOT_BUFFER_SIZE
+            # The MLA kernel reads every selected top-k in one step, so all
+            # index_topk tokens must fit resident simultaneously.
+            assert hot >= self.index_topk, (
+                f"ATOM_SPARSEKV_HOT_BUFFER_SIZE ({hot}) must be >= index_topk "
+                f"({self.index_topk}); hot buffer cannot hold a full top-k set."
+            )
+            # SparseKV translates to per-token hot-buffer rows and reads the hot
+            # buffer as page_size=1; the seg/triton MLA layouts are incompatible.
+            assert envs.ATOM_MLA_PAGE_SIZE == 1 and not envs.ATOM_USE_TRITON_MLA, (
+                "SparseKV requires ATOM_MLA_PAGE_SIZE=1 and non-triton MLA "
+                "(page_size=1 sparse decode path)."
+            )
+            # IndexShare prefetch (GLM-5.2): a "shared" layer reuses its anchor's
+            # top-k, so the anchor's swap plan overlaps its shared layers' gather
+            # on a side stream. Unsupported under PP (config indexer_types is
+            # global; local layer ids don't map) or speculative decode — fall back
+            # to per-layer synchronous swap-in there.
+            shared_index_layers = None
+            pp_size = getattr(config, "pipeline_parallel_size", 1)
+            has_spec = bool(getattr(config, "speculative_config", None))
+            if pp_size == 1 and not has_spec:
+                from atom.models.deepseek_v2 import _should_skip_index_topk
+
+                shared_index_layers = [
+                    _should_skip_index_topk(hf_config, f"model.layers.{i}.self_attn")
+                    for i in range(total_num_layers)
+                ]
+                if not any(shared_index_layers):
+                    shared_index_layers = None
+            elif envs.ATOM_SPARSEKV_PREFETCH:
+                logger.warning(
+                    "SparseKV IndexShare prefetch is unsupported under pipeline "
+                    "parallelism / speculative decode; using synchronous swap-in."
+                )
+            out["sparsekv_coordinator"] = SparseKVCoordinator(
+                num_layers=total_num_layers,
+                max_num_seqs=config.max_num_seqs,
+                hot_buffer_size=envs.ATOM_SPARSEKV_HOT_BUFFER_SIZE,
+                max_context_len=config.max_model_len,
+                kv_dim=576,
+                kv_dtype=dtypes.d_dtypes[config.kv_cache_dtype],
+                device="cuda",
+                index_topk=self.index_topk,
+                shared_index_layers=shared_index_layers,
+                host_to_device_ratio=envs.ATOM_SPARSEKV_HOST_TO_DEVICE_RATIO,
+                page_size=self.model_runner.block_size,
+            )
+            # Shared logical-top-k side-channel buffer (one per decode query
+            # token), written by the indexer op and read by the coordinator.
+            topk_buf = torch.empty(
+                self.max_num_batched_tokens,
+                self.index_topk,
+                dtype=torch.int32,
+                device="cuda",
+            )
+            out["sparsekv_topk_buffer"] = topk_buf
+            out["sparsekv_coordinator"].topk_buffer = topk_buf
+            set_sparsekv_topk_buffer(topk_buf)
         return out
 
     def build_kv_cache_tensor(self, layer_id: int, module):
@@ -901,6 +966,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 runner.aligned_index_dim,
             )
         module.kv_cache = kv_cache
+        coord = getattr(runner, "sparsekv_coordinator", None)
+        if coord is not None:
+            # The MLAAttention (where _forward_decode + _sparsekv_coord live) is
+            # module.impl; module.base_attention is an unrelated None default.
+            impl = getattr(module, "impl", None)
+            if impl is not None and hasattr(impl, "_sparsekv_coord"):
+                impl._sparsekv_coord = coord
+                impl._sparsekv_layer_id = layer_id
         return KVCacheTensor(
             layer_num=layer_id,
             k_cache=kv_cache,
@@ -919,11 +992,21 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         if not hasattr(runner, "kv_cache"):
             return None
 
+        # SparseKV: point the KV block regions at the pinned paged host cold
+        # pool so prefill RDMAs straight into it (one host page per logical
+        # block; page_size == block_size so the producer's db*bpb math is
+        # unchanged). The index cache stays on GPU (the indexer needs it resident).
+        coord = getattr(runner, "sparsekv_coordinator", None)
+
         block_regions: list[KVTransferRegion] = []
         num_layers = runner.kv_cache.shape[0]
         for layer_id in range(num_layers):
-            t = runner.kv_cache[layer_id]
-            bpb = t.stride(0) * t.element_size() * self.block_ratio
+            if coord is not None:
+                t = coord.cold_pool[layer_id]  # [num_host_slots, kv_dim] pinned host
+                bpb = coord.host_page_size * coord.item_size_bytes
+            else:
+                t = runner.kv_cache[layer_id]
+                bpb = t.stride(0) * t.element_size() * self.block_ratio
             block_regions.append(
                 KVTransferRegion(
                     base_addr=t.data_ptr(),
@@ -948,6 +1031,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             block_regions=block_regions,
             slot_regions=[],
             num_blocks=runner.config.num_kvcache_blocks,
+            sparsekv_coordinator=coord,
         )
 
     def prepare_prefill(self, batch: ScheduledBatch):
@@ -1125,7 +1209,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
     def _build_mla_chunk_meta(
         self, batch: ScheduledBatch, bs: int
-    ) -> Optional[MLAChunkContextMetadata]:
+    ) -> MLAChunkContextMetadata | None:
         """Build per-chunk slices of the cached prefix.
 
         Chunks the cached-prefix tokens along the GLOBAL token axis (not the
@@ -1150,7 +1234,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         # Per-seq absolute slot id for every cached token, in seq order, then
         # concatenated into a single global slot array of length total_cached.
-        per_seq_slots: List[np.ndarray] = []
+        per_seq_slots: list[np.ndarray] = []
         for i in range(bs):
             cached_len = int(cached_lens[i])
             if cached_len == 0:
@@ -1169,11 +1253,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         seq_offsets = np.zeros(bs + 1, dtype=np.int64)
         np.cumsum(cached_lens, out=seq_offsets[1:])
 
-        kv_indptr_list: List[torch.Tensor] = []
-        kv_indices_list: List[torch.Tensor] = []
-        cu_seqlens_k_list: List[torch.Tensor] = []
-        total_tokens_list: List[int] = []
-        max_seqlen_k_list: List[int] = []
+        kv_indptr_list: list[torch.Tensor] = []
+        kv_indices_list: list[torch.Tensor] = []
+        cu_seqlens_k_list: list[torch.Tensor] = []
+        total_tokens_list: list[int] = []
+        max_seqlen_k_list: list[int] = []
 
         for c in range(num_chunks):
             g_start = c * chunk_size
@@ -1732,6 +1816,50 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 "sparse_kv_last_page_lens"
             ].gpu[:bs]
 
+        # SparseKV: per-query-token stable cold-pool slot (CPU; consumed by the
+        # coordinator's CPU miss-detect). Set only on real decode steps where all
+        # batch requests are already staged (forward -> stage -> prepare order).
+        coord = getattr(self.model_runner, "sparsekv_coordinator", None)
+        if (
+            coord is not None
+            and self.is_sparse
+            and not batch.is_dummy_run
+            and all(coord.is_registered(rid) for rid in batch.req_ids)
+        ):
+            n_tok = bs * max_seqlen_q if max_seqlen_q > 1 else bs
+            slots = self._sparsekv_req_slots.np
+            # logical position of each query token (the position written this step).
+            # -1 marks graph-padding query tokens so the fused backup kernel skips
+            # them (they would otherwise corrupt request slot 0's cold pool).
+            pos = self._sparsekv_token_pos.np
+            slots[:n_tok] = 0
+            pos[:n_tok] = -1
+            per_seq = [coord.slot_for_req(rid) for rid in batch.req_ids]
+            for s in range(scheduled_bs):
+                ctx_s = int(context_lens[s])
+                if max_seqlen_q > 1:
+                    sl = slice(s * max_seqlen_q, (s + 1) * max_seqlen_q)
+                    slots[sl] = per_seq[s]
+                    pos[sl] = np.arange(ctx_s - max_seqlen_q, ctx_s, dtype=np.int32)
+                    # MTP uses the reference path, whose backup_new_token allocates
+                    # host pages itself; nothing to grow here.
+                else:
+                    slots[s] = per_seq[s]
+                    pos[s] = ctx_s - 1
+                    coord.alloc_host_pages(int(per_seq[s]), ctx_s - 1, 1)
+            # Copy into the fixed-address GPU buffers (pinned staging, non-blocking)
+            # so the captured fused hot path reads fresh values on every replay.
+            attn_metadata.sparsekv_req_slots = self._sparsekv_req_slots.copy_to_gpu(
+                n_tok
+            )
+            attn_metadata.sparsekv_token_pos = self._sparsekv_token_pos.copy_to_gpu(
+                n_tok
+            )
+            # src_slots: cast slot_mapping (int64) into the fixed int32 buffer in
+            # place (GPU cast, on the current stream before the graph replays).
+            self._sparsekv_src_slots[:n_tok].copy_(attn_metadata.slot_mapping[:n_tok])
+            attn_metadata.sparsekv_src_slots = self._sparsekv_src_slots[:n_tok]
+
         # Use bs (graph_bs) >= 2 instead of scheduled_bs >= 2 to avoid accuracy issue:
         if self.model_runner.config.enable_tbo_decode and bs >= 2:
             self._prepare_ubatch_decode(
@@ -2013,6 +2141,21 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             attn_matadata.sparse_kv_last_page_lens = var[
                 "sparse_kv_last_page_lens"
             ].gpu[:bs]
+
+        # SparseKV: trip the fused hot path during capture so its backup + swap
+        # kernels are recorded into the FULL decode graph. sparse_kv_indptr is
+        # zeroed here and token_pos is -1, so both kernels early-return during the
+        # capture-time run (no state mutation, no cold-pool access); replay refills
+        # these fixed buffers with real values and the recorded kernels do the work.
+        coord = getattr(self.model_runner, "sparsekv_coordinator", None)
+        if coord is not None and self.is_sparse and max_q_len == 1:
+            self._sparsekv_req_slots.np[:bs] = 0
+            self._sparsekv_token_pos.np[:bs] = -1
+            attn_matadata.sparsekv_req_slots = self._sparsekv_req_slots.copy_to_gpu(bs)
+            attn_matadata.sparsekv_token_pos = self._sparsekv_token_pos.copy_to_gpu(bs)
+            self._sparsekv_src_slots[:bs].zero_()
+            attn_matadata.sparsekv_src_slots = self._sparsekv_src_slots[:bs]
+
         positions = var["positions"].copy_to_gpu(sum_tokens)
         context = Context(
             positions=positions, is_prefill=False, batch_size=bs, graph_bs=bs

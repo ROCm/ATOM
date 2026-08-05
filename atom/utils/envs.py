@@ -63,6 +63,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_TRITON_MOE_DECODE": lambda: os.getenv("ATOM_USE_TRITON_MOE_DECODE", "0")
     == "1",
     "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
+    # --- SparseKV (DSA decode HBM offload) ---
+    # Master switch. When on (and the model is sparse/DSA), decode-phase MLA
+    # attention reads a fixed-size GPU hot buffer swapped in per step from a CPU
+    # pinned cold pool, instead of the full GPU KV cache.
+    "ATOM_SPARSEKV_ENABLE": lambda: os.getenv("ATOM_SPARSEKV_ENABLE", "0") == "1",
+    # Per-request resident hot tokens (H). The hot buffer holds H+1 slots/request.
+    "ATOM_SPARSEKV_HOT_BUFFER_SIZE": lambda: int(
+        os.getenv("ATOM_SPARSEKV_HOT_BUFFER_SIZE", "8192")
+    ),
+    # IndexShare prefetch (Stage C): overlap a full-layer group's shared-layer KV
+    # swap-in with compute on a side stream. Off (default) keeps per-layer
+    # synchronous swap-in. Auto-disabled under pipeline parallelism / spec decode.
+    "ATOM_SPARSEKV_PREFETCH": lambda: os.getenv("ATOM_SPARSEKV_PREFETCH", "0") == "1",
+    # Paged host cold-pool capacity as a multiple of the GPU hot-buffer total
+    # capacity (max_num_seqs × (hot_buffer_size+1)). The shared host pool holds
+    # this many tokens; requests allocate pages on demand and admission
+    # back-pressures when the pool is full.
+    "ATOM_SPARSEKV_HOST_TO_DEVICE_RATIO": lambda: int(
+        os.getenv("ATOM_SPARSEKV_HOST_TO_DEVICE_RATIO", "8")
+    ),
     # --- Kernel Fusion Toggles ---
     # fused_compress_attn: switch between Triton (default historical) and a
     # flydsl drop-in for V4-Pro Compressor (Main BF16 + Indexer FP8) paths.
@@ -183,6 +203,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # to the prefill[]/decode[] trace labels emitted by ModelRunner.run_model.
     "ATOM_ENABLE_DETAILED_ANNOTATION": lambda: (
         os.getenv("ATOM_ENABLE_DETAILED_ANNOTATION", "0") == "1"
+    ),
+    "ATOM_LOG_PREFIX_CACHE_PER_REQ": lambda: (
+        os.getenv("ATOM_LOG_PREFIX_CACHE_PER_REQ", "0") == "1"
     ),
     "ATOM_PROFILER_TIMEOUT": lambda: float(os.getenv("ATOM_PROFILER_TIMEOUT", "300")),
     "ATOM_LOG_MORE": lambda: int(os.getenv("ATOM_LOG_MORE", "0")) != 0,

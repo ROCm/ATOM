@@ -69,6 +69,7 @@ class PPEngineCoreProc(EngineCore):
             except Exception:
                 logger.exception("KV event publish during shutdown failed")
             self.scheduler.shutdown_kv_events()
+            self.pp_transport.close()
 
     def _pp_head_step(self):
         launched = 0
@@ -121,10 +122,11 @@ class PPEngineCoreProc(EngineCore):
                 break
             poll_ms = 0
 
-            assert list(fwd_out.req_ids) == list(scheduled_batch.req_ids), (
-                f"PP token ordering violated: received {list(fwd_out.req_ids)}, "
-                f"expected FIFO head {list(scheduled_batch.req_ids)}"
-            )
+            if list(fwd_out.req_ids) != list(scheduled_batch.req_ids):
+                raise RuntimeError(
+                    f"PP token ordering violated: received {list(fwd_out.req_ids)}, "
+                    f"expected FIFO head {list(scheduled_batch.req_ids)}"
+                )
 
             self._in_flight.popleft()
             self.scheduler.release_pp_inflight(scheduled_batch)
@@ -183,3 +185,4 @@ class PPEngineCoreProc(EngineCore):
             except Exception:
                 logger.exception("KV event publish during shutdown failed")
             self.scheduler.shutdown_kv_events()
+            self.pp_transport.close()

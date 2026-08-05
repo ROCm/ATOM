@@ -2880,6 +2880,81 @@ class ModelRunner:
             off += local_len
         return torch.cat(outs)
 
+    def _setup_pp_shared_indexer(self):
+        """Cache per-rank predicates for GLM-5.2 DSA IndexShare PP-boundary
+        top-k transfer. Computed once.
+
+        A "shared" attention layer reuses the prior "full" layer's sparse top-k
+        via the per-rank scratch buffer ``_sparse_kv_indices_gpu``. When a PP
+        boundary splits a shared group, the receiving rank's leading shared
+        layers need the sending rank's top-k, so it is carried across the
+        boundary. No-op for dense models, sparse models with no shared layers,
+        pp=1, or when every rank starts on a "full" layer.
+        """
+        if getattr(self, "_pp_share_indexer_ready", False):
+            return
+        self._pp_share_indexer_ready = True
+        self._pp_send_needs_sparse = False
+        self._pp_recv_needs_sparse = False
+        self._pp_index_topk = 0
+        if not self.is_deepseek_v32:
+            return
+        pp = get_pp_group()
+        if pp.world_size <= 1:
+            return
+        # Unwrap to the module exposing the PP layer range (make_layers sets
+        # start_layer/end_layer on the inner model; UBatchWrapper/CausalLM wrap it).
+        inner = self.model
+        while not hasattr(inner, "start_layer") and hasattr(inner, "model"):
+            inner = inner.model
+        if not hasattr(inner, "start_layer"):
+            return
+
+        # Mirror the model's authoritative per-layer "shared" decision
+        # (_should_skip_index_topk in deepseek_v2.py): indexer_types is
+        # authoritative when present (GLM-5.2), else index_topk_pattern, else the
+        # index_topk_freq schedule. Keeping these in sync avoids a mid-group PP
+        # split silently reading a stale buffer.
+        hf = self.config.hf_config
+        num_layers = int(hf.num_hidden_layers)
+        indexer_types = getattr(hf, "indexer_types", None)
+        index_topk_pattern = getattr(hf, "index_topk_pattern", None)
+        index_topk_freq = int(getattr(hf, "index_topk_freq", 1))
+        index_skip_topk_offset = int(getattr(hf, "index_skip_topk_offset", 1))
+
+        def _is_shared(layer_idx):
+            if not 0 <= layer_idx < num_layers:
+                return False
+            if indexer_types is not None:
+                return indexer_types[layer_idx] == "shared"
+            if index_topk_pattern is not None:
+                return index_topk_pattern[layer_idx] == "S"
+            if index_topk_freq <= 1:
+                return False
+            return max(layer_idx - index_skip_topk_offset, 0) % index_topk_freq != 0
+
+        # This rank consumes the prior rank's top-k iff its first layer is shared.
+        self._pp_recv_needs_sparse = (not pp.is_first_rank) and _is_shared(
+            inner.start_layer
+        )
+        # The next rank consumes this rank's top-k iff ITS first layer
+        # (== this rank's end_layer) is shared.
+        self._pp_send_needs_sparse = (not pp.is_last_rank) and _is_shared(
+            inner.end_layer
+        )
+        self._pp_index_topk = int(self.config.hf_config.index_topk)
+        if self._pp_recv_needs_sparse or self._pp_send_needs_sparse:
+            logger.info(
+                "[%s] PP shared-indexer transfer: recv=%s send=%s "
+                "(layers [%d,%d), index_topk=%d)",
+                self.rank_name,
+                self._pp_recv_needs_sparse,
+                self._pp_send_needs_sparse,
+                inner.start_layer,
+                inner.end_layer,
+                self._pp_index_topk,
+            )
+
     def run_model(
         self,
         input_ids: torch.Tensor,
@@ -2970,10 +3045,22 @@ class ModelRunner:
 
                 pp_group = get_pp_group()
                 pp_enabled = pp_group.world_size > 1
+                if pp_enabled:
+                    self._setup_pp_shared_indexer()
 
                 intermediate_tensors = None
                 if pp_enabled and not pp_group.is_first_rank:
                     intermediate_tensors = recv_intermediate_tensors()
+                    # GLM-5.2 IndexShare: if this rank starts inside a shared
+                    # group, load the prior rank's top-k into our scratch buffer
+                    # before the leading shared layers read it. Pop regardless so
+                    # the compiled model only ever sees hidden_states/residual.
+                    recv_sparse = intermediate_tensors.tensors.pop(
+                        "sparse_kv_indices", None
+                    )
+                    if recv_sparse is not None and self._pp_recv_needs_sparse:
+                        tgt = self.attn_metadata_builder._sparse_kv_indices_gpu
+                        tgt[: recv_sparse.numel()].copy_(recv_sparse)
 
                 if pp_enabled:
                     model_output = self.model(
@@ -2989,6 +3076,18 @@ class ModelRunner:
                         input_ids, positions, inputs_embeds=inputs_embeds
                     )
                 if pp_enabled and not pp_group.is_last_rank:
+                    # GLM-5.2 IndexShare: if the next rank starts inside a shared
+                    # group, carry this step's top-k (this rank's last "full"
+                    # layer wrote it) so its leading shared layers can reuse it.
+                    if self._pp_send_needs_sparse:
+                        # num_tokens is the count the indexer actually processed
+                        # (== hidden_states rows); robust under PCP where it is a
+                        # 1/pcp shard, unlike input_ids.shape[0].
+                        num_tokens = model_output.tensors["hidden_states"].shape[0]
+                        n = num_tokens * self._pp_index_topk
+                        model_output.tensors["sparse_kv_indices"] = (
+                            self.attn_metadata_builder._sparse_kv_indices_gpu[:n]
+                        )
                     if self._pp_pending_send:
                         commit_pp_send_work(self._pp_pending_send)
                     self._pp_pending_send = async_send_intermediate_tensors(
@@ -3213,10 +3312,55 @@ class ModelRunner:
 
     @torch.inference_mode()
     @with_eplb_forward_monitor
+    def _sparsekv_token_phys_slots(self, block_table, positions):
+        """Physical KV-cache slots for logical ``positions`` given a block table."""
+        bs = self.block_size
+        bt = torch.as_tensor(block_table, dtype=torch.long)
+        pos = torch.as_tensor(positions, dtype=torch.long)
+        return bt[pos // bs] * bs + (pos % bs)
+
+    def _sparsekv_stage_and_sync(self, batch: ScheduledBatch) -> None:
+        """Stage newly-arrived decode requests into the cold pool + hot buffer.
+
+        Worker-side, keyed by the stable ``batch.req_ids``: registers each request
+        not yet seen (copying its prompt KV GPU->cold pool and preloading the hot
+        set) and releases requests that have left the batch. Runs before
+        prepare_inputs so the per-token slot metadata resolves.
+        """
+        coord = getattr(self, "sparsekv_coordinator", None)
+        if coord is None or batch.is_dummy_run:
+            return
+        # Decode-only: skip prefill / chunked-prefill batches (their KV is not yet
+        # complete). A request's first decode step stages its full prompt. On a
+        # mixed batch we simply don't stage here; prepare_decode then falls back to
+        # the full-KV path for any unregistered req (always correct in Phase 0).
+        if batch.total_tokens_num_prefill > 0:
+            return
+        req_ids = batch.req_ids
+        coord.sync_active(req_ids)
+        for i, rid in enumerate(req_ids):
+            if coord.is_registered(rid):
+                ctx = int(batch.context_lens[i])
+                n_new = int(batch.num_scheduled_tokens[i])
+                coord.maybe_first_hot_load(rid, ctx - n_new)
+                continue
+            ctx = int(batch.context_lens[i])
+            n_new = int(batch.num_scheduled_tokens[i])
+            present = ctx - n_new  # KV already in cache (prompt + prior decodes)
+            if present <= 0:
+                continue
+            slot = coord.acquire(rid, present)
+            phys = self._sparsekv_token_phys_slots(
+                batch.block_tables[i], range(present)
+            )
+            coord.stage_kv_to_cold_pool(slot, self.kv_cache, phys, present)
+            coord.load_initial_hot_set(slot, present)
+
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
         # Rotate to this microbatch's slot before prepare_inputs writes buffers.
         if not batch.is_dummy_run:
             self._advance_forward_vars()
+        self._sparsekv_stage_and_sync(batch)
         (
             input_ids,
             temperatures,

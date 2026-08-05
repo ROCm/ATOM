@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+from collections.abc import Callable
 from copy import copy
 from enum import Enum, auto
 from itertools import count
-from typing import Any, Callable, Optional
+from typing import Any
 
 import numpy as np
+
 from atom.sampling_params import SamplingParams
 
 
@@ -44,17 +46,17 @@ class Sequence:
         block_size: int,
         sampling_params=SamplingParams(),
         stop_token_sequences: list[list[int]] = None,
-        stream_callback: Optional[Callable[[Any], None]] = None,
+        stream_callback: Callable[[Any], None] | None = None,
         id=None,
         kv_transfer_params: dict = None,
         num_draft_tokens: int = 0,
         has_per_req_cache: bool = False,
         needs_independent_noise: bool = False,
-        parent_request_id: Optional[str] = None,
+        parent_request_id: str | None = None,
         sibling_index: int = 0,
-        request_id: Optional[str] = None,
-        multimodal_data: Optional[dict] = None,
-        mrope_positions: Optional[np.ndarray] = None,
+        request_id: str | None = None,
+        multimodal_data: dict | None = None,
+        mrope_positions: np.ndarray | None = None,
         mrope_position_delta: int = 0,
     ):
         self.block_size = block_size
@@ -79,7 +81,6 @@ class Sequence:
         self.num_rejected = 0
         self.num_cached_tokens = 0
         self.num_compressed_hit_blocks = 0
-        self.prefix_cache_hit_tokens = 0
         # True iff this seq is mid-prefill (chunked prefill produced KV for
         # some prompt tokens but not all). Maintained by the scheduler:
         # set in postprocess when an advance leaves prompt tokens remaining,
@@ -105,6 +106,9 @@ class Sequence:
         self.stop_strings = sampling_params.stop_strings
         self.stop_token_sequences = stop_token_sequences or []
         self.is_first_decode = False
+        # SparseKV: stable coordinator slot for this request's cold-pool region,
+        # assigned on first decode, -1 while unassigned. See atom/sparsekv/.
+        self.sparsekv_req_slot = -1
         # Set to True by Scheduler.postprocess after BlockManager.hash_blocks
         # has registered the prompt blocks for prefix caching. The trigger has
         # to be per-seq because in deferred-output mode the prefill step's
@@ -125,7 +129,7 @@ class Sequence:
         # DSpark Phase 2: scheduler-chosen verify length from the previous
         # decode step's propose(). None = no schedule yet -> verify mtp_k (full).
         # Next decode step sizes this seq's verification to dspark_next_ell+1.
-        self.dspark_next_ell: Optional[int] = None
+        self.dspark_next_ell: int | None = None
 
         # statistics fields
         self.arrive_time = 0.0
@@ -136,11 +140,6 @@ class Sequence:
         # kv_transfer params
         self.kv_transfer_params = kv_transfer_params
         self.kv_transfer_params_output = None
-        if kv_transfer_params:
-            self.prefix_cache_hit_tokens = kv_transfer_params.get(
-                "prefix_cache_hit_tokens", 0
-            )
-
         self.prefix_cache_hit_tokens = (kv_transfer_params or {}).get(
             "prefix_cache_hit_tokens", 0
         )
