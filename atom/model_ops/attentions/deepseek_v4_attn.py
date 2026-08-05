@@ -38,6 +38,7 @@ Per-slot cost (V4-Pro, BF16 SWA + fp32 tail buffers, 30 CSA + 31 HCA + 1 dense):
 """
 
 import logging
+import math
 import os
 from dataclasses import dataclass
 from typing import Any, cast
@@ -77,10 +78,12 @@ from atom.model_ops.attentions.sub_pool_spec import (
     state_pool,
 )
 from atom.model_ops.attentions.v4_pool_geometry import (
+    ABSENT_RATIO,
     CSA_RATIO,
     DENSE_RATIO,
     HCA_RATIO,
     UnifiedPoolGeometry,
+    WindowParams,
 )
 from atom.model_ops.v4_kernels import (
     FP4_MQA_BLOCK_K,
@@ -99,6 +102,11 @@ from atom.utils.forward_context import (
 )
 
 logger = logging.getLogger("atom")
+
+# State field carrying the windows of layers whose KV dtype is not the pool's.
+# One field for all of them: they share a dtype (see `_discover_field_windows`)
+# and a ring length, so they differ only in the field's layer dimension.
+STATE_WINDOW_FIELD = "state_window"
 
 # Per-compress-class buffer holding, for each decode token, the plane row its
 # own KV goes to. One per class because a class interleaves its layers' windows
@@ -534,6 +542,14 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # `swa_write` modulo, and the ring-index modulo `cs` in the V4
         # paged-decode index-write kernel.
         self.win_with_spec = self.window_size + self.max_spec_steps
+        # Layers whose window the planes cannot hold at their own row width.
+        # Asked of the modules rather than derived from the config: the width
+        # is a property of what a layer's attention kernel can consume, and the
+        # layer is the only thing that knows it. This runs after the model and
+        # the drafter are built (`model_runner.py` builds them, then us).
+        self._field_window_layers, self._field_window_dtype = (
+            self._discover_field_windows()
+        )
         # How the compressor state divides between the planes, and what that
         # costs a slot in rows. Settled here because the row space is built
         # from it and sizing prices a slot before either count exists.
@@ -548,12 +564,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # address before then — warmup runs first and `DeepseekV4Attention`
         # short-circuits on `is_dummy_run`.
         self.pool_geometry = UnifiedPoolGeometry(
-            self.compress_ratios,
+            self._geometry_ratios(),
             num_blocks=0,
             num_slots=0,
             ring_slots=self.win_with_spec,
             block_size=self.block_size,
             arena_rows=arena_rows,
+            slot_align_rows=self._slot_align_rows(),
         )
         # Worst-case HCA per-token committed compress count
         # (= max_model_len // 128 for V4-Pro = 8192 at 1M context).
@@ -578,13 +595,130 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     # AttentionMetadataBuilder hooks (per-request cache abstraction).    #
     # ------------------------------------------------------------------ #
 
+    # ---- Windows the planes cannot hold at their own row width ---------- #
+    # A DSpark draft layer's block attention consumes unquantized KV, so under
+    # a packed pool its ring cannot be rows of a plane. Rather than let the
+    # pool guess, the layer declares the width and the pool reserves it as a
+    # state field — which is what makes a future fused fp8 draft kernel a
+    # one-line change on the layer instead of a layout decision here.
+
+    def _discover_field_windows(self) -> tuple[tuple[int, ...], torch.dtype | None]:
+        """The layers that declared a window KV dtype, and that dtype.
+
+        Read off the modules, not the config, because the width follows from
+        which kernel the layer runs. Safe at this point: `ModelRunner` builds
+        the model and the drafter before it builds us.
+
+        Layers come back sorted, which fixes their order in the field's layer
+        dimension — the one place that order is decided.
+        """
+        runner = self.model_runner
+        drafter = getattr(runner, "drafter", None)
+        found: dict[int, torch.dtype] = {}
+        for root in (getattr(runner, "model", None), getattr(drafter, "model", None)):
+            if root is None:
+                continue
+            for module in root.modules():
+                dtype = getattr(module, "window_kv_dtype", None)
+                if dtype is not None:
+                    found[module.layer_id] = dtype
+        widths = set(found.values())
+        if len(widths) > 1:
+            raise NotImplementedError(
+                f"window KV dtypes {sorted(map(str, widths))} in one pool: the "
+                "state field carrying them is one field, so one dtype"
+            )
+        return tuple(sorted(found)), widths.pop() if widths else None
+
+    def _geometry_ratios(self) -> list[int]:
+        """Per-layer ratios as the row space sees them.
+
+        A layer carrying its window in a state field keeps nothing addressed
+        by block or by window row, so the row space is told it is absent — it
+        must not also reserve entry rows it would never read.
+        """
+        return [
+            ABSENT_RATIO if layer_id in self._field_window_layers else ratio
+            for layer_id, ratio in enumerate(self.compress_ratios)
+        ]
+
+    def _window_field_row_bytes(self) -> int:
+        """Bytes one window position takes: `head_dim` of the layer's dtype."""
+        return self.head_dim * self._field_window_dtype.itemsize
+
+    def _window_field_plane_index(self) -> int:
+        """Which plane `plan_field_planes` put the state-carried window in."""
+        return next(
+            p
+            for p, group in enumerate(self._arena_planes)
+            if any(f.name == STATE_WINDOW_FIELD for f in group)
+        )
+
+    def _window_field_plane_rows(self) -> int:
+        """Plane rows one window position spans, in the plane it landed in.
+
+        One when the two widths agree, which is the case a shared dense class
+        would have handled — nothing downstream depends on which of the two.
+        """
+        plane = self._plane_row_widths()[self._window_field_plane_index()]
+        row_bytes = self._window_field_row_bytes()
+        if row_bytes % plane:
+            raise ValueError(
+                f"a {row_bytes}B window row does not divide into {plane}B plane "
+                "rows; the field cannot be addressed as rows of that plane"
+            )
+        return row_bytes // plane
+
+    def _slot_align_rows(self) -> int:
+        """Row multiple a slot is rounded to, so every view of it divides.
+
+        Two for the compressor state alone (`UnifiedPoolGeometry.slot_rows`).
+        A state-carried window is read through a plane retyped to its own
+        width, so the slot has to be a whole number of those rows too.
+        """
+        if self._field_window_dtype is None:
+            return 2
+        return math.lcm(2, self._window_field_plane_rows())
+
+    def _window_field_plane(self) -> torch.Tensor:
+        """The plane holding the state-carried window, retyped to its width.
+
+        `[rows, head_dim]` of the layer's own dtype, where a row is one window
+        position — which is what `swa_write` and the DSpark gather take, so
+        neither of them learns that this window is not a plane of its own.
+        """
+        plane = self._kv_planes()[self._window_field_plane_index()]
+        return plane.view(self._field_window_dtype).view(-1, self.head_dim)
+
+    def _window_field_params(self, layer_id: int) -> WindowParams:
+        """Where one state-carried window sits, in retyped-plane rows."""
+        plane_bytes = self._plane_row_widths()[self._window_field_plane_index()]
+        row_bytes = self._window_field_row_bytes()
+        offset = self.model_runner.v4_state_arena.field_offset(STATE_WINDOW_FIELD) + (
+            self._field_window_layers.index(layer_id) * self.win_with_spec * row_bytes
+        )
+        return self.pool_geometry.field_window_params(
+            offset // plane_bytes, row_bytes // plane_bytes
+        )
+
     def _state_fields(self) -> list[StateField]:
-        """The compressor tail state one request carries (paper §3.6.1).
+        """The per-request state one request carries: compressor, and windows
+        the planes cannot hold at their own row width.
 
         A `[kv_state, score_state]` fp32 pair per Compressor instance — CSA
-        Main, CSA Indexer, HCA Main. The sliding window is NOT here: it is a
-        ring at the head of every layer's `unified_kv`, addressed by the same
-        state slot but sized per token rather than per compressor entry.
+        Main, CSA Indexer, HCA Main (paper §3.6.1). Most windows are NOT here:
+        they are rings in the entry region of a slot, addressed by the same
+        state slot but sized per token rather than per compressor entry. A
+        layer whose window KV has a dtype of its own joins as a field instead,
+        because a plane is one width and a field is the one thing in this
+        layout that is priced in bytes.
+
+        Putting it here rather than in a plane of its own is what makes it
+        travel: `copy_state_entries` copies a whole slot, so a checkpoint
+        carries the window with the state. A private plane would not be
+        copied, and a request resuming a cached prefix would draft against
+        whatever the slot's previous occupant left — the same shape of bug
+        #1417 was, minus the correctness half, since drafts are verified.
 
         Field order is the wire order of a whole entry, so it is also the
         order a PD transfer or a checkpoint sees the bytes in.
@@ -592,7 +726,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         neg_inf = float("-inf")
         dt = self._state_dtype
         n_csa, n_hca = len(self.csa_layers), len(self.hca_layers)
-        return [
+        fields = [
             StateField("csa_main_kv", n_csa, self.csa_main_state_shape, dt),
             StateField("csa_main_score", n_csa, self.csa_main_state_shape, dt, neg_inf),
             StateField("csa_idx_kv", n_csa, self.csa_idx_state_shape, dt),
@@ -600,6 +734,20 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             StateField("hca_main_kv", n_hca, self.hca_main_state_shape, dt),
             StateField("hca_main_score", n_hca, self.hca_main_state_shape, dt, neg_inf),
         ]
+        if self._field_window_dtype is not None:
+            fields.append(
+                StateField(
+                    STATE_WINDOW_FIELD,
+                    len(self._field_window_layers),
+                    (self.win_with_spec, self.head_dim),
+                    self._field_window_dtype,
+                    # Its rows are also reached by index, so the field has to
+                    # start on one of its own rows, not merely on the retype
+                    # boundary every field gets.
+                    align=self._window_field_row_bytes(),
+                )
+            )
+        return fields
 
     def state_transfer(self) -> StateTransfer:
         """A copy: one request's compressor state is one contiguous entry.
@@ -640,6 +788,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         prefix had never written that prefix into its own. Reinstating it is only
         correct because the checkpoint carries the window across — drop this and
         the bug returns, silently, as garbage attention over the reused prefix.
+
+        That is also why a window whose dtype differs from the pool's is a state
+        field rather than a plane of its own: a plane of its own would sit
+        outside every slot and so outside this copy, and a resumed request would
+        draft against the slot's previous occupant. Verification would keep the
+        output right and the acceptance rate would just quietly collapse.
         """
         views = self._slot_views()
         dsts, srcs = [], []
@@ -880,15 +1034,23 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
         # A plain slice, not `as_strided`: the base row is a row count into the
         # plane, and letting torch derive the storage offset is what keeps it
-        # from being confused with an absolute one.
-        unified_kv: list[torch.Tensor] = [
-            kv_plane[geo.layer_base_row(i) :] for i in range(self.num_layers)
-        ]
-        unified_kv_rope: list[torch.Tensor | None] = (
-            [kv_plane_rope[geo.layer_base_row(i) :] for i in range(self.num_layers)]
-            if kv_plane_rope is not None
-            else [None] * self.num_layers
-        )
+        # from being confused with an absolute one. A layer carrying its window
+        # as a state field anchors nowhere in the row space and gets None —
+        # `build_kv_cache_tensor` binds it the retyped field view instead.
+        def _layer_views(plane: torch.Tensor | None) -> list[torch.Tensor | None]:
+            if plane is None:
+                return [None] * self.num_layers
+            return [
+                (
+                    None
+                    if i in self._field_window_layers
+                    else plane[geo.layer_base_row(i) :]
+                )
+                for i in range(self.num_layers)
+            ]
+
+        unified_kv = _layer_views(kv_plane)
+        unified_kv_rope = _layer_views(kv_plane_rope)
 
         # ---- Compressor state: the front rows of every slot ----------------
         # Same per-layer views the kernels bound before. What changed is where
@@ -985,25 +1147,17 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         geo = self.pool_geometry
 
         if isinstance(module, _V4Attention):
-            # A DSpark draft layer is already a dense layer of the shared row
-            # space — the ratio list carries it and every slot reserves its rows
-            # — so it takes the ordinary path below and costs no allocation of
-            # its own. The one thing that can keep it out is the plane's dtype:
-            # its block attention runs bf16, and under an fp8 pool the reserved
-            # rows are the wrong shape for it and go unused.
-            draft_dtype = getattr(module, "dspark_draft_dtype", None)
-            if draft_dtype is not None and draft_dtype is not self._swa_dtype:
-                # The same slots the target pool has, in a plane of their own.
-                # Going through the geometry rather than writing
-                # `slot * cs + pos % cs` here keeps the draft's window addressed
-                # by the same expression as every other window.
-                draft = UnifiedPoolGeometry.windows_only(geo)
-                module.swa_plane = torch.zeros(
-                    (draft.plane_rows, self.head_dim),
-                    dtype=draft_dtype,
-                    device=self.model_runner.device,
-                )
-                module.swa_window = draft.window_params(DENSE_RATIO)
+            # A layer that declared its own window KV dtype is carried as a
+            # state field instead of as rows of the entry — see
+            # `_state_fields`. It still reads through a plane and a
+            # `WindowParams`, so nothing below it in the stack can tell: what
+            # changes is that the plane is retyped to the layer's own width,
+            # where its ring is contiguous.
+            if module.layer_id in self._field_window_layers:
+                module.swa_plane = self._window_field_plane()
+                module.swa_window = self._window_field_params(module.layer_id)
+                # No second plane and no packing: this window is whatever
+                # dtype the layer asked for, RoPE inline, one plane.
                 module.kv_fp8 = False
                 module.unified_kv = None
                 module.unified_kv_rope = None

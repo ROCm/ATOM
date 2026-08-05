@@ -293,40 +293,75 @@ class TestTheArenaTakesTheFrontOfASlot:
             )
 
 
-class TestASecondPlaneAdoptsTheNumbering:
-    """A slot has to name the same request in every plane that holds one.
+class TestAWindowCarriedAsAField:
+    """A window whose row is wider than a plane's lives in the state region.
 
-    The DSpark draft keeps its own window plane, which has no compressed blocks
-    and so is far shorter — left to number itself, its position `j` would be a
-    different request's than the main plane's `j`, and both are handed the same
-    per-sequence slot.
+    A DSpark draft layer wants unquantized KV where the pool is packed, so its
+    ring cannot be rows of a plane; it takes bytes off the front of the slot
+    like the compressor state and is read through a view of that plane retyped
+    to its own width. The property to hold is that the rows it names, converted
+    back to plane rows, land inside that slot's state region and nowhere else —
+    the retype is the one step where an off-by-a-fraction-of-a-row would look
+    like a valid address.
     """
 
-    def main(self):
-        return flash_geometry(num_blocks=9, num_slots=3)
+    def geometry(self, rows_per_window_row, layers=1):
+        """A pool whose state region holds `layers` rings and nothing else."""
+        return flash_geometry(
+            num_blocks=9,
+            num_slots=3,
+            arena_rows=FLASH_WINDOW * rows_per_window_row * layers,
+            slot_align_rows=rows_per_window_row,
+        )
 
-    def test_the_same_group_is_the_same_slot_in_both(self):
-        main = self.main()
-        draft = UnifiedPoolGeometry.windows_only(main)
-        for group in range(main.num_slots):
-            assert main.physical_slot(group) == draft.physical_slot(group)
+    def plane_rows_named(self, geo, params, slot, pos, rows_per_window_row):
+        """Plane rows the window row for `(slot, pos)` covers."""
+        first = params.index(slot, pos) * rows_per_window_row
+        return range(first, first + rows_per_window_row)
 
-    def test_the_draft_plane_holds_exactly_its_slots(self):
-        main = self.main()
-        draft = UnifiedPoolGeometry.windows_only(main)
-        assert draft.slot_origin == main.slot_positions - main.num_slots
-        spans = [draft.slot_span(draft.physical_slot(g)) for g in range(3)]
-        assert min(s for s, _ in spans) == 0
-        assert max(e for _, e in spans) == draft.plane_rows
+    @pytest.mark.parametrize("rows_per_window_row", [1, 2, 8])
+    def test_every_row_lands_in_its_own_slot_state_region(self, rows_per_window_row):
+        geo = self.geometry(rows_per_window_row)
+        params = geo.field_window_params(0, rows_per_window_row)
+        for group in range(geo.num_slots):
+            slot = geo.physical_slot(group)
+            start, stop = geo.arena_span(slot)
+            for pos in range(geo.ring_slots):
+                for row in self.plane_rows_named(
+                    geo, params, slot, pos, rows_per_window_row
+                ):
+                    assert start <= row < stop, (group, pos, row, (start, stop))
 
-    def test_every_draft_window_row_lands_in_the_draft_plane(self):
-        main = self.main()
-        draft = UnifiedPoolGeometry.windows_only(main)
-        for group in range(main.num_slots):
-            slot = draft.physical_slot(group)
-            for pos in range(draft.ring_slots):
-                row = draft.absolute_row(0, draft.window_index(0, slot, pos))
-                assert 0 <= row < draft.plane_rows, (group, pos, row)
+    def test_two_layers_at_different_offsets_never_collide(self):
+        rows = 2
+        geo = self.geometry(rows, layers=2)
+        # Two layers of one field: the second starts a whole ring further in.
+        first = geo.field_window_params(0, rows)
+        second = geo.field_window_params(geo.ring_slots * rows, rows)
+        seen = set()
+        for params in (first, second):
+            for group in range(geo.num_slots):
+                slot = geo.physical_slot(group)
+                for pos in range(geo.ring_slots):
+                    row = params.index(slot, pos)
+                    assert row not in seen, (group, pos, row)
+                    seen.add(row)
+
+    def test_a_slot_that_does_not_divide_is_refused(self):
+        # Whatever the slot came out to, the first width it does not divide by
+        # has to be refused rather than silently truncated — that width is what
+        # `slot_align_rows` exists to rule out at construction.
+        geo = self.geometry(2)
+        rows = 2
+        while geo.slot_rows % rows == 0:
+            rows *= 2
+        with pytest.raises(ValueError, match="does not divide"):
+            geo.field_window_params(0, rows)
+
+    def test_a_field_offset_that_does_not_divide_is_refused(self):
+        geo = self.geometry(2)
+        with pytest.raises(ValueError, match="does not divide"):
+            geo.field_window_params(1, 2)
 
 
 class TestBoundary:

@@ -163,6 +163,10 @@ class SplitStateArena:
     def view(self, name: str) -> torch.Tensor:
         return self._by_field[name].view(name)
 
+    def field_offset(self, name: str) -> int:
+        """Bytes into the plane's slot where field `name` begins."""
+        return self._by_field[name].field_offset(name)
+
 
 @dataclass(frozen=True)
 class StateField:
@@ -179,6 +183,20 @@ class StateField:
     # Value the field is initialized to. Score states start at -inf so an
     # unwritten ring position loses the softmax; kv states start at zero.
     fill: float = 0.0
+    # Byte alignment the field's offset inside an entry must satisfy, over and
+    # above `_ALIGN`. A field read as a plain strided tensor needs nothing more
+    # than the retype boundary; one also read as rows of a *retyped plane* — a
+    # window whose row is several plane rows wide — needs its offset to land on
+    # one of those wider rows, or the row index the kernel computes is off by a
+    # fraction of a row and nothing about the view says so.
+    align: int = 0
+
+    def __post_init__(self):
+        if self.align and self.align % _ALIGN:
+            raise ValueError(
+                f"{self.name}: alignment {self.align} must be a multiple of "
+                f"{_ALIGN}, which every field already has"
+            )
 
     @property
     def per_layer_numel(self) -> int:
@@ -199,7 +217,7 @@ def entry_bytes_for(fields: list[StateField]) -> int:
     """
     total = 0
     for field in fields:
-        total = _align_up(total) + field.bytes_per_entry
+        total = _align_up(total, max(_ALIGN, field.align)) + field.bytes_per_entry
     return _align_up(total)
 
 
@@ -240,10 +258,14 @@ class StateArena:
                 f"slot stride {self.slot_stride} is under the "
                 f"{self.entry_bytes} an entry takes"
             )
-        if self.slot_stride % _ALIGN:
+        # Every entry repeats the first entry's field offsets, so whatever
+        # alignment the strictest field asks for has to survive the stride and
+        # the buffer's own start as well — otherwise only entry 0 satisfies it.
+        self._align = max([_ALIGN] + [f.align for f in self.fields])
+        if self.slot_stride % self._align:
             raise ValueError(
                 f"slot stride {self.slot_stride} must be a multiple of "
-                f"{_ALIGN}, or entries past the first fall off the boundary "
+                f"{self._align}, or entries past the first fall off the boundary "
                 "their field views retype from"
             )
         # Entries the caller will actually hand out, counted from the END:
@@ -257,7 +279,7 @@ class StateArena:
         offset = 0
         self._offsets: dict[str, int] = {}
         for field in self.fields:
-            offset = _align_up(offset)
+            offset = _align_up(offset, max(_ALIGN, field.align))
             self._offsets[field.name] = offset
             offset += field.bytes_per_entry
 
@@ -282,9 +304,9 @@ class StateArena:
                 )
             if not buf.is_contiguous():
                 raise ValueError("buf must be contiguous")
-            if buf.storage_offset() % _ALIGN:
+            if buf.storage_offset() % self._align:
                 raise ValueError(
-                    f"buf must start on a {_ALIGN}B boundary, got storage "
+                    f"buf must start on a {self._align}B boundary, got storage "
                     f"offset {buf.storage_offset()}: field views retype the "
                     "buffer, which needs the offset to divide every itemsize"
                 )

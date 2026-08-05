@@ -56,6 +56,10 @@ the attention path already builds (`prefix_swa_indices` / `prefix_hca_indices`
 / `prefix_csa_indices`) are already split exactly that way.
 
 Dense layers keep no compressed KV at all, so they appear only in the entry.
+A layer whose window is wider than a plane's row — a DSpark draft layer, whose
+block attention wants unquantized KV where the pool is packed — appears in
+neither: it is `ABSENT_RATIO` here and its ring is a state field instead, still
+addressed by `WindowParams` through `field_window_params`.
 """
 
 from __future__ import annotations
@@ -67,11 +71,20 @@ DENSE_RATIO = 0
 CSA_RATIO = 4
 HCA_RATIO = 128
 
+# Not a compress ratio: a layer whose KV this row space does not hold at all.
+# A DSpark draft layer wants its window at a width the planes do not offer —
+# unquantized where the pool is packed — so the window becomes a state field
+# instead, and the layer reserves neither an envelope nor an entry here. It is
+# spelled as a ratio because that is the per-layer vocabulary the caller
+# already has; it never reaches `classes`, so asking one for its layout raises.
+ABSENT_RATIO = -1
+
 # Envelope order puts the narrow class first so a future one can be appended
 # without moving it. The entry leads with dense, the one class that has no
 # envelope part at all, which is what frees the two orders from having to agree.
 _ENVELOPE_ORDER = (HCA_RATIO, CSA_RATIO)
 _ENTRY_ORDER = (DENSE_RATIO, HCA_RATIO, CSA_RATIO)
+_KNOWN_RATIOS = frozenset(_ENTRY_ORDER) | {ABSENT_RATIO}
 
 
 def ring_offset_for(num_layers: int, ring_stride: int, ring_pos: int) -> int:
@@ -218,6 +231,7 @@ class UnifiedPoolGeometry:
         plane_rows: int | None = None,
         arena_rows: int = 0,
         slot_positions: int | None = None,
+        slot_align_rows: int = 2,
     ):
         """`ring_slots` is `win_with_spec` — the sliding window plus the draft
         lookahead,
@@ -231,12 +245,20 @@ class UnifiedPoolGeometry:
         currently need, leaving the surplus as the gap the two ends grow into.
         It defaults to exactly what they need, which pins the boundary.
 
+        `slot_align_rows` is the row multiple a slot's size is rounded to. Two
+        is enough for the compressor state alone (see `slot_rows`); a window
+        materialized at a width wider than a plane's row needs the slot to be a
+        multiple of that many rows as well, or the retyped view it is addressed
+        through does not divide evenly. The caller owns that arithmetic because
+        it owns the plane widths.
         """
         if not ratios:
             raise ValueError("a V4 pool needs at least one layer")
-        unknown = set(ratios) - set(_ENTRY_ORDER)
+        unknown = set(ratios) - _KNOWN_RATIOS
         if unknown:
             raise ValueError(f"unknown V4 compress ratios {sorted(unknown)}")
+        if slot_align_rows < 1:
+            raise ValueError(f"slot_align_rows must be positive, got {slot_align_rows}")
         if ring_slots < 1:
             raise ValueError(f"ring_slots must be positive, got {ring_slots}")
         if arena_rows < 0:
@@ -290,12 +312,14 @@ class UnifiedPoolGeometry:
         }
 
         # A slot's start is the one address the compressor state's alignment
-        # rests on, so it is rounded to an even row: the narrow plane is 128 B
-        # wide and `StateArena` retypes from a 256 B boundary. Rounding the slot
-        # rather than the window is what keeps `entry_rows` free of the
-        # constraint — the state sits at the front, offset zero.
-        self.slot_rows = arena_rows + self.entry_rows
-        self.slot_rows += self.slot_rows % 2
+        # rests on, so it is rounded up: the narrow plane is 128 B wide and
+        # `StateArena` retypes from a 256 B boundary, which alone wants an even
+        # row. Rounding the slot rather than the window is what keeps
+        # `entry_rows` free of the constraint — the state sits at the front,
+        # offset zero.
+        self.slot_align_rows = slot_align_rows
+        rows = arena_rows + self.entry_rows
+        self.slot_rows = -(-rows // slot_align_rows) * slot_align_rows
 
         block_rows = num_blocks * self.envelope_rows
         if plane_rows is None:
@@ -324,31 +348,6 @@ class UnifiedPoolGeometry:
                 f"the {slot_positions} positions it was told to number by"
             )
 
-    @classmethod
-    def windows_only(cls, of: UnifiedPoolGeometry) -> UnifiedPoolGeometry:
-        """The same slots, in a plane that holds nothing else.
-
-        A second window for the same requests, at a row this pool's planes
-        cannot express: the DSpark draft runs bf16 while the target pool may be
-        packed fp8, and a plane is one dtype. It could not join the shared dense
-        class either — that class's rows are interleaved through a slot rather
-        than sitting at its front, so a plane materializing them would have to
-        cover the whole slot region rather than one layer's worth of it.
-
-        So it is its own plane with one dense layer and no blocks, and it takes
-        the numbering rather than inventing one: both planes are handed the same
-        per-sequence slot, and a slot is a position, so it has to be a position
-        in the same range.
-        """
-        return cls(
-            [DENSE_RATIO],
-            num_blocks=0,
-            num_slots=of.num_slots,
-            ring_slots=of.ring_slots,
-            block_size=of.block_size,
-            slot_positions=of.slot_positions,
-        )
-
     def with_capacity(
         self, num_blocks: int, num_slots: int, plane_rows: int | None = None
     ) -> UnifiedPoolGeometry:
@@ -367,6 +366,7 @@ class UnifiedPoolGeometry:
             self.block_size,
             plane_rows,
             self.arena_rows,
+            slot_align_rows=self.slot_align_rows,
         )
 
     # ---- byte helpers ---------------------------------------------------
@@ -390,7 +390,13 @@ class UnifiedPoolGeometry:
     # ---- addressing -----------------------------------------------------
 
     def layer_class(self, layer_id: int) -> ClassLayout:
-        return self.classes[self.ratios[layer_id]]
+        ratio = self.ratios[layer_id]
+        if ratio == ABSENT_RATIO:
+            raise ValueError(
+                f"layer {layer_id} keeps no KV in this row space; its window is "
+                "a state field, so it has no class, no base row and no view"
+            )
+        return self.classes[ratio]
 
     def layer_base_row(self, layer_id: int) -> int:
         """Row a layer's view anchors at; it runs from there to the plane end.
@@ -464,6 +470,49 @@ class UnifiedPoolGeometry:
             ring_slots=self.ring_slots,
             ring_stride=cls.ring_stride,
             run_rows=cls.num_layers * cls.ring_stride,
+        )
+
+    def field_window_params(
+        self, field_offset_rows: int, rows_per_window_row: int
+    ) -> WindowParams:
+        """A window that lives in a state field rather than in the entry.
+
+        A layer whose KV is wider than a plane's row needs
+        `rows_per_window_row` of them per ring position, so it takes bytes off
+        the front of the slot like the compressor state and is read through a
+        view of the plane retyped to its own width, where those rows are one.
+        The same five scalars still describe it, counted in that view's rows:
+        the slot is that many times shorter and the ring starts at the field's
+        own offset.
+
+        A ratio of one — a layer whose KV happens to match the plane — is not a
+        special case: the expression below collapses to the field's offset,
+        which is what `window_params` would give a class placed there. Nothing
+        here branches on a dtype.
+        """
+        if rows_per_window_row < 1:
+            raise ValueError(
+                f"rows per window row must be positive, got {rows_per_window_row}"
+            )
+        for name, rows in (
+            ("slot", self.slot_rows),
+            ("field offset", field_offset_rows),
+        ):
+            if rows % rows_per_window_row:
+                raise ValueError(
+                    f"{name} of {rows} rows does not divide by the "
+                    f"{rows_per_window_row} plane rows one window row takes"
+                )
+        slot_rows = self.slot_rows // rows_per_window_row
+        return WindowParams(
+            ring_start=field_offset_rows // rows_per_window_row
+            - self.slot_origin * slot_rows,
+            slot_rows=slot_rows,
+            ring_slots=self.ring_slots,
+            # One run: the ring is contiguous here, since a field is not
+            # interleaved with anything the way a class's layers are.
+            ring_stride=self.ring_slots,
+            run_rows=self.ring_slots,
         )
 
     def physical_slot(self, group: int) -> int:

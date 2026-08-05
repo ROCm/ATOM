@@ -461,13 +461,13 @@ class DSparkLayer(Block):  # type: ignore[misc]
         # DeepseekV4AttentionMetadataBuilder.build_kv_cache_tensor at
         # allocate_kv_cache; see precompute_context_kv / dspark_attention.
         #
-        # What this layer's window has to be made of. DSpark's block attention
-        # runs bf16 — there is no fused fp8 kernel for its [window ++
-        # draft-block] shape and forcing one measured as a net regression — so
-        # under an fp8 target pool the builder owes it a private plane. Under a
-        # bf16 pool there is nothing to separate: this layer is already a dense
-        # layer of the shared row space and every slot reserves its rows.
-        self.attn.dspark_draft_dtype = torch.bfloat16
+        # What this layer's window has to be made of, which the pool reserves
+        # rather than infers. DSpark's block attention runs bf16 — there is no
+        # fused fp8 kernel for its [window ++ draft-block] shape and forcing
+        # one measured as a net regression. The day one lands, this line is the
+        # whole change: the pool prices the window off this dtype and lays it
+        # out the same way whether or not it matches the pool's own.
+        self.attn.window_kv_dtype = torch.bfloat16
 
     def reset_kv_cache(self, max_num_seqs: int, device, dtype) -> None:
         """No-op: draft KV is paged into the shared pool (bound at
@@ -549,20 +549,18 @@ class DSparkLayer(Block):  # type: ignore[misc]
         attn_md = fc.attn_metadata
         a = self.attn
         main_kv = self._compute_main_kv(main_x, positions)  # [T, head_dim]
-        # The SWA pool is allocated bf16 for DSpark draft layers regardless of the
-        # target's kv_cache_dtype, while main_kv carries the model dtype — two
-        # independent sources. Assert instead of casting so a mismatch surfaces
-        # here rather than as a silent per-step copy (or a silently reinterpreted
-        # store inside the swa_write kernel, which has no dtype guard).
-        # `raise`, not `assert`: a bare assert vanishes under `python -O`, and
-        # swa_write has no dtype guard, so the mismatch would become a silently
-        # reinterpreted store.
+        # The window was reserved at the dtype this layer declared in
+        # `window_kv_dtype`, while main_kv carries whatever the projections
+        # produce — two independent sources. Assert instead of casting so a
+        # mismatch surfaces here rather than as a silent per-step copy, or as a
+        # silently reinterpreted store inside swa_write, which has no dtype
+        # guard. `raise`, not `assert`: a bare assert vanishes under `python -O`.
         if main_kv.dtype != a.swa_plane.dtype:
             raise TypeError(
-                f"DSpark draft KV dtype {main_kv.dtype} != SWA pool dtype "
-                f"{a.swa_plane.dtype}. The draft pool is allocated bf16 "
-                "unconditionally; a non-bf16 --dtype needs that allocation "
-                "widened, not a cast here."
+                f"DSpark draft KV dtype {main_kv.dtype} != window dtype "
+                f"{a.swa_plane.dtype}, which is what this layer asked the pool "
+                "to reserve. Change `window_kv_dtype` to match the projections, "
+                "not cast here."
             )
         B = cu_seqlens_q.shape[0] - 1
         swa_write(
