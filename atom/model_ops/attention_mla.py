@@ -123,6 +123,39 @@ _MLA_Q_OUT_PADDED_DIM = 768
 _MLA_SEG_KV_LORA_RANK = 512
 _MLA_SEG_PE_DIM = 64
 
+# DIAGNOSTIC (DCP/DCP_Sparse_MLA.md §5.5): set ATOM_DSA_DCP_PREFILL_MERGE=0 to run
+# the DCP sparse prefill WITHOUT the cross-rank merge (P3) while keeping the
+# indexer gather (P1) and the compact filter (P2). The output is wrong by
+# construction -- each rank keeps only its own partial softmax -- but it isolates
+# a fault in the compacted indices from a fault in the q all-gather / LSE merge.
+_DSA_DCP_PREFILL_MERGE = os.environ.get("ATOM_DSA_DCP_PREFILL_MERGE", "1") == "1"
+
+# DIAGNOSTIC: ATOM_DSA_ATTN_DUMP=<dir>[:<l0,l1,...>] -- dump the prefill attention
+# output (post o_proj) of the listed layers, for the first two prefill calls of
+# the process. One run therefore yields BOTH a depth profile and a same-input
+# repeat, which together separate "the DCP sparse-prefill math is wrong" from
+# "something is nondeterministic" and show where either starts. Layers default
+# to just 0.
+_DSA_ATTN_DUMP_SPEC = os.environ.get("ATOM_DSA_ATTN_DUMP", "")
+_DSA_ATTN_DUMP = _DSA_ATTN_DUMP_SPEC.split(":")[0] if _DSA_ATTN_DUMP_SPEC else ""
+_DSA_ATTN_DUMP_LAYERS = frozenset(
+    int(x) for x in _DSA_ATTN_DUMP_SPEC.split(":")[1].split(",")
+) if ":" in _DSA_ATTN_DUMP_SPEC else frozenset({0})
+# one counter per layer: how many prefill calls of that layer we have dumped
+_dsa_attn_dump_count = {}
+
+# DIAGNOSTIC: ATOM_DSA_DCP_MERGE_FP32=1 -- run the DCP prefill merge in fp32.
+_DSA_DCP_MERGE_FP32 = os.environ.get("ATOM_DSA_DCP_MERGE_FP32", "0") == "1"
+
+# DIAGNOSTIC: ATOM_DSA_FORCE_DECODE_KERNEL=1 -- use mla_decode_fwd for sparse
+# prefill even when no LSE is needed. dcp=1 otherwise runs mla_prefill_fwd while
+# dcp>1 runs mla_decode_fwd, so a dcp=1 vs dcp=N comparison confounds "DCP is
+# wrong" with "the two kernels differ numerically". Setting this on the dcp=1
+# reference removes that confound.
+_DSA_FORCE_DECODE_KERNEL = (
+    os.environ.get("ATOM_DSA_FORCE_DECODE_KERNEL", "0") == "1"
+)
+
 if False:
     try:
         from aiter.ops.triton.fused_gemm_a8w8_blockscale_split_cat import (
@@ -341,6 +374,17 @@ class MLAAttention(nn.Module):
         # metadata builder to the shared buffer (see aiter_mla.py).
         self.dcp_sparse_kv_indptr_buffer = None
         self.dcp_owned_counts_buffer = None
+
+        # DIAGNOSTIC (DCP/DCP_Sparse_MLA.md §6.4): force sparse decode onto the
+        # non-persistent kernel even at dcp=1, to measure what persistent
+        # actually buys for sparse decode. Read once to keep it out of forward.
+        self._dsa_force_nonpersist = (
+            os.environ.get("ATOM_DSA_FORCE_NONPERSIST", "0") == "1"
+        )
+        # DIAGNOSTIC: keep prefill dense under DCP at any prompt length.
+        self._dsa_dcp_dense_prefill = (
+            os.environ.get("ATOM_DSA_DCP_DENSE_PREFILL", "0") == "1"
+        )
 
     def _pad_query_heads(self, q: torch.Tensor) -> torch.Tensor:
         if self.head_repeat_factor > 1:
@@ -1027,6 +1071,7 @@ class MLAAttention(nn.Module):
         q: torch.Tensor,
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: AttentionMetaData,
+        return_lse: bool = False,
     ) -> torch.Tensor:
         assert attn_metadata is not None
         B = q.shape[0]
@@ -1062,15 +1107,49 @@ class MLAAttention(nn.Module):
             # Sparse attention needs one last-page len per query token; the dense
             # kv_last_page_lens (per-seq) would over-read -> illegal access.
             kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens
+            if self.dcp_world_size > 1:
+                # The indexer compacted this rank's owned candidates to the front
+                # of each query token's region, so the region lengths are the
+                # per-rank (and per-layer) ones, not the global sparse_kv_indptr.
+                # Same substitution the decode path makes. See §5.5.5 (P2/P3).
+                #
+                # MUST be sliced, unlike the decode path: mla_prefill_asm_fwd
+                # derives its grid from `kv_indptr->size(0) - 1`
+                # (asm_mla.cu:1208) whereas both decode entries use
+                # `qo_indptr->size(0) - 1`. Handing it the whole
+                # max_num_batched_tokens-sized buffer launches ~32k rows over
+                # stale tail entries and faults instantly.
+                paged_kv_indptr = self.dcp_sparse_kv_indptr_buffer[
+                    : paged_cu_seqlens_q.shape[0]
+                ]
             max_q_len = 1
 
+        final_lse = None
         if kv_c_and_k_pe_cache.numel() > 0:
             if envs.ATOM_MLA_PAGE_SIZE is not None:
                 page_size = envs.ATOM_MLA_PAGE_SIZE
             else:
                 page_size = 1
-            if self.kv_cache_dtype.startswith("fp8"):
-                mla_decode_fwd(
+            # `mla_prefill_asm_fwd` NEVER writes its LSE output: aiter allocates
+            # attn_lse with torch.empty and hands the uninitialized buffer straight
+            # back (verified with a sentinel probe, DCP_Sparse_MLA.md §5.5.9 --
+            # 80/80 entries untouched). So whenever an LSE is required, route
+            # through the decode kernel instead. That is sound for sparse prefill
+            # because it runs max_q_len=1: every query token is already its own row
+            # with its own candidate list, i.e. structurally a decode. The fp8 path
+            # has always used this kernel; `return_lse` extends it to bf16.
+            use_decode_kernel = (
+                self.kv_cache_dtype.startswith("fp8")
+                or return_lse
+                or _DSA_FORCE_DECODE_KERNEL
+            )
+            if use_decode_kernel:
+                is_fp8 = self.kv_cache_dtype.startswith("fp8")
+                # DCP compacts each rank's candidates per layer, so the once-per-step
+                # persistent work metadata (built from the GLOBAL sparse_kv_indptr)
+                # does not describe this rank's regions -- run non-persistent.
+                use_work_meta = is_fp8 and self.dcp_world_size <= 1
+                _, final_lse = mla_decode_fwd(
                     q,
                     kv_c_and_k_pe_cache.view(-1, page_size, 1, q.shape[-1]),
                     o,
@@ -1080,27 +1159,50 @@ class MLAAttention(nn.Module):
                     kv_last_page_lens,
                     max_q_len,
                     page_size=page_size,
+                    # Mirror the decode path's explicit choice. Leaving this None
+                    # lets aiter pick, and several of its dispatch branches key on
+                    # `num_kv_splits == 1`, which sends stage2 down the FINAL_OUT
+                    # copy-through path that NEVER stores Final_lse -- handing back
+                    # an untouched torch.empty as the LSE (the same trap as §4.4
+                    # and as the asm-prefill LSE bug). Keep it > 1 so stage2 stays
+                    # on the reduce path that writes the LSE.
+                    num_kv_splits=max(2, 16 // max(1, self.dcp_world_size)),
                     sm_scale=self.scale,
-                    q_scale=self._q_scale,
-                    kv_scale=self._k_scale,
-                    work_meta_data=getattr(
-                        attn_metadata, "sparse_prefill_work_meta_data", None
+                    q_scale=self._q_scale if is_fp8 else None,
+                    kv_scale=self._k_scale if is_fp8 else None,
+                    work_meta_data=(
+                        getattr(attn_metadata, "sparse_prefill_work_meta_data", None)
+                        if use_work_meta
+                        else None
                     ),
-                    work_indptr=getattr(
-                        attn_metadata, "sparse_prefill_work_indptr", None
+                    work_indptr=(
+                        getattr(attn_metadata, "sparse_prefill_work_indptr", None)
+                        if use_work_meta
+                        else None
                     ),
-                    work_info_set=getattr(
-                        attn_metadata, "sparse_prefill_work_info_set", None
+                    work_info_set=(
+                        getattr(attn_metadata, "sparse_prefill_work_info_set", None)
+                        if use_work_meta
+                        else None
                     ),
-                    reduce_indptr=getattr(
-                        attn_metadata, "sparse_prefill_reduce_indptr", None
+                    reduce_indptr=(
+                        getattr(attn_metadata, "sparse_prefill_reduce_indptr", None)
+                        if use_work_meta
+                        else None
                     ),
-                    reduce_final_map=getattr(
-                        attn_metadata, "sparse_prefill_reduce_final_map", None
+                    reduce_final_map=(
+                        getattr(attn_metadata, "sparse_prefill_reduce_final_map", None)
+                        if use_work_meta
+                        else None
                     ),
-                    reduce_partial_map=getattr(
-                        attn_metadata, "sparse_prefill_reduce_partial_map", None
+                    reduce_partial_map=(
+                        getattr(
+                            attn_metadata, "sparse_prefill_reduce_partial_map", None
+                        )
+                        if use_work_meta
+                        else None
                     ),
+                    return_lse=return_lse,
                 )
             else:
                 mla_prefill_fwd(
@@ -1118,6 +1220,27 @@ class MLAAttention(nn.Module):
                 )
 
         o = self._restore_query_heads(o, num_heads_q)
+        if final_lse is not None:
+            final_lse = self._restore_query_heads(final_lse, num_heads_q)
+
+        if return_lse:
+            assert final_lse is not None, (
+                "return_lse requested but the attention kernel produced no LSE "
+                "(empty KV cache?)"
+            )
+            if self.is_sparse_mla and self.dcp_world_size > 1:
+                # Rows this rank owns no candidate of (unavoidable at prefill:
+                # query token 0 has a single candidate, so W-1 ranks are empty for
+                # it -- §5.5.8) get a zero-length KV region. mla_decode_fwd handles
+                # that correctly for the LSE (-inf, i.e. zero weight downstream)
+                # but leaves `o` as NaN from the 0/0 in acc/e_sum. Zero those rows:
+                # cp_lse_ag_out_rs computes `o * exp(lse - global_lse)`, and
+                # NaN * 0 would poison the whole merged row. Derived from the
+                # kernel's own LSE, so no side-channel buffer and no fake KV.
+                o = torch.where(
+                    torch.isfinite(final_lse).unsqueeze(-1), o, torch.zeros_like(o)
+                )
+            return o, final_lse
 
         return self._v_up_proj_and_o_proj(o)
 
@@ -1270,7 +1393,9 @@ class MLAAttention(nn.Module):
             # timing simply does not line up. Run non-persistent until either the
             # metadata build moves per-layer or aiter grows a per-request valid
             # length (§5.5).
-            if self.is_sparse_mla and self.dcp_world_size > 1:
+            if self.is_sparse_mla and (
+                self.dcp_world_size > 1 or self._dsa_force_nonpersist
+            ):
                 use_persistent_mode = False
 
             # Sparse layers in MTP verify use separate persistent metadata
@@ -1440,6 +1565,12 @@ class MLAAttention(nn.Module):
         use_prefill_mla = (
             self.is_sparse_mla and attn_metadata.max_seqlen_k > self.topk_tokens
         )
+        # DIAGNOSTIC (see ATOM_DSA_DCP_DENSE_PREFILL in deepseek_v2.py): keep
+        # prefill on the dense path under DCP regardless of prompt length, to
+        # separate a sparse-prefill fault from a sparse-decode one. The indexer
+        # skips writing top-k indices under the same env, so this must flip with it.
+        if self._dsa_dcp_dense_prefill:
+            use_prefill_mla = False
         if forward_context.context.is_dummy_run:
             output_shape = list(q.shape)
             atom_config = get_current_atom_config()
@@ -1651,7 +1782,42 @@ class MLAAttention(nn.Module):
                     )
 
             if context.is_prefill:
-                output = self._forward_prefill_mla(q_out, kv_cache, attn_metadata)
+                if (
+                    self.is_sparse_mla
+                    and self.dcp_world_size > 1
+                    and _DSA_DCP_PREFILL_MERGE
+                ):
+                    # DCP sparse prefill: the indexer left each rank with a
+                    # DISJOINT slice of the global top-k (§5.5.5 P2), so this is
+                    # a partial softmax that must be merged exactly like decode.
+                    # Legal because sparse prefill runs max_q_len=1 -- every query
+                    # token is its own row with its own candidate list, and the
+                    # causal window was already applied when the candidates were
+                    # chosen, so no global-position masking is needed (§5.5.6 ③).
+                    from atom.model_ops.dcp_ops import cp_lse_ag_out_rs
+
+                    q_out = self.dcp_group.all_gather(q_out, dim=1)
+                    o, lse = self._forward_prefill_mla(
+                        q_out, kv_cache, attn_metadata, return_lse=True
+                    )
+                    # DIAGNOSTIC (§5.5): cp_lse_ag_out_rs runs entirely in the
+                    # attention dtype -- correct_attn_out rescales in place and the
+                    # ReduceScatter sums W partials. In bf16 that is one extra
+                    # rounding per rank per layer, on top of dcp=1's single fp32
+                    # accumulation inside the kernel. Prefill chains 78 such layers,
+                    # so promote to fp32 to measure how much of the observed
+                    # divergence is merge precision.
+                    if _DSA_DCP_MERGE_FP32:
+                        o = cp_lse_ag_out_rs(
+                            o.float(), lse, self.dcp_group, ctx=None
+                        ).to(o.dtype)
+                    else:
+                        o = cp_lse_ag_out_rs(
+                            o, lse, self.dcp_group, ctx=self._cp_triton_ctx
+                        )
+                    output = self._v_up_proj_and_o_proj(o)
+                else:
+                    output = self._forward_prefill_mla(q_out, kv_cache, attn_metadata)
             elif self.dcp_world_size > 1:
                 # DCP decode: AllGather Q on the head dim, decode locally with LSE,
                 # then combine partial outputs across ranks (AG LSE + correct + RS).
@@ -1666,6 +1832,38 @@ class MLAAttention(nn.Module):
             else:
                 output = self._forward_decode(q_out, kv_cache, attn_metadata)
 
+        if (
+            _DSA_ATTN_DUMP
+            and context.is_prefill
+            and self.layer_num in _DSA_ATTN_DUMP_LAYERS
+            and _dsa_attn_dump_count.get(self.layer_num, 0) < 2
+            and torch.distributed.get_rank() == 0
+        ):
+            # Prefill output of one layer, post o_proj: identical shape and meaning at
+            # dcp=1 and dcp=N (TP sharding is already all-reduced away), so it is
+            # the one tensor that directly answers "is the DCP sparse-prefill
+            # attention + merge numerically right?" (DCP_Sparse_MLA.md §5.5).
+            _n = _dsa_attn_dump_count.get(self.layer_num, 0)
+            _dsa_attn_dump_count[self.layer_num] = _n + 1
+            import numpy as _np
+
+            _np.savez(
+                f"{_DSA_ATTN_DUMP}/attn_L{self.layer_num}"
+                f"_w{self.dcp_world_size}_r{_n}.npz",
+                out_tail=output[-4:].float().cpu().numpy(),
+                # Strided subsample across ALL rows. The tail-4 max|diff| used
+                # earlier has almost no statistical power: at |o|~6e-3 the bf16
+                # ULP is 1.5e-5, so a systematic error below ~0.25% relative is
+                # invisible in a max over 4 rows. What discriminates is the
+                # FRACTION of differing elements over many rows (§5.5).
+                out_sub=output[::7, ::13].float().cpu().numpy(),
+                shape=_np.asarray(list(output.shape)),
+            )
+            print(
+                f"[DSA-ATTN-DUMP] L={self.layer_num} "
+                f"w={self.dcp_world_size} run={_n} shape={tuple(output.shape)}",
+                flush=True,
+            )
         return output
 
     def forward(
@@ -2144,6 +2342,210 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
         bt_stride1,
     )
     return new_kv_indices
+
+
+@triton.jit
+def _count_owned_dcp_prefill_kernel(
+    dsa_kv_indptr,  # int32 [num_tokens + 1] -- GLOBAL per-token candidate counts
+    token_to_seq_idxs,  # int32 [num_tokens]
+    topk_indices,  # int32 [num_tokens, NUM_TOPK_TOKENS] -- FLAT KV indices
+    cu_seqlens_k,  # int32 [num_req + 1] -- per-seq base of the flat KV axis
+    out_counts,  # int32 [num_tokens]
+    DCP_RANK: tl.constexpr,
+    DCP_WORLD: tl.constexpr,
+    NUM_TOPK_TOKENS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    ti_stride0: tl.int64,
+    ti_stride1: tl.constexpr,
+):
+    """Pass 1 of the compacting DCP filter for sparse PREFILL: how many of the
+    global top-k candidates does this rank own, per QUERY TOKEN?
+
+    Differs from the decode twin (`_count_owned_dcp_kernel`) in two ways:
+    the row unit is a query token rather than a request (prefill has many query
+    tokens per request), and `topk_indices` holds a FLAT index into the
+    concatenated KV of all sequences, so the within-sequence position -- which
+    is what the round-robin owner is derived from -- is `indice - cu_seqlens_k[req]`.
+    """
+    token_id = tl.program_id(0)
+    req_id = tl.load(token_to_seq_idxs + token_id)
+    kv_start = tl.load(dsa_kv_indptr + token_id)
+    kv_len = tl.load(dsa_kv_indptr + token_id + 1) - kv_start
+    base = tl.load(cu_seqlens_k + req_id)
+
+    count = 0
+    for tile_start in range(0, NUM_TOPK_TOKENS, BLOCK_N):
+        col_id = tile_start + tl.arange(0, BLOCK_N)
+        col_valid = (col_id < kv_len) & (col_id < NUM_TOPK_TOKENS)
+        indice = tl.load(
+            topk_indices + token_id * ti_stride0 + col_id * ti_stride1,
+            mask=col_valid,
+            other=-1,
+        )
+        pos = indice - base  # position within the sequence
+        owned = col_valid & (indice >= 0) & ((pos % DCP_WORLD) == DCP_RANK)
+        count += tl.sum(owned.to(tl.int32))
+
+    tl.store(out_counts + token_id, count)
+
+
+@triton.jit
+def _compact_filter_dcp_prefill_kernel(
+    dsa_kv_indptr,  # int32 [num_tokens + 1] -- GLOBAL per-token candidate counts
+    out_kv_indptr,  # int32 [num_tokens + 1] -- COMPACTED offsets (cumsum of pass 1)
+    token_to_seq_idxs,  # int32 [num_tokens]
+    topk_indices,  # int32 [num_tokens, NUM_TOPK_TOKENS] -- FLAT KV indices
+    cu_seqlens_k,  # int32 [num_req + 1]
+    block_table,  # int32 [num_req, max_num_blocks_per_req] -- logical(global) blocks
+    out_kv_indices,  # int32 [>= out_kv_indptr[-1]]
+    DCP_RANK: tl.constexpr,
+    DCP_WORLD: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,  # runner (physical) block size
+    NUM_TOPK_TOKENS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    ti_stride0: tl.int64,
+    ti_stride1: tl.constexpr,
+    bt_stride0: tl.int64,
+    bt_stride1: tl.constexpr,
+):
+    """Pass 2 for sparse PREFILL: keep only this rank's owned candidates, map
+    them through the round-robin (virtual-block) layout, and pack them to the
+    front of the token's region.
+
+        vbs  = PAGE_SIZE * W
+        slot = block_table[req, pos // vbs] * PAGE_SIZE + (pos % vbs) // W
+
+    Same rationale as the decode twin: no `-1` holes (they break aiter's lse
+    path, §4.3/§4.4) and compaction is order-preserving so the fp accumulation
+    order is deterministic. See DCP/DCP_Sparse_MLA.md §5.5.5 (P2).
+    """
+    token_id = tl.program_id(0)
+    req_id = tl.load(token_to_seq_idxs + token_id)
+    kv_start = tl.load(dsa_kv_indptr + token_id)
+    kv_len = tl.load(dsa_kv_indptr + token_id + 1) - kv_start
+    base = tl.load(cu_seqlens_k + req_id)
+    out_kv_start = tl.load(out_kv_indptr + token_id)
+
+    vbs = PAGE_SIZE * DCP_WORLD
+    written = 0
+    for tile_start in range(0, NUM_TOPK_TOKENS, BLOCK_N):
+        col_id = tile_start + tl.arange(0, BLOCK_N)
+        col_valid = (col_id < kv_len) & (col_id < NUM_TOPK_TOKENS)
+        indice = tl.load(
+            topk_indices + token_id * ti_stride0 + col_id * ti_stride1,
+            mask=col_valid,
+            other=-1,
+        )
+        pos = indice - base
+        idx_valid = col_valid & (indice >= 0) & ((pos % DCP_WORLD) == DCP_RANK)
+
+        block_id = pos // vbs
+        inblock_offset = (pos % vbs) // DCP_WORLD
+        physical_block = tl.load(
+            block_table + req_id * bt_stride0 + block_id * bt_stride1,
+            mask=idx_valid,
+            other=0,
+        )
+        slot = physical_block * PAGE_SIZE + inblock_offset
+
+        owned_i32 = idx_valid.to(tl.int32)
+        dst = written + tl.cumsum(owned_i32, axis=0) - owned_i32
+        tl.store(out_kv_indices + out_kv_start + dst, slot, mask=idx_valid)
+        written += tl.sum(owned_i32)
+
+    # A row this rank owns nothing of is left EMPTY (zero-length region). That is
+    # both legal and correct for mla_decode_fwd: it writes lse = -inf, which
+    # cp_lse_ag_out_rs turns into a zero weight. Its `o` comes out NaN (0/0), so
+    # the caller zeroes those rows -- see _forward_prefill_mla. No dummy candidate
+    # is injected; the attention never sees fabricated KV. (§5.5.8 / §5.7)
+
+
+def triton_filter_and_convert_dcp_index_prefill(
+    dsa_kv_indptr: torch.Tensor,  # int32 [num_tokens + 1] GLOBAL counts
+    token_to_seq_idxs: torch.Tensor,  # int32 [num_tokens]
+    topk_indices: torch.Tensor,  # int32 [num_tokens, NUM_TOPK_TOKENS] FLAT indices
+    cu_seqlens_k: torch.Tensor,  # int32 [num_req + 1]
+    block_table: torch.Tensor,  # int32 [num_req, max_num_blocks_per_req] logical
+    dcp_rank: int,
+    dcp_world_size: int,
+    block_size: int,  # runner (physical) block size == PAGE_SIZE
+    out_kv_indptr: torch.Tensor,  # int32 [num_tokens + 1] COMPACTED, written here
+    owned_counts: torch.Tensor,  # int32 [>= num_tokens] scratch for pass 1
+    NUM_TOPK_TOKENS: int = 2048,
+    BLOCK_N: int = 128,
+    out: Optional[torch.Tensor] = None,
+):
+    """Sparse-PREFILL twin of ``triton_filter_and_convert_dcp_index``.
+
+    The decode version keys on requests (qlen==1); prefill has one row per query
+    token and its ``topk_indices`` are flat KV indices rather than
+    within-sequence positions. Everything else -- two passes, in-place int32
+    cumsum, order-preserving compaction -- is identical, and the same
+    layer-scoped buffers are reused (they are sized ``max_num_batched_tokens``,
+    which bounds the prefill token count too).
+    """
+    assert topk_indices.dtype == torch.int32
+    assert topk_indices.shape[1] == NUM_TOPK_TOKENS
+    assert NUM_TOPK_TOKENS % BLOCK_N == 0, (
+        f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) must be divisible by"
+        f"BLOCK_N ({BLOCK_N})"
+    )
+    assert 0 <= dcp_rank < dcp_world_size
+    assert out is not None, "sparse_kv_indices_buffer (out) is required"
+
+    num_tokens = dsa_kv_indptr.shape[0] - 1
+
+    dsa_kv_indptr_c = dsa_kv_indptr.contiguous()
+    token_to_seq_idxs_c = token_to_seq_idxs.contiguous()
+    topk_indices_c = topk_indices.contiguous()
+    cu_seqlens_k_c = cu_seqlens_k.contiguous()
+    block_table_c = block_table.contiguous()
+
+    ti_stride0, ti_stride1 = topk_indices_c.stride()
+    bt_stride0, bt_stride1 = block_table_c.stride()
+    grid = (num_tokens,)
+
+    counts = owned_counts[:num_tokens]
+    _count_owned_dcp_prefill_kernel[grid](
+        dsa_kv_indptr_c,
+        token_to_seq_idxs_c,
+        topk_indices_c,
+        cu_seqlens_k_c,
+        counts,
+        dcp_rank,
+        dcp_world_size,
+        NUM_TOPK_TOKENS,
+        BLOCK_N,
+        ti_stride0,
+        ti_stride1,
+    )
+
+    # Same device-side-only cumsum as the decode path (see its comment for why
+    # zero_() and dtype=torch.int32 are required).
+    out_kv_indptr[:1].zero_()
+    torch.cumsum(
+        counts, dim=0, dtype=torch.int32, out=out_kv_indptr[1 : num_tokens + 1]
+    )
+
+    _compact_filter_dcp_prefill_kernel[grid](
+        dsa_kv_indptr_c,
+        out_kv_indptr,
+        token_to_seq_idxs_c,
+        topk_indices_c,
+        cu_seqlens_k_c,
+        block_table_c,
+        out,
+        dcp_rank,
+        dcp_world_size,
+        block_size,
+        NUM_TOPK_TOKENS,
+        BLOCK_N,
+        ti_stride0,
+        ti_stride1,
+        bt_stride0,
+        bt_stride1,
+    )
+    return out
 
 
 @triton.jit
