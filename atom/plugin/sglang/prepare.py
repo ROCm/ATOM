@@ -90,6 +90,20 @@ def prepare_model(config: Any):
         "Qwen3_5MoeForConditionalGeneration",
     }:
         register_ops_to_sglang(atom_config=atom_config)
+
+    # Qwen3.5 is the only family that runs DFLASH on the ATOM plugin today.
+    # SGLang's draft greedy sampler assumes a head without `shard_indices` is
+    # not vocab-parallel, which is wrong for ATOM's ParallelLMHead and yields
+    # garbage draft tokens at TP>1; see dflash_lm_head_bridge for the details.
+    if model_arch in {
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+    }:
+        from atom.plugin.sglang.dflash_lm_head_bridge import (
+            install_dflash_lm_head_patch,
+        )
+
+        install_dflash_lm_head_patch()
     set_attn_cls()
 
     # Init aiter dist for using aiter custom collective ops.
