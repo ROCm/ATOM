@@ -442,7 +442,7 @@ class _RealSparseMlaImpl:
                 and kv_cache_base.dtype != _aiter_fp8
             ):
                 kv_cache_base = kv_cache_base.view(_aiter_fp8)
-        except ImportError:  # noqa: S110
+        except ImportError:
             pass
         try:
             concat_and_cache_mla(
@@ -1248,7 +1248,7 @@ class _RealSparseMlaImpl:
                     and q_for_kernel.dtype != _aiter_fp8_dec
                 ):
                     q_for_kernel = q_for_kernel.view(_aiter_fp8_dec)
-            except ImportError:  # noqa: S110
+            except ImportError:
                 pass
             kv_buffer = kv_cache_base.reshape(-1, 1, 1, latent_dim)
             if (
