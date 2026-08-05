@@ -461,7 +461,16 @@ class FusedMoEModularKernel(torch.nn.Module):
         if triton_experts is not None:
             from atom.model_ops.fused_moe_triton import (
                 routing_from_dispatched,
+                triton_kernel_fused_experts_a4w4_silu_gugu,
                 triton_kernel_fused_experts_a8w4_silu_gugu,
+            )
+
+            # a4w4 takes the same signature and the same weights (both are w4);
+            # only the activation quant differs, so the switch is just this.
+            fused_experts_fn = (
+                triton_kernel_fused_experts_a4w4_silu_gugu
+                if envs.ATOM_USE_TRITON_MOE_EP_A4W4
+                else triton_kernel_fused_experts_a8w4_silu_gugu
             )
 
             routing_data, gather_idx, scatter_idx, gate_valid = routing_from_dispatched(
@@ -474,7 +483,7 @@ class FusedMoEModularKernel(torch.nn.Module):
             # gate_scal carries the dispatched router weights, and
             # apply_router_weight_on_input is False (mori asserts it), so GEMM2
             # applies them -- same split as flydsl's doweight_stage1=False.
-            fused_out = triton_kernel_fused_experts_a8w4_silu_gugu(
+            fused_out = fused_experts_fn(
                 dispatch_a1,
                 triton_experts["w13_weight"],
                 triton_experts["w2_weight"],

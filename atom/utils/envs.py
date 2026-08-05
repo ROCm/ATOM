@@ -72,6 +72,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # intermediate. Off by default: the trim bound must be an upper bound on
     # received rows or it silently drops tokens.
     "ATOM_EP_TRIM_PREFILL": lambda: os.getenv("ATOM_EP_TRIM_PREFILL", "0") == "1",
+    # Use the a4w4 (MXFP4 activation) triton MoE instead of a8w4 (MXFP8) on the
+    # EP path. Requires ATOM_USE_TRITON_MOE_EP=1; ignored otherwise. Weights are
+    # identical -- both are w4 -- so no extra weight prep or memory.
+    #
+    # Measured 1.22-1.28x SLOWER than a8w4 on gfx950, and GSM8K 0.9424/0.9454 vs
+    # a8w4's 0.9575 (see _test/ep_moe_bench_report.md). Both regressions have the
+    # same root cause: moe_gemm_a4w4 has no out_mx_quant, so the intermediate
+    # takes a second mxfp4_quant -- a second expensive launch AND a second
+    # rounding to 4 bits. Off by default; kept so the trade-off can be
+    # re-measured on gfx1250.
+    #
+    # REQUIRES MAX_NUM_BATCHED_TOKENS <= 8192 on gfx950 (with 8 ranks). The
+    # second mxfp4_quant lifts the MoE's transient peak to ~18.4 GB against
+    # a8w4's ~15.5 GB at the profile-run shape, and a8w4 is already marginal at
+    # mbt=16384. Over that, the profile run dies with "Memory access fault by GPU
+    # node-N" on every rank rather than a clean OOM. Lowering
+    # --gpu-memory-utilization does NOT help: it shrinks the KV budget, which is
+    # allocated after the profile run, not the transients during it.
+    "ATOM_USE_TRITON_MOE_EP_A4W4": lambda: os.getenv("ATOM_USE_TRITON_MOE_EP_A4W4", "0")
+    == "1",
     # TEMPORARY: which EP routing prep+sort implementation to use.
     #   1 = ep_sort_routing_v1 -- 3 kernels, mirrors flydsl's opus_moe_sorting:
     #       an [expert, token] mesh, then a per-expert walk emitting contiguous

@@ -913,6 +913,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self.use_triton_decode = False
             self.use_triton_ep = False
 
+        # ATOM_USE_TRITON_MOE_EP_A4W4 only selects which Triton EP wrapper runs;
+        # it cannot enable the EP path on its own. Fail loudly rather than
+        # silently running a8w4 (or flydsl) when a4w4 was asked for.
+        assert not (envs.ATOM_USE_TRITON_MOE_EP_A4W4 and not self.use_triton_ep), (
+            "ATOM_USE_TRITON_MOE_EP_A4W4=1 requires the Triton EP path, but it is "
+            f"off (ATOM_USE_TRITON_MOE_EP={int(envs.ATOM_USE_TRITON_MOE_EP)}, "
+            f"is_guinterleave={self.is_guinterleave}, "
+            f"eplb_enable={getattr(get_current_atom_config(), 'eplb_enable', False)})."
+        )
+
     def create_weights(
         self,
         layer: torch.nn.Module,

@@ -1196,3 +1196,85 @@ def triton_kernel_fused_experts_a8w4_silu_gugu(
         # dead slots are already skipped by the sentinel histogram.
         gate_valid=gate_valid,
     )
+
+
+def triton_kernel_fused_experts_a4w4_silu_gugu(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    routing_data,
+    gather_indx,
+    scatter_indx,
+    w13_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    w13_swizzle_layout,
+    w2_swizzle_layout,
+    a13_scale: torch.Tensor | None = None,
+    a2_scale: torch.Tensor | None = None,
+    w1_bias: torch.Tensor | None = None,
+    w2_bias: torch.Tensor | None = None,
+    swiglu_limit: float = 10.0,
+    apply_router_weight_on_input: bool = False,
+    gate_valid: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """A4W4 MoE for SiLU models, GUGU -- same signature as the a8w4 twin.
+
+    Identical to ``triton_kernel_fused_experts_a8w4_silu_gugu`` except that the
+    activations are MXFP4 rather than MXFP8. The WEIGHTS are unchanged: both are
+    w4, so the same ``process_weights_after_loading`` output feeds either path
+    and no extra weight prep or memory is needed.
+
+    Costs one launch more than a8w4. ``moe_gemm_a4w4`` has no ``out_mx_quant``,
+    so the intermediate must be re-quantised by a separate ``mxfp4_quant``
+    instead of being folded into GEMM1's write-back:
+
+        mxfp4_quant -> GEMM1(a4w4, fused SiLU) -> mxfp4_quant -> GEMM2(a4w4)
+
+    versus a8w4's two launches. Measured on gfx950 that costs 1.22-1.28x overall
+    (see _test/ep_moe_bench_report.md): the a4w4 GEMMs are genuinely faster
+    (2771 vs 3154 us at conc256 prefill, the halved weight traffic paying off)
+    but the doubled quant is far more expensive than the GEMM saving. Kept behind
+    ATOM_USE_TRITON_MOE_EP_A4W4 so it is measurable on gfx1250, where the
+    trade-off may differ.
+
+    ``moe_gemm_a4w4`` has no ``preshuffled`` parameter, so unlike a8w4 there is no
+    gfx1250 pre-shuffled weight variant to select here.
+    """
+    gammas = routing_data.gate_scal if routing_data else None
+
+    x_fp4, x_scale = mxfp4_quant(hidden_states)
+    interm = moe_gemm_a4w4(
+        x_fp4,
+        w1,
+        x_scale,
+        w13_scale,
+        a13_scale,
+        None,
+        w1_bias,
+        routing_data,
+        gather_indx=gather_indx,
+        gammas=gammas if apply_router_weight_on_input else None,
+        swizzle_mx_scale=w13_swizzle_layout,
+        apply_swiglu=True,
+        alpha=1.0,
+        limit=swiglu_limit,
+        swiglu_add_residual=False,
+    )
+    # The launch a8w4 avoids via out_mx_quant=True.
+    interm_fp4, interm_scale = mxfp4_quant(interm)
+    return moe_gemm_a4w4(
+        interm_fp4,
+        w2,
+        interm_scale,
+        w2_scale,
+        a2_scale,
+        None,
+        w2_bias,
+        routing_data,
+        scatter_indx=scatter_indx,
+        gammas=None if apply_router_weight_on_input else gammas,
+        swizzle_mx_scale=w2_swizzle_layout,
+        # Only GEMM2 feeds reduce_grouped, so the mask belongs here. GEMM1's
+        # dead slots are already skipped by the sentinel histogram.
+        gate_valid=gate_valid,
+    )
