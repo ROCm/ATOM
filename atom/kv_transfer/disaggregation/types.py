@@ -133,6 +133,11 @@ class ReqMeta:
     remote_tp_size: int = 0
     transfer_id: int = 0
     local_slot_index: int = -1
+
+    # PD incremental transfer: leading prompt blocks the decode node already
+    # holds from a prior turn's prefix cache. Both sides skip these — only
+    # block_ids[num_computed_blocks:] cross the wire. 0 = full transfer.
+    num_computed_blocks: int = 0
     # The request's SWA ring slot, as a one-element list so it zips with the
     # region loop like block ids do. Empty for backends with no SWA state.
     local_swa_block_ids: list[int] = field(default_factory=list)
@@ -203,6 +208,7 @@ class ConnectorMetadata:
             ),
             transfer_id=kv_transfer_params.get("transfer_id", 0),
             local_slot_index=kv_transfer_params.get("local_slot_index", -1),
+            num_computed_blocks=kv_transfer_params.get("num_computed_blocks", 0),
         )
 
     def add_new_req_to_save(
