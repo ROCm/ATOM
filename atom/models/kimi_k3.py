@@ -8,6 +8,7 @@ weights live under ``language_model.*`` in the checkpoint, so this module keeps
 the same object hierarchy and skips the vision tower/projector tensors.
 """
 
+import logging
 from typing import ClassVar
 
 import torch
@@ -25,7 +26,11 @@ from torch import nn
 from atom.config import Config, QuantizationConfig, get_current_atom_config
 from atom.model_ops.attention_mla import MLAModules
 from atom.model_ops.base_attention import Attention
-from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
+from atom.model_ops.embed_head import (
+    ParallelLMHead,
+    ReplicatedEmbedding,
+    VocabParallelEmbedding,
+)
 from atom.model_ops.fla_ops.fused_sigmoid_gating import (
     fused_sigmoid_gating_delta_rule_update,
 )
@@ -44,6 +49,7 @@ from atom.model_ops.mamba_ops.causal_conv1d import (
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.rotary_embedding import RotaryEmbedding
 from atom.model_ops.utils import atom_parameter
+from atom.models.deepseek_v2 import use_replicated_vocab_embed
 from atom.models.utils import (
     IntermediateTensors,
     PPMissingLayer,
@@ -54,6 +60,8 @@ from atom.models.utils import (
 from atom.utils import mark_spliting_op
 from atom.utils.decorators import support_torch_compile
 from atom.utils.forward_context import get_forward_context
+
+logger = logging.getLogger("atom")
 
 
 def _text_config(config):
@@ -1157,9 +1165,33 @@ class KimiLinearModel(nn.Module):
         self.vocab_size = config.vocab_size
 
         if get_pp_group().is_first_rank:
-            self.embed_tokens = VocabParallelEmbedding(
-                config.vocab_size, config.hidden_size
-            )
+            if use_replicated_vocab_embed(config):
+                # Full table per rank, purely local lookup, no post-embed
+                # all-reduce. Chosen for the DSpark draft's sake as much as this
+                # model's: the draft is handed THIS module (native
+                # KimiK3DSpark.share_with_target, vLLM load_dspark_model) and
+                # embeds a bs x num_speculative_tokens block through it on every
+                # drafting step, so the sharded path costs one all-reduce per
+                # drafting step on top of the one per model step. Both disappear
+                # here, and the draft needs no code of its own.
+                #
+                # Costs (tp-1)/tp of the table per rank -- 2.1875 GiB replicated,
+                # so +1.914 GiB/rank at TP8 -- taken out of the KV pool. See
+                # ATOM_KIMI_K3_REPLICATE_VOCAB_EMBED for the escape hatch and
+                # use_replicated_vocab_embed for why this is bit-identical to the
+                # sharded path (and why the draft does not load its own table).
+                self.embed_tokens = ReplicatedEmbedding(
+                    config.vocab_size, config.hidden_size
+                )
+                logger.info(
+                    "Kimi-K3 vocab embedding: REPLICATED (full %d-row table per "
+                    "rank, no post-embed all-reduce)",
+                    config.vocab_size,
+                )
+            else:
+                self.embed_tokens = VocabParallelEmbedding(
+                    config.vocab_size, config.hidden_size
+                )
         else:
             self.embed_tokens = PPMissingLayer()
 

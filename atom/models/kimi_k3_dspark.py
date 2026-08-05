@@ -442,9 +442,18 @@ class KimiK3DSpark(nn.Module):
     #     head is not calibrated for inference. ATOM's confidence-scheduled
     #     ragged verify therefore has no trustworthy input with THIS checkpoint
     #     -- run it with a fixed verify length.
-    #   embed_tokens: a 2.35GB copy of the target's table. The target's is
-    #     shared instead (share_with_target), so loading it would just burn
-    #     memory and risk drifting from the target's.
+    #   embed_tokens: 2.1875 GiB, a fine-tuned DERIVATIVE of the target's table
+    #     rather than a copy of it -- byte-compared against Kimi-K3's
+    #     language_model.model.embed_tokens.weight: Pearson r = 0.954 but only
+    #     0.54% of elements bit-equal and rms 1.10x the target's (control: r
+    #     ~= 0 against the target's lm_head, so the offsets are right). So
+    #     loading it is not a memory-for-nothing trade, it CHANGES what the draft
+    #     embeds, and would need a GSM8K acceptance-length re-validation. The
+    #     target's is shared instead (share_with_target), which is also how vLLM
+    #     wires it (load_dspark_model, driven by has_own_embed_tokens=False on the
+    #     plugin wrapper), and the target's table is replicated per rank by
+    #     default (use_replicated_vocab_embed) so that shared lookup carries no
+    #     TP collective.
     skip_weight_prefixes: ClassVar[list[str]] = [
         "confidence_head.",
         "embed_tokens.",
@@ -501,6 +510,13 @@ class KimiK3DSpark(nn.Module):
         unwraps the ``language_model`` multimodal wrapper before calling this).
         The vocabularies must agree or the shared LM head would silently score
         the wrong rows.
+
+        The draft inherits whichever embedding the target built -- replicated
+        (collective-free, the default) or TP-sharded -- so there is nothing to
+        gate here; ``use_replicated_vocab_embed`` decides for both. The check
+        below compares ``num_embeddings``, the LOGICAL vocab, which both classes
+        expose, so it does not care that a replicated table's weight is ``tp``
+        times taller than a shard's.
         """
         target_vocab = target_base.model.embed_tokens.num_embeddings
         if target_vocab != self.hf_config.vocab_size:
