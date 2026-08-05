@@ -61,6 +61,7 @@ class EngineArgs:
     load_dummy: str | None = None
     enable_expert_parallel: bool = False
     fake_eplb: bool = False
+    fake_eplb_layout: str = "ring"
     torch_profiler_dir: str | None = None
     enable_dp_attention: bool = False
     dp_load_balance: str = DP_LB_DEFAULT
@@ -227,6 +228,20 @@ class EngineArgs:
             help="Replace MoE router logits with a synthetic uniform "
             "distribution so every expert is selected equally. For "
             "benchmarking the balanced-load upper bound only.",
+        )
+        parser.add_argument(
+            "--fake-eplb-layout",
+            type=str,
+            default="ring",
+            metavar="ring|block[:ROWS]",
+            help="How --fake-eplb spreads a token's choices. 'ring' (default) "
+            "sends them to topk different EP ranks, as a real router does at "
+            "any balance. 'block' confines each token to one rank, walking "
+            "runs of ROWS rows (default 16) round-robin over the ranks: same "
+            "per-expert counts, but a row is dispatched once instead of topk "
+            "times -- an upper bound on balance plus locality, which no real "
+            "router reaches. Rank counts are even only once the batch is a "
+            "multiple of ROWS x ep_size; lower ROWS for short decode steps.",
         )
         parser.add_argument(
             "--torch-profiler-dir",
