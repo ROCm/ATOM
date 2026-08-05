@@ -82,6 +82,7 @@ from atom.model_ops.attention_mla import (
     triton_gather_kv_indices_sparse,
 )
 from atom.model_ops.base_attention import Attention
+from atom.model_ops.dcp_ops import dcp_pack_topk_candidates, dcp_stable_topk
 from atom.model_ops.embed_head import (
     ParallelLMHead,
     ReplicatedEmbedding,
@@ -180,6 +181,59 @@ _dsa_p1_selfcheck_seen = set()
 #   2. sum over ranks of owned_counts must equal the global candidate count, i.e.
 #      the W kept sets really do partition the global top-k.
 # Only valid while has_cached=False (candidates all come from this batch).
+# DIAGNOSTIC: ATOM_DSA_TIE_STATS=1 -- how often does the decode top-k boundary
+# land on a TIE? §6.1.2: ties are the only place where an ambiguous selection can
+# make two ranks disagree, and §6.1.3's "topk_plain + deterministic tie-break"
+# design costs one extra pass only if the tied set is large. The indexer scores
+# come from fp8 inputs, so exact equality may be far more common than for random
+# data -- this measures it instead of assuming.
+_DSA_TIE_STATS = os.environ.get("ATOM_DSA_TIE_STATS", "0") == "1"
+_dsa_tie_calls = [0]
+_dsa_tie_acc = {"rows": 0, "tied_rows": 0, "max_eq": 0, "sum_eq": 0, "max_need": 0}
+
+
+def _dsa_tie_stats(logits, context_lens, topk_tokens):
+    """Per row: how many candidates sit exactly ON the top-k threshold?
+
+    Vectorised and accumulated across calls -- the per-row Python loop version
+    only sampled one request and was far too small to conclude anything.
+    """
+    if _dsa_tie_calls[0] >= 400 or torch.distributed.get_rank() != 0:
+        return
+    _dsa_tie_calls[0] += 1
+
+    n = min(context_lens.shape[0], logits.shape[0])
+    ctx = context_lens[:n].to(torch.int64)
+    keep = ctx > topk_tokens          # otherwise top-k selects everything
+    if not bool(keep.any()):
+        return
+    rows = logits[:n][keep].float()
+    c = ctx[keep]
+    col = torch.arange(rows.shape[1], device=rows.device).unsqueeze(0)
+    valid = col < c.unsqueeze(1)
+    masked = torch.where(valid, rows, torch.full_like(rows, float("-inf")))
+    thr = torch.topk(masked, topk_tokens, dim=-1).values[:, -1:]
+    n_gt = ((masked > thr) & valid).sum(-1)
+    n_eq = ((masked == thr) & valid).sum(-1)
+    need = topk_tokens - n_gt
+
+    a = _dsa_tie_acc
+    a["rows"] += int(n_eq.numel())
+    a["tied_rows"] += int((n_eq > 1).sum())
+    a["max_eq"] = max(a["max_eq"], int(n_eq.max()))
+    a["sum_eq"] += int(n_eq.sum())
+    a["max_need"] = max(a["max_need"], int(need.max()))
+    if _dsa_tie_calls[0] % 25 == 0:
+        print(
+            f"[DSA-TIE] calls={_dsa_tie_calls[0]} 累计行数={a['rows']} | "
+            f"阈值处有并列(n_eq>1)的行={a['tied_rows']} "
+            f"({a['tied_rows'] / max(a['rows'], 1) * 100:.2f}%) | "
+            f"n_eq 均值={a['sum_eq'] / max(a['rows'], 1):.2f} 最大={a['max_eq']} | "
+            f"need 最大={a['max_need']}",
+            flush=True,
+        )
+
+
 _DSA_P2_SELFCHECK = os.environ.get("ATOM_DSA_P2_SELFCHECK", "0") == "1"
 _dsa_p2_selfcheck_seen = set()
 
@@ -1884,17 +1938,23 @@ def sparse_attn_indexer(
         batch_size, next_n, heads, _ = padded_q_fp8_decode_tokens.shape
         num_rows = batch_size * next_n
         dcp_world_size = get_dcp_world_size()
+        logits = None
         if dcp_world_size > 1:
-            # DCP b2-logits (see DCP_Sparse_MLA.md §2.7.1): each rank
-            # holds only 1/W of the KV (index_cache is sharded, same slot_mapping
-            # as the main KV). Score the LOCAL shard — block_tables already point
-            # at it, so only context_lens must be localized — then all-gather the
-            # per-rank logit rows and interleave back to global sequence order.
-            # With interleave=1 a global position p is owned by rank p % W at
-            # local position p // W, so global_logits[q, j*W + r] equals
-            # local_logits_from_rank_r[q, j]. This is exactly equivalent to
-            # scoring the full sequence on a single rank, so the subsequent
-            # top-k is a normal (exact) global top-k — no merge kernel needed.
+            # DCP candidate exchange (DCP_Sparse_MLA.md §6.1): each rank holds
+            # only 1/W of the KV (index_cache is sharded, same slot_mapping as
+            # the main KV). Score the LOCAL shard — block_tables already point at
+            # it, so only context_lens must be localized — take a LOCAL top-k,
+            # and all-gather just the W*topk (score, global_id) candidates. A
+            # token in the global top-K is necessarily in its own rank's local
+            # top-K (§2.4), so the merge is lossless.
+            #
+            # This replaces the earlier b2-logits path, which all-gathered the
+            # whole logit plane. That plane is `max_model_len`-wide, not ctx-wide
+            # — CUDAGraph captures the collective at a static size, and ctx moves
+            # every step — so it shipped rows*1M*4 bytes per layer at ANY context
+            # length (measured 4764 us/layer at rows=512, §6.1.7). The candidate
+            # set is ctx-independent by construction, so it stays static without
+            # bucketing the graph by ctx.
             assert attn_metadata.max_seqlen_q == 1, (
                 "DCP + DeepSeek-V3.2 sparse indexer (DSA) currently supports "
                 "qlen=1 decode only (MTP verify is Phase 2)."
@@ -1922,15 +1982,56 @@ def sparse_attn_indexer(
                 KVBlockSize=runner_block_size,
                 Preshuffle=True,
             )
-            # [num_rows, l_max] -> all-gather dim0 -> [W, num_rows, l_max]
-            gathered = get_dcp_group().all_gather(
-                local_logits.contiguous(), dim=0
-            ).reshape(dcp_world_size, num_rows, l_max)
-            # interleave to global order: out[q, j*W + r] = gathered[r, q, j]
-            logits = (
-                gathered.permute(1, 2, 0)
-                .reshape(num_rows, l_max * dcp_world_size)[:, :max_model_len]
-                .contiguous()
+            # ---- local top-k -> exchange candidates -> deterministic merge ----
+            # k_loc is the constant `topk_tokens`, never the live local length:
+            # the exchanged size must be static for CUDAGraph. Short contexts
+            # therefore ship (-inf, -1) padding, which the merge drops.
+            k_loc = topk_tokens
+            local_idx = torch.empty(
+                num_rows, k_loc, dtype=torch.int32, device=local_logits.device
+            )
+            top_k_per_row_decode(
+                local_logits,
+                next_n,
+                local_ctx,
+                local_idx,
+                num_rows,
+                local_logits.stride(0),
+                local_logits.stride(1),
+                k_loc,
+            )
+            # [2, rows, k_loc]: plane 0 = score, plane 1 = int32 gid bits.
+            send = torch.empty(
+                2, num_rows, k_loc, dtype=torch.float32,
+                device=local_logits.device,
+            )
+            dcp_pack_topk_candidates(
+                local_logits, local_idx, local_ctx, dcp_rank, dcp_world_size,
+                send,
+            )
+            # Exchange as int32 so the gid bit patterns cannot be touched by any
+            # float canonicalization along the way; the score plane is bitcast
+            # back at the end (free, no copy).
+            recv = get_dcp_group().all_gather(
+                send.view(torch.int32), dim=0
+            ).view(dcp_world_size, 2, num_rows, k_loc)
+            n_cand = dcp_world_size * k_loc
+            # Rank is the outer dim after all-gather but the merge wants it on
+            # the candidate dim. Selection is provably order-independent
+            # (§6.1.6), so any consistent permutation works — but scores and gids
+            # must use the SAME one.
+            gathered_sc = (
+                recv[:, 0].permute(1, 0, 2).reshape(num_rows, n_cand).contiguous()
+            )
+            gathered_gid = (
+                recv[:, 1].permute(1, 0, 2).reshape(num_rows, n_cand).contiguous()
+            )
+            topk_indices_decode = topk_indices[:num_decode_tokens, :topk_tokens]
+            _, _dcp_topk_overflow = dcp_stable_topk(
+                gathered_sc.view(torch.float32),
+                gathered_gid,
+                topk_tokens,
+                out=topk_indices_decode,
             )
         else:
             logits = torch.empty(
@@ -1948,17 +2049,26 @@ def sparse_attn_indexer(
                 Preshuffle=True,
             )
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
-        topk_indices_decode = topk_indices[:num_decode_tokens, :topk_tokens]
-        top_k_per_row_decode(
-            logits,
-            next_n,
-            decode_metadata.context_lens,
-            topk_indices_decode,
-            num_rows,
-            logits.stride(0),
-            logits.stride(1),
-        )
-        if _DSA_DUMP and not _dsa_done[0]:
+        if logits is not None:
+            # Non-DCP: one rank holds the whole plane, so top-k is already
+            # global. The DCP branch produced topk_indices_decode itself.
+            if _DSA_TIE_STATS:
+                _dsa_tie_stats(logits, decode_metadata.context_lens, topk_tokens)
+            topk_indices_decode = topk_indices[:num_decode_tokens, :topk_tokens]
+            top_k_per_row_decode(
+                logits,
+                next_n,
+                decode_metadata.context_lens,
+                topk_indices_decode,
+                num_rows,
+                logits.stride(0),
+                logits.stride(1),
+            )
+        elif _DSA_TIE_STATS:
+            # DCP now selects by a total order, so boundary ties are no longer a
+            # correctness risk here (§6.1.3); nothing to count.
+            pass
+        if logits is not None and _DSA_DUMP and not _dsa_done[0]:
             _d, _lo, _hi = _DSA_DUMP.split(":")
             _c = int(decode_metadata.context_lens[0])
             if int(_lo) <= _c <= int(_hi) and torch.distributed.get_rank() == 0:
