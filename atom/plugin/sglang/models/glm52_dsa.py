@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import os
 from typing import Any
 
 from atom.plugin.sglang.models.deepseek_mla import _align_qknorm_fusion_for_sglang
@@ -12,6 +14,64 @@ from atom.plugin.sglang.models.glm52_dsa_attention import (
     SGLangATOMGLM52MLAAttention,
 )
 
+logger = logging.getLogger(__name__)
+
+
+def _patch_aiter_flat_fmoe_for_glm52_mi308() -> None:
+    """Keep GLM-5.2 from selecting gfx950-only flat FMOE kernels on MI308."""
+    try:
+        import aiter.fused_moe as fused_moe
+    except Exception:  # noqa: BLE001 - best-effort plugin compatibility patch.
+        logger.debug(
+            "Failed to import aiter.fused_moe for GLM-5.2 patch", exc_info=True
+        )
+        return
+
+    if getattr(fused_moe, "_atom_glm52_flat_fmoe_guarded", False):
+        return
+
+    original_get_2stage_cfgs = getattr(fused_moe, "get_2stage_cfgs", None)
+    get_gfx = getattr(fused_moe, "get_gfx", None)
+    if original_get_2stage_cfgs is None or get_gfx is None:
+        logger.warning(
+            "AITER fused_moe lacks get_2stage_cfgs/get_gfx; skip GLM-5.2 patch"
+        )
+        return
+
+    def _get_2stage_cfgs_without_unsupported_flat(*args, **kwargs):
+        metadata = original_get_2stage_cfgs(*args, **kwargs)
+        if not getattr(metadata, "flat", False) or get_gfx() == "gfx950":
+            return metadata
+
+        previous_bypass = os.environ.get("AITER_BYPASS_TUNE_CONFIG")
+        os.environ["AITER_BYPASS_TUNE_CONFIG"] = "1"
+        try:
+            cache_clear = getattr(original_get_2stage_cfgs, "cache_clear", None)
+            if cache_clear is not None:
+                cache_clear()
+            fallback_metadata = original_get_2stage_cfgs(*args, **kwargs)
+        finally:
+            if previous_bypass is None:
+                os.environ.pop("AITER_BYPASS_TUNE_CONFIG", None)
+            else:
+                os.environ["AITER_BYPASS_TUNE_CONFIG"] = previous_bypass
+
+        if getattr(fallback_metadata, "flat", False):
+            logger.warning(
+                "AITER fallback metadata is still flat on %s; forcing non-flat routing",
+                get_gfx(),
+            )
+            fallback_metadata.flat = False
+        else:
+            logger.warning(
+                "Bypassed AITER flat FMOE tuned config for GLM-5.2 on %s",
+                get_gfx(),
+            )
+        return fallback_metadata
+
+    fused_moe.get_2stage_cfgs = _get_2stage_cfgs_without_unsupported_flat
+    fused_moe._atom_glm52_flat_fmoe_guarded = True
+
 
 def setup_glm52_dsa_for_sglang(model: Any) -> None:
     """Patch GLM-5.2 for native ATOM sparse MLA under SGLang.
@@ -21,6 +81,7 @@ def setup_glm52_dsa_for_sglang(model: Any) -> None:
     the ATOM indexer into a shared physical-index buffer and shared-index layers
     reuse that buffer.
     """
+    _patch_aiter_flat_fmoe_for_glm52_mi308()
 
     if not hasattr(model, "atom_config"):
         from atom.config import get_current_atom_config
