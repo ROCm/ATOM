@@ -597,7 +597,7 @@ jobs:
 
             echo "=== Analyzing: $RANK0_TRACE ==="
             cd "profiler-analysis/$config"
-            python ../../tools/parse_trace.py "../../$RANK0_TRACE" --layer 3 2>&1 | tee analysis.log || true
+            python ../../tools/parse_trace.py "../../$RANK0_TRACE" 2>&1 | tee analysis.log || true
             python ../../tools/analyze_trace_summary.py "../../$RANK0_TRACE" \
               --output performance_summary.md 2>&1 || true
             if [ -f performance_summary.md ]; then
