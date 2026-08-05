@@ -424,16 +424,23 @@ class _RealSparseMlaImpl:
             )
         try:
             from aiter import dtypes as _aiter_dtypes
+
             _aiter_fp8 = _aiter_dtypes.fp8
             _fp8_variants = set()
             for _n in ("float8_e4m3fn", "float8_e4m3fnuz"):
                 if hasattr(torch, _n):
                     _fp8_variants.add(getattr(torch, _n))
-            if compressed_kv.dtype in _fp8_variants and compressed_kv.dtype != _aiter_fp8:
+            if (
+                compressed_kv.dtype in _fp8_variants
+                and compressed_kv.dtype != _aiter_fp8
+            ):
                 compressed_kv = compressed_kv.view(_aiter_fp8)
             if k_pe.dtype in _fp8_variants and k_pe.dtype != _aiter_fp8:
                 k_pe = k_pe.view(_aiter_fp8)
-            if kv_cache_base.dtype in _fp8_variants and kv_cache_base.dtype != _aiter_fp8:
+            if (
+                kv_cache_base.dtype in _fp8_variants
+                and kv_cache_base.dtype != _aiter_fp8
+            ):
                 kv_cache_base = kv_cache_base.view(_aiter_fp8)
         except Exception:
             pass
@@ -1225,14 +1232,21 @@ class _RealSparseMlaImpl:
         try:
             try:
                 from aiter import dtypes as _aiter_dtypes_dec
+
                 _aiter_fp8_dec = _aiter_dtypes_dec.fp8
                 _fp8_variants_dec = set()
                 for _n in ("float8_e4m3fn", "float8_e4m3fnuz"):
                     if hasattr(torch, _n):
                         _fp8_variants_dec.add(getattr(torch, _n))
-                if kv_cache_base.dtype in _fp8_variants_dec and kv_cache_base.dtype != _aiter_fp8_dec:
+                if (
+                    kv_cache_base.dtype in _fp8_variants_dec
+                    and kv_cache_base.dtype != _aiter_fp8_dec
+                ):
                     kv_cache_base = kv_cache_base.view(_aiter_fp8_dec)
-                if q_for_kernel.dtype in _fp8_variants_dec and q_for_kernel.dtype != _aiter_fp8_dec:
+                if (
+                    q_for_kernel.dtype in _fp8_variants_dec
+                    and q_for_kernel.dtype != _aiter_fp8_dec
+                ):
                     q_for_kernel = q_for_kernel.view(_aiter_fp8_dec)
             except Exception:
                 pass
