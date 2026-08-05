@@ -5,6 +5,7 @@ import numpy as np
 import torch
 from aiter import dtypes
 
+from atom.config import SSM_STATE_KERNEL_CHUNK
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import MLAAttention
 from atom.utils import envs
@@ -120,12 +121,29 @@ class _KimiMLAGDNCommon(GDNStateMixin):
         if batch.block_tables == []:
             attn_metadata.gdn_metadata = None
             return attn_metadata, positions
-        attn_metadata.gdn_metadata = self.prepare_gdn_metadata(
+        gdn_metadata = self.prepare_gdn_metadata(
             batch,
             attn_metadata,
             is_prefill=True,
             prepare_block_tables=False,
         )
+        # State cache: both halves, exactly as GDNAttentionMetadataBuilder
+        # does. Kimi does not inherit that builder — it composes GDNStateMixin
+        # with the MLA builder instead — so these two calls have to be made
+        # here as well. Omitting them does not disable the state cache: the
+        # engine still clamps hits, publishes checkpoints and sets
+        # `has_recurrent_state`, so the KDA kernel is told to seed from a
+        # runtime slot nothing ever wrote (slots are recycled unscrubbed).
+        # That is silently wrong output on a hit, not a missed optimization.
+        self.apply_state_cache_loads(batch)
+        gdn_metadata.ssm_checkpoints = self._checkpoint_targets(batch)
+        if gdn_metadata.ssm_checkpoints is not None:
+            from atom.model_ops.fla_ops.index import prepare_chunk_offsets
+
+            gdn_metadata.ssm_chunk_offsets = prepare_chunk_offsets(
+                gdn_metadata.non_spec_query_start_loc, SSM_STATE_KERNEL_CHUNK
+            )
+        attn_metadata.gdn_metadata = gdn_metadata
         return attn_metadata, positions
 
     def prepare_decode(self, batch: ScheduledBatch, bs: int):

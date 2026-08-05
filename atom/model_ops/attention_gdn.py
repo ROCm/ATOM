@@ -4,22 +4,24 @@
 import torch
 import triton
 import triton.language as tl
+from aiter.dist.parallel_state import get_tp_group
 from einops import rearrange
-from atom.model_ops.mamba_ops.causal_conv1d import (
-    causal_conv1d_fn,
-    causal_conv1d_update,
-)
+from torch import nn
+
+from atom.config import SSM_STATE_KERNEL_CHUNK
 from atom.model_ops.fla_ops import (
     chunk_gated_delta_rule,
     fused_recurrent_gated_delta_rule,
     gdn_decode_update_lossy_fast,
 )
+from atom.model_ops.mamba_ops.causal_conv1d import (
+    causal_conv1d_fn,
+    causal_conv1d_update,
+)
 from atom.utils import envs
 
 # from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadata
 from atom.utils.forward_context import ForwardContext, get_forward_context
-from torch import nn
-from aiter.dist.parallel_state import get_tp_group
 
 
 @triton.jit
@@ -181,10 +183,8 @@ class GatedDeltaNet(nn.Module):
         spec_sequence_masks = gdn_metadata.spec_sequence_masks
         spec_token_indx = gdn_metadata.spec_token_indx
         non_spec_token_indx = gdn_metadata.non_spec_token_indx
-        spec_state_indices_tensor = gdn_metadata.spec_state_indices_tensor  # noqa: E501
-        non_spec_state_indices_tensor = (
-            gdn_metadata.non_spec_state_indices_tensor
-        )  # noqa: E501
+        spec_state_indices_tensor = gdn_metadata.spec_state_indices_tensor
+        non_spec_state_indices_tensor = gdn_metadata.non_spec_state_indices_tensor
 
         # `causal_conv1d_*` expects the logical shape [slot, conv_dim, state_len].
         # ModelRunner stores [slot, state_len, conv_dim], so it needs the
@@ -326,7 +326,7 @@ class GatedDeltaNet(nn.Module):
 
         # 2.1: Process the multi-query part
         if spec_sequence_masks is not None:
-            core_attn_out_spec, last_recurrent_state = fused_recurrent_gated_delta_rule(
+            core_attn_out_spec, _ = fused_recurrent_gated_delta_rule(
                 q=query_spec,
                 k=key_spec,
                 v=value_spec,
@@ -340,66 +340,112 @@ class GatedDeltaNet(nn.Module):
                 use_qk_l2norm_in_kernel=True,
             )
         else:
-            core_attn_out_spec, last_recurrent_state = None, None
+            core_attn_out_spec = None
 
         # 2.2: Process the remaining part
         if gdn_metadata.num_prefills > 0:
-            initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()
-            initial_state[~has_initial_state, ...] = 0
-            (
-                core_attn_out_non_spec,
-                last_recurrent_state,
-            ) = chunk_gated_delta_rule(
+            # Fully paged state: the kernel indexes `ssm_state` by slot on
+            # both sides, so there is neither a per-layer gather before nor a
+            # scatter after. `dst_indices` is the same slot the read used —
+            # a prefill chunk advances its own runtime state in place — which
+            # is safe: each program owns one [K, BV] column slice of one slot.
+            # The returned final state is ignored: it IS the pool slice the
+            # kernel just wrote.
+            core_attn_out_non_spec, _ = chunk_gated_delta_rule(
                 q=query_non_spec,
                 k=key_non_spec,
                 v=value_non_spec,
                 g=g_non_spec,
                 beta=beta_non_spec,
-                initial_state=initial_state,
+                initial_state=ssm_state,
                 output_final_state=True,
                 cu_seqlens=non_spec_query_start_loc,
                 head_first=False,
                 use_qk_l2norm_in_kernel=True,
+                state_indices=non_spec_state_indices_tensor,
+                dst_indices=non_spec_state_indices_tensor,
+                h0_mask=has_initial_state,
             )
-            # Init cache
-            ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
-                ssm_state.dtype
-            )
+            # SSM state cache: copy out every checkpoint this step reached.
+            #
+            # A checkpoint slot is never where the recurrence runs — the live
+            # state stays in the request's runtime slot for its whole life —
+            # so BOTH kinds of position need a copy:
+            #   interior (a fork)  <- h[chunk boundary], see below
+            #   step end (an anchor) <- the runtime slot; NOT in `h`, which
+            #     holds boundaries strictly before the end
+            # `_checkpoint_targets` tags the second kind with `is_end`.
+            #
+            # One launch over device index tensors, not a Python loop over
+            # targets: the loop cost a `copy_` pair per target per layer, and
+            # its per-sequence base arithmetic was easy to get wrong (`h` and
+            # `mixed_qkv` are batch-concatenated, so offsets need
+            # `chunk_offsets[row]` / `cu_seqlens[row]` — the kernel does that
+            # itself).
+            #
+            # Conv state needs no support from the conv kernel: it IS the last
+            # `state_len` rows of the conv input ending at the position, the
+            # same bytes that kernel's end-of-sequence store writes (see
+            # causal_conv1d.py, `new_conv_state = where(mask, conv_state,
+            # loaded_x)`).
+            ckpt = gdn_metadata.ssm_checkpoints
+            if ckpt is not None:
+                from atom.model_ops.fla_ops.chunk import (
+                    pop_last_intermediate_states,
+                )
+                from atom.model_ops.fla_ops.state_checkpoint import (
+                    write_state_checkpoints,
+                )
+
+                h = pop_last_intermediate_states()
+                if h is not None:
+                    # One launch for both halves. `conv_state` is
+                    # [slot, conv_dim, state_len] by here (see the transpose
+                    # above) and shares `slots` with the SSM half, so the two
+                    # always describe the same token position.
+                    write_state_checkpoints(
+                        h,
+                        ssm_state,
+                        mixed_qkv_non_spec,
+                        conv_state,
+                        ckpt["rows"],
+                        ckpt["slots"],
+                        ckpt["offs"],
+                        ckpt["is_end"],
+                        ckpt["runtime"],
+                        gdn_metadata.ssm_chunk_offsets,
+                        non_spec_query_start_loc,
+                        SSM_STATE_KERNEL_CHUNK,
+                    )
         elif gdn_metadata.num_decodes > 0:
             if use_lossy_gdn_decode:
-                core_attn_out_non_spec, last_recurrent_state = (
-                    gdn_decode_update_lossy_fast(
-                        A_log=self.A_log,
-                        a=a,
-                        b=b,
-                        dt_bias=self.dt_bias,
-                        q=query_non_spec,
-                        k=key_non_spec,
-                        v=value_non_spec,
-                        initial_state=ssm_state,
-                        ssm_state_indices=non_spec_state_indices_tensor,
-                        use_qk_l2norm_in_kernel=True,
-                    )
+                core_attn_out_non_spec, _ = gdn_decode_update_lossy_fast(
+                    A_log=self.A_log,
+                    a=a,
+                    b=b,
+                    dt_bias=self.dt_bias,
+                    q=query_non_spec,
+                    k=key_non_spec,
+                    v=value_non_spec,
+                    initial_state=ssm_state,
+                    ssm_state_indices=non_spec_state_indices_tensor,
+                    use_qk_l2norm_in_kernel=True,
                 )
             else:
-                core_attn_out_non_spec, last_recurrent_state = (
-                    fused_recurrent_gated_delta_rule(
-                        q=query_non_spec,
-                        k=key_non_spec,
-                        v=value_non_spec,
-                        g=g_non_spec,
-                        beta=beta_non_spec,
-                        initial_state=ssm_state,
-                        inplace_final_state=True,
-                        cu_seqlens=non_spec_query_start_loc[
-                            : gdn_metadata.num_decodes + 1
-                        ],
-                        ssm_state_indices=non_spec_state_indices_tensor,
-                        use_qk_l2norm_in_kernel=True,
-                    )
+                core_attn_out_non_spec, _ = fused_recurrent_gated_delta_rule(
+                    q=query_non_spec,
+                    k=key_non_spec,
+                    v=value_non_spec,
+                    g=g_non_spec,
+                    beta=beta_non_spec,
+                    initial_state=ssm_state,
+                    inplace_final_state=True,
+                    cu_seqlens=non_spec_query_start_loc[: gdn_metadata.num_decodes + 1],
+                    ssm_state_indices=non_spec_state_indices_tensor,
+                    use_qk_l2norm_in_kernel=True,
                 )
         else:
-            core_attn_out_non_spec, last_recurrent_state = None, None
+            core_attn_out_non_spec = None
 
         # 3. Merge core attention output
 

@@ -1594,7 +1594,70 @@ class ModelRunner:
         max_per_req_cache_slots = (
             config.max_num_seqs * slots_per_req if per_req_cache_bytes > 0 else 0
         )
-        per_req_cache_tensor_bytes = max_per_req_cache_slots * per_req_cache_bytes
+        # SSM state cache: extra checkpoint slots appended to the same tensor.
+        # One checkpoint costs exactly one per-req slot, so budget a share of
+        # the KV capacity for them and convert to a slot count.
+        num_state_cache_slots = 0
+        state_cache_ratio = float(getattr(config, "ssm_state_cache_ratio", 0.0) or 0.0)
+        # Capacity the checkpoints actually compete for: what is left once every
+        # concurrent request has its live runtime slot. Those slots are NOT part
+        # of the denominator — they are not optional, so counting them would let
+        # the ratio claim memory the checkpoints could never have had, and would
+        # make the same ratio mean different things at different --max-num-seqs.
+        state_cache_budget = max(
+            available_for_kv - max_per_req_cache_slots * per_req_cache_bytes, 0
+        )
+        if getattr(config, "enable_ssm_state_cache", False) and per_req_cache_bytes > 0:
+            # A ratio, not a count, because one checkpoint is a whole-model
+            # state snapshot whose size is set by the architecture, not by the
+            # tokens it summarizes: 53.6MB/rank on Kimi K3 at TP8 against far
+            # less on a small Qwen3-Next. The same count means very different
+            # memory on the two; the same ratio means the same trade against
+            # the pool it competes with. This is the ONLY path — there is no
+            # count flag to override it, because the count cannot be chosen
+            # correctly without the per-slot size computed here.
+            num_state_cache_slots = int(
+                (state_cache_budget * state_cache_ratio) // per_req_cache_bytes
+            )
+            # Deliberately NOT capped at 2*max_num_seqs. That cap was here once,
+            # justified by `plan_save` reserving at most two checkpoints per
+            # sequence — true, but it bounds the WRITE path only. Eviction is
+            # lazy (`StateCachePool._alloc`): a published checkpoint stays in
+            # `hash_to_block_id` and remains hittable after its sequence ends,
+            # until its slot is physically reused. So the slots past that bound
+            # are exactly where cross-request reuse lives, which is the point of
+            # the feature. Measured on Kimi K3 with the cap in place: 128 slots,
+            # writes=1426 evict=1302 — the pool ran full and discarded 91% of
+            # what it published.
+            # `max(1, ...)`: `StateCachePool.enabled` is `num_slots > 0`, so a
+            # ratio that floors to zero would make every method a silent no-op
+            # rather than an error.
+            num_state_cache_slots = max(1, num_state_cache_slots)
+            # MUST be identical across ranks: the scheduler hands out ONE slot
+            # index for all of them, so a rank that sized its tensor smaller
+            # indexes out of bounds — a wild read, not an error. The ratio is
+            # applied to `state_cache_budget`, which derives from
+            # `available_for_kv` (live free memory) and so still differs per
+            # rank, so reduce to the global minimum.
+            # Measured on Kimi K3 at TP8: available_for_kv spanned 54.27-55.55GB
+            # and the raw per-rank picks were 51/51/52/52/53; the reduction is
+            # what made all eight agree on 51.
+            # This is now the ONLY thing making the ranks agree. While the
+            # 2*max_num_seqs cap existed it clamped every rank to the same
+            # number first, so the reduction was inert on any config where the
+            # cap bound — do not read its past no-op behaviour as evidence that
+            # it is optional.
+            if self.world_size > 1 and torch.distributed.is_initialized():
+                t = torch.tensor(
+                    [num_state_cache_slots], dtype=torch.int64, device=self.device
+                )
+                torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN)
+                num_state_cache_slots = int(t.item())
+            config.ssm_state_cache_slots = num_state_cache_slots
+
+        per_req_cache_tensor_bytes = (
+            max_per_req_cache_slots + num_state_cache_slots
+        ) * per_req_cache_bytes
         available_for_pool = available_for_kv - per_req_cache_tensor_bytes
         if available_for_pool <= 0:
             # Minimum gpu_memory_utilization that makes the budget just cover the
@@ -1750,6 +1813,24 @@ class ModelRunner:
                 f"equiv_blocks_per_req={per_req_cache_equiv_blocks}, "
                 f"pool_blocks={num_kvcache_blocks}"
             )
+        if num_state_cache_slots > 0:
+            # Sized in this subprocess and reported nowhere else, so without
+            # this line the only evidence of the trade is a smaller KV pool.
+            ckpt_bytes = num_state_cache_slots * per_req_cache_bytes
+            # The ratio is now the only thing that sets this, so the count and
+            # the share move together and the knob is worth reaching for. Slots
+            # outlive the sequences that wrote them (lazy eviction), so this is
+            # a retention budget, not a concurrency one — compare it against
+            # `evict` in the periodic stats line, not against max_num_seqs.
+            logger.info(
+                f"SSM state cache: {num_state_cache_slots} checkpoint slots "
+                f"({ckpt_bytes / (1 << 30):.2f}GB, "
+                f"{100.0 * ckpt_bytes / max(state_cache_budget, 1):.1f}% of the "
+                f"{state_cache_budget / (1 << 30):.2f}GB left after runtime "
+                f"state) sized by --ssm_state_cache_ratio "
+                f"{state_cache_ratio:.3f}; "
+                f"granularity={config.ssm_state_cache_granularity}"
+            )
 
         # Concurrent-capacity table: at each context-length percentage of
         # max_model_len, how many requests can simultaneously hold their
@@ -1801,6 +1882,12 @@ class ModelRunner:
             "num_per_req_cache_groups": (
                 config.max_num_seqs if per_req_cache_bytes > 0 else 0
             ),
+            # get_num_blocks runs in the RUNNER subprocess; only this dict
+            # crosses back. Setting config.ssm_state_cache_slots above is
+            # invisible to the engine process that builds BlockManager, and
+            # the failure is silent (pool disabled, zero hits, no error) —
+            # the same trap documented for num_swa_blocks below.
+            "ssm_state_cache_slots": num_state_cache_slots,
             # paged-SWA: get_num_blocks runs in the RUNNER subprocess, so its
             # config.num_swa_blocks isn't visible to the engine process that
             # builds BlockManager. Propagate via block_info (mirrors the

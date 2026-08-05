@@ -121,6 +121,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_SWA_RETENTION_INTERVAL": lambda: int(
         os.getenv("ATOM_SWA_RETENTION_INTERVAL", "0")
     ),
+    # Requests between SSM state cache stat lines. The counters are cumulative,
+    # so the LAST line is the whole-run figure -- but only for runs that are a
+    # multiple of this. An eval of 1319 requests at the default 100 last reports
+    # at 1300 and silently drops the tail, so lower this when the exact rate for
+    # a fixed-size eval matters (1 = every request).
+    "ATOM_SSM_STATE_CACHE_LOG_INTERVAL": lambda: max(
+        1, int(os.getenv("ATOM_SSM_STATE_CACHE_LOG_INTERVAL", "100"))
+    ),
     # Fraction of the SWA pool that pinned checkpoint tails may occupy (LRU-capped)
     # when sparse retention is on; the rest stays free for live-window churn.
     "ATOM_SWA_CHECKPOINT_FRAC": lambda: float(

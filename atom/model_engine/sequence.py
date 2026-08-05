@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+from collections.abc import Callable
 from copy import copy
 from enum import Enum, auto
 from itertools import count
-from typing import Any, Callable, Optional
+from typing import Any
 
 import numpy as np
+
 from atom.sampling_params import SamplingParams
 
 
@@ -44,17 +46,17 @@ class Sequence:
         block_size: int,
         sampling_params=SamplingParams(),
         stop_token_sequences: list[list[int]] = None,
-        stream_callback: Optional[Callable[[Any], None]] = None,
+        stream_callback: Callable[[Any], None] | None = None,
         id=None,
         kv_transfer_params: dict = None,
         num_draft_tokens: int = 0,
         has_per_req_cache: bool = False,
         needs_independent_noise: bool = False,
-        parent_request_id: Optional[str] = None,
+        parent_request_id: str | None = None,
         sibling_index: int = 0,
-        request_id: Optional[str] = None,
-        multimodal_data: Optional[dict] = None,
-        mrope_positions: Optional[np.ndarray] = None,
+        request_id: str | None = None,
+        multimodal_data: dict | None = None,
+        mrope_positions: np.ndarray | None = None,
         mrope_position_delta: int = 0,
     ):
         self.block_size = block_size
@@ -97,6 +99,51 @@ class Sequence:
         # -1 = unallocated. The slot indexes into the per-req cache tensors
         # owned by ModelRunner (e.g. mamba_k_cache for GDN).
         self.per_req_cache_group = -1
+        # True once a forward has advanced this seq's recurrent (SSM/conv)
+        # state in its per-req cache slot, i.e. the slot holds state belonging
+        # to THIS sequence. Drives `has_initial_state` for GDN-style linear
+        # attention: a later prefill chunk must seed from the previous chunk's
+        # state instead of restarting the recurrence from zero.
+        #
+        # Deliberately NOT derived from `num_cached_tokens`: that counts the
+        # PAGED-KV prefix hit and is set at admission (BlockManager.allocate)
+        # before any forward runs, while the freshly popped per-req slot still
+        # holds the PREVIOUS tenant's state (deallocate returns slots with
+        # contents intact). Using it would resume the recurrence from a foreign
+        # sequence. Reset on preempt, since preemption frees the slot.
+        self.has_recurrent_state = False
+        # SSM state cache (see atom/model_engine/state_cache.py).
+        # `state_load_slot`: cascade slot to copy INTO this seq's runtime slot
+        #   before its next forward (-1 = nothing to load). Set by
+        #   BlockManager.allocate on a state-cache hit, cleared once applied.
+        # `state_save_slot` / `state_save_pos`: cascade slot to copy this
+        #   seq's runtime state INTO once the forward has advanced it to
+        #   `state_save_pos` (-1 = nothing pending).
+        # Chained block hashes computed by BlockManager.can_allocate, kept so
+        # the state cache can key its checkpoints off the SAME chain the KV
+        # pool matched instead of recomputing it. Covers the matched prefix
+        # only; the pool extends it when it needs to look further.
+        self.block_hashes: list[int] = []
+        # Where this seq's hash chain diverged from a cached prefix, in
+        # blocks (0 = no divergence observed). Set by can_allocate, consumed
+        # by allocate() so the diverging request does not have to
+        # re-derive a position it already computed.
+        self.fork_hit_blocks: int = 0
+        self.state_load_slot = -1
+        # The pool entry `state_load_slot` names. Held so the pool can
+        # pin/unpin it without a slot->entry reverse index; the pool
+        # re-validates it against the live index before pinning, since a
+        # checkpoint can be evicted between the probe and admission.
+        self.state_load_entry = None
+        # A request reserves up to TWO checkpoints — one at an observed fork
+        # inside the prompt, one at the prompt end — because they serve
+        # different reuse patterns (mid-prefix branching vs whole-prompt
+        # follow-ups) and must not compete for a single slot.
+        self.state_save_slots: list[int] = []
+        self.state_save_positions: list[int] = []
+        # Scalars kept for the single-checkpoint fast path.
+        self.state_save_slot = -1
+        self.state_save_pos = -1
         self.temperature = sampling_params.temperature
         self.top_k = sampling_params.top_k
         self.top_p = sampling_params.top_p
@@ -125,7 +172,7 @@ class Sequence:
         # DSpark Phase 2: scheduler-chosen verify length from the previous
         # decode step's propose(). None = no schedule yet -> verify mtp_k (full).
         # Next decode step sizes this seq's verification to dspark_next_ell+1.
-        self.dspark_next_ell: Optional[int] = None
+        self.dspark_next_ell: int | None = None
 
         # statistics fields
         self.arrive_time = 0.0

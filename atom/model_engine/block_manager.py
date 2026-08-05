@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import logging
 from collections import deque
 
 import numpy as np
@@ -17,8 +18,11 @@ from atom.distributed.kv_events import (
 )
 from atom.model_engine.kv_block import Block
 from atom.model_engine.sequence import Sequence
+from atom.model_engine.state_cache import StateCachePool
 from atom.model_engine.swa_pool import SlidingWindowPool
 from atom.utils import envs
+
+logger = logging.getLogger("atom")
 
 
 def _make_block_stored(
@@ -67,6 +71,31 @@ class BlockManager:
         self.free_block_ids_set: set[int] = set(range(num_blocks))
         self.used_block_ids: set[int] = set()
         self.enable_prefix_caching = config.enable_prefix_caching
+
+        # SSM state cache: lets recurrent-state models take a KV prefix hit
+        # by supplying a checkpoint of the recurrent state at the hit
+        # boundary, so the recurrence can RESUME there instead of having to
+        # replay the whole prefix. Without it those models must decline every
+        # KV hit (see can_allocate). Slot count is sized by ModelRunner and
+        # arrives via block_info; 0 disables.
+        self.state_cache: StateCachePool | None = None
+        if getattr(config, "enable_ssm_state_cache", False):
+            slots = int(getattr(config, "ssm_state_cache_slots", 0) or 0)
+            if slots > 0:
+                self.state_cache = StateCachePool(
+                    num_slots=slots,
+                    granularity=int(config.ssm_state_cache_granularity),
+                    block_size=block_size,
+                )
+                # Logged HERE, not in Config.__post_init__: the slot count is
+                # auto-sized by the runner and only reaches this process via
+                # block_info, so a log at config time always printed 0.
+                logger.info(
+                    "SSM state cache: %d slots, granularity=%d (%d blocks/ckpt)",
+                    slots,
+                    self.state_cache.granularity,
+                    self.state_cache.blocks_per_ckpt,
+                )
 
         kv_events = getattr(config, "kv_events_config", None)
         self._events_enabled: bool = bool(kv_events and kv_events.enable)
@@ -190,13 +219,31 @@ class BlockManager:
 
         Caller (scheduler) passes the returned hit count to `allocate()`,
         avoiding a second hash pass.
+
+        Sequences with a per-request RECURRENT state (`has_per_req_cache`:
+        GDN/mamba linear attention in Qwen3-Next / Qwen3.5 / Kimi KDA) need a
+        matching *state* checkpoint before a KV hit is usable. Reusing cached
+        KV skips forwarding those tokens, but the linear layers' state is a
+        fold over every token — it cannot be reconstructed from paged KV, so
+        without a checkpoint the recurrence would enter the uncached suffix
+        having never seen the prefix. That silently corrupts output (measured:
+        a repeated 18k-token prompt answered from cache returned a
+        hallucinated value instead of the prompt's own content).
+
+        So for those sequences the KV hit is clamped to the deepest state
+        checkpoint at or below it, and is 0 when the state cache is disabled
+        or misses. Paged-KV prefix caching is unaffected for models without
+        recurrent state.
         """
         # State cache (mamba / V4 compressor ring) has its own pre-allocated
         # tensor; admission only needs a free slot index, not extra paged
         # blocks. See `allocate()` for the budget reasoning.
         if seq.has_per_req_cache and not self.free_per_req_cache_groups:
             return -1
-        if not self.enable_prefix_caching:
+        state_capable = seq.has_per_req_cache and self.state_cache is not None
+        if not self.enable_prefix_caching or (
+            seq.has_per_req_cache and not state_capable
+        ):
             if len(self.free_block_ids_set) < self._dcp_num_blocks(len(seq)):
                 return -1
             # SWA admission: only the per-request windowed peak (filled
@@ -216,6 +263,21 @@ class BlockManager:
             h = self.compute_hash(token_ids, h)
             block_id = self.hash_to_block_id.get(h, -1)
             if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
+                # Divergence point. Record WHERE on the seq; the state cache
+                # is not touched here so can_allocate stays a pure query (the
+                # scheduler also calls it as a pressure probe). `allocate`
+                # consumes this.
+                #
+                # Floored to the checkpoint grid: state exists only at grid
+                # multiples, so an off-grid fork is unrepresentable. Floor
+                # rather than drop — the cost is at most granularity-1 tokens
+                # of extra replay, where dropping sends the next brancher back
+                # to the previous checkpoint, potentially thousands earlier.
+                if state_capable and compressed_hit > 0:
+                    step = self.state_cache.blocks_per_ckpt
+                    aligned = (compressed_hit // step) * step if step else 0
+                    if aligned > 0:
+                        seq.fork_hit_blocks = aligned
                 break
             block_hashes.append(h)
             compressed_hit += 1
@@ -226,11 +288,36 @@ class BlockManager:
         # → num_cached_blocks so we never reuse a block whose in-window SWA is
         # gone (#1417), while out-of-window front blocks (SWA-freed) don't block
         # the hit.
+        # Hand the full chain to the state cache. The loop above stops at the
+        # first miss, but a checkpoint at the prompt end sits PAST that point,
+        # so extend to cover every block. This is the one place that owns
+        # block hashing — the pool only floors a position to the grid and
+        # indexes into this list.
+        #
+        # A SEPARATE list, because `block_hashes` doubles as the match length
+        # for both bounded_hit calls below; extending it in place would inflate
+        # the hit. And the extension resumes from the last APPENDED hash, not
+        # from `h`, which on a miss holds the hash of the block that failed to
+        # match and was never appended.
+        if state_capable:
+            full = list(block_hashes)
+            h_ext = full[-1] if full else -1
+            for i in range(len(full), seq.num_blocks):
+                h_ext = self.compute_hash(seq.block(i), h_ext)
+                full.append(h_ext)
+            seq.block_hashes = full
         num_cached_blocks = self.swa.bounded_hit(seq, compressed_hit, block_hashes)
         # Instrumentation: record the pre-gate compressed hit so CacheStats can
         # separate reuse lost to the SWA tail gate (compressed_hit -
         # num_cached_blocks) from reuse lost to compressed eviction.
         seq.num_compressed_hit_blocks = compressed_hit
+        # Recurrent state gate: clamp the KV hit down to the deepest state
+        # checkpoint at or below it. Without a checkpoint at the resume point
+        # the linear layers would never see the skipped prefix.
+        if state_capable:
+            num_cached_blocks = self.state_cache.bounded_hit(
+                seq, num_cached_blocks, block_hashes
+            )
         # Free-pool demand: blocks we actually reuse minus those already used
         # (shared ref); blocks we drop from the hit become fresh → counted.
         num_new_blocks = self._n_hash_blocks(seq)
@@ -245,6 +332,34 @@ class BlockManager:
         if not self.swa.has_free(min(num_new_blocks, self.swa.admission_blocks(seq))):
             return -1
         return num_cached_blocks
+
+    # SSM state-cache lifecycle. The policy (where to resume from, where to
+    # leave a checkpoint) lives in StateCachePool; these are thin lifecycle
+    # hooks so callers do not have to null-check the pool everywhere.
+
+    def on_prefill_step_done(self, seq: Sequence) -> None:
+        """State-cache bookkeeping after a prefill step's forward.
+
+        Publishes every checkpoint the step passed through (the runner wrote
+        them during the forward) and releases the entry this seq resumed from,
+        so it becomes evictable again.
+        """
+        if self.state_cache is None:
+            return
+        self.state_cache.commit_save(seq, seq.num_cached_tokens)
+        self.state_cache.release_load(seq)
+
+    def commit_state_save(self, seq: Sequence, reached: int) -> None:
+        if self.state_cache is not None:
+            self.state_cache.commit_save(seq, reached)
+
+    def cancel_state_save(self, seq: Sequence) -> None:
+        if self.state_cache is not None:
+            self.state_cache.cancel_save(seq)
+
+    def release_state_load(self, seq: Sequence) -> None:
+        if self.state_cache is not None:
+            self.state_cache.release_load(seq)
 
     def allocate(self, seq: Sequence, num_cached_blocks: int = 0):
         """Allocate blocks for `seq`. `num_cached_blocks` is the hit count
@@ -310,6 +425,26 @@ class BlockManager:
         if seq.has_per_req_cache:
             seq.per_req_cache_group = self.free_per_req_cache_groups.pop()
 
+        # State cache: every mutation of the pool happens here, once the seq
+        # is definitely being admitted. `can_allocate` only observed (it is
+        # also used as a read-only pressure probe, so it must not record a
+        # fork or reserve a slot for a request that is then turned away).
+        if self.state_cache is not None and seq.has_per_req_cache:
+            # Pin the checkpoint this seq resumes from (can_allocate only
+            # located it — pinning there would leak on a probe that never
+            # admits).
+            self.state_cache.acquire_load(seq)
+            if seq.fork_hit_blocks > 0:
+                # This seq diverged from a cached prefix. If a checkpoint
+                # already sits at that point, this is demand for it — credit
+                # it so eviction does not treat a position every request
+                # re-derives as cold.
+                self.state_cache.credit_demand(
+                    seq.block_hashes[seq.fork_hit_blocks - 1],
+                    seq.fork_hit_blocks * self.block_size,
+                )
+            self.state_cache.plan_save(seq)
+
     def hash_blocks(
         self, seq: Sequence, num_new_tokens: int, start_tokens: int | None = None
     ) -> None:
@@ -329,6 +464,13 @@ class BlockManager:
         past this chunk, so the head passes the chunk's pre-advance offset here.
         """
         if not self.enable_prefix_caching:
+            return
+        # Recurrent-state seqs can only consume a KV hit that is backed by a
+        # state checkpoint (see can_allocate). With the state cache off they
+        # never take one, so publishing their hashes would only let OTHER such
+        # seqs find blocks they can never use — and evict blocks a
+        # non-recurrent model could have reused.
+        if seq.has_per_req_cache and self.state_cache is None:
             return
         hbs = self._hash_block_size()
         base = seq.num_cached_tokens if start_tokens is None else start_tokens
@@ -378,6 +520,16 @@ class BlockManager:
         if seq.has_per_req_cache and seq.per_req_cache_group >= 0:
             self.free_per_req_cache_groups.append(seq.per_req_cache_group)
             seq.per_req_cache_group = -1
+        # The slot is returned to the free list with its tensor contents
+        # INTACT (no scrub — the pool is only zeroed once at allocation).
+        # Whoever pops it next must not read that stale state, so clear the
+        # flag here as well as on the seq that just released it. A preempted
+        # seq re-prefills from scratch and re-earns the flag.
+        seq.has_recurrent_state = False
+        # Drop any checkpoint staged against this seq's (possibly truncated)
+        # tokens, and release the one it borrowed.
+        self.cancel_state_save(seq)
+        self.release_state_load(seq)
 
     def can_append(self, seq: Sequence, num_new_tokens: int = 1) -> bool:
         seq_len = len(seq)
@@ -433,6 +585,12 @@ class BlockManager:
             if block.ref_count == 0:
                 block.hash = -1
                 block.token_ids = []
+        # The state cache is content-addressed off the SAME block hashes, so
+        # leaving it populated would keep serving checkpoints for prefixes the
+        # KV pool has just forgotten. Pinned entries survive (an in-flight DMA
+        # is reading them).
+        if self.state_cache is not None:
+            self.state_cache.clear()
         if self._event_log is not None:
             self._event_log.append(_make_all_cleared())
 
