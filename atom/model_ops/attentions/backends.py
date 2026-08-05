@@ -172,11 +172,18 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
 
         Issued by `build` before the forward, on the compute stream, so a copy
         lands after the forward that produced its source and before the one that
-        consumes its destination. Only backends declaring `StateTransfer.copy()`
-        are ever asked.
+        consumes its destination.
+
+        Owed by every backend that declares a state pool, not just the ones
+        declaring `StateTransfer.copy()`. Two callers want it and only the first
+        is about checkpointing: a copy-transfer class duplicates a group to keep
+        a checkpoint, and *any* class has to be able to hand a group's bytes to
+        a different group index when the pool's boundary moves past the one it
+        is sitting on. The second is a byte move regardless of how the class
+        checkpoints, so a fork-transfer backend owes this too.
         """
         raise NotImplementedError(
-            f"{type(self).__name__} declared a copy state transfer but does not "
+            f"{type(self).__name__} owns per-request state but does not "
             "implement copy_state_entries"
         )
 

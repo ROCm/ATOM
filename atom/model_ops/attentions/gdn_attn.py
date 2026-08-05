@@ -315,6 +315,34 @@ class GDNStateMixin:
             ),
         }
 
+    def copy_state_entries(self, pairs: list[tuple[int, int]]) -> None:
+        """Duplicate a group's whole GDN state, both families, all layers.
+
+        A group is `1 + num_spec` consecutive slots — the extra ones hold the
+        per-draft states a rejected speculation rolls back to — so a group moves
+        as that whole span or the rollback slots go with the wrong owner.
+
+        GDN checkpoints by forking, not by copying, so this is not on the
+        checkpoint path: it exists because moving the pool's boundary has to be
+        able to relocate a group that is in the way, and relocation is a byte
+        move whatever mechanism the class uses to checkpoint. A backend
+        declaring `StateTransfer.fork` therefore still owes this method.
+
+        Both caches are layer-major with the slot as the second axis, so a
+        group's rows are strided rather than contiguous and there is no single
+        range to copy. `_foreach_copy_` keeps it to one launch for the batch.
+        """
+        span = 1 + self.num_spec
+        caches = (self.model_runner.mamba_k_cache, self.model_runner.mamba_v_cache)
+        destinations, sources = [], []
+        for src_group, dst_group in pairs:
+            src_slot, dst_slot = src_group * span, dst_group * span
+            for cache in caches:
+                destinations.append(cache[:, dst_slot : dst_slot + span])
+                sources.append(cache[:, src_slot : src_slot + span])
+        if destinations:
+            torch._foreach_copy_(destinations, sources)
+
     def prepare_state_indices(self, batch: ScheduledBatch, with_spec: bool = False):
         non_spec_state_indices = self.non_spec_state_indices_tensor.np
         non_spec_state_indices_in = self.non_spec_state_indices_in_tensor.np
