@@ -76,17 +76,19 @@ expose the older API.
 | Focused runtime-owner, graph-metadata, and MTP IndexShare tests | Passed: 20 tests |
 | `git diff --check` | Passed |
 | IDE diagnostics for edited files | No diagnostics |
-| GLM-5.2 TP4 server on GPUs 4–7 | Blocked: in `zhiwei_sgl_atom_0802` the checkpoint mount was absent; `zhiwei_sgl_atom_0803` has the checkpoint, but its Kimi-K3 TP8 server occupies all eight GPUs |
+| GLM-5.2 TP4 MTP3 server on GPUs 4–7 | Passed in `zhiwei_sgl_atom_0803` |
+| Decode CUDA-graph capture | Passed: all 51 buckets through max batch size 256 captured |
+| Draft-extend CUDA-graph capture | Passed: 6.32 s |
+| `/generate`, 8192-token prefill + 1024-token decode | Passed: 5.99 s E2E, 48.7% speculative accept rate |
+| Decode graph replay | Passed: runtime logs report `cuda graph: True` throughout decode |
 
-The TP4 MTP recipe uses `CUDA_VISIBLE_DEVICES=4,5,6,7`,
-`--max-running-requests 256`, and `--cuda-graph-max-bs-decode 256`. The
-checkpoint is available in `zhiwei_sgl_atom_0803` at
-`/workspace/shared/data/amd_int/models/GLM-5.2-MXFP4`; validation can start
-once four GPUs are released from its active Kimi-K3 TP8 server.
+The TP4 MTP recipe used `CUDA_VISIBLE_DEVICES=4,5,6,7`,
+`--max-running-requests 256`, and `--cuda-graph-max-bs-decode 256` with the
+`/workspace/shared/data/amd_int/models/GLM-5.2-MXFP4` checkpoint mounted in
+`zhiwei_sgl_atom_0803`.
 
 ## Remaining validation gate
 
-The code-level reviewer items above are addressed. The remaining operational
-gate is an end-to-end GLM-5.2 MXFP4 MTP3 full-CUDA-graph launch and generation
-request with a mounted checkpoint. PCP2 end-to-end validation additionally
+The code-level reviewer items above are addressed and the TP4 MTP graph path
+has passed end-to-end validation. PCP2 end-to-end validation additionally
 requires eight available GPUs.
