@@ -614,12 +614,15 @@ class Scheduler:
         # The worker keeps every resident request's full KV in a paged host pool
         # sized ratio × max_num_seqs × (hot+1) tokens (NOT by max_model_len), so
         # the agentic trace's many long contexts can exhaust it. Mirror the pool's
-        # page budget here so admission DEFERS a request when it would not fit,
-        # instead of the worker's alloc_host_pages raising and killing the runner.
-        # Usage is RECOMPUTED from live state each schedule (see
-        # _sparsekv_pages_in_use) rather than tracked incrementally — a mirror dict
-        # drifts across the PD lifecycle (park / load-complete / abort / preempt)
-        # and undercounts, letting the worker over-commit and crash.
+        # page budget here and reserve each admitted request's whole LIFETIME
+        # footprint (prompt + decode budget) so admission DEFERS a request when it
+        # would not fit — instead of the worker's ungated per-step decode growth
+        # later raising in alloc_host_pages and killing the runner (the host pool
+        # has no preempt/spill safety net like GPU KV blocks do). Usage is
+        # RECOMPUTED from live state each schedule (see _sparsekv_pages_in_use)
+        # rather than tracked incrementally — a mirror dict drifts across the PD
+        # lifecycle (park / load-complete / abort / preempt) and undercounts,
+        # letting the worker over-commit and crash.
         self._sparsekv_enabled: bool = bool(envs.ATOM_SPARSEKV_ENABLE)
         if self._sparsekv_enabled:
             self._sparsekv_page: int = self.block_manager.block_size
@@ -875,22 +878,46 @@ class Scheduler:
             self._warn_if_unschedulable(seq)
         self.waiting.extend(seqs)
 
+    def _sparsekv_worst_case_pages(self, seq: Sequence) -> int:
+        """Host cold-pool pages a request can EVER hold over its lifetime.
+
+        SparseKV keeps each resident request's full context in the host cold pool,
+        and that context grows per decode step. The per-step growth (the worker's
+        backup path calling alloc_host_pages) is ungated and HARD-RAISES on pool
+        exhaustion, killing the runner — there is no preempt/spill safety net for
+        the host pool like there is for GPU KV blocks. So admission must reserve
+        each request's FINAL footprint, not just its prompt, or a long decode
+        overruns the pool and crashes:
+          - prompt (num_prompt_tokens) + its whole decode budget (max_tokens), and
+          - mtp_k extra positions: under speculative decode each step writes the
+            accepted token plus up to mtp_k draft positions, so the worker's peak
+            is max_tokens + mtp_k tokens of decode (0 when spec is off).
+        This equals the worker's physical peak exactly, so reserving it makes the
+        ungated per-step growth provably unable to exceed the reservation. Capped
+        at max_model_len, the coordinator's per-request context ceiling
+        (table_stride), which the worker itself never exceeds.
+        """
+        final_len = min(
+            seq.num_prompt_tokens + seq.max_tokens + self.mtp_k, self.max_model_len
+        )
+        return (final_len + self._sparsekv_page - 1) // self._sparsekv_page
+
     def _sparsekv_pages_in_use(self) -> int:
-        """Host cold-pool pages currently committed to resident SparseKV requests.
+        """Host cold-pool pages RESERVED for resident SparseKV requests.
 
         Recomputed from live state (self-correcting, no drift): every running
-        request holds ceil(num_tokens/page) pages in the cold pool, and every
-        request whose remote-KV recv is in flight (WAITING_FOR_REMOTE_KVS) has
-        already reserved that many at acquire_at_recv. num_tokens grows with
-        decode, so this also tracks per-step growth of running requests.
+        request and every request whose remote-KV recv is in flight
+        (WAITING_FOR_REMOTE_KVS) reserves its worst-case lifetime footprint (see
+        _sparsekv_worst_case_pages). Counting the lifetime footprint — not the
+        current num_tokens — is what guarantees the ungated per-step decode growth
+        on the worker can never exceed what admission already reserved.
         """
-        page = self._sparsekv_page
         total = 0
         for s in self.running:
-            total += (s.num_tokens + page - 1) // page
+            total += self._sparsekv_worst_case_pages(s)
         for s in self.waiting:
             if s.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
-                total += (s.num_tokens + page - 1) // page
+                total += self._sparsekv_worst_case_pages(s)
         return total
 
     def _unschedulable_reason(self, seq: Sequence) -> str | None:
@@ -943,13 +970,21 @@ class Scheduler:
                 f"its own pre-allocated tensor and does not consume pool blocks.)"
             )
         if self._sparsekv_enabled:
-            need = (num_tokens + self._sparsekv_page - 1) // self._sparsekv_page
+            need = self._sparsekv_worst_case_pages(seq)
             if need > self._sparsekv_admit_pages:
+                final_len = min(
+                    seq.num_prompt_tokens + seq.max_tokens + self.mtp_k,
+                    self.max_model_len,
+                )
                 return (
-                    f"needs {need} SparseKV host cold-pool pages for {num_tokens} "
-                    f"tokens > admittable pool pages={self._sparsekv_admit_pages}. "
-                    f"Raise ATOM_SPARSEKV_HOST_TO_DEVICE_RATIO / lower "
-                    f"ATOM_SPARSEKV_ADMIT_RESERVE_PAGES, or shorten the prompt."
+                    f"needs {need} SparseKV host cold-pool pages for its lifetime "
+                    f"footprint ({final_len} tokens = prompt "
+                    f"{seq.num_prompt_tokens} + max_tokens {seq.max_tokens}"
+                    f"{f' + spec {self.mtp_k}' if self.mtp_k else ''}) > "
+                    f"admittable pool pages={self._sparsekv_admit_pages}. Raise "
+                    f"ATOM_SPARSEKV_HOST_TO_DEVICE_RATIO / lower "
+                    f"ATOM_SPARSEKV_ADMIT_RESERVE_PAGES / max_tokens, or shorten "
+                    f"the prompt."
                 )
         return None
 
@@ -1194,19 +1229,23 @@ class Scheduler:
                 self.waiting.appendleft(seq)
                 break
 
-            # SparseKV host cold-pool back-pressure: a remote-load request will
-            # allocate ceil(num_tokens/page) host pages at recv. If the pool can't
-            # fit it, DEFER so it retries as resident requests finish and free
-            # pages — instead of the worker's alloc_host_pages raising and killing
-            # the runner. Requeue as plain WAITING (appendleft + break, mirroring
-            # the concurrency gate above) so it re-enters this admission path next
-            # cycle and re-evaluates. Do NOT use _park_for_remote_load here: no KV
-            # transfer has been registered yet, so WAITING_FOR_REMOTE_KVS would
-            # trap the request forever (nothing ever completes its recv).
-            # Oversized-for-pool prompts are dropped by _unschedulable_reason, so a
-            # deferred request always eventually fits — no deadlock.
+            # SparseKV host cold-pool back-pressure: reserve the request's whole
+            # LIFETIME footprint (prompt + decode budget, see
+            # _sparsekv_worst_case_pages), not just its prompt. The worker's
+            # per-step decode growth into the cold pool is ungated and hard-raises
+            # on exhaustion, so reserving only the prompt lets a long decode
+            # overrun the pool and crash the runner. If the pool can't fit the
+            # lifetime footprint, DEFER so it retries as resident requests finish
+            # and free pages. Requeue as plain WAITING (appendleft + break,
+            # mirroring the concurrency gate above) so it re-enters this admission
+            # path next cycle and re-evaluates. Do NOT use _park_for_remote_load
+            # here: no KV transfer has been registered yet, so
+            # WAITING_FOR_REMOTE_KVS would trap the request forever (nothing ever
+            # completes its recv). Requests whose lifetime footprint can never fit
+            # the pool are dropped by _unschedulable_reason, so a deferred request
+            # always eventually fits — no deadlock.
             if self._sparsekv_enabled and needs_remote_load:
-                need = (seq.num_tokens + self._sparsekv_page - 1) // self._sparsekv_page
+                need = self._sparsekv_worst_case_pages(seq)
                 if sparsekv_pages_used + need > self._sparsekv_admit_pages:
                     self.waiting.appendleft(seq)
                     break

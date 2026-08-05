@@ -83,14 +83,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_SPARSEKV_HOST_TO_DEVICE_RATIO": lambda: int(
         os.getenv("ATOM_SPARSEKV_HOST_TO_DEVICE_RATIO", "8")
     ),
-    # Host cold-pool pages the decode scheduler reserves PER request slot as
-    # headroom for in-flight decode growth (each request grows one cold-pool page
-    # per page_size decoded tokens). Admission back-pressure keeps committed pages
-    # below (num_host_pages - reserve × max_num_seqs) so already-admitted requests
-    # can grow their context without the worker over-committing the pool. Default
-    # 128 pages ≈ 2048 decoded tokens per request.
+    # Extra host cold-pool pages the decode scheduler holds back PER request slot,
+    # on top of each admitted request's reserved lifetime footprint (prompt +
+    # max_tokens + spec draft headroom, see Scheduler._sparsekv_worst_case_pages).
+    # That reservation already equals the worker's physical peak, so decode growth
+    # provably cannot exceed it; this reserve is pure belt-and-suspenders against
+    # scheduler-mirror vs worker-pool skew and may be set to 0. Default 8 pages
+    # per slot.
     "ATOM_SPARSEKV_ADMIT_RESERVE_PAGES": lambda: int(
-        os.getenv("ATOM_SPARSEKV_ADMIT_RESERVE_PAGES", "128")
+        os.getenv("ATOM_SPARSEKV_ADMIT_RESERVE_PAGES", "8")
     ),
     # --- Kernel Fusion Toggles ---
     # fused_compress_attn: switch between Triton (default historical) and a
