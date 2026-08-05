@@ -6,10 +6,9 @@ This module owns GLM-5.2 metadata construction, KV cache binding, and decode CUD
 from __future__ import annotations
 
 # --- common.py ---
-"""Shared GLM-5.2 DSA bridge helpers (all MTP phases)."""
+# Shared GLM-5.2 DSA bridge helpers (all MTP phases).
 
 import logging
-import os
 
 import numpy as np
 import torch
@@ -20,6 +19,7 @@ from atom.plugin.sglang.runtime.attention_backend_resolver import (
     resolve_sglang_runtime,
 )
 from atom.plugin.sglang.runtime.model_arch import is_glm52_dsa_config
+from atom.utils import envs
 
 DECODE_GRAPH_BUFFERS_ATTR = "_atom_glm52_decode_graph_buffers"
 EMPTY_VALUE_CACHE_ATTR = "_atom_glm52_empty_value_cache"
@@ -27,7 +27,6 @@ INDEXER_PAGE_SIZE_ATTR = "_atom_glm52_indexer_page_size"
 ATTENTION_PAGE_SIZE_ATTR = "_atom_glm52_attention_page_size"
 SHARED_SPARSE_INDICES_ATTR = "_atom_glm52_shared_sparse_kv_indices"
 DRAFT_SUB_STEP_ATTR = "_atom_glm52_draft_decode_sub_step"
-INDEXER_CONTEXT_LENS_ATTR = "_atom_glm52_indexer_context_lens"
 GLM52_GRAPH_SEQ_LEN_CAPACITY = 10240
 
 
@@ -95,33 +94,6 @@ def resolve_draft_decode_context_lens(
             if idx < pos_rows.size:
                 effective[row] = max(int(effective[row]), int(pos_rows[idx]) + 1)
     return effective
-
-
-def set_indexer_context_lens(forward_batch, context_lens_np: np.ndarray) -> None:
-    """Indexer-only logical KV length for draft_forward sub-steps.
-
-    Must not mutate ``forward_batch.seq_lens`` — that tensor is shared with the
-    scheduler batch and would corrupt the subsequent target_verify pass.
-    """
-    bs = int(context_lens_np.size)
-    if bs <= 0:
-        return
-    device = forward_batch.seq_lens.device
-    lens = torch.from_numpy(context_lens_np.astype(np.int32)).to(device=device)
-    setattr(forward_batch, INDEXER_CONTEXT_LENS_ATTR, lens)
-
-
-def clear_indexer_context_lens(forward_batch) -> None:
-    if hasattr(forward_batch, INDEXER_CONTEXT_LENS_ATTR):
-        delattr(forward_batch, INDEXER_CONTEXT_LENS_ATTR)
-
-
-def resolve_indexer_seq_lens(forward_batch, bs: int) -> torch.Tensor:
-    """Return seq lens for sparse MLA indexer decode (may differ from batch)."""
-    ctx = getattr(forward_batch, INDEXER_CONTEXT_LENS_ATTR, None)
-    if torch.is_tensor(ctx) and int(ctx.numel()) >= bs:
-        return ctx[:bs].to(dtype=torch.int32)
-    return forward_batch.seq_lens[:bs].to(dtype=torch.int32)
 
 
 def gather_draft_decode_token_row(
@@ -241,73 +213,6 @@ def resolve_speculative_num_steps(forward_batch, default: int = 1) -> int:
     if cached is not None:
         return max(1, int(cached))
     return max(1, int(default))
-
-
-def build_accept_compacted_token_table(
-    forward_batch,
-    req_to_token_pool,
-    *,
-    bs: int,
-    context_lens_np: np.ndarray,
-    prefix_lens_np: np.ndarray,
-    accept_lens_np: np.ndarray,
-    sub_step: int,
-    page_size: int,
-) -> torch.Tensor:
-    """Compact draft-pool routing: skip reject tail [prefix+accept, prefix+K)."""
-    req_n = int(forward_batch.req_pool_indices.numel())
-    bs = min(
-        int(bs),
-        req_n,
-        int(context_lens_np.size),
-        int(prefix_lens_np.size),
-        int(accept_lens_np.size),
-    )
-    if bs <= 0:
-        raise RuntimeError("build_accept_compacted_token_table: empty batch")
-    device = forward_batch.req_pool_indices.device
-    req_pool_indices = forward_batch.req_pool_indices[:bs]
-    raw = req_to_token_pool.req_to_token[req_pool_indices].clone()
-    max_len = int(context_lens_np.max(initial=1))
-    out = torch.zeros(bs, max_len, dtype=torch.int32, device=device)
-    out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
-
-    for row in range(bs):
-        prefix = int(prefix_lens_np[row])
-        accept = int(accept_lens_np[row])
-        context = int(context_lens_np[row])
-        parts: list[torch.Tensor] = []
-        if prefix > 0:
-            parts.append(raw[row, :prefix])
-        if accept > 0:
-            parts.append(raw[row, prefix : prefix + accept])
-        if sub_step > 0:
-            parts.append(raw[row, prefix + accept : prefix + accept + sub_step])
-
-        compact = torch.cat(parts) if parts else raw[row, :0]
-        past_len = max(context - 1, 0)
-        if compact.numel() > past_len:
-            compact = compact[:past_len]
-        if compact.numel() < past_len:
-            tail = raw[row, compact.numel() : past_len]
-            if tail.numel() > 0:
-                compact = torch.cat([compact, tail.to(dtype=compact.dtype)])
-
-        if torch.is_tensor(out_cache_loc) and int(out_cache_loc.numel()) > row:
-            slot = out_cache_loc[row].reshape(1).to(dtype=compact.dtype)
-            compact = torch.cat([compact, slot])
-        elif compact.numel() < context:
-            pad = raw[row, compact.numel() : context]
-            if pad.numel() > 0:
-                compact = torch.cat([compact, pad.to(dtype=compact.dtype)])
-
-        if compact.numel() > context:
-            compact = compact[:context]
-        out[row, : compact.numel()] = compact.to(dtype=torch.int32)
-
-    if page_size == 1:
-        return out.contiguous()
-    return (out[:, ::page_size] // page_size).to(dtype=torch.int32).contiguous()
 
 
 def get_extend_lens_cpu(forward_batch, positions: torch.Tensor, bs: int) -> np.ndarray:
@@ -503,6 +408,72 @@ def make_mla_work_buffers(
     return work
 
 
+def _maybe_apply_pcp_prefill_reindex(
+    md,
+    *,
+    sparse_counts: np.ndarray,
+    total_tokens: int,
+    topk: int,
+    token_to_kv_pool,
+    atom_config,
+    dtype_q,
+) -> None:
+    """Align sparse-prefill metadata with the query rows owned by this PCP rank."""
+    try:
+        from atom.distributed.pcp_utils import (
+            get_pcp_world_size,
+            pcp_is_enabled,
+            pcp_pad_dense,
+            pcp_pad_len,
+            pcp_round_robin_query_indices,
+        )
+    except ImportError:
+        return
+
+    if not pcp_is_enabled():
+        return
+
+    device = md.slot_mapping.device
+    pcp_size = get_pcp_world_size()
+    padded_total = pcp_pad_len(int(total_tokens), pcp_size)
+    n_pad = padded_total - int(total_tokens)
+    owned_q = pcp_round_robin_query_indices(padded_total, pcp_size).to(device)
+    n_owned = int(owned_q.shape[0])
+
+    md.cu_seqlen_ks = pcp_pad_dense(md.cu_seqlen_ks, n_pad)[owned_q].contiguous()
+    md.cu_seqlen_ke = pcp_pad_dense(md.cu_seqlen_ke, n_pad)[owned_q].contiguous()
+    md.token_to_seq_idxs = pcp_pad_dense(md.token_to_seq_idxs, n_pad)[
+        owned_q
+    ].contiguous()
+    md.sparse_cu_seqlens_q = torch.arange(n_owned + 1, dtype=torch.int32, device=device)
+
+    counts = torch.as_tensor(sparse_counts, dtype=torch.int64, device=device)
+    owned_counts = pcp_pad_dense(counts, n_pad)[owned_q]
+    owned_counts = torch.clamp(owned_counts, max=int(topk))
+    sparse_kv_indptr = torch.zeros(n_owned + 1, dtype=torch.int32, device=device)
+    sparse_kv_indptr[1:] = torch.cumsum(owned_counts, dim=0).to(torch.int32)
+    md.sparse_kv_indptr = sparse_kv_indptr
+    md.sparse_kv_last_page_lens = torch.ones(n_owned, dtype=torch.int32, device=device)
+
+    sparse_work = make_mla_work_buffers(
+        cu_seqlens_q=md.sparse_cu_seqlens_q,
+        kv_indptr=md.sparse_kv_indptr,
+        kv_last_page_lens=md.sparse_kv_last_page_lens,
+        num_heads=local_num_attention_heads(atom_config),
+        dtype_q=dtype_q,
+        dtype_kv=dtype_q,
+        page_size=attention_page_size(token_to_kv_pool),
+    )
+    for key, value in sparse_work.items():
+        setattr(md, f"sparse_prefill_{key}", value)
+
+    if int(total_tokens) > 0:
+        owned_clamped = torch.clamp(owned_q, max=int(total_tokens) - 1)
+        md.slot_mapping_owned = md.slot_mapping[owned_clamped].contiguous()
+    else:
+        md.slot_mapping_owned = md.slot_mapping[:0].contiguous()
+
+
 def make_sparse_mtp_work_buffers(
     *,
     sparse_cu_seqlens_q: torch.Tensor,
@@ -611,7 +582,7 @@ def attention_page_size(token_to_kv_pool) -> int:
 
 
 # --- cache_bind.py ---
-"""Bind SGLang KV pool views to ATOM GLM-5.2 sparse MLA modules."""
+# Bind SGLang KV pool views to ATOM GLM-5.2 sparse MLA modules.
 
 
 def bind_glm52_dsa_cache_views(model, token_to_kv_pool) -> bool:
@@ -675,7 +646,7 @@ def bind_glm52_dsa_cache_views(model, token_to_kv_pool) -> bool:
 
 
 # --- multi_token.py ---
-"""Multi-token MTP metadata shared by target_verify and draft_extend."""
+# Multi-token MTP metadata shared by target_verify and draft_extend.
 
 
 def build_mtp_multi_token_decode_metadata(
@@ -813,7 +784,7 @@ def build_mtp_multi_token_decode_metadata(
 
 
 # --- target_verify.py ---
-"""Target verify metadata — target pool, bs×K query rows."""
+# Target verify metadata — target pool, bs×K query rows.
 
 
 def resolve_target_verify_lens(
@@ -852,7 +823,7 @@ def should_use_mtp_verify_prefill_path(
 ) -> bool:
     """Choose prefill vs decode metadata for eager target_verify."""
     del forward_batch, positions, atom_config
-    override = os.environ.get("ATOM_GLM52_TV_VERIFY_PATH", "").lower()
+    override = envs.ATOM_GLM52_TV_VERIFY_PATH
     if override in ("prefill", "prefill_prefix"):
         return True
     if override in ("decode",):
@@ -899,7 +870,7 @@ def build_mtp_verify_decode_metadata(
 
 
 # --- draft_decode.py ---
-"""Draft forward decode metadata — draft pool, 1 tok/query, multi-step sub_step."""
+# Draft forward decode metadata — draft pool, 1 tok/query, multi-step sub_step.
 
 logger = logging.getLogger("atom.plugin.sglang.glm52_dsa_bridge")
 
@@ -1205,16 +1176,12 @@ def build_decode_metadata(
 
 
 # --- draft_extend.py ---
-"""Draft extend metadata — draft pool, DRAFT_EXTEND_V2 bs×K fill after verify."""
+# Draft extend metadata — draft pool, DRAFT_EXTEND_V2 bs×K fill after verify.
 
 
 def draft_extend_k_only() -> bool:
     """Debug opt-in: attend only the current K-token extend chunk (legacy workaround)."""
-    return os.environ.get("ATOM_GLM52_DRAFT_EXTEND_K_ONLY", "0") in (
-        "1",
-        "true",
-        "True",
-    )
+    return envs.ATOM_GLM52_DRAFT_EXTEND_K_ONLY
 
 
 def resolve_draft_extend_lens(
@@ -1263,7 +1230,7 @@ def draft_extend_token_num(forward_batch, positions: torch.Tensor, bs: int) -> i
 
 def should_use_mtp_draft_extend_decode_path(forward_batch) -> bool:
     """Use decode-style draft_extend metadata (native propose i=0 semantics)."""
-    override = os.environ.get("ATOM_GLM52_DRAFT_EXTEND_PATH", "").lower()
+    override = envs.ATOM_GLM52_DRAFT_EXTEND_PATH
     if override in ("prefill", "prefill_prefix"):
         return False
     if override in ("decode",):
@@ -1300,7 +1267,7 @@ def build_mtp_draft_extend_decode_metadata(
 
 
 # --- prefill.py ---
-"""Prefill metadata — target prefill and draft_extend_for_prefill path."""
+# Prefill metadata — target prefill and draft_extend_for_prefill path.
 
 
 def is_draft_extend_prefill(forward_batch) -> bool:
@@ -1445,6 +1412,15 @@ def build_mtp_draft_extend_prefill_metadata(
         )
         for key, value in sparse_work.items():
             setattr(md, f"sparse_prefill_{key}", value)
+        _maybe_apply_pcp_prefill_reindex(
+            md,
+            sparse_counts=sparse_counts,
+            total_tokens=total_tokens,
+            topk=topk,
+            token_to_kv_pool=token_to_kv_pool,
+            atom_config=atom_config,
+            dtype_q=dtype_q,
+        )
     else:
         ensure_shared_sparse_buffer(
             token_to_kv_pool,
@@ -1568,6 +1544,15 @@ def build_prefill_metadata(
         )
         for key, value in sparse_work.items():
             setattr(md, f"sparse_prefill_{key}", value)
+        _maybe_apply_pcp_prefill_reindex(
+            md,
+            sparse_counts=sparse_counts,
+            total_tokens=total_tokens,
+            topk=topk,
+            token_to_kv_pool=token_to_kv_pool,
+            atom_config=atom_config,
+            dtype_q=dtype_q,
+        )
     else:
         ensure_shared_sparse_buffer(
             token_to_kv_pool,
@@ -1580,7 +1565,7 @@ def build_prefill_metadata(
 
 
 # --- decode_graph.py ---
-"""Target decode CUDA-graph metadata buffers."""
+# Target decode CUDA-graph metadata buffers.
 
 
 class GLM52DecodeGraphBuffers:
@@ -1812,7 +1797,7 @@ def build_atom_glm52_decode_graph_metadata_from_sglang(
 
 
 # --- dispatcher.py ---
-"""Forward-mode router: target_verify / draft_extend / draft_decode / prefill."""
+# Forward-mode router: target_verify / draft_extend / draft_decode / prefill.
 
 
 def build_atom_glm52_attention_metadata_from_sglang(

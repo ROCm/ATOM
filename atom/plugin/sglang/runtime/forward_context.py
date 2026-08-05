@@ -1,5 +1,3 @@
-# ruff: noqa: BLE001
-
 """Scoped runtime adapter from SGLang batches to ATOM core."""
 
 from __future__ import annotations
@@ -8,7 +6,7 @@ import copy
 import logging
 from contextlib import ExitStack
 from dataclasses import dataclass, field
-from typing import Any, Self
+from typing import Any
 
 import torch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -189,7 +187,7 @@ def _slice_v4_graph_metadata_for_capture(
         elif value is not None:
             try:
                 setattr(md, name, value[:n])
-            except Exception:  # noqa: S110
+            except Exception:  # noqa: BLE001, S110 - optional metadata field
                 pass
 
     for name in (
@@ -259,7 +257,7 @@ def _slice_v4_graph_metadata_for_capture(
 def _is_current_stream_capturing() -> bool:
     try:
         return bool(torch.cuda.is_current_stream_capturing())
-    except Exception:
+    except Exception:  # noqa: BLE001 - HIP compatibility fallback
         return False
 
 
@@ -268,7 +266,7 @@ def _get_sglang_attention_backend():
         from sglang.srt.model_executor.forward_context import get_attn_backend
 
         return get_attn_backend()
-    except Exception:
+    except Exception:  # noqa: BLE001 - SGLang version compatibility
         return None
 
 
@@ -371,7 +369,7 @@ def _build_glm52_dsa_metadata(
                 )
 
                 in_graph_warmup = get_is_capture_mode()
-            except Exception:
+            except Exception:  # noqa: BLE001 - SGLang version compatibility
                 in_graph_warmup = False
             if in_graph_warmup and graph_cache_key is not None:
                 if graph_cache is None:
@@ -544,7 +542,7 @@ def _build_deepseek_v4_metadata(forward_batch: ForwardBatch, positions: torch.Te
                     num_tokens=int(positions.shape[0]),
                     bs=int(forward_batch.batch_size),
                 )
-        except Exception:
+        except Exception:  # noqa: BLE001 - optional V4 backend
             attn_metadata = None
 
     if attn_metadata is None and getattr(proxy_pool, "is_atom_v4_proxy_pool", False):
@@ -635,7 +633,7 @@ def _set_atom_forward_context(
             forward_batch,
             positions,
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - add model context
         raise RuntimeError(
             "Failed to build ATOM MiniMax-M3 sparse metadata for SGLang"
         ) from exc
@@ -647,7 +645,7 @@ def _set_atom_forward_context(
                 forward_batch,
                 positions,
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - add model context
             raise RuntimeError(
                 "Failed to build ATOM GLM-5.2 DSA metadata for SGLang"
             ) from exc
@@ -655,7 +653,7 @@ def _set_atom_forward_context(
     if attn_metadata is None:
         try:
             attn_metadata = _build_deepseek_v4_metadata(forward_batch, positions)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - add model context
             raise RuntimeError(
                 "Failed to build ATOM DeepSeek-V4 metadata for SGLang"
             ) from exc
@@ -667,7 +665,7 @@ def _set_atom_forward_context(
                 forward_batch,
                 positions,
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - add model context
             raise RuntimeError(
                 "Failed to build ATOM EAGLE3 draft metadata for SGLang"
             ) from exc
@@ -738,7 +736,7 @@ class SGLangPluginRuntime:
     _is_dummy_run: bool = field(init=False, default=False)
     _exit_stack: ExitStack = field(init=False, repr=False)
 
-    def __enter__(self) -> Self:
+    def __enter__(self) -> "SGLangPluginRuntime":
         self._original_forward_batch = self.forward_batch
         self._is_dummy_run = _is_dummy_forward(self.forward_batch)
 

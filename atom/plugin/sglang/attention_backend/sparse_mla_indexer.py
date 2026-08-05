@@ -1,14 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-# ruff: noqa: BLE001
-
 """SGLang plugin sparse MLA indexer support for DeepSeek-V3.2."""
 
 from __future__ import annotations
 
 import logging
-import os
 import re
 from dataclasses import dataclass
 
@@ -32,6 +29,7 @@ from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
 from atom.plugin.sglang.glm52_dsa_bridge import GLM52_GRAPH_SEQ_LEN_CAPACITY
 from atom.utils.custom_register import direct_register_custom_op
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -39,7 +37,7 @@ logger = logging.getLogger("atom")
 def _is_stream_capturing() -> bool:
     try:
         return bool(torch.cuda.is_current_stream_capturing())
-    except Exception:
+    except Exception:  # noqa: BLE001 - HIP compatibility fallback
         return False
 
 
@@ -276,7 +274,7 @@ def _is_mtp_spec_extend_like(forward_batch) -> bool:
         return True
     if not _is_draft_extend_v2(forward_batch):
         return False
-    override = os.environ.get("ATOM_GLM52_DRAFT_EXTEND_PATH", "").lower()
+    override = envs.ATOM_GLM52_DRAFT_EXTEND_PATH
     return override not in ("prefill", "prefill_prefix")
 
 
@@ -374,7 +372,7 @@ def _maybe_apply_pcp_query_split(
         )
 
         pcp_size = get_pcp_world_size()
-    except Exception:
+    except Exception:  # noqa: BLE001 - PCP is optional
         pcp_size = 1
 
     if pcp_size <= 1:
@@ -386,6 +384,37 @@ def _maybe_apply_pcp_query_split(
     cu_starts = pcp_round_robin_split(pcp_pad_dense(cu_starts, n_pad), pcp_size)
     cu_ends = pcp_round_robin_split(pcp_pad_dense(cu_ends, n_pad), pcp_size)
     return cu_starts[:num_tokens], cu_ends[:num_tokens]
+
+
+def _maybe_apply_pcp_dense_query_split(
+    values: torch.Tensor,
+    num_tokens: int,
+) -> torch.Tensor:
+    """Match dense per-query metadata to ATOM's local PCP query rows."""
+    if int(values.shape[0]) <= num_tokens:
+        return values[:num_tokens]
+
+    try:
+        from atom.distributed.pcp_utils import (
+            get_pcp_world_size,
+            pcp_pad_dense,
+            pcp_pad_len,
+            pcp_round_robin_split,
+        )
+
+        pcp_size = get_pcp_world_size()
+    except Exception:  # noqa: BLE001 - PCP is optional
+        pcp_size = 1
+
+    if pcp_size <= 1:
+        return values
+
+    total_queries = int(values.shape[0])
+    padded_total = pcp_pad_len(total_queries, pcp_size)
+    values = pcp_round_robin_split(
+        pcp_pad_dense(values, padded_total - total_queries), pcp_size
+    )
+    return values[:num_tokens]
 
 
 def _pad_query_ranges_for_indexer(
@@ -524,6 +553,7 @@ def _resolve_sglang_pools(forward_batch):
 def _build_sparse_req_id_per_token_for_sglang(
     forward_batch,
     device: torch.device,
+    num_tokens: int | None = None,
 ) -> torch.Tensor:
     bs = int(forward_batch.batch_size)
     req_ids = torch.arange(bs, dtype=torch.int32, device=device)
@@ -537,7 +567,14 @@ def _build_sparse_req_id_per_token_for_sglang(
     query_lens = getattr(forward_batch, "extend_seq_lens", None)
     if query_lens is None:
         query_lens = forward_batch.seq_lens
-    return torch.repeat_interleave(req_ids, query_lens[:bs].to(torch.int32))
+    req_id_per_token = torch.repeat_interleave(
+        req_ids, query_lens[:bs].to(torch.int32)
+    )
+    if num_tokens is not None:
+        req_id_per_token = _maybe_apply_pcp_dense_query_split(
+            req_id_per_token, int(num_tokens)
+        )
+    return req_id_per_token
 
 
 def _supports_sparse_mla_fast_metadata(
@@ -1018,7 +1055,7 @@ def _prepare_sparse_mla_kernel_metadata(
     token_to_kv_pool, _ = _resolve_sglang_pools(forward_batch)
     allocator_page_size = int(getattr(token_to_kv_pool, "page_size", 1))
     req_id_per_token = _build_sparse_req_id_per_token_for_sglang(
-        forward_batch, q.device
+        forward_batch, q.device, num_tokens=num_tokens
     )
     block_table = _build_sglang_block_table(forward_batch, allocator_page_size).to(
         dtype=torch.int32
@@ -1135,12 +1172,7 @@ def forward_sparse_mla_for_sglang(
     topk_indices = topk_indices[:num_tokens]
     output_dtype = input_dtype or torch.bfloat16
     k_buffer = token_to_kv_pool.get_key_buffer(layer.layer_id)
-    align_fp8_q = os.environ.get("ATOM_SGLANG_SPARSE_MLA_ALIGN_FP8_Q", "0").lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
+    align_fp8_q = envs.ATOM_SGLANG_SPARSE_MLA_ALIGN_FP8_Q
     graph_mode = _is_graph_warmup_or_capture()
     fixed_graph_phase = bool(
         forward_batch.forward_mode.is_decode_or_idle()
@@ -1351,9 +1383,7 @@ def sparse_attn_indexer_sglang_plugin_mode(
                 f"{bs} token rows, got q={q_fp8.shape[0]}, weights={weights.shape[0]}. "
                 "This usually means TP-scattered indexer inputs were not gathered."
             )
-        from atom.plugin.sglang.glm52_dsa_bridge import resolve_indexer_seq_lens
-
-        seq_lens_i32 = resolve_indexer_seq_lens(forward_batch, bs)
+        seq_lens_i32 = forward_batch.seq_lens[:bs].to(dtype=torch.int32)
         padded_q_fp8 = q_fp8[:bs].reshape(bs, 1, *q_fp8.shape[1:])
         logits = torch.empty([bs, max_model_len], dtype=torch.float32, device=k.device)
         deepgemm_fp8_paged_mqa_logits(

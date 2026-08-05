@@ -7,7 +7,6 @@ actual draft core to ATOM's `DeepSeekMTP`.
 
 import copy
 import logging
-import os
 import re
 from collections.abc import Iterable
 
@@ -29,6 +28,7 @@ from atom.plugin.sglang.runtime import (
     SGLangPluginRuntime,
     plugin_runtime_scope,
 )
+from atom.utils import envs
 
 logger = logging.getLogger("atom.plugin.sglang.models")
 
@@ -282,7 +282,8 @@ class DeepseekV3ForCausalLMNextN(nn.Module):
             raise ValueError(
                 f"{self.draft_model_name} draft forward requires speculative info"
             )
-        forward_batch._atom_glm52_generic_draft_frontend = True
+        if self._is_glm_moe_dsa_nextn:
+            forward_batch._atom_glm52_generic_draft_frontend = True
 
         with plugin_runtime_scope(framework="sglang", atom_config=self.atom_config):
             with SGLangPluginRuntime(
@@ -386,11 +387,7 @@ class DeepseekV3ForCausalLMNextN(nn.Module):
 
             if self.pp_group.is_last_rank:
                 hidden_states = runtime.trim_output(hidden_states)
-                wrapper_mode = (
-                    os.environ.get("ATOM_GLM52_MTP_WRAPPER_MODE", "current")
-                    .strip()
-                    .lower()
-                )
+                wrapper_mode = envs.ATOM_GLM52_MTP_WRAPPER_MODE.strip()
                 if wrapper_mode not in ("current", "pr1578"):
                     raise ValueError(
                         "ATOM_GLM52_MTP_WRAPPER_MODE must be 'current' or "

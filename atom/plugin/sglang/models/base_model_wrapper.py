@@ -357,31 +357,6 @@ class _AtomCausalLMBaseForSglang(nn.Module):
                 hidden_states, aux_hidden_states = self._split_aux_hidden_states(
                     hidden_states
                 )
-                try:
-                    import os
-
-                    mode = getattr(forward_batch, "forward_mode", None)
-                    if (
-                        os.environ.get("ATOM_GLM52_HIDDEN_DEBUG", "0")
-                        in ("1", "true", "True")
-                        and mode is not None
-                        and bool(getattr(mode, "is_target_verify", lambda: False)())
-                        and torch.is_tensor(hidden_states)
-                    ):
-                        rows = (
-                            hidden_states[: min(4, int(hidden_states.shape[0]))]
-                            .detach()
-                            .float()
-                        )
-                        logger.info(
-                            "[GLM52_HIDDEN_DEBUG] post_model shape=%s norm=%s absmax=%s",
-                            tuple(hidden_states.shape),
-                            rows.norm(dim=-1).cpu().tolist(),
-                            rows.abs().amax(dim=-1).cpu().tolist(),
-                        )
-                except Exception:
-                    logger.exception("Failed GLM52 hidden debug log")
-
                 hidden_states = runtime.trim_output(hidden_states)
                 aux_hidden_states = self._trim_aux_hidden_states(
                     runtime, aux_hidden_states

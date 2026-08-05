@@ -43,6 +43,49 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ATOM remaps the SGLang world into internal TP x PCP groups.
     # 0 means unset.
     "ATOM_SGLANG_PCP_SIZE": lambda: int(os.getenv("ATOM_SGLANG_PCP_SIZE", "0") or "0"),
+    # --- SGLang speculative decoding ---
+    "ATOM_SGLANG_MTP_LOG": lambda: os.getenv("ATOM_SGLANG_MTP_LOG", "0") == "1",
+    "ATOM_SGLANG_DRAFT_ARGMAX": lambda: os.getenv(
+        "ATOM_SGLANG_DRAFT_ARGMAX", "1"
+    ).lower()
+    not in ("0", "false", "no"),
+    "ATOM_SGLANG_V4_DISABLE_DRAFT_CG": lambda: os.getenv(
+        "ATOM_SGLANG_V4_DISABLE_DRAFT_CG", "0"
+    ).lower()
+    in ("1", "true", "yes"),
+    "ATOM_SGLANG_V4_ENABLE_TARGET_VERIFY_CG": lambda: os.getenv(
+        "ATOM_SGLANG_V4_ENABLE_TARGET_VERIFY_CG", "0"
+    ).lower()
+    in ("1", "true", "yes"),
+    "ATOM_SGLANG_V4_DISABLE_TARGET_VERIFY_CG": lambda: os.getenv(
+        "ATOM_SGLANG_V4_DISABLE_TARGET_VERIFY_CG", "0"
+    ).lower()
+    in ("1", "true", "yes"),
+    "ATOM_SGLANG_V4_ENABLE_DRAFT_EXTEND_CG": lambda: os.getenv(
+        "ATOM_SGLANG_V4_ENABLE_DRAFT_EXTEND_CG", "0"
+    ).lower()
+    in ("1", "true", "yes"),
+    "ATOM_SGLANG_V4_DISABLE_DRAFT_EXTEND_CG": lambda: os.getenv(
+        "ATOM_SGLANG_V4_DISABLE_DRAFT_EXTEND_CG", "0"
+    ).lower()
+    in ("1", "true", "yes"),
+    "ATOM_GLM52_MTP_WRAPPER_MODE": lambda: os.getenv(
+        "ATOM_GLM52_MTP_WRAPPER_MODE", "current"
+    ).lower(),
+    "ATOM_GLM52_DRAFT_EXTEND_PATH": lambda: os.getenv(
+        "ATOM_GLM52_DRAFT_EXTEND_PATH", ""
+    ).lower(),
+    "ATOM_GLM52_TV_VERIFY_PATH": lambda: os.getenv(
+        "ATOM_GLM52_TV_VERIFY_PATH", ""
+    ).lower(),
+    "ATOM_GLM52_DRAFT_EXTEND_K_ONLY": lambda: os.getenv(
+        "ATOM_GLM52_DRAFT_EXTEND_K_ONLY", "0"
+    ).lower()
+    in ("1", "true", "yes"),
+    "ATOM_SGLANG_SPARSE_MLA_ALIGN_FP8_Q": lambda: os.getenv(
+        "ATOM_SGLANG_SPARSE_MLA_ALIGN_FP8_Q", "0"
+    ).lower()
+    in ("1", "true", "yes"),
     # --- Compilation & Execution ---
     "ATOM_USE_TRITON_GEMM": lambda: os.getenv("ATOM_USE_TRITON_GEMM", "0") == "1",
     "ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE": lambda: (

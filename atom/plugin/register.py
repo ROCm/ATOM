@@ -18,6 +18,7 @@ from atom.models.qwen3_5 import (
 )
 from atom.models.qwen3_moe import Qwen3MoeForCausalLM
 from atom.plugin.prepare import is_rtpllm, is_sglang, is_vllm
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -186,7 +187,7 @@ def _patch_sglang_dsv4_draft_backends() -> None:
 def _patch_sglang_mtp_total_accept_rate_logging() -> None:
     """Log cumulative SGLang speculative acceptance statistics."""
 
-    if os.getenv("ATOM_SGLANG_MTP_LOG", "0") != "1":
+    if not envs.ATOM_SGLANG_MTP_LOG:
         return
 
     try:
@@ -312,7 +313,6 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
             )
             return any(
                 "GlmMoeDsaForCausalLMNextN" in str(arch)
-                or "DeepseekV3ForCausalLMNextN" in str(arch)
                 for arch in arches
             )
         except Exception:
@@ -381,6 +381,8 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
         return hidden_states
 
     def _env_flag(name: str) -> bool:
+        if name in envs.environment_variables:
+            return bool(getattr(envs, name))
         return os.environ.get(name, "0").lower() in ("1", "true", "yes", "on")
 
     def _is_dsv4_flash_runner(runner) -> bool:
@@ -539,7 +541,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                 model_runner = getattr(self, "model_runner", None)
                 if _is_glm52_nextn_runner(
                     model_runner
-                ) and not _uses_glm52_generic_draft_frontend(model_runner):
+                ) and _uses_glm52_generic_draft_frontend(model_runner):
                     from atom.plugin.sglang.runtime.forward_context import (
                         stage_glm52_draft_decode_graph_metadata,
                     )
@@ -762,6 +764,11 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                 import torch
                 from sglang.srt.speculative.eagle_info import EagleDraftInput
                 from sglang.srt.speculative.spec_utils import fast_topk
+
+                if not hasattr(
+                    EagleDraftInput, "prepare_for_extend_to_fill_draft_kvcache"
+                ):
+                    return original_draft_extend_for_decode(self, batch, batch_result)
 
                 num_draft_tokens = int(
                     getattr(self, "speculative_num_draft_tokens", 0)
@@ -1006,7 +1013,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
 
 def _patch_sglang_eagle_v2_draft_argmax() -> None:
     """Use ATOM draft distributed argmax for SGLang EAGLE topk=1 drafting."""
-    if os.getenv("ATOM_SGLANG_DRAFT_ARGMAX", "1").lower() in ("0", "false", "no"):
+    if not envs.ATOM_SGLANG_DRAFT_ARGMAX:
         return
     try:
         from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
@@ -1273,8 +1280,13 @@ def init_aiter_dist(config: Config) -> None:
 
     distributed_init_method = get_distributed_init_method(dp_master_ip, dp_master_port)
 
+    prefill_context_parallel_size = config.prefill_context_parallel_size
     logger.info(
-        f"Initialize aiter dist for using aiter custom collective op for plugin mode, rank:{rank}"
+        "Initialize aiter dist for using aiter custom collective op for "
+        f"plugin mode, rank:{rank}, tp:{tensor_parallel_size}, "
+        f"pcp:{prefill_context_parallel_size}, "
+        f"dp:{config.parallel_config.data_parallel_size}, "
+        f"dp_rank:{config.parallel_config.data_parallel_rank}"
     )
     init_dist_env(
         tensor_model_parallel_size=tensor_parallel_size,
@@ -1283,4 +1295,5 @@ def init_aiter_dist(config: Config) -> None:
         distributed_init_method=distributed_init_method,
         data_parallel_size=config.parallel_config.data_parallel_size,
         data_parallel_rank=config.parallel_config.data_parallel_rank,
+        prefill_context_model_parallel_size=prefill_context_parallel_size,
     )
