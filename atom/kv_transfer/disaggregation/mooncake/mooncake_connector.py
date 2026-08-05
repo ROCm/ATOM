@@ -305,6 +305,8 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         self.dp_size = config.parallel_config.data_parallel_size
         self.dp_rank = config.parallel_config.data_parallel_rank
         self.pp_size = config.pipeline_parallel_size
+        self.block_size = config.kv_cache_block_size
+        self.hash_block_size = self.block_size * config.decode_context_parallel_size
         self.host_ip = get_ip()
 
         # Pending requests: req_id -> (Sequence, block_table)
@@ -380,12 +382,26 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             self._reqs_need_recv[seq.id] = (seq, seq.block_table, slot_index)
             params["do_remote_prefill"] = False
             params["local_slot_index"] = slot_index
+            # PD incremental: the leading blocks the decode node already holds
+            # from a prior turn's prefix cache (allocate() reused them and set
+            # num_cached_tokens) are transferred by neither side. Disabled for
+            # stateful backends — SWA pool and per-request slot state (V4/DSA)
+            # are not covered by this block-only delta path, so fall back to full.
+            num_computed_blocks = 0
+            if (
+                not getattr(seq, "swa_block_table", None)
+                and not getattr(seq, "has_per_req_cache", False)
+                and self.hash_block_size > 0
+            ):
+                num_computed_blocks = seq.num_cached_tokens // self.hash_block_size
+            params["num_computed_blocks"] = num_computed_blocks
             logger.info(
                 "[SCHEDULER-CONSUMER] Queued req %s for remote KV recv "
-                "(%d blocks, slot=%d), transfer_id=%s, remote_host=%s, "
-                "remote_handshake_port=%s",
+                "(%d blocks, %d locally cached, slot=%d), transfer_id=%s, "
+                "remote_host=%s, remote_handshake_port=%s",
                 seq.id,
                 len(seq.block_table),
+                num_computed_blocks,
                 slot_index,
                 params.get("transfer_id"),
                 params.get("remote_host"),
@@ -922,16 +938,34 @@ class MooncakeConnector(KVConnectorBase):
                 self._pending_recv_expected[req_id] = expected_responses
                 self._pending_recv_nonce[req_id] = write_nonce
 
+            # PD incremental: skip the leading blocks the decode node already
+            # holds locally. Both dst and remote src are sliced by the same
+            # offset so block i stays aligned across nodes. A corrupt/oversized
+            # offset falls back to a full transfer.
+            remote_block_ids = meta.remote_block_ids or []
+            off = meta.num_computed_blocks
+            if (
+                off < 0
+                or off >= len(meta.local_block_ids)
+                or off >= len(remote_block_ids)
+            ):
+                off = 0
+            dst_block_ids = meta.local_block_ids[off:]
+            src_block_ids = remote_block_ids[off:]
+
             # Build the (stage-independent) write_request payload once.
             request_body = {
                 "request_id": req_id,
                 "transfer_id": meta.transfer_id,
                 "consumer_host": self.local_ip,
                 "consumer_rpc_port": self.rpc_port,
-                "dst_block_ids": meta.local_block_ids,
+                "dst_block_ids": dst_block_ids,
                 # Source block_ids so downstream stages (no scheduler, no
                 # _completed_prefills) can transfer without a local lookup.
-                "src_block_ids": meta.remote_block_ids,
+                "src_block_ids": src_block_ids,
+                # Producer slices its local prefill block_ids by this offset in
+                # the TP-TP path (where it uses its own cache, not src above).
+                "num_computed_blocks": off,
                 "notify_host": self.local_ip,
                 "notify_port": self._notification_port,
                 "consumer_tp_size": self.tp_size,
@@ -997,17 +1031,20 @@ class MooncakeConnector(KVConnectorBase):
                 self._send_on_socket(remote_addr, [MSG_WRITE_REQUEST, write_request])
                 logger.info(
                     "[CONSUMER] write_request sent for req %s (transfer_id=%s) "
-                    "to stage %d/%d at %s, dst_block_ids=%s",
+                    "to stage %d/%d at %s, off=%d, dst_block_ids=%s",
                     req_id,
                     meta.transfer_id,
                     stage,
                     remote_pp_size,
                     remote_addr,
-                    meta.local_block_ids[:10],
+                    off,
+                    dst_block_ids[:10],
                 )
 
             self._pending_recv.add(req_id)
-            self._pending_recv_blocks[req_id] = list(meta.local_block_ids)
+            # Only the delta blocks are RDMA-written, so only they need fencing;
+            # the reused prefix blocks are already coherent.
+            self._pending_recv_blocks[req_id] = list(dst_block_ids)
             if meta.local_slot_index >= 0:
                 self._pending_recv_slots[req_id] = (
                     meta.local_slot_index,
@@ -1204,6 +1241,23 @@ class MooncakeConnector(KVConnectorBase):
                 }
 
             src_block_ids = prefill_data["block_ids"]
+            # PD incremental (TP-TP): dst is already sliced by the consumer, but
+            # src here comes from the producer's own full prefill block_table, so
+            # slice it by the same offset to keep block i aligned. (Under PP the
+            # consumer-supplied src is already sliced, so skip.)
+            if self.pp_size == 1:
+                off = request_data.get("num_computed_blocks", 0)
+                if 0 < off < len(src_block_ids):
+                    src_block_ids = src_block_ids[off:]
+            if len(src_block_ids) != len(dst_block_ids):
+                logger.error(
+                    "[PRODUCER] src/dst block count mismatch for req %s "
+                    "(src=%d, dst=%d); aborting transfer to avoid misaligned KV.",
+                    req_id,
+                    len(src_block_ids),
+                    len(dst_block_ids),
+                )
+                return
             target = f"{consumer_host}:{consumer_rpc_port}"
 
             if hasattr(self.transfer_engine, "get_first_buffer_address"):
