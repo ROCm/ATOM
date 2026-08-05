@@ -510,3 +510,54 @@ class TestDecodeBlockHashing:
         bm.hash_decode_blocks(seq, seq.num_tokens)
         assert seq.num_hashed_tokens == 0
         assert not bm.kv.num_indexed
+
+
+# ── register_received_prefix (PD consumer) ─────────────────────────────────
+
+
+class TestRegisterReceivedPrefix:
+    def test_registers_full_prompt_blocks_enabling_next_turn_hit(
+        self, block_manager_prefix, seq_factory
+    ):
+        bm = block_manager_prefix
+        # PD consumer: a remote-prefill request whose full prompt KV arrived via
+        # RDMA. It never ran a prefill forward, so its blocks are unhashed until
+        # register_received_prefix publishes them.
+        a = seq_factory(list(range(1, 13)))  # 12 tokens, bs=4 -> 3 full blocks
+        bm.allocate(a)
+        registered = bm.register_received_prefix(a)
+        assert registered == 3
+        # Next turn with the same prefix now hits locally (last block excluded).
+        b = seq_factory(list(range(1, 13)))
+        assert bm.can_allocate(b) == 2
+
+    def test_noop_without_prefix_caching(self, block_manager, seq_factory):
+        a = seq_factory(list(range(1, 13)))
+        block_manager.allocate(a)
+        assert block_manager.register_received_prefix(a) == 0
+
+    def test_excludes_trailing_partial_block(self, block_manager_prefix, seq_factory):
+        bm = block_manager_prefix
+        a = seq_factory(list(range(1, 11)))  # 10 tokens, bs=4 -> 2 full + partial
+        bm.allocate(a)
+        assert bm.register_received_prefix(a) == 2
+
+    def test_dcp_uses_hash_block_granularity(self, seq_factory, monkeypatch):
+        cfg = MockConfig(
+            num_kvcache_blocks=4,
+            kv_cache_block_size=4,
+            decode_context_parallel_size=2,
+            enable_prefix_caching=True,
+        )
+        bm = BlockManager(cfg)
+        monkeypatch.setattr(
+            bm,
+            "_dcp_num_blocks",
+            lambda seq_len: (seq_len + bm.hash_block_size - 1) // bm.hash_block_size,
+        )
+        a = seq_factory(list(range(16)))
+        bm.allocate(a)
+        assert bm.register_received_prefix(a) == 2
+
+        b = seq_factory(list(range(16)))
+        assert bm.can_allocate(b) == 1
