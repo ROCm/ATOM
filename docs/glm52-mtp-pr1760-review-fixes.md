@@ -90,5 +90,36 @@ The TP4 MTP recipe used `CUDA_VISIBLE_DEVICES=4,5,6,7`,
 ## Remaining validation gate
 
 The code-level reviewer items above are addressed and the TP4 MTP graph path
-has passed end-to-end validation. PCP2 end-to-end validation additionally
-requires eight available GPUs.
+has passed end-to-end validation.
+
+## PCP2 validation status
+
+A GLM-5.2 MXFP4 PCP2 attempt was made in `zhiwei_sgl_atom_0803` with all eight
+GPUs free and the benchmark launch arguments:
+
+```text
+--tp-size 4 --enable-nsa-prefill-context-parallel --attn-cp-size 2
+--nsa-prefill-cp-mode round-robin-split
+```
+
+The server reached application startup and produced `ATTN_CP0` through
+`ATTN_CP3` workers, proving that the SGLang PCP launch path and restored plugin
+distributed initialization execute. The container's `topk_v2` JIT first failed
+because `cooperative_groups.h` is absent; setting `SGLANG_OPT_USE_TOPK_V2=false`
+removed that unrelated environment failure.
+
+The retry still fails during SGLang's warmup decode with
+`HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION`. Its synchronous stack is:
+
+```text
+deepseek_v2_moe_pcp_merge_forward
+  -> DeepseekV2MoE._pcp_moe_merge_forward
+  -> routed_expert_forward
+  -> aiter.moe_forward
+```
+
+This occurs before an external request and after ordinary PCP process-group
+startup, so PCP2 cannot yet be considered end-to-end supported on this SGLang
+container. The server was stopped and GPUs released. The remaining fix is to
+align the PCP MoE-merge dispatch with the SGLang NSA context-parallel layout
+used by this version, then rerun the long-prefill request.
