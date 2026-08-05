@@ -255,4 +255,3 @@ vLLM 0.26.1 原生行为，因此不重新引入 Qwen3.5 的旧 metadata 问题�
   `ci/kimi-k3-gsm8k/kda-metadata-adapter-active64-full/results/20260805070651_Kimi-K3-kda-adapter-full.json`
 - Kimi-K3 (`guanbao/vllm_0.26_vision`, active64)：
   `ci/kimi-k3-gsm8k/vision-branch-full/results/20260805040551_Kimi-K3-vision-branch.json`
-
