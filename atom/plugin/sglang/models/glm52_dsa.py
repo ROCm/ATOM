@@ -41,9 +41,18 @@ def _patch_aiter_flat_fmoe_for_glm52_mi308() -> None:
         )
         return
 
+    try:
+        gfx = get_gfx()
+    except Exception:
+        logger.debug("Failed to query gfx target for GLM-5.2 patch", exc_info=True)
+        return
+
+    if gfx != "gfx942":
+        return
+
     def _get_2stage_cfgs_without_unsupported_flat(*args, **kwargs):
         metadata = original_get_2stage_cfgs(*args, **kwargs)
-        if not getattr(metadata, "flat", False) or get_gfx() == "gfx950":
+        if not getattr(metadata, "flat", False):
             return metadata
 
         previous_bypass = os.environ.get("AITER_BYPASS_TUNE_CONFIG")
@@ -62,13 +71,13 @@ def _patch_aiter_flat_fmoe_for_glm52_mi308() -> None:
         if getattr(fallback_metadata, "flat", False):
             logger.warning(
                 "AITER fallback metadata is still flat on %s; forcing non-flat routing",
-                get_gfx(),
+                gfx,
             )
             fallback_metadata.flat = False
         else:
             logger.warning(
                 "Bypassed AITER flat FMOE tuned config for GLM-5.2 on %s",
-                get_gfx(),
+                gfx,
             )
         return fallback_metadata
 
