@@ -28,33 +28,31 @@ pip install -e /path/to/ATOM --no-deps
 ```bash
 MODEL=/path/to/Kimi-K3
 
-export AITER_LOG_LEVEL=WARNING
-export ATOM_LOADER_USE_THREADPOOL=1
-export ATOM_LOADER_THREADPOOL_WORKERS=16
-export ATOM_SYNC_AFTER_LOAD=1
-export ATOM_DIST_TIMEOUT_SECONDS=3600
+# A4W4 MOE require
+export AITER_SITUV2_A4W4=1
+# A8W4 MOE require
+# export AITER_SITUV2_A8W4=0
+# export ATOM_MOE_GU_ITLV=0
 
-export ATOM_USE_TRITON_GEMM=1
-export AITER_USE_GROUPED_GEMM=0
-export ATOM_USE_TRITON_MOE=0
-export AITER_FLYDSL_FORCE=1
-export AITER_FORCE_GFX1250=0
+export VLLM_USE_BREAKABLE_CUDAGRAPH=0
 
 vllm serve "${MODEL}" \
     --host 0.0.0.0 \
     --port 8000 \
     --tensor-parallel-size 8 \
     --trust-remote-code \
-    --language-model-only \
+    --no-enable-prefix-caching \
     --kv-cache-dtype fp8 \
-    --max-model-len 16384 \
     --max-num-seqs 64 \
     --max-num-batched-tokens 16384 \
     --gpu-memory-utilization 0.93 \
     --block-size 128 \
-    --no-enable-prefix-caching \
-    --no-async-scheduling \
-    --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE"}'
+    --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE"}' \
+    --enable-auto-tool-choice \
+    --tool-call-parser kimi_k3 \
+    --reasoning-parser kimi_k3 
+
+  # --online_quant_config '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "*self_attn.[qkv]_conv1d*", "*block_sparse_moe.experts*", "*block_sparse_moe.routed_expert_*", "*vision_tower*", "*mm_projector*"]}' \
 ```
 
 The plugin keeps KDA temporal state in fp32, registers every KDA layer through
