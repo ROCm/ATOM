@@ -85,6 +85,15 @@ class _AtomCausalLMBaseForSglang(nn.Module):
         self.unpadded_vocab_size = config.vocab_size
         self.model_arch = getattr(config, "architectures", [""])[0]
         self.model_arch_spec = get_model_arch_spec(self.model_arch)
+        if self.model_arch_spec.uses_text_config:
+            text_config = getattr(config, "text_config", None)
+            if text_config is None:
+                raise ValueError(
+                    f"{self.model_arch} requires a nested text_config for SGLang"
+                )
+            self.config = text_config
+            self.vocab_size = text_config.vocab_size
+            self.unpadded_vocab_size = text_config.vocab_size
         self.capture_aux_hidden_states = False
 
         with plugin_runtime_scope(framework="sglang"):
@@ -423,7 +432,9 @@ class _AtomCausalLMBaseForSglang(nn.Module):
 
         with plugin_runtime_scope(framework="sglang", atom_config=self.atom_config):
             return load_model_in_plugin_mode(
-                model=self.model, config=self.atom_config, prefix="model."
+                model=self.model,
+                config=self.atom_config,
+                prefix=self.model_arch_spec.load_weights_prefix,
             )
 
 
