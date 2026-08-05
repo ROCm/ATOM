@@ -76,13 +76,13 @@ expose the older API.
 | Focused runtime-owner, graph-metadata, and MTP IndexShare tests | Passed: 20 tests |
 | `git diff --check` | Passed |
 | IDE diagnostics for edited files | No diagnostics |
-| GLM-5.2 TP4 server on GPUs 4–7 | Blocked: the configured checkpoint `/workspace/shared/data/amd_int/models/GLM-5.2-MXFP4` and standard local Hugging Face cache entry were absent |
+| GLM-5.2 TP4 server on GPUs 4–7 | Blocked: in `zhiwei_sgl_atom_0802` the checkpoint mount was absent; `zhiwei_sgl_atom_0803` has the checkpoint, but its Kimi-K3 TP8 server occupies all eight GPUs |
 
-At the time of the server attempt GPUs 4–7 had only the baseline ~304 MiB
-reservation each, while GPUs 0–3 were occupied. The TP4 MTP recipe uses
-`CUDA_VISIBLE_DEVICES=4,5,6,7`, `--max-running-requests 256`, and
-`--cuda-graph-max-bs-decode 256`; it is ready to run once the checkpoint is
-mounted or `MODEL_PATH` is set to its actual path.
+The TP4 MTP recipe uses `CUDA_VISIBLE_DEVICES=4,5,6,7`,
+`--max-running-requests 256`, and `--cuda-graph-max-bs-decode 256`. The
+checkpoint is available in `zhiwei_sgl_atom_0803` at
+`/workspace/shared/data/amd_int/models/GLM-5.2-MXFP4`; validation can start
+once four GPUs are released from its active Kimi-K3 TP8 server.
 
 ## Remaining validation gate
 
