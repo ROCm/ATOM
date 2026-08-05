@@ -615,5 +615,8 @@ class KimiK3DSpark(DSparkDraftModel):
         for k in range(T):
             bias, _ = self.markov_head(out_ids[:, k])
             # Greedy: temperature/sampling is applied by the target's verify.
-            out_ids[:, k + 1] = (base_logits[:, k].float() + bias).argmax(dim=-1)
+            # No .float() on the slice: bf16 + fp32 already promotes to fp32
+            # before the add, so casting first only materializes the [B, V]
+            # slice a second time for a bit-identical sum.
+            out_ids[:, k + 1] = (base_logits[:, k] + bias).argmax(dim=-1)
         return out_ids[:, 1:]

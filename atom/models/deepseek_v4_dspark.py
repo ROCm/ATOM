@@ -992,7 +992,10 @@ class _DSparkInner(nn.Module):
         markov_embeds = []
         for k in range(T):
             bias, m_embed = last.markov_head(out_ids[:, k])  # [B, V], [B, r]
-            logits_k = base_logits[:, k].float() + bias
+            # No .float() on the slice: bf16 + fp32 already promotes to fp32
+            # before the add, so casting first only materializes the [B, V]
+            # slice a second time for a bit-identical sum.
+            logits_k = base_logits[:, k] + bias
             out_ids[:, k + 1] = logits_k.argmax(
                 dim=-1
             )  # greedy (temp handled upstream)
