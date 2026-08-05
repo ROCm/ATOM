@@ -60,6 +60,7 @@ class WeightDispatcher:
         detect_fused_expert_fn: Callable[[str], bool] | None,
         get_fused_expert_mapping_fn: Callable[[], Sequence[tuple]] | None,
         load_fused_expert_weights_fn: Callable | None,
+        on_fused_param: Callable[[nn.Parameter], None] | None = None,
     ):
         self.model = model
         self.params_dict = params_dict
@@ -77,6 +78,8 @@ class WeightDispatcher:
         self.detect_fused_expert_fn = detect_fused_expert_fn
         self.get_fused_expert_mapping_fn = get_fused_expert_mapping_fn
         self.load_fused_expert_weights_fn = load_fused_expert_weights_fn
+        # Fused writes bypass `submit` and need storage prepared first.
+        self.on_fused_param = on_fused_param
 
         self.loaded_weights_record: set[str] = set()
         self.dropped_ckpt_keys: list[tuple[str, str]] = []
@@ -181,6 +184,8 @@ class WeightDispatcher:
             # the staging pool must not also own it -- see ExpertStagingPool's
             # ownership rule.
             self.staging_pool.decline(self.params_dict[name_mapped])
+            if self.on_fused_param is not None:
+                self.on_fused_param(self.params_dict[name_mapped])
 
             # Generic call - model provides implementation details
             num_experts = getattr(self.hf_config, "n_routed_experts", 0) or getattr(
@@ -194,7 +199,7 @@ class WeightDispatcher:
                 shard_id,
                 num_experts,
             ):
-                self._record(name)
+                self._record(name_mapped)
                 return True
         return False
 
