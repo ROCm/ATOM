@@ -256,6 +256,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_LOADER_STRICT_COVERAGE": lambda: (
         os.getenv("ATOM_LOADER_STRICT_COVERAGE", "true").lower() == "true"
     ),
+    # Quantize eligible modules as they load to reduce peak memory. Streaming
+    # quantizes local TP shards, so results may differ slightly from offline.
+    "ATOM_ONLINE_QUANT_STREAMING": lambda: (
+        os.getenv("ATOM_ONLINE_QUANT_STREAMING", "1").lower() in ("1", "true")
+    ),
+    # Tail workers for H2D, quantization, and source release. More workers
+    # increase overlap and in-flight memory; 0 runs inline.
+    "ATOM_ONLINE_QUANT_STREAMING_THREADS": lambda: int(
+        os.getenv("ATOM_ONLINE_QUANT_STREAMING_THREADS", "4")
+    ),
+    # Stage on the host and upload once per completed parameter. Disabling this
+    # buffers loader calls on meta and forces a single-threaded checkpoint walk.
+    "ATOM_ONLINE_QUANT_STREAMING_HOST_STAGING": lambda: (
+        os.getenv("ATOM_ONLINE_QUANT_STREAMING_HOST_STAGING", "1").lower()
+        in ("1", "true")
+    ),
     # --- Attention Backend ---
     # Use unified_attention (flash-style) for MHA paged/prefill attention instead
     # of pa_decode_gluon. Set to 1 to enable the unified_attention path.

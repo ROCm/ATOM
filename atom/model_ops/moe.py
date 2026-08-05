@@ -69,8 +69,13 @@ from atom.model_ops.utils import (
     shuffle_weights,
 )
 from atom.plugin.vllm.moe import FusedMoEDecoratorForPluginMode
-from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
+from atom.quant_spec import (
+    LayerQuantConfig,
+    should_skip_online_quant,
+    should_stream_online_quant,
+)
 from atom.quantization.quark.utils import (
+    dequant_moe_weight_online,
     dequant_weight_online,
     quant_weight_online,
 )
@@ -654,6 +659,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        # Streaming source weights start on meta; target weights remain real.
+        stream_online_quant = getattr(layer, "_stream_online_quant", False)
+        weight_device = "meta" if stream_online_quant else None
+
         # Fused gate_up_proj (column parallel)
         w13_weight = atom_parameter(
             torch.empty(
@@ -661,6 +670,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
                 2 * intermediate_size_per_partition,
                 hidden_size,
                 dtype=params_dtype,
+                device=weight_device,
             )
         )
         layer.register_parameter("w13_weight", w13_weight)
@@ -673,6 +683,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
                 hidden_size,
                 intermediate_size_per_partition,
                 dtype=params_dtype,
+                device=weight_device,
             )
         )
         layer.register_parameter("w2_weight", w2_weight)
@@ -945,6 +956,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.intermediate_pad = (
             self.intermediate_size - layer.intermediate_size_per_partition
         )
+        # MXFP4 is target-only; online dequantization accepts only FP8 sources.
         # Fused gate_up_proj (column parallel)
         w13_weight = atom_parameter(
             torch.empty(
@@ -2054,6 +2066,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     ):
         self.num_experts = num_experts
         intermediate_size_for_weight = intermediate_size_per_partition
+        # Transient sources use checkpoint shapes; target-only kernel padding
+        # would prevent streaming coverage from completing.
+        stream_online_quant = getattr(layer, "_stream_online_quant", False)
 
         if self.block_quant:
             if self.quant_type == QuantType.per_1x128:
@@ -2080,10 +2095,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     f"{intermediate_size_per_partition} is not divisible by "
                     f"weight quantization block_k = {block_k}."
                 )
-            if self.quant_type == QuantType.per_1x32:
+            if self.quant_type == QuantType.per_1x32 and not stream_online_quant:
                 # aiter's GU-interleaved MXFP8 scale shuffle packs 8 scale
                 # columns, i.e. 256 weight columns for 1x32 scales. TP8 on
                 # MiniMax-M3 has local intermediate=384, so pad to 512.
+                # For stream online quantization
+                # Streaming sources skip this padding because they are temporary
+                # checkpoint storage and never enter the shuffled kernel. Keeping
+                # their logical shape also lets loaded coverage reach the expected
+                # numel. This does not change the quantized target: _online_quant
+                # clears the streaming flag before creating its target buffers.
                 scale_pack_k = block_k * 8
                 intermediate_size_for_weight = (
                     (intermediate_size_per_partition + scale_pack_k - 1)
@@ -2092,16 +2113,19 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 )
 
         # WEIGHTS
+        weight_device = "meta" if stream_online_quant else None
         w13_weight = atom_parameter(
             torch.empty(
                 num_experts,
                 2 * intermediate_size_for_weight,
                 hidden_size,
                 dtype=params_dtype,
+                device=weight_device,
             )
         )
         layer.register_parameter("w13_weight", w13_weight)
-        if self.quant_type == QuantType.per_1x32:
+        # Only target buffers contain padding bytes.
+        if self.quant_type == QuantType.per_1x32 and not stream_online_quant:
             w13_weight.data.view(torch.uint8).zero_()
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
@@ -2111,10 +2135,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 hidden_size,
                 intermediate_size_for_weight,
                 dtype=params_dtype,
+                device=weight_device,
             )
         )
         layer.register_parameter("w2_weight", w2_weight)
-        if self.quant_type == QuantType.per_1x32:
+        if self.quant_type == QuantType.per_1x32 and not stream_online_quant:
             w2_weight.data.view(torch.uint8).zero_()
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
@@ -2767,6 +2792,14 @@ class FusedMoE(torch.nn.Module):
             "params_dtype": self.params_dtype,
             "weight_loader": self.weight_loader,
         }
+        # Set before create_weights so streaming sources allocate on meta.
+        self._stream_online_quant = should_stream_online_quant(
+            quant_config,
+            prefix,
+            layer_quant_config.quant_type if layer_quant_config else QuantType.No,
+            self.params_dtype,
+        )
+        self._load_device = torch.empty(0).device if self._stream_online_quant else None
         self.quant_method.create_weights(layer=self, **self.moe_quant_params)
         compilation_config = atom_config.compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -2851,6 +2884,140 @@ class FusedMoE(torch.nn.Module):
                 "the dispatch space; the legacy AITER fusion is unsupported."
             )
 
+    def _online_quant_row_local_batched(
+        self,
+        old_w13_data: torch.Tensor,
+        old_w2_data: torch.Tensor,
+        old_w13_scale: torch.Tensor | None,
+        old_w2_scale: torch.Tensor | None,
+        source_quant_type: QuantType,
+        source_quant_dtype: torch.dtype | None,
+        online_quant_type: QuantType,
+        online_quant_dtype: torch.dtype,
+    ) -> None:
+        """Batch row-local experts to accelerate streaming online quantization."""
+        batch_size = 8
+
+        def _quantize(source, scale):
+            bf16 = dequant_moe_weight_online(
+                source,
+                scale,
+                source_quant_type,
+                source_quant_dtype,
+            )
+            quantized, quant_scale = quant_weight_online(
+                bf16,
+                online_quant_type=online_quant_type,
+                online_quant_dtype=online_quant_dtype,
+            )
+            del bf16
+            return quantized, quant_scale
+
+        def _reshape_scale(scale: torch.Tensor, count: int) -> torch.Tensor:
+            assert scale.dim() == 2, (
+                "row-local online quantization must return a 2D scale, "
+                f"got shape={tuple(scale.shape)}"
+            )
+            assert scale.shape[0] % count == 0
+            return scale.reshape(count, scale.shape[0] // count, scale.shape[1])
+
+        def _copy_scale(
+            target: torch.Tensor,
+            source: torch.Tensor,
+            *,
+            split_gate_up: bool,
+        ) -> None:
+            # PTPC stores [E, rows], while block schemes store
+            # [E, scale_rows, scale_cols].
+            if online_quant_type == QuantType.per_Token:
+                assert source.shape[2] == 1
+                source = source.squeeze(2)
+            assert source.dim() == target.dim()
+
+            def _copy_rows(
+                target_start: int,
+                source_start: int,
+                rows: int,
+            ) -> None:
+                if target.dim() == 2:
+                    target_region = target[:, target_start : target_start + rows]
+                    source_region = source[:, source_start : source_start + rows]
+                else:
+                    target_region = target[
+                        :,
+                        target_start : target_start + rows,
+                        : source.shape[2],
+                    ]
+                    source_region = source[
+                        :,
+                        source_start : source_start + rows,
+                    ]
+                FusedMoE._copy_quant_storage(target_region, source_region)
+
+            if split_gate_up:
+                source_half_rows = source.shape[1] // 2
+                target_half_rows = target.shape[1] // 2
+                _copy_rows(0, 0, source_half_rows)
+                _copy_rows(
+                    target_half_rows,
+                    source_half_rows,
+                    source_half_rows,
+                )
+            else:
+                _copy_rows(0, 0, source.shape[1])
+
+        for start in range(0, self.local_num_experts, batch_size):
+            end = min(start + batch_size, self.local_num_experts)
+            count = end - start
+
+            # Copy gate/up separately to support target-side padding between
+            # the two halves; without padding their offsets are identical.
+            source_w13 = old_w13_data[start:end]
+            source_w13_scale = (
+                old_w13_scale[start:end] if old_w13_scale is not None else None
+            )
+            w13_q, w13_s = _quantize(source_w13, source_w13_scale)
+            source_w13_rows = source_w13.shape[1]
+            source_half_rows = source_w13_rows // 2
+            w13_q = w13_q.reshape(count, source_w13_rows, w13_q.shape[1])
+            w13_s = _reshape_scale(w13_s, count)
+
+            target_w13 = self.w13_weight.data[start:end]
+            target_w13_scale = self.w13_weight_scale.data[start:end]
+            target_half_rows = target_w13.shape[1] // 2
+            FusedMoE._copy_quant_storage(
+                target_w13[:, :source_half_rows, : w13_q.shape[2]],
+                w13_q[:, :source_half_rows],
+            )
+            FusedMoE._copy_quant_storage(
+                target_w13[
+                    :,
+                    target_half_rows : target_half_rows + source_half_rows,
+                    : w13_q.shape[2],
+                ],
+                w13_q[:, source_half_rows:],
+            )
+            _copy_scale(target_w13_scale, w13_s, split_gate_up=True)
+            del w13_q, w13_s
+
+            source_w2 = old_w2_data[start:end]
+            source_w2_scale = (
+                old_w2_scale[start:end] if old_w2_scale is not None else None
+            )
+            w2_q, w2_s = _quantize(source_w2, source_w2_scale)
+            source_w2_rows = source_w2.shape[1]
+            w2_q = w2_q.reshape(count, source_w2_rows, w2_q.shape[1])
+            w2_s = _reshape_scale(w2_s, count)
+
+            target_w2 = self.w2_weight.data[start:end]
+            target_w2_scale = self.w2_weight_scale.data[start:end]
+            FusedMoE._copy_quant_storage(
+                target_w2[:, :source_w2_rows, : w2_q.shape[2]],
+                w2_q,
+            )
+            _copy_scale(target_w2_scale, w2_s, split_gate_up=False)
+            del w2_q, w2_s
+
     def _online_quant(self):
         """Handle online quantization: (optionally dequant →) quantize weights,
         then switch quant_method.
@@ -2861,6 +3028,7 @@ class FusedMoE(torch.nn.Module):
           2. Switch quant_method and allocate target quantized buffers
           3. Per-expert: quantize bf16 → write into buffers via
              _load_model_weight_or_group_weight_scale (reuses TP-shard + padding)
+             Row-local targets may batch experts before writing the same layout.
           4. Loader then calls target method's process_weights_after_loading
              which does fn→fnuz normalization and shuffle on the already-FP8 weights.
         """
@@ -2918,13 +3086,14 @@ class FusedMoE(torch.nn.Module):
         # w13 (column parallel): (E, (2*intermediate/tp, hidden)) — TP dim 0
         # w2  (row parallel):    (E, (hidden, intermediate/tp)) — TP dim 1
         # w13 [e, m, n]->[e, m//tp, n//2]->[e, m//tp, n//32]
+        # Streaming tails must remain collective-free across ranks.
         def check_need_allgather():
             if self.use_ep:
                 assert self.tp_size == 1, "EP MoE should not TP-shard expert weights"
                 return False
 
             need_gather_w2 = False
-            if self.tp_size > 1:
+            if not self._stream_online_quant and self.tp_size > 1:
                 # self.intermediate_size_per_partition = intermediate_size // self.tp_size
                 w2_in = self.intermediate_size_per_partition
                 if online_quant_type == QuantType.per_Token:
@@ -2957,11 +3126,40 @@ class FusedMoE(torch.nn.Module):
                 f"Unsupported online quant_dtype for MoE: {online_quant_dtype}"
             )
         self.moe_quant_params["params_dtype"] = online_quant_dtype
+        # Target buffers must use real storage.
+        self._stream_online_quant = False
         with torch.device(device):
             self.quant_method.create_weights(layer=self, **self.moe_quant_params)
 
         self.w13_input_scale = None
         self.w2_input_scale = None
+
+        # Batch row-local formats; per-tensor and gathered formats stay expertwise.
+        row_local_target = online_quant_type in (
+            QuantType.per_Token,
+            QuantType.per_1x32,
+            QuantType.per_1x128,
+        )
+        target_rows_are_batchable = online_quant_type != QuantType.per_1x128 or (
+            old_w13_data.shape[1] // 2 % 128 == 0 and old_w2_data.shape[1] % 128 == 0
+        )
+        if row_local_target and target_rows_are_batchable and not need_gather_w2:
+            self._online_quant_row_local_batched(
+                old_w13_data=old_w13_data,
+                old_w2_data=old_w2_data,
+                old_w13_scale=old_w13_scale,
+                old_w2_scale=old_w2_scale,
+                source_quant_type=source_quant_type,
+                source_quant_dtype=source_quant_dtype,
+                online_quant_type=online_quant_type,
+                online_quant_dtype=online_quant_dtype,
+            )
+            self._online_quant_info = {
+                "layer": self.layer_name,
+                "quant_type": online_quant_type.name,
+                "quant_dtype": str(online_quant_dtype),
+            }
+            return
 
         for expert_id in range(self.local_num_experts):
             # --- w13 column-parallel ---
@@ -3590,6 +3788,20 @@ class FusedMoE(torch.nn.Module):
         if any(param is p for p in w2_batchable if p is not None):
             return n_local_base
         return None
+
+    def batched_expert_region_numel(
+        self,
+        param: torch.nn.Parameter,
+        local_expert_id: int,
+        shard_id: str,
+    ) -> int:
+        """Return the physical size of one staged ``(expert, shard)`` region."""
+        return expert_region(
+            param.data,
+            local_expert_id,
+            shard_id,
+            getattr(param, "is_transposed", False),
+        ).numel()
 
     @property
     def num_local_base_experts(self) -> int:
