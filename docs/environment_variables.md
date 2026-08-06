@@ -64,6 +64,7 @@ no wall-clock skew). See `atom/model_engine/prefill_delayer.py`. Active only whe
 | **ATOM_USE_TRITON_GEMM** | bool | 0 (false) | If set to `1`, use AITER Triton FP4 weight preshuffled GEMM. Otherwise use AITER ASM FP4 weight preshuffled GEMM. |
 | **ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM** | bool | 0 (false) | If set to `1`, use AITER Triton FP4 GEMM with non-shuffled weights. Takes precedence over the FP4 preshuffled GEMM path selected by `ATOM_USE_TRITON_GEMM`. |
 | **ATOM_USE_TRITON_MXFP4_BMM** | bool | 0 (false) | If set to `1`, use FP4 BMM in MLA attention module. |
+| **ATOM_USE_AITER_ATTN_RES** | bool | 0 (false) | If set to `1`, serve the Kimi-K3 residual-candidate gate (`apply_attn_res`) from AITER (`aiter.ops.triton.fusions.attn_res.attn_res_gate`) instead of the in-tree Triton kernels. Same contract; AITER reads the packed block once into registers where the in-tree path is two-pass. Not bitwise equal: AITER reduces each hidden row in one shot where the in-tree kernel tiles it (and splits it across workgroups at small token counts), so the fp32 sums land differently, staying within one ULP of the bf16 output. It also autotunes on the first call — warm it before CUDAGraph capture. Read once at import time, so it must be set before ATOM is imported. Falls back to the in-tree kernels with a warning if AITER is unavailable. |
 
 ## Fusion passes
 
