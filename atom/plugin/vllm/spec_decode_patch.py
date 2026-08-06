@@ -3,84 +3,6 @@ import logging
 
 logger = logging.getLogger("atom")
 
-_K3_DSPARK_ARCH = "K3DSparkModel"
-# aiter has no fp8 MLA decode kernel wide enough for a multi-token draft block,
-# so the Kimi-K3 DSpark draft caches in bf16 even when the target is fp8.
-_K3_DSPARK_KV_CACHE_DTYPE = "bfloat16"
-
-
-def _patch_dspark_k3_draft_config() -> None:
-    """Pin the Kimi-K3 DSpark draft to causal attention and a bf16 KV cache.
-
-    Both are properties of how ATOM runs this draft, not of the checkpoint, so
-    they are stamped onto the resolved draft config rather than asked of the
-    user:
-
-    * **Causal drafting.** vLLM resolves the draft's causality from its config
-      (``dflash_has_any_non_causal``), and a config with neither ``layer_types``
-      nor a ``dflash_config`` resolves to non-causal -- every block position
-      attending to the whole block. ATOM's ``mla_decode_fwd`` masks
-      tail-aligned-causally whatever it is asked for, so that upper triangle
-      would have to be merged in by log-sum-exp, and ATOM owns its own backend
-      selection so vLLM's ``supports_non_causal`` gate never catches the
-      mismatch. Drafting causally instead matches ATOM's native DSpark --
-      position ``i`` sees ``context + block[:i+1]`` -- for one drafting
-      semantics across both engines and no merge to build. It costs the block's
-      tail, whose positions are rarely accepted. ``dflash_config.causal``
-      overrides every layer at once and is read by all three consumers: backend
-      selection, the draft's ``use_non_causal``, and the per-group causality the
-      speculator hands its metadata builders.
-    * **bf16 draft KV.** ``speculative_config.kv_cache_dtype`` is folded into the
-      cache config the draft is built under, which is where ATOM's MLA layers
-      read their dtype from.
-
-    Both are defaults: an explicit setting on either wins.
-    """
-    try:
-        from vllm.config.speculative import SpeculativeConfig
-    except ImportError:
-        logger.warning(
-            "vLLM plugin: failed to patch SpeculativeConfig for the Kimi-K3 "
-            "DSpark draft. This can happen with an incompatible vLLM version."
-        )
-        return
-
-    original_post_init = SpeculativeConfig.__post_init__
-    if getattr(original_post_init, "_atom_k3_dspark_patched", False):
-        return
-
-    @functools.wraps(original_post_init)
-    def patched_post_init(self):
-        original_post_init(self)
-        draft_model_config = getattr(self, "draft_model_config", None)
-        hf_config = getattr(draft_model_config, "hf_config", None)
-        if hf_config is None:
-            return
-        if _K3_DSPARK_ARCH not in (getattr(hf_config, "architectures", None) or ()):
-            return
-
-        dflash_config = dict(getattr(hf_config, "dflash_config", None) or {})
-        if "causal" not in dflash_config:
-            dflash_config["causal"] = True
-            hf_config.dflash_config = dflash_config
-            logger.info(
-                "ATOM plugin: drafting the %s block causally, matching ATOM's "
-                "native DSpark attention path.",
-                _K3_DSPARK_ARCH,
-            )
-
-        if self.kv_cache_dtype is None:
-            self.kv_cache_dtype = _K3_DSPARK_KV_CACHE_DTYPE
-            logger.info(
-                "ATOM plugin: giving the %s draft its own %s KV cache.",
-                _K3_DSPARK_ARCH,
-                _K3_DSPARK_KV_CACHE_DTYPE,
-            )
-
-    patched_post_init._atom_k3_dspark_patched = True
-    SpeculativeConfig.__post_init__ = patched_post_init
-    logger.info("ATOM plugin: patched SpeculativeConfig for the Kimi-K3 DSpark draft.")
-
 
 def _patch_eagle3_model_type_checks() -> None:
     # vLLM's V1 EAGLE proposer SpecDecodeBaseProposer.propose() has an explicit
@@ -615,7 +537,6 @@ def _patch_vllm_deepseek_v4_mtp_first_pass_inputs() -> None:
 
 def apply_vllm_spec_decode_patch() -> None:
     """Patch vLLM speculative decoding for ATOM metadata compatibility."""
-    _patch_dspark_k3_draft_config()
     _patch_vllm_llm_base_model_sharing()
     _patch_vllm_draft_kv_group_validation()
     _patch_vllm_draft_positions_on_metadata()

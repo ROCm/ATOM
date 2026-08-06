@@ -145,6 +145,11 @@ class AiterMlaDecodeMetadataForVllm:
     max_qo_len: int | None = None
     # Whether dense MLA persistent metadata was built for this decode batch.
     use_persistent_metadata: bool = False
+    # False only for a bidirectional draft block, where every position attends
+    # to the whole block. The asm kernel selects a different .co by this, and
+    # the persistent work descriptors are planned for it, so the two have to
+    # agree -- carry it here rather than re-deriving it in the layer.
+    causal: bool = True
     # The fold factor for handling mqa_ratio=64 in non-persistent mode
     fold_factor: int | None = None
     # Fold buffers for the MLA nhead-fold workaround. These are populated by
@@ -1213,7 +1218,11 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
 
     # TODO: support mtp and sparse
     def _set_mla_persistent_worker_buffers(
-        self, bs: int, cu_seqlens_q: torch.Tensor, max_q_len: int = 1
+        self,
+        bs: int,
+        cu_seqlens_q: torch.Tensor,
+        max_q_len: int = 1,
+        causal: bool = True,
     ):
         split_params = {
             "kv_granularity": max(self.block_size, 16),
@@ -1235,7 +1244,7 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
             self.paged_kv_last_page_len[:bs],
             self.persistent_num_heads,
             1,  # nhead_kv,
-            True,
+            causal,
             work_meta_data,
             work_info_set,
             work_indptr,
@@ -1265,6 +1274,7 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         query_start_loc_device: torch.Tensor,
         num_decode_tokens: int,
         dcp_tot_seq_lens_device: torch.Tensor | None,
+        causal: bool = True,
     ):
         # kernel block size is always 1, although the kv block size is not 1.
         device = self.device
@@ -1376,6 +1386,7 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
                 num_reqs,
                 qo_indptr,
                 max_qo_len,
+                causal=causal,
             )
             self.mla_persistent_metadata.update(ctx_mla_ps)
 
@@ -1428,6 +1439,7 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
             max_qo_len=max_qo_len,
             attn_out_dtype=self.decode_attn_out_dtype,
             use_persistent_metadata=use_persistent_metadata,
+            causal=causal,
             fold_factor=fold_factor,
             fold_kv_indptr=fold_kv_indptr,
             fold_kv_indices=fold_kv_indices,
@@ -1745,6 +1757,9 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
                 query_start_loc_device=query_start_loc[: num_decodes + 1],
                 num_decode_tokens=num_decode_tokens,
                 dcp_tot_seq_lens_device=dcp_tot_seq_lens_device,
+                # vLLM resolves per-KV-cache-group causality and hands it down
+                # here; it is False only for a bidirectional draft block.
+                causal=bool(getattr(common_attn_metadata, "causal", True)),
             )
 
         attn_metadata = AiterMlaMetadataForVllm(

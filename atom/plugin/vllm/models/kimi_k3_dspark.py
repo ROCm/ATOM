@@ -77,23 +77,6 @@ class KimiK3DSparkVllm(ATOMForCausalLM):
         # The draft scores the full target vocabulary, so its sampled ids are
         # already target ids and need no remap table.
         self.draft_id_to_target_id = None
-        self._align_draft_kv_page_size()
-
-    def _align_draft_kv_page_size(self) -> None:
-        """Keep the draft's pages the same size as the target's.
-
-        The draft caches in bf16 even when the target's cache is fp8: aiter has
-        no fp8 MLA decode kernel wide enough for a 7-token draft block. The
-        dtype itself comes from `speculative_config.kv_cache_dtype`, which the
-        DSpark loader folds into the cache config this draft is built under.
-
-        Left alone, a bf16 draft page would then be twice the target's, and
-        since vLLM allocates one page size across all KV cache groups, half of
-        every page would go unused. The layers scale their own block size down
-        to compensate, once the engine's final block size is known.
-        """
-        for layer in self.model.layers:
-            layer.self_attn.mla_attn.align_page_size_to_engine_dtype = True
 
     def combine_hidden_states(self, aux_concat: torch.Tensor) -> torch.Tensor:
         return self.model.project_context(aux_concat)
