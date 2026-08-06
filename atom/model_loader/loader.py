@@ -283,6 +283,9 @@ def load_model(
         torch.cuda.reset_peak_memory_stats()
 
     # Quantize eligible modules as soon as their source weights complete.
+    # This must also run for speculative draft loads: those modules were built
+    # with the same meta-backed streaming parameters as the target. `spec_decode`
+    # only changes checkpoint-name selection; it must not disable materialization.
     online_quant_streamer = OnlineQuantStreamer.maybe_create(model, load_dummy)
 
     loaded_weights_record = load_weights_into_model(
