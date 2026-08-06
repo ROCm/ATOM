@@ -24,7 +24,6 @@
 """Inference-only DeepseekV2/DeepseekV3 model."""
 
 import logging
-import os
 from typing import Optional, Tuple, Union
 
 import torch
@@ -116,22 +115,10 @@ from atom.quant_spec import should_skip_online_quant
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 
-# Side-effect import: registers `torch.ops.aiter.maybe_dual_stream_forward`,
-# shared with deepseek_v4. DeepseekV2MoE.forward dispatches via this op when
-# `_use_dual_stream` is True so torch.compile/Dynamo treats stream code as opaque.
-from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.distributed.dcp_utils import (
     get_dcp_group,
     get_dcp_rank,
     get_dcp_world_size,
-)
-from atom.distributed.pcp_utils import (
-    get_pcp_world_size,
-    pcp_allgather_rerange,
-    pcp_is_enabled,
-    pcp_pad_dense,
-    pcp_pad_len,
-    pcp_round_robin_split,
 )
 from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import get_forward_context
@@ -140,220 +127,6 @@ from atom.utils.forward_context import get_forward_context
 
 
 logger = logging.getLogger("atom")
-
-# DIAGNOSTIC: ATOM_DSA_DUMP=<dir>:<ctx_lo>:<ctx_hi> -- dump the first decode call
-# whose ctx falls in range (= layer 0 of that step) so dcp=1 and dcp=N runs can be
-# compared element-wise. Rank 0 only; run with --enforce-eager (the int() below is
-# a D2H sync, illegal during cudagraph capture).
-_DSA_DUMP = os.environ.get("ATOM_DSA_DUMP", "")
-_dsa_done = [False]
-# DIAGNOSTIC: ATOM_DSA_PREFILL_DUMP=<dir> -- dump the indexer's gathered KV
-# (k_fp8 / k_scale) from the first sparse-prefill call, so the DCP local-gather +
-# all-gather + de-interleave (DCP_Sparse_MLA.md §5.5.5 P1) can be compared
-# bit-for-bit against dcp=1. Rank 0 only.
-# ATOM_DSA_PREFILL_DUMP=<dir>[:<layer>] -- which LAYER's indexer to dump. Default 0.
-# NOTE: the earlier "first call wins" version only ever captured layer 0, so the
-# k_fp8 / top-k agreement recorded in §5.5.7 covers layer 0 ONLY.
-_DSA_PREFILL_DUMP_SPEC = os.environ.get("ATOM_DSA_PREFILL_DUMP", "")
-_DSA_PREFILL_DUMP = (
-    _DSA_PREFILL_DUMP_SPEC.split(":")[0] if _DSA_PREFILL_DUMP_SPEC else ""
-)
-_DSA_PREFILL_DUMP_LAYER = (
-    int(_DSA_PREFILL_DUMP_SPEC.split(":")[1])
-    if ":" in _DSA_PREFILL_DUMP_SPEC
-    else 0
-)
-_dsa_prefill_done = [False]
-_dsa_prefill_topk_done = [False]
-
-# DIAGNOSTIC: ATOM_DSA_P1_SELFCHECK=1 -- verify the P1 de-interleave WITHOUT any
-# cross-config run. For every global position p this rank owns (p % W == r), the
-# reconstructed k_fp8[p] must equal this rank's own local gather at j = p // W.
-# The property is input-independent, so unlike a dcp=1-vs-dcp=N dump it stays
-# valid at layers whose inputs have already diverged (DCP_Sparse_MLA.md §5.5).
-_DSA_P1_SELFCHECK = os.environ.get("ATOM_DSA_P1_SELFCHECK", "0") == "1"
-_dsa_p1_selfcheck_seen = set()
-
-# DIAGNOSTIC: ATOM_DSA_P2_SELFCHECK=1 -- verify the compact filter IN SITU (the
-# unit test uses synthetic metadata). Two input-independent properties:
-#   1. every slot P2 emits must appear in THIS rank's own slot_mapping, i.e. the
-#      attention only ever reads KV this rank actually wrote;
-#   2. sum over ranks of owned_counts must equal the global candidate count, i.e.
-#      the W kept sets really do partition the global top-k.
-# Only valid while has_cached=False (candidates all come from this batch).
-# DIAGNOSTIC: ATOM_DSA_TIE_STATS=1 -- how often does the decode top-k boundary
-# land on a TIE? §6.1.2: ties are the only place where an ambiguous selection can
-# make two ranks disagree, and §6.1.3's "topk_plain + deterministic tie-break"
-# design costs one extra pass only if the tied set is large. The indexer scores
-# come from fp8 inputs, so exact equality may be far more common than for random
-# data -- this measures it instead of assuming.
-_DSA_TIE_STATS = os.environ.get("ATOM_DSA_TIE_STATS", "0") == "1"
-_dsa_tie_calls = [0]
-_dsa_tie_acc = {"rows": 0, "tied_rows": 0, "max_eq": 0, "sum_eq": 0, "max_need": 0}
-
-
-def _dsa_tie_stats(logits, context_lens, topk_tokens):
-    """Per row: how many candidates sit exactly ON the top-k threshold?
-
-    Vectorised and accumulated across calls -- the per-row Python loop version
-    only sampled one request and was far too small to conclude anything.
-    """
-    if _dsa_tie_calls[0] >= 400 or torch.distributed.get_rank() != 0:
-        return
-    _dsa_tie_calls[0] += 1
-
-    n = min(context_lens.shape[0], logits.shape[0])
-    ctx = context_lens[:n].to(torch.int64)
-    keep = ctx > topk_tokens          # otherwise top-k selects everything
-    if not bool(keep.any()):
-        return
-    rows = logits[:n][keep].float()
-    c = ctx[keep]
-    col = torch.arange(rows.shape[1], device=rows.device).unsqueeze(0)
-    valid = col < c.unsqueeze(1)
-    masked = torch.where(valid, rows, torch.full_like(rows, float("-inf")))
-    thr = torch.topk(masked, topk_tokens, dim=-1).values[:, -1:]
-    n_gt = ((masked > thr) & valid).sum(-1)
-    n_eq = ((masked == thr) & valid).sum(-1)
-    need = topk_tokens - n_gt
-
-    a = _dsa_tie_acc
-    a["rows"] += int(n_eq.numel())
-    a["tied_rows"] += int((n_eq > 1).sum())
-    a["max_eq"] = max(a["max_eq"], int(n_eq.max()))
-    a["sum_eq"] += int(n_eq.sum())
-    a["max_need"] = max(a["max_need"], int(need.max()))
-    if _dsa_tie_calls[0] % 25 == 0:
-        print(
-            f"[DSA-TIE] calls={_dsa_tie_calls[0]} 累计行数={a['rows']} | "
-            f"阈值处有并列(n_eq>1)的行={a['tied_rows']} "
-            f"({a['tied_rows'] / max(a['rows'], 1) * 100:.2f}%) | "
-            f"n_eq 均值={a['sum_eq'] / max(a['rows'], 1):.2f} 最大={a['max_eq']} | "
-            f"need 最大={a['max_need']}",
-            flush=True,
-        )
-
-
-_DSA_P2_SELFCHECK = os.environ.get("ATOM_DSA_P2_SELFCHECK", "0") == "1"
-_dsa_p2_selfcheck_seen = set()
-
-
-def _dcp_p2_selfcheck(
-    kv_indices, out_indptr, owned_counts, attn_metadata, k_cache_prefix
-):
-    layer = -1
-    for part in reversed(k_cache_prefix.split(".")):
-        if part.isdigit():
-            layer = int(part)
-            break
-    if layer in _dsa_p2_selfcheck_seen:
-        return
-    _dsa_p2_selfcheck_seen.add(layer)
-
-    if attn_metadata.has_cached:
-        # The "every emitted slot is in this rank's slot_mapping" property only
-        # holds when all candidates come from THIS batch. With a cached prefix
-        # the prefix slots were written by an earlier request, so the check would
-        # false-alarm. The partition check below stays valid, but skip both to
-        # keep the signal unambiguous.
-        print(
-            f"[P2-SELFCHECK] rank={get_dcp_rank()} SKIPPED (has_cached=True)",
-            flush=True,
-        )
-        return
-
-    n = attn_metadata.sparse_kv_indptr.shape[0] - 1
-    total = int(out_indptr[n])
-    emitted = kv_indices[:total]
-
-    # (1) every emitted slot must be one this rank wrote
-    mine = attn_metadata.slot_mapping
-    mine = mine[mine >= 0].to(torch.int64)
-    lut = torch.zeros(
-        int(mine.max()) + 2 if mine.numel() else 1,
-        dtype=torch.bool,
-        device=emitted.device,
-    )
-    lut[mine] = True
-    oob = emitted >= lut.shape[0]
-    foreign = int(oob.sum()) + int((~lut[emitted.to(torch.int64).clamp(max=lut.shape[0] - 1)]) .sum()) - int(oob.sum())
-    bad_slot = int(oob.sum()) + foreign
-
-    # (2) the W ranks' counts must sum to the global candidate count
-    gcnt = (
-        attn_metadata.sparse_kv_indptr[1 : n + 1]
-        - attn_metadata.sparse_kv_indptr[:n]
-    )
-    summed = get_dcp_group().all_gather(
-        owned_counts[:n].contiguous(), dim=0
-    ).reshape(get_dcp_world_size(), n).sum(0)
-    bad_cnt = int((summed != gcnt).sum())
-
-    print(
-        f"[P2-SELFCHECK] layer={layer} rank={get_dcp_rank()} emitted={total} "
-        f"foreign_slots={bad_slot} rows_with_bad_partition={bad_cnt} "
-        f"{'OK' if bad_slot == 0 and bad_cnt == 0 else '<-- P2 WRONG'}",
-        flush=True,
-    )
-
-
-def _dcp_p1_selfcheck(
-    k_fp8, k_scale, k_fp8_local, k_scale_local, prefill_metadata, k_cache_prefix
-):
-    """Does the de-interleave hand each owned position its own local row back?"""
-    layer = -1
-    for part in reversed(k_cache_prefix.split(".")):
-        if part.isdigit():
-            layer = int(part)
-            break
-    if layer in _dsa_p1_selfcheck_seen:
-        return
-    _dsa_p1_selfcheck_seen.add(layer)
-
-    W = get_dcp_world_size()
-    r = get_dcp_rank()
-    cu_pad = prefill_metadata.dcp_indexer_local_cu_seqlens
-    if prefill_metadata.has_cached:
-        g_cu = prefill_metadata.cu_seqlens_k
-    else:
-        g_cu = prefill_metadata.cu_seqlens_q
-    bs = g_cu.shape[0] - 1
-
-    bad_k = bad_s = checked = 0
-    for b in range(bs):
-        g0, g1 = int(g_cu[b]), int(g_cu[b + 1])
-        # global positions in this sequence that rank r owns
-        pos = torch.arange(r, g1 - g0, W, device=k_fp8.device)
-        if pos.numel() == 0:
-            continue
-        local_j = pos // W + int(cu_pad[b])
-        got_k = k_fp8[g0 + pos].view(torch.uint8)
-        ref_k = k_fp8_local[local_j].view(torch.uint8)
-        got_s = k_scale[g0 + pos]
-        ref_s = k_scale_local[local_j]
-        bad_k += int((got_k != ref_k).any(dim=-1).sum())
-        bad_s += int((got_s != ref_s).any(dim=-1).sum())
-        checked += pos.numel()
-
-    print(
-        f"[P1-SELFCHECK] layer={layer} rank={r} checked={checked} "
-        f"k_mismatch={bad_k} scale_mismatch={bad_s} "
-        f"{'OK' if bad_k == 0 and bad_s == 0 else '<-- P1 DE-INTERLEAVE WRONG'}",
-        flush=True,
-    )
-
-
-def _dsa_dump_layer_matches(k_cache_prefix: str) -> bool:
-    """Is this indexer call the layer selected by ATOM_DSA_PREFILL_DUMP?"""
-    for part in reversed(k_cache_prefix.split(".")):
-        if part.isdigit():
-            return int(part) == _DSA_PREFILL_DUMP_LAYER
-    return _DSA_PREFILL_DUMP_LAYER == 0
-
-# DIAGNOSTIC (DCP/DCP_Sparse_MLA.md): force prefill to stay dense under DCP even
-# for prompts longer than index_topk. Paired with the same env in
-# attention_mla.py (use_prefill_mla) -- both gates must flip together.
-_DSA_DCP_DENSE_PREFILL = os.environ.get("ATOM_DSA_DCP_DENSE_PREFILL", "0") == "1"
 
 if use_triton_gemm():
     try:
@@ -1685,12 +1458,8 @@ def sparse_attn_indexer(
     if context.is_prefill:
         # Below index_topk the indexer is a no-op: top-k would select every token,
         # so prefill runs dense (attention_mla.use_prefill_mla gates on the same
-        # threshold). ATOM_DSA_DCP_DENSE_PREFILL=1 extends that no-op to ALL
-        # prompt lengths under DCP -- a diagnostic to tell whether the long-prompt
-        # DCP corruption originates in sparse prefill or in sparse decode
-        # (DCP/DCP_Sparse_MLA.md). Must stay in sync with the same env in
-        # attention_mla.py, or prefill would look for top-k indices nobody wrote.
-        if attn_metadata.max_seqlen_k <= topk_tokens or _DSA_DCP_DENSE_PREFILL:
+        # threshold).
+        if attn_metadata.max_seqlen_k <= topk_tokens:
             return weights
         prefill_metadata = attn_metadata
         num_prefills = context.batch_size
@@ -1742,22 +1511,9 @@ def sparse_attn_indexer(
             gather_index = prefill_metadata.dcp_indexer_gather_index
             k_fp8 = gathered_k.index_select(0, gather_index)
             k_scale = gathered_scale.index_select(0, gather_index)
-            if _DSA_P1_SELFCHECK:
-                _dcp_p1_selfcheck(
-                    k_fp8,
-                    k_scale,
-                    k_fp8_local,
-                    k_scale_local,
-                    prefill_metadata,
-                    k_cache_prefix,
-                )
         else:
-            k_fp8 = torch.empty(
-                [total_kv, head_dim], device=k.device, dtype=dtypes.fp8
-            )
-            k_scale = torch.empty(
-                [total_kv, 1], device=k.device, dtype=torch.float32
-            )
+            k_fp8 = torch.empty([total_kv, head_dim], device=k.device, dtype=dtypes.fp8)
+            k_scale = torch.empty([total_kv, 1], device=k.device, dtype=torch.float32)
             cp_gather_indexer_k_quant_cache(
                 kv_cache,
                 k_fp8,
@@ -1769,26 +1525,6 @@ def sparse_attn_indexer(
                     else prefill_metadata.cu_seqlens_q
                 ),
                 preshuffle=True,
-            )
-        if (
-            _DSA_PREFILL_DUMP
-            and not _dsa_prefill_done[0]
-            and _dsa_dump_layer_matches(k_cache_prefix)
-            and torch.distributed.get_rank() == 0
-        ):
-            _dsa_prefill_done[0] = True
-            import numpy as _np
-
-            _np.savez(
-                f"{_DSA_PREFILL_DUMP}/pf_L{_DSA_PREFILL_DUMP_LAYER}"
-                f"_w{get_dcp_world_size()}.npz",
-                total_kv=_np.asarray([total_kv]),
-                k_fp8=k_fp8.view(torch.uint8).cpu().numpy(),
-                k_scale=k_scale.float().cpu().numpy(),
-            )
-            print(
-                f"[DSA-PF-DUMP] w={get_dcp_world_size()} total_kv={total_kv}",
-                flush=True,
             )
         cu_seqlen_ks = prefill_metadata.cu_seqlen_ks
         cu_seqlen_ke = prefill_metadata.cu_seqlen_ke
@@ -1856,31 +1592,6 @@ def sparse_attn_indexer(
                 stride0=logits.stride(0),
                 stride1=logits.stride(1),
             )
-        if (
-            _DSA_PREFILL_DUMP
-            and not _dsa_prefill_topk_done[0]
-            and _dsa_dump_layer_matches(k_cache_prefix)
-        ):
-            _dsa_prefill_topk_done[0] = True
-            import numpy as _np
-
-            # Dump on EVERY rank, not just rank 0. The DCP partition is only valid
-            # if all ranks derive their slice from the SAME global top-k set; each
-            # rank runs top_k_per_row_prefill independently, and that kernel is
-            # known to be order-nondeterministic (§4.6), so whether it is also
-            # SET-nondeterministic under ties has to be measured across ranks.
-            _rows = topk_indices[-8:].cpu().numpy()
-            _np.savez(
-                f"{_DSA_PREFILL_DUMP}/pftopk_L{_DSA_PREFILL_DUMP_LAYER}"
-                f"_w{get_dcp_world_size()}_r{get_dcp_rank()}.npz",
-                topk_tail=_rows,
-                kv_indptr=attn_metadata.sparse_kv_indptr.cpu().numpy(),
-            )
-            print(
-                f"[DSA-PF-TOPK] w={get_dcp_world_size()} rank={get_dcp_rank()} "
-                f"rows={tuple(topk_indices.shape)}",
-                flush=True,
-            )
         if get_dcp_world_size() > 1:
             # DCP: topk_indices hold GLOBAL flat KV indices (the indexer scored the
             # full sequence via the all-gathered k, P1 above). Keep only the
@@ -1902,14 +1613,6 @@ def sparse_attn_indexer(
                 NUM_TOPK_TOKENS=topk_tokens,
                 out=sparse_kv_indices_buffer,
             )
-            if _DSA_P2_SELFCHECK:
-                _dcp_p2_selfcheck(
-                    sparse_kv_indices_buffer,
-                    dcp_sparse_kv_indptr_buffer,
-                    dcp_owned_counts_buffer,
-                    attn_metadata,
-                    k_cache_prefix,
-                )
         else:
             triton_convert_req_index_to_global_index_dsa_prefill(
                 attn_metadata.sparse_cu_seqlens_q,
@@ -2002,19 +1705,28 @@ def sparse_attn_indexer(
             )
             # [2, rows, k_loc]: plane 0 = score, plane 1 = int32 gid bits.
             send = torch.empty(
-                2, num_rows, k_loc, dtype=torch.float32,
+                2,
+                num_rows,
+                k_loc,
+                dtype=torch.float32,
                 device=local_logits.device,
             )
             dcp_pack_topk_candidates(
-                local_logits, local_idx, local_ctx, dcp_rank, dcp_world_size,
+                local_logits,
+                local_idx,
+                local_ctx,
+                dcp_rank,
+                dcp_world_size,
                 send,
             )
             # Exchange as int32 so the gid bit patterns cannot be touched by any
             # float canonicalization along the way; the score plane is bitcast
             # back at the end (free, no copy).
-            recv = get_dcp_group().all_gather(
-                send.view(torch.int32), dim=0
-            ).view(dcp_world_size, 2, num_rows, k_loc)
+            recv = (
+                get_dcp_group()
+                .all_gather(send.view(torch.int32), dim=0)
+                .view(dcp_world_size, 2, num_rows, k_loc)
+            )
             n_cand = dcp_world_size * k_loc
             # Rank is the outer dim after all-gather but the merge wants it on
             # the candidate dim. Selection is provably order-independent
@@ -2052,8 +1764,6 @@ def sparse_attn_indexer(
         if logits is not None:
             # Non-DCP: one rank holds the whole plane, so top-k is already
             # global. The DCP branch produced topk_indices_decode itself.
-            if _DSA_TIE_STATS:
-                _dsa_tie_stats(logits, decode_metadata.context_lens, topk_tokens)
             topk_indices_decode = topk_indices[:num_decode_tokens, :topk_tokens]
             top_k_per_row_decode(
                 logits,
@@ -2064,24 +1774,6 @@ def sparse_attn_indexer(
                 logits.stride(0),
                 logits.stride(1),
             )
-        elif _DSA_TIE_STATS:
-            # DCP now selects by a total order, so boundary ties are no longer a
-            # correctness risk here (§6.1.3); nothing to count.
-            pass
-        if logits is not None and _DSA_DUMP and not _dsa_done[0]:
-            _d, _lo, _hi = _DSA_DUMP.split(":")
-            _c = int(decode_metadata.context_lens[0])
-            if int(_lo) <= _c <= int(_hi) and torch.distributed.get_rank() == 0:
-                _dsa_done[0] = True
-                import numpy as _np
-
-                _np.savez(
-                    f"{_d}/fix_w{get_dcp_world_size()}.npz",
-                    ctx=_np.asarray([_c]),
-                    logits=logits[0, :_c].float().cpu().numpy(),
-                    topk=topk_indices_decode[0].cpu().numpy(),
-                )
-                print(f"[DSA-DUMP] w={get_dcp_world_size()} ctx={_c}", flush=True)
         if attn_metadata.max_seqlen_q > 1:
             triton_gather_kv_indices_sparse(
                 attn_metadata.sparse_kv_indptr,
@@ -2564,11 +2256,9 @@ class Indexer(nn.Module):
         # in layernorm.py the gap is gone (0.9416 vs 0.9439, within noise), so DCP
         # can take the clean route and the index-cache scratch slot that used to
         # work around the fused op is no longer needed (§5.7 item A).
-        # DIAGNOSTIC: ATOM_DSA_FORCE_UNFUSED=1 forces the unfused path at any dcp.
-        force_unfused = os.environ.get("ATOM_DSA_FORCE_UNFUSED", "0") == "1"
         dcp = get_dcp_world_size() > 1
         positions_op = positions
-        if (not self.use_qk_rope_cache_fusion) or pcp or dcp or force_unfused:
+        if (not self.use_qk_rope_cache_fusion) or pcp or dcp:
             q_pe, _ = torch.split(
                 q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
             )
@@ -2630,10 +2320,7 @@ class Indexer(nn.Module):
             rotary_emb.is_neox_style,
             # Must match the unfused-path condition above; the caller's q_input
             # dtype depends on this flag.
-            self.use_qk_rope_cache_fusion
-            and not pcp
-            and not dcp
-            and not force_unfused,
+            self.use_qk_rope_cache_fusion and not pcp and not dcp,
         )
 
 

@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
-import os
 from dataclasses import dataclass
 from functools import partial as functools_partial
 from typing import Optional, Protocol
@@ -122,36 +121,6 @@ _MLA_Q_OUT_PADDED_DIM = 768
 # Dims the fused seg kernels are compiled against (KV_LORA / PE_DIM constexprs).
 _MLA_SEG_KV_LORA_RANK = 512
 _MLA_SEG_PE_DIM = 64
-
-# DIAGNOSTIC (DCP/DCP_Sparse_MLA.md §5.5): set ATOM_DSA_DCP_PREFILL_MERGE=0 to run
-# the DCP sparse prefill WITHOUT the cross-rank merge (P3) while keeping the
-# indexer gather (P1) and the compact filter (P2). The output is wrong by
-# construction -- each rank keeps only its own partial softmax -- but it isolates
-# a fault in the compacted indices from a fault in the q all-gather / LSE merge.
-_DSA_DCP_PREFILL_MERGE = os.environ.get("ATOM_DSA_DCP_PREFILL_MERGE", "1") == "1"
-
-# DIAGNOSTIC: ATOM_DSA_ATTN_DUMP=<dir>[:<l0,l1,...>] -- dump the prefill attention
-# output (post o_proj) of the listed layers, for the first two prefill calls of
-# the process. One run therefore yields BOTH a depth profile and a same-input
-# repeat, which together separate "the DCP sparse-prefill math is wrong" from
-# "something is nondeterministic" and show where either starts. Layers default
-# to just 0.
-_DSA_ATTN_DUMP_SPEC = os.environ.get("ATOM_DSA_ATTN_DUMP", "")
-_DSA_ATTN_DUMP = _DSA_ATTN_DUMP_SPEC.split(":")[0] if _DSA_ATTN_DUMP_SPEC else ""
-_DSA_ATTN_DUMP_LAYERS = (
-    frozenset(int(x) for x in _DSA_ATTN_DUMP_SPEC.split(":")[1].split(","))
-    if ":" in _DSA_ATTN_DUMP_SPEC
-    else frozenset({0})
-)
-# one counter per layer: how many prefill calls of that layer we have dumped
-_dsa_attn_dump_count = {}
-
-# DIAGNOSTIC: ATOM_DSA_FORCE_DECODE_KERNEL=1 -- use mla_decode_fwd for sparse
-# prefill even when no LSE is needed. dcp=1 otherwise runs mla_prefill_fwd while
-# dcp>1 runs mla_decode_fwd, so a dcp=1 vs dcp=N comparison confounds "DCP is
-# wrong" with "the two kernels differ numerically". Setting this on the dcp=1
-# reference removes that confound.
-_DSA_FORCE_DECODE_KERNEL = os.environ.get("ATOM_DSA_FORCE_DECODE_KERNEL", "0") == "1"
 
 if False:
     try:
@@ -371,17 +340,6 @@ class MLAAttention(nn.Module):
         # metadata builder to the shared buffer (see aiter_mla.py).
         self.dcp_sparse_kv_indptr_buffer = None
         self.dcp_owned_counts_buffer = None
-
-        # DIAGNOSTIC (DCP/DCP_Sparse_MLA.md §6.4): force sparse decode onto the
-        # non-persistent kernel even at dcp=1, to measure what persistent
-        # actually buys for sparse decode. Read once to keep it out of forward.
-        self._dsa_force_nonpersist = (
-            os.environ.get("ATOM_DSA_FORCE_NONPERSIST", "0") == "1"
-        )
-        # DIAGNOSTIC: keep prefill dense under DCP at any prompt length.
-        self._dsa_dcp_dense_prefill = (
-            os.environ.get("ATOM_DSA_DCP_DENSE_PREFILL", "0") == "1"
-        )
 
     def _pad_query_heads(self, q: torch.Tensor) -> torch.Tensor:
         if self.head_repeat_factor > 1:
@@ -1135,11 +1093,7 @@ class MLAAttention(nn.Module):
             # because it runs max_q_len=1: every query token is already its own row
             # with its own candidate list, i.e. structurally a decode. The fp8 path
             # has always used this kernel; `return_lse` extends it to bf16.
-            use_decode_kernel = (
-                self.kv_cache_dtype.startswith("fp8")
-                or return_lse
-                or _DSA_FORCE_DECODE_KERNEL
-            )
+            use_decode_kernel = self.kv_cache_dtype.startswith("fp8") or return_lse
             if use_decode_kernel:
                 is_fp8 = self.kv_cache_dtype.startswith("fp8")
                 # DCP compacts each rank's candidates per layer, so the once-per-step
@@ -1390,9 +1344,7 @@ class MLAAttention(nn.Module):
             # timing simply does not line up. Run non-persistent until either the
             # metadata build moves per-layer or aiter grows a per-request valid
             # length (§5.5).
-            if self.is_sparse_mla and (
-                self.dcp_world_size > 1 or self._dsa_force_nonpersist
-            ):
+            if self.is_sparse_mla and self.dcp_world_size > 1:
                 use_persistent_mode = False
 
             # Sparse layers in MTP verify use separate persistent metadata
@@ -1562,12 +1514,6 @@ class MLAAttention(nn.Module):
         use_prefill_mla = (
             self.is_sparse_mla and attn_metadata.max_seqlen_k > self.topk_tokens
         )
-        # DIAGNOSTIC (see ATOM_DSA_DCP_DENSE_PREFILL in deepseek_v2.py): keep
-        # prefill on the dense path under DCP regardless of prompt length, to
-        # separate a sparse-prefill fault from a sparse-decode one. The indexer
-        # skips writing top-k indices under the same env, so this must flip with it.
-        if self._dsa_dcp_dense_prefill:
-            use_prefill_mla = False
         if forward_context.context.is_dummy_run:
             output_shape = list(q.shape)
             atom_config = get_current_atom_config()
@@ -1779,11 +1725,7 @@ class MLAAttention(nn.Module):
                     )
 
             if context.is_prefill:
-                if (
-                    self.is_sparse_mla
-                    and self.dcp_world_size > 1
-                    and _DSA_DCP_PREFILL_MERGE
-                ):
+                if self.is_sparse_mla and self.dcp_world_size > 1:
                     # DCP sparse prefill: the indexer left each rank with a
                     # DISJOINT slice of the global top-k (§5.5.5 P2), so this is
                     # a partial softmax that must be merged exactly like decode.
@@ -1831,38 +1773,6 @@ class MLAAttention(nn.Module):
             else:
                 output = self._forward_decode(q_out, kv_cache, attn_metadata)
 
-        if (
-            _DSA_ATTN_DUMP
-            and context.is_prefill
-            and self.layer_num in _DSA_ATTN_DUMP_LAYERS
-            and _dsa_attn_dump_count.get(self.layer_num, 0) < 2
-            and torch.distributed.get_rank() == 0
-        ):
-            # Prefill output of one layer, post o_proj: identical shape and meaning at
-            # dcp=1 and dcp=N (TP sharding is already all-reduced away), so it is
-            # the one tensor that directly answers "is the DCP sparse-prefill
-            # attention + merge numerically right?" (DCP_Sparse_MLA.md §5.5).
-            _n = _dsa_attn_dump_count.get(self.layer_num, 0)
-            _dsa_attn_dump_count[self.layer_num] = _n + 1
-            import numpy as _np
-
-            _np.savez(
-                f"{_DSA_ATTN_DUMP}/attn_L{self.layer_num}"
-                f"_w{self.dcp_world_size}_r{_n}.npz",
-                out_tail=output[-4:].float().cpu().numpy(),
-                # Strided subsample across ALL rows. The tail-4 max|diff| used
-                # earlier has almost no statistical power: at |o|~6e-3 the bf16
-                # ULP is 1.5e-5, so a systematic error below ~0.25% relative is
-                # invisible in a max over 4 rows. What discriminates is the
-                # FRACTION of differing elements over many rows (§5.5).
-                out_sub=output[::7, ::13].float().cpu().numpy(),
-                shape=_np.asarray(list(output.shape)),
-            )
-            print(
-                f"[DSA-ATTN-DUMP] L={self.layer_num} "
-                f"w={self.dcp_world_size} run={_n} shape={tuple(output.shape)}",
-                flush=True,
-            )
         return output
 
     def forward(
