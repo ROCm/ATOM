@@ -61,6 +61,18 @@ def test_matches_reference(num_rows, vocab_size):
     )
 
 
+def test_fp32_base_logits():
+    """Whatever dtype the LM head hands back; only embed and W2 must agree."""
+    base, embed, w2 = _draw(16, 8192)
+    base = base.float()
+    torch.testing.assert_close(
+        dspark_markov_argmax(base, embed, w2),
+        _torch_dspark_markov_argmax(base, embed, w2),
+        rtol=0,
+        atol=0,
+    )
+
+
 def test_row_tiling_beyond_the_accumulator_cap():
     """A batch wider than BLOCK_ROW must tile rows, not widen the accumulator."""
     num_rows = _MAX_BLOCK_ROW * 3 + 5

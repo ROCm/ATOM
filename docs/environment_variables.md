@@ -110,7 +110,7 @@ materializes two `[B, V]` fp32 tensors that only an `argmax` reads. See
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| **ATOM_DSPARK_FUSED_MARKOV_SAMPLE** | bool | 0 (false) | If set to `1`, sample the DSpark block with a fused Triton kernel that computes the rank-`r` bias GEMV, adds the base logits in the GEMM epilogue and reduces to token ids in registers — so `W2` stays bf16 and is read exactly once per block position, and no `[B, V]` intermediate exists. Covers ATOM's native Kimi-K3 and DeepSeek-V4 DSpark samplers, and the **greedy** branch of vLLM's `DSparkSpeculator._sample_sequential` (installed by `atom/plugin/vllm/spec_decode_patch.py`); probabilistic drafting (`draft_sample_method="probabilistic"`) needs the real logits for `gumbel_sample` and keeps the unfused path. Tie-breaking matches `torch.argmax` (lowest index). Default off because the bias moves from an fp32 matmul to bf16 MFMA with an fp32 accumulator: every product is exact in fp32 either way, so the result is equal to the reference up to accumulation order, but the last-ulp difference could flip an `argmax` on a near-tie — enable only after a GSM8K 5-shot acceptance-length parity run. Read at Markov-head construction and at plugin-patch install time, so set it before the server starts. |
+| **ATOM_DSPARK_FUSED_MARKOV_SAMPLE** | bool | 0 (false) | If set to `1`, sample the DSpark block with a fused Triton kernel that computes the rank-`r` bias GEMV, adds the base logits in the GEMM epilogue and reduces to token ids in registers — so `W2` stays bf16 and is read exactly once per block position, and no `[B, V]` intermediate exists. Covers ATOM's native Kimi-K3 and DeepSeek-V4 DSpark samplers, and the **greedy** branch of vLLM's `DSparkSpeculator._sample_sequential` (installed by `atom/plugin/vllm/spec_decode_patch.py`); probabilistic drafting (`draft_sample_method="probabilistic"`) needs the real logits for `gumbel_sample` and keeps the unfused path. Tie-breaking matches `torch.argmax` (lowest index). Measured 3.5–5.4x per block position at B=8–64 on gfx950 (~170 µs → ~34 µs at B=64), i.e. roughly 1 ms per drafting step over the seven positions — the largest of the three DSpark wins. Default off because the bias moves from an fp32 matmul to bf16 MFMA with an fp32 accumulator: every product is exact in fp32 either way, so the result is equal to the reference up to accumulation order, but the last-ulp difference could flip an `argmax` on a near-tie. The unit tests find no such flip across batch widths, vocab sizes and strides; enable after a GSM8K 5-shot acceptance-length parity run confirms it end to end. Read at Markov-head construction and at plugin-patch install time, so set it before the server starts. |
 
 ### Qwen3 style
 
@@ -129,13 +129,13 @@ materializes two `[B, V]` fp32 tensors that only an `argmax` reads. See
 
 The Kimi-K3 DSpark draft writes the target's context rows into its own paged MLA
 cache once per draft layer per drafting step; both switches below shorten that
-path. Neither has been run on a GPU, hence the defaults — the first write of
-each process logs whether the fused path engaged.
+path. Both are unit-tested on gfx950 but neither has an end-to-end number yet,
+hence the defaults — the first write of each process logs which path it took.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| **ATOM_DSPARK_FUSED_CTX_KV** | bool | 0 (false) | If set to `1`, write the context rows with one Triton kernel (RMSNorm + RoPE + concat + paged store) instead of four launches plus a throwaway `empty_like` for the RoPE's query side. Falls back per call when the cache layout or the RoPE is not the plain one the kernel understands (seg / shuffled-KV layouts keep their own write kernels). |
-| **ATOM_DSPARK_CTX_KV_ONLY_PROJ** | bool | 0 (false) | If set to `1`, project only the KV half of the fused q_a/kv_a projection on that path (a contiguous row slice of the merged weight) instead of computing all 2112 columns and discarding the 1536-wide q half. Same math on the same bytes with N cut 3.7x, but a narrower N is a different tuned-GEMM shape, so it is measured separately. |
+| **ATOM_DSPARK_FUSED_CTX_KV** | bool | 0 (false) | If set to `1`, write the context rows with one Triton kernel (RMSNorm + RoPE + concat + paged store) instead of four launches plus a throwaway `empty_like` for the RoPE's query side. Measured 2.8–3.5x on the write itself (~62 µs → ~21 µs eager, all widths), i.e. ~200 µs per drafting step over the five draft layers. Falls back per call when the cache layout or the RoPE is not the plain one the kernel understands (seg / shuffled-KV layouts keep their own write kernels). |
+| **ATOM_DSPARK_CTX_KV_ONLY_PROJ** | bool | 0 (false) | If set to `1`, project only the KV half of the fused q_a/kv_a projection on that path (a contiguous row slice of the merged weight) instead of computing all 2112 columns and discarding the 1536-wide q half. Same math on the same bytes with N cut 3.7x, measured 1.1–1.9x at M=64–512. Thinner than it looks: aiter's bf16 tuned table has no gfx950 entry for (\*, 576, 7168) but does for the merged (512, 2112, 7168), so the narrow GEMM runs untuned. |
 
 ## V4 attention backend (Migration)
 

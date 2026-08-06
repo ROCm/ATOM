@@ -45,8 +45,10 @@ Numerics are the per-op path's, kernel for kernel:
 Bit-exactness against the per-op path is not claimed and is not achievable from
 Triton: the fp32 sum-of-squares reduction tree and ``rsqrt``'s approximation
 differ from the HIP kernel's. Both differences are ~1e-7 relative on a quantity
-that is then rounded to 8 mantissa bits, so the stored latent is expected to be
-bitwise equal in practice -- the accompanying GPU test asserts exactly that.
+that is then rounded to 8 mantissa bits, so the stored latent is bitwise equal
+almost everywhere and one ulp out otherwise -- measured on gfx950 at 1 element
+of 4,718,592 over 512 tokens, and none at all over 4096
+(``tests/test_dspark_ctx_kv_fusion.py``, which holds that line).
 
 Only the plain per-token / paged layout is covered (``[num_blocks, block_size,
 kv_lora_rank + qk_rope_head_dim]``, last dim contiguous, which is also what a

@@ -100,8 +100,23 @@ def test_tied_embedding_is_never_replicated(monkeypatch):
 # ── the wiring ────────────────────────────────────────────────────────────
 
 
+def _class_body_init(cls):
+    """The ``__init__`` the class actually declares.
+
+    ``support_torch_compile`` swaps in a wrapper that keeps the original only in
+    its closure -- no ``functools.wraps``, so ``inspect.unwrap`` cannot see past
+    it.
+    """
+    init = cls.__init__
+    for cell in init.__closure__ or ():
+        inner = cell.cell_contents
+        if inspect.isfunction(inner) and inner.__name__ == "__init__":
+            return inner
+    return init
+
+
 def test_kimi_linear_model_picks_its_embedding_from_the_gate():
-    names = KimiLinearModel.__init__.__code__.co_names
+    names = _class_body_init(KimiLinearModel).__code__.co_names
     assert "use_replicated_vocab_embed" in names
     assert "ReplicatedEmbedding" in names
     assert "VocabParallelEmbedding" in names

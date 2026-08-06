@@ -25,10 +25,12 @@ share is summation order (MFMA's K-blocking vs whatever tiling hipBLASLt
 picks), and fp32 addition is not associative -- so this is equal to the
 reference *up to accumulation order*, not bit-identical. The fp32
 accumulator is what the existing "this bias lands inside the softmax that
-decides acceptance" guarantee asks for, and that is preserved; what is not
-provable without a GPU is that no argmax anywhere flips on a pair of logits
-separated by less than the last-ulp disagreement. Hence the env gate, default
-off (see ``ATOM_DSPARK_FUSED_MARKOV_SAMPLE``).
+decides acceptance" guarantee asks for, and that is preserved. What remains is
+that an argmax could in principle flip on a pair of logits separated by less
+than the last-ulp disagreement; measured on gfx950 the sampled ids are
+identical to the reference's across batch widths, vocab sizes and strides
+(``tests/test_dspark_markov_sample.py``), but that is evidence, not proof, so
+the env gate stays default off (``ATOM_DSPARK_FUSED_MARKOV_SAMPLE``).
 
 Tie-breaking matches ``torch.argmax``: lowest index wins. Within a V tile the
 lowest index attaining the tile max is taken, and the cross-tile reduce takes

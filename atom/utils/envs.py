@@ -171,9 +171,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # all 2112 columns and discarding the 1536-wide q half. Cuts that GEMM's N
     # by 3.7x for identical math on identical bytes. Separate from
     # ATOM_DSPARK_FUSED_CTX_KV because the risk is different: a narrower N is a
-    # different tuned-GEMM shape, so an untuned (M, 576, 7168) could in
-    # principle land on a worse solution than the tuned merged one. Default off
-    # until measured on MI3xx.
+    # different tuned-GEMM shape. aiter's bf16 table has no gfx950 entry for
+    # (*, 576, 7168) and does have one for (512, 2112, 7168), so the narrow GEMM
+    # takes the default solution while the merged one takes a tuned kernel --
+    # and it still measured 1.1-1.9x faster eager at M=64-512 on gfx950. Default
+    # off anyway: that margin is thinner than the fusion's and rests on an
+    # untuned shape, so it wants an end-to-end number before it ships on.
     "ATOM_DSPARK_CTX_KV_ONLY_PROJ": lambda: (
         os.getenv("ATOM_DSPARK_CTX_KV_ONLY_PROJ", "0") == "1"
     ),
