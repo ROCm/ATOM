@@ -825,7 +825,9 @@ class LinearBase(nn.Module):
         if padding_size == 0:
             return False
         self._output_size_before_padding = output_size
-        self.weight.data = torch.nn.functional.pad(self.weight.data, (0, 0, 0, padding_size))
+        self.weight.data = torch.nn.functional.pad(
+            self.weight.data, (0, 0, 0, padding_size)
+        )
         ws = self.weight_scale.data
         self.weight_scale.data = torch.cat(
             [ws, ws.new_ones((padding_size, *ws.shape[1:]))], dim=0
@@ -833,7 +835,9 @@ class LinearBase(nn.Module):
         # Bias is also per-output-channel
         if self.bias is not None:
             b = self.bias.data
-            self.bias.data = torch.cat([b, b.new_zeros((padding_size, *b.shape[1:]))], dim=0)
+            self.bias.data = torch.cat(
+                [b, b.new_zeros((padding_size, *b.shape[1:]))], dim=0
+            )
         return True
 
     # linear mark trace shape/dtype helper
