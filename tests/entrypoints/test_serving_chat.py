@@ -226,6 +226,11 @@ class TestCreateChatChunkWithIndex:
         assert data["choices"][0]["index"] == 3
 
 
+# ============================================================================
+# Streaming Role Chunk Content Regression Tests
+# ============================================================================
+
+
 class TestStreamingRoleChunkContent:
     """End-to-end regression test for the streamed role-announcement chunk.
 
