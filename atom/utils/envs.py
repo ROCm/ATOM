@@ -151,6 +151,32 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_GLM_FUSED_INDEXER": lambda: (
         os.getenv("ATOM_ENABLE_GLM_FUSED_INDEXER", "1") == "1"
     ),
+    # Kimi-K3 DSpark draft: fuse the per-layer context-row KV write
+    # (K3DSparkMLAAttention.write_context_kv) into one Triton kernel --
+    # RMSNorm(kv_c) + rope(k_pe) + concat + paged-cache store, versus today's
+    # four launches plus a throwaway `empty_like` for the rope's query side.
+    # That chain runs once per draft layer (5) per drafting step over every
+    # scheduled target token, and each op re-reads the 576-wide latent from HBM
+    # only to hand it to the next, so the win is launch count and round trips,
+    # not FLOPs. Falls back per call when the cache layout or the rope is not
+    # the plain one the kernel understands (see
+    # MLAAttention.write_context_kv_latent). Default off until validated on
+    # MI3xx -- the kernel is a static port and has not been run on a GPU.
+    "ATOM_DSPARK_FUSED_CTX_KV": lambda: (
+        os.getenv("ATOM_DSPARK_FUSED_CTX_KV", "0") == "1"
+    ),
+    # Kimi-K3 DSpark draft: on the same context-row path, project ONLY the kv
+    # half of the fused q_a/kv_a projection (a contiguous row slice of the
+    # merged weight, MergedReplicatedLinear.forward_shard) instead of computing
+    # all 2112 columns and discarding the 1536-wide q half. Cuts that GEMM's N
+    # by 3.7x for identical math on identical bytes. Separate from
+    # ATOM_DSPARK_FUSED_CTX_KV because the risk is different: a narrower N is a
+    # different tuned-GEMM shape, so an untuned (M, 576, 7168) could in
+    # principle land on a worse solution than the tuned merged one. Default off
+    # until measured on MI3xx.
+    "ATOM_DSPARK_CTX_KV_ONLY_PROJ": lambda: (
+        os.getenv("ATOM_DSPARK_CTX_KV_ONLY_PROJ", "0") == "1"
+    ),
     "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION", "1") == "1"
     ),

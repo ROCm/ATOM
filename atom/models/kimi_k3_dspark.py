@@ -70,6 +70,7 @@ from atom.model_ops.linear import (
     RowParallelLinear,
 )
 from atom.models.deepseek_v2 import yarn_get_mscale
+from atom.utils import envs
 
 if TYPE_CHECKING:
     from atom.config import Config
@@ -264,6 +265,10 @@ class K3DSparkMLAAttention(nn.Module):
             is_sparse=False,
             topk_tokens=None,
         )
+        # Resolved once: envs re-reads os.getenv on every attribute access, and
+        # write_context_kv is on the per-step path of all five draft layers.
+        self._ctx_kv_only_proj = bool(envs.ATOM_DSPARK_CTX_KV_ONLY_PROJ)
+
         self.mla_attn = Attention(
             num_heads=self.num_local_heads,
             head_dim=self.kv_lora_rank + self.qk_rope_head_dim,
@@ -293,31 +298,33 @@ class K3DSparkMLAAttention(nn.Module):
     ) -> None:
         """Project the target context into this layer's latent cache rows.
 
-        The q half of the fused projection is computed and dropped. Avoiding
-        that would mean keeping q and kv as separate projections, which would
-        diverge from the checkpoint's own fused layout for no real gain -- this
-        runs over the handful of tokens verified per step, not the sequence.
-        (vLLM's reference makes the same trade in its non-fused path, and offers
-        a cross-layer fused fast path on top; that optimization is not ported.)
+        The checkpoint keeps q_a and kv_a as one fused weight and so does this
+        module (see packed_modules_mapping); the block pass in :meth:`forward`
+        wants both halves. Only THIS path wants the kv half alone, so it asks
+        the merged linear for that shard's rows rather than splitting the
+        module in two -- same weight, same loader, 576 output columns instead of
+        2112. `forward_shard` returns the merged GEMM's slice unchanged when the
+        weight is quantized, so this is a fast path, not a second contract.
+        (vLLM's reference computes the full projection here too, and offers a
+        cross-layer fused fast path on top; that optimization is not ported.)
         """
-        qkv_lora = _linear_out(self.fused_qkv_a_proj(ctx_hidden))
-        kv_lora = qkv_lora[..., self.q_lora_rank :]
-        kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        kv_c = self.kv_a_layernorm(kv_c)
-        # RoPE the positional lane only -- there is no query on the context
-        # path. The rope kernel is 2-component (rotates query AND key, in place
-        # on the rotary_dim views) and the YaRN variant
-        # (DeepseekScalingRotaryEmbedding) declares `key` as a REQUIRED
-        # positional, unlike the base class whose `forward_native` takes it as
-        # optional. So pass a throwaway for the query side, exactly as
-        # deepseek_v2 does for its own k-only rope under PCP.
-        k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
-        _, k_pe = self.rotary_emb(positions, torch.empty_like(k_pe), k_pe)
-        # reuse _pcp_write_full_kv (not for PCP): only helper taking an explicit
-        # slot_mapping + handling all cache layouts; normal store hardcodes
-        # attn_metadata.slot_mapping, which is the block's, not the context rows'.
-        self.mla_attn.impl._pcp_write_full_kv(
-            self.mla_attn.kv_cache, kv_c, k_pe, slot_mapping
+        if self._ctx_kv_only_proj:
+            kv_lora = _linear_out(self.fused_qkv_a_proj.forward_shard(ctx_hidden, 1))
+        else:
+            kv_lora = _linear_out(self.fused_qkv_a_proj(ctx_hidden))[
+                ..., self.q_lora_rank :
+            ]
+        # norm + rope + concat + store live behind one call so every cache
+        # layout stays in the attention impl: the normal store hardcodes
+        # attn_metadata.slot_mapping, which is the draft block's, not these
+        # context rows'. It fuses the four ops into one kernel when the layout
+        # allows and otherwise runs exactly the chain this used to run inline.
+        self.mla_attn.impl.write_context_kv_latent(
+            self.mla_attn.kv_cache,
+            kv_lora,
+            positions,
+            slot_mapping,
+            self.kv_a_layernorm,
         )
 
     # ---- block pass --------------------------------------------------------
