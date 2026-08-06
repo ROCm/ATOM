@@ -11,7 +11,8 @@ from typing import TYPE_CHECKING, Any, Optional
 import torch
 from torch import nn
 
-from aiter import gelu_tanh_and_mul
+from aiter import ActivationType, gelu_tanh_and_mul
+from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import get_tp_group
 from aiter.rotary_embedding import get_rope
 
@@ -36,6 +37,7 @@ from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from atom.model_ops.moe import FusedMoE
@@ -283,41 +285,125 @@ class Gemma4MLP(nn.Module):
         return x
 
 
-class Gemma4SparseMoeBlock(nn.Module):
-    """Sparse MoE block for Gemma 4 26B-A4B variant.
+# ---------------------------------------------------------------------------
+# Fused-expert checkpoint loading (Gemma 4 26B-A4B MoE)
+#
+# The MoE checkpoint stores all routed experts of a layer in two 3D tensors,
+# `experts.gate_up_proj` [E, 2*I, H] and `experts.down_proj` [E, H, I], which
+# map directly onto FusedMoE's `w13_weight` / `w2_weight`. These helpers split
+# the fused gate_up tensor into gate (w1) / up (w3) halves and drive FusedMoE's
+# per-expert `weight_loader`. Mirrors the Qwen3.5 BF16 fused-expert path.
+# ---------------------------------------------------------------------------
 
-    Uses AITER FusedMoE (ASM + CK backend) for high-throughput expert dispatch.
+def _gemma4_detect_fused_expert_format(weight_name: str) -> bool:
+    return "experts.gate_up_proj" in weight_name or (
+        "experts.down_proj" in weight_name and ".experts." in weight_name
+    )
+
+
+def _gemma4_get_fused_expert_mapping() -> list[tuple[str, str, str]]:
+    # (param_name, weight_name, shard_id); gate_up_proj is chunked in the loader.
+    return [
+        ("experts.w13_weight", "experts.gate_up_proj", "w1"),
+        ("experts.w2_weight", "experts.down_proj", "w2"),
+    ]
+
+
+# aiter's CK 2-stage MoE GEMM requires the per-partition intermediate dimension
+# to be a multiple of this tile (the stage-2 contraction K = intermediate/TP).
+# 32 is enough for the weight *shuffle*, but the GEMM instance itself needs 128;
+# Gemma 4's 704 gives 88 at TP=8, which fails, so we round up to 128.
+_GEMMA4_MOE_INTERMEDIATE_ALIGN = 128
+
+
+def _gemma4_padded_moe_intermediate(moe_intermediate: int, tp_size: int) -> int:
+    """Pad the MoE intermediate so every TP partition is a multiple of the tile.
+
+    Gemma 4's moe_intermediate (704) gives 88 per partition at TP=8, which is not
+    a valid tile for the aiter CK MoE GEMM. We round each partition up to the
+    next multiple of ``_GEMMA4_MOE_INTERMEDIATE_ALIGN`` (128 -> per-partition 128,
+    total 1024) and zero-pad the extra expert units. This is numerically exact: a
+    zero gate/up column yields ``gelu(0) * 0 == 0``, and the matching zero
+    down-projection row contributes nothing to the output.
+    """
+    align = _GEMMA4_MOE_INTERMEDIATE_ALIGN
+    inter_pp = (moe_intermediate + tp_size - 1) // tp_size
+    inter_pp = ((inter_pp + align - 1) // align) * align
+    return inter_pp * tp_size
+
+
+def _gemma4_pad_intermediate(
+    t: torch.Tensor, dim: int, target: int
+) -> torch.Tensor:
+    pad_len = target - t.shape[dim]
+    if pad_len <= 0:
+        return t
+    pad_shape = list(t.shape)
+    pad_shape[dim] = pad_len
+    zeros = torch.zeros(pad_shape, dtype=t.dtype, device=t.device)
+    return torch.cat([t, zeros], dim=dim)
+
+
+def _gemma4_load_fused_expert_weights(
+    original_name: str,
+    name: str,
+    params_dict: dict,
+    loaded_weight: torch.Tensor,
+    shard_id: str,
+    num_experts: int,
+    intermediate_padded: Optional[int] = None,
+) -> bool:
+    param = params_dict[name]
+    weight_loader = param.weight_loader
+    loaded = False
+    if "gate_up_proj" in original_name:
+        # loaded_weight: [E, 2*I, H] -> gate/up each [E, I, H]
+        gate_weight, up_weight = loaded_weight.chunk(2, dim=-2)
+        if intermediate_padded is not None:
+            gate_weight = _gemma4_pad_intermediate(gate_weight, 1, intermediate_padded)
+            up_weight = _gemma4_pad_intermediate(up_weight, 1, intermediate_padded)
+        for expert_id in range(num_experts):
+            weight_loader(param, gate_weight[expert_id], name, "w1", expert_id)
+            weight_loader(param, up_weight[expert_id], name, "w3", expert_id)
+            loaded = True
+    else:
+        # down_proj: [E, H, I]
+        if intermediate_padded is not None:
+            loaded_weight = _gemma4_pad_intermediate(
+                loaded_weight, loaded_weight.dim() - 1, intermediate_padded
+            )
+        for expert_id in range(num_experts):
+            weight_loader(param, loaded_weight[expert_id], name, shard_id, expert_id)
+            loaded = True
+    return loaded
+
+
+class Gemma4Router(nn.Module):
+    """Router for the Gemma 4 MoE block.
+
+    Produces expert logits via ``proj(rmsnorm(x) * scale * hidden**-0.5)``. The
+    softmax / top-k / renormalization are delegated to FusedMoE. The learned
+    ``per_expert_scale`` (a post-top-k multiplicative weight per selected expert)
+    is folded into the routed experts' down-projection at load time — see
+    ``Gemma4DecoderLayer.process_weights_after_loading`` — which is exact because
+    it commutes with the renormalized weighted sum FusedMoE computes.
     """
 
-    def __init__(
-        self,
-        config: Gemma4TextConfig,
-        quant_config=None,
-        prefix: str = "",
-    ) -> None:
+    def __init__(self, config: Gemma4TextConfig, prefix: str = "") -> None:
         super().__init__()
-        self.num_experts = config.num_experts
-        self.top_k = config.top_k_experts
-        self.moe_intermediate_size = config.moe_intermediate_size
-
-        self.experts = FusedMoE(
-            num_experts=self.num_experts,
-            top_k=self.top_k,
-            hidden_size=config.hidden_size,
-            intermediate_size=self.moe_intermediate_size,
-            quant_config=quant_config,
-            prefix=f"{prefix}.experts",
+        hidden = config.hidden_size
+        self.scalar_root_size = hidden**-0.5
+        self.norm = _Gemma4RMSNorm(hidden, eps=config.rms_norm_eps, with_scale=False)
+        self.proj = ReplicatedLinear(
+            hidden, config.num_experts, bias=False, prefix=f"{prefix}.proj"
         )
-        self.router = nn.Linear(
-            config.hidden_size, self.num_experts, bias=False
-        )
+        self.scale = nn.Parameter(torch.ones(hidden))
+        self.per_expert_scale = nn.Parameter(torch.ones(config.num_experts))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        router_logits = self.router(hidden_states)
-        return self.experts(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-        )
+        hidden_states = self.norm(hidden_states)
+        hidden_states = hidden_states * self.scale * self.scalar_root_size
+        return self.proj(hidden_states)
 
 
 class Gemma4DecoderLayer(nn.Module):
@@ -363,18 +449,48 @@ class Gemma4DecoderLayer(nn.Module):
             prefix=f"{prefix}.self_attn",
         )
 
-        if config.enable_moe_block:
-            self.mlp = Gemma4SparseMoeBlock(
-                config=config,
-                quant_config=atom_config.quant_config,
-                prefix=f"{prefix}.mlp",
+        self.enable_moe_block = config.enable_moe_block
+        self.tp_size = get_tp_group().world_size
+
+        # Dense feed-forward. For dense Gemma 4 variants this is the whole FFN;
+        # for the MoE variant it is the always-on shared expert (`mlp.*`), run in
+        # parallel with the routed experts below.
+        self.mlp = Gemma4MLP(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            quant_config=atom_config.quant_config,
+            prefix=f"{prefix}.mlp",
+        )
+
+        if self.enable_moe_block:
+            self.router = Gemma4Router(config, prefix=f"{prefix}.router")
+            # aiter's MoE weight shuffle needs each TP partition's intermediate
+            # dimension to be 32-aligned; pad it (zero-filled) when it is not.
+            moe_intermediate = _gemma4_padded_moe_intermediate(
+                config.moe_intermediate_size, self.tp_size
             )
-        else:
-            self.mlp = Gemma4MLP(
+            self.experts = FusedMoE(
+                num_experts=config.num_experts,
+                top_k=config.top_k_experts,
                 hidden_size=config.hidden_size,
-                intermediate_size=config.intermediate_size,
+                intermediate_size=moe_intermediate,
+                reduce_results=False,
+                renormalize=True,
                 quant_config=atom_config.quant_config,
-                prefix=f"{prefix}.mlp",
+                scoring_func="softmax",
+                activation=ActivationType.Gelu,
+                has_bias=False,
+                prefix=f"{prefix}.experts",
+                config=config,
+            )
+            self.post_feedforward_layernorm_1 = _Gemma4RMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps
+            )
+            self.post_feedforward_layernorm_2 = _Gemma4RMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps
+            )
+            self.pre_feedforward_layernorm_2 = _Gemma4RMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps
             )
 
         self.input_layernorm = _Gemma4RMSNorm(
@@ -410,9 +526,27 @@ class Gemma4DecoderLayer(nn.Module):
             **model_kwargs,
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
+        # The fused norm-add leaves `hidden_states` = pre_feedforward_layernorm of
+        # the post-attention residual, and `residual` = the post-attention residual
+        # itself (the input to both FFN branches below).
         hidden_states, residual = self.pre_feedforward_layernorm(hidden_states, residual)
 
-        hidden_states = self.mlp(hidden_states)
+        if self.enable_moe_block:
+            # Dense shared-expert branch (on the pre-FFN-normed hidden states).
+            shared = self.mlp(hidden_states)
+            shared = self.post_feedforward_layernorm_1(shared)
+            # Routed-expert branch operates on the post-attention residual; the
+            # router applies its own internal (scale-free) RMSNorm.
+            router_logits = self.router(residual)
+            routed = self.pre_feedforward_layernorm_2(residual)
+            routed = self.experts(hidden_states=routed, router_logits=router_logits)
+            if self.tp_size > 1:
+                routed = tensor_model_parallel_all_reduce(routed)
+            routed = self.post_feedforward_layernorm_2(routed)
+            hidden_states = shared + routed
+        else:
+            hidden_states = self.mlp(hidden_states)
+
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = residual + hidden_states
 
@@ -426,6 +560,20 @@ class Gemma4DecoderLayer(nn.Module):
         # to deliberately break the carry chain and force the next layer's
         # input_layernorm to start a fresh residual from hidden_states.
         return hidden_states, None
+
+    def process_weights_after_loading(self) -> None:
+        # Fold the router's learned per-expert scale into the routed experts'
+        # down-projection (w2). `per_expert_scale[e]` multiplies expert e's
+        # renormalized routing weight, which is exactly equivalent to scaling
+        # expert e's linear output — so baking it into w2 is numerically exact.
+        # named_modules() yields this layer before its `experts` child, so this
+        # runs before FusedMoE's own weight shuffle; a per-expert scalar commutes
+        # with the intra-expert shuffle, so ordering is safe.
+        if not self.enable_moe_block:
+            return
+        w2 = self.experts.w2_weight
+        per_expert_scale = self.router.per_expert_scale.data.to(w2.dtype)
+        w2.data.mul_(per_expert_scale.view(-1, 1, 1))
 
 
 @support_torch_compile(
@@ -501,8 +649,12 @@ class Gemma4ForCausalLM(nn.Module):
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
         "v_proj": ("qkv_proj", "v"),
-        "gate_proj": ("gate_up_proj", 0),
-        "up_proj": ("gate_up_proj", 1),
+        # `mlp.`-anchored so the routed experts' fused `experts.gate_up_proj`
+        # tensor (whose name contains the substring `up_proj`) is NOT misrouted
+        # into the dense-MLP packing path — it is loaded via the fused-expert
+        # path (`load_fused_expert_weights`) instead.
+        "mlp.gate_proj": ("mlp.gate_up_proj", 0),
+        "mlp.up_proj": ("mlp.gate_up_proj", 1),
     }
     weights_mapping = {
         "model.language_model.": "model.",
@@ -522,6 +674,7 @@ class Gemma4ForCausalLM(nn.Module):
         text_config = self.hf_config
         if hasattr(self.hf_config, "text_config"):
             text_config = self.hf_config.text_config
+        self._text_config = text_config
 
         self.model = Gemma4Model(
             atom_config=self.atom_config,
@@ -594,8 +747,55 @@ class Gemma4ForCausalLM(nn.Module):
             model=self,
             config=self.atom_config,
             prefix="model.",
+            load_fused_expert_weights_fn=self.load_fused_expert_weights,
         )
         for module in self.modules():
             if hasattr(module, '_invalidate_weight_cache'):
                 module._invalidate_weight_cache()
         return loaded_weights_record
+
+    # ------------------------------------------------------------------
+    # MoE expert-weight loading hooks (consumed by ATOM's weight loader).
+    # These are only exercised by the 26B-A4B MoE checkpoint; for the dense
+    # 31B checkpoint `get_expert_mapping` returns [] and the fused-format
+    # detector never fires, so the dense load path is unchanged.
+    # ------------------------------------------------------------------
+    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+        if not getattr(self._text_config, "enable_moe_block", False):
+            return []
+        return FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self._text_config.num_experts,
+        )
+
+    def detect_fused_expert_format(self, weight_name: str) -> bool:
+        return _gemma4_detect_fused_expert_format(weight_name)
+
+    def get_fused_expert_mapping(self) -> list[tuple[str, str, str]]:
+        return _gemma4_get_fused_expert_mapping()
+
+    def load_fused_expert_weights(
+        self,
+        original_name: str,
+        name: str,
+        params_dict: dict,
+        loaded_weight: torch.Tensor,
+        shard_id: str,
+        num_experts: int,
+    ) -> bool:
+        if not num_experts:
+            num_experts = getattr(self._text_config, "num_experts", 0)
+        intermediate_padded = _gemma4_padded_moe_intermediate(
+            self._text_config.moe_intermediate_size, get_tp_group().world_size
+        )
+        return _gemma4_load_fused_expert_weights(
+            original_name,
+            name,
+            params_dict,
+            loaded_weight,
+            shard_id,
+            num_experts,
+            intermediate_padded=intermediate_padded,
+        )
