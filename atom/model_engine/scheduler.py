@@ -2365,10 +2365,36 @@ class DecodeScheduler(Scheduler):
 
         seq = self.prefill_waiting.pop(seq_id, None)
         if seq is not None:
-            seq.num_cached_tokens = num_tokens_computed
+            # `num_tokens_computed` is the DELTA prefill actually ran
+            # (PrefillScheduler: num_tokens - num_cached_tokens), not the total.
+            # Assigning it would clobber a nonzero prefix-cache hit and make the
+            # one-shot hash publish in postprocess re-hash from mid-prompt.
+            # `+=` mirrors the non-disagg `seq.num_cached_tokens += chunk`.
+            seq.num_cached_tokens += num_tokens_computed
             seq.append_token(sampled_token_id)
+            # T0 lives in seq.token_ids (so the first decode forward reads it as
+            # input), but no postprocess ever sees it in a fwd_output: with
+            # deferred output this seq has idx=None on its first decode step and
+            # `continue`s before any stream output is built, so T0 would never be
+            # emitted and every completion would silently lose its first token.
+            # Mark it for injection so the first postprocess that does carry a
+            # token for this seq prepends T0 to new_tokens — the same hook the
+            # inter-node P/D path uses at _schedule_first_decode_after_remote_kv.
+            seq._injected_t0 = sampled_token_id
             seq.first_token_time = time.time()
             self.prefill_done.append(seq)
+
+    def preempt(self, seq: Sequence):
+        """Drop any pending T0 injection before the base preemption logic.
+
+        A preempted sequence is re-prefilled from scratch and will emit its
+        first token through the normal path. Carrying `_injected_t0` across the
+        preempt/resume boundary would prepend T0 to the output a second time.
+        Overridden here rather than in Scheduler.preempt so the disagg fix
+        cannot affect the non-disagg path.
+        """
+        seq._injected_t0 = None
+        super().preempt(seq)
 
     def schedule(self):
         """Schedule decode-only batches.

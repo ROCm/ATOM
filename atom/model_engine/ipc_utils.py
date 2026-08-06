@@ -89,6 +89,53 @@ def import_kv_cache(meta: dict) -> tuple[torch.Tensor, torch.Tensor | None]:
 # ---------------------------------------------------------------------------
 
 
+# Reserved key in the handles dict holding non-tensor Python metadata.
+_META_KEY = "__meta__"
+
+# Simple picklable value types carried by the sidecar (below).
+_META_VALUE_TYPES = (str, bool, int, float)
+
+
+def _tensor_meta_attrs(t: torch.Tensor) -> dict:
+    """Custom Python attributes stamped onto a tensor object.
+
+    process_weights_after_loading marks tensors with plain attributes rather
+    than wrapping them — e.g. ``weight.is_shuffled = True`` (model_ops/moe.py,
+    model_ops/utils.py).  A CUDA IPC handle carries storage + dtype/shape/stride
+    and nothing else, and the consumer rebuilds a fresh tensor object, so these
+    are silently dropped unless carried explicitly.  aiter reads ``is_shuffled``
+    via getattr(..., False) as a KERNEL-SELECTION key for QuantType.per_1x32,
+    so losing it makes the consumer run MXFP4 kernels against a layout the
+    bytes do not have — wrong results, no error.
+    """
+    return {
+        k: v
+        for k, v in getattr(t, "__dict__", {}).items()
+        if not k.startswith("_") and isinstance(v, _META_VALUE_TYPES)
+    }
+
+
+def _module_meta_attrs(mod: nn.Module) -> dict:
+    """Non-tensor str/bool attributes stashed on a module by post-load hooks.
+
+    Same class of bug as _tensor_meta_attrs, one level up: e.g. the swizzle
+    layout labels ``w13_swizzle_layout`` / ``w2_swizzle_layout`` (moe.py:1109),
+    which are plain strings initialised to None at construction and only filled
+    by process_weights_after_loading.
+
+    Restricted to str/bool deliberately.  Layout labels and format flags live in
+    those types; ints/floats on a module are construction-time config, identical
+    in both processes, so carrying them would only bloat the payload.
+    """
+    return {
+        k: v
+        for k, v in mod.__dict__.items()
+        if not k.startswith("_")
+        and k != "training"
+        and isinstance(v, (str, bool))
+    }
+
+
 def export_model_weight_handles(model: nn.Module) -> dict:
     """Export all model parameter tensors as CUDA IPC handles.
 
@@ -96,20 +143,38 @@ def export_model_weight_handles(model: nn.Module) -> dict:
     which are plain tensor attributes set by process_weights_after_loading(),
     not nn.Parameters, so named_parameters() misses them.
 
+    Alongside the handles, a ``__meta__`` sidecar carries the non-tensor Python
+    metadata that post-load hooks attach to tensors and modules; see
+    _tensor_meta_attrs / _module_meta_attrs.  The consumer never runs
+    process_weights_after_loading (it builds on meta and imports), so anything
+    that hook produced must travel in the payload or it does not exist there.
+
     Must be called from the process that allocated the weights (prefill),
     after load_model() completes.  Returns a dict {key: meta_dict}.
     """
     handles = {}
+    tensor_attrs: dict[str, dict] = {}
+    module_attrs: dict[str, dict] = {}
     # Parameters. remove_duplicate=False so a Parameter registered under multiple
     # names (e.g. e_score_correction_bias, shared by gate + experts) is exported
     # under EVERY name — otherwise the consumer only materializes one of the
     # aliased registrations and the other stays on meta.
     for name, param in model.named_parameters(remove_duplicate=False):
-        handles[f"__param__{name}"] = _export_tensor(param.data)
+        key = f"__param__{name}"
+        handles[key] = _export_tensor(param.data)
+        # Read attrs off the Parameter object, not param.data — process_weights
+        # stamps the Parameter (e.g. `layer.w13_weight.is_shuffled = True`).
+        attrs = _tensor_meta_attrs(param)
+        if attrs:
+            tensor_attrs[key] = attrs
     # Registered buffers (non-persistent included).
     for name, buf in model.named_buffers():
         if isinstance(buf, torch.Tensor) and buf.is_cuda and buf.numel() > 0:
-            handles[f"__buf__{name}"] = _export_tensor(buf)
+            key = f"__buf__{name}"
+            handles[key] = _export_tensor(buf)
+            attrs = _tensor_meta_attrs(buf)
+            if attrs:
+                tensor_attrs[key] = attrs
     # Plain tensor attributes set by process_weights_after_loading() — e.g. the
     # MLA absorbed W_K/W_V — which are neither Parameters nor registered buffers.
     for mod_name, mod in model.named_modules():
@@ -122,7 +187,18 @@ def export_model_weight_handles(model: nn.Module) -> dict:
             ):
                 key = f"{mod_name}.{attr}" if mod_name else attr
                 handles[f"__attr__{key}"] = _export_tensor(val)
+                attrs = _tensor_meta_attrs(val)
+                if attrs:
+                    tensor_attrs[f"__attr__{key}"] = attrs
+        mattrs = _module_meta_attrs(mod)
+        if mattrs:
+            module_attrs[mod_name] = mattrs
 
+    handles[_META_KEY] = {"tensor_attrs": tensor_attrs, "module_attrs": module_attrs}
+    logger.info(
+        f"[WT-EXPORT] {len(handles) - 1} tensors, "
+        f"{len(tensor_attrs)} with attrs, {len(module_attrs)} modules with attrs"
+    )
     return handles
 
 
@@ -143,7 +219,18 @@ def import_model_weights(model: nn.Module, handles: dict) -> None:
     params = dict(model.named_parameters(remove_duplicate=False))
     buffers = dict(model.named_buffers())
 
+    sidecar = handles.get(_META_KEY, {})
+    tensor_attrs = sidecar.get("tensor_attrs", {})
+    module_attrs = sidecar.get("module_attrs", {})
+
+    def _restore_attrs(obj, key):
+        """Re-stamp the producer's non-tensor attributes onto the rebuilt object."""
+        for k, v in tensor_attrs.get(key, {}).items():
+            setattr(obj, k, v)
+
     for key, meta in handles.items():
+        if key == _META_KEY:
+            continue
         t = _import_tensor(meta)
         if key.startswith("__param__"):
             # Rebuild the Parameter around the imported CUDA view (set_data fails
@@ -153,7 +240,9 @@ def import_model_weights(model: nn.Module, handles: dict) -> None:
             parent, _, attr = name.rpartition(".")
             mod = modules.get(parent, model)
             rg = params[name].requires_grad if name in params else False
-            mod._parameters[attr] = nn.Parameter(t, requires_grad=rg)
+            p = nn.Parameter(t, requires_grad=rg)
+            _restore_attrs(p, key)
+            mod._parameters[attr] = p
         elif key.startswith("__buf__"):
             # Keep decode's locally-built real buffers (e.g. RoPE caches built
             # during construction); only fill buffers it is missing or left on
@@ -164,6 +253,7 @@ def import_model_weights(model: nn.Module, handles: dict) -> None:
                 parent, _, attr = name.rpartition(".")
                 mod = modules.get(parent, model)
                 if mod is not None:
+                    _restore_attrs(t, key)
                     mod._buffers[attr] = t
         elif key.startswith("__attr__"):
             # Plain tensor attribute (e.g. MLA W_K/W_V from process_weights).
@@ -171,7 +261,25 @@ def import_model_weights(model: nn.Module, handles: dict) -> None:
             parent, _, attr = name.rpartition(".")
             mod = modules.get(parent, model)
             if mod is not None:
+                _restore_attrs(t, key)
                 setattr(mod, attr, t)
+
+    # Module-level non-tensor metadata (e.g. swizzle layout labels). Fill only
+    # what the consumer lacks — mirrors the buffer policy above. Never clobber a
+    # value the consumer computed itself during construction.
+    restored_mod_attrs = 0
+    for mod_name, attrs in module_attrs.items():
+        mod = modules.get(mod_name)
+        if mod is None:
+            continue
+        for k, v in attrs.items():
+            if getattr(mod, k, None) is None:
+                setattr(mod, k, v)
+                restored_mod_attrs += 1
+    logger.info(
+        f"[WT-IMPORT] restored {sum(len(a) for a in tensor_attrs.values())} tensor "
+        f"attrs and {restored_mod_attrs} module attrs from the producer"
+    )
 
     leftover = [n for n, p in model.named_parameters() if p.is_meta] + [
         n for n, b in model.named_buffers() if isinstance(b, torch.Tensor) and b.is_meta
