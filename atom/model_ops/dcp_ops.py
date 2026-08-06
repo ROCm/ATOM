@@ -98,6 +98,12 @@ def _correct_attn_cp_out_kernel(
     )
     output = tl.load(outputs_ptr + output_offsets)
     output = output * factor
+    # A rank that owns no candidate for this row has local_lse=-inf -> factor=0,
+    # and its attention output is NaN (0/0 in the kernel's acc/e_sum). NaN*0=NaN
+    # would poison the ReduceScatter sum, so force the empty-rank contribution to
+    # 0. Matches vLLM's cp merge kernel; covers both decode and prefill so callers
+    # need no separate NaN scrub.
+    output = tl.where(factor == 0.0, 0.0, output)
     tl.store(new_output_ptr + output_offsets, output)
 
 
@@ -296,9 +302,7 @@ def get_dcp_local_seq_lens(seq_lens, dcp_size, dcp_rank, interleave_size=1):
 
 
 # ---------------------------------------------------------------------------
-# Deterministic global top-k over exchanged DCP candidates. Replaces "all-gather
-# the full logit plane" with "all-gather W*topk (score, global_id) candidates" on
-# the decode indexer path.
+# Deterministic global top-k over exchanged DCP candidates.
 #
 # Every rank runs the merge independently, so the selection must be a *function*
 # of its input, not merely "usually the same": an ambiguous choice resolved
@@ -310,13 +314,15 @@ def get_dcp_local_seq_lens(seq_lens, dcp_size, dcp_rank, interleave_size=1):
 #     keep  score > T
 #     keep  score == T  and  gid <= G     where G is the `need`-th smallest gid
 #
-# Measured on real data (25,600 rows, 6.1.4): 0.06% of rows have a boundary
+# Measured on real data (25,600 rows): 0.06% of rows have a boundary
 # tie and the tied set is never larger than 2.
 # ---------------------------------------------------------------------------
 
-# Ties measured <= 2 (6.1.4); 256 leaves a 128x margin. Overflow is reported in
-# a per-row flag rather than silently mis-selecting. Must be a power of two
-# (`tl.sort`).
+# Ties measured <= 2; 256 leaves a 128x margin. Must be a power of two (`tl.sort`).
+# WARNING: silent correctness limit. If a row has >CAP candidates tied at the
+# threshold score, the extra ties are dropped and that row's top-k is wrong; the
+# `overflow` flag records it but the hot path can't read it back (D2H breaks
+# CUDAGraph). Accepted since >256 exact fp32 ties is extremely rare.
 DCP_TOPK_TIE_CAP = 256
 
 
@@ -363,8 +369,8 @@ def _dcp_stable_topk_kernel(
     # ---- loop 1: count strict winners, scatter tied gids to scratch ----
     # The tied gids go to GLOBAL scratch, not a register array: Triton cannot
     # index registers dynamically, so a register buffer needs an O(CAP) fold per
-    # tile -- measured 2117 us at CAP=256 against a ~54 us two-pass floor
-    # (6.1.6). A global store takes the computed per-lane slot directly.
+    # tile -- measured 2117 us at CAP=256 against a ~54 us two-pass floor.
+    # A global store takes the computed per-lane slot directly.
     c_strict = 0
     n_tie = 0
     for start in range(0, n, BLOCK):
@@ -432,7 +438,7 @@ def dcp_stable_topk(scores, gids, k, out=None):
     # aiter's tuned topk_plain is fp32-only, so it cannot take a 64-bit
     # composite key; it supplies the score threshold and the kernel above adds
     # the deterministic tie-break. A from-scratch Triton radix-select measured
-    # 524 us against a ~26.9 us/pass memory floor (6.1.5).
+    # 524 us against a ~26.9 us/pass memory floor.
     topk_plain(
         scores,
         idx_buf,

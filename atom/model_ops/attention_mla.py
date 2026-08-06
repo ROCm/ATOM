@@ -1085,14 +1085,8 @@ class MLAAttention(nn.Module):
                 page_size = envs.ATOM_MLA_PAGE_SIZE
             else:
                 page_size = 1
-            # `mla_prefill_asm_fwd` NEVER writes its LSE output: aiter allocates
-            # attn_lse with torch.empty and hands the uninitialized buffer straight
-            # back (verified with a sentinel probe -- entries left untouched). So
-            # whenever an LSE is required, route
-            # through the decode kernel instead. That is sound for sparse prefill
-            # because it runs max_q_len=1: every query token is already its own row
-            # with its own candidate list, i.e. structurally a decode. The fp8 path
-            # has always used this kernel; `return_lse` extends it to bf16.
+            # `mla_prefill_asm_fwd` NEVER writes its LSE output, so DCP also needs
+            # `mla_decode_fwd` kernel.
             use_decode_kernel = self.kv_cache_dtype.startswith("fp8") or return_lse
             if use_decode_kernel:
                 is_fp8 = self.kv_cache_dtype.startswith("fp8")
@@ -1110,13 +1104,6 @@ class MLAAttention(nn.Module):
                     kv_last_page_lens,
                     max_q_len,
                     page_size=page_size,
-                    # Mirror the decode path's explicit choice. Leaving this None
-                    # lets aiter pick, and several of its dispatch branches key on
-                    # `num_kv_splits == 1`, which sends stage2 down the FINAL_OUT
-                    # copy-through path that NEVER stores Final_lse -- handing back
-                    # an untouched torch.empty as the LSE (the same trap as the
-                    # asm-prefill LSE bug). Keep it > 1 so stage2 stays
-                    # on the reduce path that writes the LSE.
                     num_kv_splits=max(2, 16 // max(1, self.dcp_world_size)),
                     sm_scale=self.scale,
                     q_scale=self._q_scale if is_fp8 else None,
@@ -1379,16 +1366,6 @@ class MLAAttention(nn.Module):
             num_kv_splits = (
                 16 if use_persistent_mode else max(1, 16 // self.dcp_world_size)
             )
-            # NOTE: sparse + DCP used to force num_kv_splits=1 here, because
-            # a -1-padded fixed-length region made aiter's stage2 believe every
-            # split held tokens and one of them could be all sentinels -> NaN. That
-            # forcing then hit a second problem: num_kv_splits==1 sends aiter's
-            # stage2 down its copy-through fast path (FINAL_OUT, aiter/mla.py:74),
-            # which never stores Final_lse, so return_lse handed back an untouched
-            # torch.empty buffer. Compaction removes both: cur_kv_seq_len is now the
-            # true (small) owned count, so stage2's own
-            # min(splits, cdiv(seq_len, mgc)) clamp skips the empty splits, and
-            # num_kv_splits>1 keeps it on the reduce path that writes the lse.
 
             # TODO refactor this
             if envs.ATOM_MLA_PAGE_SIZE is not None:
@@ -1734,7 +1711,7 @@ class MLAAttention(nn.Module):
                         q_out, kv_cache, attn_metadata, return_lse=True
                     )
                     # Merge in fp32: the bf16 ReduceScatter sum dominates the accuracy
-                    # regression under fp8 KV.
+                    # regression under fp8 KV in long context scenario.
                     o = cp_lse_ag_out_rs(o.float(), lse, self.dcp_group, ctx=None).to(
                         o.dtype
                     )

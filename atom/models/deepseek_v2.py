@@ -1650,9 +1650,15 @@ def sparse_attn_indexer(
             # (index_cache is sharded, same slot_mapping as the main KV). Score
             # the LOCAL shard — block_tables already point at it, so only
             # context_lens must be localized — take a LOCAL top-k, and all-gather
-            # just the W*topk (score, global_id) candidates. A token in the global
-            # top-K is necessarily in its own rank's local top-K, so the merge is
-            # lossless.
+            # just the W*topk (score, global_id) candidates. Because fewer tokens
+            # outrank a given token locally than globally, a token in the global
+            # top-K is in its own rank's local top-K, so the merge reconstructs
+            # the global top-K. Caveat: the local top-k is a score-only
+            # radix-select whose tie handling differs from the global gid-ordered
+            # tie-break, so when the local boundary (2048th) sits on a score tie a
+            # tied token may be dropped before the exchange -- the merged set can
+            # then differ from dcp=1 at that boundary. Exact fp32 score ties are
+            # rare, so this is a negligible boundary effect, not a systematic loss.
             #
             # This replaces the earlier path, which all-gathered the whole logit
             # plane. That plane is `max_model_len`-wide, not ctx-wide
@@ -2259,8 +2265,14 @@ class Indexer(nn.Module):
         # can take the clean route and the index-cache scratch slot that used to
         # work around the fused op is no longer needed.
         dcp = get_dcp_world_size() > 1
+        # `unfused_qk_rope` = run k_norm/rope/quant/kv-cache as separate ops
+        # instead of the fused `indexer_qk_rope_quant_and_cache`. The fused op is
+        # slot_mapping-driven, so under pcp/dcp non-owner ranks (slot=-1) skip it
+        # and leave q_fp8/weights uninitialized. Computed once and passed
+        # (negated) to the op below so the two conditions can't drift apart.
+        unfused_qk_rope = (not self.use_qk_rope_cache_fusion) or pcp or dcp
         positions_op = positions
-        if (not self.use_qk_rope_cache_fusion) or pcp or dcp:
+        if unfused_qk_rope:
             q_pe, _ = torch.split(
                 q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
             )
@@ -2320,9 +2332,7 @@ class Indexer(nn.Module):
             rotary_emb.sin_cache.squeeze(-2).squeeze(-2),
             self._weights_scale,
             rotary_emb.is_neox_style,
-            # Must match the unfused-path condition above; the caller's q_input
-            # dtype depends on this flag.
-            self.use_qk_rope_cache_fusion and not pcp and not dcp,
+            not unfused_qk_rope,
         )
 
 
