@@ -128,6 +128,13 @@ class BlockManager:
         # moment it stops forking (see the state-cache protocol).
         self.state_caches: tuple[StateCache, ...] = (self.state,)
 
+        # The demand funnel: recorded at admission, cut for when a prefill
+        # chunk is shortened to land on it, kept when the state pool files it.
+        # Counted at all three because a gap between any two is a different
+        # bug, and they are indistinguishable in the hit rate alone.
+        self.demands_recorded: int = 0
+        self.chunks_cut_for_demand: int = 0
+
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
         h = xxhash.xxh64()
@@ -582,7 +589,8 @@ class BlockManager:
         The shape that pays for this is a template header whose checkpoint is
         invalidated before anyone reaches it — there each request cuts a chunk
         and none collects. What bounds that is convergence rather than a
-        threshold: found once, filled once, gone.
+        threshold: found once, filled once, gone. `chunks_cut_for_demand`
+        against `demands_recorded` is where it would show if it did not.
         """
         wanted = (
             self._gated_hit(seq, compressed_hit, block_hashes, assume_checkpointed=True)
@@ -596,6 +604,7 @@ class BlockManager:
         seq.checkpoint_demand_pos = (
             wanted * self.hash_block_size if interval_on and wanted > hit else 0
         )
+        self.demands_recorded += bool(seq.checkpoint_demand_pos)
 
     def checkpoint_cut(self, seq: Sequence, start: int, end: int) -> int:
         """Latest ladder position in `(start, end]`, or 0 if there is none.
@@ -618,7 +627,24 @@ class BlockManager:
         # rung at all, be the only position either side has.
         demand = seq.checkpoint_demand_pos
         target = max(rung, demand if demand <= end else 0)
-        return target if target > start else 0
+        if target <= start:
+            return 0
+        # `target` is the larger of the two, so beating the grid means the
+        # demand chose this cut and the grid would not have.
+        self.chunks_cut_for_demand += target > rung
+        return target
+
+    def checkpoint_funnel(self) -> dict[str, int]:
+        """Every stage a wanted checkpoint passes through, in order.
+
+        Assembled here because the stages live in two objects — the ladder
+        decides what to ask for, the pool decides what survives — and a reader
+        needs them side by side to tell which stage lost it.
+        """
+        return {
+            "demands_recorded": self.demands_recorded,
+            "chunks_cut_for_demand": self.chunks_cut_for_demand,
+        } | self.state.checkpoint_fates()
 
     def checkpointers_at(
         self, seq: Sequence, pos: int, next_forward_tokens: int | None = None

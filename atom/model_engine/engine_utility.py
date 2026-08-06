@@ -310,6 +310,9 @@ class EngineUtilityHandler:
         else:
             result = stats.get_statistics()
             result["enabled"] = True
+            # `CacheStats` counts the reuse a request wanted and did not
+            # get; the funnel is where it was lost.
+            result |= self.scheduler.block_manager.checkpoint_funnel()
         self.output_queue.put_nowait(
             ("UTILITY_RESPONSE", {"cmd": "get_cache_statistics", "result": result})
         )

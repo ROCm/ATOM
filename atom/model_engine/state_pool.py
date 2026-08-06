@@ -210,6 +210,14 @@ class StateGroupPool:
         # checkpoint copies the owner's state out, resuming from one copies it
         # back in.
         self._copies: list[tuple[int, int]] = []
+        # `dropped` had no group to go to; `evicted` landed and was later
+        # spent on an allocation. Counted apart because they read the same in a
+        # hit rate and want opposite fixes — the first says the pool is too
+        # small for the rate of keeping, the second for how long a checkpoint
+        # has to last.
+        self.checkpoints_kept: int = 0
+        self.checkpoints_dropped: int = 0
+        self.checkpoints_evicted: int = 0
 
     # ------------------------------ free list ------------------------------ #
     def has_free(self) -> bool:
@@ -244,6 +252,7 @@ class StateGroupPool:
         if group < 0:
             group = self._checkpointed.popleft()
             self._free.discard(group)
+            self.checkpoints_evicted += 1
         self.invalidate(group)
         return group
 
@@ -486,11 +495,13 @@ class StateGroupPool:
             seq.pending_checkpoint = h
             return
         if not self.has_free():
+            self.checkpoints_dropped += 1
             return
         seq.per_req_cache_group = self.pop()
         seq.state_fork_src = old
         self.release(old)
         self._index(h, old)
+        self.checkpoints_kept += 1
 
     def _commit_pending(self) -> None:
         """Turn the last step's checkpoint intents into copy pairs.
@@ -510,13 +521,25 @@ class StateGroupPool:
         for seq in self._checkpoint_pending:
             h, seq.pending_checkpoint = seq.pending_checkpoint, -1
             src = seq.per_req_cache_group
-            if h == -1 or src < 0 or not self.has_free():
+            if h == -1 or src < 0:
+                continue
+            if not self.has_free():
+                self.checkpoints_dropped += 1
                 continue
             dst = self.pop()
             self.release(dst)
             self._index(h, dst)
             self._copies.append((src, dst))
+            self.checkpoints_kept += 1
         self._checkpoint_pending.clear()
+
+    def checkpoint_fates(self) -> dict[str, int]:
+        """What became of the checkpoints the ladder asked this pool to keep."""
+        return {
+            "checkpoints_kept": self.checkpoints_kept,
+            "checkpoints_dropped": self.checkpoints_dropped,
+            "checkpoints_evicted": self.checkpoints_evicted,
+        }
 
     def record_copy(self, src: int, dst: int) -> None:
         """Schedule a state copy for the next batch's forward to issue."""

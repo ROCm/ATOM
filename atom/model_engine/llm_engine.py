@@ -370,6 +370,11 @@ class LLMEngine:
                 "compressed_tokens",
                 "wanted_tokens",
                 "full_tokens",
+                "checkpoints_kept",
+                "checkpoints_dropped",
+                "checkpoints_evicted",
+                "demands_recorded",
+                "chunks_cut_for_demand",
             )
         }
         full = totals["full_tokens"]
