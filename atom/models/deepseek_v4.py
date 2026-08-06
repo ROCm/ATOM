@@ -170,6 +170,28 @@ def _v4_attention_fake(
 # attention op's output.
 _v4_attn_piecewise_out: dict = {}
 
+# ATOM_ATTN_CUDAGRAPH: per-(layer_name, num_tokens, q_eff, bs) captured cudagraphs
+# of the eager attention core (_attn_core). Captured in the capture pass
+# (mode=PIECEWISE, in_hipgraph=True), replayed at real decode (in_hipgraph=False).
+# Each entry: {"graph": CUDAGraph, "in": [stable_tensor|None,...], "out": Tensor}.
+_v4_attn_core_graphs: dict = {}
+
+# ATOM_ATTN_CUDAGRAPH_COVERAGE=1: diagnostic counters to measure whether real
+# decode actually HITS the captured graphs or silently falls back to eager. Keyed
+# by (num_tokens, q_eff, bs); value = {"capture","replay","eager_fallback"} counts.
+# Reveals the ragged-vs-rectangle shape mismatch (num_tokens=x.shape[0] at replay
+# is the ragged flat bucket, but capture built graphs at bs*max_q_len).
+_v4_attn_cg_coverage: dict = {}
+
+# ONE shared pool for ALL attention-core graphs — separate from the dense pieces'
+# shared pool. Rationale: (a) sharing the dense pool corrupts its overlay layout
+# (attention captures on a different forward pass than the dense pieces -> MoE
+# aperture fault at replay); (b) a pool-per-graph explodes memory (~42GB private
+# pools -> OOM). One attention-only pool overlays the attention graphs among
+# themselves (they replay serially, outputs pinned to _v4_attn_piecewise_out) while
+# staying isolated from the dense pool. Created once on first capture.
+_v4_attn_graph_pool = None
+
 
 @mark_spliting_op(is_custom=True, gen_fake=_v4_attention_fake, mutates_args=[])
 def v4_attention_with_output(
@@ -222,23 +244,157 @@ def v4_core_attention(
 ) -> torch.Tensor:
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
-    out = self._attn_core(
-        x, q, kv_pre, qr, qr_scale, positions, idx_q_quant, idx_weights, idx_q_scale
-    )
 
     from atom.config import CUDAGraphMode
     from atom.utils.forward_context import get_forward_context
 
     fc = get_forward_context()
-    if getattr(fc, "cudagraph_runtime_mode", None) == CUDAGraphMode.PIECEWISE:
-        key = (layer_name, int(out.shape[0]))
-        buf = _v4_attn_piecewise_out.get(key)
-        if buf is None:
-            buf = torch.empty_like(out)
-            _v4_attn_piecewise_out[key] = buf
-        buf.copy_(out)
-        return buf
-    return out
+
+    # READ-ONLY probe (ATOM_ATTN_CUDAGRAPH_PROBE=1): confirm the trigger timing
+    # inside this eager op before adding capture/replay. Log only layer 0 to avoid
+    # flooding. Prints on every call: mode / in_hipgraph / dummy / shape / q_eff / bs.
+    if os.environ.get("ATOM_ATTN_CUDAGRAPH_PROBE") == "1" and (
+        "layers.0." in layer_name or layer_name.startswith("layers.0")
+    ):
+        _ctx = getattr(fc, "context", None)
+        _amd = getattr(fc, "attn_metadata", None)
+        logger.info(
+            "[ATTN_CG_PROBE] v4_core_attention layer=%s mode=%s in_hipgraph=%s "
+            "dummy=%s num_tokens=%s q_eff=%s bs=%s",
+            layer_name,
+            getattr(fc, "cudagraph_runtime_mode", None),
+            getattr(fc, "in_hipgraph", None),
+            getattr(_ctx, "is_dummy_run", None),
+            int(x.shape[0]),
+            getattr(_amd, "max_seqlen_q", None),
+            getattr(_ctx, "batch_size", None),
+        )
+
+    _piecewise = getattr(fc, "cudagraph_runtime_mode", None) == CUDAGraphMode.PIECEWISE
+    _tensor_args = (x, q, kv_pre, qr, qr_scale, positions,
+                    idx_q_quant, idx_weights, idx_q_scale)  # fmt: skip
+
+    def _run_eager():
+        return self._attn_core(
+            x, q, kv_pre, qr, qr_scale, positions,
+            idx_q_quant, idx_weights, idx_q_scale,
+        )  # fmt: skip
+
+    def _stabilize(out):
+        # PIECEWISE: the DOWNSTREAM dense piece's cudagraph was captured reading
+        # attention output from this fixed per-(layer, num_tokens) address, so
+        # eager/replay/capture must all return THIS buffer (never a pool tensor
+        # whose address a later piece can recycle).
+        if not _piecewise:
+            return out
+        k = (layer_name, int(out.shape[0]))
+        b = _v4_attn_piecewise_out.get(k)
+        if b is None:
+            b = torch.empty_like(out)
+            _v4_attn_piecewise_out[k] = b
+        b.copy_(out)
+        return b
+
+    # ATOM_ATTN_CUDAGRAPH: capture _attn_core into its own cudagraph and replay it
+    # at real decode, so attention stops running eager between the dense-piece graphs.
+    _attn_cg = (
+        os.environ.get("ATOM_ATTN_CUDAGRAPH") == "1"
+        and not getattr(getattr(fc, "context", None), "is_dummy_run", False)
+        and getattr(fc, "attn_metadata", None) is not None
+    )
+    if _attn_cg:
+        _amd = fc.attn_metadata
+        _ctx = getattr(fc, "context", None)
+        q_eff = int(getattr(_amd, "max_seqlen_q", 1) or 1)
+        # Key on the PADDED graph_bs, not the real scheduled batch_size. Capture
+        # builds each attention graph at the rectangle bs=graph_bs (context built
+        # with batch_size=graph_bs in build_for_cudagraph_capture), and the
+        # graph's SWA-write grid is baked at that graph_bs. Real ragged decode
+        # refills the SAME persistent geometry buffers padded to graph_bs
+        # (cu_seqlens_q -> graph_bs+1 with zero-len pad seqs, batch_id_per_token
+        # -> graph_bs*q with -1 sentinel tail, tokens zeroed to graph_bs*q); the
+        # pad seqs are inert in every kernel. But context.batch_size at replay is
+        # the REAL scheduled bs (e.g. 62) while capture stored graph_bs (e.g. 64)
+        # -> the old key missed 100% of ragged steps. graph_bs is the value both
+        # sides agree on.
+        graph_bs = int(getattr(_ctx, "graph_bs", 0) or 0)
+        key = (layer_name, int(x.shape[0]), q_eff, graph_bs)
+        entry = _v4_attn_core_graphs.get(key)
+        _in_hipgraph = getattr(fc, "in_hipgraph", False)
+
+        # ATOM_ATTN_CUDAGRAPH_COVERAGE: count how real decode resolves per shape.
+        # A real decode step is (_piecewise and not _in_hipgraph). If entry is
+        # None there, attention SILENTLY runs eager -> feature contributes nothing
+        # for that shape. Shape key excludes layer_name (aggregate across layers).
+        if os.environ.get("ATOM_ATTN_CUDAGRAPH_COVERAGE") == "1" and (
+            _piecewise and not _in_hipgraph
+        ):
+            _real_bs = int(getattr(_ctx, "batch_size", 0) or 0)
+            _ck = (int(x.shape[0]), q_eff, graph_bs)
+            _cov = _v4_attn_cg_coverage.setdefault(
+                _ck, {"replay": 0, "eager_fallback": 0}
+            )
+            _cov["replay" if entry is not None else "eager_fallback"] += 1
+            if "layers.0." in layer_name or layer_name.startswith("layers.0"):
+                logger.info(
+                    "[ATTN_CG_COV] num_tokens=%s q_eff=%s real_bs=%s graph_bs=%s -> %s "
+                    "(distinct_shapes=%s captured_graphs=%s)",
+                    int(x.shape[0]), q_eff, _real_bs, graph_bs,
+                    "REPLAY" if entry is not None else "EAGER_FALLBACK",
+                    len(_v4_attn_cg_coverage), len(_v4_attn_core_graphs),
+                )  # fmt: skip
+
+        # CAPTURE in the WARMUP forward of the capture pass (in_hipgraph=True,
+        # mode=None). That forward runs every piece EAGER — the stream is NOT in
+        # cudagraph-capturing state, so opening our own torch.cuda.graph here is
+        # legal. (The mode=PIECEWISE forward canNOT be used: the dense pieces are
+        # mid-capture there -> "operation not permitted when stream is capturing".)
+        # aiter kernels for this shape were already JIT'd earlier in this same
+        # eager forward, and build_for_cudagraph_capture set full-capacity geometry.
+        if _in_hipgraph and not _piecewise and entry is None:
+            in_bufs = [t.clone() if t is not None else None for t in _tensor_args]
+            # Warm up once more on THESE buffers so any lazy alloc/JIT bound to the
+            # cloned addresses happens before capture, then capture cleanly.
+            self._attn_core(*in_bufs)
+            graph = torch.cuda.CUDAGraph()
+            # ONE attention-only shared pool (see _v4_attn_graph_pool comment):
+            # isolated from the dense pool (avoids MoE aperture fault) but shared
+            # across attention graphs (avoids per-graph OOM).
+            global _v4_attn_graph_pool
+            if _v4_attn_graph_pool is None:
+                _v4_attn_graph_pool = torch.cuda.graph_pool_handle()
+            pool = _v4_attn_graph_pool
+            # capture_error_mode="thread_local" (matches dense-piece capture): the
+            # default "global" mode fails with "operation not permitted when stream
+            # is capturing" because the NCCL watchdog thread polls hipEventQuery on
+            # a background thread every ~100ms and global mode counts that as an
+            # illegal concurrent op. thread_local restricts the check to THIS thread.
+            with torch.cuda.graph(
+                graph,
+                pool=pool,
+                stream=torch.cuda.current_stream(),
+                capture_error_mode="thread_local",
+            ):
+                cg_out = self._attn_core(*in_bufs)
+            _v4_attn_core_graphs[key] = {
+                "graph": graph,
+                "in": in_bufs,
+                "out": cg_out,
+                "pool": pool,
+            }
+            # Fall through to eager for THIS warmup call's real output (the capture
+            # ran on clone buffers; return the genuine eager result for correctness).
+            return _stabilize(_run_eager())
+
+        # REPLAY at real decode (mode=PIECEWISE, not in_hipgraph) when captured.
+        if _piecewise and not _in_hipgraph and entry is not None:
+            for buf, src in zip(entry["in"], _tensor_args):
+                if buf is not None and src is not None:
+                    buf.copy_(src)
+            entry["graph"].replay()
+            return _stabilize(entry["out"])
+
+    return _stabilize(_run_eager())
 
 
 # ---------------------------------------------------------------------------
@@ -2433,6 +2589,13 @@ class DeepseekV4Attention(nn.Module):
         self._use_async_compress = (
             self.alt_stream is not None and self.compressor is not None
         )
+        # ATOM_ATTN_CUDAGRAPH: capturing _attn_core into its own cudagraph cannot
+        # contain the multi-stream compressor/indexer fork/join (side-stream
+        # kernels don't get captured -> dirty KV -> gibberish; the join event
+        # never resolves on replay -> hang). Force single-stream compression so
+        # the whole attention core is one linear stream, safe to capture/replay.
+        if os.environ.get("ATOM_ATTN_CUDAGRAPH") == "1":
+            self._use_async_compress = False
 
         self.layer_name = prefix
         atom_config = get_current_atom_config()
