@@ -504,6 +504,7 @@ def sparse_attn_indexer_sglang_plugin_mode(
     weights_scale: float,
     is_neox_style: bool,
     use_qk_rope_cache_fusion: bool,
+    stable_topk: bool,
 ) -> torch.Tensor:
     from atom.plugin.sglang.models.base_model_wrapper import get_current_forward_batch
 
@@ -592,15 +593,27 @@ def sparse_attn_indexer_sglang_plugin_mode(
             KVBlockSize=page_size,
             WavePerEU=2,
         )
-        top_k_per_row_decode(
-            logits,
-            1,
-            seq_lens_i32,
-            topk_indices_buffer[:bs, :topk_tokens],
-            bs,
-            logits.stride(0),
-            logits.stride(1),
-        )
+        if stable_topk:
+            top_k_per_row_decode(
+                logits,
+                1,
+                seq_lens_i32,
+                topk_indices_buffer[:bs, :topk_tokens],
+                bs,
+                logits.stride(0),
+                logits.stride(1),
+                stable=True,
+            )
+        else:
+            top_k_per_row_decode(
+                logits,
+                1,
+                seq_lens_i32,
+                topk_indices_buffer[:bs, :topk_tokens],
+                bs,
+                logits.stride(0),
+                logits.stride(1),
+            )
         return weights
 
     cu_starts, cu_ends = _build_sglang_query_ranges(forward_batch)
@@ -633,16 +646,29 @@ def sparse_attn_indexer_sglang_plugin_mode(
     )
     assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
     topk_indices = topk_indices_buffer[:num_tokens, :topk_tokens]
-    top_k_per_row_prefill(
-        logits=logits,
-        rowStarts=cu_starts,
-        rowEnds=cu_ends,
-        indices=topk_indices,
-        values=None,
-        numRows=logits.shape[0],
-        stride0=logits.stride(0),
-        stride1=logits.stride(1),
-    )
+    if stable_topk:
+        top_k_per_row_prefill(
+            logits=logits,
+            rowStarts=cu_starts,
+            rowEnds=cu_ends,
+            indices=topk_indices,
+            values=None,
+            numRows=logits.shape[0],
+            stride0=logits.stride(0),
+            stride1=logits.stride(1),
+            stable=True,
+        )
+    else:
+        top_k_per_row_prefill(
+            logits=logits,
+            rowStarts=cu_starts,
+            rowEnds=cu_ends,
+            indices=topk_indices,
+            values=None,
+            numRows=logits.shape[0],
+            stride0=logits.stride(0),
+            stride1=logits.stride(1),
+        )
     topk_indices.copy_(
         torch.where(topk_indices >= 0, topk_indices - cu_starts[:, None], topk_indices)
     )
@@ -672,6 +698,7 @@ def sparse_attn_indexer_sglang_fake(
     weights_scale: float,
     is_neox_style: bool,
     use_qk_rope_cache_fusion: bool,
+    stable_topk: bool,
 ) -> torch.Tensor:
     del (
         hidden_states,
@@ -695,6 +722,7 @@ def sparse_attn_indexer_sglang_fake(
         weights_scale,
         is_neox_style,
         use_qk_rope_cache_fusion,
+        stable_topk,
     )
     return torch.empty(weights.shape, device=weights.device, dtype=torch.float32)
 

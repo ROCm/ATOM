@@ -1368,6 +1368,7 @@ def sparse_attn_indexer(
     weights_scale: float,
     is_neox_style: bool,
     use_qk_rope_cache_fusion: bool,
+    stable_topk: bool,
 ) -> torch.Tensor:
     topk_indices = torch.empty(
         hidden_states.shape[0],
@@ -1534,16 +1535,29 @@ def sparse_attn_indexer(
                 cu_starts=row_starts,
                 cu_ends=row_ends,
             )
-            top_k_per_row_prefill(
-                logits=logits,
-                rowStarts=row_starts,
-                rowEnds=row_ends,
-                indices=topk_indices_prefill[chunk_start:chunk_end],
-                values=None,
-                numRows=chunk_end - chunk_start,
-                stride0=logits.stride(0),
-                stride1=logits.stride(1),
-            )
+            if stable_topk:
+                top_k_per_row_prefill(
+                    logits=logits,
+                    rowStarts=row_starts,
+                    rowEnds=row_ends,
+                    indices=topk_indices_prefill[chunk_start:chunk_end],
+                    values=None,
+                    numRows=chunk_end - chunk_start,
+                    stride0=logits.stride(0),
+                    stride1=logits.stride(1),
+                    stable=True,
+                )
+            else:
+                top_k_per_row_prefill(
+                    logits=logits,
+                    rowStarts=row_starts,
+                    rowEnds=row_ends,
+                    indices=topk_indices_prefill[chunk_start:chunk_end],
+                    values=None,
+                    numRows=chunk_end - chunk_start,
+                    stride0=logits.stride(0),
+                    stride1=logits.stride(1),
+                )
         triton_convert_req_index_to_global_index_dsa_prefill(
             attn_metadata.sparse_cu_seqlens_q,
             attn_metadata.sparse_kv_indptr,
@@ -1586,15 +1600,27 @@ def sparse_attn_indexer(
         num_rows = logits.shape[0]
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
         topk_indices_decode = topk_indices[:num_decode_tokens, :topk_tokens]
-        top_k_per_row_decode(
-            logits,
-            next_n,
-            decode_metadata.context_lens,
-            topk_indices_decode,
-            num_rows,
-            logits.stride(0),
-            logits.stride(1),
-        )
+        if stable_topk:
+            top_k_per_row_decode(
+                logits,
+                next_n,
+                decode_metadata.context_lens,
+                topk_indices_decode,
+                num_rows,
+                logits.stride(0),
+                logits.stride(1),
+                stable=True,
+            )
+        else:
+            top_k_per_row_decode(
+                logits,
+                next_n,
+                decode_metadata.context_lens,
+                topk_indices_decode,
+                num_rows,
+                logits.stride(0),
+                logits.stride(1),
+            )
         if attn_metadata.max_seqlen_q > 1:
             triton_gather_kv_indices_sparse(
                 attn_metadata.sparse_kv_indptr,
@@ -1641,6 +1667,7 @@ def sparse_attn_indexer_fake(
     weights_scale: float,
     is_neox_style: bool,
     use_qk_rope_cache_fusion: bool,
+    stable_topk: bool,
 ) -> torch.Tensor:
     # profile run
     # NOTE(Chen): create the max possible flattened_kv. So that
@@ -1949,6 +1976,14 @@ class Indexer(nn.Module):
         self.max_model_len = atom_config.max_model_len
         self.prefix = prefix
         self.max_total_seq_len = atom_config.max_num_seqs * self.max_model_len
+        # The stable top-k path is only needed to keep GLM-5.2 sparse KV
+        # selection identical across tensor-parallel ranks. TP=1 keeps the
+        # regular path. The MTP draft rewrites model_type to deepseek_mtp but
+        # retains the GLM-only index_share_for_mtp_iteration marker.
+        is_glm52 = getattr(config, "model_type", None) == "glm_moe_dsa" or bool(
+            getattr(config, "index_share_for_mtp_iteration", False)
+        )
+        self.stable_topk = is_glm52 and get_tensor_model_parallel_world_size() > 1
         # register_metadata_builder("indexer_attn_metadata", self.k_cache.get_attn_backend().get_builder_cls())
 
         self.sparse_kv_indices_buffer = torch.empty(0, dtype=torch.int32, device="cuda")
@@ -2086,6 +2121,7 @@ class Indexer(nn.Module):
             self._weights_scale,
             rotary_emb.is_neox_style,
             self.use_qk_rope_cache_fusion and not pcp,
+            self.stable_topk,
         )
 
 
