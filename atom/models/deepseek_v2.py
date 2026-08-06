@@ -76,12 +76,15 @@ from atom.model_ops.attention_mla import (
     is_rocm_aiter_fp4bmm_enabled,
     triton_convert_req_index_to_global_index,
     triton_convert_req_index_to_global_index_dsa_prefill,
-    triton_filter_and_convert_dcp_index,
-    triton_filter_and_convert_dcp_index_prefill,
     triton_gather_kv_indices_sparse,
 )
 from atom.model_ops.base_attention import Attention
-from atom.model_ops.dcp_ops import dcp_pack_topk_candidates, dcp_stable_topk
+from atom.model_ops.dcp_ops import (
+    dcp_pack_topk_candidates,
+    dcp_stable_topk,
+    triton_filter_and_convert_dcp_index,
+    triton_filter_and_convert_dcp_index_prefill,
+)
 from atom.model_ops.embed_head import (
     ParallelLMHead,
     ReplicatedEmbedding,
