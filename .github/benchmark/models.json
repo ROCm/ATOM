@@ -93,14 +93,14 @@
           "label": "Standard MoE",
           "suffix": "-standard",
           "conc_min": 64,
-          "conc_max": 256
+          "conc_max": 1024
         },
         {
           "label": "MegaMoE",
           "suffix": "-mega",
           "extra_args": "--moe-backend mega",
           "conc_min": 64,
-          "conc_max": 256
+          "conc_max": 1024
         }
       ]
     },
