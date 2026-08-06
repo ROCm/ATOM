@@ -24,6 +24,7 @@ from torch import nn
 
 from atom.config import Config, QuantizationConfig, get_current_atom_config
 from atom.model_ops.attention_mla import MLAModules
+from atom.model_ops.attention_residual import AttnRes
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.fla_ops.fused_sigmoid_gating import (
@@ -365,10 +366,17 @@ class KimiSparseMoeBlock(nn.Module):
                 else None
             )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self._forward_impl(hidden_states)
+    def forward(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Returns ``(routed, shared)``, left unsummed.
 
-    def _forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        The caller's next apply_attn_res folds both into its prefix on-load, so
+        deferring the add here removes a whole [T, H] elementwise kernel and its
+        HBM round-trip per MoE layer. ``shared`` is None when there are no shared
+        experts, or when the two branches had to be summed before a collective
+        (see below).
+        """
         identity = hidden_states
         router_logits = self.gate(hidden_states)
         routed_input = (
@@ -390,20 +398,29 @@ class KimiSparseMoeBlock(nn.Module):
             routed_output = self.routed_expert_up_proj(routed_output)
             if self.shared_experts is not None:
                 # Shared branch is TP-partial (down_proj is row-parallel); reduce
-                # it separately and add to the already-full routed output.
+                # it separately. Both branches are full after their own
+                # all-reduce, so the add between them is deferrable.
                 shared_output = self.shared_experts(identity)
                 if self.tp_size > 1:
                     shared_output = tensor_model_parallel_all_reduce(shared_output)
-                routed_output = routed_output + shared_output
-            return routed_output
+                return routed_output, shared_output
+            return routed_output, None
         # Non-latent path: routed experts and shared experts are both TP-partial
         # and everything after them is linear, so a single deferred all-reduce
         # over their sum is correct.
         if self.shared_experts is not None:
-            routed_output = routed_output + self.shared_experts(identity)
+            shared_output = self.shared_experts(identity)
+            if self.tp_size == 1:
+                # No collective to batch, so the add is free to defer.
+                return routed_output, shared_output
+            # With TP the branches must be summed BEFORE the all-reduce: both are
+            # partial here, and while all_reduce is linear (so reducing them
+            # separately would also be correct), that would cost two collectives
+            # to save one elementwise add. Sum first, hand back a single tensor.
+            routed_output = routed_output + shared_output
         if self.tp_size > 1:
             routed_output = tensor_model_parallel_all_reduce(routed_output)
-        return routed_output
+        return routed_output, None
 
 
 class KimiFullAttention(nn.Module):
@@ -1014,7 +1031,6 @@ class KimiDecoderLayer(nn.Module):
             getattr(config, "attn_res_block_size", None) is not None
         )
         if self.use_attn_residuals:
-            self.attn_res_block_size = config.attn_res_block_size
             self.self_attention_res_norm = RMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps
             )
@@ -1033,23 +1049,39 @@ class KimiDecoderLayer(nn.Module):
                 quant_config=None,
                 prefix=f"{prefix}.mlp_res_proj",
             )
+        # Built in both modes: a disabled AttnRes is the ordinary pre-norm
+        # residual step, which is exactly what this layer used to open-code.
+        # Both sites feed a rmsnorm, so both fold it into the kernel's store.
+        # The projs/norms above stay the parameter owners; these only alias
+        # them (see AttnRes).
+        self.self_attention_attn_res = AttnRes(
+            getattr(self, "self_attention_res_proj", None),
+            getattr(self, "self_attention_res_norm", None),
+            out_norm=self.input_layernorm,
+            enabled=self.use_attn_residuals,
+            # Only this site banks the running prefix as a candidate.
+            block_size=getattr(config, "attn_res_block_size", None),
+            layer_idx=layer_num,
+        )
+        self.mlp_attn_res = AttnRes(
+            getattr(self, "mlp_res_proj", None),
+            getattr(self, "mlp_res_norm", None),
+            out_norm=self.post_attention_layernorm,
+            enabled=self.use_attn_residuals,
+        )
 
-    def _ffn(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def _ffn(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run the FFN, leaving the MoE's routed/shared add to the caller.
+
+        The second tensor (when not None) is folded into the next
+        apply_attn_res's prefix as ``add_hidden2``, skipping a [T, H]
+        elementwise kernel. A dense mlp has nothing to defer.
+        """
         if hasattr(self, "block_sparse_moe"):
             return self.block_sparse_moe(hidden_states)
-        return self.mlp(hidden_states)
-
-    def process_weights_after_loading(self) -> None:
-        # Fold each attn-residual (norm.weight * proj.weight) into a single
-        # static score vector consumed by apply_attn_res (see
-        # _attn_res_score_weight). Both operands are load-time constants.
-        if not self.use_attn_residuals:
-            return
-        for proj, norm in (
-            (self.self_attention_res_proj, self.self_attention_res_norm),
-            (self.mlp_res_proj, self.mlp_res_norm),
-        ):
-            proj.score_weight = _attn_res_score_weight(proj, norm)
+        return self.mlp(hidden_states), None
 
     def forward(
         self,
@@ -1057,94 +1089,61 @@ class KimiDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         block_residual: torch.Tensor | None = None,
         pending_add: torch.Tensor | None = None,
+        pending_add2: torch.Tensor | None = None,
     ):
-        if not self.use_attn_residuals:
-            if pending_add is not None:
-                hidden_states = hidden_states + pending_add
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-            if self.is_linear_attn:
-                hidden_states = self.self_attn(hidden_states)
-            else:
-                hidden_states = self.self_attn(positions, hidden_states)
-            hidden_states = residual + hidden_states
-            residual = hidden_states
-            hidden_states = self.post_attention_layernorm(hidden_states)
-            hidden_states = self._ffn(hidden_states)
-            return residual + hidden_states, None, block_residual
+        # Both sites go through AttnRes in either mode: with residuals enabled
+        # it mixes the block candidates, and without it degenerates to the
+        # ordinary pre-norm residual step. input_layernorm and
+        # post_attention_layernorm are its out_norms, so hidden_states comes
+        # back already normed at both.
+        hidden_states, prefix_sum = self.self_attention_attn_res(
+            hidden_states, block_residual, pending_add, pending_add2
+        )
+        block_residual, prefix_sum = self.self_attention_attn_res.maybe_close_block(
+            prefix_sum, block_residual
+        )
 
-        prefix_sum = hidden_states
-        if block_residual is not None and block_residual.shape[1] > 0:
-            hidden_states, prefix_sum = _apply_attn_res(
-                prefix_sum,
-                block_residual,
-                self.self_attention_res_proj,
-                self.self_attention_res_norm,
-                add_hidden=pending_add,
-            )
-        elif pending_add is not None:
-            prefix_sum = prefix_sum + pending_add
-            hidden_states = prefix_sum
-        if self.layer_idx % self.attn_res_block_size == 0:
-            assert block_residual is not None
-            block_residual = torch.cat([block_residual, prefix_sum.unsqueeze(1)], dim=1)
-            prefix_sum = None
-
-        hidden_states = self.input_layernorm(hidden_states)
         if self.is_linear_attn:
             hidden_states = self.self_attn(hidden_states)
         else:
             hidden_states = self.self_attn(positions, hidden_states)
 
+        hidden_states, prefix_sum = self.mlp_attn_res(
+            prefix_sum, block_residual, hidden_states
+        )
+        # Routed and shared expert outputs come back unsummed: the next layer's
+        # attn_res kernel folds both into its prefix on-load, so the [T, H]
+        # elementwise add that would combine them here never runs.
+        hidden_states, shared = self._ffn(hidden_states)
+        return prefix_sum, hidden_states, shared, block_residual
+
+    @staticmethod
+    def aux_hidden_state(output: tuple) -> torch.Tensor | None:
+        """Reconstruct this layer's post-layer hidden state from ``forward``'s
+        return, for a drafter tapping it as an aux hidden state.
+
+        Every DSpark draft is trained on the HF reference's
+        ``output.hidden_states[layer_idx + 1]`` -- the plain residual stream
+        after this layer, which the reference forms as
+        ``prefix_sum = prefix_sum + hidden_states`` before returning. forward()
+        deliberately does not: it hands the FFN output back unapplied so the
+        NEXT layer's attn_res kernel can fold it into its on-load, and an MoE
+        layer defers its routed and shared outputs separately so that same fold
+        absorbs their sum too. So add the pendings back here. Each is None on
+        the layers that already folded it in.
+
+        This lives on the layer rather than in the drafter because it is a
+        property of THIS layer's return protocol -- it has to change in lockstep
+        with forward(), and any drafter trained against a Kimi-K3 target needs
+        the same reconstruction.
+        """
+        prefix_sum, *pendings, _block_residual = output
         if prefix_sum is None:
-            prefix_sum = hidden_states
-            hidden_states, prefix_sum = _apply_attn_res(
-                prefix_sum, block_residual, self.mlp_res_proj, self.mlp_res_norm
-            )
-        else:
-            # Fold prefix_sum = prefix_sum + hidden_states into the fused kernel.
-            hidden_states, prefix_sum = _apply_attn_res(
-                prefix_sum,
-                block_residual,
-                self.mlp_res_proj,
-                self.mlp_res_norm,
-                add_hidden=hidden_states,
-            )
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self._ffn(hidden_states)
-        if prefix_sum is None:
-            return hidden_states, None, block_residual
-        return prefix_sum, hidden_states, block_residual
-
-
-def _attn_res_score_weight(proj: ReplicatedLinear, norm: RMSNorm) -> torch.Tensor:
-    """Fold the static rmsnorm gain and projection into one [H] score vector.
-
-    Both operands are load-time constants, so this is precomputed once in
-    ``process_weights_after_loading`` and cached on ``proj.score_weight``; the
-    apply_attn_res kernel then reads a single vector per H-chunk instead of
-    reloading norm.weight and proj.weight and multiplying them every forward.
-    """
-    return (norm.weight.float() * proj.weight.squeeze(0).float()).contiguous()
-
-
-def _apply_attn_res(
-    prefix_sum: torch.Tensor,
-    block_residual: torch.Tensor,
-    proj: ReplicatedLinear,
-    norm: RMSNorm,
-    add_hidden: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    # Returns (mixed_output, prefix_out). When add_hidden is given the fused path
-    # folds ``prefix_sum = prefix_sum + add_hidden`` into the kernel and returns
-    # the summed prefix; otherwise prefix_out is prefix_sum unchanged.
-    eps = getattr(norm, "variance_epsilon", getattr(norm, "eps", 1e-6))
-    score_weight = getattr(proj, "score_weight", None)
-    if score_weight is None:
-        score_weight = _attn_res_score_weight(proj, norm)
-    from atom.model_ops.kimi_k3 import apply_attn_res
-
-    return apply_attn_res(prefix_sum, block_residual, score_weight, eps, add_hidden)
+            return None
+        for pending in pendings:
+            if pending is not None:
+                prefix_sum = prefix_sum + pending
+        return prefix_sum
 
 
 @support_torch_compile
@@ -1173,9 +1172,10 @@ class KimiLinearModel(nn.Module):
             prefix=f"{prefix}.layers",
             layer_num_offset=0,
         )
+        use_attn_residuals = getattr(config, "attn_res_block_size", None) is not None
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-            if getattr(config, "attn_res_block_size", None) is not None:
+            if use_attn_residuals:
                 self.output_attn_res_norm = RMSNorm(
                     config.hidden_size, eps=config.rms_norm_eps
                 )
@@ -1186,21 +1186,21 @@ class KimiLinearModel(nn.Module):
                     quant_config=None,
                     prefix=f"{prefix}.output_attn_res_proj",
                 )
+            # self.norm folds into the kernel's store, so the mix it returns is
+            # the model's final hidden state. Disabled, this is just self.norm
+            # applied to the pending adds -- the old non-residual tail.
+            self.output_attn_res = AttnRes(
+                getattr(self, "output_attn_res_proj", None),
+                getattr(self, "output_attn_res_norm", None),
+                out_norm=self.norm,
+                enabled=use_attn_residuals,
+            )
         else:
             self.norm = PPMissingLayer()
 
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "block_residual"], config.hidden_size
         )
-
-    def process_weights_after_loading(self) -> None:
-        # Fold the final output attn-residual (norm.weight * proj.weight) into a
-        # single static score vector for apply_attn_res. Present only on the last
-        # PP rank when attn residuals are enabled.
-        if hasattr(self, "output_attn_res_proj"):
-            self.output_attn_res_proj.score_weight = _attn_res_score_weight(
-                self.output_attn_res_proj, self.output_attn_res_norm
-            )
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -1230,32 +1230,31 @@ class KimiLinearModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             block_residual = intermediate_tensors["block_residual"]
 
-        pending_add = None
+        # Each layer hands its FFN output back unapplied (pending_add), and an MoE
+        # layer hands its shared-expert output back separately (pending_add2); the
+        # next layer's attn_res kernel folds both into its prefix on-load.
+        pending_add = pending_add2 = None
         for layer in self.layers[self.start_layer : self.end_layer]:
-            hidden_states, pending_add, block_residual = layer(
+            hidden_states, pending_add, pending_add2, block_residual = layer(
                 positions,
                 hidden_states,
                 block_residual,
                 pending_add=pending_add,
+                pending_add2=pending_add2,
             )
 
         if not get_pp_group().is_last_rank:
             if pending_add is not None:
                 hidden_states = hidden_states + pending_add
+            if pending_add2 is not None:
+                hidden_states = hidden_states + pending_add2
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "block_residual": block_residual}
             )
-        if getattr(self.config, "attn_res_block_size", None) is not None:
-            hidden_states, _ = _apply_attn_res(
-                hidden_states,
-                block_residual,
-                self.output_attn_res_proj,
-                self.output_attn_res_norm,
-                add_hidden=pending_add,
-            )
-        elif pending_add is not None:
-            hidden_states = hidden_states + pending_add
-        return self.norm(hidden_states)
+        hidden_states, _ = self.output_attn_res(
+            hidden_states, block_residual, pending_add, pending_add2
+        )
+        return hidden_states
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return FusedMoE.make_expert_params_mapping(
