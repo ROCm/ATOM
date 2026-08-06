@@ -80,7 +80,10 @@ class DSparkProposer(Drafter):
         place each step."""
         if self._blk_ps_bufs is not None:
             return self._blk_ps_bufs
-        from atom.model_ops.attentions.aiter_mla import get_mla_metadata_info_v1
+        from atom.model_ops.attentions.aiter_mla import (
+            _MLA_META_SUPPORTS_MAX_SPLIT,
+            get_mla_metadata_info_v1,
+        )
 
         max_bs = self.config.max_num_seqs
         # padded_num_heads lives on the draft MLA module (>=_MLA_MIN_HEADS==16),
@@ -89,6 +92,12 @@ class DSparkProposer(Drafter):
         self._blk_padded_heads = self.model.layers[
             0
         ].self_attn.mla_attn.impl.padded_num_heads
+        # max_split_per_batch only exists in newer aiter builds; feature-detect
+        # it (as aiter_mla does) so old builds don't hit a TypeError. Cache the
+        # kwargs so the sizing (info) and fill (get_mla_metadata_v1) calls agree.
+        self._blk_split_kwargs = (
+            {"max_split_per_batch": 16} if _MLA_META_SUPPORTS_MAX_SPLIT else {}
+        )
         (
             (wmd_sz, wmd_ty),
             (wip_sz, wip_ty),
@@ -104,7 +113,7 @@ class DSparkProposer(Drafter):
             dtype_kv,
             is_sparse=False,
             fast_mode=True,
-            max_split_per_batch=16,
+            **self._blk_split_kwargs,
         )
         dev = self.device
         self._blk_ps_bufs = {
@@ -536,9 +545,9 @@ class DSparkProposer(Drafter):
                 max_seqlen_qo=T,
                 uni_seqlen_qo=T,
                 fast_mode=True,
-                max_split_per_batch=16,
                 dtype_q=dtype_q,
                 dtype_kv=dtype_kv,
+                **self._blk_split_kwargs,
             )
             attn_metadata.work_meta_data = ps["work_meta_data"]
             attn_metadata.work_indptr = ps["work_indptr"]
