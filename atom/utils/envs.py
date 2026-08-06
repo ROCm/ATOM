@@ -249,6 +249,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_GLUON_PA_DECODE": lambda: (
         os.getenv("ATOM_USE_GLUON_PA_DECODE", "0") == "1"
     ),
+    # Route dense (no qk-norm-in-attn) bf16 gfx950 attention through the NHD
+    # triton path (NHD KV write + gluon split-KV decode). Trades ~1.4% prefill
+    # for ~4.6% decode throughput; net positive for decode-dominated workloads.
+    # Gated to the validated-safe shape in PagedAttentionImpl._use_nhd_split_kv_decode.
+    "ATOM_ATTN_NHD_SPLIT_KV": lambda: (
+        os.getenv("ATOM_ATTN_NHD_SPLIT_KV", "0") == "1"
+    ),
     # --- Plugin Mode ---
     "ATOM_DISABLE_VLLM_PLUGIN": lambda: (
         os.getenv("ATOM_DISABLE_VLLM_PLUGIN", "0").lower() == "1"

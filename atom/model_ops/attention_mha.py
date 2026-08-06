@@ -162,6 +162,25 @@ class PagedAttentionImpl(nn.Module):
             return False
         return True
 
+    def _use_nhd_split_kv_decode(self) -> bool:
+        """Opt-in NHD triton path (NHD KV write + gluon split-KV decode).
+
+        Gated to the validated-safe shape: gfx950, bf16 KV cache, head_dim 128,
+        no sliding window, and the dense path where qk-norm is applied in the
+        model rather than passed into attention (q_norm/k_norm None). Within that
+        shape the whole layer uses the triton path; split-KV decode's win
+        requires the NHD cache write, so this cannot be scoped to decode alone.
+        """
+        return (
+            envs.ATOM_ATTN_NHD_SPLIT_KV
+            and get_gfx() == "gfx950"
+            and self.kv_cache_dtype == "bf16"
+            and self.head_dim == 128
+            and self.sliding_window == -1
+            and self.q_norm is None
+            and self.k_norm is None
+        )
+
     def forward_impl(
         self,
         q: torch.Tensor,
@@ -211,6 +230,7 @@ class PagedAttentionImpl(nn.Module):
             envs.ATOM_FORCE_ATTN_TRITON
             or self.sliding_window != -1
             or self.head_dim != 128
+            or self._use_nhd_split_kv_decode()
         )
         self.use_triton_attn = use_triton_attn
 
