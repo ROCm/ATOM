@@ -78,6 +78,33 @@
       ]
     },
     {
+      "display": "DeepSeek-V4-Pro EPLB r64 biased",
+      "path": "deepseek-ai/DeepSeek-V4-Pro",
+      "prefix": "deepseek-v4-pro-eplb-mega",
+      "runner": "atom-mi355-8gpu.predownload",
+      "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1\nAITER_LOG_LEVEL=WARNING",
+      "config": {
+        "tp": 8,
+        "kv_cache_dtype": "fp8",
+        "extra_args": "--no-enable_prefix_caching --enable-dp-attention --enable-expert-parallel --eplb-enable --eplb-config '{\"num_redundant_experts\": 64, \"placement_policy\": \"biased\", \"rebalance_interval\": 200, \"load_window_size\": 200, \"rebalance_min_balancedness\": 2.0}'"
+      },
+      "variants": [
+        {
+          "label": "Standard MoE",
+          "suffix": "-standard",
+          "conc_min": 64,
+          "conc_max": 256
+        },
+        {
+          "label": "MegaMoE",
+          "suffix": "-mega",
+          "extra_args": "--moe-backend mega",
+          "conc_min": 64,
+          "conc_max": 256
+        }
+      ]
+    },
+    {
       "display": "DeepSeek-R1-0528-MXFP4",
       "path": "amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
       "prefix": "deepseek-r1-0528-mxfp4",

@@ -889,6 +889,17 @@ class ModelRunner:
         setups that share the GPU with another process."""
         return 0
 
+    def _dummy_token_ids(self, n: int) -> list[int]:
+        """Build token ids for warmup, CUDAGraph capture, and DP-sync batches.
+
+        MegaMoE cannot use an all-zero dummy input: hash routing sends every
+        token to the same expert set and can overflow its dispatch/combine
+        buffers. Other backends retain the original all-zero behavior.
+        """
+        if self.config.moe_backend == "mega":
+            return [i % 8192 for i in range(n)]
+        return [0] * n
+
     def is_deepseek_mla(self) -> bool:
         if not hasattr(self.hf_text_config, "model_type"):
             return False
@@ -1214,7 +1225,11 @@ class ModelRunner:
         mtp_factor = mtp_k + 1
         num_tokens_original = mtp_factor
 
-        seq = Sequence([0] * num_tokens_original, block_size=self.block_size, id=-1)
+        seq = Sequence(
+            self._dummy_token_ids(num_tokens_original),
+            block_size=self.block_size,
+            id=-1,
+        )
         seq.status = SequenceStatus.RUNNING
         seq.type = SequenceType.DECODE
         seq.block_table = [0]
@@ -1272,7 +1287,11 @@ class ModelRunner:
             seq_len = max_model_len
 
         seqs = [
-            Sequence([0] * seq_len, block_size=self.block_size) for _ in range(num_seqs)
+            Sequence(
+                self._dummy_token_ids(seq_len),
+                block_size=self.block_size,
+            )
+            for _ in range(num_seqs)
         ]
         seqs = {seq.id: seq for seq in seqs}
 
@@ -2197,6 +2216,7 @@ class ModelRunner:
             # Context default — otherwise single-GPU/TP-only decode would
             # be forced into eager and lose the CUDAGraph decode path.
             self._dspark_decode_replay = True
+            self._eplb_any_rank_has_prefill = None
             return (
                 num_input_tokens,
                 None,
@@ -2220,6 +2240,9 @@ class ModelRunner:
             local_is_dummy=bool(getattr(batch, "is_dummy_run", False)),
         )
 
+        # Stash the DP-wide prefill OR for the EPLB prefill gate. Reused for free
+        # by on_forward_pass_end when the DP group == the migration (EP) group.
+        self._eplb_any_rank_has_prefill = sync.any_rank_has_prefill
         max_tokens = int(sync.num_tokens_across_dp.max())
         dp_uniform_decode = (not sync.any_rank_has_prefill) or (
             not self.config.enable_dp_attention

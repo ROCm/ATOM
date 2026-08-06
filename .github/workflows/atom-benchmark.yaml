@@ -13,51 +13,55 @@ on:
       deepseek-v4-pro:
         description: "Benchmark DeepSeek-V4-Pro"
         type: boolean
+        default: false
+      deepseek-v4-pro-eplb-mega:
+        description: "Benchmark DeepSeek-V4-Pro EPLB r64 biased: standard vs MegaMoE"
+        type: boolean
         default: true
       glm-5-2-fp8:
         description: "Benchmark GLM-5.2-FP8"
         type: boolean
-        default: true
+        default: false
       glm-5-2-mxfp4:
         description: "Benchmark GLM-5.2-MXFP4 (+ MTP3)"
         type: boolean
-        default: true
+        default: false
       deepseek-r1-0528-mxfp4:
         description: "Benchmark DeepSeek-R1-0528 MXFP4 (+ MXFP4-MTP3)"
         type: boolean
-        default: true
+        default: false
       gpt-oss-120b:
         description: "Benchmark gpt-oss-120b"
         type: boolean
-        default: true
+        default: false
       kimi-k27-code-mxfp4:
         description: "Benchmark Kimi-K2.7-Code-MXFP4"
         type: boolean
-        default: true
+        default: false
       kimi-k3:
         description: "Benchmark Kimi-K3 (+ DSpark)"
         type: boolean
-        default: true
+        default: false
       m3-mxfp8:
         description: "Benchmark MiniMax-M3-MXFP8 (+ EAGLE3)"
         type: boolean
-        default: true
+        default: false
       m3-mxfp4:
         description: "Benchmark MiniMax-M3-MXFP4 (+ EAGLE3)"
         type: boolean
-        default: true
+        default: false
       qwen35-397b-fp8:
         description: "Benchmark Qwen3.5-397B-A17B-FP8"
         type: boolean
-        default: true
+        default: false
       qwen35-397b-mxfp4:
         description: "Benchmark Qwen3.5-397B-A17B-MXFP4"
         type: boolean
-        default: true
+        default: false
       llama-3-3-70b-instruct-mxfp4:
         description: "Benchmark Llama-3.3-70B-Instruct-MXFP4"
         type: boolean
-        default: true
+        default: false
       extra_args:
         description: "Extra arguments to pass to the ATOM server"
         type: string
@@ -85,7 +89,7 @@ on:
           Example (single set): 1024,1024,128,0.8
           Example (multiple sets): 1024,1024,128,0.8;2048,1024,256,0.7"
         type: string
-        default: "1024,1024,128,0.8"
+        default: "8192,1,128,1.0"
       atom_commit:
         description: "ATOM commit SHA to checkout; leave empty to use the workflow ref"
         type: string
@@ -258,6 +262,7 @@ jobs:
             --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
       - name: Store benchmark result to dashboard
+        if: github.ref == 'refs/heads/main'
         uses: benchmark-action/github-action-benchmark@v1
         with:
           tool: customBiggerIsBetter
@@ -272,6 +277,7 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Deploy custom dashboard to gh-pages
+        if: github.ref == 'refs/heads/main'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -297,7 +303,10 @@ jobs:
 
   # ---------- Generate regression matrix (lightweight, ubuntu) ----------
   generate-regression-matrix:
-    if: always() && needs.summarize-benchmark-result.outputs.has_regression == 'true'
+    if: >-
+      always()
+      && github.ref == 'refs/heads/main'
+      && needs.summarize-benchmark-result.outputs.has_regression == 'true'
     name: Generate regression rerun matrix
     needs: [summarize-benchmark-result]
     runs-on: ubuntu-latest
