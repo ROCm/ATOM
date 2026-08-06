@@ -721,8 +721,6 @@ def set_kv_cache_data(
     MLA's token-major latent cache, where tensor.shape[0] is the page-size-1
     physical row count rather than the scheduler block count.
     """
-    global _forward_kv_cache_context
-
     if hasattr(config, "kv_transfer_config") and config.kv_transfer_config:
         connector = get_kvconnector(config=config)
         if connector is not None:

@@ -3,8 +3,8 @@
 
 from __future__ import annotations
 
-import threading
 import sys
+import threading
 import types
 from types import SimpleNamespace
 
@@ -16,13 +16,13 @@ except ModuleNotFoundError:
     sys.modules["torch"] = types.ModuleType("torch")
 
 from atom.kv_transfer.disaggregation import KVConnectorOutput, KVOutputAggregator
-from atom.kv_transfer.offload.connector import (
-    LMCacheOffloadConnector,
-    LMCacheOffloadConnectorScheduler,
-)
 from atom.kv_transfer.offload.atom_kv_byte_codec import ATOMKVByteCodec
 from atom.kv_transfer.offload.atom_lmcache_gpu_connector import (
     ATOMLMCacheGPUConnector,
+)
+from atom.kv_transfer.offload.connector import (
+    LMCacheOffloadConnector,
+    LMCacheOffloadConnectorScheduler,
 )
 from atom.kv_transfer.offload.metadata import (
     ATOMRawBytesLMCacheMetadata,
@@ -1403,9 +1403,9 @@ def test_codec_dsa_includes_index_cache_segment():
         pytest.skip("real torch is unavailable")
 
     num_blocks, block_size, latent, index_dim = 4, 2, 3, 5
-    k_cache = torch.arange(
-        num_blocks * block_size * latent, dtype=torch.uint8
-    ).reshape(num_blocks * block_size, 1, latent)
+    k_cache = torch.arange(num_blocks * block_size * latent, dtype=torch.uint8).reshape(
+        num_blocks * block_size, 1, latent
+    )
     # Block-major indexer cache (num_blocks, block_size, index_dim).
     index_cache = torch.arange(
         num_blocks * block_size * index_dim, dtype=torch.uint8
@@ -1440,8 +1440,14 @@ def test_codec_dsa_includes_index_cache_segment():
     # each chunk it is all K blocks, then all index blocks.
     expected = torch.cat(
         [
-            k_flat[0], k_flat[1], idx_flat[0], idx_flat[1],
-            k_flat[2], k_flat[3], idx_flat[2], idx_flat[3],
+            k_flat[0],
+            k_flat[1],
+            idx_flat[0],
+            idx_flat[1],
+            k_flat[2],
+            k_flat[3],
+            idx_flat[2],
+            idx_flat[3],
         ],
     )
     assert torch.equal(device_buf.cpu(), expected.cpu())
@@ -1521,9 +1527,9 @@ def test_codec_dsa_fp8_multilayer_including_mtp_round_trip():
     codec.gpu_to_chunk_major_device_buffer(device_buf, block_id_groups)
 
     # Wipe every segment (via the uint8 view for fp8) and scatter back.
-    for name in kv_caches:
-        kv_caches[name].k_cache.zero_()
-        kv_caches[name].index_cache.view(torch.uint8).zero_()
+    for cache in kv_caches.values():
+        cache.k_cache.zero_()
+        cache.index_cache.view(torch.uint8).zero_()
     codec.chunk_major_device_buffer_to_gpu(device_buf, block_id_groups)
 
     for name, (k, idx) in layers.items():
