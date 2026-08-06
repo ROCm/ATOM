@@ -53,8 +53,12 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 _BLOCK_V = 128
 _BLOCK_K = 64
 # MFMA needs M >= 16, so a batch smaller than that runs padded-and-masked
-# rather than falling off the kernel.
+# rather than falling off the kernel. Capped at 64 because the accumulator is
+# [BLOCK_ROW, BLOCK_V] fp32 and lives in registers: batches past the cap take
+# more row tiles rather than a wider accumulator, which would spill (native
+# ATOM defaults max_num_seqs to 512, so this is reachable, not theoretical).
 _MIN_BLOCK_ROW = 16
+_MAX_BLOCK_ROW = 64
 # Triton forms the offset expressions below in int32 before sign-extending
 # into the pointer, so a tensor whose largest element offset does not fit is
 # handed to torch instead of silently wrapping.
@@ -78,9 +82,9 @@ def _dspark_markov_argmax_stage1(
     BLOCK_V: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    """One V tile x all rows: bias GEMV, add base logits, reduce to (max, id)."""
+    """One (V tile, row tile): bias GEMV, add base logits, reduce to (max, id)."""
     tile = tl.program_id(0)
-    offs_row = tl.arange(0, BLOCK_ROW)
+    offs_row = tl.program_id(1) * BLOCK_ROW + tl.arange(0, BLOCK_ROW)
     offs_v = tile * BLOCK_V + tl.arange(0, BLOCK_V)
     row_mask = offs_row < num_rows
     v_mask = offs_v < vocab_size
@@ -238,7 +242,9 @@ def dspark_markov_argmax(
         return _torch_dspark_markov_argmax(base_logits, markov_embed, markov_w2)
 
     num_tiles = triton.cdiv(vocab_size, _BLOCK_V)
-    block_row = max(_MIN_BLOCK_ROW, triton.next_power_of_2(num_rows))
+    block_row = min(
+        _MAX_BLOCK_ROW, max(_MIN_BLOCK_ROW, triton.next_power_of_2(num_rows))
+    )
     # Fresh per call rather than a persistent buffer: under CUDA-graph capture
     # these come from the graph's private pool and are freed back into it each
     # block position, so the pool holds one pair of them and replay reuses the
@@ -252,7 +258,7 @@ def dspark_markov_argmax(
     )
     out = torch.empty(num_rows, dtype=torch.int64, device=base_logits.device)
 
-    _dspark_markov_argmax_stage1[(num_tiles,)](
+    _dspark_markov_argmax_stage1[(num_tiles, triton.cdiv(num_rows, block_row))](
         base_logits,
         markov_embed,
         markov_w2,
