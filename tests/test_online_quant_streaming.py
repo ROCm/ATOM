@@ -14,7 +14,6 @@ from unittest import mock
 import torch
 from torch import nn
 
-import atom.model_loader.loader as loader_module
 import atom.model_loader.online_quant_streaming as streaming_module
 from atom.model_loader.loading_core import load_weights_into_model
 from atom.model_loader.online_quant_streaming import OnlineQuantStreamer
@@ -811,6 +810,13 @@ class StreamingCoverageTest(unittest.TestCase):
 
 class DraftStreamingSelectionTest(unittest.TestCase):
     def test_spec_decode_load_passes_streamer_to_loading_core(self):
+        try:
+            import atom.model_loader.loader as loader_module
+        except ModuleNotFoundError as exc:
+            if exc.name == "aiter":
+                self.skipTest("loader integration requires AITER")
+            raise
+
         model = nn.Module()
         streamer = mock.Mock()
         streamer.done_module_ids = set()
