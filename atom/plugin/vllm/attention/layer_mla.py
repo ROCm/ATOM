@@ -946,6 +946,12 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         q = q[:num_actual_toks, ...]
         k_c_normed = k_c_normed[:num_actual_toks, ...]
         k_pe = k_pe[:num_actual_toks, ...]
+        # Model runner V2 sizes slot_mapping to the CUDA-graph token width and
+        # marks the tail with PAD_SLOT_ID, but leaves num_actual_tokens unpadded
+        # on the piecewise path; V1 never pads it. The cache kernels launch one
+        # block per slot and index q/kv by that block, so slot_mapping must not
+        # outrun the tensors sliced above. Same trim layer_mha already applies.
+        slot_mapping = attn_metadata.slot_mapping[:num_actual_toks]
 
         decode_q = q[:num_decode_tokens]
         prefill_q = q[num_decode_tokens:]
@@ -973,7 +979,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                     k_c_normed,
                     self.rotary_emb_cos_sin_cache,
                     self.rotary_emb.is_neox_style,
-                    attn_metadata.slot_mapping,
+                    slot_mapping,
                     kv_cache,
                     self.kv_cache_dtype,
                     self._k_scale,
@@ -985,7 +991,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                         k_c_normed,
                         k_pe.squeeze(1),
                         kv_cache,
-                        attn_metadata.slot_mapping.flatten(),
+                        slot_mapping.flatten(),
                         kv_cache_dtype=self.kv_cache_dtype,
                         scale=self._k_scale,
                     )
@@ -1066,7 +1072,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                         self.kv_lora_rank + self.qk_rope_head_dim,
                     ),
                     decode_q,
-                    attn_metadata.slot_mapping,
+                    slot_mapping,
                     self._k_scale,
                     self._q_scale,
                     positions,
@@ -1236,6 +1242,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         q = q[:num_actual_toks, ...]
         k_c_normed = k_c_normed[:num_actual_toks, ...]
         k_pe = k_pe[:num_actual_toks, ...].unsqueeze(1)
+        slot_mapping = sparse_meta.slot_mapping[:num_actual_toks]
 
         positions = None
         if self._is_vllm_forward_context_available():
@@ -1314,7 +1321,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
                     kv_cache.shape[0], -1, self.kv_lora_rank + self.qk_rope_head_dim
                 ),
                 q_out,
-                sparse_meta.slot_mapping,
+                slot_mapping,
                 self._k_scale,
                 self._q_scale,
                 positions,
@@ -1372,11 +1379,60 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         )
         return self.o_proj(output)
 
+    def pin_kv_cache_dtype(self, kv_cache_dtype: str) -> None:
+        """Cache in `kv_cache_dtype` rather than the engine-wide dtype.
+
+        Layers otherwise take the engine's `--kv-cache-dtype`, which is right
+        for anything sharing the engine's pool. A draft that owns a separate
+        pool in another dtype re-pins it here, so that the dtype-driven
+        dispatch -- the fp8 decode overload, the cache-write kernel, aiter's
+        fp8 split-KV table -- matches the pool the layer actually reads.
+        """
+        from vllm.config import get_current_vllm_config
+        from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+
+        is_fp8 = kv_cache_dtype.startswith("fp8")
+        self.kv_cache_dtype = "fp8" if is_fp8 else "auto"
+        self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
+            kv_cache_dtype if is_fp8 else "auto",
+            get_current_vllm_config().model_config,
+        )
+
     def get_kv_cache_spec(self, vllm_config):
+        from vllm.utils.torch_utils import (
+            get_dtype_size,
+            kv_cache_dtype_str_to_dtype,
+        )
         from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
+        block_size = vllm_config.cache_config.block_size
+        if getattr(self, "align_page_size_to_engine_dtype", False):
+            # This layer caches in a different dtype than the engine's, so at a
+            # shared block size its pages would be a different size than
+            # everyone else's -- and vLLM allocates a single page size across
+            # all KV cache groups, sizing it to the largest. Scaling the block
+            # size by the inverse dtype ratio makes the pages match exactly.
+            #
+            # Read the block size here rather than at construction: hybrid
+            # models raise it afterwards to line attention pages up with mamba
+            # state pages.
+            engine_element_size = get_dtype_size(
+                kv_cache_dtype_str_to_dtype(
+                    vllm_config.cache_config.cache_dtype,
+                    vllm_config.model_config,
+                )
+            )
+            element_size = get_dtype_size(self.kv_cache_torch_dtype)
+            scaled = block_size * engine_element_size
+            if scaled % element_size:
+                raise ValueError(
+                    f"{self.layer_name}: a {element_size}-byte cache dtype "
+                    f"cannot be page-aligned to the engine's at "
+                    f"block_size={block_size}."
+                )
+            block_size = scaled // element_size
         return MLAAttentionSpec(
-            block_size=vllm_config.cache_config.block_size,
+            block_size=block_size,
             num_kv_heads=1,
             head_size=self.head_size,
             dtype=self.kv_cache_torch_dtype,

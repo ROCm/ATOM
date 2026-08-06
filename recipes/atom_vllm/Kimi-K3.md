@@ -28,18 +28,6 @@ pip install -e /path/to/ATOM --no-deps
 ```bash
 MODEL=/path/to/Kimi-K3
 
-export AITER_LOG_LEVEL=WARNING
-export ATOM_LOADER_USE_THREADPOOL=1
-export ATOM_LOADER_THREADPOOL_WORKERS=16
-export ATOM_SYNC_AFTER_LOAD=1
-export ATOM_DIST_TIMEOUT_SECONDS=3600
-
-export ATOM_USE_TRITON_GEMM=1
-export AITER_USE_GROUPED_GEMM=0
-export ATOM_USE_TRITON_MOE=0
-export AITER_FLYDSL_FORCE=1
-export AITER_FORCE_GFX1250=0
-
 vllm serve "${MODEL}" \
     --host 0.0.0.0 \
     --port 8000 \
@@ -47,13 +35,11 @@ vllm serve "${MODEL}" \
     --trust-remote-code \
     --language-model-only \
     --kv-cache-dtype fp8 \
-    --max-model-len 16384 \
     --max-num-seqs 64 \
     --max-num-batched-tokens 16384 \
     --gpu-memory-utilization 0.93 \
     --block-size 128 \
     --no-enable-prefix-caching \
-    --no-async-scheduling \
     --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE"}'
 ```
 
@@ -108,9 +94,17 @@ Use a freshly started server for each reported accuracy run, matching the
 native Kimi-K3 validation protocol. Back-to-back evaluations on a warm server
 are not used as baselines for this model.
 
+## Speculative decoding
+
+Kimi-K3 can be served with DSpark block drafting by adding a
+`--speculative-config` pointing at the standalone
+[Inferact/Kimi-K3-DSpark](https://huggingface.co/Inferact/Kimi-K3-DSpark) draft.
+That path enables asynchronous scheduling, needs headroom for a separate bf16
+draft KV cache, and drafts causally rather than the way upstream vLLM does; see
+[DSpark](./DSpark.md) for the full launch command and validated numbers.
+
 ## Current scope
 
 - Text generation only; the vision tower and multimodal projector are skipped.
 - TP8 on MI355/gfx950 is the validated deployment.
-- Prefix caching and asynchronous scheduling are disabled.
-- Speculative decoding is not enabled for this model.
+- Prefix caching is disabled.
