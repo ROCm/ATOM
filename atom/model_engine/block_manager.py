@@ -409,6 +409,7 @@ class BlockManager:
         num_new_tokens: int,
         start_tokens: int | None = None,
         next_forward_tokens: int | None = None,
+        aimed: bool = True,
     ) -> None:
         """Register hashes for blocks finalized by the most recent step.
 
@@ -460,10 +461,12 @@ class BlockManager:
                     self.block_size,
                 )
             )
-        for cache in self.checkpointers_at(
-            seq, base + num_new_tokens, next_forward_tokens
-        ):
+        pos = base + num_new_tokens
+        kept = self.checkpointers_at(seq, pos, next_forward_tokens, aimed)
+        for cache in kept:
             cache.checkpoint(seq, end, h)
+        if kept:
+            seq.last_checkpoint_pos = pos
 
     def hash_decode_blocks(
         self, seq: Sequence, committed_kv_len: int, next_forward_tokens: int = 0
@@ -499,6 +502,10 @@ class BlockManager:
                 committed_kv_len - base,
                 start_tokens=base,
                 next_forward_tokens=next_forward_tokens,
+                # Generation cannot choose where a step ends, least of all a
+                # speculative one, so it is held to spacing rather than to the
+                # grid.
+                aimed=False,
             )
 
     def cancel_state_fork(self, seq: Sequence) -> bool:
@@ -647,7 +654,11 @@ class BlockManager:
         } | self.state.checkpoint_fates()
 
     def checkpointers_at(
-        self, seq: Sequence, pos: int, next_forward_tokens: int | None = None
+        self,
+        seq: Sequence,
+        pos: int,
+        next_forward_tokens: int | None = None,
+        aimed: bool = True,
     ) -> list[StateCache]:
         """State classes that should keep a checkpoint at `pos`, in class order.
 
@@ -678,11 +689,44 @@ class BlockManager:
         `checkpoint_demand_pos` — a boundary this seq was denied for want of a
         checkpoint (`_record_checkpoint_demand`). `checkpoint_cut` reads the
         same field, so the cut and the keep cannot drift apart.
+
+        `aimed` says whether the caller could place the forward's end. Prefill
+        can — `checkpoint_cut` shortens the chunk — so it is held to the exact
+        grid and the two agree position for position. A speculative decode step
+        cannot: it commits `1 + accepted`, so it steps over most rungs, and
+        holding it to the grid made a decode checkpoint a one-in-`toks/fwd`
+        chance. Bounding the drafts would land it there, at the price of
+        throwing away speculation and under-reporting the acceptance rate,
+        which counts drafts offered as `mtp_k` regardless.
+
+        Nothing needs that price. The grid exists to space checkpoints out, and
+        a step that lands on any hash-block boundary far enough past the last
+        one serves the purpose exactly as well — the position only has to be
+        *findable*, and a resumer finds it by hash, never by arithmetic. So an
+        unaimed caller is held to the spacing rather than the grid.
+
+        What that buys scales with how many boundaries a rung spans. A step
+        lands on any given boundary with probability `1 / toks_per_forward`, so
+        the chance of keeping a checkpoint per rung is
+        `1 - (1 - 1/toks_per_forward) ** (interval / hash_block_size)`: at
+        DeepSeek-V4's 256-token block and 4.3 tokens a forward, 23% when the
+        interval is one block and effectively certain at the 8192 default. The
+        two rules coincide exactly when the interval *is* the block, which is
+        also the finest grid V4 admits — so a test at that setting measures
+        nothing, and `demand_config` exists to avoid it.
+
+        The demand rung is absent from that branch by construction, not by
+        omission: a demand is at most the prompt's own hit ceiling, and every
+        unaimed position is at or past the end of the prompt, so generation
+        cannot reach one.
         """
         interval = self.state_checkpoint_interval_tokens
         if interval <= 0 or pos <= 0:
             return []
-        if pos % interval and pos != seq.checkpoint_demand_pos:
+        if aimed:
+            if pos % interval and pos != seq.checkpoint_demand_pos:
+                return []
+        elif pos % self.hash_block_size or pos - seq.last_checkpoint_pos < interval:
             return []
         if next_forward_tokens is None:
             next_forward_tokens = seq.num_prompt_tokens - pos
@@ -702,6 +746,7 @@ class BlockManager:
         # Likewise the demand: it describes one admission against one cache
         # state, and a re-admitted seq gets a fresh answer from `can_allocate`.
         seq.checkpoint_demand_pos = 0
+        seq.last_checkpoint_pos = 0
         # An uncommitted checkpoint describes state in a group that is about to
         # go back on the free list, so the intent dies with it.
         self.state.forget_pending(seq)

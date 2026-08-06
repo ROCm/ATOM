@@ -104,6 +104,11 @@ class Sequence:
         # `BlockManager._record_checkpoint_demand` at admission; this one is
         # read by `checkpoint_cut` and `checkpointers_at`, which must agree.
         self.checkpoint_demand_pos = 0
+        # Where this seq last kept a checkpoint. Prefill lands on the grid so
+        # this tracks it, but a speculative decode step lands wherever
+        # `1 + accepted` puts it, and there the grid is unreachable — see
+        # `BlockManager.checkpointers_at`, which measures spacing from here.
+        self.last_checkpoint_pos = 0
         self.prefix_cache_hit_tokens = 0
         # True iff this seq is mid-prefill (chunked prefill produced KV for
         # some prompt tokens but not all). Maintained by the scheduler:

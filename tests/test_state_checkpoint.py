@@ -1341,3 +1341,68 @@ class TestCacheStatsAttribution:
         sched._schedule_prefill_seq(seq, 44, {}, [], 0, 0)
         assert sched.cache_stats.total_compressed_tokens == 3 * 2 * BLOCK
         assert sched.cache_stats.total_wanted_tokens == 2 * 2 * BLOCK
+
+
+class TestGenerationIsHeldToSpacingNotTheGrid:
+    """A step that cannot choose where it ends is judged by distance instead.
+
+    Prefill lands where `checkpoint_cut` puts it, so it meets the grid exactly.
+    A speculative decode step commits `1 + accepted` and steps over most rungs;
+    held to the grid it would keep a checkpoint only when the arithmetic
+    happened to divide out. The grid is there to space checkpoints, and any
+    hash-block boundary far enough past the last one spaces them just as well —
+    a resumer finds a checkpoint by hash, never by arithmetic.
+
+    `demand_config`, whose grid is several hash blocks wide: where the two
+    coincide there is no rule to tell apart.
+    """
+
+    def keepers(self, bm, seq, pos, aimed):
+        # Room to spare: what is under test is which positions qualify, not
+        # whether a class has enough forward left to take one there.
+        return bm.checkpointers_at(seq, pos, MIN_FORK, aimed=aimed)
+
+    def test_an_aimed_step_is_held_to_the_grid(self):
+        bm = BlockManager(demand_config())
+        seq = stateful_seq(PROMPT)
+        assert self.keepers(bm, seq, INTERVAL, aimed=True)
+        assert not self.keepers(bm, seq, INTERVAL + BLOCK, aimed=True)
+
+    def test_an_unaimed_step_keeps_off_the_grid(self):
+        bm = BlockManager(demand_config())
+        seq = stateful_seq(PROMPT)
+        assert self.keepers(bm, seq, INTERVAL + BLOCK, aimed=False)
+
+    def test_an_unaimed_step_still_has_to_land_on_a_block(self):
+        bm = BlockManager(demand_config())
+        seq = stateful_seq(PROMPT)
+        # The checkpoint is filed under the hash of a whole block, so a landing
+        # between two of them has nothing to file it under.
+        assert not self.keepers(bm, seq, INTERVAL + 1, aimed=False)
+
+    def test_spacing_is_measured_from_the_last_one_kept(self):
+        bm = BlockManager(demand_config())
+        seq = stateful_seq(PROMPT)
+        seq.last_checkpoint_pos = INTERVAL + BLOCK
+        assert not self.keepers(bm, seq, 2 * INTERVAL, aimed=False)
+        assert self.keepers(bm, seq, 2 * INTERVAL + BLOCK, aimed=False)
+
+    def test_the_grid_ignores_the_watermark(self):
+        # An aimed caller answers to `checkpoint_cut`, which knows nothing of
+        # the watermark; letting it in here would put the two out of step.
+        bm = BlockManager(demand_config())
+        seq = stateful_seq(PROMPT)
+        seq.last_checkpoint_pos = INTERVAL
+        assert self.keepers(bm, seq, 2 * INTERVAL, aimed=True)
+
+    def test_a_demand_is_out_of_generation_s_reach(self):
+        # Not a rule, an arithmetic fact: a demand is bounded by the prompt's
+        # own hit ceiling, and generation only ever asks about positions at or
+        # past the end of the prompt. The unaimed branch omits the demand
+        # because of this, so the day it stops holding, this fails first.
+        bm = BlockManager(demand_config())
+        seq = stateful_seq(PROMPT)
+        bm.allocate(seq, bm.can_allocate(seq))
+        second = stateful_seq(PROMPT)
+        bm.allocate(second, bm.can_allocate(second))
+        assert second.checkpoint_demand_pos < second.num_prompt_tokens
