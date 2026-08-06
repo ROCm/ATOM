@@ -1149,13 +1149,9 @@ class MLAAttention(nn.Module):
         return_lse: bool = False,
         causal: bool = True,
     ) -> torch.Tensor:
-        # `causal` is True for the target (standard autoregressive decode) and
-        # False only for DSpark's bidirectional draft block, where every one of
-        # the T draft query positions must attend the whole block. The target
-        # MUST stay causal -- the asm decode kernel selects a different .co by
-        # the causal flag, so forcing causal=False here corrupts target output.
-        # Callers gate this on (context.is_draft and is_dspark): plain MTP/eagle
-        # drafters set is_draft too but must stay causal.
+        # causal=True for the target; False only for DSpark's bidirectional
+        # draft block. The asm kernel picks a different .co by this flag, so the
+        # target must stay causal.
         assert kv_c_and_k_pe_cache.numel() > 0
         assert attn_metadata is not None
         B = q.shape[0]
@@ -1195,9 +1191,6 @@ class MLAAttention(nn.Module):
                 self.scale,
                 self.kv_lora_rank,
                 self.qk_rope_head_dim,
-                # Triton shuffle path stays causal: the gfx1250 gluon kernel
-                # asserts causal, and the DSpark non-causal block runs on the
-                # asm seg path, not here.
                 True,  # causal
                 # q is bf16 (the shuffled fused write does not quantize q), so
                 # no q de-scale; kv carries its own per-tensor scale.
