@@ -86,9 +86,9 @@ class DSparkProposer(Drafter):
         # padded_num_heads lives on the draft MLA module (>=_MLA_MIN_HEADS==16),
         # matching the gqa ratio the asm kernel dispatches on. The ModelRunner
         # itself has no such attribute.
-        self._blk_padded_heads = (
-            self.model.layers[0].self_attn.mla_attn.impl.padded_num_heads
-        )
+        self._blk_padded_heads = self.model.layers[
+            0
+        ].self_attn.mla_attn.impl.padded_num_heads
         (
             (wmd_sz, wmd_ty),
             (wip_sz, wip_ty),
@@ -519,12 +519,12 @@ class DSparkProposer(Drafter):
             dtype_kv = dtype_q
             ps = self._init_block_persistent_buffers(dtype_q, dtype_kv)
             get_mla_metadata_v1(
-                attn_metadata.cu_seqlens_q,          # seqlens_qo_indptr
-                kv_indptr,                            # seqlens_kv_indptr
-                attn_metadata.kv_last_page_lens,      # kv_last_page_lens
+                attn_metadata.cu_seqlens_q,  # seqlens_qo_indptr
+                kv_indptr,  # seqlens_kv_indptr
+                attn_metadata.kv_last_page_lens,  # kv_last_page_lens
                 self._blk_padded_heads,
-                1,                                    # nhead_kv
-                False,                                # is_causal (non-causal block)
+                1,  # nhead_kv
+                False,  # is_causal (non-causal block)
                 ps["work_meta_data"],
                 ps["work_info_set"],
                 ps["work_indptr"],
