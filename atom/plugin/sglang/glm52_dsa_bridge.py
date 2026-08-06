@@ -8,8 +8,6 @@ from __future__ import annotations
 # --- common.py ---
 # Shared GLM-5.2 DSA bridge helpers (all MTP phases).
 
-import logging
-
 import numpy as np
 import torch
 from aiter import dtypes, get_mla_metadata_info_v1, get_mla_metadata_v1
@@ -161,7 +159,6 @@ def build_draft_decode_token_table(
     seq_lens_np: np.ndarray,
     sub_step: int,
     num_steps: int = 1,
-    topk: int = 1,
     page_size: int = 1,
 ) -> torch.Tensor:
     """Build per-request token table for draft_forward sub-steps (SGLang layout)."""
@@ -286,6 +283,17 @@ def get_index_topk(atom_config) -> int:
     if topk is None:
         raise RuntimeError("GLM-5.2 DSA bridge requires hf_config.index_topk")
     return int(topk)
+
+
+def _make_decode_slot_mapping(
+    out_cache_loc: torch.Tensor | None,
+    *,
+    batch_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    if torch.is_tensor(out_cache_loc):
+        return out_cache_loc[:batch_size].to(device=device, dtype=torch.int64)
+    return torch.zeros(batch_size, dtype=torch.int64, device=device)
 
 
 def local_num_attention_heads(atom_config) -> int:
@@ -816,23 +824,6 @@ def resolve_target_verify_lens(
     return prefix_lens, context_lens
 
 
-def should_use_mtp_verify_prefill_path(
-    forward_batch,
-    positions: torch.Tensor,
-    atom_config,
-) -> bool:
-    """Choose prefill vs decode metadata for eager target_verify."""
-    del forward_batch, positions, atom_config
-    override = envs.ATOM_GLM52_TV_VERIFY_PATH
-    if override in ("prefill", "prefill_prefix"):
-        return True
-    if override in ("decode",):
-        return False
-    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
-        return False
-    return False
-
-
 def build_mtp_verify_decode_metadata(
     forward_batch,
     positions: torch.Tensor,
@@ -872,9 +863,6 @@ def build_mtp_verify_decode_metadata(
 # --- draft_decode.py ---
 # Draft forward decode metadata — draft pool, 1 tok/query, multi-step sub_step.
 
-logger = logging.getLogger("atom.plugin.sglang.glm52_dsa_bridge")
-
-
 def get_draft_decode_sub_step(forward_batch) -> int:
     return int(getattr(forward_batch, DRAFT_SUB_STEP_ATTR, 0) or 0)
 
@@ -890,17 +878,6 @@ def clear_draft_decode_sub_step(forward_batch) -> None:
 
 def is_draft_decode_metadata(forward_batch) -> bool:
     return hasattr(forward_batch, DRAFT_SUB_STEP_ATTR)
-
-
-def resolve_committed_lens_cpu(forward_batch, bs: int) -> np.ndarray:
-    """Post-verify committed length (pre_verify + accept), from scheduler state."""
-    spec_info = getattr(forward_batch, "spec_info", None)
-    new_seq_lens = (
-        getattr(spec_info, "new_seq_lens", None) if spec_info is not None else None
-    )
-    if torch.is_tensor(new_seq_lens) and int(new_seq_lens.numel()) >= bs:
-        return new_seq_lens[:bs].detach().cpu().numpy().astype(np.int32)
-    return get_seq_lens_cpu(forward_batch, bs)
 
 
 def resolve_draft_decode_lens(
@@ -968,7 +945,6 @@ def _build_mtp_draft_decode_metadata(
         seq_lens_np=committed_np,
         sub_step=sub_step,
         num_steps=num_steps,
-        topk=1,
         page_size=1,
     )
     block_tables = build_draft_decode_token_table(
@@ -978,7 +954,6 @@ def _build_mtp_draft_decode_metadata(
         seq_lens_np=committed_np,
         sub_step=sub_step,
         num_steps=num_steps,
-        topk=1,
         page_size=page_size,
     )
     kv_indptr = counts_to_indptr(context_lens_np, device)
@@ -1034,11 +1009,11 @@ def _build_mtp_draft_decode_metadata(
         page_size=attn_page_size,
     )
 
-    out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
-    if torch.is_tensor(out_cache_loc):
-        slot_mapping = out_cache_loc[:bs].to(dtype=torch.int32)
-    else:
-        slot_mapping = torch.zeros(bs, dtype=torch.int32, device=device)
+    slot_mapping = _make_decode_slot_mapping(
+        getattr(forward_batch, "out_cache_loc", None),
+        batch_size=bs,
+        device=device,
+    )
 
     md = AttentionMetaData(
         cu_seqlens_q=cu_q,
@@ -1148,12 +1123,11 @@ def build_decode_metadata(
         page_size=attention_page_size(token_to_kv_pool),
     )
 
-    out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
-    if torch.is_tensor(out_cache_loc):
-        slot_mapping = out_cache_loc[:bs]
-    else:
-        slot_mapping = torch.zeros(bs, dtype=torch.int32, device=device)
-    slot_mapping = slot_mapping.to(dtype=torch.int32)
+    slot_mapping = _make_decode_slot_mapping(
+        getattr(forward_batch, "out_cache_loc", None),
+        batch_size=bs,
+        device=device,
+    )
 
     md = AttentionMetaData(
         cu_seqlens_q=cu_q,
@@ -1179,11 +1153,6 @@ def build_decode_metadata(
 # Draft extend metadata — draft pool, DRAFT_EXTEND_V2 bs×K fill after verify.
 
 
-def draft_extend_k_only() -> bool:
-    """Debug opt-in: attend only the current K-token extend chunk (legacy workaround)."""
-    return envs.ATOM_GLM52_DRAFT_EXTEND_K_ONLY
-
-
 def resolve_draft_extend_lens(
     forward_batch,
     positions: torch.Tensor,
@@ -1192,11 +1161,6 @@ def resolve_draft_extend_lens(
 ):
     """Return prefix and total KV lengths for DRAFT_EXTEND_V2."""
     draft_token_num = int(draft_token_num)
-    if draft_extend_k_only():
-        prefix_lens = np.zeros(bs, dtype=np.int32)
-        context_lens = np.full(bs, draft_token_num, dtype=np.int32)
-        return prefix_lens, context_lens
-
     seq_lens = get_seq_lens_cpu(forward_batch, bs)
     position_rows = positions.detach().cpu().numpy().astype(np.int32)
     required = bs * draft_token_num
@@ -1226,20 +1190,6 @@ def draft_extend_token_num(forward_batch, positions: torch.Tensor, bs: int) -> i
     if bs > 0 and int(positions.numel()) >= bs:
         return max(1, int(positions.numel()) // bs)
     return 1
-
-
-def should_use_mtp_draft_extend_decode_path(forward_batch) -> bool:
-    """Use decode-style draft_extend metadata (native propose i=0 semantics)."""
-    override = envs.ATOM_GLM52_DRAFT_EXTEND_PATH
-    if override in ("prefill", "prefill_prefix"):
-        return False
-    if override in ("decode",):
-        return True
-    if is_draft_extend_mode(forward_batch):
-        return True
-    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
-        return True
-    return int(getattr(forward_batch, "_graph_cache_bs", 0) or 0) > 0
 
 
 def build_mtp_draft_extend_decode_metadata(
@@ -1809,11 +1759,6 @@ def build_atom_glm52_attention_metadata_from_sglang(
     atom_config,
 ):
     if getattr(forward_batch.forward_mode, "is_target_verify", lambda: False)():
-        if should_use_mtp_verify_prefill_path(forward_batch, positions, atom_config):
-            raise RuntimeError(
-                "GLM-5.2 DSA target_verify prefill metadata is not ported yet; "
-                "use decode path (default) or unset ATOM_GLM52_TV_VERIFY_PATH"
-            )
         return build_mtp_verify_decode_metadata(
             forward_batch,
             positions,
@@ -1840,15 +1785,7 @@ def build_atom_glm52_attention_metadata_from_sglang(
     if getattr(forward_batch.forward_mode, "is_draft_extend", lambda **kwargs: False)(
         include_v2=True
     ):
-        if should_use_mtp_draft_extend_decode_path(forward_batch):
-            return build_mtp_draft_extend_decode_metadata(
-                forward_batch,
-                positions,
-                token_to_kv_pool=token_to_kv_pool,
-                req_to_token_pool=req_to_token_pool,
-                atom_config=atom_config,
-            )
-        return build_prefill_metadata(
+        return build_mtp_draft_extend_decode_metadata(
             forward_batch,
             positions,
             token_to_kv_pool=token_to_kv_pool,

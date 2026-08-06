@@ -29,7 +29,6 @@ from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
 from atom.plugin.sglang.glm52_dsa_bridge import GLM52_GRAPH_SEQ_LEN_CAPACITY
 from atom.utils.custom_register import direct_register_custom_op
-from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -272,10 +271,7 @@ def _is_mtp_spec_extend_like(forward_batch) -> bool:
     """Eager MTP phases with bs * K query rows (target_verify / draft_extend decode)."""
     if forward_batch.forward_mode.is_target_verify():
         return True
-    if not _is_draft_extend_v2(forward_batch):
-        return False
-    override = envs.ATOM_GLM52_DRAFT_EXTEND_PATH
-    return override not in ("prefill", "prefill_prefix")
+    return _is_draft_extend_v2(forward_batch)
 
 
 def _build_mtp_spec_query_ranges(
@@ -993,7 +989,7 @@ def _prepare_sparse_mla_graph_metadata(
     triton_convert_req_index_to_global_index(
         buffers.req_id_per_token,
         buffers.block_table,
-        topk_indices,
+        topk_indices.to(dtype=torch.int32),
         buffers.kv_indptr,
         buffers.kv_indices,
         BLOCK_SIZE=buffers.allocator_page_size,
@@ -1172,18 +1168,13 @@ def forward_sparse_mla_for_sglang(
     topk_indices = topk_indices[:num_tokens]
     output_dtype = input_dtype or torch.bfloat16
     k_buffer = token_to_kv_pool.get_key_buffer(layer.layer_id)
-    align_fp8_q = envs.ATOM_SGLANG_SPARSE_MLA_ALIGN_FP8_Q
     graph_mode = _is_graph_warmup_or_capture()
     fixed_graph_phase = bool(
         forward_batch.forward_mode.is_decode_or_idle()
         or _is_mtp_spec_extend_like(forward_batch)
     )
     use_fixed_graph_buffers = graph_mode and fixed_graph_phase
-    q_kernel_dtype = (
-        dtypes.fp8 if align_fp8_q and k_buffer.dtype == dtypes.fp8 else q.dtype
-    )
-    if not use_fixed_graph_buffers and q.dtype != q_kernel_dtype:
-        q = q.to(dtypes.fp8)
+    q_kernel_dtype = q.dtype
     q_descale = None
     if q_kernel_dtype == dtypes.fp8:
         q_descale = q_scale

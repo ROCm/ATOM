@@ -37,6 +37,7 @@ def setup_deepseek_for_sglang(model) -> None:
         model.atom_config = get_current_atom_config()
 
     kv_cache_dtype = model.atom_config.kv_cache_dtype
+    activation_dtype = model.atom_config.torch_dtype
 
     # Initialise SGLang's MLA TP context before patching per-layer forwards.
     try:
@@ -56,6 +57,7 @@ def setup_deepseek_for_sglang(model) -> None:
                 module,
                 config,
                 kv_cache_dtype,
+                activation_dtype,
             )
             if getattr(module, "use_nsa", False):
                 indexer = getattr(module, "indexer", None)
@@ -70,6 +72,7 @@ def _patch_mla_attention_for_sglang(
     attn: "DeepseekV2MLAAttention",
     config: Any,
     kv_cache_dtype: str = "bf16",
+    activation_dtype: Any = None,
 ) -> None:
     """Patch one DeepSeek MLA layer for SGLang plugin mode."""
     _align_qknorm_fusion_for_sglang(attn)
@@ -78,9 +81,27 @@ def _patch_mla_attention_for_sglang(
     _patch_indexer_for_sglang_sparse_mla(attn)
     if not isinstance(attn.mla_attn, SGLangDeepseekMLAAttention):
         attn.mla_attn = SGLangDeepseekMLAAttention(attn, attn.mla_attn)
-    attn.process_weights_after_loading = lambda: process_mla_kv_b_proj_after_loading(
-        attn
-    )
+    def process_weights_after_loading() -> None:
+        process_mla_kv_b_proj_after_loading(attn)
+        _align_indexer_layernorm_dtype(attn, activation_dtype)
+
+    attn.process_weights_after_loading = process_weights_after_loading
+
+
+def _align_indexer_layernorm_dtype(
+    attn: "DeepseekV2MLAAttention", activation_dtype: Any
+) -> None:
+    """Match SGLang sparse-indexer affine tensors to AITER's input dtype."""
+    if activation_dtype is None:
+        return
+    indexer = getattr(attn, "indexer", None)
+    k_norm = getattr(indexer, "k_norm", None)
+    if k_norm is None:
+        return
+    for name in ("weight", "bias"):
+        parameter = getattr(k_norm, name, None)
+        if parameter is not None and parameter.dtype != activation_dtype:
+            parameter.data = parameter.data.to(activation_dtype)
 
 
 def _patch_indexer_for_sglang_sparse_mla(attn: "DeepseekV2MLAAttention") -> None:

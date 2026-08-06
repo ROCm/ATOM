@@ -18,7 +18,6 @@ from atom.models.qwen3_5 import (
 )
 from atom.models.qwen3_moe import Qwen3MoeForCausalLM
 from atom.plugin.prepare import is_rtpllm, is_sglang, is_vllm
-from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -181,81 +180,6 @@ def _patch_sglang_dsv4_draft_backends() -> None:
     DraftBackendFactory._create_dsv4_decode_backend = _create_atom_dsv4_decode_backend
     DraftBackendFactory._create_dsv4_prefill_backend = _create_atom_dsv4_prefill_backend
     DraftBackendFactory._atom_dsv4_draft_backend_patched = True
-    logger.info("Patched SGLang DSV4 speculative draft backends to ATOM")
-
-
-def _patch_sglang_mtp_total_accept_rate_logging() -> None:
-    """Log cumulative SGLang speculative acceptance statistics."""
-
-    if not envs.ATOM_SGLANG_MTP_LOG:
-        return
-
-    try:
-        from sglang.srt.managers.scheduler import Scheduler
-    except Exception:  # noqa: BLE001 - optional across SGLang versions
-        return
-
-    # SGLang <= 0.5.12 exposes reporting and counters directly on Scheduler.
-    # In 0.5.15 they moved to SchedulerMetricsReporter.
-    if hasattr(Scheduler, "report_decode_stats"):
-        stats_owner_cls = Scheduler
-    else:
-        try:
-            from sglang.srt.managers.scheduler_components.metrics_reporter import (
-                SchedulerMetricsReporter,
-            )
-        except Exception:  # noqa: BLE001 - optional across SGLang versions
-            return
-        stats_owner_cls = SchedulerMetricsReporter
-
-    if getattr(stats_owner_cls, "_atom_spec_stats_logging_patched", False):
-        return
-
-    original_report_decode_stats = stats_owner_cls.report_decode_stats
-    stats_logger = logging.getLogger("atom.plugin.sglang.spec_stats")
-
-    def report_decode_stats(self, *args, **kwargs):
-        total_forward_ct_before = int(
-            getattr(self, "spec_total_num_forward_ct", 0) or 0
-        )
-        ret = original_report_decode_stats(self, *args, **kwargs)
-        scheduler = getattr(self, "scheduler", self)
-        if scheduler.spec_algorithm.is_none():
-            return ret
-
-        total_forward_ct = int(getattr(self, "spec_total_num_forward_ct", 0) or 0)
-        total_accept_tokens = int(getattr(self, "spec_total_num_accept_tokens", 0) or 0)
-        # The original method updates lifetime counters only at
-        # decode_log_interval. Avoid repeating the same cumulative snapshot on
-        # every decode iteration between reporting intervals.
-        if total_forward_ct <= total_forward_ct_before:
-            return ret
-
-        draft_per_round = (
-            int(scheduler.server_args.speculative_num_draft_tokens) - 1
-            if getattr(scheduler.server_args, "speculative_num_draft_tokens", None)
-            else int(getattr(scheduler.server_args, "speculative_num_steps", 0) or 0)
-        )
-        accepted_drafts = total_accept_tokens - total_forward_ct
-        total_draft_tokens = total_forward_ct * max(draft_per_round, 0)
-        accept_rate = (
-            accepted_drafts / total_draft_tokens if total_draft_tokens > 0 else 0.0
-        )
-
-        stats_logger.info(
-            "[MTP Stats         ] Average toks/fwd: %.2f, "
-            "Accepted/Total Draft tokens: %d/%d, Acceptance rate: %.2f%%",
-            total_accept_tokens / total_forward_ct,
-            accepted_drafts,
-            total_draft_tokens,
-            accept_rate * 100.0,
-        )
-        return ret
-
-    stats_owner_cls.report_decode_stats = report_decode_stats
-    stats_owner_cls._atom_spec_stats_logging_patched = True
-
-
 def _patch_sglang_dsv4_spec_cuda_graph() -> None:
     """Patch SGLang speculative CUDA graph handling for ATOM DSV4.
 
@@ -303,17 +227,16 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
 
     def _is_glm52_nextn_runner(runner) -> bool:
         try:
+            hf_config = getattr(
+                getattr(runner, "model_config", None), "hf_config", None
+            )
+            model_type = str(getattr(hf_config, "model_type", "")).lower()
             arches = (
-                getattr(
-                    getattr(getattr(runner, "model_config", None), "hf_config", None),
-                    "architectures",
-                    None,
-                )
+                getattr(hf_config, "architectures", None)
                 or []
             )
-            return any(
-                "GlmMoeDsaForCausalLMNextN" in str(arch)
-                for arch in arches
+            return model_type == "glm_moe_dsa" or any(
+                "GlmMoeDsaForCausalLMNextN" in str(arch) for arch in arches
             )
         except Exception:
             return False
@@ -381,8 +304,6 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
         return hidden_states
 
     def _env_flag(name: str) -> bool:
-        if name in envs.environment_variables:
-            return bool(getattr(envs, name))
         return os.environ.get(name, "0").lower() in ("1", "true", "yes", "on")
 
     def _is_dsv4_flash_runner(runner) -> bool:
@@ -410,58 +331,6 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
         return _env_flag("ATOM_SGLANG_V4_ENABLE_TARGET_VERIFY_CG") and not _env_flag(
             "ATOM_SGLANG_V4_DISABLE_TARGET_VERIFY_CG"
         )
-
-    def _safe_spec_graph_bs(original_bs, env_name: str):
-        configured = os.environ.get(env_name)
-        if not configured:
-            return list(original_bs)
-        allowed = {int(x) for x in configured.replace(" ", ",").split(",") if x.strip()}
-        return [bs for bs in original_bs if int(bs) in allowed]
-
-    if not getattr(CudaGraphRunner, "_atom_dsv4_init_patched", False):
-        original_target_init = CudaGraphRunner.__init__
-
-        def __init__(self, model_runner, *args, **kwargs):
-            should_cap = False
-            server_args = getattr(model_runner, "server_args", None)
-            original_cuda_graph_bs = (
-                list(getattr(server_args, "cuda_graph_bs", []))
-                if server_args is not None
-                else None
-            )
-            try:
-                should_cap = _is_dsv4_or_glm52_runner(model_runner) and bool(
-                    getattr(
-                        getattr(model_runner, "spec_algorithm", None),
-                        "is_speculative",
-                        lambda: False,
-                    )()
-                )
-                should_cap = (
-                    should_cap
-                    and not getattr(model_runner, "is_draft_worker", False)
-                    and _target_verify_graph_enabled()
-                )
-            except Exception:
-                should_cap = False
-
-            try:
-                if should_cap and server_args is not None and original_cuda_graph_bs:
-                    server_args.cuda_graph_bs = _safe_spec_graph_bs(
-                        original_cuda_graph_bs,
-                        "ATOM_SGLANG_V4_TARGET_VERIFY_CG_BS",
-                    )
-                original_target_init(self, model_runner, *args, **kwargs)
-            finally:
-                if (
-                    should_cap
-                    and server_args is not None
-                    and original_cuda_graph_bs is not None
-                ):
-                    server_args.cuda_graph_bs = original_cuda_graph_bs
-
-        CudaGraphRunner.__init__ = __init__
-        CudaGraphRunner._atom_dsv4_init_patched = True
 
     can_run_method = (
         "can_run_graph" if hasattr(CudaGraphRunner, "can_run_graph") else "can_run"
@@ -541,7 +410,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                 model_runner = getattr(self, "model_runner", None)
                 if _is_glm52_nextn_runner(
                     model_runner
-                ) and _uses_glm52_generic_draft_frontend(model_runner):
+                ) and not _uses_glm52_generic_draft_frontend(model_runner):
                     from atom.plugin.sglang.runtime.forward_context import (
                         stage_glm52_draft_decode_graph_metadata,
                     )
@@ -696,30 +565,25 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                             ],
                         )
                 out = original_extend_replay(self, forward_batch)
-                try:
-                    # EAGLE V2 consumes draft-extend logits with a fixed
-                    # `seq * speculative_num_draft_tokens + offset` layout.
-                    # SGLang's runner trims to the actual compact token count,
-                    # which makes that indexing OOB when fewer than the padded
-                    # graph tokens were materialized.  Return the captured
-                    # padded output buffer for DSV4 so downstream indexing stays
-                    # within the fixed graph layout.
-                    if bool(
-                        getattr(
-                            getattr(self, "forward_mode", None),
-                            "is_draft_extend_v2",
-                            lambda: False,
-                        )()
-                    ):
-                        padded_out = getattr(self, "output_buffers", {}).get(
-                            getattr(self, "bs", None)
-                        )
-                        if padded_out is not None:
-                            out = padded_out
-                except Exception:
-                    logger.exception(
-                        "Failed to restore padded DSV4 draft-extend graph output"
+                # EAGLE V2 consumes draft-extend logits with a fixed
+                # `seq * speculative_num_draft_tokens + offset` layout.
+                # SGLang's runner trims to the actual compact token count,
+                # which makes that indexing OOB when fewer than the padded
+                # graph tokens were materialized.  Return the captured
+                # padded output buffer for DSV4 so downstream indexing stays
+                # within the fixed graph layout.
+                if bool(
+                    getattr(
+                        getattr(self, "forward_mode", None),
+                        "is_draft_extend_v2",
+                        lambda: False,
+                    )()
+                ):
+                    padded_out = getattr(self, "output_buffers", {}).get(
+                        getattr(self, "bs", None)
                     )
+                    if padded_out is not None:
+                        out = padded_out
                 return out
             finally:
                 if backend is not None:
@@ -976,28 +840,9 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                             backend, "_cuda_graph_seq_len_fill_value"
                         ):
                             backend._cuda_graph_seq_len_fill_value = seq_len_fill
-                    draft_runner = getattr(self, "draft_runner", None)
-                    server_args = getattr(draft_runner, "server_args", None)
-                    original_cuda_graph_bs = (
-                        list(getattr(server_args, "cuda_graph_bs", []))
-                        if server_args is not None
-                        else None
+                    self.cuda_graph_runner_for_draft_extend = (
+                        EAGLEDraftExtendCudaGraphRunner(self)
                     )
-                    try:
-                        if server_args is not None and original_cuda_graph_bs:
-                            server_args.cuda_graph_bs = _safe_spec_graph_bs(
-                                original_cuda_graph_bs,
-                                "ATOM_SGLANG_V4_DRAFT_EXTEND_CG_BS",
-                            )
-                        self.cuda_graph_runner_for_draft_extend = (
-                            EAGLEDraftExtendCudaGraphRunner(self)
-                        )
-                    finally:
-                        if (
-                            server_args is not None
-                            and original_cuda_graph_bs is not None
-                        ):
-                            server_args.cuda_graph_bs = original_cuda_graph_bs
                 elif supports_plugin_graph:
                     self.cuda_graph_runner_for_draft_extend = None
             except Exception as exc:
@@ -1013,18 +858,14 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
 
 def _patch_sglang_eagle_v2_draft_argmax() -> None:
     """Use ATOM draft distributed argmax for SGLang EAGLE topk=1 drafting."""
-    if not envs.ATOM_SGLANG_DRAFT_ARGMAX:
-        return
     try:
         from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
             EAGLEDraftCudaGraphRunner,
         )
-    except Exception as exc:
-        logger.debug("Skip patching SGLang EAGLE draft argmax: %s", exc)
+    except Exception:
         return
 
     if hasattr(EAGLEDraftCudaGraphRunner, "execute"):
-        logger.info("Use upstream SGLang ROCm-safe EAGLE draft selection")
         return
 
     try:
@@ -1035,8 +876,7 @@ def _patch_sglang_eagle_v2_draft_argmax() -> None:
             maybe_detect_oob,
             select_top_k_tokens,
         )
-    except Exception as exc:
-        logger.debug("Skip patching SGLang EAGLE draft argmax: %s", exc)
+    except Exception:
         return
 
     if getattr(EagleDraftWorker, "_atom_sglang_draft_argmax_patched", False):
@@ -1044,18 +884,16 @@ def _patch_sglang_eagle_v2_draft_argmax() -> None:
 
     def _is_glm52_nextn_runner(runner) -> bool:
         try:
+            hf_config = getattr(
+                getattr(runner, "model_config", None), "hf_config", None
+            )
+            model_type = str(getattr(hf_config, "model_type", "")).lower()
             arches = (
-                getattr(
-                    getattr(getattr(runner, "model_config", None), "hf_config", None),
-                    "architectures",
-                    None,
-                )
+                getattr(hf_config, "architectures", None)
                 or []
             )
-            return any(
-                "GlmMoeDsaForCausalLMNextN" in str(arch)
-                or "DeepseekV3ForCausalLMNextN" in str(arch)
-                for arch in arches
+            return model_type == "glm_moe_dsa" or any(
+                "GlmMoeDsaForCausalLMNextN" in str(arch) for arch in arches
             )
         except Exception:
             return False
@@ -1180,7 +1018,6 @@ def _patch_sglang_eagle_v2_draft_argmax() -> None:
 
     EagleDraftWorker.draft_forward = draft_forward
     EagleDraftWorker._atom_sglang_draft_argmax_patched = True
-    logger.info("Patched SGLang EAGLE draft_forward for ATOM distributed argmax")
 
 
 def register_ops_to_sglang(atom_config: Config) -> None:
@@ -1193,7 +1030,6 @@ def register_ops_to_sglang(atom_config: Config) -> None:
 
     _register_custom_attention_to_sglang()
     _patch_sglang_dsv4_draft_backends()
-    _patch_sglang_mtp_total_accept_rate_logging()
     patch_sglang_eagle3_runtime_compat()
     _patch_sglang_dsv4_spec_cuda_graph()
     _patch_sglang_eagle_v2_draft_argmax()
@@ -1280,13 +1116,8 @@ def init_aiter_dist(config: Config) -> None:
 
     distributed_init_method = get_distributed_init_method(dp_master_ip, dp_master_port)
 
-    prefill_context_parallel_size = config.prefill_context_parallel_size
     logger.info(
-        "Initialize aiter dist for using aiter custom collective op for "
-        f"plugin mode, rank:{rank}, tp:{tensor_parallel_size}, "
-        f"pcp:{prefill_context_parallel_size}, "
-        f"dp:{config.parallel_config.data_parallel_size}, "
-        f"dp_rank:{config.parallel_config.data_parallel_rank}"
+        f"Initialize aiter dist for using aiter custom collective op for plugin mode, rank:{rank}"
     )
     init_dist_env(
         tensor_model_parallel_size=tensor_parallel_size,
@@ -1295,5 +1126,5 @@ def init_aiter_dist(config: Config) -> None:
         distributed_init_method=distributed_init_method,
         data_parallel_size=config.parallel_config.data_parallel_size,
         data_parallel_rank=config.parallel_config.data_parallel_rank,
-        prefill_context_model_parallel_size=prefill_context_parallel_size,
+        prefill_context_model_parallel_size=config.prefill_context_parallel_size,
     )

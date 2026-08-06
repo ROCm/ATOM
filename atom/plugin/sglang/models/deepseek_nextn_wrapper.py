@@ -28,7 +28,6 @@ from atom.plugin.sglang.runtime import (
     SGLangPluginRuntime,
     plugin_runtime_scope,
 )
-from atom.utils import envs
 
 logger = logging.getLogger("atom.plugin.sglang.models")
 
@@ -387,24 +386,12 @@ class DeepseekV3ForCausalLMNextN(nn.Module):
 
             if self.pp_group.is_last_rank:
                 hidden_states = runtime.trim_output(hidden_states)
-                wrapper_mode = envs.ATOM_GLM52_MTP_WRAPPER_MODE.strip()
-                if wrapper_mode not in ("current", "pr1578"):
-                    raise ValueError(
-                        "ATOM_GLM52_MTP_WRAPPER_MODE must be 'current' or "
-                        f"'pr1578', got {wrapper_mode!r}"
-                    )
-                if wrapper_mode == "pr1578":
-                    logits_hidden = hidden_states
-                    hidden_states_before_norm = None
-                else:
-                    logits_hidden = hidden_states
-                    hidden_states_before_norm = _incoming_hidden_for_chain
                 return self.logits_processor(
                     input_ids,
-                    logits_hidden,
+                    hidden_states,
                     self.lm_head,
                     forward_batch,
-                    hidden_states_before_norm=hidden_states_before_norm,
+                    hidden_states_before_norm=_incoming_hidden_for_chain,
                 )
             return hidden_states
 
@@ -429,21 +416,6 @@ class DeepseekV3ForCausalLMNextN(nn.Module):
 
 class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
     """SGLang-compatible GLM-5.2 MTP draft wrapper backed by ATOM `DeepSeekMTP`."""
-
-    draft_model_name = "GLM DSA MTP"
-
-    def _prepare_atom_config_for_nextn(
-        self,
-        *,
-        config,
-        draft_model_path: str,
-        use_standalone_draft: bool,
-    ) -> None:
-        return super()._prepare_atom_config_for_nextn(
-            config=config,
-            draft_model_path=draft_model_path,
-            use_standalone_draft=use_standalone_draft,
-        )
 
 
 EntryClass = [DeepseekV3ForCausalLMNextN, GlmMoeDsaForCausalLMNextN]
