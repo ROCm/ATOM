@@ -1200,6 +1200,26 @@ class KimiKDAAttention(nn.Module):
         # straight to o_proj's x_scale path. Otherwise it is a bf16 tensor.
         if isinstance(normed, tuple):
             o_fp8, o_scale = normed
+            # The per-token fp8 o_proj GEMM (gemm_a8w8_bpreshuffle) tiles M and
+            # writes its output in tile_m-row blocks. Unlike the MLA/MLP o_proj --
+            # which run inside the inductor-compiled region whose buffers carry
+            # alignment slack -- this one runs *eagerly* inside the Dynamo-opaque
+            # KDA custom op. For a non-tile-aligned token count (e.g. prefill
+            # M=1890) the kernel's final partial tile writes past the tightly
+            # allocated output rows, corrupting the heap and surfacing as an
+            # intermittent HIP illegal access at the next allocation. Pad the rows
+            # up to the kernel's M-tile (aiter picks min(256, next_pow2(M))) so the
+            # last tile is fully in-bounds, then slice the real rows back out.
+            m = o_fp8.shape[0]
+            if m > 0:
+                align = min(256, max(16, 1 << (m - 1).bit_length()))
+                m_pad = (m + align - 1) // align * align
+                if m_pad != m:
+                    o_fp8_pad = o_fp8.new_zeros((m_pad, o_fp8.shape[1]))
+                    o_fp8_pad[:m] = o_fp8
+                    o_scale_pad = o_scale.new_zeros((m_pad, o_scale.shape[1]))
+                    o_scale_pad[:m] = o_scale
+                    return self.o_proj(o_fp8_pad, x_scale=o_scale_pad)[:m]
             return self.o_proj(o_fp8, x_scale=o_scale)
         return self.o_proj(rearrange(normed, "t h d -> t (h d)"))
 
