@@ -129,7 +129,7 @@ class LMCacheOffloadMetadata(ConnectorMetadata):
     def __init__(self) -> None:
         super().__init__()
         self.requests: list[LMCacheReqMeta] = []
-        # req_ids whose scheduler-side lookup pin should be released this step.
+        # req_ids whose worker-side lookup pin can be released this step.
         self.lookup_requests_in_step: list[str] = []
 
     def add_request(self, meta: LMCacheReqMeta) -> None:
