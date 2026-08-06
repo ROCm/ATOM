@@ -16,7 +16,10 @@ logger = logging.getLogger("atom.plugin.sglang.attention_backend.glm52_dsa")
 
 def install_upstream_glm52_graph_metadata_adapter() -> None:
     """Publish ATOM target-verify metadata from SGLang's active DSA backend."""
-    from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
+    try:
+        from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
+    except (ImportError, ModuleNotFoundError):
+        return
 
     if getattr(
         DeepseekSparseAttnBackend,

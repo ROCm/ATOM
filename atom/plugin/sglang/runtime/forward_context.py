@@ -608,24 +608,6 @@ def _set_atom_forward_context(
             include_v2=True
         )
     )
-    # This value is only used by ATOM-side MoE padding in the SGLang wrapper.
-    if is_target_verify:
-        draft_token_num = int(
-            getattr(getattr(forward_batch, "spec_info", None), "draft_token_num", 0)
-            or 0
-        )
-        max_seqlen_q = max(1, draft_token_num)
-    elif is_draft_extend:
-        from atom.plugin.sglang.glm52_dsa_bridge import draft_extend_token_num
-
-        max_seqlen_q = max(
-            1,
-            draft_extend_token_num(
-                forward_batch, positions, int(forward_batch.batch_size)
-            ),
-        )
-    else:
-        max_seqlen_q = 1 if forward_mode.is_decode_or_idle() else 0
     attn_metadata = None
     try:
         attn_metadata = _build_minimax_m3_metadata(
@@ -671,6 +653,28 @@ def _set_atom_forward_context(
             ) from exc
 
     if attn_metadata is None:
+        # Model-specific builders own their query geometry. This fallback value
+        # is only used by generic metadata for ATOM-side MoE padding.
+        from atom.plugin.sglang.runtime.model_arch import is_glm52_dsa_config
+
+        is_glm52_dsa = is_glm52_dsa_config(getattr(atom_config, "hf_config", None))
+        if is_glm52_dsa and is_target_verify:
+            draft_token_num = int(
+                getattr(getattr(forward_batch, "spec_info", None), "draft_token_num", 0)
+                or 0
+            )
+            max_seqlen_q = max(1, draft_token_num)
+        elif is_glm52_dsa and is_draft_extend:
+            from atom.plugin.sglang.glm52_dsa_bridge import draft_extend_token_num
+
+            max_seqlen_q = max(
+                1,
+                draft_extend_token_num(
+                    forward_batch, positions, int(forward_batch.batch_size)
+                ),
+            )
+        else:
+            max_seqlen_q = 1 if forward_mode.is_decode_or_idle() else 0
         attn_metadata = _build_generic_attention_metadata(forward_batch, max_seqlen_q)
     batch_size = int(forward_batch.batch_size)
     is_dummy_run = _is_dummy_forward(forward_batch)
