@@ -53,6 +53,87 @@ vllm serve "${MODEL}" \
     --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE"}'
 ```
 
+### GPQA-Diamond official mode
+
+GPQA requires a larger context/output budget and Kimi's reasoning channel. Use
+a fresh server with the official sampling settings and a stable served name:
+
+```bash
+MODEL=/path/to/Kimi-K3
+
+export AITER_LOG_LEVEL=WARNING
+export ATOM_LOADER_USE_THREADPOOL=1
+export ATOM_LOADER_THREADPOOL_WORKERS=16
+export ATOM_SYNC_AFTER_LOAD=1
+export ATOM_DIST_TIMEOUT_SECONDS=3600
+export AITER_SITUV2_A4W4=1
+export VLLM_USE_BREAKABLE_CUDAGRAPH=0
+
+vllm serve "${MODEL}" \
+    --served-model-name Kimi-K3 \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --tensor-parallel-size 8 \
+    --trust-remote-code \
+    --language-model-only \
+    --reasoning-parser kimi_k3 \
+    --kv-cache-dtype fp8 \
+    --max-model-len 114688 \
+    --max-num-seqs 32 \
+    --max-num-batched-tokens 16384 \
+    --gpu-memory-utilization 0.93 \
+    --block-size 128 \
+    --no-enable-prefix-caching \
+    --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE"}'
+```
+
+Install the pinned client dependency and run the full one-repeat upgrade gate:
+
+```bash
+pip install "evalscope==1.9.1"
+
+GENERATION_CONFIG='{"max_tokens": 100000, "temperature": 1.0, "top_p": 0.95, "timeout": 7200, "stream": true, "extra_body": {"chat_template_kwargs": {"thinking": true, "thinking_effort": "max"}}}'
+
+evalscope eval \
+    --model Kimi-K3 \
+    --api-url http://127.0.0.1:8000/v1/chat/completions \
+    --api-key EMPTY \
+    --eval-type openai_api \
+    --datasets gpqa_diamond \
+    --eval-batch-size 32 \
+    --generation-config "${GENERATION_CONFIG}" \
+    --seed 42 \
+    --repeats 1 \
+    --work-dir /tmp/kimi_k3_gpqa_r1 \
+    --no-timestamp
+```
+
+For a 26-question smoke gate, use the same command with:
+
+```bash
+--limit 26 --repeats 1 --work-dir /tmp/kimi_k3_gpqa_gate
+```
+
+For the official recommended protocol, use the full dataset with eight repeats:
+
+```bash
+--repeats 8 --work-dir /tmp/kimi_k3_gpqa_r8
+```
+
+The EvalScope request uses `temperature=1.0`, `top_p=0.95`, a 96K output
+budget, max thinking effort, streaming, and 32 concurrent requests.
+
+Validated after the vLLM 0.26.1 upgrade:
+
+```text
+Direct EvalScope, max effort, 1 repeat:       186/198 = 0.9394
+Direct EvalScope, default effort, 1 repeat:   181/198 = 0.9141
+```
+
+No framing leakage was observed in either upgraded full run. The max-effort
+result (`0.9394`) is the primary official-mode comparison. The eight-repeat
+official protocol is intentionally separate from the one-repeat upgrade gate.
+
 The plugin keeps KDA temporal state in fp32, registers every KDA layer through
 vLLM's hybrid/Mamba cache contract, and uses ATOM's MLA backend for full
 attention. vLLM may increase the physical attention block size so its MLA and
