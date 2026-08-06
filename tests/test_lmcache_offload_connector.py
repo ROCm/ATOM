@@ -24,7 +24,11 @@ from atom.kv_transfer.offload.atom_kv_byte_codec import ATOMKVByteCodec
 from atom.kv_transfer.offload.atom_lmcache_gpu_connector import (
     ATOMLMCacheGPUConnector,
 )
-from atom.kv_transfer.offload.metadata import ATOMRawBytesLMCacheMetadata
+from atom.kv_transfer.offload.metadata import (
+    ATOMRawBytesLMCacheMetadata,
+    LMCacheOffloadMetadata,
+    LMCacheReqMeta,
+)
 from atom.model_engine.scheduler import Scheduler
 
 
@@ -567,6 +571,23 @@ def test_full_prompt_hit_is_clamped_before_load_spec():
     assert sched._load_specs[str(seq.id)].lmcache_cached_tokens == 7
 
 
+def test_lookup_miss_is_forwarded_for_worker_unpin():
+    sched = _scheduler()
+    seq = SimpleNamespace(
+        id=124,
+        num_prompt_tokens=8,
+        token_ids=list(range(8)),
+        num_cached_tokens=0,
+    )
+
+    need, should_park = sched.get_num_new_matched_tokens(seq)
+    meta = sched.build_connector_meta()
+
+    assert need == 0
+    assert should_park is False
+    assert meta.lookup_requests_in_step == ["124"]
+
+
 def test_load_is_skipped_if_hbm_satisfies_after_allocation():
     sched = _scheduler()
     lookup = _LookupClient(hit=8)
@@ -593,6 +614,7 @@ def test_load_is_skipped_if_hbm_satisfies_after_allocation():
 
     assert meta.requests == []
     assert [req for req in meta.requests if req.load_spec is not None] == []
+    assert meta.lookup_requests_in_step == ["321"]
     assert seq.offload_loaded_tokens == 8
     assert sched._save_tracker[str(seq.id)][1] == 8
     assert lookup.cleared == ["321"]
@@ -620,6 +642,7 @@ def test_lookup_time_hbm_satisfies_does_not_resave_hit_prefix():
     meta1 = sched.build_connector_meta()
 
     assert meta1.requests == []
+    assert meta1.lookup_requests_in_step == ["322"]
     assert sched._save_tracker[str(seq.id)][1] == 8
     assert lookup.cleared == ["322"]
 
@@ -657,6 +680,10 @@ def test_unaligned_hbm_handoff_prefills_boundary_then_emits_load():
     assert seq.offload_loaded_tokens == 6
     assert sched.adjust_prefill_chunk_after_alloc(seq, 10) == 2
 
+    handoff_meta = sched.build_connector_meta()
+    assert handoff_meta.lookup_requests_in_step == []
+    assert sched._lookup_in_step == ["657"]
+
     seq.num_cached_tokens = 8
     assert sched.should_park_partial_prefill_for_load(seq) is True
     meta = sched.build_connector_meta()
@@ -668,6 +695,7 @@ def test_unaligned_hbm_handoff_prefills_boundary_then_emits_load():
     assert req.token_ids == list(range(16))
     assert req.load_spec.hbm_cached_tokens == 8
     assert req.load_spec.lmcache_cached_tokens == 16
+    assert meta.lookup_requests_in_step == ["657"]
     assert seq.offload_loaded_tokens == 16
     assert str(seq.id) not in sched._handoff_loads
     assert lookup.cleared == []
@@ -699,6 +727,7 @@ def test_unaligned_handoff_skips_if_boundary_remainder_is_too_small():
     assert str(seq.id) not in sched._reqs_need_recv
     assert seq.offload_loaded_tokens == 6
     assert lookup.cleared == ["658"]
+    assert sched.build_connector_meta().lookup_requests_in_step == ["658"]
 
 
 def test_load_is_skipped_if_aligned_hit_is_below_threshold():
@@ -724,6 +753,7 @@ def test_load_is_skipped_if_aligned_hit_is_below_threshold():
     meta = sched.build_connector_meta()
 
     assert [req for req in meta.requests if req.load_spec is not None] == []
+    assert meta.lookup_requests_in_step == ["655"]
     assert seq.offload_loaded_tokens == 8
     assert lookup.cleared == ["655"]
 
@@ -758,6 +788,7 @@ def test_aligned_large_hit_parks_and_emits_load_metadata():
     assert req.block_ids == [1, 2, 3, 4]
     assert req.load_spec.hbm_cached_tokens == 4
     assert req.load_spec.lmcache_cached_tokens == 12
+    assert meta.lookup_requests_in_step == ["656"]
     assert seq.offload_loaded_tokens == 12
     assert lookup.cleared == []
 
@@ -834,7 +865,9 @@ def test_worker_completes_noop_load_when_hbm_satisfies():
     conn._failed_load = set()
     conn._done_save = set()
     conn._engine = SimpleNamespace(unpinned=[])
-    conn._engine.lookup_unpin = lambda ids: conn._engine.unpinned.extend(ids)
+    conn._engine.lookup_unpin = lambda lookup_id: conn._engine.unpinned.append(
+        lookup_id
+    )
 
     req = SimpleNamespace(
         req_id=321,
@@ -850,6 +883,46 @@ def test_worker_completes_noop_load_when_hbm_satisfies():
     assert conn._engine.unpinned == ["321"]
 
 
+def test_worker_unpins_only_lookups_without_an_emitted_load():
+    class _Executor:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def submit(self, *args) -> None:
+            self.calls.append(args)
+
+    class _Engine:
+        def __init__(self) -> None:
+            self.unpinned = []
+
+        def lookup_unpin(self, lookup_id) -> None:
+            self.unpinned.append(lookup_id)
+
+    conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
+    conn._do_load = True
+    conn._do_save = False
+    conn._engine = _Engine()
+    conn._load_executor = _Executor()
+    metadata = LMCacheOffloadMetadata()
+    metadata.lookup_requests_in_step = ["skipped", "loading"]
+    metadata.add_request(
+        LMCacheReqMeta(
+            req_id="loading",
+            token_ids=list(range(8)),
+            block_ids=[1, 2],
+            load_spec=SimpleNamespace(
+                hbm_cached_tokens=4,
+                lmcache_cached_tokens=8,
+            ),
+        )
+    )
+
+    conn.start_load_kv(metadata)
+
+    assert conn._engine.unpinned == ["skipped"]
+    assert len(conn._load_executor.calls) == 1
+
+
 def test_worker_reports_unaligned_hbm_load_as_failed_without_exception():
     conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
     conn._lock = threading.Lock()
@@ -858,7 +931,9 @@ def test_worker_reports_unaligned_hbm_load_as_failed_without_exception():
     conn._done_save = set()
     conn.chunk_size = 4
     conn._engine = SimpleNamespace(unpinned=[])
-    conn._engine.lookup_unpin = lambda ids: conn._engine.unpinned.extend(ids)
+    conn._engine.lookup_unpin = lambda lookup_id: conn._engine.unpinned.append(
+        lookup_id
+    )
 
     req = SimpleNamespace(
         req_id=654,
@@ -963,8 +1038,8 @@ def test_worker_load_uses_lmcache_engine_retrieve_and_marks_done():
             self.calls.append((tokens.tolist(), mask.tolist(), kwargs))
             return torch.tensor([False] * 4 + [True] * 8, dtype=torch.bool)
 
-        def lookup_unpin(self, ids) -> None:
-            self.unpinned.extend(ids)
+        def lookup_unpin(self, lookup_id) -> None:
+            self.unpinned.append(lookup_id)
 
     conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
     conn._lock = threading.Lock()
@@ -1006,8 +1081,8 @@ def test_worker_load_partial_retrieve_marks_failed():
         def retrieve(self, tokens, mask=None, **kwargs):
             return torch.tensor([False] * 4 + [True] * 4 + [False] * 4)
 
-        def lookup_unpin(self, ids) -> None:
-            self.unpinned.extend(ids)
+        def lookup_unpin(self, lookup_id) -> None:
+            self.unpinned.append(lookup_id)
 
     conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
     conn._lock = threading.Lock()
