@@ -650,7 +650,7 @@ start_router() {
     router_dp_aware_args=(--dp-aware)
   fi
   local -a router_cmd=(
-    /usr/local/bin/atomesh launch
+    /app/ATOM/atom/mesh/target/release/atomesh launch
     --host 0.0.0.0
     --port "${ROUTER_PORT}"
     --pd-disaggregation
