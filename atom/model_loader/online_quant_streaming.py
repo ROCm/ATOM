@@ -172,6 +172,8 @@ class OnlineQuantStreamer:
         if module is None:
             fn(*args)
             return
+        if self._is_nonlocal_expert_arrival(module, fn, args):
+            return
         if module._stream_claimed:
             # Never overwrite quantized storage with a late source arrival.
             self.excessive_loads.append(
@@ -206,6 +208,16 @@ class OnlineQuantStreamer:
                 module._stream_claimed = True
         if claimed:
             self._submit_finalize(module)
+
+    @staticmethod
+    def _is_nonlocal_expert_arrival(module, fn, args) -> bool:
+        """Whether a claimed EP module can ignore this checkpoint arrival."""
+        return (
+            len(args) >= 5
+            and getattr(fn, "__self__", None) is module
+            and hasattr(module, "_map_global_expert_id_to_local_expert_id")
+            and module._map_global_expert_id_to_local_expert_id(args[4]) == -1
+        )
 
     def _run_counted(self, module, param, fn, args) -> _CopyCounter:
         """Apply one loader call and return its logical or physical coverage."""
