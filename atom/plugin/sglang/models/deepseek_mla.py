@@ -37,8 +37,6 @@ def setup_deepseek_for_sglang(model) -> None:
         model.atom_config = get_current_atom_config()
 
     kv_cache_dtype = model.atom_config.kv_cache_dtype
-    activation_dtype = model.atom_config.torch_dtype
-
     # Initialise SGLang's MLA TP context before patching per-layer forwards.
     try:
         from sglang.srt.configs.model_config import is_deepseek_dsa
@@ -57,7 +55,6 @@ def setup_deepseek_for_sglang(model) -> None:
                 module,
                 config,
                 kv_cache_dtype,
-                activation_dtype,
             )
             if getattr(module, "use_nsa", False):
                 indexer = getattr(module, "indexer", None)
@@ -72,37 +69,55 @@ def _patch_mla_attention_for_sglang(
     attn: DeepseekV2MLAAttention,
     config: Any,
     kv_cache_dtype: str = "bf16",
-    activation_dtype: Any = None,
 ) -> None:
     """Patch one DeepSeek MLA layer for SGLang plugin mode."""
     _align_qknorm_fusion_for_sglang(attn)
     init_sgl_attrs(attn, config, kv_cache_dtype)
     _patch_attention_projs_for_sglang_mxfp4(attn)
     _patch_indexer_for_sglang_sparse_mla(attn)
+    _patch_indexer_layernorm_for_sglang(attn)
     if not isinstance(attn.mla_attn, SGLangDeepseekMLAAttention):
         attn.mla_attn = SGLangDeepseekMLAAttention(attn, attn.mla_attn)
 
     def process_weights_after_loading() -> None:
         process_mla_kv_b_proj_after_loading(attn)
-        _align_indexer_layernorm_dtype(attn, activation_dtype)
+        _patch_indexer_layernorm_for_sglang(attn)
 
     attn.process_weights_after_loading = process_weights_after_loading
 
 
-def _align_indexer_layernorm_dtype(
-    attn: DeepseekV2MLAAttention, activation_dtype: Any
-) -> None:
-    """Match SGLang sparse-indexer affine tensors to AITER's input dtype."""
-    if activation_dtype is None:
-        return
+def _patch_indexer_layernorm_for_sglang(attn: DeepseekV2MLAAttention) -> None:
+    """Adapt FP32 indexer affine tensors to AITER's standalone norm ABI."""
     indexer = getattr(attn, "indexer", None)
     k_norm = getattr(indexer, "k_norm", None)
-    if k_norm is None:
+    if k_norm is None or getattr(k_norm, "_atom_sglang_dtype_patched", False):
         return
-    for name in ("weight", "bias"):
-        parameter = getattr(k_norm, name, None)
-        if parameter is not None and parameter.dtype != activation_dtype:
-            parameter.data = parameter.data.to(activation_dtype)
+
+    from atom.model_ops.layernorm import (
+        layernorm2d_fwd_,
+        layernorm2d_fwd_with_add_,
+    )
+
+    def forward(self, x, residual=None):
+        input_dtype = x.dtype
+        weight = self.weight.to(input_dtype)
+        bias = self.bias.to(input_dtype)
+        if residual is None:
+            return layernorm2d_fwd_(x, weight, bias, self.eps, self.dim)
+
+        residual_dtype = residual.dtype
+        output, residual_output = layernorm2d_fwd_with_add_(
+            x,
+            weight,
+            residual.to(input_dtype),
+            bias,
+            self.eps,
+            self.dim,
+        )
+        return output, residual_output.to(residual_dtype)
+
+    k_norm.forward = MethodType(forward, k_norm)
+    k_norm._atom_sglang_dtype_patched = True
 
 
 def _patch_indexer_for_sglang_sparse_mla(attn: DeepseekV2MLAAttention) -> None:
@@ -112,6 +127,7 @@ def _patch_indexer_for_sglang_sparse_mla(attn: DeepseekV2MLAAttention) -> None:
         return
 
     import torch
+
     import atom.plugin.sglang.attention_backend.sparse_mla_indexer  # noqa: F401
 
     original_forward = indexer.forward
@@ -150,7 +166,7 @@ def _patch_indexer_for_sglang_sparse_mla(attn: DeepseekV2MLAAttention) -> None:
     indexer._atom_sglang_topk_buffer_patched = True
 
 
-def _align_qknorm_fusion_for_sglang(attn: "DeepseekV2MLAAttention") -> None:
+def _align_qknorm_fusion_for_sglang(attn: DeepseekV2MLAAttention) -> None:
     """Keep non-quant q/k norm fusion on the BF16 path in SGLang plugin mode."""
     if getattr(attn, "fuse_qknorm", False) and not getattr(
         attn, "fuse_qknorm_quant", False
