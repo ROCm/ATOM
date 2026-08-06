@@ -59,6 +59,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_TRITON_MLA_SHUFFLE_KV": lambda: (
         os.getenv("ATOM_USE_TRITON_MLA_SHUFFLE_KV", "0") == "1"
     ),
+    # Run the Kimi-K3 KDA prefill recurrence on aiter's
+    # aiter.ops.triton.kimi_delta_attn.chunk_kimi_delta_attn instead of
+    # fla.ops.kda.chunk_kda. Both consume the same packed varlen layout and the
+    # same V-first fp32 recurrent state, so this only swaps the kernel backend.
+    "ATOM_USE_AITER_KDA": lambda: os.getenv("ATOM_USE_AITER_KDA", "0") == "1",
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
     "ATOM_USE_TRITON_MOE_DECODE": lambda: os.getenv("ATOM_USE_TRITON_MOE_DECODE", "0")
     == "1",
