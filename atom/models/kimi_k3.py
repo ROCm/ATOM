@@ -958,36 +958,35 @@ class KimiKDAAttention(nn.Module):
         cu_seqlens: torch.Tensor | None,
         output_final_state: bool,
     ):
-        from fla.ops.kda import chunk_kda
+        from aiter.ops.triton.kimi_delta_attn import chunk_kimi_delta_attn
 
-        kwargs = {
-            "q": q,
-            "k": k,
-            "v": v,
-            "g": g,
-            # Keep beta in fp32: fla computes b = sigmoid(beta) in-kernel with
-            # use_beta_sigmoid_in_kernel, and triton's sigmoid follows the input
-            # dtype -- a bf16 beta yields a bf16 write strength, which erodes the
-            # delta-rule state update across the 71 KDA layers (measured gsm8k
-            # regression). b_proj stays bf16; only this reduction is widened.
-            "beta": beta.float(),
-            "A_log": self.A_log,
-            "dt_bias": self.dt_bias,
-            "initial_state": initial_state,
-            "output_final_state": output_final_state,
-            "use_qk_l2norm_in_kernel": True,
-            "use_gate_in_kernel": True,
-            "use_beta_sigmoid_in_kernel": True,
-            "safe_gate": self._kda_gate_lower_bound is not None,
-            "lower_bound": self._kda_gate_lower_bound,
-            "transpose_state_layout": True,
-            "cu_seqlens": cu_seqlens,
-        }
-        # FLA 0.5.1's default KDA recompute specialization is non-deterministic
-        # for long, packed gfx950 prefills and can emit extreme values. Selecting
-        # disable_recompute enables its STORE_QG specialization, which is stable
-        # and preserves the same chunk-KDA forward semantics.
-        return chunk_kda(**kwargs, disable_recompute=True)
+        return chunk_kimi_delta_attn(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            # Keep beta in fp32: the sigmoid b = sigmoid(beta) is applied
+            # in-kernel with use_beta_sigmoid_in_kernel, and triton's sigmoid
+            # follows the input dtype -- a bf16 beta yields a bf16 write
+            # strength, which erodes the delta-rule state update across the 71
+            # KDA layers (measured gsm8k regression). b_proj stays bf16; only
+            # this reduction is widened.
+            beta=beta.float(),
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=True,
+            use_gate_in_kernel=True,
+            use_beta_sigmoid_in_kernel=True,
+            safe_gate=self._kda_gate_lower_bound is not None,
+            lower_bound=self._kda_gate_lower_bound,
+            cu_seqlens=cu_seqlens,
+            # V-first state, matching the layout mamba_v_cache holds and the
+            # fused decode kernel writes. Without it the state comes back
+            # K-first and decode reads it transposed.
+            state_v_first=True,
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # hidden_states is a (fp8, scale) tuple when input_layernorm fused the
