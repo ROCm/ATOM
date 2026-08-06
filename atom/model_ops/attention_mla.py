@@ -294,6 +294,11 @@ class MLAAttention(nn.Module):
         # ==1 falls back to the original interleaved per-token (page_size=1)
         # kernels with an unpadded 576-wide q_out. The triton path never uses seg.
         self.use_seg_mla = (not self.use_triton_mla) and envs.ATOM_MLA_PAGE_SIZE > 1
+        # Only DSpark's bidirectional block drafter wants a non-causal decode.
+        # Plain serial MTP / eagle drafters stay causal (they also set
+        # context.is_draft), so gate the non-causal path on DSpark specifically.
+        _spec_cfg = get_current_atom_config().speculative_config
+        self.is_dspark = bool(_spec_cfg and _spec_cfg.use_dspark())
         if self.use_seg_mla:
             if envs.ATOM_MLA_PAGE_SIZE != _MLA_SEG_PAGE_SIZE:
                 raise RuntimeError(
@@ -1142,7 +1147,15 @@ class MLAAttention(nn.Module):
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: AttentionMetaData,
         return_lse: bool = False,
+        causal: bool = True,
     ) -> torch.Tensor:
+        # `causal` is True for the target (standard autoregressive decode) and
+        # False only for DSpark's bidirectional draft block, where every one of
+        # the T draft query positions must attend the whole block. The target
+        # MUST stay causal -- the asm decode kernel selects a different .co by
+        # the causal flag, so forcing causal=False here corrupts target output.
+        # Callers gate this on (context.is_draft and is_dspark): plain MTP/eagle
+        # drafters set is_draft too but must stay causal.
         assert kv_c_and_k_pe_cache.numel() > 0
         assert attn_metadata is not None
         B = q.shape[0]
@@ -1182,6 +1195,9 @@ class MLAAttention(nn.Module):
                 self.scale,
                 self.kv_lora_rank,
                 self.qk_rope_head_dim,
+                # Triton shuffle path stays causal: the gfx1250 gluon kernel
+                # asserts causal, and the DSpark non-causal block runs on the
+                # asm seg path, not here.
                 True,  # causal
                 # q is bf16 (the shuffled fused write does not quantize q), so
                 # no q de-scale; kv carries its own per-tensor scale.
@@ -1335,6 +1351,7 @@ class MLAAttention(nn.Module):
                 g_kv_indptr=g_kv_indptr,
                 cp_world_size=cp_world_size,
                 cp_rank=cp_rank,
+                causal=causal,
             )
 
         o = self._restore_query_heads(o, num_heads_q)
@@ -1618,14 +1635,23 @@ class MLAAttention(nn.Module):
                 # then combine partial outputs across ranks (AG LSE + correct + RS).
                 q_out = self.dcp_group.all_gather(q_out, dim=1)
                 o, lse = self._forward_decode(
-                    q_out, kv_cache, attn_metadata, return_lse=True
+                    q_out,
+                    kv_cache,
+                    attn_metadata,
+                    return_lse=True,
+                    causal=not (context.is_draft and self.is_dspark),
                 )
                 from atom.model_ops.dcp_ops import cp_lse_ag_out_rs
 
                 o = cp_lse_ag_out_rs(o, lse, self.dcp_group, ctx=self._cp_triton_ctx)
                 output = self._v_up_proj_and_o_proj(o)
             else:
-                output = self._forward_decode(q_out, kv_cache, attn_metadata)
+                output = self._forward_decode(
+                    q_out,
+                    kv_cache,
+                    attn_metadata,
+                    causal=not (context.is_draft and self.is_dspark),
+                )
 
         return output
 
