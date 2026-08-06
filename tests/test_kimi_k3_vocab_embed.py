@@ -55,34 +55,36 @@ def _k3_text_config(**overrides):
 # ── the gate ──────────────────────────────────────────────────────────────
 
 
-def test_kimi_k3_replicates_by_default():
-    assert use_replicated_vocab_embed(_k3_text_config()) is True
+def test_kimi_k3_shards_until_asked_otherwise():
+    # Unlike GLM-5.2, K3 does not ride the master switch: no end-to-end number
+    # yet, and the table it would replicate is the largest ATOM replicates.
+    assert use_replicated_vocab_embed(_k3_text_config()) is False
     # Root config too — served through the multimodal wrapper.
-    assert use_replicated_vocab_embed(_k3_text_config(model_type="kimi_k3")) is True
+    assert use_replicated_vocab_embed(_k3_text_config(model_type="kimi_k3")) is False
 
 
 @pytest.mark.parametrize(
-    ("master", "override", "expected"),
+    ("master", "opt_in", "expected"),
     [
-        (None, None, True),  # default: replicated
-        (None, "0", False),  # family pinned off, master untouched
-        ("0", None, False),  # master off disables K3 as well
-        ("0", "1", True),  # family pinned on over a disabled master
-        ("1", "0", False),  # family override beats an enabled master
+        (None, None, False),  # default: sharded
+        (None, "1", True),  # opted in
+        (None, "0", False),  # explicitly off reads the same as unset
+        ("0", "1", False),  # the master switch is still a global off
+        ("1", "1", True),
     ],
 )
-def test_kimi_k3_override_pins_the_family(monkeypatch, master, override, expected):
+def test_kimi_k3_opt_in(monkeypatch, master, opt_in, expected):
     if master is not None:
         monkeypatch.setenv(_MASTER, master)
-    if override is not None:
-        monkeypatch.setenv(_K3, override)
+    if opt_in is not None:
+        monkeypatch.setenv(_K3, opt_in)
     assert use_replicated_vocab_embed(_k3_text_config()) is expected
 
 
-def test_kimi_k3_override_leaves_other_families_alone(monkeypatch):
-    # The K3 knob exists precisely so K3 can be turned off without moving
-    # GLM-5.2 (validated) off the replicated path, or a plain DeepSeek onto it.
-    monkeypatch.setenv(_K3, "0")
+def test_kimi_k3_opt_in_leaves_other_families_alone(monkeypatch):
+    # The K3 knob exists precisely so K3 can be moved without moving GLM-5.2
+    # (validated) off the replicated path, or a plain DeepSeek onto it.
+    monkeypatch.setenv(_K3, "1")
     glm = SimpleNamespace(model_type="glm_moe_dsa", tie_word_embeddings=False)
     ds = SimpleNamespace(model_type="deepseek_v3", tie_word_embeddings=False)
     assert use_replicated_vocab_embed(glm) is True

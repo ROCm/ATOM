@@ -490,8 +490,8 @@ class KimiK3DSpark(nn.Module):
     #     embeds, and would need a GSM8K acceptance-length re-validation. The
     #     target's is shared instead (share_with_target), which is also how vLLM
     #     wires it (load_dspark_model, driven by has_own_embed_tokens=False on the
-    #     plugin wrapper), and the target's table is replicated per rank by
-    #     default (use_replicated_vocab_embed) so that shared lookup carries no
+    #     plugin wrapper), and the target's table can be replicated per rank
+    #     (ATOM_KIMI_K3_REPLICATE_VOCAB_EMBED) so that shared lookup carries no
     #     TP collective.
     skip_weight_prefixes: ClassVar[list[str]] = [
         "confidence_head.",
@@ -550,9 +550,9 @@ class KimiK3DSpark(nn.Module):
         The vocabularies must agree or the shared LM head would silently score
         the wrong rows.
 
-        The draft inherits whichever embedding the target built -- replicated
-        (collective-free, the default) or TP-sharded -- so there is nothing to
-        gate here; ``use_replicated_vocab_embed`` decides for both. The check
+        The draft inherits whichever embedding the target built -- TP-sharded
+        (the default) or replicated and collective-free -- so there is nothing
+        to gate here; ``use_replicated_vocab_embed`` decides for both. The check
         below compares ``num_embeddings``, the LOGICAL vocab, which both classes
         expose, so it does not care that a replicated table's weight is ``tp``
         times taller than a shard's.

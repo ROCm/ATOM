@@ -220,27 +220,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_REPLICATE_VOCAB_EMBED": lambda: (
         os.getenv("ATOM_REPLICATE_VOCAB_EMBED", "1") == "1"
     ),
-    # Kimi-K3-only override for ATOM_REPLICATE_VOCAB_EMBED. Unset (the default)
-    # follows the master switch, i.e. K3 replicates; "0"/"1" pin this family alone
-    # and leave GLM-5.2 / the EAGLE3 drafts on the master switch.
+    # Kimi-K3 opt-in for the above. K3 does NOT follow the master switch: it is
+    # the one family whose replication has not been measured end to end, so it
+    # is off until asked for, and ATOM_REPLICATE_VOCAB_EMBED=0 still switches it
+    # off globally along with everyone else.
     #
-    # K3 gets its own knob because it is the one family where replication is
-    # enabled WITHOUT having been measured on GPU (see use_replicated_vocab_embed
-    # in deepseek_v2.py). It was turned on for the Kimi-K3 DSpark draft, which
-    # embeds a bs x num_speculative_tokens block through the TARGET's table on
-    # every drafting step and so pays the post-embed all-reduce twice per engine
-    # step (once drafting, once verifying). The lookup is bit-identical either
-    # way, but K3's table is the largest ATOM replicates: 163840 x 7168 bf16 =
-    # 2.1875 GiB, i.e. +1.914 GiB per rank at TP8 over the 1/8 shard, taken out of
-    # the KV budget. That is ~3.4% of the 55.74 GiB KV pool the benchmarked TP8
-    # `--gpu-memory-utilization 0.93` config leaves, which is ~10x oversized for
-    # its own `--max-num-seqs 64`; on a deployment tuned for maximum context this
-    # is the switch to turn off, without also disturbing the families that were
-    # validated.
+    # Worth asking for on a DSpark deployment: the draft embeds a
+    # bs x num_speculative_tokens block through the TARGET's table on every
+    # drafting step, so the sharded path pays the post-embed all-reduce twice per
+    # engine step (once drafting, once verifying), and the replicated lookup is
+    # bit-identical to it. What it costs is memory, and K3's table is the largest
+    # ATOM replicates: 163840 x 7168 bf16 = 2.1875 GiB, i.e. +1.914 GiB per rank
+    # at TP8 over the 1/8 shard, taken out of the KV budget -- ~3.4% of the
+    # 55.74 GiB KV pool the benchmarked TP8 `--gpu-memory-utilization 0.93`
+    # config leaves. Cheap where the pool is oversized for --max-num-seqs, not
+    # cheap on a deployment tuned for maximum context.
     "ATOM_KIMI_K3_REPLICATE_VOCAB_EMBED": lambda: (
-        None
-        if os.getenv("ATOM_KIMI_K3_REPLICATE_VOCAB_EMBED") is None
-        else os.getenv("ATOM_KIMI_K3_REPLICATE_VOCAB_EMBED") == "1"
+        os.getenv("ATOM_KIMI_K3_REPLICATE_VOCAB_EMBED", "0") == "1"
     ),
     "ATOM_ENABLE_GDN_DECODE_LOSSY_FAST": lambda: (
         os.getenv("ATOM_ENABLE_GDN_DECODE_LOSSY_FAST", "0").lower() == "1"

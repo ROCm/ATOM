@@ -79,8 +79,8 @@ gate.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| **ATOM_REPLICATE_VOCAB_EMBED** | bool | 1 (true) | Master switch. Applies to the EAGLE3 draft head, GLM-5.2 (`glm_moe_dsa`) target + MTP draft, and Kimi-K3. Set to `0` to fall back to `VocabParallelEmbedding` everywhere. |
-| **ATOM_KIMI_K3_REPLICATE_VOCAB_EMBED** | bool | unset (= follow `ATOM_REPLICATE_VOCAB_EMBED`) | Kimi-K3-only override, so this family can be pinned without disturbing the others. Replication also removes the collective from the Kimi-K3 DSpark drafting step, since the draft shares the target's table. K3's table is the largest ATOM replicates (163840 x 7168 bf16 = 2.1875 GiB, i.e. +1.914 GiB/rank at TP8, taken from the KV budget) and this family's replication has **not been GPU-validated**; set to `0` on deployments tuned for maximum context. |
+| **ATOM_REPLICATE_VOCAB_EMBED** | bool | 1 (true) | Master switch. Applies to the EAGLE3 draft head and the GLM-5.2 (`glm_moe_dsa`) target + MTP draft, and gates the Kimi-K3 opt-in below. Set to `0` to fall back to `VocabParallelEmbedding` everywhere. |
+| **ATOM_KIMI_K3_REPLICATE_VOCAB_EMBED** | bool | 0 (false) | Kimi-K3 opt-in, separate from the master switch because this family has no end-to-end number yet. Worth enabling on a DSpark deployment: the draft shares the target's table and embeds a block through it on every drafting step, so replication removes one all-reduce per drafting step on top of the one per model step, bit-identically. Costs the largest table ATOM replicates — 163840 x 7168 bf16 = 2.1875 GiB, i.e. +1.914 GiB/rank at TP8 out of the KV budget (~3.4% of the pool the benchmarked TP8 config leaves). |
 
 ## Fusion passes
 

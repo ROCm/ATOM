@@ -2829,17 +2829,17 @@ def use_replicated_vocab_embed(config: PretrainedConfig) -> bool:
     ``SpeculativeConfig.hf_config_override``) but still carries the GLM-only
     ``index_share_for_mtp_iteration`` flag, so we detect either.
 
-    Also enabled for **Kimi-K3** (root ``model_type == "kimi_k3"``, text config
-    ``"kimi_linear"``), which satisfies the same preconditions —
+    Available, but **opt-in**, for **Kimi-K3** (root ``model_type == "kimi_k3"``,
+    text config ``"kimi_linear"``). It satisfies the same preconditions —
     ``tie_word_embeddings=False``, a separate ``ParallelLMHead`` that stays
     sharded, no quantization on the embedding, nothing reading the embed weight's
     shape — and additionally feeds the Kimi-K3 DSpark draft, whose
     ``share_with_target`` (native) / ``load_dspark_model`` (vLLM) binds the
     draft's ``embed_tokens`` to *this* module, so replicating here removes the
-    collective from the drafting step as well as the model step.
-    ``ATOM_KIMI_K3_REPLICATE_VOCAB_EMBED`` overrides this family alone, because
-    unlike GLM-5.2 and the EAGLE3 drafts **K3 replication has not been validated
-    on GPU** and its table is the largest ATOM replicates (+1.914 GiB/rank at
+    collective from the drafting step as well as the model step. It needs
+    ``ATOM_KIMI_K3_REPLICATE_VOCAB_EMBED=1`` rather than riding the master switch
+    because, unlike GLM-5.2 and the EAGLE3 drafts, this family has no end-to-end
+    number yet and its table is the largest ATOM replicates (+1.914 GiB/rank at
     TP8, out of the KV budget).
 
     Rejected alternative for the DSpark draft: give it its own
@@ -2855,13 +2855,10 @@ def use_replicated_vocab_embed(config: PretrainedConfig) -> bool:
     if getattr(config, "tie_word_embeddings", False):
         return False
     model_type = getattr(config, "model_type", None)
-    if model_type in ("kimi_k3", "kimi_linear"):
-        override = envs.ATOM_KIMI_K3_REPLICATE_VOCAB_EMBED
-        if override is not None:
-            return override
-        return envs.ATOM_REPLICATE_VOCAB_EMBED
     if not envs.ATOM_REPLICATE_VOCAB_EMBED:
         return False
+    if model_type in ("kimi_k3", "kimi_linear"):
+        return envs.ATOM_KIMI_K3_REPLICATE_VOCAB_EMBED
     return model_type == "glm_moe_dsa" or bool(
         getattr(config, "index_share_for_mtp_iteration", False)
     )

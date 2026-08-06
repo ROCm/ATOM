@@ -1175,11 +1175,12 @@ class KimiLinearModel(nn.Module):
                 # drafting step on top of the one per model step. Both disappear
                 # here, and the draft needs no code of its own.
                 #
-                # Costs (tp-1)/tp of the table per rank -- 2.1875 GiB replicated,
-                # so +1.914 GiB/rank at TP8 -- taken out of the KV pool. See
-                # ATOM_KIMI_K3_REPLICATE_VOCAB_EMBED for the escape hatch and
-                # use_replicated_vocab_embed for why this is bit-identical to the
-                # sharded path (and why the draft does not load its own table).
+                # Opt-in (ATOM_KIMI_K3_REPLICATE_VOCAB_EMBED), because it costs
+                # (tp-1)/tp of the table per rank -- 2.1875 GiB replicated, so
+                # +1.914 GiB/rank at TP8 -- taken out of the KV pool. See
+                # use_replicated_vocab_embed for why the lookup is bit-identical
+                # to the sharded path (and why the draft does not load its own
+                # table).
                 self.embed_tokens = ReplicatedEmbedding(
                     config.vocab_size, config.hidden_size
                 )
