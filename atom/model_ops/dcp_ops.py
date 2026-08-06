@@ -294,9 +294,9 @@ def get_dcp_local_seq_lens(seq_lens, dcp_size, dcp_rank, interleave_size=1):
 
 
 # ---------------------------------------------------------------------------
-# Deterministic global top-k over exchanged DCP candidates (DCP_Sparse_MLA.md
-# 6.1). Replaces "all-gather the full logit plane" with "all-gather W*topk
-# (score, global_id) candidates" on the decode indexer path.
+# Deterministic global top-k over exchanged DCP candidates. Replaces "all-gather
+# the full logit plane" with "all-gather W*topk (score, global_id) candidates" on
+# the decode indexer path.
 #
 # Every rank runs the merge independently, so the selection must be a *function*
 # of its input, not merely "usually the same": an ambiguous choice resolved
@@ -396,9 +396,7 @@ def _dcp_stable_topk_kernel(
         m = cols < n
         sc = tl.load(scores + sbase + cols, mask=m, other=-float("inf"))
         g = tl.load(gids + gbase + cols, mask=m, other=-1)
-        take = m & (g >= 0) & (
-            (sc > t) | ((sc == t) & finite_t & (g <= g_thr))
-        )
+        take = m & (g >= 0) & ((sc > t) | ((sc == t) & finite_t & (g <= g_thr)))
         ti = take.to(tl.int32)
         dst = written + tl.cumsum(ti, 0) - ti
         tl.store(out + obase + dst, g, mask=take & (dst < k))
@@ -434,15 +432,33 @@ def dcp_stable_topk(scores, gids, k, out=None):
     # the deterministic tie-break. A from-scratch Triton radix-select measured
     # 524 us against a ~26.9 us/pass memory floor (6.1.5).
     topk_plain(
-        scores, idx_buf, val_buf, k, True, row_starts, row_ends,
-        scores.stride(0), 1,
+        scores,
+        idx_buf,
+        val_buf,
+        k,
+        True,
+        row_starts,
+        row_ends,
+        scores.stride(0),
+        1,
     )
     thr = val_buf.min(dim=-1).values
 
     _dcp_stable_topk_kernel[(rows,)](
-        scores, gids, thr, out, tie_buf, overflow, k, n,
-        scores.stride(0), gids.stride(0), out.stride(0),
-        BLOCK=1024, CAP=DCP_TOPK_TIE_CAP, num_warps=8,
+        scores,
+        gids,
+        thr,
+        out,
+        tie_buf,
+        overflow,
+        k,
+        n,
+        scores.stride(0),
+        gids.stride(0),
+        out.stride(0),
+        BLOCK=1024,
+        CAP=DCP_TOPK_TIE_CAP,
+        num_warps=8,
     )
     return out, overflow
 
@@ -465,9 +481,7 @@ def dcp_pack_topk_candidates(
     valid = (local_idx >= 0) & (local_idx < local_lens.view(rows, 1))
     safe = torch.where(valid, local_idx, torch.zeros_like(local_idx))
     sc = torch.gather(local_logits, 1, safe.to(torch.int64))
-    out_pair[0].copy_(
-        torch.where(valid, sc, torch.full_like(sc, -float("inf")))
-    )
+    out_pair[0].copy_(torch.where(valid, sc, torch.full_like(sc, -float("inf"))))
     gid = torch.where(
         valid,
         local_idx * dcp_world_size + dcp_rank,

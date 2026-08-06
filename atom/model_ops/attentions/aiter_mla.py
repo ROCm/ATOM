@@ -264,8 +264,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 device=self.device,
             )
             # DCP sparse decode compacts each rank's owned top-k slots to the
-            # front (no -1 holes -- see DCP/DCP_Sparse_MLA.md ch.5), so the
-            # per-request region length becomes data- AND layer-dependent. These
+            # front (no -1 holes), so the per-request region length becomes data-
+            # AND layer-dependent. These
             # hold the recomputed (per-layer) offsets; the layer-invariant
             # var["sparse_kv_indptr"] stays as-is for the non-DCP paths.
             self._dcp_sparse_kv_indptr_gpu = torch.zeros(
@@ -971,12 +971,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         )
 
     def _build_dcp_indexer_prefill_meta(self, attn_metadata, bs: int, counts, var):
-        """Metadata for the DCP sparse-prefill indexer gather (DCP_Sparse_MLA §5.5, P1).
+        """Metadata for the DCP sparse-prefill indexer gather.
 
         The indexer scores against the WHOLE sequence, but under DCP each rank's
         index cache holds only the round-robin 1/W shard. The fix mirrors the
-        decode-side b2-logits (§2.2): gather the local shard with *local*
-        cu_seqlens, all-gather it, then de-interleave back to global order.
+        decode side: gather the local shard with *local* cu_seqlens, all-gather
+        it, then de-interleave back to global order.
 
         Two products, both rank-independent in shape so the all-gather is a plain
         concat:
@@ -1011,9 +1011,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         # Position within its sequence for every global KV token.
         pos = np.arange(total_kv, dtype=np.int64) - np.repeat(g_cu[:bs], g_lens)
-        src = (
-            (pos % W) * local_total + np.repeat(cu_pad[:bs], g_lens) + pos // W
-        )
+        src = (pos % W) * local_total + np.repeat(cu_pad[:bs], g_lens) + pos // W
 
         dev = self.device
         attn_metadata.dcp_indexer_local_total = local_total
@@ -1092,9 +1090,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 sum_scheduled_tokens + 1
             )
             if self.dcp_world_size > 1:
-                self._build_dcp_indexer_prefill_meta(
-                    attn_metadata, bs, counts, var
-                )
+                self._build_dcp_indexer_prefill_meta(attn_metadata, bs, counts, var)
             get_mla_metadata_v1(
                 attn_metadata.sparse_cu_seqlens_q,
                 attn_metadata.sparse_kv_indptr,

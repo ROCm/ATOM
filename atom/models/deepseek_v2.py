@@ -1484,9 +1484,9 @@ def sparse_attn_indexer(
             # plain gather below would silently return a 1/W-long prefix of
             # garbage. Gather the local shard with LOCAL cu_seqlens (the gather's
             # own slot formula, block_table[j//bs]*bs + j%bs, is exactly the
-            # round-robin write layout -- see DCP_Sparse_MLA.md §5.5.2/§5.5.6),
-            # all-gather it, then de-interleave back to global order. Structurally
-            # identical to the decode-side b2-logits (§2.2), object is k not logits.
+            # round-robin write layout), all-gather it, then de-interleave back to
+            # global order -- the same local-shard + all-gather the decode path
+            # uses, on k rather than logits.
             local_total = prefill_metadata.dcp_indexer_local_total
             k_fp8_local = torch.empty(
                 [local_total, head_dim], device=k.device, dtype=dtypes.fp8
@@ -1594,11 +1594,11 @@ def sparse_attn_indexer(
             )
         if get_dcp_world_size() > 1:
             # DCP: topk_indices hold GLOBAL flat KV indices (the indexer scored the
-            # full sequence via the all-gathered k, P1 above). Keep only the
-            # positions this rank owns (pos % W == r), map them through the
-            # round-robin virtual-block layout, and COMPACT them to the front --
-            # the same treatment the decode path gets (§4.6), with the row unit
-            # being a query token instead of a request. See §5.5.5 (P2).
+            # full sequence via the all-gathered k). Keep only the positions this
+            # rank owns (pos % W == r), map them through the round-robin
+            # virtual-block layout, and COMPACT them to the front -- the same
+            # treatment the decode path gets, with the row unit being a query token
+            # instead of a request.
             triton_filter_and_convert_dcp_index_prefill(
                 attn_metadata.sparse_kv_indptr,
                 attn_metadata.token_to_seq_idxs,
@@ -1643,21 +1643,21 @@ def sparse_attn_indexer(
         dcp_world_size = get_dcp_world_size()
         logits = None
         if dcp_world_size > 1:
-            # DCP candidate exchange (DCP_Sparse_MLA.md §6.1): each rank holds
-            # only 1/W of the KV (index_cache is sharded, same slot_mapping as
-            # the main KV). Score the LOCAL shard — block_tables already point at
-            # it, so only context_lens must be localized — take a LOCAL top-k,
-            # and all-gather just the W*topk (score, global_id) candidates. A
-            # token in the global top-K is necessarily in its own rank's local
-            # top-K (§2.4), so the merge is lossless.
+            # DCP candidate exchange: each rank holds only 1/W of the KV
+            # (index_cache is sharded, same slot_mapping as the main KV). Score
+            # the LOCAL shard — block_tables already point at it, so only
+            # context_lens must be localized — take a LOCAL top-k, and all-gather
+            # just the W*topk (score, global_id) candidates. A token in the global
+            # top-K is necessarily in its own rank's local top-K, so the merge is
+            # lossless.
             #
-            # This replaces the earlier b2-logits path, which all-gathered the
-            # whole logit plane. That plane is `max_model_len`-wide, not ctx-wide
+            # This replaces the earlier path, which all-gathered the whole logit
+            # plane. That plane is `max_model_len`-wide, not ctx-wide
             # — CUDAGraph captures the collective at a static size, and ctx moves
             # every step — so it shipped rows*1M*4 bytes per layer at ANY context
-            # length (measured 4764 us/layer at rows=512, §6.1.7). The candidate
-            # set is ctx-independent by construction, so it stays static without
-            # bucketing the graph by ctx.
+            # length (measured 4764 us/layer at rows=512). The candidate set is
+            # ctx-independent by construction, so it stays static without bucketing
+            # the graph by ctx.
             assert attn_metadata.max_seqlen_q == 1, (
                 "DCP + DeepSeek-V3.2 sparse indexer (DSA) currently supports "
                 "qlen=1 decode only (MTP verify is Phase 2)."
@@ -1729,9 +1729,9 @@ def sparse_attn_indexer(
             )
             n_cand = dcp_world_size * k_loc
             # Rank is the outer dim after all-gather but the merge wants it on
-            # the candidate dim. Selection is provably order-independent
-            # (§6.1.6), so any consistent permutation works — but scores and gids
-            # must use the SAME one.
+            # the candidate dim. Selection is provably order-independent, so any
+            # consistent permutation works — but scores and gids must use the
+            # SAME one.
             gathered_sc = (
                 recv[:, 0].permute(1, 0, 2).reshape(num_rows, n_cand).contiguous()
             )
@@ -1789,9 +1789,8 @@ def sparse_attn_indexer(
             # tokens (p % W == r), de-interleave (p // W), map to the local
             # main-KV slot, and COMPACT them to the front -- non-owned positions
             # are dropped, not marked with -1, because holes break aiter's lse
-            # output (DCP/DCP_Sparse_MLA.md ch.4-5). The compacted per-request
-            # lengths are written into dcp_sparse_kv_indptr_buffer for this
-            # layer's attention to consume.
+            # output. The compacted per-request lengths are written into
+            # dcp_sparse_kv_indptr_buffer for this layer's attention to consume.
             triton_filter_and_convert_dcp_index(
                 attn_metadata.cu_seqlens_q,
                 attn_metadata.g_kv_indptr,
@@ -2247,15 +2246,15 @@ class Indexer(nn.Module):
         # current token, so those ranks skip it entirely and leave q_fp8 /
         # weights_out uninitialized. Only the owner rank ends up with a valid
         # query -- invisible while ctx <= index_topk (top-k selects everything
-        # anyway), garbage beyond it. See DCP/DCP_Sparse_MLA.md §5.2.
+        # anyway), garbage beyond it.
         #
         # This routing was previously rejected because the unfused path was 23pp
-        # worse (gsm8k 20-shot 0.9439 -> 0.7157 at dcp=1, §5.3). That was a real
-        # bug, since fixed: LayerNorm held its weight/bias in fp32 while `k` is
-        # bf16, and the aiter kernel reads them at the input dtype. With the cast
-        # in layernorm.py the gap is gone (0.9416 vs 0.9439, within noise), so DCP
+        # worse (gsm8k 20-shot 0.9439 -> 0.7157 at dcp=1). That was a real bug,
+        # since fixed: LayerNorm held its weight/bias in fp32 while `k` is bf16,
+        # and the aiter kernel reads them at the input dtype. With the cast in
+        # layernorm.py the gap is gone (0.9416 vs 0.9439, within noise), so DCP
         # can take the clean route and the index-cache scratch slot that used to
-        # work around the fused op is no longer needed (§5.7 item A).
+        # work around the fused op is no longer needed.
         dcp = get_dcp_world_size() > 1
         positions_op = positions
         if (not self.use_qk_rope_cache_fusion) or pcp or dcp:

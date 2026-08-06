@@ -33,9 +33,11 @@ def build_case(g_ctxs, max_blocks, seed):
 
     # Physical blocks are deliberately shuffled so a wrong slot formula cannot
     # accidentally match a "logical == physical" identity mapping.
-    block_table = torch.randperm(bs * max_blocks, generator=gen)[
-        : bs * max_blocks
-    ].reshape(bs, max_blocks).to(torch.int32)
+    block_table = (
+        torch.randperm(bs * max_blocks, generator=gen)[: bs * max_blocks]
+        .reshape(bs, max_blocks)
+        .to(torch.int32)
+    )
 
     token_indices = torch.full((bs, K), -1, dtype=torch.int32)
     for b, g in enumerate(g_ctxs):
@@ -57,7 +59,9 @@ def reference(g_ctxs, block_table, token_indices, rank):
             if tok < 0 or tok % W != rank:
                 continue
             vbs = BLOCK_SIZE * W
-            slots.append(int(block_table[b, tok // vbs]) * BLOCK_SIZE + (tok % vbs) // W)
+            slots.append(
+                int(block_table[b, tok // vbs]) * BLOCK_SIZE + (tok % vbs) // W
+            )
         out.append(slots)
     return out
 
@@ -101,9 +105,9 @@ def run_case(name, g_ctxs, seed=0):
         # (2) lengths
         for b in range(bs):
             got_len = indptr[b + 1] - indptr[b]
-            assert got_len == len(exp[b]), (
-                f"[{name}] rank{rank} req{b}: length {got_len} != {len(exp[b])}"
-            )
+            assert got_len == len(
+                exp[b]
+            ), f"[{name}] rank{rank} req{b}: length {got_len} != {len(exp[b])}"
         # (1) values and order
         for b in range(bs):
             got = out_buf[indptr[b] : indptr[b + 1]].cpu().tolist()

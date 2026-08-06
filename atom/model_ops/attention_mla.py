@@ -1066,7 +1066,7 @@ class MLAAttention(nn.Module):
                 # The indexer compacted this rank's owned candidates to the front
                 # of each query token's region, so the region lengths are the
                 # per-rank (and per-layer) ones, not the global sparse_kv_indptr.
-                # Same substitution the decode path makes. See §5.5.5 (P2/P3).
+                # Same substitution the decode path makes.
                 #
                 # MUST be sliced, unlike the decode path: mla_prefill_asm_fwd
                 # derives its grid from `kv_indptr->size(0) - 1`
@@ -1087,8 +1087,8 @@ class MLAAttention(nn.Module):
                 page_size = 1
             # `mla_prefill_asm_fwd` NEVER writes its LSE output: aiter allocates
             # attn_lse with torch.empty and hands the uninitialized buffer straight
-            # back (verified with a sentinel probe, DCP_Sparse_MLA.md §5.5.9 --
-            # 80/80 entries untouched). So whenever an LSE is required, route
+            # back (verified with a sentinel probe -- entries left untouched). So
+            # whenever an LSE is required, route
             # through the decode kernel instead. That is sound for sparse prefill
             # because it runs max_q_len=1: every query token is already its own row
             # with its own candidate list, i.e. structurally a decode. The fp8 path
@@ -1114,8 +1114,8 @@ class MLAAttention(nn.Module):
                     # lets aiter pick, and several of its dispatch branches key on
                     # `num_kv_splits == 1`, which sends stage2 down the FINAL_OUT
                     # copy-through path that NEVER stores Final_lse -- handing back
-                    # an untouched torch.empty as the LSE (the same trap as §4.4
-                    # and as the asm-prefill LSE bug). Keep it > 1 so stage2 stays
+                    # an untouched torch.empty as the LSE (the same trap as the
+                    # asm-prefill LSE bug). Keep it > 1 so stage2 stays
                     # on the reduce path that writes the LSE.
                     num_kv_splits=max(2, 16 // max(1, self.dcp_world_size)),
                     sm_scale=self.scale,
@@ -1182,7 +1182,7 @@ class MLAAttention(nn.Module):
             if self.is_sparse_mla and self.dcp_world_size > 1:
                 # Rows this rank owns no candidate of (unavoidable at prefill:
                 # query token 0 has a single candidate, so W-1 ranks are empty for
-                # it -- §5.5.8) get a zero-length KV region. mla_decode_fwd handles
+                # it) get a zero-length KV region. mla_decode_fwd handles
                 # that correctly for the LSE (-inf, i.e. zero weight downstream)
                 # but leaves `o` as NaN from the 0/0 in acc/e_sum. Zero those rows:
                 # cp_lse_ag_out_rs computes `o * exp(lse - global_lse)`, and
@@ -1327,7 +1327,7 @@ class MLAAttention(nn.Module):
                         # DCP compacts each rank's owned top-k to the front, so
                         # the region length is shorter than the global clip and
                         # varies per layer. The indexer just rewrote these
-                        # offsets for this layer (§5.3).
+                        # offsets for this layer.
                         paged_kv_indptr = self.dcp_sparse_kv_indptr_buffer
 
             dp_size = get_dp_group().world_size
@@ -1336,14 +1336,13 @@ class MLAAttention(nn.Module):
                 use_persistent_mode = False
             if self.dcp_world_size > 1 and not self.dcp_persistent_supported:
                 use_persistent_mode = False
-            # sparse + DCP compacts the per-rank top-k (§5.1), which makes the
-            # sparse region length depend on the *per-layer* selection. The
-            # persistent work/reduce metadata is built once per step from
-            # sparse_kv_indptr (aiter_mla.set_mla_persistent_worker_buffers), so
-            # it cannot describe a length that changes layer to layer -- the
-            # timing simply does not line up. Run non-persistent until either the
-            # metadata build moves per-layer or aiter grows a per-request valid
-            # length (§5.5).
+            # sparse + DCP compacts the per-rank top-k, which makes the sparse
+            # region length depend on the *per-layer* selection. The persistent
+            # work/reduce metadata is built once per step from sparse_kv_indptr
+            # (aiter_mla.set_mla_persistent_worker_buffers), so it cannot describe
+            # a length that changes layer to layer -- the timing simply does not
+            # line up. Run non-persistent until either the metadata build moves
+            # per-layer or aiter grows a per-request valid length.
             if self.is_sparse_mla and self.dcp_world_size > 1:
                 use_persistent_mode = False
 
@@ -1380,7 +1379,7 @@ class MLAAttention(nn.Module):
             num_kv_splits = (
                 16 if use_persistent_mode else max(1, 16 // self.dcp_world_size)
             )
-            # NOTE (§5.2): sparse + DCP used to force num_kv_splits=1 here, because
+            # NOTE: sparse + DCP used to force num_kv_splits=1 here, because
             # a -1-padded fixed-length region made aiter's stage2 believe every
             # split held tokens and one of them could be all sentinels -> NaN. That
             # forcing then hit a second problem: num_kv_splits==1 sends aiter's
@@ -1726,33 +1725,16 @@ class MLAAttention(nn.Module):
 
             if context.is_prefill:
                 if self.is_sparse_mla and self.dcp_world_size > 1:
-                    # DCP sparse prefill: the indexer left each rank with a
-                    # DISJOINT slice of the global top-k (§5.5.5 P2), so this is
-                    # a partial softmax that must be merged exactly like decode.
-                    # Legal because sparse prefill runs max_q_len=1 -- every query
-                    # token is its own row with its own candidate list, and the
-                    # causal window was already applied when the candidates were
-                    # chosen, so no global-position masking is needed (§5.5.6 ③).
+                    # DCP sparse prefill: each rank holds a disjoint slice of the
+                    # global top-k, so merge partials like decode.
                     from atom.model_ops.dcp_ops import cp_lse_ag_out_rs
 
                     q_out = self.dcp_group.all_gather(q_out, dim=1)
                     o, lse = self._forward_prefill_mla(
                         q_out, kv_cache, attn_metadata, return_lse=True
                     )
-                    # cp_lse_ag_out_rs accumulates in the tensor dtype: the
-                    # per-rank correction stores bf16 and the ReduceScatter sums W
-                    # partials in bf16. Chained over 78 prefill layers (and worse
-                    # with fp8 KV), that bf16 cross-rank sum is the dominant merge
-                    # error, so run the prefill merge in fp32 (o.float() keeps the
-                    # corrected partials fp32 through the ReduceScatter) and cast
-                    # back. Only the merge collective doubles in bytes; KV/weights
-                    # are untouched. Decode merge stays bf16 (validated fine).
-                    #
-                    # ctx=None (not the persistent self._cp_triton_ctx): prefill
-                    # runs variable-length shapes and the persistent-context kernel
-                    # reuse corrupts the fp32 merge here (gsm8k 0.66 vs 0.95 with a
-                    # fresh context). ctx=None re-enters Triton's own JIT cache, so
-                    # it is correct and cheap -- prefill is not the decode hot path.
+                    # Merge in fp32: the bf16 ReduceScatter sum dominates the accuracy
+                    # regression under fp8 KV.
                     o = cp_lse_ag_out_rs(o.float(), lse, self.dcp_group, ctx=None).to(
                         o.dtype
                     )
@@ -1984,8 +1966,7 @@ def _compact_filter_dcp_kernel(
     # via all-gathered logits). This rank keeps ONLY the positions it owns and
     # writes them COMPACTED to the front of its region -- no -1 holes. Holes are
     # exactly what breaks aiter's lse path (immediate fault on the persistent
-    # kernel, silently unwritten lse on the split-KV one); see
-    # DCP/DCP_Sparse_MLA.md §4.11/§4.13.
+    # kernel, silently unwritten lse on the split-KV one).
     #
     # Compaction is order-preserving (tl.cumsum within a tile plus a running
     # offset across tiles) rather than atomic-allocated like vLLM, so the KV
@@ -2059,11 +2040,11 @@ def triton_filter_and_convert_dcp_index(
     Non-owned positions are **dropped**, not marked: the kept slots are packed
     contiguously (original top-k order preserved) and ``out_kv_indptr`` is
     rewritten to the resulting per-request lengths. This replaces the earlier
-    "fixed length + -1 sentinel" layout, whose holes broke aiter's lse output
-    (see DCP/DCP_Sparse_MLA.md ch.4-5). Because the kept count depends on the
-    per-layer top-k selection, ``out_kv_indptr`` is layer-dependent and must be
-    recomputed on every call -- it cannot feed the once-per-step persistent
-    metadata, which is why sparse+DCP runs non-persistent for now (§5.1).
+    "fixed length + -1 sentinel" layout, whose holes broke aiter's lse output.
+    Because the kept count depends on the per-layer top-k selection,
+    ``out_kv_indptr`` is layer-dependent and must be recomputed on every call --
+    it cannot feed the once-per-step persistent metadata, which is why sparse+DCP
+    runs non-persistent for now.
 
     The 8 ranks' kept sets are disjoint and their union is exactly the global
     top-k, which is what makes the downstream ``cp_lse_ag_out_rs`` merge valid.
@@ -2323,8 +2304,8 @@ def _compact_filter_dcp_prefill_kernel(
         slot = block_table[req, pos // vbs] * PAGE_SIZE + (pos % vbs) // W
 
     Same rationale as the decode twin: no `-1` holes (they break aiter's lse
-    path, §4.3/§4.4) and compaction is order-preserving so the fp accumulation
-    order is deterministic. See DCP/DCP_Sparse_MLA.md §5.5.5 (P2).
+    path) and compaction is order-preserving so the fp accumulation order is
+    deterministic.
     """
     token_id = tl.program_id(0)
     req_id = tl.load(token_to_seq_idxs + token_id)
@@ -2364,7 +2345,7 @@ def _compact_filter_dcp_prefill_kernel(
     # both legal and correct for mla_decode_fwd: it writes lse = -inf, which
     # cp_lse_ag_out_rs turns into a zero weight. Its `o` comes out NaN (0/0), so
     # the caller zeroes those rows -- see _forward_prefill_mla. No dummy candidate
-    # is injected; the attention never sees fabricated KV. (§5.5.8 / §5.7)
+    # is injected; the attention never sees fabricated KV.
 
 
 def triton_filter_and_convert_dcp_index_prefill(
