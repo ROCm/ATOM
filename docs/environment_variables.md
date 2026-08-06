@@ -57,23 +57,6 @@ no wall-clock skew). See `atom/model_engine/prefill_delayer.py`. Active only whe
 |----------|------|---------|-------------|
 | **ATOM_DISABLE_VLLM_PLUGIN** | bool | 0 (false) | If set to `1`, disable the vLLM plugin registration entirely. |
 
-## SGLang speculative decoding
-
-| Variable | Type | Default | Description |
-|----------|------|---------|-------------|
-| **ATOM_SGLANG_MTP_LOG** | bool | false | Log cumulative MTP acceptance statistics. |
-| **ATOM_SGLANG_DRAFT_ARGMAX** | bool | true | Enable the ATOM EAGLE top-1 draft argmax patch. |
-| **ATOM_SGLANG_V4_DISABLE_DRAFT_CG** | bool | false | Disable DSV4 draft decode CUDA graphs. |
-| **ATOM_SGLANG_V4_ENABLE_TARGET_VERIFY_CG** | bool | false | Enable DSV4 target-verify CUDA graphs. |
-| **ATOM_SGLANG_V4_DISABLE_TARGET_VERIFY_CG** | bool | false | Force-disable DSV4 target-verify CUDA graphs. |
-| **ATOM_SGLANG_V4_ENABLE_DRAFT_EXTEND_CG** | bool | false | Enable DSV4 draft-extend CUDA graphs. |
-| **ATOM_SGLANG_V4_DISABLE_DRAFT_EXTEND_CG** | bool | false | Force-disable DSV4 draft-extend CUDA graphs. |
-| **ATOM_GLM52_MTP_WRAPPER_MODE** | `current`\|`pr1578` | `current` | Select GLM-5.2 MTP logits-wrapper compatibility behavior. |
-| **ATOM_GLM52_TV_VERIFY_PATH** | `decode`\|`prefill` | `decode` | Override the eager GLM target-verify metadata path; intended for diagnosis only. |
-| **ATOM_GLM52_DRAFT_EXTEND_PATH** | `decode`\|`prefill` | `decode` | Override GLM draft-extend metadata selection; intended for diagnosis only. |
-| **ATOM_GLM52_DRAFT_EXTEND_K_ONLY** | bool | false | Legacy diagnostic mode that restricts GLM draft-extend attention to its K-token suffix. |
-| **ATOM_SGLANG_SPARSE_MLA_ALIGN_FP8_Q** | bool | false | Align sparse MLA indexer Q tensors to FP8 before the kernel call. |
-
 ## Kernel / backend selection
 
 | Variable | Type | Default | Description |
@@ -131,7 +114,7 @@ land. See `atom/model_ops/v4_backend_gate.py` for the selector.
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_TORCH_PROFILER_DIR** | str | — | When set, enables PyTorch profiler and writes traces to this directory. Create subdirectories per rank (e.g., `rank_0`, `dp0_tp0`). |
-| **ATOM_PROFILER_MORE** | bool | 0 (false) | When `ATOM_TORCH_PROFILER_DIR` is set and this is `1`, enables detailed profiling: `record_shapes`, `with_stack`, and `profile_memory`. Applies to both the run-phase profiler and the CUDA-graph capture profiler. |
+| **ATOM_PROFILER_MORE** | bool | 0 (false) | When `ATOM_TORCH_PROFILER_DIR` is set and this is `1`, enables detailed profiling: `record_shapes`, `with_stack`, and `profile_memory`. |
 | **ATOM_ENABLE_DETAILED_ANNOTATION** | bool | 0 (false) | When profiling is active, appends detailed attention aggregates to the `prefill[]`/`decode[]` trace labels: `sqsq` (Σ N_Q²), `sqsk` (Σ N_Q·N_KV), and `sk` (Σ N_KV), where N_Q is the scheduled query tokens and N_KV the KV length per request. Used to estimate attention FLOPs for downstream roofline analysis. |
 | **ATOM_LOG_MORE** | bool | 0 (false) | If set to `1`, use verbose logging format (includes process name, PID, path, line number, function name). |
 
