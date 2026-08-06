@@ -90,6 +90,7 @@ jobs:
     runs-on: ${{ inputs.runner }}
 
     env:
+      AITER_COMMIT: 124e22c027eb0e6477a4474fa59eaacef7bb75fc
       MODEL_PATH: ${{ inputs.model_path }}
       ARGS: ${{ inputs.server_args }}
       ISL: ${{ inputs.isl }}
@@ -116,6 +117,15 @@ jobs:
         with:
           ref: ${{ inputs.atom_commit || github.ref }}
 
+      - name: Checkout aiter PR 4439
+        uses: actions/checkout@v6
+        with:
+          repository: ROCm/aiter
+          ref: ${{ env.AITER_COMMIT }}
+          path: aiter-pr-4439
+          submodules: recursive
+          persist-credentials: false
+
       - name: Start container + download model
         uses: ./.github/actions/atom-bench-container
         with:
@@ -130,6 +140,44 @@ jobs:
             -e CONC=${{ env.CONC }} -e RANDOM_RANGE_RATIO=${{ env.RANDOM_RANGE_RATIO }}
             -e ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }}
             -e ENABLE_RTL_PROFILER=${{ inputs.enable_rtl && '1' || '0' }}
+
+      - name: Install aiter PR 4439 in benchmark container
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          docker exec atom-benchmark bash -lc '
+            set -euo pipefail
+            pip uninstall -y amd-aiter aiter || true
+            pip install --upgrade "pybind11>=3.0.1"
+            cd /workspace/aiter-pr-4439
+            MAX_JOBS=64 PREBUILD_KERNELS=0 GPU_ARCHS=gfx950 pip install -e .
+            ./.github/scripts/install_triton.sh
+            python3 - <<"PY"
+          from pathlib import Path
+          import aiter
+
+          source = Path(aiter.__file__).resolve()
+          print(f"aiter imported from: {source}")
+          if "/workspace/aiter-pr-4439/" not in f"{source}/":
+              raise SystemExit(f"unexpected aiter import path: {source}")
+          PY
+          '
+
+      - name: Record integration provenance
+        run: |
+          set -euo pipefail
+          atom_sha=$(git rev-parse HEAD)
+          aiter_sha=$(git -C aiter-pr-4439 rev-parse HEAD)
+          test "$aiter_sha" = "${AITER_COMMIT}"
+          {
+            echo "### ATOM + aiter integration benchmark"
+            echo
+            echo "- ATOM: \`$atom_sha\` (ROCm/ATOM#1691 replayed on main)"
+            echo "- aiter: \`$aiter_sha\` (ROCm/aiter#4439)"
+            echo "- image: \`${{ inputs.image }}\`"
+            echo "- case: \`${{ inputs.display }}${{ inputs.suffix }}\`"
+            echo "- workload: ISL=${ISL}, OSL=${OSL}, concurrency=${CONC}, ratio=${RANDOM_RANGE_RATIO}"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Collect GPU info (inside container)
         id: gpu-info
