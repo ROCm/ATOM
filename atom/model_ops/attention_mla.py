@@ -138,23 +138,20 @@ _DSA_DCP_PREFILL_MERGE = os.environ.get("ATOM_DSA_DCP_PREFILL_MERGE", "1") == "1
 # to just 0.
 _DSA_ATTN_DUMP_SPEC = os.environ.get("ATOM_DSA_ATTN_DUMP", "")
 _DSA_ATTN_DUMP = _DSA_ATTN_DUMP_SPEC.split(":")[0] if _DSA_ATTN_DUMP_SPEC else ""
-_DSA_ATTN_DUMP_LAYERS = frozenset(
-    int(x) for x in _DSA_ATTN_DUMP_SPEC.split(":")[1].split(",")
-) if ":" in _DSA_ATTN_DUMP_SPEC else frozenset({0})
+_DSA_ATTN_DUMP_LAYERS = (
+    frozenset(int(x) for x in _DSA_ATTN_DUMP_SPEC.split(":")[1].split(","))
+    if ":" in _DSA_ATTN_DUMP_SPEC
+    else frozenset({0})
+)
 # one counter per layer: how many prefill calls of that layer we have dumped
 _dsa_attn_dump_count = {}
-
-# DIAGNOSTIC: ATOM_DSA_DCP_MERGE_FP32=1 -- run the DCP prefill merge in fp32.
-_DSA_DCP_MERGE_FP32 = os.environ.get("ATOM_DSA_DCP_MERGE_FP32", "0") == "1"
 
 # DIAGNOSTIC: ATOM_DSA_FORCE_DECODE_KERNEL=1 -- use mla_decode_fwd for sparse
 # prefill even when no LSE is needed. dcp=1 otherwise runs mla_prefill_fwd while
 # dcp>1 runs mla_decode_fwd, so a dcp=1 vs dcp=N comparison confounds "DCP is
 # wrong" with "the two kernels differ numerically". Setting this on the dcp=1
 # reference removes that confound.
-_DSA_FORCE_DECODE_KERNEL = (
-    os.environ.get("ATOM_DSA_FORCE_DECODE_KERNEL", "0") == "1"
-)
+_DSA_FORCE_DECODE_KERNEL = os.environ.get("ATOM_DSA_FORCE_DECODE_KERNEL", "0") == "1"
 
 if False:
     try:
@@ -1800,21 +1797,23 @@ class MLAAttention(nn.Module):
                     o, lse = self._forward_prefill_mla(
                         q_out, kv_cache, attn_metadata, return_lse=True
                     )
-                    # DIAGNOSTIC (§5.5): cp_lse_ag_out_rs runs entirely in the
-                    # attention dtype -- correct_attn_out rescales in place and the
-                    # ReduceScatter sums W partials. In bf16 that is one extra
-                    # rounding per rank per layer, on top of dcp=1's single fp32
-                    # accumulation inside the kernel. Prefill chains 78 such layers,
-                    # so promote to fp32 to measure how much of the observed
-                    # divergence is merge precision.
-                    if _DSA_DCP_MERGE_FP32:
-                        o = cp_lse_ag_out_rs(
-                            o.float(), lse, self.dcp_group, ctx=None
-                        ).to(o.dtype)
-                    else:
-                        o = cp_lse_ag_out_rs(
-                            o, lse, self.dcp_group, ctx=self._cp_triton_ctx
-                        )
+                    # cp_lse_ag_out_rs accumulates in the tensor dtype: the
+                    # per-rank correction stores bf16 and the ReduceScatter sums W
+                    # partials in bf16. Chained over 78 prefill layers (and worse
+                    # with fp8 KV), that bf16 cross-rank sum is the dominant merge
+                    # error, so run the prefill merge in fp32 (o.float() keeps the
+                    # corrected partials fp32 through the ReduceScatter) and cast
+                    # back. Only the merge collective doubles in bytes; KV/weights
+                    # are untouched. Decode merge stays bf16 (validated fine).
+                    #
+                    # ctx=None (not the persistent self._cp_triton_ctx): prefill
+                    # runs variable-length shapes and the persistent-context kernel
+                    # reuse corrupts the fp32 merge here (gsm8k 0.66 vs 0.95 with a
+                    # fresh context). ctx=None re-enters Triton's own JIT cache, so
+                    # it is correct and cheap -- prefill is not the decode hot path.
+                    o = cp_lse_ag_out_rs(o.float(), lse, self.dcp_group, ctx=None).to(
+                        o.dtype
+                    )
                     output = self._v_up_proj_and_o_proj(o)
                 else:
                     output = self._forward_prefill_mla(q_out, kv_cache, attn_metadata)
@@ -2202,9 +2201,7 @@ def triton_filter_and_convert_dcp_index(
     # through a host->device copy, which HIP rejects while a graph is capturing
     # (hipErrorStreamCaptureUnsupported). Everything here must stay device-side.
     out_kv_indptr[:1].zero_()
-    torch.cumsum(
-        counts, dim=0, dtype=torch.int32, out=out_kv_indptr[1 : num_batch + 1]
-    )
+    torch.cumsum(counts, dim=0, dtype=torch.int32, out=out_kv_indptr[1 : num_batch + 1])
 
     # Pass 2: write the owned slots packed to the front of each region.
     _compact_filter_dcp_kernel[grid](
