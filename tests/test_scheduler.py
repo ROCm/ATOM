@@ -4,6 +4,9 @@
 
 from collections import deque
 from types import SimpleNamespace
+from unittest import mock
+
+import numpy as np
 
 from atom.model_engine.scheduler import (
     ScheduledBatch,
@@ -89,6 +92,41 @@ class TestSchedule:
             sched.add(seq_factory([1, 2, 3, 4]))
         batch, _ = sched.schedule()
         assert batch.total_seqs_num_prefill == 2
+
+    def test_remote_kv_decode_promotion_respects_max_num_seqs(self, seq_factory):
+        """A PD consumer ready for first-decode must NOT be promoted into a full
+        running queue — the bug that let decode-side running climb to 2x
+        max_num_seqs and thrash (preempt -> full recompute) at KV exhaustion."""
+        sched = Scheduler(
+            MockConfig(
+                max_num_seqs=2, max_num_batched_tokens=1000, num_kvcache_blocks=100
+            )
+        )
+        # Fill running to the cap with two decode seqs.
+        r0, r1 = seq_factory([1, 2, 3, 4]), seq_factory([5, 6, 7, 8])
+        for r in (r0, r1):
+            r.status = SequenceStatus.RUNNING
+            r.type = SequenceType.DECODE
+        sched.running = deque([r0, r1])
+        # A consumer whose remote KV has arrived and is ready for first decode.
+        consumer = seq_factory([9, 10, 11, 12])
+        consumer.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+        sched.waiting = deque([consumer])
+
+        promoted = []
+        with (
+            mock.patch.object(sched, "_resolve_waiting_remote_kv", return_value=True),
+            mock.patch.object(
+                sched,
+                "_schedule_first_decode_after_remote_kv",
+                side_effect=lambda s: promoted.append(s),
+            ),
+        ):
+            sched.schedule()
+
+        assert promoted == []  # capped out, not promoted
+        assert consumer in sched.waiting  # requeued for a later tick
+        assert len(sched.running) <= sched.max_num_seqs
 
     def test_prefill_respects_max_batched_tokens(self, seq_factory):
         sched = Scheduler(
@@ -187,6 +225,52 @@ class TestSchedule:
 
         assert [seq.id for seq in sched.waiting] == [2, 1, 3]
 
+    def test_offload_parked_count_released_only_after_resume(self, seq_factory):
+        sched = Scheduler(
+            MockConfig(
+                max_num_seqs=2,
+                max_num_batched_tokens=64,
+                num_kvcache_blocks=100,
+            )
+        )
+        sched.kv_connector = SimpleNamespace(
+            is_offload=True,
+            build_connector_meta=lambda: None,
+        )
+
+        seq = seq_factory(list(range(8)))
+        seq.num_cached_tokens = 4
+        seq.block_table = [0]
+        seq.offload_loaded_tokens = 4
+        sched._park_for_remote_load(seq, deque())
+        sched._count_inflight_load(seq)
+        sched.finished_recving_kv_req_ids.append(seq.id)
+
+        assert sched._resolve_waiting_remote_kv(seq, deque()) is False
+        assert sched._num_parked_remote_kv == 1
+        sched.waiting.append(seq)
+
+        batch, _ = sched.schedule()
+
+        assert batch.total_seqs_num_prefill == 1
+        assert seq in sched.running
+        assert sched._num_parked_remote_kv == 0
+        assert seq._counted_as_inflight_load is False
+
+        sched.running.clear()
+        failed = seq_factory(list(range(8)))
+        failed.num_cached_tokens = 4
+        failed.block_table = [0]
+        sched._park_for_remote_load(failed, deque())
+        sched.failed_recving_kv_req_ids.append(failed.id)
+        sched.waiting.append(failed)
+
+        sched.schedule()
+
+        assert failed.offload_load_failed is True
+        assert failed in sched.running
+        assert sched._num_parked_remote_kv == 0
+
     def test_partial_prefill_ready_for_offload_load_moves_to_waiting(self):
         class _Connector:
             def should_park_partial_prefill_for_load(self, seq):
@@ -196,6 +280,7 @@ class TestSchedule:
         sched.kv_connector = _Connector()
         sched.waiting = deque()
         sched._partial_prefill_count = 1
+        sched._num_parked_remote_kv = 0
         keep = SimpleNamespace(
             id=1,
             status=SequenceStatus.RUNNING,
@@ -214,10 +299,12 @@ class TestSchedule:
         assert [seq.id for seq in sched.waiting] == [2]
         assert ready.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
         assert ready.is_partial_prefill is False
-        assert ready._discard_next_deferred_output is True
+        assert not hasattr(ready, "_discard_next_deferred_output")
         assert sched._partial_prefill_count == 0
+        assert sched._num_parked_remote_kv == 1
+        assert ready._counted_as_inflight_load is True
 
-    def test_offload_partial_handoff_discards_stale_deferred_output(self, seq_factory):
+    def test_offload_partial_handoff_keeps_resumed_deferred_output(self, seq_factory):
         sched = Scheduler(
             MockConfig(
                 max_num_batched_tokens=64,
@@ -230,7 +317,9 @@ class TestSchedule:
         seq.status = SequenceStatus.RUNNING
         seq.type = SequenceType.PREFILL
         seq.num_cached_tokens = 8
-        seq._discard_next_deferred_output = True
+        # The pre-handoff partial-prefill postprocess already appended the
+        # deferred-output placeholder before the request was parked.
+        seq.append_token(sched.eos_token_id)
         sched.running = deque([seq])
 
         sched.postprocess(
@@ -247,9 +336,157 @@ class TestSchedule:
         )
 
         assert seq.num_cached_tokens == 10
-        assert seq._discard_next_deferred_output is False
-        assert 999 not in seq.output_tokens
-        assert seq.output_tokens == [sched.eos_token_id]
+        assert seq.output_tokens == [999, sched.eos_token_id]
+
+
+# ── _waiting_new_token_count (PrefillDelayer queue signal) ─────────────────
+
+
+class TestWaitingNewTokenCount:
+    """The coalescer fill signal must count only ADMITTABLE waiting seqs,
+    mirroring `_can_admit_head_prefill`'s skip set — otherwise remote-KV /
+    unschedulable tokens inflate the aggregate and reach the fill target early."""
+
+    def _sched(self):
+        return Scheduler(
+            MockConfig(
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                max_num_batched_tokens=1000,
+                max_model_len=64,
+                enable_chunked_prefill=True,
+            )
+        )
+
+    def test_counts_normal_waiting_tokens(self, seq_factory):
+        sched = self._sched()
+        sched.waiting = deque(
+            [seq_factory(list(range(8))), seq_factory(list(range(10)))]
+        )
+        assert sched._waiting_new_token_count() == 18
+
+    def test_skips_remote_kv_seqs(self, seq_factory):
+        sched = self._sched()
+        normal = seq_factory(list(range(8)))
+        remote = seq_factory(list(range(10)))
+        remote.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+        sched.waiting = deque([normal, remote])
+        # Only the 8 admittable tokens count; the 10 remote-KV tokens are skipped.
+        assert sched._waiting_new_token_count() == 8
+
+    def test_skips_unschedulable_oversized_seq(self, seq_factory):
+        # Prompt longer than max_model_len is permanently unschedulable → skipped.
+        sched = self._sched()
+        normal = seq_factory(list(range(8)))
+        oversized = seq_factory(list(range(200)))  # > max_model_len=64
+        sched.waiting = deque([normal, oversized])
+        assert sched._waiting_new_token_count() == 8
+
+    def test_saturates_at_cap(self, seq_factory):
+        sched = Scheduler(
+            MockConfig(
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                max_num_batched_tokens=16,
+                max_model_len=64,
+                enable_chunked_prefill=True,
+            )
+        )
+        sched.waiting = deque([seq_factory(list(range(10))) for _ in range(5)])
+        assert sched._waiting_new_token_count() == 16  # capped, scan short-circuits
+
+
+class TestPartialPrefillRemainingTokens:
+    """Remaining tokens of mid-chunked-prefill seqs, folded into the coalescer
+    pending signal so a small partial tail chunk batches instead of firing
+    its own tiny forward. `remaining = num_tokens - num_cached_tokens`."""
+
+    def _sched(self):
+        return Scheduler(
+            MockConfig(
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                max_num_batched_tokens=1000,
+                max_model_len=64,
+                enable_chunked_prefill=True,
+            )
+        )
+
+    def test_zero_when_no_partials(self, seq_factory):
+        sched = self._sched()
+        sched.running = deque([seq_factory(list(range(8)))])  # not partial
+        assert sched._partial_prefill_remaining_tokens() == 0
+
+    def test_sums_partial_remaining(self, seq_factory):
+        sched = self._sched()
+        p1 = seq_factory(list(range(20)))
+        p1.is_partial_prefill = True
+        p1.num_cached_tokens = 8  # 12 remaining
+        p2 = seq_factory(list(range(30)))
+        p2.is_partial_prefill = True
+        p2.num_cached_tokens = 25  # 5 remaining
+        plain = seq_factory(list(range(10)))  # not partial → excluded
+        sched.running = deque([p1, p2, plain])
+        sched._partial_prefill_count = 2
+        assert sched._partial_prefill_remaining_tokens() == 17
+
+    def test_saturates_at_cap(self, seq_factory):
+        sched = Scheduler(
+            MockConfig(
+                num_kvcache_blocks=1000,
+                kv_cache_block_size=4,
+                max_num_batched_tokens=16,
+                max_model_len=4096,
+                enable_chunked_prefill=True,
+            )
+        )
+        big = seq_factory(list(range(100)))
+        big.is_partial_prefill = True
+        sched.running = deque([big])
+        sched._partial_prefill_count = 1
+        assert sched._partial_prefill_remaining_tokens() == 16  # capped
+
+
+class TestOldestWaitingPrefillAge:
+    """TTFT SLA guard signal: age (ms) of the oldest ADMITTABLE waiting prefill,
+    skipping the same non-admittable seqs as _can_admit_head_prefill."""
+
+    def _sched(self):
+        return Scheduler(
+            MockConfig(
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                max_num_batched_tokens=1000,
+                max_model_len=64,
+                enable_chunked_prefill=True,
+            )
+        )
+
+    def test_zero_when_empty(self):
+        sched = self._sched()
+        sched.waiting = deque()
+        assert sched._oldest_waiting_prefill_age_ms() == 0.0
+
+    def test_uses_oldest_arrival(self, seq_factory):
+        sched = self._sched()
+        new = seq_factory(list(range(8)))
+        old = seq_factory(list(range(8)))
+        sched.waiting = deque([new, old])
+        with mock.patch("atom.model_engine.scheduler.time.time", return_value=1000.0):
+            new.arrive_time = 999.0  # 1s ago
+            old.arrive_time = 997.5  # 2.5s ago → oldest
+            assert sched._oldest_waiting_prefill_age_ms() == 2500.0
+
+    def test_skips_remote_kv(self, seq_factory):
+        sched = self._sched()
+        admittable = seq_factory(list(range(8)))
+        remote = seq_factory(list(range(8)))
+        remote.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+        sched.waiting = deque([admittable, remote])
+        with mock.patch("atom.model_engine.scheduler.time.time", return_value=1000.0):
+            admittable.arrive_time = 999.0  # 1s
+            remote.arrive_time = 990.0  # 10s but skipped (remote-KV)
+            assert sched._oldest_waiting_prefill_age_ms() == 1000.0
 
 
 # ── long_prefill_token_threshold ──────────────────────────────────────────
@@ -673,3 +910,120 @@ class TestScheduledBatchPDFirstDecodeMTP:
         )
 
         assert list(batch.scheduled_tokens) == toks[-(mtp_k + 1) :]
+
+
+# ── detailed annotation aggregates ──────────────────────────────────────────
+
+
+class TestComputeDetailedAggregates:
+    """Unit tests for Scheduler.compute_detailed_aggregates (pure Python).
+
+    The method only touches ``self.profile_active`` and the cached
+    ``self._detailed_annotation_enabled`` flag, so a lightweight
+    SimpleNamespace stands in for both the scheduler and the sequences — no
+    GPU or full Scheduler construction required.
+    """
+
+    @staticmethod
+    def _make_batch(num_scheduled_tokens):
+        return SimpleNamespace(
+            num_scheduled_tokens=num_scheduled_tokens,
+            detailed_sqsq=None,
+            detailed_sqsk=None,
+            detailed_sk=None,
+        )
+
+    @staticmethod
+    def _make_seqs():
+        # Two prefill requests + one decode request.
+        #   prefill A: N_Q=4, cached=2 -> N_KV=6  -> sqsq 16, sqsk 24, sk 6
+        #   prefill B: N_Q=3, cached=0 -> N_KV=3  -> sqsq  9, sqsk  9, sk 3
+        #   decode  C: N_Q=1,          -> N_KV=10 -> sqsq  1, sqsk 10, sk 10
+        return {
+            0: SimpleNamespace(
+                type=SequenceType.PREFILL, num_tokens=6, num_cached_tokens=2
+            ),
+            1: SimpleNamespace(
+                type=SequenceType.PREFILL, num_tokens=3, num_cached_tokens=0
+            ),
+            2: SimpleNamespace(
+                type=SequenceType.DECODE, num_tokens=10, num_cached_tokens=9
+            ),
+        }
+
+    def test_aggregates_when_enabled(self):
+        fake_self = SimpleNamespace(
+            profile_active=True, _detailed_annotation_enabled=True
+        )
+        batch = self._make_batch([4, 3, 1])
+
+        Scheduler.compute_detailed_aggregates(fake_self, batch, self._make_seqs())
+
+        assert batch.detailed_sqsq == 16 + 9 + 1
+        assert batch.detailed_sqsk == 24 + 9 + 10
+        assert batch.detailed_sk == 6 + 3 + 10
+
+    def test_noop_when_flag_disabled(self):
+        fake_self = SimpleNamespace(
+            profile_active=True, _detailed_annotation_enabled=False
+        )
+        batch = self._make_batch([4, 3, 1])
+
+        Scheduler.compute_detailed_aggregates(fake_self, batch, self._make_seqs())
+
+        assert batch.detailed_sqsq is None
+        assert batch.detailed_sqsk is None
+        assert batch.detailed_sk is None
+
+    def test_noop_when_profiling_inactive(self):
+        fake_self = SimpleNamespace(
+            profile_active=False, _detailed_annotation_enabled=True
+        )
+        batch = self._make_batch([4, 3, 1])
+
+        Scheduler.compute_detailed_aggregates(fake_self, batch, self._make_seqs())
+
+        assert batch.detailed_sqsq is None
+        assert batch.detailed_sqsk is None
+        assert batch.detailed_sk is None
+
+    def test_no_int32_overflow_large_prefill(self):
+        # Regression: num_scheduled_tokens is np.int32, so nq*nq must not
+        # overflow for long prefills. np.int32(65536)**2 wraps to 0, which
+        # would silently corrupt the estimate the feature exists to produce.
+        fake_self = SimpleNamespace(
+            profile_active=True, _detailed_annotation_enabled=True
+        )
+        nq = 65536
+        batch = self._make_batch(np.asarray([nq], dtype=np.int32))
+        seqs = {
+            0: SimpleNamespace(
+                type=SequenceType.PREFILL, num_tokens=nq, num_cached_tokens=0
+            )
+        }
+
+        Scheduler.compute_detailed_aggregates(fake_self, batch, seqs)
+
+        assert batch.detailed_sqsq == nq * nq  # 4294967296, not 0
+        assert batch.detailed_sqsk == nq * nq
+        assert batch.detailed_sk == nq
+        assert isinstance(batch.detailed_sqsq, int)
+
+    def test_decode_counts_scheduled_query_tokens(self):
+        # MTP/spec-decode schedules mtp_k+1 query tokens; nq must reflect the
+        # scheduled count rather than a hardcoded 1 (otherwise undercounted).
+        fake_self = SimpleNamespace(
+            profile_active=True, _detailed_annotation_enabled=True
+        )
+        batch = self._make_batch(np.asarray([3], dtype=np.int32))
+        seqs = {
+            0: SimpleNamespace(
+                type=SequenceType.DECODE, num_tokens=100, num_cached_tokens=97
+            )
+        }
+
+        Scheduler.compute_detailed_aggregates(fake_self, batch, seqs)
+
+        assert batch.detailed_sqsq == 9  # 3^2
+        assert batch.detailed_sqsk == 300  # 3 * 100
+        assert batch.detailed_sk == 100

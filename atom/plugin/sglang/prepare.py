@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+from contextlib import nullcontext
 from typing import Any
 
 from atom.plugin.prepare import _set_framework_backbone
@@ -38,6 +39,15 @@ def prepare_model(config: Any):
         )
 
         install_deepseek_v4_proxy_pool_patch()
+    elif model_arch in (
+        "MiniMaxM3SparseForCausalLM",
+        "MiniMaxM3SparseForConditionalGeneration",
+    ):
+        from atom.plugin.sglang.minimax_m3_bridge import (
+            install_minimax_m3_pool_patch,
+        )
+
+        install_minimax_m3_pool_patch()
 
     # Import here to avoid partial initialization while SGLang discovers models.
     from atom.plugin.register import (
@@ -64,6 +74,8 @@ def prepare_model(config: Any):
     from atom.plugin.sglang.runtime import get_model_arch_spec
 
     model_adapter = get_model_arch_spec(model_arch)
+    if model_adapter.prepare_draft_model_config is not None:
+        model_adapter.prepare_draft_model_config(atom_config, config)
     if model_adapter.prepare_config is not None:
         model_adapter.prepare_config(atom_config, model_arch)
     else:
@@ -82,13 +94,19 @@ def prepare_model(config: Any):
 
     apply_graph_capture_patch()
 
-    init_params = inspect.signature(model_cls.__init__).parameters
-    if "atom_config" in init_params:
-        model = model_cls(atom_config=atom_config)
-    elif "config" in init_params:
-        model = model_cls(config=atom_config)
-    else:
-        model = model_cls(atom_config)
+    construct_context = (
+        model_adapter.construction_context()
+        if model_adapter.construction_context is not None
+        else nullcontext()
+    )
+    with construct_context:
+        init_params = inspect.signature(model_cls.__init__).parameters
+        if "atom_config" in init_params:
+            model = model_cls(atom_config=atom_config)
+        elif "config" in init_params:
+            model = model_cls(config=atom_config)
+        else:
+            model = model_cls(atom_config)
     if not hasattr(model, "atom_config"):
         model.atom_config = atom_config
     return model

@@ -19,7 +19,8 @@ documented at the bottom of this file but NOT managed here.
 """
 
 import os
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # --- Data Parallelism ---
@@ -28,8 +29,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_SIZE": lambda: int(os.getenv("ATOM_DP_SIZE", "1")),
     "ATOM_DP_MASTER_IP": lambda: os.getenv("ATOM_DP_MASTER_IP", "127.0.0.1"),
     "ATOM_DP_MASTER_PORT": lambda: int(os.getenv("ATOM_DP_MASTER_PORT", "29500")),
+    # Token-equivalent cost of one in-flight request for the "least_tokens" DP
+    # load-balance strategy. The per-rank load score is
+    #   sum(prompt_tokens) + ATOM_DP_LB_REQ_EQUIV * num_in_flight_requests
+    # so a larger value biases routing toward request-count balance (decode
+    # pressure) and a smaller value toward prompt-token balance (prefill
+    # pressure). See engine_core_mgr.CoreManager._select_dp_rank_locked.
+    "ATOM_DP_LB_REQ_EQUIV": lambda: int(os.getenv("ATOM_DP_LB_REQ_EQUIV", "512")),
     # Prefix for process titles set via set_process_title (shown in ps/top/rocm-smi)
     "ATOM_PROCESS_NAME_PREFIX": lambda: os.getenv("ATOM_PROCESS_NAME_PREFIX", "ATOM"),
+    # SGLang's GLM-5.2 and DeepSeek V4 prefill CP paths still force
+    # attention TP size to 1.
+    # ATOM remaps the SGLang world into internal TP x PCP groups.
+    # 0 means unset.
+    "ATOM_SGLANG_PCP_SIZE": lambda: int(os.getenv("ATOM_SGLANG_PCP_SIZE", "0") or "0"),
     # --- Compilation & Execution ---
     "ATOM_USE_TRITON_GEMM": lambda: os.getenv("ATOM_USE_TRITON_GEMM", "0") == "1",
     "ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE": lambda: (
@@ -60,8 +73,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FUSED_COMPRESS_USE_FLYDSL": lambda: os.getenv(
         "ATOM_FUSED_COMPRESS_USE_FLYDSL", "auto"
     ).lower(),
-    # QK-norm-rope-cache-quant fusion for Qwen3-MoE; disabled by default.
-    # Enable for Qwen3-MoE to get better performance.
+    # QK-norm-rope-cache-quant fusion for Qwen3 dense and MoE; disabled by default.
     "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION", "0") == "1"
     ),
@@ -76,6 +88,43 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION", "1") == "1"
+    ),
+    # DeepSeek-V4 paged-SWA: retain the FULL sliding-window KV history in the
+    # content-addressed SWA cache instead of the default window-only prefill
+    # write. Default OFF preserves the window-only optimization (writes only each
+    # prefill chunk's trailing `window` tokens). When ON, swa_write persists the
+    # whole chunk and ensure_for_tokens materializes every block, so cross-request
+    # prefix hits can reuse the middle SWA blocks (agentic branch/replay reuse) —
+    # the live sliding-window free is UNCHANGED (out-of-window refs still released
+    # each chunk/decode; freed blocks stay hash+KV resident until overwritten).
+    # Pairs with a larger SWA pool (swa_pool_num_blocks) so freed-but-cached
+    # blocks survive until replay. Costs ~compressed-pool-magnitude SWA memory.
+    "ATOM_SWA_FULL_RETAIN": lambda: (os.getenv("ATOM_SWA_FULL_RETAIN", "0") == "1"),
+    # DeepSeek-V4 paged-SWA full-retain: fraction of the KV budget given to the
+    # SWA tail pool (the rest goes to the compressed pool). One SWA block is ~7x
+    # the bytes of one compressed block, so a 1:1 mirror starves the compressed
+    # prefix index; a small fraction keeps compressed near full while retaining
+    # the hot-boundary tail working set (LRU-evicted). Only consulted when
+    # ATOM_SWA_FULL_RETAIN=1. Default 0.2; tune 0.15-0.25 with cache-hit
+    # instrumentation. Clamped to (0, 0.9).
+    "ATOM_SWA_TAIL_BUDGET_FRAC": lambda: float(
+        os.getenv("ATOM_SWA_TAIL_BUDGET_FRAC", "0.2")
+    ),
+    # DeepSeek-V4 paged-SWA sparse checkpoint retention (only with
+    # ATOM_SWA_FULL_RETAIN=1). Tokens per retained SWA-tail checkpoint: 0 = dense
+    # (retain every written tail, relies on pool size — floods a small pool);
+    # >0 = keep a tail only once per this-many-tokens segment plus at each prompt
+    # boundary, and PIN those so live-window churn cannot overwrite them (mirrors
+    # vLLM VLLM_PREFIX_CACHE_RETENTION_INTERVAL / SlidingWindowManager sparse
+    # reachable_block_mask). Should be a multiple of the KV block size; 32768
+    # matches the vLLM trace-replay tuning. Default 0 (dense).
+    "ATOM_SWA_RETENTION_INTERVAL": lambda: int(
+        os.getenv("ATOM_SWA_RETENTION_INTERVAL", "0")
+    ),
+    # Fraction of the SWA pool that pinned checkpoint tails may occupy (LRU-capped)
+    # when sparse retention is on; the rest stays free for live-window churn.
+    "ATOM_SWA_CHECKPOINT_FRAC": lambda: float(
+        os.getenv("ATOM_SWA_CHECKPOINT_FRAC", "0.5")
     ),
     # DSA sparse-indexer prefill: KV-dimension chunk size (in tokens) for
     # `fp8_mqa_logits`. The dense logits buffer is [prefill_tokens, total_kv];
@@ -130,6 +179,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # --- Profiling & Logging ---
     "ATOM_TORCH_PROFILER_DIR": lambda: os.getenv("ATOM_TORCH_PROFILER_DIR", None),
     "ATOM_PROFILER_MORE": lambda: os.getenv("ATOM_PROFILER_MORE", "0") == "1",
+    # When profiling is active, append detailed attention aggregates (sqsq, sqsk, sk)
+    # to the prefill[]/decode[] trace labels emitted by ModelRunner.run_model.
+    "ATOM_ENABLE_DETAILED_ANNOTATION": lambda: (
+        os.getenv("ATOM_ENABLE_DETAILED_ANNOTATION", "0") == "1"
+    ),
     "ATOM_PROFILER_TIMEOUT": lambda: float(os.getenv("ATOM_PROFILER_TIMEOUT", "300")),
     "ATOM_LOG_MORE": lambda: int(os.getenv("ATOM_LOG_MORE", "0")) != 0,
     # RTL (rocm-trace-lite) GPU kernel tracing — set to output directory to enable.
@@ -140,10 +194,49 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DISABLE_MMAP": lambda: (
         os.getenv("ATOM_DISABLE_MMAP", "false").lower() == "true"
     ),
-    # Use a thread pool for weight loading instead of main-process sequential I/O.
-    # Set to 0 to disable if the thread pool causes hangs (e.g. on gfx1250).
-    "ATOM_LOADER_USE_THREADPOOL": lambda: (
-        os.getenv("ATOM_LOADER_USE_THREADPOOL", "1") == "1"
+    # Worker threads for weight loading. >1 (default 16) enables the batched
+    # parallel loader (per-fused-param CPU staging flushed with one H2D copy)
+    # with that many threads; set to 1 to fall back to the original sequential
+    # per-expert path.
+    "ATOM_LOADER_NUM_THREADS": lambda: int(os.getenv("ATOM_LOADER_NUM_THREADS", "16")),
+    # Warm the page cache with a background sequential reader instead of
+    # leaving it to demand faults through the mmap. Measured on a local NVMe:
+    # the fault-driven pattern sustains 3.2 GB/s where the device does 6.9 and
+    # a single sequential reader alone reaches 6.06, so the gap is the access
+    # pattern rather than queue depth. On DeepSeek-R1 MXFP4 (350 GiB, TP=4)
+    # this takes a cold load from ~156s to ~68s and leaves the warm case
+    # slightly better too, so it is on by default; turn it off for storage
+    # where a second sequential reader competes with the loader instead of
+    # feeding it.
+    "ATOM_LOADER_PREFETCH": lambda: (
+        os.getenv("ATOM_LOADER_PREFETCH", "true").lower() == "true"
+    ),
+    # Shards read concurrently by the prefetcher. Kept small: the device here
+    # saturates at 2 streams, and every thread also competes with the loader.
+    "ATOM_LOADER_PREFETCH_THREADS": lambda: int(
+        os.getenv("ATOM_LOADER_PREFETCH_THREADS", "4")
+    ),
+    "ATOM_LOADER_PREFETCH_BLOCK_MB": lambda: int(
+        os.getenv("ATOM_LOADER_PREFETCH_BLOCK_MB", "16")
+    ),
+    # Hint the kernel to read each shard ahead. Off by default because it never
+    # paid for itself once measured on its own: the read loop runs far ahead of
+    # the workers, so WILLNEED is issued for the whole checkpoint within
+    # seconds, and asking for 350 GiB of read-ahead is bookkeeping the kernel
+    # largely discards. Cold load 193.0s vs 194.2s -- no effect; warm load
+    # 27.3s vs 42.8s -- 15.5s of pure overhead. Kept as a switch rather than
+    # deleted so the behaviour can be restored on storage that behaves
+    # differently. Ignored when prefetching, which supersedes it.
+    "ATOM_LOADER_FADVISE": lambda: (
+        os.getenv("ATOM_LOADER_FADVISE", "false").lower() == "true"
+    ),
+    # Fail loading when the checkpoint does not deliver every routed expert of
+    # a fused MoE parameter. On by default: the alternative is a model that
+    # loads happily with some expert slots left at their init values, which
+    # only shows up much later as an accuracy drop. Set to false to downgrade
+    # to a warning when bringing up a checkpoint that is known to be partial.
+    "ATOM_LOADER_STRICT_COVERAGE": lambda: (
+        os.getenv("ATOM_LOADER_STRICT_COVERAGE", "true").lower() == "true"
     ),
     # --- Attention Backend ---
     # Use unified_attention (flash-style) for MHA paged/prefill attention instead
@@ -248,26 +341,64 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DEBUG_FORCE_SKIP_DRAFT_MODEL": lambda: (
         os.getenv("ATOM_DEBUG_FORCE_SKIP_DRAFT_MODEL", "0") == "1"
     ),
+    # NOTE: DSpark runtime knobs (confidence_schedule, ragged,
+    # ragged_graph_sizes, q_buckets, disable_sps_calib) are no longer env vars.
+    # They are configured via --dspark-config (JSON dict) and carried in
+    # config.dspark (see atom/config.py DSparkConfig). See
+    # recipes/DSpark.md.
     # --- PrefillDelayer (cross-DP prefill alignment) ---
     # Master switch; default on. Set "0" to disable construction.
+    # The delayer is a prefill COALESCER: it holds back prefill admission under
+    # DP-attention until the accumulated prefill fills a worthwhile forward, so
+    # fragmented short-input prefills / small partial tail chunks batch into one
+    # forward instead of firing many tiny ones.
     "ATOM_ENABLE_PREFILL_DELAYER": lambda: (
         os.getenv("ATOM_ENABLE_PREFILL_DELAYER", "1") == "1"
     ),
-    # Max consecutive scheduler passes the delayer is allowed to suppress
-    # prefill admission while waiting for cross-DP alignment.
-    "ATOM_PREFILL_DELAYER_MAX_DELAY_PASSES": lambda: int(
-        os.getenv("ATOM_PREFILL_DELAYER_MAX_DELAY_PASSES", "30")
+    # Fill target: release prefill once accumulated pending tokens reach
+    # target_fill * max_num_batched_tokens (averaged across prefillable ranks).
+    # In (0, 1]; higher batches harder (fewer, larger prefills) at some TTFT
+    # cost. Default 0.9.
+    "ATOM_PREFILL_DELAYER_TARGET_FILL": lambda: float(
+        os.getenv("ATOM_PREFILL_DELAYER_TARGET_FILL", "0.9")
     ),
-    # Wall-clock cap (milliseconds) on a single delay window.
-    "ATOM_PREFILL_DELAYER_MAX_DELAY_MS": lambda: float(
-        os.getenv("ATOM_PREFILL_DELAYER_MAX_DELAY_MS", "5000")
+    # TTFT bound: max consecutive scheduler ticks a held prefill waits before
+    # force-release (deterministic across ranks; replaces the old wall-clock +
+    # pass-count pair).
+    "ATOM_PREFILL_DELAYER_TTFT_MAX_TICKS": lambda: int(
+        os.getenv("ATOM_PREFILL_DELAYER_TTFT_MAX_TICKS", "200")
     ),
-    # Optional KV-usage low watermark below which delaying is allowed.
-    # Empty string => None (use PrefillDelayer's internal default).
+    # Tight bound (ticks) for a held mid-chunked-prefill: a partial holds already
+    # allocated KV, so it force-releases sooner than a fresh prefill.
+    "ATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS": lambda: int(
+        os.getenv("ATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS", "100")
+    ),
+    # Consecutive non-growing ticks after which the coalescer gives up waiting
+    # (burst ended, more won't come) and releases.
+    "ATOM_PREFILL_DELAYER_STALL_TICKS": lambda: int(
+        os.getenv("ATOM_PREFILL_DELAYER_STALL_TICKS", "10")
+    ),
+    # KV high watermark: at/above this KV usage a prefillable rank force-releases
+    # (can't accumulate a bigger batch anyway).
+    "ATOM_PREFILL_DELAYER_KV_HIGH_WATERMARK": lambda: float(
+        os.getenv("ATOM_PREFILL_DELAYER_KV_HIGH_WATERMARK", "0.9")
+    ),
+    # Optional KV-usage low watermark: below it a prefillable rank force-releases
+    # (GPU starving — feed it). Empty string => None => disabled.
     "ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK": lambda: (
         None
         if os.getenv("ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK", "") == ""
         else float(os.getenv("ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK"))
+    ),
+    # TTFT SLA guard: if any rank's oldest schedulable waiting prefill has queued
+    # (since arrival) >= this many ms, force-release regardless of the fill
+    # target. Bounds worst-case TTFT. Empty string => None => disabled (set this
+    # to your TTFT budget in ms to activate; a small value under heavy backlog
+    # will fire every tick and defeat coalescing, so size it to the SLA).
+    "ATOM_PREFILL_DELAYER_MAX_QUEUE_MS": lambda: (
+        None
+        if os.getenv("ATOM_PREFILL_DELAYER_MAX_QUEUE_MS", "") == ""
+        else float(os.getenv("ATOM_PREFILL_DELAYER_MAX_QUEUE_MS"))
     ),
     # --- TBO prefill ubatch splitting ---
     # Split prefill ubatches at the exact token midpoint (vLLM-DBO style),
@@ -280,6 +411,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_TBO_PREFILL_MIN_TOKENS": lambda: int(
         os.getenv("ATOM_TBO_PREFILL_MIN_TOKENS", "8192")
     ),
+    # --- PCP MoE comm mode ---
+    # Fold the PCP (prefill-context-parallel) dim into the MoE tp/ep sharding.
+    # Only meaningful when prefill_context_parallel_size > 1;
+    # Default "1": all-gather hidden 1/W -> full before MoE and slice
+    # full -> 1/W after, so MoE sees the complete token set (MoE itself is
+    # untouched / PCP-agnostic). Costs one extra hidden all-gather per layer.
+    # "0": MoE runs on each rank's 1/W token shard with no extra comm.
+    "ATOM_PCP_MOE_MERGE": lambda: os.getenv("ATOM_PCP_MOE_MERGE", "1") == "1",
+    # Pure-TP TBO all_reduce overlap mode (see module_dispatch_ops.tbo_all_reduce):
+    #   "overlap" (default): move the AR onto the comm stream so it overlaps the
+    #             partner ubatch's compute. Per-ubatch pynccl comms keep the
+    #             cross-rank enqueue order consistent (hang-free).
+    #   "inline": run the AR on the current stream, no overlap. Plan-A baseline.
+    "ATOM_TBO_TP_AR_MODE": lambda: os.getenv("ATOM_TBO_TP_AR_MODE", "overlap"),
     # --- NUMA binding ---
     # Master switch: pin each GPU worker to its GPU-local NUMA node's CPU cores
     # and preferred memory. Default off so baseline/pinned A/B stays clean.
@@ -294,6 +439,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_CRASH_ON_NUMA_BIND_FAILURE": lambda: (
         os.getenv("ATOM_CRASH_ON_NUMA_BIND_FAILURE", "0") == "1"
     ),
+    # PP-boundary hidden_states/residual are TP-replicated; when on, each rank
+    # sends only its 1/tp_size slice and the receiver all-gathers, cutting PP
+    # link traffic by tp_size. Default on; set "0" for full-tensor sends.
+    "ATOM_PP_SEND_ALLGATHER": lambda: os.getenv("ATOM_PP_SEND_ALLGATHER", "1") == "1",
 }
 
 

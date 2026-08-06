@@ -6,9 +6,10 @@
 from __future__ import annotations
 
 import re
-from typing import Optional
 
 import torch
+import triton
+import triton.language as tl
 from aiter import (
     cp_gather_indexer_k_quant_cache,
     dtypes,
@@ -22,8 +23,6 @@ from aiter import (
 from aiter.mla import mla_decode_fwd
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
-import triton
-import triton.language as tl
 
 from atom.utils.custom_register import direct_register_custom_op
 
@@ -158,6 +157,97 @@ def _build_sglang_query_ranges(forward_batch) -> tuple[torch.Tensor, torch.Tenso
     )
 
 
+def _maybe_apply_pcp_query_split(
+    cu_starts: torch.Tensor,
+    cu_ends: torch.Tensor,
+    num_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Match full SGLang query metadata to ATOM's local PCP query rows."""
+
+    if int(cu_starts.shape[0]) <= num_tokens:
+        return cu_starts, cu_ends
+
+    try:
+        from atom.distributed.pcp_utils import (
+            get_pcp_world_size,
+            pcp_pad_dense,
+            pcp_pad_len,
+            pcp_round_robin_split,
+        )
+
+        pcp_size = get_pcp_world_size()
+    except Exception:  # noqa: BLE001
+        pcp_size = 1
+
+    if pcp_size <= 1:
+        return cu_starts, cu_ends
+
+    # DeepseekV2/GLM-DSA model forward splits input_ids/positions by ATOM PCP,
+    # but SGLang forward_batch still describes the full local-SGLang query set.
+    # Reindex per-query indexer metadata with the same round-robin rule so its
+    # rows line up with the already-split hidden/q tensors.
+    total_queries = int(cu_starts.shape[0])
+    padded_total = pcp_pad_len(total_queries, pcp_size)
+    n_pad = padded_total - total_queries
+    cu_starts = pcp_round_robin_split(pcp_pad_dense(cu_starts, n_pad), pcp_size)
+    cu_ends = pcp_round_robin_split(pcp_pad_dense(cu_ends, n_pad), pcp_size)
+    return cu_starts[:num_tokens], cu_ends[:num_tokens]
+
+
+def _maybe_apply_pcp_dense_query_split(
+    values: torch.Tensor,
+    num_tokens: int,
+) -> torch.Tensor:
+    """Match dense per-query metadata to ATOM's local PCP query rows."""
+
+    if int(values.shape[0]) <= num_tokens:
+        return values[:num_tokens]
+
+    try:
+        from atom.distributed.pcp_utils import (
+            get_pcp_world_size,
+            pcp_pad_dense,
+            pcp_pad_len,
+            pcp_round_robin_split,
+        )
+
+        pcp_size = get_pcp_world_size()
+    except Exception:  # noqa: BLE001
+        pcp_size = 1
+
+    if pcp_size <= 1:
+        return values
+
+    total_queries = int(values.shape[0])
+    padded_total = pcp_pad_len(total_queries, pcp_size)
+    values = pcp_round_robin_split(
+        pcp_pad_dense(values, padded_total - total_queries), pcp_size
+    )
+    return values[:num_tokens]
+
+
+def _pad_query_ranges_for_indexer(
+    cu_starts: torch.Tensor, cu_ends: torch.Tensor, num_tokens: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pad CP/DP dummy query rows with zero-length KV ranges."""
+    num_ranges = int(cu_starts.shape[0])
+    if num_ranges == num_tokens:
+        return cu_starts, cu_ends
+    if num_ranges > num_tokens:
+        raise RuntimeError(
+            "[SGL+ATOM] sparse indexer query metadata has more rows than input "
+            f"tokens: ranges={num_ranges}, tokens={num_tokens}."
+        )
+
+    pad_len = num_tokens - num_ranges
+    pad_starts = cu_starts.new_zeros(pad_len)
+    pad_ends = cu_ends.new_zeros(pad_len)
+    return (
+        torch.cat([cu_starts, pad_starts], dim=0),
+        torch.cat([cu_ends, pad_ends], dim=0),
+    )
+
+
 def _build_sglang_block_table(forward_batch, page_size: int) -> torch.Tensor:
     req_pool_indices = forward_batch.req_pool_indices
     req_to_token = forward_batch.req_to_token_pool.req_to_token
@@ -191,6 +281,7 @@ def _build_sglang_block_table(forward_batch, page_size: int) -> torch.Tensor:
 def _build_sparse_req_id_per_token_for_sglang(
     forward_batch,
     device: torch.device,
+    num_tokens: int | None = None,
 ) -> torch.Tensor:
     bs = int(forward_batch.batch_size)
     req_ids = torch.arange(bs, dtype=torch.int32, device=device)
@@ -199,7 +290,12 @@ def _build_sparse_req_id_per_token_for_sglang(
     query_lens = getattr(forward_batch, "extend_seq_lens", None)
     if query_lens is None:
         query_lens = forward_batch.seq_lens
-    return torch.repeat_interleave(req_ids, query_lens[:bs].to(torch.int32))
+    req_id_per_token = torch.repeat_interleave(req_ids, query_lens[:bs].to(torch.int32))
+    if num_tokens is not None:
+        req_id_per_token = _maybe_apply_pcp_dense_query_split(
+            req_id_per_token, int(num_tokens)
+        )
+    return req_id_per_token
 
 
 def _supports_sparse_mla_fast_metadata(
@@ -230,8 +326,8 @@ def forward_sparse_mla_for_sglang(
     forward_batch,
     topk_indices: torch.Tensor,
     save_kv_cache: bool = True,
-    input_dtype: Optional[torch.dtype] = None,
-    q_scale: Optional[torch.Tensor] = None,
+    input_dtype: torch.dtype | None = None,
+    q_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """ATOM sparse MLA path for SGLang DeepSeek-V3.2."""
     if save_kv_cache and k is not None:
@@ -247,7 +343,7 @@ def forward_sparse_mla_for_sglang(
     page_size = int(getattr(forward_batch.token_to_kv_pool, "page_size", 1))
 
     req_id_per_token = _build_sparse_req_id_per_token_for_sglang(
-        forward_batch, q.device
+        forward_batch, q.device, int(num_tokens)
     )
     block_table = _build_sglang_block_table(forward_batch, page_size).to(
         dtype=torch.int32
@@ -355,8 +451,10 @@ def forward_sparse_mla_for_sglang(
             max_seqlen_qo=max_seqlen_qo,
             uni_seqlen_qo=uni_seqlen_qo,
             fast_mode=True,
-            dtype_q=q.dtype,
-            dtype_kv=k_buffer.dtype,
+            dtype_q_nope=q.dtype,
+            dtype_q_rope=q.dtype,
+            dtype_kv_nope=k_buffer.dtype,
+            dtype_kv_rope=k_buffer.dtype,
         )
 
     mla_decode_fwd(
@@ -391,7 +489,7 @@ def sparse_attn_indexer_sglang_plugin_mode(
     k: torch.Tensor,
     weights: torch.Tensor,
     quant_block_size: int,
-    scale_fmt: Optional[str],
+    scale_fmt: str | None,
     topk_tokens: int,
     head_dim: int,
     max_model_len: int,
@@ -506,6 +604,12 @@ def sparse_attn_indexer_sglang_plugin_mode(
         return weights
 
     cu_starts, cu_ends = _build_sglang_query_ranges(forward_batch)
+    cu_starts, cu_ends = _maybe_apply_pcp_query_split(
+        cu_starts, cu_ends, int(num_tokens)
+    )
+    cu_starts, cu_ends = _pad_query_ranges_for_indexer(
+        cu_starts, cu_ends, int(num_tokens)
+    )
     total_kv = int(forward_batch.seq_lens_sum)
     k_fp8 = torch.empty([total_kv, head_dim], device=k.device, dtype=dtypes.fp8)
     k_scale = torch.empty([total_kv, 1], device=k.device, dtype=torch.float32)
@@ -553,7 +657,7 @@ def sparse_attn_indexer_sglang_fake(
     k: torch.Tensor,
     weights: torch.Tensor,
     quant_block_size: int,
-    scale_fmt: Optional[str],
+    scale_fmt: str | None,
     topk_tokens: int,
     head_dim: int,
     max_model_len: int,

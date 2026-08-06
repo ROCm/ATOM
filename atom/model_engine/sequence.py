@@ -78,6 +78,8 @@ class Sequence:
         self.num_prompt_tokens = len(token_ids)
         self.num_rejected = 0
         self.num_cached_tokens = 0
+        self.num_compressed_hit_blocks = 0
+        self.prefix_cache_hit_tokens = 0
         # True iff this seq is mid-prefill (chunked prefill produced KV for
         # some prompt tokens but not all). Maintained by the scheduler:
         # set in postprocess when an advance leaves prompt tokens remaining,
@@ -120,6 +122,11 @@ class Sequence:
         # save speculative tokens if is_deferred_output = False or prefill is inter
         self.spec_token_ids: np.ndarray = np.array([], dtype=np.int32)
 
+        # DSpark Phase 2: scheduler-chosen verify length from the previous
+        # decode step's propose(). None = no schedule yet -> verify mtp_k (full).
+        # Next decode step sizes this seq's verification to dspark_next_ell+1.
+        self.dspark_next_ell: Optional[int] = None
+
         # statistics fields
         self.arrive_time = 0.0
         self.first_token_time = 0.0
@@ -129,6 +136,14 @@ class Sequence:
         # kv_transfer params
         self.kv_transfer_params = kv_transfer_params
         self.kv_transfer_params_output = None
+        if kv_transfer_params:
+            self.prefix_cache_hit_tokens = kv_transfer_params.get(
+                "prefix_cache_hit_tokens", 0
+            )
+
+        self.prefix_cache_hit_tokens = (kv_transfer_params or {}).get(
+            "prefix_cache_hit_tokens", 0
+        )
 
         # accepted tokens for spec decode
         self.num_bonus_tokens = 0

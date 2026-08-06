@@ -1,6 +1,10 @@
 #!/bin/bash
 set -euo pipefail
 
+# The CI checkout is mounted into the container. Avoid leaving root-owned
+# __pycache__ files in that host workspace between matrix jobs.
+export PYTHONDONTWRITEBYTECODE="${PYTHONDONTWRITEBYTECODE:-1}"
+
 # Usage:
 #   .github/scripts/atom_sglang_test.sh start
 #   .github/scripts/atom_sglang_test.sh launch
@@ -39,7 +43,8 @@ fi
 MAX_WAIT_RETRIES=${MAX_WAIT_RETRIES:-60}
 WAIT_INTERVAL_SEC=${WAIT_INTERVAL_SEC:-30}
 SGLANG_PORT=${SGLANG_PORT:-8000}
-SGLANG_HOST=${SGLANG_HOST:-localhost}
+# Prefer IPv4 loopback: Docker often sets disable_ipv6=1 while localhost still resolves to ::1.
+SGLANG_HOST=${SGLANG_HOST:-127.0.0.1}
 SGLANG_PID_FILE=${SGLANG_PID_FILE:-/tmp/atom_sglang.pid}
 SGLANG_LOG_FILE=${SGLANG_LOG_FILE:-/tmp/atom_sglang.log}
 RESULT_DIR=${RESULT_DIR:-/tmp/atom_sglang_accuracy_results}
@@ -66,15 +71,24 @@ if [[ -z "${MODEL_NAME}" || -z "${MODEL_PATH}" ]]; then
 fi
 
 prepare_runtime_paths() {
-  if [[ -d /app/sglang/python && -d /app/ATOM ]]; then
-    local path_prefix="/app/sglang/python:/app/ATOM"
-    if [[ -d /app/aiter-test ]]; then
-      path_prefix="/app/aiter-test:${path_prefix}"
-    fi
-    export PYTHONPATH="${path_prefix}${PYTHONPATH:+:${PYTHONPATH}}"
-    cd /app
-  elif [[ -d /workspace ]]; then
+  local path_prefix=""
+  if [[ -d /app/aiter-test ]]; then
+    path_prefix="/app/aiter-test"
+  fi
+  if [[ -d /app/sglang/python ]]; then
+    path_prefix="${path_prefix:+${path_prefix}:}/app/sglang/python"
+  fi
+  if [[ -d /workspace ]]; then
+    # The CI checkout is mounted at /workspace; prefer it over the ATOM copy
+    # baked into the base image so validation covers the current branch.
+    path_prefix="${path_prefix:+${path_prefix}:}/workspace"
     cd /workspace
+  elif [[ -d /app/ATOM ]]; then
+    path_prefix="${path_prefix:+${path_prefix}:}/app/ATOM"
+    cd /app
+  fi
+  if [[ -n "${path_prefix}" ]]; then
+    export PYTHONPATH="${path_prefix}${PYTHONPATH:+:${PYTHONPATH}}"
   fi
 }
 
@@ -107,17 +121,10 @@ emit_new_sglang_logs() {
 }
 
 wait_server_ready() {
+  local expected_model_path="${1:-}"
   echo ""
   echo "========== Waiting for SGLang server (${MODEL_NAME}) =========="
   for ((i=1; i<=MAX_WAIT_RETRIES; i++)); do
-    if curl -fsS "http://127.0.0.1:${SGLANG_PORT}/v1/models" >/dev/null 2>&1; then
-      emit_new_sglang_logs
-      echo "SGLang server is ready for ${MODEL_NAME}."
-      return 0
-    fi
-
-    emit_new_sglang_logs
-
     if [[ -f "${SGLANG_PID_FILE}" ]]; then
       local pid
       pid=$(cat "${SGLANG_PID_FILE}")
@@ -129,6 +136,45 @@ wait_server_ready() {
       fi
     fi
 
+    local models_response
+    models_response=$(curl -fsS "http://127.0.0.1:${SGLANG_PORT}/v1/models" 2>/dev/null || true)
+    if [[ -n "${models_response}" ]]; then
+      if [[ -z "${expected_model_path}" ]] || \
+        MODELS_RESPONSE="${models_response}" EXPECTED_MODEL_PATH="${expected_model_path}" python3 - <<'PY'
+import json
+import os
+import sys
+
+
+def normalize_model_id(model_id: str) -> str:
+    model_id = model_id.rstrip("/")
+    if model_id.startswith("/models/"):
+        return model_id[len("/models/") :]
+    return model_id
+
+
+expected_model = normalize_model_id(os.environ["EXPECTED_MODEL_PATH"])
+try:
+    payload = json.loads(os.environ["MODELS_RESPONSE"])
+except Exception:
+    sys.exit(1)
+
+served_models = {
+    normalize_model_id(item.get("id", ""))
+    for item in payload.get("data", [])
+    if isinstance(item, dict) and isinstance(item.get("id"), str)
+}
+
+sys.exit(0 if expected_model in served_models else 1)
+PY
+      then
+        emit_new_sglang_logs
+        echo "SGLang server is ready for ${MODEL_NAME}."
+        return 0
+      fi
+    fi
+
+    emit_new_sglang_logs
     echo "Waiting for SGLang server... (${i}/${MAX_WAIT_RETRIES})"
     sleep "${WAIT_INTERVAL_SEC}"
   done
@@ -217,7 +263,7 @@ PY
   echo "Server PID: $(cat "${SGLANG_PID_FILE}")"
 
   if [[ "${wait_for_ready}" == "1" ]]; then
-    wait_server_ready
+    wait_server_ready "${resolved_model_path}"
   fi
 }
 
@@ -304,6 +350,62 @@ PY
   if [[ "${result_file}" != "${flat_result_file}" ]]; then
     cp -f "${result_file}" "${flat_result_file}"
     result_file="${flat_result_file}"
+  fi
+
+  local server_info_file="/tmp/atom_sglang_server_info.json"
+  if curl -fsS "http://127.0.0.1:${SGLANG_PORT}/server_info" -o "${server_info_file}" 2>/dev/null; then
+    RESULT_FILE="${result_file}" SERVER_INFO_FILE="${server_info_file}" python3 - <<'PY'
+import json
+import math
+import os
+
+with open(os.environ["SERVER_INFO_FILE"], encoding="utf-8") as f:
+    server_info = json.load(f)
+
+acceptance_rates = []
+accept_lengths = []
+for state in server_info.get("internal_states", []):
+    accept_length = state.get("avg_spec_accept_length")
+    num_draft_tokens = state.get("speculative_num_draft_tokens")
+    num_steps = state.get("speculative_num_steps")
+    if num_draft_tokens and num_draft_tokens > 1:
+        draft_tokens_per_round = int(num_draft_tokens) - 1
+    elif num_steps and num_steps > 0:
+        draft_tokens_per_round = int(num_steps)
+    else:
+        draft_tokens_per_round = 0
+    if accept_length is None or not draft_tokens_per_round:
+        continue
+    acceptance_rate = (float(accept_length) - 1.0) / draft_tokens_per_round
+    if not math.isfinite(acceptance_rate) or not 0.0 <= acceptance_rate <= 1.0:
+        raise ValueError(
+            f"Invalid SGLang MTP acceptance rate {acceptance_rate} "
+            f"from accept length {accept_length} and "
+            f"{draft_tokens_per_round} draft tokens per round"
+        )
+    acceptance_rates.append(acceptance_rate)
+    accept_lengths.append(float(accept_length))
+
+if acceptance_rates:
+    with open(os.environ["RESULT_FILE"], encoding="utf-8") as f:
+        data = json.load(f)
+    metadata = data.setdefault("atom_ci_metadata", {})
+    metadata["mtp_acceptance_rate"] = (
+        sum(acceptance_rates) / len(acceptance_rates) * 100.0
+    )
+    metadata["mtp_accept_length"] = sum(accept_lengths) / len(accept_lengths)
+    metadata["avg_tokens_per_forward"] = metadata["mtp_accept_length"]
+    with open(os.environ["RESULT_FILE"], "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    print(
+        f"MTP acceptance rate: {metadata['mtp_acceptance_rate']:.2f}%, "
+        f"accept length: {metadata['mtp_accept_length']:.4f}"
+    )
+else:
+    print("MTP acceptance: no speculative decoding metrics found.")
+PY
+  else
+    echo "MTP acceptance: /server_info not reachable."
   fi
 
   if [[ -n "${SGLANG_DOCKER_IMAGE:-}" ]] || [[ -n "${GPU_NAME:-}" ]] || [[ -n "${GPU_VRAM_GB:-}" ]] || [[ -n "${ROCM_VERSION:-}" ]]; then

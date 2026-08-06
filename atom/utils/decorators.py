@@ -1,30 +1,32 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import (
-    Callable,
-    Optional,
-    ParamSpec,
-    TypeVar,
-    Union,
-    overload as _overload,
-)
 import inspect
 import os
 import sys
+import time
+from abc import abstractmethod
+from collections.abc import Callable
+from contextlib import contextmanager
 from functools import wraps
 from types import CodeType
-from abc import abstractmethod
-from contextlib import contextmanager
+from typing import (
+    Literal,
+    Optional,
+    ParamSpec,
+    TypeVar,
+)
+from typing import (
+    overload as _overload,
+)
 from unittest.mock import patch
 
-from torch._dynamo.symbolic_convert import InliningInstructionTranslator
 import torch
-import torch.nn as nn
-import time
+from torch import nn
+from torch._dynamo.symbolic_convert import InliningInstructionTranslator
 
-from atom.config import CompilationConfig, Config, CompilationLevel
-
+from atom.config import CompilationConfig, CompilationLevel, Config
+from atom.models.utils import IntermediateTensors
 from atom.utils.graph_marker import graph_marker
 
 # from atom.utils import start_monitoring_torch_compile
@@ -41,7 +43,7 @@ def _resolve_record_span_name(
     func: Callable,
     args,
     kwargs,
-    explicit_prefix: Optional[str] = None,
+    explicit_prefix: str | None = None,
 ):
     if explicit_prefix is not None:
         return str(explicit_prefix)
@@ -60,10 +62,23 @@ def _resolve_record_span_name(
 
     if isinstance(runtime_prefix, str) and runtime_prefix:
         return runtime_prefix
+
+    if args:
+        trace_prefix_fn = getattr(args[0], "get_trace_prefix", None)
+        if callable(trace_prefix_fn):
+            try:
+                trace_prefix = trace_prefix_fn(*args[1:], **kwargs)
+                if isinstance(trace_prefix, str) and trace_prefix:
+                    return trace_prefix
+            except Exception:
+                pass
+        owner_prefix = getattr(args[0], "prefix", None)
+        if isinstance(owner_prefix, str) and owner_prefix:
+            return owner_prefix
     return span_name
 
 
-def _decorate_record_function(func: Callable, prefix: Optional[str] = None):
+def _decorate_record_function(func: Callable, prefix: str | None = None):
     @wraps(func)
     def _wrapped(*args, **kwargs):
         # Keep this decorator no-op unless mark-trace is enabled.
@@ -119,7 +134,7 @@ def _graph_marker_first_tensor(obj, name: str):
     return obj, False
 
 
-def _decorate_mark_trace_torch_compile(func: Callable, prefix: Optional[str] = None):
+def _decorate_mark_trace_torch_compile(func: Callable, prefix: str | None = None):
     if getattr(func, "__mark_trace_wrapped__", False):
         return func
 
@@ -142,11 +157,10 @@ def _decorate_mark_trace_torch_compile(func: Callable, prefix: Optional[str] = N
         marker_prefix = str(prefix) if prefix is not None else owner_name
         start_idx = 0
         if skip_first_arg and args:
-            marker_prefix = (
-                str(prefix)
-                if prefix is not None
-                else getattr(args[0], "prefix", owner_name)
-            )
+            if prefix is None:
+                marker_prefix = getattr(args[0], "prefix", owner_name)
+            else:
+                marker_prefix = str(prefix)
             start_idx = 1
         if prefix is None:
             runtime_prefix = kwargs.get("prefix")
@@ -176,6 +190,33 @@ def _decorate_mark_trace_torch_compile(func: Callable, prefix: Optional[str] = N
     return wrapped
 
 
+def _is_torch_compiling() -> bool:
+    try:
+        compiler = getattr(torch, "compiler", None)
+        if compiler is not None and bool(compiler.is_compiling()):
+            return True
+    except Exception:
+        pass
+    try:
+        return bool(torch._dynamo.is_compiling())
+    except Exception:
+        return False
+
+
+def _decorate_mark_trace_auto(func: Callable, prefix: str | None = None):
+    compiled_wrapped = _decorate_mark_trace_torch_compile(func, prefix)
+    record_wrapped = _decorate_record_function(func, prefix)
+
+    @wraps(func)
+    def wrapped(*args, **kwargs):
+        if _is_torch_compiling():
+            return compiled_wrapped(*args, **kwargs)
+        return record_wrapped(*args, **kwargs)
+
+    wrapped.__mark_trace_wrapped__ = True
+    return wrapped
+
+
 # Overloads preserve the decorated callable's signature for pyright.
 # Without them, `@mark_trace` instances were inferred as plain `Callable`,
 # and class instances whose `__call__` was wrapped (DualRMSNorm, LinearBase,
@@ -185,23 +226,27 @@ def mark_trace(func: Callable[_P, _R], /) -> Callable[_P, _R]: ...
 @_overload
 def mark_trace(
     *,
-    torch_compile: bool = ...,
-    prefix: Optional[str] = ...,
+    torch_compile: bool | Literal["auto"] = ...,
+    prefix: str | None = ...,
 ) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]: ...
 def mark_trace(
-    func: Optional[Callable] = None,
+    func: Callable | None = None,
     *,
-    torch_compile: bool = True,
-    prefix: Optional[str] = None,
+    torch_compile: bool | Literal["auto"] = "auto",
+    prefix: str | None = None,
 ):
     """
     Unified trace decorator.
 
     - torch_compile=True: original graph_marker-based mark_trace behavior.
     - torch_compile=False: record_function behavior.
+    - torch_compile="auto": graph_marker while Dynamo is compiling, otherwise
+      record_function.
     """
 
     def _decorate(target: Callable):
+        if torch_compile == "auto":
+            return _decorate_mark_trace_auto(target, prefix)
         if torch_compile:
             return _decorate_mark_trace_torch_compile(target, prefix)
         return _decorate_record_function(target, prefix)
@@ -262,7 +307,7 @@ class TorchCompileWrapperWithCustomDispatcher:
     def __init__(
         self,
         vllm_config: Config,
-        compiled_callable: Optional[Callable] = None,
+        compiled_callable: Callable | None = None,
         compilation_level: int = 0,
     ):
         self.vllm_config = vllm_config
@@ -354,7 +399,7 @@ class TorchCompileWrapperWithCustomDispatcher:
             msg = (
                 "Assigning / modifying buffers of nn.Module during forward pass is not allowed when using cudagraph inside the compiler because it will cause silent errors. Please use eager mode or fix the code. The following code contains clues about which buffer is being modified (please search for the usage of the function `update`):\n"
                 + src
-            )  # noqa
+            )
             raise RuntimeError(msg)
 
     @contextmanager
@@ -366,17 +411,17 @@ class TorchCompileWrapperWithCustomDispatcher:
         the code object in the function and call it.
 
         See https://dev-discuss.pytorch.org/t/what-is-the-relationship-requirement-among-original-bytecode-transformed-bytecode-and-bytecode-returned-by-hooks-in-dynamo/1693/7 for more details.
-        """  # noqa
+        """
         self.__class__.forward.__code__ = self.compiled_codes[index]
         yield
         self.__class__.forward.__code__ = self.original_code_object
 
 
 def support_torch_compile(
-    cls: Optional[_T] = None,
+    cls: _T | None = None,
     *,
-    dynamic_arg_dims: Optional[dict[str, Union[int, list[int]]]] = None,
-) -> Union[Callable[[_T], _T], _T]:
+    dynamic_arg_dims: dict[str, int | list[int]] | None = None,
+) -> Callable[[_T], _T] | _T:
     def cls_decorator_helper(cls: _T) -> _T:
         # helper to pass `dynamic_arg_dims`` to `_support_torch_compile``
         # to avoid too much indentation for `_support_torch_compile``
@@ -416,7 +461,7 @@ def support_torch_compile(
 
 def _support_torch_compile(
     cls: _T,
-    dynamic_arg_dims: dict[str, Union[int, list[int]]],
+    dynamic_arg_dims: dict[str, int | list[int]],
 ) -> _T:
     """
     A decorator to add support for compiling the forward method of a class.
@@ -481,6 +526,15 @@ def _support_torch_compile(
                             "Unsupported dynamic dimensions"
                             f" {dims} for argument {k} with type {type(arg)}."
                         )
+            # PP non-first stages receive activations inside an
+            # IntermediateTensors container, so the Tensor-typed arg inference
+            # above never marks them; mark the token dim of each contained
+            # tensor here so inductor keeps the general-shape graph dynamic.
+            for arg in bound_args.arguments.values():
+                if isinstance(arg, IntermediateTensors):
+                    for t in arg.tensors.values():
+                        if isinstance(t, torch.Tensor):
+                            torch._dynamo.mark_dynamic(t, 0)
             # here, it is the starting point of the `torch.compile` process
             start_monitoring_torch_compile(self.atom_config)
             # print("Start compiling function %s",

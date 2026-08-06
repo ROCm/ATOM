@@ -14,6 +14,7 @@ from atom.model_ops.lm_head_argmax import lm_head_argmax_pack
 from atom.model_ops.utils import atom_parameter
 from atom.plugin import is_plugin_mode
 from atom.utils import envs
+from atom.utils.decorators import mark_trace
 from atom.utils.forward_context import ForwardContext, get_forward_context
 from aiter.tuned_gemm import tgemm
 
@@ -140,8 +141,10 @@ class VocabParallelEmbedding(nn.Module):
         self,
         num_embeddings: int,
         embedding_dim: int,
+        prefix: str = "",
     ):
         super().__init__()
+        self.prefix = prefix
         self.tp_rank = get_tp_group().rank_in_group
         self.tp_size = get_tp_group().world_size
         assert num_embeddings % self.tp_size == 0
@@ -162,6 +165,7 @@ class VocabParallelEmbedding(nn.Module):
         assert param_data.size() == loaded_weight.size()
         param_data.copy_(loaded_weight)
 
+    @mark_trace
     def forward(self, x: torch.Tensor):
         # Torch compile will make logical_and, mask, embedding in a fused triton kernel, but make accuracy issue in MTP.
         if self.tp_size > 1:

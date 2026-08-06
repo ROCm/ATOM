@@ -34,6 +34,10 @@ on:
         description: "Benchmark Kimi-K2.7-Code-MXFP4"
         type: boolean
         default: true
+      kimi-k3:
+        description: "Benchmark Kimi-K3 (+ DSpark)"
+        type: boolean
+        default: true
       m3-mxfp8:
         description: "Benchmark MiniMax-M3-MXFP8 (+ EAGLE3)"
         type: boolean
@@ -382,7 +386,7 @@ jobs:
         env:
           SERVER_ARGS: ${{ matrix.cell.server_args }}
         run: |
-          if [ -d "/models" ]; then MODEL_DIR="/models/${{ matrix.cell.model_path }}"
+          if [ -n "${MODEL_HOST_ROOT:-}" ]; then MODEL_DIR="/models/${{ matrix.cell.model_path }}"
           else MODEL_DIR="${{ matrix.cell.model_path }}"; fi
 
           # cell.env_vars are already injected into the container env via
@@ -404,7 +408,7 @@ jobs:
         run: |
           set -uo pipefail  # no -e: allow per-config failure without aborting loop
 
-          if [ -d "/models" ]; then MODEL_DIR="/models/${{ matrix.cell.model_path }}"
+          if [ -n "${MODEL_HOST_ROOT:-}" ]; then MODEL_DIR="/models/${{ matrix.cell.model_path }}"
           else MODEL_DIR="${{ matrix.cell.model_path }}"; fi
 
           FAIL_COUNT=0
@@ -593,7 +597,7 @@ jobs:
 
             echo "=== Analyzing: $RANK0_TRACE ==="
             cd "profiler-analysis/$config"
-            python ../../tools/parse_trace.py "../../$RANK0_TRACE" --layer 3 2>&1 | tee analysis.log || true
+            python ../../tools/parse_trace.py "../../$RANK0_TRACE" 2>&1 | tee analysis.log || true
             python ../../tools/analyze_trace_summary.py "../../$RANK0_TRACE" \
               --output performance_summary.md 2>&1 || true
             if [ -f performance_summary.md ]; then

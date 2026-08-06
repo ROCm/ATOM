@@ -260,7 +260,6 @@ class AsyncIOProcManager:
         io_addrs = [get_open_zmq_ipc_path(), get_open_zmq_ipc_path()]
         self.procs: list[multiprocessing.Process] = []
         ctx = get_mp_context()
-        self.mp_ctx = ctx
         self.runner_label = runner.split(".")[-1]
         self.label = f"AsyncIOProcManager({self.runner_label})"
 

@@ -65,6 +65,8 @@ class KVConnectorOutput:
         finished_recving: Request IDs whose KV receive completed on this worker.
         failed_recving: Request IDs whose KV receive failed on this worker.
         finished_saving: Request IDs whose local fire-and-forget save completed.
+        finished_loading: Request IDs whose local/offload KV load completed.
+        failed_loading: Request IDs whose local/offload KV load failed.
         expected_finished_count: How many finished notifications should be
             expected per request (used by the aggregator).
     """
@@ -73,6 +75,8 @@ class KVConnectorOutput:
     finished_recving: set[ReqId] = field(default_factory=set)
     failed_recving: set[ReqId] = field(default_factory=set)
     finished_saving: set[ReqId] = field(default_factory=set)
+    finished_loading: set[ReqId] = field(default_factory=set)
+    failed_loading: set[ReqId] = field(default_factory=set)
     expected_finished_count: int = 0
 
     def is_empty(self) -> bool:
@@ -82,6 +86,8 @@ class KVConnectorOutput:
             and not self.finished_recving
             and not self.failed_recving
             and not self.finished_saving
+            and not self.finished_loading
+            and not self.failed_loading
         )
 
     def __repr__(self) -> str:
@@ -89,7 +95,9 @@ class KVConnectorOutput:
             f"KVConnectorOutput(sending={self.finished_sending}, "
             f"recving={self.finished_recving}, "
             f"failed_recving={self.failed_recving}, "
-            f"finished_saving={self.finished_saving})"
+            f"finished_saving={self.finished_saving}, "
+            f"loading={self.finished_loading}, "
+            f"failed_loading={self.failed_loading})"
         )
 
 
@@ -110,6 +118,8 @@ class ReqMeta:
     tp_size: int
     remote_dp_size: int
     remote_dp_rank: int = 0
+    remote_pp_size: int = 1
+    remote_tp_size: int = 0
     transfer_id: int = 0
     local_slot_index: int = -1
     # paged-SWA: parallel block ids into the SEPARATE SWA pool. Empty for
@@ -173,6 +183,8 @@ class ConnectorMetadata:
             remote_handshake_port=kv_transfer_params.get("remote_handshake_port"),
             remote_dp_size=kv_transfer_params.get("remote_dp_size", 1),
             remote_dp_rank=kv_transfer_params.get("remote_dp_rank", 0),
+            remote_pp_size=kv_transfer_params.get("remote_pp_size", 1),
+            remote_tp_size=kv_transfer_params.get("remote_tp_size", 0),
             tp_size=(
                 kv_transfer_params.get("tp_size")
                 if "tp_size" in kv_transfer_params
