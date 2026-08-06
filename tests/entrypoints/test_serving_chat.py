@@ -3,18 +3,16 @@
 
 """Tests for chat completion serving logic (chunk creation, response building)."""
 
-import json
 import asyncio
 import json
 
-
 from atom.entrypoints.openai.serving_chat import (
-      build_chat_response,
-      build_chat_response_multi,
-      create_chat_chunk,
-      stream_chat_response,
-      stream_chat_response_fanout,
-  )
+    build_chat_response,
+    build_chat_response_multi,
+    create_chat_chunk,
+    stream_chat_response,
+    stream_chat_response_fanout,
+)
 
 # ============================================================================
 # create_chat_chunk Tests
@@ -226,6 +224,7 @@ class TestCreateChatChunkWithIndex:
         chunk_str = create_chat_chunk("req", "model", delta={"content": "hi"}, index=3)
         data = json.loads(chunk_str[6:])
         assert data["choices"][0]["index"] == 3
+
 
 class TestStreamingRoleChunkContent:
     """End-to-end regression test for the streamed role-announcement chunk.
