@@ -1915,3 +1915,37 @@ class MergedReplicatedLinear(ReplicatedLinear):
             shard_size = self.output_sizes[loaded_shard_id]
         param_data = param_data.narrow(0, shard_offset, shard_size)
         param.weight_loader_process(param_data, loaded_weight)
+
+    def forward_shard(
+        self, x: torch.Tensor, shard_id: int, otype=dtypes.bf16
+    ) -> torch.Tensor:
+        """Produce only shard `shard_id`'s output columns.
+
+        Callers merge projections to share the read of `x` (DeepSeek-style
+        q_a + kv_a); a caller that wants only one shard otherwise pays for the
+        other's N columns. The merged weight is row-major
+        `[sum(output_sizes), input_size]` with the shards in order, so a shard's
+        rows are a contiguous `narrow` -- the narrow GEMM is the same math over
+        the same bytes with a smaller N, no gather and no copy.
+
+        Unquantized only. Every quantized path either carries per-shard scales
+        that would have to be sliced in lockstep with the weight, or
+        (per_Token / per_1x32 / preshuffled per_1x128) has been through
+        `shuffle_weights`, after which row r of the tensor is no longer output
+        row r and the narrow would silently return the wrong columns. Those keep
+        the merged GEMM and slice its result, so the caller sees one contract.
+
+        Not bit-identical to slicing the merged result: the tuned solution is
+        chosen per (M, N, K), so a different N can mean a different tile or
+        split-K and therefore a different fp32 accumulation order.
+        """
+        offset = sum(self.output_sizes[:shard_id])
+        size = self.output_sizes[shard_id]
+        if self.quant_type.value != QuantType.No.value:
+            return self.forward(x, otype=otype).narrow(-1, offset, size)
+        return tgemm.mm(
+            x,
+            self.weight.narrow(0, offset, size),
+            None if self.bias is None else self.bias.narrow(0, offset, size),
+            otype=otype,
+        )
