@@ -144,8 +144,7 @@ def _extract_layer_idx(prefix: str) -> int:
 # RMSNorm+quant fusion is scheme-agnostic: the aiter fused RMSNorm kernels
 # (RMSNorm._aiter_rms_quant and deepseek's _fuse_rmsnorm_quant) emit any of these
 # dynamic activation quant layouts, so a preceding norm can fold the quant for a
-# Linear that runs one of them. Everything else (per_Tensor, static-scale, No)
-# keeps the standalone quant inside the Linear.
+# Linear that runs one of them.
 _RMS_FUSABLE_QUANT_TYPES = (
     QuantType.per_1x32,
     QuantType.per_1x128,
@@ -284,9 +283,7 @@ class KimiMLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # `x` arrives as a (fp8, scale) tuple when the preceding RMSNorm fused its
-        # activation quant (dense-MLP layers); gate_up_proj then consumes it
-        # directly. Plain-tensor input (shared experts, unfused layers) keeps the
-        # standalone quant inside gate_up_proj.
+        # activation quant (dense-MLP layers)
         x_scale = None
         if isinstance(x, tuple):
             x, x_scale = x
@@ -648,11 +645,6 @@ class KimiFullAttention(nn.Module):
             prefix=prefix,
         )
 
-        # --- RMSNorm(+quant) fusion metadata (general across fp8 / fp4x2) ------
-        # q/kv latent norms + optional q-activation quant fuse into ONE kernel via
-        # _fuse_rmsnorm_quant. The scheme is q_b_proj's (the consumer of the normed
-        # q); when it is not a fusable quant scheme we still fuse the two norms
-        # (quant_type=No, bf16 out) so the dual-norm stays a single launch.
         qknorm_type, qknorm_dtype = _effective_layer_quant(
             quant_config, f"{prefix}.q_b_proj"
         )
@@ -676,8 +668,7 @@ class KimiFullAttention(nn.Module):
     ) -> torch.Tensor:
         # deepseek_v2 pattern: one _fuse_rmsnorm_quant kernel does q_a norm +
         # kv_a norm (+ q-activation quant), then q's scale is forwarded into the
-        # MLA module (q_proj consumes it). kv_c_normed stays bf16 -- it is written
-        # to the KV cache and re-projected inside MLA, so it must not be quantized.
+        # MLA module (q_proj consumes it).
         from atom.models.deepseek_v2 import _fuse_rmsnorm_quant
 
         # hidden_states is a (fp8, scale) tuple when input_layernorm fused the
