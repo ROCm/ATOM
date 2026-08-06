@@ -40,10 +40,13 @@ class KVCacheTensor:
     """
 
     layer_num: int
-    k_cache: torch.Tensor = torch.tensor([])
-    v_cache: torch.Tensor = torch.tensor([])
+    k_cache: torch.Tensor = field(default_factory=lambda: torch.tensor([]))
+    v_cache: torch.Tensor = field(default_factory=lambda: torch.tensor([]))
     k_scale: torch.Tensor = None
     v_scale: torch.Tensor = None
+    # DSA sparse layers (GLM-5.2 / DeepSeek-V3.2): indexer key cache, block-major
+    # ``(num_blocks, block_size, aligned_index_dim)``. Omitted for non-DSA layers.
+    index_cache: torch.Tensor | None = None
 
 
 @dataclass
@@ -314,8 +317,15 @@ class QuantizationConfig:
             "mxfp4",
             "mxfp8",
             "quark",
+            "compressed-tensors",
         ]:
             self.online_quant = True
+            if self.quant_method == "compressed-tensors":
+                logger.warning(
+                    "Online quant with compressed-tensors is not fully supported. "
+                    "Be careful about the online quant config setting when launching "
+                    "the server."
+                )
             online_parser = get_quant_parser("online_quant")
             online_parsed_quant_config = online_parser.parse(online_quant_config)
             self.online_global_spec = online_parsed_quant_config.global_spec

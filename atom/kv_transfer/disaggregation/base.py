@@ -39,7 +39,7 @@ class KVConnectorBase(ABC):
         """Register local KV cache tensors for remote access.
 
         Called once after model loading and KV cache allocation. ``num_blocks``
-        is the physical KV block count (used by the offload connector to
+        is the scheduler-visible block count (used by the offload connector to
         byte-slice MLA's token-major latent cache); connectors that don't need
         it may ignore it.
         """
