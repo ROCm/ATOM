@@ -21,6 +21,7 @@ the methods listed in each op's docstring.
 Currently registered:
   - torch.ops.aiter.maybe_dual_stream_forward — V2/V3.2/V4 MoE
   - torch.ops.aiter.indexer_score_topk       — V4 sparse indexer
+  - torch.ops.aiter.wo_a_mxscale             — V4 grouped output LoRA (gfx950)
 """
 
 import torch
@@ -204,5 +205,61 @@ direct_register_custom_op(
     op_func=tbo_all_reduce,
     mutates_args=(),
     fake_impl=_tbo_all_reduce_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+# ---------------------------------------------------------------------------
+# Grouped output-LoRA (`wo_a`) fp8 e8m0 mxscale batched GEMM (V4, gfx950)
+# ---------------------------------------------------------------------------
+#
+# Caller contract (the DeepseekV4Attention module looked up by `layer_name`):
+#   - `_wo_a_grouped_lora(o) -> Tensor`  ([num_tokens, dim] -> [M, G, N])
+#   - `n_local_groups: int`, `o_lora_rank: int`
+#
+# Why opaque: the mxscale grouped LoRA quantizes the activation and dispatches
+# `aiter.batched_gemm_a8w8_mxscale`, whose per-(g,m,n,k) tuned-CSV lookup +
+# kernel-id heuristic is plain Python/pandas. Tracing that under Dynamo forces
+# graph breaks in the hot per-layer path (V4: 61 layers). Wrapping it in this
+# op keeps the whole selection + BMM eager and opaque — the tuned CSV is used
+# as-is, CUDAGraph capture stays transparent (same stream work), and only the
+# Python dispatch is hidden. The BF16 grouped-LoRA path is NOT routed here so
+# inductor can still fuse its einsum.
+
+
+def wo_a_mxscale(
+    o: torch.Tensor, positions: torch.Tensor, layer_name: str
+) -> torch.Tensor:
+    self = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    # `prefix` is what mark_trace names the span after; without it the span falls
+    # back to the bare function name and this path lands under a different label
+    # than the BF16 one, which makes the two traces look like different modules.
+    return self._wo_a_grouped_lora(o, positions, prefix=f"{layer_name}.wo_a")
+
+
+def _wo_a_mxscale_fake(
+    o: torch.Tensor, positions: torch.Tensor, layer_name: str
+) -> torch.Tensor:
+    self = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    return torch.empty(
+        o.shape[0],
+        self.n_local_groups,
+        self.o_lora_rank,
+        dtype=o.dtype,
+        device=o.device,
+    )
+
+
+direct_register_custom_op(
+    op_name="wo_a_mxscale",
+    op_func=wo_a_mxscale,
+    # Fresh [M, G, N] output; the FP8 weight + e8m0 scale are read-only module
+    # attrs looked up via `layer_name`, so functionalization needn't clone.
+    mutates_args=(),
+    fake_impl=_wo_a_mxscale_fake,
     tags=(torch.Tag.needs_fixed_stride_order,),
 )

@@ -41,6 +41,8 @@ from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8_mxscale
+from aiter.ops.inverse_rope_group_quant import inverse_rope_group_quant
 from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.fusions.fused_clamp_act_mul import (
@@ -655,6 +657,35 @@ def _dequant_fp8_block_to_bf16(w_fp8, scale, block=128):
     s = scale.float()
     deq = w * s[:, None, :, None]
     return deq.flatten(2, 3).flatten(0, 1).bfloat16()
+
+
+# ---------------------------------------------------------------------------
+# fp8 e8m0 mxscale (128x128 block-scale) batched GEMM path for the grouped
+# output LoRA (`wo_a`). The kernel consumes:
+#   x       [M, G, K]         fp8 activation, per-token e8m0 (GROUP_M=1)
+#   wo_a    [G, N, K]         fp8 weight, batch-major
+#   x_scale [M, G, K/128]     uint8 e8m0 activation scale
+#   w_scale [G, N/128, K/128] uint8 e8m0 weight (128x128) block scale
+# The [M, G, *] views are transposed views of contiguous batch-major [G, M, *]
+# buffers (K/N contiguous). See op_tests/test_opus_a8w8_bmm.py for the
+# reference quant math.
+# ---------------------------------------------------------------------------
+
+
+def _wo_a_block_scale_to_e8m0(scale: torch.Tensor, n_groups: int) -> torch.Tensor:
+    """Disk FP8 128x128 block scale ``[G*N/128, K/128]`` -> uint8 e8m0
+    ``[G, N/128, K/128]``.
+
+    The V4 ``wo_a`` block scale is already power-of-two (``scale_fmt='ue8m0'``),
+    so the biased e8m0 exponent is recovered exactly by
+    ``round(log2(s)) + 127``. Emitted as plain uint8 (the mxscale kernel reads
+    the e8m0 bytes directly).
+    """
+    s = scale.detach().float().clamp_min(torch.finfo(torch.float32).tiny)
+    e = torch.round(torch.log2(s)).to(torch.int32) + 127
+    e = e.clamp_(0, 255).to(torch.uint8)
+    nb, kb = e.shape
+    return e.reshape(n_groups, nb // n_groups, kb).contiguous()
 
 
 # ---------------------------------------------------------------------------
@@ -2356,6 +2387,13 @@ class DeepseekV4Attention(nn.Module):
         # Cached at construction (non-compiled) so `_attn_post` — now traced into
         # the graphed dense piece — doesn't graph-break on a runtime get_gfx().
         self._is_gfx1250 = get_gfx() == "gfx1250"
+        self._is_gfx950 = get_gfx() == "gfx950"
+        # Flipped by process_weights_after_loading when wo_a is eligible for the
+        # mxscale BMM; off means the BF16 grouped-LoRA path.
+        self._wo_a_mxscale = False
+        self._wo_a_fp8_dtype: torch.dtype | None = None
+        self._wo_a_w_fp8: torch.Tensor | None = None
+        self._wo_a_w_scale: torch.Tensor | None = None
 
         # ----- Compressor (and Indexer for CSA) -----
         if self.compress_ratio:
@@ -2445,14 +2483,18 @@ class DeepseekV4Attention(nn.Module):
         self.kv_fp8 = atom_config.kv_cache_dtype == "fp8"
 
     def process_weights_after_loading(self) -> None:
-        """Dequant wo_a (FP8 + e8m0 block scale) → BF16 in place.
+        """Prepare wo_a (FP8 + e8m0 block scale) for the grouped output LoRA.
 
         Called by ATOM's standard loader (atom.model_loader.loader.load_model)
         after all weights are filled. wo_a is allocated as FP8 ColumnParallelLinear
         so both `.weight` (FP8) and `.weight_scale` (e8m0 block scale) load
-        correctly via the standard FP8 path. We then dequant to BF16 because
-        forward needs `wo_a.weight` as BF16 for the grouped LoRA einsum
-        (`bsgd,grd->bsgr`); aiter has no FP8 grouped einsum.
+        correctly via the standard FP8 path. Two outcomes:
+
+        * gfx950 + 128-aligned shape: keep wo_a FP8 and cache the uint8 e8m0
+          [G, N/128, K/128] block scale for `batched_gemm_a8w8_mxscale`.
+        * otherwise: dequant to BF16 for the grouped LoRA einsum
+          (`sgd,grd->sgr`) / `batched_gemm_bf16` — aiter has no FP8 grouped
+          einsum.
 
         Idempotent: if wo_a.weight is already BF16 (e.g. dequant was applied
         elsewhere), this is a no-op.
@@ -2463,6 +2505,43 @@ class DeepseekV4Attention(nn.Module):
         scale = getattr(self.wo_a, "weight_scale", None)
         if w.dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz) or scale is None:
             return  # nothing to do
+
+        # ---- fp8 e8m0 mxscale batched-GEMM path (gfx950) --------------------
+        # The 128x128 weight block scale and per-128 activation groups need
+        # N % 128 == 0 and K % 128 == 0; anything else falls through to BF16.
+        G = self.n_local_groups
+        N = self.o_lora_rank
+        out_dim, K = int(w.shape[0]), int(w.shape[1])
+        if (
+            self._is_gfx950
+            and out_dim == G * N
+            and N % 128 == 0
+            and K % 128 == 0
+            and scale.dim() == 2
+            and scale.shape[0] == out_dim // 128
+            and scale.shape[1] == K // 128
+        ):
+            self._wo_a_fp8_dtype = w.dtype
+            # Cached as module attrs so the forward skips the reshape and the
+            # scale conversion on every call.
+            self._wo_a_w_fp8 = w.data.view(G, N, K)
+            self._wo_a_w_scale = _wo_a_block_scale_to_e8m0(scale.data, G)
+            self._wo_a_mxscale = True
+            logger.info(
+                "%s: wo_a using fp8 e8m0 mxscale batched GEMM "
+                "(G=%d, N=%d, K=%d, keeping FP8 weight).",
+                self.layer_name,
+                G,
+                N,
+                K,
+            )
+            # Suppress the LinearBase CK-layout shuffle, same as the BF16 branch
+            # below: the mxscale kernel reads `wo_a.weight` directly and needs
+            # the plain row-major [G*N, K] layout.
+            self.wo_a.quant_type = QuantType.No
+            self.wo_a.need_normalize_e4m3fn_to_e4m3fnuz = False
+            return
+
         # Dequant: w (FP8 [out, in]) × scale (e8m0 [out/128, in/128]) → BF16
         bf16 = _dequant_fp8_block_to_bf16(
             w.data, scale.data.to(torch.float32), block=128
@@ -2483,15 +2562,6 @@ class DeepseekV4Attention(nn.Module):
         # (DeepseekV4Attention before its child wo_a Linear), so our hook
         # runs BEFORE the shuffle — overriding `quant_type` here makes the
         # subsequent LinearBase post-load a no-op for wo_a.
-        #
-        # TODO(perf): replace dequant-to-BF16 + einsum with FP8 batched BMM
-        # (same path as MLA's `_v_up_proj_and_o_proj`). Steps:
-        #   1. Dequant FP8 per-128-block → BF16 (this code)
-        #   2. Reshape to [n_local_groups, o_lora_rank, d_per_group]
-        #   3. Requant via dynamic_per_batched_tensor_quant → FP8 + scalar scale
-        #   4. Forward: _aiter_triton_fp8_bmm(o, W_OA, W_OA_scale, group_size=128)
-        # This avoids the dequant + einsum overhead and reuses the proven MLA
-        # batched-FP8 kernel. See attention_mla.py:211 for reference.
         self.wo_a.quant_type = QuantType.No
         self.wo_a.need_normalize_e4m3fn_to_e4m3fnuz = False
 
@@ -2584,7 +2654,7 @@ class DeepseekV4Attention(nn.Module):
                 idx_q_scale,
                 self.layer_name,
             )
-            return self._attn_post(o)
+            return self._attn_post(o, positions)
         return torch.ops.aiter.v4_attention_with_output(x, positions, self.layer_name)
 
     def _attn_pre(
@@ -2629,8 +2699,58 @@ class DeepseekV4Attention(nn.Module):
         return q, kv_pre, qr, qr_scale, x, idx_q_quant, idx_weights, idx_q_scale
 
     @mark_trace
-    def _wo_a_grouped_lora(self, o: torch.Tensor, prefix: str = "") -> torch.Tensor:
+    def _wo_a_grouped_lora(
+        self,
+        o: torch.Tensor,
+        positions: torch.Tensor | None = None,
+        prefix: str = "",
+    ) -> torch.Tensor:
         num_tokens = o.size(0)
+        if self._wo_a_mxscale:
+            # `o` arrives un-inverse-RoPE'd (see `_attn_core`):
+            # `inverse_rope_group_quant` fuses the output inverse RoPE into the
+            # per-token e8m0 group-quant, saving a bf16 round trip. The output
+            # is token-major [M, G, N] with N contiguous, so `_attn_post`'s
+            # `.flatten(1)` is a free view.
+            assert positions is not None, "wo_a mxscale needs positions for fused RoPE"
+            H = self.n_local_heads
+            G = self.n_local_groups
+            D = H * self.head_dim // G
+            o = o.view(num_tokens, H, self.head_dim)  # [S, H, head_dim] pre-rope
+            x_fp8 = torch.empty(
+                (num_tokens, G, D), dtype=self._wo_a_fp8_dtype, device=o.device
+            )
+            x_scale = torch.empty(
+                (num_tokens, G, D // 128), dtype=torch.uint8, device=o.device
+            )
+            cos, sin = self.rotary_emb.cos_cache, self.rotary_emb.sin_cache
+            inverse_rope_group_quant(
+                o,
+                positions.to(torch.int64),
+                cos.reshape(cos.shape[0], -1),
+                sin.reshape(sin.shape[0], -1),
+                num_groups=G,
+                quant_group_size=128,
+                scale_shuffle=False,
+                x_fp8=x_fp8,
+                x_scale=x_scale,
+            )
+            y = torch.empty(
+                num_tokens,
+                G,
+                self.o_lora_rank,
+                dtype=o.dtype,
+                device=o.device,
+            )
+            batched_gemm_a8w8_mxscale(
+                x_fp8,
+                self._wo_a_w_fp8,
+                x_scale,
+                self._wo_a_w_scale,
+                out=y,
+                dtype=o.dtype,
+            )
+            return y
         o = o.view(num_tokens, self.n_local_groups, -1)
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
         if num_tokens <= 32 or self._is_gfx1250:
@@ -2645,14 +2765,23 @@ class DeepseekV4Attention(nn.Module):
             return y.transpose(0, 1)
         return torch.einsum("sgd,grd->sgr", o, wo_a)
 
-    def _attn_post(self, o: torch.Tensor) -> torch.Tensor:
+    def _attn_post(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """Grouped output LoRA + wo_b (graphable, num_tokens-shaped).
+
+        `o` is the un-inverse-RoPE'd attention output when `_wo_a_mxscale` is on;
+        `positions` is forwarded so the fused `inverse_rope_group_quant` can apply
+        the output inverse RoPE inside the wo_a group-quant.
 
         wo_b's RowParallelLinear TP all_reduce goes through the ATOM AR layer,
         which routes it through the TBO-aware custom op on the pure-TP+TBO path
         (overlaps the partner ubatch's compute) and a plain reduce otherwise.
         """
-        o = self._wo_a_grouped_lora(o, prefix=f"{self.layer_name}.wo_a")
+        if self._wo_a_mxscale:
+            # Opaque op -> [M, G, N]; keeps the eager tuned-CSV lookup out of
+            # the graph (see module_dispatch_ops.wo_a_mxscale).
+            o = torch.ops.aiter.wo_a_mxscale(o, positions, self.layer_name)
+        else:
+            o = self._wo_a_grouped_lora(o, prefix=f"{self.layer_name}.wo_a")
         return self.wo_b(o.flatten(1))
 
     def forward_impl(
@@ -2717,7 +2846,7 @@ class DeepseekV4Attention(nn.Module):
             compressor_already_launched=True,
         )
         # Output LoRA + wo_b.
-        return self._attn_post(o)
+        return self._attn_post(o, positions)
 
     def _attn_core(
         self,
@@ -3091,11 +3220,15 @@ class DeepseekV4Attention(nn.Module):
 
         # Inverse RoPE on output's rope dims to remove absolute-position
         # contribution carried in by the value-side RoPE of the KV entries.
-        self.rotary_emb.inverse(
-            positions,
-            o[..., -rd:],
-            prefix=f"{self.layer_name}.inverse_rope",
-        )
+        # Under the wo_a mxscale path this step is fused into the group-quant
+        # (`inverse_rope_group_quant` in `_wo_a_grouped_lora`), so `o` is left
+        # un-inverse-RoPE'd here and the positions are forwarded downstream.
+        if not self._wo_a_mxscale:
+            self.rotary_emb.inverse(
+                positions,
+                o[..., -rd:],
+                prefix=f"{self.layer_name}.inverse_rope",
+            )
         # Output LoRA (wo_a/wo_b) now runs in `_attn_post` (graphed piece).
         return o.reshape(num_tokens, -1)  # [num_tokens, n_local_heads*head_dim]
 
