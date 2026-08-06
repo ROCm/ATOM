@@ -6,7 +6,8 @@ Scheduling logic for batching prefill and decode requests.
 
 This module provides:
 
-- :class:`SpecStats`: Tracks speculative-decoding acceptance rates.
+- :class:`EngineStats`: Tracks speculative-decoding acceptance rates, prefix
+  cache hit rate, and periodic engine-status throughput reporting.
 - :class:`ScheduledBatch`: A frozen snapshot of sequences selected for the
   next forward pass, together with their block tables and metadata.
 - :class:`ScheduledBatchOutput`: Token-level outputs from a completed batch.
@@ -35,39 +36,106 @@ from atom.utils import envs
 logger = logging.getLogger("atom")
 
 
-class SpecStats:
-    """Tracks speculative decoding acceptance statistics."""
+class EngineStats:
+    """Consolidates the engine's three periodic stats trackers into one
+    object: speculative-decoding acceptance (MTP), prefix-cache hit rate,
+    and the vLLM-aligned engine-status throughput line. Each section keeps
+    its own enablement flag and its own (independent, unrelated) print
+    cadence — merging only removes duplicated accumulator/interval-reset
+    boilerplate, it does not change when or whether each section prints:
+
+    - **spec**: gated by ``use_spec``; logs every ``spec_log_interval *
+      mtp_k`` draft tokens (default 1000 decode steps).
+    - **cache**: gated by ``enable_prefix_caching``; pure accumulator, no
+      print cadence of its own — its cumulative rates are folded into the
+      **throughput** line below (``Prefix cache hit rate`` plus a
+      parenthetical ``Compressed-hit``/``Lost-to-SWA-gate`` breakdown).
+    - **throughput**: gated by ``enable_log_stats``; logs every
+      ``log_interval_s`` wall-clock seconds (default 10s), mirroring vLLM's
+      ``LoggingStatLogger`` console line (extended with the cache breakdown)::
+
+          Engine 000: Avg prompt throughput: 254.4 tokens/s, Avg generation
+          throughput: 0.3 tokens/s, Running: 6 reqs, Waiting: 0 reqs, GPU KV
+          cache usage: 0.0%, Prefix cache hit rate: 0.0% (Compressed-hit:
+          0.0%, Lost-to-SWA-gate: 0.0%)
+    """
 
     __slots__ = (
         "_interval_distribution",
         "_interval_draft_tokens",
-        "_log_interval",
+        "_spec_log_interval",
         "distribution",
+        "enable_log_stats",
+        "enable_prefix_caching",
+        "engine_index",
+        "last_log_time",
+        "log_interval_s",
         "mtp_k",
+        "num_generation_tokens",
+        "num_prompt_tokens",
+        "total_cached_tokens",
+        "total_compressed_tokens",
         "total_draft_tokens",
+        "total_full_tokens",
+        "total_requests",
+        "use_spec",
     )
 
-    def __init__(self, mtp_k: int, log_interval: int = 1000):
+    def __init__(
+        self,
+        use_spec: bool = False,
+        mtp_k: int = 0,
+        spec_log_interval: int = 1000,
+        enable_prefix_caching: bool = False,
+        enable_log_stats: bool = False,
+        engine_index: int = 0,
+        log_interval_s: float = 10.0,
+    ):
+        # -- spec (MTP) --
+        self.use_spec = use_spec
         self.mtp_k = mtp_k
-        # Log every log_interval decode steps (in terms of draft tokens)
-        self._log_interval = log_interval * mtp_k
+        # Log every spec_log_interval decode steps (in terms of draft tokens)
+        self._spec_log_interval = spec_log_interval * mtp_k if mtp_k else 0
         self.total_draft_tokens: int = 0
         self.distribution: dict[int, int] = {k: 0 for k in range(mtp_k + 1)}
-        # Per-interval tracking
         self._interval_draft_tokens: int = 0
         self._interval_distribution: dict[int, int] = {k: 0 for k in range(mtp_k + 1)}
 
-    def update(self, num_accepted_tokens: int) -> None:
-        """Record acceptance result for one sequence in one decode step."""
+        # -- cache -- (pure accumulator; see `record_throughput` for printing)
+        self.enable_prefix_caching = enable_prefix_caching
+        self.total_requests: int = 0
+        self.total_cached_tokens: int = 0
+        self.total_full_tokens: int = 0
+        # Pre-SWA-gate compressed-prefix hit tokens. total - cached separates
+        # reuse lost to the SWA tail gate from reuse lost to compressed eviction.
+        self.total_compressed_tokens: int = 0
+
+        # -- throughput --
+        self.enable_log_stats = enable_log_stats
+        self.engine_index = engine_index
+        self.log_interval_s = log_interval_s
+        self.last_log_time = time.monotonic()
+        self.num_prompt_tokens = 0
+        self.num_generation_tokens = 0
+
+    # ------------------------------------------------------------------
+    # Spec (MTP) section
+    # ------------------------------------------------------------------
+
+    def record_spec(self, num_accepted_tokens: int) -> None:
+        """Record acceptance result for one sequence in one decode step.
+        No-op unless speculative decoding is enabled."""
+        if not self.use_spec:
+            return
         self.total_draft_tokens += self.mtp_k
         self._interval_draft_tokens += self.mtp_k
         num_bonus = num_accepted_tokens - 1
         self.distribution[num_bonus] += 1
         self._interval_distribution[num_bonus] += 1
 
-        if self.total_draft_tokens % self._log_interval == 0:
-            self._log()
-            self._reset_interval()
+        if self.total_draft_tokens % self._spec_log_interval == 0:
+            self.log_spec_stats()
+            self._reset_spec_interval()
 
     @property
     def total_accepted(self) -> int:
@@ -85,32 +153,46 @@ class SpecStats:
             return 0.0
         return self.total_accepted / self.total_draft_tokens
 
-    def get_statistics(self) -> dict:
+    def get_spec_statistics(self) -> dict:
         """Return a summary dict compatible with engine_core reporting."""
+        if not self.use_spec:
+            return {"enabled": False}
         return {
             "total_draft_tokens": self.total_draft_tokens,
             "total_accepted_tokens": self.total_accepted,
             "acceptance_rate": self.acceptance_rate,
             "distribution": dict(self.distribution),
+            "enabled": True,
         }
 
-    def reset(self) -> None:
+    def reset_spec(self) -> None:
         self.total_draft_tokens = 0
         self.distribution = {k: 0 for k in range(self.mtp_k + 1)}
-        self._reset_interval()
+        self._reset_spec_interval()
 
-    def _reset_interval(self) -> None:
+    def _reset_spec_interval(self) -> None:
         self._interval_draft_tokens = 0
         self._interval_distribution = {k: 0 for k in range(self.mtp_k + 1)}
 
-    def _log(self) -> None:
+    def log_spec_stats(self) -> None:
+        """Print the interval + cumulative MTP acceptance breakdown. Called
+        automatically every `_spec_log_interval` draft tokens, and also
+        on-demand (fire-and-forget) by `engine_utility.py`'s UTILITY command
+        handler. Prints an explanatory line instead when MTP isn't enabled,
+        matching that handler's previous behavior."""
+        if not self.use_spec:
+            logger.info(
+                "\n[MTP Stats] No MTP statistics available "
+                "(MTP not enabled or no tokens processed)\n"
+            )
+            return
         ts = self.total_steps
         if ts == 0:
             return
         # Interval stats
         iv_steps = sum(self._interval_distribution.values())
         if iv_steps == 0:
-            self._reset_interval()
+            self._reset_spec_interval()
             return
         iv_accepted = sum(k * v for k, v in self._interval_distribution.items())
         iv_rate = (
@@ -131,100 +213,94 @@ class SpecStats:
             f"Accepted tokens distribution: { {k: f'{v / ts:.2%}' for k, v in self.distribution.items()} }"
         )
 
+    # ------------------------------------------------------------------
+    # Cache section
+    # ------------------------------------------------------------------
 
-class CacheStats:
-    """Tracks prefix caching hit statistics."""
-
-    __slots__ = (
-        "_interval_cached_tokens",
-        "_interval_compressed_tokens",
-        "_interval_full_tokens",
-        "_interval_requests",
-        "_log_interval",
-        "total_cached_tokens",
-        "total_compressed_tokens",
-        "total_full_tokens",
-        "total_requests",
-    )
-
-    def __init__(self, log_interval: int = 100):
-        self._log_interval = log_interval
-        self.total_requests: int = 0
-        self.total_cached_tokens: int = 0
-        self.total_full_tokens: int = 0
-        # Pre-SWA-gate compressed-prefix hit tokens. total - cached separates
-        # reuse lost to the SWA tail gate from reuse lost to compressed eviction.
-        self.total_compressed_tokens: int = 0
-        self._interval_requests: int = 0
-        self._interval_cached_tokens: int = 0
-        self._interval_full_tokens: int = 0
-        self._interval_compressed_tokens: int = 0
-
-    def update(
+    def record_cache(
         self,
         num_cached_tokens: int,
         num_full_tokens: int,
         num_compressed_tokens: int = 0,
     ) -> None:
-        """Record cache stats for one prefill sequence."""
+        """Record cache stats for one prefill sequence. No-op unless prefix
+        caching is enabled. Purely accumulates lifetime totals — see
+        `record_throughput` for where/when these get printed."""
+        if not self.enable_prefix_caching:
+            return
         self.total_requests += 1
         self.total_cached_tokens += num_cached_tokens
         self.total_full_tokens += num_full_tokens
         self.total_compressed_tokens += num_compressed_tokens
-        self._interval_requests += 1
-        self._interval_cached_tokens += num_cached_tokens
-        self._interval_full_tokens += num_full_tokens
-        self._interval_compressed_tokens += num_compressed_tokens
-
-        if self.total_requests % self._log_interval == 0:
-            self._log()
-            self._reset_interval()
-
-    @property
-    def hit_rate(self) -> float:
-        if self.total_full_tokens == 0:
-            return 0.0
-        return self.total_cached_tokens / self.total_full_tokens
-
-    def _reset_interval(self) -> None:
-        self._interval_requests = 0
-        self._interval_cached_tokens = 0
-        self._interval_full_tokens = 0
-        self._interval_compressed_tokens = 0
 
     @staticmethod
     def _rate(num: int, den: int) -> float:
         return num / den if den > 0 else 0.0
 
-    def _log(self) -> None:
-        # compressed = pre-SWA-gate prefix hit; cached = post-gate (admitted).
-        # (compressed - cached) is reuse lost to a missing SWA tail; (full -
-        # compressed) is reuse lost to compressed eviction / no logical reuse.
-        iv_hit = self._rate(self._interval_cached_tokens, self._interval_full_tokens)
-        iv_comp = self._rate(
-            self._interval_compressed_tokens, self._interval_full_tokens
-        )
-        iv_gate = self._rate(
-            self._interval_compressed_tokens - self._interval_cached_tokens,
-            self._interval_full_tokens,
-        )
-        logger.info(
-            f"[Cache Stats Interval] Reqs: {self._interval_requests}, "
-            f"Cached/Total: {self._interval_cached_tokens}/{self._interval_full_tokens}, "
-            f"Hit: {iv_hit:.2%}, Compressed-hit: {iv_comp:.2%}, "
-            f"Lost-to-SWA-gate: {iv_gate:.2%}"
-        )
-        tot_comp = self._rate(self.total_compressed_tokens, self.total_full_tokens)
-        tot_gate = self._rate(
+    @property
+    def hit_rate(self) -> float:
+        return self._rate(self.total_cached_tokens, self.total_full_tokens)
+
+    @property
+    def compressed_hit_rate(self) -> float:
+        """Pre-SWA-gate prefix-hit rate (before the admission gate)."""
+        return self._rate(self.total_compressed_tokens, self.total_full_tokens)
+
+    @property
+    def lost_to_swa_gate_rate(self) -> float:
+        """Reuse lost to the SWA tail gate: hits that were compressed-cache
+        hits but got rejected by admission. Can be negative — that reflects
+        `cached` occasionally exceeding `compressed` under the current
+        accounting, not a bug introduced here."""
+        return self._rate(
             self.total_compressed_tokens - self.total_cached_tokens,
             self.total_full_tokens,
         )
+
+    # ------------------------------------------------------------------
+    # Throughput / engine-status section
+    # ------------------------------------------------------------------
+
+    def record_throughput(
+        self,
+        num_running_reqs: int,
+        num_waiting_reqs: int,
+        kv_usage: float,
+        num_prompt_tokens: int = 0,
+        num_generation_tokens: int = 0,
+    ) -> None:
+        """Feed this tick's token counts in and print the engine-status line
+        once `log_interval_s` wall-clock seconds have elapsed. No-op unless
+        `enable_log_stats` is set."""
+        if not self.enable_log_stats:
+            return
+        self.num_prompt_tokens += num_prompt_tokens
+        self.num_generation_tokens += num_generation_tokens
+        now = time.monotonic()
+        elapsed = now - self.last_log_time
+        if elapsed < self.log_interval_s:
+            return
+        prompt_throughput = self.num_prompt_tokens / elapsed
+        generation_throughput = self.num_generation_tokens / elapsed
         logger.info(
-            f"[Cache Stats         ] Reqs: {self.total_requests}, "
-            f"Cached/Total: {self.total_cached_tokens}/{self.total_full_tokens}, "
-            f"Hit: {self.hit_rate:.2%}, Compressed-hit: {tot_comp:.2%}, "
-            f"Lost-to-SWA-gate: {tot_gate:.2%}"
+            "Engine %03d: Avg prompt throughput: %.1f tokens/s, "
+            "Avg generation throughput: %.1f tokens/s, Running: %d reqs, "
+            "Waiting: %d reqs, GPU KV cache usage: %.1f%%, "
+            "Prefix cache hit rate: %.1f%% (Compressed-hit: %.2f%%, "
+            "Lost-to-SWA-gate: %.2f%%)",
+            self.engine_index,
+            prompt_throughput,
+            generation_throughput,
+            num_running_reqs,
+            num_waiting_reqs,
+            kv_usage * 100,
+            self.hit_rate * 100,
+            self.compressed_hit_rate * 100,
+            self.lost_to_swa_gate_rate * 100,
         )
+        self.last_log_time = now
+        self.num_prompt_tokens = 0
+        self.num_generation_tokens = 0
 
 
 def _optimal_cu_fraction(
@@ -557,12 +633,6 @@ class Scheduler:
         self.mtp_k: int = (
             config.speculative_config.num_speculative_tokens if self.use_spec else 0
         )  # type: ignore
-        self.spec_stats: SpecStats | None = (
-            SpecStats(mtp_k=self.mtp_k) if self.use_spec else None
-        )
-        self.cache_stats: CacheStats | None = (
-            CacheStats() if config.enable_prefix_caching else None
-        )
         self.profile_active = False
         # Cache the env flag once (env vars are fixed at process start) so the
         # per-iteration compute_detailed_aggregates never pays an os.getenv.
@@ -613,6 +683,13 @@ class Scheduler:
             getattr(parallel_cfg, "data_parallel_rank", None)
             if parallel_cfg is not None
             else None
+        )
+        self.engine_stats = EngineStats(
+            use_spec=self.use_spec,
+            mtp_k=self.mtp_k,
+            enable_prefix_caching=config.enable_prefix_caching,
+            enable_log_stats=config.enable_log_stats,
+            engine_index=dp_rank or 0,
         )
         if kv_events_cfg is not None and kv_events_cfg.enable:
             self.kv_event_publisher: _EventPublisher = _make_publisher(
@@ -696,6 +773,20 @@ class Scheduler:
         if total <= 0:
             return 0.0
         return len(bm.used_block_ids) / total
+
+    def _record_throughput(
+        self, num_prompt_tokens: int = 0, num_generation_tokens: int = 0
+    ) -> None:
+        """Feed this tick's token counts into `EngineStats` and emit the
+        periodic engine-status log line once `log_interval_s` has elapsed.
+        No-op when `--no-enable-log-stats` disabled that section."""
+        self.engine_stats.record_throughput(
+            num_running_reqs=len(self.running),
+            num_waiting_reqs=len(self.waiting),
+            kv_usage=self._kv_usage(),
+            num_prompt_tokens=num_prompt_tokens,
+            num_generation_tokens=num_generation_tokens,
+        )
 
     def _waiting_new_token_count(self) -> int:
         """Sum of new (uncached) tokens across the ADMITTABLE waiting queue,
@@ -968,6 +1059,7 @@ class Scheduler:
             delayer_allows = True
 
         if not self.running and not self.waiting:
+            self._record_throughput()
             return None
 
         # ---- Phase 1: resume partial prefills from running ----
@@ -1203,6 +1295,7 @@ class Scheduler:
             connector_meta_output = None
             if self.kv_connector is not None:
                 connector_meta_output = self.kv_connector.build_connector_meta()
+            self._record_throughput(num_prompt_tokens=total_tokens_num_prefill)
 
             # Freeze, per seq, whether this chunk finishes the prompt. Uses the
             # pre-advance offsets so it is correct whether or not schedule-time
@@ -1342,6 +1435,7 @@ class Scheduler:
             remote_kv_block_ids=sorted(remote_kv_blocks) if remote_kv_blocks else [],
             remote_kv_seq_blocks=remote_kv_seq_blocks,
         )
+        self._record_throughput(num_generation_tokens=total_tokens_num_decode)
         return (decode_batch, scheduled_seqs)
 
     # -- Remote KV / offload admission helpers ------------------------------
@@ -1505,12 +1599,11 @@ class Scheduler:
         num_batched_tokens: int,
     ) -> tuple[int, int]:
         num_seqs_prefill += 1
-        if self.cache_stats:
-            self.cache_stats.update(
-                seq.num_cached_tokens,
-                seq.num_tokens,
-                seq.num_compressed_hit_blocks * self.block_manager.block_size,
-            )
+        self.engine_stats.record_cache(
+            seq.num_cached_tokens,
+            seq.num_tokens,
+            seq.num_compressed_hit_blocks * self.block_manager.block_size,
+        )
         num_batched_tokens += chunk
         seq.status = SequenceStatus.RUNNING
         seq.type = SequenceType.PREFILL
@@ -1822,12 +1915,8 @@ class Scheduler:
                 # prefill-only step where no draft tokens were scored against
                 # the target — vLLM gates this via
                 # `if scheduled_spec_token_ids and generated_token_ids`.
-                if (
-                    self.spec_stats
-                    and num_new_token > 0
-                    and (num_new_token + num_rejected) > 1
-                ):
-                    self.spec_stats.update(num_new_token)
+                if num_new_token > 0 and (num_new_token + num_rejected) > 1:
+                    self.engine_stats.record_spec(num_new_token)
                 seq.num_rejected = num_rejected
                 seq.num_bonus_tokens = num_bonus
                 # DSpark Phase 2: stash this step's scheduler-chosen ell on the
@@ -2389,8 +2478,7 @@ class PrefillScheduler:
         # spec decode not used on prefill side
         self.use_spec = False
         self.mtp_k = 0
-        self.spec_stats = None
-        self.cache_stats = None
+        self.engine_stats = None
 
         # Shared memory for dynamic CU partitioning.
         # Layout: [0:4] = decode_tokens (uint32)

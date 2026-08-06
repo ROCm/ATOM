@@ -7,36 +7,174 @@ from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
+from conftest import MockConfig
 
 from atom.model_engine.scheduler import (
+    EngineStats,
     ScheduledBatch,
-    Scheduler,
     ScheduledBatchOutput,
-    SpecStats,
+    Scheduler,
 )
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 from atom.sampling_params import SamplingParams
-from conftest import MockConfig
 
-# ── SpecStats ──────────────────────────────────────────────────────────────
+# ── EngineStats (spec section) ──────────────────────────────────────────────
 
 
-class TestSpecStats:
+class TestEngineStatsSpec:
     def test_no_division_by_zero_with_valid_mtp_k(self):
-        """SpecStats with mtp_k >= 1 must not raise on update()."""
-        stats = SpecStats(mtp_k=1)
+        """Spec section with mtp_k >= 1 must not raise on record_spec()."""
+        stats = EngineStats(use_spec=True, mtp_k=1)
         # Should not raise ZeroDivisionError
-        stats.update(num_accepted_tokens=1)
-        stats.update(num_accepted_tokens=2)
+        stats.record_spec(num_accepted_tokens=1)
+        stats.record_spec(num_accepted_tokens=2)
 
     def test_update_accumulates_draft_tokens(self):
-        stats = SpecStats(mtp_k=2)
-        stats.update(num_accepted_tokens=1)
+        stats = EngineStats(use_spec=True, mtp_k=2)
+        stats.record_spec(num_accepted_tokens=1)
         assert stats.total_draft_tokens == 2
 
     def test_acceptance_rate_zero_when_no_updates(self):
-        stats = SpecStats(mtp_k=3)
+        stats = EngineStats(use_spec=True, mtp_k=3)
         assert stats.acceptance_rate == 0.0
+
+
+# ── EngineStats (cache section) ─────────────────────────────────────────────
+
+
+class TestEngineStatsCache:
+    def test_record_cache_noop_when_disabled(self):
+        stats = EngineStats(enable_prefix_caching=False)
+        stats.record_cache(num_cached_tokens=8, num_full_tokens=16)
+        assert stats.total_requests == 0
+        assert stats.total_full_tokens == 0
+        assert stats.hit_rate == 0.0
+
+    def test_record_cache_accumulates(self):
+        stats = EngineStats(enable_prefix_caching=True)
+        stats.record_cache(
+            num_cached_tokens=8, num_full_tokens=16, num_compressed_tokens=8
+        )
+        stats.record_cache(
+            num_cached_tokens=4, num_full_tokens=16, num_compressed_tokens=8
+        )
+        assert stats.total_requests == 2
+        assert stats.total_cached_tokens == 12
+        assert stats.total_full_tokens == 32
+        assert stats.total_compressed_tokens == 16
+
+    def test_rates_zero_with_no_tokens(self):
+        stats = EngineStats(enable_prefix_caching=True)
+        assert stats.hit_rate == 0.0
+        assert stats.compressed_hit_rate == 0.0
+        assert stats.lost_to_swa_gate_rate == 0.0
+
+    def test_rate_computation(self):
+        stats = EngineStats(enable_prefix_caching=True)
+        stats.record_cache(
+            num_cached_tokens=8, num_full_tokens=32, num_compressed_tokens=16
+        )
+        assert stats.hit_rate == 8 / 32
+        assert stats.compressed_hit_rate == 16 / 32
+        assert stats.lost_to_swa_gate_rate == (16 - 8) / 32
+
+    def test_lost_to_swa_gate_rate_can_be_negative(self):
+        """`cached` exceeding `compressed` is a known accounting quirk of the
+        underlying metric, not a bug — the property must not clamp it."""
+        stats = EngineStats(enable_prefix_caching=True)
+        stats.record_cache(
+            num_cached_tokens=16, num_full_tokens=32, num_compressed_tokens=8
+        )
+        assert stats.lost_to_swa_gate_rate < 0
+
+
+# ── EngineStats (throughput section) ────────────────────────────────────────
+
+
+class TestEngineStatsThroughput:
+    def test_record_throughput_noop_when_disabled(self):
+        stats = EngineStats(enable_log_stats=False)
+        with mock.patch("atom.model_engine.scheduler.logger") as mock_logger:
+            stats.record_throughput(
+                num_running_reqs=1,
+                num_waiting_reqs=0,
+                kv_usage=0.1,
+                num_prompt_tokens=10,
+                num_generation_tokens=5,
+            )
+        mock_logger.info.assert_not_called()
+        assert stats.num_prompt_tokens == 0
+        assert stats.num_generation_tokens == 0
+
+    def test_record_throughput_waits_for_interval(self):
+        stats = EngineStats(enable_log_stats=True, log_interval_s=10.0)
+        with (
+            mock.patch(
+                "atom.model_engine.scheduler.time.monotonic",
+                return_value=stats.last_log_time + 1.0,
+            ),
+            mock.patch("atom.model_engine.scheduler.logger") as mock_logger,
+        ):
+            stats.record_throughput(
+                num_running_reqs=1,
+                num_waiting_reqs=0,
+                kv_usage=0.0,
+                num_prompt_tokens=10,
+                num_generation_tokens=0,
+            )
+        mock_logger.info.assert_not_called()
+        # Tokens accumulate even though the interval hasn't elapsed yet.
+        assert stats.num_prompt_tokens == 10
+
+    def test_record_throughput_logs_after_interval_and_resets(self):
+        stats = EngineStats(enable_log_stats=True, log_interval_s=10.0, engine_index=2)
+        start = stats.last_log_time
+        with (
+            mock.patch(
+                "atom.model_engine.scheduler.time.monotonic", return_value=start + 10.0
+            ),
+            mock.patch("atom.model_engine.scheduler.logger") as mock_logger,
+        ):
+            stats.record_throughput(
+                num_running_reqs=4,
+                num_waiting_reqs=1,
+                kv_usage=0.25,
+                num_prompt_tokens=100,
+                num_generation_tokens=50,
+            )
+        mock_logger.info.assert_called_once()
+        args = mock_logger.info.call_args[0]
+        assert args[1] == 2  # engine_index
+        assert args[2] == 10.0  # prompt tokens/s = 100 / 10s
+        assert args[3] == 5.0  # generation tokens/s = 50 / 10s
+        assert args[4] == 4  # running reqs
+        assert args[5] == 1  # waiting reqs
+        assert args[6] == 25.0  # kv usage %
+        assert stats.num_prompt_tokens == 0
+        assert stats.num_generation_tokens == 0
+        assert stats.last_log_time == start + 10.0
+
+    def test_record_throughput_includes_cache_breakdown(self):
+        stats = EngineStats(
+            enable_log_stats=True, enable_prefix_caching=True, log_interval_s=10.0
+        )
+        stats.record_cache(
+            num_cached_tokens=8, num_full_tokens=32, num_compressed_tokens=16
+        )
+        start = stats.last_log_time
+        with (
+            mock.patch(
+                "atom.model_engine.scheduler.time.monotonic", return_value=start + 10.0
+            ),
+            mock.patch("atom.model_engine.scheduler.logger") as mock_logger,
+        ):
+            stats.record_throughput(
+                num_running_reqs=1, num_waiting_reqs=0, kv_usage=0.0
+            )
+        args = mock_logger.info.call_args[0]
+        assert args[7] == 25.0  # hit rate %  (8/32)
+        assert args[8] == 50.0  # compressed-hit % (16/32)
+        assert args[9] == 25.0  # lost-to-SWA-gate % ((16-8)/32)
 
 
 # ── add / extend / query ───────────────────────────────────────────────────

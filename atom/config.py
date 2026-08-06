@@ -1306,6 +1306,7 @@ class Config:
     index_cache_dtype: str | None = None
     enable_prefix_caching: bool = True
     enable_chunked_prefill: bool = True
+    enable_log_stats: bool = True
     port: int = 8006
     torch_profiler_dir: str | None = field(
         default_factory=lambda: envs.ATOM_TORCH_PROFILER_DIR
@@ -1425,18 +1426,6 @@ class Config:
                 f"tp_size ({self.tensor_parallel_size}) must be divisible by "
                 f"dcp_size ({self.decode_context_parallel_size})"
             )
-            if self.enable_prefix_caching:
-                logger.warning(
-                    "DCP does not support prefix caching yet; "
-                    "disabling enable_prefix_caching."
-                )
-                self.enable_prefix_caching = False
-            if self.enable_chunked_prefill:
-                logger.warning(
-                    "DCP does not support chunked prefill yet; "
-                    "disabling enable_chunked_prefill."
-                )
-                self.enable_chunked_prefill = False
         assert 1 <= self.pipeline_parallel_size
         self.hf_config = get_hf_config(
             self.model, trust_remote_code=self.trust_remote_code
