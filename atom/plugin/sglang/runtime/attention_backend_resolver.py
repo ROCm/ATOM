@@ -29,12 +29,16 @@ def _get_backend_pools(backend):
         return token_to_kv_pool, req_to_token_pool
     full_backend = getattr(backend, "full_attn_backend", None)
     return (
-        token_to_kv_pool
-        if token_to_kv_pool is not None
-        else getattr(full_backend, "token_to_kv_pool", None),
-        req_to_token_pool
-        if req_to_token_pool is not None
-        else getattr(full_backend, "req_to_token_pool", None),
+        (
+            token_to_kv_pool
+            if token_to_kv_pool is not None
+            else getattr(full_backend, "token_to_kv_pool", None)
+        ),
+        (
+            req_to_token_pool
+            if req_to_token_pool is not None
+            else getattr(full_backend, "req_to_token_pool", None)
+        ),
     )
 
 

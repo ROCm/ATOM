@@ -180,6 +180,8 @@ def _patch_sglang_dsv4_draft_backends() -> None:
     DraftBackendFactory._create_dsv4_decode_backend = _create_atom_dsv4_decode_backend
     DraftBackendFactory._create_dsv4_prefill_backend = _create_atom_dsv4_prefill_backend
     DraftBackendFactory._atom_dsv4_draft_backend_patched = True
+
+
 def _patch_sglang_dsv4_spec_cuda_graph() -> None:
     """Patch SGLang speculative CUDA graph handling for ATOM DSV4.
 
@@ -231,10 +233,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                 getattr(runner, "model_config", None), "hf_config", None
             )
             model_type = str(getattr(hf_config, "model_type", "")).lower()
-            arches = (
-                getattr(hf_config, "architectures", None)
-                or []
-            )
+            arches = getattr(hf_config, "architectures", None) or []
             return model_type == "glm_moe_dsa" or any(
                 "GlmMoeDsaForCausalLMNextN" in str(arch) for arch in arches
             )
@@ -888,10 +887,7 @@ def _patch_sglang_eagle_v2_draft_argmax() -> None:
                 getattr(runner, "model_config", None), "hf_config", None
             )
             model_type = str(getattr(hf_config, "model_type", "")).lower()
-            arches = (
-                getattr(hf_config, "architectures", None)
-                or []
-            )
+            arches = getattr(hf_config, "architectures", None) or []
             return model_type == "glm_moe_dsa" or any(
                 "GlmMoeDsaForCausalLMNextN" in str(arch) for arch in arches
             )

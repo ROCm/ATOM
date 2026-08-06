@@ -441,18 +441,32 @@ During CUDA-graph capture (server bring-up), ATOM can emit one trace file per
 captured batch size instead of a single combined blob. This makes each graph's
 capture cost easy to inspect in isolation and keeps individual trace files
 small. Capture-trace profiling is gated on `--mark-trace` (with
-`--torch-profiler-dir`/`ATOM_TORCH_PROFILER_DIR` set); the warmup phase is
-omitted so only meaningful capture work is retained.
+`--torch-profiler-dir`/`ATOM_TORCH_PROFILER_DIR` set).
 
-The per-batch-size traces are written to:
+Each file covers one full iteration of the capture loop: the warmup forward
+followed by the graph capture itself. Both are needed — inside
+`torch.cuda.graph(...)` the stream is in capture mode, so kernel launches are
+recorded as graph nodes rather than dispatched, and a trace of that region
+alone has an empty GPU track. The warmup forward is where the kernels actually
+run.
+
+The traces are written to:
 
 ```
-{profiler_dir}/capture_traces/bs_<bs>_rank<rank>.json.gz
+{profiler_dir}/capture_traces/bs_<bs>_q_<max_q_len>_rank<rank>.json.gz
 ```
 
-where `<bs>` is the captured batch size and `<rank>` the worker rank. Each file
-is a gzip-compressed Chrome trace viewable with `chrome://tracing` or
-TensorBoard.
+where `<bs>` is the captured batch size, `<max_q_len>` the query-length bucket
+(`1` without speculative decoding, `mtp_k + 1` with a drafter, and one file per
+bucket when DSpark expands them — see
+[Speculative decoding](#speculative-decoding-mtp)), and `<rank>` the worker
+rank. Each file is a gzip-compressed Chrome trace viewable with
+`chrome://tracing` or TensorBoard.
+
+Like the run-phase profiler, these traces carry `record_shapes`, `with_stack`,
+and `profile_memory` only when `ATOM_PROFILER_MORE=1`. Leave it unset unless you
+need the shapes or Python stacks — stack capture runs on every rank and
+noticeably stretches server bring-up.
 
 To additionally annotate the run-phase `prefill[]`/`decode[]` labels with the
 attention FLOP aggregates used for roofline analysis, set

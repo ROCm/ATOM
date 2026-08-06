@@ -563,9 +563,7 @@ def _build_sparse_req_id_per_token_for_sglang(
     query_lens = getattr(forward_batch, "extend_seq_lens", None)
     if query_lens is None:
         query_lens = forward_batch.seq_lens
-    req_id_per_token = torch.repeat_interleave(
-        req_ids, query_lens[:bs].to(torch.int32)
-    )
+    req_id_per_token = torch.repeat_interleave(req_ids, query_lens[:bs].to(torch.int32))
     if num_tokens is not None:
         req_id_per_token = _maybe_apply_pcp_dense_query_split(
             req_id_per_token, int(num_tokens)

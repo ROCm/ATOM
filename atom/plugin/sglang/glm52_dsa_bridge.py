@@ -7,7 +7,6 @@ from __future__ import annotations
 
 # --- common.py ---
 # Shared GLM-5.2 DSA bridge helpers (all MTP phases).
-
 import numpy as np
 import torch
 from aiter import dtypes, get_mla_metadata_info_v1, get_mla_metadata_v1
@@ -17,7 +16,6 @@ from atom.plugin.sglang.runtime.attention_backend_resolver import (
     resolve_sglang_runtime,
 )
 from atom.plugin.sglang.runtime.model_arch import is_glm52_dsa_config
-from atom.utils import envs
 
 DECODE_GRAPH_BUFFERS_ATTR = "_atom_glm52_decode_graph_buffers"
 EMPTY_VALUE_CACHE_ATTR = "_atom_glm52_empty_value_cache"
@@ -862,6 +860,7 @@ def build_mtp_verify_decode_metadata(
 
 # --- draft_decode.py ---
 # Draft forward decode metadata — draft pool, 1 tok/query, multi-step sub_step.
+
 
 def get_draft_decode_sub_step(forward_batch) -> int:
     return int(getattr(forward_batch, DRAFT_SUB_STEP_ATTR, 0) or 0)

@@ -633,7 +633,7 @@ def _set_atom_forward_context(
             forward_batch,
             positions,
         )
-    except Exception as exc:  # noqa: BLE001 - add model context
+    except Exception as exc:
         raise RuntimeError(
             "Failed to build ATOM MiniMax-M3 sparse metadata for SGLang"
         ) from exc
@@ -645,7 +645,7 @@ def _set_atom_forward_context(
                 forward_batch,
                 positions,
             )
-        except Exception as exc:  # noqa: BLE001 - add model context
+        except Exception as exc:
             raise RuntimeError(
                 "Failed to build ATOM GLM-5.2 DSA metadata for SGLang"
             ) from exc
@@ -653,7 +653,7 @@ def _set_atom_forward_context(
     if attn_metadata is None:
         try:
             attn_metadata = _build_deepseek_v4_metadata(forward_batch, positions)
-        except Exception as exc:  # noqa: BLE001 - add model context
+        except Exception as exc:
             raise RuntimeError(
                 "Failed to build ATOM DeepSeek-V4 metadata for SGLang"
             ) from exc
@@ -665,7 +665,7 @@ def _set_atom_forward_context(
                 forward_batch,
                 positions,
             )
-        except Exception as exc:  # noqa: BLE001 - add model context
+        except Exception as exc:
             raise RuntimeError(
                 "Failed to build ATOM EAGLE3 draft metadata for SGLang"
             ) from exc

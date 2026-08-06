@@ -69,7 +69,7 @@ def setup_deepseek_for_sglang(model) -> None:
 
 
 def _patch_mla_attention_for_sglang(
-    attn: "DeepseekV2MLAAttention",
+    attn: DeepseekV2MLAAttention,
     config: Any,
     kv_cache_dtype: str = "bf16",
     activation_dtype: Any = None,
@@ -81,6 +81,7 @@ def _patch_mla_attention_for_sglang(
     _patch_indexer_for_sglang_sparse_mla(attn)
     if not isinstance(attn.mla_attn, SGLangDeepseekMLAAttention):
         attn.mla_attn = SGLangDeepseekMLAAttention(attn, attn.mla_attn)
+
     def process_weights_after_loading() -> None:
         process_mla_kv_b_proj_after_loading(attn)
         _align_indexer_layernorm_dtype(attn, activation_dtype)
@@ -89,7 +90,7 @@ def _patch_mla_attention_for_sglang(
 
 
 def _align_indexer_layernorm_dtype(
-    attn: "DeepseekV2MLAAttention", activation_dtype: Any
+    attn: DeepseekV2MLAAttention, activation_dtype: Any
 ) -> None:
     """Match SGLang sparse-indexer affine tensors to AITER's input dtype."""
     if activation_dtype is None:
@@ -104,7 +105,7 @@ def _align_indexer_layernorm_dtype(
             parameter.data = parameter.data.to(activation_dtype)
 
 
-def _patch_indexer_for_sglang_sparse_mla(attn: "DeepseekV2MLAAttention") -> None:
+def _patch_indexer_for_sglang_sparse_mla(attn: DeepseekV2MLAAttention) -> None:
     """Adapt DeepSeek-V3.2 sparse indexer buffers for SGLang plugin mode."""
     indexer = getattr(attn, "indexer", None)
     if indexer is None or getattr(indexer, "_atom_sglang_topk_buffer_patched", False):
