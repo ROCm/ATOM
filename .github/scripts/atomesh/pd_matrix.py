@@ -259,6 +259,7 @@ def build_cell(
     allow_auto_nodes = slurm_submit_runner in {
         "atomesh-cicd-mi350",
         "atomesh-cicd-crusoe-mi355",
+        "atomesh-cicd-mi355-crusoe",
     }
     requires_explicit_candidate_nodes = slurm_submit_runner == "atomesh-cicd-mi350"
 
