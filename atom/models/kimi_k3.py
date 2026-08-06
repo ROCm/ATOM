@@ -957,8 +957,9 @@ class KimiKDAAttention(nn.Module):
         initial_state: torch.Tensor | None,
         cu_seqlens: torch.Tensor | None,
         output_final_state: bool,
+        recurrent: bool = False,
     ):
-        from fla.ops.kda import chunk_kda
+        from fla.ops.kda import chunk_kda, fused_recurrent_kda
 
         kwargs = {
             "q": q,
@@ -983,6 +984,10 @@ class KimiKDAAttention(nn.Module):
             "transpose_state_layout": True,
             "cu_seqlens": cu_seqlens,
         }
+        if recurrent:
+            # safe_gate/disable_recompute are chunk_kda-only knobs.
+            kwargs.pop("safe_gate", None)
+            return fused_recurrent_kda(**kwargs)
         # FLA 0.5.1's default KDA recompute specialization is non-deterministic
         # for long, packed gfx950 prefills and can emit extreme values. Selecting
         # disable_recompute enables its STORE_QG specialization, which is stable
@@ -1052,7 +1057,12 @@ class KimiKDAAttention(nn.Module):
         gate = self.f_b_proj(f_a)
         gate = rearrange(gate, "t (h d) -> 1 t h d", d=self.head_dim)
         # Allocate from fused_in (bf16), not hidden_states, which may be fp8.
-        out = fused_in.new_empty(
+        # Zeroed, not empty: on the decode path the fused kernel returns early
+        # for rows whose cache slot is PAD_SLOT_ID (CUDAGraph batch padding), so
+        # it leaves those rows unwritten. Uninitialized bf16 easily lands on a
+        # NaN/Inf bit pattern, which o_norm/o_proj then propagate into
+        # hidden_states and the MoE router turns into out-of-range expert ids.
+        out = fused_in.new_zeros(
             (num_actual_tokens, self.num_local_heads, self.head_dim)
         )
 
@@ -1085,6 +1095,13 @@ class KimiKDAAttention(nn.Module):
             initial = gather_kda_initial_state(
                 ssm_state, state_indices, gdn_metadata.has_initial_state
             )
+            # gfx1250 workaround: chunk_kda NaNs on short prompts (seq < chunk size),
+            # and its transpose_state_layout output can mismatch what the decode-time
+            # fused_recurrent_kda reader expects, so the first decode step goes NaN.
+            # NaN logits make argmax pick token 0 ("!") forever. Running prefill on the
+            # recurrent kernel keeps the KDA state layout consistent across
+            # prefill/decode. Env-gated so the faster chunk path stays default on the
+            # arches where it is correct.
             kda_out, last_state = self._run_kda(
                 q,
                 k,
@@ -1094,6 +1111,7 @@ class KimiKDAAttention(nn.Module):
                 initial,
                 query_start_loc,
                 True,
+                recurrent=envs.ATOM_KDA_FORCE_RECURRENT,
             )
             # last_state already has ssm_state's dtype (fla preserves the
             # initial_state dtype; the gathered initial is allocated as such),

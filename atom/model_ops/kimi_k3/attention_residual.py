@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import functools
+
 import torch
 
 from atom.utils.custom_register import direct_register_custom_op
@@ -68,7 +70,16 @@ if _HAS_TRITON:
         b_idx = tl.arange(0, BP)
         b_mask = b_idx < Bp
         is_last = b_idx == B  # prefix_sum candidate
-        br_base = t * stride_br_t + b_idx * stride_br_b  # [BP]
+        # BP rounds Bp=B+1 up to a power of 2, so lanes b_idx >= B name rows
+        # block_residual does not have. Their values are never used (masked on
+        # load; the b_idx==B lane takes ps via is_last), but the *address* must
+        # still be in bounds -- an out-of-bounds address faults on gfx1250 even
+        # when the mask is correct, because a false mask does not narrow exec:
+        # the AMD backend swaps in a 0x80000000 sentinel voffset and lets the
+        # access issue. Clamping is addressing-only; masked lanes still resolve
+        # to other=0.0, so the result is bit-identical.
+        b_safe = tl.minimum(b_idx, tl.maximum(B - 1, 0))
+        br_base = t * stride_br_t + b_safe * stride_br_b  # [BP]
         ps_base = t * stride_ps_t
 
         acc_sq = tl.zeros((BP,), dtype=tl.float32)
@@ -168,7 +179,9 @@ if _HAS_TRITON:
         s = tl.program_id(1)
         b_idx = tl.arange(0, BP)
         is_last = b_idx == B
-        br_base = t * stride_br_t + b_idx * stride_br_b
+        # Addressing-only clamp; see _attn_res_fused_kernel.
+        b_safe = tl.minimum(b_idx, tl.maximum(B - 1, 0))
+        br_base = t * stride_br_t + b_safe * stride_br_b
         ps_base = t * stride_ps_t
         acc_sq = tl.zeros((BP,), dtype=tl.float32)
         acc_dot = tl.zeros((BP,), dtype=tl.float32)
@@ -242,7 +255,9 @@ if _HAS_TRITON:
         scores = scores - tl.max(scores, axis=0)
         probs = tl.exp(scores)
         probs = probs / tl.sum(probs, axis=0)
-        br_base = t * stride_br_t + b_idx * stride_br_b
+        # Addressing-only clamp; see _attn_res_fused_kernel.
+        b_safe = tl.minimum(b_idx, tl.maximum(B - 1, 0))
+        br_base = t * stride_br_t + b_safe * stride_br_b
         ps_base = t * stride_ps_t
         for h0 in tl.range(0, H, BLOCK_H, num_stages=NS):
             cols = h0 + tl.arange(0, BLOCK_H)
@@ -289,11 +304,30 @@ _ATTN_RES_CATCHALL = (False, 1, 2, 4)  # T > largest bucket
 _ATTN_RES_BLOCK_H = 1024
 
 
+@functools.cache
+def _max_num_stages() -> int:
+    """Upper bound on num_stages for the two-pass kernels.
+
+    Software-pipelining the H loop faults on gfx1250: TTGIR bounds the loop and
+    recomputes each prefetch mask, but on the AMD backend a false mask does not
+    narrow exec -- it swaps in a 0x80000000 sentinel voffset and lets the access
+    issue, relying on the SRD's num_records to drop it. That is enough to kill a
+    rank with hipErrorIllegalAddress minutes into concurrent load, and the
+    in-bounds addressing above is not sufficient to prevent it. Pipelining only
+    pays off at small T, which takes the split-H path anyway, so capping it here
+    costs no measurable throughput. Queried lazily to keep import GPU-free.
+    """
+    from aiter.jit.utils.chip_info import get_gfx
+
+    return 1 if get_gfx() == "gfx1250" else 2
+
+
 def _pick_attn_res_config(tokens: int):
     for max_tokens, split, s, ns, nw in _ATTN_RES_CONFIGS:
         if tokens <= max_tokens:
-            return split, s, ns, nw
-    return _ATTN_RES_CATCHALL
+            return split, s, min(ns, _max_num_stages()), nw
+    split, s, ns, nw = _ATTN_RES_CATCHALL
+    return split, s, min(ns, _max_num_stages()), nw
 
 
 def _apply_attn_res_impl(
