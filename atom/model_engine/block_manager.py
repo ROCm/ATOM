@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import logging
 from collections import deque
 
 import numpy as np
@@ -19,6 +20,8 @@ from atom.model_engine.kv_block import Block
 from atom.model_engine.sequence import Sequence
 from atom.model_engine.swa_pool import SlidingWindowPool
 from atom.utils import envs
+
+logger = logging.getLogger("atom")
 
 
 def _make_block_stored(
@@ -364,6 +367,122 @@ class BlockManager:
                 )
             )
 
+    def publish_loaded_prefix(
+        self,
+        seq: Sequence,
+        start_token: int,
+        end_token: int,
+    ) -> int:
+        """Publish a successfully loaded offload prefix into the GPU cache index.
+
+        LMCache restores KV directly into already allocated physical blocks, so
+        those blocks do not pass through ``hash_blocks()``. Without explicitly
+        publishing them here, the current request can consume the restored KV,
+        but later requests cannot discover it through ``can_allocate()`` and
+        repeatedly load the same prefix from CPU.
+
+        Only complete, hash-block-aligned loaded blocks are published. Existing
+        canonical mappings win: concurrent requests may load the same prefix
+        into different physical blocks, and replacing the canonical mapping
+        would make its eventual eviction remove the wrong cache entry.
+        """
+        if not self.enable_prefix_caching:
+            return 0
+
+        start_token = max(0, int(start_token))
+        end_token = min(int(end_token), int(seq.num_prompt_tokens))
+        if end_token <= start_token:
+            return 0
+        hbs = self._hash_block_size()
+        if start_token % hbs != 0:
+            logger.warning(
+                "Cannot publish offload prefix with unaligned start: "
+                "seq=%s start=%d hash_block_size=%d",
+                seq.id,
+                start_token,
+                hbs,
+            )
+            return 0
+
+        start_block = start_token // hbs
+        end_block = end_token // hbs
+        if end_block <= start_block:
+            return 0
+        if end_block > len(seq.block_table):
+            logger.warning(
+                "Cannot publish offload prefix beyond block table: "
+                "seq=%s end_block=%d blocks=%d",
+                seq.id,
+                end_block,
+                len(seq.block_table),
+            )
+            return 0
+
+        if start_block == 0:
+            parent_hash = -1
+        else:
+            parent = self.blocks[seq.block_table[start_block - 1]]
+            if parent.hash == -1:
+                logger.warning(
+                    "Cannot publish offload prefix without indexed parent: "
+                    "seq=%s start_block=%d",
+                    seq.id,
+                    start_block,
+                )
+                return 0
+            parent_hash = parent.hash
+
+        indexed_tokens = 0
+        for i in range(start_block, end_block):
+            token_ids = self._hash_block_tokens(seq, i)
+            block_id = seq.block_table[i]
+            block = self.blocks[block_id]
+            block_hash = self.compute_hash(token_ids, parent_hash)
+            canonical_id = self.hash_to_block_id.get(block_hash)
+
+            if block.hash not in (-1, block_hash):
+                logger.warning(
+                    "Refusing to overwrite indexed block during offload "
+                    "promotion: seq=%s block=%d",
+                    seq.id,
+                    block_id,
+                )
+                break
+
+            if canonical_id is not None:
+                canonical = self.blocks[canonical_id]
+                if canonical.token_ids != token_ids:
+                    logger.warning(
+                        "Hash collision while publishing offload prefix: "
+                        "seq=%s block=%d canonical=%d",
+                        seq.id,
+                        block_id,
+                        canonical_id,
+                    )
+                    break
+                # Keep the canonical hash_to_block_id mapping, but annotate this
+                # request's duplicate physical block as well. hash_blocks()
+                # needs the final loaded block's hash as the parent when it
+                # publishes the newly computed suffix.
+                block.update(block_hash, token_ids)
+            else:
+                block.update(block_hash, token_ids)
+                self.hash_to_block_id[block_hash] = block_id
+                if self._event_log is not None:
+                    self._event_log.append(
+                        _make_block_stored(
+                            [block_hash],
+                            token_ids,
+                            parent_hash if parent_hash != -1 else None,
+                            self.block_size,
+                        )
+                    )
+
+            indexed_tokens += hbs
+            parent_hash = block_hash
+
+        return indexed_tokens
+
     def deallocate(self, seq: Sequence):
         for block_id in reversed(seq.block_table):
             block = self.blocks[block_id]
@@ -387,9 +506,7 @@ class BlockManager:
         new_blocks_needed = max(0, needed_blocks - current_blocks)
         if len(self.free_block_ids_set) < new_blocks_needed:
             return False
-        if not self.swa.has_free(new_blocks_needed):  # True when SWA disabled
-            return False
-        return True
+        return self.swa.has_free(new_blocks_needed)  # True when SWA disabled
 
     def may_append(self, seq: Sequence, num_new_tokens: int = 1):
         # Note: in disaggregated (P/D) mode the scheduler skips this call on
