@@ -82,7 +82,7 @@
       "path": "deepseek-ai/DeepSeek-V4-Pro",
       "prefix": "deepseek-v4-pro-eplb-mega",
       "runner": "atom-mi355-8gpu.predownload",
-      "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1\nAITER_LOG_LEVEL=WARNING",
+      "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1\nAITER_LOG_LEVEL=WARNING\nMORI_SHMEM_HEAP_SIZE=16G",
       "config": {
         "tp": 8,
         "kv_cache_dtype": "fp8",
