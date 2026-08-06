@@ -716,9 +716,10 @@ def set_kv_cache_data(
 ) -> None:
     """Register KV cache data globally and with the KV connector if enabled.
 
-    ``num_blocks`` is the physical KV block count; the offload connector needs
-    it to byte-slice MLA's token-major latent cache (where tensor.shape[0] is
-    the token count, not the block count).
+    ``num_blocks`` is the scheduler-visible KV block count (the ID space used
+    by request block tables). The offload connector needs it to byte-slice
+    MLA's token-major latent cache, where tensor.shape[0] is the page-size-1
+    physical row count rather than the scheduler block count.
     """
     global _forward_kv_cache_context
 

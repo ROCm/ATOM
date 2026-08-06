@@ -112,10 +112,11 @@ class LMCacheOffloadConnector(KVConnectorBase):
             cfg, getattr(self._config, "kv_transfer_config", None)
         )
         self.chunk_size = int(cfg.chunk_size)
-        # num_blocks is the physical block count (num_physical_kvcache_blocks),
-        # threaded from the model runner. MLA stores its KV token-major, so the
-        # codec can't infer the block count from tensor.shape[0]; pass it.
+        # num_blocks is the scheduler-visible block count, threaded from the
+        # model runner. MLA stores its KV token-major, so the codec cannot infer
+        # this count from tensor.shape[0] (the page-size-1 physical row count).
         self._codec = ATOMKVByteCodec(kv_caches, num_blocks=num_blocks)
+        self._validate_block_geometry(transfer_tensors)
         base_meta = offcfg.build_lmcache_metadata(self._config, cfg, world, rank)
         meta = ATOMRawBytesLMCacheMetadata(
             base_meta,
@@ -168,19 +169,48 @@ class LMCacheOffloadConnector(KVConnectorBase):
             self._do_load,
         )
 
+    def _validate_block_geometry(self, transfer_tensors) -> None:
+        """Cross-check codec blocks against existing transfer-region metadata."""
+        block_regions = getattr(transfer_tensors, "block_regions", None) or []
+        if not block_regions:
+            return
+        expected = sum(int(region.unit_bytes) for region in block_regions)
+        if self._codec.bytes_per_block != expected:
+            raise ValueError(
+                "LMCache offload KV block geometry mismatch: "
+                f"codec={self._codec.bytes_per_block} bytes, "
+                f"transfer_regions={expected} bytes, "
+                f"num_blocks={self._codec.num_blocks}"
+            )
+
     # -- per-step (RPC thread): only enqueue, never copy ------------------
     def start_load_kv(self, metadata) -> None:
         if not isinstance(metadata, LMCacheOffloadMetadata):
             return
+        save_ready_event = None
+        if self._do_save and any(
+            req.save_spec is not None for req in metadata.requests
+        ):
+            # Forward kernels publish KV on the RPC thread's current stream.
+            # Save workers pack it on independent streams, so carry an event
+            # across the thread boundary instead of racing the producer.
+            save_ready_event = torch.cuda.Event()
+            save_ready_event.record(torch.cuda.current_stream())
         for req in metadata.requests:
             if req.load_spec is not None and self._do_load:
                 self._load_executor.submit(self._guard, "load", self._do_load_req, req)
             if req.save_spec is not None and self._do_save:
-                self._save_executor.submit(self._guard, "save", self._do_save_req, req)
+                self._save_executor.submit(
+                    self._guard,
+                    "save",
+                    self._do_save_req,
+                    req,
+                    save_ready_event,
+                )
 
-    def _guard(self, kind: str, fn, req) -> None:
+    def _guard(self, kind: str, fn, req, *args) -> None:
         try:
-            fn(req)
+            fn(req, *args)
         except Exception:
             logger.exception(
                 "LMCache offload: %s failed for %s", fn.__name__, req.req_id
@@ -315,7 +345,7 @@ class LMCacheOffloadConnector(KVConnectorBase):
                 total_ms,
             )
 
-    def _do_save_req(self, req: LMCacheReqMeta) -> None:
+    def _do_save_req(self, req: LMCacheReqMeta, producer_event=None) -> None:
         ss = req.save_spec
         assert ss is not None
         toks = req.token_ids
@@ -326,6 +356,12 @@ class LMCacheOffloadConnector(KVConnectorBase):
             with self._lock:
                 self._done_save.add(req.req_id)
             return
+
+        # Wait only for the forward work that produces this save's KV. This
+        # blocks the background save worker, not the model RPC thread, and is
+        # intentionally narrower than a device-wide synchronize().
+        if producer_event is not None:
+            producer_event.synchronize()
 
         t_total0 = time.perf_counter()
         mask = torch.ones(len(toks), dtype=torch.bool)

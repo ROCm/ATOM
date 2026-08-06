@@ -912,6 +912,42 @@ def test_worker_save_uses_lmcache_engine_store():
     assert kwargs["req_id"] == "987"
 
 
+def test_worker_save_waits_for_forward_event_before_store():
+    import torch
+
+    if not hasattr(torch, "tensor"):
+        pytest.skip("real torch is unavailable")
+
+    order = []
+
+    class _Event:
+        def synchronize(self) -> None:
+            order.append("forward-ready")
+
+    class _Engine:
+        def store(self, *args, **kwargs) -> None:
+            order.append("store")
+
+    conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
+    conn._lock = threading.Lock()
+    conn._done_save = set()
+    conn.chunk_size = 4
+    conn._engine = _Engine()
+
+    req = SimpleNamespace(
+        req_id=988,
+        token_ids=list(range(8)),
+        block_ids=[3, 4],
+        is_last_prefill=True,
+        save_spec=SimpleNamespace(skip_leading_tokens=0),
+    )
+
+    conn._do_save_req(req, _Event())
+
+    assert order == ["forward-ready", "store"]
+    assert conn._done_save == {988}
+
+
 def test_worker_load_uses_lmcache_engine_retrieve_and_marks_done():
     import torch
 
@@ -1218,8 +1254,21 @@ def test_codec_mla_token_major_block_accounting():
 
     # Block count comes from the explicit arg, not tensor.shape[0] (= tokens).
     assert codec.num_blocks == num_blocks
-    # One physical block spans block_size tokens of `latent` bytes each.
+    # One scheduler block spans block_size tokens of `latent` bytes each.
     assert codec.bytes_per_block == block_size * latent
+
+    # Regression: passing the page-size-1 physical row count instead of the
+    # scheduler block count shrinks each transfer block by block_size. The
+    # connector compares this against its existing transfer-region metadata.
+    wrong_codec = ATOMKVByteCodec(kv_caches, num_blocks=num_blocks * block_size)
+    conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
+    conn._codec = wrong_codec
+    with pytest.raises(ValueError, match="KV block geometry mismatch"):
+        conn._validate_block_geometry(
+            SimpleNamespace(
+                block_regions=[SimpleNamespace(unit_bytes=block_size * latent)]
+            )
+        )
 
     # A segment whose element count is not divisible by num_blocks is rejected.
     with pytest.raises(ValueError):
@@ -1270,3 +1319,141 @@ def test_codec_mla_round_trip_byte_identical():
     kv_caches["l0"].k_cache.zero_()
     codec.chunk_major_device_buffer_to_gpu(device_buf, block_id_groups)
     assert torch.equal(kv_caches["l0"].k_cache, original)
+
+
+def test_codec_dsa_includes_index_cache_segment():
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    num_blocks, block_size, latent, index_dim = 4, 2, 3, 5
+    k_cache = torch.arange(
+        num_blocks * block_size * latent, dtype=torch.uint8
+    ).reshape(num_blocks * block_size, 1, latent)
+    # Block-major indexer cache (num_blocks, block_size, index_dim).
+    index_cache = torch.arange(
+        num_blocks * block_size * index_dim, dtype=torch.uint8
+    ).reshape(num_blocks, block_size, index_dim)
+    kv_caches = {
+        "l0": SimpleNamespace(
+            k_cache=k_cache.clone(),
+            v_cache=None,
+            k_scale=None,
+            v_scale=None,
+            index_cache=index_cache.clone(),
+        )
+    }
+    codec = ATOMKVByteCodec(kv_caches, num_blocks=num_blocks)
+    mla_only = block_size * latent
+    index_only = block_size * index_dim
+    assert codec.bytes_per_block == mla_only + index_only
+
+    _install_byte_addressing_fused(codec)
+    # Stage every block (two chunks) so the round trip below can assert the full
+    # tensor is restored.
+    block_id_groups = [[0, 1], [2, 3]]
+    device_buf = torch.empty(
+        num_blocks * codec.bytes_per_block, dtype=torch.uint8, device=codec.device
+    )
+    codec.gpu_to_chunk_major_device_buffer(device_buf, block_id_groups)
+
+    k_flat = k_cache.view(torch.uint8).reshape(num_blocks, -1)
+    idx_flat = index_cache.reshape(num_blocks, -1)
+    # Staging is segment-major within a chunk (see ATOMKVByteCodec docstring and
+    # the Triton kernel's ``segment_prefix_bytes[seg] * nblocks`` base): within
+    # each chunk it is all K blocks, then all index blocks.
+    expected = torch.cat(
+        [
+            k_flat[0], k_flat[1], idx_flat[0], idx_flat[1],
+            k_flat[2], k_flat[3], idx_flat[2], idx_flat[3],
+        ],
+    )
+    assert torch.equal(device_buf.cpu(), expected.cpu())
+
+    kv_caches["l0"].k_cache.zero_()
+    kv_caches["l0"].index_cache.zero_()
+    codec.chunk_major_device_buffer_to_gpu(device_buf, block_id_groups)
+    assert torch.equal(kv_caches["l0"].k_cache, k_cache)
+    assert torch.equal(kv_caches["l0"].index_cache, index_cache)
+
+
+def test_codec_dsa_fp8_multilayer_including_mtp_round_trip():
+    """GLM-5.2 realistic geometry: an ``fp8`` indexer cache
+    (``aligned_index_dim=144``) alongside the token-major MLA latent (576),
+    across main *and* MTP layers.
+
+    For GLM-5.2 the MTP draft is MLA, so it shares the target's KV pool and is
+    bound by the main attention builder exactly like a decoder layer (no
+    ``eagle3_draft_builder``); its ``index_cache`` therefore reaches the codec
+    as just another registered layer. This asserts the codec moves the fp8
+    index segment byte-exact for every layer. Bytes are compared through a
+    ``uint8`` view so fp8 NaN bit patterns (which are ``!=`` themselves) do not
+    make a byte-identical round trip look unequal.
+    """
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+    fp8 = getattr(torch, "float8_e4m3fn", None)
+    if fp8 is None:
+        pytest.skip("fp8 dtype unavailable")
+
+    num_blocks, block_size = 4, 2
+    latent, aligned_index_dim = 576, 144  # DeepSeek-V3.2 / GLM-5.2 real dims
+
+    def _make_layer(seed: int):
+        # MLA latent: token-major (num_blocks*block_size, 1, latent).
+        k = (
+            torch.arange(num_blocks * block_size * latent, dtype=torch.uint8) + seed
+        ).reshape(num_blocks * block_size, 1, latent)
+        # Indexer: block-major (num_blocks, block_size, aligned_index_dim), fp8.
+        idx = (
+            (
+                torch.arange(
+                    num_blocks * block_size * aligned_index_dim, dtype=torch.uint8
+                )
+                + seed * 7
+            )
+            .view(fp8)
+            .reshape(num_blocks, block_size, aligned_index_dim)
+        )
+        return k, idx
+
+    # layer_0/layer_1 are decoder layers; layer_2 stands in for the MTP layer,
+    # which shares the pool and is registered identically.
+    layers = {f"layer_{i}": _make_layer(i) for i in range(3)}
+    kv_caches = {
+        name: SimpleNamespace(
+            k_cache=k.clone(),
+            v_cache=None,
+            k_scale=None,
+            v_scale=None,
+            index_cache=idx.clone(),
+        )
+        for name, (k, idx) in layers.items()
+    }
+    codec = ATOMKVByteCodec(kv_caches, num_blocks=num_blocks)
+
+    per_block = block_size * latent + block_size * aligned_index_dim
+    assert codec.bytes_per_block == len(layers) * per_block
+
+    _install_byte_addressing_fused(codec)
+    block_id_groups = [[0, 1], [2, 3]]
+    device_buf = torch.empty(
+        num_blocks * codec.bytes_per_block, dtype=torch.uint8, device=codec.device
+    )
+    codec.gpu_to_chunk_major_device_buffer(device_buf, block_id_groups)
+
+    # Wipe every segment (via the uint8 view for fp8) and scatter back.
+    for name in kv_caches:
+        kv_caches[name].k_cache.zero_()
+        kv_caches[name].index_cache.view(torch.uint8).zero_()
+    codec.chunk_major_device_buffer_to_gpu(device_buf, block_id_groups)
+
+    for name, (k, idx) in layers.items():
+        assert torch.equal(kv_caches[name].k_cache, k)
+        assert torch.equal(
+            kv_caches[name].index_cache.view(torch.uint8),
+            idx.view(torch.uint8),
+        )
