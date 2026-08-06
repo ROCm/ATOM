@@ -1246,24 +1246,31 @@ class TestDemandDrivenCheckpoints:
         assert second.num_wanted_hit_blocks == 8  # ...none of it recoverable
         assert second.checkpoint_demand_pos == 0
 
-    def test_demand_under_one_interval_costs_nothing(self):
-        """`checkpoint_limit`'s promise, from the other side.
+    def test_a_demand_the_grid_cannot_express_is_kept_anyway(self):
+        """The grid's granularity does not gate the evidence.
 
-        A demand of at least one interval implies a limit above zero, because
-        the demand carries `successor_room` behind it by construction. So a
-        workload keeping no checkpoints today cannot start paying for cuts —
-        the threshold is what makes that statable rather than probable.
+        A prompt with no room for a rung — shorter than an interval, or with
+        its whole tail inside the last one — used to decline every reusable
+        block it had: the demand was measured, compared against the interval,
+        and dropped. But the interval is a guess about where reuse might
+        resume, while a demand is reuse that was asked for and refused, and one
+        is no reason to discard the other. This is the workload that motivates
+        it: prompts under the interval, sharing a real prefix.
         """
         bm = BlockManager(demand_config())
-        short = list(range(16))  # under one interval
+        short = list(range(16))
         run_prompt_on_the_ladder(bm, stateful_seq(short))
 
         second = stateful_seq(short)
         assert bm.can_allocate(second) == 0
-        assert second.num_wanted_hit_blocks == 2  # a checkpoint at 8 would land
-        assert bm.checkpoint_limit(second) == 0  # but this prompt keeps none
-        assert second.checkpoint_demand_pos == 0
-        assert run_prompt_on_the_ladder(bm, second) == []
+        assert bm.checkpoint_limit(second) == 0  # the grid places no rung here
+        assert second.checkpoint_demand_pos == 8  # the demand is its own rung
+        assert run_prompt_on_the_ladder(bm, second) == [8]
+
+        third = stateful_seq(short)
+        assert bm.can_allocate(third) == 2  # ...and the next one collects it
+        assert third.checkpoint_demand_pos == 0  # nothing left to want
+        assert run_prompt_on_the_ladder(bm, third) == []
 
     def test_the_demand_is_cut_and_kept_at_the_same_position(self):
         """The cut and the keep read the same call, so they cannot drift."""

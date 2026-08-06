@@ -531,10 +531,10 @@ class BlockManager:
         forward. Kept as its own method because the scheduler needs the bound up
         front, to cut prefill chunks so they land on the ladder.
 
-        0 means this seq checkpoints nothing off its prompt — including every
-        prompt shorter than one interval, which is the point: a workload whose
-        prompts all fit under the interval pays nothing for a feature it would
-        never hit.
+        0 means the grid places no rung on this prompt — every prompt shorter
+        than one interval, among others. It does not mean the seq keeps
+        nothing: a demand rung sits outside the grid and `checkpoint_cut`
+        takes it either way.
         """
         interval = self.state_checkpoint_interval_tokens
         if interval <= 0:
@@ -571,25 +571,30 @@ class BlockManager:
         this chunk by the time `hash_blocks` runs, so a reader comparing against
         it would drop the demand on exactly the forward that was cut for it.
 
-        Demand under one interval is dropped, which is what keeps the property
-        `checkpoint_limit` states. The position satisfies
-        `num_prompt_tokens - pos >= successor_room` by construction, so one
-        interval of demand implies `checkpoint_limit > 0`: a workload keeping no
-        checkpoints today gains no chunk cuts from this, not one. It also
-        filters the shape where a shared prefix is a template header and every
-        checkpoint is invalidated by the next admission — there each request
-        would pay for a cut and none would collect.
+        A demand is not measured against the interval. The grid guesses
+        where reuse will resume; a demand is reuse that was asked for and
+        refused, and the granularity of the guess is no reason to discard it —
+        gating one by the other left every prompt shorter than an interval
+        declining all the reuse it had. The position comes from the same
+        forkable test as the hit, so it always satisfies
+        `num_prompt_tokens - pos >= successor_room`: somebody can really keep it.
+
+        The shape that pays for this is a template header whose checkpoint is
+        invalidated before anyone reaches it — there each request cuts a chunk
+        and none collects. What bounds that is convergence rather than a
+        threshold: found once, filled once, gone.
         """
         wanted = (
             self._gated_hit(seq, compressed_hit, block_hashes, assume_checkpointed=True)
             if hit < compressed_hit
             else hit
         )
-        interval = self.state_checkpoint_interval_tokens
-        pos = wanted * self.hash_block_size
         seq.num_wanted_hit_blocks = wanted
+        # Zero interval switches the ladder off entirely — `checkpointers_at`
+        # keeps nothing then, so a cut for a demand would buy nothing either.
+        interval_on = self.state_checkpoint_interval_tokens > 0
         seq.checkpoint_demand_pos = (
-            pos if interval and pos >= interval and wanted > hit else 0
+            wanted * self.hash_block_size if interval_on and wanted > hit else 0
         )
 
     def checkpoint_cut(self, seq: Sequence, start: int, end: int) -> int:
@@ -600,16 +605,17 @@ class BlockManager:
         ending there keeps: the two have to agree position for position, so the
         grid arithmetic lives here rather than at the scheduler's call site.
         """
-        limit = self.checkpoint_limit(seq)
-        if not limit:
-            return 0
-        # `limit` is itself a multiple of the interval, so a chunk cut at it
-        # needs no special case.
-        rung = min(end, limit)
-        rung -= rung % self.state_checkpoint_interval_tokens
-        # A demand is not capped by `limit`: `limit` is the last position on the
-        # *grid* that leaves the widest class its room, and a demand carries
-        # that room by construction — it can sit to the right of the last rung.
+        rung = 0
+        if limit := self.checkpoint_limit(seq):
+            # `limit` is itself a multiple of the interval, so a chunk cut at
+            # it needs no special case.
+            rung = min(end, limit)
+            rung -= rung % self.state_checkpoint_interval_tokens
+        # A demand is capped by neither the grid nor `limit`. `limit` is the
+        # last position on the *grid* that leaves the widest class its room; a
+        # demand carries that room by construction, so it may sit to the right
+        # of the last rung — or, on a prompt too short for the grid to place a
+        # rung at all, be the only position either side has.
         demand = seq.checkpoint_demand_pos
         target = max(rung, demand if demand <= end else 0)
         return target if target > start else 0
