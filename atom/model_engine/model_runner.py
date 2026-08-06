@@ -838,6 +838,10 @@ class ModelRunner:
             self.drafter.arm_aux_capture(self.model)
         self._init_forward_vars_ring()
         self.forward_done_event = torch.cuda.Event()
+        # Completion of the previous SparseKV decode forward, and its active
+        # request-id set (see _sparsekv_stage_and_sync).
+        self._sparsekv_prev_forward_event: torch.cuda.Event | None = None
+        self._sparsekv_last_active_reqids: set = set()
         initialize_eplb_runtime(self)
         self._maybe_warmup()
 
@@ -3363,6 +3367,15 @@ class ModelRunner:
         if batch.total_tokens_num_prefill > 0:
             return
         req_ids = batch.req_ids
+        # On batch-composition change (a slot is freed/reassigned) drain the
+        # previous decode forward before mutating the coordinator tables it read.
+        cur_active = set(req_ids)
+        if (
+            cur_active != self._sparsekv_last_active_reqids
+            and self._sparsekv_prev_forward_event is not None
+        ):
+            self._sparsekv_prev_forward_event.synchronize()
+        self._sparsekv_last_active_reqids = cur_active
         coord.sync_active(req_ids)
         for i, rid in enumerate(req_ids):
             if coord.is_registered(rid):
@@ -3409,6 +3422,16 @@ class ModelRunner:
             needs_independent_noise,
         ) = self.prepare_model(batch)
         logits, hidden_states = self.run_model(input_ids, batch)
+
+        coord = getattr(self, "sparsekv_coordinator", None)
+        if (
+            coord is not None
+            and not batch.is_dummy_run
+            and batch.total_tokens_num_prefill == 0
+        ):
+            if self._sparsekv_prev_forward_event is None:
+                self._sparsekv_prev_forward_event = torch.cuda.Event()
+            self._sparsekv_prev_forward_event.record()
 
         pp_group = get_pp_group()
         pp_non_last = pp_group.world_size > 1 and not pp_group.is_last_rank

@@ -378,6 +378,9 @@ class SparseKVCoordinator:
         if slot is None:
             return
         self.unregister_request(slot)
+        # Sole path a slot re-enters the free pool. ModelRunner._sparsekv_stage_and_sync
+        # drains the previous forward on the batch-change step this runs on, so the
+        # freed slot's last reader is done before it is reused; keep it that way.
         self._free_slots.append(slot)
 
     def sync_active(self, active_req_ids) -> None:
