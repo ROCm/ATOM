@@ -1690,6 +1690,9 @@ class Config:
         # deploying it on top of a cache built with the other setting — reuses a
         # stale artifact and trips assert_size_stride at runtime.
         factors.append(bool(envs.ATOM_REPLICATE_VOCAB_EMBED))
+        # Same hazard for the Kimi-K3 per-family override, which can flip the
+        # embed shape/op while the master switch above is unchanged.
+        factors.append(envs.ATOM_KIMI_K3_REPLICATE_VOCAB_EMBED)
 
         hash_str = hashlib.md5(
             str(factors).encode(), usedforsecurity=False
