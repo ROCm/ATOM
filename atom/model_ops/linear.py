@@ -379,9 +379,6 @@ def _can_use_a8w8_preshuffle(output_size: int, input_size: int) -> bool:
     ``shuffle_weight(..., layout=(16, 16))`` packs the output (N) dim in 16-row
     tiles and the input (K) dim in ``BK = IK * 2 = 32``-col tiles (it asserts
     ``x.shape[-1] % 32 == 0``). So N must be 16-aligned and K must be 32-aligned.
-    A fused output that is not 16-aligned (e.g. KDA in_proj, whose
-    N = 4*local_proj + num_heads + head_dim) must first be padded -- see
-    ``_a8w8_preshuffle_output_padding``.
     """
     return output_size % 16 == 0 and input_size % 32 == 0
 
@@ -508,6 +505,7 @@ class LinearBase(nn.Module):
             self.weight_scale.weight_loader = self.weight_loader
         self.need_normalize_e4m3fn_to_e4m3fnuz = params_dtype == torch.float8_e4m3fnuz
         self.quant_func = get_hip_quant(self.quant_type)
+        self.is_output_padded = False
 
     @staticmethod
     def weight_loader_process(
@@ -797,10 +795,7 @@ class LinearBase(nn.Module):
                 ):
                     need_shuffle = True
             if need_shuffle and self.weight.dim() == 2:
-                # a8w8 (per_Token fp8) bpreshuffle needs an N-tile-aligned
-                # output; pad a misaligned fused N (e.g. KDA in_proj) before
-                # shuffling so the padded rows land in the shuffled layout too.
-                self._maybe_pad_a8w8_preshuffle_output()
+                self.is_output_padded = self._maybe_pad_a8w8_preshuffle_output()
                 shuffle_weights(self.weight)
                 # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
         # shuffle weight scale once so no reshuffling for every gemm
@@ -809,24 +804,16 @@ class LinearBase(nn.Module):
         ):
             self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
 
-    def _maybe_pad_a8w8_preshuffle_output(self):
-        """Pad a per_Token FP8 weight's output dim (N) up to the CK bpreshuffle
-        N-tile when it is not tile-aligned, so the fused GEMM can use the tuned
-        preshuffle path. Records the logical width in ``_output_size_before_padding``
-        so ``forward`` slices the padding rows back off. No-op (byte-identical) for
-        already-aligned weights, so existing models are unaffected.
-        """
+    def _maybe_pad_a8w8_preshuffle_output(self) -> bool:
         if not (
             self.quant_type == QuantType.per_Token and self.params_dtype == dtypes.fp8
         ):
-            return
+            return False
         if self.weight.dim() != 2:
-            return
+            return False
         output_size, input_size = self.weight.shape
-        if _can_use_a8w8_preshuffle(output_size, input_size):
-            return
-        pad = _a8w8_preshuffle_output_padding(output_size)
-        if not _can_use_a8w8_preshuffle(output_size + pad, input_size):
+        padding_size = _a8w8_preshuffle_output_padding(output_size)
+        if not _can_use_a8w8_preshuffle(output_size + padding_size, input_size):
             # Padding the output (N) cannot make this weight preshuffle-able, i.e.
             # the input dim K is not 32-aligned. Fail loudly here rather than let
             # shuffle_weights hit its cryptic `x.shape[-1] % 32 == 0` assertion.
@@ -835,19 +822,19 @@ class LinearBase(nn.Module):
                 f"K={input_size}. Align K or run this layer via the triton a8w8 "
                 f"path (ATOM_USE_TRITON_GEMM=1)."
             )
+        if padding_size == 0:
+            return False
         self._output_size_before_padding = output_size
-        # Padding rows are zeros -> their GEMM output is discarded after slicing.
-        self.weight.data = torch.nn.functional.pad(self.weight.data, (0, 0, 0, pad))
-        # Grow the per-output-channel weight_scale with matching (arbitrary) rows.
+        self.weight.data = torch.nn.functional.pad(self.weight.data, (0, 0, 0, padding_size))
         ws = self.weight_scale.data
         self.weight_scale.data = torch.cat(
-            [ws, ws.new_ones((pad, *ws.shape[1:]))], dim=0
+            [ws, ws.new_ones((padding_size, *ws.shape[1:]))], dim=0
         )
-        # Bias is also per-output-channel; pad with zeros so `y += bias` on the
-        # padded output stays shape-correct (KDA is bias=False, but keep general).
+        # Bias is also per-output-channel
         if self.bias is not None:
             b = self.bias.data
-            self.bias.data = torch.cat([b, b.new_zeros((pad, *b.shape[1:]))], dim=0)
+            self.bias.data = torch.cat([b, b.new_zeros((padding_size, *b.shape[1:]))], dim=0)
+        return True
 
     # linear mark trace shape/dtype helper
     def get_trace_prefix(
@@ -991,9 +978,8 @@ class LinearBase(nn.Module):
                 )
                 if self.bias is not None:
                     y += self.bias
-        if hasattr(self, "_output_size_before_padding"):
-            # Drop the CK-tile padding rows added to the a8w8 preshuffle weight so
-            # the GEMM output matches this layer's logical output width.
+        if self.is_output_padded:
+            # Drop the padded output rows
             y = y[..., : self._output_size_before_padding]
         if self.tp_dim == 1 and self.tp_size > 1 and self.reduce_results:
             y = tensor_model_parallel_all_reduce(y)
