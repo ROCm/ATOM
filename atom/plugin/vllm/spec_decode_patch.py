@@ -90,56 +90,6 @@ def _patch_dspark_standalone_draft_config() -> None:
     logger.info("ATOM plugin: patched SpeculativeConfig for standalone DSpark drafts.")
 
 
-def _patch_dspark_causal_draft() -> None:
-    """Draft the Kimi-K3 DSpark block causally, the way ATOM's own DSpark does.
-
-    vLLM's DSpark speculator pins drafting to non-causal: every block position
-    attends to the whole block. ``mla_decode_fwd`` masks tail-aligned-causally
-    whatever it is asked for, so getting that upper triangle means merging a
-    second partial attention in by log-sum-exp.
-
-    ATOM's native DSpark never merges: the block pass just takes what the
-    kernel gives, so position ``i`` sees ``context + block[:i+1]``. Matching it
-    keeps one drafting semantics across both engines, and it needs no LSE at
-    all. The cost is the block's tail -- positions 5-7 are almost never
-    accepted, so acceptance lands near 3.8. Causal drafting is a first-class
-    DFlash mode here, so matching native is just flipping the flag the DSpark
-    subclass pins off, for the Kimi-K3 draft only.
-
-    Non-causal is a possible follow-up rather than a dead end: the persistent
-    decode kernel does return a usable LSE on gfx950 -- DCP merges cross-rank
-    on it -- so the merge is buildable. The split-KV kernel is the one to avoid,
-    its stage2 reduce leaving ``final_lse`` untouched for a request whose valid
-    split count collapses, which is what a large batch produces.
-    """
-    try:
-        from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
-    except ImportError:
-        return
-
-    original_init = DSparkSpeculator.__init__
-    if getattr(original_init, "_atom_dspark_causal_patched", False):
-        return
-
-    @functools.wraps(original_init)
-    def wrapped_init(self, *args, **kwargs):
-        original_init(self, *args, **kwargs)
-        hf_config = getattr(self.draft_model_config, "hf_config", None)
-        if _K3_DSPARK_ARCH not in (getattr(hf_config, "architectures", None) or ()):
-            return
-        # Read by init_cudagraph_manager() and by every draft attention
-        # metadata build, both of which run after __init__.
-        self.dflash_causal = True
-        logger.info(
-            "ATOM plugin: drafting the %s block causally, matching ATOM's "
-            "native DSpark attention path.",
-            _K3_DSPARK_ARCH,
-        )
-
-    wrapped_init._atom_dspark_causal_patched = True
-    DSparkSpeculator.__init__ = wrapped_init
-
-
 def _patch_dspark_fused_markov_sample() -> None:
     """Sample the DSpark block with the fused Markov bias+argmax kernel.
 
@@ -750,7 +700,6 @@ def _patch_vllm_deepseek_v4_mtp_first_pass_inputs() -> None:
 def apply_vllm_spec_decode_patch() -> None:
     """Patch vLLM speculative decoding for ATOM metadata compatibility."""
     _patch_dspark_standalone_draft_config()
-    _patch_dspark_causal_draft()
     _patch_dspark_fused_markov_sample()
     _patch_vllm_llm_base_model_sharing()
     _patch_vllm_draft_kv_group_validation()

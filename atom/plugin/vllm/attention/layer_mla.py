@@ -841,6 +841,11 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
             q_scale=self._q_scale,
             kv_scale=self._k_scale,
             return_lse=return_lse,
+            # A bidirectional draft block needs every position to see the whole
+            # block. The asm kernel picks its .co by this flag and the work
+            # descriptors were planned for it, so it has to match what the
+            # metadata builder planned.
+            causal=attn_metadata.decode.causal,
         )
         if do_fold:
             o = o.view(ori_total_s, ori_nhead, -1)
@@ -1379,60 +1384,11 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         )
         return self.o_proj(output)
 
-    def pin_kv_cache_dtype(self, kv_cache_dtype: str) -> None:
-        """Cache in `kv_cache_dtype` rather than the engine-wide dtype.
-
-        Layers otherwise take the engine's `--kv-cache-dtype`, which is right
-        for anything sharing the engine's pool. A draft that owns a separate
-        pool in another dtype re-pins it here, so that the dtype-driven
-        dispatch -- the fp8 decode overload, the cache-write kernel, aiter's
-        fp8 split-KV table -- matches the pool the layer actually reads.
-        """
-        from vllm.config import get_current_vllm_config
-        from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
-
-        is_fp8 = kv_cache_dtype.startswith("fp8")
-        self.kv_cache_dtype = "fp8" if is_fp8 else "auto"
-        self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
-            kv_cache_dtype if is_fp8 else "auto",
-            get_current_vllm_config().model_config,
-        )
-
     def get_kv_cache_spec(self, vllm_config):
-        from vllm.utils.torch_utils import (
-            get_dtype_size,
-            kv_cache_dtype_str_to_dtype,
-        )
         from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
-        block_size = vllm_config.cache_config.block_size
-        if getattr(self, "align_page_size_to_engine_dtype", False):
-            # This layer caches in a different dtype than the engine's, so at a
-            # shared block size its pages would be a different size than
-            # everyone else's -- and vLLM allocates a single page size across
-            # all KV cache groups, sizing it to the largest. Scaling the block
-            # size by the inverse dtype ratio makes the pages match exactly.
-            #
-            # Read the block size here rather than at construction: hybrid
-            # models raise it afterwards to line attention pages up with mamba
-            # state pages.
-            engine_element_size = get_dtype_size(
-                kv_cache_dtype_str_to_dtype(
-                    vllm_config.cache_config.cache_dtype,
-                    vllm_config.model_config,
-                )
-            )
-            element_size = get_dtype_size(self.kv_cache_torch_dtype)
-            scaled = block_size * engine_element_size
-            if scaled % element_size:
-                raise ValueError(
-                    f"{self.layer_name}: a {element_size}-byte cache dtype "
-                    f"cannot be page-aligned to the engine's at "
-                    f"block_size={block_size}."
-                )
-            block_size = scaled // element_size
         return MLAAttentionSpec(
-            block_size=block_size,
+            block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
             head_size=self.head_size,
             dtype=self.kv_cache_torch_dtype,

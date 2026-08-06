@@ -11,8 +11,9 @@ are one ulp apart (2^-7 relative at the bottom of a binade): measured on gfx950,
 disagreements passes, a wiring bug (wrong slot, wrong lane, wrong position)
 moves whole rows and does not.
 
-Shapes are Kimi-K3-DSpark's: a 512-wide latent plus a 64-wide positional lane,
-cached bf16.
+Shapes are Kimi-K3-DSpark's: a 512-wide latent plus a 64-wide positional lane.
+The draft shares the engine's fp8 cache, so the fp8 store -- scale then cast,
+which the bf16 store must not do -- is covered alongside the bf16 one.
 """
 
 import pytest
@@ -28,6 +29,15 @@ ENTRY = KV_LORA_RANK + PE_DIM
 Q_LORA_RANK = 1536
 EPS = 1e-6
 
+def _fp8_dtype():
+    """Whichever fp8 this build caches in -- gfx950 is OCP e4m3, gfx942 is fnuz."""
+    from aiter import dtypes
+
+    return dtypes.fp8
+
+
+FP8_DTYPE = _fp8_dtype()
+
 
 def _assert_cache_matches(fused, ref):
     """Bitwise equal but for a sprinkling of last-bit rounding (see module doc)."""
@@ -38,9 +48,15 @@ def _assert_cache_matches(fused, ref):
         "than last-bit rounding can account for"
     )
     # One bf16 ulp is 2^-8 relative at the top of a binade and 2^-7 at the
-    # bottom, so 2^-7 is the bound that means "last bit". atol covers the
-    # subnormal end, where a relative bound has nothing to hold on to.
-    torch.testing.assert_close(fused, ref, rtol=2**-7, atol=1e-6)
+    # bottom, so 2^-7 is the bound that means "last bit". An fp8 e4m3 mantissa
+    # is 3 bits, so its last bit is 2^-3. atol covers the subnormal end, where a
+    # relative bound has nothing to hold on to.
+    if fused.dtype is FP8_DTYPE:
+        fused, ref = fused.float(), ref.float()
+        rtol = 2**-3
+    else:
+        rtol = 2**-7
+    torch.testing.assert_close(fused, ref, rtol=rtol, atol=1e-6)
 
 
 def _rope(max_position=4096):
@@ -64,7 +80,9 @@ def _rope(max_position=4096):
     return rope
 
 
-def _reference_write(kv_lora, norm_weight, rope, positions, slot_mapping, cache):
+def _reference_write(
+    kv_lora, norm_weight, rope, positions, slot_mapping, cache, k_scale
+):
     from aiter import concat_and_cache_mla, rmsnorm2d_fwd
 
     kv_c, k_pe = kv_lora.split([KV_LORA_RANK, PE_DIM], dim=-1)
@@ -79,12 +97,14 @@ def _reference_write(kv_lora, norm_weight, rope, positions, slot_mapping, cache)
         k_pe.squeeze(1),
         cache,
         slot_mapping.flatten(),
-        kv_cache_dtype="auto",
-        scale=torch.tensor(1.0, dtype=torch.float32, device=cache.device),
+        kv_cache_dtype="fp8" if cache.dtype is FP8_DTYPE else "auto",
+        scale=k_scale,
     )
 
 
-def _run_both(num_tokens, num_blocks, block_size, slot_mapping, kv_lora=None):
+def _run_both(
+    num_tokens, num_blocks, block_size, slot_mapping, kv_lora=None, cache_dtype=None
+):
     from atom.model_ops.triton_fused_mla_ctx_kv import fused_mla_ctx_norm_rope_cache
 
     gen = torch.Generator(device="cuda").manual_seed(num_tokens)
@@ -99,12 +119,16 @@ def _run_both(num_tokens, num_blocks, block_size, slot_mapping, kv_lora=None):
         0, 4096, (num_tokens,), generator=gen, device="cuda", dtype=torch.int64
     )
 
+    cache_dtype = cache_dtype or torch.bfloat16
+    is_fp8 = cache_dtype is FP8_DTYPE
     # Pre-filled with a sentinel so an untouched slot is distinguishable from a
     # written one -- that is what the slot < 0 case below checks.
     fused_cache = torch.full(
-        (num_blocks, block_size, ENTRY), -7.0, device="cuda", dtype=torch.bfloat16
+        (num_blocks, block_size, ENTRY), -7.0, device="cuda", dtype=cache_dtype
     )
     ref_cache = fused_cache.clone()
+    # Not 1.0: a unit scale would let a store that forgets to divide by it pass.
+    k_scale = torch.tensor(0.5 if is_fp8 else 1.0, dtype=torch.float32, device="cuda")
 
     fused_mla_ctx_norm_rope_cache(
         kv_lora,
@@ -114,14 +138,16 @@ def _run_both(num_tokens, num_blocks, block_size, slot_mapping, kv_lora=None):
         rope.sin_cache,
         slot_mapping,
         fused_cache,
-        torch.tensor(1.0, dtype=torch.float32, device="cuda"),
+        k_scale,
         EPS,
         KV_LORA_RANK,
         PE_DIM,
         rope.is_neox_style,
-        False,
+        is_fp8,
     )
-    _reference_write(kv_lora, norm_weight, rope, positions, slot_mapping, ref_cache)
+    _reference_write(
+        kv_lora, norm_weight, rope, positions, slot_mapping, ref_cache, k_scale
+    )
     return fused_cache, ref_cache
 
 
@@ -141,6 +167,29 @@ def test_matches_per_op_chain(num_tokens, num_blocks, block_size):
     )[:num_tokens]
     fused_cache, ref_cache = _run_both(
         num_tokens, num_blocks, block_size, slots.to(torch.int64)
+    )
+    _assert_cache_matches(fused_cache, ref_cache)
+
+
+@pytest.mark.parametrize("num_tokens,num_blocks,block_size", [(512, 64, 128), (7, 8, 1)])
+def test_matches_per_op_chain_on_an_fp8_cache(num_tokens, num_blocks, block_size):
+    """The draft caches fp8 with the engine, so the store scales before casting.
+
+    aiter's kFp8 branch divides by ``k_scale`` and the kAuto branch does not, and
+    the fused kernel has to pick the same branch off the same flag -- getting it
+    backwards is silent, since both produce plausible-looking numbers.
+    """
+    slots = torch.randperm(
+        num_blocks * block_size,
+        device="cuda",
+        generator=torch.Generator(device="cuda").manual_seed(num_tokens),
+    )[:num_tokens]
+    fused_cache, ref_cache = _run_both(
+        num_tokens,
+        num_blocks,
+        block_size,
+        slots.to(torch.int64),
+        cache_dtype=FP8_DTYPE,
     )
     _assert_cache_matches(fused_cache, ref_cache)
 
