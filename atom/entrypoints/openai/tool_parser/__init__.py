@@ -3,22 +3,25 @@
 
 """Tool call parsing for models that emit tool calls in their text output.
 
-Five on-the-wire formats are auto-detected and normalized into the OpenAI
+Six on-the-wire formats are auto-detected and normalized into the OpenAI
 ``tool_calls`` structure:
 
 ==============================  ===============================================
 Module                          Format
 ==============================  ===============================================
 `kimi_tool_parser`              Kimi-K2 ``<|tool_call_begin|>`` special tokens
+`kimi_k3_tool_parser`           Kimi-K3 ``<|open|>call tool="`` channel format
 `qwen3_tool_parser`             Qwen3 (qwen3_coder / qwen3_xml) ``<function=`` XML
 `deepseekv4_tool_parser`        DeepSeek-V4 ``<｜DSML｜invoke>`` markup
 `glm_tool_parser`               GLM-4.5/4.6/5.x ``<tool_call>``/``<arg_key>``
 `minimax_tool_parser`           MiniMax-M3 ``]<]minimax[>[``-prefixed tags
 ==============================  ===============================================
 
-Formats other than Kimi carry no value types on the wire, so when the request's
-``tools`` schema is supplied each parameter is coerced to its declared
-JSON-Schema type; otherwise it is left as a string.
+The XML-ish formats (Qwen / DSML / GLM / MiniMax) carry no value types on the
+wire, so when the request's ``tools`` schema is supplied each parameter is
+coerced to its declared JSON-Schema type; otherwise it is left as a string.
+Kimi-K2 arguments are already JSON; Kimi-K3 carries a per-argument
+``type="..."`` on the wire, so neither needs the request schema.
 
 Two entry points, both format-agnostic:
 
@@ -40,6 +43,7 @@ documented there.
 
 from .deepseekv4_tool_parser import DsmlParser
 from .glm_tool_parser import GlmParser
+from .kimi_k3_tool_parser import KimiK3Parser
 from .kimi_tool_parser import KimiParser
 from .minimax_tool_parser import MiniMaxParser
 from .qwen3_tool_parser import QwenXmlParser
@@ -51,6 +55,7 @@ __all__ = [
     "BufferedMarkerParser",
     "DsmlParser",
     "GlmParser",
+    "KimiK3Parser",
     "KimiParser",
     "MiniMaxParser",
     "QwenXmlParser",

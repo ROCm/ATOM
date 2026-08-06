@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Tests for atom/model_engine/block_manager.py — public API only
 
-from types import SimpleNamespace
 
 from conftest import MockConfig
 
@@ -128,6 +127,36 @@ class TestPrefixCaching:
         assert len(s2.block_table) == 2
         # Deallocate s2 — no crash
         block_manager_prefix.deallocate(s2)
+
+
+class TestPublishLoadedPrefix:
+    def test_dcp_uses_hash_block_granularity(self, seq_factory, monkeypatch):
+        cfg = MockConfig(
+            num_kvcache_blocks=6,
+            kv_cache_block_size=4,
+            decode_context_parallel_size=2,
+            enable_prefix_caching=True,
+        )
+        bm = BlockManager(cfg)
+        # This test targets loaded-prefix publication, so isolate allocation
+        # from the GPU-only dcp_ops module used to calculate local block counts.
+        monkeypatch.setattr(
+            bm,
+            "_dcp_num_blocks",
+            lambda seq_len: (seq_len + bm.hash_block_size - 1) // bm.hash_block_size,
+        )
+        loaded = seq_factory(list(range(16)))
+        bm.allocate(loaded)
+
+        assert bm.publish_loaded_prefix(loaded, start_token=0, end_token=8) == 8
+        loaded_block = bm.kv.block(loaded.block_table[0])
+        assert loaded_block.token_ids == list(range(8))
+
+        probe = seq_factory(list(range(8)) + list(range(100, 108)))
+        num_cached_blocks = bm.can_allocate(probe)
+        assert num_cached_blocks == 1
+        bm.allocate(probe, num_cached_blocks)
+        assert probe.num_cached_tokens == 8
 
 
 # ── can_append / may_append ────────────────────────────────────────────────

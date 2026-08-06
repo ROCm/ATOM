@@ -352,6 +352,62 @@ PY
     result_file="${flat_result_file}"
   fi
 
+  local server_info_file="/tmp/atom_sglang_server_info.json"
+  if curl -fsS "http://127.0.0.1:${SGLANG_PORT}/server_info" -o "${server_info_file}" 2>/dev/null; then
+    RESULT_FILE="${result_file}" SERVER_INFO_FILE="${server_info_file}" python3 - <<'PY'
+import json
+import math
+import os
+
+with open(os.environ["SERVER_INFO_FILE"], encoding="utf-8") as f:
+    server_info = json.load(f)
+
+acceptance_rates = []
+accept_lengths = []
+for state in server_info.get("internal_states", []):
+    accept_length = state.get("avg_spec_accept_length")
+    num_draft_tokens = state.get("speculative_num_draft_tokens")
+    num_steps = state.get("speculative_num_steps")
+    if num_draft_tokens and num_draft_tokens > 1:
+        draft_tokens_per_round = int(num_draft_tokens) - 1
+    elif num_steps and num_steps > 0:
+        draft_tokens_per_round = int(num_steps)
+    else:
+        draft_tokens_per_round = 0
+    if accept_length is None or not draft_tokens_per_round:
+        continue
+    acceptance_rate = (float(accept_length) - 1.0) / draft_tokens_per_round
+    if not math.isfinite(acceptance_rate) or not 0.0 <= acceptance_rate <= 1.0:
+        raise ValueError(
+            f"Invalid SGLang MTP acceptance rate {acceptance_rate} "
+            f"from accept length {accept_length} and "
+            f"{draft_tokens_per_round} draft tokens per round"
+        )
+    acceptance_rates.append(acceptance_rate)
+    accept_lengths.append(float(accept_length))
+
+if acceptance_rates:
+    with open(os.environ["RESULT_FILE"], encoding="utf-8") as f:
+        data = json.load(f)
+    metadata = data.setdefault("atom_ci_metadata", {})
+    metadata["mtp_acceptance_rate"] = (
+        sum(acceptance_rates) / len(acceptance_rates) * 100.0
+    )
+    metadata["mtp_accept_length"] = sum(accept_lengths) / len(accept_lengths)
+    metadata["avg_tokens_per_forward"] = metadata["mtp_accept_length"]
+    with open(os.environ["RESULT_FILE"], "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    print(
+        f"MTP acceptance rate: {metadata['mtp_acceptance_rate']:.2f}%, "
+        f"accept length: {metadata['mtp_accept_length']:.4f}"
+    )
+else:
+    print("MTP acceptance: no speculative decoding metrics found.")
+PY
+  else
+    echo "MTP acceptance: /server_info not reachable."
+  fi
+
   if [[ -n "${SGLANG_DOCKER_IMAGE:-}" ]] || [[ -n "${GPU_NAME:-}" ]] || [[ -n "${GPU_VRAM_GB:-}" ]] || [[ -n "${ROCM_VERSION:-}" ]]; then
     RESULT_FILE="${result_file}" \
     SGLANG_DOCKER_IMAGE="${SGLANG_DOCKER_IMAGE:-}" \

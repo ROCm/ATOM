@@ -92,6 +92,59 @@ python3 -m sglang.launch_server \
     --disable-radix-cache 2>&1 | tee "${run_name}-server.log"
 ```
 
+## MXFP8 with MTP (EAGLE3) on 4xMI355 GPUs
+
+Use the [`Inferact/MiniMax-M3-EAGLE3`](https://huggingface.co/Inferact/MiniMax-M3-EAGLE3)
+draft checkpoint with the MXFP8 target model to enable MTP decoding through
+SGLang's `EAGLE3` speculative algorithm. The following example uses three
+speculative draft steps.
+
+### Launching Server
+
+```bash
+model_path=${model_path:-MiniMaxAI/MiniMax-M3-MXFP8}
+draft_model_path=${draft_model_path:-Inferact/MiniMax-M3-EAGLE3}
+run_name=${run_name:-m3-mxfp8-mtp3}
+
+export SGLANG_PLUGINS=atom_sglang
+export SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
+export SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=atom.plugin.sglang.models
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export SGLANG_USE_AITER=1
+export SGLANG_AITER_FP8_PREFILL_ATTN=0
+export ATOM_FORCE_ATTN_TRITON=1
+export SGLANG_ENABLE_TORCH_COMPILE=1
+export TORCHINDUCTOR_COMPILE_THREADS=128
+
+MODEL_LOADER_EXTRA_CONFIG='{"online_quant_config":{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","vision_tower","multi_modal_projector","patch_merge_mlp","*block_sparse_moe"]}}'
+JSON_MODEL_OVERRIDE_ARGS='{"use_index_cache":true,"index_topk_freq":4}'
+
+PORT=${PORT:-8000}
+TP=${TP:-4}
+
+python3 -m sglang.launch_server \
+    --model-path "${model_path}" \
+    --host 127.0.0.1 \
+    --port "${PORT}" \
+    --trust-remote-code \
+    --random-seed 0 \
+    --tensor-parallel-size "${TP}" \
+    --attention-backend aiter \
+    --mem-fraction-static 0.75 \
+    --page-size 128 \
+    --context-length 32768 \
+    --max-running-requests 128 \
+    --model-loader-extra-config "${MODEL_LOADER_EXTRA_CONFIG}" \
+    --json-model-override-args "${JSON_MODEL_OVERRIDE_ARGS}" \
+    --speculative-algorithm EAGLE3 \
+    --speculative-draft-model-path "${draft_model_path}" \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 \
+    --kv-cache-dtype fp8_e4m3 \
+    --disable-radix-cache \
+    --decode-log-interval 1 2>&1 | tee "${run_name}-server.log"
+```
+
 
 ### Accuracy Test
 

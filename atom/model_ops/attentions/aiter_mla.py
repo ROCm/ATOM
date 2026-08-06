@@ -15,7 +15,11 @@ from aiter import (
     get_mla_metadata_v1,
 )
 
-from atom.distributed.dcp_utils import get_dcp_rank, get_dcp_world_size
+from atom.distributed.dcp_utils import (
+    dcp_persistent_supported,
+    get_dcp_rank,
+    get_dcp_world_size,
+)
 from atom.distributed.pcp_utils import (
     get_pcp_world_size,
     pcp_is_enabled,
@@ -163,6 +167,18 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self.dcp_world_size = get_dcp_world_size()
         self.dcp_rank = get_dcp_rank()
 
+        # DCP decode all-gathers Q on the head dim across the DCP group, so the
+        # head count that reaches mla_decode_fwd (and thus the persistent decode
+        # metadata) is padded_num_attention_heads * dcp_world_size. The module's
+        # head-repeat compensates the _MLA_MIN_HEADS padding, so this product
+        # matches the kernel's actual nhead in every case. dcp=1 -> unchanged.
+        # Only gfx950 runs DCP in persistent mode (gfx942 lacks the lse persistent
+        # kernel and stays non-persistent, where this metadata is unused); scale
+        # by dcp only there so gfx942 keeps the original per-rank head sizing.
+        self.persistent_num_heads = self.padded_num_attention_heads * (
+            self.dcp_world_size if dcp_persistent_supported() else 1
+        )
+
         max_seqlen_qo = getattr(model_runner, "num_spec_tokens", 0) + 1
         (
             (work_meta_data_size, work_meta_data_type),
@@ -174,7 +190,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         ) = get_mla_metadata_info_v1(
             self.max_bs,
             max_seqlen_qo,
-            self.padded_num_attention_heads,
+            self.persistent_num_heads,
             self.dtype_q,
             self.dtype_kv,
             is_sparse=self.is_sparse,
@@ -206,6 +222,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 device=self.device,
             ),
             "kv_indptr": CpuGpuBuffer(self.max_bs + 1, **i32_kwargs),
+            # Global (un-sharded) per-request KV indptr for round-robin CP: cumsum
+            # of the GLOBAL context_lens (token-level, page_size=1). Only filled
+            # when dcp_world_size > 1; consumed by the cprr kernel via
+            # mla_decode_fwd(g_kv_indptr=...) to apply the global-position causal
+            # mask for MTP (max_q_len > 1).
+            "g_kv_indptr": CpuGpuBuffer(self.max_bs + 1, **i32_kwargs),
             "kv_indices": CpuGpuBuffer(
                 self.max_bs * self.max_num_blocks_per_seq,
                 **i32_kwargs,
@@ -420,6 +442,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         for ub_idx in range(self._NUM_TBO_UBATCHES):
             p = f"ub{ub_idx}_"
             var[f"{p}kv_indptr"] = CpuGpuBuffer(ub_max_bs + 1, **i32_kwargs)
+            # Per-ubatch global (un-sharded) kv_indptr for round-robin CP (see the
+            # shared "g_kv_indptr" buffer). Filled in _build_ubatch when dcp>1.
+            var[f"{p}g_kv_indptr"] = CpuGpuBuffer(ub_max_bs + 1, **i32_kwargs)
             var[f"{p}kv_indices"] = CpuGpuBuffer(
                 self.max_bs * self.max_num_blocks_per_seq,
                 **i32_kwargs,
@@ -552,6 +577,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         only_update: bool = False,
         num_reject_tokens: torch.Tensor = None,
         sparse_decode: bool = False,
+        is_cp_round_robin: bool = False,
     ):
         split_params = {
             "kv_granularity": max(self.block_size, 16),
@@ -560,6 +586,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             "fast_mode": 1,
             "max_split_per_batch": 16,
         }
+        # round-robin CP only lands on the full-build path: decode_update_mla_
+        # metadata_v1 has no is_cp_round_robin arg and collapses qlen>1 to 1.
+        assert not (only_update and is_cp_round_robin), (
+            "is_cp_round_robin requires the full get_mla_metadata_v1 build "
+            "(only_update path does not support round-robin CP / qlen>1)"
+        )
         var = self.model_runner.forward_vars
         work_meta_data = var["work_meta_data"]
         work_info_set = var["work_info_set"]
@@ -602,7 +634,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 var["cu_seqlens_q"].gpu[: bs + 1],
                 kv_indptr_for_metadata,
                 kv_last_page_lens_for_metadata,
-                self.padded_num_attention_heads,
+                self.persistent_num_heads,
                 1,  # nhead_kv,
                 True,
                 work_meta_data,
@@ -623,7 +655,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 var["cu_seqlens_q"].gpu[: bs + 1],
                 kv_indptr_for_metadata,
                 kv_last_page_lens_for_metadata,
-                self.padded_num_attention_heads,
+                self.persistent_num_heads,
                 1,  # nhead_kv,
                 True,
                 work_meta_data,
@@ -635,6 +667,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 page_size=self.block_size,
                 dtype_q=self.dtype_q,
                 dtype_kv=self.dtype_kv,
+                is_cp_round_robin=is_cp_round_robin,
                 **split_params,
             )
         return {
@@ -702,13 +735,43 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             BLOCK=self._mtp_fuse_block,
         )
 
+        # DCP + MTP draft decode: each prepare_mtp_decode call advances every
+        # sequence's KV by exactly 1 token (mtp_k controls how many times this
+        # runs, not tokens-per-call), so rebuild for LOCAL qlen=1 regardless of
+        # the max_seqlen_q param above (which the non-DCP path may pass as
+        # i0_max_seqlen_q for its incremental-update fast path — DCP always
+        # needs a full local-shard rebuild, no incremental variant exists).
+        dcp_local_rebuild = self.dcp_world_size > 1 and not self.is_sparse
+        if dcp_local_rebuild:
+            assert self.block_size == 1
+            W = self.dcp_world_size
+            r = self.dcp_rank
+            ctx_g = var["context_lens"].gpu[:bs].to(torch.int64)
+            base = ctx_g // W
+            remainder = (ctx_g - base * W - r).clamp_(0, 1)
+            local_ctx = (base + remainder).to(torch.int32)  # local KV tokens/blocks
+            kv_indptr[0] = 0
+            kv_indptr[1 : bs + 1] = torch.cumsum(local_ctx, dim=0, dtype=torch.int32)
+            var["kv_last_page_lens"].gpu[:bs] = (local_ctx > 0).to(
+                var["kv_last_page_lens"].gpu.dtype
+            )
+            # Host upper bound for the index generator's loop (safe overestimate,
+            # avoids a device->host sync); kv_indptr caps the real per-seq count.
+            local_max_k = max_seqlen_k // W + 1
+
         kv_indices_generate_triton(
             var["block_tables"].gpu[:bs],
             var["kv_indices"].gpu,
             kv_indptr,
             self.block_ratio,
-            max_seqlen_k,
+            local_max_k if dcp_local_rebuild else max_seqlen_k,
         )
+        if dcp_local_rebuild:
+            # qlen==1 local decode: full build (not cprr; is_cp_round_robin=False),
+            # over the just-rebuilt LOCAL kv_indptr / kv_last_page_lens.
+            return self.set_mla_persistent_worker_buffers(
+                bs, 1, only_update=False, num_reject_tokens=None
+            )
         if self.is_sparse:
             # The MTP draft's single sparse block reads sparse_kv_indptr, but it
             # reuses the TARGET's work_info buffer, which was built dense. The
@@ -1380,6 +1443,19 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             owned_clamped
         ].contiguous()
 
+    def _dcp_round_robin_slot(self, block_table, pos: int) -> int:
+        """DCP round-robin write slot for global position ``pos`` on this rank, or
+        -1 if another rank owns it. KV is token-level round-robin sharded
+        (page_size=1). Shared by the qlen==1 and MTP qlen>1 decode paths."""
+        if pos % self.dcp_world_size != self.dcp_rank:
+            return -1
+        block_size = self.model_runner.block_size
+        virtual_block_size = block_size * self.dcp_world_size
+        return (
+            block_table[pos // virtual_block_size] * block_size
+            + (pos % virtual_block_size) // self.dcp_world_size
+        )
+
     def prepare_decode(self, batch: ScheduledBatch, bs: int):
         scheduled_bs = batch.total_seqs_num_decode
         dropout_p = 0.0
@@ -1399,29 +1475,28 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     num_blocks = cdiv(context_lens, self.model_runner.block_size)
                     block_tables = [bt[:n] for bt, n in zip(block_tables, num_blocks)]
 
-                slot_mapping = [
-                    block_table[pos // self.model_runner.block_size]
-                    * self.model_runner.block_size
-                    + (pos % self.model_runner.block_size)
-                    for block_table, seq_len in zip(block_tables, context_lens)
-                    for pos in range(seq_len - max_seqlen_q, seq_len)
-                ]
+                if self.dcp_world_size > 1:
+                    # DCP round-robin + MTP: each of the max_seqlen_q new (draft)
+                    # tokens is written only on the rank owning its global pos.
+                    slot_mapping = [
+                        self._dcp_round_robin_slot(block_table, pos)
+                        for block_table, seq_len in zip(block_tables, context_lens)
+                        for pos in range(seq_len - max_seqlen_q, seq_len)
+                    ]
+                else:
+                    slot_mapping = [
+                        block_table[pos // self.model_runner.block_size]
+                        * self.model_runner.block_size
+                        + (pos % self.model_runner.block_size)
+                        for block_table, seq_len in zip(block_tables, context_lens)
+                        for pos in range(seq_len - max_seqlen_q, seq_len)
+                    ]
             else:
                 if self.dcp_world_size > 1:
-                    slot_mapping = []
-                    block_size = self.model_runner.block_size
-                    virtual_block_size = block_size * self.dcp_world_size
-                    for block_table, seq_len in zip(block_tables, context_lens):
-                        pos = seq_len - 1
-                        if pos % self.dcp_world_size == self.dcp_rank:
-                            blk_idx = pos // virtual_block_size
-                            vb_offset = pos % virtual_block_size
-                            local_offset = vb_offset // self.dcp_world_size
-                            slot_mapping.append(
-                                block_table[blk_idx] * block_size + local_offset
-                            )
-                        else:
-                            slot_mapping.append(-1)
+                    slot_mapping = [
+                        self._dcp_round_robin_slot(block_table, seq_len - 1)
+                        for block_table, seq_len in zip(block_tables, context_lens)
+                    ]
                 else:
                     slot_mapping = [
                         block_table[-1] * self.model_runner.block_size
@@ -1473,6 +1548,16 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self.prepare_block_tables(batch)
         var["kv_indptr"].np[1 : scheduled_bs + 1] = kv_indptr
         var["kv_indptr"].np[scheduled_bs + 1 : bs + 1] = sum_blocks
+        if self.dcp_world_size > 1:
+            # Global (un-sharded) token-level kv_indptr for the round-robin CP
+            # causal mask (page_size=1 -> token granularity). context_lens is the
+            # GLOBAL per-request KV length (local shard = get_dcp_local_seq_lens).
+            g_kv_indptr = np.cumsum(context_lens[:scheduled_bs], dtype=np.int32)
+            var["g_kv_indptr"].np[0] = 0
+            var["g_kv_indptr"].np[1 : scheduled_bs + 1] = g_kv_indptr
+            var["g_kv_indptr"].np[scheduled_bs + 1 : bs + 1] = (
+                g_kv_indptr[-1] if scheduled_bs > 0 else 0
+            )
         if self.dcp_world_size > 1 and self.block_size != 1:
             local_last = local_context_lens % self.block_size
             var["kv_last_page_lens"].np[:scheduled_bs] = np.where(
@@ -1586,7 +1671,21 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 sum_tokens
             )
         else:
-            ctx_mla_ps = self.set_mla_persistent_worker_buffers(bs, max_seqlen_q)
+            # DCP + MTP (max_q_len>1) needs the round-robin global-position causal
+            # mask: build persistent metadata with is_cp_round_robin so the kernel
+            # masks on global positions g(j)=j*W+r instead of local-causal trim.
+            cp_round_robin = self.dcp_world_size > 1 and max_seqlen_q > 1
+            # For cprr, build metadata over the REAL requests (scheduled_bs), not
+            # the cudagraph-padded bs. The padded tail is 0-query, which the cprr
+            # metadata kernel mishandles (num_qo_tiles=0 -> div-by-zero; and its
+            # is_cp_round_robin "no trim" is overridden by the nhead=128 M-fold
+            # qk_batch_ratio branch). The persistent kernel is work_indptr-driven,
+            # so scheduled_bs metadata naturally skips the padding rows. Eager has
+            # scheduled_bs == bs, so this is a no-op there.
+            meta_bs = scheduled_bs if cp_round_robin else bs
+            ctx_mla_ps = self.set_mla_persistent_worker_buffers(
+                meta_bs, max_seqlen_q, is_cp_round_robin=cp_round_robin
+            )
             ctx_mla_ps_sparse = None
         ctx.update(ctx_mla_ps)
         if not disagg:
@@ -1598,6 +1697,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             **ctx,
         )
         attn_metadata.dtype_q = self.dtype_q
+
+        # Round-robin CP global kv_indptr (only under DCP; None otherwise so the
+        # non-DCP / qlen=1 paths keep the plain kernel). Consumed by
+        # _forward_decode -> mla_decode_fwd for the MTP (max_q_len>1) cprr mask.
+        attn_metadata.g_kv_indptr = (
+            var["g_kv_indptr"].copy_to_gpu(bs + 1) if self.dcp_world_size > 1 else None
+        )
 
         if ctx_mla_ps_sparse is not None:
             for k, v in ctx_mla_ps_sparse.items():
@@ -1697,6 +1803,22 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             last_val = var[f"{p}kv_indptr"].np[ub_real_reqs] if ub_real_reqs > 0 else 0
             var[f"{p}kv_indptr"].np[ub_real_reqs + 1 : padded_bs + 1] = last_val
 
+            if self.dcp_world_size > 1:
+                # Per-ubatch slice of the global kv_indptr (rebased); diffs (per-req
+                # global KV length) are preserved, which is what the cprr mask uses.
+                full_g_kv_indptr = var["g_kv_indptr"].np
+                g_base = full_g_kv_indptr[req_start]
+                var[f"{p}g_kv_indptr"].np[0] = 0
+                if ub_real_reqs > 0:
+                    var[f"{p}g_kv_indptr"].np[1 : ub_real_reqs + 1] = (
+                        full_g_kv_indptr[req_start + 1 : req_start + ub_real_reqs + 1]
+                        - g_base
+                    )
+                g_last = (
+                    var[f"{p}g_kv_indptr"].np[ub_real_reqs] if ub_real_reqs > 0 else 0
+                )
+                var[f"{p}g_kv_indptr"].np[ub_real_reqs + 1 : padded_bs + 1] = g_last
+
             if self.is_sparse:
                 full_sparse = var["sparse_kv_indptr"].np
                 sparse_base = full_sparse[req_start]
@@ -1732,6 +1854,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 (f"{p}kv_indptr", padded_bs + 1),
                 (f"{p}cu_seqlens_q", padded_bs + 1),
             ]
+            if self.dcp_world_size > 1:
+                vars_used.append((f"{p}g_kv_indptr", padded_bs + 1))
             if self.is_sparse:
                 vars_used.append((f"{p}sparse_kv_indptr", padded_bs + 1))
 
@@ -1751,9 +1875,16 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 ub_max_seqlen_k,
             )
 
-            self._set_ubatch_mla_buffers(padded_bs, max_seqlen_q, ub_idx)
+            self._set_ubatch_mla_buffers(
+                padded_bs,
+                max_seqlen_q,
+                ub_idx,
+                is_cp_round_robin=self.dcp_world_size > 1 and max_seqlen_q > 1,
+            )
 
-    def _set_ubatch_mla_buffers(self, padded_bs, max_q_len, ubatch_idx):
+    def _set_ubatch_mla_buffers(
+        self, padded_bs, max_q_len, ubatch_idx, is_cp_round_robin=False
+    ):
         """Compute MLA work buffers for a per-ubatch forward_vars set."""
         p = f"ub{ubatch_idx}_"
         var = self.model_runner.forward_vars
@@ -1772,7 +1903,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             var[f"{p}cu_seqlens_q"].gpu[: padded_bs + 1],
             kv_indptr_for_mla,
             kv_last_page_lens_for_mla,
-            self.padded_num_attention_heads,
+            self.persistent_num_heads,
             1,  # nhead_kv
             True,
             var[f"{p}work_meta_data"],
@@ -1784,6 +1915,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             page_size=self.block_size,
             dtype_q=self.dtype_q,
             dtype_kv=self.dtype_kv,
+            is_cp_round_robin=is_cp_round_robin,
             kv_granularity=max(self.block_size, 16),
             max_seqlen_qo=max_q_len,
             uni_seqlen_qo=max_q_len,
@@ -1813,6 +1945,21 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         max_q_len = var["mtp_k"] + 1 if "mtp_k" in var else 1
         sum_tokens = bs * max_q_len
         is_sparse_mtp = self.is_sparse and max_q_len > 1
+        # DCP + MTP (max_q_len>1) capture: the cprr kernel masks on GLOBAL
+        # positions, so capture needs a self-consistent (local, global) KV layout
+        # or the graph shape won't match replay. Give every seq 1 local token per
+        # rank -> global length = dcp_world_size (page_size=1 only; round-robin
+        # requires it). Replay overwrites these buffers with real values.
+        cp_round_robin = self.dcp_world_size > 1 and max_q_len > 1
+        if cp_round_robin and self.block_size == 1:
+            var["kv_indptr"].np[: bs + 1] = np.arange(bs + 1, dtype=np.int32)
+            var["kv_indptr"].copy_to_gpu(bs + 1)
+            var["kv_indices"].gpu[:bs].zero_()
+            var["kv_last_page_lens"].gpu[:bs].fill_(1)
+            var["g_kv_indptr"].np[: bs + 1] = (
+                np.arange(bs + 1, dtype=np.int32) * self.dcp_world_size
+            )
+            var["g_kv_indptr"].copy_to_gpu(bs + 1)
         if is_sparse_mtp:
             # Two sets: normal for dense layers, sparse_mtp for sparse layers
             ctx_mla_ps = self.set_mla_persistent_worker_buffers(bs, max_q_len)
@@ -1820,7 +1967,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 sum_tokens
             )
         else:
-            ctx_mla_ps = self.set_mla_persistent_worker_buffers(bs, max_q_len)
+            ctx_mla_ps = self.set_mla_persistent_worker_buffers(
+                bs, max_q_len, is_cp_round_robin=cp_round_robin
+            )
             ctx_mla_ps_sparse = None
         attn_matadata = AttentionMetaData(
             slot_mapping=var["slot_mapping"].gpu[:sum_tokens],
@@ -1835,6 +1984,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             **ctx_mla_ps,
         )
         attn_matadata.dtype_q = self.dtype_q
+        # Attach the round-robin CP global kv_indptr for the captured graph so
+        # replay (which overwrites the buffer with real values) matches. Only
+        # consumed by _forward_decode when dcp>1 and max_q_len>1.
+        attn_matadata.g_kv_indptr = (
+            var["g_kv_indptr"].gpu[: bs + 1] if self.dcp_world_size > 1 else None
+        )
         if ctx_mla_ps_sparse is not None:
             for k, v in ctx_mla_ps_sparse.items():
                 setattr(attn_matadata, k, v)
@@ -1875,7 +2030,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         max_q_len = var["mtp_k"] + 1 if "mtp_k" in var else 1
 
         # Compute MLA work buffers for this ubatch
-        self._set_ubatch_mla_buffers(padded_bs, max_q_len, ubatch_idx)
+        self._set_ubatch_mla_buffers(
+            padded_bs,
+            max_q_len,
+            ubatch_idx,
+            is_cp_round_robin=self.dcp_world_size > 1 and max_q_len > 1,
+        )
 
         attn = AttentionMetaData(
             slot_mapping=var[f"{p}slot_mapping"].gpu[: padded_bs * max_q_len],
@@ -1904,6 +2064,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             reduce_partial_map=var[f"{p}reduce_partial_map"],
         )
         attn.dtype_q = self.dtype_q
+        # Per-ubatch round-robin CP global kv_indptr (None when non-DCP). Consumed
+        # by _forward_decode when dcp>1 and max_q_len>1 (MTP).
+        attn.g_kv_indptr = (
+            var[f"{p}g_kv_indptr"].gpu[: padded_bs + 1]
+            if self.dcp_world_size > 1
+            else None
+        )
         return attn
 
     def build_ubatch_prefill_metadata(

@@ -762,9 +762,8 @@ class Scheduler:
                 and num_new_tokens > self.max_num_batched_tokens
             ):
                 continue
-            if self.block_manager.can_allocate(seq) < 0:
-                return False  # KV-pressured: definitely cannot prefill
-            return True
+            # KV-pressured requests definitely cannot prefill.
+            return self.block_manager.can_allocate(seq) >= 0
         return False
 
     def _kv_usage(self) -> float:
@@ -1474,12 +1473,14 @@ class Scheduler:
         self._uncount_inflight_load(seq)
         seq.offload_loaded = False
         seq.offload_loaded_tokens = seq.num_cached_tokens
+        seq.offload_load_start_tokens = None
         seq.offload_load_failed = True
         return True
 
     def _mark_offload_load_ready(self, seq: Sequence) -> None:
         """Turn a completed offload load into a suffix-prefill resume."""
         loaded = getattr(seq, "offload_loaded_tokens", None)
+        load_start = getattr(seq, "offload_load_start_tokens", None)
         logger.debug(
             "[OFFLOAD-WAKE] seq %s: loaded=%s prev_cached=%d num_tokens=%d",
             seq.id,
@@ -1488,7 +1489,24 @@ class Scheduler:
             seq.num_tokens,
         )
         if loaded is not None and loaded > seq.num_cached_tokens:
+            promoted = 0
+            if load_start is not None and load_start < loaded:
+                promoted = self.block_manager.publish_loaded_prefix(
+                    seq,
+                    start_token=load_start,
+                    end_token=loaded,
+                )
+                logger.info(
+                    "[OFFLOAD-PROMOTE] seq=%s loaded_range=%d:%d "
+                    "gpu_indexed_tokens=%d",
+                    seq.id,
+                    load_start,
+                    loaded,
+                    promoted,
+                )
+            seq.offload_promoted_tokens = promoted
             seq.num_cached_tokens = loaded
+        seq.offload_load_start_tokens = None
         seq.offload_loaded = True
 
     def _is_offload_prefill_resume(self, seq: Sequence) -> bool:

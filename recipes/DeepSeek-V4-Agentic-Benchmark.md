@@ -163,7 +163,7 @@ exec podman run --rm --name "atom_agentic_${RUN_LABEL}" \
   -e INFMAX_CONTAINER_WORKSPACE=/inferencex \
   -e AGENTIC_DIR=/inferencex/utils/agentic-benchmark -e AIPERF_DIR=/inferencex/utils/aiperf \
   -e AIPERF_RUNTIME_DIR="/workspace/runtime/$RUN_LABEL" \
-  -e AIPERF_AGENTIC_CACHE_WARMUP_DURATION=600 -e AIPERF_WARMUP_GRACE_PERIOD=1800 \
+  -e AIPERF_WARMUP_REQUESTS_PER_LANE=10 -e AIPERF_TRACE_IDLE_GAP_CAP_SECONDS=300 -e AIPERF_WARMUP_GRACE_PERIOD=1800 \
   -e HF_HOME=/workspace/hf_home -e PYTHONDONTWRITEBYTECODE=1 \
   "$IMAGE" bash /workspace/atom_agentic_dsv4.sh
 ```
@@ -200,8 +200,8 @@ The replay `build_replay_cmd` expands to:
 aiperf profile --scenario inferencex-agentx-mvp \
   --url http://localhost:18080 --endpoint /v1/chat/completions --endpoint-type chat --streaming \
   --model /data/amd_int/models/DeepSeek-V4-Pro \
-  --concurrency 48 --benchmark-duration 3600 --random-seed 42 \
-  --agentic-cache-warmup-duration 600 --warmup-grace-period 1800 \
+  --concurrency 48 --benchmark-duration 3600 --stats-interval 30 --random-seed 42 \
+  --warmup-requests-per-lane 10 --trace-idle-gap-cap-seconds 300 --warmup-grace-period 1800 \
   --public-dataset semianalysis_cc_traces_weka_062126 --num-dataset-entries 393 \
   --output-artifact-dir "$RESULT_DIR/aiperf_artifacts"
 ```

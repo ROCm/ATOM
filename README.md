@@ -222,7 +222,7 @@ curl -X POST http://127.0.0.1:8000/stop_profile
 
 ```bash
 # Kernel breakdown per layer → Excel
-python tools/parse_trace.py ./trace/rank_0/DeepSeek-R1_ts_*.json.gz --layer 3
+python tools/parse_trace.py ./trace/rank_0/DeepSeek-R1_ts_*.json.gz
 
 # Performance summary → Markdown report
 python tools/analyze_trace_summary.py ./trace/rank_0/DeepSeek-R1_ts_*.json.gz
