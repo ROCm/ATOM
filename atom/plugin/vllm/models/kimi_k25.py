@@ -13,6 +13,7 @@ from vllm.model_executor.models.kimi_k25_vit import (
     KimiK25MultiModalProjector,
     MoonViT3dPretrainedModel,
 )
+from vllm.model_executor.models.vision import is_vit_use_data_parallel
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
 from atom.config import Config, QuantizationConfig
@@ -221,7 +222,9 @@ class KimiK25ForConditionalGeneration_(vLLMKimiK25):
 
         self.config = config
         self.multimodal_config = multimodal_config
-        self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
+        self.use_data_parallel = is_vit_use_data_parallel(
+            config.vision_config.num_attention_heads
+        )
         self.video_pruning_rate = multimodal_config.video_pruning_rate
         self.is_multimodal_pruning_enabled = (
             multimodal_config.is_multimodal_pruning_enabled()

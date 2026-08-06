@@ -596,6 +596,10 @@ def _deepseek_v32_indexer_get_attn_backend(self):
     return AiterSparseMlaIndexerBackendForVllm
 
 
+def _deepseek_v32_indexer_bind_kv_cache(self, kv_cache):
+    self.kv_cache = kv_cache
+
+
 def DeepseekV32IndexerCacheDecoratorForPluginMode(cls):
     if getattr(cls, "_atom_vllm_indexer_cache_decorated", False):
         return cls
@@ -603,6 +607,7 @@ def DeepseekV32IndexerCacheDecoratorForPluginMode(cls):
         return cls
     cls.get_kv_cache_spec = _deepseek_v32_indexer_get_kv_cache_spec
     cls.get_attn_backend = _deepseek_v32_indexer_get_attn_backend
+    cls.bind_kv_cache = _deepseek_v32_indexer_bind_kv_cache
 
     # In ATOM, kv cache is a list of tensors and accessed through indexing [0].
     # But in vLLM plugin mode, kv cache is a single tensor. So we wrap it in a
