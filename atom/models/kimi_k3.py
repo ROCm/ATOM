@@ -957,37 +957,53 @@ class KimiKDAAttention(nn.Module):
         initial_state: torch.Tensor | None,
         cu_seqlens: torch.Tensor | None,
         output_final_state: bool,
+        h0_indices: torch.Tensor | None = None,
+        has_initial_state: torch.Tensor | None = None,
+        inplace_final_state: bool = False,
+        o: torch.Tensor | None = None,
     ):
-        from fla.ops.kda import chunk_kda
+        from atom.model_ops.fla_ops.kda import chunk_kda
 
-        kwargs = {
-            "q": q,
-            "k": k,
-            "v": v,
-            "g": g,
-            # Keep beta in fp32: fla computes b = sigmoid(beta) in-kernel with
-            # use_beta_sigmoid_in_kernel, and triton's sigmoid follows the input
-            # dtype -- a bf16 beta yields a bf16 write strength, which erodes the
-            # delta-rule state update across the 71 KDA layers (measured gsm8k
-            # regression). b_proj stays bf16; only this reduction is widened.
-            "beta": beta.float(),
-            "A_log": self.A_log,
-            "dt_bias": self.dt_bias,
-            "initial_state": initial_state,
-            "output_final_state": output_final_state,
-            "use_qk_l2norm_in_kernel": True,
-            "use_gate_in_kernel": True,
-            "use_beta_sigmoid_in_kernel": True,
-            "safe_gate": self._kda_gate_lower_bound is not None,
-            "lower_bound": self._kda_gate_lower_bound,
-            "transpose_state_layout": True,
-            "cu_seqlens": cu_seqlens,
-        }
-        # FLA 0.5.1's default KDA recompute specialization is non-deterministic
-        # for long, packed gfx950 prefills and can emit extreme values. Selecting
-        # disable_recompute enables its STORE_QG specialization, which is stable
-        # and preserves the same chunk-KDA forward semantics.
-        return chunk_kda(**kwargs, disable_recompute=True)
+        return chunk_kda(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            # No .float(): the sigmoid output is allocated fp32 whatever the input
+            # dtype (fla/ops/common/gate.py:59), so the widening was a redundant d2d
+            # copy. The gsm8k regression it was added for was a bf16 sigmoid *output*,
+            # which cannot occur here.
+            #
+            # .contiguous() stays. beta is a non-contiguous column slice of fused_in
+            # (row stride N_fused, width nlh). kda/chunk.py calls the public
+            # fused_beta_sigmoid, whose forward is @input_guard-decorated, so fla
+            # would in fact make it contiguous today -- but the guard is exactly what
+            # this branch dropped from its own vendored chunk.py, and underneath it
+            # fused_beta_sigmoid_fwd is stride-blind flat pointer arithmetic. We do
+            # not stake correctness on a decorator upstream can remove. [tokens, 16]
+            # bf16: the copy is negligible.
+            beta=beta.contiguous(),
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=True,
+            use_gate_in_kernel=True,
+            use_beta_sigmoid_in_kernel=True,
+            safe_gate=self._kda_gate_lower_bound is not None,
+            lower_bound=self._kda_gate_lower_bound,
+            state_v_first=True,
+            cu_seqlens=cu_seqlens,
+            # FLA's default KDA recompute specialization is non-deterministic
+            # for long, packed gfx950 prefills and can emit extreme values.
+            # disable_recompute selects its STORE_QG specialization, which is
+            # stable and preserves the same chunk-KDA forward semantics.
+            disable_recompute=True,
+            h0_indices=h0_indices,
+            has_initial_state=has_initial_state,
+            inplace_final_state=inplace_final_state,
+            o=o,
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # hidden_states is a (fp8, scale) tuple when input_layernorm fused the
@@ -1043,8 +1059,11 @@ class KimiKDAAttention(nn.Module):
         # requires x.stride(1)==1 (feature-contiguous, which the slice preserves).
         mixed_qkv = fused_in[..., : 3 * lp]
         out_gate = fused_in[..., 3 * lp : 4 * lp]
-        # beta is widened to fp32 inside _run_kda (see the note there): the KDA
-        # delta-rule write strength must stay fp32 for accuracy.
+        # beta is a column slice of fused_in -- stays bf16. _run_kda makes it
+        # contiguous there rather than here; see that note for why we do not
+        # lean on fla's @input_guard to do it for us. The sigmoid *output* is
+        # fp32 whatever the input dtype (fla/ops/common/gate.py:59), so no
+        # widening is needed here either.
         beta = fused_in[..., 4 * lp : 4 * lp + nlh].unsqueeze(0)
         # f_a feeds a second GEMM (f_b_proj); make it contiguous so tgemm sees a
         # unit row stride rather than the fused output's N_fused stride.
@@ -1077,29 +1096,52 @@ class KimiKDAAttention(nn.Module):
             q = rearrange(q, "t (h d) -> 1 t h d", d=self.head_dim)
             k = rearrange(k, "t (h d) -> 1 t h d", d=self.head_dim)
             v = rearrange(v, "t (h d) -> 1 t h d", d=self.head_dim)
-            # Fused masked gather: ssm_state[state_indices] with fresh
-            # sequences (~has_initial_state) written as zeros in one pass,
-            # replacing the gather + separate zero-write.
-            from atom.model_ops.kimi_k3 import gather_kda_initial_state
-
-            initial = gather_kda_initial_state(
-                ssm_state, state_indices, gdn_metadata.has_initial_state
+            # One call, no surrounding copies: the kernel reads the initial
+            # state from ssm_state[state_indices] (zero-started where
+            # has_initial_state is False), writes the final state back to the
+            # same slots inplace, and writes the recurrence output straight into
+            # `out`. This is the same shape as the decode branch below.
+            #
+            # chunk_o_gk.py CALLER CONTRACT: rows at t >= cu_seqlens[-1] get no
+            # program launched, so with a caller-provided `o` they come back as
+            # uninitialised new_empty garbage. `out` is [num_actual_tokens, H, D],
+            # so we own any row past the last sequence end.
+            #
+            # query_start_loc here is non_spec_query_start_loc, whose final entry
+            # is the non-spec token total -- num_prefill_tokens + num_decode_tokens.
+            # Compute that from the two host ints instead of reading
+            # query_start_loc[-1], which would force a d2h sync on the hot path.
+            #
+            # Normally it equals num_actual_tokens and nothing needs zeroing:
+            #  - prefill-only: num_decode_tokens == 0 and the two agree.
+            #  - mixed prefill+decode: decodes sort to the front of the batch and
+            #    ride through the chunk kernel as 1-token sequences, which is
+            #    exact (vllm gdn_attn.py: "the prefill kernel handles 1-token
+            #    sequences with initial state correctly, producing identical
+            #    results"). cu_seqlens spans them, so coverage is still complete.
+            # It falls short only when spec-decode tokens share the batch: those
+            # sort to the tail, are excluded from the non-spec cu_seqlens, and
+            # this branch never computes them. Zeroing that tail reproduces the
+            # pre-fusion behaviour exactly, where `o=None` allocated zeros_like(v).
+            non_spec_tokens = (
+                gdn_metadata.num_prefill_tokens + gdn_metadata.num_decode_tokens
             )
-            kda_out, last_state = self._run_kda(
+            if non_spec_tokens < num_actual_tokens:
+                out[non_spec_tokens:].zero_()
+            self._run_kda(
                 q,
                 k,
                 v,
                 gate,
                 beta,
-                initial,
+                ssm_state,
                 query_start_loc,
                 True,
+                h0_indices=state_indices,
+                has_initial_state=gdn_metadata.has_initial_state,
+                inplace_final_state=True,
+                o=out.unsqueeze(0),
             )
-            # last_state already has ssm_state's dtype (fla preserves the
-            # initial_state dtype; the gathered initial is allocated as such),
-            # so no .to() cast is needed.
-            ssm_state[state_indices] = last_state
-            out.copy_(kda_out.squeeze(0))
         elif gdn_metadata.num_decodes > 0:
             # Slice the per-token cache-slot indices once (used for both the
             # conv update and the fused recurrence below).
@@ -1126,6 +1168,16 @@ class KimiKDAAttention(nn.Module):
             # one kernel. is_kda + lower_bound select the per-K-channel,
             # lower-bounded sigmoid gate that Kimi-KDA uses (beta stays raw
             # logits; the kernel applies sigmoid in fp32 internally).
+            #
+            # beta is passed as-is here, deliberately unlike the prefill branch
+            # which calls beta.contiguous(). beta is a non-contiguous column
+            # slice of fused_in, and this kernel navigates it by stride
+            # (stride_b_token = b.stride(-2)), so it reads correctly with no copy.
+            # Prefill's fused_beta_sigmoid_fwd is stride-blind; its caller is
+            # @input_guard-guarded today, but prefill does not rely on that (see
+            # _run_kda). Do not "unify" the two branches in either direction:
+            # .contiguous() here buys a pointless copy, and prefill's is its only
+            # guarantee against a stride-blind read.
             fused_sigmoid_gating_delta_rule_update(
                 A_log=self.A_log,
                 a=gate,

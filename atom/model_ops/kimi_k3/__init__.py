@@ -8,11 +8,9 @@ from atom.model_ops.kimi_k3.activations import (
     situ_and_mul,
 )
 from atom.model_ops.kimi_k3.attention_residual import apply_attn_res
-from atom.model_ops.kimi_k3.kda_state import gather_kda_initial_state
 
 __all__ = [
     "apply_attn_res",
-    "gather_kda_initial_state",
     "rmsnorm_gated",
     "situ_and_mul",
 ]
