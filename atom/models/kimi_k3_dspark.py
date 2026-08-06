@@ -61,6 +61,7 @@ from torch import nn
 from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.attention_mla import MLAModules
 from atom.model_ops.base_attention import Attention
+from atom.model_ops.dspark_markov_sample import dspark_markov_argmax
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import (
     ColumnParallelLinear,
@@ -103,6 +104,9 @@ class DSparkMarkovHead(nn.Module):
         self.rank = rank
         self.markov_w1 = nn.Embedding(vocab_size, rank)
         self.markov_w2 = nn.Embedding(vocab_size, rank)
+        # Read once here rather than per sampled position: envs re-reads the
+        # environment on every attribute access.
+        self.fused_sample = envs.ATOM_DSPARK_FUSED_MARKOV_SAMPLE
 
     def forward(self, token_ids: torch.Tensor):
         """Args:
@@ -117,6 +121,34 @@ class DSparkMarkovHead(nn.Module):
             markov_embed.float(), self.markov_w2.weight.float().t()
         )
         return logits_bias, markov_embed
+
+    def sample_next(self, token_ids: torch.Tensor, base_logits: torch.Tensor):
+        """One greedy block position: the argmax of the biased logits, and W1[x].
+
+        The bias itself is never returned, which is what lets the fused path
+        skip materializing it: ``dspark_markov_argmax`` keeps ``W2`` bf16 and
+        reduces straight to ids, with the same fp32 accumulation the softmax
+        guarantee above asks for (see that module for the numerics argument).
+        ``markov_embed`` is still returned because V4's confidence head
+        consumes it.
+
+        Args:
+            token_ids:   [B]     ids of the previously sampled token x_{k-1}.
+            base_logits: [B, V]  this position's base logits.
+        Returns:
+            next_ids:     [B]     argmax over the biased logits.
+            markov_embed: [B, r]  W1[x_{k-1}].
+        """
+        if self.fused_sample:
+            markov_embed = self.markov_w1(token_ids)
+            next_ids = dspark_markov_argmax(
+                base_logits, markov_embed, self.markov_w2.weight
+            )
+            return next_ids, markov_embed
+        bias, markov_embed = self(token_ids)
+        # bf16 + fp32 promotes the slice to fp32 before the add, so an explicit
+        # .float() would only materialize it twice for the same sum.
+        return (base_logits + bias).argmax(dim=-1), markov_embed
 
 
 class K3DSparkMLAAttention(nn.Module):
@@ -621,7 +653,8 @@ class KimiK3DSpark(nn.Module):
         out_ids = anchor_ids.new_empty(bs, T + 1)
         out_ids[:, 0] = anchor_ids
         for k in range(T):
-            bias, _ = self.markov_head(out_ids[:, k])
             # Greedy: temperature/sampling is applied by the target's verify.
-            out_ids[:, k + 1] = (base_logits[:, k].float() + bias).argmax(dim=-1)
+            out_ids[:, k + 1], _ = self.markov_head.sample_next(
+                out_ids[:, k], base_logits[:, k]
+            )
         return out_ids[:, 1:]

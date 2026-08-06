@@ -99,6 +99,19 @@ gate.
 | **ATOM_ENABLE_DS_QKNORM_QUANT_FUSION** | bool | 1 (true) | If set to `1`, fuse QK norm with quantization in MLA attention module. |
 | **ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD** | int | 1024 | Upper bound on MoE token count (`num_tokens` in the MoE forward) for using the dual-stream path: shared experts on a secondary CUDA stream while routed experts run on the default stream. If `num_tokens` exceeds this value, that forward uses single-stream MoE instead. Set to `0` to disable dual-stream setup entirely (no alt stream, no `maybe_dual_stream_forward` registration). |
 
+### DSpark block sampling
+
+DSpark drafts a `num_speculative_tokens`-wide block in one backbone pass, then
+samples it left-to-right with a low-rank first-order Markov head
+(`logits_k = base_logits_k + W1[x_{k-1}] @ W2ᵀ`, `x_k = argmax(logits_k)`). The
+unfused loop casts the whole `[V, r]` `W2` table to fp32 on every iteration and
+materializes two `[B, V]` fp32 tensors that only an `argmax` reads. See
+`atom/model_ops/dspark_markov_sample.py`.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_DSPARK_FUSED_MARKOV_SAMPLE** | bool | 0 (false) | If set to `1`, sample the DSpark block with a fused Triton kernel that computes the rank-`r` bias GEMV, adds the base logits in the GEMM epilogue and reduces to token ids in registers — so `W2` stays bf16 and is read exactly once per block position, and no `[B, V]` intermediate exists. Covers ATOM's native Kimi-K3 and DeepSeek-V4 DSpark samplers, and the **greedy** branch of vLLM's `DSparkSpeculator._sample_sequential` (installed by `atom/plugin/vllm/spec_decode_patch.py`); probabilistic drafting (`draft_sample_method="probabilistic"`) needs the real logits for `gumbel_sample` and keeps the unfused path. Tie-breaking matches `torch.argmax` (lowest index). Default off because the bias moves from an fp32 matmul to bf16 MFMA with an fp32 accumulator: every product is exact in fp32 either way, so the result is equal to the reference up to accumulation order, but the last-ulp difference could flip an `argmax` on a near-tie — enable only after a GSM8K 5-shot acceptance-length parity run. Read at Markov-head construction and at plugin-patch install time, so set it before the server starts. |
+
 ### Qwen3 style
 
 | Variable | Type | Default | Description |

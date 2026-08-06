@@ -123,6 +123,19 @@ class KimiK3DSparkVllm(ATOMForCausalLM):
         weight = self.model.markov_head.markov_w2.weight
         return torch.matmul(markov_embed.float(), weight.float().t())
 
+    def markov_argmax(
+        self, base_logits: torch.Tensor, token_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Greedy next id per request, without materializing the [B, V] bias.
+
+        The pair above is what vLLM's sequential loop calls; this collapses both
+        of them plus the add and the argmax into one step. Only reachable from
+        the greedy branch, and only when
+        ``spec_decode_patch._patch_dspark_fused_markov_sample`` installed itself
+        -- probabilistic drafting needs the real logits and keeps ``markov_bias``.
+        """
+        return self.model.markov_head.sample_next(token_ids, base_logits)[0]
+
     def map_draft_to_target(self, draft_token_ids: torch.Tensor) -> torch.Tensor:
         return draft_token_ids
 
