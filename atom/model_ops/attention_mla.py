@@ -294,11 +294,6 @@ class MLAAttention(nn.Module):
         # ==1 falls back to the original interleaved per-token (page_size=1)
         # kernels with an unpadded 576-wide q_out. The triton path never uses seg.
         self.use_seg_mla = (not self.use_triton_mla) and envs.ATOM_MLA_PAGE_SIZE > 1
-        # Only DSpark's bidirectional block drafter wants a non-causal decode.
-        # Plain serial MTP / eagle drafters stay causal (they also set
-        # context.is_draft), so gate the non-causal path on DSpark specifically.
-        _spec_cfg = get_current_atom_config().speculative_config
-        self.is_dspark = bool(_spec_cfg and _spec_cfg.use_dspark())
         if self.use_seg_mla:
             if envs.ATOM_MLA_PAGE_SIZE != _MLA_SEG_PAGE_SIZE:
                 raise RuntimeError(
@@ -1147,11 +1142,11 @@ class MLAAttention(nn.Module):
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: AttentionMetaData,
         return_lse: bool = False,
-        causal: bool = True,
     ) -> torch.Tensor:
-        # causal=True for the target; False only for DSpark's bidirectional
-        # draft block. The asm kernel picks a different .co by this flag, so the
-        # target must stay causal.
+        # attn_metadata.causal is True for the target; False only for DSpark's
+        # bidirectional draft block (set by the proposer). The asm kernel picks
+        # a different .co by this flag, so the target must stay causal.
+        causal = attn_metadata.causal
         assert kv_c_and_k_pe_cache.numel() > 0
         assert attn_metadata is not None
         B = q.shape[0]
@@ -1635,23 +1630,14 @@ class MLAAttention(nn.Module):
                 # then combine partial outputs across ranks (AG LSE + correct + RS).
                 q_out = self.dcp_group.all_gather(q_out, dim=1)
                 o, lse = self._forward_decode(
-                    q_out,
-                    kv_cache,
-                    attn_metadata,
-                    return_lse=True,
-                    causal=not (context.is_draft and self.is_dspark),
+                    q_out, kv_cache, attn_metadata, return_lse=True
                 )
                 from atom.model_ops.dcp_ops import cp_lse_ag_out_rs
 
                 o = cp_lse_ag_out_rs(o, lse, self.dcp_group, ctx=self._cp_triton_ctx)
                 output = self._v_up_proj_and_o_proj(o)
             else:
-                output = self._forward_decode(
-                    q_out,
-                    kv_cache,
-                    attn_metadata,
-                    causal=not (context.is_draft and self.is_dspark),
-                )
+                output = self._forward_decode(q_out, kv_cache, attn_metadata)
 
         return output
 
