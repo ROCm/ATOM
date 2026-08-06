@@ -173,6 +173,34 @@ class SharedExpertStreamMoE(StreamMoE):
         self.num_batched_experts = num_experts - 1
 
 
+class ExpertParallelStreamMoE(StreamMoE):
+    """Rank-zero EP storage for half of the checkpoint experts."""
+
+    def __init__(self, num_experts: int, stream: bool):
+        super().__init__(num_experts // 2, stream)
+
+    @staticmethod
+    def _map_global_expert_id_to_local_expert_id(expert_id):
+        return expert_id if expert_id < NUM_EXPERTS // 2 else -1
+
+    def weight_loader(
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+        shard_id: str,
+        expert_id: int,
+    ) -> None:
+        local_expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
+        if local_expert_id == -1:
+            return
+        self._copy_expert_shard(
+            param.data[local_expert_id],
+            loaded_weight,
+            shard_id,
+        )
+
+
 class DeclineW2StreamMoE(StreamMoE):
     def stage_expert_weight(self, *args, shard_id, **kwargs):
         if shard_id == "w2":
@@ -240,6 +268,10 @@ class StreamModel(nn.Module):
 
 class SharedExpertStreamModel(StreamModel):
     moe_cls = SharedExpertStreamMoE
+
+
+class ExpertParallelStreamModel(StreamModel):
+    moe_cls = ExpertParallelStreamMoE
 
 
 class DeclineW2StreamModel(StreamModel):
@@ -753,6 +785,27 @@ class StreamingCoverageTest(unittest.TestCase):
         weight = model.model.layers[0].self_attn.o_proj.weight
         torch.testing.assert_close(weight.detach(), wanted, rtol=0, atol=0)
         self.assertEqual(len(online_quant_streamer.excessive_loads), 1)
+
+    def test_nonlocal_ep_loads_after_quantization_are_ignored(self):
+        """Do not report non-local expert arrivals after local completion."""
+        model, online_quant_streamer = run_load(
+            streaming=True,
+            num_layers=1,
+            model_cls=ExpertParallelStreamModel,
+        )
+        baseline, _ = run_load(
+            streaming=False,
+            num_layers=1,
+            model_cls=ExpertParallelStreamModel,
+        )
+
+        experts = model.model.layers[0].mlp.experts
+        self.assertIn(id(experts), online_quant_streamer.done_module_ids)
+        self.assertEqual(online_quant_streamer.excessive_loads, [])
+        for name, want in weights_of(baseline).items():
+            torch.testing.assert_close(
+                want, dict(model.named_parameters())[name].detach(), rtol=0, atol=0
+            )
 
 
 if __name__ == "__main__":
