@@ -2735,19 +2735,14 @@ class DeepseekV4Attention(nn.Module):
                 x_fp8=x_fp8,
                 x_scale=x_scale,
             )
-            y = torch.empty(
-                num_tokens,
-                G,
-                self.o_lora_rank,
-                dtype=o.dtype,
-                device=o.device,
-            )
-            batched_gemm_a8w8_mxscale(
+            # Guarded aiter entry returns a fresh token-major [M, G, o_lora_rank]
+            # (same layout as the old out= buffer); N is contiguous so the
+            # caller's `.flatten(1)` stays a free view.
+            y = batched_gemm_a8w8_mxscale(
                 x_fp8,
                 self._wo_a_w_fp8,
                 x_scale,
                 self._wo_a_w_scale,
-                out=y,
                 dtype=o.dtype,
             )
             return y
@@ -2777,9 +2772,10 @@ class DeepseekV4Attention(nn.Module):
         (overlaps the partner ubatch's compute) and a plain reduce otherwise.
         """
         if self._wo_a_mxscale:
-            # Opaque op -> [M, G, N]; keeps the eager tuned-CSV lookup out of
-            # the graph (see module_dispatch_ops.wo_a_mxscale).
-            o = torch.ops.aiter.wo_a_mxscale(o, positions, self.layer_name)
+            # The AITER BMM entry is itself compile-guarded, so only its
+            # tuned-CSV lookup/kernel dispatch stays opaque; quantization and
+            # surrounding tensor work remain visible to the compiled graph.
+            o = self._wo_a_grouped_lora(o, positions, prefix=f"{self.layer_name}.wo_a")
         else:
             o = self._wo_a_grouped_lora(o, prefix=f"{self.layer_name}.wo_a")
         return self.wo_b(o.flatten(1))
