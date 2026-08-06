@@ -467,6 +467,12 @@ class DSparkProposer(Drafter):
         # leave its activations out of the KV budget.
         is_dummy = forward_context.context.is_dummy_run
 
+        # The DSpark draft block is bidirectional: every one of the T draft
+        # positions attends the whole block, so the MLA decode runs non-causal.
+        # The target rebuilds its own metadata (causal defaults True), so this
+        # never leaks back.
+        attn_metadata.causal = False
+
         # ---- 1. Context rows -------------------------------------------------
         if not is_dummy:
             with record_function(f"dspark_ctx_kv[bs={bs} tok={num_tokens}]"):
