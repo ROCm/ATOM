@@ -217,6 +217,10 @@ def topology_key(value: Any) -> str:
     return match.group("topology").replace("-", "_") if match else text
 
 
+def model_key(value: Any) -> str:
+    return string_value(value).strip().rstrip("/").split("/")[-1].lower()
+
+
 def derive_fields(path: Path, payload: dict[str, Any]) -> dict[str, Any] | None:
     match = RESULT_RE.match(path.name)
     if match:
@@ -328,7 +332,7 @@ def perf_point(
     payload: dict[str, Any],
     fields: dict[str, Any],
     run_url: str | None,
-    gsm8k: float | None,
+    accuracy: dict[str, Any] | None,
 ) -> dict[str, Any]:
     resources = topology_resources(payload, fields)
     run_date, timestamp = parse_payload_date(payload)
@@ -445,8 +449,26 @@ def perf_point(
         "slurm_job": string_value(payload.get("slurm_job_id")),
         "chart_group": "atomesh-model-performance",
         "chart_label": f"{hardware.upper()} ({display_backend} {precision.upper()})",
-        "gsm8k": round_or_none(gsm8k, digits=4),
+        "accuracy_task": accuracy.get("task") if accuracy else None,
+        "accuracy_metric": accuracy.get("metric") if accuracy else None,
+        "accuracy_score": (
+            round_or_none(accuracy.get("value"), digits=4) if accuracy else None
+        ),
+        "accuracy_score_raw": accuracy.get("raw") if accuracy else None,
+        "accuracy_strict": (
+            round_or_none(accuracy.get("strict"), digits=4) if accuracy else None
+        ),
+        "accuracy_resolved": (
+            int_value(accuracy.get("resolved")) if accuracy else None
+        ),
+        "accuracy_total": int_value(accuracy.get("total")) if accuracy else None,
+        "accuracy_threshold": (
+            round_or_none(accuracy.get("threshold"), digits=4) if accuracy else None
+        ),
+        "accuracy_fewshot": (int_value(accuracy.get("fewshot")) if accuracy else None),
     }
+    if accuracy and accuracy.get("task") == "gsm8k":
+        point["gsm8k"] = round_or_none(accuracy.get("value"), digits=4)
     return {key: value for key, value in point.items() if value is not None}
 
 
@@ -469,7 +491,7 @@ def dashboard_point_entry(point: dict[str, Any], extra: str) -> dict[str, Any] |
 def collect_dashboard_entries(
     paths: list[Path],
     run_url: str | None,
-    gsm8k_scores: dict[tuple[str, int], dict[str, Any]],
+    accuracy_scores: dict[tuple[str, str, int], dict[str, Any]],
     hardware: str | None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     entries: list[dict[str, Any]] = []
@@ -485,15 +507,30 @@ def collect_dashboard_entries(
             continue
         payload = enrich_payload(path, payload, fields, hardware)
         conc = int(payload.get("max_concurrency", fields["conc"]))
-        gsm8k_score = gsm8k_scores.get((topology_key(fields["topology"]), conc))
-        if gsm8k_score is None:
-            gsm8k_score = gsm8k_scores.get(("", conc))
-        gsm8k = gsm8k_score.get("value") if gsm8k_score else None
-        if gsm8k_score is not None:
-            payload["gsm8k"] = gsm8k
-            payload["gsm8k_raw"] = gsm8k_score.get("raw")
+        model = model_key(payload.get("benchmark_model_name") or fields["model"])
+        topology = topology_key(fields["topology"])
+        accuracy = accuracy_scores.get((model, topology, conc))
+        if accuracy is None:
+            accuracy = accuracy_scores.get(("", topology, conc))
+        if accuracy is None:
+            accuracy = accuracy_scores.get((model, "", conc))
+        if accuracy is None:
+            accuracy = accuracy_scores.get(("", "", conc))
+        if accuracy is not None:
+            payload["accuracy_task"] = accuracy.get("task")
+            payload["accuracy_metric"] = accuracy.get("metric")
+            payload["accuracy_score"] = accuracy.get("value")
+            payload["accuracy_score_raw"] = accuracy.get("raw")
+            payload["accuracy_strict"] = accuracy.get("strict")
+            payload["accuracy_resolved"] = accuracy.get("resolved")
+            payload["accuracy_total"] = accuracy.get("total")
+            payload["accuracy_threshold"] = accuracy.get("threshold")
+            payload["accuracy_fewshot"] = accuracy.get("fewshot")
+            if accuracy.get("task") == "gsm8k":
+                payload["gsm8k"] = accuracy.get("value")
+                payload["gsm8k_raw"] = accuracy.get("raw")
         extra = extra_text(payload, run_url, payload.get("slurm_job_id"))
-        point = perf_point(path, payload, fields, run_url, gsm8k)
+        point = perf_point(path, payload, fields, run_url, accuracy)
         point_entry = dashboard_point_entry(point, extra)
         if point_entry:
             entries.append(point_entry)
@@ -517,7 +554,7 @@ def eval_topology(path: Path) -> str:
     return ""
 
 
-def find_eval_scores(root: Path) -> dict[tuple[str, int], dict[str, Any]]:
+def find_eval_scores(root: Path) -> dict[tuple[str, str, int], dict[str, Any]]:
     scores = {}
     for path in sorted(root.rglob("results*.json")):
         payload = read_json(path)
@@ -526,24 +563,60 @@ def find_eval_scores(root: Path) -> dict[tuple[str, int], dict[str, Any]]:
         conc = eval_concurrency(path)
         if conc is None:
             continue
-        result = payload.get("results", {}).get("gsm8k", {})
-        score_raw = next(
-            (
-                value
-                for value in (
-                    result.get("exact_match,flexible-extract"),
-                    result.get("exact_match,strict-match"),
-                    result.get("acc"),
-                )
-                if value not in (None, "")
-            ),
-            None,
-        )
+        results = payload.get("results", {})
+        task = ""
+        metric = ""
+        score_raw = None
+        strict = None
+        resolved = None
+        total = None
+
+        if "swebench_lite" in results:
+            task = "swebench_lite"
+            metric = "resolved"
+            result = results[task]
+            score_raw = result.get("exact_match,resolved")
+            details = payload.get("swebench", {})
+            resolved = details.get("resolved")
+            total = details.get("total")
+        elif "gsm8k" in results:
+            task = "gsm8k"
+            metric = "flexible-extract"
+            result = results[task]
+            score_raw = next(
+                (
+                    value
+                    for value in (
+                        result.get("exact_match,flexible-extract"),
+                        result.get("exact_match,strict-match"),
+                        result.get("acc"),
+                    )
+                    if value not in (None, "")
+                ),
+                None,
+            )
+            strict = number(result.get("exact_match,strict-match"))
+        else:
+            continue
+
         score = number(score_raw)
         if score is not None:
-            scores[(eval_topology(path), conc)] = {
+            env = slurm_job_env(path)
+            task_config = payload.get("configs", {}).get(task, {})
+            global_config = payload.get("config", {})
+            fewshot = task_config.get("num_fewshot")
+            if fewshot is None:
+                fewshot = global_config.get("num_fewshot")
+            scores[(model_key(env.get("MODEL_NAME")), eval_topology(path), conc)] = {
+                "task": task,
+                "metric": metric,
                 "value": round(score, 4),
                 "raw": f"{score:.4f}",
+                "strict": round(strict, 4) if strict is not None else None,
+                "resolved": int_value(resolved),
+                "total": int_value(total),
+                "threshold": number(env.get("EVAL_THRESHOLD")),
+                "fewshot": int_value(fewshot),
             }
     return scores
 
@@ -552,12 +625,12 @@ def write_summary(rows: list[dict[str, Any]], summary_path: Path) -> None:
     lines = [
         "### ATOMesh Model Performance Benchmark Summary",
         "",
-        "| Hardware | Model | Topology | ISL/OSL | Concurrency | Interactivity | Total tok/s | Input tok/s | Output tok/s | Total tok/s/GPU | Input tok/s/GPU | Output tok/s/GPU | TTFT ms | TPOT ms | E2E ms | GSM8K |",
-        "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Hardware | Model | Topology | ISL/OSL | Concurrency | Interactivity | Total tok/s | Input tok/s | Output tok/s | Total tok/s/GPU | Input tok/s/GPU | Output tok/s/GPU | TTFT ms | TPOT ms | E2E ms | Accuracy Task | Accuracy |",
+        "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: |",
     ]
     for row in rows:
         lines.append(
-            "| {hardware} | {model} | {topology} | {isl}/{osl} | {conc} | {interactivity} | {total} | {input_} | {output} | {total_per_gpu} | {input_per_gpu} | {output_per_gpu} | {ttft} | {tpot} | {e2e} | {gsm8k} |".format(
+            "| {hardware} | {model} | {topology} | {isl}/{osl} | {conc} | {interactivity} | {total} | {input_} | {output} | {total_per_gpu} | {input_per_gpu} | {output_per_gpu} | {ttft} | {tpot} | {e2e} | {accuracy_task} | {accuracy} |".format(
                 hardware=row.get("hardware", "--"),
                 model=row.get("benchmark_model_name", "--"),
                 topology=row.get("display_topology") or row.get("topology", "--"),
@@ -574,7 +647,8 @@ def write_summary(rows: list[dict[str, Any]], summary_path: Path) -> None:
                 ttft=fmt(row.get("mean_ttft_ms")),
                 tpot=fmt(row.get("mean_tpot_ms")),
                 e2e=fmt(row.get("mean_e2el_ms")),
-                gsm8k=fmt(row.get("gsm8k"), digits=4),
+                accuracy_task=row.get("accuracy_task") or "--",
+                accuracy=fmt(row.get("accuracy_score"), digits=4),
             )
         )
     summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -598,15 +672,15 @@ def main() -> None:
 
     root = Path(args.result_dir)
     bench_paths = list(root.rglob("pd-*.json"))
-    gsm8k_scores = find_eval_scores(root)
+    accuracy_scores = find_eval_scores(root)
     entries, rows = collect_dashboard_entries(
-        bench_paths, args.run_url, gsm8k_scores, args.hardware
+        bench_paths, args.run_url, accuracy_scores, args.hardware
     )
     Path(args.output).write_text(json.dumps(entries, indent=2), encoding="utf-8")
     write_summary(rows, Path(args.summary))
     print(
         f"Generated {len(entries)} dashboard entries from {len(rows)} benchmark result(s) "
-        f"and {len(gsm8k_scores)} GSM8K score(s)"
+        f"and {len(accuracy_scores)} accuracy score(s)"
     )
 
 
