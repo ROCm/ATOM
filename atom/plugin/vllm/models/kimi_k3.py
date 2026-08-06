@@ -1,7 +1,9 @@
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any, ClassVar
 
 import torch
+from aiter.dist.parallel_state import get_pp_group
 from torch import nn
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context as get_vllm_forward_context
@@ -40,7 +42,7 @@ from atom.models.kimi_k3 import (
     KimiKDAAttention,
     _normalize_kimi_config,
 )
-from atom.models.utils import maybe_prefix
+from atom.models.utils import IntermediateTensors, maybe_prefix
 from atom.plugin.vllm.model_wrapper import ATOMForConditionalGeneration
 from atom.utils.forward_context import get_forward_context as get_atom_forward_context
 
@@ -134,6 +136,85 @@ class KimiKDAAttentionVllm(KimiKDAAttention, MambaBase):
     def mamba_type(self) -> MambaAttentionBackendEnum:
         return MambaAttentionBackendEnum.GDN_ATTN
 
+    def _forward_segments(
+        self,
+        hidden_states: torch.Tensor,
+        hidden_states_scale: torch.Tensor | None,
+        gdn_metadata: GDNAttentionMetadata,
+    ) -> torch.Tensor:
+        """Run the native KDA layer once per request class in the batch.
+
+        The native layer takes one branch per call -- prefill, decode, or
+        speculative decode -- and writes only that class's rows into an
+        uninitialized output. Its own runtime batches by class, so a single
+        branch always covers everything; vLLM's continuous batching does not.
+        It never mixes plain and speculative decodes (it folds the former into
+        the prefill counts), but a request still prefilling while another
+        drafts is routine, and there the speculative rows would come back as
+        whatever the allocator last left there.
+
+        The builder already splits every per-class input -- token indices,
+        zero-based ``query_start_loc``, state indices -- so each class runs as
+        if it were the whole batch and the rows are scattered back afterwards.
+        """
+        mixed = gdn_metadata.num_spec_decodes > 0 and (
+            gdn_metadata.num_prefills > 0 or gdn_metadata.num_decodes > 0
+        )
+        if not mixed:
+            self._atom_metadata.gdn_metadata = gdn_metadata
+            return super()._forward_impl(hidden_states, hidden_states_scale)
+
+        spec_indx = gdn_metadata.spec_token_indx
+        non_spec_indx = gdn_metadata.non_spec_token_indx
+        assert spec_indx is not None and non_spec_indx is not None
+        rows = hidden_states[: gdn_metadata.num_actual_tokens]
+
+        def _scale_rows(index: torch.Tensor) -> torch.Tensor | None:
+            if hidden_states_scale is None:
+                return None
+            return hidden_states_scale[: gdn_metadata.num_actual_tokens].index_select(
+                0, index
+            )
+
+        spec_out = self._forward_one_segment(
+            rows.index_select(0, spec_indx),
+            _scale_rows(spec_indx),
+            replace(
+                gdn_metadata,
+                num_prefills=0,
+                num_prefill_tokens=0,
+                num_decodes=0,
+                num_decode_tokens=0,
+                num_actual_tokens=gdn_metadata.num_spec_decode_tokens,
+            ),
+        )
+        non_spec_out = self._forward_one_segment(
+            rows.index_select(0, non_spec_indx),
+            _scale_rows(non_spec_indx),
+            replace(
+                gdn_metadata,
+                num_spec_decodes=0,
+                num_spec_decode_tokens=0,
+                num_actual_tokens=(
+                    gdn_metadata.num_prefill_tokens + gdn_metadata.num_decode_tokens
+                ),
+            ),
+        )
+
+        merged = spec_out.new_empty((rows.shape[0], spec_out.shape[-1]))
+        merged.index_copy_(0, spec_indx, spec_out)
+        merged.index_copy_(0, non_spec_indx, non_spec_out)
+        return merged
+
+    def _forward_one_segment(
+        self,
+        hidden_states: torch.Tensor,
+        hidden_states_scale: torch.Tensor | None,
+        gdn_metadata: GDNAttentionMetadata,
+    ) -> torch.Tensor:
+        self._atom_metadata.gdn_metadata = gdn_metadata
+        return super()._forward_impl(hidden_states, hidden_states_scale)
+
     def _forward_impl(
         self,
         hidden_states: torch.Tensor,
@@ -157,7 +238,6 @@ class KimiKDAAttentionVllm(KimiKDAAttention, MambaBase):
 
         vllm_layer = vllm_context.no_compile_layers[self.layer_name]
         conv_state, ssm_state = vllm_layer.kv_cache
-        self._atom_metadata.gdn_metadata = gdn_metadata
         self._atom_cache.k_cache = conv_state
         self._atom_cache.v_cache = ssm_state
 
@@ -167,7 +247,9 @@ class KimiKDAAttentionVllm(KimiKDAAttention, MambaBase):
         atom_context.attn_metadata = self._atom_metadata
         atom_context.kv_cache_data = self._atom_kv_cache_data
         try:
-            output = super()._forward_impl(hidden_states, hidden_states_scale)
+            output = self._forward_segments(
+                hidden_states, hidden_states_scale, gdn_metadata
+            )
         finally:
             atom_context.attn_metadata = previous_metadata
             atom_context.kv_cache_data = previous_kv_cache_data
@@ -184,18 +266,161 @@ class KimiKDAAttentionVllm(KimiKDAAttention, MambaBase):
         return output
 
 
+def _k3_residual_stream(
+    hidden_states: torch.Tensor,
+    pending_add: torch.Tensor | None,
+    pending_add2: torch.Tensor | None,
+) -> torch.Tensor:
+    """The plain residual stream at a layer boundary.
+
+    A Kimi-K3 layer hands its FFN output back unapplied, and an MoE layer hands
+    its shared-expert output back separately again, so the next layer's attn_res
+    kernel can fold both into its on-load. The residual stream a drafter is
+    trained on is the sum, which is how the native layer's
+    ``aux_hidden_state()`` and the native pipeline-parallel tail both
+    reconstruct it. Each addend is None on a layer that already folded it in.
+    """
+    if pending_add is not None:
+        hidden_states = hidden_states + pending_add
+    if pending_add2 is not None:
+        hidden_states = hidden_states + pending_add2
+    return hidden_states
+
+
+class KimiLinearModelVllm(kimi_k3_base.KimiLinearModel):
+    """Native Kimi-K3 body that can also emit Eagle3/DSpark auxiliary states.
+
+    The DSpark draft is trained on five of the target's layer outputs. They are
+    collected inline in the layer loop, into a local list, the way every ATOM
+    and vLLM target that feeds a drafter does it. Collecting them from wrapped
+    layer ``forward``s instead splits this function across a Dynamo graph
+    break, and ATOM's compile backend accepts exactly one graph.
+
+    ``aux_hidden_state_layers`` indexes the residual stream, not the layers:
+    entry ``i`` is the stream entering layer ``i``, i.e. the reference model's
+    ``output.hidden_states[i]``. vLLM resolves the draft's ``target_layer_ids``
+    into that space by adding one before handing them over.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.aux_hidden_state_layers = tuple(layers)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ):
+        # The signature must stay explicit: ATOM's compile decorator marks the
+        # dynamic token dimension by binding these argument names, and a
+        # *args/**kwargs override would silently compile the model at a single
+        # static shape.
+        if not self.aux_hidden_state_layers:
+            return super().forward(
+                input_ids, positions, intermediate_tensors, inputs_embeds
+            )
+
+        if get_pp_group().is_first_rank:
+            hidden_states = (
+                inputs_embeds
+                if inputs_embeds is not None
+                else self.embed_tokens(input_ids)
+            )
+            block_residual = (
+                hidden_states.new_zeros(
+                    hidden_states.shape[0], 0, hidden_states.shape[1]
+                )
+                if getattr(self.config, "attn_res_block_size", None) is not None
+                else None
+            )
+        else:
+            assert intermediate_tensors is not None
+            hidden_states = intermediate_tensors["hidden_states"]
+            block_residual = intermediate_tensors["block_residual"]
+
+        aux_hidden_states: list[torch.Tensor] = []
+        pending_add = pending_add2 = None
+        for idx in range(self.start_layer, self.end_layer):
+            if idx in self.aux_hidden_state_layers:
+                aux_hidden_states.append(
+                    _k3_residual_stream(hidden_states, pending_add, pending_add2)
+                )
+            hidden_states, pending_add, pending_add2, block_residual = self.layers[idx](
+                positions,
+                hidden_states,
+                block_residual,
+                pending_add=pending_add,
+                pending_add2=pending_add2,
+            )
+
+        if not get_pp_group().is_last_rank:
+            hidden_states = _k3_residual_stream(
+                hidden_states, pending_add, pending_add2
+            )
+            return IntermediateTensors(
+                {"hidden_states": hidden_states, "block_residual": block_residual}
+            )
+
+        if self.end_layer in self.aux_hidden_state_layers:
+            aux_hidden_states.append(
+                _k3_residual_stream(hidden_states, pending_add, pending_add2)
+            )
+        hidden_states, _ = self.output_attn_res(
+            hidden_states, block_residual, pending_add, pending_add2
+        )
+        return hidden_states, aux_hidden_states
+
+
 class KimiK3ForCausalLM(KimiK3ForCausalLMBase):
     def __init__(self, *args, **kwargs):
         original_kda_cls = kimi_k3_base.KimiKDAAttention
+        original_model_cls = kimi_k3_base.KimiLinearModel
         kimi_k3_base.KimiKDAAttention = KimiKDAAttentionVllm
+        kimi_k3_base.KimiLinearModel = KimiLinearModelVllm
         try:
             super().__init__(*args, **kwargs)
         finally:
             kimi_k3_base.KimiKDAAttention = original_kda_cls
+            kimi_k3_base.KimiLinearModel = original_model_cls
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         # Required by vLLM SupportsMultiModal.get_language_model discovery.
         return self.get_input_embeddings(input_ids)
+
+    @property
+    def model(self) -> nn.Module:
+        """The body the DSpark loader reaches for ``embed_tokens`` on.
+
+        ``load_dspark_model`` reads ``get_language_model().model.embed_tokens``
+        and ``get_language_model().lm_head``. Multimodal discovery stops at this
+        class, one level above the causal LM that actually owns both, so expose
+        them here rather than redirecting ``get_language_model`` -- which the
+        vision path also uses. A property, so it stays out of ``named_modules``
+        and the checkpoint prefixes are unchanged.
+        """
+        return self.language_model.model
+
+    @property
+    def lm_head(self) -> nn.Module:
+        """The head the DSpark draft borrows to score its block."""
+        return self.language_model.lm_head
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.language_model.model.set_aux_hidden_state_layers(layers)
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        """Fallback only; the DSpark checkpoint names its own target layers.
+
+        ATOM's server-mode name: ATOMModelBase re-exposes it to vLLM as
+        ``get_eagle3_default_aux_hidden_state_layers``.
+        """
+        num_layers = len(self.language_model.model.layers)
+        return (2, num_layers // 2, num_layers - 3)
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -314,6 +539,15 @@ class KimiK3ForConditionalGeneration_(vLLMKimiK3):
 
     def get_expert_mapping(self):
         return self.language_model.get_expert_mapping()
+
+    # ATOMModelBase probes the inner model for the ATOM server-mode aux-hidden
+    # -state interface when the target drives EAGLE3 or DSpark. The taps live on
+    # the text body, one level further in.
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.language_model.set_aux_hidden_state_layers(layers)
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        return self.language_model.get_eagle3_aux_hidden_state_layers()
 
 
 @MULTIMODAL_REGISTRY.register_processor(

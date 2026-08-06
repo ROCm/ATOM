@@ -109,9 +109,96 @@ Use a freshly started server for each reported accuracy run, matching the
 native Kimi-K3 validation protocol. Back-to-back evaluations on a warm server
 are not used as baselines for this model.
 
+## Speculative decoding (DSpark)
+
+Kimi-K3's DSpark draft is a separate checkpoint,
+[Inferact/Kimi-K3-DSpark](https://huggingface.co/Inferact/Kimi-K3-DSpark). It
+drafts a whole block in one parallel backbone pass, which the target then
+verifies. The launch is the one above with `--speculative-config` added; nothing
+else changes:
+
+```bash
+MODEL=/path/to/Kimi-K3
+DRAFT=/path/to/Kimi-K3-DSpark
+
+export AITER_SITUV2_A4W4=1
+export VLLM_USE_BREAKABLE_CUDAGRAPH=0
+
+vllm serve "${MODEL}" \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --tensor-parallel-size 8 \
+    --trust-remote-code \
+    --enable-prefix-caching \
+    --mamba-cache-mode align \
+    --kv-cache-dtype fp8 \
+    --max-num-seqs 64 \
+    --max-num-batched-tokens 16384 \
+    --gpu-memory-utilization 0.93 \
+    --block-size 128 \
+    --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE"}' \
+    --enable-auto-tool-choice \
+    --tool-call-parser kimi_k3 \
+    --reasoning-parser kimi_k3 \
+    --speculative-config "{\"method\":\"dspark\",\"model\":\"${DRAFT}\",\"num_speculative_tokens\":7}" \
+    --additional-config '{"online_quant_config": {"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "*self_attn.[qkv]_conv1d*", "*block_sparse_moe.experts*", "*block_sparse_moe.routed_expert_*", "*vision_tower*", "*mm_projector*"]}}'
+```
+
+This needs an aiter build carrying the non-causal MLA decode kernels for an fp8
+KV cache; without them the draft has no kernel to run its block through.
+
+**Leave `kv_cache_dtype` out of the speculative config.** The draft then
+inherits the engine's fp8, which is what lets prefix caching stay on. Pinning
+the draft to bf16 doubles its page against a fp8 target page, and since vLLM
+allocates one page size across all KV cache groups the draft layers have to
+scale their own block size down to compensate — a block size prefix caching
+then rejects for disagreeing with its hash block size.
+
+The draft block is drafted **non-causally**: every position attends to the whole
+block. Nothing has to be passed for this. The draft checkpoint carries neither
+`layer_types` nor a `dflash_config`, so vLLM resolves the draft to non-causal on
+its own, and the plugin carries that per-KV-cache-group flag down into both the
+persistent MLA work descriptors and the decode kernel so the two agree.
+
+`FULL_AND_PIECEWISE` applies to the target as usual.
+
+**Clear the compile cache whenever `num_speculative_tokens` changes.** The cache
+key does not include it, so a new width silently replays graphs captured for the
+old one and the run dies with an opaque `HIP error: unknown error`:
+
+```bash
+rm -rf /app/.cache/atom/* /app/.cache/vllm/* /app/.cache/inductor/* /root/.cache/atom/* /root/.cache/vllm/*
+```
+
+### Accuracy
+
+Full 1319-example GSM8K 5-shot, TP8, fp8 KV, 64 concurrent,
+`FULL_AND_PIECEWISE`, prefix caching on, `num_speculative_tokens=7`:
+
+```text
+|Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
+|-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
+|gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9492|±  |0.0060|
+|     |       |strict-match    |     5|exact_match|↑  |0.9484|±  |0.0061|
+```
+
+Over that run the draft held ~51% acceptance at a mean accepted length of ~4.6
+tokens per target forward, with per-position acceptance decaying smoothly from
+0.93 at position 0 to 0.15 at position 6.
+
+### Known issue: prefill slows down sharply with the draft enabled
+
+Decode is unaffected, but prefill is not. Serving the same 245,912 computed
+prompt tokens (four unique 64K-token prompts, no prefix reuse) takes 15.8 s
+without a draft and 438.6 s with one, so TTFT on long-prompt workloads inflates
+by more than an order of magnitude while ITL barely moves (23 ms vs 32 ms).
+Sampling puts the time in the *target's* KDA prefill path, not in the draft's
+own pass. Short-prompt serving is not affected. Under investigation.
+
 ## Current scope
 
 - Text generation only; the vision tower and multimodal projector are skipped.
 - TP8 on MI355/gfx950 is the validated deployment.
 - Prefix caching is on via `--mamba-cache-mode align`; async scheduling is off.
-- Speculative decoding is not enabled for this model.
+- DSpark speculative decoding is supported; see the section above, including the
+  open prefill-throughput issue.
