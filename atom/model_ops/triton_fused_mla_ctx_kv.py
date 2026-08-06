@@ -60,6 +60,7 @@ per-token ``[num_slots, 1, entry]`` cache is). The seg (``ATOM_MLA_PAGE_SIZE``
 import torch
 import triton
 import triton.language as tl
+from aiter import dtypes
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
 
@@ -188,6 +189,14 @@ def fused_mla_ctx_norm_rope_cache(
     num_tokens = slot_mapping.shape[0]
     if num_tokens == 0:
         return
+
+    if kv_cache.dtype is torch.uint8:
+        # vLLM hands an fp8 pool out as raw bytes. The store below casts to the
+        # pointer's element type, so left as uint8 it would round each value to
+        # an integer instead of writing the fp8 bit pattern -- silently, and
+        # only for the fp8 cache. aiter's own kFp8 store reinterprets the same
+        # way, off the same build-wide fp8 flavour.
+        kv_cache = kv_cache.view(dtypes.fp8)
 
     _fused_mla_ctx_kv_kernel[(num_tokens,)](
         kv_lora,

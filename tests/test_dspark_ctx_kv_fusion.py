@@ -41,6 +41,8 @@ FP8_DTYPE = _fp8_dtype()
 
 def _assert_cache_matches(fused, ref):
     """Bitwise equal but for a sprinkling of last-bit rounding (see module doc)."""
+    if fused.dtype is torch.uint8:
+        fused, ref = fused.view(FP8_DTYPE), ref.view(FP8_DTYPE)
     mismatched = int((fused != ref).sum())
     # One in a hundred thousand, i.e. room for the rounding and none for a bug.
     assert mismatched <= max(1, fused.numel() // 100_000), (
@@ -97,7 +99,7 @@ def _reference_write(
         k_pe.squeeze(1),
         cache,
         slot_mapping.flatten(),
-        kv_cache_dtype="fp8" if cache.dtype is FP8_DTYPE else "auto",
+        kv_cache_dtype="fp8" if cache.dtype is torch.uint8 else "auto",
         scale=k_scale,
     )
 
@@ -127,6 +129,11 @@ def _run_both(
         (num_blocks, block_size, ENTRY), -7.0, device="cuda", dtype=cache_dtype
     )
     ref_cache = fused_cache.clone()
+    if is_fp8:
+        # As vLLM holds it: an fp8 pool is allocated as raw bytes, and both
+        # stores have to reinterpret rather than convert.
+        fused_cache = fused_cache.view(torch.uint8)
+        ref_cache = ref_cache.view(torch.uint8)
     # Not 1.0: a unit scale would let a store that forgets to divide by it pass.
     k_scale = torch.tensor(0.5 if is_fp8 else 1.0, dtype=torch.float32, device="cuda")
 
