@@ -958,7 +958,6 @@ jobs:
           mi355_rows = [row for row in include if not is_mi308_row(row)]
 
           sep = (",", ":")
-          full = json.dumps({"include": include}, separators=sep)
           j355 = json.dumps({"include": mi355_rows}, separators=sep)
           j308 = json.dumps({"include": mi308_rows}, separators=sep)
 
