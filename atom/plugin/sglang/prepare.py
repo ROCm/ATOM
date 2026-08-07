@@ -51,8 +51,8 @@ def prepare_model(config: Any):
     elif model_arch == "KimiK3ForConditionalGeneration":
         from atom.plugin.sglang.kimi_k3_bridge import install_kimi_k3_pool_patch
 
-        # Keep this idempotent fallback for source-mounted development installs
-        # whose SGLang entry-point metadata has not been refreshed.
+        # Model construction precedes ModelRunner.init_memory_pool(), so install
+        # the K3-only pool hooks here after the architecture is known.
         install_kimi_k3_pool_patch()
 
     # Import here to avoid partial initialization while SGLang discovers models.
