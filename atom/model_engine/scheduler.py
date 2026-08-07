@@ -651,6 +651,9 @@ class Scheduler:
             self._sparsekv_gpu_cold_enabled: bool = self._sparsekv_gpu_pages > 0
             self._sparsekv_defer_log_time: float = 0.0
             self._sparsekv_defer_count: int = 0
+            # Finished ids awaiting hand-off to the worker (see
+            # ConnectorMetadata.reqs_to_release).
+            self._sparsekv_pending_release: set = set()
             # Without this line a failed hand-off from the worker is invisible:
             # admission would silently run host-only while the worker has a tier.
             logger.info(
@@ -1464,7 +1467,7 @@ class Scheduler:
 
             connector_meta_output = None
             if self.kv_connector is not None:
-                connector_meta_output = self.kv_connector.build_connector_meta()
+                connector_meta_output = self._build_connector_meta_with_release()
 
             # Freeze, per seq, whether this chunk finishes the prompt. Uses the
             # pre-advance offsets so it is correct whether or not schedule-time
@@ -1589,7 +1592,7 @@ class Scheduler:
 
         connector_meta_output = None
         if self.kv_connector is not None:
-            connector_meta_output = self.kv_connector.build_connector_meta()
+            connector_meta_output = self._build_connector_meta_with_release()
 
         decode_batch = ScheduledBatch(
             seqs=scheduled_seqs,
@@ -2300,6 +2303,8 @@ class Scheduler:
                     self.deferred_free_blocks[seq.id] = seq
             else:
                 self.block_manager.deallocate(seq)
+            if self._sparsekv_enabled:
+                self._sparsekv_pending_release.add(seq.id)
             self.running.remove(seq)
         return finished_seqs
 
@@ -2357,6 +2362,19 @@ class Scheduler:
         scheduled_batch.detailed_sqsq = sqsq
         scheduled_batch.detailed_sqsk = sqsk
         scheduled_batch.detailed_sk = sk
+
+    def _build_connector_meta_with_release(self):
+        """Build the per-step connector metadata, carrying finished ids along.
+
+        SparseKV's worker-side slot is taken at recv and normally handed back on
+        the request's first decode. A request that finishes without ever decoding
+        never reaches that point, so the scheduler has to say so explicitly.
+        """
+        meta = self.kv_connector.build_connector_meta()
+        if meta is not None and self._sparsekv_pending_release:
+            meta.reqs_to_release = self._sparsekv_pending_release
+            self._sparsekv_pending_release = set()
+        return meta
 
     def _connector_flag(self, name: str) -> bool:
         return bool(getattr(self.kv_connector, name, False))

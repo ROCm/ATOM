@@ -393,9 +393,16 @@ class SparseKVCoordinator:
         if not self._free_slots:
             self._reclaim_finished_slots()
         if not self._free_slots:
+            held = set(self._reqid_to_slot)
+            awaiting = held & self._awaiting_first_decode
             raise RuntimeError(
                 "SparseKV: no free request slots "
-                f"(max_num_seqs={self.max_num_seqs} exhausted)"
+                f"(max_num_seqs={self.max_num_seqs} exhausted). "
+                f"held={len(held)} awaiting_first_decode={len(awaiting)} "
+                f"in_last_active={len(held & self._last_active_reqids)} "
+                f"hot_loaded={len(held & self._hot_loaded)} "
+                f"last_active_size={len(self._last_active_reqids)}; "
+                f"held_ids={sorted(held)[:40]} awaiting_ids={sorted(awaiting)[:40]}"
             )
         slot = self._free_slots.pop()
         self._reqid_to_slot[req_id] = slot
@@ -443,6 +450,28 @@ class SparseKVCoordinator:
         # drains the previous forward on the batch-change step this runs on, so the
         # freed slot's last reader is done before it is reused; keep it that way.
         self._free_slots.append(slot)
+
+    def release_finished(self, req_ids) -> int:
+        """Release slots for requests the scheduler reports as finished.
+
+        sync_active cannot reclaim a request that never ran a decode forward: it
+        is still in ``_awaiting_first_decode`` (only maybe_first_hot_load clears
+        that, and that lives in the forward). Under deferred output a request
+        whose turn asks for a single token takes it from the injected
+        first_token_id and completes without ever decoding, so without this the
+        slot is held for the life of the process.
+
+        Drains the last forward once up front so a freed slot's final reader is
+        done before the slot can be handed out again.
+        """
+        pending = [r for r in req_ids if r in self._reqid_to_slot]
+        if not pending:
+            return 0
+        if self.last_forward_event is not None:
+            self.last_forward_event.synchronize()
+        for req_id in pending:
+            self.release(req_id)
+        return len(pending)
 
     def _reclaim_finished_slots(self) -> int:
         """Release slots of requests that already left the decode batch.

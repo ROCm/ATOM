@@ -174,6 +174,11 @@ class ConnectorMetadata:
         self.reqs_to_send: dict[ReqId, float] = {}
         self.reqs_in_batch: set[ReqId] = set()
         self.reqs_not_processed: set[ReqId] = set()
+        # Requests the scheduler has finished. SparseKV holds a coordinator slot
+        # from recv until first decode, and a request that finishes without ever
+        # decoding (OSL=1 turns take their only token from the injected
+        # first_token_id) would otherwise hold it forever.
+        self.reqs_to_release: set[ReqId] = set()
         self.request_id_to_transfer_id: dict[ReqId, int] = {}
 
     @staticmethod

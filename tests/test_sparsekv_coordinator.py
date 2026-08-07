@@ -795,6 +795,34 @@ def test_gpu_cold_enabled_allocates_pool():
     assert len(c._free_gpu_pages) == 4
 
 
+def test_release_finished_frees_never_decoded_requests():
+    """A request that finishes without ever running a decode forward is still in
+    _awaiting_first_decode, which sync_active deliberately skips — under deferred
+    output an OSL=1 turn takes its only token from the injected first_token_id and
+    never decodes, so the scheduler has to release it explicitly."""
+    c = _make(max_num_seqs=2, max_ctx=64)
+    c.acquire_at_recv(req_id=1, num_tokens=16)
+    c.acquire_at_recv(req_id=2, num_tokens=16)
+    assert not c._free_slots
+    assert c._awaiting_first_decode == {1, 2}
+
+    # sync_active cannot touch them, whatever the active set says.
+    c.sync_active([])
+    assert not c._free_slots and c.is_registered(1)
+
+    # The scheduler reporting them finished is the only way out.
+    assert c.release_finished([1, 2]) == 2
+    assert len(c._free_slots) == 2
+    assert not c.is_registered(1) and not c.is_registered(2)
+    assert c._awaiting_first_decode == set()
+
+
+def test_release_finished_ignores_unknown_ids():
+    c = _make(max_num_seqs=2, max_ctx=64)
+    c.acquire_at_recv(req_id=1, num_tokens=16)
+    assert c.release_finished([99, 1]) == 1
+
+
 def test_acquire_reclaims_finished_slots_before_raising():
     """The recv path grabs a slot as soon as the scheduler admits a replacement,
     one forward before sync_active would free the request it replaced. acquire()

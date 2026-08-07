@@ -876,6 +876,13 @@ class MooncakeConnector(KVConnectorBase):
 
         self.request_id_to_transfer_id = metadata.request_id_to_transfer_id
 
+        # Hand finished requests' SparseKV slots back before acquiring below, so
+        # a request that never ran a decode forward (and so was never cleared
+        # from _awaiting_first_decode) does not hold its slot forever.
+        release_ids = getattr(metadata, "reqs_to_release", None)
+        if release_ids and self._sparsekv_coord is not None:
+            self._sparsekv_coord.release_finished(release_ids)
+
         # Producer: cache block_ids + slot_index from completed prefills
         if self.is_producer:
             for req_id, meta in metadata.reqs_to_save.items():
