@@ -1419,7 +1419,15 @@ class Scheduler:
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             remote_kv_block_ids=sorted(remote_kv_blocks) if remote_kv_blocks else [],
             remote_kv_seq_blocks=remote_kv_seq_blocks,
-            state_copy_pairs=self.block_manager.state_copies_for_batch(),
+            # An empty batch is not forwarded (`engine_core` skips on zero
+            # req_ids), so draining here would file the destinations in the
+            # index and then never issue the copies that fill them — a resumer
+            # would read the previous occupant's state, the exact #1417 shape
+            # the copies exist to prevent. Leave them pending for the next
+            # batch that actually runs.
+            state_copy_pairs=(
+                self.block_manager.state_copies_for_batch() if scheduled_seqs else ()
+            ),
         )
         self._consume_state_forks(scheduled_seqs)
         return (decode_batch, scheduled_seqs)
@@ -2796,6 +2804,12 @@ class DecodeScheduler(Scheduler):
         on_prefill_done(); this method only schedules the running queue.
         """
 
+        # This override does not call `super().schedule()`, but it does route
+        # through the same `block_manager.allocate` and the same `postprocess`,
+        # so it owes the state pool the same two hooks. Without this one the
+        # pins taken by every resume accumulate forever and admission starves.
+        self.block_manager.release_state_pins()
+
         prefill_finished = False
         while self.prefill_done:
             seq = self.prefill_done.popleft()
@@ -2875,6 +2889,10 @@ class DecodeScheduler(Scheduler):
                 num_spec_step=self.mtp_k,
                 scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
                 cu_stream_fraction=self.cu_fraction,
+                # The other half of the pair above: queued copies have to reach
+                # a batch or the group they were filed under holds the previous
+                # occupant's state.
+                state_copy_pairs=self.block_manager.state_copies_for_batch(),
             ),
             scheduled_seqs,
         )
