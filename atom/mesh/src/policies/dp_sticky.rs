@@ -16,7 +16,7 @@ use dashmap::{mapref::entry::Entry, DashMap};
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
 use crate::{core::Worker, routers::comm::header_utils::extract_sticky_routing_key};
 
-const SESSION_REASSIGNMENT_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const SESSION_REASSIGNMENT_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Debug)]
 struct StickyAssignment {
