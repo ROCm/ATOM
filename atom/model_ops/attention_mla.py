@@ -1068,12 +1068,12 @@ class MLAAttention(nn.Module):
                 # per-rank (and per-layer) ones, not the global sparse_kv_indptr.
                 # Same substitution the decode path makes.
                 #
-                # MUST be sliced, unlike the decode path: mla_prefill_asm_fwd
-                # derives its grid from `kv_indptr->size(0) - 1`
-                # (asm_mla.cu:1208) whereas both decode entries use
-                # `qo_indptr->size(0) - 1`. Handing it the whole
-                # max_num_batched_tokens-sized buffer launches ~32k rows over
-                # stale tail entries and faults instantly.
+                # Slice to num_requests+1: mla_prefill_asm_fwd grids from
+                # `kv_indptr->size(0)-1` (asm_mla.cu:1208), so the full
+                # max_num_batched_tokens buffer faulted (MEMORY_VIOLATION, ~32k
+                # stale rows). DCP prefill now uses mla_decode_fwd (grids from
+                # qo_indptr), so the slice is defensive here but kept: correct
+                # length, and mandatory if the asm-prefill path is used again.
                 paged_kv_indptr = self.dcp_sparse_kv_indptr_buffer[
                     : paged_cu_seqlens_q.shape[0]
                 ]

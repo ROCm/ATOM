@@ -1022,9 +1022,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.dcp_indexer_local_cu_seqlens = torch.from_numpy(
             cu_pad.astype(np.int32)
         ).to(dev, non_blocking=True)
-        attn_metadata.dcp_indexer_gather_index = torch.from_numpy(src).to(
-            dev, non_blocking=True
-        )
+        # gather_index is an index_select source; int32 halves both the transfer
+        # and the on-device index tensor vs int64. Safe: src indexes the
+        # [W, sum(Lpad)] all-gather buffer, so src < W*local_total ~= total_kv
+        # (the KV token count) -- ~1M even at a 1M context, far below 2^31. The
+        # host math stays in int64 for headroom; only the tensor is int32.
+        attn_metadata.dcp_indexer_gather_index = torch.from_numpy(
+            src.astype(np.int32)
+        ).to(dev, non_blocking=True)
 
     def prepare_prefill(self, batch: ScheduledBatch):
         attn_metadata, positions = CommonAttentionBuilder.prepare_prefill(self, batch)
