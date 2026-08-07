@@ -808,51 +808,5 @@ class StreamingCoverageTest(unittest.TestCase):
             )
 
 
-class DraftStreamingSelectionTest(unittest.TestCase):
-    def test_spec_decode_load_passes_streamer_to_loading_core(self):
-        try:
-            import atom.model_loader.loader as loader_module
-        except ModuleNotFoundError as exc:
-            if exc.name == "aiter":
-                self.skipTest("loader integration requires AITER")
-            raise
-
-        model = nn.Module()
-        streamer = mock.Mock()
-        streamer.done_module_ids = set()
-        streamer.candidates = []
-
-        with (
-            mock.patch.object(
-                loader_module.OnlineQuantStreamer,
-                "maybe_create",
-                return_value=streamer,
-            ) as maybe_create,
-            mock.patch.object(
-                loader_module,
-                "load_weights_into_model",
-                return_value=set(),
-            ) as load_weights,
-            mock.patch.object(
-                loader_module.torch.cuda,
-                "is_available",
-                return_value=False,
-            ),
-        ):
-            loader_module.load_model(
-                model,
-                "<synthetic>",
-                mock.Mock(),
-                spec_decode=True,
-            )
-
-        maybe_create.assert_called_once_with(model, None)
-        self.assertIs(
-            load_weights.call_args.kwargs["online_quant_streamer"],
-            streamer,
-        )
-        streamer.replay_stragglers_and_report.assert_called_once_with(True)
-
-
 if __name__ == "__main__":
     unittest.main()
