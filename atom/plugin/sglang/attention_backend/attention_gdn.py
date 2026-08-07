@@ -154,7 +154,7 @@ class SGLangGDNForwardContext:
             "num_spec_decodes": 0,
             "num_spec_decode_tokens": 0,
             "spec_query_start_loc": None,
-            "non_spec_query_start_loc": fm.query_start_loc,
+            "non_spec_query_start_loc": query_start_loc,
             "spec_state_indices_tensor": None,
             "non_spec_state_indices_tensor": idx,
             "spec_sequence_masks": None,
