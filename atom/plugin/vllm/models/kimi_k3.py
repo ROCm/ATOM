@@ -108,11 +108,17 @@ class KimiKDAAttentionVllm(KimiKDAAttention, MambaBase):
     def mamba_type(self) -> MambaAttentionBackendEnum:
         return MambaAttentionBackendEnum.GDN_ATTN
 
-    def _forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def _forward_impl(
+        self,
+        hidden_states: torch.Tensor,
+        hidden_states_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         vllm_context = get_vllm_forward_context()
         attn_metadata = vllm_context.attn_metadata
         if attn_metadata is None:
-            return hidden_states.new_zeros(hidden_states.shape)
+            return torch.zeros(
+                hidden_states.shape, dtype=torch.bfloat16, device=hidden_states.device
+            )
 
         if not isinstance(attn_metadata, dict):
             raise TypeError("Kimi-K3 vLLM attention metadata must be layer-indexed")
@@ -135,7 +141,7 @@ class KimiKDAAttentionVllm(KimiKDAAttention, MambaBase):
         atom_context.attn_metadata = self._atom_metadata
         atom_context.kv_cache_data = self._atom_kv_cache_data
         try:
-            output = super()._forward_impl(hidden_states)
+            output = super()._forward_impl(hidden_states, hidden_states_scale)
         finally:
             atom_context.attn_metadata = previous_metadata
             atom_context.kv_cache_data = previous_kv_cache_data
@@ -143,7 +149,7 @@ class KimiKDAAttentionVllm(KimiKDAAttention, MambaBase):
         # vLLM pads token rows to the selected piecewise/full graph bucket,
         # while GDN metadata tracks only real tokens. The native KDA path
         # intentionally slices to num_actual_tokens; restore the graph bucket
-        # width so this custom op matches its empty_like fake implementation.
+        # width so this custom op matches its fake implementation's output shape.
         if output.shape[0] < hidden_states.shape[0]:
             output = torch.nn.functional.pad(
                 output,

@@ -1,0 +1,139 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""Kimi-K3 channel-format tool-call format::
+
+    <|open|>call tool="NAME" index="i"<|sep|>
+      <|open|>argument key="K" type="T"<|sep|>VALUE<|close|>argument<|sep|> ...
+    <|close|>call ...
+
+Argument VALUEs are raw-by-type (string unquoted, number/bool/object as literals)
+and are coerced then assembled into one JSON object per call. Unlike the XML-ish
+formats the type travels on the wire (``type="..."``) so no request ``tools``
+schema is needed; ``tools`` is unused.
+
+K3 interleaves think/response/tools sections in one channel-framed stream, so
+partial-chunk parsing is unreliable: this parser buffers the whole output and
+parses once at flush. Plain (non-tool) answers also carry channel framing
+tokens, which are stripped from ``content``.
+"""
+
+import json
+import re
+from typing import ClassVar
+
+from .tool_parser import ToolCall, ToolCallParser, unique_tool_call_id
+
+# K3 channel tokens this parser matches on. Kept local so the parser is
+# self-contained; the reasoning splitter declares its own copies.
+KIMI_K3_CALL_PREFIX = '<|open|>call tool="'
+KIMI_K3_TOOLS_START = "<|open|>tools<|sep|>"
+KIMI_K3_RESPONSE_START = "<|open|>response<|sep|>"
+KIMI_K3_RESPONSE_END = "<|close|>response<|sep|>"
+KIMI_K3_END_OF_MSG = "<|end_of_msg|>"
+
+_K3_CALL_RE = re.compile(
+    r'<\|open\|>call tool="(?P<name>[^"]*)"(?:\s+index="(?P<index>\d+)")?<\|sep\|>'
+    r"(?P<body>.*?)<\|close\|>call",
+    re.DOTALL,
+)
+_K3_ARG_RE = re.compile(
+    r'<\|open\|>argument key="(?P<key>[^"]*)"(?:\s+type="(?P<type>[^"]*)")?<\|sep\|>'
+    r"(?P<val>.*?)<\|close\|>argument",
+    re.DOTALL,
+)
+_K3_FRAMING_RE = re.compile(
+    r"<\|(?:open|close)\|>(?:response|message|tools|think|call|argument)[^<]*?<\|sep\|>"
+    r"|<\|close\|>(?:response|message|tools|think)"
+    r"|<\|end_of_msg\|>|<\|sep\|>"
+)
+
+
+def is_kimi_k3(text: str) -> bool:
+    return (
+        KIMI_K3_CALL_PREFIX in text
+        or KIMI_K3_TOOLS_START in text
+        or KIMI_K3_RESPONSE_START in text
+        or KIMI_K3_RESPONSE_END in text
+        or KIMI_K3_END_OF_MSG in text
+    )
+
+
+def _k3_coerce(val: str, ptype: str | None):
+    t = (ptype or "").lower()
+    # Strings are returned verbatim: leading/trailing whitespace can be
+    # semantically significant (e.g. an enum of whitespace values), so stripping
+    # would corrupt valid values. Non-string types strip first, since surrounding
+    # whitespace there is only formatting noise around the literal to coerce.
+    if t.startswith("str"):
+        return val
+    v = val.strip()
+    try:
+        if t.startswith("int"):
+            return int(v)
+        if t.startswith(("num", "float", "double", "decimal")):
+            f = float(v)
+            return int(f) if f.is_integer() else f
+        if t.startswith("bool"):
+            return v.lower() == "true"
+        return json.loads(v)  # object / array / unknown
+    except Exception:  # noqa: BLE001 - best-effort coercion, return raw
+        return v
+
+
+def _strip_k3_framing(text: str) -> str:
+    return _K3_FRAMING_RE.sub("", text).strip()
+
+
+class KimiK3Parser(ToolCallParser):
+    """Kimi-K3 channel format: buffer the whole output, parse + emit at flush.
+
+    K3's channel framing interleaves think/response/tools, so partial-chunk
+    parsing is unreliable; buffering to EOS and parsing once is simplest and the
+    outputs are short.
+    """
+
+    NAME: ClassVar[str] = "kimi_k3"
+
+    @classmethod
+    def detect(cls, text: str) -> bool:
+        return is_kimi_k3(text)
+
+    @classmethod
+    def parse(cls, text: str, tools: list | None) -> tuple[str, list[ToolCall]]:
+        """Parse the Kimi-K3 channel format; return (clean_content, tool_calls)."""
+        ts = text.find(KIMI_K3_TOOLS_START)
+        content = _strip_k3_framing(text if ts == -1 else text[:ts])
+        tool_calls: list[ToolCall] = []
+        for m in _K3_CALL_RE.finditer(text):
+            args: dict = {}
+            for a in _K3_ARG_RE.finditer(m.group("body")):
+                args[a.group("key")] = _k3_coerce(a.group("val"), a.group("type"))
+            tool_calls.append(
+                ToolCall(
+                    id=unique_tool_call_id(),
+                    type="function",
+                    function={
+                        "name": m.group("name"),
+                        "arguments": json.dumps(args, ensure_ascii=False),
+                    },
+                )
+            )
+        return content, tool_calls
+
+    def process(self, text: str) -> list:
+        # Buffer everything; K3's interleaved framing is parsed once at flush.
+        self.buf += text
+        return []
+
+    def flush(self) -> list:
+        content, tool_calls = self.parse(self.buf, self.tools)
+        self.buf = ""
+        results: list = []
+        if content:
+            results.append(("content", content))
+        for tc in tool_calls:
+            results.extend(self._emit_call(tc))
+        if self.emitted_calls > 0:
+            results.append(("tool_call_end", None))
+        return results
