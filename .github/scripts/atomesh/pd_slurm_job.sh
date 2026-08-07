@@ -118,7 +118,7 @@ run_container_rank() {
   local rank_dir="${RUN_DIR}/rank-${rank}"
   local bin_dir="${RUN_DIR}/bin"
   local video_gid render_gid host_ionic nccl_socket_ifname
-  local docker_socket_gid docker_cli
+  local docker_socket_gid docker_cli docker_root
 
   mkdir -p "${rank_dir}"
   mkdir -p "${bin_dir}"
@@ -217,6 +217,18 @@ EOF
         -e SWEBENCH_DOCKER_EXECUTABLE=/usr/local/bin/docker-host
         --group-add "${docker_socket_gid}"
       )
+      # The SWE-bench disk preflight df(1)s the path the daemon reports as its
+      # root, but that path is in the *host* namespace. Bind it in at the same
+      # path so it resolves to the same filesystem inside rank 0; without it the
+      # check either finds nothing and skips, or measures the rootfs of the
+      # container and reports a number for the wrong disk.
+      docker_root="$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || true)"
+      if [[ -n "${docker_root}" && -d "${docker_root}" ]]; then
+        docker_args+=(-v "${docker_root}:${docker_root}:ro")
+      else
+        echo "WARN: could not resolve the Docker root on this host; the" \
+          "SWE-bench disk preflight check will be skipped" >&2
+      fi
     fi
   fi
 
@@ -494,6 +506,23 @@ for execution_phase in "${EXECUTION_PHASES[@]}"; do
             -e SWEBENCH_DOCKER_EXECUTABLE=/usr/local/bin/docker-host
             --group-add "${docker_socket_gid}"
           )
+          # The SWE-bench disk preflight df(1)s the path the daemon reports as
+          # its root, but that path is in the *host* namespace. Bind it in at
+          # the same path so it resolves to the same filesystem inside rank 0;
+          # without it the check either finds nothing and skips, or measures the
+          # rootfs of the container and reports a number for the wrong disk.
+          # No apostrophes and no single quotes below: this whole block is one
+          # single-quoted remote command string, and either would end it early.
+          host_docker_root="$(docker info \
+            --format "{{.DockerRootDir}}" 2>/dev/null || true)"
+          if [[ -n "${host_docker_root}" && -d "${host_docker_root}" ]]; then
+            nested_docker_args+=(
+              -v "${host_docker_root}:${host_docker_root}:ro"
+            )
+          else
+            echo "WARN: could not resolve the Docker root on this host; the" \
+              "SWE-bench disk preflight check will be skipped" >&2
+          fi
         fi
       fi
       docker run --rm --name "${container}" \
