@@ -54,10 +54,21 @@ class OnlineQuantStreamer:
         ]
         if not candidates:
             return None
-        return cls(candidates)
+        deferred_module_ids = {
+            id(child)
+            for parent in model.modules()
+            if hasattr(parent, "get_streaming_deferred_modules")
+            for child in parent.get_streaming_deferred_modules()
+        }
+        return cls(candidates, deferred_module_ids)
 
-    def __init__(self, candidates: list[tuple[str, nn.Module]]):
+    def __init__(
+        self,
+        candidates: list[tuple[str, nn.Module]],
+        deferred_module_ids: set[int] | None = None,
+    ):
         self.candidates = candidates
+        self.deferred_module_ids = deferred_module_ids or set()
         self.param_to_module: dict[int, nn.Module] = {}
         # Claimed modules no longer accept loader arrivals.
         self.done_module_ids: set[int] = set()
@@ -210,7 +221,11 @@ class OnlineQuantStreamer:
             )
             if claimed:
                 module._stream_claimed = True
-        if claimed:
+        # Some child modules must keep their source weights until a parent
+        # post-load hook has combined them. They still use host staging here,
+        # but intentionally fall back to the ordered post-load pass for
+        # finalization and quantization.
+        if claimed and id(module) not in self.deferred_module_ids:
             self._submit_finalize(module)
 
     @staticmethod

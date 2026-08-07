@@ -887,6 +887,10 @@ class KimiKDAAttention(nn.Module):
         self.fuse_input_norm_quant = in_proj_type in _RMS_FUSABLE_QUANT_TYPES
         self.input_quant_prefix = f"{prefix}.in_proj"
 
+    def get_streaming_deferred_modules(self) -> tuple[nn.Module, ...]:
+        """Children that must remain unquantized until KDA fuses their weights."""
+        return self.in_proj, self.f_a_proj
+
     def process_weights_after_loading(self) -> None:
         """Fuse all hidden-input projections into the single in-proj (one GEMM).
 
