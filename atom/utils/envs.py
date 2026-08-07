@@ -84,6 +84,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FUSED_COMPRESS_USE_FLYDSL": lambda: os.getenv(
         "ATOM_FUSED_COMPRESS_USE_FLYDSL", "auto"
     ).lower(),
+    # wo_a (grouped output LoRA) batched GEMM backend on gfx1250. Default keeps
+    # the proven BF16 Triton/einsum path. "always"/"auto" route it through the
+    # flydsl strided-batched a8w4 kernel (MXFP8 act x MXFP4 wo_a): the attention
+    # output is quantized to MXFP8 before the GEMM (an ADDED pre-quant) and the
+    # existing wo_b input quant after it is unchanged. This trades a few-percent
+    # numeric error for a faster GEMM + halved wo_a weight bandwidth, so validate
+    # accuracy before enabling in prod.
+    "ATOM_WO_A_USE_FLYDSL": lambda: os.getenv("ATOM_WO_A_USE_FLYDSL", "never").lower(),
     # QK-norm-rope-cache-quant fusion for Qwen3 dense and MoE; disabled by default.
     "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION", "0") == "1"
