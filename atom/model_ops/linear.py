@@ -273,6 +273,39 @@ def gemm_a8w8_blockscale_preshuffle_impl(
     return gemm_a8w8_blockscale_bpreshuffle(x, weight, x_scale, w_scale, dtype)
 
 
+def gemm_a8w8_blockscale_preshuffle_into_output_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    out: torch.Tensor,
+    dtype: torch.dtype = torch.bfloat16,
+    prefix: str = "",
+) -> None:
+    return None
+
+
+@torch_compile_guard(
+    gen_fake=gemm_a8w8_blockscale_preshuffle_into_output_fake, mutates_args=["out"]
+)
+def gemm_a8w8_blockscale_preshuffle_into_output(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    out: torch.Tensor,
+    dtype: torch.dtype = torch.bfloat16,
+    prefix: str = "",
+) -> None:
+    # Same GEMM, but the result lands in the CALLER-owned `out` buffer (a fixed
+    # address) and the op returns None — a mutates_args op must NOT also return
+    # the mutated tensor (Inductor functionalization then emits a getitem it
+    # cannot lower). Lets the downstream attention cudagraph read this output at
+    # a stable address with no per-step input copy. Mirrors 035db69's
+    # unified_attention_into_output.
+    gemm_a8w8_blockscale_bpreshuffle(x, weight, x_scale, w_scale, dtype, out=out)
+
+
 def gemm_a8w8_blockscale_triton_fake(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -804,8 +837,22 @@ class LinearBase(nn.Module):
 
     @mark_trace
     def forward(
-        self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None, otype=dtypes.bf16
+        self,
+        x: torch.Tensor,
+        x_scale: Optional[torch.Tensor] = None,
+        otype=dtypes.bf16,
+        out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # out= (fixed output buffer) is only wired through the per_1x128
+        # preshuffle GEMM path; any other quant path must not silently ignore it.
+        _out_ok = (
+            self.quant_type.value == QuantType.per_1x128.value
+            and bool(envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE)
+        )
+        assert out is None or _out_ok, (
+            "Linear out= requested but this quant path does not support it "
+            f"(quant_type={self.quant_type})."
+        )
         if self.quant_type.value == QuantType.No.value:
             y = tgemm.mm(
                 x,
@@ -885,15 +932,34 @@ class LinearBase(nn.Module):
                         y += self.bias
             elif self.quant_type.value == QuantType.per_1x128.value:
                 if envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE:
-                    y = gemm_a8w8_blockscale_preshuffle_impl(
-                        x,
-                        self.weight,
-                        x_scale,
-                        self.weight_scale,
-                        dtype=otype,
-                        prefix=self.prefix,
-                    )
+                    if out is not None:
+                        # Fixed-address output: write into `out` (returns None),
+                        # then use it as y. Separate op because a mutates_args op
+                        # must not also return the mutated tensor.
+                        gemm_a8w8_blockscale_preshuffle_into_output(
+                            x,
+                            self.weight,
+                            x_scale,
+                            self.weight_scale,
+                            out,
+                            dtype=otype,
+                            prefix=self.prefix,
+                        )
+                        y = out
+                    else:
+                        y = gemm_a8w8_blockscale_preshuffle_impl(
+                            x,
+                            self.weight,
+                            x_scale,
+                            self.weight_scale,
+                            dtype=otype,
+                            prefix=self.prefix,
+                        )
                 else:
+                    assert out is None, (
+                        "Linear out= only supported on the per_1x128 preshuffle "
+                        "path (ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE)."
+                    )
                     if use_triton_gemm() and gemm_a8w8_blockscale_triton is not None:
                         y = gemm_a8w8_blockscale_triton_impl(
                             x,

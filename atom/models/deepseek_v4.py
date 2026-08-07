@@ -170,31 +170,33 @@ def _v4_attention_fake(
 # attention op's output.
 _v4_attn_piecewise_out: dict = {}
 
-# ATOM_ATTN_CUDAGRAPH: per-(layer_name, num_tokens, q_eff, bs) captured cudagraphs
-# of the eager attention core (_attn_core). Captured in the capture pass
-# (mode=PIECEWISE, in_hipgraph=True), replayed at real decode (in_hipgraph=False).
+# ATOM_ATTN_CUDAGRAPH: per-(layer_name, bucket_bs, q_eff) captured cudagraphs of the
+# eager attention core (_attn_core). Captured at the :3850 PIECEWISE capture forward
+# (mode=PIECEWISE, in_hipgraph=True) — the SAME forward as the dense pieces, sharing
+# their graph pool — and replayed at real decode (mode=PIECEWISE, in_hipgraph=False).
 # Each entry: {"graph": CUDAGraph, "in": [stable_tensor|None,...], "out": Tensor}.
 _v4_attn_core_graphs: dict = {}
 
-# ATOM_ATTN_CUDAGRAPH_COVERAGE=1: diagnostic counters to measure whether real
-# decode actually HITS the captured graphs or silently falls back to eager. Keyed
-# by (num_tokens, q_eff, bs); value = {"capture","replay","eager_fallback"} counts.
-# Reveals the ragged-vs-rectangle shape mismatch (num_tokens=x.shape[0] at replay
-# is the ragged flat bucket, but capture built graphs at bs*max_q_len).
-_v4_attn_cg_coverage: dict = {}
+# Indices into _tensor_args = (x, q, kv_pre, qr, qr_scale, positions, idx_q_quant,
+# idx_weights, idx_q_scale) that the attn-core graph captures on DIRECTLY (no
+# clone) and that skip the per-step replay copy. Every entry is an upstream
+# dense-piece cudagraph output (or a split view / forward_vars buffer) living at a
+# FIXED pool address; since the attn-core graph captures at :3850 in the SAME
+# forward, its baked input address == the address dense-piece replay re-writes
+# each step — so no per-step input copy is needed. None entries (e.g. idx_q_scale
+# on the fp8 path) are inert. All args zero-copy by default; ATOM_ATTN_ZC=
+# comma-list overrides (empty -> copy everything) for debugging.
+_V4_ATTN_ZEROCOPY_ARGS: frozenset = (
+    frozenset(
+        int(i)
+        for i in os.environ["ATOM_ATTN_ZC"].split(",")
+        if i.strip().isdigit()
+    )
+    if "ATOM_ATTN_ZC" in os.environ
+    else frozenset(range(9))
+)
 
-# ATOM_ATTN_CUDAGRAPH_ADDRPROBE=1: per-layer last-seen tuple of _attn_pre output
-# data_ptrs, to check whether attention-graph inputs land at stable addresses
-# step-to-step (prerequisite for dropping the replay-time buf.copy_(src)).
-_v4_attn_addrprobe_prev: dict = {}
-
-# ONE shared pool for ALL attention-core graphs — separate from the dense pieces'
-# shared pool. Rationale: (a) sharing the dense pool corrupts its overlay layout
-# (attention captures on a different forward pass than the dense pieces -> MoE
-# aperture fault at replay); (b) a pool-per-graph explodes memory (~42GB private
-# pools -> OOM). One attention-only pool overlays the attention graphs among
-# themselves (they replay serially, outputs pinned to _v4_attn_piecewise_out) while
-# staying isolated from the dense pool. Created once on first capture.
+# Isolated attention-graph pool. Created once on first capture.
 _v4_attn_graph_pool = None
 
 
@@ -217,6 +219,24 @@ def v4_attention_with_output(
 # Narrow PIECEWISE split: only the paged / dynamic-shape attention core stays
 # eager.
 # ---------------------------------------------------------------------------
+
+
+def _v4_attn_bucket_bs_q(fc, self) -> tuple[int, int]:
+    """(bucket_bs, q_eff) — the attention-cudagraph key basis. bucket_bs is the
+    ceil-to-captured-graph_bs value (forward_mode.effective_bs at replay; capture
+    Context has no forward_mode so batch_size==graph_bs==bucket). See the
+    v4_core_attention key comment for the full rationale."""
+    _amd = fc.attn_metadata
+    _ctx = getattr(fc, "context", None)
+    q_eff = int(getattr(_amd, "max_seqlen_q", 1) or 1)
+    _fm = getattr(_ctx, "forward_mode", None)
+    if _fm is not None and getattr(_fm, "effective_bs", 0):
+        bucket_bs = int(_fm.effective_bs)
+    else:
+        bucket_bs = int(getattr(_ctx, "batch_size", 0) or 0)
+    return bucket_bs, q_eff
+
+
 def _v4_core_attention_fake(
     x: torch.Tensor,
     q: torch.Tensor,
@@ -255,26 +275,6 @@ def v4_core_attention(
 
     fc = get_forward_context()
 
-    # READ-ONLY probe (ATOM_ATTN_CUDAGRAPH_PROBE=1): confirm the trigger timing
-    # inside this eager op before adding capture/replay. Log only layer 0 to avoid
-    # flooding. Prints on every call: mode / in_hipgraph / dummy / shape / q_eff / bs.
-    if os.environ.get("ATOM_ATTN_CUDAGRAPH_PROBE") == "1" and (
-        "layers.0." in layer_name or layer_name.startswith("layers.0")
-    ):
-        _ctx = getattr(fc, "context", None)
-        _amd = getattr(fc, "attn_metadata", None)
-        logger.info(
-            "[ATTN_CG_PROBE] v4_core_attention layer=%s mode=%s in_hipgraph=%s "
-            "dummy=%s num_tokens=%s q_eff=%s bs=%s",
-            layer_name,
-            getattr(fc, "cudagraph_runtime_mode", None),
-            getattr(fc, "in_hipgraph", None),
-            getattr(_ctx, "is_dummy_run", None),
-            int(x.shape[0]),
-            getattr(_amd, "max_seqlen_q", None),
-            getattr(_ctx, "batch_size", None),
-        )
-
     _piecewise = getattr(fc, "cudagraph_runtime_mode", None) == CUDAGraphMode.PIECEWISE
     _tensor_args = (x, q, kv_pre, qr, qr_scale, positions,
                     idx_q_quant, idx_weights, idx_q_scale)  # fmt: skip
@@ -308,93 +308,39 @@ def v4_core_attention(
         and getattr(fc, "attn_metadata", None) is not None
     )
     if _attn_cg:
-        _amd = fc.attn_metadata
-        _ctx = getattr(fc, "context", None)
-        q_eff = int(getattr(_amd, "max_seqlen_q", 1) or 1)
-        # Key on the CAPTURED-BUCKET bs (+ q_eff), NOT num_tokens and NOT
-        # context.graph_bs. Rationale (all verified):
-        #  - The graph's SWA-write kernel bakes grid=(block_tables.shape[0], ...)
-        #    at capture, where block_tables.shape[0] == the graph_bs BUCKET (e.g.
-        #    32). So the key MUST identify that bucket for the baked grid to be
-        #    valid at replay. Ragged replay pads to graph_bs>=scheduled_bs and the
-        #    extra rows sentinel-skip, so a bucket>=real-bs graph is correct.
-        #  - num_tokens alone is UNSAFE: the same flat bucket (e.g. 96) can arise
-        #    from different real seq counts (16x6 or 32x3) -> different SWA grid.
-        #  - context.graph_bs is WRONG under DSpark ragged: _dspark_ragged_moe_graph_bs
-        #    overwrites it to flat_bucket//q (e.g. 16), which can be < scheduled_bs.
-        #  - forward_mode.effective_bs IS the ceil-to-captured-bucket value
-        #    (forward_context.py:256-261: next(x in graph_bs if x>=padded_bs)) and
-        #    equals the capture-side bucket. Capture builds Context WITHOUT a
-        #    forward_mode but WITH batch_size==graph_bs==bucket, so fall back to
-        #    context.batch_size there.
-        _fm = getattr(_ctx, "forward_mode", None)
-        if _fm is not None and getattr(_fm, "effective_bs", 0):
-            bucket_bs = int(_fm.effective_bs)
-        else:
-            bucket_bs = int(getattr(_ctx, "batch_size", 0) or 0)
+        bucket_bs, q_eff = _v4_attn_bucket_bs_q(fc, self)
         key = (layer_name, bucket_bs, q_eff)
         entry = _v4_attn_core_graphs.get(key)
         _in_hipgraph = getattr(fc, "in_hipgraph", False)
+        _zc = _V4_ATTN_ZEROCOPY_ARGS
 
-        # ATOM_ATTN_CUDAGRAPH_COVERAGE: count how real decode resolves per shape.
-        # A real decode step is (_piecewise and not _in_hipgraph). If entry is
-        # None there, attention SILENTLY runs eager -> feature contributes nothing
-        # for that shape. Shape key excludes layer_name (aggregate across layers).
-        if os.environ.get("ATOM_ATTN_CUDAGRAPH_COVERAGE") == "1" and (
-            _piecewise and not _in_hipgraph
-        ):
-            _real_bs = int(getattr(_ctx, "batch_size", 0) or 0)
-            _gbs = int(getattr(_ctx, "graph_bs", 0) or 0)
-            _ck = (bucket_bs, q_eff)
-            _cov = _v4_attn_cg_coverage.setdefault(
-                _ck, {"replay": 0, "eager_fallback": 0}
-            )
-            _cov["replay" if entry is not None else "eager_fallback"] += 1
-            if "layers.0." in layer_name or layer_name.startswith("layers.0"):
-                logger.info(
-                    "[ATTN_CG_COV] num_tokens=%s q_eff=%s real_bs=%s graph_bs=%s "
-                    "bucket_bs=%s -> %s (distinct_shapes=%s captured_graphs=%s)",
-                    int(x.shape[0]), q_eff, _real_bs, _gbs, bucket_bs,
-                    "REPLAY" if entry is not None else "EAGER_FALLBACK",
-                    len(_v4_attn_cg_coverage), len(_v4_attn_core_graphs),
-                )  # fmt: skip
-
-        # CAPTURE in the WARMUP forward of the capture pass (in_hipgraph=True,
-        # mode=None). That forward runs every piece EAGER — the stream is NOT in
-        # cudagraph-capturing state, so opening our own torch.cuda.graph here is
-        # legal. (The mode=PIECEWISE forward canNOT be used: the dense pieces are
-        # mid-capture there -> "operation not permitted when stream is capturing".)
-        # aiter kernels for this shape were already JIT'd earlier in this same
-        # eager forward, and build_for_cudagraph_capture set full-capacity geometry.
-        if _in_hipgraph and not _piecewise and entry is None:
-            in_bufs = [t.clone() if t is not None else None for t in _tensor_args]
-            # Warm up once more on THESE buffers so any lazy alloc/JIT bound to the
-            # cloned addresses happens before capture, then capture cleanly.
+        # CAPTURE at the :3850 PIECEWISE capture forward (mode=PIECEWISE AND
+        # in_hipgraph) — the SAME forward where the dense pieces capture. Capturing
+        # here (not the :3839 warmup) makes the graph's baked input addresses the
+        # dense pieces' fixed cudagraph-pool output addresses, which dense-piece
+        # replay re-writes each step — so zero-copy args need no per-step copy.
+        # The dense pieces open+close their own torch.cuda.graph serially, so
+        # between two pieces the stream is NOT capturing and opening our own graph
+        # is legal.
+        if _piecewise and _in_hipgraph and entry is None:
+            # Zero-copy args (a plain dense-piece output at a fixed address) are
+            # captured on DIRECTLY (no clone), so the graph reads exactly what
+            # dense-piece replay writes. Other args are cloned into an owned stable
+            # buffer (copied each replay).
+            in_bufs = [
+                (t if (i in _zc) else (t.clone() if t is not None else None))
+                for i, t in enumerate(_tensor_args)
+            ]
+            # Warm up on THESE buffers so lazy alloc/JIT happens before capture.
             self._attn_core(*in_bufs)
             graph = torch.cuda.CUDAGraph()
-            # ATOM_ATTN_SHARE_DENSE_POOL=1 (EXPERIMENT): capture into the dense
-            # pieces' shared pool instead of the isolated attention pool. Goal:
-            # make attention-graph input addresses coincide with the upstream
-            # dense piece's output pool so the per-step input DtoD copies can be
-            # dropped. Historically this aperture-faulted (attention captures on a
-            # different forward pass than the dense pieces); re-testing now that
-            # single-stream compressor + graph_bs padding changed the setup.
-            # Default (off) = the isolated attention pool, the committed baseline.
             global _v4_attn_graph_pool
-            if os.environ.get("ATOM_ATTN_SHARE_DENSE_POOL") == "1":
-                import atom.utils.cuda_graph as _cg_mod
-                if _cg_mod._shared_graph_pool is None:
-                    _cg_mod._shared_graph_pool = torch.cuda.graph_pool_handle()
-                pool = _cg_mod._shared_graph_pool
-            else:
-                if _v4_attn_graph_pool is None:
-                    _v4_attn_graph_pool = torch.cuda.graph_pool_handle()
-                pool = _v4_attn_graph_pool
+            if _v4_attn_graph_pool is None:
+                _v4_attn_graph_pool = torch.cuda.graph_pool_handle()
+            pool = _v4_attn_graph_pool
             # capture_error_mode="thread_local" (matches dense-piece capture): the
-            # default "global" mode fails with "operation not permitted when stream
-            # is capturing" because the NCCL watchdog thread polls hipEventQuery on
-            # a background thread every ~100ms and global mode counts that as an
-            # illegal concurrent op. thread_local restricts the check to THIS thread.
+            # NCCL watchdog polls hipEventQuery on a background thread; "global"
+            # mode would count that as an illegal concurrent op.
             with torch.cuda.graph(
                 graph,
                 pool=pool,
@@ -406,46 +352,21 @@ def v4_core_attention(
                 "graph": graph,
                 "in": in_bufs,
                 "out": cg_out,
-                "pool": pool,
             }
-            # Fall through to eager for THIS warmup call's real output (the capture
-            # ran on clone buffers; return the genuine eager result for correctness).
+            # Return the genuine eager result for THIS capture forward's output.
             return _stabilize(_run_eager())
 
         # REPLAY at real decode (mode=PIECEWISE, not in_hipgraph) when captured.
         if _piecewise and not _in_hipgraph and entry is not None:
-            # ATOM_ATTN_CUDAGRAPH_ADDRPROBE: diagnostic for the zero-copy idea —
-            # measure per-replay input-copy bytes and whether each _attn_pre output
-            # (src) lands at a STABLE data_ptr step-to-step. If src ptrs are stable,
-            # we could capture on the src addresses directly and drop buf.copy_(src).
-            if os.environ.get("ATOM_ATTN_CUDAGRAPH_ADDRPROBE") == "1" and (
-                "layers.0." in layer_name or layer_name.startswith("layers.0")
-            ):
-                _prev = _v4_attn_addrprobe_prev.get(layer_name)
-                _cur = tuple(
-                    (s.data_ptr() if s is not None else 0) for s in _tensor_args
-                )
-                _bytes = sum(
-                    (s.numel() * s.element_size()) if s is not None else 0
-                    for s in _tensor_args
-                )
-                _stable = (_prev == _cur) if _prev is not None else None
-                _v4_attn_addrprobe_prev[layer_name] = _cur
-                logger.info(
-                    "[ATTN_CG_ADDR] layer=%s copy_bytes=%s src_ptrs_stable_vs_prev=%s "
-                    "n_tensors=%s",
-                    layer_name, _bytes, _stable,
-                    sum(1 for s in _tensor_args if s is not None),
-                )  # fmt: skip
-            # The captured buffers are sized to the graph_bs RECTANGLE
-            # (bucket_bs*q_eff rows, e.g. 192). Real ragged decode forwards a
-            # SMALLER flat bucket (e.g. 96 rows). Copy the real rows into the
-            # LEADING slots and leave the padded tail as-is: the persistent
-            # attn_metadata (batch_id_per_token=-1, zero-length cu_seqlens spans)
-            # marks those tail rows inert, so every kernel sentinel-skips them.
-            # This is the "num_tokens as a runtime attribute padded into the
-            # bucket rectangle" contract — dim 0 is the token axis for every arg.
-            for buf, src in zip(entry["in"], _tensor_args):
+            # Copy non-zero-copy args into the graph's fixed input buffers. The
+            # captured buffers are the bucket_bs*q_eff RECTANGLE; ragged decode
+            # forwards a smaller flat bucket -> write the real leading rows, leave
+            # the padded tail inert (batch_id=-1 / zero-len cu_seqlens spans make
+            # kernels sentinel-skip it). Zero-copy args are skipped: they are dense
+            # -piece outputs whose fixed address the graph already captured on.
+            for i, (buf, src) in enumerate(zip(entry["in"], _tensor_args)):
+                if i in _zc:
+                    continue
                 if buf is not None and src is not None:
                     n = src.shape[0]
                     if buf.shape[0] == n:
@@ -453,10 +374,8 @@ def v4_core_attention(
                     else:
                         buf[:n].copy_(src)
             entry["graph"].replay()
-            # The graph output is the FULL rectangle (bucket_bs*q_eff rows). The
-            # real step consumed only the leading num_tokens rows; slice back so
-            # the downstream dense piece (and _stabilize's per-num_tokens buffer)
-            # see exactly the real token count, with the inert padded tail dropped.
+            # Graph output is the full rectangle; slice back to the real token
+            # count so the downstream dense piece + _stabilize see exactly that.
             _real_nt = int(x.shape[0])
             _out = entry["out"]
             if _out.shape[0] != _real_nt:
