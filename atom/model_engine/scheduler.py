@@ -1076,6 +1076,7 @@ class Scheduler:
                     num_seqs_prefill,
                     num_batched_tokens,
                 )
+                self._uncount_inflight_load(seq)
                 continue
 
             if (
@@ -1379,7 +1380,8 @@ class Scheduler:
         if self.kv_connector is not None and hasattr(self.kv_connector, "load_failed"):
             self.kv_connector.load_failed(seq.id)
         seq.status = SequenceStatus.WAITING
-        self._uncount_inflight_load(seq)
+        if not self._connector_flag("is_offload"):
+            self._uncount_inflight_load(seq)
         seq.offload_loaded = False
         seq.offload_loaded_tokens = seq.num_cached_tokens
         seq.offload_load_start_tokens = None
@@ -1537,8 +1539,12 @@ class Scheduler:
     ) -> None:
         skipped_waiting_requests.append(seq)
         seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
-        self._num_parked_remote_kv += 1
-        seq._counted_as_inflight_load = True
+        self._count_inflight_load(seq)
+
+    def _count_inflight_load(self, seq: Sequence) -> None:
+        if not getattr(seq, "_counted_as_inflight_load", False):
+            self._num_parked_remote_kv += 1
+            seq._counted_as_inflight_load = True
 
     def _uncount_inflight_load(self, seq: Sequence) -> None:
         if getattr(seq, "_counted_as_inflight_load", False):
@@ -1755,23 +1761,13 @@ class Scheduler:
                     continue
             elif seq.is_partial_prefill:
                 continue
-            # Drop stale tokens produced by chunked-prefill steps.
-            #
-            # There are two ways a stale token reaches this point:
-            # 1. Normal chunked prefill: the seq was partial at the start of
-            #    this postprocess call. With deferred output, the visible token
-            #    is one step late, so it belongs to the previous partial chunk.
-            # 2. Offload/remote-KV handoff: a partial seq can be parked out of
-            #    running and have seq.is_partial_prefill cleared. In that case
-            #    prev_partial_ids can no longer see it, so the park path sets
-            #    _discard_next_deferred_output to carry "drop one old token"
-            #    across the park/resume boundary.
-            was_partial_prefill_at_step_start = seq.id in prev_partial_ids
-            drop_old_token_after_offload_park = False
-            if is_deferred_out and getattr(seq, "_discard_next_deferred_output", False):
-                seq._discard_next_deferred_output = False
-                drop_old_token_after_offload_park = True
-            if was_partial_prefill_at_step_start or drop_old_token_after_offload_park:
+            # With deferred output, a token visible after a normal chunked-
+            # prefill step belongs to the previous partial chunk and must be
+            # dropped. An offload handoff is different: parking removes the
+            # request from at least one intervening model-runner batch, which
+            # already discards its deferred partial output. The first output
+            # after the request resumes is fresh and must be kept.
+            if seq.id in prev_partial_ids:
                 continue
             # Register prefix-cache hashes for blocks the prefill step just
             # finalized. Deferred from BlockManager.allocate() so a hash is
@@ -2206,10 +2202,10 @@ class Scheduler:
             should_park = self.kv_connector.should_park_partial_prefill_for_load(seq)
             if should_park:
                 if seq.is_partial_prefill:
-                    seq._discard_next_deferred_output = True
                     seq.is_partial_prefill = False
                     self._partial_prefill_count -= 1
                 seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+                self._count_inflight_load(seq)
                 parked.append(seq)
             else:
                 keep_running.append(seq)
