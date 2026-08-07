@@ -8,6 +8,8 @@ across DCP ranks using LSE (Log-Sum-Exp) correction.
 Uses vllm-style algorithm: AllGather LSE -> correct local output -> ReduceScatter.
 """
 
+from typing import Optional
+
 import numpy as np
 import torch
 import triton
@@ -96,6 +98,12 @@ def _correct_attn_cp_out_kernel(
     )
     output = tl.load(outputs_ptr + output_offsets)
     output = output * factor
+    # A rank that owns no candidate for this row has local_lse=-inf -> factor=0,
+    # and its attention output is NaN (0/0 in the kernel's acc/e_sum). NaN*0=NaN
+    # would poison the ReduceScatter sum, so force the empty-rank contribution to
+    # 0. Matches vLLM's cp merge kernel; covers both decode and prefill so callers
+    # need no separate NaN scrub.
+    output = tl.where(factor == 0.0, 0.0, output)
     tl.store(new_output_ptr + output_offsets, output)
 
 
@@ -113,8 +121,19 @@ def correct_attn_out(out, lses, cp_rank, ctx=None):
     """
     B, H, D = out.shape
     N = lses.shape[0]
+    # N (= cp world size) is baked into the kernel as N_ROUNDED and consumed by
+    # tl.arange, which requires a power of two. DCP world sizes are always 2/4/8;
+    # assert here so a non-pow2 size fails loudly instead of as a cryptic Triton
+    # compile error (and the unmasked LSE load stays in-bounds).
+    assert (N & (N - 1)) == 0, f"cp world size must be a power of two, got {N}"
 
-    lse = torch.empty(B, H, device=lses.device, dtype=lses.dtype)
+    # Allocate the global-LSE output with the SAME B/H strides as a slice of
+    # `lses`: the kernel writes vlse using lses_stride_B/H (it shares the offset
+    # math), so matching strides keeps that write correct even if `lses` is a
+    # non-contiguous view, instead of relying on both happening to be contiguous.
+    lse = torch.empty_strided(
+        (B, H), (lses.stride(1), lses.stride(2)), device=lses.device, dtype=lses.dtype
+    )
 
     grid = (B, H, 1)
     regular_args = (
@@ -291,3 +310,624 @@ def get_dcp_local_seq_lens(seq_lens, dcp_size, dcp_rank, interleave_size=1):
         remainder_total - dcp_rank * interleave_size, 0, interleave_size
     )
     return base + remainder
+
+
+# ---------------------------------------------------------------------------
+# Deterministic global top-k over exchanged DCP candidates.
+#
+# Every rank runs the merge independently, so the selection must be a *function*
+# of its input, not merely "usually the same": an ambiguous choice resolved
+# differently on two ranks breaks the disjoint-partition property that
+# `cp_lse_ag_out_rs` relies on (6.1.3). Ambiguity can only arise among
+# candidates whose score exactly equals the selection threshold, so ties are
+# broken by the globally unique token id:
+#
+#     keep  score > T
+#     keep  score == T  and  gid <= G     where G is the `need`-th smallest gid
+#
+# Measured on real data (25,600 rows): 0.06% of rows have a boundary
+# tie and the tied set is never larger than 2.
+# ---------------------------------------------------------------------------
+
+# Ties measured <= 2; 256 leaves a 128x margin. Must be a power of two (`tl.sort`).
+# WARNING: silent correctness limit. If a row has >CAP candidates tied at the
+# threshold score, the extra ties are dropped and that row's top-k is wrong; the
+# `overflow` flag records it but the hot path can't read it back (D2H breaks
+# CUDAGraph). Accepted since >256 exact fp32 ties is extremely rare.
+DCP_TOPK_TIE_CAP = 256
+
+
+@triton.jit
+def _dcp_stable_topk_kernel(
+    scores,  # fp32 [rows, n]
+    gids,  # int32 [rows, n], < 0 marks a padding candidate
+    thr,  # fp32 [rows] -- k-th largest score, from topk_plain
+    out,  # int32 [rows, k]
+    tie_buf,  # int32 [rows, CAP] scratch
+    overflow,  # int32 [rows]
+    k,
+    n,
+    s_s0: tl.int64,
+    g_s0: tl.int64,
+    o_s0: tl.int64,
+    BLOCK: tl.constexpr,
+    CAP: tl.constexpr,
+):
+    """One program per row: find the tie boundary, then emit.
+
+    Loop 1 reads the score plane; its gid loads are masked to the handful of
+    tied lanes, so they touch almost no extra cache lines. Loop 2 reads both.
+    """
+    row = tl.program_id(0)
+    sbase = row * s_s0
+    gbase = row * g_s0
+    obase = row * o_s0
+    t = tl.load(thr + row)
+    # A row whose candidate set is smaller than k emits fewer than k ids. `out`
+    # is reused across steps, so pad first or stale ids from the previous step
+    # survive in the tail.
+    for start in range(0, k, BLOCK):
+        cols = start + tl.arange(0, BLOCK)
+        tl.store(out + obase + cols, tl.full([BLOCK], -1, tl.int32), mask=cols < k)
+
+    # t == -inf means the row has fewer than k real candidates. Everything real
+    # is then strictly greater and the padding (-inf) must be dropped, so the
+    # tie branch has to stay off -- otherwise every pad lane looks "tied" and
+    # floods tie_buf.
+    finite_t = t > -float("inf")
+    tl.debug_barrier()
+
+    # ---- loop 1: count strict winners, scatter tied gids to scratch ----
+    # The tied gids go to GLOBAL scratch, not a register array: Triton cannot
+    # index registers dynamically, so a register buffer needs an O(CAP) fold per
+    # tile -- measured 2117 us at CAP=256 against a ~54 us two-pass floor.
+    # A global store takes the computed per-lane slot directly.
+    c_strict = 0
+    n_tie = 0
+    for start in range(0, n, BLOCK):
+        cols = start + tl.arange(0, BLOCK)
+        m = cols < n
+        sc = tl.load(scores + sbase + cols, mask=m, other=-float("inf"))
+        gt = m & (sc > t)
+        eq = m & (sc == t) & finite_t
+        c_strict += tl.sum(gt.to(tl.int32))
+        ei = eq.to(tl.int32)
+        dst = n_tie + tl.cumsum(ei, 0) - ei
+        g = tl.load(gids + gbase + cols, mask=eq, other=0)
+        tl.store(tie_buf + row * CAP + dst, g, mask=eq & (dst < CAP))
+        n_tie += tl.sum(ei)
+
+    tl.store(overflow + row, (n_tie > CAP).to(tl.int32))
+    tl.debug_barrier()
+
+    # ---- G = the `need`-th smallest tied gid ----
+    slot = tl.arange(0, CAP)
+    buf = tl.load(tie_buf + row * CAP + slot, mask=slot < n_tie, other=2147483647)
+    need = k - c_strict
+    srt = tl.sort(buf, 0)  # ascending; padding is INT32_MAX and sorts last
+    g_thr = tl.sum(tl.where(slot == (need - 1), srt, 0))
+    g_thr = tl.where(need > 0, g_thr, -1)
+
+    # ---- loop 2: emit ----
+    written = 0
+    for start in range(0, n, BLOCK):
+        cols = start + tl.arange(0, BLOCK)
+        m = cols < n
+        sc = tl.load(scores + sbase + cols, mask=m, other=-float("inf"))
+        g = tl.load(gids + gbase + cols, mask=m, other=-1)
+        take = m & (g >= 0) & ((sc > t) | ((sc == t) & finite_t & (g <= g_thr)))
+        ti = take.to(tl.int32)
+        dst = written + tl.cumsum(ti, 0) - ti
+        tl.store(out + obase + dst, g, mask=take & (dst < k))
+        written += tl.sum(ti)
+
+
+def dcp_stable_topk(scores, gids, k, out=None):
+    """Deterministic top-k over a candidate set. scores/gids: [rows, n].
+
+    Returns (out int32 [rows, k] of global ids, overflow int32 [rows]).
+    `out` is padded with -1 when a row holds fewer than k real candidates.
+
+    CUDAGraph note: every shape here is static, and `torch.empty` inside a
+    captured region lands in the graph's private pool at a stable address. The
+    caller must NOT read `overflow` back to host per step -- that is a D2H sync
+    and breaks capture. Read it only under a diagnostic switch.
+    """
+    from aiter import topk_plain
+
+    rows, n = scores.shape
+    dev = scores.device
+    if out is None:
+        out = torch.empty(rows, k, dtype=torch.int32, device=dev)
+    val_buf = torch.empty(rows, k, dtype=torch.float32, device=dev)
+    idx_buf = torch.empty(rows, k, dtype=torch.int32, device=dev)
+    row_starts = torch.zeros(rows, dtype=torch.int32, device=dev)
+    row_ends = torch.full((rows,), n, dtype=torch.int32, device=dev)
+    tie_buf = torch.empty(rows, DCP_TOPK_TIE_CAP, dtype=torch.int32, device=dev)
+    overflow = torch.zeros(rows, dtype=torch.int32, device=dev)
+
+    # aiter's tuned topk_plain is fp32-only, so it cannot take a 64-bit
+    # composite key; it supplies the score threshold and the kernel above adds
+    # the deterministic tie-break. A from-scratch Triton radix-select measured
+    # 524 us against a ~26.9 us/pass memory floor.
+    topk_plain(
+        scores,
+        idx_buf,
+        val_buf,
+        k,
+        True,
+        row_starts,
+        row_ends,
+        scores.stride(0),
+        1,
+    )
+    thr = val_buf.min(dim=-1).values
+
+    _dcp_stable_topk_kernel[(rows,)](
+        scores,
+        gids,
+        thr,
+        out,
+        tie_buf,
+        overflow,
+        k,
+        n,
+        scores.stride(0),
+        gids.stride(0),
+        out.stride(0),
+        BLOCK=1024,
+        CAP=DCP_TOPK_TIE_CAP,
+        num_warps=8,
+    )
+    return out, overflow
+
+
+def dcp_pack_topk_candidates(
+    local_logits, local_idx, local_lens, dcp_rank, dcp_world_size, out_pair
+):
+    """Turn a rank-local top-k into exchangeable (score, global_id) pairs.
+
+    out_pair: fp32 [2, rows, k] -- plane 0 holds scores, plane 1 holds int32
+    global ids reinterpreted as fp32 so both travel in one collective. Slots the
+    local top-k did not fill get (-inf, -1); `dcp_stable_topk` drops gid < 0.
+
+    Under round-robin (interleave=1) sharding a local position j on rank r is
+    global position j*W + r, so the id is globally unique -- which is what makes
+    the tie-break a total order.
+    """
+    rows, k = local_idx.shape
+    # Bound-check rather than assume a padding convention from the aiter kernel.
+    valid = (local_idx >= 0) & (local_idx < local_lens.view(rows, 1))
+    safe = torch.where(valid, local_idx, torch.zeros_like(local_idx))
+    sc = torch.gather(local_logits, 1, safe.to(torch.int64))
+    out_pair[0].copy_(torch.where(valid, sc, torch.full_like(sc, -float("inf"))))
+    gid = torch.where(
+        valid,
+        local_idx * dcp_world_size + dcp_rank,
+        torch.full_like(local_idx, -1),
+    )
+    out_pair.view(torch.int32)[1].copy_(gid)
+
+
+# ---------------------------------------------------------------------------
+# DCP sparse index filter + round-robin localize (decode & prefill).
+# Two-pass compacting filter: count this rank's owned top-k, then pack the
+# owned slots to the front of each region (no -1 holes -- see cp_lse_ag_out_rs).
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _count_owned_dcp_kernel(
+    qo_indptr,  # int32 [num_requests + 1]
+    global_kv_indptr,  # int32 [num_requests + 1] -- GLOBAL context (column range)
+    token_indices_ptr,  # int32 [num_tokens, NUM_TOPK_TOKENS] -- GLOBAL top-k positions
+    out_counts,  # int32 [num_requests] -- owned top-k count per request
+    DCP_RANK: tl.constexpr,
+    DCP_WORLD: tl.constexpr,
+    NUM_TOPK_TOKENS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    ti_stride0,
+    ti_stride1,
+):
+    """Pass 1 of the compacting DCP filter: how many of the global top-k
+    positions does this rank own, per request? Its exclusive cumsum gives the
+    compacted output offsets used by ``_compact_filter_dcp_kernel``.
+
+    qlen==1 only (DCP + sparse + MTP is rejected upstream), so each request has
+    exactly one query token.
+    """
+    batch_id = tl.program_id(0)
+    g_kv_start = tl.load(global_kv_indptr + batch_id)
+    g_kv_len = tl.load(global_kv_indptr + batch_id + 1) - g_kv_start
+    token_id = tl.load(qo_indptr + batch_id)
+
+    count = 0
+    for tile_start in range(0, NUM_TOPK_TOKENS, BLOCK_N):
+        indice_id = tile_start + tl.arange(0, BLOCK_N)
+        col_valid = (indice_id < g_kv_len) & (indice_id < NUM_TOPK_TOKENS)
+        ti_ptr = token_indices_ptr + token_id * ti_stride0 + indice_id * ti_stride1
+        tok = tl.load(ti_ptr, mask=col_valid, other=-1)
+        owned = col_valid & (tok >= 0) & ((tok % DCP_WORLD) == DCP_RANK)
+        count += tl.sum(owned.to(tl.int32))
+
+    tl.store(out_counts + batch_id, count)
+
+
+@triton.jit
+def _compact_filter_dcp_kernel(
+    qo_indptr,  # int32 [num_requests + 1]
+    global_kv_indptr,  # int32 [num_requests + 1] -- GLOBAL context (column range)
+    out_kv_indptr,  # int32 [num_requests + 1] -- COMPACTED offsets (cumsum of pass 1)
+    block_table,  # int32 [num_req, max_num_blocks_per_req] -- logical(global) blocks
+    token_indices_ptr,  # int32 [num_tokens, NUM_TOPK_TOKENS] -- GLOBAL top-k positions
+    out_kv_indices,  # int32 [>= out_kv_indptr[-1]]
+    DCP_RANK: tl.constexpr,
+    DCP_WORLD: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,  # runner (physical) block size
+    NUM_TOPK_TOKENS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    ti_stride0,
+    ti_stride1,
+    bt_stride0: tl.int64,
+    bt_stride1: tl.constexpr,
+):
+    # DCP round-robin (interleave=1): a GLOBAL position g is owned by rank
+    # ``g % W``; on the owner rank its physical slot follows the round-robin
+    # (virtual-block) layout used by _dcp_round_robin_slot / ATOM PR #847:
+    #     vbs  = PAGE_SIZE * W
+    #     slot = block_table[req, g // vbs] * PAGE_SIZE + (g % vbs) // W
+    # token_indices holds GLOBAL positions (the indexer scored the full sequence
+    # via all-gathered logits). This rank keeps ONLY the positions it owns and
+    # writes them COMPACTED to the front of its region -- no -1 holes. Holes are
+    # exactly what breaks aiter's lse path (immediate fault on the persistent
+    # kernel, silently unwritten lse on the split-KV one).
+    #
+    # Compaction is order-preserving (tl.cumsum within a tile plus a running
+    # offset across tiles) rather than atomic-allocated like vLLM, so the KV
+    # order -- and hence the floating-point accumulation order -- is
+    # deterministic run to run, which the dcp=1 vs dcp=N comparison relies on.
+    #
+    # NOTE: the slot is computed from block_table directly (like vLLM) rather
+    # than gathered from a precomputed kv_indices -- the DCP round-robin
+    # per-token slot array does not exist on the sparse path (dense reads go
+    # through block_tables in-kernel).
+    batch_id = tl.program_id(0)
+
+    g_kv_start = tl.load(global_kv_indptr + batch_id)
+    g_kv_len = tl.load(global_kv_indptr + batch_id + 1) - g_kv_start
+    out_kv_start = tl.load(out_kv_indptr + batch_id)
+    token_id = tl.load(qo_indptr + batch_id)
+
+    vbs = PAGE_SIZE * DCP_WORLD
+    written = 0
+    for tile_start in range(0, NUM_TOPK_TOKENS, BLOCK_N):
+        indice_id = tile_start + tl.arange(0, BLOCK_N)
+        # Columns within [0, min(global_ctx, topk)) carry a real top-k position.
+        col_valid = (indice_id < g_kv_len) & (indice_id < NUM_TOPK_TOKENS)
+
+        ti_ptr = token_indices_ptr + token_id * ti_stride0 + indice_id * ti_stride1
+        tok = tl.load(ti_ptr, mask=col_valid, other=-1)  # GLOBAL position
+
+        idx_valid = col_valid & (tok >= 0) & ((tok % DCP_WORLD) == DCP_RANK)
+
+        block_id = tok // vbs
+        inblock_offset = (tok % vbs) // DCP_WORLD
+        physical_block = tl.load(
+            block_table + batch_id * bt_stride0 + block_id * bt_stride1,
+            mask=idx_valid,
+            other=0,
+        )
+        slot = physical_block * PAGE_SIZE + inblock_offset
+
+        # Exclusive prefix sum of the owned mask -> destination inside this tile.
+        owned_i32 = idx_valid.to(tl.int32)
+        dst = written + tl.cumsum(owned_i32, axis=0) - owned_i32
+        tl.store(out_kv_indices + out_kv_start + dst, slot, mask=idx_valid)
+        written += tl.sum(owned_i32)
+
+
+def triton_filter_and_convert_dcp_index(
+    qo_indptr: torch.Tensor,  # int32 [num_requests + 1]
+    global_kv_indptr: torch.Tensor,  # int32 [num_requests + 1]
+    block_table: torch.Tensor,  # int32 [num_req, max_num_blocks_per_req] logical
+    token_indices: torch.Tensor,  # int32 [num_tokens, NUM_TOPK_TOKENS] GLOBAL pos
+    dcp_rank: int,
+    dcp_world_size: int,
+    block_size: int,  # runner (physical) block size == PAGE_SIZE
+    out_kv_indptr: torch.Tensor,  # int32 [num_requests + 1] COMPACTED, written here
+    owned_counts: torch.Tensor,  # int32 [>= num_requests] scratch for pass 1
+    NUM_TOPK_TOKENS: int = 2048,
+    BLOCK_N: int = 128,
+    out: Optional[torch.Tensor] = None,
+):
+    """DCP (interleave=1) filter + round-robin localize of global top-k positions,
+    **compacting** each rank's owned slots to the front of its region.
+
+    ``token_indices[token_id, indice_id]`` is a GLOBAL token position selected by
+    the indexer (scored over the full sequence via all-gathered logits). This
+    rank keeps a position ``g`` only if ``g % W == dcp_rank`` and maps it to its
+    physical slot via the round-robin (virtual-block) layout, computed directly
+    from ``block_table`` (like vLLM):
+        vbs  = block_size * W
+        slot = block_table[req, g // vbs] * block_size + (g % vbs) // W
+
+    Non-owned positions are **dropped**, not marked: the kept slots are packed
+    contiguously (original top-k order preserved) and ``out_kv_indptr`` is
+    rewritten to the resulting per-request lengths. This replaces the earlier
+    "fixed length + -1 sentinel" layout, whose holes broke aiter's lse output.
+    Because the kept count depends on the per-layer top-k selection,
+    ``out_kv_indptr`` is layer-dependent and must be recomputed on every call --
+    it cannot feed the once-per-step persistent metadata, which is why sparse+DCP
+    runs non-persistent for now.
+
+    The 8 ranks' kept sets are disjoint and their union is exactly the global
+    top-k, which is what makes the downstream ``cp_lse_ag_out_rs`` merge valid.
+    """
+    assert token_indices.dtype == torch.int32
+    assert token_indices.shape[1] == NUM_TOPK_TOKENS
+    assert NUM_TOPK_TOKENS % BLOCK_N == 0, (
+        f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) must be divisible by"
+        f"BLOCK_N ({BLOCK_N})"
+    )
+    assert 0 <= dcp_rank < dcp_world_size
+    assert out is not None, "sparse_kv_indices_buffer (out) is required"
+
+    num_batch = global_kv_indptr.shape[0] - 1
+
+    qo_indptr_c = qo_indptr.contiguous()
+    global_kv_indptr_c = global_kv_indptr.contiguous()
+    block_table_c = block_table.contiguous()
+    token_indices_c = token_indices.contiguous()
+
+    ti_stride0, ti_stride1 = token_indices_c.stride()
+    bt_stride0, bt_stride1 = block_table_c.stride()
+    grid = (num_batch,)
+
+    # Pass 1: per-request count of owned top-k positions.
+    counts = owned_counts[:num_batch]
+    _count_owned_dcp_kernel[grid](
+        qo_indptr_c,
+        global_kv_indptr_c,
+        token_indices_c,
+        counts,
+        dcp_rank,
+        dcp_world_size,
+        NUM_TOPK_TOKENS,
+        BLOCK_N,
+        ti_stride0,
+        ti_stride1,
+    )
+
+    # Exclusive cumsum -> compacted offsets. Written in place so the caller's
+    # tensor (and anything already holding a view of it) sees the update.
+    # dtype=int32 keeps the accumulation in int32 (torch would promote integral
+    # cumsum to int64 by default, which the kernels' int32 pointers reject).
+    # zero_() rather than `out_kv_indptr[0] = 0`: assigning a Python scalar goes
+    # through a host->device copy, which HIP rejects while a graph is capturing
+    # (hipErrorStreamCaptureUnsupported). Everything here must stay device-side.
+    out_kv_indptr[:1].zero_()
+    torch.cumsum(counts, dim=0, dtype=torch.int32, out=out_kv_indptr[1 : num_batch + 1])
+
+    # Pass 2: write the owned slots packed to the front of each region.
+    _compact_filter_dcp_kernel[grid](
+        qo_indptr_c,
+        global_kv_indptr_c,
+        out_kv_indptr,
+        block_table_c,
+        token_indices_c,
+        out,
+        dcp_rank,
+        dcp_world_size,
+        block_size,
+        NUM_TOPK_TOKENS,
+        BLOCK_N,
+        ti_stride0,
+        ti_stride1,
+        bt_stride0,
+        bt_stride1,
+    )
+    return out
+
+
+@triton.jit
+def _count_owned_dcp_prefill_kernel(
+    dsa_kv_indptr,  # int32 [num_tokens + 1] -- GLOBAL per-token candidate counts
+    token_to_seq_idxs,  # int32 [num_tokens]
+    topk_indices,  # int32 [num_tokens, NUM_TOPK_TOKENS] -- FLAT KV indices
+    cu_seqlens_k,  # int32 [num_req + 1] -- per-seq base of the flat KV axis
+    out_counts,  # int32 [num_tokens]
+    DCP_RANK: tl.constexpr,
+    DCP_WORLD: tl.constexpr,
+    NUM_TOPK_TOKENS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    ti_stride0: tl.int64,
+    ti_stride1: tl.constexpr,
+):
+    """Pass 1 of the compacting DCP filter for sparse PREFILL: how many of the
+    global top-k candidates does this rank own, per QUERY TOKEN?
+
+    Differs from the decode twin (`_count_owned_dcp_kernel`) in two ways:
+    the row unit is a query token rather than a request (prefill has many query
+    tokens per request), and `topk_indices` holds a FLAT index into the
+    concatenated KV of all sequences, so the within-sequence position -- which
+    is what the round-robin owner is derived from -- is `indice - cu_seqlens_k[req]`.
+    """
+    token_id = tl.program_id(0)
+    req_id = tl.load(token_to_seq_idxs + token_id)
+    kv_start = tl.load(dsa_kv_indptr + token_id)
+    kv_len = tl.load(dsa_kv_indptr + token_id + 1) - kv_start
+    base = tl.load(cu_seqlens_k + req_id)
+
+    count = 0
+    for tile_start in range(0, NUM_TOPK_TOKENS, BLOCK_N):
+        col_id = tile_start + tl.arange(0, BLOCK_N)
+        col_valid = (col_id < kv_len) & (col_id < NUM_TOPK_TOKENS)
+        indice = tl.load(
+            topk_indices + token_id * ti_stride0 + col_id * ti_stride1,
+            mask=col_valid,
+            other=-1,
+        )
+        pos = indice - base  # position within the sequence
+        owned = col_valid & (indice >= 0) & ((pos % DCP_WORLD) == DCP_RANK)
+        count += tl.sum(owned.to(tl.int32))
+
+    tl.store(out_counts + token_id, count)
+
+
+@triton.jit
+def _compact_filter_dcp_prefill_kernel(
+    dsa_kv_indptr,  # int32 [num_tokens + 1] -- GLOBAL per-token candidate counts
+    out_kv_indptr,  # int32 [num_tokens + 1] -- COMPACTED offsets (cumsum of pass 1)
+    token_to_seq_idxs,  # int32 [num_tokens]
+    topk_indices,  # int32 [num_tokens, NUM_TOPK_TOKENS] -- FLAT KV indices
+    cu_seqlens_k,  # int32 [num_req + 1]
+    block_table,  # int32 [num_req, max_num_blocks_per_req] -- logical(global) blocks
+    out_kv_indices,  # int32 [>= out_kv_indptr[-1]]
+    DCP_RANK: tl.constexpr,
+    DCP_WORLD: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,  # runner (physical) block size
+    NUM_TOPK_TOKENS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    ti_stride0: tl.int64,
+    ti_stride1: tl.constexpr,
+    bt_stride0: tl.int64,
+    bt_stride1: tl.constexpr,
+):
+    """Pass 2 for sparse PREFILL: keep only this rank's owned candidates, map
+    them through the round-robin (virtual-block) layout, and pack them to the
+    front of the token's region.
+
+        vbs  = PAGE_SIZE * W
+        slot = block_table[req, pos // vbs] * PAGE_SIZE + (pos % vbs) // W
+
+    Same rationale as the decode twin: no `-1` holes (they break aiter's lse
+    path) and compaction is order-preserving so the fp accumulation order is
+    deterministic.
+    """
+    token_id = tl.program_id(0)
+    req_id = tl.load(token_to_seq_idxs + token_id)
+    kv_start = tl.load(dsa_kv_indptr + token_id)
+    kv_len = tl.load(dsa_kv_indptr + token_id + 1) - kv_start
+    base = tl.load(cu_seqlens_k + req_id)
+    out_kv_start = tl.load(out_kv_indptr + token_id)
+
+    vbs = PAGE_SIZE * DCP_WORLD
+    written = 0
+    for tile_start in range(0, NUM_TOPK_TOKENS, BLOCK_N):
+        col_id = tile_start + tl.arange(0, BLOCK_N)
+        col_valid = (col_id < kv_len) & (col_id < NUM_TOPK_TOKENS)
+        indice = tl.load(
+            topk_indices + token_id * ti_stride0 + col_id * ti_stride1,
+            mask=col_valid,
+            other=-1,
+        )
+        pos = indice - base
+        idx_valid = col_valid & (indice >= 0) & ((pos % DCP_WORLD) == DCP_RANK)
+
+        block_id = pos // vbs
+        inblock_offset = (pos % vbs) // DCP_WORLD
+        physical_block = tl.load(
+            block_table + req_id * bt_stride0 + block_id * bt_stride1,
+            mask=idx_valid,
+            other=0,
+        )
+        slot = physical_block * PAGE_SIZE + inblock_offset
+
+        owned_i32 = idx_valid.to(tl.int32)
+        dst = written + tl.cumsum(owned_i32, axis=0) - owned_i32
+        tl.store(out_kv_indices + out_kv_start + dst, slot, mask=idx_valid)
+        written += tl.sum(owned_i32)
+
+    # A row this rank owns nothing of is left EMPTY (zero-length region). That is
+    # both legal and correct for mla_decode_fwd: it writes lse = -inf, which
+    # cp_lse_ag_out_rs turns into a zero weight. Its `o` comes out NaN (0/0), so
+    # the caller zeroes those rows -- see _forward_prefill_mla. No dummy candidate
+    # is injected; the attention never sees fabricated KV.
+
+
+def triton_filter_and_convert_dcp_index_prefill(
+    dsa_kv_indptr: torch.Tensor,  # int32 [num_tokens + 1] GLOBAL counts
+    token_to_seq_idxs: torch.Tensor,  # int32 [num_tokens]
+    topk_indices: torch.Tensor,  # int32 [num_tokens, NUM_TOPK_TOKENS] FLAT indices
+    cu_seqlens_k: torch.Tensor,  # int32 [num_req + 1]
+    block_table: torch.Tensor,  # int32 [num_req, max_num_blocks_per_req] logical
+    dcp_rank: int,
+    dcp_world_size: int,
+    block_size: int,  # runner (physical) block size == PAGE_SIZE
+    out_kv_indptr: torch.Tensor,  # int32 [num_tokens + 1] COMPACTED, written here
+    owned_counts: torch.Tensor,  # int32 [>= num_tokens] scratch for pass 1
+    NUM_TOPK_TOKENS: int = 2048,
+    BLOCK_N: int = 128,
+    out: Optional[torch.Tensor] = None,
+):
+    """Sparse-PREFILL twin of ``triton_filter_and_convert_dcp_index``.
+
+    The decode version keys on requests (qlen==1); prefill has one row per query
+    token and its ``topk_indices`` are flat KV indices rather than
+    within-sequence positions. Everything else -- two passes, in-place int32
+    cumsum, order-preserving compaction -- is identical, and the same
+    layer-scoped buffers are reused (they are sized ``max_num_batched_tokens``,
+    which bounds the prefill token count too).
+    """
+    assert topk_indices.dtype == torch.int32
+    assert topk_indices.shape[1] == NUM_TOPK_TOKENS
+    assert NUM_TOPK_TOKENS % BLOCK_N == 0, (
+        f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) must be divisible by"
+        f"BLOCK_N ({BLOCK_N})"
+    )
+    assert 0 <= dcp_rank < dcp_world_size
+    assert out is not None, "sparse_kv_indices_buffer (out) is required"
+
+    num_tokens = dsa_kv_indptr.shape[0] - 1
+
+    dsa_kv_indptr_c = dsa_kv_indptr.contiguous()
+    token_to_seq_idxs_c = token_to_seq_idxs.contiguous()
+    topk_indices_c = topk_indices.contiguous()
+    cu_seqlens_k_c = cu_seqlens_k.contiguous()
+    block_table_c = block_table.contiguous()
+
+    ti_stride0, ti_stride1 = topk_indices_c.stride()
+    bt_stride0, bt_stride1 = block_table_c.stride()
+    grid = (num_tokens,)
+
+    counts = owned_counts[:num_tokens]
+    _count_owned_dcp_prefill_kernel[grid](
+        dsa_kv_indptr_c,
+        token_to_seq_idxs_c,
+        topk_indices_c,
+        cu_seqlens_k_c,
+        counts,
+        dcp_rank,
+        dcp_world_size,
+        NUM_TOPK_TOKENS,
+        BLOCK_N,
+        ti_stride0,
+        ti_stride1,
+    )
+
+    # Same device-side-only cumsum as the decode path (see its comment for why
+    # zero_() and dtype=torch.int32 are required).
+    out_kv_indptr[:1].zero_()
+    torch.cumsum(
+        counts, dim=0, dtype=torch.int32, out=out_kv_indptr[1 : num_tokens + 1]
+    )
+
+    _compact_filter_dcp_prefill_kernel[grid](
+        dsa_kv_indptr_c,
+        out_kv_indptr,
+        token_to_seq_idxs_c,
+        topk_indices_c,
+        cu_seqlens_k_c,
+        block_table_c,
+        out,
+        dcp_rank,
+        dcp_world_size,
+        block_size,
+        NUM_TOPK_TOKENS,
+        BLOCK_N,
+        ti_stride0,
+        ti_stride1,
+        bt_stride0,
+        bt_stride1,
+    )
+    return out
