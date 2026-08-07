@@ -885,7 +885,6 @@ jobs:
       && needs.load-models.outputs.has_enabled_models == 'true'
     runs-on: ubuntu-latest
     outputs:
-      benchmark_matrix: ${{ steps.build.outputs.benchmark_matrix }}
       benchmark_matrix_mi355: ${{ steps.build.outputs.benchmark_matrix_mi355 }}
       benchmark_matrix_mi308: ${{ steps.build.outputs.benchmark_matrix_mi308 }}
       has_benchmark_cells: ${{ steps.build.outputs.has_benchmark_cells }}
@@ -962,7 +961,6 @@ jobs:
 
           gh_out = os.environ["GITHUB_OUTPUT"]
           with open(gh_out, "a", encoding="utf-8") as fh:
-              fh.write(f"benchmark_matrix={full}\n")
               fh.write(f"benchmark_matrix_mi355={j355}\n")
               fh.write(f"benchmark_matrix_mi308={j308}\n")
               fh.write("has_benchmark_cells=" + ("false" if not include else "true") + "\n")
@@ -972,7 +970,7 @@ jobs:
           if not include:
               print("No eligible benchmark cases remain after model-specific parameter filtering.", file=sys.stderr)
           else:
-              print(f"Benchmark matrix (full): {full}", file=sys.stderr)
+              print(f"Benchmark cells: {len(include)}", file=sys.stderr)
               print(f"MI355 shard cells: {len(mi355_rows)}, MI308 shard cells: {len(mi308_rows)}", file=sys.stderr)
           PY
 
@@ -1197,9 +1195,23 @@ jobs:
 
       - name: Generate SGLang benchmark summary table
         env:
-          BENCHMARK_MATRIX: ${{ needs.build-benchmark-matrix.outputs.benchmark_matrix }}
+          BENCHMARK_MATRIX_MI355: ${{ needs.build-benchmark-matrix.outputs.benchmark_matrix_mi355 }}
+          BENCHMARK_MATRIX_MI308: ${{ needs.build-benchmark-matrix.outputs.benchmark_matrix_mi308 }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
+          BENCHMARK_MATRIX="$(python3 - <<'PY'
+          import json
+          import os
+
+          include = []
+          for name in ("BENCHMARK_MATRIX_MI355", "BENCHMARK_MATRIX_MI308"):
+              raw = os.environ.get(name) or '{"include":[]}'
+              include.extend(json.loads(raw).get("include", []))
+
+          print(json.dumps({"include": include}, separators=(",", ":")))
+          PY
+          )"
+
           python3 .github/scripts/plugin_benchmark_summary.py \
             --result-dir . \
             --matrix-json "${BENCHMARK_MATRIX}" \
