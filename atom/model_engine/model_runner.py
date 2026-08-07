@@ -1976,13 +1976,16 @@ class ModelRunner:
             draft_regions = self.eagle3_draft_builder.get_kv_transfer_tensors()
             if draft_regions:
                 transfer_tensors.block_regions.extend(draft_regions)
-        # Pass the physical block count so the offload connector can byte-slice
-        # MLA's token-major latent cache (shape[0] is tokens, not blocks there).
+        # The transfer protocol addresses scheduler blocks, whose IDs index
+        # ``req.block_ids``.  MLA's cache is allocated in page-size-1 physical
+        # rows, so ``num_physical_kvcache_blocks`` is larger by block_ratio and
+        # must not be used here: doing so would make the codec treat one token
+        # as a complete scheduler block.
         set_kv_cache_data(
             kv_cache_data,
             config,
             transfer_tensors,
-            num_blocks=self.num_physical_kvcache_blocks,
+            num_blocks=num_kvcache_blocks,
         )
 
         # Cross-validate: compare estimated vs actual KV cache allocation.

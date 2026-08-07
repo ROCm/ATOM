@@ -921,12 +921,16 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 runner.aligned_index_dim,
             )
         module.kv_cache = kv_cache
+        index_cache = None
+        if runner.is_deepseek_v32 and hasattr(runner, "index_cache"):
+            index_cache = runner.index_cache[layer_id]
         return KVCacheTensor(
             layer_num=layer_id,
             k_cache=kv_cache,
             v_cache=None,
             k_scale=None,
             v_scale=None,
+            index_cache=index_cache,
         )
 
     def get_kv_transfer_tensors(self):
