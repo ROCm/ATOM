@@ -616,10 +616,14 @@ class SparseKVCoordinator:
         page = self.host_page_size
         allocated_len = self._req_gpu_alloc_len[req_slot]
         end_pos = start_pos + num_tokens
-        assert start_pos <= allocated_len, (
-            f"non-contiguous GPU alloc: start_pos={start_pos} > "
-            f"allocated_len={allocated_len} (req_slot={req_slot})"
-        )
+        if start_pos > allocated_len:
+            # Partially promoted request: the GPU tier ran out part-way through
+            # promote_to_gpu, so positions [allocated_len, start_pos) still live
+            # on host. This allocator only grows contiguously and fills
+            # req_to_gpu_pool from allocated_len, so backing start_pos here would
+            # route that host-resident gap to GPU rows nothing ever writes.
+            # Decline and let the caller fall back to host.
+            return 0
         page_end = ((end_pos + page - 1) // page) * page
         if page_end <= allocated_len:
             return num_tokens

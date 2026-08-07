@@ -795,6 +795,29 @@ def test_gpu_cold_enabled_allocates_pool():
     assert len(c._free_gpu_pages) == 4
 
 
+def test_gpu_alloc_declines_after_partial_promote():
+    """A request whose promote ran out of GPU pages keeps its tail on host. The
+    decode-growth path must then decline GPU and fall back, not try to append
+    past the gap — req_to_gpu_pool is filled from _req_gpu_alloc_len, so backing
+    the new position on GPU would route the host-resident gap at
+    [alloc_len, pos) to rows the promote never wrote."""
+    c = _make_gpu_cold(gpu_pages=2, page=16, max_ctx=256, max_num_seqs=2)
+    slot = c.acquire(req_id=1, context_len=64)
+
+    # Only the first 32 logical positions get GPU pages (pool holds 2 pages).
+    assert c.alloc_gpu_pages(slot, 0, 64) == 32
+    assert c._req_gpu_alloc_len[slot] == 32
+
+    # Position 63 sits past the promoted prefix: decline rather than assert.
+    assert c.alloc_gpu_pages(slot, 63, 1) == 0
+    # And the gap must not have been mapped into the GPU tier.
+    assert int(c.req_to_gpu_pool[slot, 40].item()) == -1
+
+    # grow_cold_for_new_token therefore lands it on host instead.
+    c.grow_cold_for_new_token(slot, 63)
+    assert int(c.req_to_host_pool[slot, 63].item()) >= 0
+
+
 def test_gpu_page_bytes_matches_pool_footprint():
     """The auto-sizer divides free HBM by this, so it must equal what a page
     actually costs across all layers or the tier over- or under-shoots."""
