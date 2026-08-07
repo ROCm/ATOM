@@ -1390,7 +1390,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # here: the pool hands out positions from the top down so that growing
         # it never relocates one, which puts group `g` at
         # `base + (num_slots - 1 - g) * unit` rather than `base + g * unit`.
-        slot_start, _ = geo.slot_span(num_slots - 1) if num_slots else (0, 0)
+        # `slot_span` takes a plane position, so the group has to be crossed
+        # over first -- capacity can exceed the live slot count, and then the
+        # two differ and the base lands inside the block region.
+        slot_start, _ = (
+            geo.slot_span(geo.physical_slot(num_slots - 1)) if num_slots else (0, 0)
+        )
         for plane, row_bytes in planes:
             unit = geo.slot_bytes(row_bytes)
             swa_block_regions.append(
@@ -1976,7 +1981,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         if len(group_np) < scheduled_bs:
             group_np = np.zeros(scheduled_bs, dtype=np.int32)
         state_slot_np = self._physical_slots(group_np)
-        ss_buf = var["v4_meta_state_slot_groups"]
+        ss_buf = var["v4_meta_state_slot_out"]
         ss_buf.np[:scheduled_bs] = state_slot_np
         si_buf = var["v4_meta_state_slot_in"]
         si_buf.np[:scheduled_bs] = self._state_slot_in_np(
@@ -2152,11 +2157,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             ub_state_np = state_slot_np[req_start : req_start + ub_real_reqs]
             if len(ub_state_np) < ub_real_reqs:
                 ub_state_np = np.zeros(ub_real_reqs, dtype=np.int32)
-            var[f"{p}v4_meta_state_slot_groups"].np[:ub_real_reqs] = ub_state_np
-            var[f"{p}v4_meta_state_slot_groups"].np[ub_real_reqs:padded_bs] = 0
-            state_slot_np_ub = (
-                var[f"{p}v4_meta_state_slot_groups"].np[:padded_bs].copy()
-            )
+            var[f"{p}v4_meta_state_slot_out"].np[:ub_real_reqs] = ub_state_np
+            var[f"{p}v4_meta_state_slot_out"].np[ub_real_reqs:padded_bs] = 0
+            state_slot_np_ub = var[f"{p}v4_meta_state_slot_out"].np[:padded_bs].copy()
             ub_state_in_np = state_slot_in_np[req_start : req_start + ub_real_reqs]
             if len(ub_state_in_np) < ub_real_reqs:
                 ub_state_in_np = np.zeros(ub_real_reqs, dtype=np.int32)
@@ -2189,7 +2192,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             cu_seqlens_q_gpu = var[f"{p}cu_seqlens_q"].copy_to_gpu(padded_bs + 1)
             context_lens_gpu = var[f"{p}context_lens"].copy_to_gpu(padded_bs)
             block_tables_gpu = var[f"{p}block_tables"].copy_to_gpu(padded_bs)
-            state_slot_gpu = var[f"{p}v4_meta_state_slot_groups"].copy_to_gpu(padded_bs)
+            state_slot_gpu = var[f"{p}v4_meta_state_slot_out"].copy_to_gpu(padded_bs)
 
             # ---- compress plans (per ubatch buffer set) ----
             extend_lens_np = np.full(ub_real_reqs, max_seqlen_q, dtype=np.int32)
@@ -3140,7 +3143,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             # contamination, wrong output without a crash. block_tables_np_full
             # above (HCA) already uses the prefixed buffer; this must match.
             # Off the ubatch path the prefix is "" and this is the global one.
-            state_slot_per_seq=var[f"{buf_prefix_ubatch}v4_meta_state_slot_groups"].gpu[
+            state_slot_per_seq=var[f"{buf_prefix_ubatch}v4_meta_state_slot_out"].gpu[
                 :scheduled_bs
             ],
             batch_id_per_token=batch_id_per_token_gpu,
@@ -3532,7 +3535,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         if len(groups_np) < scheduled_bs:
             groups_np = np.zeros(scheduled_bs, dtype=np.int32)
         slots_np = self._physical_slots(groups_np)
-        gpu = self._stage("v4_meta_state_slot_groups", slots_np)
+        gpu = self._stage("v4_meta_state_slot_out", slots_np)
         if return_cpu:
             return gpu, slots_np
         return gpu
@@ -3630,8 +3633,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         positions_np = (np.arange(total_tokens, dtype=np.int64) % max_q_len) + start_pos
         cu_seqlens_q_np = np.arange(0, bs + 1, dtype=np.int32) * max_q_len
         context_lens_np = np.full(bs, start_pos + max_q_len, dtype=np.int32)
-        # Slot mapping: use real per-req cache slots [0..bs-1].
-        state_slot_np = np.arange(bs, dtype=np.int32)
+        # Slot mapping: pool groups [0..bs-1] crossed to the plane positions
+        # every kernel addresses by, the same crossing `prepare_decode` makes.
+        # Raw group ids here are not a harmless placeholder: capture runs a
+        # real eager warmup forward first, so group `g` would resolve to plane
+        # rows inside the compressed-block region and the warmup would write
+        # compressor state and window KV over live blocks.
+        state_slot_np = self._physical_slots(np.arange(bs, dtype=np.int32))
         # Block tables: block 0 for every seq (placeholder; capture warmup
         # fills it via real reads but the data is throwaway).
         block_tables_np = np.zeros(
@@ -3647,7 +3655,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         context_lens_gpu = var["context_lens"].copy_to_gpu(bs)
         var["block_tables"].np[:bs] = block_tables_np
         block_tables_gpu = var["block_tables"].copy_to_gpu(bs)
-        state_slot_gpu = self._stage("v4_meta_state_slot_groups", state_slot_np)
+        state_slot_gpu = self._stage("v4_meta_state_slot_out", state_slot_np)
         # Read side captured from its own persistent buffer: replay-time
         # prepare_decode refills it, so a fork can change the values without
         # invalidating the graph.
@@ -3724,6 +3732,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 max_seqlen_q=max_q_len,
                 context_lens_np=context_lens_np,
                 state_slot_np=state_slot_np,
+                # Capture has no forks, so the read side is the write side.
+                state_slot_in_np=state_slot_np,
                 positions_np=positions_np.astype(np.int32),
             )
 
@@ -3770,11 +3780,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         bufs["kv_indptr"] = CpuGpuBuffer(bs + 1, **i32)
 
         # _attach_v4_per_fwd_meta + _populate_state_slot_mappings.
-        # state_slot is staged ONCE into v4_meta_state_slot_groups (set by
+        # state_slot is staged ONCE into v4_meta_state_slot_out (set by
         # `_populate_state_slot_mappings`); attn_metadata.state_slot_out
         # exposes that GPU view to all downstream consumers (no second
         # H2D-staged copy).
-        bufs["v4_meta_state_slot_groups"] = CpuGpuBuffer(bs, **i32)
+        bufs["v4_meta_state_slot_out"] = CpuGpuBuffer(bs, **i32)
         # Read side of the compressor ring (`_populate_state_slot_in`). Its own
         # buffer on every path, forked or not, so the captured decode graph sees
         # a stable address.
@@ -3956,7 +3966,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             bufs[f"{p}cu_seqlens_q"] = CpuGpuBuffer(bs + 1, **i32)
 
             # V4 decode metadata buffers.
-            bufs[f"{p}v4_meta_state_slot_groups"] = CpuGpuBuffer(bs, **i32)
+            bufs[f"{p}v4_meta_state_slot_out"] = CpuGpuBuffer(bs, **i32)
             bufs[f"{p}v4_meta_state_slot_in"] = CpuGpuBuffer(bs, **i32)
             bufs[f"{p}v4_kv_indices_swa"] = CpuGpuBuffer(T_dec * win, **i32)
             bufs[f"{p}v4_kv_indices_csa"] = CpuGpuBuffer(
