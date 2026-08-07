@@ -51,6 +51,7 @@ on:
           - GLM-5.2 FP8 TP4
           - GLM-5.2 FP8 TP4 PCP2
           - GLM-5.2 FP4 TP4
+          - Kimi-K3 TP8
           - MiniMax-M3-MXFP8 EAGLE3 TP4 MTP3
       model_mi308:
         description: "Manual MI308 benchmark model selection"
