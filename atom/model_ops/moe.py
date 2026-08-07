@@ -6,6 +6,7 @@ from abc import abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
+from functools import lru_cache
 
 import torch
 from aiter import ActivationType, QuantType, dtypes, get_hip_quant, topk_gating
@@ -105,6 +106,71 @@ class FusedMoeWeightScaleSupported(Enum):
     BLOCK = "block"
 
 
+# Saturating magnitude for the synthetic logits. The picked/unpicked gap after
+# sigmoid (or softmax / sqrtsoftplus) then swamps a router correction bias, which
+# is added to the score before top-k. sigmoid caps that gap at 1.0, so a bias
+# spread wider than 1.0 can still reorder the selection.
+_FAKE_EPLB_LOGIT = 10.0
+
+
+@lru_cache(maxsize=1)
+def init_balance_router_logits(
+    n_routed_experts: int,
+    topk: int,
+    ep_size: int = 1,
+    dp_size: int = 1,
+    dp_rank: int = 0,
+    n_group: int = 1,
+    topk_group: int = 1,
+    dtype: torch.dtype = torch.bfloat16,
+    max_num_tokens: int = 32768,
+):
+    # Synthetic router logits whose top-k is balanced across both experts and EP
+    # ranks. ATOM shards experts contiguously (rank r owns [r*L, (r+1)*L), with
+    # L = E // ep_size), so we walk one flat ring: position p = t * topk + j takes
+    # rank p % ep_size and slot (p // ep_size) % L. Consecutive positions step the
+    # rank by one, so a token's experts land on distinct ranks and rank load stays
+    # even at any batch size -- down to single-token decode, unlike a per-row
+    # rotation.
+    #
+    # t = dp_rank + i * dp_size rather than plain i: the table is substituted per
+    # device before the MoE gather, so the axis to interleave on is the token-shard
+    # axis, which is DP. TP ranks inside a DP group see the same tokens and must
+    # share one table; pure TP-attn + EP collapses to dp_size == 1.
+    device = "cuda"
+    E = n_routed_experts
+    L = max(1, E // ep_size)  # experts per rank; a remainder is left unused
+    t = dp_rank + torch.arange(max_num_tokens, device=device) * dp_size  # (T,)
+
+    if n_group > 1 and 0 < topk_group < n_group and topk % topk_group == 0:
+        # Group-limited routing (DeepSeek): every group but topk_group of n_group
+        # is masked out before top-k, so a ring laid across all groups loses the
+        # choices that fall in the masked ones. Run it inside a rotating set of
+        # groups instead, and inside each group across the EP ranks that group
+        # spans. A token can only reach topk_group groups by construction, so rank
+        # load evens out over ceil(n_group / topk_group) tokens, not at T == 1.
+        gs = E // n_group  # experts per group
+        rg = max(1, gs // L)  # EP ranks spanned by one group
+        sub = gs // rg  # experts per (group, rank) pair
+        c = topk // topk_group  # choices placed in each selected group
+        m = torch.arange(topk_group, device=device).view(1, -1, 1)
+        k = torch.arange(c, device=device).view(1, 1, -1)
+        q = t.view(-1, 1, 1) * topk_group + m  # position on the group ring
+        p = (q // n_group) * c + k  # visits to that group so far
+        slot = (p % rg) * sub + (p // rg) % sub
+        expert_ids = ((q % n_group) * gs + slot).reshape(max_num_tokens, topk)
+    else:
+        j = torch.arange(topk, device=device).unsqueeze(0)
+        p = t.unsqueeze(1) * topk + j
+        expert_ids = (p % ep_size) * L + (p // ep_size) % L  # (T, topk)
+
+    router_logits = torch.full(
+        (max_num_tokens, E), -_FAKE_EPLB_LOGIT, dtype=dtype, device=device
+    )
+    router_logits.scatter_(1, expert_ids, _FAKE_EPLB_LOGIT)
+    return router_logits
+
+
 @dataclass
 class FusedMoEParallelConfig:
     tp_size: int
@@ -117,10 +183,23 @@ class FusedMoEParallelConfig:
     use_ep: bool  # whether to use EP or not
     local_ep_size: int
 
+    # Config.dp_logical_size / dp_size: >1 when DP-attention simulates a
+    # deployment wider than the box, in which case experts shard that many
+    # times finer and each rank repeats the gathered tokens that many times.
+    dp_logical_ratio: int = 1
+
     @property
     def use_all2all_kernels(self):
-        # Only use mori all2all kernels when expert parallel is enabled
-        return self.dp_size > 1 and self.use_ep and _has_module("mori")
+        # Only use mori all2all kernels when expert parallel is enabled.
+        # Never while simulating: mori is real peer-to-peer, so absent ranks
+        # cannot be stood in for, and it derives a token's destination from
+        # num_experts // real peer count -- which disagrees with a finer map.
+        return (
+            self.dp_size > 1
+            and self.use_ep
+            and self.dp_logical_ratio == 1
+            and _has_module("mori")
+        )
 
     @property
     def use_mori_kernels(self):
@@ -130,11 +209,16 @@ class FusedMoEParallelConfig:
     def make(
         tp_size_: int, dp_size_: int, parallel_config: Config
     ) -> "FusedMoEParallelConfig":
+        # Width the expert sharding is cut for; wider than the real DP size only
+        # while simulating. The rank stays real, so this device keeps the slice
+        # it would own in the full deployment.
+        dp_logical = getattr(parallel_config, "dp_logical_size", 0) or dp_size_
+
         def flatten_tp_across_dp(dp_rank: int):
             tp_rank = 0 if tp_size_ == 1 else get_tp_group().rank_in_group
-            # There are actually dp_size_ * tp_size_ devices. Update tp_size
+            # There are actually dp_logical * tp_size_ devices. Update tp_size
             # and tp_rank so we shard across all devices.
-            tp_size = dp_size_ * tp_size_
+            tp_size = dp_logical * tp_size_
             tp_rank = dp_rank * tp_size_ + tp_rank
             return tp_size, tp_rank
 
@@ -148,7 +232,10 @@ class FusedMoEParallelConfig:
             enable_dp_attention or parallel_config.moe_ep_flatten_tp_across_dp
         )
 
-        use_ep = dp_size_ * tp_size_ > 1 and parallel_config.enable_expert_parallel
+        # dp_logical, not dp_size_: with DP-attention simulated down to a single
+        # rank the real product is 1, but the deployment being reproduced still
+        # shards experts, so EP must stay on.
+        use_ep = dp_logical * tp_size_ > 1 and parallel_config.enable_expert_parallel
 
         dp_size = dp_size_
         dp_rank = get_dp_group().rank_in_group if dp_size > 1 else 0
@@ -210,6 +297,10 @@ class FusedMoEParallelConfig:
             ep_size=ep_size,
             ep_rank=ep_rank,
             use_ep=True,
+            # CoreManager guarantees the division is exact.
+            dp_logical_ratio=(
+                dp_logical // dp_size if flatten_tp_across_dp_for_moe else 1
+            ),
             local_ep_size=atom_config.parallel_config.data_parallel_size_local
             * tp_size_,
         )
@@ -300,6 +391,21 @@ def all_gather_with_padding(
         padded_x, use_custom=use_cag, dim=0
     )
     return gathered_hidden_states, original_batch_size
+
+
+def repeat_rows(x: torch.Tensor, times: int) -> torch.Tensor:
+    """Repeat `x` along dim 0 so it holds `times` copies of what was gathered.
+
+    Stands in for the token shards of the DP ranks a simulated run did not
+    launch, giving the expert GEMMs the full deployment's token volume. Under
+    `--fake-eplb` the gathered rows cover a whole number of turns of the
+    balanced expert ring, so copying them keeps every expert's count equal.
+
+    The caller drops the copies before the reduce scatter.
+    """
+    if times <= 1:
+        return x
+    return x.repeat(times, *([1] * (x.dim() - 1)))
 
 
 def reduce_scatter_with_unpadding(
@@ -2651,6 +2757,25 @@ class FusedMoE(torch.nn.Module):
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
         self.layer_name = prefix
+        # Interleave the synthetic logits across the token-shard (DP) axis only
+        # when DP-attention actually shards tokens per DP group; otherwise every
+        # device sees the same tokens and must share one table (dp_size=1).
+        _dp_shard = self.use_ep and atom_config.enable_dp_attention
+        self.balance_router_logits = (
+            init_balance_router_logits(
+                self.global_num_experts,
+                top_k,
+                self.ep_size if self.use_ep else 1,
+                self.dp_size if _dp_shard else 1,
+                self.dp_rank if _dp_shard else 0,
+                (self.num_expert_group or 1) if self.use_grouped_topk else 1,
+                (self.topk_group or 1) if self.use_grouped_topk else 1,
+                torch.get_default_dtype(),
+                atom_config.max_num_batched_tokens,
+            )
+            if atom_config.fake_eplb
+            else None
+        )
 
     def process_weights_after_loading(self):
         self._online_quant()
@@ -3680,6 +3805,8 @@ class FusedMoE(torch.nn.Module):
         return topk_weights, topk_ids
 
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+        if self.balance_router_logits is not None:
+            router_logits = self.balance_router_logits[: hidden_states.shape[0]]
         return torch.ops.aiter.moe_forward(
             hidden_states, router_logits, self.layer_name
         )
@@ -3724,6 +3851,14 @@ class FusedMoE(torch.nn.Module):
                 hidden_states, router_logits, dp_eager_mode, ctx, dp_group
             )
 
+            # Stand in for the DP ranks a simulated run did not launch. Same row
+            # order for both, so a copied token keeps its own routing.
+            dp_repeat = self.moe_parallel_config.dp_logical_ratio
+            gathered_rows = hidden_states.shape[0]
+            if dp_repeat > 1:
+                hidden_states = repeat_rows(hidden_states, dp_repeat)
+                router_logits = repeat_rows(router_logits, dp_repeat)
+
             if _tbo:
                 tbo_switch_to_compute_sync()
 
@@ -3750,6 +3885,9 @@ class FusedMoE(torch.nn.Module):
 
         # Use reduce_scatter when DP > 1 but not using mori all2all kernels
         if use_dp_gather_scatter:
+            # `sizes` and the scatter below are sized for the real ranks.
+            if dp_repeat > 1:
+                final_hidden_states = final_hidden_states[:gathered_rows]
             if _tbo:
                 tbo_yield_and_switch_from_compute_to_comm()
             if dp_eager_mode:
@@ -3786,6 +3924,15 @@ class FusedMoE(torch.nn.Module):
             hidden_states = naive_multicast(hidden_states, cu_tokens_across_dp_cpu)
             router_logits = naive_multicast(router_logits, cu_tokens_across_dp_cpu)
 
+        # Simulated DP with no peers to gather from: the absent ranks' token
+        # shards are stood in for locally, same as after the gather in
+        # forward_impl_graph. Dropped again below.
+        dp_repeat = self.moe_parallel_config.dp_logical_ratio
+        local_rows = hidden_states.shape[0]
+        if dp_repeat > 1:
+            hidden_states = repeat_rows(hidden_states, dp_repeat)
+            router_logits = repeat_rows(router_logits, dp_repeat)
+
         # Matrix multiply.
         final_hidden_states = self.quant_method.apply(
             layer=self,
@@ -3806,6 +3953,9 @@ class FusedMoE(torch.nn.Module):
             apply_router_weight_on_input=self.apply_router_weight_on_input,
             prefix=f"{self.prefix}.fused_moe",
         )
+
+        if dp_repeat > 1:
+            final_hidden_states = final_hidden_states[:local_rows]
 
         dp_group = get_dp_group()
         if dp_group.world_size > 1:

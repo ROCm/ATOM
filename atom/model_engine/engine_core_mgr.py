@@ -34,6 +34,44 @@ DP_LB_STRATEGIES = ("round_robin", "least_requests", "least_tokens")
 DP_LB_DEFAULT = "least_requests"
 
 
+def _resolve_dp_engine_count(config: Config, logical: int) -> int:
+    """How many DP-attention EngineCores to launch for a `logical`-wide run.
+
+    Normally `logical`, one per device. Under `--fake-eplb` on a box with fewer
+    visible devices, launch only that many and record the width to keep sharding
+    experts for, so each device owns the slice it would own in the full
+    deployment; `FusedMoE` repeats the gathered tokens by the same ratio to
+    match its token volume too.
+
+    Gated on fake_eplb like `Config.tp_world_size`, and for the same reason.
+    """
+    import torch
+
+    if not config.fake_eplb:
+        return logical
+    visible = torch.cuda.device_count()
+    if not 0 < visible < logical:
+        return logical
+    if logical % visible:
+        raise ValueError(
+            f"Simulated DP-attention: {logical} ranks do not divide evenly over "
+            f"{visible} visible device(s). Make the visible device count a "
+            f"divisor of tp x dp, e.g. via HIP_VISIBLE_DEVICES."
+        )
+    config.dp_logical_size = logical
+    logger.warning(
+        "Simulated DP-attention: running %d of a %d-rank deployment. Experts "
+        "shard %d ways and each rank repeats the gathered tokens %dx, so "
+        "per-device MoE shapes match -- but collectives only cover the ranks "
+        "that exist, so THE MODEL OUTPUT IS MEANINGLESS. Benchmarking only.",
+        visible,
+        logical,
+        logical,
+        logical // visible,
+    )
+    return visible
+
+
 class CoreManager:
     def _init_shared_state(
         self, config: Config, *, label: str, local_engine_count: int
@@ -103,9 +141,10 @@ class CoreManager:
         self.pp_size = pp_size
         if config.enable_dp_attention:
             assert pp_size == 1, "Pipeline parallel + DP-attention is not supported yet"
-            local_engine_count = (
+            logical = (
                 config.tensor_parallel_size * config.parallel_config.data_parallel_size
             )
+            local_engine_count = _resolve_dp_engine_count(config, logical)
             logger.info(
                 f"Enable dp attention, using {local_engine_count} data parallel ranks"
             )
@@ -861,8 +900,10 @@ def launch_engine_core(config: Config, dp_rank: int = 0):
     config.parallel_config.data_parallel_rank = dp_rank
     config.parallel_config.data_parallel_rank_local = dp_rank
 
+    # tp_world_size: the GPUs this DP rank really occupies.
     logger.info(
-        f"Creating EngineCore process: DP rank {dp_rank}, will use GPUs {dp_rank * config.tensor_parallel_size} to {(dp_rank + 1) * config.tensor_parallel_size - 1}"
+        f"Creating EngineCore process: DP rank {dp_rank}, will use GPUs "
+        f"{dp_rank * config.tp_world_size} to {(dp_rank + 1) * config.tp_world_size - 1}"
     )
 
     process = multiprocessing.Process(
