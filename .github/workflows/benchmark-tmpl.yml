@@ -200,7 +200,7 @@ jobs:
           echo "Docker: ${DOCKER_IMAGE}"
 
       - name: Run benchmark
-        timeout-minutes: 80
+        timeout-minutes: 240
         env:
           EXTRA_LAUNCH_ARGS: ${{ inputs.extra_args }}
         run: |
