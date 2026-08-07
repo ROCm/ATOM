@@ -73,6 +73,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FUSED_COMPRESS_USE_FLYDSL": lambda: os.getenv(
         "ATOM_FUSED_COMPRESS_USE_FLYDSL", "auto"
     ).lower(),
+    # Kimi-K3 apply_attn_res: serve the residual-candidate gate from aiter
+    # (aiter.ops.triton.fusions.attn_res.attn_res_gate) instead of the in-tree
+    # Triton kernels. Identical contract, and aiter reads the packed block once
+    # into registers where the in-tree path is two-pass. Not bitwise equal: aiter
+    # reduces each H row in one shot where the in-tree kernel tiles H (and splits
+    # it across workgroups at small T), so the fp32 sums land differently -- the
+    # gap stays under one ULP of the bf16 output. It also autotunes on the first
+    # call, so warm it before CUDAGraph capture. Read once at import time (see
+    # attention_residual.py).
+    "ATOM_USE_AITER_ATTN_RES": lambda: (
+        os.getenv("ATOM_USE_AITER_ATTN_RES", "0") == "1"
+    ),
     # QK-norm-rope-cache-quant fusion for Qwen3 dense and MoE; disabled by default.
     "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION", "0") == "1"

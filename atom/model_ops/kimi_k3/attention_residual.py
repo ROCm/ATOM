@@ -5,9 +5,14 @@
 
 from __future__ import annotations
 
+import logging
+
 import torch
 
+from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
+
+logger = logging.getLogger("atom")
 
 try:
     import triton
@@ -16,6 +21,23 @@ try:
     _HAS_TRITON = True
 except ImportError:  # pragma: no cover
     _HAS_TRITON = False
+
+# Serving the gate from aiter is opt-in. The env is read once here rather than
+# per call: apply_attn_res runs once per sub-layer, so at decode sizes the
+# Python dispatch cost is already comparable to the kernel itself. Flipping
+# ATOM_USE_AITER_ATTN_RES after import therefore has no effect (as in linear.py).
+if envs.ATOM_USE_AITER_ATTN_RES:
+    try:
+        from aiter.ops.triton.fusions.attn_res import attn_res_gate
+    except ImportError as e:  # pragma: no cover
+        logger.warning(
+            "ATOM_USE_AITER_ATTN_RES=1 but aiter attn_res is unavailable (%s); "
+            "falling back to the in-tree Triton kernels",
+            e,
+        )
+        attn_res_gate = None
+else:
+    attn_res_gate = None
 
 
 if _HAS_TRITON:
@@ -318,7 +340,14 @@ def _apply_attn_res_impl(
     so downstream layers reuse it.
 
     Dispatches by token count (see ``_ATTN_RES_CONFIGS``): split-H at small T to
-    fill the GPU, the single-pass pipelined kernel once T saturates it."""
+    fill the GPU, the single-pass pipelined kernel once T saturates it, or to
+    aiter when ATOM_USE_AITER_ATTN_RES is set."""
+    if attn_res_gate is not None:
+        # Identical contract: candidates are the B packed rows plus prefix, the
+        # add is folded, and (y, prefix_out) comes back with prefix_out aliasing
+        # the input when add_hidden is None.
+        return attn_res_gate(prefix_sum, block_residual, score_weight, eps, add_hidden)
+
     T, B, H = block_residual.shape
     Bp = B + 1
     do_add = add_hidden is not None
