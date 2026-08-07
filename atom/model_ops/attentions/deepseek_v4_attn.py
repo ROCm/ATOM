@@ -1773,9 +1773,21 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             and _drafter.uses_confidence_schedule
         )
         if ragged_lens is not None or _dspark_ragged_graph:
-            attn_metadata.dspark_ragged_lens_gpu = torch.as_tensor(
-                extend_lens_np, device=positions.device
-            )
+            # Pinned staging, NOT `torch.as_tensor(np_array, device=cuda)`. That
+            # is a PAGEABLE H2D: PyTorch issues cudaMemcpyAsync and then
+            # SYNCHRONIZES the stream, so the host blocks until everything
+            # already queued has drained. This runs in the metadata build at the
+            # top of a step, when the queue is full from the step before --
+            # measured on this box with a step's work queued, 53998 us of host
+            # block vs 181 us pinned. A 300x cliff on 64 bytes.
+            #
+            # This branch is gated on ragged (directly, or via
+            # `_dspark_ragged_graph`), so it was the whole of the ragged-only
+            # decode bubble: `confidence_schedule` alone never reaches it.
+            _n = extend_lens_np.size
+            _buf = var["ragged_extend"]
+            _buf.np[:_n] = extend_lens_np
+            attn_metadata.dspark_ragged_lens_gpu = _buf.copy_to_gpu(_n)
             attn_metadata.dspark_full_q = int(full_q)
 
         padded_bs = int(bs)

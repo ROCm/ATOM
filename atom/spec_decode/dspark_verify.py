@@ -6,6 +6,11 @@ import torch
 
 logger = logging.getLogger("atom")
 
+# Max in-flight async ell copies to keep queued. The CPU runs at most a step or
+# two ahead of the GPU, so anything older is already superseded by the entries
+# behind it; the cap just bounds the queue if the GPU falls far behind.
+_MAX_ELL_INFLIGHT = 4
+
 
 class VerifyScheduler:
     """Hardware-Aware Prefix Scheduler for confidence-scheduled block drafting.
@@ -25,7 +30,25 @@ class VerifyScheduler:
     monotone SPS stub keeps the path lossless.
 
     Kept sync-free on the decode hot path: ``record_ell`` fires an ASYNC D2H of
-    ell to a pinned buffer and the {req_id: ell} map is materialized lazily.
+    ell and the {req_id: ell} map is adopted only once that copy has ALREADY
+    completed -- the ell handoff is NEVER waited on.
+
+    Why never waited on: ``record_ell`` runs at the end of a step, after the
+    whole step (target forward + block draft) is queued on the default stream,
+    and the copy stream waits on it -- so the copy completes only when the step
+    drains. The map is read at the TOP of the next step
+    (``ModelRunner.prepare_model`` -> ``_dspark_apply_q_bucket``). Blocking there
+    would pin the host to the GPU's tail every step, collapsing the run-ahead the
+    rest of this loop is built on (``recv_async_output`` and friends all consume
+    a copy fired a step earlier, never the current one) and leaving the GPU idle
+    for the whole of the next step's host-side prep. Measured as a large
+    dspark -> next-decode bubble under ``confidence_schedule``.
+
+    Consuming a step-or-two-stale ell instead is lossless: ell is only the
+    PREDICTED accept count used to SIZE the next verify, a missing entry already
+    falls back to full length (never under-verify), the hard anchor lower bound
+    comes from the current step's ``num_bonus``, and any draft suffix dropped by
+    a short ell is simply re-drafted next step.
     """
 
     def __init__(self, runner):
@@ -34,11 +57,17 @@ class VerifyScheduler:
         self.sps_table: Optional[torch.Tensor] = None
         self.sts_temperatures: Optional[torch.Tensor] = None
         self._last_ell: Optional[torch.Tensor] = None
-        # req_id -> ell map from the PREVIOUS step's propose(), re-mapped onto the
-        # next step's (possibly reordered) batch by req_id. Resolved lazily from
-        # the async D2H fired by record_ell (event complete by next read).
-        self._ell_map_cache: dict = {}
-        self._ell_pending: Optional[tuple] = None  # (event, cpu_buf, req_ids)
+        # FIFO of in-flight async D2H copies of ell, one entry per step:
+        # (event, cpu_buf, req_ids). Drained non-blockingly by _drain_ell.
+        self._ell_pending: list = []
+        # Freshest RESOLVED {req_id: ell}, re-mapped onto each step's (possibly
+        # reordered) batch by req_id. Lags the GPU by a step or two whenever the
+        # CPU is running ahead -- see the class docstring.
+        self._ell_map: dict = {}
+        # Pinned landing ring for the D2H, [_MAX_ELL_INFLIGHT, max_num_seqs].
+        # Allocated on first use (the runner's config is complete by then).
+        self._ell_stage_ring: Optional[torch.Tensor] = None
+        self._ell_stage_idx = 0
 
     def compute_ell(self, confidence: torch.Tensor) -> torch.Tensor:
         """Run the Hardware-Aware Prefix Scheduler (paper Algorithm 1) and return
@@ -82,81 +111,119 @@ class VerifyScheduler:
         """Stash the ell computed by this step's propose() (or None)."""
         self._last_ell = ell
 
+    def _ell_stage(self, n: int) -> torch.Tensor:
+        """Next pinned CPU slot to land an async ell D2H in, as an ``[n]`` view.
+
+        Pinned matters here: a D2H into freshly allocated PAGEABLE memory is not
+        reliably asynchronous, and this copy is issued behind
+        ``wait_stream(default_stream)`` -- i.e. behind the whole step -- so a
+        blocking one would stall the host on the GPU's tail, exactly what this
+        class exists to avoid.
+
+        Rotating over ``_MAX_ELL_INFLIGHT`` slots in lockstep with the pending
+        queue means a slot is only rewritten once its entry has been consumed or
+        dropped, so no in-flight copy is ever overwritten.
+
+        NOTE: ``device="cpu"`` is not optional. This ring is first allocated on
+        the warmup forward, which ModelRunner.__init__ runs while the default
+        device is still the GPU (it is only reset to "cpu" AFTER
+        ``_maybe_warmup()`` returns), so an unqualified
+        ``torch.zeros(..., pin_memory=True)`` allocates on the GPU and dies with
+        "Only dense CPU tensors can be pinned". Other pin_memory sites in the
+        engine get away with it only because they are unreachable from warmup.
+        CpuGpuBuffer pins the same, explicitly-CPU way.
+        """
+        ring = self._ell_stage_ring
+        width = ring.shape[1] if ring is not None else self.runner.config.max_num_seqs
+        if n > width:
+            # Should be unreachable (ell is [decode_bs] <= max_num_seqs); fall
+            # back to a one-off pinned buffer rather than corrupt the ring.
+            return torch.zeros(n, dtype=torch.int64, device="cpu", pin_memory=True)
+        if ring is None:
+            ring = torch.zeros(
+                _MAX_ELL_INFLIGHT,
+                width,
+                dtype=torch.int64,
+                device="cpu",
+                pin_memory=True,
+            )
+            self._ell_stage_ring = ring
+        slot = ring[self._ell_stage_idx]
+        self._ell_stage_idx = (self._ell_stage_idx + 1) % _MAX_ELL_INFLIGHT
+        return slot[:n]
+
     def record_ell(self, req_ids: Sequence) -> None:
         """Fire an ASYNC copy of this step's ell, keyed later by req_id.
 
         ell was computed in propose() ordered by THIS step's decode batch. We
-        save {req_id: ell} so the NEXT step can re-map it onto its own (possibly
+        save {req_id: ell} so a LATER step can re-map it onto its own (possibly
         reordered) batch by req_id — batch position is not stable across steps
         under continuous batching.
+
+        The copy is queued, never awaited; ``_drain_ell`` adopts it on whichever
+        later step finds it already complete.
         """
         ell = self._last_ell
         if ell is None:
-            self._ell_pending = None
-            self._ell_map_cache = {}
+            self._ell_pending.clear()
+            self._ell_map = {}
             return
-        ell = ell.detach()
+        ell = ell.detach().reshape(-1)
         # Reuse the runner's shared async D2H stream
         copy_stream = self.runner.tokenID_processor.async_copy_stream
         default_stream = torch.cuda.current_stream()
         event = torch.cuda.Event()
+        cpu_buf = self._ell_stage(ell.numel())
         with torch.cuda.stream(copy_stream):
             copy_stream.wait_stream(default_stream)
-            cpu_buf = ell.to("cpu", non_blocking=True)
+            cpu_buf.copy_(ell, non_blocking=True)
             event.record(copy_stream)
         # Keep req_ids as a plain list snapshot (CPU-only, order-safe).
-        self._ell_pending = (event, cpu_buf, list(req_ids))
-        # Invalidate last step's resolved map; recomputed lazily on first read.
-        self._ell_map_cache = None
+        self._ell_pending.append((event, cpu_buf, list(req_ids)))
+        if len(self._ell_pending) > _MAX_ELL_INFLIGHT:
+            del self._ell_pending[: -_MAX_ELL_INFLIGHT]
+
+    def _drain_ell(self) -> None:
+        """Adopt the freshest COMPLETED async ell copy. NEVER blocks.
+
+        All copies are issued on one stream, so they complete in order: popping
+        while the head's event is done leaves the newest finished entry in
+        ``newest`` and keeps the still-in-flight ones queued for a later step.
+        No completed copy -> keep the map we already have.
+        """
+        pending = self._ell_pending
+        newest = None
+        while pending and pending[0][0].query():
+            newest = pending.pop(0)
+        if newest is None:
+            return
+        _event, cpu_buf, req_ids = newest
+        ell_np = cpu_buf.numpy().astype(np.int32)
+        n = min(len(req_ids), ell_np.shape[0])
+        self._ell_map = {req_ids[i]: int(ell_np[i]) for i in range(n)}
 
     @property
     def ell_by_req(self) -> dict:
-        """Lazily materialize {req_id: ell} from the async D2H fired by
-        record_ell. Syncs the (already-complete) event on first read, then
-        caches so repeated reads within a step are free."""
-        cache = self._ell_map_cache
-        if cache is not None:
-            return cache
-        pending = self._ell_pending
-        if pending is None:
-            self._ell_map_cache = {}
-            return self._ell_map_cache
-        event, cpu_buf, req_ids = pending
-        event.synchronize()  # long done by next step; no hot-path stall
-        ell_np = cpu_buf.numpy().astype(np.int32)
-        n = min(len(req_ids), ell_np.shape[0])
-        self._ell_map_cache = {req_ids[i]: int(ell_np[i]) for i in range(n)}
-        return self._ell_map_cache
+        """{req_id: ell} for sizing this step's verify. Never syncs — see the
+        class docstring for why a stale ell is the correct trade here."""
+        self._drain_ell()
+        return self._ell_map
 
     @ell_by_req.setter
     def ell_by_req(self, value: dict) -> None:
-        # Direct assignment (e.g. reset to {}) bypasses the pending copy.
-        self._ell_map_cache = value
-        self._ell_pending = None
+        # Direct assignment (e.g. reset to {}) drops the in-flight copies too.
+        self._ell_map = value
+        self._ell_pending.clear()
 
     def ell_nonblocking(self) -> dict:
-        """Non-blocking read of the ell map for the SAME-step postprocess path
-        (carried back to the scheduler as fwd_output.dspark_ell). Must NOT sync:
-        record_ell just fired this step's async D2H, and forcing it here would
-        re-serialize CPU on GPU — the exact stall we removed. If the copy is
-        already resolved (cache present) return it; if it's still pending (this
-        step's fresh copy) query without waiting; else fall back to {}.
+        """Non-blocking read for the SAME-step postprocess path (carried back to
+        the scheduler as fwd_output.dspark_ell).
 
-        Correctness: the scheduler only uses this to set seq.dspark_next_ell for
-        NEXT-step sizing, and the worker's own _dspark_apply_q_bucket reads the
-        (fully resolved) property next step regardless — so a same-step empty
-        here never under-verifies."""
-        cache = self._ell_map_cache
-        if cache:
-            return dict(cache)
-        pending = self._ell_pending
-        if pending is None:
-            return {}
-        event, cpu_buf, req_ids = pending
-        if not event.query():  # not done yet — do NOT stall the hot path
-            return {}
-        ell_np = cpu_buf.numpy().astype(np.int32)
-        n = min(len(req_ids), ell_np.shape[0])
-        resolved = {req_ids[i]: int(ell_np[i]) for i in range(n)}
-        self._ell_map_cache = resolved
-        return dict(resolved)
+        Identical policy to ``ell_by_req`` — this step's own copy was fired
+        moments ago and will not be ready, so this returns the freshest map
+        already resolved. Correctness: the scheduler only uses it to set
+        seq.dspark_next_ell for NEXT-step sizing, and the worker's own
+        _dspark_apply_q_bucket re-reads the map next step regardless.
+        """
+        self._drain_ell()
+        return dict(self._ell_map)
