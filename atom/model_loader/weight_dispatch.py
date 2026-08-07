@@ -52,6 +52,7 @@ class WeightDispatcher:
         submit: Callable[..., None],
         staging_pool: Any,
         batching_enabled: bool,
+        batching_excluded: Callable[[nn.Parameter], bool] | None,
         default_weight_loader: Callable,
         packed_modules_mapping: Mapping[str, Any],
         expert_index: Mapping[str, tuple[str, int, str]],
@@ -70,6 +71,7 @@ class WeightDispatcher:
         self.submit = submit
         self.staging_pool = staging_pool
         self.batching_enabled = batching_enabled
+        self.batching_excluded = batching_excluded
         self.default_weight_loader = default_weight_loader
         self.packed_modules_mapping = packed_modules_mapping
         self.expert_index = expert_index
@@ -224,7 +226,14 @@ class WeightDispatcher:
                 # Parameter absent from model (e.g. weight scales for an
                 # unquantized drafter MTP block); skip silently.
                 return True, name
-            if self.batching_enabled and self.staging_pool.is_batchable(param, name):
+            batching_excluded = (
+                self.batching_excluded is not None and self.batching_excluded(param)
+            )
+            if (
+                self.batching_enabled
+                and not batching_excluded
+                and self.staging_pool.is_batchable(param, name)
+            ):
                 self.submit(
                     self.staging_pool.stage, param, name, shard_id, expert_id, tensor
                 )
