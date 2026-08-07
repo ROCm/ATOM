@@ -308,7 +308,9 @@ class ATOMGLM52DSABackendForSgl(AttentionBackend):
                     draft_token_num,
                 ) + torch.arange(
                     draft_token_num, dtype=torch.int64, device=self.device
-                ).repeat(bs)
+                ).repeat(
+                    bs
+                )
                 metadata_batch = SimpleNamespace(
                     forward_mode=forward_mode,
                     actual_forward_mode=forward_mode,
@@ -328,9 +330,7 @@ class ATOMGLM52DSABackendForSgl(AttentionBackend):
                     metadata_batch, positions
                 )
                 self._target_verify_graph_metadata[bs] = fixed
-                return self._publish_target_verify_graph_metadata(
-                    metadata_batch, fixed
-                )
+                return self._publish_target_verify_graph_metadata(metadata_batch, fixed)
 
             fixed = self._target_verify_graph_metadata.get(bs)
             if fixed is None:
@@ -352,9 +352,7 @@ class ATOMGLM52DSABackendForSgl(AttentionBackend):
                 positions=positions,
                 spec_info=SimpleNamespace(draft_token_num=draft_token_num),
             )
-            staged = self._build_target_verify_graph_metadata(
-                metadata_batch, positions
-            )
+            staged = self._build_target_verify_graph_metadata(metadata_batch, positions)
             self._copy_metadata_in_place(staged, fixed)
             return self._publish_target_verify_graph_metadata(metadata_batch, fixed)
 
