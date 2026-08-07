@@ -112,16 +112,28 @@ class BlockManager:
         )
         # A checkpoint is filed under the content hash of the last block it
         # covers, so a rung that isn't a hash-block boundary can never be looked
-        # up — the ladder would checkpoint into a void.
-        assert not (
+        # up — the ladder would checkpoint into a void. The interval defaults to
+        # 8192 while `hash_block_size` follows `--block-size` and
+        # `--decode-context-parallel-size`, so ordinary flag combinations
+        # (`--block-size 100`, dcp 3) land off the grid through no choice of the
+        # user's. Snap down to the grid and say so, rather than refusing to
+        # start — and rather than asserting, which `python -O` would drop and
+        # leave the ladder cutting prefill chunks onto rungs nothing can reach.
+        if (
             self.state.enabled
             and self.state_checkpoint_interval_tokens
             and self.state_checkpoint_interval_tokens % self.hash_block_size
-        ), (
-            f"--state-checkpoint-interval-tokens="
-            f"{self.state_checkpoint_interval_tokens} must be a multiple of the "
-            f"prefix-cache hash block size {self.hash_block_size}"
-        )
+        ):
+            snapped = (
+                self.state_checkpoint_interval_tokens // self.hash_block_size
+            ) * self.hash_block_size
+            logger.warning(
+                f"--state-checkpoint-interval-tokens="
+                f"{self.state_checkpoint_interval_tokens} is not a multiple of "
+                f"the prefix-cache hash block size {self.hash_block_size}; "
+                f"snapping to {snapped or 'off (0)'}."
+            )
+            self.state_checkpoint_interval_tokens = snapped
 
         # Every Pool.STATE class. A tuple of one today — the sliding window
         # used to be the second member, back when it was a content-addressed
@@ -611,10 +623,18 @@ class BlockManager:
         # Zero interval switches the ladder off entirely — `checkpointers_at`
         # keeps nothing then, so a cut for a demand would buy nothing either.
         interval_on = self.state_checkpoint_interval_tokens > 0
+        previously_demanded = seq.checkpoint_demand_pos
         seq.checkpoint_demand_pos = (
             wanted * self.hash_block_size if interval_on and wanted > hit else 0
         )
-        self.demands_recorded += bool(seq.checkpoint_demand_pos)
+        # `can_allocate` re-runs for a sequence the queue keeps deferring, so
+        # count the demand when it first appears rather than once per attempt —
+        # otherwise one request under pressure inflates the denominator the
+        # convergence check above is read against. `deallocate` clears the
+        # field, so a re-admitted request does count again, which it should.
+        self.demands_recorded += bool(seq.checkpoint_demand_pos) and not (
+            previously_demanded
+        )
 
     def checkpoint_cut(self, seq: Sequence, start: int, end: int) -> int:
         """Latest ladder position in `(start, end]`, or 0 if there is none.
@@ -640,8 +660,12 @@ class BlockManager:
         if target <= start:
             return 0
         # `target` is the larger of the two, so beating the grid means the
-        # demand chose this cut and the grid would not have.
-        self.chunks_cut_for_demand += target > rung
+        # demand chose this position and the grid would not have. `target < end`
+        # is the other half: at `end` the chunk is not shortened and the demand
+        # cost nothing, and counting those made the funnel report cuts that
+        # never happened — which is the one number meant to expose a shape that
+        # pays per request and never converges.
+        self.chunks_cut_for_demand += target > rung and target < end
         return target
 
     def checkpoint_funnel(self) -> dict[str, int]:

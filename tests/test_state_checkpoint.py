@@ -16,7 +16,6 @@
 from math import inf, isinf
 from types import SimpleNamespace
 
-import pytest
 from conftest import MockConfig
 
 from atom.model_engine.block_manager import BlockManager
@@ -554,10 +553,22 @@ class TestForkLifecycle:
         assert not bm.state.hash_to_group
         assert seq.state_fork_src == -1
 
-    def test_interval_must_divide_the_hash_block_size(self):
-        """A rung off the block grid has no content hash to be filed under."""
-        with pytest.raises(AssertionError, match="must be a multiple"):
-            BlockManager(ckpt_config(state_checkpoint_interval_tokens=BLOCK + 1))
+    def test_interval_snaps_onto_the_hash_block_grid(self):
+        """A rung off the block grid has no content hash to be filed under.
+
+        The interval defaults to 8192 while the grid follows `--block-size` and
+        `--decode-context-parallel-size`, so an off-grid interval is something
+        ordinary flag combinations produce rather than something the user asked
+        for. Snapping down keeps the ladder on positions a lookup can reach; the
+        alternative the pool used to take — refusing to construct — turned a
+        block-size choice into a startup failure naming a flag nobody set.
+        """
+        bm = BlockManager(ckpt_config(state_checkpoint_interval_tokens=BLOCK + 1))
+        assert bm.state_checkpoint_interval_tokens == BLOCK
+        # Below one block there is no reachable rung at all, so the ladder is
+        # off rather than snapped to something unusable.
+        bm = BlockManager(ckpt_config(state_checkpoint_interval_tokens=BLOCK - 1))
+        assert bm.state_checkpoint_interval_tokens == 0
 
     def test_hit_never_lands_where_swa_cannot_follow(self):
         """The two gates settle jointly; neither is applied to the other's answer.
