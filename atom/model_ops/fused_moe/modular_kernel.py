@@ -1,16 +1,19 @@
 from abc import ABC, abstractmethod
-
+from collections.abc import Callable
 from dataclasses import dataclass
+from enum import Enum
+from typing import final
+
+import torch
+from aiter import ActivationType, QuantType
+from aiter.dist.parallel_state import get_dp_group
+from aiter.fused_moe import fused_moe
+
 from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
 from atom.model_ops.fused_moe.utils import disable_inplace
-from atom.utils.tbo.ubatching import tbo_overlap_enabled
+from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
-import torch
-from typing import Callable, Optional, final
-from enum import Enum
-from aiter import ActivationType, QuantType
-from aiter.fused_moe import fused_moe
-from aiter.dist.parallel_state import get_dp_group
+from atom.utils.tbo.ubatching import tbo_overlap_enabled
 
 
 class FusedMoEActivationFormat(Enum):
@@ -314,6 +317,30 @@ class FusedMoEModularKernel(torch.nn.Module):
             dispatch_weights = dispatch_weights[:total_valid_tokens]
             if dispatch_scale is not None:
                 dispatch_scale = dispatch_scale[:total_valid_tokens]
+        elif envs.ATOM_EP_TRIM_PREFILL and not all_ranks_decode:
+            # Prefill keeps the whole (mbt * ep_size) buffer above, since
+            # graph_bs is meaningless here. But rows are per-token and
+            # de-duplicated per destination rank, so at most ONE row can arrive
+            # per cluster token -- making the cross-rank token total an exact
+            # upper bound on received rows.
+            #
+            # cu_tokens_across_dp_cpu is already on the host, so reading it costs
+            # no sync. Using this rank's own count instead would be WRONG: under
+            # non-uniform prefill another rank can hold more tokens and send more
+            # rows here, and under-sizing drops received tokens silently.
+            #
+            # Prefill is not cudagraph-captured, so a per-pass dynamic bound is
+            # fine (the static graph_bs bound above is what capture needs).
+            dp_meta = getattr(get_forward_context(), "dp_metadata", None)
+            cu = getattr(dp_meta, "cu_tokens_across_dp_cpu", None)
+            if cu is not None:
+                cluster_tokens = int(cu[-1])
+                if 0 < cluster_tokens < dispatch_a1.shape[0]:
+                    dispatch_a1 = dispatch_a1[:cluster_tokens]
+                    dispatch_ids = dispatch_ids[:cluster_tokens]
+                    dispatch_weights = dispatch_weights[:cluster_tokens]
+                    if dispatch_scale is not None:
+                        dispatch_scale = dispatch_scale[:cluster_tokens]
         return dispatch_a1, dispatch_scale, dispatch_ids, dispatch_weights
 
     def forward(
@@ -330,15 +357,15 @@ class FusedMoEModularKernel(torch.nn.Module):
         expert_map: torch.Tensor | None = None,
         expert_mask: torch.Tensor | None = None,
         apply_router_weight_on_input: bool = False,
-        w1_scale: Optional[torch.Tensor] = None,
-        w2_scale: Optional[torch.Tensor] = None,
-        a1_scale: Optional[torch.Tensor] = None,
-        a2_scale: Optional[torch.Tensor] = None,
-        bias1: Optional[torch.Tensor] = None,
-        bias2: Optional[torch.Tensor] = None,
-        hidden_pad: Optional[int] = 0,
-        intermediate_pad: Optional[int] = 0,
-        moe_extra_args: Optional[dict] = None,
+        w1_scale: torch.Tensor | None = None,
+        w2_scale: torch.Tensor | None = None,
+        a1_scale: torch.Tensor | None = None,
+        a2_scale: torch.Tensor | None = None,
+        bias1: torch.Tensor | None = None,
+        bias2: torch.Tensor | None = None,
+        hidden_pad: int | None = 0,
+        intermediate_pad: int | None = 0,
+        moe_extra_args: dict | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
 
         if inplace and self.shared_experts is None and not disable_inplace():
@@ -386,6 +413,35 @@ class FusedMoEModularKernel(torch.nn.Module):
             expert_tokens_meta,
         )
 
+        # TEMPORARY: capture for _test/bench_ep_moe.py. No-op unless
+        # ATOM_EP_MOE_DUMP_DIR is set; delete with ep_moe_dump.py.
+        from atom.model_ops.fused_moe.ep_moe_dump import maybe_dump_dispatched
+
+        maybe_dump_dispatched(
+            dispatch_a1,
+            dispatch_scale,
+            dispatch_ids,
+            dispatch_weights,
+            expert_tokens_meta.expert_num_tokens,
+            expert_map,
+            expert_mask,
+            local_num_experts,
+            w1,
+            w2,
+            {
+                "activation": activation,
+                "quant_type": quant_type,
+                "global_num_experts": global_num_experts,
+                "hidden_pad": hidden_pad,
+                "intermediate_pad": intermediate_pad,
+                "apply_router_weight_on_input": apply_router_weight_on_input,
+                "gate_mode": (moe_extra_args or {}).get("gate_mode"),
+                "swiglu_limit": (moe_extra_args or {}).get("swiglu_limit"),
+                "w1_scale": w1_scale,
+                "w2_scale": w2_scale,
+            },
+        )
+
         # aiter fused_moe expects a *binary* (0/1) expert_mask in this slot, not
         # the index-style expert_map (which carries -1 sentinels for non-local
         # experts). Passing expert_map here makes moe_sorting mis-classify
@@ -395,6 +451,66 @@ class FusedMoEModularKernel(torch.nn.Module):
         # gate_mode=INTERLEAVE + swiglu_limit) are forwarded verbatim from the
         # quant method's apply() via `moe_extra_args`.
         extra_kwargs = dict(moe_extra_args or {})
+
+        # Triton backend for the routed-expert GEMMs, in place of flydsl
+        # fused_moe. Sits between dispatch and combine, so `_prepare`/`_finalize`
+        # (and therefore the mori all-to-all) are untouched. The a8w4-specific
+        # weights live on the layer, so the quant method forwards them through
+        # `moe_extra_args` -- the modular kernel holds no layer reference.
+        triton_experts = extra_kwargs.pop("triton_experts", None)
+        if triton_experts is not None:
+            from atom.model_ops.fused_moe_triton import (
+                routing_from_dispatched,
+                triton_kernel_fused_experts_a4w4_silu_gugu,
+                triton_kernel_fused_experts_a8w4_silu_gugu,
+            )
+
+            # a4w4 takes the same signature and the same weights (both are w4);
+            # only the activation quant differs, so the switch is just this.
+            fused_experts_fn = (
+                triton_kernel_fused_experts_a4w4_silu_gugu
+                if envs.ATOM_USE_TRITON_MOE_EP_A4W4
+                else triton_kernel_fused_experts_a8w4_silu_gugu
+            )
+
+            routing_data, gather_idx, scatter_idx, gate_valid = routing_from_dispatched(
+                dispatch_weights,
+                dispatch_ids,
+                expert_map,
+                local_num_experts,
+                expert_tokens_meta.expert_num_tokens,
+            )
+            # gate_scal carries the dispatched router weights, and
+            # apply_router_weight_on_input is False (mori asserts it), so GEMM2
+            # applies them -- same split as flydsl's doweight_stage1=False.
+            fused_out = fused_experts_fn(
+                dispatch_a1,
+                triton_experts["w13_weight"],
+                triton_experts["w2_weight"],
+                routing_data,
+                gather_idx,
+                scatter_idx,
+                w13_scale=triton_experts["w13_scale"],
+                w2_scale=triton_experts["w2_scale"],
+                w13_swizzle_layout=triton_experts["w13_swizzle_layout"],
+                w2_swizzle_layout=triton_experts["w2_swizzle_layout"],
+                a13_scale=triton_experts.get("a13_scale"),
+                a2_scale=triton_experts.get("a2_scale"),
+                w1_bias=triton_experts.get("w1_bias"),
+                w2_bias=triton_experts.get("w2_bias"),
+                swiglu_limit=triton_experts.get("swiglu_limit", 10.0),
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                gate_valid=gate_valid,
+            )
+            return self._finalize(
+                output,
+                fused_out,
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                apply_router_weight_on_input,
+            )
+
         fused_out = fused_moe(
             dispatch_a1,
             w1,
