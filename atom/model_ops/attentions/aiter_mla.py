@@ -1934,7 +1934,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 else:
                     slots[s] = per_seq[s]
                     pos[s] = ctx_s - 1
-                    coord.alloc_host_pages(int(per_seq[s]), ctx_s - 1, 1)
+                    coord.grow_cold_for_new_token(int(per_seq[s]), ctx_s - 1)
             # Copy into the fixed-address GPU buffers (pinned staging, non-blocking)
             # so the captured fused hot path reads fresh values on every replay.
             attn_metadata.sparsekv_req_slots = self._sparsekv_req_slots.copy_to_gpu(

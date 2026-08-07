@@ -93,6 +93,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_SPARSEKV_ADMIT_RESERVE_PAGES": lambda: int(
         os.getenv("ATOM_SPARSEKV_ADMIT_RESERVE_PAGES", "8")
     ),
+    # GPU cold tier: number of paged GPU cold-pool pages (page_size tokens each)
+    # allocated from spare HBM to extend total cold capacity beyond the host pool.
+    # 0 (default) disables the GPU cold tier entirely (two-layer mode). When > 0,
+    # RDMA-received KV is promoted from host to GPU cold tier after done_recving,
+    # and decode swap reads from both tiers based on each token's home.
+    "ATOM_SPARSEKV_GPU_COLD_PAGES": lambda: int(
+        os.getenv("ATOM_SPARSEKV_GPU_COLD_PAGES", "0")
+    ),
     # --- Kernel Fusion Toggles ---
     # fused_compress_attn: switch between Triton (default historical) and a
     # flydsl drop-in for V4-Pro Compressor (Main BF16 + Indexer FP8) paths.

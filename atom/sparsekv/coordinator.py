@@ -61,6 +61,7 @@ class SparseKVCoordinator:
         shared_index_layers: list[bool] | None = None,
         host_to_device_ratio: int = 8,
         page_size: int = 16,
+        num_gpu_cold_pages: int = 0,
     ):
         self.num_layers = num_layers
         self.max_num_seqs = max_num_seqs
@@ -96,6 +97,40 @@ class SparseKVCoordinator:
         self._free_host_pages: list[int] = list(range(self.num_host_pages))
         self._req_pages: dict[int, list[int]] = {}
         self._req_host_alloc_len = [0] * R
+
+        # GPU cold tier: spare HBM used as a second cold pool alongside the host
+        # pool. Tokens are disjoint across the two tiers (a token's home is in
+        # exactly one). Disabled when num_gpu_cold_pages == 0.
+        self.num_gpu_pages = num_gpu_cold_pages
+        self.gpu_cold_enabled = num_gpu_cold_pages > 0
+        if self.gpu_cold_enabled:
+            num_gpu_slots = num_gpu_cold_pages * page_size
+            self.gpu_cold_pool = torch.zeros(
+                (num_layers, num_gpu_slots, kv_dim),
+                dtype=kv_dtype,
+                device=self.device,
+            )
+            self.req_to_gpu_pool = torch.full(
+                (R, self.table_stride), _EMPTY, dtype=torch.int32, device=self.device
+            )
+        else:
+            self.gpu_cold_pool = None
+            self.req_to_gpu_pool = None
+        self._free_gpu_pages: list[int] = list(range(num_gpu_cold_pages))
+        self._req_gpu_pages: dict[int, list[int]] = {}
+        self._req_gpu_alloc_len = [0] * R
+
+        # Promote queue: completion thread enqueues req_ids after done_recving;
+        # model runner forward loop drains and runs promote_to_gpu.
+        import threading
+
+        self._promote_lock = threading.Lock()
+        self._promote_queue: list = []
+        self._promote_events: dict[int, torch.cuda.Event] = {}
+        if self.gpu_cold_enabled and str(self.device) != "cpu":
+            self.promote_stream = torch.cuda.Stream(device=self.device)
+        else:
+            self.promote_stream = None
 
         # GPU hot buffer: [num_layers, R * H1, kv_dim].
         self.hot_buffer = torch.zeros(
@@ -154,9 +189,14 @@ class SparseKVCoordinator:
         # Monotonic recency tick, advanced each swap/backup.
         self._tick = 0
 
+        gpu_gb = (
+            self.gpu_cold_pool.numel() * self.gpu_cold_pool.element_size() / 1e9
+            if self.gpu_cold_pool is not None
+            else 0.0
+        )
         logger.info(
             "SparseKVCoordinator: layers=%d max_seqs=%d hot=%d(+1) max_ctx=%d "
-            "kv_dim=%d dtype=%s cold_pool=%.2fGB hot_buffer=%.2fGB",
+            "kv_dim=%d dtype=%s cold_pool=%.2fGB gpu_cold=%.2fGB hot_buffer=%.2fGB",
             num_layers,
             max_num_seqs,
             hot_buffer_size,
@@ -164,6 +204,7 @@ class SparseKVCoordinator:
             kv_dim,
             kv_dtype,
             self.cold_pool.numel() * self.cold_pool.element_size() / 1e9,
+            gpu_gb,
             self.hot_buffer.numel() * self.hot_buffer.element_size() / 1e9,
         )
 
@@ -315,6 +356,10 @@ class SparseKVCoordinator:
         self.slot_token[:, req_slot, :] = _EMPTY
         self.last_used[:, req_slot, :] = _EMPTY
         self.token_to_slot[:, req_slot, :] = _EMPTY
+        ev = self._promote_events.pop(req_slot, None)
+        if ev is not None:
+            ev.synchronize()
+        self.free_gpu_pages(req_slot)
         self.free_host_pages(req_slot)
 
     # ------------------------------------------------------------------
@@ -416,6 +461,17 @@ class SparseKVCoordinator:
             else self._empty_host_locs
         )
 
+    def _gpu_locs_arg(self) -> torch.Tensor:
+        """Tensor to pass the swap kernels as ``gpu_cache_locs``.
+
+        Returns the GPU cold-pool paged translation table when the GPU tier is
+        active, or a persistent empty tensor otherwise (kernel sees nullptr ->
+        all tokens are host-home only, unchanged from two-layer mode).
+        """
+        if self.gpu_cold_enabled and self.req_to_gpu_pool is not None:
+            return self.req_to_gpu_pool
+        return self._empty_host_locs
+
     # ------------------------------------------------------------------
     # paged host pool (RDMA-direct)
     # ------------------------------------------------------------------
@@ -466,19 +522,211 @@ class SparseKVCoordinator:
         self.req_to_host_pool[req_slot].fill_(_EMPTY)
         self._req_host_alloc_len[req_slot] = 0
 
+    # ------------------------------------------------------------------
+    # paged GPU cold tier
+    # ------------------------------------------------------------------
+    def alloc_gpu_pages(self, req_slot: int, start_pos: int, num_tokens: int) -> int:
+        """Back logical positions with GPU cold-pool pages. Returns tokens allocated.
+
+        Symmetric to alloc_host_pages but never raises — returns the count of
+        tokens actually backed (may be < num_tokens if the GPU pool is exhausted).
+        """
+        if not self.gpu_cold_enabled or num_tokens <= 0:
+            return 0
+        page = self.host_page_size
+        allocated_len = self._req_gpu_alloc_len[req_slot]
+        end_pos = start_pos + num_tokens
+        assert start_pos <= allocated_len, (
+            f"non-contiguous GPU alloc: start_pos={start_pos} > "
+            f"allocated_len={allocated_len} (req_slot={req_slot})"
+        )
+        page_end = ((end_pos + page - 1) // page) * page
+        if page_end <= allocated_len:
+            return num_tokens
+        num_new_pages = (page_end - allocated_len) // page
+        available = min(num_new_pages, len(self._free_gpu_pages))
+        if available == 0:
+            return 0
+        new_pages = [self._free_gpu_pages.pop() for _ in range(available)]
+        self._req_gpu_pages.setdefault(req_slot, []).extend(new_pages)
+        actual_end = allocated_len + available * page
+        slots = torch.empty(actual_end - allocated_len, dtype=torch.int32)
+        off = torch.arange(page, dtype=torch.int32)
+        for i, p in enumerate(new_pages):
+            slots[i * page : (i + 1) * page] = p * page + off
+        self.req_to_gpu_pool[req_slot, allocated_len:actual_end] = slots.to(self.device)
+        self._req_gpu_alloc_len[req_slot] = actual_end
+        return min(num_tokens, available * page)
+
+    def free_gpu_pages(self, req_slot: int) -> None:
+        """Return a request's GPU cold-pool pages to the free pool."""
+        if not self.gpu_cold_enabled:
+            return
+        pages = self._req_gpu_pages.pop(req_slot, None)
+        if pages:
+            self._free_gpu_pages.extend(pages)
+        self.req_to_gpu_pool[req_slot].fill_(_EMPTY)
+        self._req_gpu_alloc_len[req_slot] = 0
+
+    # ------------------------------------------------------------------
+    # GPU cold tier promote (host → GPU)
+    # ------------------------------------------------------------------
+    def enqueue_promote(self, req_id) -> None:
+        """Thread-safe enqueue of a request for GPU promotion.
+
+        Called by the mooncake connector completion thread after done_recving.
+        The model runner forward loop drains and runs promote_to_gpu.
+        """
+        with self._promote_lock:
+            self._promote_queue.append(req_id)
+
+    def drain_promote_queue(self) -> dict:
+        """Drain the promote queue and run promote_to_gpu for each request.
+
+        Called from the model runner forward loop. Returns a dict mapping
+        req_id -> number of GPU pages promoted (for the promote-done signal
+        to the scheduler).
+        """
+        with self._promote_lock:
+            pending = list(self._promote_queue)
+            self._promote_queue.clear()
+        result = {}
+        for req_id in pending:
+            slot = self._reqid_to_slot.get(req_id)
+            if slot is None:
+                continue
+            gpu_pages = self.promote_to_gpu(slot)
+            if gpu_pages > 0:
+                result[req_id] = gpu_pages
+        return result
+
+    def promote_to_gpu(self, req_slot: int) -> int:
+        """Move a request's host-resident KV pages to the GPU cold tier.
+
+        Iterates the request's host-backed logical range page by page. For each
+        page where the GPU tier has capacity: allocates a GPU page, gathers the
+        data H2D, records the GPU mapping, and frees the host page. Runs on
+        promote_stream (async, non-blocking to the decode forward).
+
+        Returns the number of GPU pages promoted.
+        """
+        if not self.gpu_cold_enabled:
+            return 0
+        page = self.host_page_size
+        host_len = self._req_host_alloc_len[req_slot]
+        if host_len == 0:
+            return 0
+
+        gpu_promoted = 0
+        host_pages_to_free = []
+        host_page_indices_in_req = []
+        src_all = []
+        dst_all = []
+
+        req_host_pages = self._req_pages.get(req_slot, [])
+        for page_idx, host_page_id in enumerate(list(req_host_pages)):
+            if not self._free_gpu_pages:
+                break
+            gpu_page_id = self._free_gpu_pages.pop()
+            self._req_gpu_pages.setdefault(req_slot, []).append(gpu_page_id)
+            start_tok = page_idx * page
+            end_tok = min(start_tok + page, host_len)
+            for t in range(start_tok, end_tok):
+                host_flat = int(self.req_to_host_pool[req_slot, t].item())
+                if host_flat < 0:
+                    continue
+                gpu_flat = gpu_page_id * page + (t - start_tok)
+                src_all.append(host_flat)
+                dst_all.append(gpu_flat)
+                self.req_to_gpu_pool[req_slot, t] = gpu_flat
+                self.req_to_host_pool[req_slot, t] = _EMPTY
+            host_pages_to_free.append(host_page_id)
+            host_page_indices_in_req.append(page_idx)
+            gpu_promoted += 1
+
+        if not src_all:
+            return 0
+
+        src_t = torch.tensor(src_all, dtype=torch.int32, device=self.device)
+        dst_t = torch.tensor(dst_all, dtype=torch.int32, device=self.device)
+        if self.promote_stream is not None:
+            with torch.cuda.stream(self.promote_stream):
+                for layer_id in range(self.num_layers):
+                    self._run_promote_swap(layer_id, src_t, dst_t)
+            ev = torch.cuda.Event()
+            ev.record(self.promote_stream)
+            self._promote_events[req_slot] = ev
+        else:
+            for layer_id in range(self.num_layers):
+                self._run_promote_swap(layer_id, src_t, dst_t)
+
+        for hp in host_pages_to_free:
+            self._free_host_pages.append(hp)
+            if hp in req_host_pages:
+                req_host_pages.remove(hp)
+
+        self._req_gpu_alloc_len[req_slot] = max(
+            self._req_gpu_alloc_len[req_slot],
+            (
+                (host_page_indices_in_req[-1] + 1) * page
+                if host_page_indices_in_req
+                else 0
+            ),
+        )
+        return gpu_promoted
+
+    def _run_promote_swap(
+        self, layer_id: int, src_locs: torch.Tensor, dst_locs: torch.Tensor
+    ) -> None:
+        """Gather from host cold pool into GPU cold pool for one layer."""
+        if src_locs.numel() == 0:
+            return
+        if str(self.device) == "cpu":
+            src_idx = src_locs.to(torch.long)
+            dst_idx = dst_locs.to(torch.long)
+            self.gpu_cold_pool[layer_id, dst_idx] = self.cold_pool[layer_id, src_idx]
+            return
+        from atom.sparsekv.swap_kernel import sparsekv_swap_in
+
+        host_ptr = self._ensure_cold_dev_ptr(layer_id)
+        sparsekv_swap_in(
+            host_ptr,
+            self.gpu_cold_pool[layer_id],
+            src_locs.to(torch.int32),
+            dst_locs.to(torch.int32),
+            self.item_size_bytes,
+        )
+
+    def grow_cold_for_new_token(self, req_slot: int, pos: int) -> None:
+        """Back a single new-token position in the preferred cold tier.
+
+        Tries GPU cold tier first (spare HBM); falls back to host if GPU is full
+        or disabled. The fused backup kernel writes the cold pool at the position
+        recorded in whichever mapping table was updated here.
+        """
+        if pos < 0:
+            return
+        if self.gpu_cold_enabled:
+            got = self.alloc_gpu_pages(req_slot, pos, 1)
+            if got > 0:
+                return
+        host_len = self._req_host_alloc_len[req_slot]
+        if pos > host_len:
+            self.alloc_host_pages(req_slot, host_len, pos - host_len)
+        self.alloc_host_pages(req_slot, pos, 1)
+
     def grow_host_for_new_tokens(
         self, req_slots: list[int], positions: list[int]
     ) -> None:
-        """Ensure each decode query token's logical position has a backing host slot.
+        """Ensure each decode query token's logical position has a backing cold slot.
 
         Called eagerly before the forward each step so the fused backup kernel can
-        write cold pool at ``req_to_host_pool[r][pos]`` (the table update is a fixed-
-        address scatter on an already-allocated tensor, so the captured forward that
-        follows reads it correctly).
+        write cold pool at the position's mapped slot. When the GPU cold tier is
+        enabled, new tokens prefer GPU pages; overflow goes to host.
         """
         for r, pos in zip(req_slots, positions):
             if pos >= 0:
-                self.alloc_host_pages(r, pos, 1)
+                self.grow_cold_for_new_token(r, pos)
 
     def _hot_base(self, req_slot: int) -> int:
         return req_slot * self.padded_hot_size
@@ -836,11 +1084,21 @@ class SparseKVCoordinator:
         high recency (it will likely be selected next step).
         """
         assert logical_pos < self.max_context_len
-        self.alloc_host_pages(req_slot, logical_pos, 1)
-        cold_row = int(self.req_to_host_pool[req_slot, logical_pos].item())
-        self.cold_pool[layer_id, cold_row].copy_(
-            new_token_kv.reshape(self.kv_dim).to(self.cold_pool.dtype)
+        self.grow_cold_for_new_token(req_slot, logical_pos)
+        gpu_row = (
+            int(self.req_to_gpu_pool[req_slot, logical_pos].item())
+            if self.gpu_cold_enabled
+            else _EMPTY
         )
+        if gpu_row >= 0:
+            self.gpu_cold_pool[layer_id, gpu_row].copy_(
+                new_token_kv.reshape(self.kv_dim).to(self.gpu_cold_pool.dtype)
+            )
+        else:
+            cold_row = int(self.req_to_host_pool[req_slot, logical_pos].item())
+            self.cold_pool[layer_id, cold_row].copy_(
+                new_token_kv.reshape(self.kv_dim).to(self.cold_pool.dtype)
+            )
         self._tick += 1
         tick = self._tick
         lu = self.last_used[layer_id, req_slot]

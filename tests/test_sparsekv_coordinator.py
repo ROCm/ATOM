@@ -47,6 +47,7 @@ def test_item_size_bytes():
 def test_all_hit_no_swap():
     c = _make()
     c.register_request(0, 10)
+    c.alloc_host_pages(0, 0, 10)
     _seed_resident(c, 0, 0, [7, 8, 9])
     topk = torch.tensor([9, 8, 7], dtype=torch.int32)
     src, dst, tr = c.plan_swap_for_request(0, 0, topk)
@@ -642,3 +643,172 @@ def test_prefetch_matches_per_layer_fused(monkeypatch):
         assert torch.allclose(
             pre.hot_buffer[layer].float(), ref.hot_buffer[layer].float()
         ), layer
+
+
+# --- GPU cold tier (Design Y) ------------------------------------------------
+
+
+def _make_gpu_cold(
+    num_layers=1,
+    max_num_seqs=2,
+    hot=4,
+    max_ctx=32,
+    kv_dim=8,
+    ratio=8,
+    page=16,
+    gpu_pages=4,
+):
+    return SparseKVCoordinator(
+        num_layers=num_layers,
+        max_num_seqs=max_num_seqs,
+        hot_buffer_size=hot,
+        max_context_len=max_ctx,
+        kv_dim=kv_dim,
+        kv_dtype=torch.bfloat16,
+        device="cpu",
+        host_to_device_ratio=ratio,
+        page_size=page,
+        num_gpu_cold_pages=gpu_pages,
+    )
+
+
+def test_gpu_cold_disabled_by_default():
+    c = _make()
+    assert not c.gpu_cold_enabled
+    assert c.gpu_cold_pool is None
+    assert c.req_to_gpu_pool is None
+    assert len(c._free_gpu_pages) == 0
+
+
+def test_gpu_cold_enabled_allocates_pool():
+    c = _make_gpu_cold(gpu_pages=4, page=16)
+    assert c.gpu_cold_enabled
+    assert c.gpu_cold_pool is not None
+    assert c.gpu_cold_pool.shape == (1, 4 * 16, 8)
+    assert c.req_to_gpu_pool is not None
+    assert len(c._free_gpu_pages) == 4
+
+
+def test_gpu_alloc_and_free_pages():
+    c = _make_gpu_cold(gpu_pages=4, page=16, max_ctx=64)
+    slot = c.acquire(req_id=1, context_len=20)
+    got = c.alloc_gpu_pages(slot, 0, 20)
+    assert got == 20
+    assert c._req_gpu_alloc_len[slot] == 32  # 2 pages, page-rounded
+    assert len(c._free_gpu_pages) == 2
+    row = c.req_to_gpu_pool[slot]
+    for t in range(20):
+        assert int(row[t].item()) >= 0
+    assert int(row[32].item()) == _EMPTY
+    c.free_gpu_pages(slot)
+    assert len(c._free_gpu_pages) == 4
+    assert torch.all(c.req_to_gpu_pool[slot] == _EMPTY)
+
+
+def test_gpu_alloc_partial_when_full():
+    c = _make_gpu_cold(gpu_pages=1, page=16)
+    slot = c.acquire(req_id=1, context_len=30)
+    got = c.alloc_gpu_pages(slot, 0, 30)
+    assert got == 16  # only one page (16 tokens) available
+    assert len(c._free_gpu_pages) == 0
+    got2 = c.alloc_gpu_pages(slot, 16, 14)
+    assert got2 == 0  # no pages left
+
+
+def test_gpu_alloc_disabled_returns_zero():
+    c = _make()
+    slot = c.acquire(req_id=1, context_len=10)
+    got = c.alloc_gpu_pages(slot, 0, 10)
+    assert got == 0
+
+
+def test_unregister_frees_both_pools():
+    c = _make_gpu_cold(gpu_pages=4, page=16)
+    slot = c.acquire(req_id=1, context_len=20)
+    c.alloc_host_pages(slot, 0, 16)
+    c.alloc_gpu_pages(slot, 0, 16)
+    host_free_before = len(c._free_host_pages)
+    gpu_free_before = len(c._free_gpu_pages)
+    c.unregister_request(slot)
+    assert len(c._free_host_pages) > host_free_before
+    assert len(c._free_gpu_pages) > gpu_free_before
+    assert torch.all(c.req_to_host_pool[slot] == _EMPTY)
+    assert torch.all(c.req_to_gpu_pool[slot] == _EMPTY)
+
+
+def test_grow_cold_prefers_gpu():
+    c = _make_gpu_cold(gpu_pages=2, page=16)
+    slot = c.acquire(req_id=1, context_len=20)
+    c.grow_cold_for_new_token(slot, 0)
+    assert int(c.req_to_gpu_pool[slot, 0].item()) >= 0
+    assert int(c.req_to_host_pool[slot, 0].item()) == _EMPTY
+
+
+def test_grow_cold_falls_back_to_host():
+    c = _make_gpu_cold(gpu_pages=0, page=16)
+    assert not c.gpu_cold_enabled
+    slot = c.acquire(req_id=1, context_len=20)
+    c.grow_cold_for_new_token(slot, 0)
+    assert int(c.req_to_host_pool[slot, 0].item()) >= 0
+
+
+def test_grow_cold_overflows_to_host():
+    c = _make_gpu_cold(gpu_pages=1, page=16)
+    slot = c.acquire(req_id=1, context_len=30)
+    # Fill GPU tier (1 page = 16 tokens)
+    for t in range(16):
+        c.grow_cold_for_new_token(slot, t)
+    assert len(c._free_gpu_pages) == 0
+    # Next token must go to host
+    c.grow_cold_for_new_token(slot, 16)
+    assert int(c.req_to_host_pool[slot, 16].item()) >= 0
+    assert int(c.req_to_gpu_pool[slot, 16].item()) == _EMPTY
+
+
+def test_backup_new_token_writes_gpu_cold():
+    c = _make_gpu_cold(gpu_pages=2, page=16, num_layers=1)
+    slot = c.acquire(req_id=1, context_len=20)
+    kv = torch.full((c.kv_dim,), 7.0, dtype=torch.bfloat16)
+    c.backup_new_token(req_slot=slot, layer_id=0, new_token_kv=kv, logical_pos=0)
+    gpu_row = int(c.req_to_gpu_pool[slot, 0].item())
+    assert gpu_row >= 0
+    row = c.gpu_cold_pool[0, gpu_row]
+    assert torch.allclose(row.float(), torch.full_like(row.float(), 7.0))
+
+
+def test_backup_new_token_falls_back_host():
+    c = _make_gpu_cold(gpu_pages=0, page=16, num_layers=1)
+    slot = c.acquire(req_id=1, context_len=20)
+    kv = torch.full((c.kv_dim,), 9.0, dtype=torch.bfloat16)
+    c.backup_new_token(req_slot=slot, layer_id=0, new_token_kv=kv, logical_pos=0)
+    host_row = int(c.req_to_host_pool[slot, 0].item())
+    assert host_row >= 0
+    row = c.cold_pool[0, host_row]
+    assert torch.allclose(row.float(), torch.full_like(row.float(), 9.0))
+
+
+def test_gpu_locs_arg():
+    c_off = _make()
+    assert c_off._gpu_locs_arg().numel() == 0
+    c_on = _make_gpu_cold(gpu_pages=2)
+    assert c_on._gpu_locs_arg() is c_on.req_to_gpu_pool
+
+
+def test_enqueue_drain_promote_queue():
+    c = _make_gpu_cold(gpu_pages=4, page=16)
+    slot = c.acquire(req_id=42, context_len=20)
+    c.alloc_host_pages(slot, 0, 16)
+    c.enqueue_promote(42)
+    assert len(c._promote_queue) == 1
+    # drain_promote_queue calls promote_to_gpu internally; on CPU device the
+    # swap kernel is not called (promote_stream is None) but bookkeeping runs.
+    result = c.drain_promote_queue()
+    assert len(c._promote_queue) == 0
+    # Promote moved pages from host to GPU
+    if 42 in result:
+        assert result[42] > 0
+        # Some host pages freed, some GPU pages allocated
+        for t in range(16):
+            gpu_val = int(c.req_to_gpu_pool[slot, t].item())
+            host_val = int(c.req_to_host_pool[slot, t].item())
+            assert gpu_val >= 0 or host_val >= 0

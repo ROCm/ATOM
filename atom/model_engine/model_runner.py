@@ -842,6 +842,7 @@ class ModelRunner:
         # request-id set (see _sparsekv_stage_and_sync).
         self._sparsekv_prev_forward_event: torch.cuda.Event | None = None
         self._sparsekv_last_active_reqids: set = set()
+        self._sparsekv_promoted: dict = {}
         initialize_eplb_runtime(self)
         self._maybe_warmup()
 
@@ -3376,6 +3377,10 @@ class ModelRunner:
         ):
             self._sparsekv_prev_forward_event.synchronize()
         self._sparsekv_last_active_reqids = cur_active
+        if coord.gpu_cold_enabled:
+            promoted = coord.drain_promote_queue()
+            if promoted:
+                self._sparsekv_promoted.update(promoted)
         coord.sync_active(req_ids)
         for i, rid in enumerate(req_ids):
             if coord.is_registered(rid):
@@ -3489,16 +3494,20 @@ class ModelRunner:
         # request for local recompute, and finished_saving to release blocks
         # whose free was deferred while a background save read their KV.
         if isinstance(finished, KVConnectorOutput):
-            return finished
+            output = finished
+        else:
+            # Legacy P/D connectors still return the old
+            # (done_sending, done_recving) tuple. Normalize it so EngineCore and
+            # Scheduler only need to consume KVConnectorOutput.
+            done_sending, done_recving = finished
+            output = KVConnectorOutput(
+                finished_sending=done_sending, finished_recving=done_recving
+            )
 
-        # Legacy P/D connectors still return the old
-        # (done_sending, done_recving) tuple. Normalize it so EngineCore and
-        # Scheduler only need to consume KVConnectorOutput.
-        done_sending, done_recving = finished
-
-        return KVConnectorOutput(
-            finished_sending=done_sending, finished_recving=done_recving
-        )
+        if self._sparsekv_promoted:
+            output.promoted_gpu_pages = dict(self._sparsekv_promoted)
+            self._sparsekv_promoted.clear()
+        return output
 
     def propose_draft_token_ids(
         self,

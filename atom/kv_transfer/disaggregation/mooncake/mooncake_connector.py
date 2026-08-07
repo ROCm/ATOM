@@ -1793,4 +1793,8 @@ class MooncakeConnector(KVConnectorBase):
         )
         # PP-prefill: signal stage-0 it may now reuse the shared page table.
         self._send_release(req_id)
+        # GPU cold tier: enqueue for host→GPU promotion (drained by forward loop).
+        coord = self._sparsekv_coord
+        if coord is not None and getattr(coord, "gpu_cold_enabled", False):
+            coord.enqueue_promote(req_id)
         return True

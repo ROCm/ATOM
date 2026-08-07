@@ -84,6 +84,7 @@ class KVConnectorOutput:
     finished_loading: set[ReqId] = field(default_factory=set)
     failed_loading: set[ReqId] = field(default_factory=set)
     expected_finished_count: int = 0
+    promoted_gpu_pages: dict = field(default_factory=dict)
 
     def is_empty(self) -> bool:
         """Return True if no transfers finished on this worker."""
