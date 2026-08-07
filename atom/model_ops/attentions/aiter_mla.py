@@ -1006,7 +1006,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 shared_index_layers=shared_index_layers,
                 host_to_device_ratio=envs.ATOM_SPARSEKV_HOST_TO_DEVICE_RATIO,
                 page_size=self.model_runner.block_size,
-                num_gpu_cold_pages=envs.ATOM_SPARSEKV_GPU_COLD_PAGES,
+                # Auto mode starts at 0 pages so the hot buffer allocates first;
+                # autosize_gpu_cold_tier below then claims what is left.
+                num_gpu_cold_pages=max(0, envs.ATOM_SPARSEKV_GPU_COLD_PAGES),
             )
             # Shared logical-top-k side-channel buffer (one per decode query
             # token), written by the indexer op and read by the coordinator.
@@ -1019,6 +1021,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             out["sparsekv_topk_buffer"] = topk_buf
             out["sparsekv_coordinator"].topk_buffer = topk_buf
             set_sparsekv_topk_buffer(topk_buf)
+            # Size the GPU cold tier LAST: it claims whatever HBM the model,
+            # index cache, hot buffer and scratch left behind, so it must be the
+            # final allocation. -1 (the default) means auto; a non-negative value
+            # is an explicit page count, including 0 to disable the tier.
+            if envs.ATOM_SPARSEKV_GPU_COLD_PAGES < 0:
+                out["sparsekv_coordinator"].autosize_gpu_cold_tier(
+                    1.0 - config.gpu_memory_utilization
+                )
         return out
 
     def build_kv_cache_tensor(self, layer_id: int, module):

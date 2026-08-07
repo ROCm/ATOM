@@ -637,6 +637,26 @@ class Scheduler:
             # Admittable budget = pool minus per-slot decode-growth headroom.
             reserve = envs.ATOM_SPARSEKV_ADMIT_RESERVE_PAGES * self.max_num_seqs
             self._sparsekv_admit_pages: int = max(1, num_host_pages - reserve)
+            # GPU cold tier (spare HBM used as a second cold pool). Auto sizing
+            # means only the worker knows the real page count, so it is reported
+            # back onto the config before this Scheduler is built; the env is the
+            # fallback for explicit-page-count runs and for tests with no worker.
+            self._sparsekv_gpu_pages: int = int(
+                getattr(
+                    config,
+                    "sparsekv_gpu_cold_pages",
+                    max(0, envs.ATOM_SPARSEKV_GPU_COLD_PAGES),
+                )
+            )
+            self._sparsekv_gpu_cold_enabled: bool = self._sparsekv_gpu_pages > 0
+            # Without this line a failed hand-off from the worker is invisible:
+            # admission would silently run host-only while the worker has a tier.
+            logger.info(
+                "SparseKV admission: host %d pages, GPU cold tier %d pages (%s)",
+                self._sparsekv_admit_pages,
+                self._sparsekv_gpu_pages,
+                "enabled" if self._sparsekv_gpu_cold_enabled else "disabled",
+            )
 
         # Under PP the head keeps pp_size batches in flight, so schedule() must
         # advance chunked-prefill progress itself rather than defer it to
@@ -902,6 +922,25 @@ class Scheduler:
         )
         return (final_len + self._sparsekv_page - 1) // self._sparsekv_page
 
+    def _sparsekv_live_seqs(self):
+        """Requests holding SparseKV cold-pool pages: running + recv in flight.
+
+        A request outside this set holds no coordinator slot, so it holds no page
+        in either tier — which is why a promote credit may only ever be read from,
+        or written to, a sequence this yields.
+        """
+        yield from self.running
+        for s in self.waiting:
+            if s.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
+                yield s
+
+    @staticmethod
+    def _sparsekv_gpu_pages_of(seq: Sequence) -> int:
+        """Pages of `seq` the worker has promoted from the host pool to the GPU
+        cold tier. Kept on the Sequence, not in a scheduler-side dict, so it dies
+        with the request instead of drifting across the PD lifecycle."""
+        return getattr(seq, "sparsekv_promoted_pages", 0)
+
     def _sparsekv_pages_in_use(self) -> int:
         """Host cold-pool pages RESERVED for resident SparseKV requests.
 
@@ -911,14 +950,42 @@ class Scheduler:
         _sparsekv_worst_case_pages). Counting the lifetime footprint — not the
         current num_tokens — is what guarantees the ungated per-step decode growth
         on the worker can never exceed what admission already reserved.
+
+        Pages already promoted to the GPU cold tier are subtracted: they no longer
+        live on host, and without that downgrade the host reservation would pin a
+        request's full footprint for its whole lifetime and the host pool would
+        stay the batch ceiling no matter how large the GPU tier is.
         """
         total = 0
-        for s in self.running:
-            total += self._sparsekv_worst_case_pages(s)
-        for s in self.waiting:
-            if s.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
-                total += self._sparsekv_worst_case_pages(s)
+        for s in self._sparsekv_live_seqs():
+            total += max(
+                0,
+                self._sparsekv_worst_case_pages(s) - self._sparsekv_gpu_pages_of(s),
+            )
         return total
+
+    def _sparsekv_gpu_pages_credited(self) -> int:
+        """GPU cold-tier pages the worker has REPORTED promoting.
+
+        A floor on tier occupancy, not the occupancy itself: decode-step growth
+        also prefers GPU pages (grow_cold_for_new_token) and is never reported.
+        That under-count is the safe direction — those pages stay charged to host.
+        Clamped to the pool: the worker cannot promote more pages than exist, so a
+        larger sum means the signal path is broken, and letting it through would
+        wedge the capacity gate into deferring every request forever.
+        """
+        credited = sum(
+            self._sparsekv_gpu_pages_of(s) for s in self._sparsekv_live_seqs()
+        )
+        if credited > self._sparsekv_gpu_pages:
+            logger.error(
+                "SparseKV promote credit %d exceeds the GPU cold tier (%d pages); "
+                "clamping. The promote-done signal is over-reporting.",
+                credited,
+                self._sparsekv_gpu_pages,
+            )
+            return self._sparsekv_gpu_pages
+        return credited
 
     def _unschedulable_reason(self, seq: Sequence) -> str | None:
         """Return a human-readable reason if `seq` is permanently unschedulable.
@@ -1139,6 +1206,11 @@ class Scheduler:
         sparsekv_pages_used = (
             self._sparsekv_pages_in_use() if self._sparsekv_enabled else 0
         )
+        sparsekv_gpu_pages_used = (
+            self._sparsekv_gpu_pages_credited()
+            if self._sparsekv_enabled and self._sparsekv_gpu_cold_enabled
+            else 0
+        )
         while (
             delayer_allows
             and (self.delay_factor <= 0 or self._passed_delay(time.time()))
@@ -1246,7 +1318,20 @@ class Scheduler:
             # always eventually fits — no deadlock.
             if self._sparsekv_enabled and needs_remote_load:
                 need = self._sparsekv_worst_case_pages(seq)
+                # RECV gate: prefill RDMAs the whole request into the HOST pool
+                # before any of it can be promoted, so it must land in one piece.
+                # Bounds how many requests sit in the recv/promote window at once.
                 if sparsekv_pages_used + need > self._sparsekv_admit_pages:
+                    self.waiting.appendleft(seq)
+                    break
+                # CAPACITY gate: post-promotion the request still has to live
+                # somewhere, in either tier. A backstop, not the ceiling — the
+                # recv gate already implies it once the GPU tally is bounded by
+                # the pool, and it is a no-op with the GPU tier off.
+                if (
+                    sparsekv_pages_used + sparsekv_gpu_pages_used + need
+                    > self._sparsekv_admit_pages + self._sparsekv_gpu_pages
+                ):
                     self.waiting.appendleft(seq)
                     break
                 # Count this admission so later iterations in THIS cycle see it
@@ -1255,6 +1340,10 @@ class Scheduler:
                 # cycle). If a later can_allocate fails and breaks, the local tally
                 # is simply discarded and recomputed next cycle — no drift.
                 sparsekv_pages_used += need
+                # The recv lands the whole request on host again, so any credit
+                # carried over from an earlier residency (preempt, failed recv)
+                # would under-count host by exactly that much.
+                seq.sparsekv_promoted_pages = 0
 
             # Probe cache hits FIRST so budget check sees the real
             # (post-prefix-cache) remaining token count. V4 SWA correctness is
@@ -1555,6 +1644,9 @@ class Scheduler:
             self.kv_connector.load_failed(seq.id)
         seq.status = SequenceStatus.WAITING
         self._uncount_inflight_load(seq)
+        # Falling back to local prefill drops the coordinator slot, so any promote
+        # credit from the abandoned recv no longer describes resident pages.
+        seq.sparsekv_promoted_pages = 0
         seq.offload_loaded = False
         seq.offload_loaded_tokens = seq.num_cached_tokens
         seq.offload_load_failed = True
@@ -1742,6 +1834,9 @@ class Scheduler:
         seq.num_bonus_tokens = 0
         seq.spec_token_ids = np.array([], dtype=np.int32)
         seq.is_first_decode = False
+        # Leaving the batch drops the coordinator slot, freeing both cold tiers;
+        # keeping the credit would under-count host usage on re-admission.
+        seq.sparsekv_promoted_pages = 0
         if seq.is_partial_prefill:
             seq.is_partial_prefill = False
             self._partial_prefill_count -= 1
@@ -2267,6 +2362,24 @@ class Scheduler:
     def _connector_flag(self, name: str) -> bool:
         return bool(getattr(self.kv_connector, name, False))
 
+    def _find_cold_pool_resident_seq(self, req_id) -> Sequence | None:
+        """Locate a cold-pool-resident Sequence by connector req_id (str or int).
+
+        Deliberately blind to sequences outside _sparsekv_live_seqs: a promote
+        report can land after the request lost its coordinator slot (preempt,
+        abort, finish), and crediting it there would resurrect pages the worker
+        has already freed.
+        """
+        candidates = {req_id, str(req_id)}
+        try:
+            candidates.add(int(req_id))
+        except (TypeError, ValueError):
+            pass
+        for seq in self._sparsekv_live_seqs():
+            if seq.id in candidates:
+                return seq
+        return None
+
     @staticmethod
     def _has_req_id(req_ids: list, seq_id) -> bool:
         candidates = (seq_id, str(seq_id))
@@ -2475,6 +2588,31 @@ class Scheduler:
                 req_id,
             )
             self.failed_recving_kv_req_ids.append(req_id)
+
+        if getattr(self, "_sparsekv_gpu_cold_enabled", False):
+            for req_id, pages in (kv_connector_output.promoted_gpu_pages or {}).items():
+                if pages <= 0:
+                    continue
+                seq = self._find_cold_pool_resident_seq(req_id)
+                if seq is None:
+                    continue
+                # Highest report wins rather than a running sum: a duplicated
+                # round would otherwise walk the credit up to the request's whole
+                # footprint and zero out its host reservation. Capped at that
+                # footprint for the same reason — the worker cannot promote more
+                # pages than the request holds.
+                worst_case = self._sparsekv_worst_case_pages(seq)
+                credit = max(self._sparsekv_gpu_pages_of(seq), int(pages))
+                if credit > worst_case:
+                    logger.error(
+                        "SparseKV promote report for %s claims %d pages > its %d-page "
+                        "footprint; clamping. The promote-done signal is broken.",
+                        req_id,
+                        credit,
+                        worst_case,
+                    )
+                    credit = worst_case
+                seq.sparsekv_promoted_pages = credit
 
         for req_id in kv_connector_output.finished_sending or ():
             assert (

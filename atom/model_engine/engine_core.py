@@ -7,11 +7,12 @@ import queue
 import threading
 import time
 from contextlib import ExitStack
-from typing import List
 
 import torch
 import zmq
+
 from atom.config import Config, ParallelConfig
+from atom.kv_transfer.disaggregation import KVOutputAggregator
 from atom.model_engine.async_proc import AsyncIOProcManager
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import EngineUtilityHandler
@@ -27,8 +28,6 @@ from atom.utils.distributed.utils import (
     stateless_destroy_torch_distributed_process_group,
 )
 
-from atom.kv_transfer.disaggregation import KVOutputAggregator
-
 logger = logging.getLogger("atom")
 
 
@@ -36,7 +35,7 @@ class EngineCore:
     def __init__(self, config: Config, input_address: str, output_address: str):
         self.label = "Engine Core"
         self.input_queue = queue.Queue[Sequence]()
-        self.output_queue = queue.Queue[List[Sequence]]()
+        self.output_queue = queue.Queue[list[Sequence]]()
         self.stream_output_queue = (
             queue.Queue()
         )  # Queue for streaming intermediate outputs
@@ -104,6 +103,12 @@ class EngineCore:
             assert ret, "Failed to allocate kv cache"
 
             config.num_kvcache_blocks = num_blocks
+            # Report the auto-sized SparseKV GPU cold tier back before the
+            # Scheduler is built below; its admission gate needs the real page
+            # count, which only the worker knows.
+            config.sparsekv_gpu_cold_pages = self.runner_mgr.call_func(
+                "get_sparsekv_gpu_cold_pages", wait_out=True
+            )
             if not config.enforce_eager and not config.disagg_is_decode:
                 cap_cost, bs, pool_bytes = self.runner_mgr.call_func(
                     "capture_cudagraph", wait_out=True
@@ -151,7 +156,6 @@ class EngineCore:
         """Called after ModelRunner is initialized (model loaded) but before
         get_num_blocks/allocate_kv_cache.  Override in subclasses to inject
         inter-process synchronization at this point in the init sequence."""
-        pass
 
     def _init_data_parallel(self, config: Config):
         pass
@@ -920,6 +924,9 @@ class DecodeEngineCore(EngineCore):
             )
 
         # --- Create DecodeScheduler now that num_kvcache_blocks is set ---
+        config.sparsekv_gpu_cold_pages = self.runner_mgr.call_func(
+            "get_sparsekv_gpu_cold_pages", wait_out=True
+        )
         self.scheduler = DecodeScheduler(
             config, disagg_cu_shm_name=config.disagg_cu_shm_name
         )

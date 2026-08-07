@@ -104,7 +104,8 @@ class KVConnectorOutput:
             f"failed_recving={self.failed_recving}, "
             f"finished_saving={self.finished_saving}, "
             f"loading={self.finished_loading}, "
-            f"failed_loading={self.failed_loading})"
+            f"failed_loading={self.failed_loading}, "
+            f"promoted_gpu_pages={self.promoted_gpu_pages})"
         )
 
 

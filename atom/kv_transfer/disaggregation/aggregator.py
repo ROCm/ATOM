@@ -54,6 +54,7 @@ class KVOutputAggregator:
         self._seen_saving: dict[ReqId, set[int]] = {}
         self._seen_loading: dict[ReqId, set[int]] = {}
         self._seen_load_failed: dict[ReqId, set[int]] = {}
+        self._seen_promoted: dict[ReqId, dict[int, int]] = {}
 
     @property
     def world_size(self) -> int:
@@ -92,6 +93,10 @@ class KVOutputAggregator:
             if wo.failed_loading:
                 for rid in wo.failed_loading:
                     self._seen_load_failed.setdefault(rid, set()).add(worker_idx)
+            if wo.promoted_gpu_pages:
+                for rid, pages in wo.promoted_gpu_pages.items():
+                    per_worker = self._seen_promoted.setdefault(rid, {})
+                    per_worker[worker_idx] = per_worker.get(worker_idx, 0) + pages
 
         done_sending = {
             rid
@@ -142,6 +147,10 @@ class KVOutputAggregator:
         for rid in failed_recving:
             self._seen_recving.pop(rid, None)
             self._seen_recv_failed.pop(rid, None)
+            # A rank whose recv failed never enqueues a promote, so a partial
+            # promote fan-in for this request can never complete — drop it rather
+            # than retain it for the life of the process.
+            self._seen_promoted.pop(rid, None)
         for rid in done_saving:
             del self._seen_saving[rid]
         for rid in done_loading:
@@ -151,6 +160,17 @@ class KVOutputAggregator:
             self._seen_loading.pop(rid, None)
             self._seen_load_failed.pop(rid, None)
 
+        # SparseKV cold tiers are per-rank, and the scheduler's page budget
+        # mirrors ONE rank's pool. So a request's promoted page count is the
+        # MINIMUM across ranks — the amount every rank actually freed on host.
+        promoted = {
+            rid: min(per_worker.values())
+            for rid, per_worker in self._seen_promoted.items()
+            if len(per_worker) >= self._world_size
+        }
+        for rid in promoted:
+            del self._seen_promoted[rid]
+
         return KVConnectorOutput(
             finished_sending=done_sending,
             finished_recving=done_recving,
@@ -158,6 +178,7 @@ class KVOutputAggregator:
             finished_saving=done_saving,
             finished_loading=done_loading,
             failed_loading=failed_loading,
+            promoted_gpu_pages=promoted,
         )
 
     def reset(self) -> None:
@@ -168,6 +189,7 @@ class KVOutputAggregator:
         self._seen_saving.clear()
         self._seen_loading.clear()
         self._seen_load_failed.clear()
+        self._seen_promoted.clear()
 
     @property
     def pending_count(self) -> tuple[int, int]:

@@ -1557,6 +1557,17 @@ class ModelRunner:
             )
         return int(overhead)
 
+    def get_sparsekv_gpu_cold_pages(self) -> int:
+        """Pages the SparseKV GPU cold tier actually got (0 when off).
+
+        Under auto sizing the count is only known after every other GPU tensor is
+        allocated, so the scheduler cannot derive it — it has to be reported back
+        from the worker, or its admission gate would run as if the tier were off
+        and the promote-done downgrade would never fire.
+        """
+        coord = getattr(self, "sparsekv_coordinator", None)
+        return int(getattr(coord, "num_gpu_pages", 0)) if coord is not None else 0
+
     def get_num_blocks(self) -> dict[str, int]:
         torch.set_default_device(self.device)
         config = self.config
@@ -3379,8 +3390,12 @@ class ModelRunner:
         self._sparsekv_last_active_reqids = cur_active
         if coord.gpu_cold_enabled:
             promoted = coord.drain_promote_queue()
-            if promoted:
-                self._sparsekv_promoted.update(promoted)
+            for rid, pages in promoted.items():
+                # Accumulate: a second promote for the same request before the
+                # scheduler reads this batch must not drop the first one's pages.
+                self._sparsekv_promoted[rid] = (
+                    self._sparsekv_promoted.get(rid, 0) + pages
+                )
         coord.sync_active(req_ids)
         for i, rid in enumerate(req_ids):
             if coord.is_registered(rid):

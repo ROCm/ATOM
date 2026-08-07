@@ -93,13 +93,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_SPARSEKV_ADMIT_RESERVE_PAGES": lambda: int(
         os.getenv("ATOM_SPARSEKV_ADMIT_RESERVE_PAGES", "8")
     ),
-    # GPU cold tier: number of paged GPU cold-pool pages (page_size tokens each)
-    # allocated from spare HBM to extend total cold capacity beyond the host pool.
-    # 0 (default) disables the GPU cold tier entirely (two-layer mode). When > 0,
-    # RDMA-received KV is promoted from host to GPU cold tier after done_recving,
-    # and decode swap reads from both tiers based on each token's home.
+    # GPU cold tier: paged GPU cold-pool pages (page_size tokens each) carved out
+    # of spare HBM to extend total cold capacity beyond the host pool. RDMA-received
+    # KV is promoted host -> GPU after done_recving, and decode swap reads from both
+    # tiers based on each token's home.
+    #   -1 (default) = auto — take whatever HBM is still free once everything else
+    #                  is allocated, leaving (1 - gpu_memory_utilization) as
+    #                  headroom. This is the intended knob: size the tier with
+    #                  --gpu-memory-utilization, not with a page count.
+    #    0           = disabled (two-layer host-only mode)
+    #   >0           = explicit page count, for tests and A/B runs
     "ATOM_SPARSEKV_GPU_COLD_PAGES": lambda: int(
-        os.getenv("ATOM_SPARSEKV_GPU_COLD_PAGES", "0")
+        os.getenv("ATOM_SPARSEKV_GPU_COLD_PAGES", "-1")
     ),
     # --- Kernel Fusion Toggles ---
     # fused_compress_attn: switch between Triton (default historical) and a

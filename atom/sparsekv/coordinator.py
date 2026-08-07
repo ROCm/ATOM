@@ -98,28 +98,6 @@ class SparseKVCoordinator:
         self._req_pages: dict[int, list[int]] = {}
         self._req_host_alloc_len = [0] * R
 
-        # GPU cold tier: spare HBM used as a second cold pool alongside the host
-        # pool. Tokens are disjoint across the two tiers (a token's home is in
-        # exactly one). Disabled when num_gpu_cold_pages == 0.
-        self.num_gpu_pages = num_gpu_cold_pages
-        self.gpu_cold_enabled = num_gpu_cold_pages > 0
-        if self.gpu_cold_enabled:
-            num_gpu_slots = num_gpu_cold_pages * page_size
-            self.gpu_cold_pool = torch.zeros(
-                (num_layers, num_gpu_slots, kv_dim),
-                dtype=kv_dtype,
-                device=self.device,
-            )
-            self.req_to_gpu_pool = torch.full(
-                (R, self.table_stride), _EMPTY, dtype=torch.int32, device=self.device
-            )
-        else:
-            self.gpu_cold_pool = None
-            self.req_to_gpu_pool = None
-        self._free_gpu_pages: list[int] = list(range(num_gpu_cold_pages))
-        self._req_gpu_pages: dict[int, list[int]] = {}
-        self._req_gpu_alloc_len = [0] * R
-
         # Promote queue: completion thread enqueues req_ids after done_recving;
         # model runner forward loop drains and runs promote_to_gpu.
         import threading
@@ -127,10 +105,16 @@ class SparseKVCoordinator:
         self._promote_lock = threading.Lock()
         self._promote_queue: list = []
         self._promote_events: dict[int, torch.cuda.Event] = {}
-        if self.gpu_cold_enabled and str(self.device) != "cpu":
-            self.promote_stream = torch.cuda.Stream(device=self.device)
-        else:
-            self.promote_stream = None
+        # Host pages a promote gather is still reading; freed once its event fires.
+        self._promote_pending_free: list[tuple] = []
+
+        # GPU cold tier: spare HBM used as a second cold pool alongside the host
+        # pool. Tokens are disjoint across the two tiers (a token's home is in
+        # exactly one). Disabled when num_gpu_cold_pages == 0; autosize_gpu_cold_tier
+        # can size it later, once the rest of the model's HBM is committed.
+        self._req_gpu_pages: dict[int, list[int]] = {}
+        self._req_gpu_alloc_len = [0] * R
+        self._init_gpu_cold_tier(num_gpu_cold_pages)
 
         # GPU hot buffer: [num_layers, R * H1, kv_dim].
         self.hot_buffer = torch.zeros(
@@ -523,6 +507,8 @@ class SparseKVCoordinator:
             return
         num_new_pages = (page_end - allocated_len) // page
         if len(self._free_host_pages) < num_new_pages:
+            self._reclaim_promoted_host_pages(force=True)
+        if len(self._free_host_pages) < num_new_pages:
             raise RuntimeError(
                 f"SparseKV host pool exhausted: need {num_new_pages} pages, "
                 f"{len(self._free_host_pages)} free (num_host_pages="
@@ -550,6 +536,75 @@ class SparseKVCoordinator:
     # ------------------------------------------------------------------
     # paged GPU cold tier
     # ------------------------------------------------------------------
+    @property
+    def gpu_page_bytes(self) -> int:
+        """HBM one GPU cold-tier page costs, across all layers."""
+        return (
+            self.num_layers
+            * self.host_page_size
+            * self.kv_dim
+            * (torch.empty(0, dtype=self.kv_dtype).element_size())
+        )
+
+    def _init_gpu_cold_tier(self, num_pages: int) -> None:
+        """Allocate (or disable) the GPU cold pool and its page free-list."""
+        self.num_gpu_pages = max(0, num_pages)
+        self.gpu_cold_enabled = self.num_gpu_pages > 0
+        if self.gpu_cold_enabled:
+            self.gpu_cold_pool = torch.zeros(
+                (
+                    self.num_layers,
+                    self.num_gpu_pages * self.host_page_size,
+                    self.kv_dim,
+                ),
+                dtype=self.kv_dtype,
+                device=self.device,
+            )
+            self.req_to_gpu_pool = torch.full(
+                (self.max_num_seqs, self.table_stride),
+                _EMPTY,
+                dtype=torch.int32,
+                device=self.device,
+            )
+        else:
+            self.gpu_cold_pool = None
+            self.req_to_gpu_pool = None
+        self._free_gpu_pages: list[int] = list(range(self.num_gpu_pages))
+        if self.gpu_cold_enabled and str(self.device) != "cpu":
+            self.promote_stream = torch.cuda.Stream(device=self.device)
+        else:
+            self.promote_stream = None
+
+    def autosize_gpu_cold_tier(self, reserve_fraction: float) -> int:
+        """Give the GPU cold tier whatever HBM is left, minus a headroom fraction.
+
+        Call once every other GPU allocation is done (hot buffer, decode scratch,
+        index cache, top-k buffer): free memory is MEASURED here rather than
+        predicted, so a tensor added elsewhere later shrinks the tier instead of
+        silently overcommitting HBM. ``reserve_fraction`` is
+        ``1 - gpu_memory_utilization`` — the share of the device the server
+        promised not to touch, which is also what CUDA graph capture and the
+        collective libraries draw on after this point.
+
+        Returns the number of pages allocated (0 leaves the tier disabled).
+        """
+        if str(self.device) == "cpu":
+            return 0
+        free, total = torch.cuda.mem_get_info(self.device)
+        usable = int(free) - int(total * reserve_fraction)
+        pages = max(0, usable // self.gpu_page_bytes)
+        self._init_gpu_cold_tier(pages)
+        logger.info(
+            "SparseKV GPU cold tier: %d pages = %.2fGB (free %.2fGB, reserved "
+            "%.0f%% = %.2fGB for CUDA graphs / collectives / headroom)",
+            self.num_gpu_pages,
+            self.num_gpu_pages * self.gpu_page_bytes / 1e9,
+            free / 1e9,
+            reserve_fraction * 100,
+            total * reserve_fraction / 1e9,
+        )
+        return self.num_gpu_pages
+
     def alloc_gpu_pages(self, req_slot: int, start_pos: int, num_tokens: int) -> int:
         """Back logical positions with GPU cold-pool pages. Returns tokens allocated.
 
@@ -615,14 +670,15 @@ class SparseKVCoordinator:
         with self._promote_lock:
             pending = list(self._promote_queue)
             self._promote_queue.clear()
+        self._reclaim_promoted_host_pages()
         result = {}
         for req_id in pending:
             slot = self._reqid_to_slot.get(req_id)
-            if slot is None:
-                continue
-            gpu_pages = self.promote_to_gpu(slot)
-            if gpu_pages > 0:
-                result[req_id] = gpu_pages
+            # Report every drained request, a 0-page promote included (GPU tier
+            # full, or the request already released). The scheduler aggregates
+            # this signal across all ranks before granting host-budget relief, so
+            # a silent rank would stall that request's signal forever.
+            result[req_id] = self.promote_to_gpu(slot) if slot is not None else 0
         return result
 
     def promote_to_gpu(self, req_slot: int) -> int:
@@ -686,9 +742,15 @@ class SparseKVCoordinator:
                 self._run_promote_swap(layer_id, src_t, dst_t)
 
         for hp in host_pages_to_free:
-            self._free_host_pages.append(hp)
             if hp in req_host_pages:
                 req_host_pages.remove(hp)
+        if self.promote_stream is not None:
+            # The gather is still reading these pages on promote_stream. Handing
+            # them back now lets admission hand them to a new request whose RDMA
+            # would overwrite the source mid-copy.
+            self._promote_pending_free.append((ev, host_pages_to_free))
+        else:
+            self._free_host_pages.extend(host_pages_to_free)
 
         self._req_gpu_alloc_len[req_slot] = max(
             self._req_gpu_alloc_len[req_slot],
@@ -699,6 +761,28 @@ class SparseKVCoordinator:
             ),
         )
         return gpu_promoted
+
+    def _reclaim_promoted_host_pages(self, force: bool = False) -> int:
+        """Return host pages whose promote gather has finished to the free pool.
+
+        ``force`` blocks on the outstanding events instead of polling them; used
+        as the last resort before alloc_host_pages would declare the pool
+        exhausted, since pages waiting here are free in every sense but timing.
+        """
+        if not self._promote_pending_free:
+            return 0
+        still_pending = []
+        reclaimed = 0
+        for ev, pages in self._promote_pending_free:
+            if force:
+                ev.synchronize()
+            elif not ev.query():
+                still_pending.append((ev, pages))
+                continue
+            self._free_host_pages.extend(pages)
+            reclaimed += len(pages)
+        self._promote_pending_free = still_pending
+        return reclaimed
 
     def _run_promote_swap(
         self, layer_id: int, src_locs: torch.Tensor, dst_locs: torch.Tensor

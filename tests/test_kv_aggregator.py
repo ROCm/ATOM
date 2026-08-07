@@ -156,6 +156,79 @@ class TestReset:
         assert agg.pending_count == (0, 0)
 
 
+class TestPromotedGpuPages:
+    """SparseKV promote-done signal: cold tiers are per-rank and the scheduler's
+    page budget mirrors ONE rank, so a request's credit is the minimum across
+    ranks and is only released once every rank has reported."""
+
+    def test_min_across_workers(self):
+        agg = KVOutputAggregator(world_size=3)
+        result = agg.aggregate(
+            [
+                KVConnectorOutput(promoted_gpu_pages={"r1": 5}),
+                KVConnectorOutput(promoted_gpu_pages={"r1": 3}),
+                KVConnectorOutput(promoted_gpu_pages={"r1": 4}),
+            ]
+        )
+        assert result.promoted_gpu_pages == {"r1": 3}
+
+    def test_withheld_until_all_workers_report(self):
+        agg = KVOutputAggregator(world_size=2)
+        first = agg.aggregate(
+            [KVConnectorOutput(promoted_gpu_pages={"r1": 4}), KVConnectorOutput()]
+        )
+        assert first.promoted_gpu_pages == {}
+        second = agg.aggregate(
+            [KVConnectorOutput(), KVConnectorOutput(promoted_gpu_pages={"r1": 2})]
+        )
+        assert second.promoted_gpu_pages == {"r1": 2}
+
+    def test_zero_report_yields_no_credit(self):
+        # A rank whose GPU tier was full promotes nothing; the request then gets
+        # no host-budget relief, but the signal still resolves.
+        agg = KVOutputAggregator(world_size=2)
+        result = agg.aggregate(
+            [
+                KVConnectorOutput(promoted_gpu_pages={"r1": 4}),
+                KVConnectorOutput(promoted_gpu_pages={"r1": 0}),
+            ]
+        )
+        assert result.promoted_gpu_pages == {"r1": 0}
+
+    def test_repeat_report_from_same_worker_accumulates(self):
+        agg = KVOutputAggregator(world_size=2)
+        agg.aggregate(
+            [KVConnectorOutput(promoted_gpu_pages={"r1": 2}), KVConnectorOutput()]
+        )
+        result = agg.aggregate(
+            [
+                KVConnectorOutput(promoted_gpu_pages={"r1": 1}),
+                KVConnectorOutput(promoted_gpu_pages={"r1": 3}),
+            ]
+        )
+        assert result.promoted_gpu_pages == {"r1": 3}
+
+    def test_failed_recv_drops_partial_fan_in(self):
+        # A rank whose recv failed never enqueues a promote, so the fan-in for
+        # this request can never complete; retaining it would leak forever.
+        agg = KVOutputAggregator(world_size=2)
+        agg.aggregate(
+            [KVConnectorOutput(promoted_gpu_pages={"r1": 4}), KVConnectorOutput()]
+        )
+        agg.aggregate(
+            [
+                KVConnectorOutput(finished_recving={"r1"}),
+                KVConnectorOutput(failed_recving={"r1"}),
+            ]
+        )
+        assert agg._seen_promoted == {}
+
+    def test_emitted_once(self):
+        agg = KVOutputAggregator(world_size=1)
+        agg.aggregate([KVConnectorOutput(promoted_gpu_pages={"r1": 4})])
+        assert agg.aggregate([KVConnectorOutput()]).promoted_gpu_pages == {}
+
+
 class TestKVConnectorOutput:
     def test_defaults(self):
         out = KVConnectorOutput()

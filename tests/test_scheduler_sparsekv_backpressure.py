@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Tests for the SparseKV host cold-pool admission back-pressure in Scheduler.
+# Tests for the SparseKV cold-pool admission back-pressure in Scheduler.
 #
 # The decode worker keeps every resident request's full KV in a paged host pool
 # sized ratio × max_num_seqs × (hot+1) tokens, and that context grows one page per
@@ -9,21 +9,46 @@
 # remote-load request that would overflow the pool, and permanently REJECTS one
 # whose lifetime footprint can never fit — instead of the worker over-committing
 # mid-decode and killing the runner.
+#
+# With a GPU cold tier (ATOM_SPARSEKV_GPU_COLD_PAGES > 0) admission becomes two
+# gates and a promote-done signal: the recv gate keeps the host pool able to land
+# a whole incoming request (prefill RDMAs it there in one piece), the capacity
+# gate bounds combined host+GPU residency, and promote-done downgrades the host
+# half of a request's reservation once the worker has moved those pages to the
+# GPU tier — without which host stays the batch ceiling and the GPU tier is inert.
 
 
 from conftest import MockConfig
 
+from atom.kv_transfer.disaggregation.types import KVConnectorOutput
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import SequenceStatus
 from atom.sampling_params import SamplingParams
 
 
-def _make_scheduler(monkeypatch, *, ratio, hot, reserve_pages, **cfg):
+def _make_scheduler(monkeypatch, *, ratio, hot, reserve_pages, gpu_pages=0, **cfg):
     monkeypatch.setenv("ATOM_SPARSEKV_ENABLE", "1")
     monkeypatch.setenv("ATOM_SPARSEKV_HOST_TO_DEVICE_RATIO", str(ratio))
     monkeypatch.setenv("ATOM_SPARSEKV_HOT_BUFFER_SIZE", str(hot))
     monkeypatch.setenv("ATOM_SPARSEKV_ADMIT_RESERVE_PAGES", str(reserve_pages))
+    monkeypatch.setenv("ATOM_SPARSEKV_GPU_COLD_PAGES", str(gpu_pages))
     return Scheduler(MockConfig(**cfg))
+
+
+class _RemoteLoadConnector:
+    """Consumer-side stub: every prefill parks for a remote KV load."""
+
+    is_producer = False
+    is_offload = False
+
+    def get_num_new_matched_tokens(self, seq):
+        return 0, True
+
+    def update_state_after_alloc(self, seq):
+        pass
+
+    def build_connector_meta(self):
+        return None
 
 
 def test_admit_pages_matches_coordinator_formula(monkeypatch):
@@ -175,3 +200,230 @@ def test_worst_case_includes_spec_draft_headroom(monkeypatch, seq_factory):
     # (the extra draft position crosses into a new page and must be reserved).
     sch.mtp_k = 2
     assert sch._sparsekv_worst_case_pages(r) == 6
+
+
+# ---------------------------------------------------------------------------
+# GPU cold tier: two admission gates + promote-done signal
+# ---------------------------------------------------------------------------
+
+
+def _gpu_tier_scheduler(monkeypatch, gpu_pages):
+    # host_tokens = 2*8*2 = 32; page=4 -> 8 pages; reserve 0 -> host admit 8.
+    return _make_scheduler(
+        monkeypatch,
+        ratio=2,
+        hot=1,
+        reserve_pages=0,
+        gpu_pages=gpu_pages,
+        max_num_seqs=8,
+        kv_cache_block_size=4,
+        num_kvcache_blocks=1000,
+        max_num_batched_tokens=256,
+        max_model_len=4096,
+    )
+
+
+def _resident(sch, seq_factory, prompt=8, max_tokens=4, promoted=0):
+    """Add a request already holding cold-pool pages (recv in flight)."""
+    seq = seq_factory(
+        [1] * prompt, sampling_params=SamplingParams(max_tokens=max_tokens)
+    )
+    seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+    seq.sparsekv_promoted_pages = promoted
+    sch.waiting.append(seq)
+    return seq
+
+
+def _incoming(sch, seq_factory, prompt=8, max_tokens=4):
+    seq = seq_factory(
+        [1] * prompt, sampling_params=SamplingParams(max_tokens=max_tokens)
+    )
+    sch.waiting.append(seq)
+    return seq
+
+
+def test_gpu_tier_budget_from_env(monkeypatch):
+    sch = _gpu_tier_scheduler(monkeypatch, gpu_pages=6)
+    assert sch._sparsekv_admit_pages == 8
+    assert sch._sparsekv_gpu_pages == 6
+    assert sch._sparsekv_gpu_cold_enabled is True
+
+    off = _gpu_tier_scheduler(monkeypatch, gpu_pages=0)
+    assert off._sparsekv_gpu_pages == 0
+    assert off._sparsekv_gpu_cold_enabled is False
+
+
+def test_promoted_pages_split_host_and_gpu_usage(monkeypatch, seq_factory):
+    """A promoted page moves from the host tally to the GPU tally; the combined
+    total stays the request's worst-case footprint."""
+    sch = _gpu_tier_scheduler(monkeypatch, gpu_pages=6)
+    seq = _resident(sch, seq_factory)  # 8 + 4 = 12 tokens -> 3 pages
+    assert sch._sparsekv_pages_in_use() == 3
+    assert sch._sparsekv_gpu_pages_credited() == 0
+
+    seq.sparsekv_promoted_pages = 2
+    assert sch._sparsekv_pages_in_use() == 1
+    assert sch._sparsekv_gpu_pages_credited() == 2
+
+
+def test_dual_gate_host_full_defers(monkeypatch, seq_factory):
+    """Recv gate: prefill RDMAs the whole request into the HOST pool before any
+    of it can be promoted, so free GPU-tier space does not make it admissible."""
+    sch = _gpu_tier_scheduler(monkeypatch, gpu_pages=6)
+    sch.kv_connector = _RemoteLoadConnector()
+    _resident(sch, seq_factory)
+    _resident(sch, seq_factory)  # host used 6 of 8, GPU tier fully free
+    seq = _incoming(sch, seq_factory)  # needs 3 host pages, only 2 free
+
+    assert sch._sparsekv_pages_in_use() == 6
+    assert sch._sparsekv_gpu_pages_credited() == 0  # capacity gate has room to spare
+    sch.schedule()
+
+    assert seq.status == SequenceStatus.WAITING
+    assert seq in sch.waiting
+
+    # Control: the host budget is the only thing holding it back.
+    sch._sparsekv_admit_pages = 9
+    sch.schedule()
+    assert seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+
+
+def test_capacity_gate_never_binds_before_recv_gate(monkeypatch, seq_factory):
+    """The capacity gate is a backstop, not the batch ceiling.
+
+    Its budget exceeds the recv gate's by exactly the GPU pool, and the GPU tally
+    can never exceed that pool, so anything the recv gate admits it also admits.
+    The batch ceiling of host+GPU comes from the recv gate alone, via the
+    promote-done downgrade (see test_promote_done_releases_host_budget). Pinned
+    here so a change that makes the tally unbounded — dropping the clamp, or
+    counting unreported decode-time GPU pages — has to confront this first.
+    """
+    sch = _gpu_tier_scheduler(monkeypatch, gpu_pages=6)
+    sch.kv_connector = _RemoteLoadConnector()
+    a = _resident(sch, seq_factory)
+    b = _resident(sch, seq_factory)
+    a.sparsekv_promoted_pages = 3
+    b.sparsekv_promoted_pages = 3  # host tally 0, GPU tier saturated
+    seq = _incoming(sch, seq_factory, prompt=12)  # 12 + 4 = 16 -> 4 pages
+
+    host_used = sch._sparsekv_pages_in_use()
+    gpu_used = sch._sparsekv_gpu_pages_credited()
+    need = sch._sparsekv_worst_case_pages(seq)
+    assert gpu_used == 6 and host_used == 0
+    assert host_used + need <= sch._sparsekv_admit_pages  # recv gate admits
+    assert (  # so does the capacity gate, necessarily
+        host_used + gpu_used + need
+        <= sch._sparsekv_admit_pages + sch._sparsekv_gpu_pages
+    )
+
+    sch.schedule()
+    assert seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+
+
+def test_over_credit_clamped_not_trapped(monkeypatch, seq_factory):
+    """An over-reporting worker must not wedge the capacity gate into deferring
+    every request forever; the tally is clamped to the physical pool instead."""
+    sch = _gpu_tier_scheduler(monkeypatch, gpu_pages=6)
+    sch.kv_connector = _RemoteLoadConnector()
+    bogus = _resident(sch, seq_factory)
+    bogus.sparsekv_promoted_pages = 99
+    seq = _incoming(sch, seq_factory)
+
+    assert sch._sparsekv_gpu_pages_credited() == 6
+    sch.schedule()
+    assert seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+
+
+def test_promote_report_clamped_to_footprint(monkeypatch, seq_factory):
+    """A report larger than the request's whole footprint is impossible; crediting
+    it verbatim would zero out that request's host reservation."""
+    sch = _gpu_tier_scheduler(monkeypatch, gpu_pages=64)
+    sch.kv_connector = _RemoteLoadConnector()
+    seq = _resident(sch, seq_factory)  # worst case 3 pages
+
+    sch._update_from_kv_xfer_finished(
+        KVConnectorOutput(promoted_gpu_pages={seq.id: 40})
+    )
+    assert seq.sparsekv_promoted_pages == 3
+
+
+def test_promote_done_releases_host_budget(monkeypatch, seq_factory):
+    """The promote-done signal downgrades a request's host reservation, which is
+    what lets the host pool cycle instead of pinning the batch ceiling."""
+    sch = _gpu_tier_scheduler(monkeypatch, gpu_pages=6)
+    sch.kv_connector = _RemoteLoadConnector()
+    promoted_seq = _resident(sch, seq_factory)
+    _resident(sch, seq_factory)
+    seq = _incoming(sch, seq_factory)
+
+    sch._update_from_kv_xfer_finished(
+        KVConnectorOutput(promoted_gpu_pages={promoted_seq.id: 3})
+    )
+    assert promoted_seq.sparsekv_promoted_pages == 3
+    assert sch._sparsekv_pages_in_use() == 3  # was 6
+    assert sch._sparsekv_gpu_pages_credited() == 3
+
+    sch.schedule()
+
+    assert seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+
+
+def test_gpu_tier_off_keeps_single_host_gate(monkeypatch, seq_factory):
+    """Kill-switch: with no GPU tier the capacity gate reduces to the recv gate,
+    so admission behaves exactly as it did before the tier existed."""
+    sch = _gpu_tier_scheduler(monkeypatch, gpu_pages=0)
+    sch.kv_connector = _RemoteLoadConnector()
+    _resident(sch, seq_factory)
+    fits = _incoming(sch, seq_factory)  # 3 + 3 <= 8
+
+    sch.schedule()
+    assert fits.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+
+    _resident(sch, seq_factory)  # host used 9 > 8
+    overflows = _incoming(sch, seq_factory)
+    sch.schedule()
+    assert overflows.status == SequenceStatus.WAITING
+
+
+def test_promote_credit_dropped_on_preempt(monkeypatch, seq_factory):
+    """Preempt drops the coordinator slot (both tiers freed), so the credit must
+    not survive into re-admission or host usage is under-counted."""
+    sch = _gpu_tier_scheduler(monkeypatch, gpu_pages=6)
+    seq = seq_factory([1] * 8, sampling_params=SamplingParams(max_tokens=4))
+    seq.status = SequenceStatus.RUNNING
+    seq.sparsekv_promoted_pages = 3
+    sch.running.append(seq)
+    assert sch._sparsekv_pages_in_use() == 0
+
+    sch.preempt(sch.running.pop())  # as the decode loop preempts
+    assert seq.sparsekv_promoted_pages == 0
+    assert sch._sparsekv_gpu_pages_credited() == 0
+
+    # The report is fanned in across all TP ranks and can land steps later, well
+    # after the preempt already freed both tiers.
+    sch.kv_connector = _RemoteLoadConnector()
+    sch._update_from_kv_xfer_finished(KVConnectorOutput(promoted_gpu_pages={seq.id: 3}))
+    assert seq.sparsekv_promoted_pages == 0
+    sch.waiting.remove(seq)  # re-admitted
+    seq.status = SequenceStatus.RUNNING
+    sch.running.append(seq)
+    assert sch._sparsekv_pages_in_use() == 3  # full footprint, no phantom credit
+
+
+def test_promote_signal_for_unknown_request_ignored(monkeypatch, seq_factory):
+    """A promote report can land after the request finished; drop it rather than
+    accumulate scheduler-side state keyed by a dead id."""
+    sch = _gpu_tier_scheduler(monkeypatch, gpu_pages=6)
+    sch.kv_connector = _RemoteLoadConnector()
+    live = _resident(sch, seq_factory)
+    sch._update_from_kv_xfer_finished(
+        KVConnectorOutput(promoted_gpu_pages={str(live.id + 1000): 4})
+    )
+    assert live.sparsekv_promoted_pages == 0
+    assert sch._sparsekv_gpu_pages_credited() == 0
+
+    # Same request id as a str, which is how connectors report it: credited.
+    sch._update_from_kv_xfer_finished(
+        KVConnectorOutput(promoted_gpu_pages={str(live.id): 2})
+    )
+    assert live.sparsekv_promoted_pages == 2

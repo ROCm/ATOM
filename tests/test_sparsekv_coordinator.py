@@ -795,6 +795,40 @@ def test_gpu_cold_enabled_allocates_pool():
     assert len(c._free_gpu_pages) == 4
 
 
+def test_gpu_page_bytes_matches_pool_footprint():
+    """The auto-sizer divides free HBM by this, so it must equal what a page
+    actually costs across all layers or the tier over- or under-shoots."""
+    c = _make_gpu_cold(num_layers=3, gpu_pages=4, page=16, kv_dim=8)
+    assert c.gpu_page_bytes == 3 * 16 * 8 * 2  # bf16
+    assert c.gpu_cold_pool.numel() * c.gpu_cold_pool.element_size() == (
+        4 * c.gpu_page_bytes
+    )
+
+
+def test_gpu_cold_tier_resizable_after_construction():
+    """Auto sizing builds the coordinator with 0 pages so the hot buffer lands
+    first, then re-inits the tier; both directions must leave consistent state."""
+    c = _make_gpu_cold(gpu_pages=0, page=16)
+    assert not c.gpu_cold_enabled and c.promote_stream is None
+
+    c._init_gpu_cold_tier(4)
+    assert c.gpu_cold_enabled
+    assert c.gpu_cold_pool.shape == (1, 4 * 16, 8)
+    assert c.req_to_gpu_pool is not None
+    assert len(c._free_gpu_pages) == 4
+
+    c._init_gpu_cold_tier(0)
+    assert not c.gpu_cold_enabled
+    assert c.gpu_cold_pool is None and c.req_to_gpu_pool is None
+    assert len(c._free_gpu_pages) == 0
+
+
+def test_autosize_is_noop_on_cpu():
+    c = _make_gpu_cold(gpu_pages=0)
+    assert c.autosize_gpu_cold_tier(0.15) == 0
+    assert not c.gpu_cold_enabled
+
+
 def test_gpu_alloc_and_free_pages():
     c = _make_gpu_cold(gpu_pages=4, page=16, max_ctx=64)
     slot = c.acquire(req_id=1, context_len=20)
