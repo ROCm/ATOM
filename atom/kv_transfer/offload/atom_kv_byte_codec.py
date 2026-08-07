@@ -45,8 +45,8 @@ class ATOMKVByteCodec:
         ``register_kv_caches``. We flatten every movable per-layer tensor (K, V,
         and fp8 scales when present) into one ordered segment list.
 
-        Each segment is a contiguous GPU tensor whose first ``num_blocks``
-        equal slices are the per-physical-block payloads we copy as raw bytes.
+        Each segment is a contiguous GPU tensor whose first ``num_blocks`` equal
+        slices are scheduler-visible transfer-block payloads copied as raw bytes.
         Two layouts must both work:
 
         * **Standard MHA/GQA** — block-major ``[num_blocks, ...]`` (e.g. ATOM's
@@ -69,6 +69,8 @@ class ATOMKVByteCodec:
                 getattr(kvt, "v_cache", None),
                 getattr(kvt, "k_scale", None),
                 getattr(kvt, "v_scale", None),
+                # DSA indexer cache (GLM-5.2 / DeepSeek-V3.2 sparse layers).
+                getattr(kvt, "index_cache", None),
             ):
                 if t is not None and isinstance(t, torch.Tensor) and t.numel() > 0:
                     self._segments.append(t)
@@ -101,7 +103,7 @@ class ATOMKVByteCodec:
                     f"(shape={tuple(seg.shape)})"
                 )
 
-        # Bytes for one physical block of each segment. Works for both
+        # Bytes for one scheduler-visible block of each segment. Works for both
         # block-major (numel = num_blocks * per_block) and token-major MLA
         # (numel = num_blocks * block_size * per_token) because both reduce to
         # the same contiguous per-block stride.
