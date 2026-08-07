@@ -51,6 +51,7 @@ class EngineArgs:
     long_prefill_token_threshold: int = 0
     attn_prefill_chunk_size: int = 16384
     state_checkpoint_interval_tokens: int = 8192
+    state_checkpoint_extra_entries: int = 0
     enable_chunked_prefill: bool = True
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
@@ -81,6 +82,8 @@ class EngineArgs:
     def __post_init__(self) -> None:
         if self.index_cache_dtype is None:
             self.index_cache_dtype = self.kv_cache_dtype
+        if self.state_checkpoint_extra_entries < 0:
+            raise ValueError("state_checkpoint_extra_entries must be >= 0")
 
     eplb_enable: bool = False
     eplb_config: dict | None = None
@@ -340,6 +343,18 @@ class EngineArgs:
                 "be a multiple of the prefix-cache hash block size; 0 disables "
                 "checkpoints entirely. Prefill chunks are aligned to these "
                 "positions, so this also quantizes chunk boundaries."
+            ),
+        )
+        parser.add_argument(
+            "--state-checkpoint-extra-entries",
+            type=int,
+            default=0,
+            help=(
+                "DeepSeek-V4 only: statically reserve this many STATE entries "
+                "above the --max-num-seqs live-request floor for retained "
+                "checkpoints. One entry is one V4 state group. The reservation "
+                "reduces PAGE capacity and remains allocated even when state "
+                "checkpointing or prefix caching is disabled."
             ),
         )
         parser.add_argument(

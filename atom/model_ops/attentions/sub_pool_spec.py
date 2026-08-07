@@ -10,7 +10,8 @@ There are exactly two pools, distinguished by what their size scales with:
               sliding window, the DeepSeek-V4 compressor ring, GDN/Mamba
               recurrent state. Classification follows the scaling, not the
               addressing: what puts a class in STATE is that its total is
-              `max_num_seqs * per_req`, whatever the rows are indexed by.
+              `max_num_seqs * per_req + optional flat headroom`, whatever the
+              rows are indexed by.
 
 A pool is a budget region, not a single entry size. Inside one pool there can
 be several **entry classes**, each with its own index space, its own bytes
@@ -69,6 +70,8 @@ class SubPoolSpec:
     extra_entries: int = 0
 
     def __post_init__(self):
+        if self.extra_entries < 0:
+            raise ValueError(f"{self.name}: extra_entries must be >= 0")
         if self.pool is Pool.STATE and self.entries_per_req < 1:
             raise ValueError(f"{self.name}: STATE entries need entries_per_req >= 1")
         if self.pool is Pool.PAGE and (self.entries_per_req or self.extra_entries):

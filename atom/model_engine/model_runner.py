@@ -1576,11 +1576,11 @@ class ModelRunner:
         # Sub-pool sizing is pure arithmetic over the byte budget — see
         # atom/model_ops/attentions/sub_pool_spec.py. STATE classes (GDN
         # recurrent state, the V4 compressor ring, the V4 sliding window) take
-        # their floor first because a request cannot run without them; the
-        # PAGE class absorbs the rest. Which classes exist, and what they are
-        # called, is the backend's business — the runner sizes them and
-        # publishes the counts, then every consumer looks up the class it
-        # declared itself.
+        # their live-request floor and any explicit static headroom first
+        # because a request cannot run without its state; the PAGE class
+        # absorbs the rest. Which classes exist, and what they are called, is
+        # the backend's business — the runner sizes them and publishes the
+        # counts, then every consumer looks up the class it declared itself.
         try:
             plan = plan_pools(specs, available_for_kv, config.max_num_seqs)
         except InsufficientPoolBudget as exc:
@@ -1596,6 +1596,15 @@ class ModelRunner:
                 f"({available_for_kv / (1 << 30):.2f}GB) at "
                 f"--gpu-memory-utilization {config.gpu_memory_utilization:.2f}."
             )
+            extra_entries = int(
+                getattr(config, "state_checkpoint_extra_entries", 0) or 0
+            )
+            extra_hint = (
+                f" or reduce --state-checkpoint-extra-entries "
+                f"(currently {extra_entries})"
+                if extra_entries > 0 and any(spec.extra_entries > 0 for spec in specs)
+                else ""
+            )
             if available_for_kv_budget > free:
                 # The physical free-memory clamp is the binding limit, not the
                 # utilization budget — raising --gpu-memory-utilization won't help.
@@ -1603,20 +1612,22 @@ class ModelRunner:
                     f" Only {free / (1 << 30):.2f}GB is physically free on the GPU "
                     f"(other processes may be holding memory); raising "
                     f"--gpu-memory-utilization will NOT help. Free GPU memory or "
-                    f"reduce --max-num-seqs (currently {config.max_num_seqs})."
+                    f"reduce --max-num-seqs (currently {config.max_num_seqs})"
+                    f"{extra_hint}."
                 )
             elif min_util_hint <= 1.0:
                 fix_msg = (
                     f" Set --gpu-memory-utilization >= {min_util_hint:.2f} "
                     f"(this only zeroes out the deficit; use a higher value for "
                     f"actual KV capacity) or reduce --max-num-seqs "
-                    f"(currently {config.max_num_seqs})."
+                    f"(currently {config.max_num_seqs}){extra_hint}."
                 )
             else:
                 fix_msg = (
                     f" Even --gpu-memory-utilization 1.0 is insufficient "
                     f"(would need {min_util:.2f}); reduce --max-num-seqs "
-                    f"(currently {config.max_num_seqs}) or free GPU memory."
+                    f"(currently {config.max_num_seqs}){extra_hint} or free GPU "
+                    f"memory."
                 )
             raise RuntimeError(base_msg + fix_msg) from exc
 
@@ -1671,9 +1682,11 @@ class ModelRunner:
         # KV in the pool. Per-req block usage = ceil(ctx_len/block_size).
         # STATE classes sit in their own reservation (already excluded from
         # the paged count at sizing time), so they add no per-block cost and
-        # never bind either: sizing reserves every STATE floor at exactly
-        # `max_num_seqs` requests' worth, so the request cap is max_num_seqs
-        # and the paged pool is the only thing that can run out first.
+        # never bind first: sizing reserves at least `max_num_seqs` requests'
+        # worth for every STATE class. Optional checkpoint headroom increases
+        # that reservation without changing the scheduler request cap, so the
+        # request cap remains max_num_seqs and only the paged pool can bind
+        # before it.
         max_model_len = config.max_model_len
         cap = config.max_num_seqs
         pct_lines = []

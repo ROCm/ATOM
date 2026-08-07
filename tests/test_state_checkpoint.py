@@ -16,6 +16,8 @@
 from math import inf, isinf
 from types import SimpleNamespace
 
+import pytest
+
 from conftest import MockConfig
 
 from atom.model_engine.block_manager import BlockManager
@@ -904,6 +906,46 @@ class TestCopyLifecycle:
         # committed by state_copies_for_batch()
         assert not bm.state.hash_to_group
         assert not bm.state_copies_for_batch()
+
+    @pytest.mark.parametrize(("extra_groups", "kept"), [(0, False), (1, True)])
+    def test_checkpoint_capacity_starts_above_the_live_floor(self, extra_groups, kept):
+        live_floor = 4
+        config = copy_config(
+            max_num_seqs=live_floor,
+            pool_entries={"state": live_floor + extra_groups},
+        )
+        bm = BlockManager(config)
+        owners = [
+            self._admitted(bm, list(range(100 * i, 100 * i + 40)))
+            for i in range(config.max_num_seqs)
+        ]
+        owner_groups = {seq.per_req_cache_group for seq in owners}
+        assert len(owner_groups) == live_floor
+        assert bm.state.num_free() == extra_groups
+
+        publisher = owners[0]
+        bm.hash_blocks(
+            publisher,
+            bm.checkpoint_limit(publisher) - publisher.num_cached_tokens,
+        )
+        h = boundary_hash(bm, publisher)
+        assert publisher.pending_checkpoint != -1
+
+        copies = bm.state_copies_for_batch()
+        assert publisher.pending_checkpoint == -1
+        assert bool(copies) is kept
+        assert (bm.state.lookup(h) >= 0) is kept
+        assert bm.state.checkpoint_fates() == {
+            "checkpoints_kept": int(kept),
+            "checkpoints_dropped": int(not kept),
+            "checkpoints_evicted": 0,
+            "checkpoints_orphaned": 0,
+        }
+        if kept:
+            src, dst = copies[0]
+            assert src == publisher.per_req_cache_group
+            assert dst == bm.state.lookup(h)
+            assert dst not in owner_groups
 
     def test_a_resume_is_handed_a_duplicate_not_a_fork(self):
         bm = BlockManager(copy_config())

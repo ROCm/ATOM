@@ -1313,6 +1313,10 @@ class Config:
     # hash block size (asserted in BlockManager). See
     # BlockManager.checkpointers_at.
     state_checkpoint_interval_tokens: int = 8192
+    # DeepSeek-V4 only: additional STATE entries beyond the max_num_seqs live
+    # floor. This is an explicit static reservation (one entry per V4 group),
+    # so it still consumes memory when checkpointing/prefix caching is off.
+    state_checkpoint_extra_entries: int = 0
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
     max_model_len: int | None = None
@@ -1424,6 +1428,8 @@ class Config:
     def __post_init__(self):
         if self.index_cache_dtype is None:
             self.index_cache_dtype = self.kv_cache_dtype
+        if self.state_checkpoint_extra_entries < 0:
+            raise ValueError("state_checkpoint_extra_entries must be >= 0")
 
         if isinstance(self.compilation_config, dict):
             self.compilation_config = CompilationConfig(**self.compilation_config)
