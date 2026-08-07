@@ -314,13 +314,15 @@ def install_minimax_m3_pool_patch() -> None:
 
 
 def maybe_get_minimax_m3_pools_from_sglang_batch(forward_batch=None):
-    if forward_batch is None:
+    from atom.plugin.sglang.runtime.attention_backend_resolver import (
+        resolve_sglang_runtime,
+    )
+
+    try:
+        runtime = resolve_sglang_runtime(forward_batch)
+    except RuntimeError:
         return None, None
-    token_to_kv_pool = getattr(forward_batch, "token_to_kv_pool", None)
-    req_to_token_pool = getattr(forward_batch, "req_to_token_pool", None)
-    if token_to_kv_pool is None or req_to_token_pool is None:
-        return None, None
-    return token_to_kv_pool, req_to_token_pool
+    return runtime.token_to_kv_pool, runtime.req_to_token_pool
 
 
 def _page_size(token_to_kv_pool) -> int:

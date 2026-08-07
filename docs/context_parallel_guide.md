@@ -265,7 +265,8 @@ existing TP ranks, so `world = tp` and `tp` must be divisible by `dcp`.
 - **Requires**: `tp % dcp == 0`; `world = tp` (DCP reuses TP GPUs, it does *not*
   add any). E.g. `-tp 8 -dcp 8` or `-tp 8 -dcp 2` on 8 GPUs.
 - **Composes with**: prefix caching and chunked prefill (both supported under
-  DCP); `--kv-cache-dtype fp8` (per-tensor scale).
+  DCP); `--kv-cache-dtype fp8` (per-tensor scale); **speculative decode / MTP**
+  (`--method mtp`, `num_speculative_tokens` 1–3; **gfx950 only**.
 - **Little benefit / avoid**: short-context, KV-memory-plentiful workloads —
   DCP adds per-step decode communication (Q all-gather + output reduce-scatter)
   that isn't worth it when KV memory isn't the constraint.
@@ -313,10 +314,23 @@ vllm serve deepseek-ai/DeepSeek-R1 \
     --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}'
 ```
 
+### ATOM server — DeepSeek-R1: TP8 + DCP8 + MTP (8 GPUs, gfx950)
+
+```bash
+python -m atom.entrypoints.openai_server \
+    --model deepseek-ai/DeepSeek-R1 \
+    -tp 8 -dcp 8 \
+    --kv_cache_dtype fp8 \       # bf16 or fp8; both support MTP under DCP
+    --method mtp --num-speculative-tokens 3
+```
+
 Tips:
 - `-tp 8 -dcp 1` (or omitting `-dcp`) disables DCP and serves as the baseline.
 - `--kv_cache_dtype fp8` further lowers KV memory; DCP uses a per-tensor scale
   (per-token / per-group fp8 layouts are not yet supported).
+- **MTP under DCP is gfx950-only** and works with both bf16 and fp8 KV cache for
+  `num_speculative_tokens` 1–3 — see
+  [DCP + Speculative Decode (MTP)](#dcp--speculative-decode-mtp).
 
 ## How it works
 
@@ -343,6 +357,43 @@ Tips:
    (a copy-only collective — safe); the prefill context path dequantizes the
    AllGathered compressed KV before `kv_b_proj`.
 
+## DCP + Speculative Decode (MTP)
+
+DCP composes with **MTP speculative decoding** (`--method mtp`). MTP verifies
+several draft tokens per step, so decode has query length `q = num_speculative_tokens
++ 1 > 1`. Under DCP the KV is round-robin sharded, so the intra-block causal mask
+must be applied on **global** token positions. This is handled by a dedicated
+**round-robin CP (`cprr`) MLA kernel**, selected automatically when DCP is on and
+`q > 1`.
+
+**Support matrix:**
+
+| | Supported |
+|---|---|
+| GPU arch | **gfx950 only** (the `cprr` kernel is persistent-only and ships for gfx950; gfx942 has no such kernel) |
+| Method | `--method mtp` (`num_speculative_tokens` = 1, 2, or 3) |
+| KV cache dtype | **bf16 and fp8** both work for all of `num_speculative_tokens` 1/2/3 |
+| DCP size | dcp2 / dcp4 / dcp8 all validated (`tp8`) |
+
+**Usage** (add MTP flags to any DCP command):
+
+```bash
+python -m atom.entrypoints.openai_server \
+    --model deepseek-ai/DeepSeek-R1 \
+    -tp 8 -dcp 8 --kv_cache_dtype fp8 \
+    --method mtp --num-speculative-tokens 3
+```
+
+Plugin path (`vllm serve`): add `--speculative-config '{"method":"mtp","num_speculative_tokens":3}'`.
+
+> **Not on gfx942.** Speculative decode + DCP raises at startup on non-gfx950
+> GPUs (`atom/config.py`). On gfx942 the non-persistent decode fallback ignores
+> the `cprr` masking and would silently produce wrong output, so it is rejected
+> rather than run — disable either DCP or speculative decode there.
+
+Accuracy: gsm8k (DeepSeek-R1, tp8, 5-shot) matches the non-speculative DCP
+baseline (≈0.95) across bf16/fp8 and `num_speculative_tokens` 1/2/3.
+
 ## Constraints & Compatibility
 
 | Constraint | Notes |
@@ -351,6 +402,7 @@ Tips:
 | World size | `world = tp`, `tp % dcp == 0` (DCP does not add GPUs) |
 | fp8 KV cache | Supported, **per-tensor scale only** (per-token / per-group not supported) |
 | prefix caching / chunked prefill | Supported |
+| speculative decode (MTP) | Supported on **gfx950 only** (bf16/fp8, `num_speculative_tokens` 1–3); raises at startup on gfx942 |
 | DCP + PCP | Independent dimensions (different phases); combined use not validated here |
 
 ## Source Files
@@ -358,10 +410,12 @@ Tips:
 | File | Description |
 |------|-------------|
 | `atom/model_engine/arg_utils.py` | `--decode-context-parallel-size` / `-dcp` CLI |
-| `atom/config.py` | DCP validation (`tp % dcp == 0`) |
+| `atom/config.py` | DCP validation (`tp % dcp == 0`); spec-decode + DCP arch gate (gfx950) |
 | `atom/model_engine/block_manager.py` | Interleaved block allocation; prefix-cache virtual-block accounting |
 | `atom/distributed/dcp_utils.py` | DCP distributed-access layer: `get_dcp_world_size` / `dcp_is_enabled` / `get_dcp_group` / `get_dcp_rank` |
 | `atom/model_ops/dcp_ops.py` | AG+RS LSE-combine, `reorg_kvcache`, local compressed-KV gather |
 | `atom/model_ops/attention_mla.py` | Server-mode DCP decode + prefix-cache / chunked-prefill context |
 | `atom/model_ops/attentions/aiter_mla.py`, `attentions/backends.py` | DCP decode / prefill metadata (interleaved slot_mapping, local seq lens) |
 | `atom/plugin/vllm/attention/layer_mla.py` | vllm-atom plugin DCP decode + prefill context |
+| `atom/spec_decode/eagle_proposer.py` | MTP draft loop: DCP round-robin slot for draft KV writes |
+| `atom/model_ops/attentions/aiter_mla.py` (`prepare_mtp_decode`) | Per-draft-step DCP-local metadata rebuild; `cprr` decode selects the round-robin MLA kernel via `g_kv_indptr` |
