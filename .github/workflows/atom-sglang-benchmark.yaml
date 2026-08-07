@@ -497,11 +497,6 @@ jobs:
             "${ATOM_REPOSITORY}" \
             "${ATOM_REF}" \
             "${SGLANG_IMAGE_SOURCE}" >> "$GITHUB_STEP_SUMMARY"
-          if [[ "${USE_WORKSPACE_ATOM}" == "true" ]]; then
-            printf -- '- ATOM runtime source: `workspace checkout`\n' >> "$GITHUB_STEP_SUMMARY"
-          else
-            printf -- '- ATOM runtime source: `baked Docker image`\n' >> "$GITHUB_STEP_SUMMARY"
-          fi
 
           if [[ "${USER_PROVIDED_SGLANG_IMAGE}" == "true" ]]; then
             printf -- '- User-provided image: `%s`\n- Expected SGLang version: `%s`\n- Expected SGLang commit: `%s`\n' \

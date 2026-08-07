@@ -182,11 +182,6 @@ jobs:
           SOURCE_SHA="$(git rev-parse HEAD)"
           echo "ATOM_SOURCE_SHA=${SOURCE_SHA}" >> "$GITHUB_ENV"
           echo "Benchmarking ${ATOM_SOURCE_REPOSITORY}@${ATOM_SOURCE_REF} (${SOURCE_SHA}) with ${SGLANG_IMAGE_SOURCE} image ${SGLANG_IMAGE_TAG}"
-          if [[ "${ATOM_BENCH_USE_WORKSPACE_ATOM}" == "true" ]]; then
-            echo "ATOM runtime source: workspace checkout"
-          else
-            echo "ATOM runtime source: baked Docker image"
-          fi
 
       - name: Container Engine Login
         run: |
@@ -606,11 +601,6 @@ jobs:
           data["atom_source_repository"] = os.environ.get("ATOM_SOURCE_REPOSITORY", "")
           data["atom_source_ref"] = os.environ.get("ATOM_SOURCE_REF", "")
           data["atom_source_sha"] = os.environ.get("ATOM_SOURCE_SHA", "")
-          data["atom_runtime_source"] = (
-              "workspace"
-              if os.environ.get("ATOM_BENCH_USE_WORKSPACE_ATOM", "true").lower() == "true"
-              else "baked-image"
-          )
           data["sglang_ref"] = os.environ.get("SGLANG_REF_USED", "")
           data["sglang_version"] = os.environ.get("SGLANG_VERSION_USED", "")
           data["sglang_image_source"] = os.environ.get("SGLANG_IMAGE_SOURCE", "")
