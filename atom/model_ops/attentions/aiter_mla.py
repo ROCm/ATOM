@@ -1006,6 +1006,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 shared_index_layers=shared_index_layers,
                 host_to_device_ratio=envs.ATOM_SPARSEKV_HOST_TO_DEVICE_RATIO,
                 page_size=self.model_runner.block_size,
+                num_gpu_cold_pages=envs.ATOM_SPARSEKV_GPU_COLD_PAGES,
             )
             # Shared logical-top-k side-channel buffer (one per decode query
             # token), written by the indexer op and read by the coordinator.

@@ -251,6 +251,36 @@ class SparseKVCoordinator:
         self.enable_prefetch = (
             bool(self._prefetch_groups) and envs.ATOM_SPARSEKV_PREFETCH
         )
+
+        # Plan buffers hold the per-query-token miss list recorded by a record-only
+        # detect: the logical cold token, the hot slot it was assigned, and its home
+        # (0=host, 1=gpu). Two consumers need them: IndexShare (anchor records, its
+        # shared layers replay) and the GPU cold tier (Design Y dual-source: detect
+        # once, then gather per home). Allocate whenever either is active; indexed by
+        # decode query token (0..n-1), one group live at a time.
+        # Production always supplies index_topk (it's a DSA requirement); the
+        # storage-only unit tests build a GPU-tier coordinator without it and never
+        # hit the swap path, so allocate only when the width is known. The prefetch
+        # branch below still hard-requires index_topk.
+        self._need_plan_buffers = (
+            self.enable_prefetch or self.gpu_cold_enabled
+        ) and index_topk is not None
+        if self._need_plan_buffers:
+            R = self.max_num_seqs
+            self._plan_miss_tok = torch.zeros(
+                (R, index_topk), dtype=torch.int32, device=self.device
+            )
+            self._plan_miss_slot = torch.zeros(
+                (R, index_topk), dtype=torch.int32, device=self.device
+            )
+            self._plan_miss_count = torch.zeros(
+                (R,), dtype=torch.int32, device=self.device
+            )
+            self._plan_miss_home = torch.zeros(
+                (R, index_topk), dtype=torch.int32, device=self.device
+            )
+            self._plan_topk = index_topk
+
         if not self.enable_prefetch:
             return
 
@@ -259,16 +289,6 @@ class SparseKVCoordinator:
         max_group = max(len(g) for g in self._prefetch_groups.values())
         self.prefetch_stream = torch.cuda.Stream()
         self._prefetch_events = [torch.cuda.Event() for _ in range(max_group)]
-        R = self.max_num_seqs
-        # Miss plan recorded by the current anchor, replayed by its shared layers.
-        # Indexed by decode query token (0..n-1); one group is live at a time.
-        self._plan_miss_tok = torch.zeros(
-            (R, index_topk), dtype=torch.int32, device=self.device
-        )
-        self._plan_miss_slot = torch.zeros(
-            (R, index_topk), dtype=torch.int32, device=self.device
-        )
-        self._plan_miss_count = torch.zeros((R,), dtype=torch.int32, device=self.device)
         logger.info(
             "SparseKV: IndexShare prefetch enabled; %d anchor group(s), "
             "%d shared layer(s) of %d total, max group size %d.",
@@ -308,21 +328,26 @@ class SparseKVCoordinator:
         self.prefetch_stream.wait_stream(cur)
         with torch.cuda.stream(self.prefetch_stream):
             for skip in group:
-                host_ptr = self._ensure_cold_dev_ptr(skip)
-                sparsekv_copy_planned(
-                    host_ptr,
-                    self.hot_buffer[skip],
-                    req_slots,
-                    self._plan_miss_tok[:n],
-                    self._plan_miss_slot[:n],
-                    self._plan_miss_count[:n],
-                    self._host_locs_arg(),
-                    self._host_stride,
-                    self.item_size_bytes,
-                    self.padded_hot_size,
-                    self.max_context_len,
-                    topk,
-                )
+                if self.gpu_cold_enabled:
+                    # Dual-source: replay the anchor's plan per home (the recorded
+                    # plan_miss_home tags each miss's tier). Same plan, two gathers.
+                    self._gather_planned_dual(skip, req_slots, n, topk)
+                else:
+                    host_ptr = self._ensure_cold_dev_ptr(skip)
+                    sparsekv_copy_planned(
+                        host_ptr,
+                        self.hot_buffer[skip],
+                        req_slots,
+                        self._plan_miss_tok[:n],
+                        self._plan_miss_slot[:n],
+                        self._plan_miss_count[:n],
+                        self._host_locs_arg(),
+                        self._host_stride,
+                        self.item_size_bytes,
+                        self.padded_hot_size,
+                        self.max_context_len,
+                        topk,
+                    )
                 self._prefetch_events[self._prefetch_slot[skip]].record(
                     self.prefetch_stream
                 )
@@ -742,6 +767,59 @@ class SparseKVCoordinator:
             self._cold_dev_ptr[layer_id] = ptr
         return ptr
 
+    def _gpu_cold_ptr(self, layer_id: int) -> int:
+        """Device pointer for one layer's GPU cold tier (0 if the tier is off)."""
+        if not self.gpu_cold_enabled:
+            return 0
+        return self.gpu_cold_pool[layer_id].data_ptr()
+
+    def _gather_planned_dual(
+        self, layer_id: int, req_slots: torch.Tensor, n: int, topk: int
+    ) -> None:
+        """Replay the recorded miss plan into one layer's hot buffer, per home.
+
+        Design Y dual-source swap-in: a record-only detect already wrote the miss
+        plan (tok, hot slot, home) into the plan buffers; this issues two pure
+        gathers — host-home misses from the pinned host cold pool, gpu-home misses
+        from the GPU cold tier — so a mixed-home top-k lands entirely in the hot
+        buffer. Runs on the current stream (the caller picks it).
+        """
+        from atom.sparsekv.swap_kernel import sparsekv_gather_planned
+
+        host_ptr = self._ensure_cold_dev_ptr(layer_id)
+        sparsekv_gather_planned(
+            host_ptr,
+            self.hot_buffer[layer_id],
+            req_slots,
+            self._plan_miss_tok[:n],
+            self._plan_miss_slot[:n],
+            self._plan_miss_count[:n],
+            self._plan_miss_home[:n],
+            0,  # target_home = host
+            self._host_locs_arg(),
+            self._host_stride,
+            self.item_size_bytes,
+            self.padded_hot_size,
+            self.max_context_len,
+            topk,
+        )
+        sparsekv_gather_planned(
+            self._gpu_cold_ptr(layer_id),
+            self.hot_buffer[layer_id],
+            req_slots,
+            self._plan_miss_tok[:n],
+            self._plan_miss_slot[:n],
+            self._plan_miss_count[:n],
+            self._plan_miss_home[:n],
+            1,  # target_home = gpu
+            self._gpu_locs_arg(),
+            self._host_stride,  # req_to_gpu_pool shares the table stride
+            self.item_size_bytes,
+            self.padded_hot_size,
+            self.max_context_len,
+            topk,
+        )
+
     # ------------------------------------------------------------------
     # staging (first decode)
     # ------------------------------------------------------------------
@@ -783,15 +861,30 @@ class SparseKVCoordinator:
         # above the initial hot set (all initial tokens share this baseline tick).
         self.recency[req_slot] = self._tick
         hot_base = self._hot_base(req_slot)
-        src = self.req_to_host_pool[req_slot, start_tok:num_tokens]
         dst = hot_base + slots
+        # Split the initial window by home: by first decode, promote may already
+        # have moved some of these tokens to the GPU cold tier (their host row is
+        # then -1), so gather each from its own tier. Two-layer mode keeps a single
+        # host gather (gpu group empty).
+        host_locs_row = self.req_to_host_pool[req_slot, start_tok:num_tokens]
+        if self.gpu_cold_enabled:
+            gpu_locs_row = self.req_to_gpu_pool[req_slot, start_tok:num_tokens]
+            gpu_home = gpu_locs_row >= 0
+            host_home = ~gpu_home
+            host_src, host_dst = host_locs_row[host_home], dst[host_home]
+            gpu_src, gpu_dst = gpu_locs_row[gpu_home], dst[gpu_home]
+        else:
+            host_src, host_dst = host_locs_row, dst
+            gpu_src = gpu_dst = None
         for layer_id in range(self.num_layers):
             # bookkeeping
             self.slot_token[layer_id, req_slot, :h] = tokens
             self.last_used[layer_id, req_slot, :h] = self._tick
             self.token_to_slot[layer_id, req_slot, start_tok:num_tokens] = slots
-            # data movement: cold[src] -> hot[hot_base+slot]
-            self._run_swap(layer_id, src, dst)
+            # data movement: each tier's cold[src] -> hot[hot_base+slot]
+            self._run_swap(layer_id, host_src, host_dst)
+            if gpu_src is not None and gpu_src.numel() > 0:
+                self._run_swap(layer_id, gpu_src, gpu_dst, gpu=True)
 
     # ------------------------------------------------------------------
     # per-layer swap-in (decode hot path)
@@ -809,26 +902,32 @@ class SparseKVCoordinator:
                 and are ignored / translated to slot 0).
 
         Returns:
-            (src_locs, dst_locs, translated) all CPU int32 1-D tensors:
-              - src_locs/dst_locs: cold-pool / hot-buffer ABSOLUTE rows to swap in
-                (paired, one per unique miss token).
+            (host_src, host_dst, gpu_src, gpu_dst, translated) all int32 1-D tensors:
+              - host_src/host_dst: host cold-pool / hot-buffer ABSOLUTE rows to swap
+                in for host-home misses (paired, one per unique host-home miss).
+              - gpu_src/gpu_dst: GPU cold-tier / hot-buffer ABSOLUTE rows for gpu-home
+                misses (both empty when the GPU tier is disabled — everything is
+                host-home, matching two-layer behaviour).
               - translated: hot-buffer ABSOLUTE row per entry of ``topk_logical``
                 (padding entries map to hot_base, harmless).
         """
         self._tick += 1
         tick = self._tick
         host_locs = self.req_to_host_pool[req_slot]
+        gpu_locs = self.req_to_gpu_pool[req_slot] if self.gpu_cold_enabled else None
         hot_base = self._hot_base(req_slot)
 
         topk = topk_logical.to(torch.int64)
-        # A position is valid only if in-range AND backed by an allocated cold-pool
-        # page. Anything < 0, beyond the cold pool depth, or outside the request's
-        # allocated range (``req_to_host_pool == -1``) is padding/garbage and is
-        # ignored (mirrors the sparse gather kernel's ``pos < req_kv_len`` guard).
-        # Without the backed check an in-range-but-unallocated position resolves to
-        # host row -1 and the gather faults. Clamp so the lookup never faults.
+        # A position is valid only if in-range AND backed in exactly one cold tier.
+        # Anything < 0, beyond the cold pool depth, or outside the request's
+        # allocated range (both tables == -1) is padding/garbage and is ignored
+        # (mirrors the sparse gather kernel's ``pos < req_kv_len`` guard). Without
+        # the backed check an in-range-but-unallocated position resolves to cold row
+        # -1 and the gather faults. Clamp so the lookup never faults.
         clamped = topk.clamp(min=0, max=self.max_context_len - 1)
         backed = host_locs[clamped] >= 0
+        if gpu_locs is not None:
+            backed = backed | (gpu_locs[clamped] >= 0)
         valid = (topk >= 0) & (topk < self.max_context_len) & backed
 
         tts = self.token_to_slot[layer_id, req_slot]  # [C]
@@ -844,8 +943,8 @@ class SparseKVCoordinator:
         miss = valid & (slots_for_topk < 0)
         miss_tokens = torch.unique(topk[miss]) if miss.any() else topk.new_empty(0)
 
-        src_locs = topk.new_empty(0, dtype=torch.int32)
-        dst_locs = topk.new_empty(0, dtype=torch.int32)
+        empty = topk.new_empty(0, dtype=torch.int32)
+        host_src = host_dst = gpu_src = gpu_dst = empty
         if miss_tokens.numel() > 0:
             m = miss_tokens.numel()
             lu = self.last_used[layer_id, req_slot]  # [H1]
@@ -864,14 +963,25 @@ class SparseKVCoordinator:
             self.slot_token[layer_id, req_slot, chosen] = miss_tokens_i32
             self.last_used[layer_id, req_slot, chosen] = tick
             self.token_to_slot[layer_id, req_slot, miss_tokens] = chosen_i32
-            src_locs = host_locs[miss_tokens].to(torch.int32)
-            dst_locs = (hot_base + chosen_i32).to(torch.int32)
+            dst_all = (hot_base + chosen_i32).to(torch.int32)
+            # Split misses by home: a backed token lives in exactly one tier, so its
+            # swap source is that tier's cold pool. gpu-home iff req_to_gpu_pool >= 0.
+            if gpu_locs is not None:
+                gpu_home = gpu_locs[miss_tokens] >= 0
+                host_home = ~gpu_home
+                host_src = host_locs[miss_tokens][host_home].to(torch.int32)
+                host_dst = dst_all[host_home]
+                gpu_src = gpu_locs[miss_tokens][gpu_home].to(torch.int32)
+                gpu_dst = dst_all[gpu_home]
+            else:
+                host_src = host_locs[miss_tokens].to(torch.int32)
+                host_dst = dst_all
 
         # translate every top-k entry to its (now-resident) hot ABSOLUTE row
         final_slots = self.token_to_slot[layer_id, req_slot][clamped].to(torch.int64)
         final_slots = torch.where(valid, final_slots, torch.zeros_like(final_slots))
         translated = (hot_base + final_slots).to(torch.int32)
-        return src_locs, dst_locs, translated
+        return host_src, host_dst, gpu_src, gpu_dst, translated
 
     def swap_in_for_layer(
         self,
@@ -888,8 +998,8 @@ class SparseKVCoordinator:
         request ``i``'s top-k run within ``out_translated`` (same layout as
         ``sparse_kv_indices_buffer``).
         """
-        all_src = []
-        all_dst = []
+        host_src, host_dst = [], []
+        gpu_src, gpu_dst = [], []
         for i, req_slot in enumerate(batch_req_slots):
             start = int(out_indptr[i].item())
             end = int(out_indptr[i + 1].item())
@@ -898,28 +1008,62 @@ class SparseKVCoordinator:
                 # garbage top-k never mutates a real request's LRU state.
                 continue
             topk = topk_per_req[i]
-            src, dst, translated = self.plan_swap_for_request(layer_id, req_slot, topk)
+            hs, hd, gs, gd, translated = self.plan_swap_for_request(
+                layer_id, req_slot, topk
+            )
             n = min(end - start, translated.numel())
             out_translated[start : start + n] = translated[:n].to(out_translated.device)
-            if src.numel() > 0:
-                all_src.append(src)
-                all_dst.append(dst)
-        if all_src:
-            src = torch.cat(all_src).to(self.device)
-            dst = torch.cat(all_dst).to(self.device)
-            self._run_swap(layer_id, src, dst)
+            if hs.numel() > 0:
+                host_src.append(hs)
+                host_dst.append(hd)
+            if gs.numel() > 0:
+                gpu_src.append(gs)
+                gpu_dst.append(gd)
+        if host_src:
+            self._run_swap(
+                layer_id,
+                torch.cat(host_src).to(self.device),
+                torch.cat(host_dst).to(self.device),
+            )
+        if gpu_src:
+            self._run_swap(
+                layer_id,
+                torch.cat(gpu_src).to(self.device),
+                torch.cat(gpu_dst).to(self.device),
+                gpu=True,
+            )
 
     def _run_swap(
-        self, layer_id: int, src_locs: torch.Tensor, dst_locs: torch.Tensor
+        self,
+        layer_id: int,
+        src_locs: torch.Tensor,
+        dst_locs: torch.Tensor,
+        gpu: bool = False,
     ) -> None:
-        """Invoke the HIP gather kernel for one layer's swap-in."""
+        """Invoke the HIP gather kernel for one layer's swap-in.
+
+        ``gpu`` selects the source cold tier: the GPU cold pool (D2D) when set, else
+        the pinned host cold pool (H2D). ``dst_locs`` are hot-buffer absolute rows in
+        both cases (the hot buffer is the single attention cache).
+        """
         if src_locs.numel() == 0:
+            return
+        if str(self.device) == "cpu":
+            # Reference (no-GPU) path: gather straight from the chosen cold pool.
+            src_idx = src_locs.to(torch.long)
+            dst_idx = dst_locs.to(torch.long)
+            pool = self.gpu_cold_pool if gpu else self.cold_pool
+            self.hot_buffer[layer_id, dst_idx] = pool[layer_id, src_idx].to(
+                self.hot_buffer.dtype
+            )
             return
         from atom.sparsekv.swap_kernel import sparsekv_swap_in
 
-        host_ptr = self._ensure_cold_dev_ptr(layer_id)
+        base = (
+            self._gpu_cold_ptr(layer_id) if gpu else self._ensure_cold_dev_ptr(layer_id)
+        )
         sparsekv_swap_in(
-            host_ptr,
+            base,
             self.hot_buffer[layer_id],
             src_locs.to(torch.int32),
             dst_locs.to(torch.int32),
@@ -949,8 +1093,52 @@ class SparseKVCoordinator:
         When ``record_plan`` is set (an IndexShare anchor), the kernel also records
         the per-query-token miss list it computed into the coordinator's plan
         buffers so the anchor's shared layers can replay the identical IO.
+
+        With the GPU cold tier active (Design Y), detect is *always* record-only
+        (``skip_gather=1``) — it reads both translation tables to place each miss's
+        home, records the plan, and moves no data. Two per-home gather passes then
+        bring host-home and gpu-home misses into the hot buffer. An IndexShare
+        anchor's recorded plan additionally drives its shared layers' gathers.
         """
         host_ptr = self._ensure_cold_dev_ptr(layer_id)
+        topk = topk_logical.shape[1]
+
+        if self.gpu_cold_enabled:
+            from atom.sparsekv.swap_kernel import sparsekv_swap_and_translate_record
+
+            assert hasattr(self, "_plan_miss_home"), (
+                "GPU cold tier dual-source swap needs plan buffers; construct the "
+                "SparseKVCoordinator with index_topk set (a DSA requirement)"
+            )
+            n = int(req_slots.shape[0])
+            sparsekv_swap_and_translate_record(
+                host_ptr,
+                self.hot_buffer[layer_id],
+                topk_logical,
+                indptr,
+                req_slots,
+                self.slot_token[layer_id],
+                self.last_used[layer_id],
+                self.token_to_slot[layer_id],
+                self.recency,
+                out_translated,
+                self._plan_miss_tok[:n],
+                self._plan_miss_slot[:n],
+                self._plan_miss_count[:n],
+                self._plan_miss_home[:n],
+                self._host_locs_arg(),
+                self._host_stride,
+                self._gpu_locs_arg(),
+                self._host_stride,  # req_to_gpu_pool shares the table stride
+                1,  # skip_gather: detect + record only, no data movement
+                self.item_size_bytes,
+                self.padded_hot_size,
+                self.max_context_len,
+                topk,
+            )
+            self._gather_planned_dual(layer_id, req_slots, n, topk)
+            return
+
         if record_plan:
             from atom.sparsekv.swap_kernel import sparsekv_swap_and_translate_record
 
@@ -969,12 +1157,16 @@ class SparseKVCoordinator:
                 self._plan_miss_tok[:n],
                 self._plan_miss_slot[:n],
                 self._plan_miss_count[:n],
+                self._plan_miss_home[:n],
                 self._host_locs_arg(),
                 self._host_stride,
+                self._gpu_locs_arg(),
+                self._host_stride,
+                0,  # skip_gather off: two-layer mode gathers inline from host
                 self.item_size_bytes,
                 self.padded_hot_size,
                 self.max_context_len,
-                topk_logical.shape[1],
+                topk,
             )
             return
 
@@ -993,10 +1185,13 @@ class SparseKVCoordinator:
             out_translated,
             self._host_locs_arg(),
             self._host_stride,
+            self._gpu_locs_arg(),
+            self._host_stride,
+            0,  # skip_gather off
             self.item_size_bytes,
             self.padded_hot_size,
             self.max_context_len,
-            topk_logical.shape[1],
+            topk,
         )
 
     def backup_into_assigned_fused(
@@ -1020,6 +1215,7 @@ class SparseKVCoordinator:
         host_ptr = self._ensure_cold_dev_ptr(layer_id)
         sparsekv_backup_into_assigned(
             host_ptr,
+            self._gpu_cold_ptr(layer_id),
             self.hot_buffer[layer_id],
             layer_kv.reshape(-1, self.kv_dim),
             src_slots,
@@ -1027,6 +1223,8 @@ class SparseKVCoordinator:
             logical_pos,
             self.token_to_slot[anchor_layer],
             self._host_locs_arg(),
+            self._host_stride,
+            self._gpu_locs_arg(),
             self._host_stride,
             self.item_size_bytes,
             self.padded_hot_size,
@@ -1052,6 +1250,7 @@ class SparseKVCoordinator:
         host_ptr = self._ensure_cold_dev_ptr(layer_id)
         sparsekv_backup_new_token(
             host_ptr,
+            self._gpu_cold_ptr(layer_id),
             self.hot_buffer[layer_id],
             layer_kv.reshape(-1, self.kv_dim),
             src_slots,
@@ -1062,6 +1261,8 @@ class SparseKVCoordinator:
             self.token_to_slot[layer_id],
             self.recency,
             self._host_locs_arg(),
+            self._host_stride,
+            self._gpu_locs_arg(),
             self._host_stride,
             self.item_size_bytes,
             self.padded_hot_size,

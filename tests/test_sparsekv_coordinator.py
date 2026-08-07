@@ -50,7 +50,7 @@ def test_all_hit_no_swap():
     c.alloc_host_pages(0, 0, 10)
     _seed_resident(c, 0, 0, [7, 8, 9])
     topk = torch.tensor([9, 8, 7], dtype=torch.int32)
-    src, dst, tr = c.plan_swap_for_request(0, 0, topk)
+    src, dst, _gs, _gd, tr = c.plan_swap_for_request(0, 0, topk)
     assert src.numel() == 0 and dst.numel() == 0
     hot_base = c._hot_base(0)
     # 9->slot2, 8->slot1, 7->slot0
@@ -62,7 +62,7 @@ def test_cold_start_all_miss():
     c.register_request(0, 10)
     c.alloc_host_pages(0, 0, 10)
     topk = torch.tensor([1, 2, 3], dtype=torch.int32)
-    src, dst, tr = c.plan_swap_for_request(0, 0, topk)
+    src, dst, _gs, _gd, tr = c.plan_swap_for_request(0, 0, topk)
     # all three are misses, land in empty slots
     expected = sorted(int(c.req_to_host_pool[0, t].item()) for t in [1, 2, 3])
     assert sorted(src.tolist()) == expected
@@ -84,7 +84,7 @@ def test_lru_eviction_picks_stale():
     c._tick = 4  # tick must exceed any seeded recency (real-flow invariant)
     # request a brand new token -> must evict the stalest (token 10, slot 0)
     topk = torch.tensor([20], dtype=torch.int32)
-    src, dst, tr = c.plan_swap_for_request(0, 0, topk)
+    src, dst, _gs, _gd, tr = c.plan_swap_for_request(0, 0, topk)
     assert dst.tolist() == [c._hot_base(0) + 0]  # slot 0 evicted
     assert c.token_to_slot[0, 0, 10].item() == _EMPTY  # 10 evicted
     assert c.token_to_slot[0, 0, 20].item() == 0  # 20 now resident in slot 0
@@ -102,7 +102,7 @@ def test_hit_refreshes_recency_protects_from_eviction():
     # touch token 10 (stalest) as a hit, then bring in a new token.
     # 10 should now be protected; 11 (next stalest) evicted instead.
     topk = torch.tensor([10, 20], dtype=torch.int32)
-    src, dst, tr = c.plan_swap_for_request(0, 0, topk)
+    src, dst, _gs, _gd, tr = c.plan_swap_for_request(0, 0, topk)
     assert c.token_to_slot[0, 0, 10].item() == 0  # still resident
     assert c.token_to_slot[0, 0, 11].item() == _EMPTY  # evicted instead
 
@@ -112,7 +112,7 @@ def test_padding_entries_ignored():
     c.register_request(0, 10)
     _seed_resident(c, 0, 0, [5])
     topk = torch.tensor([5, -1, -1], dtype=torch.int32)
-    src, dst, tr = c.plan_swap_for_request(0, 0, topk)
+    src, dst, _gs, _gd, tr = c.plan_swap_for_request(0, 0, topk)
     assert src.numel() == 0  # only the real token, already resident
     hot_base = c._hot_base(0)
     assert tr[0].item() == hot_base + 0
@@ -125,11 +125,58 @@ def test_duplicate_topk_tokens_dedup_misses():
     c.register_request(0, 10)
     c.alloc_host_pages(0, 0, 10)
     topk = torch.tensor([3, 3, 3], dtype=torch.int32)
-    src, dst, tr = c.plan_swap_for_request(0, 0, topk)
+    src, dst, _gs, _gd, tr = c.plan_swap_for_request(0, 0, topk)
     assert src.numel() == 1  # deduped to a single swap
     hot_base = c._hot_base(0)
     assert tr.tolist() == [tr[0].item()] * 3  # all resolve to same slot
     assert tr[0].item() == hot_base + c.token_to_slot[0, 0, 3].item()
+
+
+def test_plan_swap_dual_source():
+    """Design Y: a mixed-home top-k splits into host and gpu swap groups."""
+    c = SparseKVCoordinator(
+        num_layers=1,
+        max_num_seqs=2,
+        hot_buffer_size=8,
+        max_context_len=32,
+        kv_dim=8,
+        kv_dtype=torch.bfloat16,
+        device="cpu",
+        index_topk=4,
+        host_to_device_ratio=8,
+        page_size=16,
+        num_gpu_cold_pages=4,
+    )
+    assert c.gpu_cold_enabled
+    c.register_request(0, 20)
+    # Disjoint homes: tokens 3,7 live in the host cold pool; 5,9 in the GPU tier.
+    # A token has a valid row in exactly one table (the other stays -1).
+    c.req_to_host_pool[0, 3] = 103
+    c.req_to_host_pool[0, 7] = 107
+    c.req_to_gpu_pool[0, 5] = 205
+    c.req_to_gpu_pool[0, 9] = 209
+    topk = torch.tensor([3, 5, 7, 9], dtype=torch.int32)
+    hs, hd, gs, gd, tr = c.plan_swap_for_request(0, 0, topk)
+    # host group carries only host-home sources; gpu group only gpu-home sources.
+    assert sorted(hs.tolist()) == [103, 107]
+    assert sorted(gs.tolist()) == [205, 209]
+    assert hd.numel() == 2 and gd.numel() == 2
+    # every top-k entry is now resident in some hot slot (mixed home, one cache).
+    for t in [3, 5, 7, 9]:
+        assert c.token_to_slot[0, 0, t].item() >= 0
+    assert tr.numel() == 4
+
+
+def test_plan_swap_gpu_disabled_all_host():
+    """With the GPU tier off, plan_swap keeps everything host-home (empty gpu group)."""
+    c = _make()  # num_gpu_cold_pages defaults to 0
+    assert not c.gpu_cold_enabled
+    c.register_request(0, 10)
+    c.alloc_host_pages(0, 0, 10)
+    topk = torch.tensor([1, 2, 3], dtype=torch.int32)
+    hs, hd, gs, gd, _tr = c.plan_swap_for_request(0, 0, topk)
+    assert hs.numel() == 3 and hd.numel() == 3
+    assert gs.numel() == 0 and gd.numel() == 0
 
 
 def test_request_lifecycle_reset():
@@ -145,7 +192,7 @@ def test_request_lifecycle_reset():
     c.register_request(0, 5)
     c.alloc_host_pages(0, 0, 5)
     topk = torch.tensor([1], dtype=torch.int32)
-    src, _, _ = c.plan_swap_for_request(0, 0, topk)
+    src, _, _, _, _ = c.plan_swap_for_request(0, 0, topk)
     assert src.numel() == 1  # token 1 no longer resident -> miss
 
 
@@ -155,8 +202,8 @@ def test_per_layer_independent_state():
     c.alloc_host_pages(0, 0, 10)
     _seed_resident(c, 0, 0, [7])  # resident only in layer 0
     topk = torch.tensor([7], dtype=torch.int32)
-    src0, _, _ = c.plan_swap_for_request(0, 0, topk)
-    src1, _, _ = c.plan_swap_for_request(1, 0, topk)
+    src0, _, _, _, _ = c.plan_swap_for_request(0, 0, topk)
+    src1, _, _, _, _ = c.plan_swap_for_request(1, 0, topk)
     assert src0.numel() == 0  # hit in layer 0
     assert src1.numel() == 1  # miss in layer 1
 
@@ -421,6 +468,65 @@ def test_fused_swap_data_movement_matches_cold_pool():
             row = c.hot_buffer[0, int(out[k].item())].float()
             expected = torch.full((D,), float(tok), device=dev).float()
             assert torch.allclose(row, expected), (step, k, tok, row[0].item())
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="dual-source fused swap needs a GPU + aiter"
+)
+def test_fused_swap_dual_source_mixed_home():
+    """Design Y: a top-k spanning host-home and gpu-home tokens gathers from both.
+
+    Stage the full KV in the host cold pool, promote the first page to the GPU cold
+    tier (so those tokens are gpu-home, their host row freed), then run the fused
+    swap for a top-k that mixes a promoted (gpu) token with unpromoted (host) ones.
+    Each translated hot row must hold that token's KV, proving the record-only
+    detect + per-home gather (skip_gather path) moves both tiers correctly.
+    """
+    dev = "cuda"
+    L, R, H, C, D, page = 1, 1, 4, 48, 8, 16
+    c = SparseKVCoordinator(
+        num_layers=L,
+        max_num_seqs=R,
+        hot_buffer_size=H,
+        max_context_len=C,
+        kv_dim=D,
+        kv_dtype=torch.bfloat16,
+        device=dev,
+        index_topk=8,
+        host_to_device_ratio=8,
+        page_size=page,
+        num_gpu_cold_pages=1,  # room for exactly one promoted page (tokens 0..15)
+    )
+    assert c.gpu_cold_enabled
+    slot = c.acquire(req_id=1, context_len=C)
+    c.alloc_host_pages(slot, 0, C)
+    for t in range(C):  # host cold-pool row for token t holds the constant t
+        hs = int(c.req_to_host_pool[slot, t].item())
+        c.cold_pool[0, hs] = torch.full((D,), float(t), dtype=torch.bfloat16)
+    # Promote the oldest page (tokens 0..15) to the GPU tier: those become gpu-home
+    # (host row freed to -1), the rest stay host-home.
+    promoted = c.promote_to_gpu(slot)
+    torch.cuda.synchronize()
+    assert promoted == 1
+    assert int(c.req_to_gpu_pool[slot, 2].item()) >= 0  # token 2 now gpu-home
+    assert int(c.req_to_host_pool[slot, 2].item()) == _EMPTY
+    assert int(c.req_to_host_pool[slot, 40].item()) >= 0  # token 40 still host-home
+
+    c.load_initial_hot_set(slot, C)  # seeds recency; recent tokens are host-home
+    torch.cuda.synchronize()
+
+    K = 3
+    step = [2, 20, 40]  # 2 is gpu-home; 20 and 40 are host-home
+    topk = torch.tensor([step], dtype=torch.int32, device=dev)
+    indptr = torch.tensor([0, K], dtype=torch.int32, device=dev)
+    req_slots = torch.tensor([slot], dtype=torch.int32, device=dev)
+    out = torch.zeros(K, dtype=torch.int32, device=dev)
+    c.swap_in_for_layer_fused(0, topk, indptr, req_slots, out)
+    torch.cuda.synchronize()
+    for k, tok in enumerate(step):
+        row = c.hot_buffer[0, int(out[k].item())].float()
+        expected = torch.full((D,), float(tok), device=dev).float()
+        assert torch.allclose(row, expected), (step, k, tok, row[0].item())
 
 
 @pytest.mark.skipif(

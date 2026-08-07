@@ -187,6 +187,9 @@ def sparsekv_swap_and_translate(
     out_translated: torch.Tensor,
     host_cache_locs: torch.Tensor,
     host_stride: int,
+    gpu_cache_locs: torch.Tensor,
+    gpu_stride: int,
+    skip_gather: int,
     item_size_bytes: int,
     hot_slots: int,
     cold_depth: int,
@@ -212,6 +215,9 @@ def sparsekv_swap_and_translate(
         out_translated,
         host_cache_locs,
         host_stride,
+        gpu_cache_locs,
+        gpu_stride,
+        skip_gather,
         item_size_bytes,
         hot_slots,
         cold_depth,
@@ -233,8 +239,12 @@ def sparsekv_swap_and_translate_record(
     plan_miss_tok: torch.Tensor,
     plan_miss_slot: torch.Tensor,
     plan_miss_count: torch.Tensor,
+    plan_miss_home: torch.Tensor,
     host_cache_locs: torch.Tensor,
     host_stride: int,
+    gpu_cache_locs: torch.Tensor,
+    gpu_stride: int,
+    skip_gather: int,
     item_size_bytes: int,
     hot_slots: int,
     cold_depth: int,
@@ -261,8 +271,12 @@ def sparsekv_swap_and_translate_record(
         plan_miss_tok,
         plan_miss_slot,
         plan_miss_count,
+        plan_miss_home,
         host_cache_locs,
         host_stride,
+        gpu_cache_locs,
+        gpu_stride,
+        skip_gather,
         item_size_bytes,
         hot_slots,
         cold_depth,
@@ -307,8 +321,55 @@ def sparsekv_copy_planned(
     )
 
 
+def sparsekv_gather_planned(
+    base_dev_ptr: int,
+    hot_buffer: torch.Tensor,
+    req_slots: torch.Tensor,
+    plan_miss_tok: torch.Tensor,
+    plan_miss_slot: torch.Tensor,
+    plan_miss_count: torch.Tensor,
+    plan_miss_home: torch.Tensor,
+    target_home: int,
+    cache_locs: torch.Tensor,
+    cache_stride: int,
+    item_size_bytes: int,
+    hot_slots: int,
+    cold_depth: int,
+    topk: int,
+) -> None:
+    """Replay one home's share of a recorded miss plan into the hot buffer (aiter).
+
+    Design Y dual-source swap: gathers only misses whose recorded home matches
+    ``target_home`` (0=host, 1=gpu), indirecting through that home's translation
+    table (``cache_locs``) and cold-pool base (``base_dev_ptr``).
+    """
+    a = _aiter()
+    if a is None:
+        raise RuntimeError(
+            "sparsekv_gather_planned requires the aiter module_sparsekv_swap "
+            "op; aiter could not be imported."
+        )
+    a.sparsekv_gather_planned(
+        base_dev_ptr,
+        hot_buffer,
+        req_slots,
+        plan_miss_tok,
+        plan_miss_slot,
+        plan_miss_count,
+        plan_miss_home,
+        target_home,
+        cache_locs,
+        cache_stride,
+        item_size_bytes,
+        hot_slots,
+        cold_depth,
+        topk,
+    )
+
+
 def sparsekv_backup_into_assigned(
     cold_pool_dev_ptr: int,
+    gpu_cold_pool_ptr: int,
     hot_buffer: torch.Tensor,
     layer_kv: torch.Tensor,
     src_slots: torch.Tensor,
@@ -317,6 +378,8 @@ def sparsekv_backup_into_assigned(
     token_to_slot: torch.Tensor,
     host_cache_locs: torch.Tensor,
     host_stride: int,
+    gpu_cache_locs: torch.Tensor,
+    gpu_stride: int,
     item_size_bytes: int,
     hot_slots: int,
     cold_depth: int,
@@ -330,6 +393,7 @@ def sparsekv_backup_into_assigned(
         )
     a.sparsekv_backup_into_assigned(
         cold_pool_dev_ptr,
+        gpu_cold_pool_ptr,
         hot_buffer,
         layer_kv,
         src_slots,
@@ -338,6 +402,8 @@ def sparsekv_backup_into_assigned(
         token_to_slot,
         host_cache_locs,
         host_stride,
+        gpu_cache_locs,
+        gpu_stride,
         item_size_bytes,
         hot_slots,
         cold_depth,
@@ -346,6 +412,7 @@ def sparsekv_backup_into_assigned(
 
 def sparsekv_backup_new_token(
     cold_pool_dev_ptr: int,
+    gpu_cold_pool_ptr: int,
     hot_buffer: torch.Tensor,
     layer_kv: torch.Tensor,
     src_slots: torch.Tensor,
@@ -357,6 +424,8 @@ def sparsekv_backup_new_token(
     recency: torch.Tensor,
     host_cache_locs: torch.Tensor,
     host_stride: int,
+    gpu_cache_locs: torch.Tensor,
+    gpu_stride: int,
     item_size_bytes: int,
     hot_slots: int,
     cold_depth: int,
@@ -370,6 +439,7 @@ def sparsekv_backup_new_token(
         )
     a.sparsekv_backup_new_token(
         cold_pool_dev_ptr,
+        gpu_cold_pool_ptr,
         hot_buffer,
         layer_kv,
         src_slots,
@@ -381,6 +451,8 @@ def sparsekv_backup_new_token(
         recency,
         host_cache_locs,
         host_stride,
+        gpu_cache_locs,
+        gpu_stride,
         item_size_bytes,
         hot_slots,
         cold_depth,
