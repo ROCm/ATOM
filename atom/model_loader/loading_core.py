@@ -215,6 +215,10 @@ def load_weights_into_model(
         else:
             fn(*args)
 
+    batching_excluded = None
+    if online_quant_streamer is not None:
+        batching_excluded = online_quant_streamer.manages_param
+
     dispatcher = WeightDispatcher(
         model=model,
         params_dict=params_dict,
@@ -223,7 +227,14 @@ def load_weights_into_model(
         spec_decode=spec_decode,
         submit=_submit,
         staging_pool=staging_pool,
-        batching_enabled=executor is not None and online_quant_streamer is None,
+        # The streamer and ExpertStagingPool own disjoint parameters. Streamed
+        # parameters use the streamer's host staging so they can be quantized
+        # and released as soon as their module completes. Non-streamed expert
+        # parameters still need ExpertStagingPool; globally disabling it when a
+        # streamer exists turns large per-expert checkpoints into tens of
+        # thousands of small loader/H2D operations.
+        batching_enabled=executor is not None,
+        batching_excluded=batching_excluded,
         default_weight_loader=default_weight_loader,
         packed_modules_mapping=packed_modules_mapping,
         expert_index=expert_index,

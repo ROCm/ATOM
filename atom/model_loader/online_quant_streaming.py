@@ -105,6 +105,10 @@ class OnlineQuantStreamer:
 
     # ── loading-loop wiring ───────────────────────────────────────────────
 
+    def manages_param(self, param: nn.Parameter) -> bool:
+        """Whether this parameter belongs to a streamed quantization module."""
+        return id(param) in self.param_to_module
+
     def bind_params_dict(self, params_dict: dict) -> None:
         self._params_dict = params_dict
 
