@@ -229,6 +229,36 @@ class TestPromotedGpuPages:
         assert agg.aggregate([KVConnectorOutput()]).promoted_gpu_pages == {}
 
 
+class TestPartialFanIn:
+    """A dropped per-worker report is unrecoverable: the connector clears its
+    finished set once handed over, so the request would never complete on every
+    rank again. Partial rounds must therefore accumulate, not be discarded."""
+
+    def test_partial_round_completes_on_a_later_call(self):
+        agg = KVOutputAggregator(world_size=4)
+        # Round 1: only workers 0 and 1 reported before the collector timed out.
+        partial = agg.aggregate([KVConnectorOutput(finished_recving={"r1"})] * 2)
+        assert partial.finished_recving == set()
+
+        # Round 2: the late workers report. Combined with what round 1 retained,
+        # the fan-in now covers all four and the request is released — which is
+        # exactly what discarding the partial round used to make impossible.
+        rest = agg.aggregate(
+            [KVConnectorOutput() for _ in range(2)]
+            + [KVConnectorOutput(finished_recving={"r1"})] * 2
+        )
+        assert rest.finished_recving == {"r1"}
+
+    def test_same_worker_indices_do_not_double_count(self):
+        agg = KVOutputAggregator(world_size=4)
+        for _ in range(5):
+            out = agg.aggregate([KVConnectorOutput(finished_recving={"r1"})] * 2)
+            assert out.finished_recving == set()
+        assert agg.aggregate(
+            [KVConnectorOutput(finished_recving={"r1"}) for _ in range(4)]
+        ).finished_recving == {"r1"}
+
+
 class TestKVConnectorOutput:
     def test_defaults(self):
         out = KVConnectorOutput()

@@ -25,6 +25,7 @@ from threading import Thread
 import zmq
 import zmq.asyncio
 from aiter.dist.shm_broadcast import MessageQueue
+
 from atom.kv_transfer.disaggregation import KVOutputAggregator
 from atom.utils import (
     get_mp_context,
@@ -435,10 +436,19 @@ class AsyncIOProcManager:
                 output = output_queue.get(timeout=timeout)
                 worker_outputs.append(output)
             except queue.Empty:
+                # Hand the aggregator what the earlier workers already reported
+                # instead of dropping it. A connector clears its finished set the
+                # moment it hands it over, so a discarded report is never re-sent:
+                # the aggregator then never sees that request on every rank and
+                # the request stays parked for the rest of the run. The aggregator
+                # accumulates per worker ACROSS calls, and each worker owns its own
+                # queue, so the late worker's output is picked up on a later call
+                # with its index intact and the fan-in completes then.
                 logger.error(
-                    f"{self.label}: Timeout waiting for KV output from worker {i}"
+                    f"{self.label}: Timeout waiting for KV output from worker {i}; "
+                    f"aggregating the {len(worker_outputs)} already collected"
                 )
-                return None
+                break
 
         if not worker_outputs:
             return None
