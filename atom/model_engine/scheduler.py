@@ -18,6 +18,7 @@ This module provides:
 from __future__ import annotations
 
 import logging
+import os
 import struct
 import threading
 import time
@@ -26,6 +27,15 @@ from collections import deque
 import numpy as np
 
 from atom.config import Config
+
+# --- head-of-line scheduling bounds (see Scheduler.schedule) -----------------
+# Upper bound on how long decode-priority may hold prefill admission back.
+_HOL_STARVE_MS = float(os.environ.get("ATOM_PREFILL_STARVE_MS", "2000"))
+# A partial prefill with more than this many tokens left counts as "large" and may
+# be deferred so that short waiting prefills can be admitted first.
+_HOL_LARGE_TOKENS = int(os.environ.get("ATOM_LARGE_PREFILL_DEFER_TOKENS", "30000"))
+# Upper bound on how long one large prefill resume may be deferred.
+_HOL_DEFER_MS = float(os.environ.get("ATOM_LARGE_PREFILL_DEFER_MS", "2000"))
 from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.request import RequestOutput
@@ -970,6 +980,21 @@ class Scheduler:
         if not self.running and not self.waiting:
             return None
 
+        # Decode-priority: a chunked prefill occupies the whole token budget for
+        # every tick it runs, so scheduling it ahead of ready decodes stalls every
+        # running sequence for the length of the prompt.  Run decode first and let
+        # the prefill resume on a later tick -- but only while prefill work has not
+        # been held back past `_HOL_STARVE_MS`, otherwise a steady decode load would
+        # block new admissions forever.
+        if (
+            self.running
+            and self._has_decode_ready_seqs()
+            and not self._prefill_admission_starving()
+        ):
+            decode_result = self._try_schedule_decode_priority()
+            if decode_result is not None:
+                return decode_result
+
         # ---- Phase 1: resume partial prefills from running ----
         # Gated by `delayer_allows` so cross-DP alignment still holds when one
         # rank is mid-chunked-prefill: a delayer veto skips both Phase 1 and
@@ -977,12 +1002,26 @@ class Scheduler:
         # when no seq is mid-prefill — the common steady-state decode case —
         # using the counter maintained by postprocess / preempt / finished-removal.
         if delayer_allows and self._partial_prefill_count > 0:
+            # One resume chunk of a long prompt fills the whole batch budget, so a
+            # short prompt queued behind it waits out the rest of that prompt.  Hold
+            # the large resume back for at most `_HOL_DEFER_MS` so the short prompt
+            # is admitted first and reaches decode.
+            defer_large = self._has_small_waiting()
+            now = time.time()
             for seq in self.running:
                 if num_seqs_prefill >= self.max_num_seqs:
                     break
                 if not seq.is_partial_prefill:
                     continue
                 remaining = seq.num_tokens - seq.num_cached_tokens
+                if defer_large and remaining > _HOL_LARGE_TOKENS:
+                    deferred_since = getattr(seq, "hol_deferred_since", None)
+                    if deferred_since is None:
+                        seq.hol_deferred_since = now
+                        continue
+                    if (now - deferred_since) * 1000.0 <= _HOL_DEFER_MS:
+                        continue
+                    # deferred long enough -- resume it on this tick
                 if 0 < self.long_prefill_token_threshold < remaining:
                     remaining = self.long_prefill_token_threshold
                 budget_remaining = self.max_num_batched_tokens - num_batched_tokens
@@ -992,6 +1031,8 @@ class Scheduler:
                 num_batched_tokens += chunk
                 num_seqs_prefill += 1
                 seq.type = SequenceType.PREFILL
+                seq.hol_deferred_since = None
+                seq.hol_decode_parked_since = None
                 scheduled_seqs[seq.id] = seq
                 num_scheduled_tokens.append(chunk)
 
@@ -1236,6 +1277,25 @@ class Scheduler:
             return (prefill_batch, scheduled_seqs)
 
         # --- Decode scheduling ---
+        return self._schedule_decode_batch(park_partial_prefills=False)
+
+    def _schedule_decode_batch(
+        self, *, park_partial_prefills: bool
+    ) -> tuple[ScheduledBatch, dict[int, Sequence]]:
+        """Build a decode-only batch from `self.running`.
+
+        Shared by the decode phase of `schedule()` and by
+        `_try_schedule_decode_priority()`. `schedule()` only reaches its decode
+        phase when no prefill was scheduled, so both callers start from empty
+        accumulators and the batch is decode-only either way.
+
+        `park_partial_prefills` stamps `hol_decode_parked_since` on chunked
+        prefills this loop steps over, which `_prefill_admission_starving()`
+        uses to release them once they have waited long enough.
+        """
+        scheduled_seqs: dict[int, Sequence] = {}
+        num_scheduled_tokens: list[int] = []
+        scheduled_spec_decode_tokens: dict[int, np.ndarray] = {}
         num_seqs_decode = 0
         num_decode_tokens = 0
         tokens_per_decode_seq = self.mtp_k + 1
@@ -1248,11 +1308,18 @@ class Scheduler:
         # they are reconsidered once the head releases them post-postprocess.
         skipped_pp_inflight: list[Sequence] = []
         _pp_block = self._pp_inflight_token_block
+        now = time.time()
         while self.running and num_seqs_decode < self.max_num_seqs:
             if num_decode_tokens + tokens_per_decode_seq > self.max_num_batched_tokens:
                 break
             seq = self.running.popleft()
             if seq.is_partial_prefill:
+                # Stamp the first tick this prefill was parked so
+                # `_prefill_admission_starving` can release it later.
+                if park_partial_prefills and (
+                    getattr(seq, "hol_decode_parked_since", None) is None
+                ):
+                    seq.hol_decode_parked_since = now
                 skipped_partial_prefills.append(seq)
                 continue
             if _pp_block and seq.id in _pp_block:
@@ -1334,8 +1401,8 @@ class Scheduler:
             num_scheduled_tokens=num_scheduled_tokens,
             total_tokens_num=total_tokens_num_decode,
             total_tokens_num_decode=total_tokens_num_decode,
-            total_seqs_num=num_seqs_prefill + num_seqs_decode,
-            total_seqs_num_prefill=num_seqs_prefill,
+            total_seqs_num=num_seqs_decode,
+            total_seqs_num_prefill=0,
             total_seqs_num_decode=num_seqs_decode,
             connector_meta_output=connector_meta_output,
             num_spec_step=self.mtp_k,
@@ -1344,6 +1411,66 @@ class Scheduler:
             remote_kv_seq_blocks=remote_kv_seq_blocks,
         )
         return (decode_batch, scheduled_seqs)
+
+    # -- Head-of-line scheduling helpers ------------------------------------
+    def _has_decode_ready_seqs(self) -> bool:
+        """True when at least one running seq can be decoded on this tick."""
+        pp_block = self._pp_inflight_token_block
+        for seq in self.running:
+            if not seq.is_partial_prefill and seq.id not in pp_block:
+                return True
+        return False
+
+    def _has_small_waiting(self) -> bool:
+        """True when an admittable waiting prefill is short enough to be scheduled
+        beside, rather than behind, a large chunked prefill."""
+        for seq in self.waiting:
+            if self._unschedulable_reason(seq) is not None:
+                continue
+            if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
+                continue
+            if seq.num_tokens - seq.num_cached_tokens < _HOL_LARGE_TOKENS:
+                return True
+        return False
+
+    def _prefill_admission_starving(self) -> bool:
+        """True when prefill has been held back long enough that decode-priority
+        must yield this tick.
+
+        Bounds the inverse of the block decode-priority fixes: without it a
+        continuously busy decode batch keeps `_has_decode_ready_seqs()` true forever
+        and Phase 1 / Phase 2 -- the only paths that admit new work, resume chunked
+        prefills, and promote remote-KV consumers -- are never reached.
+        """
+        if _HOL_STARVE_MS <= 0:
+            return False
+        if self.waiting and self._oldest_waiting_prefill_age_ms() > _HOL_STARVE_MS:
+            return True
+        if self._partial_prefill_count > 0:
+            now = time.time()
+            for seq in self.running:
+                if not seq.is_partial_prefill:
+                    continue
+                parked_since = getattr(seq, "hol_decode_parked_since", None)
+                if (
+                    parked_since is not None
+                    and (now - parked_since) * 1000.0 > _HOL_STARVE_MS
+                ):
+                    return True
+        return False
+
+    def _try_schedule_decode_priority(
+        self,
+    ) -> tuple[ScheduledBatch, dict[int, Sequence]] | None:
+        """Schedule a decode-only batch ahead of any pending prefill work.
+
+        Returns None when nothing was decodable, so the caller falls through to
+        normal prefill scheduling.
+        """
+        batch, scheduled_seqs = self._schedule_decode_batch(park_partial_prefills=True)
+        if batch.total_seqs_num_decode == 0:
+            return None
+        return (batch, scheduled_seqs)
 
     # -- Remote KV / offload admission helpers ------------------------------
     def _resolve_waiting_remote_kv(
@@ -1563,7 +1690,13 @@ class Scheduler:
         # Strip placeholder + rejected draft tokens added by postprocess.
         # Real token count = seq.num_tokens - mtp_k - num_rejected
         # (same formula as postprocess line: num_tokens = seq.num_tokens - self.mtp_k - num_rejected)
-        if self.mtp_k > 0:
+        #
+        # A mid-chunked-prefill seq never received those placeholders -- postprocess
+        # appends them only for RUNNING seqs that are not partial prefills -- so
+        # stripping here would delete real prompt tokens and push num_tokens below
+        # num_prompt_tokens, which is fixed at construction. The seq would then stay
+        # partial forever on re-admission and pin its KV blocks.
+        if self.mtp_k > 0 and not seq.is_partial_prefill:
             strip = self.mtp_k + seq.num_rejected
             if strip > 0:
                 del seq.token_ids[-strip:]
