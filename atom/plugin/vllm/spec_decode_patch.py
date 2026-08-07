@@ -7,6 +7,11 @@ logger = logging.getLogger("atom")
 
 _K3_DSPARK_ARCH = "K3DSparkModel"
 
+# Share of the card set aside for the draft's CUDA graph pool. Measured on
+# gfx950: drafting raises the resident footprint from 281.6GiB to 286.1GiB of a
+# 288GiB card, all of it captured after the KV cache is already sized.
+_DRAFT_CUDAGRAPH_RESERVE_FRACTION = 0.02
+
 
 def _patch_eagle3_model_type_checks() -> None:
     # vLLM's V1 EAGLE proposer SpecDecodeBaseProposer.propose() has an explicit
@@ -650,6 +655,67 @@ def _patch_vllm_dflash_kernel_block_units() -> None:
     DFlashSpeculator.set_attn = wrapped_set_attn
 
 
+def _patch_dspark_reserve_draft_cudagraph_memory() -> None:
+    """Keep the draft's CUDA graphs out of the KV cache budget.
+
+    vLLM sizes the KV cache as `requested - non_kv_cache_memory - graphs`, but
+    the graph term is only ever non-zero on CUDA: `determine_available_memory`
+    skips the estimate on ROCm, where the pool handles read back differently
+    and the estimate can come out negative. Everything captured therefore comes
+    out of the slack `--gpu-memory-utilization` leaves behind rather than out
+    of the budget.
+
+    For the target alone that is affordable -- its capture measures ~0.5GiB
+    against a ~13GiB slack. Drafting adds a second capture, one full graph per
+    batch shape (29 of them for the Kimi-K3 draft), and that measures ~4.9GiB
+    on gfx950: at --gpu-memory-utilization 0.93 the card ends up 97% resident,
+    with less left over than the ~5.5GiB the decode step itself peaks at.
+
+    So take the draft's share off the top. The reserve is a fraction of the
+    card because the capture list scales with `max_num_seqs`, and the pool with
+    it; 2% leaves a drafting run the same slack a non-drafting run of the same
+    model gets.
+    """
+    try:
+        import torch
+        from vllm.config.compilation import CUDAGraphMode
+        from vllm.v1.worker.gpu_worker import Worker
+    except ImportError:
+        return
+
+    original = Worker.determine_available_memory
+    if getattr(original, "_atom_dspark_graph_reserve_patched", False):
+        return
+
+    def _drafts_under_full_graphs(vllm_config) -> bool:
+        spec = vllm_config.speculative_config
+        if spec is None or getattr(spec, "method", None) != "dspark":
+            return False
+        mode = vllm_config.compilation_config.cudagraph_mode
+        return mode is not None and mode.decode_mode() == CUDAGraphMode.FULL
+
+    @functools.wraps(original)
+    def wrapped_determine_available_memory(self) -> int:
+        available = original(self)
+        if not _drafts_under_full_graphs(self.vllm_config):
+            return available
+        total = torch.cuda.get_device_properties(self.device).total_memory
+        reserve = int(_DRAFT_CUDAGRAPH_RESERVE_FRACTION * total)
+        logger.info(
+            "ATOM plugin: reserving %.2f GiB for the DSpark draft's CUDA "
+            "graphs, which ROCm's memory profile does not account for; "
+            "KV cache budget %.2f -> %.2f GiB.",
+            reserve / 2**30,
+            available / 2**30,
+            (available - reserve) / 2**30,
+        )
+        self.available_kv_cache_memory_bytes = available - reserve
+        return available - reserve
+
+    wrapped_determine_available_memory._atom_dspark_graph_reserve_patched = True
+    Worker.determine_available_memory = wrapped_determine_available_memory
+
+
 def _patch_vllm_deepseek_v4_mtp_first_pass_inputs() -> None:
     from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
 
@@ -705,6 +771,7 @@ def apply_vllm_spec_decode_patch() -> None:
     _patch_vllm_draft_kv_group_validation()
     _patch_vllm_draft_positions_on_metadata()
     _patch_vllm_dflash_kernel_block_units()
+    _patch_dspark_reserve_draft_cudagraph_memory()
     _patch_vllm_deepseek_v4_mtp_first_pass_inputs()
 
     from vllm.v1.spec_decode.eagle import SpecDecodeBaseProposer
