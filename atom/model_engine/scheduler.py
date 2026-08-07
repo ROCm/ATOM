@@ -1783,6 +1783,22 @@ class Scheduler:
                 seq.num_compressed_hit_blocks * self.block_manager.block_size,
             )
         num_batched_tokens += chunk
+        if self._sparsekv_enabled:
+            # SparseKV replaces the paged MLA pool with a compact decode scratch,
+            # so a prefill forward asserts in MLAAttention. Reaching here means a
+            # request arrived at the decode node without the PD hand-off that
+            # would have parked it for a remote load; log what it carried so the
+            # next occurrence identifies the source instead of only crashing.
+            logger.error(
+                "SparseKV: scheduling seq %s as PREFILL on a SparseKV node "
+                "(chunk=%d prompt=%d cached=%d kv_transfer_params=%s) — the "
+                "forward will assert; this request never took the remote-load path.",
+                seq.id,
+                chunk,
+                seq.num_prompt_tokens,
+                seq.num_cached_tokens,
+                seq.kv_transfer_params,
+            )
         seq.status = SequenceStatus.RUNNING
         seq.type = SequenceType.PREFILL
         self.running.append(seq)
