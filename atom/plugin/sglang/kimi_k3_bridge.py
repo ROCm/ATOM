@@ -136,9 +136,9 @@ def install_kimi_k3_pool_patch() -> None:
         req_pool = getattr(self, "req_to_token_pool", None)
         if req_pool is None or not hasattr(req_pool, "get_mamba_indices"):
             raise RuntimeError("Kimi-K3 HybridReqToTokenPool is missing")
-        setattr(pool, "_atom_kimi_k3_req_pool", req_pool)
+        pool._atom_kimi_k3_req_pool = req_pool
         if full_pool is not pool:
-            setattr(full_pool, "_atom_kimi_k3_req_pool", req_pool)
+            full_pool._atom_kimi_k3_req_pool = req_pool
         logger.info(
             "Kimi-K3 attention owner=ATOM, KV owner=SGLang, "
             "layout=MLA/NHD, latent_dim=576"
@@ -154,7 +154,7 @@ def install_kimi_k3_pool_patch() -> None:
 def kimi_k3_native_attention_construction():
     """Construct K3 full-attention layers with native ATOM attention."""
 
-    import atom.models.kimi_k3 as kimi_k3
+    from atom.models import kimi_k3
 
     previous = kimi_k3.Attention
     kimi_k3.Attention = SGLangATOMKimiK3Attention
@@ -233,7 +233,7 @@ def _iter_kimi_full_attention(model: Any):
         if isinstance(module, KimiFullAttention):
             attn = getattr(module, "attn", None)
             if not isinstance(attn, SGLangATOMKimiK3Attention):
-                raise RuntimeError(
+                raise TypeError(
                     "Kimi-K3 full attention did not construct the native ATOM frontend"
                 )
             yield attn
@@ -273,7 +273,7 @@ def maybe_get_kimi_k3_pools(forward_batch: Any):
 def _is_stream_capturing() -> bool:
     try:
         return bool(torch.cuda.is_current_stream_capturing())
-    except Exception:
+    except (AssertionError, RuntimeError):
         return False
 
 

@@ -38,8 +38,8 @@ _ATOM_SUPPORTED_MODELS = {
 if is_sglang():
     from atom.models.deepseek_v4 import DeepseekV4ForCausalLM
     from atom.models.eagle3_llama import Eagle3LlamaModel
-    from atom.models.kimi_k25 import KimiK25ForCausalLM
     from atom.models.kimi_k3 import KimiK3ForCausalLM
+    from atom.models.kimi_k25 import KimiK25ForCausalLM
     from atom.models.qwen3_5 import (
         Qwen3_5ForCausalLM,
         Qwen3_5MoeForCausalLM,
