@@ -136,7 +136,7 @@ jobs:
           import re
           import sys
           import time
-          from datetime import datetime
+          from datetime import datetime, timedelta
           from pathlib import Path
           from urllib.error import HTTPError, URLError
           from urllib.parse import quote, urlencode
@@ -161,7 +161,8 @@ jobs:
           if not version_match:
               raise SystemExit("Failed to read SGLANG_VERSION from .github/workflows/docker-release.yaml")
 
-          today = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y%m%d")
+          today_date = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+          today = today_date.strftime("%Y%m%d")
           version = version_match.group(1)
           tag = f"sglang-v{version}-nightly_{today}"
           nightly_pattern = re.compile(r"^sglang-v(?P<version>.+)-nightly_(?P<date>\d{8})$")
@@ -230,22 +231,33 @@ jobs:
                   url = next_page_url(url, headers.get("Link"))
               return tags
 
-          def latest_recent_nightly_tag(token):
+          def latest_recent_nightly_tag(token, max_age_days=1):
+              allowed_dates = {
+                  (today_date - timedelta(days=offset)).strftime("%Y%m%d")
+                  for offset in range(max_age_days + 1)
+              }
               candidates = []
               for candidate in list_tags(token):
                   match = nightly_pattern.match(candidate)
                   if not match:
                       continue
+                  if match.group("version") != version:
+                      continue
+                  if match.group("date") not in allowed_dates:
+                      continue
                   candidates.append(
                       (
                           match.group("date"),
-                          1 if match.group("version") == version else 0,
                           candidate,
                       )
                   )
               if not candidates:
-                  raise RuntimeError(f"No SGLang nightly tags were found in {repository}")
-              return max(candidates)[2]
+                  allowed = ", ".join(sorted(allowed_dates))
+                  raise RuntimeError(
+                      f"No SGLang nightly tags for version {version} were found in {repository} "
+                      f"within allowed dates: {allowed}"
+                  )
+              return max(candidates)[1]
 
           def write_selected_image(image_tag, digest, resolution):
               image = f"{repository}:{image_tag}@{digest}"
@@ -286,13 +298,27 @@ jobs:
                   last_error = str(exc)
                   print(f"Warning: failed to check {repository}:{tag}: {last_error}", file=sys.stderr)
 
+              try:
+                  fallback_tag = latest_recent_nightly_tag(token, max_age_days=1)
+                  if fallback_tag != tag:
+                      digest = get_digest(token, fallback_tag)
+                      image = write_selected_image(fallback_tag, digest, "recent-nightly-tag")
+                      print(
+                          f"{repository}:{tag} is not available yet; "
+                          f"using recent SGLang nightly image: {image}"
+                      )
+                      break
+              except (HTTPError, RuntimeError, URLError) as exc:
+                  last_error = str(exc)
+
               remaining = deadline - time.monotonic()
               if remaining <= 0:
                   print(
                       f"Timed out waiting for scheduled SGLang image {repository}:{tag}. "
-                      f"Falling back to the latest recent SGLang nightly tag. Last error: {last_error or 'not found'}"
+                      f"Falling back to a same-version nightly tag from today/yesterday. "
+                      f"Last error: {last_error or 'not found'}"
                   )
-                  fallback_tag = latest_recent_nightly_tag(token)
+                  fallback_tag = latest_recent_nightly_tag(token, max_age_days=1)
                   digest = get_digest(token, fallback_tag)
                   image = write_selected_image(fallback_tag, digest, "recent-nightly-tag")
                   print(f"Using latest recent SGLang image: {image}")
