@@ -9,8 +9,8 @@ low-level IPC handle path (hipIpcGetMemHandle / hipIpcOpenMemHandle on ROCm).
 Both processes must be on the same physical GPU device.
 
 Phase 1 (KV cache sharing):
-  - export_kv_cache_handle  — called by PrefillEngineCore after allocate_kv_cache()
-  - import_kv_cache         — called by DecodeEngineCore at startup
+  - export_kv_cache_handles — called by PrefillEngineCore after allocate_kv_cache()
+  - import_kv_cache_handles — called by DecodeEngineCore at startup
 
 Phase 2 (weight sharing):
   - export_model_weight_handles  — called by PrefillEngineCore after load_model()
@@ -58,30 +58,59 @@ def _import_tensor(meta: dict) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 
-def export_kv_cache_handle(
-    kv_cache: torch.Tensor, kv_scale: torch.Tensor | None = None
-) -> dict:
-    """Export kv_cache (and optionally kv_scale for fp8) as CUDA IPC handles.
+def export_kv_cache_handles(named_values: dict) -> dict:
+    """Export a name→value map of KV state as CUDA IPC handles.
 
-    Must be called from the process that allocated the tensor (prefill).
-    Returns a dict that can be pickled and sent over ZMQ to the decode process.
+    Name-keyed rather than hardcoded, because every attention backend produces
+    a different set: MLA yields only `kv_cache`, MHA adds `kv_scale` and
+    `_kv_layer_cache_store`, GDN adds `mamba_*`, and DeepSeek-V4 yields
+    `v4_csa_idx_kv` (no `kv_cache` at all) plus a per-layer LIST in
+    `v4_unified_kv`. Hardcoding two names silently broke every backend that
+    does not happen to use them.
+
+    Handles three value shapes: a CUDA tensor, a list/tuple of CUDA tensors
+    (V4's per-layer pools), and a plain picklable scalar (e.g.
+    `aligned_index_dim`). Anything else is skipped and reported by the caller.
+
+    Must be called from the process that allocated the tensors (prefill).
     """
-    result = {"kv_cache": _export_tensor(kv_cache)}
-    if kv_scale is not None:
-        result["kv_scale"] = _export_tensor(kv_scale)
-    return result
+    out: dict = {}
+    for name, value in named_values.items():
+        if isinstance(value, torch.Tensor):
+            if value.is_cuda and value.numel() > 0:
+                out[name] = ("tensor", _export_tensor(value))
+        elif (
+            isinstance(value, (list, tuple))
+            and value
+            and all(
+                isinstance(v, torch.Tensor) and v.is_cuda and v.numel() > 0
+                for v in value
+            )
+        ):
+            out[name] = (
+                "tensor_list",
+                [_export_tensor(v) for v in value],
+            )
+        elif value is None or isinstance(value, (str, bool, int, float)):
+            out[name] = ("value", value)
+    return out
 
 
-def import_kv_cache(meta: dict) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Reconstruct kv_cache (and kv_scale if present) from CUDA IPC handles.
+def import_kv_cache_handles(meta: dict) -> dict:
+    """Reconstruct the name→value map produced by export_kv_cache_handles.
 
-    Must be called from the consumer process (decode).
-    Returns (kv_cache, kv_scale) — kv_scale is None when not fp8.
-    The returned tensors share GPU memory with prefill's allocation — no copy.
+    Must be called from the consumer process (decode). Returned tensors share
+    GPU memory with the producer's allocation — no copy.
     """
-    kv_cache = _import_tensor(meta["kv_cache"])
-    kv_scale = _import_tensor(meta["kv_scale"]) if "kv_scale" in meta else None
-    return kv_cache, kv_scale
+    out: dict = {}
+    for name, (kind, payload) in meta.items():
+        if kind == "tensor":
+            out[name] = _import_tensor(payload)
+        elif kind == "tensor_list":
+            out[name] = [_import_tensor(p) for p in payload]
+        else:
+            out[name] = payload
+    return out
 
 
 # ---------------------------------------------------------------------------

@@ -2381,6 +2381,27 @@ class DecodeScheduler(Scheduler):
             # token for this seq prepends T0 to new_tokens — the same hook the
             # inter-node P/D path uses at _schedule_first_decode_after_remote_kv.
             seq._injected_t0 = sampled_token_id
+            if self.mtp_k > 0:
+                # Rapidserve has no draft-token plumbing: PrefillDone carries
+                # only T0 and prefill_forward never runs the drafter, so this
+                # seq reaches its first decode step with no drafts. But
+                # schedule() always asks for mtp_k+1 query tokens, and the
+                # per-seq query count CANNOT be shrunk for plain MTP: the
+                # q-shrink offset correction (model_runner.py:3134) and the
+                # defensive index clamp (drafter.py:456) are both gated on the
+                # DSpark drafter, so EagleProposer would scatter an
+                # out-of-range anchor index and fault the GPU.
+                #
+                # Instead keep the shape uniform and hand the verifier mtp_k
+                # placeholder drafts. Rejection sampling makes draft *quality*
+                # irrelevant to correctness — a draft is emitted only if it
+                # matches what the target model would have sampled — so these
+                # are simply rejected and the step falls back to the bonus
+                # token. Cost is one step of lost speculation per request.
+                drafts = [self.eos_token_id] * self.mtp_k
+                for d in drafts:
+                    seq.append_token(int(d))
+                seq.spec_token_ids = np.asarray(drafts, dtype=np.int32)
             seq.first_token_time = time.time()
             self.prefill_done.append(seq)
 

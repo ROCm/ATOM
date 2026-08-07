@@ -1677,9 +1677,15 @@ class ModelRunner:
             "swa_window_size": int(getattr(config, "swa_window_size", 0)),
         }
 
-    def allocate_kv_cache(self, num_kvcache_blocks):
-        pre_alloc = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+    def _prepare_kv_dims(self, num_kvcache_blocks):
+        """Derive the dimensions both KV allocation and KV binding depend on.
 
+        Split out of allocate_kv_cache so the decode process under intra-GPU
+        disaggregation can establish the same dims before binding tensors it
+        imported over CUDA IPC, without allocating anything itself.
+
+        Returns (num_kv_heads, num_draft_layers) for the allocation step.
+        """
         config = self.config
         config.num_kvcache_blocks = num_kvcache_blocks
         hf_config = config.hf_config
@@ -1721,6 +1727,20 @@ class ModelRunner:
                     f"{num_draft_layers} draft (MTP) layers = {total_num_layers} total layers"
                 )
 
+        return num_kv_heads, num_draft_layers
+
+    def _allocate_kv_tensors(self, num_kv_heads, num_draft_layers) -> list:
+        """Allocate every KV tensor this backend needs and setattr them on self.
+
+        Records and returns the attribute names written, so the disagg export
+        can ship exactly this set rather than guessing at hardcoded names.
+        Backends differ widely: MLA returns only `kv_cache`; MHA adds
+        `kv_scale` + `_kv_layer_cache_store`; GDN adds `mamba_*`; DeepSeek-V4
+        returns `v4_csa_idx_kv` (no `kv_cache` at all) plus per-layer
+        `v4_unified_kv` and compressor state from allocate_per_req_cache.
+        """
+        kv_names: list[str] = []
+
         # Primary KV cache allocation (model-agnostic, delegated to the
         # attention builder). Each builder owns its tensor layout: MLA →
         # single 576-dim per layer; GDN-hybrid → only num_full_attn rows;
@@ -1734,6 +1754,7 @@ class ModelRunner:
         )
         for name, value in main_kv.items():
             setattr(self, name, value)
+            kv_names.append(name)
 
         # Heterogeneous draft (e.g. Eagle3 MHA alongside an MLA target) owns
         # its own KV pool through a sibling builder; same protocol as above,
@@ -1744,6 +1765,7 @@ class ModelRunner:
             )
             for name, value in draft_kv.items():
                 setattr(self, name, value)
+                kv_names.append(name)
 
         # Per-request cache allocation (model-agnostic, delegated to the
         # attention metadata builder). For GDN this returns
@@ -1756,6 +1778,31 @@ class ModelRunner:
             )
             for name, tensor in per_req_tensors.items():
                 setattr(self, name, tensor)
+                kv_names.append(name)
+
+        self._kv_tensor_names = kv_names
+        return kv_names
+
+    def _bind_kv_tensors(self):
+        """Bind whatever KV tensors are on self into the attention modules.
+
+        Shared by allocate_kv_cache (freshly allocated tensors) and, under
+        intra-GPU disaggregation, by the decode process after importing
+        prefill's tensors over CUDA IPC. Per-layer binding is delegated to the
+        attention builder's build_kv_cache_tensor(), so every backend (MLA,
+        MHA, GDN, V4, Eagle3) works without ModelRunner knowing any layout.
+        """
+        config = self.config
+        hf_config = config.hf_config
+
+        # Binding artifact, not allocated state: the MHA / MiMo-V2 path has
+        # build_kv_cache_tensor() append per-layer entries here
+        # (aiter_attention.py). Reset it at the start of binding so (a) binding
+        # is idempotent and (b) the decode process under disagg — which skips
+        # allocate_kv_cache, where the empty list is normally created — has it
+        # before the first append. Backends that never touch it just carry an
+        # unused empty list, which reads as falsy exactly like "absent" did.
+        self._kv_layer_cache_store = []
 
         # Build KVCacheConfig
         # lirong TODO: This is a simple solution to build KVCacheConfig,
@@ -1835,6 +1882,13 @@ class ModelRunner:
             transfer_tensors,
             num_blocks=self.num_physical_kvcache_blocks,
         )
+
+    def allocate_kv_cache(self, num_kvcache_blocks):
+        pre_alloc = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+
+        num_kv_heads, num_draft_layers = self._prepare_kv_dims(num_kvcache_blocks)
+        self._allocate_kv_tensors(num_kv_heads, num_draft_layers)
+        self._bind_kv_tensors()
 
         # Cross-validate: compare estimated vs actual KV cache allocation.
         # `actual_kv_bytes` includes BOTH the unified pool tensors (counted by
@@ -3828,6 +3882,14 @@ class ModelRunner:
         )
 
 
+# Runner attributes that get_num_blocks() derives from the owning process's
+# memory profile, and that attention builders read while binding. The decode
+# process skips get_num_blocks (it owns no KV memory) and cannot recompute
+# them, so they travel with the KV IPC payload. Add to this tuple whenever a
+# builder starts reading another get_num_blocks-derived attribute.
+_KV_DIM_ATTRS = ("num_swa_blocks", "max_per_req_cache_slots")
+
+
 class RapidServeModelRunner(ModelRunner):
     """ModelRunner for intra-GPU prefill/decode disaggregation.
 
@@ -4065,16 +4127,45 @@ class RapidServeModelRunner(ModelRunner):
         return True
 
     def export_kv_cache_ipc_handle(self) -> list[str] | None:
-        """Export self.kv_cache (and self.kv_scale for fp8) as CUDA IPC handles.
+        """Export every KV tensor this backend allocated, as CUDA IPC handles.
+
+        Exports the exact set of attribute names recorded by
+        _allocate_kv_tensors rather than a hardcoded `kv_cache`/`kv_scale`
+        pair — backends differ, and DeepSeek-V4 has no `kv_cache` attribute at
+        all (it uses `v4_csa_idx_kv` plus per-layer `v4_unified_kv`).
 
         TP-aware: each rank writes its handles to a temp file.  Rank 0 waits for
         all ranks and returns the list of paths; other ranks return None.
         """
-        from atom.model_engine.ipc_utils import export_kv_cache_handle
+        from atom.model_engine.ipc_utils import export_kv_cache_handles
 
         logger.info(f"ModelRunner rank {self.rank}: export_kv_cache_ipc_handle")
-        kv_scale = getattr(self, "kv_scale", None)
-        handles = export_kv_cache_handle(self.kv_cache, kv_scale)
+        names = getattr(self, "_kv_tensor_names", None)
+        if not names:
+            raise RuntimeError(
+                "export_kv_cache_ipc_handle: no KV tensor names recorded — "
+                "_allocate_kv_tensors must run before the IPC export."
+            )
+        named_values = {n: getattr(self, n, None) for n in names}
+        # Dims established by get_num_blocks() from THIS process's memory
+        # profile. Decode short-circuits get_num_blocks (it owns no KV memory)
+        # so it cannot recompute them, yet builders read them during binding
+        # (e.g. V4's build_kv_cache_tensor uses num_swa_blocks). They are plain
+        # ints, so the classifier ships them as values alongside the tensors.
+        for dim in _KV_DIM_ATTRS:
+            if hasattr(self, dim):
+                named_values[dim] = getattr(self, dim)
+        handles = export_kv_cache_handles(named_values)
+        missing = [n for n in names if n not in handles]
+        if missing:
+            logger.warning(
+                f"[KV-EXPORT] rank {self.rank}: {len(missing)} KV attributes not "
+                f"exportable (unsupported value shape): {missing}"
+            )
+        logger.info(
+            f"[KV-EXPORT] rank {self.rank}: exported {len(handles)} KV entries: "
+            f"{sorted(handles)}"
+        )
         self._disagg_write_rank_file("kvcache", handles)
         paths = self._disagg_collect_rank_files("kvcache")
         if paths is not None:
@@ -4088,17 +4179,23 @@ class RapidServeModelRunner(ModelRunner):
     ) -> bool:
         """Import kvcache from prefill's GPU allocation into this (decode) process.
 
+        Sets every KV attribute prefill exported, then binds through the SAME
+        builder protocol allocate_kv_cache uses (_prepare_kv_dims +
+        _bind_kv_tensors). Decode no longer reimplements binding, so any
+        backend the builder supports — MLA, MHA, GDN, V4, Eagle3 — works here
+        without further changes.
+
         TP-aware: each rank reads its own handles file (index=self.rank) and
-        deletes it after import.  Also imports kv_scale when present (fp8).
-        Returns True as sentinel for wait_out=True.
+        deletes it after import.  Returns True as sentinel for wait_out=True.
         """
         import pickle
 
-        from atom.model_engine.ipc_utils import import_kv_cache
+        from atom.model_engine.ipc_utils import import_kv_cache_handles
 
-        self.num_physical_kvcache_blocks = (
-            num_kvcache_blocks * self.attn_metadata_builder.block_ratio
-        )
+        # Establish the dims binding depends on. Decode skips allocate_kv_cache
+        # entirely (it owns no KV memory), so num_physical_kvcache_blocks,
+        # num_kv_heads and the layer counts are otherwise never set here.
+        self._prepare_kv_dims(num_kvcache_blocks)
         path = paths[self.rank]
         logger.info(
             f"ModelRunner rank {self.rank}: reading kvcache handles from {path}"
@@ -4107,99 +4204,26 @@ class RapidServeModelRunner(ModelRunner):
             meta = pickle.load(f)
         os.remove(path)
         logger.info(f"ModelRunner rank {self.rank}: hipIpcOpenMemHandle for kvcache...")
-        self.kv_cache, kv_scale = import_kv_cache(meta)
-        if kv_scale is not None:
-            self.kv_scale = kv_scale
+        imported = import_kv_cache_handles(meta)
+        for name, value in imported.items():
+            setattr(self, name, value)
+        self._kv_tensor_names = [n for n in imported if n not in _KV_DIM_ATTRS]
+        # Fail with a readable message rather than an AttributeError raised
+        # several frames deep inside a backend's build_kv_cache_tensor().
+        absent = [d for d in _KV_DIM_ATTRS if not hasattr(self, d)]
+        if absent:
+            raise RuntimeError(
+                f"import_kv_cache_ipc_handle: prefill did not ship required KV "
+                f"dims {absent}. These are derived in get_num_blocks(), which "
+                f"decode skips; add them to _KV_DIM_ATTRS if a builder needs them."
+            )
         logger.info(
-            f"ModelRunner rank {self.rank}: kvcache IPC import done, binding..."
+            f"[KV-IMPORT] rank {self.rank}: imported {len(imported)} KV entries: "
+            f"{sorted(imported)} — binding via builder protocol"
         )
-        self._bind_kv_cache_to_modules()
+        self._bind_kv_tensors()
         logger.info(f"ModelRunner rank {self.rank}: import_kv_cache_ipc_handle done")
         return True
-
-    def _bind_kv_cache_to_modules(self):
-        """Bind self.kv_cache (and self.kv_scale if present) to all attention
-        modules.  Called after replacing self.kv_cache with an IPC-imported
-        tensor (decode process), where the builder-based binding path in
-        allocate_kv_cache() is skipped."""
-        config = self.config
-        hf_config = config.hf_config
-        if hf_config.num_key_value_heads >= self.world_size:
-            num_kv_heads = hf_config.num_key_value_heads // self.world_size
-        else:
-            num_kv_heads = 1
-        x = 16 // self.kv_cache.element_size()
-
-        models_to_bind = [("target", self.model)]
-        if self.config.speculative_config and hasattr(self, "drafter"):
-            models_to_bind.append(("draft", self.drafter.model))
-
-        kv_cache_tensors = []
-        layer_id = 0
-        for _model_name, model in models_to_bind:
-            for module in model.modules():
-                if hasattr(module, "base_attention"):
-                    if hasattr(module, "use_mla") and not module.use_mla:
-                        if self.is_qwen_next():
-                            attn_idx = layer_id // self.full_attention_interval
-                        else:
-                            attn_idx = layer_id
-                        k_cache = self.kv_cache[0, attn_idx].view(
-                            self.num_physical_kvcache_blocks,
-                            num_kv_heads,
-                            hf_config.head_dim // x,
-                            self.physical_block_size,
-                            x,
-                        )
-                        v_cache = self.kv_cache[1, attn_idx].view(
-                            self.num_physical_kvcache_blocks,
-                            num_kv_heads,
-                            hf_config.head_dim,
-                            self.physical_block_size,
-                        )
-                        module.max_model_len = self.config.max_model_len
-                        if config.kv_cache_dtype == "fp8":
-                            module.k_scale = self.kv_scale[0, attn_idx]
-                            module.v_scale = self.kv_scale[1, attn_idx]
-                        from atom.config import KVCacheTensor
-
-                        kv_cache_tensors.append(
-                            KVCacheTensor(
-                                layer_num=layer_id,
-                                k_cache=k_cache,
-                                v_cache=v_cache,
-                                k_scale=module.k_scale,
-                                v_scale=module.v_scale,
-                            )
-                        )
-                        module.k_cache = k_cache
-                        module.v_cache = v_cache
-                        layer_id += 1
-                    elif hasattr(module, "use_mla") and module.use_mla:
-                        kv_cache = self.kv_cache[layer_id].view(
-                            self.num_physical_kvcache_blocks * self.physical_block_size,
-                            1,
-                            576,
-                        )
-                        module.max_model_len = self.config.max_model_len
-                        from atom.config import KVCacheTensor
-
-                        kv_cache_tensors.append(
-                            KVCacheTensor(
-                                layer_num=layer_id,
-                                k_cache=kv_cache,
-                                v_cache=None,
-                                k_scale=None,
-                                v_scale=None,
-                            )
-                        )
-                        module.kv_cache = kv_cache
-                        layer_id += 1
-
-        from atom.utils.forward_context import set_kv_cache_data
-
-        kv_cache_data = {f"layer_{i}": t for i, t in enumerate(kv_cache_tensors)}
-        set_kv_cache_data(kv_cache_data)
 
     # ------------------------------------------------------------------
     # CU-masked stream pools + prefill forward
