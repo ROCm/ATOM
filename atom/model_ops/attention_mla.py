@@ -1555,17 +1555,15 @@ class MLAAttention(nn.Module):
         kv_cache_data = forward_context.kv_cache_data
         kv_cache = kv_cache_data[f"layer_{self.layer_num}"].k_cache
 
-        # SparseKV: kv_cache is the compact per-step decode scratch, sized for
-        # decode query tokens only. A prefill write uses the real paged
-        # slot_mapping and would index the scratch out of bounds. SparseKV is a
-        # decode-only feature (prompt KV arrives via RDMA-direct into the cold
-        # pool; the DecodeScheduler never emits a prefill batch), so a prefill
-        # here means a misconfiguration — fail loudly rather than corrupt HBM.
-        assert self._sparsekv_coord is None or not context.is_prefill, (
-            "SparseKV: a prefill forward reached MLAAttention with the compact "
-            "decode scratch as kv_cache. SparseKV is decode-only; enable it only "
-            "on the PD decode node (RDMA-direct prompt ingestion)."
-        )
+        # SparseKV: kv_cache is the compact per-step decode scratch. A PD decode
+        # consumer with the normal (non-Decode) Scheduler can still see a prefill
+        # forward: chunked-prefill emits partial-prefill continuation chunks as
+        # PREFILL batches in the decode scheduling loop, and PD incremental
+        # transfers leave a small suffix for local prefill. These chunks write KV
+        # through the normal paged slot_mapping (not the SparseKV scratch) — the
+        # SparseKV staging path already skips them
+        # (_sparsekv_stage_and_sync returns early on prefill tokens), so the
+        # scratch is never indexed. No assert needed.
 
         if context.is_prefill and not use_prefill_mla:
             prefill_q = self.q_proj(q, x_scale=q_scale).view(
