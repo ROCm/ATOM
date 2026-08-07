@@ -958,18 +958,17 @@ class KimiKDAAttention(nn.Module):
         cu_seqlens: torch.Tensor | None,
         output_final_state: bool,
     ):
-        from fla.ops.kda import chunk_kda
-
         kwargs = {
             "q": q,
             "k": k,
             "v": v,
             "g": g,
-            # Keep beta in fp32: fla computes b = sigmoid(beta) in-kernel with
-            # use_beta_sigmoid_in_kernel, and triton's sigmoid follows the input
-            # dtype -- a bf16 beta yields a bf16 write strength, which erodes the
-            # delta-rule state update across the 71 KDA layers (measured gsm8k
-            # regression). b_proj stays bf16; only this reduction is widened.
+            # Keep beta in fp32: the sigmoid b = sigmoid(beta) is applied
+            # in-kernel with use_beta_sigmoid_in_kernel, and triton's sigmoid
+            # follows the input dtype -- a bf16 beta yields a bf16 write
+            # strength, which erodes the delta-rule state update across the 71
+            # KDA layers (measured gsm8k regression). b_proj stays bf16; only
+            # this reduction is widened.
             "beta": beta.float(),
             "A_log": self.A_log,
             "dt_bias": self.dt_bias,
@@ -980,14 +979,30 @@ class KimiKDAAttention(nn.Module):
             "use_beta_sigmoid_in_kernel": True,
             "safe_gate": self._kda_gate_lower_bound is not None,
             "lower_bound": self._kda_gate_lower_bound,
-            "transpose_state_layout": True,
             "cu_seqlens": cu_seqlens,
+            # V-first state, matching the layout mamba_v_cache holds and the
+            # fused decode kernel writes. Spelled as fla spells it from 0.5.1
+            # on; the pre-0.5.1 name `transpose_state_layout` only survives
+            # there via a deprecation shim reading `**kwargs`, so once that
+            # shim goes it is dropped without error and the state comes back
+            # K-first. Requires fla >= 0.5.1 on both backends.
+            "state_v_first": True,
+            # FLA's default KDA recompute specialization is non-deterministic
+            # for long, packed gfx950 prefills and can emit extreme values.
+            # Selecting disable_recompute enables its STORE_QG specialization,
+            # which is stable and preserves the same chunk-KDA forward
+            # semantics. aiter ignores the flag: it is forward-only, and the
+            # `qg` this keeps alive is only ever read by fla's backward.
+            "disable_recompute": True,
         }
-        # FLA 0.5.1's default KDA recompute specialization is non-deterministic
-        # for long, packed gfx950 prefills and can emit extreme values. Selecting
-        # disable_recompute enables its STORE_QG specialization, which is stable
-        # and preserves the same chunk-KDA forward semantics.
-        return chunk_kda(**kwargs, disable_recompute=True)
+        if envs.ATOM_USE_AITER_KDA:
+            from aiter.ops.triton.kimi_delta_attn import chunk_kimi_delta_attn
+
+            return chunk_kimi_delta_attn(**kwargs)
+
+        from fla.ops.kda import chunk_kda
+
+        return chunk_kda(**kwargs)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # hidden_states is a (fp8, scale) tuple when input_layernorm fused the
