@@ -731,12 +731,20 @@ class SparseKVCoordinator:
         src_t = torch.tensor(src_all, dtype=torch.int32, device=self.device)
         dst_t = torch.tensor(dst_all, dtype=torch.int32, device=self.device)
         if self.promote_stream is not None:
+            # Source is the host pool the compute stream fills (RDMA landing,
+            # backup_new_token), so the gather has to queue behind those writes.
+            self.promote_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self.promote_stream):
                 for layer_id in range(self.num_layers):
                     self._run_promote_swap(layer_id, src_t, dst_t)
             ev = torch.cuda.Event()
             ev.record(self.promote_stream)
             self._promote_events[req_slot] = ev
+            # req_to_gpu_pool above already routes these tokens to the GPU tier,
+            # and that write lands on the compute stream immediately — so without
+            # this the next swap/load_initial_hot_set gathers rows the promote
+            # has not written yet and the request decodes from garbage.
+            ev.wait(torch.cuda.current_stream())
         else:
             for layer_id in range(self.num_layers):
                 self._run_promote_swap(layer_id, src_t, dst_t)
