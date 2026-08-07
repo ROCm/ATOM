@@ -540,9 +540,12 @@ jobs:
                   "${RESOLVED_PREBUILT_DIGEST}" >> "$GITHUB_STEP_SUMMARY"
                 ;;
               recent-nightly-tag)
-                printf -- '- Resolution: today'\''s nightly tag was not available before the wait timeout, so this run uses the latest recent SGLang nightly tag `%s` pinned to digest `%s`.\n' \
-                  "${RESOLVED_NIGHTLY_TAG}" \
-                  "${RESOLVED_PREBUILT_DIGEST}" >> "$GITHUB_STEP_SUMMARY"
+                {
+                  printf -- '- Resolution: today'\''s nightly tag was not available before the wait timeout, '
+                  printf -- 'so this run uses the latest recent SGLang nightly tag `%s` pinned to digest `%s`.\n' \
+                    "${RESOLVED_NIGHTLY_TAG}" \
+                    "${RESOLVED_PREBUILT_DIGEST}"
+                } >> "$GITHUB_STEP_SUMMARY"
                 ;;
               resolution-failed)
                 printf -- '- Resolution: digest pinning itself failed, so this run falls back to floating `sglang-latest`.\n' \
