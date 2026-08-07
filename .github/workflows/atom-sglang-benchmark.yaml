@@ -346,6 +346,7 @@ jobs:
       publish_to_dashboard: ${{ steps.resolve.outputs.publish_to_dashboard }}
       upload_to_custom_dashboard: ${{ steps.resolve.outputs.upload_to_custom_dashboard }}
       workload_label: ${{ steps.resolve.outputs.workload_label }}
+      use_workspace_atom: ${{ steps.resolve.outputs.use_workspace_atom }}
     steps:
       - name: Checkout selected branch
         uses: actions/checkout@v6
@@ -377,6 +378,7 @@ jobs:
           REBUILD_SGLANG_IMAGE=false
           SGLANG_IMAGE_SOURCE="prebuilt"
           USER_PROVIDED_SGLANG_IMAGE=false
+          USE_WORKSPACE_ATOM=true
           RESOLVED_PREBUILT_ALIAS=""
           RESOLVED_PREBUILT_DIGEST=""
           PREBUILT_RESOLUTION_TYPE=""
@@ -388,6 +390,7 @@ jobs:
           elif [[ "${GITHUB_EVENT_NAME}" == "schedule" && "${NORMALIZED_REF}" == "main" && -n "${SCHEDULED_SGLANG_IMAGE}" ]]; then
             PREBUILT_SGLANG_IMAGE="${SCHEDULED_SGLANG_IMAGE}"
             SGLANG_IMAGE_SOURCE="prebuilt-scheduled-nightly"
+            USE_WORKSPACE_ATOM=false
             RESOLVED_PREBUILT_ALIAS="rocm/atom-dev:${SCHEDULED_SGLANG_TAG}"
             RESOLVED_PREBUILT_DIGEST="${SCHEDULED_SGLANG_DIGEST}"
             PREBUILT_RESOLUTION_TYPE="${SCHEDULED_SGLANG_RESOLUTION:-scheduled-nightly-tag}"
@@ -487,12 +490,18 @@ jobs:
             echo "publish_to_dashboard=${PUBLISH_TO_DASHBOARD}"
             echo "upload_to_custom_dashboard=${UPLOAD_TO_CUSTOM_DASHBOARD}"
             echo "workload_label=${WORKLOAD_LABEL}"
+            echo "use_workspace_atom=${USE_WORKSPACE_ATOM}"
           } >> "$GITHUB_OUTPUT"
 
           printf '### SGLang benchmark source\n- Repository: `%s`\n- Ref: `%s`\n- Image mode: `%s`\n' \
             "${ATOM_REPOSITORY}" \
             "${ATOM_REF}" \
             "${SGLANG_IMAGE_SOURCE}" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "${USE_WORKSPACE_ATOM}" == "true" ]]; then
+            printf -- '- ATOM runtime source: `workspace checkout`\n' >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf -- '- ATOM runtime source: `baked Docker image`\n' >> "$GITHUB_STEP_SUMMARY"
+          fi
 
           if [[ "${USER_PROVIDED_SGLANG_IMAGE}" == "true" ]]; then
             printf -- '- User-provided image: `%s`\n- Expected SGLang version: `%s`\n- Expected SGLang commit: `%s`\n' \
@@ -1108,6 +1117,7 @@ jobs:
       selected_sglang_version: ${{ needs.resolve-atom-source.outputs.selected_sglang_version }}
       publish_to_dashboard: ${{ needs.resolve-atom-source.outputs.publish_to_dashboard }}
       upload_to_custom_dashboard: ${{ needs.resolve-atom-source.outputs.upload_to_custom_dashboard }}
+      use_workspace_atom: ${{ needs.resolve-atom-source.outputs.use_workspace_atom }}
       sglang_image_tag: ${{ needs.build-sglang-image.outputs.sglang_image_tag || needs.resolve-atom-source.outputs.prebuilt_sglang_image }}
       atom_source_sha_for_checkout: ${{ needs.build-sglang-image.outputs.atom_source_sha || github.sha }}
 
@@ -1137,6 +1147,7 @@ jobs:
       selected_sglang_version: ${{ needs.resolve-atom-source.outputs.selected_sglang_version }}
       publish_to_dashboard: ${{ needs.resolve-atom-source.outputs.publish_to_dashboard }}
       upload_to_custom_dashboard: ${{ needs.resolve-atom-source.outputs.upload_to_custom_dashboard }}
+      use_workspace_atom: ${{ needs.resolve-atom-source.outputs.use_workspace_atom }}
       sglang_image_tag: ${{ needs.build-sglang-image.outputs.sglang_image_tag || needs.resolve-atom-source.outputs.prebuilt_sglang_image }}
       atom_source_sha_for_checkout: ${{ needs.build-sglang-image.outputs.atom_source_sha || github.sha }}
 
