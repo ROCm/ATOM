@@ -348,6 +348,9 @@ def load_model(
         )
     pp_start = time.perf_counter()
 
+    # Parent-first traversal is significant for streaming-deferred children:
+    # their parent first combines source weights, then the child's normal hook
+    # online-quantizes the final fused weight.
     for module_name, module in model.named_modules():
         # Avoid repeating module post-processing already run by the streamer.
         if (
