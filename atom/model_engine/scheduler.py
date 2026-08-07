@@ -649,6 +649,8 @@ class Scheduler:
                 )
             )
             self._sparsekv_gpu_cold_enabled: bool = self._sparsekv_gpu_pages > 0
+            self._sparsekv_defer_log_time: float = 0.0
+            self._sparsekv_defer_count: int = 0
             # Without this line a failed hand-off from the worker is invisible:
             # admission would silently run host-only while the worker has a tier.
             logger.info(
@@ -921,6 +923,37 @@ class Scheduler:
             seq.num_prompt_tokens + seq.max_tokens + self.mtp_k, self.max_model_len
         )
         return (final_len + self._sparsekv_page - 1) // self._sparsekv_page
+
+    def _log_sparsekv_defer(self, need: int, host_used: int) -> None:
+        """Report why admission stalled, throttled to one line per 5s.
+
+        Without this the cold-pool ceiling is invisible: throughput just plateaus
+        with nothing saying whether the host gate is holding requests back or the
+        workload simply ran out. ``promoted`` is the page count the GPU tier has
+        taken off the host reservation — the tier's contribution, in the same
+        units as the budget it relieves.
+        """
+        now = time.time()
+        self._sparsekv_defer_count += 1
+        if now - self._sparsekv_defer_log_time < 5.0:
+            return
+        self._sparsekv_defer_log_time = now
+        promoted = sum(
+            self._sparsekv_gpu_pages_of(s) for s in self._sparsekv_live_seqs()
+        )
+        logger.info(
+            "SparseKV admit DEFER (%d since last): need=%d host_used=%d/%d "
+            "promoted_to_gpu=%d/%d running=%d waiting=%d",
+            self._sparsekv_defer_count,
+            need,
+            host_used,
+            self._sparsekv_admit_pages,
+            promoted,
+            self._sparsekv_gpu_pages,
+            len(self.running),
+            len(self.waiting),
+        )
+        self._sparsekv_defer_count = 0
 
     def _sparsekv_live_seqs(self):
         """Requests holding SparseKV cold-pool pages: running + recv in flight.
@@ -1297,6 +1330,7 @@ class Scheduler:
                 # implies it. What lifts the ceiling from host to host+GPU is the
                 # promote-done downgrade shrinking the reservations counted here.
                 if sparsekv_pages_used + need > self._sparsekv_admit_pages:
+                    self._log_sparsekv_defer(need, sparsekv_pages_used)
                     self.waiting.appendleft(seq)
                     break
                 # Count this admission so later iterations in THIS cycle see it
