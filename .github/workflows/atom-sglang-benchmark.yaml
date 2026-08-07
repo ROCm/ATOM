@@ -346,6 +346,7 @@ jobs:
       publish_to_dashboard: ${{ steps.resolve.outputs.publish_to_dashboard }}
       upload_to_custom_dashboard: ${{ steps.resolve.outputs.upload_to_custom_dashboard }}
       workload_label: ${{ steps.resolve.outputs.workload_label }}
+      use_workspace_atom: ${{ steps.resolve.outputs.use_workspace_atom }}
     steps:
       - name: Checkout selected branch
         uses: actions/checkout@v6
@@ -377,6 +378,7 @@ jobs:
           REBUILD_SGLANG_IMAGE=false
           SGLANG_IMAGE_SOURCE="prebuilt"
           USER_PROVIDED_SGLANG_IMAGE=false
+          USE_WORKSPACE_ATOM=true
           RESOLVED_PREBUILT_ALIAS=""
           RESOLVED_PREBUILT_DIGEST=""
           PREBUILT_RESOLUTION_TYPE=""
@@ -388,6 +390,7 @@ jobs:
           elif [[ "${GITHUB_EVENT_NAME}" == "schedule" && "${NORMALIZED_REF}" == "main" && -n "${SCHEDULED_SGLANG_IMAGE}" ]]; then
             PREBUILT_SGLANG_IMAGE="${SCHEDULED_SGLANG_IMAGE}"
             SGLANG_IMAGE_SOURCE="prebuilt-scheduled-nightly"
+            USE_WORKSPACE_ATOM=false
             RESOLVED_PREBUILT_ALIAS="rocm/atom-dev:${SCHEDULED_SGLANG_TAG}"
             RESOLVED_PREBUILT_DIGEST="${SCHEDULED_SGLANG_DIGEST}"
             PREBUILT_RESOLUTION_TYPE="${SCHEDULED_SGLANG_RESOLUTION:-scheduled-nightly-tag}"
@@ -487,6 +490,7 @@ jobs:
             echo "publish_to_dashboard=${PUBLISH_TO_DASHBOARD}"
             echo "upload_to_custom_dashboard=${UPLOAD_TO_CUSTOM_DASHBOARD}"
             echo "workload_label=${WORKLOAD_LABEL}"
+            echo "use_workspace_atom=${USE_WORKSPACE_ATOM}"
           } >> "$GITHUB_OUTPUT"
 
           printf '### SGLang benchmark source\n- Repository: `%s`\n- Ref: `%s`\n- Image mode: `%s`\n' \
@@ -540,9 +544,12 @@ jobs:
                   "${RESOLVED_PREBUILT_DIGEST}" >> "$GITHUB_STEP_SUMMARY"
                 ;;
               recent-nightly-tag)
-                printf -- '- Resolution: today'\''s nightly tag was not available before the wait timeout, so this run uses the latest recent SGLang nightly tag `%s` pinned to digest `%s`.\n' \
-                  "${RESOLVED_NIGHTLY_TAG}" \
-                  "${RESOLVED_PREBUILT_DIGEST}" >> "$GITHUB_STEP_SUMMARY"
+                {
+                  printf -- '- Resolution: today'\''s nightly tag was not available before the wait timeout, '
+                  printf -- 'so this run uses the latest recent SGLang nightly tag `%s` pinned to digest `%s`.\n' \
+                    "${RESOLVED_NIGHTLY_TAG}" \
+                    "${RESOLVED_PREBUILT_DIGEST}"
+                } >> "$GITHUB_STEP_SUMMARY"
                 ;;
               resolution-failed)
                 printf -- '- Resolution: digest pinning itself failed, so this run falls back to floating `sglang-latest`.\n' \
@@ -885,7 +892,6 @@ jobs:
       && needs.load-models.outputs.has_enabled_models == 'true'
     runs-on: ubuntu-latest
     outputs:
-      benchmark_matrix: ${{ steps.build.outputs.benchmark_matrix }}
       benchmark_matrix_mi355: ${{ steps.build.outputs.benchmark_matrix_mi355 }}
       benchmark_matrix_mi308: ${{ steps.build.outputs.benchmark_matrix_mi308 }}
       has_benchmark_cells: ${{ steps.build.outputs.has_benchmark_cells }}
@@ -956,13 +962,11 @@ jobs:
           mi355_rows = [row for row in include if not is_mi308_row(row)]
 
           sep = (",", ":")
-          full = json.dumps({"include": include}, separators=sep)
           j355 = json.dumps({"include": mi355_rows}, separators=sep)
           j308 = json.dumps({"include": mi308_rows}, separators=sep)
 
           gh_out = os.environ["GITHUB_OUTPUT"]
           with open(gh_out, "a", encoding="utf-8") as fh:
-              fh.write(f"benchmark_matrix={full}\n")
               fh.write(f"benchmark_matrix_mi355={j355}\n")
               fh.write(f"benchmark_matrix_mi308={j308}\n")
               fh.write("has_benchmark_cells=" + ("false" if not include else "true") + "\n")
@@ -972,7 +976,7 @@ jobs:
           if not include:
               print("No eligible benchmark cases remain after model-specific parameter filtering.", file=sys.stderr)
           else:
-              print(f"Benchmark matrix (full): {full}", file=sys.stderr)
+              print(f"Benchmark cells: {len(include)}", file=sys.stderr)
               print(f"MI355 shard cells: {len(mi355_rows)}, MI308 shard cells: {len(mi308_rows)}", file=sys.stderr)
           PY
 
@@ -1108,6 +1112,7 @@ jobs:
       selected_sglang_version: ${{ needs.resolve-atom-source.outputs.selected_sglang_version }}
       publish_to_dashboard: ${{ needs.resolve-atom-source.outputs.publish_to_dashboard }}
       upload_to_custom_dashboard: ${{ needs.resolve-atom-source.outputs.upload_to_custom_dashboard }}
+      use_workspace_atom: ${{ needs.resolve-atom-source.outputs.use_workspace_atom }}
       sglang_image_tag: ${{ needs.build-sglang-image.outputs.sglang_image_tag || needs.resolve-atom-source.outputs.prebuilt_sglang_image }}
       atom_source_sha_for_checkout: ${{ needs.build-sglang-image.outputs.atom_source_sha || github.sha }}
 
@@ -1137,6 +1142,7 @@ jobs:
       selected_sglang_version: ${{ needs.resolve-atom-source.outputs.selected_sglang_version }}
       publish_to_dashboard: ${{ needs.resolve-atom-source.outputs.publish_to_dashboard }}
       upload_to_custom_dashboard: ${{ needs.resolve-atom-source.outputs.upload_to_custom_dashboard }}
+      use_workspace_atom: ${{ needs.resolve-atom-source.outputs.use_workspace_atom }}
       sglang_image_tag: ${{ needs.build-sglang-image.outputs.sglang_image_tag || needs.resolve-atom-source.outputs.prebuilt_sglang_image }}
       atom_source_sha_for_checkout: ${{ needs.build-sglang-image.outputs.atom_source_sha || github.sha }}
 
@@ -1197,9 +1203,23 @@ jobs:
 
       - name: Generate SGLang benchmark summary table
         env:
-          BENCHMARK_MATRIX: ${{ needs.build-benchmark-matrix.outputs.benchmark_matrix }}
+          BENCHMARK_MATRIX_MI355: ${{ needs.build-benchmark-matrix.outputs.benchmark_matrix_mi355 }}
+          BENCHMARK_MATRIX_MI308: ${{ needs.build-benchmark-matrix.outputs.benchmark_matrix_mi308 }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
+          BENCHMARK_MATRIX="$(python3 - <<'PY'
+          import json
+          import os
+
+          include = []
+          for name in ("BENCHMARK_MATRIX_MI355", "BENCHMARK_MATRIX_MI308"):
+              raw = os.environ.get(name) or '{"include":[]}'
+              include.extend(json.loads(raw).get("include", []))
+
+          print(json.dumps({"include": include}, separators=(",", ":")))
+          PY
+          )"
+
           python3 .github/scripts/plugin_benchmark_summary.py \
             --result-dir . \
             --matrix-json "${BENCHMARK_MATRIX}" \
