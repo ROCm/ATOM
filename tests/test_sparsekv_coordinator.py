@@ -795,6 +795,48 @@ def test_gpu_cold_enabled_allocates_pool():
     assert len(c._free_gpu_pages) == 4
 
 
+def test_acquire_reclaims_finished_slots_before_raising():
+    """The recv path grabs a slot as soon as the scheduler admits a replacement,
+    one forward before sync_active would free the request it replaced. acquire()
+    must reclaim that slot rather than hard-raise and kill the runner."""
+    c = _make(max_num_seqs=2, max_ctx=64)
+    c.acquire(req_id=1, context_len=16)
+    c.acquire(req_id=2, context_len=16)
+    assert not c._free_slots
+
+    # A forward ran with both live, then req 1 finished — but the next forward
+    # (which would sync_active it away) has not happened yet when the recv path
+    # needs a slot for its replacement.
+    c.sync_active([1, 2])
+    c._last_active_reqids = {2}
+    slot = c.acquire(req_id=3, context_len=16)
+    assert slot >= 0
+    assert 1 not in c._reqid_to_slot and c.is_registered(2)
+
+
+def test_acquire_still_raises_when_all_slots_are_live():
+    """The reclaim is a safety valve, not a licence to over-commit: with every
+    slot genuinely active the hard error must survive."""
+    c = _make(max_num_seqs=2, max_ctx=64)
+    c.acquire(req_id=1, context_len=16)
+    c.acquire(req_id=2, context_len=16)
+    c.sync_active([1, 2])
+    with pytest.raises(RuntimeError, match="no free request slots"):
+        c.acquire(req_id=3, context_len=16)
+
+
+def test_acquire_does_not_reclaim_before_any_forward():
+    """With no active set reported yet, absence of information must not be read
+    as "nothing is live" — reclaiming there would free requests still in use."""
+    c = _make(max_num_seqs=2, max_ctx=64)
+    c.acquire(req_id=1, context_len=16)
+    c.acquire(req_id=2, context_len=16)
+    assert c._last_active_reqids == set()
+    with pytest.raises(RuntimeError, match="no free request slots"):
+        c.acquire(req_id=3, context_len=16)
+    assert c.is_registered(1) and c.is_registered(2)
+
+
 def test_gpu_alloc_declines_after_partial_promote():
     """A request whose promote ran out of GPU pages keeps its tail on host. The
     decode-growth path must then decline GPU and fall back, not try to append

@@ -3452,6 +3452,10 @@ class ModelRunner:
             if self._sparsekv_prev_forward_event is None:
                 self._sparsekv_prev_forward_event = torch.cuda.Event()
             self._sparsekv_prev_forward_event.record()
+            # Publish it so a slot reclaim triggered off the forward path (the
+            # connector RPC hitting an exhausted slot pool) can drain this
+            # forward before handing a freed slot to a new request.
+            coord.last_forward_event = self._sparsekv_prev_forward_event
 
         pp_group = get_pp_group()
         pp_non_last = pp_group.world_size > 1 and not pp_group.is_last_rank

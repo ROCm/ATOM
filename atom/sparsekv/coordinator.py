@@ -169,6 +169,11 @@ class SparseKVCoordinator:
         # sync_active must NOT reclaim these — they are absent from the decode batch
         # only because their transfer is still in flight, not because they finished.
         self._awaiting_first_decode: set = set()
+        # Last decode batch's req ids + that forward's completion event, so a
+        # slot reclaim triggered off the forward path (see _reclaim_finished_slots)
+        # knows what is still live and can drain the previous forward first.
+        self._last_active_reqids: set = set()
+        self.last_forward_event = None
 
         # Monotonic recency tick, advanced each swap/backup.
         self._tick = 0
@@ -386,6 +391,8 @@ class SparseKVCoordinator:
         if req_id in self._reqid_to_slot:
             return self._reqid_to_slot[req_id]
         if not self._free_slots:
+            self._reclaim_finished_slots()
+        if not self._free_slots:
             raise RuntimeError(
                 "SparseKV: no free request slots "
                 f"(max_num_seqs={self.max_num_seqs} exhausted)"
@@ -437,6 +444,33 @@ class SparseKVCoordinator:
         # freed slot's last reader is done before it is reused; keep it that way.
         self._free_slots.append(slot)
 
+    def _reclaim_finished_slots(self) -> int:
+        """Release slots of requests that already left the decode batch.
+
+        The recv path (acquire_at_recv, driven by the connector RPC) grabs a slot
+        as soon as the scheduler admits a replacement, which is one forward
+        earlier than sync_active would have freed the request being replaced. At
+        churn the coordinator therefore needs momentarily more slots than
+        max_num_seqs and acquire() hard-raised, killing the runner. Reclaiming
+        here collapses that window instead.
+
+        Safe because it runs on the worker's main loop — the RPC that drives
+        start_load_kv is serialized with the forwards, same as sync_active — and
+        the previous forward is drained first, so a freed slot's last reader is
+        done before the slot is handed out again.
+        """
+        if not self._reqid_to_slot or not self._last_active_reqids:
+            # No forward has reported an active set yet, so nothing is known to
+            # have finished. Reclaiming on an empty set would read "no
+            # information" as "nothing is live" and free requests still in use —
+            # worse than the exhaustion error this is trying to avoid.
+            return 0
+        if self.last_forward_event is not None:
+            self.last_forward_event.synchronize()
+        before = len(self._free_slots)
+        self.sync_active(self._last_active_reqids)
+        return len(self._free_slots) - before
+
     def sync_active(self, active_req_ids) -> None:
         """Release every registered request not in ``active_req_ids``.
 
@@ -450,6 +484,7 @@ class SparseKVCoordinator:
         recv window; they become reclaimable once their first decode runs.
         """
         active = set(active_req_ids)
+        self._last_active_reqids = active
         for req_id in list(self._reqid_to_slot.keys()):
             if req_id not in active and req_id not in self._awaiting_first_decode:
                 self.release(req_id)
