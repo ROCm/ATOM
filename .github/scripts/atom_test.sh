@@ -84,8 +84,10 @@ if [ "$TYPE" == "launch" ]; then
 
   echo ""
   echo "========== Waiting for ATOM server to start =========="
-  # Phase 1: Wait for HTTP server to be up via /health endpoint (45 min max)
-  max_retries=45
+  # Phase 1: Wait for HTTP server to be up via /health endpoint. Large models
+  # can spend 35-45 minutes loading from shared storage before JIT/warmup starts,
+  # so leave enough headroom for initialization after the weights are resident.
+  max_retries=${ATOM_SERVER_READY_RETRIES:-90}
   retry_interval=60
   server_up=false
   for ((i=1; i<=max_retries; i++)); do
@@ -460,12 +462,15 @@ if [ "$TYPE" == "benchmark" ]; then
   set +m
 
   echo "========== Supervising benchmark with wait_infer_drain.sh =========="
-  # See accuracy block above for STUCK_POLLS=18 rationale.
-  # MAX_MIN=60: high-concurrency long-context runs (e.g. DP-attention 8k/1k
-  # c=1024 with num_prompts=conc*10) take ~48 min wall (warmup + 10240 reqs);
-  # 30 min cut them off mid-run (drain exit 4). Real hangs/faults still
-  # surface fast via STUCK_POLLS / fault detection, not MAX_MIN.
-  bash scripts/wait_infer_drain.sh ${ATOM_SERVER_PORT} 60 10 "$ATOM_CLIENT_LOG" 18
+  # 8k/1k c=1024 first prepares/encodes 10240 prompts and 2048 warmups. That
+  # client-only phase can be silent for more than three minutes, so do not let
+  # the progress watchdog mistake it for an engine hang. Fault signatures are
+  # still detected immediately by wait_infer_drain.sh.
+  benchmark_max_minutes=${ATOM_BENCHMARK_MAX_MINUTES:-120}
+  benchmark_stuck_polls=${ATOM_BENCHMARK_STUCK_POLLS:-120}
+  bash scripts/wait_infer_drain.sh \
+    ${ATOM_SERVER_PORT} "$benchmark_max_minutes" 10 \
+    "$ATOM_CLIENT_LOG" "$benchmark_stuck_polls"
   DRAIN_RC=$?
   if [ "$DRAIN_RC" -ne 0 ]; then
     echo "wait_infer_drain.sh exit=$DRAIN_RC — killing benchmark pgid $CLIENT_PID"
