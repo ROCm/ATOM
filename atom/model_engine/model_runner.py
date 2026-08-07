@@ -2322,26 +2322,25 @@ class ModelRunner:
         )
         max_nb = int(nb.max()) if nb is not None and nb.size > 0 else 0
 
-        # Per-request forward length = max(ell_i, max_num_bonus) + 1, in [1, full_q].
+        from atom.spec_decode.dspark_scheduler import (
+            quantize_to_bucket,
+            ragged_verify_len,
+            resolve_q_buckets,
+        )
+
+        # Per-request forward length, bounded by BOTH max_nb+1 (the anchor must
+        # stay inside the segment) and old_nst[i] (a stale ell must never grow a
+        # seq past what the scheduler scheduled). See `ragged_verify_len`; None
+        # means the two bounds cross and ragged is not representable this step.
         new_len = np.empty(scheduled_bs, dtype=np.int32)
         any_shrink = False
         for i, rid in enumerate(batch.req_ids[:scheduled_bs]):
-            ell = by_req.get(rid)
-            ell_i = full_q - 1 if ell is None else int(ell)
-            ell_i = max(ell_i, max_nb)
-            li = ell_i + 1
-            if li < 1:
-                li = 1
-            elif li > full_q:
-                li = full_q
+            li = ragged_verify_len(by_req.get(rid), full_q, max_nb, int(old_nst[i]))
+            if li is None:
+                return  # stay rectangular
             new_len[i] = li
             if li < int(old_nst[i]):
                 any_shrink = True
-
-        from atom.spec_decode.dspark_scheduler import (
-            quantize_to_bucket,
-            resolve_q_buckets,
-        )
 
         if not any_shrink:
             return  # nothing to shrink this step -> Phase-1 layout
