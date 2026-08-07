@@ -39,6 +39,59 @@ Checkpoint layout (DeepSeek-V4-Pro-DSpark):
   mtp.2.confidence_head.proj       confidence head [1, hidden+rank]
   mtp.2.hc_head_{fn,base,scale}, mtp.2.norm   final mHC reduction + norm
   (embed + lm_head are shared with the target via share_with_target)
+
+COMPILE BOUNDARY -- read before editing.
+
+``_DSparkInner.forward`` carries ``@support_torch_compile``. Everything it
+reaches is traced by Dynamo and, at ``--level 3``, replayed WITHOUT guard
+evaluation (``dispatch_to_code``, atom/utils/decorators.py:582) -- so whatever
+the FIRST call traced is permanent.
+
+  TRACED: _DSparkInner.forward, _build_block_plan, _dspark_block_topk_idxs,
+          DSparkLayer.forward_block
+
+The compiled region runs embed -> 3 stages -> mHC reduction and STOPS at the
+hidden state. Two things are deliberately outside it, both because they contain
+LAZY JIT LOADERS that Dynamo cannot trace -- tracing either one graph-breaks,
+and the break splits the forward into two Dynamo graphs, the second of which
+trips "VllmBackend can only be called once":
+
+  1. DSparkLayer.dspark_attention -- reachable only through the Dynamo-opaque
+     torch.ops.aiter.dspark_block_attention splitting op (mirrors how the V4
+     target reaches _attn_core through v4_core_attention). The fused
+     qk_norm_rope_maybe_quant JIT-builds a flydsl kernel; the builder hits
+     function.__new__.
+  2. head_and_sample (LM head + Markov sampler) -- a plain uncompiled method.
+     Under TP, ParallelLMHead's aiter all_gather lazily JIT-loads an aiter
+     module, reaching shutil.which()/posix.stat. Same division as the target,
+     whose LM head lives in compute_logits, outside DeepseekV4Model.forward.
+
+Being outside also means their per-step forward-context reads run eagerly and
+can never bake -- which is what makes dspark_attention's is_dummy_run gate and
+ParallelLMHead's is_prefill/is_draft branch safe, and what lets WARMUP be the
+first traced call (see DeepseekV4DSpark.forward_spec: warmup is padded to B==2
+so the batch dim does not get 0/1-specialized).
+
+In the TRACED region, do NOT:
+  - read get_forward_context(), os.environ, or any per-step mutable global --
+    it bakes
+  - call anything that may lazily build or load a kernel on first use
+  - branch on a python value that differs between calls (batch size,
+    is_dummy_run, is_prefill, num_draft)
+  - mutate an nn.Module buffer -- ``bytecode_hook`` (decorators.py:392) rejects
+    it outright
+
+These failures are SILENT: the output stays correct (speculative decoding is
+lossless), only the acceptance rate collapses. The merge gate is the acceptance
+rate, not GSM8K.
+
+  NOT TRACED, safe to edit and instrument: write_context_kv (deliberately
+  left eager -- the decorator replaces only ``__call__``), share_with_target,
+  remap_mtp_weight_name, get_expert_mapping, and DSparkProposer.propose().
+
+Instrument at ``DSparkProposer.propose()``, never inside the traced region.
+Rollback: ``ATOM_DSPARK_DISABLE_COMPILE=1`` (draft only) or ``--level 0`` (both
+models). ``--enforce-eager`` does NOT disable this.
 """
 
 from dataclasses import dataclass
@@ -47,11 +100,63 @@ from typing import TYPE_CHECKING
 import torch
 from torch import nn
 
+from atom.config import get_current_atom_config
 from atom.models.dspark_draft import DSparkDraftModel
-from atom.utils import envs
+from atom.utils import envs, mark_spliting_op
+from atom.utils.decorators import support_torch_compile
 
 if TYPE_CHECKING:
     from atom.config import Config
+
+
+def _dspark_block_attention_fake(
+    x: torch.Tensor,
+    positions: torch.Tensor,
+    draft_pos: torch.Tensor,
+    valid_target: torch.Tensor,
+    topk_idxs: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+@mark_spliting_op(
+    is_custom=True, gen_fake=_dspark_block_attention_fake, mutates_args=[]
+)
+def dspark_block_attention(
+    x: torch.Tensor,  # [B, T, dim] per-block hidden (post attn_norm)
+    positions: torch.Tensor,  # [B] anchor position per request
+    draft_pos: torch.Tensor,  # [B, T] block plan: absolute draft positions
+    valid_target: torch.Tensor,  # [B, W] block plan: window validity
+    topk_idxs: torch.Tensor,  # [B, T, W+T] block plan: gather indices
+    layer_name: str,
+) -> torch.Tensor:  # [B, T, dim]
+    """Dynamo-opaque wrapper around one DSpark stage's block attention.
+
+    REQUIRED for the draft to compile at all, not an optimization. The fused
+    ``qk_norm_rope_maybe_quant`` lazily JIT-builds a flydsl kernel on first call
+    for a given shape, and Dynamo cannot trace that builder (it hits
+    ``function.__new__``). Tracing into it graph-breaks, and the break splits the
+    forward into two Dynamo graphs, the second of which trips ``VllmBackend can
+    only be called once``.
+
+    The V4 target calls the very same kernel and is fine precisely because its
+    call site (``DeepseekV4Attention._attn_core``) is reachable only through
+    ``torch.ops.aiter.v4_core_attention``, a splitting op. This mirrors that,
+    at the WIDE granularity (``v4_attention_with_output``): the whole attention
+    sub-layer stays eager.
+
+    Being opaque also means everything inside runs eagerly EVERY step, which is
+    what makes the ``is_dummy_run`` / ``attn_metadata`` reads in
+    ``dspark_attention`` safe -- they can no longer bake into a compiled graph.
+
+    The plan's tensors are passed individually because a custom op's schema
+    cannot carry the ``_DSparkBlockPlan`` dataclass.
+    """
+    layer = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    return layer.dspark_attention(x, positions, draft_pos, valid_target, topk_idxs)
 
 
 class DSparkMarkovHead(nn.Module):
@@ -291,21 +396,25 @@ def _build_block_plan(
     positions: torch.Tensor,  # [B] anchor position per request
     T: int,  # draft width
     W: int,  # rolling window size
-    is_dummy_run: bool,
 ) -> _DSparkBlockPlan:
-    """Build the per-block invariants once for the whole DSpark backbone."""
+    """Build the per-block invariants once for the whole DSpark backbone.
+
+    TRACED — no ``is_dummy_run`` parameter on purpose. This function is pure
+    tensor arithmetic over ``positions`` and touches no unbound state, so it
+    needs no warmup special case: on a dummy run it produces a mask over a
+    window that ``dspark_attention`` returns as zeros, and the resulting garbage
+    is discarded. A gate here would be baked from the warmup trace under
+    ``CompilationLevel >= DYNAMO_ONCE`` and permanently zero the window.
+    Re-adding one is a silent accuracy bug; ``tests/test_dspark.py`` asserts the
+    parameter stays gone.
+    """
     B = positions.shape[0]
     device = positions.device
     offsets = torch.arange(1, T + 1, device=device, dtype=positions.dtype)
     draft_pos = positions.view(B, 1) + offsets.view(1, T)
-    if is_dummy_run:
-        # warmup runs BEFORE allocate_kv_cache: no window is bound yet, so every
-        # slot is invalid (the draft output is discarded anyway).
-        valid_target = torch.zeros(B, W, dtype=torch.bool, device=device)
-    else:
-        # slot s valid iff its absolute position (anchor-(W-1)+s) >= 0.
-        slot_ids = torch.arange(W, device=device).view(1, W)
-        valid_target = slot_ids >= (W - 1) - positions.view(B, 1)
+    # slot s valid iff its absolute position (anchor-(W-1)+s) >= 0.
+    slot_ids = torch.arange(W, device=device).view(1, W)
+    valid_target = slot_ids >= (W - 1) - positions.view(B, 1)
     return _DSparkBlockPlan(
         draft_pos=draft_pos,
         valid_target=valid_target,
@@ -509,6 +618,16 @@ class DSparkLayer(Block):  # type: ignore[misc]
         # out the same way whether or not it matches the pool's own.
         self.attn.window_kv_dtype = torch.bfloat16
 
+        # Register for the opaque attention op's lookup. `dspark_attention` is
+        # reachable ONLY through torch.ops.aiter.dspark_block_attention, which
+        # takes this name and resolves the layer here -- the standard way to get
+        # module state into a Dynamo-opaque op (see module_dispatch_ops.py, and
+        # DeepseekV4Attention's own registration in deepseek_v4.py).
+        self.dspark_layer_name = f"{self.attn.layer_name}.dspark"
+        get_current_atom_config().compilation_config.static_forward_context[
+            self.dspark_layer_name
+        ] = self
+
     def reset_kv_cache(self, max_num_seqs: int, device, dtype) -> None:
         """No-op: draft KV is paged into the shared pool (bound at
         allocate_kv_cache), not a private per-layer ring. Kept for eagle.py's
@@ -611,9 +730,16 @@ class DSparkLayer(Block):  # type: ignore[misc]
         self,
         x: torch.Tensor,  # [B, T, dim]  per-block hidden (post attn_norm)
         positions: torch.Tensor,  # [B]  anchor position per request
-        plan: "_DSparkBlockPlan",  # per-block invariants, shared across stages
+        draft_pos: torch.Tensor,  # [B, T]     block plan, shared across stages
+        valid_target: torch.Tensor,  # [B, W]     block plan
+        topk_idxs: torch.Tensor,  # [B, T, W+T] block plan
     ) -> torch.Tensor:  # [B, T, dim]
-        """Block attention over (rolling target window ++ draft block KV)."""
+        """Block attention over (rolling target window ++ draft block KV).
+
+        EAGER — reached only via ``torch.ops.aiter.dspark_block_attention``, so
+        this body is never traced. That is deliberate (the flydsl JIT below is
+        untraceable) and it is what lets the forward-context reads here stay.
+        """
         a = self.attn
         B, T, _ = x.shape
         flat = x.view(B * T, -1)
@@ -630,7 +756,6 @@ class DSparkLayer(Block):  # type: ignore[misc]
         # q stays 2-D [B*T, H*D], kv 2-D [B*T, D] — the fused kernel wants 2-D.
 
         # Draft positions (anchor+1 .. anchor+T) come from the shared block plan.
-        draft_pos = plan.draft_pos
         rope_dim = a.rope_head_dim
         # Per-head weightless Q RMSNorm + weighted KV RMSNorm + GPT-J RoPE in ONE
         # fused kernel — the same `qk_norm_rope_maybe_quant` the V4 target runs
@@ -688,8 +813,8 @@ class DSparkLayer(Block):  # type: ignore[misc]
             q,
             all_kv,
             a.attn_sink[: a.n_local_heads],
-            plan.valid_target,
-            plan.topk_idxs,
+            valid_target,
+            topk_idxs,
             a.softmax_scale,
         )  # [B, T, n_heads, head_dim]
 
@@ -736,7 +861,16 @@ class DSparkLayer(Block):  # type: ignore[misc]
             self.norm_eps,
         )
         attn_in = hc_state.x_prev.view(B, T, -1)
-        attn_out = self.dspark_attention(attn_in, positions, plan)
+        # Through the opaque splitting op, never `self.dspark_attention` direct:
+        # that body contains an untraceable JIT kernel builder. See the op.
+        attn_out = torch.ops.aiter.dspark_block_attention(
+            attn_in,
+            positions,
+            plan.draft_pos,
+            plan.valid_target,
+            plan.topk_idxs,
+            self.dspark_layer_name,
+        )
         hc_state.x_prev = attn_out.view(B * T, -1)
         # ----- FFN sub-layer with mHC mixing -----
         hc_state = self.fuse_hc(
@@ -797,6 +931,8 @@ class DeepseekV4DSpark(DSparkDraftModel):
         self.atom_config.quant_config = self.args.quant_config
 
         self.block_size = int(self.hf_config.dspark_block_size)
+        # Draft width the compiled graph was built for; see forward_spec.
+        self._compiled_num_draft: "int | None" = None
         # Rolling target-KV window width. Exposed on the wrapper (top level) so the
         # proposer never reaches through `self.model.model.mtp[0]` to read it.
         self.window_size = int(self.args.window_size)
@@ -828,7 +964,7 @@ class DeepseekV4DSpark(DSparkDraftModel):
 
         self.model = _DSparkInner(
             self.atom_config,
-            self.args,
+            args=self.args,
             num_stages=self.num_stages,
             markov_rank=self.markov_rank,
             target_layer_ids=self.target_layer_ids,
@@ -910,17 +1046,76 @@ class DeepseekV4DSpark(DSparkDraftModel):
             draft_token_ids: [B, num_draft]
             confidence: [B, num_draft]
         """
-        return self.model.forward_spec(input_ids, positions, num_draft=num_draft)
+        from atom.utils.forward_context import get_forward_context
+
+        T = int(num_draft) if num_draft is not None else self.block_size
+
+        # num_draft is a python int, so the decorator does not mark it dynamic
+        # and it is baked into the compiled graph. It is constant for the
+        # process -- min(mtp_k, window_size) -- so baking is correct, but say so
+        # loudly rather than silently replaying a graph built for another width.
+        if self._compiled_num_draft is None:
+            self._compiled_num_draft = T
+        elif T != self._compiled_num_draft:
+            raise ValueError(
+                f"DSpark draft width changed after the first forward "
+                f"({self._compiled_num_draft} -> {T}). num_draft is baked into "
+                f"the compiled graph at CompilationLevel >= DYNAMO_ONCE."
+            )
+
+        # ---- Keep the batch dim off the 0/1 specialization ------------------
+        # torch._dynamo.mark_dynamic -- which the decorator applies on the FIRST
+        # call only (decorators.py:510) -- SPECIALIZES a size-0/1 dimension
+        # instead of making it symbolic. A graph first traced at B==1 therefore
+        # holds no SymInt at all, and PiecewiseBackend indexes
+        # sym_shape_indices[0] on its first replay and dies with IndexError.
+        # Observed: the dumped computation_graph.py read `L_input_ids_: "i32[1]"`
+        # where it should read `s0`.
+        #
+        # The fix is to make WARMUP the first traced call and pad it to B==2.
+        # Padding is sound there and ONLY there: on a dummy run the opaque
+        # attention op synthesizes a zero window (kv.new_zeros(B, W, ...)) and
+        # never touches attn_metadata, so an extra synthetic row costs nothing.
+        # On a REAL step it would be a bug -- attn_metadata is built for the
+        # actual batch, so swa_block_tables[:B] silently returns the REAL row
+        # count rather than the padded one, and the [window ++ draft] concat
+        # blows up on mismatched batch dims. (Tried it; that is exactly what
+        # happens.)
+        #
+        # Tracing at warmup is safe only because dspark_attention sits behind
+        # the opaque op: is_dummy_run is read eagerly inside it, every step, and
+        # so can never bake into the graph.
+        is_dummy = get_forward_context().context.is_dummy_run
+        anchor_ids = input_ids
+        pad = is_dummy and input_ids.shape[0] == 1
+        if pad:
+            input_ids = input_ids.repeat(2)
+            positions = positions.repeat(2)
+
+        # __call__, not .forward -- the decorator's compiled dispatch lives there.
+        normed, hc_hidden = self.model(input_ids, positions, T)
+        if pad:
+            # normed is [B*T, dim] and hc_hidden [B, T, dim]; keep request 0.
+            normed, hc_hidden = normed[:T], hc_hidden[:1]
+        return self.model.head_and_sample(normed, hc_hidden, anchor_ids)
 
 
+@support_torch_compile
 class _DSparkInner(nn.Module):
-    """Inner module owning the DSpark backbone layers; embed/head set externally."""
+    """Inner module owning the DSpark backbone layers; embed/head set externally.
+
+    COMPILED — ``forward`` is the traced entry point. The decorator is here
+    rather than on ``DeepseekV4DSpark`` so the wrapper keeps its public
+    ``forward_spec`` / ``write_context_kv`` signatures (the proposer's hot
+    path is unchanged) and so ``write_context_kv`` stays eager: the
+    decorator only replaces ``__call__``, never other methods.
+    """
 
     def __init__(
         self,
         atom_config: "Config",
-        args: "DeepseekV4Args",
         *,
+        args: "DeepseekV4Args",
         num_stages: int,
         markov_rank: int,
         target_layer_ids: tuple,
@@ -957,13 +1152,33 @@ class _DSparkInner(nn.Module):
         self.embed = None  # set by share_with_target
         self.head = None
 
-    def forward_spec(self, input_ids, positions, num_draft=None):
+    def forward(
+        self,
+        input_ids: torch.Tensor,  # [B]  anchor token per request (x0)
+        positions: torch.Tensor,  # [B]  anchor position per request
+        num_draft: int,  # draft width T; see the note below
+    ):
+        """TRACED ENTRY POINT — see the COMPILE BOUNDARY note at the top of this
+        file before editing anything reachable from here.
+
+        ``input_ids`` / ``positions`` are the only dynamic-shaped arguments; the
+        decorator marks dim 0 (the batch) dynamic on the first call.
+
+        ``num_draft`` is a python int, so it is NOT marked dynamic and is baked
+        permanently into the compiled graph. That is correct — the draft width is
+        ``min(mtp_k, window_size)``, both fixed for the process — and the caller
+        (``DeepseekV4DSpark.forward_spec``) raises if it ever changes.
+
+        Returns the block's hidden state, NOT tokens: ``(normed [B*T, dim],
+        hc_hidden [B, T, dim])``. The LM head and Markov sampler follow in the
+        uncompiled ``head_and_sample``.
+        """
         B = input_ids.shape[0]
         # Draft width defaults to the training block size but may be widened up to
         # the rolling window when num_speculative_tokens > block_size (the weights
         # are draft-width-agnostic; positions past the block size are RoPE-
         # extrapolated). Cap at window_size so the [window ++ draft] KV stays sane.
-        T = int(num_draft) if num_draft is not None else self.block_size
+        T = int(num_draft)
         # No main_proj here: the target context reaches the draft block through
         # the rolling KV window (written by write_context_kv and gathered in
         # each stage's attention), not through this forward's activations.
@@ -977,14 +1192,7 @@ class _DSparkInner(nn.Module):
         # Per-block invariants (draft positions, window validity, gather indices)
         # depend only on (positions, T, W), so build them once and share across
         # every stage instead of recomputing them inside each stage's attention.
-        from atom.utils.forward_context import get_forward_context
-
-        plan = _build_block_plan(
-            positions,
-            T,
-            self.mtp[0].window_size,
-            get_forward_context().context.is_dummy_run,
-        )
+        plan = _build_block_plan(positions, T, self.mtp[0].window_size)
 
         # ----- Parallel backbone: run all stages over the block in one pass ---
         hc_state = None
@@ -1005,12 +1213,26 @@ class _DSparkInner(nn.Module):
         hc_hidden = self.head.hc_head(
             reduced, last.hc_head_fn, last.hc_head_scale, last.hc_head_base
         )  # [B*T, dim]
-        base_logits = self.head.get_logits(last.norm(hc_hidden)).view(
-            B, T, -1
-        )  # [B, T, vocab]
+        # The compiled region ENDS here, at the hidden state -- the LM head and
+        # the Markov sampler run eagerly in `head_and_sample`. Same division the
+        # V4 target uses: `DeepseekV4Model.forward` is the decorated part and
+        # `compute_logits` is a separate uncompiled step.
+        #
+        # Not a style choice: under TP, ParallelLMHead.forward does an aiter
+        # all_gather whose first call lazily JIT-loads an aiter module, and
+        # tracing that loader reaches shutil.which()/posix.stat, which Dynamo
+        # cannot trace -- the same graph-break-then-"VllmBackend can only be
+        # called once" failure the attention op fixes.
+        return last.norm(hc_hidden), hc_hidden.view(B, T, -1)  # [B*T,dim], [B,T,dim]
 
-        # ----- Sequential Markov head: sample the block left-to-right ---------
-        return self.forward_head(base_logits, hc_hidden.view(B, T, -1), input_ids)
+    def head_and_sample(self, normed, hc_hidden, anchor_ids):
+        """LM head + sequential Markov sampling. NOT TRACED (see `forward`).
+
+        normed: [B*T, dim] post-norm hidden; hc_hidden: [B, T, dim] pre-norm.
+        """
+        B, T, _ = hc_hidden.shape
+        base_logits = self.head.get_logits(normed).view(B, T, -1)  # [B, T, vocab]
+        return self.forward_head(base_logits, hc_hidden, anchor_ids)
 
     def forward_head(self, base_logits, hc_hidden, anchor_ids):
         """Apply the Markov transition bias position-by-position and sample.

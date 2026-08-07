@@ -17,6 +17,7 @@ from atom.spec_decode.dspark_scheduler import (
     schedule_prefix_lengths,
     survival_probabilities,
 )
+from atom.spec_decode.dspark_verify import VerifyScheduler
 
 # ----------------------------------------------------------------------------
 # survival_probabilities
@@ -488,3 +489,120 @@ def test_ragged_graph_bucket_plan_b():
     batch_id = np.full(cap, -1, dtype=np.int32)
     batch_id[:total_new] = np.repeat(np.arange(bs), new_len)
     assert (batch_id[total_new:] == -1).all()
+
+
+# ----------------------------------------------------------------------------
+# VerifyScheduler ell handoff (non-blocking)
+# ----------------------------------------------------------------------------
+
+
+class _FakeEvent:
+    """Stand-in for torch.cuda.Event exposing only query()."""
+
+    def __init__(self, done: bool):
+        self.done = done
+        self.synchronize_calls = 0
+
+    def query(self):
+        return self.done
+
+    def synchronize(self):  # pragma: no cover - must never be reached
+        self.synchronize_calls += 1
+        raise AssertionError("ell handoff must never block on the GPU")
+
+
+def _pending(done, ell, req_ids):
+    return (_FakeEvent(done), _torch.tensor(ell, dtype=_torch.int64), list(req_ids))
+
+
+def _fresh_scheduler():
+    """A VerifyScheduler with __init__'s state but no runner/CUDA."""
+    vs = VerifyScheduler.__new__(VerifyScheduler)
+    vs._ell_pending = []
+    vs._ell_map = {}
+    vs._ell_stage_ring = None
+    vs._ell_stage_idx = 0
+    return vs
+
+
+def test_ell_drain_never_synchronizes_and_keeps_last_map():
+    # This step's copy is still in flight -> reads fall back to what we have,
+    # and nothing may block. Regression guard for the dspark -> decode bubble:
+    # ell_by_req used to event.synchronize() at the top of every step.
+    vs = _fresh_scheduler()
+    vs._ell_map = {"A": 2}
+    vs._ell_pending = [_pending(False, [5, 5], ["A", "B"])]
+
+    assert vs.ell_by_req == {"A": 2}
+    assert vs.ell_nonblocking() == {"A": 2}
+    # Entry stays queued for a later step rather than being consumed or waited on.
+    assert len(vs._ell_pending) == 1
+
+
+def test_ell_drain_adopts_freshest_completed_copy():
+    # Two landed copies + one in flight: the newest LANDED one wins, and the
+    # in-flight one stays queued.
+    vs = _fresh_scheduler()
+    vs._ell_pending = [
+        _pending(True, [1, 1], ["A", "B"]),
+        _pending(True, [4, 3], ["A", "B"]),
+        _pending(False, [0, 0], ["A", "B"]),
+    ]
+
+    assert vs.ell_by_req == {"A": 4, "B": 3}
+    assert len(vs._ell_pending) == 1
+    assert vs._ell_pending[0][0].query() is False
+
+
+def test_ell_map_is_remapped_by_req_id_not_position():
+    # ell was computed in step-N batch order; a reordered batch must still read
+    # each request's own value (continuous batching reorders between steps).
+    vs = _fresh_scheduler()
+    vs._ell_pending = [_pending(True, [2, 5, 1], ["A", "B", "C"])]
+    by_req = vs.ell_by_req
+    assert [by_req[r] for r in ["C", "A", "B"]] == [1, 2, 5]
+
+
+def test_ell_setter_drops_inflight_copies():
+    vs = _fresh_scheduler()
+    vs._ell_pending = [_pending(True, [3], ["A"])]
+    vs.ell_by_req = {}
+    assert vs.ell_by_req == {}
+    assert vs._ell_pending == []
+
+
+def test_ell_stage_ring_allocates_on_cpu_under_a_gpu_default_device():
+    """The pinned ell ring must survive a non-CPU default device.
+
+    It is first allocated on the warmup forward, and ModelRunner.__init__ only
+    resets the default device to "cpu" AFTER _maybe_warmup() returns — so an
+    unqualified torch.zeros(..., pin_memory=True) allocates on the GPU and
+    raises "Only dense CPU tensors can be pinned", killing every rank at
+    startup. Reproduces that context exactly.
+    """
+    import pytest
+
+    if not (_torch.cuda.is_available() is True):
+        pytest.skip("needs a real CUDA/HIP device to set as the default")
+
+    class _StubRunnerCfg:
+        max_num_seqs = 8
+
+    class _StubRunner:
+        config = _StubRunnerCfg()
+
+    vs = _fresh_scheduler()
+    vs.runner = _StubRunner()
+
+    _torch.set_default_device("cuda")
+    try:
+        slot = vs._ell_stage(4)
+    finally:
+        _torch.set_default_device(None)
+
+    assert slot.device.type == "cpu"
+    assert slot.is_pinned()
+    assert slot.shape == (4,)
+    # Slots rotate so an in-flight copy is never overwritten under it.
+    assert vs._ell_stage_ring.shape == (4, 8)
+    assert vs._ell_stage_idx == 1

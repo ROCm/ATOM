@@ -1268,6 +1268,27 @@ class ModelRunner:
             self.forward_vars["num_accepted_tokens"] = CpuGpuBuffer(
                 self.max_bs, **i32_kwargs
             )
+            if self.config.dspark.ragged and self.drafter.uses_confidence_schedule:
+                # Pinned staging for the three per-step DSpark RAGGED host->device
+                # transfers. They used to go through
+                # `torch.as_tensor(np_array, device=cuda)`, which is a PAGEABLE
+                # H2D: PyTorch issues cudaMemcpyAsync and then synchronizes the
+                # stream, draining every kernel already queued for this step
+                # before the host may continue. Living in forward_vars gets them
+                # the same per-slot ring treatment as `input_ids`, which bounds
+                # reuse against an in-flight forward.
+                #   ragged_lens    : per-seq verify lengths (propose_draft_token_ids)
+                #   ragged_extend  : the same lengths, but built and consumed in
+                #                    the V4 attention metadata build -- a separate
+                #                    slot because the two live at opposite ends of
+                #                    a step (attn build in prepare, propose in
+                #                    postprocess) and must not alias
+                self.forward_vars["ragged_lens"] = CpuGpuBuffer(
+                    self.max_bs, **i32_kwargs
+                )
+                self.forward_vars["ragged_extend"] = CpuGpuBuffer(
+                    self.max_bs, **i32_kwargs
+                )
 
     def _init_forward_vars_ring(self):
         """Build a ring of independent ``forward_vars`` copies, one per possible
@@ -2180,10 +2201,12 @@ class ModelRunner:
             return
         full_q = self.drafter.mtp_k + 1
 
-        # {req_id: ell} from the PREVIOUS step's propose() (verify_scheduler,
-        # same process). The worker batch copy has req_ids but NOT the
-        # scheduler-side `seqs` dict, so look ell up by req_id. A request with no
-        # prior ell (new this step) -> full length (never under-verify).
+        # {req_id: ell} from an EARLIER step's propose() (verify_scheduler, same
+        # process) — the freshest one whose async D2H has landed, which is a step
+        # or two back while the CPU runs ahead; reading it never syncs. The
+        # worker batch copy has req_ids but NOT the scheduler-side `seqs` dict,
+        # so look ell up by req_id. A request with no ell yet (new this step, or
+        # its copy still in flight) -> full length (never under-verify).
         verify_scheduler = self.drafter.verify_scheduler
         by_req = (
             verify_scheduler.ell_by_req if verify_scheduler is not None else None
@@ -2455,6 +2478,9 @@ class ModelRunner:
         # Precompute the flat replay token count once here (before attn build +
         # run_model) so the attn builder's positions padding matches it.
         batch.dynamic_num_tokens_pad = self._dynamic_num_tokens_pad(batch)
+
+        if envs.ATOM_DSPARK_LOG_RAGGED and not batch.is_dummy_run:
+            self._log_ragged_step(batch)
 
         if not tbo_collective_active:
             self._pcp_tbo_balanced_active = False
@@ -3275,11 +3301,15 @@ class ModelRunner:
             # RAGGED: each seg has its own len_i; anchor offset = len_i - num_bonus_i
             # (num_bonus_i = mtp_k - num_reject_i), applied to cu_seqlens_q ends.
             sbs = batch.total_seqs_num_decode
-            lens_t = torch.as_tensor(
-                np.asarray(ragged_lens)[:sbs],
-                device=num_reject_tokens.device,
-                dtype=num_reject_tokens.dtype,
-            )
+            # Pinned staging + non_blocking: a pageable H2D here would sit
+            # between the target forward and the block draft and synchronize the
+            # stream, forcing the host to wait out the whole target forward.
+            # int32 matches num_reject_tokens (rejection_sampler emits int32 and
+            # default_num_rejected_tokens is int32), so the arithmetic below
+            # keeps the dtype it had before.
+            lens_buf = self.forward_vars["ragged_lens"]
+            lens_buf.np[:sbs] = np.asarray(ragged_lens)[:sbs]
+            lens_t = lens_buf.copy_to_gpu(sbs)
             num_bonus = self.drafter.mtp_k - num_reject_tokens[:sbs]
             last_token_offset = lens_t - num_bonus
         elif (
@@ -3423,6 +3453,37 @@ class ModelRunner:
                     "capture path for cudagraph-safe DP collectives.",
                     getter,
                 )
+
+    def _log_ragged_step(self, batch) -> None:
+        """One line per decode step with every value ragged actually changes.
+
+        Diagnostic for the ragged-only decode bubble. Reading the code narrowed
+        the delta to the replay SHAPE -- `ragged_graph_sizes="6"` pins q_eff to
+        full_q, so q is not a variable; what moves is the real token total, and
+        with it the flat CUDA-graph bucket and the MoE pad width. Whether those
+        actually thrash step to step (and whether any step falls off the
+        captured set into eager) cannot be settled by reading. Gated by
+        ATOM_DSPARK_LOG_RAGGED=1; off costs one attribute read.
+        """
+        if not hasattr(self, "drafter") or batch.total_tokens_num_prefill > 0:
+            return
+        lens = getattr(batch, "dynamic_spec_query_tokens_per_req", None)
+        sbs = batch.total_seqs_num_decode
+        q = int(getattr(batch, "num_spec_query_tokens", 0))
+        pad = batch.dynamic_num_tokens_pad
+        real = int(batch.total_tokens_num_decode)
+        captured = pad in self._piecewise_captured_tokens if pad is not None else None
+        logger.info(
+            "DSPARK_RAGGED bs=%d q_eff=%d real_tok=%d pad_tok=%s captured=%s "
+            "moe_graph_bs=%s lens=%s",
+            sbs,
+            q,
+            real,
+            pad,
+            captured,
+            (int(pad) // q) if (pad is not None and q) else None,
+            np.asarray(lens)[:sbs].tolist() if lens is not None else "rectangular",
+        )
 
     def _dynamic_num_tokens_pad(self, batch) -> int | None:
         """Flat PIECEWISE replay token count for a ragged decode step, or None so
@@ -3740,6 +3801,23 @@ class ModelRunner:
         q_buckets = self._dspark_capture_q_buckets(full_q_len)
         if q_buckets != [full_q_len]:
             logger.info("DSpark CUDA-graph query buckets: %s", q_buckets)
+        elif hasattr(self, "drafter") and self.drafter.uses_confidence_schedule:
+            # resolve_q_buckets always folds full_q in, so a spec naming only
+            # full_q (or nothing, or nothing valid) collapses to [full_q] and
+            # every step replays at full length. The step still pays the
+            # confidence schedule + ragged rebuild, so say so rather than look
+            # like it is shrinking anything.
+            dspark = self.config.dspark
+            spec = dspark.ragged_graph_sizes if dspark.ragged else dspark.q_buckets
+            logger.warning(
+                "DSpark %s=%r resolves to [%d] (== full verify length), so no "
+                "query-length shrink is possible and every decode step replays "
+                "at full length. Pass sizes BELOW %d to get any benefit.",
+                "ragged_graph_sizes" if dspark.ragged else "q_buckets",
+                spec,
+                full_q_len,
+                full_q_len,
+            )
 
         # Whether this backend's capture builder supports a dynamic (per-bucket)
         build_capture = self.attn_metadata_builder.build_for_cudagraph_capture
