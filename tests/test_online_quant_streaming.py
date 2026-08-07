@@ -298,6 +298,46 @@ class _MixedLayer(nn.Module):
         self.mlp.experts = StreamMoE(num_experts, False)
 
 
+class _DeferredAttention(nn.Module):
+    """Parent hook that must run before its streamed child is finalized."""
+
+    def __init__(self, stream: bool, linear_cls):
+        super().__init__()
+        self.o_proj = linear_cls(HIDDEN, HIDDEN, stream)
+        self.child_calls_when_processed = None
+
+    def get_streaming_deferred_modules(self):
+        return (self.o_proj,)
+
+    def process_weights_after_loading(self):
+        self.child_calls_when_processed = self.o_proj.post_process_calls
+        self.o_proj.weight.data.add_(1)
+
+
+class _DeferredLayer(nn.Module):
+    def __init__(self, num_experts: int, stream: bool, linear_cls):
+        super().__init__()
+        self.self_attn = _DeferredAttention(stream, linear_cls)
+        self.mlp = nn.Module()
+        self.mlp.experts = StreamMoE(num_experts, False)
+
+
+class DeferredStreamModel(StreamModel):
+    def __init__(
+        self,
+        num_layers: int,
+        num_experts: int,
+        stream: bool,
+        linear_cls=StreamLinear,
+    ):
+        nn.Module.__init__(self)
+        self.num_experts = num_experts
+        self.model = nn.Module()
+        self.model.layers = nn.ModuleList(
+            _DeferredLayer(num_experts, stream, linear_cls) for _ in range(num_layers)
+        )
+
+
 class SharedExpertStreamModel(StreamModel):
     moe_cls = SharedExpertStreamMoE
 
@@ -520,6 +560,45 @@ class StreamingDifferentialTest(unittest.TestCase):
                 online_quant_streamer.done_module_ids,
             )
             self.assertNotIn(id(experts), online_quant_streamer.done_module_ids)
+
+    def test_deferred_child_finalizes_after_parent_post_process(self):
+        baseline, _ = run_load(
+            streaming=False,
+            num_layers=1,
+            model_cls=DeferredStreamModel,
+        )
+        model, online_quant_streamer = run_load(
+            streaming=True,
+            host_staging=True,
+            num_threads=8,
+            num_layers=1,
+            model_cls=DeferredStreamModel,
+        )
+
+        for module in baseline.modules():
+            if hasattr(module, "process_weights_after_loading"):
+                module.process_weights_after_loading()
+        for module in model.modules():
+            if (
+                hasattr(module, "process_weights_after_loading")
+                and id(module) not in online_quant_streamer.done_module_ids
+            ):
+                module.process_weights_after_loading()
+
+        for name, want in weights_of(baseline).items():
+            torch.testing.assert_close(
+                want,
+                dict(model.named_parameters())[name].detach(),
+                rtol=0,
+                atol=0,
+            )
+        attention = model.model.layers[0].self_attn
+        self.assertEqual(attention.child_calls_when_processed, 0)
+        self.assertEqual(attention.o_proj.post_process_calls, 1)
+        self.assertNotIn(
+            id(attention.o_proj),
+            online_quant_streamer.done_module_ids,
+        )
 
     def test_host_staging_with_tail_workers_matches_non_streaming(self):
         model, _ = run_load(
