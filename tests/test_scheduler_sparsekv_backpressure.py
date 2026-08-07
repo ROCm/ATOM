@@ -10,12 +10,11 @@
 # whose lifetime footprint can never fit — instead of the worker over-committing
 # mid-decode and killing the runner.
 #
-# With a GPU cold tier (ATOM_SPARSEKV_GPU_COLD_PAGES > 0) admission becomes two
-# gates and a promote-done signal: the recv gate keeps the host pool able to land
-# a whole incoming request (prefill RDMAs it there in one piece), the capacity
-# gate bounds combined host+GPU residency, and promote-done downgrades the host
-# half of a request's reservation once the worker has moved those pages to the
-# GPU tier — without which host stays the batch ceiling and the GPU tier is inert.
+# A GPU cold tier (ATOM_SPARSEKV_GPU_COLD_PAGES > 0) does not add a second gate:
+# the gate still counts HOST pages only, because prefill RDMAs a whole request
+# into the host pool before any of it can be promoted. What lifts the batch
+# ceiling from host to host+GPU is the promote-done signal shrinking each
+# request's host reservation once the worker moves those pages to the GPU tier.
 
 
 from conftest import MockConfig
@@ -259,16 +258,16 @@ def test_promoted_pages_split_host_and_gpu_usage(monkeypatch, seq_factory):
     sch = _gpu_tier_scheduler(monkeypatch, gpu_pages=6)
     seq = _resident(sch, seq_factory)  # 8 + 4 = 12 tokens -> 3 pages
     assert sch._sparsekv_pages_in_use() == 3
-    assert sch._sparsekv_gpu_pages_credited() == 0
+    assert sch._sparsekv_gpu_pages_of(seq) == 0
 
     seq.sparsekv_promoted_pages = 2
-    assert sch._sparsekv_pages_in_use() == 1
-    assert sch._sparsekv_gpu_pages_credited() == 2
+    assert sch._sparsekv_pages_in_use() == 1  # host tally drops by the promoted 2
+    assert sch._sparsekv_gpu_pages_of(seq) == 2
 
 
-def test_dual_gate_host_full_defers(monkeypatch, seq_factory):
-    """Recv gate: prefill RDMAs the whole request into the HOST pool before any
-    of it can be promoted, so free GPU-tier space does not make it admissible."""
+def test_admission_gates_on_host_pages_only(monkeypatch, seq_factory):
+    """Prefill RDMAs the whole request into the HOST pool before any of it can be
+    promoted, so a free GPU tier does not make an unlandable request admissible."""
     sch = _gpu_tier_scheduler(monkeypatch, gpu_pages=6)
     sch.kv_connector = _RemoteLoadConnector()
     _resident(sch, seq_factory)
@@ -276,7 +275,6 @@ def test_dual_gate_host_full_defers(monkeypatch, seq_factory):
     seq = _incoming(sch, seq_factory)  # needs 3 host pages, only 2 free
 
     assert sch._sparsekv_pages_in_use() == 6
-    assert sch._sparsekv_gpu_pages_credited() == 0  # capacity gate has room to spare
     sch.schedule()
 
     assert seq.status == SequenceStatus.WAITING
@@ -284,52 +282,6 @@ def test_dual_gate_host_full_defers(monkeypatch, seq_factory):
 
     # Control: the host budget is the only thing holding it back.
     sch._sparsekv_admit_pages = 9
-    sch.schedule()
-    assert seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
-
-
-def test_capacity_gate_never_binds_before_recv_gate(monkeypatch, seq_factory):
-    """The capacity gate is a backstop, not the batch ceiling.
-
-    Its budget exceeds the recv gate's by exactly the GPU pool, and the GPU tally
-    can never exceed that pool, so anything the recv gate admits it also admits.
-    The batch ceiling of host+GPU comes from the recv gate alone, via the
-    promote-done downgrade (see test_promote_done_releases_host_budget). Pinned
-    here so a change that makes the tally unbounded — dropping the clamp, or
-    counting unreported decode-time GPU pages — has to confront this first.
-    """
-    sch = _gpu_tier_scheduler(monkeypatch, gpu_pages=6)
-    sch.kv_connector = _RemoteLoadConnector()
-    a = _resident(sch, seq_factory)
-    b = _resident(sch, seq_factory)
-    a.sparsekv_promoted_pages = 3
-    b.sparsekv_promoted_pages = 3  # host tally 0, GPU tier saturated
-    seq = _incoming(sch, seq_factory, prompt=12)  # 12 + 4 = 16 -> 4 pages
-
-    host_used = sch._sparsekv_pages_in_use()
-    gpu_used = sch._sparsekv_gpu_pages_credited()
-    need = sch._sparsekv_worst_case_pages(seq)
-    assert gpu_used == 6 and host_used == 0
-    assert host_used + need <= sch._sparsekv_admit_pages  # recv gate admits
-    assert (  # so does the capacity gate, necessarily
-        host_used + gpu_used + need
-        <= sch._sparsekv_admit_pages + sch._sparsekv_gpu_pages
-    )
-
-    sch.schedule()
-    assert seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
-
-
-def test_over_credit_clamped_not_trapped(monkeypatch, seq_factory):
-    """An over-reporting worker must not wedge the capacity gate into deferring
-    every request forever; the tally is clamped to the physical pool instead."""
-    sch = _gpu_tier_scheduler(monkeypatch, gpu_pages=6)
-    sch.kv_connector = _RemoteLoadConnector()
-    bogus = _resident(sch, seq_factory)
-    bogus.sparsekv_promoted_pages = 99
-    seq = _incoming(sch, seq_factory)
-
-    assert sch._sparsekv_gpu_pages_credited() == 6
     sch.schedule()
     assert seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
 
@@ -361,7 +313,6 @@ def test_promote_done_releases_host_budget(monkeypatch, seq_factory):
     )
     assert promoted_seq.sparsekv_promoted_pages == 3
     assert sch._sparsekv_pages_in_use() == 3  # was 6
-    assert sch._sparsekv_gpu_pages_credited() == 3
 
     sch.schedule()
 
@@ -369,8 +320,8 @@ def test_promote_done_releases_host_budget(monkeypatch, seq_factory):
 
 
 def test_gpu_tier_off_keeps_single_host_gate(monkeypatch, seq_factory):
-    """Kill-switch: with no GPU tier the capacity gate reduces to the recv gate,
-    so admission behaves exactly as it did before the tier existed."""
+    """Kill-switch: with no GPU tier nothing is ever promoted, so no reservation
+    is ever downgraded and admission behaves as it did before the tier existed."""
     sch = _gpu_tier_scheduler(monkeypatch, gpu_pages=0)
     sch.kv_connector = _RemoteLoadConnector()
     _resident(sch, seq_factory)
@@ -397,7 +348,6 @@ def test_promote_credit_dropped_on_preempt(monkeypatch, seq_factory):
 
     sch.preempt(sch.running.pop())  # as the decode loop preempts
     assert seq.sparsekv_promoted_pages == 0
-    assert sch._sparsekv_gpu_pages_credited() == 0
 
     # The report is fanned in across all TP ranks and can land steps later, well
     # after the preempt already freed both tiers.
@@ -420,7 +370,6 @@ def test_promote_signal_for_unknown_request_ignored(monkeypatch, seq_factory):
         KVConnectorOutput(promoted_gpu_pages={str(live.id + 1000): 4})
     )
     assert live.sparsekv_promoted_pages == 0
-    assert sch._sparsekv_gpu_pages_credited() == 0
 
     # Same request id as a str, which is how connectors report it: credited.
     sch._update_from_kv_xfer_finished(

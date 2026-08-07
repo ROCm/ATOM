@@ -964,29 +964,6 @@ class Scheduler:
             )
         return total
 
-    def _sparsekv_gpu_pages_credited(self) -> int:
-        """GPU cold-tier pages the worker has REPORTED promoting.
-
-        A floor on tier occupancy, not the occupancy itself: decode-step growth
-        also prefers GPU pages (grow_cold_for_new_token) and is never reported.
-        That under-count is the safe direction — those pages stay charged to host.
-        Clamped to the pool: the worker cannot promote more pages than exist, so a
-        larger sum means the signal path is broken, and letting it through would
-        wedge the capacity gate into deferring every request forever.
-        """
-        credited = sum(
-            self._sparsekv_gpu_pages_of(s) for s in self._sparsekv_live_seqs()
-        )
-        if credited > self._sparsekv_gpu_pages:
-            logger.error(
-                "SparseKV promote credit %d exceeds the GPU cold tier (%d pages); "
-                "clamping. The promote-done signal is over-reporting.",
-                credited,
-                self._sparsekv_gpu_pages,
-            )
-            return self._sparsekv_gpu_pages
-        return credited
-
     def _unschedulable_reason(self, seq: Sequence) -> str | None:
         """Return a human-readable reason if `seq` is permanently unschedulable.
 
@@ -1206,11 +1183,6 @@ class Scheduler:
         sparsekv_pages_used = (
             self._sparsekv_pages_in_use() if self._sparsekv_enabled else 0
         )
-        sparsekv_gpu_pages_used = (
-            self._sparsekv_gpu_pages_credited()
-            if self._sparsekv_enabled and self._sparsekv_gpu_cold_enabled
-            else 0
-        )
         while (
             delayer_allows
             and (self.delay_factor <= 0 or self._passed_delay(time.time()))
@@ -1318,20 +1290,13 @@ class Scheduler:
             # always eventually fits — no deadlock.
             if self._sparsekv_enabled and needs_remote_load:
                 need = self._sparsekv_worst_case_pages(seq)
-                # RECV gate: prefill RDMAs the whole request into the HOST pool
-                # before any of it can be promoted, so it must land in one piece.
-                # Bounds how many requests sit in the recv/promote window at once.
+                # Gate on HOST pages only: prefill RDMAs the whole request into
+                # the host pool before any of it can be promoted, so it must land
+                # there in one piece. A combined host+GPU gate would be dead code —
+                # the GPU tally can never exceed its pool, so this check already
+                # implies it. What lifts the ceiling from host to host+GPU is the
+                # promote-done downgrade shrinking the reservations counted here.
                 if sparsekv_pages_used + need > self._sparsekv_admit_pages:
-                    self.waiting.appendleft(seq)
-                    break
-                # CAPACITY gate: post-promotion the request still has to live
-                # somewhere, in either tier. A backstop, not the ceiling — the
-                # recv gate already implies it once the GPU tally is bounded by
-                # the pool, and it is a no-op with the GPU tier off.
-                if (
-                    sparsekv_pages_used + sparsekv_gpu_pages_used + need
-                    > self._sparsekv_admit_pages + self._sparsekv_gpu_pages
-                ):
                     self.waiting.appendleft(seq)
                     break
                 # Count this admission so later iterations in THIS cycle see it
