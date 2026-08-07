@@ -73,6 +73,22 @@ def publish_at_boundary(bm: BlockManager, seq: Sequence) -> int:
     return boundary_hash(bm, seq)
 
 
+def publisher_has_read_its_source(bm: BlockManager) -> None:
+    """Step past the two passes `checkpoint` holds its fork source for.
+
+    `checkpoint` runs in postprocess, after its own batch went out, so the
+    forward that reads the source it handed over is the one the *next* pass
+    builds and the pin clears the pass after that. Until then the group is off
+    the free list — handing it to somebody else in between is one kernel
+    reading and writing it at once.
+
+    Tests about a resumer, not about the publisher, step over that here rather
+    than each spelling out two `release_state_pins` calls.
+    """
+    bm.release_state_pins()
+    bm.release_state_pins()
+
+
 def run_prompt_on_the_ladder(bm: BlockManager, seq: Sequence) -> list[int]:
     """Admit `seq`, then forward its prompt on the ladder."""
     bm.allocate(seq, bm.can_allocate(seq))
@@ -451,6 +467,7 @@ class TestCapacity:
         bm = BlockManager(ckpt_config(pool_entries={"state": 2}))
         first = stateful_seq(list(range(40)))
         h = publish_at_boundary(bm, first)
+        publisher_has_read_its_source(bm)
         group = bm.state.lookup(h)
         assert bm.state.num_free() == 1
 
@@ -512,6 +529,11 @@ class TestForkLifecycle:
         seq = stateful_seq(list(range(40)))
         bm.allocate(seq, bm.can_allocate(seq))
         for _ in range(4):
+            # One scheduling pass per chunk: each publish hands its source to
+            # the next forward, and that forward is what lets the group go.
+            # Without the boundary four publishes would hold four sources at
+            # once and the pool would run out mid-ladder.
+            bm.release_state_pins()
             bm.hash_blocks(seq, 2 * BLOCK, start_tokens=seq.num_cached_tokens)
             seq.num_cached_tokens += 2 * BLOCK
         # Four publishes into four groups: the oldest was recycled to serve the
@@ -607,14 +629,18 @@ class TestForkLifecycle:
         seq = stateful_seq(list(range(40)))
         bm.allocate(seq, bm.can_allocate(seq))
         source = seq.per_req_cache_group
+        free_before_publish = bm.state.num_free()
         bm.hash_blocks(seq, bm.checkpoint_limit(seq) - seq.num_cached_tokens)
-        free_after_publish = bm.state.num_free()
+        # Publishing costs a group until the forward that reads the source has
+        # run: the seq now owns a fresh group and the source is pinned for it.
+        assert bm.state.num_free() == free_before_publish - 1
 
         bm.cancel_state_fork(seq)
         assert seq.per_req_cache_group == source
         assert seq.state_fork_src == -1
         assert not bm.state.hash_to_group
-        assert bm.state.num_free() == free_after_publish
+        # Cancelling gives back exactly what publishing took.
+        assert bm.state.num_free() == free_before_publish
 
     def test_two_resumers_in_one_step_share_the_checkpoint(self):
         # A checkpoint is read-only, so a second request hitting the same prefix
@@ -623,6 +649,7 @@ class TestForkLifecycle:
         bm = BlockManager(ckpt_config(pool_entries={"state": 8}))
         first = stateful_seq(list(range(40)))
         src = bm.state.lookup(publish_at_boundary(bm, first))
+        publisher_has_read_its_source(bm)
 
         resumers = [stateful_seq(list(range(40))) for _ in range(3)]
         for seq in resumers:
@@ -643,6 +670,7 @@ class TestForkLifecycle:
         bm = BlockManager(ckpt_config())
         first = stateful_seq(list(range(40)))
         src = bm.state.lookup(publish_at_boundary(bm, first))
+        publisher_has_read_its_source(bm)
 
         sharers = [stateful_seq(list(range(40))) for _ in range(2)]
         for seq in sharers:
@@ -661,6 +689,7 @@ class TestForkLifecycle:
         bm = BlockManager(ckpt_config())
         first = stateful_seq(list(range(40)))
         src = bm.state.lookup(publish_at_boundary(bm, first))
+        publisher_has_read_its_source(bm)
 
         second = stateful_seq(list(range(40)))
         bm.allocate(second, bm.can_allocate(second))
@@ -676,11 +705,99 @@ class TestForkLifecycle:
         bm = BlockManager(ckpt_config())
         first = stateful_seq(list(range(40)))
         src = bm.state.lookup(publish_at_boundary(bm, first))
+        publisher_has_read_its_source(bm)
         second = stateful_seq(list(range(40)))
         bm.allocate(second, bm.can_allocate(second))
         assert not bm.state.is_free(src)
         bm.release_state_pins()
         assert bm.state.is_free(src)
+
+    def test_a_published_source_is_not_handed_out_before_its_reader_runs(self):
+        """The source is what the publisher's NEXT forward reads.
+
+        `checkpoint` runs in postprocess, so that forward belongs to the batch
+        the next pass builds — one pass further off than a resume's reader.
+        Handing the group back straight away, as this used to, put it on the
+        free list during the very pass that admits the requests which could pop
+        it, and then one kernel reads and writes it at once.
+        """
+        bm = BlockManager(ckpt_config())
+        first = stateful_seq(list(range(40)))
+        src = bm.state.lookup(publish_at_boundary(bm, first))
+        assert first.state_fork_src == src
+
+        assert not bm.state.is_free(src)  # the pass that admits cannot get it
+        bm.release_state_pins()  # the batch carrying the fork is built
+        assert not bm.state.is_free(src)  # its forward has not been issued yet
+        bm.release_state_pins()  # it has now
+        assert bm.state.is_free(src)
+        # And it comes back as a checkpoint, at the LRU tail — publishing is
+        # not what spends it.
+        assert bm.state.lookup(bm.state.group_hash[src]) == src
+
+    def test_a_finished_publisher_gives_its_source_back_at_once(self):
+        """Nobody is left to read it, so the clock should not hold it.
+
+        This is what keeps publishing capacity-neutral for the common shape —
+        a request that crosses a rung and then finishes or is preempted.
+        """
+        bm = BlockManager(ckpt_config())
+        first = stateful_seq(list(range(40)))
+        whole = bm.state.num_free()  # nothing handed out yet
+        h = publish_at_boundary(bm, first)
+        src = bm.state.lookup(h)
+        assert not bm.state.is_free(src)
+
+        bm.deallocate(first)
+        assert bm.state.is_free(src)
+        # Source and write group both back: the pool is whole again, without
+        # waiting out the two passes the clock would have taken.
+        assert bm.state.num_free() == whole
+        assert bm.state.lookup(h) == src  # the checkpoint itself survives
+
+
+class TestCheckpointsDieWithTheirPrefix:
+    """A checkpoint whose KV block left the index can never be reached again.
+
+    The two pools are addressed by one chained content hash and a prefix hit
+    claims both, so `_gated_hit` caps at the last block still indexed. Until
+    the state pool is told, the dead checkpoint holds a group and sits in the
+    LRU queue ahead of live ones — the pool spends something usable to make
+    room for something that is not.
+    """
+
+    def test_evicting_the_block_frees_the_checkpoint_group(self):
+        bm = BlockManager(ckpt_config())
+        first = stateful_seq(list(range(40)))
+        h = publish_at_boundary(bm, first)
+        publisher_has_read_its_source(bm)
+        src = bm.state.lookup(h)
+        assert bm.state.holds_checkpoint(src)
+
+        bm._record_evicted(h)
+        assert bm.state.lookup(h) == -1
+        assert bm.state.is_free(src)
+        assert not bm.state.holds_checkpoint(src)  # vacant, spent before live ones
+        assert bm.state.checkpoint_fates()["checkpoints_orphaned"] == 1
+
+    def test_an_orphan_is_spent_before_a_live_checkpoint(self):
+        pool = StateGroupPool(4)
+        while pool.has_free():
+            pool.pop()
+        for group, h in ((0, 10), (1, 11)):
+            pool.release(group)
+            pool._index(h, group)
+
+        pool.unindex(10)  # group 0's prefix is gone
+        assert pool.pop() == 0
+        assert pool.lookup(11) == 1
+
+    def test_unindex_of_an_unknown_hash_is_a_no_op(self):
+        pool = StateGroupPool(4)
+        pool._index(10, 0)
+        assert pool.unindex(999) == -1
+        assert pool.lookup(10) == 0
+        assert pool.checkpoint_fates()["checkpoints_orphaned"] == 0
 
 
 # ── The scheduler side: what a checkpoint costs the publisher ──────────────

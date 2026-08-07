@@ -200,6 +200,13 @@ class StateGroupPool:
         # read-only and several requests may share one: the group goes back only
         # once, and no reader may take it over while another still reads it.
         self._pinned: dict[int, int] = {}
+        # Of those, the ones whose reader is the batch the *next* pass builds
+        # rather than the one just built. `checkpoint` runs in postprocess,
+        # after its batch went out, so the forward that reads the source it
+        # hands over is one pass further off than a resume's. Carried as a set
+        # rather than a second count because the depth is only ever one pass
+        # more — see `release_pins`.
+        self._deferred: set[int] = set()
         # `copy` only. Seqs whose last forward left their state on a boundary
         # worth keeping. `take_copies` turns each into a copy pair when the next
         # batch is built, which is the latest moment the owner is still known to
@@ -218,6 +225,12 @@ class StateGroupPool:
         self.checkpoints_kept: int = 0
         self.checkpoints_dropped: int = 0
         self.checkpoints_evicted: int = 0
+        # Died because the prefix it was filed under left the KV index first,
+        # so nothing could ever have resumed off it. Apart from `evicted`
+        # because they want opposite fixes: `evicted` says this pool is too
+        # small for how long a checkpoint has to last, `orphaned` says the KV
+        # pool is too small for the same span.
+        self.checkpoints_orphaned: int = 0
 
     # ------------------------------ free list ------------------------------ #
     def has_free(self) -> bool:
@@ -499,8 +512,14 @@ class StateGroupPool:
             return
         seq.per_req_cache_group = self.pop()
         seq.state_fork_src = old
-        self.release(old)
+        # Not released: `state_fork_src` names `old` as what this request's
+        # NEXT forward reads, and that forward is two passes off — one to build
+        # the batch carrying the fork, one to issue it. Handing it back now put
+        # it on the free list during the pass that admits the requests which
+        # could pop it, and then one kernel would read and write it at once.
+        # `_index` files it either way; `_set_hash` leaves a non-free group be.
         self._index(h, old)
+        self.pin(old, reader_is_next_batch=True)
         self.checkpoints_kept += 1
 
     def _commit_pending(self) -> None:
@@ -539,6 +558,7 @@ class StateGroupPool:
             "checkpoints_kept": self.checkpoints_kept,
             "checkpoints_dropped": self.checkpoints_dropped,
             "checkpoints_evicted": self.checkpoints_evicted,
+            "checkpoints_orphaned": self.checkpoints_orphaned,
         }
 
     def record_copy(self, src: int, dst: int) -> None:
@@ -598,6 +618,31 @@ class StateGroupPool:
         if prev != -1 and prev != group:
             self._set_hash(prev, -1)
 
+    def unindex(self, h: int) -> int:
+        """Drop the checkpoint filed under `h`. The dual of `_index`.
+
+        Called when the KV block of that hash leaves the block index. The two
+        pools are addressed by the same chained content hash and a prefix hit
+        is a joint claim on both, so a checkpoint whose block is gone can never
+        be reached again: `_gated_hit` caps at the last block still indexed.
+        Until it is dropped it holds a group and sits in the LRU queue ahead of
+        checkpoints that are still worth something, so the pool spends a live
+        one to make room for a dead one.
+
+        Necessary but not sufficient for reachability — an *earlier* block in
+        the chain may be the one that went — so this reclaims a subset. Making
+        it exact would have the state pool watch every block of every prefix,
+        which costs more than the tail it would catch.
+
+        Returns the group freed, or -1.
+        """
+        group = self.hash_to_group.get(h, -1)
+        if group < 0:
+            return -1
+        self.invalidate(group)
+        self.checkpoints_orphaned += 1
+        return group
+
     def invalidate(self, group: int) -> None:
         """Drop `group`'s checkpoint. Called when the group is handed out."""
         if not self.enabled:
@@ -610,8 +655,17 @@ class StateGroupPool:
             del self.hash_to_group[h]
 
     # -------------------------------- pins --------------------------------- #
-    def pin(self, group: int) -> None:
+    def pin(self, group: int, *, reader_is_next_batch: bool = False) -> None:
+        """Hold `group` off the free list until the forward that reads it ran.
+
+        The caller states which batch that is, not when to let go: a resume
+        pins while its own batch is being built, `checkpoint` pins after its
+        batch went out and the forward that reads what it handed over is the
+        one the next pass builds. `release_pins` turns the two into passes.
+        """
         self._pinned[group] = self._pinned.get(group, 0) + 1
+        if reader_is_next_batch:
+            self._deferred.add(group)
 
     def is_pinned(self, group: int) -> bool:
         return group in self._pinned
@@ -629,19 +683,51 @@ class StateGroupPool:
         count = self._pinned.get(group, 0)
         if count <= 1:
             self._pinned.pop(group, None)
+            self._deferred.discard(group)
         else:
             self._pinned[group] = count - 1
 
+    def drop_reader(self, group: int) -> None:
+        """A reader of `group` is gone before it read. Free it if it was last.
+
+        A pin says some forward still has to read this group. When the request
+        that owed that forward is deallocated the obligation goes with it, and
+        holding the group to the clock would cost admission a group for
+        nothing — which is what keeps `checkpoint` capacity-neutral for a
+        request that finishes or is preempted on the boundary it published.
+        `release_pins` stays the backstop, for readers still to come.
+        """
+        if group < 0 or not self.is_pinned(group):
+            return
+        self.unpin(group)
+        if not self.is_pinned(group):
+            self.release(group)
+
     def release_pins(self) -> None:
-        """Return the fork sources pinned for the step that just went out.
+        """Return the sources whose reading forward has been issued.
 
         They go back to the free list, once each however many requests read
-        them. Safe once the reading forward has been issued: a request handed
-        one of these groups next step runs its forward after the reader's, on
-        the same stream.
+        them. Safe once that forward is out: a request handed one of these
+        groups next pass runs its own forward after it, on the same stream.
+
+        A pin taken while a batch was being built is read by that batch, so it
+        clears here, one pass later. A pin marked `reader_is_next_batch` is
+        read by the batch this pass is about to build, so it survives one more
+        — and `checkpoint`'s source has to, because it is on nobody's free
+        list to protect it during the very pass that admits the requests which
+        could otherwise be handed it.
+
+        Every pin clears within two passes whatever else happens. Nothing here
+        waits on the obligation being consumed, so a request preempted between
+        taking a checkpoint and its next batch cannot strand a group — which
+        is why this stays a clock rather than moving to `_consume_state_forks`,
+        where it would be tighter and leak.
         """
         if not self._pinned:
             return
+        held, self._deferred = self._deferred, set()
         for group in sorted(self._pinned):
+            if group in held:
+                continue
             self.release(group)
-        self._pinned.clear()
+            del self._pinned[group]

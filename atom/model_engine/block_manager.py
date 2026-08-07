@@ -179,9 +179,17 @@ class BlockManager:
         return self.state.take_copies()
 
     def _record_evicted(self, h: int) -> None:
-        """Report a hash the pool just dropped, as a KV event."""
+        """A hash the block pool just dropped: report it, and settle the state.
+
+        The crossing belongs here rather than in either pool — the two are
+        addressed by one chained content hash and a prefix hit claims both, so
+        neither can be left holding a boundary the other can no longer honour.
+        Without this the state pool keeps handing groups to checkpoints nothing
+        can reach and spends live ones to make room for them.
+        """
         if self._event_log is not None:
             self._event_log.append(_make_block_removed([h]))
+        self.state.unindex(h)
 
     def _fresh_block(self) -> int:
         """Take a block for content this step is about to compute."""
@@ -544,10 +552,13 @@ class BlockManager:
             return False
         self.state.release(seq.per_req_cache_group)
         self.state.invalidate(src)
-        if self.state.is_pinned(src):
-            self.state.unpin(src)  # resume source: was held off the free list
-        else:
-            self.state.claim(src)  # checkpoint source: was handed back
+        # Both flavours of source are pinned — held off the free list for the
+        # forward that has to read them — so taking one over is just dropping
+        # this request's claim on it. It used to matter which flavour it was:
+        # `checkpoint` handed its source straight back, so adopting it meant
+        # claiming it off the free list, and `pin_count` then undercounted the
+        # readers this refuses to overwrite.
+        self.state.unpin(src)
         seq.per_req_cache_group = src
         seq.state_fork_src = -1
         return True
@@ -898,9 +909,13 @@ class BlockManager:
         seq.block_table.clear()
         if seq.has_per_req_cache and seq.per_req_cache_group >= 0:
             # Only the group the seq was writing. A checkpoint it took is
-            # already back on the free list under the state index, and a fork
-            # source it borrowed is returned by `release_state_pins`.
+            # already back on the free list under the state index; the source
+            # it was going to fork off is dropped here rather than left to
+            # `release_state_pins`, because the forward that owed the read is
+            # not going to happen and the group should not sit out a pass for
+            # a reader that no longer exists.
             self.state.release(seq.per_req_cache_group)
+            self.state.drop_reader(seq.state_fork_src)
             seq.per_req_cache_group = -1
             seq.state_fork_src = -1
 
