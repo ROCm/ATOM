@@ -299,13 +299,12 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         """fused_moe kwargs that let the gemm2 epilogue P2P-write its weighted
         per-(token,k) results straight into the peers' combine staging.
 
-        Empty unless the op runs combine_mode="scatter_fused". The staging must be
-        zeroed first: gemm2 only writes the (token,k) slots whose expert survived
-        dispatch, and the dropped ones have to read 0 in the combine sum.
+        Empty unless the op runs combine_mode="scatter_fused". The staging is NOT
+        zeroed: that relies on gemm2 writing every (token,k) slot, so a dropped
+        route would let the combine sum read the previous forward's value.
         """
         if not self.is_fused:
             return {}
-        self._op.zero_fused_staging()
         params = self._op.ep_scatter_params()
         return dict(
             ep_scatter=True,
