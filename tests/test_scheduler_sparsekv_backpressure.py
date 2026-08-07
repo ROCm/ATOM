@@ -19,7 +19,10 @@
 
 from conftest import MockConfig
 
-from atom.kv_transfer.disaggregation.types import KVConnectorOutput
+from atom.kv_transfer.disaggregation.types import (
+    ConnectorMetadata,
+    KVConnectorOutput,
+)
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import SequenceStatus
 from atom.sampling_params import SamplingParams
@@ -376,3 +379,30 @@ def test_promote_signal_for_unknown_request_ignored(monkeypatch, seq_factory):
         KVConnectorOutput(promoted_gpu_pages={str(live.id): 2})
     )
     assert live.sparsekv_promoted_pages == 2
+
+
+def test_connector_meta_release_channel_works_with_sparsekv_off(monkeypatch):
+    """The producer node runs with SparseKV disabled but builds connector meta on
+    every schedule, so the release channel's state must exist unconditionally."""
+    monkeypatch.delenv("ATOM_SPARSEKV_ENABLE", raising=False)
+    sch = Scheduler(MockConfig())
+    sch.kv_connector = _RemoteLoadConnector()
+    assert sch._sparsekv_enabled is False
+    assert sch._build_connector_meta_with_release() is None  # stub returns None
+
+
+def test_connector_meta_carries_and_clears_finished_ids(monkeypatch, seq_factory):
+    """Finished ids ride out once and are not re-sent on the next build."""
+
+    class _MetaConnector(_RemoteLoadConnector):
+        def build_connector_meta(self):
+            return ConnectorMetadata()
+
+    sch = _gpu_tier_scheduler(monkeypatch, gpu_pages=6)
+    sch.kv_connector = _MetaConnector()
+    sch._sparsekv_pending_release.add(7)
+
+    meta = sch._build_connector_meta_with_release()
+    assert meta.reqs_to_release == {7}
+    assert sch._sparsekv_pending_release == set()
+    assert not sch._build_connector_meta_with_release().reqs_to_release

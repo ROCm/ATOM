@@ -623,6 +623,11 @@ class Scheduler:
         # rather than tracked incrementally — a mirror dict drifts across the PD
         # lifecycle (park / load-complete / abort / preempt) and undercounts,
         # letting the worker over-commit and crash.
+        # Finished ids awaiting hand-off to the worker (see
+        # ConnectorMetadata.reqs_to_release). Defined unconditionally: the
+        # producer node runs with SparseKV off but still builds connector meta
+        # every schedule.
+        self._sparsekv_pending_release: set = set()
         self._sparsekv_enabled: bool = bool(envs.ATOM_SPARSEKV_ENABLE)
         if self._sparsekv_enabled:
             self._sparsekv_page: int = self.block_manager.block_size
@@ -651,9 +656,6 @@ class Scheduler:
             self._sparsekv_gpu_cold_enabled: bool = self._sparsekv_gpu_pages > 0
             self._sparsekv_defer_log_time: float = 0.0
             self._sparsekv_defer_count: int = 0
-            # Finished ids awaiting hand-off to the worker (see
-            # ConnectorMetadata.reqs_to_release).
-            self._sparsekv_pending_release: set = set()
             # Without this line a failed hand-off from the worker is invisible:
             # admission would silently run host-only while the worker has a tier.
             logger.info(
