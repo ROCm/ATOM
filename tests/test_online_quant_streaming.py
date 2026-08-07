@@ -95,6 +95,7 @@ class StreamMoE(nn.Module):
         self.post_process_calls = 0
         self.loader_calls = 0
         self.stage_calls = 0
+        self.flush_calls = 0
 
     def weight_loader(
         self,
@@ -156,6 +157,10 @@ class StreamMoE(nn.Module):
 
     def is_batched_expert_slot(self, local_expert_id):
         return local_expert_id < self.num_batched_experts
+
+    def flush_staged(self, param, staging, filled):
+        self.flush_calls += 1
+        param.data.copy_(staging)
 
     @staticmethod
     def batched_expert_region_numel(param, local_expert_id, shard_id):
@@ -264,6 +269,33 @@ class StreamModel(nn.Module):
                 ("w3", "up_proj"),
             )
         ]
+
+
+class MixedStreamModel(StreamModel):
+    """Stream attention while leaving per-expert checkpoint weights unstreamed."""
+
+    def __init__(
+        self,
+        num_layers: int,
+        num_experts: int,
+        stream: bool,
+        linear_cls=StreamLinear,
+    ):
+        nn.Module.__init__(self)
+        self.num_experts = num_experts
+        self.model = nn.Module()
+        self.model.layers = nn.ModuleList(
+            _MixedLayer(num_experts, stream, linear_cls) for _ in range(num_layers)
+        )
+
+
+class _MixedLayer(nn.Module):
+    def __init__(self, num_experts: int, stream: bool, linear_cls):
+        super().__init__()
+        self.self_attn = nn.Module()
+        self.self_attn.o_proj = linear_cls(HIDDEN, HIDDEN, stream)
+        self.mlp = nn.Module()
+        self.mlp.experts = StreamMoE(num_experts, False)
 
 
 class SharedExpertStreamModel(StreamModel):
@@ -467,6 +499,27 @@ class StreamingDifferentialTest(unittest.TestCase):
     def test_host_staging_with_parallel_walk_matches_non_streaming(self):
         model, _ = run_load(streaming=True, host_staging=True, num_threads=8)
         self.assert_matches_baseline(model)
+
+    def test_unstreamed_experts_keep_batched_staging(self):
+        """Streamer candidates and excluded experts must use disjoint staging."""
+        model, online_quant_streamer = run_load(
+            streaming=True,
+            host_staging=True,
+            num_threads=8,
+            model_cls=MixedStreamModel,
+        )
+
+        self.assert_matches_baseline(model)
+        for layer in model.model.layers:
+            experts = layer.mlp.experts
+            self.assertEqual(experts.stage_calls, 3 * NUM_EXPERTS)
+            self.assertEqual(experts.loader_calls, 0)
+            self.assertEqual(experts.flush_calls, 2)
+            self.assertIn(
+                id(layer.self_attn.o_proj),
+                online_quant_streamer.done_module_ids,
+            )
+            self.assertNotIn(id(experts), online_quant_streamer.done_module_ids)
 
     def test_host_staging_with_tail_workers_matches_non_streaming(self):
         model, _ = run_load(
