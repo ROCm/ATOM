@@ -667,8 +667,7 @@ def _dequant_fp8_block_to_bf16(w_fp8, scale, block=128):
 #   x_scale [M, G, K/128]     uint8 e8m0 activation scale
 #   w_scale [G, N/128, K/128] uint8 e8m0 weight (128x128) block scale
 # The [M, G, *] views are transposed views of contiguous batch-major [G, M, *]
-# buffers (K/N contiguous). See op_tests/test_opus_a8w8_bmm.py for the
-# reference quant math.
+# buffers (K/N contiguous).
 # ---------------------------------------------------------------------------
 
 
@@ -681,9 +680,18 @@ def _wo_a_block_scale_to_e8m0(scale: torch.Tensor, n_groups: int) -> torch.Tenso
     ``round(log2(s)) + 127``. Emitted as plain uint8 (the mxscale kernel reads
     the e8m0 bytes directly).
     """
-    s = scale.detach().float().clamp_min(torch.finfo(torch.float32).tiny)
-    e = torch.round(torch.log2(s)).to(torch.int32) + 127
-    e = e.clamp_(0, 255).to(torch.uint8)
+    s = scale.detach()
+    if s.element_size() == 1:
+        # ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE allocates weight_scale as
+        # dtypes.fp8_e8m0, which aiter resolves to torch.uint8 when the torch
+        # build has no float8_e8m0fnu. Those bytes are already biased
+        # exponents, so the float path would read 127 as a magnitude and
+        # return 134; a native float8_e8m0fnu byte is the same exponent.
+        e = s.view(torch.uint8)
+    else:
+        s = s.float().clamp_min(torch.finfo(torch.float32).tiny)
+        e = torch.round(torch.log2(s)).to(torch.int32) + 127
+        e = e.clamp_(0, 255).to(torch.uint8)
     nb, kb = e.shape
     return e.reshape(n_groups, nb // n_groups, kb).contiguous()
 
