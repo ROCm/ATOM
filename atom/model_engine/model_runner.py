@@ -2345,6 +2345,36 @@ class ModelRunner:
         if not any_shrink:
             return  # nothing to shrink this step -> Phase-1 layout
 
+        # q_eff, and the replay-shape feasibility check, BEFORE anything on the
+        # batch is rewritten. Shrinking the flat token layout is only safe if the
+        # replay can follow it down; when it cannot, the rebuild is what makes
+        # the step unsafe, so the decision has to come first.
+        #   * num_spec_query_tokens (scalar) q_eff : the PER-SEQ length bound
+        #     (>= max(new_len), quantized up to a captured bucket). Per-seq
+        #     structures (compressor grid, rectangular indexer) size by it, so no
+        #     seq can overflow them. It is NOT the total compute size -- that is
+        #     the flat num_tokens bucket (dynamic_num_tokens_pad), sized to the
+        #     real sum, so a long-tail seq no longer inflates the batch row count.
+        buckets = resolve_q_buckets(self.config.dspark.ragged_graph_sizes, full_q)
+        if self.enforce_eager:
+            # Eager: no graph → capacity == exact Σ (no bucket). Scalar = batch max
+            # real len (positions/attn bound); layout is pure flat Σ.
+            q_eff = int(new_len.max()) if scheduled_bs > 0 else full_q
+        else:
+            # Graph: q_eff = smallest bucket >= the real MAX per-seq len, so no
+            # seq ever exceeds q_eff. Per-seq structures (compressor grid,
+            # rectangular indexer) size by q_eff and can't overflow -- no separate
+            # full_q cap needed. The TOTAL compute size is chosen apart from this
+            # by the flat num_tokens bucket (dynamic_num_tokens_pad, sized to the
+            # real sum), so q_eff no longer needs to track the sum/avg.
+            q_eff = (
+                quantize_to_bucket(int(new_len.max()), buckets)
+                if scheduled_bs > 0
+                else full_q
+            )
+            if not self._ragged_flat_bucket_exists(int(new_len.sum()), q_eff):
+                return  # replay cannot follow the shrink -> stay rectangular
+
         # Rebuild scheduled_tokens (flat) to the ragged per-seq layout: keep the
         # first new_len[i] of each seq's old segment (token[0]=anchor, rest=draft
         # placeholders already populated by the scheduler from seq.token_ids).
@@ -2370,29 +2400,8 @@ class ModelRunner:
         # Two sources of truth (TRUE FLAT, paper §5.2): tokens are flat-packed
         # [0:Σ] with the per-seq ragged new_len.
         #   * dynamic_spec_query_tokens_per_req : the true ragged per-seq lengths.
-        #   * num_spec_query_tokens (scalar) q_eff : the PER-SEQ length bound
-        #     (>= max(new_len), quantized up to a captured bucket). Per-seq
-        #     structures (compressor grid, rectangular indexer) size by it, so no
-        #     seq can overflow them. It is NOT the total compute size -- that is
-        #     the flat num_tokens bucket (dynamic_num_tokens_pad), sized to the
-        #     real sum, so a long-tail seq no longer inflates the batch row count.
-        buckets = resolve_q_buckets(self.config.dspark.ragged_graph_sizes, full_q)
-        if self.enforce_eager:
-            # Eager: no graph → capacity == exact Σ (no bucket). Scalar = batch max
-            # real len (positions/attn bound); layout is pure flat Σ.
-            q_eff = int(new_len.max()) if scheduled_bs > 0 else full_q
-        else:
-            # Graph: q_eff = smallest bucket >= the real MAX per-seq len, so no
-            # seq ever exceeds q_eff. Per-seq structures (compressor grid,
-            # rectangular indexer) size by q_eff and can't overflow -- no separate
-            # full_q cap needed. The TOTAL compute size is chosen apart from this
-            # by the flat num_tokens bucket (dynamic_num_tokens_pad, sized to the
-            # real sum), so q_eff no longer needs to track the sum/avg.
-            q_eff = (
-                quantize_to_bucket(int(new_len.max()), buckets)
-                if scheduled_bs > 0
-                else full_q
-            )
+        #   * num_spec_query_tokens (scalar) q_eff : computed above, before the
+        #     rebuild, together with the replay-shape feasibility check.
         batch.num_spec_query_tokens = int(q_eff)
         batch.dynamic_spec_query_tokens_per_req = new_len
 
@@ -3482,6 +3491,33 @@ class ModelRunner:
             captured,
             (int(pad) // q) if (pad is not None and q) else None,
             np.asarray(lens)[:sbs].tolist() if lens is not None else "rectangular",
+        )
+
+    def _ragged_flat_bucket_exists(self, total_tokens: int, q: int) -> bool:
+        """Can a captured flat num_tokens bucket hold a ragged step of
+        ``total_tokens`` at per-seq bound ``q``?
+
+        Same predicate ``_dynamic_num_tokens_pad`` searches with -- keep the two
+        in step. Asked BEFORE ``_dspark_apply_ragged`` rewrites the batch,
+        because when no bucket matches that function returns None and every
+        caller falls back to ``bs * max_seqlen_q``: a replay over MORE tokens
+        than the ragged rebuild populated. The ``[total : bs*q]`` tail is then
+        whatever the previous step left in the input buffer, and those stale ids
+        reach the draft's Markov transition-table lookup as out-of-range
+        indices -- a device-side trap attributed to whatever kernel happened to
+        be in flight, nowhere near here.
+
+        The usual way to get here is FULL (non-PIECEWISE) cudagraphs, where no
+        flat bucket set is captured at all: then NO ragged shrink is
+        representable and the caller must stay rectangular. Shrinking buys
+        nothing in that mode anyway -- the replay is rectangular either way.
+        """
+        if not self._piecewise_cg_active():
+            return False
+        from atom.spec_decode.dspark_scheduler import flat_bucket_fits
+
+        return flat_bucket_fits(
+            total_tokens, q, getattr(self, "_piecewise_sorted_tokens", None)
         )
 
     def _dynamic_num_tokens_pad(self, batch) -> int | None:
