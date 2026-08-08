@@ -12,18 +12,27 @@ It follows the same construction-swap pattern as ``qwen3_next``: the
 variant, then restores it.
 """
 
-from typing import Optional
-
 import torch
 
 from atom.models import deepseek_v4 as deepseek_v4_base
 from atom.models.deepseek_v4 import (
     DeepseekV4Attention as DeepseekV4AttentionBase,
+)
+from atom.models.deepseek_v4 import (
     DeepseekV4ForCausalLM as DeepseekV4ForCausalLMBase,
+)
+from atom.models.deepseek_v4 import (
     DeepseekV4Model as DeepseekV4ModelBase,
+)
+from atom.models.deepseek_v4 import (
     Indexer as IndexerBase,
 )
+from atom.plugin.vllm.deepseek_v4_bridge import ATOM_DEEPSEEK_V4_BLOCK_SIZE
 from atom.utils.forward_context import AttnState, get_forward_context
+
+# Compressor.forward and CSA translation read this module global at runtime, so
+# it must remain aligned with the vLLM proxy page geometry after construction.
+deepseek_v4_base._V4_BLOCK_SIZE = ATOM_DEEPSEEK_V4_BLOCK_SIZE
 
 
 class IndexerVllm(IndexerBase):
