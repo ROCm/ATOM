@@ -522,6 +522,8 @@ def _fresh_scheduler():
     vs._ell_map = {}
     vs._ell_stage_ring = None
     vs._ell_stage_idx = 0
+    vs._ell_slot_event = [None] * 4
+    vs._ell_last_slot = None
     return vs
 
 
@@ -603,6 +605,61 @@ def test_ell_stage_ring_allocates_on_cpu_under_a_gpu_default_device():
     assert slot.device.type == "cpu"
     assert slot.is_pinned()
     assert slot.shape == (4,)
-    # Slots rotate so an in-flight copy is never overwritten under it.
     assert vs._ell_stage_ring.shape == (4, 8)
+    assert vs._ell_stage_idx == 1
+    assert vs._ell_last_slot == 0
+
+
+class _FakeEvent:
+    """Stands in for torch.cuda.Event; `query()` is all `_ell_stage` uses."""
+
+    def __init__(self, landed: bool):
+        self.landed = landed
+
+    def query(self):
+        return self.landed
+
+
+def test_ell_stage_never_reuses_a_slot_whose_copy_is_still_in_flight():
+    """Rotation alone does not free a slot.
+
+    The ring has _MAX_ELL_INFLIGHT slots and record_ell caps _ell_pending at the
+    same number, so once the host runs that many steps ahead the index wraps
+    onto a slot whose entry is being evicted -- and evicting the bookkeeping
+    tuple does NOT cancel its DMA. Handing the slot out anyway puts two copies
+    on one pinned buffer and the reader sees torn values: an ell that is neither
+    current nor merely stale, which ragged_verify_len then clamps into a legal
+    range and passes downstream. Only a device trap far away shows for it.
+
+    Guard: a busy slot is skipped for a one-off buffer, and the index parks so
+    the same slot is retried next step rather than being silently burned.
+    """
+
+    class _StubRunnerCfg:
+        max_num_seqs = 8
+
+    class _StubRunner:
+        config = _StubRunnerCfg()
+
+    vs = _fresh_scheduler()
+    vs.runner = _StubRunner()
+
+    # Prime the ring, then mark slot 0's copy as still in flight.
+    vs._ell_stage(4)
+    assert vs._ell_last_slot == 0
+    vs._ell_slot_event[0] = _FakeEvent(landed=False)
+    vs._ell_stage_idx = 0
+
+    buf = vs._ell_stage(4)
+
+    assert vs._ell_last_slot is None, "must not claim a busy ring slot"
+    assert buf.data_ptr() != vs._ell_stage_ring[0].data_ptr()
+    assert vs._ell_stage_idx == 0, "index parks; the slot is retried, not burned"
+    assert buf.device.type == "cpu" and buf.is_pinned()
+
+    # Once it lands, the same slot is handed out again.
+    vs._ell_slot_event[0] = _FakeEvent(landed=True)
+    slot = vs._ell_stage(4)
+    assert vs._ell_last_slot == 0
+    assert slot.data_ptr() == vs._ell_stage_ring[0].data_ptr()
     assert vs._ell_stage_idx == 1

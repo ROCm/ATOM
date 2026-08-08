@@ -68,6 +68,14 @@ class VerifyScheduler:
         # Allocated on first use (the runner's config is complete by then).
         self._ell_stage_ring: Optional[torch.Tensor] = None
         self._ell_stage_idx = 0
+        # Event of the D2H that last landed in each ring slot (None = unused).
+        # Checked before the slot is handed out again: evicting an entry from
+        # `_ell_pending` does NOT cancel its in-flight DMA, so queue length
+        # alone cannot tell us a slot is free.
+        self._ell_slot_event: list = [None] * _MAX_ELL_INFLIGHT
+        # Ring index returned by the last `_ell_stage` call, or None when it
+        # fell back to a one-off buffer. Consumed by `record_ell`.
+        self._ell_last_slot: Optional[int] = None
 
     def compute_ell(self, confidence: torch.Tensor) -> torch.Tensor:
         """Run the Hardware-Aware Prefix Scheduler (paper Algorithm 1) and return
@@ -120,9 +128,16 @@ class VerifyScheduler:
         blocking one would stall the host on the GPU's tail, exactly what this
         class exists to avoid.
 
-        Rotating over ``_MAX_ELL_INFLIGHT`` slots in lockstep with the pending
-        queue means a slot is only rewritten once its entry has been consumed or
-        dropped, so no in-flight copy is ever overwritten.
+        A slot is handed out only once the D2H that last used it has LANDED,
+        checked through that copy's event. Rotation alone is NOT enough: the
+        ring has ``_MAX_ELL_INFLIGHT`` slots and ``record_ell`` caps
+        ``_ell_pending`` at the same number, so as soon as the host runs that
+        many steps ahead of the copy stream the index wraps onto the slot whose
+        entry is being evicted -- and evicting the bookkeeping tuple does not
+        cancel its DMA. Two copies would then write the same pinned buffer
+        concurrently and the reader would see torn values (an ell that is
+        neither current nor merely stale). While a slot is still busy we park
+        the index and take a one-off buffer for this step instead.
 
         NOTE: ``device="cpu"`` is not optional. This ring is first allocated on
         the warmup forward, which ModelRunner.__init__ runs while the default
@@ -138,6 +153,7 @@ class VerifyScheduler:
         if n > width:
             # Should be unreachable (ell is [decode_bs] <= max_num_seqs); fall
             # back to a one-off pinned buffer rather than corrupt the ring.
+            self._ell_last_slot = None
             return torch.zeros(n, dtype=torch.int64, device="cpu", pin_memory=True)
         if ring is None:
             ring = torch.zeros(
@@ -148,8 +164,17 @@ class VerifyScheduler:
                 pin_memory=True,
             )
             self._ell_stage_ring = ring
-        slot = ring[self._ell_stage_idx]
-        self._ell_stage_idx = (self._ell_stage_idx + 1) % _MAX_ELL_INFLIGHT
+        idx = self._ell_stage_idx
+        busy = self._ell_slot_event[idx]
+        if busy is not None and not busy.query():
+            # Previous D2H into this slot has not landed. Overwriting it now is
+            # the torn-read race described above -- park the index (so the same
+            # slot is retried next step) and stage into a one-off buffer.
+            self._ell_last_slot = None
+            return torch.zeros(n, dtype=torch.int64, device="cpu", pin_memory=True)
+        slot = ring[idx]
+        self._ell_last_slot = idx
+        self._ell_stage_idx = (idx + 1) % _MAX_ELL_INFLIGHT
         return slot[:n]
 
     def record_ell(self, req_ids: Sequence) -> None:
@@ -178,6 +203,12 @@ class VerifyScheduler:
             copy_stream.wait_stream(default_stream)
             cpu_buf.copy_(ell, non_blocking=True)
             event.record(copy_stream)
+        # Bind the event to the ring slot this copy is landing in, so the slot
+        # is not handed out again until the DMA completes. This outlives the
+        # `_ell_pending` entry on purpose: the eviction below drops bookkeeping,
+        # not the copy itself. None -> one-off buffer, nothing to guard.
+        if self._ell_last_slot is not None:
+            self._ell_slot_event[self._ell_last_slot] = event
         # Keep req_ids as a plain list snapshot (CPU-only, order-safe).
         self._ell_pending.append((event, cpu_buf, list(req_ids)))
         if len(self._ell_pending) > _MAX_ELL_INFLIGHT:
