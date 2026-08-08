@@ -631,14 +631,22 @@ class Scheduler:
         self._sparsekv_enabled: bool = bool(envs.ATOM_SPARSEKV_ENABLE)
         if self._sparsekv_enabled:
             self._sparsekv_page: int = self.block_manager.block_size
-            host_tokens = (
-                envs.ATOM_SPARSEKV_HOST_TO_DEVICE_RATIO
-                * self.max_num_seqs
-                * (envs.ATOM_SPARSEKV_HOT_BUFFER_SIZE + 1)
-            )
-            num_host_pages = max(
-                1, (host_tokens + self._sparsekv_page - 1) // self._sparsekv_page
-            )
+            # The worker solves the host/GPU cold split against measured HBM and
+            # reports it back (see ModelRunner._size_sparsekv_cold_storage): the
+            # host pool is smaller than the ratio asks for whenever HBM cannot
+            # index that many pages, and admitting against the ratio would then
+            # overrun the real pool. The env formula is the fallback for tests
+            # and explicit-page runs with no worker.
+            num_host_pages = int(getattr(config, "sparsekv_host_pages", 0) or 0)
+            if num_host_pages <= 0:
+                host_tokens = (
+                    envs.ATOM_SPARSEKV_HOST_TO_DEVICE_RATIO
+                    * self.max_num_seqs
+                    * (envs.ATOM_SPARSEKV_HOT_BUFFER_SIZE + 1)
+                )
+                num_host_pages = max(
+                    1, (host_tokens + self._sparsekv_page - 1) // self._sparsekv_page
+                )
             # Admittable budget = pool minus per-slot decode-growth headroom.
             reserve = envs.ATOM_SPARSEKV_ADMIT_RESERVE_PAGES * self.max_num_seqs
             self._sparsekv_admit_pages: int = max(1, num_host_pages - reserve)

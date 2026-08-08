@@ -62,6 +62,7 @@ class SparseKVCoordinator:
         host_to_device_ratio: int = 8,
         page_size: int = 16,
         num_gpu_cold_pages: int = 0,
+        num_host_pages: int | None = None,
     ):
         self.num_layers = num_layers
         self.max_num_seqs = max_num_seqs
@@ -84,8 +85,16 @@ class SparseKVCoordinator:
         self.table_stride = ((C + page_size - 1) // page_size) * page_size
         # Shared host pool sized as a multiple of the GPU hot-buffer total
         # capacity; requests allocate pages on demand from a common free pool.
+        # `num_host_pages` overrides the ratio when the caller has already solved
+        # the host/GPU cold split against the HBM available to index it — the
+        # index_cache must cover host + GPU pages, so the split cannot be
+        # recomputed here from the ratio alone.
         host_tokens = host_to_device_ratio * R * H1
-        self.num_host_pages = max(1, (host_tokens + page_size - 1) // page_size)
+        self.num_host_pages = (
+            max(1, num_host_pages)
+            if num_host_pages is not None
+            else max(1, (host_tokens + page_size - 1) // page_size)
+        )
         num_host_slots = self.num_host_pages * page_size
         self.cold_pool = torch.zeros(
             (num_layers, num_host_slots, kv_dim), dtype=kv_dtype, pin_memory=True
@@ -110,8 +119,9 @@ class SparseKVCoordinator:
 
         # GPU cold tier: spare HBM used as a second cold pool alongside the host
         # pool. Tokens are disjoint across the two tiers (a token's home is in
-        # exactly one). Disabled when num_gpu_cold_pages == 0; autosize_gpu_cold_tier
-        # can size it later, once the rest of the model's HBM is committed.
+        # exactly one). Disabled when num_gpu_cold_pages == 0. The page count is
+        # solved by ModelRunner together with the index_cache size, which must
+        # cover host + GPU pages.
         self._req_gpu_pages: dict[int, list[int]] = {}
         self._req_gpu_alloc_len = [0] * R
         self._init_gpu_cold_tier(num_gpu_cold_pages)
@@ -638,36 +648,6 @@ class SparseKVCoordinator:
             self.promote_stream = torch.cuda.Stream(device=self.device)
         else:
             self.promote_stream = None
-
-    def autosize_gpu_cold_tier(self, reserve_fraction: float) -> int:
-        """Give the GPU cold tier whatever HBM is left, minus a headroom fraction.
-
-        Call once every other GPU allocation is done (hot buffer, decode scratch,
-        index cache, top-k buffer): free memory is MEASURED here rather than
-        predicted, so a tensor added elsewhere later shrinks the tier instead of
-        silently overcommitting HBM. ``reserve_fraction`` is
-        ``1 - gpu_memory_utilization`` — the share of the device the server
-        promised not to touch, which is also what CUDA graph capture and the
-        collective libraries draw on after this point.
-
-        Returns the number of pages allocated (0 leaves the tier disabled).
-        """
-        if str(self.device) == "cpu":
-            return 0
-        free, total = torch.cuda.mem_get_info(self.device)
-        usable = int(free) - int(total * reserve_fraction)
-        pages = max(0, usable // self.gpu_page_bytes)
-        self._init_gpu_cold_tier(pages)
-        logger.info(
-            "SparseKV GPU cold tier: %d pages = %.2fGB (free %.2fGB, reserved "
-            "%.0f%% = %.2fGB for CUDA graphs / collectives / headroom)",
-            self.num_gpu_pages,
-            self.num_gpu_pages * self.gpu_page_bytes / 1e9,
-            free / 1e9,
-            reserve_fraction * 100,
-            total * reserve_fraction / 1e9,
-        )
-        return self.num_gpu_pages
 
     def alloc_gpu_pages(self, req_slot: int, start_pos: int, num_tokens: int) -> int:
         """Back logical positions with GPU cold-pool pages. Returns tokens allocated.

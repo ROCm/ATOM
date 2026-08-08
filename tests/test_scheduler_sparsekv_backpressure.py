@@ -71,6 +71,41 @@ def test_admit_pages_matches_coordinator_formula(monkeypatch):
     assert sch._sparsekv_admit_pages == 4
 
 
+def test_admit_pages_follow_the_worker_solved_host_pool(monkeypatch):
+    # The worker solves the host/GPU cold split against measured HBM and reports
+    # the result back; when it had to shrink the host pool below what the ratio
+    # asks for, admitting against the ratio would overrun the real pool.
+    sch = _make_scheduler(
+        monkeypatch,
+        ratio=8,
+        hot=1,
+        reserve_pages=0,
+        max_num_seqs=4,
+        kv_cache_block_size=4,
+        num_kvcache_blocks=1000,
+        max_model_len=4096,
+        sparsekv_host_pages=6,  # ratio formula would say 8*4*2/4 = 16
+    )
+    assert sch._sparsekv_admit_pages == 6
+
+
+def test_admit_pages_fall_back_to_ratio_without_a_worker(monkeypatch):
+    # No worker reported a split (tests, explicit-page runs): the coordinator's
+    # own formula is still the right answer.
+    sch = _make_scheduler(
+        monkeypatch,
+        ratio=8,
+        hot=1,
+        reserve_pages=0,
+        max_num_seqs=4,
+        kv_cache_block_size=4,
+        num_kvcache_blocks=1000,
+        max_model_len=4096,
+        sparsekv_host_pages=0,
+    )
+    assert sch._sparsekv_admit_pages == 16
+
+
 def test_reserve_pages_subtracted_per_slot(monkeypatch):
     sch = _make_scheduler(
         monkeypatch,

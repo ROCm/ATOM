@@ -186,6 +186,23 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         return 0
 
     # ------------------------------------------------------------------ #
+    # SparseKV two-tier cold storage — the paged pool holds only indexer  #
+    # keys, while the KV itself lives in a pinned host pool plus a GPU    #
+    # cold tier. ModelRunner sizes both out of one budget (see            #
+    # _split_sparsekv_pool_budget); these report the backend-owned        #
+    # layout constants it needs. Both 0 (default) means no SparseKV.      #
+    # ------------------------------------------------------------------ #
+
+    def sparsekv_host_pages(self) -> int:
+        """Pages the pinned host cold pool wants, or 0 (default) when SparseKV
+        is off. The runner may size it smaller when HBM cannot index that many."""
+        return 0
+
+    def sparsekv_gpu_cold_page_bytes(self) -> int:
+        """HBM one GPU cold-tier page costs across all layers, or 0 (default)."""
+        return 0
+
+    # ------------------------------------------------------------------ #
     # Paged sliding-window (SWA) pool — a separate, window-freed KV pool  #
     # some attention types carve out of the main KV budget.              #
     # ------------------------------------------------------------------ #

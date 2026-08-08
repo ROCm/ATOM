@@ -916,12 +916,6 @@ def test_gpu_cold_tier_resizable_after_construction():
     assert len(c._free_gpu_pages) == 0
 
 
-def test_autosize_is_noop_on_cpu():
-    c = _make_gpu_cold(gpu_pages=0)
-    assert c.autosize_gpu_cold_tier(0.15) == 0
-    assert not c.gpu_cold_enabled
-
-
 def test_gpu_alloc_and_free_pages():
     c = _make_gpu_cold(gpu_pages=4, page=16, max_ctx=64)
     slot = c.acquire(req_id=1, context_len=20)

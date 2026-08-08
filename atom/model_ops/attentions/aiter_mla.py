@@ -885,6 +885,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         recency_bytes = R * i64
         # Top-k side-channel buffer [max_num_batched_tokens, index_topk] int32.
         topk_buf_bytes = self.max_num_batched_tokens * self.index_topk * i32
+        # req_to_gpu_pool [R, stride], allocated by _init_gpu_cold_tier. Counted
+        # unconditionally: whether the tier gets pages is decided from this very
+        # number, so making the term depend on it would be circular. The tier is
+        # on in every configuration that matters and the table is small.
+        req_to_gpu_pool_bytes = R * table_stride * i32
 
         return (
             hot_bytes
@@ -895,6 +900,36 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             + last_used_bytes
             + recency_bytes
             + topk_buf_bytes
+            + req_to_gpu_pool_bytes
+        )
+
+    def sparsekv_host_pages(self) -> int:
+        """Pages the pinned host cold pool wants (0 when SparseKV is off).
+
+        Mirrors SparseKVCoordinator's own `num_host_pages` formula; the runner
+        needs it before the coordinator exists to size index_cache against it.
+        """
+        if not self.sparsekv_enabled:
+            return 0
+        config = self.model_runner.config
+        host_tokens = (
+            envs.ATOM_SPARSEKV_HOST_TO_DEVICE_RATIO
+            * config.max_num_seqs
+            * (envs.ATOM_SPARSEKV_HOT_BUFFER_SIZE + 1)
+        )
+        page = self.model_runner.block_size
+        return max(1, (host_tokens + page - 1) // page)
+
+    def sparsekv_gpu_cold_page_bytes(self) -> int:
+        """HBM one GPU cold-tier page costs across all layers (0 when off)."""
+        if not self.sparsekv_enabled:
+            return 0
+        config = self.model_runner.config
+        return (
+            self.model_runner._get_total_num_layers()
+            * self.model_runner.block_size
+            * 576
+            * dtypes.d_dtypes[config.kv_cache_dtype].itemsize
         )
 
     def allocate_kv_cache_tensors(
@@ -1006,9 +1041,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 shared_index_layers=shared_index_layers,
                 host_to_device_ratio=envs.ATOM_SPARSEKV_HOST_TO_DEVICE_RATIO,
                 page_size=self.model_runner.block_size,
-                # Auto mode starts at 0 pages so the hot buffer allocates first;
-                # autosize_gpu_cold_tier below then claims what is left.
-                num_gpu_cold_pages=max(0, envs.ATOM_SPARSEKV_GPU_COLD_PAGES),
+                # Both tiers come from get_num_blocks' joint solve, which sized
+                # index_cache to exactly host_pages + gpu_cold_pages. Deriving
+                # either one here instead would let the pools drift apart again.
+                num_host_pages=runner.sparsekv_host_pages,
+                num_gpu_cold_pages=runner.sparsekv_gpu_cold_pages,
             )
             # Shared logical-top-k side-channel buffer (one per decode query
             # token), written by the indexer op and read by the coordinator.
@@ -1021,14 +1058,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             out["sparsekv_topk_buffer"] = topk_buf
             out["sparsekv_coordinator"].topk_buffer = topk_buf
             set_sparsekv_topk_buffer(topk_buf)
-            # Size the GPU cold tier LAST: it claims whatever HBM the model,
-            # index cache, hot buffer and scratch left behind, so it must be the
-            # final allocation. -1 (the default) means auto; a non-negative value
-            # is an explicit page count, including 0 to disable the tier.
-            if envs.ATOM_SPARSEKV_GPU_COLD_PAGES < 0:
-                out["sparsekv_coordinator"].autosize_gpu_cold_tier(
-                    1.0 - config.gpu_memory_utilization
-                )
         return out
 
     def build_kv_cache_tensor(self, layer_id: int, module):

@@ -103,12 +103,14 @@ class EngineCore:
             assert ret, "Failed to allocate kv cache"
 
             config.num_kvcache_blocks = num_blocks
-            # Report the auto-sized SparseKV GPU cold tier back before the
-            # Scheduler is built below; its admission gate needs the real page
-            # count, which only the worker knows.
-            config.sparsekv_gpu_cold_pages = self.runner_mgr.call_func(
-                "get_sparsekv_gpu_cold_pages", wait_out=True
+            # Report the solved SparseKV cold-storage split back before the
+            # Scheduler is built below; its admission gate reserves host pages
+            # and discounts promoted ones, and only the worker knows the counts.
+            sparsekv_pages = self.runner_mgr.call_func(
+                "get_sparsekv_pool_pages", wait_out=True
             )
+            config.sparsekv_host_pages = sparsekv_pages["host_pages"]
+            config.sparsekv_gpu_cold_pages = sparsekv_pages["gpu_cold_pages"]
             if not config.enforce_eager and not config.disagg_is_decode:
                 cap_cost, bs, pool_bytes = self.runner_mgr.call_func(
                     "capture_cudagraph", wait_out=True
@@ -924,9 +926,11 @@ class DecodeEngineCore(EngineCore):
             )
 
         # --- Create DecodeScheduler now that num_kvcache_blocks is set ---
-        config.sparsekv_gpu_cold_pages = self.runner_mgr.call_func(
-            "get_sparsekv_gpu_cold_pages", wait_out=True
+        _sparsekv_pages = self.runner_mgr.call_func(
+            "get_sparsekv_pool_pages", wait_out=True
         )
+        config.sparsekv_host_pages = _sparsekv_pages["host_pages"]
+        config.sparsekv_gpu_cold_pages = _sparsekv_pages["gpu_cold_pages"]
         self.scheduler = DecodeScheduler(
             config, disagg_cu_shm_name=config.disagg_cu_shm_name
         )

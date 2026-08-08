@@ -49,6 +49,7 @@ from atom.model_ops.eplb import (
 from atom.model_ops.rejection_sampler import RejectionSampler
 from atom.model_ops.sampler import SAMPLER_EPS, Sampler
 from atom.models.utils import get_pp_indices
+from atom.sparsekv.sizing import split_cold_storage_budget
 from atom.spec_decode.drafter import Drafter
 from atom.spec_decode.factory import build_drafter
 from atom.utils import (
@@ -669,6 +670,12 @@ class tokenIDProcessor:
 
 
 class ModelRunner:
+
+    # SparseKV cold-storage split, solved in get_num_blocks and consumed when the
+    # coordinator is built. Class-level defaults keep paths that skip block sizing
+    # (subclasses that reuse an existing pool) from tripping over a missing attr.
+    sparsekv_host_pages: int = 0
+    sparsekv_gpu_cold_pages: int = 0
 
     def __init__(self, rank: int, config: Config):
         self.config = config
@@ -1557,16 +1564,109 @@ class ModelRunner:
             )
         return int(overhead)
 
-    def get_sparsekv_gpu_cold_pages(self) -> int:
-        """Pages the SparseKV GPU cold tier actually got (0 when off).
+    def get_sparsekv_pool_pages(self) -> dict[str, int]:
+        """The SparseKV cold-storage split this worker actually allocated.
 
-        Under auto sizing the count is only known after every other GPU tensor is
-        allocated, so the scheduler cannot derive it — it has to be reported back
-        from the worker, or its admission gate would run as if the tier were off
-        and the promote-done downgrade would never fire.
+        The scheduler's admission gate reserves host pages and discounts pages
+        promoted to the GPU tier, so it needs both counts; neither is derivable
+        from config alone once the split is solved against measured free HBM
+        (see _size_sparsekv_cold_storage).
         """
         coord = getattr(self, "sparsekv_coordinator", None)
-        return int(getattr(coord, "num_gpu_pages", 0)) if coord is not None else 0
+        if coord is None:
+            return {"host_pages": 0, "gpu_cold_pages": 0}
+        return {
+            "host_pages": int(getattr(coord, "num_host_pages", 0)),
+            "gpu_cold_pages": int(getattr(coord, "num_gpu_pages", 0)),
+        }
+
+    def _size_sparsekv_cold_storage(
+        self,
+        *,
+        free: int,
+        total: int,
+        index_page_bytes: int,
+        per_req_cache_tensor_bytes: int,
+        gpu_reserved_bytes: int,
+    ) -> int:
+        """Size index_cache and the GPU cold tier together; return index pages.
+
+        Records the split on ``self`` so allocate_kv_cache_tensors can build both
+        pools from it instead of the tier claiming whatever HBM happens to be
+        left over — the leftover rule is what decoupled the two pool sizes.
+        """
+        config = self.config
+        builder = self.attn_metadata_builder
+        # The envelope the GPU cold tier claimed on its own before this joint
+        # solve: measured free minus the device share the server promised not to
+        # touch (CUDA graph capture and the collectives draw on that share after
+        # this point). Kept identical so this changes only HOW the HBM is split,
+        # not how much of it SparseKV takes.
+        usable = (
+            free
+            - int(total * (1.0 - config.gpu_memory_utilization))
+            - per_req_cache_tensor_bytes
+            - gpu_reserved_bytes
+        )
+        # Every rank measures its own free HBM, but index pages define the block
+        # id space the scheduler hands to all of them. Reduce the BUDGET rather
+        # than the results, so every rank runs the same solve on the same input
+        # and both pools come out uniform.
+        if torch.distributed.is_initialized():
+            t = torch.tensor([usable], dtype=torch.int64, device=self.device)
+            torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN)
+            usable = int(t.item())
+
+        host_wanted = builder.sparsekv_host_pages()
+        gpu_page_bytes = builder.sparsekv_gpu_cold_page_bytes()
+        host_pages, gpu_pages = split_cold_storage_budget(
+            usable, host_wanted, index_page_bytes, gpu_page_bytes
+        )
+        # An explicit page count caps the tier instead of replacing the solve:
+        # index_cache is sized from the pages the tier actually gets, so honoring
+        # a larger request than the budget allows would reopen the gap this
+        # method exists to close. 0 disables the tier, -1 (default) means auto.
+        explicit = envs.ATOM_SPARSEKV_GPU_COLD_PAGES
+        if explicit >= 0:
+            if explicit > gpu_pages:
+                logger.warning(
+                    "SparseKV: ATOM_SPARSEKV_GPU_COLD_PAGES=%d exceeds the %d "
+                    "pages the HBM budget can back together with their index "
+                    "entries; using %d.",
+                    explicit,
+                    gpu_pages,
+                    gpu_pages,
+                )
+            gpu_pages = min(gpu_pages, explicit)
+        self.sparsekv_host_pages = host_pages
+        self.sparsekv_gpu_cold_pages = gpu_pages
+
+        if host_pages < host_wanted:
+            logger.warning(
+                "SparseKV: HBM can index only %d of the %d host cold-pool pages "
+                "requested by ATOM_SPARSEKV_HOST_TO_DEVICE_RATIO=%d; shrinking the "
+                "host pool to match and disabling the GPU cold tier. Lower the "
+                "ratio (or max_model_len / max_num_seqs) to stop over-provisioning "
+                "pinned host memory the indexer cannot address.",
+                host_pages,
+                host_wanted,
+                envs.ATOM_SPARSEKV_HOST_TO_DEVICE_RATIO,
+            )
+        index_pages = host_pages + gpu_pages
+        logger.info(
+            "SparseKV cold storage: budget=%.2fGB -> index_cache %d pages "
+            "(%.2fGB) = host %d + gpu_cold %d pages (%.2fGB); "
+            "index_page=%dB gpu_cold_page=%dB",
+            usable / (1 << 30),
+            index_pages,
+            index_pages * index_page_bytes / (1 << 30),
+            host_pages,
+            gpu_pages,
+            gpu_pages * gpu_page_bytes / (1 << 30),
+            index_page_bytes,
+            gpu_page_bytes,
+        )
+        return index_pages
 
     def get_num_blocks(self) -> dict[str, int]:
         torch.set_default_device(self.device)
@@ -1741,22 +1841,14 @@ class ModelRunner:
             config.swa_window_size = 0
             self.num_swa_blocks = 0
             num_kvcache_blocks = available_for_pool // block_bytes
-            # SparseKV: the paged pool holds only the indexer's index_cache (the
-            # MLA KV lives in the host cold pool + GPU hot buffer). Size it to
-            # cover exactly the cold pool's logical capacity — matching
-            # SparseKVCoordinator's page count — so the HBM freed by dropping the
-            # full MLA pool stays freed rather than being refilled by a larger
-            # index_cache. Still capped by the VRAM budget above.
             if getattr(self.attn_metadata_builder, "sparsekv_enabled", False):
-                page = config.kv_cache_block_size
-                padded_hot = envs.ATOM_SPARSEKV_HOT_BUFFER_SIZE + 1
-                host_tokens = (
-                    envs.ATOM_SPARSEKV_HOST_TO_DEVICE_RATIO
-                    * config.max_num_seqs
-                    * padded_hot
+                num_kvcache_blocks = self._size_sparsekv_cold_storage(
+                    free=free,
+                    total=total,
+                    index_page_bytes=block_bytes,
+                    per_req_cache_tensor_bytes=per_req_cache_tensor_bytes,
+                    gpu_reserved_bytes=gpu_reserved_bytes,
                 )
-                cold_pool_pages = max(1, (host_tokens + page - 1) // page)
-                num_kvcache_blocks = min(num_kvcache_blocks, cold_pool_pages)
 
         # PP stages compute different block counts; block ids must be valid on
         # every stage's KV tensor, so reduce to the global minimum.
