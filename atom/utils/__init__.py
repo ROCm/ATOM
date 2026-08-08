@@ -887,7 +887,10 @@ def _patch_torch_dynamo_metrics_config_logging() -> None:
 
 def getLogger():
     if not logger.handlers:
-        logger.setLevel(logging.DEBUG)
+        # Must match the handler level below: a logger at DEBUG feeding a
+        # handler at INFO still builds a LogRecord per logger.debug() call
+        # and then discards it -- 10.4% of the API server's CPU at c=2048.
+        logger.setLevel(logging.INFO)
 
         console_handler = logging.StreamHandler()
         from atom.utils import envs as _envs

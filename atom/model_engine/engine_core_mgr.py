@@ -57,7 +57,6 @@ class CoreManager:
         self.local_engine_count = local_engine_count
         self.ctx = zmq.Context(io_threads=2)
         self.outputs_queue = queue.Queue[list[Sequence]]()
-        self.stream_outputs_queue = queue.Queue()
         self.utility_response_queue = queue.Queue()
         self._seq_id_to_callback = {}
         # Batched stream-flush hook, resolved lazily by the API server (avoids
@@ -315,19 +314,29 @@ class CoreManager:
                         logger.debug(
                             f"{self.label}: Received STREAM message with {len(stream_outputs)} outputs"
                         )
-                        self.stream_outputs_queue.put_nowait(stream_outputs)
-                        # Also call callbacks if registered
+                        # Delivered only through the per-seq callbacks below.
+                        # These also used to go onto stream_outputs_queue,
+                        # which nothing ever read, so every RequestOutput
+                        # stayed reachable for the life of the process and
+                        # made each gen-2 GC pass progressively slower.
+                        #
+                        # The f-strings below are built by the caller before
+                        # logger.debug() can drop them, so check the level
+                        # once per step rather than twice per chunk.
+                        dbg = logger.isEnabledFor(logging.DEBUG)
                         for seq_id, request_output in stream_outputs:
                             callback = self._seq_id_to_callback.get(seq_id)
-                            logger.debug(
-                                f"{self.label}: seq_id={seq_id}, callback={'found' if callback is not None else 'NOT FOUND'}, tokens={request_output.output_tokens}"
-                            )
+                            if dbg:
+                                logger.debug(
+                                    f"{self.label}: seq_id={seq_id}, callback={'found' if callback is not None else 'NOT FOUND'}, tokens={request_output.output_tokens}"
+                                )
                             if callback is not None:
                                 try:
                                     callback(request_output)
-                                    logger.debug(
-                                        f"{self.label}: Successfully called callback for seq_id={seq_id}"
-                                    )
+                                    if dbg:
+                                        logger.debug(
+                                            f"{self.label}: Successfully called callback for seq_id={seq_id}"
+                                        )
                                 except Exception as e:
                                     logger.warning(
                                         f"Error calling stream_callback for sequence {seq_id}: {e}",
@@ -336,9 +345,10 @@ class CoreManager:
                             if request_output.finished:
                                 self._seq_id_to_callback.pop(seq_id, None)
                                 self._release_seq_load(seq_id)
-                                logger.debug(
-                                    f"{self.label}: Cleaned up callback for finished sequence {seq_id}"
-                                )
+                                if dbg:
+                                    logger.debug(
+                                        f"{self.label}: Cleaned up callback for finished sequence {seq_id}"
+                                    )
                         # Batched stream dispatch: the per-seq callbacks only buffer
                         # their chunks into a thread-local; flush the whole step's
                         # buffer into the per-request asyncio queues now (one
@@ -711,12 +721,6 @@ class CoreManager:
             self._rank_reqs = [0] * self.local_engine_count
             self._rank_tokens = [0] * self.local_engine_count
             self._seq_load.clear()
-
-    def get_stream_outputs(self):
-        try:
-            return self.stream_outputs_queue.get_nowait()
-        except queue.Empty:
-            return None
 
     def send_utility_command(self, cmd: str, dp_rank: int = None):
         if dp_rank is None:
