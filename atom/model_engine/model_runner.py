@@ -387,7 +387,24 @@ class tokenIDProcessor:
         ]
         self.input_ids.copy_to_gpu(total_tokens_prefill)
 
-        self.prev_rejected_num, self.prev_bonus_num = self.recv_mtp_status_async()
+        # `pending_mtp_status_copies` is filled in `postprocess`, which the
+        # pure-middle-chunk / non-last-PP early return in `forward` skips. Popping it
+        # on every step drains it: a chunked prefill that produces no token discards
+        # the status belonging to the previous decode, and the next decode step then
+        # reads an empty queue and gets (None, None). Consume it under the same
+        # predicate that fills it so producer and consumer stay in lockstep.
+        if batch.produces_output():
+            self.prev_rejected_num, self.prev_bonus_num = self.recv_mtp_status_async()
+            if (
+                self.is_deferred_out
+                and self.prev_rejected_num is None
+                and batch.total_seqs_num_decode > 0
+                and not batch.is_dummy_run
+            ):
+                logger.warning(
+                    "MTP status queue was empty on a token-producing decode step; "
+                    "speculative bookkeeping for this step is unreliable."
+                )
 
         # TODO: remove this when we support mixed prefill and decode in one batch
         if total_reqs_prefill > 0:
