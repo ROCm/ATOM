@@ -31,6 +31,16 @@ openai_server.py → LLMEngine → CoreManager → EngineCore → Scheduler → 
                                                loop)                    KV cache, CUDAGraphs)
 ```
 
+ATOM also has a **diffusion subsystem** (`atom/diffusion/`) for video+audio
+generation, which is a sibling of `atom/model_engine/` rather than an extension
+of it — no KV cache, one fixed N-step denoise loop per job, four heterogeneous
+networks, and sequence parallelism across a *single* request:
+
+```
+diffusion_server.py → DiffusionEngine → DiffusionCoreManager → DiffusionEngineCore → PipelineRunner
+   (/v1/videos)        (JobScheduler)      (ZMQ, one PUSH/rank)    (per-GPU worker)     (ComposedPipeline)
+```
+
 Key entry points:
 - Server: `atom/entrypoints/openai_server.py`
 - Engine: `atom/model_engine/llm_engine.py` → `engine_core.py` → `scheduler.py` → `model_runner.py`
@@ -38,6 +48,8 @@ Key entry points:
 - Ops: `atom/model_ops/` — AITER kernel wrappers (linear, attention, fused_moe)
 - Config: `atom/config.py` (Config, KVCacheConfig, CompilationConfig)
 - Env vars: `atom/utils/envs.py` (all `ATOM_*` variable definitions)
+- Diffusion: `atom/diffusion/` — server `entrypoints/diffusion_server.py`, models
+  `models/`, H3 stages `stages/minimax_h3/`. Install extras: `pip install -e ".[diffusion]"`
 
 ## Critical Rules
 
@@ -79,3 +91,4 @@ Key entry points:
 | Performance benchmark | `/benchmark-guide` |
 | Debugging | `/debug-guide` |
 | Adding a model | `/add-model` |
+| MiniMax-H3 (video+audio diffusion) | `recipes/MiniMax-H3.md` |
