@@ -6,30 +6,19 @@
 
 """MiniMax-H3 conditioning noise augmentation.
 
-Visual conditioning rows -- fl2va keyframes and ref2va image/video references
--- are **not** fed to the DiT clean. They are mixed with seeded noise on the
-rectified-flow line at a fixed timestep:
+Visual conditioning rows are not fed to the DiT clean:
 
-    rows = a * clean + (1 - a) * noise,      a = MINIMAX_H3_IMGVID_COND_TIMESTEP
+    rows = a * clean + (1 - a) * noise,   a = MINIMAX_H3_IMGVID_COND_TIMESTEP
 
-and the same ``a`` is what the DiT sees as those rows' timestep. So the 0.999
-in the captured ``unique_timesteps`` is not a "nearly clean" convention -- it
-is literally the mixing coefficient, and value and timestep must agree or the
-model is told the anchor is cleaner than it is.
+The same ``a`` is the timestep the DiT sees for those rows, so the 0.999 in the
+captured ``unique_timesteps`` is the mixing coefficient itself, not a
+"nearly clean" convention. Audio references use ``a = 1.0`` -- no augmentation.
 
-Audio references use ``a = 1.0``, i.e. no augmentation at all. Keeping them as
-separate constants rather than one shared knob is deliberate: they differ.
-
-The RNG contract is fiddly and unobservable if wrong -- a wrong draw yields a
-plausible anchor and a silently different video:
-
-* a **fresh CPU generator per condition**, so concatenating conditions and
-  drawing once is *not* equivalent for multi-reference requests;
-* visual conditions seed with ``seed``, audio with ``seed + 1``;
-* the visual draw is taken at ``target_latent_t + num_conditions`` frames and
-  then **sliced** to the condition's own length -- drawing the condition's
-  length directly gives a different sample for the same seed;
-* the mix is evaluated in fp32.
+RNG contract, all four parts unobservable if wrong (a wrong draw gives a
+plausible anchor and a silently different video): a fresh CPU generator per
+condition; ``seed`` for visual, ``seed + 1`` for audio; the visual draw is taken
+at ``target_latent_t + num_conditions`` frames and *sliced*, not drawn at the
+condition's own length; the mix is fp32.
 """
 
 from collections.abc import Sequence

@@ -3,26 +3,16 @@
 
 """MiniMax-H3 VAE decode.
 
-The H3 checkpoint **ships its own VAE implementation** -- ``video_vae/*.py``
-and ``audio_vae/*.py``, each with an ``auto_map`` entry and a `from_pretrained`
-that wires up config, tiling options and weights. We load that rather than
-re-implementing ~4,200 LOC: it is the reference numerics by construction, and
-it tracks the checkpoint if MiniMax revises it.
+The checkpoint ships its own VAE implementation (~4,200 LOC under
+``video_vae/`` and ``audio_vae/``), so we load that rather than re-implement it:
+reference numerics by construction. ``AutoModel.from_pretrained`` cannot
+dispatch on those directories -- their config.json has an ``auto_map`` but no
+``model_type`` -- so go through ``get_class_from_dynamic_module``.
 
-``AutoModel.from_pretrained`` does **not** work on these directories -- their
-config.json has an ``auto_map`` but no ``model_type``, so the auto-class
-registry cannot dispatch. Load the class through
-``get_class_from_dynamic_module`` and call the wrapper's own
-``from_pretrained``.
-
-Decode contract:
-
-1. rows -> latent tensor (unpatchify for video, channel-major unpack for audio)
-2. de-normalize per channel: ``z = z * std + mean``
-3. ``vae.decode(z)``
-4. crop video back to the target canvas -- the VAE pads the latent grid up to
-   its tile multiples, so a non-tile-aligned request decodes *larger* than
-   asked for, with the padding at bottom/right.
+Decode: rows -> latent (unpatchify video, channel-major unpack audio) ->
+de-normalize per channel (``z*std + mean``) -> ``vae.decode`` -> crop to canvas.
+The crop matters: the VAE pads the latent grid to tile multiples, so a
+non-tile-aligned request decodes larger than asked for.
 """
 
 import json
@@ -180,13 +170,10 @@ def decode_video_rows(
     latent = denormalize_latents(latent, mean=mean, std=std, name="video_vae")
     z = latent.to(next(vae.parameters()).dtype)
 
-    # Use the clip-aware temporal path, not the base `decode`. The base path
-    # upsamples uniformly by vae_ratio_t (37 latents -> 148 frames), whereas H3
-    # frames live on the 17n+5 lattice (37 -> 124). `decode_temporal` honours
-    # clip_length=17 / token_drop=3 and produces the right count; measured
-    # side by side on this checkpoint, decode()->148 and
-    # decode_temporal()->124. Nothing downstream catches the difference -- the
-    # file is still a valid MP4, just with the wrong frames.
+    # Clip-aware path, not the base `decode`: the latter upsamples uniformly by
+    # vae_ratio_t (37 latents -> 148 frames) where H3 frames live on the 17n+5
+    # lattice (37 -> 124). Nothing downstream catches the difference -- the file
+    # is still a valid MP4, just with the wrong frames.
     decode_fn = getattr(vae, "decode_temporal", None) or vae.decode
     frames = decode_fn(z)
     frames = getattr(frames, "sample", frames)

@@ -3,21 +3,14 @@
 
 """Spawns and talks to a replica's GPU workers.
 
-The diffusion counterpart of ``atom.model_engine.engine_core_mgr.CoreManager``,
-with the parts that only exist for token serving removed -- no DP load
-balancing, no streaming flush hook, no per-sequence callbacks. A diffusion
-replica is *one* collective group running *one* job at a time, so the manager's
-whole job is: spawn N ranks, fan a request out to all of them, and drain a
-single output socket.
+``CoreManager``'s role without the token-serving machinery -- no DP load
+balancing, no streaming hook, no per-sequence callbacks. One collective group
+running one job at a time: spawn N ranks, fan a request to all, drain one
+output socket.
 
-Transport:
-
-* **one PUSH socket per rank.** A single PUB would be simpler but PUB/SUB drops
-  messages to slow joiners, and a rank that misses a job hangs the replica in
-  an all-to-all rather than merely falling behind. Per-rank PUSH also makes it
-  unambiguous that every rank got exactly one copy.
-* **one shared PULL socket** for outputs. Only rank 0 reports results, so there
-  is nothing to interleave; errors carry their rank.
+One PUSH socket per rank rather than a PUB, because PUB drops to slow joiners
+and a rank that misses a job hangs the replica in an all-to-all. One shared PULL
+for outputs; only rank 0 reports results, and errors carry their rank.
 """
 
 import logging
@@ -88,10 +81,8 @@ class DiffusionCoreManager:
 
     def start(self) -> None:
         """Spawn every rank and block until all report READY."""
-        # Rendezvous for the workers' process group. Set here rather than left
-        # to the caller because a spawned worker inherits the environment as it
-        # is at spawn time, and a missing MASTER_PORT surfaces as every rank
-        # hanging in init_process_group with no error.
+        # Workers inherit the environment as it is at spawn time, and a missing
+        # MASTER_PORT surfaces as every rank hanging in init_process_group.
         env = {
             "MASTER_ADDR": os.environ.get("MASTER_ADDR", "127.0.0.1"),
             "MASTER_PORT": os.environ.get("MASTER_PORT") or str(get_open_port()),

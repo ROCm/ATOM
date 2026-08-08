@@ -3,27 +3,12 @@
 
 """Ulysses sequence parallelism.
 
-Diffusion transformers process one very long sequence per request (~37.7k
-packed tokens for MiniMax-H3 at 1344x768), so the parallel axis that matters is
-the sequence, not the batch. Ulysses splits the sequence across ranks for the
-linear layers, then trades sequence for heads with an all-to-all so each rank
-can run attention over the *whole* sequence for a *subset* of heads:
+Trades sequence for heads around attention: ``[S/W, H, D]`` -> ``[S, H/W, D]``
+before, and back after. Degenerates to identity at world size 1.
 
-    linears   : [S/W, H,   D]   -- every rank holds W-th of the tokens
-      all-to-all
-    attention : [S,   H/W, D]   -- every rank holds all tokens, W-th of heads
-      all-to-all
-    linears   : [S/W, H,   D]
-
-Measured on 8x MI308X at H3's real geometry: 0.272 ms per q/k/v tensor at
-202.7 GB/s effective, ~1.9 ms per layer including relayout -- about 2% of a
-denoise step, so this is not a bottleneck at this scale.
-
-One caveat worth knowing before tuning: attention efficiency falls as heads per
-rank shrinks. At fixed total work the same aiter kernel reaches 123 TFLOP/s
-with 56 heads but only 96 TFLOP/s with 7 (Ulysses-8), because 7 heads
-under-fill a 80-CU GPU. Higher Ulysses degree still wins on wall clock, just
-sub-linearly.
+``scatter_heads``/``gather_heads`` must round-trip exactly. A permute mismatch
+yields a plausible tensor of the right shape whose tokens are shuffled, which
+surfaces only as a corrupted frame -- hence the round-trip assertion in tests.
 """
 
 import torch

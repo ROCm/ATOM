@@ -3,15 +3,11 @@
 
 """Stage abstraction for composed diffusion pipelines.
 
-A diffusion pipeline is an ordered list of stages -- validate, encode text,
-prepare latents, prepare timesteps, denoise, decode, present -- each of which
-transforms a shared :class:`DiffusionBatch` in place and returns it.
-
-The one thing a stage must declare that has no LLM analogue is *where* it runs.
-Some stages are replicated on every rank (the denoise loop, which is
-collectively parallel), some run only on rank 0 and broadcast (text encoding,
-where replicating a 66 GB encoder's work on 8 ranks is pure waste), and some
-run only on rank 0 with no broadcast at all (writing the output file).
+An ordered list of stages, each transforming a shared :class:`DiffusionBatch`
+in place. The declaration with no LLM analogue is *where* a stage runs:
+replicated on every rank (the denoise loop, collectively parallel), rank 0 then
+broadcast (text encoding -- a 66 GB encoder on 8 ranks is waste), or rank 0
+alone (writing the file).
 """
 
 from abc import ABC, abstractmethod

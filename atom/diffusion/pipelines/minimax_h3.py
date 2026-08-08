@@ -1,27 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-"""MiniMax-H3 t2va and fl2va pipeline.
-
-Assembles the validated pieces onto the ``ComposedPipeline`` skeleton:
+"""MiniMax-H3 pipeline: t2va, fl2va and ref2va.
 
     TextEncoding (rank 0, broadcast)
-      -> Plan            resolve geometry + sigma schedules
-      -> KeyframeEncode  fl2va only: anchor image -> cond rows (rank 0, broadcast)
-      -> LatentPrep      seeded noise, row form
-      -> PackedSequence  layout, position grid, per-rank shard
-      -> Denoise         49 steps of DiT + Euler-ancestral
-      -> Decode          video/audio VAE (rank 0)
-      -> Present         H.264 + AAC mux (rank 0)
+      -> Plan             geometry + sigma schedules
+      -> ConditionEncode  conditioning -> packed rows (rank 0, broadcast)
+      -> LatentPrep       seeded noise, row form
+      -> PackedSequence   layout, position grid, per-rank shard
+      -> Denoise          N-1 steps of DiT + Euler-ancestral
+      -> Decode           video/audio VAE (rank 0)
+      -> Present          H.264 + AAC mux (rank 0)
 
-fl2va conditions on an anchor image twice over, and both are required: the
-Qwen3-VL vision tower folds it into the prompt sequence (1,010 of the 1,029
-conditioning tokens for a 1344x768 anchor), and the video VAE encodes it into
-1,008 packed rows that head the image region. Wiring only one of the two
-produces a plausible video that ignores its keyframe.
-
-``ref2va`` is still refused rather than stubbed -- a half-wired task that
-silently drops its conditioning is worse than one that declines.
+fl2va conditions on its anchor **twice** and both are required: the Qwen3-VL
+vision tower folds it into the prompt sequence (1,010 of 1,029 tokens for a
+1344x768 anchor) and the video VAE encodes it into 1,008 packed rows. Wiring
+only one produces a plausible video that ignores its keyframe.
 """
 
 import contextlib
@@ -208,10 +202,8 @@ def reference_materials(job) -> list[dict]:
             )
             item["max_duration_seconds"] = condition.get("max_duration_seconds")
         else:
-            # The reference resolves a video's own material shape during
-            # pre-queue admission; without that hook the target canvas is the
-            # right default, and an explicit width/height on the condition
-            # overrides it.
+            # No pre-queue shape hook here, so default to the target canvas;
+            # an explicit width/height on the condition overrides it.
             ref_width = int(condition.get("width", width))
             ref_height = int(condition.get("height", height))
             frames = decode_reference_video_frames(
@@ -684,11 +676,8 @@ class DenoiseStage(PipelineStage):
             row_start,
             row_start + local,
         )
-        # Refine the text embeddings once, not per step: the refiner is
-        # request-static, and the DiT's raw-input path would otherwise run
-        # condition_proj + the 2-layer token refiner on all 49 iterations.
-        # It also reconciles widths -- the encoder emits text_dim (5120) rows
-        # while the loop's contract is hidden_size (5376).
+        # Once, not per step: the refiner is request-static. It also reconciles
+        # widths -- the encoder emits text_dim (5120), the loop wants 5376.
         raw_embeds = batch.require("prompt_embeds").to(device)
         text_len = int(raw_embeds.shape[0])
         refiner_cu = torch.tensor([0, text_len], dtype=torch.int32, device=device)
@@ -788,24 +777,17 @@ class MiniMaxH3Pipeline(ComposedPipeline):
     host_staged_components = ("text_encoder",)
 
     # Identity defaults so construction never touches the filesystem; the real
-    # values are read from the checkpoint in load_components(), which is the
-    # place a wrong path should fail loudly rather than quietly de-normalise
-    # latents with the wrong constants.
+    # values load in load_components(), where a wrong path fails loudly.
     video_stats: tuple[list[float], list[float]] = ([0.0] * 24, [1.0] * 24)
     audio_stats: tuple[list[float], list[float]] | None = None
 
     def load_components(self) -> None:
         """Load the four networks from the checkpoint root.
 
-        Each has its own loader and none of them is a plain state-dict load:
-        the DiT needs the grouped-QKV reorder, both VAEs come from the
-        checkpoint's own ``auto_map`` classes (they carry no ``model_type``, so
-        the auto-class registry cannot dispatch), and the text encoder is
-        Qwen3-VL truncated one layer past the one it reads.
-
-        The text encoder and the VAEs live on the main rank only -- they run in
-        MAIN_RANK_ONLY / broadcast stages, so a copy per rank would be ~70 GB of
-        pure waste.
+        None is a plain state-dict load: the DiT needs the grouped-QKV reorder,
+        the VAEs come from the checkpoint's own ``auto_map`` classes, and the
+        encoder is Qwen3-VL truncated one layer past the one it reads. Encoder
+        and VAEs are main-rank only -- a copy per rank is ~70 GB of waste.
         """
         import torch
 
@@ -877,10 +859,8 @@ class MiniMaxH3Pipeline(ComposedPipeline):
             )
 
     def build_stages(self):
-        # Stages resolve components *and* latent stats by name at forward time:
-        # build_stages runs inside __init__, before register_component and
-        # before load_components, so capturing either here would capture
-        # nothing (or force a filesystem read at construction).
+        # Stages resolve components and stats at forward time: build_stages runs
+        # inside __init__, before either exists.
         return [
             TextEncodingStage(self),
             PlanStage(),

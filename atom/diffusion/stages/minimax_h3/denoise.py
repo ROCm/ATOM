@@ -1,22 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-"""MiniMax-H3 denoise loop (t2va and fl2va).
+"""MiniMax-H3 denoise loop.
 
-State is carried in **row form** -- video ``[Nv, 96]`` and audio ``[Na, 32]`` --
-and scattered into the full-length ``[1, S, *]`` buffers the DiT reads on each
-step. The DiT returns rows again, so the sampler never sees the padded layout.
+State stays in row form -- video ``[Nv, 96]``, audio ``[Na, 32]`` -- and is
+scattered into the padded ``[1, S, *]`` buffers each step, so the sampler never
+sees the packed layout.
 
-Video and audio run on separate sigma schedules, which is why each step builds a
-per-token timestep vector: the DiT conditions AdaLN on
-``token_tag + 3 * inverse_index``, where ``inverse_index`` points into the
-unique timesteps present in that step. At step 0 both modalities sit at t=0 so
-there is exactly one unique timestep (matching the captured
-``unique_timesteps`` of shape [1]); later steps generally have two.
-
-fl2va adds a third: the keyframe conditioning rows sit at a fixed near-clean
-timestep of their own and are never stepped, so a conditioned request carries
-one extra unique timestep from step 0 onward.
+Video and audio run separate sigma schedules, so each step builds a per-token
+timestep vector: AdaLN conditions on ``token_tag + 3 * inverse_index`` into that
+step's unique timesteps. Step 0 has one (both modalities at t=0), later steps
+two, and conditioned requests a third for the conditioning rows.
 """
 
 from collections.abc import Callable
@@ -36,12 +30,9 @@ from atom.diffusion.stages.minimax_h3.packed_sequence import (
     build_local_embedding_layout,
 )
 
-# Conditioning rows ride ``max(video_timestep, noise_aug)`` rather than the
-# video schedule. ``noise_aug`` is the same coefficient the rows were mixed with
-# (see :mod:`atom.diffusion.stages.minimax_h3.condition_noise`), so value and
-# timestep agree. The max never binds on the released 50-step schedules -- video
-# tops out at t=0.8, audio at 0.941 -- but it is the reference's rule and a
-# longer schedule would reach past 0.999.
+# Conditioning rows ride max(video_timestep, noise_aug) -- the same coefficient
+# they were mixed with, so value and timestep agree. The max never binds on the
+# released 50-step schedules (video tops out at 0.8, audio 0.941).
 
 
 def build_timestep_conditioning(
@@ -59,11 +50,10 @@ def build_timestep_conditioning(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return ``(unique_timesteps, inverse_indices, combined_indices)``.
 
-    Non-media rows (text, padding) ride the video timestep: they carry no
-    latent, so the choice only has to keep them inside the unique set.
-    ``cond_pos`` marks fl2va keyframe and ref2va image/video rows;
-    ``cond_audio_pos`` marks ref2va audio references, which ride a *different*
-    constant (1.0 -- they are not noise-augmented at all).
+    Text and padding ride the video timestep -- they carry no latent, so the
+    choice only has to keep them inside the unique set. ``cond_pos`` marks
+    visual conditioning, ``cond_audio_pos`` audio references (a different
+    constant: they are not noise-augmented).
     """
     seq_len = int(token_tags.shape[0])
     per_token = torch.full(
@@ -110,18 +100,12 @@ def run_denoise_loop(
     scheduler: MiniMaxH3EulerAncestralEta0Scheduler | None = None,
     progress: Callable[[int, int], None] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run the full denoise loop and return final ``(video_rows, audio_rows)``.
+    """Run the loop and return final ``(video_rows, audio_rows)``.
 
-    ``video_sigmas``/``audio_sigmas`` are the 50-entry schedules; the loop runs
-    ``len(sigmas) - 1`` steps.
-
-    ``cond_rows`` are fl2va keyframe / ref2va visual latents and
-    ``cond_audio_rows`` are ref2va audio references. Both head their region and
-    are re-scattered unchanged every step, but the DiT treats them
-    asymmetrically: it returns **only** the generated video rows, while it
-    returns *all* audio rows including the references. So the video side is
-    kept out of the sampler by construction and the audio side has to be
-    trimmed off the prediction.
+    Runs ``len(sigmas) - 1`` steps. Conditioning rows head their region and are
+    re-scattered unchanged each step, but the DiT is asymmetric: it returns only
+    the *generated* video rows yet *all* audio rows, so the audio references
+    must be trimmed off the prediction.
     """
     if len(video_sigmas) != len(audio_sigmas):
         raise ValueError(

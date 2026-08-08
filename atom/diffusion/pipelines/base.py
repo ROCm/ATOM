@@ -78,11 +78,8 @@ class ComposedPipeline(ABC):
     def load_components(self) -> None:
         """Build every component from the checkpoint and register it.
 
-        Left to subclasses on purpose. A diffusion pipeline is several
-        independent networks with different loaders -- H3's DiT needs a
-        grouped-QKV reorder, its VAEs load through the checkpoint's own
-        ``auto_map`` classes, and its text encoder is a truncated Qwen3-VL --
-        so a generic "instantiate class_path and load a state dict" would fit
+        Left to subclasses: a diffusion pipeline is several networks with different
+        loaders, so a generic "instantiate class_path and load a state dict" fits
         none of them.
         """
         raise NotImplementedError(

@@ -3,21 +3,14 @@
 
 """Wire protocol between the diffusion API process and its GPU workers.
 
-Deliberately smaller than the LLM engine's protocol, because the traffic is:
-one job in, occasional progress out, one result out -- minutes apart. There is
-no token stream, no per-step batching and no KV-cache bookkeeping, so the
-message set is five types and the payloads are small enough that pickle over
-ZMQ costs nothing measurable next to a 4-minute generation.
+One job in, occasional progress out, one result out, minutes apart -- so five
+message types and pickle over ZMQ, whose cost is nothing next to a 4-minute
+generation.
 
-Two properties the rest of the engine depends on:
-
-* **Every rank receives every request.** Ulysses is collective -- a job that
-  reaches three of four ranks does not run three-quarters as fast, it hangs in
-  an all-to-all. So requests fan out, and it is the *worker* that decides
-  whether it has anything to report.
-* **Only the main rank replies.** Rank 0 is the one that decodes and muxes, so
-  it is the only rank with a result; the others would otherwise produce N-1
-  duplicate completions the API layer would have to deduplicate.
+Two properties the engine depends on: every rank receives every request
+(Ulysses is collective -- a job reaching 3 of 4 ranks hangs in an all-to-all
+rather than running slower), and only rank 0 replies (it is the one that decodes
+and muxes, so the others would be N-1 duplicate completions).
 """
 
 from dataclasses import dataclass, field

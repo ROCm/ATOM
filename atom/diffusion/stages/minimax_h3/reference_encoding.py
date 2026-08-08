@@ -6,30 +6,19 @@
 
 """MiniMax-H3 ref2va reference material -> packed conditioning rows.
 
-Three material kinds, three recipes, and they do **not** share geometry with
-the target -- an fl2va keyframe binds the target canvas, a ref2va reference
-never does:
+Unlike an fl2va keyframe, a reference never binds the target canvas.
 
-``image``
-    Keep the display ratio, resize the *short edge* to 2048 (upscaling if
-    necessary), round both dimensions independently to the nearest multiple of
-    32, then the fl2va keyframe encode.
-``audio``
-    Decode to stereo float PCM at the source rate, resample once to 32 kHz,
-    take the audio VAE posterior **mean** (encoder -> optional pre_block ->
-    mean_proj -- no sampling), normalise, and emit channel-major rows.
-``video`` / ``video_audio``
-    One ffmpeg pass produces CFR RGB24 frames that feed *both* Qwen and the
-    visual VAE, so conditioning never goes through a lossy intermediate or a
-    second decode. The soundtrack is extracted separately at 44.1 kHz.
+* ``image`` -- keep the ratio, short edge to 2048 (upscaling if needed), round
+  both dims to the nearest 32, then the fl2va keyframe encode.
+* ``audio`` -- stereo float PCM at the source rate, one resample to 32 kHz, then
+  the audio VAE posterior **mean** (no sampling), normalised, channel-major.
+* ``video``/``video_audio`` -- one ffmpeg pass feeds *both* Qwen and the visual
+  VAE, so the two cannot disagree. Soundtrack extracted separately at 44.1 kHz.
 
-Two asymmetries worth stating because they look like oversights:
-
-* the video encode **samples** the VAE posterior (seed pinned to 42) while the
-  audio encode takes the mean. Different models, different recipes.
-* the audio encode runs under a scoped determinism context that disables cuDNN
-  outright. Without it the same waveform gives slightly different latents run
-  to run, which is invisible until two runs of the same seed disagree.
+Two asymmetries that look like oversights but are not: the video encode
+*samples* the posterior (seed 42) while the audio encode takes the mean, and the
+audio encode needs :class:`audio_vae_determinism` or the same waveform yields
+different latents run to run.
 """
 
 import functools
@@ -67,12 +56,9 @@ VIDEO_MATERIAL_CHAINS = ("video.reference_preserve", "video_audio.reference_pres
 class audio_vae_determinism:
     """Scoped determinism for the audio encode.
 
-    Disables TF32 and cuDNN entirely and pins SDP to the math backend, then
-    restores everything -- the decode path wants its own configuration. Without
-    this the same waveform yields slightly different latents between runs.
-
-    Re-entrant via a depth counter so a caller encoding several references can
-    wrap the whole loop without each inner use re-saving the same flags.
+    Disables TF32 and cuDNN and pins SDP to math, then restores. Without it the
+    same waveform yields different latents run to run. Re-entrant, so a caller
+    encoding several references can wrap the whole loop.
     """
 
     _depth = 0

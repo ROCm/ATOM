@@ -6,22 +6,13 @@
 
 """MiniMax-H3 fl2va keyframe conditioning.
 
-An anchor image becomes packed conditioning rows in three steps:
+canvas (LANCZOS cover crop) -> ``encode_images(use_fp16_latent=True)`` on fp32
+weights under a forked RNG seeded to **42** -> ``(z - mean) / std`` -> patchify.
 
-1. **canvas** -- aspect-preserving cover crop onto the target canvas
-   (LANCZOS), identity when the image already *is* the canvas;
-2. **encode** -- ``video_vae.encode_images(img, use_fp16_latent=True)`` on fp32
-   weights, under an RNG forked and seeded to **42**;
-3. **normalise + patchify** -- ``(z - mean) / std`` then patch (1, 2, 2).
-
-The seed is part of the contract, not a convenience: the VAE posterior is
-*sampled* (not the mean), so a different seed gives different -- still
-plausible -- conditioning rows and a silently different video. The fork keeps
-the process-global generators untouched.
-
-Step 3 is the exact inverse of the decode-side de-normalisation; getting the
-direction backwards produces conditioning of roughly the right magnitude and is
-correspondingly hard to notice.
+The seed is contract, not convenience: the posterior is *sampled*, so another
+seed gives different-but-plausible rows and a silently different video. The
+normalise step is the exact inverse of decode's; reversing it yields
+conditioning of roughly the right magnitude and is correspondingly hard to spot.
 """
 
 import contextlib

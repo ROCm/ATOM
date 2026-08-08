@@ -1,26 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Packed varlen attention backends for the diffusion DiT stack.
+"""Packed varlen attention backends. A real trade, not a fallback ladder.
 
-Three backends, and the choice is a real trade rather than a fallback ladder:
+    asm     aiter ASM v3 varlen. 124.0 TFLOP/s on gfx942, matching the tuned
+            fixed-length kernel (123.9). The default.
+    triton  aiter Triton varlen. 99.0 TFLOP/s, but the only backend that
+            reproduces the sglang reference bit-for-bit. Pin in parity tests.
+    sdpa    Segment-wise SDPA. CPU fallback and numerics anchor.
 
-``asm``
-    aiter's ASM v3 varlen FMHA. Fastest on gfx942 -- measured 124.0 TFLOP/s at
-    H3's shapes, matching the tuned fixed-length kernel (123.9), so there is no
-    varlen overhead to reclaim. The runtime default.
-``triton``
-    aiter's Triton varlen path. 99.0 TFLOP/s (~20% slower), but it is what the
-    sglang reference forces on gfx942, so **it is the only backend that
-    reproduces reference outputs bit-for-bit**. Pin this in parity tests.
-``sdpa``
-    Segment-wise ``scaled_dot_product_attention``. CPU fallback and numerics
-    anchor; no aiter dependency.
-
-The backends agree to ~1e-5 cosine per call, which is ordinary bf16 spread. Over
-a 50-step denoise that compounds into a *different but equally valid* sample --
-so a run that compares pixels against sglang must select ``triton`` or it will
-chase a phantom. Nothing here claims one kernel is more accurate than another.
+They agree to ~1e-5 cosine per call (ordinary bf16 spread), which over 50 steps
+compounds into a different but equally valid sample. No claim that any one is
+more accurate; a run comparing pixels against sglang must select ``triton``.
 """
 
 import itertools

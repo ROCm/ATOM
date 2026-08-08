@@ -4,34 +4,23 @@
 # Layout rules follow the reference in sgl-project/sglang
 # (.../minimax_h3/packed_sequence.py, Apache-2.0).
 
-"""MiniMax-H3 packed-sequence layout for t2va and fl2va.
+"""MiniMax-H3 packed-sequence layout.
 
-One request becomes a single packed row block:
+    t2va/fl2va  [ text | imgvid_cond | audio (audio_t x 2ch) | video | pad ]
+    ref2va      [ text | ref blocks  | audio | video | pad ]
 
-    [ text L | imgvid_cond C | audio A (= audio_t x 2ch) | video V | pad P ]
+Conditioning rows are part of ``img_pos`` but excluded from ``update_mask``.
+``cu_seqlens`` is ``[0, used, seq_len]`` -- the second segment is pure padding.
 
-``C`` is empty for t2va. For fl2va it holds one full frame of latent rows per
-keyframe anchor, and those rows are part of ``img_pos`` but excluded from
-``update_mask`` -- they are conditioning, not generated.
+The fp64 position grid has three non-obvious rules: the temporal axis continues
+the text counter (video time starts at ``text_len``) and advances by
+``5/3 * frame_per_token`` cycling ``(1, 4, 4, 4, 4)``; spatial axes are centred
+on aspect ratio against ``sqrt(H*W)``, half-open, scaled by 32; audio rows are
+channel-major, pinned to the two extremes of the w grid.
 
-with ``cu_seqlens = [0, used, seq_len]`` -- two segments, the second being pure
-padding. That matches the captured ``[0, 37712, 37760]``.
-
-The 3-D position grid is fp64 and deliberately odd:
-
-* the temporal axis *continues the text counter*, so video time starts at
-  ``text_len`` rather than 0, and advances by ``5/3 * frame_per_token`` where
-  ``frame_per_token`` cycles ``(1, 4, 4, 4, 4)``;
-* each spatial axis is centred on its aspect ratio against ``sqrt(H*W)`` and
-  spans a half-open interval scaled by 32;
-* audio rows are channel-major and pinned to the two extremes of the w grid.
-
-ref2va uses a different block builder and is not covered here.
-
-One numerics trap: the fl2va last-frame anchor sums the temporal spans with
-numpy (pairwise summation), while the per-frame t grid accumulates
-sequentially. The two orders diverge in the last ulp from n=16 onward, so they
-must not be unified -- see ``temporal_position_span`` vs ``video_t_grid``.
+Numerics trap: :func:`temporal_position_span` sums with numpy (pairwise) while
+:func:`video_t_grid` accumulates sequentially. They diverge in the last ulp from
+n=16 and must not be unified.
 """
 
 from collections.abc import Sequence
@@ -84,10 +73,9 @@ FL2VA_KEYFRAME_SIGNATURES: tuple[tuple[int, ...], ...] = ((0,), (-1,), (0, -1))
 def temporal_position_span(temporal_length: int) -> float:
     """Total temporal span of ``n`` latent frames, in fp64.
 
-    Deliberately **not** shared with :func:`video_t_grid`. This one sums via
-    numpy (pairwise summation) to match the fl2va anchor computation; the grid
-    accumulates sequentially. The two orders differ in the last ulp from n=16
-    onward, and the anchor position feeds RoPE, so the distinction is real.
+    Deliberately not shared with :func:`video_t_grid`: this sums via numpy
+    (pairwise) to match the fl2va anchor, that one accumulates sequentially.
+    They differ in the last ulp from n=16, and the anchor feeds RoPE.
     """
     spans = np.ones(int(temporal_length), dtype=np.float64) * FRAME_RESCALE
     for token_index in range(T_GROUP):
@@ -311,12 +299,9 @@ def build_local_embedding_layout(
         )
         return pos.index_select(0, sel)
 
-    # Text occupies global rows [0, text_len). Intersect that with this shard
-    # and express it in source coordinates. Clamping (rather than searching for
-    # selected indices) is what makes a text-free shard report an empty range
-    # *at text_len* -- e.g. (2, 2) for rank 1 -- which is what the reference
-    # emits. Any empty range behaves identically downstream, but matching the
-    # reference exactly keeps golden comparisons clean.
+    # Text is global rows [0, text_len); intersect with this shard. Clamping
+    # makes a text-free shard report its empty range *at* text_len -- (2, 2),
+    # not (0, 0) -- matching the reference so golden diffs stay clean.
     text_len = int(text_pos.numel())
     text_source_start = min(max(row_start, 0), text_len)
     text_source_stop = min(max(row_stop, 0), text_len)
@@ -417,21 +402,14 @@ def build_packed_sequence_ref2va(
 ) -> dict:
     """Packed layout for ref2va: reference material, then the target.
 
-        [ text | ref blocks (in request order) | target audio | target video | pad ]
+        [ text | ref blocks (request order) | target audio | target video | pad ]
 
-    Reference blocks are consumed in request order and each advances a shared
-    temporal cursor that starts at ``text_len``, so references and target sit
-    on one continuous timeline rather than overlapping:
+    Blocks share one temporal cursor starting at ``text_len``: ``image`` takes a
+    single integer slot, ``audio`` advances by its own latent length, and
+    ``video``/``video_audio`` pack their audio immediately before their video,
+    share a temporal origin, and advance by the longer of the two spans.
 
-    * ``image`` occupies one integer slot;
-    * ``audio`` advances by its own latent length;
-    * ``video``/``video_audio`` pack their audio rows **immediately before**
-      their video rows, share a temporal origin, and advance by whichever of
-      the two spans is longer.
-
-    Unlike fl2va there are two update masks. Reference *audio* rows are real
-    audio conditioning, so ``audio_update_mask`` is the audio-side counterpart
-    of ``update_mask`` -- a single mask cannot express "hold these audio rows
+    Two update masks, because a single one cannot express "hold these audio rows
     but step those".
     """
     if text_len < 1:
