@@ -858,11 +858,23 @@ class Scheduler:
                 f"input tokens={num_tokens} > max_model_len={self.max_model_len}. "
                 f"Increase --max-model-len or shorten the prompt."
             )
-        if not self.enable_chunked_prefill and num_tokens > self.max_num_batched_tokens:
+        # Multimodal prefills are never chunked (the vision embeddings cover the
+        # whole prompt), so for them the batched-token budget is a hard cap even
+        # when chunked prefill is on.
+        is_multimodal = getattr(seq, "multimodal_data", None) is not None
+        if (
+            not self.enable_chunked_prefill or is_multimodal
+        ) and num_tokens > self.max_num_batched_tokens:
+            remedy = (
+                "Increase --max-num-batched-tokens or shorten the prompt "
+                "(multimodal prompts are never chunked)."
+                if is_multimodal
+                else "Increase --max-num-batched-tokens, enable chunked "
+                "prefill, or shorten the prompt."
+            )
             return (
                 f"input tokens={num_tokens} > max_num_batched_tokens="
-                f"{self.max_num_batched_tokens}. Increase --max-num-batched-tokens, "
-                f"enable chunked prefill, or shorten the prompt."
+                f"{self.max_num_batched_tokens}. {remedy}"
             )
         bm = self.block_manager
         total_blocks = len(bm.blocks)
@@ -1102,8 +1114,25 @@ class Scheduler:
             num_new_tokens = (
                 seq.num_tokens - num_cached_blocks * self.block_manager.hash_block_size
             )
+            # Vision embeddings are computed for the whole prompt in one shot
+            # and scattered onto the placeholder positions of the tokens in the
+            # batch, so a multimodal prefill must not be split: a partial chunk
+            # would either miss the placeholders entirely or land them at the
+            # wrong offsets. Take the prompt whole or wait for a step with
+            # enough budget.
+            #
+            # TODO: support chunked multimodal prefill. Needs the vision
+            # embeddings computed once and cached per request, then sliced by
+            # the chunk's token offset at scatter time (see the merge site in
+            # ModelRunner.run_model). Today the scheduler also clears
+            # `seq.multimodal_data` after the first batch, so later chunks would
+            # silently embed raw `<|media_pad|>` tokens into the KV cache. Until
+            # that lands, `max_num_batched_tokens` caps multimodal prompt length
+            # even with chunked prefill enabled.
+            atomic_prefill = getattr(seq, "multimodal_data", None) is not None
             if (
-                self.enable_chunked_prefill
+                not atomic_prefill
+                and self.enable_chunked_prefill
                 and 0 < self.long_prefill_token_threshold < num_new_tokens
             ):
                 num_new_tokens = self.long_prefill_token_threshold
@@ -1111,7 +1140,7 @@ class Scheduler:
             chunk = self._prefill_chunk_for_budget(
                 num_new_tokens, budget_remaining, num_batched_tokens
             )
-            if chunk is None:
+            if chunk is None or (atomic_prefill and chunk < num_new_tokens):
                 self.waiting.appendleft(seq)
                 break
             self.block_manager.allocate(seq, num_cached_blocks)
