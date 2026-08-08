@@ -59,6 +59,8 @@ class CoreManager:
         self.outputs_queue = queue.Queue[list[Sequence]]()
         self.stream_outputs_queue = queue.Queue()
         self.utility_response_queue = queue.Queue()
+        self._collective_rpc_router = CollectiveRPCResponseRouter()
+        self._utility_send_lock = Lock()
         self._seq_id_to_callback = {}
         # Batched stream-flush hook, resolved lazily by the API server (avoids
         # an api_server <-> engine_core_mgr import cycle). Stays None on every
@@ -354,7 +356,7 @@ class CoreManager:
                                     exc_info=True,
                                 )
                     elif request_type == EngineCoreRequestType.UTILITY_RESPONSE:
-                        self.utility_response_queue.put_nowait(data)
+                        self._route_utility_response(dp_rank, data)
                     elif request_type == EngineCoreRequestType.ADD:
                         # logger.info(f"Engine core output sequence id: {seq.id}")
                         seqs = data
@@ -373,6 +375,20 @@ class CoreManager:
             name=f"EngineCoreOutputThread-DP{dp_rank}",
             daemon=True,
         )
+
+    def _route_utility_response(self, dp_rank: int, data) -> None:
+        """Route correlated collective responses without disturbing legacy FIFO."""
+        if not isinstance(data, EngineCoreRPCResponse):
+            self.utility_response_queue.put_nowait(data)
+            return
+
+        if not self._collective_rpc_router.route(data.request_id, (dp_rank, data)):
+            logger.warning(
+                "%s: dropping late response for collective RPC %s from DP rank %d",
+                self.label,
+                data.request_id,
+                dp_rank,
+            )
 
     def _ensure_output_handler_task(self):
         if self._asyncio_mode and self._output_handler_task is None:
@@ -764,17 +780,20 @@ class CoreManager:
         payload = {"cmd": cmd, **kwargs}
         # Serialize once and reuse for all ranks (optimization: avoid repeated pickle.dumps)
         serialized_payload = pickle.dumps((EngineCoreRequestType.UTILITY, payload))
-        for rank in range(self.local_engine_count):
-            logger.debug(
-                f"{self.label}: Broadcast utility command '{cmd}' to DP rank {rank}"
-            )
-            self.input_sockets[rank].send_multipart(
-                [
-                    self.engine_core_identities[rank],
-                    serialized_payload,
-                ],
-                copy=True,  # Use copy=True since we're reusing the same buffer
-            )
+        # ZeroMQ sockets are not safe for concurrent sends from multiple caller
+        # threads (e.g. overlapping Ray control RPCs).
+        with self._utility_send_lock:
+            for rank in range(self.local_engine_count):
+                logger.debug(
+                    f"{self.label}: Broadcast utility command '{cmd}' to DP rank {rank}"
+                )
+                self.input_sockets[rank].send_multipart(
+                    [
+                        self.engine_core_identities[rank],
+                        serialized_payload,
+                    ],
+                    copy=True,  # Use copy=True since we're reusing the same buffer
+                )
 
     def broadcast_utility_command_sync(
         self, cmd: str, timeout: float = 300.0, **kwargs
@@ -800,6 +819,120 @@ class CoreManager:
                     f"for command '{cmd}' (timeout={timeout}s)"
                 )
         return responses
+
+    @staticmethod
+    def _dp_rpc_transport_failure(
+        request_id: str, method: str, message: str
+    ) -> EngineCoreRPCResponse:
+        return EngineCoreRPCResponse.failure(
+            request_id, method, RPCErrorInfo.transport(message)
+        )
+
+    def collective_rpc(
+        self,
+        method: str,
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict | None = None,
+    ) -> list:
+        """Execute a control-plane method on all DP/TP model runners."""
+        request = CollectiveRPCRequest.create(method, timeout, args, kwargs)
+        responses_by_rank: dict[int, EngineCoreRPCResponse] = {}
+
+        with self._collective_rpc_router.register(request.request_id) as response_queue:
+            self.broadcast_utility_command(
+                COLLECTIVE_RPC_UTILITY,
+                request=request,
+            )
+            while len(responses_by_rank) < self.local_engine_count:
+                remaining = request.remaining_timeout()
+                if remaining is None:
+                    wait_s = 1.0
+                else:
+                    if remaining <= 0:
+                        break
+                    wait_s = min(1.0, remaining)
+
+                try:
+                    dp_rank, response = response_queue.get(timeout=wait_s)
+                except queue.Empty:
+                    for dp_rank, process in enumerate(self.engine_core_processes):
+                        if dp_rank not in responses_by_rank and not process.is_alive():
+                            responses_by_rank[dp_rank] = self._dp_rpc_transport_failure(
+                                request.request_id,
+                                request.method,
+                                f"DP EngineCore {dp_rank} is not alive",
+                            )
+                    continue
+
+                if not isinstance(dp_rank, int) or not (
+                    0 <= dp_rank < self.local_engine_count
+                ):
+                    logger.warning(
+                        "%s: ignoring collective RPC %s response with invalid DP rank %r",
+                        self.label,
+                        request.request_id,
+                        dp_rank,
+                    )
+                    continue
+                if not isinstance(response, EngineCoreRPCResponse):
+                    responses_by_rank[dp_rank] = self._dp_rpc_transport_failure(
+                        request.request_id,
+                        request.method,
+                        f"invalid DP response type: {type(response).__name__}",
+                    )
+                    continue
+                if dp_rank in responses_by_rank:
+                    logger.warning(
+                        "%s: ignoring duplicate collective RPC %s response from DP rank %d",
+                        self.label,
+                        request.request_id,
+                        dp_rank,
+                    )
+                    continue
+                responses_by_rank[dp_rank] = response
+
+            for dp_rank in range(self.local_engine_count):
+                if dp_rank not in responses_by_rank:
+                    responses_by_rank[dp_rank] = self._dp_rpc_transport_failure(
+                        request.request_id,
+                        request.method,
+                        f"RPC method {request.method!r} timed out "
+                        f"on DP EngineCore {dp_rank}",
+                    )
+
+        failures: list[RankedRPCFailure] = []
+        results: list = []
+        for dp_rank in range(self.local_engine_count):
+            dp_response = responses_by_rank[dp_rank]
+            if dp_response.error is not None:
+                failures.append(RankedRPCFailure(dp_rank, None, dp_response.error))
+                continue
+
+            protocol_error = validate_worker_responses(dp_response)
+            if protocol_error is not None:
+                failures.append(RankedRPCFailure(dp_rank, None, protocol_error))
+                continue
+            for tp_response in sorted(
+                dp_response.tp_responses, key=lambda item: item.tp_rank
+            ):
+                if not tp_response.ok:
+                    failures.append(
+                        RankedRPCFailure(
+                            dp_rank,
+                            tp_response.tp_rank,
+                            tp_response.error
+                            or RPCErrorInfo.protocol(
+                                "failed worker response has no error"
+                            ),
+                        )
+                    )
+                else:
+                    results.append(tp_response.result)
+
+        if failures:
+            raise CollectiveRPCError(request.method, failures)
+        return results
 
     def _shutdown_engine_core_rank(self, dp_rank: int):
         if dp_rank >= len(self.engine_core_processes):

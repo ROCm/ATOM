@@ -25,7 +25,14 @@ from threading import Thread
 import zmq
 import zmq.asyncio
 from aiter.dist.shm_broadcast import MessageQueue
+
 from atom.kv_transfer.disaggregation import KVOutputAggregator
+from atom.model_engine.collective_rpc import (
+    COLLECTIVE_RPC_COMMAND,
+    CollectiveRPCRequest,
+    RPCErrorInfo,
+    WorkerRPCResponse,
+)
 from atom.utils import (
     get_mp_context,
     get_open_zmq_ipc_path,
@@ -55,6 +62,7 @@ class AsyncIOProc:
         runner_qualname: Fully qualified class name of the runner to instantiate.
         rank: TP rank of this worker.
         kv_output_addr: Optional ZMQ endpoint for KV aggregation output.
+        rpc_output_addr: Optional ZMQ endpoint for collective RPC acknowledgements.
     """
 
     # Function names whose output goes to the KV channel instead of primary
@@ -70,6 +78,7 @@ class AsyncIOProc:
         kv_output_addr: str | None = None,
         all_ranks_barrier=None,
         *args,
+        rpc_output_addr: str | None = None,
         **kwargs,
     ):
         # Bind this worker's lifetime to its parent EngineCore: if the parent
@@ -115,6 +124,10 @@ class AsyncIOProc:
         # KV aggregation output channel
         self.kv_output_addr = kv_output_addr
         self.kv_queue: queue.Queue | None = None
+        # Collective RPC completion channel. Unlike the primary output channel,
+        # every TP rank owns one so the caller can prove that all ranks finished.
+        self.rpc_output_addr = rpc_output_addr
+        self.rpc_queue: queue.Queue | None = None
 
         self.rpc_broadcast_mq = MessageQueue.create_from_handle(input_shm_handle, rank)
         import atexit
@@ -140,6 +153,16 @@ class AsyncIOProc:
             t = threading.Thread(
                 target=self.send_output_to_socket,
                 args=(self.kv_output_addr, self.kv_queue),
+                daemon=True,
+            )
+            t.start()
+            self.io_threads.append(t)
+
+        if self.rpc_output_addr is not None:
+            self.rpc_queue = queue.Queue()
+            t = threading.Thread(
+                target=self.send_output_to_socket,
+                args=(self.rpc_output_addr, self.rpc_queue),
                 daemon=True,
             )
             t.start()
@@ -210,6 +233,9 @@ class AsyncIOProc:
         """Main event loop: dequeue RPCs and dispatch to runners."""
         while True:
             func_name, args = self.get_func()
+            if func_name == COLLECTIVE_RPC_COMMAND:
+                self._execute_collective_rpc(*args)
+                continue
             need_barrier = func_name in self._BARRIER_FUNCS
             for runner in self.runners:
                 func = getattr(runner, func_name, None)
@@ -230,6 +256,28 @@ class AsyncIOProc:
                 break
         logger.debug(f"{self.label}: exit busy_loop...")
 
+    def _execute_collective_rpc(
+        self,
+        request: CollectiveRPCRequest,
+    ) -> None:
+        """Execute one control-plane RPC and always acknowledge this TP rank."""
+        try:
+            runner = self.runners[0]
+            func = getattr(runner, request.method)
+            result = func(*request.args, **request.kwargs)
+            response = WorkerRPCResponse.success(request.request_id, self.rank, result)
+            # Turn an unpicklable result into a normal RPC failure instead of
+            # silently killing the socket sender thread.
+            pickle.dumps(response)
+        except Exception as exc:
+            response = WorkerRPCResponse.failure(
+                request.request_id, self.rank, RPCErrorInfo.from_exception(exc)
+            )
+
+        if self.rpc_queue is None:
+            raise RuntimeError("collective RPC response channel is not configured")
+        self.rpc_queue.put_nowait(response)
+
     def get_func(self):
         method_name, *args = self.rpc_broadcast_mq.dequeue()
         return method_name, args
@@ -241,10 +289,11 @@ class AsyncIOProcManager:
     Handles process lifecycle, function dispatch via shared-memory broadcast,
     and KV output aggregation across all workers.
 
-    The manager maintains two output channels:
+    The manager maintains three output channels:
     - **Primary channel** (rank 0 only): Regular forward outputs.
     - **KV channels** (all ranks): Per-worker KV transfer status, aggregated
       by :class:`KVOutputAggregator` before returning to the caller.
+    - **RPC channels** (all ranks): Per-worker control-plane results and errors.
 
     Args:
         finalizer: Callback invoked when the manager shuts down.
@@ -282,6 +331,11 @@ class AsyncIOProcManager:
             queue.Queue() for _ in range(proc_num)
         ]
         self.kv_output_threads: list[threading.Thread] = []
+        self.rpc_output_addrs = [get_open_zmq_ipc_path() for _ in range(proc_num)]
+        self.rpc_outputs_queues: list[queue.Queue] = [
+            queue.Queue() for _ in range(proc_num)
+        ]
+        self.rpc_output_threads: list[threading.Thread] = []
 
         for i in range(proc_num):
             label = f"ModelRunner{i}/{proc_num}"
@@ -301,6 +355,7 @@ class AsyncIOProcManager:
                     self.all_ranks_barrier,
                     *args,
                 ),
+                kwargs={"rpc_output_addr": self.rpc_output_addrs[i]},
             )
             process.start()
             self.procs.append(process)
@@ -328,6 +383,16 @@ class AsyncIOProcManager:
             t.start()
             self.kv_output_threads.append(t)
 
+        for i, output_addr in enumerate(self.rpc_output_addrs):
+            t = threading.Thread(
+                target=self.process_rpc_output_sockets,
+                name=f"{self.label}_rpc_output_thread_{i}",
+                args=(output_addr, i),
+                daemon=True,
+            )
+            t.start()
+            self.rpc_output_threads.append(t)
+
         self.monitor_procs()
 
     def exit(self):
@@ -343,6 +408,8 @@ class AsyncIOProcManager:
         self.procs = []
         self.output_thread.join(timeout=1)
         for thread in self.kv_output_threads:
+            thread.join(timeout=0.5)
+        for thread in self.rpc_output_threads:
             thread.join(timeout=0.5)
         logger.info(f"{self.label}: All runners are shutdown.")
         self.outputs_queue.put_nowait(SystemExit())
@@ -397,6 +464,22 @@ class AsyncIOProcManager:
             output_socket.close(linger=0)
             logger.debug(f"{self.label}: kv output thread {worker_id} exit")
 
+    def process_rpc_output_sockets(self, output_address: str, worker_id: int):
+        """Receive collective RPC acknowledgements from one TP worker."""
+        output_socket = make_zmq_socket(self.zmq_ctx, output_address, zmq.PULL)
+        try:
+            poller = zmq.Poller()
+            poller.register(output_socket, zmq.POLLIN)
+            while self.still_running:
+                socks = poller.poll(timeout=1000)
+                if not socks:
+                    continue
+                obj = pickle.loads(output_socket.recv(copy=False))
+                self.rpc_outputs_queues[worker_id].put_nowait(obj)
+        finally:
+            output_socket.close(linger=0)
+            logger.debug(f"{self.label}: RPC output thread {worker_id} exit")
+
     def call_func(self, func_name: str, *args, wait_out: bool = False):
         """Standard RPC call for non-KV operations."""
         logger.debug(f"{self.label}: call_func {func_name} {args}")
@@ -407,6 +490,96 @@ class AsyncIOProcManager:
             if isinstance(ret, SystemExit):
                 raise ret
             return ret
+
+    @staticmethod
+    def _rpc_transport_failure(
+        request_id: str, tp_rank: int, message: str
+    ) -> WorkerRPCResponse:
+        return WorkerRPCResponse.failure(
+            request_id, tp_rank, RPCErrorInfo.transport(message)
+        )
+
+    def collective_rpc(
+        self,
+        request: CollectiveRPCRequest,
+    ) -> list[WorkerRPCResponse]:
+        """Execute a method on every TP runner and collect rank-ordered replies."""
+        if not isinstance(request, CollectiveRPCRequest):
+            raise TypeError("collective RPC request must be CollectiveRPCRequest")
+
+        self.rpc_broadcast_mq.enqueue((COLLECTIVE_RPC_COMMAND, request))
+
+        responses: list[WorkerRPCResponse] = []
+        for tp_rank, output_queue in enumerate(self.rpc_outputs_queues):
+            while True:
+                try:
+                    response = output_queue.get_nowait()
+                except queue.Empty:
+                    response = None
+
+                if response is None:
+                    if tp_rank >= len(self.procs) or not self.procs[tp_rank].is_alive():
+                        responses.append(
+                            self._rpc_transport_failure(
+                                request.request_id,
+                                tp_rank,
+                                f"TP worker {tp_rank} is not alive",
+                            )
+                        )
+                        break
+
+                    remaining = request.remaining_timeout()
+                    if remaining is None:
+                        wait_s = 1.0
+                    else:
+                        if remaining <= 0:
+                            responses.append(
+                                self._rpc_transport_failure(
+                                    request.request_id,
+                                    tp_rank,
+                                    f"RPC method {request.method!r} timed out "
+                                    f"on TP worker {tp_rank}",
+                                )
+                            )
+                            break
+                        wait_s = min(1.0, remaining)
+
+                    try:
+                        response = output_queue.get(timeout=wait_s)
+                    except queue.Empty:
+                        continue
+
+                if not isinstance(response, WorkerRPCResponse):
+                    responses.append(
+                        self._rpc_transport_failure(
+                            request.request_id,
+                            tp_rank,
+                            f"invalid RPC response type: {type(response).__name__}",
+                        )
+                    )
+                    break
+                if response.request_id != request.request_id:
+                    logger.warning(
+                        "%s: dropping stale RPC response for request %s while waiting for %s",
+                        self.label,
+                        response.request_id,
+                        request.request_id,
+                    )
+                    continue
+                if response.tp_rank != tp_rank:
+                    responses.append(
+                        self._rpc_transport_failure(
+                            request.request_id,
+                            tp_rank,
+                            "RPC response rank mismatch: "
+                            f"expected {tp_rank}, got {response.tp_rank}",
+                        )
+                    )
+                else:
+                    responses.append(response)
+                break
+
+        return responses
 
     def call_func_with_aggregation(self, func_name: str, *args, timeout: float = 10.0):
         """RPC call with KV output aggregation across all workers.

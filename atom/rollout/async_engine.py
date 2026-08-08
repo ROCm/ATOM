@@ -4,7 +4,7 @@
 import logging
 
 from atom.model_engine.llm_engine import LLMEngine
-from atom.rollout.weight_sync import load_weights_via_shm, load_weights_via_ipc
+from atom.rollout.weight_sync import load_weights_via_ipc, load_weights_via_shm
 
 logger = logging.getLogger("atom")
 
@@ -30,6 +30,26 @@ class AsyncLLMEngine(LLMEngine):
             "atom.rollout.model_runner_ext.RLHFModelRunner",
         )
         super().__init__(model, **kwargs)
+
+    def collective_rpc(
+        self,
+        method: str,
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict | None = None,
+    ) -> list:
+        """Execute a control-plane method on every DP/TP model runner.
+
+        The return order is DP-major, then TP rank. This API is intended for
+        small control messages; bulk tensors should use the weight-sync data
+        plane instead.
+        """
+        return self.core_mgr.collective_rpc(
+            method=method,
+            timeout=timeout,
+            args=args,
+            kwargs=kwargs,
+        )
 
     def sleep(self, level: int = 1):
         """Release GPU resources.

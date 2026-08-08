@@ -125,6 +125,28 @@ class EngineUtilityHandler:
         )
         logger.info(f"{self.label}: update_weights completed, updated={result}")
 
+    def _handle_collective_rpc(self, args: dict):
+        """Fan a generic control-plane call out to every local TP runner."""
+        request = args.get("request")
+        if not isinstance(request, CollectiveRPCRequest):
+            raise TypeError("collective RPC utility payload has no valid request")
+
+        try:
+            tp_responses = self.runner_mgr.collective_rpc(request)
+            response = EngineCoreRPCResponse.success(
+                request,
+                tp_world_size=self.runner_mgr.proc_num,
+                tp_responses=tp_responses,
+            )
+        except Exception as exc:
+            response = EngineCoreRPCResponse.failure(
+                request.request_id,
+                request.method,
+                RPCErrorInfo.from_exception(exc),
+            )
+
+        self.output_queue.put_nowait(("UTILITY_RESPONSE", response))
+
     def _handle_update_weights_shm(self, args: dict):
         """Handle shared-memory weight update command.
 
