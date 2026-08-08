@@ -6,21 +6,19 @@
 
 """Build MiniMax-H3's Qwen presentation token stream.
 
-H3 does **not** use a chat template. It builds the conditioning sequence
-explicitly:
+H3 does **not** use a chat template; it builds the sequence explicitly:
 
-    t2va   prompt                                       (verbatim, no specials)
-    fl2va  "<Picture 1>: " + vision-block + [ "<Picture 2>: " + block ] + prompt
-    ref2va per-condition labels ("<Picture i>: " / "<Audio j>: ") + prompt
+    t2va   prompt (verbatim, no special tokens)
+    fl2va  "<Picture i>: " + vision block, per keyframe, then the prompt
+    ref2va per-condition labels ("<Picture i>: " / "<Audio j>: "), then prompt
 
-A vision block is ``<|vision_start|>`` + N x pad token + ``<|vision_end|>``.
-Everything in a vision block is tagged VIDEO(0); everything else TEXT(1), and
-those tags become the DiT's AdaLN modality gather for the text region.
+A vision block is ``<|vision_start|>`` + N pad tokens + ``<|vision_end|>``,
+tagged VIDEO(0); everything else TEXT(1). Those tags feed the DiT's AdaLN
+modality gather.
 
-Using ``apply_chat_template`` instead produces a *plausible* sequence with the
-right image span but the wrong wrapper -- measured 3/1010/18 tokens against the
-reference's 6/1010/13 -- so ids and tags must be built here, together, to stay
-aligned.
+``apply_chat_template`` gives a plausible sequence with the right image span and
+the wrong wrapper -- measured 3/1010/18 tokens against the reference's
+6/1010/13 -- so ids and tags are built here together, to stay aligned.
 """
 
 from collections.abc import Sequence

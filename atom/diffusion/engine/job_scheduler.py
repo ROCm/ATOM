@@ -80,11 +80,8 @@ class JobScheduler:
             if not self.has_capacity:
                 return None
             job = self.waiting.popleft()
-            # Any terminal state, not just ABORTED. A queued job can also be
-            # FAILED before it ever starts -- a rank dying takes the whole
-            # replica with it -- and dispatching that job would flip it back to
-            # RUNNING, hiding the failure and leaving the caller polling a
-            # replica that no longer exists.
+            # Any terminal state, not just ABORTED: a rank dying FAILs queued
+            # jobs too, and dispatching one would flip it back to RUNNING.
             if job.is_finished:
                 self.finished[job.job_id] = job
                 logger.info(

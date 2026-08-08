@@ -39,21 +39,14 @@ def load_minimax_h3_dit_weights(
     device: torch.device | str = "cpu",
     strict: bool = True,
 ) -> int:
-    """Load a MiniMax-H3 DiT checkpoint into ``model``.
+    """Load a DiT from safetensors shards, applying the QKV reorder.
 
-    Parameter names map 1:1 onto the module tree (verified: 535/535 with no
-    shape mismatches), so the only transformations are:
+    The checkpoint stores QKV **interleaved per query group**, not as [Q;K;V]:
+    ``num_query_groups`` blocks of ``(heads_per_group + 2) * head_dim`` rows. A
+    plain three-way split of the fused tensor is silently wrong.
 
-    * ``*.attn.qkv_proj.weight`` -- the checkpoint stores QKV interleaved
-      **per head** as ``[q, k, v]`` repeated (MHA, one head per group), while
-      the module wants ``[Q_all; K_all; V_all]``. Both layouts have identical
-      shape, so nothing downstream will catch a missed reorder -- it just
-      scrambles attention. Always reorder.
-    * dtype -- each tensor is cast to whatever its destination parameter uses,
-      which preserves the checkpoint's deliberately mixed fp32/bf16 precision
-      (patch projections, timestep embedding and output heads are fp32).
-
-    Returns the number of tensors loaded.
+    Fails loudly on any missing or unexpected tensor -- a partially loaded DiT
+    produces plausible noise rather than an error.
     """
     from safetensors import safe_open
 

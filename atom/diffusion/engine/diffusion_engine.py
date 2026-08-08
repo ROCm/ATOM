@@ -3,16 +3,10 @@
 
 """User-facing diffusion engine: submit a job, poll it, collect the file.
 
-Mirrors ``atom.model_engine.llm_engine.LLMEngine``'s role, but the API shape
-follows from the workload rather than from the LLM one. A generation takes
-minutes, so there is nothing to stream and blocking is the wrong default: the
-engine hands back a job id immediately and the caller polls. That is also the
-shape the OpenAI ``/v1/videos`` contract expects.
-
-Concurrency: exactly one job is in flight per replica, because the resident DiT
-plus activations own the GPU. Admission is the :class:`JobScheduler`'s
-business, and it *rejects* past the queue cap rather than queueing -- with
-4-minute jobs an unbounded queue is an unbounded invisible wait.
+``LLMEngine``'s role, with an API shape that follows the workload: a generation
+takes minutes, so there is nothing to stream and the engine hands back a job id
+immediately. One job in flight per replica -- the resident DiT plus activations
+own the GPU -- and admission *rejects* past the queue cap rather than queueing.
 """
 
 import logging

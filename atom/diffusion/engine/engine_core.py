@@ -3,21 +3,13 @@
 
 """Per-rank GPU worker for diffusion serving.
 
-Plays the role of ``atom.model_engine.engine_core.EngineCore``, with the
-scheduling loop removed: a diffusion replica runs one job at a time, so the
-worker is a straight receive-run-reply loop and admission lives in the API
-process where the queue is observable.
+``atom.model_engine.engine_core.EngineCore``'s role minus the scheduling loop:
+a replica runs one job at a time, so this is a receive-run-reply loop and
+admission lives in the API process where the queue is observable.
 
-The two structural facts that shape everything here:
-
-* **Ulysses is collective.** Every rank must enter every job, in the same
-  order. A rank that skips one -- because it saw an abort the others did not,
-  or because its socket dropped a message -- does not fall behind, it hangs the
-  replica in an all-to-all. So aborts are only honoured *between* jobs, and the
-  loop never conditionally skips a received ADD.
-* **Only rank 0 has a result.** It is the rank that decodes and muxes. The
-  others report READY and errors, and stay silent otherwise, so the API process
-  does not have to deduplicate N identical completions.
+Ulysses is collective, so every rank enters every job in the same order --
+aborts are honoured only *between* jobs and the loop never skips a received ADD.
+Only rank 0 has a result; the others report READY and errors and stay silent.
 """
 
 import logging

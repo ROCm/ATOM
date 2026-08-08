@@ -3,21 +3,13 @@
 
 """MiniMax-H3 text conditioning: Qwen3-VL truncated at layer 50.
 
-H3 does not use a pooled sentence embedding. It consumes the **unnormalized
-hidden state immediately after language-model layer 49** -- i.e.
-``hidden_states[50]`` -- as a ``[T, 5120]`` sequence, which the DiT's
-``condition_proj`` widens to 5376 and the 2-layer token refiner then processes.
+H3 consumes ``hidden_states[50]`` -- the *unnormalized* state after LM layer 49
+-- as a ``[T, 5120]`` sequence, not a pooled vector.
 
-Two consequences worth stating, because both are silent if wrong:
-
-* the checkpoint ships 64 language layers but only the first 50 matter, so we
-  truncate rather than materialise a full 66 GB encoder;
-* the selected state must be taken **before** the final norm. This is the
-  subtle part: transformers appends the *post-norm* activation as the **last**
-  entry of ``hidden_states``. Truncating to exactly 50 layers therefore makes
-  ``hidden_states[50]`` that normalised entry -- measured cos-sim 0.78 against
-  the reference. Loading **51** layers keeps index 50 an intermediate, i.e.
-  the raw output of layer 49, and costs one extra layer instead of fourteen.
+The trap: transformers appends the *post-norm* activation as the last entry of
+``hidden_states``, so truncating to exactly 50 layers makes index 50 that
+normalised entry (measured cos 0.78 against the reference). Load **51** layers
+to keep index 50 an intermediate -- one extra layer instead of fourteen.
 """
 
 import contextlib
@@ -106,13 +98,11 @@ class MiniMaxH3TextEncoder:
 
     @torch.no_grad()
     def encode(self, prompt: str, images: Any | list | None = None) -> torch.Tensor:
-        """Prompt (optionally with a keyframe) -> ``[T, 5120]`` rows.
+        """Prompt (optionally with keyframes) -> ``[T, 5120]`` rows.
 
-        For fl2va the keyframe goes through Qwen3-VL's *vision tower* as part
-        of the prompt -- it is not only VAE-encoded. Those image tokens occupy
-        real positions in the conditioning sequence (1010 of them for a
-        1344x768 anchor) and must be tagged VIDEO downstream; see
-        :meth:`encode_with_tags`.
+        For fl2va the keyframe also goes through Qwen3-VL's vision tower, so it
+        occupies real positions in the conditioning sequence and must be tagged
+        VIDEO downstream; see :meth:`encode_with_tags`.
         """
         rows, _ = self.encode_with_tags(prompt, images)
         return rows
@@ -174,10 +164,9 @@ class MiniMaxH3TextEncoder:
         ids = input_ids.to(device=self.device, dtype=torch.long)
         batch: dict[str, Any] = {"input_ids": ids.unsqueeze(0)}
         if pixel_values is not None or pixel_values_videos is not None:
-            # Building input_ids by hand means the processor never emits
-            # mm_token_type_ids, and Qwen3-VL raises rather than guessing where
-            # multimodal RoPE applies. Mark exactly the pad positions -- the
-            # vision_start/end markers are ordinary text tokens.
+            # Hand-built input_ids means no mm_token_type_ids from the
+            # processor, and Qwen3-VL raises rather than guess. Mark exactly the
+            # pad positions -- vision_start/end are ordinary text tokens.
             from atom.diffusion.stages.minimax_h3.presentation import (
                 IMAGE_PAD,
                 VIDEO_PAD,
@@ -233,11 +222,8 @@ class MiniMaxH3TextEncoder:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return ``(rows [T, 5120], token_tags [T])`` for t2va / fl2va.
 
-        H3 builds its conditioning sequence explicitly rather than through a
-        chat template -- see
-        :mod:`atom.diffusion.stages.minimax_h3.presentation`. Tags mark the
-        vision blocks as VIDEO so the DiT's AdaLN gather treats those positions
-        as image, not text.
+        Tags mark vision blocks as VIDEO so the DiT's AdaLN gather treats those
+        positions as image, not text.
         """
         from atom.diffusion.stages.minimax_h3.presentation import (
             multi_image_presentation,

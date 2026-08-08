@@ -45,13 +45,12 @@ class PipelineRunner:
     # ------------------------------------------------------------------
 
     def place_components(self) -> None:
-        """Move every registered component to the device.
+        """Move every component to the device, and verify it landed.
 
-        Resident placement only. This is the step whose *absence* silently
-        wrecked the sglang baseline on ROCm: platform detection failed, the
-        runtime initialised with ``device=cpu``, and the model loaded to host
-        RAM with no error until the first matmul. So placement asserts rather
-        than trusts.
+        Asserts rather than trusts ``.to()``: this is the step whose absence
+        wrecked the sglang baseline on ROCm, where platform detection failed,
+        the runtime initialised with ``device=cpu`` and the model loaded to host
+        RAM with no error until the first matmul.
         """
         if self.config.performance_mode is not PerformanceMode.SPEED:
             raise NotImplementedError(

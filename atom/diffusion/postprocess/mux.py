@@ -23,12 +23,11 @@ AUDIO_CHANNELS = 2
 
 
 def frames_to_uint8(frames: torch.Tensor) -> np.ndarray:
-    """``[B, C, T, H, W]`` in **[0, 1]** -> ``[T, H, W, 3]`` uint8.
+    """``[T, H, W, 3]`` uint8 from a float tensor in **[0, 1]**.
 
-    [0, 1] is what ``denormalize_pixels`` produces, matching the reference's
-    ``transform_rev(x).clamp(0, 1)``. Do not feed raw decoder output here: it
-    is still in the model's ImageNet-normalized pixel space and must be
-    denormalized per channel first.
+    [0, 1], not [-1, 1]: the VAE's ``transform_rev`` already returns display
+    range. Assuming [-1, 1] here halves contrast and lifts black, which is
+    structurally invisible and cost ~22 dB before it was found.
     """
     if frames.ndim == 5:
         if int(frames.shape[0]) != 1:

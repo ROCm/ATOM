@@ -63,10 +63,8 @@ def build_parser() -> argparse.ArgumentParser:
 def config_from_args(args: argparse.Namespace) -> DiffusionConfig:
     import os
 
-    # H3 ships two ~135 GiB partitions under one root and they are separate
-    # replicas, so the variant resolves to a path rather than to a runtime
-    # branch. Accept either spelling: --model /root --model-variant FL2VA, or
-    # --model /root/FL2VA.
+    # Partitions are separate replicas, so the variant is a path, not a runtime
+    # branch. Accept --model /root --model-variant FL2VA or --model /root/FL2VA.
     model_path = args.model
     if args.model_variant:
         candidate = os.path.join(args.model, args.model_variant)

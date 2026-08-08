@@ -90,12 +90,11 @@ def reorder_grouped_qkv_to_qkv(
     heads_per_group: int,
     head_dim: int,
 ) -> torch.Tensor:
-    """Convert the checkpoint's interleaved grouped QKV into [Q; K; V].
+    """Reorder the checkpoint's interleaved-grouped QKV into [Q; K; V].
 
-    The checkpoint stores qkv as ``num_query_groups`` blocks of
-    ``(heads_per_group + 2) * head_dim`` rows -- i.e. Q heads then one K head
-    then one V head, repeated. A naive three-way split of the fused tensor is
-    silently wrong.
+    The checkpoint stores ``num_query_groups`` blocks of
+    ``(heads_per_group + 2) * head_dim`` rows, so a plain three-way split of the
+    fused tensor is silently wrong.
     """
     per_group = (heads_per_group + 2) * head_dim
     expected_out = num_query_groups * per_group
@@ -206,10 +205,8 @@ class MiniMaxH3Rope(nn.Module):
 
     def __init__(self, inv_freq_len: int) -> None:
         super().__init__()
-        # Initialised, not left as torch.empty: the checkpoint always supplies
-        # this buffer, but an unloaded model would otherwise read uninitialised
-        # memory and emit NaN velocities intermittently -- a failure that looks
-        # like a sampler bug and reproduces only sometimes.
+        # Initialised, not torch.empty: an unloaded model would otherwise read
+        # uninitialised memory and emit NaN velocities intermittently.
         index = torch.arange(inv_freq_len, dtype=_FP32)
         self.register_buffer(
             "inv_freq",
