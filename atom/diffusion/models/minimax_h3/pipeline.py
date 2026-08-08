@@ -25,45 +25,30 @@ import os
 import torch
 
 from atom.diffusion.config import DiffusionConfig
-from atom.diffusion.models.schedulers.euler_ancestral_h3 import (
-    MiniMaxH3EulerAncestralEta0Scheduler,
-)
-from atom.diffusion.models.vaes.minimax_h3 import (
-    decode_audio_rows,
-    decode_video_rows,
-    latent_stats,
-)
-from atom.diffusion.pipelines.base import ComposedPipeline
-from atom.diffusion.postprocess.mux import write_video_with_audio
-from atom.diffusion.stages.base import (
-    DiffusionBatch,
-    PipelineStage,
-    StageParallelism,
-)
-from atom.diffusion.stages.minimax_h3.condition_noise import (
+from atom.diffusion.models.minimax_h3.condition_noise import (
     MINIMAX_H3_IMGVID_COND_TIMESTEP,
     imgvid_cond_noise_aug_rows,
 )
-from atom.diffusion.stages.minimax_h3.denoise import run_denoise_loop
-from atom.diffusion.stages.minimax_h3.geometry import (
+from atom.diffusion.models.minimax_h3.denoise import run_denoise_loop
+from atom.diffusion.models.minimax_h3.geometry import (
     VAE_SPATIAL_COMPRESSION,
     MiniMaxH3Geometry,
     align_frame_count,
     time_shift_sigmas,
 )
-from atom.diffusion.stages.minimax_h3.keyframe import (
+from atom.diffusion.models.minimax_h3.keyframe import (
     encode_keyframe_cond_rows,
     prepare_keyframe_canvas,
     stretch_keyframe_canvas,
 )
-from atom.diffusion.stages.minimax_h3.latent_prep import build_initial_latents
-from atom.diffusion.stages.minimax_h3.packed_sequence import (
+from atom.diffusion.models.minimax_h3.latent_prep import build_initial_latents
+from atom.diffusion.models.minimax_h3.packed_sequence import (
     build_packed_sequence,
     build_packed_sequence_ref2va,
     validate_keyframe_signature,
 )
-from atom.diffusion.stages.minimax_h3.presentation import ref2va_presentation
-from atom.diffusion.stages.minimax_h3.reference_encoding import (
+from atom.diffusion.models.minimax_h3.presentation import ref2va_presentation
+from atom.diffusion.models.minimax_h3.reference_encoding import (
     AUDIO_SAMPLE_RATE,
     decode_reference_video_frames,
     encode_reference_audio_rows,
@@ -71,6 +56,21 @@ from atom.diffusion.stages.minimax_h3.reference_encoding import (
     resize_reference_image,
     resolve_reference_image_shape,
     sample_reference_video_frames,
+)
+from atom.diffusion.models.minimax_h3.scheduler import (
+    MiniMaxH3EulerAncestralEta0Scheduler,
+)
+from atom.diffusion.models.minimax_h3.vae import (
+    decode_audio_rows,
+    decode_video_rows,
+    latent_stats,
+)
+from atom.diffusion.mux import write_video_with_audio
+from atom.diffusion.pipeline import (
+    ComposedPipeline,
+    DiffusionBatch,
+    PipelineStage,
+    StageParallelism,
 )
 
 logger = logging.getLogger(__name__)
@@ -791,11 +791,11 @@ class MiniMaxH3Pipeline(ComposedPipeline):
         """
         import torch
 
-        from atom.diffusion.configs.minimax_h3 import MiniMaxH3DiTArchConfig
-        from atom.diffusion.models.dits.minimax_h3 import MiniMaxH3DiTModel
-        from atom.diffusion.models.encoders.minimax_h3_text import MiniMaxH3TextEncoder
-        from atom.diffusion.models.loader import load_minimax_h3_dit_weights
-        from atom.diffusion.models.vaes.minimax_h3 import load_checkpoint_vae
+        from atom.diffusion.models.minimax_h3.arch import MiniMaxH3DiTArchConfig
+        from atom.diffusion.models.minimax_h3.dit import MiniMaxH3DiTModel
+        from atom.diffusion.models.minimax_h3.loader import load_minimax_h3_dit_weights
+        from atom.diffusion.models.minimax_h3.text_encoder import MiniMaxH3TextEncoder
+        from atom.diffusion.models.minimax_h3.vae import load_checkpoint_vae
 
         root = self.model_root or self.config.model_path
         if not root:

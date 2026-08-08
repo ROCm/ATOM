@@ -14,12 +14,12 @@ import time
 from typing import TYPE_CHECKING
 
 from atom.diffusion.config import DiffusionConfig, PerformanceMode
-from atom.diffusion.distributed.ulysses import UlyssesGroup
+from atom.diffusion.pipeline import DiffusionBatch
 from atom.diffusion.request import DiffusionJob
-from atom.diffusion.stages.base import DiffusionBatch
+from atom.diffusion.ulysses import UlyssesGroup
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from atom.diffusion.pipelines.base import ComposedPipeline
+    from atom.diffusion.pipeline import ComposedPipeline
 
 logger = logging.getLogger(__name__)
 

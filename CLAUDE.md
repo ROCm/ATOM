@@ -48,8 +48,9 @@ Key entry points:
 - Ops: `atom/model_ops/` — AITER kernel wrappers (linear, attention, fused_moe)
 - Config: `atom/config.py` (Config, KVCacheConfig, CompilationConfig)
 - Env vars: `atom/utils/envs.py` (all `ATOM_*` variable definitions)
-- Diffusion: `atom/diffusion/` — server `entrypoints/diffusion_server.py`, models
-  `models/`, H3 stages `stages/minimax_h3/`. Install extras: `pip install -e ".[diffusion]"`
+- Diffusion: `atom/diffusion/` — framework at the top level (`pipeline.py`,
+  `attention.py`, `ulysses.py`), engine in `engine/`, server in `entrypoints/`,
+  and one package per model in `models/<family>/`. Extras: `pip install -e ".[diffusion]"`
 
 ## Critical Rules
 

@@ -37,16 +37,16 @@ from typing import Any
 import torch
 from torch import nn
 
-from atom.diffusion.configs.minimax_h3 import (
-    MINIMAX_H3_ADALN_MODALITY_NUM,
-    MiniMaxH3DiTArchConfig,
-)
-from atom.diffusion.distributed.ulysses import UlyssesGroup
-from atom.diffusion.layers.attention import (
+from atom.diffusion.attention import (
     AttentionBackend,
     packed_varlen_attention,
     resolve_attention_backend,
 )
+from atom.diffusion.models.minimax_h3.arch import (
+    MINIMAX_H3_ADALN_MODALITY_NUM,
+    MiniMaxH3DiTArchConfig,
+)
+from atom.diffusion.ulysses import UlyssesGroup
 
 _BF16 = torch.bfloat16
 _FP32 = torch.float32
@@ -297,7 +297,7 @@ class MiniMaxH3Attention(nn.Module):
     ) -> torch.Tensor:
         """Non-causal varlen attention over the packed sequence.
 
-        Backend choice lives in :mod:`atom.diffusion.layers.attention`; ASM is
+        Backend choice lives in :mod:`atom.diffusion.attention`; ASM is
         the default and Triton is what reproduces the sglang reference exactly.
         """
         return packed_varlen_attention(

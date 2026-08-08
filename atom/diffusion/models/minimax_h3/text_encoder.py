@@ -149,7 +149,7 @@ class MiniMaxH3TextEncoder:
         """Run a prebuilt presentation through Qwen3-VL -> ``[T, 5120]`` rows.
 
         The caller owns the token stream (see
-        :mod:`atom.diffusion.stages.minimax_h3.presentation`), which is the
+        :mod:`atom.diffusion.models.minimax_h3.presentation`), which is the
         whole point: fl2va and ref2va differ only in how the stream is built.
         """
         if input_ids.dim() != 1:
@@ -167,7 +167,7 @@ class MiniMaxH3TextEncoder:
             # Hand-built input_ids means no mm_token_type_ids from the
             # processor, and Qwen3-VL raises rather than guess. Mark exactly the
             # pad positions -- vision_start/end are ordinary text tokens.
-            from atom.diffusion.stages.minimax_h3.presentation import (
+            from atom.diffusion.models.minimax_h3.presentation import (
                 IMAGE_PAD,
                 VIDEO_PAD,
             )
@@ -225,7 +225,7 @@ class MiniMaxH3TextEncoder:
         Tags mark vision blocks as VIDEO so the DiT's AdaLN gather treats those
         positions as image, not text.
         """
-        from atom.diffusion.stages.minimax_h3.presentation import (
+        from atom.diffusion.models.minimax_h3.presentation import (
             multi_image_presentation,
             text_only_presentation,
         )

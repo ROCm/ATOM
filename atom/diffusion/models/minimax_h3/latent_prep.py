@@ -20,7 +20,7 @@ reference for the same seed, and there is nothing downstream to catch it:
 
 import torch
 
-from atom.diffusion.stages.minimax_h3.packed_tokens import patchify_video_latent
+from atom.diffusion.models.minimax_h3.packed_tokens import patchify_video_latent
 
 DEFAULT_SEED = 42
 VIDEO_LATENT_CHANNELS = 24

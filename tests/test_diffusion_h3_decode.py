@@ -11,12 +11,12 @@ cropping, frame quantisation and the container contract.
 import pytest
 import torch
 
-from atom.diffusion.models.vaes.minimax_h3 import (
+from atom.diffusion.models.minimax_h3.vae import (
     crop_to_canvas,
     denormalize_latents,
     denormalize_pixels,
 )
-from atom.diffusion.postprocess.mux import frames_to_uint8, write_video_with_audio
+from atom.diffusion.mux import frames_to_uint8, write_video_with_audio
 
 av = pytest.importorskip("av", reason="PyAV needed for the mux tests")
 

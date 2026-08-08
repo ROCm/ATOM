@@ -13,13 +13,13 @@ import os
 import pytest
 import torch
 
-from atom.diffusion.layers.attention import (
+from atom.diffusion.attention import (
+    ATTENTION_BACKEND_ENV,
     AttentionBackend,
     packed_varlen_attention,
     resolve_attention_backend,
 )
-from atom.diffusion.layers.attention.backend import ATTENTION_BACKEND_ENV
-from atom.diffusion.models.dits.minimax_h3 import MiniMaxH3DiTModel
+from atom.diffusion.models.minimax_h3.dit import MiniMaxH3DiTModel
 from tests.test_diffusion_minimax_h3 import tiny_arch
 
 

@@ -25,7 +25,7 @@ from collections.abc import Sequence
 
 import torch
 
-from atom.diffusion.stages.minimax_h3.packed_tokens import patchify_video_latent
+from atom.diffusion.models.minimax_h3.packed_tokens import patchify_video_latent
 
 # Both are timesteps *and* mixing coefficients; see the module docstring.
 MINIMAX_H3_IMGVID_COND_TIMESTEP = 0.999

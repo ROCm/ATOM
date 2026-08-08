@@ -25,16 +25,16 @@ import torch
 import torch.distributed as dist
 
 from atom.diffusion.config import ComponentConfig, DiffusionConfig
-from atom.diffusion.distributed.ulysses import UlyssesGroup
 from atom.diffusion.engine.job_scheduler import JobScheduler
 from atom.diffusion.engine.pipeline_runner import PipelineRunner
-from atom.diffusion.pipelines.base import ComposedPipeline
-from atom.diffusion.request import DiffusionJob
-from atom.diffusion.stages.base import (
+from atom.diffusion.pipeline import (
+    ComposedPipeline,
     DiffusionBatch,
     PipelineStage,
     StageParallelism,
 )
+from atom.diffusion.request import DiffusionJob
+from atom.diffusion.ulysses import UlyssesGroup
 
 logger = logging.getLogger(__name__)
 

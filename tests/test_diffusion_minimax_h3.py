@@ -12,8 +12,8 @@ against /md0/dit_golden.
 import pytest
 import torch
 
-from atom.diffusion.configs.minimax_h3 import MiniMaxH3DiTArchConfig
-from atom.diffusion.models.dits.minimax_h3 import (
+from atom.diffusion.models.minimax_h3.arch import MiniMaxH3DiTArchConfig
+from atom.diffusion.models.minimax_h3.dit import (
     MiniMaxH3DiTModel,
     reorder_grouped_qkv_to_qkv,
 )
@@ -248,7 +248,7 @@ def test_rope_inv_freq_is_initialised_not_uninitialised_memory():
     """The checkpoint always supplies this buffer, but a model built without
     weights must still be well-defined: torch.empty here produced NaN
     velocities on roughly one run in fifteen."""
-    from atom.diffusion.models.dits.minimax_h3 import MiniMaxH3Rope
+    from atom.diffusion.models.minimax_h3.dit import MiniMaxH3Rope
 
     rope = MiniMaxH3Rope(16)
     assert bool(torch.isfinite(rope.inv_freq).all())

@@ -11,7 +11,7 @@ context's restore behaviour.
 import pytest
 import torch
 
-from atom.diffusion.stages.minimax_h3.reference_encoding import (
+from atom.diffusion.models.minimax_h3.reference_encoding import (
     QWEN_TEMPORAL_PATCH,
     REFERENCE_IMAGE_MULTIPLE,
     REFERENCE_IMAGE_SHORT_EDGE,

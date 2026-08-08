@@ -32,7 +32,7 @@ from atom.diffusion.request import DiffusionJob, JobStatus
 def make_config(**kwargs) -> DiffusionConfig:
     defaults = {
         "model_path": "<test>",
-        "pipeline_class": "atom.diffusion.pipelines.minimax_h3.MiniMaxH3Pipeline",
+        "pipeline_class": "atom.diffusion.models.minimax_h3.pipeline.MiniMaxH3Pipeline",
         "components": [
             ComponentConfig(name="transformer", class_path="torch.nn.Identity")
         ],
@@ -204,10 +204,10 @@ def test_shutdown_sets_the_loop_flag():
 
 
 def test_pipeline_class_resolves_from_a_dotted_path():
-    from atom.diffusion.pipelines.minimax_h3 import MiniMaxH3Pipeline
+    from atom.diffusion.models.minimax_h3.pipeline import MiniMaxH3Pipeline
 
     resolved = resolve_pipeline_class(
-        "atom.diffusion.pipelines.minimax_h3.MiniMaxH3Pipeline"
+        "atom.diffusion.models.minimax_h3.pipeline.MiniMaxH3Pipeline"
     )
     assert resolved is MiniMaxH3Pipeline
 
@@ -606,7 +606,7 @@ def test_a_model_path_that_already_names_the_partition_is_left_alone(tmp_path):
 def test_the_pipeline_base_takes_a_model_root():
     """The worker builds whatever pipeline the config names, so it cannot pass
     a kwarg only one subclass accepts."""
-    from atom.diffusion.pipelines.minimax_h3 import MiniMaxH3Pipeline
+    from atom.diffusion.models.minimax_h3.pipeline import MiniMaxH3Pipeline
 
     config = make_config(model_path="/data/root")
     assert MiniMaxH3Pipeline(config).model_root == "/data/root"

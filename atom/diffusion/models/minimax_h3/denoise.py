@@ -17,17 +17,17 @@ from collections.abc import Callable
 
 import torch
 
-from atom.diffusion.configs.minimax_h3 import MINIMAX_H3_ADALN_MODALITY_NUM
-from atom.diffusion.models.schedulers.euler_ancestral_h3 import (
-    MiniMaxH3EulerAncestralEta0Scheduler,
-)
-from atom.diffusion.stages.minimax_h3.condition_noise import (
+from atom.diffusion.models.minimax_h3.arch import MINIMAX_H3_ADALN_MODALITY_NUM
+from atom.diffusion.models.minimax_h3.condition_noise import (
     MINIMAX_H3_AUDIO_REF_COND_TIMESTEP,
     MINIMAX_H3_IMGVID_COND_TIMESTEP,
 )
-from atom.diffusion.stages.minimax_h3.latent_prep import scatter_rows_into_packed
-from atom.diffusion.stages.minimax_h3.packed_sequence import (
+from atom.diffusion.models.minimax_h3.latent_prep import scatter_rows_into_packed
+from atom.diffusion.models.minimax_h3.packed_sequence import (
     build_local_embedding_layout,
+)
+from atom.diffusion.models.minimax_h3.scheduler import (
+    MiniMaxH3EulerAncestralEta0Scheduler,
 )
 
 # Conditioning rows ride max(video_timestep, noise_aug) -- the same coefficient

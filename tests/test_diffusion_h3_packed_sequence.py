@@ -11,7 +11,7 @@ invariants in CI, plus the observed token counts.
 import pytest
 import torch
 
-from atom.diffusion.stages.minimax_h3.packed_sequence import (
+from atom.diffusion.models.minimax_h3.packed_sequence import (
     TAG_AUDIO,
     TAG_PAD,
     TAG_TEXT,

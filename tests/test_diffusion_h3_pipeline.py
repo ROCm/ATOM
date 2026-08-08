@@ -13,11 +13,11 @@ import torch
 from torch import nn
 
 from atom.diffusion.config import ComponentConfig, DiffusionConfig
-from atom.diffusion.configs.minimax_h3 import MiniMaxH3DiTArchConfig
-from atom.diffusion.models.dits.minimax_h3 import MiniMaxH3DiTModel
-from atom.diffusion.pipelines.minimax_h3 import MiniMaxH3Pipeline, PlanStage
+from atom.diffusion.models.minimax_h3.arch import MiniMaxH3DiTArchConfig
+from atom.diffusion.models.minimax_h3.dit import MiniMaxH3DiTModel
+from atom.diffusion.models.minimax_h3.pipeline import MiniMaxH3Pipeline, PlanStage
+from atom.diffusion.pipeline import DiffusionBatch
 from atom.diffusion.request import DiffusionJob
-from atom.diffusion.stages.base import DiffusionBatch
 
 pytest.importorskip("av", reason="PyAV needed to write the MP4")
 
@@ -114,7 +114,7 @@ def build(tmp_path, *, duration=0.5, steps=3):
     torch.manual_seed(20260807)
     config = DiffusionConfig(
         model_path="<test>",
-        pipeline_class="atom.diffusion.pipelines.minimax_h3.MiniMaxH3Pipeline",
+        pipeline_class="atom.diffusion.models.minimax_h3.pipeline.MiniMaxH3Pipeline",
         components=[
             ComponentConfig(name="transformer", class_path="torch.nn.Identity")
         ],
@@ -241,7 +241,7 @@ def test_plan_rejects_geometry_that_cannot_shard(tmp_path):
 def test_pipeline_requires_its_components(tmp_path):
     config = DiffusionConfig(
         model_path="<test>",
-        pipeline_class="atom.diffusion.pipelines.minimax_h3.MiniMaxH3Pipeline",
+        pipeline_class="atom.diffusion.models.minimax_h3.pipeline.MiniMaxH3Pipeline",
         num_gpus=1,
         ulysses_degree=1,
         output_dir=str(tmp_path),

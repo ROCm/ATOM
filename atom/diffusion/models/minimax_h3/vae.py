@@ -22,7 +22,7 @@ from typing import Any
 
 import torch
 
-from atom.diffusion.stages.minimax_h3.packed_tokens import (
+from atom.diffusion.models.minimax_h3.packed_tokens import (
     unpack_audio_tokens,
     unpatchify_video_tokens,
 )
