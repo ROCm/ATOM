@@ -1143,6 +1143,10 @@ class MLAAttention(nn.Module):
         attn_metadata: AttentionMetaData,
         return_lse: bool = False,
     ) -> torch.Tensor:
+        # attn_metadata.causal is True for the target; False only for DSpark's
+        # bidirectional draft block (set by the proposer). The asm kernel picks
+        # a different .co by this flag, so the target must stay causal.
+        causal = attn_metadata.causal
         assert kv_c_and_k_pe_cache.numel() > 0
         assert attn_metadata is not None
         B = q.shape[0]
@@ -1335,6 +1339,7 @@ class MLAAttention(nn.Module):
                 g_kv_indptr=g_kv_indptr,
                 cp_world_size=cp_world_size,
                 cp_rank=cp_rank,
+                causal=causal,
             )
 
         o = self._restore_query_heads(o, num_heads_q)

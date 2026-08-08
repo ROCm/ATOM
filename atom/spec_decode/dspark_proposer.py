@@ -68,6 +68,64 @@ class DSparkProposer(Drafter):
 
         self._blk_dtype_q = None
 
+        # Persistent (ps=1) MLA-decode metadata for the block pass.
+        self._blk_ps_bufs = None
+
+    def _init_block_persistent_buffers(self, dtype_q, dtype_kv):
+        """Allocate the block-pass persistent MLA metadata buffers once.
+
+        Mirrors MLAAttentionBackend's constructor (aiter_mla.py:150-197): the
+        buffer sizes come from get_mla_metadata_info_v1 for this draft's head
+        count / dtypes / block width, and get_mla_metadata_v1 fills them in
+        place each step."""
+        if self._blk_ps_bufs is not None:
+            return self._blk_ps_bufs
+        from atom.model_ops.attentions.aiter_mla import (
+            _MLA_META_SUPPORTS_MAX_SPLIT,
+            get_mla_metadata_info_v1,
+        )
+
+        max_bs = self.config.max_num_seqs
+        # padded_num_heads lives on the draft MLA module (>=_MLA_MIN_HEADS==16),
+        # matching the gqa ratio the asm kernel dispatches on. The ModelRunner
+        # itself has no such attribute.
+        self._blk_padded_heads = self.model.layers[
+            0
+        ].self_attn.mla_attn.impl.padded_num_heads
+        # max_split_per_batch only exists in newer aiter builds; feature-detect
+        # it (as aiter_mla does) so old builds don't hit a TypeError. Cache the
+        # kwargs so the sizing (info) and fill (get_mla_metadata_v1) calls agree.
+        self._blk_split_kwargs = (
+            {"max_split_per_batch": 16} if _MLA_META_SUPPORTS_MAX_SPLIT else {}
+        )
+        (
+            (wmd_sz, wmd_ty),
+            (wip_sz, wip_ty),
+            (wis_sz, wis_ty),
+            (rip_sz, rip_ty),
+            (rfm_sz, rfm_ty),
+            (rpm_sz, rpm_ty),
+        ) = get_mla_metadata_info_v1(
+            max_bs,
+            self.mtp_k,  # max_seqlen_qo = block width T
+            self._blk_padded_heads,
+            dtype_q,
+            dtype_kv,
+            is_sparse=False,
+            fast_mode=True,
+            **self._blk_split_kwargs,
+        )
+        dev = self.device
+        self._blk_ps_bufs = {
+            "work_meta_data": torch.empty(wmd_sz, dtype=wmd_ty, device=dev),
+            "work_indptr": torch.empty(wip_sz, dtype=wip_ty, device=dev),
+            "work_info_set": torch.empty(wis_sz, dtype=wis_ty, device=dev),
+            "reduce_indptr": torch.empty(rip_sz, dtype=rip_ty, device=dev),
+            "reduce_final_map": torch.empty(rfm_sz, dtype=rfm_ty, device=dev),
+            "reduce_partial_map": torch.empty(rpm_sz, dtype=rpm_ty, device=dev),
+        }
+        return self._blk_ps_bufs
+
     def _resolve_dtype_q(self, forward_context) -> "tuple[torch.dtype, bool]":
         """q_out dtype for the draft's MLA decode, read from its bound cache.
 
@@ -409,6 +467,12 @@ class DSparkProposer(Drafter):
         # leave its activations out of the KV budget.
         is_dummy = forward_context.context.is_dummy_run
 
+        # The DSpark draft block is bidirectional: every one of the T draft
+        # positions attends the whole block, so the MLA decode runs non-causal.
+        # The target rebuilds its own metadata (causal defaults True), so this
+        # never leaks back.
+        attn_metadata.causal = False
+
         # ---- 1. Context rows -------------------------------------------------
         if not is_dummy:
             with record_function(f"dspark_ctx_kv[bs={bs} tok={num_tokens}]"):
@@ -463,12 +527,40 @@ class DSparkProposer(Drafter):
             attn_metadata.kv_indices = self._blk_kv_indices
             attn_metadata.kv_last_page_lens = self._blk_last_page_lens[:bs]
 
-            attn_metadata.work_meta_data = None
-            attn_metadata.work_indptr = None
-            attn_metadata.work_info_set = None
-            attn_metadata.reduce_indptr = None
-            attn_metadata.reduce_final_map = None
-            attn_metadata.reduce_partial_map = None
+            # Build persistent (ps=1) MLA-decode metadata
+            from atom.model_ops.attentions.aiter_mla import get_mla_metadata_v1
+
+            dtype_q, _ = self._resolve_dtype_q(forward_context)
+            dtype_kv = dtype_q
+            ps = self._init_block_persistent_buffers(dtype_q, dtype_kv)
+            get_mla_metadata_v1(
+                attn_metadata.cu_seqlens_q,  # seqlens_qo_indptr
+                kv_indptr,  # seqlens_kv_indptr
+                attn_metadata.kv_last_page_lens,  # kv_last_page_lens
+                self._blk_padded_heads,
+                1,  # nhead_kv
+                False,  # is_causal (non-causal block)
+                ps["work_meta_data"],
+                ps["work_info_set"],
+                ps["work_indptr"],
+                ps["reduce_indptr"],
+                ps["reduce_final_map"],
+                ps["reduce_partial_map"],
+                page_size=block_size,
+                kv_granularity=max(block_size, 16),
+                max_seqlen_qo=T,
+                uni_seqlen_qo=T,
+                fast_mode=True,
+                dtype_q=dtype_q,
+                dtype_kv=dtype_kv,
+                **self._blk_split_kwargs,
+            )
+            attn_metadata.work_meta_data = ps["work_meta_data"]
+            attn_metadata.work_indptr = ps["work_indptr"]
+            attn_metadata.work_info_set = ps["work_info_set"]
+            attn_metadata.reduce_indptr = ps["reduce_indptr"]
+            attn_metadata.reduce_final_map = ps["reduce_final_map"]
+            attn_metadata.reduce_partial_map = ps["reduce_partial_map"]
 
         self._refresh_dp_metadata(forward_context, bs * T)
 
