@@ -847,14 +847,12 @@ class MiniMaxH3Pipeline(ComposedPipeline):
         # Staged on the host: it is used once per request and is the largest
         # single component, so co-residency with the DiT is what overflows the
         # card. TextEncodingStage swaps it in for the encode.
-        self.register_component(
-            "text_encoder",
-            MiniMaxH3TextEncoder.from_pretrained(
-                os.path.join(root, "text_encoder"),
-                device="cpu",
-                dtype=torch.bfloat16,
-            ),
+        encoder = MiniMaxH3TextEncoder.from_pretrained(
+            os.path.join(root, "text_encoder"), device="cpu", dtype=torch.bfloat16
         )
+        # Pin now, at load, so the first request does not pay the ~11 s.
+        encoder.prime_host_cache()
+        self.register_component("text_encoder", encoder)
         self.encode_device = device
 
     def verify_components(self) -> None:
