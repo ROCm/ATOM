@@ -244,3 +244,52 @@ it bought instead:
 addressed.** The levers are, in order: profile the prefill node (never done —
 26.0K tok/s is an unexplained number), and rebalance the PD GPU split, since
 decode now has roughly 2x the capacity this workload needs.
+
+---
+
+# The prefill prefix cache was the throughput lever (2026-08-08)
+
+Prefill is the ceiling, and a prefill trace showed nothing structural to reclaim:
+inside a common 4924 ms window all four PP stages ran 91-97% compute-busy with
+idle near zero, and the 18,20,20,20 split left only a 6% compute spread. So the
+only ways to serve more requests are to compute fewer tokens or buy more
+hardware. Computing fewer tokens means a higher prefix-cache hit — and 81% of
+prefill requests were evicting cached blocks.
+
+`PREFILL_GPU_UTIL=0.93` (from 0.85) moves the prefill KV budget 244.79 -> 267.83
+GB per GPU. One config value:
+
+| | before (`gather_opt_c48`) | after (`prefill_util93_c48`) |
+|---|---|---|
+| **output tok/s** | 266.2 | **388.4 (+46%)** |
+| total tok/s | 37,702 | 52,686 |
+| requests served | 1109 | **1558** |
+| **prefix-cache hit** | 30.8% | **53.5%** |
+| prefill tokens actually computed | 94.2M | 88.6M |
+| scheduled prefill batches | 24,000 | 18,983 |
+| TTFT p50 | 158.6 s | 85.6 s |
+| e2e p50 | 177.7 s | 104.8 s |
+| failures | 0 | 0 |
+
+The mechanism is exactly the one the earlier runs implied: prefill compute is a
+fixed budget, and the hit rate decides how many requests that budget buys. Here
+it bought 40% more requests off *less* compute. The hit moved well outside the
+30.8-37.5% band two identically-configured runs had already drawn, so this is
+not the run-to-run variance that band represents.
+
+Against the session's starting point (`postfix_c48_m48_r14`, 288.6 tok/s) this
+is +35%.
+
+## Where the bottleneck sits now
+
+Both sides are close to balanced:
+
+- prefill's compute rate fell 26.0 -> 24.5K tok/s, so it is no longer pinned;
+- decode came back under load — batch 40/48, index pool 91%, **host cold pool
+  343,674/343,722 (99.99%)**, and admission deferred 5 times.
+
+The host cold pool is the hard wall now, and RATIO cannot go much higher (16 is
+already where startup pinning is known to hang). With host pages fixed, total
+decode capacity is `host + gpu_cold` and gpu_cold is what the HBM budget buys —
+so the symmetric next experiment is the decode side's own `GPU_UTIL`, and 83% of
+prefill requests still evict, so its cache is not saturated either.
