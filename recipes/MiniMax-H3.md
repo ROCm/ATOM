@@ -203,7 +203,13 @@ Measured on MI308X (192 GB/GPU), 1344×768 × 5.17 s, 50 steps, Ulysses-4:
 | rank 0, additionally | 10.4 GB video VAE + 0.6 GB audio VAE |
 | peak, rank 0 | ~171 GB |
 | denoise | ~450 s |
-| decode + mux | ~90 s |
+| decode + mux | ~28 s |
+
+The video VAE decodes in **bf16**. It is transformer-based rather than
+convolutional -- 39.7% of decode is `addmm`, 0.0% is convolution -- so the
+checkpoint's fp32 weights make decode GEMM-bound for no benefit: measured 88.4 s
+fp32 against 24.4 s bf16, agreeing to 51.4 dB. End-to-end parity is unchanged
+(41.47 dB vs 41.48). Encode still runs fp32, which is the reference's recipe.
 
 The 67 GB Qwen3-VL text encoder is **staged on the host** and moved onto the
 device only for the encode. This is not an optimisation, it is what makes the

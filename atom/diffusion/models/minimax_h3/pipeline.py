@@ -795,7 +795,10 @@ class MiniMaxH3Pipeline(ComposedPipeline):
         from atom.diffusion.models.minimax_h3.dit import MiniMaxH3DiTModel
         from atom.diffusion.models.minimax_h3.loader import load_minimax_h3_dit_weights
         from atom.diffusion.models.minimax_h3.text_encoder import MiniMaxH3TextEncoder
-        from atom.diffusion.models.minimax_h3.vae import load_checkpoint_vae
+        from atom.diffusion.models.minimax_h3.vae import (
+            VIDEO_VAE_DECODE_DTYPE,
+            load_checkpoint_vae,
+        )
 
         root = self.model_root or self.config.model_path
         if not root:
@@ -827,9 +830,15 @@ class MiniMaxH3Pipeline(ComposedPipeline):
         if not self.ulysses.is_main:
             return
 
+        # bf16 for the video VAE: it is transformer-based, so decode is GEMM
+        # bound, and fp32 costs 88 s against bf16's 24 s for a 51 dB difference.
         self.register_component(
             "video_vae",
-            load_checkpoint_vae(os.path.join(root, "video_vae"), device=device),
+            load_checkpoint_vae(
+                os.path.join(root, "video_vae"),
+                device=device,
+                dtype=VIDEO_VAE_DECODE_DTYPE,
+            ),
         )
         self.register_component(
             "audio_vae",

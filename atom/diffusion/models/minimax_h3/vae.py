@@ -30,7 +30,20 @@ from atom.diffusion.models.minimax_h3.packed_tokens import (
 logger = logging.getLogger(__name__)
 
 
-def load_checkpoint_vae(path: str, *, device: torch.device | str = "cpu") -> Any:
+# The checkpoint ships fp32 weights, but H3's video VAE is transformer-based
+# (39.7% of decode is addmm, 0.0% convolution) so fp32 GEMMs dominate it.
+# Measured at 1344x768x124f: fp32 88.4 s, bf16 24.4 s, and the two agree to
+# 51.4 dB -- an order of magnitude inside the 41 dB bar the whole pipeline is
+# validated at. Encode still runs fp32; see encode_keyframe_cond_rows.
+VIDEO_VAE_DECODE_DTYPE = torch.bfloat16
+
+
+def load_checkpoint_vae(
+    path: str,
+    *,
+    device: torch.device | str = "cpu",
+    dtype: torch.dtype | None = None,
+) -> Any:
     """Instantiate a VAE from the code bundled in the checkpoint directory."""
     from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
@@ -48,8 +61,17 @@ def load_checkpoint_vae(path: str, *, device: torch.device | str = "cpu") -> Any
 
     cls = get_class_from_dynamic_module(ref, path)
     model = cls.from_pretrained(path)
-    model = model.to(device).eval()
-    logger.info("loaded %s from %s on %s", type(model).__name__, path, device)
+    model = model.to(device)
+    if dtype is not None:
+        model = model.to(dtype)
+    model = model.eval()
+    logger.info(
+        "loaded %s from %s on %s (%s)",
+        type(model).__name__,
+        path,
+        device,
+        dtype or next(model.parameters()).dtype,
+    )
     return model
 
 
