@@ -1039,3 +1039,78 @@ def test_enqueue_drain_promote_queue():
             gpu_val = int(c.req_to_gpu_pool[slot, t].item())
             host_val = int(c.req_to_host_pool[slot, t].item())
             assert gpu_val >= 0 or host_val >= 0
+
+
+def test_second_promote_maps_the_right_logical_pages():
+    """A promote that ran out of GPU pages leaves the request's remaining host
+    pages further along in its logical range. The next promote must map those
+    pages to the logical positions they actually back — reading the position off
+    the page's recorded index rather than off its position in the list, which
+    the first promote compacted."""
+    c = _make_gpu_cold(gpu_pages=2, page=16, max_ctx=256, max_num_seqs=2)
+    slot = c.acquire(req_id=1, context_len=64)
+    c.alloc_host_pages(slot, 0, 64)  # 4 host pages, logical pages 0..3
+    host_rows = [int(c.req_to_host_pool[slot, t].item()) for t in range(64)]
+
+    assert c.promote_to_gpu(slot) == 2  # only pages 0,1 fit
+    # Tokens 0..31 moved to GPU; 32..63 must still be host-backed.
+    assert all(int(c.req_to_gpu_pool[slot, t].item()) >= 0 for t in range(32))
+    assert all(int(c.req_to_host_pool[slot, t].item()) == -1 for t in range(32))
+    assert all(
+        int(c.req_to_host_pool[slot, t].item()) == host_rows[t] for t in range(32, 64)
+    )
+
+    # Free the GPU tier so a second promote has room, then promote the tail.
+    c._free_gpu_pages.extend([0, 1])
+    assert c.promote_to_gpu(slot) == 2
+    # The tail's tokens — not tokens 0..31 again — are what got mapped.
+    assert all(int(c.req_to_gpu_pool[slot, t].item()) >= 0 for t in range(32, 64))
+    assert all(int(c.req_to_host_pool[slot, t].item()) == -1 for t in range(32, 64))
+
+
+def test_promote_does_not_free_host_pages_it_did_not_move():
+    """The pages handed back must be exactly the ones whose rows were cleared.
+    Freeing a page still mapped in req_to_host_pool hands live storage to the
+    next request's RDMA."""
+    c = _make_gpu_cold(gpu_pages=2, page=16, max_ctx=256, max_num_seqs=2)
+    slot = c.acquire(req_id=1, context_len=64)
+    c.alloc_host_pages(slot, 0, 64)
+    still_mapped = {int(c.req_to_host_pool[slot, t].item()) // 16 for t in range(32, 64)}
+
+    c.promote_to_gpu(slot)
+    c._reclaim_promoted_host_pages(force=True)
+    assert still_mapped.isdisjoint(set(c._free_host_pages))
+
+
+def test_promote_after_host_growth_past_the_promoted_prefix():
+    """A request that decoded onto fresh host pages after a full promote has a
+    page list that no longer starts at logical page 0. Promoting again must
+    target that page's real logical range."""
+    c = _make_gpu_cold(gpu_pages=8, page=16, max_ctx=256, max_num_seqs=2)
+    slot = c.acquire(req_id=1, context_len=32)
+    c.alloc_host_pages(slot, 0, 32)
+    assert c.promote_to_gpu(slot) == 2
+    assert not c._req_pages[slot]
+
+    # New token lands on host at logical page 2 (tokens 32..47).
+    c.alloc_host_pages(slot, 32, 1)
+    assert c._req_pages[slot][0][0] == 2
+    row32 = int(c.req_to_host_pool[slot, 32].item())
+    assert row32 >= 0
+
+    assert c.promote_to_gpu(slot) == 1
+    assert int(c.req_to_host_pool[slot, 32].item()) == -1
+    assert int(c.req_to_gpu_pool[slot, 32].item()) >= 0
+    # Tokens 0..31 were already on GPU and must be untouched by this promote.
+    assert all(int(c.req_to_host_pool[slot, t].item()) == -1 for t in range(32))
+
+
+def test_promote_keeps_gpu_pages_when_nothing_is_backed():
+    """An unbacked page range must not consume GPU pages the gather never fills."""
+    c = _make_gpu_cold(gpu_pages=4, page=16, max_ctx=256, max_num_seqs=2)
+    slot = c.acquire(req_id=1, context_len=32)
+    c.alloc_host_pages(slot, 0, 32)
+    c.req_to_host_pool[slot].fill_(-1)  # simulate rows already moved away
+    free_before = len(c._free_gpu_pages)
+    assert c.promote_to_gpu(slot) == 0
+    assert len(c._free_gpu_pages) == free_before

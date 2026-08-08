@@ -104,7 +104,11 @@ class SparseKVCoordinator:
             (R, self.table_stride), _EMPTY, dtype=torch.int32, device=self.device
         )
         self._free_host_pages: list[int] = list(range(self.num_host_pages))
-        self._req_pages: dict[int, list[int]] = {}
+        # Host pages backing each request, as (logical page index, page id).
+        # promote_to_gpu removes promoted pages from the middle of this list, so
+        # a page's position in it stops tracking the logical range it backs; the
+        # logical index has to travel with the page.
+        self._req_pages: dict[int, list[tuple[int, int]]] = {}
         self._req_host_alloc_len = [0] * R
 
         # Promote queue: completion thread enqueues req_ids after done_recving;
@@ -590,7 +594,10 @@ class SparseKVCoordinator:
                 "or lower concurrency"
             )
         new_pages = [self._free_host_pages.pop() for _ in range(num_new_pages)]
-        self._req_pages.setdefault(req_slot, []).extend(new_pages)
+        first_logical_page = allocated_len // page
+        self._req_pages.setdefault(req_slot, []).extend(
+            (first_logical_page + i, p) for i, p in enumerate(new_pages)
+        )
         # Flat host slots for the newly backed logical range, page-contiguous.
         slots = torch.empty(page_end - allocated_len, dtype=torch.int32)
         off = torch.arange(page, dtype=torch.int32)
@@ -603,7 +610,7 @@ class SparseKVCoordinator:
         """Return a request's host pages to the shared free pool and clear its row."""
         pages = self._req_pages.pop(req_slot, None)
         if pages:
-            self._free_host_pages.extend(pages)
+            self._free_host_pages.extend(page_id for _, page_id in pages)
         self.req_to_host_pool[req_slot].fill_(_EMPTY)
         self._req_host_alloc_len[req_slot] = 0
 
@@ -746,38 +753,53 @@ class SparseKVCoordinator:
         if host_len == 0:
             return 0
 
-        gpu_promoted = 0
-        host_pages_to_free = []
-        host_page_indices_in_req = []
-        src_all = []
-        dst_all = []
-
         req_host_pages = self._req_pages.get(req_slot, [])
-        for page_idx, host_page_id in enumerate(list(req_host_pages)):
-            if not self._free_gpu_pages:
-                break
-            gpu_page_id = self._free_gpu_pages.pop()
-            self._req_gpu_pages.setdefault(req_slot, []).append(gpu_page_id)
-            start_tok = page_idx * page
-            end_tok = min(start_tok + page, host_len)
-            for t in range(start_tok, end_tok):
-                host_flat = int(self.req_to_host_pool[req_slot, t].item())
-                if host_flat < 0:
-                    continue
-                gpu_flat = gpu_page_id * page + (t - start_tok)
-                src_all.append(host_flat)
-                dst_all.append(gpu_flat)
-                self.req_to_gpu_pool[req_slot, t] = gpu_flat
-                self.req_to_host_pool[req_slot, t] = _EMPTY
-            host_pages_to_free.append(host_page_id)
-            host_page_indices_in_req.append(page_idx)
-            gpu_promoted += 1
+        n_promote = min(len(req_host_pages), len(self._free_gpu_pages))
+        if n_promote == 0:
+            return 0
+        promoting = req_host_pages[:n_promote]
+        gpu_page_ids = [self._free_gpu_pages.pop() for _ in range(n_promote)]
 
-        if not src_all:
+        # Whole-tensor, because this runs inside the forward loop: a 250K-token
+        # request is ~16K pages, and one .item() per logical token used to stall
+        # the loop for tens of seconds on device syncs alone.
+        dev = self.device
+        logical = torch.tensor(
+            [lp for lp, _ in promoting], dtype=torch.int64, device=dev
+        )
+        off32 = torch.arange(page, dtype=torch.int32, device=dev)
+        tok_idx = logical.unsqueeze(1) * page + off32.to(torch.int64)  # [n, page]
+        gpu_flat = (
+            torch.tensor(gpu_page_ids, dtype=torch.int32, device=dev).unsqueeze(1)
+            * page
+            + off32
+        )
+        in_range = tok_idx < host_len
+        tok_idx = tok_idx[in_range]
+        gpu_flat = gpu_flat[in_range]
+
+        host_row = self.req_to_host_pool[req_slot]
+        src_t = host_row[tok_idx]
+        backed = src_t >= 0
+        tok_idx = tok_idx[backed]
+        src_t = src_t[backed]
+        dst_t = gpu_flat[backed]
+
+        if src_t.numel() == 0:
+            # Nothing actually backed these pages; keep the GPU pages instead of
+            # burning them on rows the gather would never write.
+            self._free_gpu_pages.extend(gpu_page_ids)
             return 0
 
-        src_t = torch.tensor(src_all, dtype=torch.int32, device=self.device)
-        dst_t = torch.tensor(dst_all, dtype=torch.int32, device=self.device)
+        self._req_gpu_pages.setdefault(req_slot, []).extend(gpu_page_ids)
+        self.req_to_gpu_pool[req_slot].index_copy_(0, tok_idx, dst_t)
+        host_row.index_fill_(0, tok_idx, _EMPTY)
+
+        host_pages_to_free = [page_id for _, page_id in promoting]
+        del req_host_pages[:n_promote]
+        gpu_promoted = n_promote
+        last_logical_page = max(lp for lp, _ in promoting)
+
         if self.promote_stream is not None:
             # Source is the host pool the compute stream fills (RDMA landing,
             # backup_new_token), so the gather has to queue behind those writes.
@@ -797,9 +819,6 @@ class SparseKVCoordinator:
             for layer_id in range(self.num_layers):
                 self._run_promote_swap(layer_id, src_t, dst_t)
 
-        for hp in host_pages_to_free:
-            if hp in req_host_pages:
-                req_host_pages.remove(hp)
         if self.promote_stream is not None:
             # The gather is still reading these pages on promote_stream. Handing
             # them back now lets admission hand them to a new request whose RDMA
@@ -809,12 +828,7 @@ class SparseKVCoordinator:
             self._free_host_pages.extend(host_pages_to_free)
 
         self._req_gpu_alloc_len[req_slot] = max(
-            self._req_gpu_alloc_len[req_slot],
-            (
-                (host_page_indices_in_req[-1] + 1) * page
-                if host_page_indices_in_req
-                else 0
-            ),
+            self._req_gpu_alloc_len[req_slot], (last_logical_page + 1) * page
         )
         return gpu_promoted
 
