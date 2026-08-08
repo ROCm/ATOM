@@ -63,6 +63,7 @@ from .serving_anthropic import (
 from .serving_chat import (
     build_chat_response,
     build_chat_response_multi,
+    normalize_chat_tools,
     resolve_thinking,
     stream_chat_response,
     stream_chat_response_fanout,
@@ -1090,6 +1091,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
     validate_model(request.model)
 
     try:
+        request.tools = normalize_chat_tools(request.tools)
         validate_chat_request(request)
         messages = request.get_messages()
 
