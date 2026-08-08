@@ -1834,6 +1834,26 @@ class Scheduler:
                     ell_r = fwd_output.dspark_ell.get(seq.id)
                     if ell_r is not None:
                         seq.dspark_next_ell = int(ell_r)
+                # Back-fill placeholder slots if this seq reached the
+                # deferred-output write without them. Placeholders are normally
+                # appended at the END of postprocess (the `if need_placeholder`
+                # loop below), so by the next step the tail of token_ids /
+                # output_tokens holds `num_placeholder (+ offset)` eos slots for
+                # the negative-index overwrite here to land on. But a seq whose
+                # prefill completes in a single chunk was never partial at step
+                # start, so it is NOT continue'd above and reaches this write on
+                # its very first appearance — output_tokens is still empty. The
+                # negative index would then raise IndexError on output_tokens
+                # (killing the engine core) and, worse, silently overwrite the
+                # last PROMPT token in token_ids. append_token keeps token_ids,
+                # output_tokens and num_tokens in lockstep; the loop below then
+                # overwrites these eos slots with the real sampled values. This
+                # is self-healing: any step that arrives short back-fills exactly
+                # what it needs, independent of whether the tail loop ran.
+                while len(seq.output_tokens) < num_placeholder + offset:
+                    seq.append_token(self.eos_token_id)
+                    if seq.return_logprobs:
+                        seq.logprobs.append(0.0)
                 for i, el in enumerate(token_ids):
                     seq.token_ids[-num_placeholder - offset + i] = el
                     seq.output_tokens[-num_placeholder - offset + i] = el
