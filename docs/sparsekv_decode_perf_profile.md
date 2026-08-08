@@ -114,3 +114,97 @@ experiment.
 4. **Detect at 119 µs × 21 anchors/step** (8.4%) — worth a look only after the
    gather work lands.
 5. **CUDAGraph capture sizes — do nothing.** Measured, not a cost.
+
+---
+
+# What the optimization changed (2026-08-08, same day)
+
+Two changes to `sparsekv_gather_planned`, measured with the same load and window
+(`--requests 24 --ctx-tokens 60000`, batch 5-16):
+
+| variant | gather/step | kernel/step | **wall/step** | launches/step |
+|---|---|---|---|---|
+| two passes, `grid=n` (baseline) | 9.74 ms | 29.76 ms | 25.20 ms | 156 |
+| merged into one pass | 4.95 ms | 25.61 ms | 25.19 ms | 78 |
+| merged + `grid.y` over the miss list | **0.36 ms** | **20.53 ms** | **20.53 ms** | 78 |
+
+**The merge alone bought nothing in wall time.** It cut GPU kernel work 14% and
+halved the launch count, both real, but step time did not move: the pass it
+removed was the one the IndexShare prefetch had been hiding (overlap fell from
+1.18x to 1.02x), so the critical path was untouched. Worth recording — "less GPU
+work" and "faster" are not the same claim, and only the second one was asked for.
+
+**The grid was the actual bug.** The gather launched `grid = n`, one block per
+query token: at a decode batch of 16 that is 16 blocks of 4 warps on a 256-CU
+device — under 6% of the machine — with each warp walking a hundred rows in
+series. Adding a second grid dimension over the miss list, sized to keep ~2048
+blocks resident, took the gather from 9.74 to 0.36 ms/step and step wall time
+from 25.20 to **20.53 ms (-18.5%)**.
+
+## The gather is now near its ceiling
+
+`scripts/bench_sparsekv_gather.py`, n=16 queries x 2048 misses of 576 B:
+
+| host share | before | after | achieved | vs contiguous ceiling |
+|---|---|---|---|---|
+| 100% host | 1.473 ms | 0.380 ms | 49.6 GB/s | **88%** of 56.7 GB/s H2D |
+| 90% | 1.461 ms | 0.342 ms | 55.2 GB/s | |
+| 50% | 1.314 ms | 0.197 ms | 95.8 GB/s | |
+| 0% (all GPU tier) | 0.514 ms | 0.013 ms | 1476 GB/s | 37% of 4031 GB/s D2D |
+
+88% of the contiguous host-to-device rate for a *scattered* 576 B gather leaves
+nothing worth chasing in this kernel. Further gains on the host path have to come
+from moving fewer bytes, not from a faster gather.
+
+## The profile after
+
+| bucket | share |
+|---|---|
+| MoE | 23.3% |
+| SparseKV swap (was 43.7%) | **21.6%** |
+| — detect (`swap_and_translate`) | 11.9% |
+| — promote / initial-hot gather (`sparsekv_swap_in`) | 4.4% |
+| — backup | 2.4% |
+| — planned gather | ~0.4% |
+| TP all-reduce | 9.9% |
+| MLA attention | 6.5% |
+| DSA indexer | 5.1% |
+
+MoE is now the largest single bucket. Within SparseKV the remaining target is
+**detect**: one block per query token, and its LRU victim search binary-searches
+the recency range, rescanning all 8193 hot slots on every step of the search. It
+cannot be split across blocks the way the gather was — the search is a block-wide
+reduction over the whole hot set — so the levers are threads per block and a
+cheaper victim-selection algorithm.
+
+Validation for the above: 83 unit tests, `check_sparsekv_row_bounds.py`,
+needle 4K-114K 12/12, GSM8K 200 flexible 0.970 / strict 0.965 (pre-change
+0.945/0.940).
+
+## What did not work: a wider detect block
+
+The detect kernel is one block per query token, and its LRU victim search
+binary-searches the recency range, rescanning all 8193 hot slots on every step —
+at 256 threads that is 32 slots per thread per step. Raising just that kernel's
+block to 1024 (the kernel is written against `blockDim.x` throughout, so it
+looked safe) **faults within three decode steps**:
+
+```
+Memory access fault by GPU node-9 on address 0x76dd1aa6a000. Reason: Unknown.
+```
+
+Reverted. Two things make this worth recording rather than retrying:
+
+- The row bound was armed and reported **zero** out-of-range rows, so this is
+  *not* the out-of-range `cold_row` failure mode from
+  `sparsekv_decode_row_bound_fault.md`. The address is 4 KiB aligned, so it is
+  still a host-pool dereference, but by a path the bound does not cover.
+- It means the detect kernel has an undiagnosed dependence on its block size.
+  `vic[]` is filled with an unbounded `atomicAdd` index (`vic[idx] = s` with no
+  `idx < topk` check); the invariant that keeps it in range —
+  `count(last_used < tau) < m <= topk` — rests on the tau binary search
+  converging, which is a block-wide reduction. That is where to look.
+
+Do not change the detect block size without root-causing this first. And it is a
+live lead for the still-open decode fault: it shows a host-address fault can be
+reached without tripping the row bound.
