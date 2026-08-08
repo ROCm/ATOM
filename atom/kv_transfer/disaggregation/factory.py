@@ -135,6 +135,14 @@ KVConnectorFactory.register(
     scheduler_class="MooncakeConnectorScheduler",
 )
 
+KVConnectorFactory.register(
+    "native",
+    worker_module="atom.kv_transfer.disaggregation.native.native_connector",
+    worker_class="NativeConnector",
+    scheduler_module="atom.kv_transfer.disaggregation.native.native_connector",
+    scheduler_class="NativeConnectorScheduler",
+)
+
 # Composite backend: fans out to several sub-connectors listed under
 # kv_transfer_config["connectors"] (e.g. moriio P/D + lmcache_offload on one
 # prefill node). Lightweight import — no heavy deps until a sub is built.
