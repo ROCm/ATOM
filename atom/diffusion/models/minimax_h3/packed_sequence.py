@@ -28,7 +28,7 @@ from collections.abc import Sequence
 import numpy as np
 import torch
 
-from atom.diffusion.stages.minimax_h3.geometry import (
+from atom.diffusion.models.minimax_h3.geometry import (
     PACKED_SEQUENCE_ALIGNMENT,
 )
 

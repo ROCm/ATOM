@@ -10,21 +10,21 @@ scatter, per-step timestep conditioning, sampler wiring) is what's under test.
 import pytest
 import torch
 
-from atom.diffusion.stages.minimax_h3.denoise import (
+from atom.diffusion.models.minimax_h3.denoise import (
     build_timestep_conditioning,
     run_denoise_loop,
 )
-from atom.diffusion.stages.minimax_h3.latent_prep import (
+from atom.diffusion.models.minimax_h3.latent_prep import (
     build_initial_latents,
     scatter_rows_into_packed,
 )
-from atom.diffusion.stages.minimax_h3.packed_sequence import (
+from atom.diffusion.models.minimax_h3.packed_sequence import (
     TAG_AUDIO,
     TAG_TEXT,
     TAG_VIDEO,
     build_packed_sequence_t2va,
 )
-from atom.diffusion.stages.minimax_h3.packed_tokens import (
+from atom.diffusion.models.minimax_h3.packed_tokens import (
     patchify_video_latent,
     unpack_audio_tokens,
     unpatchify_video_tokens,

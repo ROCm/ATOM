@@ -50,7 +50,7 @@ def load_minimax_h3_dit_weights(
     """
     from safetensors import safe_open
 
-    from atom.diffusion.models.dits.minimax_h3 import reorder_grouped_qkv_to_qkv
+    from atom.diffusion.models.minimax_h3.dit import reorder_grouped_qkv_to_qkv
 
     arch = model.arch
     weight_map = _shard_files(path)

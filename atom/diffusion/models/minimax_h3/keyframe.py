@@ -20,7 +20,7 @@ from typing import Any
 
 import torch
 
-from atom.diffusion.stages.minimax_h3.packed_tokens import patchify_video_latent
+from atom.diffusion.models.minimax_h3.packed_tokens import patchify_video_latent
 
 KEYFRAME_ENCODE_SEED = 42
 KEYFRAME_PATCH_SIZE = (1, 2, 2)

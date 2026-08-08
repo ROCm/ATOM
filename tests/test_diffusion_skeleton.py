@@ -11,16 +11,16 @@ import pytest
 import torch
 
 from atom.diffusion.config import ComponentConfig, DiffusionConfig, PerformanceMode
-from atom.diffusion.distributed.ulysses import UlyssesGroup
 from atom.diffusion.engine.job_scheduler import AdmissionError, JobScheduler
 from atom.diffusion.engine.pipeline_runner import PipelineRunner
-from atom.diffusion.pipelines.base import ComposedPipeline
-from atom.diffusion.request import DiffusionJob, JobStatus
-from atom.diffusion.stages.base import (
+from atom.diffusion.pipeline import (
+    ComposedPipeline,
     DiffusionBatch,
     PipelineStage,
     StageParallelism,
 )
+from atom.diffusion.request import DiffusionJob, JobStatus
+from atom.diffusion.ulysses import UlyssesGroup
 
 
 def make_config(**overrides) -> DiffusionConfig:

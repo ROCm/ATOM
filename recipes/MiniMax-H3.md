@@ -22,6 +22,29 @@ PSNR/SSIM are measured against the upstream sglang reference on the same box at
 the same seed. See [Validation](#validation) for exactly what that number does
 and does not cover.
 
+## Layout
+
+`atom/diffusion/` is **model-major**: the framework sits at the top level and
+everything for one model lives in one package, so adding a model is a new
+directory plus a `--pipeline` path rather than edits scattered across
+`dits/`, `vaes/`, `encoders/` and `schedulers/`.
+
+```
+atom/diffusion/
+  config.py request.py pipeline.py attention.py ulysses.py mux.py
+  engine/        job scheduler, ZMQ workers, per-GPU runner
+  entrypoints/   diffusion_server.py, video_api.py
+  models/minimax_h3/
+      arch.py dit.py vae.py text_encoder.py scheduler.py loader.py
+      pipeline.py                       the 8 stages and the pipeline
+      geometry.py packed_sequence.py packed_tokens.py latent_prep.py
+      keyframe.py condition_noise.py reference_encoding.py presentation.py
+      denoise.py
+```
+
+A component graduates out of a model package into the shared layer when a
+*second* model uses it, not in anticipation.
+
 ## Preparing environment
 
 ```bash
@@ -140,7 +163,7 @@ from atom.diffusion.request import DiffusionJob
 
 config = DiffusionConfig(
     model_path="/data/models/MiniMax-H3/FL2VA",
-    pipeline_class="atom.diffusion.pipelines.minimax_h3.MiniMaxH3Pipeline",
+    pipeline_class="atom.diffusion.models.minimax_h3.pipeline.MiniMaxH3Pipeline",
     num_gpus=4,
     ulysses_degree=4,
     output_dir="/data/outputs",

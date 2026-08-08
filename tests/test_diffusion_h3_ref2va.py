@@ -11,7 +11,7 @@ rather than just the totals.
 import pytest
 import torch
 
-from atom.diffusion.stages.minimax_h3.packed_sequence import (
+from atom.diffusion.models.minimax_h3.packed_sequence import (
     PACKED_SEQUENCE_ALIGNMENT,
     TAG_AUDIO,
     TAG_PAD,

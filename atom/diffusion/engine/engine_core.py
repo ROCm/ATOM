@@ -20,7 +20,6 @@ import traceback
 from typing import Any
 
 from atom.diffusion.config import DiffusionConfig
-from atom.diffusion.distributed.ulysses import UlyssesGroup
 from atom.diffusion.engine.pipeline_runner import PipelineRunner
 from atom.diffusion.engine.protocol import (
     EngineOutput,
@@ -29,6 +28,7 @@ from atom.diffusion.engine.protocol import (
     RequestType,
 )
 from atom.diffusion.request import DiffusionJob, JobStatus
+from atom.diffusion.ulysses import UlyssesGroup
 
 logger = logging.getLogger(__name__)
 

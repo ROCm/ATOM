@@ -29,8 +29,8 @@ from typing import Any, Self
 import numpy as np
 import torch
 
-from atom.diffusion.stages.minimax_h3.keyframe import scoped_encode_rng
-from atom.diffusion.stages.minimax_h3.packed_tokens import patchify_video_latent
+from atom.diffusion.models.minimax_h3.keyframe import scoped_encode_rng
+from atom.diffusion.models.minimax_h3.packed_tokens import patchify_video_latent
 
 REFERENCE_IMAGE_SHORT_EDGE = 2048
 REFERENCE_IMAGE_MULTIPLE = 32

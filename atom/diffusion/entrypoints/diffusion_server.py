@@ -23,7 +23,7 @@ from atom.diffusion.engine.diffusion_engine import DiffusionEngine
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_PIPELINE = "atom.diffusion.pipelines.minimax_h3.MiniMaxH3Pipeline"
+DEFAULT_PIPELINE = "atom.diffusion.models.minimax_h3.pipeline.MiniMaxH3Pipeline"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -104,7 +104,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.attn_backend:
         import os
 
-        from atom.diffusion.layers.attention.backend import ATTENTION_BACKEND_ENV
+        from atom.diffusion.attention import ATTENTION_BACKEND_ENV
 
         # Set before the workers are spawned so they inherit it: the backend is
         # frozen when each model is constructed, and a replica split across two

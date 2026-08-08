@@ -3,17 +3,17 @@
 
 """MiniMax-H3 specific pipeline stages and helpers."""
 
-from atom.diffusion.stages.minimax_h3.condition_noise import (
+from atom.diffusion.models.minimax_h3.condition_noise import (
     MINIMAX_H3_AUDIO_REF_COND_TIMESTEP,
     MINIMAX_H3_IMGVID_COND_TIMESTEP,
     audio_cond_noise_aug_rows,
     imgvid_cond_noise_aug_rows,
 )
-from atom.diffusion.stages.minimax_h3.denoise import (
+from atom.diffusion.models.minimax_h3.denoise import (
     build_timestep_conditioning,
     run_denoise_loop,
 )
-from atom.diffusion.stages.minimax_h3.geometry import (
+from atom.diffusion.models.minimax_h3.geometry import (
     MiniMaxH3Geometry,
     align_frame_count,
     audio_latent_t,
@@ -21,17 +21,17 @@ from atom.diffusion.stages.minimax_h3.geometry import (
     time_shift_sigmas,
     video_latent_t,
 )
-from atom.diffusion.stages.minimax_h3.keyframe import (
+from atom.diffusion.models.minimax_h3.keyframe import (
     cover_crop_plan,
     encode_keyframe_cond_rows,
     prepare_keyframe_canvas,
     stretch_keyframe_canvas,
 )
-from atom.diffusion.stages.minimax_h3.latent_prep import (
+from atom.diffusion.models.minimax_h3.latent_prep import (
     build_initial_latents,
     scatter_rows_into_packed,
 )
-from atom.diffusion.stages.minimax_h3.packed_sequence import (
+from atom.diffusion.models.minimax_h3.packed_sequence import (
     FL2VA_KEYFRAME_SIGNATURES,
     build_local_embedding_layout,
     build_packed_sequence,
@@ -41,7 +41,7 @@ from atom.diffusion.stages.minimax_h3.packed_sequence import (
     temporal_position_span,
     validate_keyframe_signature,
 )
-from atom.diffusion.stages.minimax_h3.packed_tokens import (
+from atom.diffusion.models.minimax_h3.packed_tokens import (
     patchify_video_latent,
     unpack_audio_tokens,
     unpatchify_video_tokens,
