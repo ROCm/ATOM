@@ -293,3 +293,30 @@ already where startup pinning is known to hang). With host pages fixed, total
 decode capacity is `host + gpu_cold` and gpu_cold is what the HBM budget buys —
 so the symmetric next experiment is the decode side's own `GPU_UTIL`, and 83% of
 prefill requests still evict, so its cache is not saturated either.
+
+## Throughput on this workload is a function of the cache hit, and little else
+
+Four c48 rounds, same trace, same duration:
+
+| run | prefix hit | out tok/s | fit | residual |
+|---|---|---|---|---|
+| `postfix_c48_m48_r14` | 37.5% | 288.0 | 295.5 | -7.5 |
+| `gather_opt_c48` | 30.8% | 265.6 | 259.4 | +6.2 |
+| `prefill_util93_c48` | 53.5% | 387.6 | 382.5 | +5.1 |
+| `both_util_c48` | 47.9% | 348.6 | 352.5 | -3.8 |
+
+`out tok/s = 91 + 5.44 x hit%`, **R^2 = 0.985**, every residual inside +-2%.
+
+Two things follow, and they are the most useful results here.
+
+**Nothing that fails to move the hit rate moves throughput.** The gather kernel
+work (decode step -18.5%, ITL halved) and the decode `GPU_UTIL` raise (index
+pages +6.3%, GPU cold pages +63%) both land inside the residual. They are real
+improvements to latency and to headroom — decode went from index 91% / 5
+admission deferrals to 74% / 0 — but on this workload they are not throughput.
+
+**The single-run resolution is +-15 tok/s.** Two rounds at the *same* prefill
+setting drew 53.5% and 47.9%, so the hit rate itself carries +-2.8 points of
+run-to-run variance. Any A/B expecting less than that needs repeats, and the
++16.5 points the prefill cache bought is the only change so far that clears it
+comfortably.
