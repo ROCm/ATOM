@@ -51,6 +51,12 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-1048576}"
 HOT_BUFFER="${HOT_BUFFER:-8192}"
 PREFETCH="${PREFETCH:-1}"
 RATIO="${RATIO:-16}"
+# The prefill node is the throughput ceiling for the agentic trace (both c48
+# rounds computed 94.2M prompt tokens at 26.0K tok/s), and 81% of its requests
+# evict cached blocks, so how much of its HBM goes to the prefix cache decides
+# how many of those tokens it has to compute at all.
+PREFILL_GPU_UTIL="${PREFILL_GPU_UTIL:-0.85}"
+PREFILL_CHUNK="${PREFILL_CHUNK:-8192}"
 # atomesh defaults to 1800s, which is shorter than the agentic trace's own tail:
 # its longest outputs run to ~32K tokens, and at a decode ITL of 100-200 ms that
 # is 3200-6600s of legitimate streaming. The default cut one such request in
@@ -137,9 +143,10 @@ HIP_VISIBLE_DEVICES=0,1,2,3 \
 nohup python -m atom.entrypoints.openai_server \
   --model "$MODEL" --server-port "$PREFILL_PORT" --trust-remote-code \
   -pp 4 -tp 1 --level 3 --enforce-eager \
-  --max-num-batched-tokens 8192 \
-  --kv_cache_dtype fp8 --gpu-memory-utilization 0.85 \
+  --max-num-batched-tokens $PREFILL_CHUNK \
+  --kv_cache_dtype fp8 --gpu-memory-utilization $PREFILL_GPU_UTIL \
   --enable_prefix_caching \
+  ${PREFILL_PROFILER_DIR:+--torch-profiler-dir $PREFILL_PROFILER_DIR} \
   --kv-transfer-config "{\"kv_role\":\"kv_producer\",\"kv_connector\":\"mooncake\",\"handshake_port\":$HANDSHAKE_PORT,\"proxy_ip\":\"127.0.0.1\"}" \
   > /tmp/prefill.log 2>&1 &
 

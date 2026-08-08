@@ -1,4 +1,4 @@
-"""Drive a steady SparseKV decode batch and capture a profiler window over it.
+"""Drive a long-context load and capture a profiler window once the node is busy.
 
 A trace is only worth reading if it covers the regime being asked about, so this
 waits for the decode batch to actually build up before starting the profiler
@@ -44,6 +44,12 @@ def main() -> int:
     ap.add_argument("--max-tokens", type=int, default=400)
     ap.add_argument("--settle-secs", type=int, default=180)
     ap.add_argument("--decode-log", default="/tmp/decode.log")
+    ap.add_argument(
+        "--live-marker",
+        default="Engine Core: output send",
+        help="log line whose count must be rising before the window opens; use "
+        "'Scheduled prefill batch' with --decode/--decode-log pointed at prefill",
+    )
     ap.add_argument("--window-secs", type=int, default=6)
     args = ap.parse_args()
 
@@ -83,7 +89,7 @@ def main() -> int:
     def output_sends() -> int:
         try:
             with open(args.decode_log, errors="replace") as f:
-                return sum(1 for ln in f if "Engine Core: output send" in ln)
+                return sum(1 for ln in f if args.live_marker in ln)
         except OSError:
             return -1
 
