@@ -116,6 +116,25 @@ support_model_arch_dict = {
 # torch.cuda.manual_seed_all(seed)
 
 
+def max_schedulable_decode_bs(
+    max_num_seqs: int, max_num_batched_tokens: int, full_q_len: int
+) -> int:
+    """Largest decode batch the scheduler can admit.
+
+    `Scheduler.schedule_decode` stops on either of two bounds: `max_num_seqs`
+    sequences, or `max_num_batched_tokens` tokens. It charges every decode
+    sequence the full speculative width `full_q_len` (== ``mtp_k + 1``) up
+    front, whatever query length the step later replays, so dividing by
+    `full_q_len` is exact rather than conservative — and it bounds every
+    smaller q bucket too.
+
+    Lives here so CUDAGraph capture can refuse to build a bucket the scheduler
+    would never hand it. Must stay in step with `schedule_decode`'s
+    `tokens_per_decode_seq`.
+    """
+    return min(max_num_seqs, max_num_batched_tokens // full_q_len)
+
+
 class tokenIDProcessor:
 
     def __init__(
@@ -1531,6 +1550,12 @@ class ModelRunner:
             budget = self.config.gpu_memory_utilization * torch.cuda.mem_get_info()[1]
             target_reserve = 0.15 * budget
             all_shapes = sorted({bs * q for bs in cap_sizes for q in q_buckets})
+            # Mirror the capture-loop token-budget skip: a bucket over
+            # `max_num_batched_tokens` is not schedulable and is not captured,
+            # so reserving for it would only shrink KV.
+            all_shapes = [
+                s for s in all_shapes if s <= self.config.max_num_batched_tokens
+            ]
             # Mirror the capture-loop DP+spec num_tokens cap (see capture_cudagraph)
             # so the reservation only counts buckets we actually capture.
             if dp_size > 1 and hasattr(self, "drafter"):
@@ -3626,25 +3651,54 @@ class ModelRunner:
                 self.graph_bs = cuda_graph_sizes
         self.graph_bs.sort(reverse=True)
 
-        # Drop any capture size that exceeds max_num_seqs — those graphs would
-        # never be replayed since the scheduler can't produce a batch larger
-        # than max_num_seqs. Warn so the user notices a misconfig (default
-        # cuda_graph_sizes=[512] vs e.g. max_num_seqs=16) without crashing.
-        max_bs = self.config.max_num_seqs
+        # Drop any capture size the scheduler could never produce. `schedule_decode`
+        # bounds a decode batch two ways: at most `max_num_seqs` sequences, and at
+        # most `max_num_batched_tokens` tokens, charging `mtp_k + 1` tokens per
+        # sequence whatever query length the step ends up replaying. So the
+        # reachable batch size is the min of the two, and under speculation the
+        # token budget is what binds first — mtp_k=3 turns 256 sequences into 1024
+        # tokens.
+        #
+        # Filtering on the token budget is not just about avoiding a graph that is
+        # never replayed. The per-token forward buffers (`positions`, `input_ids`,
+        # `outputs`) are sized `max_num_batched_tokens`, so capture at a bs past
+        # this bound writes out of bounds — it used to surface as a bare
+        # `could not broadcast input array from shape (1024,) into shape (512,)`
+        # out of `capture_cudagraph`, which reads like a shape bug rather than a
+        # config one. Charging `mtp_k + 1` (never a smaller q bucket) also keeps
+        # every (bs, max_q_len) pair the loop below visits within the bound, so
+        # the runtime `self.graphs[(bs, max_q_len)]` lookup cannot miss.
+        #
+        # Warn rather than raise so a misconfig (default cuda_graph_sizes=[512]
+        # vs e.g. max_num_seqs=16) stays recoverable.
+        full_q_len = self.drafter.mtp_k + 1 if hasattr(self, "drafter") else 1
+        max_seq_bs = self.config.max_num_seqs
+        max_tok_bs = self.config.max_num_batched_tokens // full_q_len
+        max_bs = max_schedulable_decode_bs(
+            max_seq_bs, self.config.max_num_batched_tokens, full_q_len
+        )
         oversized = [s for s in self.graph_bs if s > max_bs]
         if oversized:
             self.graph_bs = [s for s in self.graph_bs if s <= max_bs]
             logger.warning(
-                "cudagraph capture sizes %s exceed max_num_seqs=%d; dropping. "
-                "Remaining: %s",
+                "cudagraph capture sizes %s exceed the schedulable batch size "
+                "min(max_num_seqs=%d, max_num_batched_tokens=%d // (mtp_k+1)=%d "
+                "= %d) = %d; dropping. Remaining: %s",
                 oversized,
+                max_seq_bs,
+                self.config.max_num_batched_tokens,
+                full_q_len,
+                max_tok_bs,
                 max_bs,
                 self.graph_bs,
             )
         assert self.graph_bs, (
-            f"no cudagraph capture sizes left after filtering by "
-            f"max_num_seqs={max_bs}; pass --cudagraph-capture-sizes or raise "
-            f"--max-num-seqs."
+            f"no cudagraph capture sizes left: the scheduler can only reach "
+            f"bs <= min(max_num_seqs={max_seq_bs}, "
+            f"max_num_batched_tokens={self.config.max_num_batched_tokens} // "
+            f"(mtp_k+1)={full_q_len} = {max_tok_bs}) = {max_bs}. Pass "
+            f"--cudagraph-capture-sizes, raise --max-num-seqs, or raise "
+            f"--max-num-batched-tokens."
         )
 
         # PIECEWISE: the set of num_tokens shapes whose dense pieces we captured
@@ -3686,7 +3740,6 @@ class ModelRunner:
         positions = self.forward_vars["positions"].gpu
         outputs = self.forward_vars["outputs"]
 
-        full_q_len = self.drafter.mtp_k + 1 if hasattr(self, "drafter") else 1
         # Capture one graph per (bs, query-length bucket). Buckets default to
         # [full_q_len] (single-graph, classic per-bs capture); DSpark confidence
         # scheduling expands to the smaller q-buckets a decode step may replay.
