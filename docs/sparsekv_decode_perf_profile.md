@@ -208,3 +208,39 @@ Reverted. Two things make this worth recording rather than retrying:
 Do not change the detect block size without root-causing this first. And it is a
 live lead for the still-open decode fault: it shows a host-address fault can be
 reached without tripping the row bound.
+
+## End-to-end: the win is real, and it does not show up in throughput
+
+Full c48 round on M48/RATIO=14, same config as the pre-optimization baseline:
+
+| | before (`postfix_c48_m48_r14`) | after (`gather_opt_c48`) |
+|---|---|---|
+| **itl p50 / p95** | 60 / 70 ms | **30 / 36 ms** |
+| **intvty p50** (per-user tok/s) | 17 | **33** |
+| output tok/s | 288.0 | 265.6 |
+| peak decode batch | 41 | 24 |
+| index pool peak | 91% | 57% |
+| admission DEFERs | 3 | 0 |
+| TTFT p50 | 99.6 s | 158.6 s |
+| prefix-cache hit | 37.5% | 30.8% |
+| failures | 0 | 0 |
+
+**The system is prefill-bound, and was already.** Both runs computed exactly
+**94.2M prefill tokens at 26.0K tok/s** and scheduled 24,006 vs 24,000 prefill
+batches — the prefill node is pinned at its ceiling and did identical work in
+both. The output-token difference is a workload difference, not a regression:
+the second run drew a lower prefix-cache hit (30.8% vs 37.5%), so the same
+94.2M tokens of prefill compute served 1109 requests instead of 1261.
+
+So the decode optimization cannot raise system throughput at this PD split. What
+it bought instead:
+
+- **per-user decode speed doubled** (intvty p50 17 -> 33 tok/s, ITL 60 -> 30 ms),
+  which is the metric a user actually feels;
+- **half the decode node is now idle capacity** — batch 41 -> 24 for the same
+  offered load, index pool 91% -> 57%, and admission stopped deferring.
+
+**Anything further on the decode side is worth ~0 in throughput until prefill is
+addressed.** The levers are, in order: profile the prefill node (never done —
+26.0K tok/s is an unexplained number), and rebalance the PD GPU split, since
+decode now has roughly 2x the capacity this workload needs.
