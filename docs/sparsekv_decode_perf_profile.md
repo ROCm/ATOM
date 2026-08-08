@@ -307,6 +307,10 @@ Four c48 rounds, same trace, same duration:
 
 `out tok/s = 91 + 5.44 x hit%`, **R^2 = 0.985**, every residual inside +-2%.
 
+> **Corrected below.** A fifth round dropped this to R^2 = 0.939 with residuals
+> from -18 to +12, and the same-decode-config series is clearly convex, not
+> linear. The strong dependence on the hit rate holds; the slope does not.
+
 Two things follow, and they are the most useful results here.
 
 **Nothing that fails to move the hit rate moves throughput.** The gather kernel
@@ -344,3 +348,40 @@ newly-seen prefill shape can ask for a fresh large allocation at any time.
 The throughput result stands — hit 34% -> 51% and +46% output tokens is real and
 mechanistically explained — but the setting that produced it cannot ship. The
 safe operating point has to be found between 0.85 (many clean rounds) and 0.93.
+
+## Correction: the relationship is convex, and decode util is not zero
+
+A fifth c48 round (`prefill_util90_c48`) refits the model to
+`97 + 5.22 x hit%` with **R^2 = 0.939** and residuals -18.2 to +12.2. Holding
+the decode config fixed at 0.85 gives four clean points:
+
+| hit | out tok/s | marginal |
+|---|---|---|
+| 30.8% | 266.0 | |
+| 37.5% | 288.4 | 3.34 / point |
+| 46.4% | 320.7 | 3.63 / point |
+| 53.5% | 388.2 | **9.51 / point** |
+
+The curve accelerates. The earlier linear fit was four points flattering a
+convex relationship, so "out tok/s = 91 + 5.44 x hit" should not be quoted as a
+law — what holds is that throughput depends strongly and monotonically on the
+hit rate, with rising marginal returns.
+
+That also revises the decode `GPU_UTIL` verdict. Interpolating the 0.85 series
+to `both_util_c48`'s 47.9% hit gives ~335 tok/s against its measured 349.1, so
+decode 0.92 is worth roughly +14 tok/s rather than nothing. One point, inside
+the noise the hit rate itself carries — but "no gain" was too strong a claim.
+
+## Where the safe operating point sits
+
+| prefill util | rounds | result |
+|---|---|---|
+| 0.85 | many | 266.0 / 288.4 tok/s at 30.8% / 37.5% hit, never failed |
+| **0.90** | 1 | **320.7 tok/s at 46.4% hit**, full round, zero failures |
+| 0.93 | 3 | 388.2 tok/s at 53.5% hit — and OOMed the prefill node on the third |
+
+0.90 is the best setting with any safety evidence: **+11% over the session's
+starting round and +16% over the 0.85 mean**, at zero failures. One clean round
+is not proof — 0.93 had two before it died — so this needs repeats before it
+ships, and the useful bound would be an actual accounting of the worst-case
+transient allocation rather than another empirical round.
