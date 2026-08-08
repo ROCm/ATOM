@@ -965,34 +965,18 @@ class SparseKVCoordinator:
     def _gather_planned_dual(
         self, layer_id: int, req_slots: torch.Tensor, n: int, topk: int
     ) -> None:
-        """Replay the recorded miss plan into one layer's hot buffer, per home.
+        """Replay the recorded miss plan into one layer's hot buffer.
 
         Design Y dual-source swap-in: a record-only detect already wrote the miss
-        plan (tok, hot slot, home) into the plan buffers; this issues two pure
-        gathers — host-home misses from the pinned host cold pool, gpu-home misses
-        from the GPU cold tier — so a mixed-home top-k lands entirely in the hot
-        buffer. Runs on the current stream (the caller picks it).
+        plan (tok, hot slot, home) into the plan buffers; one gather then walks it
+        and pulls each miss from the tier the plan assigned it, so a mixed-home
+        top-k lands entirely in the hot buffer. Runs on the current stream (the
+        caller picks it).
         """
-        from atom.sparsekv.swap_kernel import sparsekv_gather_planned
+        from atom.sparsekv.swap_kernel import sparsekv_gather_planned_dual
 
-        host_ptr = self._ensure_cold_dev_ptr(layer_id)
-        sparsekv_gather_planned(
-            host_ptr,
-            self.hot_buffer[layer_id],
-            req_slots,
-            self._plan_miss_tok[:n],
-            self._plan_miss_slot[:n],
-            self._plan_miss_count[:n],
-            self._plan_miss_home[:n],
-            0,  # target_home = host
-            self._host_locs_arg(),
-            self._host_stride,
-            self.item_size_bytes,
-            self.padded_hot_size,
-            self.max_context_len,
-            topk,
-        )
-        sparsekv_gather_planned(
+        sparsekv_gather_planned_dual(
+            self._ensure_cold_dev_ptr(layer_id),
             self._gpu_cold_ptr(layer_id),
             self.hot_buffer[layer_id],
             req_slots,
@@ -1000,7 +984,8 @@ class SparseKVCoordinator:
             self._plan_miss_slot[:n],
             self._plan_miss_count[:n],
             self._plan_miss_home[:n],
-            1,  # target_home = gpu
+            self._host_locs_arg(),
+            self._host_stride,
             self._gpu_locs_arg(),
             self._host_stride,  # req_to_gpu_pool shares the table stride
             self.item_size_bytes,

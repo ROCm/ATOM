@@ -396,6 +396,55 @@ def sparsekv_gather_planned(
     )
 
 
+def sparsekv_gather_planned_dual(
+    host_base_ptr: int,
+    gpu_base_ptr: int,
+    hot_buffer: torch.Tensor,
+    req_slots: torch.Tensor,
+    plan_miss_tok: torch.Tensor,
+    plan_miss_slot: torch.Tensor,
+    plan_miss_count: torch.Tensor,
+    plan_miss_home: torch.Tensor,
+    host_cache_locs: torch.Tensor,
+    host_stride: int,
+    gpu_cache_locs: torch.Tensor,
+    gpu_stride: int,
+    item_size_bytes: int,
+    hot_slots: int,
+    cold_depth: int,
+    topk: int,
+) -> None:
+    """Replay a recorded miss plan for both homes in one pass (aiter).
+
+    One launch that walks the miss list once, versus two that each walk it whole
+    and skip the other home's entries.
+    """
+    a = _aiter()
+    if a is None:
+        raise RuntimeError(
+            "sparsekv_gather_planned_dual requires the aiter module_sparsekv_swap "
+            "op; aiter could not be imported."
+        )
+    a.sparsekv_gather_planned_dual(
+        host_base_ptr,
+        gpu_base_ptr,
+        hot_buffer,
+        req_slots,
+        plan_miss_tok,
+        plan_miss_slot,
+        plan_miss_count,
+        plan_miss_home,
+        host_cache_locs,
+        host_stride,
+        gpu_cache_locs,
+        gpu_stride,
+        item_size_bytes,
+        hot_slots,
+        cold_depth,
+        topk,
+    )
+
+
 def sparsekv_backup_into_assigned(
     cold_pool_dev_ptr: int,
     gpu_cold_pool_ptr: int,
