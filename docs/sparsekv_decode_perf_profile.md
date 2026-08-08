@@ -320,3 +320,27 @@ setting drew 53.5% and 47.9%, so the hit rate itself carries +-2.8 points of
 run-to-run variance. Any A/B expecting less than that needs repeats, and the
 +16.5 points the prefill cache bought is the only change so far that clears it
 comfortably.
+
+## The +46% setting is not safe as measured
+
+`PREFILL_GPU_UTIL=0.93` killed the prefill node mid-run:
+
+```
+rocdevice.cpp:3717: Callback: Queue Aborting with error :
+HSA_STATUS_ERROR_OUT_OF_RESOURCES: The runtime failed to allocate
+[ModelRunner0/1] proc died unexpectedly (exitcode=-6)
+```
+
+Two full c48 rounds at 0.93 completed cleanly first; the third round (c32) died
+51 minutes in and again 11 minutes later. So 0.93 is marginal rather than
+broken, which is the worse failure mode — it survives long enough to look
+validated.
+
+0.93 leaves 7% of a 288 GB device for everything the KV pool does not own:
+activations, collective buffers, and the aiter top-k workspace, which is
+allocated per power-of-two size bucket and LRU-cached up to 16 buffers, so a
+newly-seen prefill shape can ask for a fresh large allocation at any time.
+
+The throughput result stands — hit 34% -> 51% and +46% output tokens is real and
+mechanistically explained — but the setting that produced it cannot ship. The
+safe operating point has to be found between 0.85 (many clean rounds) and 0.93.
