@@ -3480,6 +3480,20 @@ class ModelRunner:
         ):
             self._sparsekv_prev_forward_event.synchronize()
         self._sparsekv_last_active_reqids = cur_active
+        # An out-of-range translation row is skipped by the kernels rather than
+        # dereferenced — that stops it killing the process, but the token then
+        # reads a stale hot slot, so it must not pass silently. Polled rarely:
+        # reading the counter costs a device sync.
+        self._sparsekv_steps = getattr(self, "_sparsekv_steps", 0) + 1
+        if self._sparsekv_steps % 1000 == 0:
+            oob = coord.take_oob_row_count()
+            if oob:
+                logger.warning(
+                    "SparseKV: %d cold-pool rows were out of range and skipped; "
+                    "those tokens read a stale hot slot. A translation table is "
+                    "being corrupted — this is a correctness bug, not back-pressure.",
+                    oob,
+                )
         if coord.gpu_cold_enabled:
             promoted = coord.drain_promote_queue()
             for rid, pages in promoted.items():

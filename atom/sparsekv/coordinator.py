@@ -655,6 +655,41 @@ class SparseKVCoordinator:
             self.promote_stream = torch.cuda.Stream(device=self.device)
         else:
             self.promote_stream = None
+        self._publish_pool_rows()
+
+    def take_oob_row_count(self) -> int:
+        """Rows the kernels skipped for being out of range since the last call.
+
+        Non-zero is a correctness alarm, not a health metric: those tokens read
+        a stale hot slot instead of their KV. See :meth:`_publish_pool_rows`.
+        """
+        if str(self.device) == "cpu":
+            return 0
+        from atom.sparsekv.swap_kernel import take_oob_row_count
+
+        return take_oob_row_count()
+
+    def _publish_pool_rows(self) -> None:
+        """Tell the swap kernels how many rows each cold pool has.
+
+        Their only handle on a token's location is the translation table, so
+        without the bounds a stale entry dereferences past an exact-sized pool
+        and faults the process instead of being skipped. Re-published whenever
+        the GPU tier is (re)sized.
+        """
+        if str(self.device) == "cpu":
+            return
+        from atom.sparsekv.swap_kernel import set_pool_rows
+
+        host_rows = self.num_host_pages * self.host_page_size
+        gpu_rows = self.num_gpu_pages * self.host_page_size
+        set_pool_rows(host_rows, gpu_rows)
+        logger.info(
+            "SparseKV row bounds published: host=%d gpu_cold=%d "
+            "(rows past these are skipped, not dereferenced)",
+            host_rows,
+            gpu_rows,
+        )
 
     def alloc_gpu_pages(self, req_slot: int, start_pos: int, num_tokens: int) -> int:
         """Back logical positions with GPU cold-pool pages. Returns tokens allocated.

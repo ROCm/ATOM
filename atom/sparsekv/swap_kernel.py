@@ -132,6 +132,35 @@ def _fallback():
     return _FALLBACK_MODULE
 
 
+def set_pool_rows(cold_rows: int, gpu_cold_rows: int) -> None:
+    """Publish both cold pools' row counts to the swap kernels.
+
+    The kernels resolve a token's cold-pool row through a translation table, and
+    the pools are sized exactly; a stale or corrupt entry therefore dereferences
+    unmapped memory and kills the process with a memory access fault. Once the
+    bounds are published an out-of-range row is reported unbacked and skipped.
+    No-op when aiter is unavailable (the load_inline fallback has no such op).
+    """
+    a = _aiter()
+    if a is None or not hasattr(a, "sparsekv_set_pool_rows"):
+        return
+    a.sparsekv_set_pool_rows(int(cold_rows), int(gpu_cold_rows))
+
+
+def take_oob_row_count() -> int:
+    """Read and reset the kernels' count of rows skipped for being out of range.
+
+    Non-zero means a translation table held a row past the end of its pool: the
+    token was skipped instead of dereferenced (so the process survived a fault
+    that used to be fatal) but it read a stale hot slot, which is a correctness
+    problem worth surfacing. Returns 0 when aiter has no such op.
+    """
+    a = _aiter()
+    if a is None or not hasattr(a, "sparsekv_take_oob_row_count"):
+        return 0
+    return int(a.sparsekv_take_oob_row_count())
+
+
 def host_get_device_pointer(pinned_host_tensor: torch.Tensor) -> int:
     """Translate a pinned host tensor to a device-mapped pointer (int VA).
 
