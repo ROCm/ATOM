@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import warnings
+from typing import Sequence
 
 import torch
 from aiter import mixed_sample_outer_exponential
@@ -30,6 +31,21 @@ _NATIVE_SAMPLING_WARNING_ISSUED = False
 # Epsilon value for numerical stability and to prevent division by 0
 SAMPLER_EPS = 1e-10
 
+_SPLITMIX64_MASK = 0xFFFFFFFFFFFFFFFF
+
+
+def _splitmix64(x: int) -> int:
+    x = (x + 0x9E3779B97F4A7C15) & _SPLITMIX64_MASK
+    z = x
+    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & _SPLITMIX64_MASK
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & _SPLITMIX64_MASK
+    return z ^ (z >> 31)
+
+
+def _derive_sampling_seed(base_seed: int, step: int, row_idx: int) -> int:
+    mixed = _splitmix64(int(base_seed) + (int(step) << 32) + int(row_idx))
+    return int(mixed & 0x7FFFFFFFFFFFFFFF)
+
 
 def get_per_token_exponential(vocab_size: int, device) -> torch.Tensor:
     """Returns a tensor of shape (1, vocab_size) filled with exponential random values.
@@ -54,6 +70,8 @@ class Sampler(nn.Module):
         top_ps: torch.Tensor | None = None,  # (num_tokens,) float32, 1.0 means disabled
         all_greedy: bool = False,  # True if all temperatures are 0 (checked on CPU)
         needs_independent_noise: bool = False,
+        sequence_seeds: torch.Tensor | Sequence[int] | None = None,
+        sequence_steps: torch.Tensor | Sequence[int] | None = None,
     ) -> torch.Tensor:  # (num_tokens,)
         """
         Sample tokens from logits using temperature or top-k top-p filtering.
@@ -76,7 +94,11 @@ class Sampler(nn.Module):
         # No Top-K Top-P parameters, perform temperature-based sampling
         if not self._needs_filtering(top_ks, top_ps):
             return self._temperature_sample(
-                logits, temperatures, needs_independent_noise=needs_independent_noise
+                logits,
+                temperatures,
+                needs_independent_noise=needs_independent_noise,
+                sequence_seeds=sequence_seeds,
+                sequence_steps=sequence_steps,
             )
 
         # Apply top-k/top-p filtering
@@ -87,6 +109,8 @@ class Sampler(nn.Module):
             top_ps,
             all_greedy,
             needs_independent_noise=needs_independent_noise,
+            sequence_seeds=sequence_seeds,
+            sequence_steps=sequence_steps,
         )
 
     def _needs_filtering(
@@ -106,19 +130,55 @@ class Sampler(nn.Module):
         logits: torch.Tensor,
         temperatures: torch.Tensor,
         needs_independent_noise: bool = False,
+        sequence_seeds: torch.Tensor | Sequence[int] | None = None,
+        sequence_steps: torch.Tensor | Sequence[int] | None = None,
     ) -> torch.Tensor:
         """Temperature-based Gumbel-max sampling.
 
-        When ``needs_independent_noise`` is True the per-row exponential noise
-        tensor is freshly drawn with shape ``(num_tokens, vocab_size)`` so that
-        fan-out siblings produced by ``SamplingParams.n > 1`` diverge instead
-        of collapsing onto the same token when they share logits. Otherwise we
-        keep the cached ``(1, vocab_size)`` row broadcasted across the batch,
-        which preserves the existing run-to-run determinism optimization.
+        When a per-sequence seed is provided, each row draws exponential noise
+        from a deterministic torch.Generator seeded by (seed, decode_step, row).
+        This removes cross-request RNG coupling while preserving stochastic
+        behavior for temperature > 0.
         """
         num_tokens, vocab_size = logits.shape
         sampled_tokens = torch.empty(num_tokens, dtype=torch.int, device=logits.device)
-        if needs_independent_noise:
+
+        seeds = None
+        steps = None
+        if sequence_seeds is not None:
+            if torch.is_tensor(sequence_seeds):
+                seeds = sequence_seeds.detach().to("cpu", dtype=torch.int64).tolist()
+            else:
+                seeds = [int(s) for s in sequence_seeds]
+
+            if sequence_steps is None:
+                steps = [0] * len(seeds)
+            elif torch.is_tensor(sequence_steps):
+                steps = sequence_steps.detach().to("cpu", dtype=torch.int64).tolist()
+            else:
+                steps = [int(s) for s in sequence_steps]
+
+            if len(seeds) < num_tokens:
+                seeds.extend([-1] * (num_tokens - len(seeds)))
+            if len(steps) < num_tokens:
+                steps.extend([0] * (num_tokens - len(steps)))
+
+        if seeds is not None and any(int(s) >= 0 for s in seeds[:num_tokens]):
+            exponential = torch.empty(
+                (num_tokens, vocab_size), dtype=torch.float, device=logits.device
+            )
+            for row_idx in range(num_tokens):
+                base_seed = int(seeds[row_idx])
+                if base_seed >= 0:
+                    det_seed = _derive_sampling_seed(
+                        base_seed, int(steps[row_idx]), row_idx
+                    )
+                    gen = torch.Generator(device=logits.device)
+                    gen.manual_seed(det_seed)
+                    exponential[row_idx].exponential_(1, generator=gen)
+                else:
+                    exponential[row_idx].exponential_(1)
+        elif needs_independent_noise:
             exponential = torch.empty(
                 (num_tokens, vocab_size), dtype=torch.float, device=logits.device
             ).exponential_(1)
@@ -126,6 +186,7 @@ class Sampler(nn.Module):
             exponential = get_per_token_exponential(vocab_size, logits.device).expand(
                 num_tokens, vocab_size
             )
+
         mixed_sample_outer_exponential(
             sampled_tokens, logits, exponential, temperatures, eps=self.eps
         )
@@ -139,6 +200,8 @@ class Sampler(nn.Module):
         top_ps: torch.Tensor | None,
         all_greedy: bool,
         needs_independent_noise: bool = False,
+        sequence_seeds: torch.Tensor | Sequence[int] | None = None,
+        sequence_steps: torch.Tensor | Sequence[int] | None = None,
     ) -> torch.Tensor:
         """Top-K/Top-P sampling with temperature scaling.
 
@@ -147,8 +210,8 @@ class Sampler(nn.Module):
         batch row, so fan-out siblings already diverge naturally and the
         ``needs_independent_noise`` flag is accepted purely for API symmetry.
         """
-        # Accepted but unused here; see docstring.
-        del needs_independent_noise
+        # Accepted but currently unused in top-k/top-p path.
+        del needs_independent_noise, sequence_seeds, sequence_steps
         # Fast path: if ALL requests are greedy (temperature=0), just do argmax
         # This avoids the overhead of softmax and top-k/top-p filtering
         if all_greedy:
