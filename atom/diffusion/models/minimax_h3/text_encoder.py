@@ -40,6 +40,8 @@ class MiniMaxH3TextEncoder:
         self.tokenizer = tokenizer
         self.processor = processor
         self.device = torch.device(device)
+        # Populated on first resident_on(): the pinned, authoritative host copy.
+        self._host_tensors: list[tuple[torch.Tensor, torch.Tensor]] | None = None
 
     @classmethod
     def from_pretrained(
@@ -107,33 +109,63 @@ class MiniMaxH3TextEncoder:
         rows, _ = self.encode_with_tags(prompt, images)
         return rows
 
+    def _tensors(self):
+        yield from self.model.parameters()
+        yield from self.model.buffers()
+
     def to(self, device: torch.device | str) -> "MiniMaxH3TextEncoder":
         """Move the encoder and remember where it is."""
         self.model = self.model.to(device)
         self.device = torch.device(device)
         return self
 
+    def prime_host_cache(self) -> None:
+        """Pin the host weights once, so no request pays for it.
+
+        Pinning 50 GiB takes ~11 s; done at load it is startup cost, done
+        lazily it lands on the first request.
+        """
+        if self._host_tensors is not None:
+            return
+        self._host_tensors = []
+        for tensor in self._tensors():
+            host = tensor.data
+            if host.device.type == "cpu" and not host.is_pinned():
+                try:
+                    host = host.pin_memory()
+                except RuntimeError:  # pragma: no cover - host-dependent
+                    logger.warning("could not pin host weights; uploads will be slower")
+            tensor.data = host
+            self._host_tensors.append((tensor, host))
+
     @contextlib.contextmanager
     def resident_on(self, device: torch.device | str):
-        """Hold the encoder on ``device`` for one encode, then send it back.
+        """Hold the encoder on ``device`` for one encode, then release it.
 
-        H3 encodes once per request and then never touches the encoder again,
-        but at ~67 GB it is the single largest resident tensor on the main
-        rank. Leaving it on the GPU alongside the DiT overflows a 192 GB card
-        during denoise -- measured, not predicted: the first served request
-        died with 182 GiB already allocated.
+        H3 encodes once per request and never touches the encoder again, but at
+        50 GiB it is the largest resident tensor on the main rank -- leaving it
+        beside the DiT overflows a 192 GB card during denoise (measured: the
+        first served request died with 182 GiB allocated).
 
-        The round trip costs a couple of seconds against a multi-minute
-        generation, and it is what makes a 4-GPU replica fit at all.
+        Weights are read-only under inference, so the host copy stays
+        authoritative and releasing is just dropping the device copy: no
+        copy-back. With the host side pinned that turns a 12.7 s round trip
+        into a ~2 s upload.
         """
-        origin = self.device
+        self.prime_host_cache()
+
+        for tensor, host in self._host_tensors:
+            tensor.data = host.to(device, non_blocking=True)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        self.device = torch.device(device)
         try:
-            yield self.to(device)
+            yield self
         finally:
-            self.to(origin)
+            for tensor, host in self._host_tensors:
+                tensor.data = host
+            self.device = torch.device("cpu")
             if torch.cuda.is_available():
-                # Return the block to the allocator, not just to this module:
-                # otherwise the DiT's next allocation still sees a full cache.
                 torch.cuda.empty_cache()
 
     @torch.no_grad()

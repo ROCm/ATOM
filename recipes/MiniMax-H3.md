@@ -211,11 +211,29 @@ checkpoint's fp32 weights make decode GEMM-bound for no benefit: measured 88.4 s
 fp32 against 24.4 s bf16, agreeing to 51.4 dB. End-to-end parity is unchanged
 (41.47 dB vs 41.48). Encode still runs fp32, which is the reference's recipe.
 
-The 67 GB Qwen3-VL text encoder is **staged on the host** and moved onto the
-device only for the encode. This is not an optimisation, it is what makes the
-replica fit: the first served request died with 182 GiB allocated before the
-encoder was moved off the resident set. The round trip costs a couple of
-seconds against a multi-minute generation.
+The 50 GiB Qwen3-VL text encoder is **staged on the host** and uploaded only
+for the encode it performs once per request. Not an optimisation -- it is what
+makes the replica fit: the first served request died with 182 GiB allocated
+before the encoder was moved off the resident set.
+
+Weights are read-only, so the host copy stays authoritative and releasing just
+drops the device copy -- no copy back. With the host side pinned at load, the
+per-request cost is **1.0 s** rather than the 12.7 s a naive round trip costs.
+
+### Against the sglang reference, same box, t2va at Ulysses-4
+
+| | reference | ATOM |
+|---|---:|---:|
+| text encode | ~23 s | ~23 s |
+| encoder staging | — | 1.0 s |
+| denoise | ~425 s | **424.7 s** |
+| decode | 17.3 s | 27.7 s |
+| **total** | **465.5 s** | **~476 s** |
+
+Denoise is even. The reference is locked to the Triton attention kernel on
+gfx942 by an upstream workaround for an ASM hang that does not reproduce on
+this aiter build (14 configurations tested), so ATOM runs the faster ASM path
+and gives that time back on decode, where sglang uses its own vendored VAE.
 
 ## Validation
 
