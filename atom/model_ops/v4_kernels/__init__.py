@@ -16,7 +16,9 @@ from aiter.jit.utils.chip_info import get_gfx
 
 from atom.model_ops.v4_kernels.compress_plan import (
     CompressPlan,
+    make_capture_boundary_plan,
     make_compress_plans,
+    make_restore_boundary_plan,
 )
 from atom.model_ops.v4_kernels.csa_translate_pack import (
     csa_translate_pack,
@@ -54,6 +56,8 @@ from atom.model_ops.v4_kernels.qk_norm_rope_maybe_quant import (
     qk_norm_rope_maybe_quant_reference,
 )
 from atom.model_ops.v4_kernels.state_writes import (
+    capture_compressor_boundary,
+    restore_compressor_boundary,
     swa_write,
     swa_write_2buff_prepacked,
     update_compressor_states,
@@ -64,6 +68,7 @@ __all__ = [
     "FP4_MQA_PARALLEL_UNIT_NUM",
     "CompressPlan",
     "QKNormRopeOut",
+    "capture_compressor_boundary",
     "csa_translate_pack",
     "csa_translate_pack_reference",
     "fp4_indexer_enabled",
@@ -71,10 +76,13 @@ __all__ = [
     "fused_compress_attn_reference",
     "hca_compress_paged_offsets",
     "inverse_rope_inplace",
+    "make_capture_boundary_plan",
     "make_compress_plans",
+    "make_restore_boundary_plan",
     "qk_norm_rope_maybe_quant",
     "qk_norm_rope_maybe_quant_fp8_2buff",
     "qk_norm_rope_maybe_quant_reference",
+    "restore_compressor_boundary",
     "scale_indexer_weights",
     "sparse_attn_v4_paged_decode",
     "sparse_attn_v4_paged_decode_reference",

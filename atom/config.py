@@ -1316,6 +1316,11 @@ class Config:
     index_cache_dtype: str | None = None
     enable_prefix_caching: bool = True
     enable_chunked_prefill: bool = True
+    # DeepSeek-V4 CSA prefix-state cache (native, no arena): restore the CSA
+    # compressor ring boundary from a SWA-page-indexed snapshot on a prefix hit
+    # instead of recomputing. Set from ATOM_V4_CSA_PREFIX_STATE_CACHE when V4 is
+    # detected. Default False (recompute).
+    enable_v4_csa_prefix_state_cache: bool = False
     port: int = 8006
     torch_profiler_dir: str | None = field(
         default_factory=lambda: envs.ATOM_TORCH_PROFILER_DIR
@@ -1630,6 +1635,27 @@ class Config:
             v4_block_size = 256
             if self.kv_cache_block_size != v4_block_size:
                 self.kv_cache_block_size = v4_block_size
+            # CSA prefix-state cache is a V4-only feature; source it from the env
+            # here so the attention builder / KV manager can read it off config.
+            # It only does anything on a prefix-cache HIT (restore reseeds the
+            # compressor ring from the terminal cached block's snapshot), so it
+            # REQUIRES enable_prefix_caching — otherwise capture would run every
+            # prefill (wasted compute + boundary-pool VRAM) with no restore ever
+            # firing. Gate it on prefix caching so the whole capture/restore path
+            # (pool alloc, kernels, plans, scheduler source) stays off when
+            # prefix caching is off.
+            from atom.utils import envs as _envs
+
+            _csa_env = bool(_envs.ATOM_V4_CSA_PREFIX_STATE_CACHE)
+            self.enable_v4_csa_prefix_state_cache = (
+                _csa_env and self.enable_prefix_caching
+            )
+            if _csa_env and not self.enable_prefix_caching:
+                logger.warning(
+                    "ATOM_V4_CSA_PREFIX_STATE_CACHE=1 ignored: it requires "
+                    "prefix caching (enable_prefix_caching is off) — nothing to "
+                    "restore without cross-request prefix hits."
+                )
 
     def compute_hash(self) -> str:
         """

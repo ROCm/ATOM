@@ -106,6 +106,13 @@ class BlockManager:
             retention_interval=envs.ATOM_SWA_RETENTION_INTERVAL,
             checkpoint_frac=envs.ATOM_SWA_CHECKPOINT_FRAC,
         )
+        # DeepSeek-V4 CSA prefix-state cache: when on, a prefix hit records the
+        # terminal cached block's physical SWA page as the boundary-snapshot
+        # restore source (rides the SWA claim/pin — no separate pool). Gated so
+        # non-V4 / feature-off paths never touch seq.csa_boundary_state_block_id.
+        self.enable_csa_boundary_state = bool(
+            getattr(config, "enable_v4_csa_prefix_state_cache", False)
+        )
 
     @property
     def swa_enabled(self) -> bool:
@@ -313,6 +320,17 @@ class BlockManager:
         if seq.has_per_req_cache:
             seq.per_req_cache_group = self.free_per_req_cache_groups.pop()
 
+        # CSA prefix-state restore source: the terminal cached block's physical
+        # SWA page (always in the trailing window → claimed → >= 0). Its fused
+        # boundary snapshot seeds the new request's compressor ring on the first
+        # suffix forward. Consumed + cleared one-shot in scheduler.postprocess().
+        if (
+            self.enable_csa_boundary_state
+            and num_cached_blocks > 0
+            and seq.swa_block_table
+        ):
+            seq.csa_boundary_state_block_id = seq.swa_block_table[num_cached_blocks - 1]
+
     def hash_blocks(
         self, seq: Sequence, num_new_tokens: int, start_tokens: int | None = None
     ) -> None:
@@ -494,6 +512,7 @@ class BlockManager:
         )  # release SWA blocks + clear swa_block_table (no-op if disabled)
         seq.num_cached_tokens = 0
         seq.block_table.clear()
+        seq.csa_boundary_state_block_id = -1
         if seq.has_per_req_cache and seq.per_req_cache_group >= 0:
             self.free_per_req_cache_groups.append(seq.per_req_cache_group)
             seq.per_req_cache_group = -1

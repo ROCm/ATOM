@@ -312,6 +312,15 @@ class ScheduledBatch:
             for seq in seqs.values()
             if seq.has_per_req_cache and seq.per_req_cache_group >= 0
         ]
+        # DeepSeek-V4 CSA prefix-state cache: per-seq boundary-snapshot restore
+        # source (physical SWA page of the terminal cached block on a prefix hit,
+        # else -1). Full-length (aligns with context_lens / state_slot for the V4
+        # prefill batch where every seq has per-req cache). All -1 when the
+        # feature is off, so downstream builds an empty restore plan.
+        self.csa_boundary_state_block_ids = np.asarray(
+            [seq.csa_boundary_state_block_id for seq in seqs.values()],
+            dtype=np.int32,
+        )
         self.top_ks = np.asarray([seq.top_k for seq in seqs.values()], dtype=np.int32)
         self.top_ps = np.asarray([seq.top_p for seq in seqs.values()], dtype=np.float32)
         # True if any seq in the batch is a fan-out child (SamplingParams.n>1)
@@ -1697,6 +1706,11 @@ class Scheduler:
                 self.block_manager.hash_blocks(seq, chunk, start_tokens=start_tokens)
                 if not is_final:
                     pp_middle_chunk_ids.add(req_id)
+                # CSA prefix-state restore is one-shot: the first suffix forward
+                # (this step) consumed the boundary snapshot, so clear the source
+                # to prevent re-restore on later chunks.
+                if self.block_manager.enable_csa_boundary_state:
+                    seq.csa_boundary_state_block_id = -1
         elif batch is not None:
             running_by_id = {seq.id: seq for seq in self.running}
             for i, req_id in enumerate(batch.req_ids):
@@ -1713,6 +1727,10 @@ class Scheduler:
                 # correct under chunked-prefill where one block may span
                 # multiple steps (hash_blocks clips to fully-filled blocks).
                 self.block_manager.hash_blocks(seq, chunk)
+                # CSA prefix-state restore is one-shot: clear the boundary source
+                # after the forward that consumed it (this step).
+                if self.block_manager.enable_csa_boundary_state:
+                    seq.csa_boundary_state_block_id = -1
                 seq.num_cached_tokens += chunk
                 # chunked-prefill: reclaim SWA blocks that just fell out of
                 # the window, using the computed-so-far length

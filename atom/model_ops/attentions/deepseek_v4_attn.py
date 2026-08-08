@@ -461,6 +461,18 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self.csa_main_state_shape = (2 * 4 + ring_extra, 2 * self.head_dim)
         self.csa_idx_state_shape = (2 * 4 + ring_extra, 2 * self.index_head_dim)
         self.hca_main_state_shape = (128 + ring_extra, self.head_dim)
+        # CSA prefix-state boundary snapshot (native prefix cache, no arena):
+        # the last `tail`=ratio ring rows (abs positions B-tail..B-1) of each
+        # finalized block, snapshotted per CSA layer into a pool indexed by the
+        # block's physical SWA page (rides the SWA pin — see allocate_per_req_cache
+        # / Compressor.forward). tail == ratio(4) because the overlap compressor
+        # needs the last `ratio` rows to bit-exactly reseed at a block boundary.
+        self.enable_csa_prefix_state_cache = bool(
+            getattr(model_runner.config, "enable_v4_csa_prefix_state_cache", False)
+        )
+        self.csa_boundary_tail = 4
+        self.csa_main_boundary_shape = (self.csa_boundary_tail, 2 * self.head_dim)
+        self.csa_idx_boundary_shape = (self.csa_boundary_tail, 2 * self.index_head_dim)
         self.max_decode_tokens = self.max_bs * (1 + self.max_spec_steps)
         # SWA ring-buffer slots per req. Distinct from `window_size`:
         #   * `window_size`  = SWA attention window = topk count per token
@@ -782,6 +794,30 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             (n_hca, num_slots, *self.hca_main_state_shape), device
         )
 
+        # ---- CSA boundary-state snapshot pool (feature-gated) ---------------
+        # Separate per-CSA-layer fp32 pool [n_csa, num_swa_blocks, tail, 2*dim],
+        # indexed by the block's PHYSICAL SWA page (== seq.swa_block_table entry;
+        # no arena). It carries NO pin of its own — the SWA block's alloc / free /
+        # retention / prefix-hit (swa_pool) own the physical page, so the snapshot
+        # rides the SWA pin. `main` / `idx` are distinct tensors that capture and
+        # restore address by the same physical SWA page. REQUIRES SWA
+        # (num_swa_blocks > 0); off -> zero-page tensors so the kernels no-op.
+        num_swa_blocks = self.model_runner.num_swa_blocks
+        csa_state_on = self.enable_csa_prefix_state_cache and n_csa > 0
+        boundary_pages = num_swa_blocks if (csa_state_on and num_swa_blocks > 0) else 0
+        csa_main_boundary_kv = self._zero_state(
+            (n_csa, boundary_pages, *self.csa_main_boundary_shape), device
+        )
+        csa_main_boundary_score = self._zero_state(
+            (n_csa, boundary_pages, *self.csa_main_boundary_shape), device
+        )
+        csa_idx_boundary_kv = self._zero_state(
+            (n_csa, boundary_pages, *self.csa_idx_boundary_shape), device
+        )
+        csa_idx_boundary_score = self._zero_state(
+            (n_csa, boundary_pages, *self.csa_idx_boundary_shape), device
+        )
+
         # ---- RDMA staging pool, only allocated in PD disaggregation mode --
         is_pd = bool(getattr(self.model_runner.config, "kv_transfer_config", None))
         state_tensors = [
@@ -813,6 +849,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             "v4_csa_idx_score_state": csa_idx_score,
             "v4_hca_main_kv_state": hca_main_kv,
             "v4_hca_main_score_state": hca_main_score,
+            "v4_csa_main_boundary_kv": csa_main_boundary_kv,
+            "v4_csa_main_boundary_score": csa_main_boundary_score,
+            "v4_csa_idx_boundary_kv": csa_idx_boundary_kv,
+            "v4_csa_idx_boundary_score": csa_idx_boundary_score,
             "v4_state_pool": state_pool,
             "v4_state_pool_size": pool_size,
             "v4_state_slot_stride": state_slot_stride,
@@ -918,6 +958,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 pos = self.layer_id_to_csa_pos[layer_id_from_prefix]
                 module.kv_state = runner.v4_csa_idx_kv_state[pos]
                 module.score_state = runner.v4_csa_idx_score_state[pos]
+                if self.enable_csa_prefix_state_cache:
+                    # Boundary snapshot pool for THIS CSA layer's indexer-inner
+                    # compressor, indexed by physical SWA page. _csa_owner routes
+                    # capture/restore in Compressor.forward.
+                    module.boundary_kv = runner.v4_csa_idx_boundary_kv[pos]
+                    module.boundary_score = runner.v4_csa_idx_boundary_score[pos]
+                    module._csa_owner = "idx"
                 # Inner compressor writes target the SAME storage as the
                 # outer Indexer.kv_cache (csa_idx_kv). Same [NB, k1_csa,
                 # aligned_dim] FP8 shape — `Compressor.forward` resolves
@@ -967,6 +1014,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 pos = self.layer_id_to_csa_pos[layer_id_from_prefix]
                 module.kv_state = runner.v4_csa_main_kv_state[pos]
                 module.score_state = runner.v4_csa_main_score_state[pos]
+                if self.enable_csa_prefix_state_cache:
+                    # Boundary snapshot pool for THIS CSA layer's main compressor,
+                    # indexed by physical SWA page. _csa_owner routes
+                    # capture/restore in Compressor.forward.
+                    module.boundary_kv = runner.v4_csa_main_boundary_kv[pos]
+                    module.boundary_score = runner.v4_csa_main_boundary_score[pos]
+                    module._csa_owner = "main"
                 # CSA Main compressed pool now lives in the tail of the
                 # owning layer's `unified_kv`. Compressor.forward writes via
                 # `kv_cache[block_id, slot_in_block, :] = entry`, so we hand
@@ -2047,6 +2101,16 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
         attn_metadata.compress_plans = self._build_compress_plans(
             extend_lens_np, context_lens_np
+        )
+        # CSA prefix-state capture/restore plans (prefill/eager only; ratio-4).
+        self._attach_csa_boundary_plans(
+            attn_metadata,
+            extend_lens_np=extend_lens_np,
+            context_lens_np=context_lens_np,
+            state_slot_np=state_slot_np,
+            batch=batch,
+            scheduled_bs=scheduled_bs,
+            device=positions.device,
         )
         # Prefill goes through eager (no CG): defaults make padded_total_tokens
         # collapse to total_tokens — no padding logic kicks in. Must still run
@@ -3231,6 +3295,65 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             graph_bs=graph_bs,
             max_q_len=max_q_len,
         )
+
+    def _attach_csa_boundary_plans(
+        self,
+        attn_metadata,
+        *,
+        extend_lens_np,
+        context_lens_np,
+        state_slot_np,
+        batch,
+        scheduled_bs,
+        device,
+    ) -> None:
+        """Attach CSA prefix-state capture/restore plans to the ratio-4 plan.
+
+        Prefill-only (eager) hook — the plan tensors are freshly allocated, so
+        this must NOT run on the decode CUDAGraph path (fixed-pointer plan
+        buffers). Decode-time capture of generated-token block boundaries is a
+        follow-up; those boundaries fall back to recompute (still correct).
+
+        - capture (every prefill): last `tail` ring rows of each finalized block
+          → boundary pool, keyed by physical SWA page (== swa_block_tables).
+        - restore (prefix hit only): reseed the fresh ring from the terminal
+          cached block's snapshot; boundary_B = context_len - extend_len.
+        No-op unless the feature is on and a ratio-4 plan exists.
+        """
+        if not self.enable_csa_prefix_state_cache:
+            return
+        plans = attn_metadata.compress_plans
+        if not plans or 4 not in plans:
+            return
+        from atom.model_ops.v4_kernels import (
+            make_capture_boundary_plan,
+            make_restore_boundary_plan,
+        )
+
+        cp4 = plans[4]
+        cap_gpu, n_cap = make_capture_boundary_plan(
+            extend_lens_np,
+            context_lens_np,
+            block_size=self.block_size,
+            device=device,
+            tail=self.csa_boundary_tail,
+        )
+        cp4.capture_boundary_plan_gpu = cap_gpu
+        cp4.num_capture_boundary = n_cap
+        # main and idx capture into their own boundary tensors but by the SAME
+        # physical SWA page table the SWA writes use.
+        cp4.csa_page_tables_gpu = attn_metadata.swa_block_tables
+        # Restore: one row per seq whose terminal cached block has a live
+        # snapshot (source >= 0). Empty when no prefix hit / feature off.
+        src = np.asarray(
+            batch.csa_boundary_state_block_ids[:scheduled_bs], dtype=np.int32
+        )
+        slots = np.asarray(state_slot_np[:scheduled_bs], dtype=np.int32)
+        if src.size == scheduled_bs and slots.size == scheduled_bs and (src >= 0).any():
+            boundary_b = (context_lens_np - extend_lens_np).astype(np.int32)
+            cp4.restore_boundary_plan_gpu, _ = make_restore_boundary_plan(
+                src, slots, boundary_b, device=device
+            )
 
     def _populate_block_tables(
         self, batch: ScheduledBatch, scheduled_bs: int

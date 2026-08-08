@@ -840,3 +840,353 @@ def dspark_paged_window_gather_2buff_reference(
         swa_region_rope, block_tables, anchor_pos, window, block_size
     )  # [B, W, rope] bf16
     return dequantize_v4_2buff_to_bf16(nope, rope)
+
+
+# === CSA boundary-state snapshot (native prefix-cache) ==================
+# On a 128-aligned prefix-cache boundary B, the first post-boundary CSA
+# compressed output pools the previous block's B-4..B-1 first-half projections.
+# A fresh per-request compressor ring cannot reproduce them from the lossy
+# compressed KV, so we snapshot the exact ring rows for those 4 positions at
+# capture time (keyed by the terminal compressed *physical* block id) and copy
+# them back into the new request's ring on a hit — no token replay, no
+# dependency on the (partly reclaimed) SWA window. The snapshot stores the FULL
+# ring row (both overlap halves), i.e. exactly what `update_compressor_states`
+# writes, so restore is a byte-for-byte copy back. Only CSA (ratio=4,
+# overlap=True) layers need this; HCA is clean at an aligned boundary.
+#
+# Capture window: the last `TAIL` positions of each block
+# (`position % BLOCK_SIZE >= BLOCK_SIZE - TAIL`), with TAIL = 4. Snapshot row =
+# `position % BLOCK_SIZE - (BLOCK_SIZE - TAIL)` in [0, TAIL). The score snapshot
+# fuses `+ ape[position % RATIO]` to match the live ring exactly.
+
+
+@triton.jit
+def _capture_compressor_boundary_kernel(
+    kv_ptr,  # [N, dim] (strided allowed)
+    kv_row_stride: tl.constexpr,
+    score_ptr,  # [N, dim] (strided allowed)
+    score_row_stride: tl.constexpr,
+    ape_ptr,  # [RATIO, dim]
+    capture_plan_ptr,  # [num_capture, 4] int32 (ragged_id, batch_id, position, _)
+    block_tables_ptr,  # [bs, max_blocks_per_seq] int32 CSA page table (page ids)
+    block_tables_stride,
+    boundary_kv_ptr,  # [num_pages, TAIL, dim]
+    boundary_kv_blk_stride: tl.constexpr,  # = TAIL * dim
+    boundary_kv_row_stride: tl.constexpr,  # = dim
+    boundary_score_ptr,
+    boundary_score_blk_stride: tl.constexpr,
+    boundary_score_row_stride: tl.constexpr,
+    dim: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,  # tokens per KV block (128)
+    TAIL: tl.constexpr,  # snapshot rows per block (4)
+    RATIO: tl.constexpr,
+    NUM_PAGES: tl.constexpr,  # boundary store slots; slot = phys % NUM_PAGES
+    BLOCK_D: tl.constexpr,
+):
+    """One program per row in `capture_plan_ptr`. Writes the token's full ring
+    row into the terminal block's immutable boundary snapshot slot.
+
+        blk_log = position // BLOCK_SIZE
+        page    = csa_page_table[batch_id, blk_log]   (associative pool page id)
+        row     = position % BLOCK_SIZE - (BLOCK_SIZE - TAIL)   in [0, TAIL)
+        boundary_kv   [page, row] = kv
+        boundary_score[page, row] = score + ape[position % RATIO]
+
+    The page id already indexes the boundary store directly (0 <= page <
+    NUM_PAGES), so no modulo. Sentinel rows (position < 0) and unclaimed blocks
+    (page < 0) are skipped (CUDAGraph fixed-grid padding / cached blocks).
+    """
+    pid = tl.program_id(0)
+    plan_base = capture_plan_ptr + pid * 4
+    ragged_id = tl.load(plan_base + 0)
+    batch_id = tl.load(plan_base + 1)
+    position = tl.load(plan_base + 2)
+    if position < 0:
+        return
+
+    row = position % BLOCK_SIZE - (BLOCK_SIZE - TAIL)
+    blk_log = position // BLOCK_SIZE
+    phys = tl.load(block_tables_ptr + batch_id * block_tables_stride + blk_log)
+    if phys < 0:  # unclaimed (cached / uncaptured) block — nothing to capture
+        return
+    ape_idx = position % RATIO
+
+    d = tl.arange(0, BLOCK_D)
+    m = d < dim
+    kv_v = tl.load(kv_ptr + ragged_id * kv_row_stride + d, mask=m).to(tl.float32)
+    sc_v = tl.load(score_ptr + ragged_id * score_row_stride + d, mask=m).to(tl.float32)
+    ape_v = tl.load(ape_ptr + ape_idx * dim + d, mask=m).to(tl.float32)
+
+    tl.store(
+        boundary_kv_ptr
+        + phys * boundary_kv_blk_stride
+        + row * boundary_kv_row_stride
+        + d,
+        kv_v,
+        mask=m,
+    )
+    tl.store(
+        boundary_score_ptr
+        + phys * boundary_score_blk_stride
+        + row * boundary_score_row_stride
+        + d,
+        sc_v + ape_v,
+        mask=m,
+    )
+
+
+def capture_compressor_boundary(
+    kv: torch.Tensor,
+    score: torch.Tensor,
+    ape: torch.Tensor,
+    boundary_kv: torch.Tensor,
+    boundary_score: torch.Tensor,
+    *,
+    capture_plan: torch.Tensor,  # [num_capture, 4] int32
+    block_tables: torch.Tensor,  # [bs, max_blocks_per_seq] int32
+    block_size: int,
+    ratio: int,
+) -> None:
+    """In-place capture of a CSA layer's boundary-state snapshot.
+
+    For every token in `capture_plan` (the last `TAIL` positions of each block
+    this fwd finalized), copy its full compressor ring row into
+    `boundary_{kv,score}[phys, row]`, where `phys` is the terminal compressed
+    physical block id (`block_tables[batch_id, position // block_size]`) and
+    `row = position % block_size - (block_size - TAIL)`. `boundary_score` fuses
+    `+ ape[position % ratio]` to match the live ring bit-for-bit.
+
+    Args:
+      kv, score:  [N, dim] flat batched compressor projection (same tensors fed
+                  to `update_compressor_states`; strided allowed, inner stride 1).
+      ape:        [ratio, dim] absolute position embedding.
+      boundary_kv, boundary_score: [num_blocks, TAIL, dim] snapshot for THIS
+                  CSA layer (a per-layer slice of the runner-owned pool).
+      capture_plan: [num_capture, 4] int32 (ragged_id, batch_id, position, _),
+                  sentinel rows carry position=-1.
+      block_tables: [bs, max_blocks_per_seq] int32 logical→physical.
+      block_size, ratio: CSA geometry (128, 4).
+    """
+    assert kv.dim() == 2 and score.dim() == 2 and kv.shape == score.shape
+    assert boundary_kv.dim() == 3 and boundary_score.shape == boundary_kv.shape
+    tail = boundary_kv.shape[1]
+    dim = kv.shape[1]
+    assert (
+        boundary_kv.shape[2] == dim
+    ), f"boundary dim {boundary_kv.shape[2]} != ring row dim {dim}"
+    assert ape.dim() == 2 and ape.shape[0] == ratio and ape.shape[1] == dim
+    assert capture_plan.dim() == 2 and capture_plan.shape[1] == 4
+    assert capture_plan.dtype == torch.int32
+    assert block_size % ratio == 0, "block_size must be a multiple of ratio"
+    assert kv.stride(-1) == 1 and score.stride(-1) == 1
+    # Kernel is fully stride-driven (blk/row strides passed below), so a strided
+    # view is fine as long as the innermost `dim` is contiguous. The unified-KV
+    # byte-arena binds boundary_{kv,score} as fp32 as_strided views over the
+    # per-layer KV bytes (page stride > payload width), which are non-contiguous
+    # at dim-0/1 but dim-contiguous — allow them.
+    assert boundary_kv.stride(-1) == 1 and boundary_score.stride(-1) == 1
+    grid_size = capture_plan.shape[0]
+    if grid_size == 0:
+        return
+    BLOCK_D = triton.next_power_of_2(dim)
+    _capture_compressor_boundary_kernel[(grid_size,)](
+        kv,
+        kv.stride(0),
+        score,
+        score.stride(0),
+        ape,
+        capture_plan,
+        block_tables,
+        block_tables.stride(0),
+        boundary_kv,
+        boundary_kv.stride(0),
+        boundary_kv.stride(1),
+        boundary_score,
+        boundary_score.stride(0),
+        boundary_score.stride(1),
+        dim,
+        BLOCK_SIZE=block_size,
+        TAIL=tail,
+        RATIO=ratio,
+        NUM_PAGES=boundary_kv.shape[0],
+        BLOCK_D=BLOCK_D,
+    )
+
+
+def capture_compressor_boundary_reference(
+    kv: torch.Tensor,
+    score: torch.Tensor,
+    ape: torch.Tensor,
+    boundary_kv: torch.Tensor,
+    boundary_score: torch.Tensor,
+    *,
+    capture_plan: torch.Tensor,
+    block_tables: torch.Tensor,
+    block_size: int,
+    ratio: int,
+) -> None:
+    """Pure-PyTorch reference equivalent of `capture_compressor_boundary`.
+
+    `block_tables` here is the CSA page table (logical block -> page id); the
+    page indexes the boundary store directly. Unclaimed blocks (page < 0) are
+    skipped."""
+    tail = boundary_kv.shape[1]
+    plan_cpu = capture_plan.detach().cpu()
+    bt_cpu = block_tables.detach().cpu()
+    for i in range(plan_cpu.shape[0]):
+        ragged_id, batch_id, position, _ = plan_cpu[i].tolist()
+        if position < 0:
+            continue
+        page = int(bt_cpu[batch_id, position // block_size].item())
+        if page < 0:
+            continue
+        row = position % block_size - (block_size - tail)
+        boundary_kv[page, row] = kv[ragged_id]
+        boundary_score[page, row] = score[ragged_id] + ape[position % ratio]
+
+
+@triton.jit
+def _restore_compressor_boundary_kernel(
+    boundary_kv_ptr,  # [num_blocks, TAIL, dim]
+    boundary_kv_blk_stride: tl.constexpr,
+    boundary_kv_row_stride: tl.constexpr,
+    boundary_score_ptr,
+    boundary_score_blk_stride: tl.constexpr,
+    boundary_score_row_stride: tl.constexpr,
+    restore_plan_ptr,  # [num_restore, 4] int32 (source_phys, slot, boundary_B, _)
+    kv_state_ptr,
+    kv_state_slot_stride: tl.constexpr,
+    kv_state_pos_stride: tl.constexpr,
+    score_state_ptr,
+    score_state_slot_stride: tl.constexpr,
+    score_state_pos_stride: tl.constexpr,
+    dim: tl.constexpr,
+    STATE_SIZE: tl.constexpr,
+    TAIL: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """2D grid (num_restore, TAIL). Program (i, row) copies snapshot row `row`
+    of source block into the request's fresh ring at `(B - TAIL + row) %
+    STATE_SIZE`. Sentinel sources (source < 0) are skipped.
+    """
+    i = tl.program_id(0)
+    row = tl.program_id(1)
+    plan_base = restore_plan_ptr + i * 4
+    source = tl.load(plan_base + 0)
+    slot = tl.load(plan_base + 1)
+    boundary_b = tl.load(plan_base + 2)
+    if source < 0:
+        return
+    dst = (boundary_b - TAIL + row) % STATE_SIZE
+
+    d = tl.arange(0, BLOCK_D)
+    m = d < dim
+    kv_v = tl.load(
+        boundary_kv_ptr
+        + source * boundary_kv_blk_stride
+        + row * boundary_kv_row_stride
+        + d,
+        mask=m,
+    )
+    sc_v = tl.load(
+        boundary_score_ptr
+        + source * boundary_score_blk_stride
+        + row * boundary_score_row_stride
+        + d,
+        mask=m,
+    )
+    tl.store(
+        kv_state_ptr + slot * kv_state_slot_stride + dst * kv_state_pos_stride + d,
+        kv_v,
+        mask=m,
+    )
+    tl.store(
+        score_state_ptr
+        + slot * score_state_slot_stride
+        + dst * score_state_pos_stride
+        + d,
+        sc_v,
+        mask=m,
+    )
+
+
+def restore_compressor_boundary(
+    boundary_kv: torch.Tensor,
+    boundary_score: torch.Tensor,
+    kv_state: torch.Tensor,
+    score_state: torch.Tensor,
+    *,
+    restore_plan: torch.Tensor,  # [num_restore, 4] int32
+) -> None:
+    """In-place reseed of a CSA layer's per-request ring from the boundary
+    snapshot. For each `restore_plan` row `(source_phys, slot, B, _)` with
+    `source_phys >= 0`, copy the 4 snapshot rows of `source_phys` into
+    `kv_state[slot]`/`score_state[slot]` at ring positions
+    `(B - TAIL + row) % STATE_SIZE`, matching where `update_compressor_states`
+    would have placed absolute positions `B-4 .. B-1`. Pure copy — the score
+    snapshot already carries `+ ape`.
+
+    Args:
+      boundary_kv, boundary_score: [num_blocks, TAIL, dim] snapshot (per layer).
+      kv_state, score_state: [num_slots, STATE_SIZE, dim] live ring (per layer).
+      restore_plan: [num_restore, 4] int32; sentinel rows carry source=-1.
+    """
+    assert boundary_kv.dim() == 3 and boundary_score.shape == boundary_kv.shape
+    assert kv_state.dim() == 3 and score_state.shape == kv_state.shape
+    tail = boundary_kv.shape[1]
+    dim = boundary_kv.shape[2]
+    assert (
+        kv_state.shape[2] == dim
+    ), f"ring row dim {kv_state.shape[2]} != boundary dim {dim}"
+    state_size = kv_state.shape[1]
+    assert state_size >= tail
+    assert restore_plan.dim() == 2 and restore_plan.shape[1] == 4
+    assert restore_plan.dtype == torch.int32
+    # Stride-driven kernel: strided fp32 views over the byte arena are fine as
+    # long as the innermost `dim` is contiguous (see capture note above).
+    assert boundary_kv.stride(-1) == 1 and boundary_score.stride(-1) == 1
+    n = restore_plan.shape[0]
+    if n == 0:
+        return
+    BLOCK_D = triton.next_power_of_2(dim)
+    _restore_compressor_boundary_kernel[(n, tail)](
+        boundary_kv,
+        boundary_kv.stride(0),
+        boundary_kv.stride(1),
+        boundary_score,
+        boundary_score.stride(0),
+        boundary_score.stride(1),
+        restore_plan,
+        kv_state,
+        kv_state.stride(0),
+        kv_state.stride(1),
+        score_state,
+        score_state.stride(0),
+        score_state.stride(1),
+        dim,
+        STATE_SIZE=state_size,
+        TAIL=tail,
+        BLOCK_D=BLOCK_D,
+    )
+
+
+def restore_compressor_boundary_reference(
+    boundary_kv: torch.Tensor,
+    boundary_score: torch.Tensor,
+    kv_state: torch.Tensor,
+    score_state: torch.Tensor,
+    *,
+    restore_plan: torch.Tensor,
+) -> None:
+    """Pure-PyTorch reference equivalent of `restore_compressor_boundary`."""
+    tail = boundary_kv.shape[1]
+    state_size = kv_state.shape[1]
+    plan_cpu = restore_plan.detach().cpu()
+    for i in range(plan_cpu.shape[0]):
+        source, slot, boundary_b, _ = plan_cpu[i].tolist()
+        if source < 0:
+            continue
+        for row in range(tail):
+            dst = (boundary_b - tail + row) % state_size
+            kv_state[slot, dst] = boundary_kv[source, row]
+            score_state[slot, dst] = boundary_score[source, row]
