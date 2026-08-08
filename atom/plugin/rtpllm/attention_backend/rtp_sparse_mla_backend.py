@@ -1539,6 +1539,7 @@ def _run_rtp_sparse_attn_indexer_topk_only(
     weights_scale: float,
     is_neox_style: bool,
     use_qk_rope_cache_fusion: bool,
+    stable_topk: bool,
     context: Any,
     attn_metadata: Any,
 ) -> torch.Tensor:
@@ -1669,16 +1670,29 @@ def _run_rtp_sparse_attn_indexer_topk_only(
             cu_starts=cu_seqlen_ks,
             cu_ends=cu_seqlen_ke,
         )
-        top_k_per_row_prefill(
-            logits=logits,
-            rowStarts=cu_seqlen_ks,
-            rowEnds=cu_seqlen_ke,
-            indices=topk_indices[num_decode_tokens:num_tokens, :topk_tokens],
-            values=None,
-            numRows=logits.shape[0],
-            stride0=logits.stride(0),
-            stride1=logits.stride(1),
-        )
+        if stable_topk:
+            top_k_per_row_prefill(
+                logits=logits,
+                rowStarts=cu_seqlen_ks,
+                rowEnds=cu_seqlen_ke,
+                indices=topk_indices[num_decode_tokens:num_tokens, :topk_tokens],
+                values=None,
+                numRows=logits.shape[0],
+                stride0=logits.stride(0),
+                stride1=logits.stride(1),
+                stable=True,
+            )
+        else:
+            top_k_per_row_prefill(
+                logits=logits,
+                rowStarts=cu_seqlen_ks,
+                rowEnds=cu_seqlen_ke,
+                indices=topk_indices[num_decode_tokens:num_tokens, :topk_tokens],
+                values=None,
+                numRows=logits.shape[0],
+                stride0=logits.stride(0),
+                stride1=logits.stride(1),
+            )
         return weights
 
     max_seqlen_q = int(getattr(attn_metadata, "max_seqlen_q", 1) or 1)
@@ -1710,15 +1724,27 @@ def _run_rtp_sparse_attn_indexer_topk_only(
         KVBlockSize=runner_block_size,
         Preshuffle=True,
     )
-    top_k_per_row_decode(
-        logits,
-        next_n,
-        context_lens,
-        topk_indices[:num_decode_tokens, :topk_tokens],
-        logits.shape[0],
-        logits.stride(0),
-        logits.stride(1),
-    )
+    if stable_topk:
+        top_k_per_row_decode(
+            logits,
+            next_n,
+            context_lens,
+            topk_indices[:num_decode_tokens, :topk_tokens],
+            logits.shape[0],
+            logits.stride(0),
+            logits.stride(1),
+            stable=True,
+        )
+    else:
+        top_k_per_row_decode(
+            logits,
+            next_n,
+            context_lens,
+            topk_indices[:num_decode_tokens, :topk_tokens],
+            logits.shape[0],
+            logits.stride(0),
+            logits.stride(1),
+        )
     return weights
 
 
@@ -1745,6 +1771,7 @@ def rtp_sparse_attn_indexer(
     weights_scale: float,
     is_neox_style: bool,
     use_qk_rope_cache_fusion: bool,
+    stable_topk: bool,
 ) -> torch.Tensor:
     try:
         from atom.utils.forward_context import get_forward_context
@@ -1816,6 +1843,7 @@ def rtp_sparse_attn_indexer(
             weights_scale,
             is_neox_style,
             use_qk_rope_cache_fusion,
+            stable_topk,
             context,
             attn_metadata,
         )
@@ -1845,6 +1873,7 @@ def rtp_sparse_attn_indexer(
         weights_scale,
         is_neox_style,
         use_qk_rope_cache_fusion,
+        stable_topk,
     )
 
 
@@ -1871,6 +1900,7 @@ def rtp_sparse_attn_indexer_fake(
     weights_scale: float,
     is_neox_style: bool,
     use_qk_rope_cache_fusion: bool,
+    stable_topk: bool,
 ) -> torch.Tensor:
     from atom.models.deepseek_v2 import sparse_attn_indexer_fake
 
@@ -1897,6 +1927,7 @@ def rtp_sparse_attn_indexer_fake(
         weights_scale,
         is_neox_style,
         use_qk_rope_cache_fusion,
+        stable_topk,
     )
 
 

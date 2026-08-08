@@ -12,14 +12,19 @@ forward_impl_sparse handles everything end-to-end: RoPE, KV cache
 write, Q absorption, topk index conversion, sparse kernel, V up-projection.
 """
 
-import torch
+import logging
+from typing import Optional
 
+import torch
+import triton
+import triton.language as tl
 from aiter import (
     cp_gather_indexer_k_quant_cache,
     dtypes,
     indexer_k_quant_and_cache,
     indexer_qk_rope_quant_and_cache,
     top_k_per_row_decode,
+    top_k_per_row_prefill,
 )
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
@@ -27,12 +32,6 @@ from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 from atom.plugin.prepare import is_vllm
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
-
-import triton
-import triton.language as tl
-
-from typing import Optional
-import logging
 
 logger = logging.getLogger("atom")
 
@@ -263,6 +262,7 @@ def sparse_attn_indexer_plugin_mode(
     weights_scale: float,
     is_neox_style: bool,
     use_qk_rope_cache_fusion: bool,
+    stable_topk: bool,
 ) -> torch.Tensor:
     topk_indices = torch.full(
         (hidden_states.shape[0], topk_tokens),
@@ -419,19 +419,31 @@ def sparse_attn_indexer_plugin_mode(
                 )
                 num_rows = logits.shape[0]
                 topk_indices_prefill = topk_indices[q_start:q_end, :topk_tokens]
-                # Use top_k_per_row_prefill from vLLM to correctly handle row
-                # starts and ends. It also produces 0-based local indices,
-                # eliminating the need for conversion from global.
-                torch.ops._C.top_k_per_row_prefill(
-                    logits,
-                    row_ks,
-                    row_ke,
-                    topk_indices_prefill,
-                    num_rows,
-                    logits.stride(0),
-                    logits.stride(1),
-                    topk_tokens,
-                )
+                if stable_topk:
+                    top_k_per_row_prefill(
+                        logits,
+                        row_ks,
+                        row_ke,
+                        topk_indices_prefill,
+                        None,
+                        num_rows,
+                        logits.stride(0),
+                        logits.stride(1),
+                        k=topk_tokens,
+                        stable=True,
+                    )
+                else:
+                    # Preserve vLLM's existing operator on the non-stable path.
+                    torch.ops._C.top_k_per_row_prefill(
+                        logits,
+                        row_ks,
+                        row_ke,
+                        topk_indices_prefill,
+                        num_rows,
+                        logits.stride(0),
+                        logits.stride(1),
+                        topk_tokens,
+                    )
 
     if has_decode:
         decode_metadata = indexer_meta.decode
@@ -478,15 +490,27 @@ def sparse_attn_indexer_plugin_mode(
         num_rows = logits.shape[0]
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
         topk_indices_decode = topk_indices[:num_decode_tokens, :topk_tokens]
-        top_k_per_row_decode(
-            logits,
-            next_n,
-            decode_metadata.seq_lens,
-            topk_indices_decode,
-            num_rows,
-            logits.stride(0),
-            logits.stride(1),
-        )
+        if stable_topk:
+            top_k_per_row_decode(
+                logits,
+                next_n,
+                decode_metadata.seq_lens,
+                topk_indices_decode,
+                num_rows,
+                logits.stride(0),
+                logits.stride(1),
+                stable=True,
+            )
+        else:
+            top_k_per_row_decode(
+                logits,
+                next_n,
+                decode_metadata.seq_lens,
+                topk_indices_decode,
+                num_rows,
+                logits.stride(0),
+                logits.stride(1),
+            )
 
         if decode_metadata.requires_padding:
             # if padded, we need to unpack
@@ -539,6 +563,7 @@ def sparse_attn_indexer_fake(
     weights_scale: float,
     is_neox_style: bool,
     use_qk_rope_cache_fusion: bool,
+    stable_topk: bool,
 ) -> torch.Tensor:
     # profile run
     # NOTE(Chen): create the max possible flattened_kv. So that
