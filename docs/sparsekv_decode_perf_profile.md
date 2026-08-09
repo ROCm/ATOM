@@ -383,5 +383,51 @@ the noise the hit rate itself carries — but "no gain" was too strong a claim.
 0.90 is the best setting with any safety evidence: **+11% over the session's
 starting round and +16% over the 0.85 mean**, at zero failures. One clean round
 is not proof — 0.93 had two before it died — so this needs repeats before it
-ships, and the useful bound would be an actual accounting of the worst-case
-transient allocation rather than another empirical round.
+ships.
+
+> **Retracted.** The repeat came back at 29.2% hit / 251.9 tok/s. See below —
+> two samples cannot separate 0.90 from 0.85.
+
+## Retraction: 0.90 is not distinguishable from 0.85
+
+A second round at `PREFILL_GPU_UTIL=0.90` drew 29.2% hit and 251.9 tok/s,
+against the first round's 46.4% and 322.0. Both rounds ran clean. With two
+samples per setting:
+
+| prefill util | hit range | out tok/s range |
+|---|---|---|
+| 0.85 | 30.8 - 37.5% | 267.1 - 289.6 |
+| **0.90** | **29.2 - 46.4%** | **251.9 - 322.0** |
+| 0.93 | 47.9 - 53.5% | 350.5 - 389.8 |
+
+**0.90's range straddles 0.85's entirely**, so the "+16% at 0.90" claim above is
+withdrawn — it rested on one draw at the top of a very wide distribution. 0.93
+is the only setting whose samples both clear every other sample, and 0.93 OOMs.
+
+So the honest state is: **the only config change shown to raise throughput also
+kills the prefill node, and the safe intermediate value cannot be told apart
+from the baseline with the data collected.**
+
+### What this says about the method, including earlier claims here
+
+Throughput still tracks the hit rate tightly — 6 points fit `99 + 5.21 x hit%`
+at R^2 = 0.958 — so the mechanism is not in doubt. What is far noisier than
+assumed is **config -> hit**: at a fixed setting the hit rate swung 29.2% to
+46.4%, about 17 points, or +-35 tok/s of throughput. The closed-loop trace
+replay fixes the trajectory *set* by seed but not the interleaving, and which
+requests are in flight together is what decides reuse.
+
+Every single-round A/B in this document is therefore under-powered against that
+spread, including the ones that read as conclusions:
+
+- "gather optimization: -7.8% throughput" — inside the spread; the ITL halving
+  is the part that was measured well (it is a per-step property, not a
+  workload draw).
+- "decode GPU_UTIL: no throughput gain", later revised to "~+14 tok/s" — both
+  readings are inside the spread. Unresolved.
+- "prefill cache +46%" — the effect is larger than the spread and both 0.93
+  samples clear all others, so this one survives; the *size* of it does not.
+
+Resolving any of these needs three or more rounds per configuration (~6 h each)
+or a replay mode with a deterministic request interleaving. Comparing on hit
+rate with repeats, rather than on throughput from one round, is the cheaper fix.
