@@ -202,7 +202,7 @@ Measured on MI308X (192 GB/GPU), 1344×768 × 5.17 s, 50 steps, Ulysses-4:
 | resident per rank | 66 GB (DiT) |
 | rank 0, additionally | 10.4 GB video VAE + 0.6 GB audio VAE |
 | peak, rank 0 | ~171 GB |
-| denoise | ~450 s |
+| denoise | ~395 s |
 | decode + mux | ~28 s |
 
 The video VAE decodes in **bf16**. It is transformer-based rather than
@@ -220,15 +220,22 @@ Weights are read-only, so the host copy stays authoritative and releasing just
 drops the device copy -- no copy back. With the host side pinned at load, the
 per-request cost is **1.0 s** rather than the 12.7 s a naive round trip costs.
 
+Attention skips the trailing alignment padding. The ASM kernel's grid is
+`(heads, num_segments, ceil(max_seqlen / 256))` and is sized from `max_seqlen`
+rather than from each segment, so a 24-row padding segment gets a whole plane
+of 2,072 workgroups of which one has work. Dropping those rows halves the grid:
+93.0 -> 80.9 ms per layer, 30 s off a denoise, output pixel-identical. Triton
+shows no benefit (104.78 vs 104.66), so this is ASM-only.
+
 ### Against the sglang reference, same box, t2va at Ulysses-4
 
 | | reference | ATOM |
 |---|---:|---:|
 | text encode | ~23 s | ~23 s |
 | encoder staging | — | 1.0 s |
-| denoise | ~425 s | **424.7 s** |
+| denoise | ~425 s | **394.6 s** |
 | decode | 17.3 s | 27.7 s |
-| **total** | **465.5 s** | **~476 s** |
+| **total** | **465.5 s** | **~446 s** |
 
 Denoise is even. The reference is locked to the Triton attention kernel on
 gfx942 by an upstream workaround for an ASM hang that does not reproduce on

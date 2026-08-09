@@ -122,3 +122,65 @@ def test_env_is_not_consulted_once_constructed(monkeypatch):
         for m in model.modules()
         if hasattr(m, "attn_backend")
     )
+
+
+def test_pad_from_is_ignored_when_there_is_no_padding():
+    torch.manual_seed(0)
+    q, k, v = (torch.randn(12, 2, 8) for _ in range(3))
+    cu = torch.tensor([0, 12], dtype=torch.int32)
+    kw = {"cu_seqlens": cu, "max_seqlen": 12, "softmax_scale": 0.35, "backend": "sdpa"}
+    assert torch.equal(
+        packed_varlen_attention(q, k, v, **kw),
+        packed_varlen_attention(q, k, v, pad_from=12, **kw),
+    )
+
+
+def test_dropping_a_trailing_pad_segment_preserves_the_real_rows():
+    """The premise of the optimisation: padding lives in its own segment, so
+    no real token attends to it and removing it cannot change their output."""
+    torch.manual_seed(0)
+    q, k, v = (torch.randn(16, 2, 8) for _ in range(3))
+    used = 12
+    with_pad = packed_varlen_attention(
+        q,
+        k,
+        v,
+        cu_seqlens=torch.tensor([0, used, 16], dtype=torch.int32),
+        max_seqlen=used,
+        softmax_scale=0.35,
+        backend="sdpa",
+    )
+    without_pad = packed_varlen_attention(
+        q[:used],
+        k[:used],
+        v[:used],
+        cu_seqlens=torch.tensor([0, used], dtype=torch.int32),
+        max_seqlen=used,
+        softmax_scale=0.35,
+        backend="sdpa",
+    )
+    assert torch.equal(with_pad[:used], without_pad)
+
+
+def test_the_dit_passes_used_len_down_to_attention(monkeypatch):
+    """pad_from has to survive the whole chain -- packed_seq_params, the block
+    stack and the refiner -- or the optimisation silently does nothing."""
+    from atom.diffusion.models.minimax_h3 import dit as dit_mod
+    from tests.test_diffusion_minimax_h3 import make_inputs
+
+    arch = tiny_arch()
+    model = MiniMaxH3DiTModel(arch, attn_backend="sdpa").eval()
+    seen = []
+    original = dit_mod.packed_varlen_attention
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs.get("pad_from"))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(dit_mod, "packed_varlen_attention", spy)
+    inputs = make_inputs(arch)
+    inputs["packed_seq_params"] = {**inputs["packed_seq_params"], "used_len": 14}
+    with torch.no_grad():
+        model(**inputs)
+    # Refiner blocks see None (their own cu_seqlens), the DiT blocks see 14.
+    assert 14 in seen, seen

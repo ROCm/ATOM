@@ -81,11 +81,23 @@ def packed_varlen_attention(
     max_seqlen: int,
     softmax_scale: float,
     backend: "AttentionBackend | str | None" = None,
+    pad_from: int | None = None,
 ) -> torch.Tensor:
     """Non-causal varlen attention over a packed multi-segment sequence.
 
     ``q``/``k``/``v`` are ``[total_tokens, heads, head_dim]``; segments are
     delimited by ``cu_seqlens``.
+
+    ``pad_from`` marks where trailing alignment padding begins. Those rows are
+    dropped from the kernel call and zeroed in the result, which is *not* a
+    micro-optimisation: the ASM kernel's grid is
+    ``(heads, num_segments, ceil(max_seqlen / 256))``, sized from ``max_seqlen``
+    rather than from each segment, so a 24-row padding segment gets a full
+    plane of 2,072 workgroups of which one has work. Dropping it halves the
+    grid and measures 93.0 -> 80.9 ms per layer at H3's shapes.
+
+    Bit-exact: the padding already sits in its own segment, so no real token
+    attends to it either way.
     """
     backend = resolve_attention_backend(backend)
 
@@ -106,6 +118,30 @@ def packed_varlen_attention(
             return _sdpa_varlen(
                 q, k, v, cu_seqlens=cu_seqlens, softmax_scale=softmax_scale
             )
+
+    total = int(q.shape[0])
+    if (
+        pad_from is not None
+        and 0 < pad_from < total
+        and backend is AttentionBackend.ASM
+    ):
+        # Prefix views of contiguous tensors stay contiguous, and aiter writes
+        # through `out=`, so nothing is copied.
+        out = torch.empty_like(q)
+        out[pad_from:].zero_()
+        _varlen(
+            q=q[:pad_from].contiguous(),
+            k=k[:pad_from].contiguous(),
+            v=v[:pad_from].contiguous(),
+            cu_seqlens_q=cu_seqlens[:-1].contiguous(),
+            cu_seqlens_k=cu_seqlens[:-1].contiguous(),
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            softmax_scale=softmax_scale,
+            causal=False,
+            out=out[:pad_from],
+        )
+        return out
 
     out = _varlen(
         q=q.contiguous(),

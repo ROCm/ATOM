@@ -222,6 +222,9 @@ def run_denoise_loop(
             packed_seq_params={
                 "cu_seqlens_q": cu_seqlens,
                 "max_seqlen_q": max_seqlen,
+                # Where trailing alignment padding starts; lets attention drop
+                # a workgroup plane it would otherwise launch for dead rows.
+                "used_len": packed.get("used_len"),
             },
             refiner_packed_seq_params={
                 "cu_seqlens_q": torch.tensor(

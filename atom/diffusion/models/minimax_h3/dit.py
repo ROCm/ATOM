@@ -294,6 +294,7 @@ class MiniMaxH3Attention(nn.Module):
         *,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
+        pad_from: int | None = None,
     ) -> torch.Tensor:
         """Non-causal varlen attention over the packed sequence.
 
@@ -306,6 +307,7 @@ class MiniMaxH3Attention(nn.Module):
             v,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            pad_from=pad_from,
             softmax_scale=self.softmax_scale,
             backend=self.attn_backend,
         )
@@ -317,6 +319,7 @@ class MiniMaxH3Attention(nn.Module):
         rope_cache: torch.Tensor | None,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
+        pad_from: int | None = None,
         ulysses: UlyssesGroup,
     ) -> torch.Tensor:
         """[T_local, H] -> [T_local, H].
@@ -342,7 +345,9 @@ class MiniMaxH3Attention(nn.Module):
             k = ulysses.scatter_heads(k)
             v = ulysses.scatter_heads(v)
 
-        out = self._attend(q, k, v, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+        out = self._attend(
+            q, k, v, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, pad_from=pad_from
+        )
 
         if ulysses.enabled:
             out = ulysses.gather_heads(out)
@@ -420,6 +425,7 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
         *,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
+        pad_from: int | None = None,
         ulysses: UlyssesGroup,
     ) -> torch.Tensor:
         x = x + self.attn(
@@ -427,6 +433,7 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
             rope_cache=None,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            pad_from=pad_from,
             ulysses=ulysses,
         )
         return x + self.mlp(self.norm2(x))
@@ -452,10 +459,17 @@ class MiniMaxH3TokenRefiner(nn.Module):
         *,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
+        pad_from: int | None = None,
         ulysses: UlyssesGroup,
     ) -> torch.Tensor:
         for block in self.blocks:
-            x = block(x, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, ulysses=ulysses)
+            x = block(
+                x,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                pad_from=pad_from,
+                ulysses=ulysses,
+            )
         return self.final_norm(x)
 
 
@@ -489,6 +503,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         rope_cache: torch.Tensor | None,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
+        pad_from: int | None = None,
         ulysses: UlyssesGroup,
         adaln_params: tuple[torch.Tensor, ...] | None = None,
     ) -> torch.Tensor:
@@ -505,6 +520,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             rope_cache=rope_cache,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            pad_from=pad_from,
             ulysses=ulysses,
         )
         x = _modulate_gate(residual, gate_msa, h, combined_indices, dtype=_BF16)
@@ -693,6 +709,11 @@ class MiniMaxH3DiTModel(nn.Module):
             device=device, dtype=torch.int32
         )
         max_seqlen = int(self._psp(kwargs["packed_seq_params"], "max_seqlen_q"))
+        # Trailing alignment padding, if the caller declared it. Dropping those
+        # rows halves the attention grid; see packed_varlen_attention.
+        psp = kwargs["packed_seq_params"]
+        pad_from = psp.get("used_len") if isinstance(psp, dict) else None
+        pad_from = None if pad_from is None else int(pad_from)
         refiner_cu = self._psp(kwargs["refiner_packed_seq_params"], "cu_seqlens_q")
 
         world = self.ulysses.world_size
@@ -780,6 +801,7 @@ class MiniMaxH3DiTModel(nn.Module):
                 rope_cache=rope_cache,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
+                pad_from=pad_from,
                 ulysses=self.ulysses,
             )
 
