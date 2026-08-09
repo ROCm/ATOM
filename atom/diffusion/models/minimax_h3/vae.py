@@ -75,6 +75,45 @@ def load_checkpoint_vae(
     return model
 
 
+def enable_parallel_tiled_decode(vae, *, group, rank, world_size) -> bool:
+    """Point the checkpoint's bundled VAE at our sequence-parallel group.
+
+    The bundled VAE already implements tiled decode *and* the rank sharding for
+    it (``_local_tile_indices`` / ``_all_gather_tiled_results``), and
+    ``from_pretrained`` turns it on from the config. What it cannot know is our
+    process group, so it seeds a single-process state -- ``sp_size = 1`` -- and
+    every tile runs on one rank.
+
+    Overwriting that state is the whole of the change: decode then shards tiles
+    across the replica and all-gathers, which is what upstream does. Returns
+    False when there is nothing to distribute.
+    """
+    if world_size <= 1:
+        return False
+    import sys
+
+    module = sys.modules.get(type(vae).__module__)
+    get_state = getattr(module, "get_parallel_state", None)
+    if get_state is None:
+        logger.warning("bundled VAE exposes no parallel state; decode stays serial")
+        return False
+
+    # Mutated in place: klvae holds a reference to the same dict.
+    get_state().update(
+        {
+            "group_size": world_size,
+            "group_rank": rank,
+            "local_process_group": group,
+            "sp_size": world_size,
+            "sp_rank": rank,
+            "sp_enabled": True,
+            "sp_process_group": group,
+        }
+    )
+    logger.info("parallel tiled decode enabled: rank %d of %d", rank, world_size)
+    return True
+
+
 def latent_stats(path: str) -> tuple[list[float], list[float]] | None:
     """Read ``latents_mean``/``latents_std`` from a VAE config.
 

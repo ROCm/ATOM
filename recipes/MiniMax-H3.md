@@ -203,7 +203,7 @@ Measured on MI308X (192 GB/GPU), 1344×768 × 5.17 s, 50 steps, Ulysses-4:
 | rank 0, additionally | 10.4 GB video VAE + 0.6 GB audio VAE |
 | peak, rank 0 | ~171 GB |
 | denoise | ~395 s |
-| decode + mux | ~28 s |
+| decode + mux | ~28 s (Ulysses-4) / ~4 s (Ulysses-8) |
 
 The video VAE decodes in **bf16**. It is transformer-based rather than
 convolutional -- 39.7% of decode is `addmm`, 0.0% is convolution -- so the
@@ -219,6 +219,13 @@ before the encoder was moved off the resident set.
 Weights are read-only, so the host copy stays authoritative and releasing just
 drops the device copy -- no copy back. With the host side pinned at load, the
 per-request cost is **1.0 s** rather than the 12.7 s a naive round trip costs.
+
+Video decode is **collective**. The checkpoint's bundled VAE already
+implements tiled decode and the rank sharding for it, but seeds a
+single-process parallel state, so every tile ran on rank 0. Pointing it at the
+sequence-parallel group takes decode from 27.5 s to **4.1 s** at Ulysses-8,
+output pixel-identical. The video VAE therefore lives on every rank (~5 GB in
+bf16); the encoder and audio VAE stay on rank 0.
 
 Attention skips the trailing alignment padding. The ASM kernel's grid is
 `(heads, num_segments, ceil(max_seqlen / 256))` and is sized from `max_seqlen`

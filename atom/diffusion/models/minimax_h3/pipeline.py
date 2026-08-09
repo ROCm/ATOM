@@ -708,9 +708,15 @@ class DenoiseStage(PipelineStage):
 
 
 class DecodeStage(PipelineStage):
-    """VAE decode on rank 0 only; the result is written, not consumed."""
+    """VAE decode. Video is collective, audio and the output are rank 0's.
 
-    parallelism = StageParallelism.MAIN_RANK_ONLY
+    REPLICATED rather than MAIN_RANK_ONLY because the video VAE's tiled decode
+    is a collective: every rank decodes a slice of the tiles and they
+    all-gather. A rank that skips it hangs the others in that gather. Audio is
+    ~3 s of work on a 0.6 GB model, so it stays serial on rank 0.
+    """
+
+    parallelism = StageParallelism.REPLICATED
     requires = ("denoised_video", "denoised_audio", "geometry")
     produces = ("frames",)
 
@@ -797,6 +803,7 @@ class MiniMaxH3Pipeline(ComposedPipeline):
         from atom.diffusion.models.minimax_h3.text_encoder import MiniMaxH3TextEncoder
         from atom.diffusion.models.minimax_h3.vae import (
             VIDEO_VAE_DECODE_DTYPE,
+            enable_parallel_tiled_decode,
             load_checkpoint_vae,
         )
 
@@ -827,19 +834,25 @@ class MiniMaxH3Pipeline(ComposedPipeline):
         )
         self.register_component("transformer", dit)
 
+        # The video VAE lives on *every* rank: its bundled tiled decode shards
+        # tiles across the group, so a rank-0-only copy leaves the other GPUs
+        # idle through decode. bf16 because it is transformer-based, so decode
+        # is GEMM bound -- fp32 costs 88 s against bf16's 24 s for 51 dB.
+        video_vae = load_checkpoint_vae(
+            os.path.join(root, "video_vae"),
+            device=device,
+            dtype=VIDEO_VAE_DECODE_DTYPE,
+        )
+        self.parallel_decode = enable_parallel_tiled_decode(
+            video_vae,
+            group=self.ulysses.group,
+            rank=self.ulysses.rank,
+            world_size=self.ulysses.world_size,
+        )
+        self.register_component("video_vae", video_vae)
+
         if not self.ulysses.is_main:
             return
-
-        # bf16 for the video VAE: it is transformer-based, so decode is GEMM
-        # bound, and fp32 costs 88 s against bf16's 24 s for a 51 dB difference.
-        self.register_component(
-            "video_vae",
-            load_checkpoint_vae(
-                os.path.join(root, "video_vae"),
-                device=device,
-                dtype=VIDEO_VAE_DECODE_DTYPE,
-            ),
-        )
         self.register_component(
             "audio_vae",
             load_checkpoint_vae(os.path.join(root, "audio_vae"), device=device),

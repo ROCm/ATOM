@@ -32,6 +32,11 @@ class UlyssesGroup:
             self._rank = 0
 
     @property
+    def group(self):
+        """The underlying process group (None means the default group)."""
+        return self._group
+
+    @property
     def world_size(self) -> int:
         return self._world_size
 
