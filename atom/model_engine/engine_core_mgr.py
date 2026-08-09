@@ -722,7 +722,7 @@ class CoreManager:
             self._rank_tokens = [0] * self.local_engine_count
             self._seq_load.clear()
 
-    def send_utility_command(self, cmd: str, dp_rank: int = None):
+    def send_utility_command(self, cmd: str, dp_rank: int | None = None):
         if dp_rank is None:
             # Send to all DP ranks
             for rank in range(self.local_engine_count):
