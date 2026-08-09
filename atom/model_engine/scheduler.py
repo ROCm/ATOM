@@ -355,9 +355,9 @@ class ScheduledBatch:
             [seq.temperature for seq in seqs.values()], dtype=np.float32
         )
         self.return_logprobs = [seq.return_logprobs for seq in seqs.values()]
-        self.context_lens = np.asarray(
-            [seq.num_tokens for seq in seqs.values()], dtype=np.int32
-        )
+        # `context_lens` is set further down, once `num_cached_tokens` is known:
+        # a chunked prefill's context ends at this chunk, not at the whole
+        # prompt, so `seq.num_tokens` is only right for decode.
         self.num_rejected = np.asarray(
             [seq.num_rejected for seq in seqs.values()], dtype=np.int32
         )
