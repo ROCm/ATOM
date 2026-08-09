@@ -30,7 +30,7 @@ except ImportError:
     concat_and_cache_mla_seg = None
     fused_qk_rope_concat_and_cache_mla_seg = None
 from aiter.dist.parallel_state import get_dp_group
-from aiter.mla import mla_decode_fwd, mla_decode_fwd_ds32, mla_prefill_fwd
+from aiter.mla import mla_decode_fwd, mla_prefill_fwd
 from aiter.ops.triton.attention.mla import (
     mla_decode_fwd as triton_shuffle_mla_decode_fwd,
 )
@@ -63,6 +63,24 @@ from atom.utils.forward_context import (
     get_forward_context,
 )
 
+
+def _sparse_index_workspace(
+    out: Optional[torch.Tensor],
+    total_out: int,
+    *,
+    device: torch.device,
+    name: str,
+) -> torch.Tensor:
+    if out is None:
+        return torch.empty(total_out, dtype=torch.int32, device=device)
+    if out.numel() < total_out:
+        raise RuntimeError(
+            f"{name} requires {total_out} int32 sparse-index slots, "
+            f"but workspace has only {out.numel()}."
+        )
+    return out[:total_out]
+
+
 from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (  # isort: skip
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant as _aiter_triton_fp8_bmm,
 )
@@ -85,9 +103,6 @@ if fused_qk_rope_concat_and_cache_mla_seg is not None:
     )
 mla_prefill_fwd = mark_trace(mla_prefill_fwd, prefix="mla_prefill", torch_compile=False)
 mla_decode_fwd = mark_trace(mla_decode_fwd, prefix="mla_decode", torch_compile=False)
-mla_decode_fwd_ds32 = mark_trace(
-    mla_decode_fwd_ds32, prefix="mla_decode_ds32", torch_compile=False
-)
 
 # Shuffled-KV (block_size=64) Triton/Gluon MLA kernels, gated by
 # ATOM_USE_TRITON_MLA and ATOM_USE_TRITON_MLA_SHUFFLE_KV:. Write kernels mirror the aiter
@@ -124,79 +139,6 @@ _MLA_Q_OUT_PADDED_DIM = 768
 # Dims the fused seg kernels are compiled against (KV_LORA / PE_DIM constexprs).
 _MLA_SEG_KV_LORA_RANK = 512
 _MLA_SEG_PE_DIM = 64
-_DS32_NOPE_DIM = 512
-_DS32_ROPE_DIM = 64
-_DS32_SCALE_DIM = _DS32_NOPE_DIM // 32
-_DS32_CACHE_BYTES = _DS32_NOPE_DIM + _DS32_SCALE_DIM + _DS32_ROPE_DIM * 2
-
-
-@triton.jit
-def _ds32_store_kv_kernel(
-    k_nope,
-    k_scale,
-    k_rope,
-    cache_nope,
-    cache_scale,
-    cache_rope,
-    slot_mapping,
-    stride_kn_t,
-    stride_ks_t,
-    stride_kr_t,
-    stride_cn_t,
-    stride_cs_t,
-    stride_cr_t,
-    NOPE_DIM: tl.constexpr,
-    SCALE_DIM: tl.constexpr,
-    ROPE_DIM: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    token_idx = tl.program_id(0)
-    offsets = tl.arange(0, BLOCK)
-    slot = tl.load(slot_mapping + token_idx)
-    valid_slot = slot >= 0
-
-    nope_mask = valid_slot & (offsets < NOPE_DIM)
-    nope = tl.load(k_nope + token_idx * stride_kn_t + offsets, mask=nope_mask)
-    tl.store(cache_nope + slot * stride_cn_t + offsets, nope, mask=nope_mask)
-
-    scale_mask = valid_slot & (offsets < SCALE_DIM)
-    scale = tl.load(k_scale + token_idx * stride_ks_t + offsets, mask=scale_mask)
-    tl.store(cache_scale + slot * stride_cs_t + offsets, scale, mask=scale_mask)
-
-    rope_mask = valid_slot & (offsets < ROPE_DIM)
-    rope = tl.load(k_rope + token_idx * stride_kr_t + offsets, mask=rope_mask)
-    tl.store(cache_rope + slot * stride_cr_t + offsets, rope, mask=rope_mask)
-
-
-def _ds32_store_kv(
-    k_nope: torch.Tensor,
-    k_scale: torch.Tensor,
-    k_rope: torch.Tensor,
-    cache_nope: torch.Tensor,
-    cache_scale: torch.Tensor,
-    cache_rope: torch.Tensor,
-    slot_mapping: torch.Tensor,
-) -> None:
-    _ds32_store_kv_kernel[(k_nope.shape[0],)](
-        k_nope,
-        k_scale,
-        k_rope,
-        cache_nope,
-        cache_scale,
-        cache_rope,
-        slot_mapping.flatten(),
-        k_nope.stride(0),
-        k_scale.stride(0),
-        k_rope.stride(0),
-        cache_nope.stride(0),
-        cache_scale.stride(0),
-        cache_rope.stride(0),
-        NOPE_DIM=_DS32_NOPE_DIM,
-        SCALE_DIM=_DS32_SCALE_DIM,
-        ROPE_DIM=_DS32_ROPE_DIM,
-        BLOCK=512,
-    )
-
 
 if False:
     try:
@@ -279,6 +221,49 @@ def _mla_output_width(impl: _MLAOutputShape, hidden_size: int) -> int:
     return hidden_size
 
 
+def requires_persistent_mode(
+    atom_config,
+    mla_modules: MLAModules,
+    *,
+    kv_cache_dtype: str,
+    num_heads: int,
+    num_kv_heads: int,
+) -> bool:
+    """Whether legacy MLA must stay persistent for GLM-5.2 DPA decode.
+
+    AITER's FP8 Q/FP8 KV GQA64 kernel is available only in persistent mode.
+    Keep this gate exact so other DPA models retain the existing non-persistent
+    policy and all MLA variants continue to use the common 576-wide KV layout.
+    """
+    return (
+        atom_config.enable_dp_attention
+        and kv_cache_dtype == "fp8"
+        and getattr(mla_modules, "is_sparse", False)
+        and getattr(atom_config.hf_config, "model_type", None) == "glm_moe_dsa"
+        and mla_modules.kv_lora_rank == 512
+        and mla_modules.qk_rope_head_dim == 64
+        and num_heads == 64
+        and num_kv_heads == 1
+    )
+
+
+def is_persistent_mode(
+    *,
+    dp_size: int,
+    persistent_required: bool,
+    page_size: int,
+    dcp_world_size: int,
+    dcp_persistent_supported: bool,
+) -> bool:
+    """Apply the common persistent-mode policy and required exceptions."""
+    use_persistent = dp_size <= 1 or persistent_required
+    if page_size > 1:
+        use_persistent = False
+    if dcp_world_size > 1 and not dcp_persistent_supported:
+        use_persistent = False
+    return use_persistent
+
+
 def dynamic_per_batched_tensor_quant(
     x: torch.Tensor, dtype: torch.dtype = torch.float8_e4m3fn
 ):
@@ -311,19 +296,7 @@ class MLAAttention(nn.Module):
         self.kv_cache_dtype = "fp8" if kv_cache_dtype.startswith("fp8") else "auto"
         self.dtype = dtype
 
-        atom_config = get_current_atom_config()
-        # Select the dedicated DS32 kernel only for GLM DPA with the expected
-        # sparse MLA layout. PCP-only keeps the existing MLA/PCP path.
-        self.use_ds32 = (
-            atom_config.enable_dp_attention
-            and self.kv_cache_dtype == "fp8"
-            and getattr(mla_modules, "is_sparse", False)
-            and getattr(atom_config.hf_config, "model_type", None) == "glm_moe_dsa"
-            and mla_modules.kv_lora_rank == _DS32_NOPE_DIM
-            and mla_modules.qk_rope_head_dim == _DS32_ROPE_DIM
-        )
-        min_mla_heads = 128 if self.use_ds32 else _MLA_MIN_HEADS
-        self.padded_num_heads = max(num_heads, min_mla_heads)
+        self.padded_num_heads = max(num_heads, _MLA_MIN_HEADS)
         self.head_repeat_factor = 1
         self.head_pad = 0
         if self.padded_num_heads != num_heads:
@@ -352,6 +325,14 @@ class MLAAttention(nn.Module):
         self.one_scale = torch.tensor(1.0, dtype=torch.float32)
         self._k_scale = self.one_scale
         self._q_scale = self.one_scale
+        atom_config = get_current_atom_config()
+        self._requires_persistent_mode = requires_persistent_mode(
+            atom_config,
+            mla_modules,
+            kv_cache_dtype=self.kv_cache_dtype,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+        )
         # Derive sparsity from the model-level flag, not from whether THIS layer
         # owns an indexer: GLM-5.2 IndexShare "shared" layers have indexer=None
         # but must still run sparse MLA, reusing the prior "full" layer's top-k.
@@ -439,162 +420,6 @@ class MLAAttention(nn.Module):
         if self.head_pad > 0:
             return output[:, : (num_heads or self.num_heads), ...].contiguous()
         return output
-
-    def _validate_ds32_caches(
-        self,
-        kv_nope: torch.Tensor,
-        kv_scale: torch.Tensor,
-        kv_rope: torch.Tensor,
-    ) -> None:
-        """Verify the three independent cache buffers match the DS32 ABI."""
-        expected = (
-            (kv_nope, dtypes.fp8, _DS32_NOPE_DIM, "NoPE"),
-            (kv_scale, torch.uint8, _DS32_SCALE_DIM, "scale"),
-            (kv_rope, torch.bfloat16, _DS32_ROPE_DIM, "RoPE"),
-        )
-        for tensor, dtype, width, name in expected:
-            if (
-                tensor is None
-                or tensor.dtype != dtype
-                or tensor.ndim != 2
-                or tensor.shape[1] != width
-                or tensor.stride() != (width, 1)
-            ):
-                raise RuntimeError(
-                    f"DS32 {name} cache must be contiguous [slots, {width}] "
-                    f"{dtype}, got {None if tensor is None else (tensor.shape, tensor.dtype, tensor.stride())}."
-                )
-
-    def _ds32_quantize_nope(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Quantize a 512-wide MLA latent to MXFP8 with per-1x32 E8M0 scales."""
-        shape = x.shape
-        if shape[-1] != _DS32_NOPE_DIM:
-            raise RuntimeError(f"DS32 NoPE dimension must be 512, got {shape[-1]}.")
-        x_fp8, scale = get_hip_quant(QuantType.per_1x32)(
-            x.reshape(-1, _DS32_NOPE_DIM),
-            quant_dtype=dtypes.fp8,
-            scale_type=dtypes.fp8_e8m0,
-            shuffle=False,
-        )
-        x_fp8 = x_fp8.view(*shape)
-        scale = scale.view(torch.uint8).view(*shape[:-1], _DS32_SCALE_DIM)
-        return x_fp8, scale
-
-    def _write_ds32_kv_cache(
-        self,
-        k_nope: torch.Tensor,
-        k_rope: torch.Tensor,
-        kv_nope: torch.Tensor,
-        kv_scale: torch.Tensor,
-        kv_rope: torch.Tensor,
-        slot_mapping: torch.Tensor,
-    ) -> None:
-        """Quantize and store new KV entries in the three DS32 cache buffers."""
-        self._validate_ds32_caches(kv_nope, kv_scale, kv_rope)
-        k_nope_fp8, k_scale = self._ds32_quantize_nope(
-            k_nope.reshape(-1, _DS32_NOPE_DIM)
-        )
-        _ds32_store_kv(
-            k_nope_fp8,
-            k_scale,
-            k_rope.reshape(-1, _DS32_ROPE_DIM).to(torch.bfloat16),
-            kv_nope,
-            kv_scale,
-            kv_rope,
-            slot_mapping,
-        )
-
-    def _forward_ds32(
-        self,
-        q_nope: torch.Tensor,
-        q_rope: torch.Tensor,
-        q_scale: torch.Tensor,
-        kv_nope: torch.Tensor,
-        kv_scale: torch.Tensor,
-        kv_rope: torch.Tensor,
-        attn_metadata: AttentionMetaData,
-        *,
-        is_prefill: bool,
-    ) -> torch.Tensor:
-        """Run DS32 sparse MLA with mode-specific persistent work metadata."""
-        # This path requires sparse top-k KV indices and currently supports
-        # single-token decode only; multi-token decode is the MTP case.
-        if not self.is_sparse_mla:
-            raise RuntimeError("DS32 is only used by sparse MLA.")
-        if not is_prefill and attn_metadata.max_seqlen_q > 1:
-            raise RuntimeError("DS32 MTP verification is not enabled in phase 1.")
-
-        # Adapt GLM's query-head count to the DS32 kernel contract. Apply the
-        # same transformation to values and their corresponding block scales.
-        num_heads_q = q_nope.shape[1]
-        q_nope = self._pad_query_heads(q_nope)
-        q_rope = self._pad_query_heads(q_rope).to(torch.bfloat16)
-        q_scale = self._pad_query_heads(q_scale)
-        self._validate_ds32_caches(kv_nope, kv_scale, kv_rope)
-
-        # Prefill and decode use different query indptr and persistent
-        # work/reduction metadata, while sharing sparse KV page metadata.
-        if is_prefill:
-            qo_indptr = attn_metadata.sparse_cu_seqlens_q
-            kv_indptr = attn_metadata.sparse_kv_indptr
-            kv_indices = self.sparse_kv_indices_buffer
-            kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens
-            work_meta_data = attn_metadata.sparse_prefill_work_meta_data
-            work_indptr = attn_metadata.sparse_prefill_work_indptr
-            work_info_set = attn_metadata.sparse_prefill_work_info_set
-            reduce_indptr = attn_metadata.sparse_prefill_reduce_indptr
-            reduce_final_map = attn_metadata.sparse_prefill_reduce_final_map
-            reduce_partial_map = attn_metadata.sparse_prefill_reduce_partial_map
-        else:
-            qo_indptr = attn_metadata.cu_seqlens_q
-            kv_indptr = attn_metadata.sparse_kv_indptr
-            kv_indices = self.sparse_kv_indices_buffer
-            kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens
-            work_meta_data = attn_metadata.work_meta_data
-            work_indptr = attn_metadata.work_indptr
-            work_info_set = attn_metadata.work_info_set
-            reduce_indptr = attn_metadata.reduce_indptr
-            reduce_final_map = attn_metadata.reduce_final_map
-            reduce_partial_map = attn_metadata.reduce_partial_map
-
-        if kv_indices is None:
-            raise RuntimeError("DS32 sparse KV indices are not bound.")
-
-        # The kernel returns one 512-wide compressed value latent per query
-        # head; V-up and output projections are applied after head restoration.
-        output = torch.empty(
-            q_nope.shape[0],
-            q_nope.shape[1],
-            _DS32_NOPE_DIM,
-            dtype=torch.bfloat16,
-            device=q_nope.device,
-        )
-        mla_decode_fwd_ds32(
-            q_nope,
-            q_rope,
-            kv_nope,
-            kv_rope,
-            output,
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            kv_last_page_lens,
-            1,
-            page_size=1,
-            nhead_kv=1,
-            sm_scale=self.scale,
-            num_kv_splits=16,
-            work_meta_data=work_meta_data,
-            work_indptr=work_indptr,
-            work_info_set=work_info_set,
-            reduce_indptr=reduce_indptr,
-            reduce_final_map=reduce_final_map,
-            reduce_partial_map=reduce_partial_map,
-            q_scale=q_scale,
-            kv_scale=kv_scale,
-        )
-        output = self._restore_query_heads(output, num_heads_q)
-        return self._v_up_proj_and_o_proj(output)
 
     def _seg_kv_cache_view(self, kv_cache: torch.Tensor) -> torch.Tensor:
         """Reshape the KV cache buffer into the page-level flat seg layout
@@ -1489,11 +1314,13 @@ class MLAAttention(nn.Module):
                     paged_kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens
 
             dp_size = get_dp_group().world_size
-            use_persistent_mode = not (dp_size > 1)
-            if envs.ATOM_MLA_PAGE_SIZE > 1:
-                use_persistent_mode = False
-            if self.dcp_world_size > 1 and not self.dcp_persistent_supported:
-                use_persistent_mode = False
+            use_persistent_mode = is_persistent_mode(
+                dp_size=dp_size,
+                persistent_required=self._requires_persistent_mode,
+                page_size=envs.ATOM_MLA_PAGE_SIZE,
+                dcp_world_size=self.dcp_world_size,
+                dcp_persistent_supported=self.dcp_persistent_supported,
+            )
 
             # Sparse layers in MTP verify use separate persistent metadata
             # (per-token, max_seqlen_qo=1) while dense layers use normal metadata
@@ -1655,10 +1482,7 @@ class MLAAttention(nn.Module):
             output = torch.empty(output_shape, dtype=output_dtype, device=q.device)
             return output
         kv_cache_data = forward_context.kv_cache_data
-        layer_cache = kv_cache_data[f"layer_{self.layer_num}"]
-        kv_cache = layer_cache.k_cache
-        ds32_kv_scale = layer_cache.k_scale if self.use_ds32 else None
-        ds32_kv_rope = layer_cache.v_cache if self.use_ds32 else None
+        kv_cache = kv_cache_data[f"layer_{self.layer_num}"].k_cache
 
         if context.is_prefill and not use_prefill_mla:
             prefill_q = self.q_proj(q, x_scale=q_scale).view(
@@ -1668,18 +1492,7 @@ class MLAAttention(nn.Module):
             self.rotary_emb(positions, prefill_q_pe, k_rope)
 
             if kv_cache.numel() > 0:
-                if self.use_ds32:
-                    # DS32 stores the compressed NoPE latent, its E8M0 block
-                    # scales, and the RoPE component in independent buffers.
-                    self._write_ds32_kv_cache(
-                        k_nope,
-                        k_rope,
-                        kv_cache,
-                        ds32_kv_scale,
-                        ds32_kv_rope,
-                        attn_metadata.slot_mapping,
-                    )
-                elif envs.ATOM_USE_TRITON_MLA and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
+                if envs.ATOM_USE_TRITON_MLA and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
                     shuffled_cache = self._shuffled_kv_view(kv_cache)
                     triton_cat_and_cache_mla(
                         k_nope.view(-1, self.num_kv_heads, self.kv_lora_rank),
@@ -1735,35 +1548,6 @@ class MLAAttention(nn.Module):
                 )
         else:
             q_nope, q_rope = self._q_proj_and_k_up_proj(q, x_scale=q_scale)
-
-            if self.use_ds32:
-                # DS32 flow:
-                # - Apply RoPE and quantize the 512-wide query latent.
-                # - Write NoPE, scale, and RoPE to independent KV caches.
-                # - Run sparse attention, then V-up and output projection.
-                self.rotary_emb(positions, q_rope, k_rope)
-                q_nope_fp8, q_nope_scale = self._ds32_quantize_nope(q_nope)
-
-                if kv_cache.numel() > 0:
-                    self._write_ds32_kv_cache(
-                        k_nope,
-                        k_rope,
-                        kv_cache,
-                        ds32_kv_scale,
-                        ds32_kv_rope,
-                        attn_metadata.slot_mapping,
-                    )
-
-                return self._forward_ds32(
-                    q_nope_fp8,
-                    q_rope,
-                    q_nope_scale,
-                    kv_cache,
-                    ds32_kv_scale,
-                    ds32_kv_rope,
-                    attn_metadata,
-                    is_prefill=context.is_prefill,
-                )
 
             # ---- Prefill Context Parallel --------------------------------
             # q is this rank's 1/pcp queries, so q_out is naturally 1/pcp. But
@@ -1947,6 +1731,9 @@ def _convert_req_index_to_global_index_kernel(
     out_kv_indices,  # int32
     # shapes (compile-time where possible)
     NUM_TOPK_TOKENS: tl.constexpr,
+    OUT_NUMEL: tl.constexpr,
+    TOKEN_ROWS: tl.constexpr,
+    KV_INDICES_NUMEL: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,  # tile width along columns
     # strides (in elements)
@@ -1972,20 +1759,37 @@ def _convert_req_index_to_global_index_kernel(
     for token_id in range(qo_start, qo_end):
         # Load token indices for this tile
         ti_ptr = token_indices_ptr + token_id * ti_stride0 + indice_id * ti_stride1
-        tok = tl.load(ti_ptr)  # int32
+        valid_token_row = (token_id >= 0) & (token_id < TOKEN_ROWS)
+        tok = tl.load(ti_ptr, mask=valid_token_row, other=-1)  # int32
 
         # Split masks: store_mask = column-valid, load_mask adds tok-bound
         # guard to prevent OOB GPU fault (masked load yields 0 = valid page).
-        store_mask = (indice_id < kv_len) & (indice_id < NUM_TOPK_TOKENS)
-        load_mask = store_mask & (tok >= 0) & (tok < kv_len)
+        valid_col_mask = (indice_id < kv_len) & (indice_id < NUM_TOPK_TOKENS)
+        kv_offset = kv_start + tok
+        load_mask = (
+            valid_token_row
+            & valid_col_mask
+            & (tok >= 0)
+            & (tok < kv_len)
+            & (kv_offset >= 0)
+            & (kv_offset < KV_INDICES_NUMEL)
+        )
         out_val = tl.load(
-            kv_indices + kv_start + tok,
+            kv_indices + kv_offset,
             mask=load_mask,
             other=0,
         )
+        out_val = tl.where(out_val >= 0, out_val, 0)
 
         # Store results
-        out_ptr_ij = out_kv_indices + out_kv_start + indice_id
+        out_offset = out_kv_start + indice_id
+        store_mask = (
+            valid_token_row
+            & valid_col_mask
+            & (out_offset >= 0)
+            & (out_offset < OUT_NUMEL)
+        )
+        out_ptr_ij = out_kv_indices + out_offset
         tl.store(
             out_ptr_ij,
             out_val,
@@ -2010,9 +1814,8 @@ def triton_convert_req_index_to_global_index(
             token_indices[token_id, indice_id] // BLOCK_SIZE] * BLOCK_SIZE
         + token_indices[token_id, indice_id] % BLOCK_SIZE
 
-    Only when token_indices[token_id, indice_id] == -1 do we output -1.
-    For safety, we also output -1 if the derived block_id would be
-        out-of-bounds.
+    Invalid metadata is mapped to cache slot 0 so it cannot become a negative
+    or out-of-range address in the downstream assembly MLA kernel.
     """
     assert kv_indices.dtype == torch.int32
     assert token_indices.dtype == torch.int32
@@ -2022,20 +1825,31 @@ def triton_convert_req_index_to_global_index(
         f"BLOCK_N ({BLOCK_N})"
     )
 
-    num_batch = kv_indptr.shape[0] - 1
+    # DP attention can expose transient local/global metadata length skew.
+    # Launch only rows represented by every indptr; otherwise the kernel reads
+    # qo/page indptr one row past its allocation before payload guards apply.
+    num_batch = min(
+        qo_indptr.shape[0] - 1,
+        kv_indptr.shape[0] - 1,
+        page_kv_indptr.shape[0] - 1,
+    )
     tiles_per_row = NUM_TOPK_TOKENS // BLOCK_N
 
     # Ensure contiguous tensors on the same device
-    qo_indptr_c = qo_indptr.contiguous()
-    kv_indptr_c = kv_indptr.contiguous()
+    qo_indptr_c = qo_indptr[: num_batch + 1].contiguous()
+    kv_indptr_c = kv_indptr[: num_batch + 1].contiguous()
     kv_indices_c = kv_indices.contiguous()
     token_indices_c = token_indices.contiguous()
-    page_kv_indptr_c = page_kv_indptr.contiguous()
-    # NOTE: MTP (max_seqlen_q > 1) uses triton_convert_req_index_to_global_index_dsa_prefill instead
-    if out is not None:
-        new_kv_indices = out[: kv_indices.shape[0]]
-    else:
-        new_kv_indices = torch.empty_like(kv_indices)
+    page_kv_indptr_c = page_kv_indptr[: num_batch + 1].contiguous()
+    # Sparse output is packed by page_kv_indptr.  Its workspace upper bound is
+    # rows * topk, not the dense kv_indices length.
+    total_out = num_batch * NUM_TOPK_TOKENS
+    new_kv_indices = _sparse_index_workspace(
+        out,
+        total_out,
+        device=token_indices.device,
+        name="triton_convert_req_index_to_global_index",
+    )
 
     # Strides in elements
     ti_stride0, ti_stride1 = token_indices_c.stride()
@@ -2052,6 +1866,9 @@ def triton_convert_req_index_to_global_index(
         new_kv_indices,
         # shapes / constexprs
         NUM_TOPK_TOKENS,
+        new_kv_indices.numel(),
+        token_indices_c.shape[0],
+        kv_indices_c.numel(),
         BLOCK_SIZE,
         BLOCK_N,
         # strides
@@ -2072,6 +1889,9 @@ def _convert_req_index_to_global_index_dsa_prefill_kernel(
     out_kv_indices,  # int32
     # shapes (compile-time where possible)
     NUM_TOPK_TOKENS: tl.constexpr,
+    OUT_NUMEL: tl.constexpr,
+    NUM_REQ: tl.constexpr,
+    MAX_NUM_BLOCKS_PER_REQ: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,  # tile width along columns
     # strides (in elements)
@@ -2086,6 +1906,7 @@ def _convert_req_index_to_global_index_dsa_prefill_kernel(
     col_id = tile_id * BLOCK_N + tl.arange(0, BLOCK_N)
 
     req_id = tl.load(token_to_seq_idxs + token_id)  # int32
+    valid_req = (req_id >= 0) & (req_id < NUM_REQ)
 
     kv_start = tl.load(dsa_kv_indptr + token_id)
     kv_end = tl.load(dsa_kv_indptr + token_id + 1)
@@ -2095,24 +1916,43 @@ def _convert_req_index_to_global_index_dsa_prefill_kernel(
     indice = tl.load(
         topk_indices + token_id * ti_stride0 + col_id * ti_stride1
     )  # int32
-    pre_seqlens_q = tl.load(cu_seqlens_q + req_id)
+    pre_seqlens_q = tl.load(cu_seqlens_q + req_id, mask=valid_req, other=0)
+    req_kv_end = tl.load(cu_seqlens_q + req_id + 1, mask=valid_req, other=0)
+    req_kv_len = req_kv_end - pre_seqlens_q
 
     seq_token_idx = indice - pre_seqlens_q
     block_id = seq_token_idx // PAGE_SIZE
     inblock_offset = seq_token_idx % PAGE_SIZE
 
     # Guard block_table access
-    store_mask = (col_id < kv_len) & (col_id < NUM_TOPK_TOKENS)
-    valid_mask = store_mask & (indice >= 0)
+    out_offset = kv_start + col_id
+    store_mask = (
+        (col_id < kv_len)
+        & (col_id < NUM_TOPK_TOKENS)
+        & (out_offset >= 0)
+        & (out_offset < OUT_NUMEL)
+    )
+    valid_mask = (
+        valid_req
+        & store_mask
+        & (indice >= 0)
+        & (seq_token_idx >= 0)
+        & (seq_token_idx < req_kv_len)
+        & (block_id >= 0)
+        & (block_id < MAX_NUM_BLOCKS_PER_REQ)
+    )
     physical_block = tl.load(
         block_table + req_id * bt_stride0 + block_id * bt_stride1,
         mask=valid_mask,
         other=-1,
     )
-    out_val = tl.where(valid_mask, physical_block * PAGE_SIZE + inblock_offset, -1)
+    physical_valid = valid_mask & (physical_block >= 0)
+    out_val = tl.where(
+        physical_valid, physical_block * PAGE_SIZE + inblock_offset, 0
+    )
 
     # Store results
-    out_ptr_ij = out_kv_indices + kv_start + col_id
+    out_ptr_ij = out_kv_indices + out_offset
     tl.store(
         out_ptr_ij,
         out_val,
@@ -2140,16 +1980,27 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
         f"BLOCK_N ({BLOCK_N})"
     )
 
-    num_tokens = dsa_qo_indptr.shape[0] - 1
+    num_tokens = min(
+        dsa_qo_indptr.shape[0] - 1,
+        dsa_kv_indptr.shape[0] - 1,
+        token_to_seq_idxs.shape[0],
+        topk_indices.shape[0],
+    )
+    dsa_qo_indptr = dsa_qo_indptr[: num_tokens + 1]
+    dsa_kv_indptr = dsa_kv_indptr[: num_tokens + 1]
+    token_to_seq_idxs = token_to_seq_idxs[:num_tokens]
+    topk_indices = topk_indices[:num_tokens]
     tiles_per_row = NUM_TOPK_TOKENS // BLOCK_N
 
     total_out = num_tokens * NUM_TOPK_TOKENS
-    if out is not None:
-        new_kv_indices = out[:total_out]
-    else:
-        new_kv_indices = torch.empty(
-            total_out, dtype=torch.int32, device=topk_indices.device
-        )
+    new_kv_indices = _sparse_index_workspace(
+        out,
+        total_out,
+        device=topk_indices.device,
+        name="triton_convert_req_index_to_global_index_dsa_prefill",
+    )
+    num_req = min(block_table.shape[0], cu_seqlens_q.shape[0] - 1)
+    max_num_blocks_per_req = block_table.shape[1]
 
     # Strides in elements
     ti_stride0, ti_stride1 = topk_indices.stride()
@@ -2167,6 +2018,9 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
         new_kv_indices,
         # shapes / constexprs
         NUM_TOPK_TOKENS,
+        new_kv_indices.numel(),
+        num_req,
+        max_num_blocks_per_req,
         PAGE_SIZE,
         BLOCK_N,
         # strides
@@ -2187,6 +2041,9 @@ def _gather_kv_indices_sparse_kernel(
     kv_indptr,
     out_kv_indices,
     NUM_TOPK_TOKENS: tl.constexpr,
+    OUT_NUMEL: tl.constexpr,
+    NUM_REQ: tl.constexpr,
+    KV_INDICES_NUMEL: tl.constexpr,
     BLOCK_N: tl.constexpr,
     ti_stride0: tl.int64,
     ti_stride1: tl.constexpr,
@@ -2196,6 +2053,7 @@ def _gather_kv_indices_sparse_kernel(
     col_id = tile_id * BLOCK_N + tl.arange(0, BLOCK_N)
 
     req_id = tl.load(token_to_seq_idxs + token_id)
+    valid_req = (req_id >= 0) & (req_id < NUM_REQ)
 
     out_start = tl.load(sparse_kv_indptr + token_id)
     out_end = tl.load(sparse_kv_indptr + token_id + 1)
@@ -2203,21 +2061,36 @@ def _gather_kv_indices_sparse_kernel(
 
     pos = tl.load(topk_indices + token_id * ti_stride0 + col_id * ti_stride1)
 
-    kv_base = tl.load(kv_indptr + req_id)
-    kv_end = tl.load(kv_indptr + req_id + 1)
+    kv_base = tl.load(kv_indptr + req_id, mask=valid_req, other=0)
+    kv_end = tl.load(kv_indptr + req_id + 1, mask=valid_req, other=0)
     req_kv_len = kv_end - kv_base
 
-    store_mask = (col_id < kv_len) & (col_id < NUM_TOPK_TOKENS)
-    valid_mask = store_mask & (pos >= 0) & (pos < req_kv_len)
+    out_offset = out_start + col_id
+    store_mask = (
+        valid_req
+        & (col_id < kv_len)
+        & (col_id < NUM_TOPK_TOKENS)
+        & (out_offset >= 0)
+        & (out_offset < OUT_NUMEL)
+    )
+    kv_offset = kv_base + pos
+    valid_mask = (
+        store_mask
+        & (pos >= 0)
+        & (pos < req_kv_len)
+        & (kv_offset >= 0)
+        & (kv_offset < KV_INDICES_NUMEL)
+    )
 
     out_val = tl.load(
-        kv_indices + kv_base + pos,
+        kv_indices + kv_offset,
         mask=valid_mask,
         other=0,
     )
+    out_val = tl.where(out_val >= 0, out_val, 0)
 
     tl.store(
-        out_kv_indices + out_start + col_id,
+        out_kv_indices + out_offset,
         out_val,
         mask=store_mask,
     )
@@ -2249,12 +2122,15 @@ def triton_gather_kv_indices_sparse(
     token_to_seq_idxs = token_to_seq_idxs[:num_tokens]
     topk_indices = topk_indices[:num_tokens]
     tiles_per_row = NUM_TOPK_TOKENS // BLOCK_N
+    num_req = kv_indptr.shape[0] - 1
 
     total_out = num_tokens * NUM_TOPK_TOKENS
-    if out is not None:
-        out_buf = out[:total_out]
-    else:
-        out_buf = torch.empty(total_out, dtype=torch.int32, device=topk_indices.device)
+    out_buf = _sparse_index_workspace(
+        out,
+        total_out,
+        device=topk_indices.device,
+        name="triton_gather_kv_indices_sparse",
+    )
 
     ti_stride0, ti_stride1 = topk_indices.stride()
     grid = (num_tokens, tiles_per_row)
@@ -2267,6 +2143,9 @@ def triton_gather_kv_indices_sparse(
         kv_indptr,
         out_buf,
         NUM_TOPK_TOKENS,
+        out_buf.numel(),
+        num_req,
+        kv_indices.numel(),
         BLOCK_N,
         ti_stride0,
         ti_stride1,
