@@ -88,13 +88,12 @@ def packed_varlen_attention(
     ``q``/``k``/``v`` are ``[total_tokens, heads, head_dim]``; segments are
     delimited by ``cu_seqlens``.
 
-    ``pad_from`` marks where trailing alignment padding begins. Those rows are
-    dropped from the kernel call and zeroed in the result, which is *not* a
-    micro-optimisation: the ASM kernel's grid is
-    ``(heads, num_segments, ceil(max_seqlen / 256))``, sized from ``max_seqlen``
-    rather than from each segment, so a 24-row padding segment gets a full
-    plane of 2,072 workgroups of which one has work. Dropping it halves the
-    grid and measures 93.0 -> 80.9 ms per layer at H3's shapes.
+    ``pad_from`` marks where trailing alignment padding begins; those rows are
+    dropped from the call and zeroed in the result. Not a micro-optimisation:
+    the ASM grid is ``(heads, num_segments, ceil(max_seqlen / 256))``, sized
+    from ``max_seqlen`` rather than per segment, so a 24-row padding segment
+    gets a full plane of 2,072 workgroups of which one has work. Dropping it
+    halves the grid: 93.0 -> 80.9 ms per layer at H3's shapes.
 
     Bit-exact: the padding already sits in its own segment, so no real token
     attends to it either way.

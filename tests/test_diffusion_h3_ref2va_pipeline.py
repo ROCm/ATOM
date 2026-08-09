@@ -15,8 +15,8 @@ import pytest
 import torch
 from torch import nn
 
-from atom.diffusion.config import ComponentConfig, DiffusionConfig
-from atom.diffusion.models.minimax_h3.condition_noise import (
+from atom.diffusion.config import DiffusionConfig
+from atom.diffusion.models.minimax_h3.conditioning import (
     MINIMAX_H3_AUDIO_REF_COND_TIMESTEP,
     MINIMAX_H3_IMGVID_COND_TIMESTEP,
 )
@@ -82,9 +82,6 @@ def build_ref2va(tmp_path, conditions, *, steps=3, duration=0.5):
     config = DiffusionConfig(
         model_path="<test>",
         pipeline_class="atom.diffusion.models.minimax_h3.pipeline.MiniMaxH3Pipeline",
-        components=[
-            ComponentConfig(name="transformer", class_path="torch.nn.Identity")
-        ],
         num_gpus=1,
         ulysses_degree=1,
         num_inference_steps=steps,
@@ -176,8 +173,7 @@ def test_condition_encode_produces_blocks_and_both_row_kinds(tmp_path, monkeypat
         ],
     )
     monkeypatch.setattr(
-        "atom.diffusion.models.minimax_h3.reference_encoding."
-        "load_reference_waveform",
+        "atom.diffusion.models.minimax_h3.conditioning." "load_reference_waveform",
         lambda *a, **k: (torch.zeros(2, 32000), 32000),
     )
     PlanStage()(batch, config)
@@ -207,8 +203,7 @@ def test_visual_references_are_noise_augmented_and_audio_ones_are_not(
         ],
     )
     monkeypatch.setattr(
-        "atom.diffusion.models.minimax_h3.reference_encoding."
-        "load_reference_waveform",
+        "atom.diffusion.models.minimax_h3.conditioning." "load_reference_waveform",
         lambda *a, **k: (torch.zeros(2, 32000), 32000),
     )
     PlanStage()(batch, config)
@@ -232,8 +227,7 @@ def test_packed_layout_reserves_exactly_what_was_encoded(tmp_path, monkeypatch):
         ],
     )
     monkeypatch.setattr(
-        "atom.diffusion.models.minimax_h3.reference_encoding."
-        "load_reference_waveform",
+        "atom.diffusion.models.minimax_h3.conditioning." "load_reference_waveform",
         lambda *a, **k: (torch.zeros(2, 32000), 32000),
     )
     PlanStage()(batch, config)
@@ -287,7 +281,7 @@ def test_denoise_trims_the_reference_audio_off_the_prediction():
     """The DiT returns *all* audio rows but only the generated video rows, so
     the audio side needs an explicit trim the video side does not."""
     from atom.diffusion.models.minimax_h3.denoise import run_denoise_loop
-    from atom.diffusion.models.minimax_h3.packed_sequence import (
+    from atom.diffusion.models.minimax_h3.layout import (
         build_packed_sequence_ref2va,
     )
 
@@ -330,7 +324,7 @@ def test_denoise_trims_the_reference_audio_off_the_prediction():
 
 def test_denoise_rejects_missing_audio_reference_rows():
     from atom.diffusion.models.minimax_h3.denoise import run_denoise_loop
-    from atom.diffusion.models.minimax_h3.packed_sequence import (
+    from atom.diffusion.models.minimax_h3.layout import (
         build_packed_sequence_ref2va,
     )
 
@@ -359,7 +353,7 @@ def test_denoise_rejects_missing_audio_reference_rows():
 
 def test_video_reference_frame_sampling_feeds_both_consumers():
     """Qwen and the VAE must see the same decoded array, not two decodes."""
-    from atom.diffusion.models.minimax_h3.reference_encoding import (
+    from atom.diffusion.models.minimax_h3.conditioning import (
         sample_reference_video_frames,
     )
 

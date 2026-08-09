@@ -14,18 +14,14 @@ from atom.diffusion.models.minimax_h3.denoise import (
     build_timestep_conditioning,
     run_denoise_loop,
 )
-from atom.diffusion.models.minimax_h3.latent_prep import (
-    build_initial_latents,
-    scatter_rows_into_packed,
-)
-from atom.diffusion.models.minimax_h3.packed_sequence import (
+from atom.diffusion.models.minimax_h3.layout import (
     TAG_AUDIO,
     TAG_TEXT,
     TAG_VIDEO,
+    build_initial_latents,
     build_packed_sequence_t2va,
-)
-from atom.diffusion.models.minimax_h3.packed_tokens import (
     patchify_video_latent,
+    scatter_rows_into_packed,
     unpack_audio_tokens,
     unpatchify_video_tokens,
 )

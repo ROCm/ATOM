@@ -36,15 +36,21 @@ atom/diffusion/
   engine/        job scheduler, ZMQ workers, per-GPU runner
   entrypoints/   diffusion_server.py, video_api.py
   models/minimax_h3/
-      arch.py dit.py vae.py text_encoder.py scheduler.py loader.py
-      pipeline.py                       the 8 stages and the pipeline
-      geometry.py packed_sequence.py packed_tokens.py latent_prep.py
-      keyframe.py condition_noise.py reference_encoding.py presentation.py
-      denoise.py
+      arch.py          architecture config
+      dit.py           the network
+      components.py    both VAEs, text encoder, weight loading
+      layout.py        geometry, packed sequence, patchify, initial latents
+      conditioning.py  keyframes, references, noise aug, presentation
+      denoise.py       the loop and its rectified-flow sampler
+      pipeline.py      the 8 stages and the pipeline
 ```
 
-A component graduates out of a model package into the shared layer when a
-*second* model uses it, not in anticipation.
+Seven files per model, grouped by role. Deliberately *not* split further: the
+generic-looking pieces (weight sharding, patchify, seeded noise,
+rectified-flow Euler) each sit alongside H3 specifics in the same module, and
+promoting them to a shared layer today would mean inventing an API with one
+caller. A component graduates when a *second* model uses it, not in
+anticipation.
 
 ## Preparing environment
 
@@ -255,40 +261,27 @@ of 2,072 workgroups of which one has work. Dropping those rows halves the grid:
 93.0 -> 80.9 ms per layer, 30 s off a denoise, output pixel-identical. Triton
 shows no benefit (104.78 vs 104.66), so this is ASM-only.
 
-### Against the sglang reference, same box, t2va at Ulysses-4
+### Measured cost, t2va at Ulysses-4
 
-| | reference | ATOM |
-|---|---:|---:|
-| text encode | ~23 s | ~23 s |
-| encoder staging | — | 1.0 s |
-| denoise | ~425 s | **394.6 s** |
-| decode | 17.3 s | 27.7 s |
-| **total** | **465.5 s** | **~446 s** |
-
-Denoise is even. The reference is locked to the Triton attention kernel on
-gfx942 by an upstream workaround for an ASM hang that does not reproduce on
-this aiter build (14 configurations tested), so ATOM runs the faster ASM path
-and gives that time back on decode, where sglang uses its own vendored VAE.
+| | |
+|---|---:|
+| text encode | ~23 s |
+| encoder staging | 1.0 s |
+| denoise | 394.6 s |
+| decode | 27.7 s |
+| **total** | **~446 s** |
 
 ### On MI355X (gfx950), Ulysses-8
 
-The hardware is ~6× and the balance shifts with it. Steady-state denoise is
-**563 ms/step against sglang's 552–571 ms** — a dead heat — measured with a
-kernel-level profile of one DiT forward on each side at step 3:
+Steady-state denoise is **563 ms/step**, of which the DiT forward is
+essentially all: a kernel profile of one forward puts attention at 272.6 ms,
+GEMM at 171.1 ms, norm at 23.9 ms and elementwise/cat at 55.9 ms. The CPU
+queues the whole 50-layer forward in 29 ms and then waits 531 ms for the GPU,
+so the loop is GPU-bound -- there is no launch overhead to reclaim.
 
-| | ATOM | sglang |
-| --- | ---: | ---: |
-| attention (`fmha_fwd_hd128_bf16_group`) | 272.6 ms | 272.5 ms |
-| gemm (Tensile) | 171.1 | 169.0 |
-| norm | 23.9 | 24.6 |
-| elementwise + cat/copy | 55.9 | 34.9 |
-| fused adaln / qkv-pack | — | 8.2 |
-
-Attention and GEMM are the *same kernels* at the same cost. sglang's three
-fused kernels (`_pack_qkv_destination_major`, `_indexed_scale_shift_bf16`,
-`_indexed_gate_bf16`) do in 8.2 ms what ATOM does unfused in ~21 ms, so
-porting them to aiter is worth ~13 ms/step (~2%) — real, but far below what
-the warmup above recovers, and the reason it is not the top priority.
+The elementwise share is where a fused AdaLN-modulation and QKV-pack kernel
+would pay off, worth roughly 13 ms/step. Small next to the warmup above, which
+is why it is not the top priority.
 
 Two profiler traps worth not re-learning: `key_averages()` reports the aten
 scope *and* the kernel it launched, each with the same device time, so summing

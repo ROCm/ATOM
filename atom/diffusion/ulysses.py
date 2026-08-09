@@ -4,11 +4,11 @@
 """Ulysses sequence parallelism.
 
 Trades sequence for heads around attention: ``[S/W, H, D]`` -> ``[S, H/W, D]``
-before, and back after. Degenerates to identity at world size 1.
+before, back after. Identity at world size 1.
 
-``scatter_heads``/``gather_heads`` must round-trip exactly. A permute mismatch
-yields a plausible tensor of the right shape whose tokens are shuffled, which
-surfaces only as a corrupted frame -- hence the round-trip assertion in tests.
+``scatter_heads``/``gather_heads`` must round-trip exactly: a permute mismatch
+yields a right-shaped tensor with shuffled tokens, visible only as a corrupted
+frame -- hence the round-trip assertion in tests.
 """
 
 import torch
@@ -18,8 +18,8 @@ import torch.distributed as dist
 class UlyssesGroup:
     """Sequence<->head all-to-all over a torch.distributed process group.
 
-    A ``world_size`` of 1 degenerates to identity, which keeps single-GPU and
-    CPU-only test paths free of distributed setup.
+    World size 1 is identity, keeping CPU-only test paths free of distributed
+    setup.
     """
 
     def __init__(self, group: "dist.ProcessGroup | None" = None) -> None:

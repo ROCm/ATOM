@@ -12,7 +12,7 @@ import pytest
 import torch
 from torch import nn
 
-from atom.diffusion.config import ComponentConfig, DiffusionConfig
+from atom.diffusion.config import DiffusionConfig
 from atom.diffusion.models.minimax_h3.arch import MiniMaxH3DiTArchConfig
 from atom.diffusion.models.minimax_h3.dit import MiniMaxH3DiTModel
 from atom.diffusion.models.minimax_h3.pipeline import MiniMaxH3Pipeline, PlanStage
@@ -115,9 +115,6 @@ def build(tmp_path, *, duration=0.5, steps=3):
     config = DiffusionConfig(
         model_path="<test>",
         pipeline_class="atom.diffusion.models.minimax_h3.pipeline.MiniMaxH3Pipeline",
-        components=[
-            ComponentConfig(name="transformer", class_path="torch.nn.Identity")
-        ],
         num_gpus=1,
         ulysses_degree=1,
         num_inference_steps=steps,

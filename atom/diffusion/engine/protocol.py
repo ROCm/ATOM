@@ -3,14 +3,11 @@
 
 """Wire protocol between the diffusion API process and its GPU workers.
 
-One job in, occasional progress out, one result out, minutes apart -- so five
-message types and pickle over ZMQ, whose cost is nothing next to a 4-minute
-generation.
+One job in, one result out, minutes apart -- so pickle over ZMQ costs nothing.
 
 Two properties the engine depends on: every rank receives every request
-(Ulysses is collective -- a job reaching 3 of 4 ranks hangs in an all-to-all
-rather than running slower), and only rank 0 replies (it is the one that decodes
-and muxes, so the others would be N-1 duplicate completions).
+(Ulysses is collective, so a job reaching 3 of 4 ranks hangs rather than
+running slower), and only rank 0 replies (the others would be duplicates).
 """
 
 from dataclasses import dataclass, field

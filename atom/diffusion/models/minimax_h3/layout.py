@@ -1,36 +1,251 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-#
-# Layout rules follow the reference in sgl-project/sglang
-# (.../minimax_h3/packed_sequence.py, Apache-2.0).
 
-"""MiniMax-H3 packed-sequence layout.
+"""MiniMax-H3 request geometry and the packed-sequence layout.
 
-    t2va/fl2va  [ text | imgvid_cond | audio (audio_t x 2ch) | video | pad ]
-    ref2va      [ text | ref blocks  | audio | video | pad ]
-
-Conditioning rows are part of ``img_pos`` but excluded from ``update_mask``.
-``cu_seqlens`` is ``[0, used, seq_len]`` -- the second segment is pure padding.
-
-The fp64 position grid has three non-obvious rules: the temporal axis continues
-the text counter (video time starts at ``text_len``) and advances by
-``5/3 * frame_per_token`` cycling ``(1, 4, 4, 4, 4)``; spatial axes are centred
-on aspect ratio against ``sqrt(H*W)``, half-open, scaled by 32; audio rows are
-channel-major, pinned to the two extremes of the w grid.
-
-Numerics trap: :func:`temporal_position_span` sums with numpy (pairwise) while
-:func:`video_t_grid` accumulates sequentially. They diverge in the last ulp from
-n=16 and must not be unified.
-"""
+Turns a request (canvas, duration, prompt length) into the row layout the
+DiT consumes: frame/latent lattice, the packed [text | audio | video | pad]
+sequence with its 3-D position grid, patchify/unpatchify, and the seeded
+initial latents."""
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 import numpy as np
 import torch
 
-from atom.diffusion.models.minimax_h3.geometry import (
-    PACKED_SEQUENCE_ALIGNMENT,
-)
+# The video VAE compresses 16x spatially; the DiT then applies a (1, 2, 2)
+# patch, so each latent frame contributes (H/16/2) * (W/16/2) rows.
+VAE_SPATIAL_COMPRESSION = 16
+
+# Audio latents are produced at 40 Hz.
+AUDIO_LATENT_HZ = 40.0
+
+# Two interleaved audio channels per latent step.
+AUDIO_CHANNELS = 2
+
+# The packed sequence is padded up to this multiple.
+PACKED_SEQUENCE_ALIGNMENT = 64
+
+
+def align_frame_count(frame_count: int) -> int:
+    """Snap up to H3's 17n+5 frame boundary."""
+    if frame_count <= 0:
+        return 1
+    current = int(frame_count)
+    return current + (5 - current) % 17
+
+
+def video_latent_t(frame_count: int) -> int:
+    """Frames -> video latent T (1 or 5n+2)."""
+    if frame_count <= 5:
+        return 2
+    return ((int(frame_count) - 5) // 17) * 5 + 2
+
+
+def frame_count_from_video_latent_t(latent_t: int) -> int:
+    """Inverse of :func:`video_latent_t`."""
+    if latent_t == 1:
+        return 1
+    if latent_t < 2 or (latent_t - 2) % 5 != 0:
+        raise ValueError(f"video latent T must be 1 or match 5n+2, got {latent_t}")
+    return 17 * ((latent_t - 2) // 5) + 5
+
+
+def audio_latent_t(duration_seconds: float) -> int:
+    """Duration -> audio latent T, rounded at the 40 Hz boundary."""
+    # round() with no ndigits already returns int.
+    return round(float(duration_seconds) * AUDIO_LATENT_HZ)
+
+
+def time_shift_sigmas(*, num_steps: int = 50, shift_scale: float = 6.0) -> list[float]:
+    """Rectified-flow sigma schedule with a flow shift.
+
+    ``sigma = s*b / (1 + (s-1)*b)`` over ``b`` linearly spaced on [1, 0].
+    Returns ``num_steps`` sigmas ending at 0, so a denoise loop runs
+    ``num_steps - 1`` iterations (50 sigmas -> 49 steps, which is what the
+    reference server reports).
+    """
+    if shift_scale <= 0:
+        raise ValueError(f"shift_scale must be > 0, got {shift_scale}")
+    if num_steps <= 0:
+        raise ValueError(f"num_steps must be > 0, got {num_steps}")
+
+    import torch
+
+    base = torch.linspace(1.0, 0.0, int(num_steps), dtype=torch.float32)
+    shifted = shift_scale * base / (1 + (shift_scale - 1) * base)
+    shifted = torch.unique_consecutive(shifted)
+    if num_steps > 1 and shifted[-1].item() > 0.0:
+        shifted = torch.cat([shifted, torch.zeros(1, dtype=shifted.dtype)])
+    return [float(v) for v in shifted.tolist()]
+
+
+@dataclass(frozen=True)
+class MiniMaxH3Geometry:
+    """Resolved token layout for one request."""
+
+    height: int
+    width: int
+    frame_count: int
+    duration_seconds: float
+    text_len: int
+
+    latent_t: int
+    latent_h: int
+    latent_w: int
+    audio_t: int
+
+    video_rows: int
+    audio_rows: int
+    used_len: int
+    seq_len: int
+
+    @classmethod
+    def resolve(
+        cls,
+        *,
+        height: int,
+        width: int,
+        frame_count: int,
+        duration_seconds: float,
+        text_len: int,
+        patch_size: tuple[int, int, int] = (1, 2, 2),
+    ) -> "MiniMaxH3Geometry":
+        if height % VAE_SPATIAL_COMPRESSION or width % VAE_SPATIAL_COMPRESSION:
+            raise ValueError(
+                f"height and width must be multiples of "
+                f"{VAE_SPATIAL_COMPRESSION}, got {height}x{width}"
+            )
+        aligned_frames = align_frame_count(frame_count)
+        lt = video_latent_t(aligned_frames)
+        lh = height // VAE_SPATIAL_COMPRESSION
+        lw = width // VAE_SPATIAL_COMPRESSION
+
+        _, ph, pw = patch_size
+        if lh % ph or lw % pw:
+            raise ValueError(
+                f"latent grid {lh}x{lw} is not divisible by patch {ph}x{pw}"
+            )
+        frame_rows = (lh // ph) * (lw // pw)
+        video_rows = lt * frame_rows
+
+        at = audio_latent_t(duration_seconds)
+        audio_rows = at * AUDIO_CHANNELS
+
+        used = text_len + audio_rows + video_rows
+        seq = (
+            (used + PACKED_SEQUENCE_ALIGNMENT - 1)
+            // PACKED_SEQUENCE_ALIGNMENT
+            * PACKED_SEQUENCE_ALIGNMENT
+        )
+        return cls(
+            height=height,
+            width=width,
+            frame_count=aligned_frames,
+            duration_seconds=duration_seconds,
+            text_len=text_len,
+            latent_t=lt,
+            latent_h=lh,
+            latent_w=lw,
+            audio_t=at,
+            video_rows=video_rows,
+            audio_rows=audio_rows,
+            used_len=used,
+            seq_len=seq,
+        )
+
+    def validate_ulysses(self, world_size: int) -> None:
+        """The padded sequence must split evenly across the Ulysses group."""
+        if self.seq_len % world_size:
+            raise ValueError(
+                f"packed sequence {self.seq_len} does not divide across "
+                f"ulysses world size {world_size}; alignment is "
+                f"{PACKED_SEQUENCE_ALIGNMENT}, so degrees above that or "
+                f"non-divisors of it cannot work"
+            )
+
+
+def _int_tuple(value: Sequence[int], name: str, length: int) -> tuple[int, ...]:
+    if len(value) != length:
+        raise ValueError(f"{name} must have length {length}, got {list(value)!r}")
+    out = tuple(int(v) for v in value)
+    if any(v <= 0 for v in out):
+        raise ValueError(f"{name} values must be positive, got {list(value)!r}")
+    return out
+
+
+def patchify_video_latent(
+    latent: torch.Tensor, *, patch_size: Sequence[int] = (1, 2, 2)
+) -> torch.Tensor:
+    """``[B, C, T, H, W]`` -> ``[B*t*h*w, C*pt*ph*pw]``."""
+    if latent.ndim != 5:
+        raise ValueError(f"video latent must be rank 5, got shape {list(latent.shape)}")
+    pt, ph, pw = _int_tuple(patch_size, "patch_size", 3)
+    b, c, full_t, full_h, full_w = (int(d) for d in latent.shape)
+    if full_t % pt or full_h % ph or full_w % pw:
+        raise ValueError(
+            f"latent dims {list(latent.shape)} not divisible by patch "
+            f"{[pt, ph, pw]}"
+        )
+    t, h, w = full_t // pt, full_h // ph, full_w // pw
+    packed = latent.reshape(b, c, t, pt, h, ph, w, pw)
+    packed = torch.einsum("nctrhpwq->nthwcrpq", packed)
+    return packed.reshape(b * t * h * w, c * pt * ph * pw).contiguous()
+
+
+def unpatchify_video_tokens(
+    rows: torch.Tensor,
+    *,
+    latent_shape: Sequence[int],
+    patch_size: Sequence[int] = (1, 2, 2),
+) -> torch.Tensor:
+    """``[N, C*pt*ph*pw]`` -> ``[B, C, T, H, W]``. ``latent_shape`` is (t,h,w,C)."""
+    if rows.ndim != 2:
+        raise ValueError(f"token rows must be rank 2, got {list(rows.shape)}")
+    t, h, w, channel = _int_tuple(latent_shape, "latent_shape", 4)
+    pt, ph, pw = _int_tuple(patch_size, "patch_size", 3)
+    expected = pt * ph * pw * channel
+    if int(rows.shape[-1]) != expected:
+        raise ValueError(
+            f"token width {int(rows.shape[-1])} != patch volume x channel {expected}"
+        )
+    per_sample = t * h * w
+    if int(rows.shape[0]) % per_sample:
+        raise ValueError(
+            f"row count {int(rows.shape[0])} not divisible by t*h*w {per_sample}"
+        )
+    packed = rows.reshape(-1, t, h, w, channel, pt, ph, pw)
+    latent = torch.einsum("nthwcrpq->nctrhpwq", packed)
+    return latent.reshape(-1, channel, t * pt, h * ph, w * pw).contiguous()
+
+
+def unpack_audio_tokens(
+    rows: torch.Tensor, *, audio_t: int, audio_channel: int = 2
+) -> torch.Tensor:
+    """``[audio_t, D]`` -> ``[C, D, audio_t // C]`` for the audio VAE.
+
+    ``audio_t`` here is the *row* count (latent steps x channels); rows are
+    channel-major, matching how the packed sequence lays them out.
+    """
+    if rows.ndim != 2:
+        raise ValueError(f"audio token rows must be rank 2, got {list(rows.shape)}")
+    audio_t = int(audio_t)
+    audio_channel = int(audio_channel)
+    if audio_t <= 0 or audio_channel <= 0:
+        raise ValueError(
+            f"audio_t and audio_channel must be positive, got {audio_t}, "
+            f"{audio_channel}"
+        )
+    if int(rows.shape[0]) != audio_t:
+        raise ValueError(f"audio rows {int(rows.shape[0])} != audio_t {audio_t}")
+    if audio_t % audio_channel:
+        raise ValueError(
+            f"audio_t {audio_t} not divisible by audio_channel {audio_channel}"
+        )
+    native = rows.reshape(audio_channel, audio_t // audio_channel, int(rows.shape[-1]))
+    return native.permute(0, 2, 1).contiguous()
+
 
 INTERP = 32
 T_GROUP = 5
@@ -593,3 +808,90 @@ def build_packed_sequence_ref2va(
         "cu_seqlens": torch.tensor([0, used, seq_len], dtype=torch.int32),
         "blocks": parsed,
     }
+
+
+DEFAULT_SEED = 42
+VIDEO_LATENT_CHANNELS = 24
+AUDIO_LATENT_CHANNELS = 32
+AUDIO_CHANNELS = 2
+
+
+def build_initial_latents(
+    *,
+    latent_t: int,
+    latent_h: int,
+    latent_w: int,
+    audio_t: int,
+    seed: int | None = None,
+    patch_size: tuple[int, int, int] = (1, 2, 2),
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return ``(video_rows [Nv, 96], audio_rows [Na, 32])`` fp32 on CPU."""
+    if seed is None:
+        seed = DEFAULT_SEED
+    seed = int(seed)
+
+    pt, ph, pw = patch_size
+    if latent_t % pt or latent_h % ph or latent_w % pw:
+        raise ValueError(
+            f"latent grid {latent_t}x{latent_h}x{latent_w} not divisible by "
+            f"patch {patch_size}"
+        )
+
+    gen_v = torch.Generator().manual_seed(seed)
+    video_tensor = torch.randn(
+        1,
+        VIDEO_LATENT_CHANNELS,
+        latent_t,
+        latent_h,
+        latent_w,
+        generator=gen_v,
+        dtype=torch.float32,
+    )
+    video_rows = patchify_video_latent(video_tensor, patch_size=patch_size).to(
+        torch.float32
+    )
+
+    # Independent generator, same seed -- each modality re-seeds its own.
+    gen_a = torch.Generator().manual_seed(seed)
+    audio_rows = torch.randn(
+        audio_t * AUDIO_CHANNELS,
+        AUDIO_LATENT_CHANNELS,
+        generator=gen_a,
+        dtype=torch.float32,
+    )
+
+    expected_video = (
+        (latent_t // pt) * (latent_h // ph) * (latent_w // pw),
+        VIDEO_LATENT_CHANNELS * pt * ph * pw,
+    )
+    if tuple(video_rows.shape) != expected_video:
+        raise ValueError(
+            f"video noise shape {tuple(video_rows.shape)} != {expected_video}"
+        )
+    return video_rows, audio_rows
+
+
+def scatter_rows_into_packed(
+    *,
+    video_rows: torch.Tensor,
+    audio_rows: torch.Tensor,
+    img_pos: torch.Tensor,
+    audio_pos: torch.Tensor,
+    seq_len: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Row-form latents -> the full-length ``x`` / ``audio_x`` the DiT takes.
+
+    The DiT reads ``[1, S, 96]`` and ``[1, S, 32]`` buffers indexed by global
+    row id, even though only the media rows carry data; padding and text rows
+    stay zero.
+    """
+    device = video_rows.device
+    x = torch.zeros(
+        1, seq_len, video_rows.shape[-1], dtype=video_rows.dtype, device=device
+    )
+    audio_x = torch.zeros(
+        1, seq_len, audio_rows.shape[-1], dtype=audio_rows.dtype, device=device
+    )
+    x[0].index_copy_(0, img_pos.to(device), video_rows)
+    audio_x[0].index_copy_(0, audio_pos.to(device), audio_rows)
+    return x, audio_x

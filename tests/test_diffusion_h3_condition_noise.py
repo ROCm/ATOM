@@ -11,13 +11,13 @@ contract distinguishes correct from silently-different.
 import pytest
 import torch
 
-from atom.diffusion.models.minimax_h3.condition_noise import (
+from atom.diffusion.models.minimax_h3.conditioning import (
     MINIMAX_H3_AUDIO_REF_COND_TIMESTEP,
     MINIMAX_H3_IMGVID_COND_TIMESTEP,
     audio_cond_noise_aug_rows,
     imgvid_cond_noise_aug_rows,
 )
-from atom.diffusion.models.minimax_h3.packed_tokens import patchify_video_latent
+from atom.diffusion.models.minimax_h3.layout import patchify_video_latent
 
 LT, LH, LW = 1, 4, 6
 ROWS = LT * (LH // 2) * (LW // 2)

@@ -10,7 +10,7 @@ not fake modules. Nothing here needs a GPU or AITER.
 import pytest
 import torch
 
-from atom.diffusion.config import ComponentConfig, DiffusionConfig, PerformanceMode
+from atom.diffusion.config import DiffusionConfig, PerformanceMode
 from atom.diffusion.engine.job_scheduler import AdmissionError, JobScheduler
 from atom.diffusion.engine.pipeline_runner import PipelineRunner
 from atom.diffusion.pipeline import (
@@ -27,9 +27,6 @@ def make_config(**overrides) -> DiffusionConfig:
     kwargs = {
         "model_path": "<test>",
         "pipeline_class": "tests.test_diffusion_skeleton._Pipeline",
-        "components": [
-            ComponentConfig(name="transformer", class_path="torch.nn.Identity")
-        ],
         "num_gpus": 1,
         "ulysses_degree": 1,
         "num_inference_steps": 3,
@@ -41,37 +38,15 @@ def make_config(**overrides) -> DiffusionConfig:
 # ── config ────────────────────────────────────────────────────────────────
 
 
-def test_ulysses_times_tp_must_equal_num_gpus():
+def test_ulysses_degree_must_equal_num_gpus():
     with pytest.raises(ValueError, match="must equal num_gpus"):
-        make_config(num_gpus=8, ulysses_degree=4, tp_size=1)
-    # 4 x 2 == 8 is a legal tiling
-    make_config(num_gpus=8, ulysses_degree=4, tp_size=2)
+        make_config(num_gpus=8, ulysses_degree=4)
+    make_config(num_gpus=8, ulysses_degree=8)
 
 
 def test_queue_cap_cannot_be_below_concurrency():
     with pytest.raises(ValueError, match="max_queued_jobs"):
         make_config(max_queued_jobs=1, max_concurrent_jobs=2)
-
-
-def test_duplicate_component_names_rejected():
-    dup = [
-        ComponentConfig(name="vae", class_path="torch.nn.Identity"),
-        ComponentConfig(name="vae", class_path="torch.nn.Identity"),
-    ]
-    with pytest.raises(ValueError, match="duplicate component names"):
-        make_config(components=dup)
-
-
-def test_component_lookup():
-    cfg = make_config()
-    assert cfg.component("transformer").class_path == "torch.nn.Identity"
-    with pytest.raises(KeyError):
-        cfg.component("nope")
-
-
-def test_component_config_rejects_bare_class_path():
-    with pytest.raises(ValueError, match="dotted path"):
-        ComponentConfig(name="x", class_path="Identity")
 
 
 # ── request ───────────────────────────────────────────────────────────────

@@ -24,7 +24,7 @@ import os
 import torch
 import torch.distributed as dist
 
-from atom.diffusion.config import ComponentConfig, DiffusionConfig
+from atom.diffusion.config import DiffusionConfig
 from atom.diffusion.engine.job_scheduler import JobScheduler
 from atom.diffusion.engine.pipeline_runner import PipelineRunner
 from atom.diffusion.pipeline import (
@@ -170,12 +170,8 @@ def main() -> int:
     config = DiffusionConfig(
         model_path="<dummy>",
         pipeline_class="atom.diffusion.examples.dummy_pipeline.DummyPipeline",
-        components=[
-            ComponentConfig(name="transformer", class_path="torch.nn.Identity")
-        ],
         num_gpus=world,
         ulysses_degree=world,
-        tp_size=1,
         num_inference_steps=args.steps,
     )
 

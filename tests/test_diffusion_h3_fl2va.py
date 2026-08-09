@@ -11,12 +11,12 @@ import numpy as np
 import pytest
 import torch
 
-from atom.diffusion.models.minimax_h3.keyframe import (
+from atom.diffusion.models.minimax_h3.conditioning import (
     KEYFRAME_ENCODE_SEED,
     cover_crop_plan,
     scoped_encode_rng,
 )
-from atom.diffusion.models.minimax_h3.packed_sequence import (
+from atom.diffusion.models.minimax_h3.layout import (
     FL2VA_KEYFRAME_SIGNATURES,
     FRAME_RESCALE,
     build_packed_sequence,

@@ -13,18 +13,18 @@ import itertools
 import pytest
 import torch
 
-from atom.diffusion.models.minimax_h3.geometry import (
+from atom.diffusion.models.minimax_h3.denoise import (
+    MiniMaxH3EulerAncestralEta0Scheduler,
+    minimax_h3_euler_eta0_step,
+    minimax_h3_rf_v_to_x0,
+)
+from atom.diffusion.models.minimax_h3.layout import (
     MiniMaxH3Geometry,
     align_frame_count,
     audio_latent_t,
     frame_count_from_video_latent_t,
     time_shift_sigmas,
     video_latent_t,
-)
-from atom.diffusion.models.minimax_h3.scheduler import (
-    MiniMaxH3EulerAncestralEta0Scheduler,
-    minimax_h3_euler_eta0_step,
-    minimax_h3_rf_v_to_x0,
 )
 
 # Observed in the live capture.

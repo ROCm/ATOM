@@ -27,45 +27,39 @@ from typing import ClassVar
 import torch
 
 from atom.diffusion.config import DiffusionConfig
-from atom.diffusion.models.minimax_h3.condition_noise import (
-    MINIMAX_H3_IMGVID_COND_TIMESTEP,
-    imgvid_cond_noise_aug_rows,
-)
-from atom.diffusion.models.minimax_h3.denoise import run_denoise_loop
-from atom.diffusion.models.minimax_h3.geometry import (
-    VAE_SPATIAL_COMPRESSION,
-    MiniMaxH3Geometry,
-    align_frame_count,
-    time_shift_sigmas,
-)
-from atom.diffusion.models.minimax_h3.keyframe import (
-    encode_keyframe_cond_rows,
-    prepare_keyframe_canvas,
-    stretch_keyframe_canvas,
-)
-from atom.diffusion.models.minimax_h3.latent_prep import build_initial_latents
-from atom.diffusion.models.minimax_h3.packed_sequence import (
-    build_packed_sequence,
-    build_packed_sequence_ref2va,
-    validate_keyframe_signature,
-)
-from atom.diffusion.models.minimax_h3.presentation import ref2va_presentation
-from atom.diffusion.models.minimax_h3.reference_encoding import (
-    AUDIO_SAMPLE_RATE,
-    decode_reference_video_frames,
-    encode_reference_audio_rows,
-    encode_reference_video_rows,
-    resize_reference_image,
-    resolve_reference_image_shape,
-    sample_reference_video_frames,
-)
-from atom.diffusion.models.minimax_h3.scheduler import (
-    MiniMaxH3EulerAncestralEta0Scheduler,
-)
-from atom.diffusion.models.minimax_h3.vae import (
+from atom.diffusion.models.minimax_h3.components import (
     decode_audio_rows,
     decode_video_rows,
     latent_stats,
+)
+from atom.diffusion.models.minimax_h3.conditioning import (
+    AUDIO_SAMPLE_RATE,
+    MINIMAX_H3_IMGVID_COND_TIMESTEP,
+    decode_reference_video_frames,
+    encode_keyframe_cond_rows,
+    encode_reference_audio_rows,
+    encode_reference_video_rows,
+    imgvid_cond_noise_aug_rows,
+    prepare_keyframe_canvas,
+    ref2va_presentation,
+    resize_reference_image,
+    resolve_reference_image_shape,
+    sample_reference_video_frames,
+    stretch_keyframe_canvas,
+)
+from atom.diffusion.models.minimax_h3.denoise import (
+    MiniMaxH3EulerAncestralEta0Scheduler,
+    run_denoise_loop,
+)
+from atom.diffusion.models.minimax_h3.layout import (
+    VAE_SPATIAL_COMPRESSION,
+    MiniMaxH3Geometry,
+    align_frame_count,
+    build_initial_latents,
+    build_packed_sequence,
+    build_packed_sequence_ref2va,
+    time_shift_sigmas,
+    validate_keyframe_signature,
 )
 from atom.diffusion.mux import write_video_with_audio
 from atom.diffusion.pipeline import (
@@ -396,13 +390,10 @@ class PlanStage(PipelineStage):
 class ConditionEncodeStage(PipelineStage):
     """Encode conditioning material into packed rows (rank 0, broadcast).
 
-    Mirrors text encoding: the encode is cheap next to broadcasting ~1k rows,
-    and it keeps the VAEs off the other ranks. t2va passes straight through.
-
-    fl2va contributes visual rows only. ref2va contributes both, plus the block
-    descriptors the packed layout needs -- and the two conditioning kinds are
-    augmented differently (visual rows are mixed with seeded noise, audio
-    references are not), which is why they are produced together here.
+    t2va passes straight through. fl2va contributes visual rows; ref2va both,
+    plus the block descriptors the layout needs. The two kinds are augmented
+    differently -- visual rows are mixed with seeded noise, audio references
+    are not -- which is why they are produced together.
     """
 
     parallelism = StageParallelism.MAIN_RANK_BROADCAST
@@ -800,14 +791,14 @@ class MiniMaxH3Pipeline(ComposedPipeline):
         import torch
 
         from atom.diffusion.models.minimax_h3.arch import MiniMaxH3DiTArchConfig
-        from atom.diffusion.models.minimax_h3.dit import MiniMaxH3DiTModel
-        from atom.diffusion.models.minimax_h3.loader import load_minimax_h3_dit_weights
-        from atom.diffusion.models.minimax_h3.text_encoder import MiniMaxH3TextEncoder
-        from atom.diffusion.models.minimax_h3.vae import (
+        from atom.diffusion.models.minimax_h3.components import (
             VIDEO_VAE_DECODE_DTYPE,
+            MiniMaxH3TextEncoder,
             enable_parallel_tiled_decode,
             load_checkpoint_vae,
+            load_minimax_h3_dit_weights,
         )
+        from atom.diffusion.models.minimax_h3.dit import MiniMaxH3DiTModel
 
         root = self.model_root or self.config.model_path
         if not root:
@@ -870,11 +861,9 @@ class MiniMaxH3Pipeline(ComposedPipeline):
         self.register_component("text_encoder", encoder)
         self.encode_device = device
 
-    #: Geometry warmed at load: the released 1344x768 / 5.17 s contract, which
-    #: is what the recipe and every validated run use. A request at another
-    #: canvas still benefits -- the dominant costs (aiter kernel JIT, allocator
-    #: growth, RCCL channel setup) are shape-independent -- but its first step
-    #: will re-pay the shape-dependent part of GEMM selection.
+    #: The released 1344x768 / 5.17 s contract. Another canvas still benefits
+    #: -- aiter JIT, allocator growth and RCCL setup are shape-independent --
+    #: but re-pays the shape-dependent part of GEMM selection.
     WARMUP_GEOMETRY: ClassVar[dict] = {
         "height": 768,
         "width": 1344,
@@ -886,9 +875,8 @@ class MiniMaxH3Pipeline(ComposedPipeline):
     def warmup(self, device: object) -> bool:
         """Run one denoise step on zeros, through the real loop.
 
-        Deliberately the shipping code path rather than a synthetic forward:
-        what needs warming is whatever the first request will actually call,
-        and a hand-rolled forward drifts from the loop it is standing in for.
+        The shipping code path, not a synthetic forward: what needs warming is
+        what the first request calls, and a hand-rolled copy drifts from it.
         """
         import torch
 

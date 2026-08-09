@@ -3,15 +3,12 @@
 
 """Pipeline and stage abstractions for diffusion.
 
-A pipeline is an ordered list of stages, each transforming a shared
-:class:`DiffusionBatch` in place. The declaration with no LLM analogue is
-*where* a stage runs: replicated on every rank (the denoise loop, collectively
-parallel), rank 0 then broadcast (text encoding -- a 66 GB encoder on 8 ranks is
-waste), or rank 0 alone (writing the file).
+An ordered list of stages transforming a shared :class:`DiffusionBatch` in
+place. The declaration with no LLM analogue is *where* a stage runs: on every
+rank, on rank 0 then broadcast, or on rank 0 alone.
 
-Stages declare ``requires``/``produces`` and are checked on both sides, so an
-ordering mistake fails at the boundary rather than as a ``None`` several stages
-later.
+``requires``/``produces`` are checked on both sides, so an ordering mistake
+fails at the boundary rather than as a ``None`` several stages later.
 """
 
 import logging
@@ -47,9 +44,8 @@ class StageParallelism(Enum):
 class DiffusionBatch:
     """Mutable state threaded through a pipeline's stages.
 
-    Deliberately a bag rather than a typed struct: stages are model-specific
-    and the set of intermediates differs per pipeline. Keys are namespaced by
-    convention (``"latents"``, ``"prompt_embeds"``, ``"packed_seq_params"``).
+    A bag rather than a typed struct: the set of intermediates differs per
+    model.
     """
 
     job: "DiffusionJob"
@@ -61,11 +57,7 @@ class DiffusionBatch:
         return self.tensors.get(key, default)
 
     def require(self, key: str) -> Any:
-        """Fetch a required intermediate, failing loudly if a stage is missing.
-
-        Stage ordering bugs otherwise surface as an opaque ``None`` several
-        stages later.
-        """
+        """Fetch a required intermediate; a missing one is a stage-order bug."""
         if key not in self.tensors:
             raise KeyError(
                 f"{key!r} not in batch; produced-so-far: " f"{sorted(self.tensors)}"
@@ -165,11 +157,10 @@ class ComposedPipeline(ABC):
     # ------------------------------------------------------------------
 
     host_staged_components: tuple[str, ...] = ()
-    """Components deliberately kept in host memory and moved in per use.
+    """Components kept in host memory and moved in per use.
 
-    Resident placement is the default and the right one for anything on the
-    denoise critical path. This is the exception list for components that run
-    once per request and are large enough that co-residency does not fit.
+    Resident is the default; this is the exception list for components used
+    once per request and too large to keep co-resident.
     """
 
     def register_component(self, name: str, module: object) -> None:
@@ -185,9 +176,8 @@ class ComposedPipeline(ABC):
     def load_components(self) -> None:
         """Build every component from the checkpoint and register it.
 
-        Left to subclasses: a diffusion pipeline is several networks with different
-        loaders, so a generic "instantiate class_path and load a state dict" fits
-        none of them.
+        Left to subclasses: a pipeline is several networks with different
+        loaders, so a generic state-dict load fits none of them.
         """
         raise NotImplementedError(
             f"{self.pipeline_name} does not implement load_components(); "
@@ -197,11 +187,9 @@ class ComposedPipeline(ABC):
     def warmup(self, device: object) -> bool:
         """Pre-pay first-forward cost. Return True if anything was warmed.
 
-        Opt-in per pipeline: what to warm is model-specific, and a generic
-        "run the pipeline once" would need a real prompt and would decode and
-        mux a throwaway file. Implementations must be **collective and
-        identical on every rank** -- this runs inside the denoise process
-        group, so a rank that skips it hangs the ones that do not.
+        Opt-in per pipeline: a generic "run the pipeline once" would need a
+        real prompt and would mux a throwaway file. Must be **collective and
+        identical on every rank** -- a rank that skips hangs the others.
         """
         return False
 

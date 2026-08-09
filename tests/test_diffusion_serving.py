@@ -13,7 +13,7 @@ import pickle
 
 import pytest
 
-from atom.diffusion.config import ComponentConfig, DiffusionConfig
+from atom.diffusion.config import DiffusionConfig
 from atom.diffusion.engine.diffusion_engine import DiffusionEngine
 from atom.diffusion.engine.engine_core import (
     DiffusionEngineCore,
@@ -33,9 +33,6 @@ def make_config(**kwargs) -> DiffusionConfig:
     defaults = {
         "model_path": "<test>",
         "pipeline_class": "atom.diffusion.models.minimax_h3.pipeline.MiniMaxH3Pipeline",
-        "components": [
-            ComponentConfig(name="transformer", class_path="torch.nn.Identity")
-        ],
         "num_gpus": 1,
         "ulysses_degree": 1,
     }

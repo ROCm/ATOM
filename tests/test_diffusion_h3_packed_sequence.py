@@ -11,7 +11,7 @@ invariants in CI, plus the observed token counts.
 import pytest
 import torch
 
-from atom.diffusion.models.minimax_h3.packed_sequence import (
+from atom.diffusion.models.minimax_h3.layout import (
     TAG_AUDIO,
     TAG_PAD,
     TAG_TEXT,
@@ -178,8 +178,10 @@ def test_warmup_geometry_matches_a_real_request():
     shape-independent costs but would quietly stop pre-paying the rest, and
     nothing downstream would notice.
     """
-    from atom.diffusion.models.minimax_h3.geometry import MiniMaxH3Geometry
-    from atom.diffusion.models.minimax_h3.packed_sequence import build_packed_sequence
+    from atom.diffusion.models.minimax_h3.layout import (
+        MiniMaxH3Geometry,
+        build_packed_sequence,
+    )
     from atom.diffusion.models.minimax_h3.pipeline import MiniMaxH3Pipeline
 
     geo = MiniMaxH3Geometry.resolve(**MiniMaxH3Pipeline.WARMUP_GEOMETRY)

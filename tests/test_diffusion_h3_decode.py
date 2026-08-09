@@ -11,7 +11,7 @@ cropping, frame quantisation and the container contract.
 import pytest
 import torch
 
-from atom.diffusion.models.minimax_h3.vae import (
+from atom.diffusion.models.minimax_h3.components import (
     crop_to_canvas,
     denormalize_latents,
     denormalize_pixels,

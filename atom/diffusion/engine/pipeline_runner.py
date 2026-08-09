@@ -3,10 +3,8 @@
 
 """Per-GPU executor for diffusion pipelines.
 
-Mirrors the role of ``atom.model_engine.model_runner.ModelRunner``, minus
-everything that exists to serve a KV cache. What it owns: device/process-group
-setup, component placement, running one job through the pipeline, and peak
-memory accounting.
+The ``ModelRunner`` role minus everything that serves a KV cache: device setup,
+component placement, running one job, and peak-memory accounting.
 """
 
 import logging
@@ -47,10 +45,8 @@ class PipelineRunner:
     def place_components(self) -> None:
         """Move every component to the device, and verify it landed.
 
-        Asserts rather than trusts ``.to()``: this is the step whose absence
-        wrecked the sglang baseline on ROCm, where platform detection failed,
-        the runtime initialised with ``device=cpu`` and the model loaded to host
-        RAM with no error until the first matmul.
+        Asserts rather than trusting ``.to()``: a platform-detection failure
+        loads 144 GB to host RAM and stays silent until the first matmul.
         """
         if self.config.performance_mode is not PerformanceMode.SPEED:
             raise NotImplementedError(
@@ -84,11 +80,10 @@ class PipelineRunner:
     def warmup(self) -> bool:
         """Run the pipeline's warmup, if it has one and config allows it.
 
-        A failure here is logged, not raised: the same work runs again on the
-        first real request, which is where the error belongs -- attributed to a
-        job, reported to its caller, rather than killing a replica that has
-        just spent minutes loading. The peak-memory reset afterwards keeps the
-        throwaway step out of the first job's accounting.
+        A failure is logged, not raised: the same work reruns on the first
+        request, where the error is attributable to a job rather than killing a
+        replica that just spent minutes loading. The peak-memory reset keeps
+        the throwaway step out of the first job's accounting.
         """
         if not self.config.warmup or self.device is None:
             return False
@@ -145,9 +140,8 @@ class PipelineRunner:
     ) -> DiffusionBatch:
         """Run one job end to end through the pipeline.
 
-        ``on_progress(step, total)`` is called from inside the denoise loop.
-        It travels on the batch rather than as a stage argument because the
-        loop is several stages deep and only one stage can report meaningfully.
+        ``on_progress(step, total)`` travels on the batch rather than as a
+        stage argument: the denoise loop is several stages deep.
         """
         self._reset_peak_memory()
         batch = DiffusionBatch(job=job, is_warmup=is_warmup)

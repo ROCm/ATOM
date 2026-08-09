@@ -3,11 +3,9 @@
 
 """FIFO admission and queueing for diffusion jobs.
 
-This replaces ``atom.model_engine.scheduler.Scheduler`` for the diffusion path,
-and is much simpler on purpose. The LLM scheduler exists to pack many sequences
-into one forward pass and to juggle KV blocks. Neither applies here: a diffusion
-job occupies the whole replica for minutes, so the only decisions are whether to
-admit a job and which one runs next.
+Much simpler than the LLM scheduler on purpose: a job occupies the whole
+replica for minutes, so there is nothing to pack and no KV to juggle. The only
+decisions are whether to admit a job and which one runs next.
 """
 
 import logging

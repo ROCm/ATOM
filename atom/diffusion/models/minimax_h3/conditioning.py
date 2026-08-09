@@ -1,36 +1,293 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-#
-# Encode recipes follow the reference in sgl-project/sglang
-# (.../minimax_h3/reference_encoding.py, Apache-2.0).
 
-"""MiniMax-H3 ref2va reference material -> packed conditioning rows.
+"""MiniMax-H3 conditioning: turning images, audio and video into packed rows.
 
-Unlike an fl2va keyframe, a reference never binds the target canvas.
+fl2va keyframes and ref2va references both land here, along with the noise
+augmentation they share and the prompt presentation that tells Qwen3-VL
+where the material sits."""
 
-* ``image`` -- keep the ratio, short edge to 2048 (upscaling if needed), round
-  both dims to the nearest 32, then the fl2va keyframe encode.
-* ``audio`` -- stereo float PCM at the source rate, one resample to 32 kHz, then
-  the audio VAE posterior **mean** (no sampling), normalised, channel-major.
-* ``video``/``video_audio`` -- one ffmpeg pass feeds *both* Qwen and the visual
-  VAE, so the two cannot disagree. Soundtrack extracted separately at 44.1 kHz.
-
-Two asymmetries that look like oversights but are not: the video encode
-*samples* the posterior (seed 42) while the audio encode takes the mean, and the
-audio encode needs :class:`audio_vae_determinism` or the same waveform yields
-different latents run to run.
-"""
-
+import contextlib
 import functools
 import math
 import subprocess
+from collections.abc import Sequence
 from typing import Any, Self
 
 import numpy as np
 import torch
 
-from atom.diffusion.models.minimax_h3.keyframe import scoped_encode_rng
-from atom.diffusion.models.minimax_h3.packed_tokens import patchify_video_latent
+from atom.diffusion.models.minimax_h3.layout import patchify_video_latent
+
+# Both are timesteps *and* mixing coefficients; see the module docstring.
+MINIMAX_H3_IMGVID_COND_TIMESTEP = 0.999
+MINIMAX_H3_AUDIO_REF_COND_TIMESTEP = 1.0
+
+AUDIO_COND_CHANNELS = 2
+LATENT_CHANNELS = 24
+VIDEO_ROW_WIDTH = 96
+AUDIO_ROW_WIDTH = 32
+COND_PATCH_SIZE = (1, 2, 2)
+
+
+def _check_noise_aug(noise_aug: float) -> float:
+    noise_aug = float(noise_aug)
+    if not 0.0 <= noise_aug <= 1.0:
+        raise ValueError(f"noise_aug must be in [0, 1], got {noise_aug}")
+    return noise_aug
+
+
+def imgvid_cond_noise_aug_rows(
+    clean_rows: torch.Tensor,
+    *,
+    condition_shapes: Sequence[Sequence[int]],
+    target_latent_t: int,
+    seed: int,
+    noise_aug: float = MINIMAX_H3_IMGVID_COND_TIMESTEP,
+) -> torch.Tensor:
+    """Noise-augment packed visual conditioning rows ``[n, 96]``.
+
+    ``condition_shapes`` holds ``(latent_t, latent_h, latent_w)`` per condition
+    in packed order. The number of conditions is itself part of the noise draw
+    length, so adding a second keyframe changes the first one's noise.
+    """
+    noise_aug = _check_noise_aug(noise_aug)
+    if noise_aug == 1.0:
+        return clean_rows
+    if clean_rows.ndim != 2 or int(clean_rows.shape[1]) != VIDEO_ROW_WIDTH:
+        raise ValueError(
+            f"visual condition rows must be [n, {VIDEO_ROW_WIDTH}], got "
+            f"{list(clean_rows.shape)}"
+        )
+    target_latent_t = int(target_latent_t)
+    if target_latent_t <= 0:
+        raise ValueError(f"target_latent_t must be positive, got {target_latent_t}")
+
+    shapes: list[tuple[int, int, int]] = []
+    expected_rows = 0
+    for index, raw in enumerate(condition_shapes):
+        if len(raw) != 3:
+            raise ValueError(
+                f"condition_shapes[{index}] must be (latent_t, latent_h, "
+                f"latent_w), got {list(raw)}"
+            )
+        lt, lh, lw = (int(v) for v in raw)
+        if lt <= 0 or lh <= 0 or lw <= 0:
+            raise ValueError(f"condition_shapes[{index}] must be positive: {list(raw)}")
+        if lh % 2 or lw % 2:
+            raise ValueError(
+                f"condition_shapes[{index}] spatial dims must be even: {(lt, lh, lw)}"
+            )
+        shapes.append((lt, lh, lw))
+        expected_rows += lt * (lh // 2) * (lw // 2)
+    if not shapes:
+        raise ValueError("condition_shapes must not be empty")
+    if int(clean_rows.shape[0]) != expected_rows:
+        raise ValueError(
+            f"got {int(clean_rows.shape[0])} visual condition rows, shapes imply "
+            f"{expected_rows}"
+        )
+
+    num_conditions = len(shapes)
+    coefficient = torch.tensor(noise_aug, dtype=torch.float32, device=clean_rows.device)
+    out: list[torch.Tensor] = []
+    offset = 0
+    for latent_t, latent_h, latent_w in shapes:
+        draw_t = target_latent_t + num_conditions
+        if draw_t < latent_t:
+            raise ValueError(
+                f"condition latent_t {latent_t} exceeds the noise draw length "
+                f"{draw_t}"
+            )
+        generator = torch.Generator(device="cpu").manual_seed(int(seed))
+        noise = torch.randn(
+            1,
+            LATENT_CHANNELS,
+            draw_t,
+            latent_h,
+            latent_w,
+            generator=generator,
+            dtype=torch.float32,
+            device="cpu",
+        )[:, :, :latent_t]
+        noise_rows = patchify_video_latent(noise, patch_size=COND_PATCH_SIZE).to(
+            device=clean_rows.device, dtype=torch.float32
+        )
+        count = int(noise_rows.shape[0])
+        clean = clean_rows[offset : offset + count].to(torch.float32)
+        out.append(coefficient * clean + (1.0 - coefficient) * noise_rows)
+        offset += count
+    return (out[0] if len(out) == 1 else torch.cat(out, dim=0)).contiguous()
+
+
+def audio_cond_noise_aug_rows(
+    clean_rows: torch.Tensor,
+    *,
+    condition_audio_t: Sequence[int],
+    seed: int,
+    noise_aug: float = MINIMAX_H3_AUDIO_REF_COND_TIMESTEP,
+) -> torch.Tensor:
+    """Noise-augment packed audio reference rows ``[n, 32]``.
+
+    A no-op at the released default (``noise_aug = 1.0``); kept complete so the
+    audio path is not silently different from the visual one if that changes.
+    """
+    noise_aug = _check_noise_aug(noise_aug)
+    if noise_aug == 1.0:
+        return clean_rows
+    if clean_rows.ndim != 2 or int(clean_rows.shape[1]) != AUDIO_ROW_WIDTH:
+        raise ValueError(
+            f"audio condition rows must be [n, {AUDIO_ROW_WIDTH}], got "
+            f"{list(clean_rows.shape)}"
+        )
+    lengths = [int(v) for v in condition_audio_t]
+    if not lengths:
+        raise ValueError("condition_audio_t must not be empty")
+    if any(v <= 0 for v in lengths):
+        raise ValueError(f"condition audio lengths must be positive, got {lengths}")
+    expected_rows = AUDIO_COND_CHANNELS * sum(lengths)
+    if int(clean_rows.shape[0]) != expected_rows:
+        raise ValueError(
+            f"got {int(clean_rows.shape[0])} audio condition rows, lengths imply "
+            f"{expected_rows}"
+        )
+
+    coefficient = torch.tensor(noise_aug, dtype=torch.float32)
+    out: list[torch.Tensor] = []
+    offset = 0
+    for audio_t in lengths:
+        count = AUDIO_COND_CHANNELS * audio_t
+        clean = clean_rows[offset : offset + count].detach().cpu().float()
+        generator = torch.Generator(device="cpu").manual_seed(int(seed) + 1)
+        noise = torch.randn(
+            clean.shape, generator=generator, dtype=torch.float32, device="cpu"
+        )
+        out.append(coefficient * clean + (1.0 - coefficient) * noise)
+        offset += count
+    rows = out[0] if len(out) == 1 else torch.cat(out, dim=0)
+    return rows.to(device=clean_rows.device, dtype=torch.float32).contiguous()
+
+
+KEYFRAME_ENCODE_SEED = 42
+KEYFRAME_PATCH_SIZE = (1, 2, 2)
+LATENT_CHANNELS = 24
+
+
+def cover_crop_plan(
+    *,
+    source_width: int,
+    source_height: int,
+    target_width: int,
+    target_height: int,
+    allow_upscale: bool = False,
+) -> dict[str, Any]:
+    """Deterministic aspect-preserving cover-crop transform."""
+    if source_width <= 0 or source_height <= 0:
+        raise ValueError("cover crop requires positive source dimensions")
+    scale = max(
+        target_width / float(source_width), target_height / float(source_height)
+    )
+    if scale > 1.0 and not allow_upscale:
+        raise ValueError(
+            f"cover crop would upscale {source_width}x{source_height} to "
+            f"{target_width}x{target_height}; pass allow_upscale=True"
+        )
+    resized_w = max(target_width, round(source_width * scale))
+    resized_h = max(target_height, round(source_height * scale))
+    left = max(0, (resized_w - target_width) // 2)
+    top = max(0, (resized_h - target_height) // 2)
+    return {
+        "scale": scale,
+        "resized_size": (resized_w, resized_h),
+        "crop_box": (left, top, left + target_width, top + target_height),
+    }
+
+
+def prepare_keyframe_canvas(
+    image: Any,
+    *,
+    target_width: int,
+    target_height: int,
+    allow_upscale: bool = False,
+) -> Any:
+    """Cover-crop a PIL image onto the target canvas."""
+    from PIL import Image
+
+    image = image.convert("RGB")
+    if image.size == (target_width, target_height):
+        return image
+    plan = cover_crop_plan(
+        source_width=image.size[0],
+        source_height=image.size[1],
+        target_width=target_width,
+        target_height=target_height,
+        allow_upscale=allow_upscale,
+    )
+    return image.resize(plan["resized_size"], Image.Resampling.LANCZOS).crop(
+        plan["crop_box"]
+    )
+
+
+def stretch_keyframe_canvas(
+    image: Any, *, target_width: int, target_height: int
+) -> Any:
+    """Stretch (do not crop) an image onto the target canvas."""
+    from PIL import Image
+
+    image = image.convert("RGB")
+    if image.size == (target_width, target_height):
+        return image
+    return image.resize((target_width, target_height), Image.Resampling.LANCZOS)
+
+
+@contextlib.contextmanager
+def scoped_encode_rng(seed: int, device: torch.device | None = None):
+    """Seed the default generators for one sampled encode, then restore them."""
+    devices: list[torch.device] = []
+    if device is not None and device.type == "cuda" and torch.cuda.is_available():
+        devices = [device]
+    with torch.random.fork_rng(devices=devices):
+        torch.default_generator.manual_seed(int(seed))
+        for dev in devices:
+            with torch.cuda.device(dev):
+                torch.cuda.manual_seed(int(seed))
+        yield
+
+
+@torch.inference_mode()
+def encode_keyframe_cond_rows(
+    video_vae: Any,
+    image: Any,
+    *,
+    latents_mean: list[float],
+    latents_std: list[float],
+    seed: int = KEYFRAME_ENCODE_SEED,
+) -> torch.Tensor:
+    """Canvas-sized PIL image -> packed cond rows ``[n_rows, 96]`` fp32 (CPU)."""
+    parameter = next(video_vae.parameters())
+    prev_dtype = parameter.dtype
+    if prev_dtype != torch.float32:
+        video_vae.to(torch.float32)
+    try:
+        with scoped_encode_rng(seed, parameter.device):
+            z = video_vae.encode_images(image, use_fp16_latent=True)[0]
+    finally:
+        if prev_dtype != torch.float32:
+            video_vae.to(prev_dtype)
+
+    z = z.cpu().float()
+    if z.dim() == 4:
+        z = z[None]
+    if z.dim() != 5 or int(z.shape[1]) != LATENT_CHANNELS:
+        raise ValueError(f"unexpected keyframe latent shape {list(z.shape)}")
+
+    view = (1, LATENT_CHANNELS, 1, 1, 1)
+    mean = torch.tensor(latents_mean).view(view)
+    std = torch.tensor(latents_std).view(view)
+    z = (z - mean) / std
+
+    return patchify_video_latent(z, patch_size=KEYFRAME_PATCH_SIZE).to(torch.float32)
+
 
 REFERENCE_IMAGE_SHORT_EDGE = 2048
 REFERENCE_IMAGE_MULTIPLE = 32
@@ -453,3 +710,122 @@ def sample_reference_video_frames(frames: np.ndarray) -> dict[str, Any]:
         for i in range(0, len(stamps), QWEN_TEMPORAL_PATCH)
     ]
     return {"frames": sampled, "block_timestamps": block_timestamps}
+
+
+VISION_START = "<|vision_start|>"
+VISION_END = "<|vision_end|>"
+IMAGE_PAD = "<|image_pad|>"
+VIDEO_PAD = "<|video_pad|>"
+
+TAG_TEXT = 1
+TAG_VIDEO = 0
+
+
+def text_ids(tokenizer: Any, text: str) -> list[int]:
+    """Tokenize without special tokens -- the presentation supplies its own."""
+    return list(tokenizer(text, add_special_tokens=False)["input_ids"])
+
+
+def vision_block_ids(tokenizer: Any, pad_token: str, count: int) -> list[int]:
+    if int(count) <= 0:
+        raise ValueError(f"vision block needs a positive token count, got {count}")
+    return (
+        [tokenizer.convert_tokens_to_ids(VISION_START)]
+        + [tokenizer.convert_tokens_to_ids(pad_token)] * int(count)
+        + [tokenizer.convert_tokens_to_ids(VISION_END)]
+    )
+
+
+class Presentation:
+    """Accumulates ids and modality tags together so they cannot drift."""
+
+    def __init__(self) -> None:
+        self.ids: list[int] = []
+        self.tags: list[int] = []
+
+    def text(self, token_ids: list[int]) -> "Presentation":
+        self.ids += token_ids
+        self.tags += [TAG_TEXT] * len(token_ids)
+        return self
+
+    def vision(self, token_ids: list[int]) -> "Presentation":
+        self.ids += token_ids
+        self.tags += [TAG_VIDEO] * len(token_ids)
+        return self
+
+    def build(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return (
+            torch.tensor(self.ids, dtype=torch.long),
+            torch.tensor(self.tags, dtype=torch.long),
+        )
+
+
+def text_only_presentation(
+    tokenizer: Any, *, prompt: str
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """t2va: the prompt verbatim, no special tokens, all TEXT."""
+    if not prompt:
+        raise ValueError("prompt must be non-empty")
+    return Presentation().text(text_ids(tokenizer, prompt)).build()
+
+
+def multi_image_presentation(
+    tokenizer: Any, *, prompt: str, image_token_counts: Sequence[int]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """fl2va: one ``<Picture i>: `` label + vision block per keyframe."""
+    counts = [int(c) for c in image_token_counts]
+    if not counts:
+        raise ValueError("image_token_counts must be non-empty")
+    p = Presentation()
+    for index, count in enumerate(counts, start=1):
+        p.text(text_ids(tokenizer, f"<Picture {index}>: "))
+        p.vision(vision_block_ids(tokenizer, IMAGE_PAD, count))
+    p.text(text_ids(tokenizer, prompt))
+    return p.build()
+
+
+def ref2va_presentation(
+    tokenizer: Any,
+    *,
+    prompt: str,
+    condition_labels: Sequence[tuple[str, int]],
+    image_token_counts: Sequence[int] | None = None,
+    video_block_token_counts: Sequence[Sequence[int]] | None = None,
+    video_block_timestamps: Sequence[Sequence[float]] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """ref2va: per-condition labels in request order, then the prompt.
+
+    ``condition_labels`` is ``[("image", 1), ("audio", 1), ("video", 1), ...]``
+    with 1-based ordinals per type. Audio contributes a **label only** -- audio
+    content never enters Qwen. Video contributes one timestamped block per
+    temporal chunk.
+    """
+    images = list(image_token_counts or [])
+    vid_counts = [list(c) for c in (video_block_token_counts or [])]
+    vid_stamps = [list(t) for t in (video_block_timestamps or [])]
+
+    p = Presentation()
+    img_i = vid_i = 0
+    for kind, ordinal in condition_labels:
+        if kind == "image":
+            if img_i >= len(images):
+                raise ValueError("more image conditions than image_token_counts")
+            p.text(text_ids(tokenizer, f"<Picture {ordinal}>: "))
+            p.vision(vision_block_ids(tokenizer, IMAGE_PAD, images[img_i]))
+            img_i += 1
+        elif kind == "audio":
+            p.text(text_ids(tokenizer, f"<Audio {ordinal}>: "))
+        elif kind == "video":
+            if vid_i >= len(vid_counts) or vid_i >= len(vid_stamps):
+                raise ValueError("video condition without block counts/timestamps")
+            counts, stamps = vid_counts[vid_i], vid_stamps[vid_i]
+            if not counts or len(counts) != len(stamps):
+                raise ValueError("video block counts and timestamps must align")
+            for count, stamp in zip(counts, stamps):
+                p.text(text_ids(tokenizer, f"<{stamp:.1f} seconds>"))
+                p.vision(vision_block_ids(tokenizer, VIDEO_PAD, count))
+            vid_i += 1
+        else:
+            raise ValueError(f"unknown condition kind {kind!r}")
+    p.text(text_ids(tokenizer, prompt))
+    return p.build()
