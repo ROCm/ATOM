@@ -9,7 +9,7 @@ import math
 import os
 import time
 from contextlib import contextmanager, nullcontext
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 import torch
@@ -48,6 +48,10 @@ from atom.model_ops.attentions.sub_pool_spec import (
     PoolPlan,
     SubPoolSpec,
     plan_pools,
+)
+from atom.model_ops.decode_input_ids import (
+    NEW_SEQUENCE,
+    fill_deferred_decode_ids,
 )
 from atom.model_ops.eplb import (
     initialize_eplb_runtime,
@@ -135,6 +139,24 @@ def max_schedulable_decode_bs(
     return min(max_num_seqs, max_num_batched_tokens // full_q_len)
 
 
+class TokenLocations(NamedTuple):
+    """How each request in this decode batch gets its anchor token.
+
+    `deferred_curr[k]` is a position in the CURRENT batch and
+    `deferred_prev[k]` the row that request occupied in the previous forward,
+    so its sampled id can be read from `prev_token_ids` without a D2H sync.
+    `new_curr` holds the positions whose id the scheduler already put on the
+    host. Together they cover the batch exactly once.
+
+    A tuple of three same-typed arrays is easy to unpack in the wrong order;
+    naming them makes that a typo the reader can see.
+    """
+
+    deferred_curr: np.ndarray
+    deferred_prev: np.ndarray
+    new_curr: np.ndarray
+
+
 class tokenIDProcessor:
 
     def __init__(
@@ -152,8 +174,16 @@ class tokenIDProcessor:
         self.input_ids = CpuGpuBuffer(
             max_num_batched_tokens + 1, dtype=torch.int32, device=device
         )
-        self.input_ids_loc = CpuGpuBuffer(
-            max_num_batched_tokens, dtype=torch.int64, device=device
+        # One per request, not per token: `decode_cu` is the exclusive prefix
+        # sum of this step's per-request token counts and `decode_src` says
+        # where each request's anchor comes from. Sized by tokens because that
+        # is the bound this class is handed; a batch can never hold more
+        # requests than tokens.
+        self.decode_cu = CpuGpuBuffer(
+            max_num_batched_tokens + 1, dtype=torch.int32, device=device
+        )
+        self.decode_src = CpuGpuBuffer(
+            max_num_batched_tokens, dtype=torch.int32, device=device
         )
         self.use_spec = use_spec
         self.num_spec_tokens = num_spec_tokens
@@ -354,9 +384,7 @@ class tokenIDProcessor:
         token_id_dict[-1] = 1
         return token_id_dict, logprobs_map
 
-    def get_token_locations(
-        self, batch: ScheduledBatch
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool]:
+    def get_token_locations(self, batch: ScheduledBatch) -> TokenLocations:
         prev_req_ids = self.prev_batch.req_ids
         cur_req_ids = batch.req_ids
         num_prev = len(prev_req_ids)
@@ -384,13 +412,14 @@ class tokenIDProcessor:
         deferred_prev = deferred_prev[:n_deferred]
         new_curr = new_curr[:n_new]
 
-        is_all_same = (
-            n_new == 0
-            and n_deferred == num_prev
-            and np.array_equal(deferred_curr, deferred_prev)
-        )
-
-        return deferred_curr, deferred_prev, new_curr, is_all_same
+        # Every request must be classified exactly once: `deferred_curr` and
+        # `new_curr` are what the caller addresses the batch through, so a gap
+        # or an overlap would leave a request reading whatever was staged for
+        # it -- silently, and only in whatever batch shape produced the gap.
+        assert (
+            n_deferred + n_new == num_cur
+        ), f"{n_deferred} deferred + {n_new} new != {num_cur} requests"
+        return TokenLocations(deferred_curr, deferred_prev, new_curr)
 
     def prepare_input_ids(
         self,
@@ -454,32 +483,19 @@ class tokenIDProcessor:
             return self.input_ids.copy_to_gpu(total_tokens_decode)
 
         """for decode: input ids are from prev_sampled_token_ids"""
-        deferred_curr_indices, deferred_prev_indices, new_curr_indices, is_all_same = (
-            self.get_token_locations(batch)
-        )
+        locs = self.get_token_locations(batch)
+        deferred_curr_indices = locs.deferred_curr
+        deferred_prev_indices = locs.deferred_prev
+        new_curr_indices = locs.new_curr
         num_deferred_seqs = len(deferred_curr_indices)
         num_new_seqs = len(new_curr_indices)
 
-        # Calculate token counts: in MTP mode, each seq has multiple tokens.
-        # num_spec_query_tokens is the single source of truth (= mtp_k+1 for
-        # plain MTP, or the DSpark q-bucket when shrunk this step). See
-        # ScheduledBatch.num_spec_query_tokens.
+        # `num_spec_query_tokens` is the single source of truth for the uniform
+        # case (= mtp_k+1 for plain MTP, or the DSpark q-bucket when shrunk this
+        # step); `dynamic_spec_query_tokens_per_req` overrides it per request
+        # when DSpark runs ragged. See `ScheduledBatch.num_spec_query_tokens`.
         _per_req = getattr(batch, "dynamic_spec_query_tokens_per_req", None)
-        if self.use_spec and _per_req is not None and is_all_same:
-            _pr = np.asarray(_per_req)
-            tokens_per_seq = int(batch.num_spec_query_tokens)
-            num_deferred_tokens = int(_pr[deferred_curr_indices].sum())
-            num_new_tokens = (
-                int(_pr[new_curr_indices].sum()) if len(new_curr_indices) else 0
-            )
-        elif self.use_spec:
-            tokens_per_seq = batch.num_spec_query_tokens
-            num_deferred_tokens = num_deferred_seqs * tokens_per_seq
-            num_new_tokens = num_new_seqs * tokens_per_seq
-        else:
-            tokens_per_seq = 1
-            num_deferred_tokens = num_deferred_seqs
-            num_new_tokens = num_new_seqs
+        tokens_per_seq = int(batch.num_spec_query_tokens) if self.use_spec else 1
 
         # Receive and map bonus_list to current batch order
         self.num_rejected = batch.num_rejected
@@ -494,194 +510,65 @@ class tokenIDProcessor:
                 deferred_prev_indices
             ]
 
-        # DSpark dynamic: per-req lengths differ, build input_ids by scattering each
-        # seq's [anchor, drafts...] into its cu-offset segment.
-        ragged_lens = getattr(batch, "dynamic_spec_query_tokens_per_req", None)
-        if ragged_lens is not None and is_all_same and self.use_spec:
-            self._ragged_fill_deferred_all_same(batch, ragged_lens, num_deferred_tokens)
-            input_ids = self.input_ids.gpu[:total_tokens]
-            return input_ids
-
-        if is_all_same:
-            # All requests are the same, only deferred tokens
-            if self.use_spec:
-                # MTP mode: combine prev_token_ids and draft_token_ids
-                if (
-                    self.draft_token_ids is not None
-                    and self.pre_num_decode_token_per_seq > 1
-                ):
-                    # DSpark: self.draft_token_ids carries full mtp_k
-                    # columns from the previous step, but this step's q-bucket
-                    # wants only tokens_per_seq (= q) per seq.
-                    draft_cols = self.draft_token_ids
-                    n_draft = tokens_per_seq - 1
-                    if n_draft < draft_cols.shape[1]:
-                        draft_cols = draft_cols[:, :n_draft]
-                    combined = torch.cat(
-                        [
-                            self.prev_token_ids.unsqueeze(1),  # (num_seqs, 1)
-                            draft_cols,  # (num_seqs, q-1)
-                        ],
-                        dim=1,
-                    ).reshape(
-                        -1
-                    )  # (num_deferred_tokens,)
-                else:
-                    combined = self.prev_token_ids
-                self.input_ids.gpu[:num_deferred_tokens] = combined
-            else:
-                # Non-MTP mode: only prev_token_ids
-                self.input_ids.gpu[:num_deferred_tokens] = self.prev_token_ids
-        else:
-            """
-            (1) prev_batch=[301], cur_batch=[0..255, 301] → Layout: [301 prefill | new | deferred]
-            (2) prev_batch=[0..255], cur_batch=[0..253, 256, 257] → Layout: [deferred | new 256, 257] when conc > max_num_seq
-            """
-            is_prev_prefill = self.prev_batch.total_tokens_num_prefill > 0
-            new_decode_front = (
-                is_prev_prefill
-                and np.array_equal(new_curr_indices, np.arange(num_new_seqs))
-                and np.array_equal(
-                    deferred_curr_indices,
-                    np.arange(num_new_seqs, num_new_seqs + num_deferred_seqs),
-                )
-            )
-
-            gathered_tokens = None
-            # old requests (deferred)
-            if num_deferred_seqs > 0:
-                self.input_ids_loc.np[:num_deferred_seqs] = deferred_prev_indices
-                deferred_indices_gpu = self.input_ids_loc.copy_to_gpu(num_deferred_seqs)
-                gathered_prev = torch.gather(
-                    self.prev_token_ids,
-                    0,
-                    deferred_indices_gpu,
-                )
-                if self.use_spec:
-                    # MTP mode: combine prev_token_ids and draft_token_ids
-                    if (
-                        self.draft_token_ids is not None
-                        and self.pre_num_decode_token_per_seq > 1
-                    ):
-                        # draft_token_ids is 2D (num_seqs, mtp_n_grams-1), use direct indexing
-                        gathered_draft = self.draft_token_ids[deferred_indices_gpu]
-                        n_draft = tokens_per_seq - 1
-                        if n_draft < gathered_draft.shape[1]:
-                            gathered_draft = gathered_draft[:, :n_draft]
-                        gathered_tokens = torch.cat(
-                            [
-                                gathered_prev.unsqueeze(1),  # (num_deferred_seqs, 1)
-                                gathered_draft,  # (num_deferred_seqs, q-1)
-                            ],
-                            dim=1,
-                        ).reshape(
-                            -1
-                        )  # (num_deferred_tokens,)
-                    else:
-                        # normal decode (fallback)
-                        gathered_tokens = gathered_prev
-                else:
-                    # Non-MTP mode: only prev_token_ids
-                    gathered_tokens = gathered_prev
-
-            if new_decode_front:
-                # Layout: [new | deferred]
-                if gathered_tokens is not None:
-                    self.input_ids.gpu[
-                        num_new_tokens : num_new_tokens + num_deferred_tokens
-                    ] = gathered_tokens
-                if num_new_tokens > 0:
-                    token_ids = scheduled_tokens[
-                        total_tokens_prefill : total_tokens_prefill + num_new_tokens
-                    ].reshape(num_new_seqs, tokens_per_seq)
-                    if self.use_spec:
-                        token_ids[:, 1:] = batch.scheduled_spec_decode_tokens[
-                            :num_new_seqs
-                        ]
-                    self.input_ids.np[:num_new_tokens] = token_ids.flatten()
-                    self.input_ids.copy_to_gpu(num_new_tokens)
-            else:
-                # Layout: [deferred | new] - deferred at front, new is from previous finished prefill and waiting for decode
-                if num_new_tokens > 0:
-                    # Convert seq-level indices to token-level indices
-                    new_token_indices = (
-                        new_curr_indices[:, None] * tokens_per_seq
-                        + np.arange(tokens_per_seq)
-                    ).flatten()
-                    new_token_ids = scheduled_tokens[new_token_indices].reshape(
-                        num_new_seqs, tokens_per_seq
-                    )
-                    if self.use_spec:
-                        # MTP mode: combine scheduled_tokens and draft_tokens
-                        draft_tokens = batch.scheduled_spec_decode_tokens[
-                            new_curr_indices
-                        ]
-                        new_token_ids[:, 1:] = draft_tokens
-                    self.input_ids.np[:num_new_tokens] = new_token_ids.flatten()
-                    self.input_ids.gpu[
-                        num_deferred_tokens : num_deferred_tokens + num_new_tokens
-                    ].copy_(self.input_ids.cpu[:num_new_tokens], non_blocking=True)
-                if gathered_tokens is not None:
-                    self.input_ids.gpu[:num_deferred_tokens] = gathered_tokens
-        input_ids = self.input_ids.gpu[:total_tokens]
-        return input_ids
-
-    def _ragged_fill_deferred_all_same(self, batch, ragged_lens, num_deferred_tokens):
-        """Fill input_ids for the all-same deferred decode step under RAGGED.
-
-        Layout per seq i (length ragged_lens[i] = ell_i+1):
-          [ anchor_i (= prev_token_ids[i]),  draft_i[0 .. ell_i-1] ]
-        anchor from self.prev_token_ids [bs]; drafts from self.draft_token_ids
-        [bs, mtp_k] (full columns, sliced to ell_i-1). Scatter into the flat
-        input_ids buffer at per-seq cu offsets. Done on CPU then one H2D — the
-        token counts are tiny (Σ ell_i+1 ≤ bs*(mtp_k+1)).
-        """
-        lens = np.asarray(ragged_lens, dtype=np.int64)
+        # ---- One path for every decode step -------------------------------
+        # DSpark's ragged buckets give each request its own length; everything
+        # else gives them all `tokens_per_seq`. Both are just `lens`.
+        ragged_lens = _per_req
+        # `lens` is the only statement of how many tokens each request gets:
+        # per-request under DSpark's ragged buckets, uniform `tokens_per_seq`
+        # otherwise. Everything below addresses through its prefix sum, so a
+        # ragged step and a rectangular one run the same code.
+        lens = (
+            np.asarray(ragged_lens, dtype=np.int32)
+            if ragged_lens is not None
+            else np.full(len(batch.req_ids), tokens_per_seq, dtype=np.int32)
+        )
         bs = lens.shape[0]
-        cu = np.zeros(bs + 1, dtype=np.int64)
-        np.cumsum(lens, out=cu[1:])
-        total = int(cu[-1])
-        assert total <= num_deferred_tokens, (
-            f"ragged total {total} > num_deferred_tokens {num_deferred_tokens} "
-            f"(graph bucket capacity); ragged must fit within bs*q_eff"
+        cu_np = self.decode_cu.np[: bs + 1]
+        cu_np[0] = 0
+        np.cumsum(lens, out=cu_np[1:])
+        total = int(cu_np[bs])
+
+        # Stage the scheduler's ids over the whole region. For a request the
+        # scheduler just admitted this is already its real anchor (and drafts);
+        # for a carried-over one it is a placeholder the kernel overwrites.
+        self.input_ids.np[:total] = scheduled_tokens[
+            total_tokens_prefill : total_tokens_prefill + total
+        ]
+        if self.use_spec and ragged_lens is None and num_new_seqs > 0:
+            self.input_ids.np[:total].reshape(bs, tokens_per_seq)[
+                new_curr_indices, 1:
+            ] = batch.scheduled_spec_decode_tokens[new_curr_indices]
+        self.input_ids.copy_to_gpu(total)
+
+        src_np = self.decode_src.np[:bs]
+        src_np.fill(NEW_SEQUENCE)
+        src_np[deferred_curr_indices] = deferred_prev_indices
+        fill_deferred_decode_ids(
+            self.input_ids.gpu,
+            self.decode_cu.copy_to_gpu(bs + 1),
+            self.decode_src.copy_to_gpu(bs),
+            self.prev_token_ids,
+            self.draft_token_ids if self.pre_num_decode_token_per_seq > 1 else None,
+            max_tokens_per_seq=int(lens.max()) if bs else 1,
         )
 
-        # FLAT graph tail-padding. Under CUDAGraph the captured grid processes
-        # C = effective_bs * q_eff tokens (effective_bs = the graph bs bucket
-        # >= bs), but this ragged step has only Σ = total real tokens (Σ ≤ C).
-        # The graph reads the static input_ids buffer out to C, so [Σ:C] must
-        # hold a LEGAL vocab id (0) — stale ids would OOB the embedding gather.
-        # Compute C the same way ForwardMode will (smallest graph_bs >= bs) ×
-        # q_eff. Eager (no graph) → fill_to == total (no-op beyond the Σ fill).
-        q_eff = int(getattr(batch, "num_spec_query_tokens", 1))
-        fill_to = num_deferred_tokens
-        if not self.runner.enforce_eager:
-            # smallest captured graph_bs >= bs (graph_bs is sorted descending)
-            gbs = next((g for g in reversed(self.runner.graph_bs) if g >= bs), None)
-            if gbs is not None:
-                fill_to = max(fill_to, int(gbs) * q_eff)
+        # FLAT graph tail-padding. A captured decode graph reads out to
+        # `graph_bs * q_eff`, which a ragged step falls short of; those slots
+        # must hold a legal vocab id or the embedding gather runs off the end.
+        # Rectangular steps fill the region exactly and `run_model` pads the
+        # graph's own tail, so this only has work to do under ragged.
+        if ragged_lens is not None:
+            fill_to = total
+            if not self.runner.enforce_eager:
+                gbs = next((g for g in reversed(self.runner.graph_bs) if g >= bs), None)
+                if gbs is not None:
+                    fill_to = max(fill_to, int(gbs) * tokens_per_seq)
+            if fill_to > total:
+                self.input_ids.gpu[total:fill_to].zero_()
 
-        # Per flat pos p in [0, total): seq_of_pos[p] = owning seq i,
-        # local_of_pos[p] = p - cu[i] (0 = anchor, >=1 = draft column local-1).
-        gpu = self.input_ids.gpu
-        if total > 0:
-            seq_of_pos = np.repeat(np.arange(bs, dtype=np.int64), lens)  # [total]
-            local_of_pos = np.arange(total, dtype=np.int64) - cu[seq_of_pos]
-            dev = self.prev_token_ids.device
-            seq_t = torch.as_tensor(seq_of_pos, device=dev)
-            local_t = torch.as_tensor(local_of_pos, device=dev)
-            anchor_vals = self.prev_token_ids[seq_t]  # [total]
-            if self.draft_token_ids is not None:
-                # draft column = local-1; clamp anchor rows (local==0) to 0 then
-                # mask them back to the anchor value.
-                draft_col = (local_t - 1).clamp_(min=0)
-                draft_vals = self.draft_token_ids[seq_t, draft_col]
-                out = torch.where(local_t == 0, anchor_vals, draft_vals)
-            else:
-                out = anchor_vals
-            gpu[:total] = out
-        if fill_to > total:
-            gpu[total:fill_to].zero_()
+        input_ids = self.input_ids.gpu[:total_tokens]
+        return input_ids
 
     def prepare_draft_ids(
         self, batch: ScheduledBatch, draft_token_ids: torch.Tensor
@@ -2335,8 +2222,10 @@ class ModelRunner:
         prev_b = getattr(tp, "prev_batch", None) if tp is not None else None
         cur_req = list(batch.req_ids[:scheduled_bs])
         prev_req = list(prev_b.req_ids) if prev_b is not None else None
-        # is_all_same premise: previous batch is exactly this decode set, same
-        # order (no new/prefill seqs, no reorder). Any deviation → boundary step.
+        # Shrinking needs the previous batch to be exactly this decode set in
+        # the same order (no new/prefill seqs, no reorder), because the per-
+        # request lengths below are read off that batch's `num_bonus`. Any
+        # deviation → boundary step.
         if prev_req is None or prev_req != cur_req:
             return  # boundary / reorder step: skip ragged, stay rectangular
 
@@ -2424,8 +2313,8 @@ class ModelRunner:
         batch.dynamic_spec_query_tokens_per_req = new_len
 
         # (No flat scheduled_spec_decode_tokens is built here: the ragged
-        # input_ids are assembled downstream in _ragged_fill_deferred_all_same
-        # from prev_token_ids (anchor) + draft_token_ids, which never consults
+        # input_ids are assembled downstream by `fill_deferred_decode_ids` from
+        # prev_token_ids (anchor) + draft_token_ids, which never consults
         # scheduled_spec_decode_tokens.)
 
     def _dspark_local_shape(self, batch: ScheduledBatch) -> tuple[int, int, int] | None:
