@@ -194,6 +194,17 @@ class ComposedPipeline(ABC):
             "register components explicitly or implement the hook"
         )
 
+    def warmup(self, device: object) -> bool:
+        """Pre-pay first-forward cost. Return True if anything was warmed.
+
+        Opt-in per pipeline: what to warm is model-specific, and a generic
+        "run the pipeline once" would need a real prompt and would decode and
+        mux a throwaway file. Implementations must be **collective and
+        identical on every rank** -- this runs inside the denoise process
+        group, so a rank that skips it hangs the ones that do not.
+        """
+        return False
+
     def verify_components(self) -> None:
         missing = [c for c in self.required_components if c not in self.components]
         if missing:

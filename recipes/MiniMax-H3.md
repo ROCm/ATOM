@@ -17,6 +17,7 @@ is not a valid H3 result.
 | MI308X (gfx942) | t2va | FL2VA | Ulysses-4 | ✅ 41.48 dB / SSIM 0.963 |
 | MI308X (gfx942) | fl2va | FL2VA | Ulysses-4 | ✅ 40.66 dB / SSIM 0.970 |
 | MI308X (gfx942) | ref2va | Ref2VA | Ulysses-4 | ✅ 41.52 dB / SSIM 0.969 |
+| MI355X (gfx950) | t2va | FL2VA | Ulysses-8 | ✅ single-forward cos 1.0000 |
 
 PSNR/SSIM are measured against the upstream sglang reference on the same box at
 the same seed. See [Validation](#validation) for exactly what that number does
@@ -81,6 +82,26 @@ python -m atom.diffusion.entrypoints.diffusion_server \
 Startup loads ~144 GiB and takes roughly 4–5 minutes; the server does not bind
 until every rank reports ready, so a successful `/health` means the model is
 actually resident.
+
+The replica runs **one throwaway denoise step before reporting ready**. The
+first DiT forward in a fresh process costs far more than the rest — on gfx950
+at Ulysses-8, the token refiner's first attention forward alone is 8.9 s of
+aiter kernel JIT — and paying it during a multi-minute load is free where
+paying it inside the first generation is not. `--no-warmup` skips it.
+
+| first request, gfx950 U-8 | `--no-warmup` | default |
+| --- | ---: | ---: |
+| warmup at load | — | 10.8 s |
+| rope + `refine_prompt_embeds` | 8.9 s | 0.0 s |
+| denoise step 1 | 1,373 ms | **552 ms** |
+| steps 2–6 | ~552 ms | ~552 ms |
+| **first denoise block** | **13.0 s** | **3.4 s** |
+
+Warmup uses the released 1344×768 / 5.17 s geometry. A request at another
+canvas still benefits — aiter JIT, allocator growth and RCCL setup are
+shape-independent — but re-pays the shape-dependent part of GEMM selection.
+A warmup failure is logged, not fatal: the same work reruns on the first
+request, where the error is attributable to a job.
 
 **Ulysses degree must divide both the head count (56) and the 64-aligned packed
 sequence.** 1, 2, 4 and 8 all work. 7 divides the heads but not the sequence
@@ -248,6 +269,31 @@ Denoise is even. The reference is locked to the Triton attention kernel on
 gfx942 by an upstream workaround for an ASM hang that does not reproduce on
 this aiter build (14 configurations tested), so ATOM runs the faster ASM path
 and gives that time back on decode, where sglang uses its own vendored VAE.
+
+### On MI355X (gfx950), Ulysses-8
+
+The hardware is ~6× and the balance shifts with it. Steady-state denoise is
+**563 ms/step against sglang's 552–571 ms** — a dead heat — measured with a
+kernel-level profile of one DiT forward on each side at step 3:
+
+| | ATOM | sglang |
+| --- | ---: | ---: |
+| attention (`fmha_fwd_hd128_bf16_group`) | 272.6 ms | 272.5 ms |
+| gemm (Tensile) | 171.1 | 169.0 |
+| norm | 23.9 | 24.6 |
+| elementwise + cat/copy | 55.9 | 34.9 |
+| fused adaln / qkv-pack | — | 8.2 |
+
+Attention and GEMM are the *same kernels* at the same cost. sglang's three
+fused kernels (`_pack_qkv_destination_major`, `_indexed_scale_shift_bf16`,
+`_indexed_gate_bf16`) do in 8.2 ms what ATOM does unfused in ~21 ms, so
+porting them to aiter is worth ~13 ms/step (~2%) — real, but far below what
+the warmup above recovers, and the reason it is not the top priority.
+
+Two profiler traps worth not re-learning: `key_averages()` reports the aten
+scope *and* the kernel it launched, each with the same device time, so summing
+both double-counts; and host API entries (`hipThreadExchangeStreamCaptureMode`
+and friends) carry attributed device time without being GPU work.
 
 ## Validation
 

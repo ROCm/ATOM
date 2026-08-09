@@ -54,6 +54,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="packed varlen attention kernel; triton reproduces the sglang "
         "reference bit-for-bit, asm is faster",
     )
+    parser.add_argument(
+        "--no-warmup",
+        dest="warmup",
+        action="store_false",
+        help="skip the throwaway denoise step at load; the first request then "
+        "pays the first-forward cost (~11 s on gfx950 at Ulysses-8)",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=30010)
     parser.add_argument("--log-level", default="info")
@@ -80,6 +87,7 @@ def config_from_args(args: argparse.Namespace) -> DiffusionConfig:
         max_queued_jobs=args.max_queued_jobs,
         output_dir=args.output_dir,
         seed=args.seed,
+        warmup=args.warmup,
     )
 
 

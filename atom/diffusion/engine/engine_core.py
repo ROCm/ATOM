@@ -101,6 +101,7 @@ class DiffusionEngineCore:
             self.config, self.pipeline, self.ulysses, device=device
         )
         self.runner.place_components()
+        self.runner.warmup()
 
     # ------------------------------------------------------------------
     # execution

@@ -81,6 +81,36 @@ class PipelineRunner:
                     )
                 logger.info("placed component %s on %s", name, self.device)
 
+    def warmup(self) -> bool:
+        """Run the pipeline's warmup, if it has one and config allows it.
+
+        A failure here is logged, not raised: the same work runs again on the
+        first real request, which is where the error belongs -- attributed to a
+        job, reported to its caller, rather than killing a replica that has
+        just spent minutes loading. The peak-memory reset afterwards keeps the
+        throwaway step out of the first job's accounting.
+        """
+        if not self.config.warmup or self.device is None:
+            return False
+
+        t0 = time.perf_counter()
+        try:
+            warmed = self.pipeline.warmup(self.device)
+        except Exception as exc:
+            logger.warning(
+                "warmup failed on rank %d (%s); the first request will pay "
+                "the first-forward cost instead",
+                self.ulysses.rank,
+                exc,
+                exc_info=True,
+            )
+            return False
+
+        if warmed and self.ulysses.is_main:
+            logger.info("warmup took %.1fs", time.perf_counter() - t0)
+        self._reset_peak_memory()
+        return warmed
+
     # ------------------------------------------------------------------
     # execution
     # ------------------------------------------------------------------

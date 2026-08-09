@@ -20,7 +20,9 @@ only one produces a plausible video that ignores its keyframe.
 
 import contextlib
 import logging
+import math
 import os
+from typing import ClassVar
 
 import torch
 
@@ -867,6 +869,88 @@ class MiniMaxH3Pipeline(ComposedPipeline):
         encoder.prime_host_cache()
         self.register_component("text_encoder", encoder)
         self.encode_device = device
+
+    #: Geometry warmed at load: the released 1344x768 / 5.17 s contract, which
+    #: is what the recipe and every validated run use. A request at another
+    #: canvas still benefits -- the dominant costs (aiter kernel JIT, allocator
+    #: growth, RCCL channel setup) are shape-independent -- but its first step
+    #: will re-pay the shape-dependent part of GEMM selection.
+    WARMUP_GEOMETRY: ClassVar[dict] = {
+        "height": 768,
+        "width": 1344,
+        "frame_count": 124,
+        "duration_seconds": 5.166667,
+        "text_len": 26,
+    }
+
+    def warmup(self, device: object) -> bool:
+        """Run one denoise step on zeros, through the real loop.
+
+        Deliberately the shipping code path rather than a synthetic forward:
+        what needs warming is whatever the first request will actually call,
+        and a hand-rolled forward drifts from the loop it is standing in for.
+        """
+        import torch
+
+        dit = self.component("transformer")
+        arch = dit.arch
+        geo = MiniMaxH3Geometry.resolve(**self.WARMUP_GEOMETRY)
+        packed = build_packed_sequence(
+            text_len=self.WARMUP_GEOMETRY["text_len"],
+            latent_t=geo.latent_t,
+            latent_h=geo.latent_h,
+            latent_w=geo.latent_w,
+            audio_t=geo.audio_t,
+        )
+        world = self.ulysses.world_size
+        if int(packed["seq_len"]) % world:
+            logger.warning(
+                "warmup geometry packs to %d rows, which does not divide "
+                "ulysses world %d; skipping warmup",
+                int(packed["seq_len"]),
+                world,
+            )
+            return False
+        local = int(packed["seq_len"]) // world
+        row_start = self.ulysses.rank * local
+
+        text_len = self.WARMUP_GEOMETRY["text_len"]
+        rope_cache = dit.build_rope_cache(
+            packed["img_position_ids"].unsqueeze(0).to(device),
+            row_start,
+            row_start + local,
+        )
+        prompt_embeds = dit.refine_prompt_embeds(
+            torch.zeros(text_len, arch.text_dim, device=device),
+            torch.tensor([0, text_len], dtype=torch.int32, device=device),
+            device=torch.device(device),
+        )
+
+        # Two sigmas is one step -- the only expensive one.
+        with torch.inference_mode():
+            run_denoise_loop(
+                dit=dit,
+                video_rows=torch.zeros(
+                    int(packed["img_pos"].numel()),
+                    arch.latents_dim * math.prod(arch.patch_size),
+                    device=device,
+                ),
+                audio_rows=torch.zeros(
+                    int(packed["audio_pos"].numel()),
+                    arch.audio_latents_dim,
+                    device=device,
+                ),
+                packed=packed,
+                video_sigmas=[1.0, 0.99],
+                audio_sigmas=[1.0, 0.99],
+                rank_slice=(row_start, row_start + local),
+                device=device,
+                prompt_embeds=prompt_embeds,
+                refined_prompt_embeds_length=text_len,
+                rope_cache=rope_cache,
+                scheduler=MiniMaxH3EulerAncestralEta0Scheduler(),
+            )
+        return True
 
     def verify_components(self) -> None:
         """Only the main rank holds the encoder and VAEs, so only it is checked."""

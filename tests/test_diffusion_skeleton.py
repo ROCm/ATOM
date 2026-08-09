@@ -317,3 +317,52 @@ def test_runner_runs_a_job_on_cpu():
     assert batch.get("b") == 2
     assert batch.meta["ulysses_world"] == 1
     assert cfg.performance_mode is PerformanceMode.SPEED
+
+
+# ── warmup ────────────────────────────────────────────────────────────────
+
+
+def test_base_pipeline_does_not_warm_by_default():
+    """Warming is opt-in: what to warm is model-specific."""
+    assert _Pipeline(make_config()).warmup("cpu") is False
+
+
+def test_runner_skips_warmup_when_disabled():
+    cfg = make_config(warmup=False)
+    pipe = _Pipeline(cfg)
+    calls = []
+    pipe.warmup = lambda device: calls.append(device) or True
+    runner = PipelineRunner(cfg, pipe, device="cpu")
+    assert runner.warmup() is False
+    assert calls == []
+
+
+def test_runner_warms_and_passes_the_device():
+    cfg = make_config()
+    pipe = _Pipeline(cfg)
+    calls = []
+    pipe.warmup = lambda device: calls.append(device) or True
+    runner = PipelineRunner(cfg, pipe, device="cpu")
+    assert runner.warmup() is True
+    assert calls == ["cpu"]
+
+
+def test_runner_skips_warmup_without_a_device():
+    """A CPU-only worker has no first-forward cost worth pre-paying."""
+    cfg = make_config()
+    pipe = _Pipeline(cfg)
+    pipe.warmup = lambda device: True
+    assert PipelineRunner(cfg, pipe, device=None).warmup() is False
+
+
+def test_a_failing_warmup_does_not_kill_the_replica():
+    """The same work reruns on the first request, where the error is reportable
+    against a job rather than taking down a freshly loaded replica."""
+    cfg = make_config()
+    pipe = _Pipeline(cfg)
+
+    def boom(device):
+        raise RuntimeError("aiter jit exploded")
+
+    pipe.warmup = boom
+    assert PipelineRunner(cfg, pipe, device="cpu").warmup() is False

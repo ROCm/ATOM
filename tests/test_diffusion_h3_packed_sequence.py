@@ -169,3 +169,33 @@ def test_layout_rejects_empty_shard(packed):
             row_start=100,
             row_stop=100,
         )
+
+
+def test_warmup_geometry_matches_a_real_request():
+    """The warm shape must be the shape requests actually pack.
+
+    Warming a geometry that no request produces would still pay the
+    shape-independent costs but would quietly stop pre-paying the rest, and
+    nothing downstream would notice.
+    """
+    from atom.diffusion.models.minimax_h3.geometry import MiniMaxH3Geometry
+    from atom.diffusion.models.minimax_h3.packed_sequence import build_packed_sequence
+    from atom.diffusion.models.minimax_h3.pipeline import MiniMaxH3Pipeline
+
+    geo = MiniMaxH3Geometry.resolve(**MiniMaxH3Pipeline.WARMUP_GEOMETRY)
+    packed = build_packed_sequence(
+        text_len=MiniMaxH3Pipeline.WARMUP_GEOMETRY["text_len"],
+        latent_t=geo.latent_t,
+        latent_h=geo.latent_h,
+        latent_w=geo.latent_w,
+        audio_t=geo.audio_t,
+    )
+    # The validated 1344x768 / 5.17 s t2va layout, measured against the
+    # reference: 414 audio + 37,296 video rows, padded to a 64 boundary.
+    assert int(packed["img_pos"].numel()) == 37296
+    assert int(packed["audio_pos"].numel()) == 414
+    assert int(packed["seq_len"]) == 37760
+    # Every supported Ulysses degree must divide it, or warmup silently
+    # no-ops on exactly the topologies it was written for.
+    for degree in (1, 2, 4, 8):
+        assert int(packed["seq_len"]) % degree == 0

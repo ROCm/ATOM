@@ -84,6 +84,15 @@ class DiffusionConfig:
     """In-flight generations per replica. The resident DiT plus activations
     dominate the GPU, so anything above 1 mostly trades latency for nothing."""
 
+    warmup: bool = True
+    """Run one throwaway denoise step at load, before the replica reports ready.
+
+    The first DiT forward on a fresh process costs far more than the rest: on
+    gfx950 at Ulysses-8, step 1 is 11.6 s against 563 ms for every later step,
+    which is aiter kernel JIT, allocator growth and GEMM selection, not model
+    work. Paying it during a multi-minute load is free; paying it inside the
+    first generation is 11 s of that request's latency."""
+
     seed: int | None = None
     output_dir: str = "outputs"
 
