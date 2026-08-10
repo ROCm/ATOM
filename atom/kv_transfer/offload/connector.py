@@ -104,7 +104,14 @@ class LMCacheOffloadConnector(KVConnectorBase):
         from lmcache.v1.memory_management import MemoryFormat
 
         tp = get_tp_group()
-        rank, world = tp.rank_in_group, tp.world_size
+        pp_rank = getattr(
+            getattr(self._config, "parallel_config", None),
+            "pipeline_parallel_rank",
+            0,
+        )
+        pp_size = int(getattr(self._config, "pipeline_parallel_size", 1) or 1)
+        rank = pp_rank * tp.world_size + tp.rank_in_group
+        world = pp_size * tp.world_size
         self._rank = rank
 
         cfg = offcfg.build_lmcache_config()

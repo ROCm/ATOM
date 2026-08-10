@@ -67,8 +67,21 @@ def build_lmcache_metadata(config, cfg, world_size: int, worker_id: int):
     from aiter import dtypes
     from lmcache.v1.metadata import LMCacheMetadata
 
+    from atom.models.utils import get_pp_indices
+
     hf = config.hf_config
-    num_layers = int(getattr(hf, "num_hidden_layers"))
+    total_layers = int(hf.num_hidden_layers)
+    pp_size = int(getattr(config, "pipeline_parallel_size", 1) or 1)
+    pp_rank = getattr(
+        getattr(config, "parallel_config", None),
+        "pipeline_parallel_rank",
+        0,
+    )
+    if pp_size > 1:
+        start, end = get_pp_indices(total_layers, pp_rank, pp_size)
+        num_layers = end - start
+    else:
+        num_layers = total_layers
     tp = int(getattr(config, "tensor_parallel_size", world_size) or 1)
     kv_dtype = dtypes.d_dtypes[config.kv_cache_dtype]
     model_name = str(getattr(config, "model", "atom-model"))
@@ -79,13 +92,13 @@ def build_lmcache_metadata(config, cfg, world_size: int, worker_id: int):
     # keep use_mla=False because our BINARY storage bypasses LMCache's own MLA
     # GPU-connector format path; only kv_shape needs to reflect reality.
     if getattr(hf, "kv_lora_rank", None) is not None:
-        latent = int(getattr(hf, "kv_lora_rank")) + int(
+        latent = int(hf.kv_lora_rank) + int(
             getattr(hf, "qk_rope_head_dim", 0)
         )
         kv_shape = (num_layers, 1, int(cfg.chunk_size), 1, latent)
     else:
         num_kv_heads = int(
-            getattr(hf, "num_key_value_heads", getattr(hf, "num_attention_heads"))
+            getattr(hf, "num_key_value_heads", hf.num_attention_heads)
         )
         num_kv_heads_local = max(1, num_kv_heads // tp)
         head_dim = int(

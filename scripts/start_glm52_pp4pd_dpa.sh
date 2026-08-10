@@ -51,6 +51,9 @@ DECODE_PORT=8020
 MESH_PORT=30000
 HANDSHAKE_PORT=6301
 
+LMCACHE_CPU_SIZE="${LMCACHE_CPU_SIZE:-64.0}"
+LMCACHE_CHUNK="${LMCACHE_CHUNK:-256}"
+
 # ONLINE_QUANT='{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "*.mlp.gate", "*expert*"]}'
 
 # ── cleanup ──────────────────────────────────────────────────────────
@@ -59,13 +62,16 @@ pkill -f atomesh 2>/dev/null || true
 sleep 2
 rm -rf /root/.cache/atom/*
 
-# ── prefill: PP4×TP1 on GPU 0-3 (unchanged from start_glm52_pp4pd.sh) ─
-echo ">>> Starting prefill (PP4×TP1) on GPU 0-3 ..."
+# ── prefill: PP4×TP1 on GPU 0-3 (mooncake producer + lmcache offload) ─
+echo ">>> Starting prefill (PP4×TP1) on GPU 0-3 [mooncake + lmcache] ..."
 AITER_LOG_LEVEL=WARNING \
 ATOM_LOG_PREFIX_CACHE_PER_REQ=1 \
 AITER_QUICK_REDUCE_QUANTIZATION=INT4 \
 AITER_USE_FLYDSL_MOE_SORTING=1 \
 VLLM_PP_LAYER_PARTITION=18,20,20,20 \
+LMCACHE_LOCAL_CPU=True \
+LMCACHE_MAX_LOCAL_CPU_SIZE="$LMCACHE_CPU_SIZE" \
+LMCACHE_CHUNK_SIZE="$LMCACHE_CHUNK" \
 HIP_VISIBLE_DEVICES=0,1,2,3 \
 nohup python -m atom.entrypoints.openai_server \
   --model "$MODEL" --server-port "$PREFILL_PORT" --trust-remote-code \
@@ -73,7 +79,7 @@ nohup python -m atom.entrypoints.openai_server \
   --max-num-batched-tokens 8192 \
   --kv_cache_dtype fp8 --block-size 16 --gpu-memory-utilization 0.85 \
   --enable_prefix_caching \
-  --kv-transfer-config "{\"kv_role\":\"kv_producer\",\"kv_connector\":\"mooncake\",\"handshake_port\":$HANDSHAKE_PORT,\"proxy_ip\":\"127.0.0.1\"}" \
+  --kv-transfer-config "{\"kv_connector\":\"multi\",\"connectors\":[{\"kv_connector\":\"mooncake\",\"kv_role\":\"kv_producer\",\"handshake_port\":$HANDSHAKE_PORT,\"proxy_ip\":\"127.0.0.1\"},{\"kv_connector\":\"lmcache_offload\",\"kv_role\":\"offload\"}]}" \
   > /tmp/prefill.log 2>&1 &
 
 # ── decode: DPA (dp4 × tp1) on GPU 4-7 ───────────────────────────────
@@ -169,3 +175,5 @@ echo "  prefill log: /tmp/prefill.log"
 echo "  decode  log: /tmp/decode.log"
 echo "  mesh    log: /tmp/mesh_dpa.log"
 echo "  mesh API:    http://127.0.0.1:$MESH_PORT/v1/chat/completions"
+echo "  LMCache:     CPU=${LMCACHE_CPU_SIZE}GB  chunk=${LMCACHE_CHUNK}"
+echo "  Verify:      grep -i 'lmcache\|offload' /tmp/prefill.log"
