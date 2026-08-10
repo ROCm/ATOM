@@ -206,7 +206,9 @@ class TestAnthropicSamplingParams:
         )
         monkeypatch.setattr(api_server, "model_name", "test")
         monkeypatch.setattr(api_server, "apply_chat_template", lambda *_a, **_kw: "")
-        monkeypatch.setattr(api_server, "_build_sampling_params", capture_sampling_params)
+        monkeypatch.setattr(
+            api_server, "_build_sampling_params", capture_sampling_params
+        )
         monkeypatch.setattr(
             api_server, "_run_nonstream_with_disconnect", fake_nonstream
         )
