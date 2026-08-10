@@ -1,15 +1,22 @@
-# DeepSeek-V4-Pro DSpark Usage Guide
+# DSpark Usage Guide
 
-[DeepSeek-V4-Pro-DSpark](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro) adds
-**DSpark** — a semi-autoregressive *block* drafter — on top of the DeepSeek-V4-Pro
-backbone. Unlike serial MTP (which drafts `k` tokens over `k` sequential passes),
-DSpark drafts a whole block in a **single parallel backbone pass** (parallel
-backbone + Markov sequential head + confidence head), then the target model
-**verifies** the block. A per-request **confidence head** predicts how many
-drafted tokens are worth verifying, so each request can verify a different
-length and the freed batch capacity lifts throughput. DSpark ships inside the V4
-checkpoint under the same `mtp.*` namespace and is detected by the
-`dspark_block_size` config field.
+**DSpark** is a semi-autoregressive *block* drafter for speculative decoding.
+Unlike serial MTP (which drafts `k` tokens over `k` sequential passes), DSpark
+drafts a whole block in a **single parallel backbone pass** (parallel backbone +
+Markov sequential head + confidence head), then the target model **verifies** the
+block. A per-request **confidence head** predicts how many drafted tokens are
+worth verifying, so each request can verify a different length and the freed
+batch capacity lifts throughput.
+
+ATOM supports two DSpark flavors, which differ only in **where the draft lives**:
+
+| Target | Draft | How it's loaded |
+|---|---|---|
+| **DeepSeek-V4-Pro** | in-checkpoint (`mtp.*` namespace) | auto-detected via the `dspark_block_size` config field — no `--draft-model` |
+| **Kimi-K3** | separate checkpoint | passed explicitly with `--draft-model` |
+
+Everything downstream of loading — the parallel block draft, confidence-scheduled
+ragged verify, and `--dspark-config` knobs — is shared between the two.
 
 ## Preparing environment
 
@@ -21,7 +28,10 @@ All the operations below will be executed inside the container.
 
 ## Launching server
 
-### FP8 on 8xMI355X GPUs (TP8 + FP8 KV Cache + DSpark)
+### DeepSeek-V4-Pro — FP8 on 8xMI355X GPUs (TP8 + FP8 KV Cache + DSpark)
+
+The V4 draft ships inside the [DeepSeek-V4-Pro-DSpark](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro)
+checkpoint (`mtp.*` namespace), so no `--draft-model` is needed:
 
 ```bash
 python -m atom.entrypoints.openai_server \
@@ -37,6 +47,35 @@ python -m atom.entrypoints.openai_server \
   --enable-dp-attention \
   --dspark-config '{"confidence_schedule": true, "ragged": true, "ragged_graph_sizes": "8"}'
 ```
+
+### Kimi-K3 — FP8 on 8xMI355X GPUs (TP8 + FP8 KV Cache + DSpark)
+
+Kimi-K3 (`kimi_linear`: KDA linear-attention + MLA full-attention + MXFP4 MoE)
+uses a **separate** DSpark draft checkpoint, so the draft is passed with
+`--draft-model`. The target is [moonshotai/Kimi-K3](https://huggingface.co/moonshotai/Kimi-K3)
+and the draft is [Inferact/Kimi-K3-DSpark](https://huggingface.co/Inferact/Kimi-K3-DSpark):
+
+```bash
+python -m atom.entrypoints.openai_server \
+  --model moonshotai/Kimi-K3 \
+  --draft-model Inferact/Kimi-K3-DSpark \
+  --tensor-parallel-size 8 \
+  --kv_cache_dtype fp8 \
+  --method dspark \
+  --num-speculative-tokens 7 \
+  --trust-remote-code \
+  --gpu-memory-utilization 0.93 \
+  --block-size 128 \
+  --no-enable_prefix_caching \
+  --server-port 7777
+```
+
+Notes for Kimi-K3:
+- The draft is a standalone MLA model; its KV cache is allocated independently of
+  the target and is kept in **bf16** regardless of the target's `--kv_cache_dtype`.
+- `--draft-model` accepts a local path or an HF repo id (downloaded on startup).
+- The confidence-scheduled ragged verify (`--dspark-config`) also applies here;
+  omit it to run the plain batch-uniform verify.
 
 ### `--dspark-config` knobs
 
@@ -67,7 +106,11 @@ Tips on server configuration:
   replays captured `(bs, q_eff)` graphs. Eager also works for correctness checks.
 - Clear compile cache before restarting after code changes: `rm -rf /root/.cache/atom/*`
 
-## Performance baseline
+## Performance baseline (DeepSeek-V4-Pro)
+
+The numbers in this section were measured on **DeepSeek-V4-Pro DSpark**. Kimi-K3
+DSpark uses the same launch/benchmark flow (swap `--model`/`--draft-model`); its
+latest acceptance and accuracy are tracked on the dashboard linked at the end.
 
 The following script can be used to benchmark the performance:
 

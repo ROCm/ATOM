@@ -3,10 +3,11 @@
 """Inference-only MiMo-V2 MTP (Multi-Token Prediction) model."""
 
 import re
+from typing import ClassVar
 
 import torch
-import torch.nn as nn
-from aiter.dist.communication_op import tensor_model_parallel_all_reduce
+from torch import nn
+
 from atom.config import Config
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import RMSNorm
@@ -155,8 +156,20 @@ class MiMoV2MTPPredictorLayer(nn.Module):
         hidden_states, residual = self.mtp_block(
             positions=positions, hidden_states=hidden_states, residual=None
         )
-        # MTP always has fused_allreduce off, do explicit all-reduce
-        hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        # No all-reduce here: MiMoV2MTPLayer returns self.mlp(...) and that mlp
+        # is built with reduce_results=True (:52), as is the attention's o_proj
+        # (mimo_v2.py:258), so every TP partial sum inside the block has already
+        # been reduced. Both of the block's layernorms are fused_allreduce=False,
+        # so nothing is deferred out to here either.
+        #
+        # The explicit all_reduce this replaces was unconditionally wrong at
+        # tp > 1 -- the block output came out as residual + tp_size * mlp_out.
+        # Its comment ("MTP always has fused_allreduce off") named the wrong
+        # flag: fused_allreduce governs whether a NORM absorbs a pending reduce,
+        # while what decides if one is pending here is reduce_results, and that
+        # is hard-coded True. Unlike the DeepSeek MTP block, whose mlp uses
+        # `reduce_results=not fuse_ar_input_norm`, there was no setting under
+        # which this was correct.
         hidden_states = residual + hidden_states
 
         # Apply final layernorm
@@ -290,8 +303,27 @@ class MiMoV2MTP(nn.Module):
     ) -> torch.Tensor | None:
         return self.lm_head(hidden_states)
 
+    def compute_draft_ids(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        """Greedy draft token ids via distributed argmax — each rank reduces its
+        own vocab shard and only [N, 2] is all-gathered, instead of the full
+        [N, vocab] that compute_logits() would gather. Token-identical to
+        compute_logits(...).argmax(-1): the draft path never hits the LM head's
+        prefill last-token slice (is_draft is set for the whole propose loop),
+        so both see the same rows.
+        """
+        return self.lm_head.compute_argmax_token(hidden_states)
+
     _MTP_PATTERN = re.compile(r"model\.mtp\.layers\.(\d+)\.")
-    _PREDICTOR_KEYS = {"enorm", "hnorm", "eh_proj", "final_layernorm"}
+    _PREDICTOR_KEYS: ClassVar[set[str]] = {
+        "enorm",
+        "hnorm",
+        "eh_proj",
+        "final_layernorm",
+    }
 
     def remap_mtp_weight_name(self, name: str) -> str | None:
         """Remap checkpoint MTP weight names to model parameter names.

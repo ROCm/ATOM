@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from atom.plugin.sglang.models.deepseek_mla import _align_qknorm_fusion_for_sglang
+from atom.plugin.sglang.models.deepseek_mla import (
+    _align_qknorm_fusion_for_sglang,
+    _patch_indexer_layernorm_for_sglang,
+)
 from atom.plugin.sglang.models.deepseek_mla_forward import (
     _patch_attention_projs_for_sglang_mxfp4,
 )
@@ -28,11 +31,16 @@ def setup_glm52_dsa_for_sglang(model: Any) -> None:
         model.atom_config = get_current_atom_config()
 
     from atom.models.deepseek_v2 import DeepseekV2MLAAttention
-    from sglang.srt.configs.model_config import is_deepseek_nsa
+
+    try:
+        from sglang.srt.configs.model_config import is_deepseek_dsa
+    except ImportError:
+        from sglang.srt.configs.model_config import is_deepseek_nsa as is_deepseek_dsa
+
     from sglang.srt.layers.communicator import get_attn_tp_context
 
     config = model.config
-    get_attn_tp_context().init_context(config.q_lora_rank, is_deepseek_nsa(config))
+    get_attn_tp_context().init_context(config.q_lora_rank, is_deepseek_dsa(config))
 
     last_full_index_seen = False
     for module in model.modules():
@@ -41,9 +49,10 @@ def setup_glm52_dsa_for_sglang(model: Any) -> None:
 
         _align_qknorm_fusion_for_sglang(module)
         _patch_attention_projs_for_sglang_mxfp4(module)
+        _patch_indexer_layernorm_for_sglang(module)
 
         if not isinstance(module.mla_attn, SGLangATOMGLM52MLAAttention):
-            raise RuntimeError(
+            raise TypeError(
                 "GLM-5.2 SGLang native DSA setup expected "
                 "SGLangATOMGLM52MLAAttention. Ensure the GLM construction "
                 "context is installed before model initialization."

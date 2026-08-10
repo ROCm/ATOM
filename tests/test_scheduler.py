@@ -93,6 +93,41 @@ class TestSchedule:
         batch, _ = sched.schedule()
         assert batch.total_seqs_num_prefill == 2
 
+    def test_remote_kv_decode_promotion_respects_max_num_seqs(self, seq_factory):
+        """A PD consumer ready for first-decode must NOT be promoted into a full
+        running queue — the bug that let decode-side running climb to 2x
+        max_num_seqs and thrash (preempt -> full recompute) at KV exhaustion."""
+        sched = Scheduler(
+            MockConfig(
+                max_num_seqs=2, max_num_batched_tokens=1000, num_kvcache_blocks=100
+            )
+        )
+        # Fill running to the cap with two decode seqs.
+        r0, r1 = seq_factory([1, 2, 3, 4]), seq_factory([5, 6, 7, 8])
+        for r in (r0, r1):
+            r.status = SequenceStatus.RUNNING
+            r.type = SequenceType.DECODE
+        sched.running = deque([r0, r1])
+        # A consumer whose remote KV has arrived and is ready for first decode.
+        consumer = seq_factory([9, 10, 11, 12])
+        consumer.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+        sched.waiting = deque([consumer])
+
+        promoted = []
+        with (
+            mock.patch.object(sched, "_resolve_waiting_remote_kv", return_value=True),
+            mock.patch.object(
+                sched,
+                "_schedule_first_decode_after_remote_kv",
+                side_effect=lambda s: promoted.append(s),
+            ),
+        ):
+            sched.schedule()
+
+        assert promoted == []  # capped out, not promoted
+        assert consumer in sched.waiting  # requeued for a later tick
+        assert len(sched.running) <= sched.max_num_seqs
+
     def test_prefill_respects_max_batched_tokens(self, seq_factory):
         sched = Scheduler(
             MockConfig(
@@ -190,6 +225,52 @@ class TestSchedule:
 
         assert [seq.id for seq in sched.waiting] == [2, 1, 3]
 
+    def test_offload_parked_count_released_only_after_resume(self, seq_factory):
+        sched = Scheduler(
+            MockConfig(
+                max_num_seqs=2,
+                max_num_batched_tokens=64,
+                num_kvcache_blocks=100,
+            )
+        )
+        sched.kv_connector = SimpleNamespace(
+            is_offload=True,
+            build_connector_meta=lambda: None,
+        )
+
+        seq = seq_factory(list(range(8)))
+        seq.num_cached_tokens = 4
+        seq.block_table = [0]
+        seq.offload_loaded_tokens = 4
+        sched._park_for_remote_load(seq, deque())
+        sched._count_inflight_load(seq)
+        sched.finished_recving_kv_req_ids.append(seq.id)
+
+        assert sched._resolve_waiting_remote_kv(seq, deque()) is False
+        assert sched._num_parked_remote_kv == 1
+        sched.waiting.append(seq)
+
+        batch, _ = sched.schedule()
+
+        assert batch.total_seqs_num_prefill == 1
+        assert seq in sched.running
+        assert sched._num_parked_remote_kv == 0
+        assert seq._counted_as_inflight_load is False
+
+        sched.running.clear()
+        failed = seq_factory(list(range(8)))
+        failed.num_cached_tokens = 4
+        failed.block_table = [0]
+        sched._park_for_remote_load(failed, deque())
+        sched.failed_recving_kv_req_ids.append(failed.id)
+        sched.waiting.append(failed)
+
+        sched.schedule()
+
+        assert failed.offload_load_failed is True
+        assert failed in sched.running
+        assert sched._num_parked_remote_kv == 0
+
     def test_partial_prefill_ready_for_offload_load_moves_to_waiting(self):
         class _Connector:
             def should_park_partial_prefill_for_load(self, seq):
@@ -199,6 +280,7 @@ class TestSchedule:
         sched.kv_connector = _Connector()
         sched.waiting = deque()
         sched._partial_prefill_count = 1
+        sched._num_parked_remote_kv = 0
         keep = SimpleNamespace(
             id=1,
             status=SequenceStatus.RUNNING,
@@ -217,10 +299,12 @@ class TestSchedule:
         assert [seq.id for seq in sched.waiting] == [2]
         assert ready.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
         assert ready.is_partial_prefill is False
-        assert ready._discard_next_deferred_output is True
+        assert not hasattr(ready, "_discard_next_deferred_output")
         assert sched._partial_prefill_count == 0
+        assert sched._num_parked_remote_kv == 1
+        assert ready._counted_as_inflight_load is True
 
-    def test_offload_partial_handoff_discards_stale_deferred_output(self, seq_factory):
+    def test_offload_partial_handoff_keeps_resumed_deferred_output(self, seq_factory):
         sched = Scheduler(
             MockConfig(
                 max_num_batched_tokens=64,
@@ -233,7 +317,9 @@ class TestSchedule:
         seq.status = SequenceStatus.RUNNING
         seq.type = SequenceType.PREFILL
         seq.num_cached_tokens = 8
-        seq._discard_next_deferred_output = True
+        # The pre-handoff partial-prefill postprocess already appended the
+        # deferred-output placeholder before the request was parked.
+        seq.append_token(sched.eos_token_id)
         sched.running = deque([seq])
 
         sched.postprocess(
@@ -250,9 +336,7 @@ class TestSchedule:
         )
 
         assert seq.num_cached_tokens == 10
-        assert seq._discard_next_deferred_output is False
-        assert 999 not in seq.output_tokens
-        assert seq.output_tokens == [sched.eos_token_id]
+        assert seq.output_tokens == [999, sched.eos_token_id]
 
 
 # ── _waiting_new_token_count (PrefillDelayer queue signal) ─────────────────

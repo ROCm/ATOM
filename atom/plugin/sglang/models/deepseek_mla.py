@@ -37,19 +37,25 @@ def setup_deepseek_for_sglang(model) -> None:
         model.atom_config = get_current_atom_config()
 
     kv_cache_dtype = model.atom_config.kv_cache_dtype
-
     # Initialise SGLang's MLA TP context before patching per-layer forwards.
-    from sglang.srt.configs.model_config import is_deepseek_nsa
+    try:
+        from sglang.srt.configs.model_config import is_deepseek_dsa
+    except ImportError:
+        from sglang.srt.configs.model_config import is_deepseek_nsa as is_deepseek_dsa
     from sglang.srt.layers.communicator import get_attn_tp_context
 
-    get_attn_tp_context().init_context(config.q_lora_rank, is_deepseek_nsa(config))
+    get_attn_tp_context().init_context(config.q_lora_rank, is_deepseek_dsa(config))
 
     from atom.models.deepseek_v2 import DeepseekV2MLAAttention
 
     last_sparse_indexer = None
     for module in model.modules():
         if isinstance(module, DeepseekV2MLAAttention):
-            _patch_mla_attention_for_sglang(module, config, kv_cache_dtype)
+            _patch_mla_attention_for_sglang(
+                module,
+                config,
+                kv_cache_dtype,
+            )
             if getattr(module, "use_nsa", False):
                 indexer = getattr(module, "indexer", None)
                 if indexer is not None and not getattr(module, "skip_topk", False):
@@ -60,7 +66,7 @@ def setup_deepseek_for_sglang(model) -> None:
 
 
 def _patch_mla_attention_for_sglang(
-    attn: "DeepseekV2MLAAttention",
+    attn: DeepseekV2MLAAttention,
     config: Any,
     kv_cache_dtype: str = "bf16",
 ) -> None:
@@ -69,29 +75,71 @@ def _patch_mla_attention_for_sglang(
     init_sgl_attrs(attn, config, kv_cache_dtype)
     _patch_attention_projs_for_sglang_mxfp4(attn)
     _patch_indexer_for_sglang_sparse_mla(attn)
+    _patch_indexer_layernorm_for_sglang(attn)
     if not isinstance(attn.mla_attn, SGLangDeepseekMLAAttention):
         attn.mla_attn = SGLangDeepseekMLAAttention(attn, attn.mla_attn)
-    attn.process_weights_after_loading = lambda: process_mla_kv_b_proj_after_loading(
-        attn
+
+    def process_weights_after_loading() -> None:
+        process_mla_kv_b_proj_after_loading(attn)
+        _patch_indexer_layernorm_for_sglang(attn)
+
+    attn.process_weights_after_loading = process_weights_after_loading
+
+
+def _patch_indexer_layernorm_for_sglang(attn: DeepseekV2MLAAttention) -> None:
+    """Adapt FP32 indexer affine tensors to AITER's standalone norm ABI."""
+    indexer = getattr(attn, "indexer", None)
+    k_norm = getattr(indexer, "k_norm", None)
+    if k_norm is None or getattr(k_norm, "_atom_sglang_dtype_patched", False):
+        return
+
+    from atom.model_ops.layernorm import (
+        layernorm2d_fwd_,
+        layernorm2d_fwd_with_add_,
     )
 
+    def forward(self, x, residual=None):
+        input_dtype = x.dtype
+        weight = self.weight.to(input_dtype)
+        bias = self.bias.to(input_dtype)
+        if residual is None:
+            return layernorm2d_fwd_(x, weight, bias, self.eps, self.dim)
 
-def _patch_indexer_for_sglang_sparse_mla(attn: "DeepseekV2MLAAttention") -> None:
+        residual_dtype = residual.dtype
+        output, residual_output = layernorm2d_fwd_with_add_(
+            x,
+            weight,
+            residual.to(input_dtype),
+            bias,
+            self.eps,
+            self.dim,
+        )
+        return output, residual_output.to(residual_dtype)
+
+    k_norm.forward = MethodType(forward, k_norm)
+    k_norm._atom_sglang_dtype_patched = True
+
+
+def _patch_indexer_for_sglang_sparse_mla(attn: DeepseekV2MLAAttention) -> None:
     """Adapt DeepSeek-V3.2 sparse indexer buffers for SGLang plugin mode."""
     indexer = getattr(attn, "indexer", None)
     if indexer is None or getattr(indexer, "_atom_sglang_topk_buffer_patched", False):
         return
 
     import torch
+
     import atom.plugin.sglang.attention_backend.sparse_mla_indexer  # noqa: F401
 
     original_forward = indexer.forward
     indexer.use_qk_rope_cache_fusion = False
-    indexer.sparse_attn_indexer_impl = (
+    generic_sparse_attn_indexer_impl = (
         torch.ops.aiter.sparse_attn_indexer_sglang_plugin_mode
     )
+    indexer.sparse_attn_indexer_impl = generic_sparse_attn_indexer_impl
 
     def _forward_with_topk_buffer(self, hidden_states, *args, **kwargs):
+        self.use_qk_rope_cache_fusion = False
+        self.sparse_attn_indexer_impl = generic_sparse_attn_indexer_impl
         num_tokens = int(hidden_states.shape[0])
         topk_tokens = int(self.topk_tokens)
         buffer = getattr(self, "topk_indices_buffer", None)
@@ -118,7 +166,7 @@ def _patch_indexer_for_sglang_sparse_mla(attn: "DeepseekV2MLAAttention") -> None
     indexer._atom_sglang_topk_buffer_patched = True
 
 
-def _align_qknorm_fusion_for_sglang(attn: "DeepseekV2MLAAttention") -> None:
+def _align_qknorm_fusion_for_sglang(attn: DeepseekV2MLAAttention) -> None:
     """Keep non-quant q/k norm fusion on the BF16 path in SGLang plugin mode."""
     if getattr(attn, "fuse_qknorm", False) and not getattr(
         attn, "fuse_qknorm_quant", False
