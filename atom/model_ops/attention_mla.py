@@ -44,6 +44,7 @@ from torch import nn
 from atom.config import get_current_atom_config
 from atom.distributed.dcp_utils import (
     dcp_persistent_supported,
+    dcp_prefill_merge_bf16_ok,
     get_dcp_group,
     get_dcp_rank,
     get_dcp_world_size,
@@ -335,6 +336,11 @@ class MLAAttention(nn.Module):
         # the lse persistent kernel, gfx942 does not — see dcp_utils). Cached
         # once here to avoid a per-forward get_gfx() (graph-break).
         self.dcp_persistent_supported = dcp_persistent_supported()
+
+        # Whether the DCP sparse-prefill merge may accumulate in bf16 on this
+        # GPU (gfx950 yes, gfx942 loses ~3.5pp — see dcp_utils). Cached here for
+        # the same reason as above: no per-forward get_gfx().
+        self.dcp_prefill_merge_bf16_ok = dcp_prefill_merge_bf16_ok()
 
         # Compacted per-layer sparse offsets for DCP decode; rebound by the
         # metadata builder to the shared buffer (see aiter_mla.py).
@@ -1703,11 +1709,16 @@ class MLAAttention(nn.Module):
                     o, lse = self._forward_prefill_mla(
                         q_out, kv_cache, attn_metadata, return_lse=True
                     )
-                    # Merge in fp32: the bf16 ReduceScatter sum dominates the accuracy
-                    # regression under fp8 KV in long context scenario.
-                    o = cp_lse_ag_out_rs(o.float(), lse, self.dcp_group, ctx=None).to(
-                        o.dtype
-                    )
+                    # Merge dtype is platform-dependent: on gfx942 the bf16
+                    # ReduceScatter sum costs ~3.5pp, on gfx950 it is free even at
+                    # ctx~32k with fp8 KV. Pay the fp32 upcast only where it buys
+                    # something -- see dcp_prefill_merge_bf16_ok for the numbers.
+                    if self.dcp_prefill_merge_bf16_ok:
+                        o = cp_lse_ag_out_rs(o, lse, self.dcp_group, ctx=None)
+                    else:
+                        o = cp_lse_ag_out_rs(
+                            o.float(), lse, self.dcp_group, ctx=None
+                        ).to(o.dtype)
                     output = self._v_up_proj_and_o_proj(o)
                 else:
                     output = self._forward_prefill_mla(q_out, kv_cache, attn_metadata)
