@@ -662,6 +662,8 @@ def install_deepseek_v4_proxy_pool_patch() -> None:
     import sglang.srt.mem_cache.deepseek_v4_memory_pool as dsv4_pool
 
     original_pool_cls = getattr(dsv4_pool, "DeepSeekV4TokenToKVPool", None)
+    if original_pool_cls is None:
+        raise RuntimeError("SGLang DeepSeekV4TokenToKVPool is not available")
     if original_pool_cls is ATOMDeepSeekV4ProxyKVPool:
         return
 
