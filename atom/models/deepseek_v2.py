@@ -1430,7 +1430,7 @@ def _dcp_decode_candidate_exchange(
     num_padded_tokens = num_rows
     assert attn_metadata.max_seqlen_q == 1, (
         "DCP + DeepSeek-V3.2 sparse indexer (DSA) currently supports "
-        "qlen=1 decode only (MTP verify is Phase 2)."
+        "qlen=1 decode only (MTP verify not yet supported)."
     )
     g_ctx = attn_metadata.context_lens
     base = g_ctx // dcp_world_size
