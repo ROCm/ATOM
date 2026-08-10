@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786294174783,
+  "lastUpdate": 1786353171066,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -1442,6 +1442,42 @@ window.BENCHMARK_DATA = {
             "value": 0.7491,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/31323129825 | Threshold: 0.73 | Baseline: 0.75 | BaselineModel: meta-llama/Meta-Llama-3-8B-Instruct | BaselineNote: HF reports 0.796 but 8-shot CoT; CI uses 3-shot, not comparable | Docker: rocm/atom-dev:nightly_202608091507 | GPU: AMD Instinct MI350X | VRAM: 252GB | ROCm: unknown | strict-match: 0.7483 | fewshot: 3 | Model: /models/meta-llama/Meta-Llama-3-8B-Instruct"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "yuechao.guo@amd.com",
+            "name": "Morpheus Guo",
+            "username": "Yuechguo"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "2b61f9871e225730131e96ae0c4e21ef34653381",
+          "message": "feat(dp_sticky) : add new dp_sticky policy for dp-aware routing. (#1699)\n\n* Add the dp_sticky policy to route requests with the same X-Session-ID to a\nconsistent healthy worker. New or reassigned sessions select the lowest-load\nworker, while requests without a session ID use the same load-balancing\nfallback.\n\n* feat(dp_sticky): reassign idle sessions to the lowest-load worker\n\n* feat(mesh): support dp_sticky CLI routing policy\n\n* fix(dp_sticky): preserve DP rank affinity and track worker load\n\n* fix(dp_sticky): avoid concurrent session reassignment races\n\n* update default session-id idle times\n\n* balance new sticky sessions\n\n---------\n\nCo-authored-by: yuechguo <yuechguo@amd.com>\nCo-authored-by: wanzhenchn <wanzhenchn@gmail.com>",
+          "timestamp": "2026-08-10T16:50:56+08:00",
+          "tree_id": "7459edde1029253ec1f4a77e3ba0d992df10c9f0",
+          "url": "https://github.com/ROCm/ATOM/commit/2b61f9871e225730131e96ae0c4e21ef34653381"
+        },
+        "date": 1786353140107,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9447,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/31371899680 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202608091507 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: unknown | strict-match: 0.9409 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::Meta-Llama-3-8B-Instruct accuracy (GSM8K)",
+            "value": 0.746,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/31371899680 | Threshold: 0.73 | Baseline: 0.75 | BaselineModel: meta-llama/Meta-Llama-3-8B-Instruct | BaselineNote: HF reports 0.796 but 8-shot CoT; CI uses 3-shot, not comparable | Docker: rocm/atom-dev:nightly_202608091507 | GPU: AMD Instinct MI350X | VRAM: 288GB | ROCm: unknown | strict-match: 0.7453 | fewshot: 3 | Model: /models/meta-llama/Meta-Llama-3-8B-Instruct"
           }
         ]
       }
