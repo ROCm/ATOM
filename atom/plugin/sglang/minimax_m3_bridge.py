@@ -314,15 +314,54 @@ def install_minimax_m3_pool_patch() -> None:
 
 
 def maybe_get_minimax_m3_pools_from_sglang_batch(forward_batch=None):
-    from atom.plugin.sglang.runtime.attention_backend_resolver import (
-        resolve_sglang_runtime,
-    )
+    token_to_kv_pool = getattr(forward_batch, "token_to_kv_pool", None)
+    req_to_token_pool = getattr(forward_batch, "req_to_token_pool", None)
 
-    try:
-        runtime = resolve_sglang_runtime(forward_batch)
-    except RuntimeError:
+    if token_to_kv_pool is None or req_to_token_pool is None:
+        try:
+            from sglang.srt.model_executor.forward_context import (
+                get_attn_backend,
+                has_forward_context,
+            )
+
+            backends = []
+            if has_forward_context():
+                active_backend = get_attn_backend()
+                backends.append(active_backend)
+                full_backend = getattr(active_backend, "full_attn_backend", None)
+                if full_backend is not None:
+                    backends.append(full_backend)
+                backends.extend(getattr(active_backend, "attn_backends", None) or [])
+
+            for backend in backends:
+                token_to_kv_pool = token_to_kv_pool or getattr(
+                    backend,
+                    "_atom_token_to_kv_pool",
+                    getattr(backend, "token_to_kv_pool", None),
+                )
+                req_to_token_pool = req_to_token_pool or getattr(
+                    backend,
+                    "_atom_req_to_token_pool",
+                    getattr(backend, "req_to_token_pool", None),
+                )
+                if token_to_kv_pool is not None and req_to_token_pool is not None:
+                    break
+        except Exception:  # noqa: BLE001, S110 - optional across SGLang versions
+            pass
+
+    if token_to_kv_pool is None or req_to_token_pool is None:
         return None, None
-    return runtime.token_to_kv_pool, runtime.req_to_token_pool
+    if (
+        forward_batch is not None
+        and getattr(forward_batch, "token_to_kv_pool", None) is None
+    ):
+        forward_batch.token_to_kv_pool = token_to_kv_pool
+    if (
+        forward_batch is not None
+        and getattr(forward_batch, "req_to_token_pool", None) is None
+    ):
+        forward_batch.req_to_token_pool = req_to_token_pool
+    return token_to_kv_pool, req_to_token_pool
 
 
 def _page_size(token_to_kv_pool) -> int:

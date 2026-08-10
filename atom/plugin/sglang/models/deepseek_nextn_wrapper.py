@@ -209,10 +209,11 @@ class DeepseekV3ForCausalLMNextN(nn.Module):
                     self.atom_config.hf_config, model_path=draft_model_path
                 )
         if use_standalone_draft:
-            self.atom_config.quant_config = AtomQuantizationConfig(
-                self.atom_config.hf_config,
-                self.atom_config.online_quant_config,
-            )
+            with _safe_hf_config_repr():
+                self.atom_config.quant_config = AtomQuantizationConfig(
+                    self.atom_config.hf_config,
+                    self.atom_config.online_quant_config,
+                )
         self._prepare_atom_config_for_nextn(
             config=config,
             draft_model_path=draft_model_path,
