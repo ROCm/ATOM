@@ -61,3 +61,36 @@ def dcp_persistent_supported() -> bool:
     from aiter.jit.utils.chip_info import get_gfx
 
     return get_gfx() == "gfx950"
+
+
+def dcp_prefill_merge_bf16_ok() -> bool:
+    """Whether the DCP sparse-prefill partial merge may accumulate in bf16.
+
+    ``cp_lse_ag_out_rs`` accumulates in the tensor dtype: the LSE math is fp32,
+    but the per-rank corrected output is stored bf16 and the W-way
+    ``reduce_scatter`` then sums in bf16. Over 78 layers x thousands of prefill
+    rows that rounding is measurable on *some* GPUs and not others:
+
+        gfx942  dcp8 nshot=20 full gsm8k  bf16 merge 0.9166-0.9174
+                                          fp32 merge 0.9522-0.9598   (-3.5pp)
+                (both KV dtypes drop by the same amount, so the amplifier is the
+                platform, not fp8 KV)
+        gfx950  dcp8 nshot=200 full gsm8k (ctx~32k, fp8 KV -- the harshest case
+                available: ~10x the prefill rows of the gfx942 run)
+                                          bf16 merge 0.9575
+                                          fp32 merge 0.9575           (identical)
+
+    So the fp32 merge is a platform-specific fix, not a universal one, and it is
+    not free: it doubles this collective's bytes and cost ~18% end-to-end wall
+    clock on the gfx950 200-shot run (1:48:35 -> 1:28:54).
+
+    Deliberately an *allowlist*: bf16 is enabled only where it has been measured
+    safe. An unrecognised arch keeps the fp32 merge, because the failure mode of
+    guessing wrong is a silent multi-pp accuracy loss, while the cost of being
+    conservative is only prefill throughput. Kept separate from
+    ``dcp_persistent_supported`` -- both happen to be gfx950 today, but one is
+    about kernel availability and the other about numerics.
+    """
+    from aiter.jit.utils.chip_info import get_gfx
+
+    return get_gfx() == "gfx950"
