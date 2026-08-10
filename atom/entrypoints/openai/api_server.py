@@ -229,6 +229,21 @@ def _validate_sequence_context_length(seq) -> None:
     )
 
 
+# Enough trailing tokens to cover any dialect's prompt-open marker
+# (Kimi-K3's `<|open|>think<|sep|>` is four).
+_PROMPT_TAIL_TOKENS = 16
+
+
+def _decode_prompt_tail(token_ids: list[int]) -> str:
+    """Render the end of a pre-tokenized prompt back to text.
+
+    `prompt_starts_in_reasoning` only inspects the very end of the prompt, so
+    decoding a short suffix avoids paying for a prompt that can run to thousands
+    of image tokens.
+    """
+    return tokenizer.decode(token_ids[-_PROMPT_TAIL_TOKENS:])
+
+
 def _has_multimodal_content(messages: list[Any]) -> bool:
     for message in messages:
         content = getattr(message, "content", None)
@@ -1200,9 +1215,11 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
 
         # The K3 template may inject the opening reasoning marker into the prompt
         # itself; if so the stream begins mid-thought and the ReasoningFilter must
-        # start in the thinking state. Multimodal inputs are pre-tokenized ids, so
-        # this only applies to the text path.
-        _starts_thinking = (not is_multimodal) and prompt_starts_in_reasoning(prompt)
+        # start in the thinking state. Multimodal inputs arrive pre-tokenized, so
+        # decode the tail back to text to run the same check.
+        _starts_thinking = prompt_starts_in_reasoning(
+            _decode_prompt_tail(token_ids) if is_multimodal else prompt
+        )
 
         # Streaming
         if request.stream:
