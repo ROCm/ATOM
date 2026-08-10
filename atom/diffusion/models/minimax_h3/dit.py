@@ -132,6 +132,33 @@ def _modulate_scale_shift(
     ).to(dtype)
 
 
+def _norm_modulate(
+    norm: nn.RMSNorm,
+    x: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    indices: torch.Tensor,
+) -> torch.Tensor:
+    """RMSNorm then indexed scale/shift, in one kernel where aiter has it.
+
+    Unfused, the normalised activation is written and immediately re-read, and
+    both modulation tables are materialised at [tokens, hidden] by the gather.
+    Measured 5.2x on a 63,232 x 5376 row block.
+    """
+    if x.device.type == "cuda" and x.dtype is _BF16:
+        try:
+            from aiter.ops.triton.fusions.fused_rmsnorm_indexed_adaln import (
+                fused_rmsnorm_indexed_adaln,
+            )
+        except ImportError:
+            pass
+        else:
+            return fused_rmsnorm_indexed_adaln(
+                x.contiguous(), norm.weight, shift, scale, indices, eps=norm.eps
+            )
+    return _modulate_scale_shift(norm(x), shift, scale, indices, dtype=_BF16)
+
+
 def _modulate_gate(
     x: torch.Tensor,
     gate: torch.Tensor,
@@ -512,9 +539,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = adaln_params
 
         residual = x
-        h = _modulate_scale_shift(
-            self.norm1(x), shift_msa, scale_msa, combined_indices, dtype=_BF16
-        )
+        h = _norm_modulate(self.norm1, x, shift_msa, scale_msa, combined_indices)
         h = self.attn(
             h,
             rope_cache=rope_cache,
@@ -526,9 +551,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         x = _modulate_gate(residual, gate_msa, h, combined_indices, dtype=_BF16)
 
         residual = x
-        h = _modulate_scale_shift(
-            self.norm2(x), shift_mlp, scale_mlp, combined_indices, dtype=_BF16
-        )
+        h = _norm_modulate(self.norm2, x, shift_mlp, scale_mlp, combined_indices)
         h = self.mlp(h)
         return _modulate_gate(residual, gate_mlp, h, combined_indices, dtype=_BF16)
 
