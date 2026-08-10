@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 import torch
 import torch._inductor.compile_fx
-import torch.fx as fx
+from torch import fx
 
 from atom.config import Config
 from atom.utils import compilation_counter, is_torch_equal_or_newer
