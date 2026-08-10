@@ -107,9 +107,8 @@ class LMCacheOffloadConnector(KVConnectorBase):
         rank, world = tp.rank_in_group, tp.world_size
         self._rank = rank
 
-        cfg = offcfg.build_lmcache_config()
-        offcfg.apply_extra_overrides(
-            cfg, getattr(self._config, "kv_transfer_config", None)
+        cfg = offcfg.build_lmcache_config(
+            getattr(self._config, "kv_transfer_config", None)
         )
         self.chunk_size = int(cfg.chunk_size)
         # num_blocks is the scheduler-visible block count, threaded from the
@@ -142,6 +141,7 @@ class LMCacheOffloadConnector(KVConnectorBase):
         # opaque uint8 object, so keep a supported tensor MemoryFormat.
         self._engine.fmt = MemoryFormat.KV_2LTD
         self._engine.post_init()
+        self._validate_and_log_storage_backends(cfg)
 
         # ZMQ lookup server so the scheduler process can query our hit counts.
         try:
@@ -182,6 +182,41 @@ class LMCacheOffloadConnector(KVConnectorBase):
                 f"transfer_regions={expected} bytes, "
                 f"num_blocks={self._codec.num_blocks}"
             )
+
+    def _validate_and_log_storage_backends(self, cfg) -> None:
+        """Report the realized LMCache tier topology and validate NVMe startup."""
+        storage_manager = getattr(self._engine, "storage_manager", None)
+        backend_names: list[str] = []
+        if storage_manager is not None:
+            list_backends = getattr(storage_manager, "list_backends", None)
+            if callable(list_backends):
+                backend_names = sorted(str(name) for name in list_backends())
+            else:
+                storage_backends = getattr(storage_manager, "storage_backends", {})
+                backend_names = sorted(str(name) for name in storage_backends)
+
+        local_disk = getattr(cfg, "local_disk", None)
+        disk_size_gib = float(getattr(cfg, "max_local_disk_size", 0.0) or 0.0)
+        disk_configured = bool(local_disk) and disk_size_gib > 0
+        if disk_configured and "LocalDiskBackend" not in backend_names:
+            raise RuntimeError(
+                "LMCache local-disk offload was configured but LocalDiskBackend "
+                f"was not created on rank {self._rank}; backends={backend_names}"
+            )
+
+        logger.info(
+            "LMCache offload worker rank=%d storage: backends=%s "
+            "local_cpu=%s max_local_cpu_gib=%s local_disk=%s "
+            "max_local_disk_gib=%s store_location=%s retrieve_locations=%s",
+            self._rank,
+            backend_names,
+            getattr(cfg, "local_cpu", None),
+            getattr(cfg, "max_local_cpu_size", None),
+            local_disk,
+            getattr(cfg, "max_local_disk_size", None),
+            getattr(cfg, "store_location", None),
+            getattr(cfg, "retrieve_locations", None),
+        )
 
     # -- per-step (RPC thread): only enqueue, never copy ------------------
     def start_load_kv(self, metadata) -> None:
@@ -499,8 +534,7 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
             self._min_load_tokens = 8192
 
         try:
-            cfg = offcfg.build_lmcache_config()
-            offcfg.apply_extra_overrides(cfg, kvc)
+            cfg = offcfg.build_lmcache_config(kvc)
             self.chunk_size = int(cfg.chunk_size)
             from lmcache.v1.lookup_client.factory import LookupClientFactory
 

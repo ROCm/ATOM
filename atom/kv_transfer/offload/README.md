@@ -527,11 +527,16 @@ LMCache is driven by `LMCACHE_*` env, exactly like the vLLM recipe:
 
 | Env | Purpose |
 |-----|---------|
-| `LMCACHE_LOCAL_CPU=True` | Enable the CPU (L2) tier. |
-| `LMCACHE_MAX_LOCAL_CPU_SIZE` | CPU tier size, GiB. |
+| `LMCACHE_LOCAL_CPU` | Enable the CPU hot-cache tier. Set `False` for NVMe-only storage. |
+| `LMCACHE_MAX_LOCAL_CPU_SIZE` | CPU hot-cache/staging allocator size, GiB. This must remain greater than zero for NVMe I/O even when `LMCACHE_LOCAL_CPU=False`. |
 | `LMCACHE_CHUNK_SIZE=256` | LMCache chunk size (must be a multiple of ATOM block size). |
-| `LMCACHE_LOCAL_DISK` | NVMe (L3) tier path; omit to disable. |
-| `LMCACHE_MAX_LOCAL_DISK_SIZE` | NVMe tier size, GiB. |
+| `LMCACHE_LOCAL_DISK` | NVMe (L3) tier path; omit together with disk size to disable. |
+| `LMCACHE_MAX_LOCAL_DISK_SIZE` | NVMe tier size, GiB; must be greater than zero when a disk path is set. |
+
+NVMe uses LMCache's host-mediated POSIX path, not GDS: HBM is staged through
+the CPU allocator before `LocalDiskBackend` writes or reads the NVMe files. At
+startup each worker logs the realized backend list and capacities; a configured
+disk tier fails startup if `LocalDiskBackend` was not actually created.
 
 Connector-specific tuning (env):
 
@@ -559,6 +564,12 @@ export LMCACHE_LOCAL_CPU=True
 export LMCACHE_MAX_LOCAL_CPU_SIZE=200          # GiB CPU tier
 export LMCACHE_CHUNK_SIZE=256
 # Optional NVMe L3 tier:
+# export LMCACHE_LOCAL_DISK=/nvme/lmcache
+# export LMCACHE_MAX_LOCAL_DISK_SIZE=2000
+
+# For an NVMe-backed tier without a CPU hot cache, use:
+# export LMCACHE_LOCAL_CPU=False
+# export LMCACHE_MAX_LOCAL_CPU_SIZE=8           # required host staging pool
 # export LMCACHE_LOCAL_DISK=/nvme/lmcache
 # export LMCACHE_MAX_LOCAL_DISK_SIZE=2000
 

@@ -16,11 +16,31 @@ from __future__ import annotations
 from typing import Any
 
 
-def build_lmcache_config():
-    """Return an ``LMCacheEngineConfig`` from ``LMCACHE_*`` env + extras."""
+def build_lmcache_config(
+    kv_transfer_config: dict[str, Any] | None = None,
+) -> Any:
+    """Return a validated ``LMCacheEngineConfig`` for ATOM offload.
+
+    LMCache's local-disk backend always uses the local-CPU allocator as its
+    host staging pool, even when the CPU hot-cache tier is disabled. Validate
+    that relationship here so an incomplete NVMe configuration fails during
+    connector startup instead of silently running CPU-only.
+
+    Args:
+        kv_transfer_config: Optional ATOM connector configuration containing
+            ``lmcache.<field>`` overrides.
+
+    Returns:
+        The finalized LMCache engine configuration.
+
+    Raises:
+        ValueError: If the local-disk path, capacity, or CPU staging capacity
+            is incomplete.
+    """
     from lmcache.v1.config import LMCacheEngineConfig
 
     cfg = LMCacheEngineConfig.from_env()
+    apply_extra_overrides(cfg, kv_transfer_config)
     # cufile GDS has no NVMe-GDS hardware here and hangs on init; force off.
     if getattr(cfg, "use_gds", False):
         try:
@@ -38,6 +58,7 @@ def build_lmcache_config():
         cfg.lookup_server_worker_ids = [0]
     except Exception:
         pass
+    validate_lmcache_storage_config(cfg)
     return cfg
 
 
@@ -54,6 +75,41 @@ def apply_extra_overrides(cfg, kv_transfer_config: dict[str, Any] | None) -> Non
                     setattr(cfg, field, value)
                 except Exception:
                     pass
+
+
+def validate_lmcache_storage_config(cfg: Any) -> None:
+    """Validate the host-staged LMCache local-disk configuration.
+
+    Args:
+        cfg: An LMCache engine configuration object.
+
+    Raises:
+        ValueError: If only one of the local-disk path/capacity is configured,
+            or if no local-CPU staging capacity is available for disk I/O.
+    """
+    local_disk = getattr(cfg, "local_disk", None)
+    disk_path_configured = bool(str(local_disk).strip()) if local_disk else False
+    try:
+        disk_size_gib = float(getattr(cfg, "max_local_disk_size", 0.0) or 0.0)
+        cpu_size_gib = float(getattr(cfg, "max_local_cpu_size", 0.0) or 0.0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "LMCache CPU/disk capacities must be numeric GiB values"
+        ) from exc
+
+    if disk_path_configured and disk_size_gib <= 0:
+        raise ValueError(
+            "LMCACHE_LOCAL_DISK is set but LMCACHE_MAX_LOCAL_DISK_SIZE must be > 0"
+        )
+    if not disk_path_configured and disk_size_gib > 0:
+        raise ValueError(
+            "LMCACHE_MAX_LOCAL_DISK_SIZE is set but LMCACHE_LOCAL_DISK is missing"
+        )
+    if disk_path_configured and cpu_size_gib <= 0:
+        raise ValueError(
+            "LMCache local-disk offload requires LMCACHE_MAX_LOCAL_CPU_SIZE > 0 "
+            "for the host staging allocator, even when LMCACHE_LOCAL_CPU=False"
+        )
 
 
 def build_lmcache_metadata(config, cfg, world_size: int, worker_id: int):
