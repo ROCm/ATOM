@@ -1443,8 +1443,8 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
             if generation_config is not None
             else {}
         )
-        # Ignore Transformers defaults materialized for fields absent from the
-        # model's generation_config.json (notably top_k=50).
+        # Only non-None sampling values from the model generation config
+        # should override ATOM's neutral defaults.
         model_sampling_defaults = {
             name: generation_config_diff[name]
             for name in ("temperature", "top_p", "top_k")
