@@ -8,7 +8,8 @@ To add a new model, append its architecture class name to _MODEL_NAMES.
 
 import inspect
 import logging
-from typing import Any, Iterable, Optional, Tuple, Union
+from collections.abc import Iterable
+from typing import Any, Optional, Union
 
 import torch
 from sglang.srt.distributed import get_pp_group
@@ -406,7 +407,7 @@ class _AtomCausalLMBaseForSglang(nn.Module):
                     )
                 return hidden_states
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         # The passed `weights` iterable from sglang is ignored because ATOM
         # uses its own weight loading pipeline (handling AITER-specific quant
         # formats, kv_b_proj splitting, etc.) that is incompatible with
