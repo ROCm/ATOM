@@ -125,6 +125,23 @@ def _resolve_num_tokens_across_dp(
     return num_tokens_across_dp
 
 
+def _resolve_dp_uniform_decode(
+    atom_config: Any,
+    forward_batch: ForwardBatch,
+) -> bool:
+    """Resolve the DP decode mode needed by ATOM TBO.
+
+    This was added after skewed TBO prefill incorrectly inherited the Context
+    default ``True`` and entered the uniform-decode MORI path, which could
+    truncate variable-length buffers and eventually trigger a HIP error.
+    Keep the legacy default when TBO is disabled.
+    """
+
+    if not atom_config.enable_tbo or not atom_config.enable_dp_attention:
+        return True
+    return not forward_batch.is_extend_in_batch
+
+
 def _max_len_from_optional(cpu_lens, gpu_lens, default: int) -> int:
     if cpu_lens is not None:
         if isinstance(cpu_lens, torch.Tensor):
@@ -698,12 +715,14 @@ def _set_atom_forward_context(
         num_tokens_across_dp = None
         graph_bs = num_tokens if is_prefill else batch_size
 
+    dp_uniform_decode = _resolve_dp_uniform_decode(atom_config, forward_batch)
     context = Context(
         positions=positions,
         is_prefill=is_prefill,
         is_dummy_run=is_dummy_run,
         batch_size=batch_size,
         graph_bs=graph_bs,
+        dp_uniform_decode=dp_uniform_decode,
     )
     set_forward_context(
         attn_metadata=attn_metadata,
@@ -740,7 +759,7 @@ class SGLangPluginRuntime:
     _is_dummy_run: bool = field(init=False, default=False)
     _exit_stack: ExitStack = field(init=False, repr=False)
 
-    def __enter__(self) -> "SGLangPluginRuntime":
+    def __enter__(self) -> SGLangPluginRuntime:  # noqa: PYI034
         self._original_forward_batch = self.forward_batch
         self._is_dummy_run = _is_dummy_forward(self.forward_batch)
 

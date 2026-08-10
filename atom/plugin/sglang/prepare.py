@@ -67,6 +67,10 @@ def prepare_model(config: Any):
     from atom.plugin.config import generate_atom_config_for_plugin_mode
 
     atom_config = generate_atom_config_for_plugin_mode(config)
+    if getattr(atom_config, "enable_tbo", False):
+        from atom.plugin.sglang.tbo import install_sglang_tbo_compat_patches
+
+        install_sglang_tbo_compat_patches()
 
     model_cls = _ATOM_SUPPORTED_MODELS[model_arch]
     logger.info("ATOM model class for %s is %s", model_arch, model_cls)
