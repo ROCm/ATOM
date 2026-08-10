@@ -706,9 +706,8 @@ class Scheduler:
                 and num_new_tokens > self.max_num_batched_tokens
             ):
                 continue
-            if self.block_manager.can_allocate(seq) < 0:
-                return False  # KV-pressured: definitely cannot prefill
-            return True
+            # KV-pressured requests definitely cannot prefill.
+            return self.block_manager.can_allocate(seq) >= 0
         return False
 
     def _kv_usage(self) -> float:
@@ -923,18 +922,21 @@ class Scheduler:
         # We check the slot list length below; without the accounting dict we
         # infer "no slots ever existed" from `num_per_req_cache_groups == 0`,
         # exposed via the free list at init time (slot ids 0..N-1).
-        if seq.has_per_req_cache and len(bm.free_per_req_cache_groups) == 0:
+        if (
+            seq.has_per_req_cache
+            and len(bm.free_per_req_cache_groups) == 0
+            and getattr(self.config, "num_per_req_cache_groups", 0) == 0
+        ):
             # All slots are currently in-use OR no slots were ever created.
             # The schedule loop handles "currently full" by waiting; only
             # warn for the permanent "never created" case, identified by
             # `num_per_req_cache_groups` being 0 in the config.
-            if getattr(self.config, "num_per_req_cache_groups", 0) == 0:
-                logger.warning(
-                    "Request %s will never be scheduled: needs per-req cache "
-                    "slot but no slots were allocated (max_num_seqs=0 for "
-                    "this model type).",
-                    seq.id,
-                )
+            logger.warning(
+                "Request %s will never be scheduled: needs per-req cache "
+                "slot but no slots were allocated (max_num_seqs=0 for "
+                "this model type).",
+                seq.id,
+            )
 
     def take_rejected(self) -> list[Sequence]:
         """Pop and return any seqs the prefill scheduler dropped because
@@ -1101,6 +1103,7 @@ class Scheduler:
                     num_seqs_prefill,
                     num_batched_tokens,
                 )
+                self._uncount_inflight_load(seq)
                 continue
 
             if (
@@ -1404,15 +1407,18 @@ class Scheduler:
         if self.kv_connector is not None and hasattr(self.kv_connector, "load_failed"):
             self.kv_connector.load_failed(seq.id)
         seq.status = SequenceStatus.WAITING
-        self._uncount_inflight_load(seq)
+        if not self._connector_flag("is_offload"):
+            self._uncount_inflight_load(seq)
         seq.offload_loaded = False
         seq.offload_loaded_tokens = seq.num_cached_tokens
+        seq.offload_load_start_tokens = None
         seq.offload_load_failed = True
         return True
 
     def _mark_offload_load_ready(self, seq: Sequence) -> None:
         """Turn a completed offload load into a suffix-prefill resume."""
         loaded = getattr(seq, "offload_loaded_tokens", None)
+        load_start = getattr(seq, "offload_load_start_tokens", None)
         logger.debug(
             "[OFFLOAD-WAKE] seq %s: loaded=%s prev_cached=%d num_tokens=%d",
             seq.id,
@@ -1421,7 +1427,24 @@ class Scheduler:
             seq.num_tokens,
         )
         if loaded is not None and loaded > seq.num_cached_tokens:
+            promoted = 0
+            if load_start is not None and load_start < loaded:
+                promoted = self.block_manager.publish_loaded_prefix(
+                    seq,
+                    start_token=load_start,
+                    end_token=loaded,
+                )
+                logger.info(
+                    "[OFFLOAD-PROMOTE] seq=%s loaded_range=%d:%d "
+                    "gpu_indexed_tokens=%d",
+                    seq.id,
+                    load_start,
+                    loaded,
+                    promoted,
+                )
+            seq.offload_promoted_tokens = promoted
             seq.num_cached_tokens = loaded
+        seq.offload_load_start_tokens = None
         seq.offload_loaded = True
 
     def _is_offload_prefill_resume(self, seq: Sequence) -> bool:
@@ -1552,8 +1575,12 @@ class Scheduler:
     ) -> None:
         skipped_waiting_requests.append(seq)
         seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
-        self._num_parked_remote_kv += 1
-        seq._counted_as_inflight_load = True
+        self._count_inflight_load(seq)
+
+    def _count_inflight_load(self, seq: Sequence) -> None:
+        if not getattr(seq, "_counted_as_inflight_load", False):
+            self._num_parked_remote_kv += 1
+            seq._counted_as_inflight_load = True
 
     def _uncount_inflight_load(self, seq: Sequence) -> None:
         if getattr(seq, "_counted_as_inflight_load", False):
@@ -1783,23 +1810,13 @@ class Scheduler:
                     continue
             elif seq.is_partial_prefill:
                 continue
-            # Drop stale tokens produced by chunked-prefill steps.
-            #
-            # There are two ways a stale token reaches this point:
-            # 1. Normal chunked prefill: the seq was partial at the start of
-            #    this postprocess call. With deferred output, the visible token
-            #    is one step late, so it belongs to the previous partial chunk.
-            # 2. Offload/remote-KV handoff: a partial seq can be parked out of
-            #    running and have seq.is_partial_prefill cleared. In that case
-            #    prev_partial_ids can no longer see it, so the park path sets
-            #    _discard_next_deferred_output to carry "drop one old token"
-            #    across the park/resume boundary.
-            was_partial_prefill_at_step_start = seq.id in prev_partial_ids
-            drop_old_token_after_offload_park = False
-            if is_deferred_out and getattr(seq, "_discard_next_deferred_output", False):
-                seq._discard_next_deferred_output = False
-                drop_old_token_after_offload_park = True
-            if was_partial_prefill_at_step_start or drop_old_token_after_offload_park:
+            # With deferred output, a token visible after a normal chunked-
+            # prefill step belongs to the previous partial chunk and must be
+            # dropped. An offload handoff is different: parking removes the
+            # request from at least one intervening model-runner batch, which
+            # already discards its deferred partial output. The first output
+            # after the request resumes is fresh and must be kept.
+            if seq.id in prev_partial_ids:
                 continue
             # Register prefix-cache hashes for blocks the prefill step just
             # finalized. Deferred from BlockManager.allocate() so a hash is
@@ -2234,10 +2251,10 @@ class Scheduler:
             should_park = self.kv_connector.should_park_partial_prefill_for_load(seq)
             if should_park:
                 if seq.is_partial_prefill:
-                    seq._discard_next_deferred_output = True
                     seq.is_partial_prefill = False
                     self._partial_prefill_count -= 1
                 seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+                self._count_inflight_load(seq)
                 parked.append(seq)
             else:
                 keep_running.append(seq)

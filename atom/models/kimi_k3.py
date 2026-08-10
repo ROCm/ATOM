@@ -11,14 +11,13 @@ the same object hierarchy and skips the vision tower/projector tensors.
 from typing import ClassVar
 
 import torch
-from aiter import ActivationType, QuantType, fused_qk_rmsnorm
+from aiter import ActivationType, QuantType, dtypes
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from aiter.jit.utils.torch_guard import torch_compile_guard
 from einops import rearrange
 from torch import nn
 
@@ -28,6 +27,11 @@ from atom.config import (
     QuantizationConfig,
     get_current_atom_config,
 )
+
+# Side-effect import: registers `torch.ops.aiter.maybe_dual_stream_forward`, the
+# Dynamo-opaque custom op that dispatches the MoE between single- and dual-stream
+# forwards (shared with deepseek_v2/v4). Imported for the registration only.
+from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.model_ops.attention_mla import MLAModules
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
@@ -41,6 +45,8 @@ from atom.model_ops.linear import (
     MergedReplicatedLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    use_fp4_non_shuffle_triton_gemm,
+    use_triton_gemm,
 )
 from atom.model_ops.mamba_ops.causal_conv1d import (
     causal_conv1d_fn,
@@ -56,7 +62,8 @@ from atom.models.utils import (
     make_layers,
     maybe_prefix,
 )
-from atom.utils import mark_spliting_op
+from atom.quant_spec import should_skip_online_quant
+from atom.utils import envs, mark_spliting_op
 from atom.utils.decorators import support_torch_compile
 from atom.utils.forward_context import get_forward_context
 
@@ -139,39 +146,37 @@ def _extract_layer_idx(prefix: str) -> int:
     return 0
 
 
-def _fused_qk_rmsnorm_fake(
-    q: torch.Tensor,
-    q_weight: torch.Tensor,
-    q_eps: float,
-    k: torch.Tensor,
-    k_weight: torch.Tensor,
-    k_eps: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return q.new_empty(q.shape), k.new_empty(k.shape)
+# RMSNorm+quant fusion is scheme-agnostic: the aiter fused RMSNorm kernels
+# (RMSNorm._aiter_rms_quant and deepseek's _fuse_rmsnorm_quant) emit any of these
+# dynamic activation quant layouts, so a preceding norm can fold the quant for a
+# Linear that runs one of them.
+_RMS_FUSABLE_QUANT_TYPES = (
+    QuantType.per_1x32,
+    QuantType.per_1x128,
+    QuantType.per_Token,
+)
 
 
-@torch_compile_guard(gen_fake=_fused_qk_rmsnorm_fake, mutates_args=[])
-def _fused_qk_rmsnorm(
-    q: torch.Tensor,
-    q_weight: torch.Tensor,
-    q_eps: float,
-    k: torch.Tensor,
-    k_weight: torch.Tensor,
-    k_eps: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    q_out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
-    k_out = torch.empty(k.shape, dtype=k.dtype, device=k.device)
-    fused_qk_rmsnorm(
-        q_out_quantized=q_out,
-        q=q,
-        q_weight=q_weight,
-        q_epsilon=q_eps,
-        k_out=k_out,
-        k=k,
-        k_weight=k_weight,
-        k_epsilon=k_eps,
-    )
-    return q_out, k_out
+def _effective_layer_quant(
+    quant_config: QuantizationConfig | None, prefix: str
+) -> tuple[QuantType, torch.dtype | None]:
+    """Resolve the ``(quant_type, quant_dtype)`` a Linear runs with at runtime.
+
+    Same resolution the Linear itself performs (mirrors
+    ``LinearBase.online_quantize_weight`` and deepseek_v2's MLA setup): the static
+    checkpoint scheme, overridden by the online-quant target when that override
+    actually applies (``should_skip_online_quant``). A preceding RMSNorm uses this
+    to decide whether -- and in which scheme (fp8 / fp4x2, per-token / block) -- to
+    fuse its activation quant, rather than hard-coding one layout.
+    """
+    if quant_config is None:
+        return QuantType.No, None
+    cfg = quant_config.get_layer_quant_config(prefix)
+    if quant_config.online_quant:
+        online_cfg = quant_config.get_layer_quant_config(prefix, use_online_quant=True)
+        if not should_skip_online_quant(cfg.quant_type, cfg.quant_dtype, online_cfg):
+            cfg = online_cfg
+    return cfg.quant_type, cfg.quant_dtype
 
 
 class _NoPositionalRotaryEmbedding(RotaryEmbedding):
@@ -209,15 +214,33 @@ class SituAndMul(nn.Module):
 
 
 class KimiRMSNormGated(nn.Module):
-    def __init__(self, hidden_size: int, eps: float):
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float,
+        quant_type: QuantType | None = None,
+        quant_dtype: torch.dtype | None = None,
+    ):
         super().__init__()
         self.weight = atom_parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
+        # When ``quant_type`` names a fusable per-token scheme, the per-head
+        # sigmoid-gated norm also emits (quantized, scale) so the consuming
+        # o_proj skips its standalone quant; otherwise it returns a bf16 tensor.
+        self.quant_type = quant_type
+        self.quant_dtype = quant_dtype
 
-    def forward(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, gate: torch.Tensor):
         from atom.model_ops.kimi_k3 import rmsnorm_gated
 
-        return rmsnorm_gated(x, self.weight, gate, self.variance_epsilon)
+        return rmsnorm_gated(
+            x,
+            self.weight,
+            gate,
+            self.variance_epsilon,
+            quant_type=self.quant_type,
+            quant_dtype=self.quant_dtype,
+        )
 
 
 def _sharded_vector_loader(tp_rank: int, tp_size: int):
@@ -264,7 +287,12 @@ class KimiMLP(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(self.act_fn(self.gate_up_proj(x)))
+        # `x` arrives as a (fp8, scale) tuple when the preceding RMSNorm fused its
+        # activation quant (dense-MLP layers)
+        x_scale = None
+        if isinstance(x, tuple):
+            x, x_scale = x
+        return self.down_proj(self.act_fn(self.gate_up_proj(x, x_scale)))
 
 
 class KimiSparseMoeBlock(nn.Module):
@@ -273,10 +301,12 @@ class KimiSparseMoeBlock(nn.Module):
         config,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        alt_stream: torch.cuda.Stream | None = None,
     ):
         super().__init__()
         self.config = config
         self.prefix = prefix
+        self.alt_stream = alt_stream
         self.hidden_dim = config.hidden_size
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_token
@@ -364,17 +394,64 @@ class KimiSparseMoeBlock(nn.Module):
                 source_quant_dtype=_routed_source_quant_dtype(up_proj_prefix),
                 prefix=up_proj_prefix,
             )
+            up_proj_quant_type, up_proj_quant_dtype = _effective_layer_quant(
+                quant_config, up_proj_prefix
+            )
+            latent_moe_use_norm = getattr(config, "latent_moe_use_norm", False)
+            # AITER RMSNorm+quant emits the activation layout consumed directly by
+            # the routed up-projection. FP4 Triton paths choose an M-dependent
+            # shuffled/non-shuffled scale layout, so keep those on their existing
+            # standalone quant path until the fused kernel supports both layouts.
+            fp4_triton_active = up_proj_quant_type == QuantType.per_1x32 and (
+                use_triton_gemm() or use_fp4_non_shuffle_triton_gemm()
+            )
+            self.fuse_routed_norm_quant = latent_moe_use_norm and (
+                (
+                    up_proj_quant_type == QuantType.per_1x32
+                    and up_proj_quant_dtype == dtypes.fp4x2
+                    and not fp4_triton_active
+                )
+                or (
+                    up_proj_quant_type in (QuantType.per_1x128, QuantType.per_Token)
+                    and up_proj_quant_dtype == dtypes.fp8
+                )
+            )
             self.routed_expert_norm = (
-                RMSNorm(self.moe_hidden_size, eps=config.rms_norm_eps)
-                if getattr(config, "latent_moe_use_norm", False)
+                RMSNorm(
+                    self.moe_hidden_size,
+                    eps=config.rms_norm_eps,
+                    fused_quant=self.fuse_routed_norm_quant,
+                    quant_config=quant_config,
+                    prefix=up_proj_prefix,
+                )
+                if latent_moe_use_norm
                 else None
             )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self._forward_impl(hidden_states)
+        # Dual-stream gate: overlap the shared-expert GEMMs (on alt_stream) with
+        # the routed-expert path (on the main stream). Only meaningful when a
+        # shared branch exists and an alt_stream was threaded in. TBO already
+        # provides its own overlap, so the two are mutually exclusive.
+        self._use_dual_stream = False
+        if self.shared_experts is not None and self.alt_stream is not None:
+            tbo_active = get_current_atom_config().enable_tbo
+            if envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0 and not tbo_active:
+                self._use_dual_stream = True
+        if self._use_dual_stream:
+            # Register self so `maybe_dual_stream_forward` can look this module up
+            # by prefix from static_forward_context (the op is Dynamo-opaque).
+            cc = get_current_atom_config().compilation_config
+            cc.static_forward_context[self.prefix] = self
 
-    def _forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        identity = hidden_states
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self._use_dual_stream:
+            return torch.ops.aiter.maybe_dual_stream_forward(hidden_states, self.prefix)
+        return self.single_stream_moe_forward(hidden_states)
+
+    def routed_expert_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Routed-expert path only. For the latent MoE this includes the routed
+        all-reduce (required before the nonlinear routed_expert_norm); the shared
+        branch is handled by the caller."""
         router_logits = self.gate(hidden_states)
         routed_input = (
             self.routed_expert_down_proj(hidden_states)
@@ -392,7 +469,19 @@ class KimiSparseMoeBlock(nn.Module):
                 routed_output = tensor_model_parallel_all_reduce(routed_output)
             if self.routed_expert_norm is not None:
                 routed_output = self.routed_expert_norm(routed_output)
-            routed_output = self.routed_expert_up_proj(routed_output)
+            if isinstance(routed_output, tuple):
+                routed_output, routed_output_scale = routed_output
+                routed_output = self.routed_expert_up_proj(
+                    routed_output, x_scale=routed_output_scale
+                )
+            else:
+                routed_output = self.routed_expert_up_proj(routed_output)
+        return routed_output
+
+    def single_stream_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        identity = hidden_states
+        routed_output = self.routed_expert_forward(hidden_states)
+        if self.use_latent_moe:
             if self.shared_experts is not None:
                 # Shared branch is TP-partial (down_proj is row-parallel); reduce
                 # it separately and add to the already-full routed output.
@@ -406,6 +495,55 @@ class KimiSparseMoeBlock(nn.Module):
         # over their sum is correct.
         if self.shared_experts is not None:
             routed_output = routed_output + self.shared_experts(identity)
+        if self.tp_size > 1:
+            routed_output = tensor_model_parallel_all_reduce(routed_output)
+        return routed_output
+
+    def dual_stream_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Queue routed pre-AR work first on the current stream, then run the
+        # shared-expert path on alt_stream. The latent path keeps both all-reduces
+        # on their respective streams while preserving shared AR -> routed AR
+        # order on the single TP communicator.
+        current = torch.cuda.current_stream()
+        alt = self.alt_stream
+        alt.wait_stream(current)
+
+        if self.use_latent_moe:
+            router_logits = self.gate(hidden_states)
+            routed_input = self.routed_expert_down_proj(hidden_states)
+            routed_output = self.experts(routed_input, router_logits)
+        else:
+            routed_output = self.routed_expert_forward(hidden_states)
+
+        with torch.cuda.stream(alt):
+            shared_output = self.shared_experts(hidden_states)
+            if self.use_latent_moe and self.tp_size > 1:
+                shared_output = tensor_model_parallel_all_reduce(shared_output)
+
+        if self.use_latent_moe:
+            if self.tp_size > 1:
+                current.wait_stream(alt)
+                routed_output = tensor_model_parallel_all_reduce(routed_output)
+
+            if self.routed_expert_norm is not None:
+                routed_output = self.routed_expert_norm(routed_output)
+            if isinstance(routed_output, tuple):
+                routed_output, routed_output_scale = routed_output
+                routed_output = self.routed_expert_up_proj(
+                    routed_output,
+                    x_scale=routed_output_scale,
+                )
+            else:
+                routed_output = self.routed_expert_up_proj(routed_output)
+
+            if self.tp_size == 1:
+                current.wait_stream(alt)
+            shared_output.record_stream(current)
+            return routed_output + shared_output
+
+        # Non-latent: shared has no AR yet; single deferred AR over the sum.
+        current.wait_stream(alt)
+        routed_output = routed_output + shared_output
         if self.tp_size > 1:
             routed_output = tensor_model_parallel_all_reduce(routed_output)
         return routed_output
@@ -473,12 +611,15 @@ class KimiFullAttention(nn.Module):
 
         rope_parameters = getattr(config, "rope_parameters", None) or {}
         rope_theta = rope_parameters.get("rope_theta") or 10000.0
+        # max_position_embeddings field only exists in the text config
+        _text_max_pos = getattr(config, "max_position_embeddings", None)
+        rope_max_position = int(
+            _text_max_pos or getattr(atom_config, "max_model_len", None) or 16384
+        )
         self.rotary_emb = _NoPositionalRotaryEmbedding(
             head_size=self.qk_rope_head_dim,
             rotary_dim=self.qk_rope_head_dim,
-            max_position_embeddings=int(
-                getattr(atom_config, "max_model_len", None) or 16384
-            ),
+            max_position_embeddings=rope_max_position,
             base=rope_theta,
         )
         mla_modules = MLAModules(
@@ -509,31 +650,86 @@ class KimiFullAttention(nn.Module):
             prefix=prefix,
         )
 
+        qknorm_type, qknorm_dtype = _effective_layer_quant(
+            quant_config, f"{prefix}.q_b_proj"
+        )
+        self.fuse_qknorm_quant = qknorm_dtype in (dtypes.fp8, dtypes.fp4x2)
+        self.qknorm_dtype = qknorm_dtype if self.fuse_qknorm_quant else torch.bfloat16
+        self.qknorm_quant_type_value = (
+            qknorm_type.value if self.fuse_qknorm_quant else QuantType.No.value
+        )
+        # input_layernorm fuses its activation quant only when BOTH consumers of
+        # the normed hidden state -- fused_qkv_a_proj and g_proj -- run with the
+        # same fusable RMSNorm quant scheme (else a mismatched consumer mis-GEMMs).
+        a_scheme = _effective_layer_quant(quant_config, f"{prefix}.fused_qkv_a_proj")
+        g_scheme = _effective_layer_quant(quant_config, f"{prefix}.g_proj")
+        self.fuse_input_norm_quant = (
+            a_scheme[0] in _RMS_FUSABLE_QUANT_TYPES and a_scheme == g_scheme
+        )
+        self.input_quant_prefix = f"{prefix}.fused_qkv_a_proj"
+
     def forward(
         self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
-        q, kv, k_rope = torch.split(
-            self.fused_qkv_a_proj(hidden_states),
+        # deepseek_v2 pattern: one _fuse_rmsnorm_quant kernel does q_a norm +
+        # kv_a norm (+ q-activation quant), then q's scale is forwarded into the
+        # MLA module (q_proj consumes it).
+        from atom.models.deepseek_v2 import _fuse_rmsnorm_quant
+
+        # hidden_states is a (fp8, scale) tuple when input_layernorm fused the
+        # quant; both fused_qkv_a_proj and g_proj consume it directly.
+        hidden_states_scale = None
+        if isinstance(hidden_states, tuple):
+            hidden_states, hidden_states_scale = hidden_states
+
+        q_c, kv_c, k_rope = torch.split(
+            self.fused_qkv_a_proj(hidden_states, hidden_states_scale),
             [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim],
             dim=-1,
         )
-        q, kv = _fused_qk_rmsnorm(
-            q,
+        q_shuffle = False
+        q_scale_shuffle_padding = False
+        if self.qknorm_dtype == dtypes.fp4x2:
+            from atom.model_ops.linear import use_triton_gemm
+            from atom.models.deepseek_v2 import _mxfp4_activation_quant_layout
+
+            if not use_triton_gemm():
+                q_shuffle, q_scale_shuffle_padding = _mxfp4_activation_quant_layout(
+                    q_c.shape[0]
+                )
+        (q, q_scale), _, kv, _ = _fuse_rmsnorm_quant(
+            q_c,
             self.q_a_layernorm.weight,
             self.q_a_layernorm.eps,
-            kv,
+            kv_c,
             self.kv_a_layernorm.weight,
             self.kv_a_layernorm.eps,
+            None,
+            dtype_quant=self.qknorm_dtype,
+            shuffle=q_shuffle,
+            scale_shuffle_padding=q_scale_shuffle_padding,
+            group_size=128,
+            quant_type=self.qknorm_quant_type_value,
+            output_unquantized_inp1=False,
+            transpose_scale=True,
         )
-        attn_out = self.attn(q, kv, k_rope, positions)
-        attn_out = attn_out * torch.sigmoid(self.g_proj(hidden_states))
+        attn_out = self.attn(q, kv, k_rope, positions, q_scale=q_scale)
+        attn_out = attn_out * torch.sigmoid(
+            self.g_proj(hidden_states, hidden_states_scale)
+        )
         return self.o_proj(attn_out)
 
 
 def _kda_attention_with_output_fake(
-    hidden_states: torch.Tensor, layer_name: str
+    hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor | None,
+    layer_name: str,
 ) -> torch.Tensor:
-    return torch.empty_like(hidden_states)
+    # The mixer output (o_proj) is always bf16 even when the input activation is
+    # fp8 (fused input_layernorm+quant), so pin the dtype rather than empty_like.
+    return torch.empty(
+        hidden_states.shape, dtype=torch.bfloat16, device=hidden_states.device
+    )
 
 
 @mark_spliting_op(
@@ -542,7 +738,9 @@ def _kda_attention_with_output_fake(
     mutates_args=[],
 )
 def kda_attention_with_output(
-    hidden_states: torch.Tensor, layer_name: str
+    hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor | None,
+    layer_name: str,
 ) -> torch.Tensor:
     """Opaque splitting-op boundary for the KDA mixer.
 
@@ -556,7 +754,7 @@ def kda_attention_with_output(
     self = get_current_atom_config().compilation_config.static_forward_context[
         layer_name
     ]
-    return self._forward_impl(hidden_states)
+    return self._forward_impl(hidden_states, hidden_states_scale)
 
 
 class KimiKDAAttention(nn.Module):
@@ -671,7 +869,13 @@ class KimiKDAAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.f_b_proj",
         )
-        self.o_norm = KimiRMSNormGated(self.head_dim, eps=config.rms_norm_eps)
+        o_type, o_dtype = _effective_layer_quant(quant_config, f"{prefix}.o_proj")
+        self.o_norm = KimiRMSNormGated(
+            self.head_dim,
+            eps=config.rms_norm_eps,
+            quant_type=o_type,
+            quant_dtype=o_dtype,
+        )
         self.o_proj = RowParallelLinear(
             self.proj_size,
             self.hidden_size,
@@ -679,6 +883,14 @@ class KimiKDAAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
+
+        # The decoder's input_layernorm can fuse its activation quant into the
+        # single fused in_proj GEMM (q|k|v|g|b|f_a) that consumes the normed hidden
+        # state; the (fp8, scale) rides the splitting custom op into _forward_impl.
+        # Enabled for any fusable RMSNorm quant scheme (fp8 / fp4x2).
+        in_proj_type, _ = _effective_layer_quant(quant_config, f"{prefix}.in_proj")
+        self.fuse_input_norm_quant = in_proj_type in _RMS_FUSABLE_QUANT_TYPES
+        self.input_quant_prefix = f"{prefix}.in_proj"
 
     def process_weights_after_loading(self) -> None:
         """Fuse all hidden-input projections into the single in-proj (one GEMM).
@@ -829,15 +1041,30 @@ class KimiKDAAttention(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # hidden_states is a (fp8, scale) tuple when input_layernorm fused the
+        # per-token quant; carry the scale through the opaque splitting custom op
+        # so in_proj consumes it in _forward_impl.
+        hidden_states_scale = None
+        if isinstance(hidden_states, tuple):
+            hidden_states, hidden_states_scale = hidden_states
         # Route through the opaque custom op so torch.compile splits the graph
         # here instead of tracing the stateful recurrence in _forward_impl.
-        return torch.ops.aiter.kda_attention_with_output(hidden_states, self.layer_name)
+        return torch.ops.aiter.kda_attention_with_output(
+            hidden_states, hidden_states_scale, self.layer_name
+        )
 
-    def _forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def _forward_impl(
+        self,
+        hidden_states: torch.Tensor,
+        hidden_states_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         fwd_ctx = get_forward_context()
         gdn_metadata = getattr(fwd_ctx.attn_metadata, "gdn_metadata", None)
         if gdn_metadata is None:
-            return hidden_states.new_zeros(hidden_states.shape)
+            # Output is bf16 even when the input activation is fp8 (fused quant).
+            return torch.zeros(
+                hidden_states.shape, dtype=torch.bfloat16, device=hidden_states.device
+            )
 
         cache = fwd_ctx.kv_cache_data[f"layer_{self.layer_num}"]
         conv_state = cache.k_cache
@@ -847,6 +1074,8 @@ class KimiKDAAttention(nn.Module):
 
         num_actual_tokens = gdn_metadata.num_actual_tokens
         hidden_states = hidden_states[:num_actual_tokens]
+        if hidden_states_scale is not None:
+            hidden_states_scale = hidden_states_scale[:num_actual_tokens]
         # Single fused in-proj GEMM producing [q | k | v | g]; slice out each
         # part. `out_gate` is the KDA output gate consumed at o_norm below
         # (computed here so it rides the same GEMM instead of a separate one
@@ -857,7 +1086,7 @@ class KimiKDAAttention(nn.Module):
         lp = self.local_proj_size
         nlh = self.num_local_heads
         hd = self.head_dim
-        fused_in = self.in_proj(hidden_states)
+        fused_in = self.in_proj(hidden_states, x_scale=hidden_states_scale)
         # No .contiguous() needed: mixed_qkv is a column slice (feature stride 1,
         # row stride N_fused). Both causal-conv consumers read the token stride
         # from the tensor itself — causal_conv1d_fn uses x.stride(1) after
@@ -873,7 +1102,8 @@ class KimiKDAAttention(nn.Module):
         f_a = fused_in[..., 4 * lp + nlh : 4 * lp + nlh + hd].contiguous()
         gate = self.f_b_proj(f_a)
         gate = rearrange(gate, "t (h d) -> 1 t h d", d=self.head_dim)
-        out = hidden_states.new_empty(
+        # Allocate from fused_in (bf16), not hidden_states, which may be fp8.
+        out = fused_in.new_empty(
             (num_actual_tokens, self.num_local_heads, self.head_dim)
         )
 
@@ -1052,8 +1282,15 @@ class KimiKDAAttention(nn.Module):
         else:
             out.zero_()
 
-        out = self.o_norm(out, rearrange(out_gate, "t (h d) -> t h d", d=self.head_dim))
-        return self.o_proj(rearrange(out, "t h d -> t (h d)"))
+        normed = self.o_norm(
+            out, rearrange(out_gate, "t (h d) -> t h d", d=self.head_dim)
+        )
+        # A fused per-token quant makes o_norm return (quantized, scale); feed it
+        # straight to o_proj's x_scale path. Otherwise it is a bf16 tensor.
+        if isinstance(normed, tuple):
+            o_fp8, o_scale = normed
+            return self.o_proj(o_fp8, x_scale=o_scale)
+        return self.o_proj(rearrange(normed, "t h d -> t (h d)"))
 
 
 class KimiDecoderLayer(nn.Module):
@@ -1062,6 +1299,7 @@ class KimiDecoderLayer(nn.Module):
         atom_config: Config,
         prefix: str,
         layer_num: int = 0,
+        alt_stream: torch.cuda.Stream | None = None,
     ):
         super().__init__()
         config = _text_config(atom_config.hf_config)
@@ -1089,14 +1327,42 @@ class KimiDecoderLayer(nn.Module):
                 config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.block_sparse_moe",
+                alt_stream=alt_stream,
             )
         else:
             self.mlp = KimiMLP(
                 config, quant_config=quant_config, prefix=f"{prefix}.mlp"
             )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # Fuse the activation quant into input_layernorm when the attention input
+        # projection(s) run with a fusable quant scheme (self_attn decides and
+        # exposes the flag + representative prefix). The normed output then flows
+        # to the attention as a (fp8, scale) tuple instead of a bf16 tensor + a
+        # standalone quant op.
+        self.input_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_quant=self.self_attn.fuse_input_norm_quant,
+            quant_config=(
+                quant_config if self.self_attn.fuse_input_norm_quant else None
+            ),
+            prefix=self.self_attn.input_quant_prefix,
+        )
+        # Fuse post_attention_layernorm's quant into the dense-MLP gate_up_proj.
+        # MoE layers are skipped: their router gate is unquantized and the routed
+        # experts are excluded, so the normed output has mixed-precision consumers.
+        if hasattr(self, "mlp"):
+            ffn_type, _ = _effective_layer_quant(
+                quant_config, f"{prefix}.mlp.gate_up_proj"
+            )
+            self.fuse_ffn_norm_quant = ffn_type in _RMS_FUSABLE_QUANT_TYPES
+        else:
+            self.fuse_ffn_norm_quant = False
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_quant=self.fuse_ffn_norm_quant,
+            quant_config=quant_config if self.fuse_ffn_norm_quant else None,
+            prefix=f"{prefix}.mlp.gate_up_proj",
         )
 
         self.use_attn_residuals = (
@@ -1252,12 +1518,21 @@ class KimiLinearModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
+        # Shared second stream for dual-stream MoE (shared-expert GEMMs overlap the
+        # routed path). Created once and threaded into every decoder layer; only
+        # used when the model has shared experts.
+        self.alt_stream = None
+        if getattr(config, "num_shared_experts", 0):
+            self.alt_stream = torch.cuda.Stream()
+        _alt_stream = self.alt_stream
+
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix, layer_num=None: KimiDecoderLayer(
                 atom_config,
                 prefix=prefix,
                 layer_num=layer_num or 0,
+                alt_stream=_alt_stream,
             ),
             prefix=f"{prefix}.layers",
             layer_num_offset=0,

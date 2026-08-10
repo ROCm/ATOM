@@ -3,8 +3,8 @@
 
 from __future__ import annotations
 
-import threading
 import sys
+import threading
 import types
 from types import SimpleNamespace
 
@@ -16,15 +16,19 @@ except ModuleNotFoundError:
     sys.modules["torch"] = types.ModuleType("torch")
 
 from atom.kv_transfer.disaggregation import KVConnectorOutput, KVOutputAggregator
-from atom.kv_transfer.offload.connector import (
-    LMCacheOffloadConnector,
-    LMCacheOffloadConnectorScheduler,
-)
 from atom.kv_transfer.offload.atom_kv_byte_codec import ATOMKVByteCodec
 from atom.kv_transfer.offload.atom_lmcache_gpu_connector import (
     ATOMLMCacheGPUConnector,
 )
-from atom.kv_transfer.offload.metadata import ATOMRawBytesLMCacheMetadata
+from atom.kv_transfer.offload.connector import (
+    LMCacheOffloadConnector,
+    LMCacheOffloadConnectorScheduler,
+)
+from atom.kv_transfer.offload.metadata import (
+    ATOMRawBytesLMCacheMetadata,
+    LMCacheOffloadMetadata,
+    LMCacheReqMeta,
+)
 from atom.model_engine.scheduler import Scheduler
 
 
@@ -567,6 +571,23 @@ def test_full_prompt_hit_is_clamped_before_load_spec():
     assert sched._load_specs[str(seq.id)].lmcache_cached_tokens == 7
 
 
+def test_lookup_miss_is_forwarded_for_worker_unpin():
+    sched = _scheduler()
+    seq = SimpleNamespace(
+        id=124,
+        num_prompt_tokens=8,
+        token_ids=list(range(8)),
+        num_cached_tokens=0,
+    )
+
+    need, should_park = sched.get_num_new_matched_tokens(seq)
+    meta = sched.build_connector_meta()
+
+    assert need == 0
+    assert should_park is False
+    assert meta.lookup_requests_in_step == ["124"]
+
+
 def test_load_is_skipped_if_hbm_satisfies_after_allocation():
     sched = _scheduler()
     lookup = _LookupClient(hit=8)
@@ -593,6 +614,7 @@ def test_load_is_skipped_if_hbm_satisfies_after_allocation():
 
     assert meta.requests == []
     assert [req for req in meta.requests if req.load_spec is not None] == []
+    assert meta.lookup_requests_in_step == ["321"]
     assert seq.offload_loaded_tokens == 8
     assert sched._save_tracker[str(seq.id)][1] == 8
     assert lookup.cleared == ["321"]
@@ -620,6 +642,7 @@ def test_lookup_time_hbm_satisfies_does_not_resave_hit_prefix():
     meta1 = sched.build_connector_meta()
 
     assert meta1.requests == []
+    assert meta1.lookup_requests_in_step == ["322"]
     assert sched._save_tracker[str(seq.id)][1] == 8
     assert lookup.cleared == ["322"]
 
@@ -657,6 +680,10 @@ def test_unaligned_hbm_handoff_prefills_boundary_then_emits_load():
     assert seq.offload_loaded_tokens == 6
     assert sched.adjust_prefill_chunk_after_alloc(seq, 10) == 2
 
+    handoff_meta = sched.build_connector_meta()
+    assert handoff_meta.lookup_requests_in_step == []
+    assert sched._lookup_in_step == ["657"]
+
     seq.num_cached_tokens = 8
     assert sched.should_park_partial_prefill_for_load(seq) is True
     meta = sched.build_connector_meta()
@@ -668,6 +695,7 @@ def test_unaligned_hbm_handoff_prefills_boundary_then_emits_load():
     assert req.token_ids == list(range(16))
     assert req.load_spec.hbm_cached_tokens == 8
     assert req.load_spec.lmcache_cached_tokens == 16
+    assert meta.lookup_requests_in_step == ["657"]
     assert seq.offload_loaded_tokens == 16
     assert str(seq.id) not in sched._handoff_loads
     assert lookup.cleared == []
@@ -699,6 +727,7 @@ def test_unaligned_handoff_skips_if_boundary_remainder_is_too_small():
     assert str(seq.id) not in sched._reqs_need_recv
     assert seq.offload_loaded_tokens == 6
     assert lookup.cleared == ["658"]
+    assert sched.build_connector_meta().lookup_requests_in_step == ["658"]
 
 
 def test_load_is_skipped_if_aligned_hit_is_below_threshold():
@@ -724,6 +753,7 @@ def test_load_is_skipped_if_aligned_hit_is_below_threshold():
     meta = sched.build_connector_meta()
 
     assert [req for req in meta.requests if req.load_spec is not None] == []
+    assert meta.lookup_requests_in_step == ["655"]
     assert seq.offload_loaded_tokens == 8
     assert lookup.cleared == ["655"]
 
@@ -758,6 +788,7 @@ def test_aligned_large_hit_parks_and_emits_load_metadata():
     assert req.block_ids == [1, 2, 3, 4]
     assert req.load_spec.hbm_cached_tokens == 4
     assert req.load_spec.lmcache_cached_tokens == 12
+    assert meta.lookup_requests_in_step == ["656"]
     assert seq.offload_loaded_tokens == 12
     assert lookup.cleared == []
 
@@ -834,7 +865,9 @@ def test_worker_completes_noop_load_when_hbm_satisfies():
     conn._failed_load = set()
     conn._done_save = set()
     conn._engine = SimpleNamespace(unpinned=[])
-    conn._engine.lookup_unpin = lambda ids: conn._engine.unpinned.extend(ids)
+    conn._engine.lookup_unpin = lambda lookup_id: conn._engine.unpinned.append(
+        lookup_id
+    )
 
     req = SimpleNamespace(
         req_id=321,
@@ -850,6 +883,46 @@ def test_worker_completes_noop_load_when_hbm_satisfies():
     assert conn._engine.unpinned == ["321"]
 
 
+def test_worker_unpins_only_lookups_without_an_emitted_load():
+    class _Executor:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def submit(self, *args) -> None:
+            self.calls.append(args)
+
+    class _Engine:
+        def __init__(self) -> None:
+            self.unpinned = []
+
+        def lookup_unpin(self, lookup_id) -> None:
+            self.unpinned.append(lookup_id)
+
+    conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
+    conn._do_load = True
+    conn._do_save = False
+    conn._engine = _Engine()
+    conn._load_executor = _Executor()
+    metadata = LMCacheOffloadMetadata()
+    metadata.lookup_requests_in_step = ["skipped", "loading"]
+    metadata.add_request(
+        LMCacheReqMeta(
+            req_id="loading",
+            token_ids=list(range(8)),
+            block_ids=[1, 2],
+            load_spec=SimpleNamespace(
+                hbm_cached_tokens=4,
+                lmcache_cached_tokens=8,
+            ),
+        )
+    )
+
+    conn.start_load_kv(metadata)
+
+    assert conn._engine.unpinned == ["skipped"]
+    assert len(conn._load_executor.calls) == 1
+
+
 def test_worker_reports_unaligned_hbm_load_as_failed_without_exception():
     conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
     conn._lock = threading.Lock()
@@ -858,7 +931,9 @@ def test_worker_reports_unaligned_hbm_load_as_failed_without_exception():
     conn._done_save = set()
     conn.chunk_size = 4
     conn._engine = SimpleNamespace(unpinned=[])
-    conn._engine.lookup_unpin = lambda ids: conn._engine.unpinned.extend(ids)
+    conn._engine.lookup_unpin = lambda lookup_id: conn._engine.unpinned.append(
+        lookup_id
+    )
 
     req = SimpleNamespace(
         req_id=654,
@@ -912,6 +987,42 @@ def test_worker_save_uses_lmcache_engine_store():
     assert kwargs["req_id"] == "987"
 
 
+def test_worker_save_waits_for_forward_event_before_store():
+    import torch
+
+    if not hasattr(torch, "tensor"):
+        pytest.skip("real torch is unavailable")
+
+    order = []
+
+    class _Event:
+        def synchronize(self) -> None:
+            order.append("forward-ready")
+
+    class _Engine:
+        def store(self, *args, **kwargs) -> None:
+            order.append("store")
+
+    conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
+    conn._lock = threading.Lock()
+    conn._done_save = set()
+    conn.chunk_size = 4
+    conn._engine = _Engine()
+
+    req = SimpleNamespace(
+        req_id=988,
+        token_ids=list(range(8)),
+        block_ids=[3, 4],
+        is_last_prefill=True,
+        save_spec=SimpleNamespace(skip_leading_tokens=0),
+    )
+
+    conn._do_save_req(req, _Event())
+
+    assert order == ["forward-ready", "store"]
+    assert conn._done_save == {988}
+
+
 def test_worker_load_uses_lmcache_engine_retrieve_and_marks_done():
     import torch
 
@@ -927,8 +1038,8 @@ def test_worker_load_uses_lmcache_engine_retrieve_and_marks_done():
             self.calls.append((tokens.tolist(), mask.tolist(), kwargs))
             return torch.tensor([False] * 4 + [True] * 8, dtype=torch.bool)
 
-        def lookup_unpin(self, ids) -> None:
-            self.unpinned.extend(ids)
+        def lookup_unpin(self, lookup_id) -> None:
+            self.unpinned.append(lookup_id)
 
     conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
     conn._lock = threading.Lock()
@@ -970,8 +1081,8 @@ def test_worker_load_partial_retrieve_marks_failed():
         def retrieve(self, tokens, mask=None, **kwargs):
             return torch.tensor([False] * 4 + [True] * 4 + [False] * 4)
 
-        def lookup_unpin(self, ids) -> None:
-            self.unpinned.extend(ids)
+        def lookup_unpin(self, lookup_id) -> None:
+            self.unpinned.append(lookup_id)
 
     conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
     conn._lock = threading.Lock()
@@ -1218,8 +1329,21 @@ def test_codec_mla_token_major_block_accounting():
 
     # Block count comes from the explicit arg, not tensor.shape[0] (= tokens).
     assert codec.num_blocks == num_blocks
-    # One physical block spans block_size tokens of `latent` bytes each.
+    # One scheduler block spans block_size tokens of `latent` bytes each.
     assert codec.bytes_per_block == block_size * latent
+
+    # Regression: passing the page-size-1 physical row count instead of the
+    # scheduler block count shrinks each transfer block by block_size. The
+    # connector compares this against its existing transfer-region metadata.
+    wrong_codec = ATOMKVByteCodec(kv_caches, num_blocks=num_blocks * block_size)
+    conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
+    conn._codec = wrong_codec
+    with pytest.raises(ValueError, match="KV block geometry mismatch"):
+        conn._validate_block_geometry(
+            SimpleNamespace(
+                block_regions=[SimpleNamespace(unit_bytes=block_size * latent)]
+            )
+        )
 
     # A segment whose element count is not divisible by num_blocks is rejected.
     with pytest.raises(ValueError):
@@ -1270,3 +1394,147 @@ def test_codec_mla_round_trip_byte_identical():
     kv_caches["l0"].k_cache.zero_()
     codec.chunk_major_device_buffer_to_gpu(device_buf, block_id_groups)
     assert torch.equal(kv_caches["l0"].k_cache, original)
+
+
+def test_codec_dsa_includes_index_cache_segment():
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    num_blocks, block_size, latent, index_dim = 4, 2, 3, 5
+    k_cache = torch.arange(num_blocks * block_size * latent, dtype=torch.uint8).reshape(
+        num_blocks * block_size, 1, latent
+    )
+    # Block-major indexer cache (num_blocks, block_size, index_dim).
+    index_cache = torch.arange(
+        num_blocks * block_size * index_dim, dtype=torch.uint8
+    ).reshape(num_blocks, block_size, index_dim)
+    kv_caches = {
+        "l0": SimpleNamespace(
+            k_cache=k_cache.clone(),
+            v_cache=None,
+            k_scale=None,
+            v_scale=None,
+            index_cache=index_cache.clone(),
+        )
+    }
+    codec = ATOMKVByteCodec(kv_caches, num_blocks=num_blocks)
+    mla_only = block_size * latent
+    index_only = block_size * index_dim
+    assert codec.bytes_per_block == mla_only + index_only
+
+    _install_byte_addressing_fused(codec)
+    # Stage every block (two chunks) so the round trip below can assert the full
+    # tensor is restored.
+    block_id_groups = [[0, 1], [2, 3]]
+    device_buf = torch.empty(
+        num_blocks * codec.bytes_per_block, dtype=torch.uint8, device=codec.device
+    )
+    codec.gpu_to_chunk_major_device_buffer(device_buf, block_id_groups)
+
+    k_flat = k_cache.view(torch.uint8).reshape(num_blocks, -1)
+    idx_flat = index_cache.reshape(num_blocks, -1)
+    # Staging is segment-major within a chunk (see ATOMKVByteCodec docstring and
+    # the Triton kernel's ``segment_prefix_bytes[seg] * nblocks`` base): within
+    # each chunk it is all K blocks, then all index blocks.
+    expected = torch.cat(
+        [
+            k_flat[0],
+            k_flat[1],
+            idx_flat[0],
+            idx_flat[1],
+            k_flat[2],
+            k_flat[3],
+            idx_flat[2],
+            idx_flat[3],
+        ],
+    )
+    assert torch.equal(device_buf.cpu(), expected.cpu())
+
+    kv_caches["l0"].k_cache.zero_()
+    kv_caches["l0"].index_cache.zero_()
+    codec.chunk_major_device_buffer_to_gpu(device_buf, block_id_groups)
+    assert torch.equal(kv_caches["l0"].k_cache, k_cache)
+    assert torch.equal(kv_caches["l0"].index_cache, index_cache)
+
+
+def test_codec_dsa_fp8_multilayer_including_mtp_round_trip():
+    """GLM-5.2 realistic geometry: an ``fp8`` indexer cache
+    (``aligned_index_dim=144``) alongside the token-major MLA latent (576),
+    across main *and* MTP layers.
+
+    For GLM-5.2 the MTP draft is MLA, so it shares the target's KV pool and is
+    bound by the main attention builder exactly like a decoder layer (no
+    ``eagle3_draft_builder``); its ``index_cache`` therefore reaches the codec
+    as just another registered layer. This asserts the codec moves the fp8
+    index segment byte-exact for every layer. Bytes are compared through a
+    ``uint8`` view so fp8 NaN bit patterns (which are ``!=`` themselves) do not
+    make a byte-identical round trip look unequal.
+    """
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+    fp8 = getattr(torch, "float8_e4m3fn", None)
+    if fp8 is None:
+        pytest.skip("fp8 dtype unavailable")
+
+    num_blocks, block_size = 4, 2
+    latent, aligned_index_dim = 576, 144  # DeepSeek-V3.2 / GLM-5.2 real dims
+
+    def _make_layer(seed: int):
+        # MLA latent: token-major (num_blocks*block_size, 1, latent).
+        k = (
+            torch.arange(num_blocks * block_size * latent, dtype=torch.uint8) + seed
+        ).reshape(num_blocks * block_size, 1, latent)
+        # Indexer: block-major (num_blocks, block_size, aligned_index_dim), fp8.
+        idx = (
+            (
+                torch.arange(
+                    num_blocks * block_size * aligned_index_dim, dtype=torch.uint8
+                )
+                + seed * 7
+            )
+            .view(fp8)
+            .reshape(num_blocks, block_size, aligned_index_dim)
+        )
+        return k, idx
+
+    # layer_0/layer_1 are decoder layers; layer_2 stands in for the MTP layer,
+    # which shares the pool and is registered identically.
+    layers = {f"layer_{i}": _make_layer(i) for i in range(3)}
+    kv_caches = {
+        name: SimpleNamespace(
+            k_cache=k.clone(),
+            v_cache=None,
+            k_scale=None,
+            v_scale=None,
+            index_cache=idx.clone(),
+        )
+        for name, (k, idx) in layers.items()
+    }
+    codec = ATOMKVByteCodec(kv_caches, num_blocks=num_blocks)
+
+    per_block = block_size * latent + block_size * aligned_index_dim
+    assert codec.bytes_per_block == len(layers) * per_block
+
+    _install_byte_addressing_fused(codec)
+    block_id_groups = [[0, 1], [2, 3]]
+    device_buf = torch.empty(
+        num_blocks * codec.bytes_per_block, dtype=torch.uint8, device=codec.device
+    )
+    codec.gpu_to_chunk_major_device_buffer(device_buf, block_id_groups)
+
+    # Wipe every segment (via the uint8 view for fp8) and scatter back.
+    for cache in kv_caches.values():
+        cache.k_cache.zero_()
+        cache.index_cache.view(torch.uint8).zero_()
+    codec.chunk_major_device_buffer_to_gpu(device_buf, block_id_groups)
+
+    for name, (k, idx) in layers.items():
+        assert torch.equal(kv_caches[name].k_cache, k)
+        assert torch.equal(
+            kv_caches[name].index_cache.view(torch.uint8),
+            idx.view(torch.uint8),
+        )

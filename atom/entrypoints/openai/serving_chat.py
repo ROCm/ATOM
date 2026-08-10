@@ -7,25 +7,195 @@ import asyncio
 import json
 import logging
 import time
-from typing import Any, AsyncGenerator, Dict, List, Optional
+from collections.abc import AsyncGenerator
+from typing import Any
 
 from .protocol import (
     CHAT_COMPLETION_CHUNK_OBJECT,
     STREAM_DONE_MESSAGE,
+    TOOL_CHOICE_VALUES,
+    TOOL_NAME_RE,
+    ChatCompletionRequest,
     ChatCompletionResponse,
 )
-from .reasoning import ReasoningFilter, separate_reasoning
+from .reasoning import (
+    VALID_TEMPLATE_EFFORTS,
+    ReasoningFilter,
+    separate_reasoning,
+)
 from .tool_parser import ToolCallStreamParser, parse_tool_calls
 
 logger = logging.getLogger("atom")
 
 
+# ============================================================================
+# Request validation & thinking control
+# ============================================================================
+
+
+def normalize_chat_tools(tools: Any) -> Any:
+    """Accept Anthropic-style tools on the OpenAI-compatible endpoint.
+
+    Well-formed OpenAI tools and malformed values are left unchanged so the
+    existing validator remains authoritative. Only the unambiguous Anthropic
+    shape (name + input_schema, without type/function) is converted.
+    """
+    if not isinstance(tools, list):
+        return tools
+
+    normalized = []
+    for tool in tools:
+        if (
+            isinstance(tool, dict)
+            and "type" not in tool
+            and "function" not in tool
+            and isinstance(tool.get("name"), str)
+            and isinstance(tool.get("input_schema"), dict)
+        ):
+            normalized.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool["name"],
+                        "description": tool.get("description", ""),
+                        "parameters": tool["input_schema"],
+                    },
+                }
+            )
+        else:
+            normalized.append(tool)
+    return normalized
+
+
+def resolve_thinking(request: ChatCompletionRequest) -> tuple[bool, str | None]:
+    """Resolve (enabled, effort) from the request's thinking / reasoning_effort.
+
+    ``thinking`` (extra_body) takes precedence over ``reasoning_effort``.
+    Thinking is disabled when ``thinking.type == "disabled"`` or
+    ``reasoning_effort == "none"``. Effort is only returned when it is one of
+    the values the template understands.
+    """
+    thinking = request.thinking or {}
+    enabled = True
+    if isinstance(thinking, dict) and thinking.get("type") == "disabled":
+        enabled = False
+    if request.reasoning_effort == "none":
+        enabled = False
+
+    effort = None
+    if isinstance(thinking, dict) and thinking.get("effort") is not None:
+        effort = thinking.get("effort")
+    elif request.reasoning_effort is not None:
+        effort = request.reasoning_effort
+    if effort not in VALID_TEMPLATE_EFFORTS:
+        effort = None
+    return enabled, effort
+
+
+def _validate_one_tool(tool: Any, index: int) -> None:
+    if not isinstance(tool, dict):
+        # ValueError (not TypeError) so the handler maps it to HTTP 400.
+        raise ValueError(f"tools[{index}] must be an object")  # noqa: TRY004
+    if tool.get("type") != "function":
+        raise ValueError(f"tools[{index}].type must be 'function'")
+    fn = tool.get("function")
+    if not isinstance(fn, dict):
+        raise ValueError(f"tools[{index}].function must be an object")  # noqa: TRY004
+    name = fn.get("name")
+    if not isinstance(name, str) or not TOOL_NAME_RE.match(name):
+        raise ValueError(
+            f"tools[{index}].function.name must match {TOOL_NAME_RE.pattern}"
+        )
+
+
+def _validate_tool_list(tools: Any) -> None:
+    if tools is None:
+        return
+    if not isinstance(tools, list):
+        raise ValueError("tools must be an array")  # noqa: TRY004
+    seen: set[str] = set()
+    for i, tool in enumerate(tools):
+        _validate_one_tool(tool, i)
+        name = tool["function"]["name"]
+        if name in seen:
+            raise ValueError(f"duplicate tool name: {name}")
+        seen.add(name)
+
+
+def validate_chat_request(request: ChatCompletionRequest) -> None:
+    """Validate tool / tool_choice / response_format shape before dispatch.
+
+    Raises ``ValueError`` (surfaced as HTTP 400) on malformed input so the
+    engine is never handed a request the chat template cannot render.
+    """
+    _validate_tool_list(request.tools)
+
+    tool_choice = request.tool_choice
+    if tool_choice is not None:
+        if isinstance(tool_choice, str):
+            if tool_choice not in TOOL_CHOICE_VALUES:
+                raise ValueError(
+                    f"tool_choice string must be one of {sorted(TOOL_CHOICE_VALUES)}"
+                )
+        elif isinstance(tool_choice, dict):
+            if tool_choice.get("type") != "function":
+                raise ValueError("tool_choice object must have type 'function'")
+            fn = tool_choice.get("function")
+            if not isinstance(fn, dict) or not isinstance(fn.get("name"), str):
+                raise ValueError(  # noqa: TRY004
+                    "tool_choice.function.name must be a string"
+                )
+            # A named tool_choice must reference a declared tool.
+            names = {
+                t["function"]["name"]
+                for t in (request.tools or [])
+                if isinstance(t, dict) and isinstance(t.get("function"), dict)
+            }
+            if fn["name"] not in names:
+                raise ValueError(f"tool_choice names unknown tool: {fn['name']}")
+        else:
+            raise ValueError("tool_choice must be a string or an object")
+
+    rf = request.response_format
+    if rf is not None:
+        if not isinstance(rf, dict):
+            raise ValueError("response_format must be an object")
+        rf_type = rf.get("type")
+        if rf_type not in ("text", "json_object", "json_schema"):
+            raise ValueError(
+                "response_format.type must be 'text', 'json_object', or 'json_schema'"
+            )
+        if rf_type == "json_schema":
+            js = rf.get("json_schema")
+            if not isinstance(js, dict) or not isinstance(js.get("schema"), dict):
+                raise ValueError("response_format.json_schema.schema must be an object")
+
+
+def _normalize_finish_reason(finish_reason: str | None) -> str | None:
+    """Map engine finish reasons to the OpenAI-standard vocabulary.
+
+    The engine may report an EOS stop as ``"stop_<token_id>"`` (the raw id of
+    the stop token that fired, e.g. ``"stop_163586"``). OpenAI clients only
+    understand ``"stop"``/``"length"``/``"tool_calls"``, so anything that is
+    not a recognized value collapses to ``"stop"``.
+    """
+    if finish_reason is None:
+        return None
+    if finish_reason in ("stop", "length", "tool_calls"):
+        return finish_reason
+    if finish_reason in ("max_tokens", "max_new_tokens"):
+        return "length"
+    if finish_reason.startswith("stop"):
+        return "stop"
+    return "stop"
+
+
 def create_chat_chunk(
     request_id: str,
     model: str,
-    delta: Optional[Dict[str, Any]] = None,
-    finish_reason: Optional[str] = None,
-    usage: Optional[Dict] = None,
+    delta: dict[str, Any] | None = None,
+    finish_reason: str | None = None,
+    usage: dict | None = None,
     index: int = 0,
 ) -> str:
     """Create a chat completion chunk in SSE format.
@@ -60,6 +230,8 @@ async def stream_chat_response(
     num_prompt_tokens: int,
     cleanup_fn,
     tools=None,
+    tool_choice=None,
+    starts_thinking: bool = False,
 ) -> AsyncGenerator[str, None]:
     """Generate streaming chat completion response with reasoning and tool calls.
 
@@ -75,7 +247,7 @@ async def stream_chat_response(
     num_tokens_input = num_prompt_tokens
     num_tokens_output = 0
     num_cached_tokens = 0
-    reasoning_filter = ReasoningFilter()
+    reasoning_filter = ReasoningFilter(starts_thinking=starts_thinking)
     tool_parser = ToolCallStreamParser(tools=tools)
     has_tool_calls = False
 
@@ -122,14 +294,14 @@ async def stream_chat_response(
                             yield create_chat_chunk(
                                 request_id, model, delta={"content": data}
                             )
-                        elif event_type == "tool_call_start":
+                        elif event_type == "tool_call_start" and tool_choice != "none":
                             has_tool_calls = True
                             yield create_chat_chunk(
                                 request_id,
                                 model,
                                 delta={"tool_calls": [data]},
                             )
-                        elif event_type == "tool_call_args":
+                        elif event_type == "tool_call_args" and tool_choice != "none":
                             yield create_chat_chunk(
                                 request_id,
                                 model,
@@ -143,12 +315,12 @@ async def stream_chat_response(
                         yield create_chat_chunk(
                             request_id, model, delta={"content": data}
                         )
-                    elif event_type == "tool_call_start":
+                    elif event_type == "tool_call_start" and tool_choice != "none":
                         has_tool_calls = True
                         yield create_chat_chunk(
                             request_id, model, delta={"tool_calls": [data]}
                         )
-                    elif event_type == "tool_call_args":
+                    elif event_type == "tool_call_args" and tool_choice != "none":
                         yield create_chat_chunk(
                             request_id, model, delta={"tool_calls": [data]}
                         )
@@ -188,10 +360,11 @@ async def stream_chat_response(
 
 def _build_chat_choice(
     raw_text: str,
-    finish_reason: Optional[str],
+    finish_reason: str | None,
     index: int = 0,
     tools=None,
-) -> Dict[str, Any]:
+    tool_choice=None,
+) -> dict[str, Any]:
     """Build one entry of ``choices[...]`` from a raw output string.
 
     Factored out of :func:`build_chat_response` so multi-sample responses
@@ -201,13 +374,20 @@ def _build_chat_choice(
     reasoning_content, content_with_tools = separate_reasoning(raw_text)
     content, tool_calls = parse_tool_calls(content_with_tools, tools)
 
-    message: Dict[str, Any] = {"role": "assistant", "content": content}
+    # tool_choice="none" forbids tool calls: any the model emitted anyway are
+    # dropped so they never surface in the response.
+    if tool_choice == "none":
+        tool_calls = []
+
+    message: dict[str, Any] = {"role": "assistant", "content": content}
     if reasoning_content is not None:
         message["reasoning_content"] = reasoning_content
     if tool_calls:
         message["tool_calls"] = [tc.to_dict() for tc in tool_calls]
 
-    effective_finish_reason = "tool_calls" if tool_calls else finish_reason
+    effective_finish_reason = (
+        "tool_calls" if tool_calls else _normalize_finish_reason(finish_reason)
+    )
     return {
         "index": index,
         "message": message,
@@ -219,8 +399,9 @@ def build_chat_response(
     request_id: str,
     model: str,
     raw_text: str,
-    final_output: Dict[str, Any],
+    final_output: dict[str, Any],
     tools=None,
+    tool_choice=None,
 ) -> ChatCompletionResponse:
     """Build a non-streaming chat completion response (single choice)."""
     response = ChatCompletionResponse(
@@ -229,7 +410,11 @@ def build_chat_response(
         model=model,
         choices=[
             _build_chat_choice(
-                raw_text, final_output["finish_reason"], index=0, tools=tools
+                raw_text,
+                final_output["finish_reason"],
+                index=0,
+                tools=tools,
+                tool_choice=tool_choice,
             )
         ],
         usage={
@@ -257,8 +442,9 @@ def build_chat_response(
 def build_chat_response_multi(
     request_id: str,
     model: str,
-    final_outputs: List[Dict[str, Any]],
+    final_outputs: list[dict[str, Any]],
     tools=None,
+    tool_choice=None,
 ) -> ChatCompletionResponse:
     """Build a non-streaming response with one choice per fan-out sibling.
 
@@ -270,7 +456,13 @@ def build_chat_response_multi(
     """
     assert final_outputs, "build_chat_response_multi requires at least one output"
     choices = [
-        _build_chat_choice(out["text"], out["finish_reason"], index=i, tools=tools)
+        _build_chat_choice(
+            out["text"],
+            out["finish_reason"],
+            index=i,
+            tools=tools,
+            tool_choice=tool_choice,
+        )
         for i, out in enumerate(final_outputs)
     ]
     prompt_tokens = final_outputs[0]["num_tokens_input"]
@@ -305,7 +497,7 @@ async def stream_chat_response_fanout(
     request_id: str,
     model: str,
     shared_queue: asyncio.Queue,
-    seq_ids: List[int],
+    seq_ids: list[int],
     num_prompt_tokens: int,
     cleanup_fn,
     tools=None,

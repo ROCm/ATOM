@@ -9,10 +9,9 @@ import os
 import re
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
-from aiter import QuantType
 from torch.distributed import ProcessGroup, ReduceOp
 from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 
@@ -25,6 +24,11 @@ from atom.quant_spec import (
 )
 from atom.utils import envs, get_open_port
 from atom.utils.distributed.utils import stateless_init_torch_distributed_process_group
+
+if TYPE_CHECKING:
+    # Annotation only. Importing AITER here would put a GPU kernel build behind
+    # `import atom.config`, which is what `atom.quant_spec` defers on purpose.
+    from aiter import QuantType
 
 logger = logging.getLogger("atom")
 
@@ -76,10 +80,13 @@ class KVCacheTensor:
     """
 
     layer_num: int
-    k_cache: torch.Tensor = torch.tensor([])
-    v_cache: torch.Tensor = torch.tensor([])
+    k_cache: torch.Tensor = field(default_factory=lambda: torch.tensor([]))
+    v_cache: torch.Tensor = field(default_factory=lambda: torch.tensor([]))
     k_scale: torch.Tensor = None
     v_scale: torch.Tensor = None
+    # DSA sparse layers (GLM-5.2 / DeepSeek-V3.2): indexer key cache, block-major
+    # ``(num_blocks, block_size, aligned_index_dim)``. Omitted for non-DSA layers.
+    index_cache: torch.Tensor | None = None
 
 
 @dataclass
@@ -330,9 +337,7 @@ class QuantizationConfig:
         self.hf_quant_config = getattr(config, "quantization_config", None)
 
         if self.hf_quant_config is None:
-            self.global_spec = LayerQuantConfig(
-                quant_type=QuantType.No, quant_dtype=self.torch_dtype
-            )
+            self.global_spec = LayerQuantConfig.no_quant(self.torch_dtype)
             self.layer_pattern_specs = []
             self.exclude_layers = []
             self.quant_method = ""
@@ -352,8 +357,15 @@ class QuantizationConfig:
             "mxfp4",
             "mxfp8",
             "quark",
+            "compressed-tensors",
         ]:
             self.online_quant = True
+            if self.quant_method == "compressed-tensors":
+                logger.warning(
+                    "Online quant with compressed-tensors is not fully supported. "
+                    "Be careful about the online quant config setting when launching "
+                    "the server."
+                )
             online_parser = get_quant_parser("online_quant")
             online_parsed_quant_config = online_parser.parse(online_quant_config)
             self.online_global_spec = online_parsed_quant_config.global_spec
@@ -419,7 +431,7 @@ class QuantizationConfig:
     # -- convenience properties (delegate to global_spec) ---------------------
 
     @property
-    def quant_type(self) -> QuantType:
+    def quant_type(self) -> "QuantType":
         return self.global_spec.quant_type
 
     @property
@@ -1491,18 +1503,19 @@ class Config:
                 f"tp_size ({self.tensor_parallel_size}) must be divisible by "
                 f"dcp_size ({self.decode_context_parallel_size})"
             )
-            if self.enable_prefix_caching:
-                logger.warning(
-                    "DCP does not support prefix caching yet; "
-                    "disabling enable_prefix_caching."
-                )
-                self.enable_prefix_caching = False
-            if self.enable_chunked_prefill:
-                logger.warning(
-                    "DCP does not support chunked prefill yet; "
-                    "disabling enable_chunked_prefill."
-                )
-                self.enable_chunked_prefill = False
+            # Spec-decode + DCP arch gating. Any speculative method (mtp /
+            # eagle3 / dspark) runs a q>1 verify pass, and DCP decode with q>1
+            # uses the round-robin CP (cprr) MLA kernel, which is persistent-only
+            # and ships only on gfx950; on gfx942 the non-persistent fallback
+            # ignores the cprr masking and silently produces WRONG output.
+            from aiter.jit.utils.chip_info import get_gfx
+
+            gfx = get_gfx()
+            assert gfx == "gfx950", (
+                f"Speculative decode + DCP is only supported on gfx950 (needs "
+                f"the persistent cprr MLA kernel); got {gfx}. Disable DCP or "
+                f"speculative decode on this GPU."
+            )
         assert 1 <= self.pipeline_parallel_size
         self.hf_config = get_hf_config(
             self.model, trust_remote_code=self.trust_remote_code
