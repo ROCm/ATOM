@@ -4,6 +4,7 @@ from typing import Optional
 
 import torch
 from aiter import get_pa_metadata_info_v1, get_pa_metadata_v1
+
 try:
     from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 except ModuleNotFoundError:
