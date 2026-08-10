@@ -200,7 +200,7 @@ python3 -m sglang.launch_server \
     --speculative-algorithm DSPARK \
     --speculative-draft-model-path "${DRAFT_PATH}" \
     --speculative-num-draft-tokens 8 \
-    --cuda-graph-max-bs 4 \
+    --cuda-graph-max-bs 16 \
     2>&1 | tee kimi-k3-dspark-tp8-sglang-server.log
 ```
 

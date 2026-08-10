@@ -149,8 +149,15 @@ class ATOMKimiK3BackendForSgl(ATOMAttnBackendForSgl):
 
             _, req_pool = self._kimi_pools()
             num_draft = int(getattr(self, "num_draft_tokens", 0) or 0)
+            # Eager (non-graph) verify forwards run the EXTEND path and can have a
+            # real bs up to the request-pool capacity, which exceeds the captured
+            # graph bucket count (max_bs). Size the KDA conv scratch for that true
+            # maximum so a bs>max_bs eager verify's pre-seed never indexes past the
+            # buffer (which crashes the KDA conv kernel with a HIP illegal access).
+            pool_cap = int(getattr(req_pool, "size", 0) or 0)
+            scratch_bs = max(int(max_bs), pool_cap)
             if req_pool is not None and getattr(req_pool, "mamba_map", None):
-                preallocate_k3_verify_scratch(req_pool, int(max_bs), num_draft)
+                preallocate_k3_verify_scratch(req_pool, scratch_bs, num_draft)
         except Exception:  # noqa: BLE001,S110
             pass
         return result

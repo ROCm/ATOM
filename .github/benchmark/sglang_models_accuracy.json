@@ -122,7 +122,7 @@
   {
     "model_name": "Kimi-K3 DSpark TP8",
     "model_path": "moonshotai/Kimi-K3",
-    "extraArgs": "--trust-remote-code --tensor-parallel-size 8 --attention-backend aiter --kv-cache-dtype fp8_e4m3 --page-size 128 --context-length 8192 --mem-fraction-static 0.85 --disable-radix-cache --speculative-algorithm DSPARK --speculative-draft-model-path Inferact/Kimi-K3-DSpark --speculative-num-draft-tokens 8 --cuda-graph-max-bs 4",
+    "extraArgs": "--trust-remote-code --tensor-parallel-size 8 --attention-backend aiter --kv-cache-dtype fp8_e4m3 --page-size 128 --context-length 8192 --mem-fraction-static 0.85 --disable-radix-cache --speculative-algorithm DSPARK --speculative-draft-model-path Inferact/Kimi-K3-DSpark --speculative-num-draft-tokens 8 --cuda-graph-max-bs 16",
     "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_PLUGINS=atom_sglang\nSGLANG_USE_AITER=1\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nSGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=atom.plugin.sglang.models\nATOM_LOADER_NUM_THREADS=16\nATOM_SYNC_AFTER_LOAD=1\nATOM_DIST_TIMEOUT_SECONDS=3600\nATOM_USE_TRITON_GEMM=1\nAITER_USE_GROUPED_GEMM=0\nATOM_USE_TRITON_MOE=0\nAITER_FLYDSL_FORCE=1\nAITER_FORCE_GFX1250=0\nATOM_MLA_PAGE_SIZE=1\nATOM_USE_UNIFIED_ATTN=1\nATOM_FORCE_ATTN_TRITON=1",
     "runner": "atom-plugin-acc-validation-runner-sgl",
     "test_level": "nightly",
