@@ -1300,13 +1300,6 @@ class MLAAttention(nn.Module):
             cp_rank = 0
             g_kv_indptr = None
             if self.dcp_world_size > 1 and max_q_len > 1:
-                # cprr kernel is bf16-only (no fp8 cprr kernel on gfx950).
-                if self.kv_cache_dtype == "fp8":
-                    raise NotImplementedError(
-                        "MTP + DCP (max_q_len>1) requires bf16 KV cache: the "
-                        "round-robin CP (cprr) MLA kernel has no fp8 variant. "
-                        "Use --kv_cache_dtype bf16, or disable DCP/MTP for fp8."
-                    )
                 cp_world_size = self.dcp_world_size
                 cp_rank = self.dcp_rank
                 g_kv_indptr = getattr(attn_metadata, "g_kv_indptr", None)
