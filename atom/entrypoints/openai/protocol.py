@@ -10,13 +10,16 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from atom.sampling_params import (
+    DEFAULT_TEMPERATURE,
+    DEFAULT_TOP_K,
+    DEFAULT_TOP_P,
+)
+
 # ============================================================================
 # Constants
 # ============================================================================
 
-DEFAULT_TEMPERATURE = 1.0
-DEFAULT_TOP_K = -1
-DEFAULT_TOP_P = 1.0
 DEFAULT_MAX_TOKENS = 8192
 CHAT_COMPLETION_OBJECT = "chat.completion"
 CHAT_COMPLETION_CHUNK_OBJECT = "chat.completion.chunk"

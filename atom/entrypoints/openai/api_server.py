@@ -1435,26 +1435,26 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
             **merged_kwargs,
         )
 
-        sampling_defaults = resolve_anthropic_sampling_params(
-            request, engine.config.generation_config
+        resolved_sampling = resolve_anthropic_sampling_params(
+            request, engine.config.sampling_defaults
         )
-        logger.info(
+        logger.debug(
             "[anthropic] resolved sampling params: temperature=%s top_p=%s "
             "top_k=%s (request temperature=%s top_p=%s top_k=%s)",
-            sampling_defaults["temperature"],
-            sampling_defaults["top_p"],
-            sampling_defaults["top_k"],
+            resolved_sampling.temperature,
+            resolved_sampling.top_p,
+            resolved_sampling.top_k,
             request.temperature,
             request.top_p,
             request.top_k,
         )
         sampling_params = _build_sampling_params(
-            temperature=sampling_defaults["temperature"],
+            temperature=resolved_sampling.temperature,
             max_tokens=request.max_tokens,
             stop_strings=request.stop_sequences,
             ignore_eos=False,
-            top_k=sampling_defaults["top_k"],
-            top_p=sampling_defaults["top_p"],
+            top_k=resolved_sampling.top_k,
+            top_p=resolved_sampling.top_p,
         )
 
         request_id = uuid.uuid4().hex[:24]

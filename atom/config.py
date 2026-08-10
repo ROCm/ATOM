@@ -22,6 +22,7 @@ from atom.quant_spec import (
     LayerQuantConfig,
     get_quant_parser,
 )
+from atom.sampling_params import SamplingDefaults
 from atom.utils import envs, get_open_port
 from atom.utils.distributed.utils import stateless_init_torch_distributed_process_group
 
@@ -725,7 +726,7 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
     return hf_config
 
 
-def get_generation_config(model: str) -> GenerationConfig:
+def get_generation_config(model: str) -> GenerationConfig | None:
     try:
         return GenerationConfig.from_pretrained(
             model,
@@ -1305,7 +1306,8 @@ class Config:
     prefill_context_parallel_size: int = 1
     enforce_eager: bool = False
     hf_config: PretrainedConfig = field(init=False)
-    generation_config: GenerationConfig = field(init=False)
+    generation_config: GenerationConfig | None = field(init=False)
+    sampling_defaults: SamplingDefaults = field(init=False)
     parallel_config: ParallelConfig = field(default_factory=ParallelConfig)
     bos_token_id: int = -1
     eos_token_id: int = -1
@@ -1484,11 +1486,16 @@ class Config:
             self.hf_config.rope_parameters = rope_params
 
         self.generation_config = get_generation_config(self.model)
-        if self.generation_config is not None:
-            if (
-                eos_ids := getattr(self.generation_config, "eos_token_id", None)
-            ) is not None:
-                self.stop_token_ids = [eos_ids] if isinstance(eos_ids, int) else eos_ids
+        self.sampling_defaults = SamplingDefaults.from_generation_config(
+            self.generation_config
+        )
+        logger.info("Model sampling defaults: %s", self.sampling_defaults)
+        if (
+            self.generation_config is not None
+            and (eos_ids := getattr(self.generation_config, "eos_token_id", None))
+            is not None
+        ):
+            self.stop_token_ids = [eos_ids] if isinstance(eos_ids, int) else eos_ids
         self.quant_config = QuantizationConfig(
             self.hf_config,
             self.online_quant_config,

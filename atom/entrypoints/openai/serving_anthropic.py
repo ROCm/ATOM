@@ -10,9 +10,11 @@ Anthropic-compatible tools to use ATOM as a backend.
 
 import json
 import logging
-from typing import Any, List, Optional
+from typing import Any
 
 from pydantic import BaseModel
+
+from atom.sampling_params import SamplingDefaults
 
 logger = logging.getLogger("atom")
 
@@ -22,14 +24,14 @@ logger = logging.getLogger("atom")
 
 class AnthropicContentBlock(BaseModel):
     type: str
-    text: Optional[str] = None
+    text: str | None = None
     # tool_use fields
-    id: Optional[str] = None
-    name: Optional[str] = None
-    input: Optional[Any] = None
+    id: str | None = None
+    name: str | None = None
+    input: Any | None = None
     # tool_result fields
-    tool_use_id: Optional[str] = None
-    content: Optional[Any] = None
+    tool_use_id: str | None = None
+    content: Any | None = None
 
 
 class AnthropicMessage(BaseModel):
@@ -39,18 +41,18 @@ class AnthropicMessage(BaseModel):
 
 class AnthropicMessagesRequest(BaseModel):
     model: str
-    messages: List[AnthropicMessage]
+    messages: list[AnthropicMessage]
     max_tokens: int = 4096
-    system: Optional[Any] = None  # str or list
-    temperature: Optional[float] = None
-    top_p: Optional[float] = None
-    top_k: Optional[int] = None
+    system: Any | None = None  # str or list
+    temperature: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
     stream: bool = False
-    stop_sequences: Optional[List[str]] = None
-    tools: Optional[List[dict]] = None
-    tool_choice: Optional[Any] = None
-    metadata: Optional[dict] = None
-    thinking: Optional[dict] = None  # {"type":"enabled","budget_tokens":N}
+    stop_sequences: list[str] | None = None
+    tools: list[dict] | None = None
+    tool_choice: Any | None = None
+    metadata: dict | None = None
+    thinking: dict | None = None  # {"type":"enabled","budget_tokens":N}
 
 
 # ── Format Conversion ──────────────────────────────────────────────────
@@ -58,48 +60,20 @@ class AnthropicMessagesRequest(BaseModel):
 
 def resolve_anthropic_sampling_params(
     request: AnthropicMessagesRequest,
-    generation_config: Any = None,
-) -> dict[str, float | int]:
-    """Merge request values, model generation defaults, and engine defaults.
-
-    The precedence matches vLLM's OpenAI serving layer: an explicitly supplied
-    request value wins, then a value explicitly present in the model's
-    ``generation_config.json``, and finally an engine-neutral default.
-
-    ``GenerationConfig`` can materialize library defaults for fields absent
-    from the model file. Use ``to_diff_dict()`` instead of direct attributes so
-    an implicit Transformers default (notably ``top_k``) is not enabled by
-    accident.
-    """
-    model_defaults: dict[str, Any] = {}
-    if generation_config is not None:
-        if isinstance(generation_config, dict):
-            model_defaults = generation_config
-        else:
-            to_diff_dict = getattr(generation_config, "to_diff_dict", None)
-            if callable(to_diff_dict):
-                model_defaults = to_diff_dict()
-
-    neutral_defaults: dict[str, float | int] = {
-        "temperature": 1.0,
-        "top_p": 1.0,
-        "top_k": -1,
-    }
-    resolved: dict[str, float | int] = {}
-    for name, neutral_value in neutral_defaults.items():
-        request_value = getattr(request, name)
-        if request_value is not None:
-            resolved[name] = request_value
-            continue
-        model_value = model_defaults.get(name)
-        resolved[name] = neutral_value if model_value is None else model_value
-    return resolved
+    model_defaults: SamplingDefaults,
+) -> SamplingDefaults:
+    """Apply explicit Anthropic request values over model sampling defaults."""
+    return model_defaults.with_overrides(
+        temperature=request.temperature,
+        top_p=request.top_p,
+        top_k=request.top_k,
+    )
 
 
 def anthropic_to_openai_messages(
-    messages: List[AnthropicMessage],
-    system: Optional[Any] = None,
-) -> List[dict]:
+    messages: list[AnthropicMessage],
+    system: Any | None = None,
+) -> list[dict]:
     """Convert Anthropic messages to OpenAI format."""
     result = []
 
@@ -182,7 +156,7 @@ def anthropic_to_openai_messages(
     return result
 
 
-def anthropic_to_openai_tools(tools: Optional[List[dict]]) -> Optional[List[dict]]:
+def anthropic_to_openai_tools(tools: list[dict] | None) -> list[dict] | None:
     """Convert Anthropic tool definitions to OpenAI format."""
     if not tools:
         return None
@@ -208,8 +182,8 @@ def build_anthropic_response(
     request_id: str,
     model: str,
     content_text: str,
-    reasoning_content: Optional[str] = None,
-    tool_calls: Optional[list] = None,
+    reasoning_content: str | None = None,
+    tool_calls: list | None = None,
     input_tokens: int = 0,
     output_tokens: int = 0,
     cache_read_input_tokens: int = 0,
