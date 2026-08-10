@@ -84,8 +84,13 @@ def _stable_reference(scores, gids, k):
     # up (see test_threshold_tie_cap_boundary). Measured max tie set: 0.9 -> 6,
     # 0.99 -> 26, 0.999 -> 249, i.e. 0.999 sits 7 short of the 256 cap and would
     # start failing on any RNG change. Keep the cases well below it.
-    [(8, 16384, 0.0), (8, 16384, 0.99), (32, 16384, 0.9), (16, 16384, 0.99),
-     (4, 8192, 0.0)],
+    [
+        (8, 16384, 0.0),
+        (8, 16384, 0.99),
+        (32, 16384, 0.9),
+        (16, 16384, 0.99),
+        (4, 8192, 0.0),
+    ],
 )
 def test_stable_topk_matches_reference(rows, n, tie_frac):
     sc, gd = _make_case(rows, n, seed=rows * 31 + n, tie_frac=tie_frac)
@@ -136,9 +141,9 @@ def test_threshold_tie_cap_boundary(delta, overflows):
     assert int(ovf.sum()) == (rows if overflows else 0)
     if not overflows:
         ref = _stable_reference(scores, gid, TOPK)
-        assert torch.equal(got.sort(-1).values, ref.sort(-1).values.int()), (
-            "tie-break must take the `need` smallest gids among the tied set"
-        )
+        assert torch.equal(
+            got.sort(-1).values, ref.sort(-1).values.int()
+        ), "tie-break must take the `need` smallest gids among the tied set"
 
 
 def test_stable_topk_is_deterministic():
@@ -263,9 +268,9 @@ def test_candidate_exchange_reproduces_global_topk(
     # themselves must match the gid-stable reference.
     thr = gl[:, :ctx].topk(n_keep, dim=-1).values[:, -1:]
     if int((gl[:, :ctx] == thr).sum(-1).max()) == 1:
-        assert torch.equal(got.sort(-1).values, ref.sort(-1).values), (
-            f"[{name}] ids differ from the reference with no threshold tie"
-        )
+        assert torch.equal(
+            got.sort(-1).values, ref.sort(-1).values
+        ), f"[{name}] ids differ from the reference with no threshold tie"
 
 
 def test_merge_agrees_across_ranks_on_a_fixed_buffer():
@@ -281,9 +286,9 @@ def test_merge_agrees_across_ranks_on_a_fixed_buffer():
     sc, gid = _build_gathered(gl, 65536, 8)
     first = dcp_stable_topk(sc, gid, TOPK)[0].clone()
     for i in range(20):
-        assert torch.equal(dcp_stable_topk(sc, gid, TOPK)[0], first), (
-            f"merge {i} disagrees -- ranks would build overlapping candidate sets"
-        )
+        assert torch.equal(
+            dcp_stable_topk(sc, gid, TOPK)[0], first
+        ), f"merge {i} disagrees -- ranks would build overlapping candidate sets"
 
 
 def test_reruns_stay_valid_even_when_the_set_shifts():

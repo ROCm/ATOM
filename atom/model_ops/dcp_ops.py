@@ -8,8 +8,6 @@ across DCP ranks using LSE (Log-Sum-Exp) correction.
 Uses vllm-style algorithm: AllGather LSE -> correct local output -> ReduceScatter.
 """
 
-from typing import Optional
-
 import numpy as np
 import torch
 import triton
@@ -495,7 +493,7 @@ def dcp_pack_topk_candidates(
     global position j*W + r, so the id is globally unique -- which is what makes
     the tie-break a total order.
     """
-    rows, k = local_idx.shape
+    rows, _k = local_idx.shape
     # Bound-check rather than assume a padding convention from the aiter kernel.
     valid = (local_idx >= 0) & (local_idx < local_lens.view(rows, 1))
     safe = torch.where(valid, local_idx, torch.zeros_like(local_idx))
@@ -638,7 +636,7 @@ def triton_filter_and_convert_dcp_index(
     owned_counts: torch.Tensor,  # int32 [>= num_requests] scratch for pass 1
     NUM_TOPK_TOKENS: int = 2048,
     BLOCK_N: int = 128,
-    out: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
 ):
     """DCP (interleave=1) filter + round-robin localize of global top-k positions,
     **compacting** each rank's owned slots to the front of its region.
@@ -858,7 +856,7 @@ def triton_filter_and_convert_dcp_index_prefill(
     owned_counts: torch.Tensor,  # int32 [>= num_tokens] scratch for pass 1
     NUM_TOPK_TOKENS: int = 2048,
     BLOCK_N: int = 128,
-    out: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
 ):
     """Sparse-PREFILL twin of ``triton_filter_and_convert_dcp_index``.
 

@@ -129,9 +129,7 @@ def _decode_reference(g_ctxs, block_table, token_indices, rank):
 )
 def test_decode_filter(name, g_ctxs, seed):
     bs = len(g_ctxs)
-    max_blocks = (
-        max(1, (max(g_ctxs) + DEC_PAGE * DEC_W - 1) // (DEC_PAGE * DEC_W)) + 1
-    )
+    max_blocks = max(1, (max(g_ctxs) + DEC_PAGE * DEC_W - 1) // (DEC_PAGE * DEC_W)) + 1
     qo_indptr, global_kv_indptr, block_table, token_indices = _build_decode_case(
         g_ctxs, max_blocks, seed
     )
@@ -176,9 +174,9 @@ def test_decode_filter(name, g_ctxs, seed):
             assert got == exp[b], f"[{name}] rank{rank} req{b}: {got} != {exp[b]}"
 
         written = out_buf[: indptr[bs]]
-        assert int((written < 0).sum()) == 0, (
-            f"[{name}] rank{rank}: -1 hole inside the compacted region"
-        )
+        assert (
+            int((written < 0).sum()) == 0
+        ), f"[{name}] rank{rank}: -1 hole inside the compacted region"
 
         per_rank_lens.append([indptr[b + 1] - indptr[b] for b in range(bs)])
 
@@ -241,15 +239,15 @@ def _build_prefill_case(seq_lens):
         max((s + PRE_PAGE * PRE_W - 1) // (PRE_PAGE * PRE_W) for s in seq_lens)
     )
     block_table = rng.permutation(bs * max_blocks).reshape(bs, max_blocks)
-    return dict(
-        bs=bs,
-        num_tokens=num_tokens,
-        cu_k=cu_k,
-        token_to_seq=token_to_seq,
-        kv_indptr=kv_indptr,
-        topk=topk,
-        block_table=block_table.astype(np.int32),
-    )
+    return {
+        "bs": bs,
+        "num_tokens": num_tokens,
+        "cu_k": cu_k,
+        "token_to_seq": token_to_seq,
+        "kv_indptr": kv_indptr,
+        "topk": topk,
+        "block_table": block_table.astype(np.int32),
+    }
 
 
 def _run_prefill(case):
@@ -318,9 +316,9 @@ def test_prefill_filter(seq_lens):
                 for r in range(PRE_W)
             ]
             claims = [(r, s) for r, s in claims if s >= 0]
-            assert len(claims) == 1, (
-                f"seq {b} position {p}: the writer gives it {len(claims)} owners"
-            )
+            assert (
+                len(claims) == 1
+            ), f"seq {b} position {p}: the writer gives it {len(claims)} owners"
             owner_of[key] = claims[0]
         return owner_of[key]
 
@@ -358,9 +356,9 @@ def test_prefill_filter(seq_lens):
                 )
                 continue
 
-            assert cnts[t] == len(exp_slots), (
-                f"token={t} rank={r}: owned_count {cnts[t]} != {len(exp_slots)}"
-            )
+            assert cnts[t] == len(
+                exp_slots
+            ), f"token={t} rank={r}: owned_count {cnts[t]} != {len(exp_slots)}"
             assert list(slots) == exp_slots, (
                 f"token={t} rank={r}: slots {list(slots)[:8]}... "
                 f"!= {exp_slots[:8]}..."
@@ -368,9 +366,9 @@ def test_prefill_filter(seq_lens):
 
         # Partition: every candidate is claimed by exactly one rank -- neither
         # dropped nor double-claimed, which is what cp_lse_ag_out_rs needs.
-        assert n_claimed == len(want), (
-            f"token={t}: ranks kept {n_claimed} of {len(want)} candidates"
-        )
+        assert n_claimed == len(
+            want
+        ), f"token={t}: ranks kept {n_claimed} of {len(want)} candidates"
 
     # Every batch starts with tokens whose causal window is shorter than W, so
     # the zero-owned path must have been exercised -- guard against the empty-row

@@ -54,6 +54,11 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from atom.config import Config, QuantizationConfig, get_current_atom_config
+from atom.distributed.dcp_utils import (
+    get_dcp_group,
+    get_dcp_rank,
+    get_dcp_world_size,
+)
 from atom.distributed.pcp_utils import (
     get_pcp_world_size,
     pcp_all_reduce,
@@ -117,12 +122,6 @@ from atom.plugin.vllm.attention.layer_sparse_mla import (
 from atom.quant_spec import should_skip_online_quant
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
-
-from atom.distributed.dcp_utils import (
-    get_dcp_group,
-    get_dcp_rank,
-    get_dcp_world_size,
-)
 from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import get_forward_context
 
@@ -1363,7 +1362,7 @@ def _dcp_gather_indexer_k_prefill(
     prefill_metadata,
     head_dim: int,
     device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Gather the full-sequence indexer K under DCP for prefill top-k.
 
     The index cache holds only this rank's round-robin 1/W, so a plain gather
@@ -1756,7 +1755,7 @@ def sparse_attn_indexer(
         next_n = padded_q_fp8_decode_tokens.shape[1]
         assert batch_size == context.batch_size
         num_padded_tokens = batch_size * next_n
-        batch_size, next_n, heads, _ = padded_q_fp8_decode_tokens.shape
+        batch_size, next_n, _heads, _ = padded_q_fp8_decode_tokens.shape
         num_rows = batch_size * next_n
         dcp_world_size = get_dcp_world_size()
         logits = None

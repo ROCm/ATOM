@@ -66,8 +66,9 @@ def _dense_and_shards(B, H, L, D, N, dtype, seed=0):
     for r in range(N):
         part = logits[:, :, r::N]
         outs.append(
-            torch.einsum("bhl,bhld->bhd", torch.softmax(part, dim=-1), v[:, :, r::N])
-            .to(dtype)
+            torch.einsum(
+                "bhl,bhld->bhd", torch.softmax(part, dim=-1), v[:, :, r::N]
+            ).to(dtype)
         )
         lses.append(torch.logsumexp(part, dim=-1))
     return dense_o, dense_lse, outs, torch.stack(lses)
@@ -269,18 +270,18 @@ def _build_chunk(cached_lens, dcp, block_size, chunk_size, chunk_idx, dim=4, pe=
                     k_pe[r * toks + off + j] = -tag
             off += int(plc[s])
 
-    return dict(
-        kv_c=kv_c,
-        k_pe=k_pe,
-        plc=plc.astype(int).tolist(),
-        local_lens=local_lens.astype(int).tolist(),
-        real=real,
-        toks=toks,
-        sum_seq_len=int(real.sum()),
-        max_seq_len=int(real.sum(axis=1).max(initial=0)),
-        c_lo=c_lo,
-        c_hi=c_hi,
-    )
+    return {
+        "kv_c": kv_c,
+        "k_pe": k_pe,
+        "plc": plc.astype(int).tolist(),
+        "local_lens": local_lens.astype(int).tolist(),
+        "real": real,
+        "toks": toks,
+        "sum_seq_len": int(real.sum()),
+        "max_seq_len": int(real.sum(axis=1).max(initial=0)),
+        "c_lo": c_lo,
+        "c_hi": c_hi,
+    }
 
 
 @pytest.mark.parametrize("chunk_idx", [0, 1, 2, 3])
@@ -320,11 +321,7 @@ def test_reorg_kvcache_rebuilds_each_sequence(chunk_idx):
         n = int(c["real"][s].sum())
         seg = got[pos : pos + n].tolist()
         pos += n
-        want = {
-            float(p)
-            for p in range(glen)
-            if c["c_lo"] <= p // dcp < c["c_hi"]
-        }
+        want = {float(p) for p in range(glen) if c["c_lo"] <= p // dcp < c["c_hi"]}
         assert set(seg) == want, f"seq {s}: wrong token set in chunk {chunk_idx}"
         assert len(seg) == len(want), f"seq {s}: duplicated tokens"
 
