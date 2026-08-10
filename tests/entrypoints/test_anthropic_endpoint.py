@@ -17,7 +17,6 @@ from atom.entrypoints.openai.serving_anthropic import (
     anthropic_to_openai_tools,
     build_anthropic_response,
     format_sse,
-    resolve_anthropic_sampling_params,
     stream_content_block_delta,
     stream_content_block_start,
     stream_content_block_stop,
@@ -25,7 +24,6 @@ from atom.entrypoints.openai.serving_anthropic import (
     stream_message_start,
     stream_message_stop,
 )
-from atom.sampling_params import SamplingDefaults
 
 # ============================================================================
 # Message Conversion Tests
@@ -467,52 +465,3 @@ class TestAnthropicMessagesRequest:
         result = anthropic_to_openai_messages(msgs, system=system)
         # No system message when all blocks are attribution headers
         assert result[0]["role"] == "user"
-
-
-class TestAnthropicSamplingParams:
-    @staticmethod
-    def _request(**kwargs):
-        return AnthropicMessagesRequest(
-            model="test",
-            messages=[AnthropicMessage(role="user", content="Hi")],
-            **kwargs,
-        )
-
-    def test_uses_explicit_model_generation_defaults(self):
-        request = self._request()
-        model_defaults = SamplingDefaults(temperature=1.0, top_p=0.95)
-
-        assert resolve_anthropic_sampling_params(request, model_defaults) == (
-            SamplingDefaults(temperature=1.0, top_p=0.95, top_k=-1)
-        )
-
-    def test_explicit_request_values_override_model_defaults(self):
-        request = self._request(temperature=0.0, top_p=1.0, top_k=20)
-        model_defaults = SamplingDefaults(temperature=0.8, top_p=0.95, top_k=50)
-
-        assert resolve_anthropic_sampling_params(request, model_defaults) == (
-            SamplingDefaults(temperature=0.0, top_p=1.0, top_k=20)
-        )
-
-    def test_missing_model_values_use_engine_neutral_defaults(self):
-        assert (
-            resolve_anthropic_sampling_params(self._request(), SamplingDefaults())
-            == SamplingDefaults()
-        )
-
-    def test_uses_generation_config_diff_not_materialized_attributes(self):
-        class FakeGenerationConfig:
-            # Simulate defaults materialized by Transformers but absent from
-            # generation_config.json.
-            temperature = 0.7
-            top_p = 0.8
-            top_k = 50
-
-            def to_diff_dict(self):
-                return {"top_p": 0.95}
-
-        model_defaults = SamplingDefaults.from_generation_config(FakeGenerationConfig())
-
-        assert resolve_anthropic_sampling_params(
-            self._request(), model_defaults
-        ) == SamplingDefaults(top_p=0.95)

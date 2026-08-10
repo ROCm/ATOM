@@ -14,8 +14,6 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from atom.sampling_params import SamplingDefaults
-
 logger = logging.getLogger("atom")
 
 
@@ -56,18 +54,6 @@ class AnthropicMessagesRequest(BaseModel):
 
 
 # ── Format Conversion ──────────────────────────────────────────────────
-
-
-def resolve_anthropic_sampling_params(
-    request: AnthropicMessagesRequest,
-    model_defaults: SamplingDefaults,
-) -> SamplingDefaults:
-    """Apply explicit Anthropic request values over model sampling defaults."""
-    return model_defaults.with_overrides(
-        temperature=request.temperature,
-        top_p=request.top_p,
-        top_k=request.top_k,
-    )
 
 
 def anthropic_to_openai_messages(

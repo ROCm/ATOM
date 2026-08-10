@@ -52,7 +52,6 @@ from .serving_anthropic import (
     anthropic_to_openai_messages,
     anthropic_to_openai_tools,
     build_anthropic_response,
-    resolve_anthropic_sampling_params,
     stream_content_block_delta,
     stream_content_block_start,
     stream_content_block_stop,
@@ -1435,8 +1434,10 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
             **merged_kwargs,
         )
 
-        resolved_sampling = resolve_anthropic_sampling_params(
-            request, engine.config.sampling_defaults
+        resolved_sampling = engine.config.sampling_defaults.with_overrides(
+            temperature=request.temperature,
+            top_p=request.top_p,
+            top_k=request.top_k,
         )
         logger.debug(
             "[anthropic] resolved sampling params: temperature=%s top_p=%s "
