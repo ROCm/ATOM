@@ -106,6 +106,24 @@ stateful cache pool 保留 vLLM `a82f` 之前的 free-queue 顺序，普通 MHA/
 Mamba/GDN metadata。移除 ATOM 针对旧版 vLLM 的二次 compaction，避免把
 上游生成的 PAD slot 覆盖为 live state index。
 
+### ROCm FULL graph 临时内存预捕获
+
+vLLM 0.26 将 `profile_cudagraph_memory()` 扩展到 ROCm：正式捕获前会临时
+捕获并销毁全部图。AITER 会保留属于临时 graph pool 的状态，随后在高并发
+FULL replay 中访问失效地址并触发 HIP illegal memory access。
+
+对照测试固定 PyTorch 与 AITER `0.1.1.dev1+gaf02117fb`：
+
+- vLLM 0.25 + 升级前 ATOM，并发 65：通过；
+- vLLM 0.25 + 升级后 ATOM，并发 65：通过；
+- vLLM 0.26 默认临时预捕获，并发 65：崩溃；
+- vLLM 0.26 跳过临时预捕获，并发 65：完整 GSM8K 通过，
+  flexible-extract `0.9363`，正式 FULL graph 保持启用。
+
+ATOM 补丁使 `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0` 真正跳过临时
+graph capture，而不只是忽略其显存估算值。受影响nightly配置使用该开关并
+恢复默认并发 65；没有降级到 PIECEWISE。
+
 ### AITER 基线
 
 `rocm/atom-dev:latest` 中原有 AITER package metadata 为 `0.0.0`，且缺少
