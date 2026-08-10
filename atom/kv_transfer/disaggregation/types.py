@@ -138,6 +138,10 @@ class KVTransferTensors:
     slot_regions: list[KVTransferRegion]
     num_blocks: int
     num_slots: int = 0
+    # Optional producer-local -> consumer-global mapping for non-uniform block
+    # region layouts. Uniform per-layer groups leave this unset and use the
+    # connector's existing group-major inference.
+    block_region_consumer_indices: list[int] | None = None
     # Legacy field name: full per-request SLOT regions keyed by pool group.
     # `unit_bytes` includes compressor state and SWA, not just one ring.
     swa_block_regions: list[KVTransferRegion] = field(default_factory=list)

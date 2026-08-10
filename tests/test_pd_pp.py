@@ -256,7 +256,8 @@ def test_region_map_undefined_when_groups_uneven():
 
 
 def test_region_map_stages_tile_consumer_no_overlap():
-    # GLM-5.2: 78 layers, PP4 partition [18,20,20,20], 2 groups (kv + index).
+    # Uniform MLA layout: 78 layers, PP4 partition [18,20,20,20],
+    # 2 complete groups (kv + per-layer index).
     partitions, num_hidden, groups = [18, 20, 20, 20], 78, 2
     covered = []
     for start, n_local in zip(_starts(partitions), partitions):
@@ -309,6 +310,55 @@ def test_region_map_group_major_beats_naive_offset():
     cmap = consumer_region_indices(40, 20, 18, 156, 4)
     assert cmap[20] == 78 + 18
     assert cmap[20] != 56
+
+
+def test_explicit_region_map_supports_compact_index_group():
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    conn = object.__new__(mc.MooncakeConnector)
+    # PP stage 1 owns target layers [18, 38). In this synthetic IndexShare
+    # schedule only global layers 18, 22, 26, 30, and 34 own index caches.
+    explicit = list(range(18, 38)) + [83, 84, 85, 86, 87]
+
+    assert conn._consumer_region_map(len(explicit), explicit) == explicit
+
+
+def test_compact_index_region_maps_tile_consumer_without_overlap():
+    partitions = [18, 20, 20, 20]
+    num_hidden = 78
+    full_layer_ids = tuple(range(0, num_hidden, 4))
+    full_layer_slots = {
+        layer_id: slot for slot, layer_id in enumerate(full_layer_ids)
+    }
+    covered = []
+
+    for start, n_local in zip(_starts(partitions), partitions):
+        local_layers = tuple(range(start, start + n_local))
+        local_full_layers = tuple(
+            layer_id
+            for layer_id in local_layers
+            if layer_id in full_layer_slots
+        )
+        explicit = list(local_layers) + [
+            num_hidden + full_layer_slots[layer_id]
+            for layer_id in local_full_layers
+        ]
+        covered.extend(explicit)
+
+    expected = list(range(num_hidden + len(full_layer_ids)))
+    assert sorted(covered) == expected
+    assert len(covered) == len(set(covered))
+
+
+def test_explicit_region_map_rejects_length_mismatch():
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    conn = object.__new__(mc.MooncakeConnector)
+
+    with pytest.raises(ValueError, match="length does not match"):
+        conn._consumer_region_map(3, [0, 1])
 
 
 # ---------------------------------------------------------------------------

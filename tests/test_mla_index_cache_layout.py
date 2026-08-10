@@ -1,0 +1,255 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+
+from types import SimpleNamespace
+
+from atom.model_ops.attentions import aiter_mla
+from atom.model_ops.attentions.aiter_mla import (
+    AiterMLAMetadataBuilder,
+    _global_index_cache_layer_ids,
+)
+
+
+def _mock_pp(monkeypatch, rank: int, world_size: int) -> None:
+    from aiter.dist import parallel_state
+
+    monkeypatch.setattr(
+        parallel_state,
+        "get_pp_group",
+        lambda: SimpleNamespace(rank_in_group=rank, world_size=world_size),
+    )
+
+
+def _builder(indexer_types, total_local_layers: int):
+    hf_config = SimpleNamespace(
+        num_hidden_layers=len(indexer_types) if indexer_types is not None else 6,
+        indexer_types=indexer_types,
+        index_head_dim=128,
+    )
+    runner = SimpleNamespace(
+        config=SimpleNamespace(
+            hf_config=hf_config,
+            kv_cache_dtype="fp8",
+            speculative_config=SimpleNamespace(
+                draft_model_hf_config=SimpleNamespace(
+                    num_nextn_predict_layers=1,
+                ),
+                use_dspark_with_draft=lambda: False,
+            ),
+        ),
+        block_size=16,
+        is_deepseek_v32=True,
+        _get_total_num_layers=lambda: total_local_layers,
+    )
+    builder = object.__new__(AiterMLAMetadataBuilder)
+    builder.model_runner = runner
+    return builder, runner
+
+
+def test_global_index_cache_layout_excludes_shared_and_keeps_mtp():
+    assert _global_index_cache_layer_ids(
+        ("full", "shared", "shared", "full"), 4, 2
+    ) == (0, 3, 4, 5)
+
+
+def test_global_index_cache_layout_without_schedule_is_unchanged():
+    assert _global_index_cache_layer_ids(None, 4, 1) == (0, 1, 2, 3, 4)
+
+
+def test_pp_local_index_cache_layout_uses_global_layer_ids(monkeypatch):
+    builder, _ = _builder(
+        ("full", "shared", "shared", "full", "shared", "full"),
+        total_local_layers=4,
+    )
+    _mock_pp(monkeypatch, rank=1, world_size=2)
+
+    local_layer_ids, global_layer_ids = builder._index_cache_layout()
+
+    assert global_layer_ids == (0, 3, 5, 6)
+    assert local_layer_ids == (3, 5, 6)
+
+
+def test_pp_non_draft_stage_keeps_draft_only_in_global_layout(monkeypatch):
+    builder, _ = _builder(
+        ("full", "shared", "shared", "full", "shared", "full"),
+        total_local_layers=3,
+    )
+    _mock_pp(monkeypatch, rank=0, world_size=2)
+
+    local_layer_ids, global_layer_ids = builder._index_cache_layout()
+
+    assert global_layer_ids == (0, 3, 5, 6)
+    assert local_layer_ids == (0,)
+
+
+def test_compute_block_bytes_uses_compact_index_layer_count(monkeypatch):
+    builder, _ = _builder(
+        ("full", "shared", "shared", "full", "shared", "full"),
+        total_local_layers=4,
+    )
+    _mock_pp(monkeypatch, rank=1, world_size=2)
+    fake_fp8 = SimpleNamespace(itemsize=1)
+    monkeypatch.setattr(
+        aiter_mla,
+        "dtypes",
+        SimpleNamespace(d_dtypes={"fp8": fake_fp8}, fp8=fake_fp8),
+    )
+
+    assert builder.compute_block_bytes() == 16 * (4 * 576 + 3 * 144)
+
+
+def test_allocate_index_cache_uses_compact_shape_and_map(monkeypatch):
+    builder, runner = _builder(
+        ("full", "shared", "shared", "full", "shared", "full"),
+        total_local_layers=4,
+    )
+    _mock_pp(monkeypatch, rank=1, world_size=2)
+    fake_fp8 = SimpleNamespace(itemsize=1)
+    monkeypatch.setattr(
+        aiter_mla,
+        "dtypes",
+        SimpleNamespace(d_dtypes={"fp8": fake_fp8}, fp8=fake_fp8),
+    )
+    runner.num_physical_kvcache_blocks = 8
+    runner.physical_block_size = 1
+    allocations = []
+
+    def fake_zeros(*shape, **kwargs):
+        allocations.append((shape, kwargs))
+        return SimpleNamespace(shape=shape)
+
+    monkeypatch.setattr(aiter_mla.torch, "zeros", fake_zeros)
+
+    out = builder.allocate_kv_cache_tensors(num_kv_heads=1, num_draft_layers=1)
+
+    assert out["kv_cache"].shape == (4, 8, 1, 576)
+    assert out["index_cache"].shape == (3, 8, 1, 144)
+    assert out["index_cache_layer_ids"] == (3, 5, 6)
+    assert out["index_cache_layer_map"] == {3: 0, 5: 1, 6: 2}
+    assert len(allocations) == 2
+
+
+class _FakeCache:
+    def __init__(self, prefix):
+        self.prefix = prefix
+
+    def __getitem__(self, index):
+        return _FakeCacheSlice((self.prefix, index))
+
+
+class _FakeCacheSlice:
+    def __init__(self, identity):
+        self.identity = identity
+
+    def view(self, *shape):
+        return self.identity, shape
+
+
+class _FakeTransferTensor:
+    def __init__(self, address):
+        self._address = address
+
+    def stride(self, dim):
+        assert dim == 0
+        return 1
+
+    def element_size(self):
+        return 1
+
+    def numel(self):
+        return 8
+
+    def data_ptr(self):
+        return self._address
+
+
+class _FakeTransferStack:
+    def __init__(self, num_layers, address_base):
+        self.shape = (num_layers,)
+        self._layers = [
+            _FakeTransferTensor(address_base + layer_id)
+            for layer_id in range(num_layers)
+        ]
+
+    def __getitem__(self, index):
+        return self._layers[index]
+
+
+def test_build_kv_cache_tensor_binds_compact_index_slice():
+    builder = object.__new__(AiterMLAMetadataBuilder)
+    runner = SimpleNamespace(
+        kv_cache=_FakeCache("kv"),
+        index_cache=_FakeCache("index"),
+        index_cache_layer_map={3: 0, 5: 1},
+        is_deepseek_v32=True,
+        num_physical_kvcache_blocks=8,
+        physical_block_size=1,
+        aligned_index_dim=144,
+        config=SimpleNamespace(max_model_len=1024),
+    )
+    builder.model_runner = runner
+    module = SimpleNamespace(
+        base_attention=object(),
+        use_mla=True,
+        layer_num=5,
+        indexer=SimpleNamespace(
+            k_cache=SimpleNamespace(kv_cache=[None]),
+        ),
+    )
+
+    cache_tensor = builder.build_kv_cache_tensor(layer_id=2, module=module)
+
+    assert module.kv_cache[0] == ("kv", 2)
+    assert module.indexer.k_cache.kv_cache[0][0] == ("index", 1)
+    assert cache_tensor.layer_num == 2
+
+
+def test_build_shared_layer_keeps_main_kv_without_index_slice():
+    builder = object.__new__(AiterMLAMetadataBuilder)
+    runner = SimpleNamespace(
+        kv_cache=_FakeCache("kv"),
+        index_cache=_FakeCache("index"),
+        index_cache_layer_map={0: 0},
+        is_deepseek_v32=True,
+        num_physical_kvcache_blocks=8,
+        physical_block_size=1,
+        aligned_index_dim=144,
+        config=SimpleNamespace(max_model_len=1024),
+    )
+    builder.model_runner = runner
+    module = SimpleNamespace(
+        base_attention=object(),
+        use_mla=True,
+        layer_num=1,
+        indexer=None,
+    )
+
+    builder.build_kv_cache_tensor(layer_id=1, module=module)
+
+    assert module.kv_cache[0] == ("kv", 1)
+
+
+def test_transfer_regions_use_explicit_compact_consumer_map(monkeypatch):
+    builder, runner = _builder(
+        ("full", "shared", "shared", "full", "shared", "full"),
+        total_local_layers=4,
+    )
+    _mock_pp(monkeypatch, rank=1, world_size=2)
+    builder.block_ratio = 1
+    runner.kv_cache = _FakeTransferStack(4, 100)
+    runner.index_cache = _FakeTransferStack(3, 200)
+    runner.index_cache_layer_ids = (3, 5, 6)
+    runner.config.num_kvcache_blocks = 8
+
+    transfer_tensors = builder.get_kv_transfer_tensors()
+
+    assert len(transfer_tensors.block_regions) == 7
+    assert transfer_tensors.block_region_consumer_indices == [
+        3,
+        4,
+        5,
+        6,
+        8,
+        9,
+        10,
+    ]
