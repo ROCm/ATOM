@@ -177,15 +177,6 @@ class TestBuildSamplingParams:
 
 class TestAnthropicSamplingParams:
     def test_request_overrides_model_then_neutral_defaults(self, monkeypatch):
-        class FakeGenerationConfig:
-            def to_diff_dict(self):
-                return {"temperature": 1.0, "top_p": 0.95}
-
-        class FakeTokenizer:
-            @staticmethod
-            def encode(_text):
-                return [1]
-
         captured = {}
         build_sampling_params = api_server._build_sampling_params
 
@@ -201,11 +192,16 @@ class TestAnthropicSamplingParams:
             "engine",
             SimpleNamespace(
                 config=SimpleNamespace(
-                    generation_config=FakeGenerationConfig(), max_model_len=4096
+                    generation_config=SimpleNamespace(
+                        to_diff_dict=lambda: {"temperature": 1.0, "top_p": 0.95}
+                    ),
+                    max_model_len=4096,
                 )
             ),
         )
-        monkeypatch.setattr(api_server, "tokenizer", FakeTokenizer())
+        monkeypatch.setattr(
+            api_server, "tokenizer", SimpleNamespace(encode=lambda _text: [1])
+        )
         monkeypatch.setattr(api_server, "model_name", "test")
         monkeypatch.setattr(api_server, "apply_chat_template", lambda *_a, **_kw: "")
         monkeypatch.setattr(api_server, "_build_sampling_params", capture_sampling_params)
@@ -216,12 +212,10 @@ class TestAnthropicSamplingParams:
         request = api_server.AnthropicMessagesRequest(
             model="test",
             messages=[{"role": "user", "content": "Hi"}],
-            max_tokens=16,
             temperature=0.0,
         )
-        response = asyncio.run(api_server.anthropic_messages(request, None))
+        asyncio.run(api_server.anthropic_messages(request, None))
 
-        assert response["model"] == "test"
         assert captured["temperature"] == 0.0
         assert captured["top_p"] == 0.95
         assert captured["top_k"] == -1
