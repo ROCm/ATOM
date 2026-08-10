@@ -13,8 +13,10 @@ rather than block the rest of the suite.
 
 from __future__ import annotations
 
+import asyncio
 import sys
 import types
+from types import SimpleNamespace
 
 import pytest
 
@@ -171,6 +173,58 @@ class TestBuildSamplingParams:
                 ignore_eos=False,
                 n=0,
             )
+
+
+class TestAnthropicSamplingParams:
+    def test_request_overrides_model_then_neutral_defaults(self, monkeypatch):
+        class FakeGenerationConfig:
+            def to_diff_dict(self):
+                return {"temperature": 1.0, "top_p": 0.95}
+
+        class FakeTokenizer:
+            @staticmethod
+            def encode(_text):
+                return [1]
+
+        captured = {}
+        build_sampling_params = api_server._build_sampling_params
+
+        def capture_sampling_params(**kwargs):
+            captured.update(kwargs)
+            return build_sampling_params(**kwargs)
+
+        async def fake_nonstream(*_args, **_kwargs):
+            return {"text": "", "num_cached_tokens": 0}
+
+        monkeypatch.setattr(
+            api_server,
+            "engine",
+            SimpleNamespace(
+                config=SimpleNamespace(
+                    generation_config=FakeGenerationConfig(), max_model_len=4096
+                )
+            ),
+        )
+        monkeypatch.setattr(api_server, "tokenizer", FakeTokenizer())
+        monkeypatch.setattr(api_server, "model_name", "test")
+        monkeypatch.setattr(api_server, "apply_chat_template", lambda *_a, **_kw: "")
+        monkeypatch.setattr(api_server, "_build_sampling_params", capture_sampling_params)
+        monkeypatch.setattr(
+            api_server, "_run_nonstream_with_disconnect", fake_nonstream
+        )
+
+        request = api_server.AnthropicMessagesRequest(
+            model="test",
+            messages=[{"role": "user", "content": "Hi"}],
+            max_tokens=16,
+            temperature=0.0,
+        )
+        response = asyncio.run(api_server.anthropic_messages(request, None))
+
+        assert response["model"] == "test"
+        assert captured["temperature"] == 0.0
+        assert captured["top_p"] == 0.95
+        assert captured["top_k"] == -1
 
 
 class TestValidateContextLength:

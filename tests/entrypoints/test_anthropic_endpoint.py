@@ -447,15 +447,6 @@ class TestAnthropicMessagesRequest:
         assert req.stop_sequences == ["STOP"]
         assert len(req.tools) == 1
 
-    def test_explicit_zero_temperature_is_preserved(self):
-        req = AnthropicMessagesRequest(
-            model="test",
-            messages=[AnthropicMessage(role="user", content="Hi")],
-            temperature=0.0,
-        )
-
-        assert req.temperature == 0.0
-
     def test_attribution_header_stripped(self):
         system = [
             {"type": "text", "text": "x-anthropic-billing-header: abc123"},
