@@ -134,6 +134,17 @@ def _load_module(filename: str, module_name: str):
     sys.modules[module_name] = mod
     with _temporary_mocks():
         spec.loader.exec_module(mod)
+        # `quant_spec` resolves its AITER handles on first *use* rather than at
+        # import, so executing the module body is no longer enough to bind
+        # them. Touch them while the stand-ins above are still installed --
+        # afterwards there is no aiter to resolve against on a CPU-only runner.
+        #
+        # Deliberately not left in `sys.modules` instead: a lingering fake
+        # `aiter` would satisfy `pytest.importorskip("aiter")` in the other
+        # test modules, and whether it did would depend on collection order.
+        if hasattr(mod, "QuantType"):
+            _ = mod.QuantType.No
+            _ = mod.d_dtypes.get("fp8")
     return mod
 
 
@@ -755,3 +766,27 @@ class TestConvenienceProperties:
         assert qcfg.quant_type == QuantType.per_Token
         assert qcfg.quant_dtype == FP8
         assert qcfg.is_dynamic is True
+
+
+def test_get_hf_config_restores_qwen3_next_full_attention_interval(monkeypatch):
+    hf = FakeHFConfig(model_type="qwen3_next")
+    config_dict = {
+        "model_type": "qwen3_next",
+        "full_attention_interval": 4,
+    }
+    config_class = MagicMock()
+    config_class.from_pretrained.return_value = hf
+    monkeypatch.setattr(
+        _m.PretrainedConfig,
+        "get_config_dict",
+        staticmethod(lambda _model: (config_dict, {})),
+    )
+    monkeypatch.setattr(
+        _m.AutoConfig,
+        "for_model",
+        MagicMock(return_value=config_class),
+    )
+
+    result = _m.get_hf_config("Qwen/Qwen3-Next-80B-A3B-Thinking")
+
+    assert result.full_attention_interval == 4

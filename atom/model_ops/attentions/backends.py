@@ -11,12 +11,19 @@ if TYPE_CHECKING:
 import numpy as np
 import torch
 from aiter.dist.parallel_state import get_tp_group
+from torch import nn
+
+from atom.distributed.dcp_utils import get_dcp_rank, get_dcp_world_size
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import MLAModules
 from atom.utils import CpuGpuBuffer
-from atom.utils.tbo.ubatch_splitting import UBatchSlice, split_attn_metadata
 from atom.utils.forward_context import AttentionMetaData, AttnState
-from torch import nn
+from atom.utils.tbo.ubatch_splitting import (
+    UBatchSlice,
+    attach_tbo_cpu_lens,
+    split_attn_metadata,
+)
+from atom.utils.tbo.ubatching import tbo_enabled
 
 logger = logging.getLogger("atom")
 T = TypeVar("T", bound="BroadcastableModelInput")
@@ -242,6 +249,8 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         self.device = model_runner.device
         config = model_runner.config
         hf_config = config.hf_config
+        self.dcp_world_size = get_dcp_world_size()
+        self.dcp_rank = get_dcp_rank()
         self.max_num_batched_tokens = model_runner.max_num_batched_tokens
         self.max_bs = model_runner.max_bs
         self.max_num_blocks_per_seq = (
@@ -396,19 +405,36 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
                 continue
             block_table = batch.block_tables[i]
             block_size = self.model_runner.block_size
-            first_blk = cached_seqlen // block_size
-            last_blk = (seqlen - 1) // block_size
-            for blk_idx in range(first_blk, last_blk + 1):
-                blk_start = block_table[blk_idx] * block_size
-                # Offset within block: skip already-cached prefix in first block
-                off_start = cached_seqlen % block_size if blk_idx == first_blk else 0
-                # End within block: partial last block
-                off_end = (
-                    ((seqlen - 1) % block_size) + 1
-                    if blk_idx == last_blk
-                    else block_size
-                )
-                slot_mapping.extend(range(blk_start + off_start, blk_start + off_end))
+            if self.dcp_world_size > 1:
+                virtual_block_size = block_size * self.dcp_world_size
+                for pos in range(cached_seqlen, seqlen):
+                    vb_offset = pos % virtual_block_size
+                    if vb_offset % self.dcp_world_size == self.dcp_rank:
+                        blk_idx = pos // virtual_block_size
+                        local_offset = vb_offset // self.dcp_world_size
+                        slot_mapping.append(
+                            block_table[blk_idx] * block_size + local_offset
+                        )
+                    else:
+                        slot_mapping.append(-1)
+            else:
+                first_blk = cached_seqlen // block_size
+                last_blk = (seqlen - 1) // block_size
+                for blk_idx in range(first_blk, last_blk + 1):
+                    blk_start = block_table[blk_idx] * block_size
+                    # Offset within block: skip already-cached prefix in first block
+                    off_start = (
+                        cached_seqlen % block_size if blk_idx == first_blk else 0
+                    )
+                    # End within block: partial last block
+                    off_end = (
+                        ((seqlen - 1) % block_size) + 1
+                        if blk_idx == last_blk
+                        else block_size
+                    )
+                    slot_mapping.extend(
+                        range(blk_start + off_start, blk_start + off_end)
+                    )
         if has_cached:
             self.prepare_block_tables(batch)
         # Validate metadata consistency
@@ -479,6 +505,26 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
     ) -> AttentionMetaData:
         del ubatch_idx  # only used by builders with per-ubatch plan buffers
         return split_attn_metadata(attn_metadata, ub_slice, padded_bs)
+
+    def _attach_tbo_prefill_cpu_lens(
+        self, attn_metadata: AttentionMetaData, bs: int
+    ) -> None:
+        """Publish CPU (numpy) copies of the per-request length arrays so that
+        split_attn_metadata can recompute per-ubatch max_seqlen_q/k and total_kv
+        on the host with zero device sync.
+        """
+        if not tbo_enabled():
+            return
+        var = self.model_runner.forward_vars
+        attach_tbo_cpu_lens(
+            attn_metadata, "context_lens", var["context_lens"].np[:bs].copy()
+        )
+        attach_tbo_cpu_lens(
+            attn_metadata, "cu_seqlens_q", var["cu_seqlens_q"].np[: bs + 1].copy()
+        )
+        attach_tbo_cpu_lens(
+            attn_metadata, "cu_seqlens_k", var["cu_seqlens_k"].np[: bs + 1].copy()
+        )
 
     def build(self, batch: ScheduledBatch, bs: int):
         is_prefill = batch.total_tokens_num_prefill > 0

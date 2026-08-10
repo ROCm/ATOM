@@ -1,17 +1,19 @@
 # SPDX-License-Identifier: MIT
-# Shared fixtures and module stubs for ATOM unit tests.
-# Must be imported before any atom.* module to avoid triggering heavy imports.
+# Shared fixtures for ATOM unit tests.
+#
+# Nothing here fakes a module. Tests import the same classes the engine
+# imports, so a test cannot pass against an API the engine no longer has --
+# which is what happened while this file hand-built stand-ins for `atom` and
+# `atom.config`: the copy lost `CompilationLevel`, and four test modules
+# silently stopped running on every machine.
+#
+# `atom.config` no longer needs the AITER build to import (`atom.quant_spec`
+# resolves its two AITER handles on first use), and every other third-party
+# import here is a declared dependency, so a plain CPU runner has them.
 
-import importlib
-import importlib.util
-import importlib.machinery
 import sys
-import os
-import types
-import hashlib
 from itertools import count
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -21,98 +23,14 @@ ATOM_ROOT = str(Path(__file__).resolve().parent.parent)
 if ATOM_ROOT not in sys.path:
     sys.path.insert(0, ATOM_ROOT)
 
-# ── 2. Stub the top-level `atom` package so __init__.py never runs ─────────
-# atom/__init__.py imports LLMEngine which pulls in zmq, GPU init, etc.
+# ── 2. Import atom submodules ──────────────────────────────────────────────
 
-_atom_pkg = types.ModuleType("atom")
-_atom_pkg.__path__ = [os.path.join(ATOM_ROOT, "atom")]
-_atom_pkg.__package__ = "atom"
-sys.modules["atom"] = _atom_pkg
+from atom.model_engine.block_manager import BlockManager
+from atom.model_engine.scheduler import Scheduler
+from atom.model_engine.sequence import Sequence
+from atom.sampling_params import SamplingParams
 
-# ── 3. Stub `atom.config` to avoid HuggingFace / torch heavy imports ──────
-
-_atom_config = types.ModuleType("atom.config")
-_atom_config.__package__ = "atom.config"
-
-
-class _StubConfig:
-    """Placeholder so `from atom.config import Config` doesn't fail."""
-
-    pass
-
-
-class _StubKVCacheTensor:
-    """Placeholder for KVCacheTensor."""
-
-    def __init__(self, **kwargs):
-        for k, v in kwargs.items():
-            setattr(self, k, v)
-
-
-class _StubParallelConfig:
-    """Placeholder for ParallelConfig."""
-
-    pass
-
-
-_atom_config.Config = _StubConfig
-_atom_config.KVCacheTensor = _StubKVCacheTensor
-_atom_config.ParallelConfig = _StubParallelConfig
-sys.modules["atom.config"] = _atom_config
-
-# ── 3b. Stub forward_context; Scheduler only needs get_kvconnector in tests ──
-
-_forward_context = types.ModuleType("atom.utils.forward_context")
-_forward_context.__package__ = "atom.utils"
-_forward_context.__spec__ = importlib.machinery.ModuleSpec(
-    "atom.utils.forward_context", loader=None
-)
-_forward_context.get_kvconnector = lambda *args, **kwargs: None
-sys.modules["atom.utils.forward_context"] = _forward_context
-
-# ── 4. Stub zmq / zmq.asyncio if not installed ────────────────────────────
-
-if importlib.util.find_spec("zmq") is None:
-    for _mod_name in ("zmq", "zmq.asyncio"):
-        sys.modules[_mod_name] = MagicMock()
-
-# ── 4b. Stub atom.utils.custom_register to avoid torch.library side effects
-
-_cr = types.ModuleType("atom.utils.custom_register")
-_cr.direct_register_custom_op = lambda **kwargs: None
-sys.modules["atom.utils.custom_register"] = _cr
-
-# ── 5. Stub xxhash with a hashlib-based fallback ──────────────────────────
-
-if importlib.util.find_spec("xxhash") is None:
-    _xxhash_mod = types.ModuleType("xxhash")
-
-    class _XXH64:
-        def __init__(self):
-            self._h = hashlib.sha256()
-
-        def update(self, data):
-            if isinstance(data, (bytes, bytearray, memoryview)):
-                self._h.update(data)
-            else:
-                raise TypeError(
-                    f"expected bytes-like object, got {type(data).__name__}"
-                )
-
-        def intdigest(self):
-            return int.from_bytes(self._h.digest()[:8], "little")
-
-    _xxhash_mod.xxh64 = _XXH64
-    sys.modules["xxhash"] = _xxhash_mod
-
-# ── 6. Now safe to import atom submodules ──────────────────────────────────
-
-from atom.sampling_params import SamplingParams  # noqa: E402
-from atom.model_engine.sequence import Sequence  # noqa: E402
-from atom.model_engine.block_manager import BlockManager  # noqa: E402
-from atom.model_engine.scheduler import Scheduler  # noqa: E402
-
-# ── 7. MockConfig ──────────────────────────────────────────────────────────
+# ── 3. MockConfig ──────────────────────────────────────────────────────────
 
 
 class _MockHFConfig:
@@ -132,30 +50,31 @@ class MockConfig:
     """
 
     def __init__(self, **overrides):
-        defaults = dict(
-            kv_cache_block_size=4,
-            num_kvcache_blocks=10,
-            enable_prefix_caching=False,
-            enable_chunked_prefill=True,
-            max_num_seqs=4,
-            max_num_batched_tokens=64,
-            long_prefill_token_threshold=0,
-            max_model_len=64,
-            bos_token_id=1,
-            eos_token_id=2,
-            stop_token_ids=[],
-            scheduler_delay_factor=0.0,
-            speculative_config=None,
+        defaults = {
+            "kv_cache_block_size": 4,
+            "num_kvcache_blocks": 10,
+            "enable_prefix_caching": False,
+            "enable_chunked_prefill": True,
+            "max_num_seqs": 4,
+            "max_num_batched_tokens": 64,
+            "long_prefill_token_threshold": 0,
+            "decode_context_parallel_size": 1,
+            "max_model_len": 64,
+            "bos_token_id": 1,
+            "eos_token_id": 2,
+            "stop_token_ids": [],
+            "scheduler_delay_factor": 0.0,
+            "speculative_config": None,
             # Scheduler.__init__ reads config.hf_config.architectures for V4
             # SWA-warmup detection; a non-V4 stub keeps that path inert.
-            hf_config=_MockHFConfig(),
-        )
+            "hf_config": _MockHFConfig(),
+        }
         defaults.update(overrides)
         for k, v in defaults.items():
             setattr(self, k, v)
 
 
-# ── 8. Fixtures ────────────────────────────────────────────────────────────
+# ── 4. Fixtures ────────────────────────────────────────────────────────────
 
 
 @pytest.fixture

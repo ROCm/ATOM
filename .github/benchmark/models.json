@@ -3,7 +3,7 @@
     {
       "isl": 1024,
       "osl": 1024,
-      "concurrency": [4, 8, 16, 32, 64, 128, 256, 512, 1024],
+      "concurrency": [4, 8, 16, 32, 64, 128, 256, 512],
       "random_range_ratio": 0.8
     },
     {
@@ -36,11 +36,19 @@
           "conc_max": 256
         },
         {
+          "label": "TBO",
+          "suffix": "-tbo",
+          "extra_args": "--enable-tbo",
+          "env_vars": "GPU_MAX_HW_QUEUES=5\nATOM_NUMA_BIND=1",
+          "conc_min": 64,
+          "conc_max": 256
+        },
+        {
           "label": "DPA",
           "suffix": "-dpa",
           "extra_args": "--enable-dp-attention",
           "conc_min": 64,
-          "conc_max": 1024
+          "conc_max": 2048
         },
         {
           "label": "DPA TBO",
@@ -48,7 +56,7 @@
           "extra_args": "--enable-dp-attention --enable-tbo",
           "env_vars": "GPU_MAX_HW_QUEUES=5\nATOM_NUMA_BIND=1",
           "conc_min": 256,
-          "conc_max": 1024
+          "conc_max": 2048
         },
         {
           "label": "DPA MTP3",
@@ -57,6 +65,15 @@
           "bench_args": "--use-chat-template",
           "conc_min": 64,
           "conc_max": 1024
+        },
+        {
+          "label": "DPA DSpark",
+          "suffix": "-dpa-dspark",
+          "path": "deepseek-ai/DeepSeek-V4-Pro-DSpark",
+          "extra_args": "--method dspark --num-speculative-tokens 7 --cudagraph-mode PIECEWISE --enable-dp-attention --dspark-config '{\"confidence_schedule\": true, \"ragged\": true, \"ragged_graph_sizes\": \"8\"}'",
+          "bench_args": "--use-chat-template",
+          "conc_min": 64,
+          "conc_max": 512
         }
       ]
     },
@@ -155,6 +172,29 @@
         "extra_args": "--gpu-memory-utilization 0.9 --max-model-len 32768 --max-num-batched-tokens 32768 --no-enable_prefix_caching --online_quant_config '{\"global_quant_config\": \"\", \"layer_quant_config\": {\"model.layers.*.self_attn.fused_qkv_a_proj\": \"ptpc_fp8\", \"model.layers.*.self_attn.q_b_proj\": \"ptpc_fp8\", \"model.layers.*.self_attn.kv_b_proj\": \"ptpc_fp8\", \"model.layers.*.self_attn.o_proj\": \"ptpc_fp8\"}}'"
       },
       "variants": [{ "label": "", "suffix": "", "conc_max": 256 }]
+    },
+    {
+      "display": "Kimi-K3",
+      "path": "moonshotai/Kimi-K3",
+      "prefix": "kimi-k3",
+      "runner": "atom-mi355-8gpu.predownload",
+      "env_vars": "",
+      "config": {
+        "tp": 8,
+        "kv_cache_dtype": "fp8",
+        "trust_remote_code": true,
+        "extra_args": "--gpu-memory-utilization 0.93 --block-size 128 --no-enable_prefix_caching"
+      },
+      "variants": [
+        { "label": "", "suffix": "", "conc_max": 256 },
+        {
+          "label": "DSpark",
+          "suffix": "-dspark",
+          "extra_args": "--method dspark --draft-model Inferact/Kimi-K3-DSpark --num-speculative-tokens 7 --max-num-seqs 64",
+          "bench_args": "--use-chat-template",
+          "conc_max": 256
+        }
+      ]
     },
     {
       "display": "MiniMax-M3-MXFP8",

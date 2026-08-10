@@ -25,9 +25,7 @@ support_model_arch_dict = {
 
 ATOM resolves the HuggingFace `architectures` field from a model's `config.json` against this dictionary. If the architecture string matches a key, ATOM imports and instantiates the corresponding class.
 
----
-
-## 1. Supported Model Architectures
+## Supported model architectures
 
 | HF Architecture | ATOM Module | ATOM Class | MoE | MLA | Key Features |
 |---|---|---|---|---|---|
@@ -44,17 +42,15 @@ ATOM resolves the HuggingFace `architectures` field from a model's `config.json`
 | `Glm4MoeForCausalLM` | `atom.models.glm4_moe` | `Glm4MoeForCausalLM` | Yes | No | GQA, partial RoPE (0.5 factor), QK norm, shared+routed experts, sigmoid scoring, grouped top-k |
 | `Qwen3NextForCausalLM` | `atom.models.qwen3_next` | `Qwen3NextForCausalLM` | Yes | No | Hybrid architecture: full attention + Gated DeltaNet linear attention, GQA, QK norm, FusedMoE |
 
-**Note:** `DeepSeekMTP` (`atom.models.deepseek_mtp.DeepSeekMTP`), `Qwen3NextMTP` (`atom.models.qwen3_next_mtp.Qwen3NextMTP`), and `Qwen3_5MTP` (`atom.models.qwen3_5_mtp.Qwen3_5MTP`) are not in the registry -- they are used exclusively as speculative draft models and are loaded separately via `EagleProposer`.
+**Note:** `DeepSeekMTP` (`atom.models.deepseek_mtp.DeepSeekMTP`), `Qwen3NextMTP` (`atom.models.qwen3_next_mtp.Qwen3NextMTP`), and `Qwen3_5MTP` (`atom.models.qwen3_5_mtp.Qwen3_5MTP`) are not in the registry — they are used exclusively as speculative draft models and are loaded separately via `EagleProposer`.
 
----
-
-## 2. Model Architecture Details
+## Model architecture details
 
 ### Qwen3 (`Qwen3ForCausalLM`)
 
 - **Architecture:** Dense transformer with Grouped-Query Attention (GQA).
 - **Layer structure:** `Qwen3DecoderLayer` containing `Qwen3Attention` + `Qwen3MLP`.
-- **Attention:** `QKVParallelLinear` for fused QKV projection, per-head QK RMSNorm (`q_norm`, `k_norm`), RoPE, `RowParallelLinear` for output projection.
+- **Attention:** `QKVParallelLinear` for fused QKV projection, per-head QK RMSNorm (`q_norm`, `k_norm`), RoPE, `RowParallelLinear` for output projection. Supports QK norm + RoPE + cache + quant fusion when `ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION` is set.
 - **MLP:** `MergedColumnParallelLinear` for gate+up projection, SiLU activation, `RowParallelLinear` for down projection.
 - **Normalization:** RMSNorm on input and post-attention.
 
@@ -62,7 +58,7 @@ ATOM resolves the HuggingFace `architectures` field from a model's `config.json`
 
 - **Architecture:** Mixture-of-Experts transformer with GQA.
 - **Layer structure:** `Qwen3MoeDecoderLayer` containing `Qwen3MoeAttention` + either `Qwen3MoeSparseMoeBlock` (MoE layers) or `Qwen3MoeMLP` (dense layers, controlled by `mlp_only_layers` and `decoder_sparse_step`).
-- **Attention:** Same QKV structure as Qwen3 with QK norm. Supports QK norm + RoPE + cache + quant fusion when `ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION` is set -- this precomputes a joint `cos_sin_cache` and passes `q_norm`/`k_norm` to the `Attention` module.
+- **Attention:** Same QKV structure as Qwen3 with QK norm. Supports QK norm + RoPE + cache + quant fusion when `ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION` is set — this precomputes a joint `cos_sin_cache` and passes `q_norm`/`k_norm` to the `Attention` module.
 - **MoE:** `FusedMoE` with `ReplicatedLinear` gate router. Supports allreduce+RMSNorm fusion (`ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION`).
 - **Normalization:** RMSNorm with optional fused allreduce.
 
@@ -73,8 +69,8 @@ ATOM resolves the HuggingFace `architectures` field from a model's `config.json`
 - **Attention:** `QKVParallelLinear`, RoPE (NeoX or original style based on GGUF), per-layer sliding window support via `layer_types` config.
 - **MLP:** `MergedColumnParallelLinear` for gate+up, SiLU+mul activation, `RowParallelLinear` for down.
 - **Fused optimizations:** Controlled by environment variables:
-  - `ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT` -- fuses RMSNorm with FP8/MXFP4 quantization.
-  - `ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT` -- fuses SiLU+mul activation with quantization.
+  - `ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT` — fuses RMSNorm with FP8/MXFP4 quantization.
+  - `ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT` — fuses SiLU+mul activation with quantization.
 - **Pipeline parallelism:** Full PP support with `PPMissingLayer` placeholders and `IntermediateTensors` for cross-stage communication. Supports auxiliary hidden state extraction for speculative decoding.
 
 ### Mixtral (`MixtralForCausalLM`)
@@ -92,9 +88,9 @@ ATOM resolves the HuggingFace `architectures` field from a model's `config.json`
 - **MLA Attention:** Uses LoRA-compressed QKV (`q_lora_rank`, `kv_lora_rank`), separate `qk_nope_head_dim` and `qk_rope_head_dim` for non-positional and rotary-embedded components. Backed by `MLAModules` from `atom.model_ops.attention_mla`.
 - **MoE:** `DeepseekV2MoE` with routed + shared experts. Supports shared expert fusion (`is_rocm_aiter_fusion_shared_expert_enabled`), routed scaling factor fusion (`is_rocm_aiter_fuse_routed_scaling_factor`), and grouped top-k routing.
 - **Fused optimizations:**
-  - `ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION` -- fuses input RMSNorm with FP8/FP4 quantization.
-  - `ATOM_ENABLE_DS_QKNORM_QUANT_FUSION` -- fuses QK norm with quantization.
-  - `ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION` -- fuses allreduce with RMSNorm.
+  - `ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION` — fuses input RMSNorm with FP8/FP4 quantization.
+  - `ATOM_ENABLE_DS_QKNORM_QUANT_FUSION` — fuses QK norm with quantization.
+  - `ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION` — fuses allreduce with RMSNorm.
   - Dedicated Triton kernels for FP8 MQA logits (`fp8_mqa_logits`), paged MQA logits (`deepgemm_fp8_paged_mqa_logits`), and fused RMSNorm+quantization (`_fuse_rmsnorm_quant`).
 - **V3.2 extension:** `DeepseekV32ForCausalLM` is an alias. The `DeepseekV2Model` detects V3.2 via `config.index_topk`; the indexer computes top-k rows as per-forward scratch and the MLA path packs them into sparse attention metadata.
 - **Note:** `DeepseekV3ForCausalLM` is a subclass of `DeepseekV2ForCausalLM` (pass-through, no override).
@@ -102,7 +98,7 @@ ATOM resolves the HuggingFace `architectures` field from a model's `config.json`
 ### DeepSeek MTP (`DeepSeekMTP`)
 
 - **Architecture:** Multi-Token Prediction draft model for speculative decoding.
-- **Layer structure:** `DeepSeekMultiTokenPredictor` containing one or more `DeepSeekMultiTokenPredictorLayer`, each with `enorm` (embedding norm), `hnorm` (hidden state norm), `eh_proj` (linear projection joining embedded+hidden), `mtp_block` (a `DeepseekV2DecoderLayer`), and a `SharedHead` (norm + LM head).
+- **Layer structure:** `DeepSeekMultiTokenPredictor` containing one or more `DeepSeekMultiTokenPredictorLayer`, each with `enorm` (embedding norm), `hnorm` (hidden state norm), `eh_proj` (linear projection joining embedded+hidden), `mtp_block` (a `DeepseekV2DecoderLayer`), and a `SharedHead` (norm + LM head; the norm runs at the end of the layer's `forward`, see below).
 - **Usage:** Not registered in `support_model_arch_dict`. Loaded separately with `spec_decode=True` in `load_model()`, which invokes `rewrite_spec_layer_name()` to remap MTP weight names (e.g., adding `.mtp_block.` prefix for transformer layer weights, remapping `embed_tokens` to top-level).
 - **MTP layers start** at `config.num_hidden_layers` (i.e., the layer indices following the main model layers).
 
@@ -158,29 +154,39 @@ ATOM resolves the HuggingFace `architectures` field from a model's `config.json`
 - **Performance:** Typical acceptance rates of ~94% for MTP1 and ~83% for MTP3, with draft token generation overhead of ~1.94 and ~3.49 tokens per forward pass respectively.
 - **Attention metadata:** Since MTP only uses full attention (not MLA), the attention builder calls `prepare_mtp_decode()` with block table and context length updates (unlike MLA which uses kv_indptr).
 
----
+## Weight loading
 
-## 3. Weight Loading
+`load_model()` in `atom/model_loader/loader.py` handles weight loading. It binds the pieces that need AITER — the TP group, the quant-config-driven shared-expert fusion decision, the safetensors iterator — and owns post-load weight processing; everything else lives in modules that import nothing but torch, so they are unit-testable on a runner with no GPU build:
 
-Weight loading is handled by `load_model()` in `atom/model_loader/loader.py`.
+| Module | Responsibility |
+|--------|----------------|
+| `atom/model_loader/loading_core.py` | `load_weights_into_model`: the loading loop, thread pool and post-load coverage report |
+| `atom/model_loader/weight_names.py` | `WeightsMapper` and `CheckpointNameRewriter`: on-disk name → parameter name |
+| `atom/model_loader/weight_dispatch.py` | `WeightDispatcher`: which of the five write paths a tensor takes |
+| `atom/model_loader/expert_staging.py` | `ExpertStagingPool`: batched MoE expert staging (see below) |
+| `atom/model_ops/fused_moe/expert_layout.py` | expert slot layout shared by the loader and `FusedMoE` |
 
-### Function Signature
+### Function signature
 
 ```python
 def load_model(
     model: nn.Module,
     model_name_or_path: str,
     hf_config: AutoConfig,
-    load_dummy: bool = False,
+    load_dummy: Optional[str] = None,
     spec_decode: bool = False,
 ):
 ```
 
-### Loading Flow
+### Loading flow
 
-1. **SafeTensors iteration:** `safetensors_weights_iterator()` discovers and iterates over all `*.safetensors` files in the model directory (or downloads them from HuggingFace Hub via `download_weights_from_hf()`). Duplicate files are filtered using the `model.safetensors.index.json` weight map. Memory-mapped loading is used by default; set `ATOM_DISABLE_MMAP=true` to disable.
+1. **SafeTensors iteration:** `safetensors_weights_iterator()` discovers and iterates over all `*.safetensors` files in the model directory (or downloads them from HuggingFace Hub via `download_weights_from_hf()`). Duplicate files are filtered using the `model.safetensors.index.json` weight map. ATOM uses memory-mapped loading by default; set `ATOM_DISABLE_MMAP=true` to disable.
 
-2. **Weight name rewriting:** Each weight name goes through several transformations:
+   The iterator takes a `wants(name)` predicate so a tensor can be rejected before it is materialized — step 2 below is what answers it. A shard holding nothing wanted is skipped without being read, decided from the safetensors header alone. This matters for a drafter load, which reads the *target's* checkpoint to pick out the MTP block and discards the rest: for DeepSeek-V4-Flash that is 1 shard out of 46. Without mmap (`ATOM_DISABLE_MMAP=true`, which CI sets) each shard is otherwise read and deserialized whole, so the discarded work is real — that pass drops from 26s to 1s.
+
+   Within a shard that *is* read, the non-mmap path still deserializes every tensor in it, because `safetensors.torch.load` has no partial API; the predicate only suppresses the yield.
+
+2. **Weight name rewriting:** `CheckpointNameRewriter` turns an on-disk name into the parameter name it belongs to, returning `None` for a tensor this model does not want — which is also what decides whether a shard gets read at all (step 1). Each weight name goes through several transformations:
    - `weight_scale_inv` is renamed to `weight_scale`.
    - Model-specific `weights_mapping` (e.g., GPT-OSS maps `gate_up_proj_blocks` to `w13_weight`).
    - For speculative decoding (`spec_decode=True`), MTP layer weights are rewritten via `rewrite_spec_layer_name()`.
@@ -196,25 +202,37 @@ def load_model(
    ```
    Each packed parameter has a `weight_loader` attribute that knows how to shard and place the weight into the correct slice.
 
-4. **Expert parameter loading:** If the model has a `get_expert_mapping()` method, expert weights are loaded using `FusedMoE.make_expert_params_mapping()`, which generates (param_name, weight_name, expert_id, shard_id) tuples. This handles per-expert sharding across TP ranks.
+4. **Expert parameter loading:** If the model has a `get_expert_mapping()` method, expert weights are loaded using `FusedMoE.make_expert_params_mapping()`, which generates (param_name, weight_name, expert_id, shard_id) tuples. This handles per-expert sharding across TP ranks. Each expert shard is then placed either through the per-expert `FusedMoE.weight_loader` or, when the parallel loader is enabled, the batched staging path (see [Batched Expert Staging](#batched-expert-staging)). Checkpoints that stack all routed experts of a layer into one tensor instead go through the model's own `load_fused_expert_weights`, which writes them directly.
 
 5. **TP sharding:** Parallel linear layers (`ColumnParallelLinear`, `RowParallelLinear`, `QKVParallelLinear`) have custom `weight_loader` methods that automatically select the correct shard for the current TP rank during loading. The default fallback `default_weight_loader` handles simple cases where weights need to be sliced by TP rank.
 
-6. **Concurrent loading:** All weight loading calls are submitted to a `ThreadPoolExecutor` for parallel execution.
+6. **Concurrent loading:** Controlled by `ATOM_LOADER_NUM_THREADS` (default `16`). A value `>1` runs loads on a `ThreadPoolExecutor` of that many workers and routes MoE expert weights through the batched staging path (see [Batched Expert Staging](#batched-expert-staging)); `1` loads sequentially and sends every expert through the per-expert `weight_loader` path.
 
 7. **Post-processing:** After all weights are loaded, `process_weights_after_loading()` is called on each module (e.g., for weight pre-shuffling, scale computation), and `quant_method.process_weights_after_loading()` is invoked for quantized modules. For `FusedMoEMethodBase`, `init_prepare_finalize()` is also called.
 
-### Layers Beyond `num_hidden_layers`
+### Batched expert staging
+
+On large MoE checkpoints each expert's weight arrives as a separate tensor, so the per-expert `weight_loader` issues one small H2D copy per (expert, shard). When the parallel loader is enabled (`ATOM_LOADER_NUM_THREADS > 1`), `ExpertStagingPool` collects them in a CPU buffer shaped like the fused parameter and writes the result back in one copy.
+
+**Ownership rule:** the pool writes back only the (expert slot, shard) regions it actually staged. Other loader paths may write the same parameter as long as they touch different regions — a checkpoint that stores routed experts as one stacked tensor loads them directly while the shared expert comes through the per-expert path. Before writing such a parameter, those paths call `ExpertStagingPool.decline`, which hands the parameter over after writing back whatever had already been staged.
+
+What the pool does and does not own:
+
+- **Routed base experts only.** `expected_batched_arrivals` counts them and nothing else. A fused shared expert is three tensors per layer and skips staging entirely (`is_batched_expert_slot`); EPLB redundant replicas are populated by `fill_redundant` after loading.
+- **One large copy when the batch is complete.** `flush_staged` copies slots `[0, n_base)` in one go when every routed base slot arrived, and falls back to per-region copies otherwise. It also zeroes the redundant slots, which `process_weights_after_loading` reads before `fill_redundant` fills them.
+- **Region granularity, not byte.** `_load_w13` / `_load_w2` narrow further to the checkpoint shard's width when a parameter is padded (MXFP4 alignment); the padding tail is zero on both sides, since staging buffers are zero-initialised and MXFP4 parameters are zeroed in `create_weights`.
+
+If a parameter never receives every routed base expert, loading raises a `RuntimeError` naming the parameter and how many (slot, shard) regions arrived. Set `ATOM_LOADER_STRICT_COVERAGE=false` to downgrade that to a warning and load anyway, leaving those slots at their init values.
+
+### Layers beyond `num_hidden_layers`
 
 Weights for layers with index >= `config.num_hidden_layers` are skipped during normal loading. These layers (MTP layers) are only loaded when `spec_decode=True`.
 
----
-
-## 4. Adding a New Model
+## Adding a new model
 
 Follow these steps to add support for a new model architecture:
 
-### Step 1: Create the Model File
+### Step 1: Create the model file
 
 Create a new file in `atom/models/`, e.g., `atom/models/my_model.py`. Follow the existing patterns:
 
@@ -238,7 +256,7 @@ from atom.models.utils import (
 from atom.utils.decorators import support_torch_compile
 ```
 
-### Step 2: Implement Layer Classes
+### Step 2: Implement layer classes
 
 Each model typically defines three core module classes:
 
@@ -257,7 +275,7 @@ Each model typically defines three core module classes:
    - Combine attention + MLP with RMSNorm layers.
    - Implement the forward pass with residual connections.
 
-### Step 3: Implement the Model and CausalLM Classes
+### Step 3: Implement the model and CausalLM classes
 
 1. **Backbone model** (e.g., `MyModel`):
    - Decorate with `@support_torch_compile`.
@@ -270,7 +288,7 @@ Each model typically defines three core module classes:
    - Implement `forward()` (returns hidden states) and `compute_logits()` (returns logits via `lm_head`).
    - If the model uses MoE, implement `get_expert_mapping()` returning `FusedMoE.make_expert_params_mapping(...)`.
 
-### Step 4: Register the Model
+### Step 4: Register the model
 
 Add an entry to `support_model_arch_dict` in `atom/model_engine/model_runner.py`:
 
@@ -283,7 +301,7 @@ support_model_arch_dict = {
 
 The key must exactly match the `architectures` field in the HuggingFace model's `config.json`.
 
-### Step 5: Handle Weight Loading
+### Step 5: Handle weight loading
 
 Ensure your `packed_modules_mapping` correctly maps all checkpoint weight names that differ from ATOM's internal names. Common patterns:
 
@@ -299,11 +317,9 @@ For MoE models, add `get_expert_mapping()` to delegate to `FusedMoE.make_expert_
 
 If the checkpoint uses non-standard weight names (like GPT-OSS), define a `weights_mapping` class attribute to rename them at load time.
 
----
+## Model-specific optimizations
 
-## 5. Model-Specific Optimizations
-
-### Llama: Fused RMSNorm+Quant and SiLU+Mul+Quant
+### Llama: fused RMSNorm+Quant and SiLU+Mul+Quant
 
 Llama supports two AITER Triton fused kernel optimizations:
 
@@ -313,7 +329,7 @@ Llama supports two AITER Triton fused kernel optimizations:
 
 Both are controlled by environment variables and read from `atom.utils.envs`.
 
-### DeepSeek V2/V3: MLA + Fused Input Norm + QK Norm Fusion
+### DeepSeek V2/V3: MLA + fused input norm + QK norm fusion
 
 DeepSeek models use Multi-head Latent Attention (MLA) with LoRA-compressed projections (`q_lora_rank`, `kv_lora_rank`). Several fusion optimizations are available:
 
@@ -327,7 +343,7 @@ DeepSeek models use Multi-head Latent Attention (MLA) with LoRA-compressed proje
 
 - **FP4 support**: MXFP4 quantized GEMM kernels (`gemm_afp4wfp4_preshuffle`, `gemm_a16wfp4_preshuffle`) and FP4 block-scale BMM via `is_rocm_aiter_fp4bmm_enabled()`.
 
-### Qwen3-MoE: QK Norm + RoPE + Cache + Quant Fusion
+### Qwen3-MoE: QK norm + RoPE + cache + quant fusion
 
 When `ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION` is enabled, the `Qwen3MoeAttention` module:
 1. Precomputes a joint `cos_sin_cache` by concatenating cosine and sine RoPE caches.
@@ -336,13 +352,13 @@ When `ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION` is enabled, the `Qwen3MoeAtte
 
 Additionally, `ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION` fuses allreduce with RMSNorm for both attention output and MoE output, reducing communication overhead.
 
-### MTP: Multi-Token Prediction (Speculative Decoding)
+### MTP: Multi-token prediction (speculative decoding)
 
 Multi-Token Prediction (MTP) models serve as lightweight draft models for speculative decoding, proposing multiple tokens per forward pass to improve throughput while maintaining accuracy through rejection sampling. ATOM supports three MTP variants:
 
 **DeepSeekMTP** (`DeepSeekMTP`):
 - Each `DeepSeekMultiTokenPredictorLayer` takes the previous hidden state and the next token's embedding, normalizes both (`enorm`, `hnorm`), concatenates them, and passes through a linear projection (`eh_proj`) followed by a standard `DeepseekV2DecoderLayer`.
-- The `SharedHead` provides per-layer norm + LM head for logit computation (one shared head per MTP layer).
+- The `SharedHead` provides a per-layer norm + LM head (one shared head per MTP layer). The norm is applied at the **end of the layer's `forward`**, not in `compute_logits`: draft step 0 consumes the target's post-final-norm hidden, so steps 1+ must consume the draft's post-final-norm hidden too. `compute_logits` / `compute_draft_ids` therefore take an already-normed input and are a bare head.
 - For FP4 quantized main models, MTP blocks fall back to non-FP4 quantization config to maintain draft model accuracy.
 
 **Qwen3NextMTP** (`Qwen3NextMTP`):
@@ -361,9 +377,7 @@ Multi-Token Prediction (MTP) models serve as lightweight draft models for specul
 - Each MTP variant uses `num_speculative_tokens` to control the number of draft tokens (e.g., MTP1 = 1 token, MTP3 = 3 tokens).
 - Attention metadata is updated incrementally: MLA models use `kv_indptr` tracking, while hybrid/GDN models (Qwen3.5 MTP) use block tables and context length updates.
 
----
-
-## Source Files
+## Source files
 
 | File | Description |
 |------|-------------|
@@ -381,5 +395,6 @@ Multi-Token Prediction (MTP) models serve as lightweight draft models for specul
 | `atom/models/qwen3_next_mtp.py` | Qwen3-Next MTP draft model |
 | `atom/models/qwen3_5_mtp.py` | Qwen3.5 MTP draft model: `Qwen3_5MTP`, `Qwen3_5MultiTokenPredictor` |
 | `atom/models/utils.py` | Model utilities: `IntermediateTensors`, `PPMissingLayer`, `make_layers`, `maybe_prefix`, `extract_layer_index` |
-| `atom/model_loader/loader.py` | Weight loading: `load_model`, `safetensors_weights_iterator`, `default_weight_loader` |
+| `atom/model_loader/loader.py` | Public API: `load_model`, `default_weight_loader`; binds the AITER-dependent pieces and runs post-load processing |
+| `atom/model_loader/weight_iterator.py` | `safetensors_weights_iterator`: reads shards, skipping what the caller does not want |
 | `atom/model_loader/weight_utils.py` | Weight utilities: `download_weights_from_hf`, `set_weight_attrs`, `filter_duplicate_safetensors_files` |

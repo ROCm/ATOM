@@ -12,6 +12,8 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.utils.decorators import mark_trace
+
 
 @triton.jit
 def _inverse_rope_gptj_kernel(
@@ -70,11 +72,13 @@ def _inverse_rope_gptj_kernel(
     tl.store(x_ptr + x_offs, out, mask=x_mask)
 
 
+@mark_trace
 def inverse_rope_inplace(
     x: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
     positions: torch.Tensor,
+    prefix: str = "",
 ) -> None:
     """In-place inverse RoPE (GPT-J style) on the rope slice of attention output.
 

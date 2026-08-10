@@ -6,7 +6,7 @@ import copy
 import logging
 from contextlib import ExitStack
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 import torch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -28,11 +28,11 @@ def _is_dummy_forward(forward_batch: ForwardBatch) -> bool:
 
 
 def _pad_dummy_like(
-    tensor: Optional[torch.Tensor],
+    tensor: torch.Tensor | None,
     *,
     length: int,
-    fill_value: int | float = 0,
-) -> Optional[torch.Tensor]:
+    fill_value: float = 0,
+) -> torch.Tensor | None:
     if tensor is None:
         return None
     shape = (length, *tensor.shape[1:])
@@ -40,14 +40,14 @@ def _pad_dummy_like(
 
 
 def _materialize_atom_dummy_forward(
-    input_ids: Optional[torch.Tensor],
-    positions: Optional[torch.Tensor],
-    input_embeds: Optional[torch.Tensor],
+    input_ids: torch.Tensor | None,
+    positions: torch.Tensor | None,
+    input_embeds: torch.Tensor | None,
     forward_batch: ForwardBatch,
 ) -> tuple[
-    Optional[torch.Tensor],
-    Optional[torch.Tensor],
-    Optional[torch.Tensor],
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
     ForwardBatch,
 ]:
     """Convert an empty SGLang IDLE batch into ATOM-style dummy inputs."""
@@ -125,6 +125,46 @@ def _resolve_num_tokens_across_dp(
     return num_tokens_across_dp
 
 
+def _max_len_from_optional(cpu_lens, gpu_lens, default: int) -> int:
+    if cpu_lens is not None:
+        if isinstance(cpu_lens, torch.Tensor):
+            return int(cpu_lens.max().item()) if cpu_lens.numel() else default
+        return max((int(x) for x in cpu_lens), default=default)
+    if gpu_lens is not None:
+        return int(gpu_lens.max().item()) if gpu_lens.numel() else default
+    return default
+
+
+def _build_generic_attention_metadata(forward_batch: ForwardBatch, max_seqlen_q: int):
+    """Build minimal ATOM metadata from SGLang batch fields for non-V4 models."""
+
+    from atom.utils.forward_context import AttentionMetaData
+
+    # GLM/DSA SGLang plugin attention kernels read detailed scheduling metadata
+    # directly from SGLang's forward_batch.  ATOM's model-level PCP gate,
+    # however, runs before those kernels and checks
+    # get_forward_context().attn_metadata.max_seqlen_k in deepseek_v2._pcp_active().
+    # Without this fallback metadata, max_seqlen_k stays at AttentionMetaData's
+    # default 0 and long-prefill PCP never activates.
+    forward_mode = forward_batch.forward_mode
+    seq_lens = getattr(forward_batch, "seq_lens", None)
+    seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+    extend_seq_lens = getattr(forward_batch, "extend_seq_lens", None)
+    extend_seq_lens_cpu = getattr(forward_batch, "extend_seq_lens_cpu", None)
+
+    if not forward_mode.is_decode_or_idle():
+        max_seqlen_q = _max_len_from_optional(
+            extend_seq_lens_cpu, extend_seq_lens, max_seqlen_q
+        )
+    max_seqlen_k = _max_len_from_optional(seq_lens_cpu, seq_lens, 0)
+
+    return AttentionMetaData(
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        context_lens=seq_lens,
+    )
+
+
 def _slice_v4_graph_metadata_for_capture(
     attn_metadata: Any, *, num_tokens: int, bs: int
 ):
@@ -147,7 +187,7 @@ def _slice_v4_graph_metadata_for_capture(
         elif value is not None:
             try:
                 setattr(md, name, value[:n])
-            except Exception:
+            except Exception:  # noqa: BLE001, S110 - optional metadata field
                 pass
 
     for name in (
@@ -217,7 +257,7 @@ def _slice_v4_graph_metadata_for_capture(
 def _is_current_stream_capturing() -> bool:
     try:
         return bool(torch.cuda.is_current_stream_capturing())
-    except Exception:
+    except Exception:  # noqa: BLE001 - HIP compatibility fallback
         return False
 
 
@@ -226,7 +266,7 @@ def _get_sglang_attention_backend():
         from sglang.srt.model_executor.forward_context import get_attn_backend
 
         return get_attn_backend()
-    except Exception:
+    except Exception:  # noqa: BLE001 - SGLang version compatibility
         return None
 
 
@@ -238,6 +278,8 @@ def _build_glm52_dsa_metadata(
     hf_config = getattr(atom_config, "hf_config", None)
     if _is_dummy_forward(forward_batch) or hf_config is None:
         return None
+    if bool(getattr(forward_batch, "_atom_glm52_generic_draft_frontend", False)):
+        return None
 
     from atom.plugin.sglang.runtime.model_arch import is_glm52_dsa_config
 
@@ -246,25 +288,64 @@ def _build_glm52_dsa_metadata(
 
     from atom.plugin.sglang.glm52_dsa_bridge import (
         build_atom_glm52_attention_metadata_from_sglang,
-        maybe_get_glm52_dsa_pools_from_sglang_backend,
+        get_draft_decode_sub_step,
+        is_draft_decode_metadata,
     )
 
-    attn_metadata = getattr(forward_batch, "atom_glm52_graph_metadata", None)
-    if attn_metadata is None:
-        backend = _get_sglang_attention_backend()
-        attn_metadata = getattr(backend, "atom_glm52_graph_metadata", None)
-
     is_capture_batch = _is_current_stream_capturing()
-    if attn_metadata is None and is_capture_batch:
+    from atom.plugin.sglang.runtime.attention_backend_resolver import (
+        resolve_sglang_runtime,
+    )
+
+    runtime_objects = resolve_sglang_runtime(forward_batch)
+    backend = runtime_objects.attn_backend
+    token_to_kv_pool = runtime_objects.token_to_kv_pool
+    req_to_token_pool = runtime_objects.req_to_token_pool
+    is_draft_decode = is_draft_decode_metadata(forward_batch)
+    is_target_verify = bool(
+        getattr(forward_batch.forward_mode, "is_target_verify", lambda: False)()
+    )
+    is_plain_decode = (
+        forward_batch.forward_mode.is_decode_or_idle() and not is_draft_decode
+    )
+    attn_metadata = (
+        getattr(forward_batch, "atom_glm52_graph_metadata", None)
+        if is_target_verify or is_plain_decode
+        else None
+    )
+    if attn_metadata is None and is_plain_decode:
+        attn_metadata = getattr(backend, "atom_glm52_graph_metadata", None)
+    if attn_metadata is None and is_target_verify and is_capture_batch:
+        batch_backend = getattr(forward_batch, "attn_backend", None)
+        attn_metadata = getattr(batch_backend, "atom_glm52_graph_metadata", None)
+    if attn_metadata is None and is_target_verify and is_capture_batch:
+        attn_metadata = getattr(backend, "atom_glm52_graph_metadata", None)
+    graph_cache = None
+    graph_cache_key = None
+    if is_draft_decode and token_to_kv_pool is not None:
+        graph_cache = getattr(
+            token_to_kv_pool, "_atom_glm52_draft_decode_graph_metadata", None
+        )
+        graph_cache_key = (
+            int(forward_batch.batch_size),
+            get_draft_decode_sub_step(forward_batch),
+        )
+        if is_capture_batch:
+            cached_metadata = (
+                graph_cache.get(graph_cache_key) if graph_cache is not None else None
+            )
+            if cached_metadata is None:
+                raise RuntimeError(
+                    "Missing fixed GLM-5.2 draft graph metadata for "
+                    f"batch/substep={graph_cache_key}"
+                )
+            attn_metadata = cached_metadata
+    elif attn_metadata is None and is_capture_batch and is_target_verify:
         from atom.plugin.sglang.attention_backend.glm52_dsa_backend import (
             ATOMGLM52DSABackendForSgl,
         )
 
         attn_metadata = ATOMGLM52DSABackendForSgl._last_atom_glm52_graph_metadata
-
-    token_to_kv_pool, req_to_token_pool = maybe_get_glm52_dsa_pools_from_sglang_backend(
-        forward_batch
-    )
     if (
         attn_metadata is None
         and token_to_kv_pool is not None
@@ -281,7 +362,148 @@ def _build_glm52_dsa_metadata(
             req_to_token_pool=req_to_token_pool,
             atom_config=atom_config,
         )
+        if is_draft_decode:
+            try:
+                from sglang.srt.model_executor.cuda_graph_runner import (
+                    get_is_capture_mode,
+                )
+
+                in_graph_warmup = get_is_capture_mode()
+            except Exception:  # noqa: BLE001 - SGLang version compatibility
+                in_graph_warmup = False
+            if in_graph_warmup and graph_cache_key is not None:
+                if graph_cache is None:
+                    graph_cache = {}
+                    token_to_kv_pool._atom_glm52_draft_decode_graph_metadata = (
+                        graph_cache
+                    )
+                graph_cache[graph_cache_key] = attn_metadata
     return attn_metadata
+
+
+def stage_glm52_draft_decode_graph_metadata(
+    forward_batch: ForwardBatch,
+    *,
+    speculative_num_steps: int,
+    topk: int,
+) -> None:
+    """Stage current draft-decode routing into fixed graph metadata tensors."""
+    from atom.config import get_current_atom_config
+    from atom.plugin.sglang.glm52_dsa_bridge import (
+        build_atom_glm52_attention_metadata_from_sglang,
+        clear_draft_decode_sub_step,
+        set_draft_decode_sub_step,
+    )
+    from atom.plugin.sglang.runtime.attention_backend_resolver import (
+        resolve_sglang_runtime,
+    )
+
+    runtime_objects = resolve_sglang_runtime(forward_batch)
+    token_to_kv_pool = runtime_objects.token_to_kv_pool
+    req_to_token_pool = runtime_objects.req_to_token_pool
+    cache = getattr(token_to_kv_pool, "_atom_glm52_draft_decode_graph_metadata", None)
+    if not cache:
+        raise RuntimeError("GLM-5.2 draft-decode graph metadata cache is empty")
+
+    bs = int(forward_batch.batch_size)
+    original_out_cache_loc = forward_batch.out_cache_loc
+    original_positions = forward_batch.positions
+    out_cache_rows = (
+        original_out_cache_loc.reshape(bs, int(topk), int(speculative_num_steps))
+        .permute(2, 0, 1)
+        .reshape(int(speculative_num_steps), -1)
+    )
+    tensor_fields = (
+        "cu_seqlens_q",
+        "cu_seqlens_k",
+        "slot_mapping",
+        "context_lens",
+        "block_tables",
+        "kv_indptr",
+        "kv_indices",
+        "kv_last_page_lens",
+        "sparse_kv_indptr",
+        "sparse_kv_last_page_lens",
+        "sparse_cu_seqlens_q",
+        "token_to_seq_idxs",
+        "work_meta_data",
+        "work_indptr",
+        "work_info_set",
+        "reduce_indptr",
+        "reduce_final_map",
+        "reduce_partial_map",
+    )
+
+    try:
+        for sub_step in range(int(speculative_num_steps) - 1):
+            set_draft_decode_sub_step(forward_batch, sub_step)
+            forward_batch.out_cache_loc = out_cache_rows[sub_step]
+            forward_batch.positions = original_positions + sub_step
+            staged = build_atom_glm52_attention_metadata_from_sglang(
+                forward_batch,
+                forward_batch.positions,
+                token_to_kv_pool=token_to_kv_pool,
+                req_to_token_pool=req_to_token_pool,
+                atom_config=get_current_atom_config(),
+            )
+            fixed = cache.get((bs, sub_step))
+            if fixed is None:
+                raise RuntimeError(
+                    "Missing GLM-5.2 draft graph metadata for "
+                    f"batch_size={bs}, sub_step={sub_step}"
+                )
+            for name in tensor_fields:
+                source = getattr(staged, name, None)
+                target = getattr(fixed, name, None)
+                if not torch.is_tensor(source) or not torch.is_tensor(target):
+                    continue
+                if source.numel() > target.numel():
+                    raise RuntimeError(
+                        f"GLM-5.2 draft graph metadata field {name} exceeds "
+                        f"capture capacity: runtime={tuple(source.shape)} "
+                        f"capture={tuple(target.shape)}"
+                    )
+                target_flat = target.reshape(-1)
+                source_flat = source.reshape(-1)
+                target_flat.zero_()
+                target_flat[: source_flat.numel()].copy_(source_flat)
+    finally:
+        clear_draft_decode_sub_step(forward_batch)
+        forward_batch.out_cache_loc = original_out_cache_loc
+        forward_batch.positions = original_positions
+
+
+def _build_minimax_m3_metadata(
+    atom_config: Any,
+    forward_batch: ForwardBatch,
+    positions: torch.Tensor,
+):
+    hf_config = getattr(atom_config, "hf_config", None)
+    if _is_dummy_forward(forward_batch) or hf_config is None:
+        return None
+
+    from atom.plugin.sglang.minimax_m3_bridge import (
+        build_atom_minimax_m3_attention_metadata_from_sglang,
+        is_minimax_m3_config,
+        maybe_get_minimax_m3_pools_from_sglang_batch,
+    )
+
+    if not is_minimax_m3_config(hf_config):
+        return None
+
+    token_to_kv_pool, req_to_token_pool = maybe_get_minimax_m3_pools_from_sglang_batch(
+        forward_batch
+    )
+    if token_to_kv_pool is None or req_to_token_pool is None:
+        return None
+
+    return build_atom_minimax_m3_attention_metadata_from_sglang(
+        forward_batch,
+        positions,
+        token_to_kv_pool=token_to_kv_pool,
+        req_to_token_pool=req_to_token_pool,
+        max_model_len=int(atom_config.max_model_len),
+    )
 
 
 def _build_deepseek_v4_metadata(forward_batch: ForwardBatch, positions: torch.Tensor):
@@ -320,7 +542,7 @@ def _build_deepseek_v4_metadata(forward_batch: ForwardBatch, positions: torch.Te
                     num_tokens=int(positions.shape[0]),
                     bs=int(forward_batch.batch_size),
                 )
-        except Exception:
+        except Exception:  # noqa: BLE001 - optional V4 backend
             attn_metadata = None
 
     if attn_metadata is None and getattr(proxy_pool, "is_atom_v4_proxy_pool", False):
@@ -337,6 +559,36 @@ def _build_deepseek_v4_metadata(forward_batch: ForwardBatch, positions: torch.Te
     return attn_metadata
 
 
+def _build_eagle3_llama_metadata(
+    atom_config: Any, forward_batch: ForwardBatch, positions: torch.Tensor
+):
+    hf_config = getattr(atom_config, "hf_config", None)
+    if _is_dummy_forward(forward_batch) or hf_config is None:
+        return None
+
+    from atom.plugin.sglang.eagle3_llama_bridge import (
+        build_atom_eagle3_attention_metadata_from_sglang,
+        is_eagle3_llama_config,
+        maybe_get_eagle3_pools_from_sglang_batch,
+    )
+
+    if not is_eagle3_llama_config(hf_config):
+        return None
+
+    token_to_kv_pool, req_to_token_pool = maybe_get_eagle3_pools_from_sglang_batch(
+        forward_batch
+    )
+    if token_to_kv_pool is None or req_to_token_pool is None:
+        return None
+
+    return build_atom_eagle3_attention_metadata_from_sglang(
+        forward_batch,
+        positions,
+        token_to_kv_pool=token_to_kv_pool,
+        req_to_token_pool=req_to_token_pool,
+    )
+
+
 def _set_atom_forward_context(
     atom_config: Any,
     forward_batch: ForwardBatch,
@@ -345,25 +597,40 @@ def _set_atom_forward_context(
     """Bridge SGLang batch metadata into ATOM's global forward context."""
 
     from atom.utils.forward_context import (
-        AttentionMetaData,
         Context,
         set_forward_context,
     )
 
     forward_mode = forward_batch.forward_mode
-    # This value is only used by ATOM-side MoE padding in the SGLang wrapper.
-    max_seqlen_q = 1 if forward_mode.is_decode_or_idle() else 0
+    is_target_verify = bool(getattr(forward_mode, "is_target_verify", lambda: False)())
+    is_draft_extend = bool(
+        getattr(forward_mode, "is_draft_extend", lambda **kwargs: False)(
+            include_v2=True
+        )
+    )
     attn_metadata = None
     try:
-        attn_metadata = _build_glm52_dsa_metadata(
+        attn_metadata = _build_minimax_m3_metadata(
             atom_config,
             forward_batch,
             positions,
         )
     except Exception as exc:
         raise RuntimeError(
-            "Failed to build ATOM GLM-5.2 DSA metadata for SGLang"
+            "Failed to build ATOM MiniMax-M3 sparse metadata for SGLang"
         ) from exc
+
+    if attn_metadata is None:
+        try:
+            attn_metadata = _build_glm52_dsa_metadata(
+                atom_config,
+                forward_batch,
+                positions,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to build ATOM GLM-5.2 DSA metadata for SGLang"
+            ) from exc
 
     if attn_metadata is None:
         try:
@@ -374,10 +641,52 @@ def _set_atom_forward_context(
             ) from exc
 
     if attn_metadata is None:
-        attn_metadata = AttentionMetaData(max_seqlen_q=max_seqlen_q)
+        try:
+            attn_metadata = _build_eagle3_llama_metadata(
+                atom_config,
+                forward_batch,
+                positions,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to build ATOM EAGLE3 draft metadata for SGLang"
+            ) from exc
+
+    if attn_metadata is None:
+        # Model-specific builders own their query geometry. This fallback value
+        # is only used by generic metadata for ATOM-side MoE padding.
+        from atom.plugin.sglang.runtime.model_arch import is_glm52_dsa_config
+
+        is_glm52_dsa = is_glm52_dsa_config(getattr(atom_config, "hf_config", None))
+        if is_glm52_dsa and is_target_verify:
+            draft_token_num = int(
+                getattr(getattr(forward_batch, "spec_info", None), "draft_token_num", 0)
+                or 0
+            )
+            max_seqlen_q = max(1, draft_token_num)
+        elif is_glm52_dsa and is_draft_extend:
+            from atom.plugin.sglang.glm52_dsa_bridge import draft_extend_token_num
+
+            max_seqlen_q = max(
+                1,
+                draft_extend_token_num(
+                    forward_batch, positions, int(forward_batch.batch_size)
+                ),
+            )
+        else:
+            max_seqlen_q = 1 if forward_mode.is_decode_or_idle() else 0
+        attn_metadata = _build_generic_attention_metadata(forward_batch, max_seqlen_q)
     batch_size = int(forward_batch.batch_size)
     is_dummy_run = _is_dummy_forward(forward_batch)
     is_prefill = forward_mode.is_prefill()
+    if is_target_verify or is_draft_extend:
+        from atom.utils.forward_context import AttnState
+
+        verify_state = getattr(attn_metadata, "state", None)
+        is_prefill = verify_state in (
+            AttnState.PREFILL_PREFIX,
+            AttnState.PREFILL_NATIVE,
+        )
     num_tokens = int(positions.shape[0])
 
     if bool(atom_config.enable_dp_attention):
@@ -424,8 +733,8 @@ class SGLangPluginRuntime:
     atom_config: Any
     forward_batch: ForwardBatch
     positions: torch.Tensor
-    input_ids: Optional[torch.Tensor] = None
-    input_embeds: Optional[torch.Tensor] = None
+    input_ids: torch.Tensor | None = None
+    input_embeds: torch.Tensor | None = None
     set_forward_context: bool = True
     _original_forward_batch: ForwardBatch = field(init=False, repr=False)
     _is_dummy_run: bool = field(init=False, default=False)

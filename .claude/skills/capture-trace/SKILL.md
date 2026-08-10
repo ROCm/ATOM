@@ -156,7 +156,7 @@ ATOM annotates the critical path with `torch.profiler.record_function`. The **ki
 | `dummy_prefill[...]` | warmup dummy prefill |
 | `draft[i/k bs=]` | eagle/MTP draft mid-step |
 
-Fields: `bs` effective batch, `tok` total tokens, `ctx` per-seq context lens (truncated if many), `p`/`d` prefill/decode seq counts, `spec` speculative steps, and **`tbo=1`** appended when the step ran Two-Batch-Overlap ubatches.
+Fields: `bs` effective (real) batch — on the CUDAGraph path shown as `bs=<real>/<graph>` (e.g. `bs=117/128`) when the replayed graph is padded above the real batch; `tok` total tokens, `ctx` per-seq context lens (truncated if many), `p`/`d` prefill/decode seq counts, `spec` speculative steps, and **`tbo=1`** appended when the step ran Two-Batch-Overlap ubatches.
 
 Distinguishing dummy vs real matters: e.g. the leading `dummy_decode[bs=1 tok=1]` runs are DP-sync idle steps, NOT real decode. `parse_trace.py` matches only the exact `prefill[` / `decode[` prefixes, so dummy/eager variants are auto-excluded from its stats.
 

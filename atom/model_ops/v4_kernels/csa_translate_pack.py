@@ -46,6 +46,8 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.utils.decorators import mark_trace
+
 # Target workgroup count for BLOCK_K tuning (see csa_translate_pack): grow the
 # per-program tile until the grid would drop below this many workgroups, then
 # stop, so large-T launches use fat tiles without starving GPU occupancy.
@@ -139,6 +141,7 @@ def _csa_translate_pack_kernel(
     )
 
 
+@mark_trace
 def csa_translate_pack(
     topk_local: torch.Tensor,
     block_tables: torch.Tensor,
@@ -151,6 +154,7 @@ def csa_translate_pack(
     swa_pages: int,
     csa_block_capacity: int,
     window_size: int = 0,
+    prefix: str = "",
 ) -> None:
     """Fused topk translate + packed write into `kv_indices_csa` (in-place).
 
@@ -196,7 +200,7 @@ def csa_translate_pack(
                                    `[indptr[t], indptr[t]+valid_k[t])`.
       swa_pages:                   SWA region size — `num_slots * window_size`,
                                    fixed at CG capture time. Keyword-only.
-      csa_block_capacity:          `block_size // ratio = 128 // 4 = 32`
+      csa_block_capacity:          `block_size // ratio = 256 // 4 = 64`
                                    (constexpr; triton can strength-reduce
                                    // and %). Keyword-only.
       window_size:                 SWA window. When > 0 the kernel computes

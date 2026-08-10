@@ -44,6 +44,9 @@ on:
       atom_source_sha_for_checkout:
         required: true
         type: string
+      use_workspace_atom:
+        required: true
+        type: string
 
 jobs:
   benchmark:
@@ -80,6 +83,7 @@ jobs:
       BENCH_SERVING_REPO_URL: https://github.com/kimbochen/bench_serving.git
       ATOM_SOURCE_REPOSITORY: ${{ inputs.atom_repository }}
       ATOM_SOURCE_REF: ${{ inputs.atom_ref }}
+      ATOM_BENCH_USE_WORKSPACE_ATOM: ${{ inputs.use_workspace_atom }}
       SGLANG_REF_USED: ${{ inputs.selected_sglang_ref }}
       SGLANG_VERSION_USED: ${{ inputs.selected_sglang_version }}
       PUBLISH_TO_DASHBOARD: ${{ inputs.publish_to_dashboard }}
@@ -234,7 +238,10 @@ jobs:
         run: |
           MODEL_CACHE_MOUNT=""
           MODEL_CACHE_DESC="container-local /models (no host cache mount)"
-          if [ -d "/it-share/models" ]; then
+          if [ -d "/shared_nfs/huggingface_models" ]; then
+            MODEL_CACHE_MOUNT="-v /shared_nfs/huggingface_models:/models"
+            MODEL_CACHE_DESC="/shared_nfs/huggingface_models (shared host path)"
+          elif [ -d "/it-share/models" ]; then
             MODEL_CACHE_MOUNT="-v /it-share/models:/models"
             MODEL_CACHE_DESC="/it-share/models (shared host path)"
           elif [ -d "/models" ]; then
@@ -325,6 +332,7 @@ jobs:
             --ulimit stack=67108864 \
             --env-file "${OOT_ENV_FILE}" \
             -e HF_TOKEN="${HF_TOKEN:-}" \
+            -e ATOM_BENCH_USE_WORKSPACE_ATOM="${ATOM_BENCH_USE_WORKSPACE_ATOM}" \
             --name "$CONTAINER_NAME" \
             --entrypoint /bin/bash \
             "${SGLANG_IMAGE_REF:-${SGLANG_IMAGE_TAG}}" \
@@ -341,6 +349,8 @@ jobs:
           model_dir="${MODEL_PATH}"
           if [[ "${model_dir}" = /models/* ]]; then
             model_dir="/models/${model_dir#/models/}"
+          elif [[ "${model_dir}" = /shared_nfs/huggingface_models/* ]]; then
+            model_dir="/models/${model_dir#/shared_nfs/huggingface_models/}"
           elif [[ "${model_dir}" = /it-share/models/* ]]; then
             model_dir="/models/${model_dir#/it-share/models/}"
           elif [[ "${model_dir}" = /data/models/* ]]; then
@@ -363,6 +373,8 @@ jobs:
           model_dir="${MODEL_PATH}"
           if [[ "${model_dir}" = /models/* ]]; then
             model_dir="/models/${model_dir#/models/}"
+          elif [[ "${model_dir}" = /shared_nfs/huggingface_models/* ]]; then
+            model_dir="/models/${model_dir#/shared_nfs/huggingface_models/}"
           elif [[ "${model_dir}" = /it-share/models/* ]]; then
             model_dir="/models/${model_dir#/it-share/models/}"
           elif [[ "${model_dir}" = /data/models/* ]]; then
@@ -538,6 +550,7 @@ jobs:
             -e ATOM_SOURCE_REPOSITORY="${ATOM_SOURCE_REPOSITORY}" \
             -e ATOM_SOURCE_REF="${ATOM_SOURCE_REF}" \
             -e ATOM_SOURCE_SHA="${ATOM_SOURCE_SHA}" \
+            -e ATOM_BENCH_USE_WORKSPACE_ATOM="${ATOM_BENCH_USE_WORKSPACE_ATOM}" \
             -e SGLANG_REF_USED="${SGLANG_REF_USED}" \
             -e SGLANG_VERSION_USED="${SGLANG_VERSION_USED}" \
             -e SGLANG_IMAGE_SOURCE="${SGLANG_IMAGE_SOURCE}" \

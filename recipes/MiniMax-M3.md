@@ -30,6 +30,8 @@ python -m atom.entrypoints.openai_server \
   --max-model-len 32768 \
   --max-num-seqs 128 \
   --max-num-batched-tokens 32768 \
+  --kv_cache_dtype fp8 \
+  --index-cache-dtype fp8 \
   --online_quant_config '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "vision_tower", "multi_modal_projector", "patch_merge_mlp", "*block_sparse_moe"]}' \
   --no-enable_prefix_caching \
   --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4}' 2>&1 | tee "${run_name}-server.log"
@@ -57,6 +59,8 @@ python -m atom.entrypoints.openai_server \
   --block-size 128 \
   --max-model-len 32768 \
   --max-num-seqs 128 \
+  --kv_cache_dtype fp8 \
+  --index-cache-dtype fp8 \
   --max-num-batched-tokens 32768 \
   --online_quant_config '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "vision_tower", "multi_modal_projector", "patch_merge_mlp", "*block_sparse_moe"]}' \
   --no-enable_prefix_caching \

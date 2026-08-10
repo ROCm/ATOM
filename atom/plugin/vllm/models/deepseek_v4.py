@@ -58,8 +58,9 @@ class IndexerVllm(IndexerBase):
 
     def indexer_score_topk(
         self,
-        q_fp8: torch.Tensor,  # [total_tokens, n_heads, head_dim] fp8
+        q_quant: torch.Tensor,  # [total_tokens, n_heads, head_dim] — FP8 (this vLLM override handles the FP8 dispatch)
         weights: torch.Tensor,  # [total_tokens, n_heads] fp32
+        q_scale: torch.Tensor | None,  # FP4 e8m0 Q scale; None here (FP8-only override)
         topk: int,
     ) -> torch.Tensor:
         fc = get_forward_context()
@@ -70,7 +71,7 @@ class IndexerVllm(IndexerBase):
             # Pure-decode step (AttnState.DECODE): the CUDAGraph-captured
             # fixed-shape paged path. Byte-for-byte the native call.
             return self._score_topk_decode(
-                q_fp8, weights, block_tables, indexer_meta, topk
+                q_quant, weights, block_tables, indexer_meta, topk
             )  # [total_tokens, topk] int32
 
         # Prefill-classified step (may be MIXED under continuous batching).
@@ -78,14 +79,14 @@ class IndexerVllm(IndexerBase):
         if num_decode_tokens == 0:
             # Pure prefill: `total_committed` already spans only prefill seqs.
             return self._score_topk_prefill(
-                q_fp8, weights, block_tables, indexer_meta, topk
+                q_quant, weights, block_tables, indexer_meta, topk
             )  # [total_tokens, topk] int32
 
         num_decodes = int(indexer_meta["num_decodes"])
         n_committed_per_seq = indexer_meta["n_committed_per_seq_gpu"]
         # Decode rows: paged fixed-shape logits (bounded per-seq, no batch-sum).
         decode_topk = self._score_topk_decode(
-            q_fp8[:num_decode_tokens],
+            q_quant[:num_decode_tokens],
             weights[:num_decode_tokens],
             block_tables[:num_decodes],
             indexer_meta,
@@ -97,7 +98,7 @@ class IndexerVllm(IndexerBase):
         # committed K (the bridge builds the committed meta over the prefill
         # sub-batch), so `total_committed` no longer explodes.
         prefill_topk = self._score_topk_prefill(
-            q_fp8[num_decode_tokens:],
+            q_quant[num_decode_tokens:],
             weights[num_decode_tokens:],
             block_tables[num_decodes:],
             indexer_meta,
@@ -114,8 +115,8 @@ class IndexerVllm(IndexerBase):
         indexer_meta: dict,
         topk: int,
         *,
-        next_n: Optional[int] = None,
-        n_committed_per_seq: Optional[torch.Tensor] = None,
+        next_n: int | None = None,
+        n_committed_per_seq: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Paged decode top-k, extended for the DECODE slice of a mixed batch.
 
@@ -271,8 +272,9 @@ class DeepseekV4AttentionVllm(DeepseekV4AttentionBase):
         qr: torch.Tensor,
         qr_scale: torch.Tensor,
         positions: torch.Tensor,
-        idx_q_fp8: Optional[torch.Tensor] = None,
-        idx_weights: Optional[torch.Tensor] = None,
+        idx_q_quant: torch.Tensor | None = None,
+        idx_weights: torch.Tensor | None = None,
+        idx_q_scale: torch.Tensor | None = None,
         compressor_already_launched: bool = False,
     ) -> torch.Tensor:
         # NARROW PIECEWISE entry (see class docstring): the ``v4_core_attention``
@@ -312,8 +314,9 @@ class DeepseekV4AttentionVllm(DeepseekV4AttentionBase):
                         _clip(qr),
                         _clip(qr_scale),
                         _clip(positions),
-                        _clip(idx_q_fp8),
+                        _clip(idx_q_quant),
                         _clip(idx_weights),
+                        _clip(idx_q_scale),
                         compressor_already_launched=compressor_already_launched,
                     )
                     return torch.nn.functional.pad(o, (0, 0, 0, num_in - num_real))
@@ -324,8 +327,9 @@ class DeepseekV4AttentionVllm(DeepseekV4AttentionBase):
             qr,
             qr_scale,
             positions,
-            idx_q_fp8,
+            idx_q_quant,
             idx_weights,
+            idx_q_scale,
             compressor_already_launched=compressor_already_launched,
         )
 
