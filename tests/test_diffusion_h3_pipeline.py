@@ -15,6 +15,7 @@ from torch import nn
 from atom.diffusion.config import DiffusionConfig
 from atom.diffusion.models.minimax_h3.arch import MiniMaxH3DiTArchConfig
 from atom.diffusion.models.minimax_h3.dit import MiniMaxH3DiTModel
+from atom.diffusion.models.minimax_h3.layout import MiniMaxH3Geometry
 from atom.diffusion.models.minimax_h3.pipeline import MiniMaxH3Pipeline, PlanStage
 from atom.diffusion.pipeline import DiffusionBatch
 from atom.diffusion.request import DiffusionJob
@@ -248,3 +249,27 @@ def test_pipeline_requires_its_components(tmp_path):
     batch.meta.update({"ulysses_world": 1, "ulysses_rank": 0, "device": "cpu"})
     with pytest.raises(RuntimeError, match="missing required components"):
         pipe.forward(batch)
+
+
+def test_warmup_decode_covers_both_vaes(tmp_path):
+    """Warmup has to cover decode, not just the DiT.
+
+    Measured on gfx950 at 209 frames, the VAEs' first call costs 4.52 s (video)
+    and 5.68 s (audio) against 1.37 s and 0.08 s once warm -- a larger relative
+    penalty than the DiT's, and invisible to a benchmark that decodes once.
+    """
+    pipe, _, _, _ = build(tmp_path)
+    seen = []
+    for name in ("video_vae", "audio_vae"):
+        vae = pipe.component(name)
+        original = vae.decode
+        vae.decode = lambda z, _n=name, _f=original: (seen.append(_n), _f(z))[1]
+
+    # A small geometry keeps the stub decoders cheap; what is asserted is that
+    # warmup reaches them at all.
+    pipe.video_stats = ([0.0] * 24, [1.0] * 24)
+    geo = MiniMaxH3Geometry.resolve(
+        height=64, width=128, frame_count=5, duration_seconds=0.5, text_len=2
+    )
+    pipe._warmup_decode(geo, pipe.component("transformer").arch, "cpu")
+    assert seen == ["video_vae", "audio_vae"]

@@ -938,7 +938,49 @@ class MiniMaxH3Pipeline(ComposedPipeline):
                 rope_cache=rope_cache,
                 scheduler=MiniMaxH3EulerAncestralEta0Scheduler(),
             )
+            self._warmup_decode(geo, arch, device)
         return True
+
+    def _warmup_decode(self, geo, arch, device) -> None:
+        """Warm both VAEs too. Measured on gfx950 at 209 frames:
+
+            video decode   4.52 s first call, 1.37 s after
+            audio decode   5.68 s first call, 0.08 s after
+
+        Larger in relative terms than the DiT's, and easy to miss because a
+        benchmark that decodes once reports the setup as if it were the work.
+        """
+        import torch
+
+        video_vae = self.components.get("video_vae")
+        if video_vae is not None:
+            rows = torch.zeros(
+                geo.video_rows,
+                arch.latents_dim * math.prod(arch.patch_size),
+                device=device,
+            )
+            # Collective: the bundled VAE all-gathers tiles across the group.
+            decode_video_rows(
+                video_vae,
+                rows,
+                latent_t=geo.latent_t,
+                latent_h=geo.latent_h,
+                latent_w=geo.latent_w,
+                height=geo.height,
+                width=geo.width,
+                mean=self.video_stats[0],
+                std=self.video_stats[1],
+            )
+
+        audio_vae = self.components.get("audio_vae")  # rank 0 only
+        if audio_vae is not None:
+            stats = self.audio_stats
+            decode_audio_rows(
+                audio_vae,
+                torch.zeros(geo.audio_t * 2, arch.audio_latents_dim, device=device),
+                mean=stats[0] if stats else None,
+                std=stats[1] if stats else None,
+            )
 
     def verify_components(self) -> None:
         """Only the main rank holds the encoder and VAEs, so only it is checked."""
