@@ -102,7 +102,7 @@ def _get_synthetic_params(rate: float, num_spec_steps: int) -> tuple[float, floa
 
 
 class RejectionSampler(nn.Module):
-    def __init__(self, synthetic_acceptance_rate: Optional[float] = None):
+    def __init__(self, synthetic_acceptance_rate: float | None = None):
         super().__init__()
         # Debug/benchmark override: force a fixed acceptance rate (see module
         # docstring). None => normal draft/target rejection sampling.
@@ -171,7 +171,7 @@ def rejection_sample(
     # [batch_size, 1]
     bonus_token_ids: torch.Tensor,
     # Debug override: forced acceptance rate in [0, 1] (None => normal path).
-    synthetic_acceptance_rate: Optional[float] = None,
+    synthetic_acceptance_rate: float | None = None,
     # Per-step seed for the (rank-consistent) synthetic RNG; ignored otherwise.
     synthetic_step: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
