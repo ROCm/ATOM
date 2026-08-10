@@ -69,6 +69,10 @@ class BlockManager:
         assert num_blocks > 0
         self.block_size = block_size
         self.dcp_world_size = config.decode_context_parallel_size
+        # DCP KV-cache interleave granularity S (1 = token-level round-robin).
+        self.cp_kv_cache_interleave_size = getattr(
+            config, "cp_kv_cache_interleave_size", 1
+        )
         # dcp_rank is always 0 here: BlockManager runs only on the scheduler
         # (rank 0). DCP rank is used only to compute local token counts for
         # memory reservation; the actual per-rank routing is done in the workers.
@@ -239,7 +243,10 @@ class BlockManager:
         from atom.model_ops.dcp_ops import get_dcp_local_seq_lens
 
         local_len = get_dcp_local_seq_lens(
-            np.array([seq_len]), self.dcp_world_size, self.dcp_rank
+            np.array([seq_len]),
+            self.dcp_world_size,
+            self.dcp_rank,
+            self.cp_kv_cache_interleave_size,
         )[0]
         return int((local_len + self.block_size - 1) // self.block_size)
 

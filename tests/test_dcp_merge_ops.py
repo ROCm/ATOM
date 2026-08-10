@@ -29,6 +29,9 @@ import torch
 try:
     from atom.model_ops.dcp_ops import (
         correct_attn_out,
+        dcp_global_pos,
+        dcp_local_index,
+        dcp_owner_rank,
         get_dcp_local_seq_lens,
         reorg_kvcache,
     )
@@ -209,7 +212,7 @@ def test_non_power_of_two_world_size_is_rejected():
 
 def _brute_local_len(seq_len, dcp_size, dcp_rank, interleave):
     """Definition, straight from the storage rule: token i lives on rank
-    (i // interleave_size) % dcp_size."""
+    (i // cp_kv_cache_interleave_size) % dcp_size."""
     return sum(1 for i in range(seq_len) if (i // interleave) % dcp_size == dcp_rank)
 
 
@@ -230,6 +233,111 @@ def test_local_seq_lens_match_the_storage_rule(dcp_size, interleave):
     # No token is dropped or double-counted -- a shard-length bug here desyncs
     # the KV writes from the reads with no error anywhere.
     np.testing.assert_array_equal(sum(per_rank), lens)
+
+
+# ──────────────────────────────────── dcp_owner_rank / dcp_local_index (Part 1) ──
+# Block-level interleave (cp_kv_cache_interleave_size > 1) enabler: these two
+# helpers centralize the owner + local-index math that was inlined as `% W` /
+# `// W` all over the DCP paths. Every write/read site will call them, so a bug
+# here silently desyncs KV writes from reads. The tests pin them to the storage
+# rule (token i -> rank (i//S)%W, local index (i//(S*W))*S + i%S) and cross-check
+# against get_dcp_local_seq_lens and the vLLM slot formula.
+
+
+def _brute_local_index(i, dcp_size, dcp_rank, interleave):
+    """Local index of global token i on its owning rank, by counting: how many
+    earlier tokens (j < i) also land on the same rank."""
+    assert (i // interleave) % dcp_size == dcp_rank
+    return sum(1 for j in range(i) if (j // interleave) % dcp_size == dcp_rank)
+
+
+@pytest.mark.parametrize("dcp_size", [1, 2, 4, 8])
+@pytest.mark.parametrize("interleave", [1, 2, 4, 8])
+def test_dcp_owner_and_local_index_match_storage_rule(dcp_size, interleave):
+    pos = np.arange(0, 500, dtype=np.int64)
+    owners = dcp_owner_rank(pos, dcp_size, interleave)
+    local = dcp_local_index(pos, dcp_size, interleave)
+    for i in range(len(pos)):
+        r = (i // interleave) % dcp_size
+        assert int(owners[i]) == r, f"owner i={i} S={interleave} W={dcp_size}"
+        assert int(local[i]) == _brute_local_index(i, dcp_size, r, interleave), (
+            f"local_index i={i} S={interleave} W={dcp_size}"
+        )
+
+
+@pytest.mark.parametrize("dcp_size", [1, 2, 4, 8])
+@pytest.mark.parametrize("interleave", [1, 2, 4, 8])
+def test_dcp_global_pos_inverts_local_index(dcp_size, interleave):
+    # dcp_global_pos(local_index(g), owner(g)) must round-trip to g. The sparse
+    # candidate exchange rebuilds global ids this way, and the tie-break needs
+    # them to be a correct total order over global positions.
+    pos = np.arange(0, 500, dtype=np.int64)
+    for g in pos:
+        r = int(dcp_owner_rank(g, dcp_size, interleave))
+        j = int(dcp_local_index(g, dcp_size, interleave))
+        assert int(dcp_global_pos(j, r, dcp_size, interleave)) == int(g), (
+            f"g={g} S={interleave} W={dcp_size} r={r} j={j}"
+        )
+    # And S=1 reduces to the round-robin j*W + r.
+    j = pos
+    for r in range(dcp_size):
+        np.testing.assert_array_equal(
+            dcp_global_pos(j, r, dcp_size, 1), j * dcp_size + r
+        )
+
+
+@pytest.mark.parametrize("dcp_size", [1, 2, 4, 8])
+def test_dcp_helpers_reduce_to_round_robin_when_interleave_1(dcp_size):
+    # S == 1 must be bit-identical to the old inline round-robin (owner = i%W,
+    # local index = i//W) -- this is the S=1 regression guarantee.
+    pos = np.arange(0, 300, dtype=np.int64)
+    np.testing.assert_array_equal(dcp_owner_rank(pos, dcp_size, 1), pos % dcp_size)
+    np.testing.assert_array_equal(dcp_local_index(pos, dcp_size, 1), pos // dcp_size)
+
+
+@pytest.mark.parametrize("dcp_size", [1, 2, 4, 8])
+@pytest.mark.parametrize("interleave", [1, 2, 4, 8])
+def test_dcp_local_index_max_equals_local_seq_len(dcp_size, interleave):
+    # The largest local index a rank produces for a seq of length L, plus 1, must
+    # equal that rank's get_dcp_local_seq_lens(L) -- the two must agree or writes
+    # overflow / underflow the reserved per-rank KV.
+    for L in [0, 1, 7, 63, 64, 65, 130, 257, 500]:
+        pos = np.arange(0, L, dtype=np.int64)
+        owners = dcp_owner_rank(pos, dcp_size, interleave)
+        local = dcp_local_index(pos, dcp_size, interleave)
+        for r in range(dcp_size):
+            owned = local[owners == r]
+            expect = int(get_dcp_local_seq_lens(np.array([L]), dcp_size, r, interleave)[0])
+            got = int(owned.max()) + 1 if owned.size else 0
+            assert got == expect, f"L={L} r={r} S={interleave} W={dcp_size}"
+
+
+@pytest.mark.parametrize("dcp_size", [2, 4, 8])
+@pytest.mark.parametrize("interleave", [1, 2, 4, 8])
+@pytest.mark.parametrize("block_size", [8, 16, 64])
+def test_dcp_slot_matches_vllm_reference(dcp_size, interleave, block_size):
+    # Cross-check the (block_table_index, slot_offset) our helpers imply against
+    # vLLM's merged slot kernel (block_table.py:413-439), the authoritative
+    # block-level layout. Requires block_size % S == 0 (the config constraint).
+    if block_size % interleave != 0:
+        pytest.skip("block_size must be a multiple of cp_kv_cache_interleave_size")
+    vbs = block_size * dcp_size
+    for i in range(0, 4 * vbs + 3):
+        r = (i // interleave) % dcp_size
+        # ours
+        loc = dcp_local_index(i, dcp_size, interleave)
+        our_blk = i // vbs
+        our_off = loc % block_size
+        assert loc // block_size == our_blk  # block_size % S == 0 keeps these aligned
+        # vLLM reference on the virtual-block offset
+        vb_off = i % vbs
+        assert ((vb_off // interleave) % dcp_size == r)
+        ref_loc = (vb_off // (dcp_size * interleave)) * interleave + (vb_off % interleave)
+        ref_blk = i // vbs + ref_loc // block_size
+        ref_off = ref_loc % block_size
+        assert (our_blk, our_off) == (ref_blk, ref_off), (
+            f"i={i} S={interleave} W={dcp_size} bs={block_size}"
+        )
 
 
 # ─────────────────────────────────────────────────────────────── reorg_kvcache ──

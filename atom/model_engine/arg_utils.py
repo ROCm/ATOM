@@ -37,6 +37,7 @@ class EngineArgs:
     trust_remote_code: bool = False
     tensor_parallel_size: int = 1
     decode_context_parallel_size: int = 1
+    cp_kv_cache_interleave_size: int = 1
     pipeline_parallel_size: int = 1
     prefill_context_parallel_size: int = 1
     data_parallel_size: int = 1
@@ -141,6 +142,16 @@ class EngineArgs:
             type=int,
             default=1,
             help="Decode context parallel size. Must divide tensor_parallel_size.",
+        )
+        parser.add_argument(
+            "--cp-kv-cache-interleave-size",
+            type=int,
+            default=1,
+            help="DCP KV-cache interleave granularity S: token i is stored on "
+            "DCP rank (i // S) %% W. Default 1 = token-level round-robin. Set to "
+            "block_size for block-level interleave (each physical block holds one "
+            "rank's contiguous run), which lets PD-disaggregation pull whole KV "
+            "blocks without in-block token rearrangement. Must divide block_size.",
         )
         parser.add_argument(
             "--enforce-eager",

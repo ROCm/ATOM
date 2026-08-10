@@ -1330,6 +1330,7 @@ class Config:
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
     decode_context_parallel_size: int = 1
+    cp_kv_cache_interleave_size: int = 1
     pipeline_parallel_size: int = 1
     prefill_context_parallel_size: int = 1
     enforce_eager: bool = False
@@ -1493,6 +1494,31 @@ class Config:
                     f"the persistent cprr MLA kernel); got {gfx}. Disable DCP or "
                     f"speculative decode on this GPU."
                 )
+        # DCP KV-cache interleave granularity S. S=1 (default) = token-level
+        # round-robin (unchanged). S>1 = block-level interleave; must divide the
+        # KV block so each physical block holds an integer number of S-groups
+        # (the (i//(S*W))*S + i%S local-index math relies on block_size % S == 0),
+        # and only makes sense under DCP.
+        assert 1 <= self.cp_kv_cache_interleave_size <= self.kv_cache_block_size, (
+            f"cp_kv_cache_interleave_size ({self.cp_kv_cache_interleave_size}) must "
+            f"be in [1, kv_cache_block_size={self.kv_cache_block_size}]"
+        )
+        if self.cp_kv_cache_interleave_size > 1:
+            assert self.kv_cache_block_size % self.cp_kv_cache_interleave_size == 0, (
+                f"kv_cache_block_size ({self.kv_cache_block_size}) must be divisible "
+                f"by cp_kv_cache_interleave_size ({self.cp_kv_cache_interleave_size})"
+            )
+            assert self.decode_context_parallel_size > 1, (
+                "cp_kv_cache_interleave_size > 1 only applies under DCP "
+                f"(decode_context_parallel_size={self.decode_context_parallel_size})"
+            )
+            assert self.speculative_config is None, (
+                "cp_kv_cache_interleave_size > 1 (block-level DCP interleave) is "
+                "incompatible with speculative decode (MTP/eagle/dspark): the q>1 "
+                "verify cprr MLA kernel assumes token-level interleave. Use "
+                "cp_kv_cache_interleave_size=1 with speculative decode, or disable "
+                "speculative decode for block-level interleave."
+            )
         assert 1 <= self.pipeline_parallel_size
         self.hf_config = get_hf_config(
             self.model, trust_remote_code=self.trust_remote_code

@@ -23,6 +23,7 @@ from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attention_mla import MLAModules
 from atom.model_ops.attentions.sub_pool_spec import SubPoolSpec
+from atom.model_ops.dcp_ops import dcp_local_index, dcp_owner_rank
 from atom.utils import CpuGpuBuffer
 from atom.utils.forward_context import AttentionMetaData, AttnState
 from atom.utils.tbo.ubatch_splitting import (
@@ -233,6 +234,10 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         hf_config = config.hf_config
         self.dcp_world_size = get_dcp_world_size()
         self.dcp_rank = get_dcp_rank()
+        # DCP KV-cache interleave granularity S (1 = token-level round-robin).
+        self.cp_kv_cache_interleave_size = getattr(
+            config, "cp_kv_cache_interleave_size", 1
+        )
         self.max_num_batched_tokens = model_runner.max_num_batched_tokens
         self.max_bs = model_runner.max_bs
         self.max_num_blocks_per_seq = (
@@ -374,12 +379,17 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             block_table = batch.block_tables[i]
             block_size = self.model_runner.block_size
             if self.dcp_world_size > 1:
-                virtual_block_size = block_size * self.dcp_world_size
+                W = self.dcp_world_size
+                S = self.cp_kv_cache_interleave_size
+                virtual_block_size = block_size * W
                 for pos in range(cached_seqlen, seqlen):
-                    vb_offset = pos % virtual_block_size
-                    if vb_offset % self.dcp_world_size == self.dcp_rank:
+                    # Block-level interleave: token pos is owned by rank
+                    # (pos//S)%W at local index (pos//(S*W))*S + pos%S. S=1 is the
+                    # original round-robin. blk_idx = pos // (block_size*W) equals
+                    # local_index // block_size (needs block_size % S == 0).
+                    if dcp_owner_rank(pos, W, S) == self.dcp_rank:
                         blk_idx = pos // virtual_block_size
-                        local_offset = vb_offset // self.dcp_world_size
+                        local_offset = dcp_local_index(pos, W, S) % block_size
                         slot_mapping.append(
                             block_table[blk_idx] * block_size + local_offset
                         )
