@@ -1438,24 +1438,17 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         )
 
         generation_config = engine.config.generation_config
-        generation_config_diff = (
-            generation_config.to_diff_dict()
-            if generation_config is not None
-            else {}
-        )
-        # Only non-None sampling values from the model generation config
-        # should override ATOM's neutral defaults.
-        model_sampling_defaults = {
-            name: generation_config_diff[name]
-            for name in ("temperature", "top_p", "top_k")
-            if generation_config_diff.get(name) is not None
-        }
+        model_temperature = getattr(generation_config, "temperature", None)
+        model_top_p = getattr(generation_config, "top_p", None)
+        model_top_k = getattr(generation_config, "top_k", None)
         sampling_params = _build_sampling_params(
             temperature=(
                 request.temperature
                 if request.temperature is not None
-                else model_sampling_defaults.get(
-                    "temperature", DEFAULT_TEMPERATURE
+                else (
+                    model_temperature
+                    if model_temperature is not None
+                    else DEFAULT_TEMPERATURE
                 )
             ),
             max_tokens=request.max_tokens,
@@ -1464,12 +1457,12 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
             top_k=(
                 request.top_k
                 if request.top_k is not None
-                else model_sampling_defaults.get("top_k", DEFAULT_TOP_K)
+                else model_top_k if model_top_k is not None else DEFAULT_TOP_K
             ),
             top_p=(
                 request.top_p
                 if request.top_p is not None
-                else model_sampling_defaults.get("top_p", DEFAULT_TOP_P)
+                else model_top_p if model_top_p is not None else DEFAULT_TOP_P
             ),
         )
 

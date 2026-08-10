@@ -193,7 +193,9 @@ class TestAnthropicSamplingParams:
             SimpleNamespace(
                 config=SimpleNamespace(
                     generation_config=SimpleNamespace(
-                        to_diff_dict=lambda: {"temperature": 1.0, "top_p": 0.95}
+                        temperature=1.0,
+                        top_p=0.95,
+                        top_k=None,
                     ),
                     max_model_len=4096,
                 )
