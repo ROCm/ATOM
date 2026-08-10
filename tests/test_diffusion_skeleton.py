@@ -341,3 +341,19 @@ def test_a_failing_warmup_does_not_kill_the_replica():
 
     pipe.warmup = boom
     assert PipelineRunner(cfg, pipe, device="cpu").warmup() is False
+
+
+def test_placement_clears_requires_grad():
+    """aiter's varlen attention asserts on a grad-requiring input.
+
+    `.eval()` does not clear the flag. At Ulysses >= 2 the all-to-all writes
+    into a fresh buffer and launders it away, so the failure only appears at
+    degree 1 -- which is why every validated topology missed it.
+    """
+    cfg = make_config()
+    pipe = _Pipeline(cfg)
+    module = torch.nn.Linear(4, 4)
+    assert all(p.requires_grad for p in module.parameters())
+    pipe.register_component("transformer", module)
+    PipelineRunner(cfg, pipe, device="cpu").place_components()
+    assert not any(p.requires_grad for p in module.parameters())

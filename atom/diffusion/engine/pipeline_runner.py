@@ -65,6 +65,11 @@ class PipelineRunner:
                 continue
             if isinstance(module, torch.nn.Module):
                 module.to(self.device).eval()
+                # eval() does not clear requires_grad, and aiter's varlen
+                # attention asserts when it sees a grad-requiring input. At
+                # Ulysses >= 2 the all-to-all writes into a fresh buffer and
+                # launders the flag away, so this only ever bites at degree 1.
+                module.requires_grad_(False)
                 bad = [
                     pname
                     for pname, p in module.named_parameters()
