@@ -775,6 +775,56 @@ class TestPostprocess:
         assert 10 in seq.token_ids
         assert finished == []
 
+    def test_mtp_prefill_output_without_rejection_metadata(self, seq_factory):
+        config = MockConfig(
+            speculative_config=SimpleNamespace(num_speculative_tokens=3, method="mtp")
+        )
+        scheduler = Scheduler(config)
+        seq = self._prefill(scheduler, seq_factory([1, 2, 3, 4]))
+        # The deferred prefill output surfaces after the next speculative
+        # schedule has reserved its placeholder slots.
+        seq.token_ids.extend([0] * scheduler.mtp_k)
+        seq.output_tokens.extend([0] * scheduler.mtp_k)
+        output = ScheduledBatchOutput(
+            req_ids=[seq.id],
+            token_ids=[(10,)],
+            num_rejected=None,
+            num_bonus=None,
+            draft_token_ids=None,
+            is_prev_prefill=True,
+        )
+
+        finished = scheduler.postprocess(list(scheduler.running), output)
+
+        assert 10 in seq.token_ids
+        assert seq.num_rejected == 0
+        assert seq.num_bonus_tokens == 0
+        assert seq.spec_token_ids.size == 0
+        assert finished == []
+
+    def test_mtp_decode_reconstructs_missing_rejection_metadata(self, seq_factory):
+        config = MockConfig(
+            speculative_config=SimpleNamespace(num_speculative_tokens=3, method="mtp")
+        )
+        scheduler = Scheduler(config)
+        seq = self._prefill(scheduler, seq_factory([1, 2, 3, 4]))
+        seq.token_ids.extend([0] * (scheduler.mtp_k * 2))
+        seq.output_tokens.extend([0] * (scheduler.mtp_k * 2))
+        output = ScheduledBatchOutput(
+            req_ids=[seq.id],
+            token_ids=[(10, 11, 12, 13)],
+            num_rejected=None,
+            num_bonus=None,
+            draft_token_ids=None,
+            is_prev_prefill=False,
+        )
+
+        scheduler.postprocess(list(scheduler.running), output)
+
+        assert seq.num_rejected == 0
+        assert seq.num_bonus_tokens == 3
+        assert seq.spec_token_ids.size == 0
+
     def test_eos_finishes(self, scheduler, seq_factory):
         seq = self._prefill(scheduler, seq_factory([1, 2, 3, 4]))
         finished = scheduler.postprocess(
