@@ -221,7 +221,7 @@ def _mla_output_width(impl: _MLAOutputShape, hidden_size: int) -> int:
     return hidden_size
 
 
-def requires_persistent_mode(
+def supports_dpa_persistent_mode(
     atom_config,
     mla_modules: MLAModules,
     *,
@@ -229,7 +229,7 @@ def requires_persistent_mode(
     num_heads: int,
     num_kv_heads: int,
 ) -> bool:
-    """Whether legacy MLA must stay persistent for GLM-5.2 DPA decode.
+    """Whether this model supports the persistent-mode exception under DPA.
 
     AITER's FP8 Q/FP8 KV GQA64 kernel is available only in persistent mode.
     Keep this gate exact so other DPA models retain the existing non-persistent
@@ -247,21 +247,20 @@ def requires_persistent_mode(
     )
 
 
-def is_persistent_mode(
+def should_use_persistent_mode(
     *,
     dp_size: int,
-    persistent_required: bool,
+    dpa_persistent_supported: bool,
     page_size: int,
     dcp_world_size: int,
     dcp_persistent_supported: bool,
 ) -> bool:
     """Apply the common persistent-mode policy and required exceptions."""
-    use_persistent = dp_size <= 1 or persistent_required
-    if page_size > 1:
-        use_persistent = False
-    if dcp_world_size > 1 and not dcp_persistent_supported:
-        use_persistent = False
-    return use_persistent
+    return (
+        (dp_size <= 1 or dpa_persistent_supported)
+        and page_size <= 1
+        and (dcp_world_size <= 1 or dcp_persistent_supported)
+    )
 
 
 def dynamic_per_batched_tensor_quant(
@@ -326,7 +325,7 @@ class MLAAttention(nn.Module):
         self._k_scale = self.one_scale
         self._q_scale = self.one_scale
         atom_config = get_current_atom_config()
-        self._requires_persistent_mode = requires_persistent_mode(
+        self._dpa_persistent_supported = supports_dpa_persistent_mode(
             atom_config,
             mla_modules,
             kv_cache_dtype=self.kv_cache_dtype,
@@ -1314,9 +1313,9 @@ class MLAAttention(nn.Module):
                     paged_kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens
 
             dp_size = get_dp_group().world_size
-            use_persistent_mode = is_persistent_mode(
+            use_persistent_mode = should_use_persistent_mode(
                 dp_size=dp_size,
-                persistent_required=self._requires_persistent_mode,
+                dpa_persistent_supported=self._dpa_persistent_supported,
                 page_size=envs.ATOM_MLA_PAGE_SIZE,
                 dcp_world_size=self.dcp_world_size,
                 dcp_persistent_supported=self.dcp_persistent_supported,
