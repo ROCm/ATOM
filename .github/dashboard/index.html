@@ -1076,12 +1076,15 @@ for (const run of allRuns) {
     if (!p.isAccuracy) continue;
     const key = `${p.backend}|${p.model}`;
     if (!accuracyMap[key]) accuracyMap[key] = [];
-    const entry = { date: run.date, commit: run.commit, score: b.value, runUrl: '' };
+    const entry = { date: run.date, commit: run.commit, score: b.value, runUrl: '', hardware: 'unknown' };
     if (b.extra) {
       const meta = parseAccuracyExtra(b.extra);
       if (meta.runUrl) entry.runUrl = meta.runUrl;
       if (meta.dockerImage) entry.dockerImage = meta.dockerImage;
-      if (meta.gpuName) entry._gpu_name = meta.gpuName;
+      if (meta.gpuName) {
+        entry._gpu_name = meta.gpuName;
+        entry.hardware = hardwareFromGpuName(meta.gpuName);
+      }
       if (meta.gpuVramGb != null) entry._gpu_vram_gb = meta.gpuVramGb;
       if (meta.rocmVersion) entry._rocm_version = meta.rocmVersion;
       if (meta.threshold != null) entry.threshold = meta.threshold;
@@ -1171,7 +1174,14 @@ const standardIslOsl = [...new Set([
 ])].filter(Boolean).sort();
 const allIslOsl = [AGENTIC_TRACE_FILTER, ...standardIslOsl];
 const allConc = [...new Set([...Object.keys(historyMap).map(k => +k.split('|')[3]), ...atomeshSummaryRows.map(row => row.concurrency)].filter(Number.isFinite))].sort((a, b) => a - b);
-const allHardware = [...new Set([...Object.values(latestConfigs).map(cfg => cfg.hardware || 'unknown'), ...atomeshSummaryRows.map(row => row.hardware || 'unknown')])].sort(_lc);
+// Build the hardware selector from all historical sources. A platform must
+// remain selectable even when it has no performance result in a recent run.
+const allHardware = [...new Set([
+  ...Object.values(historyMap).flatMap(history => history.map(cfg => cfg.hardware || 'unknown')),
+  ...Object.values(accuracyMap).flatMap(history => history.map(entry => entry.hardware || 'unknown')),
+  ...atomeshHistoricalRows.map(row => row.hardware || 'unknown'),
+  ...atomeshSummaryRows.map(row => row.hardware || 'unknown'),
+])].sort(_lc);
 const defaultHardware = allHardware.includes('mi355x') ? 'mi355x' : (allHardware[0] || 'unknown');
 const allTrendModelKeys = [...new Set(Object.values(latestConfigs).map(cfg => `${cfg.backend}|${cfg.model}`))].sort(_lc);
 
@@ -3000,7 +3010,7 @@ function showPopover(key, cfg) {
   });
 }
 function showAccuracyPopover(key, acc, prevOverride) {
-  const history = accuracyMap[key] || [];
+  const history = accuracyHistoryForSelectedHardware(key);
   const prev = prevOverride !== undefined ? prevOverride : (history.length > 1 ? history[1] : null);
   const [backend, model] = key.split('|');
   const hasThreshold = acc.threshold != null;
@@ -3161,10 +3171,17 @@ function readFromHash() {
    16. ACCURACY TAB
    ================================================================ */
 /** Accuracy keys are "backend|model"; ISL/conc do not apply to GSM8K rows. */
+function accuracyHistoryForSelectedHardware(key) {
+  const hardware = selectedHardware();
+  return (accuracyMap[key] || []).filter(entry => (entry.hardware || 'unknown') === hardware);
+}
+
 function filteredAccuracyEntries() {
-  return Object.entries(latestAccuracy).filter(([key]) => {
+  return Object.keys(accuracyMap).flatMap(key => {
     const [backend] = key.split('|');
-    return state.filters.backends.includes(backend);
+    if (!state.filters.backends.includes(backend)) return [];
+    const history = accuracyHistoryForSelectedHardware(key);
+    return history.length ? [[key, history[0]]] : [];
   });
 }
 
@@ -3178,7 +3195,7 @@ function renderAccuracyTab() {
     .sort((a, b) => _lc(a[0].split('|')[1], b[0].split('|')[1]));
 
   if (models.length === 0) {
-    container.innerHTML = '<div class="chart-empty">No accuracy rows match the current Backend / Model filters.<br><span style="font-size:12px;color:var(--text-tertiary)">Widen filters above or click Reset. (Concurrency / ISL filters do not apply to accuracy.)</span></div>';
+    container.innerHTML = '<div class="chart-empty">No accuracy rows match the current Backend / Hardware filters.<br><span style="font-size:12px;color:var(--text-tertiary)">Widen filters above or click Reset. (Concurrency / ISL filters do not apply to accuracy.)</span></div>';
     return;
   }
 
@@ -3197,7 +3214,7 @@ function renderAccuracyTab() {
 
   for (const [key, acc] of models) {
     const [backend, model] = key.split('|');
-    const history = accuracyMap[key];
+    const history = accuracyHistoryForSelectedHardware(key);
     const prev = history.length > 1 ? history[1] : null;
     const threshold = acc.threshold || 0;
     const hasThreshold = !!acc.threshold;
@@ -3307,7 +3324,7 @@ function renderAccuracyTab() {
     const btn = target?.closest ? target.closest('.accuracy-score-trigger') : null;
     if (!btn || !container.contains(btn)) return null;
     const key = btn.dataset.accOpen;
-    const acc = latestAccuracy[key];
+    const acc = accuracyHistoryForSelectedHardware(key)[0];
     if (!acc) return null;
     return { btn, key, acc, preview: { model: key.split('|')[1], dateText: fmtDate(acc.date), score: acc.score } };
   }
@@ -3349,7 +3366,7 @@ function renderAccuracyMiniChart(key, chartCache) {
   const canvas = document.getElementById(canvasId);
   if (!canvas) return;
 
-  const history = accuracyMap[key];
+  const history = accuracyHistoryForSelectedHardware(key);
   if (!history || !history.length) return;
   const [backend, model] = key.split('|');
   const color = getModelColor(backend, model);
@@ -3365,7 +3382,7 @@ function renderAccuracyMiniChart(key, chartCache) {
   const hasStrict = strictScores.some(v => v != null);
 
   // Baseline reference line
-  const baseline = sorted[0].baseline ?? (Object.entries(latestAccuracy).find(([k]) => k === key)?.[1]?.baseline);
+  const baseline = sorted[0].baseline ?? history[0]?.baseline;
 
   const datasets = [
     {
@@ -3507,7 +3524,7 @@ function renderMtpAcceptanceMiniChart(key) {
         const h = sorted[elems[0].index];
         if (!h) return;
         const [backend, model] = key.split('|');
-        const acc = latestAccuracy[key] || {};
+        const acc = accuracyHistoryForSelectedHardware(key)[0] || {};
         const gpuParts = [];
         if (acc._gpu_name) gpuParts.push(acc._gpu_name);
         if (acc._gpu_vram_gb) gpuParts.push(acc._gpu_vram_gb + 'GB');
