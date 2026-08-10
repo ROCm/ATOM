@@ -1,22 +1,24 @@
 //! Data-parallel worker routing with session affinity.
 //!
 //! Requests carrying `X-Session-ID` are pinned to the first healthy worker
-//! selected for that session. New sessions and requests without a session ID
-//! use minimum-load balancing. A stale mapping is replaced when its worker is
-//! no longer healthy or the session has been idle for too long.
+//! selected for that session. A new session goes to the worker holding the
+//! fewest live sessions (load breaks ties); requests without a session ID use
+//! minimum-load balancing. A stale mapping is replaced when its worker is no
+//! longer healthy or the session has been idle for too long.
 
 use std::{
-    sync::Arc,
+    collections::HashMap,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
-use dashmap::{mapref::entry::Entry, DashMap};
+use dashmap::DashMap;
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
 use crate::{core::Worker, routers::comm::header_utils::extract_sticky_routing_key};
 
-const SESSION_REASSIGNMENT_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+const SESSION_REASSIGNMENT_IDLE_TIMEOUT: Duration = Duration::from_secs(120 * 60);
 
 #[derive(Debug)]
 struct StickyAssignment {
@@ -24,7 +26,7 @@ struct StickyAssignment {
     last_access: Instant,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct WorkerIdentity {
     url: String,
     dp_rank: Option<usize>,
@@ -35,12 +37,17 @@ pub struct DpStickyPolicy {
     /// Session ID -> worker identity. The DP rank distinguishes logical workers
     /// that share a common endpoint URL.
     assignments: DashMap<String, StickyAssignment>,
+    /// Serializes count -> choose -> insert for new sessions so a burst cannot
+    /// pin every session to the same DP rank. Established sessions use the
+    /// lock-free assignment lookup above.
+    assign_lock: Mutex<()>,
 }
 
 impl DpStickyPolicy {
     pub fn new() -> Self {
         Self {
             assignments: DashMap::new(),
+            assign_lock: Mutex::new(()),
         }
     }
 
@@ -74,6 +81,32 @@ impl DpStickyPolicy {
             .min_by_key(|&index| workers[index].load())
     }
 
+    /// Select the healthy worker holding the fewest non-expired assignments,
+    /// tie-broken by current request load. Caller must hold `assign_lock`.
+    fn select_new_session_worker(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        now: Instant,
+    ) -> Option<usize> {
+        let mut live_sessions: HashMap<WorkerIdentity, usize> = HashMap::new();
+        for entry in self.assignments.iter() {
+            if now.saturating_duration_since(entry.last_access) <= SESSION_REASSIGNMENT_IDLE_TIMEOUT
+            {
+                *live_sessions.entry(entry.worker.clone()).or_insert(0) += 1;
+            }
+        }
+
+        get_healthy_worker_indices(workers)
+            .into_iter()
+            .min_by_key(|&index| {
+                let identity = Self::worker_identity(&workers[index]);
+                (
+                    live_sessions.get(&identity).copied().unwrap_or(0),
+                    workers[index].load(),
+                )
+            })
+    }
+
     fn select_worker_impl(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -88,7 +121,6 @@ impl DpStickyPolicy {
         if let Some(mut assignment) = self.assignments.get_mut(session_id) {
             let is_expired = now.saturating_duration_since(assignment.last_access)
                 > SESSION_REASSIGNMENT_IDLE_TIMEOUT;
-
             if !is_expired {
                 if let Some(index) = Self::healthy_worker_for_identity(workers, &assignment.worker)
                 {
@@ -98,48 +130,33 @@ impl DpStickyPolicy {
             }
         }
 
-        let selected_index = Self::select_low_load_worker(workers)?;
-        let selected_worker = Self::worker_identity(&workers[selected_index]);
-
-        match self.assignments.entry(session_id.to_string()) {
-            Entry::Occupied(mut entry) => {
-                let existing_index = {
-                    let assignment = entry.get_mut();
-                    let is_expired = now.saturating_duration_since(assignment.last_access)
-                        > SESSION_REASSIGNMENT_IDLE_TIMEOUT;
-
-                    if !is_expired {
-                        if let Some(index) =
-                            Self::healthy_worker_for_identity(workers, &assignment.worker)
-                        {
-                            assignment.last_access = now;
-                            Some(index)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                };
-
-                if let Some(index) = existing_index {
-                    Some(index)
-                } else {
-                    entry.insert(StickyAssignment {
-                        worker: selected_worker,
-                        last_access: now,
-                    });
-                    Some(selected_index)
+        // New, expired, or orphaned sessions must assign atomically: another
+        // request may have pinned this session while this one waited for the lock.
+        let _assign_guard = self
+            .assign_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(mut assignment) = self.assignments.get_mut(session_id) {
+            let is_expired = now.saturating_duration_since(assignment.last_access)
+                > SESSION_REASSIGNMENT_IDLE_TIMEOUT;
+            if !is_expired {
+                if let Some(index) = Self::healthy_worker_for_identity(workers, &assignment.worker)
+                {
+                    assignment.last_access = now;
+                    return Some(index);
                 }
             }
-            Entry::Vacant(slot) => {
-                slot.insert(StickyAssignment {
-                    worker: selected_worker,
-                    last_access: now,
-                });
-                Some(selected_index)
-            }
         }
+
+        let selected_index = self.select_new_session_worker(workers, now)?;
+        self.assignments.insert(
+            session_id.to_string(),
+            StickyAssignment {
+                worker: Self::worker_identity(&workers[selected_index]),
+                last_access: now,
+            },
+        );
+        Some(selected_index)
     }
 }
 
@@ -230,6 +247,29 @@ mod tests {
         workers[0].increment_load();
         assert_eq!(policy.select_worker(&workers, &info).await, Some(1));
         assert_eq!(policy.select_worker(&workers, &info).await, Some(1));
+    }
+
+    #[tokio::test]
+    async fn new_sessions_are_spread_by_assignment_count() {
+        let policy = DpStickyPolicy::new();
+        let workers = dp_workers();
+
+        for (session_id, expected_worker) in [
+            ("session-1", 0),
+            ("session-2", 1),
+            ("session-3", 0),
+            ("session-4", 1),
+        ] {
+            let headers = headers(session_id);
+            let info = SelectWorkerInfo {
+                headers: Some(&headers),
+                ..Default::default()
+            };
+            assert_eq!(
+                policy.select_worker(&workers, &info).await,
+                Some(expected_worker)
+            );
+        }
     }
 
     #[tokio::test]
