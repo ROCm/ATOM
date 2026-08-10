@@ -56,6 +56,46 @@ class AnthropicMessagesRequest(BaseModel):
 # ── Format Conversion ──────────────────────────────────────────────────
 
 
+def resolve_anthropic_sampling_params(
+    request: AnthropicMessagesRequest,
+    generation_config: Any = None,
+) -> dict[str, float | int]:
+    """Merge request values, model generation defaults, and engine defaults.
+
+    The precedence matches vLLM's OpenAI serving layer: an explicitly supplied
+    request value wins, then a value explicitly present in the model's
+    ``generation_config.json``, and finally an engine-neutral default.
+
+    ``GenerationConfig`` can materialize library defaults for fields absent
+    from the model file. Use ``to_diff_dict()`` instead of direct attributes so
+    an implicit Transformers default (notably ``top_k``) is not enabled by
+    accident.
+    """
+    model_defaults: dict[str, Any] = {}
+    if generation_config is not None:
+        if isinstance(generation_config, dict):
+            model_defaults = generation_config
+        else:
+            to_diff_dict = getattr(generation_config, "to_diff_dict", None)
+            if callable(to_diff_dict):
+                model_defaults = to_diff_dict()
+
+    neutral_defaults: dict[str, float | int] = {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "top_k": -1,
+    }
+    resolved: dict[str, float | int] = {}
+    for name, neutral_value in neutral_defaults.items():
+        request_value = getattr(request, name)
+        if request_value is not None:
+            resolved[name] = request_value
+            continue
+        model_value = model_defaults.get(name)
+        resolved[name] = neutral_value if model_value is None else model_value
+    return resolved
+
+
 def anthropic_to_openai_messages(
     messages: List[AnthropicMessage],
     system: Optional[Any] = None,
