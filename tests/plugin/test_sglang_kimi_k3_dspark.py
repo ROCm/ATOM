@@ -121,3 +121,33 @@ def test_build_spec_gdn_metadata_marks_full_spec_batch():
     assert metadata.spec_query_start_loc is plan.spec_query_start_loc
     assert metadata.non_spec_query_start_loc is None
     assert metadata.non_spec_state_indices_tensor is None
+
+
+def test_target_verify_gate_is_kimi_k3_only(monkeypatch):
+    """The shared GDN bridge must only enter K3 code for a K3 model."""
+    from atom.plugin.sglang.attention_backend import attention_gdn
+
+    def _set_config(hf_config):
+        monkeypatch.setattr(
+            attention_gdn,
+            "get_current_atom_config",
+            lambda: SimpleNamespace(hf_config=hf_config),
+        )
+
+    gate = attention_gdn.SGLangGDNForwardContext._is_kimi_k3_target_verify
+
+    _set_config(SimpleNamespace(architectures=["KimiK3ForConditionalGeneration"]))
+    assert gate() is True
+
+    # Other GDN models share this bridge and must not reach K3 helpers.
+    _set_config(SimpleNamespace(architectures=["Qwen3NextForCausalLM"]))
+    assert gate() is False
+    _set_config(None)
+    assert gate() is False
+
+    # No ATOM config set (e.g. dummy forward) must not raise.
+    def _raise():
+        raise AssertionError("Current atom config is not set")
+
+    monkeypatch.setattr(attention_gdn, "get_current_atom_config", _raise)
+    assert gate() is False

@@ -59,6 +59,22 @@ class SGLangGDNForwardContext:
         return getattr(attn_backend, "linear_attn_backend", attn_backend)
 
     @staticmethod
+    def _is_kimi_k3_target_verify() -> bool:
+        """Report whether the running model is Kimi-K3.
+
+        TARGET_VERIFY below is implemented by the Kimi-K3 DSpark helpers only.
+        Any other GDN model (Qwen3-Next, ...) must keep the previous
+        "unsupported" behaviour instead of routing into Kimi-K3 code.
+        """
+        from atom.plugin.sglang.kimi_k3_bridge import is_kimi_k3_config
+
+        try:
+            atom_config = get_current_atom_config()
+        except AssertionError:
+            return False
+        return is_kimi_k3_config(getattr(atom_config, "hf_config", None))
+
+    @staticmethod
     def _resolve_attn_backend(forward_batch: Any) -> Any:
         return resolve_attn_backend(forward_batch)
 
@@ -96,8 +112,10 @@ class SGLangGDNForwardContext:
         if mamba_map is None:
             return {}
 
-        if getattr(forward_batch, "forward_mode", None) is not None and (
-            forward_batch.forward_mode.is_target_verify()
+        if (
+            getattr(forward_batch, "forward_mode", None) is not None
+            and forward_batch.forward_mode.is_target_verify()
+            and SGLangGDNForwardContext._is_kimi_k3_target_verify()
         ):
             from atom.plugin.sglang.kimi_k3_spec_verify import (
                 build_spec_cache_tensors,
@@ -145,6 +163,13 @@ class SGLangGDNForwardContext:
     ) -> GDNAttentionMetadata | None:
         mode = forward_batch.forward_mode
         if mode.is_target_verify():
+            if not SGLangGDNForwardContext._is_kimi_k3_target_verify():
+                logger.warning(
+                    "SGLang GDN forward context: TARGET_VERIFY is only "
+                    "supported for Kimi-K3; GDN metadata skipped."
+                )
+                return None
+
             from atom.plugin.sglang.kimi_k3_spec_verify import (
                 build_spec_gdn_metadata,
                 build_spec_plan,
