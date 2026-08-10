@@ -1817,8 +1817,7 @@ class Scheduler:
                 # that case (it previously crashed long AgentX MTP runs).
                 if fwd_output.num_rejected is None or fwd_output.num_bonus is None:
                     if not (
-                        fwd_output.num_rejected is None
-                        and fwd_output.num_bonus is None
+                        fwd_output.num_rejected is None and fwd_output.num_bonus is None
                     ):
                         raise RuntimeError(
                             "Incomplete speculative metadata: num_rejected and "
