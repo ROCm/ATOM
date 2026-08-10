@@ -3210,6 +3210,9 @@ class ModelRunner:
             is_deferred_out=self.tokenID_processor.is_deferred_out,
             num_rejected=prev_rejected_num,
             num_bonus=prev_bonus_num,
+            is_prev_prefill=(
+                prev_batch is not None and prev_batch.total_seqs_num_prefill > 0
+            ),
             logprobs=logprobs_map,
             dspark_ell=dspark_ell,
         )

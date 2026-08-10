@@ -554,6 +554,11 @@ class Scheduler:
 
         # Speculative decoding
         self.use_spec = config.speculative_config is not None
+        self.spec_method = (
+            getattr(config.speculative_config, "method", None)
+            if self.use_spec
+            else None
+        )
         self.mtp_k: int = (
             config.speculative_config.num_speculative_tokens if self.use_spec else 0
         )  # type: ignore
@@ -1805,13 +1810,49 @@ class Scheduler:
                 token_logprob = token_logprobs.get(seq.id)
 
             if is_deferred_out or self.use_spec:
-                # int() casts strip the np.int32 wrapper coming out of
-                # fwd_output's np.ndarray indexing. Without these, the values
-                # propagate into seq.num_rejected / seq.num_bonus_tokens, then
-                # into seq.num_tokens via `preempt()`'s `-= mtp_k + num_rejected`,
-                # contaminating downstream logs and arithmetic with np.int32.
-                num_rejected = int(fwd_output.num_rejected[idx])
-                num_bonus = int(fwd_output.num_bonus[idx])
+                # A prefill forward does not run speculative verification. In
+                # deferred/chunked execution its sampled token can surface with
+                # no rejection metadata, which is equivalent to zero rejected
+                # and zero bonus tokens. Do not index the optional arrays in
+                # that case (it previously crashed long AgentX MTP runs).
+                if fwd_output.num_rejected is None or fwd_output.num_bonus is None:
+                    if not (
+                        fwd_output.num_rejected is None
+                        and fwd_output.num_bonus is None
+                    ):
+                        raise RuntimeError(
+                            "Incomplete speculative metadata: num_rejected and "
+                            "num_bonus must either both be present or both be None"
+                        )
+                    if fwd_output.is_prev_prefill or not self.use_spec:
+                        # Prefill emits one target token without proposing or
+                        # validating drafts.
+                        num_rejected = 0
+                        num_bonus = 0
+                    elif (
+                        self.spec_method == "mtp"
+                        and 1 <= num_new_token <= self.mtp_k + 1
+                    ):
+                        # In deferred plain-MTP execution, an interleaved
+                        # prefill can consume the queued D2H status before the
+                        # previous decode output surfaces. The output length is
+                        # sufficient to reconstruct the fixed-width MTP status:
+                        # one target token plus num_bonus accepted drafts.
+                        num_bonus = num_new_token - 1
+                        num_rejected = self.mtp_k - num_bonus
+                    else:
+                        raise RuntimeError(
+                            "Missing speculative metadata for an output with "
+                            f"{num_new_token} accepted tokens"
+                        )
+                else:
+                    # int() casts strip the np.int32 wrapper coming out of
+                    # fwd_output's np.ndarray indexing. Without these, the values
+                    # propagate into seq.num_rejected / seq.num_bonus_tokens, then
+                    # into seq.num_tokens via `preempt()`'s `-= mtp_k + num_rejected`,
+                    # contaminating downstream logs and arithmetic with np.int32.
+                    num_rejected = int(fwd_output.num_rejected[idx])
+                    num_bonus = int(fwd_output.num_bonus[idx])
                 offset = 0 if (num_new_token + num_rejected) == 1 else self.mtp_k
                 # Align stats with vLLM: only count steps that actually ran
                 # speculation (drafts proposed and validated). Skip the
@@ -1857,8 +1898,13 @@ class Scheduler:
                 seq._injected_t0 = None
 
             if self.mtp_k > 0:
-                # idx already resolved above via get_idx
-                seq.spec_token_ids = draft_token_ids[idx]
+                # Prefill outputs do not propose draft tokens. Clear any stale
+                # draft state instead of indexing the optional draft array.
+                seq.spec_token_ids = (
+                    draft_token_ids[idx]
+                    if draft_token_ids is not None
+                    else np.empty(0, dtype=np.int32)
+                )
 
             if seq.num_completion_tokens <= 3 and seq.kv_transfer_params:
                 logger.info(
