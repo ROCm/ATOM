@@ -13,6 +13,7 @@ from unittest.mock import patch
 import torch
 import torch._inductor.compile_fx
 import torch.fx as fx
+
 from atom.config import Config
 from atom.utils import compilation_counter, is_torch_equal_or_newer
 
@@ -40,9 +41,7 @@ def _save_standalone_compiled_graph(
     """
     is_saveable = getattr(compiled_graph, "is_saveable", None)
     if callable(is_saveable) and not is_saveable():
-        _log_non_saveable_artifact(
-            key, "PyTorch did not emit a serializable artifact"
-        )
+        _log_non_saveable_artifact(key, "PyTorch did not emit a serializable artifact")
         return None
 
     try:
