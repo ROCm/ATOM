@@ -1690,6 +1690,43 @@ class Indexer(nn.Module):
             topk_global - seq_base,
         )  # [total_tokens, topk] int32, raw seq-local with -1 in tail
 
+    def _decode_top_k(
+        self,
+        logits: torch.Tensor,
+        out: torch.Tensor,
+        *,
+        num_rows: int,
+        topk: int,
+        next_n: int,
+        n_committed_per_seq_gpu: torch.Tensor,
+        row_ends: torch.Tensor | None,
+    ) -> None:
+        """`top_k_per_row_decode`, bounded per ROW rather than per seq.
+
+        aiter's per-seq bound is `rowEnds[b] - next_n + (row % next_n) + 1` —
+        one KV row per query token, which is a ratio-1 indexer's rule. CSA packs
+        `ratio` query tokens into one compressed row, so under speculation that
+        writes FEWER entries than the CSA slice head reserved and leaves aiter's
+        `-1` sentinel in the rest, which `csa_translate_pack` turns into pool row
+        `phys * envelope_rows - 1`. `row_ends` is the array the head was reserved
+        from, so passing it makes the two exact by construction.
+
+        `row_ends=None` keeps the per-seq form, for callers that build their own
+        metadata (the SGLang bridge), whose decode is one token per seq — where
+        the two bounds coincide.
+        """
+        top_k_per_row_decode(
+            logits,
+            next_n,
+            n_committed_per_seq_gpu,
+            out,
+            num_rows,
+            logits.stride(0),
+            logits.stride(1),
+            k=topk,
+            rowEndsPerRow=row_ends,
+        )
+
     def _score_topk_decode(
         self,
         q_fp8: torch.Tensor,  # [total_tokens, n_heads, head_dim] fp8
@@ -1779,15 +1816,15 @@ class Indexer(nn.Module):
         topk_local = torch.empty(
             total_tokens, self.index_topk, dtype=torch.int32, device=q_fp8.device
         )
-        top_k_per_row_decode(
+        row_ends = getattr(attn_md, "csa_topk_row_ends", None)
+        self._decode_top_k(
             logits,
-            next_n,
-            n_committed_per_seq_gpu,
             topk_local,
-            total_tokens,
-            logits.stride(0),
-            logits.stride(1),
-            k=topk,
+            num_rows=total_tokens,
+            topk=topk,
+            next_n=next_n,
+            n_committed_per_seq_gpu=n_committed_per_seq_gpu,
+            row_ends=None if row_ends is None else row_ends[:total_tokens],
         )
         return topk_local  # [total_tokens, index_topk] int32, raw seq-local
 
@@ -1982,9 +2019,9 @@ class Indexer(nn.Module):
         cta_info = indexer_meta["fp4_cta_info"]
         total_ctas = indexer_meta["fp4_total_ctas"]
         # Write-once GPU scratch, NOT -inf-filled (mirrors the FP8 decode path).
-        # The kernel writes every column in `[0, context_len)` per row and
-        # `top_k_per_row_decode` bounds each row by `n_committed_per_seq` (==
-        # context_len) — so cells past it are never read. A `torch.full(-inf)`
+        # The kernel writes every column in `[0, context_len)` per row and the
+        # top-k bounds each row by at most `n_committed_per_seq` (== context_len)
+        # — so cells past it are never read. A `torch.full(-inf)`
         # pre-fill would be wasted ~290μs FillFunc work at width
         # `max_model_len_idx`. CG-safe: torch.empty lands in the graph's private
         # pool at a stable address across replays at this captured shape.
@@ -2016,15 +2053,15 @@ class Indexer(nn.Module):
         topk_local = torch.empty(
             total_tokens, self.index_topk, dtype=torch.int32, device=q_fp4.device
         )
-        top_k_per_row_decode(
+        row_ends = getattr(attn_md, "csa_topk_row_ends", None)
+        self._decode_top_k(
             logits,
-            next_n,
-            n_committed_per_seq_gpu,
             topk_local,
-            total_tokens,
-            logits.stride(0),
-            logits.stride(1),
-            k=topk,
+            num_rows=total_tokens,
+            topk=topk,
+            next_n=next_n,
+            n_committed_per_seq_gpu=n_committed_per_seq_gpu,
+            row_ends=None if row_ends is None else row_ends[:total_tokens],
         )
         return topk_local  # [total_tokens, index_topk] int32, raw seq-local
 
@@ -2225,15 +2262,23 @@ class Indexer(nn.Module):
         topk_rect = torch.full(
             (R + 1, self.index_topk), -1, dtype=torch.int32, device=device
         )
-        top_k_per_row_decode(
+        # Per-row ends follow the same scatter as Q, so a rect row is bounded by
+        # the count its own token reserved (see `_decode_top_k`). Rows no token
+        # landed on keep 0 — the kernel writes only sentinels there, and the
+        # gather never reads them.
+        row_ends = getattr(attn_md, "csa_topk_row_ends", None)
+        ends_rect = None
+        if row_ends is not None:
+            ends_rect = torch.zeros(R + 1, dtype=torch.int32, device=device)
+            ends_rect[dst] = row_ends[:total_tokens]
+        self._decode_top_k(
             logits,
-            full_q,
-            n_committed_per_seq_gpu,
             topk_rect[:R],
-            R,
-            logits.stride(0),
-            logits.stride(1),
-            k=topk,
+            num_rows=R,
+            topk=topk,
+            next_n=full_q,
+            n_committed_per_seq_gpu=n_committed_per_seq_gpu,
+            row_ends=None if ends_rect is None else ends_rect[:R],
         )
         # Gather each seq's real rows back to the ragged [total_tokens] layout.
         # Pad tokens (dst==R) read the -1 sentinel row → harmless downstream.

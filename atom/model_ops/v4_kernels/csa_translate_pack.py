@@ -87,13 +87,11 @@ def _csa_translate_pack_kernel(
     # per token — see `_attach_v4_paged_decode_meta` / `_build_paged_prefill_meta`).
     # Reading the delta replaces the previous chain
     # `min(min((pos+1)//ratio, n_csa_seq), index_topk)` — eliminates the
-    # `n_csa_seq` load and the `(pos+1)//ratio` compute, and stays
-    # CORRECT under the aiter `top_k_per_row_*` contract which only writes
-    # `[0, min(k, row_length))` (the tail is uninitialized garbage from
-    # `torch.empty`, never -1 — aiter tests confirm via `compare_topk_results`
-    # checking only the head). The `k_offs < valid_k` mask remains the
-    # primary correctness barrier; `topk >= 0` is dropped as it was never
-    # a reliable filter for the uninitialized tail.
+    # `n_csa_seq` load and the `(pos+1)//ratio` compute. Correct only while
+    # `valid_k` equals aiter's `row_length`, since `top_k_per_row_*` writes
+    # `[0, min(k, row_length))` and leaves the rest as garbage (prefill) or as
+    # `-1` (decode). Both paths now hand the kernel that same number as its
+    # per-row ends. `k_offs < valid_k` is the barrier; the clamp below the floor.
     if INLINE_SKIP_FROM_POS:
         # Decode: skip = `actual_swa_count[t]` = min(positions[t]+1, win).
         # Derived inline so the caller can omit the per-token CPU write +
@@ -121,6 +119,12 @@ def _csa_translate_pack_kernel(
         mask=in_range,
         other=0,
     )
+    # A negative here means the top-k wrote fewer entries than `valid_k` cells
+    # were reserved — the two come from one array now, so it should not happen.
+    # If it ever does, floor to this request's own first compressed row rather
+    # than let `-1` become `phys * ENVELOPE_ROWS - 1`, which is either a fault
+    # or a silent read of whatever the previous block ends with.
+    topk = tl.maximum(topk, 0)
 
     # Translate seq-local row → physical paged offset.
     blk_idx = topk // csa_block_capacity
@@ -163,10 +167,11 @@ def csa_translate_pack(
     (`min((pos+1)//ratio, n_committed_csa[bid], index_topk)`) by construction
     of the CPU-side indptr builders (see `_attach_v4_paged_decode_meta`,
     `_build_paged_prefill_meta`). aiter's `top_k_per_row_*` writes only
-    `[0, valid_k)` and leaves the tail UNINITIALIZED (`torch.empty`, no
-    `-1` fill), so the explicit `k_offs < valid_k` mask is what keeps the
-    kernel correct — the previous `topk >= 0` check would NOT have been a
-    reliable filter for the garbage tail.
+    `[0, min(k, row_length))`, so this holds exactly as long as its `row_length`
+    is that same number — which both paths arrange by handing the kernel per-row
+    ends. The `k_offs < valid_k` mask is what keeps the kernel correct; a
+    `topk >= 0` check would not be, since a prefill tail is uninitialized
+    garbage rather than `-1`.
 
     Args:
       topk_local:                  [T, index_topk] int32 — indexer's seq-local
