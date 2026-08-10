@@ -11,12 +11,11 @@ import logging
 from typing import Any, Iterable, Optional, Tuple, Union
 
 import torch
-from torch import nn
-
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from torch import nn
 
 from atom.plugin.sglang.runtime import (
     MODEL_ARCH_SPECS,
@@ -81,8 +80,13 @@ class _AtomCausalLMBaseForSglang(nn.Module):
         self.pp_group = get_pp_group()
         self.quant_config = quant_config
         self.config = config
-        self.vocab_size = config.vocab_size
-        self.unpadded_vocab_size = config.vocab_size
+        vocab_size = getattr(config, "vocab_size", None)
+        if vocab_size is None and hasattr(config, "text_config"):
+            vocab_size = getattr(config.text_config, "vocab_size", None)
+        if vocab_size is None:
+            raise AttributeError(f"{type(config).__name__} does not define vocab_size")
+        self.vocab_size = vocab_size
+        self.unpadded_vocab_size = vocab_size
         self.model_arch = getattr(config, "architectures", [""])[0]
         self.model_arch_spec = get_model_arch_spec(self.model_arch)
         self.capture_aux_hidden_states = False
