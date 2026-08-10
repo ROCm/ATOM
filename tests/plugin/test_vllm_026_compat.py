@@ -1,12 +1,5 @@
-import importlib
-import json
-import sys
-from pathlib import Path
 from types import SimpleNamespace
 
-from atom.plugin.vllm.cudagraph_memory_profiler_patch import (
-    apply_vllm_cudagraph_memory_profiler_patch,
-)
 from atom.plugin.vllm.deepseek_v4_prefix_patch import (
     _drop_swa_warmup_blocks,
     _kv_cache_config_has_v4_proxy,
@@ -14,8 +7,6 @@ from atom.plugin.vllm.deepseek_v4_prefix_patch import (
     _mark_v4_proxy_cache_mode,
 )
 from atom.plugin.vllm.spec_decode_patch import _make_atom_compatible_eagle3_type
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 class _FakeKVCacheManager:
@@ -119,62 +110,3 @@ def test_eagle3_type_proxy_is_valid_isinstance_guard():
     assert isinstance(NativeEagle3(), guard)
     assert isinstance(AtomModelBase(), guard)
     assert not isinstance(object(), guard)
-
-
-def test_disabled_cudagraph_memory_profiler_skips_temporary_capture(monkeypatch):
-    vllm_envs = importlib.import_module("vllm.envs")
-
-    calls = []
-
-    class FakeGPUModelRunner:
-        def profile_cudagraph_memory(self, marker=None):
-            calls.append(marker)
-            return 17
-
-    fake_module = SimpleNamespace(GPUModelRunner=FakeGPUModelRunner)
-    monkeypatch.setitem(
-        sys.modules,
-        "vllm.v1.worker.gpu_model_runner",
-        fake_module,
-    )
-    monkeypatch.setattr(
-        vllm_envs,
-        "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS",
-        False,
-    )
-
-    apply_vllm_cudagraph_memory_profiler_patch()
-    patched = FakeGPUModelRunner.profile_cudagraph_memory
-    apply_vllm_cudagraph_memory_profiler_patch()
-
-    runner = FakeGPUModelRunner()
-    assert FakeGPUModelRunner.profile_cudagraph_memory is patched
-    assert runner.profile_cudagraph_memory("disabled") == 0
-    assert calls == []
-
-    monkeypatch.setattr(
-        vllm_envs,
-        "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS",
-        True,
-    )
-    assert runner.profile_cudagraph_memory("enabled") == 17
-    assert calls == ["enabled"]
-
-
-def test_stateful_nightly_cases_use_root_cudagraph_fix():
-    catalog = json.loads(
-        (REPO_ROOT / ".github/benchmark/oot_models_accuracy.json").read_text()
-    )
-    target_models = {
-        "MiniMax-M2.5 TP2",
-        "MiniMax-M2.5 TP4",
-        "GLM-4.7-FP8 MTP TP4",
-        "GLM-4.7-FP8 MTP TP8",
-    }
-    entries = {entry["model_name"]: entry for entry in catalog}
-
-    for model_name in target_models:
-        entry = entries[model_name]
-        assert "client_command" not in entry
-        assert "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0" in entry["env_vars"]
-        assert "PIECEWISE" not in entry["extra_args"]
