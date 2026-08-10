@@ -16,7 +16,7 @@ class WeightUpdaterMixin:
       - self.model (nn.Module)
       - self.device (torch.device)
       - self.rank (int) — TP rank
-      - self.world_size (int) — TP size
+      - self.tp_size (int) — tensor-parallel size
       - self.label (str)
       - self.clear_kv_cache() — method
     """
@@ -209,7 +209,7 @@ class WeightUpdaterMixin:
 
         tensor_gpu = tensor.to(device=self.device, dtype=torch.float32)
 
-        tp_size = self.world_size
+        tp_size = self.tp_size
         if tp_size > 1 and tensor_gpu.shape != param.shape:
             for dim in range(len(param.shape)):
                 if tensor_gpu.shape[dim] == param.shape[dim] * tp_size:
@@ -382,7 +382,7 @@ class WeightUpdaterMixin:
                     )
                     skipped += 1
             else:
-                tp_size = self.world_size
+                tp_size = self.tp_size
                 tp_rank = self.rank
                 if tp_size > 1 and self._try_shard_weight(
                     param, tensor, tp_rank, tp_size
@@ -501,7 +501,7 @@ class WeightUpdaterMixin:
                         )
                         skipped += 1
                 else:
-                    tp_size = self.world_size
+                    tp_size = self.tp_size
                     tp_rank = self.rank
                     if tp_size > 1 and self._try_shard_weight(
                         param, tensor, tp_rank, tp_size
@@ -575,7 +575,7 @@ class WeightUpdaterMixin:
             from atom.rollout.weight_sync import rebuild_ipc_handle
 
             dp_rank_local = self.config.parallel_config.data_parallel_rank_local or 0
-            global_device_idx = dp_rank_local * self.world_size + self.rank
+            global_device_idx = dp_rank_local * self.tp_size + self.rank
             local_device_idx = self.device.index
             if ipc_handles is not None and global_device_idx in ipc_handles:
                 self._ipc_buffer = rebuild_ipc_handle(
@@ -658,7 +658,7 @@ class WeightUpdaterMixin:
                     )
                     skipped += 1
             else:
-                tp_size = self.world_size
+                tp_size = self.tp_size
                 tp_rank = self.rank
                 if tp_size > 1 and self._try_shard_weight(
                     param, tensor, tp_rank, tp_size

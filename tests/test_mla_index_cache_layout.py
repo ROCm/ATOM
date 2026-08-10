@@ -6,7 +6,9 @@ from types import SimpleNamespace
 from atom.model_ops.attentions import aiter_mla
 from atom.model_ops.attentions.aiter_mla import (
     AiterMLAMetadataBuilder,
+    _aligned_index_cache_dim,
     _global_index_cache_layer_ids,
+    _mla_kv_cache_dim,
 )
 
 
@@ -20,11 +22,20 @@ def _mock_pp(monkeypatch, rank: int, world_size: int) -> None:
     )
 
 
-def _builder(indexer_types, total_local_layers: int):
+def _builder(
+    indexer_types,
+    total_local_layers: int,
+    *,
+    kv_lora_rank: int = 512,
+    qk_rope_head_dim: int = 64,
+    index_head_dim: int = 128,
+):
     hf_config = SimpleNamespace(
         num_hidden_layers=len(indexer_types) if indexer_types is not None else 6,
         indexer_types=indexer_types,
-        index_head_dim=128,
+        index_head_dim=index_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
     )
     runner = SimpleNamespace(
         config=SimpleNamespace(
@@ -39,7 +50,8 @@ def _builder(indexer_types, total_local_layers: int):
         ),
         block_size=16,
         is_deepseek_v32=True,
-        _get_total_num_layers=lambda: total_local_layers,
+        _get_local_total_num_layers=lambda: total_local_layers,
+        _get_local_num_target_layers=lambda: 3,
     )
     builder = object.__new__(AiterMLAMetadataBuilder)
     builder.model_runner = runner
@@ -54,6 +66,35 @@ def test_global_index_cache_layout_excludes_shared_and_keeps_mtp():
 
 def test_global_index_cache_layout_without_schedule_is_unchanged():
     assert _global_index_cache_layer_ids(None, 4, 1) == (0, 1, 2, 3, 4)
+
+
+def test_local_total_layers_adds_mtp_only_on_drafter_stage(monkeypatch):
+    from atom.model_engine import model_runner
+    from atom.model_engine.model_runner import ModelRunner
+
+    runner = object.__new__(ModelRunner)
+    runner.config = SimpleNamespace(
+        hf_config=SimpleNamespace(num_hidden_layers=6),
+        speculative_config=SimpleNamespace(
+            draft_model_hf_config=SimpleNamespace(num_nextn_predict_layers=2),
+            use_dspark_with_draft=lambda: False,
+        ),
+    )
+
+    monkeypatch.setattr(
+        model_runner,
+        "get_pp_group",
+        lambda: SimpleNamespace(rank_in_group=0, world_size=2),
+    )
+    assert runner._get_local_total_num_layers() == 3
+
+    runner.drafter = object()
+    monkeypatch.setattr(
+        model_runner,
+        "get_pp_group",
+        lambda: SimpleNamespace(rank_in_group=1, world_size=2),
+    )
+    assert runner._get_local_total_num_layers() == 5
 
 
 def test_pp_local_index_cache_layout_uses_global_layer_ids(monkeypatch):
@@ -96,6 +137,51 @@ def test_compute_block_bytes_uses_compact_index_layer_count(monkeypatch):
     )
 
     assert builder.compute_block_bytes() == 16 * (4 * 576 + 3 * 144)
+
+
+def test_cache_dimensions_are_derived_and_index_rows_are_aligned():
+    hf_config = SimpleNamespace(kv_lora_rank=480, qk_rope_head_dim=32)
+
+    assert _mla_kv_cache_dim(hf_config) == 512
+    assert _aligned_index_cache_dim(111) == 128
+    assert _aligned_index_cache_dim(124) == 128
+    assert _aligned_index_cache_dim(125) == 144
+
+
+def test_block_bytes_support_nonstandard_mla_and_index_dimensions(monkeypatch):
+    builder, _ = _builder(
+        ("full", "shared", "shared", "full", "shared", "full"),
+        total_local_layers=4,
+        kv_lora_rank=480,
+        qk_rope_head_dim=32,
+        index_head_dim=111,
+    )
+    _mock_pp(monkeypatch, rank=1, world_size=2)
+    fake_fp8 = SimpleNamespace(itemsize=1)
+    monkeypatch.setattr(
+        aiter_mla,
+        "dtypes",
+        SimpleNamespace(d_dtypes={"fp8": fake_fp8}, fp8=fake_fp8),
+    )
+
+    assert builder.compute_block_bytes() == 16 * (4 * 512 + 3 * 128)
+
+
+def test_compact_layout_uses_fewer_bytes_than_full_layout(monkeypatch):
+    compact, _ = _builder(
+        ("full", "shared", "shared", "full", "shared", "full"),
+        total_local_layers=4,
+    )
+    full, _ = _builder(None, total_local_layers=4)
+    _mock_pp(monkeypatch, rank=1, world_size=2)
+    fake_fp8 = SimpleNamespace(itemsize=1)
+    monkeypatch.setattr(
+        aiter_mla,
+        "dtypes",
+        SimpleNamespace(d_dtypes={"fp8": fake_fp8}, fp8=fake_fp8),
+    )
+
+    assert full.compute_block_bytes() - compact.compute_block_bytes() == 16 * 144
 
 
 def test_allocate_index_cache_uses_compact_shape_and_map(monkeypatch):
@@ -185,7 +271,10 @@ def test_build_kv_cache_tensor_binds_compact_index_slice():
         num_physical_kvcache_blocks=8,
         physical_block_size=1,
         aligned_index_dim=144,
-        config=SimpleNamespace(max_model_len=1024),
+        config=SimpleNamespace(
+            max_model_len=1024,
+            hf_config=SimpleNamespace(kv_lora_rank=480, qk_rope_head_dim=32),
+        ),
     )
     builder.model_runner = runner
     module = SimpleNamespace(
@@ -199,7 +288,7 @@ def test_build_kv_cache_tensor_binds_compact_index_slice():
 
     cache_tensor = builder.build_kv_cache_tensor(layer_id=2, module=module)
 
-    assert module.kv_cache[0] == ("kv", 2)
+    assert module.kv_cache == (("kv", 2), (8, 1, 512))
     assert module.indexer.k_cache.kv_cache[0][0] == ("index", 1)
     assert cache_tensor.layer_num == 2
 
@@ -214,7 +303,10 @@ def test_build_shared_layer_keeps_main_kv_without_index_slice():
         num_physical_kvcache_blocks=8,
         physical_block_size=1,
         aligned_index_dim=144,
-        config=SimpleNamespace(max_model_len=1024),
+        config=SimpleNamespace(
+            max_model_len=1024,
+            hf_config=SimpleNamespace(kv_lora_rank=480, qk_rope_head_dim=32),
+        ),
     )
     builder.model_runner = runner
     module = SimpleNamespace(
@@ -226,7 +318,7 @@ def test_build_shared_layer_keeps_main_kv_without_index_slice():
 
     builder.build_kv_cache_tensor(layer_id=1, module=module)
 
-    assert module.kv_cache[0] == ("kv", 1)
+    assert module.kv_cache == (("kv", 1), (8, 1, 512))
 
 
 def test_transfer_regions_use_explicit_compact_consumer_map(monkeypatch):

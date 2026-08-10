@@ -613,9 +613,7 @@ class ModelRunner:
         self.block_size = config.kv_cache_block_size
         self.kv_cache_dtype = config.kv_cache_dtype
         self.enforce_eager = config.enforce_eager
-        # TODO(Mengqing): it seems more proper to name it as tp_world_size
-        # instead of world_size
-        self.world_size = config.tensor_parallel_size
+        self.tp_size = config.tensor_parallel_size
         self.tp_world_size = config.tp_world_size
         self.rank = rank
         self.label = f"Model Runner{rank}/{self.tp_world_size}"
@@ -1430,11 +1428,11 @@ class ModelRunner:
     def _get_num_kv_heads(self):
         """Return the per-rank number of KV heads."""
         hf_config = self.config.hf_config
-        if hf_config.num_key_value_heads >= self.world_size:
-            assert hf_config.num_key_value_heads % self.world_size == 0
-            return hf_config.num_key_value_heads // self.world_size
+        if hf_config.num_key_value_heads >= self.tp_size:
+            assert hf_config.num_key_value_heads % self.tp_size == 0
+            return hf_config.num_key_value_heads // self.tp_size
         else:
-            assert self.world_size % hf_config.num_key_value_heads == 0
+            assert self.tp_size % hf_config.num_key_value_heads == 0
             return 1
 
     def _mrope_positions_view(self, num_tokens: int) -> torch.Tensor:
@@ -1451,8 +1449,8 @@ class ModelRunner:
         times and declares how many it has in `num_nextn_predict_layers`.
 
         Single source of truth on purpose: this count drives both the pool
-        sizing (`_get_total_num_layers` -> the builders' `sub_pool_specs`) and
-        the allocation itself. Two independent spellings of it silently
+        sizing (`_get_local_total_num_layers` -> the builders' `sub_pool_specs`)
+        and the allocation itself. Two independent spellings of it silently
         disagreed for the standalone DSpark draft, sizing 1 slot while
         allocating 5.
         """
@@ -1466,24 +1464,25 @@ class ModelRunner:
             return draft_hf.num_hidden_layers
         return getattr(draft_hf, "num_nextn_predict_layers", 1)
 
-    def _get_total_num_layers(self):
-        # TODO(Mengqing): it seems more proper to name it as _get_local_total_num_layers
-        """Return total layer count including draft (MTP) layers.
+    def _get_local_num_target_layers(self) -> int:
+        """Return the number of target-model layers owned by this PP stage."""
+        num_hidden = self.config.hf_config.num_hidden_layers
+        pp_group = get_pp_group()
+        start, end = get_pp_indices(
+            num_hidden, pp_group.rank_in_group, pp_group.world_size
+        )
+        return end - start
+
+    def _get_local_total_num_layers(self) -> int:
+        """Return this PP stage's target and shared-pool draft layer count.
 
         Drafts that own an independent KV cache via their own builder
         (e.g. Eagle3 MHA draft on an MLA target) account for their layers
-        through that builder, so they are NOT added here. Only drafts that
-        share the target's KV pool contribute.
+        through that builder, so they are NOT added here. Only MTP-style
+        drafts that share the target's KV pool contribute, and only the last
+        PP stage constructs a drafter.
         """
-        num_hidden = self.config.hf_config.num_hidden_layers
-        pp_group = get_pp_group()
-        if pp_group.world_size > 1:
-            start, end = get_pp_indices(
-                num_hidden, pp_group.rank_in_group, pp_group.world_size
-            )
-            total = end - start
-        else:
-            total = num_hidden
+        total = self._get_local_num_target_layers()
         if (
             self.config.speculative_config
             and hasattr(self, "drafter")
@@ -1497,7 +1496,7 @@ class ModelRunner:
 
         The target builder always, plus an optional `eagle3_draft_builder`
         when a heterogeneous spec-decode draft owns its own KV. Each builder
-        knows its own tensor layout (MLA 576-dim packed, GDN-hybrid
+        knows its own tensor layout ((MLA packed latent, GDN-hybrid
         full-attn-only, MiMo-V2 per-layer-type, standard MHA split-K/V,
         Eagle3 independent MHA); the runner only sums bytes. Specs sharing a
         name merge in `plan_pools`, which is how the draft KV joins the
@@ -1840,36 +1839,48 @@ class ModelRunner:
         self.num_physical_kvcache_blocks = (
             num_kvcache_blocks * self.attn_metadata_builder.block_ratio
         )
-        if hf_config.num_key_value_heads >= self.world_size:
-            assert hf_config.num_key_value_heads % self.world_size == 0
-            num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        if hf_config.num_key_value_heads >= self.tp_size:
+            assert hf_config.num_key_value_heads % self.tp_size == 0
+            num_kv_heads = hf_config.num_key_value_heads // self.tp_size
         else:
-            assert self.world_size % hf_config.num_key_value_heads == 0
+            assert self.tp_size % hf_config.num_key_value_heads == 0
             num_kv_heads = 1
         # Promote to self so attention builders' build_kv_cache_tensor()
         # hooks can access it without re-deriving from hf_config.
         self.num_kv_heads = num_kv_heads
         self.aligned_index_dim = None  # set below for DeepSeek-V3.2
 
-        # Total layer count (target + any draft sharing the target's pool).
-        total_num_layers = self._get_total_num_layers()
+        # Calculate total number of layers (target + draft)
+        total_num_layers = self._get_local_total_num_layers()
+        num_local_target_layers = self._get_local_num_target_layers()
         num_draft_layers = 0
         if self.config.speculative_config and hasattr(self, "drafter"):
             owns_pool = hasattr(self, "eagle3_draft_builder")
+            spec_config = self.config.speculative_config
             num_draft_layers = self._num_draft_kv_layers()
+            has_real_stack = (
+                owns_pool
+                or getattr(spec_config, "use_dspark_with_draft", lambda: False)()
+            )
+            num_shared_pool_draft_layers = total_num_layers - num_local_target_layers
             logger.info(
-                f"Allocating KV cache for {hf_config.num_hidden_layers} target "
-                f"layers + {num_draft_layers} draft layers"
+                f"Allocating target KV cache for {num_local_target_layers} "
+                f"local target layers + {num_shared_pool_draft_layers} "
+                f"shared-pool draft layers = {total_num_layers} total layers"
                 + (
-                    " (separate sibling pool)"
+                    f"; {num_draft_layers} draft layers use a separate sibling pool"
                     if owns_pool
-                    else f" = {total_num_layers} total layers"
+                    else (
+                        f"; {num_draft_layers} DSpark stages use private caches"
+                        if has_real_stack
+                        else ""
+                    )
                 )
             )
 
         # Primary KV cache allocation (model-agnostic, delegated to the
         # attention builder). Each builder owns its tensor layout: MLA →
-        # single 576-dim per layer; GDN-hybrid → only num_full_attn rows;
+        # one packed latent row per layer; GDN-hybrid → only num_full_attn rows;
         # MiMo-V2 → defer per-module; standard MHA → split-K/V `[2, L, ...]`.
         # Returned tensors are setattr'd on `self` under their conventional
         # names (kv_cache, kv_scale, index_cache, aligned_index_dim,
@@ -4012,7 +4023,7 @@ class ModelRunner:
         self.graph_pool = None
         is_tbo = self.config.enable_tbo and isinstance(self.model, UBatchWrapper)
         # TBO graphs don't capture compute_logits, so disable logits_in_graph.
-        self.logits_in_graph = self.world_size == 1 and not is_tbo
+        self.logits_in_graph = self.tp_size == 1 and not is_tbo
 
         # start capture profiler
         self.start_capture_profiler()
@@ -4660,8 +4671,8 @@ class RapidServeModelRunner(ModelRunner):
         allocate_kv_cache() is skipped."""
         config = self.config
         hf_config = config.hf_config
-        if hf_config.num_key_value_heads >= self.world_size:
-            num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        if hf_config.num_key_value_heads >= self.tp_size:
+            num_kv_heads = hf_config.num_key_value_heads // self.tp_size
         else:
             num_kv_heads = 1
         x = 16 // self.kv_cache.element_size()
@@ -4712,10 +4723,13 @@ class RapidServeModelRunner(ModelRunner):
                         module.v_cache = v_cache
                         layer_id += 1
                     elif hasattr(module, "use_mla") and module.use_mla:
+                        mla_cache_dim = (
+                            hf_config.kv_lora_rank + hf_config.qk_rope_head_dim
+                        )
                         kv_cache = self.kv_cache[layer_id].view(
                             self.num_physical_kvcache_blocks * self.physical_block_size,
                             1,
-                            576,
+                            mla_cache_dim,
                         )
                         module.max_model_len = self.config.max_model_len
                         from atom.config import KVCacheTensor
