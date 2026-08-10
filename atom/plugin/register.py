@@ -39,6 +39,7 @@ if is_sglang():
     from atom.models.deepseek_v4 import DeepseekV4ForCausalLM
     from atom.models.eagle3_llama import Eagle3LlamaModel
     from atom.models.kimi_k3 import KimiK3ForCausalLM
+    from atom.models.kimi_k3_dspark import KimiK3DSpark
     from atom.models.kimi_k25 import KimiK25ForCausalLM
     from atom.models.qwen3_5 import (
         Qwen3_5ForCausalLM,
@@ -64,6 +65,8 @@ if is_sglang():
     )
     _ATOM_SUPPORTED_DRAFT_MODELS = {
         "LlamaForCausalLMEagle3": Eagle3LlamaModel,
+        # Kimi-K3 DSpark standalone block drafter (arch K3DSparkModel).
+        "K3DSparkModel": KimiK3DSpark,
     }
     _ATOM_SUPPORTED_MODELS.update(_ATOM_SUPPORTED_DRAFT_MODELS)
 

@@ -96,6 +96,17 @@ class SGLangGDNForwardContext:
         if mamba_map is None:
             return {}
 
+        if getattr(forward_batch, "forward_mode", None) is not None and (
+            forward_batch.forward_mode.is_target_verify()
+        ):
+            from atom.plugin.sglang.kimi_k3_spec_verify import (
+                build_spec_cache_tensors,
+            )
+
+            return build_spec_cache_tensors(
+                forward_batch, attn_backend, pool, mamba_map
+            )
+
         out: dict[str, KVCacheTensor] = {}
         for layer_id in mamba_map:
             layer_cache = pool.mamba2_layer_cache(layer_id)
@@ -134,10 +145,13 @@ class SGLangGDNForwardContext:
     ) -> GDNAttentionMetadata | None:
         mode = forward_batch.forward_mode
         if mode.is_target_verify():
-            logger.warning(
-                "SGLang GDN forward context: TARGET_VERIFY is not supported; GDN metadata skipped."
+            from atom.plugin.sglang.kimi_k3_spec_verify import (
+                build_spec_gdn_metadata,
+                build_spec_plan,
             )
-            return None
+
+            plan = build_spec_plan(forward_batch, linear_backend)
+            return build_spec_gdn_metadata(plan)
 
         bs = forward_batch.batch_size
         fm = getattr(linear_backend, "forward_metadata", None)
