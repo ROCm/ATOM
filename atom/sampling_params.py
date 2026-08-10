@@ -42,20 +42,6 @@ class SamplingDefaults:
         }
         return cls(**values)
 
-    def with_overrides(
-        self,
-        *,
-        temperature: float | None = None,
-        top_k: int | None = None,
-        top_p: float | None = None,
-    ) -> "SamplingDefaults":
-        """Return defaults overridden by values explicitly sent by a client."""
-        return type(self)(
-            temperature=self.temperature if temperature is None else temperature,
-            top_k=self.top_k if top_k is None else top_k,
-            top_p=self.top_p if top_p is None else top_p,
-        )
-
 
 @dataclass
 class SamplingParams:

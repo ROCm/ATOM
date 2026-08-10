@@ -70,17 +70,3 @@ def test_sampling_defaults_use_generation_config_diff():
     assert SamplingDefaults.from_generation_config(
         FakeGenerationConfig()
     ) == SamplingDefaults(top_p=0.95)
-
-
-def test_sampling_defaults_preserve_explicit_request_values():
-    model_defaults = SamplingDefaults(temperature=0.8, top_p=0.95, top_k=50)
-
-    assert model_defaults.with_overrides(
-        temperature=0.0, top_p=1.0, top_k=20
-    ) == SamplingDefaults(temperature=0.0, top_p=1.0, top_k=20)
-
-
-def test_sampling_defaults_keep_model_values_for_omitted_request_fields():
-    model_defaults = SamplingDefaults(temperature=1.0, top_p=0.95, top_k=-1)
-
-    assert model_defaults.with_overrides() == model_defaults
