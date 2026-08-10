@@ -907,6 +907,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             v_cache=None,
             k_scale=None,
             v_scale=None,
+            index_cache=(
+                runner.index_cache[layer_id] if runner.is_deepseek_v32 else None
+            ),
         )
 
     def get_kv_transfer_tensors(self):
