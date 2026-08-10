@@ -251,22 +251,11 @@ def gemm_a4w4_quant(
             x = x.view(torch.float4_e2m1fn_x2)
 
         m = x.view(-1, x.size(-1)).shape[0]
-        y = torch.empty(
-            (
-                (m + MXFP4_QUANT_BLOCK_SIZE - 1)
-                // MXFP4_QUANT_BLOCK_SIZE
-                * MXFP4_QUANT_BLOCK_SIZE,
-                output_size,
-            ),
-            dtype=otype,
-            device=x.device,
-        )
         y = gemm_a4w4(
             x,
             weight,
             x_scale,
             weight_scale,
-            y,
         )
 
     return y[:m, ...]
