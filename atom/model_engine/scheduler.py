@@ -342,6 +342,7 @@ class ScheduledBatch:
         remote_kv_seq_blocks: dict[int, list[int]] | None = None,
         num_cached_tokens: list[int] | None = None,
         is_final_chunk: list[bool] | None = None,
+        next_token_ids: list[int] | None = None,
         state_copy_pairs: list[tuple[int, int]] | None = None,
     ):
         if scheduled_spec_decode_tokens is None:
@@ -417,6 +418,11 @@ class ScheduledBatch:
         )
 
         self.is_final_chunk = is_final_chunk
+        # Per seq, the token following this forward where the scheduler knows it
+        # (a middle prefill chunk's successor prompt token), -1 where sampling
+        # supplies it. A drafter runs one position ahead of the target, so this
+        # is its anchor on the chunks that never reach sampling.
+        self.next_token_ids = next_token_ids
 
         # context_lens: for prefill seqs, use num_cached_tokens + num_scheduled_tokens
         self.context_lens = np.asarray(
@@ -640,6 +646,14 @@ class Scheduler:
         self.mtp_k: int = (
             config.speculative_config.num_speculative_tokens if self.use_spec else 0
         )  # type: ignore
+        # Serial EAGLE/MTP reads the target's token stream and needs the
+        # successor token; DSpark drafts from aux hidden states and ignores it.
+        # Must stay `use_dspark()`, the discriminator `build_drafter` branches
+        # on: `--method mtp` on a checkpoint carrying `dspark_block_size` still
+        # resolves to DSpark, so the method name alone would be wrong here.
+        self.drafter_needs_next_token = self.use_spec and not (
+            config.speculative_config.use_dspark()
+        )
         self.spec_stats: SpecStats | None = (
             SpecStats(mtp_k=self.mtp_k) if self.use_spec else None
         )
@@ -1288,6 +1302,24 @@ class Scheduler:
                 >= seq.num_prompt_tokens
                 for i, seq in enumerate(scheduled_seqs.values())
             ]
+            # See `ScheduledBatch.next_token_ids`. Only the scheduler can see
+            # past a middle chunk -- the batch carries that chunk's tokens alone.
+            next_token_ids = (
+                [
+                    (
+                        -1
+                        if is_final_chunk[i]
+                        else int(
+                            seq.token_ids[
+                                num_cached_tokens_list[i] + int(num_scheduled_tokens[i])
+                            ]
+                        )
+                    )
+                    for i, seq in enumerate(scheduled_seqs.values())
+                ]
+                if self.drafter_needs_next_token
+                else None
+            )
 
             prefill_batch = ScheduledBatch(
                 seqs=scheduled_seqs,
@@ -1299,6 +1331,7 @@ class Scheduler:
                 connector_meta_output=connector_meta_output,
                 num_cached_tokens=num_cached_tokens_list,
                 is_final_chunk=is_final_chunk,
+                next_token_ids=next_token_ids,
                 state_copy_pairs=self.block_manager.state_copies_for_batch(),
             )
             self._consume_state_forks(scheduled_seqs)

@@ -256,6 +256,43 @@ class DSparkProposer(Drafter):
         # Plain residual stream (no special bookkeeping).
         return output
 
+    def precompute_context_kv(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        next_token_ids: list[int] | None,
+    ) -> None:
+        """Populate the rolling target-KV window for this forward.
+
+        Every scheduled row is written, prefill and decode alike: the read side
+        gathers by absolute position without checking what was written, so
+        anything left unwritten shows the slot's previous occupant. Rejected
+        rows are harmless -- they land on future positions, unread until the
+        step that accepts them rewrites them.
+
+        `write_per_batch` must cover window + mtp_k, not just window: the anchor
+        sits up to mtp_k rows before the span end. Do NOT clamp it by
+        max_seqlen_q the way the V4 target clamps its own swa_write -- that was
+        tried and measured worse (GSM8K 0.936/0.941 vs 0.942-0.950).
+
+        `next_token_ids` is unused: DSpark drafts from aux hidden states.
+        """
+        del next_token_ids
+        aux_hidden_states = self.aux_for(hidden_states)
+        if aux_hidden_states is None:
+            return
+        forward_context = get_forward_context()
+        bs = forward_context.context.batch_size
+        main_hidden_all = torch.cat(aux_hidden_states, dim=-1)
+        write_per_batch = int(self.model.window_size) + int(self.mtp_k)
+        with record_function(f"dspark_ctx_kv[bs={bs} tok={main_hidden_all.shape[0]}]"):
+            self.model.precompute_context_kv(
+                main_hidden_all,
+                positions,
+                forward_context.attn_metadata.cu_seqlens_q[: bs + 1],
+                write_per_batch=write_per_batch,
+            )
+
     def propose(
         self,
         # [num_tokens] (unused: DSpark seeds from the verified anchor, not the
@@ -314,30 +351,9 @@ class DSparkProposer(Drafter):
                 anchor_positions,
             )
 
-        # Populate the rolling target-KV window: write EVERY scheduled row, on
-        # prefill and decode alike. A spec-decode step advances the anchor by
-        # 1 + accepted drafts, so writing only the anchor would leave most slots
-        # at their zero-init value — and the read side gathers them regardless,
-        # since validity comes from absolute position, not from what was written.
-        # Rejected rows are harmless: swa_write is content-addressed by position
-        # and the draft only reads [anchor-window+1, anchor], so they land on
-        # future positions, unread until the step that accepts them rewrites them.
+        # The rolling target-KV window is filled by `precompute_context_kv`,
+        # which the runner calls after every target forward.
         #
-        # write_per_batch is the grid's y extent; the kernel writes the LAST
-        # min(tok_n, WRITE_PER_BATCH) rows of each span. It must cover
-        # window + mtp_k, not just window: the anchor sits up to mtp_k rows
-        # before the span end, so a narrower bound drops the anchor's own row.
-        # Not clamped by max_seqlen_q the way the V4 target clamps its own
-        # swa_write — that was tried and measured worse (GSM8K 0.936/0.941 vs
-        # 0.942-0.950), so the over-provisioned grid stays.
-        write_per_batch = int(self.model.window_size) + int(self.mtp_k)
-        with record_function(f"dspark_ctx_kv[bs={bs} tok={main_hidden_all.shape[0]}]"):
-            self.model.precompute_context_kv(
-                main_hidden_all,
-                target_positions,
-                attn_metadata.cu_seqlens_q[: bs + 1],
-                write_per_batch=write_per_batch,
-            )
         # Draft width = the verify horizon mtp_k (num_speculative_tokens). This
         # may exceed dspark_block_size (the training default); the DSpark weights
         # carry no per-width parameters, so the wider block is drafted in one

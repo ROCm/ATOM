@@ -974,7 +974,7 @@ class TestCopyLifecycle:
 
     def test_a_copy_checkpoints_where_a_fork_cannot(self):
         """Speculation and a one-token step both stop a fork, neither a copy."""
-        spec = SimpleNamespace(num_speculative_tokens=3)
+        spec = SimpleNamespace(num_speculative_tokens=3, use_dspark=lambda: False)
         seq = stateful_seq(list(range(40)))
         seq.type = SequenceType.DECODE
         forking = Scheduler(ckpt_config(state_fork_tokens=1, speculative_config=spec))
@@ -1101,7 +1101,9 @@ class TestDecodePublishGate:
         path.
         """
         sched = self._sched(
-            speculative_config=SimpleNamespace(num_speculative_tokens=3)
+            speculative_config=SimpleNamespace(
+                num_speculative_tokens=3, use_dspark=lambda: False
+            )
         )
         assert sched._checkpoint_room(self._decoding_seq(), False) == 0
         assert sched.block_manager.checkpoint_limit(stateful_seq(list(range(40)))) > 0

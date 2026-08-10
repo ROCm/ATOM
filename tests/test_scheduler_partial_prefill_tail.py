@@ -33,8 +33,12 @@ from conftest import MockConfig
 from atom.model_engine.scheduler import Scheduler
 
 
-def _spec_config(k=3):
-    return SimpleNamespace(num_speculative_tokens=k)
+def _spec_config(k=3, dspark=False):
+    # `use_dspark` is part of the real SpeculativeConfig surface the scheduler
+    # reads (it decides whether a drafter consumes the target's token stream),
+    # so the stub carries it rather than letting the scheduler getattr around
+    # a missing attribute.
+    return SimpleNamespace(num_speculative_tokens=k, use_dspark=lambda: dspark)
 
 
 class _VetoDelayer:

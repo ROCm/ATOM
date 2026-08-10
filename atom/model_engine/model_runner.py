@@ -553,19 +553,22 @@ class tokenIDProcessor:
             max_tokens_per_seq=int(lens.max()) if bs else 1,
         )
 
-        # FLAT graph tail-padding. A captured decode graph reads out to
-        # `graph_bs * q_eff`, which a ragged step falls short of; those slots
-        # must hold a legal vocab id or the embedding gather runs off the end.
-        # Rectangular steps fill the region exactly and `run_model` pads the
-        # graph's own tail, so this only has work to do under ragged.
-        if ragged_lens is not None:
-            fill_to = total
-            if not self.runner.enforce_eager:
-                gbs = next((g for g in reversed(self.runner.graph_bs) if g >= bs), None)
-                if gbs is not None:
-                    fill_to = max(fill_to, int(gbs) * tokens_per_seq)
-            if fill_to > total:
-                self.input_ids.gpu[total:fill_to].zero_()
+        # CUDAGraph tail padding. A replayed decode graph reads a fixed
+        # `graph_bs * tokens_per_seq` tokens out of this persistent buffer, but a
+        # step writes only the `total` it scheduled, and `bs` sits between two
+        # captured buckets on most steps -- a 65-request batch replays the 128
+        # graph, so 63 requests' worth of slots are never written. Nobody else
+        # fills them: `run_model` pads `cu_seqlens_q` so the padded sequences are
+        # empty for attention, but the ids stay whatever the previous forward
+        # left, and the MoE path does consume padded rows. Zero is a legal vocab
+        # id, so the embedding gather stays in bounds either way.
+        fill_to = total
+        if not self.runner.enforce_eager:
+            gbs = next((g for g in reversed(self.runner.graph_bs) if g >= bs), None)
+            if gbs is not None:
+                fill_to = max(fill_to, int(gbs) * tokens_per_seq)
+        if fill_to > total:
+            self.input_ids.gpu[total:fill_to].zero_()
 
         input_ids = self.input_ids.gpu[:total_tokens]
         return input_ids
@@ -2849,7 +2852,13 @@ class ModelRunner:
                     hidden_states = None
                     logits = None
                 elif self._is_pure_middle_chunk(batch):
-                    hidden_states = None
+                    # Skips `compute_logits` only -- a middle chunk samples
+                    # nothing, but the drafter is still handed its hidden states.
+                    if _pcp_tbo_balanced:
+                        model_output = self._restore_pcp_balanced_output(
+                            model_output, _pcp_bal_groups, _pcp_size
+                        )
+                    hidden_states = model_output
                     logits = None
                 else:
                     if _pcp_tbo_balanced:
@@ -3081,6 +3090,15 @@ class ModelRunner:
 
         pp_group = get_pp_group()
         pp_non_last = pp_group.world_size > 1 and not pp_group.is_last_rank
+        # Before the batch is classified as producing a token or not: `propose()`
+        # is reached only from `postprocess`, so a drafter context maintained
+        # there would cover a chunked prefill's final chunk alone.
+        if hasattr(self, "drafter") and not pp_non_last and not batch.is_dummy_run:
+            self.drafter.precompute_context_kv(
+                get_forward_context().context.positions,
+                hidden_states,
+                batch.next_token_ids,
+            )
         if pp_non_last or self._is_pure_middle_chunk(batch):
             reset_forward_context()
             # Mark this slot's GPU work (attention consumed its metadata) done.
@@ -3155,6 +3173,21 @@ class ModelRunner:
         num_reject_tokens: torch.Tensor,
     ):
         forward_context = get_forward_context()
+
+        # A sequence still mid-prompt samples nothing usable, so its anchor is
+        # the scheduler's successor token instead. Per SEQUENCE, not per batch:
+        # a middle chunk can sit beside one on its final chunk.
+        nxt = batch.next_token_ids
+        if nxt is not None:
+            assert len(nxt) == next_token_ids.shape[0], (
+                f"{len(nxt)} scheduler anchors != {next_token_ids.shape[0]} "
+                "sampled -- they are matched positionally"
+            )
+            # -1 marks "sampling supplies it", so keep the sampled value there.
+            override = self.drafter.anchors_to_gpu(nxt)
+            next_token_ids = torch.where(
+                override >= 0, override.to(next_token_ids.dtype), next_token_ids
+            )
 
         positions = forward_context.context.positions
         # Anchor (last verified target token) flat index = segment_start +
