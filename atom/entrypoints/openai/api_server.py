@@ -41,6 +41,9 @@ from atom.utils.arg_parser import FlexibleArgumentParser
 
 from .chat_encoders import apply_chat_template, load_custom_message_encoder
 from .protocol import (
+    DEFAULT_TEMPERATURE,
+    DEFAULT_TOP_K,
+    DEFAULT_TOP_P,
     ChatCompletionRequest,
     CompletionRequest,
     ModelCard,
@@ -1434,12 +1437,26 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
             **merged_kwargs,
         )
 
-        model_sampling_defaults = engine.config.sampling_defaults
+        generation_config = engine.config.generation_config
+        generation_config_diff = (
+            generation_config.to_diff_dict()
+            if generation_config is not None
+            else {}
+        )
+        # Ignore Transformers defaults materialized for fields absent from the
+        # model's generation_config.json (notably top_k=50).
+        model_sampling_defaults = {
+            name: generation_config_diff[name]
+            for name in ("temperature", "top_p", "top_k")
+            if generation_config_diff.get(name) is not None
+        }
         sampling_params = _build_sampling_params(
             temperature=(
                 request.temperature
                 if request.temperature is not None
-                else model_sampling_defaults.temperature
+                else model_sampling_defaults.get(
+                    "temperature", DEFAULT_TEMPERATURE
+                )
             ),
             max_tokens=request.max_tokens,
             stop_strings=request.stop_sequences,
@@ -1447,23 +1464,13 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
             top_k=(
                 request.top_k
                 if request.top_k is not None
-                else model_sampling_defaults.top_k
+                else model_sampling_defaults.get("top_k", DEFAULT_TOP_K)
             ),
             top_p=(
                 request.top_p
                 if request.top_p is not None
-                else model_sampling_defaults.top_p
+                else model_sampling_defaults.get("top_p", DEFAULT_TOP_P)
             ),
-        )
-        logger.debug(
-            "[anthropic] resolved sampling params: temperature=%s top_p=%s "
-            "top_k=%s (request temperature=%s top_p=%s top_k=%s)",
-            sampling_params.temperature,
-            sampling_params.top_p,
-            sampling_params.top_k,
-            request.temperature,
-            request.top_p,
-            request.top_k,
         )
 
         request_id = uuid.uuid4().hex[:24]

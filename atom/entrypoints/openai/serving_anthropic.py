@@ -10,7 +10,7 @@ Anthropic-compatible tools to use ATOM as a backend.
 
 import json
 import logging
-from typing import Any
+from typing import Any, List, Optional
 
 from pydantic import BaseModel
 
@@ -22,14 +22,14 @@ logger = logging.getLogger("atom")
 
 class AnthropicContentBlock(BaseModel):
     type: str
-    text: str | None = None
+    text: Optional[str] = None
     # tool_use fields
-    id: str | None = None
-    name: str | None = None
-    input: Any | None = None
+    id: Optional[str] = None
+    name: Optional[str] = None
+    input: Optional[Any] = None
     # tool_result fields
-    tool_use_id: str | None = None
-    content: Any | None = None
+    tool_use_id: Optional[str] = None
+    content: Optional[Any] = None
 
 
 class AnthropicMessage(BaseModel):
@@ -39,27 +39,27 @@ class AnthropicMessage(BaseModel):
 
 class AnthropicMessagesRequest(BaseModel):
     model: str
-    messages: list[AnthropicMessage]
+    messages: List[AnthropicMessage]
     max_tokens: int = 4096
-    system: Any | None = None  # str or list
-    temperature: float | None = None
-    top_p: float | None = None
-    top_k: int | None = None
+    system: Optional[Any] = None  # str or list
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    top_k: Optional[int] = None
     stream: bool = False
-    stop_sequences: list[str] | None = None
-    tools: list[dict] | None = None
-    tool_choice: Any | None = None
-    metadata: dict | None = None
-    thinking: dict | None = None  # {"type":"enabled","budget_tokens":N}
+    stop_sequences: Optional[List[str]] = None
+    tools: Optional[List[dict]] = None
+    tool_choice: Optional[Any] = None
+    metadata: Optional[dict] = None
+    thinking: Optional[dict] = None  # {"type":"enabled","budget_tokens":N}
 
 
 # ── Format Conversion ──────────────────────────────────────────────────
 
 
 def anthropic_to_openai_messages(
-    messages: list[AnthropicMessage],
-    system: Any | None = None,
-) -> list[dict]:
+    messages: List[AnthropicMessage],
+    system: Optional[Any] = None,
+) -> List[dict]:
     """Convert Anthropic messages to OpenAI format."""
     result = []
 
@@ -142,7 +142,7 @@ def anthropic_to_openai_messages(
     return result
 
 
-def anthropic_to_openai_tools(tools: list[dict] | None) -> list[dict] | None:
+def anthropic_to_openai_tools(tools: Optional[List[dict]]) -> Optional[List[dict]]:
     """Convert Anthropic tool definitions to OpenAI format."""
     if not tools:
         return None
@@ -168,8 +168,8 @@ def build_anthropic_response(
     request_id: str,
     model: str,
     content_text: str,
-    reasoning_content: str | None = None,
-    tool_calls: list | None = None,
+    reasoning_content: Optional[str] = None,
+    tool_calls: Optional[list] = None,
     input_tokens: int = 0,
     output_tokens: int = 0,
     cache_read_input_tokens: int = 0,

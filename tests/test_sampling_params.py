@@ -2,8 +2,7 @@
 # Tests for atom/sampling_params.py
 
 import pytest
-
-from atom.sampling_params import SamplingDefaults, SamplingParams
+from atom.sampling_params import SamplingParams
 
 
 class TestSamplingParamsDefaults:
@@ -53,20 +52,3 @@ class TestSamplingParamsCustom:
     def test_n_negative_rejected(self):
         with pytest.raises(ValueError, match="n must be >= 1"):
             SamplingParams(n=-3)
-
-
-class FakeGenerationConfig:
-    # Simulate Transformers defaults materialized despite being absent from
-    # generation_config.json.
-    temperature = 0.7
-    top_p = 0.8
-    top_k = 50
-
-    def to_diff_dict(self):
-        return {"top_p": 0.95}
-
-
-def test_sampling_defaults_use_generation_config_diff():
-    assert SamplingDefaults.from_generation_config(
-        FakeGenerationConfig()
-    ) == SamplingDefaults(top_p=0.95)

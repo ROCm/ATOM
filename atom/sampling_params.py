@@ -2,62 +2,24 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 from dataclasses import dataclass
-from typing import Any, Protocol
-
-DEFAULT_TEMPERATURE = 1.0
-DEFAULT_TOP_K = -1
-DEFAULT_TOP_P = 1.0
-
-
-class _GenerationConfig(Protocol):
-    def to_diff_dict(self) -> dict[str, Any]: ...
-
-
-@dataclass(frozen=True)
-class SamplingDefaults:
-    """Effective model defaults for sampling-related request fields."""
-
-    temperature: float = DEFAULT_TEMPERATURE
-    top_k: int = DEFAULT_TOP_K
-    top_p: float = DEFAULT_TOP_P
-
-    @classmethod
-    def from_generation_config(
-        cls, generation_config: _GenerationConfig | None
-    ) -> "SamplingDefaults":
-        """Apply non-default values from a model ``generation_config.json``.
-
-        ``GenerationConfig`` materializes Transformers defaults even when a
-        field is absent from the model file. Its diff excludes those implicit
-        values, notably ``top_k=50``, so ATOM's neutral defaults remain intact.
-        """
-        if generation_config is None:
-            return cls()
-
-        config_diff = generation_config.to_diff_dict()
-        values = {
-            name: config_diff[name]
-            for name in ("temperature", "top_k", "top_p")
-            if config_diff.get(name) is not None
-        }
-        return cls(**values)
+from typing import Optional, Union
 
 
 @dataclass
 class SamplingParams:
-    temperature: float = DEFAULT_TEMPERATURE
-    top_k: int = DEFAULT_TOP_K  # -1 means disabled (keep all tokens)
-    top_p: float = DEFAULT_TOP_P  # 1.0 means disabled (keep all tokens)
+    temperature: float = 1.0
+    top_k: int = -1  # -1 means disabled (keep all tokens)
+    top_p: float = 1.0  # 1.0 means disabled (keep all tokens)
     max_tokens: int = 64
     ignore_eos: bool = False
-    stop_strings: list[str] | None = None
+    stop_strings: Optional[list[str]] = None
     # Number of independently sampled completions to return for a single
     # prompt. n == 1 preserves the historical single-sequence behavior.
     # n > 1 causes the engine to fan out N sibling sequences sharing the
     # same prompt; each uses independent random noise at the sampler so
     # outputs diverge when temperature > 0.
     n: int = 1
-    logprobs: bool | int | None = None
+    logprobs: Optional[Union[bool, int]] = None
 
     def __post_init__(self):
         if self.top_k != -1 and self.top_k < 1:
