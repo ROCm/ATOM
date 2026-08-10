@@ -3648,7 +3648,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         is full + 1 CSA committed entry — exercises the production decode
         codepath: state-cache reads, sparse_attn gather, indexer fp8 logits).
 
-        ATOM_ATTN_CUDAGRAPH zero-copy-q: when `num_tokens_pad` is given and is
+        AF_PIECEWISE zero-copy-q: when `num_tokens_pad` is given and is
         LESS than the rectangle `bs*max_q_len`, synthesize a RAGGED batch whose
         `bs` seqs' lengths sum to exactly `num_tokens_pad` (base=nt//bs, first
         rem seqs get base+1) — mirroring real ragged decode (prepare_decode's

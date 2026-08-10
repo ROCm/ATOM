@@ -3618,9 +3618,9 @@ class ModelRunner:
     def _capture_attn_core_ragged_combos(
         self, bs, max_q_len, rectangle_tokens, build_capture, input_ids
     ):
-        """ATOM_ATTN_CUDAGRAPH zero-copy-q: capture the attn-core cudagraph for the
-        RAGGED (effective_bs=bs, num_tokens_pad) combos a real ragged decode step at
-        this bs may replay.
+        """AF_PIECEWISE zero-copy-q: capture the attn-core cudagraph for the RAGGED
+        (effective_bs=bs, num_tokens_pad) combos a real ragged decode step at this bs
+        may replay.
 
         A ragged step with real_bs<=bs forwards nt_pad = b*max_q_len where b is a
         captured graph_bs <= bs — a flat bucket SMALLER than this bs's rectangle
@@ -3634,7 +3634,7 @@ class ModelRunner:
         Only the smaller buckets are new work — the rectangle nt==rectangle_tokens was
         captured by the caller. Runs one PIECEWISE forward per new nt_pad, feeding a
         ragged synthetic batch (bs seqs summing to nt_pad) via build_for_cudagraph_
-        capture(num_tokens_pad=...). Gated: only invoked when ATOM_ATTN_CUDAGRAPH=1.
+        capture(num_tokens_pad=...). Gated: only invoked under AF_PIECEWISE.
         """
         positions = self.forward_vars["positions"].gpu
         for b in self.graph_bs:
@@ -3680,6 +3680,9 @@ class ModelRunner:
 
     def capture_cudagraph(self):
         _piecewise = self._piecewise_cg_active()
+        # AF_PIECEWISE: also capture the attn core (ragged combos below)
+        _cg_mode = getattr(self.config.compilation_config, "cudagraph_mode", None)
+        _af_piecewise = _cg_mode is not None and _cg_mode.is_af_piecewise()
         if _piecewise:
             logger.info(
                 "PIECEWISE cudagraph: capturing per-piece graphs (attention "
@@ -3891,20 +3894,9 @@ class ModelRunner:
                         fc.cudagraph_runtime_mode = CUDAGraphMode.NONE
                         fc.batch_descriptor = None
                         self._piecewise_captured_tokens.add(num_tokens)
-                        # ATOM_ATTN_CUDAGRAPH zero-copy-q: also capture the attn-core
-                        # graph for the RAGGED (effective_bs=bs, num_tokens_pad) combos
-                        # this bs replays at. A real ragged step with real_bs<=bs
-                        # forwards a SMALLER flat bucket nt_pad = b*max_q_len
-                        # (b in graph_bs, b<bs). The dense pieces at that num_tokens
-                        # already self-captured on their own bs=b iteration (they
-                        # REPLAY here, deduped by batch_descriptor=num_tokens); the
-                        # attn-core custom op captures its fresh (bs, q_eff, nt_pad)
-                        # key. Only the smaller buckets are new — the rectangle
-                        # nt==bs*max_q_len was just captured above.
-                        if (
-                            os.environ.get("ATOM_ATTN_CUDAGRAPH") == "1"
-                            and supports_ragged_capture
-                        ):
+                        # also capture attn-core for this bs's ragged combos
+                        # (see _capture_attn_core_ragged_combos)
+                        if _af_piecewise and supports_ragged_capture:
                             self._capture_attn_core_ragged_combos(
                                 bs=bs,
                                 max_q_len=max_q_len,

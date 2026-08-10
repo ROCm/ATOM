@@ -192,33 +192,9 @@ def _pin_core_input(layer_name: str, arg_idx: int, num_tokens: int, t):
     return buf
 
 
-# ATOM_ATTN_CUDAGRAPH: per-(layer_name, bucket_bs, q_eff) captured cudagraphs of the
-# eager attention core (_attn_core). Captured at the :3850 PIECEWISE capture forward
-# (mode=PIECEWISE, in_hipgraph=True) — the SAME forward as the dense pieces, sharing
-# their graph pool — and replayed at real decode (mode=PIECEWISE, in_hipgraph=False).
-# Each entry: {"graph": CUDAGraph, "in": [stable_tensor|None,...], "out": Tensor}.
+# AF_PIECEWISE: attn-core cudagraphs keyed (layer, bucket_bs, q_eff, num_tokens_pad).
+# entry: {"graph", "in": [stable|None,...], "out"}
 _v4_attn_core_graphs: dict = {}
-
-# ATOM_ATTN_CUDAGRAPH_COVERAGE=1: count REPLAY vs EAGER_FALLBACK at real decode to
-# confirm the (effective_bs, q_eff, num_tokens_pad) capture combos actually hit.
-_v4_attn_cov: dict = {"replay": 0, "eager": 0}
-
-# Indices into _tensor_args = (x, q, kv_pre, qr, qr_scale, positions, idx_q_quant,
-# idx_weights, idx_q_scale) that the attn-core graph captures on DIRECTLY (no
-# clone) and that skip the per-step replay copy. Every entry is an upstream
-# dense-piece cudagraph output (or a split view / forward_vars buffer) living at a
-# FIXED pool address; since the attn-core graph captures at :3850 in the SAME
-# forward, its baked input address == the address dense-piece replay re-writes
-# each step — so no per-step input copy is needed. None entries (e.g. idx_q_scale
-# on the fp8 path) are inert. All args zero-copy by default; ATOM_ATTN_ZC=
-# comma-list overrides (empty -> copy everything) for debugging.
-_V4_ATTN_ZEROCOPY_ARGS: frozenset = (
-    frozenset(
-        int(i) for i in os.environ["ATOM_ATTN_ZC"].split(",") if i.strip().isdigit()
-    )
-    if "ATOM_ATTN_ZC" in os.environ
-    else frozenset(range(9))
-)
 
 # Isolated attention-graph pool. Created once on first capture.
 _v4_attn_graph_pool = None
@@ -355,10 +331,11 @@ def v4_core_attention(
         b.copy_(out)
         return b
 
-    # ATOM_ATTN_CUDAGRAPH: capture _attn_core into its own cudagraph and replay it
-    # at real decode, so attention stops running eager between the dense-piece graphs.
+    # AF_PIECEWISE: capture _attn_core into its own cudagraph (op body not traced)
+    _cg_mode = atom_config.compilation_config.cudagraph_mode
     _attn_cg = (
-        os.environ.get("ATOM_ATTN_CUDAGRAPH") == "1"
+        _cg_mode is not None
+        and _cg_mode.is_af_piecewise()
         and not getattr(getattr(fc, "context", None), "is_dummy_run", False)
         and getattr(fc, "attn_metadata", None) is not None
     )
@@ -375,47 +352,19 @@ def v4_core_attention(
         key = (layer_name, bucket_bs, q_eff, num_tokens_pad)
         entry = _v4_attn_core_graphs.get(key)
         _in_hipgraph = getattr(fc, "in_hipgraph", False)
-        # Zero-copy args live at fixed addresses so the graph captures on them
-        # directly and skips their per-step copy:
-        #   1 q, 2 kv_pre, 3 qr, 4 qr_scale, 6 idx_q_quant, 7 idx_weights,
-        #     8 idx_q_scale — fixed-address public buffers written by _attn_pre
-        #     (self._v4_q_pub / _v4_kv_pre_pub / _v4_qr_pub / _v4_qr_scale_pub /
-        #     _v4_idx_{q_quant,weights,q_scale}_pub).
-        #   5 positions — already a forward_vars persistent buffer (fixed address,
-        #     refilled each step outside the graph), so it needs no public buffer.
-        # Because the graph's token dimension now EQUALS num_tokens_pad, read/write
-        # rows match exactly — no stale rectangle tail. A _zc arg that is None (e.g.
-        # idx_* on non-indexer layers, idx_q_scale on FP8) is skipped by the
-        # None-guards in the capture/replay loops. Only x(0) remains copied: it is
-        # the dense-piece INPUT (produced upstream, not by _attn_pre), so it has no
-        # fixed-address public buffer we can bake here.
+        # zero-copy args (fixed-address public buffers / persistent buffers);
+        # only x(0) still copied (upstream input, no bakeable address).
         _zc = frozenset({1, 2, 3, 4, 5, 6, 7, 8})
 
-        # CAPTURE at the :3850 PIECEWISE capture forward (mode=PIECEWISE AND
-        # in_hipgraph) — the SAME forward where the dense pieces capture. Capturing
-        # here (not the :3839 warmup) makes the graph's baked input addresses the
-        # dense pieces' fixed cudagraph-pool output addresses, which dense-piece
-        # replay re-writes each step — so zero-copy args need no per-step copy.
-        # The dense pieces open+close their own torch.cuda.graph serially, so
-        # between two pieces the stream is NOT capturing and opening our own graph
-        # is legal.
+        # capture at the :3850 PIECEWISE forward (same as dense pieces)
         if _piecewise and _in_hipgraph and entry is None:
-            # Zero-copy args (a plain dense-piece output at a fixed address) are
-            # captured on DIRECTLY (no clone), so the graph reads exactly what
-            # dense-piece replay writes. Other args are cloned into an owned stable
-            # buffer (copied each replay).
+            # zc args captured directly; others cloned
             in_bufs = [
                 (t if (i in _zc) else (t.clone() if t is not None else None))
                 for i, t in enumerate(_tensor_args)
             ]
-            # Warm up on THESE buffers so lazy alloc/JIT happens before capture.
-            _warm_out = self._attn_core(*in_bufs)
-            # Output zero-copy: pre-allocate the persistent output buffer at the
-            # fixed per-(layer, num_tokens_pad) address the DOWNSTREAM dense piece
-            # was captured reading from (same buffer _stabilize uses). Allocating it
-            # HERE (outside the graph) keeps the address stable; the copy into it is
-            # then baked INSIDE the graph below, so replay refreshes it with NO
-            # Python — eliminating the per-step _stabilize output copy.
+            _warm_out = self._attn_core(*in_bufs)  # warmup before capture
+            # output buffer: alloc outside graph (stable addr), copy baked inside
             _out_key = (layer_name, int(_warm_out.shape[0]))
             out_buf = _v4_attn_piecewise_out.get(_out_key)
             if out_buf is None:
@@ -426,9 +375,7 @@ def v4_core_attention(
             if _v4_attn_graph_pool is None:
                 _v4_attn_graph_pool = torch.cuda.graph_pool_handle()
             pool = _v4_attn_graph_pool
-            # capture_error_mode="thread_local" (matches dense-piece capture): the
-            # NCCL watchdog polls hipEventQuery on a background thread; "global"
-            # mode would count that as an illegal concurrent op.
+            # thread_local: NCCL watchdog polls hipEventQuery on a bg thread
             with torch.cuda.graph(
                 graph,
                 pool=pool,
@@ -436,58 +383,24 @@ def v4_core_attention(
                 capture_error_mode="thread_local",
             ):
                 cg_out = self._attn_core(*in_bufs)
-                # Bake the output copy into the graph: replay writes the persistent
-                # buffer directly (no post-replay Python copy).
-                out_buf.copy_(cg_out)
+                out_buf.copy_(cg_out)  # output copy baked into graph
             _v4_attn_core_graphs[key] = {
                 "graph": graph,
                 "in": in_bufs,
                 "out": out_buf,
             }
-            # Return the genuine eager result for THIS capture forward's output.
-            return _stabilize(_run_eager())
+            return _stabilize(_run_eager())  # eager result for this forward
 
-        # REPLAY at real decode (mode=PIECEWISE, not in_hipgraph) when captured.
+        # REPLAY at real decode (mode=PIECEWISE, not in_hipgraph)
         if _piecewise and not _in_hipgraph and entry is not None:
-            # Copy non-zero-copy args into the graph's fixed input buffers. The
-            # graph was captured at EXACTLY num_tokens_pad rows (key dim), so every
-            # buffer's row count already matches src -> full-length copy_, no
-            # leading-slice, no padded tail. Zero-copy args (q) are skipped: q is a
-            # dense-piece output at the public buffer's fixed address the graph
-            # already captured on, and its rows match too.
+            # rows match num_tokens_pad exactly -> full copy; zc args skipped
             for i, (buf, src) in enumerate(zip(entry["in"], _tensor_args)):
                 if i in _zc:
                     continue
                 if buf is not None and src is not None:
                     buf.copy_(src)
             entry["graph"].replay()
-            if os.environ.get("ATOM_ATTN_CUDAGRAPH_COVERAGE") == "1":
-                _v4_attn_cov["replay"] += 1
-                if layer_name.endswith(".0") or ".layers.0." in layer_name:
-                    print(
-                        f"[attn-cg REPLAY] {key} nt={num_tokens_pad} "
-                        f"replay={_v4_attn_cov['replay']} eager={_v4_attn_cov['eager']}",
-                        flush=True,
-                    )
-            # entry["out"] IS the persistent _v4_attn_piecewise_out buffer, refreshed
-            # in-graph by the baked copy above — it's already the fixed address the
-            # downstream dense piece reads, so return it directly (no _stabilize copy).
-            return entry["out"]
-
-        # Fell through to eager at real decode (mode=PIECEWISE, not in_hipgraph, but
-        # no captured graph for this key) — correct but slow; count it.
-        if (
-            _piecewise
-            and not _in_hipgraph
-            and os.environ.get("ATOM_ATTN_CUDAGRAPH_COVERAGE") == "1"
-        ):
-            _v4_attn_cov["eager"] += 1
-            if layer_name.endswith(".0") or ".layers.0." in layer_name:
-                print(
-                    f"[attn-cg EAGER_FALLBACK] {key} nt={num_tokens_pad} "
-                    f"replay={_v4_attn_cov['replay']} eager={_v4_attn_cov['eager']}",
-                    flush=True,
-                )
+            return entry["out"]  # persistent buf, refreshed in-graph
 
     return _stabilize(_run_eager())
 
@@ -2572,13 +2485,7 @@ class DeepseekV4Attention(nn.Module):
             quant_config=qc,
             prefix=f"{p}.wqkv_a",
         )
-        # ATOM_ATTN_CUDAGRAPH zero-copy for q: one fixed-address public buffer,
-        # allocated ONCE here. The dense piece (_attn_pre) writes q into it and the
-        # attn-core cudagraph reads it — the address is CONSTANT across steps, so it
-        # never drifts even under high concurrency (unlike capturing directly on the
-        # dense-piece pool output). Allocating here (not lazily in the compiled/
-        # capture forward) is what keeps the address stable. bf16 q,
-        # [_V4_ATTN_QPUB_MAX, n_local_heads*head_dim].
+        # AF_PIECEWISE q public buffer: alloc ONCE (stable addr, not lazy)
         self._v4_q_pub = torch.empty(
             _V4_ATTN_QPUB_MAX,
             self.n_local_heads * self.head_dim,
@@ -2702,17 +2609,15 @@ class DeepseekV4Attention(nn.Module):
         self._use_async_compress = (
             self.alt_stream is not None and self.compressor is not None
         )
-        # ATOM_ATTN_CUDAGRAPH: capturing _attn_core into its own cudagraph cannot
-        # contain the multi-stream compressor/indexer fork/join (side-stream
-        # kernels don't get captured -> dirty KV -> gibberish; the join event
-        # never resolves on replay -> hang). Force single-stream compression so
-        # the whole attention core is one linear stream, safe to capture/replay.
-        if os.environ.get("ATOM_ATTN_CUDAGRAPH") == "1":
-            self._use_async_compress = False
-
         self.layer_name = prefix
         atom_config = get_current_atom_config()
         atom_config.compilation_config.static_forward_context[self.layer_name] = self
+        # AF_PIECEWISE gate resolved once -> plain bool (traced paths read this)
+        _cg_mode = atom_config.compilation_config.cudagraph_mode
+        self._af_piecewise = _cg_mode is not None and _cg_mode.is_af_piecewise()
+        if self._af_piecewise:
+            # single-stream: captured graph can't hold the compressor fork/join
+            self._use_async_compress = False
         # Frozen bool: when KV cache dtype is fp8, route writes/attention to the
         # native 2buff fp8 path (compute-only 2buff quant, op4 fp8 prefill, op5
         # asm decode). Dynamo specializes on this constant so the bf16 path
@@ -2771,30 +2676,21 @@ class DeepseekV4Attention(nn.Module):
         self.wo_a.quant_type = QuantType.No
         self.wo_a.need_normalize_e4m3fn_to_e4m3fnuz = False
 
-        # ATOM_ATTN_CUDAGRAPH zero-copy for qr/qr_scale: allocate their fixed-
-        # address public buffers HERE (weights are loaded, q_norm is runnable, and
-        # this runs BEFORE cudagraph capture so the addresses are stable). We run a
-        # dummy q_norm on a full [_V4_ATTN_QPUB_MAX, q_lora_rank] input to learn the
-        # REAL (dtype, feature dims, scale layout) of qr/qr_scale — which vary with
-        # the quant config (fp8/fp4, transpose_scale, e8m0) and would be error-prone
-        # to hardcode — then empty_like the full-row buffers. _attn_pre writes into
-        # buf[:n]; the attn-core cudagraph reads the same constant address.
-        if os.environ.get("ATOM_ATTN_CUDAGRAPH") == "1":
+        # AF_PIECEWISE: alloc fixed-address public buffers post-load (pre-capture).
+        # Shapes learned from a dummy forward (dtype/scale-layout vary by quant cfg),
+        # not hardcoded. _attn_pre writes buf[:n]; attn-core graph reads same addr.
+        if self._af_piecewise:
             _dev = self.wqkv_a.weight.device
             _dummy_x = torch.empty(
                 _V4_ATTN_QPUB_MAX, self.dim, dtype=dtypes.bf16, device=_dev
             )
             with torch.no_grad():
-                # kv_pre = torch.split(wqkv_a(x))[1] — a strided view [T, head_dim].
-                # Its dtype comes from the wqkv_a GEMM; learn it from a real forward
-                # rather than hardcoding. The public buffer is CONTIGUOUS (empty, not
-                # empty_like of the view) so the attn-core graph reads a dense fixed
-                # address; _v4_write_pub's copy_ accepts the strided src.
                 _qkv_a = self.wqkv_a(_dummy_x)
                 _q_lora, _kv_pre = torch.split(
                     _qkv_a, [self.q_lora_rank, self.head_dim], dim=-1
                 )
                 _qr, _qr_scale = self.q_norm(_q_lora)
+            # kv_pre buffer CONTIGUOUS (not empty_like of the strided view)
             self._v4_kv_pre_pub = torch.empty(
                 _V4_ATTN_QPUB_MAX,
                 self.head_dim,
@@ -2805,12 +2701,7 @@ class DeepseekV4Attention(nn.Module):
             self._v4_qr_scale_pub = (
                 torch.empty_like(_qr_scale) if _qr_scale is not None else None
             )
-            # Indexer outputs (idx_q_quant, idx_weights, idx_q_scale): same dummy-
-            # forward + empty_like trick — their shapes/dtypes are multi-dim and vary
-            # by FP4/FP8 path (idx_q_scale is 5-D on FP4, None on FP8), so we learn
-            # them from a real forward_pre rather than hardcoding. Buffers are None
-            # when this layer has no indexer / skips top-k (idx_* stay None in
-            # _attn_pre) or when a given output is None.
+            # indexer outputs: None on no-indexer / skip-topk / fp8 q_scale
             self._v4_idx_q_quant_pub = None
             self._v4_idx_weights_pub = None
             self._v4_idx_q_scale_pub = None
@@ -2906,6 +2797,8 @@ class DeepseekV4Attention(nn.Module):
         #  - FULL / NONE -> WIDE split attention: the whole attention is one eager
         #    op for torch compile.
         cg_mode = get_current_atom_config().compilation_config.cudagraph_mode
+        # resolve to plain bool (Dynamo folds it; traced _attn_pre reads this)
+        self._af_piecewise = cg_mode is not None and cg_mode.is_af_piecewise()
         if cg_mode is not None and cg_mode.requires_piecewise_compilation():
             (
                 q,
@@ -2960,45 +2853,22 @@ class DeepseekV4Attention(nn.Module):
             act_quant_inplace(x, 128, "ue8m0")
         qkv_a = self.wqkv_a(x)
         q_lora, kv_pre = torch.split(qkv_a, [self.q_lora_rank, self.head_dim], dim=-1)
-        # ATOM_ATTN_CUDAGRAPH zero-copy for kv_pre: kv_pre is a strided split view of
-        # qkv_a; redirect it into the contiguous fixed-address public buffer so the
-        # attn-core cudagraph reads a constant dense address. copy_ accepts the
-        # strided src; this write compiles into the dense piece (baked at replay).
-        if (
-            os.environ.get("ATOM_ATTN_CUDAGRAPH") == "1"
-            and kv_pre.shape[0] <= _V4_ATTN_QPUB_MAX
-        ):
+        # AF_PIECEWISE zero-copy: kv_pre (strided view) -> contiguous public buffer
+        if self._af_piecewise and kv_pre.shape[0] <= _V4_ATTN_QPUB_MAX:
             kv_pre = _v4_write_pub(self._v4_kv_pre_pub, kv_pre, kv_pre.shape[0])
         assert (
             not _V4_FORCE_UE8M0_QUANT
         ), "_V4_FORCE_UE8M0_QUANT incompatible with fused q_norm quant (qr is already FP8)"
         qr, qr_scale = self.q_norm(q_lora)
-        # ATOM_ATTN_CUDAGRAPH zero-copy for qr/qr_scale: redirect both into their
-        # fixed-address public buffers (allocated in process_weights_after_loading)
-        # BEFORE any consumer (wq_b, indexer, and the values returned to the attn-
-        # core op) so every reader sees the constant address. The token axis is the
-        # one whose public-buffer size == _V4_ATTN_QPUB_MAX (qr is row-major [T,..];
-        # qr_scale may be transposed [..,T]); slice that axis to n.
-        if (
-            os.environ.get("ATOM_ATTN_CUDAGRAPH") == "1"
-            and qr.shape[0] <= _V4_ATTN_QPUB_MAX
-        ):
+        # AF_PIECEWISE zero-copy: qr/qr_scale -> public buffers BEFORE consumers
+        if self._af_piecewise and qr.shape[0] <= _V4_ATTN_QPUB_MAX:
             n = qr.shape[0]
             qr = _v4_write_pub(self._v4_qr_pub, qr, n)
             if qr_scale is not None and self._v4_qr_scale_pub is not None:
                 qr_scale = _v4_write_pub(self._v4_qr_scale_pub, qr_scale, n)
         q = self.wq_b(qr, x_scale=qr_scale)
-        # ATOM_ATTN_CUDAGRAPH zero-copy for q: write q into the fixed-address public
-        # buffer self._v4_q_pub and pass that slice on. This write is compiled into
-        # the dense piece, so dense-piece replay re-writes the buffer at the SAME
-        # num_tokens rows without Python. The attn-core cudagraph is captured reading
-        # this constant address at the SAME num_tokens_pad (its key dim), so read/
-        # write row counts MATCH — no per-step q copy, no stale tail. Decode shapes
-        # only (num_tokens <= _V4_ATTN_QPUB_MAX); larger fall through with plain q.
-        if (
-            os.environ.get("ATOM_ATTN_CUDAGRAPH") == "1"
-            and q.shape[0] <= _V4_ATTN_QPUB_MAX
-        ):
+        # AF_PIECEWISE zero-copy: q -> public buffer (decode shapes only)
+        if self._af_piecewise and q.shape[0] <= _V4_ATTN_QPUB_MAX:
             n = q.shape[0]
             self._v4_q_pub[:n].copy_(q)
             q = self._v4_q_pub[:n]
@@ -3008,13 +2878,9 @@ class DeepseekV4Attention(nn.Module):
             idx_q_quant, idx_weights, idx_q_scale = self.indexer.forward_pre(
                 x, qr, positions, qr_scale
             )
-            # ATOM_ATTN_CUDAGRAPH zero-copy for the indexer outputs: redirect each
-            # into its fixed-address public buffer (allocated in
-            # process_weights_after_loading via a dummy forward_pre) so the attn-
-            # core cudagraph reads a constant address. Token axis = the dim whose
-            # buffer size == _V4_ATTN_QPUB_MAX (shapes are multi-dim / path-varying).
+            # AF_PIECEWISE zero-copy: indexer outputs -> public buffers
             if (
-                os.environ.get("ATOM_ATTN_CUDAGRAPH") == "1"
+                self._af_piecewise
                 and idx_q_quant is not None
                 and idx_q_quant.shape[0] <= _V4_ATTN_QPUB_MAX
             ):

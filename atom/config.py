@@ -69,12 +69,21 @@ class CUDAGraphMode(enum.Enum):
     FULL = 2
     FULL_DECODE_ONLY = (FULL, NONE)
     FULL_AND_PIECEWISE = (FULL, PIECEWISE)
+    # AF_PIECEWISE ("attention/FFN-wise"): PIECEWISE + attention core in its own
+    # cudagraph (DSpark). Tuple so decode/mixed_mode resolve to PIECEWISE (existing
+    # == PIECEWISE checks treat it as such); extra capture gated by is_af_piecewise().
+    AF_PIECEWISE = (PIECEWISE, PIECEWISE)
 
     def decode_mode(self) -> "CUDAGraphMode":
         return CUDAGraphMode(self.value[0]) if self.separate_routine() else self
 
     def mixed_mode(self) -> "CUDAGraphMode":
         return CUDAGraphMode(self.value[1]) if self.separate_routine() else self
+
+    def is_af_piecewise(self) -> bool:
+        """True only for AF_PIECEWISE — gates the extra attention-core cudagraph
+        (attention/FFN-wise capture) on top of the standard piecewise pieces."""
+        return self is CUDAGraphMode.AF_PIECEWISE
 
     def requires_piecewise_compilation(self) -> bool:
         return (
@@ -144,6 +153,13 @@ class CompilationConfig:
     - FULL.
     - FULL_DECODE_ONLY.
     - FULL_AND_PIECEWISE.
+    - AF_PIECEWISE.
+
+    AF_PIECEWISE ("attention/FFN-wise") mode: PIECEWISE where the attention
+    core is ALSO captured into its own cudagraph with zero-copy public buffers
+    (DeepSeek-V4 DSpark), so small-batch decode is all-replay with no eager
+    attention gap between the dense pieces. Falls back to plain PIECEWISE
+    behavior for models that don't implement the attention-core capture.
 
     PIECEWISE mode build piecewise cudagraph only, keeping the cudagraph
     incompatiable ops (i.e. some attention ops) outside the cudagraph

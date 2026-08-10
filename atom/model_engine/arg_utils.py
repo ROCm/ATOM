@@ -198,10 +198,12 @@ class EngineArgs:
             "--cudagraph-mode",
             type=str,
             default="FULL",
-            choices=["NONE", "PIECEWISE", "FULL", "FULL_AND_PIECEWISE"],
+            choices=["NONE", "PIECEWISE", "FULL", "FULL_AND_PIECEWISE", "AF_PIECEWISE"],
             help="CUDA graph runtime mode. FULL = manual whole-forward capture "
             "(default, existing behavior). PIECEWISE = per-piece cudagraph with "
-            "attention eager (requires --level 3).",
+            "attention eager (requires --level 3). AF_PIECEWISE = PIECEWISE where "
+            "the attention core is also captured into its own cudagraph with "
+            "zero-copy buffers (DeepSeek-V4 DSpark).",
         )
         parser.add_argument(
             "--load_dummy",
