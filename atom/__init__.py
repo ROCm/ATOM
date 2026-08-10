@@ -1,6 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+from atom.aiter_compat import ensure_gpu_archs_env
+
+# AITER snapshots GPU_ARCHS while its modules are imported. Resolve the runtime
+# target before any plugin or engine import can pull AITER into this process.
+ensure_gpu_archs_env()
+
 from atom.plugin.sglang import prepare_model_for_sglang
 from atom.sampling_params import SamplingParams
 
