@@ -55,6 +55,7 @@ def test_affected_nightly_cases_restore_default_concurrency():
         (REPO_ROOT / ".github/benchmark/oot_models_accuracy.json").read_text()
     )
     target_models = {
+        "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP4",
         "MiniMax-M2.5 TP2",
         "MiniMax-M2.5 TP4",
         "GLM-4.7-FP8 MTP TP4",
