@@ -96,7 +96,6 @@ else:
 from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE  # noqa
 
 
-
 def divide(numerator, denominator):
     assert (
         numerator % denominator == 0

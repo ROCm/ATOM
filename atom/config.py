@@ -618,7 +618,6 @@ _PLUGIN_SUPPORTED_MULTIMODAL_MODELS: set[str] = {
 }
 
 
-
 def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConfig:
     config_dict, _ = PretrainedConfig.get_config_dict(
         model,

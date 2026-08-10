@@ -181,7 +181,6 @@ class PagedAttentionImpl(nn.Module):
             return o
 
         o: torch.Tensor
-
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
