@@ -715,7 +715,11 @@ class ModelRunner:
             torch.set_default_device(self.device)
             with set_model_tag("drafter"):
                 self.drafter = build_drafter(self.config, self.device, self)
-            self.rejection_sampler = RejectionSampler()
+            self.rejection_sampler = RejectionSampler(
+                synthetic_acceptance_rate=(
+                    self.config.speculative_config.synthetic_acceptance_rate
+                )
+            )
             torch.set_default_device(None)
             logger.info("Loading drafter model...")
             self.drafter.load_model(self.model)
