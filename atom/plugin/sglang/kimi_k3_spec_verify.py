@@ -300,6 +300,13 @@ def build_spec_cache_tensors(
     T = plan.draft_token_num
     device = plan.device
     max_bs = _max_graph_bs(linear_backend, bs)
+    # Eager (non-graph) verify forwards run the EXTEND path and can have a real
+    # bs LARGER than the captured-graph bucket count (max_bs) -- up to the
+    # scheduler's request-pool capacity. Size the scratch for whichever is larger
+    # so the pre-seed / commit never index past the buffer (otherwise a bs>max_bs
+    # eager verify triggers an out-of-bounds HIP illegal access). The backend
+    # pre-allocates for the pool capacity, so this max() is mainly a safety net.
+    scratch_bs = max(max_bs, bs)
     # int32 live slots (graph-stable view; may hold -1 padding). Mirror into a
     # local int64 buffer (captured copy -> refreshed on replay) and clamp padding
     # so the gather never indexes out of bounds.
@@ -335,17 +342,18 @@ def build_spec_cache_tensors(
         conv_dim = int(conv0.shape[-1])
         wide = km1 + plan.num_spec  # (K-1) + num_spec rolling window
 
-        # One max-bs shared scratch per layer: allocate once at the largest bs so
-        # its address stays stable across every (including padded) bs graph.
+        # One shared scratch per layer sized for the largest verify bs (graph
+        # bucket max or eager pool capacity), so its address stays stable across
+        # every (including padded) bs graph and covers eager bs>max_bs verifies.
         scratch_full = shared.get(layer_id)
         if (
             scratch_full is None
-            or scratch_full.shape[0] < max_bs * T
+            or scratch_full.shape[0] < scratch_bs * T
             or scratch_full.shape[1] != wide
             or scratch_full.shape[2] != conv_dim
         ):
             scratch_full = torch.zeros(
-                (max_bs * T, wide, conv_dim), dtype=conv0.dtype, device=conv0.device
+                (scratch_bs * T, wide, conv_dim), dtype=conv0.dtype, device=conv0.device
             )
             shared[layer_id] = scratch_full
         scratch = scratch_full[: bs * T]
