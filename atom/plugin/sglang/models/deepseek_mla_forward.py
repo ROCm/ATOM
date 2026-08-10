@@ -486,7 +486,12 @@ def _concat_mha_k_for_non_absorbed(
     )
 
     try:
-        from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
+        try:
+            from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
+        except ModuleNotFoundError:
+            from sglang.kernels.ops.attention.utils import (
+                concat_and_cast_mha_k_triton,
+            )
     except ImportError as exc:
         logger.warning(
             "Unable to import concat_and_cast_mha_k_triton; "

@@ -4,7 +4,10 @@ from typing import Optional
 
 import torch
 from aiter import get_pa_metadata_info_v1, get_pa_metadata_v1
-from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+try:
+    from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+except ModuleNotFoundError:
+    from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
 
 
 def _ensure_buffer(backend, name, size, dtype, zero=True):
