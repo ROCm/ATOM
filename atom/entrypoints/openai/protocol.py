@@ -171,6 +171,8 @@ class ChatCompletionRequest(BaseModel):
     n: int | None = 1
     # Optional KV-transfer metadata for P/D disaggregation.
     kv_transfer_params: dict[str, Any] | None = None
+    # Optional DPA routing hint inserted by atomesh for DP-aware workers.
+    data_parallel_rank: int | None = None
 
     def get_max_tokens(self) -> int:
         """Return the effective generation cap for OpenAI chat requests."""

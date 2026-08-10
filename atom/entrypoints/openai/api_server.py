@@ -830,6 +830,7 @@ async def setup_streaming_request(
     request_id: str,
     kv_transfer_params: dict[str, Any] | None = None,
     multimodal_data: dict[str, Any] | None = None,
+    data_parallel_rank: int | None = None,
 ) -> tuple[int, asyncio.Queue, int]:
     """Set up a streaming request with the engine.
 
@@ -865,6 +866,8 @@ async def setup_streaming_request(
     seq = None
     try:
         seq = await executor_loop.run_in_executor(None, do_preprocess)
+        if data_parallel_rank is not None:
+            seq.data_parallel_rank = data_parallel_rank
         _validate_sequence_context_length(seq)
     except Exception:
         _stream_queues.pop(request_id, None)
@@ -1018,6 +1021,7 @@ async def setup_streaming_request_fanout(
     request_id: str,
     kv_transfer_params: dict[str, Any] | None = None,
     multimodal_data: dict[str, Any] | None = None,
+    data_parallel_rank: int | None = None,
 ) -> tuple[list[int], asyncio.Queue, int]:
     """Fan-out variant of :func:`setup_streaming_request`.
 
@@ -1069,6 +1073,9 @@ async def setup_streaming_request_fanout(
     seqs = []
     try:
         seqs = await executor_loop.run_in_executor(None, do_preprocess)
+        if data_parallel_rank is not None:
+            for seq in seqs:
+                seq.data_parallel_rank = data_parallel_rank
         _validate_sequence_context_length(seqs[0])
     except Exception:
         _stream_queues.pop(request_id, None)
@@ -1256,6 +1263,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                         request_id,
                         multimodal_data=stream_multimodal_data,
                         kv_transfer_params=request.kv_transfer_params,
+                        data_parallel_rank=request.data_parallel_rank,
                     )
                 )
                 gen = stream_chat_response_fanout(
@@ -1274,6 +1282,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     request_id,
                     multimodal_data=stream_multimodal_data,
                     kv_transfer_params=request.kv_transfer_params,
+                    data_parallel_rank=request.data_parallel_rank,
                 )
                 gen = stream_chat_response(
                     request_id,
@@ -1421,6 +1430,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
                         sampling_params,
                         request_id,
                         kv_transfer_params=request.kv_transfer_params,
+                        data_parallel_rank=request.data_parallel_rank,
                     )
                 )
                 gen = stream_completion_response_fanout(
@@ -1437,6 +1447,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
                     sampling_params,
                     request_id,
                     kv_transfer_params=request.kv_transfer_params,
+                    data_parallel_rank=request.data_parallel_rank,
                 )
                 gen = stream_completion_response(
                     request_id,
