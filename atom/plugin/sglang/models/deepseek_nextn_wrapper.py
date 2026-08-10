@@ -9,6 +9,7 @@ import copy
 import logging
 import re
 from collections.abc import Iterable
+from contextlib import contextmanager
 
 import torch
 from sglang.srt.distributed import get_pp_group
@@ -30,6 +31,25 @@ from atom.plugin.sglang.runtime import (
 )
 
 logger = logging.getLogger("atom.plugin.sglang.models")
+
+
+@contextmanager
+def _safe_hf_config_repr():
+    from transformers.configuration_utils import PretrainedConfig
+
+    original_repr = PretrainedConfig.__repr__
+
+    def safe_repr(self) -> str:
+        try:
+            return original_repr(self)
+        except TypeError:
+            return f"{self.__class__.__name__}(model_type={getattr(self, 'model_type', None)!r})"
+
+    PretrainedConfig.__repr__ = safe_repr
+    try:
+        yield
+    finally:
+        PretrainedConfig.__repr__ = original_repr
 
 
 def _sync_replaced_weights() -> None:
@@ -184,9 +204,10 @@ class DeepseekV3ForCausalLMNextN(nn.Module):
                 }
             )
         else:
-            SpeculativeConfig.hf_config_override(
-                self.atom_config.hf_config, model_path=draft_model_path
-            )
+            with _safe_hf_config_repr():
+                SpeculativeConfig.hf_config_override(
+                    self.atom_config.hf_config, model_path=draft_model_path
+                )
         if use_standalone_draft:
             self.atom_config.quant_config = AtomQuantizationConfig(
                 self.atom_config.hf_config,

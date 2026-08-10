@@ -9,7 +9,7 @@ To add a new model, append its architecture class name to _MODEL_NAMES.
 import inspect
 import logging
 from collections.abc import Iterable
-from typing import Any, Optional, Union
+from typing import Any
 
 import torch
 from sglang.srt.distributed import get_pp_group
@@ -72,7 +72,7 @@ class _AtomCausalLMBaseForSglang(nn.Module):
     def __init__(
         self,
         config,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -86,6 +86,8 @@ class _AtomCausalLMBaseForSglang(nn.Module):
             vocab_size = getattr(config.text_config, "vocab_size", None)
         if vocab_size is None:
             raise AttributeError(f"{type(config).__name__} does not define vocab_size")
+        if not hasattr(config, "vocab_size"):
+            config.vocab_size = vocab_size
         self.vocab_size = vocab_size
         self.unpadded_vocab_size = vocab_size
         self.model_arch = getattr(config, "architectures", [""])[0]
@@ -298,114 +300,114 @@ class _AtomCausalLMBaseForSglang(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
         get_embedding: bool = False,
-        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        pp_proxy_tensors: PPProxyTensors | None = None,
         **model_kwargs: Any,
-    ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
-        with plugin_runtime_scope(framework="sglang", atom_config=self.atom_config):
-            with SGLangPluginRuntime(
+    ) -> LogitsProcessorOutput | PPProxyTensors:
+        with (
+            plugin_runtime_scope(framework="sglang", atom_config=self.atom_config),
+            SGLangPluginRuntime(
                 atom_config=self.atom_config,
                 forward_batch=forward_batch,
                 positions=positions,
                 input_ids=input_ids,
                 input_embeds=input_embeds,
                 set_forward_context=not self.model_arch_spec.wrapper_binds_gdn_context,
-            ) as runtime:
-                if self.model_arch_spec.bind_cache_views is not None:
-                    self.model_arch_spec.bind_cache_views(self.model, runtime)
+            ) as runtime,
+        ):
+            if self.model_arch_spec.bind_cache_views is not None:
+                self.model_arch_spec.bind_cache_views(self.model, runtime)
 
-                metadata = SGLangForwardBatchMetadata.build(
-                    runtime.forward_batch,
-                    pp_proxy_tensors=pp_proxy_tensors,
-                    save_kv_cache=model_kwargs.get("save_kv_cache"),
-                )
-                model_inputs = {
-                    "input_ids": runtime.input_ids,
-                    "positions": runtime.positions,
-                    "intermediate_tensors": SGLangForwardBatchMetadata.to_intermediate_tensors(
-                        pp_proxy_tensors, metadata
-                    ),
-                    "inputs_embeds": runtime.input_embeds,
-                }
+            metadata = SGLangForwardBatchMetadata.build(
+                runtime.forward_batch,
+                pp_proxy_tensors=pp_proxy_tensors,
+                save_kv_cache=model_kwargs.get("save_kv_cache"),
+            )
+            model_inputs = {
+                "input_ids": runtime.input_ids,
+                "positions": runtime.positions,
+                "intermediate_tensors": SGLangForwardBatchMetadata.to_intermediate_tensors(
+                    pp_proxy_tensors, metadata
+                ),
+                "inputs_embeds": runtime.input_embeds,
+            }
 
-                with SGLangForwardBatchMetadata.bind(metadata):
-                    if self.model_arch == "LlamaForCausalLMEagle3":
-                        hidden_states = self._forward_eagle3_draft_model(
-                            runtime.input_ids,
-                            runtime.positions,
-                            runtime.forward_batch,
-                        )
-                    elif self.model_arch_spec.wrapper_binds_gdn_context:
-                        from atom.plugin.sglang.attention_backend.attention_gdn import (
-                            SGLangGDNForwardContext,
-                        )
+            with SGLangForwardBatchMetadata.bind(metadata):
+                if self.model_arch == "LlamaForCausalLMEagle3":
+                    hidden_states = self._forward_eagle3_draft_model(
+                        runtime.input_ids,
+                        runtime.positions,
+                        runtime.forward_batch,
+                    )
+                elif self.model_arch_spec.wrapper_binds_gdn_context:
+                    from atom.plugin.sglang.attention_backend.attention_gdn import (
+                        SGLangGDNForwardContext,
+                    )
 
-                        with SGLangGDNForwardContext.bind(metadata):
-                            hidden_states = self.model(
-                                **self._filter_model_forward_kwargs(model_inputs)
-                            )
-                    elif self.model_arch_spec.uses_context_only_forward:
+                    with SGLangGDNForwardContext.bind(metadata):
                         hidden_states = self.model(
                             **self._filter_model_forward_kwargs(model_inputs)
                         )
-                    else:
-                        model_call_kwargs = dict(
-                            model_inputs,
-                            forward_batch=runtime.forward_batch,
-                            get_embedding=get_embedding,
-                            pp_proxy_tensors=pp_proxy_tensors,
-                        )
-                        model_call_kwargs.update(model_kwargs)
-                        hidden_states = self.model(
-                            **self._filter_model_forward_kwargs(model_call_kwargs)
-                        )
+                elif self.model_arch_spec.uses_context_only_forward:
+                    hidden_states = self.model(
+                        **self._filter_model_forward_kwargs(model_inputs)
+                    )
+                else:
+                    model_call_kwargs = dict(
+                        model_inputs,
+                        forward_batch=runtime.forward_batch,
+                        get_embedding=get_embedding,
+                        pp_proxy_tensors=pp_proxy_tensors,
+                    )
+                    model_call_kwargs.update(model_kwargs)
+                    hidden_states = self.model(
+                        **self._filter_model_forward_kwargs(model_call_kwargs)
+                    )
 
-                hidden_states, aux_hidden_states = self._split_aux_hidden_states(
-                    hidden_states
-                )
-                hidden_states = runtime.trim_output(hidden_states)
-                aux_hidden_states = self._trim_aux_hidden_states(
-                    runtime, aux_hidden_states
-                )
-                logits_input_ids = input_ids
-                mode = getattr(forward_batch, "forward_mode", None)
-                spec_info = getattr(forward_batch, "spec_info", None)
-                draft_token_num = int(getattr(spec_info, "draft_token_num", 0) or 0)
-                target_verify_rows = int(forward_batch.batch_size) * draft_token_num
-                if (
-                    mode is not None
-                    and bool(getattr(mode, "is_target_verify", lambda: False)())
-                    and target_verify_rows > 0
-                    and torch.is_tensor(hidden_states)
-                    and hidden_states.shape[0] != target_verify_rows
-                ):
-                    if int(hidden_states.shape[0]) < target_verify_rows:
-                        raise RuntimeError(
-                            "Target-verify hidden_states shorter than expected: "
-                            f"hidden_states={tuple(hidden_states.shape)}, "
-                            f"expected_rows={target_verify_rows}"
-                        )
-                    hidden_states = hidden_states[:target_verify_rows]
-                    if torch.is_tensor(logits_input_ids):
-                        logits_input_ids = logits_input_ids[:target_verify_rows]
+            hidden_states, aux_hidden_states = self._split_aux_hidden_states(
+                hidden_states
+            )
+            hidden_states = runtime.trim_output(hidden_states)
+            aux_hidden_states = self._trim_aux_hidden_states(runtime, aux_hidden_states)
+            logits_input_ids = input_ids
+            mode = getattr(forward_batch, "forward_mode", None)
+            spec_info = getattr(forward_batch, "spec_info", None)
+            draft_token_num = int(getattr(spec_info, "draft_token_num", 0) or 0)
+            target_verify_rows = int(forward_batch.batch_size) * draft_token_num
+            if (
+                mode is not None
+                and bool(getattr(mode, "is_target_verify", lambda: False)())
+                and target_verify_rows > 0
+                and torch.is_tensor(hidden_states)
+                and hidden_states.shape[0] != target_verify_rows
+            ):
+                if int(hidden_states.shape[0]) < target_verify_rows:
+                    raise RuntimeError(
+                        "Target-verify hidden_states shorter than expected: "
+                        f"hidden_states={tuple(hidden_states.shape)}, "
+                        f"expected_rows={target_verify_rows}"
+                    )
+                hidden_states = hidden_states[:target_verify_rows]
+                if torch.is_tensor(logits_input_ids):
+                    logits_input_ids = logits_input_ids[:target_verify_rows]
 
-                if self.pp_group.is_last_rank:
-                    if self.model_arch == "DeepseekV4ForCausalLM":
-                        return self.logits_processor(
-                            logits_input_ids,
-                            hidden_states,
-                            self.logits_head,
-                            forward_batch,
-                            aux_hidden_states=aux_hidden_states,
-                            hidden_states_before_norm=hidden_states,
-                        )
+            if self.pp_group.is_last_rank:
+                if self.model_arch == "DeepseekV4ForCausalLM":
                     return self.logits_processor(
                         logits_input_ids,
                         hidden_states,
                         self.logits_head,
                         forward_batch,
                         aux_hidden_states=aux_hidden_states,
+                        hidden_states_before_norm=hidden_states,
                     )
-                return hidden_states
+                return self.logits_processor(
+                    logits_input_ids,
+                    hidden_states,
+                    self.logits_head,
+                    forward_batch,
+                    aux_hidden_states=aux_hidden_states,
+                )
+            return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         # The passed `weights` iterable from sglang is ignored because ATOM

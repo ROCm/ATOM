@@ -1,6 +1,19 @@
 import logging
+import os
 
 logger = logging.getLogger("atom.plugin.sglang.register")
+
+
+def _ensure_aiter_gpu_archs_env() -> None:
+    """Bridge ATOM image arch env names to aiter's runtime JIT env."""
+
+    if os.environ.get("GPU_ARCHS"):
+        return
+    for env_name in ("GPU_ARCH_LIST", "PYTORCH_ROCM_ARCH"):
+        archs = os.environ.get(env_name)
+        if archs:
+            os.environ["GPU_ARCHS"] = archs
+            return
 
 
 def _is_atom_external_model_enabled() -> bool:
@@ -77,6 +90,7 @@ def _install_loader_quant_patch() -> None:
 def register_plugin() -> None:
     """Install ATOM patches that must run before SGLang parses server args."""
 
+    _ensure_aiter_gpu_archs_env()
     _install_model_config_quant_patch()
     _install_loader_quant_patch()
 
