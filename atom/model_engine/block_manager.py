@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import logging
 from collections import deque
 
 import numpy as np
 import xxhash
+
 from atom.config import Config
 from atom.distributed.kv_events import (
     MEDIUM_GPU,
@@ -18,6 +20,8 @@ from atom.model_engine.kv_block import Block
 from atom.model_engine.sequence import Sequence
 from atom.model_engine.swa_pool import SlidingWindowPool
 from atom.utils import envs
+
+logger = logging.getLogger("atom")
 
 
 def _make_block_stored(
@@ -51,13 +55,17 @@ class BlockManager:
         num_blocks = config.num_kvcache_blocks
         assert num_blocks > 0
         self.block_size = block_size
-        self.dcp_world_size = getattr(config, "decode_context_parallel_size", 1)
+        self.dcp_world_size = config.decode_context_parallel_size
         # dcp_rank is always 0 here: BlockManager runs only on the scheduler
         # (rank 0). DCP rank is used only to compute local token counts for
         # memory reservation; the actual per-rank routing is done in the workers.
         self.dcp_rank = 0
+        # Prefix-cache hashing / reuse granularity: under DCP one block_table
+        # entry maps to a virtual block of `block_size * dcp_world_size` global
+        # tokens (see _hash_block_size). == block_size when DCP is off.
+        self.hash_block_size = self.block_size * self.dcp_world_size
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
-        self.hash_to_block_id: dict[int, int] = dict()
+        self.hash_to_block_id: dict[int, int] = {}
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         self.free_block_ids_set: set[int] = set(range(num_blocks))
         self.used_block_ids: set[int] = set()
@@ -155,6 +163,24 @@ class BlockManager:
     def _effective_block_size(self):
         return self.block_size * self.dcp_world_size
 
+    # --- Prefix-cache block accounting granularity ---------------------------
+    # Under DCP one entry of `block_table` maps to a VIRTUAL block spanning
+    # `block_size * dcp_world_size` consecutive global tokens (each rank stores
+    # its `block_size` interleaved tokens in that physical block). So prefix
+    # cache hashing / reuse must be done per virtual block, not per physical
+    # block — otherwise the logical block index runs past the (dcp-shrunk)
+    # block_table. For dcp_world_size == 1 this reduces to the physical size.
+    def _hash_block_size(self) -> int:
+        return self.hash_block_size
+
+    def _n_hash_blocks(self, seq: Sequence) -> int:
+        hbs = self.hash_block_size
+        return (len(seq) + hbs - 1) // hbs
+
+    def _hash_block_tokens(self, seq: Sequence, i: int) -> list[int]:
+        hbs = self.hash_block_size
+        return seq.token_ids[i * hbs : (i + 1) * hbs]
+
     def can_allocate(self, seq: Sequence) -> int:
         """Return number of cache-hit blocks (>=0) if seq fits, else -1.
 
@@ -188,8 +214,8 @@ class BlockManager:
         h = -1
         compressed_hit = 0
         block_hashes: list[int] = []
-        for i in range(seq.num_blocks - 1):
-            token_ids = seq.block(i)
+        for i in range(self._n_hash_blocks(seq) - 1):
+            token_ids = self._hash_block_tokens(seq, i)
             h = self.compute_hash(token_ids, h)
             block_id = self.hash_to_block_id.get(h, -1)
             if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
@@ -210,7 +236,7 @@ class BlockManager:
         seq.num_compressed_hit_blocks = compressed_hit
         # Free-pool demand: blocks we actually reuse minus those already used
         # (shared ref); blocks we drop from the hit become fresh → counted.
-        num_new_blocks = seq.num_blocks
+        num_new_blocks = self._n_hash_blocks(seq)
         for i in range(num_cached_blocks):
             if self.hash_to_block_id[block_hashes[i]] in self.used_block_ids:
                 num_new_blocks -= 1
@@ -247,7 +273,7 @@ class BlockManager:
         swa_hit_start = max(0, num_cached_blocks - self.swa.tail_blocks)
         h = -1
         for i in range(num_cached_blocks):
-            token_ids = seq.block(i)
+            token_ids = self._hash_block_tokens(seq, i)
             h = self.compute_hash(token_ids, h)
             block_id = self.hash_to_block_id[h]
             block = self.blocks[block_id]
@@ -275,7 +301,7 @@ class BlockManager:
             # window slots before each forward, free_after_prefill_chunk releases
             # out-of-window ones.
             self.swa.alloc_placeholder(seq)
-        seq.num_cached_tokens = num_cached_blocks * self.block_size
+        seq.num_cached_tokens = num_cached_blocks * self._hash_block_size()
 
         # Per-request cache: claim one slot index from the pre-allocated
         # state tensor (e.g. GDN mamba_k_cache, V4 compressor state + SWA
@@ -287,7 +313,9 @@ class BlockManager:
         if seq.has_per_req_cache:
             seq.per_req_cache_group = self.free_per_req_cache_groups.pop()
 
-    def hash_blocks(self, seq: Sequence, num_new_tokens: int) -> None:
+    def hash_blocks(
+        self, seq: Sequence, num_new_tokens: int, start_tokens: int | None = None
+    ) -> None:
         """Register hashes for blocks finalized by the most recent step.
 
         Called from scheduler.postprocess() after the forward completes, so a
@@ -298,11 +326,17 @@ class BlockManager:
         Caller passes `num_new_tokens` = tokens forwarded in this step. For
         single-shot prefill that's `seq.num_tokens - seq.num_cached_tokens`;
         chunked prefill will pass the per-chunk count.
+
+        `start_tokens` overrides the token offset the range starts at. Pipeline-
+        parallel schedule-time advancement already bumped seq.num_cached_tokens
+        past this chunk, so the head passes the chunk's pre-advance offset here.
         """
         if not self.enable_prefix_caching:
             return
-        start = seq.num_cached_tokens // self.block_size
-        end = (seq.num_cached_tokens + num_new_tokens) // self.block_size
+        hbs = self._hash_block_size()
+        base = seq.num_cached_tokens if start_tokens is None else start_tokens
+        start = base // hbs
+        end = (base + num_new_tokens) // hbs
         if start >= end:
             return
         h = self.blocks[seq.block_table[start - 1]].hash if start > 0 else -1
@@ -312,7 +346,7 @@ class BlockManager:
         store_run_tokens: list[int] = []
         for i in range(start, end):
             block = self.blocks[seq.block_table[i]]
-            token_ids = seq.block(i)
+            token_ids = self._hash_block_tokens(seq, i)
             h = self.compute_hash(token_ids, h)
             block.update(h, token_ids)
             self.hash_to_block_id[h] = block.block_id
@@ -332,6 +366,122 @@ class BlockManager:
                     self.block_size,
                 )
             )
+
+    def publish_loaded_prefix(
+        self,
+        seq: Sequence,
+        start_token: int,
+        end_token: int,
+    ) -> int:
+        """Publish a successfully loaded offload prefix into the GPU cache index.
+
+        LMCache restores KV directly into already allocated physical blocks, so
+        those blocks do not pass through ``hash_blocks()``. Without explicitly
+        publishing them here, the current request can consume the restored KV,
+        but later requests cannot discover it through ``can_allocate()`` and
+        repeatedly load the same prefix from CPU.
+
+        Only complete, hash-block-aligned loaded blocks are published. Existing
+        canonical mappings win: concurrent requests may load the same prefix
+        into different physical blocks, and replacing the canonical mapping
+        would make its eventual eviction remove the wrong cache entry.
+        """
+        if not self.enable_prefix_caching:
+            return 0
+
+        start_token = max(0, int(start_token))
+        end_token = min(int(end_token), int(seq.num_prompt_tokens))
+        if end_token <= start_token:
+            return 0
+        hbs = self._hash_block_size()
+        if start_token % hbs != 0:
+            logger.warning(
+                "Cannot publish offload prefix with unaligned start: "
+                "seq=%s start=%d hash_block_size=%d",
+                seq.id,
+                start_token,
+                hbs,
+            )
+            return 0
+
+        start_block = start_token // hbs
+        end_block = end_token // hbs
+        if end_block <= start_block:
+            return 0
+        if end_block > len(seq.block_table):
+            logger.warning(
+                "Cannot publish offload prefix beyond block table: "
+                "seq=%s end_block=%d blocks=%d",
+                seq.id,
+                end_block,
+                len(seq.block_table),
+            )
+            return 0
+
+        if start_block == 0:
+            parent_hash = -1
+        else:
+            parent = self.blocks[seq.block_table[start_block - 1]]
+            if parent.hash == -1:
+                logger.warning(
+                    "Cannot publish offload prefix without indexed parent: "
+                    "seq=%s start_block=%d",
+                    seq.id,
+                    start_block,
+                )
+                return 0
+            parent_hash = parent.hash
+
+        indexed_tokens = 0
+        for i in range(start_block, end_block):
+            token_ids = self._hash_block_tokens(seq, i)
+            block_id = seq.block_table[i]
+            block = self.blocks[block_id]
+            block_hash = self.compute_hash(token_ids, parent_hash)
+            canonical_id = self.hash_to_block_id.get(block_hash)
+
+            if block.hash not in (-1, block_hash):
+                logger.warning(
+                    "Refusing to overwrite indexed block during offload "
+                    "promotion: seq=%s block=%d",
+                    seq.id,
+                    block_id,
+                )
+                break
+
+            if canonical_id is not None:
+                canonical = self.blocks[canonical_id]
+                if canonical.token_ids != token_ids:
+                    logger.warning(
+                        "Hash collision while publishing offload prefix: "
+                        "seq=%s block=%d canonical=%d",
+                        seq.id,
+                        block_id,
+                        canonical_id,
+                    )
+                    break
+                # Keep the canonical hash_to_block_id mapping, but annotate this
+                # request's duplicate physical block as well. hash_blocks()
+                # needs the final loaded block's hash as the parent when it
+                # publishes the newly computed suffix.
+                block.update(block_hash, token_ids)
+            else:
+                block.update(block_hash, token_ids)
+                self.hash_to_block_id[block_hash] = block_id
+                if self._event_log is not None:
+                    self._event_log.append(
+                        _make_block_stored(
+                            [block_hash],
+                            token_ids,
+                            parent_hash if parent_hash != -1 else None,
+                            self.block_size,
+                        )
+                    )
+
+            indexed_tokens += hbs
+            parent_hash = block_hash
+
+        return indexed_tokens
 
     def deallocate(self, seq: Sequence):
         for block_id in reversed(seq.block_table):
@@ -356,9 +506,7 @@ class BlockManager:
         new_blocks_needed = max(0, needed_blocks - current_blocks)
         if len(self.free_block_ids_set) < new_blocks_needed:
             return False
-        if not self.swa.has_free(new_blocks_needed):  # True when SWA disabled
-            return False
-        return True
+        return self.swa.has_free(new_blocks_needed)  # True when SWA disabled
 
     def may_append(self, seq: Sequence, num_new_tokens: int = 1):
         # Note: in disaggregated (P/D) mode the scheduler skips this call on

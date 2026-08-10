@@ -5,12 +5,63 @@
 
 import json
 
-
 from atom.entrypoints.openai.serving_chat import (
     build_chat_response,
     build_chat_response_multi,
     create_chat_chunk,
+    normalize_chat_tools,
 )
+
+# ============================================================================
+# normalize_chat_tools Tests
+# ============================================================================
+
+
+class TestNormalizeChatTools:
+    def test_converts_anthropic_tool_schema(self):
+        tools = [
+            {
+                "name": "search",
+                "description": "Search documents",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                },
+            }
+        ]
+
+        assert normalize_chat_tools(tools) == [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search",
+                    "description": "Search documents",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+
+    def test_preserves_openai_tool_schema(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ]
+
+        assert normalize_chat_tools(tools) == tools
+
+    def test_leaves_malformed_tool_for_validator(self):
+        tools = [{"name": "search", "input_schema": "not-an-object"}]
+
+        assert normalize_chat_tools(tools) == tools
+
 
 # ============================================================================
 # create_chat_chunk Tests

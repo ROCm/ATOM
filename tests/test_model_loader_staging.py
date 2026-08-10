@@ -23,6 +23,7 @@ the tests keep their teeth.
 import builtins
 import os
 import tempfile
+import threading
 import unittest
 import unittest.mock
 from typing import ClassVar
@@ -31,7 +32,7 @@ import safetensors.torch
 import torch
 from torch import nn
 
-from atom.model_loader.expert_staging import ExpertStagingPool
+from atom.model_loader.expert_staging import ExpertStagingPool, _cpu_zeroable
 from atom.model_loader.loading_core import load_weights_into_model
 from atom.model_loader.weight_iterator import (
     _shard_tensor_names,
@@ -536,6 +537,170 @@ class StagingBufferAllocationTest(unittest.TestCase):
         self.assertEqual(staging.dtype, torch.uint8)
         self.assertEqual(staging.shape, param.data.shape)
         self.assertEqual(int(staging.sum()), 0, "staging buffer must be zeroed")
+
+    @unittest.skipUnless(hasattr(torch, "float4_e2m1fn_x2"), "torch has no fp4x2 dtype")
+    def test_packed_dtype_allocates_exactly_one_buffer(self):
+        """The doomed first allocation must not happen.
+
+        Finding the raw-byte fallback by allocating with the packed dtype and
+        letting `zero_` raise costs a full host allocation per parameter --
+        pinned host memory allocates at ~4 GB/s cold, and on DeepSeek-R1 MXFP4
+        every routed-expert parameter is packed. That discarded buffer
+        profiled as ~40% of the loader worker pool's time.
+        """
+        param = nn.Parameter(
+            torch.empty((4, self.NUMEL // 4), dtype=torch.float4_e2m1fn_x2),
+            requires_grad=False,
+        )
+        # The dtype probe allocates too, and is cached; warm it first so the
+        # count below sees only the staging allocation.
+        _cpu_zeroable(param.data.dtype)
+
+        dtypes_allocated = []
+        real_empty = torch.empty
+
+        def counting_empty(*args, **kwargs):
+            dtypes_allocated.append(kwargs.get("dtype"))
+            return real_empty(*args, **kwargs)
+
+        with unittest.mock.patch.object(torch, "empty", counting_empty):
+            staging = ExpertStagingPool._allocate_staging(param)
+
+        self.assertEqual(staging.dtype, torch.uint8)
+        self.assertEqual(
+            dtypes_allocated,
+            [torch.uint8],
+            "packed params must go straight to a raw-byte buffer",
+        )
+
+
+class _OneParamMoE:
+    """The smallest module satisfying the pool's protocol, for race tests."""
+
+    def __init__(self, param: nn.Parameter, expected: int):
+        self.param = param
+        self.expected = expected
+        self.on_staged = lambda: None
+
+    def expected_batched_arrivals(self, param):
+        return self.expected
+
+    def _map_global_expert_id_to_local_expert_id(self, global_expert_id):
+        return global_expert_id
+
+    def is_batched_expert_slot(self, local_expert_id):
+        return True
+
+    def stage_expert_weight(
+        self, param, staging, loaded_weight, local_expert_id, shard_id, weight_name
+    ):
+        staging[local_expert_id].copy_(loaded_weight)
+        self.on_staged()
+        return True
+
+    def flush_staged(self, param, staging, filled):
+        for local_expert_id, _ in filled:
+            param.data[local_expert_id].copy_(staging[local_expert_id])
+
+
+class DeclineDuringArrivalTest(unittest.TestCase):
+    """`decline` must never strand a region an in-flight arrival is writing.
+
+    `decline` hands the parameter to another loader path, which writes only
+    regions the pool never staged. It takes the entry off the table and writes
+    back what has landed -- but "what has landed" is read at that instant, so
+    an arrival still in flight is invisible to it. Both windows below end with
+    the expert silently missing from the parameter if the arrival does not
+    write its own region back.
+    """
+
+    NUM_SLOTS = 4
+    ARRIVING_SLOT = 3
+
+    def _setup(self, expected):
+        param = nn.Parameter(torch.zeros(self.NUM_SLOTS, HIDDEN), requires_grad=False)
+        moe = _OneParamMoE(param, expected)
+        direct = []
+
+        def weight_loader(p, w, name, shard_id, global_expert_id):
+            direct.append(global_expert_id)
+            p.data[global_expert_id].copy_(w)
+
+        param.weight_loader = weight_loader
+        return param, moe, direct, ExpertStagingPool(lambda name: moe)
+
+    def _assert_region_survived(self, param, direct, payload):
+        landed = param.data[self.ARRIVING_SLOT]
+        self.assertTrue(
+            torch.equal(landed, payload),
+            f"expert region was dropped: got {landed.tolist()}, "
+            f"want {payload.tolist()} (direct_load calls: {direct})",
+        )
+
+    def test_decline_lands_while_the_buffer_is_being_allocated(self):
+        """The wide window: the entry is published before its buffer exists.
+
+        `decline` pops that entry, sees `staging is None`, and skips the flush
+        entirely -- so nothing it does can cover the arrival that is at that
+        moment blocked inside the allocation.
+        """
+        param, _moe, direct, pool = self._setup(expected=self.NUM_SLOTS)
+        payload = torch.full((HIDDEN,), 7.0)
+
+        allocating = threading.Event()
+        may_finish = threading.Event()
+        real_allocate = ExpertStagingPool._allocate_staging
+
+        def blocking_allocate(p):
+            allocating.set()
+            may_finish.wait(timeout=5)
+            return real_allocate(p)
+
+        arrival = threading.Thread(
+            target=pool.stage,
+            args=(param, "m.w13_weight", "w1", self.ARRIVING_SLOT, payload),
+        )
+        with unittest.mock.patch.object(
+            ExpertStagingPool, "_allocate_staging", staticmethod(blocking_allocate)
+        ):
+            arrival.start()
+            self.assertTrue(allocating.wait(timeout=5), "allocation never started")
+            pool.decline(param)
+            may_finish.set()
+            arrival.join(timeout=5)
+        self.assertFalse(arrival.is_alive(), "arrival thread hung")
+
+        pool.flush_pending()
+        self._assert_region_survived(param, direct, payload)
+
+    def test_decline_lands_between_the_copy_and_the_bookkeeping(self):
+        """The narrow window: the region is staged but not yet in `filled`.
+
+        `decline` does flush here, but over a `filled` set this region has not
+        been added to yet, so the copy it makes skips exactly this slot.
+        """
+        param, moe, direct, pool = self._setup(expected=self.NUM_SLOTS)
+        payload = torch.full((HIDDEN,), 5.0)
+
+        # Fire the decline from inside the copy, i.e. after the bytes reach the
+        # staging buffer and before `stage` records the region as filled.
+        moe.on_staged = lambda: pool.decline(param)
+
+        pool.stage(param, "m.w13_weight", "w1", self.ARRIVING_SLOT, payload)
+
+        pool.flush_pending()
+        self._assert_region_survived(param, direct, payload)
+
+    def test_declined_before_arrival_goes_straight_to_the_weight_loader(self):
+        """The ordinary case still bypasses the pool rather than double-writing."""
+        param, _moe, direct, pool = self._setup(expected=self.NUM_SLOTS)
+        payload = torch.full((HIDDEN,), 3.0)
+
+        pool.decline(param)
+        pool.stage(param, "m.w13_weight", "w1", self.ARRIVING_SLOT, payload)
+
+        self.assertEqual(direct, [self.ARRIVING_SLOT])
+        self._assert_region_survived(param, direct, payload)
 
 
 class DrafterSkipsUnwantedTensorsTest(unittest.TestCase):

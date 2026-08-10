@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 
 import sglang.srt.layers.attention.aiter_backend as _sglang_aiter
 import torch
+from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
 from sglang.srt.layers.attention.utils import (
     create_flashinfer_kv_indices_triton,
@@ -24,6 +25,7 @@ from sglang.srt.layers.attention.utils import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import get_bool_env_var
 
+from atom.model_ops.base_attention import run_pa_decode_gluon
 from atom.plugin.sglang.attention_backend.full_attention.kv_cache import (
     set_kv_buffer_with_layout_shuffle as _set_kv_buffer_with_layout_shuffle,
 )
@@ -38,6 +40,7 @@ from atom.plugin.sglang.attention_backend.full_attention.pa_metadata import (
     build_pa_metadata_for_prefill as _build_pa_metadata_for_prefill,
 )
 from atom.plugin.sglang.runtime.context import is_draft_extend_mode
+from atom.utils import envs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -107,8 +110,6 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         topk: int = 1,
     ):
         super().__init__(model_runner, skip_prefill, kv_indptr_buf, topk)
-        self._atom_token_to_kv_pool = model_runner.token_to_kv_pool
-        self._atom_req_to_token_pool = model_runner.req_to_token_pool
         mapping = getattr(
             model_runner.token_to_kv_pool, "full_attention_layer_id_mapping", None
         )
@@ -179,36 +180,6 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         else:
             self.prefill_ps_num_kv_splits = None
 
-    def _patch_forward_batch_pools(self, forward_batch: ForwardBatch):
-        attr_to_pool = {
-            "token_to_kv_pool": self._atom_token_to_kv_pool,
-            "req_to_token_pool": self._atom_req_to_token_pool,
-        }
-        for attr, saved_pool in attr_to_pool.items():
-            if getattr(forward_batch, attr, None) is not None:
-                continue
-            pool = saved_pool or getattr(self, attr, None)
-            if pool is None:
-                try:
-                    from sglang.srt.model_executor.forward_context import (
-                        get_attn_backend,
-                        has_forward_context,
-                    )
-
-                    if has_forward_context():
-                        backend = get_attn_backend()
-                        pool = getattr(backend, attr, None)
-                        if pool is None:
-                            full_backend = getattr(backend, "full_attn_backend", None)
-                            pool = getattr(full_backend, attr, None)
-                except Exception:  # noqa: BLE001 - forward context is optional
-                    pool = None
-            if pool is not None:
-                try:
-                    setattr(forward_batch, attr, pool)
-                except Exception:  # noqa: BLE001, S110
-                    pass
-
     def _cuda_graph_mla_max_seqlen_qo(self) -> int:
         """Largest q length used by MLA CUDA graph speculative paths."""
         max_seqlen_qo = 1
@@ -220,15 +191,20 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
-        self._patch_forward_batch_pools(forward_batch)
         if forward_batch.forward_mode.is_decode_or_idle():
             self._init_forward_metadata_decode(forward_batch)
         elif self.use_mla and forward_batch.forward_mode.is_draft_extend_v2():
             self._init_draft_extend_v2_mla(forward_batch.batch_size, forward_batch)
         elif self.use_mla and is_draft_extend_mode(forward_batch.forward_mode):
             self._init_draft_extend_mla(forward_batch.batch_size, forward_batch)
+        elif (not self.use_mla) and forward_batch.forward_mode.is_draft_extend_v2():
+            self._init_draft_extend_v2_mha(forward_batch.batch_size, forward_batch)
+        elif (not self.use_mla) and is_draft_extend_mode(forward_batch.forward_mode):
+            self._init_draft_extend_mha(forward_batch.batch_size, forward_batch)
         elif self.use_mla and forward_batch.forward_mode.is_target_verify():
             self._init_target_verify_mla(forward_batch.batch_size, forward_batch)
+        elif (not self.use_mla) and forward_batch.forward_mode.is_target_verify():
+            self._init_target_verify_mha(forward_batch.batch_size, forward_batch)
         else:
             self._init_forward_metadata_extend(forward_batch)
         self._fixup_page_table(forward_batch)
@@ -239,7 +215,6 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         in_capture: bool = False,
     ):
         """Build ATOM metadata for SGLang's split CUDA graph init protocol."""
-        self._patch_forward_batch_pools(forward_batch)
         if in_capture:
             self.init_forward_metadata_capture_cuda_graph(
                 forward_batch.batch_size,
@@ -382,7 +357,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             )
             _build_pa_metadata_for_decode(self, bs, tp_q_head_num=self.num_head)
         else:
-            page_table = forward_batch.req_to_token_pool.req_to_token[
+            page_table = self.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices, :
             ]
             self.forward_metadata = ForwardMetadata(
@@ -587,6 +562,67 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             run_graph=False,
         )
 
+    def _init_draft_extend_v2_mha(self, bs, forward_batch):
+        spec_info = forward_batch.spec_info
+        if spec_info is None:
+            raise RuntimeError("MHA draft_extend_v2 requires speculative metadata")
+        if forward_batch.extend_prefix_lens is None:
+            raise RuntimeError("MHA draft_extend_v2 requires extend_prefix_lens")
+        self.indices_updater_prefill.update(
+            forward_batch.req_pool_indices,
+            forward_batch.seq_lens,
+            forward_batch.seq_lens_sum,
+            prefix_lens=forward_batch.extend_prefix_lens,
+            encoder_lens=forward_batch.encoder_lens,
+            spec_info=None,
+        )
+        max_q_len = self._max_len(
+            forward_batch.extend_seq_lens_cpu,
+            forward_batch.extend_seq_lens,
+        )
+        max_kv_len = self._max_len(forward_batch.seq_lens_cpu, forward_batch.seq_lens)
+        self.forward_metadata = ForwardMetadata(
+            self.indices_updater_prefill.kv_indptr,
+            self.indices_updater_prefill.kv_indices,
+            self.qo_indptr[: bs + 1],
+            None,
+            max_q_len,
+            max_kv_len,
+            None,
+            None,
+            custom_mask=None,
+            mask_indptr=None,
+            max_extend_len=max_q_len,
+        )
+
+    def _init_draft_extend_mha(self, bs, forward_batch):
+        spec_info = forward_batch.spec_info
+        if spec_info is None:
+            raise RuntimeError("MHA draft_extend requires speculative metadata")
+        kv_indices, kv_indptr, qo_indptr, custom_mask = (
+            spec_info.generate_attn_arg_prefill(
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                forward_batch.seq_lens_sum,
+                self.req_to_token,
+            )
+        )
+        kv_indices = kv_indices.to(torch.int64)
+        draft_max_extend_len = int(torch.max(spec_info.num_accept_tokens).item())
+        self.forward_metadata = ForwardMetadata(
+            kv_indptr,
+            kv_indices,
+            qo_indptr,
+            None,
+            draft_max_extend_len,
+            None,
+            None,
+            None,
+            custom_mask=custom_mask,
+            mask_indptr=None,
+            max_extend_len=draft_max_extend_len,
+        )
+
     def _init_target_verify_mla(self, bs, forward_batch):
         """Init MLA metadata for speculative target_verify."""
         spec_info = forward_batch.spec_info
@@ -779,6 +815,55 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             forward_batch.seq_lens,
         )
 
+    def _init_target_verify_mha(self, bs, forward_batch):
+        spec_info = forward_batch.spec_info
+        if spec_info is None:
+            raise RuntimeError("MHA target_verify requires speculative metadata")
+
+        draft_num = spec_info.draft_token_num
+        qo_indptr = torch.arange(
+            0,
+            (1 + bs) * draft_num,
+            step=draft_num,
+            dtype=torch.int32,
+            device=self.device,
+        )
+
+        kv_indptr = self.kv_indptr[: bs + 1]
+        kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
+        kv_indptr = kv_indptr[: bs + 1]
+
+        kv_indices_len = int(kv_indptr[-1].item())
+        kv_indices = torch.empty(kv_indices_len, dtype=torch.int64, device=self.device)
+        create_flashinfer_kv_indices_triton[(bs,)](
+            self.req_to_token,
+            forward_batch.req_pool_indices,
+            forward_batch.seq_lens,
+            kv_indptr,
+            None,
+            kv_indices,
+            self.req_to_token.stride(0),
+        )
+
+        seq_mask_len = draft_num * (forward_batch.seq_lens + draft_num)
+        mask_indptr = self.mask_indptr
+        mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
+        mask_indptr = mask_indptr[: bs + 1]
+
+        self.forward_metadata = ForwardMetadata(
+            kv_indptr,
+            kv_indices,
+            qo_indptr,
+            None,
+            draft_num,
+            None,
+            None,
+            None,
+            custom_mask=spec_info.custom_mask,
+            mask_indptr=mask_indptr,
+            max_extend_len=draft_num,
+        )
+
     def _fixup_page_table(self, forward_batch: ForwardBatch):
         """Post-process page_table for non-MLA extend mode."""
         if (
@@ -817,6 +902,11 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         max_num_tokens: int,
         kv_indices_buf: torch.Tensor | None = None,
     ):
+        from atom.plugin.sglang.attention_backend.sparse_mla_indexer import (
+            init_sparse_mla_graph_state,
+        )
+
+        init_sparse_mla_graph_state(self, max_bs, max_num_tokens)
         self.cuda_graph_kv_last_page_len = torch.ones(
             max_bs, dtype=torch.int, device=self.device
         )
@@ -833,6 +923,14 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             )
         else:
             self.cuda_graph_kv_indices = kv_indices_buf
+
+        draft_tokens = int(self.num_draft_tokens or 1)
+        custom_mask_size = max_bs * draft_tokens * (self.max_context_len + draft_tokens)
+        self.cuda_graph_custom_mask = torch.ones(
+            custom_mask_size,
+            dtype=torch.bool,
+            device=self.device,
+        )
 
         # Always use preshuffle layout for pa_fwd_asm
         self.page_table = torch.zeros(
@@ -1653,17 +1751,6 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
 
     def _should_use_native_dense_mha(self, layer) -> bool:
         sliding_window_size = getattr(layer, "sliding_window_size", None)
-        is_minimax_m3 = bool(getattr(layer, "_atom_minimax_m3_dense_mha", False))
-        if (
-            is_minimax_m3
-            and not self.use_mla
-            and not layer.is_cross_attention
-            and layer.head_dim == 128
-            and layer.qk_head_dim == 128
-            and layer.v_head_dim == 128
-            and (sliding_window_size is None or sliding_window_size <= -1)
-        ):
-            return True
         return (
             not self.use_mla
             and not layer.is_cross_attention
@@ -1717,9 +1804,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
     def _set_kv_buffer_native_dense(self, layer, cache_loc, k, v, forward_batch):
         k_descale, v_descale = self._kv_descales(layer)
         if self.kv_cache_dtype == dtypes.fp8:
-            k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
-                layer.layer_id
-            )
+            k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
             launch_reshape_and_cache_flash(
                 k.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
                 v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
@@ -1733,7 +1818,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             )
             return
 
-        forward_batch.token_to_kv_pool.set_kv_buffer(
+        self.token_to_kv_pool.set_kv_buffer(
             layer, cache_loc, k, v, k_descale, v_descale
         )
 
@@ -1808,9 +1893,9 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                         layer, cache_loc, k, v, forward_batch
                     )
                 elif self.use_mla:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                    self.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
                 else:
-                    k_buffer, v_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(
+                    k_buffer, v_buffer = self.token_to_kv_pool.get_kv_buffer(
                         layer.layer_id
                     )
                     k_scale, v_scale = self._ensure_fp8_kv_scales(
@@ -1829,17 +1914,17 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
 
         if self.use_mla:
             return self._forward_extend_mla(q, k, v, layer, forward_batch)
-        if bool(getattr(layer, "_atom_minimax_m3_dense_mha", False)):
-            # M3 dense decode benefits from the native ragged path, but batched
-            # SGLang prefill is safer through the standard varlen extend path.
-            return self._forward_extend_mha(q, k, v, layer, forward_batch)
+        if forward_batch.forward_mode.is_target_verify() or is_draft_extend_mode(
+            forward_batch.forward_mode, include_v2=True
+        ):
+            return self._forward_extend_mha_speculative(q, k, v, layer, forward_batch)
         if use_native_dense_mha:
             return self._forward_extend_native_dense_mha(q, layer, forward_batch)
         else:
             return self._forward_extend_mha(q, k, v, layer, forward_batch)
 
     def _forward_extend_native_dense_mha(self, q, layer, forward_batch):
-        k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
         q_descale, k_descale, v_descale = None, None, None
 
         if self.kv_cache_dtype == dtypes.fp8:
@@ -1870,6 +1955,42 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             v_descale=v_descale,
         )
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
+    def _forward_extend_mha_speculative(self, q, k, v, layer, forward_batch):
+        """Non-MLA EAGLE verify/draft-extend path.
+
+        Mirrors /app/sglang's AiterAttnBackend: speculative MHA uses the
+        extend-attention kernel with custom masks, not plain flash_attn_varlen.
+        """
+
+        if k is None or v is None:
+            raise RuntimeError("MHA speculative extend requires explicit k/v tensors")
+
+        if layer.qk_head_dim != layer.v_head_dim:
+            o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
+        else:
+            o = torch.empty_like(q)
+
+        self.extend_attention_fwd(
+            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+            k.contiguous(),
+            v.contiguous(),
+            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+            self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            self.forward_metadata.qo_indptr,
+            self.forward_metadata.kv_indptr,
+            self.forward_metadata.kv_indices,
+            self.forward_metadata.custom_mask,
+            True,
+            self.forward_metadata.mask_indptr,
+            self.forward_metadata.max_extend_len,
+            1.0,
+            1.0,
+            layer.scaling,
+            logit_cap=layer.logit_cap,
+        )
+        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def _forward_extend_mha(self, q, k, v, layer, forward_batch):
         """Non-MLA extend path: standard MHA with flash_attn_varlen_func."""
@@ -1904,7 +2025,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         kv_indices = self.forward_metadata.kv_indices
         qo_indptr = self.forward_metadata.qo_indptr
 
-        K_Buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        K_Buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
         assert len(q.shape) == 3
 
@@ -1935,7 +2056,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         if k is None or v is None:
             raise RuntimeError("MLA normal extend requires explicit k/v tensors")
 
-        V_Buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        V_Buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
         kv_lora_rank = V_Buffer.shape[-1]
         qk_rope_head_dim = K_Buffer.shape[-1] - kv_lora_rank
         qk_nope_head_dim = k.shape[-1] - qk_rope_head_dim
@@ -2417,7 +2538,6 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         save_kv_cache=True,
         **kwargs,
     ):
-        self._patch_forward_batch_pools(forward_batch)
         topk_indices = kwargs.get("topk_indices")
         if self.use_mla and topk_indices is not None:
             return self._forward_sparse_mla(
@@ -2438,10 +2558,10 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 dtype=self.input_dtype,
             )
             if save_kv_cache:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
+                self.token_to_kv_pool.set_kv_buffer(
                     layer, forward_batch.out_cache_loc, k, v
                 )
-            k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             self._call_mla_decode_fwd(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                 k_buffer,
@@ -2459,12 +2579,22 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 )
             return self._forward_decode_native_dense_mha(q, layer, forward_batch)
 
+        if (
+            envs.ATOM_FORCE_ATTN_TRITON
+            and not layer.is_cross_attention
+            and layer.qk_head_dim == layer.v_head_dim
+            and layer.head_dim == layer.qk_head_dim
+        ):
+            if save_kv_cache:
+                self._set_kv_buffer_native_dense(
+                    layer, forward_batch.out_cache_loc, k, v, forward_batch
+                )
+            return self._forward_decode_native_dense_mha(q, layer, forward_batch)
+
         o = q.new_empty((batch_size, layer.tp_q_head_num, head_dim_out))
 
         if save_kv_cache:
-            k_buffer, v_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(
-                layer.layer_id
-            )
+            k_buffer, v_buffer = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
             k_scale, v_scale = self._ensure_fp8_kv_scales(
                 layer, k_buffer, self.page_size
             )
@@ -2479,9 +2609,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 self.page_size,
             )
 
-        k_buffer, v_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(
-            layer.layer_id
-        )
+        k_buffer, v_buffer = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
         block_size = self.page_size
         num_slots, num_kv_heads, head_size = k_buffer.shape
         num_blocks = num_slots // block_size
@@ -2524,13 +2652,9 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             )
         else:
             q_3d = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
-            page_table = getattr(self.forward_metadata, "page_table", None)
+            page_table = self.forward_metadata.page_table
             if page_table is None:
-                page_table = getattr(self.forward_metadata, "swa_page_table", None)
-            if page_table is None:
-                raise AttributeError(
-                    "ForwardMetadata has neither page_table nor swa_page_table"
-                )
+                raise AttributeError("ForwardMetadata.page_table is not initialized")
             if page_table.dtype != torch.int32:
                 raise TypeError(
                     "pa_fwd_asm block_tables must be torch.int32, got "
@@ -2562,7 +2686,80 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         return o.view(-1, layer.tp_q_head_num * head_dim_out)
 
     def _forward_decode_native_dense_mha(self, q, layer, forward_batch):
-        k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        if envs.ATOM_FORCE_ATTN_TRITON:
+            block_size = self.page_size
+            num_slots, num_kv_heads, head_size = k_cache.shape
+            num_blocks = num_slots // block_size
+            k_cache = k_cache[: num_blocks * block_size].view(
+                num_blocks, block_size, num_kv_heads, head_size
+            )
+            v_cache = v_cache[: num_blocks * block_size].view(
+                num_blocks, block_size, num_kv_heads, layer.v_head_dim
+            )
+            x = 16 // k_cache.element_size()
+            k_cache = (
+                k_cache.view(num_blocks, block_size, num_kv_heads, head_size // x, x)
+                .permute(0, 2, 3, 1, 4)
+                .contiguous()
+            )
+            v_cache = (
+                v_cache.view(
+                    num_blocks, block_size // x, x, num_kv_heads, layer.v_head_dim
+                )
+                .permute(0, 3, 1, 4, 2)
+                .contiguous()
+            )
+            q_3d = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+            out = torch.empty_like(q_3d, dtype=self.input_dtype)
+            num_seqs = self.forward_metadata.kv_lens.shape[0]
+            query_group_size = 1 * (layer.tp_q_head_num // layer.tp_k_head_num)
+            max_context_partition_num = get_recommended_splits(
+                num_seqs, layer.tp_k_head_num
+            )
+            context_partition_size = 256
+            intermediate_shape = (
+                num_seqs,
+                layer.tp_k_head_num,
+                max_context_partition_num,
+                query_group_size,
+            )
+            exp_sums = torch.empty(
+                intermediate_shape, dtype=torch.float32, device=q.device
+            )
+            max_logits = torch.empty(
+                intermediate_shape, dtype=torch.float32, device=q.device
+            )
+            temporary_output = torch.empty(
+                *intermediate_shape,
+                layer.head_dim,
+                dtype=q.dtype,
+                device=q.device,
+            )
+            run_pa_decode_gluon(
+                output=out,
+                q=q_3d,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                context_lens=self.forward_metadata.kv_lens,
+                block_tables=self.forward_metadata.page_table,
+                softmax_scale=layer.scaling,
+                max_seqlen_q=1,
+                max_context_partition_num=max_context_partition_num,
+                context_partition_size=context_partition_size,
+                compute_type=torch.bfloat16,
+                q_scale=None,
+                k_scale=None,
+                v_scale=None,
+                exp_sums=exp_sums,
+                max_logits=max_logits,
+                temporary_output=temporary_output,
+                alibi_slopes=None,
+                sinks=None,
+                sliding_window=-1,
+                ps=True,
+            )
+            return out.reshape_as(q)
         aiter_kv_str = self._get_aiter_paged_ragged_kv_cache_dtype()
 
         o = torch.empty_like(q, dtype=self.input_dtype)
