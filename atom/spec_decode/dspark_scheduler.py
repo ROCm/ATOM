@@ -285,38 +285,6 @@ def ragged_verify_len(
 ) -> int | None:
     """Per-request RAGGED verify length (paper §5.2 avoid-padding), or None when
     no length is representable and the caller must stay rectangular.
-
-    ``max(ell, max_num_bonus) + 1``, bounded on BOTH sides. Violating either
-    bound desyncs the batch layout from what the scheduler reserved, and that
-    surfaces far downstream as an out-of-range token id in the draft's Markov
-    transition-table lookup -- never as a failure here.
-
-    * lower, ``max_num_bonus + 1`` -- ell is only the PREDICTED accept count
-      while the anchor sits at the previous step's ACTUAL num_bonus. Shrink
-      below this and the anchor falls outside the shrunk segment. Same bound the
-      q-bucket path applies via ``need = max(max_ell + 1, max_num_bonus + 1)``.
-    * upper, ``scheduled_len`` -- what the scheduler actually scheduled for this
-      seq this step. ``ell`` is read from a D2H that is never awaited, so in
-      steady state it is TWO steps old, while the caller's boundary guard only
-      checks that step N-1's request set equals step N's. It says nothing about
-      step N-2, where the ell values were produced: a request present in both
-      N-1 and N may have had a longer segment back at N-2, and its stale ell
-      then exceeds this step's ``scheduled_len``. Growing is not representable --
-      the caller's flat rebuild keeps the first ``len`` entries of each seq's OLD
-      segment, so a longer length reads into the NEXT seq's tokens and claims
-      more rows than the scheduler reserved.
-
-    Shrinking is always safe, and is the point of ragged: the dropped draft
-    suffix is re-drafted next step, losslessly.
-
-    Args:
-        ell: verify length from the confidence head, or None if this request has
-            no ell yet (new this step, or its copy still in flight) -> full
-            length, i.e. never under-verify.
-        full_q: full verify length = mtp_k + 1.
-        max_num_bonus: batch-max bonus tokens; the length must cover it.
-        scheduled_len: this seq's ``num_scheduled_tokens`` for this step. A
-            non-positive value means "no scheduler bound to honor".
     """
     lo = max(max_num_bonus + 1, 1)
     if 0 < scheduled_len < lo:

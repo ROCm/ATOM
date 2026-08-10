@@ -120,42 +120,20 @@ class VerifyScheduler:
         self._last_ell = ell
 
     def _ell_stage(self, n: int) -> torch.Tensor:
-        """Next pinned CPU slot to land an async ell D2H in, as an ``[n]`` view.
-
-        Pinned matters here: a D2H into freshly allocated PAGEABLE memory is not
-        reliably asynchronous, and this copy is issued behind
-        ``wait_stream(default_stream)`` -- i.e. behind the whole step -- so a
-        blocking one would stall the host on the GPU's tail, exactly what this
-        class exists to avoid.
-
-        A slot is handed out only once the D2H that last used it has LANDED,
-        checked through that copy's event. Rotation alone is NOT enough: the
-        ring has ``_MAX_ELL_INFLIGHT`` slots and ``record_ell`` caps
-        ``_ell_pending`` at the same number, so as soon as the host runs that
-        many steps ahead of the copy stream the index wraps onto the slot whose
-        entry is being evicted -- and evicting the bookkeeping tuple does not
-        cancel its DMA. Two copies would then write the same pinned buffer
-        concurrently and the reader would see torn values (an ell that is
-        neither current nor merely stale). While a slot is still busy we park
-        the index and take a one-off buffer for this step instead.
-
-        NOTE: ``device="cpu"`` is not optional. This ring is first allocated on
-        the warmup forward, which ModelRunner.__init__ runs while the default
-        device is still the GPU (it is only reset to "cpu" AFTER
-        ``_maybe_warmup()`` returns), so an unqualified
-        ``torch.zeros(..., pin_memory=True)`` allocates on the GPU and dies with
-        "Only dense CPU tensors can be pinned". Other pin_memory sites in the
-        engine get away with it only because they are unreachable from warmup.
-        CpuGpuBuffer pins the same, explicitly-CPU way.
-        """
+        """Free pinned ell landing slot."""
+        # pin_memory: a pageable D2H is not async, and this copy sits behind the
+        # whole step -- blocking here stalls the host on the GPU's tail.
         ring = self._ell_stage_ring
         width = ring.shape[1] if ring is not None else self.runner.config.max_num_seqs
         if n > width:
-            # Should be unreachable (ell is [decode_bs] <= max_num_seqs); fall
-            # back to a one-off pinned buffer rather than corrupt the ring.
+            # Unreachable (ell is [decode_bs] <= max_num_seqs); one-off rather
+            # than corrupt the ring.
             self._ell_last_slot = None
             return torch.zeros(n, dtype=torch.int64, device="cpu", pin_memory=True)
         if ring is None:
+            # device="cpu" is not optional: warmup runs with a GPU default
+            # device, where unqualified pin_memory=True allocates on GPU and
+            # dies with "Only dense CPU tensors can be pinned".
             ring = torch.zeros(
                 _MAX_ELL_INFLIGHT,
                 width,
@@ -167,9 +145,10 @@ class VerifyScheduler:
         idx = self._ell_stage_idx
         busy = self._ell_slot_event[idx]
         if busy is not None and not busy.query():
-            # Previous D2H into this slot has not landed. Overwriting it now is
-            # the torn-read race described above -- park the index (so the same
-            # slot is retried next step) and stage into a one-off buffer.
+            # Rotation alone does not free a slot: the ring and the _ell_pending
+            # cap are the same size, so the index wraps onto an entry being
+            # evicted -- and eviction does not cancel its DMA. Two writers, one
+            # buffer, torn reads. Park the index and take a one-off buffer.
             self._ell_last_slot = None
             return torch.zeros(n, dtype=torch.int64, device="cpu", pin_memory=True)
         slot = ring[idx]

@@ -39,59 +39,6 @@ Checkpoint layout (DeepSeek-V4-Pro-DSpark):
   mtp.2.confidence_head.proj       confidence head [1, hidden+rank]
   mtp.2.hc_head_{fn,base,scale}, mtp.2.norm   final mHC reduction + norm
   (embed + lm_head are shared with the target via share_with_target)
-
-COMPILE BOUNDARY -- read before editing.
-
-``_DSparkInner.forward`` carries ``@support_torch_compile``. Everything it
-reaches is traced by Dynamo and, at ``--level 3``, replayed WITHOUT guard
-evaluation (``dispatch_to_code``, atom/utils/decorators.py:582) -- so whatever
-the FIRST call traced is permanent.
-
-  TRACED: _DSparkInner.forward, _build_block_plan, _dspark_block_topk_idxs,
-          DSparkLayer.forward_block
-
-The compiled region runs embed -> 3 stages -> mHC reduction and STOPS at the
-hidden state. Two things are deliberately outside it, both because they contain
-LAZY JIT LOADERS that Dynamo cannot trace -- tracing either one graph-breaks,
-and the break splits the forward into two Dynamo graphs, the second of which
-trips "VllmBackend can only be called once":
-
-  1. DSparkLayer.dspark_attention -- reachable only through the Dynamo-opaque
-     torch.ops.aiter.dspark_block_attention splitting op (mirrors how the V4
-     target reaches _attn_core through v4_core_attention). The fused
-     qk_norm_rope_maybe_quant JIT-builds a flydsl kernel; the builder hits
-     function.__new__.
-  2. head_and_sample (LM head + Markov sampler) -- a plain uncompiled method.
-     Under TP, ParallelLMHead's aiter all_gather lazily JIT-loads an aiter
-     module, reaching shutil.which()/posix.stat. Same division as the target,
-     whose LM head lives in compute_logits, outside DeepseekV4Model.forward.
-
-Being outside also means their per-step forward-context reads run eagerly and
-can never bake -- which is what makes dspark_attention's is_dummy_run gate and
-ParallelLMHead's is_prefill/is_draft branch safe, and what lets WARMUP be the
-first traced call (see DeepseekV4DSpark.forward_spec: warmup is padded to B==2
-so the batch dim does not get 0/1-specialized).
-
-In the TRACED region, do NOT:
-  - read get_forward_context(), os.environ, or any per-step mutable global --
-    it bakes
-  - call anything that may lazily build or load a kernel on first use
-  - branch on a python value that differs between calls (batch size,
-    is_dummy_run, is_prefill, num_draft)
-  - mutate an nn.Module buffer -- ``bytecode_hook`` (decorators.py:392) rejects
-    it outright
-
-These failures are SILENT: the output stays correct (speculative decoding is
-lossless), only the acceptance rate collapses. The merge gate is the acceptance
-rate, not GSM8K.
-
-  NOT TRACED, safe to edit and instrument: write_context_kv (deliberately
-  left eager -- the decorator replaces only ``__call__``), share_with_target,
-  remap_mtp_weight_name, get_expert_mapping, and DSparkProposer.propose().
-
-Instrument at ``DSparkProposer.propose()``, never inside the traced region.
-Rollback: ``ATOM_DSPARK_DISABLE_COMPILE=1`` (draft only) or ``--level 0`` (both
-models). ``--enforce-eager`` does NOT disable this.
 """
 
 from dataclasses import dataclass
@@ -104,6 +51,7 @@ from atom.config import get_current_atom_config
 from atom.models.dspark_draft import DSparkDraftModel
 from atom.utils import envs, mark_spliting_op
 from atom.utils.decorators import support_torch_compile
+
 
 if TYPE_CHECKING:
     from atom.config import Config
