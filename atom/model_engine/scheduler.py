@@ -2566,6 +2566,21 @@ class DecodeScheduler(Scheduler):
                     logger.warning("Cannot allocate prefill")
                     break
                 self.block_manager.allocate(seq)
+                # Paged SWA (DeepSeek-V4): allocate() leaves the SWA slots as -1
+                # placeholders, and the base scheduler normally fills them via
+                # swa.ensure_for_tokens() right before the prefill forward. Under
+                # rapidserve that forward runs in the PREFILL process, which has
+                # no BlockManager (PrefillScheduler.block_manager is None) and so
+                # can never fill them. Materialize the trailing window here — the
+                # same thing the inter-node P/D consumer does at
+                # _schedule_first_decode_after_remote_kv — so prefill's forward
+                # has real slots to write the sliding-window KV into. The filled
+                # table ships to prefill in the BlockAssignment. No-op when SWA
+                # is disabled.
+                if self.block_manager.swa_enabled:
+                    self.block_manager.swa.materialize_window(
+                        seq, seq.num_prompt_tokens
+                    )
             self.waiting.popleft()
 
             self.prefill_waiting[seq.id] = seq

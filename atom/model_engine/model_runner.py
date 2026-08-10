@@ -1923,8 +1923,13 @@ class ModelRunner:
         self._kv_tensor_names = kv_names
         return kv_names
 
-    def _bind_kv_tensors(self):
+    def _bind_kv_tensors(self, num_kvcache_blocks):
         """Bind whatever KV tensors are on self into the attention modules.
+
+        `num_kvcache_blocks` is the SCHEDULER block count, passed explicitly
+        rather than read off self: the transfer protocol addresses scheduler
+        blocks, and `self.num_physical_kvcache_blocks` is larger by block_ratio
+        (see the note at the set_kv_cache_data call below).
 
         Shared by allocate_kv_cache (freshly allocated tensors) and, under
         intra-GPU disaggregation, by the decode process after importing
@@ -2040,7 +2045,7 @@ class ModelRunner:
 
         num_kv_heads, num_draft_layers = self._prepare_kv_dims(num_kvcache_blocks)
         self._allocate_kv_tensors(num_kv_heads, num_draft_layers)
-        self._bind_kv_tensors()
+        self._bind_kv_tensors(num_kvcache_blocks)
 
         # Cross-validate: compare estimated vs actual KV cache allocation.
         # `actual_kv_bytes` includes BOTH the unified pool tensors (counted by
@@ -4436,7 +4441,7 @@ class RapidServeModelRunner(ModelRunner):
             f"[KV-IMPORT] rank {self.rank}: imported {len(imported)} KV entries: "
             f"{sorted(imported)} — binding via builder protocol"
         )
-        self._bind_kv_tensors()
+        self._bind_kv_tensors(num_kvcache_blocks)
         logger.info(f"ModelRunner rank {self.rank}: import_kv_cache_ipc_handle done")
         return True
 

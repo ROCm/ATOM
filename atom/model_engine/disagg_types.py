@@ -10,7 +10,7 @@ DecodeEngineCore.
 """
 
 import enum
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 class DisaggMsgType(enum.Enum):
@@ -37,6 +37,12 @@ class BlockAssignment:
     block_table: list  # list[int] — physical block IDs owned by decode
     num_cached_tokens: int  # prefix-cache hits; prefill skips these blocks
     context_len: int  # total token count (prompt length)
+    # Paged-SWA (DeepSeek-V4) parallel block table, positionally aligned with
+    # block_table. The PREFILL forward is what writes the sliding-window KV, but
+    # only decode owns the SlidingWindowPool — so decode materializes the
+    # trailing window and ships the resulting slots here. Empty list for models
+    # without paged SWA.
+    swa_block_table: list = field(default_factory=list)
 
 
 @dataclass

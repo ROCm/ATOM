@@ -780,6 +780,10 @@ class PrefillEngineCore(EngineCore):
                     assignment = self._pending_assignments.pop(seq.id)
                     seq.block_table = list(assignment.block_table)
                     seq.num_cached_tokens = assignment.num_cached_tokens
+                    # Paged-SWA parallel table, already window-materialized by
+                    # decode. Must stay positionally aligned with block_table —
+                    # the V4 index kernels use absolute logical indexing.
+                    seq.swa_block_table = list(assignment.swa_block_table)
 
     def _process_engine_step(self):
         from atom.model_engine.disagg_types import DisaggMsgType, PrefillDone
@@ -1023,6 +1027,7 @@ class DecodeEngineCore(EngineCore):
             block_table=list(seq.block_table),
             num_cached_tokens=seq.num_cached_tokens,
             context_len=seq.num_tokens,
+            swa_block_table=list(seq.swa_block_table),
         )
         self._d2p_sock.send(pickle.dumps((DisaggMsgType.BLOCK_ASSIGNMENT, assignment)))
         logger.info(
