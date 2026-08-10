@@ -43,6 +43,9 @@ python3 -m sglang.launch_server \
 
 ### DeepSeek with FP8 (TP=4)
 
+Use the AITER attention backend for TP4. With an FP8 KV cache, ATOM keeps the
+absorbed decode query in FP8 so AITER dispatches its native 32-head kernel.
+
 ```bash
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export SGLANG_AITER_FP8_PREFILL_ATTN=0
@@ -93,11 +96,15 @@ python3 -m sglang.launch_server \
 
 ### DeepSeek with MXFP4 (TP=4)
 
+As with the FP8 TP4 configuration, use AITER attention with FP8 Q/KV decode.
+Load this FP4 checkpoint serially to avoid incomplete batched MoE expert groups.
+
 ```bash
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
-export SGLANG_AITER_FP8_PREFILL_ATTN=1
+export SGLANG_AITER_FP8_PREFILL_ATTN=0
 export SGLANG_USE_AITER=1
 export ATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1
+export ATOM_LOADER_NUM_THREADS=1
 # Introduce ATOM as external model package of SGLang
 export SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
 export SGLANG_ENABLE_TORCH_COMPILE=1

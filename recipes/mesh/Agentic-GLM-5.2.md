@@ -209,7 +209,7 @@ Prepare an isolated AIPerf environment if one is not already available:
 ```bash
 export AIPERF_DIR=${AIPERF_DIR:-/workspace/codes/aiperf}
 export AIPERF_VENV=${AIPERF_VENV:-/workspace/venvs/aiperf-sa}
-export SA_AIPERF_COMMIT=${SA_AIPERF_COMMIT:-0d2aa0572ac685943d38c580675c4a61023581d3}
+export SA_AIPERF_COMMIT=${SA_AIPERF_COMMIT:-b7b16cf851885567988a643282266bce74e34437}
 
 mkdir -p "$(dirname "${AIPERF_DIR}")" "$(dirname "${AIPERF_VENV}")"
 if [[ ! -d "${AIPERF_DIR}/.git" ]]; then
@@ -241,7 +241,8 @@ export PUBLIC_DATASET=${PUBLIC_DATASET:-semianalysis_cc_traces_weka_062126}
 
 export CONCURRENCY=${CONCURRENCY:-1}
 export BENCHMARK_DURATION=${BENCHMARK_DURATION:-3600}
-export AGENTIC_CACHE_WARMUP_DURATION=${AGENTIC_CACHE_WARMUP_DURATION:-600}
+export WARMUP_REQUESTS_PER_LANE=${WARMUP_REQUESTS_PER_LANE:-10}
+export TRACE_IDLE_GAP_CAP_SECONDS=${TRACE_IDLE_GAP_CAP_SECONDS:-300}
 export WARMUP_GRACE_PERIOD=${WARMUP_GRACE_PERIOD:-1800}
 export MAX_CONTEXT_LENGTH=${MAX_CONTEXT_LENGTH:-1048576}
 export NUM_DATASET_ENTRIES=${NUM_DATASET_ENTRIES:-393}
@@ -254,6 +255,7 @@ export SLICE_DURATION=${SLICE_DURATION:-1.0}
 export AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES=0
 export AIPERF_DATASET_CONFIGURATION_TIMEOUT=1800
 export AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT=1800
+export AIPERF_UI_REALTIME_METRICS_ENABLED=true
 export AIPERF_HTTP_TCP_USER_TIMEOUT=900000
 export AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT=300
 
@@ -280,10 +282,12 @@ mkdir -p "${OUTPUT_DIR}"
   --concurrency "${CONCURRENCY}" \
   --benchmark-duration "${BENCHMARK_DURATION}" \
   --random-seed "${RANDOM_SEED}" \
+  --stats-interval 30 \
   --failed-request-threshold "${FAILED_REQUEST_THRESHOLD}" \
   --trajectory-start-min-ratio "${TRAJECTORY_START_MIN_RATIO}" \
   --trajectory-start-max-ratio "${TRAJECTORY_START_MAX_RATIO}" \
-  --agentic-cache-warmup-duration "${AGENTIC_CACHE_WARMUP_DURATION}" \
+  --warmup-requests-per-lane "${WARMUP_REQUESTS_PER_LANE}" \
+  --trace-idle-gap-cap-seconds "${TRACE_IDLE_GAP_CAP_SECONDS}" \
   --warmup-grace-period "${WARMUP_GRACE_PERIOD}" \
   --use-server-token-count \
   --no-gpu-telemetry \
@@ -320,19 +324,241 @@ router before every point so each measurement begins with fresh HBM and LMCache
 state. The repository's nightly configuration models every layout/concurrency
 combination as an independent job for the same reason.
 
-For a short functional smoke test, use:
+## Agentic Accuracy (SWE-bench Lite)
+
+Agentic accuracy does not use the fixed-sequence GSM8K evaluator. The c1
+nightly case runs ATOM's local SWE-bench Lite agentic evaluation after the
+performance trace:
+
+- `princeton-nlp/SWE-bench_Lite`, full 300-instance test split.
+- 16 local `mini-swe-agent==2.4.5` workers with a 150-step limit.
+- Local Docker sandboxes and official `swebench==4.1.0` scoring.
+- Accuracy is `resolved / submitted` from `exact_match,resolved`.
+- The current CI threshold is `0.50`.
+
+For manual validation in a local container, follow the procedure below.
+
+Only c1 runs the full accuracy suite so the five performance jobs do not
+duplicate the same 300-instance evaluation. Rank 0 receives the host Docker
+socket and CLI for this step; no Modal credentials or InferenceX checkout is
+required. Plan for roughly 120 GB of reusable Docker image storage and at least
+16 GB of free memory on the evaluation node.
+
+For a short AIPerf functional smoke test (not SWE-bench), use:
 
 ```bash
 export CONCURRENCY=1
 export BENCHMARK_DURATION=20
-export AGENTIC_CACHE_WARMUP_DURATION=1
+export WARMUP_REQUESTS_PER_LANE=1
 export NUM_DATASET_ENTRIES=39
 export TRAJECTORY_START_MAX_RATIO=0.25
 
 # Add --unsafe-override to the AIPerf command only for this smoke run.
 ```
 
-## Validation Checklist
+## Local SWE-bench Lite Accuracy Validation
+
+Run all commands below in one Bash shell inside a local ATOM development
+container. The container must have:
+
+- GPUs 0-3 and the ATOM source tree at `/workspace/ATOM`.
+- `GLM-5.2-MXFP4` at `/mnt/models/GLM-5.2-MXFP4`.
+- A persistent mount at `/workspace/swebench-results`.
+- The host `/var/run/docker.sock`, a Docker CLI, and permission to use the
+  socket. mini-swe-agent and the official harness use it to start sibling
+  SWE-bench containers.
+- Network access to PyPI, Hugging Face, and Docker Hub.
+
+### Step 1: Initialize the Container Environment
+
+```bash
+set -euo pipefail
+
+export ATOM_ROOT=${ATOM_ROOT:-/workspace/ATOM}
+export MODEL_PATH=${MODEL_PATH:-/mnt/models/GLM-5.2-MXFP4}
+export OUTPUT_ROOT=${OUTPUT_ROOT:-/workspace/swebench-results}
+export SWEBENCH_DOCKER_EXECUTABLE=${SWEBENCH_DOCKER_EXECUTABLE:-docker}
+
+test -f "${ATOM_ROOT}/.github/scripts/atomesh/run_swebench_lite.sh"
+test -d "${MODEL_PATH}"
+test -S /var/run/docker.sock
+mkdir -p "${OUTPUT_ROOT}"
+test -w "${OUTPUT_ROOT}"
+"${SWEBENCH_DOCKER_EXECUTABLE}" version
+
+cd "${ATOM_ROOT}"
+git status --short
+git rev-parse HEAD
+```
+
+If the Docker CLI was mounted under another name, set
+`SWEBENCH_DOCKER_EXECUTABLE` to its absolute path, for example
+`/usr/local/bin/docker-host`.
+
+### Step 2: Start a Standalone GLM-5.2 Server
+
+```bash
+export PYTHONPATH="${ATOM_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+export HIP_VISIBLE_DEVICES=0,1,2,3
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export AITER_USE_FLYDSL_MOE_SORTING=1
+export SERVER_LOG="${OUTPUT_ROOT}/atom-swebench-glm52-server.log"
+export SERVER_PID_FILE="${OUTPUT_ROOT}/atom-swebench-glm52-server.pid"
+
+if curl -sS --fail http://127.0.0.1:8000/v1/models >/dev/null 2>&1; then
+  echo "ERROR: port 8000 already has an OpenAI-compatible server" >&2
+  exit 1
+fi
+
+python3 -m atom.entrypoints.openai_server \
+  --model "${MODEL_PATH}" \
+  --host 0.0.0.0 \
+  --server-port 8000 \
+  --default-chat-template-kwargs '{"enable_thinking":false}' \
+  --kv_cache_dtype fp8 \
+  --no-enable_prefix_caching \
+  --online_quant_config '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","*expert*"]}' \
+  -tp 4 \
+  >"${SERVER_LOG}" 2>&1 &
+server_pid=$!
+printf '%s\n' "${server_pid}" > "${SERVER_PID_FILE}"
+
+for attempt in $(seq 1 180); do
+  curl -sS --fail http://127.0.0.1:8000/v1/models >/dev/null 2>&1 && break
+  if ! kill -0 "${server_pid}" 2>/dev/null; then
+    tail -n 100 "${SERVER_LOG}"
+    exit 1
+  fi
+  sleep 10
+done
+
+if ! curl -sS --fail http://127.0.0.1:8000/v1/models | python3 -m json.tool; then
+  tail -n 100 "${SERVER_LOG}"
+  exit 1
+fi
+```
+
+### Step 3: Verify Tool-Call Translation
+
+Do not start a 300-instance run until a real GLM response contains
+`message.tool_calls` and `finish_reason="tool_calls"`:
+
+```bash
+curl -sS --fail http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  --data-binary @- <<JSON | python3 -m json.tool
+  {
+    "model": "${MODEL_PATH}",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Use the bash tool to run exactly: printf parser-ok"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "bash",
+          "description": "Execute a shell command",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "command": {"type": "string"}
+            },
+            "required": ["command"]
+          }
+        }
+      }
+    ],
+    "tool_choice": "required",
+    "temperature": 0,
+    "max_tokens": 256
+  }
+JSON
+```
+
+The expected function name is `bash`, and its JSON arguments should contain
+`{"command": "printf parser-ok"}`. If the response instead exposes raw
+`<tool_call>/<arg_key>/<arg_value>` XML as assistant content, the GLM parser is
+not active and mini-swe-agent will fail with `RepeatedFormatError`.
+
+### Step 4: Run SWE-bench Lite
+
+Use `EVAL_LIMIT=10` first for a smoke test. If it succeeds, rerun this block
+with `EVAL_LIMIT=full` for the official 300-instance result.
+
+```bash
+export SWEBENCH_VENV=/tmp/atomesh-swebench-venv-local
+export SWEBENCH_MAX_WORKERS=4
+export SWEBENCH_EVAL_TIMEOUT=900
+export SWEBENCH_SCORE_TIMEOUT=7200
+export SWEBENCH_KEEP_TRAJECTORIES=true
+
+# Smoke test: EVAL_LIMIT=10, AGENT_WORKERS=10
+# Full run:   EVAL_LIMIT=full, AGENT_WORKERS=16
+export EVAL_LIMIT=${EVAL_LIMIT:-10}
+export AGENT_WORKERS=${AGENT_WORKERS:-10}
+run_stamp="$(date +%Y%m%d_%H%M%S)"
+export OUTPUT_DIR="${OUTPUT_ROOT}/swebench_lite_${EVAL_LIMIT}_${run_stamp}"
+export RUN_ID="local-glm52-${EVAL_LIMIT}-${run_stamp//_/}"
+
+bash "${ATOM_ROOT}/.github/scripts/atomesh/run_swebench_lite.sh" \
+  --output-dir "${OUTPUT_DIR}" \
+  --model-name GLM-5.2-MXFP4 \
+  --api-model "${MODEL_PATH}" \
+  --api-base http://127.0.0.1:8000/v1 \
+  --run-id "${RUN_ID}" \
+  --limit "${EVAL_LIMIT}" \
+  --venv "${SWEBENCH_VENV}" \
+  --agent-workers "${AGENT_WORKERS}"
+```
+
+Before starting the full run in the same shell, explicitly reset:
+
+```bash
+export EVAL_LIMIT=full
+export AGENT_WORKERS=16
+```
+
+The runner installs pinned `mini-swe-agent==2.4.5` and `swebench==4.1.0`,
+generates patches, and then runs official Docker-based scoring.
+
+### Results and Cleanup
+
+Successful completion produces:
+
+- `agent_preds.json`: normalized copy of all generated predictions.
+- `predictions.jsonl`: input passed to the official harness.
+- `swebench_report_swebench_lite.json`: stable copy of the official report.
+- `results_swebench_lite.json`: dashboard-compatible accuracy result.
+- `generation/console.log`: mini-swe-agent generation log.
+- `swebench_score.log`: official harness log.
+
+The final resolved count and rate are available under:
+
+```text
+swebench.resolved
+swebench.total
+swebench.resolved_rate
+results.swebench_lite["exact_match,resolved"]
+```
+
+Both rate fields are fractions in `[0, 1]`; multiply by 100 for the percentage.
+For the full Lite set, the reported accuracy is `resolved / 300`.
+
+Stop the model server when testing is complete:
+
+```bash
+if [[ -s "${SERVER_PID_FILE}" ]]; then
+  server_pid="$(<"${SERVER_PID_FILE}")"
+  kill "${server_pid}" 2>/dev/null || true
+  wait "${server_pid}" 2>/dev/null || true
+  rm -f "${SERVER_PID_FILE}"
+fi
+```
+
+## Weka Validation Checklist
 
 - Prefill logs show a `multi` connector containing both the Mooncake producer
   and `lmcache_offload`.

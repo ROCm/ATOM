@@ -1812,7 +1812,11 @@ impl PDRouter {
             );
             error::internal_error(
                 "worker_prepare_request_failed",
-                format!("Failed to prepare worker request for {}: {:?}", worker.url(), e),
+                format!(
+                    "Failed to prepare worker request for {}: {:?}",
+                    worker.url(),
+                    e
+                ),
             )
         })?;
 
