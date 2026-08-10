@@ -3640,13 +3640,24 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
 
     def build_for_cudagraph_capture(
-        self, bs: int, max_q_len: int | None = None
+        self, bs: int, max_q_len: int | None = None, num_tokens_pad: int | None = None
     ) -> tuple[AttentionMetaData_DSV4, Context]:
         """Build attn_metadata for CUDAGraph capture using a synthetic decode batch.
 
         Synthesizes bs sequences each at start_pos=window_size (so SWA window
         is full + 1 CSA committed entry — exercises the production decode
         codepath: state-cache reads, sparse_attn gather, indexer fp8 logits).
+
+        ATOM_ATTN_CUDAGRAPH zero-copy-q: when `num_tokens_pad` is given and is
+        LESS than the rectangle `bs*max_q_len`, synthesize a RAGGED batch whose
+        `bs` seqs' lengths sum to exactly `num_tokens_pad` (base=nt//bs, first
+        rem seqs get base+1) — mirroring real ragged decode (prepare_decode's
+        ragged branch). This makes the attn-core graph's flat token dimension
+        equal `num_tokens_pad` (what the dense pieces actually write), so the
+        q public buffer's read/write row counts MATCH (no rectangle-pad tail).
+        `max_seqlen_q` stays = `max_q_len` (bakes swa `write_per_batch`); only
+        cu_seqlens/positions/token-count go ragged. Default (num_tokens_pad None
+        or == rectangle) keeps the byte-identical uniform rectangle path.
 
         Per-fwd metadata is populated through the SAME helpers prepare_decode
         uses (`_attach_v4_indexer_meta`, `_attach_v4_per_fwd_meta`,
@@ -3677,17 +3688,47 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # (decode_query_len in 1..mtp_k+1). Default = full mtp_k+1 (unchanged).
         if max_q_len is None:
             max_q_len = 1 + self.max_spec_steps
-        total_tokens = bs * max_q_len
+        rectangle_tokens = bs * max_q_len
+        # Ragged capture (zero-copy-q): each seq gets base=nt//bs tokens, the
+        # first rem=nt%bs seqs get base+1 (as-uniform-as-possible, remainder on
+        # the head). Falls back to the uniform rectangle when num_tokens_pad is
+        # None or == the rectangle (byte-identical to the classic path).
+        _ragged_cap = (
+            num_tokens_pad is not None and int(num_tokens_pad) < rectangle_tokens
+        )
+        if _ragged_cap:
+            nt = int(num_tokens_pad)
+            assert bs <= nt <= rectangle_tokens, (
+                f"ragged capture needs bs<=num_tokens_pad<=bs*max_q_len; "
+                f"got bs={bs} nt={nt} max_q_len={max_q_len}"
+            )
+            base = nt // bs
+            rem = nt % bs
+            extend_lens_np = np.full(bs, base, dtype=np.int32)
+            extend_lens_np[:rem] += 1  # each seq len in [1, max_q_len]
+            total_tokens = nt
+        else:
+            extend_lens_np = np.full(bs, max_q_len, dtype=np.int32)
+            total_tokens = rectangle_tokens
         win = self.window_size
 
-        # Synthetic state: each seq has already produced `win` tokens; this
-        # fwd is `max_q_len` decode/draft steps at positions
-        # [win, win+max_q_len). Hits is_pure_decode (start_pos > 0, uniform
-        # tok-per-seq), exercising Phase B/C/E paths during capture.
+        # Synthetic state: each seq has already produced `win` tokens; this fwd
+        # is `len_i` decode/draft steps per seq at positions [win, win+len_i).
+        # Hits is_pure_decode (start_pos > 0), exercising Phase B/C/E paths
+        # during capture. Positions are per-seq span-head anchored (like the
+        # ragged prepare_decode branch): token j of seq i -> win + j.
         start_pos = win
-        positions_np = (np.arange(total_tokens, dtype=np.int64) % max_q_len) + start_pos
-        cu_seqlens_q_np = np.arange(0, bs + 1, dtype=np.int32) * max_q_len
-        context_lens_np = np.full(bs, start_pos + max_q_len, dtype=np.int32)
+        # Ragged (zero-copy-q) or uniform: build positions/cu_seqlens/context_lens
+        # from extend_lens_np. When extend_lens is uniform (== max_q_len) this
+        # reduces to the classic rectangle, so one path covers both.
+        cu_seqlens_q_np = np.zeros(bs + 1, dtype=np.int32)
+        np.cumsum(extend_lens_np, out=cu_seqlens_q_np[1:])
+        _batch_ids = np.repeat(np.arange(bs, dtype=np.int32), extend_lens_np)
+        _j_in_seq = np.arange(total_tokens, dtype=np.int64) - cu_seqlens_q_np[
+            _batch_ids
+        ].astype(np.int64)
+        positions_np = _j_in_seq + start_pos
+        context_lens_np = (start_pos + extend_lens_np).astype(np.int32)
         # Slot mapping: pool groups [0..bs-1] crossed to the plane positions
         # every kernel addresses by, the same crossing `prepare_decode` makes.
         # Raw group ids here are not a harmless placeholder: capture runs a
@@ -3716,9 +3757,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # invalidating the graph.
         state_slot_in_gpu = self._stage("v4_meta_state_slot_in", state_slot_np)
 
-        # Synthetic decode batch: start_pos = win > 0 and uniform
-        # max_q_len tokens per seq, so is_pure_decode is True by
-        # construction (capture replays the decode codepath).
+        # Synthetic decode batch: start_pos = win > 0 and per-seq len_i tokens
+        # (ragged under zero-copy-q, else uniform max_q_len), so is_pure_decode
+        # is True by construction (capture replays the decode codepath).
         attn_metadata = AttentionMetaData_DSV4(
             cu_seqlens_q=cu_seqlens_q_gpu,
             cu_seqlens_k=None,
@@ -3738,8 +3779,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.state_slot_out_cpu = state_slot_np
 
         # DSpark TRUE-FLAT graph: capture must take the same ragged indexer branch
-        # and rect shape [bs, full_q] as replay, else the graph mismatches. Synthetic
-        # capture gives each seq max_q_len tokens; replay refreshes dst for real lens.
+        # and rect shape [bs, full_q] as replay, else the graph mismatches. The
+        # synthetic batch's per-seq lengths (`extend_lens_np`, ragged under
+        # zero-copy-q else uniform max_q_len) drive the indexer ragged topk — same
+        # construction (`torch.as_tensor`) as replay's prepare_decode branch.
         drafter = getattr(self.model_runner, "drafter", None)
         if (
             self.model_runner.config.dspark.ragged
@@ -3747,14 +3790,14 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             and drafter.uses_confidence_schedule
         ):
             full_q_real = drafter.mtp_k + 1
-            attn_metadata.dspark_ragged_lens_gpu = torch.full(
-                (bs,), max_q_len, dtype=torch.int32, device=positions.device
+            attn_metadata.dspark_ragged_lens_gpu = torch.as_tensor(
+                extend_lens_np, device=positions.device
             )
             attn_metadata.dspark_full_q = int(full_q_real)
 
         # Build compress_plans + per-fwd meta + indexer meta via the same
-        # helpers used at runtime — guarantees addresses match.
-        extend_lens_np = np.full(bs, max_q_len, dtype=np.int32)
+        # helpers used at runtime — guarantees addresses match. `extend_lens_np`
+        # is the synthetic batch's per-seq lengths (computed above).
         attn_metadata.compress_plans = self._build_compress_plans(
             extend_lens_np,
             context_lens_np,
@@ -3766,7 +3809,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # builder can reuse the shared per-fwd GPU tensors.
         self._attach_v4_per_fwd_meta(
             attn_metadata,
-            extend_lens_np,  # = np.full(bs, max_q_len) — synthetic uniform decode batch
+            extend_lens_np,  # synthetic per-seq lengths (ragged or uniform max_q_len)
             attn_metadata.state_slot_out_cpu,
             bs,
             total_tokens,

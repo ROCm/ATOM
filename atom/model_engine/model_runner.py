@@ -3615,6 +3615,69 @@ class ModelRunner:
             return True
         return False
 
+    def _capture_attn_core_ragged_combos(
+        self, bs, max_q_len, rectangle_tokens, build_capture, input_ids
+    ):
+        """ATOM_ATTN_CUDAGRAPH zero-copy-q: capture the attn-core cudagraph for the
+        RAGGED (effective_bs=bs, num_tokens_pad) combos a real ragged decode step at
+        this bs may replay.
+
+        A ragged step with real_bs<=bs forwards nt_pad = b*max_q_len where b is a
+        captured graph_bs <= bs — a flat bucket SMALLER than this bs's rectangle
+        (bs*max_q_len). The attn-core graph key is (layer, effective_bs, q_eff,
+        num_tokens_pad); effective_bs is always this bs (the ceil-to-graph_bs bucket
+        real_bs lands in), while num_tokens_pad ranges over the smaller flat buckets.
+        The dense pieces for each nt_pad already self-captured on their own bs=b main-
+        loop iteration; here they REPLAY (deduped by batch_descriptor=num_tokens),
+        while the attn-core custom op captures its fresh (bs, q_eff, nt_pad) key.
+
+        Only the smaller buckets are new work — the rectangle nt==rectangle_tokens was
+        captured by the caller. Runs one PIECEWISE forward per new nt_pad, feeding a
+        ragged synthetic batch (bs seqs summing to nt_pad) via build_for_cudagraph_
+        capture(num_tokens_pad=...). Gated: only invoked when ATOM_ATTN_CUDAGRAPH=1.
+        """
+        positions = self.forward_vars["positions"].gpu
+        for b in self.graph_bs:
+            nt_pad = b * max_q_len
+            if nt_pad >= rectangle_tokens or nt_pad < bs:
+                # >= rectangle: the rectangle case (already captured) or larger.
+                # < bs: fewer than 1 token/seq — unreachable at real decode.
+                continue
+            if self._piecewise_skip_capture(nt_pad):
+                continue
+            # Ragged synthetic metadata: bs seqs whose lengths sum to nt_pad.
+            attn_metadata, context = build_capture(
+                bs=bs, max_q_len=max_q_len, num_tokens_pad=nt_pad
+            )
+            num_pad, num_tokens_across_dp = self.get_dp_padding(nt_pad)
+            nt_dp = nt_pad + num_pad
+            if num_tokens_across_dp is not None:
+                num_tokens_across_dp = torch.full_like(num_tokens_across_dp, nt_dp)
+            model_positions = (
+                self._mrope_positions_view(nt_dp)
+                if self.use_mrope
+                else positions[:nt_dp]
+            )
+            set_forward_context(
+                attn_metadata=attn_metadata,
+                atom_config=self.config,
+                context=context,
+                num_tokens=nt_dp,
+                num_tokens_across_dp=num_tokens_across_dp,
+                ubatch_slices=None,
+                in_hipgraph=True,
+            )
+            # Warmup, then the PIECEWISE forward: dense pieces replay (deduped by
+            # num_tokens); attn-core op captures its (bs, q_eff, nt_pad) graph.
+            self.model(input_ids[:nt_dp], model_positions)
+            fc = get_forward_context()
+            fc.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
+            fc.batch_descriptor = BatchDescriptor(num_tokens=nt_dp)
+            self.model(input_ids[:nt_dp], model_positions)
+            fc.cudagraph_runtime_mode = CUDAGraphMode.NONE
+            fc.batch_descriptor = None
+            self._piecewise_captured_tokens.add(nt_dp)
+
     def capture_cudagraph(self):
         _piecewise = self._piecewise_cg_active()
         if _piecewise:
@@ -3734,9 +3797,10 @@ class ModelRunner:
 
         # Whether this backend's capture builder supports a dynamic (per-bucket)
         build_capture = self.attn_metadata_builder.build_for_cudagraph_capture
-        supports_dynamic_q_len = (
-            "max_q_len" in inspect.signature(build_capture).parameters
-        )
+        _build_params = inspect.signature(build_capture).parameters
+        supports_dynamic_q_len = "max_q_len" in _build_params
+        # Whether it supports a ragged num_tokens_pad (zero-copy-q attn-core graphs).
+        supports_ragged_capture = "num_tokens_pad" in _build_params
 
         with pause_gc(), graph_capture() as capture_ctx, self.capture_profiler as prof:
             for max_q_len in q_buckets:
@@ -3827,6 +3891,27 @@ class ModelRunner:
                         fc.cudagraph_runtime_mode = CUDAGraphMode.NONE
                         fc.batch_descriptor = None
                         self._piecewise_captured_tokens.add(num_tokens)
+                        # ATOM_ATTN_CUDAGRAPH zero-copy-q: also capture the attn-core
+                        # graph for the RAGGED (effective_bs=bs, num_tokens_pad) combos
+                        # this bs replays at. A real ragged step with real_bs<=bs
+                        # forwards a SMALLER flat bucket nt_pad = b*max_q_len
+                        # (b in graph_bs, b<bs). The dense pieces at that num_tokens
+                        # already self-captured on their own bs=b iteration (they
+                        # REPLAY here, deduped by batch_descriptor=num_tokens); the
+                        # attn-core custom op captures its fresh (bs, q_eff, nt_pad)
+                        # key. Only the smaller buckets are new — the rectangle
+                        # nt==bs*max_q_len was just captured above.
+                        if (
+                            os.environ.get("ATOM_ATTN_CUDAGRAPH") == "1"
+                            and supports_ragged_capture
+                        ):
+                            self._capture_attn_core_ragged_combos(
+                                bs=bs,
+                                max_q_len=max_q_len,
+                                rectangle_tokens=num_tokens,
+                                build_capture=build_capture,
+                                input_ids=input_ids,
+                            )
                         if prof is not None:
                             # Drain before closing the window so this bs's
                             # kernels land in this bs's file. Profiling-only —
