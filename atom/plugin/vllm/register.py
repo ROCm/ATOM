@@ -301,6 +301,15 @@ def register_model() -> None:
     # isolation, so extend that allow-list before MTP/Eagle proposal runs.
     apply_vllm_spec_decode_patch()
 
+    # vLLM 0.26 profiles CUDA graph memory on ROCm by temporarily capturing
+    # and destroying every graph. Skip that pass before it can leave stale
+    # AITER graph-owned state.
+    from atom.plugin.vllm.cudagraph_memory_profiler_patch import (
+        apply_vllm_cudagraph_memory_profiler_patch,
+    )
+
+    apply_vllm_cudagraph_memory_profiler_patch()
+
     # Patch vLLM graph_capture to also enter aiter's ca_comm.capture(),
     # avoiding hipMemcpyAsync in fused_allreduce_rmsnorm when model uses aiter collectives
     from atom.plugin.vllm.graph_capture_patch import apply_graph_capture_patch
