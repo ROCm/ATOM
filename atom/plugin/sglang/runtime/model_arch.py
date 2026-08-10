@@ -353,6 +353,81 @@ def _bind_eagle3_llama_cache_views(model: Any, runtime: Any) -> None:
         raise RuntimeError("EAGLE3 SGLang draft KV pool is not initialized")
 
 
+def _prepare_k3_dspark_draft_model_config(atom_config: Any, draft_config: Any) -> None:
+    """Switch the ATOM config to the Kimi-K3 DSpark draft checkpoint.
+
+    SGLang builds the plugin ``atom_config`` from the target ServerArgs but
+    passes the draft-local HF config here. Normalize the standalone DSpark draft
+    fields onto ATOM's canonical ``dspark_*`` names, remember the target layer
+    count (the draft attention numbers itself after the target stack), and point
+    weight loading + quant at the draft checkpoint.
+    """
+    from atom.config import QuantizationConfig, _normalize_draft_dspark_config
+
+    _normalize_draft_dspark_config(draft_config)
+
+    # The Kimi-K3 DSpark checkpoint ships an untrained (training-only) confidence
+    # head that is deliberately not loaded; run a fixed verify length. Clear the
+    # config flag so sglang's DSpark worker does not expect confidence weights or
+    # enable confidence-scheduled ragged verify.
+    if getattr(draft_config, "enable_confidence_head", False):
+        draft_config.enable_confidence_head = False
+
+    target_config = getattr(atom_config.hf_config, "text_config", atom_config.hf_config)
+    atom_config.sgl_atom_k3_dspark_layer_offset = int(
+        getattr(target_config, "num_hidden_layers", 0) or 0
+    )
+
+    atom_config.hf_config = draft_config
+    model_path = getattr(draft_config, "_name_or_path", None) or getattr(
+        draft_config, "name_or_path", None
+    )
+    if not model_path:
+        # The draft HF config may not carry a usable _name_or_path; fall back to
+        # the authoritative draft path from server args so the ATOM loader reads
+        # the DRAFT checkpoint (not the target, whose MoE shared-expert names
+        # would trip the weight rewriter).
+        try:
+            from sglang.srt.server_args import get_global_server_args
+
+            model_path = getattr(
+                get_global_server_args(), "speculative_draft_model_path", None
+            )
+        except Exception:  # noqa: BLE001 - server args optional in unit tests
+            model_path = None
+    if not model_path:
+        raise ValueError(
+            "Kimi-K3 DSpark: could not resolve the draft checkpoint path "
+            "(draft_config._name_or_path and speculative_draft_model_path are "
+            "both empty)."
+        )
+    atom_config.model = model_path
+    # The Kimi-K3 DSpark checkpoint is single-file BF16 with no quantization
+    # metadata; QuantizationConfig resolves to the unquantized path but must stay
+    # a real object (exclude_layers=[]) so MoE/shared-expert probes that read
+    # quant_config.exclude_layers do not hit None.
+    atom_config.quant_config = QuantizationConfig(
+        draft_config,
+        online_quant_config=getattr(atom_config, "online_quant_config", None),
+    )
+
+
+def _kimi_k3_dspark_construction_context():
+    from atom.plugin.sglang.kimi_k3_dspark_bridge import (
+        kimi_k3_dspark_native_attention_construction,
+    )
+
+    return kimi_k3_dspark_native_attention_construction()
+
+
+def _bind_kimi_k3_dspark_cache_views(model: Any, runtime: Any) -> None:
+    from atom.plugin.sglang.kimi_k3_dspark_bridge import (
+        bind_kimi_k3_dspark_cache_views,
+    )
+
+    bind_kimi_k3_dspark_cache_views(model, runtime)
+
+
 MODEL_ADAPTER_SPECS = {
     "DeepseekV3ForCausalLM": SGLangModelAdapterSpec(
         install_adapters=_install_deepseek_mla_adapters,
@@ -419,6 +494,16 @@ MODEL_ADAPTER_SPECS = {
         prepare_draft_model_config=_prepare_eagle3_llama_draft_model_config,
         construction_context=_eagle3_llama_construction_context,
         bind_cache_views=_bind_eagle3_llama_cache_views,
+    ),
+    # Kimi-K3 DSpark standalone block drafter. Uses a custom EntryClass wrapper
+    # (models/kimi_k3_dspark_draft.py), so it is intentionally absent from
+    # MODEL_ARCH_SPECS below.
+    "K3DSparkModel": SGLangModelAdapterSpec(
+        uses_context_only_forward=True,
+        load_weights_prefix="",
+        prepare_draft_model_config=_prepare_k3_dspark_draft_model_config,
+        construction_context=_kimi_k3_dspark_construction_context,
+        bind_cache_views=_bind_kimi_k3_dspark_cache_views,
     ),
 }
 

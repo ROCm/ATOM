@@ -617,18 +617,28 @@ def _set_atom_forward_context(
         )
 
         if is_kimi_k3_config(atom_config.hf_config):
-            attn_metadata = getattr(forward_batch, "atom_kimi_k3_graph_metadata", None)
-            if attn_metadata is None:
-                backend = _get_sglang_attention_backend()
-                attn_metadata = getattr(backend, "atom_kimi_k3_graph_metadata", None)
-            if attn_metadata is None and _is_current_stream_capturing():
-                from atom.plugin.sglang.attention_backend.kimi_k3_backend import (
-                    ATOMKimiK3BackendForSgl,
+            # Only decode uses the K3 backend's pre-built graph metadata cache.
+            # TARGET_VERIFY builds fresh, graph-safe MLA metadata (it reuses the
+            # full-attention backend's already graph-stable verify buffers), so
+            # must NOT pick up the stale decode metadata from these caches during
+            # capture -- doing so would replay decode geometry for a verify batch.
+            if forward_mode.is_decode_or_idle():
+                attn_metadata = getattr(
+                    forward_batch, "atom_kimi_k3_graph_metadata", None
                 )
+                if attn_metadata is None:
+                    backend = _get_sglang_attention_backend()
+                    attn_metadata = getattr(
+                        backend, "atom_kimi_k3_graph_metadata", None
+                    )
+                if attn_metadata is None and _is_current_stream_capturing():
+                    from atom.plugin.sglang.attention_backend.kimi_k3_backend import (
+                        ATOMKimiK3BackendForSgl,
+                    )
 
-                attn_metadata = (
-                    ATOMKimiK3BackendForSgl._last_atom_kimi_k3_graph_metadata
-                )
+                    attn_metadata = (
+                        ATOMKimiK3BackendForSgl._last_atom_kimi_k3_graph_metadata
+                    )
             token_to_kv_pool, req_to_token_pool = maybe_get_kimi_k3_pools(forward_batch)
             if token_to_kv_pool is None or req_to_token_pool is None:
                 raise RuntimeError("Kimi-K3 SGLang pools are unavailable")

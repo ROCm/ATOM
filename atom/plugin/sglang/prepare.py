@@ -50,10 +50,15 @@ def prepare_model(config: Any):
         install_minimax_m3_pool_patch()
     elif model_arch == "KimiK3ForConditionalGeneration":
         from atom.plugin.sglang.kimi_k3_bridge import install_kimi_k3_pool_patch
+        from atom.plugin.sglang.kimi_k3_spec_verify import (
+            install_k3_verify_commit_hook,
+        )
 
         # Model construction precedes ModelRunner.init_memory_pool(), so install
         # the K3-only pool hooks here after the architecture is known.
         install_kimi_k3_pool_patch()
+        # DSpark speculative decoding: own the KDA post-verify mamba commit.
+        install_k3_verify_commit_hook()
 
     # Import here to avoid partial initialization while SGLang discovers models.
     from atom.plugin.register import (

@@ -139,6 +139,20 @@ class ATOMKimiK3BackendForSgl(ATOMAttnBackendForSgl):
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int, *args, **kwargs):
         result = super().init_cuda_graph_state(max_bs, max_num_tokens, *args, **kwargs)
         self._init_kimi_graph_buffers(int(max_bs))
+        # Pre-allocate the KDA (GDN) verify conv scratch in normal memory, before
+        # any graph capture, so its buffer is never reused for other graphs'
+        # activations (which corrupts the max-bs verify batch otherwise).
+        try:
+            from atom.plugin.sglang.kimi_k3_spec_verify import (
+                preallocate_k3_verify_scratch,
+            )
+
+            _, req_pool = self._kimi_pools()
+            num_draft = int(getattr(self, "num_draft_tokens", 0) or 0)
+            if req_pool is not None and getattr(req_pool, "mamba_map", None):
+                preallocate_k3_verify_scratch(req_pool, int(max_bs), num_draft)
+        except Exception:  # noqa: BLE001,S110
+            pass
         return result
 
     def init_forward_metadata_out_graph(self, forward_batch, in_capture: bool = False):
