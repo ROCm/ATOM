@@ -857,6 +857,8 @@ async def setup_streaming_request(
     seq = None
     try:
         seq = await executor_loop.run_in_executor(None, do_preprocess)
+        if data_parallel_rank is not None:
+            seq.data_parallel_rank = data_parallel_rank
         _validate_sequence_context_length(seq)
     except Exception:
         _stream_queues.pop(request_id, None)
@@ -1063,6 +1065,9 @@ async def setup_streaming_request_fanout(
     seqs = []
     try:
         seqs = await executor_loop.run_in_executor(None, do_preprocess)
+        if data_parallel_rank is not None:
+            for seq in seqs:
+                seq.data_parallel_rank = data_parallel_rank
         _validate_sequence_context_length(seqs[0])
     except Exception:
         _stream_queues.pop(request_id, None)
