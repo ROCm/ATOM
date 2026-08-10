@@ -1441,29 +1441,24 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         model_temperature = getattr(generation_config, "temperature", None)
         model_top_p = getattr(generation_config, "top_p", None)
         model_top_k = getattr(generation_config, "top_k", None)
+        if model_temperature is None:
+            model_temperature = DEFAULT_TEMPERATURE
+        if model_top_p is None:
+            model_top_p = DEFAULT_TOP_P
+        if model_top_k is None:
+            model_top_k = DEFAULT_TOP_K
+
         sampling_params = _build_sampling_params(
             temperature=(
                 request.temperature
                 if request.temperature is not None
-                else (
-                    model_temperature
-                    if model_temperature is not None
-                    else DEFAULT_TEMPERATURE
-                )
+                else model_temperature
             ),
             max_tokens=request.max_tokens,
             stop_strings=request.stop_sequences,
             ignore_eos=False,
-            top_k=(
-                request.top_k
-                if request.top_k is not None
-                else model_top_k if model_top_k is not None else DEFAULT_TOP_K
-            ),
-            top_p=(
-                request.top_p
-                if request.top_p is not None
-                else model_top_p if model_top_p is not None else DEFAULT_TOP_P
-            ),
+            top_k=(request.top_k if request.top_k is not None else model_top_k),
+            top_p=(request.top_p if request.top_p is not None else model_top_p),
         )
 
         request_id = uuid.uuid4().hex[:24]
