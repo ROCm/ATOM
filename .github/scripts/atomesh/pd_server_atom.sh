@@ -738,6 +738,25 @@ ensure_aiperf() {
   "${AIPERF_VENV}/bin/aiperf" --version
 }
 
+dump_aiperf_info() {
+  local version commit python_version
+  version="$("${AIPERF_VENV}/bin/aiperf" --version 2>&1)"
+  commit="$(git -C "${AIPERF_DIR}" rev-parse HEAD 2>/dev/null || echo unknown)"
+  python_version="$("${AIPERF_VENV}/bin/python" --version 2>&1)"
+
+  echo ""
+  echo "========================================"
+  echo "  AIPERF runtime info"
+  echo "========================================"
+  echo "version=${version}"
+  echo "commit=${commit}"
+  echo "python=${python_version}"
+  echo "source_dir=${AIPERF_DIR}"
+  echo "venv=${AIPERF_VENV}"
+  echo "========================================"
+  echo ""
+}
+
 write_aiperf_dashboard_json() {
   local aiperf_json="$1"
   local out_json="$2"
@@ -818,6 +837,7 @@ PY
 
 run_aiperf_agentic_benchmark() {
   ensure_aiperf
+  dump_aiperf_info
 
   if is_agentic_dpa; then
     export AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID=true
@@ -850,42 +870,47 @@ run_aiperf_agentic_benchmark() {
       unsafe_args+=(--unsafe-override)
     fi
 
-    echo "[aiperf] ${result_file}"
     mkdir -p "${out_dir}"
-    AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT="${AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT}" \
-    AIPERF_HTTP_TCP_USER_TIMEOUT="${AIPERF_HTTP_TCP_USER_TIMEOUT}" \
-    AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES="${AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES}" \
-    AIPERF_DATASET_CONFIGURATION_TIMEOUT="${AIPERF_DATASET_CONFIGURATION_TIMEOUT}" \
-    AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT="${AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT}" \
-    AIPERF_UI_REALTIME_METRICS_ENABLED=true \
-      "${AIPERF_VENV}/bin/aiperf" profile \
-      "${unsafe_args[@]}" \
-      --scenario "${AIPERF_SCENARIO}" \
-      --url "http://127.0.0.1:${ROUTER_PORT}" \
-      --endpoint /v1/chat/completions \
-      --endpoint-type chat \
-      --streaming \
-      --model "${MODEL_PATH}" \
-      --concurrency "${conc}" \
-      --benchmark-duration "${AIPERF_BENCHMARK_DURATION}" \
-      --stats-interval 30 \
-      --random-seed 42 \
-      --failed-request-threshold "${AIPERF_FAILED_REQUEST_THRESHOLD}" \
-      --trajectory-start-min-ratio "${AIPERF_TRAJECTORY_START_MIN_RATIO}" \
-      --trajectory-start-max-ratio "${AIPERF_TRAJECTORY_START_MAX_RATIO}" \
-      --warmup-requests-per-lane "${AIPERF_WARMUP_REQUESTS_PER_LANE}" \
-      --trace-idle-gap-cap-seconds "${AIPERF_TRACE_IDLE_GAP_CAP_SECONDS}" \
-      --warmup-grace-period "${AIPERF_WARMUP_GRACE_PERIOD}" \
-      --use-server-token-count \
-      --no-gpu-telemetry \
-      --tokenizer "${MODEL_PATH}" \
-      --tokenizer-trust-remote-code \
-      --max-context-length "${AIPERF_MAX_CONTEXT_LENGTH}" \
-      --num-dataset-entries "${AIPERF_NUM_DATASET_ENTRIES}" \
-      --slice-duration "${AIPERF_SLICE_DURATION}" \
-      "${server_metrics_args[@]}" \
-      --output-artifact-dir "${out_dir}" \
-      --public-dataset "${AIPERF_PUBLIC_DATASET}" \
+    local -a aiperf_env=(
+      "AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT=${AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT}"
+      "AIPERF_HTTP_TCP_USER_TIMEOUT=${AIPERF_HTTP_TCP_USER_TIMEOUT}"
+      "AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES=${AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES}"
+      "AIPERF_DATASET_CONFIGURATION_TIMEOUT=${AIPERF_DATASET_CONFIGURATION_TIMEOUT}"
+      "AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT=${AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT}"
+      "AIPERF_UI_REALTIME_METRICS_ENABLED=true"
+    )
+    local -a aiperf_cmd=(
+      "${AIPERF_VENV}/bin/aiperf" profile
+      "${unsafe_args[@]}"
+      --scenario "${AIPERF_SCENARIO}"
+      --url "http://127.0.0.1:${ROUTER_PORT}"
+      --endpoint /v1/chat/completions
+      --endpoint-type chat
+      --streaming
+      --model "${MODEL_PATH}"
+      --concurrency "${conc}"
+      --benchmark-duration "${AIPERF_BENCHMARK_DURATION}"
+      --stats-interval 30
+      --random-seed 42
+      --failed-request-threshold "${AIPERF_FAILED_REQUEST_THRESHOLD}"
+      --trajectory-start-min-ratio "${AIPERF_TRAJECTORY_START_MIN_RATIO}"
+      --trajectory-start-max-ratio "${AIPERF_TRAJECTORY_START_MAX_RATIO}"
+      --warmup-requests-per-lane "${AIPERF_WARMUP_REQUESTS_PER_LANE}"
+      --trace-idle-gap-cap-seconds "${AIPERF_TRACE_IDLE_GAP_CAP_SECONDS}"
+      --warmup-grace-period "${AIPERF_WARMUP_GRACE_PERIOD}"
+      --use-server-token-count
+      --no-gpu-telemetry
+      --tokenizer "${MODEL_PATH}"
+      --tokenizer-trust-remote-code
+      --max-context-length "${AIPERF_MAX_CONTEXT_LENGTH}"
+      --num-dataset-entries "${AIPERF_NUM_DATASET_ENTRIES}"
+      --slice-duration "${AIPERF_SLICE_DURATION}"
+      "${server_metrics_args[@]}"
+      --output-artifact-dir "${out_dir}"
+      --public-dataset "${AIPERF_PUBLIC_DATASET}"
+    )
+    dump_launch_info "AIPERF c${conc}" env "${aiperf_env[@]}" "${aiperf_cmd[@]}"
+    env "${aiperf_env[@]}" "${aiperf_cmd[@]}" \
       2>&1 | tee "${out_dir}/aiperf.log"
 
     if [[ ! -f "${aiperf_json}" ]]; then
