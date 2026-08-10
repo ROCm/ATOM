@@ -106,11 +106,9 @@ def _wait_for_disk_hit(
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         files = list(disk_path.rglob("*.pt"))
-        if (
-            len(files) == 2
-            and engine.lookup(tokens, search_range=["LocalDiskBackend"])
-            == len(tokens)
-        ):
+        if len(files) == 2 and engine.lookup(
+            tokens, search_range=["LocalDiskBackend"]
+        ) == len(tokens):
             return files
         time.sleep(0.01)
     return list(disk_path.rglob("*.pt"))
@@ -200,8 +198,8 @@ def test_gpu_kv_round_trip_through_cpu_staging_and_nvme(tmp_path: Path):
         assert bool(ret_mask.all())
         for layer_name, cache in kv_caches.items():
             for field, expected_tensor in expected[layer_name].items():
-                assert torch.equal(getattr(cache, field), expected_tensor), (
-                    f"GPU KV mismatch after NVMe round trip: {layer_name}.{field}"
-                )
+                assert torch.equal(
+                    getattr(cache, field), expected_tensor
+                ), f"GPU KV mismatch after NVMe round trip: {layer_name}.{field}"
     finally:
         LMCacheEngineBuilder.destroy(instance_id)

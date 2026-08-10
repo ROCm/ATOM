@@ -61,11 +61,9 @@ def _wait_for_disk_chunks(
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         files = list(disk_path.rglob("*.pt"))
-        if (
-            len(files) == 2
-            and engine.lookup(tokens, search_range=["LocalDiskBackend"])
-            == len(tokens)
-        ):
+        if len(files) == 2 and engine.lookup(
+            tokens, search_range=["LocalDiskBackend"]
+        ) == len(tokens):
             return files
         time.sleep(0.01)
     return list(disk_path.rglob("*.pt"))

@@ -43,10 +43,7 @@ def build_lmcache_config(
     apply_extra_overrides(cfg, kv_transfer_config)
     # cufile GDS has no NVMe-GDS hardware here and hangs on init; force off.
     if getattr(cfg, "use_gds", False):
-        try:
-            cfg.use_gds = False
-        except Exception:
-            pass
+        cfg.use_gds = False
     # TP>1 fix: only rank 0 serves/answers the ZMQ lookup. Without this the
     # client queries all ranks and takes min() over results; we observed rank!=0
     # engine.lookup returning 0 even though that rank stored the chunk
@@ -54,10 +51,7 @@ def build_lmcache_config(
     # always recomputes. Our connector saves on ALL ranks in lockstep, so rank 0
     # is authoritative for "is it offloaded?"; each rank still loads its own KV
     # shard, and _do_load is all-or-nothing (re-prefills if a shard is missing).
-    try:
-        cfg.lookup_server_worker_ids = [0]
-    except Exception:
-        pass
+    cfg.lookup_server_worker_ids = [0]
     validate_lmcache_storage_config(cfg)
     return cfg
 
@@ -71,10 +65,7 @@ def apply_extra_overrides(cfg, kv_transfer_config: dict[str, Any] | None) -> Non
         if isinstance(key, str) and key.startswith("lmcache."):
             field = key[len("lmcache.") :]
             if hasattr(cfg, field):
-                try:
-                    setattr(cfg, field, value)
-                except Exception:
-                    pass
+                setattr(cfg, field, value)
 
 
 def validate_lmcache_storage_config(cfg: Any) -> None:
