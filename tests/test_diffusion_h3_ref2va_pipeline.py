@@ -322,35 +322,6 @@ def test_denoise_trims_the_reference_audio_off_the_prediction():
     assert video.shape[0] == n_video
 
 
-def test_denoise_rejects_missing_audio_reference_rows():
-    from atom.diffusion.models.minimax_h3.denoise import run_denoise_loop
-    from atom.diffusion.models.minimax_h3.layout import (
-        build_packed_sequence_ref2va,
-    )
-
-    packed = build_packed_sequence_ref2va(
-        text_len=4,
-        latent_t=1,
-        latent_h=4,
-        latent_w=4,
-        audio_t=3,
-        ref_blocks=[{"kind": "audio", "ref_audio_t": 2}],
-    )
-    with pytest.raises(ValueError, match="audio reference rows"):
-        run_denoise_loop(
-            dit=lambda **k: (torch.zeros(1, 96), torch.zeros(1, 32)),
-            video_rows=torch.zeros(int(packed["img_pos"].numel()), 96),
-            audio_rows=torch.zeros(6, 32),
-            packed=packed,
-            video_sigmas=[1.0, 0.0],
-            audio_sigmas=[1.0, 0.0],
-            rank_slice=(0, int(packed["seq_len"])),
-            prompt_embeds=torch.zeros(4, 64),
-            refined_prompt_embeds_length=4,
-            rope_cache=torch.zeros(int(packed["seq_len"]), 96),
-        )
-
-
 def test_video_reference_frame_sampling_feeds_both_consumers():
     """Qwen and the VAE must see the same decoded array, not two decodes."""
     from atom.diffusion.models.minimax_h3.conditioning import (

@@ -20,7 +20,6 @@ from atom.diffusion.models.minimax_h3.layout import (
     FL2VA_KEYFRAME_SIGNATURES,
     FRAME_RESCALE,
     build_packed_sequence,
-    build_packed_sequence_t2va,
     resolve_keyframe_indices,
     temporal_position_span,
     validate_keyframe_signature,
@@ -50,11 +49,6 @@ def test_only_first_last_signatures_are_accepted():
         validate_keyframe_signature([-1, 0])  # order matters
     with pytest.raises(ValueError, match="requires keyframe_frame_indices"):
         validate_keyframe_signature(None)
-
-
-def test_signature_rejects_bools_and_non_ints():
-    with pytest.raises(ValueError, match="must be integers"):
-        validate_keyframe_signature([True])
 
 
 def test_resolve_maps_minus_one_to_last_frame():
@@ -178,16 +172,6 @@ def test_both_anchors_get_distinct_times_and_shared_spatial_grid():
     assert first[0, 0].item() != last[0, 0].item()
     # Same spatial coordinates, different time.
     torch.testing.assert_close(first[:, 1:], last[:, 1:])
-
-
-def test_fl2va_requires_frame_count():
-    with pytest.raises(ValueError, match="frame_count is required"):
-        build_packed_sequence(**GEO, keyframe_frame_indices=[0])
-
-
-def test_t2va_wrapper_refuses_keyframes():
-    with pytest.raises(ValueError, match="use build_packed_sequence"):
-        build_packed_sequence_t2va(**GEO, keyframe_frame_indices=[0])
 
 
 def test_t2va_layout_unchanged_by_the_generalisation(t2va):

@@ -23,25 +23,22 @@ from atom.diffusion.models.minimax_h3.dit import MiniMaxH3DiTModel
 from tests.test_diffusion_minimax_h3 import tiny_arch
 
 
-def test_default_backend_is_asm(monkeypatch):
-    monkeypatch.delenv(ATTENTION_BACKEND_ENV, raising=False)
-    assert resolve_attention_backend() is AttentionBackend.ASM
-
-
-def test_env_selects_backend(monkeypatch):
-    monkeypatch.setenv(ATTENTION_BACKEND_ENV, "triton")
-    assert resolve_attention_backend() is AttentionBackend.TRITON
-
-
-def test_explicit_choice_beats_env(monkeypatch):
-    monkeypatch.setenv(ATTENTION_BACKEND_ENV, "triton")
-    assert resolve_attention_backend("sdpa") is AttentionBackend.SDPA
-
-
-def test_string_and_enum_are_equivalent():
-    assert resolve_attention_backend("ASM ") is resolve_attention_backend(
-        AttentionBackend.ASM
-    )
+@pytest.mark.parametrize(
+    ("env", "explicit", "expected"),
+    [
+        (None, None, AttentionBackend.ASM),  # default
+        ("triton", None, AttentionBackend.TRITON),  # env selects
+        ("triton", "sdpa", AttentionBackend.SDPA),  # explicit beats env
+        (None, "ASM ", AttentionBackend.ASM),  # string == enum, trimmed
+        (None, AttentionBackend.ASM, AttentionBackend.ASM),
+    ],
+)
+def test_backend_resolution(monkeypatch, env, explicit, expected):
+    if env is None:
+        monkeypatch.delenv(ATTENTION_BACKEND_ENV, raising=False)
+    else:
+        monkeypatch.setenv(ATTENTION_BACKEND_ENV, env)
+    assert resolve_attention_backend(explicit) is expected
 
 
 def test_unknown_backend_names_the_valid_ones():

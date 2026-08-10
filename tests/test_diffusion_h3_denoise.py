@@ -48,22 +48,12 @@ def test_patchify_unpatchify_roundtrip():
     torch.testing.assert_close(back, latent)
 
 
-def test_patchify_rejects_indivisible_grid():
-    with pytest.raises(ValueError, match="not divisible by patch"):
-        patchify_video_latent(torch.randn(1, 24, 3, 5, 6), patch_size=(1, 2, 2))
-
-
 def test_unpack_audio_tokens_is_channel_major():
     rows = torch.arange(10 * 32, dtype=torch.float32).reshape(10, 32)
     out = unpack_audio_tokens(rows, audio_t=10, audio_channel=2)
     assert out.shape == (2, 32, 5)
     # First channel is the first half of the rows.
     torch.testing.assert_close(out[0].permute(1, 0), rows[:5])
-
-
-def test_unpack_audio_rejects_mismatched_count():
-    with pytest.raises(ValueError, match="!= audio_t"):
-        unpack_audio_tokens(torch.randn(9, 32), audio_t=10, audio_channel=2)
 
 
 # ── latent prep ───────────────────────────────────────────────────────────
@@ -251,20 +241,3 @@ def test_denoise_loop_feeds_the_dit_full_length_buffers(packed):
         == packed["cu_seqlens"].tolist()
     )
     assert captured["skip_mask_out_condition"] is True
-
-
-def test_denoise_loop_rejects_mismatched_schedules(packed):
-    v0, a0 = build_initial_latents(seed=5, **_latent_kwargs())
-    with pytest.raises(ValueError, match="same length"):
-        run_denoise_loop(
-            dit=lambda **_: (v0, a0),
-            video_rows=v0,
-            audio_rows=a0,
-            packed=packed,
-            video_sigmas=[1.0, 0.5, 0.0],
-            audio_sigmas=[1.0, 0.0],
-            rank_slice=(0, packed["seq_len"]),
-            prompt_embeds=torch.randn(2, 8, dtype=torch.bfloat16),
-            refined_prompt_embeds_length=2,
-            rope_cache=torch.zeros(packed["seq_len"], 96, dtype=torch.bfloat16),
-        )

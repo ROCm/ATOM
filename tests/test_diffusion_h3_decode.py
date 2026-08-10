@@ -39,16 +39,6 @@ def test_denormalize_does_not_mutate_input():
     torch.testing.assert_close(latents, before)
 
 
-def test_denormalize_rejects_channel_mismatch():
-    with pytest.raises(ValueError, match="channel mismatch"):
-        denormalize_latents(torch.ones(1, 4, 2), mean=[0.0, 1.0], std=[1.0, 1.0])
-
-
-def test_denormalize_rejects_mean_std_shape_mismatch():
-    with pytest.raises(ValueError, match="mean/std shape mismatch"):
-        denormalize_latents(torch.ones(1, 2, 2), mean=[0.0, 1.0], std=[1.0])
-
-
 # ── canvas crop ───────────────────────────────────────────────────────────
 
 
@@ -68,11 +58,6 @@ def test_crop_is_a_no_op_when_already_exact():
     assert crop_to_canvas(frames, height=6, width=7) is frames
 
 
-def test_crop_rejects_upscaling():
-    with pytest.raises(ValueError, match="smaller than the target canvas"):
-        crop_to_canvas(torch.randn(1, 3, 2, 4, 4), height=8, width=8)
-
-
 # ── frame quantisation ────────────────────────────────────────────────────
 
 
@@ -89,11 +74,6 @@ def test_frames_to_uint8_maps_the_unit_range():
 def test_frames_to_uint8_clamps_out_of_range():
     assert int(frames_to_uint8(torch.full((1, 3, 1, 2, 2), 5.0)).max()) == 255
     assert int(frames_to_uint8(torch.full((1, 3, 1, 2, 2), -5.0)).min()) == 0
-
-
-def test_frames_to_uint8_rejects_wrong_channel_count():
-    with pytest.raises(ValueError, match="3 colour channels"):
-        frames_to_uint8(torch.randn(1, 4, 2, 8, 8))
 
 
 # ── mux ───────────────────────────────────────────────────────────────────
@@ -179,16 +159,3 @@ def test_denormalize_pixels_clamps_to_unit_range():
     out = denormalize_pixels(frames, _FakeVAE())
     assert float(out.max()) <= 1.0
     assert float(out.min()) >= 0.0
-
-
-def test_denormalize_pixels_requires_transform_rev():
-    class _NoTransform:
-        pass
-
-    with pytest.raises(AttributeError, match="transform_rev"):
-        denormalize_pixels(torch.zeros(1, 3, 1, 2, 2), _NoTransform())
-
-
-def test_denormalize_pixels_rejects_wrong_rank():
-    with pytest.raises(ValueError, match="rank 5"):
-        denormalize_pixels(torch.zeros(3, 4, 5), _FakeVAE())

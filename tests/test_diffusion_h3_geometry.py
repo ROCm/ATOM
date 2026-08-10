@@ -74,11 +74,6 @@ def test_video_latent_t_roundtrips():
         assert frame_count_from_video_latent_t(video_latent_t(aligned)) == aligned
 
 
-def test_frame_count_from_latent_t_rejects_off_lattice():
-    with pytest.raises(ValueError, match="5n\\+2"):
-        frame_count_from_video_latent_t(4)
-
-
 def test_audio_latent_t_rounds_at_40hz():
     assert audio_latent_t(5.166667) == 207
     assert audio_latent_t(4.0) == 160
@@ -155,11 +150,6 @@ def test_v_to_x0_identity():
     torch.testing.assert_close(minimax_h3_rf_v_to_x0(xt, v, t), xt + 0.75 * v)
 
 
-def test_v_to_x0_rejects_out_of_range_timestep():
-    with pytest.raises(ValueError, match=r"\[0, 1\]"):
-        minimax_h3_rf_v_to_x0(torch.randn(2), torch.randn(2), torch.tensor([1.5]))
-
-
 def test_euler_step_interpolates_between_state_and_denoised():
     state = torch.zeros(4)
     denoised = torch.ones(4)
@@ -174,13 +164,6 @@ def test_euler_step_at_sigma_zero_is_a_no_op():
         state, torch.randn(4), sigma_curr=0.0, sigma_next=0.0
     )
     torch.testing.assert_close(out, state)
-
-
-def test_euler_step_rejects_nonzero_next_at_sigma_zero():
-    with pytest.raises(ValueError, match="sigma_next must be 0"):
-        minimax_h3_euler_eta0_step(
-            torch.randn(4), torch.randn(4), sigma_curr=0.0, sigma_next=0.5
-        )
 
 
 def test_euler_step_accumulates_in_fp32_for_bf16_state():

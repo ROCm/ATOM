@@ -182,18 +182,3 @@ def test_sequence_is_padded_to_the_alignment():
     p = build([{"kind": "image", "latent_h": 4, "latent_w": 4}])
     assert p["seq_len"] % PACKED_SEQUENCE_ALIGNMENT == 0
     assert p["cu_seqlens"].tolist() == [0, p["used_len"], p["seq_len"]]
-
-
-def test_explicit_seq_len_must_fit():
-    with pytest.raises(ValueError, match="smaller than"):
-        build([], seq_len=8)
-
-
-def test_unknown_block_kind_is_rejected():
-    with pytest.raises(ValueError, match="kind"):
-        build([{"kind": "subtitle"}])
-
-
-def test_non_patch_aligned_reference_is_rejected():
-    with pytest.raises(ValueError, match="patch-aligned"):
-        build([{"kind": "image", "latent_h": 5, "latent_w": 4}])

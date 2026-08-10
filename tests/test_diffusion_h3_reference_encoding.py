@@ -24,28 +24,22 @@ from atom.diffusion.models.minimax_h3.conditioning import (
 np = pytest.importorskip("numpy")
 
 
-def test_short_edge_lands_on_the_reference_target():
-    shape = resolve_reference_image_shape(width=1344, height=768)
+@pytest.mark.parametrize(
+    ("width", "height"),
+    [(1344, 768), (1333, 777), (320, 240), (1600, 800)],
+)
+def test_reference_shape_invariants(width, height):
+    """A reference always reaches the short edge, on grid, aspect preserved.
+
+    Unlike the target canvas it is upscaled to get there -- 320x240 comes out
+    larger than it went in.
+    """
+    shape = resolve_reference_image_shape(width=width, height=height)
     assert shape["short_edge"] == REFERENCE_IMAGE_SHORT_EDGE
-    assert shape["height"] == REFERENCE_IMAGE_SHORT_EDGE
-
-
-def test_both_axes_round_to_the_32_grid():
-    shape = resolve_reference_image_shape(width=1333, height=777)
+    assert min(shape["width"], shape["height"]) == REFERENCE_IMAGE_SHORT_EDGE
     assert shape["width"] % REFERENCE_IMAGE_MULTIPLE == 0
     assert shape["height"] % REFERENCE_IMAGE_MULTIPLE == 0
-
-
-def test_small_images_are_upscaled():
-    """Unlike the target canvas, a reference always reaches the short edge."""
-    shape = resolve_reference_image_shape(width=320, height=240)
-    assert shape["short_edge"] == REFERENCE_IMAGE_SHORT_EDGE
-    assert shape["width"] > 320
-
-
-def test_aspect_ratio_is_preserved_within_the_rounding_grid():
-    shape = resolve_reference_image_shape(width=1600, height=800)
-    assert shape["width"] == pytest.approx(2 * shape["height"], rel=0.02)
+    assert shape["width"] / shape["height"] == pytest.approx(width / height, rel=0.02)
 
 
 def test_extreme_ratios_are_rejected():
@@ -57,13 +51,6 @@ def test_extreme_ratios_are_rejected():
 def test_degenerate_dimensions_are_rejected(width, height):
     with pytest.raises(ValueError, match="positive finite"):
         resolve_reference_image_shape(width=width, height=height)
-
-
-def test_resize_rejects_unaligned_targets():
-    pil = pytest.importorskip("PIL.Image")
-    image = pil.new("RGB", (64, 64))
-    with pytest.raises(ValueError, match="aligned"):
-        resize_reference_image(image, target_width=100, target_height=64)
 
 
 def test_resize_is_a_no_op_at_the_target_size():

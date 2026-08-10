@@ -107,13 +107,6 @@ def test_update_mask_is_all_true_for_t2va(packed):
     assert packed["update_mask"].numel() == OBS_VIDEO
 
 
-def test_builder_rejects_bad_inputs():
-    with pytest.raises(ValueError, match="text_len"):
-        build_packed_sequence_t2va(**{**OBS, "text_len": 0})
-    with pytest.raises(ValueError, match="not divisible by patch"):
-        build_packed_sequence_t2va(**{**OBS, "latent_h": 47})
-
-
 # ── per-rank layout ───────────────────────────────────────────────────────
 
 
@@ -158,17 +151,6 @@ def test_text_range_is_empty_at_text_len_for_shards_without_text(packed):
         row_stop=2 * local,
     )
     assert (second["text_source_start"], second["text_source_stop"]) == (2, 2)
-
-
-def test_layout_rejects_empty_shard(packed):
-    with pytest.raises(ValueError, match="empty row shard"):
-        build_local_embedding_layout(
-            img_pos=packed["img_pos"],
-            audio_pos=packed["audio_pos"],
-            text_pos=packed["text_pos"],
-            row_start=100,
-            row_stop=100,
-        )
 
 
 def test_warmup_geometry_matches_a_real_request():

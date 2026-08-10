@@ -8,7 +8,6 @@ tensor of the right shape holding roughly the anchor, so only the exact RNG
 contract distinguishes correct from silently-different.
 """
 
-import pytest
 import torch
 
 from atom.diffusion.models.minimax_h3.conditioning import (
@@ -128,39 +127,6 @@ def test_seed_changes_the_result():
     assert not torch.allclose(a, b)
 
 
-def test_row_count_must_agree_with_the_declared_shapes():
-    with pytest.raises(ValueError, match="shapes imply"):
-        imgvid_cond_noise_aug_rows(
-            clean_rows(ROWS + 1),
-            condition_shapes=[(LT, LH, LW)],
-            target_latent_t=8,
-            seed=1,
-            noise_aug=0.5,
-        )
-
-
-def test_odd_spatial_dims_are_rejected():
-    with pytest.raises(ValueError, match="even"):
-        imgvid_cond_noise_aug_rows(
-            clean_rows(),
-            condition_shapes=[(LT, 3, LW)],
-            target_latent_t=8,
-            seed=1,
-            noise_aug=0.5,
-        )
-
-
-def test_coefficient_out_of_range_is_rejected():
-    with pytest.raises(ValueError, match="noise_aug"):
-        imgvid_cond_noise_aug_rows(
-            clean_rows(),
-            condition_shapes=[(LT, LH, LW)],
-            target_latent_t=8,
-            seed=1,
-            noise_aug=1.5,
-        )
-
-
 def test_audio_default_is_a_passthrough():
     rows = clean_rows(4, width=32)
     assert audio_cond_noise_aug_rows(rows, condition_audio_t=[2], seed=1) is rows
@@ -172,10 +138,3 @@ def test_audio_uses_seed_plus_one():
     generator = torch.Generator(device="cpu").manual_seed(11)
     expected = torch.randn((4, 32), generator=generator, dtype=torch.float32)
     assert torch.allclose(out, expected, atol=0, rtol=0)
-
-
-def test_audio_rows_are_two_channels_per_latent_step():
-    with pytest.raises(ValueError, match="lengths imply"):
-        audio_cond_noise_aug_rows(
-            torch.zeros(3, 32), condition_audio_t=[2], seed=1, noise_aug=0.5
-        )

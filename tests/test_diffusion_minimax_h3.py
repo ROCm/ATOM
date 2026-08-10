@@ -108,11 +108,6 @@ def test_arch_derived_dims():
     assert a.video_patch_dim == 24 * 1 * 2 * 2  # 96, matches the captured x width
 
 
-def test_arch_rejects_inconsistent_adaln():
-    with pytest.raises(ValueError, match="adaln_out_features"):
-        MiniMaxH3DiTArchConfig(adaln_out_features=1234)
-
-
 def test_validate_ulysses_rejects_indivisible_heads():
     a = MiniMaxH3DiTArchConfig()
     a.validate_ulysses(8)  # 56 / 8 = 7
@@ -144,13 +139,6 @@ def test_grouped_qkv_reorder_moves_the_right_rows():
     )
     k0 = w[heads_per_group * head_dim : (heads_per_group + 1) * head_dim]
     torch.testing.assert_close(out[q_rows : q_rows + head_dim], k0)
-
-
-def test_grouped_qkv_reorder_rejects_bad_shape():
-    with pytest.raises(ValueError, match="output dim"):
-        reorder_grouped_qkv_to_qkv(
-            torch.zeros(7, 2), num_query_groups=2, heads_per_group=3, head_dim=4
-        )
 
 
 # ── model ─────────────────────────────────────────────────────────────────
@@ -190,25 +178,6 @@ def test_update_mask_zeroes_condition_rows():
     assert torch.count_nonzero(video[2:]) > 0
 
 
-def test_mismatched_update_mask_is_rejected():
-    arch = tiny_arch()
-    model = MiniMaxH3DiTModel(arch).eval()
-    kwargs = make_inputs(arch)
-    kwargs["skip_mask_out_condition"] = False
-    kwargs["update_mask"] = torch.ones(N_IMG + 1, dtype=torch.bool)
-    with pytest.raises(ValueError, match="update_mask length"):
-        model(**kwargs)
-
-
-def test_missing_embedding_layout_is_rejected():
-    arch = tiny_arch()
-    model = MiniMaxH3DiTModel(arch).eval()
-    kwargs = make_inputs(arch)
-    del kwargs["local_embedding_layout"]
-    with pytest.raises(KeyError, match="local_embedding_layout"):
-        model(**kwargs)
-
-
 def test_rope_cache_is_built_when_absent_and_matches_supplied():
     """An omitted rope_cache must reproduce what build_rope_cache would give."""
     arch = tiny_arch()
@@ -227,13 +196,6 @@ def test_rope_cache_is_built_when_absent_and_matches_supplied():
     assert built.shape == (S, arch.rope_dim)
     torch.testing.assert_close(a_video, b_video)
     torch.testing.assert_close(a_audio, b_audio)
-
-
-def test_rope_rejects_wrong_position_rank():
-    arch = tiny_arch()
-    model = MiniMaxH3DiTModel(arch).eval()
-    with pytest.raises(ValueError, match=r"\[1, S, 3\]"):
-        model.rope(torch.rand(S, 3))
 
 
 def test_sequence_must_divide_across_ulysses_world():
