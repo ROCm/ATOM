@@ -668,13 +668,6 @@ def install_deepseek_v4_proxy_pool_patch() -> None:
     dsv4_pool.DeepSeekV4TokenToKVPool = ATOMDeepSeekV4ProxyKVPool
     dsv4_pool.ATOMDeepSeekV4ProxyKVPool = ATOMDeepSeekV4ProxyKVPool
 
-    try:
-        import sglang.srt.model_executor.model_runner_kv_cache_mixin as mixin
-    except ModuleNotFoundError:
-        mixin = None
-    if mixin is not None:
-        mixin.DeepSeekV4TokenToKVPool = ATOMDeepSeekV4ProxyKVPool
-
     # SGLang 0.5.17 moved pool construction into mem_cache.kv_cache_configurator,
     # which imports DeepSeekV4TokenToKVPool as a module-local symbol. Patch any
     # already-loaded local aliases that still point at the original class.
