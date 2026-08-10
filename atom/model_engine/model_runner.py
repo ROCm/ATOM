@@ -387,7 +387,11 @@ class tokenIDProcessor:
         ]
         self.input_ids.copy_to_gpu(total_tokens_prefill)
 
-        self.prev_rejected_num, self.prev_bonus_num = self.recv_mtp_status_async()
+        # MTP status records are enqueued by postprocess(), which pure middle
+        # prefill chunks skip. Consume them on that same output-producing
+        # cadence so they stay aligned with the deferred sampled-token queue.
+        if batch.produces_output():
+            self.prev_rejected_num, self.prev_bonus_num = self.recv_mtp_status_async()
 
         # TODO: remove this when we support mixed prefill and decode in one batch
         if total_reqs_prefill > 0:
