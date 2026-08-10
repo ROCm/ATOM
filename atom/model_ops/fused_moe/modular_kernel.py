@@ -458,6 +458,11 @@ class FusedMoEModularKernel(torch.nn.Module):
         # weights live on the layer, so the quant method forwards them through
         # `moe_extra_args` -- the modular kernel holds no layer reference.
         triton_experts = extra_kwargs.pop("triton_experts", None)
+
+        # Runs on prefill as well as decode. The gfx1250 gluon kernel used to
+        # be prefill-broken (TDM async_gather over mxfp8 activations), so this
+        # was decode-only; that is fixed in the aiter gluon kernel, which now
+        # loads the x mx-scales via async_copy when X_SCALE_TDM is off.
         if triton_experts is not None:
             from atom.model_ops.fused_moe_triton import (
                 routing_from_dispatched,
@@ -473,9 +478,50 @@ class FusedMoEModularKernel(torch.nn.Module):
                 else triton_kernel_fused_experts_a8w4_silu_gugu
             )
 
+            # --- Direction-3: shrink the ROUTED work, not the mori buffer -----
+            # The trim above leaves graph_bs*topk*dp rows, but mori de-duplicates
+            # per destination rank -- a token whose top-k spans several experts
+            # here arrives as ONE row -- so at most graph_bs*max_seqlen_q*dp rows
+            # can ever be live. Everything past that is padding that still costs
+            # a full pass in routing / quant / GEMM / reduce, all of which are
+            # sized by M (and n_gates = M * topk).
+            #
+            # Unlike tightening the trim itself, this leaves `_prepare`,
+            # `_finalize` and the buffer handed to mori's combine byte-identical:
+            # only the slice fed to the Triton experts shrinks, and the result is
+            # written back into a full-M tensor below. A measured probe
+            # (ATOM_EP_TRIM_PROBE) saw R reach exactly graph_bs*dp and never
+            # exceed it, so the bound is exact -- but it has NO margin, hence the
+            # env gate and the all_ranks_decode guard (a non-uniform batch makes
+            # graph_bs this rank's size only, which under-counts the cluster).
+            M_full = dispatch_a1.shape[0]
+            M_eff = M_full
+            if envs.ATOM_EP_SHRINK_ROUTING:
+                _fwd_ctx = get_forward_context()
+                _ctx = _fwd_ctx.context
+                if _ctx is not None and getattr(
+                    _ctx, "dp_uniform_decode", not _ctx.is_prefill
+                ):
+                    # All host-side ints (max_seqlen_q is `int`, see
+                    # forward_context.ForwardMetadata) -- no sync, and constant
+                    # per captured graph exactly like graph_bs itself.
+                    tokens_per_rank = _ctx.graph_bs
+                    attn_md = _fwd_ctx.attn_metadata
+                    if attn_md is not None:
+                        tokens_per_rank *= attn_md.max_seqlen_q
+                    M_eff = min(M_full, tokens_per_rank * get_dp_group().world_size)
+
+            if M_eff < M_full:
+                # Views, not copies.
+                a1_eff = dispatch_a1[:M_eff]
+                ids_eff = dispatch_ids[:M_eff]
+                wts_eff = dispatch_weights[:M_eff]
+            else:
+                a1_eff, ids_eff, wts_eff = dispatch_a1, dispatch_ids, dispatch_weights
+
             routing_data, gather_idx, scatter_idx, gate_valid = routing_from_dispatched(
-                dispatch_weights,
-                dispatch_ids,
+                wts_eff,
+                ids_eff,
                 expert_map,
                 local_num_experts,
                 expert_tokens_meta.expert_num_tokens,
@@ -484,7 +530,7 @@ class FusedMoEModularKernel(torch.nn.Module):
             # apply_router_weight_on_input is False (mori asserts it), so GEMM2
             # applies them -- same split as flydsl's doweight_stage1=False.
             fused_out = fused_experts_fn(
-                dispatch_a1,
+                a1_eff,
                 triton_experts["w13_weight"],
                 triton_experts["w2_weight"],
                 routing_data,
@@ -502,6 +548,21 @@ class FusedMoEModularKernel(torch.nn.Module):
                 apply_router_weight_on_input=apply_router_weight_on_input,
                 gate_valid=gate_valid,
             )
+
+            if M_eff < M_full:
+                # Restore the row count mori's combine expects. The tail is left
+                # UNINITIALISED on purpose: combine is driven by the routing
+                # handle and only touches slots < total_recv <= M_eff, so those
+                # rows are never read. Zeroing them would cost a ~147 MB memset
+                # per layer and buy nothing.
+                full_out = torch.empty(
+                    (M_full, fused_out.shape[-1]),
+                    dtype=fused_out.dtype,
+                    device=fused_out.device,
+                )
+                full_out[:M_eff] = fused_out
+                fused_out = full_out
+
             return self._finalize(
                 output,
                 fused_out,

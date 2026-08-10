@@ -62,50 +62,45 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
     "ATOM_USE_TRITON_MOE_DECODE": lambda: os.getenv("ATOM_USE_TRITON_MOE_DECODE", "0")
     == "1",
-    # Run the routed-expert GEMMs through the Triton a8w4 path *inside* the EP
-    # modular kernel (between mori dispatch and combine). Separate from
-    # ATOM_USE_TRITON_MOE, whose branches short-circuit apply() before EP runs.
+    # Run the routed experts with the aiter Triton a8w4 kernel *inside* the EP
+    # modular kernel, i.e. between the mori dispatch and combine. Unlike
+    # ATOM_USE_TRITON_MOE_DECODE (GGUU, gate/up separated) this path is GUGU, so
+    # it requires ATOM_MOE_GU_ITLV=1; it is ignored when the layer is not
+    # gate/up-interleaved, and forced off when EPLB is enabled.
     "ATOM_USE_TRITON_MOE_EP": lambda: os.getenv("ATOM_USE_TRITON_MOE_EP", "0") == "1",
-    # Trim the mori receive buffer during PREFILL too. Without it, prefill keeps
-    # the full (mbt * ep_size) buffer -- measured M=131072 for ~400 real rows,
-    # which the Triton EP path then multiplies by topk into an ~11 GB per-layer
-    # intermediate. Off by default: the trim bound must be an upper bound on
-    # received rows or it silently drops tokens.
+    # Select the a4w4 Triton EP wrapper instead of a8w4. Only chooses *which*
+    # wrapper runs -- it cannot enable the Triton EP path on its own, and
+    # asserts if set without ATOM_USE_TRITON_MOE_EP.
+    "ATOM_USE_TRITON_MOE_EP_A4W4": lambda: (
+        os.getenv("ATOM_USE_TRITON_MOE_EP_A4W4", "0") == "1"
+    ),
+    # Trim the dispatched-token buffer to the actual valid token count on
+    # prefill steps. Decode already trims to graph_bs; prefill otherwise keeps
+    # the full (max_batched_tokens * ep_size) buffer, so the expert GEMMs run
+    # over rows that are entirely padding.
     "ATOM_EP_TRIM_PREFILL": lambda: os.getenv("ATOM_EP_TRIM_PREFILL", "0") == "1",
-    # Use the a4w4 (MXFP4 activation) triton MoE instead of a8w4 (MXFP8) on the
-    # EP path. Requires ATOM_USE_TRITON_MOE_EP=1; ignored otherwise. Weights are
-    # identical -- both are w4 -- so no extra weight prep or memory.
+    # Run the Triton EP experts over only the rows that can actually be live --
+    # graph_bs * max_seqlen_q * dp (the cluster-token count mori's per-destination
+    # dedup permits) -- instead of the graph_bs * topk * dp the dispatch trim
+    # leaves. Cuts routing / quant / GEMM / reduce work by up to topk, since all
+    # of them are sized by M (and n_gates = M * topk).
     #
-    # Measured 1.22-1.28x SLOWER than a8w4 on gfx950, and GSM8K 0.9424/0.9454 vs
-    # a8w4's 0.9575 (see _test/ep_moe_bench_report.md). Both regressions have the
-    # same root cause: moe_gemm_a4w4 has no out_mx_quant, so the intermediate
-    # takes a second mxfp4_quant -- a second expensive launch AND a second
-    # rounding to 4 bits. Off by default; kept so the trade-off can be
-    # re-measured on gfx1250.
-    #
-    # REQUIRES MAX_NUM_BATCHED_TOKENS <= 8192 on gfx950 (with 8 ranks). The
-    # second mxfp4_quant lifts the MoE's transient peak to ~18.4 GB against
-    # a8w4's ~15.5 GB at the profile-run shape, and a8w4 is already marginal at
-    # mbt=16384. Over that, the profile run dies with "Memory access fault by GPU
-    # node-N" on every rank rather than a clean OOM. Lowering
-    # --gpu-memory-utilization does NOT help: it shrinks the KV budget, which is
-    # allocated after the profile run, not the transients during it.
-    "ATOM_USE_TRITON_MOE_EP_A4W4": lambda: os.getenv("ATOM_USE_TRITON_MOE_EP_A4W4", "0")
-    == "1",
-    # TEMPORARY: which EP routing prep+sort implementation to use.
-    #   1 = ep_sort_routing_v1 -- 3 kernels, mirrors flydsl's opus_moe_sorting:
-    #       an [expert, token] mesh, then a per-expert walk emitting contiguous
-    #       runs. Trades memory for coalesced stores and no rank arithmetic, but
-    #       the mesh build costs E-fold redundant reads and scales badly with M
-    #       (21x from M=384 to M=16384 -- see _test/bench_ep_moe.py).
-    #   2 = ep_sort_routing_v2 -- no mesh: per-CTA partial histogram + scan +
-    #       arithmetic scatter, with the scatter and ExptData stages fused into
-    #       one launch split by CTA index (aiter's _combined_routing_fused
-    #       layout). 3 kernels, fastest at every measured shape. DEFAULT.
-    # Both are bit-exact against each other through the full MoE. The former v0
-    # (unfused scatter + standalone ExptData) was removed once v2 matched it
-    # bit-for-bit and beat it at every shape.
-    # Remove this knob once one wins on both gfx950 and gfx1250.
+    # The mori buffer and the tensor handed to combine are NOT changed: the
+    # result is written back into a full-M tensor, so _prepare/_finalize see
+    # exactly what they see today. Only fires under all_ranks_decode, because
+    # graph_bs is this rank's size and a non-uniform batch would under-count the
+    # cluster. The bound is exact with NO margin (measured: R reaches it exactly),
+    # so this is opt-in until it has soaked.
+    "ATOM_EP_SHRINK_ROUTING": lambda: (
+        os.getenv("ATOM_EP_SHRINK_ROUTING", "0") == "1"
+    ),
+    # Which post-dispatch expert-sort implementation routing_from_dispatched uses.
+    # 2 (default) = ep_sort_routing_v2, the no-mesh prep+sort with the scatter and
+    # ExptData stages fused into one launch (3 kernels).
+    # 1 = ep_sort_routing_v1, the flydsl-style (E, M) uint8 mesh path (2 kernels),
+    # kept as the reference. v1's mesh holds one slot per (expert, token) cell, so
+    # it silently drops a repeat if a token picks the same local expert twice.
+    # Must be 1 or 2; routing_from_dispatched asserts otherwise.
     "ATOM_EP_SORT_VERSION": lambda: int(os.getenv("ATOM_EP_SORT_VERSION", "2")),
     "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
     # --- Kernel Fusion Toggles ---

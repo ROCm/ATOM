@@ -38,6 +38,7 @@ if (
     # time when only the EP flag is set.
     or envs.ATOM_USE_TRITON_MOE_EP
 ):
+    from aiter.ops.triton.moe.moe_routing.routing import routing
     # Module level, not function local: `_ep_scatter_expt_data_kernel` calls these
     # from inside a @triton.jit body, so they must be resolvable in the kernel's
     # global namespace when it is compiled on first launch.
@@ -50,6 +51,7 @@ if (
         mxfp4_quant,
     )
     from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
+        get_kernel_config_gluon,
         moe_gemm_a8w4,
     )
     from aiter.ops.triton.moe.moe_op_gemm_a16w4 import (
@@ -127,15 +129,12 @@ def _ep_gate_prep_kernel(
     BLOCK: tl.constexpr,
 ):
     """Kernel A: gate gating + per-CTA private histogram. No atomics.
-
     Replaces ~9 elementwise launches that all share the G = M*topk axis:
-
         ids   = dispatch_ids.long().clamp_(0, E_map-1)
         local = expert_map[ids]
         local = where(row < R, local, -1)
         gate_valid = (local >= 0).reshape(-1).int()
         expt_indx  = where(local < 0, SENTINEL, local).reshape(-1).int()
-
     The histogram is built as a one-hot reduction inside each CTA rather than
     with `atomic_add` into shared bins: at prefill G is ~786k against 49 bins,
     which serialises badly. Each CTA writes its own row of PartialHist, and the
@@ -180,11 +179,9 @@ def _ep_scan_partials_kernel(
     C_BLOCK: tl.constexpr,
 ):
     """Kernel A': exclusive scan of PartialHist down the CTA axis, per bin.
-
     Grid is (N_BINS,) -- one program per bin, so the bins run in parallel and
     each does a strided sequential scan over n_ctas. Gives every (CTA, bin) pair
     its own write cursor, which is what lets the scatter avoid atomics entirely.
-
     Separate launch by necessity: A's axis is G and this one's is the bin axis, so
     no CTA arrangement serves both, and the scan needs every CTA's partial counts.
     """
@@ -214,27 +211,20 @@ def _ep_scatter_body(
     BLOCK: tl.constexpr,
 ):
     """Kernel B's body: the atomic-free scatter into expert-sorted order.
-
     Takes `pid` as an argument rather than reading `tl.program_id(0)`, because it
     occupies the upper part of v2's wider grid and must be shifted down by the
     expt_data CTA count.
-
     Deterministic, atomic-free scatter into expert-sorted order.
-
     Destination of gate `i` in CTA `c` with bin `e`:
-
         pos = bin_base[e] + cta_base[c][e] + rank_of_i_within_(c, e)
-
     `bin_base` is the exclusive cumsum of Hist over bins -- only N_BINS (64)
     elements, so every CTA recomputes it rather than reading a separate buffer.
     `rank` comes from an exclusive cumsum of the same one-hot matrix Kernel A
     built; recomputing it is cheaper than storing (BLOCK, N_BINS) per CTA, and is
     the same trade aiter's P23 makes when it re-reads topk_ids.
-
     Because the sentinel is the largest bin, live gates tile [0, sum(hist[:E]))
     and dead gates land in the tail -- so the matmul, which only reads
     GatherIndx[start_m + j] for j < hist[e], never sees them.
-
     Both permutations and the permuted weights fall out of the same `pos`, so
     GateScal cannot drift out of alignment, and outputs are int32 directly (no
     trailing .int() copies).
@@ -283,16 +273,13 @@ def _ep_scatter_expt_data_kernel(
     GATE_BLOCK: tl.constexpr,
 ):
     """v2 Kernel B+C: scatter and ExptData in ONE launch, split by CTA index.
-
     Grid is ``(N_EXPTS + n_ctas,)``, borrowing the layout of aiter's
     ``_combined_routing_fused`` (``blocks1a + blocks1b`` with an ``if pid <
     blocks1a`` split). Legal because, given ``Hist``, the two halves are
     independent: both only *read* the histogram, and their writes are disjoint --
     scatter owns GatherIndx/ScatterIndx/GateScal, expt_data owns
     TokenStart/TileStart/MDTileInfo.
-
     Two deliberate differences from the aiter reference:
-
     1. **No grid-wide dependency, so no barrier before the split.** The reference
        must build its histogram inside the same launch, which it can only do
        because ``_sum_bitmatrix_rows_fused`` has no ``pid`` in it: *every* CTA
@@ -307,12 +294,10 @@ def _ep_scatter_expt_data_kernel(
        redundantly prefix-summing 48 bins for nothing. ``pid == 0``, which owns
        stage1's terminal writes and the 0xFFFFFFFF tail memset, is still inside
        the guard.
-
     The one barrier we do keep is *within* the expt_data half: stage1 writes
     TileStart lane-wise and stage2 reads TileStart[pid] as a scalar, so the
     producing lane need not be the consuming one. `pid` is CTA-uniform, so the
     branch is uniform and the barrier is well-formed.
-
     Cost of branch fusion: one register/LDS budget and one `num_warps` for both
     halves, sized by whichever is heavier (the scatter's (GATE_BLOCK, N_BINS)
     one-hot). Measure before trusting it -- see _test/bench_ep_sort.py.
@@ -369,17 +354,14 @@ def _ep_mesh_build_kernel(
     T_BLOCK: tl.constexpr,
 ):
     """v1 phase 1 -- mirrors flydsl's MoeSortingMultiPhaseKernel_P0_v2.
-
     Grid is (E,): one program per LOCAL expert, which scans every gate and writes
     its own contiguous mesh row. That layout is the whole point -- phase 2 then
     walks a single row and emits a contiguous run, so it needs no rank arithmetic
     and its stores coalesce. flydsl calls this `p_expert_mesh` [expert, tokens].
-
     The trade versus v2: E-fold redundant reads of DispatchIds/ExpertMap, in
     exchange for exact per-expert counts with no atomics and no cross-CTA
     histogram barrier (each program owns a row, so `Hist[e]` is just its own
     count). The row is written in full including zeros, so no memset is needed.
-
     ASSUMPTION -- a token's topk selections must be DISTINCT experts. The mesh
     holds one slot per (expert, token) cell, so if a token named the same expert
     twice the second write overwrites the first and that gate is silently dropped
@@ -388,7 +370,6 @@ def _ep_mesh_build_kernel(
     independent -- so if a router ever emits duplicates, v2 is the correct path.
     flydsl's decode mesh is `int` rather than `unsigned char`, which would allow a
     per-slot bitmask instead; worth revisiting if duplicates are ever possible.
-
     GateValid is gate-indexed, not expert-indexed, so program 0 alone emits it
     while it already has `local` in registers. Avoids both a memset and a race.
     """
@@ -428,13 +409,11 @@ def _ep_mesh_scatter_kernel(
     T_BLOCK: tl.constexpr,
 ):
     """v1 phase 2 -- mirrors flydsl's MoeSortingMultiPhaseKernel_P23.
-
     Grid is (E,). Each program redundantly cumsums the E-element histogram to get
     its own base (48 elements, cheaper than a separate buffer + launch -- the same
     reason v2's scatter recomputes `bin_base`), then walks its mesh row and emits
     a CONTIGUOUS run of GatherIndx/GateScal. That contiguity is what v2 lacks:
     there a CTA's 256 gates scatter to up to 49 distant regions.
-
     Dead gates never appear in the mesh, so their ScatterIndx entry is left at the
     pre-zeroed 0 -- harmless because reduce_grouped clamps masked slots via
     indx_valid before dereferencing.
@@ -472,12 +451,10 @@ def ep_sort_routing_v1(
     n_gates,
 ):
     """Mesh prep+sort: 2 kernels, mirroring flydsl's opus_moe_sorting.
-
     P0-equivalent: grid (E,), each program writes its own [expert, token] mesh row
                    and its exact count -- no atomics, no histogram barrier.
     P23-equivalent: grid (E,), redundant E-element cumsum for the base, then walk
                    the row emitting a CONTIGUOUS run.
-
     Costs an (E, M) uint8 mesh and E-fold redundant reads of dispatch_ids, and
     buys coalesced stores plus no rank arithmetic -- the two things that make
     flydsl's sort 9.4 ms where the no-mesh scatter's is 30 ms.
@@ -534,21 +511,17 @@ def ep_sort_routing_v2(
     expt_data_bufs,
 ):
     """No-mesh prep+sort with the scatter and ExptData stages fused: 3 kernels.
-
     A  : gating + per-CTA private histogram          (grid: n_ctas)
     A' : per-bin exclusive scan down the CTA axis    (grid: N_BINS)
     B+C: scatter | ExptData, split by CTA index      (grid: N_EXPTS + n_ctas)
-
     A and A' cannot join anything -- A' consumes every CTA's partials, which is a
     grid-wide reduction. But B and C are both pure consumers of `hist` with
     disjoint outputs, so they collapse into one launch. See
     `_ep_scatter_expt_data_kernel` for why this mirrors aiter's
     `_combined_routing_fused` layout without needing its barrier.
-
     `expt_data_bufs` is the tuple `_compute_expt_data_internal` returns; the
     caller allocates it (it is allocation-only and version-independent) so v1 can
     keep launching the standalone `_expt_data_only_kernel` unchanged.
-
     Returns the same 5-tuple as v1; the ExptData buffers are filled in place.
     """
     device = dispatch_ids.device
@@ -623,13 +596,11 @@ def routing_from_dispatched(
     num_local_tokens: torch.Tensor,
 ):
     """Build triton RoutingData / gather / scatter from mori-dispatched rows.
-
     The EP path cannot use aiter's ``routing()``: that starts from router logits,
     but after the all-to-all the top-k choice is already made and the rows have
     been permuted across ranks. This is ``routing_torch``'s second half --
     everything from ``(expt_scal, expt_indx)`` onward -- adapted for three facts
     about the post-dispatch buffer:
-
     1. Rows are per-token: mori sends one copy per (token, destination rank), so
        a row carries the full top-k tuple with only *some* entries owned here.
        Non-local entries go to a sentinel bin that is sliced off the histogram,
@@ -644,7 +615,6 @@ def routing_from_dispatched(
        It is REQUIRED, not optional: the mori buffer always has M > R, so
        skipping the row mask would fold garbage rows into the histogram as live
        gates -- silently wrong rather than an error.
-
     Returns ``(routing_data, gather_indx, scatter_indx, gate_valid)`` -- the first
     three match ``routing()``; ``gate_valid`` is the extra piece EP needs, since
     ``routing()`` never produces dead gates.
@@ -748,6 +718,234 @@ def _resize_cache(x: torch.Tensor, v: tuple[int, ...]) -> torch.Tensor:
         prod(v) <= x.numel()
     ), f"{v} ({prod(v)}) <= {x.shape} ({x.numel()})"  # CUDAGRAPH unfriendly?
     return x.flatten()[: prod(v)].view(*v)
+
+
+def _gluon_fused_quant_supported(m, n, k, routing_data) -> bool:
+    """Will the gfx1250 kernel that moe_gemm_a8w4 picks support out_mx_quant?
+
+    moe_gemm_a8w4 chooses between three gluon kernels, in this order, and only
+    the middle one implements the fused MXFP8 requant epilogue:
+
+        config["use_persistent"]  -> _moe_gemm_a8w4_decode_persistent   no
+        block_m == 16             -> _moe_gemm_a8w4_decode              YES
+        (otherwise)               -> _moe_gemm_a8w4_prefill             no
+
+    This must be exact, because getting it wrong is silently WRONG rather than
+    an error: moe_gemm_a8w4 allocates and returns the y_scale buffer whenever
+    out_mx_quant is set, but only the kernels that take HAS_MX_OUT ever write
+    it -- an unsupported pick returns uninitialised scales, and there is no
+    assert on the aiter side to catch it.
+
+    block_m comes from routing_data (tokens-per-expert, see
+    routing_from_dispatched), NOT from a prefill/decode flag: a decode step at
+    high enough concurrency raises block_m above 16 and lands on the prefill
+    kernel. So this has to be recomputed per call, not cached per layer.
+
+    Defers the persistent decision to aiter's own selector instead of restating
+    its thresholds, so this stays correct if that heuristic moves.
+    """
+    if routing_data is None or getattr(routing_data, "block_m", None) != 16:
+        return False
+    return not get_kernel_config_gluon(m, n, k, routing_data)["use_persistent"]
+
+
+def triton_kernel_fused_experts_a8w4_silu_gugu(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    routing_data,
+    gather_indx,
+    scatter_indx,
+    w13_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    w13_swizzle_layout,
+    w2_swizzle_layout,
+    a13_scale: torch.Tensor | None = None,
+    a2_scale: torch.Tensor | None = None,
+    w1_bias: torch.Tensor | None = None,
+    w2_bias: torch.Tensor | None = None,
+    swiglu_limit: float = 10.0,
+    apply_router_weight_on_input: bool = False,
+    gate_valid: torch.Tensor | None = None,
+    # None = pick by arch (preshuffled only on gfx1250, where the gluon kernel
+    # supports it). Overridable so the two weight layouts can be A/B'd from one
+    # process: preshuffle is a pure layout change, so the same source weights
+    # through either path must agree numerically, which is what validates
+    # process_weights_after_loading's is_gfx1250 branch without needing a
+    # reference implementation.
+    preshuffled: bool | None = None,
+) -> torch.Tensor:
+    """A8W4 MoE for SiLU models, GUGU (interleaved ``[gate, up]``).
+    Interleaved is the a8w4 kernel's native layout: ``_swiglu`` splits
+    ``reshape(M, N // 2, 2)`` on the trailing axis, i.e. adjacent gate/up pairs,
+    so a BLOCK_N tile carries both halves and the activation fuses into GEMM1's
+    write-back. ``out_mx_quant=True`` folds the MXFP8 requant in with it, so the
+    whole layer is two launches:
+        MXFP8 quant -> GEMM1(a8w4, fused SiLU + MX requant) -> GEMM2(a8w4)
+    versus four on the GGUU path (GEMM1 -> fused_clamp_act_mul ->
+    downcast_to_mxfp -> GEMM2), which needs the separate steps precisely because
+    a tile there spans only gate *or* only up.
+    ``alpha=1.0`` with ``swiglu_add_residual=False`` is plain SiLU (``s * linear``).
+    GPT-OSS uses ``swiglu_add_residual=True`` for its ``s * (linear + 1)`` variant,
+    which would be wrong for DeepSeek-V4.
+    """
+    assert hidden_states.ndim == 2
+    assert hidden_states.dtype == torch.bfloat16
+
+    gammas = routing_data.gate_scal if routing_data else None
+
+    # Only gfx1250's gluon kernel consumes the WMMA-preshuffled weight; the
+    # CDNA triton kernel takes a plain (E, K, N) weight.
+    _preshuffled = (
+        (get_arch() == "gfx1250") if preshuffled is None else bool(preshuffled)
+    )
+
+    x_fp8, x_scale = downcast_to_mxfp(hidden_states, torch.float8_e4m3fn, axis=-1)
+
+    # GEMM1: SiLU(gate)*up fused into write-back.
+    #
+    # out_mx_quant folds the MXFP8 requant into GEMM1's epilogue, saving a whole
+    # downcast_to_mxfp launch over the (M, intermediate) intermediate. The CDNA
+    # triton kernel has always supported it. On gfx1250 only ONE of the three
+    # gluon kernels does, so we must predict which one moe_gemm_a8w4 will pick
+    # -- see _gluon_fused_quant_supported for why guessing is unsafe.
+    #
+    # Derive the shapes exactly as moe_gemm_a8w4 does: M from the gather index,
+    # K from the (already fp8) activation, N from the weight -- x16 under the
+    # preshuffled layout, whose last dim is N // 16. We pass no unpadded_N /
+    # unpadded_K, so it applies no further adjustment.
+    if get_arch() != "gfx1250":
+        _fuse_requant = True
+    else:
+        _m = (
+            gather_indx.shape[0]
+            if gather_indx is not None
+            else hidden_states.shape[-2]
+        )
+        _k = x_fp8.shape[-1]
+        _n = w1.shape[-1] * 16 if _preshuffled else w1.shape[-1]
+        _fuse_requant = _gluon_fused_quant_supported(_m, _n, _k, routing_data)
+    interm = moe_gemm_a8w4(
+        x_fp8,
+        w1,
+        x_scale,
+        w13_scale,
+        a13_scale,
+        None,
+        w1_bias,
+        routing_data,
+        gather_indx=gather_indx,
+        gammas=gammas if apply_router_weight_on_input else None,
+        swizzle_mx_scale=w13_swizzle_layout,
+        apply_swiglu=True,
+        alpha=1.0,
+        limit=swiglu_limit,
+        swiglu_add_residual=False,
+        out_mx_quant=_fuse_requant,
+        out_dtype=torch.float8_e4m3fn if _fuse_requant else torch.bfloat16,
+        preshuffled=_preshuffled,
+    )
+    if _fuse_requant:
+        interm_fp8, interm_scale = interm
+    else:
+        interm_fp8, interm_scale = downcast_to_mxfp(
+            interm, torch.float8_e4m3fn, axis=-1
+        )
+
+    return moe_gemm_a8w4(
+        interm_fp8,
+        w2,
+        interm_scale,
+        w2_scale,
+        a2_scale,
+        None,
+        w2_bias,
+        routing_data,
+        scatter_indx=scatter_indx,
+        gammas=None if apply_router_weight_on_input else gammas,
+        swizzle_mx_scale=w2_swizzle_layout,
+        preshuffled=_preshuffled,
+        # Only GEMM2 feeds reduce_grouped, so the mask belongs here. GEMM1's
+        # dead slots are already skipped by the sentinel histogram.
+        gate_valid=gate_valid,
+    )
+
+
+def triton_kernel_fused_experts_a4w4_silu_gugu(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    routing_data,
+    gather_indx,
+    scatter_indx,
+    w13_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    w13_swizzle_layout,
+    w2_swizzle_layout,
+    a13_scale: torch.Tensor | None = None,
+    a2_scale: torch.Tensor | None = None,
+    w1_bias: torch.Tensor | None = None,
+    w2_bias: torch.Tensor | None = None,
+    swiglu_limit: float = 10.0,
+    apply_router_weight_on_input: bool = False,
+    gate_valid: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """A4W4 MoE for SiLU models, GUGU -- same signature as the a8w4 twin.
+    Identical to ``triton_kernel_fused_experts_a8w4_silu_gugu`` except that the
+    activations are MXFP4 rather than MXFP8. The WEIGHTS are unchanged: both are
+    w4, so the same ``process_weights_after_loading`` output feeds either path
+    and no extra weight prep or memory is needed.
+    Costs one launch more than a8w4. ``moe_gemm_a4w4`` has no ``out_mx_quant``,
+    so the intermediate must be re-quantised by a separate ``mxfp4_quant``
+    instead of being folded into GEMM1's write-back:
+        mxfp4_quant -> GEMM1(a4w4, fused SiLU) -> mxfp4_quant -> GEMM2(a4w4)
+    versus a8w4's two launches. Measured on gfx950 that costs 1.22-1.28x overall
+    (see _test/ep_moe_bench_report.md): the a4w4 GEMMs are genuinely faster
+    (2771 vs 3154 us at conc256 prefill, the halved weight traffic paying off)
+    but the doubled quant is far more expensive than the GEMM saving. Kept behind
+    ATOM_USE_TRITON_MOE_EP_A4W4 so it is measurable on gfx1250, where the
+    trade-off may differ.
+    ``moe_gemm_a4w4`` has no ``preshuffled`` parameter, so unlike a8w4 there is no
+    gfx1250 pre-shuffled weight variant to select here.
+    """
+    gammas = routing_data.gate_scal if routing_data else None
+
+    x_fp4, x_scale = mxfp4_quant(hidden_states)
+    interm = moe_gemm_a4w4(
+        x_fp4,
+        w1,
+        x_scale,
+        w13_scale,
+        a13_scale,
+        None,
+        w1_bias,
+        routing_data,
+        gather_indx=gather_indx,
+        gammas=gammas if apply_router_weight_on_input else None,
+        swizzle_mx_scale=w13_swizzle_layout,
+        apply_swiglu=True,
+        alpha=1.0,
+        limit=swiglu_limit,
+        swiglu_add_residual=False,
+    )
+    # The launch a8w4 avoids via out_mx_quant=True.
+    interm_fp4, interm_scale = mxfp4_quant(interm)
+    return moe_gemm_a4w4(
+        interm_fp4,
+        w2,
+        interm_scale,
+        w2_scale,
+        a2_scale,
+        None,
+        w2_bias,
+        routing_data,
+        scatter_indx=scatter_indx,
+        gammas=None if apply_router_weight_on_input else gammas,
+        swizzle_mx_scale=w2_swizzle_layout,
+        # Only GEMM2 feeds reduce_grouped, so the mask belongs here. GEMM1's
+        # dead slots are already skipped by the sentinel histogram.
+        gate_valid=gate_valid,
+    )
 
 
 def triton_kernel_moe_forward(
@@ -1105,185 +1303,3 @@ def triton_kernel_fused_experts_a8w4_silu_gguu(
     )
 
     return output_tensor
-
-
-def triton_kernel_fused_experts_a8w4_silu_gugu(
-    hidden_states: torch.Tensor,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    routing_data,
-    gather_indx,
-    scatter_indx,
-    w13_scale: torch.Tensor,
-    w2_scale: torch.Tensor,
-    w13_swizzle_layout,
-    w2_swizzle_layout,
-    a13_scale: torch.Tensor | None = None,
-    a2_scale: torch.Tensor | None = None,
-    w1_bias: torch.Tensor | None = None,
-    w2_bias: torch.Tensor | None = None,
-    swiglu_limit: float = 10.0,
-    apply_router_weight_on_input: bool = False,
-    gate_valid: torch.Tensor | None = None,
-    # None = pick by arch (preshuffled only on gfx1250, where the gluon kernel
-    # supports it). Overridable so the two weight layouts can be A/B'd from one
-    # process: preshuffle is a pure layout change, so the same source weights
-    # through either path must agree numerically, which is what validates
-    # process_weights_after_loading's is_gfx1250 branch without needing a
-    # reference implementation.
-    preshuffled: bool | None = None,
-) -> torch.Tensor:
-    """A8W4 MoE for SiLU models, GUGU (interleaved ``[gate, up]``).
-
-    Interleaved is the a8w4 kernel's native layout: ``_swiglu`` splits
-    ``reshape(M, N // 2, 2)`` on the trailing axis, i.e. adjacent gate/up pairs,
-    so a BLOCK_N tile carries both halves and the activation fuses into GEMM1's
-    write-back. ``out_mx_quant=True`` folds the MXFP8 requant in with it, so the
-    whole layer is two launches:
-
-        MXFP8 quant -> GEMM1(a8w4, fused SiLU + MX requant) -> GEMM2(a8w4)
-
-    versus four on the GGUU path (GEMM1 -> fused_clamp_act_mul ->
-    downcast_to_mxfp -> GEMM2), which needs the separate steps precisely because
-    a tile there spans only gate *or* only up.
-
-    ``alpha=1.0`` with ``swiglu_add_residual=False`` is plain SiLU (``s * linear``).
-    GPT-OSS uses ``swiglu_add_residual=True`` for its ``s * (linear + 1)`` variant,
-    which would be wrong for DeepSeek-V4.
-    """
-    assert hidden_states.ndim == 2
-    assert hidden_states.dtype == torch.bfloat16
-
-    gammas = routing_data.gate_scal if routing_data else None
-
-    # Only gfx1250's gluon kernel consumes the WMMA-preshuffled weight; the
-    # CDNA triton kernel takes a plain (E, K, N) weight.
-    _preshuffled = (
-        (get_arch() == "gfx1250") if preshuffled is None else bool(preshuffled)
-    )
-
-    x_fp8, x_scale = downcast_to_mxfp(hidden_states, torch.float8_e4m3fn, axis=-1)
-
-    # GEMM1: SiLU(gate)*up fused into write-back, emitting (fp8 e4m3, ue8m0)
-    # directly. out_mx_quant requires split_k == 1 and no scatter_indx, both of
-    # which hold for a GEMM1-style call.
-    interm_fp8, interm_scale = moe_gemm_a8w4(
-        x_fp8,
-        w1,
-        x_scale,
-        w13_scale,
-        a13_scale,
-        None,
-        w1_bias,
-        routing_data,
-        gather_indx=gather_indx,
-        gammas=gammas if apply_router_weight_on_input else None,
-        swizzle_mx_scale=w13_swizzle_layout,
-        apply_swiglu=True,
-        alpha=1.0,
-        limit=swiglu_limit,
-        swiglu_add_residual=False,
-        out_mx_quant=True,
-        out_dtype=torch.float8_e4m3fn,
-        preshuffled=_preshuffled,
-    )
-
-    return moe_gemm_a8w4(
-        interm_fp8,
-        w2,
-        interm_scale,
-        w2_scale,
-        a2_scale,
-        None,
-        w2_bias,
-        routing_data,
-        scatter_indx=scatter_indx,
-        gammas=None if apply_router_weight_on_input else gammas,
-        swizzle_mx_scale=w2_swizzle_layout,
-        preshuffled=_preshuffled,
-        # Only GEMM2 feeds reduce_grouped, so the mask belongs here. GEMM1's
-        # dead slots are already skipped by the sentinel histogram.
-        gate_valid=gate_valid,
-    )
-
-
-def triton_kernel_fused_experts_a4w4_silu_gugu(
-    hidden_states: torch.Tensor,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    routing_data,
-    gather_indx,
-    scatter_indx,
-    w13_scale: torch.Tensor,
-    w2_scale: torch.Tensor,
-    w13_swizzle_layout,
-    w2_swizzle_layout,
-    a13_scale: torch.Tensor | None = None,
-    a2_scale: torch.Tensor | None = None,
-    w1_bias: torch.Tensor | None = None,
-    w2_bias: torch.Tensor | None = None,
-    swiglu_limit: float = 10.0,
-    apply_router_weight_on_input: bool = False,
-    gate_valid: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """A4W4 MoE for SiLU models, GUGU -- same signature as the a8w4 twin.
-
-    Identical to ``triton_kernel_fused_experts_a8w4_silu_gugu`` except that the
-    activations are MXFP4 rather than MXFP8. The WEIGHTS are unchanged: both are
-    w4, so the same ``process_weights_after_loading`` output feeds either path
-    and no extra weight prep or memory is needed.
-
-    Costs one launch more than a8w4. ``moe_gemm_a4w4`` has no ``out_mx_quant``,
-    so the intermediate must be re-quantised by a separate ``mxfp4_quant``
-    instead of being folded into GEMM1's write-back:
-
-        mxfp4_quant -> GEMM1(a4w4, fused SiLU) -> mxfp4_quant -> GEMM2(a4w4)
-
-    versus a8w4's two launches. Measured on gfx950 that costs 1.22-1.28x overall
-    (see _test/ep_moe_bench_report.md): the a4w4 GEMMs are genuinely faster
-    (2771 vs 3154 us at conc256 prefill, the halved weight traffic paying off)
-    but the doubled quant is far more expensive than the GEMM saving. Kept behind
-    ATOM_USE_TRITON_MOE_EP_A4W4 so it is measurable on gfx1250, where the
-    trade-off may differ.
-
-    ``moe_gemm_a4w4`` has no ``preshuffled`` parameter, so unlike a8w4 there is no
-    gfx1250 pre-shuffled weight variant to select here.
-    """
-    gammas = routing_data.gate_scal if routing_data else None
-
-    x_fp4, x_scale = mxfp4_quant(hidden_states)
-    interm = moe_gemm_a4w4(
-        x_fp4,
-        w1,
-        x_scale,
-        w13_scale,
-        a13_scale,
-        None,
-        w1_bias,
-        routing_data,
-        gather_indx=gather_indx,
-        gammas=gammas if apply_router_weight_on_input else None,
-        swizzle_mx_scale=w13_swizzle_layout,
-        apply_swiglu=True,
-        alpha=1.0,
-        limit=swiglu_limit,
-        swiglu_add_residual=False,
-    )
-    # The launch a8w4 avoids via out_mx_quant=True.
-    interm_fp4, interm_scale = mxfp4_quant(interm)
-    return moe_gemm_a4w4(
-        interm_fp4,
-        w2,
-        interm_scale,
-        w2_scale,
-        a2_scale,
-        None,
-        w2_bias,
-        routing_data,
-        scatter_indx=scatter_indx,
-        gammas=None if apply_router_weight_on_input else gammas,
-        swizzle_mx_scale=w2_swizzle_layout,
-        # Only GEMM2 feeds reduce_grouped, so the mask belongs here. GEMM1's
-        # dead slots are already skipped by the sentinel histogram.
-        gate_valid=gate_valid,
-    )
