@@ -19,6 +19,300 @@ def is_minimax_m3_config(config: Any) -> bool:
     return any("MiniMaxM3" in str(arch) for arch in archs) or "minimax_m3" in model_type
 
 
+def _text_config(config: Any) -> Any:
+    return getattr(config, "text_config", config)
+
+
+def _m3_sparse_cfg(config: Any) -> dict:
+    return getattr(_text_config(config), "sparse_attention_config", None) or {}
+
+
+def _m3_sparse_layer_ids(config: Any) -> list[int]:
+    freq = _m3_sparse_cfg(config).get("sparse_attention_freq", []) or []
+    return [i for i, enabled in enumerate(freq) if enabled]
+
+
+def _m3_index_dim(config: Any) -> int:
+    index_dim = _m3_sparse_cfg(config).get("sparse_index_dim", None)
+    if index_dim is None:
+        raise RuntimeError(
+            "MiniMax-M3 sparse_attention_config.sparse_index_dim missing"
+        )
+    return int(index_dim)
+
+
+def _dtype_size(dtype: torch.dtype) -> int:
+    return torch.empty((), dtype=dtype).element_size()
+
+
+def _is_fp8_dtype(dtype: torch.dtype) -> bool:
+    return dtype in {
+        candidate
+        for candidate in (
+            getattr(torch, "float8_e4m3fn", None),
+            getattr(torch, "float8_e4m3fnuz", None),
+            getattr(torch, "float8_e5m2", None),
+        )
+        if candidate is not None
+    }
+
+
+def _resolve_m3_index_cache_dtype(fallback: torch.dtype) -> torch.dtype:
+    try:
+        from atom.config import get_current_atom_config
+
+        index_cache_dtype = getattr(
+            get_current_atom_config(), "index_cache_dtype", None
+        )
+    except Exception:
+        index_cache_dtype = None
+
+    if str(index_cache_dtype).startswith("fp8"):
+        from aiter import dtypes
+
+        return dtypes.d_dtypes["fp8"]
+    if index_cache_dtype == "bf16":
+        return torch.bfloat16
+    return fallback
+
+
+class ATOMMiniMaxM3SGLangKVPool:
+    """Add MiniMax-M3 index-K cache to an older SGLang MHA KV pool."""
+
+    is_atom_minimax_m3_pool = True
+
+    def __init__(
+        self,
+        main_pool,
+        hf_config: Any,
+        index_dtype: torch.dtype,
+        *,
+        use_fp8_scales: bool,
+    ) -> None:
+        self.main_pool = main_pool
+        self.size = int(main_pool.size)
+        self.page_size = int(main_pool.page_size)
+        self.dtype = main_pool.dtype
+        self.device = main_pool.device
+        self.layer_num = main_pool.layer_num
+        self.start_layer = main_pool.start_layer
+        self.end_layer = main_pool.end_layer
+        self.head_num = main_pool.head_num
+        self.head_dim = main_pool.head_dim
+        self.layer_transfer_counter = getattr(main_pool, "layer_transfer_counter", None)
+        self._local_layers = list(range(self.start_layer, self.end_layer))
+        self._layer_mapping = {
+            layer_id: idx for idx, layer_id in enumerate(self._local_layers)
+        }
+        self._sparse_layers = [
+            lid
+            for lid in _m3_sparse_layer_ids(hf_config)
+            if self.start_layer <= lid < self.end_layer
+        ]
+        self._sparse_layer_mapping = {
+            layer_id: idx for idx, layer_id in enumerate(self._sparse_layers)
+        }
+        index_dim = _m3_index_dim(hf_config)
+        # SGLang v0.5.15 may allocate the native MiniMax sparse index cache in
+        # the model dtype (for example, BF16) even when the main KV cache uses
+        # FP8. ATOM's FP8 sparse-cache kernels only accept FP8 values or their
+        # uint8 storage representation, so reuse the native cache only when its
+        # concrete tensor dtype is compatible; otherwise allocate an ATOM-owned
+        # index cache below with the requested dtype.
+        requested_index_is_fp8 = _is_fp8_dtype(index_dtype)
+
+        def index_dtype_is_compatible(buffer: torch.Tensor) -> bool:
+            return buffer.dtype == index_dtype or (
+                requested_index_is_fp8
+                and (buffer.dtype == torch.uint8 or _is_fp8_dtype(buffer.dtype))
+            )
+
+        self._reuse_main_index_cache = False
+        if hasattr(main_pool, "get_index_k_buffer"):
+            try:
+                self._reuse_main_index_cache = all(
+                    index_dtype_is_compatible(main_pool.get_index_k_buffer(layer_id))
+                    for layer_id in self._sparse_layers
+                )
+            except (AttributeError, RuntimeError, ValueError):
+                self._reuse_main_index_cache = False
+        self.index_k_buffer = (
+            []
+            if self._reuse_main_index_cache
+            else [
+                torch.empty(
+                    (self.size + self.page_size, 1, index_dim),
+                    dtype=index_dtype,
+                    device=self.device,
+                )
+                for _ in self._sparse_layers
+            ]
+        )
+        self.k_scale_buffer = []
+        self.v_scale_buffer = []
+        if use_fp8_scales:
+            num_blocks = (self.size + self.page_size) // self.page_size
+            self.k_scale_buffer = [
+                torch.zeros(
+                    (num_blocks, self.head_num, self.page_size),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                for _ in self._local_layers
+            ]
+            self.v_scale_buffer = [
+                torch.zeros(
+                    (num_blocks, self.head_num, self.page_size),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                for _ in self._local_layers
+            ]
+        self.mem_usage = (
+            float(getattr(main_pool, "mem_usage", 0.0))
+            + sum(t.nbytes for t in self.index_k_buffer) / (1 << 30)
+            + sum(t.nbytes for t in self.k_scale_buffer) / (1 << 30)
+            + sum(t.nbytes for t in self.v_scale_buffer) / (1 << 30)
+        )
+
+    def __getattr__(self, name: str):
+        return getattr(self.main_pool, name)
+
+    def get_key_buffer(self, layer_id: int):
+        return self.main_pool.get_key_buffer(layer_id)
+
+    def get_value_buffer(self, layer_id: int):
+        return self.main_pool.get_value_buffer(layer_id)
+
+    def get_kv_buffer(self, layer_id: int):
+        return self.main_pool.get_kv_buffer(layer_id)
+
+    def set_kv_buffer(self, *args, **kwargs) -> None:
+        return self.main_pool.set_kv_buffer(*args, **kwargs)
+
+    def get_kv_size_bytes(self):
+        k_bytes, v_bytes = self.main_pool.get_kv_size_bytes()
+        return (
+            k_bytes
+            + sum(t.nbytes for t in self.index_k_buffer)
+            + sum(t.nbytes for t in self.k_scale_buffer),
+            v_bytes + sum(t.nbytes for t in self.v_scale_buffer),
+        )
+
+    def get_index_k_buffer(self, layer_id: int) -> torch.Tensor:
+        if self._reuse_main_index_cache:
+            return self.main_pool.get_index_k_buffer(layer_id)
+        mapped = self._sparse_layer_mapping.get(int(layer_id))
+        if mapped is None:
+            raise ValueError(f"MiniMax-M3 layer {layer_id} has no index-K cache")
+        return self.index_k_buffer[mapped]
+
+    def get_kv_scale_buffer(
+        self, layer_id: int
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        mapped = self._layer_mapping.get(int(layer_id))
+        if mapped is None or not self.k_scale_buffer:
+            return None, None
+        return self.k_scale_buffer[mapped], self.v_scale_buffer[mapped]
+
+
+def install_minimax_m3_pool_patch() -> None:
+    """Patch older SGLang builds that lack MiniMaxSparseKVPool support."""
+
+    import sglang.srt.model_executor.model_runner_kv_cache_mixin as mixin
+
+    if getattr(mixin.ModelRunnerKVCacheMixin, "_atom_minimax_m3_pool_patched", False):
+        return
+
+    original_resolve = mixin.ModelRunnerKVCacheMixin._resolve_memory_pool_config
+    original_init_pools = mixin.ModelRunnerKVCacheMixin._init_pools
+
+    def _is_m3_runner(runner) -> bool:
+        return is_minimax_m3_config(getattr(runner.model_config, "hf_config", None))
+
+    def _local_kv_heads(runner) -> int:
+        try:
+            from sglang.srt.layers.dp_attention import get_attention_tp_size
+
+            return int(runner.model_config.get_num_kv_heads(get_attention_tp_size()))
+        except Exception:
+            hf_config = _text_config(runner.model_config.hf_config)
+            tp_size = max(1, int(getattr(runner, "tp_size", 1)))
+            return max(1, int(getattr(hf_config, "num_key_value_heads", 1)) // tp_size)
+
+    def _resolve_memory_pool_config(self, pre_model_load_memory: int):
+        config = original_resolve(self, pre_model_load_memory)
+        if not _is_m3_runner(self):
+            return config
+
+        hf_config = _text_config(self.model_config.hf_config)
+        kv_dtype = self.kv_cache_dtype
+        use_fp8_scales = _is_fp8_dtype(self.kv_cache_dtype) or str(
+            self.kv_cache_dtype
+        ).startswith("fp8")
+        index_dtype = _resolve_m3_index_cache_dtype(
+            getattr(self, "dtype", getattr(self, "torch_dtype", torch.bfloat16))
+        )
+        num_layers = int(
+            getattr(self, "num_effective_layers", hf_config.num_hidden_layers)
+        )
+        main_bytes = (
+            2
+            * num_layers
+            * _local_kv_heads(self)
+            * int(hf_config.head_dim)
+            * _dtype_size(kv_dtype)
+        )
+        index_bytes = (
+            len(_m3_sparse_layer_ids(self.model_config.hf_config))
+            * _m3_index_dim(self.model_config.hf_config)
+            * _dtype_size(index_dtype)
+        )
+        scale_bytes = 0
+        if use_fp8_scales:
+            scale_bytes = (
+                2 * num_layers * _local_kv_heads(self) * _dtype_size(torch.float32)
+            )
+        extra_bytes = index_bytes + scale_bytes
+        if main_bytes <= 0 or extra_bytes <= 0:
+            return config
+
+        old_tokens = int(config.max_total_num_tokens)
+        new_tokens = (old_tokens * main_bytes) // (main_bytes + extra_bytes)
+        page_size = int(self.server_args.page_size)
+        new_tokens = max(page_size, (new_tokens // page_size) * page_size)
+        if new_tokens < old_tokens:
+            config.max_total_num_tokens = new_tokens
+            config.max_running_requests = self._resolve_max_num_reqs(new_tokens)
+        return config
+
+    def _init_pools(self):
+        original_init_pools(self)
+        if not _is_m3_runner(self):
+            return
+        pool = getattr(self, "token_to_kv_pool", None)
+        if pool is None or hasattr(pool, "get_kv_scale_buffer"):
+            return
+        use_fp8_scales = _is_fp8_dtype(self.kv_cache_dtype) or str(
+            self.kv_cache_dtype
+        ).startswith("fp8")
+        index_dtype = _resolve_m3_index_cache_dtype(
+            getattr(self, "dtype", getattr(self, "torch_dtype", torch.bfloat16))
+        )
+        self.token_to_kv_pool = ATOMMiniMaxM3SGLangKVPool(
+            pool,
+            self.model_config.hf_config,
+            index_dtype,
+            use_fp8_scales=use_fp8_scales,
+        )
+
+    mixin.ModelRunnerKVCacheMixin._resolve_memory_pool_config = (
+        _resolve_memory_pool_config
+    )
+    mixin.ModelRunnerKVCacheMixin._init_pools = _init_pools
+    mixin.ModelRunnerKVCacheMixin._atom_minimax_m3_pool_patched = True
+
+
 def maybe_get_minimax_m3_pools_from_sglang_batch(forward_batch=None):
     from atom.plugin.sglang.runtime.attention_backend_resolver import (
         resolve_sglang_runtime,
