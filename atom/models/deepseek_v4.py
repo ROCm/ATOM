@@ -2226,11 +2226,10 @@ class Indexer(nn.Module):
         topk_rect = torch.full(
             (R + 1, self.index_topk), -1, dtype=torch.int32, device=device
         )
-        per_token_rect = attn_md.n_committed_csa_per_token_rect
         top_k_per_row_decode(
             logits,
             1,
-            per_token_rect[:R],
+            attn_md.n_committed_csa_per_token_rect[:R],
             topk_rect[:R],
             R,
             logits.stride(0),
