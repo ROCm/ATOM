@@ -321,11 +321,15 @@ def maybe_get_minimax_m3_pools_from_sglang_batch(forward_batch=None):
         try:
             from sglang.srt.model_executor.forward_context import (
                 get_attn_backend,
+                get_req_to_token_pool,
+                get_token_to_kv_pool,
                 has_forward_context,
             )
 
             backends = []
             if has_forward_context():
+                token_to_kv_pool = token_to_kv_pool or get_token_to_kv_pool()
+                req_to_token_pool = req_to_token_pool or get_req_to_token_pool()
                 active_backend = get_attn_backend()
                 backends.append(active_backend)
                 full_backend = getattr(active_backend, "full_attn_backend", None)
