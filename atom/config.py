@@ -1313,7 +1313,8 @@ class Config:
     # (snapped, with a warning, in BlockManager).
     #   >0  a rung every N tokens
     #    0  state checkpointing off entirely
-    #   -1  no interval rungs, but the demand rung still places checkpoints
+    #   -1  no interval rungs, but the demand rung and the prompt-end anchor
+    #       still place checkpoints
     # See BlockManager.checkpointers_at.
     state_checkpoint_interval_tokens: int = 8192
     scheduler_delay_factor: float = 0.0

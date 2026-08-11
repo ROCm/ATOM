@@ -1299,6 +1299,13 @@ class TestGatedHitFixpoint:
 
 INTERVAL = 4 * BLOCK
 PROMPT = list(range(44))  # 11 blocks; last never reused, so 10 are hittable
+# A prompt that diverges from `PROMPT` at token 28, mid-interval and nowhere
+# near either prompt's end. This is the traffic the demand is for now that the
+# prompt-end anchor exists: on a conversation that just grows, the position the
+# next turn resumes at *is* the previous turn's end, and the anchor reserves it
+# up front rather than one disappointed request late. What the anchor cannot
+# reserve is a branch point, because no prompt ever ended there.
+BRANCH = list(range(28)) + list(range(900, 916))
 
 
 def demand_config(**overrides):
@@ -1323,19 +1330,25 @@ class TestDemandDrivenCheckpoints:
     answers is reuse being declined only for want of a checkpoint. The request
     that finds the gap is the one that pays for it — it collects none of that
     reuse and has to compute the prefix anyway.
+
+    Scoped to branch points since the prompt-end anchor landed. A conversation
+    that only grows resumes at the previous turn's end, and the anchor reserves
+    that proactively — see `TestPromptEndAnchor`, which inherited the cases
+    these tests used to make. What no anchor can reserve is a position no prompt
+    ever ended at, and that is what these now use.
     """
 
     def test_the_gap_becomes_a_rung_off_the_grid(self):
         bm = BlockManager(demand_config())
         run_prompt_on_the_ladder(bm, stateful_seq(PROMPT))
 
-        second = stateful_seq(PROMPT)
-        assert bm.can_allocate(second) == 8  # the grid's last rung, 32 tokens
-        assert second.num_wanted_hit_blocks == 9  # what a checkpoint would give
-        assert second.checkpoint_demand_pos == 36
-        # Off the grid, and to the right of the last rung the grid offers: the
-        # demand carries its own fork room, so `limit` does not cap it.
-        assert 36 % INTERVAL
+        second = stateful_seq(BRANCH)
+        assert bm.can_allocate(second) == 0  # nothing resumable at the branch
+        assert second.num_wanted_hit_blocks == 7  # what a checkpoint would give
+        assert second.checkpoint_demand_pos == 28
+        # Off the grid: the demand carries its own fork room, so it sits where
+        # the request asked rather than where the interval would have put it.
+        assert 28 % INTERVAL
         assert bm.checkpoint_limit(second) == 32
 
     def test_the_third_request_finds_what_the_second_was_missing(self):
@@ -1343,16 +1356,18 @@ class TestDemandDrivenCheckpoints:
         bm = BlockManager(demand_config())
 
         first = stateful_seq(PROMPT)
-        assert run_prompt_on_the_ladder(bm, first) == [32]  # the grid alone
+        # 32 is the grid's last rung; 36 is `first`'s own end, anchored.
+        assert run_prompt_on_the_ladder(bm, first) == [32, 36]
         assert first.checkpoint_demand_pos == 0  # nothing was cached to fall short
 
-        second = stateful_seq(PROMPT)
+        second = stateful_seq(BRANCH)
         bm.allocate(second, bm.can_allocate(second))
-        assert second.num_cached_tokens == 32  # the grid got it this far...
-        assert second.checkpoint_demand_pos == 36  # ...one block short of the rest
-        assert forward_on_the_ladder(bm, second) == [36]  # one cut, for the gap
+        assert second.num_cached_tokens == 0  # the branch point is unreachable...
+        assert second.checkpoint_demand_pos == 28  # ...and this is where it is
+        # The demand at 28, then the grid rung and this prompt's own anchor.
+        assert forward_on_the_ladder(bm, second) == [28, 32, 36]
 
-        third = stateful_seq(PROMPT)
+        third = stateful_seq(BRANCH)
         bm.allocate(third, bm.can_allocate(third))
         assert third.num_cached_tokens == 36
         assert third.checkpoint_demand_pos == 0  # nothing left to want
@@ -1389,15 +1404,21 @@ class TestDemandDrivenCheckpoints:
         """
         bm = BlockManager(demand_config())
         short = list(range(16))
-        run_prompt_on_the_ladder(bm, stateful_seq(short))
+        short_branch = list(range(4)) + list(range(900, 912))
+        first = stateful_seq(short)
+        run_prompt_on_the_ladder(bm, first)
+        assert bm.checkpoint_limit(first) == 0  # the grid places no rung here
 
-        second = stateful_seq(short)
+        second = stateful_seq(short_branch)
         assert bm.can_allocate(second) == 0
-        assert bm.checkpoint_limit(second) == 0  # the grid places no rung here
-        assert second.checkpoint_demand_pos == 8  # the demand is its own rung
-        assert run_prompt_on_the_ladder(bm, second) == [8]
+        assert bm.checkpoint_limit(second) == 0
+        assert second.checkpoint_demand_pos == 4  # the demand is its own rung
+        # 4 is the demand, 8 is this prompt's own end anchored — and the anchor
+        # is reachable here only because it is the demand's neighbour, not its
+        # substitute: no prompt has ever ended at 4.
+        assert run_prompt_on_the_ladder(bm, second) == [4, 8]
 
-        third = stateful_seq(short)
+        third = stateful_seq(short_branch)
         assert bm.can_allocate(third) == 2  # ...and the next one collects it
         assert third.checkpoint_demand_pos == 0  # nothing left to want
         assert run_prompt_on_the_ladder(bm, third) == []
@@ -1406,14 +1427,19 @@ class TestDemandDrivenCheckpoints:
         """The cut and the keep read the same call, so they cannot drift."""
         bm = BlockManager(demand_config())
         run_prompt_on_the_ladder(bm, stateful_seq(PROMPT))
-        seq = stateful_seq(PROMPT)
+        seq = stateful_seq(BRANCH)
         bm.allocate(seq, bm.can_allocate(seq))
-        assert seq.checkpoint_demand_pos == 36
+        assert seq.checkpoint_demand_pos == 28
+        assert seq.checkpoint_end_pos == 36
 
-        n = len(PROMPT)
+        n = len(BRANCH)
         cuts = {bm.checkpoint_cut(seq, pos - 1, pos) for pos in range(1, n + 1)}
         rungs = {pos for pos in range(1, n + 1) if bm.checkpointers_at(seq, pos)}
-        assert cuts - {0} == rungs == {16, 32, 36}
+        # 16 and 32 from the grid, 28 the demand, 36 the anchor. Swept one
+        # token at a time, so every position is offered to both sides — which
+        # is what would catch `checkpoint_cut` picking a target `checkpointers_at`
+        # then refuses, the failure the two-candidate ladder made possible.
+        assert cuts - {0} == rungs == {16, 28, 32, 36}
 
     def test_a_recorded_demand_is_always_a_position_something_keeps(self):
         """Otherwise the cut is an extra forward that stores nothing.
@@ -1444,15 +1470,141 @@ class TestDemandDrivenCheckpoints:
         assert warm.checkpoint_demand_pos == 0
 
 
+class TestPromptEndAnchor:
+    """A rung reserved at this prompt's own end, before anyone asks for it.
+
+    The demand is reactive: it exists only once a hit has already been refused
+    for want of a checkpoint, which is one request too late for the position
+    that serves the next turn of a conversation. On agentic traffic that
+    position is where nearly all the reuse is — over the SemiAnalysis cc-traces
+    93.5% of resumes land on a previous prompt's end and 0.0% on the interval
+    ladder — so it is reserved up front instead of waited for.
+
+    These cases are the ones `TestDemandDrivenCheckpoints` used to make, before
+    the anchor started serving the growing-conversation traffic they replayed.
+    """
+
+    def test_the_second_request_resumes_where_the_first_ended(self):
+        """No disappointed request in between — this is the whole point."""
+        bm = BlockManager(demand_config())
+        first = stateful_seq(PROMPT)
+        run_prompt_on_the_ladder(bm, first)
+        assert first.checkpoint_end_pos == 36
+
+        second = stateful_seq(PROMPT)
+        # 9 blocks = 36 tokens, the anchor. The grid alone would have given 8,
+        # and the demand would have taken until the third request to find it.
+        assert bm.can_allocate(second) == 9
+        assert second.num_wanted_hit_blocks == 9  # nothing left on the table
+        assert second.checkpoint_demand_pos == 0  # so nothing to demand
+
+    def test_the_anchor_steps_back_to_a_position_that_is_keepable(self):
+        """The exact end is never keepable, so insisting on it anchors nothing.
+
+        A checkpoint at P binds the forward after it to carry `successor_room`
+        tokens, and a grid-floored prompt end leaves at most `hash_block_size`
+        minus one. Wherever the room reaches a block or more — MIN_FORK 8
+        against BLOCK 4 here, V4's 131 against 256 in production — the floored
+        end fails that test for *every* prompt: `checkpoint_cut` would shorten
+        a chunk and `checkpointers_at` would then refuse to keep anything, with
+        no error to show for it. Stepping back to the rightmost keepable grid
+        position costs at most one block of the next turn's reuse.
+        """
+        bm = BlockManager(demand_config())
+        for n in (12, 40, 44, 45, 50):
+            seq = stateful_seq(list(range(1000 * n, 1000 * n + n)))
+            bm.can_allocate(seq)
+            anchor = seq.checkpoint_end_pos
+            assert anchor % BLOCK == 0, n  # on the hash grid
+            assert n - anchor >= MIN_FORK, n  # and it leaves the fork its room
+            assert bm.checkpointers_at(seq, anchor), n  # so it is really kept
+
+    def test_a_prompt_with_no_room_for_an_anchor_gets_none(self):
+        bm = BlockManager(demand_config())
+        seq = stateful_seq(list(range(MIN_FORK)))
+        bm.can_allocate(seq)
+        assert seq.checkpoint_end_pos == 0
+
+    def test_the_cut_and_the_keep_agree_at_every_anchor(self):
+        """Swept, because a cut nothing keeps is a forward spent on nothing."""
+        for n in range(BLOCK, 80):
+            bm = BlockManager(demand_config())
+            tokens = list(range(1000 * n, 1000 * n + n))
+            for _ in range(3):
+                seq = stateful_seq(tokens)
+                bm.allocate(seq, bm.can_allocate(seq))
+                cuts = set(forward_on_the_ladder(bm, seq))
+                keeps = {p for p in range(1, n + 1) if bm.checkpointers_at(seq, p)}
+                assert not cuts - keeps, (n, sorted(cuts), sorted(keeps))
+
+    def test_the_anchor_does_not_displace_the_grid_rung(self):
+        """Both are cut for, because they serve different classes.
+
+        `checkpoint_cut` takes the *earliest* candidate for exactly this: with
+        the anchor at 36 and a rung at 32, returning the later one means the
+        forward never ends at 32 and the rung is not deferred but lost. A class
+        the anchor is out of reach for would then lose the rung it had been
+        resuming from, on every request, permanently.
+        """
+        bm = BlockManager(demand_config())
+        first = stateful_seq(PROMPT)
+        assert run_prompt_on_the_ladder(bm, first) == [32, 36]
+
+        bm.state_caches = (*bm.state_caches, StubStateCache(cap=8))
+        second = stateful_seq(PROMPT)
+        assert bm.can_allocate(second) == 8  # the rung, still there
+        assert second.num_wanted_hit_blocks == 8  # and no gap to demand
+        assert second.checkpoint_demand_pos == 0
+
+    def test_a_stateless_model_records_no_anchor(self):
+        bm = BlockManager(
+            demand_config(
+                pool_entries={}, state_transfer_kind="none", state_fork_tokens=0
+            )
+        )
+        cold = Sequence(PROMPT, BLOCK, has_per_req_cache=False)
+        bm.can_allocate(cold)
+        assert cold.checkpoint_end_pos == 0
+
+    def test_deallocate_clears_the_anchor(self):
+        """Sequences are recycled; a stale anchor would cut the next prompt."""
+        bm = BlockManager(demand_config())
+        seq = stateful_seq(PROMPT)
+        run_prompt_on_the_ladder(bm, seq)
+        assert seq.checkpoint_end_pos == 36
+        bm.deallocate(seq)
+        assert seq.checkpoint_end_pos == 0
+
+    def test_anchor_cuts_are_counted_apart_from_demand_cuts(self):
+        """The demand counter is a convergence signal and must stay readable.
+
+        The anchor fires on nearly every prompt while the demand is supposed to
+        fall silent once the gap it found is filled. Folding the two together
+        would leave `chunks_cut_for_demand` growing forever on healthy traffic,
+        which is precisely the shape it exists to expose.
+        """
+        bm = BlockManager(demand_config())
+        run_prompt_on_the_ladder(bm, stateful_seq(PROMPT))
+        assert bm.checkpoint_funnel()["chunks_cut_for_demand"] == 0
+        assert bm.checkpoint_funnel()["chunks_cut_for_end"] == 1
+
+        second = stateful_seq(BRANCH)
+        bm.allocate(second, bm.can_allocate(second))
+        forward_on_the_ladder(bm, second)
+        assert bm.checkpoint_funnel()["chunks_cut_for_demand"] == 1
+        assert bm.checkpoint_funnel()["chunks_cut_for_end"] == 2
+
+
 class TestLadderOffButCheckpointingOn:
-    """`-1`: no interval rungs, the demand rung still places checkpoints.
+    """`-1`: no interval rungs, demand and anchor still place checkpoints.
 
     Every rung costs the prompt that keeps it an extra prefill chunk, and the
-    interval is a guess about where reuse will resume. A demand is not a guess:
-    it is a position a request was actually refused at. On the SemiAnalysis
-    cc-traces the ladder placed ~30x the writes of the demand rung alone and
-    caught reuse the demand already reaches — 0.0% of resumes landed on an 8192
-    rung.
+    interval is a guess about where reuse will resume. The other two placements
+    are not guesses — one is a position a request was refused at, the other is
+    where the next turn of a conversation demonstrably starts. On the
+    SemiAnalysis cc-traces the ladder placed ~30x the writes of the two of them
+    together and caught reuse they already reach: 0.0% of resumes landed on an
+    8192 rung.
 
     Spelled `-1` rather than folded into `0` because `0` is the documented off
     switch *and* reachable by accident — `test_interval_snaps_onto_the_hash_-
@@ -1470,31 +1622,45 @@ class TestLadderOffButCheckpointingOn:
         seq = stateful_seq(PROMPT)
         bm.can_allocate(seq)
         assert bm.checkpoint_limit(seq) == 0
-        # 32 is a rung under the default interval and nothing under -1. Swept,
-        # because -1 divides every integer: a bare `pos % interval` test would
-        # admit *every* position as on-grid rather than none.
-        assert not any(bm.checkpointers_at(seq, p) for p in range(1, 45))
+        # 32 is a rung under the default interval, and nothing under -1. The
+        # anchor at 36 is the only aimed position left.
+        assert not bm.checkpointers_at(seq, 32)
+        assert bm.checkpointers_at(seq, 36)
+
+    def test_the_anchor_still_reaches_the_same_hit(self):
+        """The point of the mode: the ladder's reuse for one cut, not two."""
+        bm = BlockManager(demand_config(state_checkpoint_interval_tokens=-1))
+        first = stateful_seq(PROMPT)
+        assert run_prompt_on_the_ladder(bm, first) == [36]  # the ladder cut 32 too
+
+        second = stateful_seq(PROMPT)
+        assert bm.can_allocate(second) == 9  # what the full ladder also gave
+        assert second.checkpoint_demand_pos == 0
 
     def test_the_demand_still_fires(self):
         """This is what -1 buys over 0, and why it is not spelled 0."""
         bm = BlockManager(demand_config(state_checkpoint_interval_tokens=-1))
         run_prompt_on_the_ladder(bm, stateful_seq(PROMPT))
 
-        second = stateful_seq(PROMPT)
-        assert bm.can_allocate(second) == 0  # no rung was placed to resume from
-        assert second.checkpoint_demand_pos == 36
+        second = stateful_seq(BRANCH)
+        assert bm.can_allocate(second) == 0
+        assert second.checkpoint_demand_pos == 28
         bm.allocate(second, 0)
-        assert forward_on_the_ladder(bm, second) == [36]  # one cut, for the gap
+        assert forward_on_the_ladder(bm, second) == [28, 36]  # no rung at 32
 
-        third = stateful_seq(PROMPT)
-        assert bm.can_allocate(third) == 9  # collected
-        assert third.checkpoint_demand_pos == 0  # nothing left to want
+        third = stateful_seq(BRANCH)
+        # 9, not the demand's 7: by now `second` has left its own anchor at 36,
+        # which is further along than the branch point. The demand's rung is
+        # what got `second` past 28 to reach the end and place that anchor —
+        # under interval=0 the pair would still be stuck at 0.
+        assert bm.can_allocate(third) == 9
 
     def test_zero_would_have_left_that_reuse_on_the_floor(self):
         """The same three requests under 0, as the contrast -1 exists for."""
         bm = BlockManager(demand_config(state_checkpoint_interval_tokens=0))
+        run_prompt_on_the_ladder(bm, stateful_seq(PROMPT))
         for _ in range(3):
-            seq = stateful_seq(PROMPT)
+            seq = stateful_seq(BRANCH)
             assert bm.can_allocate(seq) == 0
             bm.allocate(seq, 0)
             assert forward_on_the_ladder(bm, seq) == []
@@ -1502,10 +1668,10 @@ class TestLadderOffButCheckpointingOn:
     def test_generation_keeps_no_checkpoints(self):
         """Decode spacing is measured in intervals, and there is no interval.
 
-        The demand is a prompt position, so an unaimed position past the prompt
-        has nothing to match. Stated as a test because the arithmetic that would
-        otherwise run — `pos - last < -1` — is true for every pos, which would
-        checkpoint on every decode step.
+        Both aimed placements are prompt positions, so an unaimed position past
+        the prompt has nothing to match. Stated as a test because the arithmetic
+        that would otherwise run — `pos - last < -1` — is true for every pos,
+        which would checkpoint on every decode step.
         """
         bm = BlockManager(demand_config(state_checkpoint_interval_tokens=-1))
         seq = stateful_seq(PROMPT)
@@ -1542,6 +1708,21 @@ class TestLadderOffButCheckpointingOn:
                 cuts = set(forward_on_the_ladder(bm, seq))
                 keeps = {p for p in range(1, n + 1) if bm.checkpointers_at(seq, p)}
                 assert not cuts - keeps, (n, sorted(cuts), sorted(keeps))
+
+    def test_interval_zero_anchors_nothing(self):
+        """0 is off for *all three* placements, not just the grid.
+
+        The anchor is recorded outside the grid, so it does not inherit the
+        grid's off switch — it has to check the interval itself. Without that
+        check `checkpoint_cut` shortens a chunk on every prompt and
+        `checkpointers_at` then refuses to keep anything, which is a per-request
+        cost with nothing stored and no error raised.
+        """
+        bm = BlockManager(demand_config(state_checkpoint_interval_tokens=0))
+        seq = stateful_seq(PROMPT)
+        bm.can_allocate(seq)
+        assert seq.checkpoint_end_pos == 0
+        assert run_prompt_on_the_ladder(bm, stateful_seq(PROMPT)) == []
 
 
 class TestCacheStatsAttribution:
