@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 from contextlib import contextmanager
@@ -571,6 +572,11 @@ def _patch_sglang_eagle3_state_lifecycle() -> None:
     state_attr = "_atom_sglang_eagle3_num_reject_tokens"
     original_filter_batch = EagleDraftInput.filter_batch
     original_merge_batch = EagleDraftInput.merge_batch
+    try:
+        filter_signature = inspect.signature(original_filter_batch)
+        filter_has_legacy_flag = "has_been_filtered" in filter_signature.parameters
+    except (TypeError, ValueError):
+        filter_has_legacy_flag = False
     uses_pool_indexed_future_map = all(
         hasattr(FutureMap, name) for name in ("stash", "_resolve_spec_extras")
     )
@@ -626,7 +632,9 @@ def _patch_sglang_eagle3_state_lifecycle() -> None:
         # intentionally resolved lazily by ``FutureMap.resolve_future``.
         # Reading/indexing our plugin-only state here would introduce the same
         # cross-stream race that SGLang's native early-return avoids.
-        has_been_filtered = bool(kwargs.get("has_been_filtered", True))
+        has_been_filtered = bool(
+            kwargs.get("has_been_filtered", filter_has_legacy_flag)
+        )
         if args and isinstance(args[0], bool):
             has_been_filtered = args[0]
         state_is_deferred = getattr(self, "future_indices", None) is not None
