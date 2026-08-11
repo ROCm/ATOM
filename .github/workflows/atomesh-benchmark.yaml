@@ -410,8 +410,12 @@ jobs:
             IFS=',' read -r -a node_list <<< "${nodes}"
             node_count="${#node_list[@]}"
           else
-            # Allow Slurm to select one node when a cluster has no static node list.
-            node_count=1
+            # Cross-node GDR validation requires Slurm to allocate two nodes.
+            node_count=2
+          fi
+          if [[ "${node_count}" -lt 2 ]]; then
+            echo "::error::GPUDirect RDMA smoke testing requires at least two Slurm nodes."
+            exit 1
           fi
 
           current_user="$(id -un 2>/dev/null || id -u)"
@@ -419,6 +423,8 @@ jobs:
           log_root="${log_root//\$USER/${current_user}}"
           run_dir="${log_root%/}/rdma-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           mkdir -p "${run_dir}"
+          export RDMA_SMOKE_RUN_DIR="${run_dir}"
+          export RDMA_SMOKE_NODE_COUNT="${node_count}"
 
           rank_script="${run_dir}/run-rdma-smoke-rank.sh"
           cat > "${rank_script}" <<'RANK_SCRIPT'
@@ -437,10 +443,18 @@ jobs:
           docker_args=(
             run --rm --name "${container}"
             --network host --ipc host
+            --privileged
+            --device=/dev/kfd
+            --device=/dev/dri
             --device=/dev/infiniband
+            --group-add=video
             --cap-add=IPC_LOCK
             --ulimit memlock=-1:-1
             -e MC_GID_INDEX=1
+            -e SMOKE_RANK="${rank}"
+            -e SMOKE_NODE_COUNT="${RDMA_SMOKE_NODE_COUNT}"
+            -e SMOKE_RUN_DIR=/rdma-smoke-shared
+            -v "${RDMA_SMOKE_RUN_DIR}:/rdma-smoke-shared"
           )
           host_ionic="$(readlink -f /usr/lib/x86_64-linux-gnu/libionic.so.1 2>/dev/null || true)"
           [[ -z "${host_ionic}" ]] || docker_args+=(
@@ -468,26 +482,56 @@ jobs:
             echo "ERROR: no RDMA devices found under /sys/class/infiniband" >&2
             exit 1
           fi
-          target_device="${rdma_devices[0]}"
-          initiator_device="${rdma_devices[1]:-${rdma_devices[0]}}"
           echo "RDMA devices: ${rdma_devices[*]}"
-          echo "Target device: ${target_device}; initiator device: ${initiator_device}"
           ibv_devinfo
+          rocm-smi --showproductname || true
+
+          gpu_count="$(python3 - <<'PY'
+          import torch
+          print(torch.cuda.device_count())
+          PY
+          )"
+          if ! [[ "${gpu_count}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "ERROR: no ROCm GPUs are visible for GPUDirect RDMA testing" >&2
+            exit 1
+          fi
+          echo "Visible ROCm GPUs: ${gpu_count}"
 
           build_dir="/tmp/mooncake-rdma-smoke-build"
           rm -rf "${build_dir}"
           cmake -S /app/mooncake -B "${build_dir}" \
-            -DUSE_HIP=OFF \
+            -DUSE_HIP=ON \
             -DUSE_ETCD=ON \
             -DBUILD_UNIT_TESTS=ON
           cmake --build "${build_dir}" \
-            --target rdma_transport_test \
+            --target transfer_engine_validator \
             --parallel "$(nproc)"
-          test_bin="${build_dir}/mooncake-transfer-engine/tests/rdma_transport_test"
-          if [[ ! -x "${test_bin}" ]]; then
-            echo "ERROR: rdma_transport_test was not built at ${test_bin}" >&2
+          validator_bin="${build_dir}/mooncake-transfer-engine/example/transfer_engine_validator"
+          if [[ ! -x "${validator_bin}" ]]; then
+            echo "ERROR: transfer_engine_validator was not built at ${validator_bin}" >&2
             exit 1
           fi
+
+          rdma_device_csv="$(IFS=,; echo "${rdma_devices[*]}")"
+          export RDMA_DEVICE_CSV="${rdma_device_csv}"
+          export GPU_COUNT="${gpu_count}"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          devices = os.environ["RDMA_DEVICE_CSV"].split(",")
+          gpu_count = int(os.environ["GPU_COUNT"])
+          matrix = {}
+          for gpu_id in range(gpu_count):
+              matrix[f"cuda:{gpu_id}"] = [devices, []]
+          Path("/tmp/rdma-smoke-nic-priority.json").write_text(
+              json.dumps(matrix),
+              encoding="utf-8",
+          )
+          PY
+          echo "NIC priority matrix:"
+          cat /tmp/rdma-smoke-nic-priority.json
 
           etcd --listen-client-urls http://0.0.0.0:2379 \
             --advertise-client-urls http://127.0.0.1:2379 \
@@ -504,35 +548,222 @@ jobs:
           sleep 3
           kill -0 "${etcd_pid}"
 
-          "${test_bin}" \
-            --mode=target \
-            --metadata_server=127.0.0.1:2379 \
-            --local_server_name=127.0.0.2:14345 \
-            --device_name="${target_device}" \
-            >/tmp/rdma-smoke-target.log 2>&1 &
-          target_pid=$!
-          sleep 5
-          if ! kill -0 "${target_pid}" 2>/dev/null; then
-            cat /tmp/rdma-smoke-target.log
-            echo "ERROR: Mooncake RDMA target exited before the transfer test" >&2
+          for ((gpu_id = 0; gpu_id < gpu_count; gpu_id++)); do
+            target_port=$((14400 + gpu_id * 2))
+            initiator_port=$((target_port + 1))
+            target_name="127.0.0.2:${target_port}"
+            target_log="/tmp/gdr-smoke-target-gpu-${gpu_id}.log"
+            initiator_log="/tmp/gdr-smoke-initiator-gpu-${gpu_id}.log"
+
+            echo "=== GPUDirect RDMA smoke test: GPU ${gpu_id} ==="
+            HIP_VISIBLE_DEVICES="${gpu_id}" \
+            ROCR_VISIBLE_DEVICES="${gpu_id}" \
+            "${validator_bin}" \
+              --mode=target \
+              --protocol=rdma \
+              --metadata_server=127.0.0.1:2379 \
+              --local_server_name="${target_name}" \
+              --device_name="${rdma_device_csv}" \
+              --nic_priority_matrix=/tmp/rdma-smoke-nic-priority.json \
+              --use_vram=true \
+              --gpu_id=0 \
+              --buffer_size=67108864 \
+              >"${target_log}" 2>&1 &
+            target_pid=$!
+            sleep 3
+            if ! kill -0 "${target_pid}" 2>/dev/null; then
+              cat "${target_log}"
+              echo "ERROR: GDR target failed to register GPU ${gpu_id} VRAM" >&2
+              exit 1
+            fi
+
+            HIP_VISIBLE_DEVICES="${gpu_id}" \
+            ROCR_VISIBLE_DEVICES="${gpu_id}" \
+            timeout 120 "${validator_bin}" \
+              --mode=initiator \
+              --protocol=rdma \
+              --metadata_server=127.0.0.1:2379 \
+              --local_server_name="127.0.0.3:${initiator_port}" \
+              --segment_id="${target_name}" \
+              --device_name="${rdma_device_csv}" \
+              --nic_priority_matrix=/tmp/rdma-smoke-nic-priority.json \
+              --use_vram=true \
+              --gpu_id=0 \
+              --buffer_size=67108864 \
+              --batch_size=4 \
+              --block_size=1048576 \
+              --threads=1 \
+              --duration=2 \
+              2>&1 | tee "${initiator_log}"
+
+            if ! grep -q "Data validation passed" "${initiator_log}"; then
+              cat "${target_log}"
+              echo "ERROR: GPUDirect RDMA data validation failed on GPU ${gpu_id}" >&2
+              exit 1
+            fi
+            kill "${target_pid}" 2>/dev/null || true
+            wait "${target_pid}" 2>/dev/null || true
+            target_pid=""
+            echo "GPUDirect RDMA passed on GPU ${gpu_id}"
+          done
+          echo "Node-local GPUDirect RDMA passed on all ${gpu_count} GPUs"
+
+          touch "${SMOKE_RUN_DIR}/local-gdr-done-${SMOKE_RANK}"
+          if [[ "${SMOKE_RANK}" -le 1 ]]; then
+            deadline=$((SECONDS + 300))
+            while true; do
+              completed_nodes=0
+              for marker in "${SMOKE_RUN_DIR}"/local-gdr-done-*; do
+                [[ -e "${marker}" ]] && completed_nodes=$((completed_nodes + 1))
+              done
+              [[ "${completed_nodes}" -ge "${SMOKE_NODE_COUNT}" ]] && break
+              if [[ "${SECONDS}" -ge "${deadline}" ]]; then
+                echo "ERROR: timed out waiting for node-local GDR tests" >&2
+                exit 1
+              fi
+              sleep 2
+            done
+          fi
+
+          wait_for_file() {
+            local path="$1"
+            local timeout_seconds="$2"
+            local description="$3"
+            local deadline=$((SECONDS + timeout_seconds))
+            while [[ ! -s "${path}" ]]; do
+              if [[ "${SECONDS}" -ge "${deadline}" ]]; then
+                echo "ERROR: timed out waiting for ${description}: ${path}" >&2
+                exit 1
+              fi
+              sleep 1
+            done
+          }
+
+          local_ip="$(ip route get 1.1.1.1 2>/dev/null | awk '
+            {
+              for (i = 1; i <= NF; i++) {
+                if ($i == "src" && i < NF) {
+                  print $(i + 1)
+                  exit
+                }
+              }
+            }
+          ')"
+          local_ip="${local_ip:-$(hostname -I | awk '{print $1}')}"
+          if [[ -z "${local_ip}" ]]; then
+            echo "ERROR: unable to determine node IP for cross-node GDR testing" >&2
             exit 1
           fi
 
-          timeout 120 "${test_bin}" \
-            --metadata_server=127.0.0.1:2379 \
-            --segment_id=127.0.0.2:14345 \
-            --local_server_name=127.0.0.3:14346 \
-            --device_name="${initiator_device}" \
-            2>&1 | tee /tmp/rdma-smoke-initiator.log
-
-          # rdma_transport_test reports transfer failures in its output without
-          # returning non-zero, so require its end-to-end data comparison.
-          if ! grep -q "Compare: OK" /tmp/rdma-smoke-initiator.log; then
-            cat /tmp/rdma-smoke-target.log
-            echo "ERROR: Mooncake RDMA WRITE/READ data comparison failed" >&2
-            exit 1
+          peer_info="${SMOKE_RUN_DIR}/cross-node-peer-info"
+          if [[ "${SMOKE_RANK}" -eq 0 ]]; then
+            {
+              echo "${local_ip}"
+              echo "${gpu_count}"
+            } > "${peer_info}.tmp"
+            mv "${peer_info}.tmp" "${peer_info}"
+          elif [[ "${SMOKE_RANK}" -eq 1 ]]; then
+            wait_for_file "${peer_info}" 60 "rank 0 peer information"
+            mapfile -t peer_data < "${peer_info}"
+            target_node_ip="${peer_data[0]:-}"
+            target_gpu_count="${peer_data[1]:-0}"
+            if [[ -z "${target_node_ip}" || "${target_gpu_count}" -ne "${gpu_count}" ]]; then
+              echo "ERROR: cross-node GPU topology mismatch: target=${target_gpu_count}, initiator=${gpu_count}" >&2
+              exit 1
+            fi
           fi
-          echo "Mooncake RDMA smoke test passed"
+
+          if [[ "${SMOKE_RANK}" -eq 0 || "${SMOKE_RANK}" -eq 1 ]]; then
+            for ((gpu_id = 0; gpu_id < gpu_count; gpu_id++)); do
+              target_port=$((16400 + gpu_id * 2))
+              initiator_port=$((target_port + 1))
+              ready_file="${SMOKE_RUN_DIR}/cross-node-ready-gpu-${gpu_id}"
+              result_file="${SMOKE_RUN_DIR}/cross-node-result-gpu-${gpu_id}"
+
+              if [[ "${SMOKE_RANK}" -eq 0 ]]; then
+                target_name="${local_ip}:${target_port}"
+                target_log="/tmp/cross-node-gdr-target-gpu-${gpu_id}.log"
+                echo "=== Cross-node GDR target: ${target_name}, GPU ${gpu_id} ==="
+                HIP_VISIBLE_DEVICES="${gpu_id}" \
+                ROCR_VISIBLE_DEVICES="${gpu_id}" \
+                "${validator_bin}" \
+                  --mode=target \
+                  --protocol=rdma \
+                  --metadata_server="${local_ip}:2379" \
+                  --local_server_name="${target_name}" \
+                  --device_name="${rdma_device_csv}" \
+                  --nic_priority_matrix=/tmp/rdma-smoke-nic-priority.json \
+                  --use_vram=true \
+                  --gpu_id=0 \
+                  --buffer_size=67108864 \
+                  >"${target_log}" 2>&1 &
+                target_pid=$!
+                sleep 3
+                if ! kill -0 "${target_pid}" 2>/dev/null; then
+                  cat "${target_log}"
+                  echo "ERROR: cross-node GDR target failed on GPU ${gpu_id}" >&2
+                  exit 1
+                fi
+                echo "${target_name}" > "${ready_file}.tmp"
+                mv "${ready_file}.tmp" "${ready_file}"
+
+                wait_for_file "${result_file}" 150 "cross-node GPU ${gpu_id} result"
+                result="$(<"${result_file}")"
+                kill "${target_pid}" 2>/dev/null || true
+                wait "${target_pid}" 2>/dev/null || true
+                target_pid=""
+                if [[ "${result}" != "0" ]]; then
+                  cat "${target_log}"
+                  echo "ERROR: cross-node GPUDirect RDMA failed on GPU ${gpu_id}" >&2
+                  exit 1
+                fi
+                echo "Cross-node GPUDirect RDMA passed on target GPU ${gpu_id}"
+              else
+                wait_for_file "${ready_file}" 60 "cross-node GPU ${gpu_id} target"
+                target_name="$(<"${ready_file}")"
+                initiator_log="/tmp/cross-node-gdr-initiator-gpu-${gpu_id}.log"
+                echo "=== Cross-node GDR initiator: ${local_ip} -> ${target_name}, GPU ${gpu_id} ==="
+                set +e
+                HIP_VISIBLE_DEVICES="${gpu_id}" \
+                ROCR_VISIBLE_DEVICES="${gpu_id}" \
+                timeout 120 "${validator_bin}" \
+                  --mode=initiator \
+                  --protocol=rdma \
+                  --metadata_server="${target_node_ip}:2379" \
+                  --local_server_name="${local_ip}:${initiator_port}" \
+                  --segment_id="${target_name}" \
+                  --device_name="${rdma_device_csv}" \
+                  --nic_priority_matrix=/tmp/rdma-smoke-nic-priority.json \
+                  --use_vram=true \
+                  --gpu_id=0 \
+                  --buffer_size=67108864 \
+                  --batch_size=4 \
+                  --block_size=1048576 \
+                  --threads=1 \
+                  --duration=2 \
+                  2>&1 | tee "${initiator_log}"
+                transfer_rc="${PIPESTATUS[0]}"
+                set -e
+                if [[ "${transfer_rc}" -eq 0 ]] &&
+                   grep -q "Data validation passed" "${initiator_log}"; then
+                  result=0
+                else
+                  result=1
+                fi
+                echo "${result}" > "${result_file}.tmp"
+                mv "${result_file}.tmp" "${result_file}"
+                if [[ "${result}" -ne 0 ]]; then
+                  echo "ERROR: cross-node GPUDirect RDMA data validation failed on GPU ${gpu_id}" >&2
+                  exit 1
+                fi
+                echo "Cross-node GPUDirect RDMA passed on initiator GPU ${gpu_id}"
+              fi
+            done
+          fi
+
+          if [[ "${SMOKE_RANK}" -eq 0 ]]; then
+            echo "Mooncake cross-node GPUDirect RDMA passed between Slurm ranks 0 and 1 on all ${gpu_count} GPUs"
+          fi
           CONTAINER_SCRIPT
           RANK_SCRIPT
           chmod +x "${rank_script}"
