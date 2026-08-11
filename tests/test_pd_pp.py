@@ -166,6 +166,42 @@ def test_producer_advertises_remote_pp_size():
 
 
 # ---------------------------------------------------------------------------
+# Mooncake transport selection
+# ---------------------------------------------------------------------------
+
+
+def test_mooncake_tcp_disables_rdma_device_even_when_configured():
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    assert mc._select_ib_device("tcp", "rdma0", None) == ""
+    assert mc._select_ib_device(" TCP ", "ionic_0", None) == ""
+
+
+def test_mooncake_rdma_preserves_explicit_device():
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    assert mc._select_ib_device("rdma", "ionic_3", None) == "ionic_3"
+
+
+def test_mooncake_rdma_auto_selects_from_physical_gpu(monkeypatch):
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    monkeypatch.setattr(mc, "_auto_select_ib_device", lambda idx: f"auto{idx}")
+    assert mc._select_ib_device("rdma", "", 5) == "auto5"
+
+
+def test_mooncake_rdma_requires_gpu_index_without_explicit_device():
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    with pytest.raises(ValueError, match="physical GPU index"):
+        mc._select_ib_device("rdma", "", None)
+
+
+# ---------------------------------------------------------------------------
 # Producer per-layer region mapping (consumer_region_indices)
 # ---------------------------------------------------------------------------
 

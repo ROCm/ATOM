@@ -4,7 +4,7 @@
 """
 Worker-side and scheduler-side KV cache connectors for disaggregated P/D.
 
-Uses Mooncake TransferEngine for RDMA-based push (WRITE) transfers of
+Uses Mooncake TransferEngine for TCP- or RDMA-based push (WRITE) transfers of
 KV cache data from producer (prefill) to consumer (decode) nodes.
 """
 
@@ -110,6 +110,26 @@ def _auto_select_ib_device(phys_idx: int) -> str:
     if _ib_device_exists(ionic_device):
         return ionic_device
     return rdma_device
+
+
+def _select_ib_device(
+    protocol: str, configured_device: str, phys_idx: int | None
+) -> str:
+    """Resolve the Mooncake device filter without enabling RDMA for TCP.
+
+    Mooncake's TCP transport requires an empty device list. Passing a usable
+    HCA alongside ``protocol=tcp`` allows the transfer engine to activate RDMA
+    as an alternate path, which violates the caller's explicit transport
+    choice. RDMA-family transports retain the existing configured/automatic
+    device selection.
+    """
+    if protocol.strip().lower() == "tcp":
+        return ""
+    if configured_device:
+        return configured_device
+    if phys_idx is None:
+        raise ValueError("physical GPU index is required for RDMA device selection")
+    return _auto_select_ib_device(phys_idx)
 
 
 # ZMQ side-channel message types
@@ -461,19 +481,22 @@ class MooncakeConnector(KVConnectorBase):
         if not _MOONCAKE_AVAILABLE:
             raise RuntimeError(
                 "Mooncake is not installed but kv_connector='mooncake' was requested. "
-                "Install the mooncake package to use push-mode RDMA transfers."
+                "Install the mooncake package to use push-mode transfers."
             )
 
-        # Determine which RDMA device this TP rank should use.
+        # Determine which RDMA device this TP rank should use. TCP is
+        # intentionally initialized with an empty device filter so Mooncake
+        # cannot activate an available HCA as an alternate path.
         # AMD GPU nodes pair GPU N with NIC N, but the HCA name is cluster
         # dependent: Spur MI350 exposes ionic_N while older setups used rdmaN.
         # Registering GPU memory with a non-local RDMA NIC fails with
         # EINVAL.  Pass the device name as a filter so Mooncake only
         # creates a context for the local NIC.
-        ib_device = kv_transfer_config.get("ib_device", "")
-        if not ib_device:
-            ib_device = os.environ.get("ATOM_MOONCAKE_IB_DEVICE", "")
-        if not ib_device:
+        configured_ib_device = kv_transfer_config.get(
+            "ib_device", ""
+        ) or os.environ.get("ATOM_MOONCAKE_IB_DEVICE", "")
+        phys_idx: int | None = None
+        if self.protocol.strip().lower() != "tcp" and not configured_ib_device:
             visible_idx = torch.cuda.current_device()
             visible_env = os.environ.get("HIP_VISIBLE_DEVICES") or os.environ.get(
                 "CUDA_VISIBLE_DEVICES"
@@ -483,7 +506,10 @@ class MooncakeConnector(KVConnectorBase):
                 phys_idx = int(visible_list[visible_idx])
             else:
                 phys_idx = visible_idx
-            ib_device = _auto_select_ib_device(phys_idx)
+        ib_device = _select_ib_device(self.protocol, configured_ib_device, phys_idx)
+        if self.protocol.strip().lower() == "tcp":
+            logger.info("Mooncake TCP selected; RDMA device selection is disabled")
+        elif not configured_ib_device:
             logger.info(
                 "Auto-selecting RDMA device %s for physical GPU %d "
                 "(visible_idx=%d, tp_rank=%d)",
@@ -493,7 +519,11 @@ class MooncakeConnector(KVConnectorBase):
                 self.tp_rank,
             )
 
-        rdma_local_ip = _ip_for_ib_device(ib_device, default_local_ip)
+        rdma_local_ip = (
+            _ip_for_ib_device(ib_device, default_local_ip)
+            if ib_device
+            else default_local_ip
+        )
         if rdma_local_ip != default_local_ip:
             logger.info(
                 "Using RDMA-local IP %s for ib_device=%s instead of default IP %s",
