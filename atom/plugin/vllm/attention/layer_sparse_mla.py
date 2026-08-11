@@ -490,27 +490,16 @@ def sparse_attn_indexer_plugin_mode(
         num_rows = logits.shape[0]
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
         topk_indices_decode = topk_indices[:num_decode_tokens, :topk_tokens]
-        if stable_topk:
-            top_k_per_row_decode(
-                logits,
-                next_n,
-                decode_metadata.seq_lens,
-                topk_indices_decode,
-                num_rows,
-                logits.stride(0),
-                logits.stride(1),
-                stable=True,
-            )
-        else:
-            top_k_per_row_decode(
-                logits,
-                next_n,
-                decode_metadata.seq_lens,
-                topk_indices_decode,
-                num_rows,
-                logits.stride(0),
-                logits.stride(1),
-            )
+        top_k_per_row_decode(
+            logits,
+            next_n,
+            decode_metadata.seq_lens,
+            topk_indices_decode,
+            num_rows,
+            logits.stride(0),
+            logits.stride(1),
+            stable=stable_topk,
+        )
 
         if decode_metadata.requires_padding:
             # if padded, we need to unpack

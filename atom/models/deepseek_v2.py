@@ -1535,29 +1535,17 @@ def sparse_attn_indexer(
                 cu_starts=row_starts,
                 cu_ends=row_ends,
             )
-            if stable_topk:
-                top_k_per_row_prefill(
-                    logits=logits,
-                    rowStarts=row_starts,
-                    rowEnds=row_ends,
-                    indices=topk_indices_prefill[chunk_start:chunk_end],
-                    values=None,
-                    numRows=chunk_end - chunk_start,
-                    stride0=logits.stride(0),
-                    stride1=logits.stride(1),
-                    stable=True,
-                )
-            else:
-                top_k_per_row_prefill(
-                    logits=logits,
-                    rowStarts=row_starts,
-                    rowEnds=row_ends,
-                    indices=topk_indices_prefill[chunk_start:chunk_end],
-                    values=None,
-                    numRows=chunk_end - chunk_start,
-                    stride0=logits.stride(0),
-                    stride1=logits.stride(1),
-                )
+            top_k_per_row_prefill(
+                logits=logits,
+                rowStarts=row_starts,
+                rowEnds=row_ends,
+                indices=topk_indices_prefill[chunk_start:chunk_end],
+                values=None,
+                numRows=chunk_end - chunk_start,
+                stride0=logits.stride(0),
+                stride1=logits.stride(1),
+                stable=stable_topk,
+            )
         triton_convert_req_index_to_global_index_dsa_prefill(
             attn_metadata.sparse_cu_seqlens_q,
             attn_metadata.sparse_kv_indptr,
@@ -1600,27 +1588,16 @@ def sparse_attn_indexer(
         num_rows = logits.shape[0]
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
         topk_indices_decode = topk_indices[:num_decode_tokens, :topk_tokens]
-        if stable_topk:
-            top_k_per_row_decode(
-                logits,
-                next_n,
-                decode_metadata.context_lens,
-                topk_indices_decode,
-                num_rows,
-                logits.stride(0),
-                logits.stride(1),
-                stable=True,
-            )
-        else:
-            top_k_per_row_decode(
-                logits,
-                next_n,
-                decode_metadata.context_lens,
-                topk_indices_decode,
-                num_rows,
-                logits.stride(0),
-                logits.stride(1),
-            )
+        top_k_per_row_decode(
+            logits,
+            next_n,
+            decode_metadata.context_lens,
+            topk_indices_decode,
+            num_rows,
+            logits.stride(0),
+            logits.stride(1),
+            stable=stable_topk,
+        )
         if attn_metadata.max_seqlen_q > 1:
             triton_gather_kv_indices_sparse(
                 attn_metadata.sparse_kv_indptr,
