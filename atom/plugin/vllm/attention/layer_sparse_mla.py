@@ -24,7 +24,6 @@ from aiter import (
     indexer_k_quant_and_cache,
     indexer_qk_rope_quant_and_cache,
     top_k_per_row_decode,
-    top_k_per_row_prefill,
 )
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
@@ -419,31 +418,19 @@ def sparse_attn_indexer_plugin_mode(
                 )
                 num_rows = logits.shape[0]
                 topk_indices_prefill = topk_indices[q_start:q_end, :topk_tokens]
-                if stable_topk:
-                    top_k_per_row_prefill(
-                        logits,
-                        row_ks,
-                        row_ke,
-                        topk_indices_prefill,
-                        None,
-                        num_rows,
-                        logits.stride(0),
-                        logits.stride(1),
-                        k=topk_tokens,
-                        stable=True,
-                    )
-                else:
-                    # Preserve vLLM's existing operator on the non-stable path.
-                    torch.ops._C.top_k_per_row_prefill(
-                        logits,
-                        row_ks,
-                        row_ke,
-                        topk_indices_prefill,
-                        num_rows,
-                        logits.stride(0),
-                        logits.stride(1),
-                        topk_tokens,
-                    )
+                # Use top_k_per_row_prefill from vLLM to correctly handle row
+                # starts and ends. It also produces 0-based local indices,
+                # eliminating the need for conversion from global.
+                torch.ops._C.top_k_per_row_prefill(
+                    logits,
+                    row_ks,
+                    row_ke,
+                    topk_indices_prefill,
+                    num_rows,
+                    logits.stride(0),
+                    logits.stride(1),
+                    topk_tokens,
+                )
 
     if has_decode:
         decode_metadata = indexer_meta.decode
