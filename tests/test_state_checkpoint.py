@@ -1581,6 +1581,106 @@ class TestDemandDrivenCheckpoints:
         assert warm.checkpoint_demand_pos == 0
 
 
+class TestLadderOffButCheckpointingOn:
+    """`-1`: no interval rungs, the demand rung still places checkpoints.
+
+    Every rung costs the prompt that keeps it an extra prefill chunk, and the
+    interval is a guess about where reuse will resume. A demand is not a guess:
+    it is a position a request was actually refused at. On the SemiAnalysis
+    cc-traces the ladder placed ~30x the writes of the demand rung alone and
+    caught reuse the demand already reaches — 0.0% of resumes landed on an 8192
+    rung.
+
+    Spelled `-1` rather than folded into `0` because `0` is the documented off
+    switch *and* reachable by accident — `test_interval_snaps_onto_the_hash_-
+    block_grid` shows an off-grid interval snapping down to it. Giving `0` a
+    second meaning would turn a `--block-size` typo from failing safe into
+    silently enabling a policy.
+    """
+
+    def test_minus_one_survives_the_grid_snap(self):
+        bm = BlockManager(ckpt_config(state_checkpoint_interval_tokens=-1))
+        assert bm.state_checkpoint_interval_tokens == -1
+
+    def test_the_grid_places_no_rung(self):
+        bm = BlockManager(demand_config(state_checkpoint_interval_tokens=-1))
+        seq = stateful_seq(PROMPT)
+        bm.can_allocate(seq)
+        assert bm.checkpoint_limit(seq) == 0
+        # 32 is a rung under the default interval and nothing under -1. Swept,
+        # because -1 divides every integer: a bare `pos % interval` test would
+        # admit *every* position as on-grid rather than none.
+        assert not any(bm.checkpointers_at(seq, p) for p in range(1, 45))
+
+    def test_the_demand_still_fires(self):
+        """This is what -1 buys over 0, and why it is not spelled 0."""
+        bm = BlockManager(demand_config(state_checkpoint_interval_tokens=-1))
+        run_prompt_on_the_ladder(bm, stateful_seq(PROMPT))
+
+        second = stateful_seq(PROMPT)
+        assert bm.can_allocate(second) == 0  # no rung was placed to resume from
+        assert second.checkpoint_demand_pos == 36
+        bm.allocate(second, 0)
+        assert forward_on_the_ladder(bm, second) == [36]  # one cut, for the gap
+
+        third = stateful_seq(PROMPT)
+        assert bm.can_allocate(third) == 9  # collected
+        assert third.checkpoint_demand_pos == 0  # nothing left to want
+
+    def test_zero_would_have_left_that_reuse_on_the_floor(self):
+        """The same three requests under 0, as the contrast -1 exists for."""
+        bm = BlockManager(demand_config(state_checkpoint_interval_tokens=0))
+        for _ in range(3):
+            seq = stateful_seq(PROMPT)
+            assert bm.can_allocate(seq) == 0
+            bm.allocate(seq, 0)
+            assert forward_on_the_ladder(bm, seq) == []
+
+    def test_generation_keeps_no_checkpoints(self):
+        """Decode spacing is measured in intervals, and there is no interval.
+
+        The demand is a prompt position, so an unaimed position past the prompt
+        has nothing to match. Stated as a test because the arithmetic that would
+        otherwise run — `pos - last < -1` — is true for every pos, which would
+        checkpoint on every decode step.
+        """
+        bm = BlockManager(demand_config(state_checkpoint_interval_tokens=-1))
+        seq = stateful_seq(PROMPT)
+        bm.allocate(seq, bm.can_allocate(seq))
+        assert not any(
+            bm.checkpointers_at(seq, pos, aimed=False)
+            for pos in range(BLOCK, 200, BLOCK)
+        )
+
+    def test_it_costs_fewer_cuts_than_the_ladder(self):
+        """The whole justification, swept rather than asserted at one length."""
+        totals = {}
+        for interval in (INTERVAL, -1):
+            cuts = 0
+            for n in range(BLOCK, 80):
+                bm = BlockManager(
+                    demand_config(state_checkpoint_interval_tokens=interval)
+                )
+                tokens = list(range(1000 * n, 1000 * n + n))
+                for _ in range(3):
+                    seq = stateful_seq(tokens)
+                    bm.allocate(seq, bm.can_allocate(seq))
+                    cuts += len(forward_on_the_ladder(bm, seq))
+            totals[interval] = cuts
+        assert totals[-1] < totals[INTERVAL]
+
+    def test_every_cut_is_still_kept(self):
+        for n in range(BLOCK, 80):
+            bm = BlockManager(demand_config(state_checkpoint_interval_tokens=-1))
+            tokens = list(range(1000 * n, 1000 * n + n))
+            for _ in range(3):
+                seq = stateful_seq(tokens)
+                bm.allocate(seq, bm.can_allocate(seq))
+                cuts = set(forward_on_the_ladder(bm, seq))
+                keeps = {p for p in range(1, n + 1) if bm.checkpointers_at(seq, p)}
+                assert not cuts - keeps, (n, sorted(cuts), sorted(keeps))
+
+
 class TestCacheStatsAttribution:
     """Splitting declined reuse into the part a checkpoint reaches and the rest.
 

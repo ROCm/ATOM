@@ -346,9 +346,15 @@ class EngineArgs:
                 "can resume there. "
                 "A prompt shorter than N publishes nothing, which is what keeps "
                 "the feature free on workloads that never reuse a prefix. Must "
-                "be a multiple of the prefix-cache hash block size; 0 disables "
-                "checkpoints entirely. Prefill chunks are aligned to these "
-                "positions, so this also quantizes chunk boundaries."
+                "be a multiple of the prefix-cache hash block size. Prefill "
+                "chunks are aligned to these positions, so this also quantizes "
+                "chunk boundaries. "
+                "0 disables state checkpointing entirely. -1 keeps it on but "
+                "places no interval rungs: checkpoints are then taken only "
+                "where a request was seen to want one — every rung costs the "
+                "prompt that keeps it an extra prefill chunk, and on measured "
+                "traces the interval ladder is ~30x the writes for reuse the "
+                "demand rung already reaches."
             ),
         )
         parser.add_argument(

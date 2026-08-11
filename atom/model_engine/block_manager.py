@@ -107,8 +107,21 @@ class BlockManager:
         self.num_per_req_cache_groups = state_entries // state_per_req
         # Tokens between rungs of the checkpoint ladder, shared by every
         # Pool.STATE class (--state-checkpoint-interval-tokens).
+        #
+        # Three regimes, and the sign carries the distinction:
+        #   >0  ladder on, a rung every N tokens.
+        #    0  state checkpointing off entirely. Nothing is kept, anywhere.
+        #   -1  ladder off, checkpointing on: the demand rung still places
+        #       checkpoints, the interval grid does not.
+        #
+        # -1 rather than reusing 0 for this, even though "no interval" reads
+        # like zero: 0 is the documented off switch and it is also *reachable
+        # by accident* — the snap below rounds an off-grid interval down and
+        # can land on 0, so a `--block-size` typo currently fails safe. Giving 0
+        # a second meaning would make that typo silently enable a caching policy
+        # instead of disabling one.
         self.state_checkpoint_interval_tokens = max(
-            0, int(getattr(config, "state_checkpoint_interval_tokens", 0) or 0)
+            -1, int(getattr(config, "state_checkpoint_interval_tokens", 0) or 0)
         )
         checkpoint_spec = state_runtime.checkpoint_spec
         self.paged_state_checkpoints: PagedStateCheckpointCoordinator | None = None
@@ -141,9 +154,12 @@ class BlockManager:
         # user's. Snap down to the grid and say so, rather than refusing to
         # start — and rather than asserting, which `python -O` would drop and
         # leave the ladder cutting prefill chunks onto rungs nothing can reach.
+        # `> 0` rather than truthy: -1 is not an interval to snap onto the grid,
+        # it is the absence of one. Snapping it would give -4 and a warning
+        # about a flag the user set deliberately.
         if (
             self.state.enabled
-            and self.state_checkpoint_interval_tokens
+            and self.state_checkpoint_interval_tokens > 0
             and self.state_checkpoint_interval_tokens % self.hash_block_size
         ):
             snapped = (
@@ -675,9 +691,11 @@ class BlockManager:
             else hit
         )
         seq.num_wanted_hit_blocks = wanted
-        # Zero interval switches the ladder off entirely — `checkpointers_at`
-        # keeps nothing then, so a cut for a demand would buy nothing either.
-        interval_on = self.state_checkpoint_interval_tokens > 0
+        # Zero switches checkpointing off entirely — `checkpointers_at` keeps
+        # nothing then, so a cut for a demand would buy nothing either. -1 is
+        # the other thing: the interval grid is off but checkpointing is on, and
+        # the demand rung is what then carries it.
+        interval_on = self.state_checkpoint_interval_tokens != 0
         previously_demanded = seq.checkpoint_demand_pos
         seq.checkpoint_demand_pos = (
             wanted * self.hash_block_size if interval_on and wanted > hit else 0
@@ -803,11 +821,21 @@ class BlockManager:
         cannot reach one.
         """
         interval = self.state_checkpoint_interval_tokens
-        if interval <= 0 or pos <= 0:
+        if interval == 0 or pos <= 0:
             return []
+        # -1: no grid, so `pos % interval` has nothing to say and asking it
+        # would be a ZeroDivisionError's less honest cousin — -1 divides
+        # everything, admitting every position as a rung. The demand is then
+        # the only placement, which is the whole point.
+        on_grid = interval > 0 and not pos % interval
         if aimed:
-            if pos % interval and pos != seq.checkpoint_demand_pos:
+            if not on_grid and pos != seq.checkpoint_demand_pos:
                 return []
+        elif interval < 0:
+            # Decode-side spacing has no grid to fall back on either. The demand
+            # is a prompt position, so nothing here is reachable and generation
+            # keeps no checkpoints under -1.
+            return []
         elif pos % self.hash_block_size or pos - seq.last_checkpoint_pos < interval:
             return []
         if next_forward_tokens is None:
