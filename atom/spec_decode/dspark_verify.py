@@ -1,5 +1,5 @@
 import logging
-from typing import Optional, Sequence
+from collections.abc import Sequence
 
 import numpy as np
 import torch
@@ -65,9 +65,9 @@ class VerifyScheduler:
     def __init__(self, runner):
         # runner: provides the shared async D2H stream (tokenID_processor).
         self.runner = runner
-        self.sps_table: Optional[torch.Tensor] = None
-        self.sts_temperatures: Optional[torch.Tensor] = None
-        self._last_ell: Optional[torch.Tensor] = None
+        self.sps_table: torch.Tensor | None = None
+        self.sts_temperatures: torch.Tensor | None = None
+        self._last_ell: torch.Tensor | None = None
         # FIFO of in-flight async D2H copies of ell, one entry per step:
         # (event, cpu_buf, req_ids). Read by index in _resolve_ell, never popped.
         self._ell_pending: list = []
@@ -77,7 +77,7 @@ class VerifyScheduler:
         self._ell_map: dict = {}
         # Pinned landing ring for the D2H, [_MAX_ELL_INFLIGHT, max_num_seqs].
         # Allocated on first use (the runner's config is complete by then).
-        self._ell_stage_ring: Optional[torch.Tensor] = None
+        self._ell_stage_ring: torch.Tensor | None = None
         self._ell_stage_idx = 0
         # Event of the D2H that last landed in each ring slot (None = unused).
         # Checked before the slot is handed out again: evicting an entry from
@@ -86,7 +86,7 @@ class VerifyScheduler:
         self._ell_slot_event: list = [None] * _MAX_ELL_INFLIGHT
         # Ring index returned by the last `_ell_stage` call, or None when it
         # fell back to a one-off buffer. Consumed by `record_ell`.
-        self._ell_last_slot: Optional[int] = None
+        self._ell_last_slot: int | None = None
 
     def compute_ell(self, confidence: torch.Tensor) -> torch.Tensor:
         """Run the Hardware-Aware Prefix Scheduler (paper Algorithm 1) and return
@@ -126,7 +126,7 @@ class VerifyScheduler:
             sts_temperatures=self.sts_temperatures,
         )
 
-    def set_last_ell(self, ell: Optional[torch.Tensor]) -> None:
+    def set_last_ell(self, ell: torch.Tensor | None) -> None:
         """Stash the ell computed by this step's propose() (or None)."""
         self._last_ell = ell
 
@@ -202,7 +202,7 @@ class VerifyScheduler:
         # Keep req_ids as a plain list snapshot (CPU-only, order-safe).
         self._ell_pending.append((event, cpu_buf, list(req_ids)))
         if len(self._ell_pending) > _MAX_ELL_INFLIGHT:
-            del self._ell_pending[: -_MAX_ELL_INFLIGHT]
+            del self._ell_pending[:-_MAX_ELL_INFLIGHT]
 
     def _resolve_ell(self) -> None:
         """Adopt the ell from a FIXED generation back (``_ELL_GENERATION``).

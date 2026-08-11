@@ -281,11 +281,17 @@ def test_sps_table_feeds_scheduler_end_to_end():
 def _next_anchor(cu_end, mtp_k, ell, accepted):
     """Replicate the engine's anchor-advance math for one seq.
 
-    num_bonus = accepted (+1 if the whole verified prefix passed -> bonus token)
-    num_reject = mtp_k - num_bonus   (engine hardcodes mtp_k here)
+    num_bonus = accepted + 1        (the bonus slot always counts)
+    num_reject = mtp_k - num_bonus  (engine hardcodes mtp_k here)
     anchor_idx = cu_end - (1 + num_reject)
+
+    `ell` is unused: this used to read `accepted + 1 if accepted == ell else
+    accepted + 1`, both arms identical. Making it conditional on the prefix
+    fully passing (what the old docstring described) breaks
+    test_level_b_anchor_matches_phase1_prefix, so the unconditional +1 is the
+    behaviour under test and the condition was dead.
     """
-    num_bonus = accepted + 1 if accepted == ell else accepted + 1
+    num_bonus = accepted + 1
     num_reject = mtp_k - num_bonus
     return cu_end - (1 + num_reject)
 
@@ -469,6 +475,7 @@ def test_ragged_graph_bucket_plan_b():
     ForwardMode-recovery / pad-tail invariants for the 10-req example.
     """
     import numpy as np
+
     from atom.spec_decode.dspark_scheduler import quantize_to_bucket, resolve_q_buckets
 
     bs, full_q = 10, 6
