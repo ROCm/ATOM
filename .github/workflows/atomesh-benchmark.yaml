@@ -459,9 +459,14 @@ jobs:
           set -euo pipefail
 
           rank="${SLURM_PROCID:-${SPUR_TASK_OFFSET:-0}}"
-          container="atomesh-rdma-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${rank}"
+          job_id="${SLURM_JOB_ID:-${SPUR_JOB_ID:-local}}"
+          container="atomesh-rdma-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${job_id}-${rank}-$$"
           cleanup() {
-            docker rm -f "${container}" >/dev/null 2>&1 || true
+            if docker container inspect "${container}" >/dev/null 2>&1; then
+              docker rm -f "${container}" || {
+                echo "WARNING: failed to remove RDMA smoke container ${container}" >&2
+              }
+            fi
           }
           trap cleanup EXIT HUP INT TERM
           cleanup
