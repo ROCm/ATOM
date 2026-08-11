@@ -86,7 +86,10 @@ class PPEngineCoreProc(EngineCore):
             if result is None:
                 break
             scheduled_batch, seqs = result
-            if scheduled_batch is None or len(scheduled_batch.req_ids) == 0:
+            if scheduled_batch is None:
+                break
+            if len(scheduled_batch.req_ids) == 0:
+                self._dispatch_connector_only_batch(scheduled_batch)
                 break
 
             needs_output = scheduled_batch.produces_output()
@@ -161,6 +164,29 @@ class PPEngineCoreProc(EngineCore):
                 )
 
     # -- KV transfer PP aggregation ------------------------------------------
+
+    def _dispatch_connector_only_batch(self, batch) -> None:
+        """Dispatch the KV connector metadata of a batch that has no requests.
+
+        ``Scheduler.schedule()`` attaches connector metadata to every batch it
+        returns, including the request-less one it returns once every sequence
+        is parked waiting on an offload load. That metadata is what starts those
+        loads, so dropping the batch strands them and the head spins forever on
+        a queue it can never drain. Rebuilding it later does not work either:
+        ``build_connector_meta`` consumes the connector's pending state, so by
+        then there is nothing left to rebuild from.
+
+        Every stage must see it or ``PPKVAggregator`` never reaches a global
+        completion, so it goes out on the channel a real batch would use.
+        ``_downstream_busy_loop`` skips the forward for a request-less batch.
+        """
+        if not self.kv_transfer_enabled:
+            return
+        meta = batch.connector_meta_output
+        if meta is None or not getattr(meta, "requests", None):
+            return
+        self.runner_mgr.call_func("process_kvconnector_output", meta)
+        self.pp_transport.send_metadata(batch)
 
     def _poll_kv_transfer_progress(self):
         """Aggregate KV transfer status from local TP workers AND downstream
@@ -238,7 +264,6 @@ class PPEngineCoreProc(EngineCore):
                 batch = self.pp_transport.recv_metadata(timeout_ms=100)
                 if batch is None:
                     if self.kv_transfer_enabled:
-                        self._dispatch_idle_offload_work()
                         self._poll_and_send_kv_status()
                     self.runner_mgr.call_func("flush_pp_send", wait_out=True)
                     continue
@@ -251,6 +276,13 @@ class PPEngineCoreProc(EngineCore):
                         "process_kvconnector_output",
                         batch.connector_meta_output,
                     )
+
+                if len(batch.req_ids) == 0:
+                    # Connector-only broadcast from an idle head: the metadata
+                    # above was the whole payload, there is nothing to forward.
+                    if self.kv_transfer_enabled:
+                        self._poll_and_send_kv_status()
+                    continue
 
                 fwd_out = self.runner_mgr.call_func("forward", batch, wait_out=True)
 
