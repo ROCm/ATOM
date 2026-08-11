@@ -1994,13 +1994,6 @@ class DeepseekV4Attention(nn.Module):
         if fc.context.is_dummy_run or os.environ.get("ATOM_V4_BYPASS_ATTN") == "1":
             return torch.zeros_like(x)
 
-        # Mixed prefill+decode: share the per-token small ops (Q/KV projections
-        # in _attn_pre, output LoRA in _attn_post) across the whole batch and
-        # split ONLY the segment-specific attention core. See _forward_impl_mixed.
-        attn_md_top = cast("AttentionMetaData_DSV4", fc.attn_metadata)
-        if getattr(attn_md_top, "is_mixed", False):
-            return self._forward_impl_mixed(x, positions, attn_md_top)
-
         # Experimental UE8M0 input round-trip BEFORE the compressor sees x, to
         # match the legacy inline ordering (dead path: default off + asserted off
         # under fused q_norm quant, but kept ordered for byte-equivalence).
@@ -2009,15 +2002,22 @@ class DeepseekV4Attention(nn.Module):
             act_quant_inplace(x, 128, "ue8m0")
 
         # Metadata + compressor launch (must precede projections for overlap).
+        # A mixed batch has no whole-batch compressor plan (its merged metadata
+        # carries compress_plans=None; each half's plans live on its sub-metadata),
+        # so skip the launch here and let `_attn_core`'s per-segment split fire it
+        # with the right plans — same reason it gets compressor_already_launched
+        # False below. Non-mixed behaviour is unchanged.
         ratio = self.compress_ratio
         attn_md = cast("AttentionMetaData_DSV4", fc.attn_metadata)
-        plan_for_layer = attn_md.compress_plans[ratio] if ratio else None
-        self.maybe_compressors_async(
-            x,
-            plan_for_layer,
-            attn_md.state_slot_mapping,
-            attn_md.block_tables,
-        )
+        is_mixed = getattr(attn_md, "is_mixed", False)
+        if not is_mixed:
+            plan_for_layer = attn_md.compress_plans[ratio] if ratio else None
+            self.maybe_compressors_async(
+                x,
+                plan_for_layer,
+                attn_md.state_slot_mapping,
+                attn_md.block_tables,
+            )
 
         # Q/KV projections (indexer projection deferred to the core's inline
         # forward_batched -> run_indexer_proj=False). x already UE8M0-quantised
@@ -2027,7 +2027,8 @@ class DeepseekV4Attention(nn.Module):
         q, kv_pre, qr, qr_scale, x, _idx_q, _idx_w = self._attn_pre(
             x, positions, run_indexer_proj=False
         )
-        # Paged attention core (compressor already launched above).
+        # Paged attention core (compressor already launched above, except for a
+        # mixed batch where the core's per-segment split launches it).
         o = self._attn_core(
             x,
             q,
@@ -2037,71 +2038,55 @@ class DeepseekV4Attention(nn.Module):
             positions,
             idx_q_fp8=None,
             idx_weights=None,
-            compressor_already_launched=True,
+            compressor_already_launched=not is_mixed,
         )
         # Output LoRA + wo_b.
         return self._attn_post(o)
 
-    def _forward_impl_mixed(
+    def _attn_core_mixed(
         self,
-        x: torch.Tensor,  # [n_p + n_d, dim]  flat [prefill | decode] hidden state
-        positions: torch.Tensor,  # [n_p + n_d] int
-        attn_md_top: "AttentionMetaData_DSV4",
-    ) -> torch.Tensor:  # [n_p + n_d, dim]
-        """Mixed prefill+decode attention with the per-token small ops shared.
+        x: torch.Tensor,
+        q: torch.Tensor,
+        kv_pre: torch.Tensor,
+        qr: torch.Tensor,
+        qr_scale: torch.Tensor,
+        positions: torch.Tensor,
+        idx_q_fp8: Optional[torch.Tensor],
+        idx_weights: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Run the attention core once per segment of a mixed batch.
 
-        A mixed batch packs [prefill rows | decode rows] in one flat tensor. Only
-        the attention *core* (compressor scatter, indexer, sparse paged attn) is
-        genuinely prefill-vs-decode-specific — it needs each segment's own
-        metadata and its own sparse kernel. The surrounding per-token ops are
-        identical for every row, so we run them ONCE on the full batch:
+        Only the core is segment-specific: the compressor scatter, the indexer
+        and the sparse paged kernels each need their own segment's metadata. The
+        per-token projections around it (`_attn_pre` / `_attn_post`) already ran
+        once on the full batch in the caller, so every tensor here is simply
+        sliced — all of them are num_tokens-major (including the indexer's
+        `idx_q_fp8` / `idx_weights`, which PIECEWISE projects in `_attn_pre`).
 
-          (1) _attn_pre  — wqkv_a / q_norm / wq_b projections, full batch
-          (2) per-segment compressor + _attn_core (reusing the sliced
-              projections), returning PRE-o_proj core output
-          (3) _attn_post — output LoRA + wo_b, full batch
-
-        This replaces the previous per-segment `forward_impl` re-entry, which
-        re-ran _attn_pre / compressor / _attn_post once per segment (and, via the
-        outer forward_impl, a redundant extra time). The attention core is still
-        split, so numerics are unchanged; only the launch count of the small ops
-        drops (they are launch-bound, so they also run at full-batch width).
+        Each segment re-enters `_attn_core` with `fc.attn_metadata` pointed at
+        that segment's complete sub-metadata (is_mixed False) and
+        `compressor_already_launched=False`, so the core launches the compressor
+        with the segment's own `compress_plans`.
         """
+        attn_md_top = cast(
+            "AttentionMetaData_DSV4", get_forward_context().attn_metadata
+        )
         n_p = attn_md_top.num_prefill_tokens
         n_d = x.size(0) - n_p
-        p_md = attn_md_top.prefill_attn_metadata
-        d_md = attn_md_top.decode_attn_metadata
         fc = get_forward_context()
         ctx = fc.context
         saved_md = fc.attn_metadata
         saved_is_prefill = ctx.is_prefill
         saved_input_ids = ctx.input_ids
-        ratio = self.compress_ratio
 
-        # (1) Shared Q/KV projections ONCE on the full [prefill | decode] batch.
-        #     Indexer projection stays inline in the per-segment core
-        #     (run_indexer_proj=False), matching the FULL non-mixed path.
-        q, kv_pre, qr, qr_scale, x, _idx_q, _idx_w = self._attn_pre(
-            x, positions, run_indexer_proj=False
-        )
-
-        # (2) Segment-specific work (compressor + paged attention core) against
-        #     each segment's own complete metadata, reusing the shared
-        #     projections. Returns PRE-o_proj core output for the segment.
-        def _core_segment(lo, hi, seg_md, is_prefill):
+        def _seg(lo, hi, seg_md, is_prefill):
             fc.attn_metadata = seg_md
             ctx.is_prefill = is_prefill
             if saved_input_ids is not None:
                 # Keep ctx.input_ids segment-consistent for anything the core
-                # reads off it (e.g. indexer), mirroring a pure-prefill/decode
-                # forward for that segment.
+                # reads off it (e.g. the hash-MoE `_hash_topk`), mirroring a
+                # pure-prefill / pure-decode forward for that segment.
                 ctx.input_ids = saved_input_ids[lo:hi]
-            self.maybe_compressors_async(
-                x[lo:hi],
-                seg_md.compress_plans[ratio] if ratio else None,
-                seg_md.state_slot_mapping,
-                seg_md.block_tables,
-            )
             return self._attn_core(
                 x[lo:hi],
                 q[lo:hi],
@@ -2109,22 +2094,23 @@ class DeepseekV4Attention(nn.Module):
                 qr[lo:hi],
                 qr_scale[lo:hi],
                 positions[lo:hi],
-                idx_q_fp8=None,
-                idx_weights=None,
-                compressor_already_launched=True,
+                idx_q_fp8=None if idx_q_fp8 is None else idx_q_fp8[lo:hi],
+                idx_weights=None if idx_weights is None else idx_weights[lo:hi],
+                compressor_already_launched=False,
             )
 
-        with torch.profiler.record_function(f"mixed[n_p={n_p} n_d={n_d}]"):
-            o_p = _core_segment(0, n_p, p_md, True)
-            o_d = _core_segment(n_p, n_p + n_d, d_md, False)
+        try:
+            with torch.profiler.record_function(f"mixed[n_p={n_p} n_d={n_d}]"):
+                o_p = _seg(0, n_p, attn_md_top.prefill_attn_metadata, True)
+                o_d = _seg(n_p, n_p + n_d, attn_md_top.decode_attn_metadata, False)
+        finally:
+            # Restore the top-level mixed context for the caller / later layers
+            # even if a segment raises.
+            fc.attn_metadata = saved_md
+            ctx.is_prefill = saved_is_prefill
+            ctx.input_ids = saved_input_ids
 
-        # Restore the top-level mixed context for any caller / later layer.
-        fc.attn_metadata = saved_md
-        ctx.is_prefill = saved_is_prefill
-        ctx.input_ids = saved_input_ids
-
-        # (3) Shared output projection ONCE on the full concatenated core output.
-        return self._attn_post(torch.cat([o_p, o_d], dim=0))
+        return torch.cat([o_p, o_d], dim=0)
 
     def _attn_core(
         self,
@@ -2166,10 +2152,22 @@ class DeepseekV4Attention(nn.Module):
         if fc.context.is_dummy_run or os.environ.get("ATOM_V4_BYPASS_ATTN") == "1":
             return x.new_zeros((x.shape[0], self.n_local_heads * self.head_dim))
 
-        # Mixed prefill+decode is handled one level up in `_forward_impl_mixed`,
-        # which shares _attn_pre/_attn_post across the batch and calls this core
-        # once per segment with that segment's metadata. So by the time we reach
-        # here the batch is always a single pure-prefill or pure-decode segment.
+        # ===== Mixed prefill+decode: split ONLY the core, per segment. =====
+        # Both attention paths reach this method with the whole [prefill | decode]
+        # batch and with the per-token small ops (_attn_pre / _attn_post) already
+        # shared across it:
+        #   FULL      forward_impl: _attn_pre -> _attn_core -> _attn_post
+        #   PIECEWISE forward():    _attn_pre -> v4_core_attention -> _attn_post
+        # so the split belongs HERE, not in forward_impl — putting it a level up
+        # covered FULL only and left PIECEWISE to hit this body with the merged
+        # metadata (whose compress_plans is None) => TypeError.
+        # Each segment re-enters with its own complete sub-metadata (is_mixed
+        # False), so this recursion is one level deep.
+        if getattr(fc.attn_metadata, "is_mixed", False):
+            return self._attn_core_mixed(
+                x, q, kv_pre, qr, qr_scale, positions, idx_q_fp8, idx_weights
+            )
+
         num_tokens = x.size(0)
         # paged-SWA: swa_kv is now the flat [num_blocks*block_size, head_dim]
         # content-addressed region; block_size (not a ring cache_size) is the
