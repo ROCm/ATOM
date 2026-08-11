@@ -238,6 +238,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_LOADER_STRICT_COVERAGE": lambda: (
         os.getenv("ATOM_LOADER_STRICT_COVERAGE", "true").lower() == "true"
     ),
+    # --- gfx1250 (MI450) ---
+    # Run K3's KDA prefill on fused_recurrent_kda instead of chunk_kda. Needed on
+    # gfx1250, where chunk_kda NaNs; see KimiKDA._run_kda's call site.
+    "ATOM_KDA_FORCE_RECURRENT": lambda: (
+        os.getenv("ATOM_KDA_FORCE_RECURRENT", "0") == "1"
+    ),
     # --- Attention Backend ---
     # Use unified_attention (flash-style) for MHA paged/prefill attention instead
     # of pa_decode_gluon. Set to 1 to enable the unified_attention path.

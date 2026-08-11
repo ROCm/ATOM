@@ -313,9 +313,24 @@ class GDNStateMixin:
         if prepare_block_tables:
             self.prepare_block_tables(batch)
 
-        context_lens_tensor = attn_metadata.context_lens
         query_start_loc = attn_metadata.cu_seqlens_q
-        context_lens_tensor = torch.zeros(batch.total_seqs_num_prefill).cuda()
+        # Drives has_initial_state below. Under chunked prefill a linear-attention
+        # layer must CONTINUE its recurrent conv/ssm state across chunks, so a
+        # sequence that already has cached (previously-processed) tokens must
+        # report a non-zero context length. num_cached_tokens is set by
+        # CommonAttentionBuilder.prepare_prefill when has_cached, and is None for
+        # whole-prompt / first-chunk prefill -> all-zero, preserving the previous
+        # behaviour. Hard-zeroing it (as this did) restarts the recurrence on
+        # every chunk and silently corrupts chunked-prefill output.
+        num_cached = getattr(attn_metadata, "num_cached_tokens", None)
+        if num_cached is not None:
+            context_lens_tensor = num_cached[: batch.total_seqs_num_prefill].to(
+                device=self.device
+            )
+        else:
+            context_lens_tensor = torch.zeros(
+                (batch.total_seqs_num_prefill,), device=self.device
+            )
         nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
         if not self.use_spec_decode or is_prefill:
             self.prepare_state_indices(batch, with_spec=False)
