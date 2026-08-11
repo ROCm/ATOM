@@ -264,7 +264,6 @@ class PPEngineCoreProc(EngineCore):
                 batch = self.pp_transport.recv_metadata(timeout_ms=100)
                 if batch is None:
                     if self.kv_transfer_enabled:
-                        self._dispatch_idle_offload_work()
                         self._poll_and_send_kv_status()
                     self.runner_mgr.call_func("flush_pp_send", wait_out=True)
                     continue
