@@ -1714,15 +1714,14 @@ async def health():
 @app.get("/debug/mtp_stats")
 async def get_mtp_stats():
     """Return current speculative decoding acceptance statistics."""
-    global engine
     if engine is None:
         raise HTTPException(status_code=503, detail="Engine is not initialized")
     try:
         return engine.get_mtp_statistics()
     except Exception as e:
-        logger.error(f"Failed to get MTP statistics: {e}", exc_info=True)
+        logger.exception("Failed to get MTP statistics")
         raise HTTPException(
-            status_code=500, detail=f"Failed to get MTP statistics: {str(e)}"
+            status_code=500, detail=f"Failed to get MTP statistics: {e!s}"
         )
 
 

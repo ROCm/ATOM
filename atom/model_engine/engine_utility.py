@@ -3,6 +3,7 @@
 
 import logging
 import queue
+from typing import ClassVar
 
 from atom.model_engine.sequence import SequenceStatus
 
@@ -31,7 +32,7 @@ class EngineUtilityHandler:
     """
 
     # Utility command name  ->  handler method name
-    _UTILITY_HANDLERS = {
+    _UTILITY_HANDLERS: ClassVar[dict[str, str]] = {
         "update_weights": "_handle_update_weights",
         "update_weights_shm": "_handle_update_weights_shm",
         "update_weights_ipc": "_handle_update_weights_ipc",

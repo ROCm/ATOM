@@ -108,7 +108,7 @@ def _layer_counts(hf_config) -> tuple[list[int], int, int, int]:
 
 
 def _classical_block_bytes(hf_config, kv_fp8: bool = False) -> int:
-    ratios, _dense, csa_layers, hca_layers = _layer_counts(hf_config)
+    _ratios, _dense, csa_layers, hca_layers = _layer_counts(hf_config)
     head_dim = int(getattr(hf_config, "head_dim", 512))
     rope_head_dim = _v4_rope_head_dim(hf_config)
     index_head_dim = int(getattr(hf_config, "index_head_dim", 128))
