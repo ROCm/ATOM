@@ -9,14 +9,20 @@ import torch
 def _load_bridge_with_fake_modules(monkeypatch, eagle_cls, future_map_cls):
     minimax_mod = types.ModuleType("atom.plugin.sglang.models.minimax_m3")
     minimax_mod.SGLangATOMMiniMaxM3Attention = object
-    monkeypatch.setitem(sys.modules, "atom.plugin.sglang.models.minimax_m3", minimax_mod)
+    monkeypatch.setitem(
+        sys.modules, "atom.plugin.sglang.models.minimax_m3", minimax_mod
+    )
 
     overlap_mod = types.ModuleType("sglang.srt.managers.overlap_utils")
     overlap_mod.FutureMap = future_map_cls
     overlap_mod.RelayPayload = type(
         "RelayPayload",
         (),
-        {"from_draft_input": classmethod(lambda cls, draft_input: types.SimpleNamespace())},
+        {
+            "from_draft_input": classmethod(
+                lambda cls, draft_input: types.SimpleNamespace()
+            )
+        },
     )
     monkeypatch.setitem(sys.modules, "sglang.srt.managers.overlap_utils", overlap_mod)
 
@@ -72,4 +78,3 @@ def test_v0517_filter_batch_reorders_plugin_state_for_same_length_permutation(
 
     assert draft_input.topk_index.squeeze(-1).tolist() == [2, 0, 1]
     assert draft_input._atom_sglang_eagle3_num_reject_tokens.tolist() == [30, 10, 20]
-
