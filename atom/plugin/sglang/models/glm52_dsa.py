@@ -20,6 +20,9 @@ from atom.plugin.sglang.models.glm52_dsa_attention import (
 logger = logging.getLogger(__name__)
 
 
+_MI308_GFX = "gfx942"
+
+
 def _patch_aiter_flat_fmoe_for_glm52_mi308() -> None:
     """Keep GLM-5.2 from selecting gfx950-only flat FMOE kernels on MI308."""
     try:
@@ -30,7 +33,7 @@ def _patch_aiter_flat_fmoe_for_glm52_mi308() -> None:
         )
         return
 
-    if getattr(fused_moe, "_atom_glm52_flat_fmoe_guarded", False):
+    if getattr(fused_moe, "_atom_glm52_mi308_flat_fmoe_guarded", False):
         return
 
     original_get_2stage_cfgs = getattr(fused_moe, "get_2stage_cfgs", None)
@@ -47,14 +50,19 @@ def _patch_aiter_flat_fmoe_for_glm52_mi308() -> None:
         logger.debug("Failed to query gfx target for GLM-5.2 patch", exc_info=True)
         return
 
-    if gfx != "gfx942":
+    if gfx != _MI308_GFX:
         return
 
     def _get_2stage_cfgs_without_unsupported_flat(*args, **kwargs):
+        if get_gfx() != _MI308_GFX:
+            return original_get_2stage_cfgs(*args, **kwargs)
+
         metadata = original_get_2stage_cfgs(*args, **kwargs)
         if not getattr(metadata, "flat", False):
             return metadata
 
+        # MI308/gfx942 cannot run the flat FMOE tuned path selected by AITER for
+        # GLM-5.2.  Re-query with tune-config bypass only for this GLM setup.
         previous_bypass = os.environ.get("AITER_BYPASS_TUNE_CONFIG")
         os.environ["AITER_BYPASS_TUNE_CONFIG"] = "1"
         try:
@@ -82,7 +90,7 @@ def _patch_aiter_flat_fmoe_for_glm52_mi308() -> None:
         return fallback_metadata
 
     fused_moe.get_2stage_cfgs = _get_2stage_cfgs_without_unsupported_flat
-    fused_moe._atom_glm52_flat_fmoe_guarded = True
+    fused_moe._atom_glm52_mi308_flat_fmoe_guarded = True
 
 
 def setup_glm52_dsa_for_sglang(model: Any) -> None:
