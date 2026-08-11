@@ -1714,7 +1714,6 @@ class Indexer(nn.Module):
         `csa_translate_pack` consumes.
         """
         total_tokens = q_fp8.size(0)
-        n_committed_per_seq_gpu = indexer_meta["n_committed_per_seq_gpu"]  # int32 [bs]
         attn_md = get_forward_context().attn_metadata
 
         # DSpark RAGGED (paper §5.2): the decode indexer kernel
@@ -1731,23 +1730,19 @@ class Indexer(nn.Module):
                 q_fp8,
                 weights,
                 block_tables,
-                n_committed_per_seq_gpu,
                 ragged_lens,
                 int(attn_md.dspark_full_q),
                 topk,
             )
 
-        # NOTE: derive the query batch size from the ACTUAL number of query
-        # tokens, NOT from block_tables.size(0). Under TBO the per-ubatch
-        # block_tables / n_committed are padded to a DP-unified bucket and will
-        # get errors if we try to use the padded rows.
-        next_n = max(1, int(attn_md.max_seqlen_q))
-        bs = total_tokens // next_n
+        # Treat each query row as an independent batch item (`next_n=1`).
+        # The expanded block table preserves its source sequence mapping while
+        # the uncapped row end supplies the exact ratio-4 causal boundary.
         # deepgemm requires Q in [bs, next_n, heads, head_dim], KV in
         # [num_blocks, block_size, n_head=1, hidden_dim+scale_dim] (4D).
         q_4d = q_fp8.view(
-            bs, next_n, self.n_heads, self.head_dim
-        )  # [bs, next_n, n_heads, head_dim] fp8
+            total_tokens, 1, self.n_heads, self.head_dim
+        )  # [total_tokens, 1, n_heads, head_dim] fp8
         kv_cache_4d = self.kv_cache.unsqueeze(
             -2
         )  # [num_blocks, k1_csa, 1, head_dim+scale_dim] uint8
@@ -1768,8 +1763,8 @@ class Indexer(nn.Module):
             kv_cache_4d,
             weights,
             logits,
-            n_committed_per_seq_gpu,  # int32, sized [bs] (staged in builder)
-            block_tables,
+            attn_md.csa_topk_row_ends[:total_tokens],
+            attn_md.csa_mqa_block_tables[:total_tokens],
             self._max_model_len_idx,
             KVBlockSize=self.kv_cache.size(1),  # k1_csa = 64
             Preshuffle=True,
@@ -1923,8 +1918,8 @@ class Indexer(nn.Module):
         topk: int,
     ) -> torch.Tensor:
         """Decode/varctx FP4: `flydsl_pa_mqa_logits_fp4` reads the paged FP4
-        cache directly over each seq's `[0, n_committed)` window. Output is
-        seq-local `[bs*next_n, max_model_len_idx]`, consumed by
+        cache directly over each query row's exact CSA-visible window. Output is
+        seq-local `[total_tokens, max_model_len_idx]`, consumed by
         `top_k_per_row_decode` exactly like the FP8 deepgemm path.
 
         CUDAGraph-safe: the persistent-grid schedule (`cta_info`/`total_ctas`)
@@ -1942,7 +1937,6 @@ class Indexer(nn.Module):
 
         fc = get_forward_context()
         total_tokens = q_fp4.size(0)
-        n_committed_per_seq_gpu = indexer_meta["n_committed_per_seq_gpu"]  # int32 [bs]
         # DSpark RAGGED decode (per-request variable query lengths): route to the
         # varqlen FP4 path (aiter `flydsl_pa_mqa_logits_fp4_varqlen` via the
         # ragged-prefill kernel). The rectangular path below does
@@ -1958,12 +1952,10 @@ class Indexer(nn.Module):
             return self._score_topk_decode_ragged_fp4(
                 q_fp4, q_scale, block_tables, weights, indexer_meta, topk
             )
-        next_n = max(1, int(attn_md.max_seqlen_q))
-        bs = total_tokens // next_n
         k_tiles = self.head_dim // 128
         qs_pad = q_scale.shape[-1]
-        q_4d = q_fp4.view(bs, next_n, self.n_heads, self.head_dim // 2)
-        q_scale_6d = q_scale.view(bs, next_n, k_tiles, 4, 16, qs_pad)
+        q_4d = q_fp4.view(total_tokens, 1, self.n_heads, self.head_dim // 2)
+        q_scale_6d = q_scale.view(total_tokens, 1, k_tiles, 4, 16, qs_pad)
         max_seq_len = self._max_model_len_idx
         kv_block_size = self.kv_cache.size(3)  # k1_csa = 64
         # The packed-dword scale readers in pa_mqa_logits_fp4* require N_PHYS==1
@@ -1997,12 +1989,12 @@ class Indexer(nn.Module):
             q_scale_6d,
             self.kv_cache,
             self.kv_scale,
-            block_tables,
+            attn_md.csa_mqa_block_tables[:total_tokens],
             weights,
-            n_committed_per_seq_gpu,
+            attn_md.csa_topk_row_ends[:total_tokens],
             max_seq_len,
             weight_scale=self._weights_scale,
-            next_n=next_n,
+            next_n=1,
             block_k=FP4_MQA_BLOCK_K,
             kv_block_size=kv_block_size,
             # Grid is driven by the pre-built `cta_info`/`total_ctas`; the kernel
@@ -2146,7 +2138,6 @@ class Indexer(nn.Module):
         q_fp8: torch.Tensor,  # [total_tokens, n_heads, head_dim] fp8
         weights: torch.Tensor,  # [total_tokens, n_heads] fp32
         block_tables: torch.Tensor,  # [bs, max_blocks_per_seq] int32
-        n_committed_per_seq_gpu: torch.Tensor,  # int32 [bs]
         ragged_lens: torch.Tensor,  # int32 [bs] — per-seq len_i (= ell_i+1)
         full_q: int,  # full draft span width (mtp_k + 1)
         topk: int,
@@ -2161,11 +2152,10 @@ class Indexer(nn.Module):
 
         The decode indexer kernel is rectangular-only (see `_score_topk_decode`).
         We scatter the ragged Q/weights into a [bs, full_q] rectangle at each
-        token's original in-span slot j, run the kernel at next_n=full_q, then
-        gather each seq's first len_i rows back. Numerically identical to a
-        regular rectangular decode (the causal bound lines up because ragged
-        positions are span-head-anchored and slot j == pid_next_n). Padding rows
-        carry zero Q; their logits are computed but never gathered.
+        token's original in-span slot j, flatten its rows into independent
+        `next_n=1` batch items, then gather real rows back. The expanded per-row
+        block table preserves sequence ownership and the right-aligned row-end
+        metadata supplies each row's exact CSA-visible range.
         """
         device = q_fp8.device
         total_tokens = q_fp8.size(0)
@@ -2201,7 +2191,7 @@ class Indexer(nn.Module):
         w_rect = torch.zeros(R + 1, weights.size(1), dtype=weights.dtype, device=device)
         q_rect[dst] = q_fp8
         w_rect[dst] = weights
-        q_4d = q_rect[:R].view(bs, full_q, H, D)
+        q_4d = q_rect[:R].view(R, 1, H, D)
 
         kv_cache_4d = self.kv_cache.unsqueeze(-2)
         # kernel operates on the real [R] rect (bs*full_q rows); the dump row R is
@@ -2214,8 +2204,8 @@ class Indexer(nn.Module):
             kv_cache_4d,
             w_rect[:R],
             logits,
-            n_committed_per_seq_gpu,
-            block_tables,
+            attn_md.csa_topk_row_ends[:R],
+            attn_md.csa_mqa_block_tables[:R],
             self._max_model_len_idx,
             KVBlockSize=self.kv_cache.size(1),
             Preshuffle=True,
