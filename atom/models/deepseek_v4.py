@@ -193,17 +193,18 @@ def _pin_core_input(layer_name: str, arg_idx: int, num_tokens: int, t):
 # Owns its isolated graph pool + per-key graph cache + output buffers.
 _v4_attn_runner = CudagraphCaptureRunner()
 
-# Max decode num_tokens the q public buffer covers; also its row count. Decode
-# forwards a flat bucket up to this. Larger num_tokens (prefill / huge concat)
-# skip the q public buffer and take the normal per-step copy path.
+# Max decode num_tokens the pub buffers cover (= their row count). Larger
+# num_tokens (prefill / huge concat) skip zero-copy and take the copy path.
 _V4_ATTN_QPUB_MAX = 512
 
-# zero-copy arg indices; all-8 drops ~2pts (padding-tail), so drop positions(5).
+# zero-copy arg indices. All 9 args are zero-copy EXCEPT positions(5): including it
+# drops ~2pts (cumulative padding-tail regression, see memory). x(0) is zero-copy —
+# it's the upstream dense-piece output, already at a fixed address.
 # ATOM_ATTN_ZC overrides (=empty: all-copy). See memory af-piecewise-zerocopy-tail.
 _V4_ATTN_ZC = (
     frozenset(int(i) for i in os.environ["ATOM_ATTN_ZC"].split(",") if i.strip() != "")
     if "ATOM_ATTN_ZC" in os.environ
-    else frozenset({1, 2, 3, 4, 6, 7, 8})
+    else frozenset({0, 1, 2, 3, 4, 6, 7, 8})
 )
 
 
@@ -2845,12 +2846,12 @@ class DeepseekV4Attention(nn.Module):
         # the attn-core cudagraph reads a constant address (no per-step copy). `bufs`
         # is None (and the whole path skipped) when AF_PIECEWISE is off.
         bufs = self.zerocopy_buffers
-        use_zerocopy = bufs is not None and bufs.fits(x.shape[0])
+        af_piecewise_zerocopy = bufs is not None and bufs.fits(x.shape[0])
         n = x.shape[0]
 
         # kv_pre: fix the WHOLE wqkv_a output inplace so kv_pre = split[1] is a
         # stable view (no kv_pre copy); else plain GEMM + stage kv_pre by copy.
-        if use_zerocopy and bufs.wqkv_a_inplace:
+        if af_piecewise_zerocopy and bufs.wqkv_a_inplace:
             qkv_a = self.wqkv_a(x, out=bufs.qkv_a[:n])
             q_lora, kv_pre = torch.split(
                 qkv_a, [self.q_lora_rank, self.head_dim], dim=-1
@@ -2860,14 +2861,14 @@ class DeepseekV4Attention(nn.Module):
             q_lora, kv_pre = torch.split(
                 qkv_a, [self.q_lora_rank, self.head_dim], dim=-1
             )
-            if use_zerocopy:
+            if af_piecewise_zerocopy:
                 kv_pre = bufs.stage(bufs.kv_pre, kv_pre)
         assert (
             not _V4_FORCE_UE8M0_QUANT
         ), "_V4_FORCE_UE8M0_QUANT incompatible with fused q_norm quant (qr is already FP8)"
 
         qr, qr_scale = self.q_norm(q_lora)
-        if use_zerocopy:
+        if af_piecewise_zerocopy:
             # qr/qr_scale staged BEFORE their consumers (wq_b / indexer / the op).
             qr = bufs.stage(bufs.qr, qr)
             qr_scale = bufs.stage(bufs.qr_scale, qr_scale)
@@ -2888,7 +2889,7 @@ class DeepseekV4Attention(nn.Module):
             idx_q_quant, idx_weights, idx_q_scale = self.indexer.forward_pre(
                 x, qr, positions, qr_scale
             )
-            if use_zerocopy:
+            if af_piecewise_zerocopy:
                 idx_q_quant = bufs.stage(bufs.idx_q_quant, idx_q_quant)
                 idx_weights = bufs.stage(bufs.idx_weights, idx_weights)
                 idx_q_scale = bufs.stage(bufs.idx_q_scale, idx_q_scale)

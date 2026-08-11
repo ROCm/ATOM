@@ -902,9 +902,8 @@ class LinearBase(nn.Module):
     ) -> torch.Tensor:
         # out= (fixed output buffer) is only wired through the per_1x128
         # preshuffle GEMM path; any other quant path must not silently ignore it.
-        _out_ok = (
-            self.quant_type.value == QuantType.per_1x128.value
-            and bool(envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE)
+        _out_ok = self.quant_type.value == QuantType.per_1x128.value and bool(
+            envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
         )
         assert out is None or _out_ok, (
             "Linear out= requested but this quant path does not support it "

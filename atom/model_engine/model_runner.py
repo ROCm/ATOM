@@ -3638,23 +3638,12 @@ class ModelRunner:
     def _capture_attn_core_ragged_combos(
         self, bs, max_q_len, rectangle_tokens, build_capture, input_ids
     ):
-        """AF_PIECEWISE zero-copy-q: capture the attn-core cudagraph for the RAGGED
-        (effective_bs=bs, num_tokens_pad) combos a real ragged decode step at this bs
-        may replay.
-
-        A ragged step with real_bs<=bs forwards num_tokens_pad = b*max_q_len where b is a
-        captured graph_bs <= bs — a flat bucket SMALLER than this bs's rectangle
-        (bs*max_q_len). The attn-core graph key is (layer, effective_bs, q_eff,
-        num_tokens_pad); effective_bs is always this bs (the ceil-to-graph_bs bucket
-        real_bs lands in), while num_tokens_pad ranges over the smaller flat buckets.
-        The dense pieces for each num_tokens_pad already self-captured on their own bs=b main-
-        loop iteration; here they REPLAY (deduped by batch_descriptor=num_tokens),
-        while the attn-core custom op captures its fresh (bs, q_eff, num_tokens_pad) key.
-
-        Only the smaller buckets are new work — the rectangle nt==rectangle_tokens was
-        captured by the caller. Runs one PIECEWISE forward per new num_tokens_pad, feeding a
-        ragged synthetic batch (bs seqs summing to num_tokens_pad) via build_for_cudagraph_
-        capture(num_tokens_pad=...). Gated: only invoked under AF_PIECEWISE.
+        """AF_PIECEWISE: capture the attn-core graphs for the smaller ragged buckets
+        (num_tokens_pad = b*max_q_len < this bs's rectangle) a real ragged step at
+        this bs may replay. Runs one PIECEWISE forward per new bucket on a ragged
+        synthetic batch: dense pieces REPLAY (already captured, deduped by
+        num_tokens); the attn-core op captures its fresh (bs, q_eff, num_tokens_pad)
+        key. The rectangle bucket was already captured by the caller.
         """
         positions = self.forward_vars["positions"].gpu
         for b in self.graph_bs:
