@@ -799,6 +799,9 @@ class ParallelConfig:
     pp_token_addr: str = ""
     """ZMQ endpoint where the head receives sampled tokens back from the last
     stage. Populated by CoreManager for pp_size > 1."""
+    pp_kv_status_addr: str = ""
+    """ZMQ endpoint where the head receives KV offload status from downstream
+    PP stages. All downstream stages PUSH; the head PULLs."""
     world_size: int = field(init=False)
     """Vestigial: never assigned or read; engine_core derives worker count directly."""
     data_parallel_master_port: int = 29500

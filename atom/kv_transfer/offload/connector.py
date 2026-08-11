@@ -104,12 +104,22 @@ class LMCacheOffloadConnector(KVConnectorBase):
         from lmcache.v1.memory_management import MemoryFormat
 
         tp = get_tp_group()
-        rank, world = tp.rank_in_group, tp.world_size
+        pp_rank = getattr(
+            getattr(self._config, "parallel_config", None),
+            "pipeline_parallel_rank",
+            0,
+        )
+        pp_size = int(getattr(self._config, "pipeline_parallel_size", 1) or 1)
+        rank = pp_rank * tp.world_size + tp.rank_in_group
+        world = pp_size * tp.world_size
         self._rank = rank
 
         cfg = offcfg.build_lmcache_config(
             getattr(self._config, "kv_transfer_config", None)
         )
+        # Applied here, not on the scheduler-side lookup client below: this is
+        # the only path that allocates the CPU pool.
+        offcfg.scale_cpu_size_for_pp(cfg, self._config)
         self.chunk_size = int(cfg.chunk_size)
         # num_blocks is the scheduler-visible block count, threaded from the
         # model runner. MLA stores its KV token-major, so the codec cannot infer

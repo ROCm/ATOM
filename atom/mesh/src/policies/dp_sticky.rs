@@ -37,9 +37,10 @@ pub struct DpStickyPolicy {
     /// Session ID -> worker identity. The DP rank distinguishes logical workers
     /// that share a common endpoint URL.
     assignments: DashMap<String, StickyAssignment>,
-    /// Serializes count -> choose -> insert for new sessions so a burst cannot
-    /// pin every session to the same DP rank. Established sessions use the
-    /// lock-free assignment lookup above.
+    /// Serializes count -> choose -> insert for new sessions so a burst of them
+    /// cannot all read the same pre-burst assignment counts and pile onto one
+    /// worker. Only new/expired sessions contend; established ones take the
+    /// lock-free path above.
     assign_lock: Mutex<()>,
 }
 
@@ -81,8 +82,18 @@ impl DpStickyPolicy {
             .min_by_key(|&index| workers[index].load())
     }
 
-    /// Select the healthy worker holding the fewest non-expired assignments,
-    /// tie-broken by current request load. Caller must hold `assign_lock`.
+    /// Select the healthy worker holding the fewest live session assignments,
+    /// tie-broken by current load.
+    ///
+    /// Load alone cannot spread new sessions. On the streaming PD path the
+    /// router creates a request's `WorkerLoadGuard` only once the upstream
+    /// response headers arrive, so every request of a simultaneous burst reads
+    /// `load() == 0` and `min_by_key` hands them all the same worker — which
+    /// this policy then pins for the rest of each session. Assignment counts
+    /// update the instant a session is pinned, so the N-th new session of a
+    /// burst sees the N-1 pins made before it.
+    ///
+    /// Caller must hold `assign_lock`.
     fn select_new_session_worker(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -107,6 +118,25 @@ impl DpStickyPolicy {
             })
     }
 
+    /// Return the worker index this session is already pinned to, refreshing
+    /// its access time. `None` when the session is new, idle-expired, or its
+    /// worker is no longer usable.
+    fn resolve_existing(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        session_id: &str,
+        now: Instant,
+    ) -> Option<usize> {
+        let mut assignment = self.assignments.get_mut(session_id)?;
+        if now.saturating_duration_since(assignment.last_access) > SESSION_REASSIGNMENT_IDLE_TIMEOUT
+        {
+            return None;
+        }
+        let index = Self::healthy_worker_for_identity(workers, &assignment.worker)?;
+        assignment.last_access = now;
+        Some(index)
+    }
+
     fn select_worker_impl(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -118,41 +148,26 @@ impl DpStickyPolicy {
         };
         let now = Instant::now();
 
-        if let Some(mut assignment) = self.assignments.get_mut(session_id) {
-            let is_expired = now.saturating_duration_since(assignment.last_access)
-                > SESSION_REASSIGNMENT_IDLE_TIMEOUT;
-            if !is_expired {
-                if let Some(index) = Self::healthy_worker_for_identity(workers, &assignment.worker)
-                {
-                    assignment.last_access = now;
-                    return Some(index);
-                }
-            }
+        if let Some(index) = self.resolve_existing(workers, session_id, now) {
+            return Some(index);
         }
 
-        // New, expired, or orphaned sessions must assign atomically: another
-        // request may have pinned this session while this one waited for the lock.
-        let _assign_guard = self
-            .assign_lock
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if let Some(mut assignment) = self.assignments.get_mut(session_id) {
-            let is_expired = now.saturating_duration_since(assignment.last_access)
-                > SESSION_REASSIGNMENT_IDLE_TIMEOUT;
-            if !is_expired {
-                if let Some(index) = Self::healthy_worker_for_identity(workers, &assignment.worker)
-                {
-                    assignment.last_access = now;
-                    return Some(index);
-                }
-            }
+        // New, expired, or orphaned session: assign under the lock so concurrent
+        // newcomers observe each other's pins instead of all reading the same
+        // counts and landing on one worker.
+        let _guard = self.assign_lock.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Another thread may have assigned this session while we waited.
+        if let Some(index) = self.resolve_existing(workers, session_id, now) {
+            return Some(index);
         }
 
         let selected_index = self.select_new_session_worker(workers, now)?;
+        let selected_worker = Self::worker_identity(&workers[selected_index]);
         self.assignments.insert(
             session_id.to_string(),
             StickyAssignment {
-                worker: Self::worker_identity(&workers[selected_index]),
+                worker: selected_worker,
                 last_access: now,
             },
         );
