@@ -118,6 +118,9 @@ class LMCacheOffloadConnector(KVConnectorBase):
         offcfg.apply_extra_overrides(
             cfg, getattr(self._config, "kv_transfer_config", None)
         )
+        # Applied here, not on the scheduler-side lookup client below: this is
+        # the only path that allocates the CPU pool.
+        offcfg.scale_cpu_size_for_pp(cfg, self._config)
         self.chunk_size = int(cfg.chunk_size)
         # num_blocks is the scheduler-visible block count, threaded from the
         # model runner. MLA stores its KV token-major, so the codec cannot infer
