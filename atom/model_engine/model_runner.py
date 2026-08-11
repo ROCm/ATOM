@@ -106,7 +106,9 @@ support_model_arch_dict = {
     "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MultimodalModel",
     "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MoeMultimodalModel",
     "KimiK25ForConditionalGeneration": "atom.models.kimi_k25.KimiK25ForCausalLM",
-    "KimiK3ForConditionalGeneration": "atom.models.kimi_k3.KimiK3ForCausalLM",
+    "KimiK3ForConditionalGeneration": (
+        "atom.models.kimi_k3.KimiK3ForConditionalGeneration"
+    ),
     "MiniMaxM2ForCausalLM": "atom.models.minimax_m2.MiniMaxM2ForCausalLM",
     "MiMoV2ForCausalLM": "atom.models.mimo_v2.MiMoV2ForCausalLM",
     "MiMoV2FlashForCausalLM": "atom.models.mimo_v2.MiMoV2ForCausalLM",
@@ -2846,7 +2848,15 @@ class ModelRunner:
             # prefill, or decode forced eager (enforce_eager / DP peer
             # prefill / bs above the largest captured graph).
             with record_function(label):
-                # Handle multimodal prefill: compute vision embeddings and merge
+                # Handle multimodal prefill: compute vision embeddings and merge.
+                #
+                # This assumes `input_ids` spans the whole prompt: the encoder
+                # runs over every image and the result is scattered onto all
+                # placeholder positions found in the batch. The scheduler
+                # therefore refuses to chunk a multimodal prefill.
+                # TODO: support chunked multimodal prefill — cache the encoder
+                # output per request and scatter only the slice belonging to
+                # this chunk, keyed by its token offset into the prompt.
                 inputs_embeds = None
                 if (
                     is_prefill
