@@ -351,10 +351,11 @@ class EngineArgs:
                 "chunk boundaries. "
                 "0 disables state checkpointing entirely. -1 keeps it on but "
                 "places no interval rungs: checkpoints are then taken only "
-                "where a request was seen to want one — every rung costs the "
-                "prompt that keeps it an extra prefill chunk, and on measured "
-                "traces the interval ladder is ~30x the writes for reuse the "
-                "demand rung already reaches."
+                "where a request is seen to want one and at each prompt's own "
+                "end, which is where agentic traffic actually resumes — every "
+                "rung costs the prompt that keeps it an extra prefill chunk, "
+                "and on measured traces the interval ladder is ~30x the writes "
+                "for reuse the other two placements already reach."
             ),
         )
         parser.add_argument(

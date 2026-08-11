@@ -105,6 +105,21 @@ class Sequence:
         # `BlockManager._record_checkpoint_demand` at admission; this one is
         # read by `checkpoint_cut` and `checkpointers_at`, which must agree.
         self.checkpoint_demand_pos = 0
+        # The demand's sibling: this prompt's own end, floored to the hash
+        # grid. 0 = nowhere.
+        #
+        # The demand is reactive — it only exists once a hit has already been
+        # refused for want of a checkpoint, which is one request too late for
+        # the position that serves the *next* turn of a conversation. On
+        # agentic traffic that position is where the reuse actually is: over
+        # the SemiAnalysis cc-traces, 93.5% of resumes land on a previous
+        # prompt's end and 0.0% on the interval ladder. So it is reserved up
+        # front rather than waited for.
+        #
+        # Written by `BlockManager._record_checkpoint_end` at admission, read
+        # by `checkpoint_cut` and `checkpointers_at` — which must agree, the
+        # same contract `checkpoint_demand_pos` is held to.
+        self.checkpoint_end_pos = 0
         # Where this seq last kept a checkpoint. Prefill lands on the grid so
         # this tracks it, but a speculative decode step lands wherever
         # `1 + accepted` puts it, and there the grid is unreachable — see
