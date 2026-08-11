@@ -800,7 +800,7 @@ jobs:
           #!/usr/bin/env bash
           set -euo pipefail
           srun --nodes=${node_count} --ntasks=${node_count} --ntasks-per-node=1 \
-            --kill-on-bad-exit=1 "${rank_script}"
+            "${rank_script}"
           EOF
           chmod +x "${batch_script}"
 
