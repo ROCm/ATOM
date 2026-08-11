@@ -292,38 +292,51 @@ class CudagraphCaptureRunner:
 
     def __init__(self, capture_error_mode: str = "thread_local"):
         self._graphs: dict = {}
+        self._out_bufs: dict = {}  # out_key -> persistent output buffer (stable addr)
         self._pool = None
         self._capture_error_mode = capture_error_mode
 
-    def get(self, key):
-        return self._graphs.get(key)
+    def _out_buf(self, out_key, sample):
+        b = self._out_bufs.get(out_key)
+        if b is None:
+            b = torch.empty_like(sample)
+            self._out_bufs[out_key] = b
+        return b
+
+    def stabilize(self, out_key, out, piecewise):
+        """PIECEWISE: funnel `out` into the fixed per-out_key buffer the downstream
+        dense piece was captured reading from (never a recyclable pool tensor).
+        Non-piecewise (FULL / eager): passthrough."""
+        if not piecewise:
+            return out
+        b = self._out_buf(out_key, out)
+        b.copy_(out)
+        return b
 
     def run(
         self,
         *,
         key,
+        out_key,
         args: tuple,
         zc: frozenset,
         compute_fn: Callable,
-        out_buf_fn: Callable,
-        is_capture: bool,
-        is_replay: bool,
-        stabilize_fn: Callable | None = None,
+        piecewise: bool,
+        in_hipgraph: bool,
     ):
-        """Dispatch capture / replay / eager for one op invocation.
+        """Dispatch capture / replay / eager for one op invocation. The runner
+        computes the schedule and owns the output buffers + stabilize.
 
-        key         : hashable graph key (caller-built)
+        key         : hashable graph key (caller-built, V4-specific)
+        out_key     : (layer, num_tokens) key for the persistent output buffer
         args        : input tensors (entries may be None)
         zc          : zero-copy arg indices (captured directly, skipped at replay)
         compute_fn  : callable(*bufs) -> output tensor (the core compute)
-        out_buf_fn  : callable(warm_out) -> persistent output buffer (stable addr)
-        is_capture  : _piecewise and _in_hipgraph and key not captured yet
-        is_replay   : _piecewise and not _in_hipgraph and key captured
-        stabilize_fn: optional callable(out)->out for the eager/fallback return
+        piecewise   : forward is in PIECEWISE cudagraph mode
+        in_hipgraph : this is the capture forward (vs real decode replay)
         """
-
-        def _stab(out):
-            return stabilize_fn(out) if stabilize_fn is not None else out
+        is_capture = piecewise and in_hipgraph and key not in self._graphs
+        is_replay = piecewise and not in_hipgraph and key in self._graphs
 
         if is_capture:
             # zc args captured directly; others cloned into owned stable buffers
@@ -332,7 +345,7 @@ class CudagraphCaptureRunner:
                 for i, t in enumerate(args)
             ]
             warm_out = compute_fn(*in_bufs)  # warmup before capture
-            out_buf = out_buf_fn(warm_out)  # persistent buffer, stable addr
+            out_buf = self._out_buf(out_key, warm_out)  # persistent, stable addr
             graph = torch.cuda.CUDAGraph()
             if self._pool is None:
                 self._pool = torch.cuda.graph_pool_handle()
@@ -345,7 +358,7 @@ class CudagraphCaptureRunner:
                 cg_out = compute_fn(*in_bufs)
                 out_buf.copy_(cg_out)  # output copy baked into graph
             self._graphs[key] = {"graph": graph, "in": in_bufs, "out": out_buf}
-            return _stab(compute_fn(*args))  # genuine eager result this forward
+            return self.stabilize(out_key, compute_fn(*args), piecewise)
 
         if is_replay:
             entry = self._graphs[key]
@@ -357,4 +370,4 @@ class CudagraphCaptureRunner:
             entry["graph"].replay()
             return entry["out"]  # persistent buf, refreshed in-graph
 
-        return _stab(compute_fn(*args))  # eager fallback
+        return self.stabilize(out_key, compute_fn(*args), piecewise)  # eager

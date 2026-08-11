@@ -167,10 +167,6 @@ def _v4_attention_fake(
     return torch.empty_like(x)
 
 
-# PIECEWISE cudagraph: persistent per-(layer, num_tokens) buffers holding each
-# attention op's output (eager core -> next graph piece boundary).
-_v4_attn_piecewise_out: dict = {}
-
 # PIECEWISE cudagraph: persistent per-(layer, num_tokens, arg) buffers holding a
 # snapshot of the eager core's transient projection inputs (q/kv_pre/qr/qr_scale/
 # idx_*). Those are outputs of the preceding graph piece and live in the SHARED
@@ -194,7 +190,7 @@ def _pin_core_input(layer_name: str, arg_idx: int, num_tokens: int, t):
 
 
 # AF_PIECEWISE: attn-core capture/replay (keyed layer, bucket_bs, q_eff, nt_pad).
-# Owns its isolated graph pool + per-key graph cache.
+# Owns its isolated graph pool + per-key graph cache + output buffers.
 _v4_attn_runner = CudagraphCaptureRunner()
 
 # Max decode num_tokens the q public buffer covers; also its row count. Decode
@@ -358,29 +354,10 @@ def v4_core_attention(
 
     _tensor_args = (x, q, kv_pre, qr, qr_scale, positions,
                     idx_q_quant, idx_weights, idx_q_scale)  # fmt: skip
+    # Persistent output buffer key (downstream dense piece reads this fixed addr).
+    out_key = (layer_name, int(x.shape[0]))
 
-    def _run_eager():
-        return self._attn_core(
-            x, q, kv_pre, qr, qr_scale, positions,
-            idx_q_quant, idx_weights, idx_q_scale,
-        )  # fmt: skip
-
-    def _stabilize(out):
-        # PIECEWISE: the DOWNSTREAM dense piece's cudagraph was captured reading
-        # attention output from this fixed per-(layer, num_tokens) address, so
-        # eager/replay/capture must all return THIS buffer (never a pool tensor
-        # whose address a later piece can recycle).
-        if not _piecewise:
-            return out
-        k = (layer_name, int(out.shape[0]))
-        b = _v4_attn_piecewise_out.get(k)
-        if b is None:
-            b = torch.empty_like(out)
-            _v4_attn_piecewise_out[k] = b
-        b.copy_(out)
-        return b
-
-    # AF_PIECEWISE: capture _attn_core into its own cudagraph (op body not traced)
+    # AF_PIECEWISE: capture _attn_core into its own cudagraph (op body not traced).
     _cg_mode = atom_config.compilation_config.cudagraph_mode
     _attn_cg = (
         _cg_mode is not None
@@ -394,34 +371,20 @@ def v4_core_attention(
         # len (no rectangle-pad tail). See _v4_attn_bucket_bs_q for bucket_bs/q_eff.
         bucket_bs, q_eff = _v4_attn_bucket_bs_q(fc, self)
         key = (layer_name, bucket_bs, q_eff, int(x.shape[0]))
-        _in_hipgraph = getattr(fc, "in_hipgraph", False)
-        # zc args are fixed-address public/persistent buffers; only x(0) is copied
-        _zc = frozenset({1, 2, 3, 4, 5, 6, 7, 8})
-
-        def _out_buf_fn(warm_out):
-            k = (layer_name, int(warm_out.shape[0]))
-            b = _v4_attn_piecewise_out.get(k)
-            if b is None:
-                b = torch.empty_like(warm_out)
-                _v4_attn_piecewise_out[k] = b
-            return b
-
+        # zc args are fixed-address public/persistent buffers; only x(0) is copied.
         return _v4_attn_runner.run(
             key=key,
+            out_key=out_key,
             args=_tensor_args,
-            zc=_zc,
+            zc=frozenset({1, 2, 3, 4, 5, 6, 7, 8}),
             compute_fn=self._attn_core,
-            out_buf_fn=_out_buf_fn,
-            is_capture=(
-                _piecewise and _in_hipgraph and _v4_attn_runner.get(key) is None
-            ),
-            is_replay=(
-                _piecewise and not _in_hipgraph and _v4_attn_runner.get(key) is not None
-            ),
-            stabilize_fn=_stabilize,
+            piecewise=_piecewise,
+            in_hipgraph=getattr(fc, "in_hipgraph", False),
         )
 
-    return _stabilize(_run_eager())
+    return _v4_attn_runner.stabilize(
+        out_key, self._attn_core(*_tensor_args), _piecewise
+    )
 
 
 # ---------------------------------------------------------------------------
