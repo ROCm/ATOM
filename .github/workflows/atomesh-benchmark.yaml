@@ -392,7 +392,7 @@ jobs:
     timeout-minutes: 45
     env:
       RDMA_SMOKE_IMAGE: ${{ needs.load-config.outputs.image }}
-      RDMA_SMOKE_NODES: ${{ inputs.rdma_smoke_nodes != '' && inputs.rdma_smoke_nodes || env.ATOMESH_1P1D_NODES }}
+      RDMA_SMOKE_NODES: ${{ inputs.rdma_smoke_nodes }}
       SLURM_SUBMIT_RUNNER: ${{ inputs.atomesh_slurm_submit_runner }}
     steps:
       - name: Run Mooncake RDMA transfer test on selected nodes
@@ -405,7 +405,8 @@ jobs:
             exit 1
           fi
 
-          nodes="${RDMA_SMOKE_NODES// /}"
+          nodes="${RDMA_SMOKE_NODES:-${ATOMESH_1P1D_NODES:-}}"
+          nodes="${nodes// /}"
           if [[ -n "${nodes}" ]]; then
             IFS=',' read -r -a node_list <<< "${nodes}"
             node_count="${#node_list[@]}"
