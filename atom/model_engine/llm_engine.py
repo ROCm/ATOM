@@ -6,7 +6,9 @@ import logging
 import time
 from collections import Counter
 from dataclasses import fields
-from typing import Any, Dict, List, Optional, Union
+from typing import Any
+
+from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 from atom.config import Config
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
@@ -14,7 +16,6 @@ from atom.model_engine.multimodal import get_mrope_input_positions
 from atom.model_engine.sequence import Sequence
 from atom.sampling_params import SamplingParams
 from atom.utils import envs
-from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 logger = logging.getLogger("atom")
 
@@ -153,11 +154,11 @@ class LLMEngine:
 
     def add_request(
         self,
-        prompt_or_tokens_list: List[Union[str, List[int]]],
-        sampling_params_list: SamplingParams | List[SamplingParams],
+        prompt_or_tokens_list: list[str | list[int]],
+        sampling_params_list: SamplingParams | list[SamplingParams],
         stream_callback=None,
-        multimodal_data_list: List[dict] | None = None,
-        request_ids: Optional[list[str]] = None,
+        multimodal_data_list: list[dict] | None = None,
+        request_ids: list[str] | None = None,
     ):
         # if sampling params is not list, use it for all prompts
         if not isinstance(sampling_params_list, list):
@@ -235,7 +236,7 @@ class LLMEngine:
         self,
         prompts: list[str],
         sampling_params: SamplingParams | list[SamplingParams],
-        request_ids: Optional[list[str]] = None,
+        request_ids: list[str] | None = None,
     ) -> list[str]:
         # Reset DP routing state (round-robin cursor + in-flight load) so a
         # fresh batch gets deterministic DP assignment and no leaked counts.
@@ -281,7 +282,7 @@ class LLMEngine:
         self.core_mgr.broadcast_utility_command_sync("start_profile")
         logger.info("Profiling started")
 
-    def stop_profile(self) -> List[Dict[str, Any]]:
+    def stop_profile(self) -> list[dict[str, Any]]:
         responses = self.core_mgr.broadcast_utility_command_sync(
             "stop_profile", timeout=envs.ATOM_PROFILER_TIMEOUT
         )
@@ -290,7 +291,7 @@ class LLMEngine:
     def print_mtp_statistics(self):
         self.core_mgr.send_utility_command("get_mtp_stats")
 
-    def get_mtp_statistics(self, timeout: float = 30.0) -> Dict[str, Any]:
+    def get_mtp_statistics(self, timeout: float = 30.0) -> dict[str, Any]:
         """Return aggregated speculative decoding statistics across DP ranks."""
         responses = self.core_mgr.broadcast_utility_command_sync(
             "get_mtp_statistics", timeout=timeout
@@ -337,6 +338,63 @@ class LLMEngine:
             },
         }
 
+    def get_cache_statistics(self, timeout: float = 30.0) -> dict[str, Any]:
+        """Return aggregated prefix-cache statistics across DP ranks.
+
+        The four rates are the ones `[Cache Stats]` logs, recomputed from
+        summed counters rather than averaged: ranks admit different numbers of
+        tokens, so the mean of their rates is not the rate of their union.
+
+        `cached <= wanted <= compressed <= full` by construction, which is what
+        makes the differences below meaningful:
+          hit                 reuse actually admitted
+          compressed_hit      reuse the prefix index held, before the
+                              per-request state classes had their say
+          lost_to_checkpoint  declined only because no checkpoint existed at
+                              that boundary — what a denser ladder recovers
+          lost_unrecoverable  declined for a reason no checkpoint touches
+        """
+        responses = self.core_mgr.broadcast_utility_command_sync(
+            "get_cache_statistics", timeout=timeout
+        )
+        rank_stats = [
+            resp.get("result", resp)
+            for resp in responses
+            if resp.get("result", resp).get("enabled", False)
+        ]
+        totals = {
+            key: sum(int(stats.get(key, 0)) for stats in rank_stats)
+            for key in (
+                "requests",
+                "cached_tokens",
+                "compressed_tokens",
+                "wanted_tokens",
+                "full_tokens",
+                "checkpoints_kept",
+                "checkpoints_dropped",
+                "checkpoints_evicted",
+                "demands_recorded",
+                "chunks_cut_for_demand",
+            )
+        }
+        full = totals["full_tokens"]
+
+        def rate(num: int) -> float:
+            return num / full if full else 0.0
+
+        return {
+            "enabled": bool(rank_stats),
+            **totals,
+            "hit": rate(totals["cached_tokens"]),
+            "compressed_hit": rate(totals["compressed_tokens"]),
+            "lost_to_checkpoint": rate(
+                totals["wanted_tokens"] - totals["cached_tokens"]
+            ),
+            "lost_unrecoverable": rate(
+                totals["compressed_tokens"] - totals["wanted_tokens"]
+            ),
+        }
+
 
 class InputOutputProcessor:
 
@@ -370,7 +428,7 @@ class InputOutputProcessor:
 
         Read by Sequence-construction (here) AND by ModelRunner's startup
         sanity check, which asserts that any model whose attention builder
-        returns `compute_per_req_cache_bytes() > 0` has its model_type
+        declares a per-request state sub-pool has its model_type
         registered here. Adding a new stateful-attention model means
         adding its model_type to this set.
         """
@@ -391,7 +449,7 @@ class InputOutputProcessor:
         stream_callback=None,
         kv_transfer_params=None,
         multimodal_data=None,
-        request_id: Optional[str] = None,
+        request_id: str | None = None,
     ):
         """responsible for:
         1) Tokenize
@@ -421,11 +479,11 @@ class InputOutputProcessor:
         prompt_or_tokens: str | list[int],
         sampling_params: SamplingParams,
         stream_callback=None,
-        stream_callbacks: Optional[List] = None,
+        stream_callbacks: list | None = None,
         kv_transfer_params=None,
         multimodal_data=None,
-        parent_request_id: Optional[str] = None,
-    ) -> List[Sequence]:
+        parent_request_id: str | None = None,
+    ) -> list[Sequence]:
         """Tokenize once and materialize ``sampling_params.n`` Sequences.
 
         Returns a list of length ``n``. For ``n == 1`` this is functionally
@@ -475,7 +533,7 @@ class InputOutputProcessor:
                 f"stream_callbacks length {len(stream_callbacks)} does not match n={n}"
             )
 
-        seqs: List[Sequence] = []
+        seqs: list[Sequence] = []
         for i in range(n):
             cb = (
                 stream_callbacks[i] if stream_callbacks is not None else stream_callback
@@ -518,7 +576,7 @@ class InputOutputProcessor:
             )
         return seqs
 
-    def postprocess(self, reqs: List[Sequence]):
+    def postprocess(self, reqs: list[Sequence]):
         """responsible for:
         1) Compute stats for logging
         2) Detokenize"""

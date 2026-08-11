@@ -457,16 +457,17 @@ class DSparkLayer(Block):  # type: ignore[misc]
             )
             self.hc_head_scale = atom_parameter(torch.empty(1, dtype=torch.float32))
 
-        # PAGED-SWA: draft window KV lives in a paged pool bound by
+        # The draft window KV lives in an SWA ring bound by
         # DeepseekV4AttentionMetadataBuilder.build_kv_cache_tensor at
         # allocate_kv_cache; see precompute_context_kv / dspark_attention.
         #
-        # Mark this attn as a DSpark draft layer so the builder always binds it a
-        # PRIVATE bf16 SWA pool, even under an fp8 target KV cache. DSpark's block
-        # attention runs bf16 (no fused fp8 kernel for its [window ++ draft-block]
-        # shape), so an fp8 draft window is a measured net regression. The target
-        # KV cache is unaffected (still fp8).
-        self.attn.dspark_draft = True
+        # What this layer's window has to be made of, which the pool reserves
+        # rather than infers. DSpark's block attention runs bf16 — there is no
+        # fused fp8 kernel for its [window ++ draft-block] shape and forcing
+        # one measured as a net regression. The day one lands, this line is the
+        # whole change: the pool prices the window off this dtype and lays it
+        # out the same way whether or not it matches the pool's own.
+        self.attn.window_kv_dtype = torch.bfloat16
 
     def reset_kv_cache(self, max_num_seqs: int, device, dtype) -> None:
         """No-op: draft KV is paged into the shared pool (bound at
@@ -524,50 +525,51 @@ class DSparkLayer(Block):  # type: ignore[misc]
         position regardless of whether they were ever written. See
         :meth:`DSparkProposer.propose` for why writing rejected rows is safe.
 
-        PAGED-SWA: the draft window KV now lives in the shared paged pool
-        (``self.attn.swa_kv``, this draft layer's slice of ``unified_kv``),
-        content-addressed by ``swa_block_tables`` exactly like the V4 target SWA
-        (#1417). ``swa_write`` is the same cudagraph-safe Triton kernel the target
-        uses: it derives all indices in-kernel from ``cu_seqlens_q`` +
-        ``positions`` (no advanced-index buffer-mutation, no ``.item()`` sync), so
-        it graph-replays correctly. The physical destination comes entirely from
-        ``swa_block_tables``, so no per-request state slot is needed here.
+        The draft window KV lives in the draft layer's own plane
+        (``self.attn.swa_plane``), addressed by ``self.attn.swa_window`` exactly
+        like the V4 target's window. ``swa_write`` is the same
+        cudagraph-safe Triton kernel the target uses: it derives all indices
+        in-kernel from ``cu_seqlens_q`` + ``positions`` (no advanced-index
+        buffer-mutation, no ``.item()`` sync), so it graph-replays correctly.
+
+        ``write_per_batch`` must not exceed ``a.swa_window.ring_slots``; the
+        draft's ``window_size`` and the target's ``win_with_spec`` are separate
+        configs and ``swa_write`` asserts the relation rather than aliasing
+        silently.
         """
         from atom.utils.forward_context import get_forward_context
 
         fc = get_forward_context()
-        # warmup_model runs BEFORE allocate_kv_cache, so `self.attn.swa_kv` /
-        # `swa_block_size` are unbound and `swa_block_tables` is absent. Same
-        # short-circuit as the V4 target (deepseek_v4.py is_dummy_run guard):
-        # skip the paged SWA write on dummy runs — warmup discards draft output.
+        # warmup_model runs BEFORE allocate_kv_cache, so `self.attn.swa_plane`
+        # / `swa_window` are unbound. Same short-circuit as the V4 target
+        # (deepseek_v4.py is_dummy_run guard): skip the SWA write on dummy runs
+        # — warmup discards draft output.
         if fc.context.is_dummy_run:
             return
         attn_md = fc.attn_metadata
         a = self.attn
         main_kv = self._compute_main_kv(main_x, positions)  # [T, head_dim]
-        # The SWA pool is allocated bf16 for DSpark draft layers regardless of the
-        # target's kv_cache_dtype, while main_kv carries the model dtype — two
-        # independent sources. Assert instead of casting so a mismatch surfaces
-        # here rather than as a silent per-step copy (or a silently reinterpreted
-        # store inside the swa_write kernel, which has no dtype guard).
-        # `raise`, not `assert`: a bare assert vanishes under `python -O`, and
-        # swa_write has no dtype guard, so the mismatch would become a silently
-        # reinterpreted store.
-        if main_kv.dtype != a.swa_kv.dtype:
+        # The window was reserved at the dtype this layer declared in
+        # `window_kv_dtype`, while main_kv carries whatever the projections
+        # produce — two independent sources. Assert instead of casting so a
+        # mismatch surfaces here rather than as a silent per-step copy, or as a
+        # silently reinterpreted store inside swa_write, which has no dtype
+        # guard. `raise`, not `assert`: a bare assert vanishes under `python -O`.
+        if main_kv.dtype != a.swa_plane.dtype:
             raise TypeError(
-                f"DSpark draft KV dtype {main_kv.dtype} != SWA pool dtype "
-                f"{a.swa_kv.dtype}. The draft pool is allocated bf16 "
-                "unconditionally; a non-bf16 --dtype needs that allocation "
-                "widened, not a cast here."
+                f"DSpark draft KV dtype {main_kv.dtype} != window dtype "
+                f"{a.swa_plane.dtype}, which is what this layer asked the pool "
+                "to reserve. Change `window_kv_dtype` to match the projections, "
+                "not cast here."
             )
         B = cu_seqlens_q.shape[0] - 1
         swa_write(
             main_kv,  # [T, head_dim]
             positions,  # [T] int64
             cu_seqlens_q,  # [B+1] int32, per-req spans
-            attn_md.swa_block_tables[:B],  # [B, max_blocks]
-            a.swa_kv,  # [num_pages, head_dim]
-            a.swa_block_size,
+            attn_md.state_slot_out[:B],  # [B] ring slot per request
+            a.swa_plane,  # [plane_rows, head_dim]
+            a.swa_window,
             write_per_batch,
         )
 
@@ -624,27 +626,27 @@ class DSparkLayer(Block):  # type: ignore[misc]
 
         # Assemble the [window ++ draft block] KV. The window-validity mask and
         # gather indices are stage-invariant and come from the block plan; only
-        # the KV gather is per-stage (each stage owns its own swa_kv slice).
-        # PAGED-SWA: gather the dense [B, W, head_dim] rolling window from the
-        # shared paged pool (this draft layer's swa_kv slice), addressed by
-        # swa_block_tables — the same content-addressing the write used.
+        # the KV gather is per-stage (each stage owns its own plane).
+        # Gather the dense [B, W, head_dim] rolling window from this draft
+        # layer's plane, addressed by the request's state slot — the same
+        # expression the write used.
         from atom.utils.forward_context import get_forward_context
 
         fc = get_forward_context()
         W = self.window_size
         if fc.context.is_dummy_run:
-            # warmup runs BEFORE allocate_kv_cache → swa_kv / swa_block_tables
+            # warmup runs BEFORE allocate_kv_cache → swa_plane / state_slot_out
             # unbound. All-zero window so the forward still compiles at shape
             # (draft output is discarded).
             window_kv = kv.new_zeros(B, W, a.head_dim)
         else:
             attn_md = fc.attn_metadata
             window_kv = dspark_paged_window_gather(
-                a.swa_kv,  # [num_pages, head_dim]
-                attn_md.swa_block_tables[:B],  # [B, max_blocks]
+                a.swa_plane,  # [plane_rows, head_dim]
+                attn_md.state_slot_out[:B],  # [B] ring slot per request
                 positions,  # [B] anchor positions
                 W,
-                a.swa_block_size,
+                a.swa_window,
             )  # [B, W, head_dim]
         all_kv = torch.cat([window_kv, kv], dim=1)  # [B, W+T, head_dim]
 

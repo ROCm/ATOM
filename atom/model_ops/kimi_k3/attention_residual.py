@@ -8,6 +8,7 @@ from __future__ import annotations
 import torch
 
 from atom.utils.custom_register import direct_register_custom_op
+from atom.utils.decorators import mark_trace
 
 try:
     import triton
@@ -482,6 +483,7 @@ direct_register_custom_op(
 )
 
 
+@mark_trace
 def apply_attn_res(
     prefix_sum: torch.Tensor,
     block_residual: torch.Tensor,
