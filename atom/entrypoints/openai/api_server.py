@@ -15,6 +15,7 @@ Usage:
 import asyncio
 import base64
 import binascii
+import gc
 import io
 import json
 import logging
@@ -37,6 +38,7 @@ from atom import SamplingParams
 from atom.model_engine.arg_utils import EngineArgs
 from atom.model_engine.llm_engine import _load_tokenizer
 from atom.model_engine.request import RequestOutput
+from atom.utils import envs
 from atom.utils.arg_parser import FlexibleArgumentParser
 
 from .chat_encoders import apply_chat_template, load_custom_message_encoder
@@ -1038,10 +1040,39 @@ async def setup_streaming_request_fanout(
 # ============================================================================
 
 
+def _tune_gc() -> None:
+    """Stretch the interval between full (generation-2) collections.
+
+    Only gen-2 matters: it is stop-the-world and rescans every tracked
+    container, so its cost tracks live objects rather than recent garbage.
+    At c=2048 it was 47% of wall clock while the 23k gen-0/1 passes over the
+    same window cost 0.1s. Raising the thresholds is close to free because
+    reference counting, not the collector, reclaims everything acyclic --
+    peak RSS actually fell, since a larger gen-0 threshold lets more objects
+    die before a collection can promote them.
+
+    gc.freeze() was tried here and removed: once gen-2 stops running there is
+    nothing left for it to make cheaper, and alone it made collections more
+    frequent by emptying gen-2, which is the denominator CPython gates full
+    collections on (long_lived_pending > long_lived_total / 4).
+    """
+    thresholds = envs.ATOM_GC_THRESHOLD
+    if not thresholds:
+        return
+    try:
+        t = tuple(int(x) for x in thresholds.split(","))
+        old = gc.get_threshold()
+        gc.set_threshold(*t)
+        logger.info("[gc] thresholds %s -> %s", old, t)
+    except (ValueError, TypeError):
+        logger.warning("[gc] bad ATOM_GC_THRESHOLD=%r, ignored", thresholds)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown."""
     logger.info("Server started successfully and ready to accept requests")
+    _tune_gc()
     yield
     logger.info("Server shutting down, releasing resources...")
     if engine is not None:
@@ -1721,7 +1752,6 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
 @app.get("/v1/models")
 async def list_models():
     """List available models."""
-    global model_name
     return ModelList(data=[ModelCard(id=model_name)])
 
 
@@ -1734,16 +1764,29 @@ async def health():
 @app.get("/debug/mtp_stats")
 async def get_mtp_stats():
     """Return current speculative decoding acceptance statistics."""
-    global engine
     if engine is None:
         raise HTTPException(status_code=503, detail="Engine is not initialized")
     try:
         return engine.get_mtp_statistics()
     except Exception as e:
-        logger.error(f"Failed to get MTP statistics: {e}", exc_info=True)
+        logger.exception("Failed to get MTP statistics")
         raise HTTPException(
-            status_code=500, detail=f"Failed to get MTP statistics: {str(e)}"
+            status_code=500, detail=f"Failed to get MTP statistics: {e!s}"
         )
+
+
+@app.get("/debug/cache_stats")
+async def get_cache_stats():
+    """Return cumulative prefix-cache reuse statistics."""
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Engine is not initialized")
+    try:
+        return engine.get_cache_statistics()
+    except Exception as e:
+        logger.exception("Failed to get cache statistics")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to get cache statistics: {e}"
+        ) from e
 
 
 def _resolve_kv_transfer_role(kv_cfg: dict) -> tuple[str | None, int]:
@@ -1771,7 +1814,6 @@ def _resolve_kv_transfer_role(kv_cfg: dict) -> tuple[str | None, int]:
 
 @app.get("/kv_transfer_info")
 async def kv_transfer_info():
-    global engine
     cfg = engine.config
     kv_cfg = cfg.kv_transfer_config or {}
     kv_role, handshake_port = _resolve_kv_transfer_role(kv_cfg)
@@ -1786,21 +1828,17 @@ async def kv_transfer_info():
 @app.post("/start_profile")
 async def start_profile():
     """Start profiling the engine."""
-    global engine
     try:
         engine.start_profile()
         return {"status": "success", "message": "Profiling started"}
     except Exception as e:
-        logger.error(f"Failed to start profiling: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=500, detail=f"Failed to start profiling: {str(e)}"
-        )
+        logger.exception("Failed to start profiling")
+        raise HTTPException(status_code=500, detail=f"Failed to start profiling: {e!s}")
 
 
 @app.post("/stop_profile")
 async def stop_profile():
     """Stop profiling the engine."""
-    global engine
     try:
         traces = engine.stop_profile()
         return {
@@ -1809,10 +1847,8 @@ async def stop_profile():
             "traces": traces,
         }
     except Exception as e:
-        logger.error(f"Failed to stop profiling: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=500, detail=f"Failed to stop profiling: {str(e)}"
-        )
+        logger.exception("Failed to stop profiling")
+        raise HTTPException(status_code=500, detail=f"Failed to stop profiling: {e!s}")
 
 
 # ============================================================================

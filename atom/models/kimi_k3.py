@@ -59,7 +59,7 @@ from atom.models.utils import (
 )
 from atom.quant_spec import should_skip_online_quant
 from atom.utils import envs, mark_spliting_op
-from atom.utils.decorators import support_torch_compile
+from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import get_forward_context
 
 
@@ -573,7 +573,9 @@ class KimiFullAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.fused_qkv_a_proj",
         )
-        self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=1e-6)
+        self.q_a_layernorm = RMSNorm(
+            self.q_lora_rank, eps=1e-6, prefix=f"{prefix}.q_a_layernorm"
+        )
         self.q_b_proj = ColumnParallelLinear(
             self.q_lora_rank,
             self.num_heads * self.q_head_dim,
@@ -581,7 +583,9 @@ class KimiFullAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.q_b_proj",
         )
-        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=1e-6)
+        self.kv_a_layernorm = RMSNorm(
+            self.kv_lora_rank, eps=1e-6, prefix=f"{prefix}.kv_a_layernorm"
+        )
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
@@ -1002,6 +1006,7 @@ class KimiKDAAttention(nn.Module):
             hidden_states, hidden_states_scale, self.layer_name
         )
 
+    @mark_trace
     def _forward_impl(
         self,
         hidden_states: torch.Tensor,
@@ -1282,9 +1287,15 @@ class KimiDecoderLayer(nn.Module):
         if self.use_attn_residuals:
             self.attn_res_block_size = config.attn_res_block_size
             self.self_attention_res_norm = RMSNorm(
-                config.hidden_size, eps=config.rms_norm_eps
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+                prefix=f"{prefix}.self_attention_res_norm",
             )
-            self.mlp_res_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.mlp_res_norm = RMSNorm(
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+                prefix=f"{prefix}.mlp_res_norm",
+            )
             self.self_attention_res_proj = ReplicatedLinear(
                 config.hidden_size,
                 1,
@@ -1449,10 +1460,14 @@ class KimiLinearModel(nn.Module):
             layer_num_offset=0,
         )
         if get_pp_group().is_last_rank:
-            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.norm = RMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps, prefix=f"{prefix}.norm"
+            )
             if getattr(config, "attn_res_block_size", None) is not None:
                 self.output_attn_res_norm = RMSNorm(
-                    config.hidden_size, eps=config.rms_norm_eps
+                    config.hidden_size,
+                    eps=config.rms_norm_eps,
+                    prefix=f"{prefix}.output_attn_res_norm",
                 )
                 self.output_attn_res_proj = ReplicatedLinear(
                     config.hidden_size,
