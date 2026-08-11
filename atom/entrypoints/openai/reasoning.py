@@ -10,6 +10,7 @@ All model-specific marker knowledge lives in ``reasoning_dialects.DIALECTS``;
 this module contains no per-model conditions. Add a model there, not here.
 """
 
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from .reasoning_dialects import DIALECTS
@@ -37,6 +38,25 @@ def prompt_starts_in_reasoning(prompt: str) -> bool:
     (:attr:`ReasoningFilter.starts_thinking`)."""
     p = prompt.rstrip()
     return any(p.endswith(m) for m in _REASONING_OPEN_MARKERS)
+
+
+def prompt_tokens_start_in_reasoning(
+    token_ids: Sequence[int], decode: Callable[[Sequence[int]], str]
+) -> bool:
+    """:func:`prompt_starts_in_reasoning` for an already-tokenized prompt.
+
+    Multimodal requests reach the engine as token ids, and decoding all of them
+    would be wasteful — an image prompt runs to thousands of tokens while only
+    the end is inspected. Decoding as many trailing tokens as the longest marker
+    has *characters* is always enough, because a token never renders to fewer
+    than one character.
+
+    ``decode`` is injected so this module stays free of tokenizer knowledge.
+    """
+    if not _REASONING_OPEN_MARKERS or not len(token_ids):
+        return False
+    tail = max(len(m) for m in _REASONING_OPEN_MARKERS)
+    return prompt_starts_in_reasoning(decode(token_ids[-tail:]))
 
 
 def _earliest_marker(buf: str, markers) -> tuple[int, str | None]:

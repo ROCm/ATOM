@@ -12,6 +12,7 @@ from atom.utils import envs
 from .aiter_mla import AiterMLAMetadataBuilder
 from .backends import AttentionBackend
 from .gdn_attn import GDNStateMixin
+from .sub_pool_spec import SubPoolSpec, page_pool
 from .triton_mla import TritonMLAMetadataBuilder
 
 
@@ -43,7 +44,9 @@ class _KimiMLAGDNCommon(GDNStateMixin):
             for index, layer in enumerate(model_runner.kda_attention_layers)
         }
 
-    def compute_block_bytes(self) -> int:
+    def sub_pool_specs(self) -> list[SubPoolSpec]:
+        """MLA paged KV for the full-attention layers, plus the KDA/GDN
+        per-request state pool (`GDNStateMixin.state_spec`)."""
         runner = self.model_runner
         config = runner.config
         hf = config.hf_config
@@ -51,7 +54,8 @@ class _KimiMLAGDNCommon(GDNStateMixin):
         num_layers = runner.num_full_attn + num_draft
         entry = hf.kv_lora_rank + hf.qk_rope_head_dim
         kv_dtype_size = dtypes.d_dtypes[config.kv_cache_dtype].itemsize
-        return num_layers * runner.block_size * entry * kv_dtype_size
+        block_bytes = num_layers * runner.block_size * entry * kv_dtype_size
+        return [page_pool(block_bytes), self.state_spec()]
 
     def allocate_kv_cache_tensors(
         self, num_kv_heads: int, num_draft_layers: int
