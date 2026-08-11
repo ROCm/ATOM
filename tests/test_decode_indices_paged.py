@@ -49,8 +49,7 @@ CSA_HEAD = [3, 0, 5, 0]
 HCA_HEAD = [1, 2, 0, 0]
 
 
-@pytest.fixture(scope="module")
-def indices():
+def build(geometry):
     """Run kernel and reference over one shared decode batch."""
     torch.manual_seed(0)
     positions = torch.tensor(POSITIONS, dtype=torch.int32, device=DEV)
@@ -93,7 +92,7 @@ def indices():
             dest_rows=dest,
             T=T,
             win=WIN,
-            geometry=GEOMETRY,
+            geometry=geometry,
             **ptrs,
             **bufs,
         )
@@ -102,10 +101,16 @@ def indices():
     ref = run(write_v4_paged_decode_indices_reference)
     ker = run(write_v4_paged_decode_indices)
     torch.cuda.synchronize()
+    return {"ref": ref, "ker": ker, "ptrs": ptrs}
+
+
+@pytest.fixture(scope="module")
+def indices():
+    out = build(GEOMETRY)
     # Two buffers both left at the sentinel compare equal, so check the SWA
     # section — the one this kernel fills completely — actually got written.
-    assert not (ref["swa_indices"] == -7).any(), "reference wrote no SWA indices"
-    return {"ref": ref, "ker": ker, "ptrs": ptrs}
+    assert not (out["ref"]["swa_indices"] == -7).any(), "reference wrote no SWA indices"
+    return out
 
 
 @pytest.mark.parametrize("section", ["swa_indices", "csa_indices", "hca_indices"])
@@ -158,6 +163,43 @@ def test_the_three_buffers_disagree_by_class(indices):
         (HCA_RATIO, hca_row),
     ):
         assert row == GEOMETRY.window_params(ratio).index(SLOTS[1], 13)
+
+
+# A pool with no dense layer at all. V4-Pro's trunk is entirely CSA and HCA and
+# its one ratio-0 layer is the draft slot, so a draft that carries its window in
+# a state field takes the dense class out of the geometry with it. The builders
+# used to ask for that class unconditionally and died on a bare KeyError before
+# any of this ran.
+NO_DENSE_GEOMETRY = UnifiedPoolGeometry(
+    [CSA_RATIO, HCA_RATIO, CSA_RATIO, HCA_RATIO],
+    num_blocks=4,
+    num_slots=6,
+    ring_slots=CACHE_SIZE,
+    block_size=256,
+)
+
+
+@pytest.fixture(scope="module")
+def no_dense():
+    return build(NO_DENSE_GEOMETRY)
+
+
+@pytest.mark.parametrize("section", ["csa_indices", "hca_indices"])
+def test_the_served_classes_are_unaffected_by_a_missing_one(no_dense, section):
+    ref, ker = no_dense["ref"][section], no_dense["ker"][section]
+    # Only the SWA tail of each slice belongs to this kernel; the compress head
+    # keeps the sentinel. So the check is that some of it moved, not all.
+    assert (ref != -7).any(), f"{section} was not written"
+    assert torch.equal(ker, ref), f"{section} mismatch\nref={ref}\nker={ker}"
+
+
+def test_a_missing_class_gets_no_rows_rather_than_borrowed_ones(no_dense):
+    """The parameters an absent class is launched with belong to another class,
+    so the failure this guards against is not a crash but a plausible row: the
+    SWA buffer filled with CSA addresses, which no reader would flag."""
+    for side in ("ref", "ker"):
+        assert (no_dense[side]["swa_indices"] == -7).all(), side
+        assert (no_dense[side]["dest"][DENSE_RATIO] == -7).all(), side
 
 
 # --- HCA compress paged offsets with more than one row per block ----------
