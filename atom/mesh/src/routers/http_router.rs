@@ -259,7 +259,7 @@ impl Router {
             policy_name,
         );
 
-        let load_guard = ["cache_aware", "manual"]
+        let load_guard = ["cache_aware", "manual", "dp_sticky"]
             .contains(&policy_name)
             .then(|| WorkerLoadGuard::new(worker.clone(), headers));
 

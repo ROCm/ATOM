@@ -24,7 +24,8 @@ ARG GPU_ARCH
 ENV GPU_ARCH_LIST=$GPU_ARCH
 ENV PYTORCH_ROCM_ARCH=$GPU_ARCH
 
-RUN pip install --upgrade pip && \
+# AITER's prebuilt and runtime-JIT modules must use the same pybind ABI.
+RUN pip install --upgrade pip "pybind11==3.0.4" && \
     apt-get update && \
     apt --fix-broken install -y && \
     apt-get install -y \
