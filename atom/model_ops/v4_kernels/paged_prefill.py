@@ -11,8 +11,9 @@ for design rationale.
 
 Caller contract:
   unified_kv:        [total_pages, D] BF16 — prefix source. Same buffer as
-    decode kernel: SWA ring slots in `[0, swa_pages)`, compress pages in
-    `[swa_pages, total_pages)`. For prefill, prefix indices select
+    decode kernel: one row space holding a request's sliding windows and the
+    compressed blocks alike (see `v4_pool_geometry`). For prefill, prefix
+    indices select
     (a) prior-chunk SWA history, (b) CSA topk, (c) HCA all-committed.
   kv_indices_prefix: [total_prefix_indices] int32 — flat per-token slot
     lists. Per-token entries live in
@@ -21,7 +22,7 @@ Caller contract:
   kv_indptr_prefix:  [N+1] int32 — true prefix sum (variable per-token len).
 
   kv:                [total_tokens, D] BF16 — extend source = current
-    fwd's just-computed K (NOT yet written to swa_kv ring). Layout matches
+    fwd's just-computed K (NOT yet written to the window). Layout matches
     `swa_write` input.
   kv_indices_extend: [total_extend_indices] int32 — flat per-token row idx
     lists into `kv`. Per-token entries live in
@@ -48,9 +49,9 @@ import torch
 import triton
 import triton.language as tl
 
-from atom.utils.decorators import mark_trace
-
+from atom.model_ops.v4_kernels.pool_index import row_offset
 from atom.utils import envs
+from atom.utils.decorators import mark_trace
 
 try:
     from aiter.ops.pa_sparse_prefill_opus import pa_sparse_prefill_opus
@@ -161,7 +162,7 @@ def _sparse_attn_v4_paged_prefill_kernel(
 
             kv_ptrs = (
                 unified_kv_ptr
-                + slot[:, None] * pkv_stride_n
+                + row_offset(slot, pkv_stride_n)[:, None]
                 + d_offs[None, :] * pkv_stride_d
             )
             if FULL_D:
@@ -317,7 +318,7 @@ def _sparse_attn_v4_paged_prefill_csa_kernel(
         slot = tl.load(kv_indices_prefix_ptr + p_start + k_pos, mask=valid, other=0)
         kv_ptrs = (
             unified_kv_ptr
-            + slot[:, None] * pkv_stride_n
+            + row_offset(slot, pkv_stride_n)[:, None]
             + d_offs[None, :] * pkv_stride_d
         )
         kv = tl.load(kv_ptrs, mask=valid[:, None], other=0.0)
@@ -614,7 +615,7 @@ def sparse_attn_v4_paged_prefill(
         unified_kv. -1 sentinels skipped.
       kv_indptr_prefix:  [T+1] int32 — true prefix sum.
       kv:                [total_tokens, D] BF16/FP16 — extend source (bf16 path;
-        this fwd's input K, NOT yet in swa_kv ring).
+        this fwd's input K, NOT yet in the window).
       kv_indices_extend: [total_extend] int32 — flat per-token row idx lists
         into kv. -1 sentinels skipped.
       kv_indptr_extend:  [T+1] int32 — true prefix sum.

@@ -4,6 +4,7 @@ import torch
 from aiter import dtypes
 
 from atom.config import KVCacheTensor
+from atom.model_ops.attentions.sub_pool_spec import SubPoolSpec, page_pool
 
 logger = logging.getLogger("atom")
 
@@ -13,7 +14,7 @@ class Eagle3DraftBuilder:
 
     Implements the same subset of `AttentionMetadataBuilder` hooks that
     ModelRunner consults during KV pool sizing and per-module binding —
-    `compute_block_bytes`, `allocate_kv_cache_tensors`, and
+    `sub_pool_specs`, `allocate_kv_cache_tensors`, and
     `build_kv_cache_tensor` — so the draft's independent cache fits the
     post-#659 builder protocol without leaking into the target's builder. The
     draft does NOT drive prepare_decode/prepare_prefill; it piggybacks on the
@@ -44,15 +45,26 @@ class Eagle3DraftBuilder:
             self.num_kv_heads = draft_hf.num_key_value_heads // model_runner.world_size
             self.head_dim = draft_hf.head_dim
 
-    def compute_block_bytes(self) -> int:
-        """Per-block bytes for the draft's independent KV cache."""
+    def sub_pool_specs(self) -> list[SubPoolSpec]:
+        """The draft's independent KV cache.
+
+        `page_pool` puts it in the same entry class as the target builder's
+        pool: the draft KV rides the target's block ids, so the two
+        contributions sum into one per-block cost rather than forming a
+        second pool.
+        """
         kv_dtype_size = dtypes.d_dtypes[
             self.model_runner.config.kv_cache_dtype
         ].itemsize
         if self.is_mla:
-            return (
-                self.num_layers * self.block_size * self.mla_dim * dtypes.bf16.itemsize
-            )
+            return [
+                page_pool(
+                    self.num_layers
+                    * self.block_size
+                    * self.mla_dim
+                    * dtypes.bf16.itemsize
+                )
+            ]
         bb = (
             2
             * self.num_layers
@@ -72,7 +84,7 @@ class Eagle3DraftBuilder:
                 * self.num_kv_heads
                 * dtypes.fp32.itemsize
             )
-        return bb
+        return [page_pool(bb)]
 
     def allocate_kv_cache_tensors(self, num_kv_heads, num_draft_layers) -> dict:
         """Allocate the draft's independent KV pool under namespaced keys so it

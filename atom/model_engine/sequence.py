@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+from collections.abc import Callable
 from copy import copy
 from enum import Enum, auto
 from itertools import count
-from typing import Any, Callable, Optional
+from typing import Any
 
 import numpy as np
 
@@ -43,22 +44,26 @@ class Sequence:
         self,
         token_ids: list[int],
         block_size: int,
-        sampling_params=SamplingParams(),
-        stop_token_sequences: list[list[int]] = None,
-        stream_callback: Optional[Callable[[Any], None]] = None,
+        sampling_params: SamplingParams | None = None,
+        stop_token_sequences: list[list[int]] | None = None,
+        stream_callback: Callable[[Any], None] | None = None,
         id=None,
-        kv_transfer_params: dict = None,
+        kv_transfer_params: dict | None = None,
         num_draft_tokens: int = 0,
         has_per_req_cache: bool = False,
         needs_independent_noise: bool = False,
-        parent_request_id: Optional[str] = None,
+        parent_request_id: str | None = None,
         sibling_index: int = 0,
-        request_id: Optional[str] = None,
-        multimodal_data: Optional[dict] = None,
-        mrope_positions: Optional[np.ndarray] = None,
+        request_id: str | None = None,
+        multimodal_data: dict | None = None,
+        mrope_positions: np.ndarray | None = None,
         mrope_position_delta: int = 0,
         data_parallel_rank: Optional[int] = None,
     ):
+        # Built here rather than as a default argument: one instance shared by
+        # every defaulting Sequence would be a mutable default in all but name.
+        if sampling_params is None:
+            sampling_params = SamplingParams()
         self.block_size = block_size
         self.id = id or next(Sequence.counter)
         self.external_request_id = request_id
@@ -80,7 +85,31 @@ class Sequence:
         self.num_prompt_tokens = len(token_ids)
         self.num_rejected = 0
         self.num_cached_tokens = 0
+        # Tokens whose blocks are registered in the prefix cache: through the
+        # prompt as chunks finalize, then on through decode as generated blocks
+        # fill (BlockManager.hash_decode_blocks). Distinct from
+        # `num_cached_tokens`, which means "KV computed" and stops at the
+        # prompt; this means "content hash published". They part ways the moment
+        # generation starts.
+        self.num_hashed_tokens = 0
         self.num_compressed_hit_blocks = 0
+        # The same hit asked counterfactually: how far it would have reached
+        # with a state checkpoint at every boundary. Equal to the admitted hit
+        # when nothing was lost to a missing checkpoint, so the difference is
+        # the reuse a checkpoint would have delivered — what CacheStats reports
+        # as recoverable.
+        self.num_wanted_hit_blocks = 0
+        # That gap as a prompt position, once it is worth a forward: the one
+        # place off the checkpoint grid where this seq's prefill is cut so a
+        # checkpoint can be kept. 0 = nowhere. Both written by
+        # `BlockManager._record_checkpoint_demand` at admission; this one is
+        # read by `checkpoint_cut` and `checkpointers_at`, which must agree.
+        self.checkpoint_demand_pos = 0
+        # Where this seq last kept a checkpoint. Prefill lands on the grid so
+        # this tracks it, but a speculative decode step lands wherever
+        # `1 + accepted` puts it, and there the grid is unreachable — see
+        # `BlockManager.checkpointers_at`, which measures spacing from here.
+        self.last_checkpoint_pos = 0
         self.prefix_cache_hit_tokens = 0
         # True iff this seq is mid-prefill (chunked prefill produced KV for
         # some prompt tokens but not all). Maintained by the scheduler:
@@ -90,15 +119,25 @@ class Sequence:
         # scheduler's Phase 1 scan when no partials exist.
         self.is_partial_prefill = False
         self.block_table = []
-        # paged-SWA: separate physical block table for the sliding-window
-        # KV pool (independent lifetime from the compressed block_table so
-        # out-of-window SWA blocks can be freed while compressed blocks persist).
-        # Empty / unused for non-SWA models.
-        self.swa_block_table = []
         # Per-request cache slot index (filled by BlockManager.allocate()).
         # -1 = unallocated. The slot indexes into the per-req cache tensors
         # owned by ModelRunner (e.g. mamba_k_cache for GDN).
         self.per_req_cache_group = -1
+        # Group the NEXT forward reads its incoming state from, when that is not
+        # the group it writes (`per_req_cache_group`). Set by BlockManager on a
+        # state fork — resuming from a checkpoint, or taking one — and
+        # cleared by the scheduler once a batch has carried it, so it describes
+        # exactly one forward. -1 = read and write the same group, the case for
+        # every step in between.
+        self.state_fork_src = -1
+        # Content hash of a boundary this seq's last forward landed on and whose
+        # state is worth keeping, for state classes that checkpoint by copying
+        # (`StateGroupPool.checkpoint`). The copy needs a forward to issue it, so
+        # the intent outlives the step that formed it; `StateGroupPool.take_copies`
+        # turns it into a destination group and a copy pair when the next batch
+        # is built.
+        # -1 = nothing pending, which is also what `deallocate` restores.
+        self.pending_checkpoint = -1
         self.temperature = sampling_params.temperature
         self.top_k = sampling_params.top_k
         self.top_p = sampling_params.top_p
@@ -127,7 +166,7 @@ class Sequence:
         # DSpark Phase 2: scheduler-chosen verify length from the previous
         # decode step's propose(). None = no schedule yet -> verify mtp_k (full).
         # Next decode step sizes this seq's verification to dspark_next_ell+1.
-        self.dspark_next_ell: Optional[int] = None
+        self.dspark_next_ell: int | None = None
 
         # statistics fields
         self.arrive_time = 0.0

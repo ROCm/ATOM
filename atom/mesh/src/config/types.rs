@@ -225,6 +225,11 @@ pub enum PolicyConfig {
     #[serde(rename = "round_robin")]
     RoundRobin,
 
+    /// Session-affinity policy for data-parallel workers.
+    /// Requests with the same `X-Session-ID` are routed to the same healthy worker.
+    #[serde(rename = "dp_sticky")]
+    DpSticky,
+
     #[serde(rename = "cache_aware")]
     CacheAware {
         cache_threshold: f32,
@@ -267,6 +272,7 @@ impl PolicyConfig {
         match self {
             PolicyConfig::Random => "random",
             PolicyConfig::RoundRobin => "round_robin",
+            PolicyConfig::DpSticky => "dp_sticky",
             PolicyConfig::CacheAware { .. } => "cache_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::PrefixHash { .. } => "prefix_hash",
@@ -592,6 +598,7 @@ mod tests {
     fn test_policy_config_name() {
         assert_eq!(PolicyConfig::Random.name(), "random");
         assert_eq!(PolicyConfig::RoundRobin.name(), "round_robin");
+        assert_eq!(PolicyConfig::DpSticky.name(), "dp_sticky");
 
         let cache_aware = PolicyConfig::CacheAware {
             cache_threshold: 0.8,
@@ -613,6 +620,10 @@ mod tests {
         let random = PolicyConfig::Random;
         let json = serde_json::to_string(&random).unwrap();
         assert_eq!(json, r#"{"type":"random"}"#);
+
+        let dp_sticky = PolicyConfig::DpSticky;
+        let json = serde_json::to_string(&dp_sticky).unwrap();
+        assert_eq!(json, r#"{"type":"dp_sticky"}"#);
 
         let cache_aware = PolicyConfig::CacheAware {
             cache_threshold: 0.8,

@@ -3,9 +3,10 @@
 
 
 class Block:
-    """One physical KV cache block. Shared by the compressed pool (BlockManager)
-    and the sliding-window pool (SlidingWindowPool). Lives in its own module so
-    both can import it without a circular dependency."""
+    """One physical KV cache block of the compressed pool (BlockManager).
+
+    Lives in its own module because `block_pool.py` and `block_manager.py` both
+    need it and would otherwise import each other."""
 
     def __init__(self, block_id):
         self.block_id = block_id
@@ -21,3 +22,9 @@ class Block:
         self.ref_count = 1
         self.hash = -1
         self.token_ids = []
+
+
+# Name of the sub-pool sizing class backing the per-request state slots
+# (GDN/Mamba recurrent state, the DeepSeek-V4 compressor ring). Owned next to
+# the block/slot machinery that consumes the count, not in the sizing layer.
+STATE_SLOT_CLASS = "state"
