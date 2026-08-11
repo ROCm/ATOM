@@ -500,7 +500,7 @@ jobs:
           docker pull "${RDMA_SMOKE_IMAGE}"
           echo "=== RDMA smoke image pull complete on rank ${rank} ==="
           docker_args=(
-            run --rm --name "${container}"
+            run --rm -i --name "${container}"
             --network host --ipc host
             --privileged
             --device=/dev/kfd
@@ -836,12 +836,20 @@ jobs:
           RANK_SCRIPT
           chmod +x "${rank_script}"
 
+          slurm_status_file="${run_dir}/slurm-job.rc"
+          rm -f "${slurm_status_file}" "${slurm_status_file}.tmp"
           batch_script="${run_dir}/rdma-smoke.sbatch.sh"
           cat > "${batch_script}" <<EOF
           #!/usr/bin/env bash
           set -euo pipefail
+          set +e
           srun --nodes=${node_count} --ntasks=${node_count} --ntasks-per-node=1 \
             "${rank_script}"
+          srun_rc=\$?
+          set -e
+          printf '%s\n' "\${srun_rc}" > "${slurm_status_file}.tmp"
+          mv "${slurm_status_file}.tmp" "${slurm_status_file}"
+          exit "\${srun_rc}"
           EOF
           chmod +x "${batch_script}"
 
@@ -897,6 +905,21 @@ jobs:
           set_slurm_job_log_paths "${JOB_ID}"
           monitor_slurm_job "${JOB_ID}"
           read_slurm_exit_code "${JOB_ID}"
+          if [[ "${SLURM_STATE}" == "unknown" && -s "${slurm_status_file}" ]]; then
+            batch_rc="$(tr -d '[:space:]' < "${slurm_status_file}")"
+            if [[ "${batch_rc}" =~ ^[0-9]+$ ]]; then
+              SLURM_JOB_RC="${batch_rc}"
+              SLURM_EXIT_CODE="${batch_rc}:0"
+              if [[ "${batch_rc}" -eq 0 ]]; then
+                SLURM_STATE="COMPLETED"
+              else
+                SLURM_STATE="FAILED"
+              fi
+              echo "Using batch script exit status because Slurm accounting is unavailable."
+            else
+              echo "WARNING: invalid batch script exit status: ${batch_rc}" >&2
+            fi
+          fi
           SLURM_JOB_ACTIVE=0
           echo "slurm_state=${SLURM_STATE}"
           echo "slurm_exit_code=${SLURM_EXIT_CODE}"
