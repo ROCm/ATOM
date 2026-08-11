@@ -35,9 +35,20 @@ _SYNTHETIC_PARAMS_CACHE: dict[tuple[float, int], tuple[float, float]] = {}
 # identical on every TP rank: sampled_tokens is broadcast from rank 0 while
 # num_bonus_tokens stays local, so a per-rank torch.rand would desync the two and
 # make the anchor gather read a rejected (-1) column -> the draft model then
-# embeds an invalid id (HSA out-of-bounds). We therefore derive the uniforms from
-# a fixed CPU-seeded generator (identical across ranks / GPUs, and reproducible).
+# embeds an invalid id (HSA out-of-bounds). A dedicated device generator re-seeded
+# from the step counter gives that: same Philox stream, so bit-identical uniforms
+# on every rank, and isolated from whatever else consumes the global RNG.
 _SYNTHETIC_RNG_BASE_SEED = 0x5EED
+# One generator per device, kept alive so the draw costs a kernel and nothing else.
+_SYNTHETIC_GENERATORS: dict[torch.device, torch.Generator] = {}
+
+
+def _synthetic_generator(device: torch.device) -> torch.Generator:
+    generator = _SYNTHETIC_GENERATORS.get(device)
+    if generator is None:
+        generator = torch.Generator(device=device)
+        _SYNTHETIC_GENERATORS[device] = generator
+    return generator
 
 
 def compute_synthetic_rejection_sampler_params(
@@ -211,16 +222,23 @@ def rejection_sample(
             synthetic_acceptance_rate, num_spec_steps
         )
         target_argmax = target_probs.argmax(dim=-1)
-        # Rank-consistent uniforms: draw on CPU from a fixed per-step seed (same on
-        # every TP rank / GPU) so the accept/reject pattern — and hence
-        # num_bonus_tokens — is identical across ranks and matches the broadcast
-        # sampled_tokens. A per-rank torch.rand would desync them and make the
-        # anchor gather read a -1 column (draft embeds an invalid id -> crash).
-        cpu_generator = torch.Generator()
-        cpu_generator.manual_seed(_SYNTHETIC_RNG_BASE_SEED + int(synthetic_step))
+        # Rank-consistent uniforms: a dedicated device generator re-seeded from the
+        # step counter draws the same Philox stream on every TP rank / GPU, so the
+        # accept/reject pattern — and hence num_bonus_tokens — matches the
+        # broadcast sampled_tokens. A per-rank unseeded torch.rand would desync
+        # them and make the anchor gather read a -1 column (draft embeds an
+        # invalid id -> crash).
+        #
+        # These stay on the device on purpose. Drawing on the host and copying in
+        # costs a pageable H2D, which PyTorch issues as memcpy + stream sync: the
+        # caller then blocks until the whole target forward has drained, right
+        # between verify and propose, so the draft model's kernels cannot be
+        # dispatched while the target is still running.
+        generator = _synthetic_generator(device)
+        generator.manual_seed(_SYNTHETIC_RNG_BASE_SEED + int(synthetic_step))
         uniform = torch.rand(
-            num_tokens, dtype=torch.float32, generator=cpu_generator
-        ).to(device)
+            num_tokens, dtype=torch.float32, device=device, generator=generator
+        )
         rejection_synthetic_sample_kernel[(batch_size,)](
             output_token_ids,
             num_bonus_tokens,
