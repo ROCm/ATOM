@@ -198,6 +198,14 @@ _v4_attn_runner = CudagraphCaptureRunner()
 # skip the q public buffer and take the normal per-step copy path.
 _V4_ATTN_QPUB_MAX = 512
 
+# zero-copy arg indices; all-8 drops ~2pts (padding-tail), so drop positions(5).
+# ATOM_ATTN_ZC overrides (=empty: all-copy). See memory af-piecewise-zerocopy-tail.
+_V4_ATTN_ZC = (
+    frozenset(int(i) for i in os.environ["ATOM_ATTN_ZC"].split(",") if i.strip() != "")
+    if "ATOM_ATTN_ZC" in os.environ
+    else frozenset({1, 2, 3, 4, 6, 7, 8})
+)
+
 
 class _V4AttnZeroCopyBuffers:
     """Fixed-address public buffers for one attention layer's AF_PIECEWISE zero-copy
@@ -335,13 +343,15 @@ def v4_core_attention(
 
     fc = get_forward_context()
 
-    _piecewise = getattr(fc, "cudagraph_runtime_mode", None) == CUDAGraphMode.PIECEWISE
-    if _piecewise:
+    is_piecewise = (
+        getattr(fc, "cudagraph_runtime_mode", None) == CUDAGraphMode.PIECEWISE
+    )
+    if is_piecewise:
         # (#1884) Snapshot the transient projection inputs out of the shared graph
         # pool before the core reads them (the pool overlays them across num_tokens
         # buckets). `x` is a dense-piece residual (kept live into attn_post's
-        # piece, so not overlaid) and is left in place. Done BEFORE _tensor_args so
-        # both the eager fallback and the capture/replay path below see pinned
+        # piece, so not overlaid) and is left in place. Done BEFORE attn_args so
+        # both the eager fallback and the AF capture/replay path below see pinned
         # tensors.
         _n = int(q.shape[0])
         q = _pin_core_input(layer_name, 0, _n, q)
@@ -352,39 +362,37 @@ def v4_core_attention(
         idx_weights = _pin_core_input(layer_name, 5, _n, idx_weights)
         idx_q_scale = _pin_core_input(layer_name, 6, _n, idx_q_scale)
 
-    _tensor_args = (x, q, kv_pre, qr, qr_scale, positions,
-                    idx_q_quant, idx_weights, idx_q_scale)  # fmt: skip
+    attn_args = (x, q, kv_pre, qr, qr_scale, positions,
+                 idx_q_quant, idx_weights, idx_q_scale)  # fmt: skip
     # Persistent output buffer key (downstream dense piece reads this fixed addr).
     out_key = (layer_name, int(x.shape[0]))
 
     # AF_PIECEWISE: capture _attn_core into its own cudagraph (op body not traced).
-    _cg_mode = atom_config.compilation_config.cudagraph_mode
-    _attn_cg = (
-        _cg_mode is not None
-        and _cg_mode.is_af_piecewise()
+    cudagraph_mode = atom_config.compilation_config.cudagraph_mode
+    use_attn_cudagraph = (
+        cudagraph_mode is not None
+        and cudagraph_mode.is_af_piecewise()
         and not getattr(getattr(fc, "context", None), "is_dummy_run", False)
         and getattr(fc, "attn_metadata", None) is not None
+        and int(x.shape[0]) <= _V4_ATTN_QPUB_MAX
     )
-    if _attn_cg and int(x.shape[0]) <= _V4_ATTN_QPUB_MAX:
+    if use_attn_cudagraph:
         # num_tokens_pad (=x rows) is a KEY DIM: the attn-core graph is captured at
         # exactly this flat row count so q's public-buffer read len == dense write
         # len (no rectangle-pad tail). See _v4_attn_bucket_bs_q for bucket_bs/q_eff.
         bucket_bs, q_eff = _v4_attn_bucket_bs_q(fc, self)
         key = (layer_name, bucket_bs, q_eff, int(x.shape[0]))
-        # zc args are fixed-address public/persistent buffers; only x(0) is copied.
         return _v4_attn_runner.run(
             key=key,
             out_key=out_key,
-            args=_tensor_args,
-            zc=frozenset({1, 2, 3, 4, 5, 6, 7, 8}),
+            args=attn_args,
+            zc=_V4_ATTN_ZC,
             compute_fn=self._attn_core,
-            piecewise=_piecewise,
+            piecewise=is_piecewise,
             in_hipgraph=getattr(fc, "in_hipgraph", False),
         )
 
-    return _v4_attn_runner.stabilize(
-        out_key, self._attn_core(*_tensor_args), _piecewise
-    )
+    return _v4_attn_runner.stabilize(out_key, self._attn_core(*attn_args), is_piecewise)
 
 
 # ---------------------------------------------------------------------------
