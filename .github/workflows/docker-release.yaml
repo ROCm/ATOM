@@ -287,6 +287,7 @@ jobs:
           password: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Push OOT Docker image
+        id: push_oot
         if: ${{ steps.login_oot.outcome == 'success' }}
         continue-on-error: true
         run: |
@@ -357,6 +358,12 @@ jobs:
           else
             echo "Custom SGLang tag suffix '${SGLANG_TAG_SUFFIX}' provided; skipping rocm/atom-dev:${SGLANG_LATEST_TAG} update."
           fi
+
+      - name: Fail if OOT Docker image failed
+        if: ${{ always() && steps.gates.outputs.oot == 'true' && (steps.build_oot.outcome == 'failure' || steps.login_oot.outcome == 'failure' || steps.push_oot.outcome == 'failure') }}
+        run: |
+          echo "OOT vLLM Docker image failed; SGLang steps were allowed to run first."
+          exit 1
 
       - name: Clean Up
         if: always()
