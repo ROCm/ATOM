@@ -320,7 +320,7 @@ class DSparkProposer(Drafter):
         hidden_states: torch.Tensor,
         next_token_ids: list[int] | None,
     ) -> None:
-        """Populate the rolling target-KV window for this forward.
+        """Populate the inline draft's rolling target-KV window for this forward.
 
         Every scheduled row is written, prefill and decode alike: the read side
         gathers by absolute position without checking what was written, so
@@ -328,27 +328,29 @@ class DSparkProposer(Drafter):
         rows are harmless -- they land on future positions, unread until the
         step that accepts them rewrites them.
 
-        `write_per_batch` must cover window + mtp_k, not just window: the anchor
-        sits up to mtp_k rows before the span end. Do NOT clamp it by
-        max_seqlen_q the way the V4 target clamps its own swa_write -- that was
-        tried and measured worse (GSM8K 0.936/0.941 vs 0.942-0.950).
+        How many rows of each span that is belongs to the draft model, not to
+        this hook: it falls out of the window geometry the model owns (see
+        `DeepseekV4DSpark.write_per_batch`).
 
         `next_token_ids` is unused: DSpark drafts from aux hidden states.
         """
         del next_token_ids
+        if self._with_draft:
+            # Standalone draft (Kimi-K3): no rolling window exists to fill. Its
+            # target context goes into the paged sibling pool addressed by slot
+            # mapping, which `_propose_with_draft` writes at draft time.
+            return
         aux_hidden_states = self.aux_for(hidden_states)
         if aux_hidden_states is None:
             return
         forward_context = get_forward_context()
         bs = forward_context.context.batch_size
         main_hidden_all = torch.cat(aux_hidden_states, dim=-1)
-        write_per_batch = int(self.model.window_size) + int(self.mtp_k)
         with record_function(f"dspark_ctx_kv[bs={bs} tok={main_hidden_all.shape[0]}]"):
             self.model.precompute_context_kv(
                 main_hidden_all,
                 positions,
                 forward_context.attn_metadata.cu_seqlens_q[: bs + 1],
-                write_per_batch=write_per_batch,
             )
 
     def propose(

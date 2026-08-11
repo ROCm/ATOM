@@ -516,9 +516,10 @@ class DSparkLayer(Block):  # type: ignore[misc]
 
         ``main_x`` is the flat [T, dim] ragged batch of every scheduled token and
         ``cu_seqlens_q`` ([B+1]) delimits the per-request spans; the last
-        ``min(seq_len, write_per_batch)`` rows of each span are written. Callers
-        pass ``write_per_batch = window_size``, which covers a prefill tail and a
-        decode verify span alike.
+        ``min(seq_len, write_per_batch)`` rows of each span are written.
+        ``write_per_batch`` is ``DeepseekV4DSpark.write_per_batch``
+        (``window_size + mtp_k``), which covers a prefill tail and a decode
+        verify span alike.
 
         Every scheduled row is written on every step: the window must hold a row
         for every position it spans, and the read side gathers slots by absolute
@@ -766,6 +767,12 @@ class DeepseekV4DSpark(nn.Module):
         # Rolling target-KV window width. Exposed on the wrapper (top level) so the
         # proposer never reaches through `self.model.model.mtp[0]` to read it.
         self.window_size = int(self.args.window_size)
+        num_spec = getattr(
+            getattr(config, "speculative_config", None),
+            "num_speculative_tokens",
+            None,
+        )
+        self.write_per_batch = self.window_size + int(num_spec or self.block_size)
         self.markov_rank = int(self.hf_config.dspark_markov_rank)
         self.noise_token_id = int(self.hf_config.dspark_noise_token_id)
         self.target_layer_ids = tuple(
@@ -839,16 +846,16 @@ class DeepseekV4DSpark(nn.Module):
         main_hidden,
         positions,
         cu_seqlens_q,
-        write_per_batch: int,
     ) -> None:
         """Populate every stage's rolling target-KV window from target hidden.
 
         Pass the flat ragged batch of all scheduled tokens with the real
-        ``cu_seqlens_q`` and ``write_per_batch = window_size``. See
+        ``cu_seqlens_q``; how many rows of each span land in the window is
+        ``self.write_per_batch``, this model's own. See
         :meth:`DSparkLayer.precompute_context_kv`.
         """
         self.model.precompute_context_kv(
-            main_hidden, positions, cu_seqlens_q, write_per_batch
+            main_hidden, positions, cu_seqlens_q, self.write_per_batch
         )
 
     def forward_spec(
