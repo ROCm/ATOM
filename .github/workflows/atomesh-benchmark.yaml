@@ -461,6 +461,7 @@ jobs:
           rank="${SLURM_PROCID:-${SPUR_TASK_OFFSET:-0}}"
           job_id="${SLURM_JOB_ID:-${SPUR_JOB_ID:-local}}"
           container="atomesh-rdma-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${job_id}-${rank}-$$"
+          rank_host="$(hostname)"
           cleanup() {
             if docker container inspect "${container}" >/dev/null 2>&1; then
               docker rm -f "${container}" || {
@@ -468,10 +469,36 @@ jobs:
               }
             fi
           }
-          trap cleanup EXIT HUP INT TERM
+          on_error() {
+            local rc="$1"
+            local line="$2"
+            local command="$3"
+            echo "ERROR: RDMA smoke rank ${rank} failed on ${rank_host}: rc=${rc} line=${line} command=${command}" >&2
+          }
+          on_signal() {
+            local signal="$1"
+            local rc="$2"
+            echo "ERROR: RDMA smoke rank ${rank} received ${signal} on ${rank_host}" >&2
+            exit "${rc}"
+          }
+          on_exit() {
+            local rc=$?
+            trap - EXIT
+            echo "=== RDMA smoke rank exit: rank=${rank} host=${rank_host} pid=$$ job=${job_id} container=${container} rc=${rc} ==="
+            cleanup
+            exit "${rc}"
+          }
+          trap 'on_error "$?" "${LINENO}" "${BASH_COMMAND}"' ERR
+          trap on_exit EXIT
+          trap 'on_signal HUP 129' HUP
+          trap 'on_signal INT 130' INT
+          trap 'on_signal TERM 143' TERM
           cleanup
 
+          echo "=== RDMA smoke rank start: rank=${rank} host=${rank_host} pid=$$ job=${job_id} container=${container} ==="
+          echo "=== Pulling RDMA smoke image on rank ${rank}: ${RDMA_SMOKE_IMAGE} ==="
           docker pull "${RDMA_SMOKE_IMAGE}"
+          echo "=== RDMA smoke image pull complete on rank ${rank} ==="
           docker_args=(
             run --rm --name "${container}"
             --network host --ipc host
@@ -502,6 +529,11 @@ jobs:
             "${RDMA_SMOKE_IMAGE}"
             bash -s
           )
+          printf '=== RDMA smoke docker command on rank %s ===' "${rank}"
+          printf ' %q' docker "${docker_args[@]}"
+          echo
+          echo "=== Starting RDMA smoke container on rank ${rank} ==="
+          set +e
           docker "${docker_args[@]}" <<'CONTAINER_SCRIPT'
           set -euo pipefail
 
@@ -797,6 +829,10 @@ jobs:
             echo "Mooncake cross-node GPUDirect RDMA passed between Slurm ranks 0 and 1 on all ${gpu_count} GPUs"
           fi
           CONTAINER_SCRIPT
+          docker_rc=$?
+          set -e
+          echo "=== RDMA smoke container finished on rank ${rank}: rc=${docker_rc} ==="
+          exit "${docker_rc}"
           RANK_SCRIPT
           chmod +x "${rank_script}"
 
