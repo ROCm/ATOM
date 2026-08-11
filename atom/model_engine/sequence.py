@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+from collections.abc import Callable
 from copy import copy
 from enum import Enum, auto
 from itertools import count
-from typing import Any, Callable, Optional
+from typing import Any
 
 import numpy as np
+
 from atom.sampling_params import SamplingParams
 
 
@@ -44,17 +46,17 @@ class Sequence:
         block_size: int,
         sampling_params=SamplingParams(),
         stop_token_sequences: list[list[int]] = None,
-        stream_callback: Optional[Callable[[Any], None]] = None,
+        stream_callback: Callable[[Any], None] | None = None,
         id=None,
         kv_transfer_params: dict = None,
         num_draft_tokens: int = 0,
         has_per_req_cache: bool = False,
         needs_independent_noise: bool = False,
-        parent_request_id: Optional[str] = None,
+        parent_request_id: str | None = None,
         sibling_index: int = 0,
-        request_id: Optional[str] = None,
-        multimodal_data: Optional[dict] = None,
-        mrope_positions: Optional[np.ndarray] = None,
+        request_id: str | None = None,
+        multimodal_data: dict | None = None,
+        mrope_positions: np.ndarray | None = None,
         mrope_position_delta: int = 0,
     ):
         self.block_size = block_size
@@ -118,6 +120,11 @@ class Sequence:
         # stream callback
         self.stream_callback = stream_callback
         self.output_tokens = []  # cache for newly generate tokens
+        # Placeholder tokens appended by the previous postprocess for this step's
+        # output to overwrite in place. Zero until a postprocess has appended
+        # some, which is why the first output for a sequence must be appended
+        # rather than written at a negative offset.
+        self.num_placeholder_tokens: int = 0
 
         # save speculative tokens if is_deferred_output = False or prefill is inter
         self.spec_token_ids: np.ndarray = np.array([], dtype=np.int32)
@@ -125,7 +132,7 @@ class Sequence:
         # DSpark Phase 2: scheduler-chosen verify length from the previous
         # decode step's propose(). None = no schedule yet -> verify mtp_k (full).
         # Next decode step sizes this seq's verification to dspark_next_ell+1.
-        self.dspark_next_ell: Optional[int] = None
+        self.dspark_next_ell: int | None = None
 
         # statistics fields
         self.arrive_time = 0.0
