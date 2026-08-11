@@ -1279,9 +1279,14 @@ class ModelRunner:
         """
         pp_size = self.config.pipeline_parallel_size
         self._fv_idx = 0
+        self._stage_h2d_done = None
         if pp_size <= 1:
             self._fv_ring = [self.forward_vars]
             self._fv_slot_events = None
+            # Nothing to rotate to, so bound the lead in time instead. See
+            # `_gate_staging_reuse`.
+            self._stage_h2d_done = torch.cuda.Event()
+            logger.info("forward_vars ring: 1 slot (staging reuse gated on its H2D)")
             return
 
         assert self.enforce_eager, (
@@ -1323,6 +1328,45 @@ class ModelRunner:
         # `input_ids` is the one forward_vars buffer aliased outside the dict
         # (tokenID_processor writes into it directly); repoint it at this slot.
         self.tokenID_processor.input_ids = self.forward_vars["input_ids"]
+
+    def _gate_staging_reuse(self):
+        """Block until the previous forward's staging H2Ds have executed.
+
+        `_stage` / `CpuGpuBuffer.copy_to_gpu` copy `non_blocking=True` out of
+        ONE pinned buffer per name, so the next forward's `buf.np[:n] = arr`
+        races the previous forward's DMA. Sampling forwards close that window
+        by accident, since `postprocess` synchronizes to read the sampled ids,
+        but a chunked prefill's middle chunk returns before `postprocess` and
+        closes nothing. Measured: the host reached 4042 packets ahead and the
+        GPU read a `batch_id_per_token` from a later batch (id 3 in a `bs=2`
+        batch), tripping the bounds assert in
+        `cu_committed_gpu[batch_id_per_token]` -- which wedges the queue with
+        no fault line and no traceback.
+
+        One buffer admits one forward of lead, so the gate is depth-1. Decode
+        already syncs every step, so it never blocks in steady state; it
+        throttles only runs of middle chunks, where the unbounded lead was
+        buying nothing. A never-recorded event passes, so the first forward is
+        not held.
+
+        The pipeline ring solves the same problem by rotating buffers, which
+        bounds the lead to its depth; `_stage_h2d_done` is None there and this
+        does nothing.
+        """
+        if self._stage_h2d_done is not None:
+            self._stage_h2d_done.synchronize()
+
+    def _mark_staging_h2d_enqueued(self):
+        """Close the window the gate above waits on.
+
+        Every `_stage` / `copy_to_gpu` a forward does is enqueued inside
+        `prepare_model` -- `build()` fences the current stream behind
+        `prep_stream` before returning -- so one event after it covers them
+        all. `prepare_mtp_decode` is the exception, staging from inside
+        `postprocess`, a path that synchronizes on its own.
+        """
+        if self._stage_h2d_done is not None:
+            self._stage_h2d_done.record()
 
     def _record_forward_vars_event(self):
         """Mark the current slot's forward as done on the GPU stream. Paired
@@ -3075,9 +3119,12 @@ class ModelRunner:
     @torch.inference_mode()
     @with_eplb_forward_monitor
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
-        # Rotate to this microbatch's slot before prepare_inputs writes buffers.
+        # Make this forward's staging buffers safe to overwrite before
+        # prepare_inputs writes them: rotate to a free slot if there is a ring,
+        # otherwise wait out the previous forward's copies.
         if not batch.is_dummy_run:
             self._advance_forward_vars()
+            self._gate_staging_reuse()
         (
             input_ids,
             temperatures,
@@ -3086,6 +3133,8 @@ class ModelRunner:
             all_greedy,
             needs_independent_noise,
         ) = self.prepare_model(batch)
+        if not batch.is_dummy_run:
+            self._mark_staging_h2d_enqueued()
         logits, hidden_states = self.run_model(input_ids, batch)
 
         pp_group = get_pp_group()
