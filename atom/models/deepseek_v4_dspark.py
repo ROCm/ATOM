@@ -52,7 +52,6 @@ from atom.models.dspark_draft import DSparkDraftModel
 from atom.utils import envs, mark_spliting_op
 from atom.utils.decorators import support_torch_compile
 
-
 if TYPE_CHECKING:
     from atom.config import Config
 
@@ -880,7 +879,7 @@ class DeepseekV4DSpark(DSparkDraftModel):
 
         self.block_size = int(self.hf_config.dspark_block_size)
         # Draft width the compiled graph was built for; see forward_spec.
-        self._compiled_num_draft: "int | None" = None
+        self._compiled_num_draft: int | None = None
         # Rolling target-KV window width. Exposed on the wrapper (top level) so the
         # proposer never reaches through `self.model.model.mtp[0]` to read it.
         self.window_size = int(self.args.window_size)
