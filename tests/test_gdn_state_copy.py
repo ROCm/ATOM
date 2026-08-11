@@ -12,6 +12,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
+
 from atom.model_ops.attentions.gdn_attn import GDNStateMixin
 
 LAYERS = 3

@@ -12,6 +12,8 @@ forward buffers (sized `max_num_batched_tokens`) and surfaced as a bare
 
 import pytest
 
+pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
+
 from atom.model_engine.model_runner import max_schedulable_decode_bs
 
 

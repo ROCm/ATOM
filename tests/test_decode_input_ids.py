@@ -25,6 +25,8 @@ import numpy as np
 import pytest
 import torch
 
+pytest.importorskip("triton", reason="needs the Triton GPU kernel library")
+
 from atom.model_ops.decode_input_ids import (
     NEW_SEQUENCE,
     fill_deferred_decode_ids_reference,
