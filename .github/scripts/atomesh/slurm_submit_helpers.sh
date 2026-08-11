@@ -34,29 +34,72 @@ scancel_slurm_job_by_name() {
   run_scancel --user "${CURRENT_USER}" --name "${SLURM_JOB_NAME}"
 }
 
-slurm_job_in_queue() {
+query_slurm_job() {
   local job_id="$1"
   local -a squeue_cmd=(squeue)
+  local output
 
   if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
     squeue_cmd+=(--controller "${SPUR_CONTROLLER_ADDR}")
   fi
 
-  [[ -n "$("${squeue_cmd[@]}" -h -j "${job_id}" 2>/dev/null)" ]]
+  if ! output="$("${squeue_cmd[@]}" --noheader --format="%A|%T|%M|%D|%R" 2>&1)"; then
+    echo "ERROR: unable to query Slurm job ${job_id}: ${output}" >&2
+    return 2
+  fi
+
+  awk -F'|' -v job_id="${job_id}" '
+    {
+      current_job_id = $1
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", current_job_id)
+      if (current_job_id == job_id) {
+        print
+        exit
+      }
+    }
+  ' <<< "${output}"
+}
+
+slurm_job_in_queue() {
+  local job_id="$1"
+  local job_line rc
+
+  if job_line="$(query_slurm_job "${job_id}")"; then
+    [[ -n "${job_line}" ]]
+    return
+  else
+    rc=$?
+    return "${rc}"
+  fi
 }
 
 wait_for_slurm_cancel() {
   local job_id="$1"
   local initial_signal="$2"
   local deadline=$(( $(date +%s) + ${SLURM_CANCEL_WAIT_SECONDS:-60} ))
-  local kill_deadline
+  local kill_deadline query_rc
 
-  while slurm_job_in_queue "${job_id}"; do
+  while true; do
+    if slurm_job_in_queue "${job_id}"; then
+      :
+    else
+      query_rc=$?
+      if [[ "${query_rc}" -eq 1 ]]; then
+        break
+      fi
+      echo "WARNING: retrying failed Slurm queue query for job ${job_id}" >&2
+    fi
     if [[ "$(date +%s)" -ge "${deadline}" ]]; then
       echo "=== Slurm job ${job_id} still queued after ${initial_signal}; sending KILL ===" >&2
       run_scancel --signal=KILL "${job_id}"
       kill_deadline=$(( $(date +%s) + ${SLURM_CANCEL_KILL_WAIT_SECONDS:-30} ))
-      while slurm_job_in_queue "${job_id}" && [[ "$(date +%s)" -lt "${kill_deadline}" ]]; do
+      while [[ "$(date +%s)" -lt "${kill_deadline}" ]]; do
+        if slurm_job_in_queue "${job_id}"; then
+          :
+        else
+          query_rc=$?
+          [[ "${query_rc}" -eq 1 ]] && break
+        fi
         sleep 5
       done
       break
@@ -172,10 +215,25 @@ job_id_in_queue() {
   [[ -n "${job_id}" ]] || return 1
   command -v squeue >/dev/null 2>&1 || return 1
   local -a cmd=(squeue)
+  local output
   if [[ "${uses_spur}" == "1" ]]; then
     cmd+=(--controller "${controller}")
   fi
-  [[ -n "$("${cmd[@]}" -h -j "${job_id}" 2>/dev/null)" ]]
+  if ! output="$("${cmd[@]}" --noheader --format="%A" 2>&1)"; then
+    echo "WARNING: unable to query Slurm job ${job_id}: ${output}" >&2
+    return 0
+  fi
+  awk -v job_id="${job_id}" '
+    {
+      current_job_id = $1
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", current_job_id)
+      if (current_job_id == job_id) {
+        found = 1
+        exit
+      }
+    }
+    END { exit(found ? 0 : 1) }
+  ' <<< "${output}"
 }
 
 if [[ -n "${job_id}" ]]; then
@@ -223,17 +281,42 @@ stream_slurm_logs_once() {
 
 monitor_slurm_job() {
   local job_id="$1"
-  local -a squeue_cmd=(squeue)
+  local job_line query_rc query_failures=0
+  local job_seen=0 initial_empty_queries=0
+  local current_job_id state elapsed nodes reason
   OUT_LINE=0
   ERR_LINE=0
 
-  if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
-    squeue_cmd+=(--controller "${SPUR_CONTROLLER_ADDR}")
-  fi
-
   echo "=== monitoring Slurm job ${job_id} ==="
-  while "${squeue_cmd[@]}" -h -j "${job_id}" >/dev/null 2>&1 && [[ -n "$("${squeue_cmd[@]}" -h -j "${job_id}" 2>/dev/null)" ]]; do
-    "${squeue_cmd[@]}" -h -j "${job_id}" -o "[slurm] job=%i state=%T elapsed=%M nodes=%D reason=%R" || true
+  while true; do
+    if job_line="$(query_slurm_job "${job_id}")"; then
+      query_failures=0
+      if [[ -z "${job_line}" ]]; then
+        if [[ "${job_seen}" -eq 1 ]]; then
+          break
+        fi
+        initial_empty_queries=$((initial_empty_queries + 1))
+        if [[ "${initial_empty_queries}" -ge "${SLURM_SQUEUE_INITIAL_ATTEMPTS:-6}" ]]; then
+          echo "WARNING: Slurm job ${job_id} did not appear in squeue" >&2
+          break
+        fi
+        sleep "${SLURM_SQUEUE_RETRY_INTERVAL:-5}"
+        continue
+      fi
+      job_seen=1
+    else
+      query_rc=$?
+      query_failures=$((query_failures + 1))
+      if [[ "${query_failures}" -ge "${SLURM_SQUEUE_MAX_FAILURES:-3}" ]]; then
+        echo "ERROR: failed to query Slurm job ${job_id} ${query_failures} consecutive times" >&2
+        return "${query_rc}"
+      fi
+      sleep "${SLURM_SQUEUE_RETRY_INTERVAL:-5}"
+      continue
+    fi
+
+    IFS='|' read -r current_job_id state elapsed nodes reason <<< "${job_line}"
+    echo "[slurm] job=${current_job_id} state=${state} elapsed=${elapsed} nodes=${nodes} reason=${reason}"
     stream_slurm_logs_once
     if [[ -n "${SLURM_EXTRA_LOG_STREAMER:-}" ]]; then
       "${SLURM_EXTRA_LOG_STREAMER}" "${job_id}"
@@ -250,6 +333,7 @@ monitor_slurm_job() {
 read_slurm_exit_code() {
   local job_id="$1"
   local sacct_line exit_status exit_signal
+  local attempt state
 
   SLURM_STATE="unknown"
   SLURM_EXIT_CODE="unknown"
@@ -260,12 +344,26 @@ read_slurm_exit_code() {
     return 0
   fi
 
-  if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
-    sacct_line="$(sacct --accounting "${SPUR_ACCOUNTING_ADDR}" --brief --noheader 2>/dev/null | awk -v job_id="${job_id}" '$1 == job_id { print $2 "|" $3; exit }' || true)"
-  else
-    sacct_line="$(sacct -j "${job_id}" -X -n -P -o State,ExitCode 2>/dev/null | awk -F'|' 'NF { print; exit }' || true)"
-  fi
+  for ((attempt = 1; attempt <= ${SLURM_SACCT_MAX_ATTEMPTS:-12}; attempt++)); do
+    if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
+      sacct_line="$(sacct --accounting "${SPUR_ACCOUNTING_ADDR}" --brief --noheader 2>/dev/null | awk -v job_id="${job_id}" '$1 == job_id { print $2 "|" $3; exit }' || true)"
+    else
+      sacct_line="$(sacct -j "${job_id}" -X -n -P -o State,ExitCode 2>/dev/null | awk -F'|' 'NF { print; exit }' || true)"
+    fi
+    if [[ -n "${sacct_line}" ]]; then
+      state="${sacct_line%%|*}"
+      case "${state}" in
+        COMPLETE|COMPLETED|FAILED|CANCELLED|TIMEOUT|OUT_OF_MEMORY|NODE_FAIL|PREEMPTED|BOOT_FAIL|DEADLINE)
+          break
+          ;;
+      esac
+    fi
+    if [[ "${attempt}" -lt "${SLURM_SACCT_MAX_ATTEMPTS:-12}" ]]; then
+      sleep "${SLURM_SACCT_RETRY_INTERVAL:-5}"
+    fi
+  done
   if [[ -z "${sacct_line}" ]]; then
+    echo "WARNING: no Slurm accounting record found for job ${job_id}" >&2
     return 0
   fi
 
