@@ -1247,9 +1247,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         _ls = self._v4_fp4_ragged_local_starts[:_padded]
         _le = self._v4_fp4_ragged_local_ends[:_padded]
         compute_varqlen_windows(cu_seq_q, _ncmt, _padded, out=(_rtb, _ls, _le))
-        row_ends = attn_metadata.csa_topk_row_ends
-        if row_ends is not None:
-            _le.copy_(row_ends[:_padded])
+        if attn_metadata.csa_topk_row_ends is not None:
+            _le.copy_(attn_metadata.csa_topk_row_ends[:_padded])
         # Fixed logits width (max_model_len_idx) → the scorer's [padded, W] buffer
         # is a static shape (CG-capturable), same as the rectangular decode path.
         compute_prefill_schedule(
