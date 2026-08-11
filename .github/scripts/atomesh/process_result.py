@@ -56,13 +56,37 @@ def read_env_file(path: Path) -> dict[str, str]:
     return values
 
 
-def slurm_job_env(path: Path) -> dict[str, str]:
+def run_dir_for(path: Path) -> Path | None:
+    """Nearest ancestor holding the container env file, i.e. the Slurm RUN_DIR.
+
+    ``benchmark_results/`` and ``eval_results/`` are both direct children of
+    RUN_DIR, so this directory identifies the matrix cell that produced a file.
+    Anchoring on it rather than on a path prefix keeps the grouping identical
+    whether this script runs per-cell (root=atomesh-results/<id>) or over the
+    merged artifact (root=atomesh-results).
+    """
     for parent in path.parents:
-        env_path = parent / "docker.env"
-        if env_path.is_file():
-            return read_env_file(env_path)
-        for env_path in sorted(parent.glob("docker-rank-*.env")):
-            return read_env_file(env_path)
+        if (parent / "docker.env").is_file():
+            return parent
+        if any(parent.glob("docker-rank-*.env")):
+            return parent
+    return None
+
+
+def cell_key(path: Path) -> str:
+    run_dir = run_dir_for(path)
+    return str(run_dir) if run_dir is not None else ""
+
+
+def slurm_job_env(path: Path) -> dict[str, str]:
+    run_dir = run_dir_for(path)
+    if run_dir is None:
+        return {}
+    env_path = run_dir / "docker.env"
+    if env_path.is_file():
+        return read_env_file(env_path)
+    for env_path in sorted(run_dir.glob("docker-rank-*.env")):
+        return read_env_file(env_path)
     return {}
 
 
@@ -466,6 +490,9 @@ def perf_point(
             round_or_none(accuracy.get("threshold"), digits=4) if accuracy else None
         ),
         "accuracy_fewshot": (int_value(accuracy.get("fewshot")) if accuracy else None),
+        "accuracy_concurrency": (
+            int_value(accuracy.get("concurrency")) if accuracy else None
+        ),
     }
     if accuracy and accuracy.get("task") == "gsm8k":
         point["gsm8k"] = round_or_none(accuracy.get("value"), digits=4)
@@ -488,10 +515,60 @@ def dashboard_point_entry(point: dict[str, Any], extra: str) -> dict[str, Any] |
     )
 
 
+class AccuracyIndex:
+    """Eval scores keyed by matrix cell, with a global fallback.
+
+    A cell that produced any score never borrows another cell's score. That
+    guard is what stops an agentic gsm8k run from bleeding onto unrelated perf
+    rows that merely share a model, topology and concurrency. Results that
+    cannot be attributed to a cell (no docker.env alongside them) still resolve
+    through the legacy global chain.
+    """
+
+    def __init__(self) -> None:
+        # A cell runs exactly one case, so model and topology are constant
+        # within it and concurrency alone identifies a score. Matching on the
+        # names parsed out of paths does not work here: the perf filename for
+        # 1p1d-tp4-pcp2 splits as model=GLM-5.2-MXFP4-1p1d-tp4/topology=pcp2
+        # while its eval directory yields model=GLM-5.2-MXFP4/topology=1p1d.
+        self.by_cell: dict[str, dict[int, dict[str, Any]]] = {}
+        self.by_run: dict[tuple[str, str, int], dict[str, Any]] = {}
+        self.count = 0
+
+    def add(
+        self, cell: str, model: str, topology: str, conc: int, score: dict[str, Any]
+    ) -> None:
+        if cell:
+            self.by_cell.setdefault(cell, {})[conc] = score
+        self.by_run[(model, topology, conc)] = score
+        self.count += 1
+
+    def lookup(
+        self, cell: str, model: str, topology: str, conc: int
+    ) -> dict[str, Any] | None:
+        cell_scores = self.by_cell.get(cell) if cell else None
+        if cell_scores is not None:
+            # This cell ran an eval, so it never borrows another cell's score.
+            return cell_scores.get(conc)
+        for key in (
+            (model, topology, conc),
+            ("", topology, conc),
+            (model, "", conc),
+            ("", "", conc),
+        ):
+            found = self.by_run.get(key)
+            if found is not None:
+                return found
+        return None
+
+    def __len__(self) -> int:
+        return self.count
+
+
 def collect_dashboard_entries(
     paths: list[Path],
     run_url: str | None,
-    accuracy_scores: dict[tuple[str, str, int], dict[str, Any]],
+    accuracy_scores: AccuracyIndex,
     hardware: str | None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     entries: list[dict[str, Any]] = []
@@ -509,13 +586,7 @@ def collect_dashboard_entries(
         conc = int(payload.get("max_concurrency", fields["conc"]))
         model = model_key(payload.get("benchmark_model_name") or fields["model"])
         topology = topology_key(fields["topology"])
-        accuracy = accuracy_scores.get((model, topology, conc))
-        if accuracy is None:
-            accuracy = accuracy_scores.get(("", topology, conc))
-        if accuracy is None:
-            accuracy = accuracy_scores.get((model, "", conc))
-        if accuracy is None:
-            accuracy = accuracy_scores.get(("", "", conc))
+        accuracy = accuracy_scores.lookup(cell_key(path), model, topology, conc)
         if accuracy is not None:
             payload["accuracy_task"] = accuracy.get("task")
             payload["accuracy_metric"] = accuracy.get("metric")
@@ -526,6 +597,7 @@ def collect_dashboard_entries(
             payload["accuracy_total"] = accuracy.get("total")
             payload["accuracy_threshold"] = accuracy.get("threshold")
             payload["accuracy_fewshot"] = accuracy.get("fewshot")
+            payload["accuracy_concurrency"] = accuracy.get("concurrency")
             if accuracy.get("task") == "gsm8k":
                 payload["gsm8k"] = accuracy.get("value")
                 payload["gsm8k_raw"] = accuracy.get("raw")
@@ -554,8 +626,38 @@ def eval_topology(path: Path) -> str:
     return ""
 
 
-def find_eval_scores(root: Path) -> dict[tuple[str, str, int], dict[str, Any]]:
-    scores = {}
+def benchmark_concurrencies(bench_paths: list[Path]) -> dict[str, set[int]]:
+    """Concurrencies each cell actually benchmarked, used to place eval scores."""
+    concurrencies: dict[str, set[int]] = {}
+    for path in bench_paths:
+        if path.name.endswith("-benchmark-action.json"):
+            continue
+        payload = read_json(path)
+        if not payload:
+            continue
+        fields = derive_fields(path, payload)
+        if not fields:
+            continue
+        conc = int(number(payload.get("max_concurrency")) or fields["conc"])
+        concurrencies.setdefault(cell_key(path), set()).add(conc)
+    return concurrencies
+
+
+def nearest_concurrency(conc: int, choices: set[int]) -> int:
+    """Snap an eval concurrency onto the closest concurrency the cell measured.
+
+    Accuracy runs are free to use a concurrency that is not in the benchmark
+    sweep (agentic cases evaluate at 48; the non-agentic GLM cases at 65). Left
+    unsnapped those scores match no perf row and are silently discarded.
+    """
+    if not choices or conc in choices:
+        return conc
+    return min(choices, key=lambda value: (abs(value - conc), value))
+
+
+def find_eval_scores(root: Path, bench_paths: list[Path]) -> AccuracyIndex:
+    scores = AccuracyIndex()
+    cell_concurrencies = benchmark_concurrencies(bench_paths)
     for path in sorted(root.rglob("results*.json")):
         payload = read_json(path)
         if not payload:
@@ -607,18 +709,36 @@ def find_eval_scores(root: Path) -> dict[tuple[str, str, int], dict[str, Any]]:
             fewshot = task_config.get("num_fewshot")
             if fewshot is None:
                 fewshot = global_config.get("num_fewshot")
-            scores[(model_key(env.get("MODEL_NAME")), eval_topology(path), conc)] = {
-                "task": task,
-                "metric": metric,
-                "value": round(score, 4),
-                "raw": f"{score:.4f}",
-                "strict": round(strict, 4) if strict is not None else None,
-                "resolved": int_value(resolved),
-                "total": int_value(total),
-                "threshold": number(env.get("EVAL_THRESHOLD")),
-                "fewshot": int_value(fewshot),
-            }
+            cell = cell_key(path)
+            scores.add(
+                cell,
+                model_key(env.get("MODEL_NAME")),
+                eval_topology(path),
+                nearest_concurrency(conc, cell_concurrencies.get(cell, set())),
+                {
+                    "task": task,
+                    "metric": metric,
+                    "value": round(score, 4),
+                    "raw": f"{score:.4f}",
+                    "strict": round(strict, 4) if strict is not None else None,
+                    "resolved": int_value(resolved),
+                    "total": int_value(total),
+                    "threshold": number(env.get("EVAL_THRESHOLD")),
+                    "fewshot": int_value(fewshot),
+                    "concurrency": conc,
+                },
+            )
     return scores
+
+
+def accuracy_cell(row: dict[str, Any]) -> str:
+    """Accuracy score, annotated when it was measured at another concurrency."""
+    score = fmt(row.get("accuracy_score"), digits=4)
+    eval_conc = number(row.get("accuracy_concurrency"))
+    row_conc = number(row.get("max_concurrency"))
+    if score == "--" or eval_conc is None or eval_conc == row_conc:
+        return score
+    return f"{score} (eval c={int(eval_conc)})"
 
 
 def write_summary(rows: list[dict[str, Any]], summary_path: Path) -> None:
@@ -648,7 +768,7 @@ def write_summary(rows: list[dict[str, Any]], summary_path: Path) -> None:
                 tpot=fmt(row.get("mean_tpot_ms")),
                 e2e=fmt(row.get("mean_e2el_ms")),
                 accuracy_task=row.get("accuracy_task") or "--",
-                accuracy=fmt(row.get("accuracy_score"), digits=4),
+                accuracy=accuracy_cell(row),
             )
         )
     summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -672,7 +792,7 @@ def main() -> None:
 
     root = Path(args.result_dir)
     bench_paths = list(root.rglob("pd-*.json"))
-    accuracy_scores = find_eval_scores(root)
+    accuracy_scores = find_eval_scores(root, bench_paths)
     entries, rows = collect_dashboard_entries(
         bench_paths, args.run_url, accuracy_scores, args.hardware
     )

@@ -1068,10 +1068,11 @@ run_benchmark_and_eval() {
     return
   fi
   if [[ "${BENCHMARK_KIND}" == "aiperf_agentic" \
-    && "${EVAL_TASK}" == "swebench_lite" \
     && ( "${RUN_EVAL}" == "true" || "${RUN_EVAL}" == "1" ) ]]; then
-    # Agentic performance cases require a fresh prefix-cache state. Run their
-    # trace benchmark before the independent SWE-bench workload.
+    # Agentic performance cases require a fresh prefix-cache state, so their
+    # trace benchmark runs before any accuracy workload sharing the same
+    # server -- SWE-bench Lite on the weekly, gsm8k on the daily. Running the
+    # eval first would warm the prefix cache and inflate the reported hit rate.
     run_benchmark
     run_eval
   else

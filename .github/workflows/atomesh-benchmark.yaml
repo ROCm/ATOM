@@ -17,7 +17,8 @@ on:
       - '.github/scripts/atomesh/**'
       - '.github/workflows/atomesh-benchmark.yaml'
   schedule:
-    # TW nightly for DeepSeek and GLM-Agentic cases only at 00:00 Beijing time (16:00 UTC).
+    # TW weekly for DeepSeek and GLM-Agentic cases only, Saturday 00:00 Beijing
+    # time (Friday 16:00 UTC). This is the run that measures SWE-bench Lite.
     - cron: '0 16 * * 5'
     # Spur MI350X nightly at 00:10 Beijing time (16:10 UTC).
     - cron: '10 16 * * *'
@@ -122,6 +123,11 @@ on:
         type: string
       eval_concurrency:
         description: 'Optional accuracy result-concurrency override; SWE-bench agent workers come from models_atomesh.yaml'
+        required: false
+        default: ''
+        type: string
+      case_profile:
+        description: 'Per-case profile overlay, e.g. daily (agentic cases run gsm8k instead of SWE-bench Lite); empty = case defaults'
         required: false
         default: ''
         type: string
@@ -269,6 +275,7 @@ jobs:
           ATOMESH_IMAGE: ${{ steps.image.outputs.image }}
           ATOMESH_BENCHMARK_CONCURRENCY: ${{ github.event_name == 'workflow_dispatch' && inputs.benchmark_concurrency || '' }}
           ATOMESH_EVAL_CONCURRENCY: ${{ github.event_name == 'workflow_dispatch' && inputs.eval_concurrency || '' }}
+          CASE_PROFILE: ${{ github.event_name == 'workflow_dispatch' && inputs.case_profile || '' }}
         run: |
           set -euo pipefail
           MODEL_NAME=""
@@ -283,6 +290,13 @@ jobs:
               fi
               MODEL_NAME="${MODEL_NAMES}"
             fi
+          fi
+
+          # The Spur MI350X daily swaps the agentic accuracy workload from
+          # SWE-bench Lite (a ~13h agent run that also needs a host Docker
+          # socket) to gsm8k. The TW weekly below keeps the case defaults.
+          if [[ "${GITHUB_EVENT_NAME}" == "schedule" && "${EVENT_SCHEDULE}" == "10 16 * * *" ]]; then
+            CASE_PROFILE="daily"
           fi
 
           if [[ "${GITHUB_EVENT_NAME}" == "schedule" && "${EVENT_SCHEDULE}" == "0 16 * * 5" ]]; then
@@ -337,6 +351,7 @@ jobs:
               ${ATOMESH_IMAGE:+--image "$ATOMESH_IMAGE"} \
               ${ATOMESH_BENCHMARK_CONCURRENCY:+--benchmark-concurrency "$ATOMESH_BENCHMARK_CONCURRENCY"} \
               ${ATOMESH_EVAL_CONCURRENCY:+--eval-concurrency "$ATOMESH_EVAL_CONCURRENCY"} \
+              ${CASE_PROFILE:+--profile "$CASE_PROFILE"} \
               --output atomesh-matrix.json \
               --github-output
           fi
@@ -388,7 +403,7 @@ jobs:
         || (github.event_name == 'workflow_dispatch' && inputs.run_model_benchmark)
       )
     runs-on: ${{ matrix.runner.slurm_submit_runner }}
-    timeout-minutes: ${{ matrix.run_eval && matrix.accuracy.task == 'swebench_lite' && 780 || 420 }}
+    timeout-minutes: ${{ matrix.run_eval && (matrix.accuracy.task == 'swebench_lite' || matrix.benchmark.kind == 'aiperf_agentic') && 780 || 420 }}
     strategy:
       fail-fast: false
       max-parallel: 1

@@ -15,6 +15,18 @@ import yaml
 
 ENV_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
+# Keys a case-level `profiles:` overlay is allowed to touch. Everything that
+# shapes the performance run (concurrency, isl/osl, topology, benchmark kind,
+# nodes) is deliberately excluded so a profile can never make two schedules
+# measure different things under the same cell id.
+PROFILE_OVERRIDE_KEYS = {
+    "accuracy",
+    "eval_concurrency",
+    "eval_limit",
+    "run_eval",
+    "runner",
+}
+
 
 def deep_merge(*items: dict[str, Any]) -> dict[str, Any]:
     merged: dict[str, Any] = {}
@@ -25,6 +37,27 @@ def deep_merge(*items: dict[str, Any]) -> dict[str, Any]:
             else:
                 merged[key] = copy.deepcopy(value)
     return merged
+
+
+def apply_case_profile(
+    case_cfg: dict[str, Any], profile: str | None
+) -> tuple[dict[str, Any], bool]:
+    """Overlay ``case_cfg['profiles'][profile]``; returns ``(cfg, matched)``."""
+    profiles = case_cfg.get("profiles") or {}
+    overlay = profiles.get(profile) if profile else None
+    if overlay is None:
+        cfg = dict(case_cfg)
+        cfg.pop("profiles", None)
+        return cfg, False
+    unknown = set(overlay) - PROFILE_OVERRIDE_KEYS
+    if unknown:
+        raise ValueError(
+            f"profile '{profile}' on case '{case_cfg.get('name')}' may not "
+            f"override {sorted(unknown)}; allowed: {sorted(PROFILE_OVERRIDE_KEYS)}"
+        )
+    cfg = deep_merge(case_cfg, overlay)
+    cfg.pop("profiles", None)
+    return cfg, True
 
 
 def normalize_list(value: Any) -> list[Any]:
@@ -415,13 +448,17 @@ def build_cells(
     override_image: str | None,
     override_benchmark_concurrency: list[int] | None,
     override_eval_concurrency: list[int] | None,
+    profile: str | None = None,
 ) -> list[dict[str, Any]]:
     cells = []
+    known_profiles: set[str] = set()
+    profile_matched = False
     for model_name, model_cfg in (cfg.get("models") or {}).items():
         if model_filter and model_name not in model_filter:
             continue
         suites = model_cfg.get("suites", {})
         for suite_cfg in normalize_list(suites.get(suite)):
+            known_profiles.update(suite_cfg.get("profiles") or {})
             if case_filter and str(suite_cfg.get("name", "")) not in case_filter:
                 continue
             benchmark_cfg = deep_merge(
@@ -431,18 +468,27 @@ def build_cells(
             benchmark_kind = str(benchmark_cfg.get("kind", "random"))
             if benchmark_kind_filter and benchmark_kind not in benchmark_kind_filter:
                 continue
-            cells.append(
-                build_cell(
-                    cfg=cfg,
-                    model_name=str(model_name),
-                    model_cfg=model_cfg,
-                    suite_name=suite,
-                    suite_cfg=suite_cfg,
-                    override_image=override_image,
-                    override_benchmark_concurrency=override_benchmark_concurrency,
-                    override_eval_concurrency=override_eval_concurrency,
-                )
+            case_cfg, matched = apply_case_profile(suite_cfg, profile)
+            profile_matched = profile_matched or matched
+            cell = build_cell(
+                cfg=cfg,
+                model_name=str(model_name),
+                model_cfg=model_cfg,
+                suite_name=suite,
+                suite_cfg=case_cfg,
+                override_image=override_image,
+                override_benchmark_concurrency=override_benchmark_concurrency,
+                override_eval_concurrency=override_eval_concurrency,
             )
+            cell["profile"] = profile or ""
+            cells.append(cell)
+    # A mistyped profile would silently fall back to the case defaults, which is
+    # exactly the regression the profile exists to prevent. Fail loudly instead.
+    if profile and not profile_matched:
+        raise ValueError(
+            f"profile '{profile}' matched no case in suite '{suite}'; "
+            f"profiles defined in this suite: {sorted(known_profiles) or 'none'}"
+        )
     return cells
 
 
@@ -486,6 +532,11 @@ def main() -> int:
         default=os.environ.get("ATOMESH_EVAL_CONCURRENCY") or None,
         help="Optional comma-separated lm_eval concurrency override",
     )
+    parser.add_argument(
+        "--profile",
+        default=os.environ.get("ATOMESH_CASE_PROFILE") or None,
+        help="Optional per-case profile overlay name (e.g. daily)",
+    )
     parser.add_argument("--output", help="Optional output JSON path")
     parser.add_argument("--github-output", action="store_true")
     args = parser.parse_args()
@@ -504,13 +555,20 @@ def main() -> int:
         override_image=args.image,
         override_benchmark_concurrency=benchmark_concurrency or None,
         override_eval_concurrency=eval_concurrency or None,
+        profile=args.profile,
     )
-    print(f"Generated {len(cells)} ATOMesh benchmark cell(s) for suite={args.suite}")
+    profile_note = f" profile={args.profile}" if args.profile else ""
+    print(
+        f"Generated {len(cells)} ATOMesh benchmark cell(s) "
+        f"for suite={args.suite}{profile_note}"
+    )
     for cell in cells:
+        eval_note = cell["accuracy"]["task"] if cell["run_eval"] else "off"
         print(
             f"  {cell['id']}: {cell['model']} {cell['display_topology']} "
             f"nodes={','.join(cell['nodes'])} isl={cell['isl']} osl={cell['osl']} "
-            f"conc={cell['concurrency']} eval_conc={cell['accuracy']['concurrency']}"
+            f"conc={cell['concurrency']} eval={eval_note} "
+            f"eval_conc={cell['accuracy']['concurrency']}"
         )
 
     if args.output:

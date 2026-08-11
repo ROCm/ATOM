@@ -292,6 +292,19 @@ models:
               wait_server_timeout: 4500
               wait_router_timeout: 600
             run_eval: false
+            # Inherited by every AgentX case below. The Spur MI350X daily
+            # (cron '10 16 * * *') measures gsm8k right after the aiperf trace;
+            # SWE-bench Lite stays on the TW MI355X weekly (cron '0 16 * * 5'),
+            # which runs without a profile and therefore sees the case defaults.
+            profiles:
+              daily:
+                run_eval: true
+                eval_concurrency: [48]
+                accuracy:
+                  task: gsm8k
+                  # gsm8k has no agreed baseline yet, so leave it ungated
+                  # instead of inheriting the SWE-bench Lite threshold.
+                  threshold: null
           name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c1
           concurrency: [1]
           accuracy:
