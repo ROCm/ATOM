@@ -2240,7 +2240,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             )
             attn_metadata.state_slot_out_cpu = state_slot_np_ub
             attn_metadata.compress_plans = compress_plans
-            attn_metadata.swa_block_tables = swa_block_tables_gpu
             if dspark_ragged:
                 ragged_lens_buf = np.zeros(padded_bs, dtype=np.int32)
                 ragged_lens_buf[:ub_real_reqs] = ub_extend_lens_np
@@ -3987,11 +3986,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             self.model_runner.config, "enable_tbo_decode", False
         ):
             self._alloc_v4_ubatch_decode_buffers(bufs, i32, i64)
-
-        # paged-SWA: parallel SWA block table (same shape as the compressed
-        # block_tables), filled from batch.swa_block_tables. -1 = window-freed
-        # (never indexed; SWA attention only reads in-window positions).
-        bufs["swa_block_tables"] = CpuGpuBuffer(bs, _bt_cols, **i32)
 
         self.model_runner.forward_vars.update(bufs)
 
