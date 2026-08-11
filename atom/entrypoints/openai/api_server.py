@@ -1721,7 +1721,6 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
 @app.get("/v1/models")
 async def list_models():
     """List available models."""
-    global model_name
     return ModelList(data=[ModelCard(id=model_name)])
 
 
@@ -1734,16 +1733,29 @@ async def health():
 @app.get("/debug/mtp_stats")
 async def get_mtp_stats():
     """Return current speculative decoding acceptance statistics."""
-    global engine
     if engine is None:
         raise HTTPException(status_code=503, detail="Engine is not initialized")
     try:
         return engine.get_mtp_statistics()
     except Exception as e:
-        logger.error(f"Failed to get MTP statistics: {e}", exc_info=True)
+        logger.exception("Failed to get MTP statistics")
         raise HTTPException(
-            status_code=500, detail=f"Failed to get MTP statistics: {str(e)}"
+            status_code=500, detail=f"Failed to get MTP statistics: {e!s}"
         )
+
+
+@app.get("/debug/cache_stats")
+async def get_cache_stats():
+    """Return cumulative prefix-cache reuse statistics."""
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Engine is not initialized")
+    try:
+        return engine.get_cache_statistics()
+    except Exception as e:
+        logger.exception("Failed to get cache statistics")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to get cache statistics: {e}"
+        ) from e
 
 
 def _resolve_kv_transfer_role(kv_cfg: dict) -> tuple[str | None, int]:
@@ -1771,7 +1783,6 @@ def _resolve_kv_transfer_role(kv_cfg: dict) -> tuple[str | None, int]:
 
 @app.get("/kv_transfer_info")
 async def kv_transfer_info():
-    global engine
     cfg = engine.config
     kv_cfg = cfg.kv_transfer_config or {}
     kv_role, handshake_port = _resolve_kv_transfer_role(kv_cfg)
@@ -1786,21 +1797,17 @@ async def kv_transfer_info():
 @app.post("/start_profile")
 async def start_profile():
     """Start profiling the engine."""
-    global engine
     try:
         engine.start_profile()
         return {"status": "success", "message": "Profiling started"}
     except Exception as e:
-        logger.error(f"Failed to start profiling: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=500, detail=f"Failed to start profiling: {str(e)}"
-        )
+        logger.exception("Failed to start profiling")
+        raise HTTPException(status_code=500, detail=f"Failed to start profiling: {e!s}")
 
 
 @app.post("/stop_profile")
 async def stop_profile():
     """Stop profiling the engine."""
-    global engine
     try:
         traces = engine.stop_profile()
         return {
@@ -1809,10 +1816,8 @@ async def stop_profile():
             "traces": traces,
         }
     except Exception as e:
-        logger.error(f"Failed to stop profiling: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=500, detail=f"Failed to stop profiling: {str(e)}"
-        )
+        logger.exception("Failed to stop profiling")
+        raise HTTPException(status_code=500, detail=f"Failed to stop profiling: {e!s}")
 
 
 # ============================================================================
