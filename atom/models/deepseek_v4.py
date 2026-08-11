@@ -1780,18 +1780,10 @@ class Indexer(nn.Module):
         topk_local = torch.empty(
             total_tokens, self.index_topk, dtype=torch.int32, device=q_fp8.device
         )
-        # Reuse aiter's existing ratio-1 decode API with next_n=1: its bound
-        # `seqLens[row/next_n] - next_n + row%next_n + 1` then becomes the exact
-        # per-token CSA reservation `csa_topk_row_ends[row]`.
-        row_ends = getattr(attn_md, "csa_topk_row_ends", None)
         top_k_per_row_decode(
             logits,
-            1 if row_ends is not None else next_n,
-            (
-                row_ends[:total_tokens]
-                if row_ends is not None
-                else n_committed_per_seq_gpu
-            ),
+            1,
+            attn_md.n_committed_csa_per_token[:total_tokens],
             topk_local,
             total_tokens,
             logits.stride(0),
@@ -2025,15 +2017,10 @@ class Indexer(nn.Module):
         topk_local = torch.empty(
             total_tokens, self.index_topk, dtype=torch.int32, device=q_fp4.device
         )
-        row_ends = getattr(attn_md, "csa_topk_row_ends", None)
         top_k_per_row_decode(
             logits,
-            1 if row_ends is not None else next_n,
-            (
-                row_ends[:total_tokens]
-                if row_ends is not None
-                else n_committed_per_seq_gpu
-            ),
+            1,
+            attn_md.n_committed_csa_per_token[:total_tokens],
             topk_local,
             total_tokens,
             logits.stride(0),
@@ -2239,17 +2226,11 @@ class Indexer(nn.Module):
         topk_rect = torch.full(
             (R + 1, self.index_topk), -1, dtype=torch.int32, device=device
         )
-        # Layer-invariant ratio-4 bounds were right-aligned into this same
-        # rectangle by the metadata builder; do not zero+scatter them per layer.
-        ends_rect = getattr(attn_md, "csa_topk_row_ends_rect", None)
+        per_token_rect = attn_md.n_committed_csa_per_token_rect
         top_k_per_row_decode(
             logits,
-            1 if ends_rect is not None else full_q,
-            (
-                ends_rect[:R]
-                if ends_rect is not None
-                else n_committed_per_seq_gpu
-            ),
+            1,
+            per_token_rect[:R],
             topk_rect[:R],
             R,
             logits.stride(0),
