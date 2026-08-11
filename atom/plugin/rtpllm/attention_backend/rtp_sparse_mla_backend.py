@@ -380,6 +380,32 @@ class _RealSparseMlaImpl:
         # RTP allocates GLM5 FP8 MLA KV cache in the aiter 576-byte/token layout.
         return "fp8"
 
+    @staticmethod
+    def _view_as_aiter_fp8(tensor: torch.Tensor) -> torch.Tensor:
+        """Adapt the E4M3 dtype metadata expected by AITER on MI308 and MI355.
+
+        ROCm may expose platform-native E4M3 data as either float8_e4m3fn or
+        float8_e4m3fnuz, while AITER kernels expect aiter.dtypes.fp8. The data
+        is already encoded for the current platform, so only reinterpret its
+        dtype metadata; non-FP8 activations must remain unchanged.
+        """
+        try:
+            from aiter import dtypes
+        except ImportError:
+            return tensor
+
+        e4m3_dtypes = {
+            dtype
+            for dtype in (
+                getattr(torch, "float8_e4m3fn", None),
+                getattr(torch, "float8_e4m3fnuz", None),
+            )
+            if dtype is not None
+        }
+        if tensor.dtype in e4m3_dtypes:
+            return tensor.view(dtypes.fp8)
+        return tensor
+
     def _write_current_to_cache(
         self,
         *,
@@ -422,6 +448,9 @@ class _RealSparseMlaImpl:
             slot_mapping_for_cache = slot_mapping.to(
                 device=compressed_kv.device, dtype=torch.int64
             )
+        compressed_kv = self._view_as_aiter_fp8(compressed_kv)
+        k_pe = self._view_as_aiter_fp8(k_pe)
+        kv_cache_base = self._view_as_aiter_fp8(kv_cache_base)
         try:
             concat_and_cache_mla(
                 compressed_kv,
@@ -1208,6 +1237,8 @@ class _RealSparseMlaImpl:
             else:
                 q_for_kernel = q_for_kernel.to(dtype=dtypes.fp8)
         try:
+            kv_cache_base = self._view_as_aiter_fp8(kv_cache_base)
+            q_for_kernel = self._view_as_aiter_fp8(q_for_kernel)
             kv_buffer = kv_cache_base.reshape(-1, 1, 1, latent_dim)
             if (
                 not in_capture
