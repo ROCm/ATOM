@@ -1361,9 +1361,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 # Single-kernel schedule written straight into the fixed-address
                 # buffer (no intermediate alloc + copy). ~50 tiny torch launches
                 # -> 1 Triton launch (~300us -> ~40us per decode step).
-                _ncmt_sched = attn_metadata.csa_topk_row_ends[
-                    : positions_gpu.shape[0]
-                ]
+                _ncmt_sched = attn_metadata.csa_topk_row_ends[: positions_gpu.shape[0]]
                 compute_varctx_schedule(
                     _ncmt_sched,
                     self._fp4_block_k,
@@ -1891,9 +1889,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             tok_start = int(token_offsets[req_start])
             tok_end = int(token_offsets[req_start + ub_real_reqs])
             ub_real_tokens = tok_end - tok_start
-            ub_extend_lens_np = extend_lens_np[
-                req_start : req_start + ub_real_reqs
-            ]
+            ub_extend_lens_np = extend_lens_np[req_start : req_start + ub_real_reqs]
 
             # ---- per-seq slices into ub buffers ----
             ub_ctx_np = context_lens_np[req_start : req_start + ub_real_reqs]
@@ -1932,9 +1928,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             cu = np.zeros(ub_real_reqs + 1, dtype=np.int32)
             np.cumsum(ub_extend_lens_np, out=cu[1:])
             var[f"{p}cu_seqlens_q"].np[: ub_real_reqs + 1] = cu
-            var[f"{p}cu_seqlens_q"].np[ub_real_reqs + 1 : padded_bs + 1] = (
-                ub_real_reqs * max_seqlen_q
-            )
+            var[f"{p}cu_seqlens_q"].np[
+                ub_real_reqs + 1 : padded_bs + 1
+            ] = ub_real_tokens
 
             # ---- H2D ----
             ub_sum_tokens = max(ub_real_tokens, 1)
@@ -2816,7 +2812,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             ragged_lens_np = np.asarray(
                 token_num_per_seq[:scheduled_bs], dtype=np.int32
             )
-            rect_bs = max(scheduled_bs, T_pad // full_q)
+            ragged_lens_gpu = getattr(attn_metadata, "dspark_ragged_lens_gpu", None)
+            rect_bs = max(
+                scheduled_bs,
+                int(ragged_lens_gpu.shape[0]) if ragged_lens_gpu is not None else 0,
+            )
             csa_topk_row_ends_np = np.zeros(rect_bs * full_q, dtype=np.int32)
             cu = np.zeros(scheduled_bs + 1, dtype=np.int32)
             np.cumsum(ragged_lens_np, out=cu[1:], dtype=np.int32)
@@ -3733,9 +3733,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             bufs[f"{p}v4_kv_indptr_csa"] = CpuGpuBuffer(T_dec + 1, **i32)
             bufs[f"{p}v4_kv_indptr_hca"] = CpuGpuBuffer(T_dec + 1, **i32)
             bufs[f"{p}v4_csa_topk_row_ends"] = CpuGpuBuffer(T_dec, **i32)
-            bufs[f"{p}v4_csa_mqa_block_tables"] = CpuGpuBuffer(
-                T_dec, max_blocks, **i32
-            )
+            bufs[f"{p}v4_csa_mqa_block_tables"] = CpuGpuBuffer(T_dec, max_blocks, **i32)
             bufs[f"{p}v4_n_committed_csa_per_seq"] = CpuGpuBuffer(bs, **i32)
             bufs[f"{p}v4_batch_id_per_token"] = CpuGpuBuffer(mnbt, **i32)
             bufs[f"{p}v4_indexer_cu_committed"] = CpuGpuBuffer(bs + 1, **i32)
