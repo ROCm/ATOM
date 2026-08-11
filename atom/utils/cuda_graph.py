@@ -276,3 +276,85 @@ class CUDAGraphWrapper:
 
         entry.cudagraph.replay()
         return entry.output
+
+
+class CudagraphCaptureRunner:
+    """Generic capture/replay for a split-op body captured into its OWN cudagraph.
+
+    Extracted from the AF_PIECEWISE attention-core path (DeepSeek-V4 DSpark). A
+    model's custom op builds a graph key, the arg tuple, and the zero-copy index
+    set, then calls run(); the runner owns the per-key graph cache and a dedicated
+    graph pool (isolated from the dense-piece pool). zero-copy args are captured on
+    directly (no per-step copy); others are cloned at capture and copied at replay.
+    The output copy is baked INSIDE the graph so replay refreshes a persistent
+    buffer with no Python. Behavior is identical to the old inline V4 state machine.
+    """
+
+    def __init__(self, capture_error_mode: str = "thread_local"):
+        self._graphs: dict = {}
+        self._pool = None
+        self._capture_error_mode = capture_error_mode
+
+    def get(self, key):
+        return self._graphs.get(key)
+
+    def run(
+        self,
+        *,
+        key,
+        args: tuple,
+        zc: frozenset,
+        compute_fn: Callable,
+        out_buf_fn: Callable,
+        is_capture: bool,
+        is_replay: bool,
+        stabilize_fn: Callable | None = None,
+    ):
+        """Dispatch capture / replay / eager for one op invocation.
+
+        key         : hashable graph key (caller-built)
+        args        : input tensors (entries may be None)
+        zc          : zero-copy arg indices (captured directly, skipped at replay)
+        compute_fn  : callable(*bufs) -> output tensor (the core compute)
+        out_buf_fn  : callable(warm_out) -> persistent output buffer (stable addr)
+        is_capture  : _piecewise and _in_hipgraph and key not captured yet
+        is_replay   : _piecewise and not _in_hipgraph and key captured
+        stabilize_fn: optional callable(out)->out for the eager/fallback return
+        """
+
+        def _stab(out):
+            return stabilize_fn(out) if stabilize_fn is not None else out
+
+        if is_capture:
+            # zc args captured directly; others cloned into owned stable buffers
+            in_bufs = [
+                (t if (i in zc) else (t.clone() if t is not None else None))
+                for i, t in enumerate(args)
+            ]
+            warm_out = compute_fn(*in_bufs)  # warmup before capture
+            out_buf = out_buf_fn(warm_out)  # persistent buffer, stable addr
+            graph = torch.cuda.CUDAGraph()
+            if self._pool is None:
+                self._pool = torch.cuda.graph_pool_handle()
+            with torch.cuda.graph(
+                graph,
+                pool=self._pool,
+                stream=torch.cuda.current_stream(),
+                capture_error_mode=self._capture_error_mode,
+            ):
+                cg_out = compute_fn(*in_bufs)
+                out_buf.copy_(cg_out)  # output copy baked into graph
+            self._graphs[key] = {"graph": graph, "in": in_bufs, "out": out_buf}
+            return _stab(compute_fn(*args))  # genuine eager result this forward
+
+        if is_replay:
+            entry = self._graphs[key]
+            for i, (buf, src) in enumerate(zip(entry["in"], args)):
+                if i in zc:
+                    continue
+                if buf is not None and src is not None:
+                    buf.copy_(src)
+            entry["graph"].replay()
+            return entry["out"]  # persistent buf, refreshed in-graph
+
+        return _stab(compute_fn(*args))  # eager fallback

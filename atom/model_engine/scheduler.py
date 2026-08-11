@@ -347,6 +347,11 @@ class ScheduledBatch:
     ):
         if scheduled_spec_decode_tokens is None:
             scheduled_spec_decode_tokens = {}
+        # Defaults so these attrs always exist (set for real in the num_spec_step
+        # branch below). spec_decode_req_ids[r] = seq id of row r in the compacted
+        # scheduled_spec_decode_tokens array.
+        self.scheduled_spec_decode_tokens = np.empty((0, 0), dtype=np.int32)
+        self.spec_decode_req_ids: list[int] = []
         self.remote_kv_block_ids = remote_kv_block_ids or []
         self.remote_kv_seq_blocks = remote_kv_seq_blocks or {}
 
@@ -469,6 +474,12 @@ class ScheduledBatch:
                     continue
                 width = min(drafts.size, num_spec_step)
                 self.scheduled_spec_decode_tokens[i, :width] = drafts[:width]
+            # The array is DENSE (one row per seq, filled by batch position
+            # above), so name rows by the batch-ordered req ids: row r <-> seq
+            # self.req_ids[r]. `_draft_tokens_for` maps a seq -> row via this,
+            # which stays correct when prefill/decode interleave and shift
+            # positions (a no-draft seq maps to its own zero row).
+            self.spec_decode_req_ids = list(self.req_ids)
         self.block_tables = [
             seq.block_table for seq in seqs.values() if seq.block_table
         ]

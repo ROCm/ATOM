@@ -112,6 +112,7 @@ from atom.model_ops.v4_kernels import (
     update_compressor_states,
 )
 from atom.utils import envs, mark_spliting_op
+from atom.utils.cuda_graph import CudagraphCaptureRunner
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import AttnState, get_forward_context
@@ -192,12 +193,9 @@ def _pin_core_input(layer_name: str, arg_idx: int, num_tokens: int, t):
     return buf
 
 
-# AF_PIECEWISE: attn-core cudagraphs keyed (layer, bucket_bs, q_eff, num_tokens_pad).
-# entry: {"graph", "in": [stable|None,...], "out"}
-_v4_attn_core_graphs: dict = {}
-
-# Isolated attention-graph pool. Created once on first capture.
-_v4_attn_graph_pool = None
+# AF_PIECEWISE: attn-core capture/replay (keyed layer, bucket_bs, q_eff, nt_pad).
+# Owns its isolated graph pool + per-key graph cache.
+_v4_attn_runner = CudagraphCaptureRunner()
 
 # Max decode num_tokens the q public buffer covers; also its row count. Decode
 # forwards a flat bucket up to this. Larger num_tokens (prefill / huge concat)
@@ -205,14 +203,65 @@ _v4_attn_graph_pool = None
 _V4_ATTN_QPUB_MAX = 512
 
 
-def _v4_write_pub(pub: torch.Tensor, src: torch.Tensor, n: int) -> torch.Tensor:
-    """Write `src` (n tokens) into the fixed-address public buffer `pub` and return
-    the leading-n slice `pub[:n]`. Token axis is ALWAYS dim 0 for every arg this is
-    used on: qr [T, q_lora_rank], qr_scale [T, num_groups] (the fused-quant kernel
-    emits `.view(M, num_groups)` even on the transpose_scale path), and the indexer
-    outputs [T, ...]. `pub` was allocated with leading dim _V4_ATTN_QPUB_MAX >= n."""
-    pub[:n].copy_(src)
-    return pub[:n]
+class _V4AttnZeroCopyBuffers:
+    """Fixed-address public buffers for one attention layer's AF_PIECEWISE zero-copy
+    inputs, plus the inplace-out flags. Allocated post-load from a dummy forward
+    (shapes/dtypes vary by quant cfg). _attn_pre stages each per-step input into its
+    buffer so the attn-core cudagraph reads a constant address (no per-step copy).
+    Token axis is ALWAYS dim 0 for every staged tensor."""
+
+    MAX = _V4_ATTN_QPUB_MAX
+
+    def __init__(self):
+        self.qkv_a = self.kv_pre = self.q = None
+        self.qr = self.qr_scale = None
+        self.idx_q_quant = self.idx_weights = self.idx_q_scale = None
+        self.wqkv_a_inplace = False
+        self.wq_b_inplace = False
+
+    @staticmethod
+    def _like(sample):
+        return torch.empty_like(sample) if sample is not None else None
+
+    def alloc(
+        self, *, qkv_a, kv_pre, qr, qr_scale, idx, q_width, device,
+        wqkv_a_inplace, wq_b_inplace,
+    ):  # fmt: skip
+        # Whole merged wqkv_a output (inplace path -> kv_pre is a stable view).
+        self.qkv_a = self._like(qkv_a)
+        # Fallback path only: contiguous kv_pre buffer ([MAX, head_dim]).
+        self.kv_pre = torch.empty(
+            self.MAX, kv_pre.shape[-1], dtype=kv_pre.dtype, device=device
+        )
+        self.q = torch.empty(self.MAX, q_width, dtype=dtypes.bf16, device=device)
+        self.qr = self._like(qr)
+        self.qr_scale = self._like(qr_scale)
+        self.idx_q_quant = self._like(idx[0])
+        self.idx_weights = self._like(idx[1])
+        self.idx_q_scale = self._like(idx[2])
+        self.wqkv_a_inplace = wqkv_a_inplace
+        self.wq_b_inplace = wq_b_inplace
+
+    def fits(self, n: int) -> bool:
+        return n <= self.MAX
+
+    def stage(self, buf, tensor):
+        """Copy `tensor` (n tokens on dim 0) into `buf[:n]`, return the fixed slice.
+        None-safe: returns `tensor` unchanged if either is None."""
+        if buf is None or tensor is None:
+            return tensor
+        n = tensor.shape[0]
+        buf[:n].copy_(tensor)
+        return buf[:n]
+
+    def stage_inplace(self, buf, inplace, n, produce_out, produce_plain):
+        """Single-tensor producer writes its OWN fixed buffer (inplace out=), or
+        plain-produce then copy. Returns `buf[:n]`."""
+        if inplace:
+            produce_out(buf[:n])
+        else:
+            buf[:n].copy_(produce_plain())
+        return buf[:n]
 
 
 @mark_spliting_op(is_custom=True, gen_fake=_v4_attention_fake, mutates_args=[])
@@ -340,67 +389,37 @@ def v4_core_attention(
         and getattr(fc, "attn_metadata", None) is not None
     )
     if _attn_cg and int(x.shape[0]) <= _V4_ATTN_QPUB_MAX:
+        # num_tokens_pad (=x rows) is a KEY DIM: the attn-core graph is captured at
+        # exactly this flat row count so q's public-buffer read len == dense write
+        # len (no rectangle-pad tail). See _v4_attn_bucket_bs_q for bucket_bs/q_eff.
         bucket_bs, q_eff = _v4_attn_bucket_bs_q(fc, self)
-        # num_tokens_pad = the REAL flat token count dense pieces forwarded (x rows).
-        # It is a KEY DIMENSION (not a runtime attribute): the attn-core graph must
-        # be captured at exactly this row count so q's public buffer read length
-        # (attn-core) == write length (dense piece). At capture x.shape[0] is the
-        # ragged synthetic total_tokens; at replay it is the dense flat bucket —
-        # they coincide by construction (capture loop iterates these combos). This
-        # is what kills the zero-copy-q row-count mismatch (no rectangle-pad tail).
-        num_tokens_pad = int(x.shape[0])
-        key = (layer_name, bucket_bs, q_eff, num_tokens_pad)
-        entry = _v4_attn_core_graphs.get(key)
+        key = (layer_name, bucket_bs, q_eff, int(x.shape[0]))
         _in_hipgraph = getattr(fc, "in_hipgraph", False)
-        # zero-copy args (fixed-address public buffers / persistent buffers);
-        # only x(0) still copied (upstream input, no bakeable address).
+        # zc args are fixed-address public/persistent buffers; only x(0) is copied
         _zc = frozenset({1, 2, 3, 4, 5, 6, 7, 8})
 
-        # capture at the :3850 PIECEWISE forward (same as dense pieces)
-        if _piecewise and _in_hipgraph and entry is None:
-            # zc args captured directly; others cloned
-            in_bufs = [
-                (t if (i in _zc) else (t.clone() if t is not None else None))
-                for i, t in enumerate(_tensor_args)
-            ]
-            _warm_out = self._attn_core(*in_bufs)  # warmup before capture
-            # output buffer: alloc outside graph (stable addr), copy baked inside
-            _out_key = (layer_name, int(_warm_out.shape[0]))
-            out_buf = _v4_attn_piecewise_out.get(_out_key)
-            if out_buf is None:
-                out_buf = torch.empty_like(_warm_out)
-                _v4_attn_piecewise_out[_out_key] = out_buf
-            graph = torch.cuda.CUDAGraph()
-            global _v4_attn_graph_pool
-            if _v4_attn_graph_pool is None:
-                _v4_attn_graph_pool = torch.cuda.graph_pool_handle()
-            pool = _v4_attn_graph_pool
-            # thread_local: NCCL watchdog polls hipEventQuery on a bg thread
-            with torch.cuda.graph(
-                graph,
-                pool=pool,
-                stream=torch.cuda.current_stream(),
-                capture_error_mode="thread_local",
-            ):
-                cg_out = self._attn_core(*in_bufs)
-                out_buf.copy_(cg_out)  # output copy baked into graph
-            _v4_attn_core_graphs[key] = {
-                "graph": graph,
-                "in": in_bufs,
-                "out": out_buf,
-            }
-            return _stabilize(_run_eager())  # eager result for this forward
+        def _out_buf_fn(warm_out):
+            k = (layer_name, int(warm_out.shape[0]))
+            b = _v4_attn_piecewise_out.get(k)
+            if b is None:
+                b = torch.empty_like(warm_out)
+                _v4_attn_piecewise_out[k] = b
+            return b
 
-        # REPLAY at real decode (mode=PIECEWISE, not in_hipgraph)
-        if _piecewise and not _in_hipgraph and entry is not None:
-            # rows match num_tokens_pad exactly -> full copy; zc args skipped
-            for i, (buf, src) in enumerate(zip(entry["in"], _tensor_args)):
-                if i in _zc:
-                    continue
-                if buf is not None and src is not None:
-                    buf.copy_(src)
-            entry["graph"].replay()
-            return entry["out"]  # persistent buf, refreshed in-graph
+        return _v4_attn_runner.run(
+            key=key,
+            args=_tensor_args,
+            zc=_zc,
+            compute_fn=self._attn_core,
+            out_buf_fn=_out_buf_fn,
+            is_capture=(
+                _piecewise and _in_hipgraph and _v4_attn_runner.get(key) is None
+            ),
+            is_replay=(
+                _piecewise and not _in_hipgraph and _v4_attn_runner.get(key) is not None
+            ),
+            stabilize_fn=_stabilize,
+        )
 
     return _stabilize(_run_eager())
 
@@ -2485,13 +2504,8 @@ class DeepseekV4Attention(nn.Module):
             quant_config=qc,
             prefix=f"{p}.wqkv_a",
         )
-        # AF_PIECEWISE q public buffer: alloc ONCE (stable addr, not lazy)
-        self._v4_q_pub = torch.empty(
-            _V4_ATTN_QPUB_MAX,
-            self.n_local_heads * self.head_dim,
-            dtype=dtypes.bf16,
-            device=torch.cuda.current_device(),
-        )
+        # AF_PIECEWISE zero-copy pub buffers (built post-load in the hook; None off).
+        self._zerocopy_buffers: _V4AttnZeroCopyBuffers | None = None
         # Fuse q_norm + per_1x128 FP8 quant: kernel emits (qr_fp8, qr_scale)
         # in one launch, both wq_b consumers (outer ColumnParallel + Indexer
         # ReplicatedLinear) skip their own input quant.
@@ -2676,52 +2690,50 @@ class DeepseekV4Attention(nn.Module):
         self.wo_a.quant_type = QuantType.No
         self.wo_a.need_normalize_e4m3fn_to_e4m3fnuz = False
 
-        # AF_PIECEWISE: alloc fixed-address public buffers post-load (pre-capture).
-        # Shapes learned from a dummy forward (dtype/scale-layout vary by quant cfg),
-        # not hardcoded. _attn_pre writes buf[:n]; attn-core graph reads same addr.
+        # AF_PIECEWISE: build fixed-address zero-copy buffers post-load (pre-capture).
+        # Sample shapes from a dummy forward (dtype/scale-layout vary by quant cfg),
+        # then alloc empty_like's them. _attn_pre stages buf[:n]; attn-core graph
+        # reads the same address (no per-step copy).
         if self._af_piecewise:
+            # GEMMs can write INPLACE into a pub buffer (out=) only on the per_1x128
+            # preshuffle path; else _attn_pre falls back to copy_.
+            _inplace_ok = bool(envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE)
             _dev = self.wqkv_a.weight.device
             _dummy_x = torch.empty(
                 _V4_ATTN_QPUB_MAX, self.dim, dtype=dtypes.bf16, device=_dev
             )
+            _iq = _iw = _is = None
             with torch.no_grad():
                 _qkv_a = self.wqkv_a(_dummy_x)
                 _q_lora, _kv_pre = torch.split(
                     _qkv_a, [self.q_lora_rank, self.head_dim], dim=-1
                 )
                 _qr, _qr_scale = self.q_norm(_q_lora)
-            # kv_pre buffer CONTIGUOUS (not empty_like of the strided view)
-            self._v4_kv_pre_pub = torch.empty(
-                _V4_ATTN_QPUB_MAX,
-                self.head_dim,
-                dtype=_kv_pre.dtype,
-                device=_dev,
-            )
-            self._v4_qr_pub = torch.empty_like(_qr)
-            self._v4_qr_scale_pub = (
-                torch.empty_like(_qr_scale) if _qr_scale is not None else None
-            )
-            # indexer outputs: None on no-indexer / skip-topk / fp8 q_scale
-            self._v4_idx_q_quant_pub = None
-            self._v4_idx_weights_pub = None
-            self._v4_idx_q_scale_pub = None
-            if self.indexer is not None and not self.skip_topk:
-                with torch.no_grad():
+                if self.indexer is not None and not self.skip_topk:
                     _dummy_pos = torch.zeros(
                         _V4_ATTN_QPUB_MAX, dtype=torch.int64, device=_dev
                     )
                     _iq, _iw, _is = self.indexer.forward_pre(
                         _dummy_x, _qr, _dummy_pos, _qr_scale
                     )
-                self._v4_idx_q_quant_pub = (
-                    torch.empty_like(_iq) if _iq is not None else None
-                )
-                self._v4_idx_weights_pub = (
-                    torch.empty_like(_iw) if _iw is not None else None
-                )
-                self._v4_idx_q_scale_pub = (
-                    torch.empty_like(_is) if _is is not None else None
-                )
+            self._zerocopy_buffers = _V4AttnZeroCopyBuffers()
+            self._zerocopy_buffers.alloc(
+                qkv_a=_qkv_a,
+                kv_pre=_kv_pre,
+                qr=_qr,
+                qr_scale=_qr_scale,
+                idx=(_iq, _iw, _is),
+                q_width=self.n_local_heads * self.head_dim,
+                device=_dev,
+                wqkv_a_inplace=(
+                    self.wqkv_a.quant_type.value == QuantType.per_1x128.value
+                    and _inplace_ok
+                ),
+                wq_b_inplace=(
+                    self.wq_b.quant_type.value == QuantType.per_1x128.value
+                    and _inplace_ok
+                ),
+            )
 
     def maybe_compressors_async(
         self, x, plan, state_slot_in, state_slot_out, block_tables
@@ -2851,52 +2863,58 @@ class DeepseekV4Attention(nn.Module):
         if _V4_FORCE_UE8M0_QUANT:
             x = x.clone()
             act_quant_inplace(x, 128, "ue8m0")
-        qkv_a = self.wqkv_a(x)
-        q_lora, kv_pre = torch.split(qkv_a, [self.q_lora_rank, self.head_dim], dim=-1)
-        # AF_PIECEWISE zero-copy: kv_pre (strided view) -> contiguous public buffer
-        if self._af_piecewise and kv_pre.shape[0] <= _V4_ATTN_QPUB_MAX:
-            kv_pre = _v4_write_pub(self._v4_kv_pre_pub, kv_pre, kv_pre.shape[0])
+
+        # AF_PIECEWISE zero-copy: stage each input into its fixed-address buffer so
+        # the attn-core cudagraph reads a constant address (no per-step copy). `bufs`
+        # is None (and the whole path skipped) when AF_PIECEWISE is off.
+        bufs = self._zerocopy_buffers
+        use_zerocopy = bufs is not None and bufs.fits(x.shape[0])
+        n = x.shape[0]
+
+        # kv_pre: fix the WHOLE wqkv_a output inplace so kv_pre = split[1] is a
+        # stable view (no kv_pre copy); else plain GEMM + stage kv_pre by copy.
+        if use_zerocopy and bufs.wqkv_a_inplace:
+            qkv_a = self.wqkv_a(x, out=bufs.qkv_a[:n])
+            q_lora, kv_pre = torch.split(
+                qkv_a, [self.q_lora_rank, self.head_dim], dim=-1
+            )
+        else:
+            qkv_a = self.wqkv_a(x)
+            q_lora, kv_pre = torch.split(
+                qkv_a, [self.q_lora_rank, self.head_dim], dim=-1
+            )
+            if use_zerocopy:
+                kv_pre = bufs.stage(bufs.kv_pre, kv_pre)
         assert (
             not _V4_FORCE_UE8M0_QUANT
         ), "_V4_FORCE_UE8M0_QUANT incompatible with fused q_norm quant (qr is already FP8)"
+
         qr, qr_scale = self.q_norm(q_lora)
-        # AF_PIECEWISE zero-copy: qr/qr_scale -> public buffers BEFORE consumers
-        if self._af_piecewise and qr.shape[0] <= _V4_ATTN_QPUB_MAX:
-            n = qr.shape[0]
-            qr = _v4_write_pub(self._v4_qr_pub, qr, n)
-            if qr_scale is not None and self._v4_qr_scale_pub is not None:
-                qr_scale = _v4_write_pub(self._v4_qr_scale_pub, qr_scale, n)
-        q = self.wq_b(qr, x_scale=qr_scale)
-        # AF_PIECEWISE zero-copy: q -> public buffer (decode shapes only)
-        if self._af_piecewise and q.shape[0] <= _V4_ATTN_QPUB_MAX:
-            n = q.shape[0]
-            self._v4_q_pub[:n].copy_(q)
-            q = self._v4_q_pub[:n]
+        if use_zerocopy:
+            # qr/qr_scale staged BEFORE their consumers (wq_b / indexer / the op).
+            qr = bufs.stage(bufs.qr, qr)
+            qr_scale = bufs.stage(bufs.qr_scale, qr_scale)
+            # q: wq_b writes its buffer inplace (out=) or plain GEMM + copy.
+            q = bufs.stage_inplace(
+                bufs.q,
+                bufs.wq_b_inplace,
+                n,
+                lambda o: self.wq_b(qr, x_scale=qr_scale, out=o),
+                lambda: self.wq_b(qr, x_scale=qr_scale),
+            )
+        else:
+            q = self.wq_b(qr, x_scale=qr_scale)
+
         # Indexer Q/weights projection (no paged access) -> graphed piece.
         idx_q_quant = idx_weights = idx_q_scale = None
         if run_indexer_proj and self.indexer is not None and not self.skip_topk:
             idx_q_quant, idx_weights, idx_q_scale = self.indexer.forward_pre(
                 x, qr, positions, qr_scale
             )
-            # AF_PIECEWISE zero-copy: indexer outputs -> public buffers
-            if (
-                self._af_piecewise
-                and idx_q_quant is not None
-                and idx_q_quant.shape[0] <= _V4_ATTN_QPUB_MAX
-            ):
-                n = idx_q_quant.shape[0]
-                if self._v4_idx_q_quant_pub is not None:
-                    idx_q_quant = _v4_write_pub(
-                        self._v4_idx_q_quant_pub, idx_q_quant, n
-                    )
-                if idx_weights is not None and self._v4_idx_weights_pub is not None:
-                    idx_weights = _v4_write_pub(
-                        self._v4_idx_weights_pub, idx_weights, n
-                    )
-                if idx_q_scale is not None and self._v4_idx_q_scale_pub is not None:
-                    idx_q_scale = _v4_write_pub(
-                        self._v4_idx_q_scale_pub, idx_q_scale, n
-                    )
+            if use_zerocopy:
+                idx_q_quant = bufs.stage(bufs.idx_q_quant, idx_q_quant)
+                idx_weights = bufs.stage(bufs.idx_weights, idx_weights)
+                idx_q_scale = bufs.stage(bufs.idx_q_scale, idx_q_scale)
         return q, kv_pre, qr, qr_scale, x, idx_q_quant, idx_weights, idx_q_scale
 
     @mark_trace
