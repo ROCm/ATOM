@@ -279,7 +279,7 @@ jobs:
         id: login_oot
         # Fresh token before this push: the OOT build above adds even more time
         # since the initial login, so the auth token is stale by push time.
-        if: ${{ steps.gates.outputs.oot == 'true' && steps.build_oot.outcome == 'success' }}
+        if: ${{ steps.build_oot.outcome == 'success' }}
         continue-on-error: true
         uses: ./.github/actions/docker-auth
         with:
@@ -287,8 +287,7 @@ jobs:
           password: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Push OOT Docker image
-        id: push_oot
-        if: ${{ steps.gates.outputs.oot == 'true' && steps.build_oot.outcome == 'success' && steps.login_oot.outcome == 'success' }}
+        if: ${{ steps.login_oot.outcome == 'success' }}
         continue-on-error: true
         run: |
           set -euo pipefail
