@@ -45,6 +45,7 @@ from atom.kv_transfer.offload._offload_common import (
     OffloadSchedulerMixin,
     OffloadWorkerMixin,
     build_offload_engine,
+    pp_aware_rank_and_world,
     validated_kv_role,
 )
 from atom.kv_transfer.offload.dense.kv_byte_codec import DenseKVByteCodec
@@ -87,7 +88,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         from aiter.dist.parallel_state import get_tp_group
 
         tp = get_tp_group()
-        rank, world = tp.rank_in_group, tp.world_size
+        rank, world = pp_aware_rank_and_world(self._config, tp)
         self._rank = rank
 
         # num_blocks is the physical block count (num_physical_kvcache_blocks),

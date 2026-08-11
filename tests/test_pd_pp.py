@@ -5,6 +5,7 @@ import os
 import sys
 import threading
 import types
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -394,3 +395,127 @@ def test_write_done_blocks_fenced_on_completion():
     conn._pending_recv_blocks["r1"] = [10, 20, 30]
     conn._record_write_done("r1", 0, 0, 0)
     assert conn._blocks_pending_fence == [10, 20, 30]
+
+
+# ---------------------------------------------------------------------------
+# PP head: request-less batches still carry KV connector metadata
+# ---------------------------------------------------------------------------
+
+
+class _FakeMeta:
+    def __init__(self, requests):
+        self.requests = list(requests)
+
+
+def _fake_batch(req_ids, meta):
+    return SimpleNamespace(req_ids=list(req_ids), connector_meta_output=meta)
+
+
+def _pp_engine_core_cls():
+    # The aiter stubs above shadow the real package; fill in the submodules the
+    # engine-core import chain reaches for.
+    for name, attrs in (
+        ("aiter.dist.shm_broadcast", ("MessageQueue",)),
+        ("aiter.ops.communication", ("set_custom_all_reduce",)),
+    ):
+        if name not in sys.modules:
+            mod = types.ModuleType(name)
+            for attr in attrs:
+                setattr(mod, attr, MagicMock())
+            sys.modules[name] = mod
+    from atom.model_engine.pp_engine_core import PPEngineCoreProc
+
+    return PPEngineCoreProc
+
+
+def _fake_head(batch):
+    PPEngineCoreProc = _pp_engine_core_cls()
+
+    head = SimpleNamespace(
+        _in_flight=deque(),
+        _defer_prefix_hash=False,
+        pp_size=4,
+        kv_transfer_enabled=True,
+        output_queue=MagicMock(),
+        runner_mgr=MagicMock(),
+        pp_transport=MagicMock(),
+        scheduler=MagicMock(),
+        _poll_kv_transfer_progress=MagicMock(),
+    )
+    head.scheduler.schedule.side_effect = [(batch, {}), None]
+    head.scheduler.take_rejected.return_value = None
+    head._dispatch_connector_only_batch = (
+        PPEngineCoreProc._dispatch_connector_only_batch.__get__(head)
+    )
+    PPEngineCoreProc._pp_head_step(head)
+    return head
+
+
+def _dispatched_metas(head):
+    return [
+        c.args[1]
+        for c in head.runner_mgr.call_func.call_args_list
+        if c.args and c.args[0] == "process_kvconnector_output"
+    ]
+
+
+def test_pp_head_dispatches_meta_of_request_less_batch():
+    """All sequences parked on offload loads -> no batch, but the metadata that
+    starts those loads must still reach the workers, or the head deadlocks."""
+    meta = _FakeMeta(["load-r1"])
+    head = _fake_head(_fake_batch([], meta))
+
+    assert _dispatched_metas(head) == [meta]
+    head.pp_transport.send_metadata.assert_called_once()
+    assert head.pp_transport.send_metadata.call_args.args[0].req_ids == []
+    head.runner_mgr.call_func.assert_any_call("flush_pp_send", wait_out=True)
+
+
+def test_pp_head_skips_empty_meta_of_request_less_batch():
+    """An idle head must not broadcast metadata that carries no work."""
+    for meta in (None, _FakeMeta([])):
+        head = _fake_head(_fake_batch([], meta))
+        assert _dispatched_metas(head) == []
+        head.pp_transport.send_metadata.assert_not_called()
+
+
+def test_pp_head_forwards_normal_batch_with_meta():
+    """A batch with requests keeps the original path: dispatch, send, forward."""
+    meta = _FakeMeta(["load-r1"])
+    batch = _fake_batch([7], meta)
+    batch.produces_output = lambda: False
+    head = _fake_head(batch)
+
+    assert _dispatched_metas(head) == [meta]
+    head.pp_transport.send_metadata.assert_called_once_with(batch)
+    head.runner_mgr.call_func.assert_any_call("forward", batch, wait_out=True)
+
+
+def test_pp_downstream_skips_forward_for_request_less_batch():
+    """Downstream must apply the metadata but run no forward for it."""
+    PPEngineCoreProc = _pp_engine_core_cls()
+
+    meta = _FakeMeta(["load-r1"])
+    stage = SimpleNamespace(
+        kv_transfer_enabled=True,
+        is_last=True,
+        runner_mgr=MagicMock(),
+        pp_transport=MagicMock(),
+        scheduler=MagicMock(),
+        utility_handler=MagicMock(),
+        utility_queue=MagicMock(),
+        _is_idle_rl_weights_offloaded=lambda: False,
+        _poll_and_send_kv_status=MagicMock(),
+    )
+    # One pass over the loop body, then shut down.
+    stage.pull_and_process_input_queue = MagicMock(side_effect=[False, True])
+    stage.pp_transport.recv_metadata.return_value = _fake_batch([], meta)
+
+    PPEngineCoreProc._downstream_busy_loop(stage)
+
+    stage.runner_mgr.call_func.assert_any_call("process_kvconnector_output", meta)
+    forwards = [
+        c for c in stage.runner_mgr.call_func.call_args_list if c.args[0] == "forward"
+    ]
+    assert forwards == []
+    stage.pp_transport.send_tokens.assert_not_called()

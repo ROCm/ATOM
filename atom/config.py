@@ -804,6 +804,9 @@ class ParallelConfig:
     for this EngineCore, separate from the request endpoint. Keeping the two
     apart leaves the request socket with a single writer thread, so admitting a
     request needs no synchronization. Populated by launch_engine_core."""
+    pp_kv_status_addr: str = ""
+    """ZMQ endpoint where the head receives KV offload status from downstream
+    PP stages. All downstream stages PUSH; the head PULLs."""
     world_size: int = field(init=False)
     """Vestigial: never assigned or read; engine_core derives worker count directly."""
     data_parallel_master_port: int = 29500

@@ -861,6 +861,8 @@ async def setup_streaming_request(
             multimodal_data=multimodal_data,
             data_parallel_rank=data_parallel_rank,
         )
+        if data_parallel_rank is not None:
+            seq.data_parallel_rank = data_parallel_rank
         _seq_id_to_request_id[seq.id] = request_id
         return seq
 
@@ -1079,6 +1081,8 @@ async def setup_streaming_request_fanout(
             data_parallel_rank=data_parallel_rank,
         )
         for seq in seqs:
+            if data_parallel_rank is not None:
+                seq.data_parallel_rank = data_parallel_rank
             _seq_id_to_request_id[seq.id] = request_id
         return seqs
 

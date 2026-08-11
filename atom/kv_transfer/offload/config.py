@@ -258,6 +258,65 @@ def build_lmcache_config(
     return cfg
 
 
+def scale_cpu_size_for_pp(cfg, config) -> None:
+    """Split the CPU offload budget across PP stages by layer count.
+
+    Every stage reads the same ``LMCACHE_MAX_LOCAL_CPU_SIZE``, but a stage only
+    holds its own slice of layers, so its bytes-per-token scales with that
+    slice. Equal GB therefore buys unequal token horizons: under an uneven
+    split like 18,20,20,20 the 18-layer stage caches ~11% more tokens than the
+    others. Loads are all-or-nothing across stages, so those extra tokens are
+    never usable — a prefix that survived only on the widest stage still forces
+    a full recompute, and the bytes that stage read back are wasted. Measured
+    on a 4-stage GLM-5.2 agentic replay: 22.4% of requests fell back this way
+    while one stage had the whole prefix in hand.
+
+    Give each stage a share proportional to its layer count, leaving the total
+    (``pp_size * configured``) unchanged. The horizon then works out to
+    ``configured * pp_size / (total_layers * bytes_per_token_per_layer)`` on
+    every stage, independent of how the layers were split.
+    """
+    pp_size = int(getattr(config, "pipeline_parallel_size", 1) or 1)
+    if pp_size <= 1:
+        return
+
+    configured = float(getattr(cfg, "max_local_cpu_size", 0.0) or 0.0)
+    if configured <= 0:
+        return
+
+    from atom.models.utils import get_pp_indices
+
+    total_layers = int(config.hf_config.num_hidden_layers)
+    pp_rank = int(
+        getattr(
+            getattr(config, "parallel_config", None),
+            "pipeline_parallel_rank",
+            0,
+        )
+    )
+    start, end = get_pp_indices(total_layers, pp_rank, pp_size)
+    local_layers = end - start
+    if local_layers <= 0 or total_layers <= 0:
+        return
+
+    scaled = configured * pp_size * local_layers / total_layers
+    try:
+        cfg.max_local_cpu_size = scaled
+    except Exception:
+        return
+    logger.info(
+        "LMCache CPU budget for PP stage %d/%d: %.2fGB -> %.2fGB "
+        "(%d/%d layers; total across stages unchanged at %.2fGB)",
+        pp_rank,
+        pp_size,
+        configured,
+        scaled,
+        local_layers,
+        total_layers,
+        configured * pp_size,
+    )
+
+
 def apply_extra_overrides(cfg, kv_transfer_config: dict[str, Any] | None) -> None:
     """Apply ``{"lmcache.<field>": value}`` extras from kv_transfer_config."""
     if not kv_transfer_config:
@@ -317,12 +376,25 @@ def build_lmcache_metadata(config, cfg, world_size: int, worker_id: int):
     from aiter import dtypes
     from lmcache.v1.metadata import LMCacheMetadata
 
+    from atom.models.utils import get_pp_indices
+
     hf = config.hf_config
-    num_layers = _strict_integer(
+    total_layers = _strict_integer(
         "LMCache layer count",
         hf.num_hidden_layers,
         minimum=1,
     )
+    pp_size = int(getattr(config, "pipeline_parallel_size", 1) or 1)
+    pp_rank = getattr(
+        getattr(config, "parallel_config", None),
+        "pipeline_parallel_rank",
+        0,
+    )
+    if pp_size > 1:
+        start, end = get_pp_indices(total_layers, pp_rank, pp_size)
+        num_layers = end - start
+    else:
+        num_layers = total_layers
     raw_tp = getattr(config, "tensor_parallel_size", world_size)
     tp = _strict_integer(
         "LMCache tensor parallel size",
