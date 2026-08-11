@@ -3648,16 +3648,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         is full + 1 CSA committed entry — exercises the production decode
         codepath: state-cache reads, sparse_attn gather, indexer fp8 logits).
 
-        AF_PIECEWISE zero-copy-q: when `num_tokens_pad` is given and is
-        LESS than the rectangle `bs*max_q_len`, synthesize a RAGGED batch whose
-        `bs` seqs' lengths sum to exactly `num_tokens_pad` (base=nt//bs, first
-        rem seqs get base+1) — mirroring real ragged decode (prepare_decode's
-        ragged branch). This makes the attn-core graph's flat token dimension
-        equal `num_tokens_pad` (what the dense pieces actually write), so the
-        q public buffer's read/write row counts MATCH (no rectangle-pad tail).
-        `max_seqlen_q` stays = `max_q_len` (bakes swa `write_per_batch`); only
-        cu_seqlens/positions/token-count go ragged. Default (num_tokens_pad None
-        or == rectangle) keeps the byte-identical uniform rectangle path.
+        AF_PIECEWISE: if num_tokens_pad < bs*max_q_len, build a RAGGED batch of bs
+        seqs summing to num_tokens_pad, so the graph's flat token dim == what the
+        dense pieces write (zero-copy row counts match). max_seqlen_q stays max_q_len
+        (bakes swa write_per_batch). Default (None / == rectangle) = uniform path.
 
         Per-fwd metadata is populated through the SAME helpers prepare_decode
         uses (`_attach_v4_indexer_meta`, `_attach_v4_per_fwd_meta`,

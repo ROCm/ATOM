@@ -294,14 +294,14 @@ def _v4_attn_bucket_bs_q(fc, self) -> tuple[int, int]:
     ceil-to-captured-graph_bs value (forward_mode.effective_bs at replay; capture
     Context has no forward_mode so batch_size==graph_bs==bucket). See the
     v4_core_attention key comment for the full rationale."""
-    _amd = fc.attn_metadata
-    _ctx = getattr(fc, "context", None)
-    q_eff = int(getattr(_amd, "max_seqlen_q", 1) or 1)
-    _fm = getattr(_ctx, "forward_mode", None)
-    if _fm is not None and getattr(_fm, "effective_bs", 0):
-        bucket_bs = int(_fm.effective_bs)
+    attn_metadata = fc.attn_metadata
+    context = getattr(fc, "context", None)
+    q_eff = int(getattr(attn_metadata, "max_seqlen_q", 1) or 1)
+    forward_mode = getattr(context, "forward_mode", None)
+    if forward_mode is not None and getattr(forward_mode, "effective_bs", 0):
+        bucket_bs = int(forward_mode.effective_bs)
     else:
-        bucket_bs = int(getattr(_ctx, "batch_size", 0) or 0)
+        bucket_bs = int(getattr(context, "batch_size", 0) or 0)
     return bucket_bs, q_eff
 
 
@@ -2476,7 +2476,7 @@ class DeepseekV4Attention(nn.Module):
             prefix=f"{p}.wqkv_a",
         )
         # AF_PIECEWISE zero-copy pub buffers (built post-load in the hook; None off).
-        self._zerocopy_buffers: _V4AttnZeroCopyBuffers | None = None
+        self.zerocopy_buffers: _V4AttnZeroCopyBuffers | None = None
         # Fuse q_norm + per_1x128 FP8 quant: kernel emits (qr_fp8, qr_scale)
         # in one launch, both wq_b consumers (outer ColumnParallel + Indexer
         # ReplicatedLinear) skip their own input quant.
@@ -2598,9 +2598,11 @@ class DeepseekV4Attention(nn.Module):
         atom_config = get_current_atom_config()
         atom_config.compilation_config.static_forward_context[self.layer_name] = self
         # AF_PIECEWISE gate resolved once -> plain bool (traced paths read this)
-        _cg_mode = atom_config.compilation_config.cudagraph_mode
-        self._af_piecewise = _cg_mode is not None and _cg_mode.is_af_piecewise()
-        if self._af_piecewise:
+        cudagraph_mode = atom_config.compilation_config.cudagraph_mode
+        self.af_piecewise = (
+            cudagraph_mode is not None and cudagraph_mode.is_af_piecewise()
+        )
+        if self.af_piecewise:
             # single-stream: captured graph can't hold the compressor fork/join
             self._use_async_compress = False
         # Frozen bool: when KV cache dtype is fp8, route writes/attention to the
@@ -2665,44 +2667,48 @@ class DeepseekV4Attention(nn.Module):
         # Sample shapes from a dummy forward (dtype/scale-layout vary by quant cfg),
         # then alloc empty_like's them. _attn_pre stages buf[:n]; attn-core graph
         # reads the same address (no per-step copy).
-        if self._af_piecewise:
+        if self.af_piecewise:
             # GEMMs can write INPLACE into a pub buffer (out=) only on the per_1x128
             # preshuffle path; else _attn_pre falls back to copy_.
-            _inplace_ok = bool(envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE)
-            _dev = self.wqkv_a.weight.device
-            _dummy_x = torch.empty(
-                _V4_ATTN_QPUB_MAX, self.dim, dtype=dtypes.bf16, device=_dev
+            inplace_ok = bool(envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE)
+            device = self.wqkv_a.weight.device
+            dummy_x = torch.empty(
+                _V4_ATTN_QPUB_MAX, self.dim, dtype=dtypes.bf16, device=device
             )
-            _iq = _iw = _is = None
+            # Sample tensors from a dummy forward — used only to learn buffer
+            # shapes/dtypes (vary by quant cfg), then discarded.
+            sample_idx_q_quant = sample_idx_weights = sample_idx_q_scale = None
             with torch.no_grad():
-                _qkv_a = self.wqkv_a(_dummy_x)
-                _q_lora, _kv_pre = torch.split(
-                    _qkv_a, [self.q_lora_rank, self.head_dim], dim=-1
+                sample_qkv_a = self.wqkv_a(dummy_x)
+                sample_q_lora, sample_kv_pre = torch.split(
+                    sample_qkv_a, [self.q_lora_rank, self.head_dim], dim=-1
                 )
-                _qr, _qr_scale = self.q_norm(_q_lora)
+                sample_qr, sample_qr_scale = self.q_norm(sample_q_lora)
                 if self.indexer is not None and not self.skip_topk:
-                    _dummy_pos = torch.zeros(
-                        _V4_ATTN_QPUB_MAX, dtype=torch.int64, device=_dev
+                    dummy_pos = torch.zeros(
+                        _V4_ATTN_QPUB_MAX, dtype=torch.int64, device=device
                     )
-                    _iq, _iw, _is = self.indexer.forward_pre(
-                        _dummy_x, _qr, _dummy_pos, _qr_scale
+                    sample_idx_q_quant, sample_idx_weights, sample_idx_q_scale = (
+                        self.indexer.forward_pre(
+                            dummy_x, sample_qr, dummy_pos, sample_qr_scale
+                        )
                     )
-            self._zerocopy_buffers = _V4AttnZeroCopyBuffers()
-            self._zerocopy_buffers.alloc(
-                qkv_a=_qkv_a,
-                kv_pre=_kv_pre,
-                qr=_qr,
-                qr_scale=_qr_scale,
-                idx=(_iq, _iw, _is),
+            self.zerocopy_buffers = _V4AttnZeroCopyBuffers()
+            self.zerocopy_buffers.alloc(
+                qkv_a=sample_qkv_a,
+                kv_pre=sample_kv_pre,
+                qr=sample_qr,
+                qr_scale=sample_qr_scale,
+                idx=(sample_idx_q_quant, sample_idx_weights, sample_idx_q_scale),
                 q_width=self.n_local_heads * self.head_dim,
-                device=_dev,
+                device=device,
                 wqkv_a_inplace=(
                     self.wqkv_a.quant_type.value == QuantType.per_1x128.value
-                    and _inplace_ok
+                    and inplace_ok
                 ),
                 wq_b_inplace=(
                     self.wq_b.quant_type.value == QuantType.per_1x128.value
-                    and _inplace_ok
+                    and inplace_ok
                 ),
             )
 
@@ -2781,7 +2787,7 @@ class DeepseekV4Attention(nn.Module):
         #    op for torch compile.
         cg_mode = get_current_atom_config().compilation_config.cudagraph_mode
         # resolve to plain bool (Dynamo folds it; traced _attn_pre reads this)
-        self._af_piecewise = cg_mode is not None and cg_mode.is_af_piecewise()
+        self.af_piecewise = cg_mode is not None and cg_mode.is_af_piecewise()
         if cg_mode is not None and cg_mode.requires_piecewise_compilation():
             (
                 q,
@@ -2838,7 +2844,7 @@ class DeepseekV4Attention(nn.Module):
         # AF_PIECEWISE zero-copy: stage each input into its fixed-address buffer so
         # the attn-core cudagraph reads a constant address (no per-step copy). `bufs`
         # is None (and the whole path skipped) when AF_PIECEWISE is off.
-        bufs = self._zerocopy_buffers
+        bufs = self.zerocopy_buffers
         use_zerocopy = bufs is not None and bufs.fits(x.shape[0])
         n = x.shape[0]
 
@@ -2962,7 +2968,8 @@ class DeepseekV4Attention(nn.Module):
         # above, so _attn_pre must NOT re-quantise -> its guard is a no-op here
         # because we pass the already-processed x (the flag re-clones, harmless
         # on the dead path, but we rely on the assert keeping this off anyway).
-        q, kv_pre, qr, qr_scale, x, _idx_q, _idx_w, _idx_qs = self._attn_pre(
+        # run_indexer_proj=False -> the last three (indexer outputs) are None here.
+        q, kv_pre, qr, qr_scale, x, _, _, _ = self._attn_pre(
             x, positions, run_indexer_proj=False
         )
         # Paged attention core (compressor already launched above).

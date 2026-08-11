@@ -348,9 +348,9 @@ class ScheduledBatch:
         if scheduled_spec_decode_tokens is None:
             scheduled_spec_decode_tokens = {}
         # Defaults so these attrs always exist (set for real in the num_spec_step
-        # branch below). spec_decode_req_ids[r] = seq id of row r in the compacted
-        # scheduled_spec_decode_tokens array.
-        self.scheduled_spec_decode_tokens = np.empty((0, 0), dtype=np.int32)
+        # branch below; only read there). spec_decode_req_ids[r] = seq id of row r
+        # in the compacted scheduled_spec_decode_tokens array.
+        self.scheduled_spec_decode_tokens: np.ndarray | None = None
         self.spec_decode_req_ids: list[int] = []
         self.remote_kv_block_ids = remote_kv_block_ids or []
         self.remote_kv_seq_blocks = remote_kv_seq_blocks or {}
