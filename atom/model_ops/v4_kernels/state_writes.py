@@ -38,7 +38,8 @@ Caller contract (`swa_write`):
                         cu_seqlens_q[i]`.
 - `state_slot_per_seq`  [bs] int — `state_slot_mapping_gpu_i32`.
 - `pool`                [rows, head_dim] this layer's whole plane view,
-                        written in place.
+                        written in place. A row outside it is dropped, not
+                        wrapped — see the bound in `_swa_write_kernel`.
 - `window`              `WindowParams` for this layer's compress class; carries
                         the ring size `window_size + max_spec_steps` (e.g.
                         128 + 0 = 128 non-MTP; 128 + 1 = 129 MTP-1).
@@ -75,6 +76,7 @@ def _swa_write_kernel(
     state_slot_per_seq_ptr,  # [bs] int — state_slot_mapping_gpu_i32
     pool_ptr,  # this layer's whole unified-pool view, [rows, head_dim]
     pool_row_stride,  # = head_dim
+    pool_rows,  # rows in that view; nothing may be written past it
     head_dim,
     ring_start,
     WRITE_PER_BATCH: tl.constexpr,
@@ -121,6 +123,14 @@ def _swa_write_kernel(
     dst_row = window_row(
         slot, pos, ring_start, RING_SLOTS, SLOT_ROWS, RING_STRIDE, RUN_ROWS
     )
+
+    # `cu_seqlens_q` and `write_n` bound the reads; nothing bounded the write.
+    # `slot` and `pos` are the row's only inputs and both come from per-forward
+    # staging, so a stale one could address anywhere in a 150 GB pool and only
+    # surface as a fault in an unrelated kernel a thousand dispatches later.
+    # The fused twin in aiter took this same guard when the ring came back.
+    if dst_row < 0 or dst_row >= pool_rows:
+        return
 
     d_offsets = tl.arange(0, BLOCK_D)
     d_mask = d_offsets < head_dim
@@ -243,6 +253,7 @@ def swa_write(
         state_slot_per_seq,
         pool,
         pool.stride(0),
+        pool.shape[0],
         head_dim,
         window.ring_start,
         WRITE_PER_BATCH=write_per_batch,
@@ -299,13 +310,17 @@ def _swa_scatter_rows_kernel(
     batch_id_per_token_ptr,  # [T] int — -1 on CG-pad tokens
     pool_ptr,  # [rows, head_dim] this layer's plane view
     pool_row_stride,
+    pool_rows,  # rows in that view; nothing may be written past it
     head_dim,
     BLOCK_D: tl.constexpr,
 ):
     t = tl.program_id(0)
     dst_row = tl.load(dest_row_ptr + t)
     bid = tl.load(batch_id_per_token_ptr + t)
-    if dst_row < 0 or bid < 0:
+    # Upper bound as well as lower: `dest_rows` comes from another kernel fed
+    # by the same staging, so it is no more trustworthy than the row
+    # `swa_write` derives inline.
+    if dst_row < 0 or dst_row >= pool_rows or bid < 0:
         return
     d = tl.arange(0, BLOCK_D)
     m = d < head_dim
@@ -365,6 +380,7 @@ def swa_scatter_rows(
         batch_id_per_token,
         pool,
         pool.stride(0),
+        pool.shape[0],
         head_dim,
         BLOCK_D=triton.next_power_of_2(head_dim),
     )

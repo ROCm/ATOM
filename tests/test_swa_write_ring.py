@@ -214,3 +214,39 @@ def test_scatter_rows_lands_where_the_window_formula_says(geometry, batch, ratio
         assert torch.equal(got[int(dest[t])], kv[t]), f"token {t}"
     touched = set((got.abs().sum(-1) > 0).nonzero().flatten().tolist())
     assert touched <= {int(dest[t]) for t in live}
+
+
+def _empty_plane(geometry):
+    return torch.zeros(geometry.plane_rows, HEAD_DIM, dtype=torch.bfloat16, device=DEV)
+
+
+def test_a_slot_past_the_plane_writes_nothing(geometry, batch):
+    """A bad slot must drop its write, not land elsewhere in the pool.
+
+    Why that matters is in `_swa_write_kernel`. Not a reference comparison:
+    `swa_write_reference` indexes with torch, which raises on an out-of-range
+    row instead of skipping, so the two disagree here by construction.
+    """
+    params = geometry.window_params(DENSE_RATIO)
+    plane = _empty_plane(geometry)
+    # One past the last slot the plane numbers, so `slot * slot_rows` lands
+    # exactly one slot beyond the end — positive, which a `slot < 0` guard
+    # would wave through.
+    bad = torch.full(
+        (BS,), geometry.plane_rows // params.slot_rows, dtype=torch.int32, device=DEV
+    )
+    args = (batch["kv"], batch["positions"], batch["cu"], bad)
+    swa_write(*args, plane, params, RING_SLOTS)
+    torch.cuda.synchronize()
+    assert not plane.any(), "an out-of-plane slot still wrote into the pool"
+
+
+def test_scatter_rows_ignores_a_row_past_the_plane(geometry, batch):
+    """Same bound on the decode counterpart, which only checked `row < 0`."""
+    total = int(batch["cu"][-1])
+    plane = _empty_plane(geometry)
+    dest = torch.full((total,), geometry.plane_rows, dtype=torch.int32, device=DEV)
+    bid = torch.zeros(total, dtype=torch.int32, device=DEV)
+    swa_scatter_rows(batch["kv"], dest, bid, plane)
+    torch.cuda.synchronize()
+    assert not plane.any(), "an out-of-plane dest row still wrote into the pool"
