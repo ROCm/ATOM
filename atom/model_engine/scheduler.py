@@ -22,6 +22,7 @@ import struct
 import threading
 import time
 from collections import deque
+from collections.abc import Iterable
 
 import numpy as np
 
@@ -1698,18 +1699,38 @@ class Scheduler:
         for req_id in self._pp_inflight_req_ids(batch):
             self._pp_inflight_token_block.discard(req_id)
 
-    def register_prefill_hashes(self, batch: ScheduledBatch) -> None:
+    def _batch_seq_lookup(self, seqs: Iterable[Sequence] | None) -> dict[int, Sequence]:
+        """Resolve a batch's sequences without going through ``self.running``.
+
+        The deferred prefix-hash paths run after the batch's forward returns, by
+        which time the sequence may have left ``running`` — most commonly parked
+        in ``WAITING_FOR_REMOTE_KVS`` by
+        ``_park_ready_offload_partial_prefills`` for an LMCache load. Its blocks
+        are still allocated and their KV is computed, so the hashes must still be
+        published; looking the sequence up in ``running`` silently drops them and
+        breaks the prefix-hash chain at that point.
+
+        Callers hand over the batch's own sequence objects. ``running`` remains
+        the fallback for call sites that do not carry them.
+        """
+        if seqs is not None:
+            return {seq.id: seq for seq in seqs}
+        return {seq.id: seq for seq in self.running}
+
+    def register_prefill_hashes(
+        self, batch: ScheduledBatch, seqs: Iterable[Sequence] | None = None
+    ) -> None:
         """Hash blocks for middle chunked-prefill chunks that skip postprocess."""
         if not self.block_manager.enable_prefix_caching:
             return
         if batch.is_final_chunk is None:
             return
-        running_by_id = {seq.id: seq for seq in self.running}
+        seq_by_id = self._batch_seq_lookup(seqs)
         for i, req_id in enumerate(batch.req_ids):
-            seq = running_by_id.get(req_id)
-            if seq is None:
+            seq = seq_by_id.get(req_id)
+            if seq is None or not seq.block_table:
                 logger.warning(
-                    "register_prefill_hashes: seq %s not in running "
+                    "register_prefill_hashes: seq %s unavailable "
                     "(possible preemption leak under PP)",
                     req_id,
                 )
@@ -1747,11 +1768,14 @@ class Scheduler:
         if batch is not None and self.advance_on_schedule:
             # Progress already advanced at schedule time; publish prefix-cache
             # hashes at the chunk's pre-advance offset and record non-final chunks.
-            running_by_id = {seq.id: seq for seq in self.running}
+            # Resolved from the batch's own sequences, not `running`: a chunk
+            # that parked the sequence for an offload load still has to publish
+            # its hashes (see _batch_seq_lookup).
+            seq_by_id = self._batch_seq_lookup(seqs)
             final = batch.is_final_chunk
             for i, req_id in enumerate(batch.req_ids):
-                seq = running_by_id.get(req_id)
-                if seq is None or final is None:
+                seq = seq_by_id.get(req_id)
+                if seq is None or final is None or not seq.block_table:
                     continue
                 is_final = final[i]
                 chunk = int(batch.num_scheduled_tokens[i])

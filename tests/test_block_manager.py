@@ -157,6 +157,99 @@ class TestPublishLoadedPrefix:
         bm.allocate(probe, num_cached_blocks)
         assert probe.num_cached_tokens == 8
 
+    def test_publishes_when_predecessor_unhashed(self, seq_factory):
+        """A gap before the loaded range must be backfilled, not bail out.
+
+        A sequence parked for an offload load can leave its boundary chunk's
+        blocks unhashed. The loaded prefix still has to reach the index, and it
+        has to reach it under the same chain a fresh request would compute.
+        """
+        cfg = MockConfig(num_kvcache_blocks=16, enable_prefix_caching=True)
+        bm = BlockManager(cfg)
+        tokens = list(range(24))
+
+        reference = seq_factory(tokens)
+        bm.allocate(reference)
+        bm.hash_blocks(reference, len(tokens))
+        expected = [bm.blocks[b].hash for b in reference.block_table[:4]]
+        bm.deallocate(reference)
+        bm.hash_to_block_id.clear()
+
+        loaded = seq_factory(tokens)
+        bm.allocate(loaded)
+        # Blocks 0-1 arrived through a chunk whose hashes were dropped.
+        assert bm.publish_loaded_prefix(loaded, start_token=8, end_token=16) == 8
+
+        got = [bm.blocks[b].hash for b in loaded.block_table[:4]]
+        assert got == expected
+        assert bm.total_backfilled_blocks == 2
+        for h in expected[:4]:
+            assert h in bm.hash_to_block_id
+
+    def test_backfill_keeps_existing_canonical_mapping(self, seq_factory):
+        cfg = MockConfig(num_kvcache_blocks=16, enable_prefix_caching=True)
+        bm = BlockManager(cfg)
+        tokens = list(range(24))
+
+        owner = seq_factory(tokens)
+        bm.allocate(owner)
+        bm.hash_blocks(owner, len(tokens))
+        canonical = dict(bm.hash_to_block_id)
+
+        loaded = seq_factory(tokens)
+        num_cached_blocks = bm.can_allocate(loaded)
+        bm.allocate(loaded, num_cached_blocks)
+        for block_id in loaded.block_table:
+            bm.blocks[block_id].hash = -1
+
+        bm.publish_loaded_prefix(loaded, start_token=8, end_token=16)
+        for h, block_id in canonical.items():
+            assert bm.hash_to_block_id[h] == block_id
+
+
+class TestHashChainBackfill:
+    def test_hash_blocks_rechains_after_gap(self, block_manager_prefix, seq_factory):
+        """A dropped hash must not re-root the chain at -1.
+
+        `compute_hash(tokens, -1)` is indistinguishable from a genuine
+        prompt-initial block, so re-rooting both loses the prefix and mints a
+        false root a later request could match at position 0.
+        """
+        bm = block_manager_prefix
+        tokens = list(range(16))
+
+        reference = seq_factory(tokens)
+        bm.allocate(reference)
+        bm.hash_blocks(reference, len(tokens))
+        expected = [bm.blocks[b].hash for b in reference.block_table]
+        bm.deallocate(reference)
+        bm.hash_to_block_id.clear()
+
+        seq = seq_factory(tokens)
+        bm.allocate(seq)
+        # First two blocks computed, but their publish never happened.
+        seq.num_cached_tokens = 8
+        bm.hash_blocks(seq, 8)
+
+        got = [bm.blocks[b].hash for b in seq.block_table]
+        assert got == expected
+        assert got[0] != -1
+        assert bm.total_backfilled_blocks == 2
+
+    def test_no_backfill_when_chain_intact(self, block_manager_prefix, seq_factory):
+        bm = block_manager_prefix
+        seq = seq_factory(list(range(16)))
+        bm.allocate(seq)
+        bm.hash_blocks(seq, 16)
+        assert bm.total_backfilled_blocks == 0
+
+    def test_hash_blocks_clamps_to_block_table(self, block_manager_prefix, seq_factory):
+        bm = block_manager_prefix
+        seq = seq_factory(list(range(16)))
+        bm.allocate(seq)
+        seq.block_table.pop()
+        bm.hash_blocks(seq, 16)  # must not IndexError
+
 
 # ── can_append / may_append ────────────────────────────────────────────────
 

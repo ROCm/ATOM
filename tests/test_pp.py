@@ -6,6 +6,7 @@ import os
 import sys
 import tempfile
 import types
+from collections import deque
 from dataclasses import dataclass
 from unittest.mock import MagicMock
 
@@ -49,7 +50,7 @@ from atom.model_engine.scheduler import (
     ScheduledBatchOutput,
     Scheduler,
 )
-from atom.model_engine.sequence import Sequence, SequenceType
+from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 from atom.models.utils import (
     IntermediateTensors,
     PPMissingLayer,
@@ -630,8 +631,8 @@ def _drive_pp_prefill(sched, prompt_len, block_size=16):
         if not batch.req_ids:
             break
         if batch.produces_output():
-            for b in pending:
-                sched.register_prefill_hashes(b)
+            for b, b_seqs in pending:
+                sched.register_prefill_hashes(b, b_seqs.values())
             pending.clear()
             n = len(batch.req_ids)
             fwd = ScheduledBatchOutput(
@@ -644,7 +645,7 @@ def _drive_pp_prefill(sched, prompt_len, block_size=16):
             )
             sched.postprocess(list(seqs.values()), fwd, batch=batch)
         else:
-            pending.append(batch)
+            pending.append((batch, seqs))
         if (
             seq.num_cached_tokens >= seq.num_prompt_tokens
             and not seq.is_partial_prefill
@@ -665,5 +666,112 @@ def test_pp_chunked_prefill_registers_prefix_hashes():
     prompt = 512  # 32 blocks, 8 chunks of 64 -> 7 middle chunks
     _drive_pp_prefill(sched, prompt, block_size=bs)
     # A fresh same-prefix request must hit the whole prompt minus the last block.
+    hit = sched.block_manager.can_allocate(_make_seq(prompt, block_size=bs))
+    assert hit == prompt // bs - 1
+
+
+def _park(sched, seq):
+    """Mimic Scheduler._park_ready_offload_partial_prefills for one sequence."""
+    sched.running = deque(s for s in sched.running if s.id != seq.id)
+    if seq.is_partial_prefill:
+        seq.is_partial_prefill = False
+        sched._partial_prefill_count -= 1
+    seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+    sched.waiting.appendleft(seq)
+
+
+def _pp_prefill_until_parked(sched, prompt_len, block_size):
+    """Schedule chunks until one is deferred, then park the seq mid-prefill.
+
+    Reproduces the LMCache unaligned-handoff shape: the sequence prefills up to
+    a chunk boundary and leaves `running` to wait for the load while the chunk
+    that filled those blocks is still awaiting its deferred hash publish.
+    """
+    seq = _make_seq(prompt_len, block_size=block_size)
+    sched.add(seq)
+    for _ in range(400):
+        res = sched.schedule()
+        assert res is not None
+        batch, seqs = res
+        if not batch.produces_output():
+            _park(sched, seq)
+            return seq, batch, seqs
+    raise AssertionError("no deferred chunk produced")
+
+
+def test_parked_seq_still_registers_prefix_hashes():
+    bs = 16
+    cfg = _pp_config(
+        enable_prefix_caching=True,
+        max_num_batched_tokens=64,
+        kv_cache_block_size=bs,
+        long_prefill_token_threshold=0,
+    )
+    sched = Scheduler(cfg)
+    seq, batch, seqs = _pp_prefill_until_parked(sched, 512, bs)
+
+    sched.register_prefill_hashes(batch, seqs.values())
+
+    bm = sched.block_manager
+    filled = seq.num_cached_tokens // bs
+    assert filled > 0
+    assert all(bm.blocks[b].hash != -1 for b in seq.block_table[:filled])
+
+
+def test_postprocess_hashes_parked_seq():
+    import numpy as np
+
+    bs = 16
+    cfg = _pp_config(
+        enable_prefix_caching=True,
+        max_num_batched_tokens=64,
+        kv_cache_block_size=bs,
+        long_prefill_token_threshold=0,
+    )
+    sched = Scheduler(cfg)
+    seq, batch, seqs = _pp_prefill_until_parked(sched, 512, bs)
+
+    n = len(batch.req_ids)
+    fwd = ScheduledBatchOutput(
+        req_ids=list(batch.req_ids),
+        token_ids=[(0,)] * n,
+        num_rejected=np.zeros(n, dtype=np.int32),
+        num_bonus=np.zeros(n, dtype=np.int32),
+        draft_token_ids=None,
+        is_deferred_out=False,
+    )
+    sched.postprocess(list(seqs.values()), fwd, batch=batch)
+
+    bm = sched.block_manager
+    filled = seq.num_cached_tokens // bs
+    assert all(bm.blocks[b].hash != -1 for b in seq.block_table[:filled])
+
+
+def test_parked_seq_prefix_is_discoverable_after_load():
+    """End-to-end shape of the offload promote path.
+
+    Park mid-prefill, publish the "loaded" range on top, and check a fresh
+    same-prefix request can find the whole thing — the failure mode was
+    `publish_loaded_prefix` returning 0 because the boundary block was unhashed.
+    """
+    bs = 16
+    cfg = _pp_config(
+        enable_prefix_caching=True,
+        max_num_batched_tokens=64,
+        kv_cache_block_size=bs,
+        long_prefill_token_threshold=0,
+    )
+    sched = Scheduler(cfg)
+    prompt = 512
+    seq, batch, seqs = _pp_prefill_until_parked(sched, prompt, bs)
+    sched.register_prefill_hashes(batch, seqs.values())
+
+    boundary = seq.num_cached_tokens
+    loaded = prompt - bs  # leave the tail block unpublished, as prefill would
+    promoted = sched.block_manager.publish_loaded_prefix(
+        seq, start_token=boundary, end_token=loaded
+    )
+    assert promoted == loaded - boundary
+
     hit = sched.block_manager.can_allocate(_make_seq(prompt, block_size=bs))
     assert hit == prompt // bs - 1
