@@ -4,22 +4,23 @@
 import torch
 import triton
 import triton.language as tl
+from aiter.dist.parallel_state import get_tp_group
 from einops import rearrange
-from atom.model_ops.mamba_ops.causal_conv1d import (
-    causal_conv1d_fn,
-    causal_conv1d_update,
-)
+from torch import nn
+
 from atom.model_ops.fla_ops import (
     chunk_gated_delta_rule,
     fused_recurrent_gated_delta_rule,
     gdn_decode_update_lossy_fast,
 )
+from atom.model_ops.mamba_ops.causal_conv1d import (
+    causal_conv1d_fn,
+    causal_conv1d_update,
+)
 from atom.utils import envs
 
 # from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadata
 from atom.utils.forward_context import ForwardContext, get_forward_context
-from torch import nn
-from aiter.dist.parallel_state import get_tp_group
 
 
 @triton.jit
@@ -181,10 +182,9 @@ class GatedDeltaNet(nn.Module):
         spec_sequence_masks = gdn_metadata.spec_sequence_masks
         spec_token_indx = gdn_metadata.spec_token_indx
         non_spec_token_indx = gdn_metadata.non_spec_token_indx
-        spec_state_indices_tensor = gdn_metadata.spec_state_indices_tensor  # noqa: E501
-        non_spec_state_indices_tensor = (
-            gdn_metadata.non_spec_state_indices_tensor
-        )  # noqa: E501
+        spec_state_indices_tensor = gdn_metadata.spec_state_indices_tensor
+        non_spec_state_indices_tensor = gdn_metadata.non_spec_state_indices_tensor
+        non_spec_state_indices_in_tensor = gdn_metadata.non_spec_state_indices_in_tensor
 
         # `causal_conv1d_*` expects the logical shape [slot, conv_dim, state_len].
         # ModelRunner stores [slot, state_len, conv_dim], so it needs the
@@ -265,6 +265,7 @@ class GatedDeltaNet(nn.Module):
                 conv_states=conv_state,
                 has_initial_state=has_initial_state,
                 cache_indices=non_spec_state_indices_tensor,
+                cache_indices_in=non_spec_state_indices_in_tensor,
                 query_start_loc=non_spec_query_start_loc,
                 k_dim_size=self.num_k_heads * self.head_k_dim // self.tp_size,
                 v_dim_size=self.num_v_heads * self.head_v_dim // self.tp_size,
@@ -280,6 +281,9 @@ class GatedDeltaNet(nn.Module):
                 self.conv1d.bias,
                 self.activation,
                 conv_state_indices=non_spec_state_indices_tensor[
+                    : gdn_metadata.num_actual_tokens
+                ],
+                conv_state_indices_in=non_spec_state_indices_in_tensor[
                     : gdn_metadata.num_actual_tokens
                 ],
                 validate_data=True,
@@ -344,7 +348,7 @@ class GatedDeltaNet(nn.Module):
 
         # 2.2: Process the remaining part
         if gdn_metadata.num_prefills > 0:
-            initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()
+            initial_state = ssm_state[non_spec_state_indices_in_tensor].contiguous()
             initial_state[~has_initial_state, ...] = 0
             (
                 core_attn_out_non_spec,
@@ -378,6 +382,7 @@ class GatedDeltaNet(nn.Module):
                         v=value_non_spec,
                         initial_state=ssm_state,
                         ssm_state_indices=non_spec_state_indices_tensor,
+                        ssm_state_indices_in=non_spec_state_indices_in_tensor,
                         use_qk_l2norm_in_kernel=True,
                     )
                 )
@@ -395,6 +400,7 @@ class GatedDeltaNet(nn.Module):
                             : gdn_metadata.num_decodes + 1
                         ],
                         ssm_state_indices=non_spec_state_indices_tensor,
+                        ssm_state_indices_in=non_spec_state_indices_in_tensor,
                         use_qk_l2norm_in_kernel=True,
                     )
                 )
