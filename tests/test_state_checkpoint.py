@@ -1292,9 +1292,12 @@ class TestDecodePublishGate:
 class StubStateCache:
     """Minimal `StateCache`: a fixed room and a hit it can be told to cap."""
 
-    def __init__(self, successor_room=inf, cap=None, enabled=True):
+    def __init__(
+        self, successor_room=inf, cap=None, enabled=True, readable_midstep=False
+    ):
         self.successor_room = successor_room
         self.enabled = enabled
+        self.readable_midstep = readable_midstep
         self._cap = cap
 
     def applies(self, seq):
@@ -1304,6 +1307,15 @@ class StubStateCache:
         return P if self._cap is None else min(P, self._cap)
 
     def checkpoint(self, seq, boundary_blocks, h):
+        pass
+
+    def reserve_midstep(self, seq, positions):
+        return []
+
+    def publish_midstep(self, reservations):
+        pass
+
+    def cancel_midstep(self, reservations):
         pass
 
 
@@ -1954,3 +1966,280 @@ class TestGenerationIsHeldToSpacingNotTheGrid:
         second = stateful_seq(PROMPT)
         bm.allocate(second, bm.can_allocate(second))
         assert second.checkpoint_demand_pos < second.num_prompt_tokens
+
+
+# ── midstep checkpoints ────────────────────────────────────────────────────
+
+
+def midstep_config(**overrides):
+    """`demand_config` for a backend that reads its state mid-forward."""
+    overrides.setdefault("state_readable_midstep", True)
+    return demand_config(**overrides)
+
+
+def forward_midstep(bm: BlockManager, seq: Sequence) -> list[int]:
+    """Run an admitted seq's prompt the way a readable backend does.
+
+    The scheduler's loop with the cut still consulted — it should never fire —
+    and `plan_midstep` where `Scheduler.schedule` puts it, once the chunk is
+    settled. Returns the positions checkpointed, which under this backend is
+    what the ladder yields *without* the forwards it used to cost.
+    """
+    kept = []
+    while seq.num_cached_tokens < seq.num_prompt_tokens:
+        start = seq.num_cached_tokens
+        chunk = seq.num_prompt_tokens - start
+        assert not bm.checkpoint_cut(seq, start, start + chunk)
+        bm.plan_midstep(seq, start, start + chunk)
+        kept.extend(p for _g, p, _h in seq.midstep_reservations)
+        bm.hash_blocks(seq, chunk, start_tokens=start)
+        seq.num_cached_tokens = start + chunk
+    return kept
+
+
+class TestMidstepCheckpoints:
+    """Every rung of the ladder, kept inside one full-length forward.
+
+    A checkpoint is state as of position P, and the only reason the scheduler
+    shortens a prefill chunk onto P is that most backends can hand back state
+    only as of the forward's last token. A chunk kernel does not have that
+    limitation: it materializes the recurrent state at every interior chunk
+    boundary on its way through, so P is a copy rather than a forward.
+
+    So the ladder's cost model changes and its reach does not. `checkpoint_cut`
+    returns 0 for every seq and `checkpointers_at` defers to the midstep path;
+    the two gates are one change, because suppressing the cut alone leaves
+    `checkpointers_at` refusing off-grid positions it is then handed and keeping
+    nothing at all, silently.
+    """
+
+    def test_the_ladder_costs_no_forwards(self):
+        bm = BlockManager(midstep_config())
+        seq = stateful_seq(PROMPT)
+        bm.allocate(seq, bm.can_allocate(seq))
+        # The unreadable backend cuts at 32 and again at 36 for this prompt.
+        assert forward_midstep(bm, seq) == [32, 36]
+        assert bm.checkpoint_funnel()["chunks_cut_for_end"] == 0
+        assert bm.checkpoint_funnel()["chunks_cut_for_demand"] == 0
+
+    def test_the_reuse_is_the_same_reuse(self):
+        """The point: same hit as the cutting ladder, without the cuts."""
+        for readable in (False, True):
+            bm = BlockManager(demand_config(state_readable_midstep=readable))
+            first = stateful_seq(PROMPT)
+            bm.allocate(first, bm.can_allocate(first))
+            (forward_midstep if readable else forward_on_the_ladder)(bm, first)
+
+            second = stateful_seq(PROMPT)
+            assert bm.can_allocate(second) == 9, readable
+
+    def test_both_positions_are_separately_resumable(self):
+        """Not one checkpoint at the rightmost — one per position, each keyed.
+
+        A single group filed under the last position would look identical on a
+        prompt that reuses the whole prefix, and fail the moment a request
+        branches before it.
+        """
+        bm = BlockManager(midstep_config())
+        first = stateful_seq(PROMPT)
+        bm.allocate(first, bm.can_allocate(first))
+        forward_midstep(bm, first)
+
+        assert len(set(bm.state.hash_to_group.values())) == 2
+
+        # A request sharing 32 tokens and then diverging cannot use the anchor
+        # at 36, so its hit of 8 blocks is 32's checkpoint and could have come
+        # from nowhere else. Filing both positions under one group would leave
+        # this at 0.
+        branch_at_32 = stateful_seq(list(range(32)) + list(range(900, 916)))
+        assert bm.can_allocate(branch_at_32) == 8
+        # And the whole-prefix case still reaches the further one.
+        assert bm.can_allocate(stateful_seq(PROMPT)) == 9
+
+    def test_the_boundary_is_not_kept_twice(self):
+        """`checkpointers_at` has to defer, or both paths keep the same rung.
+
+        The midstep path already filed 32, and a forward that also ends there
+        is exactly what the ladder used to produce — so without the gate the
+        rung is kept a second time. Two groups on one hash, the loser sitting
+        free and unindexed; and under `fork` the seq gives its live group away
+        and takes a fresh one, binding the next forward to refill a replacement
+        it had no reason to need.
+        """
+        bm = BlockManager(midstep_config())
+        seq = stateful_seq(PROMPT)
+        bm.allocate(seq, bm.can_allocate(seq))
+        group = seq.per_req_cache_group
+        bm.plan_midstep(seq, 0, 32)
+        bm.hash_blocks(seq, 32, start_tokens=0)
+
+        assert bm.checkpoint_funnel()["checkpoints_kept"] == 1
+        assert seq.per_req_cache_group == group  # not forked out from under it
+        assert seq.state_fork_src == -1
+
+    def test_a_position_the_hash_chain_cannot_name_is_skipped(self):
+        """No hash, no way back — so reserving one would spend a group on air."""
+        bm = BlockManager(midstep_config())
+        seq = stateful_seq(PROMPT)
+        bm.can_allocate(seq)
+        seq.block_hashes = seq.block_hashes[:2]  # 8 tokens' worth
+        assert bm.midstep_positions(seq, 0, 44) == []
+
+    def test_the_chain_covers_the_whole_prompt_past_the_miss(self):
+        """`block_hashes` stops at the first miss; the anchor is past it."""
+        bm = BlockManager(midstep_config())
+        seq = stateful_seq(PROMPT)
+        bm.can_allocate(seq)
+        assert len(seq.block_hashes) == len(PROMPT) // BLOCK
+        # And it is the same chain `hash_blocks` publishes, or a resumer would
+        # look the checkpoint up under a hash nothing files it under.
+        bm.allocate(seq, 0)
+        bm.hash_blocks(seq, seq.num_prompt_tokens)
+        published = [bm.kv.block(b).hash for b in seq.block_table]
+        assert published == seq.block_hashes
+
+    def test_an_unreadable_backend_keeps_its_chain_empty(self):
+        """A hash pass over every prompt, for a field nothing would read."""
+        bm = BlockManager(demand_config())
+        seq = stateful_seq(PROMPT)
+        bm.can_allocate(seq)
+        assert seq.block_hashes == []
+
+    def test_nothing_is_findable_until_the_forward_has_run(self):
+        """Publishing at reservation time indexes bytes nobody wrote."""
+        bm = BlockManager(midstep_config())
+        seq = stateful_seq(PROMPT)
+        bm.allocate(seq, bm.can_allocate(seq))
+        bm.plan_midstep(seq, 0, 44)
+        assert seq.midstep_reservations
+        assert bm.state.hash_to_group == {}
+
+        bm.hash_blocks(seq, 44)
+        assert len(bm.state.hash_to_group) == 2
+        assert seq.midstep_reservations == []  # drained, not left to re-publish
+
+    def test_a_cancelled_reservation_is_returned_vacant(self):
+        bm = BlockManager(midstep_config())
+        seq = stateful_seq(PROMPT)
+        bm.allocate(seq, bm.can_allocate(seq))
+        free_before = bm.state.num_free()
+        bm.plan_midstep(seq, 0, 44)
+        assert bm.state.num_free() == free_before - 2
+
+        bm.cancel_midstep(seq)
+        assert bm.state.num_free() == free_before
+        assert bm.state.hash_to_group == {}  # holding nothing findable
+
+    def test_replanning_returns_the_previous_forward_s_groups(self):
+        """A plan is good for one forward; a second means the first never ran."""
+        bm = BlockManager(midstep_config())
+        seq = stateful_seq(PROMPT)
+        bm.allocate(seq, bm.can_allocate(seq))
+        bm.plan_midstep(seq, 0, 44)
+        free_with_one_plan = bm.state.num_free()
+        bm.plan_midstep(seq, 0, 44)
+        assert bm.state.num_free() == free_with_one_plan
+
+    def test_deallocate_returns_them_too(self):
+        """Preemption frees through here, and the forward is not going to run."""
+        bm = BlockManager(midstep_config())
+        seq = stateful_seq(PROMPT)
+        bm.allocate(seq, bm.can_allocate(seq))
+        free_before = bm.state.num_free()
+        bm.plan_midstep(seq, 0, 44)
+        bm.deallocate(seq)
+        # `free_before` counted the seq's own group as taken; deallocate hands
+        # that back as well, so the reservations are the difference.
+        assert bm.state.num_free() == free_before + 1
+        assert seq.midstep_reservations == []
+
+    def test_a_shortage_keeps_the_earliest_position(self):
+        """Best-effort, in the order a later forward would reach them.
+
+        The earliest is the one an earlier chunk arrives at, and the one a
+        branching request is most likely to still be able to use.
+        """
+        bm = BlockManager(midstep_config(pool_entries={"state": 2}))
+        seq = stateful_seq(PROMPT)
+        bm.allocate(seq, bm.can_allocate(seq))
+        bm.plan_midstep(seq, 0, 44)
+        assert [p for _g, p, _h in seq.midstep_reservations] == [32]
+        assert bm.checkpoint_funnel()["checkpoints_dropped"] == 1
+
+    def test_reservations_never_starve_an_admission(self):
+        """`has_free` is the gate, so the worst case is a deferred admission."""
+        bm = BlockManager(midstep_config(pool_entries={"state": 3}))
+        first = stateful_seq(PROMPT)
+        bm.allocate(first, bm.can_allocate(first))
+        bm.plan_midstep(first, 0, 44)
+        # Two groups reserved, one held by `first` — the pool is empty, and a
+        # second request is refused rather than handed a reserved group.
+        second = stateful_seq(PROMPT)
+        assert bm.can_allocate(second) == -1
+        assert bm.state.num_free() == 0
+
+    def test_generation_still_checkpoints_the_ordinary_way(self):
+        """Midstep is a prefill affair; a decode step ends where acceptance says.
+
+        `checkpointers_at` defers only on the aimed path, so an unaimed caller
+        gets the same answer a fork backend has always given.
+        """
+        bm = BlockManager(midstep_config())
+        seq = stateful_seq(PROMPT)
+        bm.allocate(seq, bm.can_allocate(seq))
+        assert bm.checkpointers_at(seq, INTERVAL + BLOCK, MIN_FORK, aimed=False)
+
+    def test_the_prompt_s_checkpoints_space_the_decode_ones(self):
+        """`last_checkpoint_pos` is the decode spacing rule's only input.
+
+        A prompt that filed a midstep checkpoint at its end and left the
+        watermark at 0 would let the first decode boundary keep another one
+        immediately, which is what the interval exists to prevent.
+        """
+        bm = BlockManager(midstep_config())
+        seq = stateful_seq(PROMPT)
+        bm.allocate(seq, bm.can_allocate(seq))
+        forward_midstep(bm, seq)
+        assert seq.last_checkpoint_pos == 36
+
+    def test_one_unreadable_class_keeps_the_cut(self):
+        """The gate is `all`, not `any`: that class still needs the forward.
+
+        A readable class loses nothing by being handed a position it would have
+        taken anyway, and an unreadable one loses everything by being handed a
+        forward that does not end there.
+        """
+        bm = BlockManager(midstep_config())
+        bm.state_caches = (*bm.state_caches, StubStateCache(successor_room=0))
+        seq = stateful_seq(PROMPT)
+        bm.allocate(seq, bm.can_allocate(seq))
+        assert bm.checkpoint_cut(seq, 0, 44) == 32
+        assert bm.checkpointers_at(seq, 32)
+
+    def test_interval_zero_reserves_nothing(self):
+        """0 is off for the midstep path too, as it is for the other three."""
+        bm = BlockManager(midstep_config(state_checkpoint_interval_tokens=0))
+        seq = stateful_seq(PROMPT)
+        bm.allocate(seq, bm.can_allocate(seq))
+        assert bm.midstep_positions(seq, 0, 44) == []
+
+    def test_minus_one_reserves_the_anchor_alone(self):
+        """The two changes compose: no grid, no cuts, and the reuse still there."""
+        bm = BlockManager(midstep_config(state_checkpoint_interval_tokens=-1))
+        first = stateful_seq(PROMPT)
+        bm.allocate(first, bm.can_allocate(first))
+        assert forward_midstep(bm, first) == [36]
+
+        second = stateful_seq(PROMPT)
+        assert bm.can_allocate(second) == 9
+
+    def test_a_stateless_model_reserves_nothing(self):
+        bm = BlockManager(
+            midstep_config(
+                pool_entries={}, state_transfer_kind="none", state_fork_tokens=0
+            )
+        )
+        cold = Sequence(PROMPT, BLOCK, has_per_req_cache=False)
+        bm.can_allocate(cold)
+        assert cold.block_hashes == []
+        assert bm.midstep_positions(cold, 0, 44) == []

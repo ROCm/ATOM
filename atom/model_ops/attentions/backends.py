@@ -144,7 +144,41 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         return {}
 
     def state_transfer(self) -> StateTransfer:
-        """Declare this backend's per-request state checkpoint capability."""
+        """How this backend hands one request's state to another slot.
+
+        A checkpoint is a second copy of the state as of some boundary, so every
+        backend with per-request state has to say how one gets there. There are
+        three answers and the state pool runs whichever it is told:
+
+        `StateTransfer.fork(n)` — the state rolls and is not one range to
+        duplicate, so the old slot goes to the index and the request takes a
+        fresh one, reading the old and writing the new for exactly one forward.
+        That forward has to leave the new slot self-contained (a single read
+        index cannot span both), which takes `n` *committed* tokens.
+        `BlockManager` walks a checkpoint/hit point back to the previous block
+        boundary until it fits.
+
+        `StateTransfer.copy(layout_id)` — one request's state is a contiguous
+        byte range, so the index gets a duplicate and the owner is left alone.
+        No forward is bound and no boundary is disqualified for lack of room,
+        which is what makes a decode boundary checkpointable at all: a decode
+        step commits `1 + accepted_drafts` tokens and acceptance is not knowable
+        when the checkpoint has to be decided. The backend must declare a
+        matching `PagedStateCheckpointSpec` and implement
+        `execute_paged_state_copies`.
+
+        `StateTransfer.none()` (default) — no per-request state, or none that can
+        be handed over; the checkpoint index stays empty and prefix hits shrink
+        to 0 for its models.
+
+        `fork` and `copy` each take a second and independent argument,
+        `readable_midstep`: can this backend snapshot a boundary *inside* a
+        forward, or only at the forward's last token? False, the default, makes
+        `BlockManager` shorten a prefill chunk onto every checkpoint position —
+        one forward per rung. True says those positions can be read out of
+        intermediates the kernel already materializes, so the chunk runs full
+        length and the backend owes `write_state_checkpoints` instead.
+        """
         return StateTransfer.none()
 
     def relocate_state_slots(self, pairs: Sequence[tuple[int, int]]) -> None:

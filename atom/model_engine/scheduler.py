@@ -388,6 +388,23 @@ class ScheduledBatch:
             if state_maintenance_ops is not None
             else StateMaintenanceOps()
         )
+        # Midstep checkpoints this forward must write, `[(slot, position)]` per
+        # seq, positionally aligned with `per_req_cache_groups` like the fork
+        # sources above. A list per seq, not one entry: a readable backend takes
+        # every position the chunk covers rather than only the one it ends on.
+        # Positions are absolute prompt offsets; the backend rebases them onto
+        # the step's own tokens, which is the only frame its intermediates are
+        # in. Empty everywhere except a `readable_midstep` prefill.
+        #
+        # Separate from `state_maintenance_ops` on purpose: those are moves the
+        # pool performs *between* forwards, out of values that already exist in
+        # a slot. These are writes only the forward itself can make, because the
+        # interior values they capture exist only while it runs.
+        self.state_save_all = [
+            [(g, p) for g, p, _h in seq.midstep_reservations]
+            for seq in seqs.values()
+            if seq.has_per_req_cache and seq.per_req_cache_group >= 0
+        ]
         self.top_ks = np.asarray([seq.top_k for seq in seqs.values()], dtype=np.int32)
         self.top_ps = np.asarray([seq.top_p for seq in seqs.values()], dtype=np.float32)
         # True if any seq in the batch is a fan-out child (SamplingParams.n>1)
@@ -1364,6 +1381,19 @@ class Scheduler:
                 if self.drafter_needs_next_token
                 else None
             )
+
+            # Reserve midstep checkpoint destinations for the chunks just
+            # settled. Here rather than inside `_finalize_prefill_chunk`
+            # because a reservation takes a group off the free list, and
+            # admission for this pass only finishes above — planning any
+            # earlier would let a checkpoint's destination compete with a
+            # request still to be let in. The batch below snapshots what this
+            # leaves on each seq.
+            for i, seq in enumerate(scheduled_seqs.values()):
+                start = num_cached_tokens_list[i]
+                self.block_manager.plan_midstep(
+                    seq, start, start + int(num_scheduled_tokens[i])
+                )
 
             prefill_batch = ScheduledBatch(
                 seqs=scheduled_seqs,
