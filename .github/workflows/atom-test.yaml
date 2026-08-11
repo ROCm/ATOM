@@ -542,6 +542,7 @@ jobs:
             -e GPU_NAME="${{ steps.gpu-info.outputs.gpu_name }}" \
             -e GPU_VRAM_GB="${{ steps.gpu-info.outputs.gpu_vram_gb }}" \
             -e ROCM_VERSION="${{ steps.gpu-info.outputs.rocm_version }}" \
+            -e ACCURACY_TASK="${{ matrix.accuracy_task || 'gsm8k' }}" \
             "$CONTAINER_NAME" bash -lc "
             .github/scripts/atom_test.sh accuracy $model_path
           " 2>&1 | tee atom_accuracy_output.txt
@@ -560,6 +561,7 @@ jobs:
         if: success()
         env:
           MODEL_NAME: ${{ matrix.model_name }}
+          RESULT_TASK: ${{ matrix.accuracy_task || 'gsm8k' }}
         run: |
           result_file=$(ls -1t accuracy_test_results/*.json 2>/dev/null | head -n 1)
           if [ -z "$result_file" ] || [ ! -f "$result_file" ]; then
@@ -568,8 +570,26 @@ jobs:
           else
               echo "RESULT_FILE: $result_file"
           fi
-          flexible_extract_value=$(jq '.results.gsm8k["exact_match,flexible-extract"]' "$result_file")
-          echo "Flexible extract value: $flexible_extract_value"
+          if [ "$RESULT_TASK" = "gsm8k_cot" ]; then
+            RESULT_METRIC="exact_match,strict-match"
+          else
+            RESULT_METRIC="exact_match,flexible-extract"
+          fi
+          score=$(jq --arg task "$RESULT_TASK" --arg metric "$RESULT_METRIC" \
+            '.results[$task][$metric]' "$result_file")
+          # jq returns the literal string "null" (not an empty string) when the
+          # task/metric path is missing. awk's numeric comparison then treats
+          # "null" as 0, which turns a missing-key bug into a confusing
+          # "score (0) < threshold (0.93)" accuracy failure. Catch this here
+          # with a clearer error so model_name / accuracy_task mismatches
+          # surface obviously.
+          if [ -z "$score" ] || [ "$score" = "null" ]; then
+            echo "ERROR: missing accuracy score in $result_file for task '$RESULT_TASK', metric '$RESULT_METRIC'."
+            echo "       Check that the model entry's accuracy_task matches the lm_eval task key in the result JSON:"
+            jq '.results | keys' "$result_file" 2>/dev/null || true
+            exit 2
+          fi
+          echo "Score ($RESULT_TASK / $RESULT_METRIC): $score"
 
           # Read threshold from models_accuracy.json (via env var to avoid shell injection)
           threshold=$(python3 -c "
@@ -581,12 +601,12 @@ jobs:
           ")
           echo "Accuracy test threshold: $threshold"
 
-          result=$(awk -v val="$flexible_extract_value" -v threshold="$threshold" 'BEGIN {print (val < threshold) ? 1 : 0}')
+          result=$(awk -v val="$score" -v threshold="$threshold" 'BEGIN {print (val < threshold) ? 1 : 0}')
           if [ "$result" -eq 1 ]; then
-            echo "Accuracy test failed: $flexible_extract_value < $threshold"
+            echo "Accuracy test failed: $score < $threshold"
             exit 1
           else
-            echo "Accuracy test passed: $flexible_extract_value >= $threshold"
+            echo "Accuracy test passed: $score >= $threshold"
           fi
 
       - name: Check MTP acceptance rate
@@ -639,7 +659,10 @@ jobs:
           print(next((m.get('accuracy_threshold', 0) for m in models if m['model_name'] == name), 0))
           ")
           result_file=$(ls -1t accuracy_test_results/*.json 2>/dev/null | head -n 1)
-          score=$(jq '.results.gsm8k["exact_match,flexible-extract"]' "$result_file" 2>/dev/null || echo "N/A")
+          SUMMARY_TASK="${{ matrix.accuracy_task || 'gsm8k' }}"
+          SUMMARY_METRIC=$( [ "$SUMMARY_TASK" = "gsm8k_cot" ] && echo "exact_match,strict-match" || echo "exact_match,flexible-extract" )
+          score=$(jq --arg task "$SUMMARY_TASK" --arg metric "$SUMMARY_METRIC" \
+            '.results[$task][$metric]' "$result_file" 2>/dev/null || echo "N/A")
 
           echo "Accuracy Test Summary for ${{ matrix.model_name }} (threshold: ${threshold}, score: ${score}):" >> $GITHUB_STEP_SUMMARY
           awk '/\|Tasks\|Version\|/,/^$/ { if (NF > 0) print }' atom_accuracy_output.txt >> $GITHUB_STEP_SUMMARY

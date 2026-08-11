@@ -103,6 +103,7 @@ support_model_arch_dict = {
     "MistralForCausalLM": "atom.models.mistral3.Mistral3ForCausalLM",
     "MiniMaxM3SparseForCausalLM": "atom.models.minimax_m3.MiniMaxM3SparseForCausalLM",
     "MiniMaxM3SparseForConditionalGeneration": "atom.models.minimax_m3.MiniMaxM3SparseForConditionalGeneration",
+    "Gemma4ForConditionalGeneration": "atom.models.gemma4.Gemma4ForCausalLM",
 }
 # seed = 34567
 # np.random.seed(seed)
@@ -949,6 +950,34 @@ class ModelRunner:
             return True
         return False
 
+    def is_gemma4(self) -> bool:
+        """Whether this model uses Gemma 4-style hybrid attention.
+
+        Detected structurally rather than by `model_type` string match: a
+        model is Gemma 4-style when `hf_config` exposes `layer_types`,
+        `global_head_dim` and `num_global_key_value_heads`, and the per-type
+        `head_dim` differs (homogeneous models fall through to the standard
+        MHA path).
+        """
+        hf = self.config.hf_config
+        layer_types = getattr(hf, "layer_types", None)
+        global_head_dim = getattr(hf, "global_head_dim", None)
+        num_global_kv_heads = getattr(hf, "num_global_key_value_heads", None)
+        if layer_types is None or global_head_dim is None or num_global_kv_heads is None:
+            return False
+        return global_head_dim != hf.head_dim
+
+    def gemma4_layer_partition(self):
+        """Return `(sliding_indices, full_indices)` for Gemma 4-style models.
+
+        Both lists are ordered indices into `hf_config.layer_types`. Caller
+        must verify `is_gemma4()` first.
+        """
+        layer_types = self.config.hf_config.layer_types
+        sliding = [i for i, lt in enumerate(layer_types) if lt == "sliding_attention"]
+        full = [i for i, lt in enumerate(layer_types) if lt == "full_attention"]
+        return sliding, full
+
     def _setup_device_and_distributed(self, rank: int, config: Config):
         # Calculate local device rank considering DP, PP and PCP.
         # On a single node the physical GPU index equals the global distributed
@@ -1055,6 +1084,8 @@ class ModelRunner:
         for attr in (
             "kv_cache",
             "kv_scale",
+            "kv_cache_full",
+            "kv_scale_full",
             "index_cache",
             "mamba_k_cache",
             "mamba_v_cache",

@@ -21,6 +21,7 @@ from atom.utils.forward_context import AttentionMetaData, Context, get_forward_c
 from atom.utils.tbo import TokenSplitPrefillState
 
 from .backends import AttentionBackend, CommonAttentionBuilder
+from .utils import per_rank_kv_heads
 
 logger = logging.getLogger("atom")
 
@@ -195,7 +196,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         else:
             max_qlen = 1
 
-        num_head_k = max(1, hf_config.num_key_value_heads // get_tp_group().world_size)
+        num_head_k = per_rank_kv_heads(hf_config.num_key_value_heads, get_tp_group().world_size)
         (
             (work_meta_data_size, work_meta_data_type),
             (work_indptr_size, work_indptr_type),
@@ -412,6 +413,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
           num_kv_heads, head_dim]` for kv_cache + matching kv_scale (fp32).
         - MiMo-V2-Flash: per-layer-type accounting (full vs SWA layers
           have different num_kv_heads).
+        - Gemma 4-style hybrid: sliding-window and full-attention layers
+          have independent (num_kv_heads, head_dim), so the KV pool is
+          split into two `[2, L_kind, ...]` tensors.
         """
         from aiter import dtypes
 
@@ -422,6 +426,28 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         num_kv_heads = runner._get_num_kv_heads()
         total_num_layers = runner._get_total_num_layers()
         kv_dtype_size = dtypes.d_dtypes[config.kv_cache_dtype].itemsize
+
+        if runner.is_gemma4():
+            sliding_idxs, full_idxs = runner.gemma4_layer_partition()
+            num_draft_layers = total_num_layers - hf_config.num_hidden_layers
+            # MTP/draft layers reuse the sliding KV-cache shape (appended
+            # after target sliding layers in the binding pass).
+            num_sliding = len(sliding_idxs) + num_draft_layers
+            num_full = len(full_idxs)
+
+            s_kv_heads = per_rank_kv_heads(hf_config.num_key_value_heads, runner.world_size)
+            f_kv_heads = per_rank_kv_heads(hf_config.num_global_key_value_heads, runner.world_size)
+            s_head_dim = hf_config.head_dim
+            f_head_dim = hf_config.global_head_dim
+
+            return (
+                # sliding kv_cache + matching kv_scale (fp32)
+                2 * num_sliding * runner.block_size * s_kv_heads * s_head_dim * kv_dtype_size
+                + 2 * num_sliding * s_kv_heads * runner.physical_block_size * 4
+                # full-attention kv_cache + matching kv_scale (fp32)
+                + 2 * num_full * runner.block_size * f_kv_heads * f_head_dim * kv_dtype_size
+                + 2 * num_full * f_kv_heads * runner.physical_block_size * 4
+            )
 
         if runner.is_mimo_v2():
             # Mixed full + SWA layers, possibly different num_kv_heads.
@@ -509,6 +535,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
 
         - MiMo-V2-Flash defers per-module allocation to build_kv_cache_tensor
           (each module has its own num_kv_heads), returning sentinels here.
+        - Gemma 4-style hybrid returns two `[2, L_kind, ...]` tensors plus a
+          `layer_id -> (kind, slot)` map used by build_kv_cache_tensor for
+          O(1) routing.
         - All other models use a single `[2, num_hidden_layers, ...]` tensor
           shared across layers; per-layer slicing happens in build_kv_cache_tensor.
         """
@@ -518,6 +547,69 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         config = runner.config
         hf_config = config.hf_config
         text_config = getattr(hf_config, "text_config", hf_config)
+
+        if runner.is_gemma4():
+            sliding_idxs, full_idxs = runner.gemma4_layer_partition()
+            num_sliding = len(sliding_idxs) + num_draft_layers
+            num_full = len(full_idxs)
+
+            s_kv_heads = per_rank_kv_heads(hf_config.num_key_value_heads, runner.world_size)
+            f_kv_heads = per_rank_kv_heads(hf_config.num_global_key_value_heads, runner.world_size)
+            kv_dtype = dtypes.d_dtypes[config.kv_cache_dtype]
+
+            # Pre-build the layer_id -> (kind, slot) routing map. MTP/draft
+            # layers (layer_id >= num_hidden_layers) reuse sliding-shape
+            # slots appended after the target sliding layers.
+            slot_map: dict[int, tuple[str, int]] = {}
+            for slot, lid in enumerate(sliding_idxs):
+                slot_map[lid] = ("sliding", slot)
+            for slot, lid in enumerate(full_idxs):
+                slot_map[lid] = ("full", slot)
+            target_layers = hf_config.num_hidden_layers
+            for d in range(num_draft_layers):
+                slot_map[target_layers + d] = ("sliding", len(sliding_idxs) + d)
+
+            return {
+                "kv_cache": torch.zeros(
+                    2,
+                    num_sliding,
+                    runner.num_physical_kvcache_blocks,
+                    runner.physical_block_size,
+                    s_kv_heads,
+                    hf_config.head_dim,
+                    dtype=kv_dtype,
+                    device="cuda",
+                ),
+                "kv_scale": torch.zeros(
+                    2,
+                    num_sliding,
+                    runner.num_physical_kvcache_blocks,
+                    s_kv_heads,
+                    runner.physical_block_size,
+                    dtype=dtypes.fp32,
+                    device="cuda",
+                ),
+                "kv_cache_full": torch.zeros(
+                    2,
+                    num_full,
+                    runner.num_physical_kvcache_blocks,
+                    runner.physical_block_size,
+                    f_kv_heads,
+                    hf_config.global_head_dim,
+                    dtype=kv_dtype,
+                    device="cuda",
+                ),
+                "kv_scale_full": torch.zeros(
+                    2,
+                    num_full,
+                    runner.num_physical_kvcache_blocks,
+                    f_kv_heads,
+                    runner.physical_block_size,
+                    dtype=dtypes.fp32,
+                    device="cuda",
+                ),
+                "_gemma4_slot_map": slot_map,
+            }
 
         if runner.is_mimo_v2():
             # Per-layer allocation deferred (each module gets its own
@@ -574,9 +666,11 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
     def build_kv_cache_tensor(self, layer_id: int, module):
         """Bind one MHA (non-MLA) attention module to its KV slice.
 
-        Handles both standard hybrid models (Qwen3-Next pattern: full-attn
-        layers interleaved with linear-attn) and MiMo-V2-Flash (per-layer
-        allocation with potentially different num_kv_heads per module).
+        Handles standard hybrid models (Qwen3-Next pattern: full-attn layers
+        interleaved with linear-attn), MiMo-V2-Flash (per-layer allocation
+        with potentially different num_kv_heads per module), and Gemma 4-style
+        hybrid (sliding-window vs full-attention layers with independent
+        num_kv_heads / head_dim, routed via `_gemma4_slot_map`).
 
         Returns the KVCacheTensor to register, or None if the module is not
         an MHA attention this builder owns. Side effects: sets module
@@ -615,6 +709,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         runner = self.model_runner
         config = runner.config
         hf_config = config.hf_config
+
+        if runner.is_gemma4():
+            return self._build_gemma4_kv_cache_tensor(layer_id, module)
 
         # attn_idx: hybrid models (Qwen3-Next) skip linear-attention layers
         # in the kv_cache slot ordering; non-hybrid models use layer_id 1:1.
@@ -690,6 +787,61 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             if config.kv_cache_dtype == "fp8":
                 module.k_scale = runner.kv_scale[0, attn_idx]
                 module.v_scale = runner.kv_scale[1, attn_idx]
+
+        module.max_model_len = config.max_model_len
+        module.k_cache = k_cache
+        module.v_cache = v_cache
+        return KVCacheTensor(
+            layer_num=layer_id,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            k_scale=module.k_scale,
+            v_scale=module.v_scale,
+        )
+
+    def _build_gemma4_kv_cache_tensor(self, layer_id: int, module):
+        """Bind one Gemma 4-style hybrid attention layer to its KV slice.
+
+        Sliding-window and full-attention layers live in two separate
+        `[2, L_kind, ...]` tensors; `_gemma4_slot_map` (built once in
+        `allocate_kv_cache_tensors`) tells us which tensor and slot to view
+        for this `layer_id`.
+        """
+        from atom.config import KVCacheTensor
+
+        runner = self.model_runner
+        config = runner.config
+        hf_config = config.hf_config
+
+        kind, slot = runner._gemma4_slot_map[layer_id]
+        if kind == "sliding":
+            cache = runner.kv_cache
+            scale = runner.kv_scale
+            head_dim = hf_config.head_dim
+            kv_heads = per_rank_kv_heads(hf_config.num_key_value_heads, runner.world_size)
+        else:
+            cache = runner.kv_cache_full
+            scale = runner.kv_scale_full
+            head_dim = hf_config.global_head_dim
+            kv_heads = per_rank_kv_heads(hf_config.num_global_key_value_heads, runner.world_size)
+
+        x = 16 // cache.element_size()
+        k_cache = cache[0, slot].view(
+            runner.num_physical_kvcache_blocks,
+            kv_heads,
+            head_dim // x,
+            runner.physical_block_size,
+            x,
+        )
+        v_cache = cache[1, slot].view(
+            runner.num_physical_kvcache_blocks,
+            kv_heads,
+            head_dim,
+            runner.physical_block_size,
+        )
+        if config.kv_cache_dtype == "fp8":
+            module.k_scale = scale[0, slot]
+            module.v_scale = scale[1, slot]
 
         module.max_model_len = config.max_model_len
         module.k_cache = k_cache

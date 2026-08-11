@@ -80,6 +80,7 @@ class PagedAttentionImpl(nn.Module):
             else 1.0
         )
         self.kv_scale = torch.tensor(self.kv_scale_float, dtype=torch.float32)
+        self.per_tensor_scale = self.kv_scale
         # Pre-allocated fp8 dequant scale for the pa_decode_bf16_asm path. Built
         # here (outside CUDAGraph capture) and reused so the kernel wrapper never
         # allocates a tensor mid-capture.
@@ -726,6 +727,13 @@ class PagedAttentionImpl(nn.Module):
 
             return output.view(batch_size * max_seqlen_q, self.num_heads, self.head_dim)
 
+    @staticmethod
+    def _sdpa_varlen_fallback(q, k, v, cu_seqlens_q, cu_seqlens_k, softmax_scale, causal):
+        """SDPA fallback for head_dim > 256 where CK is unsupported."""
+        from atom.model_ops.attentions.utils import _sdpa_varlen_attn
+        return _sdpa_varlen_attn(q, k, v, cu_seqlens_q, cu_seqlens_k,
+                                 softmax_scale, causal)
+
     @mark_trace(prefix="prefill_attention", torch_compile=False)
     def prefill_attention(
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
@@ -748,21 +756,55 @@ class PagedAttentionImpl(nn.Module):
         sliding_window = (
             (self.sliding_window, 0, 0) if self.sliding_window > 0 else (-1, -1, 0)
         )
-        o = aiter.flash_attn_varlen_func(
-            q,
-            k,
-            v,
-            cu_seqlens_q=attn_metadata.cu_seqlens_q,
-            cu_seqlens_k=attn_metadata.cu_seqlens_k,
-            max_seqlen_q=attn_metadata.max_seqlen_q,
-            max_seqlen_k=attn_metadata.max_seqlen_k,
-            min_seqlen_q=attn_metadata.min_seqlen_q,
-            dropout_p=attn_metadata.dropout_p,
-            softmax_scale=self.scale,
-            causal=True,
-            window_size=sliding_window,
-            sink_ptr=self.sinks,
-        )
+        if self.head_dim > 256:
+            # _sdpa_varlen_fallback dispatches to _sdpa_varlen_attn, which
+            # implements only causal masking with GQA head expansion — it does
+            # NOT honor sliding_window or attention sinks. Silently taking
+            # this path with either feature active would change attention
+            # semantics (windowed -> full, sinks dropped). No current model
+            # hits this combination (Gemma 4 has head_dim=512 full-attn layers
+            # but no sinks/sliding window; gpt-oss/MiMo use sinks but
+            # head_dim<=256), but guard explicitly to keep future callers safe.
+            # Mirrors the OOT plugin guards (fbe7cbaf / 83a27eb3).
+            if self.sinks is not None:
+                raise NotImplementedError(
+                    f"prefill_attention SDPA fallback (head_dim={self.head_dim} "
+                    f"> 256) does not support attention sinks; self.sinks is "
+                    f"set. Add sink_ptr support to _sdpa_varlen_attn before "
+                    f"enabling this model."
+                )
+            # self.sliding_window stored as int (-1 == disabled, >0 == window size)
+            if self.sliding_window is not None and self.sliding_window > 0:
+                raise NotImplementedError(
+                    f"prefill_attention SDPA fallback (head_dim={self.head_dim} "
+                    f"> 256) does not support sliding_window; "
+                    f"self.sliding_window={self.sliding_window}. Add window "
+                    f"masking support to _sdpa_varlen_attn before enabling "
+                    f"this model."
+                )
+            o = self._sdpa_varlen_fallback(
+                q, k, v,
+                cu_seqlens_q=attn_metadata.cu_seqlens_q,
+                cu_seqlens_k=attn_metadata.cu_seqlens_k,
+                softmax_scale=self.scale,
+                causal=True,
+            )
+        else:
+            o = aiter.flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_seqlens_q=attn_metadata.cu_seqlens_q,
+                cu_seqlens_k=attn_metadata.cu_seqlens_k,
+                max_seqlen_q=attn_metadata.max_seqlen_q,
+                max_seqlen_k=attn_metadata.max_seqlen_k,
+                min_seqlen_q=attn_metadata.min_seqlen_q,
+                dropout_p=attn_metadata.dropout_p,
+                softmax_scale=self.scale,
+                causal=True,
+                window_size=sliding_window,
+                sink_ptr=self.sinks,
+            )
         return o
 
     def prefill_attention_triton(

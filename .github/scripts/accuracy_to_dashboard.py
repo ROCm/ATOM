@@ -42,16 +42,34 @@ def build_entries(
         except (OSError, json.JSONDecodeError):
             continue
 
-        # Extract accuracy scores
+        # Lookup model config for threshold and baseline. We need the config
+        # before extracting scores because the accuracy task can be overridden
+        # per-model in models_accuracy.json (e.g. Gemma 4 uses gsm8k_cot).
+        cfg = model_configs.get(model_name, {})
+        accuracy_task = cfg.get("accuracy_task", "gsm8k")
+
+        # Extract accuracy scores. lm_eval keys results by task name, and the
+        # primary metric depends on the task: atom-test.yaml uses
+        # exact_match,strict-match for gsm8k_cot and exact_match,flexible-extract
+        # for plain gsm8k (see RESULT_METRIC selection around line 562). The
+        # dashboard MUST publish the same metric the CI threshold / baseline
+        # refer to, otherwise reviewers see a dashboard score that doesn't
+        # match the threshold check in the PR run.
+        if accuracy_task == "gsm8k_cot":
+            primary_metric = "exact_match,strict-match"
+            secondary_metric = "exact_match,flexible-extract"
+        else:
+            primary_metric = "exact_match,flexible-extract"
+            secondary_metric = "exact_match,strict-match"
+
         results = data.get("results", {})
-        gsm8k = results.get("gsm8k", {})
-        score = gsm8k.get("exact_match,flexible-extract")
+        task_results = results.get(accuracy_task, {})
+        score = task_results.get(primary_metric)
         if score is None:
             continue
-        strict_score = gsm8k.get("exact_match,strict-match")
-
-        # Lookup model config for threshold and baseline
-        cfg = model_configs.get(model_name, {})
+        # Keep the non-primary metric around for the "extra" metadata field
+        # so reviewers still see both numbers, just labelled clearly.
+        strict_score = task_results.get(secondary_metric)
 
         # Build extra metadata
         extra_parts = []
@@ -98,14 +116,18 @@ def build_entries(
 
         try:
             if strict_score is not None:
-                extra_parts.append(f"strict-match: {round(float(strict_score), 4)}")
+                # Label the secondary metric by what it actually is, not the
+                # hard-coded "strict-match" string. For gsm8k the secondary
+                # is strict-match; for gsm8k_cot it's flexible-extract.
+                secondary_label = secondary_metric.split(",", 1)[-1]
+                extra_parts.append(f"{secondary_label}: {round(float(strict_score), 4)}")
         except (TypeError, ValueError):
             pass
 
-        # Include num_fewshot: check configs.gsm8k first, then top-level config
+        # Include num_fewshot: check configs.<task> first, then top-level config
         lm_config = data.get("config", {})
         task_configs = data.get("configs", {})
-        num_fewshot = task_configs.get("gsm8k", {}).get("num_fewshot") or lm_config.get(
+        num_fewshot = task_configs.get(accuracy_task, {}).get("num_fewshot") or lm_config.get(
             "num_fewshot"
         )
         if num_fewshot is not None:
@@ -127,8 +149,21 @@ def build_entries(
         except (TypeError, ValueError):
             continue
 
+        # Match the dashboard entry-name suffix to the actual eval task so
+        # reviewers can tell which task a score belongs to. `gsm8k_cot`
+        # produces a different score distribution than plain `gsm8k`, and
+        # the threshold/baseline numbers in models_accuracy.json are
+        # task-specific. Default unknown tasks to an uppercased version of
+        # the task name rather than falling back to "GSM8K", which would
+        # mislabel any future task we add to models_accuracy.json.
+        if accuracy_task == "gsm8k_cot":
+            task_suffix = "GSM8K-COT"
+        elif accuracy_task == "gsm8k":
+            task_suffix = "GSM8K"
+        else:
+            task_suffix = accuracy_task.upper().replace("_", "-")
         entry = {
-            "name": f"{backend}::{model_name} accuracy (GSM8K)",
+            "name": f"{backend}::{model_name} accuracy ({task_suffix})",
             "unit": "score",
             "value": score_val,
         }

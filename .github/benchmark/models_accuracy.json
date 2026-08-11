@@ -457,5 +457,19 @@
     "accuracy_baseline": 0.95,
     "accuracy_baseline_model": "deepseek-ai/DeepSeek-V4-Pro",
     "_baseline_note": "TBO + dp-attention at conc=1000. Local 1319-sample GSM8K 3-shot, 4 runs = 0.9439/0.9484/0.9538/0.9530 (mean ~0.950, 2026-06-14, after TBO ids-gather + pad_for_all_gather fixes). Baseline 0.95; threshold 0.93 (~1.4pp below lowest 0.9439, conc=1000 variance)."
+  },
+  {
+    "model_name": "gemma-4-31b-it",
+    "model_path": "google/gemma-4-31b-it",
+    "extraArgs": "-tp 8 --trust-remote-code --max-model-len 4096",
+    "env_vars": "",
+    "accuracy_task": "gsm8k_cot",
+    "client_command": "lm_eval --model local-chat-completions --apply_chat_template --model_args model=${MODEL_PATH},base_url=http://localhost:8000/v1/chat/completions,num_concurrent=65,max_retries=3,max_gen_toks=2048,tokenized_requests=False,trust_remote_code=True --tasks gsm8k_cot --num_fewshot 8 --output_path ${OUTPUT_PATH}",
+    "runner": "atom-mi355-8gpu.predownload",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.93,
+    "accuracy_baseline": 0.9598,
+    "accuracy_baseline_model": "google/gemma-4-31b-it",
+    "_baseline_note": "gsm8k_cot 8-shot with chat template; standalone baseline 0.9598 (2026-05 MI355X, gemma4-dev)"
   }
 ]

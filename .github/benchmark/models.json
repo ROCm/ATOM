@@ -288,6 +288,18 @@
       "env_vars": "",
       "config": { "tp": 1, "kv_cache_dtype": "fp8" },
       "variants": [{ "label": "", "suffix": "", "conc_max": 256 }]
+    },
+    {
+      "display": "gemma-4-31b-it",
+      "path": "google/gemma-4-31b-it",
+      "prefix": "gemma-4-31b-it",
+      "runner": "atom-mi355-8gpu.predownload",
+      "env_vars": "",
+      "config": {
+        "tp": 8,
+        "extra_args": "--trust-remote-code --max-model-len 4096"
+      },
+      "variants": [{ "label": "", "suffix": "", "conc_max": 256 }]
     }
   ]
 }

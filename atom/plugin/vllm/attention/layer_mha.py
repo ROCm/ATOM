@@ -1,3 +1,4 @@
+import logging
 from typing import TYPE_CHECKING, Optional
 
 import aiter
@@ -27,6 +28,8 @@ if TYPE_CHECKING:
 
 ATOM_USE_GLUON_PA_DECODE = envs.ATOM_USE_GLUON_PA_DECODE
 
+logger = logging.getLogger("atom")
+
 # the dispatch rule is based on the kernel benchmark result
 #  of gluon/asm pa with model-specific shapes
 _GLUON_PA_DECODE_BS_MAPPING = {
@@ -35,6 +38,116 @@ _GLUON_PA_DECODE_BS_MAPPING = {
     "minimax_m2": 16,
 }
 _NO_PS_FIXED_SPLITS = 64
+
+
+# _CK_MAX_HEAD_DIM and _sdpa_varlen_attn are shared with the standalone
+# (model_ops/) path via atom/model_ops/attentions/utils.py. Re-export under
+# the original names so existing call sites in this file (and anyone
+# `from atom.plugin.attention_mha import _sdpa_varlen_attn`) keep working.
+from atom.model_ops.attentions.utils import _CK_MAX_HEAD_DIM, _sdpa_varlen_attn  # noqa: F401, E402
+
+
+def _flash_attn_varlen_with_fallback(
+    q, k, v,
+    cu_seqlens_q, cu_seqlens_k,
+    max_seqlen_q, max_seqlen_k,
+    min_seqlen_q,
+    softmax_scale, causal,
+    head_dim,
+    sink_ptr=None,
+    alibi_slopes=None,
+):
+    """CK flash attention with automatic SDPA fallback for large head_dim."""
+    if head_dim <= _CK_MAX_HEAD_DIM:
+        return aiter.flash_attn_varlen_func(
+            q=q, k=k, v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            min_seqlen_q=min_seqlen_q,
+            dropout_p=0.0,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            sink_ptr=sink_ptr,
+            alibi_slopes=alibi_slopes,
+            return_lse=True,
+        )
+    # head_dim > _CK_MAX_HEAD_DIM (256): fall back to SDPA. The fallback
+    # implements only causal masking with GQA head expansion; it does NOT
+    # apply attention sinks or ALiBi position biases, so silently routing a
+    # caller that passes either would change attention semantics. No current
+    # model triggers this combination (Gemma 4 has head_dim=512 full-attn
+    # layers but no sinks/ALiBi; gpt-oss / MiMo use sinks but head_dim<=256),
+    # but guard explicitly to keep future callers safe.
+    if sink_ptr is not None or alibi_slopes is not None:
+        raise NotImplementedError(
+            f"_flash_attn_varlen_with_fallback SDPA path (head_dim={head_dim} "
+            f"> {_CK_MAX_HEAD_DIM}) does not implement sink_ptr or alibi_slopes; "
+            f"got sink_ptr={'set' if sink_ptr is not None else None}, "
+            f"alibi_slopes={'set' if alibi_slopes is not None else None}. "
+            f"Add support to _sdpa_varlen_attn before enabling this model."
+        )
+    return _sdpa_varlen_attn(q, k, v, cu_seqlens_q, cu_seqlens_k,
+                             softmax_scale, causal, return_lse=True)
+
+
+def _triton_flash_attn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k,
+                               max_seqlen_q, max_seqlen_k, softmax_scale,
+                               causal=True, sliding_window=(-1, -1, 0),
+                               out=None, dropout_p=0.0):
+    """Fallback for prefill when head_dim > 256 (CK limitation).
+
+    Tries aiter Triton FA2 first, falls back to PyTorch SDPA with
+    GQA head expansion.
+    """
+    import torch
+
+    try:
+        from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.interface_v2 import (  # noqa: E501
+            varlen_fwd,
+        )
+        if out is None:
+            out = torch.empty_like(q)
+        wl = sliding_window[0] if isinstance(sliding_window, (tuple, list)) else sliding_window
+        wr = sliding_window[1] if isinstance(sliding_window, (tuple, list)) else 0
+        device = q.device
+        empty = torch.empty(0, device=device)
+        varlen_fwd(
+            q, k, v, out,
+            cu_seqlens_q, cu_seqlens_k,
+            None, None, empty, None,
+            max_seqlen_q, max_seqlen_k,
+            dropout_p, softmax_scale,
+            False, causal,
+            wl if wl > 0 else -1,
+            wr if wr > 0 else -1,
+            0.0, False,
+        )
+        return out
+    except Exception as e:
+        # SDPA fallback below ignores sliding_window (it only handles causal
+        # masking). Falling back silently when sliding_window is active would
+        # turn windowed attention into full attention -> wrong outputs.
+        # Currently no caller hits this (Gemma 4 only routes here for full-
+        # attention layers where sliding_window=(-1,-1,0)), but guard
+        # explicitly to keep future callers safe.
+        wl_check = (
+            sliding_window[0]
+            if isinstance(sliding_window, (tuple, list))
+            else sliding_window
+        )
+        if wl_check is not None and wl_check > 0:
+            raise RuntimeError(
+                f"Triton FA2 varlen_fwd failed with active sliding_window="
+                f"{sliding_window} (head_dim={q.shape[-1]}); SDPA fallback "
+                f"does not support sliding window, so cannot silently fall "
+                f"back without changing attention semantics. Original error: {e}"
+            ) from e
+        logger.warning("Triton FA2 varlen_fwd failed (head_dim=%s), "
+                       "falling back to PyTorch SDPA: %s", q.shape[-1], e)
+        return _sdpa_varlen_attn(q, k, v, cu_seqlens_q, cu_seqlens_k,
+                                 softmax_scale, causal, out=out)
 
 
 def _init_vllm_mha_layer_state(
@@ -256,7 +369,8 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         self.use_triton_attn = use_triton_attn
 
         if (
-            self.rotary_emb is not None
+            qkv is not None
+            and self.rotary_emb is not None
             and self.q_norm is not None
             and self.k_norm is not None
         ):
@@ -621,7 +735,7 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
                 v_scale,
             )
             return
-        out, lse = aiter.flash_attn_varlen_func(
+        out, lse = _flash_attn_varlen_with_fallback(
             q=query,
             k=key,
             v=value,
@@ -630,12 +744,11 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_q,
             min_seqlen_q=min_seqlen_q,
-            dropout_p=0.0,
             softmax_scale=self.scale,
             causal=True,
+            head_dim=self.head_dim,
             sink_ptr=self.sinks,
             alibi_slopes=self.alibi_slopes,
-            return_lse=True,
         )
         assert attn_metadata.extend_metadata is not None
         chunk_context_metadata = attn_metadata.extend_metadata.chunk_context_metadata
@@ -667,7 +780,7 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
                 per_token_quant=self.per_token_quant,
             )
 
-            suf_out, suf_lse = aiter.flash_attn_varlen_func(
+            suf_out, suf_lse = _flash_attn_varlen_with_fallback(
                 q=query,
                 k=key_fetched,
                 v=value_fetched,
@@ -676,13 +789,11 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_k=max_seqlens[chunk_idx],
                 min_seqlen_q=min_seqlen_q,
-                dropout_p=0.0,
                 softmax_scale=self.scale,
                 causal=False,
-                window_size=(-1, -1, 0),
+                head_dim=self.head_dim,
                 sink_ptr=self.sinks,
                 alibi_slopes=self.alibi_slopes,
-                return_lse=True,
             )
 
             if chunked_output is None:
@@ -850,23 +961,51 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
                 else (-1, -1, 0)
             )
 
-            aiter.flash_attn_varlen_func(
-                q=prefill_query,
-                k=prefill_key,
-                v=prefill_value,
-                cu_seqlens_q=attn_metadata.prefill_metadata.query_start_loc,
-                cu_seqlens_k=attn_metadata.prefill_metadata.query_start_loc,
-                max_seqlen_q=attn_metadata.prefill_metadata.max_query_len,
-                max_seqlen_k=attn_metadata.prefill_metadata.max_seq_len,
-                min_seqlen_q=1,
-                dropout_p=attn_metadata.dropout_p,
-                softmax_scale=self.scale,
-                causal=True,
-                window_size=sliding_window,
-                alibi_slopes=None,
-                sink_ptr=self.sinks,
-                out=output_actual_tokens[num_decode_tokens + num_extend_tokens :],
-            )
+            _pf_out = output_actual_tokens[num_decode_tokens + num_extend_tokens :]
+            if self.head_dim > 256:
+                # _triton_flash_attn_varlen does not accept sink_ptr; if the
+                # caller has attention sinks configured, routing here would
+                # silently drop them and produce wrong attention. No current
+                # model triggers this (Gemma 4 has head_dim>256 but no sinks;
+                # gpt-oss / MiMo have sinks but head_dim<=256), but guard
+                # explicitly to avoid silent breakage on future models.
+                if getattr(self, "sinks", None) is not None:
+                    raise RuntimeError(
+                        f"head_dim={self.head_dim} > 256 routes prefill "
+                        f"through _triton_flash_attn_varlen which does not "
+                        f"forward sink_ptr; self.sinks is set so this "
+                        f"combination would silently drop attention sinks. "
+                        f"Add sink_ptr support to the Triton/SDPA fallback "
+                        f"path before enabling this model."
+                    )
+                _triton_flash_attn_varlen(
+                    q=prefill_query, k=prefill_key, v=prefill_value,
+                    cu_seqlens_q=attn_metadata.prefill_metadata.query_start_loc,
+                    cu_seqlens_k=attn_metadata.prefill_metadata.query_start_loc,
+                    max_seqlen_q=attn_metadata.prefill_metadata.max_query_len,
+                    max_seqlen_k=attn_metadata.prefill_metadata.max_seq_len,
+                    softmax_scale=self.scale, causal=True,
+                    sliding_window=sliding_window, out=_pf_out,
+                    dropout_p=0.0,
+                )
+            else:
+                aiter.flash_attn_varlen_func(
+                    q=prefill_query,
+                    k=prefill_key,
+                    v=prefill_value,
+                    cu_seqlens_q=attn_metadata.prefill_metadata.query_start_loc,
+                    cu_seqlens_k=attn_metadata.prefill_metadata.query_start_loc,
+                    max_seqlen_q=attn_metadata.prefill_metadata.max_query_len,
+                    max_seqlen_k=attn_metadata.prefill_metadata.max_seq_len,
+                    min_seqlen_q=1,
+                    dropout_p=attn_metadata.dropout_p,
+                    softmax_scale=self.scale,
+                    causal=True,
+                    window_size=sliding_window,
+                    alibi_slopes=None,
+                    sink_ptr=self.sinks,
+                    out=_pf_out,
+                )
 
         # calculate for extends
         if num_extends > 0:
