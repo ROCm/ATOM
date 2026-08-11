@@ -460,6 +460,7 @@ jobs:
 
           rank="${SLURM_PROCID:-${SPUR_TASK_OFFSET:-0}}"
           job_id="${SLURM_JOB_ID:-${SPUR_JOB_ID:-local}}"
+          metadata_port=$((20000 + GITHUB_RUN_ID % 10000))
           container="atomesh-rdma-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${job_id}-${rank}-$$"
           rank_host="$(hostname)"
           cleanup() {
@@ -512,6 +513,7 @@ jobs:
             -e MC_GID_INDEX=1
             -e SMOKE_RANK="${rank}"
             -e SMOKE_NODE_COUNT="${RDMA_SMOKE_NODE_COUNT}"
+            -e SMOKE_METADATA_PORT="${metadata_port}"
             -e SMOKE_RUN_DIR=/rdma-smoke-shared
             -v "${RDMA_SMOKE_RUN_DIR}:/rdma-smoke-shared"
           )
@@ -597,9 +599,11 @@ jobs:
           echo "NIC priority matrix:"
           cat /tmp/rdma-smoke-nic-priority.json
 
-          etcd --listen-client-urls http://0.0.0.0:2379 \
-            --advertise-client-urls http://127.0.0.1:2379 \
-            >/tmp/rdma-smoke-etcd.log 2>&1 &
+          metadata_port="${SMOKE_METADATA_PORT}"
+          etcd_log=/tmp/rdma-smoke-etcd.log
+          etcd --listen-client-urls "http://0.0.0.0:${metadata_port}" \
+            --advertise-client-urls "http://127.0.0.1:${metadata_port}" \
+            >"${etcd_log}" 2>&1 &
           etcd_pid=$!
           target_pid=""
           cleanup_processes() {
@@ -610,7 +614,12 @@ jobs:
           }
           trap cleanup_processes EXIT HUP INT TERM
           sleep 3
-          kill -0 "${etcd_pid}"
+          if ! kill -0 "${etcd_pid}" 2>/dev/null; then
+            echo "ERROR: etcd failed to start on port ${metadata_port}" >&2
+            cat "${etcd_log}" >&2 || true
+            wait "${etcd_pid}" 2>/dev/null || true
+            exit 1
+          fi
 
           for ((gpu_id = 0; gpu_id < gpu_count; gpu_id++)); do
             target_port=$((14400 + gpu_id * 2))
@@ -625,7 +634,7 @@ jobs:
             "${validator_bin}" \
               --mode=target \
               --protocol=rdma \
-              --metadata_server=127.0.0.1:2379 \
+              --metadata_server="127.0.0.1:${metadata_port}" \
               --local_server_name="${target_name}" \
               --device_name="${rdma_device_csv}" \
               --nic_priority_matrix=/tmp/rdma-smoke-nic-priority.json \
@@ -646,7 +655,7 @@ jobs:
             timeout 120 "${validator_bin}" \
               --mode=initiator \
               --protocol=rdma \
-              --metadata_server=127.0.0.1:2379 \
+              --metadata_server="127.0.0.1:${metadata_port}" \
               --local_server_name="127.0.0.3:${initiator_port}" \
               --segment_id="${target_name}" \
               --device_name="${rdma_device_csv}" \
@@ -753,7 +762,7 @@ jobs:
                 "${validator_bin}" \
                   --mode=target \
                   --protocol=rdma \
-                  --metadata_server="${local_ip}:2379" \
+                  --metadata_server="${local_ip}:${metadata_port}" \
                   --local_server_name="${target_name}" \
                   --device_name="${rdma_device_csv}" \
                   --nic_priority_matrix=/tmp/rdma-smoke-nic-priority.json \
@@ -793,7 +802,7 @@ jobs:
                 timeout 120 "${validator_bin}" \
                   --mode=initiator \
                   --protocol=rdma \
-                  --metadata_server="${target_node_ip}:2379" \
+                  --metadata_server="${target_node_ip}:${metadata_port}" \
                   --local_server_name="${local_ip}:${initiator_port}" \
                   --segment_id="${target_name}" \
                   --device_name="${rdma_device_csv}" \
