@@ -59,20 +59,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_TRITON_MLA_SHUFFLE_KV": lambda: (
         os.getenv("ATOM_USE_TRITON_MLA_SHUFFLE_KV", "0") == "1"
     ),
+    # Run the routed experts with the aiter Triton/gluon MoE kernels instead of
+    # FlyDSL fused_moe, on prefill and decode alike. For SiLU models on gfx1250
+    # this selects the a8w4 GUGU (gate/up-interleaved) kernel -- the default --
+    # which fuses SiLU into GEMM1's write-back and the MXFP8 requant into its
+    # epilogue. SwiGLU models (GPT-OSS) and CDNA archs keep the general
+    # moe_gemm_a16w4 / a4w4 / a8w4 path. Defaults to on for gfx94x, and for
+    # gfx95x when ATOM_USE_TRITON_GEMM is set.
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
-    "ATOM_USE_TRITON_MOE_DECODE": lambda: os.getenv("ATOM_USE_TRITON_MOE_DECODE", "0")
-    == "1",
-    # Run the routed experts with the aiter Triton a8w4 kernel *inside* the EP
-    # modular kernel, i.e. between the mori dispatch and combine. Unlike
-    # ATOM_USE_TRITON_MOE_DECODE (GGUU, gate/up separated) this path is GUGU, so
-    # it requires ATOM_MOE_GU_ITLV=1; it is ignored when the layer is not
-    # gate/up-interleaved, and forced off when EPLB is enabled.
+    # Run the routed experts with the same Triton a8w4 GUGU kernel *inside* the
+    # EP modular kernel, i.e. between the mori dispatch and combine. Only the
+    # routing front end differs from the TP path (routing_from_dispatched after
+    # the all-to-all, rather than routing() from the raw logits). Forced off when
+    # EPLB is enabled.
     "ATOM_USE_TRITON_MOE_EP": lambda: os.getenv("ATOM_USE_TRITON_MOE_EP", "0") == "1",
-    # Select the a4w4 Triton EP wrapper instead of a8w4. Only chooses *which*
-    # wrapper runs -- it cannot enable the Triton EP path on its own, and
-    # asserts if set without ATOM_USE_TRITON_MOE_EP.
-    "ATOM_USE_TRITON_MOE_EP_A4W4": lambda: (
-        os.getenv("ATOM_USE_TRITON_MOE_EP_A4W4", "0") == "1"
+    # Select the a4w4 Triton wrapper instead of the a8w4 default, on both the TP
+    # and EP paths. Only chooses *which* wrapper runs -- it cannot enable the
+    # Triton path on its own, and asserts if set without one of the two flags
+    # above. The weights are identical (both are w4); only the activation quant
+    # differs, so no extra weight prep or memory is involved.
+    "ATOM_USE_TRITON_MOE_A4W4": lambda: (
+        os.getenv("ATOM_USE_TRITON_MOE_A4W4", "0") == "1"
     ),
     # Trim the dispatched-token buffer to the actual valid token count on
     # prefill steps. Decode already trims to graph_bs; prefill otherwise keeps

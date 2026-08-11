@@ -464,18 +464,15 @@ class FusedMoEModularKernel(torch.nn.Module):
         # was decode-only; that is fixed in the aiter gluon kernel, which now
         # loads the x mx-scales via async_copy when X_SCALE_TDM is off.
         if triton_experts is not None:
+            # Same entry point the TP path uses; the flag selects the fused
+            # SiLU a8w4/a4w4 experts (a8w4 by default, a4w4 under
+            # ATOM_USE_TRITON_MOE_A4W4 -- same weights either way, only the
+            # activation quant differs). `gate_valid` is the one genuinely
+            # EP-specific argument: routing() never produces dead gates, but
+            # routing_from_dispatched does.
             from atom.model_ops.fused_moe_triton import (
                 routing_from_dispatched,
-                triton_kernel_fused_experts_a4w4_silu_gugu,
-                triton_kernel_fused_experts_a8w4_silu_gugu,
-            )
-
-            # a4w4 takes the same signature and the same weights (both are w4);
-            # only the activation quant differs, so the switch is just this.
-            fused_experts_fn = (
-                triton_kernel_fused_experts_a4w4_silu_gugu
-                if envs.ATOM_USE_TRITON_MOE_EP_A4W4
-                else triton_kernel_fused_experts_a8w4_silu_gugu
+                triton_kernel_fused_experts,
             )
 
             # --- Direction-3: shrink the ROUTED work, not the mori buffer -----
@@ -529,13 +526,16 @@ class FusedMoEModularKernel(torch.nn.Module):
             # gate_scal carries the dispatched router weights, and
             # apply_router_weight_on_input is False (mori asserts it), so GEMM2
             # applies them -- same split as flydsl's doweight_stage1=False.
-            fused_out = fused_experts_fn(
+            fused_out = triton_kernel_fused_experts(
+                None,  # output_tensor: unused, the GUGU path allocates its own
                 a1_eff,
                 triton_experts["w13_weight"],
                 triton_experts["w2_weight"],
                 routing_data,
                 gather_idx,
                 scatter_idx,
+                topk=routing_data.n_expts_act,
+                use_triton_gfx1250_silu=True,
                 w13_scale=triton_experts["w13_scale"],
                 w2_scale=triton_experts["w2_scale"],
                 w13_swizzle_layout=triton_experts["w13_swizzle_layout"],

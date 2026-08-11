@@ -32,7 +32,6 @@ from atom.utils import envs
 if (
     envs.ATOM_USE_TRITON_GEMM
     or envs.ATOM_USE_TRITON_MOE
-    or envs.ATOM_USE_TRITON_MOE_DECODE
     # The EP path reaches these same helpers from inside the modular kernel, so
     # it must pull the imports in too -- otherwise they are NameErrors at call
     # time when only the EP flag is set.
@@ -749,7 +748,7 @@ def _gluon_fused_quant_supported(m, n, k, routing_data) -> bool:
     return not get_kernel_config_gluon(m, n, k, routing_data)["use_persistent"]
 
 
-def triton_kernel_fused_experts_a8w4_silu_gugu(
+def _fused_experts_silu_gugu(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
@@ -767,27 +766,33 @@ def triton_kernel_fused_experts_a8w4_silu_gugu(
     swiglu_limit: float = 10.0,
     apply_router_weight_on_input: bool = False,
     gate_valid: torch.Tensor | None = None,
-    # None = pick by arch (preshuffled only on gfx1250, where the gluon kernel
-    # supports it). Overridable so the two weight layouts can be A/B'd from one
-    # process: preshuffle is a pure layout change, so the same source weights
-    # through either path must agree numerically, which is what validates
-    # process_weights_after_loading's is_gfx1250 branch without needing a
-    # reference implementation.
     preshuffled: bool | None = None,
+    act_quant: MoEActivationQuant = MoEActivationQuant.BF16,
 ) -> torch.Tensor:
-    """A8W4 MoE for SiLU models, GUGU (interleaved ``[gate, up]``).
-    Interleaved is the a8w4 kernel's native layout: ``_swiglu`` splits
+    """Fused-SiLU MoE experts over GUGU (interleaved ``[gate, up]``) weights.
+
+    Interleaved is the w4 kernels' native layout: ``_swiglu`` splits
     ``reshape(M, N // 2, 2)`` on the trailing axis, i.e. adjacent gate/up pairs,
     so a BLOCK_N tile carries both halves and the activation fuses into GEMM1's
-    write-back. ``out_mx_quant=True`` folds the MXFP8 requant in with it, so the
-    whole layer is two launches:
+    write-back. On a8w4 ``out_mx_quant=True`` folds the MXFP8 requant in with it,
+    so the whole layer is two launches:
+
         MXFP8 quant -> GEMM1(a8w4, fused SiLU + MX requant) -> GEMM2(a8w4)
-    versus four on the GGUU path (GEMM1 -> fused_clamp_act_mul ->
+
+    against four on the GGUU path (GEMM1 -> fused_clamp_act_mul ->
     downcast_to_mxfp -> GEMM2), which needs the separate steps precisely because
     a tile there spans only gate *or* only up.
-    ``alpha=1.0`` with ``swiglu_add_residual=False`` is plain SiLU (``s * linear``).
-    GPT-OSS uses ``swiglu_add_residual=True`` for its ``s * (linear + 1)`` variant,
-    which would be wrong for DeepSeek-V4.
+
+    ``alpha=1.0`` with ``swiglu_add_residual=False`` is plain SiLU
+    (``s * linear``); GPT-OSS's ``s * (linear + 1)`` variant is NOT served here.
+
+    a8w4 is the default. a4w4 -- selected by ``ATOM_USE_TRITON_MOE_A4W4`` or an
+    MXFP4-activation checkpoint -- takes the SAME weights (both are w4), so it
+    needs no extra weight prep or memory; it just costs one launch more, since
+    ``moe_gemm_a4w4`` has no ``out_mx_quant`` and must re-quantise the
+    intermediate separately. Measured on gfx950 that was 1.22-1.28x overall (see
+    _test/ep_moe_bench_report.md): the a4w4 GEMMs are genuinely faster (halved
+    weight traffic) but the doubled quant costs more than the GEMM saving.
     """
     assert hidden_states.ndim == 2
     assert hidden_states.dtype == torch.bfloat16
@@ -799,6 +804,54 @@ def triton_kernel_fused_experts_a8w4_silu_gugu(
     _preshuffled = (
         (get_arch() == "gfx1250") if preshuffled is None else bool(preshuffled)
     )
+
+    if envs.ATOM_USE_TRITON_MOE_A4W4 or act_quant == MoEActivationQuant.FP4:
+        # ``moe_gemm_a4w4`` has no ``preshuffled`` parameter, so it can only
+        # consume the plain (E, K, N) weight -- i.e. a4w4 is a CDNA-only variant.
+        # Handed a gfx1250 WMMA-preshuffled weight it reads N as N // 16 and
+        # dies inside mxfp4_quant on a block-size assert with no hint as to why,
+        # so say it here instead.
+        assert not _preshuffled, (
+            "ATOM_USE_TRITON_MOE_A4W4 needs the plain (E, K, N) weight layout, "
+            "but this layer was prepared WMMA-preshuffled (gfx1250). "
+            "moe_gemm_a4w4 has no preshuffled variant -- a4w4 is CDNA-only."
+        )
+        x_fp4, x_scale = mxfp4_quant(hidden_states)
+        interm = moe_gemm_a4w4(
+            x_fp4,
+            w1,
+            x_scale,
+            w13_scale,
+            a13_scale,
+            None,
+            w1_bias,
+            routing_data,
+            gather_indx=gather_indx,
+            gammas=gammas if apply_router_weight_on_input else None,
+            swizzle_mx_scale=w13_swizzle_layout,
+            apply_swiglu=True,
+            alpha=1.0,
+            limit=swiglu_limit,
+            swiglu_add_residual=False,
+        )
+        # The launch a8w4 avoids via out_mx_quant=True.
+        interm_fp4, interm_scale = mxfp4_quant(interm)
+        return moe_gemm_a4w4(
+            interm_fp4,
+            w2,
+            interm_scale,
+            w2_scale,
+            a2_scale,
+            None,
+            w2_bias,
+            routing_data,
+            scatter_indx=scatter_indx,
+            gammas=None if apply_router_weight_on_input else gammas,
+            swizzle_mx_scale=w2_swizzle_layout,
+            # Only GEMM2 feeds reduce_grouped, so the mask belongs here. GEMM1's
+            # dead slots are already skipped by the sentinel histogram.
+            gate_valid=gate_valid,
+        )
 
     x_fp8, x_scale = downcast_to_mxfp(hidden_states, torch.float8_e4m3fn, axis=-1)
 
@@ -871,81 +924,6 @@ def triton_kernel_fused_experts_a8w4_silu_gugu(
     )
 
 
-def triton_kernel_fused_experts_a4w4_silu_gugu(
-    hidden_states: torch.Tensor,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    routing_data,
-    gather_indx,
-    scatter_indx,
-    w13_scale: torch.Tensor,
-    w2_scale: torch.Tensor,
-    w13_swizzle_layout,
-    w2_swizzle_layout,
-    a13_scale: torch.Tensor | None = None,
-    a2_scale: torch.Tensor | None = None,
-    w1_bias: torch.Tensor | None = None,
-    w2_bias: torch.Tensor | None = None,
-    swiglu_limit: float = 10.0,
-    apply_router_weight_on_input: bool = False,
-    gate_valid: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """A4W4 MoE for SiLU models, GUGU -- same signature as the a8w4 twin.
-    Identical to ``triton_kernel_fused_experts_a8w4_silu_gugu`` except that the
-    activations are MXFP4 rather than MXFP8. The WEIGHTS are unchanged: both are
-    w4, so the same ``process_weights_after_loading`` output feeds either path
-    and no extra weight prep or memory is needed.
-    Costs one launch more than a8w4. ``moe_gemm_a4w4`` has no ``out_mx_quant``,
-    so the intermediate must be re-quantised by a separate ``mxfp4_quant``
-    instead of being folded into GEMM1's write-back:
-        mxfp4_quant -> GEMM1(a4w4, fused SiLU) -> mxfp4_quant -> GEMM2(a4w4)
-    versus a8w4's two launches. Measured on gfx950 that costs 1.22-1.28x overall
-    (see _test/ep_moe_bench_report.md): the a4w4 GEMMs are genuinely faster
-    (2771 vs 3154 us at conc256 prefill, the halved weight traffic paying off)
-    but the doubled quant is far more expensive than the GEMM saving. Kept behind
-    ATOM_USE_TRITON_MOE_EP_A4W4 so it is measurable on gfx1250, where the
-    trade-off may differ.
-    ``moe_gemm_a4w4`` has no ``preshuffled`` parameter, so unlike a8w4 there is no
-    gfx1250 pre-shuffled weight variant to select here.
-    """
-    gammas = routing_data.gate_scal if routing_data else None
-
-    x_fp4, x_scale = mxfp4_quant(hidden_states)
-    interm = moe_gemm_a4w4(
-        x_fp4,
-        w1,
-        x_scale,
-        w13_scale,
-        a13_scale,
-        None,
-        w1_bias,
-        routing_data,
-        gather_indx=gather_indx,
-        gammas=gammas if apply_router_weight_on_input else None,
-        swizzle_mx_scale=w13_swizzle_layout,
-        apply_swiglu=True,
-        alpha=1.0,
-        limit=swiglu_limit,
-        swiglu_add_residual=False,
-    )
-    # The launch a8w4 avoids via out_mx_quant=True.
-    interm_fp4, interm_scale = mxfp4_quant(interm)
-    return moe_gemm_a4w4(
-        interm_fp4,
-        w2,
-        interm_scale,
-        w2_scale,
-        a2_scale,
-        None,
-        w2_bias,
-        routing_data,
-        scatter_indx=scatter_indx,
-        gammas=None if apply_router_weight_on_input else gammas,
-        swizzle_mx_scale=w2_swizzle_layout,
-        # Only GEMM2 feeds reduce_grouped, so the mask belongs here. GEMM1's
-        # dead slots are already skipped by the sentinel histogram.
-        gate_valid=gate_valid,
-    )
 
 
 def triton_kernel_moe_forward(
@@ -1028,6 +1006,25 @@ def triton_kernel_fused_experts(
     expert_map: torch.Tensor | None = None,
     intermediate_cache: torch.Tensor | None = None,
     act_quant: MoEActivationQuant = MoEActivationQuant.BF16,
+    # Select the fused-SiLU a8w4/a4w4 experts over GUGU (interleaved
+    # [g0,u0,g1,u1,...]) w13, instead of the general path's GGUU ([gate|up]).
+    # The caller is the authority: the layout was decided by
+    # process_weights_after_loading, and nothing in the tensors themselves
+    # distinguishes the two. Named for the TP condition that gates it in
+    # Mxfp4MoEMethod, which is the only caller that passes it conditionally --
+    # the EP callers pass True unconditionally and do run on CDNA, where
+    # `preshuffled` resolves to False.
+    use_triton_gfx1250_silu: bool = False,
+    # EP only: dead-gate mask for rows the all-to-all did not route here.
+    # routing() never produces dead gates, so the TP callers leave it None.
+    gate_valid: torch.Tensor | None = None,
+    # GUGU only. None = pick by arch (pre-shuffled only on gfx1250, where the
+    # gluon kernel supports it). Overridable so the two weight layouts can be
+    # A/B'd from one process: pre-shuffle is a pure layout change, so the same
+    # source weights through either path must agree numerically, which validates
+    # process_weights_after_loading's is_gfx1250 branch without needing a
+    # reference implementation.
+    preshuffled: bool | None = None,
 ) -> torch.Tensor:
     # type check, uint8 means mxfp4
     assert hidden_states.dtype == torch.bfloat16
@@ -1037,6 +1034,40 @@ def triton_kernel_fused_experts(
     # Shape check
     # Changes to weight handling before this function, therefore shape check change
     assert hidden_states.ndim == 2
+
+    if use_triton_gfx1250_silu:
+        # Sits ABOVE the shared preamble rather than inside the SiLU branch
+        # below, because that preamble reads N out of `w1.shape[-1]` and sizes an
+        # intermediate cache from it. Under GUGU the weight is the pre-shuffled
+        # (E, K*16, N//16) view, so N would come out 16x too small -- and the
+        # fused path allocates no intermediate cache and writes no caller-owned
+        # output buffer anyway, so none of that setup applies.
+        assert activation != ActivationType.Swiglu, (
+            "GUGU fused experts implement plain SiLU (alpha=1, no residual). "
+            "GPT-OSS-style SwiGLU needs alpha=1.702 / swiglu_add_residual=True "
+            "and static per-tensor FP8 activations -- use the GGUU path."
+        )
+        return _fused_experts_silu_gugu(
+            hidden_states,
+            w1,
+            w2,
+            routing_data,
+            gather_indx,
+            scatter_indx,
+            w13_scale=w13_scale,
+            w2_scale=w2_scale,
+            w13_swizzle_layout=w13_swizzle_layout,
+            w2_swizzle_layout=w2_swizzle_layout,
+            a13_scale=a13_scale,
+            a2_scale=a2_scale,
+            w1_bias=w1_bias,
+            w2_bias=w2_bias,
+            swiglu_limit=swiglu_limit,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            gate_valid=gate_valid,
+            preshuffled=preshuffled,
+            act_quant=act_quant,
+        )
 
     # aiter kernels expect 2d inputs/outputs
     M, K = hidden_states.shape[-2:]
@@ -1219,87 +1250,4 @@ def triton_kernel_fused_experts(
         return output_tensor
 
     output_tensor = output_tensor.view(M, K)
-    return output_tensor
-
-
-def triton_kernel_fused_experts_a8w4_silu_gguu(
-    hidden_states: torch.Tensor,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    routing_data,
-    gather_indx,
-    scatter_indx,
-    w13_scale: torch.Tensor,
-    w2_scale: torch.Tensor,
-    w13_swizzle_layout,
-    w2_swizzle_layout,
-    a13_scale: torch.Tensor | None = None,
-    a2_scale: torch.Tensor | None = None,
-    w1_bias: torch.Tensor | None = None,
-    w2_bias: torch.Tensor | None = None,
-    swiglu_limit: float = 10.0,
-    apply_router_weight_on_input: bool = False,
-) -> torch.Tensor:
-    """Decode-only A8W4 MoE for SiLU models, GGUU (separated ``[gate|up]``).
-
-    GGUU keeps gate and up as contiguous halves, so the per-block SiLU cannot be
-    fused into GEMM1's write-back (a tile spans only gate *or* only up). The
-    activation and quant therefore run as a separate step:
-
-        MXFP8 quant -> GEMM1(a8w4, no swiglu, bf16 [gate|up]) ->
-        fused_clamp_act_mul(SiLU(gate)*up on the halves) ->
-        MXFP8 quant -> GEMM2(a8w4).
-
-    The intermediate is re-quantized with ``downcast_to_mxfp`` (same op as the x
-    path) so GEMM2 sees the identical activation-scale format. Weights are in the
-    preshuffled a8w4 layout with w13 gate/up separated.
-    """
-    assert hidden_states.ndim == 2
-    assert hidden_states.dtype == torch.bfloat16
-
-    gammas = routing_data.gate_scal if routing_data else None
-
-    x_fp8, x_scale = downcast_to_mxfp(hidden_states, torch.float8_e4m3fn, axis=-1)
-
-    # GEMM1: raw bf16 [gate|up] output; no fused activation for the separated layout.
-    interm = moe_gemm_a8w4(
-        x_fp8,
-        w1,
-        x_scale,
-        w13_scale,
-        a13_scale,
-        None,
-        w1_bias,
-        routing_data,
-        gather_indx=gather_indx,
-        gammas=gammas if apply_router_weight_on_input else None,
-        swizzle_mx_scale=w13_swizzle_layout,
-        apply_swiglu=False,
-        out_dtype=torch.bfloat16,
-        preshuffled=True,
-    )
-
-    # Standalone SiLU(gate)*up over the contiguous halves, then MXFP8 quant.
-    interm_act = fused_clamp_act_mul(
-        interm, swiglu_limit=swiglu_limit, activation="silu"
-    )
-    interm_fp8, interm_scale = downcast_to_mxfp(
-        interm_act, torch.float8_e4m3fn, axis=-1
-    )
-
-    output_tensor = moe_gemm_a8w4(
-        interm_fp8,
-        w2,
-        interm_scale,
-        w2_scale,
-        a2_scale,
-        None,
-        w2_bias,
-        routing_data,
-        scatter_indx=scatter_indx,
-        gammas=None if apply_router_weight_on_input else gammas,
-        swizzle_mx_scale=w2_swizzle_layout,
-        preshuffled=True,
-    )
-
     return output_tensor
