@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # PD-disaggregation + pipeline-parallel unit tests (GPU-free).
 
+import os
 import sys
 import threading
 import types
@@ -176,6 +177,15 @@ def test_mooncake_tcp_disables_rdma_device_even_when_configured():
     )
     assert mc._select_ib_device("tcp", "rdma0", None) == ""
     assert mc._select_ib_device(" TCP ", "ionic_0", None) == ""
+
+
+def test_mooncake_tcp_forces_transfer_engine_transport(monkeypatch):
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    monkeypatch.delenv("MC_FORCE_TCP", raising=False)
+    mc._configure_mooncake_transport(" TCP ")
+    assert os.environ["MC_FORCE_TCP"] == "true"
 
 
 def test_mooncake_rdma_preserves_explicit_device():

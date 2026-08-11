@@ -132,6 +132,17 @@ def _select_ib_device(
     return _auto_select_ib_device(phys_idx)
 
 
+def _configure_mooncake_transport(protocol: str) -> None:
+    """Make Mooncake honor ATOM's explicit transport selection.
+
+    Legacy TransferEngine builds auto-discover installed HCAs independently
+    of the device filter. ``MC_FORCE_TCP`` is Mooncake's supported override
+    for preventing that implicit RDMA transport from being installed.
+    """
+    if protocol.strip().lower() == "tcp":
+        os.environ["MC_FORCE_TCP"] = "true"
+
+
 # ZMQ side-channel message types
 MSG_WRITE_REQUEST = b"write_request"
 MSG_WRITE_DONE = b"write_done"
@@ -492,6 +503,7 @@ class MooncakeConnector(KVConnectorBase):
         # Registering GPU memory with a non-local RDMA NIC fails with
         # EINVAL.  Pass the device name as a filter so Mooncake only
         # creates a context for the local NIC.
+        _configure_mooncake_transport(self.protocol)
         configured_ib_device = kv_transfer_config.get(
             "ib_device", ""
         ) or os.environ.get("ATOM_MOONCAKE_IB_DEVICE", "")
