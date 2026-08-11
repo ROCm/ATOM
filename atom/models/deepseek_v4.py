@@ -1783,7 +1783,7 @@ class Indexer(nn.Module):
         top_k_per_row_decode(
             logits,
             1,
-            attn_md.n_committed_csa_per_token[:total_tokens],
+            attn_md.csa_topk_row_ends[:total_tokens],
             topk_local,
             total_tokens,
             logits.stride(0),
@@ -2020,7 +2020,7 @@ class Indexer(nn.Module):
         top_k_per_row_decode(
             logits,
             1,
-            attn_md.n_committed_csa_per_token[:total_tokens],
+            attn_md.csa_topk_row_ends[:total_tokens],
             topk_local,
             total_tokens,
             logits.stride(0),
@@ -2229,7 +2229,7 @@ class Indexer(nn.Module):
         top_k_per_row_decode(
             logits,
             1,
-            attn_md.n_committed_csa_per_token_rect[:R],
+            attn_md.csa_topk_row_ends[:R],
             topk_rect[:R],
             R,
             logits.stride(0),

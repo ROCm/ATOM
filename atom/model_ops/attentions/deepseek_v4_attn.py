@@ -135,7 +135,7 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     n_committed_csa_per_seq: torch.Tensor | None = None
     """[bs] int32 GPU — RAW `ctx_len // 4` per-seq committed count. Consumed
     by the indexer and csa_translate_pack. Decode additionally stages
-    `n_committed_csa_per_token`, because the generic aiter top-k needs the exact
+    `csa_topk_row_ends`, because the generic aiter top-k needs the exact
     ratio-4 per-token bound rather than only this per-sequence count."""
 
     # DSpark RAGGED (paper §5.2): per-request ragged verify lengths [bs] int32
@@ -176,13 +176,10 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     """[csa_indptr[T]] int32 GPU — packed paged offsets for CSA layers
     (CSA topk compress at slice head + SWA window prefix at tail; topk section
     filled per-layer by csa_translate_pack)."""
-    n_committed_csa_per_token: torch.Tensor | None = None
-    """[padded_T] int32 GPU — exact per-token committed CSA rows:
-    `min((position+1)//4, n_committed_csa_per_seq[bid], index_topk)`.
-    Passed as `seqLens` to decode top-k with `next_n=1`."""
-    n_committed_csa_per_token_rect: torch.Tensor | None = None
-    """[bs*dspark_full_q] int32 GPU — the same counts scattered into the
-    right-aligned rectangle consumed by FP8 DSpark ragged decode."""
+    csa_topk_row_ends: torch.Tensor | None = None
+    """int32 GPU — exact CSA row end for each row consumed by decode top-k.
+    Flat for rectangular decode and FP4 ragged; right-aligned `[bs*full_q]`
+    for FP8 ragged. Passed as `seqLens` with `next_n=1`."""
     kv_indices_hca: torch.Tensor | None = None
     """[hca_indptr[T]] int32 GPU — packed paged offsets for HCA layers
     (HCA compress at slice head + SWA window prefix at tail; layer-invariant)."""
@@ -1245,9 +1242,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         _ls = self._v4_fp4_ragged_local_starts[:_padded]
         _le = self._v4_fp4_ragged_local_ends[:_padded]
         compute_varqlen_windows(cu_seq_q, _ncmt, _padded, out=(_rtb, _ls, _le))
-        per_token = attn_metadata.n_committed_csa_per_token
-        if per_token is not None:
-            _le.copy_(per_token[:_padded])
+        row_ends = attn_metadata.csa_topk_row_ends
+        if row_ends is not None:
+            _le.copy_(row_ends[:_padded])
         # Fixed logits width (max_model_len_idx) → the scorer's [padded, W] buffer
         # is a static shape (CG-capturable), same as the rectangular decode path.
         compute_prefill_schedule(
@@ -2818,24 +2815,21 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         csa_indptr_np[1 : T + 1] = np.cumsum(csa_per_tok, dtype=np.int32)
         if T_pad > T:
             csa_indptr_np[T + 1 :].fill(int(csa_indptr_np[T]))
-        n_committed_csa_per_token_np = np.zeros(T_pad, dtype=np.int32)
-        n_committed_csa_per_token_np[:T] = csa_valid_k_per_token
-        n_committed_csa_per_token_rect_np = None
+        csa_topk_row_ends_np = np.zeros(T_pad, dtype=np.int32)
+        csa_topk_row_ends_np[:T] = csa_valid_k_per_token
         full_q = int(getattr(attn_metadata, "dspark_full_q", 0))
         if full_q > 0 and not self._indexer_fp4:
             ragged_lens_np = np.asarray(
                 token_num_per_seq[:scheduled_bs], dtype=np.int32
             )
-            n_committed_csa_per_token_rect_np = np.zeros(
-                scheduled_bs * full_q, dtype=np.int32
-            )
+            csa_topk_row_ends_np = np.zeros(scheduled_bs * full_q, dtype=np.int32)
             cu = np.zeros(scheduled_bs + 1, dtype=np.int32)
             np.cumsum(ragged_lens_np, out=cu[1:], dtype=np.int32)
             token_ids = np.arange(T, dtype=np.int32)
             bids = batch_id_per_token_np[:T]
             in_seq = token_ids - cu[bids]
             rect_dst = bids * full_q + (full_q - ragged_lens_np[bids]) + in_seq
-            n_committed_csa_per_token_rect_np[rect_dst] = csa_valid_k_per_token
+            csa_topk_row_ends_np[rect_dst] = csa_valid_k_per_token
         # HCA: ragged, per-token len = actual_swa_count + n_committed_hca
         hca_per_tok = actual_swa_count_np + n_committed_hca_per_token
         hca_indptr_np = np.zeros(T_pad + 1, dtype=np.int32)
@@ -2849,17 +2843,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         csa_indptr_gpu = self._stage(
             f"{buf_prefix_ubatch}v4_kv_indptr_csa", csa_indptr_np
         )
-        n_committed_csa_per_token_gpu = self._stage(
-            f"{buf_prefix_ubatch}v4_n_committed_csa_per_token",
-            n_committed_csa_per_token_np,
-        )
-        n_committed_csa_per_token_rect_gpu = (
-            self._stage(
-                f"{buf_prefix_ubatch}v4_n_committed_csa_per_token_rect",
-                n_committed_csa_per_token_rect_np,
-            )
-            if n_committed_csa_per_token_rect_np is not None
-            else None
+        csa_topk_row_ends_gpu = self._stage(
+            f"{buf_prefix_ubatch}v4_csa_topk_row_ends",
+            csa_topk_row_ends_np,
         )
         hca_indptr_gpu = self._stage(
             f"{buf_prefix_ubatch}v4_kv_indptr_hca", hca_indptr_np
@@ -2954,10 +2940,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # warmup carve-out fires (incomplete state_slot_mapping_cpu).
         attn_metadata.kv_indices_swa = swa_indices_gpu[: int(swa_indptr_np[T])]
         attn_metadata.kv_indices_csa = csa_indices_gpu[: int(csa_indptr_np[T])]
-        attn_metadata.n_committed_csa_per_token = n_committed_csa_per_token_gpu
-        attn_metadata.n_committed_csa_per_token_rect = (
-            n_committed_csa_per_token_rect_gpu
-        )
+        attn_metadata.csa_topk_row_ends = csa_topk_row_ends_gpu
         attn_metadata.kv_indices_hca = hca_indices_gpu  # already exact len
         attn_metadata.kv_indptr_swa = swa_indptr_gpu
         attn_metadata.kv_indptr_csa = csa_indptr_gpu
@@ -3557,8 +3540,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         bufs["v4_kv_indptr_swa"] = CpuGpuBuffer(T_dec + 1, **i32)
         bufs["v4_kv_indptr_csa"] = CpuGpuBuffer(T_dec + 1, **i32)
         bufs["v4_kv_indptr_hca"] = CpuGpuBuffer(T_dec + 1, **i32)
-        bufs["v4_n_committed_csa_per_token"] = CpuGpuBuffer(T_dec, **i32)
-        bufs["v4_n_committed_csa_per_token_rect"] = CpuGpuBuffer(T_dec, **i32)
+        bufs["v4_csa_topk_row_ends"] = CpuGpuBuffer(T_dec, **i32)
 
         # Per-token paged-decode index tensors for the fp8 asm decode kernel
         # (`mla_decode_fwd_v4_nm`, page_size=1). Values are CONSTANT — they
@@ -3731,8 +3713,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             bufs[f"{p}v4_kv_indptr_swa"] = CpuGpuBuffer(T_dec + 1, **i32)
             bufs[f"{p}v4_kv_indptr_csa"] = CpuGpuBuffer(T_dec + 1, **i32)
             bufs[f"{p}v4_kv_indptr_hca"] = CpuGpuBuffer(T_dec + 1, **i32)
-            bufs[f"{p}v4_n_committed_csa_per_token"] = CpuGpuBuffer(T_dec, **i32)
-            bufs[f"{p}v4_n_committed_csa_per_token_rect"] = CpuGpuBuffer(T_dec, **i32)
+            bufs[f"{p}v4_csa_topk_row_ends"] = CpuGpuBuffer(T_dec, **i32)
             bufs[f"{p}v4_n_committed_csa_per_seq"] = CpuGpuBuffer(bs, **i32)
             bufs[f"{p}v4_batch_id_per_token"] = CpuGpuBuffer(mnbt, **i32)
             bufs[f"{p}v4_indexer_cu_committed"] = CpuGpuBuffer(bs + 1, **i32)
