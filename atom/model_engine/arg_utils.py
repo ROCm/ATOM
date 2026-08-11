@@ -43,6 +43,7 @@ class EngineArgs:
     data_parallel_size: int = 1
     enforce_eager: bool = False
     enable_prefix_caching: bool = True
+    ssm_state_cache_ratio: float = 0.3
     port: int = 8006
     kv_cache_dtype: str = "bf16"
     index_cache_dtype: Optional[str] = None
@@ -150,7 +151,21 @@ class EngineArgs:
             action=argparse.BooleanOptionalAction,
             default=True,
             help="Enable prefix caching (default: enabled). "
-            "Use --no-enable_prefix_caching to disable.",
+            "Use --no-enable_prefix_caching to disable. On a linear-attention "
+            "model this also enables the SSM state cache, which requires "
+            "--block-size to divide 64; with any other block size prefix hits "
+            "are declined and a warning is logged.",
+        )
+        parser.add_argument(
+            "--ssm_state_cache_ratio",
+            type=float,
+            default=0.3,
+            help="Fraction of the KV capacity remaining after the per-request "
+            "runtime state tensor to spend on recurrent-state checkpoints "
+            "(default: 0.3). Only used when the SSM state cache is on. Larger "
+            "values retain more checkpoints for cross-request reuse and leave "
+            "less for the paged KV pool; raise it if the state cache stats "
+            "line shows evictions close to writes.",
         )
         parser.add_argument(
             "--port",

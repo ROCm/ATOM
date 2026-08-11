@@ -8,6 +8,7 @@ import numpy as np
 import torch
 from aiter.dist.parallel_state import get_tp_group
 
+from atom.config import SSM_STATE_KERNEL_CHUNK
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_gdn import GatedDeltaNet
 from atom.utils import CpuGpuBuffer
@@ -65,6 +66,18 @@ class GDNAttentionMetadata:
     nums_dict: dict | None = None
     batch_ptr: torch.Tensor | None = None
     token_chunk_offset_ptr: torch.Tensor | None = None
+    # SSM state cache: interior checkpoint positions this step passes through,
+    # as device index tensors ``{"rows", "slots", "offs"}`` — one entry per
+    # (sequence, checkpoint). Offsets are relative to the start of the
+    # SEQUENCE. The GDN impl writes them from the chunk kernel's per-chunk
+    # states. None when the step has none, keeping the common path
+    # allocation-free.
+    ssm_checkpoints: dict | None = None
+    # First chunk index of each sequence within the chunk kernel's `h`, i.e.
+    # `prepare_chunk_offsets(cu_seqlens, 64)`. Needed to turn a
+    # sequence-relative token offset into an index into the batch-concatenated
+    # `h`. Only built when `ssm_checkpoints` is set.
+    ssm_chunk_offsets: torch.Tensor | None = None
 
 
 class GDNStateMixin:
@@ -135,6 +148,15 @@ class GDNStateMixin:
         self.non_spec_state_indices_tensor = CpuGpuBuffer(
             (self.max_bs,),
             dtype=torch.int32,
+            device=self.device,
+        )
+        # Per-prefill-seq flag: does this seq's per-req slot already hold its
+        # own recurrent state (i.e. an earlier chunk advanced it)? Drives
+        # `has_initial_state`. Persistent buffer so the per-step path stays a
+        # numpy fill + one copy_to_gpu, matching the state-indices tensors.
+        self.has_initial_state_buf = CpuGpuBuffer(
+            (self.max_bs,),
+            dtype=torch.bool,
             device=self.device,
         )
         self.spec_sequence_masks = torch.ones(
@@ -259,18 +281,261 @@ class GDNStateMixin:
 
         Names preserved for backward compat with `attention_gdn.py` which
         accesses them as `model_runner.mamba_{k,v}_cache`.
+
+        When the SSM state cache is on, the tensors are grown by
+        ``ssm_state_cache_slots`` extra slots appended AFTER the runtime slots.
+        One physical tensor, two logical regions: ``[0, num_slots)`` is the
+        live per-request state (indices handed out by BlockManager's slot
+        pool), ``[num_slots, ...)`` holds immutable checkpoints. Sharing the
+        tensor keeps checkpoint save/load a plain slice copy with no shape or
+        dtype conversion.
         """
         shape_k, shape_v = self._state_shape_for_runner()
         dt_k, dt_v = self._state_dtypes()
         n = self.model_runner.num_gdn_attn_state
+        cfg = self.model_runner.config
+        extra = 0
+        if getattr(cfg, "enable_ssm_state_cache", False):
+            extra = int(getattr(cfg, "ssm_state_cache_slots", 0) or 0)
+        total = num_slots + extra
+        self.state_cache_base = num_slots
+        self.state_cache_slots = extra
         return {
             "mamba_k_cache": torch.zeros(
-                (n, num_slots) + shape_k, dtype=dt_k, device="cuda"
+                (n, total) + shape_k, dtype=dt_k, device="cuda"
             ),
             "mamba_v_cache": torch.zeros(
-                (n, num_slots) + shape_v, dtype=dt_v, device="cuda"
+                (n, total) + shape_v, dtype=dt_v, device="cuda"
             ),
         }
+
+    def apply_state_cache_loads(self, batch: ScheduledBatch) -> None:
+        """Seed runtime slots from the checkpoints this batch hit.
+
+        Two strided copies per hit — `[:, slot]` spans every layer at once —
+        so ~20us to skip thousands of tokens of prefill. Not worth folding
+        into the kernels: that would need the conv kernel's 2-D `cache_indices`
+        form (a code path nothing in ATOM currently exercises) kept in lockstep
+        with the chunk kernel's `state_indices`, to save two copies that happen
+        once per request rather than per step.
+
+        Runs on the main stream: the next kernel reads these slots, so there is
+        nothing to overlap with and a side stream would only add a sync.
+        """
+        slots = getattr(batch, "state_load_slots", None)
+        base = getattr(self, "state_cache_base", None)
+        if slots is None or base is None or not len(slots):
+            return
+        runner = self.model_runner
+        groups = batch.per_req_cache_groups
+        spr = self.slots_per_req()
+        limit = getattr(self, "state_cache_slots", 0)
+        for i, src in enumerate(slots):
+            # `src >= limit` guards scheduler/runner slot-count divergence:
+            # this tensor is sized per rank, so a rank that sized it smaller
+            # than the scheduler's pool would read another request's state.
+            # Skipping degrades to "no hit", which is always safe.
+            if src < 0 or src >= limit or i >= len(groups):
+                continue
+            dst = groups[i] * spr
+            src = base + int(src)
+            runner.mamba_k_cache[:, dst].copy_(runner.mamba_k_cache[:, src])
+            runner.mamba_v_cache[:, dst].copy_(runner.mamba_v_cache[:, src])
+
+    def _checkpoint_targets(self, batch: ScheduledBatch) -> dict | None:
+        """Checkpoints this step reaches, as device index tensors.
+
+        Every reserved position this step covers, `cached < p <= cached +
+        scheduled`, is a target — INCLUDING one at the step's end. That end
+        case needs its own copy like any other: the chunk kernel leaves the
+        final state in the sequence's RUNTIME slot, which is not the
+        checkpoint slot. Assuming otherwise left the checkpoint unwritten
+        while `commit_save` published it anyway, so a later request could
+        resume from whatever the slot's previous tenant left behind.
+
+        `is_end` marks those targets, because their source differs: the state
+        at the end of a sequence's tokens is not in `h` (which holds chunk
+        boundaries strictly before the end — index `chunk_offsets[row] + T //
+        64` is the NEXT sequence's first chunk). It exists only in the runtime
+        slot, so the kernel reads `runtime_slots[i]` instead.
+
+        Built once per step, not per layer: all 48 GDN layers copy the same
+        targets, so the H2D transfer is hoisted here and each layer just
+        launches one kernel over it.
+
+        Offsets are relative to the start of the sequence's slice OF THIS
+        STEP. `h` and the conv input only ever hold this step's tokens, and
+        `cu_seqlens` / `chunk_offsets` locate each sequence within them — so
+        the kernel reconstructs an absolute index as `cu_seqlens[row] + off`
+        (conv) or `chunk_offsets[row] + off // 64` (SSM). Both bases are
+        per-sequence: omitting them is what made an earlier Python-loop
+        version silently capture one sequence's state into another's
+        checkpoint whenever a batch held two prefills.
+
+        A target is dropped when this step holds too few tokens before it to
+        fill the conv window, because both halves of a checkpoint must land
+        together — an SSM state at P paired with a conv window from elsewhere
+        is silently wrong, and worse than no checkpoint. Likewise `dst >=
+        limit`, which would mean the scheduler's pool outgrew this rank's
+        tensor; skipping degrades to "no checkpoint", always safe.
+        """
+        all_saves = getattr(batch, "state_save_all", None)
+        base = getattr(self, "state_cache_base", None)
+        if not all_saves or base is None:
+            return None
+        limit = getattr(self, "state_cache_slots", 0)
+        # Tokens of conv history a checkpoint needs behind it: the conv state
+        # width. From the config, so it tracks the model rather than assuming.
+        state_len = self.model_runner.config.hf_config.linear_conv_kernel_dim - 1
+        cached = batch.num_cached_tokens
+        sched = batch.num_scheduled_tokens
+        groups = batch.per_req_cache_groups
+        spr = self.slots_per_req()
+
+        found = []
+        # A seq may hold several reservations (fork + prompt-end); take every
+        # one this step reaches.
+        for i, reservations in enumerate(all_saves):
+            if i >= len(groups):
+                continue
+            start = int(cached[i])
+            end = start + int(sched[i])
+            for dst, p in reservations:
+                dst, p = int(dst), int(p)
+                if not 0 <= dst < limit:
+                    continue
+                if not (start + state_len <= p <= end):
+                    continue
+                found.append((i, base + dst, p - start, int(p == end), groups[i] * spr))
+        if not found:
+            return None
+
+        def mk(col):
+            return torch.tensor(col, dtype=torch.int32, device=self.device)
+
+        rows, slots, offs, is_end, runtime = zip(*found)
+        return {
+            "rows": mk(rows),
+            "slots": mk(slots),
+            "offs": mk(offs),
+            "is_end": mk(is_end),
+            "runtime": mk(runtime),
+        }
+
+    def compute_block_bytes(self) -> int:
+        """GDN hybrid: only full-attention layer slots contribute paged KV
+        bytes (linear-attention layers' state lives in the per-request
+        cache pool, accounted separately via compute_per_req_cache_bytes).
+        """
+        from aiter import dtypes
+
+        runner = self.model_runner
+        config = runner.config
+        hf_config = config.hf_config
+        num_kv_heads = runner._get_num_kv_heads()
+        total = runner._get_total_num_layers()
+        num_draft = total - hf_config.num_hidden_layers
+        n_full = runner.num_full_attn + num_draft
+        kv_dtype_size = dtypes.d_dtypes[config.kv_cache_dtype].itemsize
+
+        # kv_cache: [2, n_full, blocks, block_size, num_kv_heads, head_dim]
+        block_bytes = (
+            2
+            * n_full
+            * runner.physical_block_size
+            * num_kv_heads
+            * hf_config.head_dim
+            * kv_dtype_size
+        )
+        # kv_scale: [2, n_full, blocks, num_kv_heads, block_size] fp32
+        block_bytes += 2 * n_full * num_kv_heads * runner.physical_block_size * 4
+        return block_bytes
+
+    def allocate_kv_cache_tensors(
+        self, num_kv_heads: int, num_draft_layers: int
+    ) -> dict:
+        """GDN hybrid: KV cache only covers full-attention layer slots
+        (linear-attention layers don't store paged KV; they use the
+        per-request mamba_k/v_cache pool allocated separately).
+
+        Layout: `[2, num_full_attn + num_draft_layers, ...]` — note this
+        differs from AiterAttentionMetadataBuilder's `num_hidden_layers`
+        first dim. The slot index math is in build_kv_cache_tensor's
+        attn_idx computation (skips linear-attn slots).
+        """
+        from aiter import dtypes
+
+        runner = self.model_runner
+        config = runner.config
+        hf_config = config.hf_config
+        n_full = runner.num_full_attn + num_draft_layers
+        return {
+            "kv_cache": torch.zeros(
+                2,
+                n_full,
+                runner.num_physical_kvcache_blocks,
+                runner.physical_block_size,
+                num_kv_heads,
+                hf_config.head_dim,
+                dtype=dtypes.d_dtypes[config.kv_cache_dtype],
+                device="cuda",
+            ),
+            "kv_scale": torch.zeros(
+                2,
+                n_full,
+                runner.num_physical_kvcache_blocks,
+                num_kv_heads,
+                runner.physical_block_size,
+                dtype=dtypes.fp32,
+                device="cuda",
+            ),
+        }
+
+    def build_kv_cache_tensor(self, layer_id: int, module):
+        """Dispatch by module type:
+
+        - `base_linear_attention` (GDN linear attention) → wrap the slot
+          slice of mamba_k_cache / mamba_v_cache
+        - everything else (full-attention MHA layers in the hybrid model,
+          plus modules of types this builder doesn't recognize) → defer
+          to AiterAttentionMetadataBuilder.build_kv_cache_tensor
+        """
+        if hasattr(module, "base_linear_attention"):
+            from atom.config import KVCacheTensor
+
+            runner = self.model_runner
+            gdn_idx = self._gdn_layer_index(layer_id)
+            return KVCacheTensor(
+                layer_num=layer_id,
+                k_cache=runner.mamba_k_cache[gdn_idx],
+                v_cache=runner.mamba_v_cache[gdn_idx],
+                k_scale=None,
+                v_scale=None,
+            )
+        return super().build_kv_cache_tensor(layer_id, module)
+
+    def _gdn_layer_index(self, layer_id: int) -> int:
+        """Model layer number -> row in mamba_{k,v}_cache.
+
+        Full-attention layers hold no recurrent state, so the cache is
+        dimensioned by LINEAR-layer count. Indexing it with the raw layer
+        number overruns the tensor (IndexError: index 48 is out of bounds for
+        dimension 0 with size 48).
+
+        Two layouts, because the two model families describe it differently:
+
+        * Qwen3-Next / Qwen3.5 place a full-attention layer every
+          ``full_attention_interval``, so the mapping is arithmetic.
+        * Kimi (``kimi_linear``, e.g. K3) lists its linear layers explicitly
+          in ``linear_attn_config.kda_layers`` — the spacing is irregular, so
+          the row is the layer's position in that list. Applying the interval
+          formula here would silently alias two layers onto one row.
+        """
+        kda = getattr(self.model_runner, "kda_attention_layers", None)
+        if kda:
+            return kda.index(layer_id)
+        interval = self.model_runner.full_attention_interval
+        return (layer_id // interval) * (interval - 1) + (layer_id % interval)
 
     def prepare_state_indices(self, batch: ScheduledBatch, with_spec: bool = False):
         non_spec_state_indices = self.non_spec_state_indices_tensor.np
@@ -313,9 +578,7 @@ class GDNStateMixin:
         if prepare_block_tables:
             self.prepare_block_tables(batch)
 
-        context_lens_tensor = attn_metadata.context_lens
         query_start_loc = attn_metadata.cu_seqlens_q
-        context_lens_tensor = torch.zeros(batch.total_seqs_num_prefill).cuda()
         nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
         if not self.use_spec_decode or is_prefill:
             self.prepare_state_indices(batch, with_spec=False)
@@ -361,7 +624,16 @@ class GDNStateMixin:
             num_prefill_tokens = 0
 
         if num_prefills > 0:
-            has_initial_state = context_lens_tensor > 0
+            # A prefill chunk seeds from the seq's existing recurrent state
+            # only when an earlier chunk of the SAME admission produced it.
+            # `batch.has_recurrent_state` is set in Scheduler.postprocess after
+            # a chunk's forward, and cleared when the per-req slot is released
+            # (the slot is recycled WITHOUT scrubbing, so a stale tenant's
+            # state must never be read). Prefill seqs occupy the leading rows
+            # of the batch, matching non_spec_state_indices_tensor's ordering.
+            flags = self.has_initial_state_buf.np
+            flags[:num_prefills] = batch.has_recurrent_state[:num_prefills]
+            has_initial_state = self.has_initial_state_buf.copy_to_gpu(num_prefills)
             nums_dict, batch_ptr, token_chunk_offset_ptr = (
                 compute_causal_conv1d_metadata(non_spec_query_start_loc)
             )
@@ -607,6 +879,23 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             attn_metadata.gdn_metadata = None
             return attn_metadata, positions
         gdn_metadata = self.prepare_gdn_metadata(batch, attn_metadata, is_prefill=True)
+        # Seed runtime slots from any state checkpoint this batch hit, before
+        # the forward reads them. Prefill only: a decode step never resumes
+        # from a checkpoint. Outside CUDAGraph capture (prefill is eager).
+        self.apply_state_cache_loads(batch)
+        # Interior checkpoints: the impl slices them out of the chunk kernel's
+        # per-chunk states, so a checkpoint mid-prompt costs no extra forward.
+        # Positions at the step's end are sourced from the runtime slot; both
+        # kinds are tagged and written by one kernel.
+        gdn_metadata.ssm_checkpoints = self._checkpoint_targets(batch)
+        if gdn_metadata.ssm_checkpoints is not None:
+            # Same mapping the chunk kernel builds internally, computed once
+            # per step rather than per layer.
+            from atom.model_ops.fla_ops.index import prepare_chunk_offsets
+
+            gdn_metadata.ssm_chunk_offsets = prepare_chunk_offsets(
+                gdn_metadata.non_spec_query_start_loc, SSM_STATE_KERNEL_CHUNK
+            )
 
         attn_metadata.gdn_metadata = gdn_metadata
         return attn_metadata, positions
