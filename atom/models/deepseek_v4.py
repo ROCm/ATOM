@@ -1705,8 +1705,9 @@ class Indexer(nn.Module):
         (deepseek_v2.py:1047-1084).
 
         Top-k uses aiter `top_k_per_row_decode` (radix kernel, parametric `k`):
-        the kernel honors `n_committed_per_seq` per row, so logits cells past
-        each row's valid range are never selected — no `fill_(-inf)` required.
+        ATOM passes the exact ratio-4 per-token row ends as `seqLens` with
+        `next_n=1`, so logits cells past each row's valid range are never
+        selected — no `fill_(-inf)` required.
         Rows whose valid range is shorter than `index_topk` get -1 sentinels
         for tail cols. Output is RAW seq-local (each row's cols are 0-indexed
         into that batch's compressed K), exactly the layout
@@ -1754,7 +1755,7 @@ class Indexer(nn.Module):
         # Under CUDAGraph capture, torch allocates from the graph's private
         # memory pool and the address is stable across replays at this
         # captured `total_tokens`. No `fill_(-inf)` needed —
-        # `top_k_per_row_decode` bounds each row by `n_committed_per_seq[batch]`
+        # `top_k_per_row_decode` receives the exact per-token CSA row end below,
         # so unwritten cols are never picked.
         logits = torch.empty(
             total_tokens,
@@ -1779,10 +1780,18 @@ class Indexer(nn.Module):
         topk_local = torch.empty(
             total_tokens, self.index_topk, dtype=torch.int32, device=q_fp8.device
         )
+        # Reuse aiter's existing ratio-1 decode API with next_n=1: its bound
+        # `seqLens[row/next_n] - next_n + row%next_n + 1` then becomes the exact
+        # per-token CSA reservation `csa_topk_row_ends[row]`.
+        row_ends = getattr(attn_md, "csa_topk_row_ends", None)
         top_k_per_row_decode(
             logits,
-            next_n,
-            n_committed_per_seq_gpu,
+            1 if row_ends is not None else next_n,
+            (
+                row_ends[:total_tokens]
+                if row_ends is not None
+                else n_committed_per_seq_gpu
+            ),
             topk_local,
             total_tokens,
             logits.stride(0),
@@ -1983,8 +1992,8 @@ class Indexer(nn.Module):
         total_ctas = indexer_meta["fp4_total_ctas"]
         # Write-once GPU scratch, NOT -inf-filled (mirrors the FP8 decode path).
         # The kernel writes every column in `[0, context_len)` per row and
-        # `top_k_per_row_decode` bounds each row by `n_committed_per_seq` (==
-        # context_len) — so cells past it are never read. A `torch.full(-inf)`
+        # `top_k_per_row_decode` scans only the exact ratio-4 per-token prefix
+        # below, so cells past it are never read. A `torch.full(-inf)`
         # pre-fill would be wasted ~290μs FillFunc work at width
         # `max_model_len_idx`. CG-safe: torch.empty lands in the graph's private
         # pool at a stable address across replays at this captured shape.
@@ -2016,10 +2025,15 @@ class Indexer(nn.Module):
         topk_local = torch.empty(
             total_tokens, self.index_topk, dtype=torch.int32, device=q_fp4.device
         )
+        row_ends = getattr(attn_md, "csa_topk_row_ends", None)
         top_k_per_row_decode(
             logits,
-            next_n,
-            n_committed_per_seq_gpu,
+            1 if row_ends is not None else next_n,
+            (
+                row_ends[:total_tokens]
+                if row_ends is not None
+                else n_committed_per_seq_gpu
+            ),
             topk_local,
             total_tokens,
             logits.stride(0),
@@ -2225,10 +2239,17 @@ class Indexer(nn.Module):
         topk_rect = torch.full(
             (R + 1, self.index_topk), -1, dtype=torch.int32, device=device
         )
+        # Layer-invariant ratio-4 bounds were right-aligned into this same
+        # rectangle by the metadata builder; do not zero+scatter them per layer.
+        ends_rect = getattr(attn_md, "csa_topk_row_ends_rect", None)
         top_k_per_row_decode(
             logits,
-            full_q,
-            n_committed_per_seq_gpu,
+            1 if ends_rect is not None else full_q,
+            (
+                ends_rect[:R]
+                if ends_rect is not None
+                else n_committed_per_seq_gpu
+            ),
             topk_rect[:R],
             R,
             logits.stride(0),
