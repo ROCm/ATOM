@@ -11,6 +11,13 @@ logger = logging.getLogger("atom")
 # behind it; the cap just bounds the queue if the GPU falls far behind.
 _MAX_ELL_INFLIGHT = 4
 
+# How many steps back the adopted ell comes from, counted at the TOP of a step:
+# `_ell_pending[-1]` is the previous step's copy (fired at its very end, so still
+# in flight), `[-2]` is the one before that (landed). Must be >= 2 so the
+# synchronize in `_resolve_ell` is free, and < _MAX_ELL_INFLIGHT so the ring slot
+# being read cannot be the one `record_ell` is about to reuse.
+_ELL_GENERATION = 2
+
 
 class VerifyScheduler:
     """Hardware-Aware Prefix Scheduler for confidence-scheduled block drafting.
@@ -29,26 +36,30 @@ class VerifyScheduler:
     are bound later by the runner's warmup/calibration; until then a synthetic
     monotone SPS stub keeps the path lossless.
 
-    Kept sync-free on the decode hot path: ``record_ell`` fires an ASYNC D2H of
-    ell and the {req_id: ell} map is adopted only once that copy has ALREADY
-    completed -- the ell handoff is NEVER waited on.
+    Effectively sync-free on the decode hot path, by DEFERRING rather than by
+    polling: ``record_ell`` fires an ASYNC D2H of ell, and the {req_id: ell} map
+    read at the top of a step is the one from ``_ELL_GENERATION`` steps back --
+    old enough that its copy has long landed, so the wait on it is a no-op.
 
-    Why never waited on: ``record_ell`` runs at the end of a step, after the
-    whole step (target forward + block draft) is queued on the default stream,
-    and the copy stream waits on it -- so the copy completes only when the step
-    drains. The map is read at the TOP of the next step
-    (``ModelRunner.prepare_model`` -> ``_dspark_apply_q_bucket``). Blocking there
-    would pin the host to the GPU's tail every step, collapsing the run-ahead the
-    rest of this loop is built on (``recv_async_output`` and friends all consume
-    a copy fired a step earlier, never the current one) and leaving the GPU idle
+    Why not simply wait on the LATEST copy: ``record_ell`` runs at the end of a
+    step, after the whole step (target forward + block draft) is queued on the
+    default stream, and the copy stream waits on it -- so that copy completes
+    only when the step drains. Waiting on it at the top of the next step would
+    pin the host to the GPU's tail every step, collapsing the run-ahead the rest
+    of this loop is built on (``recv_async_output`` and friends all consume a
+    copy fired a step earlier, never the current one) and leaving the GPU idle
     for the whole of the next step's host-side prep. Measured as a large
     dspark -> next-decode bubble under ``confidence_schedule``.
 
-    Consuming a step-or-two-stale ell instead is lossless: ell is only the
-    PREDICTED accept count used to SIZE the next verify, a missing entry already
-    falls back to full length (never under-verify), the hard anchor lower bound
-    comes from the current step's ``num_bonus``, and any draft suffix dropped by
-    a short ell is simply re-drafted next step.
+    Why not take whichever copy has landed: that is a function of how far THIS
+    rank's CPU has run ahead, so TP ranks pick different generations, and ell is
+    a shape under ragged -- see ``_resolve_ell``.
+
+    Consuming a few-steps-stale ell is lossless: ell is only the PREDICTED accept
+    count used to SIZE the next verify, a missing entry already falls back to
+    full length (never under-verify), the hard anchor lower bound comes from the
+    current step's ``num_bonus``, and any draft suffix dropped by a short ell is
+    simply re-drafted next step.
     """
 
     def __init__(self, runner):
@@ -58,7 +69,7 @@ class VerifyScheduler:
         self.sts_temperatures: Optional[torch.Tensor] = None
         self._last_ell: Optional[torch.Tensor] = None
         # FIFO of in-flight async D2H copies of ell, one entry per step:
-        # (event, cpu_buf, req_ids). Drained non-blockingly by _drain_ell.
+        # (event, cpu_buf, req_ids). Read by index in _resolve_ell, never popped.
         self._ell_pending: list = []
         # Freshest RESOLVED {req_id: ell}, re-mapped onto each step's (possibly
         # reordered) batch by req_id. Lags the GPU by a step or two whenever the
@@ -164,8 +175,8 @@ class VerifyScheduler:
         reordered) batch by req_id — batch position is not stable across steps
         under continuous batching.
 
-        The copy is queued, never awaited; ``_drain_ell`` adopts it on whichever
-        later step finds it already complete.
+        The copy is queued here; ``_resolve_ell`` adopts it once it is
+        ``_ELL_GENERATION`` steps old.
         """
         ell = self._last_ell
         if ell is None:
@@ -193,30 +204,40 @@ class VerifyScheduler:
         if len(self._ell_pending) > _MAX_ELL_INFLIGHT:
             del self._ell_pending[: -_MAX_ELL_INFLIGHT]
 
-    def _drain_ell(self) -> None:
-        """Adopt the freshest COMPLETED async ell copy. NEVER blocks.
+    def _resolve_ell(self) -> None:
+        """Adopt the ell from a FIXED generation back (``_ELL_GENERATION``).
 
-        All copies are issued on one stream, so they complete in order: popping
-        while the head's event is done leaves the newest finished entry in
-        ``newest`` and keeps the still-in-flight ones queued for a later step.
-        No completed copy -> keep the map we already have.
+        The generation is fixed, not "whichever copy happens to have landed".
+        Which copies have landed depends on how far THIS rank's CPU has run
+        ahead, so an opportunistic pick makes different TP ranks adopt different
+        generations. ell sizes the ragged layout, i.e. it is a shape, so the
+        ranks then disagree on token counts and hang in aiter's symmetric
+        all-reduce, each spinning for peer signals that never come (measured:
+        7 ranks at 48 tokens, 1 at 24). A fixed index is identical on every rank
+        because ``_ell_pending`` is appended to once per step, host-side.
+
+        The ``synchronize`` is the guarantee, not the cost: generation N-2's copy
+        was fired two steps ago and waits only on step N-2's GPU work, so with
+        the CPU at most a step or two ahead it has long landed and this is a
+        no-op. (N-1 would be the one that actually blocks -- it is queued behind
+        the previous step's entire forward.)
         """
         pending = self._ell_pending
-        newest = None
-        while pending and pending[0][0].query():
-            newest = pending.pop(0)
-        if newest is None:
+        if len(pending) < _ELL_GENERATION:
+            self._ell_map = {}  # too early to have one -> full length
             return
-        _event, cpu_buf, req_ids = newest
+        event, cpu_buf, req_ids = pending[-_ELL_GENERATION]
+        event.synchronize()
         ell_np = cpu_buf.numpy().astype(np.int32)
         n = min(len(req_ids), ell_np.shape[0])
         self._ell_map = {req_ids[i]: int(ell_np[i]) for i in range(n)}
 
     @property
     def ell_by_req(self) -> dict:
-        """{req_id: ell} for sizing this step's verify. Never syncs — see the
-        class docstring for why a stale ell is the correct trade here."""
-        self._drain_ell()
+        """{req_id: ell} from a fixed generation back, so every TP rank adopts
+        the SAME one — see ``_resolve_ell``. Read this at the top of a step; the
+        sync it performs is a no-op there and a real stall anywhere later."""
+        self._resolve_ell()
         return self._ell_map
 
     @ell_by_req.setter
@@ -229,11 +250,11 @@ class VerifyScheduler:
         """Non-blocking read for the SAME-step postprocess path (carried back to
         the scheduler as fwd_output.dspark_ell).
 
-        Identical policy to ``ell_by_req`` — this step's own copy was fired
-        moments ago and will not be ready, so this returns the freshest map
-        already resolved. Correctness: the scheduler only uses it to set
-        seq.dspark_next_ell for NEXT-step sizing, and the worker's own
-        _dspark_apply_q_bucket re-reads the map next step regardless.
+        Returns the map ``ell_by_req`` already resolved at the top of this step
+        WITHOUT re-resolving: by now ``record_ell`` has appended this step's
+        entry, so the fixed generation would land on a copy that is still in
+        flight and the synchronize would really block. Correctness: the scheduler
+        only uses it to set seq.dspark_next_ell for NEXT-step sizing, and the
+        worker re-reads ell_by_req next step regardless.
         """
-        self._drain_ell()
         return dict(self._ell_map)

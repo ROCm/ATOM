@@ -506,9 +506,13 @@ class _FakeEvent:
     def query(self):
         return self.done
 
-    def synchronize(self):  # pragma: no cover - must never be reached
+    def synchronize(self):
+        # Waiting on a LANDED copy is free and is how the fixed-generation read
+        # gets its guarantee. Waiting on one still in flight is the dspark ->
+        # decode bubble coming back.
         self.synchronize_calls += 1
-        raise AssertionError("ell handoff must never block on the GPU")
+        if not self.done:
+            raise AssertionError("ell handoff must never block on an in-flight copy")
 
 
 def _pending(done, ell, req_ids):
@@ -527,40 +531,57 @@ def _fresh_scheduler():
     return vs
 
 
-def test_ell_drain_never_synchronizes_and_keeps_last_map():
-    # This step's copy is still in flight -> reads fall back to what we have,
-    # and nothing may block. Regression guard for the dspark -> decode bubble:
-    # ell_by_req used to event.synchronize() at the top of every step.
+def test_ell_never_waits_on_the_in_flight_copy():
+    # Only the previous step's copy exists and it is still in flight; the
+    # fixed-generation read must not reach for it. Regression guard for the
+    # dspark -> decode bubble (ell_by_req once synchronized on the newest copy).
     vs = _fresh_scheduler()
-    vs._ell_map = {"A": 2}
     vs._ell_pending = [_pending(False, [5, 5], ["A", "B"])]
 
-    assert vs.ell_by_req == {"A": 2}
-    assert vs.ell_nonblocking() == {"A": 2}
-    # Entry stays queued for a later step rather than being consumed or waited on.
+    assert vs.ell_by_req == {}  # too early -> full length
+    assert vs._ell_pending[0][0].synchronize_calls == 0
+    # Entries are never consumed; the ring cap in record_ell retires them.
     assert len(vs._ell_pending) == 1
 
 
-def test_ell_drain_adopts_freshest_completed_copy():
-    # Two landed copies + one in flight: the newest LANDED one wins, and the
-    # in-flight one stays queued.
+def test_ell_adopts_fixed_generation_not_the_freshest_landed():
+    # [-2] wins even though a NEWER copy has also landed. Taking the freshest
+    # landed one is what made TP ranks disagree: which copies have landed is a
+    # per-rank property, the index is not.
     vs = _fresh_scheduler()
     vs._ell_pending = [
         _pending(True, [1, 1], ["A", "B"]),
-        _pending(True, [4, 3], ["A", "B"]),
-        _pending(False, [0, 0], ["A", "B"]),
+        _pending(True, [4, 3], ["A", "B"]),  # <- generation N-2
+        _pending(True, [9, 9], ["A", "B"]),
     ]
 
     assert vs.ell_by_req == {"A": 4, "B": 3}
-    assert len(vs._ell_pending) == 1
-    assert vs._ell_pending[0][0].query() is False
+    assert len(vs._ell_pending) == 3
+
+
+def test_ell_generation_is_identical_across_ranks():
+    # Same step count, different run-ahead: rank B has one more copy landed.
+    # Both must still size the step from the same generation, or their ragged
+    # token counts diverge and the TP group deadlocks in the all-reduce.
+    def rank(landed_flags):
+        vs = _fresh_scheduler()
+        vs._ell_pending = [
+            _pending(landed_flags[i], ell, ["A", "B"])
+            for i, ell in enumerate([[1, 1], [4, 3], [9, 9]])
+        ]
+        return vs.ell_by_req
+
+    assert rank([True, True, False]) == rank([True, True, True])
 
 
 def test_ell_map_is_remapped_by_req_id_not_position():
     # ell was computed in step-N batch order; a reordered batch must still read
     # each request's own value (continuous batching reorders between steps).
     vs = _fresh_scheduler()
-    vs._ell_pending = [_pending(True, [2, 5, 1], ["A", "B", "C"])]
+    vs._ell_pending = [
+        _pending(True, [2, 5, 1], ["A", "B", "C"]),  # <- generation N-2
+        _pending(False, [0, 0, 0], ["A", "B", "C"]),
+    ]
     by_req = vs.ell_by_req
     assert [by_req[r] for r in ["C", "A", "B"]] == [1, 2, 5]
 
@@ -610,8 +631,13 @@ def test_ell_stage_ring_allocates_on_cpu_under_a_gpu_default_device():
     assert vs._ell_last_slot == 0
 
 
-class _FakeEvent:
-    """Stands in for torch.cuda.Event; `query()` is all `_ell_stage` uses."""
+class _FakeSlotEvent:
+    """Stands in for torch.cuda.Event; `query()` is all `_ell_stage` uses.
+
+    Distinct from `_FakeEvent` above on purpose: same-named classes at module
+    scope silently shadow, so the ell-generation tests would have run against
+    this one and lost their synchronize() assertions.
+    """
 
     def __init__(self, landed: bool):
         self.landed = landed
@@ -647,7 +673,7 @@ def test_ell_stage_never_reuses_a_slot_whose_copy_is_still_in_flight():
     # Prime the ring, then mark slot 0's copy as still in flight.
     vs._ell_stage(4)
     assert vs._ell_last_slot == 0
-    vs._ell_slot_event[0] = _FakeEvent(landed=False)
+    vs._ell_slot_event[0] = _FakeSlotEvent(landed=False)
     vs._ell_stage_idx = 0
 
     buf = vs._ell_stage(4)
@@ -658,7 +684,7 @@ def test_ell_stage_never_reuses_a_slot_whose_copy_is_still_in_flight():
     assert buf.device.type == "cpu" and buf.is_pinned()
 
     # Once it lands, the same slot is handed out again.
-    vs._ell_slot_event[0] = _FakeEvent(landed=True)
+    vs._ell_slot_event[0] = _FakeSlotEvent(landed=True)
     slot = vs._ell_stage(4)
     assert vs._ell_last_slot == 0
     assert slot.data_ptr() == vs._ell_stage_ring[0].data_ptr()
