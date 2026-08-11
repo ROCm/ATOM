@@ -887,11 +887,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             return None
 
         runner = self.model_runner
-        kv_cache = runner.kv_cache[layer_id].view(
-            runner.num_physical_kvcache_blocks * runner.physical_block_size,
-            1,
-            576,
-        )
+        num_slots = runner.num_physical_kvcache_blocks * runner.physical_block_size
+        kv_cache = runner.kv_cache[layer_id].view(num_slots, 1, 576)
         module.max_model_len = runner.config.max_model_len
         if runner.is_deepseek_v32 and module.indexer is not None:
             # Use aligned dimension to avoid memory copy in torch inductor

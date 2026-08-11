@@ -9,6 +9,8 @@ import queue
 from collections import deque
 
 from atom.distributed.pp_transport import PPStageTransport
+from atom.kv_transfer.disaggregation.pp_kv_aggregator import PPKVAggregator
+from atom.kv_transfer.disaggregation.types import KVConnectorOutput
 from atom.model_engine.engine_core import EngineCore
 
 logger = logging.getLogger("atom")
@@ -31,6 +33,7 @@ class PPEngineCoreProc(EngineCore):
             self.pp_size,
             pc.pp_meta_addrs,
             pc.pp_token_addr,
+            kv_status_addr=getattr(pc, "pp_kv_status_addr", ""),
         )
         self._in_flight: deque = deque()
         self._pending_prefix_hash: deque = deque()
@@ -40,6 +43,7 @@ class PPEngineCoreProc(EngineCore):
         # a deferred hash would have let the two disagree. The window is a
         # per-request ring now and publishes nothing, so the exception is gone.
         self._defer_prefix_hash: bool = bm.enable_prefix_caching
+        self._pp_kv_aggregator: PPKVAggregator | None = None
         logger.info(
             f"{self.label}: PP stage {self.pp_rank}/{self.pp_size} "
             f"(head={self.is_head}, last={self.is_last}) ready"
@@ -86,7 +90,10 @@ class PPEngineCoreProc(EngineCore):
             if result is None:
                 break
             scheduled_batch, seqs = result
-            if scheduled_batch is None or len(scheduled_batch.req_ids) == 0:
+            if scheduled_batch is None:
+                break
+            if len(scheduled_batch.req_ids) == 0:
+                self._dispatch_connector_only_batch(scheduled_batch)
                 break
 
             needs_output = scheduled_batch.produces_output()
@@ -160,6 +167,94 @@ class PPEngineCoreProc(EngineCore):
                     list(batch.req_ids),
                 )
 
+    # -- KV transfer PP aggregation ------------------------------------------
+
+    def _dispatch_connector_only_batch(self, batch) -> None:
+        """Dispatch the KV connector metadata of a batch that has no requests.
+
+        ``Scheduler.schedule()`` attaches connector metadata to every batch it
+        returns, including the request-less one it returns once every sequence
+        is parked waiting on an offload load. That metadata is what starts those
+        loads, so dropping the batch strands them and the head spins forever on
+        a queue it can never drain. Rebuilding it later does not work either:
+        ``build_connector_meta`` consumes the connector's pending state, so by
+        then there is nothing left to rebuild from.
+
+        Every stage must see it or ``PPKVAggregator`` never reaches a global
+        completion, so it goes out on the channel a real batch would use.
+        ``_downstream_busy_loop`` skips the forward for a request-less batch.
+        """
+        if not self.kv_transfer_enabled:
+            return
+        meta = batch.connector_meta_output
+        if meta is None or not getattr(meta, "requests", None):
+            return
+        self.runner_mgr.call_func("process_kvconnector_output", meta)
+        self.pp_transport.send_metadata(batch)
+
+    def _poll_kv_transfer_progress(self):
+        """Aggregate KV transfer status from local TP workers AND downstream
+        PP stages, then feed the result to the scheduler.
+
+        For non-offload fields (finished_sending, finished_recving, etc.) the
+        head's own TP-aggregated output goes directly to the scheduler — those
+        are handled by mooncake's own PP-aware side-channel.
+
+        For offload fields (finished_loading, failed_loading, finished_saving)
+        the head's output is fed into :class:`PPKVAggregator` together with
+        downstream stages' reports, and only globally-complete items reach the
+        scheduler.
+        """
+        if not self.kv_transfer_enabled:
+            return
+
+        # Step 1: collect this stage's own TP-aggregated output.
+        kvoutput = self.runner_mgr.call_func_with_aggregation("async_proc_aggregation")
+        if kvoutput is None:
+            kvoutput = KVConnectorOutput()
+
+        # Step 2: split — non-offload fields go directly to scheduler.
+        non_offload = KVConnectorOutput(
+            finished_sending=kvoutput.finished_sending,
+            finished_recving=kvoutput.finished_recving,
+            failed_recving=kvoutput.failed_recving,
+        )
+        if not non_offload.is_empty():
+            self.scheduler._update_from_kv_xfer_finished(non_offload)
+
+        # Step 3: offload fields go through PP aggregator.
+        has_offload = (
+            kvoutput.finished_loading
+            or kvoutput.failed_loading
+            or kvoutput.finished_saving
+        )
+        pp_messages = self.pp_transport.recv_kv_status(timeout_ms=0)
+
+        if not has_offload and not pp_messages:
+            return
+
+        if self._pp_kv_aggregator is None:
+            self._pp_kv_aggregator = PPKVAggregator(self.pp_size)
+
+        # Ingest head (stage 0) offload output.
+        offload_local = KVConnectorOutput(
+            finished_loading=kvoutput.finished_loading,
+            failed_loading=kvoutput.failed_loading,
+            finished_saving=kvoutput.finished_saving,
+        )
+        if not offload_local.is_empty():
+            result = self._pp_kv_aggregator.ingest(0, offload_local)
+            if not result.is_empty():
+                self.scheduler._update_from_kv_xfer_finished(result)
+
+        # Ingest downstream PP stages' offload output.
+        for pp_rank, downstream_output in pp_messages:
+            result = self._pp_kv_aggregator.ingest(pp_rank, downstream_output)
+            if not result.is_empty():
+                self.scheduler._update_from_kv_xfer_finished(result)
+
+    # -- Downstream busy loop ------------------------------------------------
+
     def _downstream_busy_loop(self):
         shutdown = False
         try:
@@ -172,9 +267,32 @@ class PPEngineCoreProc(EngineCore):
                     continue
                 batch = self.pp_transport.recv_metadata(timeout_ms=100)
                 if batch is None:
+                    if self.kv_transfer_enabled:
+                        self._poll_and_send_kv_status()
                     self.runner_mgr.call_func("flush_pp_send", wait_out=True)
                     continue
+
+                if (
+                    self.kv_transfer_enabled
+                    and getattr(batch, "connector_meta_output", None) is not None
+                ):
+                    self.runner_mgr.call_func(
+                        "process_kvconnector_output",
+                        batch.connector_meta_output,
+                    )
+
+                if len(batch.req_ids) == 0:
+                    # Connector-only broadcast from an idle head: the metadata
+                    # above was the whole payload, there is nothing to forward.
+                    if self.kv_transfer_enabled:
+                        self._poll_and_send_kv_status()
+                    continue
+
                 fwd_out = self.runner_mgr.call_func("forward", batch, wait_out=True)
+
+                if self.kv_transfer_enabled:
+                    self._poll_and_send_kv_status()
+
                 if self.is_last and batch.produces_output():
                     self.pp_transport.send_tokens(fwd_out)
         finally:
@@ -187,3 +305,9 @@ class PPEngineCoreProc(EngineCore):
             except Exception:
                 logger.exception("KV event publish during shutdown failed")
             self.scheduler.shutdown_kv_events()
+
+    def _poll_and_send_kv_status(self):
+        """Downstream: collect TP-aggregated KV status and send to head."""
+        kvoutput = self.runner_mgr.call_func_with_aggregation("async_proc_aggregation")
+        if kvoutput is not None and not kvoutput.is_empty():
+            self.pp_transport.send_kv_status(kvoutput)

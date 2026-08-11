@@ -26,7 +26,7 @@ import uuid
 from asyncio import AbstractEventLoop
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import Any, Optional
+from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
@@ -169,7 +169,7 @@ def _build_sampling_params(
     )
 
 
-def _coerce_n(requested_n: Optional[int], temperature: Optional[float]) -> int:
+def _coerce_n(requested_n: int | None, temperature: float | None) -> int:
     """Return an effective ``n`` for a request.
 
     * ``None``/``<1`` coerce to ``1`` (matches OpenAI default).
@@ -183,8 +183,7 @@ def _coerce_n(requested_n: Optional[int], temperature: Optional[float]) -> int:
         n = int(n)
     except (TypeError, ValueError):
         n = 1
-    if n < 1:
-        n = 1
+    n = max(n, 1)
     if n > 1 and (temperature is None or temperature <= 0.0):
         logger.info(
             "n=%s requested with temperature=%s; collapsing to n=1 because "
@@ -199,7 +198,7 @@ def _coerce_n(requested_n: Optional[int], temperature: Optional[float]) -> int:
 def _validate_context_length(
     num_prompt_tokens: int,
     max_tokens: int,
-    max_model_len: Optional[int],
+    max_model_len: int | None,
 ) -> None:
     if max_model_len is None:
         return
@@ -262,8 +261,7 @@ def _load_image_from_url(url: str) -> Image.Image:
             image_bytes = response.read()
         return Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
-    if url.startswith("file://"):
-        url = url[len("file://") :]
+    url = url.removeprefix("file://")
     return Image.open(url).convert("RGB")
 
 
@@ -809,7 +807,7 @@ async def generate_async_fanout(
     return outputs
 
 
-def validate_model(requested_model: Optional[str]) -> None:
+def validate_model(requested_model: str | None) -> None:
     """Validate that the requested model matches the server's model."""
     if requested_model is None:
         return
@@ -860,6 +858,8 @@ async def setup_streaming_request(
             kv_transfer_params=kv_transfer_params,
             multimodal_data=multimodal_data,
         )
+        if data_parallel_rank is not None:
+            seq.data_parallel_rank = data_parallel_rank
         _seq_id_to_request_id[seq.id] = request_id
         return seq
 
@@ -1067,6 +1067,8 @@ async def setup_streaming_request_fanout(
             parent_request_id=request_id,
         )
         for seq in seqs:
+            if data_parallel_rank is not None:
+                seq.data_parallel_rank = data_parallel_rank
             _seq_id_to_request_id[seq.id] = request_id
         return seqs
 
@@ -1309,6 +1311,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     request_id,
                     multimodal_data=multimodal_data,
                     kv_transfer_params=request.kv_transfer_params,
+                    data_parallel_rank=request.data_parallel_rank,
                 ),
                 raw_request,
                 request_id,
@@ -1350,6 +1353,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     sampling_params,
                     request_id,
                     kv_transfer_params=request.kv_transfer_params,
+                    data_parallel_rank=request.data_parallel_rank,
                 ),
                 raw_request,
                 request_id,
@@ -1370,6 +1374,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     sampling_params,
                     request_id,
                     kv_transfer_params=request.kv_transfer_params,
+                    data_parallel_rank=request.data_parallel_rank,
                 ),
                 raw_request,
                 request_id,
@@ -1569,7 +1574,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
             lambda: engine.config.max_model_len,
             lambda: engine.model_config.max_model_len,
             lambda: engine.scheduler.max_model_len,
-            lambda: getattr(engine, "max_model_len"),
+            lambda: engine.max_model_len,
         ):
             try:
                 _v = _path()
