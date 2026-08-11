@@ -119,6 +119,7 @@ class BlockManager:
             transfer=StateTransfer.from_config(
                 getattr(config, "state_transfer_kind", "none") or "none",
                 int(getattr(config, "state_fork_tokens", 0) or 0),
+                bool(getattr(config, "state_readable_midstep", False)),
             ),
             hash_block_size=self.hash_block_size,
             enabled=self.enable_prefix_caching,
@@ -356,6 +357,9 @@ class BlockManager:
             block_hashes=block_hashes,
         )
         self._record_checkpoint_end(seq)
+        # Last, because it reads `checkpoint_end_pos` to decide how far the
+        # chain has to reach.
+        self._extend_hash_chain(seq, block_hashes)
         # Free-pool demand: blocks we actually reuse minus those already used
         # (shared ref); blocks we drop from the hit become fresh → counted.
         num_new_blocks = self._n_hash_blocks(seq)
@@ -511,6 +515,12 @@ class BlockManager:
             cache.checkpoint(seq, end, h)
         if kept:
             seq.last_checkpoint_pos = pos
+        # The midstep half of the same moment. Here rather than at each of the
+        # three prefill call sites because this is what they have in common:
+        # the forward for `[base, base + num_new_tokens)` has completed, which
+        # is precisely when the reserved bytes exist. A no-op with nothing
+        # reserved, so decode and unreadable backends pay a branch.
+        self.commit_midstep(seq)
 
     def hash_decode_blocks(
         self, seq: Sequence, committed_kv_len: int, next_forward_tokens: int = 0
@@ -725,6 +735,145 @@ class BlockManager:
         if end > 0:
             seq.checkpoint_end_pos = end
 
+    def _extend_hash_chain(self, seq: Sequence, block_hashes: list[int]) -> None:
+        """Cache the chained hash of *every* block of the prompt on `seq`.
+
+        `block_hashes` stops at the first cache miss — it is the *hit*, and the
+        gates read it as one. A midstep reservation names a position the forward
+        has not reached yet, which is past that miss for every reservation worth
+        making, so the chain it is named by has to run further.
+
+        A separate list rather than an extension of `block_hashes` in place.
+        Nothing downstream would misread a longer list today — `_gated_hit` and
+        the free-pool loop both index it under `compressed_hit` — but "the
+        blocks that hit" and "the blocks of the prompt" are two facts, and one
+        list holding both means the next reader of either has to know which. It
+        is also cheap: this runs after the gates, so the copy is of a list the
+        callers are already done with.
+
+        Only for a backend that reserves midstep. Everywhere else the hash a
+        checkpoint is filed under is computed by `hash_blocks` walking the
+        blocks the forward just finished, and this would be a hash pass over the
+        whole prompt on every admission, spent on nothing.
+        """
+        if not self.state.readable_midstep or not self.state.applies(seq):
+            seq.block_hashes = []
+            return
+        full = list(block_hashes)
+        # Resume from the last APPENDED hash, not from the loop's `h`: on a miss
+        # that holds the hash of the block that failed to match, which was never
+        # appended and is not part of this chain.
+        h = full[-1] if full else -1
+        for i in range(len(full), self._n_hash_blocks(seq)):
+            h = self.compute_hash(self._hash_block_tokens(seq, i), h)
+            full.append(h)
+        seq.block_hashes = full
+
+    def midstep_positions(self, seq: Sequence, start: int, end: int) -> list[tuple]:
+        """`(position, hash)` for every checkpoint a forward over `(start, end]`
+        can take without being cut short.
+
+        The midstep twin of `checkpoint_cut`. Same candidate positions — the
+        grid rung, the demand, the prompt-end anchor — but where `checkpoint_cut`
+        must pick *one* and shorten the chunk onto it, this returns all of them:
+        a backend that reads its chunk kernel's interior states takes a snapshot
+        at each without the forward ending there.
+
+        `checkpointers_at` is not consulted. That function answers "the forward
+        ended here, keep or not", and its `successor_room` test is about a fork's
+        successor forward — which a midstep snapshot does not have, because
+        nothing is handed over and the owner keeps writing where it is. Applying
+        it here would refuse exactly the block-aligned prompt end the anchor
+        exists to reserve.
+
+        Every candidate is a multiple of `hash_block_size` by construction: the
+        interval is snapped onto that grid at construction and the rung is a
+        multiple of the interval, the demand is `blocks * hash_block_size`, and
+        the anchor is floored to it. The assertion below states that rather than
+        trusting it, because a position off the grid indexes the wrong block's
+        hash — a checkpoint filed under a name no resumer will ever compute, and
+        nothing downstream that could notice.
+
+        No `interval == 0` early-out, unlike the three placements this reads.
+        Each already carries the off switch — `checkpoint_limit` returns 0 for
+        any non-positive interval, `_record_checkpoint_demand` gates on
+        `interval_on`, `_record_checkpoint_end` returns before setting the
+        anchor — so under 0 all three candidates are 0 and the loop has nothing
+        to walk. A fourth check would read as the one enforcing it, and be the
+        one nobody dared remove. `test_interval_zero_reserves_nothing` pins the
+        behavior end to end rather than the check.
+        """
+        if not self.state.readable_midstep or not self.state.applies(seq):
+            return []
+        interval = self.state_checkpoint_interval_tokens
+        hbs = self.hash_block_size
+        hashes = seq.block_hashes
+        rung = 0
+        if limit := self.checkpoint_limit(seq):
+            rung = min(end, limit)
+            rung -= rung % interval
+        out = []
+        for pos in sorted(
+            {p for p in (rung, seq.checkpoint_demand_pos, seq.checkpoint_end_pos) if p}
+        ):
+            if not start < pos <= end:
+                continue
+            assert not pos % hbs, f"checkpoint position {pos} is off the {hbs} grid"
+            nblocks = pos // hbs
+            # A position past the chain is one `_extend_hash_chain` could not
+            # name — nothing to file it under, so it cannot be found again.
+            if nblocks > len(hashes):
+                continue
+            out.append((pos, hashes[nblocks - 1]))
+        return out
+
+    def plan_midstep(self, seq: Sequence, start: int, end: int) -> None:
+        """Reserve a destination group for every checkpoint this forward covers.
+
+        Called once the chunk `(start, end]` is settled and before the batch is
+        built, which is the only window where both are true: the positions are
+        known, and the free list can still be committed against without racing
+        an admission later in the same scheduling pass.
+
+        Overwrites rather than accumulates. A reservation is good for exactly
+        one forward, so a second plan for the same seq means the first forward
+        never ran — hand its groups back rather than leak them.
+        """
+        if not self.state.readable_midstep:
+            return
+        if seq.midstep_reservations:
+            self.cancel_midstep(seq)
+        seq.midstep_reservations = self.state.reserve_midstep(
+            seq, self.midstep_positions(seq, start, end)
+        )
+
+    def commit_midstep(self, seq: Sequence) -> None:
+        """File this forward's reservations, now that its bytes exist.
+
+        Drains the list: whatever is not committed here is not a checkpoint,
+        and leaving it in place would let the next `plan_midstep` publish a
+        position this seq has already moved past.
+        """
+        if not seq.midstep_reservations:
+            return
+        self.state.publish_midstep(seq.midstep_reservations)
+        # The rightmost published position, for the decode-side spacing rule in
+        # `checkpointers_at`. Generation is never midstep-readable — its
+        # forwards end where acceptance puts them — so it still measures from
+        # here, and would otherwise re-checkpoint immediately after a prompt
+        # that just filed one.
+        seq.last_checkpoint_pos = max(
+            seq.last_checkpoint_pos, max(p for _g, p, _h in seq.midstep_reservations)
+        )
+        seq.midstep_reservations = []
+
+    def cancel_midstep(self, seq: Sequence) -> None:
+        """Hand back reservations whose forward is not going to run."""
+        if not seq.midstep_reservations:
+            return
+        self.state.cancel_midstep(seq.midstep_reservations)
+        seq.midstep_reservations = []
+
     def checkpoint_cut(self, seq: Sequence, start: int, end: int) -> int:
         """Earliest ladder position in `(start, end]`, or 0 if there is none.
 
@@ -740,7 +889,22 @@ class BlockManager:
         candidate before the choice is made. The prompt-end anchor is the
         exception that forces the loop: it does not dominate the rung and the
         rung does not dominate it. See `_record_checkpoint_end`.
+
+        0 once every class that applies reads its checkpoints midstep. The cut
+        exists only to put a forward's *end* on a rung, and a readable class
+        does not need the end — `midstep_positions` hands it the same positions
+        to snapshot inside a full-length chunk. Every, not any: one unreadable
+        class still needs the forward to land there, and the readable ones lose
+        nothing by being handed a position they would have taken anyway.
+
+        This gate and the one in `checkpointers_at` are a pair and change
+        together. Suppressing the cut alone leaves `checkpointers_at` refusing
+        every off-grid position it is then handed — zero checkpoints kept, no
+        error, no warning, and a hit rate that quietly collapses.
         """
+        applicable = [c for c in self.state_caches if c.applies(seq)]
+        if all(c.readable_midstep for c in applicable):
+            return 0
         rung = 0
         if limit := self.checkpoint_limit(seq):
             # `limit` is itself a multiple of the interval, so a chunk cut at
@@ -904,7 +1068,21 @@ class BlockManager:
         return [
             c
             for c in self.state_caches
-            if c.applies(seq) and next_forward_tokens >= c.successor_room
+            # A readable class checkpoints its prompt through
+            # `plan_midstep`/`commit_midstep` instead, so keeping it here as
+            # well would keep the same boundary twice. Both halves of that are
+            # damage: two groups spent on one hash, the loser orphaned free but
+            # unindexed — and, under `fork`, the seq hands its live group away
+            # and takes a fresh one, binding the next forward to refill a
+            # replacement it had no reason to need.
+            #
+            # Only on the aimed path. Midstep positions are all prompt
+            # positions, so generation is where `aimed=False` puts every class
+            # back on this one. The twin of the `checkpoint_cut` gate; see
+            # there for why the two cannot move separately.
+            if not (aimed and c.readable_midstep)
+            and c.applies(seq)
+            and next_forward_tokens >= c.successor_room
         ]
 
     def publish_loaded_prefix(
@@ -1045,6 +1223,12 @@ class BlockManager:
         # An uncommitted checkpoint describes state in a group that is about to
         # go back on the free list, so the intent dies with it.
         self.state.forget_pending(seq)
+        # A midstep reservation is the same intent one step earlier: a group
+        # held for a forward that is now not going to run. Handed back vacant —
+        # publishing it would file a hash over bytes nobody wrote. Before the
+        # block table is cleared, because a preempted seq re-prefills through
+        # `can_allocate` and would otherwise re-plan on top of a live list.
+        self.cancel_midstep(seq)
         seq.block_table.clear()
         if seq.has_per_req_cache and seq.per_req_cache_group >= 0:
             # Only the group the seq was writing. A checkpoint it took is

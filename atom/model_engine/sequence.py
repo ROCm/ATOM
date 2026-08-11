@@ -119,6 +119,19 @@ class Sequence:
         # by `checkpoint_cut` and `checkpointers_at` — which must agree, the
         # same contract `checkpoint_demand_pos` is held to.
         self.checkpoint_end_pos = 0
+        # The chained content hash of every block of this prompt, not just the
+        # ones that hit. Empty unless the state backend reserves checkpoints
+        # midstep (`StateTransfer.readable_midstep`), which is the only caller
+        # that needs to name a position the forward has not reached yet — see
+        # `BlockManager._extend_hash_chain` for why it cannot simply be the
+        # `block_hashes` the admission scan built.
+        self.block_hashes: list[int] = []
+        # Groups taken for midstep checkpoints of the forward now in flight,
+        # as `(group, position, hash)`. Filled by `BlockManager.plan_midstep`
+        # before the batch is built, drained by `commit_midstep` after it, and
+        # handed back by `cancel_midstep` if that forward never runs. Non-empty
+        # only between those two points.
+        self.midstep_reservations: list[tuple] = []
         # Where this seq last kept a checkpoint. Prefill lands on the grid so
         # this tracks it, but a speculative decode step lands wherever
         # `1 + accepted` puts it, and there the grid is unreachable — see

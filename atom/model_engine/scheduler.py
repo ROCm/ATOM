@@ -379,6 +379,18 @@ class ScheduledBatch:
             for seq in seqs.values()
             if seq.has_per_req_cache and seq.per_req_cache_group >= 0
         ]
+        # Midstep checkpoints this forward must write, `[(group, position)]` per
+        # seq, positionally aligned with `per_req_cache_groups` like the fork
+        # sources above. A list per seq, not one entry: a readable backend takes
+        # every position the chunk covers rather than only the one it ends on.
+        # Positions are absolute prompt offsets; the backend rebases them onto
+        # the step's own tokens, which is the only frame its intermediates are
+        # in. Empty everywhere except a `readable_midstep` prefill.
+        self.state_save_all = [
+            [(g, p) for g, p, _h in seq.midstep_reservations]
+            for seq in seqs.values()
+            if seq.has_per_req_cache and seq.per_req_cache_group >= 0
+        ]
         # (src, dst) state groups this batch's forward must duplicate before it
         # runs — the copy twin of `state_fork_srcs`, for backends that checkpoint
         # by copying. Not per-seq: a copy is between two pool slots and needs no
@@ -1349,6 +1361,19 @@ class Scheduler:
                 if self.drafter_needs_next_token
                 else None
             )
+
+            # Reserve midstep checkpoint destinations for the chunks just
+            # settled. Here rather than inside `_finalize_prefill_chunk`
+            # because a reservation takes a group off the free list, and
+            # admission for this pass only finishes above — planning any
+            # earlier would let a checkpoint's destination compete with a
+            # request still to be let in. The batch below snapshots what this
+            # leaves on each seq.
+            for i, seq in enumerate(scheduled_seqs.values()):
+                start = num_cached_tokens_list[i]
+                self.block_manager.plan_midstep(
+                    seq, start, start + int(num_scheduled_tokens[i])
+                )
 
             prefill_batch = ScheduledBatch(
                 seqs=scheduled_seqs,

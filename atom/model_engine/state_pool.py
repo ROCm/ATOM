@@ -47,27 +47,44 @@ class StateTransfer:
 
     kind: str
     fork_tokens: int = 0
+    #: Whether this backend can extract a state snapshot at a position *inside*
+    #: a forward, rather than only at the forward's last token.
+    #:
+    #: A separate axis from `kind`, and it must stay one. `kind` answers how a
+    #: group is handed to *another request*; this answers where within one
+    #: forward a snapshot can be taken at all. GDN is `fork(1)` and — once its
+    #: chunk kernel's per-chunk intermediates are copied out — midstep-readable;
+    #: DeepSeek-V4 is `copy()` and is not, because its compressor ring is not
+    #: materialized at interior boundaries the way a chunk kernel's `h` is.
+    #: Deriving either from the other would silently turn the prefill chunk cut
+    #: off for a backend that still needs it.
+    #:
+    #: Default False, so every backend keeps today's behavior until it has
+    #: actually ported the copy-out.
+    readable_midstep: bool = False
 
     @classmethod
     def none(cls) -> "StateTransfer":
         return cls(NONE)
 
     @classmethod
-    def fork(cls, tokens: int) -> "StateTransfer":
+    def fork(cls, tokens: int, readable_midstep: bool = False) -> "StateTransfer":
         assert tokens > 0, "a fork binds its successor forward; use none()"
-        return cls(FORK, tokens)
+        return cls(FORK, tokens, readable_midstep)
 
     @classmethod
-    def copy(cls) -> "StateTransfer":
-        return cls(COPY)
+    def copy(cls, readable_midstep: bool = False) -> "StateTransfer":
+        return cls(COPY, readable_midstep=readable_midstep)
 
     @classmethod
-    def from_config(cls, kind: str, fork_tokens: int) -> "StateTransfer":
-        """Rebuild from the two scalars that crossed the process boundary."""
+    def from_config(
+        cls, kind: str, fork_tokens: int, readable_midstep: bool = False
+    ) -> "StateTransfer":
+        """Rebuild from the scalars that crossed the process boundary."""
         if kind == FORK:
-            return cls.fork(fork_tokens)
+            return cls.fork(fork_tokens, readable_midstep)
         assert kind in (COPY, NONE), f"unknown state transfer kind {kind!r}"
-        return cls(kind)
+        return cls(kind, readable_midstep=readable_midstep)
 
     @property
     def copies(self) -> bool:
@@ -163,6 +180,11 @@ class StateGroupPool:
         # complete the moment the copy lands and no forward is involved.
         self.min_fork_tokens: int = self.transfer.fork_tokens
         self.successor_room: float = self.transfer.successor_room
+        # Whether a checkpoint may sit anywhere inside a forward rather than
+        # only at its last token. False is the conservative answer and the
+        # reason `BlockManager` still cuts prefill chunks onto rungs; see
+        # `StateTransfer.readable_midstep`.
+        self.readable_midstep: bool = self.transfer.readable_midstep
         self.hash_block_size: int = hash_block_size
         # The free list, split by whether the group still carries content worth
         # something. Two containers rather than one queue because the two halves
@@ -468,6 +490,80 @@ class StateGroupPool:
         if not self.enabled:
             return -1
         return self.hash_to_group.get(h, -1)
+
+    # ------------------------- midstep checkpointing ------------------------ #
+    #
+    # `checkpoint` below keeps state at the position a forward *ended* at, which
+    # is the only position a backend can be assumed to expose. A backend that
+    # declares `readable_midstep` exposes more: its chunk kernel already
+    # materializes the recurrent state at every interior chunk boundary, so a
+    # snapshot at any of them is a copy rather than a forward.
+    #
+    # That splits keeping a checkpoint into two moments that `checkpoint` runs
+    # as one:
+    #
+    #   `reserve_midstep`  before the forward, take the destination group and
+    #                      name the position. The bytes do not exist yet.
+    #   `publish_midstep`  after it, once the runner has copied them out, file
+    #                      the hash so a resuming request can find it.
+    #
+    # Publishing at reservation time would index a group over bytes the forward
+    # had not written, and a request resuming there would read whatever the
+    # previous tenant left — the same failure `copy`'s deferral avoids, for the
+    # same reason. Reserving at publish time is the other way wrong: the free
+    # list has to be committed before the batch is built, or the group the
+    # runner is told to write may have been handed to an admission in between.
+
+    def reserve_midstep(self, seq, positions: list[tuple[int, int]]) -> list[tuple]:
+        """Take a destination group for each `(position, hash)` this step covers.
+
+        Returns `(group, position, hash)` per reservation actually made — the
+        runner needs `group` and `position`, `publish_midstep` needs the hash.
+        Best-effort and order-preserving: reservations stop at the first one the
+        free list cannot fill, so the earliest position (the one an earlier
+        forward reaches first) is the one that survives a shortage.
+
+        Nothing is indexed here. `pop` takes the group off the free list, so an
+        admission in the same pass cannot be handed it, and it carries no hash
+        until `publish_midstep`, so a resuming request cannot find it either.
+
+        A reservation therefore holds capacity that a checkpoint under `fork` or
+        `copy` does not — those hand a group back the moment they take one. It
+        is held for exactly one forward, and `cancel_midstep` returns it if that
+        forward never runs. `has_free` is still the admission gate, so the worst
+        case is an admission deferred a step, never one starved: the same
+        best-effort contract `checkpoint` keeps.
+        """
+        if not self.applies(seq) or not self.readable_midstep:
+            return []
+        out = []
+        for pos, h in positions:
+            if not self.has_free():
+                self.checkpoints_dropped += 1
+                break
+            out.append((self.pop(), pos, h))
+        return out
+
+    def publish_midstep(self, reservations: list[tuple]) -> None:
+        """File each reserved group under its hash, now that its bytes exist.
+
+        The group goes back on the free list *as a checkpoint* — the same
+        capacity-neutral move `checkpoint` makes, covered by the same lazy
+        eviction: whoever pops it next invalidates the hash on the way out.
+        """
+        for group, _pos, h in reservations:
+            self._index(h, group)
+            self.release(group)
+            self.checkpoints_kept += 1
+
+    def cancel_midstep(self, reservations: list[tuple]) -> None:
+        """Hand back reservations whose forward never ran (preempt, abort).
+
+        Released vacant, not indexed: the bytes were never written, so the group
+        holds nothing anybody should be able to find.
+        """
+        for group, _pos, _h in reservations:
+            self.release(group)
 
     # ---------------------------- checkpointing ---------------------------- #
     def checkpoint(self, seq, boundary_blocks: int, h: int) -> None:
