@@ -1538,3 +1538,71 @@ def test_codec_dsa_fp8_multilayer_including_mtp_round_trip():
             kv_caches[name].index_cache.view(torch.uint8),
             idx.view(torch.uint8),
         )
+
+
+# ---------------------------------------------------------------------------
+# CPU budget split across PP stages
+# ---------------------------------------------------------------------------
+
+
+def _pp_config(pp_rank: int, pp_size: int, num_hidden: int, draft_layers: int | None):
+    spec = None
+    if draft_layers is not None:
+        spec = SimpleNamespace(
+            draft_model_hf_config=SimpleNamespace(num_nextn_predict_layers=draft_layers)
+        )
+    return SimpleNamespace(
+        pipeline_parallel_size=pp_size,
+        hf_config=SimpleNamespace(num_hidden_layers=num_hidden),
+        parallel_config=SimpleNamespace(pipeline_parallel_rank=pp_rank),
+        speculative_config=spec,
+    )
+
+
+def _budgets(pp_size, num_hidden, draft_layers, configured=256.0, partition=None):
+    from atom.kv_transfer.offload import config as offcfg
+
+    out = []
+    for rank in range(pp_size):
+        cfg = SimpleNamespace(max_local_cpu_size=configured)
+        offcfg.scale_cpu_size_for_pp(
+            cfg, _pp_config(rank, pp_size, num_hidden, draft_layers)
+        )
+        out.append(cfg.max_local_cpu_size)
+    return out
+
+
+def test_cpu_budget_split_preserves_total_and_equalizes_horizon(monkeypatch):
+    # Even split, no spec: every stage holds the same layers, so equal budgets.
+    budgets = _budgets(pp_size=4, num_hidden=80, draft_layers=None)
+    assert budgets == pytest.approx([256.0] * 4)
+    assert sum(budgets) == pytest.approx(1024.0)
+
+
+def test_cpu_budget_split_counts_the_draft_layer_on_the_last_stage(monkeypatch):
+    # GLM-5.2 PD: 78 target layers over 20,20,20,18 plus one MTP layer bound on
+    # the last stage only. The offload codec moves every bound layer, so the
+    # last stage's bytes-per-token covers 19 layers, not 18. Budgeting it for 18
+    # leaves it with a shorter token horizon than its peers, and all-or-nothing
+    # loads drag the whole node down to that stage.
+    import atom.models.utils as model_utils
+    from atom.kv_transfer.offload import config as offcfg
+
+    partition = [20, 20, 20, 18]
+    starts = [0, 20, 40, 60]
+
+    def fake_pp_indices(num_layers, rank, size):
+        return (starts[rank], starts[rank] + partition[rank])
+
+    monkeypatch.setattr(model_utils, "get_pp_indices", fake_pp_indices)
+    monkeypatch.setattr(offcfg, "get_pp_indices", fake_pp_indices, raising=False)
+
+    budgets = _budgets(pp_size=4, num_hidden=78, draft_layers=1)
+    local = [20, 20, 20, 19]
+    horizons = [b / n for b, n in zip(budgets, local)]
+
+    assert sum(budgets) == pytest.approx(1024.0)
+    assert horizons == pytest.approx([horizons[0]] * 4)
+    # The last stage must get LESS than an equal share, not more: it caches
+    # fewer tokens per GB than its peers.
+    assert budgets[3] < budgets[0]
