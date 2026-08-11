@@ -619,18 +619,19 @@ def _patch_sglang_eagle3_state_lifecycle() -> None:
             ]
         )
 
-    def filter_batch(self, new_indices, has_been_filtered: bool = True):
+    def filter_batch(self, new_indices, *args, **kwargs):
         # With overlap scheduling, ``future_indices`` is the only payload that
         # is ready on the scheduler stream.  The tensors attached to
         # ``EagleDraftInput`` are produced on the forward stream and are
         # intentionally resolved lazily by ``FutureMap.resolve_future``.
         # Reading/indexing our plugin-only state here would introduce the same
         # cross-stream race that SGLang's native early-return avoids.
+        has_been_filtered = bool(kwargs.get("has_been_filtered", True))
+        if args and isinstance(args[0], bool):
+            has_been_filtered = args[0]
         state_is_deferred = getattr(self, "future_indices", None) is not None
         state_before = getattr(self, state_attr, None)
-        ret = original_filter_batch(
-            self, new_indices, has_been_filtered=has_been_filtered
-        )
+        ret = original_filter_batch(self, new_indices, *args, **kwargs)
 
         output_rows = _row_count(self)
         if state_is_deferred:
