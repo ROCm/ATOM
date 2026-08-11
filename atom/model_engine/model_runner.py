@@ -2487,9 +2487,6 @@ class ModelRunner:
         # run_model) so the attn builder's positions padding matches it.
         batch.dynamic_num_tokens_pad = self._dynamic_num_tokens_pad(batch)
 
-        if envs.ATOM_DSPARK_LOG_RAGGED and not batch.is_dummy_run:
-            self._log_ragged_step(batch)
-
         if not tbo_collective_active:
             self._pcp_tbo_balanced_active = False
 
@@ -3461,37 +3458,6 @@ class ModelRunner:
                     "capture path for cudagraph-safe DP collectives.",
                     getter,
                 )
-
-    def _log_ragged_step(self, batch) -> None:
-        """One line per decode step with every value ragged actually changes.
-
-        Diagnostic for the ragged-only decode bubble. Reading the code narrowed
-        the delta to the replay SHAPE -- `ragged_graph_sizes="6"` pins q_eff to
-        full_q, so q is not a variable; what moves is the real token total, and
-        with it the flat CUDA-graph bucket and the MoE pad width. Whether those
-        actually thrash step to step (and whether any step falls off the
-        captured set into eager) cannot be settled by reading. Gated by
-        ATOM_DSPARK_LOG_RAGGED=1; off costs one attribute read.
-        """
-        if not hasattr(self, "drafter") or batch.total_tokens_num_prefill > 0:
-            return
-        lens = getattr(batch, "dynamic_spec_query_tokens_per_req", None)
-        sbs = batch.total_seqs_num_decode
-        q = int(getattr(batch, "num_spec_query_tokens", 0))
-        pad = batch.dynamic_num_tokens_pad
-        real = int(batch.total_tokens_num_decode)
-        captured = pad in self._piecewise_captured_tokens if pad is not None else None
-        logger.info(
-            "DSPARK_RAGGED bs=%d q_eff=%d real_tok=%d pad_tok=%s captured=%s "
-            "moe_graph_bs=%s lens=%s",
-            sbs,
-            q,
-            real,
-            pad,
-            captured,
-            (int(pad) // q) if (pad is not None and q) else None,
-            np.asarray(lens)[:sbs].tolist() if lens is not None else "rectangular",
-        )
 
     def _ragged_flat_bucket_exists(self, total_tokens: int, q: int) -> bool:
         """Can a captured flat num_tokens bucket hold a ragged step of

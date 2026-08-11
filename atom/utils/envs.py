@@ -371,15 +371,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DSPARK_DISABLE_COMPILE": lambda: (
         os.getenv("ATOM_DSPARK_DISABLE_COMPILE", "0") == "1"
     ),
-    # Log one line per decode step with everything `"ragged": true` changes:
-    # per-request lengths, real token total, the flat CUDA-graph bucket it
-    # replays, whether that bucket was captured, and the MoE pad width. For
-    # diagnosing the ragged-only decode bubble -- reading the code narrows the
-    # delta to the replay SHAPE, but only a run shows whether it thrashes.
-    # Noisy (one line per step); default off.
-    "ATOM_DSPARK_LOG_RAGGED": lambda: (
-        os.getenv("ATOM_DSPARK_LOG_RAGGED", "0") == "1"
-    ),
     # NOTE: DSpark runtime knobs (confidence_schedule, ragged,
     # ragged_graph_sizes, q_buckets, disable_sps_calib) are no longer env vars.
     # They are configured via --dspark-config (JSON dict) and carried in
