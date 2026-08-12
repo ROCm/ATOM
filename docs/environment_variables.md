@@ -95,6 +95,18 @@ no wall-clock skew). See `atom/model_engine/prefill_delayer.py`. Active only whe
 | **ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT** | bool | 1 (true) | If set to `1`, use Triton kernel to fuse RMSNorm with quantization. |
 | **ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT** | bool | 1 (true) | If set to `1`, use Triton kernel to fuse SiLU and mul with quantization in MLP module. |
 
+### DSpark drafting
+
+The Kimi-K3 DSpark draft writes the target's context rows into its own paged MLA
+cache once per draft layer per drafting step; both switches below shorten that
+path. Neither has been run on a GPU, hence the defaults — the first write of
+each process logs whether the fused path engaged.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_DSPARK_FUSED_CTX_KV** | bool | 0 (false) | If set to `1`, write the context rows with one Triton kernel (RMSNorm + RoPE + concat + paged store) instead of four launches plus a throwaway `empty_like` for the RoPE's query side. Falls back per call when the cache layout or the RoPE is not the plain one the kernel understands (seg / shuffled-KV layouts keep their own write kernels). |
+| **ATOM_DSPARK_CTX_KV_ONLY_PROJ** | bool | 0 (false) | If set to `1`, project only the KV half of the fused q_a/kv_a projection on that path (a contiguous row slice of the merged weight) instead of computing all 2112 columns and discarding the 1536-wide q half. Same math on the same bytes with N cut 3.7x, but a narrower N is a different tuned-GEMM shape, so it is measured separately. |
+
 ## V4 attention backend (Migration)
 
 Selects between the legacy per-seq Python dispatch path in `atom/models/deepseek_v4.py`
