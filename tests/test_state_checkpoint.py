@@ -17,7 +17,6 @@ from math import inf, isinf
 from types import SimpleNamespace
 
 import pytest
-
 from conftest import MockConfig
 
 from atom.model_engine.block_manager import BlockManager

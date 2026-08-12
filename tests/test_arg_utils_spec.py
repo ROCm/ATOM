@@ -40,9 +40,9 @@ if _atom_config_stub is not None:
             from_dict=lambda cfg, debug=False: MagicMock(cfg=cfg, debug=debug)
         )
 
-from atom.config import Config  # noqa: E402
-from atom.model_engine.arg_utils import EngineArgs  # noqa: E402
-from atom.utils.arg_parser import FlexibleArgumentParser  # noqa: E402
+from atom.config import Config
+from atom.model_engine.arg_utils import EngineArgs
+from atom.utils.arg_parser import FlexibleArgumentParser
 
 
 class TestFlexibleArgumentParser:
@@ -157,9 +157,11 @@ class TestStateCheckpointExtraEntriesCli:
             self._parse(["--state-checkpoint-extra-entries", "-1"])
 
     def test_config_rejects_negative_value_before_loading_the_model(self):
-        with patch("atom.config.get_hf_config") as get_hf_config:
-            with pytest.raises(ValueError, match="state_checkpoint_extra_entries"):
-                Config(model="unused", state_checkpoint_extra_entries=-1)
+        with (
+            patch("atom.config.get_hf_config") as get_hf_config,
+            pytest.raises(ValueError, match="state_checkpoint_extra_entries"),
+        ):
+            Config(model="unused", state_checkpoint_extra_entries=-1)
         get_hf_config.assert_not_called()
 
 
