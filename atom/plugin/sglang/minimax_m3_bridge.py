@@ -489,7 +489,7 @@ def build_atom_minimax_m3_attention_metadata_from_sglang(
     req_to_token_pool,
     max_model_len: int,
 ):
-    from atom.utils.forward_context import AttentionMetaData
+    from atom.utils.forward_context import AttentionMetaData, AttnState
 
     page_size = _page_size(token_to_kv_pool)
     bs = int(forward_batch.batch_size)
@@ -544,11 +544,13 @@ def build_atom_minimax_m3_attention_metadata_from_sglang(
         )
         metadata = AttentionMetaData(
             cu_seqlens_q=cu_q,
+            cu_seqlens_k=cu_q,
             max_seqlen_q=tokens_per_req,
             max_seqlen_k=max_seq_len,
             slot_mapping=slot_mapping,
             context_lens=seq_lens,
             block_tables=block_table,
+            state=AttnState.DECODE,
         )
         metadata.sparse_attention_metadata = sparse_md
         return metadata
@@ -644,11 +646,13 @@ def build_atom_minimax_m3_attention_metadata_from_sglang(
     )
     md = AttentionMetaData(
         cu_seqlens_q=cu_q,
+        cu_seqlens_k=cu_q,
         max_seqlen_q=tokens_per_req,
         max_seqlen_k=max_seq_len,
         slot_mapping=slot_mapping,
         context_lens=seq_lens,
         block_tables=block_table,
+        state=AttnState.DECODE,
     )
     md.sparse_attention_metadata = sparse_md
     return md
@@ -671,6 +675,8 @@ def _get_index_cache_view(
     *,
     k_buffer: torch.Tensor,
     index_dim: int,
+    model=None,
+    index_cache_dtype: str | None = None,
 ) -> torch.Tensor:
     """Return SGLang MiniMaxSparseKVPool's existing index-K cache view."""
 
@@ -684,7 +690,71 @@ def _get_index_cache_view(
     num_blocks = max(1, num_slots // page_size)
     expected = (num_blocks, page_size, int(index_dim))
     index_buffer = token_to_kv_pool.get_index_k_buffer(layer_id)
+    if index_cache_dtype == "fp8" and not (
+        index_buffer.dtype == torch.uint8 or _is_fp8_dtype(index_buffer.dtype)
+    ):
+        # SGLang only allocates an fp8 indexer cache when its M3 fp8 attn-GEMM
+        # mode is on, which requires the trtllm_mha backend + SM100 and so is
+        # never active on ROCm. The ATOM fused qk-norm/index-insert kernel is in
+        # fp8 sparse insert mode whenever the main KV cache is fp8 and rejects a
+        # bf16 indexer, so own fp8 indexer storage here instead.
+        return _atom_owned_index_cache(
+            model, layer_id, shape=expected, device=index_buffer.device
+        )
     return index_buffer[: num_blocks * page_size].view(*expected)
+
+
+def _atom_owned_index_cache(
+    model,
+    layer_id: int,
+    *,
+    shape: tuple[int, int, int],
+    device: torch.device,
+) -> torch.Tensor:
+    """Allocate (once per layer) an ATOM-owned fp8 indexer-K cache."""
+    from aiter import dtypes
+
+    cache = getattr(model, "_atom_sglang_m3_index_cache", None)
+    if cache is None:
+        cache = {}
+        model._atom_sglang_m3_index_cache = cache
+
+    entry = cache.get(layer_id)
+    if entry is None or tuple(entry.shape) != tuple(shape) or entry.device != device:
+        entry = torch.zeros(shape, dtype=dtypes.d_dtypes["fp8"], device=device)
+        cache[layer_id] = entry
+    return entry
+
+
+def _atom_owned_kv_scales(
+    model,
+    layer_id: int,
+    *,
+    shape: tuple[int, int, int],
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Allocate (once per layer) ATOM-owned fp8 KV dequant-scale buffers.
+
+    Shape matches the page-128 SHUFFLE scale view ``[num_blocks, nkv, page]``
+    that ``_to_page16_shuffle`` reinterprets as ``[num_blocks*8, nkv, 16]``.
+    """
+    cache = getattr(model, "_atom_sglang_m3_native_kv_scale", None)
+    if cache is None:
+        cache = {}
+        model._atom_sglang_m3_native_kv_scale = cache
+
+    entry = cache.get(layer_id)
+    if (
+        entry is None
+        or tuple(entry[0].shape) != tuple(shape)
+        or entry[0].device != device
+    ):
+        entry = (
+            torch.zeros(shape, dtype=torch.float32, device=device),
+            torch.zeros(shape, dtype=torch.float32, device=device),
+        )
+        cache[layer_id] = entry
+    return entry
 
 
 def bind_minimax_m3_sparse_cache_views(model, token_to_kv_pool) -> bool:
@@ -715,6 +785,18 @@ def bind_minimax_m3_sparse_cache_views(model, token_to_kv_pool) -> bool:
         else:
             k_scale = None
             v_scale = None
+        if k_scale is None and k_buffer.element_size() == 1:
+            # SGLang's own MiniMaxSparseKVPool carries no dequant-scale storage,
+            # but the fp8 fused qk-norm/KV-insert kernel writes per-token scales.
+            # Own them here (same fallback the EAGLE3 bridge uses for SGLang's
+            # native draft KV pool) and cache them on the model so rebinding
+            # keeps the already-written scales.
+            k_scale, v_scale = _atom_owned_kv_scales(
+                model,
+                layer_id,
+                shape=(num_blocks, num_kv_heads, page_size),
+                device=k_buffer.device,
+            )
         if not is_sparse_layer:
             pass
         elif getattr(impl, "skip_index_topk", False):
@@ -727,6 +809,8 @@ def bind_minimax_m3_sparse_cache_views(model, token_to_kv_pool) -> bool:
                 layer_id,
                 k_buffer=k_buffer,
                 index_dim=impl.index_head_dim,
+                model=model,
+                index_cache_dtype=getattr(impl, "index_cache_dtype", None),
             )
         impl.max_model_len = int(getattr(token_to_kv_pool, "size", live_slots))
         if is_sparse_layer:
