@@ -257,10 +257,10 @@ assert lmcache.c_ops.__file__.endswith('.so'), 'c_ops fell back to python backen
 print('OK: lmcache', lmcache.__version__, 'HIP c_ops; torch', torch.__version__)"
 
 # ========== SemiAnalysis aiperf agentic benchmark tool ==========
-# Install the SemiAnalysis fork pinned to the commit that supports the SA
-# agentic datasets (semianalysis_cc_traces_weka_062126*).
+# Install the SemiAnalysis fork pinned to AgentX v1.0.4, matching the
+# InferenceX MI355X SGLang comparison environment.
 ARG INSTALL_SA_AIPERF=1
-ARG SA_AIPERF_COMMIT="0d2aa0572ac685943d38c580675c4a61023581d3"
+ARG SA_AIPERF_COMMIT="49634d1c6c2e6dcc18979d704a65e7c7064efc49"
 RUN if [ "${INSTALL_SA_AIPERF}" = "1" ]; then \
         echo "========== [ATOM] Install SemiAnalysis aiperf (${SA_AIPERF_COMMIT}) =========="; \
         rm -rf /opt/aiperf && \
