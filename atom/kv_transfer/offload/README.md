@@ -527,11 +527,16 @@ LMCache is driven by `LMCACHE_*` env, exactly like the vLLM recipe:
 
 | Env | Purpose |
 |-----|---------|
-| `LMCACHE_LOCAL_CPU=True` | Enable the CPU (L2) tier. |
-| `LMCACHE_MAX_LOCAL_CPU_SIZE` | CPU tier size, GiB. |
+| `LMCACHE_LOCAL_CPU` | Enable the CPU hot-cache tier. Set `False` for NVMe-only storage. |
+| `LMCACHE_MAX_LOCAL_CPU_SIZE` | CPU hot-cache/staging allocator size, GiB. This must remain greater than zero for NVMe I/O even when `LMCACHE_LOCAL_CPU=False`. |
 | `LMCACHE_CHUNK_SIZE=256` | LMCache chunk size (must be a multiple of ATOM block size). |
-| `LMCACHE_LOCAL_DISK` | NVMe (L3) tier path; omit to disable. |
-| `LMCACHE_MAX_LOCAL_DISK_SIZE` | NVMe tier size, GiB. |
+| `LMCACHE_LOCAL_DISK` | NVMe (L3) tier path; omit together with disk size to disable. |
+| `LMCACHE_MAX_LOCAL_DISK_SIZE` | NVMe tier size, GiB; must be greater than zero when a disk path is set. |
+
+NVMe uses LMCache's host-mediated POSIX path, not GDS: HBM is staged through
+the CPU allocator before `LocalDiskBackend` writes or reads the NVMe files. At
+startup each worker logs the realized backend list and capacities; a configured
+disk tier fails startup if `LocalDiskBackend` was not actually created.
 
 Connector-specific tuning (env):
 
@@ -562,12 +567,131 @@ export LMCACHE_CHUNK_SIZE=256
 # export LMCACHE_LOCAL_DISK=/nvme/lmcache
 # export LMCACHE_MAX_LOCAL_DISK_SIZE=2000
 
+# For an NVMe-backed tier without a CPU hot cache, use:
+# export LMCACHE_LOCAL_CPU=False
+# export LMCACHE_MAX_LOCAL_CPU_SIZE=8           # required host staging pool
+# export LMCACHE_LOCAL_DISK=/nvme/lmcache
+# export LMCACHE_MAX_LOCAL_DISK_SIZE=2000
+
 python -m atom.entrypoints.openai_server \
   --model /path/to/model \
   --kv_cache_dtype fp8 \
   --block-size 16 \
   -tp 2 \
   --kv-transfer-config '{"kv_connector":"lmcache_offload","kv_role":"offload"}'
+```
+
+### NVMe-only standalone example
+
+Use the following configuration to keep reusable KV on NVMe without retaining
+it in the LMCache CPU hot-cache tier. `LMCACHE_MAX_LOCAL_CPU_SIZE` must still be
+positive because the POSIX disk backend stages data through host memory.
+
+Start the server in terminal 1:
+
+```bash
+export MODEL_PATH=/path/to/model
+export NVME_CACHE_DIR=/mnt/nvme/lmcache
+export SERVER_LOG=/tmp/atom-lmcache-nvme.log
+
+mkdir -p "${NVME_CACHE_DIR}"
+export PYTHONHASHSEED=0
+export LMCACHE_LOCAL_CPU=False
+export LMCACHE_MAX_LOCAL_CPU_SIZE=8
+export LMCACHE_LOCAL_DISK="${NVME_CACHE_DIR}"
+export LMCACHE_MAX_LOCAL_DISK_SIZE=200
+export LMCACHE_CHUNK_SIZE=256
+export LMCACHE_USE_GDS=False
+export OFFLOAD_MIN_LOAD_TOKENS=0
+
+python -m atom.entrypoints.openai_server \
+  --model "${MODEL_PATH}" \
+  --host 0.0.0.0 \
+  --server-port 8000 \
+  --trust-remote-code \
+  --tensor-parallel-size 8 \
+  --kv_cache_dtype fp8 \
+  --block-size 16 \
+  --max-model-len 8192 \
+  --no-enable_prefix_caching \
+  --kv-transfer-config '{"kv_connector":"lmcache_offload","kv_role":"offload"}' \
+  2>&1 | tee "${SERVER_LOG}"
+```
+
+`LMCACHE_CHUNK_SIZE` must be divisible by `--block-size`. Native prefix caching
+is disabled above so repeated requests demonstrate LMCache retrieval rather than
+an HBM prefix-cache hit. It may remain enabled in production if both tiers are
+desired. `OFFLOAD_MIN_LOAD_TOKENS=0` makes short validation prompts eligible for
+reload; tune it upward in production when recomputing small prefixes is cheaper.
+
+In terminal 2, wait for readiness and send requests normally:
+
+```bash
+export MODEL_PATH=/path/to/model
+export NVME_CACHE_DIR=/mnt/nvme/lmcache
+export SERVER_LOG=/tmp/atom-lmcache-nvme.log
+
+curl -sf http://127.0.0.1:8000/v1/models
+
+curl http://127.0.0.1:8000/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d "{\"model\":\"${MODEL_PATH}\",\"prompt\":\"Repeat a sufficiently long prompt here...\",\"max_tokens\":32,\"temperature\":0}"
+```
+
+Send the same prompt again to exercise the NVMe reload path, then confirm the
+realized backend topology and store/retrieve operations:
+
+```bash
+grep -E 'storage: backends|Stored [1-9]|Retrieved [1-9]|OFFLOAD-(LOAD|SAVE)-PROF' \
+  "${SERVER_LOG}"
+find "${NVME_CACHE_DIR}" -name '*.pt' -type f | wc -l
+```
+
+For a GSM8K validation, run the evaluator twice against the same live server.
+The first pass populates NVMe and the second pass reuses the same prompt KV:
+
+```bash
+export OPENAI_API_KEY=dummy
+
+lm_eval \
+  --model local-completions \
+  --model_args "model=${MODEL_PATH},base_url=http://127.0.0.1:8000/v1/completions,tokenizer=${MODEL_PATH},tokenized_requests=False,max_length=4096,num_concurrent=32,max_retries=3,trust_remote_code=True" \
+  --tasks gsm8k \
+  --num_fewshot 5 \
+  --batch_size 1 \
+  --output_path /tmp/gsm8k-pass1 \
+  --log_samples
+```
+
+To require physical disk reads rather than Linux file-page-cache hits during a
+controlled test, evict only this cache directory between passes. Do not drop the
+host's global page cache:
+
+```bash
+python - "${NVME_CACHE_DIR}" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+files = list(Path(sys.argv[1]).rglob("*.pt"))
+for path in files:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+    finally:
+        os.close(fd)
+print(f"evicted file pages for {len(files)} LMCache chunks")
+PY
+
+lm_eval \
+  --model local-completions \
+  --model_args "model=${MODEL_PATH},base_url=http://127.0.0.1:8000/v1/completions,tokenizer=${MODEL_PATH},tokenized_requests=False,max_length=4096,num_concurrent=32,max_retries=3,trust_remote_code=True" \
+  --tasks gsm8k \
+  --num_fewshot 5 \
+  --batch_size 1 \
+  --output_path /tmp/gsm8k-pass2 \
+  --log_samples
 ```
 
 `kv_role` selects direction: `offload` (default, save + load), `kv_producer`

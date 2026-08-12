@@ -6,9 +6,8 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch
-import torch.nn as nn
 from aiter import dtypes
-
+from torch import nn
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -86,15 +85,18 @@ def _v4_entry_bytes(head_dim: int, rope_head_dim: int, kv_fp8: bool) -> int:
 
 def deepseek_v4_draft_proxy_layer_name(hf_config) -> str:
     return (
-        f"model.layers.{int(getattr(hf_config, 'num_hidden_layers'))}."
+        f"model.layers.{int(hf_config.num_hidden_layers)}."
         f"{ATOM_DEEPSEEK_V4_DRAFT_PROXY_LAYER_PREFIX}"
     )
 
 
-def _aligned_index_dim(index_head_dim: int) -> int:
-    # extra 4 Bytes for scale.
-    # 16 Bytes aligned.
-    return ((index_head_dim + 4 + 15) // 16) * 16
+def _index_row_bytes(index_head_dim: int) -> int:
+    # `index_head_dim` FP8 bytes plus a 4-byte fp32 scale. Data and scale are
+    # two REGIONS inside a block, not interleaved per row, so the alignment
+    # that matters is the block stride (`rows_per_block * this`), not this
+    # value. Rounding it up to a multiple of 16 pays the rounding once per row
+    # instead of once per block — 1.5% of the KV pool for nothing.
+    return index_head_dim + 4
 
 
 def _layer_counts(hf_config) -> tuple[list[int], int, int, int]:
@@ -106,11 +108,11 @@ def _layer_counts(hf_config) -> tuple[list[int], int, int, int]:
 
 
 def _classical_block_bytes(hf_config, kv_fp8: bool = False) -> int:
-    ratios, _dense, csa_layers, hca_layers = _layer_counts(hf_config)
+    _ratios, _dense, csa_layers, hca_layers = _layer_counts(hf_config)
     head_dim = int(getattr(hf_config, "head_dim", 512))
     rope_head_dim = _v4_rope_head_dim(hf_config)
     index_head_dim = int(getattr(hf_config, "index_head_dim", 128))
-    index_dim = _aligned_index_dim(index_head_dim)
+    index_dim = _index_row_bytes(index_head_dim)
     # NoPE(+RoPE) payload bytes per classical entry; fp8 splits into a fp8 NoPE
     # pool + a bf16 RoPE pool (see _v4_entry_bytes). Indexer is always fp8 and
     # unchanged by the 2buff layout.
@@ -198,7 +200,7 @@ def slice_deepseek_v4_proxy_cache_views(
         assert csa_layer_count is not None and hca_layer_count is not None
         compress_ratios = [4] * csa_layer_count + [128] * hca_layer_count
     ratios = [int(r) for r in compress_ratios]
-    index_dim = _aligned_index_dim(index_head_dim)
+    index_dim = _index_row_bytes(index_head_dim)
     physical = proxy_kv_cache.permute(1, 0, 2, 3, 4)
     if not physical.is_contiguous():
         raise ValueError("DeepSeek V4 proxy cache must be block-major contiguous")
@@ -568,14 +570,17 @@ def _bind_compressor_state(
     )
     compressor.kv_cache = kv_cache
     if is_indexer:
-        nb, k1, aligned_dim = kv_cache.shape
-        block_fp32_stride = (k1 * aligned_dim) // 4
-        scale_fp32_offset = (k1 * head_dim) // 4
-        kv_cache_f32 = kv_cache.view(torch.float32)
-        compressor.cache_scale = kv_cache_f32.view(-1).as_strided(
-            size=(nb, k1),
+        nb, csa_rows_per_block, index_row_bytes = kv_cache.shape
+        block_fp32_stride = (csa_rows_per_block * index_row_bytes) // 4
+        scale_fp32_offset = (csa_rows_per_block * head_dim) // 4
+        # storage_offset is ABSOLUTE and `kv_cache` is a view into vLLM's proxy
+        # pool, so its own offset has to be added or every layer's cache_scale
+        # aliases the first layer's. Mirrors `deepseek_v4_attn.py`.
+        flat_f32 = kv_cache.view(torch.float32).view(-1)
+        compressor.cache_scale = flat_f32.as_strided(
+            size=(nb, csa_rows_per_block),
             stride=(block_fp32_stride, 1),
-            storage_offset=kv_cache_f32.storage_offset() + scale_fp32_offset,
+            storage_offset=flat_f32.storage_offset() + scale_fp32_offset,
         )
     else:
         compressor.cache_scale = None
@@ -652,28 +657,6 @@ def _v4_round_to_cudagraph_bucket(n: int, sizes) -> int:
     return n
 
 
-def _build_swa_ring_block_tables(
-    state_slot_gpu: torch.Tensor, max_blocks: int, out_gpu=None
-) -> torch.Tensor:
-    """Ring-emulating SWA block table for the paged SWA ABI (project 024).
-
-    ATOM #1423 made the shared V4 SWA path content-addressed via
-    ``swa_block_tables``:
-    ``swa_kv[swa_block_tables[bid, pos // block_size] * block_size + pos % block_size]``.
-    The vllm plugin keeps the per-request ring pool (correct without prefix
-    reuse). Mapping every logical block of a request to its ring slot and passing
-    ``block_size = cs`` collapses the paged offset to the ring
-    ``slot * cs + pos % cs`` — no shared-kernel change needed. ``out_gpu`` (a
-    persistent buffer) is filled in place for CUDA-graph capture safety.
-    """
-    bs = int(state_slot_gpu.shape[0])
-    src = state_slot_gpu.view(bs, 1).expand(bs, max_blocks)
-    if out_gpu is not None:
-        out_gpu[:bs, :max_blocks].copy_(src)
-        return out_gpu[:bs, :max_blocks]
-    return src.contiguous()
-
-
 class _V4DecodeMetaBuffers:
     """Persistent, fixed-address scratch for the V4 *decode* attention metadata.
 
@@ -718,10 +701,6 @@ class _V4DecodeMetaBuffers:
 
         # Per-seq scalars (sized to padded request count == num_slots).
         self.state_slot = i32(S)
-        # Ring-emulating SWA block table (project 024): [S, max_blocks], every
-        # column = the request's ring slot; paged block_size = cs. Persistent so
-        # its address is stable across CUDA-graph replay.
-        self.swa_block_tables = i32(S, self.max_blocks)
         self.n_csa = i32(S)
         self.n_hca = i32(S)
         # Per-token mapping (sized to padded token count). int32: accepted by
@@ -849,13 +828,12 @@ def bind_deepseek_v4_proxy_cache_views(
         layer_id = int(getattr(attn, "layer_id", fallback_layer_id))
         ratio = int(attn.compress_ratio)
         attn.unified_kv = views["unified"][layer_id]
-        # paged SWA ABI (#1423): shared _attn_core / swa_write treat swa_kv as a
-        # flat [pages, head_dim] region addressed by swa_block_tables. Plugin keeps
-        # the ring pool but exposes it flat with block_size = cs, so a ring-slot
-        # block table reduces the paged offset to `slot*cs + pos%cs` (project 024).
+        # The shared kernels address SWA as a per-request ring,
+        # `slot*cache_size + pos%cache_size`, which is the layout this pool
+        # already had; it is exposed flat because the kernels index rows.
         swa_view = views["swa"][layer_id]
         attn.swa_kv = swa_view.reshape(-1, swa_view.shape[-1])
-        attn.swa_block_size = int(win_with_spec)
+        attn.swa_cache_size = int(win_with_spec)
         # #1600 contract: DeepseekV4Attention.forward reads unified_kv_rope /
         # swa_kv_rope unconditionally (the parallel bf16 rope pool of the fp8
         # 2buff layout). bf16 -> both None (RoPE stays inline in unified_kv,
@@ -1357,11 +1335,6 @@ def build_atom_v4_attention_metadata(
         bufs = decode_bufs
         md.state_slot_mapping_cpu = slot_arr
         md.state_slot_mapping = bufs.stage(bufs.state_slot, slot_arr)
-        # Ring-emulating SWA block table for the paged write in _attn_core
-        # (capture-safe persistent buffer). block_size = cs at bind time.
-        md.swa_block_tables = _build_swa_ring_block_tables(
-            md.state_slot_mapping, bufs.max_blocks, out_gpu=bufs.swa_block_tables.gpu
-        )
         # Per-token seq map padded to T_pad with the -1 sentinel tail.
         if total:
             bufs.batch_id.np[:total] = batch_np
@@ -1433,9 +1406,6 @@ def build_atom_v4_attention_metadata(
     # ---- eager path: prefill, or decode without persistent buffers ----
     md.state_slot_mapping = torch.from_numpy(slot_arr).to(device)
     md.state_slot_mapping_cpu = slot_arr
-    md.swa_block_tables = _build_swa_ring_block_tables(
-        md.state_slot_mapping, int(common_attn_metadata.block_table_tensor.shape[1])
-    )
     md.batch_id_per_token = torch.from_numpy(batch_np).to(device)
     md.n_committed_csa_per_seq = torch.from_numpy(n_csa_cpu).to(device)
     md.n_committed_hca_per_seq = torch.from_numpy(n_hca_cpu).to(device)
@@ -1791,7 +1761,6 @@ def _populate_prefill(md, common, batch_np, pos_np, q_np, positions_gpu):
         state_slot_per_seq=md.state_slot_mapping[:num_reqs],
         n_committed_hca_per_seq=n_hca_seq_g,
         block_tables=common.block_table_tensor[:num_reqs],
-        swa_block_tables=md.swa_block_tables[:num_reqs],
         extend_indptr=ext_indptr,
         prefix_swa_indptr=swa_indptr,
         prefix_csa_indptr=csa_indptr,
@@ -1802,7 +1771,7 @@ def _populate_prefill(md, common, batch_np, pos_np, q_np, positions_gpu):
         prefix_hca_indices=hca_indices,
         T=T,
         win=win,
-        block_size=cs,
+        cache_size=cs,
         swa_pages=swa_pages,
     )
     md.kv_indices_extend = ext_indices[:ext_total]
@@ -1848,7 +1817,6 @@ def _populate_decode(md, common, batch_np, pos_np, positions_gpu):
     # the shared SWA window prefix into all three buffers, a second appends
     # the HCA compress tail straight from the GPU block table
     from atom.model_ops.v4_kernels import write_v4_paged_decode_indices
-
     from atom.plugin.vllm.deepseek_v4_ops import (
         write_v4_decode_hca_compress_tail,
     )
@@ -1857,7 +1825,7 @@ def _populate_decode(md, common, batch_np, pos_np, positions_gpu):
     csa_indices = torch.empty(max(csa_total, 1), dtype=torch.int32, device=device)
     hca_indices = torch.empty(max(hca_total, 1), dtype=torch.int32, device=device)
     write_v4_paged_decode_indices(
-        block_tables=md.swa_block_tables,
+        state_slot_per_seq=md.state_slot_mapping,
         batch_id_per_token=md.batch_id_per_token,
         positions=positions_gpu,
         swa_indptr=swa_indptr,
@@ -1868,7 +1836,7 @@ def _populate_decode(md, common, batch_np, pos_np, positions_gpu):
         hca_indices=hca_indices,
         T=T,
         win=win,
-        block_size=cs,
+        cache_size=cs,
     )
     write_v4_decode_hca_compress_tail(
         batch_id_per_token=md.batch_id_per_token,

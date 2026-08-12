@@ -3,6 +3,7 @@
 
 import logging
 import queue
+from typing import ClassVar
 
 from atom.model_engine.sequence import SequenceStatus
 
@@ -31,7 +32,7 @@ class EngineUtilityHandler:
     """
 
     # Utility command name  ->  handler method name
-    _UTILITY_HANDLERS = {
+    _UTILITY_HANDLERS: ClassVar[dict[str, str]] = {
         "update_weights": "_handle_update_weights",
         "update_weights_shm": "_handle_update_weights_shm",
         "update_weights_ipc": "_handle_update_weights_ipc",
@@ -43,6 +44,7 @@ class EngineUtilityHandler:
         "stop_profile": "_handle_stop_profile",
         "get_mtp_stats": "_handle_get_mtp_stats",
         "get_mtp_statistics": "_handle_get_mtp_statistics",
+        "get_cache_statistics": "_handle_get_cache_statistics",
         "abort_request": "_handle_abort_request",
     }
 
@@ -289,4 +291,29 @@ class EngineUtilityHandler:
             result["enabled"] = True
         self.output_queue.put_nowait(
             ("UTILITY_RESPONSE", {"cmd": "get_mtp_statistics", "result": result})
+        )
+
+    # ------------------------------------------------------------------
+    # Prefix cache statistics
+    # ------------------------------------------------------------------
+
+    def _handle_get_cache_statistics(self, args: dict):
+        """Return structured prefix-cache statistics via UTILITY_RESPONSE.
+
+        Same counters the periodic `[Cache Stats]` log line reports, on demand
+        instead of every hundredth request — a client measuring reuse over a
+        handful of requests cannot wait for that interval, and reading it out
+        of a log is not something a client can do at all.
+        """
+        stats = None if self.scheduler is None else self.scheduler.cache_stats
+        if stats is None:
+            result = {"enabled": False}
+        else:
+            result = stats.get_statistics()
+            result["enabled"] = True
+            # `CacheStats` counts the reuse a request wanted and did not
+            # get; the funnel is where it was lost.
+            result |= self.scheduler.block_manager.checkpoint_funnel()
+        self.output_queue.put_nowait(
+            ("UTILITY_RESPONSE", {"cmd": "get_cache_statistics", "result": result})
         )
