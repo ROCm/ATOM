@@ -20,10 +20,15 @@ import os
 
 from atom.utils import resolve_obj_by_qualname
 
+_MINIMAX_H3 = "atom.diffusion.models.minimax_h3.pipeline.MiniMaxH3Pipeline"
+
 _PIPELINE_ARCH_TO_CLASS: dict[str, str] = {
-    "MiniMaxH3ModularPipeline": (
-        "atom.diffusion.models.minimax_h3.pipeline.MiniMaxH3Pipeline"
-    ),
+    # What the released checkpoint root declares.
+    "MiniMaxH3ModularPipeline": _MINIMAX_H3,
+    # What a partition under that root declares. ``--model <root>/FL2VA`` is
+    # the documented way to serve one variant, so the manifest the server
+    # actually reads is usually this one, not the root's.
+    "MiniMaxH3Pipeline": _MINIMAX_H3,
 }
 
 MODEL_INDEX_FILENAME = "model_index.json"

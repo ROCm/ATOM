@@ -259,6 +259,24 @@ sequence-parallel group takes decode from 27.5 s to **4.1 s** at Ulysses-8,
 output pixel-identical. The video VAE therefore lives on every rank (~5 GB in
 bf16); the encoder and audio VAE stay on rank 0.
 
+Which rank holds what is a declaration, not a code path -- `component_placement`
+on the pipeline class, read by `ComposedPipeline` to guard `register_component`
+and to derive `verify_components`:
+
+```python
+component_placement = {
+    "transformer":  ComponentPlacement.ALL_RANKS,
+    "video_vae":    ComponentPlacement.ALL_RANKS,   # tiled decode is collective
+    "audio_vae":    ComponentPlacement.MAIN_RANK,
+    "text_encoder": ComponentPlacement.MAIN_RANK,
+}
+```
+
+Each rank then asserts exactly its own set at load: a video VAE that failed to
+load on rank 3 is an error there rather than a hang in decode. This is a
+different axis from `host_staged_components`, which is host-or-device; the text
+encoder is both rank-0-only and staged.
+
 Attention skips the trailing alignment padding. The ASM kernel's grid is
 `(heads, num_segments, ceil(max_seqlen / 256))` and is sized from `max_seqlen`
 rather than from each segment, so a 24-row padding segment gets a whole plane

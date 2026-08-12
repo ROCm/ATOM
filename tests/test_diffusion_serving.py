@@ -668,6 +668,19 @@ def test_a_known_checkpoint_selects_its_pipeline_without_a_flag(tmp_path):
     )
 
 
+def test_a_partition_manifest_resolves_like_the_root(tmp_path):
+    """``--model <root>/FL2VA`` is the documented invocation, and a partition's
+    model_index.json declares MiniMaxH3Pipeline where the root declares
+    MiniMaxH3ModularPipeline. Both have to land on the same pipeline."""
+    from atom.diffusion.registry import pipeline_class_for_checkpoint
+
+    root = write_model_index(tmp_path / "root", "MiniMaxH3ModularPipeline")
+    part = write_model_index(tmp_path / "root" / "FL2VA", "MiniMaxH3Pipeline")
+    assert pipeline_class_for_checkpoint(str(part)) == pipeline_class_for_checkpoint(
+        str(root)
+    )
+
+
 def test_the_pipeline_flag_overrides_the_checkpoint(tmp_path):
     """Out-of-tree pipelines have no registry entry, so the flag has to win."""
     from atom.diffusion.entrypoints.diffusion_server import (
@@ -696,7 +709,8 @@ def test_an_unknown_architecture_names_what_is_supported(tmp_path):
 
 def test_a_checkpoint_with_no_index_says_so(tmp_path):
     """The failure has to name the missing file: the common cause is pointing
-    --model at the parent of the partition rather than at the partition."""
+    --model one level too high, at a directory that holds checkpoints rather
+    than at one."""
     from atom.diffusion.entrypoints.diffusion_server import (
         build_parser,
         config_from_args,

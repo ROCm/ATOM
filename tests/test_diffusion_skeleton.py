@@ -7,6 +7,8 @@ Follows the repo convention in tests/conftest.py: import the real classes, do
 not fake modules. Nothing here needs a GPU or AITER.
 """
 
+from typing import ClassVar
+
 import pytest
 import torch
 
@@ -14,6 +16,7 @@ from atom.diffusion.config import DiffusionConfig, PerformanceMode
 from atom.diffusion.engine.job_scheduler import AdmissionError, JobScheduler
 from atom.diffusion.engine.pipeline_runner import PipelineRunner
 from atom.diffusion.pipeline import (
+    ComponentPlacement,
     ComposedPipeline,
     DiffusionBatch,
     PipelineStage,
@@ -240,6 +243,66 @@ def test_pipeline_requires_its_components():
     pipe = _Pipeline(make_config())
     with pytest.raises(RuntimeError, match="missing required components"):
         pipe.forward(_batch())
+
+
+# ── component placement ───────────────────────────────────────────────────
+#
+# These run at world size 1 and move ``_rank`` by hand, the same trick
+# test_main_rank_only_stage_skipped_off_main uses. That exercises the
+# bookkeeping, not the collectives -- multi-rank behaviour still needs a real
+# multi-GPU run.
+
+
+class _Placed(ComposedPipeline):
+    pipeline_name = "PlacedPipeline"
+    required_components = ("transformer", "shared_vae", "encoder")
+    component_placement: ClassVar[dict[str, ComponentPlacement]] = {
+        "shared_vae": ComponentPlacement.ALL_RANKS,
+        "encoder": ComponentPlacement.MAIN_RANK,
+    }
+
+    def build_stages(self):
+        return [_Produce(), _Consume()]
+
+
+def _placed_off_main() -> _Placed:
+    pipe = _Placed(make_config())
+    pipe.ulysses._rank = 1
+    return pipe
+
+
+def test_an_unlisted_component_lives_on_every_rank():
+    # "transformer" is absent from component_placement.
+    assert _placed_off_main().holds("transformer")
+
+
+def test_a_rank_refuses_a_component_it_should_not_hold():
+    pipe = _placed_off_main()
+    with pytest.raises(RuntimeError, match="rank 1 registered 'encoder'"):
+        pipe.register_component("encoder", torch.nn.Identity())
+
+
+def test_a_main_rank_component_is_not_missing_where_it_never_belonged():
+    pipe = _placed_off_main()
+    pipe.register_component("transformer", torch.nn.Identity())
+    pipe.register_component("shared_vae", torch.nn.Identity())
+    pipe.verify_components()  # "encoder" is rank 0's, so its absence is fine
+
+
+def test_a_shared_component_is_still_required_off_main():
+    # The regression the hand-written per-pipeline override let through: an
+    # all-ranks VAE that failed to load on rank 1 used to surface at decode.
+    pipe = _placed_off_main()
+    pipe.register_component("transformer", torch.nn.Identity())
+    with pytest.raises(RuntimeError, match=r"rank 1 .*\['shared_vae'\]"):
+        pipe.verify_components()
+
+
+def test_the_main_rank_holds_everything():
+    pipe = _Placed(make_config())
+    for name in _Placed.required_components:
+        pipe.register_component(name, torch.nn.Identity())
+    pipe.verify_components()
 
 
 def test_pipeline_rejects_empty_stage_list():

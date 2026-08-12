@@ -63,6 +63,7 @@ from atom.diffusion.models.minimax_h3.layout import (
 )
 from atom.diffusion.mux import write_video_with_audio
 from atom.diffusion.pipeline import (
+    ComponentPlacement,
     ComposedPipeline,
     DiffusionBatch,
     PipelineStage,
@@ -778,6 +779,15 @@ class MiniMaxH3Pipeline(ComposedPipeline):
     # 192 GB card during denoise; measured, not predicted.
     host_staged_components = ("text_encoder",)
 
+    component_placement: ClassVar[dict[str, ComponentPlacement]] = {
+        "transformer": ComponentPlacement.ALL_RANKS,
+        # Its bundled tiled decode shards tiles across the group, so this one
+        # is collective despite decode looking like a rank-0 step.
+        "video_vae": ComponentPlacement.ALL_RANKS,
+        "audio_vae": ComponentPlacement.MAIN_RANK,
+        "text_encoder": ComponentPlacement.MAIN_RANK,
+    }
+
     # Identity defaults so construction never touches the filesystem; the real
     # values load in load_components(), where a wrong path fails loudly.
     video_stats: tuple[list[float], list[float]] = ([0.0] * 24, [1.0] * 24)
@@ -788,8 +798,10 @@ class MiniMaxH3Pipeline(ComposedPipeline):
 
         None is a plain state-dict load: the DiT needs the grouped-QKV reorder,
         the VAEs come from the checkpoint's own ``auto_map`` classes, and the
-        encoder is Qwen3-VL truncated one layer past the one it reads. Encoder
-        and VAEs are main-rank only -- a copy per rank is ~70 GB of waste.
+        encoder is Qwen3-VL truncated one layer past the one it reads. Which
+        ranks build what is declared in ``component_placement``, not decided
+        here -- the encoder and audio VAE are rank 0 alone because a copy per
+        rank is ~70 GB of waste.
         """
         import torch
 
@@ -847,7 +859,9 @@ class MiniMaxH3Pipeline(ComposedPipeline):
         )
         self.register_component("video_vae", video_vae)
 
-        if not self.ulysses.is_main:
+        # Everything below is MAIN_RANK in component_placement; stop before
+        # building it rather than building ~70 GB and discarding it.
+        if not self.holds("audio_vae"):
             return
         self.register_component(
             "audio_vae",
@@ -983,16 +997,6 @@ class MiniMaxH3Pipeline(ComposedPipeline):
                 torch.zeros(geo.audio_t * 2, arch.audio_latents_dim, device=device),
                 mean=stats[0] if stats else None,
                 std=stats[1] if stats else None,
-            )
-
-    def verify_components(self) -> None:
-        """Only the main rank holds the encoder and VAEs, so only it is checked."""
-        if self.ulysses.is_main:
-            super().verify_components()
-        elif "transformer" not in self.components:
-            raise RuntimeError(
-                f"{self.pipeline_name} is missing required components: "
-                "['transformer']"
             )
 
     def build_stages(self):

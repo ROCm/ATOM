@@ -273,3 +273,31 @@ def test_warmup_decode_covers_both_vaes(tmp_path):
     )
     pipe._warmup_decode(geo, pipe.component("transformer").arch, "cpu")
     assert seen == ["video_vae", "audio_vae"]
+
+
+def test_non_main_ranks_still_owe_the_video_vae(tmp_path):
+    """The video VAE's tiled decode is collective, so every rank must hold it.
+
+    Guards the placement declaration specifically: the earlier hand-written
+    per-rank check asked only for the transformer off main, so a video VAE that
+    failed to load on rank 3 surfaced as a hang in decode rather than an error
+    at load.
+    """
+    config = DiffusionConfig(
+        model_path="<test>",
+        pipeline_class="atom.diffusion.models.minimax_h3.pipeline.MiniMaxH3Pipeline",
+        num_gpus=1,
+        ulysses_degree=1,
+        num_inference_steps=3,
+        output_dir=str(tmp_path),
+    )
+    pipe = MiniMaxH3Pipeline(config)
+    pipe.ulysses._rank = 3
+    pipe.register_component("transformer", MiniMaxH3DiTModel(tiny_arch()).eval())
+
+    with pytest.raises(RuntimeError, match=r"rank 3 .*\['video_vae'\]"):
+        pipe.verify_components()
+
+    # ...but the text encoder it never builds is not held against it.
+    pipe.register_component("video_vae", StubVideoVAE().eval())
+    pipe.verify_components()

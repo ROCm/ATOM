@@ -16,13 +16,32 @@ import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from atom.diffusion.config import DiffusionConfig
 from atom.diffusion.ulysses import UlyssesGroup
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from atom.diffusion.request import DiffusionJob
+
+
+class ComponentPlacement(Enum):
+    """Which ranks of a replica hold a component.
+
+    The sibling of :class:`StageParallelism`: that says where work runs, this
+    says where weights live. Declaring it as data lets the base class derive
+    both the load-time guard and ``verify_components``, so the rule is stated
+    once instead of being re-derived by each pipeline.
+    """
+
+    ALL_RANKS = auto()
+    """Every rank builds it. Required for collective use -- denoise, and the
+    video VAE's bundled tiled decode, which all-gathers tiles across the
+    group. This is the default for a component with no declared placement."""
+
+    MAIN_RANK = auto()
+    """Rank 0 only. For components used serially, where a copy per rank is
+    pure waste -- the H3 text encoder alone is ~67 GB."""
 
 
 class StageParallelism(Enum):
@@ -163,7 +182,34 @@ class ComposedPipeline(ABC):
     once per request and too large to keep co-resident.
     """
 
+    component_placement: ClassVar[dict[str, ComponentPlacement]] = {}
+    """Which ranks hold which component. Unlisted means ``ALL_RANKS``.
+
+    A separate axis from ``host_staged_components``: this is *which ranks*,
+    that is *host or device*. The text encoder is both -- rank 0 only, and
+    staged rather than resident.
+    """
+
+    def placement_of(self, name: str) -> ComponentPlacement:
+        return self.component_placement.get(name, ComponentPlacement.ALL_RANKS)
+
+    def holds(self, name: str) -> bool:
+        """Whether this rank is meant to hold ``name``."""
+        if self.placement_of(name) is ComponentPlacement.ALL_RANKS:
+            return True
+        return self.ulysses.is_main
+
     def register_component(self, name: str, module: object) -> None:
+        if not self.holds(name):
+            # Building it at all already cost the host memory, so this is a
+            # load-time error rather than a silent drop: the caller should not
+            # have constructed it on this rank.
+            raise RuntimeError(
+                f"{self.pipeline_name} rank {self.ulysses.rank} registered "
+                f"{name!r}, which it declares as "
+                f"{self.placement_of(name).name}; build it only where "
+                "component_placement says it is held"
+            )
         self.components[name] = module
 
     def component(self, name: str) -> object:
@@ -194,10 +240,20 @@ class ComposedPipeline(ABC):
         return False
 
     def verify_components(self) -> None:
-        missing = [c for c in self.required_components if c not in self.components]
+        """Check this rank holds everything ``component_placement`` says it should.
+
+        Per-rank, not uniform: a rank is not missing the text encoder if it was
+        never meant to have one.
+        """
+        missing = [
+            c
+            for c in self.required_components
+            if self.holds(c) and c not in self.components
+        ]
         if missing:
             raise RuntimeError(
-                f"{self.pipeline_name} is missing required components: {missing}"
+                f"{self.pipeline_name} rank {self.ulysses.rank} is missing "
+                f"required components: {missing}"
             )
 
     # ------------------------------------------------------------------
