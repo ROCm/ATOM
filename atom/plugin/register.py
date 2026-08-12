@@ -38,6 +38,8 @@ _ATOM_SUPPORTED_MODELS = {
 if is_sglang():
     from atom.models.deepseek_v4 import DeepseekV4ForCausalLM
     from atom.models.eagle3_llama import Eagle3LlamaModel
+    from atom.models.kimi_k3 import KimiK3ForCausalLM
+    from atom.models.kimi_k3_dspark import KimiK3DSpark
     from atom.models.kimi_k25 import KimiK25ForCausalLM
     from atom.models.qwen3_5 import (
         Qwen3_5ForCausalLM,
@@ -58,10 +60,13 @@ if is_sglang():
             # sglang's native model and failed weight loading on the excluded
             # (BF16) attention projections.
             "KimiK25ForConditionalGeneration": KimiK25ForCausalLM,
+            "KimiK3ForConditionalGeneration": KimiK3ForCausalLM,
         }
     )
     _ATOM_SUPPORTED_DRAFT_MODELS = {
         "LlamaForCausalLMEagle3": Eagle3LlamaModel,
+        # Kimi-K3 DSpark standalone block drafter (arch K3DSparkModel).
+        "K3DSparkModel": KimiK3DSpark,
     }
     _ATOM_SUPPORTED_MODELS.update(_ATOM_SUPPORTED_DRAFT_MODELS)
 
@@ -87,6 +92,10 @@ def _register_custom_attention_to_sglang() -> None:
         ATOMGLM52DSABackendForSgl,
         install_upstream_glm52_graph_metadata_adapter,
     )
+    from atom.plugin.sglang.attention_backend.kimi_k3_backend import (
+        ATOMKimiK3BackendForSgl,
+    )
+    from atom.plugin.sglang.kimi_k3_bridge import is_kimi_k3_config
     from atom.plugin.sglang.runtime import is_glm52_dsa_config
 
     # here register the custom attention backend with the name "aiter"
@@ -118,6 +127,11 @@ def _register_custom_attention_to_sglang() -> None:
             return ATOMDeepseekV4BackendForSgl(runner)
         if is_glm52_dsa_config(hf_config):
             return create_glm52_backend(runner)
+        if is_kimi_k3_config(hf_config):
+            logger.info(
+                "Use ATOMKimiK3BackendForSgl for Kimi-K3 through SGLang aiter backend choice"
+            )
+            return ATOMKimiK3BackendForSgl(runner)
         return ATOMAttnBackendForSgl(runner)
 
     @register_attention_backend("dsv4")

@@ -375,3 +375,28 @@ def test_register_custom_attention_uses_aiter_name():
     assert recorded["backend_name"] == "aiter"
     assert isinstance(backend, _FakeBackend)
     assert backend.runner == "runner"
+
+
+def test_sglang_plugin_registration_does_not_require_kimi_k3_pool_modules():
+    from atom.plugin.sglang import register
+
+    register_processor = MagicMock()
+    apply_load_config_patch = MagicMock()
+
+    with (
+        patch.object(register, "_install_model_config_quant_patch"),
+        patch.object(register, "_install_loader_quant_patch"),
+        patch.dict(sys.modules, {"atom.plugin.sglang.kimi_k3_bridge": None}),
+        patch(
+            "atom.plugin.sglang.models.kimi_k3_processor.register_kimi_k3_text_only_processor",
+            register_processor,
+        ),
+        patch(
+            "atom.plugin.sglang.runtime.apply_load_config_patch",
+            apply_load_config_patch,
+        ),
+    ):
+        register.register_plugin()
+
+    register_processor.assert_called_once_with()
+    apply_load_config_patch.assert_called_once_with()

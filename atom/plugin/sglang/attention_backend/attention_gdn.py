@@ -17,6 +17,11 @@ from atom.model_ops.attentions.gdn_attn import (
     GDNAttentionMetadata,
     compute_causal_conv1d_metadata,
 )
+from atom.plugin.sglang.attention_backend.backend_resolver import (
+    reconstruct_linear_metadata,
+    resolve_attn_backend,
+    resolve_mamba_req_pool,
+)
 from atom.utils.forward_context import (
     AttentionMetaData,
     Context,
@@ -54,23 +59,24 @@ class SGLangGDNForwardContext:
         return getattr(attn_backend, "linear_attn_backend", attn_backend)
 
     @staticmethod
-    def _resolve_attn_backend(forward_batch: Any) -> Any:
-        backend = getattr(forward_batch, "attn_backend", None)
-        if backend is not None:
-            return backend
+    def _is_kimi_k3_target_verify() -> bool:
+        """Report whether the running model is Kimi-K3.
+
+        TARGET_VERIFY below is implemented by the Kimi-K3 DSpark helpers only.
+        Any other GDN model (Qwen3-Next, ...) must keep the previous
+        "unsupported" behaviour instead of routing into Kimi-K3 code.
+        """
+        from atom.plugin.sglang.kimi_k3_bridge import is_kimi_k3_config
 
         try:
-            from sglang.srt.model_executor.forward_context import (
-                get_attn_backend,
-                has_forward_context,
-            )
+            atom_config = get_current_atom_config()
+        except AssertionError:
+            return False
+        return is_kimi_k3_config(getattr(atom_config, "hf_config", None))
 
-            if has_forward_context():
-                return get_attn_backend()
-        except Exception:  # noqa: BLE001, S110 - forward context is optional
-            pass
-
-        return None
+    @staticmethod
+    def _resolve_attn_backend(forward_batch: Any) -> Any:
+        return resolve_attn_backend(forward_batch)
 
     @staticmethod
     def _patch_forward_batch_pools(forward_batch: Any, attn_backend: Any) -> None:
@@ -87,10 +93,8 @@ class SGLangGDNForwardContext:
     def _build_kv_cache_tensors(
         forward_batch: Any, attn_backend: Any
     ) -> dict[str, KVCacheTensor]:
-        pool = getattr(forward_batch, "req_to_token_pool", None)
-        if pool is None:
-            pool = getattr(attn_backend, "req_to_token_pool", None)
-        if pool is None:
+        pool = resolve_mamba_req_pool(forward_batch, attn_backend)
+        if pool is None or getattr(pool, "mamba_map", None) is None:
             try:
                 from sglang.srt.model_executor.forward_context import (
                     get_req_to_token_pool,
@@ -107,6 +111,19 @@ class SGLangGDNForwardContext:
         mamba_map = getattr(pool, "mamba_map", None)
         if mamba_map is None:
             return {}
+
+        if (
+            getattr(forward_batch, "forward_mode", None) is not None
+            and forward_batch.forward_mode.is_target_verify()
+            and SGLangGDNForwardContext._is_kimi_k3_target_verify()
+        ):
+            from atom.plugin.sglang.kimi_k3_spec_verify import (
+                build_spec_cache_tensors,
+            )
+
+            return build_spec_cache_tensors(
+                forward_batch, attn_backend, pool, mamba_map
+            )
 
         out: dict[str, KVCacheTensor] = {}
         for layer_id in mamba_map:
@@ -126,7 +143,9 @@ class SGLangGDNForwardContext:
         mode = forward_batch.forward_mode
         is_prefill = mode.is_prefill()
         num_tokens = (
-            forward_batch.seq_lens_sum if mode.is_extend() else forward_batch.batch_size
+            int(forward_batch.seq_lens_sum)
+            if mode.is_extend()
+            else int(forward_batch.batch_size)
         )
         return (
             Context(
@@ -142,25 +161,39 @@ class SGLangGDNForwardContext:
     def _build_gdn_metadata(
         forward_batch: Any, linear_backend: Any
     ) -> GDNAttentionMetadata | None:
-        fm = getattr(linear_backend, "forward_metadata", None)
-        if fm is None:
-            return None
-
         mode = forward_batch.forward_mode
         if mode.is_target_verify():
-            logger.warning(
-                "SGLang GDN forward context: TARGET_VERIFY is not supported; GDN metadata skipped."
-            )
-            return None
+            if not SGLangGDNForwardContext._is_kimi_k3_target_verify():
+                logger.warning(
+                    "SGLang GDN forward context: TARGET_VERIFY is only "
+                    "supported for Kimi-K3; GDN metadata skipped."
+                )
+                return None
 
-        device = fm.query_start_loc.device
-        idx = fm.mamba_cache_indices.to(dtype=torch.int32, device=device)
+            from atom.plugin.sglang.kimi_k3_spec_verify import (
+                build_spec_gdn_metadata,
+                build_spec_plan,
+            )
+
+            plan = build_spec_plan(forward_batch, linear_backend)
+            return build_spec_gdn_metadata(plan)
+
         bs = forward_batch.batch_size
+        fm = getattr(linear_backend, "forward_metadata", None)
+        query_start_loc = getattr(fm, "query_start_loc", None)
+        idx = getattr(fm, "mamba_cache_indices", None)
+        if query_start_loc is None or idx is None:
+            reconstructed = reconstruct_linear_metadata(forward_batch, linear_backend)
+            if reconstructed is None:
+                return None
+            query_start_loc, idx = reconstructed
+        device = query_start_loc.device
+        idx = idx.to(dtype=torch.int32, device=device)
         common_kwargs = {
             "num_spec_decodes": 0,
             "num_spec_decode_tokens": 0,
             "spec_query_start_loc": None,
-            "non_spec_query_start_loc": fm.query_start_loc,
+            "non_spec_query_start_loc": query_start_loc,
             "spec_state_indices_tensor": None,
             "non_spec_state_indices_tensor": idx,
             "spec_sequence_masks": None,
@@ -184,11 +217,13 @@ class SGLangGDNForwardContext:
             )
 
         if mode.is_extend():
-            seq_sum = forward_batch.seq_lens_sum
+            # SGLang's seq_lens_sum includes cached prefix tokens for some
+            # hybrid batches; GDN only receives the active query tokens.
+            seq_sum = int(query_start_loc[-1].item())
             epl = forward_batch.extend_prefix_lens
             has_initial_state = None if epl is None else epl > 0
             nums_dict, batch_ptr, token_chunk_offset_ptr = (
-                compute_causal_conv1d_metadata(fm.query_start_loc)
+                compute_causal_conv1d_metadata(query_start_loc)
             )
             return GDNAttentionMetadata(
                 num_prefills=bs,
@@ -234,7 +269,7 @@ class SGLangGDNForwardContext:
         if gdn_metadata is None:
             return None
 
-        kv_cache_data = cls._build_kv_cache_tensors(forward_batch, attn_backend)
+        kv_cache_data = cls._build_kv_cache_tensors(forward_batch, linear_backend)
         if not kv_cache_data:
             return None
 

@@ -32,6 +32,8 @@ class SGLangModelAdapterSpec:
 
     wrapper_binds_gdn_context: bool = False
     uses_context_only_forward: bool = False
+    uses_text_config: bool = False
+    load_weights_prefix: str = "model."
     # SGLang initializes atom_config from the target ServerArgs but passes a
     # draft-local HF config to the external draft model. This early hook lets
     # adapters preserve target metadata and switch to the draft config before
@@ -68,6 +70,67 @@ def _prepare_kimi_k25_config(atom_config: Any, model_arch: str) -> None:
     )
 
     remap_kimi_k25_quant_config_for_sglang_plugin(atom_config, model_arch)
+
+
+def _prepare_kimi_k3_config(atom_config: Any, model_arch: str) -> None:
+    del model_arch
+    from atom.models.kimi_k3 import (
+        KimiK3ForCausalLM,
+        _kda_packed_modules_mapping,
+        _normalize_kimi_config,
+        _text_config,
+    )
+
+    text_config = _text_config(atom_config.hf_config)
+    _normalize_kimi_config(text_config)
+    # K3's SGLang bridge allocates a 128-token hybrid pool.  True MLA uses
+    # ATOM_MLA_PAGE_SIZE=1 with that pool rather than segmented MLA (page 64).
+    atom_config.kv_cache_block_size = 128
+    quant_config = getattr(atom_config, "quant_config", None)
+    if quant_config is not None:
+        quant_config.remap_layer_name(
+            atom_config.hf_config,
+            packed_modules_mapping=_kda_packed_modules_mapping(
+                text_config.kimi_kda_layers
+            ),
+            quant_exclude_name_mapping=KimiK3ForCausalLM.quant_exclude_name_mapping,
+        )
+
+
+def _kimi_k3_construction_context():
+    from atom.plugin.sglang.kimi_k3_bridge import (
+        kimi_k3_native_attention_construction,
+    )
+
+    return kimi_k3_native_attention_construction()
+
+
+def _bind_kimi_k3_cache_views(model: Any, runtime: Any) -> None:
+    from atom.plugin.sglang.attention_backend.attention_gdn import (
+        SGLangGDNForwardContext,
+    )
+    from atom.plugin.sglang.kimi_k3_bridge import (
+        bind_kimi_k3_cache_views,
+        maybe_get_kimi_k3_pools,
+    )
+    from atom.utils.forward_context import get_forward_context, set_kv_cache_data
+
+    token_to_kv_pool, _ = maybe_get_kimi_k3_pools(runtime.forward_batch)
+    if not bind_kimi_k3_cache_views(model, token_to_kv_pool):
+        raise RuntimeError("Kimi-K3 SGLang KV pool is not initialized")
+
+    attn_backend = SGLangGDNForwardContext._resolve_attn_backend(runtime.forward_batch)
+    linear_backend = SGLangGDNForwardContext._linear_attn_backend(attn_backend)
+    gdn_cache = SGLangGDNForwardContext._build_kv_cache_tensors(
+        runtime.forward_batch, linear_backend
+    )
+    if not gdn_cache:
+        raise RuntimeError("Kimi-K3 SGLang GDN state cache is not initialized")
+    ctx = get_forward_context()
+    kv_cache_data = dict(ctx.kv_cache_data or {})
+    kv_cache_data.update(gdn_cache)
+    set_kv_cache_data(kv_cache_data)
+    ctx.kv_cache_data = kv_cache_data
 
 
 def _prepare_minimax_m3_config(atom_config: Any, model_arch: str) -> None:
@@ -290,6 +353,81 @@ def _bind_eagle3_llama_cache_views(model: Any, runtime: Any) -> None:
         raise RuntimeError("EAGLE3 SGLang draft KV pool is not initialized")
 
 
+def _prepare_k3_dspark_draft_model_config(atom_config: Any, draft_config: Any) -> None:
+    """Switch the ATOM config to the Kimi-K3 DSpark draft checkpoint.
+
+    SGLang builds the plugin ``atom_config`` from the target ServerArgs but
+    passes the draft-local HF config here. Normalize the standalone DSpark draft
+    fields onto ATOM's canonical ``dspark_*`` names, remember the target layer
+    count (the draft attention numbers itself after the target stack), and point
+    weight loading + quant at the draft checkpoint.
+    """
+    from atom.config import QuantizationConfig, _normalize_draft_dspark_config
+
+    _normalize_draft_dspark_config(draft_config)
+
+    # The Kimi-K3 DSpark checkpoint ships an untrained (training-only) confidence
+    # head that is deliberately not loaded; run a fixed verify length. Clear the
+    # config flag so sglang's DSpark worker does not expect confidence weights or
+    # enable confidence-scheduled ragged verify.
+    if getattr(draft_config, "enable_confidence_head", False):
+        draft_config.enable_confidence_head = False
+
+    target_config = getattr(atom_config.hf_config, "text_config", atom_config.hf_config)
+    atom_config.sgl_atom_k3_dspark_layer_offset = int(
+        getattr(target_config, "num_hidden_layers", 0) or 0
+    )
+
+    atom_config.hf_config = draft_config
+    model_path = getattr(draft_config, "_name_or_path", None) or getattr(
+        draft_config, "name_or_path", None
+    )
+    if not model_path:
+        # The draft HF config may not carry a usable _name_or_path; fall back to
+        # the authoritative draft path from server args so the ATOM loader reads
+        # the DRAFT checkpoint (not the target, whose MoE shared-expert names
+        # would trip the weight rewriter).
+        try:
+            from sglang.srt.server_args import get_global_server_args
+
+            model_path = getattr(
+                get_global_server_args(), "speculative_draft_model_path", None
+            )
+        except Exception:  # noqa: BLE001 - server args optional in unit tests
+            model_path = None
+    if not model_path:
+        raise ValueError(
+            "Kimi-K3 DSpark: could not resolve the draft checkpoint path "
+            "(draft_config._name_or_path and speculative_draft_model_path are "
+            "both empty)."
+        )
+    atom_config.model = model_path
+    # The Kimi-K3 DSpark checkpoint is single-file BF16 with no quantization
+    # metadata; QuantizationConfig resolves to the unquantized path but must stay
+    # a real object (exclude_layers=[]) so MoE/shared-expert probes that read
+    # quant_config.exclude_layers do not hit None.
+    atom_config.quant_config = QuantizationConfig(
+        draft_config,
+        online_quant_config=getattr(atom_config, "online_quant_config", None),
+    )
+
+
+def _kimi_k3_dspark_construction_context():
+    from atom.plugin.sglang.kimi_k3_dspark_bridge import (
+        kimi_k3_dspark_native_attention_construction,
+    )
+
+    return kimi_k3_dspark_native_attention_construction()
+
+
+def _bind_kimi_k3_dspark_cache_views(model: Any, runtime: Any) -> None:
+    from atom.plugin.sglang.kimi_k3_dspark_bridge import (
+        bind_kimi_k3_dspark_cache_views,
+    )
+
+    bind_kimi_k3_dspark_cache_views(model, runtime)
+
+
 MODEL_ADAPTER_SPECS = {
     "DeepseekV3ForCausalLM": SGLangModelAdapterSpec(
         install_adapters=_install_deepseek_mla_adapters,
@@ -309,6 +447,14 @@ MODEL_ADAPTER_SPECS = {
     "KimiK25ForConditionalGeneration": SGLangModelAdapterSpec(
         prepare_config=_prepare_kimi_k25_config,
         install_adapters=_install_deepseek_mla_adapters,
+    ),
+    "KimiK3ForConditionalGeneration": SGLangModelAdapterSpec(
+        uses_context_only_forward=True,
+        uses_text_config=True,
+        load_weights_prefix="",
+        prepare_config=_prepare_kimi_k3_config,
+        construction_context=_kimi_k3_construction_context,
+        bind_cache_views=_bind_kimi_k3_cache_views,
     ),
     "Qwen3ForCausalLM": SGLangModelAdapterSpec(),
     "Qwen3MoeForCausalLM": SGLangModelAdapterSpec(),
@@ -349,6 +495,16 @@ MODEL_ADAPTER_SPECS = {
         construction_context=_eagle3_llama_construction_context,
         bind_cache_views=_bind_eagle3_llama_cache_views,
     ),
+    # Kimi-K3 DSpark standalone block drafter. Uses a custom EntryClass wrapper
+    # (models/kimi_k3_dspark_draft.py), so it is intentionally absent from
+    # MODEL_ARCH_SPECS below.
+    "K3DSparkModel": SGLangModelAdapterSpec(
+        uses_context_only_forward=True,
+        load_weights_prefix="",
+        prepare_draft_model_config=_prepare_k3_dspark_draft_model_config,
+        construction_context=_kimi_k3_dspark_construction_context,
+        bind_cache_views=_bind_kimi_k3_dspark_cache_views,
+    ),
 }
 
 # Architectures whose SGLang EntryClass is generated by base_model_wrapper.
@@ -360,6 +516,7 @@ MODEL_ARCH_SPECS = {
         "DeepseekV3ForCausalLM",
         "DeepseekV32ForCausalLM",
         GLM52_DSA_ARCH,
+        "KimiK3ForConditionalGeneration",
         "Qwen3ForCausalLM",
         "Qwen3MoeForCausalLM",
         "Qwen3NextForCausalLM",
