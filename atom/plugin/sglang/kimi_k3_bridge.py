@@ -13,6 +13,49 @@ import torch
 KIMI_K3_MLA_CACHE_ENTRY_DIM = 576
 logger = logging.getLogger(__name__)
 
+_UNSET = object()
+
+
+@contextmanager
+def _forced_mla_kv_pool(configurator: Any):
+    """Build the K3 full-attention KV pool as a *true* MLA pool.
+
+    ATOM reads one 576-wide latent per token per layer and never reads a V
+    buffer (``bind_kimi_k3_cache_views`` binds ``k_buffer[:, :1, :]`` and sets
+    ``v_cache=None``). ``MLATokenToKVPool`` allocates exactly that shape --
+    ``[slots, 1, kv_lora_rank + qk_rope_head_dim]`` -- whereas the MHA fallback
+    also allocates an identically sized V buffer that is pure waste.
+
+    sglang only takes that branch when ``use_mla_backend`` is set, which it
+    derives from an architecture whitelist that misses K3 (see
+    the MLA-whitelist note below). Flip it for the *pool build only*: attention
+    backend selection, which ATOM owns, must stay on its current path.
+    """
+    mc = configurator.model_config
+    text_config = getattr(mc, "hf_text_config", None)
+    dims = {
+        "kv_lora_rank": getattr(text_config, "kv_lora_rank", None) or 512,
+        "qk_rope_head_dim": getattr(text_config, "qk_rope_head_dim", None) or 64,
+    }
+    saved_flag = configurator.use_mla_backend
+    saved_dims = {name: getattr(mc, name, _UNSET) for name in dims}
+    for name, value in dims.items():
+        if not getattr(mc, name, None):
+            setattr(mc, name, value)
+    configurator.use_mla_backend = True
+    try:
+        yield
+    finally:
+        configurator.use_mla_backend = saved_flag
+        for name, value in saved_dims.items():
+            if value is _UNSET:
+                try:
+                    delattr(mc, name)
+                except Exception:  # noqa: BLE001, S110 - config may be slotted
+                    pass
+            else:
+                setattr(mc, name, value)
+
 
 def is_kimi_k3_config(config: Any) -> bool:
     archs = getattr(config, "architectures", None) or []
@@ -165,28 +208,27 @@ def _install_kimi_k3_pool_patch_sglang_main() -> bool:
         if not _is_k3(self):
             return original_resolve(self, pre_model_load_memory)
         _restore_kimi_k3_mem_fraction_server_args(self.server_args, self.model_config)
-        config = original_resolve(self, pre_model_load_memory)
+        # True-MLA pool: the budget sglang computes here already matches the real
+        # [slots, 1, 576] allocation, so no row-width compensation is needed.
+        with _forced_mla_kv_pool(self):
+            config = original_resolve(self, pre_model_load_memory)
 
-        text_config = getattr(self.model_config, "hf_text_config", None)
-        old_k = int(getattr(self.model_config, "head_dim", 0) or 0)
-        old_v = int(
-            getattr(self.model_config, "v_head_dim", None)
-            or getattr(text_config, "v_head_dim", None)
-            or old_k
-        )
-        old_row = old_k + old_v
-        # ATOM consumes the K buffer as the 576-wide MLA latent; SGLang allocates
-        # paired K/V buffers, so the real per-token footprint is 2 * 576.
-        native_row = 2 * KIMI_K3_MLA_CACHE_ENTRY_DIM
-        if old_row > 0 and old_row != native_row:
+        # sglang sizes the KV pool from free memory alone. A true-MLA token is
+        # ~24x cheaper than the old paired-K/V, 12-lane layout, so that formula
+        # would spend *all* the reclaimed memory on more tokens and leave no
+        # headroom for prefill activations (observed with an intermediate fix:
+        # available_gpu_mem 6.25GB -> 1.95GB, then a HIP OOM on the first
+        # chunked prefill). The scheduler can never address more than
+        # ``max_running_requests * context_len`` tokens, so cap there and leave
+        # the remainder free.
+        max_reqs = getattr(self.server_args, "max_running_requests", None)
+        ctx_len = getattr(self.model_config, "context_len", None)
+        if max_reqs and ctx_len:
             page_size = int(self.server_args.page_size)
-            tokens = int(config.max_total_num_tokens) * old_row // native_row
-            config.max_total_num_tokens = max(
-                page_size, (tokens // page_size) * page_size
-            )
-            config.max_running_requests = self.resolve_max_num_reqs(
-                config.max_total_num_tokens
-            )
+            cap = (int(max_reqs) * int(ctx_len) // page_size) * page_size
+            if cap > 0 and config.max_total_num_tokens > cap:
+                config.max_total_num_tokens = cap
+                config.max_running_requests = self.resolve_max_num_reqs(cap)
         return config
 
     def _init_pools(self, *, sizes, req_to_token_pool, token_to_kv_pool_allocator):
@@ -219,12 +261,13 @@ def _install_kimi_k3_pool_patch_sglang_main() -> bool:
                     except Exception:  # noqa: BLE001, S110 - optional attr
                         pass
                 try:
-                    return original_init(
-                        self,
-                        sizes=sizes,
-                        req_to_token_pool=req_to_token_pool,
-                        token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-                    )
+                    with _forced_mla_kv_pool(self):
+                        return original_init(
+                            self,
+                            sizes=sizes,
+                            req_to_token_pool=req_to_token_pool,
+                            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+                        )
                 finally:
                     self.kv_cache_dtype = saved_dtype
                     mc.head_dim = saved_head
@@ -238,45 +281,25 @@ def _install_kimi_k3_pool_patch_sglang_main() -> bool:
                 req_to_token_pool=req_to_token_pool,
                 token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             )
-        mc = self.model_config
-        htc = getattr(mc, "hf_text_config", None)
-        saved_head = getattr(mc, "head_dim", None)
-        saved_v = getattr(mc, "v_head_dim", None)
-        saved_htc_v = getattr(htc, "v_head_dim", None) if htc is not None else None
-        mc.head_dim = KIMI_K3_MLA_CACHE_ENTRY_DIM
-        try:
-            mc.v_head_dim = KIMI_K3_MLA_CACHE_ENTRY_DIM
-        except Exception:  # noqa: BLE001, S110 - optional attr
-            pass
-        if htc is not None:
-            try:
-                htc.v_head_dim = KIMI_K3_MLA_CACHE_ENTRY_DIM
-            except Exception:  # noqa: BLE001, S110 - optional attr
-                pass
-        try:
+        with _forced_mla_kv_pool(self):
             pools = original_init(
                 self,
                 sizes=sizes,
                 req_to_token_pool=req_to_token_pool,
                 token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             )
-        finally:
-            mc.head_dim = saved_head
-            if saved_v is not None:
-                mc.v_head_dim = saved_v
-            if htc is not None and saved_htc_v is not None:
-                htc.v_head_dim = saved_htc_v
 
         pool = pools.token_to_kv_pool
         full_pool = getattr(pool, "full_kv_pool", pool)
         if full_pool is None:
             raise RuntimeError("Kimi-K3 SGLang full-attention KV pool is missing")
-        if int(getattr(full_pool, "head_dim", -1)) != KIMI_K3_MLA_CACHE_ENTRY_DIM:
+        # True-MLA pool: one [slots, 1, 576] latent buffer per layer, no V.
+        latent_dim = int(getattr(full_pool, "kv_cache_dim", -1))
+        if latent_dim != KIMI_K3_MLA_CACHE_ENTRY_DIM:
             raise RuntimeError(
-                "Kimi-K3 KV pool ABI mismatch: "
-                f"K={getattr(full_pool, 'head_dim', None)}, "
-                f"V={getattr(full_pool, 'v_head_dim', None)}, expected "
-                f"{KIMI_K3_MLA_CACHE_ENTRY_DIM}/{KIMI_K3_MLA_CACHE_ENTRY_DIM}"
+                "Kimi-K3 KV pool ABI mismatch: expected a single MLA latent of "
+                f"{KIMI_K3_MLA_CACHE_ENTRY_DIM}, got kv_cache_dim={latent_dim} "
+                f"(pool={type(full_pool).__name__})"
             )
         req_pool = pools.req_to_token_pool
         if req_pool is None or not hasattr(req_pool, "get_mamba_indices"):
