@@ -47,12 +47,18 @@ def test_the_codec_packs_the_staging_entry_not_the_pool_group():
 def test_a_failed_spill_does_not_index():
     """No spill acknowledgement is sent back to the scheduler, so the index is
     the only record — indexing a spill that did not land is a guaranteed
-    false positive on every later request."""
+    false positive on every later request.
+
+    We seed the index with a *different* hash first so the assertion is
+    self-contained: it proves both that 11 was not added and that nothing else
+    was disturbed, without relying on an empty-index starting state.
+    """
     codec = FakeCodec(put_ok=False)
     t = tier(codec)
+    t.index.confirm_spill(99)  # seed a different hash so the index is non-empty
     t.submit_spill(11, entry_index=64, staging_slot=0)
     t.drain()
-    assert 11 not in t.index.hashes
+    assert t.index.hashes == {99}  # 11 absent AND 99 untouched
 
 
 def test_a_spill_always_releases_its_staging_slot():
@@ -74,11 +80,15 @@ def test_a_spill_always_releases_its_staging_slot():
 
 
 def test_a_successful_load_reports_done():
-    t = tier(FakeCodec())
+    codec = FakeCodec()
+    t = tier(codec)
     t.index.confirm_spill(11)
     t.submit_load("req-a", 11, group=3)
     t.drain()
     assert t.get_finished() == ({"req-a"}, set())
+    # Mirror of test_the_codec_packs_the_staging_entry_not_the_pool_group:
+    # the load path must receive a real pool group, not a staging entry.
+    assert codec.gets == [(11, 3)]
 
 
 def test_a_failed_load_reports_failed_and_forgets_the_hash():
@@ -98,3 +108,37 @@ def test_get_finished_drains():
     t.drain()
     t.get_finished()
     assert t.get_finished() == (set(), set())
+
+
+def test_inflight_is_empty_after_drain():
+    """After drain(), _inflight must be empty — every completed future must
+    have been discarded, not accumulated for the lifetime of the process."""
+    t = tier(FakeCodec())
+    t.index.confirm_spill(11)
+    t.submit_spill(11, entry_index=64, staging_slot=0)
+    t.submit_load("req-a", 11, group=3)
+    t.drain()
+    with t._lock:
+        assert len(t._inflight) == 0
+
+
+def test_inflight_does_not_grow_on_get_finished_path():
+    """The production serving path calls submit → get_finished, never drain.
+    _inflight must not accumulate completed futures across repeated cycles.
+
+    Non-vacuousness: revert the add_done_callback fix (use a list that only
+    drains in drain()) and this test fails because _inflight keeps growing.
+    """
+    t = tier(FakeCodec())
+    t.index.confirm_spill(11)
+    t.index.confirm_spill(22)
+    for req_id in ("req-1", "req-2", "req-3"):
+        t.submit_load(req_id, 11, group=0)
+        # Allow the worker thread to finish so the callback fires before we
+        # check; we use the executor directly rather than drain() to mirror
+        # the real serving path (no drain call in production).
+        t._executor.submit(lambda: None).result()  # fence: wait for prior work
+        t.get_finished()
+
+    with t._lock:
+        assert len(t._inflight) == 0
