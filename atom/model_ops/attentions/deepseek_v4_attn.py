@@ -786,6 +786,15 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         A slot holds the compressor state and then every layer's windows
         contiguously (see `copy_state_entries`), so a plane's whole
         contribution is one range and no per-layer split is needed.
+
+        `group` may address a staging-ring group past the last one the
+        BlockManager leases, and that resolves: `num_state_slots` (:863-866)
+        and the carve that sizes the planes (:1023, feeding `with_capacity` at
+        :1038) both read
+        `entries[STATE_SLOT_CLASS]`, the *allocation* count, which already
+        includes the K extra staging groups — admission is capped by a separate
+        count. So `_slot_views()`'s span and `physical_slot`'s bound both cover
+        the staging groups; `tests/test_state_entry_views.py` pins this.
         """
         return self._slot_views()[group]
 
