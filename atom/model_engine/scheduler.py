@@ -22,6 +22,7 @@ import struct
 import threading
 import time
 from collections import deque
+from collections.abc import Iterable
 
 import numpy as np
 
@@ -457,6 +458,13 @@ class ScheduledBatch:
 
         # Compute token offsets: prefill uses num_cached_tokens, decode uses existing formula
         self.scheduled_tokens = np.empty(total_tokens_num, dtype=np.int32)
+        # The token immediately after each seq's slice, or -1 when there is none.
+        # A speculative drafter consumes the target's token stream shifted left by
+        # one, so its last row per segment needs the token the segment stops just
+        # short of. On a final chunk that is the token the target is about to
+        # sample (unknown here, filled in after sampling); on a middle chunk it is
+        # the next prompt token, which exists by definition and lives only here.
+        self.next_chunk_tokens = np.full(len(self.req_ids), -1, dtype=np.int32)
         pos = 0
         for i, (seq, num) in enumerate(zip(seqs.values(), num_scheduled_tokens)):
             if seq.type == SequenceType.PREFILL:
@@ -466,6 +474,11 @@ class ScheduledBatch:
             self.scheduled_tokens[pos : pos + num] = seq.token_ids[
                 offset : offset + num
             ]
+            # Bound on num_tokens, not num_prompt_tokens: a preempted sequence
+            # re-forwards its generated tokens too, and those successors are just
+            # as known as prompt ones.
+            if seq.type == SequenceType.PREFILL and offset + num < seq.num_tokens:
+                self.next_chunk_tokens[i] = seq.token_ids[offset + num]
             pos += num
 
         if num_spec_step > 0 and scheduled_spec_decode_tokens is not None:
@@ -672,6 +685,20 @@ class Scheduler:
         self.drafter_needs_next_token = self.use_spec and not (
             config.speculative_config.use_dspark()
         )
+        # Whether THIS engine verifies drafts in its own decode loop, as opposed
+        # to merely producing them (a disaggregated prefill node drafts for the
+        # decode node and hands the tokens over). Verification needs a
+        # rectangular [bs, mtp_k+1] decode layout, which `prepare_input_ids`
+        # only builds under deferred output, and a ForwardMode that accounts for
+        # spec query tokens — neither exists under pipeline parallelism.
+        pp_size = getattr(config, "pipeline_parallel_size", 1)
+        self.spec_decode_local = self.use_spec and pp_size == 1
+        if self.use_spec and not self.spec_decode_local:
+            logger.info(
+                "Speculative decoding: drafting only (pipeline_parallel_size=%d). "
+                "Drafts are produced for handoff; this engine verifies none.",
+                pp_size,
+            )
         self.spec_stats: SpecStats | None = (
             SpecStats(mtp_k=self.mtp_k) if self.use_spec else None
         )
@@ -1418,8 +1445,11 @@ class Scheduler:
         # --- Decode scheduling ---
         num_seqs_decode = 0
         num_decode_tokens = 0
-        tokens_per_decode_seq = self.mtp_k + 1
-        num_new_tokens = self.mtp_k + 1
+        # Query width per decode sequence: anchor + drafts when this engine
+        # verifies, anchor alone when it only drafts for handoff.
+        spec_width = self.mtp_k if self.spec_decode_local else 0
+        tokens_per_decode_seq = spec_width + 1
+        num_new_tokens = spec_width + 1
         remote_kv_blocks: set[int] = set()
         remote_kv_seq_blocks: dict[int, list[int]] = {}
         skipped_partial_prefills: list[Sequence] = []
@@ -1445,7 +1475,7 @@ class Scheduler:
                     self.preempt(seq)
                     break
             else:
-                if seq.spec_token_ids.size > 0:
+                if self.spec_decode_local and seq.spec_token_ids.size > 0:
                     scheduled_spec_decode_tokens[seq.id] = seq.spec_token_ids
                 num_seqs_decode += 1
                 num_decode_tokens += num_new_tokens
@@ -1518,7 +1548,7 @@ class Scheduler:
             total_seqs_num_prefill=num_seqs_prefill,
             total_seqs_num_decode=num_seqs_decode,
             connector_meta_output=connector_meta_output,
-            num_spec_step=self.mtp_k,
+            num_spec_step=self.mtp_k if self.spec_decode_local else 0,
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             remote_kv_block_ids=sorted(remote_kv_blocks) if remote_kv_blocks else [],
             remote_kv_seq_blocks=remote_kv_seq_blocks,
@@ -1881,7 +1911,7 @@ class Scheduler:
         # Strip placeholder + rejected draft tokens added by postprocess.
         # Real token count = seq.num_tokens - mtp_k - num_rejected
         # (same formula as postprocess line: num_tokens = seq.num_tokens - self.mtp_k - num_rejected)
-        if self.mtp_k > 0:
+        if self.spec_decode_local and self.mtp_k > 0:
             strip = self.mtp_k + seq.num_rejected
             if strip > 0:
                 del seq.token_ids[-strip:]
@@ -1889,6 +1919,7 @@ class Scheduler:
                 seq.num_tokens -= strip
         seq.num_rejected = 0
         seq.num_bonus_tokens = 0
+        seq.num_placeholder_tokens = 0
         seq.spec_token_ids = np.array([], dtype=np.int32)
         seq.is_first_decode = False
         if seq.is_partial_prefill:
@@ -1954,18 +1985,38 @@ class Scheduler:
         for req_id in self._pp_inflight_req_ids(batch):
             self._pp_inflight_token_block.discard(req_id)
 
-    def register_prefill_hashes(self, batch: ScheduledBatch) -> None:
+    def _batch_seq_lookup(self, seqs: Iterable[Sequence] | None) -> dict[int, Sequence]:
+        """Resolve a batch's sequences without going through ``self.running``.
+
+        The deferred prefix-hash paths run after the batch's forward returns, by
+        which time the sequence may have left ``running`` — most commonly parked
+        in ``WAITING_FOR_REMOTE_KVS`` by
+        ``_park_ready_offload_partial_prefills`` for an LMCache load. Its blocks
+        are still allocated and their KV is computed, so the hashes must still be
+        published; looking the sequence up in ``running`` silently drops them and
+        breaks the prefix-hash chain at that point.
+
+        Callers hand over the batch's own sequence objects. ``running`` remains
+        the fallback for call sites that do not carry them.
+        """
+        if seqs is not None:
+            return {seq.id: seq for seq in seqs}
+        return {seq.id: seq for seq in self.running}
+
+    def register_prefill_hashes(
+        self, batch: ScheduledBatch, seqs: Iterable[Sequence] | None = None
+    ) -> None:
         """Hash blocks for middle chunked-prefill chunks that skip postprocess."""
         if not self.block_manager.enable_prefix_caching:
             return
         if batch.is_final_chunk is None:
             return
-        running_by_id = {seq.id: seq for seq in self.running}
+        seq_by_id = self._batch_seq_lookup(seqs)
         for i, req_id in enumerate(batch.req_ids):
-            seq = running_by_id.get(req_id)
-            if seq is None:
+            seq = seq_by_id.get(req_id)
+            if seq is None or not seq.block_table:
                 logger.warning(
-                    "register_prefill_hashes: seq %s not in running "
+                    "register_prefill_hashes: seq %s unavailable "
                     "(possible preemption leak under PP)",
                     req_id,
                 )
@@ -2003,11 +2054,14 @@ class Scheduler:
         if batch is not None and self.advance_on_schedule:
             # Progress already advanced at schedule time; publish prefix-cache
             # hashes at the chunk's pre-advance offset and record non-final chunks.
-            running_by_id = {seq.id: seq for seq in self.running}
+            # Resolved from the batch's own sequences, not `running`: a chunk
+            # that parked the sequence for an offload load still has to publish
+            # its hashes (see _batch_seq_lookup).
+            seq_by_id = self._batch_seq_lookup(seqs)
             final = batch.is_final_chunk
             for i, req_id in enumerate(batch.req_ids):
-                seq = running_by_id.get(req_id)
-                if seq is None or final is None:
+                seq = seq_by_id.get(req_id)
+                if seq is None or final is None or not seq.block_table:
                     continue
                 is_final = final[i]
                 chunk = int(batch.num_scheduled_tokens[i])
@@ -2052,7 +2106,10 @@ class Scheduler:
         finished_seqs = []
         stream_outputs = []
 
-        need_placeholder = is_deferred_out or self.use_spec
+        need_placeholder = is_deferred_out or self.spec_decode_local
+        # Drafts occupy trailing slots only on an engine that verifies them; a
+        # drafting-only engine's tokens are all real.
+        num_placeholder_width = self.mtp_k if self.spec_decode_local else 0
         num_placeholder = self.mtp_k
         if is_deferred_out:
             num_placeholder += 1
@@ -2117,7 +2174,17 @@ class Scheduler:
             if token_logprobs is not None and seq.return_logprobs:
                 token_logprob = token_logprobs.get(seq.id)
 
-            if is_deferred_out or self.use_spec:
+            # Deferred output always has placeholders by the time a token
+            # surfaces: the prefill step's output is withheld (idx is None), so
+            # the first write lands one step later, after placeholders exist.
+            # Without deferral the token surfaces on the prefill step itself, and
+            # placeholders are only appended at the END of this postprocess — so
+            # the negative-offset write would clobber prompt tokens and index an
+            # empty output_tokens. Fall through to plain appends until the
+            # sequence actually carries placeholders.
+            if is_deferred_out or (
+                self.spec_decode_local and seq.num_placeholder_tokens > 0
+            ):
                 # int() casts strip the np.int32 wrapper coming out of
                 # fwd_output's np.ndarray indexing. Without these, the values
                 # propagate into seq.num_rejected / seq.num_bonus_tokens, then
@@ -2183,8 +2250,11 @@ class Scheduler:
                 new_tokens = [injected_t0] + list(new_tokens)
                 seq._injected_t0 = None
 
-            if self.mtp_k > 0:
-                # idx already resolved above via get_idx
+            if self.mtp_k > 0 and draft_token_ids is not None:
+                # idx already resolved above via get_idx. draft_token_ids is None
+                # whenever the forward did not reach the drafter — a PP stage that
+                # produced no output, or a step whose batch had nothing to draft
+                # from. Leave the previous drafts in place rather than indexing None.
                 seq.spec_token_ids = draft_token_ids[idx]
 
             if seq.num_completion_tokens <= 3 and seq.kv_transfer_params:
@@ -2200,7 +2270,7 @@ class Scheduler:
             if seq.num_completion_tokens >= 1 and seq.first_token_time == 0.0:
                 seq.first_token_time = time.time()
 
-            num_tokens = seq.num_tokens - self.mtp_k - num_rejected
+            num_tokens = seq.num_tokens - num_placeholder_width - num_rejected
             leave_reason = None
             # Client disconnected -> finish now via the normal stop path (frees
             # KV blocks, emits a finished RequestOutput). A natural stop below
@@ -2344,6 +2414,7 @@ class Scheduler:
                         seq.append_token(self.eos_token_id)
                         if seq.return_logprobs:
                             seq.logprobs.append(0.0)
+                    seq.num_placeholder_tokens = num
         for seq in finished_seqs:
             logger.debug("Freeing blocks for finished seq %s", seq.id)
             if seq.is_partial_prefill:
@@ -2762,6 +2833,7 @@ class PrefillScheduler:
         self.running: deque[Sequence] = deque()
         # spec decode not used on prefill side
         self.use_spec = False
+        self.spec_decode_local = False
         self.mtp_k = 0
         self.spec_stats = None
         self.cache_stats = None
@@ -3021,7 +3093,7 @@ class DecodeScheduler(Scheduler):
                         self.preempt(seq)
                         break
                 else:
-                    if seq.spec_token_ids.size > 0:
+                    if self.spec_decode_local and seq.spec_token_ids.size > 0:
                         scheduled_spec_decode_tokens[seq.id] = seq.spec_token_ids
                     num_new_tokens = self.mtp_k + 1
                     self.block_manager.may_append(seq, num_new_tokens)
@@ -3057,7 +3129,7 @@ class DecodeScheduler(Scheduler):
                 total_tokens_num_decode=total_tokens_num_decode,
                 total_seqs_num=len(scheduled_seqs),
                 total_seqs_num_decode=len(scheduled_seqs),
-                num_spec_step=self.mtp_k,
+                num_spec_step=self.mtp_k if self.spec_decode_local else 0,
                 scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
                 cu_stream_fraction=self.cu_fraction,
                 # The other half of the pair above: queued copies have to reach
