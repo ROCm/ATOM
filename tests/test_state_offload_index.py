@@ -4,6 +4,8 @@
 
 import logging
 
+import pytest
+
 from atom.model_engine.state_offload import (
     _STARVATION_DROP_THRESHOLD,
     StateOffloadIndex,
@@ -208,6 +210,32 @@ def test_garbage_depth_falls_back_rather_than_crashing_model_load(monkeypatch):
     monkeypatch.setenv("OFFLOAD_STATE", "1")
     monkeypatch.setenv("OFFLOAD_STATE_STAGING_GROUPS", "banana")
     assert state_offload_staging_groups() == 1
+
+
+def test_garbage_depth_is_not_silent(monkeypatch, caplog):
+    """Falling back to 1 without a word is worse than the typo: a mistyped
+    depth looks exactly like a deliberate one until the ring starves."""
+    monkeypatch.setenv("OFFLOAD_STATE", "1")
+    monkeypatch.setenv("OFFLOAD_STATE_STAGING_GROUPS", "2O")
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        assert state_offload_staging_groups() == 1
+    assert "2O" in caplog.text
+
+
+@pytest.mark.parametrize("value", ["true", "TRUE", "yes", "on"])
+def test_the_usual_spellings_of_on_turn_the_tier_on(monkeypatch, value):
+    """`OFFLOAD_STATE=true` means on. Reading only the literal "1" would give
+    that user a healthy-looking server that never spills."""
+    monkeypatch.setenv("OFFLOAD_STATE", value)
+    monkeypatch.delenv("OFFLOAD_STATE_STAGING_GROUPS", raising=False)
+    assert state_offload_staging_groups() == 1
+
+
+@pytest.mark.parametrize("value", ["0", "false", "no", "off", "OFF"])
+def test_the_usual_spellings_of_off_keep_it_off(monkeypatch, value):
+    monkeypatch.setenv("OFFLOAD_STATE", value)
+    monkeypatch.setenv("OFFLOAD_STATE_STAGING_GROUPS", "4")
+    assert state_offload_staging_groups() == 0
 
 
 def test_a_negative_depth_is_floored_to_zero(monkeypatch):

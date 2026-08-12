@@ -146,10 +146,27 @@ def state_offload_staging_groups() -> int:
     One function rather than two `os.environ` reads because the arena sizes
     itself from this and the pool wires itself from this; if they disagreed,
     the arena would be short exactly the rows the spill path addresses.
+
+    Truthiness follows the offload module's own convention
+    (`staged_transfer.py:_env_flag`, `connector.py:284`) rather than an
+    equality against "1": someone who exports `OFFLOAD_STATE=true` means to
+    turn the tier on, and a silent 0 gives them a server that looks healthy
+    and never spills.
     """
-    if os.environ.get("OFFLOAD_STATE", "0") != "1":
+    if os.environ.get("OFFLOAD_STATE", "0").lower() in ("0", "false", "no", "off"):
         return 0
+    raw = os.environ.get("OFFLOAD_STATE_STAGING_GROUPS")
+    if raw is None:
+        return 1
     try:
-        return max(0, int(os.environ.get("OFFLOAD_STATE_STAGING_GROUPS", "1")))
+        return max(0, int(raw))
     except ValueError:
+        # Warn rather than raise: this runs during model load, and a typo must
+        # not be fatal. It must not be silent either -- a mistyped depth buys
+        # one group instead of twenty, and the only other symptom is a starved
+        # ring 256 dropped spills later.
+        logger.warning(
+            "state offload: invalid OFFLOAD_STATE_STAGING_GROUPS=%r; using 1",
+            raw,
+        )
         return 1
