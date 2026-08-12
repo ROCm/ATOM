@@ -548,14 +548,21 @@ class BlockManager:
         """
         if start <= 0:
             return -1
-        h = self.blocks[seq.block_table[start - 1]].hash
+        h = self.kv.block(seq.block_table[start - 1]).hash
         if h != -1:
             return h
 
         gap_start = start - 1
-        while gap_start > 0 and self.blocks[seq.block_table[gap_start - 1]].hash == -1:
+        while (
+            gap_start > 0
+            and self.kv.block(seq.block_table[gap_start - 1]).hash == -1
+        ):
             gap_start -= 1
-        h = -1 if gap_start == 0 else self.blocks[seq.block_table[gap_start - 1]].hash
+        h = (
+            -1
+            if gap_start == 0
+            else self.kv.block(seq.block_table[gap_start - 1]).hash
+        )
 
         record = self._event_log is not None
         run_parent: int | None = h if h != -1 else None
@@ -563,11 +570,13 @@ class BlockManager:
         run_tokens: list[int] = []
         for i in range(gap_start, start):
             token_ids = self._hash_block_tokens(seq, i)
-            block = self.blocks[seq.block_table[i]]
+            block_id = seq.block_table[i]
+            block = self.kv.block(block_id)
             h = self.compute_hash(token_ids, h)
-            block.update(h, token_ids)
-            self.hash_to_block_id.setdefault(h, block.block_id)
-            self.swa.publish_hash(seq, i, h, token_ids)
+            if self.kv.lookup(h) == -1:
+                self.kv.publish(block_id, h, token_ids)
+            else:
+                block.update(h, token_ids)
             if record:
                 run_hashes.append(h)
                 run_tokens.extend(token_ids)
@@ -1101,9 +1110,18 @@ class BlockManager:
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h)
             block_id = seq.block_table[i]
-            block = self.blocks[block_id]
-            block.update(h, token_ids)
-            self.hash_to_block_id[h] = block_id
+            block = self.kv.block(block_id)
+            indexed_block_id = self.kv.lookup(h)
+            if indexed_block_id == -1:
+                self.kv.publish(block_id, h, token_ids)
+            else:
+                indexed_block = self.kv.block(indexed_block_id)
+                if indexed_block.token_ids != token_ids:
+                    raise RuntimeError(
+                        "Hash collision while registering received prefix: "
+                        f"seq={seq.id} block={block_id} indexed={indexed_block_id}"
+                    )
+                block.update(h, token_ids)
         return num_full
 
     def deallocate(self, seq: Sequence):

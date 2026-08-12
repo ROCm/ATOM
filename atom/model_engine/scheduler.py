@@ -176,6 +176,7 @@ class CacheStats:
         self._interval_cached_tokens: int = 0
         self._interval_full_tokens: int = 0
         self._interval_compressed_tokens: int = 0
+        self._interval_wanted_tokens: int = 0
         # Set by Scheduler so the interval log can report pool occupancy and the
         # eviction count that drives cross-turn misses.
         self.block_manager = None
