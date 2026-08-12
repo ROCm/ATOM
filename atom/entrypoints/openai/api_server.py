@@ -528,6 +528,7 @@ async def generate_async_multimodal(
     multimodal_data: dict[str, Any],
     sampling_params: SamplingParams,
     request_id: str,
+    data_parallel_rank: int | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Generate text asynchronously for one multimodal request."""
     token_queue: asyncio.Queue = asyncio.Queue()
@@ -561,6 +562,11 @@ async def generate_async_multimodal(
         )
 
     seq = await loop.run_in_executor(None, do_preprocess)
+    if data_parallel_rank is not None:
+        seq.data_parallel_rank = data_parallel_rank
+        logger.info(
+            "Request %s pinned to data_parallel_rank=%s", seq.id, data_parallel_rank
+        )
     try:
         _validate_sequence_context_length(seq)
     except Exception:
@@ -1217,6 +1223,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     request_id,
                     multimodal_data=multimodal_data,
                     kv_transfer_params=request.kv_transfer_params,
+                    data_parallel_rank=request.data_parallel_rank,
                 ),
                 raw_request,
                 request_id,
@@ -1237,6 +1244,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     multimodal_data,
                     sampling_params,
                     request_id,
+                    data_parallel_rank=request.data_parallel_rank,
                 ),
                 raw_request,
                 request_id,
@@ -1258,6 +1266,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     sampling_params,
                     request_id,
                     kv_transfer_params=request.kv_transfer_params,
+                    data_parallel_rank=request.data_parallel_rank,
                 ),
                 raw_request,
                 request_id,
@@ -1278,6 +1287,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     sampling_params,
                     request_id,
                     kv_transfer_params=request.kv_transfer_params,
+                    data_parallel_rank=request.data_parallel_rank,
                 ),
                 raw_request,
                 request_id,
