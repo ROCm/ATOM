@@ -896,9 +896,9 @@ class LinearBase(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        x_scale: Optional[torch.Tensor] = None,
+        x_scale: torch.Tensor | None = None,
         otype=dtypes.bf16,
-        out: Optional[torch.Tensor] = None,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # out= (fixed output buffer) is only wired through the per_1x128
         # preshuffle GEMM path; any other quant path must not silently ignore it.
