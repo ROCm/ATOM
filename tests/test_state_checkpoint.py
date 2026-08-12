@@ -14,8 +14,10 @@
 
 from math import inf, isinf
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
+import torch
 from conftest import MockConfig
 
 from atom.model_engine.block_manager import BlockManager
@@ -2245,6 +2247,127 @@ class TestMidstepCheckpoints:
         assert bm.midstep_positions(cold, 0, 44) == []
 
 
+#: The two backend modules `gdn_backends` re-imports under the aiter stub.
+#: Evicted before the import so the fixture gets real source rather than a
+#: copy some earlier test already bound to real aiter.
+_UNDER_TEST = (
+    "atom.model_ops.attentions.gdn_attn",
+    "atom.model_ops.attentions.kimi_mla_gdn_attn",
+)
+
+
+@pytest.fixture
+def gdn_backends():
+    """`(GDNStateMixin, _KimiMLAGDNCommon)`, importable without a GPU.
+
+    Both modules do `from aiter import ...` at module scope, and importing
+    `aiter` anywhere runs its arch probe, which on a CPU-only box raises
+    (`0 active drivers`) and then falls back to a `jax` import that is not
+    installed. The two dtype/transfer declarations under test are plain Python
+    on `atom` classes and need none of that, so `aiter` is stubbed for the
+    duration of the import.
+
+    A finder rather than a fixed `sys.modules` list: the transitive set is 19
+    submodules today and is aiter's business, not this test's, so enumerating
+    it would turn an unrelated aiter refactor into a failure here. Everything
+    it fabricates is a MagicMock, so any test that leaned on real aiter
+    behaviour through it would be asserting against a mock rather than
+    silently passing — but nothing here does: the assertions read
+    `_state_dtypes` and `state_transfer`, which touch only `torch` and
+    `atom.model_engine.state_pool`.
+
+    Scoped and restored. `tests/test_pp.py` installs its stubs at module
+    scope and leaves them, which is invisible when it runs alone and makes
+    collection order matter when it does not.
+    """
+    import importlib.abc
+    import importlib.machinery
+    import sys
+    import types
+
+    class _Stub(types.ModuleType):
+        def __getattr__(self, name):
+            if name.startswith("__"):
+                raise AttributeError(name)
+            mock = MagicMock(name=f"{self.__name__}.{name}")
+            setattr(self, name, mock)
+            return mock
+
+    class _Loader(importlib.abc.Loader):
+        def create_module(self, spec):
+            return _Stub(spec.name)
+
+        def exec_module(self, module):
+            pass
+
+    class _Finder(importlib.abc.MetaPathFinder):
+        def find_spec(self, fullname, path, target=None):
+            if fullname == "aiter" or fullname.startswith("aiter."):
+                return importlib.machinery.ModuleSpec(
+                    fullname, _Loader(), is_package=True
+                )
+            return None
+
+    def _fake(mod):
+        """A `sys.modules` entry no import system produced.
+
+        Other test files install bare `ModuleType`s over real `atom` modules
+        (`atom.utils.forward_context`, `atom.model_ops.attention_gdn`, ... —
+        six of them by the time the suite reaches this file) and never take
+        them out. Any of those on the import path below re-raises as
+        `ImportError: cannot import name X (unknown location)`, so they get
+        evicted here and restored after, exactly like the aiter ones. Keyed on
+        the absence of `__file__`/`__path__` rather than on a list of names,
+        since the set is other files' business and grows.
+        """
+        return (
+            mod is not None
+            and getattr(mod, "__file__", None) is None
+            and not hasattr(mod, "__path__")
+        )
+
+    finder = _Finder()
+    # Drop any real aiter already imported, the atom modules that closed over
+    # it, and any atom module some earlier test left stubbed, so the imports
+    # below run against real source.
+    stale = [
+        k
+        for k in sys.modules
+        if k.split(".")[0] == "aiter"
+        or k.startswith(_UNDER_TEST)
+        or (k.split(".")[0] == "atom" and _fake(sys.modules[k]))
+    ]
+    saved = {k: sys.modules[k] for k in stale}
+    for k in stale:
+        del sys.modules[k]
+    # Snapshot after the eviction: anything `atom` that appears between here
+    # and the `finally` was imported while aiter was a mock.
+    preexisting = {k for k in sys.modules if k.split(".")[0] == "atom"}
+    sys.meta_path.insert(0, finder)
+    try:
+        from atom.model_ops.attentions.gdn_attn import GDNStateMixin
+        from atom.model_ops.attentions.kimi_mla_gdn_attn import _KimiMLAGDNCommon
+
+        yield GDNStateMixin, _KimiMLAGDNCommon
+    finally:
+        sys.meta_path.remove(finder)
+        # Everything imported under the stub must go, not just the two entry
+        # points: the aiter mocks reached whatever `atom` modules were pulled
+        # in transitively, and a later test importing one would get a class
+        # holding MagicMocks. Those are real modules with a real `__file__`,
+        # so they are identified by the snapshot rather than by `_fake`.
+        # Restoring `saved` last puts the other files' stubs back, so this
+        # fixture is not observable either way.
+        for k in [
+            k
+            for k in sys.modules
+            if k.split(".")[0] == "aiter"
+            or (k.split(".")[0] == "atom" and k not in preexisting)
+        ]:
+            del sys.modules[k]
+        sys.modules.update(saved)
+
+
 class TestMidstepExactnessPremise:
     """The interior-checkpoint path is only lossless while two dtypes agree.
 
@@ -2264,31 +2387,28 @@ class TestMidstepExactnessPremise:
     cache and runs that miss, which is close to the hardest kind to trace back.
     """
 
-    def _dtypes(self, model_type):
-        """`GDNStateMixin._state_dtypes` without constructing a builder.
+    @staticmethod
+    def _dtypes(gdn_cls, model_type):
+        """`_state_dtypes` without constructing a builder.
 
         The method reads only `model_runner.config`, so a namespace standing in
         for the runner is enough and keeps this off the GPU.
         """
-        import torch
-
-        from atom.model_ops.attentions.gdn_attn import GDNStateMixin
-
         runner = SimpleNamespace(
             config=SimpleNamespace(
                 torch_dtype=torch.bfloat16,
                 hf_config=SimpleNamespace(model_type=model_type),
             )
         )
-        return GDNStateMixin._state_dtypes(SimpleNamespace(model_runner=runner))
+        return gdn_cls._state_dtypes(SimpleNamespace(model_runner=runner))
 
-    def test_gdn_pool_matches_the_activation_dtype(self):
-        """Both families, because a checkpoint writes both."""
-        import torch
+    def test_gdn_pool_matches_the_activation_dtype(self, gdn_backends):
+        """Both halves, because a checkpoint writes both."""
+        gdn_cls, _ = gdn_backends
 
-        assert self._dtypes("qwen3_next") == (torch.bfloat16, torch.bfloat16)
+        assert self._dtypes(gdn_cls, "qwen3_next") == (torch.bfloat16, torch.bfloat16)
 
-    def test_kimi_is_the_one_pool_wider_than_h(self):
+    def test_kimi_is_the_one_pool_wider_than_h(self, gdn_backends):
         """And is excluded from the midstep path — for an unrelated reason.
 
         KDA is off it because `chunk_kda` never exposes per-chunk states at all
@@ -2296,11 +2416,11 @@ class TestMidstepExactnessPremise:
         exactness argument is a second, independent reason, so porting
         `chunk_kda_paged` to lift the first would not be enough on its own.
         """
-        import torch
+        gdn_cls, _ = gdn_backends
 
-        assert self._dtypes("kimi_linear") == (torch.bfloat16, torch.float32)
+        assert self._dtypes(gdn_cls, "kimi_linear") == (torch.bfloat16, torch.float32)
 
-    def test_midstep_backends_are_the_ones_with_a_matching_pool(self):
+    def test_midstep_backends_are_the_ones_with_a_matching_pool(self, gdn_backends):
         """The rule, rather than today's two answers to it.
 
         A backend that declares `readable_midstep` and allocates a pool wider
@@ -2308,18 +2428,16 @@ class TestMidstepExactnessPremise:
         as an invariant over the classes that declare it, so a third GDN-like
         backend added later has to satisfy it rather than merely resemble one.
         """
-        import torch
-
-        from atom.model_ops.attentions.gdn_attn import GDNStateMixin
-        from atom.model_ops.attentions.kimi_mla_gdn_attn import _KimiMLAGDNCommon
+        gdn_cls, kimi_cls = gdn_backends
 
         for cls, model_type in (
-            (GDNStateMixin, "qwen3_next"),
-            (_KimiMLAGDNCommon, "kimi_linear"),
+            (gdn_cls, "qwen3_next"),
+            (kimi_cls, "kimi_linear"),
         ):
             midstep = cls.state_transfer(SimpleNamespace()).readable_midstep
-            uniform = set(self._dtypes(model_type)) == {torch.bfloat16}
+            dtypes = self._dtypes(gdn_cls, model_type)
+            uniform = set(dtypes) == {torch.bfloat16}
             assert not midstep or uniform, (
                 f"{cls.__name__} reads checkpoints out of bf16 `h` but pools "
-                f"state at {self._dtypes(model_type)}"
+                f"state at {dtypes}"
             )
