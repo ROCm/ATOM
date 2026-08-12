@@ -59,7 +59,7 @@ from aiter.rotary_embedding import get_rope
 from torch import nn
 
 from atom.model_ops.activation import SiluAndMul
-from atom.model_ops.attention_mla import MLAModules
+from atom.model_ops.attention_mla import MLAModules, mla_min_query_heads
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import (
@@ -119,6 +119,17 @@ class DSparkMarkovHead(nn.Module):
         return logits_bias, markov_embed
 
 
+def _dspark_block_width(draft_config, atom_config) -> int:
+    """The draft block width T, resolved as `DSparkProposer._resolve_mtp_k` does.
+
+    Returns 0 when neither source names a width, which only happens outside a
+    speculative run; callers treat that as "no block pass to size for".
+    """
+    spec_config = getattr(atom_config, "speculative_config", None)
+    num_spec = getattr(spec_config, "num_speculative_tokens", None)
+    return int(num_spec or getattr(draft_config, "dspark_block_size", 0) or 0)
+
+
 class K3DSparkMLAAttention(nn.Module):
     """MLA attention for one draft layer, with a second entry point for the
     target-derived context rows.
@@ -144,9 +155,10 @@ class K3DSparkMLAAttention(nn.Module):
     one parallel pass, so intra-block order is carried by RoPE, not by a mask.
     That is settled -- sglang types these layers ``ENCODER_ONLY``, vLLM passes
     ``non_causal_multi_token_decode=True``, and vLLM ships a
-    ``test_dspark_noncausal_sparse_mla``. Wiring that through ATOM's MLA decode
-    kernel is the one piece NOT resolved here; see the comment in
-    :meth:`forward`.
+    ``test_dspark_noncausal_sparse_mla``. ATOM expresses it in
+    :class:`DSparkProposer`, which clears ``attn_metadata.causal`` and plans the
+    decode's work descriptors non-causally; the head padding chosen in
+    :meth:`__init__` is what keeps a non-causal kernel dispatchable.
     """
 
     def __init__(
@@ -270,13 +282,19 @@ class K3DSparkMLAAttention(nn.Module):
             head_dim=self.kv_lora_rank + self.qk_rope_head_dim,
             scale=self.scaling,
             num_kv_heads=1,
-            # Draft KV stays bf16 regardless of --kv_cache_dtype: it owns a bf16
-            # sibling pool (Eagle3DraftBuilder), and this string drives
-            # MLAAttention's whole dtype path (fp8 decode overload +
-            # concat_and_cache_mla dtype). "fp8" over a bf16 pool aborts in
-            # cache_kernels; bf16 also dodges aiter's fp8 split-KV table
-            # (get_block_n_fp8, no 16*7 entry), keeping block width 7 usable.
-            kv_cache_dtype="bf16",
+            # The draft binds into the engine's own MLA pool, so it caches in
+            # whatever dtype that pool was allocated with. This string has to
+            # agree with the bound tensor: it selects the fp8 decode overload
+            # and is passed straight to concat_and_cache_mla on the
+            # context-write path, and "fp8" over a bf16 tensor (or the reverse)
+            # aborts inside cache_kernels.
+            kv_cache_dtype=atom_config.kv_cache_dtype,
+            # The block pass runs this decode non-causally, which narrows the
+            # aiter kernels available for it; the draft's own block width picks
+            # the head padding that keeps one dispatchable.
+            min_query_heads=mla_min_query_heads(
+                atom_config.kv_cache_dtype, _dspark_block_width(config, atom_config)
+            ),
             layer_num=layer_num,
             use_mla=True,
             mla_modules=mla_modules,

@@ -1397,13 +1397,37 @@ class ModelRunner:
             (3, num_tokens), (num_tokens, 1)
         )
 
+    def _num_draft_kv_layers(self) -> int:
+        """How many KV cache slots the draft model needs, one per draft layer.
+
+        A draft with a REAL layer stack — the Eagle3 drafts and the standalone
+        DSpark drafts — runs every one of its layers on every drafting step, so
+        each needs its own slot. Serial MTP instead reuses one layer `mtp_k`
+        times and declares how many it has in `num_nextn_predict_layers`.
+
+        Single source of truth on purpose: this count drives both the pool
+        sizing (`_get_total_num_layers` -> the builders' `sub_pool_specs`) and
+        the allocation itself. Two independent spellings of it silently
+        disagreed for the standalone DSpark draft, sizing 1 slot while
+        allocating 5.
+        """
+        spec_config = self.config.speculative_config
+        draft_hf = spec_config.draft_model_hf_config
+        has_real_stack = (
+            hasattr(self, "eagle3_draft_builder")
+            or getattr(spec_config, "use_dspark_with_draft", lambda: False)()
+        )
+        if has_real_stack:
+            return draft_hf.num_hidden_layers
+        return getattr(draft_hf, "num_nextn_predict_layers", 1)
+
     def _get_total_num_layers(self):
         """Return total layer count including draft (MTP) layers.
 
         Drafts that own an independent KV cache via their own builder
         (e.g. Eagle3 MHA draft on an MLA target) account for their layers
-        through that builder, so they are NOT added here. Only MTP-style
-        drafts that share the target's KV pool contribute.
+        through that builder, so they are NOT added here. Only drafts that
+        share the target's KV pool contribute.
         """
         num_hidden = self.config.hf_config.num_hidden_layers
         pp_group = get_pp_group()
@@ -1419,8 +1443,7 @@ class ModelRunner:
             and hasattr(self, "drafter")
             and not hasattr(self, "eagle3_draft_builder")
         ):
-            draft_hf = self.config.speculative_config.draft_model_hf_config
-            total += getattr(draft_hf, "num_nextn_predict_layers", 1)
+            total += self._num_draft_kv_layers()
         return total
 
     def _sub_pool_specs(self) -> list[SubPoolSpec]:
@@ -1742,27 +1765,12 @@ class ModelRunner:
         self.num_kv_heads = num_kv_heads
         self.aligned_index_dim = None  # set below for DeepSeek-V3.2
 
-        # Calculate total number of layers (target + draft)
+        # Total layer count (target + any draft sharing the target's pool).
         total_num_layers = self._get_total_num_layers()
         num_draft_layers = 0
         if self.config.speculative_config and hasattr(self, "drafter"):
-            spec_config = self.config.speculative_config
-            draft_hf_config = spec_config.draft_model_hf_config
-
-            # real stack -> 1 slot/layer; else serial MTP reuses one
             owns_pool = hasattr(self, "eagle3_draft_builder")
-            has_real_stack = (
-                owns_pool
-                or getattr(spec_config, "use_dspark_with_draft", lambda: False)()
-            )
-            num_draft_layers = (
-                draft_hf_config.num_hidden_layers
-                if has_real_stack
-                else getattr(draft_hf_config, "num_nextn_predict_layers", 1)
-            )
-            # sibling-pool draft not counted in target pool
-            if not owns_pool:
-                total_num_layers += num_draft_layers
+            num_draft_layers = self._num_draft_kv_layers()
             logger.info(
                 f"Allocating KV cache for {hf_config.num_hidden_layers} target "
                 f"layers + {num_draft_layers} draft layers"

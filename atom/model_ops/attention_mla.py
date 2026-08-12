@@ -108,6 +108,27 @@ logger = logging.getLogger("atom")
 
 _MLA_MIN_HEADS = 16  # AITER MLA kernels require at least 16 attention heads
 
+
+def mla_min_query_heads(kv_cache_dtype: str, block_width: int) -> int:
+    """Query-head padding that lets aiter dispatch a NON-causal MLA decode.
+
+    aiter picks its .co from (gqa, block width, causality), and on an fp8 cache
+    a 2-wide non-causal block has no kernel at gqa=16: the asm dispatch hits
+    AITER_CHECK and aborts the whole process. Padding to 32 instead reaches the
+    4-wide non-causal kernel through aiter's own (gqa=32, width 2) remap.
+
+    Only width 2 needs this. Widths 1, 3 and 4 have gqa=16 kernels, and aiter
+    remaps anything wider onto gqa=32 itself. Padding rather than remapping
+    width 2 to the 4-wide kernel at gqa=16 is deliberate: the persistent work
+    descriptors are sized from the block width, so a 2-wide plan driving a
+    4-wide kernel writes its partials past the reduce buffers (illegal access
+    at some batch sizes, a non-terminating kernel at others).
+    """
+    if block_width == 2 and kv_cache_dtype.startswith("fp8"):
+        return 32
+    return _MLA_MIN_HEADS
+
+
 # The fused seg MLA kernels (fused_qk_rope_concat_and_cache_mla_seg +
 # concat_and_cache_mla_seg + the gfx1250 mla_decode_fwd asm) share a single
 # segmented KV cache layout (all tokens' nope packed first, then all tokens'
@@ -277,7 +298,9 @@ class MLAAttention(nn.Module):
         self.kv_cache_dtype = "fp8" if kv_cache_dtype.startswith("fp8") else "auto"
         self.dtype = dtype
 
-        self.padded_num_heads = max(num_heads, _MLA_MIN_HEADS)
+        self.padded_num_heads = max(
+            num_heads, kwargs.get("min_query_heads", _MLA_MIN_HEADS)
+        )
         self.head_repeat_factor = 1
         self.head_pad = 0
         if self.padded_num_heads != num_heads:

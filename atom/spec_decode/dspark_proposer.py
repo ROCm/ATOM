@@ -85,9 +85,11 @@ class DSparkProposer(Drafter):
         )
 
         max_bs = self.config.max_num_seqs
-        # padded_num_heads lives on the draft MLA module (>=_MLA_MIN_HEADS==16),
-        # matching the gqa ratio the asm kernel dispatches on. The ModelRunner
-        # itself has no such attribute.
+        # padded_num_heads lives on the draft MLA module (see
+        # mla_min_query_heads), matching the gqa ratio the asm kernel dispatches
+        # on -- read it rather than recomputing, so the work descriptors planned
+        # here describe the kernel that will actually run. The ModelRunner itself
+        # has no such attribute.
         self._blk_padded_heads = self.model.layers[
             0
         ].self_attn.mla_attn.impl.padded_num_heads
@@ -150,7 +152,6 @@ class DSparkProposer(Drafter):
         import copy
 
         from atom.config import CompilationLevel
-        from atom.spec_decode.eagle3_kv_builder import Eagle3DraftBuilder
 
         draft_hf = self.speculative_config.draft_model_hf_config
         draft_atom_config = copy.copy(self.config)
@@ -161,19 +162,21 @@ class DSparkProposer(Drafter):
             draft_atom_config,
             layer_offset=self.config.hf_config.num_hidden_layers,
         )
-        # The draft owns a sibling KV pool. It stores the MLA latent
-        # (kv_lora_rank 512 + qk_rope_head_dim 64 = 576 per token), and the
-        # Kimi-K3 target has NO pool of that shape to borrow: being a
-        # kimi_linear hybrid it goes through the GDN/KDA builder, which
-        # allocates its full-attention layers as split K/V at
-        # head_dim = qk_nope + qk_rope = 192, not as a compressed latent. So
-        # sharing is not merely suboptimal, it is a shape mismatch --
-        # concat_and_cache_mla asserts `kv_cache.size(2) == 576`.
+        # An MLA draft stores the same 576-wide latent (kv_lora_rank 512 +
+        # qk_rope_head_dim 64) as an MLA target's own layers, so it binds into
+        # the TARGET's pool as extra rows -- the target builder already sizes
+        # and addresses them (see `_num_cache_rows` / `build_kv_cache_tensor`),
+        # and the draft inherits `--kv_cache_dtype` for free that way.
         #
-        # Eagle3DraftBuilder covers both layouts and picks MLA off the draft
-        # config's `kv_lora_rank`. ModelRunner keys its draft-pool allocation
-        # and per-module binding off the presence of this attribute.
-        self.runner.eagle3_draft_builder = Eagle3DraftBuilder(self.runner, draft_hf)
+        # An MHA draft has no such row to borrow and needs the sibling pool.
+        # Same fork, same spelling as EagleProposer.
+        draft_is_mla = bool(getattr(draft_hf, "kv_lora_rank", None))
+        if not draft_is_mla:
+            from atom.spec_decode.eagle3_kv_builder import Eagle3DraftBuilder
+
+            # ModelRunner keys its draft-pool allocation and per-module binding
+            # off the presence of this attribute.
+            self.runner.eagle3_draft_builder = Eagle3DraftBuilder(self.runner, draft_hf)
         return model
 
     def _resolve_mtp_k(self) -> int:
@@ -228,9 +231,10 @@ class DSparkProposer(Drafter):
             logger.warning(
                 "DSpark draft layer_%d is bound to a %s KV cache, but "
                 "--kv_cache_dtype=%s implies %s. Using the bound tensor's dtype "
-                "for q_out so the fused write agrees, but the draft's sibling "
-                "pool and the requested cache dtype disagree -- check that "
-                "layer_%d maps to eagle3_kv_cache and not to a target layer.",
+                "for q_out so the fused write agrees -- but the two should not "
+                "be able to differ, since the draft binds into the pool the "
+                "engine allocated from that same flag. Check that layer_%d "
+                "resolved to a draft row and not to a target layer.",
                 layer_num,
                 bound.dtype,
                 self.config.kv_cache_dtype,
