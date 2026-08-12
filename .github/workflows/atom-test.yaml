@@ -115,6 +115,9 @@ jobs:
           CHECK_SIGNAL_HEAD_REF: ${{ github.event.pull_request.head.ref || github.head_ref || github.ref_name }}
           CHECK_SIGNAL_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
 
+  # The steps below are skipped when a caller pins an aiter ref, but the job
+  # itself still has to run and succeed: atom-test needs it and gates on its
+  # result, so skipping the job would skip the accuracy matrix with it.
   download_aiter_wheel:
     if: ${{ needs.ci-gate.outputs.should_run == 'true' && needs.check-signal.result == 'success' }}
     needs: [ci-gate, check-signal]
@@ -124,12 +127,14 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v6
       - name: Prefer latest main aiter wheel manifest and fallback to artifact
+        if: ${{ env.AITER_GIT_REF == 'main' }}
         timeout-minutes: 30
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: bash .github/scripts/download_aiter_wheel.sh
 
       - name: Upload aiter wheel
+        if: ${{ env.AITER_GIT_REF == 'main' }}
         uses: actions/upload-artifact@v7
         with:
           name: aiter-whl

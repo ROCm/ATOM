@@ -65,6 +65,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_SHA: ${{ github.sha }}
 
+  # The steps below are skipped when a caller pins an aiter ref, but the job
+  # itself still has to run and succeed: atomesh-test needs it, so skipping the
+  # job would skip the accuracy matrix with it.
   download_aiter_wheel:
     if: ${{ needs.check-signal.result == 'success' && (!github.event.pull_request || github.event.pull_request.draft == false) }}
     needs: [check-signal]
@@ -74,11 +77,13 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v6
       - name: Prefer latest main aiter wheel manifest and fallback to artifact
+        if: ${{ env.AITER_GIT_REF == 'main' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: bash .github/scripts/download_aiter_wheel.sh
 
       - name: Upload aiter wheel
+        if: ${{ env.AITER_GIT_REF == 'main' }}
         uses: actions/upload-artifact@v7
         with:
           name: aiter-whl
