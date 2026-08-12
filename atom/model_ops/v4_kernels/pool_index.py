@@ -22,7 +22,24 @@ address at all; see `UnifiedPoolGeometry.window_params`.
 import triton
 import triton.language as tl
 
-from atom.model_ops.attentions.v4_pool_geometry import WindowParams
+from atom.model_ops.attentions.v4_pool_geometry import (
+    UnifiedPoolGeometry,
+    WindowParams,
+)
+
+
+def served_window_params(geometry: UnifiedPoolGeometry) -> dict[int, WindowParams]:
+    """Window parameters for the classes this geometry actually has.
+
+    A class with no layers is not in `UnifiedPoolGeometry.classes` and has no
+    address to give: asking for one raises. That is easy to forget for DENSE,
+    which every V4 config used to have — until a layer whose window moved into
+    a state field took the last one with it, which is what a DSpark draft does
+    to a trunk that is all CSA and HCA. The index builders serve one output
+    buffer per class, so an absent class simply has no output; they read
+    presence from here rather than each deciding what "absent" means.
+    """
+    return {ratio: geometry.window_params(ratio) for ratio in geometry.classes}
 
 
 def window_constexprs(params: WindowParams, prefix: str = "") -> dict:

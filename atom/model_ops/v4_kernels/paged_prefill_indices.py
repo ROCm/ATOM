@@ -57,6 +57,7 @@ from atom.model_ops.attentions.v4_pool_geometry import (
 )
 from atom.model_ops.v4_kernels.pool_index import (
     compress_row,
+    served_window_params,
     window_constexprs,
     window_row,
 )
@@ -94,6 +95,7 @@ def _v4_paged_prefill_indices_kernel(
     HCA_ROWS_PER_BLOCK: tl.constexpr,  # HCA rows per block (block_size // HCA_RATIO)
     ENVELOPE_ROWS: tl.constexpr,  # rows one block occupies across all layers
     BLOCK_N: tl.constexpr,  # next_pow2(win) — covers SWA prefix and extend segments
+    HAS_DENSE: tl.constexpr,  # geometry has layers of this class to serve
     DENSE_RING_SLOTS: tl.constexpr,
     DENSE_SLOT_ROWS: tl.constexpr,
     DENSE_RING_STRIDE: tl.constexpr,
@@ -160,24 +162,25 @@ def _v4_paged_prefill_indices_kernel(
     # this reads is inside the ring's last lap. That bound is what lets a ring
     # serve chunked prefill at all — the in-chunk part comes from the extend
     # tensor, never from the pool.
-    swa_base_swa = tl.load(prefix_swa_indptr_ptr + t)
     swa_base_hca = tl.load(prefix_hca_indptr_ptr + t)
     swa_mask = i < prefix_swa_count
     global_pos = swa_low + i
     swa_slot = tl.load(state_slot_per_seq_ptr + bid)
-    tl.store(
-        prefix_swa_indices_ptr + swa_base_swa + i,
-        window_row(
-            swa_slot,
-            global_pos,
-            dense_ring_start,
-            DENSE_RING_SLOTS,
-            DENSE_SLOT_ROWS,
-            DENSE_RING_STRIDE,
-            DENSE_RUN_ROWS,
-        ),
-        mask=swa_mask,
-    )
+    if HAS_DENSE:
+        swa_base_swa = tl.load(prefix_swa_indptr_ptr + t)
+        tl.store(
+            prefix_swa_indices_ptr + swa_base_swa + i,
+            window_row(
+                swa_slot,
+                global_pos,
+                dense_ring_start,
+                DENSE_RING_SLOTS,
+                DENSE_SLOT_ROWS,
+                DENSE_RING_STRIDE,
+                DENSE_RUN_ROWS,
+            ),
+            mask=swa_mask,
+        )
     # CSA buffer: the SWA prefix goes at the slice TAIL. `csa_translate_pack`
     # writes the CSA topk section at the slice HEAD
     # `[indptr[t], indptr[t]+valid_k)` (valid_k = slice_len - prefix_swa_count),
@@ -300,7 +303,13 @@ def write_v4_paged_prefill_indices(
       prefix_csa_indptr:         ``[T+1]``  int.
       prefix_hca_indptr:         ``[T+1]``  int.
       extend_indices:            ``[ext_total]`` int OUT — fully written.
-      prefix_swa_indices:        ``[swa_total]`` int OUT — fully written.
+      prefix_swa_indices:        ``[swa_total]`` int OUT — fully written,
+                                  unless no layer is dense, when it is left
+                                  untouched: the dense class is its only
+                                  reader and a geometry can turn out not to
+                                  have one. The caller allocates it with
+                                  ``torch.empty`` and publishes it either way,
+                                  so in that case it holds whatever was there.
       prefix_csa_indices:        ``[csa_total]`` int OUT — SWA prefix
                                   segment written at the slice TAIL; CSA topk
                                   HEAD section filled per layer by
@@ -331,9 +340,22 @@ def write_v4_paged_prefill_indices(
     ):
         assert idx.dim() == 1
 
-    dense = geometry.window_params(DENSE_RATIO)
-    csa = geometry.window_params(CSA_RATIO)
-    hca = geometry.window_params(HCA_RATIO)
+    # DENSE is the one class a V4 config can turn out not to have: a layer that
+    # carries its window in a state field leaves the row space entirely, and on
+    # a trunk that is all CSA and HCA the draft layer is the only ratio-0 one
+    # there was. `prefix_swa_indices` then has no reader, so `HAS_DENSE` skips
+    # it and the borrowed parameters below never reach a store. CSA and HCA
+    # have no such exit today; the assert is there so the day one appears it
+    # says so instead of raising a bare KeyError out of the geometry.
+    served = served_window_params(geometry)
+    assert CSA_RATIO in served and HCA_RATIO in served, (
+        "V4 paged prefill writes the CSA and HCA prefix buffers unconditionally; "
+        f"this pool serves only {sorted(served)}"
+    )
+    has_dense = DENSE_RATIO in served
+    csa = served[CSA_RATIO]
+    hca = served[HCA_RATIO]
+    dense = served.get(DENSE_RATIO, csa)
     BLOCK_N = triton.next_power_of_2(win)
     _v4_paged_prefill_indices_kernel[(T,)](
         positions,
@@ -360,6 +382,7 @@ def write_v4_paged_prefill_indices(
         HCA_ROWS_PER_BLOCK=hca_rows_per_block,
         ENVELOPE_ROWS=geometry.envelope_rows,
         BLOCK_N=BLOCK_N,
+        HAS_DENSE=has_dense,
         **window_constexprs(dense, "DENSE_"),
         **window_constexprs(csa, "CSA_"),
         **window_constexprs(hca, "HCA_"),
@@ -399,9 +422,10 @@ def write_v4_paged_prefill_indices_reference(
     """
     if T == 0:
         return
-    dense = geometry.window_params(DENSE_RATIO)
-    csa = geometry.window_params(CSA_RATIO)
-    hca = geometry.window_params(HCA_RATIO)
+    served = served_window_params(geometry)
+    dense = served.get(DENSE_RATIO)
+    csa = served[CSA_RATIO]
+    hca = served[HCA_RATIO]
     bid_cpu = bid_per_token[:T].cpu().tolist()
     pos_cpu = positions[:T].cpu().tolist()
     cs_per_seq_cpu = chunk_start_per_seq.cpu().tolist()
@@ -452,9 +476,12 @@ def write_v4_paged_prefill_indices_reference(
                     device=device,
                 )
 
-            prefix_swa_indices[sb_swa : sb_swa + prefix_swa_count] = rows(
-                dense, prefix_swa_indices
-            )
+            # No dense layer means no reader for this buffer — the kernel
+            # leaves it alone too, on `HAS_DENSE`.
+            if dense is not None:
+                prefix_swa_indices[sb_swa : sb_swa + prefix_swa_count] = rows(
+                    dense, prefix_swa_indices
+                )
             # CSA: SWA prefix at the slice TAIL (head holds the CSA topk section
             # filled by csa_translate_pack). See the kernel comment above.
             csa_end = csa_indptr_cpu[t + 1]
