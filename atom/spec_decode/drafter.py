@@ -228,6 +228,36 @@ class Drafter(abc.ABC):
         drafter uses fixed-length verification."""
         return None
 
+    @property
+    def fills_chunk_kv(self) -> bool:
+        """True when ``fill_chunk_kv`` is implemented, i.e. this drafter can write
+        its own KV for a prompt chunk that produces no sampled token."""
+        return False
+
+    def fill_chunk_kv(
+        self,
+        target_token_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        last_token_indices: torch.Tensor,
+    ) -> None:
+        """Write this chunk's draft-model KV without drafting anything.
+
+        A middle chunk of a chunked prefill yields no sampled token, so the
+        request never reaches ``propose``. Without this the draft model's KV
+        covers only the tokens of chunks that happened to share a batch with an
+        output-producing sequence, and its attention reads whatever the previous
+        tenant of those blocks left behind.
+
+        Same inputs as ``propose`` minus the reject counts, and ``next_token_ids``
+        holds each segment's following *prompt* token rather than a sampled one.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement fill_chunk_kv; guard the "
+            "call site on the fills_chunk_kv capability."
+        )
+
     # ---- aux-hidden-state ownership (drafter-owned, hook-based) ----
     def arm_aux_capture(self, target_model: nn.Module) -> None:
         """Install drafter-owned forward hooks on the target's decoder layers per

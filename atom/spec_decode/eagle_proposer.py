@@ -225,6 +225,53 @@ class EagleProposer(Drafter):
             )
         finally:
             context.is_draft = was_draft
+    @property
+    def fills_chunk_kv(self) -> bool:
+        # Plain MTP only. The eagle3 MHA draft owns a sibling KV pool and needs
+        # the slot_mapping / block_tables re-pointing that propose() does; that
+        # is not replicated here.
+        return self.speculative_config.method == "mtp"
+
+    def fill_chunk_kv(
+        self,
+        target_token_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        last_token_indices: torch.Tensor,
+    ) -> None:
+        context = get_forward_context().context
+        context.is_draft = True
+
+        input_ids = target_token_ids
+        input_ids.scatter_(0, last_token_indices, next_token_ids)
+        positions = target_positions + 1
+
+        # Prefill Context Parallel: the chunk reuses the target's 1/pcp-reindexed
+        # attn_metadata, so the draft must run on this rank's query shard. Unlike
+        # propose's i==0 there is no hidden state to gather back — the KV writes
+        # are the whole point and each rank writes its own shard's slots.
+        hidden_states = target_hidden_states
+        if _pcp_active_for_draft_model(self.model):
+            pcp_ws = get_pcp_world_size()
+            n_pad = pcp_pad_len(input_ids.shape[0], pcp_ws) - input_ids.shape[0]
+            input_ids = pcp_round_robin_split(pcp_pad_dense(input_ids, n_pad), pcp_ws)
+            positions = pcp_round_robin_split(pcp_pad_dense(positions, n_pad), pcp_ws)
+            hidden_states = pcp_round_robin_split(
+                pcp_pad_dense(hidden_states, n_pad), pcp_ws
+            )
+
+        # The chunk's own indexer top-k, same as draft step 0. Nothing reuses the
+        # buffer afterwards, so there is no compaction to do.
+        if self._share_mtp_indices:
+            self.model.model.set_skip_topk(False)
+        self.model(
+            input_ids=input_ids,
+            positions=positions,
+            hidden_states=hidden_states,
+        )
+        if self._share_mtp_indices:
+            self.model.model.set_skip_topk(True)
 
     def propose(
         self,

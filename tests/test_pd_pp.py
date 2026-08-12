@@ -227,11 +227,11 @@ def _starts(partitions):
 
 
 def test_region_map_identity_when_pp1():
-    assert consumer_region_indices(156, 78, 0, 78, 1) == list(range(156))
+    assert consumer_region_indices(156, 78, 0, 156, 1) == list(range(156))
 
 
 def test_region_map_identity_when_empty():
-    assert consumer_region_indices(0, 0, 5, 78, 4) == []
+    assert consumer_region_indices(0, 0, 5, 156, 4) == []
 
 
 def test_region_map_group_major_single_group():
@@ -240,14 +240,19 @@ def test_region_map_group_major_single_group():
 
 
 def test_region_map_group_major_two_groups_mla():
-    # MLA: 2 groups [kv, index], stage=20 layers @ start 18, N=78.
-    got = consumer_region_indices(40, 20, 18, 78, 4)
+    # MLA: 2 groups [kv, index], stage=20 layers @ start 18, consumer has 156.
+    got = consumer_region_indices(40, 20, 18, 156, 4)
     assert got[:20] == list(range(18, 38))
     assert got[20:] == list(range(78 + 18, 78 + 38))
 
 
 def test_region_map_undefined_when_not_multiple():
-    assert consumer_region_indices(41, 20, 18, 78, 4) is None
+    assert consumer_region_indices(41, 20, 18, 156, 4) is None
+
+
+def test_region_map_undefined_when_groups_uneven():
+    # 2 local groups against a consumer list that is not 2 whole groups.
+    assert consumer_region_indices(40, 20, 18, 157, 4) is None
 
 
 def test_region_map_stages_tile_consumer_no_overlap():
@@ -256,18 +261,56 @@ def test_region_map_stages_tile_consumer_no_overlap():
     covered = []
     for start, n_local in zip(_starts(partitions), partitions):
         covered.extend(
-            consumer_region_indices(n_local * groups, n_local, start, num_hidden, 4)
+            consumer_region_indices(
+                n_local * groups, n_local, start, num_hidden * groups, 4
+            )
         )
     total = num_hidden * groups
     assert sorted(covered) == list(range(total))
     assert len(covered) == len(set(covered))  # no overlap
 
 
+def test_region_map_stages_tile_consumer_with_mtp_layer():
+    # Spec decode binds the draft's KV layer on the last PP stage only, so that
+    # stage holds one more layer than its partition and every consumer group is
+    # one entry wider. Reading the stride off the consumer's region count keeps
+    # all four stages tiling exactly — the old num_hidden_layers stride put every
+    # stage's second group one slot low.
+    partitions, num_hidden, groups = [20, 20, 20, 18], 78, 2
+    consumer_layers = num_hidden + 1  # + MTP layer 78
+    covered = []
+    for stage, (start, n_local) in enumerate(zip(_starts(partitions), partitions)):
+        if stage == len(partitions) - 1:
+            n_local += 1
+        covered.extend(
+            consumer_region_indices(
+                n_local * groups, n_local, start, consumer_layers * groups, 4
+            )
+        )
+    assert sorted(covered) == list(range(consumer_layers * groups))
+    assert len(covered) == len(set(covered))
+
+
+def test_region_map_undefined_when_producer_drafts_and_consumer_does_not():
+    # Prefill with --method mtp against a consumer without it: the last stage's
+    # 19th layer has nowhere to land. Must refuse rather than alias onto the
+    # consumer's next group.
+    assert consumer_region_indices(38, 19, 60, 78 * 2, 4) is None
+
+
+def test_region_map_consumer_mtp_layer_left_unwritten_is_fine():
+    # The reverse asymmetry is benign: the producer simply never writes the
+    # consumer's MTP layer, which is where it was before this feature.
+    got = consumer_region_indices(36, 18, 60, 79 * 2, 4)
+    assert got[:18] == list(range(60, 78))
+    assert got[18:] == list(range(79 + 60, 79 + 78))
+
+
 def test_region_map_group_major_beats_naive_offset():
     # Regression guard: a naive additive offset (start_layer*groups + i) would
     # misroute group-major layouts. Stage1's index-group region 0 (local idx 20)
     # must land in the consumer's index group (>=78), not at 36+20=56 (kv group).
-    cmap = consumer_region_indices(40, 20, 18, 78, 4)
+    cmap = consumer_region_indices(40, 20, 18, 156, 4)
     assert cmap[20] == 78 + 18
     assert cmap[20] != 56
 
