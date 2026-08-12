@@ -66,3 +66,91 @@ def test_memory_tensor_rejects_an_object_that_is_too_small():
 def test_thread_state_is_per_device_and_cached():
     st = StagedTransfer(CPU, staging_buffer_bytes=1024)
     assert st.thread_state() is st.thread_state()
+
+
+# ---------------------------------------------------------------------------
+# pack / unpack -- the state tier's whole-entry transfer. GPU only: the Triton
+# packer refuses a non-CUDA segment by design.
+# ---------------------------------------------------------------------------
+
+_needs_gpu = pytest.mark.skipif(
+    not (hasattr(torch, "cuda") and torch.cuda.is_available()),
+    reason="a ROCm GPU is required",
+)
+
+
+class _HostObj:
+    """A MemoryObj whose bytes live on the host, which is the normal case."""
+
+    def __init__(self, nbytes):
+        self.tensor = torch.zeros(nbytes, dtype=torch.uint8)
+
+
+class _DeviceObj:
+    def __init__(self, nbytes, device):
+        self.tensor = torch.zeros(nbytes, dtype=torch.uint8, device=device)
+
+
+def _segments(device, sizes=(96, 32, 160)):
+    """Segments of deliberately differing sizes -- GDN's k-views and v-views
+    are not the same size, and `_build_meta` sums them per block."""
+    return [
+        torch.arange(n, dtype=torch.uint8, device=device).add_(i * 7)
+        for i, n in enumerate(sizes)
+    ]
+
+
+def _nbytes(segments):
+    return sum(int(s.numel()) * s.element_size() for s in segments)
+
+
+@_needs_gpu
+def test_pack_unpack_round_trips_bit_exactly_through_a_host_object():
+    """The whole point of the state tier: what comes back must be the same
+    bytes, across a D2H hop the KV path also makes."""
+    device = torch.device("cuda")
+    src = _segments(device)
+    st = StagedTransfer(device, staging_buffer_bytes=1 << 16)
+    dst = _HostObj(_nbytes(src))
+    st.pack(src, dst)
+
+    out = [torch.zeros_like(s) for s in src]
+    st.unpack(dst, out)
+    for a, b in zip(src, out, strict=True):
+        assert torch.equal(a, b)
+
+
+@_needs_gpu
+def test_pack_writes_straight_into_a_device_object():
+    """No staging hop is needed when the object already lives on our device."""
+    device = torch.device("cuda")
+    src = _segments(device)
+    st = StagedTransfer(device, staging_buffer_bytes=1 << 16)
+    dst = _DeviceObj(_nbytes(src), device)
+    st.pack(src, dst)
+    torch.cuda.synchronize()
+    assert torch.equal(dst.tensor, torch.cat([s.reshape(-1) for s in src]))
+
+    out = [torch.zeros_like(s) for s in src]
+    st.unpack(dst, out)
+    for a, b in zip(src, out, strict=True):
+        assert torch.equal(a, b)
+
+
+@_needs_gpu
+def test_a_destination_too_small_raises_rather_than_truncating():
+    """Silent truncation would store a half-entry that unpacks as garbage."""
+    device = torch.device("cuda")
+    src = _segments(device)
+    st = StagedTransfer(device, staging_buffer_bytes=1 << 16)
+    with pytest.raises(ValueError, match="too small"):
+        st.pack(src, _HostObj(_nbytes(src) - 1))
+
+
+@_needs_gpu
+def test_pack_refuses_an_entry_larger_than_the_bounded_staging_buffer():
+    device = torch.device("cuda")
+    src = _segments(device)
+    st = StagedTransfer(device, staging_buffer_bytes=64)
+    with pytest.raises(RuntimeError, match="exceeds bounded GPU staging buffer"):
+        st.pack(src, _HostObj(_nbytes(src)))
