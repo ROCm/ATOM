@@ -1308,7 +1308,7 @@ class Scheduler:
             if any(fates.values()):
                 logger.info(
                     "state checkpoints: %s",
-                    " ".join(f"{k}={v}" for k, v in fates.items()),
+                    " ".join(f"{k}={v}" for k, v in sorted(fates.items())),
                 )
 
         total_tokens_num_prefill = sum(num_scheduled_tokens)

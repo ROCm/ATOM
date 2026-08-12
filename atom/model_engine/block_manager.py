@@ -184,12 +184,18 @@ class BlockManager:
         Accumulates keys from whatever each class's ``checkpoint_fates()``
         returns, so adding a counter to any pool automatically appears here
         without a matching change in this method.  Classes that do not expose
-        ``checkpoint_fates`` (e.g. stateless stubs) are skipped silently.
+        ``checkpoint_fates`` are skipped, but a warning is emitted so the
+        omission is visible rather than silently under-counting the totals.
         """
         totals: dict[str, int] = {}
         for cache in self.state_caches:
             fates_fn = getattr(cache, "checkpoint_fates", None)
             if fates_fn is None:
+                logger.warning(
+                    "state_checkpoint_fates: %s does not implement "
+                    "checkpoint_fates(); its counters are excluded from totals",
+                    type(cache).__name__,
+                )
                 continue
             for k, v in fates_fn().items():
                 totals[k] = totals.get(k, 0) + v
@@ -702,11 +708,15 @@ class BlockManager:
         Assembled here because the stages live in two objects — the ladder
         decides what to ask for, the pool decides what survives — and a reader
         needs them side by side to tell which stage lost it.
+
+        Pool-level fates are collected via ``state_checkpoint_fates()`` so that
+        a second state class is automatically included — calling
+        ``self.state.checkpoint_fates()`` directly would miss it.
         """
         return {
             "demands_recorded": self.demands_recorded,
             "chunks_cut_for_demand": self.chunks_cut_for_demand,
-        } | self.state.checkpoint_fates()
+        } | self.state_checkpoint_fates()
 
     def checkpointers_at(
         self,

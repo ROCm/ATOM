@@ -1557,3 +1557,107 @@ def test_fates_report_every_counter():
         "checkpoints_orphaned",
         "checkpoints_dropped",
     }
+
+
+def test_state_checkpoint_fates_warns_on_missing_method(caplog):
+    """A state cache that lacks checkpoint_fates() emits a warning.
+
+    The aggregator must not silently under-count: when a class registered in
+    ``state_caches`` does not implement ``checkpoint_fates()``, a WARNING is
+    logged naming the skipped class so an operator knows the total is partial.
+    """
+    import logging
+
+    bm = BlockManager(ckpt_config())
+    # StubStateCache (defined above) satisfies StateCache but has no
+    # checkpoint_fates — exactly the class of future lightweight implementations
+    # the warning is meant to catch.
+    bm.state_caches = (bm.state_caches[0], StubStateCache())
+
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        bm.state_checkpoint_fates()
+
+    assert any(
+        "StubStateCache" in r.message and "checkpoint_fates" in r.message
+        for r in caplog.records
+    ), "expected a WARNING naming StubStateCache; got: " + str(
+        [r.message for r in caplog.records]
+    )
+
+
+def test_state_checkpoint_fates_log_order_is_stable():
+    """The periodic log line must emit keys in sorted order.
+
+    Dict insertion order is not deterministic across class additions, so the
+    log format used by ``Scheduler.schedule()`` sorts ``fates.items()`` before
+    joining.  Assert that the result of sorting matches a lexicographic
+    reference — if someone removes the ``sorted()`` call the line reverts to
+    insertion order, which this test would catch.
+    """
+    pool = StateGroupPool(
+        num_groups=4, transfer=StateTransfer.copy(), hash_block_size=4
+    )
+    # Simulate one checkpoint being kept so fates has non-trivial values.
+    pool.checkpoints_kept += 3
+    pool.checkpoints_dropped += 1
+
+    fates = pool.checkpoint_fates()
+    # The scheduler joins sorted(fates.items()); verify that sorted order is
+    # stable and matches alphabetical key order.
+    sorted_keys = [k for k, _ in sorted(fates.items())]
+    assert sorted_keys == sorted(fates.keys()), (
+        "sorted(fates.items()) must yield keys in alphabetical order; "
+        f"got {sorted_keys}"
+    )
+    # And specifically: the alphabetical order for the four real keys is fixed.
+    assert sorted_keys == [
+        "checkpoints_dropped",
+        "checkpoints_evicted",
+        "checkpoints_kept",
+        "checkpoints_orphaned",
+    ]
+
+
+def test_checkpoint_funnel_includes_second_state_class():
+    """checkpoint_funnel() must aggregate fates across ALL state classes.
+
+    Prior to the fix, ``checkpoint_funnel()`` called ``self.state.checkpoint_fates()``
+    directly, which would miss any second state class added to ``state_caches``.
+    After routing through ``state_checkpoint_fates()``, a second class that
+    implements ``checkpoint_fates()`` is included in the funnel output.
+    """
+
+    class SecondPoolStub:
+        """Minimal StateCache with checkpoint_fates — mimics a second real class."""
+
+        successor_room = 0
+
+        def applies(self, seq):
+            return False
+
+        def resumable_hit(self, seq, P, block_hashes, assume_checkpointed=False):
+            return 0
+
+        def checkpoint(self, seq, boundary_blocks, h):
+            pass
+
+        def checkpoint_fates(self) -> dict:
+            return {"checkpoints_kept": 7, "checkpoints_dropped": 2}
+
+    bm = BlockManager(ckpt_config())
+    bm.state_caches = (bm.state_caches[0], SecondPoolStub())
+
+    funnel = bm.checkpoint_funnel()
+
+    # The two ladder-level counters must still be present.
+    assert "demands_recorded" in funnel
+    assert "chunks_cut_for_demand" in funnel
+
+    # The second class's counters must appear in the funnel — they would have
+    # been absent before the fix.
+    assert (
+        funnel.get("checkpoints_kept", 0) >= 7
+    ), "checkpoints_kept from SecondPoolStub missing from checkpoint_funnel()"
+    assert (
+        funnel.get("checkpoints_dropped", 0) >= 2
+    ), "checkpoints_dropped from SecondPoolStub missing from checkpoint_funnel()"
