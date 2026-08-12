@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 try:
-    import torch  # noqa: F401
+    import torch
 except ModuleNotFoundError:
     sys.modules["torch"] = types.ModuleType("torch")
 
@@ -444,6 +444,157 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
         assert torch.equal(kv_caches["l0"].v_cache[bid], original["l0"].v_cache[bid])
     assert torch.count_nonzero(kv_caches["l0"].k_cache[0]) == 0
     assert torch.count_nonzero(kv_caches["l0"].v_cache[0]) == 0
+
+
+def test_lmcache_connector_staged_pipeline_really_reaches_staged_transfer(monkeypatch):
+    """`_run_staged_pipeline` must actually delegate to `StagedTransfer`.
+
+    The fastpath test above monkeypatches `_thread_state` and
+    `_ensure_staging_buffer` **on the connector**, replacing the very methods
+    that delegate — so it never exercises `StagedTransfer.run_pipeline` at all.
+    This test leaves every delegating method intact and instead seeds the
+    thread-local state *inside* `StagedTransfer`, so a delegation that is
+    removed, inlined, or misrouted fails here. It also pins the producer-event
+    order (record ready -> stage_b waits on it -> record free), which is what
+    commit 7427e05e added to fix KV corruption on reload.
+    """
+    from contextlib import nullcontext
+
+    import torch
+
+    from atom.kv_transfer.offload.staged_transfer import StagedTransfer
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    monkeypatch.setenv("OFFLOAD_GPU_STAGING_CHUNKS", "2")
+    monkeypatch.delenv("OFFLOAD_GPU_STAGING_MAX_BYTES", raising=False)
+    original = {
+        "l0": SimpleNamespace(
+            k_cache=torch.arange(6 * 2, dtype=torch.uint8).reshape(6, 2),
+            v_cache=(torch.arange(6 * 3, dtype=torch.uint8).reshape(6, 3) + 51),
+            k_scale=None,
+            v_scale=None,
+        )
+    }
+    kv_caches = {
+        "l0": SimpleNamespace(
+            k_cache=original["l0"].k_cache.clone(),
+            v_cache=original["l0"].v_cache.clone(),
+            k_scale=None,
+            v_scale=None,
+        )
+    }
+    codec = ATOMKVByteCodec(kv_caches)
+    connector = ATOMLMCacheGPUConnector(codec, block_size=4, chunk_size=8)
+    _install_fake_fused_chunk_major(codec)
+    monkeypatch.setattr(connector, "_assert_fused_chunk_major_available", lambda: None)
+
+    # The fake streams are not real CUDA streams, so keep them out of the codec.
+    monkeypatch.setattr(
+        codec,
+        "gpu_to_chunk_major_device_buffer",
+        lambda device_buf, block_id_groups, stream=None: (
+            ATOMKVByteCodec.gpu_to_chunk_major_device_buffer(
+                codec, device_buf, block_id_groups, stream=None
+            )
+        ),
+    )
+
+    trace: list[str] = []
+
+    class _FakeEvent:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def record(self, stream) -> None:
+            trace.append(f"record:{self.name}")
+
+    class _FakeStream:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def wait_event(self, event) -> None:
+            trace.append(f"wait:{self.name}:{event.name}")
+
+        def synchronize(self) -> None:
+            trace.append(f"sync:{self.name}")
+
+    class _FakeState:
+        def __init__(self) -> None:
+            self.device = connector.device
+            self.pack_stream = _FakeStream("pack")
+            self.copy_stream = _FakeStream("copy")
+            self.staging_buffer = SimpleNamespace(
+                tensor=None,
+                ready_event=_FakeEvent("ready"),
+                free_event=_FakeEvent("free"),
+                free_event_valid=False,
+            )
+
+        def stream_ctx(self, stream):
+            return nullcontext()
+
+    fake_state = _FakeState()
+    # Seed StagedTransfer's own thread-local cache so the connector's
+    # `_thread_state()` delegation is exercised for real.
+    connector._staged._tls.states = {str(connector.device): fake_state}
+
+    reached: list[tuple[bool, int]] = []
+    real_run_pipeline = StagedTransfer.run_pipeline
+
+    def _spy_run_pipeline(self, state, groups, stage_a, stage_b):
+        reached.append((self is connector._staged, len(groups)))
+        return real_run_pipeline(self, state, groups, stage_a, stage_b)
+
+    monkeypatch.setattr(StagedTransfer, "run_pipeline", _spy_run_pipeline)
+
+    memory_objs = [
+        SimpleNamespace(
+            tensor=torch.empty(2 * codec.bytes_per_block, dtype=torch.uint8)
+        ),
+        SimpleNamespace(
+            tensor=torch.empty(1 * codec.bytes_per_block, dtype=torch.uint8)
+        ),
+    ]
+
+    connector.batched_from_gpu(
+        memory_objs,
+        [4, 12],
+        [12, 16],
+        block_ids=[0, 1, 2, 3, 4, 5],
+    )
+
+    # The delegation was genuinely taken, on this connector's StagedTransfer.
+    assert reached == [(True, 1)]
+    # The producer event is recorded before stage_b waits on it, and the free
+    # event only after stage_b has been issued.
+    assert trace == [
+        "record:ready",
+        "wait:copy:ready",
+        "record:free",
+        "sync:copy",
+    ]
+    # The real (non-monkeypatched) ensure_buffer allocated the bounded buffer.
+    assert int(fake_state.staging_buffer.tensor.numel()) == (
+        connector.gpu_staging_buffer_bytes
+    )
+    assert fake_state.staging_buffer.free_event_valid is True
+
+    expected0 = torch.cat(
+        [
+            original["l0"].k_cache[[1, 2]].reshape(-1),
+            original["l0"].v_cache[[1, 2]].reshape(-1),
+        ]
+    )
+    expected1 = torch.cat(
+        [
+            original["l0"].k_cache[[3]].reshape(-1),
+            original["l0"].v_cache[[3]].reshape(-1),
+        ]
+    )
+    assert torch.equal(memory_objs[0].tensor, expected0)
+    assert torch.equal(memory_objs[1].tensor, expected1)
 
 
 def test_lmcache_connector_requires_fused_chunk_major_staging():

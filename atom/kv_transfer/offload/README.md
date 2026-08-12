@@ -50,7 +50,7 @@ Two ideas carry the whole module:
 | `metadata.py` | `ATOMRawBytesLMCacheMetadata` (opaque uint8 allocation) + per-request transfer descriptors (`LoadSpec`, `SaveSpec`, `LMCacheReqMeta`, `LMCacheOffloadMetadata`). |
 | `atom_kv_byte_codec.py` | `ATOMKVByteCodec`: maps a token range → AITER KV blocks and packs/unpacks them as raw bytes. The layout-bridging core. |
 | `atom_lmcache_gpu_connector.py` | `ATOMLMCacheGPUConnector`: LMCache `GPUConnectorInterface` impl. Bounded GPU staging + two-stage (pack ↔ copy) pipeline. |
-| `atom_lmcache_staging.py` | Per-thread CUDA streams, staging buffer, ready/free events, env helpers. |
+| `staged_transfer.py` | `StagedTransfer`: the tier-agnostic staging half — bounded GPU buffer, per-thread CUDA streams, the two-stage producer-event pipeline, and the `OFFLOAD_*` env helpers. Shared by the KV and state offload tiers. |
 | `triton_kv_staging.py` | Triton fused chunk-major pack/unpack kernels (the fast staging path). |
 
 ## Architecture
@@ -452,13 +452,19 @@ turns LMCache's *token ranges* into ATOM *block ranges* and drives bounded stagi
 - **Observability** — keeps per-transfer stats (bytes, groups, pack/copy/sync ms,
   effective GiB/s) surfaced by the connector's `OFFLOAD_PROFILE` logging.
 
-### `atom_lmcache_staging.py` — staging primitives
+### `staged_transfer.py` — staging primitives
 
-Small but load-bearing. `_ThreadTransferState` lazily creates, per thread, the two
-CUDA streams (`pack_stream`, `copy_stream`) and a `_StagingBuffer` holding the
-device tensor plus `ready`/`free` CUDA events that gate the pipeline hand-off.
-Also the `_env_flag/_env_int/_env_optional_int` helpers that parse the `OFFLOAD_*`
-knobs. This per-thread isolation is exactly why load and save never contend.
+Small but load-bearing, and deliberately tier-agnostic: `StagedTransfer` owns the
+bounded device buffer (`ensure_buffer` / `release_buffer_if_requested`), the
+MemoryObj byte view (`memory_tensor`), and `run_pipeline` — the two-stage,
+event-synced hand-off that `ATOMLMCacheGPUConnector._run_staged_pipeline`
+delegates to. `_ThreadTransferState` lazily creates, per thread, the two CUDA
+streams (`pack_stream`, `copy_stream`) and a `_StagingBuffer` holding the device
+tensor plus `ready`/`free` CUDA events that gate the pipeline hand-off; the
+events are created in `_StagingBuffer.__init__` so the producer-event protocol
+cannot be silently skipped by a caller. Also the
+`_env_flag/_env_int/_env_optional_int` helpers that parse the `OFFLOAD_*` knobs.
+This per-thread isolation is exactly why load and save never contend.
 
 ### `config.py` & `metadata.py` — wiring and descriptors
 

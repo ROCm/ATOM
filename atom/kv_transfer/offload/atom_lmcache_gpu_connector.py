@@ -102,9 +102,7 @@ class ATOMLMCacheGPUConnector:
         self._staged = StagedTransfer(
             self.device,
             staging_buffer_bytes=self._gpu_staging_buffer_bytes,
-            release_after_transfer=_env_flag(
-                "OFFLOAD_RELEASE_GPU_STAGING_AFTER_TRANSFER"
-            ),
+            release_after_transfer=self._release_gpu_staging_after_transfer,
         )
 
     @property

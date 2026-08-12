@@ -59,11 +59,22 @@ def _env_optional_int(name: str, *, min_value: int = 1) -> int | None:
 
 
 class _StagingBuffer:
-    def __init__(self) -> None:
+    """Device buffer plus the two events that gate the pipeline hand-off.
+
+    ``use_cuda`` creates the events here rather than letting a caller attach
+    them afterwards: the producer ``ready_event`` is what commit 7427e05e added
+    to fix KV corruption on reload, and a buffer that silently carries ``None``
+    events would make that protocol a no-op. Correct by construction.
+    """
+
+    def __init__(self, use_cuda: bool = False) -> None:
         self.tensor: torch.Tensor | None = None
         self.ready_event = None
         self.free_event = None
         self.free_event_valid = False
+        if use_cuda:
+            self.ready_event = torch.cuda.Event(blocking=False)
+            self.free_event = torch.cuda.Event(blocking=False)
 
 
 class _NullCtx:
@@ -83,13 +94,11 @@ class _ThreadTransferState:
         self.device = device
         self.pack_stream = None
         self.copy_stream = None
-        self.staging_buffer = _StagingBuffer()
         if use_cuda:
             with torch.cuda.device(device):
                 self.pack_stream = torch.cuda.Stream()
                 self.copy_stream = torch.cuda.Stream()
-            self.staging_buffer.ready_event = torch.cuda.Event(blocking=False)
-            self.staging_buffer.free_event = torch.cuda.Event(blocking=False)
+        self.staging_buffer = _StagingBuffer(use_cuda)
 
     def stream_ctx(self, stream):
         if stream is None:
