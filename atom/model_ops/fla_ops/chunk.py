@@ -362,11 +362,17 @@ def pop_last_intermediate_states():
     cache can take a checkpoint at any chunk-aligned interior position without
     splitting the prefill into two forward passes.
 
-    Not bit-exact: ``h`` is stored in the input dtype (bf16) while the
-    recurrence carries fp32 internally, so a checkpoint read from it is
-    pre-rounded. Measured (T=512, resume at 256) against an output of absmax
-    0.065: re-run resume 0.0 maxdiff, captured-``h`` resume 1.2e-4 (~0.19 %).
-    Positions at a step's end do not go through ``h`` and stay exact.
+    Bit-exact against the alternative, despite appearances. ``h`` is stored in
+    the input dtype (bf16) while the recurrence carries fp32 internally, so a
+    state read out of it *is* pre-rounded — but the GDN state pool is bf16 too
+    (``GDNStateMixin._state_dtypes``), so ending the forward at that position
+    instead would round the same fp32 value on the way in. Measured on MI355
+    over 56 (seed, length, boundary) combinations: the checkpoint equals a
+    shortened re-run's stored state exactly, every time, and resuming from it
+    reproduces the remaining tokens' outputs bit for bit. See
+    ``tests/test_gdn_state_checkpoint_gpu.py``. A pool at higher precision than
+    ``h`` would break that, which is why kimi_linear — the one model whose v
+    side is fp32 — does not take this path.
 
     Consumes the reference so a later caller cannot read a stale tensor, and
     returns None when the last forward was not asked to keep its states.
