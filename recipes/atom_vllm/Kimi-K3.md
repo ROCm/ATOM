@@ -9,12 +9,11 @@ The validated configuration requires eight MI355 (gfx950) GPUs with TP8.
 
 ## Prerequisites
 
-Use the ATOM vLLM OOT image and install the KDA dependency used by the native
-Kimi-K3 implementation:
+Use the ATOM vLLM OOT image. The KDA recurrence runs on aiter, which the image
+already carries, so no extra package is needed:
 
 ```bash
 docker pull rocm/atom-dev:vllm-latest
-pip install "fla-core==0.5.1" "flash-linear-attention==0.5.1"
 ```
 
 Install the target ATOM checkout into the same environment:
@@ -27,18 +26,6 @@ pip install -e /path/to/ATOM --no-deps
 
 ```bash
 MODEL=/path/to/Kimi-K3
-
-export AITER_LOG_LEVEL=WARNING
-export ATOM_LOADER_USE_THREADPOOL=1
-export ATOM_LOADER_THREADPOOL_WORKERS=16
-export ATOM_SYNC_AFTER_LOAD=1
-export ATOM_DIST_TIMEOUT_SECONDS=3600
-
-export ATOM_USE_TRITON_GEMM=1
-export AITER_USE_GROUPED_GEMM=0
-export ATOM_USE_TRITON_MOE=0
-export AITER_FLYDSL_FORCE=1
-export AITER_FORCE_GFX1250=0
 
 vllm serve "${MODEL}" \
     --host 0.0.0.0 \
@@ -53,8 +40,8 @@ vllm serve "${MODEL}" \
     --gpu-memory-utilization 0.93 \
     --block-size 128 \
     --no-enable-prefix-caching \
-    --no-async-scheduling \
-    --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE"}'
+    --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE"}' \
+    --additional-config '{"online_quant_config":{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*self_attn.[qkv]_conv1d*","*block_sparse_moe.experts*","*block_sparse_moe.routed_expert_*","*vision_tower*","*mm_projector*"]}}' 
 ```
 
 The plugin keeps KDA temporal state in fp32, registers every KDA layer through

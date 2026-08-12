@@ -72,6 +72,10 @@ fi
 
 prepare_runtime_paths() {
   local path_prefix=""
+  local use_workspace_atom="false"
+  case "${ATOM_BENCH_USE_WORKSPACE_ATOM:-true}" in
+    true|TRUE|1|yes|YES|on|ON) use_workspace_atom="true" ;;
+  esac
   if [[ -d /app/aiter-test ]]; then
     path_prefix="/app/aiter-test"
   fi
@@ -79,9 +83,14 @@ prepare_runtime_paths() {
     path_prefix="${path_prefix:+${path_prefix}:}/app/sglang/python"
   fi
   if [[ -d /workspace ]]; then
-    # The CI checkout is mounted at /workspace; prefer it over the ATOM copy
-    # baked into the base image so validation covers the current branch.
-    path_prefix="${path_prefix:+${path_prefix}:}/workspace"
+    # Manual and rebuild runs validate the selected checkout. Scheduled
+    # prebuilt nightly runs use the ATOM copy baked into the Docker image so
+    # the benchmark data is reproducible from that image alone.
+    if [[ "${use_workspace_atom}" == "true" ]]; then
+      path_prefix="${path_prefix:+${path_prefix}:}/workspace"
+    elif [[ -d /app/ATOM ]]; then
+      path_prefix="${path_prefix:+${path_prefix}:}/app/ATOM"
+    fi
     cd /workspace
   elif [[ -d /app/ATOM ]]; then
     path_prefix="${path_prefix:+${path_prefix}:}/app/ATOM"

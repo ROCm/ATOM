@@ -189,7 +189,7 @@ class IndexerVllm(IndexerBase):
             n_committed_per_seq_gpu,  # int32, sized [bs] (staged in builder)
             block_tables,
             logits_width,  # max_model_len arg == buffer width (store guard)
-            KVBlockSize=self.kv_cache.size(1),  # k1_csa = 32
+            KVBlockSize=self.kv_cache.size(1),  # csa_rows_per_block = 32
             Preshuffle=True,
         )
         topk_local = torch.empty(

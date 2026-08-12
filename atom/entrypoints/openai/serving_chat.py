@@ -33,6 +33,40 @@ logger = logging.getLogger("atom")
 # ============================================================================
 
 
+def normalize_chat_tools(tools: Any) -> Any:
+    """Accept Anthropic-style tools on the OpenAI-compatible endpoint.
+
+    Well-formed OpenAI tools and malformed values are left unchanged so the
+    existing validator remains authoritative. Only the unambiguous Anthropic
+    shape (name + input_schema, without type/function) is converted.
+    """
+    if not isinstance(tools, list):
+        return tools
+
+    normalized = []
+    for tool in tools:
+        if (
+            isinstance(tool, dict)
+            and "type" not in tool
+            and "function" not in tool
+            and isinstance(tool.get("name"), str)
+            and isinstance(tool.get("input_schema"), dict)
+        ):
+            normalized.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool["name"],
+                        "description": tool.get("description", ""),
+                        "parameters": tool["input_schema"],
+                    },
+                }
+            )
+        else:
+            normalized.append(tool)
+    return normalized
+
+
 def resolve_thinking(request: ChatCompletionRequest) -> tuple[bool, str | None]:
     """Resolve (enabled, effort) from the request's thinking / reasoning_effort.
 
@@ -229,7 +263,9 @@ async def stream_chat_response(
             chunk_data = await stream_queue.get()
 
             if not role_sent:
-                yield create_chat_chunk(request_id, model, delta={"role": "assistant"})
+                yield create_chat_chunk(
+                    request_id, model, delta={"role": "assistant", "content": ""}
+                )
                 role_sent = True
             new_text = chunk_data["text"]
             num_tokens_output += len(chunk_data.get("token_ids", []))
@@ -500,7 +536,10 @@ async def stream_chat_response_fanout(
 
             if not role_sent[idx]:
                 yield create_chat_chunk(
-                    request_id, model, delta={"role": "assistant"}, index=idx
+                    request_id,
+                    model,
+                    delta={"role": "assistant", "content": ""},
+                    index=idx,
                 )
                 role_sent[idx] = True
 

@@ -4,7 +4,6 @@
 import inspect
 import logging
 from dataclasses import dataclass
-from typing import List, Optional, Type
 
 import numpy as np
 import torch
@@ -38,6 +37,7 @@ from atom.utils.block_convert import (
 from atom.utils.forward_context import AttentionMetaData, Context
 
 from .backends import AttentionBackend, CommonAttentionBuilder
+from .sub_pool_spec import SubPoolSpec, page_pool
 
 logger = logging.getLogger("atom")
 
@@ -80,11 +80,11 @@ class MLAChunkContextMetadata:
     iteration); only `[:total_tokens[c]]` is valid for chunk c.
     """
 
-    kv_indptr: List[torch.Tensor]
-    kv_indices: List[torch.Tensor]
-    cu_seqlens_k: List[torch.Tensor]
-    total_tokens: List[int]
-    max_seqlen_k: List[int]
+    kv_indptr: list[torch.Tensor]
+    kv_indices: list[torch.Tensor]
+    cu_seqlens_k: list[torch.Tensor]
+    total_tokens: list[int]
+    max_seqlen_k: list[int]
     num_chunks: int
     k_workspace: torch.Tensor
     v_workspace: torch.Tensor
@@ -125,11 +125,11 @@ class AiterMLABackend(AttentionBackend):
         return "ROCM_AITER_MLA"
 
     @staticmethod
-    def get_builder_cls() -> Type["AiterMLAMetadataBuilder"]:
+    def get_builder_cls() -> type["AiterMLAMetadataBuilder"]:
         return AiterMLAMetadataBuilder
 
     @staticmethod
-    def get_impl_cls() -> Type["MLAAttention"]:
+    def get_impl_cls() -> type["MLAAttention"]:
         return MLAAttention
 
 
@@ -346,8 +346,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # Allocated outside any per-step scope so a single buffer is shared
         # across all chunks and layers.
         self.attn_prefill_chunk_size = config.attn_prefill_chunk_size
-        self.k_chunk_workspace: Optional[torch.Tensor] = None
-        self.v_chunk_workspace: Optional[torch.Tensor] = None
+        self.k_chunk_workspace: torch.Tensor | None = None
+        self.v_chunk_workspace: torch.Tensor | None = None
         if self.attn_prefill_chunk_size > 0:
             qk_head_dim = hf_config.qk_nope_head_dim + hf_config.qk_rope_head_dim
             v_head_dim = hf_config.v_head_dim
@@ -801,10 +801,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             )
         return result
 
-    def compute_block_bytes(self) -> int:
-        """MLA per-block bytes: single 576-dim packed tensor per layer
-        (k_c + k_pe; V is absorbed into latent compression — no separate
-        V cache or kv_scale).
+    def sub_pool_specs(self) -> list[SubPoolSpec]:
+        """One paged KV pool. Per-block bytes = a single 576-dim packed
+        tensor per layer (k_c + k_pe; V is absorbed into latent compression —
+        no separate V cache or kv_scale).
 
         DeepSeek-V3.2 sparse variant adds an indexer cache contribution
         for every bound layer, including draft/MTP layers.
@@ -825,7 +825,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 * aligned_index_dim
                 * dtypes.fp8.itemsize
             )
-        return block_bytes
+        return [page_pool(block_bytes)]
 
     def allocate_kv_cache_tensors(
         self, num_kv_heads: int, num_draft_layers: int
@@ -901,12 +901,16 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 runner.aligned_index_dim,
             )
         module.kv_cache = kv_cache
+        index_cache = None
+        if runner.is_deepseek_v32 and hasattr(runner, "index_cache"):
+            index_cache = runner.index_cache[layer_id]
         return KVCacheTensor(
             layer_num=layer_id,
             k_cache=kv_cache,
             v_cache=None,
             k_scale=None,
             v_scale=None,
+            index_cache=index_cache,
         )
 
     def get_kv_transfer_tensors(self):
@@ -1125,7 +1129,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
     def _build_mla_chunk_meta(
         self, batch: ScheduledBatch, bs: int
-    ) -> Optional[MLAChunkContextMetadata]:
+    ) -> MLAChunkContextMetadata | None:
         """Build per-chunk slices of the cached prefix.
 
         Chunks the cached-prefix tokens along the GLOBAL token axis (not the
@@ -1150,7 +1154,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         # Per-seq absolute slot id for every cached token, in seq order, then
         # concatenated into a single global slot array of length total_cached.
-        per_seq_slots: List[np.ndarray] = []
+        per_seq_slots: list[np.ndarray] = []
         for i in range(bs):
             cached_len = int(cached_lens[i])
             if cached_len == 0:
@@ -1169,11 +1173,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         seq_offsets = np.zeros(bs + 1, dtype=np.int64)
         np.cumsum(cached_lens, out=seq_offsets[1:])
 
-        kv_indptr_list: List[torch.Tensor] = []
-        kv_indices_list: List[torch.Tensor] = []
-        cu_seqlens_k_list: List[torch.Tensor] = []
-        total_tokens_list: List[int] = []
-        max_seqlen_k_list: List[int] = []
+        kv_indptr_list: list[torch.Tensor] = []
+        kv_indices_list: list[torch.Tensor] = []
+        cu_seqlens_k_list: list[torch.Tensor] = []
+        total_tokens_list: list[int] = []
+        max_seqlen_k_list: list[int] = []
 
         for c in range(num_chunks):
             g_start = c * chunk_size

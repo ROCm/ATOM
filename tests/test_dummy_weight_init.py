@@ -60,6 +60,12 @@ def _build_module():
     m.register_parameter("w13_weight_scale", P(torch.empty(2, 4, dtype=torch.uint8)))
     # static activation scale (must stay ~1.0, not shrunk to weight magnitude)
     m.register_parameter("w13_input_scale", P(torch.empty(2, dtype=torch.float32)))
+    # FP8 packed weight, both hardware dialects: OCP e4m3fn (gfx950/NV) and
+    # AMD's e4m3fnuz (gfx942/MI300X) share a dtype-dispatch branch in
+    # initialize_dummy_weights and must both land in the fp8 fill path, not
+    # fall through to the fp4x2 byte-fill (see loader.py's fn/fnuz gate).
+    m.register_parameter("wo_a_fn", P(torch.empty(2, 4, dtype=torch.float8_e4m3fn)))
+    m.register_parameter("wo_a_fnuz", P(torch.empty(2, 4, dtype=torch.float8_e4m3fnuz)))
     return m
 
 
@@ -86,6 +92,10 @@ class TestDummyWeightInit(unittest.TestCase):
         self.assertTrue((m.w13_weight_scale == _E8M0_UNIT_CODE).all())
         # input_scale stays 1.0 (not shrunk to weight magnitude)
         self.assertTrue((m.w13_input_scale == 1.0).all())
+        # fp8 packed weight, both dialects -> filled with 1.0, not byte-filled
+        # as if it were an fp4x2 weight (regression guard for the fn/fnuz gate)
+        self.assertTrue((m.wo_a_fn == 1.0).all())
+        self.assertTrue((m.wo_a_fnuz == 1.0).all())
 
     def test_zero_mode(self):
         from atom.model_loader.loader import initialize_dummy_weights

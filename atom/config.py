@@ -40,10 +40,13 @@ class KVCacheTensor:
     """
 
     layer_num: int
-    k_cache: torch.Tensor = torch.tensor([])
-    v_cache: torch.Tensor = torch.tensor([])
+    k_cache: torch.Tensor = field(default_factory=lambda: torch.tensor([]))
+    v_cache: torch.Tensor = field(default_factory=lambda: torch.tensor([]))
     k_scale: torch.Tensor = None
     v_scale: torch.Tensor = None
+    # DSA sparse layers (GLM-5.2 / DeepSeek-V3.2): indexer key cache, block-major
+    # ``(num_blocks, block_size, aligned_index_dim)``. Omitted for non-DSA layers.
+    index_cache: torch.Tensor | None = None
 
 
 @dataclass
@@ -314,8 +317,15 @@ class QuantizationConfig:
             "mxfp4",
             "mxfp8",
             "quark",
+            "compressed-tensors",
         ]:
             self.online_quant = True
+            if self.quant_method == "compressed-tensors":
+                logger.warning(
+                    "Online quant with compressed-tensors is not fully supported. "
+                    "Be careful about the online quant config setting when launching "
+                    "the server."
+                )
             online_parser = get_quant_parser("online_quant")
             online_parsed_quant_config = online_parser.parse(online_quant_config)
             self.online_global_spec = online_parsed_quant_config.global_spec
@@ -971,6 +981,12 @@ class SpeculativeConfig:
     draft_model_hf_config: PretrainedConfig | None = None
     use_aux_hidden_state: bool = False
     eagle3_aux_layer_ids: list[int] = field(default_factory=list)
+    # Debug/benchmark knob: when set (float in [0, 1]), the rejection sampler
+    # force-accepts draft tokens with a position-decaying probability calibrated
+    # so the measured mean acceptance rate matches this value, independent of the
+    # real draft/target agreement. Mirrors vLLM's synthetic_acceptance_rate. See
+    # ROCm/ATOM#555.
+    synthetic_acceptance_rate: float | None = None
 
     # model_type → mtp_model_type mapping
     _MTP_TYPE_MAP: ClassVar[dict[str, str]] = {
@@ -1033,6 +1049,13 @@ class SpeculativeConfig:
         return bool(getattr(cfg, "dspark_with_draft", False))
 
     def __post_init__(self):
+        if self.synthetic_acceptance_rate is not None and not (
+            0.0 <= self.synthetic_acceptance_rate <= 1.0
+        ):
+            raise ValueError(
+                "synthetic_acceptance_rate (--spec-decode-acceptance-rate) must "
+                f"be in [0, 1], but got {self.synthetic_acceptance_rate}."
+            )
         if self.draft_model_hf_config is None:
             self.draft_model_hf_config = get_hf_config(
                 self.model, trust_remote_code=True
@@ -1285,6 +1308,11 @@ class Config:
     max_num_batched_tokens: int = 16384
     long_prefill_token_threshold: int = 0
     attn_prefill_chunk_size: int = 16384
+    # Tokens between rungs of the state-checkpoint ladder, shared by every
+    # Pool.STATE class; 0 = no ladder. Must be a multiple of the prefix-cache
+    # hash block size (asserted in BlockManager). See
+    # BlockManager.checkpointers_at.
+    state_checkpoint_interval_tokens: int = 8192
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
     max_model_len: int | None = None
@@ -1425,18 +1453,19 @@ class Config:
                 f"tp_size ({self.tensor_parallel_size}) must be divisible by "
                 f"dcp_size ({self.decode_context_parallel_size})"
             )
-            if self.enable_prefix_caching:
-                logger.warning(
-                    "DCP does not support prefix caching yet; "
-                    "disabling enable_prefix_caching."
-                )
-                self.enable_prefix_caching = False
-            if self.enable_chunked_prefill:
-                logger.warning(
-                    "DCP does not support chunked prefill yet; "
-                    "disabling enable_chunked_prefill."
-                )
-                self.enable_chunked_prefill = False
+            # Spec-decode + DCP arch gating. Any speculative method (mtp /
+            # eagle3 / dspark) runs a q>1 verify pass, and DCP decode with q>1
+            # uses the round-robin CP (cprr) MLA kernel, which is persistent-only
+            # and ships only on gfx950; on gfx942 the non-persistent fallback
+            # ignores the cprr masking and silently produces WRONG output.
+            from aiter.jit.utils.chip_info import get_gfx
+
+            gfx = get_gfx()
+            assert gfx == "gfx950", (
+                f"Speculative decode + DCP is only supported on gfx950 (needs "
+                f"the persistent cprr MLA kernel); got {gfx}. Disable DCP or "
+                f"speculative decode on this GPU."
+            )
         assert 1 <= self.pipeline_parallel_size
         self.hf_config = get_hf_config(
             self.model, trust_remote_code=self.trust_remote_code
