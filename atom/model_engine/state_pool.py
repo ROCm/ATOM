@@ -5,6 +5,10 @@ from collections import deque
 from dataclasses import dataclass
 from heapq import heapify, heappop, heappush
 from math import inf
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from atom.model_engine.state_offload import StateOffloadIndex
 
 # `StateTransfer.kind` values. Plain strings rather than an enum because the
 # choice crosses a process boundary inside a dict (ModelRunner's `block_info`),
@@ -193,6 +197,14 @@ class StateGroupPool:
         # Reverse map, for lazy eviction when a group is handed out. -1 = the
         # group carries no checkpoint.
         self.group_hash: list[int] = [-1] * num_groups
+        # Backing store beneath the pool, or None. Owned here rather than
+        # placed in `BlockManager.state_caches` because every member of that
+        # tuple is a veto — it answers "the rightmost boundary <= X that I
+        # accept" — and this tier does the opposite: it makes more boundaries
+        # reachable. As a sibling it could only ever return identity.
+        self.offload: StateOffloadIndex | None = None
+        # (group, staging_slot) pairs the next forward must copy out of HBM.
+        self._spill_copies: list[tuple[int, int]] = []
         # Groups serving as a fork source in the in-flight step, counted by how
         # many requests fork off each. They stay off the free list until
         # `release_pins`, so the step that reads them cannot race a request that
@@ -266,6 +278,9 @@ class StateGroupPool:
             group = self._checkpointed.popleft()
             self._free.discard(group)
             self.checkpoints_evicted += 1
+            # Before invalidate() clears group_hash[group]: the hash is the key
+            # the tier stores under.
+            self._spill(group)
         self.invalidate(group)
         return group
 
@@ -457,7 +472,7 @@ class StateGroupPool:
             return hit
         hbs = self.hash_block_size
         for i in range(hit - 1, -1, -1):
-            if not assume_checkpointed and block_hashes[i] not in self.hash_to_group:
+            if not assume_checkpointed and not self._resumable_from(block_hashes[i]):
                 continue
             if seq.num_tokens - (i + 1) * hbs >= self.min_fork_tokens:
                 return i + 1
@@ -468,6 +483,47 @@ class StateGroupPool:
         if not self.enabled:
             return -1
         return self.hash_to_group.get(h, -1)
+
+    # ------------------------------- offload ------------------------------- #
+    def _resumable_from(self, h: int) -> bool:
+        """Whether a checkpoint for `h` can be reached, in HBM or beneath it.
+
+        HBM wins without a preference rule: `resumable_hit` scans right to left
+        and both tiers are indexed by the same hash, so the rightmost boundary
+        wins wherever it lives.
+        """
+        if h in self.hash_to_group:
+            return True
+        return self.offload is not None and h in self.offload.hashes
+
+    def _spill(self, group: int) -> None:
+        """Stage `group`'s bytes for the tier, if there is room. Never blocks.
+
+        Beyond the staging depth the spill is simply dropped and
+        `checkpoints_evicted` still counts it — identical to the behaviour
+        without a tier, so there is no regression to reason about.
+        """
+        if self.offload is None or not self.offload.enabled:
+            return
+        h = self.group_hash[group]
+        if h == -1:
+            return
+        slot = self.offload.request_spill(h, group)
+        if slot >= 0:
+            self._spill_copies.append((group, slot))
+
+    def take_spill_copies(self) -> list[tuple[int, int]]:
+        """`(group, staging_slot)` pairs the next forward must copy.
+
+        The consumer turns each into `copy_state_entries([(group,
+        num_groups + slot)])` — the staging ring is K groups appended to the
+        arena past the pool's own range, so a staging slot is addressable by
+        the existing group-indexed copy with no second addressing scheme. One
+        device-to-device copy per spill, on the compute stream ahead of that
+        step's forward, the same path relocation already uses.
+        """
+        out, self._spill_copies = self._spill_copies, []
+        return out
 
     # ---------------------------- checkpointing ---------------------------- #
     def checkpoint(self, seq, boundary_blocks: int, h: int) -> None:
@@ -639,6 +695,8 @@ class StateGroupPool:
         group = self.hash_to_group.get(h, -1)
         if group < 0:
             return -1
+        if self.offload is not None and self.offload.kv_offload_enabled:
+            self._spill(group)
         self.invalidate(group)
         self.checkpoints_orphaned += 1
         return group
