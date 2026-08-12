@@ -1303,6 +1303,14 @@ class Scheduler:
                 self._kv_usage(),
             )
 
+        if self._schedule_tick % 100 == 0:
+            fates = self.block_manager.state_checkpoint_fates()
+            if any(fates.values()):
+                logger.info(
+                    "state checkpoints: %s",
+                    " ".join(f"{k}={v}" for k, v in fates.items()),
+                )
+
         total_tokens_num_prefill = sum(num_scheduled_tokens)
 
         if num_seqs_prefill > 0:

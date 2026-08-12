@@ -178,6 +178,23 @@ class BlockManager:
         """
         return self.state.take_copies()
 
+    def state_checkpoint_fates(self) -> dict[str, int]:
+        """Summed fates across every state class, for the periodic stats line.
+
+        Accumulates keys from whatever each class's ``checkpoint_fates()``
+        returns, so adding a counter to any pool automatically appears here
+        without a matching change in this method.  Classes that do not expose
+        ``checkpoint_fates`` (e.g. stateless stubs) are skipped silently.
+        """
+        totals: dict[str, int] = {}
+        for cache in self.state_caches:
+            fates_fn = getattr(cache, "checkpoint_fates", None)
+            if fates_fn is None:
+                continue
+            for k, v in fates_fn().items():
+                totals[k] = totals.get(k, 0) + v
+        return totals
+
     def _record_evicted(self, h: int) -> None:
         """A hash the block pool just dropped: report it, and settle the state.
 

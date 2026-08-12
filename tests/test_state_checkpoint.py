@@ -1536,3 +1536,24 @@ class TestGenerationIsHeldToSpacingNotTheGrid:
         second = stateful_seq(PROMPT)
         bm.allocate(second, bm.can_allocate(second))
         assert second.checkpoint_demand_pos < second.num_prompt_tokens
+
+
+def test_fates_report_every_counter():
+    """checkpoint_fates() must expose all four fate counters.
+
+    NOTE: the actual dict keys carry the ``checkpoints_`` prefix
+    (``checkpoints_kept``, ``checkpoints_evicted``, ``checkpoints_orphaned``,
+    ``checkpoints_dropped``).  The task-0 brief assumed short keys
+    (``kept`` / ``evicted`` / …); those differ — see the report for the
+    discrepancy note and the rationale for leaving the public API unchanged.
+    """
+    pool = StateGroupPool(
+        num_groups=2, transfer=StateTransfer.copy(), hash_block_size=4
+    )
+    fates = pool.checkpoint_fates()
+    assert set(fates) == {
+        "checkpoints_kept",
+        "checkpoints_evicted",
+        "checkpoints_orphaned",
+        "checkpoints_dropped",
+    }
