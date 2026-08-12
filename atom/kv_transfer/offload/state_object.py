@@ -31,9 +31,10 @@ logger = logging.getLogger("atom")
 class StateByteCodec:
     """Pack/unpack one entry's state and move it through `storage_manager`.
 
-    The object is `MemoryFormat.BINARY` uint8, like the KV path's, because the
-    x-packed / strided / multi-plane state layouts cannot be expressed in
-    LMCache's token-major model.
+    The object is an opaque flat uint8 blob -- `torch.Size([nbytes])` of
+    `torch.uint8` -- allocated under a `MemoryFormat` the allocator accepts,
+    because the x-packed / strided / multi-plane state layouts cannot be
+    expressed in LMCache's token-major model at all.
 
     `entry_index` is not always a pool group, which is why it is not called
     one. On the spill/put path it is a **staging-ring slot**: the eviction hook
@@ -109,13 +110,29 @@ class StateByteCodec:
         return True
 
     def get(self, h: int, entry_index: int) -> bool:
-        """Load one entry back into `entry_index`. False on a miss."""
+        """Load one entry back into `entry_index`. False on a miss.
+
+        The reference must be discharged here. `LocalCPUBackend.get_blocking`
+        does a `ref_count_up()` on the caller's behalf, and LMCache's own
+        callers pair it with a `ref_count_down()`. Without it the count never
+        reaches zero, so LRU eviction drops the block from the index but never
+        returns it to the pinned allocator -- an entry-sized leak per hit,
+        ending with `allocate` returning None forever. `finally`, so the
+        unpack throwing does not turn into a leak too.
+
+        `put` is deliberately *not* symmetric: `StorageManager.batched_put`
+        discharges the allocate reference itself, so a `ref_count_down` there
+        would be a double free.
+        """
         if self._storage is None:
             return False
         obj = self._storage.get(self.key(h))
         if obj is None:
             return False
-        self._staged.unpack(obj, self._backend.state_entry_views(entry_index))
+        try:
+            self._staged.unpack(obj, self._backend.state_entry_views(entry_index))
+        finally:
+            obj.ref_count_down()
         return True
 
     def contains(self, h: int) -> bool:
@@ -129,6 +146,14 @@ class StateByteCodec:
     def _allocate(self, nbytes: int) -> Any:
         from lmcache.v1.memory_management import MemoryFormat
 
+        # `MixedMemoryAllocator.allocate` accepts BINARY_BUFFER (-> a
+        # BytesBufferMemoryObj, whose `.tensor` is None and would fail
+        # `StagedTransfer.memory_tensor`) or one of the tensor formats
+        # {KV_2LTD, KV_2TD, KV_T2D, KV_MLA_FMT, EC_TD}; anything else, BINARY
+        # included, hits its `raise ValueError`. The shape/dtype above already
+        # force a flat opaque blob regardless of `fmt`, so the value is inert
+        # apart from passing that check -- same reasoning as the KV path's
+        # `self._engine.fmt = MemoryFormat.KV_2LTD` in connector.py.
         return self._storage.allocate(
-            torch.Size([nbytes]), torch.uint8, fmt=MemoryFormat.BINARY
+            torch.Size([nbytes]), torch.uint8, fmt=MemoryFormat.KV_2LTD
         )

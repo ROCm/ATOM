@@ -34,13 +34,43 @@ class FakeMemoryObj:
         self.shapes = shapes
         self.dtypes = dtypes
         self.fmt = fmt
+        # `get` hands out a +1 reference that the caller owns; the count is
+        # tracked so a leak is a test failure rather than a production one.
+        self.ref_count = 1
+
+    def ref_count_up(self):
+        self.ref_count += 1
+
+    def ref_count_down(self):
+        self.ref_count -= 1
+
+
+def _allocatable_formats():
+    """Exactly what `MixedMemoryAllocator.allocate` routes to the pinned
+    allocator (`memory_management.py`). BINARY is *not* in this list -- it
+    falls through to `raise ValueError`, and BINARY_BUFFER, while accepted,
+    yields a BytesBufferMemoryObj whose `.tensor` is None and which
+    `StagedTransfer.memory_tensor` then rejects. Mirroring the vendor's
+    accept-list here is what stops a format regression from shipping green.
+    """
+    from lmcache.v1.memory_management import MemoryFormat
+
+    return {
+        MemoryFormat.KV_2LTD,
+        MemoryFormat.KV_2TD,
+        MemoryFormat.KV_T2D,
+        MemoryFormat.KV_MLA_FMT,
+        MemoryFormat.EC_TD,
+    }
 
 
 class FakeStorageManager:
     """Mirrors the pinned LMCache StorageManager surface.
 
-    `contains` returns an Optional[str] location, not a bool, and `allocate`
-    returns None under memory pressure -- both are load-bearing here.
+    `contains` returns an Optional[str] location, not a bool; `allocate`
+    returns None under memory pressure and raises on a format the real
+    `MixedMemoryAllocator` would refuse; `get` hands out a +1 reference the
+    caller must discharge. All four are load-bearing here.
     """
 
     def __init__(self, out_of_memory=False):
@@ -57,9 +87,16 @@ class FakeStorageManager:
             self.puts.append(key)
 
     def get(self, key, location=None):
-        return self.store.get(key)
+        obj = self.store.get(key)
+        if obj is None:
+            return None
+        # `LocalCPUBackend.get_blocking` refs up for the caller.
+        obj.ref_count_up()
+        return obj
 
     def allocate(self, shapes, dtypes, fmt=None, eviction=True, busy_loop=True):
+        if fmt not in _allocatable_formats():
+            raise ValueError(f"Unsupported memory format: {fmt}")
         if self.out_of_memory:
             return None
         return FakeMemoryObj(shapes, dtypes, fmt)
@@ -130,6 +167,18 @@ def test_put_allocates_one_uint8_object_of_entry_bytes():
     assert tuple(obj.shapes) == (4096,)
 
 
+def test_put_allocates_under_a_format_the_lmcache_allocator_accepts():
+    """`MixedMemoryAllocator.allocate` raises on BINARY and hands back a
+    tensor-less BytesBufferMemoryObj for BINARY_BUFFER, so the format has to
+    come from its tensor accept-list. The shape/dtype already make the object
+    an opaque flat blob, so the value is inert beyond passing that check."""
+    from lmcache.v1.memory_management import MemoryFormat
+
+    c = codec()
+    c.put(1234, entry_index=2)
+    assert c._storage.store[c.key(1234)].fmt is MemoryFormat.KV_2LTD
+
+
 def test_get_on_a_miss_is_false_and_moves_nothing():
     c = codec()
     assert c.get(9999, entry_index=1) is False
@@ -142,6 +191,45 @@ def test_get_after_put_unpacks_into_the_destination_group():
     assert c.get(1234, entry_index=3) is True
     _, segments = c._staged.unpacked[-1]
     assert segments == c._backend.state_entry_views(3)
+
+
+def test_get_releases_the_reference_it_was_handed():
+    """`get_blocking` refs up for the caller and LMCache's own callers ref
+    down after use. Holding it would keep the count off zero forever: LRU
+    eviction drops the block from the index but never returns it to the pinned
+    allocator, leaking one entry (53.6 MiB on the real model) per hit until
+    `allocate` returns None for good."""
+    c = codec()
+    c.put(1234, entry_index=2)
+    obj = c._storage.store[c.key(1234)]
+    before = obj.ref_count
+    assert c.get(1234, entry_index=3) is True
+    assert obj.ref_count == before
+
+
+def test_a_failing_unpack_still_releases_the_reference():
+    """`finally`, not a trailing statement -- an exception on the unpack path
+    would otherwise leak exactly the same way."""
+    c = codec()
+    c.put(1234, entry_index=2)
+    obj = c._storage.store[c.key(1234)]
+    before = obj.ref_count
+
+    def _boom(src, segments):
+        raise RuntimeError("unpack blew up")
+
+    c._staged.unpack = _boom
+    with pytest.raises(RuntimeError, match="unpack blew up"):
+        c.get(1234, entry_index=3)
+    assert obj.ref_count == before
+
+
+def test_put_does_not_double_free_the_allocate_reference():
+    """`StorageManager.batched_put` discharges the allocate reference itself,
+    so a symmetric `ref_count_down` in `put` would be a double free."""
+    c = codec()
+    c.put(1234, entry_index=2)
+    assert c._storage.store[c.key(1234)].ref_count == 1
 
 
 def test_contains_answers_from_storage_not_from_a_local_set():
