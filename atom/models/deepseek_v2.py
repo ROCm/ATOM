@@ -1490,7 +1490,10 @@ def _dcp_decode_candidate_exchange(
     # candidate dim. Selection is provably order-independent, so any consistent
     # permutation works — but scores and gids must use the SAME one.
     gathered_sc = recv[:, 0].permute(1, 0, 2).reshape(num_rows, n_cand).contiguous()
-    gathered_gid = recv[:, 1].permute(1, 0, 2).reshape(num_rows, n_cand).contiguous()
+    # gid plane: `dcp_stable_topk` reads a non-contiguous [rows, W, k_loc] view
+    # directly, so this skips the materializing copy the
+    # score plane still needs (topk_plain requires a contiguous last dim).
+    gathered_gid = recv[:, 1].permute(1, 0, 2)
     topk_indices_decode = topk_indices[:num_decode_tokens, :topk_tokens]
     _, _dcp_topk_overflow = dcp_stable_topk(
         gathered_sc.view(torch.float32),

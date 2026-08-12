@@ -338,7 +338,7 @@ DCP_TOPK_TIE_CAP = 256
 @triton.jit
 def _dcp_stable_topk_kernel(
     scores,  # fp32 [rows, n]
-    gids,  # int32 [rows, n], < 0 marks a padding candidate
+    gids,  # int32 gid plane, addressed via (g_s0, g_s1, g_k_loc) below
     thr,  # fp32 [rows] -- k-th largest score, from topk_plain
     out,  # int32 [rows, k]
     tie_buf,  # int32 [rows, CAP] scratch
@@ -348,6 +348,8 @@ def _dcp_stable_topk_kernel(
     s_s0: tl.int64,
     g_s0: tl.int64,
     o_s0: tl.int64,
+    g_s1: tl.int64,
+    g_k_loc: tl.int64,
     BLOCK: tl.constexpr,
     CAP: tl.constexpr,
 ):
@@ -355,6 +357,16 @@ def _dcp_stable_topk_kernel(
 
     Loop 1 reads the score plane; its gid loads are masked to the handful of
     tied lanes, so they touch almost no extra cache lines. Loop 2 reads both.
+
+    `gids` is addressed as a flat column `col` split into `(col // g_k_loc,
+    col % g_k_loc)` with strides `(g_s1, 1)` -- i.e. logically `[rows, W,
+    g_k_loc]` with the innermost dim contiguous, W = the DCP candidate-exchange
+    world size. This lets the caller pass a non-contiguous AllGather view
+    (`recv[:, 1].permute(1, 0, 2)`) directly, skipping a `.contiguous()` copy.
+    The plain-2D-contiguous case (`gids` shape `[rows, n]`, stride1 == 1) is
+    the same formula with `g_k_loc = n`, so `col // n == 0` for every
+    `col < n` and `g_s1` is unused -- identical to the offset math before this
+    parameter was added.
     """
     row = tl.program_id(0)
     sbase = row * s_s0
@@ -391,7 +403,8 @@ def _dcp_stable_topk_kernel(
         c_strict += tl.sum(gt.to(tl.int32))
         ei = eq.to(tl.int32)
         dst = n_tie + tl.cumsum(ei, 0) - ei
-        g = tl.load(gids + gbase + cols, mask=eq, other=0)
+        g_off = gbase + (cols // g_k_loc) * g_s1 + (cols % g_k_loc)
+        g = tl.load(gids + g_off, mask=eq, other=0)
         tl.store(tie_buf + row * CAP + dst, g, mask=eq & (dst < CAP))
         n_tie += tl.sum(ei)
 
@@ -412,7 +425,8 @@ def _dcp_stable_topk_kernel(
         cols = start + tl.arange(0, BLOCK)
         m = cols < n
         sc = tl.load(scores + sbase + cols, mask=m, other=-float("inf"))
-        g = tl.load(gids + gbase + cols, mask=m, other=-1)
+        g_off = gbase + (cols // g_k_loc) * g_s1 + (cols % g_k_loc)
+        g = tl.load(gids + g_off, mask=m, other=-1)
         take = m & (g >= 0) & ((sc > t) | ((sc == t) & finite_t & (g <= g_thr)))
         ti = take.to(tl.int32)
         dst = written + tl.cumsum(ti, 0) - ti
@@ -421,7 +435,16 @@ def _dcp_stable_topk_kernel(
 
 
 def dcp_stable_topk(scores, gids, k, out=None):
-    """Deterministic top-k over a candidate set. scores/gids: [rows, n].
+    """Deterministic top-k over a candidate set. scores: [rows, n].
+
+    `gids` accepts two layouts:
+      - 2D `[rows, n]`, stride1 == 1 (contiguous) -- the original layout.
+      - 3D `[rows, W, k_loc]` with `n == W * k_loc` and stride(2) == 1 --
+        e.g. `recv[:, 1].permute(1, 0, 2)` straight off a DCP candidate
+        AllGather, with NO `.contiguous()` needed: the kernel reads it via
+        `(row_stride, w_stride, k_loc)` and does the (w, j) split internally.
+        This is the only difference from the 2D path -- it just skips a
+        materializing copy, the result is identical either way.
 
     Returns (out int32 [rows, k] of global ids, overflow int32 [rows]).
     `out` is padded with -1 when a row holds fewer than k real candidates.
@@ -435,6 +458,13 @@ def dcp_stable_topk(scores, gids, k, out=None):
 
     rows, n = scores.shape
     dev = scores.device
+    if gids.dim() == 3:
+        assert gids.shape[0] == rows and gids.shape[1] * gids.shape[2] == n
+        assert gids.stride(2) == 1, "gids innermost dim must be contiguous"
+        g_s0, g_s1, g_k_loc = gids.stride(0), gids.stride(1), gids.shape[2]
+    else:
+        assert gids.shape == (rows, n) and gids.stride(1) == 1
+        g_s0, g_s1, g_k_loc = gids.stride(0), 0, n
     if out is None:
         out = torch.empty(rows, k, dtype=torch.int32, device=dev)
     val_buf = torch.empty(rows, k, dtype=torch.float32, device=dev)
@@ -471,8 +501,10 @@ def dcp_stable_topk(scores, gids, k, out=None):
         k,
         n,
         scores.stride(0),
-        gids.stride(0),
+        g_s0,
         out.stride(0),
+        g_s1,
+        g_k_loc,
         BLOCK=1024,
         CAP=DCP_TOPK_TIE_CAP,
         num_warps=8,

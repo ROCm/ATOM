@@ -164,6 +164,47 @@ def test_stable_topk_is_permutation_invariant():
     assert torch.equal(a, b.sort(-1).values), "kept set changed when candidates moved"
 
 
+@pytest.mark.parametrize("rows, W, k_loc, tie_frac", [
+    (8, 8, 2048, 0.0),
+    (8, 8, 2048, 0.99),
+    (32, 4, 4096, 0.9),
+])
+def test_stable_topk_accepts_noncontiguous_3d_gids(rows, W, k_loc, tie_frac):
+    """Chapter-9 optimization: gids passed as a 3D AllGather VIEW (no
+    `.contiguous()`) must give the bit-identical result as the plain 2D
+    contiguous path -- this is the whole point of the g_s1/g_k_loc kernel
+    parameters: same answer, one fewer materializing copy.
+
+    Shape mimics the real candidate-exchange buffer exactly: recv is
+    `[W, 2, rows, k_loc]` contiguous (from an AllGather along dim 0), plane 1
+    is the gid plane, and the production call site does
+    `recv[:, 1].permute(1, 0, 2)` -- reproduced here without the
+    `torch.stack`+`.contiguous()` a naive test would otherwise reach for.
+    """
+    n = W * k_loc
+    sc, gd_2d = _make_case(rows, n, seed=rows * 1009 + W * 97 + k_loc, tie_frac=tie_frac)
+
+    # Build recv exactly as the AllGather does: [W, 2, rows, k_loc] contiguous,
+    # where recv[w, 1, row, j] == gd_2d[row, w*k_loc + j] (the (score, gid) pack
+    # order the production code relies on).
+    gd_3d_src = gd_2d.view(rows, W, k_loc).permute(1, 0, 2).contiguous()  # [W, rows, k_loc]
+    recv = torch.empty(W, 2, rows, k_loc, dtype=torch.int32, device=DEV)
+    recv[:, 1].copy_(gd_3d_src)
+    recv[:, 0].copy_(0)  # score plane unused by this test
+
+    gathered_gid = recv[:, 1].permute(1, 0, 2)  # [rows, W, k_loc], NOT contiguous
+    assert not gathered_gid.is_contiguous()
+    assert gathered_gid.stride(2) == 1
+
+    got_3d, ovf_3d = dcp_stable_topk(sc, gathered_gid, TOPK if n >= TOPK else n)
+    got_2d, ovf_2d = dcp_stable_topk(sc, gd_2d, TOPK if n >= TOPK else n)
+    assert torch.equal(ovf_3d, ovf_2d)
+    assert torch.equal(got_3d, got_2d), (
+        f"3D non-contiguous gid path diverged from the 2D contiguous baseline "
+        f"(rows={rows} W={W} k_loc={k_loc} tie_frac={tie_frac})"
+    )
+
+
 # ───────────────────────────────────────── pack + merge == global top-k ──
 
 
