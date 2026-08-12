@@ -10,6 +10,10 @@ set -euo pipefail
 
 : "${CONTAINER_NAME:?CONTAINER_NAME must be set}"
 : "${AITER_GIT_REF:?AITER_GIT_REF must be set}"
+if [[ "${AITER_GIT_REF}" == -* || "${AITER_GIT_REF}" =~ [[:space:]] ]]; then
+  echo "ERROR: AITER_GIT_REF must be a git ref / tag / commit and must not start with '-' or contain whitespace (got: ${AITER_GIT_REF})" >&2
+  exit 1
+fi
 AITER_REPO_URL="${AITER_REPO_URL:-https://github.com/ROCm/aiter.git}"
 AITER_SRC_DIR="${AITER_SRC_DIR:-/app/aiter-test}"
 MAX_JOBS="${MAX_JOBS:-64}"
