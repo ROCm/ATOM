@@ -262,13 +262,11 @@ class DSparkProposer(Drafter):
         hidden_states: torch.Tensor,
         next_token_ids: list[int] | None,
     ) -> None:
-        """Populate the rolling target-KV window for this forward.
+        """Populate target-derived draft KV for this forward.
 
         Every scheduled row is written, prefill and decode alike: the read side
-        gathers by absolute position without checking what was written, so
-        anything left unwritten shows the slot's previous occupant. Rejected
-        rows are harmless -- they land on future positions, unread until the
-        step that accepts them rewrites them.
+        gathers by absolute position without checking what was written. Standalone
+        drafts write paged KV; inline V4 drafts write their rolling window.
 
         `write_per_batch` must cover window + mtp_k, not just window: the anchor
         sits up to mtp_k rows before the span end. Do NOT clamp it by
@@ -283,6 +281,22 @@ class DSparkProposer(Drafter):
             return
         forward_context = get_forward_context()
         bs = forward_context.context.batch_size
+        if self._with_draft:
+            if not forward_context.context.is_dummy_run:
+                num_tokens = positions.shape[-1]
+                main_hidden_all = torch.cat(
+                    [aux[:num_tokens] for aux in aux_hidden_states], dim=-1
+                )
+                with record_function(
+                    f"dspark_ctx_kv[bs={bs} tok={num_tokens}]"
+                ):
+                    self.model.write_context_kv(
+                        main_hidden_all,
+                        positions,
+                        forward_context.attn_metadata.slot_mapping[:num_tokens],
+                    )
+            return
+
         main_hidden_all = torch.cat(aux_hidden_states, dim=-1)
         write_per_batch = int(self.model.window_size) + int(self.mtp_k)
         with record_function(f"dspark_ctx_kv[bs={bs} tok={main_hidden_all.shape[0]}]"):
@@ -332,8 +346,6 @@ class DSparkProposer(Drafter):
                 "DSpark requires target auxiliary hidden states from "
                 "dspark_target_layer_ids; none were captured."
             )
-        # Concatenate the configured target layers -> [num_tokens, dim*L].
-        main_hidden_all = torch.cat(aux_hidden_states, dim=-1)
 
         # Anchor token x0 per request = the just-verified target token, located
         # at last_token_indices in the flat batch.
@@ -345,8 +357,6 @@ class DSparkProposer(Drafter):
                 forward_context,
                 attn_metadata,
                 bs,
-                main_hidden_all,
-                target_positions,
                 anchor_ids,
                 anchor_positions,
             )
@@ -395,22 +405,17 @@ class DSparkProposer(Drafter):
         forward_context,
         attn_metadata,
         bs: int,
-        main_hidden_all: torch.Tensor,  # [num_tokens, hidden * num_aux]
-        target_positions: torch.Tensor,  # [num_tokens]
         anchor_ids: torch.Tensor,  # [bs]
         anchor_positions: torch.Tensor,  # [bs]
     ) -> torch.Tensor:
-        """Kimi-K3 DSpark: paged dual-source context + one non-causal block pass.
+        """Kimi-K3 DSpark: one non-causal block pass over paged context.
 
-        Structurally the same two steps as the V4 path -- populate the draft's
-        view of the target context, then draft the block -- but the context
-        lives in the shared paged latent cache rather than a private rolling
-        window, so both steps are addressed by slot mapping instead of by
-        position-within-a-window.
+        ``precompute_context_kv`` has already populated the draft's view of every
+        target forward, including middle chunked-prefill forwards. This method
+        retargets the paged metadata to the draft block and runs it.
         """
         T = self.mtp_k
         block_size = self.runner.block_size
-        num_tokens = main_hidden_all.shape[0]
         # warmup_model() runs at the end of ModelRunner.__init__, BEFORE
         # allocate_kv_cache(), so on a dummy run there is no paged state: the
         # draft's kv_cache is still the empty init tensor and attn_metadata's
@@ -420,16 +425,7 @@ class DSparkProposer(Drafter):
         # leave its activations out of the KV budget.
         is_dummy = forward_context.context.is_dummy_run
 
-        # ---- 1. Context rows -------------------------------------------------
-        if not is_dummy:
-            with record_function(f"dspark_ctx_kv[bs={bs} tok={num_tokens}]"):
-                self.model.write_context_kv(
-                    main_hidden_all,
-                    target_positions,
-                    attn_metadata.slot_mapping[:num_tokens],
-                )
-
-        # ---- 2. Block metadata ----------------------------------------------
+        # ---- 1. Block metadata ----------------------------------------------
         block_positions = self._blk_positions[:bs]  # [bs, T] view, stable
         torch.add(
             anchor_positions.view(bs, 1),
@@ -506,7 +502,7 @@ class DSparkProposer(Drafter):
                 self._blk_dtype_q = dtype_q
         forward_context.attn_metadata.dtype_q = dtype_q
 
-        # ---- 3. Block pass + Markov sampling ---------------------------------
+        # ---- 2. Block pass + Markov sampling ---------------------------------
         with record_function(f"dspark[bs={bs} T={T}]"):
             draft_token_ids, confidence = self.model.forward_spec(
                 anchor_ids,
