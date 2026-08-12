@@ -151,3 +151,51 @@ def test_target_verify_gate_is_kimi_k3_only(monkeypatch):
 
     monkeypatch.setattr(attention_gdn, "get_current_atom_config", _raise)
     assert gate() is False
+
+
+def test_conv_commit_mode_env(monkeypatch):
+    from atom.plugin.sglang import kimi_k3_spec_verify as kv
+
+    monkeypatch.delenv("ATOM_K3_FUSED_CONV_COMMIT", raising=False)
+    assert kv._conv_commit_mode() == "fused"
+    for raw in ("0", "false", "NO"):
+        monkeypatch.setenv("ATOM_K3_FUSED_CONV_COMMIT", raw)
+        assert kv._conv_commit_mode() == "legacy"
+    monkeypatch.setenv("ATOM_K3_FUSED_CONV_COMMIT", "check")
+    assert kv._conv_commit_mode() == "check"
+
+
+class _FakePool:
+    """Minimal MambaPool stand-in for the scratch allocator."""
+
+    def __init__(self, num_layers, num_slots, km1, conv_dim):
+        self.mamba_map = {100 + i: i for i in range(num_layers)}
+        self.conv = torch.zeros(num_layers, num_slots, km1, conv_dim)
+
+    def mamba2_layer_cache(self, layer_id):
+        return SimpleNamespace(conv=[self.conv[self.mamba_map[layer_id]]])
+
+
+def test_preallocate_scratch_is_stacked_for_fused_commit(monkeypatch):
+    """The fused commit needs one buffer with a layer stride, not N buffers."""
+    from atom.plugin.sglang import kimi_k3_spec_verify as kv
+
+    num_layers, km1, conv_dim, T = 4, 3, 8, 5
+    monkeypatch.setenv("ATOM_K3_FUSED_CONV_COMMIT", "1")
+    pool = _FakePool(num_layers, num_slots=6, km1=km1, conv_dim=conv_dim)
+    kv.preallocate_k3_verify_scratch(pool, max_bs=2, draft_token_num=T)
+
+    stacked = getattr(pool, kv._POOL_STACKED_ATTR)
+    assert stacked is not None
+    assert stacked.shape == (num_layers, 2 * T, km1 + T - 1, conv_dim)
+    # Every per-layer entry must alias the stacked buffer at its mamba ordinal.
+    for layer_id, ordinal in pool.mamba_map.items():
+        view = pool._k3_conv_scratch[layer_id]
+        assert view.data_ptr() == stacked[ordinal].data_ptr()
+
+    # Legacy mode must keep the old per-layer allocations and no stacked buffer.
+    monkeypatch.setenv("ATOM_K3_FUSED_CONV_COMMIT", "0")
+    pool2 = _FakePool(num_layers, num_slots=6, km1=km1, conv_dim=conv_dim)
+    kv.preallocate_k3_verify_scratch(pool2, max_bs=2, draft_token_num=T)
+    assert getattr(pool2, kv._POOL_STACKED_ATTR) is None
+    assert len(pool2._k3_conv_scratch) == num_layers

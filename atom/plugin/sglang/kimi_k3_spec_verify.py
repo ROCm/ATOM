@@ -44,6 +44,7 @@ present on the pool, so other hybrid-linear models keep their native commit.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -54,6 +55,29 @@ from atom.config import KVCacheTensor
 logger = logging.getLogger(__name__)
 
 _POOL_SPEC_ATTR = "_atom_k3_spec"
+# Single stacked [num_mamba_layers, max_bs*T, wide, conv_dim] conv scratch. When
+# present, every per-layer entry of ``pool._k3_conv_scratch`` is a view into it,
+# which is what lets the post-verify conv commit run as ONE fused kernel over all
+# layers instead of a per-layer Python loop.
+_POOL_STACKED_ATTR = "_k3_conv_scratch_stacked"
+
+
+def _conv_commit_mode() -> str:
+    """Which post-verify conv commit implementation to use.
+
+    ``ATOM_K3_FUSED_CONV_COMMIT``:
+
+    * unset / ``1``  -> ``fused``  : one triton kernel for all KDA layers
+    * ``0``          -> ``legacy`` : original per-layer boolean-mask loop
+    * ``check``      -> run BOTH on the live tensors and compare (debug)
+    """
+    raw = os.environ.get("ATOM_K3_FUSED_CONV_COMMIT", "1").lower()
+    if raw in ("0", "false", "no"):
+        return "legacy"
+    if raw == "check":
+        return "check"
+    return "fused"
+
 
 # ---------------------------------------------------------------------------
 # CUDA-graph capture keep-alive.
@@ -252,28 +276,65 @@ def preallocate_k3_verify_scratch(pool: Any, max_bs: int, draft_token_num: int) 
         pool._k3_conv_scratch = shared
     T = int(draft_token_num)
     num_spec = T - 1
+    rows = max_bs * T
+
+    layers: list[tuple[int, torch.Tensor]] = []
     for layer_id in mamba_map:
         try:
             layer_cache = pool.mamba2_layer_cache(layer_id)
         except Exception:  # noqa: BLE001,S112 - non-mamba layers
             continue
-        conv0 = getattr(layer_cache, "conv", None)
-        if conv0 is None:
+        conv = getattr(layer_cache, "conv", None)
+        if conv is None:
             continue
-        conv0 = conv0[0]
+        layers.append((layer_id, conv[0]))
+    if not layers:
+        return
+
+    # Fused commit needs ONE buffer with a layer stride, so it only applies when
+    # every KDA layer shares the same conv geometry (they do for K3).
+    geoms = {(int(c.shape[-2]), int(c.shape[-1]), c.dtype, c.device) for _, c in layers}
+    if (
+        _conv_commit_mode() != "legacy"
+        and len(geoms) == 1
+        and isinstance(mamba_map, dict)
+    ):
+        km1, conv_dim, dtype, device = next(iter(geoms))
+        wide = km1 + num_spec
+        num_layers = len(mamba_map)
+        stacked = getattr(pool, _POOL_STACKED_ATTR, None)
+        if (
+            stacked is None
+            or stacked.shape[0] != num_layers
+            or stacked.shape[1] < rows
+            or stacked.shape[2] != wide
+            or stacked.shape[3] != conv_dim
+        ):
+            stacked = torch.zeros(
+                (num_layers, rows, wide, conv_dim), dtype=dtype, device=device
+            )
+            setattr(pool, _POOL_STACKED_ATTR, stacked)
+        # Hand each layer a view; the ordinal must match the layer axis of the
+        # stacked conv pool (``mamba_map`` maps layer_id -> that ordinal).
+        for layer_id, _ in layers:
+            shared[layer_id] = stacked[int(mamba_map[layer_id])]
+        return
+
+    setattr(pool, _POOL_STACKED_ATTR, None)
+    for layer_id, conv0 in layers:
         km1 = int(conv0.shape[-2])
         conv_dim = int(conv0.shape[-1])
         wide = km1 + num_spec
         existing = shared.get(layer_id)
         if (
             existing is not None
-            and existing.shape[0] >= max_bs * T
+            and existing.shape[0] >= rows
             and existing.shape[1] == wide
             and existing.shape[2] == conv_dim
         ):
             continue
         shared[layer_id] = torch.zeros(
-            (max_bs * T, wide, conv_dim), dtype=conv0.dtype, device=conv0.device
+            (rows, wide, conv_dim), dtype=conv0.dtype, device=conv0.device
         )
 
 
@@ -356,6 +417,9 @@ def build_spec_cache_tensors(
                 (scratch_bs * T, wide, conv_dim), dtype=conv0.dtype, device=conv0.device
             )
             shared[layer_id] = scratch_full
+            # This layer no longer aliases the stacked buffer, so the fused
+            # all-layer commit is no longer valid -- drop back to the loop.
+            setattr(pool, _POOL_STACKED_ATTR, None)
         scratch = scratch_full[: bs * T]
         scratch.zero_()
         # Pre-seed the resume window (columns [0:K-1]) from the committed conv.
@@ -391,6 +455,171 @@ def build_spec_cache_tensors(
     return out
 
 
+def _commit_conv_windows_fused(
+    pool: Any,
+    spec: dict,
+    committed_i32: torch.Tensor,
+    last_correct_step_indices: torch.Tensor,
+    bs: int,
+) -> bool:
+    """Commit every KDA conv window with a SINGLE fused triton kernel.
+
+    ``fused_conv_window_scatter_with_mask`` was written upstream for exactly this
+    shape of problem: it reads the source through explicit strides (so an
+    *overlapping* rolling-window view is fine), applies the ``step < 0`` mask
+    inside the kernel, and covers all layers in one launch
+    (``grid = (requests, layers, blocks)``).
+
+    That removes both costs of the legacy path: the ~69-iteration Python loop and
+    the per-layer ``aten::nonzero`` device sync that boolean-mask indexing lowers
+    to.
+
+    Returns ``False`` when the fused path cannot be used, so the caller can fall
+    back to :func:`_commit_conv_windows_legacy`.
+    """
+    stacked = getattr(pool, _POOL_STACKED_ATTR, None)
+    if stacked is None:
+        return False
+    try:
+        from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+            fused_conv_window_scatter_with_mask,
+        )
+    except ImportError:
+        return False
+
+    mamba_caches = pool.get_speculative_mamba2_params_all_layers()
+    conv_all = getattr(mamba_caches, "conv", None)
+    if not conv_all:
+        return False
+    conv_states = conv_all[0]  # [num_layers, num_slots, K-1, conv_dim]
+
+    T = int(spec["T"])
+    km1 = int(spec["km1"])
+    num_layers, rows, _, conv_dim = stacked.shape
+    if (
+        conv_states.ndim != 4
+        or conv_states.shape[0] != num_layers
+        or tuple(conv_states.shape[2:]) != (km1, conv_dim)
+        or not conv_states.is_contiguous()
+        or bs * T > rows
+    ):
+        return False
+
+    # src[l, i, t, k, :] == stacked[l, i * T, t + k, :]
+    #
+    # The step axis and the in-window axis deliberately SHARE a stride: that
+    # overlap *is* the wide rolling window -- step ``t``'s committed window is
+    # ``stacked[l, i * T, t : t + km1]``. Read-only, so aliasing is safe.
+    step_stride = stacked.stride(2)
+    src = stacked.as_strided(
+        (num_layers, bs, T, km1, conv_dim),
+        (
+            stacked.stride(0),
+            T * stacked.stride(1),
+            step_stride,
+            step_stride,
+            stacked.stride(3),
+        ),
+    )
+    fused_conv_window_scatter_with_mask(
+        conv_states, src, committed_i32, last_correct_step_indices[:bs]
+    )
+    return True
+
+
+def _commit_conv_windows_legacy(
+    pool: Any,
+    spec: dict,
+    shared: dict,
+    committed: torch.Tensor,
+    step: torch.Tensor,
+    bs: int,
+) -> None:
+    """Original per-layer conv commit, kept for A/B comparison.
+
+    Selected with ``ATOM_K3_FUSED_CONV_COMMIT=0`` (or automatically when the
+    stacked scratch is unavailable).
+
+    Known cost: ``window[valid]`` is boolean-mask indexing, which PyTorch lowers
+    to ``aten::nonzero``. ``nonzero`` must read the hit count back to the host,
+    so this synchronises the device once per KDA layer (~69 syncs per decode
+    step) even though ``valid`` is the same tiny [bs] mask every time.
+    """
+    km1 = int(spec["km1"])
+    T = int(spec["T"])
+    valid = step >= 0
+    if not bool(valid.any()):
+        return
+    device = step.device
+    rows = (torch.arange(bs, device=device) * T).to(dtype=torch.long)
+    win = torch.arange(km1, device=device).view(1, km1)  # [1, K-1]
+    step_clamped = step.clamp(min=0)
+    wide_idx = step_clamped.view(bs, 1) + win  # [bs, K-1]
+    valid_rows = committed[valid]
+    for layer_id in spec["mamba_map"]:
+        scratch = shared.get(layer_id)
+        if scratch is None:
+            continue
+        layer_cache = pool.mamba2_layer_cache(layer_id)
+        conv0 = layer_cache.conv[0]
+        # Gather the accepted narrow window from the front rows: [bs, K-1, conv_dim].
+        window = scratch[rows.view(bs, 1), wide_idx, :]
+        conv0[valid_rows] = window[valid].to(conv0.dtype)
+
+
+_CHECK_STATE = {"steps": 0, "mismatches": 0}
+
+
+def _check_conv_commit_paths(
+    pool: Any,
+    spec: dict,
+    shared: dict,
+    committed_i32: torch.Tensor,
+    last_correct_step_indices: torch.Tensor,
+    bs: int,
+) -> None:
+    """Run BOTH conv commit paths on the live tensors and compare (debug mode).
+
+    Enabled with ``ATOM_K3_FUSED_CONV_COMMIT=check``. Unlike an offline test this
+    exercises the real pool layout, real acceptance patterns and padded CUDA-graph
+    batches. The legacy result is what stays in the pool, so the run itself is
+    unaffected by the fused path.
+    """
+    conv_states = pool.get_speculative_mamba2_params_all_layers().conv[0]
+    before = conv_states.clone()
+    used_fused = _commit_conv_windows_fused(
+        pool, spec, committed_i32, last_correct_step_indices, bs
+    )
+    fused_out = conv_states.clone()
+    conv_states.copy_(before)
+    _commit_conv_windows_legacy(
+        pool,
+        spec,
+        shared,
+        committed_i32.to(dtype=torch.long),
+        last_correct_step_indices[:bs].to(dtype=torch.long),
+        bs,
+    )
+    _CHECK_STATE["steps"] += 1
+    if used_fused and not torch.equal(fused_out, conv_states):
+        _CHECK_STATE["mismatches"] += 1
+        logger.error(
+            "Kimi-K3 conv commit MISMATCH at check step %d (%d total), bs=%d, "
+            "accept steps=%s",
+            _CHECK_STATE["steps"],
+            _CHECK_STATE["mismatches"],
+            bs,
+            last_correct_step_indices[:bs].tolist(),
+        )
+    elif _CHECK_STATE["steps"] % 20 == 0:
+        logger.info(
+            "Kimi-K3 conv commit check: %d steps, %d mismatches (fused_used=%s)",
+            _CHECK_STATE["steps"],
+            _CHECK_STATE["mismatches"],
+            used_fused,
+        )
+
+
 def _commit_k3_spec_state(
     pool: Any,
     committed_i32: torch.Tensor,
@@ -415,12 +644,6 @@ def _commit_k3_spec_state(
     shared = getattr(pool, "_k3_conv_scratch", None)
     if shared is None:
         return
-    km1 = spec["km1"]
-    T = spec["T"]
-    committed = committed_i32.to(dtype=torch.long)
-
-    step = last_correct_step_indices[:bs].to(dtype=torch.long)
-    valid = step >= 0
 
     # ---- ssm commit: intermediate_ssm[i, step] -> temporal[cache_idx[i]] ----
     from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
@@ -437,23 +660,24 @@ def _commit_k3_spec_state(
         )
 
     # ---- conv commit: committed window = scratch[i*T, step:step+(K-1)] --------
-    if not bool(valid.any()):
+    mode = _conv_commit_mode()
+    if mode == "check":
+        _check_conv_commit_paths(
+            pool, spec, shared, committed_i32, last_correct_step_indices, bs
+        )
         return
-    device = step.device
-    rows = (torch.arange(bs, device=device) * T).to(dtype=torch.long)
-    win = torch.arange(km1, device=device).view(1, km1)  # [1, K-1]
-    step_clamped = step.clamp(min=0)
-    wide_idx = step_clamped.view(bs, 1) + win  # [bs, K-1]
-    valid_rows = committed[valid]
-    for layer_id in spec["mamba_map"]:
-        scratch = shared.get(layer_id)
-        if scratch is None:
-            continue
-        layer_cache = pool.mamba2_layer_cache(layer_id)
-        conv0 = layer_cache.conv[0]
-        # Gather the accepted narrow window from the front rows: [bs, K-1, conv_dim].
-        window = scratch[rows.view(bs, 1), wide_idx, :]
-        conv0[valid_rows] = window[valid].to(conv0.dtype)
+    if mode == "fused" and _commit_conv_windows_fused(
+        pool, spec, committed_i32, last_correct_step_indices, bs
+    ):
+        return
+    _commit_conv_windows_legacy(
+        pool,
+        spec,
+        shared,
+        committed_i32.to(dtype=torch.long),
+        last_correct_step_indices[:bs].to(dtype=torch.long),
+        bs,
+    )
 
 
 # ---------------------------------------------------------------------------
