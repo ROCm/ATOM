@@ -28,6 +28,11 @@ from atom.diffusion.engine.protocol import (
 )
 from atom.diffusion.request import DiffusionJob, JobStatus
 
+# Tests about path and degree resolution name a pipeline explicitly, so they do
+# not depend on a checkpoint being present at the path they pass.
+PIPELINE_ARG_NAME = "--pipeline"
+DUMMY_PIPELINE = "atom.diffusion.examples.dummy_pipeline.DummyPipeline"
+
 
 def make_config(**kwargs) -> DiffusionConfig:
     defaults = {
@@ -529,7 +534,9 @@ def test_ulysses_degree_defaults_to_the_gpu_count():
         config_from_args,
     )
 
-    args = build_parser().parse_args(["--model", "/m", "--num-gpus", "4"])
+    args = build_parser().parse_args(
+        [PIPELINE_ARG_NAME, DUMMY_PIPELINE, "--model", "/m", "--num-gpus", "4"]
+    )
     assert config_from_args(args).ulysses_degree == 4
 
 
@@ -540,7 +547,16 @@ def test_a_bad_ulysses_degree_is_refused_at_config_time():
     )
 
     args = build_parser().parse_args(
-        ["--model", "/m", "--num-gpus", "4", "--ulysses-degree", "3"]
+        [
+            PIPELINE_ARG_NAME,
+            DUMMY_PIPELINE,
+            "--model",
+            "/m",
+            "--num-gpus",
+            "4",
+            "--ulysses-degree",
+            "3",
+        ]
     )
     with pytest.raises(ValueError):
         config_from_args(args)
@@ -582,7 +598,14 @@ def test_model_variant_resolves_to_the_partition_path(tmp_path):
     )
 
     args = build_parser().parse_args(
-        ["--model", str(tmp_path), "--model-variant", "FL2VA"]
+        [
+            PIPELINE_ARG_NAME,
+            DUMMY_PIPELINE,
+            "--model",
+            str(tmp_path),
+            "--model-variant",
+            "FL2VA",
+        ]
     )
     assert config_from_args(args).model_path == str(tmp_path / "FL2VA")
 
@@ -596,7 +619,16 @@ def test_a_model_path_that_already_names_the_partition_is_left_alone(tmp_path):
     )
 
     root = tmp_path / "FL2VA"
-    args = build_parser().parse_args(["--model", str(root), "--model-variant", "FL2VA"])
+    args = build_parser().parse_args(
+        [
+            PIPELINE_ARG_NAME,
+            DUMMY_PIPELINE,
+            "--model",
+            str(root),
+            "--model-variant",
+            "FL2VA",
+        ]
+    )
     assert config_from_args(args).model_path == str(root)
 
 
@@ -608,3 +640,75 @@ def test_the_pipeline_base_takes_a_model_root():
     config = make_config(model_path="/data/root")
     assert MiniMaxH3Pipeline(config).model_root == "/data/root"
     assert MiniMaxH3Pipeline(config, model_root="/other").model_root == "/other"
+
+
+# ----------------------------------------------------------------------
+# checkpoint architecture -> pipeline, mirroring the LLM side's arch dicts
+# ----------------------------------------------------------------------
+
+
+def write_model_index(root, class_name):
+    import json
+
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "model_index.json").write_text(json.dumps({"_class_name": class_name}))
+    return root
+
+
+def test_a_known_checkpoint_selects_its_pipeline_without_a_flag(tmp_path):
+    from atom.diffusion.entrypoints.diffusion_server import (
+        build_parser,
+        config_from_args,
+    )
+
+    root = write_model_index(tmp_path / "FL2VA", "MiniMaxH3ModularPipeline")
+    args = build_parser().parse_args(["--model", str(root)])
+    assert config_from_args(args).pipeline_class == (
+        "atom.diffusion.models.minimax_h3.pipeline.MiniMaxH3Pipeline"
+    )
+
+
+def test_the_pipeline_flag_overrides_the_checkpoint(tmp_path):
+    """Out-of-tree pipelines have no registry entry, so the flag has to win."""
+    from atom.diffusion.entrypoints.diffusion_server import (
+        build_parser,
+        config_from_args,
+    )
+
+    root = write_model_index(tmp_path / "FL2VA", "MiniMaxH3ModularPipeline")
+    args = build_parser().parse_args(
+        [PIPELINE_ARG_NAME, DUMMY_PIPELINE, "--model", str(root)]
+    )
+    assert config_from_args(args).pipeline_class == DUMMY_PIPELINE
+
+
+def test_an_unknown_architecture_names_what_is_supported(tmp_path):
+    from atom.diffusion.entrypoints.diffusion_server import (
+        build_parser,
+        config_from_args,
+    )
+
+    root = write_model_index(tmp_path / "ckpt", "SomeOtherPipeline")
+    args = build_parser().parse_args(["--model", str(root)])
+    with pytest.raises(ValueError, match="SomeOtherPipeline"):
+        config_from_args(args)
+
+
+def test_a_checkpoint_with_no_index_says_so(tmp_path):
+    """The failure has to name the missing file: the common cause is pointing
+    --model at the parent of the partition rather than at the partition."""
+    from atom.diffusion.entrypoints.diffusion_server import (
+        build_parser,
+        config_from_args,
+    )
+
+    args = build_parser().parse_args(["--model", str(tmp_path)])
+    with pytest.raises(ValueError, match="model_index.json"):
+        config_from_args(args)
+
+
+def test_a_malformed_index_is_a_missing_one(tmp_path):
+    from atom.diffusion.registry import pipeline_class_for_checkpoint
+
+    tmp_path.joinpath("model_index.json").write_text("{not json")
+    assert pipeline_class_for_checkpoint(str(tmp_path)) is None

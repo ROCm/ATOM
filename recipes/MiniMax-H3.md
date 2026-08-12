@@ -27,12 +27,17 @@ and does not cover.
 
 `atom/diffusion/` is **model-major**: the framework sits at the top level and
 everything for one model lives in one package, so adding a model is a new
-directory plus a `--pipeline` path rather than edits scattered across
+directory plus one line in `registry.py` rather than edits scattered across
 `dits/`, `vaes/`, `encoders/` and `schedulers/`.
+
+The pipeline is chosen the way the LLM side chooses a model class: from the
+checkpoint. `registry.py` maps the `_class_name` in `model_index.json` to a
+pipeline, so `--model /path/to/FL2VA` is enough. `--pipeline <dotted.path>`
+overrides it, which is what an out-of-tree pipeline needs.
 
 ```
 atom/diffusion/
-  config.py request.py pipeline.py attention.py ulysses.py mux.py
+  config.py request.py pipeline.py attention.py ulysses.py mux.py registry.py
   engine/        job scheduler, ZMQ workers, per-GPU runner
   entrypoints/   diffusion_server.py, video_api.py
   models/minimax_h3/

@@ -20,16 +20,25 @@ import sys
 
 from atom.diffusion.config import DiffusionConfig
 from atom.diffusion.engine.diffusion_engine import DiffusionEngine
+from atom.diffusion.registry import (
+    MODEL_INDEX_FILENAME,
+    checkpoint_architecture,
+    pipeline_class_for_checkpoint,
+    supported_architectures,
+)
 
 logger = logging.getLogger(__name__)
-
-DEFAULT_PIPELINE = "atom.diffusion.models.minimax_h3.pipeline.MiniMaxH3Pipeline"
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="atom-diffusion-server")
     parser.add_argument("--model", required=True, help="checkpoint root")
-    parser.add_argument("--pipeline", default=DEFAULT_PIPELINE)
+    parser.add_argument(
+        "--pipeline",
+        default=None,
+        help="dotted path to a ComposedPipeline subclass; by default it is "
+        "looked up from the checkpoint's model_index.json",
+    )
     parser.add_argument(
         "--model-variant",
         default=None,
@@ -67,6 +76,24 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def pipeline_class_for_model(model_path: str) -> str:
+    """Pick the pipeline for a checkpoint, or explain what would have worked."""
+    dotted = pipeline_class_for_checkpoint(model_path)
+    if dotted is not None:
+        return dotted
+    architecture = checkpoint_architecture(model_path)
+    found = (
+        f"declares _class_name {architecture!r}"
+        if architecture
+        else f"has no readable {MODEL_INDEX_FILENAME}"
+    )
+    raise ValueError(
+        f"cannot pick a diffusion pipeline for {model_path!r}: it {found}. "
+        f"Supported architectures: {', '.join(supported_architectures())}. "
+        "Pass --pipeline with a dotted path to use another."
+    )
+
+
 def config_from_args(args: argparse.Namespace) -> DiffusionConfig:
     import os
 
@@ -79,7 +106,7 @@ def config_from_args(args: argparse.Namespace) -> DiffusionConfig:
             model_path = candidate
     return DiffusionConfig(
         model_path=model_path,
-        pipeline_class=args.pipeline,
+        pipeline_class=args.pipeline or pipeline_class_for_model(model_path),
         model_variant=args.model_variant,
         num_gpus=args.num_gpus,
         ulysses_degree=args.ulysses_degree or args.num_gpus,

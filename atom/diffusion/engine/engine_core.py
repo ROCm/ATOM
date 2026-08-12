@@ -27,8 +27,11 @@ from atom.diffusion.engine.protocol import (
     OutputType,
     RequestType,
 )
+from atom.diffusion.registry import resolve_pipeline_class
 from atom.diffusion.request import DiffusionJob, JobStatus
 from atom.diffusion.ulysses import UlyssesGroup
+
+__all__ = ["DiffusionEngineCore", "resolve_pipeline_class"]
 
 logger = logging.getLogger(__name__)
 
@@ -36,16 +39,6 @@ logger = logging.getLogger(__name__)
 # a message per step is fine for the socket but noisy in logs; the API's
 # progress fraction does not get more useful than this.
 PROGRESS_EVERY = 1
-
-
-def resolve_pipeline_class(dotted: str):
-    """Import ``pkg.module.Class`` for a configured pipeline."""
-    module_name, _, class_name = dotted.rpartition(".")
-    if not module_name:
-        raise ValueError(f"pipeline_class must be a dotted path, got {dotted!r}")
-    import importlib
-
-    return getattr(importlib.import_module(module_name), class_name)
 
 
 class DiffusionEngineCore:
