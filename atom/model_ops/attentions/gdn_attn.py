@@ -293,10 +293,23 @@ class GDNStateMixin:
         because `_checkpoint_targets` and the copy-out kernel exist; a backend
         that declares it without them keeps zero checkpoints and says nothing.
 
-        One consequence worth stating: a checkpoint read out of `h` is bf16
-        while the recurrence carries fp32, so resuming from an interior
-        position is approximate (~1.2e-4 relative, measured). Positions at a
-        forward's end are read from the runtime slot and stay exact.
+        Costs no accuracy, which is worth stating because the obvious reading
+        says it must: `h` is bf16 while the recurrence carries fp32, so a state
+        sliced out of it is pre-rounded. The shortened forward it replaces
+        rounds the same fp32 value on the way into the pool, though, because
+        the two dtypes are the same one — `h` is allocated as `k.new_empty`
+        and `_state_dtypes` returns `config.torch_dtype` — so the rounding is
+        common to both paths and the difference is nil. Measured on MI355: the
+        checkpoint matches a cut prefill's stored state exactly across 56
+        (seed, length, boundary) combinations, and resuming from one reproduces
+        the remaining tokens' outputs bit for bit. See
+        `tests/test_gdn_state_checkpoint_gpu.py`.
+
+        That argument is about the two dtypes agreeing, not about the copy, so
+        it does not survive a pool allocated at higher precision than `h`.
+        `_state_dtypes` builds exactly one such pool — kimi_linear's fp32 v
+        side — and that model is already off this path for a different reason
+        (`_KimiMLAGDNCommon.state_transfer`).
         """
         return StateTransfer.fork(1, readable_midstep=True)
 

@@ -2243,3 +2243,83 @@ class TestMidstepCheckpoints:
         bm.can_allocate(cold)
         assert cold.block_hashes == []
         assert bm.midstep_positions(cold, 0, 44) == []
+
+
+class TestMidstepExactnessPremise:
+    """The interior-checkpoint path is only lossless while two dtypes agree.
+
+    A checkpoint taken mid-prompt is sliced out of the chunk kernel's `h`,
+    which is `k.new_empty(...)` — the activation dtype. The alternative it
+    replaced, cutting the prefill so the position became a step end, stores an
+    fp32 final state. Those differ, and the only reason the substitution is
+    exact is that the destination pool is the activation dtype too, so both
+    paths round identically on the way in. Verified on GPU in
+    `tests/test_gdn_state_checkpoint_gpu.py`; this pins the premise where CI
+    can see it, since that file skips without a device.
+
+    Widen the pool without widening `h` and nothing breaks loudly: the writes
+    still land, the shapes still match, and cached requests quietly resume from
+    a state carrying bf16 rounding the uncached ones do not. That is an
+    accuracy regression visible only as an eval delta between runs that hit the
+    cache and runs that miss, which is close to the hardest kind to trace back.
+    """
+
+    def _dtypes(self, model_type):
+        """`GDNStateMixin._state_dtypes` without constructing a builder.
+
+        The method reads only `model_runner.config`, so a namespace standing in
+        for the runner is enough and keeps this off the GPU.
+        """
+        import torch
+
+        from atom.model_ops.attentions.gdn_attn import GDNStateMixin
+
+        runner = SimpleNamespace(
+            config=SimpleNamespace(
+                torch_dtype=torch.bfloat16,
+                hf_config=SimpleNamespace(model_type=model_type),
+            )
+        )
+        return GDNStateMixin._state_dtypes(SimpleNamespace(model_runner=runner))
+
+    def test_gdn_pool_matches_the_activation_dtype(self):
+        """Both families, because a checkpoint writes both."""
+        import torch
+
+        assert self._dtypes("qwen3_next") == (torch.bfloat16, torch.bfloat16)
+
+    def test_kimi_is_the_one_pool_wider_than_h(self):
+        """And is excluded from the midstep path — for an unrelated reason.
+
+        KDA is off it because `chunk_kda` never exposes per-chunk states at all
+        (`_KimiMLAGDNCommon.state_transfer`). That its pool would also break the
+        exactness argument is a second, independent reason, so porting
+        `chunk_kda_paged` to lift the first would not be enough on its own.
+        """
+        import torch
+
+        assert self._dtypes("kimi_linear") == (torch.bfloat16, torch.float32)
+
+    def test_midstep_backends_are_the_ones_with_a_matching_pool(self):
+        """The rule, rather than today's two answers to it.
+
+        A backend that declares `readable_midstep` and allocates a pool wider
+        than its activations gets silent per-request accuracy drift. Asserted
+        as an invariant over the classes that declare it, so a third GDN-like
+        backend added later has to satisfy it rather than merely resemble one.
+        """
+        import torch
+
+        from atom.model_ops.attentions.gdn_attn import GDNStateMixin
+        from atom.model_ops.attentions.kimi_mla_gdn_attn import _KimiMLAGDNCommon
+
+        for cls, model_type in (
+            (GDNStateMixin, "qwen3_next"),
+            (_KimiMLAGDNCommon, "kimi_linear"),
+        ):
+            midstep = cls.state_transfer(SimpleNamespace()).readable_midstep
+            uniform = set(self._dtypes(model_type)) == {torch.bfloat16}
+            assert not midstep or uniform, (
+                f"{cls.__name__} reads checkpoints out of bf16 `h` but pools "
+                f"state at {self._dtypes(model_type)}"
+            )

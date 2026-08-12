@@ -79,6 +79,16 @@ class _KimiMLAGDNCommon(GDNStateMixin):
         that was never wanted. Overridden here rather than fixed by making the
         mixin's flag conditional, so that the class which cannot do the thing
         is the class that says so.
+
+        Two reasons, not one, and the second outlives the first. Porting the
+        branch's `chunk_kda_paged` would expose per-chunk states here and make
+        this override look removable — but KDA is also the single model whose
+        state pool is *wider* than those states: `_state_dtypes` gives
+        kimi_linear an fp32 v side while the chunked states are bf16. The GDN
+        sibling's checkpoints are exact only because those two dtypes match
+        (see `GDNStateMixin.state_transfer`), so here the same copy would
+        silently hand cached requests a bf16-rounded state where uncached ones
+        get fp32. Whoever ports the kernel has to answer that too.
         """
         return StateTransfer.fork(1)
 
