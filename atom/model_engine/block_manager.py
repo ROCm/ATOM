@@ -275,13 +275,13 @@ class BlockManager:
         return boundary
 
     def pool_occupancy(self) -> dict[str, int]:
-        used = len(self.used_block_ids)
-        free = len(self.free_block_ids_set)
-        hashed = len(self.hash_to_block_id)
+        used = self.kv.num_used
+        free = self.kv.num_free
+        hashed = self.kv.num_indexed
         return {
             "used": used,
             "free": free,
-            "total": len(self.blocks),
+            "total": self.kv.num_blocks,
             "hashed": hashed,
             "retained": max(0, hashed - used),
             "evicted_total": self.total_evicted_blocks,
