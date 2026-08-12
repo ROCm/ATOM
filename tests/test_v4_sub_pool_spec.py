@@ -16,6 +16,8 @@ ROOT = Path(__file__).resolve().parent.parent
 ATTENTION_DIR = ROOT / "atom" / "model_ops" / "attentions"
 V4_SOURCE = ATTENTION_DIR / "deepseek_v4_attn.py"
 RUNNER_SOURCE = ROOT / "atom" / "model_engine" / "model_runner.py"
+CONFIG_SOURCE = ROOT / "atom" / "config.py"
+ARG_UTILS_SOURCE = ROOT / "atom" / "model_engine" / "arg_utils.py"
 FIELD = "state_ckpt_extra_entries"
 ENV_FIELD = "STATE_CKPT_EXTRA_ENTRIES"
 
@@ -98,3 +100,10 @@ def test_checkpoint_extra_entries_are_wired_only_to_the_v4_state_slot():
     )
     assert _runtime_field_refs(init, ENV_FIELD)
     assert _runtime_field_refs(init, FIELD)
+
+
+def test_checkpoint_extra_entries_has_no_config_or_cli_surface():
+    assert "state_checkpoint_extra_entries" not in CONFIG_SOURCE.read_text()
+    arg_utils = ARG_UTILS_SOURCE.read_text()
+    assert "state_checkpoint_extra_entries" not in arg_utils
+    assert "--state-checkpoint-extra-entries" not in arg_utils
