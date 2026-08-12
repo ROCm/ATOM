@@ -636,20 +636,39 @@ jobs:
             done
           }
 
-          for ((gpu_id = 0; gpu_id < gpu_count; gpu_id++)); do
-            target_log="/tmp/gdr-smoke-target-gpu-${gpu_id}.log"
-            initiator_log="/tmp/gdr-smoke-initiator-gpu-${gpu_id}.log"
+          if [[ "${gpu_count}" -ne 8 ]]; then
+            echo "ERROR: node-local prefill/decode RDMA testing requires exactly 8 GPUs, found ${gpu_count}" >&2
+            exit 1
+          fi
+          if [[ "${#rdma_devices[@]}" -lt 8 ]]; then
+            echo "ERROR: node-local prefill/decode RDMA testing requires at least 8 RDMA devices, found ${#rdma_devices[@]}" >&2
+            exit 1
+          fi
 
-            echo "=== GPUDirect RDMA smoke test: GPU ${gpu_id} ==="
-            HIP_VISIBLE_DEVICES="${gpu_id}" \
-            ROCR_VISIBLE_DEVICES="${gpu_id}" \
+          # The initiator writes prefill VRAM into the decode target. Pair each
+          # prefill GPU with the decode GPU and NIC in the corresponding half.
+          for ((prefill_gpu_id = 0; prefill_gpu_id < 4; prefill_gpu_id++)); do
+            decode_gpu_id=$((prefill_gpu_id + 4))
+            prefill_rdma_device="${rdma_devices[prefill_gpu_id]}"
+            decode_rdma_device="${rdma_devices[decode_gpu_id]}"
+            prefill_matrix="/tmp/gdr-smoke-prefill-gpu-${prefill_gpu_id}-nic-priority.json"
+            decode_matrix="/tmp/gdr-smoke-decode-gpu-${decode_gpu_id}-nic-priority.json"
+            printf '{"cuda:0":[["%s"],[]]}\n' "${prefill_rdma_device}" > "${prefill_matrix}"
+            printf '{"cuda:0":[["%s"],[]]}\n' "${decode_rdma_device}" > "${decode_matrix}"
+
+            target_log="/tmp/gdr-smoke-decode-gpu-${decode_gpu_id}-target.log"
+            initiator_log="/tmp/gdr-smoke-prefill-gpu-${prefill_gpu_id}-initiator.log"
+
+            echo "=== GPUDirect RDMA prefill GPU ${prefill_gpu_id} (${prefill_rdma_device}) -> decode GPU ${decode_gpu_id} (${decode_rdma_device}) ==="
+            HIP_VISIBLE_DEVICES="${decode_gpu_id}" \
+            ROCR_VISIBLE_DEVICES="${decode_gpu_id}" \
             "${validator_bin}" \
               --mode=target \
               --protocol=rdma \
               --metadata_server=P2PHANDSHAKE \
               --local_server_name=127.0.0.2:0 \
-              --device_name="${rdma_device_csv}" \
-              --nic_priority_matrix=/tmp/rdma-smoke-nic-priority.json \
+              --device_name="${decode_rdma_device}" \
+              --nic_priority_matrix="${decode_matrix}" \
               --use_vram=true \
               --gpu_id=0 \
               --buffer_size=67108864 \
@@ -659,16 +678,16 @@ jobs:
             echo "P2P target listening at ${target_name}"
 
             set +e
-            HIP_VISIBLE_DEVICES="${gpu_id}" \
-            ROCR_VISIBLE_DEVICES="${gpu_id}" \
+            HIP_VISIBLE_DEVICES="${prefill_gpu_id}" \
+            ROCR_VISIBLE_DEVICES="${prefill_gpu_id}" \
             timeout 120 "${validator_bin}" \
               --mode=initiator \
               --protocol=rdma \
               --metadata_server=P2PHANDSHAKE \
               --local_server_name=127.0.0.3:0 \
               --segment_id="${target_name}" \
-              --device_name="${rdma_device_csv}" \
-              --nic_priority_matrix=/tmp/rdma-smoke-nic-priority.json \
+              --device_name="${prefill_rdma_device}" \
+              --nic_priority_matrix="${prefill_matrix}" \
               --use_vram=true \
               --gpu_id=0 \
               --buffer_size=67108864 \
@@ -683,15 +702,15 @@ jobs:
             if [[ "${transfer_rc}" -ne 0 ]] ||
                ! grep -q "Data validation passed" "${initiator_log}"; then
               cat "${target_log}" >&2
-              echo "ERROR: GPUDirect RDMA data validation failed on GPU ${gpu_id}" >&2
+              echo "ERROR: GPUDirect RDMA failed from prefill GPU ${prefill_gpu_id} (${prefill_rdma_device}) to decode GPU ${decode_gpu_id} (${decode_rdma_device})" >&2
               exit 1
             fi
             kill "${target_pid}" 2>/dev/null || true
             wait "${target_pid}" 2>/dev/null || true
             target_pid=""
-            echo "GPUDirect RDMA passed on GPU ${gpu_id}"
+            echo "GPUDirect RDMA passed from prefill GPU ${prefill_gpu_id} to decode GPU ${decode_gpu_id}"
           done
-          echo "Node-local GPUDirect RDMA passed on all ${gpu_count} GPUs"
+          echo "Node-local GPUDirect RDMA passed for all four prefill/decode GPU pairs"
 
           if [[ "${SMOKE_NODE_COUNT}" -lt 2 ]]; then
             echo "Single-node GPUDirect RDMA smoke test passed"
@@ -745,7 +764,7 @@ jobs:
             exit 1
           fi
 
-          peer_info="${SMOKE_RUN_DIR}/cross-node-peer-info"
+          peer_info="${SMOKE_RUN_DIR}/cross-node-prefill-info"
           if [[ "${SMOKE_RANK}" -eq 0 ]]; then
             {
               echo "${local_ip}"
@@ -753,33 +772,43 @@ jobs:
             } > "${peer_info}.tmp"
             mv "${peer_info}.tmp" "${peer_info}"
           elif [[ "${SMOKE_RANK}" -eq 1 ]]; then
-            wait_for_file "${peer_info}" 60 "rank 0 peer information"
+            wait_for_file "${peer_info}" 60 "prefill node information"
             mapfile -t peer_data < "${peer_info}"
-            target_node_ip="${peer_data[0]:-}"
-            target_gpu_count="${peer_data[1]:-0}"
-            if [[ -z "${target_node_ip}" || "${target_gpu_count}" -ne "${gpu_count}" ]]; then
-              echo "ERROR: cross-node GPU topology mismatch: target=${target_gpu_count}, initiator=${gpu_count}" >&2
+            prefill_node_ip="${peer_data[0]:-}"
+            prefill_gpu_count="${peer_data[1]:-0}"
+            if [[ -z "${prefill_node_ip}" || "${prefill_gpu_count}" -ne "${gpu_count}" ]]; then
+              echo "ERROR: cross-node GPU topology mismatch: prefill=${prefill_gpu_count}, decode=${gpu_count}" >&2
               exit 1
             fi
           fi
 
           if [[ "${SMOKE_RANK}" -eq 0 || "${SMOKE_RANK}" -eq 1 ]]; then
-            for ((gpu_id = 0; gpu_id < gpu_count; gpu_id++)); do
-              ready_file="${SMOKE_RUN_DIR}/cross-node-ready-gpu-${gpu_id}"
-              result_file="${SMOKE_RUN_DIR}/cross-node-result-gpu-${gpu_id}"
+            cross_prefill_gpu_ids=(0 1 2 3 4 5 6 7 0 1 2 3)
+            cross_decode_gpu_ids=(0 1 2 3 4 5 6 7 4 5 6 7)
+            for ((pair_index = 0; pair_index < ${#cross_prefill_gpu_ids[@]}; pair_index++)); do
+              prefill_gpu_id="${cross_prefill_gpu_ids[pair_index]}"
+              decode_gpu_id="${cross_decode_gpu_ids[pair_index]}"
+              prefill_rdma_device="${rdma_devices[prefill_gpu_id]}"
+              decode_rdma_device="${rdma_devices[decode_gpu_id]}"
+              prefill_matrix="/tmp/cross-node-prefill-gpu-${prefill_gpu_id}-nic-priority.json"
+              decode_matrix="/tmp/cross-node-decode-gpu-${decode_gpu_id}-nic-priority.json"
+              printf '{"cuda:0":[["%s"],[]]}\n' "${prefill_rdma_device}" > "${prefill_matrix}"
+              printf '{"cuda:0":[["%s"],[]]}\n' "${decode_rdma_device}" > "${decode_matrix}"
+              ready_file="${SMOKE_RUN_DIR}/cross-node-ready-prefill-${prefill_gpu_id}-decode-${decode_gpu_id}"
+              result_file="${SMOKE_RUN_DIR}/cross-node-result-prefill-${prefill_gpu_id}-decode-${decode_gpu_id}"
+              target_log="${SMOKE_RUN_DIR}/cross-node-prefill-${prefill_gpu_id}-decode-${decode_gpu_id}-target.log"
 
-              if [[ "${SMOKE_RANK}" -eq 0 ]]; then
-                target_log="${SMOKE_RUN_DIR}/cross-node-gdr-target-gpu-${gpu_id}.log"
-                echo "=== Cross-node GDR target: ${local_ip}, GPU ${gpu_id} ==="
-                HIP_VISIBLE_DEVICES="${gpu_id}" \
-                ROCR_VISIBLE_DEVICES="${gpu_id}" \
+              if [[ "${SMOKE_RANK}" -eq 1 ]]; then
+                echo "=== Cross-node decode target: ${local_ip}, GPU ${decode_gpu_id} (${decode_rdma_device}) ==="
+                HIP_VISIBLE_DEVICES="${decode_gpu_id}" \
+                ROCR_VISIBLE_DEVICES="${decode_gpu_id}" \
                 "${validator_bin}" \
                   --mode=target \
                   --protocol=rdma \
                   --metadata_server=P2PHANDSHAKE \
                   --local_server_name="${local_ip}:0" \
-                  --device_name="${rdma_device_csv}" \
-                  --nic_priority_matrix=/tmp/rdma-smoke-nic-priority.json \
+                  --device_name="${decode_rdma_device}" \
+                  --nic_priority_matrix="${decode_matrix}" \
                   --use_vram=true \
                   --gpu_id=0 \
                   --buffer_size=67108864 \
@@ -790,33 +819,33 @@ jobs:
                 echo "${target_name}" > "${ready_file}.tmp"
                 mv "${ready_file}.tmp" "${ready_file}"
 
-                wait_for_file "${result_file}" 150 "cross-node GPU ${gpu_id} result"
+                wait_for_file "${result_file}" 150 "prefill GPU ${prefill_gpu_id} to decode GPU ${decode_gpu_id} result"
                 result="$(<"${result_file}")"
                 kill "${target_pid}" 2>/dev/null || true
                 wait "${target_pid}" 2>/dev/null || true
                 target_pid=""
                 if [[ "${result}" != "0" ]]; then
-                  cat "${target_log}"
-                  echo "ERROR: cross-node GPUDirect RDMA failed on GPU ${gpu_id}" >&2
+                  cat "${target_log}" >&2
+                  echo "ERROR: cross-node GPUDirect RDMA failed from prefill GPU ${prefill_gpu_id} to decode GPU ${decode_gpu_id}" >&2
                   exit 1
                 fi
-                echo "Cross-node GPUDirect RDMA passed on target GPU ${gpu_id}"
+                echo "Cross-node GPUDirect RDMA passed on decode GPU ${decode_gpu_id}"
               else
-                wait_for_file "${ready_file}" 60 "cross-node GPU ${gpu_id} target"
+                wait_for_file "${ready_file}" 60 "decode GPU ${decode_gpu_id} target"
                 target_name="$(<"${ready_file}")"
-                initiator_log="/tmp/cross-node-gdr-initiator-gpu-${gpu_id}.log"
-                echo "=== Cross-node GDR initiator: ${local_ip} -> ${target_name}, GPU ${gpu_id} ==="
+                initiator_log="/tmp/cross-node-prefill-${prefill_gpu_id}-decode-${decode_gpu_id}-initiator.log"
+                echo "=== Cross-node prefill initiator: ${local_ip} GPU ${prefill_gpu_id} (${prefill_rdma_device}) -> ${target_name} decode GPU ${decode_gpu_id} ==="
                 set +e
-                HIP_VISIBLE_DEVICES="${gpu_id}" \
-                ROCR_VISIBLE_DEVICES="${gpu_id}" \
+                HIP_VISIBLE_DEVICES="${prefill_gpu_id}" \
+                ROCR_VISIBLE_DEVICES="${prefill_gpu_id}" \
                 timeout 120 "${validator_bin}" \
                   --mode=initiator \
                   --protocol=rdma \
                   --metadata_server=P2PHANDSHAKE \
                   --local_server_name="${local_ip}:0" \
                   --segment_id="${target_name}" \
-                  --device_name="${rdma_device_csv}" \
-                  --nic_priority_matrix=/tmp/rdma-smoke-nic-priority.json \
+                  --device_name="${prefill_rdma_device}" \
+                  --nic_priority_matrix="${prefill_matrix}" \
                   --use_vram=true \
                   --gpu_id=0 \
                   --buffer_size=67108864 \
@@ -836,17 +865,17 @@ jobs:
                 echo "${result}" > "${result_file}.tmp"
                 mv "${result_file}.tmp" "${result_file}"
                 if [[ "${result}" -ne 0 ]]; then
-                  cat "${SMOKE_RUN_DIR}/cross-node-gdr-target-gpu-${gpu_id}.log" >&2 || true
-                  echo "ERROR: cross-node GPUDirect RDMA data validation failed on GPU ${gpu_id}" >&2
+                  cat "${target_log}" >&2 || true
+                  echo "ERROR: cross-node GPUDirect RDMA data validation failed from prefill GPU ${prefill_gpu_id} to decode GPU ${decode_gpu_id}" >&2
                   exit 1
                 fi
-                echo "Cross-node GPUDirect RDMA passed on initiator GPU ${gpu_id}"
+                echo "Cross-node GPUDirect RDMA passed from prefill GPU ${prefill_gpu_id}"
               fi
             done
           fi
 
           if [[ "${SMOKE_RANK}" -eq 0 ]]; then
-            echo "Mooncake cross-node GPUDirect RDMA passed between Slurm ranks 0 and 1 on all ${gpu_count} GPUs"
+            echo "Mooncake cross-node GPUDirect RDMA passed for same-index GPU pairs 0-7 and prefill GPUs 0-3 to decode GPUs 4-7"
           fi
           CONTAINER_SCRIPT
           docker_rc=$?
