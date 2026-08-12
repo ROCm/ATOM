@@ -32,6 +32,11 @@ on:
         required: false
         default: 'main'
         type: string
+      models:
+        description: 'Comma-separated model_name list to run. Leave empty for every model, which is what a manual run selects by default.'
+        required: false
+        default: ''
+        type: string
       atom_base_image:
         description: 'Docker image used as the ATOM test base image'
         required: false
@@ -143,16 +148,28 @@ jobs:
       - id: load
         env:
           EVENT_NAME: ${{ github.event_name }}
+          MODELS_FILTER: ${{ inputs.models }}
         run: |
           python3 << 'PY'
           import json, os
           event = os.environ["EVENT_NAME"]
-          # pr → pr models only; push to main → pr+main; schedule/dispatch → all
-          level_map = {"schedule": "nightly", "workflow_dispatch": "nightly", "push": "main"}
-          current = level_map.get(event, "pr")
-          allowed = {"pr": {"pr"}, "main": {"pr", "main"}, "nightly": {"pr", "main", "nightly"}}[current]
           models = json.load(open(".github/benchmark/models_accuracy.json", encoding="utf-8"))
-          filtered = [m for m in models if m.get("test_level", "nightly") in allowed]
+          wanted = [n.strip() for n in os.environ.get("MODELS_FILTER", "").split(",") if n.strip()]
+          if wanted:
+              # An explicit list beats the event level, so validating one model
+              # against an aiter_branch or a custom base image does not have to
+              # occupy the 8-GPU pool with all of them.
+              unknown = sorted(set(wanted) - {m["model_name"] for m in models})
+              if unknown:
+                  raise SystemExit("Unknown model_name(s): " + ", ".join(unknown))
+              current = "manual"
+              filtered = [m for m in models if m["model_name"] in wanted]
+          else:
+              # pr → pr models only; push to main → pr+main; schedule/dispatch → all
+              level_map = {"schedule": "nightly", "workflow_dispatch": "nightly", "push": "main"}
+              current = level_map.get(event, "pr")
+              allowed = {"pr": {"pr"}, "main": {"pr", "main"}, "nightly": {"pr", "main", "nightly"}}[current]
+              filtered = [m for m in models if m.get("test_level", "nightly") in allowed]
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"models_json={json.dumps(filtered)}\n")
           print(f"Event={event} level={current}: {len(filtered)}/{len(models)} models")
