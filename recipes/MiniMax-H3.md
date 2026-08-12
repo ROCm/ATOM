@@ -314,7 +314,7 @@ and friends) carry attributed device time without being GPU work.
 ## Validation
 
 ```bash
-python -m pytest tests/test_diffusion_*.py   # 247 tests, CPU only, no AITER needed
+python -m pytest tests/diffusion/   # 235 tests, CPU only, no AITER needed
 ```
 
 Against the sglang reference on the same box, same seed, `--attn-backend triton`:

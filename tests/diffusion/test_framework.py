@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-"""CPU-only tests for the diffusion subsystem skeleton.
+"""Framework-level tests for the diffusion subsystem: config, request,
+scheduler, the Ulysses group's shape contracts, stage/pipeline execution,
+component placement and the runner.
 
 Follows the repo convention in tests/conftest.py: import the real classes, do
 not fake modules. Nothing here needs a GPU or AITER.
@@ -29,7 +31,7 @@ from atom.diffusion.ulysses import UlyssesGroup
 def make_config(**overrides) -> DiffusionConfig:
     kwargs = {
         "model_path": "<test>",
-        "pipeline_class": "tests.test_diffusion_skeleton._Pipeline",
+        "pipeline_class": "tests.diffusion.test_framework._Pipeline",
         "num_gpus": 1,
         "ulysses_degree": 1,
         "num_inference_steps": 3,

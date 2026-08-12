@@ -1,12 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Attention backend selection for the diffusion DiT stack.
-
-The backend is a product decision, not a fallback ladder: ASM is fastest on
-gfx942, Triton is the only one that reproduces the sglang reference bit-for-bit.
-These tests pin the *selection* logic, which is what a parity run depends on.
-"""
+"""Packed varlen attention: backend selection and cross-backend parity."""
 
 import os
 
@@ -20,7 +15,7 @@ from atom.diffusion.attention import (
     resolve_attention_backend,
 )
 from atom.diffusion.models.minimax_h3.dit import MiniMaxH3DiTModel
-from tests.test_diffusion_minimax_h3 import tiny_arch
+from tests.diffusion.test_h3_model import tiny_arch
 
 
 @pytest.mark.parametrize(
@@ -163,7 +158,7 @@ def test_the_dit_passes_used_len_down_to_attention(monkeypatch):
     """pad_from has to survive the whole chain -- packed_seq_params, the block
     stack and the refiner -- or the optimisation silently does nothing."""
     from atom.diffusion.models.minimax_h3 import dit as dit_mod
-    from tests.test_diffusion_minimax_h3 import make_inputs
+    from tests.diffusion.test_h3_model import make_inputs
 
     arch = tiny_arch()
     model = MiniMaxH3DiTModel(arch, attn_backend="sdpa").eval()

@@ -1,12 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Serving layer: protocol, worker message handling, engine, HTTP routes.
-
-No GPU and no subprocesses. The worker's ZMQ body is a thin wrapper around
-``DiffusionEngineCore.handle``, and the manager's is a thin wrapper around a
-queue, so both are driven directly here; what that leaves untested is socket
-plumbing, which a unit test could only re-assert against itself.
+"""Serving-layer tests: the CLI's argument and path resolution, the
+checkpoint -> pipeline registry, the HTTP surface and the engine's job
+lifecycle.
 """
 
 import pickle
