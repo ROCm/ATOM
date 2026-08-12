@@ -44,6 +44,7 @@ docker exec \
   echo "=== Building aiter $(git rev-parse --short HEAD) (${AITER_GIT_REF}) ==="
 
   pip install --upgrade setuptools_scm
+  pip install --upgrade "pybind11>=3.0.1"
   # requirements.txt is intentionally skipped: the base image already satisfies
   # aiter, and its pins would move flydsl/pandas out from under ATOM. GPU_ARCHS
   # is left unset so aiter targets the runner GPU it detects.
