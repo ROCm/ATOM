@@ -561,6 +561,27 @@ jobs:
           fi
           echo "Visible ROCm GPUs: ${gpu_count}"
 
+          rdma_context="/app/mooncake/mooncake-transfer-engine/src/transport/rdma_transport/rdma_context.cpp"
+          python3 - "${rdma_context}" <<'PY'
+          import pathlib
+          import sys
+
+          path = pathlib.Path(sys.argv[1])
+          source = path.read_text()
+
+          old = "            uint32_t init = 16;"
+          new = "            uint32_t init = max_dest_rd_atomic_;"
+
+          if source.count(old) != 1:
+              raise RuntimeError(
+                  f"Expected exactly one Mooncake RDMA atomic setting, "
+                  f"found {source.count(old)} in {path}"
+              )
+
+          path.write_text(source.replace(old, new))
+          print(f"Patched Mooncake RDMA atomic limits in {path}")
+          PY
+
           build_dir="/tmp/mooncake-rdma-smoke-build"
           rm -rf "${build_dir}"
           cmake -S /app/mooncake -B "${build_dir}" \
