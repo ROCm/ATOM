@@ -611,8 +611,6 @@ script using `EngineArgs.add_cli_args`):
 | `--block-size` | `16` | KV cache block size |
 | `--max-model-len` | `None` | Maximum context length (defaults to HF config) |
 | `--max-num-batched-tokens` | `16384` | Maximum tokens per batch |
-| `--state-checkpoint-interval-tokens` | `8192` | Tokens between state checkpoints; `0` disables checkpoint creation |
-| `--state-checkpoint-extra-entries` | `0` | DeepSeek-V4 only: statically reserved STATE groups above the live-request floor; reduces PAGE capacity |
 | `--max-num-seqs` | `512` | Maximum sequences per batch |
 | `--gpu-memory-utilization` | `0.9` | GPU memory utilization (0.0 to 1.0) |
 | `--scheduler-delay-factor` | `0.0` | Delay factor before scheduling next prompt |

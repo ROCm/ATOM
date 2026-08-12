@@ -5,8 +5,6 @@ import argparse
 import sys
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 # conftest.py stubs atom.* and zmq before any atom imports are attempted,
 # but arg_utils.py imports LLMEngine from atom and CompilationConfig /
 # SpeculativeConfig from atom.config, which the minimal stub doesn't expose.
@@ -40,9 +38,8 @@ if _atom_config_stub is not None:
             from_dict=lambda cfg, debug=False: MagicMock(cfg=cfg, debug=debug)
         )
 
-from atom.config import Config
-from atom.model_engine.arg_utils import EngineArgs
-from atom.utils.arg_parser import FlexibleArgumentParser
+from atom.model_engine.arg_utils import EngineArgs  # noqa: E402
+from atom.utils.arg_parser import FlexibleArgumentParser  # noqa: E402
 
 
 class TestFlexibleArgumentParser:
@@ -118,51 +115,6 @@ class TestKVCacheDtypeCliAlias:
     def test_kebab_registered_flag_accepts_underscore(self):
         # --tensor-parallel-size is registered kebab-case; underscore must work.
         assert self._parse(["--tensor_parallel_size", "4"]).tensor_parallel_size == 4
-
-
-class TestStateCheckpointExtraEntriesCli:
-    """The checkpoint capacity knob must survive every frontend hop.
-
-    There are three independently declared surfaces before the value reaches
-    pool sizing: Config, EngineArgs, and argparse.  A test of any one in
-    isolation would miss a spelling/default drift in either of the other two.
-    """
-
-    @staticmethod
-    def _parse(argv):
-        parser = FlexibleArgumentParser()
-        EngineArgs.add_cli_args(parser)
-        return EngineArgs.from_cli_args(parser.parse_args(argv))
-
-    def test_default_is_zero_on_every_config_surface(self):
-        config_field = Config.__dataclass_fields__["state_checkpoint_extra_entries"]
-        assert config_field.default == 0
-        args = self._parse([])
-        assert args.state_checkpoint_extra_entries == 0
-        assert args._get_engine_kwargs()["state_checkpoint_extra_entries"] == 0
-
-    def _assert_value_reaches_engine_kwargs(self, flag):
-        args = self._parse([flag, "7"])
-        assert args.state_checkpoint_extra_entries == 7
-        assert args._get_engine_kwargs()["state_checkpoint_extra_entries"] == 7
-
-    def test_dashed_form_reaches_engine_kwargs(self):
-        self._assert_value_reaches_engine_kwargs("--state-checkpoint-extra-entries")
-
-    def test_underscore_form_reaches_engine_kwargs(self):
-        self._assert_value_reaches_engine_kwargs("--state_checkpoint_extra_entries")
-
-    def test_negative_value_is_rejected_before_engine_kwargs(self):
-        with pytest.raises(ValueError, match="state_checkpoint_extra_entries"):
-            self._parse(["--state-checkpoint-extra-entries", "-1"])
-
-    def test_config_rejects_negative_value_before_loading_the_model(self):
-        with (
-            patch("atom.config.get_hf_config") as get_hf_config,
-            pytest.raises(ValueError, match="state_checkpoint_extra_entries"),
-        ):
-            Config(model="unused", state_checkpoint_extra_entries=-1)
-        get_hf_config.assert_not_called()
 
 
 class TestEngineArgsSpeculativeValidation:

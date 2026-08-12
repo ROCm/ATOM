@@ -3,7 +3,7 @@
 
 import pytest
 
-# All ATOM_* env vars that could affect default-value tests
+# All managed env vars that could affect default-value tests
 _ATOM_ENV_VARS = [
     "ATOM_DP_RANK",
     "ATOM_DP_RANK_LOCAL",
@@ -27,6 +27,7 @@ _ATOM_ENV_VARS = [
     "ATOM_DISABLE_VLLM_PLUGIN",
     "ATOM_USE_CUSTOM_ALL_GATHER",
     "ATOM_ENABLE_RELAXED_MTP",
+    "STATE_CKPT_EXTRA_ENTRIES",
 ]
 
 
@@ -61,6 +62,9 @@ class TestEnvsDefaults:
 
     def test_dp_master_port_default(self):
         assert _get_envs().ATOM_DP_MASTER_PORT == 29500
+
+    def test_state_ckpt_extra_entries_default(self):
+        assert _get_envs().STATE_CKPT_EXTRA_ENTRIES == 0
 
     def test_use_triton_gemm_default(self):
         assert _get_envs().ATOM_USE_TRITON_GEMM is False
@@ -107,6 +111,20 @@ class TestEnvsOverrides:
     def test_dp_size_override(self, monkeypatch):
         monkeypatch.setenv("ATOM_DP_SIZE", "8")
         assert _get_envs().ATOM_DP_SIZE == 8
+
+    def test_state_ckpt_extra_entries_override(self, monkeypatch):
+        monkeypatch.setenv("STATE_CKPT_EXTRA_ENTRIES", "268")
+        assert _get_envs().STATE_CKPT_EXTRA_ENTRIES == 268
+
+    def test_state_ckpt_extra_entries_empty_means_default(self, monkeypatch):
+        monkeypatch.setenv("STATE_CKPT_EXTRA_ENTRIES", "")
+        assert _get_envs().STATE_CKPT_EXTRA_ENTRIES == 0
+
+    @pytest.mark.parametrize("value", ["-1", "not-an-int"])
+    def test_state_ckpt_extra_entries_rejects_invalid_values(self, monkeypatch, value):
+        monkeypatch.setenv("STATE_CKPT_EXTRA_ENTRIES", value)
+        with pytest.raises(ValueError, match="must be a nonnegative integer"):
+            _ = _get_envs().STATE_CKPT_EXTRA_ENTRIES
 
     def test_torch_profiler_dir_override(self, monkeypatch):
         monkeypatch.setenv("ATOM_TORCH_PROFILER_DIR", "/tmp/prof")

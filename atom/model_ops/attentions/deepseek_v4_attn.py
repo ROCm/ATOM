@@ -93,7 +93,7 @@ from atom.model_ops.v4_kernels import (
     write_v4_paged_decode_indices,
     write_v4_paged_prefill_indices,
 )
-from atom.utils import CpuGpuBuffer
+from atom.utils import CpuGpuBuffer, envs
 from atom.utils.forward_context import (
     AttentionMetaData,
     AttnState,
@@ -894,7 +894,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         No implicit transient margin is needed on the slot: a ring cannot
         exceed itself the way a block-addressed window could while sliding
         across a boundary, and there is no admission-vs-materialization gap.
-        `state_checkpoint_extra_entries` is different: it is explicit static
+        `STATE_CKPT_EXTRA_ENTRIES` is different: it is explicit static
         headroom for retaining checkpoint groups beyond the live-request floor.
         """
         geo = self.pool_geometry
@@ -905,7 +905,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 STATE_SLOT_CLASS,
                 geo.slot_bytes(row_bytes),
                 entries_per_req=1,
-                extra_entries=(self.model_runner.config.state_checkpoint_extra_entries),
+                extra_entries=envs.STATE_CKPT_EXTRA_ENTRIES,
             ),
         ]
 

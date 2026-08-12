@@ -22,6 +22,20 @@ import os
 from collections.abc import Callable
 from typing import Any
 
+
+def _nonnegative_int(name: str, default: int = 0) -> int:
+    raw = os.getenv(name, "")
+    if raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a nonnegative integer, got {raw!r}") from exc
+    if value < 0:
+        raise ValueError(f"{name} must be a nonnegative integer, got {raw!r}")
+    return value
+
+
 environment_variables: dict[str, Callable[[], Any]] = {
     # --- Data Parallelism ---
     "ATOM_DP_RANK": lambda: int(os.getenv("ATOM_DP_RANK", "0")),
@@ -43,6 +57,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ATOM remaps the SGLang world into internal TP x PCP groups.
     # 0 means unset.
     "ATOM_SGLANG_PCP_SIZE": lambda: int(os.getenv("ATOM_SGLANG_PCP_SIZE", "0") or "0"),
+    # DeepSeek-V4 only: static STATE groups beyond the max_num_seqs live floor.
+    # The existing benchmark contract uses this unprefixed name; keep it exact
+    # so the container environment reaches ATOM without a CLI translation.
+    "STATE_CKPT_EXTRA_ENTRIES": lambda: _nonnegative_int("STATE_CKPT_EXTRA_ENTRIES"),
     # --- Compilation & Execution ---
     "ATOM_USE_TRITON_GEMM": lambda: os.getenv("ATOM_USE_TRITON_GEMM", "0") == "1",
     "ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE": lambda: (

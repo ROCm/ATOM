@@ -1596,12 +1596,14 @@ class ModelRunner:
                 f"({available_for_kv / (1 << 30):.2f}GB) at "
                 f"--gpu-memory-utilization {config.gpu_memory_utilization:.2f}."
             )
-            extra_entries = int(
-                getattr(config, "state_checkpoint_extra_entries", 0) or 0
+            # Derive the hint from the exact specs that failed rather than
+            # re-reading the environment after the plan was constructed.
+            extra_entries = max(
+                (spec.extra_entries for spec in specs if spec.pool is Pool.STATE),
+                default=0,
             )
             extra_hint = (
-                f" or reduce --state-checkpoint-extra-entries "
-                f"(currently {extra_entries})"
+                f" or reduce STATE_CKPT_EXTRA_ENTRIES (currently {extra_entries})"
                 if extra_entries > 0 and any(spec.extra_entries > 0 for spec in specs)
                 else ""
             )

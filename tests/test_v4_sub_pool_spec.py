@@ -15,11 +15,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 ATTENTION_DIR = ROOT / "atom" / "model_ops" / "attentions"
 V4_SOURCE = ATTENTION_DIR / "deepseek_v4_attn.py"
-FIELD = "state_checkpoint_extra_entries"
+FIELD = "STATE_CKPT_EXTRA_ENTRIES"
 
 
 def _runtime_field_refs(node: ast.AST, field: str) -> list[ast.AST]:
-    """Runtime references to a config field, excluding comments/docstrings."""
+    """Runtime references to an environment field, excluding prose."""
     refs: list[ast.AST] = [
         child
         for child in ast.walk(node)

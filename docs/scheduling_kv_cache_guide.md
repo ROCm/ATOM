@@ -25,8 +25,7 @@ ATOM (AiTer Optimized Model) uses a prefill-first scheduler with paged KV cache 
 | `max_num_batched_tokens` | 16384 | Maximum tokens scheduled in a single step |
 | `kv_cache_block_size` | 16 | Tokens per KV cache block (must be multiple of 16, or 1) |
 | `enable_prefix_caching` | `False` | Enable hash-based prefix block sharing |
-| `state_checkpoint_interval_tokens` | 8192 | Tokens between state checkpoints; `0` disables checkpoint creation |
-| `state_checkpoint_extra_entries` | 0 | DeepSeek-V4 STATE groups reserved above the live-request floor |
+| `STATE_CKPT_EXTRA_ENTRIES` | 0 | DeepSeek-V4 STATE groups reserved above the live-request floor (environment variable) |
 | `scheduler_delay_factor` | 0.0 | Delay factor for batching prompt requests (0 = no delay) |
 | `gpu_memory_utilization` | 0.9 | Fraction of GPU memory for KV cache |
 
@@ -290,7 +289,7 @@ What it costs:
 
 The state class costs no new paged blocks at admission time: sizing reserves every STATE class's live floor before the paged class is sized (see [`sub_pool_spec.py`](../atom/model_ops/attentions/sub_pool_spec.py)), so a sequence only needs a free slot index. The floor covers exactly `max_num_seqs` requests and therefore cannot bind before the scheduler limit.
 
-DeepSeek-V4 can add static checkpoint headroom with `--state-checkpoint-extra-entries N`. V4 declares `entries_per_req=1`, so the resulting pool has `max_num_seqs + N` groups; `max_num_seqs` itself, scheduler admission, and CUDA-graph capture sizes do not change. The extra groups are not a separate protected partition: they join the same vacant/checkpointed free lists, and admission may still reclaim a checkpoint. Their bytes are reserved before PAGE sizing, so the PAGE byte remainder falls by exactly `N * state_entry_bytes`; the PAGE entry count then floors that remainder to whole blocks. The reservation is explicit and remains allocated even when `--state-checkpoint-interval-tokens=0` or prefix caching is disabled; in those configurations it is unused. This first version intentionally leaves GDN unchanged because one GDN request can span multiple entries.
+Native ATOM DeepSeek-V4 can add static checkpoint headroom with the `STATE_CKPT_EXTRA_ENTRIES=N` environment variable. V4 declares `entries_per_req=1`, so the resulting pool has `max_num_seqs + N` groups; `max_num_seqs` itself, scheduler admission, and CUDA-graph capture sizes do not change. The extra groups are not a separate protected partition: they join the same vacant/checkpointed free lists, and admission may still reclaim a checkpoint. Their bytes are reserved before PAGE sizing, so the PAGE byte remainder falls by exactly `N * state_entry_bytes`; the PAGE entry count then floors that remainder to whole blocks. The reservation is explicit and remains allocated even when `--state-checkpoint-interval-tokens=0` or prefix caching is disabled; in those configurations it is unused. Values must be nonnegative integers; unset or empty means `0`. This first version intentionally leaves GDN unchanged because one GDN request can span multiple entries. The vLLM and SGLang plugin pools use their own slot sizing and do not consume this variable.
 
 ### State checkpoints (stateful-attention prefix caching)
 

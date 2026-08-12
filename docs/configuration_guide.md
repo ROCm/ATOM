@@ -42,7 +42,6 @@ Defined in `atom/config.py`. The root dataclass that the engine consumes.
 | `kv_cache_dtype` | `str` | `"bf16"` | KV cache data type (`"bf16"` or `"fp8"`) |
 | `enable_prefix_caching` | `bool` | `False` | Enable prefix caching to reuse KV blocks across requests sharing the same prefix |
 | `state_checkpoint_interval_tokens` | `int` | `8192` | For models with per-request state (DeepSeek-V4 compressor ring, GDN recurrent state): keep a state checkpoint every N tokens of context, so a later prefix hit can resume there. A prompt shorter than N checkpoints nothing. Must be a multiple of the prefix-cache hash block size; `0` disables checkpoints. See the state-checkpoint section of the [scheduling & KV cache guide](scheduling_kv_cache_guide.md) |
-| `state_checkpoint_extra_entries` | `int` | `0` | DeepSeek-V4 only: additional STATE entries above the `max_num_seqs` live-request floor. One entry is one V4 state group. The reservation is static, reduces the PAGE remainder, and remains allocated even if checkpointing or prefix caching is disabled. Must be nonnegative |
 | `port` | `int` | `8006` | Engine internal communication port |
 | `torch_profiler_dir` | `str \| None` | `os.getenv("ATOM_TORCH_PROFILER_DIR", None)` | Directory for saving PyTorch profiler traces; creates the directory if it does not exist |
 | `compilation_config` | `CompilationConfig` | `CompilationConfig()` | Compilation and CUDA graph settings (see Section 2) |
@@ -369,7 +368,6 @@ all flags via `add_cli_args()` and converts them into a `Config` via
 | `--num-speculative-tokens` | | `int` | `1` | Number of speculative tokens per iteration |
 | `--max-num-batched-tokens` | | `int` | `16384` | Maximum number of tokens to batch in the async engine |
 | `--state-checkpoint-interval-tokens` | | `int` | `8192` | Tokens between per-request state checkpoints; must be a multiple of the prefix-cache hash block size, `0` disables them. Prompts shorter than one interval publish nothing, which is what keeps the feature free on workloads that never reuse a prefix. Also quantizes prefill chunk boundaries, since a checkpoint is only valid where a forward ends exactly on one |
-| `--state-checkpoint-extra-entries` | | `int` | `0` | DeepSeek-V4 only: statically reserve extra STATE entries above the `max_num_seqs` live floor for retained checkpoints. One entry is one V4 state group. Reduces PAGE capacity and is still allocated when checkpointing or prefix caching is disabled; must be nonnegative |
 | `--max-num-seqs` | | `int` | `512` | Maximum number of sequences to batch together |
 | `--gpu-memory-utilization` | | `float` | `0.9` | Fraction of GPU memory to use (0.0 — 1.0) |
 | `--scheduler-delay-factor` | | `float` | `0.0` | Delay factor multiplied by previous prompt latency before scheduling next prompt |
@@ -402,6 +400,7 @@ anything else (including unset) as `False`, unless noted otherwise.
 | `ATOM_DP_SIZE` | `int` | `1` | Total number of data-parallel groups |
 | `ATOM_DP_MASTER_IP` | `str` | `"127.0.0.1"` | IP address of the data-parallel master |
 | `ATOM_DP_MASTER_PORT` | `int` | `29500` | Port of the data-parallel master |
+| `STATE_CKPT_EXTRA_ENTRIES` | `int` | `0` | Native ATOM DeepSeek-V4 only: extra STATE groups above the `max_num_seqs` live floor; must be a nonnegative integer |
 | ~~`ATOM_ENFORCE_EAGER`~~ | | | Removed. Use CLI flag `--enforce-eager` instead. |
 | `ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION` | `bool` | `False` | Enable QK-norm + RoPE + cache + quant fusion for Qwen3 dense and MoE models |
 | `ATOM_USE_TRITON_GEMM` | `bool` | `False` | Use Triton-based GEMM kernels instead of default backends |
@@ -411,6 +410,11 @@ anything else (including unset) as `False`, unless noted otherwise.
 | `ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION` | `bool` | `True` | Enable fused all-reduce + RMSNorm kernel |
 | `ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT` | `bool` | `True` | Enable AITER Triton fused RMSNorm + quantization for LLaMA models |
 | `ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT` | `bool` | `True` | Enable AITER Triton fused SiLU + multiply + quantization for LLaMA models |
+
+Set `STATE_CKPT_EXTRA_ENTRIES` before starting the server/workers. A running
+worker does not re-size its pools when the parent environment changes, and
+separately launched ranks or PD endpoints must use the same value. Restart the
+deployment after changing it.
 
 ### Additional environment variables (used outside `envs.py`)
 
