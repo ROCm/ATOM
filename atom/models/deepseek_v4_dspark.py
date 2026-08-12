@@ -48,6 +48,7 @@ import torch
 from torch import nn
 
 from atom.models.dspark_draft import DSparkDraftModel
+from atom.utils import envs
 
 if TYPE_CHECKING:
     from atom.config import Config
@@ -76,6 +77,9 @@ class DSparkMarkovHead(nn.Module):
         super().__init__()
         self.vocab_size = vocab_size
         self.rank = rank
+        # Read once here rather than per sampled position: envs re-reads the
+        # environment on every attribute access.
+        self.fused_sample = envs.ATOM_DSPARK_FUSED_MARKOV_SAMPLE
         # W1: per-token embedding lookup table [V, r].
         self.markov_w1 = nn.Embedding(vocab_size, rank)
         # W2: logit projection stored as [V, r] (matches checkpoint); applied as
@@ -99,6 +103,38 @@ class DSparkMarkovHead(nn.Module):
             markov_embed.float(), self.markov_w2.weight.float().t()
         )
         return logits_bias, markov_embed
+
+    def sample_next(self, token_ids: torch.Tensor, base_logits: torch.Tensor):
+        """One greedy block position: the argmax of the biased logits, and W1[x].
+
+        Same contract as the Kimi-K3 head's ``sample_next``; the fused path
+        never materializes the ``[*, V]`` bias, keeping ``W2`` bf16 and reducing
+        straight to ids with an fp32 accumulator (see the op's module docstring
+        for the numerics). ``markov_embed`` is still returned because the
+        confidence head consumes it.
+
+        Args:
+            token_ids:   [B]     ids of the previously sampled token x_{k-1}.
+            base_logits: [B, V]  this position's base logits.
+        Returns:
+            next_ids:     [B]     argmax over the biased logits.
+            markov_embed: [B, r]  W1[x_{k-1}].
+        """
+        if self.fused_sample:
+            # Imported here, not at module scope: this file keeps its Triton /
+            # AITER dependencies behind the guarded import block below so the
+            # head stays constructible on a runner with no AITER build.
+            from atom.model_ops.dspark_markov_sample import dspark_markov_argmax
+
+            markov_embed = self.markov_w1(token_ids)
+            next_ids = dspark_markov_argmax(
+                base_logits, markov_embed, self.markov_w2.weight
+            )
+            return next_ids, markov_embed
+        bias, markov_embed = self(token_ids)
+        # bf16 + fp32 promotes the slice to fp32 before the add, so an explicit
+        # .float() would only materialize it twice for the same sum.
+        return (base_logits + bias).argmax(dim=-1), markov_embed
 
 
 class DSparkConfidenceHead(nn.Module):
@@ -991,14 +1027,10 @@ class _DSparkInner(nn.Module):
         out_ids[:, 0] = anchor_ids
         markov_embeds = []
         for k in range(T):
-            bias, m_embed = last.markov_head(out_ids[:, k])  # [B, V], [B, r]
-            # No .float() on the slice: bf16 + fp32 already promotes to fp32
-            # before the add, so casting first only materializes the [B, V]
-            # slice a second time for a bit-identical sum.
-            logits_k = base_logits[:, k] + bias
-            out_ids[:, k + 1] = logits_k.argmax(
-                dim=-1
-            )  # greedy (temp handled upstream)
+            # Greedy (temperature handled upstream).
+            out_ids[:, k + 1], m_embed = last.markov_head.sample_next(
+                out_ids[:, k], base_logits[:, k]
+            )
             markov_embeds.append(m_embed)
         confidence = last.confidence_head(
             hc_hidden, torch.stack(markov_embeds, dim=1)
