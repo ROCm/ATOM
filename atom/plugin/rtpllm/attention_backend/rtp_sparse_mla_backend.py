@@ -1570,6 +1570,7 @@ def _run_rtp_sparse_attn_indexer_topk_only(
     weights_scale: float,
     is_neox_style: bool,
     use_qk_rope_cache_fusion: bool,
+    stable_topk: bool,
     context: Any,
     attn_metadata: Any,
 ) -> torch.Tensor:
@@ -1709,6 +1710,7 @@ def _run_rtp_sparse_attn_indexer_topk_only(
             numRows=logits.shape[0],
             stride0=logits.stride(0),
             stride1=logits.stride(1),
+            stable=stable_topk,
         )
         return weights
 
@@ -1749,6 +1751,7 @@ def _run_rtp_sparse_attn_indexer_topk_only(
         logits.shape[0],
         logits.stride(0),
         logits.stride(1),
+        stable=stable_topk,
     )
     return weights
 
@@ -1776,6 +1779,7 @@ def rtp_sparse_attn_indexer(
     weights_scale: float,
     is_neox_style: bool,
     use_qk_rope_cache_fusion: bool,
+    stable_topk: bool,
 ) -> torch.Tensor:
     try:
         from atom.utils.forward_context import get_forward_context
@@ -1847,6 +1851,7 @@ def rtp_sparse_attn_indexer(
             weights_scale,
             is_neox_style,
             use_qk_rope_cache_fusion,
+            stable_topk,
             context,
             attn_metadata,
         )
@@ -1876,6 +1881,7 @@ def rtp_sparse_attn_indexer(
         weights_scale,
         is_neox_style,
         use_qk_rope_cache_fusion,
+        stable_topk,
     )
 
 
@@ -1902,6 +1908,7 @@ def rtp_sparse_attn_indexer_fake(
     weights_scale: float,
     is_neox_style: bool,
     use_qk_rope_cache_fusion: bool,
+    stable_topk: bool,
 ) -> torch.Tensor:
     from atom.models.deepseek_v2 import sparse_attn_indexer_fake
 
@@ -1928,6 +1935,7 @@ def rtp_sparse_attn_indexer_fake(
         weights_scale,
         is_neox_style,
         use_qk_rope_cache_fusion,
+        stable_topk,
     )
 
 
