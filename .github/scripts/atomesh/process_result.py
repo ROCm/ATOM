@@ -430,6 +430,12 @@ def perf_point(
         "num_decode_gpu": resources["num_decode_gpu"],
         "total_gpu": total_gpu,
         "interactivity": round_or_none(interactivity),
+        # Prefill prefix-cache token hit rate as a 0-1 fraction. Absent unless the
+        # case enables prefix caching and the run was long enough for the engine
+        # to print a "[Cache Stats]" line.
+        "cache_hit_rate": round_or_none(payload.get("cache_hit_rate")),
+        "cache_hit_tokens": int_value(payload.get("cache_hit_tokens")),
+        "cache_total_tokens": int_value(payload.get("cache_total_tokens")),
         "tput_per_gpu": round_or_none(
             total_tput / total_gpu if total_tput and total_gpu else None
         ),
@@ -625,12 +631,12 @@ def write_summary(rows: list[dict[str, Any]], summary_path: Path) -> None:
     lines = [
         "### ATOMesh Model Performance Benchmark Summary",
         "",
-        "| Hardware | Model | Topology | ISL/OSL | Concurrency | Interactivity | Total tok/s | Input tok/s | Output tok/s | Total tok/s/GPU | Input tok/s/GPU | Output tok/s/GPU | TTFT ms | TPOT ms | E2E ms | Accuracy Task | Accuracy |",
-        "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: |",
+        "| Hardware | Model | Topology | ISL/OSL | Concurrency | Interactivity | Total tok/s | Input tok/s | Output tok/s | Total tok/s/GPU | Input tok/s/GPU | Output tok/s/GPU | TTFT ms | TPOT ms | E2E ms | Cache Hit | Accuracy Task | Accuracy |",
+        "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: |",
     ]
     for row in rows:
         lines.append(
-            "| {hardware} | {model} | {topology} | {isl}/{osl} | {conc} | {interactivity} | {total} | {input_} | {output} | {total_per_gpu} | {input_per_gpu} | {output_per_gpu} | {ttft} | {tpot} | {e2e} | {accuracy_task} | {accuracy} |".format(
+            "| {hardware} | {model} | {topology} | {isl}/{osl} | {conc} | {interactivity} | {total} | {input_} | {output} | {total_per_gpu} | {input_per_gpu} | {output_per_gpu} | {ttft} | {tpot} | {e2e} | {cache_hit} | {accuracy_task} | {accuracy} |".format(
                 hardware=row.get("hardware", "--"),
                 model=row.get("benchmark_model_name", "--"),
                 topology=row.get("display_topology") or row.get("topology", "--"),
@@ -647,6 +653,7 @@ def write_summary(rows: list[dict[str, Any]], summary_path: Path) -> None:
                 ttft=fmt(row.get("mean_ttft_ms")),
                 tpot=fmt(row.get("mean_tpot_ms")),
                 e2e=fmt(row.get("mean_e2el_ms")),
+                cache_hit=fmt_pct(row.get("cache_hit_rate")),
                 accuracy_task=row.get("accuracy_task") or "--",
                 accuracy=fmt(row.get("accuracy_score"), digits=4),
             )
@@ -657,6 +664,12 @@ def write_summary(rows: list[dict[str, Any]], summary_path: Path) -> None:
 def fmt(value: Any, digits: int = 2) -> str:
     parsed = number(value)
     return "--" if parsed is None else f"{parsed:.{digits}f}"
+
+
+def fmt_pct(value: Any, digits: int = 2) -> str:
+    """Render a 0-1 fraction as a percentage; "--" when the metric is missing."""
+    parsed = number(value)
+    return "--" if parsed is None else f"{parsed * 100:.{digits}f}%"
 
 
 def main() -> None:
