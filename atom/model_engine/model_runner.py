@@ -618,19 +618,6 @@ class ModelRunner:
         self.use_mla = self.is_deepseek_mla()
         self.use_gdn = self.is_qwen_next()
         self.use_v4 = self.is_deepseek_v4()
-        try:
-            self.state_ckpt_extra_entries = (
-                envs.STATE_CKPT_EXTRA_ENTRIES if self.use_v4 else 0
-            )
-            if self.state_ckpt_extra_entries < 0:
-                raise ValueError
-        except ValueError:
-            self.state_ckpt_extra_entries = 0
-            logger.warning(
-                "%s: invalid STATE_CKPT_EXTRA_ENTRIES=%r; using 0.",
-                self.label,
-                os.getenv("STATE_CKPT_EXTRA_ENTRIES"),
-            )
         self.use_kimi_mla = self.is_kimi_linear()
 
         rope_parameters = getattr(self.hf_text_config, "rope_parameters", None) or {}

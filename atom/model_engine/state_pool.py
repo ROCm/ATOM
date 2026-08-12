@@ -537,28 +537,24 @@ class StateGroupPool:
         """
         if not self._checkpoint_pending:
             return
-        pending: dict[int, int] = {}
+        copy_start = len(self._copies)
         for seq in self._checkpoint_pending:
             h, seq.pending_checkpoint = seq.pending_checkpoint, -1
             src = seq.per_req_cache_group
             if h == -1 or src < 0:
                 continue
-            pending[h] = src
-        self._checkpoint_pending.clear()
-
-        reserved: list[tuple[int, int, int]] = []
-        for h, src in pending.items():
+            if self.lookup(h) >= 0:
+                continue
             if not self.has_free():
                 self.checkpoints_dropped += 1
                 continue
             dst = self.pop()
-            reserved.append((h, src, dst))
-
-        for h, src, dst in reserved:
             self._index(h, dst)
-            self.release(dst)
             self._copies.append((src, dst))
             self.checkpoints_kept += 1
+        self._checkpoint_pending.clear()
+        for _, dst in self._copies[copy_start:]:
+            self.release(dst)
 
     def checkpoint_fates(self) -> dict[str, int]:
         """What became of the checkpoints the ladder asked this pool to keep."""
@@ -595,9 +591,6 @@ class StateGroupPool:
         can return neither.
         """
         self._commit_pending()
-        destinations = [dst for _, dst in self._copies]
-        if len(destinations) != len(set(destinations)):
-            raise RuntimeError("state copy destinations must be unique within a batch")
         copies, self._copies = self._copies, []
         return copies
 

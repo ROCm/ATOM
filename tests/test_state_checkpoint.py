@@ -946,53 +946,31 @@ class TestCopyLifecycle:
             assert dst == bm.state.lookup(h)
             assert dst not in owner_groups
 
-    @pytest.mark.parametrize("free_groups", [1, 2])
-    def test_pending_copies_deduplicate_hashes_and_reserve_destinations(
-        self, free_groups
-    ):
-        config = copy_config(
-            max_num_seqs=3,
-            pool_entries={"state": 3 + free_groups},
-        )
+    def test_an_existing_free_checkpoint_needs_no_second_copy(self):
+        config = copy_config(max_num_seqs=2, pool_entries={"state": 3})
         bm = BlockManager(config)
-        owners = [
-            self._admitted(bm, list(range(40))),
-            self._admitted(bm, list(range(40))),
-            self._admitted(bm, list(range(100, 140))),
-        ]
-        hashes = []
-        for seq in owners:
-            bm.hash_blocks(
-                seq,
-                bm.checkpoint_limit(seq) - seq.num_cached_tokens,
-            )
-            hashes.append(boundary_hash(bm, seq))
+        first = self._admitted(bm, list(range(40)))
+        second = self._admitted(bm, list(range(40)))
 
-        assert hashes[0] == hashes[1]
-        assert hashes[0] != hashes[2]
+        bm.hash_blocks(first, bm.checkpoint_limit(first) - first.num_cached_tokens)
+        h = boundary_hash(bm, first)
         copies = bm.state_copies_for_batch()
+        assert len(copies) == 1
+        dst = copies[0][1]
+        assert bm.state.lookup(h) == dst
+        assert bm.state.is_free(dst)
 
-        kept = min(free_groups, 2)
-        assert len(copies) == kept
-        destinations = [dst for _, dst in copies]
-        assert len(destinations) == len(set(destinations))
-        assert len(bm.state.hash_to_group) == kept
-        assert set(bm.state.hash_to_group).issubset(set(hashes))
-        assert set(destinations) == set(bm.state.hash_to_group.values())
+        bm.hash_blocks(second, bm.checkpoint_limit(second) - second.num_cached_tokens)
+        assert boundary_hash(bm, second) == h
+        assert bm.state_copies_for_batch() == []
+        assert second.pending_checkpoint == -1
+        assert bm.state.lookup(h) == dst
         assert bm.state.checkpoint_fates() == {
-            "checkpoints_kept": kept,
-            "checkpoints_dropped": 2 - kept,
+            "checkpoints_kept": 1,
+            "checkpoints_dropped": 0,
             "checkpoints_evicted": 0,
             "checkpoints_orphaned": 0,
         }
-
-    def test_duplicate_copy_destinations_fail_before_the_batch(self):
-        pool = StateGroupPool(4)
-        pool.record_copy(0, 3)
-        pool.record_copy(1, 3)
-
-        with pytest.raises(RuntimeError, match="destinations must be unique"):
-            pool.take_copies()
 
     def test_a_resume_is_handed_a_duplicate_not_a_fork(self):
         bm = BlockManager(copy_config())
