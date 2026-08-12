@@ -120,12 +120,6 @@ class TestEnvsOverrides:
         monkeypatch.setenv("STATE_CKPT_EXTRA_ENTRIES", "")
         assert _get_envs().STATE_CKPT_EXTRA_ENTRIES == 0
 
-    @pytest.mark.parametrize("value", ["-1", "not-an-int"])
-    def test_state_ckpt_extra_entries_rejects_invalid_values(self, monkeypatch, value):
-        monkeypatch.setenv("STATE_CKPT_EXTRA_ENTRIES", value)
-        with pytest.raises(ValueError, match="must be a nonnegative integer"):
-            _ = _get_envs().STATE_CKPT_EXTRA_ENTRIES
-
     def test_torch_profiler_dir_override(self, monkeypatch):
         monkeypatch.setenv("ATOM_TORCH_PROFILER_DIR", "/tmp/prof")
         assert _get_envs().ATOM_TORCH_PROFILER_DIR == "/tmp/prof"

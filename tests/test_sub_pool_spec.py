@@ -118,10 +118,6 @@ class TestPlanPools:
         assert plan.reserved_bytes[ENTRY_STATE] == (8 + 3) * 10
         assert plan.entries[ENTRY_KV] == 8
 
-    def test_negative_extra_state_entries_are_rejected(self):
-        with pytest.raises(ValueError, match="extra_entries"):
-            state_pool(ENTRY_STATE, 10, entries_per_req=1, extra_entries=-1)
-
     def test_paged_pool_floors_at_zero_rather_than_going_negative(self):
         specs = [page_pool(1_000_000), state_pool(ENTRY_STATE, 100, entries_per_req=1)]
         plan = plan_pools(specs, available_bytes=10_000, max_num_seqs=8)

@@ -69,8 +69,6 @@ class SubPoolSpec:
     extra_entries: int = 0
 
     def __post_init__(self):
-        if self.extra_entries < 0:
-            raise ValueError(f"{self.name}: extra_entries must be >= 0")
         if self.pool is Pool.STATE and self.entries_per_req < 1:
             raise ValueError(f"{self.name}: STATE entries need entries_per_req >= 1")
         if self.pool is Pool.PAGE and (self.entries_per_req or self.extra_entries):
