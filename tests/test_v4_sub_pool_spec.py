@@ -89,29 +89,30 @@ def test_checkpoint_extra_entries_are_wired_only_to_the_v4_state_slot():
     )
     assert _runtime_field_refs(init, ENV_FIELD)
     assert _runtime_field_refs(init, FIELD)
-    clamps = [
-        call
-        for call in ast.walk(init)
-        if isinstance(call, ast.Call)
-        and isinstance(call.func, ast.Name)
-        and call.func.id == "max"
-        and _runtime_field_refs(call, ENV_FIELD)
-    ]
-    assert len(clamps) == 1
-    assert ast.literal_eval(clamps[0].args[0]) == 0
     handlers = [
         handler
         for handler in ast.walk(init)
         if isinstance(handler, ast.ExceptHandler)
         and isinstance(handler.type, ast.Name)
         and handler.type.id == "ValueError"
-        and _runtime_field_refs(handler, FIELD)
     ]
     assert len(handlers) == 1
-    assert any(
-        isinstance(child, ast.Constant) and child.value == 0
-        for child in ast.walk(handlers[0])
-    )
+    warnings = [
+        call
+        for call in ast.walk(init)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "logger"
+        and call.func.attr == "warning"
+        and any(
+            isinstance(child, ast.Constant)
+            and isinstance(child.value, str)
+            and ENV_FIELD in child.value
+            for child in ast.walk(call)
+        )
+    ]
+    assert len(warnings) == 1
 
 
 def test_checkpoint_extra_entries_has_no_config_or_cli_surface():
