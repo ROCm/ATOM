@@ -265,6 +265,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Gate/Up interleave mode for MoE weight preshuffle and kernel gate_mode.
     # "0" (default) = SEPARATED layout; "1" = INTERLEAVE layout.
     "ATOM_MOE_GU_ITLV": lambda: os.getenv("ATOM_MOE_GU_ITLV", "0") == "1",
+    # --- Kernel-overlap kill switches (perf A/B and correctness bisect) ---
+    # "1" (default) = overlap attention-metadata H2D on the side prep_stream
+    # while the CPU builds compress plans. "0" = issue the copies on the current
+    # stream, fully serialized. Applies to the DeepSeek-V4 and MLA builders.
+    # Intra-GPU disagg already forces the serial path regardless of this flag.
+    "ATOM_ATTN_PREP_STREAM": lambda: os.getenv("ATOM_ATTN_PREP_STREAM", "1") == "1",
+    # "1" (default) = run the DeepSeek-V4 Main/Indexer Compressors on side
+    # streams concurrently with the main Q/KV chain. "0" = run them inline on
+    # the main stream. Only ever active inside a HIP graph and with TBO off.
+    "ATOM_V4_ASYNC_COMPRESS": lambda: os.getenv("ATOM_V4_ASYNC_COMPRESS", "1") == "1",
     # --- MTP (relaxed mtp for quantized mtp) ---
     "ATOM_ENABLE_RELAXED_MTP": lambda: (
         os.getenv("ATOM_ENABLE_RELAXED_MTP", "0").lower() == "1"

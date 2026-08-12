@@ -69,7 +69,7 @@ from atom.model_ops.v4_kernels import (
     write_v4_paged_decode_indices,
     write_v4_paged_prefill_indices,
 )
-from atom.utils import CpuGpuBuffer
+from atom.utils import CpuGpuBuffer, envs
 from atom.utils.forward_context import (
     AttentionMetaData,
     AttnState,
@@ -1714,9 +1714,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # ---- fire H2D on prep_stream ----
         # NB: this runs inside attn_metadata_builder.build(), BEFORE
         # set_forward_context() — can't read main_stream from the context yet.
-        prep_stream = self.prep_stream
+        # ATOM_ATTN_PREP_STREAM=0 issues the copies on the current stream
+        # instead, fully serializing them against the CPU plan build below.
+        overlap_prep = envs.ATOM_ATTN_PREP_STREAM
         current_stream = torch.cuda.current_stream()
-        prep_stream.wait_stream(current_stream)
+        prep_stream = self.prep_stream if overlap_prep else current_stream
+        if overlap_prep:
+            prep_stream.wait_stream(current_stream)
         with torch.cuda.stream(prep_stream):
             positions = var["positions"].copy_to_gpu(sum_scheduled_tokens_padded)
             cu_seqlens_q_gpu = var["cu_seqlens_q"].copy_to_gpu(bs + 1)
@@ -1744,7 +1748,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
 
         # ---- sync, build attn_metadata, per-fwd meta ----
-        current_stream.wait_stream(prep_stream)
+        if overlap_prep:
+            current_stream.wait_stream(prep_stream)
 
         attn_metadata = AttentionMetaData_DSV4(
             cu_seqlens_q=cu_seqlens_q_gpu,

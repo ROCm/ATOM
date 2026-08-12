@@ -5,7 +5,7 @@ Here's a sweep script matching the result-file convention already in your worksp
 # Sweep ATOM serving benchmarks across concurrency levels.
 set -uo pipefail   # deliberately not -e: one failed point shouldn't kill the sweep
 
-MODEL="${MODEL:-amd/DeepSeek-R1-0528-MXFP4-Preview}"
+MODEL="${MODEL:-deepseek-ai/DeepSeek-V4-Pro}"
 PORT="${PORT:-8000}"
 ISL="${ISL:-8192}"
 OSL="${OSL:-1024}"
@@ -17,7 +17,7 @@ SETTLE_SEC="${SETTLE_SEC:-20}"
 # Override by passing values as args: ./sweep.sh 1 4 16 64
 CONCURRENCIES=("${@:-}")
 [ -z "${CONCURRENCIES[0]:-}" ] && CONCURRENCIES=(4 8 16 32 64 128 256 512)
-INPUT_LENS=(1024 8192)
+INPUT_LENS=(8192)
 
 MODEL_SHORT="$(basename "$MODEL")"
 LOG_DIR="${RESULT_DIR%/}/sweep-logs"

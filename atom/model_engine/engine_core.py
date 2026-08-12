@@ -620,6 +620,19 @@ class DPEngineCoreProc(EngineCore):
 # ---------------------------------------------------------------------------
 
 
+# Scheduler-side dimensions that get_num_blocks() derives in the process that
+# owns the KV memory. Under intra-GPU disagg that is prefill only, so these ride
+# the kvcache bootstrap bundle to decode, which applies them before building its
+# BlockManager. Add here whenever get_num_blocks() starts feeding another value
+# into config for the scheduler.
+_SCHED_DIM_KEYS = (
+    "per_req_cache_equiv_blocks",
+    "num_per_req_cache_groups",
+    "num_swa_blocks",
+    "swa_window_size",
+)
+
+
 class PrefillEngineCore(EngineCore):
     """Disaggregated prefill instance.
 
@@ -702,6 +715,16 @@ class PrefillEngineCore(EngineCore):
             {
                 "kvcache_args": kvcache_args,
                 "num_kvcache_blocks": self._config.num_kvcache_blocks,
+                # Scheduler-side dims that get_num_blocks() derives HERE, in the
+                # prefill process, from its memory profile. Decode's
+                # get_num_blocks() short-circuits (it owns no KV memory), so its
+                # config leaves all of these at 0 and its BlockManager comes up
+                # crippled: num_per_req_cache_groups=0 makes can_allocate()
+                # return -1 for every sequence of a stateful model (DeepSeek-V4
+                # → "Cannot allocate prefill"), and num_swa_blocks=0 silently
+                # disables the SWA pool. Both processes must agree on these —
+                # decode allocates SWA block IDs that prefill writes into.
+                **{k: getattr(self._config, k, 0) for k in _SCHED_DIM_KEYS},
             }
         )
         logger.info(
@@ -922,6 +945,16 @@ class DecodeEngineCore(EngineCore):
             logger.info(
                 f"DecodeEngineCore: cudagraph capture{bs} cost: {cap_cost:.2f}s"
             )
+
+        # Apply prefill's scheduler dims BEFORE building DecodeScheduler — its
+        # BlockManager reads them at construction (per-req cache group free-list
+        # and SWA pool size). Without this they stay 0 and every allocate fails.
+        for _k in _SCHED_DIM_KEYS:
+            setattr(config, _k, bundle.get(_k, 0))
+        logger.info(
+            "DecodeEngineCore: scheduler dims from prefill: "
+            + ", ".join(f"{k}={bundle.get(k, 0)}" for k in _SCHED_DIM_KEYS)
+        )
 
         # --- Create DecodeScheduler now that num_kvcache_blocks is set ---
         self.scheduler = DecodeScheduler(

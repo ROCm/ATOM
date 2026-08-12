@@ -1633,10 +1633,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # serialize against it, adding per-step decode latency. So in disagg mode
         # do the copies synchronously on the current stream; otherwise keep the
         # async overlap.
+        # ATOM_ATTN_PREP_STREAM=0 takes the same serial path disagg uses, so the
+        # overlap can be switched off for perf A/B without touching disagg.
         disagg = self.model_runner.config.enable_rapidserve
+        serial_prep = disagg or not envs.ATOM_ATTN_PREP_STREAM
         ctx = {}
         ctx["kv_indptr"] = var["kv_indptr"].copy_to_gpu(bs + 1)
-        if disagg:
+        if serial_prep:
             ctx_rest = {el: var[el].copy_to_gpu(num) for el, num in vars_remaining}
             ctx.update(ctx_rest)
             ctx["kv_indices"] = var["kv_indices"].gpu

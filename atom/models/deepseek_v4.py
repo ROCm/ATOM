@@ -2431,7 +2431,11 @@ class DeepseekV4Attention(nn.Module):
         self.alt_stream = alt_stream
         self.indexer_stream = indexer_stream
         self._use_async_compress = (
-            self.alt_stream is not None and self.compressor is not None
+            self.alt_stream is not None
+            and self.compressor is not None
+            # ATOM_V4_ASYNC_COMPRESS=0 forces the Compressors inline on the main
+            # stream (see maybe_compressors_async).
+            and envs.ATOM_V4_ASYNC_COMPRESS
         )
 
         self.layer_name = prefix
