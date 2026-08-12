@@ -661,7 +661,6 @@ jobs:
 
             echo "=== GPUDirect RDMA prefill GPU ${prefill_gpu_id} (${prefill_rdma_device}) -> decode GPU ${decode_gpu_id} (${decode_rdma_device}) ==="
             HIP_VISIBLE_DEVICES="${decode_gpu_id}" \
-            ROCR_VISIBLE_DEVICES="${decode_gpu_id}" \
             "${validator_bin}" \
               --mode=target \
               --protocol=rdma \
@@ -679,7 +678,6 @@ jobs:
 
             set +e
             HIP_VISIBLE_DEVICES="${prefill_gpu_id}" \
-            ROCR_VISIBLE_DEVICES="${prefill_gpu_id}" \
             timeout 120 "${validator_bin}" \
               --mode=initiator \
               --protocol=rdma \
@@ -801,7 +799,6 @@ jobs:
               if [[ "${SMOKE_RANK}" -eq 1 ]]; then
                 echo "=== Cross-node decode target: ${local_ip}, GPU ${decode_gpu_id} (${decode_rdma_device}) ==="
                 HIP_VISIBLE_DEVICES="${decode_gpu_id}" \
-                ROCR_VISIBLE_DEVICES="${decode_gpu_id}" \
                 "${validator_bin}" \
                   --mode=target \
                   --protocol=rdma \
@@ -837,7 +834,6 @@ jobs:
                 echo "=== Cross-node prefill initiator: ${local_ip} GPU ${prefill_gpu_id} (${prefill_rdma_device}) -> ${target_name} decode GPU ${decode_gpu_id} ==="
                 set +e
                 HIP_VISIBLE_DEVICES="${prefill_gpu_id}" \
-                ROCR_VISIBLE_DEVICES="${prefill_gpu_id}" \
                 timeout 120 "${validator_bin}" \
                   --mode=initiator \
                   --protocol=rdma \
