@@ -780,6 +780,15 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         """
         return StateTransfer.copy()
 
+    def state_entry_views(self, group: int) -> list[torch.Tensor]:
+        """One contiguous slice per plane — a V4 group is one slot per plane.
+
+        A slot holds the compressor state and then every layer's windows
+        contiguously (see `copy_state_entries`), so a plane's whole
+        contribution is one range and no per-layer split is needed.
+        """
+        return self._slot_views()[group]
+
     def copy_state_entries(self, pairs: list[tuple[int, int]]) -> None:
         """Duplicate a request's whole per-request state: compressor + windows.
 

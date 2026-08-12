@@ -167,6 +167,25 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         """
         return StateTransfer.none()
 
+    def state_entry_views(self, group: int) -> list["torch.Tensor"]:
+        """Contiguous views covering the whole of `group`'s per-request state.
+
+        The byte-level counterpart of `copy_state_entries`: that method moves a
+        group between two indices, this one names the same bytes so something
+        outside the pool — the LMCache offload tier — can read or write them.
+        `copy_state_entries` is expressed in terms of this where the layout
+        allows, so the two cannot drift apart.
+
+        Every returned tensor must be contiguous. The Triton staging packer
+        builds its segment table from `seg.is_contiguous()` and refuses a
+        strided view, so a class whose group is strided (GDN, slot on axis 1)
+        returns one view per layer rather than one strided block.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} owns per-request state but does not "
+            "implement state_entry_views"
+        )
+
     def copy_state_entries(self, pairs: list[tuple[int, int]]) -> None:
         """Copy each `(src, dst)` group's whole per-request state, src → dst.
 
