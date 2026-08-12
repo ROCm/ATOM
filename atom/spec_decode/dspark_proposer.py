@@ -67,6 +67,64 @@ class DSparkProposer(Drafter):
 
         self._blk_dtype_q = None
 
+        # Persistent (ps=1) MLA-decode metadata for the block pass.
+        self._blk_ps_bufs = None
+
+    def _init_block_persistent_buffers(self, dtype_q, dtype_kv):
+        """Allocate the block-pass persistent MLA metadata buffers once.
+
+        Mirrors MLAAttentionBackend's constructor (aiter_mla.py:150-197): the
+        buffer sizes come from get_mla_metadata_info_v1 for this draft's head
+        count / dtypes / block width, and get_mla_metadata_v1 fills them in
+        place each step."""
+        if self._blk_ps_bufs is not None:
+            return self._blk_ps_bufs
+        from atom.model_ops.attentions.aiter_mla import (
+            _MLA_META_SUPPORTS_MAX_SPLIT,
+            get_mla_metadata_info_v1,
+        )
+
+        max_bs = self.config.max_num_seqs
+        # padded_num_heads lives on the draft MLA module (>=_MLA_MIN_HEADS==16),
+        # matching the gqa ratio the asm kernel dispatches on. The ModelRunner
+        # itself has no such attribute.
+        self._blk_padded_heads = self.model.layers[
+            0
+        ].self_attn.mla_attn.impl.padded_num_heads
+        # max_split_per_batch only exists in newer aiter builds; feature-detect
+        # it (as aiter_mla does) so old builds don't hit a TypeError. Cache the
+        # kwargs so the sizing (info) and fill (get_mla_metadata_v1) calls agree.
+        self._blk_split_kwargs = (
+            {"max_split_per_batch": 16} if _MLA_META_SUPPORTS_MAX_SPLIT else {}
+        )
+        (
+            (wmd_sz, wmd_ty),
+            (wip_sz, wip_ty),
+            (wis_sz, wis_ty),
+            (rip_sz, rip_ty),
+            (rfm_sz, rfm_ty),
+            (rpm_sz, rpm_ty),
+        ) = get_mla_metadata_info_v1(
+            max_bs,
+            self.mtp_k,  # max_seqlen_qo = block width T
+            self._blk_padded_heads,
+            dtype_q,
+            dtype_kv,
+            is_sparse=False,
+            fast_mode=True,
+            **self._blk_split_kwargs,
+        )
+        dev = self.device
+        self._blk_ps_bufs = {
+            "work_meta_data": torch.empty(wmd_sz, dtype=wmd_ty, device=dev),
+            "work_indptr": torch.empty(wip_sz, dtype=wip_ty, device=dev),
+            "work_info_set": torch.empty(wis_sz, dtype=wis_ty, device=dev),
+            "reduce_indptr": torch.empty(rip_sz, dtype=rip_ty, device=dev),
+            "reduce_final_map": torch.empty(rfm_sz, dtype=rfm_ty, device=dev),
+            "reduce_partial_map": torch.empty(rpm_sz, dtype=rpm_ty, device=dev),
+        }
+        return self._blk_ps_bufs
+
     @property
     def _with_draft(self) -> bool:
         """DSpark given a separate --draft-model, vs the V4 draft that ships
@@ -228,6 +286,13 @@ class DSparkProposer(Drafter):
         Returning ``None`` skips the capture for this call (the base hook
         treats it as "nothing to record").
         """
+        # A target that bookkeeps its residual stream in a non-obvious way can
+        # own the reconstruction itself; preferred, since it then changes in
+        # lockstep with that layer's forward(). Kimi-K3 does this.
+        own = getattr(block, "aux_hidden_state", None)
+        if own is not None:
+            return own(output)
+
         # DeepSeek-V4: an HCState carrying the multi-hidden-connection residual
         # [N, hc, dim]; the aux tensor is its mean over the hc axis.
         if hasattr(output, "residual"):
@@ -241,17 +306,20 @@ class DSparkProposer(Drafter):
                 residual = block.hc_post(x_prev, residual, post, comb)
             return residual.mean(dim=1)
 
-        # Kimi-K3: (prefix_sum, pending_add, block_residual). ATOM's port defers
-        # the FFN residual add across the layer boundary so the next layer can
-        # fuse it into apply_attn_res; the HF reference adds it before returning
-        # (`prefix_sum = prefix_sum + hidden_states`), and THAT sum is what
-        # transformers records and what the draft was trained on. So add it back.
-        # `pending_add` is None on the layers that already folded it in.
+        # A tuple means the layer carries residual bookkeeping we cannot
+        # interpret from here -- which component is the residual stream, and
+        # which are deferred addends, is that layer's private convention (K3
+        # returns four tensors, three of which must be summed). Guessing would
+        # feed the draft a silently wrong aux tensor, so require the target to
+        # say. Fail loudly instead.
         if isinstance(output, tuple):
-            carrier, pending = output[0], output[1]
-            if carrier is None:
-                return None
-            return carrier if pending is None else carrier + pending
+            raise TypeError(
+                f"{type(block).__name__}.forward returns a "
+                f"{len(output)}-tuple but the layer defines no "
+                "`aux_hidden_state(output)`. A drafter cannot reconstruct the "
+                "post-layer hidden state from an unknown tuple convention -- "
+                "add that method to the layer (see KimiDecoderLayer)."
+            )
 
         # Plain residual stream (no special bookkeeping).
         return output
@@ -262,18 +330,23 @@ class DSparkProposer(Drafter):
         hidden_states: torch.Tensor,
         next_token_ids: list[int] | None,
     ) -> None:
-        """Populate the rolling target-KV window for this forward.
+        """Absorb the target context into the draft's KV, for EVERY DSpark flavor.
+
+        Called once by the runner right after each target forward, while the
+        forward context still holds the TARGET's slot mapping / cu_seqlens. Each
+        backbone overrides ``model.write_context_kv`` for its own storage:
+          * V4 (inline draft): scatter into a private rolling target-KV window.
+          * Kimi-K3 (standalone draft): scatter into the paged sibling latent
+            pool at the verified tokens' slots.
+        Both take the same ``(main_hidden_all, positions)`` contract, so this
+        hook stays flavor-agnostic -- the per-request geometry (window span vs
+        slot mapping) lives inside the model, read off the live forward context.
 
         Every scheduled row is written, prefill and decode alike: the read side
         gathers by absolute position without checking what was written, so
         anything left unwritten shows the slot's previous occupant. Rejected
         rows are harmless -- they land on future positions, unread until the
         step that accepts them rewrites them.
-
-        `write_per_batch` must cover window + mtp_k, not just window: the anchor
-        sits up to mtp_k rows before the span end. Do NOT clamp it by
-        max_seqlen_q the way the V4 target clamps its own swa_write -- that was
-        tried and measured worse (GSM8K 0.936/0.941 vs 0.942-0.950).
 
         `next_token_ids` is unused: DSpark drafts from aux hidden states.
         """
@@ -284,14 +357,8 @@ class DSparkProposer(Drafter):
         forward_context = get_forward_context()
         bs = forward_context.context.batch_size
         main_hidden_all = torch.cat(aux_hidden_states, dim=-1)
-        write_per_batch = int(self.model.window_size) + int(self.mtp_k)
         with record_function(f"dspark_ctx_kv[bs={bs} tok={main_hidden_all.shape[0]}]"):
-            self.model.precompute_context_kv(
-                main_hidden_all,
-                positions,
-                forward_context.attn_metadata.cu_seqlens_q[: bs + 1],
-                write_per_batch=write_per_batch,
-            )
+            self.model.write_context_kv(main_hidden_all, positions)
 
     def propose(
         self,
@@ -332,8 +399,10 @@ class DSparkProposer(Drafter):
                 "DSpark requires target auxiliary hidden states from "
                 "dspark_target_layer_ids; none were captured."
             )
-        # Concatenate the configured target layers -> [num_tokens, dim*L].
-        main_hidden_all = torch.cat(aux_hidden_states, dim=-1)
+        # aux is validated here (drafting requires it) but the target context is
+        # already in the draft's KV: `precompute_context_kv` absorbed it right
+        # after the target forward, uniformly for every flavor. propose() only
+        # needs the anchor to seed the block.
 
         # Anchor token x0 per request = the just-verified target token, located
         # at last_token_indices in the flat batch.
@@ -345,8 +414,6 @@ class DSparkProposer(Drafter):
                 forward_context,
                 attn_metadata,
                 bs,
-                main_hidden_all,
-                target_positions,
                 anchor_ids,
                 anchor_positions,
             )
@@ -395,22 +462,18 @@ class DSparkProposer(Drafter):
         forward_context,
         attn_metadata,
         bs: int,
-        main_hidden_all: torch.Tensor,  # [num_tokens, hidden * num_aux]
-        target_positions: torch.Tensor,  # [num_tokens]
         anchor_ids: torch.Tensor,  # [bs]
         anchor_positions: torch.Tensor,  # [bs]
     ) -> torch.Tensor:
-        """Kimi-K3 DSpark: paged dual-source context + one non-causal block pass.
+        """Kimi-K3 DSpark: one non-causal block pass over the paged latent cache.
 
-        Structurally the same two steps as the V4 path -- populate the draft's
-        view of the target context, then draft the block -- but the context
-        lives in the shared paged latent cache rather than a private rolling
-        window, so both steps are addressed by slot mapping instead of by
-        position-within-a-window.
+        The target context is already in the draft's latent cache (absorbed by
+        `precompute_context_kv`); this only builds the draft block's own metadata
+        (addressed by slot mapping) and runs the block. Same shape as the V4
+        block pass -- T queries per request against a paged KV cache.
         """
         T = self.mtp_k
         block_size = self.runner.block_size
-        num_tokens = main_hidden_all.shape[0]
         # warmup_model() runs at the end of ModelRunner.__init__, BEFORE
         # allocate_kv_cache(), so on a dummy run there is no paged state: the
         # draft's kv_cache is still the empty init tensor and attn_metadata's
@@ -420,16 +483,12 @@ class DSparkProposer(Drafter):
         # leave its activations out of the KV budget.
         is_dummy = forward_context.context.is_dummy_run
 
-        # ---- 1. Context rows -------------------------------------------------
-        if not is_dummy:
-            with record_function(f"dspark_ctx_kv[bs={bs} tok={num_tokens}]"):
-                self.model.write_context_kv(
-                    main_hidden_all,
-                    target_positions,
-                    attn_metadata.slot_mapping[:num_tokens],
-                )
+        # The DSpark draft block is bidirectional: every one of the T draft
+        # positions attends the whole block, so the MLA decode runs non-causal.
+        # The target rebuilds its own metadata (causal defaults True), so this
+        # never leaks back.
+        attn_metadata.causal = False
 
-        # ---- 2. Block metadata ----------------------------------------------
         block_positions = self._blk_positions[:bs]  # [bs, T] view, stable
         torch.add(
             anchor_positions.view(bs, 1),
@@ -474,12 +533,40 @@ class DSparkProposer(Drafter):
             attn_metadata.kv_indices = self._blk_kv_indices
             attn_metadata.kv_last_page_lens = self._blk_last_page_lens[:bs]
 
-            attn_metadata.work_meta_data = None
-            attn_metadata.work_indptr = None
-            attn_metadata.work_info_set = None
-            attn_metadata.reduce_indptr = None
-            attn_metadata.reduce_final_map = None
-            attn_metadata.reduce_partial_map = None
+            # Build persistent (ps=1) MLA-decode metadata
+            from atom.model_ops.attentions.aiter_mla import get_mla_metadata_v1
+
+            dtype_q, _ = self._resolve_dtype_q(forward_context)
+            dtype_kv = dtype_q
+            ps = self._init_block_persistent_buffers(dtype_q, dtype_kv)
+            get_mla_metadata_v1(
+                attn_metadata.cu_seqlens_q,  # seqlens_qo_indptr
+                kv_indptr,  # seqlens_kv_indptr
+                attn_metadata.kv_last_page_lens,  # kv_last_page_lens
+                self._blk_padded_heads,
+                1,  # nhead_kv
+                False,  # is_causal (non-causal block)
+                ps["work_meta_data"],
+                ps["work_info_set"],
+                ps["work_indptr"],
+                ps["reduce_indptr"],
+                ps["reduce_final_map"],
+                ps["reduce_partial_map"],
+                page_size=block_size,
+                kv_granularity=max(block_size, 16),
+                max_seqlen_qo=T,
+                uni_seqlen_qo=T,
+                fast_mode=True,
+                dtype_q=dtype_q,
+                dtype_kv=dtype_kv,
+                **self._blk_split_kwargs,
+            )
+            attn_metadata.work_meta_data = ps["work_meta_data"]
+            attn_metadata.work_indptr = ps["work_indptr"]
+            attn_metadata.work_info_set = ps["work_info_set"]
+            attn_metadata.reduce_indptr = ps["reduce_indptr"]
+            attn_metadata.reduce_final_map = ps["reduce_final_map"]
+            attn_metadata.reduce_partial_map = ps["reduce_partial_map"]
 
         self._refresh_dp_metadata(forward_context, bs * T)
 

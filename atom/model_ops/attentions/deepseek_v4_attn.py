@@ -550,6 +550,14 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self._field_window_layers, self._field_window_dtype = (
             self._discover_field_windows()
         )
+        # A layer whose window moved into a state field is not served by the
+        # dense class any more — it is not in the row space at all — so the
+        # SWA-only MTP fast path cannot address it, whatever its config ratio
+        # says. Narrowed here rather than where the ratios are read, because
+        # which layers those are is only known once the modules exist.
+        self._mtp_layers_are_swa_only = self._mtp_layers_are_swa_only and not any(
+            layer_id >= self._n_main_layers for layer_id in self._field_window_layers
+        )
         # How the compressor state divides between the planes, and what that
         # costs a slot in rows. Settled here because the row space is built
         # from it and sizing prices a slot before either count exists.
@@ -1811,9 +1819,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         if not self.num_state_slots:
             return {}
         assert self._mtp_layers_are_swa_only, (
-            "prepare_mtp_decode fast path only supports SWA-only MTP layers "
-            f"(compress_ratio==0); got compress_ratios[mtp]="
-            f"{self.compress_ratios[self._n_main_layers:]}"
+            "prepare_mtp_decode fast path only supports MTP layers the pool "
+            "serves from the dense class; got compress_ratios[mtp]="
+            f"{self.compress_ratios[self._n_main_layers:]} and field-window "
+            f"layers {self._field_window_layers}"
         )
 
         var = self.model_runner.forward_vars

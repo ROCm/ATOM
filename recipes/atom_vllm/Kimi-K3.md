@@ -9,12 +9,11 @@ The validated configuration requires eight MI355 (gfx950) GPUs with TP8.
 
 ## Prerequisites
 
-Use the ATOM vLLM OOT image and install the KDA dependency used by the native
-Kimi-K3 implementation:
+Use the ATOM vLLM OOT image. The KDA recurrence runs on aiter, which the image
+already carries, so no extra package is needed:
 
 ```bash
 docker pull rocm/atom-dev:vllm-latest
-pip install "fla-core==0.5.1" "flash-linear-attention==0.5.1"
 ```
 
 Install the target ATOM checkout into the same environment:

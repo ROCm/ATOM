@@ -37,6 +37,7 @@ from transformers import AutoProcessor, AutoTokenizer
 from atom import SamplingParams
 from atom.model_engine.arg_utils import EngineArgs
 from atom.model_engine.llm_engine import _load_tokenizer
+from atom.model_engine.multimodal import build_multimodal_inputs
 from atom.model_engine.request import RequestOutput
 from atom.utils import envs
 from atom.utils.arg_parser import FlexibleArgumentParser
@@ -51,7 +52,10 @@ from .protocol import (
     ModelCard,
     ModelList,
 )
-from .reasoning import prompt_starts_in_reasoning
+from .reasoning import (
+    prompt_starts_in_reasoning,
+    prompt_tokens_start_in_reasoning,
+)
 from .serving_anthropic import (
     AnthropicMessagesRequest,
     anthropic_to_openai_messages,
@@ -214,11 +218,15 @@ def _validate_context_length(
     )
 
 
-def _get_engine_max_model_len() -> Optional[int]:
+def _get_engine_config():
     config = getattr(engine, "config", None)
     if config is None:
         config = getattr(getattr(engine, "io_processor", None), "config", None)
-    return getattr(config, "max_model_len", None)
+    return config
+
+
+def _get_engine_max_model_len() -> int | None:
+    return getattr(_get_engine_config(), "max_model_len", None)
 
 
 def _validate_sequence_context_length(seq) -> None:
@@ -267,11 +275,14 @@ def _get_multimodal_processor():
     return processor
 
 
-def _prepare_multimodal_inputs(
+def _collect_multimodal_parts(
     messages: list[Any],
-    chat_template_kwargs: dict[str, Any],
-) -> tuple[list[int], dict[str, Any]]:
-    mm_processor = _get_multimodal_processor()
+) -> tuple[list[dict[str, Any]], list[Image.Image]]:
+    """Normalize chat messages into processor form, loading every image.
+
+    Content parts keep the order the client sent them in; the images are
+    returned separately in that same order.
+    """
     processor_messages: list[dict[str, Any]] = []
     images: list[Image.Image] = []
 
@@ -281,14 +292,13 @@ def _prepare_multimodal_inputs(
             processor_messages.append({"role": message.role, "content": content or ""})
             continue
 
-        image_parts: list[dict[str, Any]] = []
-        text_parts: list[str] = []
+        parts: list[dict[str, Any]] = []
         for part in content:
             if not isinstance(part, dict):
                 continue
             part_type = part.get("type")
             if part_type == "text":
-                text_parts.append(part.get("text", ""))
+                parts.append({"type": "text", "text": part.get("text", "")})
             elif part_type == "image_url":
                 image_url = part.get("image_url", {})
                 url = image_url.get("url") if isinstance(image_url, dict) else None
@@ -298,7 +308,7 @@ def _prepare_multimodal_inputs(
                     )
                 image = _load_image_from_url(url)
                 images.append(image)
-                image_parts.append({"type": "image", "image": image})
+                parts.append({"type": "image", "image": image})
             elif part_type == "image":
                 url = part.get("image")
                 if not isinstance(url, str):
@@ -307,23 +317,64 @@ def _prepare_multimodal_inputs(
                     )
                 image = _load_image_from_url(url)
                 images.append(image)
-                image_parts.append({"type": "image", "image": image})
-
-        # Qwen3.5's template reliably emits <|image_pad|> when image entries
-        # precede the text, matching the native offline multimodal example.
-        parts = image_parts
-        if text_parts:
-            parts.append({"type": "text", "text": "\n".join(text_parts)})
+                parts.append({"type": "image", "image": image})
         processor_messages.append({"role": message.role, "content": parts})
+
+    return processor_messages, images
+
+
+def _images_before_text(
+    processor_messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Hoist image parts ahead of the text within each message.
+
+    Qwen3.5's template only reliably emits <|image_pad|> when image entries
+    precede the text, matching the native offline multimodal example.
+    """
+    reordered: list[dict[str, Any]] = []
+    for message in processor_messages:
+        content = message["content"]
+        if not isinstance(content, list):
+            reordered.append(message)
+            continue
+        parts = [part for part in content if part["type"] == "image"]
+        texts = [part["text"] for part in content if part["type"] == "text"]
+        if texts:
+            parts.append({"type": "text", "text": "\n".join(texts)})
+        reordered.append({"role": message["role"], "content": parts})
+    return reordered
+
+
+def _prepare_multimodal_inputs(
+    messages: list[Any],
+    chat_template_kwargs: dict[str, Any],
+    tools: Any = None,
+) -> tuple[list[int], dict[str, Any]]:
+    mm_processor = _get_multimodal_processor()
+    processor_messages, images = _collect_multimodal_parts(messages)
 
     if not images:
         raise ValueError("Multimodal request did not contain any images")
+
+    # Models whose processor deviates from the Qwen convention register their
+    # own builder (e.g. Kimi-K3's messages+medias API and unexpanded
+    # <|media_pad|> placeholders).
+    built = build_multimodal_inputs(
+        _get_engine_config(),
+        mm_processor,
+        processor_messages,
+        images,
+        chat_template_kwargs,
+        tools=tools,
+    )
+    if built is not None:
+        return built
 
     template_kwargs = dict(chat_template_kwargs)
     template_kwargs.pop("tokenize", None)
     template_kwargs.pop("add_generation_prompt", None)
     text = mm_processor.apply_chat_template(
-        processor_messages,
+        _images_before_text(processor_messages),
         tokenize=False,
         add_generation_prompt=True,
         **template_kwargs,
@@ -1169,7 +1220,11 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             _get_multimodal_processor()
             loop = asyncio.get_running_loop()
             token_ids, multimodal_data = await loop.run_in_executor(
-                None, _prepare_multimodal_inputs, messages, merged_kwargs
+                None,
+                _prepare_multimodal_inputs,
+                messages,
+                merged_kwargs,
+                request.tools,
             )
         else:
             prompt = apply_chat_template(
@@ -1182,9 +1237,12 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
 
         # The K3 template may inject the opening reasoning marker into the prompt
         # itself; if so the stream begins mid-thought and the ReasoningFilter must
-        # start in the thinking state. Multimodal inputs are pre-tokenized ids, so
-        # this only applies to the text path.
-        _starts_thinking = (not is_multimodal) and prompt_starts_in_reasoning(prompt)
+        # start in the thinking state. Multimodal inputs arrive pre-tokenized.
+        _starts_thinking = (
+            prompt_tokens_start_in_reasoning(token_ids, tokenizer.decode)
+            if is_multimodal
+            else prompt_starts_in_reasoning(prompt)
+        )
 
         # Streaming
         if request.stream:
