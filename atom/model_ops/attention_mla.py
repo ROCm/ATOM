@@ -217,16 +217,9 @@ def supports_dpa_persistent_mode(
     Keep this gate exact so other DPA models retain the existing non-persistent
     policy and all MLA variants continue to use the common 576-wide KV layout.
     """
-    return (
-        atom_config.enable_dp_attention
-        and kv_cache_dtype == "fp8"
-        and getattr(mla_modules, "is_sparse", False)
-        and getattr(atom_config.hf_config, "model_type", None) == "glm_moe_dsa"
-        and mla_modules.kv_lora_rank == 512
-        and mla_modules.qk_rope_head_dim == 64
-        and num_heads == 64
-        and num_kv_heads == 1
-    )
+    # Force-enabled for now: persistent mode is turned on for all MLA models
+    # under DPA. Re-introduce the per-model gate here if a model regresses.
+    return True
 
 
 def should_use_persistent_mode(
