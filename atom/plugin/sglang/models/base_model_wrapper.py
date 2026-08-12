@@ -170,6 +170,37 @@ class _AtomCausalLMBaseForSglang(nn.Module):
 
         return {key: value for key, value in kwargs.items() if key in params}
 
+    @property
+    def lm_head(self):
+        """Expose the ATOM model's lm_head for speculative target contracts.
+
+        SGLang's DSpark worker reads ``target_model.lm_head.weight`` to share the
+        head with the draft. Resolve it through the same owner logic
+        ``get_embed_and_head`` uses (handling the multimodal ``language_model``
+        nesting, e.g. Kimi-K3). Returns ``None`` for compute_logits-only models,
+        preserving the previous ``getattr(target_model, "lm_head", None)``.
+        """
+        head = getattr(self.model, "lm_head", None)
+        if head is not None and hasattr(head, "weight"):
+            return head
+        try:
+            _, head_owner = self._embed_and_head_owners()
+        except Exception:  # noqa: BLE001
+            return None
+        head = getattr(head_owner, "lm_head", None)
+        return head if head is not None and hasattr(head, "weight") else None
+
+    def get_input_embeddings(self):
+        """Return the input-embedding module (not the embedded tensor).
+
+        SGLang's DSpark worker calls ``target_model.get_input_embeddings()`` with
+        no args and later applies the returned module to the draft block ids.
+        ATOM's own ``get_input_embeddings`` on some models takes ``input_ids`` and
+        returns embeddings, so resolve the module via the shared owner logic.
+        """
+        embed_owner, _ = self._embed_and_head_owners()
+        return embed_owner.embed_tokens
+
     def get_embed_and_head(self):
         if hasattr(self.model, "get_embed_and_head"):
             return self.model.get_embed_and_head()
@@ -255,6 +286,109 @@ class _AtomCausalLMBaseForSglang(nn.Module):
             f"ATOM model {type(self.model).__name__} does not support "
             "EAGLE3 auxiliary hidden-state capture"
         )
+
+    @staticmethod
+    def _reconstruct_dspark_layer_hidden(output):
+        """Reconstruct a target decoder layer's post-layer residual stream.
+
+        Mirrors ATOM core ``DSparkProposer._extract_layer_hidden``: DSpark drafts
+        are trained on HF ``output.hidden_states[layer_id+1]`` (the plain
+        residual after the layer). ATOM's layers return that differently per
+        family, so dispatch on the return shape.
+        """
+        # DeepSeek-V4 HCState (mHC residual): mean over the hc axis.
+        residual = getattr(output, "residual", None)
+        if residual is not None:
+            return residual.mean(dim=1) if residual.dim() == 3 else residual
+        # Kimi-K3: (prefix_sum, pending_add, block_residual). The HF reference
+        # adds pending into the residual before returning, so add it back.
+        if isinstance(output, (tuple, list)):
+            if not output:
+                return None
+            carrier = output[0]
+            pending = output[1] if len(output) > 1 else None
+            if carrier is None:
+                return None
+            return carrier if pending is None else carrier + pending
+        return output
+
+    def _resolve_target_decoder_layers(self):
+        obj = self.model
+        for path in (
+            ("language_model", "model", "layers"),
+            ("model", "layers"),
+            ("layers",),
+        ):
+            cur = obj
+            for attr in path:
+                cur = getattr(cur, attr, None)
+                if cur is None:
+                    break
+            else:
+                return cur
+        return None
+
+    def set_dspark_layers_to_capture(self, layer_ids):
+        """Capture aux hidden states at the DSpark target layers.
+
+        SGLang's DSpark worker runs the target verify pass with
+        ``capture_hidden_mode=FULL`` and reads ``logits_output.hidden_states`` as
+        the draft's context. The LogitsProcessor concatenates the aux list, so we
+        capture each configured layer's post-hidden via a forward hook and hand
+        the LIST to the processor (it does ``torch.cat(..., dim=-1)``). ATOM's K3
+        target has no native aux capture, so mirror ATOM core's hook approach.
+        """
+        self.capture_aux_hidden_states = True
+        self._dspark_capture_layer_ids = tuple(int(i) for i in layer_ids)
+        self._dspark_aux_buffer = {}
+
+        for handle in getattr(self, "_dspark_capture_hooks", []) or []:
+            try:
+                handle.remove()
+            except Exception:  # noqa: BLE001, S110
+                pass
+        self._dspark_capture_hooks = []
+
+        layers = self._resolve_target_decoder_layers()
+        if layers is None:
+            raise AttributeError(
+                f"{self.model_arch}: could not resolve target decoder layers for "
+                "DSpark aux hidden-state capture."
+            )
+
+        def _make_hook(layer_id):
+            def _hook(module, inputs, output):
+                hidden = self._reconstruct_dspark_layer_hidden(output)
+                if hidden is not None:
+                    self._dspark_aux_buffer[layer_id] = hidden
+
+            return _hook
+
+        for layer_id in self._dspark_capture_layer_ids:
+            if layer_id < 0 or layer_id >= len(layers):
+                raise ValueError(
+                    f"{self.model_arch}: DSpark target layer id {layer_id} out of "
+                    f"range for {len(layers)} decoder layers."
+                )
+            self._dspark_capture_hooks.append(
+                layers[layer_id].register_forward_hook(_make_hook(layer_id))
+            )
+        logger.info(
+            "DSpark target aux capture enabled on layers %s",
+            list(self._dspark_capture_layer_ids),
+        )
+
+    def _collect_dspark_aux_hidden_states(self):
+        """Return the captured per-layer aux hidden states as a list, or None."""
+        layer_ids = getattr(self, "_dspark_capture_layer_ids", ())
+        if not layer_ids:
+            return None
+        buffer = getattr(self, "_dspark_aux_buffer", {})
+        parts = [buffer.get(layer_id) for layer_id in layer_ids]
+        self._dspark_aux_buffer = {}
+        if any(part is None for part in parts):
+            return None
+        return parts
 
     def _split_aux_hidden_states(self, output):
         if (
@@ -366,6 +500,11 @@ class _AtomCausalLMBaseForSglang(nn.Module):
                 hidden_states, aux_hidden_states = self._split_aux_hidden_states(
                     hidden_states
                 )
+                # ATOM's Kimi-K3 target has no native aux return; pull the
+                # forward-hook-captured DSpark aux layers here so the
+                # LogitsProcessor stores their concat as logits_output.hidden_states.
+                if aux_hidden_states is None:
+                    aux_hidden_states = self._collect_dspark_aux_hidden_states()
                 hidden_states = runtime.trim_output(hidden_states)
                 aux_hidden_states = self._trim_aux_hidden_states(
                     runtime, aux_hidden_states

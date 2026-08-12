@@ -74,8 +74,51 @@ def _install_loader_quant_patch() -> None:
     loader._atom_sglang_quant_patch = True
 
 
+def _register_k3_dspark_config() -> None:
+    """Register the standalone Kimi-K3 DSpark draft config with transformers.
+
+    The draft checkpoint (arch ``K3DSparkModel``, ``model_type: k3_dspark``)
+    ships no remote config code, so transformers ``AutoConfig`` cannot load it
+    and sglang's ``get_config`` fails during ``prepare_server_args``. ATOM treats
+    ``k3_dspark`` as a plain config; mirror that with a generic config class
+    whose ``__init__`` stores the checkpoint's top-level DSpark fields.
+    """
+    try:
+        from transformers import AutoConfig, PretrainedConfig
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+    except Exception:  # noqa: BLE001 - transformers always present at runtime
+        return
+
+    if "k3_dspark" in CONFIG_MAPPING:
+        return
+
+    class K3DSparkConfig(PretrainedConfig):
+        model_type = "k3_dspark"
+
+    try:
+        AutoConfig.register("k3_dspark", K3DSparkConfig)
+        logger.info("Registered Kimi-K3 DSpark draft config (model_type=k3_dspark)")
+    except (ValueError, KeyError):  # already registered by another import/rank
+        pass
+
+
 def register_plugin() -> None:
     """Install ATOM patches that must run before SGLang parses server args."""
+    # Map sglang 0.5.15 import paths the plugin still uses onto their relocated
+    # homes when running on sglang-main. Must precede any attention-backend
+    # import below. No-op on a genuine 0.5.15 runtime.
+    try:
+        from atom.plugin.sglang.runtime.sglang_main_compat import (
+            install as _install_sglang_main_compat,
+        )
+
+        _install_sglang_main_compat()
+    except Exception:
+        logger.exception("Failed to install sglang-main compat aliases")
+
+    # Must run before prepare_server_args()'s speculative-decoding hook loads the
+    # Kimi-K3 DSpark draft config (model_type=k3_dspark) via transformers.
+    _register_k3_dspark_config()
 
     _install_model_config_quant_patch()
     _install_loader_quant_patch()
