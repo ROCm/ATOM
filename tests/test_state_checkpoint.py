@@ -972,9 +972,6 @@ class TestCopyLifecycle:
         assert hashes[0] != hashes[2]
         copies = bm.state_copies_for_batch()
 
-        # The duplicate H intent needs no second copy. With one free group only
-        # one distinct boundary fits; with two, both do. In neither case may a
-        # destination be released and reused while its copy is still pending.
         kept = min(free_groups, 2)
         assert len(copies) == kept
         destinations = [dst for _, dst in copies]

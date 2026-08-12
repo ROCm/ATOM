@@ -891,11 +891,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         happen. One slot per request regardless of MTP: the draft lookahead is
         absorbed into `win_with_spec` rather than multiplying anything.
 
-        No implicit transient margin is needed on the slot: a ring cannot
-        exceed itself the way a block-addressed window could while sliding
-        across a boundary, and there is no admission-vs-materialization gap.
-        `STATE_CKPT_EXTRA_ENTRIES` is different: it is explicit static
-        headroom for retaining checkpoint groups beyond the live-request floor.
+        No flat margin on the slot: a ring cannot transiently exceed itself the
+        way a block-addressed window could while sliding across a boundary, and
+        there is no admission-vs-materialization gap to cushion — a slot exists
+        for its request's whole life.
         """
         geo = self.pool_geometry
         row_bytes = self.plane_row_bytes()

@@ -1,14 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""CPU-safe contract test for DeepSeek-V4's state-pool declaration.
-
-The V4 attention module imports AITER and Triton kernels at module import time,
-so importing its builder would either fail or make this key sizing regression
-silently skip on the CPU test gate.  Inspect only the small declaration method
-instead: arithmetic remains covered behaviorally in test_sub_pool_spec.py.
-"""
-
 import ast
 from pathlib import Path
 
@@ -23,7 +15,6 @@ ENV_FIELD = "STATE_CKPT_EXTRA_ENTRIES"
 
 
 def _runtime_field_refs(node: ast.AST, field: str) -> list[ast.AST]:
-    """Runtime references to an environment field, excluding prose."""
     refs: list[ast.AST] = [
         child
         for child in ast.walk(node)
@@ -80,8 +71,6 @@ def test_checkpoint_extra_entries_are_wired_only_to_the_v4_state_slot():
     assert ast.literal_eval(keywords["entries_per_req"]) == 1
     assert _runtime_field_refs(keywords["extra_entries"], FIELD)
 
-    # This is an explicit physical-sizing knob: disabling prefix caching or
-    # the checkpoint interval must not silently change the allocation layout.
     assert not _runtime_field_refs(
         keywords["extra_entries"], "state_checkpoint_interval_tokens"
     )

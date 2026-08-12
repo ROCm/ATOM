@@ -79,10 +79,8 @@ class BlockManager:
         # Per-request cache slot pool. Used by attention types with a
         # stateful per-request buffer (GDN recurrent state, V4 compressor
         # state). The backing tensor is pre-allocated by ModelRunner sized
-        # from the pool plan and excluded from `num_kvcache_blocks` at sizing
-        # time. Every STATE class includes a max_num_seqs admission floor;
-        # a backend may reserve additional entries for retained checkpoints.
-        # Admission therefore only needs a reclaimable slot index from here.
+        # to max_num_seqs and excluded from `num_kvcache_blocks` at sizing
+        # time, so admission only needs a free slot index from this list.
         # Sizing published `entries` per cache class plus the per-request
         # multiplicity the declaring backend asked for (1 for a single
         # committed state, + num_spec where a rollback slot per speculated
@@ -373,9 +371,9 @@ class BlockManager:
         # state tensor (e.g. GDN mamba_k_cache, the V4 compressor ring). The
         # state class took its bytes before the paged class was sized in
         # ModelRunner.get_num_blocks(), so admitting a seq adds no further
-        # paged-block cost. Its free list has at least `max_num_seqs` groups;
-        # optional extra groups retain checkpoints but remain reclaimable for
-        # admission.
+        # paged-block cost. The slot cap
+        # (the state pool's free list, size = `max_num_seqs`) is the sole
+        # admission bound for state cache.
         if seq.has_per_req_cache:
             self._attach_state_group(seq, h if num_cached_blocks > 0 else -1)
 

@@ -12,16 +12,6 @@ This document describes the environment variables used in the ATOM project.
 | **ATOM_DP_MASTER_IP** | str | 127.0.0.1 | Master IP address for DP ranks coordination. |
 | **ATOM_DP_MASTER_PORT** | int | 29500 | Master port for DP ranks coordination. |
 
-## KV cache sizing
-
-| Variable | Type | Default | Description |
-|----------|------|---------|-------------|
-| **STATE_CKPT_EXTRA_ENTRIES** | int | 0 | Native ATOM DeepSeek-V4 only: statically reserve this many STATE groups above the `max_num_seqs` live-request floor for retained checkpoints. The reservation reduces PAGE capacity without changing scheduler concurrency or CUDA-graph capture sizes, remains allocated when checkpointing or prefix caching is disabled, and must be a nonnegative integer. Unset or empty means `0`; the vLLM/SGLang plugin pools do not use this variable. |
-
-Set `STATE_CKPT_EXTRA_ENTRIES` before starting every server/worker. Pool sizing
-does not change in a running process; separately launched ranks or PD endpoints
-must use the same value, and changing it requires a restart.
-
 ## Prefill delayer (DP attention)
 
 Prefill **coalescer** for DP-attention + EP-MoE serving. Holds back prefill

@@ -3,7 +3,7 @@
 
 import pytest
 
-# All managed env vars that could affect default-value tests
+# All ATOM_* env vars that could affect default-value tests
 _ATOM_ENV_VARS = [
     "ATOM_DP_RANK",
     "ATOM_DP_RANK_LOCAL",

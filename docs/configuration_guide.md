@@ -400,7 +400,6 @@ anything else (including unset) as `False`, unless noted otherwise.
 | `ATOM_DP_SIZE` | `int` | `1` | Total number of data-parallel groups |
 | `ATOM_DP_MASTER_IP` | `str` | `"127.0.0.1"` | IP address of the data-parallel master |
 | `ATOM_DP_MASTER_PORT` | `int` | `29500` | Port of the data-parallel master |
-| `STATE_CKPT_EXTRA_ENTRIES` | `int` | `0` | Native ATOM DeepSeek-V4 only: extra STATE groups above the `max_num_seqs` live floor; must be a nonnegative integer |
 | ~~`ATOM_ENFORCE_EAGER`~~ | | | Removed. Use CLI flag `--enforce-eager` instead. |
 | `ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION` | `bool` | `False` | Enable QK-norm + RoPE + cache + quant fusion for Qwen3 dense and MoE models |
 | `ATOM_USE_TRITON_GEMM` | `bool` | `False` | Use Triton-based GEMM kernels instead of default backends |
@@ -410,11 +409,6 @@ anything else (including unset) as `False`, unless noted otherwise.
 | `ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION` | `bool` | `True` | Enable fused all-reduce + RMSNorm kernel |
 | `ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT` | `bool` | `True` | Enable AITER Triton fused RMSNorm + quantization for LLaMA models |
 | `ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT` | `bool` | `True` | Enable AITER Triton fused SiLU + multiply + quantization for LLaMA models |
-
-Set `STATE_CKPT_EXTRA_ENTRIES` before starting the server/workers. A running
-worker does not re-size its pools when the parent environment changes, and
-separately launched ranks or PD endpoints must use the same value. Restart the
-deployment after changing it.
 
 ### Additional environment variables (used outside `envs.py`)
 

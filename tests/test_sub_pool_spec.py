@@ -109,12 +109,6 @@ class TestPlanPools:
         assert plan.entries[ENTRY_SWA] == 8 * 3 + 64
 
     def test_flat_extra_state_entries_take_exactly_their_paged_budget(self):
-        """Checkpoint slack is flat, not multiplied by max_num_seqs.
-
-        Eight live-request entries plus three checkpoint entries cost 110 B.
-        The 890 B remainder holds eight whole 100 B pages; without charging
-        the extra entries it would incorrectly hold nine.
-        """
         specs = [
             page_pool(100),
             state_pool(ENTRY_STATE, 10, entries_per_req=1, extra_entries=3),
@@ -125,7 +119,6 @@ class TestPlanPools:
         assert plan.entries[ENTRY_KV] == 8
 
     def test_negative_extra_state_entries_are_rejected(self):
-        """A negative cushion would undercut the per-request capacity floor."""
         with pytest.raises(ValueError, match="extra_entries"):
             state_pool(ENTRY_STATE, 10, entries_per_req=1, extra_entries=-1)
 

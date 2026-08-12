@@ -57,9 +57,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ATOM remaps the SGLang world into internal TP x PCP groups.
     # 0 means unset.
     "ATOM_SGLANG_PCP_SIZE": lambda: int(os.getenv("ATOM_SGLANG_PCP_SIZE", "0") or "0"),
-    # DeepSeek-V4 only: static STATE groups beyond the max_num_seqs live floor.
-    # The existing benchmark contract uses this unprefixed name; keep it exact
-    # so the container environment reaches ATOM without a CLI translation.
     "STATE_CKPT_EXTRA_ENTRIES": lambda: _nonnegative_int("STATE_CKPT_EXTRA_ENTRIES"),
     # --- Compilation & Execution ---
     "ATOM_USE_TRITON_GEMM": lambda: os.getenv("ATOM_USE_TRITON_GEMM", "0") == "1",

@@ -118,18 +118,16 @@ class StateGroupPool:
     content still valid, filed under the content hash of the last block it
     covers. This is the KV block pool's lazy-eviction model (`pop` drops the
     hash at hand-out time, not at free time) applied to state groups. The index
-    therefore holds nothing back — `pop` invalidates whatever it hands out, so
-    a checkpoint can never shrink admission. With only the live-request floor,
-    full concurrency drains the checkpoint set; explicit static headroom can
-    keep checkpoints while every admitted request owns a group.
+    therefore holds nothing back — `pop` invalidates whatever it hands out, so a
+    checkpoint can never shrink admission, and under full concurrency the
+    checkpoint set drains to empty on its own.
 
     *How* a group reaches the index is the backend's `StateTransfer`, and it is
     the only thing that differs between the two mechanisms this class runs:
 
-      `fork`  the owner gives its group away and takes a fresh one. No memory is
-              allocated at checkpoint time, but an already-free group is
-              consumed, and the very next forward is bound to leave the
-              replacement self-contained (`min_fork_tokens`).
+      `fork`  the owner gives its group away and takes a fresh one, so the
+              checkpoint costs no bytes but binds the very next forward, which
+              has to leave the replacement self-contained (`min_fork_tokens`).
       `copy`  the state is a byte range, so a duplicate goes to the index and
               the owner is not disturbed at all. Nothing is bound: no successor
               forward, and the resuming side copies rather than forking too.
@@ -536,13 +534,6 @@ class StateGroupPool:
         skipped, so nothing is ever indexed over state that is gone. That check
         is only sound because this runs with the batch already decided — see
         `take_copies`.
-
-        Several owners can publish the same content hash in one step. One copy
-        satisfies that boundary, so collapse those intents before assigning
-        destinations; checkpoint fates therefore count distinct hashes, not
-        redundant intents. All destinations stay claimed until every assignment
-        is complete: releasing one early would let a later `pop` recycle it and
-        schedule two asynchronous copies into the same group.
         """
         if not self._checkpoint_pending:
             return
