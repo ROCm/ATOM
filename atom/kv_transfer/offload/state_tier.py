@@ -100,3 +100,86 @@ class StateOffloadTier:
                 # So the next request does not repeat the attempt.
                 self.index.forget(h)
                 self._failed.add(req_id)
+
+
+def clamp_state_boundary(state_blocks: int, kv_loaded_blocks: int) -> int:
+    """`P <= L`: a state boundary may not claim history the KV does not cover.
+
+    Today this holds for free because both derive from `block_hashes`. Once the
+    tier admits spilled hashes and the KV load length is decided on a separate
+    path, it does not, and the failure is silent: state is the compressed
+    history of [0,P), so with P > L the forward reads a compressed prefix whose
+    raw KV was never loaded and produces wrong output without raising.
+
+    Clamping to 0 means the sequence recomputes -- the existing path.
+    """
+    return max(0, min(int(state_blocks), int(kv_loaded_blocks)))
+
+
+class _JointPark:
+    """One park for the KV load and the state load of the same request.
+
+    Both completions must land before unpark. Waking on the state transfer
+    alone lets the model read KV blocks that are not yet filled, which is
+    silent rather than an error.
+
+    Either side failing fails the pair: half a load leaves state claiming a
+    prefix whose KV never arrived, and `failed_loading` already means "wake for
+    recompute using the blocks already allocated", which is exactly right here.
+    """
+
+    def __init__(self) -> None:
+        self._need: dict[str, set[str]] = {}
+        self._failed: set[str] = set()
+        self._ready: set[str] = set()
+        self._ready_failed: set[str] = set()
+
+    def arm(self, req_id: str, *, needs_kv: bool, needs_state: bool) -> None:
+        need = set()
+        if needs_kv:
+            need.add("kv")
+        if needs_state:
+            need.add("state")
+        self._need[req_id] = need
+        if not need:
+            self._ready.add(req_id)
+
+    def settle_kv(self, req_id: str, ok: bool) -> None:
+        self._settle(req_id, "kv", ok)
+
+    def settle_state(self, req_id: str, ok: bool) -> None:
+        self._settle(req_id, "state", ok)
+
+    def _settle(self, req_id: str, leg: str, ok: bool) -> None:
+        need = self._need.get(req_id)
+        if need is None:
+            return
+        need.discard(leg)
+        if not ok:
+            self._failed.add(req_id)
+        if need:
+            return
+        del self._need[req_id]
+        if req_id in self._failed:
+            self._failed.discard(req_id)
+            self._ready_failed.add(req_id)
+        else:
+            self._ready.add(req_id)
+
+    def take_ready(self) -> tuple[set[str], set[str]]:
+        ready, failed = set(self._ready), set(self._ready_failed)
+        self._ready.clear()
+        self._ready_failed.clear()
+        return ready, failed
+
+
+def should_load_state(hit_tokens: int, floor_tokens: int) -> bool:
+    """Whether a state hit of `hit_tokens` is worth an H2D.
+
+    Mirrors KV's OFFLOAD_MIN_LOAD_TOKENS (`connector.py:526`). Two jobs: a
+    short prefix does not repay the round trip, and the same floor bounds what
+    a false positive costs -- the index cannot know LMCache's LRU dropped the
+    bytes until the load misses.
+    """
+    hit_tokens = int(hit_tokens)
+    return hit_tokens > 0 and hit_tokens >= int(floor_tokens)

@@ -142,3 +142,22 @@ def test_inflight_does_not_grow_on_get_finished_path():
 
     with t._lock:
         assert len(t._inflight) == 0
+
+
+from atom.kv_transfer.offload.state_tier import should_load_state
+
+
+def test_a_hit_at_or_above_the_floor_loads():
+    assert should_load_state(8192, 8192) is True
+
+
+def test_a_short_hit_is_not_worth_a_pcie_round_trip():
+    assert should_load_state(4096, 8192) is False
+
+
+def test_a_zero_floor_loads_anything_positive():
+    assert should_load_state(1, 0) is True
+
+
+def test_a_zero_hit_never_loads():
+    assert should_load_state(0, 0) is False
