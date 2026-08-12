@@ -1,10 +1,9 @@
-"""End-to-end equivalence for the batched-SSM DFLASH verify path.
+"""End-to-end coverage for the default batched DFLASH verify path.
 
 ``test_gdn_target_verify_batched_equiv.py`` compares the two *kernel call
-patterns* in isolation. This module drives the real
-``SGLangGatedDeltaNet.forward()`` TARGET_VERIFY path instead, once with
-``ATOM_ENABLE_GDN_SPEC_VERIFY_BATCHED_SSM=0`` and once with ``=1``, and asserts
-that the plugin's whole observable contract is unchanged:
+patterns in isolation. This module drives the real, always-batched
+``SGLangGatedDeltaNet.forward()`` TARGET_VERIFY path and asserts the plugin's
+observable contract:
 
 * ``core_attn_out``
 * ``intermediate_ssm[req, step]`` -- what SGLang's
@@ -135,7 +134,7 @@ def _make_impl(gen: torch.Generator) -> SGLangGatedDeltaNet:
     return impl
 
 
-def _run_once(bs: int, draft: int, batched: bool, monkeypatch, conv_batched=False):
+def _run_once(bs: int, draft: int):
     gen = torch.Generator(device="cuda")
     gen.manual_seed(20260804)
 
@@ -187,12 +186,6 @@ def _run_once(bs: int, draft: int, batched: bool, monkeypatch, conv_batched=Fals
     conv_before = layer_cache.conv[0].clone()
     ssm_before = layer_cache.temporal.clone()
 
-    monkeypatch.setenv(
-        "ATOM_ENABLE_GDN_SPEC_VERIFY_BATCHED_SSM", "1" if batched else "0"
-    )
-    monkeypatch.setenv(
-        "ATOM_ENABLE_GDN_SPEC_VERIFY_BATCHED_CONV", "1" if conv_batched else "0"
-    )
     with bind_current_forward_batch(forward_batch):
         out = impl.forward(mixed_qkv, b, a, core_attn_out, f"layers.{LAYER_NUM}")
 
@@ -209,34 +202,24 @@ def _run_once(bs: int, draft: int, batched: bool, monkeypatch, conv_batched=Fals
 
 @pytest.mark.parametrize("draft", [4, 8, 16])
 @pytest.mark.parametrize("bs", [1, 3])
-def test_batched_ssm_matches_stepwise_loop(bs: int, draft: int, monkeypatch):
-    loop = _run_once(bs, draft, batched=False, monkeypatch=monkeypatch)
-    batched = _run_once(bs, draft, batched=True, monkeypatch=monkeypatch)
-
-    torch.testing.assert_close(batched["out"], loop["out"], rtol=0, atol=0)
-    torch.testing.assert_close(
-        batched["intermediate_ssm"], loop["intermediate_ssm"], rtol=0, atol=0
-    )
-    torch.testing.assert_close(
-        batched["intermediate_conv"], loop["intermediate_conv"], rtol=0, atol=0
-    )
+def test_default_batched_path_populates_verify_buffers(bs: int, draft: int):
+    result = _run_once(bs, draft)
+    assert result["out"].shape[0] == bs * draft
+    assert result["intermediate_ssm"].shape[:2] == (bs, draft)
+    assert result["intermediate_conv"].shape[:2] == (bs, draft)
 
 
 @pytest.mark.parametrize("draft", [4, 8, 16])
-@pytest.mark.parametrize("batched", [False, True])
-def test_live_state_restored_after_verify(draft: int, batched: bool, monkeypatch):
-    """Both paths must leave the live conv/SSM state exactly as they found it;
-    SGLang commits accepted steps itself from the intermediate buffers."""
-    result = _run_once(3, draft, batched=batched, monkeypatch=monkeypatch)
+def test_live_state_unchanged_after_verify(draft: int):
+    """SGLang commits accepted steps itself from the intermediate buffers."""
+    result = _run_once(3, draft)
     torch.testing.assert_close(
         result["conv_live"], result["conv_before"], rtol=0, atol=0
     )
     torch.testing.assert_close(result["ssm_live"], result["ssm_before"], rtol=0, atol=0)
 
 
-def test_batched_path_is_actually_taken(monkeypatch):
-    """Guard against the env flag silently not reaching the plugin: with the
-    flag on, the stepwise recurrent call must not be used at all."""
+def test_default_ssm_path_uses_one_kernel_call(monkeypatch):
     import atom.plugin.sglang.attention_backend.attention_gdn as gdn_mod
 
     calls = {"n": 0}
@@ -248,14 +231,8 @@ def test_batched_path_is_actually_taken(monkeypatch):
 
     monkeypatch.setattr(gdn_mod, "fused_recurrent_gated_delta_rule", counting)
 
-    _run_once(3, 8, batched=False, monkeypatch=monkeypatch)
-    loop_calls = calls["n"]
-    calls["n"] = 0
-    _run_once(3, 8, batched=True, monkeypatch=monkeypatch)
-    batched_calls = calls["n"]
-
-    assert loop_calls == 8, f"stepwise path should call the kernel 8x, got {loop_calls}"
-    assert batched_calls == 1, f"batched path should call it once, got {batched_calls}"
+    _run_once(3, 8)
+    assert calls["n"] == 1, f"batched SSM should run once, got {calls['n']} calls"
 
 
 # --------------------------------------------------------------------------
@@ -302,44 +279,20 @@ def test_conv_window_phys_recovery_matches_allocation(draft: int):
 
 
 def test_conv_window_phys_recovery_rejects_dense_layout():
-    """SGLang uses a dense per-step layout on NPU/CPU and for EAGLE tree verify;
-    the recovery must decline it so the caller keeps the stepwise conv path."""
     dense = torch.zeros(
         NUM_SLOTS, 8, CONV_DIM, STATE_LEN, device="cuda", dtype=torch.bfloat16
     )
-    assert SGLangGatedDeltaNet._spec_conv_window_phys(dense, 8) is None
+    with pytest.raises(RuntimeError, match="deduplicated sliding-window"):
+        SGLangGatedDeltaNet._spec_conv_window_phys(dense, 8)
 
 
 def test_conv_window_phys_recovery_rejects_wrong_draft_len():
     _phys, view = _sglang_dedup_conv_window(NUM_SLOTS, 8)
-    assert SGLangGatedDeltaNet._spec_conv_window_phys(view[0], 16) is None
+    with pytest.raises(RuntimeError, match="draft dimension"):
+        SGLangGatedDeltaNet._spec_conv_window_phys(view[0], 16)
 
 
-@pytest.mark.parametrize("draft", [4, 8, 16])
-@pytest.mark.parametrize("bs", [1, 3])
-def test_batched_conv_and_ssm_match_stepwise_loop(bs: int, draft: int, monkeypatch):
-    """Folding the conv update in too must leave the whole contract unchanged."""
-    loop = _run_once(bs, draft, batched=False, monkeypatch=monkeypatch)
-    both = _run_once(
-        bs, draft, batched=True, monkeypatch=monkeypatch, conv_batched=True
-    )
-
-    torch.testing.assert_close(both["out"], loop["out"], rtol=0, atol=0)
-    torch.testing.assert_close(
-        both["intermediate_ssm"], loop["intermediate_ssm"], rtol=0, atol=0
-    )
-    torch.testing.assert_close(
-        both["intermediate_conv"], loop["intermediate_conv"], rtol=0, atol=0
-    )
-    # The wide-window call only reads the live conv state.
-    torch.testing.assert_close(both["conv_live"], both["conv_before"], rtol=0, atol=0)
-    torch.testing.assert_close(both["ssm_live"], both["ssm_before"], rtol=0, atol=0)
-
-
-def test_batched_conv_path_is_actually_taken(monkeypatch):
-    """With both flags on, the conv kernel must be called once, not once per
-    draft step -- otherwise a silent fallback would make the equivalence test
-    above pass without exercising the new path."""
+def test_default_conv_path_uses_one_kernel_call(monkeypatch):
     import atom.plugin.sglang.attention_backend.attention_gdn as gdn_mod
 
     calls = {"n": 0}
@@ -351,45 +304,16 @@ def test_batched_conv_path_is_actually_taken(monkeypatch):
 
     monkeypatch.setattr(gdn_mod, "causal_conv1d_update", counting)
 
-    _run_once(3, 8, batched=True, monkeypatch=monkeypatch, conv_batched=False)
-    stepwise_calls = calls["n"]
-    calls["n"] = 0
-    _run_once(3, 8, batched=True, monkeypatch=monkeypatch, conv_batched=True)
-    batched_calls = calls["n"]
-
-    assert stepwise_calls == 8, f"stepwise conv should run 8x, got {stepwise_calls}"
-    assert batched_calls == 1, f"batched conv should run once, got {batched_calls}"
+    _run_once(3, 8)
+    assert calls["n"] == 1, f"batched conv should run once, got {calls['n']} calls"
 
 
-def test_batched_conv_falls_back_on_dense_layout(monkeypatch):
-    """A dense intermediate_conv_window must silently degrade to the stepwise
-    conv path and still produce identical results."""
-    import atom.plugin.sglang.attention_backend.attention_gdn as gdn_mod
-
-    dense_cache_holder = {}
-
+def test_default_path_rejects_dense_conv_layout(monkeypatch):
     def dense(num_slots: int, draft: int) -> torch.Tensor:
-        dense_cache_holder["used"] = True
         return torch.zeros(
             num_slots, draft, CONV_DIM, STATE_LEN, device="cuda", dtype=torch.bfloat16
         )
 
-    loop = _run_once(3, 8, batched=False, monkeypatch=monkeypatch)
-
     monkeypatch.setitem(globals(), "_dedup_conv_window_view", dense)
-    calls = {"n": 0}
-    real_conv = gdn_mod.causal_conv1d_update
-
-    def counting(*args, **kwargs):
-        calls["n"] += 1
-        return real_conv(*args, **kwargs)
-
-    monkeypatch.setattr(gdn_mod, "causal_conv1d_update", counting)
-    fallback = _run_once(3, 8, batched=True, monkeypatch=monkeypatch, conv_batched=True)
-
-    assert dense_cache_holder.get("used") is True
-    assert calls["n"] == 8, f"dense layout must stay stepwise, got {calls['n']} calls"
-    torch.testing.assert_close(fallback["out"], loop["out"], rtol=0, atol=0)
-    torch.testing.assert_close(
-        fallback["intermediate_ssm"], loop["intermediate_ssm"], rtol=0, atol=0
-    )
+    with pytest.raises(RuntimeError, match="deduplicated sliding-window"):
+        _run_once(3, 8)

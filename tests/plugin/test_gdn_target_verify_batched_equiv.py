@@ -1,12 +1,8 @@
-"""Step-0 differential test for a batched GDN target-verify path.
+"""Differential tests for the default batched GDN target-verify path.
 
-The SGLang plugin implements DFLASH target verify as a per-draft-step Python
-loop (``atom/plugin/sglang/attention_backend/attention_gdn.py``), while ATOM's
-native GDN backend already owns a batched spec path that folds the whole draft
-block into a single kernel launch (``atom/model_ops/attention_gdn.py``, the
-``spec_sequence_masks is not None`` branch). The plugin cannot reach it: its
-``_build_gdn_metadata`` returns ``None`` for TARGET_VERIFY and hard-codes every
-spec field to ``None``.
+The production SGLang plugin folds the whole draft block into one conv update
+and one SSM recurrent call. These tests retain the removed per-draft-step
+implementation as a test-only numerical reference.
 
 These tests check, with the real kernels, whether the two call patterns are
 numerically interchangeable, and whether SGLang's buffer layouts can be
@@ -133,7 +129,7 @@ def _split_qkv(packed: torch.Tensor, num_tokens: int):
 # SSM recurrent
 # --------------------------------------------------------------------------
 def _ssm_per_step_loop(inp: _Inputs):
-    """What the plugin does today: one kernel triple per draft step."""
+    """Removed production path retained as a test-only numerical reference."""
     ssm = inp.live_ssm.clone()
     out = torch.zeros(
         inp.bs, inp.draft, NUM_V_HEADS, HEAD_V_DIM, device="cuda", dtype=torch.float32

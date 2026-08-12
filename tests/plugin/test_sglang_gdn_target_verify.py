@@ -45,12 +45,14 @@ def _make_impl():
     return impl
 
 
-def test_target_verify_snapshots_each_step_and_restores_live_state():
+def test_target_verify_populates_batched_snapshots_without_touching_live_state():
+    conv_phys = torch.zeros(1, 3, 2)
+    conv_view = conv_phys.as_strided((1, 2, 3, 1), (6, 1, 2, 1))
     layer_cache = SimpleNamespace(
         conv=[torch.zeros(1, 3, 1)],
         temporal=torch.zeros(1, 1, 1, 1),
         intermediate_ssm=torch.zeros(1, 2, 1, 1, 1),
-        intermediate_conv_window=[torch.zeros(1, 2, 3, 1)],
+        intermediate_conv_window=[conv_view],
     )
     linear_backend = _FakeLinearBackend(layer_cache)
     active_backend = SimpleNamespace(linear_attn_backend=linear_backend)
@@ -63,15 +65,17 @@ def test_target_verify_snapshots_each_step_and_restores_live_state():
     b = torch.ones(2, 1)
     a = torch.ones(2, 1)
 
-    def fake_conv(x, conv_state, *_args, conv_state_indices, **_kwargs):
-        conv_state[conv_state_indices] += 1
+    def fake_conv(x, conv_state, *_args, **_kwargs):
+        for step in range(x.shape[0]):
+            conv_state[0, :, step] = step + 1
         return x[:, :1], x[:, 1:2], x[:, 2:3]
 
     def fake_gating(_A_log, a_step, b_step, _dt_bias):
         return a_step.unsqueeze(0), b_step.unsqueeze(0)
 
     def fake_recurrent(*, q, initial_state, ssm_state_indices, **_kwargs):
-        initial_state[ssm_state_indices] += 1
+        for step, index in enumerate(ssm_state_indices[0]):
+            initial_state[index] += step + 1
         return q, None
 
     with (
