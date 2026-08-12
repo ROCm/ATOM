@@ -69,6 +69,7 @@ class EngineArgs:
     num_speculative_tokens: int = 1
     kv_transfer_config: str = "{}"
     draft_model: str | None = None
+    spec_decode_acceptance_rate: float | None = None
     mark_trace: bool = False
     enable_rapidserve: bool = False
     disagg_prefill_max_num_seqs: int | None = None
@@ -285,6 +286,19 @@ class EngineArgs:
             "--method eagle3; optional for --method dspark (needed for the "
             "DFlash-backbone drafts such as Kimi-K3-DSpark, omitted for "
             "V4-Pro-DSpark which ships inside the target checkpoint).",
+        )
+        parser.add_argument(
+            "--spec-decode-acceptance-rate",
+            type=float,
+            default=None,
+            help="Debug/benchmark knob: force a fixed speculative-decoding "
+            "acceptance rate in [0, 1]. When set, the rejection sampler ignores "
+            "the real draft/target agreement and force-accepts each draft token "
+            "with a position-decaying probability calibrated so the measured "
+            "mean acceptance rate (accepted_draft/total_draft) matches this "
+            "value (equivalent accept length = 1 + num_speculative_tokens * "
+            "rate). Mirrors vLLM's 'synthetic' rejection_sample_method. Only "
+            "meaningful with a speculative method; leave unset to disable.",
         )
         parser.add_argument(
             "--max-num-batched-tokens",
@@ -517,6 +531,7 @@ class EngineArgs:
             method = kwargs.pop("method")
             num_spec_tokens = kwargs.pop("num_speculative_tokens")
             draft_model = kwargs.pop("draft_model")
+            synthetic_acceptance_rate = kwargs.pop("spec_decode_acceptance_rate")
             if method == "eagle3" and not draft_model:
                 raise ValueError("--draft-model is required when --method eagle3.")
             if draft_model and method == "mtp":
@@ -528,11 +543,13 @@ class EngineArgs:
                 method=method,
                 model=draft_model or self.model,
                 num_speculative_tokens=num_spec_tokens,
+                synthetic_acceptance_rate=synthetic_acceptance_rate,
             )
         else:
             kwargs.pop("method")
             kwargs.pop("num_speculative_tokens")
             kwargs.pop("draft_model")
+            kwargs.pop("spec_decode_acceptance_rate")
             kwargs["speculative_config"] = None
 
         # --enable-tbo [prefill|all] → enable_tbo + enable_tbo_decode

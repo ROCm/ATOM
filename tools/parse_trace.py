@@ -13,6 +13,7 @@ import gzip
 import json
 import os
 import re
+from collections.abc import Iterable
 from glob import glob
 from typing import Any
 
@@ -253,6 +254,17 @@ def build_correlation_index(
     return launches, kernels
 
 
+def is_profiler_step_tag(name: str) -> bool:
+    """kineto's own per-step marker, e.g. ``ProfilerStep#3``.
+
+    It spans the entire profiled window and names nothing in the model, so it
+    must never win as a kernel's module tag — it would otherwise be picked for
+    every kernel no enclosing ``record_function`` covers (as the only container
+    on the GPU side, and as the longest one on the CPU fallback side).
+    """
+    return name.startswith("ProfilerStep#")
+
+
 def containing_annotations(
     event: dict[str, Any], annotations: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -265,6 +277,7 @@ def containing_annotations(
         and ann.get("tid") == event.get("tid")
         and float(ann.get("ts", 0.0)) <= start
         and end <= event_end(ann)
+        and not is_profiler_step_tag(str(ann.get("name", "")))
     ]
 
 
@@ -558,6 +571,32 @@ def consume_replay_stream_for_block(
     return pos, rows
 
 
+# Ops that launch a different kernel in the eager warmup than in the captured
+# graph, keyed by a substring of the replay kernel and mapping to a substring of
+# the warmup kernel that stands in for it at the same call site.
+#
+# aiter's custom all-reduce is the only one today. Its `custom_all_reduce`
+# branches on `torch.cuda.is_current_stream_capturing()`: inside capture it
+# issues the real `cross_device_reduce_*`, and in the warmup it returns
+# `torch.zeros_like(input)` to "mimic the allocation pattern" without
+# communicating. So the template holds a FillFunctor where the replay holds the
+# reduce — same call site, same position, different kernel.
+#
+# Only add entries here for a divergence that is deliberate and documented
+# upstream; anything else should stay visibly unmatched.
+CAPTURE_MODE_KERNEL_SUBSTITUTIONS: tuple[tuple[str, str], ...] = (
+    ("cross_device_reduce", "FillFunctor"),
+)
+
+
+def substituted_warmup_kernel(replay_kernel: str) -> str | None:
+    """Warmup-kernel substring standing in for *replay_kernel*, if known."""
+    for replay_marker, warmup_marker in CAPTURE_MODE_KERNEL_SUBSTITUTIONS:
+        if replay_marker in replay_kernel:
+            return warmup_marker
+    return None
+
+
 def match_replay_to_warmup(
     replay_kernels: list[dict[str, Any]], warmup_mapping: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -614,6 +653,7 @@ def match_replay_to_warmup(
                     "kernel_name": str(replay.get("name", "")),
                     "stream": replay_stream,
                     "duration_us": float(replay.get("dur", 0.0)),
+                    "ts": float(replay.get("ts", 0.0)),
                 }
             )
 
@@ -621,17 +661,39 @@ def match_replay_to_warmup(
     for stream, events in replay_by_stream.items():
         leftovers.extend(events[stream_cursors[stream] :])
 
+    unused_warmup: list[tuple[int, dict[str, Any]]] = [
+        (idx, item)
+        for idx, item in enumerate(warmup_mapping)
+        if idx not in used_warmup_indices
+    ]
     unused_warmup_by_kernel: dict[str, list[tuple[int, dict[str, Any]]]] = {}
-    for idx, item in enumerate(warmup_mapping):
-        if idx in used_warmup_indices:
-            continue
+    for idx, item in unused_warmup:
         unused_warmup_by_kernel.setdefault(item["kernel"], []).append((idx, item))
+    consumed: set[int] = set()
+
+    def take_exact(replay_kernel: str) -> tuple[int, dict[str, Any] | None]:
+        for idx, item in unused_warmup_by_kernel.get(replay_kernel, []):
+            if idx not in consumed:
+                return idx, item
+        return -1, None
+
+    def take_substitute(replay_kernel: str) -> tuple[int, dict[str, Any] | None]:
+        marker = substituted_warmup_kernel(replay_kernel)
+        if marker is None:
+            return -1, None
+        for idx, item in unused_warmup:
+            if idx not in consumed and marker in item["kernel"]:
+                return idx, item
+        return -1, None
 
     for replay in sorted(leftovers, key=lambda event: float(event.get("ts", 0.0))):
         replay_stream = (replay.get("args") or {}).get("stream")
         replay_kernel = str(replay.get("name", ""))
-        matched_items = unused_warmup_by_kernel.get(replay_kernel, [])
-        matched_idx, matched = matched_items.pop(0) if matched_items else (-1, None)
+        matched_idx, matched = take_exact(replay_kernel)
+        if matched is None:
+            matched_idx, matched = take_substitute(replay_kernel)
+        if matched_idx >= 0:
+            consumed.add(matched_idx)
         rows.append(
             {
                 "warmup_index": matched_idx,
@@ -642,6 +704,7 @@ def match_replay_to_warmup(
                 "kernel_name": replay_kernel,
                 "stream": replay_stream,
                 "duration_us": float(replay.get("dur", 0.0)),
+                "ts": float(replay.get("ts", 0.0)),
             }
         )
     return sorted(
@@ -651,6 +714,21 @@ def match_replay_to_warmup(
             row["warmup_index"],
         ),
     )
+
+
+def union_duration(intervals: Iterable[tuple[float, float]]) -> float:
+    """Wall-clock covered by *intervals*, counting overlap once.
+
+    Kernels on concurrent streams overlap, so summing their durations measures
+    GPU work rather than elapsed time. The union is what a layer actually costs.
+    """
+    merged: list[list[float]] = []
+    for start, end in sorted(intervals):
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return sum(end - start for start, end in merged)
 
 
 def build_grouped_breakdown_rows(
@@ -669,13 +747,14 @@ def build_grouped_breakdown_rows(
     """
     layer_rows: dict[int, list[dict[str, Any]]] = {}
     non_layer_accum: dict[tuple[str, str, int], tuple[float, int]] = {}
-    unmatched_accum: dict[tuple[str, int], float] = {}
+    unmatched_accum: dict[tuple[str, int], tuple[float, int]] = {}
 
     for row in rows:
         stream_no = stream_map.get(row["stream"], 0)
         if row["cpu_module"] == "<unmatched>":
             key = (row["kernel_name"], stream_no)
-            unmatched_accum[key] = unmatched_accum.get(key, 0.0) + row["duration_us"]
+            total_us, count = unmatched_accum.get(key, (0.0, 0))
+            unmatched_accum[key] = (total_us + row["duration_us"], count + 1)
             continue
 
         layer = module_layer(row["cpu_module"])
@@ -734,6 +813,23 @@ def build_grouped_breakdown_rows(
         layer_count = len(layers)
         label = layer_group_label(layers)
         group_order_key = min(layer_rows[layer][0]["warmup_index"] for layer in layers)
+        # What one layer of this group actually costs: the union of its kernels'
+        # intervals, not the sum of their durations. Under dual-stream execution
+        # the side streams (shared_experts, attn.compressor, indexer) run
+        # concurrently with the primary one, so summing counts the same elapsed
+        # time twice — 15% of the window on a TP=4 V4-Pro decode.
+        #
+        # Also the denominator of each row's percent_of_current_layer. Per-row
+        # time_us stays unmerged, so those shares sum past 100% exactly to the
+        # extent the layer's streams overlapped — that excess is the signal.
+        layer_total_us = (
+            union_duration(
+                (item["ts"], item["ts"] + item["duration_us"])
+                for layer in layers
+                for item in layer_rows[layer]
+            )
+            / layer_count
+        )
         for idx, (module, kernel) in enumerate(signature):
             total = sum(layer_rows[layer][idx]["duration_us"] for layer in layers)
             stream_ids = [layer_rows[layer][idx]["stream_no"] for layer in layers]
@@ -753,37 +849,45 @@ def build_grouped_breakdown_rows(
                     "kernel": kernel,
                     "stream_no": stream_no,
                     "time_us": total / layer_count,
+                    "layer_total_us": layer_total_us,
                     "order_key": order_key,
                     "group_order_key": group_order_key,
                 }
             )
-        group_time_us = sum(
-            sum(layer_rows[layer][idx]["duration_us"] for layer in layers) / layer_count
-            for idx in range(len(signature))
-        )
         grouped.append(
             {
                 "layer_group": label,
                 "layer_count": layer_count,
-                "module": "__group_total__",
-                "kernel": "GROUP TOTAL",
+                "module": "__layer_total__",
+                "kernel": "LAYER TOTAL",
                 "stream_no": "",
-                "time_us": group_time_us,
+                "time_us": layer_total_us,
+                "layer_total_us": layer_total_us,
                 "order_key": float("inf"),
                 "group_order_key": group_order_key,
             }
         )
 
-    # Keep unmatched in the same output file for follow-up instrumentation work.
-    for (kernel, stream_no), total_us in unmatched_accum.items():
+    # Kept in the output as a list of what the template could not account for,
+    # so a growing tail is visible. Their numbers are suppressed: a kernel with
+    # no template counterpart has no layer to be a share of, and adding its time
+    # to a breakdown that is already attributed elsewhere only misleads.
+    #
+    # The label carries the kernel count so the tail's size is visible in the
+    # sheet itself — the rows below collapse repeats, so counting them does not
+    # give it. One constant label also keeps the group cell merging as one run.
+    unmatched_total = sum(count for _, count in unmatched_accum.values())
+    unmatched_label = f"unmatched: {unmatched_total} kernels (should be ignored)"
+    for (kernel, stream_no), (total_us, _count) in unmatched_accum.items():
         grouped.append(
             {
-                "layer_group": "unmatched",
+                "layer_group": unmatched_label,
                 "layer_count": 1,
                 "module": "<unmatched>",
                 "kernel": kernel,
                 "stream_no": stream_no,
                 "time_us": total_us,
+                "suppress_numbers": True,
                 "order_key": float("inf"),
                 "group_order_key": float("inf"),
             }
@@ -799,7 +903,8 @@ DECODE_BREAKDOWN_HEADER = [
     "kernel",
     "stream_id",
     "time_us_per_layer",
-    "percent_of_decode",
+    "percent_of_current_layer",
+    "percent_of_decode_step",
 ]
 XLSX_KERNEL_DISPLAY_LIMIT = 120
 
@@ -809,15 +914,30 @@ def decode_breakdown_values(
 ) -> list[list[Any]]:
     """Flatten breakdown rows into sheet rows.
 
-    ``time_us`` is one layer's average, so it is scaled back up by
-    ``layer_count`` before dividing by the whole-forward window — the percent
-    column is what the group costs the decode, not what one of its layers does.
+    Two shares, both kept as fractions and rendered ``xx.xxx%`` by the writers:
+
+    ``percent_of_current_layer`` divides by the row's LAYER TOTAL — what the
+    operator costs within one layer. Empty for rows outside any layer group.
+
+    ``percent_of_decode_step`` scales ``time_us`` (one layer's average) back up
+    by ``layer_count`` first, so it is what the whole group costs the step, not
+    what one of its layers does.
     """
     values: list[list[Any]] = []
     for row in rows:
         layer_count = int(row.get("layer_count", 1))
+        if row.get("suppress_numbers"):
+            values.append(
+                [row["layer_group"], "", row["module"], row["kernel"], "", "", "", ""]
+            )
+            continue
         group_us = float(row["time_us"]) * layer_count
-        percent = group_us / full_decode_us * 100.0 if full_decode_us > 0 else 0.0
+        layer_total_us = row.get("layer_total_us")
+        in_layer = (
+            float(row["time_us"]) / layer_total_us
+            if layer_total_us
+            else ""  # non_layer / unmatched rows have no owning layer
+        )
         values.append(
             [
                 row["layer_group"],
@@ -826,7 +946,8 @@ def decode_breakdown_values(
                 row["kernel"],
                 row["stream_no"],
                 float(row["time_us"]),
-                percent,
+                in_layer,
+                group_us / full_decode_us if full_decode_us > 0 else 0.0,
             ]
         )
     return values
@@ -853,8 +974,9 @@ def write_decode_csv(path: str, values: list[list[Any]]) -> None:
                     display_module,
                     row[3],
                     row[4],
-                    f"{row[5]:.3f}",
-                    f"{row[6]:.3f}",
+                    f"{row[5]:.3f}" if row[5] != "" else "",
+                    f"{row[6]:.3%}" if row[6] != "" else "",
+                    f"{row[7]:.3%}" if row[7] != "" else "",
                 ]
             )
             prev_layer_group = layer_group
@@ -939,14 +1061,17 @@ def write_decode_xlsx(path: str, values: list[list[Any]]) -> None:
         merge_same_value_runs(ws, 1, 2, end_row)
 
     for row in ws.iter_rows(min_row=2):
-        is_total_row = row[3].value == "GROUP TOTAL"
+        is_total_row = row[3].value == "LAYER TOTAL"
         for cell in row:
             cell.alignment = Alignment(vertical="top", wrap_text=True)
             if is_total_row:
                 cell.font = Font(bold=True)
                 cell.fill = PatternFill("solid", fgColor="FFF2CC")
         row[5].number_format = "0.000"
-        row[6].number_format = "0.000"
+        # Excel percent format: the cell holds the fraction and renders xx.xxx%,
+        # so the value stays a real number for sorting and further math.
+        row[6].number_format = "0.000%"
+        row[7].number_format = "0.000%"
 
     widths = {
         1: 24,
@@ -955,7 +1080,8 @@ def write_decode_xlsx(path: str, values: list[list[Any]]) -> None:
         4: 72,
         5: 10,
         6: 16,
-        7: 18,
+        7: 22,
+        8: 20,
     }
     for col, width in widths.items():
         ws.column_dimensions[get_column_letter(col)].width = width

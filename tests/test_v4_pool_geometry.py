@@ -13,6 +13,7 @@ pairwise rather than comparing against a restatement of the same expression.
 import pytest
 
 from atom.model_ops.attentions.v4_pool_geometry import (
+    ABSENT_RATIO,
     CSA_RATIO,
     DENSE_RATIO,
     HCA_RATIO,
@@ -463,3 +464,57 @@ class TestTheBoundaryIsInvisibleToAddresses:
         assert len({g.physical_slot(0) for g in tight}) > 1
         # The formula itself is innocent — it never mentions the plane.
         assert len({g.window_params(CSA_RATIO) for g in tight}) == 1
+
+
+# V4-Pro: an all-CSA/HCA trunk whose only ratio-0 layer is the draft slot. The
+# shape matters because it is the one FLASH_RATIOS cannot express — Flash has
+# two dense layers in the trunk, which keep the dense class alive no matter
+# what happens to the draft.
+PRO_RATIOS = [128, 128] + [4, 128] * 29 + [4] + [0]
+
+
+class TestAClassCanBeAbsent:
+    """A compress class with no layers is not in the layout at all.
+
+    The dense class used to be in every V4 config, so callers grew a habit of
+    asking for it unconditionally. Then a layer that carries its window in a
+    state field started leaving the row space entirely, and on a trunk with no
+    dense layers of its own the draft was the last one — the class goes with
+    it. What must not happen is that this reads as a layout with a dense class
+    whose address happens to be wrong.
+    """
+
+    def geometry(self, ratios):
+        return UnifiedPoolGeometry(
+            ratios, num_blocks=4, num_slots=3, ring_slots=FLASH_WINDOW, block_size=256
+        )
+
+    def test_a_trunk_dense_layer_keeps_the_class_when_the_draft_leaves(self):
+        flash = list(FLASH_RATIOS)
+        for i in (43, 44, 45):
+            flash[i] = ABSENT_RATIO
+        assert DENSE_RATIO in self.geometry(flash).classes
+
+    def test_the_class_goes_with_the_last_layer_that_had_it(self):
+        pro = list(PRO_RATIOS)
+        assert DENSE_RATIO in self.geometry(pro).classes
+        pro[-1] = ABSENT_RATIO
+        assert DENSE_RATIO not in self.geometry(pro).classes
+
+    def test_asking_an_absent_class_for_an_address_raises(self):
+        pro = list(PRO_RATIOS)
+        pro[-1] = ABSENT_RATIO
+        geo = self.geometry(pro)
+        with pytest.raises(KeyError):
+            geo.window_params(DENSE_RATIO)
+
+    def test_the_classes_that_remain_are_laid_out_as_if_it_never_existed(self):
+        """The absent class must not leave a hole the others address around."""
+        pro = list(PRO_RATIOS)
+        pro[-1] = ABSENT_RATIO
+        geo = self.geometry(pro)
+        without = self.geometry(pro[:-1])
+        assert geo.entry_rows == without.entry_rows
+        assert geo.envelope_rows == without.envelope_rows
+        for ratio in (CSA_RATIO, HCA_RATIO):
+            assert geo.window_params(ratio) == without.window_params(ratio)

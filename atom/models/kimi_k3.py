@@ -59,7 +59,7 @@ from atom.models.utils import (
 )
 from atom.quant_spec import should_skip_online_quant
 from atom.utils import envs, mark_spliting_op
-from atom.utils.decorators import support_torch_compile
+from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import get_forward_context
 
 
@@ -573,7 +573,9 @@ class KimiFullAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.fused_qkv_a_proj",
         )
-        self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=1e-6)
+        self.q_a_layernorm = RMSNorm(
+            self.q_lora_rank, eps=1e-6, prefix=f"{prefix}.q_a_layernorm"
+        )
         self.q_b_proj = ColumnParallelLinear(
             self.q_lora_rank,
             self.num_heads * self.q_head_dim,
@@ -581,7 +583,9 @@ class KimiFullAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.q_b_proj",
         )
-        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=1e-6)
+        self.kv_a_layernorm = RMSNorm(
+            self.kv_lora_rank, eps=1e-6, prefix=f"{prefix}.kv_a_layernorm"
+        )
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
@@ -1002,6 +1006,7 @@ class KimiKDAAttention(nn.Module):
             hidden_states, hidden_states_scale, self.layer_name
         )
 
+    @mark_trace
     def _forward_impl(
         self,
         hidden_states: torch.Tensor,
@@ -1282,9 +1287,15 @@ class KimiDecoderLayer(nn.Module):
         if self.use_attn_residuals:
             self.attn_res_block_size = config.attn_res_block_size
             self.self_attention_res_norm = RMSNorm(
-                config.hidden_size, eps=config.rms_norm_eps
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+                prefix=f"{prefix}.self_attention_res_norm",
             )
-            self.mlp_res_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.mlp_res_norm = RMSNorm(
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+                prefix=f"{prefix}.mlp_res_norm",
+            )
             self.self_attention_res_proj = ReplicatedLinear(
                 config.hidden_size,
                 1,
@@ -1449,10 +1460,14 @@ class KimiLinearModel(nn.Module):
             layer_num_offset=0,
         )
         if get_pp_group().is_last_rank:
-            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.norm = RMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps, prefix=f"{prefix}.norm"
+            )
             if getattr(config, "attn_res_block_size", None) is not None:
                 self.output_attn_res_norm = RMSNorm(
-                    config.hidden_size, eps=config.rms_norm_eps
+                    config.hidden_size,
+                    eps=config.rms_norm_eps,
+                    prefix=f"{prefix}.output_attn_res_norm",
                 )
                 self.output_attn_res_proj = ReplicatedLinear(
                     config.hidden_size,
@@ -1660,3 +1675,96 @@ class KimiK3ForCausalLM(nn.Module):
         # names, so keep these generic enough to match each layer's
         # `block_sparse_moe.experts.{id}.w*.weight` entries.
         return self.language_model.get_expert_mapping()
+
+
+class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
+    """Kimi-K3 with the MoonViT3d vision tower attached.
+
+    Adds `vision_tower` / `mm_projector` next to the language stack, matching
+    the checkpoint layout so no weight renaming is needed. Image embeddings are
+    produced once per prefill by `ModelRunner.run_model` and scattered over the
+    `<|media_pad|>` positions that the input processor expanded.
+    """
+
+    # Vision weights belong to this model, so nothing is skipped by default.
+    # `__init__` re-adds the skips on pipeline ranks that hold no tower.
+    skip_weight_prefixes: ClassVar[list[str]] = []
+    vision_weight_prefixes: ClassVar[tuple[str, ...]] = (
+        "vision_tower.",
+        "mm_projector.",
+    )
+
+    def __init__(self, atom_config: Config, prefix: str = ""):
+        super().__init__(atom_config, prefix=prefix)
+
+        vision_config = getattr(
+            getattr(atom_config, "multimodal_config", None), "vision_config", None
+        )
+        if vision_config is None:
+            raise ValueError(
+                "Kimi-K3 needs the full HF config (with `vision_config`) to "
+                "build its vision tower. Start the server with "
+                "--trust-remote-code."
+            )
+
+        # The tower only runs where the token embeddings are produced.
+        self.has_vision_tower = get_pp_group().is_first_rank
+        if not self.has_vision_tower:
+            self.vision_tower = PPMissingLayer()
+            self.mm_projector = PPMissingLayer()
+            self.skip_weight_prefixes = list(self.vision_weight_prefixes)
+            self.media_placeholder_token_id = None
+            return
+
+        from atom.models.kimi_k3_vl import build_vision_modules
+
+        self.vision_tower, self.mm_projector = build_vision_modules(vision_config)
+        self.media_placeholder_token_id = getattr(
+            atom_config.multimodal_config, "media_placeholder_token_id", 163605
+        )
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.language_model.get_input_embeddings(input_ids)
+
+    def get_vision_embeddings(
+        self, pixel_values: torch.Tensor, grid_thw: torch.Tensor
+    ) -> torch.Tensor:
+        if not self.has_vision_tower:
+            raise RuntimeError(
+                "Kimi-K3 image embeddings were requested on a pipeline rank "
+                "that holds no vision tower; they belong on the first rank."
+            )
+        return self.mm_projector(self.vision_tower(pixel_values, grid_thw))
+
+    def merge_multimodal_embeddings(
+        self,
+        input_ids: torch.Tensor,
+        inputs_embeds: torch.Tensor,
+        vision_embeds: torch.Tensor,
+    ) -> torch.Tensor:
+        mask = input_ids == self.media_placeholder_token_id
+        num_placeholders = int(mask.sum())
+        if num_placeholders != vision_embeds.shape[0]:
+            raise ValueError(
+                f"Kimi-K3 got {vision_embeds.shape[0]} image embeddings for "
+                f"{num_placeholders} placeholder tokens. The prompt's "
+                "`<|media_pad|>` runs must be expanded to (h//2)*(w//2) tokens "
+                "per image, and multimodal prefills must not be chunked."
+            )
+        inputs_embeds[mask] = vision_embeds.to(inputs_embeds.dtype)
+        return inputs_embeds
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors:
+        # Stay on the inputs_embeds path once vision embeddings exist; the
+        # language model would otherwise re-embed input_ids and drop them.
+        if inputs_embeds is None and get_pp_group().is_first_rank:
+            inputs_embeds = self.embed_input_ids(input_ids)
+        return self.language_model(
+            input_ids, positions, intermediate_tensors, inputs_embeds
+        )

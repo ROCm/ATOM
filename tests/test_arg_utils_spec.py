@@ -154,6 +154,7 @@ class TestEngineArgsSpeculativeValidation:
             method="mtp",
             model=args.model,
             num_speculative_tokens=3,
+            synthetic_acceptance_rate=None,
         )
         assert kwargs["speculative_config"] is fake_spec_config
 

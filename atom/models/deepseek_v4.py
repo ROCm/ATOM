@@ -2660,8 +2660,8 @@ class DeepseekV4Attention(nn.Module):
                 device=o.device,
             ).transpose(0, 1)
             y = batched_gemm_bf16(o.transpose(0, 1), wo_a, YQ=y)
-            return y.transpose(0, 1)
-        return torch.einsum("sgd,grd->sgr", o, wo_a)
+            return y.transpose(0, 1).flatten(1)
+        return torch.einsum("sgd,grd->sgr", o, wo_a).flatten(1)
 
     def _attn_post(self, o: torch.Tensor) -> torch.Tensor:
         """Grouped output LoRA + wo_b (graphable, num_tokens-shaped).
@@ -2671,7 +2671,7 @@ class DeepseekV4Attention(nn.Module):
         (overlaps the partner ubatch's compute) and a plain reduce otherwise.
         """
         o = self._wo_a_grouped_lora(o, prefix=f"{self.layer_name}.wo_a")
-        return self.wo_b(o.flatten(1))
+        return self.wo_b(o)
 
     def forward_impl(
         self,

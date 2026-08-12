@@ -981,6 +981,12 @@ class SpeculativeConfig:
     draft_model_hf_config: PretrainedConfig | None = None
     use_aux_hidden_state: bool = False
     eagle3_aux_layer_ids: list[int] = field(default_factory=list)
+    # Debug/benchmark knob: when set (float in [0, 1]), the rejection sampler
+    # force-accepts draft tokens with a position-decaying probability calibrated
+    # so the measured mean acceptance rate matches this value, independent of the
+    # real draft/target agreement. Mirrors vLLM's synthetic_acceptance_rate. See
+    # ROCm/ATOM#555.
+    synthetic_acceptance_rate: float | None = None
 
     # model_type → mtp_model_type mapping
     _MTP_TYPE_MAP: ClassVar[dict[str, str]] = {
@@ -1043,6 +1049,13 @@ class SpeculativeConfig:
         return bool(getattr(cfg, "dspark_with_draft", False))
 
     def __post_init__(self):
+        if self.synthetic_acceptance_rate is not None and not (
+            0.0 <= self.synthetic_acceptance_rate <= 1.0
+        ):
+            raise ValueError(
+                "synthetic_acceptance_rate (--spec-decode-acceptance-rate) must "
+                f"be in [0, 1], but got {self.synthetic_acceptance_rate}."
+            )
         if self.draft_model_hf_config is None:
             self.draft_model_hf_config = get_hf_config(
                 self.model, trust_remote_code=True
