@@ -123,8 +123,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # only to hand it to the next, so the win is launch count and round trips,
     # not FLOPs. Falls back per call when the cache layout or the rope is not
     # the plain one the kernel understands (see
-    # MLAAttention.write_context_kv_latent). Default off until validated on
-    # MI3xx -- the kernel is a static port and has not been run on a GPU.
+    # MLAAttention.write_context_kv_latent). Measured on Kimi-K3 (MI355X, TP8,
+    # fp8 KV): one 4.65us kernel replaces a 14us three-kernel chain, saving 39us
+    # per drafting step at B=1 and ~36us at B=64 -- 0.1% of the step, since the
+    # draft runs under a cudagraph and the launches this removes cost host time,
+    # not device time. Against the per-op chain the stored latent differs on
+    # ~1 element in 5M, where it is the fused kernel that matches an fp64
+    # reference: aiter's RMSNorm rounds x*rstd to bf16 before applying w.
     "ATOM_DSPARK_FUSED_CTX_KV": lambda: (
         os.getenv("ATOM_DSPARK_FUSED_CTX_KV", "0") == "1"
     ),
@@ -135,8 +140,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # by 3.7x for identical math on identical bytes. Separate from
     # ATOM_DSPARK_FUSED_CTX_KV because the risk is different: a narrower N is a
     # different tuned-GEMM shape, so an untuned (M, 576, 7168) could in
-    # principle land on a worse solution than the tuned merged one. Default off
-    # until measured on MI3xx.
+    # principle land on a worse solution than the tuned merged one.
+    # Inert whenever the draft's projection is quantized -- which is the served
+    # Kimi-K3 configuration (ptpc_fp8), since forward_shard cannot narrow a
+    # weight whose scales are per-shard or whose rows have been preshuffled, and
+    # returns the merged GEMM's slice instead. Measured there: not one kernel
+    # changes. Unquantized, (M=3, 576, 7168) has no tuned config and loses 3us
+    # per drafting step to the merged GEMM; it only pays at prefill widths
+    # (2.0ms per 32k prefill) and at larger decode batches (+26us/step at B=64).
     "ATOM_DSPARK_CTX_KV_ONLY_PROJ": lambda: (
         os.getenv("ATOM_DSPARK_CTX_KV_ONLY_PROJ", "0") == "1"
     ),
@@ -156,14 +167,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # samplers and, via spec_decode_patch, to the GREEDY branch of vLLM's
     # DSparkSpeculator._sample_sequential -- probabilistic drafting needs the
     # real logits for gumbel_sample and keeps the unfused path.
-    # Default OFF: the bias GEMV moves from an fp32 matmul over an fp32 copy of
-    # W2 to bf16 MFMA with an fp32 accumulator. Every product is exact in fp32
-    # either way, so the result is equal to the reference up to accumulation
-    # order -- but "no argmax flips on a last-ulp tie" is an empirical claim,
-    # and this could not be validated on hardware when it was written. Turn on
-    # only after a GSM8K acceptance-length parity run. Read once when the
-    # Markov head is built and once when the vLLM patch is installed, so it
-    # must be set before the server starts.
+    # The bias GEMV moves from an fp32 matmul over an fp32 copy of W2 to bf16
+    # MFMA with an fp32 accumulator. Every product is exact in fp32 either way,
+    # so the result is equal to the reference up to accumulation order; whether
+    # an argmax anywhere flips on a last-ulp tie is empirical. Measured on
+    # Kimi-K3 (MI355X, TP8, fp8 KV, full GSM8K at 64 concurrency): acceptance
+    # 87.08% against 87.06% unfused, accept-length distribution equal to within
+    # 0.1pp, flexible-extract inside the run-to-run band (0.9477 / 0.9591 fused,
+    # 0.9522 unfused). Saves 145 us per drafting step at B=1 and ~235 us at
+    # B=64. Read once when the Markov head is built and once when the vLLM
+    # patch is installed, so it must be set before the server starts.
     "ATOM_DSPARK_FUSED_MARKOV_SAMPLE": lambda: (
         os.getenv("ATOM_DSPARK_FUSED_MARKOV_SAMPLE", "0") == "1"
     ),
