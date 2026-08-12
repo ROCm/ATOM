@@ -28,7 +28,7 @@ on:
   workflow_dispatch:
     inputs:
       aiter_branch:
-        description: 'ROCm/aiter branch to build inside the CI image'
+        description: 'ROCm/aiter branch, tag or commit to build in the container. Leave as main to use the prebuilt main wheel.'
         required: false
         default: 'main'
         type: string
@@ -46,9 +46,9 @@ concurrency:
 env:
   ATOM_BASE_IMAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.atom_base_image || 'rocm/atom-dev:latest' }}
   ATOM_PYTHON_TAG: "cp312"
-  GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
-  # workflow_dispatch: inputs.aiter_branch; otherwise main (matches previous default-branch shallow clone)
+  # 'main' takes the prebuilt main wheel; any other ref is built from source in
+  # the container instead (see the two mutually exclusive aiter install steps).
   AITER_GIT_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.aiter_branch || 'main' }}
 
 jobs:
@@ -337,38 +337,8 @@ jobs:
           echo "Pulling immutable native dashboard image: ${RESOLVED_ATOM_BASE_IMAGE}"
           docker pull "${RESOLVED_ATOM_BASE_IMAGE}"
 
-      - name: Generate Dockerfile for forked repo
-        if: ${{ github.event.pull_request.head.repo.fork }}
-        run: |
-          cat <<EOF > Dockerfile.mod
-          FROM ${{ env.ATOM_BASE_IMAGE }}
-          RUN pip install -U lm-eval[api]
-          RUN pip show lm-eval || true
-          RUN pip install hf_transfer
-          RUN pip show hf_transfer || true
-          RUN echo "=== Aiter version BEFORE uninstall ===" && pip show amd-aiter || true
-          RUN pip uninstall -y amd-aiter
-          RUN pip install --upgrade "pybind11>=3.0.1"
-          RUN pip show pybind11
-          RUN rm -rf /app/aiter-test
-          RUN git clone --filter=blob:none -b ${{ env.AITER_GIT_REF }} https://github.com/ROCm/aiter.git /app/aiter-test && \\
-              cd /app/aiter-test && \\
-              git submodule sync && git submodule update --init --recursive && \\
-              MAX_JOBS=64 PREBUILD_KERNELS=0 GPU_ARCHS=gfx950 python3 setup.py develop
-          RUN echo "=== Aiter version AFTER installation ===" && pip show amd-aiter || true
-          
-          RUN echo "=== ATOM version BEFORE uninstall ===" && pip show atom || true
-          RUN pip uninstall -y atom
-          RUN rm -rf /app/ATOM
-          RUN git clone ${{ env.GITHUB_REPO_URL }} /app/ATOM && \\
-              cd /app/ATOM && \\
-              git checkout ${{ env.GITHUB_COMMIT_SHA }} && \\
-              pip install -e .
-
-          RUN echo "=== ATOM version AFTER installation ===" && pip show atom || true
-          EOF
-
       - name: Download aiter wheel
+        if: ${{ env.AITER_GIT_REF == 'main' }}
         timeout-minutes: 30
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -411,7 +381,13 @@ jobs:
         run: bash .github/scripts/collect_gpu_info.sh "$CONTAINER_NAME" docker "${{ matrix.runner }}"
 
       - name: Install aiter from wheel
+        if: ${{ env.AITER_GIT_REF == 'main' }}
         run: bash .github/scripts/install_aiter_wheel.sh
+
+      - name: Install aiter from branch
+        if: ${{ env.AITER_GIT_REF != 'main' }}
+        timeout-minutes: 60
+        run: bash .github/scripts/install_aiter_from_source.sh
 
       - name: Install ATOM and dependencies
         run: |
