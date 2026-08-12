@@ -186,6 +186,11 @@ AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT="${AIPERF_SERVICE_PROFILE_CONFIGURE_TIM
 AIPERF_UNSAFE_OVERRIDE="${AIPERF_UNSAFE_OVERRIDE:-}"
 PREFILL_KV_TRANSFER_CONFIG="${PREFILL_KV_TRANSFER_CONFIG:-}"
 DECODE_KV_TRANSFER_CONFIG="${DECODE_KV_TRANSFER_CONFIG:-}"
+# Name of an extra prefill-side offload connector (e.g. lmcache_offload) to pair
+# with mooncake. Set it instead of PREFILL_KV_TRANSFER_CONFIG so the handshake
+# port stays derived from HANDSHAKE_PORT and keeps tracking the per-phase
+# ATOMESH_SERVICE_PORT_OFFSET.
+PREFILL_KV_OFFLOAD_CONNECTOR="${PREFILL_KV_OFFLOAD_CONNECTOR:-}"
 
 default_profiler_dir="${RUN_DIR}/online_quant/rank-${NODE_RANK}"
 if [[ "${ATOMESH_EXECUTION_PHASE}" != "combined" ]]; then
@@ -546,6 +551,9 @@ start_prefill() {
     prefill_kv_transfer_config="${PREFILL_KV_TRANSFER_CONFIG}"
   else
     prefill_kv_transfer_config="{\"kv_role\":\"kv_producer\",\"kv_connector\":\"mooncake\",\"proxy_ip\":\"${host_ip}\",\"handshake_port\":${handshake_port}}"
+    if [[ -n "${PREFILL_KV_OFFLOAD_CONNECTOR}" ]]; then
+      prefill_kv_transfer_config="{\"kv_connector\":\"multi\",\"connectors\":[${prefill_kv_transfer_config},{\"kv_connector\":\"${PREFILL_KV_OFFLOAD_CONNECTOR}\",\"kv_role\":\"offload\"}]}"
+    fi
   fi
   echo "[prefill] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} handshake=${handshake_port} dp_master=${dp_master_port} dp_base=${dp_base_port} cudagraph=${PREFILL_CUDAGRAPH:-none}"
   local -a prefill_cmd=(

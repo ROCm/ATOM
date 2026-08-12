@@ -266,8 +266,20 @@ models:
               workers: 1
               tp: 4
               cudagraph: none
+            # LMCache CPU offload is the default for every AgentX case: the 1M
+            # traces reuse long prefixes across turns, so the offload tier is
+            # what the agentic scenario is meant to exercise. The connector JSON
+            # itself is assembled by pd_server_atom.sh so the mooncake handshake
+            # port keeps tracking ATOMESH_SERVICE_PORT_OFFSET.
             env:
-              decode:
+              common: &glm52_agentic_common_env
+                PYTHONHASHSEED: "0"
+              prefill: &glm52_agentic_prefill_env
+                LMCACHE_LOCAL_CPU: "True"
+                LMCACHE_MAX_LOCAL_CPU_SIZE: "200"
+                LMCACHE_CHUNK_SIZE: "256"
+                PREFILL_KV_OFFLOAD_CONNECTOR: lmcache_offload
+              decode: &glm52_agentic_decode_env
                 MAX_JOBS: "16"
             benchmark:
               kind: aiperf_agentic
@@ -356,17 +368,6 @@ models:
             tp: 8
             cudagraph: none
             extra_args: "--enable-dp-attention --enable-tbo"
-          env: &glm52_agentic_lmcache_env
-            common: &glm52_agentic_lmcache_common_env
-              PYTHONHASHSEED: "0"
-            prefill: &glm52_agentic_lmcache_prefill_env
-              LMCACHE_LOCAL_CPU: "True"
-              LMCACHE_MAX_LOCAL_CPU_SIZE: "200"
-              LMCACHE_CHUNK_SIZE: "256"
-              PREFILL_KV_TRANSFER_CONFIG: >-
-                {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":6301},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
-            decode: &glm52_agentic_lmcache_decode_env
-              MAX_JOBS: "16"
 
         - <<: *glm52_agentic_lmcache
           name: glm-52-mxfp4-1p1d-tp4-pcp2-agentic-lmcache-1m-c48
@@ -384,14 +385,16 @@ models:
             workers: 1
             tp: 8
             cudagraph: none
+          # Re-stated because an explicit `env:` replaces the anchor's wholesale;
+          # only HIP_VISIBLE_DEVICES differs from the shared AgentX environment.
           env:
             common:
-              <<: *glm52_agentic_lmcache_common_env
+              <<: *glm52_agentic_common_env
             prefill:
-              <<: *glm52_agentic_lmcache_prefill_env
+              <<: *glm52_agentic_prefill_env
               HIP_VISIBLE_DEVICES: "0,1,2,3,4,5,6,7"
             decode:
-              <<: *glm52_agentic_lmcache_decode_env
+              <<: *glm52_agentic_decode_env
 
     accuracy:
       task: gsm8k
