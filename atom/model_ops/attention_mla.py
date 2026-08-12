@@ -4,7 +4,7 @@
 import logging
 from dataclasses import dataclass
 from functools import partial as functools_partial
-from typing import Optional, Protocol
+from typing import ClassVar, Optional, Protocol
 
 import torch
 import triton
@@ -331,6 +331,14 @@ class MLAAttention(nn.Module):
         self.one_scale = torch.tensor(1.0, dtype=torch.float32)
         self._k_scale = self.one_scale
         self._q_scale = self.one_scale
+        # A device copy for write_context_kv_latent's fused store, which reads
+        # the scale from a Triton pointer. The scales above are host tensors --
+        # the aiter store kernels take them as host scalars -- and a host
+        # pointer is not addressable from the GPU. Made here so the fused path
+        # neither allocates nor synchronizes on the per-step path.
+        self._k_scale_device = self._k_scale.to(
+            torch.cuda.current_device(), non_blocking=True
+        )
         atom_config = get_current_atom_config()
         self._dpa_persistent_supported = supports_dpa_persistent_mode(
             atom_config,
@@ -1489,8 +1497,11 @@ class MLAAttention(nn.Module):
                 scale=self._k_scale,
             )
 
-    # One diagnostic line per process, not per layer: see the log below.
-    _ctx_kv_fusion_logged = False
+    # One diagnostic line per outcome per process, not per layer: see the log
+    # below. Two entries at most -- the first write necessarily takes the per-op
+    # path (it is what moves the rope cache to the device), so logging only the
+    # very first call would report a fusion that is in fact running.
+    _ctx_kv_fusion_logged: ClassVar[set[bool]] = set()
 
     def write_context_kv_latent(
         self,
@@ -1523,6 +1534,12 @@ class MLAAttention(nn.Module):
             and kv_cache.stride(-1) == 1
             and kv_lora.dim() == 2
             and kv_lora.stride(-1) == 1
+            # get_rope leaves cos/sin on the host until its first forward, which
+            # also casts them to the activation dtype. Until that has happened
+            # the kernel cannot read them (and would read fp32 where the per-op
+            # path reads bf16), so the first write of a layer takes the per-op
+            # path and moves them; every later one fuses.
+            and self.rotary_emb.cos_cache.device == kv_cache.device
             # The fused kernel inlines ATOM RMSNorm's math; a Gemma-style norm
             # (x * (1 + w)) or any other flavour must keep calling its module.
             and isinstance(kv_a_layernorm, RMSNorm)
@@ -1530,8 +1547,8 @@ class MLAAttention(nn.Module):
         # Every rejection above is silent and per call, so a layout the kernel
         # does not recognise would otherwise leave the fusion inert with nothing
         # in the log to say so. One line, first write of the process.
-        if not MLAAttention._ctx_kv_fusion_logged:
-            MLAAttention._ctx_kv_fusion_logged = True
+        if use_fused not in MLAAttention._ctx_kv_fusion_logged:
+            MLAAttention._ctx_kv_fusion_logged.add(use_fused)
             logger.info(
                 "MLA context-row KV write: %s (ATOM_DSPARK_FUSED_CTX_KV=%d, "
                 "cache %s %s, kv_lora %s)",
@@ -1550,7 +1567,7 @@ class MLAAttention(nn.Module):
                 self.rotary_emb.sin_cache,
                 slot_mapping.flatten(),
                 kv_cache,
-                self._k_scale,
+                self._k_scale_device,
                 kv_a_layernorm.eps,
                 self.kv_lora_rank,
                 self.qk_rope_head_dim,
