@@ -947,6 +947,57 @@ class TestCopyLifecycle:
             assert dst == bm.state.lookup(h)
             assert dst not in owner_groups
 
+    @pytest.mark.parametrize("free_groups", [1, 2])
+    def test_pending_copies_deduplicate_hashes_and_reserve_destinations(
+        self, free_groups
+    ):
+        config = copy_config(
+            max_num_seqs=3,
+            pool_entries={"state": 3 + free_groups},
+        )
+        bm = BlockManager(config)
+        owners = [
+            self._admitted(bm, list(range(40))),
+            self._admitted(bm, list(range(40))),
+            self._admitted(bm, list(range(100, 140))),
+        ]
+        hashes = []
+        for seq in owners:
+            bm.hash_blocks(
+                seq,
+                bm.checkpoint_limit(seq) - seq.num_cached_tokens,
+            )
+            hashes.append(boundary_hash(bm, seq))
+
+        assert hashes[0] == hashes[1]
+        assert hashes[0] != hashes[2]
+        copies = bm.state_copies_for_batch()
+
+        # The duplicate H intent needs no second copy. With one free group only
+        # one distinct boundary fits; with two, both do. In neither case may a
+        # destination be released and reused while its copy is still pending.
+        kept = min(free_groups, 2)
+        assert len(copies) == kept
+        destinations = [dst for _, dst in copies]
+        assert len(destinations) == len(set(destinations))
+        assert len(bm.state.hash_to_group) == kept
+        assert set(bm.state.hash_to_group).issubset(set(hashes))
+        assert set(destinations) == set(bm.state.hash_to_group.values())
+        assert bm.state.checkpoint_fates() == {
+            "checkpoints_kept": kept,
+            "checkpoints_dropped": 2 - kept,
+            "checkpoints_evicted": 0,
+            "checkpoints_orphaned": 0,
+        }
+
+    def test_duplicate_copy_destinations_fail_before_the_batch(self):
+        pool = StateGroupPool(4)
+        pool.record_copy(0, 3)
+        pool.record_copy(1, 3)
+
+        with pytest.raises(RuntimeError, match="destinations must be unique"):
+            pool.take_copies()
+
     def test_a_resume_is_handed_a_duplicate_not_a_fork(self):
         bm = BlockManager(copy_config())
         first = self._admitted(bm)

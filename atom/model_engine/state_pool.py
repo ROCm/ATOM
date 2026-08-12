@@ -536,23 +536,38 @@ class StateGroupPool:
         skipped, so nothing is ever indexed over state that is gone. That check
         is only sound because this runs with the batch already decided — see
         `take_copies`.
+
+        Several owners can publish the same content hash in one step. One copy
+        satisfies that boundary, so collapse those intents before assigning
+        destinations; checkpoint fates therefore count distinct hashes, not
+        redundant intents. All destinations stay claimed until every assignment
+        is complete: releasing one early would let a later `pop` recycle it and
+        schedule two asynchronous copies into the same group.
         """
         if not self._checkpoint_pending:
             return
+        pending: dict[int, int] = {}
         for seq in self._checkpoint_pending:
             h, seq.pending_checkpoint = seq.pending_checkpoint, -1
             src = seq.per_req_cache_group
             if h == -1 or src < 0:
                 continue
+            pending[h] = src
+        self._checkpoint_pending.clear()
+
+        reserved: list[tuple[int, int, int]] = []
+        for h, src in pending.items():
             if not self.has_free():
                 self.checkpoints_dropped += 1
                 continue
             dst = self.pop()
-            self.release(dst)
+            reserved.append((h, src, dst))
+
+        for h, src, dst in reserved:
             self._index(h, dst)
+            self.release(dst)
             self._copies.append((src, dst))
             self.checkpoints_kept += 1
-        self._checkpoint_pending.clear()
 
     def checkpoint_fates(self) -> dict[str, int]:
         """What became of the checkpoints the ladder asked this pool to keep."""
@@ -589,6 +604,9 @@ class StateGroupPool:
         can return neither.
         """
         self._commit_pending()
+        destinations = [dst for _, dst in self._copies]
+        if len(destinations) != len(set(destinations)):
+            raise RuntimeError("state copy destinations must be unique within a batch")
         copies, self._copies = self._copies, []
         return copies
 
