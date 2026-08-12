@@ -871,7 +871,6 @@ jobs:
               sbatch_cmd+=(
                 --controller "${SPUR_CONTROLLER_ADDR}"
                 -q amd-burst-qos
-                --reservation=atomesh-ci
               )
             fi
           fi
