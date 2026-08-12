@@ -275,6 +275,12 @@ def scale_cpu_size_for_pp(cfg, config) -> None:
     (``pp_size * configured``) unchanged. The horizon then works out to
     ``configured * pp_size / (total_layers * bytes_per_token_per_layer)`` on
     every stage, independent of how the layers were split.
+
+    Speculative decode binds the draft's KV layer on the last PP stage only, and
+    the offload codec moves every bound layer — so that stage's bytes-per-token
+    covers one more layer than its slice of the target. Counting only target
+    layers would under-budget it and, since loads are all-or-nothing, drag the
+    whole node's horizon down to the short stage.
     """
     pp_size = int(getattr(config, "pipeline_parallel_size", 1) or 1)
     if pp_size <= 1:
@@ -286,7 +292,7 @@ def scale_cpu_size_for_pp(cfg, config) -> None:
 
     from atom.models.utils import get_pp_indices
 
-    total_layers = int(config.hf_config.num_hidden_layers)
+    num_hidden_layers = int(config.hf_config.num_hidden_layers)
     pp_rank = int(
         getattr(
             getattr(config, "parallel_config", None),
@@ -294,8 +300,18 @@ def scale_cpu_size_for_pp(cfg, config) -> None:
             0,
         )
     )
-    start, end = get_pp_indices(total_layers, pp_rank, pp_size)
+    start, end = get_pp_indices(num_hidden_layers, pp_rank, pp_size)
     local_layers = end - start
+
+    spec = getattr(config, "speculative_config", None)
+    draft_layers = 0
+    if spec is not None:
+        draft_hf = getattr(spec, "draft_model_hf_config", None)
+        draft_layers = int(getattr(draft_hf, "num_nextn_predict_layers", 1) or 0)
+    total_layers = num_hidden_layers + draft_layers
+    if pp_rank == pp_size - 1:
+        local_layers += draft_layers
+
     if local_layers <= 0 or total_layers <= 0:
         return
 

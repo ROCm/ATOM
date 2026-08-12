@@ -124,7 +124,7 @@ class PPEngineCoreProc(EngineCore):
                 self._in_flight.popleft()
                 self.scheduler.release_pp_inflight(scheduled_batch)
                 if self._defer_prefix_hash:
-                    self._pending_prefix_hash.append(scheduled_batch)
+                    self._pending_prefix_hash.append((scheduled_batch, seqs))
                 continue
 
             fwd_out = self.pp_transport.recv_tokens(timeout_ms=poll_ms)
@@ -157,9 +157,9 @@ class PPEngineCoreProc(EngineCore):
 
     def _flush_pending_prefix_hashes(self):
         while self._pending_prefix_hash:
-            batch = self._pending_prefix_hash.popleft()
+            batch, seqs = self._pending_prefix_hash.popleft()
             try:
-                self.scheduler.register_prefill_hashes(batch)
+                self.scheduler.register_prefill_hashes(batch, seqs.values())
             except Exception:
                 logger.exception(
                     "register_prefill_hashes failed for batch %s — "
@@ -282,8 +282,6 @@ class PPEngineCoreProc(EngineCore):
                     )
 
                 if len(batch.req_ids) == 0:
-                    # Connector-only broadcast from an idle head: the metadata
-                    # above was the whole payload, there is nothing to forward.
                     if self.kv_transfer_enabled:
                         self._poll_and_send_kv_status()
                     continue

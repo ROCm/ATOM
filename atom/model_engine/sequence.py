@@ -160,6 +160,11 @@ class Sequence:
         # stream callback
         self.stream_callback = stream_callback
         self.output_tokens = []  # cache for newly generate tokens
+        # Placeholder tokens appended by the previous postprocess for this step's
+        # output to overwrite in place. Zero until a postprocess has appended
+        # some, which is why the first output for a sequence must be appended
+        # rather than written at a negative offset.
+        self.num_placeholder_tokens: int = 0
 
         # save speculative tokens if is_deferred_output = False or prefill is inter
         self.spec_token_ids: np.ndarray = np.array([], dtype=np.int32)

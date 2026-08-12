@@ -958,6 +958,12 @@ class MooncakeConnector(KVConnectorBase):
                 "transfer_id": meta.transfer_id,
                 "consumer_host": self.local_ip,
                 "consumer_rpc_port": self.rpc_port,
+                # Per-group width of the consumer's region list. The producer
+                # derives the same number by dividing, which cannot tell an equal
+                # number of wider groups from a different number of groups — the
+                # one region-mapping error that stays in range and so writes
+                # silently wrong KV.
+                "consumer_num_layers": self._num_local_layers,
                 "dst_block_ids": dst_block_ids,
                 # Source block_ids so downstream stages (no scheduler, no
                 # _completed_prefills) can transfer without a local lookup.
@@ -1339,31 +1345,59 @@ class MooncakeConnector(KVConnectorBase):
                 request_data.get("transfer_id"),
             )
 
-    def _consumer_region_map(self, num_local_regions: int) -> list[int]:
+    def _consumer_region_map(
+        self,
+        num_local_regions: int,
+        num_consumer_regions: int,
+        consumer_num_layers: int | None = None,
+    ) -> list[int]:
         """Map this stage's local RDMA regions onto the consumer's region list.
 
         Backends register regions group-major (all layers of one kind, then the
         next), so a pipeline stage's local region ``i`` maps to consumer index
-        ``(i // L) * num_hidden_layers + start_layer + (i % L)`` where ``L`` is
-        this stage's layer count.  Returns the identity map for the non-PP case;
-        falls back to identity (with a warning) for a non-uniform layout the
-        group-major mapping cannot express.
+        ``(i // L) * stride + start_layer + (i % L)`` where ``L`` is this stage's
+        layer count and ``stride`` is the consumer's per-group width.  Returns the
+        identity map for the non-PP case.
+
+        Raises when the layout is not expressible.  Identity is only a valid
+        fallback at ``pp_size == 1`` (handled inside ``consumer_region_indices``);
+        under PP it would write this stage's layers onto the consumer's layers
+        ``0..L`` — in range, so RDMA reports success and the KV is silently wrong.
+        Failing the transfer surfaces as a consumer timeout instead, which is
+        diagnosable.
         """
+        if (
+            consumer_num_layers is not None
+            and self.pp_size > 1
+            and num_local_regions
+            and self._num_local_layers
+            and num_local_regions % self._num_local_layers == 0
+        ):
+            groups = num_local_regions // self._num_local_layers
+            if consumer_num_layers * groups != num_consumer_regions:
+                raise RuntimeError(
+                    f"Region group mismatch: this stage has {groups} group(s) of "
+                    f"{self._num_local_layers} layers, but the consumer reports "
+                    f"{num_consumer_regions} regions over {consumer_num_layers} "
+                    "layers per group. Producer and consumer must register the "
+                    "same region groups."
+                )
         cmap = consumer_region_indices(
             num_local_regions,
             self._num_local_layers,
             self._start_layer,
-            self.num_hidden_layers,
+            num_consumer_regions,
             self.pp_size,
         )
         if cmap is None:
-            logger.warning(
-                "Cannot layer-map transfer: %d regions not a multiple of %d "
-                "local layers; writing identity (verify layer routing).",
-                num_local_regions,
-                self._num_local_layers,
+            raise RuntimeError(
+                f"Cannot layer-map transfer: {num_local_regions} local regions / "
+                f"{self._num_local_layers} local layers (start_layer="
+                f"{self._start_layer}) do not map onto {num_consumer_regions} "
+                "consumer regions as uniform group-major. Producer and consumer "
+                "must register the same region groups — check that both sides "
+                "agree on speculative decode (a draft KV layer widens every group)."
             )
-            return list(range(num_local_regions))
         return cmap
 
     def _execute_block_transfer(
@@ -1382,7 +1416,11 @@ class MooncakeConnector(KVConnectorBase):
         sizes: list[int] = []
 
         num_regions = len(self.kv_caches_base_addr)
-        cmap = self._consumer_region_map(num_regions)
+        cmap = self._consumer_region_map(
+            num_regions,
+            len(consumer_base_addrs),
+            request_data.get("consumer_num_layers"),
+        )
         for region_idx in range(num_regions):
             src_base = self.kv_caches_base_addr[region_idx]
             dst_base = consumer_base_addrs[cmap[region_idx]]
@@ -1437,7 +1475,11 @@ class MooncakeConnector(KVConnectorBase):
         block_dst: list[int] = []
         block_sizes: list[int] = []
 
-        block_cmap = self._consumer_region_map(len(self._block_regions))
+        block_cmap = self._consumer_region_map(
+            len(self._block_regions),
+            len(consumer_block_addrs),
+            request_data.get("consumer_num_layers"),
+        )
         for region_idx, (src_base, bpb) in enumerate(self._block_regions):
             cidx = block_cmap[region_idx]
             dst_base = consumer_block_addrs[cidx]
@@ -1461,7 +1503,9 @@ class MooncakeConnector(KVConnectorBase):
                 f"(src={src_swa_block_ids}, dst={dst_swa_block_ids}); the "
                 "resuming request would read an empty sliding window"
             )
-        swa_cmap = self._consumer_region_map(len(self._swa_block_regions))
+        swa_cmap = self._consumer_region_map(
+            len(self._swa_block_regions), len(consumer_swa_block_addrs)
+        )
         for region_idx, src_region in enumerate(self._swa_block_regions):
             dst_region = consumer_swa_regions[swa_cmap[region_idx]]
             for sb, db in zip(src_swa_block_ids, dst_swa_block_ids):
@@ -1499,7 +1543,9 @@ class MooncakeConnector(KVConnectorBase):
         slot_sizes: list[int] = []
 
         # Phase 2a: SWA slot regions (direct, no staging)
-        slot_cmap = self._consumer_region_map(len(self._slot_regions))
+        slot_cmap = self._consumer_region_map(
+            len(self._slot_regions), len(consumer_slot_addrs)
+        )
         for region_idx, (src_base, bps) in enumerate(self._slot_regions):
             cidx = slot_cmap[region_idx]
             dst_base = consumer_slot_addrs[cidx]

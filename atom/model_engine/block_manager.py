@@ -79,6 +79,10 @@ class BlockManager:
         self.hash_block_size = self.block_size * self.dcp_world_size
         self.enable_prefix_caching = config.enable_prefix_caching
         self.total_evicted_blocks: int = 0
+        # Blocks whose hash had to be reconstructed by _chain_parent_hash.
+        # Steady-state this should stay at 0; a rising count means some path is
+        # still dropping hashes for blocks whose KV is already computed.
+        self.total_backfilled_blocks: int = 0
 
         kv_events = getattr(config, "kv_events_config", None)
         self._events_enabled: bool = bool(kv_events and kv_events.enable)
@@ -359,6 +363,7 @@ class BlockManager:
             "hashed": hashed,
             "retained": max(0, hashed - used),
             "evicted_total": self.total_evicted_blocks,
+            "backfilled_total": self.total_backfilled_blocks,
         }
 
     def can_allocate(self, seq: Sequence) -> int:
@@ -527,6 +532,58 @@ class BlockManager:
         seq.per_req_cache_group = src
         seq.state_fork_src = -1
 
+    def _chain_parent_hash(self, seq: Sequence, start: int) -> int:
+        """Return the chained hash of block ``start - 1``, rebuilding if missing.
+
+        Block hashes form a chain: block N depends on block N-1. A gap appears
+        when the publish path doesn't fire — most commonly a sequence parked for
+        an LMCache offload load leaves ``Scheduler.running`` before its boundary
+        chunk's deferred hash flush runs. Re-rooting the chain at ``-1`` would be
+        wrong: ``compute_hash(tokens, -1)`` is indistinguishable from a genuine
+        prompt-initial block, minting false roots that a later request can match.
+
+        Walk back to the nearest hashed ancestor (or prompt start) and recompute
+        the chain forward. Existing canonical ``hash_to_block_id`` mappings are
+        not overwritten (``setdefault``), matching ``publish_loaded_prefix``.
+        """
+        if start <= 0:
+            return -1
+        h = self.blocks[seq.block_table[start - 1]].hash
+        if h != -1:
+            return h
+
+        gap_start = start - 1
+        while gap_start > 0 and self.blocks[seq.block_table[gap_start - 1]].hash == -1:
+            gap_start -= 1
+        h = -1 if gap_start == 0 else self.blocks[seq.block_table[gap_start - 1]].hash
+
+        record = self._event_log is not None
+        run_parent: int | None = h if h != -1 else None
+        run_hashes: list[int] = []
+        run_tokens: list[int] = []
+        for i in range(gap_start, start):
+            token_ids = self._hash_block_tokens(seq, i)
+            block = self.blocks[seq.block_table[i]]
+            h = self.compute_hash(token_ids, h)
+            block.update(h, token_ids)
+            self.hash_to_block_id.setdefault(h, block.block_id)
+            self.swa.publish_hash(seq, i, h, token_ids)
+            if record:
+                run_hashes.append(h)
+                run_tokens.extend(token_ids)
+        self.total_backfilled_blocks += start - gap_start
+        logger.debug(
+            "Backfilled prefix hash chain: seq=%s blocks=%d:%d",
+            seq.id,
+            gap_start,
+            start,
+        )
+        if record and run_hashes:
+            self._event_log.append(
+                _make_block_stored(run_hashes, run_tokens, run_parent, self.block_size)
+            )
+        return h
+
     def hash_blocks(
         self,
         seq: Sequence,
@@ -559,12 +616,15 @@ class BlockManager:
         base = seq.num_cached_tokens if start_tokens is None else start_tokens
         start = base // hbs
         end = (base + num_new_tokens) // hbs
+        # A finished or preempted seq has had its block table released; the
+        # deferred publish paths can still reach it with a stale token count.
+        end = min(end, len(seq.block_table))
         if start >= end:
             return
         # Watermark for the decode-side continuation, maintained here so every
         # prefill path feeds it without knowing about it.
         seq.num_hashed_tokens = max(seq.num_hashed_tokens, end * hbs)
-        h = self.kv.block(seq.block_table[start - 1]).hash if start > 0 else -1
+        h = self._chain_parent_hash(seq, start)
         record = self._event_log is not None
         store_run_parent: int | None = h if h != -1 else None
         store_run_hashes: list[int] = []
@@ -960,19 +1020,7 @@ class BlockManager:
             )
             return 0
 
-        if start_block == 0:
-            parent_hash = -1
-        else:
-            parent = self.kv.block(seq.block_table[start_block - 1])
-            if parent.hash == -1:
-                logger.warning(
-                    "Cannot publish offload prefix without indexed parent: "
-                    "seq=%s start_block=%d",
-                    seq.id,
-                    start_block,
-                )
-                return 0
-            parent_hash = parent.hash
+        parent_hash = self._chain_parent_hash(seq, start_block)
 
         indexed_tokens = 0
         for i in range(start_block, end_block):
