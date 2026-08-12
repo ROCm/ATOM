@@ -336,9 +336,8 @@ class DSparkProposer(Drafter):
         """
         del next_token_ids
         if self._with_draft:
-            # Standalone draft (Kimi-K3): no rolling window exists to fill. Its
-            # target context goes into the paged sibling pool addressed by slot
-            # mapping, which `_propose_with_draft` writes at draft time.
+            # Standalone draft (Kimi-K3): its context rows are addressed by slot
+            # mapping into the paged sibling pool
             return
         aux_hidden_states = self.aux_for(hidden_states)
         if aux_hidden_states is None:
@@ -347,11 +346,7 @@ class DSparkProposer(Drafter):
         bs = forward_context.context.batch_size
         main_hidden_all = torch.cat(aux_hidden_states, dim=-1)
         with record_function(f"dspark_ctx_kv[bs={bs} tok={main_hidden_all.shape[0]}]"):
-            self.model.precompute_context_kv(
-                main_hidden_all,
-                positions,
-                forward_context.attn_metadata.cu_seqlens_q[: bs + 1],
-            )
+            self.model.write_context_kv(main_hidden_all, positions)
 
     def propose(
         self,
@@ -487,13 +482,12 @@ class DSparkProposer(Drafter):
         attn_metadata.causal = False
 
         # ---- 1. Context rows -------------------------------------------------
-        if not is_dummy:
-            with record_function(f"dspark_ctx_kv[bs={bs} tok={num_tokens}]"):
-                self.model.write_context_kv(
-                    main_hidden_all,
-                    target_positions,
-                    attn_metadata.slot_mapping[:num_tokens],
-                )
+        # Before the retarget below: the layers read the TARGET forward's slot
+        # mapping off the forward context to place these rows (see
+        # `DSparkDraftModel.write_context_kv`), and step 2 overwrites it with the
+        # draft block's own. The `is_dummy` short-circuit is the base class's.
+        with record_function(f"dspark_ctx_kv[bs={bs} tok={num_tokens}]"):
+            self.model.write_context_kv(main_hidden_all, target_positions)
 
         # ---- 2. Block metadata ----------------------------------------------
         block_positions = self._blk_positions[:bs]  # [bs, T] view, stable
