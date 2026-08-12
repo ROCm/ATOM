@@ -6,6 +6,7 @@ import torch
 from aiter import dtypes
 
 from atom.model_engine.scheduler import ScheduledBatch
+from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attention_mla import MLAAttention
 from atom.utils import envs
 
@@ -60,6 +61,26 @@ class _KimiMLAGDNCommon(GDNStateMixin):
         hf = runner.config.hf_config
         num_draft = runner._get_total_num_layers() - hf.num_hidden_layers
         return runner.num_full_attn + num_draft
+
+    def state_transfer(self) -> StateTransfer:
+        """`GDNStateMixin`'s fork, minus its midstep claim.
+
+        KDA does not run the chunk kernel this file's GDN sibling does: it
+        calls `fla.ops.kda.chunk_kda`, which returns only the final state and
+        never exposes the per-chunk states an interior checkpoint is sliced
+        out of. `_checkpoint_targets` is also unreachable here, because
+        `prepare_prefill` below overrides the one that calls it.
+
+        Inheriting the mixin's answer would therefore be actively wrong rather
+        than merely optimistic: `BlockManager` would stop cutting prefill
+        chunks onto checkpoint positions and `checkpointers_at` would stop
+        keeping them, so KDA would keep *zero* checkpoints — silently, since
+        nothing on that path can tell a checkpoint that was skipped from one
+        that was never wanted. Overridden here rather than fixed by making the
+        mixin's flag conditional, so that the class which cannot do the thing
+        is the class that says so.
+        """
+        return StateTransfer.fork(1)
 
     def sub_pool_specs(self) -> list[SubPoolSpec]:
         """MLA paged KV for the full-attention layers, plus the KDA/GDN
