@@ -1585,37 +1585,55 @@ def test_state_checkpoint_fates_warns_on_missing_method(caplog):
     )
 
 
-def test_state_checkpoint_fates_log_order_is_stable():
-    """The periodic log line must emit keys in sorted order.
+def test_state_checkpoint_fates_log_order_is_stable(caplog):
+    """The periodic log line emitted by `Scheduler.schedule()` sorts its keys.
 
-    Dict insertion order is not deterministic across class additions, so the
-    log format used by ``Scheduler.schedule()`` sorts ``fates.items()`` before
-    joining.  Assert that the result of sorting matches a lexicographic
-    reference — if someone removes the ``sorted()`` call the line reverts to
-    insertion order, which this test would catch.
+    Read by an operator diffing one stats line against the next, so the field
+    order has to be a property of the line rather than of whichever order the
+    counters happen to be declared in — `StateGroupPool.checkpoint_fates()`
+    returns them kept/dropped/evicted/orphaned, which is not alphabetical, and
+    a new counter appended to that dict would otherwise land in the middle of
+    the line for every deployment at once.
+
+    Asserted against the emitted message, not against a `sorted()` this test
+    applies itself: dropping the `sorted()` from the scheduler's join has to be
+    what fails here, and the non-alphabetical insertion order above is what
+    makes the two distinguishable.
     """
-    pool = StateGroupPool(
-        num_groups=4, transfer=StateTransfer.copy(), hash_block_size=4
-    )
-    # Simulate one checkpoint being kept so fates has non-trivial values.
+    import logging
+
+    sched = Scheduler(ckpt_config())
+    sched.add(stateful_seq(list(range(40))))
+    pool = sched.block_manager.state
     pool.checkpoints_kept += 3
     pool.checkpoints_dropped += 1
+    # The premise: if the counters were declared alphabetically the emitted
+    # line would be sorted whether or not the scheduler sorted it.
+    assert list(pool.checkpoint_fates()) != sorted(pool.checkpoint_fates())
 
-    fates = pool.checkpoint_fates()
-    # The scheduler joins sorted(fates.items()); verify that sorted order is
-    # stable and matches alphabetical key order.
-    sorted_keys = [k for k, _ in sorted(fates.items())]
-    assert sorted_keys == sorted(fates.keys()), (
-        "sorted(fates.items()) must yield keys in alphabetical order; "
-        f"got {sorted_keys}"
-    )
-    # And specifically: the alphabetical order for the four real keys is fixed.
-    assert sorted_keys == [
+    # The line is periodic — one pass in a hundred — so the batch has to be
+    # driven to the tick that emits it.
+    with caplog.at_level(logging.INFO, logger="atom"):
+        for _ in range(100):
+            sched.schedule()
+
+    lines = [
+        r.getMessage()
+        for r in caplog.records
+        if r.getMessage().startswith("state checkpoints: ")
+    ]
+    assert lines, "the periodic state-checkpoint line was never emitted"
+
+    fields = lines[-1].removeprefix("state checkpoints: ").split()
+    keys = [f.split("=")[0] for f in fields]
+    assert keys == [
         "checkpoints_dropped",
         "checkpoints_evicted",
         "checkpoints_kept",
         "checkpoints_orphaned",
-    ]
+    ], f"fields are not in alphabetical order: {lines[-1]}"
+    # The values ride along with their keys rather than being sorted apart.
+    assert "checkpoints_kept=3" in fields and "checkpoints_dropped=1" in fields
 
 
 def test_checkpoint_funnel_includes_second_state_class():
