@@ -17,7 +17,7 @@ Usage (eager mode is REQUIRED -- see below)::
 
     ATOM_EP_MOE_DUMP_DIR=/app/_test/ep_dump \\
     ATOM_USE_TRITON_MOE_EP=1 ENFORCE_EAGER=1 \\
-        ./run_dsv4_pro_ep_server.sh
+        ./run_dsv4_pro_server.sh
     # then send any request, e.g. ./run_dsv4_pro_ep_curl.sh
 
 Works equally well under a real benchmark client (``bench_no_warmup.sh``:
