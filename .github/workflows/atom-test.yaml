@@ -42,6 +42,11 @@ on:
         required: false
         default: 'rocm/atom-dev:latest'
         type: string
+      extra_env:
+        description: 'Extra container env, KEY=VAL separated by commas, appended to the selected models own env_vars. Use it to A/B a flag against the same model.'
+        required: false
+        default: ''
+        type: string
 
 concurrency:
   # Keep scheduled main runs from blocking push-triggered validation.
@@ -55,6 +60,7 @@ env:
   # 'main' takes the prebuilt main wheel; any other ref is built from source in
   # the container instead (see the two mutually exclusive aiter install steps).
   AITER_GIT_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.aiter_branch || 'main' }}
+  EXTRA_CONTAINER_ENV: ${{ github.event_name == 'workflow_dispatch' && inputs.extra_env || '' }}
 
 jobs:
   ci-gate:
@@ -373,6 +379,21 @@ jobs:
         if: matrix.runner == 'atom-mi355-8gpu.predownload' || matrix.runner == 'linux-atom-do-mi350x-8'
         run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> "$GITHUB_ENV"
 
+      # The env-file takes one KEY=VAL per line, but a dispatch input cannot
+      # carry newlines, so the manual override arrives comma-separated and is
+      # split here. Blank lines are dropped by the container action.
+      - name: Split the manual env override into lines
+        if: ${{ env.EXTRA_CONTAINER_ENV != '' }}
+        env:
+          EXTRA_CONTAINER_ENV_RAW: ${{ env.EXTRA_CONTAINER_ENV }}
+        run: |
+          {
+            echo 'EXTRA_CONTAINER_ENV_LINES<<__ATOM_EOF__'
+            printenv EXTRA_CONTAINER_ENV_RAW | tr ',' '\n' |
+              sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$'
+            echo '__ATOM_EOF__'
+          } >> "$GITHUB_ENV"
+
       - name: Start CI container
         uses: ./.github/actions/setup-gpu-container
         with:
@@ -380,7 +401,9 @@ jobs:
           base-image: ${{ env.ATOM_BASE_IMAGE }}
           resolved-image: ${{ env.RESOLVED_ATOM_BASE_IMAGE }}
           runner: ${{ matrix.runner }}
-          env-vars: ${{ matrix.env_vars }}
+          env-vars: |
+            ${{ matrix.env_vars }}
+            ${{ env.EXTRA_CONTAINER_ENV_LINES }}
           hf-token: ${{ env.HF_TOKEN }}
           dashboard-image: ${{ env.ATOM_DASHBOARD_DOCKER_IMAGE }}
           network-host: "true"
@@ -512,8 +535,12 @@ jobs:
             echo "Success: Output matches golden outputs."
           fi
       
+      # A source-built aiter has no prebuilt kernels and no warm JIT cache from
+      # the image build, so the first server launch compiles them, serialized
+      # across the ranks by the aiter build lock. 90 minutes matches what aiter
+      # allows its own ATOM downstream gate for the same install.
       - name: Run ATOM accuracy test
-        timeout-minutes: 30
+        timeout-minutes: ${{ env.AITER_GIT_REF == 'main' && 30 || 90 }}
         env:
           MODEL_EXTRA_ARGS: ${{ matrix.extraArgs }}
           CLIENT_COMMAND: ${{ matrix.client_command || '' }}
