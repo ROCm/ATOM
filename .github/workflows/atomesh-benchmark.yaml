@@ -604,10 +604,39 @@ jobs:
           }
           trap cleanup_processes EXIT HUP INT TERM
 
+          wait_for_p2p_address() {
+            local target_log="$1"
+            local target_pid="$2"
+            local timeout_seconds="$3"
+            local deadline=$((SECONDS + timeout_seconds))
+            local address=""
+            while true; do
+              address="$(awk '
+                /Transfer Engine RPC using P2P handshake, listening on / {
+                  print $NF
+                  exit
+                }
+              ' "${target_log}" 2>/dev/null || true)"
+              if [[ -n "${address}" ]] && kill -0 "${target_pid}" 2>/dev/null; then
+                printf '%s\n' "${address}"
+                return 0
+              fi
+              if ! kill -0 "${target_pid}" 2>/dev/null; then
+                echo "ERROR: P2P target exited before publishing its listening address" >&2
+                cat "${target_log}" >&2 || true
+                wait "${target_pid}" 2>/dev/null || true
+                return 1
+              fi
+              if [[ "${SECONDS}" -ge "${deadline}" ]]; then
+                echo "ERROR: timed out waiting for P2P target listening address" >&2
+                cat "${target_log}" >&2 || true
+                return 1
+              fi
+              sleep 1
+            done
+          }
+
           for ((gpu_id = 0; gpu_id < gpu_count; gpu_id++)); do
-            target_port=$((14400 + gpu_id * 2))
-            initiator_port=$((target_port + 1))
-            target_name="127.0.0.2:${target_port}"
             target_log="/tmp/gdr-smoke-target-gpu-${gpu_id}.log"
             initiator_log="/tmp/gdr-smoke-initiator-gpu-${gpu_id}.log"
 
@@ -618,7 +647,7 @@ jobs:
               --mode=target \
               --protocol=rdma \
               --metadata_server=P2PHANDSHAKE \
-              --local_server_name="${target_name}" \
+              --local_server_name=127.0.0.2:0 \
               --device_name="${rdma_device_csv}" \
               --nic_priority_matrix=/tmp/rdma-smoke-nic-priority.json \
               --use_vram=true \
@@ -626,20 +655,17 @@ jobs:
               --buffer_size=67108864 \
               >"${target_log}" 2>&1 &
             target_pid=$!
-            sleep 3
-            if ! kill -0 "${target_pid}" 2>/dev/null; then
-              cat "${target_log}"
-              echo "ERROR: GDR target failed to register GPU ${gpu_id} VRAM" >&2
-              exit 1
-            fi
+            target_name="$(wait_for_p2p_address "${target_log}" "${target_pid}" 30)"
+            echo "P2P target listening at ${target_name}"
 
+            set +e
             HIP_VISIBLE_DEVICES="${gpu_id}" \
             ROCR_VISIBLE_DEVICES="${gpu_id}" \
             timeout 120 "${validator_bin}" \
               --mode=initiator \
               --protocol=rdma \
               --metadata_server=P2PHANDSHAKE \
-              --local_server_name="127.0.0.3:${initiator_port}" \
+              --local_server_name=127.0.0.3:0 \
               --segment_id="${target_name}" \
               --device_name="${rdma_device_csv}" \
               --nic_priority_matrix=/tmp/rdma-smoke-nic-priority.json \
@@ -651,9 +677,12 @@ jobs:
               --threads=1 \
               --duration=2 \
               2>&1 | tee "${initiator_log}"
+            transfer_rc="${PIPESTATUS[0]}"
+            set -e
 
-            if ! grep -q "Data validation passed" "${initiator_log}"; then
-              cat "${target_log}"
+            if [[ "${transfer_rc}" -ne 0 ]] ||
+               ! grep -q "Data validation passed" "${initiator_log}"; then
+              cat "${target_log}" >&2
               echo "ERROR: GPUDirect RDMA data validation failed on GPU ${gpu_id}" >&2
               exit 1
             fi
@@ -736,22 +765,19 @@ jobs:
 
           if [[ "${SMOKE_RANK}" -eq 0 || "${SMOKE_RANK}" -eq 1 ]]; then
             for ((gpu_id = 0; gpu_id < gpu_count; gpu_id++)); do
-              target_port=$((16400 + gpu_id * 2))
-              initiator_port=$((target_port + 1))
               ready_file="${SMOKE_RUN_DIR}/cross-node-ready-gpu-${gpu_id}"
               result_file="${SMOKE_RUN_DIR}/cross-node-result-gpu-${gpu_id}"
 
               if [[ "${SMOKE_RANK}" -eq 0 ]]; then
-                target_name="${local_ip}:${target_port}"
-                target_log="/tmp/cross-node-gdr-target-gpu-${gpu_id}.log"
-                echo "=== Cross-node GDR target: ${target_name}, GPU ${gpu_id} ==="
+                target_log="${SMOKE_RUN_DIR}/cross-node-gdr-target-gpu-${gpu_id}.log"
+                echo "=== Cross-node GDR target: ${local_ip}, GPU ${gpu_id} ==="
                 HIP_VISIBLE_DEVICES="${gpu_id}" \
                 ROCR_VISIBLE_DEVICES="${gpu_id}" \
                 "${validator_bin}" \
                   --mode=target \
                   --protocol=rdma \
                   --metadata_server=P2PHANDSHAKE \
-                  --local_server_name="${target_name}" \
+                  --local_server_name="${local_ip}:0" \
                   --device_name="${rdma_device_csv}" \
                   --nic_priority_matrix=/tmp/rdma-smoke-nic-priority.json \
                   --use_vram=true \
@@ -759,12 +785,8 @@ jobs:
                   --buffer_size=67108864 \
                   >"${target_log}" 2>&1 &
                 target_pid=$!
-                sleep 3
-                if ! kill -0 "${target_pid}" 2>/dev/null; then
-                  cat "${target_log}"
-                  echo "ERROR: cross-node GDR target failed on GPU ${gpu_id}" >&2
-                  exit 1
-                fi
+                target_name="$(wait_for_p2p_address "${target_log}" "${target_pid}" 30)"
+                echo "Cross-node P2P target listening at ${target_name}"
                 echo "${target_name}" > "${ready_file}.tmp"
                 mv "${ready_file}.tmp" "${ready_file}"
 
@@ -791,7 +813,7 @@ jobs:
                   --mode=initiator \
                   --protocol=rdma \
                   --metadata_server=P2PHANDSHAKE \
-                  --local_server_name="${local_ip}:${initiator_port}" \
+                  --local_server_name="${local_ip}:0" \
                   --segment_id="${target_name}" \
                   --device_name="${rdma_device_csv}" \
                   --nic_priority_matrix=/tmp/rdma-smoke-nic-priority.json \
@@ -814,6 +836,7 @@ jobs:
                 echo "${result}" > "${result_file}.tmp"
                 mv "${result_file}.tmp" "${result_file}"
                 if [[ "${result}" -ne 0 ]]; then
+                  cat "${SMOKE_RUN_DIR}/cross-node-gdr-target-gpu-${gpu_id}.log" >&2 || true
                   echo "ERROR: cross-node GPUDirect RDMA data validation failed on GPU ${gpu_id}" >&2
                   exit 1
                 fi
