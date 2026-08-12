@@ -97,9 +97,7 @@ class AtomKimiK3KDAMetadataBuilder(KimiK3KDAMetadataBuilder):
 
         query_start_loc_buf = self.non_spec_query_start_loc[: batch_size + 1]
         query_start_loc_buf[: real_num_decodes + 1].copy_(
-            compact_query_start_loc_cpu.to(
-                query_start_loc.device, non_blocking=True
-            ),
+            compact_query_start_loc_cpu.to(query_start_loc.device, non_blocking=True),
             non_blocking=True,
         )
         terminal = query_start_loc_buf[real_num_decodes]

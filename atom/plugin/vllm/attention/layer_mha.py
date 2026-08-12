@@ -262,9 +262,7 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         # (insert + decode) is block-size agnostic, so route every non-16 cache
         # through Triton, including fp8 hybrid-model pages.
         use_triton_attn = (
-            self.sliding_window != -1
-            or self.head_dim != 128
-            or block_size != 16
+            self.sliding_window != -1 or self.head_dim != 128 or block_size != 16
         )
         self.use_triton_attn = use_triton_attn
 

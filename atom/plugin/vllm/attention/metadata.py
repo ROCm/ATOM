@@ -996,13 +996,10 @@ class AiterMhaMetadataBuilderForVllm(AttentionMetadataBuilder):
         self,
         common_attn_metadata=None,
     ):
-        self.total_tokens = (
-            self.model_config.max_model_len
-            * getattr(
-                self.vllm_config.scheduler_config,
-                "max_num_partial_prefills",
-                1,
-            )
+        self.total_tokens = self.model_config.max_model_len * getattr(
+            self.vllm_config.scheduler_config,
+            "max_num_partial_prefills",
+            1,
         )
         attn_metadata = self.build(
             common_prefix_len=0, common_attn_metadata=common_attn_metadata

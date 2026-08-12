@@ -78,9 +78,7 @@ def test_v4_proxy_kv_cache_detection_ignores_unrelated_layers():
     )
     proxy = SimpleNamespace(
         kv_cache_groups=[
-            SimpleNamespace(
-                layer_names=["model.layers.0.atom_deepseek_v4_proxy"]
-            )
+            SimpleNamespace(layer_names=["model.layers.0.atom_deepseek_v4_proxy"])
         ],
         has_mamba_layers=False,
     )
