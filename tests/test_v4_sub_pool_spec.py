@@ -15,7 +15,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 ATTENTION_DIR = ROOT / "atom" / "model_ops" / "attentions"
 V4_SOURCE = ATTENTION_DIR / "deepseek_v4_attn.py"
-FIELD = "STATE_CKPT_EXTRA_ENTRIES"
+RUNNER_SOURCE = ROOT / "atom" / "model_engine" / "model_runner.py"
+FIELD = "state_ckpt_extra_entries"
+ENV_FIELD = "STATE_CKPT_EXTRA_ENTRIES"
 
 
 def _runtime_field_refs(node: ast.AST, field: str) -> list[ast.AST]:
@@ -82,3 +84,17 @@ def test_checkpoint_extra_entries_are_wired_only_to_the_v4_state_slot():
         keywords["extra_entries"], "state_checkpoint_interval_tokens"
     )
     assert not _runtime_field_refs(keywords["extra_entries"], "enable_prefix_caching")
+
+    runner_tree = ast.parse(RUNNER_SOURCE.read_text())
+    runner = next(
+        node
+        for node in runner_tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "ModelRunner"
+    )
+    init = next(
+        node
+        for node in runner.body
+        if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+    )
+    assert _runtime_field_refs(init, ENV_FIELD)
+    assert _runtime_field_refs(init, FIELD)
