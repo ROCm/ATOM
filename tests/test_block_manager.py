@@ -510,3 +510,12 @@ class TestDecodeBlockHashing:
         bm.hash_decode_blocks(seq, seq.num_tokens)
         assert seq.num_hashed_tokens == 0
         assert not bm.kv.num_indexed
+
+
+# ── state_offload disabled by default ─────────────────────────────────────
+
+
+def test_state_offload_is_none_when_tier_is_off(block_manager):
+    """With OFFLOAD_STATE unset, state_offload_staging_groups() returns 0 and
+    no index is wired, so BlockManager.state_offload is None."""
+    assert block_manager.state_offload is None

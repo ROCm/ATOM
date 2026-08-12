@@ -42,7 +42,7 @@ retained-and-shared entries live in the same region and compete for the rest.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
 
 
@@ -110,6 +110,12 @@ class PoolPlan:
     reserved_bytes: dict[str, int]
     entries_per_req: dict[str, int]
     paged_class: str | None = None
+    # What allocation buys vs. what admission may lease. They differ only by
+    # `extra_entries`: a flat cushion the declaring backend allocates for its
+    # own use (the offload staging ring) and that no request may be given.
+    # Kept as a computed table rather than a subtraction at each call site so
+    # a consumer picks a meaning by the name it reads.
+    admission_entries: dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def empty(cls) -> PoolPlan:
@@ -121,7 +127,13 @@ class PoolPlan:
         AttributeError — the runner installs this at construction time and
         replaces it in `get_num_blocks`.
         """
-        return cls(entries={}, entry_bytes={}, reserved_bytes={}, entries_per_req={})
+        return cls(
+            entries={},
+            entry_bytes={},
+            reserved_bytes={},
+            entries_per_req={},
+            admission_entries={},
+        )
 
     def with_paged_entries(self, count: int) -> PoolPlan:
         """Copy of the plan with the PAGE class resized to `count`.
@@ -136,6 +148,7 @@ class PoolPlan:
         return replace(
             self,
             entries={**self.entries, self.paged_class: count},
+            admission_entries={**self.admission_entries, self.paged_class: count},
             reserved_bytes={**self.reserved_bytes, self.paged_class: count * bytes_per},
         )
 
@@ -213,14 +226,18 @@ def plan_pools(
     """
     merged = merge_specs(specs)
     entries: dict[str, int] = {}
+    admissible_entries: dict[str, int] = {}
     reserved: dict[str, int] = {}
     remaining = available_bytes
 
     state = {n: s for n, s in merged.items() if s.pool is Pool.STATE}
     for name, spec in state.items():
-        count = max_num_seqs * spec.entries_per_req + spec.extra_entries
+        admissible = max_num_seqs * spec.entries_per_req
+        count = admissible + spec.extra_entries
         cost = count * spec.entry_bytes
         entries[name], reserved[name] = count, cost
+        # The cushion is allocated, never leased.
+        admissible_entries[name] = admissible
         remaining -= cost
     if state and remaining <= 0:
         raise InsufficientPoolBudget(
@@ -236,6 +253,7 @@ def plan_pools(
         spec = merged[name]
         count = max(0, remaining // spec.entry_bytes)
         entries[name], reserved[name] = count, count * spec.entry_bytes
+        admissible_entries[name] = count
 
     return PoolPlan(
         entries=entries,
@@ -243,4 +261,5 @@ def plan_pools(
         reserved_bytes=reserved,
         entries_per_req={n: s.entries_per_req for n, s in merged.items()},
         paged_class=paged[0] if paged else None,
+        admission_entries=admissible_entries,
     )

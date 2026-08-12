@@ -1639,7 +1639,10 @@ class ModelRunner:
         # sliding-window pool and the attention builder each index it by the
         # class name they declared. Nothing here needs to know those names.
         self.pool_plan = plan
-        config.pool_entries = dict(plan.entries)
+        # BlockManager divides this into request groups; the offload staging
+        # cushion is allocated but not leasable, so admission must not see it.
+        # Backends keep sizing their tensors from `pool_plan.entries`.
+        config.pool_entries = dict(plan.admission_entries)
         config.pool_entries_per_req = dict(plan.entries_per_req)
         # Two scalars rather than the StateTransfer itself: this travels to the
         # engine process in a plain dict, where `StateGroupPool` rebuilds it.
@@ -1647,9 +1650,15 @@ class ModelRunner:
         config.state_transfer_kind = transfer.kind
         config.state_fork_tokens = transfer.fork_tokens
         for name in sorted(plan.entries):
+            extra = plan.entries[name] - plan.admission_entries[name]
             logger.info(
-                f"sub-pool {name}: entries={plan.entries[name]}, "
-                f"entry_bytes={plan.entry_bytes[name]}, "
+                f"sub-pool {name}: entries={plan.entries[name]}"
+                + (
+                    f" ({plan.admission_entries[name]} admissible + {extra} staging)"
+                    if extra
+                    else ""
+                )
+                + f", entry_bytes={plan.entry_bytes[name]}, "
                 f"reserved={plan.reserved_bytes[name] / (1 << 30):.2f}GB"
             )
 
@@ -1716,7 +1725,10 @@ class ModelRunner:
         # the class they declared.
         return {
             "num_kvcache_blocks": num_kvcache_blocks,
-            "pool_entries": dict(plan.entries),
+            # BlockManager divides this into request groups; the offload staging
+            # cushion is allocated but not leasable, so admission must not see it.
+            # Backends keep sizing their tensors from `pool_plan.entries`.
+            "pool_entries": dict(plan.admission_entries),
             "pool_entries_per_req": dict(plan.entries_per_req),
             "state_transfer_kind": config.state_transfer_kind,
             "state_fork_tokens": config.state_fork_tokens,

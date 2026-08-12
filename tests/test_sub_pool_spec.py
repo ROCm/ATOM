@@ -336,3 +336,55 @@ class TestEagle3SharesTheTargetBlockIds:
         )
         assert set(with_draft.entries) == {ENTRY_KV}
         assert with_draft.entries[ENTRY_KV] == target_only.entries[ENTRY_KV] // 2
+
+
+def test_extra_entries_are_allocated_but_not_admissible():
+    """`extra_entries` buys rows the pool must not lease out. Allocation
+    sizes tensors from `entries`; admission divides `admission_entries`."""
+    plan = plan_pools(
+        [
+            page_pool(1000),
+            state_pool(ENTRY_STATE, 500, entries_per_req=2, extra_entries=3),
+        ],
+        available_bytes=1_000_000,
+        max_num_seqs=8,
+    )
+    assert plan.entries[ENTRY_STATE] == 8 * 2 + 3
+    assert plan.admission_entries[ENTRY_STATE] == 8 * 2
+    # The reservation covers every allocated row, staging included.
+    assert plan.reserved_bytes[ENTRY_STATE] == (8 * 2 + 3) * 500
+
+
+def test_admission_entries_defaults_to_entries_without_extras():
+    plan = plan_pools(
+        [page_pool(1000), state_pool(ENTRY_STATE, 500, entries_per_req=2)],
+        available_bytes=1_000_000,
+        max_num_seqs=8,
+    )
+    assert plan.admission_entries[ENTRY_STATE] == plan.entries[ENTRY_STATE] == 16
+
+
+def test_staging_groups_are_sized_by_multiplicity():
+    """A staging *group* is `entries_per_req` rows. Sizing the ring in bare
+    entries would run the last staging group off the end of the tensor."""
+    span, k = 3, 2  # GDN: span = 1 + num_spec
+    plan = plan_pools(
+        [
+            page_pool(1000),
+            state_pool(ENTRY_STATE, 500, entries_per_req=span, extra_entries=k * span),
+        ],
+        available_bytes=1_000_000,
+        max_num_seqs=8,
+    )
+    num_groups = plan.admission_entries[ENTRY_STATE] // span
+    assert num_groups == 8
+    # The highest staging group's last row must still be inside the tensor.
+    assert (num_groups + k - 1) * span + span <= plan.entries[ENTRY_STATE]
+
+
+def test_paged_class_admission_equals_entries():
+    """PAGE has no per-request reservation, so the two counts coincide and
+    `with_paged_entries` must keep them in step."""
+    plan = plan_pools([page_pool(1000)], available_bytes=10_500, max_num_seqs=8)
+    assert plan.admission_entries[ENTRY_KV] == plan.entries[ENTRY_KV] == 10
+    assert plan.with_paged_entries(4).admission_entries[ENTRY_KV] == 4

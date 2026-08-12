@@ -914,11 +914,26 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         there is no admission-vs-materialization gap to cushion — a slot exists
         for its request's whole life.
         """
+        from atom.model_engine.state_offload import state_offload_staging_groups
+
         geo = self.pool_geometry
         row_bytes = self.plane_row_bytes()
         return [
             page_pool(geo.block_bytes(row_bytes) + self._indexer_block_bytes()),
-            state_pool(STATE_SLOT_CLASS, geo.slot_bytes(row_bytes), entries_per_req=1),
+            state_pool(
+                STATE_SLOT_CLASS,
+                geo.slot_bytes(row_bytes),
+                entries_per_req=1,
+                # K staging groups past the pool's group range: inside the
+                # arena so `state_entry_views(num_groups + slot)` addresses
+                # them with no second scheme, outside admission so no request
+                # is ever handed one. Cost is K groups of HBM from the very
+                # budget the pool wants -- and a small pool is the problem
+                # being solved -- so K stays small (default 1) and measured.
+                # Groups, not entries: `state_entry_views` indexes by group,
+                # so a group costs `entries_per_req` rows (1 here).
+                extra_entries=state_offload_staging_groups() * 1,
+            ),
         ]
 
     def _plane_row_widths(self) -> list[int]:

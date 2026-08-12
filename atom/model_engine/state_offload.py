@@ -16,6 +16,7 @@ restart without the worker restarting.
 """
 
 import logging
+import os
 from collections import deque
 
 logger = logging.getLogger("atom")
@@ -133,3 +134,22 @@ class StateOffloadIndex:
             "loads_failed": self.loads_failed,
             "indexed": len(self.hashes),
         }
+
+
+def state_offload_staging_groups() -> int:
+    """K: staging *groups* to reserve, or 0 when the tier is off.
+
+    Groups, not entries: a sizing site multiplies by its own
+    `entries_per_req` to get rows, because `state_entry_views` is indexed by
+    group. Returning entries here would make every caller divide back out.
+
+    One function rather than two `os.environ` reads because the arena sizes
+    itself from this and the pool wires itself from this; if they disagreed,
+    the arena would be short exactly the rows the spill path addresses.
+    """
+    if os.environ.get("OFFLOAD_STATE", "0") != "1":
+        return 0
+    try:
+        return max(0, int(os.environ.get("OFFLOAD_STATE_STAGING_GROUPS", "1")))
+    except ValueError:
+        return 1

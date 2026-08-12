@@ -143,6 +143,22 @@ class BlockManager:
         # moment it stops forking (see the state-cache protocol).
         self.state_caches: tuple[StateCache, ...] = (self.state,)
 
+        from atom.model_engine.state_offload import (
+            StateOffloadIndex,
+            state_offload_staging_groups,
+        )
+
+        staging = state_offload_staging_groups()
+        self.state_offload: StateOffloadIndex | None = None
+        if staging > 0:
+            index = StateOffloadIndex(
+                staging_depth=staging,
+                kv_offload_enabled=bool(getattr(config, "kv_transfer_config", None)),
+            )
+            for cache in self.state_caches:
+                cache.offload = index
+            self.state_offload = index
+
         # The demand funnel: recorded at admission, cut for when a prefill
         # chunk is shortened to land on it, kept when the state pool files it.
         # Counted at all three because a gap between any two is a different

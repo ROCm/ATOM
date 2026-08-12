@@ -7,6 +7,7 @@ import logging
 from atom.model_engine.state_offload import (
     _STARVATION_DROP_THRESHOLD,
     StateOffloadIndex,
+    state_offload_staging_groups,
 )
 from atom.model_engine.state_pool import StateGroupPool, StateTransfer
 
@@ -167,3 +168,49 @@ def test_undrained_spill_copies_past_the_staging_depth_warns_once(caplog):
     warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
     assert len(warnings) == 1, [r.getMessage() for r in warnings]
     assert "take_spill_copies" in warnings[0].getMessage()
+
+
+def test_disabled_by_default_costs_nothing():
+    """Zero cost when disabled is a stated constraint: depth 0 means every
+    request_spill is refused and `hashes` stays empty, so `_resumable_from`
+    degenerates to the original `in`."""
+    idx = StateOffloadIndex(staging_depth=0, kv_offload_enabled=False)
+    assert idx.enabled is False
+    assert idx.request_spill(11, group=1) == -1
+    assert idx.hashes == set()
+
+
+def test_kv_offload_flag_is_carried_for_the_orphan_decision():
+    assert StateOffloadIndex(1, kv_offload_enabled=True).kv_offload_enabled is True
+    assert StateOffloadIndex(1, kv_offload_enabled=False).kv_offload_enabled is False
+
+
+def test_staging_groups_is_zero_unless_the_tier_is_switched_on(monkeypatch):
+    monkeypatch.delenv("OFFLOAD_STATE", raising=False)
+    monkeypatch.setenv("OFFLOAD_STATE_STAGING_GROUPS", "4")
+    assert state_offload_staging_groups() == 0
+
+
+def test_staging_groups_reads_its_depth_when_on(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_STATE", "1")
+    monkeypatch.setenv("OFFLOAD_STATE_STAGING_GROUPS", "4")
+    assert state_offload_staging_groups() == 4
+
+
+def test_staging_groups_defaults_to_one(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_STATE", "1")
+    monkeypatch.delenv("OFFLOAD_STATE_STAGING_GROUPS", raising=False)
+    assert state_offload_staging_groups() == 1
+
+
+def test_garbage_depth_falls_back_rather_than_crashing_model_load(monkeypatch):
+    """This runs inside model load. A typo in an env var must not be fatal."""
+    monkeypatch.setenv("OFFLOAD_STATE", "1")
+    monkeypatch.setenv("OFFLOAD_STATE_STAGING_GROUPS", "banana")
+    assert state_offload_staging_groups() == 1
+
+
+def test_a_negative_depth_is_floored_to_zero(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_STATE", "1")
+    monkeypatch.setenv("OFFLOAD_STATE_STAGING_GROUPS", "-3")
+    assert state_offload_staging_groups() == 0
