@@ -44,7 +44,11 @@ from atom.model_ops.attentions.v4_pool_geometry import (
     HCA_RATIO,
     UnifiedPoolGeometry,
 )
-from atom.model_ops.v4_kernels.pool_index import window_constexprs, window_row
+from atom.model_ops.v4_kernels.pool_index import (
+    served_window_params,
+    window_constexprs,
+    window_row,
+)
 from atom.utils.decorators import mark_trace
 
 
@@ -90,6 +94,7 @@ def _v4_paged_decode_indices_kernel(
     BLOCK_N: tl.constexpr,  # next_pow2(win)
     HAS_CSA: tl.constexpr,  # caller has layers of this class to serve
     HAS_HCA: tl.constexpr,
+    HAS_DENSE: tl.constexpr,
     DENSE_RING_SLOTS: tl.constexpr,
     DENSE_SLOT_ROWS: tl.constexpr,
     DENSE_RING_STRIDE: tl.constexpr,
@@ -122,11 +127,6 @@ def _v4_paged_decode_indices_kernel(
     # `n` = actual valid SWA prefix count. Cast to match `win` (compile-time
     # int) — pos is i32/i64 from positions buffer.
     n = tl.minimum(pos + 1, win)
-    # SWA prefix segment lives at the TAIL of each token's slice (compress
-    # section fills the head). Write base = slice END (indptr[t+1]) - n. For
-    # the SWA buffer (compress=0) end-n == indptr[t], same as a head write.
-    swa_end = tl.load(swa_indptr_ptr + t + 1)
-
     i = tl.arange(0, BLOCK_N)
     mask = i < n
     abs_pos = pos - n + 1 + i  # ∈ [0, pos] for valid i
@@ -135,35 +135,41 @@ def _v4_paged_decode_indices_kernel(
     # ring's last lap.
     slot = tl.load(state_slot_per_seq_ptr + bid)
 
-    tl.store(
-        swa_indices_ptr + swa_end - n + i,
-        window_row(
-            slot,
-            abs_pos,
-            dense_ring_start,
-            DENSE_RING_SLOTS,
-            DENSE_SLOT_ROWS,
-            DENSE_RING_STRIDE,
-            DENSE_RUN_ROWS,
-        ),
-        mask=mask,
-    )
-    # Where this token's own KV row lands. Same formula at `pos` — the last
-    # position of its own window — handed to the fused SWA write so the two
-    # cache-writing paths cannot drift, and so no kernel outside this file
-    # has to know how a window is laid out.
-    tl.store(
-        dense_dest_ptr + t,
-        window_row(
-            slot,
-            pos,
-            dense_ring_start,
-            DENSE_RING_SLOTS,
-            DENSE_SLOT_ROWS,
-            DENSE_RING_STRIDE,
-            DENSE_RUN_ROWS,
-        ),
-    )
+    if HAS_DENSE:
+        # SWA prefix segment lives at the TAIL of each token's slice (compress
+        # section fills the head). Write base = slice END (indptr[t+1]) - n.
+        # For the SWA buffer (compress=0) end-n == indptr[t], same as a head
+        # write.
+        swa_end = tl.load(swa_indptr_ptr + t + 1)
+        tl.store(
+            swa_indices_ptr + swa_end - n + i,
+            window_row(
+                slot,
+                abs_pos,
+                dense_ring_start,
+                DENSE_RING_SLOTS,
+                DENSE_SLOT_ROWS,
+                DENSE_RING_STRIDE,
+                DENSE_RUN_ROWS,
+            ),
+            mask=mask,
+        )
+        # Where this token's own KV row lands. Same formula at `pos` — the last
+        # position of its own window — handed to the fused SWA write so the two
+        # cache-writing paths cannot drift, and so no kernel outside this file
+        # has to know how a window is laid out.
+        tl.store(
+            dense_dest_ptr + t,
+            window_row(
+                slot,
+                pos,
+                dense_ring_start,
+                DENSE_RING_SLOTS,
+                DENSE_SLOT_ROWS,
+                DENSE_RING_STRIDE,
+                DENSE_RUN_ROWS,
+            ),
+        )
     if HAS_CSA:
         csa_end = tl.load(csa_indptr_ptr + t + 1)
         tl.store(
@@ -266,7 +272,10 @@ def write_v4_paged_decode_indices(
                                    prefix + HCA committed per token). `None`
                                    likewise.
       swa_indices:         [>=swa_indptr[T]] int32 OUT — fully written by
-                                   this kernel (no other source).
+                                   this kernel (no other source), unless no
+                                   layer is dense, when it is left untouched:
+                                   the dense class is the only reader and a
+                                   geometry can turn out not to have one.
       csa_indices:         [>=csa_indptr[T]] int32 OUT — SWA prefix written
                                    here at the slice tail
                                    `[csa_indptr[t+1] - n, csa_indptr[t+1])`;
@@ -281,8 +290,11 @@ def write_v4_paged_decode_indices(
                                    caller via numpy fill.
       dest_rows:           {ratio: [>=T] int32 OUT} — the row token `t`'s own
                                    KV goes to in a layer of that class. Needed
-                                   for every class the caller enabled; the
-                                   fused SWA write reads it instead of deriving
+                                   for every class that is both served by the
+                                   geometry and enabled here; the rest are
+                                   handed some other class's buffer and never
+                                   written. The fused SWA write reads it
+                                   instead of deriving
                                    the row itself, which is what keeps the pool
                                    layout out of the fused kernels.
                                    **Defined only where `batch_id_per_token[t]
@@ -311,9 +323,27 @@ def write_v4_paged_decode_indices(
     assert has_csa == (csa_indptr is not None)
     assert has_hca == (hca_indptr is not None)
 
-    dense = geometry.window_params(DENSE_RATIO)
-    csa = geometry.window_params(CSA_RATIO)
-    hca = geometry.window_params(HCA_RATIO)
+    # A class that is off — not in the geometry, or one the caller did not ask
+    # for — still needs a pointer and a value for every `constexpr`, because
+    # Triton takes them by position. It borrows another class's; its `HAS_`
+    # flag is what keeps them away from a store.
+    #
+    # The classes that are ON index `served` directly, on purpose. A caller
+    # asking for rows of a class no layer belongs to then gets a KeyError here
+    # instead of a plausible row written from borrowed parameters — and unlike
+    # an `assert`, that holds under `python -O`.
+    served = served_window_params(geometry)
+    if not served or not dest_rows:
+        raise ValueError(
+            "a V4 index build needs at least one compress class and one "
+            f"destination buffer; got {sorted(served)} and {sorted(dest_rows)}"
+        )
+    has_dense = DENSE_RATIO in served
+    borrowed = next(iter(served.values()))
+    borrowed_dest = next(iter(dest_rows.values()))
+    dense = served[DENSE_RATIO] if has_dense else borrowed
+    csa = served[CSA_RATIO] if has_csa else borrowed
+    hca = served[HCA_RATIO] if has_hca else borrowed
     BLOCK_N = triton.next_power_of_2(win)
     _v4_paged_decode_indices_kernel[(T,)](
         state_slot_per_seq,
@@ -327,9 +357,9 @@ def write_v4_paged_decode_indices(
         swa_indices,
         csa_indices if has_csa else swa_indices,
         hca_indices if has_hca else swa_indices,
-        dest_rows[DENSE_RATIO],
-        dest_rows[CSA_RATIO] if has_csa else dest_rows[DENSE_RATIO],
-        dest_rows[HCA_RATIO] if has_hca else dest_rows[DENSE_RATIO],
+        dest_rows[DENSE_RATIO] if has_dense else borrowed_dest,
+        dest_rows[CSA_RATIO] if has_csa else borrowed_dest,
+        dest_rows[HCA_RATIO] if has_hca else borrowed_dest,
         dense.ring_start,
         csa.ring_start,
         hca.ring_start,
@@ -337,6 +367,7 @@ def write_v4_paged_decode_indices(
         BLOCK_N=BLOCK_N,
         HAS_CSA=has_csa,
         HAS_HCA=has_hca,
+        HAS_DENSE=has_dense,
         **window_constexprs(dense, "DENSE_"),
         **window_constexprs(csa, "CSA_"),
         **window_constexprs(hca, "HCA_"),
@@ -366,8 +397,8 @@ def write_v4_paged_decode_indices_reference(
     """
     if T == 0:
         return
-    params = {r: geometry.window_params(r) for r in (DENSE_RATIO, CSA_RATIO, HCA_RATIO)}
-    served = {
+    params = served_window_params(geometry)
+    outputs = {
         DENSE_RATIO: (swa_indices, swa_indptr),
         CSA_RATIO: (csa_indices, csa_indptr),
         HCA_RATIO: (hca_indices, hca_indptr),
@@ -387,8 +418,11 @@ def write_v4_paged_decode_indices_reference(
         abs_pos = range(p - n + 1, p + 1)
         slot = int(state_slot_per_seq[b])
         # SWA prefix segment at the slice TAIL (compress section fills the head).
-        for ratio, (buf, indptr) in served.items():
-            if buf is None:
+        for ratio, (buf, indptr) in outputs.items():
+            # A class the caller switched off, or one the geometry does not
+            # have at all — the kernel skips both, on `HAS_*` respectively
+            # `HAS_DENSE`.
+            if buf is None or ratio not in params:
                 continue
             end = int(indptr[t + 1].item())
             rows = [params[ratio].index(slot, int(q)) for q in abs_pos]
