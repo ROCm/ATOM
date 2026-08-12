@@ -3,7 +3,6 @@
 
 from pathlib import Path
 
-
 BRIDGE_SOURCE = (
     Path(__file__).parents[2] / "atom/plugin/vllm/deepseek_v4_bridge.py"
 ).read_text()

@@ -17,8 +17,14 @@ import torch
 from atom.models import deepseek_v4 as deepseek_v4_base
 from atom.models.deepseek_v4 import (
     DeepseekV4Attention as DeepseekV4AttentionBase,
+)
+from atom.models.deepseek_v4 import (
     DeepseekV4ForCausalLM as DeepseekV4ForCausalLMBase,
+)
+from atom.models.deepseek_v4 import (
     DeepseekV4Model as DeepseekV4ModelBase,
+)
+from atom.models.deepseek_v4 import (
     Indexer as IndexerBase,
 )
 from atom.plugin.vllm.deepseek_v4_bridge import ATOM_DEEPSEEK_V4_BLOCK_SIZE
