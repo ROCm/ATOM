@@ -19,7 +19,7 @@ from atom.diffusion.models.minimax_h3.layout import (
     TAG_TEXT,
     TAG_VIDEO,
     build_initial_latents,
-    build_packed_sequence_t2va,
+    build_packed_sequence,
     patchify_video_latent,
     scatter_rows_into_packed,
     unpack_audio_tokens,
@@ -32,7 +32,7 @@ SMALL = {"text_len": 2, "latent_t": 3, "latent_h": 4, "latent_w": 6, "audio_t": 
 
 @pytest.fixture(scope="module")
 def packed():
-    return build_packed_sequence_t2va(**SMALL)
+    return build_packed_sequence(**SMALL)
 
 
 # ── token packing ─────────────────────────────────────────────────────────

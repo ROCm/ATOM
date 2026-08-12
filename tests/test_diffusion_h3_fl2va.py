@@ -12,7 +12,7 @@ import pytest
 import torch
 
 from atom.diffusion.models.minimax_h3.conditioning import (
-    KEYFRAME_ENCODE_SEED,
+    ENCODE_SEED,
     cover_crop_plan,
     scoped_encode_rng,
 )
@@ -227,11 +227,11 @@ def test_scoped_rng_is_deterministic_and_restores_global_state():
 
     torch.manual_seed(7)
     _ = torch.randn(4)
-    with scoped_encode_rng(KEYFRAME_ENCODE_SEED):
+    with scoped_encode_rng(ENCODE_SEED):
         a = torch.randn(3)
     after = torch.randn(4)
 
-    with scoped_encode_rng(KEYFRAME_ENCODE_SEED):
+    with scoped_encode_rng(ENCODE_SEED):
         b = torch.randn(3)
     # Same seed -> same sample (the posterior is sampled, so this matters).
     torch.testing.assert_close(a, b)

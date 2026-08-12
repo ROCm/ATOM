@@ -22,7 +22,6 @@ from atom.diffusion.models.minimax_h3.layout import (
     MiniMaxH3Geometry,
     align_frame_count,
     audio_latent_t,
-    frame_count_from_video_latent_t,
     time_shift_sigmas,
     video_latent_t,
 )
@@ -68,10 +67,9 @@ def test_frame_alignment_is_17n_plus_5():
         assert align_frame_count(n) == n
 
 
-def test_video_latent_t_roundtrips():
-    for frames in (5, 22, 39, 124, 990):
-        aligned = align_frame_count(frames)
-        assert frame_count_from_video_latent_t(video_latent_t(aligned)) == aligned
+def test_video_latent_t_is_five_per_seventeen_frames():
+    for frames, latent_t in ((5, 2), (22, 7), (39, 12), (124, 37), (991, 292)):
+        assert video_latent_t(align_frame_count(frames)) == latent_t
 
 
 def test_audio_latent_t_rounds_at_40hz():

@@ -63,11 +63,8 @@ def _linear(
 
     The DiT runs at ``tp_size == 1`` -- Ulysses parallelises the sequence, not
     the hidden dim -- so ATOM's Column/Row parallel wrappers would degenerate to
-    a plain matmul while adding sharded-loader machinery we do not need. At bf16
-    ``nn.Linear`` dispatches to the same rocBLAS/Tensile GEMM that measured
-    190-201 TFLOP/s on MI308X, i.e. 95-100% of this machine's ceiling, so there
-    is nothing left on the table. Swap this factory for
-    ``atom.model_ops.linear`` if TP or quantization is ever wanted.
+    a plain matmul. Swap this factory for ``atom.model_ops.linear`` if TP or
+    quantization is ever wanted.
     """
     return nn.Linear(in_features, out_features, bias=bias, dtype=dtype)
 
@@ -76,11 +73,6 @@ def _norm(size: int, *, eps: float, dtype: torch.dtype = _BF16) -> nn.RMSNorm:
     # torch.nn.RMSNorm upcasts reduced-precision input for the variance
     # reduction, which is the fp32-accumulate semantic the checkpoint expects.
     return nn.RMSNorm(size, eps=eps, dtype=dtype)
-
-
-def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1, x2 = torch.chunk(x, 2, dim=-1)
-    return torch.cat((-x2, x1), dim=-1)
 
 
 def reorder_grouped_qkv_to_qkv(
@@ -176,31 +168,25 @@ def _silu_mul(hidden: torch.Tensor) -> torch.Tensor:
     return nn.functional.silu(gate) * up
 
 
-def _apply_qk_norm(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    q_norm: nn.RMSNorm,
-    k_norm: nn.RMSNorm,
+def _rope_qk(
+    q: torch.Tensor, k: torch.Tensor, cos_sin_cache: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-head RMSNorm on q and k.
+    """3-D NeoX RoPE on q and k from a packed cos|sin cache ``[T, rot_dim]``.
 
-    Deliberately unconditional. The reference gates a fused CUDA kernel on
-    ``tensor.is_cuda``, which is True for ROCm tensors, so gfx942 dives into a
-    CUDA-only JIT that cannot build -- see the Phase 0 notes. If a fused aiter
-    QKNorm+RoPE lands, gate it on an explicit capability check, never on
-    ``is_cuda``.
+    Only the leading ``rot_dim`` head dims rotate; the rest passes through.
     """
-    return q_norm(q), k_norm(k)
+    half = cos_sin_cache.shape[-1] // 2
+    cos_half, sin_half = cos_sin_cache.split(half, dim=-1)
+    cos = torch.cat((cos_half, cos_half), dim=-1).unsqueeze(1)
+    sin = torch.cat((sin_half, sin_half), dim=-1).unsqueeze(1)
 
+    def rotate(x: torch.Tensor) -> torch.Tensor:
+        x_rot, x_pass = x[..., : 2 * half], x[..., 2 * half :]
+        x1, x2 = torch.chunk(x_rot, 2, dim=-1)
+        rotated = x_rot * cos + torch.cat((-x2, x1), dim=-1) * sin
+        return torch.cat((rotated, x_pass), dim=-1)
 
-def _apply_rope_cos_sin(
-    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-) -> torch.Tensor:
-    """Rotate the leading ``rot_dim`` head dims; pass the remainder through."""
-    rot_dim = cos.shape[-1]
-    x_rot, x_pass = x[..., :rot_dim], x[..., rot_dim:]
-    x_rot = (x_rot * cos) + (_rotate_half(x_rot) * sin)
-    return torch.cat((x_rot, x_pass), dim=-1)
+    return rotate(q), rotate(k)
 
 
 def _qk_norm_rope(
@@ -236,21 +222,11 @@ def _qk_norm_rope(
                 q, k, q_norm.weight, k_norm.weight, rope_cache, eps=q_norm.eps
             )
 
-    q, k = _apply_qk_norm(q, k, q_norm, k_norm)
-    if rope_cache is not None:
-        q, k = _apply_rope_qk(q, k, rope_cache)
-    return q, k
-
-
-def _apply_rope_qk(
-    q: torch.Tensor, k: torch.Tensor, cos_sin_cache: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply 3-D neox RoPE to q/k from a packed cos|sin cache [T, rope_dim]."""
-    half = cos_sin_cache.shape[-1] // 2
-    cos_half, sin_half = cos_sin_cache.split(half, dim=-1)
-    cos = torch.cat((cos_half, cos_half), dim=-1).unsqueeze(1)
-    sin = torch.cat((sin_half, sin_half), dim=-1).unsqueeze(1)
-    return _apply_rope_cos_sin(q, cos, sin), _apply_rope_cos_sin(k, cos, sin)
+    # The fallback norm is deliberately ungated on ``is_cuda``: that is True on
+    # ROCm, and the reference uses it to reach a CUDA-only JIT that cannot
+    # build here. Gate on capability, never on ``is_cuda``.
+    q, k = q_norm(q), k_norm(k)
+    return (q, k) if rope_cache is None else _rope_qk(q, k, rope_cache)
 
 
 def rope_cos_sin_cache(freqs: torch.Tensor, *, dtype: torch.dtype) -> torch.Tensor:

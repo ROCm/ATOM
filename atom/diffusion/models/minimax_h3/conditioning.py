@@ -17,17 +17,20 @@ from typing import Any, Self
 import numpy as np
 import torch
 
-from atom.diffusion.models.minimax_h3.layout import patchify_video_latent
+from atom.diffusion.models.minimax_h3.layout import (
+    TAG_TEXT,
+    TAG_VIDEO,
+    patchify_video_latent,
+)
 
-# Both are timesteps *and* mixing coefficients; see the module docstring.
+# Both are timesteps *and* mixing coefficients.
 MINIMAX_H3_IMGVID_COND_TIMESTEP = 0.999
 MINIMAX_H3_AUDIO_REF_COND_TIMESTEP = 1.0
 
-AUDIO_COND_CHANNELS = 2
 LATENT_CHANNELS = 24
 VIDEO_ROW_WIDTH = 96
-AUDIO_ROW_WIDTH = 32
 COND_PATCH_SIZE = (1, 2, 2)
+ENCODE_SEED = 42
 
 
 def _check_noise_aug(noise_aug: float) -> float:
@@ -120,59 +123,6 @@ def imgvid_cond_noise_aug_rows(
     return (out[0] if len(out) == 1 else torch.cat(out, dim=0)).contiguous()
 
 
-def audio_cond_noise_aug_rows(
-    clean_rows: torch.Tensor,
-    *,
-    condition_audio_t: Sequence[int],
-    seed: int,
-    noise_aug: float = MINIMAX_H3_AUDIO_REF_COND_TIMESTEP,
-) -> torch.Tensor:
-    """Noise-augment packed audio reference rows ``[n, 32]``.
-
-    A no-op at the released default (``noise_aug = 1.0``); kept complete so the
-    audio path is not silently different from the visual one if that changes.
-    """
-    noise_aug = _check_noise_aug(noise_aug)
-    if noise_aug == 1.0:
-        return clean_rows
-    if clean_rows.ndim != 2 or int(clean_rows.shape[1]) != AUDIO_ROW_WIDTH:
-        raise ValueError(
-            f"audio condition rows must be [n, {AUDIO_ROW_WIDTH}], got "
-            f"{list(clean_rows.shape)}"
-        )
-    lengths = [int(v) for v in condition_audio_t]
-    if not lengths:
-        raise ValueError("condition_audio_t must not be empty")
-    if any(v <= 0 for v in lengths):
-        raise ValueError(f"condition audio lengths must be positive, got {lengths}")
-    expected_rows = AUDIO_COND_CHANNELS * sum(lengths)
-    if int(clean_rows.shape[0]) != expected_rows:
-        raise ValueError(
-            f"got {int(clean_rows.shape[0])} audio condition rows, lengths imply "
-            f"{expected_rows}"
-        )
-
-    coefficient = torch.tensor(noise_aug, dtype=torch.float32)
-    out: list[torch.Tensor] = []
-    offset = 0
-    for audio_t in lengths:
-        count = AUDIO_COND_CHANNELS * audio_t
-        clean = clean_rows[offset : offset + count].detach().cpu().float()
-        generator = torch.Generator(device="cpu").manual_seed(int(seed) + 1)
-        noise = torch.randn(
-            clean.shape, generator=generator, dtype=torch.float32, device="cpu"
-        )
-        out.append(coefficient * clean + (1.0 - coefficient) * noise)
-        offset += count
-    rows = out[0] if len(out) == 1 else torch.cat(out, dim=0)
-    return rows.to(device=clean_rows.device, dtype=torch.float32).contiguous()
-
-
-KEYFRAME_ENCODE_SEED = 42
-KEYFRAME_PATCH_SIZE = (1, 2, 2)
-LATENT_CHANNELS = 24
-
-
 def cover_crop_plan(
     *,
     source_width: int,
@@ -254,23 +204,28 @@ def scoped_encode_rng(seed: int, device: torch.device | None = None):
         yield
 
 
-@torch.inference_mode()
-def encode_keyframe_cond_rows(
+def _encode_visual_latent(
     video_vae: Any,
-    image: Any,
+    method: str,
+    payload: Any,
     *,
     latents_mean: list[float],
     latents_std: list[float],
-    seed: int = KEYFRAME_ENCODE_SEED,
+    seed: int,
+    what: str,
 ) -> torch.Tensor:
-    """Canvas-sized PIL image -> packed cond rows ``[n_rows, 96]`` fp32 (CPU)."""
+    """Sampled fp32 encode -> normalised latent ``[1, 24, t, h, w]`` on CPU.
+
+    The encode *samples* the posterior, so it runs under seeded RNG with fp32
+    weights; both visual conditioning paths need exactly this.
+    """
     parameter = next(video_vae.parameters())
     prev_dtype = parameter.dtype
     if prev_dtype != torch.float32:
         video_vae.to(torch.float32)
     try:
         with scoped_encode_rng(seed, parameter.device):
-            z = video_vae.encode_images(image, use_fp16_latent=True)[0]
+            z = getattr(video_vae, method)(payload, use_fp16_latent=True)[0]
     finally:
         if prev_dtype != torch.float32:
             video_vae.to(prev_dtype)
@@ -279,14 +234,34 @@ def encode_keyframe_cond_rows(
     if z.dim() == 4:
         z = z[None]
     if z.dim() != 5 or int(z.shape[1]) != LATENT_CHANNELS:
-        raise ValueError(f"unexpected keyframe latent shape {list(z.shape)}")
+        raise ValueError(f"unexpected {what} latent shape {list(z.shape)}")
 
     view = (1, LATENT_CHANNELS, 1, 1, 1)
-    mean = torch.tensor(latents_mean).view(view)
-    std = torch.tensor(latents_std).view(view)
-    z = (z - mean) / std
+    mean = torch.tensor(latents_mean, dtype=torch.float32).view(view)
+    std = torch.tensor(latents_std, dtype=torch.float32).view(view)
+    return (z - mean) / std
 
-    return patchify_video_latent(z, patch_size=KEYFRAME_PATCH_SIZE).to(torch.float32)
+
+@torch.inference_mode()
+def encode_keyframe_cond_rows(
+    video_vae: Any,
+    image: Any,
+    *,
+    latents_mean: list[float],
+    latents_std: list[float],
+    seed: int = ENCODE_SEED,
+) -> torch.Tensor:
+    """Canvas-sized PIL image -> packed cond rows ``[n_rows, 96]`` fp32 (CPU)."""
+    z = _encode_visual_latent(
+        video_vae,
+        "encode_images",
+        image,
+        latents_mean=latents_mean,
+        latents_std=latents_std,
+        seed=seed,
+        what="keyframe",
+    )
+    return patchify_video_latent(z, patch_size=COND_PATCH_SIZE).to(torch.float32)
 
 
 REFERENCE_IMAGE_SHORT_EDGE = 2048
@@ -298,9 +273,6 @@ AUDIO_CHANNELS = 2
 VIDEO_SOURCE_AUDIO_RATE = 44100
 
 SUPPORTED_FPS = 24
-REFERENCE_VIDEO_ENCODE_SEED = 42
-REFERENCE_VIDEO_PATCH_SIZE = (1, 2, 2)
-LATENT_CHANNELS = 24
 
 # Qwen sees a 2 FPS strided view of the same frames the VAE encodes.
 QWEN_VIDEO_SAMPLE_FPS = 2.0
@@ -641,13 +613,11 @@ def encode_reference_video_rows(
     *,
     latents_mean: list[float],
     latents_std: list[float],
-    seed: int = REFERENCE_VIDEO_ENCODE_SEED,
+    seed: int = ENCODE_SEED,
 ) -> tuple[torch.Tensor, int, int, int]:
     """Frames -> ``(rows [n, 96] fp32 cpu, latent_t, latent_h, latent_w)``.
 
-    Same recipe as the fl2va keyframe sink -- fp32 weights, seeded RNG because
-    the encode *samples* the posterior, fp16 latent -- then normalise and
-    patchify. The VAE's ``clip_length=17`` / ``token_drop=3`` produce the
+    The VAE's ``clip_length=17`` / ``token_drop=3`` produce the
     17-frames-per-5-latents grouping.
     """
     frames = np.asarray(frames)
@@ -662,30 +632,17 @@ def encode_reference_video_rows(
             f"shape={list(frames.shape)} dtype={frames.dtype}"
         )
 
-    parameter = next(video_vae.parameters())
-    prev_dtype = parameter.dtype
-    if prev_dtype != torch.float32:
-        video_vae.to(torch.float32)
-    try:
-        with scoped_encode_rng(seed, parameter.device):
-            z = video_vae.encode_videos(frames, use_fp16_latent=True)[0]
-    finally:
-        if prev_dtype != torch.float32:
-            video_vae.to(prev_dtype)
-
-    z = z.cpu().float()
-    if z.dim() == 4:
-        z = z[None]
-    if z.dim() != 5 or int(z.shape[1]) != LATENT_CHANNELS:
-        raise ValueError(f"unexpected reference video latent shape {list(z.shape)}")
+    z = _encode_visual_latent(
+        video_vae,
+        "encode_videos",
+        frames,
+        latents_mean=latents_mean,
+        latents_std=latents_std,
+        seed=seed,
+        what="reference video",
+    )
     latent_t, latent_h, latent_w = (int(z.shape[i]) for i in (2, 3, 4))
-
-    view = (1, LATENT_CHANNELS, 1, 1, 1)
-    mean = torch.tensor(latents_mean, dtype=torch.float32).view(view)
-    std = torch.tensor(latents_std, dtype=torch.float32).view(view)
-    z = (z - mean) / std
-
-    rows = patchify_video_latent(z, patch_size=REFERENCE_VIDEO_PATCH_SIZE)
+    rows = patchify_video_latent(z, patch_size=COND_PATCH_SIZE)
     return rows.to(torch.float32), latent_t, latent_h, latent_w
 
 
@@ -716,9 +673,6 @@ VISION_START = "<|vision_start|>"
 VISION_END = "<|vision_end|>"
 IMAGE_PAD = "<|image_pad|>"
 VIDEO_PAD = "<|video_pad|>"
-
-TAG_TEXT = 1
-TAG_VIDEO = 0
 
 
 def text_ids(tokenizer: Any, text: str) -> list[int]:

@@ -241,8 +241,6 @@ def decode_audio_rows(
     return getattr(waveform, "sample", waveform)
 
 
-logger = logging.getLogger(__name__)
-
 # Output after layer 49 == hidden_states[50].
 MINIMAX_H3_SELECTED_LM_LAYER = 50
 MINIMAX_H3_TEXT_DIM = 5120
@@ -403,9 +401,8 @@ class MiniMaxH3TextEncoder:
     ) -> torch.Tensor:
         """Run a prebuilt presentation through Qwen3-VL -> ``[T, 5120]`` rows.
 
-        The caller owns the token stream (see
-        :mod:`atom.diffusion.models.minimax_h3.presentation`), which is the
-        whole point: fl2va and ref2va differ only in how the stream is built.
+        The caller owns the token stream, which is the whole point: fl2va and
+        ref2va differ only in how that stream is built.
         """
         if input_ids.dim() != 1:
             raise ValueError(f"input_ids must be 1-D, got {list(input_ids.shape)}")
@@ -511,8 +508,6 @@ class MiniMaxH3TextEncoder:
             )
         return rows, tags
 
-
-logger = logging.getLogger(__name__)
 
 _INDEX_NAME = "model.safetensors.index.json"
 

@@ -17,15 +17,17 @@ import torch
 # The video VAE compresses 16x spatially; the DiT then applies a (1, 2, 2)
 # patch, so each latent frame contributes (H/16/2) * (W/16/2) rows.
 VAE_SPATIAL_COMPRESSION = 16
-
-# Audio latents are produced at 40 Hz.
 AUDIO_LATENT_HZ = 40.0
-
-# Two interleaved audio channels per latent step.
 AUDIO_CHANNELS = 2
-
-# The packed sequence is padded up to this multiple.
+VIDEO_LATENT_CHANNELS = 24
+AUDIO_LATENT_CHANNELS = 32
 PACKED_SEQUENCE_ALIGNMENT = 64
+DEFAULT_SEED = 42
+
+
+def align_packed_length(used: int) -> int:
+    """Round a used-row count up to the packed-sequence alignment."""
+    return -(-int(used) // PACKED_SEQUENCE_ALIGNMENT) * PACKED_SEQUENCE_ALIGNMENT
 
 
 def align_frame_count(frame_count: int) -> int:
@@ -43,18 +45,8 @@ def video_latent_t(frame_count: int) -> int:
     return ((int(frame_count) - 5) // 17) * 5 + 2
 
 
-def frame_count_from_video_latent_t(latent_t: int) -> int:
-    """Inverse of :func:`video_latent_t`."""
-    if latent_t == 1:
-        return 1
-    if latent_t < 2 or (latent_t - 2) % 5 != 0:
-        raise ValueError(f"video latent T must be 1 or match 5n+2, got {latent_t}")
-    return 17 * ((latent_t - 2) // 5) + 5
-
-
 def audio_latent_t(duration_seconds: float) -> int:
     """Duration -> audio latent T, rounded at the 40 Hz boundary."""
-    # round() with no ndigits already returns int.
     return round(float(duration_seconds) * AUDIO_LATENT_HZ)
 
 
@@ -70,8 +62,6 @@ def time_shift_sigmas(*, num_steps: int = 50, shift_scale: float = 6.0) -> list[
         raise ValueError(f"shift_scale must be > 0, got {shift_scale}")
     if num_steps <= 0:
         raise ValueError(f"num_steps must be > 0, got {num_steps}")
-
-    import torch
 
     base = torch.linspace(1.0, 0.0, int(num_steps), dtype=torch.float32)
     shifted = shift_scale * base / (1 + (shift_scale - 1) * base)
@@ -134,11 +124,6 @@ class MiniMaxH3Geometry:
         audio_rows = at * AUDIO_CHANNELS
 
         used = text_len + audio_rows + video_rows
-        seq = (
-            (used + PACKED_SEQUENCE_ALIGNMENT - 1)
-            // PACKED_SEQUENCE_ALIGNMENT
-            * PACKED_SEQUENCE_ALIGNMENT
-        )
         return cls(
             height=height,
             width=width,
@@ -152,7 +137,7 @@ class MiniMaxH3Geometry:
             video_rows=video_rows,
             audio_rows=audio_rows,
             used_len=used,
-            seq_len=seq,
+            seq_len=align_packed_length(used),
         )
 
     def validate_ulysses(self, world_size: int) -> None:
@@ -268,6 +253,38 @@ def axis_from_sqrt_area(dim: int, patch: int, sqrt_area: float) -> torch.Tensor:
     right = left + ratio
     grid = np.linspace(left, right, dim // patch, endpoint=False) * INTERP
     return torch.from_numpy(grid).to(torch.float64)
+
+
+def spatial_grid(latent_h: int, latent_w: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """(h, w) coordinates for one latent frame: ``([rows, 2], w_axis)``."""
+    area = np.sqrt(latent_h * latent_w)
+    h_axis = axis_from_sqrt_area(latent_h, PATCH_H, area)
+    w_axis = axis_from_sqrt_area(latent_w, PATCH_W, area)
+    hh, ww = torch.meshgrid(h_axis, w_axis, indexing="ij")
+    return torch.stack([hh.reshape(-1), ww.reshape(-1)], dim=-1), w_axis
+
+
+def _pin_audio_w(g: torch.Tensor, sl: slice, count: int, w_axis: torch.Tensor) -> None:
+    """Audio rows are channel-major, pinned to the two extremes of the w axis."""
+    if count:
+        g[sl.start : sl.start + count, 2] = float(w_axis[0])
+        g[sl.start + count : sl.stop, 2] = float(w_axis[-1])
+
+
+def _text_tags(
+    token_tags: torch.Tensor, text_len: int, override: torch.Tensor | None
+) -> None:
+    """Tag the text block, honouring per-token tags from the encoder."""
+    if override is None:
+        token_tags[:text_len] = TAG_TEXT
+        return
+    tags = override.view(-1).to(torch.long)
+    if int(tags.numel()) != text_len:
+        raise ValueError(
+            f"text_token_tags has {int(tags.numel())} entries but text_len "
+            f"is {text_len}"
+        )
+    token_tags[:text_len] = tags
 
 
 def video_t_grid(n: int, origin: float) -> torch.Tensor:
@@ -389,11 +406,7 @@ def build_packed_sequence(
     cond_rows = len(cond_signature) * frame_rows
 
     used = text_len + cond_rows + audio_rows + video_rows
-    seq_len = (
-        (used + PACKED_SEQUENCE_ALIGNMENT - 1)
-        // PACKED_SEQUENCE_ALIGNMENT
-        * PACKED_SEQUENCE_ALIGNMENT
-    )
+    seq_len = align_packed_length(used)
 
     text_sl = slice(0, text_len)
     cond_sl = slice(text_len, text_len + cond_rows)
@@ -424,11 +437,7 @@ def build_packed_sequence(
     g[text_sl, 0] = torch.arange(text_len, dtype=torch.float64)
 
     t_grid = video_t_grid(latent_t, float(text_len))
-    sqrt_area = np.sqrt(latent_h * latent_w)
-    h_grid = axis_from_sqrt_area(latent_h, PATCH_H, sqrt_area)
-    w_grid = axis_from_sqrt_area(latent_w, PATCH_W, sqrt_area)
-    hh, ww = torch.meshgrid(h_grid, w_grid, indexing="ij")
-    frame = torch.stack([hh.reshape(-1), ww.reshape(-1)], dim=-1)
+    frame, w_grid = spatial_grid(latent_h, latent_w)
 
     video_g = g[video_sl].view(latent_t, frame_rows, 3)
     video_g[:, :, 0] = t_grid[:, None]
@@ -456,22 +465,10 @@ def build_packed_sequence(
 
     audio_t_grid = float(text_len) + torch.arange(audio_t, dtype=torch.float64)
     g[audio_sl, 0] = audio_t_grid.repeat(audio_channel)
-    # Channel-major: first channel pinned to the left edge of w, second to the
-    # right edge.
-    g[audio_sl.start : audio_sl.start + audio_t, 2] = float(w_grid[0])
-    g[audio_sl.start + audio_t : audio_sl.stop, 2] = float(w_grid[-1])
+    _pin_audio_w(g, audio_sl, audio_t, w_grid)
 
     token_tags = torch.full((seq_len,), TAG_PAD, dtype=torch.long)
-    if text_token_tags is None:
-        token_tags[text_sl] = TAG_TEXT
-    else:
-        tags = text_token_tags.view(-1).to(torch.long)
-        if int(tags.numel()) != text_len:
-            raise ValueError(
-                f"text_token_tags has {int(tags.numel())} entries but text_len "
-                f"is {text_len}"
-            )
-        token_tags[text_sl] = tags
+    _text_tags(token_tags, text_len, text_token_tags)
     token_tags[audio_sl] = TAG_AUDIO
     token_tags[img_pos] = TAG_VIDEO
 
@@ -531,15 +528,6 @@ def build_local_embedding_layout(
         "audio_global_ids": audio_global,
         "audio_row_ids": audio_global - row_start,
     }
-
-
-def build_packed_sequence_t2va(**kwargs) -> dict[str, torch.Tensor | int]:
-    """t2va convenience wrapper: no keyframe conditioning."""
-    if kwargs.get("keyframe_frame_indices") is not None:
-        raise ValueError("use build_packed_sequence() for fl2va")
-    kwargs.pop("keyframe_frame_indices", None)
-    kwargs.pop("frame_count", None)
-    return build_packed_sequence(**kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -651,11 +639,7 @@ def build_packed_sequence_ref2va(
 
     used = text_len + ref_visual_rows + ref_audio_rows + audio_rows + video_rows
     if seq_len is None:
-        seq_len = (
-            (used + PACKED_SEQUENCE_ALIGNMENT - 1)
-            // PACKED_SEQUENCE_ALIGNMENT
-            * PACKED_SEQUENCE_ALIGNMENT
-        )
+        seq_len = align_packed_length(used)
     if seq_len < used:
         raise ValueError(f"seq_len {seq_len} is smaller than the {used} rows used")
 
@@ -684,17 +668,7 @@ def build_packed_sequence_ref2va(
     g = torch.zeros(seq_len, 3, dtype=torch.float64)
     g[text_sl, 0] = torch.arange(text_len, dtype=torch.float64)
 
-    sqrt_area = np.sqrt(latent_h * latent_w)
-    h_grid = axis_from_sqrt_area(latent_h, PATCH_H, sqrt_area)
-    w_grid = axis_from_sqrt_area(latent_w, PATCH_W, sqrt_area)
-    hh, ww = torch.meshgrid(h_grid, w_grid, indexing="ij")
-    target_frame = torch.stack([hh.reshape(-1), ww.reshape(-1)], dim=-1)
-
-    def _pin_audio_extremes(sl: slice, count: int, grid: torch.Tensor) -> None:
-        """Audio rows are channel-major and pinned to the two w extremes."""
-        if count:
-            g[sl.start : sl.start + count, 2] = float(grid[0])
-            g[sl.start + count : sl.stop, 2] = float(grid[-1])
+    target_frame, w_grid = spatial_grid(latent_h, latent_w)
 
     ref_img_parts: list[torch.Tensor] = []
     ref_audio_parts: list[torch.Tensor] = []
@@ -704,16 +678,9 @@ def build_packed_sequence_ref2va(
         if kind == "image":
             sl = block["visual_sl"]
             ref_img_parts.append(torch.arange(sl.start, sl.stop, dtype=torch.long))
-            rh, rw = int(block["latent_h"]), int(block["latent_w"])
-            area = np.sqrt(rh * rw)
-            r_hh, r_ww = torch.meshgrid(
-                axis_from_sqrt_area(rh, PATCH_H, area),
-                axis_from_sqrt_area(rw, PATCH_W, area),
-                indexing="ij",
-            )
+            frame, _ = spatial_grid(int(block["latent_h"]), int(block["latent_w"]))
             g[sl, 0] = t_cursor
-            g[sl, 1] = r_hh.reshape(-1)
-            g[sl, 2] = r_ww.reshape(-1)
+            g[sl, 1:] = frame
             t_cursor += 1.0
         elif kind == "audio":
             sl = block["audio_sl"]
@@ -722,30 +689,26 @@ def build_packed_sequence_ref2va(
             g[sl, 0] = (t_cursor + torch.arange(ref_t, dtype=torch.float64)).repeat(
                 audio_channel
             )
-            _pin_audio_extremes(sl, ref_t, w_grid)
+            _pin_audio_w(g, sl, ref_t, w_grid)
             t_cursor += float(ref_t)
         else:
             a_sl, v_sl = block["audio_sl"], block["visual_sl"]
             ref_t = int(block["ref_audio_t"])
             vt = int(block["latent_t"])
-            vh, vw = int(block["latent_h"]), int(block["latent_w"])
             ref_audio_parts.append(
                 torch.arange(a_sl.start, a_sl.stop, dtype=torch.long)
             )
             ref_img_parts.append(torch.arange(v_sl.start, v_sl.stop, dtype=torch.long))
-
-            area = np.sqrt(vh * vw)
-            rv_h_grid = axis_from_sqrt_area(vh, PATCH_H, area)
-            rv_w_grid = axis_from_sqrt_area(vw, PATCH_W, area)
-            rv_hh, rv_ww = torch.meshgrid(rv_h_grid, rv_w_grid, indexing="ij")
+            rv_frame, rv_w_grid = spatial_grid(
+                int(block["latent_h"]), int(block["latent_w"])
+            )
 
             g[a_sl, 0] = (t_cursor + torch.arange(ref_t, dtype=torch.float64)).repeat(
                 audio_channel
             )
             # A video block's audio pins to *its own* w grid, not the target's.
-            _pin_audio_extremes(a_sl, ref_t, rv_w_grid)
+            _pin_audio_w(g, a_sl, ref_t, rv_w_grid)
 
-            rv_frame = torch.stack([rv_hh.reshape(-1), rv_ww.reshape(-1)], dim=-1)
             rv_g = g[v_sl].view(vt, int(block["frame_rows"]), 3)
             rv_g[:, :, 0] = video_t_grid(vt, t_cursor)[:, None]
             rv_g[:, :, 1:] = rv_frame[None]
@@ -754,7 +717,7 @@ def build_packed_sequence_ref2va(
     g[audio_sl, 0] = (t_cursor + torch.arange(audio_t, dtype=torch.float64)).repeat(
         audio_channel
     )
-    _pin_audio_extremes(audio_sl, audio_t, w_grid)
+    _pin_audio_w(g, audio_sl, audio_t, w_grid)
 
     video_g = g[video_sl].view(latent_t, frame_rows, 3)
     video_g[:, :, 0] = video_t_grid(latent_t, t_cursor)[:, None]
@@ -779,16 +742,7 @@ def build_packed_sequence_ref2va(
     audio_update_mask[ref_audio_rows:] = True
 
     token_tags = torch.full((seq_len,), TAG_PAD, dtype=torch.long)
-    if text_token_tags is None:
-        token_tags[text_sl] = TAG_TEXT
-    else:
-        tags = text_token_tags.view(-1).to(torch.long)
-        if int(tags.numel()) != text_len:
-            raise ValueError(
-                f"text_token_tags has {int(tags.numel())} entries for a "
-                f"{text_len}-token text block"
-            )
-        token_tags[text_sl] = tags
+    _text_tags(token_tags, text_len, text_token_tags)
     token_tags[audio_pos] = TAG_AUDIO
     token_tags[img_pos] = TAG_VIDEO
 
@@ -808,12 +762,6 @@ def build_packed_sequence_ref2va(
         "cu_seqlens": torch.tensor([0, used, seq_len], dtype=torch.int32),
         "blocks": parsed,
     }
-
-
-DEFAULT_SEED = 42
-VIDEO_LATENT_CHANNELS = 24
-AUDIO_LATENT_CHANNELS = 32
-AUDIO_CHANNELS = 2
 
 
 def build_initial_latents(

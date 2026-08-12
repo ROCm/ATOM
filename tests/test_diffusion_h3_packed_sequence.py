@@ -17,7 +17,7 @@ from atom.diffusion.models.minimax_h3.layout import (
     TAG_TEXT,
     TAG_VIDEO,
     build_local_embedding_layout,
-    build_packed_sequence_t2va,
+    build_packed_sequence,
 )
 
 # Resolved geometry of the captured 1344x768 / 5.1667 s request.
@@ -37,7 +37,7 @@ WORLD = 4
 
 @pytest.fixture(scope="module")
 def packed():
-    return build_packed_sequence_t2va(**OBS)
+    return build_packed_sequence(**OBS)
 
 
 def test_counts_match_the_live_capture(packed):

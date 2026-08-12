@@ -13,7 +13,6 @@ import torch
 from atom.diffusion.models.minimax_h3.conditioning import (
     MINIMAX_H3_AUDIO_REF_COND_TIMESTEP,
     MINIMAX_H3_IMGVID_COND_TIMESTEP,
-    audio_cond_noise_aug_rows,
     imgvid_cond_noise_aug_rows,
 )
 from atom.diffusion.models.minimax_h3.layout import patchify_video_latent
@@ -125,16 +124,3 @@ def test_seed_changes_the_result():
     a = imgvid_cond_noise_aug_rows(clean_rows(), seed=1, **kw)
     b = imgvid_cond_noise_aug_rows(clean_rows(), seed=2, **kw)
     assert not torch.allclose(a, b)
-
-
-def test_audio_default_is_a_passthrough():
-    rows = clean_rows(4, width=32)
-    assert audio_cond_noise_aug_rows(rows, condition_audio_t=[2], seed=1) is rows
-
-
-def test_audio_uses_seed_plus_one():
-    rows = torch.zeros(4, 32)
-    out = audio_cond_noise_aug_rows(rows, condition_audio_t=[2], seed=10, noise_aug=0.0)
-    generator = torch.Generator(device="cpu").manual_seed(11)
-    expected = torch.randn((4, 32), generator=generator, dtype=torch.float32)
-    assert torch.allclose(out, expected, atol=0, rtol=0)

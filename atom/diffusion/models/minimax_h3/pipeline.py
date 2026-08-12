@@ -80,6 +80,34 @@ KEYFRAME_CONDITION_TYPES = ("image",)
 REFERENCE_CONDITION_TYPES = ("image", "audio", "video", "video_audio")
 
 
+def _condition_path(
+    condition: dict, index: int, allowed: tuple[str, ...], what: str
+) -> str:
+    """Validate a condition's type and return its local path."""
+    kind = str(condition.get("type", "image"))
+    if kind not in allowed:
+        raise ValueError(
+            f"conditions[{index}] type {kind!r} is not {what}; "
+            f"expected one of {list(allowed)}"
+        )
+    uri = str(condition.get("uri") or condition.get("path") or "")
+    if not uri:
+        raise ValueError(f"conditions[{index}] has no uri")
+    return uri.removeprefix("file://")
+
+
+def _load_rgb(path: str):
+    from PIL import Image, ImageOps
+
+    with Image.open(path) as handle:
+        return ImageOps.exif_transpose(handle).convert("RGB")
+
+
+def _canvas(job) -> tuple[int, int]:
+    target = job.target or {}
+    return int(target.get("width", 1344)), int(target.get("height", 768))
+
+
 def keyframe_conditions(job) -> list[dict]:
     """Resolve a job's fl2va keyframes to canvas-sized PIL images.
 
@@ -93,26 +121,12 @@ def keyframe_conditions(job) -> list[dict]:
     """
     if not job.conditions:
         return []
-    from PIL import Image, ImageOps
-
-    target = job.target or {}
-    width = int(target.get("width", 1344))
-    height = int(target.get("height", 768))
+    width, height = _canvas(job)
 
     prepared: list[dict] = []
     for index, condition in enumerate(job.conditions):
-        kind = str(condition.get("type", "image"))
-        if kind not in KEYFRAME_CONDITION_TYPES:
-            raise ValueError(
-                f"conditions[{index}] type {kind!r} is not a keyframe; "
-                f"expected one of {list(KEYFRAME_CONDITION_TYPES)}"
-            )
-        uri = str(condition.get("uri") or condition.get("path") or "")
-        if not uri:
-            raise ValueError(f"conditions[{index}] has no uri")
-        path = uri.removeprefix("file://")
-        with Image.open(path) as handle:
-            image = ImageOps.exif_transpose(handle).convert("RGB")
+        path = _condition_path(condition, index, KEYFRAME_CONDITION_TYPES, "a keyframe")
+        image = _load_rgb(path)
         prepared.append(
             {
                 "image": (
@@ -148,8 +162,7 @@ def reference_materials(job) -> list[dict]:
         return []
 
     target = job.target or {}
-    width = int(target.get("width", 1344))
-    height = int(target.get("height", 768))
+    width, height = _canvas(job)
     fps = int(target.get("fps", 24))
     frame_count = align_frame_count(
         round(float(target.get("duration_seconds", 5.0)) * fps)
@@ -158,19 +171,11 @@ def reference_materials(job) -> list[dict]:
     ordinals: dict[str, int] = {}
     prepared: list[dict] = []
     for index, condition in enumerate(job.conditions):
-        kind = str(condition.get("type", "image"))
-        if kind not in REFERENCE_CONDITION_TYPES:
-            raise ValueError(
-                f"conditions[{index}] type {kind!r} is not a ref2va reference; "
-                f"expected one of {list(REFERENCE_CONDITION_TYPES)}"
-            )
-        uri = str(condition.get("uri") or condition.get("path") or "")
-        if not uri:
-            raise ValueError(f"conditions[{index}] has no uri")
-        path = uri.removeprefix("file://")
-        label_kind = (
-            "image" if kind == "image" else ("audio" if kind == "audio" else "video")
+        path = _condition_path(
+            condition, index, REFERENCE_CONDITION_TYPES, "a ref2va reference"
         )
+        kind = str(condition.get("type", "image"))
+        label_kind = kind if kind in ("image", "audio") else "video"
         ordinals[label_kind] = ordinals.get(label_kind, 0) + 1
         item = {
             "kind": kind,
@@ -181,10 +186,7 @@ def reference_materials(job) -> list[dict]:
         }
 
         if kind == "image":
-            from PIL import Image, ImageOps
-
-            with Image.open(path) as handle:
-                image = ImageOps.exif_transpose(handle).convert("RGB")
+            image = _load_rgb(path)
             shape = resolve_reference_image_shape(
                 width=image.size[0], height=image.size[1]
             )
@@ -217,6 +219,23 @@ def reference_materials(job) -> list[dict]:
     return prepared
 
 
+def resolved_conditions(batch: DiffusionBatch) -> list[dict]:
+    """A request's prepared conditioning material, resolved once per rank.
+
+    Three stages need it and resolving is not free -- images are re-opened and
+    resized, and a ref2va video is a full ffmpeg decode -- so the result is
+    memoised on the batch rather than rebuilt per stage.
+    """
+    cached = batch.meta.get("resolved_conditions")
+    if cached is None:
+        resolve = (
+            reference_materials if batch.job.task == "ref2va" else keyframe_conditions
+        )
+        cached = resolve(batch.job)
+        batch.meta["resolved_conditions"] = cached
+    return cached
+
+
 class TextEncodingStage(PipelineStage):
     """Encode the prompt on rank 0 and share the result.
 
@@ -244,7 +263,7 @@ class TextEncodingStage(PipelineStage):
             if batch.job.task == "ref2va":
                 rows, tags = self._encode_ref2va(active, batch)
             else:
-                images = [item["image"] for item in keyframe_conditions(batch.job)]
+                images = [item["image"] for item in resolved_conditions(batch)]
                 rows, tags = active.encode_with_tags(batch.job.prompt, images or None)
             rows = rows.to(torch.bfloat16).cpu()
         batch.set("prompt_embeds", rows)
@@ -259,7 +278,7 @@ class TextEncodingStage(PipelineStage):
         only the audio VAE. Video contributes one timestamped block per
         temporal chunk of its 2 FPS sampled view.
         """
-        materials = reference_materials(batch.job)
+        materials = resolved_conditions(batch)
         if not materials:
             raise ValueError("ref2va requires at least one reference condition")
 
@@ -336,7 +355,7 @@ class PlanStage(PipelineStage):
                 raise ValueError("ref2va requires at least one reference condition")
             keyframe_indices: list[int] = []
         else:
-            keyframes = keyframe_conditions(job)
+            keyframes = resolved_conditions(batch)
             if keyframes and job.task != "fl2va":
                 raise ValueError(
                     f"task {job.task!r} cannot carry keyframe conditions; use fl2va"
@@ -403,26 +422,18 @@ class ConditionEncodeStage(PipelineStage):
     def __init__(self, pipeline: "ComposedPipeline") -> None:
         self.pipeline = pipeline
 
-    @property
-    def video_stats(self):
-        return self.pipeline.video_stats
-
-    @property
-    def audio_stats(self):
-        return self.pipeline.audio_stats
-
     def forward(self, batch: DiffusionBatch, config: DiffusionConfig):
         batch.set("cond_audio_rows", None)
         batch.set("ref_blocks", None)
         if batch.job.task == "ref2va":
             return self._encode_references(batch, config)
 
-        keyframes = keyframe_conditions(batch.job)
+        keyframes = resolved_conditions(batch)
         if not keyframes:
             batch.set("cond_rows", None)
             return batch
         g = batch.require("geometry")
-        mean, std = self.video_stats
+        mean, std = self.pipeline.video_stats
         clean = torch.cat(
             [
                 encode_keyframe_cond_rows(
@@ -449,9 +460,9 @@ class ConditionEncodeStage(PipelineStage):
 
     def _encode_references(self, batch: DiffusionBatch, config: DiffusionConfig):
         g = batch.require("geometry")
-        v_mean, v_std = self.video_stats
-        a_stats = self.audio_stats or (None, None)
-        materials = reference_materials(batch.job)
+        v_mean, v_std = self.pipeline.video_stats
+        a_stats = self.pipeline.audio_stats or (None, None)
+        materials = resolved_conditions(batch)
 
         blocks: list[dict] = []
         visual: list[torch.Tensor] = []
@@ -716,17 +727,9 @@ class DecodeStage(PipelineStage):
     def __init__(self, pipeline: "ComposedPipeline") -> None:
         self.pipeline = pipeline
 
-    @property
-    def video_stats(self):
-        return self.pipeline.video_stats
-
-    @property
-    def audio_stats(self):
-        return self.pipeline.audio_stats
-
     def forward(self, batch: DiffusionBatch, config: DiffusionConfig):
         g = batch.require("geometry")
-        mean, std = self.video_stats
+        mean, std = self.pipeline.video_stats
         frames = decode_video_rows(
             self.pipeline.component("video_vae"),
             batch.require("denoised_video"),
@@ -741,7 +744,7 @@ class DecodeStage(PipelineStage):
         batch.set("frames", frames)
         audio_vae = self.pipeline.components.get("audio_vae")
         if audio_vae is not None:
-            a_mean, a_std = self.audio_stats or (None, None)
+            a_mean, a_std = self.pipeline.audio_stats or (None, None)
             batch.set(
                 "audio",
                 decode_audio_rows(
