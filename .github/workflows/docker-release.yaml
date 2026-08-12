@@ -259,7 +259,9 @@ jobs:
           fi
 
       - name: Build OOT Docker image
+        id: build_oot
         if: ${{ success() && steps.gates.outputs.oot == 'true' }}
+        continue-on-error: true
         timeout-minutes: 180
         run: |
           OOT_BASE_IMAGE="atom_release:ci"
@@ -274,16 +276,20 @@ jobs:
           docker inspect atom_oot_release:ci
 
       - name: Re-login to Docker Hub before OOT push
+        id: login_oot
         # Fresh token before this push: the OOT build above adds even more time
         # since the initial login, so the auth token is stale by push time.
-        if: ${{ success() && steps.gates.outputs.oot == 'true' }}
+        if: ${{ steps.build_oot.outcome == 'success' }}
+        continue-on-error: true
         uses: ./.github/actions/docker-auth
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Push OOT Docker image
-        if: ${{ success() && steps.gates.outputs.oot == 'true' }}
+        id: push_oot
+        if: ${{ steps.login_oot.outcome == 'success' }}
+        continue-on-error: true
         run: |
           set -euo pipefail
           VLLM_VER="${VLLM_VERSION}"
@@ -352,6 +358,12 @@ jobs:
           else
             echo "Custom SGLang tag suffix '${SGLANG_TAG_SUFFIX}' provided; skipping rocm/atom-dev:${SGLANG_LATEST_TAG} update."
           fi
+
+      - name: Fail if OOT Docker image failed
+        if: ${{ always() && steps.gates.outputs.oot == 'true' && (steps.build_oot.outcome == 'failure' || steps.login_oot.outcome == 'failure' || steps.push_oot.outcome == 'failure') }}
+        run: |
+          echo "OOT vLLM Docker image failed; SGLang steps were allowed to run first."
+          exit 1
 
       - name: Clean Up
         if: always()

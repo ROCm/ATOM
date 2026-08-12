@@ -371,6 +371,9 @@ class AttentionMetaData:
     context_lens: torch.Tensor | None = None
     block_tables: torch.Tensor | None = None
     dropout_p: float = 0.0
+    # True for standard causal attention; False only for DSpark's bidirectional
+    # draft block. The MLA asm decode kernel selects a different .co by this flag.
+    causal: bool = True
 
     state: AttnState = AttnState.PREFILL_NATIVE
     """One of `DECODE / PREFILL_NATIVE / PREFILL_PREFIX` — controls which
@@ -415,6 +418,7 @@ class AttentionMetaData:
         context_lens: torch.Tensor | None = None,
         block_tables: torch.Tensor | None = None,
         dropout_p: float = 0.0,
+        causal: bool = True,
         state: AttnState = AttnState.PREFILL_NATIVE,
         kv_indptr: torch.Tensor | None = None,
         kv_indices: torch.Tensor | None = None,
@@ -449,6 +453,7 @@ class AttentionMetaData:
         self.context_lens = context_lens
         self.block_tables = block_tables
         self.dropout_p = dropout_p
+        self.causal = causal
         self.state = state
         self.kv_indptr = kv_indptr
         self.kv_indices = kv_indices
