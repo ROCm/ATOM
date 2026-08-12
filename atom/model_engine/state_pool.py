@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import logging
 from collections import deque
 from dataclasses import dataclass
 from heapq import heapify, heappop, heappush
@@ -9,6 +10,8 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from atom.model_engine.state_offload import StateOffloadIndex
+
+logger = logging.getLogger("atom")
 
 # `StateTransfer.kind` values. Plain strings rather than an enum because the
 # choice crosses a process boundary inside a dict (ModelRunner's `block_info`),
@@ -205,6 +208,9 @@ class StateGroupPool:
         self.offload: StateOffloadIndex | None = None
         # (group, staging_slot) pairs the next forward must copy out of HBM.
         self._spill_copies: list[tuple[int, int]] = []
+        # One-shot latch so the undrained-consumer diagnosis cannot flood the
+        # log from `pop()`, which is itself a hot path.
+        self._warned_spill_copies_undrained = False
         # Groups serving as a fork source in the in-flight step, counted by how
         # many requests fork off each. They stay off the free list until
         # `release_pins`, so the step that reads them cannot race a request that
@@ -494,6 +500,11 @@ class StateGroupPool:
         """
         if h in self.hash_to_group:
             return True
+        # Invariant, relied on to keep this hot path free of an `enabled` check:
+        # a disabled (depth-0) tier never reaches `request_spill`, because
+        # `_spill` returns on `not enabled` first, so `hashes` stays empty and
+        # the membership test is false anyway. Anything that adds to `hashes`
+        # outside the confirm-after-spill path must re-check `enabled` here.
         return self.offload is not None and h in self.offload.hashes
 
     def _spill(self, group: int) -> None:
@@ -511,6 +522,23 @@ class StateGroupPool:
         slot = self.offload.request_spill(h, group)
         if slot >= 0:
             self._spill_copies.append((group, slot))
+            # Exact leak detector, not a heuristic: a slot must be released
+            # before it can be handed out again, so at most `staging_depth`
+            # copies can be outstanding if the consumer drains every step.
+            # More than that is proof `take_spill_copies` is not being called.
+            if (
+                len(self._spill_copies) > self.offload.staging_depth
+                and not self._warned_spill_copies_undrained
+            ):
+                self._warned_spill_copies_undrained = True
+                logger.warning(
+                    "StateGroupPool has %d undrained spill copies for a staging "
+                    "ring of depth %d. take_spill_copies() must be called every "
+                    "step and each slot released with release_staging(); until "
+                    "it is, the staging ring leaks and every spill is dropped.",
+                    len(self._spill_copies),
+                    self.offload.staging_depth,
+                )
 
     def take_spill_copies(self) -> list[tuple[int, int]]:
         """`(group, staging_slot)` pairs the next forward must copy.
@@ -521,6 +549,15 @@ class StateGroupPool:
         the existing group-indexed copy with no second addressing scheme. One
         device-to-device copy per spill, on the compute stream ahead of that
         step's forward, the same path relocation already uses.
+
+        Contract, and it is not optional. Whoever attaches a tier MUST call
+        this every step, and MUST call `StateOffloadIndex.release_staging(slot)`
+        for each slot once its bytes are safe. Skip the drain and this list
+        grows without bound; skip the release and the staging ring is starved
+        permanently — `request_spill` then returns -1 forever and every
+        checkpoint is silently evicted instead of spilled. Both failures are
+        detected and warned about once (here and in `request_spill`), but the
+        warning is a diagnosis, not a repair.
         """
         out, self._spill_copies = self._spill_copies, []
         return out

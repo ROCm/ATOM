@@ -2,7 +2,12 @@
 # The scheduler-side half of the state offload tier: a hash set and a bounded
 # spill queue. No device work happens here, so this runs anywhere.
 
-from atom.model_engine.state_offload import StateOffloadIndex
+import logging
+
+from atom.model_engine.state_offload import (
+    _STARVATION_DROP_THRESHOLD,
+    StateOffloadIndex,
+)
 from atom.model_engine.state_pool import StateGroupPool, StateTransfer
 
 
@@ -93,3 +98,72 @@ def test_a_spilled_hash_still_takes_the_fork_test():
     pool.offload = index()
     pool.offload.confirm_spill(7)
     assert pool.resumable_hit(Seq(), 2, [3, 7]) == 0
+
+
+# --------------------- the undrained-consumer detectors --------------------- #
+# `take_spill_copies` has no in-tree consumer yet. A tier attached before one
+# exists leaks every staging slot and silently stops spilling, so both halves of
+# that failure have to announce themselves rather than degrade quietly.
+
+
+def test_a_negative_hash_is_not_counted_as_a_dropped_spill():
+    """`_spill` already refuses a group with no checkpoint, so h<0 is a caller
+    bug. Counting it as a drop would inflate the backpressure signal."""
+    idx = index(depth=2)
+    assert idx.request_spill(-1, group=3) == -1
+    assert idx.spills_dropped == 0
+    assert idx.spills_requested == 0
+
+
+def test_a_starved_ring_warns_once_naming_the_undrained_consumer(caplog):
+    idx = index(depth=1)
+    assert idx.request_spill(11, group=3) >= 0  # takes the only slot, never freed
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        for i in range(_STARVATION_DROP_THRESHOLD + 5):
+            assert idx.request_spill(100 + i, group=4) == -1
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1, [r.getMessage() for r in warnings]
+    msg = warnings[0].getMessage()
+    assert "take_spill_copies" in msg and "release_staging" in msg
+
+
+def test_drain_and_release_never_warns(caplog):
+    """The detector must not fire on healthy traffic, or it is just noise:
+    many more spills than the threshold, but each slot comes back."""
+    pool = StateGroupPool(
+        num_groups=4, transfer=StateTransfer.copy(), hash_block_size=4
+    )
+    pool.offload = index(depth=2)
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        for i in range(_STARVATION_DROP_THRESHOLD * 4):
+            pool.group_hash[0] = 1000 + i
+            pool._spill(0)
+            for _group, slot in pool.take_spill_copies():
+                pool.offload.confirm_spill(1000 + i)
+                pool.offload.release_staging(slot)
+            pool.offload.take_pending()
+    assert pool.offload.spills_dropped == 0
+    assert [
+        r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+    ] == []
+
+
+def test_undrained_spill_copies_past_the_staging_depth_warns_once(caplog):
+    """The exact detector: a slot must be released before it is handed out
+    again, so more outstanding copies than `staging_depth` is proof, not a
+    heuristic, that nobody is calling `take_spill_copies`."""
+    pool = StateGroupPool(
+        num_groups=4, transfer=StateTransfer.copy(), hash_block_size=4
+    )
+    pool.offload = StateOffloadIndex(staging_depth=2, kv_offload_enabled=False)
+    # Hand the ring back its slots without ever draining `_spill_copies`, so
+    # spills keep succeeding while the pool-side list grows past the depth.
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        for i in range(6):
+            pool.group_hash[0] = 2000 + i
+            pool._spill(0)
+            pool.offload.release_staging(i % 2)
+    assert len(pool._spill_copies) > pool.offload.staging_depth
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1, [r.getMessage() for r in warnings]
+    assert "take_spill_copies" in warnings[0].getMessage()
