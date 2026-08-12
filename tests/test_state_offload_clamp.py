@@ -25,7 +25,11 @@ def test_no_kv_loaded_clamps_to_zero_which_means_recompute():
 
 
 def test_negatives_floor_at_zero():
+    """Either argument. A negative L is the more dangerous one: the inner
+    min() carries it straight through, and a negative boundary reaching the
+    forward is not a shorter prefix but an out-of-range one."""
     assert clamp_state_boundary(-1, 8) == 0
+    assert clamp_state_boundary(8, -1) == 0
 
 
 from atom.kv_transfer.offload.state_tier import _JointPark
