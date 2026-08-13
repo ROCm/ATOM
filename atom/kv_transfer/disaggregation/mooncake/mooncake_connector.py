@@ -381,11 +381,9 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             self._reqs_need_recv[seq.id] = (seq, seq.block_table, slot_index)
             params["do_remote_prefill"] = False
             params["local_slot_index"] = slot_index
-            # PD incremental: the leading blocks the decode node already holds
-            # from a prior turn's prefix cache (allocate() reused them and set
-            # num_cached_tokens) are transferred by neither side. Disabled for
-            # stateful backends — SWA pool and per-request slot state (V4/DSA)
-            # are not covered by this block-only delta path, so fall back to full.
+            # PD incremental: skip leading blocks already in the decode node's
+            # prefix cache. Stateful backends (SWA / per-request cache) fall
+            # back to full transfer — block-only delta cannot cover their state.
             num_computed_blocks = 0
             if (
                 not getattr(seq, "swa_block_table", None)
@@ -937,10 +935,8 @@ class MooncakeConnector(KVConnectorBase):
                 self._pending_recv_expected[req_id] = expected_responses
                 self._pending_recv_nonce[req_id] = write_nonce
 
-            # PD incremental: skip the leading blocks the decode node already
-            # holds locally. Both dst and remote src are sliced by the same
-            # offset so block i stays aligned across nodes. A corrupt/oversized
-            # offset falls back to a full transfer.
+            # PD incremental: slice off locally cached prefix blocks; invalid
+            # offset falls back to full transfer.
             remote_block_ids = meta.remote_block_ids or []
             off = meta.num_computed_blocks
             if (
@@ -1047,8 +1043,7 @@ class MooncakeConnector(KVConnectorBase):
                 )
 
             self._pending_recv.add(req_id)
-            # Only the delta blocks are RDMA-written, so only they need fencing;
-            # the reused prefix blocks are already coherent.
+            # Only delta blocks need fencing; reused prefix blocks are coherent.
             self._pending_recv_blocks[req_id] = list(dst_block_ids)
             if meta.local_slot_index >= 0:
                 self._pending_recv_slots[req_id] = (
@@ -1246,10 +1241,8 @@ class MooncakeConnector(KVConnectorBase):
                 }
 
             src_block_ids = prefill_data["block_ids"]
-            # PD incremental (TP-TP): dst is already sliced by the consumer, but
-            # src here comes from the producer's own full prefill block_table, so
-            # slice it by the same offset to keep block i aligned. (Under PP the
-            # consumer-supplied src is already sliced, so skip.)
+            # PD incremental (TP-TP only): consumer already sliced dst; slice
+            # producer's src by the same offset. PP src arrives pre-sliced.
             if self.pp_size == 1:
                 off = request_data.get("num_computed_blocks", 0)
                 if 0 < off < len(src_block_ids):

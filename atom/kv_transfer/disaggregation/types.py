@@ -134,9 +134,8 @@ class ReqMeta:
     transfer_id: int = 0
     local_slot_index: int = -1
 
-    # PD incremental transfer: leading prompt blocks the decode node already
-    # holds from a prior turn's prefix cache. Both sides skip these — only
-    # block_ids[num_computed_blocks:] cross the wire. 0 = full transfer.
+    # PD incremental: blocks already in decode's prefix cache; both sides
+    # skip block_ids[:num_computed_blocks]. 0 = full transfer.
     num_computed_blocks: int = 0
     # The request's SWA ring slot, as a one-element list so it zips with the
     # region loop like block ids do. Empty for backends with no SWA state.
