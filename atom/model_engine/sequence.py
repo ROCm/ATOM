@@ -5,7 +5,7 @@ from collections.abc import Callable
 from copy import copy
 from enum import Enum, auto
 from itertools import count
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 

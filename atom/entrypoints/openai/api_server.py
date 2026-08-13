@@ -1895,7 +1895,6 @@ async def server_info():
     per-DP-rank worker set and enable cache-aware routing to the rank that
     holds a request's prefix.
     """
-    global engine, model_name
     cfg = engine.config
     return {
         "model_id": model_name,
