@@ -558,7 +558,6 @@ function parseAtomeshSummaryRows(markdown) {
     const outputTputPerGpu = parseAtomeshNumber(raw.outputtoksgpu);
     const interactivity = parseAtomeshNumber(raw.interactivity);
     const gsm8k = parseAtomeshNumber(raw.gsm8k);
-    const cacheHitPct = parseAtomeshNumber(String(raw.cachehit || '').replace('%', ''));
     const accuracyScore = parseAtomeshNumber(raw.accuracy) ?? gsm8k;
     const accuracyTask = raw.accuracytask || (Number.isFinite(gsm8k) ? 'gsm8k' : '');
     return {
@@ -581,9 +580,6 @@ function parseAtomeshSummaryRows(markdown) {
       ttftMs: parseAtomeshNumber(raw.ttftms),
       tpotMs: parseAtomeshNumber(raw.tpotms),
       e2eMs: parseAtomeshNumber(raw.e2ems),
-      // The summary table prints this column as a percentage; the point payload
-      // carries a 0-1 fraction, so normalise to the fraction here too.
-      cacheHitRate: cacheHitPct != null ? cacheHitPct / 100 : null,
       accuracyTask,
       accuracyMetric: accuracyTask === 'gsm8k' ? 'flexible-extract' : '',
       accuracyScore,
@@ -653,11 +649,6 @@ function atomeshPointRow(point, meta, idx) {
     ttftMs: atomeshPointNumber(point, 'ttft_ms'),
     tpotMs: atomeshPointNumber(point, 'tpot_ms'),
     e2eMs: atomeshPointNumber(point, 'e2el_ms'),
-    // Prefill prefix-cache token hit rate, 0-1. Only present for cases that run
-    // with prefix caching on and long enough for the engine to report it.
-    cacheHitRate: atomeshPointNumber(point, 'cache_hit_rate'),
-    cacheHitTokens: atomeshPointNumber(point, 'cache_hit_tokens'),
-    cacheTotalTokens: atomeshPointNumber(point, 'cache_total_tokens'),
     accuracyTask,
     accuracyMetric: point.accuracy_metric || '',
     accuracyScore,
@@ -3069,15 +3060,6 @@ function atomeshDpAttentionLabel(row) {
   if (row.decodeDpa) return 'Decode only';
   return 'False';
 }
-function atomeshCacheHitRowHTML(row) {
-  // Rendered only when the case reported it: most cases run with prefix caching
-  // off, and a permanent em dash row would be noise in every one of their popovers.
-  if (!Number.isFinite(row.cacheHitRate)) return '';
-  const tokens = Number.isFinite(row.cacheHitTokens) && Number.isFinite(row.cacheTotalTokens)
-    ? ` <span style="color:var(--text-tertiary)">(${fmtNum(row.cacheHitTokens, 0)} / ${fmtNum(row.cacheTotalTokens, 0)} tok)</span>`
-    : '';
-  return `<div class="pop-row"><span class="pop-key">Prefix Cache Hit Rate</span><span class="pop-val">${fmtNum(row.cacheHitRate * 100, 2)}%${tokens}</span></div>`;
-}
 function showAtomeshPopover(row) {
   const runHref = safeHref(row.runUrl);
   const commitHref = safeHref(row.commit?.url);
@@ -3097,7 +3079,6 @@ function showAtomeshPopover(row) {
       <div class="pop-row"><span class="pop-key">Output Token Throughput per GPU</span><span class="pop-val">${atomeshDetailValue(row.outputTputPerGpu, v => fmtNum(v, 3))}</span></div>
       <div class="pop-row"><span class="pop-key">Total tok/s</span><span class="pop-val">${atomeshDetailValue(row.totalTput, v => fmtNum(v, 3))}</span></div>
       <div class="pop-row"><span class="pop-key">TTFT / TPOT / E2E</span><span class="pop-val">${[row.ttftMs, row.tpotMs, row.e2eMs].map(v => v != null ? fmtNum(v, 2) : '—').join(' / ')} ms</span></div>
-      ${atomeshCacheHitRowHTML(row)}
     </div>
     <div class="pop-section">
       <div class="pop-row"><span class="pop-key">Topology</span><span class="pop-val" style="font-family:inherit">${escHTML(row.sourceTopology || row.topology || '—')}</span></div>
