@@ -26,6 +26,7 @@ from conftest import MockConfig
 
 from atom.model_engine import state_pool
 from atom.model_engine.block_manager import BlockManager
+from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import Sequence
 
 BLOCK = 4
@@ -255,3 +256,48 @@ def test_the_gate_is_the_only_thing_holding_the_spilled_rung_back(monkeypatch):
     assert hit * bm.hash_block_size > short_boundary, "the scan stopped too early"
     bm.allocate(resumer, hit)
     assert resumer.num_cached_tokens == 0
+
+
+# ── What the disowned request tells the user it got ────────────────────────
+
+
+def test_a_disowned_request_reports_no_prefix_cache_hit(monkeypatch):
+    """`prefix_cache_hit_tokens` must be the hit kept, not the hit offered.
+
+    It is what the OpenAI response reports as
+    `prompt_tokens_details.cached_tokens`. A disown means the engine threw the
+    boundary away and recomputes it, so claiming a hit there is a false number
+    -- and one that disagrees with `CacheStats`, which reads the post-disown
+    `num_cached_tokens`. Driven through `Scheduler.schedule` rather than
+    `BlockManager.allocate` because the scheduler is where the field is set.
+    """
+    monkeypatch.setenv("OFFLOAD_STATE", "1")
+    loads_wired(monkeypatch)
+    sched = Scheduler(tier_config(pool_entries={"state": 8}, max_num_seqs=8))
+    spilled_publisher(sched.block_manager, list(range(40)))
+
+    resumer = stateful_seq(list(range(40)))
+    sched.add(resumer)
+    sched.schedule()
+
+    assert resumer.num_cached_tokens == 0, "the boundary was not disowned"
+    assert resumer.prefix_cache_hit_tokens == 0
+
+
+def test_a_resumed_request_still_reports_its_prefix_cache_hit(monkeypatch):
+    """The other half: on the ordinary path the reported hit is unchanged.
+
+    Guards against fixing the disown by simply reporting nothing. The value is
+    `seq.num_cached_tokens`, which is `num_cached_blocks * hash_block_size` --
+    the same units `CacheStats` uses.
+    """
+    monkeypatch.setenv("OFFLOAD_STATE", "1")
+    sched = Scheduler(tier_config(pool_entries={"state": 8}, max_num_seqs=8))
+    _, boundary = resident_publisher(sched.block_manager, list(range(40)))
+
+    resumer = stateful_seq(list(range(40)))
+    sched.add(resumer)
+    sched.schedule()
+
+    assert resumer.num_cached_tokens == boundary, "the boundary was not resumed"
+    assert resumer.prefix_cache_hit_tokens == boundary

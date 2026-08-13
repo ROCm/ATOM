@@ -1259,12 +1259,22 @@ class Scheduler:
                 break
             self.block_manager.allocate(seq, num_cached_blocks)
 
+            # Report the hit the request actually kept, not the one
+            # `can_allocate` offered: `allocate` may disown the boundary (a
+            # hybrid whose state group could not be produced sets
+            # `num_cached_tokens = 0` and recomputes over the claimed blocks),
+            # and `num_cached_blocks` is the pre-disown count. Sourcing from
+            # `seq.num_cached_tokens` also gets the unit right — it is
+            # `num_cached_blocks * hash_block_size`, and under DCP one
+            # block_table entry spans `block_size * dcp_world_size` tokens, so
+            # scaling by `block_size` under-reports by the DCP factor. Same
+            # value CacheStats uses (`_schedule_prefill_seq`), so the
+            # user-visible number and the internal hit rate cannot disagree.
+            #
             # Guard: PD decode consumer inherits hit from prefill node;
-            # don't clobber with local num_cached_blocks (always 0 on consumer).
+            # don't clobber with the local hit (always 0 on consumer).
             if not seq.prefix_cache_hit_tokens:
-                seq.prefix_cache_hit_tokens = (
-                    num_cached_blocks * self.block_manager.block_size
-                )
+                seq.prefix_cache_hit_tokens = seq.num_cached_tokens
 
             self._notify_connector_after_prefill_alloc(seq)
 
@@ -1276,9 +1286,18 @@ class Scheduler:
                 self._park_for_remote_load(seq, skipped_waiting_requests)
                 continue
 
-            seq.prefix_cache_hit_tokens = (
-                num_cached_blocks * self.block_manager.block_size
-            )
+            # Refresh, not a duplicate of the set above: that one is guarded on
+            # the field being empty, so a seq re-admitted after preempt() (which
+            # clears the block table but leaves this field) would keep the hit
+            # from its previous admission. Unconditional here, where the request
+            # is certain to prefill locally. A PD decode consumer's inherited
+            # hit is not at risk: it parks at the `needs_remote_load` continue
+            # above, and on the pass that unparks it, `_resolve_waiting_remote_kv`
+            # sends it to first decode before this line. The one path that does
+            # reach here holding an inherited hit is a *failed* remote recv, and
+            # there the local hit is the truthful number: the transfer never
+            # landed and this node prefills the prompt itself.
+            seq.prefix_cache_hit_tokens = seq.num_cached_tokens
 
             chunk = self._adjust_prefill_chunk_after_alloc(seq, chunk)
             chunk = self._finalize_prefill_chunk(seq, seq.num_cached_tokens, chunk)

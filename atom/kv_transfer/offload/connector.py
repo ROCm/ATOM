@@ -838,9 +838,16 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         # Saves are untouched -- this request's KV still populates the tier for
         # a stateless reader.
         #
-        # Temporary. Task 9c wires the joint park (`state_tier._JointPark`),
-        # after which a hybrid can restore KV and state together and reach a
-        # boundary where the two legitimately agree; this guard goes then.
+        # The guard stays, and is not blocked merely on a joint park existing.
+        # The two legs are decided by independent matchers at different
+        # granularities: the KV leg comes from LMCache's `lookup()` floored to
+        # `chunk_size` (256), the state leg from `BlockManager._gated_hit` -- a
+        # fixpoint over the state caches, snapped to `hash_block_size` and then
+        # to a `state_checkpoint_interval_tokens` rung, and gated by
+        # `min_fork_tokens`. They agree only by configuration coincidence.
+        # `state_tier._JointPark` makes `L == P` representable, not guaranteed.
+        # Lifting this needs a load path that clamps both legs to a common
+        # boundary and proves it; see the README's "State offload tier" section.
         if getattr(seq, "has_per_req_cache", False):
             return False, "per_req_cache_state_boundary", hbm, lmc, need, chunk
         if lmc <= hbm:

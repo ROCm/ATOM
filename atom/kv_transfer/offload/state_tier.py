@@ -142,11 +142,17 @@ class StateOffloadTier:
 def clamp_state_boundary(state_blocks: int, kv_loaded_blocks: int) -> int:
     """`P <= L`: a state boundary may not claim history the KV does not cover.
 
-    Today this holds for free because both derive from `block_hashes`. Once the
-    tier admits spilled hashes and the KV load length is decided on a separate
-    path, it does not, and the failure is silent: state is the compressed
-    history of [0,P), so with P > L the forward reads a compressed prefix whose
-    raw KV was never loaded and produces wrong output without raising.
+    Today it holds for free and the `P > L` hazard is gated off, twice over:
+    `state_pool.STATE_OFFLOAD_LOADS_WIRED` is False so the tier does not admit
+    spilled hashes at all, and `LMCacheOffloadConnectorScheduler
+    ._decide_load_after_alloc` refuses the KV load for any `has_per_req_cache`
+    sequence, so both boundaries still derive from `block_hashes`.
+
+    Re-arming either gate arms the hazard, and the failure is silent: state is
+    the compressed history of [0,P), so with P > L the forward reads a
+    compressed prefix whose raw KV was never loaded and produces wrong output
+    without raising. This helper is the clamp for that world; it has no
+    production caller today.
 
     Clamping to 0 means the sequence recomputes -- the existing path.
     """
