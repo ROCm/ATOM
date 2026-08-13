@@ -167,8 +167,29 @@ def _v4_attention_fake(
 
 
 # PIECEWISE cudagraph: persistent per-(layer, num_tokens) buffers holding each
-# attention op's output.
+# attention op's output (eager core -> next graph piece boundary).
 _v4_attn_piecewise_out: dict = {}
+
+# PIECEWISE cudagraph: persistent per-(layer, num_tokens, arg) buffers holding a
+# snapshot of the eager core's transient projection inputs (q/kv_pre/qr/qr_scale/
+# idx_*). Those are outputs of the preceding graph piece and live in the SHARED
+# graph pool, which overlays them across num_tokens buckets; snapshotting them
+# out of the pool on core entry pins the graph->eager boundary. Keyed on
+# (layer_name, num_tokens, arg_index).
+_v4_attn_piecewise_in: dict = {}
+
+
+def _pin_core_input(layer_name: str, arg_idx: int, num_tokens: int, t):
+    """Snapshot a pool-backed core input into a persistent buffer (or None)."""
+    if t is None:
+        return None
+    key = (layer_name, num_tokens, arg_idx)
+    buf = _v4_attn_piecewise_in.get(key)
+    if buf is None or buf.shape != t.shape or buf.dtype != t.dtype:
+        buf = torch.empty_like(t)
+        _v4_attn_piecewise_in[key] = buf
+    buf.copy_(t)
+    return buf
 
 
 @mark_spliting_op(is_custom=True, gen_fake=_v4_attention_fake, mutates_args=[])
@@ -222,15 +243,31 @@ def v4_core_attention(
 ) -> torch.Tensor:
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
-    out = self._attn_core(
-        x, q, kv_pre, qr, qr_scale, positions, idx_q_quant, idx_weights, idx_q_scale
-    )
 
     from atom.config import CUDAGraphMode
     from atom.utils.forward_context import get_forward_context
 
     fc = get_forward_context()
-    if getattr(fc, "cudagraph_runtime_mode", None) == CUDAGraphMode.PIECEWISE:
+    _piecewise = getattr(fc, "cudagraph_runtime_mode", None) == CUDAGraphMode.PIECEWISE
+    if _piecewise:
+        # Snapshot the transient projection inputs out of the shared graph pool
+        # before the core reads them (the pool overlays them across num_tokens
+        # buckets). `x` is a dense-piece residual (kept live into attn_post's
+        # piece, so not overlaid) and is left in place.
+        _n = int(q.shape[0])
+        q = _pin_core_input(layer_name, 0, _n, q)
+        kv_pre = _pin_core_input(layer_name, 1, _n, kv_pre)
+        qr = _pin_core_input(layer_name, 2, _n, qr)
+        qr_scale = _pin_core_input(layer_name, 3, _n, qr_scale)
+        idx_q_quant = _pin_core_input(layer_name, 4, _n, idx_q_quant)
+        idx_weights = _pin_core_input(layer_name, 5, _n, idx_weights)
+        idx_q_scale = _pin_core_input(layer_name, 6, _n, idx_q_scale)
+
+    out = self._attn_core(
+        x, q, kv_pre, qr, qr_scale, positions, idx_q_quant, idx_weights, idx_q_scale
+    )
+
+    if _piecewise:
         key = (layer_name, int(out.shape[0]))
         buf = _v4_attn_piecewise_out.get(key)
         if buf is None:
@@ -2566,9 +2603,13 @@ class DeepseekV4Attention(nn.Module):
         positions: torch.Tensor,
     ) -> torch.Tensor:
         # Split-op granularity depends on the cudagraph mode
-        #  - PIECEWISE cudagraph -> NARROW split attention
+        #  - PIECEWISE cudagraph -> NARROW split attention: only the paged /
+        #    dynamic-shape attention core stays eager; the Q/KV/indexer
+        #    projections are compiled into the preceding graph piece. Their
+        #    outputs cross the graph->eager boundary and are pinned out of the
+        #    shared graph pool on core entry (see v4_core_attention).
         #  - FULL / NONE -> WIDE split attention: the whole attention is one eager
-        #  for torch compile.
+        #    op for torch compile.
         cg_mode = get_current_atom_config().compilation_config.cudagraph_mode
         if cg_mode is not None and cg_mode.requires_piecewise_compilation():
             (

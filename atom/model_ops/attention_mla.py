@@ -4,7 +4,7 @@
 import logging
 from dataclasses import dataclass
 from functools import partial as functools_partial
-from typing import Optional, Protocol
+from typing import ClassVar, Optional, Protocol
 
 import torch
 import triton
@@ -53,7 +53,9 @@ from atom.distributed.pcp_utils import (
     pcp_allgather_rerange,
     pcp_is_enabled,
 )
+from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import use_triton_gemm
+from atom.model_ops.triton_fused_mla_ctx_kv import fused_mla_ctx_norm_rope_cache
 from atom.model_ops.utils import get_and_maybe_dequant_weights
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
@@ -62,6 +64,24 @@ from atom.utils.forward_context import (
     ForwardContext,
     get_forward_context,
 )
+
+
+def _sparse_index_workspace(
+    out: torch.Tensor | None,
+    total_out: int,
+    *,
+    device: torch.device,
+    name: str,
+) -> torch.Tensor:
+    if out is None:
+        return torch.empty(total_out, dtype=torch.int32, device=device)
+    if out.numel() < total_out:
+        raise RuntimeError(
+            f"{name} requires {total_out} int32 sparse-index slots, "
+            f"but workspace has only {out.numel()}."
+        )
+    return out[:total_out]
+
 
 from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (  # isort: skip
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant as _aiter_triton_fp8_bmm,
@@ -107,6 +127,27 @@ triton_fused_qk_rope_cat_and_cache_mla = mark_trace(
 logger = logging.getLogger("atom")
 
 _MLA_MIN_HEADS = 16  # AITER MLA kernels require at least 16 attention heads
+
+
+def mla_min_query_heads(kv_cache_dtype: str, block_width: int) -> int:
+    """Query-head padding that lets aiter dispatch a NON-causal MLA decode.
+
+    aiter picks its .co from (gqa, block width, causality), and on an fp8 cache
+    a 2-wide non-causal block has no kernel at gqa=16: the asm dispatch hits
+    AITER_CHECK and aborts the whole process. Padding to 32 instead reaches the
+    4-wide non-causal kernel through aiter's own (gqa=32, width 2) remap.
+
+    Only width 2 needs this. Widths 1, 3 and 4 have gqa=16 kernels, and aiter
+    remaps anything wider onto gqa=32 itself. Padding rather than remapping
+    width 2 to the 4-wide kernel at gqa=16 is deliberate: the persistent work
+    descriptors are sized from the block width, so a 2-wide plan driving a
+    4-wide kernel writes its partials past the reduce buffers (illegal access
+    at some batch sizes, a non-terminating kernel at others).
+    """
+    if block_width == 2 and kv_cache_dtype.startswith("fp8"):
+        return 32
+    return _MLA_MIN_HEADS
+
 
 # The fused seg MLA kernels (fused_qk_rope_concat_and_cache_mla_seg +
 # concat_and_cache_mla_seg + the gfx1250 mla_decode_fwd asm) share a single
@@ -270,7 +311,9 @@ class MLAAttention(nn.Module):
         self.kv_cache_dtype = "fp8" if kv_cache_dtype.startswith("fp8") else "auto"
         self.dtype = dtype
 
-        self.padded_num_heads = max(num_heads, _MLA_MIN_HEADS)
+        self.padded_num_heads = max(
+            num_heads, kwargs.get("min_query_heads", _MLA_MIN_HEADS)
+        )
         self.head_repeat_factor = 1
         self.head_pad = 0
         if self.padded_num_heads != num_heads:
@@ -299,6 +342,14 @@ class MLAAttention(nn.Module):
         self.one_scale = torch.tensor(1.0, dtype=torch.float32)
         self._k_scale = self.one_scale
         self._q_scale = self.one_scale
+        # A device copy for write_context_kv_latent's fused store, which reads
+        # the scale from a Triton pointer. The scales above are host tensors --
+        # the aiter store kernels take them as host scalars -- and a host
+        # pointer is not addressable from the GPU. Made here so the fused path
+        # neither allocates nor synchronizes on the per-step path.
+        self._k_scale_device = self._k_scale.to(
+            torch.cuda.current_device(), non_blocking=True
+        )
         atom_config = get_current_atom_config()
         self._dpa_persistent_supported = supports_dpa_persistent_mode(
             atom_config,
@@ -358,6 +409,27 @@ class MLAAttention(nn.Module):
                     "which are not available in the installed aiter build. Upgrade "
                     "aiter or set ATOM_MLA_PAGE_SIZE=1."
                 )
+
+        # Context-row KV fusion (write_context_kv_latent). Resolved once here,
+        # like use_seg_mla above, so a drafter pays no env/attr lookup per layer
+        # per step. The seg and shuffled-KV layouts are excluded rather than
+        # supported: their store kernels own byte layouts the fused kernel does
+        # not reproduce, and guessing at them is worse than the per-op path.
+        # RoPE must be the plain single-position kind covering exactly the pe
+        # lane, with the half-width (reuse_freqs_front_part) cos/sin cache
+        # get_rope builds -- anything else (M-RoPE, partial rotary, full-width
+        # freqs) indexes the cache differently.
+        rope = self.rotary_emb
+        self._ctx_kv_fusion_enabled = (
+            envs.ATOM_DSPARK_FUSED_CTX_KV
+            and not self.use_seg_mla
+            and not (self.use_triton_mla and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV)
+            and rope is not None
+            and getattr(rope, "rotary_dim", None) == self.qk_rope_head_dim
+            and getattr(rope, "mrope_section", None) is None
+            and getattr(rope, "cos_cache", None) is not None
+            and rope.cos_cache.shape[-1] == self.qk_rope_head_dim // 2
+        )
 
         # Decode context parallel (DCP): KV cache is sharded across TP ranks, so
         # decode attention runs locally then combines via all-gather LSE +
@@ -1436,13 +1508,107 @@ class MLAAttention(nn.Module):
                 scale=self._k_scale,
             )
 
+    # One diagnostic line per outcome per process, not per layer: see the log
+    # below. Two entries at most -- the first write necessarily takes the per-op
+    # path (it is what moves the rope cache to the device), so logging only the
+    # very first call would report a fusion that is in fact running.
+    _ctx_kv_fusion_logged: ClassVar[set[bool]] = set()
+
+    def write_context_kv_latent(
+        self,
+        kv_cache: torch.Tensor,
+        kv_lora: torch.Tensor,
+        positions: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        kv_a_layernorm: nn.Module,
+    ) -> None:
+        """Norm + RoPE + store raw latent rows at an explicit slot_mapping.
+
+        A drafter that writes target-derived CONTEXT rows into its own paged
+        cache (Kimi-K3 DSpark's ``write_context_kv``) has no query and no
+        attn_metadata for those rows, so it cannot reach the cache through
+        ``forward_impl``; it holds the raw ``kv_lora`` and the slots itself.
+        This lives here rather than in the model so that every cache layout
+        stays behind one door, as ``_pcp_write_full_kv`` already is.
+
+        ``kv_lora`` is ``[N, kv_lora_rank + qk_rope_head_dim]`` straight off the
+        projection -- normally the strided ``[..., q_lora_rank:]`` half of a
+        fused q/kv projection, which both paths below read without copying.
+        """
+        use_fused = self._ctx_kv_fusion_enabled and (
+            # A plain [num_blocks, block_size, entry] cache (a per-token cache
+            # is that with block_size 1). The empty pre-allocation every layer
+            # holds before allocate_kv_cache fails here too, so a premature
+            # write still aborts in the per-op kernels rather than scribbling.
+            kv_cache.dim() == 3
+            and kv_cache.shape[-1] == self.kv_lora_rank + self.qk_rope_head_dim
+            and kv_cache.stride(-1) == 1
+            and kv_lora.dim() == 2
+            and kv_lora.stride(-1) == 1
+            # get_rope leaves cos/sin on the host until its first forward, which
+            # also casts them to the activation dtype. Until that has happened
+            # the kernel cannot read them (and would read fp32 where the per-op
+            # path reads bf16), so the first write of a layer takes the per-op
+            # path and moves them; every later one fuses.
+            and self.rotary_emb.cos_cache.device == kv_cache.device
+            # The fused kernel inlines ATOM RMSNorm's math; a Gemma-style norm
+            # (x * (1 + w)) or any other flavour must keep calling its module.
+            and isinstance(kv_a_layernorm, RMSNorm)
+        )
+        # Every rejection above is silent and per call, so a layout the kernel
+        # does not recognise would otherwise leave the fusion inert with nothing
+        # in the log to say so. One line, first write of the process.
+        if use_fused not in MLAAttention._ctx_kv_fusion_logged:
+            MLAAttention._ctx_kv_fusion_logged.add(use_fused)
+            logger.info(
+                "MLA context-row KV write: %s (ATOM_DSPARK_FUSED_CTX_KV=%d, "
+                "cache %s %s, kv_lora %s)",
+                "FUSED" if use_fused else "per-op",
+                int(envs.ATOM_DSPARK_FUSED_CTX_KV),
+                tuple(kv_cache.shape),
+                kv_cache.dtype,
+                tuple(kv_lora.shape),
+            )
+        if use_fused:
+            fused_mla_ctx_norm_rope_cache(
+                kv_lora,
+                kv_a_layernorm.weight,
+                positions,
+                self.rotary_emb.cos_cache,
+                self.rotary_emb.sin_cache,
+                slot_mapping.flatten(),
+                kv_cache,
+                self._k_scale_device,
+                kv_a_layernorm.eps,
+                self.kv_lora_rank,
+                self.qk_rope_head_dim,
+                self.rotary_emb.is_neox_style,
+                # An "auto" cache is a straight copy in aiter's kAuto branch and
+                # ignores _k_scale entirely; only fp8 dequant-scales the store.
+                self.kv_cache_dtype.startswith("fp8"),
+            )
+            return
+
+        kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        kv_c = kv_a_layernorm(kv_c)
+        # RoPE the positional lane only -- there is no query on the context
+        # path. The rope kernel is 2-component (rotates query AND key, in place
+        # on the rotary_dim views) and the YaRN variant
+        # (DeepseekScalingRotaryEmbedding) declares `key` as a REQUIRED
+        # positional, unlike the base class whose `forward_native` takes it as
+        # optional. So pass a throwaway for the query side, exactly as
+        # deepseek_v2 does for its own k-only rope under PCP.
+        k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
+        _, k_pe = self.rotary_emb(positions, torch.empty_like(k_pe), k_pe)
+        self._pcp_write_full_kv(kv_cache, kv_c, k_pe, slot_mapping)
+
     def forward_impl(
         self,
         q: torch.Tensor,
         k_nope: torch.Tensor,
         k_rope: torch.Tensor,
         positions: torch.Tensor = None,
-        q_scale: Optional[torch.Tensor] = None,
+        q_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # kv_cache = self.kv_cache
         forward_context: ForwardContext = get_forward_context()
@@ -1710,6 +1876,9 @@ def _convert_req_index_to_global_index_kernel(
     out_kv_indices,  # int32
     # shapes (compile-time where possible)
     NUM_TOPK_TOKENS: tl.constexpr,
+    OUT_NUMEL: tl.constexpr,
+    TOKEN_ROWS: tl.constexpr,
+    KV_INDICES_NUMEL: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,  # tile width along columns
     # strides (in elements)
@@ -1735,20 +1904,37 @@ def _convert_req_index_to_global_index_kernel(
     for token_id in range(qo_start, qo_end):
         # Load token indices for this tile
         ti_ptr = token_indices_ptr + token_id * ti_stride0 + indice_id * ti_stride1
-        tok = tl.load(ti_ptr)  # int32
+        valid_token_row = (token_id >= 0) & (token_id < TOKEN_ROWS)
+        tok = tl.load(ti_ptr, mask=valid_token_row, other=-1)  # int32
 
         # Split masks: store_mask = column-valid, load_mask adds tok-bound
         # guard to prevent OOB GPU fault (masked load yields 0 = valid page).
-        store_mask = (indice_id < kv_len) & (indice_id < NUM_TOPK_TOKENS)
-        load_mask = store_mask & (tok >= 0) & (tok < kv_len)
+        valid_col_mask = (indice_id < kv_len) & (indice_id < NUM_TOPK_TOKENS)
+        kv_offset = kv_start + tok
+        load_mask = (
+            valid_token_row
+            & valid_col_mask
+            & (tok >= 0)
+            & (tok < kv_len)
+            & (kv_offset >= 0)
+            & (kv_offset < KV_INDICES_NUMEL)
+        )
         out_val = tl.load(
-            kv_indices + kv_start + tok,
+            kv_indices + kv_offset,
             mask=load_mask,
             other=0,
         )
+        out_val = tl.where(out_val >= 0, out_val, 0)
 
         # Store results
-        out_ptr_ij = out_kv_indices + out_kv_start + indice_id
+        out_offset = out_kv_start + indice_id
+        store_mask = (
+            valid_token_row
+            & valid_col_mask
+            & (out_offset >= 0)
+            & (out_offset < OUT_NUMEL)
+        )
+        out_ptr_ij = out_kv_indices + out_offset
         tl.store(
             out_ptr_ij,
             out_val,
@@ -1773,9 +1959,8 @@ def triton_convert_req_index_to_global_index(
             token_indices[token_id, indice_id] // BLOCK_SIZE] * BLOCK_SIZE
         + token_indices[token_id, indice_id] % BLOCK_SIZE
 
-    Only when token_indices[token_id, indice_id] == -1 do we output -1.
-    For safety, we also output -1 if the derived block_id would be
-        out-of-bounds.
+    Invalid metadata is mapped to cache slot 0 so it cannot become a negative
+    or out-of-range address in the downstream assembly MLA kernel.
     """
     assert kv_indices.dtype == torch.int32
     assert token_indices.dtype == torch.int32
@@ -1785,20 +1970,31 @@ def triton_convert_req_index_to_global_index(
         f"BLOCK_N ({BLOCK_N})"
     )
 
-    num_batch = kv_indptr.shape[0] - 1
+    # DP attention can expose transient local/global metadata length skew.
+    # Launch only rows represented by every indptr; otherwise the kernel reads
+    # qo/page indptr one row past its allocation before payload guards apply.
+    num_batch = min(
+        qo_indptr.shape[0] - 1,
+        kv_indptr.shape[0] - 1,
+        page_kv_indptr.shape[0] - 1,
+    )
     tiles_per_row = NUM_TOPK_TOKENS // BLOCK_N
 
     # Ensure contiguous tensors on the same device
-    qo_indptr_c = qo_indptr.contiguous()
-    kv_indptr_c = kv_indptr.contiguous()
+    qo_indptr_c = qo_indptr[: num_batch + 1].contiguous()
+    kv_indptr_c = kv_indptr[: num_batch + 1].contiguous()
     kv_indices_c = kv_indices.contiguous()
     token_indices_c = token_indices.contiguous()
-    page_kv_indptr_c = page_kv_indptr.contiguous()
-    # NOTE: MTP (max_seqlen_q > 1) uses triton_convert_req_index_to_global_index_dsa_prefill instead
-    if out is not None:
-        new_kv_indices = out[: kv_indices.shape[0]]
-    else:
-        new_kv_indices = torch.empty_like(kv_indices)
+    page_kv_indptr_c = page_kv_indptr[: num_batch + 1].contiguous()
+    # Sparse output is packed by page_kv_indptr.  Its workspace upper bound is
+    # rows * topk, not the dense kv_indices length.
+    total_out = num_batch * NUM_TOPK_TOKENS
+    new_kv_indices = _sparse_index_workspace(
+        out,
+        total_out,
+        device=token_indices.device,
+        name="triton_convert_req_index_to_global_index",
+    )
 
     # Strides in elements
     ti_stride0, ti_stride1 = token_indices_c.stride()
@@ -1815,6 +2011,9 @@ def triton_convert_req_index_to_global_index(
         new_kv_indices,
         # shapes / constexprs
         NUM_TOPK_TOKENS,
+        new_kv_indices.numel(),
+        token_indices_c.shape[0],
+        kv_indices_c.numel(),
         BLOCK_SIZE,
         BLOCK_N,
         # strides
@@ -1835,6 +2034,9 @@ def _convert_req_index_to_global_index_dsa_prefill_kernel(
     out_kv_indices,  # int32
     # shapes (compile-time where possible)
     NUM_TOPK_TOKENS: tl.constexpr,
+    OUT_NUMEL: tl.constexpr,
+    NUM_REQ: tl.constexpr,
+    MAX_NUM_BLOCKS_PER_REQ: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,  # tile width along columns
     # strides (in elements)
@@ -1849,6 +2051,7 @@ def _convert_req_index_to_global_index_dsa_prefill_kernel(
     col_id = tile_id * BLOCK_N + tl.arange(0, BLOCK_N)
 
     req_id = tl.load(token_to_seq_idxs + token_id)  # int32
+    valid_req = (req_id >= 0) & (req_id < NUM_REQ)
 
     kv_start = tl.load(dsa_kv_indptr + token_id)
     kv_end = tl.load(dsa_kv_indptr + token_id + 1)
@@ -1858,24 +2061,41 @@ def _convert_req_index_to_global_index_dsa_prefill_kernel(
     indice = tl.load(
         topk_indices + token_id * ti_stride0 + col_id * ti_stride1
     )  # int32
-    pre_seqlens_q = tl.load(cu_seqlens_q + req_id)
+    pre_seqlens_q = tl.load(cu_seqlens_q + req_id, mask=valid_req, other=0)
+    req_kv_end = tl.load(cu_seqlens_q + req_id + 1, mask=valid_req, other=0)
+    req_kv_len = req_kv_end - pre_seqlens_q
 
     seq_token_idx = indice - pre_seqlens_q
     block_id = seq_token_idx // PAGE_SIZE
     inblock_offset = seq_token_idx % PAGE_SIZE
 
     # Guard block_table access
-    store_mask = (col_id < kv_len) & (col_id < NUM_TOPK_TOKENS)
-    valid_mask = store_mask & (indice >= 0)
+    out_offset = kv_start + col_id
+    store_mask = (
+        (col_id < kv_len)
+        & (col_id < NUM_TOPK_TOKENS)
+        & (out_offset >= 0)
+        & (out_offset < OUT_NUMEL)
+    )
+    valid_mask = (
+        valid_req
+        & store_mask
+        & (indice >= 0)
+        & (seq_token_idx >= 0)
+        & (seq_token_idx < req_kv_len)
+        & (block_id >= 0)
+        & (block_id < MAX_NUM_BLOCKS_PER_REQ)
+    )
     physical_block = tl.load(
         block_table + req_id * bt_stride0 + block_id * bt_stride1,
         mask=valid_mask,
         other=-1,
     )
-    out_val = tl.where(valid_mask, physical_block * PAGE_SIZE + inblock_offset, -1)
+    physical_valid = valid_mask & (physical_block >= 0)
+    out_val = tl.where(physical_valid, physical_block * PAGE_SIZE + inblock_offset, 0)
 
     # Store results
-    out_ptr_ij = out_kv_indices + kv_start + col_id
+    out_ptr_ij = out_kv_indices + out_offset
     tl.store(
         out_ptr_ij,
         out_val,
@@ -1903,16 +2123,27 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
         f"BLOCK_N ({BLOCK_N})"
     )
 
-    num_tokens = dsa_qo_indptr.shape[0] - 1
+    num_tokens = min(
+        dsa_qo_indptr.shape[0] - 1,
+        dsa_kv_indptr.shape[0] - 1,
+        token_to_seq_idxs.shape[0],
+        topk_indices.shape[0],
+    )
+    dsa_qo_indptr = dsa_qo_indptr[: num_tokens + 1]
+    dsa_kv_indptr = dsa_kv_indptr[: num_tokens + 1]
+    token_to_seq_idxs = token_to_seq_idxs[:num_tokens]
+    topk_indices = topk_indices[:num_tokens]
     tiles_per_row = NUM_TOPK_TOKENS // BLOCK_N
 
     total_out = num_tokens * NUM_TOPK_TOKENS
-    if out is not None:
-        new_kv_indices = out[:total_out]
-    else:
-        new_kv_indices = torch.empty(
-            total_out, dtype=torch.int32, device=topk_indices.device
-        )
+    new_kv_indices = _sparse_index_workspace(
+        out,
+        total_out,
+        device=topk_indices.device,
+        name="triton_convert_req_index_to_global_index_dsa_prefill",
+    )
+    num_req = min(block_table.shape[0], cu_seqlens_q.shape[0] - 1)
+    max_num_blocks_per_req = block_table.shape[1]
 
     # Strides in elements
     ti_stride0, ti_stride1 = topk_indices.stride()
@@ -1930,6 +2161,9 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
         new_kv_indices,
         # shapes / constexprs
         NUM_TOPK_TOKENS,
+        new_kv_indices.numel(),
+        num_req,
+        max_num_blocks_per_req,
         PAGE_SIZE,
         BLOCK_N,
         # strides
