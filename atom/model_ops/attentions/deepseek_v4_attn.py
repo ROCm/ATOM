@@ -155,7 +155,10 @@ def _uses_pd_staging_at_path(kv_transfer_config: dict, *, path: str) -> bool:
     for index, child in enumerate(children):
         child_path = f"{path}.connectors[{index}]"
         if not isinstance(child, dict):
-            raise ValueError(f"{child_path} must be a dict, got {child!r}")
+            # Preserve the existing configuration-validation API.
+            raise ValueError(  # noqa: TRY004
+                f"{child_path} must be a dict, got {child!r}"
+            )
         child_connector = _canonical_kv_connector_name(
             child.get("kv_connector"), path=child_path
         )
@@ -171,7 +174,8 @@ def _uses_pd_staging(kv_transfer_config: dict | None) -> bool:
     if kv_transfer_config is None or kv_transfer_config == {}:
         return False
     if not isinstance(kv_transfer_config, dict):
-        raise ValueError(
+        # Preserve the existing configuration-validation API.
+        raise ValueError(  # noqa: TRY004
             "kv_transfer_config must be a dict or None, "
             f"got {type(kv_transfer_config).__name__}"
         )

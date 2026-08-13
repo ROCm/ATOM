@@ -15,17 +15,17 @@ either runtime.
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
-from contextlib import contextmanager
-from dataclasses import dataclass
-from enum import Enum
 import hashlib
 import logging
-from numbers import Integral
 import operator
 import struct
 import threading
 import zlib
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass
+from enum import Enum
+from numbers import Integral
 
 import torch
 
@@ -60,7 +60,7 @@ class _RegionSnapshot:
 
 @dataclass(frozen=True)
 class _RegionSet:
-    payload_kind: "DSV4PayloadKind"
+    payload_kind: DSV4PayloadKind
     item_count: int
     regions: tuple[_RegionSnapshot, ...]
     bytes_per_item: int
@@ -1105,7 +1105,10 @@ def decode_sidecar(
         snapshot_payload=True,
     )
     if not isinstance(payload, bytes):
-        raise AssertionError("legacy AOS1 decode did not snapshot payload")
+        # An internal invariant, not user-facing type validation.
+        raise AssertionError(  # noqa: TRY004
+            "legacy AOS1 decode did not snapshot payload"
+        )
     return header, payload
 
 
@@ -1315,7 +1318,10 @@ class DSV4CheckpointStore:
                 return False
             target = self._memory_tensor(memory_obj)
             if not isinstance(target, torch.Tensor):
-                raise RuntimeError("LMCache allocation did not expose a tensor")
+                # The storage manager violated its allocation contract.
+                raise RuntimeError(  # noqa: TRY004
+                    "LMCache allocation did not expose a tensor"
+                )
             if target.dtype is not torch.uint8:
                 raise RuntimeError("LMCache allocation did not preserve uint8 dtype")
             if target.device.type != "cpu":
@@ -1386,7 +1392,7 @@ class DSV4CheckpointStore:
                 if location is None
                 else self._storage_manager.get(cache_key, location=location)
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             raise RuntimeError("LMCache DSV4 checkpoint get failed") from exc
         if memory_obj is None:
             yield None
@@ -1455,7 +1461,7 @@ class DSV4CheckpointStore:
             return self._storage_manager.contains(
                 cache_key, search_range=self._retrieve_locations, pin=False
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             raise RuntimeError("LMCache SLOT sidecar visibility probe failed") from exc
 
     def _cache_key(self, key: SlotSidecarKey):
@@ -1516,7 +1522,7 @@ class DSV4CheckpointStore:
     def _validated_checkpoint_tensor(cls, memory_obj) -> torch.Tensor:
         try:
             tensor = cls._memory_tensor(memory_obj)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             raise DSV4CheckpointCorruptionError(
                 "LMCache checkpoint object did not expose a readable tensor"
             ) from exc
@@ -1561,6 +1567,9 @@ SlotSidecarStore = DSV4CheckpointStore
 
 
 __all__ = [
+    "HEADER_BYTES",
+    "LAYOUT_VERSION",
+    "MAGIC",
     "DSV4CheckpointCodec",
     "DSV4CheckpointCorruptionError",
     "DSV4CheckpointError",
@@ -1572,9 +1581,6 @@ __all__ = [
     "DSV4PageSlotCodec",
     "DSV4PayloadKind",
     "DSV4PayloadSection",
-    "HEADER_BYTES",
-    "LAYOUT_VERSION",
-    "MAGIC",
     "SidecarFormatError",
     "SlotSidecarCorruptionError",
     "SlotSidecarHeader",

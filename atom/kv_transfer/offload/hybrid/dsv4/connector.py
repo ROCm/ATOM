@@ -24,14 +24,14 @@ Design:
 
 from __future__ import annotations
 
-from contextlib import nullcontext
-from dataclasses import dataclass
 import logging
-from math import isfinite
-from numbers import Integral
 import os
 import threading
 import time
+from contextlib import nullcontext
+from dataclasses import dataclass
+from math import isfinite
+from numbers import Integral
 
 import torch
 
@@ -53,7 +53,7 @@ from atom.kv_transfer.offload._offload_common import (
     build_offload_engine,
     validated_kv_role,
 )
-from atom.kv_transfer.offload.hybrid.gpu_connector import HybridGPUConnector
+from atom.kv_transfer.offload.hybrid.admission import SlotSidecarAdmission
 from atom.kv_transfer.offload.hybrid.dsv4.codec import (
     HEADER_BYTES,
     DSV4CheckpointCodec,
@@ -75,6 +75,7 @@ from atom.kv_transfer.offload.hybrid.dsv4.policy import (
     select_pending_sidecar_boundary,
     sidecar_boundary_tokens,
 )
+from atom.kv_transfer.offload.hybrid.gpu_connector import HybridGPUConnector
 from atom.kv_transfer.offload.metadata import (
     LMCacheOffloadMetadata,
     LMCacheReqMeta,
@@ -83,7 +84,6 @@ from atom.kv_transfer.offload.metadata import (
     SlotLoadSpec,
     SlotSaveSpec,
 )
-from atom.kv_transfer.offload.hybrid.admission import SlotSidecarAdmission
 
 # Migration aliases retained for old tests and downstream type checks.  The
 # implementation and production construction both use the DSV4 classes above.
@@ -436,7 +436,10 @@ class HybridOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 f"SLOT regions, got {len(regions)}"
             )
         if isinstance(num_slots, bool) or not isinstance(num_slots, Integral):
-            raise ValueError("Stateful PAGE offload num_slots must be an integer")
+            # Preserve the public configuration error contract.
+            raise ValueError(  # noqa: TRY004
+                "Stateful PAGE offload num_slots must be an integer"
+            )
         num_slots = int(num_slots)
         if num_slots <= 0:
             raise ValueError(
@@ -739,7 +742,10 @@ class HybridOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 _, _, admission, _ = self._require_slot_components()
                 staging_id = admission.try_acquire()
             except Exception:
-                pass
+                logger.debug(
+                    "LMCache offload: SLOT load staging reservation failed",
+                    exc_info=True,
+                )
             if staging_id is None:
                 for req in slot_loads:
                     self._finish_rejected_load(req, None)
@@ -1090,7 +1096,7 @@ class HybridOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         try:
             _, _, admission, _ = self._require_slot_components()
             return admission.try_acquire()
-        except Exception:
+        except Exception:  # noqa: BLE001
             return None
 
     def _snapshot_reserved_slot_save(
@@ -1104,7 +1110,7 @@ class HybridOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
 
         try:
             slot_codec, _, admission, _ = self._require_slot_components()
-        except Exception:
+        except Exception:  # noqa: BLE001
             return _SlotSaveSnapshot(staging_id, None, False)
 
         stream = None
@@ -1125,7 +1131,7 @@ class HybridOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 )
             ready_event.record(stream)
             return _SlotSaveSnapshot(staging_id, ready_event, True)
-        except Exception:
+        except Exception:  # noqa: BLE001
             # A copy kernel may have been issued before the exception. If an
             # event can still be recorded, let the background finalizer wait it
             # before returning the row to admission.
@@ -1317,7 +1323,7 @@ class HybridOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 req.req_id,
                 getattr(req, "save_operation", None),
             )
-        except Exception:
+        except Exception:  # noqa: BLE001
             try:
                 self._save_admission.release()
             except Exception:
@@ -1889,7 +1895,7 @@ class HybridOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 )
             staging_reusable = False
             loaded = False
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             load_error_type = type(exc).__name__
             if slot_spec is None:
                 logger.warning(
@@ -2047,7 +2053,7 @@ class HybridOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                         )
                         save_failure_reason = "staging_cleanup"
                         raise RuntimeError("SLOT staging release failed after D2H")
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001
                     # PAGE storage is independent and must still run when SLOT
                     # admission, gather, D2H, or cleanup fails.
                     if isinstance(exc, _SlotStagingSyncError):
@@ -2129,7 +2135,7 @@ class HybridOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             staging_reusable = False
             save_failure_reason = "gpu_completion"
             save_error_type = type(exc).__name__
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             save_error_type = type(exc).__name__
             if slot_spec is None:
                 logger.warning(
@@ -2146,7 +2152,7 @@ class HybridOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 if not snapshot_synchronized and slot_snapshot.ready_event is not None:
                     try:
                         slot_snapshot.ready_event.synchronize()
-                    except Exception:
+                    except Exception:  # noqa: BLE001
                         staging_reusable = False
                         sidecar_published = False
                         save_failure_reason = "snapshot_fence"

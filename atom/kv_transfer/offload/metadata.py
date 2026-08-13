@@ -42,7 +42,7 @@ class ATOMRawBytesLMCacheMetadata:
         self.__dict__.update(vars(base_metadata))
         self.atom_block_size = int(atom_block_size)
         self.atom_bytes_per_block = int(bytes_per_block)
-        chunk_size = int(getattr(base_metadata, "chunk_size"))
+        chunk_size = int(base_metadata.chunk_size)
         if self.atom_block_size <= 0:
             raise ValueError("ATOM raw-byte metadata: atom_block_size must be > 0")
         if self.atom_bytes_per_block <= 0:

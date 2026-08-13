@@ -11,10 +11,10 @@ payload mapping and PAGE/SLOT policy.
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
 import logging
 import os
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from atom.kv_transfer.disaggregation.types import (
     KVConnectorOutput,

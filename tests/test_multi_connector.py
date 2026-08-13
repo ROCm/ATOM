@@ -16,17 +16,17 @@ from types import SimpleNamespace
 
 import pytest
 
+from atom.kv_transfer.disaggregation.multi.multi_connector import (
+    MultiConnector,
+    MultiConnectorMetadata,
+    MultiConnectorScheduler,
+)
 from atom.kv_transfer.disaggregation.types import (
     ConnectorMetadata,
     KVConnectorOutput,
     LoadOperationId,
     SaveOperationId,
     SendOperationId,
-)
-from atom.kv_transfer.disaggregation.multi.multi_connector import (
-    MultiConnector,
-    MultiConnectorMetadata,
-    MultiConnectorScheduler,
 )
 from atom.model_engine.scheduler import Scheduler
 

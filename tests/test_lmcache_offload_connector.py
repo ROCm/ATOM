@@ -3,12 +3,12 @@
 
 from __future__ import annotations
 
-from collections import deque
-from contextlib import nullcontext
 import logging
 import sys
 import threading
 import types
+from collections import deque
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -17,6 +17,8 @@ try:
     import torch
 except ModuleNotFoundError:
     sys.modules["torch"] = types.ModuleType("torch")
+
+from conftest import MockConfig
 
 from atom.kv_transfer.disaggregation import KVConnectorOutput, KVOutputAggregator
 from atom.kv_transfer.disaggregation.multi.multi_connector import (
@@ -31,19 +33,21 @@ from atom.kv_transfer.disaggregation.types import (
     connector_metadata_has_work,
 )
 from atom.kv_transfer.offload import config as offcfg
-from atom.kv_transfer.offload.hybrid import policy as connector_module
-from atom.kv_transfer.offload.dense.kv_byte_codec import (
-    DenseKVByteCodec,
-)
+from atom.kv_transfer.offload.dense.connector import DenseOffloadConnector
 from atom.kv_transfer.offload.dense.gpu_connector import (
     DenseGPUConnector,
 )
-from atom.kv_transfer.offload.dense.connector import DenseOffloadConnector
-from atom.kv_transfer.offload.hybrid.dsv4.codec import DSV4PageSlotCodec
+from atom.kv_transfer.offload.dense.kv_byte_codec import (
+    DenseKVByteCodec,
+)
+from atom.kv_transfer.offload.hybrid import policy as connector_module
 from atom.kv_transfer.offload.hybrid.connector import (
     HybridOffloadConnector as LMCacheOffloadConnector,
+)
+from atom.kv_transfer.offload.hybrid.connector import (
     HybridOffloadScheduler as LMCacheOffloadConnectorScheduler,
 )
+from atom.kv_transfer.offload.hybrid.dsv4.codec import DSV4PageSlotCodec
 from atom.kv_transfer.offload.hybrid.policy import (
     _chained_prefix_hashes,
 )
@@ -57,7 +61,6 @@ from atom.kv_transfer.offload.metadata import (
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import SequenceStatus
-from conftest import MockConfig
 
 
 class _LookupClient:
@@ -333,7 +336,7 @@ def _install_registration_dependencies(monkeypatch) -> dict:
     class _FakeEngine:
         def __init__(self, gpu_connector) -> None:
             self.gpu_connector = gpu_connector
-            self.storage_manager = SimpleNamespace(list_backends=lambda: {})
+            self.storage_manager = SimpleNamespace(list_backends=dict)
             self.post_initialized = False
 
         def post_init(self) -> None:
@@ -1630,7 +1633,7 @@ def test_pp_head_dispatches_idle_offload_work_for_empty_batch(monkeypatch):
     core._in_flight = deque()
     core.scheduler = SimpleNamespace(
         schedule=lambda: (empty_batch, {}),
-        take_rejected=lambda: [],
+        take_rejected=list,
     )
     core.runner_mgr = SimpleNamespace(
         call_func=lambda name, *args, **kwargs: events.append(("runner", name))
@@ -1668,7 +1671,7 @@ def test_pp_head_preserves_one_shot_connector_meta_from_empty_batch(monkeypatch)
     core.kv_transfer_enabled = True
     core.scheduler = SimpleNamespace(
         schedule=lambda: (empty_batch, {}),
-        take_rejected=lambda: [],
+        take_rejected=list,
         kv_connector=_Connector(),
     )
     core.runner_mgr = SimpleNamespace(

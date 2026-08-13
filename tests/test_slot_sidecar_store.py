@@ -3,21 +3,21 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import sys
 import types
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
 
 torch = pytest.importorskip("torch")
 
-from atom.kv_transfer.offload.hybrid.sidecar_format import (  # noqa: E402
+from atom.kv_transfer.offload.hybrid.sidecar_format import (
     SlotSidecarHeader,
     SlotSidecarKey,
     encode_sidecar,
 )
-from atom.kv_transfer.offload.hybrid.store import (  # noqa: E402
+from atom.kv_transfer.offload.hybrid.store import (
     SlotSidecarCorruptionError,
     SlotSidecarStore,
 )
@@ -47,7 +47,8 @@ class _MemoryObj:
 
     def get_num_tokens(self) -> int:
         if not isinstance(self.backing_tensor, torch.Tensor):
-            raise RuntimeError("MemoryObj has no backing tensor")
+            # This fake mirrors LMCache's runtime contract failure.
+            raise RuntimeError("MemoryObj has no backing tensor")  # noqa: TRY004
         return int(self.backing_tensor.shape[2])
 
     def ref_count_down(self) -> None:
@@ -518,9 +519,8 @@ def test_borrow_distinguishes_malformed_objects_from_storage_io(malformed):
     manager.get_result = fetched
     store = _store(manager)
 
-    with pytest.raises(SlotSidecarCorruptionError):
-        with store.borrow(_key()):
-            pytest.fail("malformed object must not be yielded")
+    with pytest.raises(SlotSidecarCorruptionError), store.borrow(_key()):
+        pytest.fail("malformed object must not be yielded")
 
     assert fetched.decref_count == 1
 

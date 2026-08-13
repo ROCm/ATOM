@@ -5,9 +5,9 @@
 
 from __future__ import annotations
 
+import operator
 from collections.abc import Sequence
 from dataclasses import dataclass
-import operator
 
 
 @dataclass(frozen=True)

@@ -5,8 +5,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 import operator
+from collections.abc import Sequence
 
 import torch
 

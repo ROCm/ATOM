@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-# ruff: noqa: E402
 
 from __future__ import annotations
 
@@ -54,22 +53,22 @@ pytestmark = pytest.mark.skipif(
 )
 
 from atom.kv_transfer.disaggregation.types import KVTransferRegion
-from atom.kv_transfer.offload.dense.kv_byte_codec import (
-    DenseKVByteCodec,
-)
 from atom.kv_transfer.offload.dense.gpu_connector import (
     DenseGPUConnector,
 )
+from atom.kv_transfer.offload.dense.kv_byte_codec import (
+    DenseKVByteCodec,
+)
 from atom.kv_transfer.offload.hybrid.page_region_codec import ATOMPageRegionCodec
-from atom.kv_transfer.offload.metadata import ATOMRawBytesLMCacheMetadata
-from atom.kv_transfer.offload.hybrid.slot_codec import ATOMSlotSidecarCodec
 from atom.kv_transfer.offload.hybrid.sidecar_format import (
     SlotSidecarHeader,
     SlotSidecarKey,
     decode_sidecar,
     encode_sidecar,
 )
+from atom.kv_transfer.offload.hybrid.slot_codec import ATOMSlotSidecarCodec
 from atom.kv_transfer.offload.hybrid.store import SlotSidecarStore
+from atom.kv_transfer.offload.metadata import ATOMRawBytesLMCacheMetadata
 
 _FINGERPRINT = bytes.fromhex("00112233445566778899aabbccddeeff")
 

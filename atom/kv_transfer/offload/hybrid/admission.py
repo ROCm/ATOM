@@ -6,13 +6,13 @@
 from __future__ import annotations
 
 import heapq
-from numbers import Integral
 import threading
+from numbers import Integral
 
 
 def _integer(name: str, value: object) -> int:
     if isinstance(value, bool) or not isinstance(value, Integral):
-        raise ValueError(f"{name} must be an integer")
+        raise TypeError(f"{name} must be an integer")
     return int(value)
 
 

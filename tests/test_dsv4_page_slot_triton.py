@@ -5,11 +5,10 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
-from pathlib import Path
 import sys
 import threading
-from types import SimpleNamespace
-from types import ModuleType
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch

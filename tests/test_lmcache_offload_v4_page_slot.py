@@ -3,11 +3,11 @@
 
 from __future__ import annotations
 
+import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from dataclasses import FrozenInstanceError
-import logging
-import threading
 from types import SimpleNamespace
 
 import pytest
@@ -20,34 +20,25 @@ from atom.kv_transfer.disaggregation.multi.multi_connector import (
 from atom.kv_transfer.disaggregation.types import (
     ConnectorMetadata,
     KVConnectorOutput,
-    SaveOperationId,
     KVTransferRegion,
-)
-from atom.kv_transfer.offload.hybrid.dsv4 import connector as connector_module
-from atom.kv_transfer.offload.hybrid.dsv4.codec import (
-    DSV4CheckpointCodec,
-    DSV4PageSlotCodec,
+    SaveOperationId,
 )
 from atom.kv_transfer.offload.hybrid.connector import (
     HybridOffloadConnector as LMCacheOffloadConnector,
-)
-from atom.kv_transfer.offload.hybrid.policy import (
-    _compute_slot_fingerprint,
 )
 from atom.kv_transfer.offload.hybrid.connector import (
     _env_nonnegative_float,
     _env_positive_float,
     _wait_for_publication,
 )
-from atom.kv_transfer.offload.metadata import (
-    LMCacheOffloadMetadata,
-    LMCacheReqMeta,
-    LoadSpec,
-    SaveSpec,
-    SlotLoadSpec,
-    SlotSaveSpec,
+from atom.kv_transfer.offload.hybrid.dsv4 import connector as connector_module
+from atom.kv_transfer.offload.hybrid.dsv4.codec import (
+    DSV4CheckpointCodec,
+    DSV4PageSlotCodec,
 )
-from atom.model_engine.state_pool import StateCheckpointCopy
+from atom.kv_transfer.offload.hybrid.policy import (
+    _compute_slot_fingerprint,
+)
 from atom.kv_transfer.offload.hybrid.sidecar_format import (
     HEADER_BYTES,
     SidecarFormatError,
@@ -57,6 +48,15 @@ from atom.kv_transfer.offload.hybrid.sidecar_format import (
     encode_sidecar,
 )
 from atom.kv_transfer.offload.hybrid.store import SlotSidecarCorruptionError
+from atom.kv_transfer.offload.metadata import (
+    LMCacheOffloadMetadata,
+    LMCacheReqMeta,
+    LoadSpec,
+    SaveSpec,
+    SlotLoadSpec,
+    SlotSaveSpec,
+)
+from atom.model_engine.state_pool import StateCheckpointCopy
 
 _FINGERPRINT = bytes.fromhex("00112233445566778899aabbccddeeff")
 _PAYLOAD = b"\x07\x08\x09\xff"
@@ -692,19 +692,19 @@ def test_slot_fingerprint_is_stable_and_covers_required_geometry():
             reverse_indexed=True,
         ),
     ]
-    kwargs = dict(
-        model_tag="org/model",
-        page_namespace="org/model::atom-page-v1-current",
-        kv_dtype="fp8",
-        compress_ratios=[4, 128, 0],
-        block_size=64,
-        kv_head_dim=512,
-        index_head_dim=128,
-        num_slots=4,
-        slot_regions=regions,
-        tp_size=2,
-        tp_rank=1,
-    )
+    kwargs = {
+        "model_tag": "org/model",
+        "page_namespace": "org/model::atom-page-v1-current",
+        "kv_dtype": "fp8",
+        "compress_ratios": [4, 128, 0],
+        "block_size": 64,
+        "kv_head_dim": 512,
+        "index_head_dim": 128,
+        "num_slots": 4,
+        "slot_regions": regions,
+        "tp_size": 2,
+        "tp_rank": 1,
+    }
 
     fingerprint = _compute_slot_fingerprint(**kwargs)
     assert len(fingerprint) == 16
@@ -2187,7 +2187,6 @@ def test_unhealthy_frozen_like_store_skip_cannot_authorize_sidecar(monkeypatch):
 
     def _silently_skipped_store(tokens, mask=None, **kwargs):
         order.append("store-skipped")
-        return None
 
     connector._engine.store = _silently_skipped_store
 

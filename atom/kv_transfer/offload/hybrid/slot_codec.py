@@ -5,9 +5,9 @@
 
 from __future__ import annotations
 
+import operator
 from collections.abc import Sequence
 from contextlib import nullcontext
-import operator
 
 import torch
 

@@ -41,10 +41,10 @@ from atom.kv_transfer.offload._offload_common import (
     build_offload_engine,
     validated_kv_role,
 )
-from atom.kv_transfer.offload.dense.kv_byte_codec import DenseKVByteCodec
 from atom.kv_transfer.offload.dense.gpu_connector import (
     DenseGPUConnector,
 )
+from atom.kv_transfer.offload.dense.kv_byte_codec import DenseKVByteCodec
 from atom.kv_transfer.offload.metadata import (
     LMCacheOffloadMetadata,
     LMCacheReqMeta,
@@ -116,7 +116,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             self._lookup_server = LookupClientFactory.create_lookup_server(
                 self._engine, meta
             )
-        except Exception as e:  # lookup server optional for save-only smoke
+        except Exception as e:  # noqa: BLE001  # optional save-only dependency
             logger.warning("LMCache offload: lookup server not started: %s", e)
 
         gpu_connector = self._engine.gpu_connector
@@ -165,7 +165,11 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         try:
             self._engine.lookup_unpin(str(req_id))  # LMCache pin keyed by str id
         except Exception:
-            pass
+            logger.debug(
+                "LMCache offload: lookup unpin failed for req=%s",
+                req_id,
+                exc_info=True,
+            )
 
     def _profile_enabled(self) -> bool:
         return os.environ.get("OFFLOAD_PROFILE", "0").lower() not in (
@@ -182,6 +186,10 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         try:
             return dict(gpu_connector.last_transfer_stats())
         except Exception:
+            logger.debug(
+                "LMCache offload: transfer stats collection failed",
+                exc_info=True,
+            )
             return {}
 
     def _reset_gpu_connector_transfer_stats(self) -> None:
@@ -191,7 +199,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         try:
             gpu_connector.reset_transfer_stats()
         except Exception:
-            pass
+            logger.debug("LMCache offload: transfer stats reset failed", exc_info=True)
 
     # -- copy daemon thread ----------------------------------------------
     def _do_load_req(self, req: LMCacheReqMeta) -> None:
@@ -405,7 +413,7 @@ class DenseOffloadScheduler(KVConnectorSchedulerBase):
             world = int(getattr(config, "tensor_parallel_size", 1) or 1)
             meta = offcfg.build_lmcache_metadata(config, cfg, world, 0)
             self._lookup_client = LookupClientFactory.create_lookup_client(cfg, meta)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  # optional lookup service
             logger.warning(
                 "LMCache offload scheduler: lookup client unavailable: %s", e
             )
@@ -441,7 +449,7 @@ class DenseOffloadScheduler(KVConnectorSchedulerBase):
                             tdb.process_tokens(token_ids, make_key=False)
                         )[:3]
                     ]
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001  # debug-only introspection
                 _lh = f"err:{e}"
             logger.debug(
                 "[OFFLOAD-LOOKUP] seq=%s num_prompt=%d hbm_cached=%d hit=%s lookuphash3=%s",
@@ -464,7 +472,11 @@ class DenseOffloadScheduler(KVConnectorSchedulerBase):
                 try:
                     self._lookup_client.clear_lookup_status(sid)
                 except Exception:
-                    pass
+                    logger.debug(
+                        "LMCache offload: lookup status cleanup failed for req=%s",
+                        sid,
+                        exc_info=True,
+                    )
             return 0, False
         self._lookup_in_step.append(sid)
         self._load_specs[sid] = LoadSpec(
@@ -536,7 +548,11 @@ class DenseOffloadScheduler(KVConnectorSchedulerBase):
             try:
                 self._lookup_client.clear_lookup_status(sid)
             except Exception:
-                pass
+                logger.debug(
+                    "LMCache offload: lookup status cleanup failed for req=%s",
+                    sid,
+                    exc_info=True,
+                )
 
     def _decide_load_after_alloc(
         self, seq, ls: LoadSpec

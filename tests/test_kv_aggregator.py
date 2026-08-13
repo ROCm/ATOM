@@ -3,6 +3,8 @@
 
 """Unit tests for KVOutputAggregator."""
 
+from dataclasses import FrozenInstanceError
+
 import pytest
 
 from atom.kv_transfer.disaggregation import KVConnectorOutput, KVOutputAggregator
@@ -493,7 +495,7 @@ class TestKVConnectorOutput:
         operation = SaveOperationId("r1", 0)
 
         assert {operation} == {SaveOperationId("r1", 0)}
-        with pytest.raises(Exception):
+        with pytest.raises(FrozenInstanceError):
             operation.generation = 1
         with pytest.raises(ValueError, match="nonnegative"):
             SaveOperationId("r1", -1)

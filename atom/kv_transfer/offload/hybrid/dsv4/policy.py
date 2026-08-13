@@ -10,13 +10,13 @@ lives in :mod:`.codec`, while LMCache and scheduler orchestration live in
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 from collections import OrderedDict
 from collections.abc import Iterator, MutableSet
 from dataclasses import dataclass
-import hashlib
-import json
 from math import lcm
-import os
 
 
 @dataclass(frozen=True)

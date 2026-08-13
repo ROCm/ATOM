@@ -3,20 +3,20 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 import importlib.util
-from pathlib import Path
 import sys
 import types
+from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 from atom.kv_transfer.disaggregation.types import KVTransferTensors
+from atom.kv_transfer.offload.hybrid.dsv4.codec import DSV4PageSlotCodec
 from atom.kv_transfer.offload.hybrid.page_region_codec import ATOMPageRegionCodec
 from atom.kv_transfer.offload.hybrid.slot_codec import ATOMSlotSidecarCodec
-from atom.kv_transfer.offload.hybrid.dsv4.codec import DSV4PageSlotCodec
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_ops.attentions.v4_pool_geometry import UnifiedPoolGeometry
 

@@ -61,10 +61,10 @@ paired ``finished_saving`` signal remains responsible for block-lifetime release
 
 from __future__ import annotations
 
-from collections import deque
 import copy
-from dataclasses import dataclass
 import logging
+from collections import deque
+from dataclasses import dataclass
 from typing import Any
 
 from atom.kv_transfer.disaggregation.base import (
@@ -268,7 +268,7 @@ class MultiConnector(KVConnectorBase):
                         getattr(req, "save_spec", None) is not None
                         or getattr(req, "slot_save_spec", None) is not None
                     ):
-                        req_id = getattr(req, "req_id")
+                        req_id = req.req_id
                         output = getattr(req, "save_operation", None) or req_id
                         req_key = str(req_id)
                         if isinstance(output, SaveOperationId):

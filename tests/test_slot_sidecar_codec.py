@@ -3,10 +3,10 @@
 
 from __future__ import annotations
 
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import FrozenInstanceError
-import threading
 
 import pytest
 import torch

@@ -9,11 +9,11 @@ import pytest
 import torch
 
 from atom.kv_transfer.offload.hybrid.dsv4.codec import (
+    HEADER_BYTES,
     DSV4CheckpointCodec,
     DSV4CheckpointError,
     DSV4CheckpointHeader,
     DSV4CheckpointKey,
-    HEADER_BYTES,
 )
 
 FINGERPRINT = bytes.fromhex("00112233445566778899aabbccddeeff")

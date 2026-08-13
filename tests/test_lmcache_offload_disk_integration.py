@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-# ruff: noqa: E402
 
 from __future__ import annotations
 
@@ -29,7 +28,6 @@ pytestmark = pytest.mark.skipif(
     reason="the external lmcache package is required for disk integration",
 )
 
-from atom.kv_transfer.offload.metadata import ATOMRawBytesLMCacheMetadata
 from atom.kv_transfer.offload.hybrid.sidecar_format import (
     SlotSidecarHeader,
     SlotSidecarKey,
@@ -37,6 +35,7 @@ from atom.kv_transfer.offload.hybrid.sidecar_format import (
     encode_sidecar,
 )
 from atom.kv_transfer.offload.hybrid.store import SlotSidecarStore
+from atom.kv_transfer.offload.metadata import ATOMRawBytesLMCacheMetadata
 
 _FINGERPRINT = bytes.fromhex("00112233445566778899aabbccddeeff")
 

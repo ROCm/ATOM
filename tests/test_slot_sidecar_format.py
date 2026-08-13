@@ -3,9 +3,9 @@
 
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
 import struct
 import zlib
+from dataclasses import FrozenInstanceError
 
 import pytest
 import torch
@@ -18,8 +18,8 @@ from atom.kv_transfer.offload.hybrid.sidecar_format import (
     SidecarFormatError,
     SlotSidecarHeader,
     SlotSidecarKey,
-    decode_sidecar_tensor,
     decode_sidecar,
+    decode_sidecar_tensor,
     encode_sidecar,
     finalize_sidecar_tensor_,
 )

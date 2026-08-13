@@ -63,7 +63,7 @@ class DenseKVByteCodec:
         to ``segment.shape[0]`` (the block-major assumption) when not supplied,
         preserving the original non-MLA behaviour."""
         self._segments: list[torch.Tensor] = []
-        for _name, kvt in kv_caches.items():
+        for kvt in kv_caches.values():
             for t in (
                 getattr(kvt, "k_cache", None),
                 getattr(kvt, "v_cache", None),
