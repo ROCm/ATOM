@@ -13,12 +13,14 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from atom.kv_transfer.disaggregation.types import ConnectorMetadata, KVConnectorOutput
+import pytest
+
 from atom.kv_transfer.disaggregation.multi.multi_connector import (
     MultiConnector,
     MultiConnectorMetadata,
     MultiConnectorScheduler,
 )
+from atom.kv_transfer.disaggregation.types import ConnectorMetadata, KVConnectorOutput
 
 # ---------------------------------------------------------------------------
 # Mock sub-connectors
@@ -138,6 +140,7 @@ def _worker(connectors):
     obj._pending_save = set()
     obj._sent = {}
     obj._saved = {}
+    obj._state_tier = None
     return obj
 
 
@@ -281,6 +284,70 @@ def test_producer_offload_load_completion_uses_loading_state():
     assert out.failed_recving == set()
     assert out.finished_loading == {"l1"}
     assert out.failed_loading == {"f1"}
+
+
+def test_state_reports_are_unioned_through_the_composite():
+    """A staging slot comes back only via this report. `multi` dropping it is
+    the silent-permanent failure: the engine drains slots onto every batch and
+    the ring starves after K spills, with one warning 256 drops later."""
+    off = FakeWorkerSub(
+        finished=KVConnectorOutput(state_staging_released={1}, state_indexed={99})
+    )
+    moriio = FakeWorkerSub(finished=(set(), set()))
+    w = _worker([moriio, off])  # not producer
+
+    out = w.get_finished()
+
+    assert out.state_staging_released == {1}
+    assert out.state_indexed == {99}
+
+
+def test_state_reports_survive_the_producer_send_save_pairing():
+    """The pairing withholds send/save until both land. These two have no
+    request identity to pair on, so they must pass through the producer branch
+    untouched -- an early `return out` in that branch would strand them."""
+    moriio = FakeWorkerSub(is_producer=True, finished=(set(), set()))
+    off = FakeWorkerSub(
+        finished=KVConnectorOutput(state_staging_released={2, 3}, state_indexed={7})
+    )
+    w = _worker([moriio, off])
+
+    out = w.get_finished()
+
+    assert out.state_staging_released == {2, 3}
+    assert out.state_indexed == {7}
+
+
+def test_the_composite_exposes_the_sub_connectors_state_tier():
+    """`AttentionBackend._submit_state_spills` reads `_state_tier` off whatever
+    connector the forward context holds. Under `multi` that is this object, so
+    without the re-export nothing is ever submitted and every slot leaks."""
+    tier = object()
+    off = FakeWorkerSub()
+    off._state_tier = tier
+    w = _worker([FakeWorkerSub(), off])
+
+    w.register_kv_caches({}, transfer_tensors=None, num_blocks=1)
+
+    assert w._state_tier is tier
+
+
+def test_no_sub_with_a_tier_leaves_the_composite_tier_none():
+    w = _worker([FakeWorkerSub(), FakeWorkerSub()])
+    w.register_kv_caches({}, transfer_tensors=None, num_blocks=1)
+    assert w._state_tier is None
+
+
+def test_two_sub_connectors_with_a_tier_is_refused():
+    """First-one-wins would be wrong, not merely arbitrary: the spill goes to
+    one tier and the load may ask the other, so a hash could be reported
+    indexed by a tier that never stored it."""
+    a, b = FakeWorkerSub(), FakeWorkerSub()
+    a._state_tier, b._state_tier = object(), object()
+    w = _worker([a, b])
+
+    with pytest.raises(ValueError, match="exactly one may"):
+        w.register_kv_caches({}, transfer_tensors=None, num_blocks=1)
 
 
 def test_recv_blocks_concat():

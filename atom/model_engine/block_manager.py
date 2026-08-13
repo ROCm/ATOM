@@ -145,15 +145,44 @@ class BlockManager:
 
         from atom.model_engine.state_offload import (
             StateOffloadIndex,
+            kv_connector_hosts_state_tier,
             state_offload_staging_groups,
         )
 
         staging = state_offload_staging_groups()
+        kv_offload_enabled = kv_connector_hosts_state_tier(
+            getattr(config, "kv_transfer_config", None)
+        )
         self.state_offload: StateOffloadIndex | None = None
-        if staging > 0:
+        if staging > 0 and not kv_offload_enabled:
+            # Refuse to install the ring rather than install an inert one.
+            # Without a connector that hosts the tier there is nobody to drain
+            # a spill: `EngineCore._poll_kv_transfer_progress` returns early on
+            # `kv_transfer_enabled`, and `AttentionBackend._submit_state_spills`
+            # finds no `_state_tier` on the connector and returns too. An
+            # installed ring would still hand out slots and drain them onto
+            # every batch, and no report would ever come back to release one --
+            # every slot leaks, and the only symptom is one starvation warning
+            # 256 dropped spills later.
+            #
+            # The configuration is pointless even if the bytes did land: see
+            # `StateOffloadIndex.__init__` -- with KV offload off, a hash whose
+            # KV left HBM never reappears, so a spilled checkpoint can never be
+            # resumed from.
+            logger.warning(
+                "OFFLOAD_STATE is set but the configured --kv-transfer-config "
+                "does not host the state offload tier, so the tier will not run "
+                "and no state is spilled. The tier rides the lmcache_offload "
+                "connector's transport, and its index is only reachable for "
+                "prefixes that same KV offload can bring back. Configure "
+                '--kv-transfer-config \'{"kv_connector":"lmcache_offload",'
+                '"kv_role":"offload"}\' (or a "multi" that lists it), or unset '
+                "OFFLOAD_STATE."
+            )
+        elif staging > 0:
             index = StateOffloadIndex(
                 staging_depth=staging,
-                kv_offload_enabled=bool(getattr(config, "kv_transfer_config", None)),
+                kv_offload_enabled=kv_offload_enabled,
             )
             for cache in self.state_caches:
                 cache.offload = index

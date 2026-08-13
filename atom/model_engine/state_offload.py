@@ -136,6 +136,39 @@ class StateOffloadIndex:
         }
 
 
+# The connector backends whose worker half builds a `StateOffloadTier`. Only
+# the offload backend does; `multi` qualifies when it lists one.
+_STATE_TIER_BACKENDS = frozenset({"lmcache_offload"})
+
+
+def kv_connector_hosts_state_tier(kv_transfer_config) -> bool:
+    """Whether the configured KV connector can actually run the state tier.
+
+    The tier is not standalone. Its bytes ride the KV connector's worker half
+    (`LMCacheOffloadConnector._maybe_build_state_tier`), its completions ride
+    that connector's `get_finished`, and the engine only polls for them when
+    `kv_transfer_enabled`. Against any other backend the staging ring would be
+    installed, hand out slots, and never get one back -- so the answer here
+    gates whether the ring is installed at all, and a false negative (the tier
+    stays off) is much cheaper than a false positive (every slot leaks).
+
+    Deliberately a name check rather than a capability probe: this runs in the
+    engine process at `BlockManager.__init__`, long before any worker
+    connector object exists to ask.
+    """
+    cfg = kv_transfer_config or {}
+    if not isinstance(cfg, dict):
+        return False
+    name = cfg.get("kv_connector", "moriio")
+    if name == "multi":
+        subs = cfg.get("connectors") or ()
+        return any(
+            isinstance(s, dict) and s.get("kv_connector") in _STATE_TIER_BACKENDS
+            for s in subs
+        )
+    return name in _STATE_TIER_BACKENDS
+
+
 def state_offload_staging_groups() -> int:
     """K: staging *groups* to reserve, or 0 when the tier is off.
 

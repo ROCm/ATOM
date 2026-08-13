@@ -1814,3 +1814,95 @@ def test_codec_dsa_fp8_multilayer_including_mtp_round_trip():
             kv_caches[name].index_cache.view(torch.uint8),
             idx.view(torch.uint8),
         )
+
+
+# ── the state offload tier is built only when it can actually work ────────
+
+
+class _StateBackend:
+    """Publishes one entry's worth of contiguous views, like a real backend."""
+
+    def __init__(self, entry_bytes: int) -> None:
+        self._entry_bytes = entry_bytes
+
+    def state_entry_views(self, group: int):
+        return [torch.empty(self._entry_bytes, dtype=torch.uint8)]
+
+
+def _state_tier_conn():
+    conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
+    conn._state_tier = None
+    conn._engine = SimpleNamespace(storage_manager=object())
+    return conn
+
+
+def _gpu_conn(staging_bytes: int):
+    return SimpleNamespace(_staged=object(), gpu_staging_buffer_bytes=staging_bytes)
+
+
+def _state_meta():
+    return SimpleNamespace(model_name="m")
+
+
+def test_state_tier_is_refused_when_an_entry_exceeds_the_staging_buffer(
+    monkeypatch, caplog
+):
+    """`StagedTransfer.ensure_buffer` raises when nbytes > capacity, and
+    `_do_spill`'s broad except turns that into a warning plus a slot release --
+    so the tier would look healthy, burn a D2D copy per eviction, and store
+    nothing forever. Compare the two numbers at construction instead."""
+    monkeypatch.setenv("OFFLOAD_STATE", "1")
+    conn = _state_tier_conn()
+    tt = SimpleNamespace(state_backend=_StateBackend(4096))
+
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        conn._maybe_build_state_tier(_gpu_conn(1024), tt, _state_meta(), 0, 1)
+
+    assert conn._state_tier is None
+    msg = caplog.text
+    assert "4096" in msg and "1024" in msg
+
+
+def test_state_tier_is_built_when_an_entry_fits(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_STATE", "1")
+    conn = _state_tier_conn()
+    tt = SimpleNamespace(state_backend=_StateBackend(1024))
+
+    conn._maybe_build_state_tier(_gpu_conn(4096), tt, _state_meta(), 0, 1)
+
+    assert conn._state_tier is not None
+    assert conn._state_tier.codec.entry_bytes == 1024
+
+
+def test_state_tier_is_disabled_when_the_backend_has_no_state_views(
+    monkeypatch, caplog
+):
+    """A builder that predates `state_entry_views` raises AttributeError, not
+    NotImplementedError. Both mean the same thing here and neither is worth
+    killing model load over."""
+    monkeypatch.setenv("OFFLOAD_STATE", "1")
+    conn = _state_tier_conn()
+    tt = SimpleNamespace(state_backend=SimpleNamespace())  # no state_entry_views
+
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        conn._maybe_build_state_tier(_gpu_conn(1 << 20), tt, _state_meta(), 0, 1)
+
+    assert conn._state_tier is None
+    assert "no per-request state views" in caplog.text
+
+
+def test_a_zero_entry_state_pool_stays_loud(monkeypatch):
+    """IndexError is deliberately not caught: group 0 missing with the tier on
+    is a sizing bug, and degrading it to a server that silently never spills is
+    exactly the failure this round is about."""
+
+    class _Empty:
+        def state_entry_views(self, group):
+            raise IndexError("no such group")
+
+    monkeypatch.setenv("OFFLOAD_STATE", "1")
+    conn = _state_tier_conn()
+    tt = SimpleNamespace(state_backend=_Empty())
+
+    with pytest.raises(IndexError):
+        conn._maybe_build_state_tier(_gpu_conn(1 << 20), tt, _state_meta(), 0, 1)

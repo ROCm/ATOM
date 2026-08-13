@@ -212,11 +212,42 @@ class LMCacheOffloadConnector(KVConnectorBase):
         try:
             views = backend.state_entry_views(0)
             entry_bytes = sum(int(v.numel()) * v.element_size() for v in views)
-        except NotImplementedError:
+        except (NotImplementedError, AttributeError):
+            # `NotImplementedError` is the base class's own refusal;
+            # `AttributeError` is a builder that predates the method. Both mean
+            # the same thing to us -- this backend has no per-request state we
+            # can name bytes for -- and neither is worth killing model load
+            # over, so both warn and disable rather than propagate.
+            # `IndexError` is deliberately NOT caught: it means group 0 does not
+            # exist, i.e. a zero-entry state pool with the tier switched on,
+            # which is a sizing bug that must be loud rather than degrade into a
+            # server that silently never spills.
             logger.warning(
                 "state offload: %s owns no per-request state views; the tier "
                 "stays off and nothing spills.",
                 type(backend).__name__,
+            )
+            return
+        # One entry is MB-scale (53.6 MiB measured) while the shared staging
+        # buffer is sized for KV chunks, so the two can easily fail to fit.
+        # `StagedTransfer.pack` would then raise inside `ensure_buffer`, and
+        # `StateOffloadTier._do_spill`'s broad `except` would turn every single
+        # spill into a warning plus a slot release -- a tier that looks healthy,
+        # burns a D2D copy per eviction, and stores nothing, forever. Refuse to
+        # build it instead, and name both numbers so the fix is obvious.
+        staging_bytes = int(getattr(gpu_connector, "gpu_staging_buffer_bytes", 0))
+        if entry_bytes > staging_bytes:
+            logger.warning(
+                "state offload: one state entry is %d bytes (%.2f MiB) but the "
+                "shared GPU staging buffer holds only %d bytes (%.2f MiB); "
+                "every spill would fail in StagedTransfer.ensure_buffer. The "
+                "tier stays off. Raise OFFLOAD_GPU_STAGING_CHUNKS (or "
+                "OFFLOAD_GPU_STAGING_MAX_BYTES) until the buffer covers one "
+                "entry, or unset OFFLOAD_STATE.",
+                entry_bytes,
+                entry_bytes / (1 << 20),
+                staging_bytes,
+                staging_bytes / (1 << 20),
             )
             return
         from atom.kv_transfer.offload.state_object import StateByteCodec
