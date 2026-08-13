@@ -544,11 +544,44 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         # than by inspection of every prepare_* variant.
         if batch.state_copy_pairs:
             self.copy_state_entries(batch.state_copy_pairs)
+        # Spills, after the checkpoint copies and still before the forward:
+        # `pop()` already handed this group to its new owner, so these bytes
+        # only exist until that owner's forward runs. Same once-per-batch
+        # guarantee as above -- prefill, decode, dummy, DP-sync, PP
+        # microbatch and TBO all reach the forward through this method.
+        if batch.state_spill_pairs:
+            self.copy_state_entries(
+                [(src, dst) for src, dst, _, _ in batch.state_spill_pairs]
+            )
+            self._submit_state_spills(batch.state_spill_pairs)
         is_prefill = batch.total_tokens_num_prefill > 0
         if is_prefill:
             return self.prepare_prefill(batch)
         else:
             return self.prepare_decode(batch, bs)
+
+    def _submit_state_spills(self, pairs) -> None:
+        """Hand the staged bytes to the offload tier's own executor.
+
+        The connector is reached function-locally, as `model_ops/attentions`
+        already reaches across packages (`deepseek_v4_attn.py:1321`,
+        `aiter_mla.py:917`), so these modules stay importable without the
+        offload extra.
+        """
+        from atom.utils.forward_context import get_kvconnector
+
+        connector = get_kvconnector()
+        tier = getattr(connector, "_state_tier", None)
+        if tier is None:
+            return
+        import torch
+
+        # One event for the whole batch: every copy above was issued on this
+        # stream, so an event recorded now is after all of them.
+        ready = torch.cuda.Event()
+        ready.record(torch.cuda.current_stream())
+        for _src, dst, slot, h in pairs:
+            tier.submit_spill(h, entry_index=dst, staging_slot=slot, ready_event=ready)
 
 
 class AttentionImpl(nn.Module):

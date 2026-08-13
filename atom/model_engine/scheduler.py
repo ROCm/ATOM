@@ -321,6 +321,9 @@ class ScheduledBatch:
         state_copy_pairs: (src, dst) per-request state groups this batch's
             forward must duplicate before running (`BlockManager
             .state_copies_for_batch`).
+        state_spill_pairs: (src_group, dst_entry, staging_slot, hash) this
+            batch's forward must copy into the staging ring before running
+            (`BlockManager.state_spills_for_batch`).
     """
 
     def __init__(
@@ -344,6 +347,7 @@ class ScheduledBatch:
         is_final_chunk: list[bool] | None = None,
         next_token_ids: list[int] | None = None,
         state_copy_pairs: list[tuple[int, int]] | None = None,
+        state_spill_pairs: list[tuple[int, int, int, int]] | None = None,
     ):
         if scheduled_spec_decode_tokens is None:
             scheduled_spec_decode_tokens = {}
@@ -386,6 +390,11 @@ class ScheduledBatch:
         # off the seqs because both halves (checkpoint taken, checkpoint resumed
         # from) accumulate in the pool during this pass.
         self.state_copy_pairs = state_copy_pairs or []
+        # (src_group, dst_entry, staging_slot, hash) for checkpoints being
+        # evicted to the offload tier. A separate list from the copies above
+        # because the destination is a staging entry past the pool's group
+        # range and the worker needs the slot and the hash as well as the copy.
+        self.state_spill_pairs = state_spill_pairs or []
         self.top_ks = np.asarray([seq.top_k for seq in seqs.values()], dtype=np.int32)
         self.top_ps = np.asarray([seq.top_p for seq in seqs.values()], dtype=np.float32)
         # True if any seq in the batch is a fan-out child (SamplingParams.n>1)
@@ -1370,6 +1379,7 @@ class Scheduler:
                 is_final_chunk=is_final_chunk,
                 next_token_ids=next_token_ids,
                 state_copy_pairs=self.block_manager.state_copies_for_batch(),
+                state_spill_pairs=self.block_manager.state_spills_for_batch(),
             )
             self._consume_state_forks(scheduled_seqs)
 
@@ -1497,6 +1507,14 @@ class Scheduler:
             # batch that actually runs.
             state_copy_pairs=(
                 self.block_manager.state_copies_for_batch() if scheduled_seqs else ()
+            ),
+            # Same guard, for the same reason and one more: a drained spill is
+            # only released once its copy reaches a forward, so draining into a
+            # batch that is never forwarded strands every slot it drained. The
+            # single guard also keeps the copy list and the pending-hash list in
+            # lockstep, which `state_spills_for_batch` relies on to join them.
+            state_spill_pairs=(
+                self.block_manager.state_spills_for_batch() if scheduled_seqs else ()
             ),
         )
         self._consume_state_forks(scheduled_seqs)
@@ -2568,6 +2586,20 @@ class Scheduler:
                 if seq is not None:
                     self.block_manager.deallocate(seq)
 
+        # The state offload tier's two reports. Unlike everything above these
+        # are not keyed by request: by the time a spill lands, the request that
+        # owned the checkpoint is long gone and only the hash and the staging
+        # slot remain.
+        offload = getattr(self.block_manager, "state_offload", None)
+        if offload is not None:
+            # Index before releasing, always. The reverse order opens a window
+            # in which the slot is reusable but its hash is not yet findable,
+            # so a lookup misses a checkpoint that is in fact stored.
+            for h in kv_connector_output.state_indexed or ():
+                offload.confirm_spill(int(h))
+            for slot in kv_connector_output.state_staging_released or ():
+                offload.release_staging(int(slot))
+
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""
         return len(self.running), len(self.waiting)
@@ -2963,6 +2995,7 @@ class DecodeScheduler(Scheduler):
                 # a batch or the group they were filed under holds the previous
                 # occupant's state.
                 state_copy_pairs=self.block_manager.state_copies_for_batch(),
+                state_spill_pairs=self.block_manager.state_spills_for_batch(),
             ),
             scheduled_seqs,
         )

@@ -242,3 +242,61 @@ def test_a_negative_depth_is_floored_to_zero(monkeypatch):
     monkeypatch.setenv("OFFLOAD_STATE", "1")
     monkeypatch.setenv("OFFLOAD_STATE_STAGING_GROUPS", "-3")
     assert state_offload_staging_groups() == 0
+
+
+def test_spills_for_batch_joins_the_copy_and_the_hash_on_the_slot():
+    """The pool knows (group, slot); the ring knows (hash, slot). A spill
+    needs all three, and the only thing that relates them is the slot."""
+    from atom.model_engine.state_pool import StateGroupPool, StateTransfer
+
+    pool = StateGroupPool(
+        num_groups=4, transfer=StateTransfer.copy(), hash_block_size=4
+    )
+    pool.offload = StateOffloadIndex(staging_depth=2, kv_offload_enabled=False)
+    pool.group_hash[1] = 111
+    pool.group_hash[2] = 222
+    pool._spill(1)
+    pool._spill(2)
+
+    copies = dict(pool.take_spill_copies())  # group -> slot
+    pending = {s: h for h, s in pool.offload.take_pending()}  # slot -> hash
+    joined = sorted((g, pool.num_groups + s, s, pending[s]) for g, s in copies.items())
+    assert [t[0] for t in joined] == [1, 2]
+    assert [t[3] for t in joined] == [111, 222]
+    # The destination is addressed in the same space state_entry_views uses.
+    assert all(dst == pool.num_groups + slot for _, dst, slot, _ in joined)
+
+
+def test_a_slot_returns_only_after_the_report_comes_back():
+    """The ring must not free a slot when the copy is issued -- only when the
+    worker says its D2H landed. Freeing early hands the same staging entry to
+    a second spill while the first is still being read."""
+    idx = index(depth=1)
+    slot = idx.request_spill(11, group=3)
+    idx.take_pending()
+    assert idx.request_spill(22, group=4) == -1  # still busy
+    idx.release_staging(slot)  # the report arrives
+    assert idx.request_spill(33, group=5) == slot
+
+
+def test_a_slot_is_released_only_when_every_rank_reports():
+    """Each TP rank D2Hs its own shard out of the same staging entry. The
+    entry is reusable only once the last rank is done with it."""
+    from atom.kv_transfer.disaggregation.aggregator import KVOutputAggregator
+    from atom.kv_transfer.disaggregation.types import KVConnectorOutput
+
+    agg = KVOutputAggregator(world_size=2)
+    out = agg.aggregate(
+        [
+            KVConnectorOutput(state_staging_released={1}, state_indexed={99}),
+            KVConnectorOutput(),
+        ]
+    )
+    assert out.state_staging_released == set() and out.state_indexed == set()
+    out = agg.aggregate(
+        [
+            KVConnectorOutput(),
+            KVConnectorOutput(state_staging_released={1}, state_indexed={99}),
+        ]
+    )
+    assert out.state_staging_released == {1} and out.state_indexed == {99}

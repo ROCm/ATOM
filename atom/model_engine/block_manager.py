@@ -194,6 +194,48 @@ class BlockManager:
         """
         return self.state.take_copies()
 
+    def state_spills_for_batch(self) -> list[tuple[int, int, int, int]]:
+        """`(src_group, dst_entry, staging_slot, hash)` the batch being built
+        must copy out before its forward.
+
+        Three facts about one spill live in two places -- the pool knows
+        `(group, slot)`, the ring knows `(hash, slot)` -- and the slot is the
+        only thing relating them. Joined here, engine-side, because
+        `num_groups` is authoritative here and the runner would have to
+        re-derive it from a published entry count. (`num_groups` is only
+        mutated by `StateGroupPool.extend`/`retire_top`, neither of which has
+        an in-tree caller, so the address stays valid for the whole step.)
+
+        Both lists are appended by the same `_spill()` call and are drained
+        together at every site, so they stay in lockstep; a slot present in
+        one and not the other is a bug, and dropping it is safer than
+        guessing which half is right.
+        """
+        out: list[tuple[int, int, int, int]] = []
+        for cache in self.state_caches:
+            offload = getattr(cache, "offload", None)
+            if offload is None:
+                continue
+            hash_of_slot = {slot: h for h, slot in offload.take_pending()}
+            for group, slot in cache.take_spill_copies():
+                h = hash_of_slot.pop(slot, None)
+                if h is None:
+                    logger.warning(
+                        "state offload: staging slot %d has a copy but no "
+                        "pending hash; dropping the spill",
+                        slot,
+                    )
+                    offload.release_staging(slot)
+                    continue
+                out.append((group, cache.num_groups + slot, slot, h))
+            # Whatever is left is a pending hash with no copy to feed it. The
+            # keys are the slots; the values are the hashes, which the ring
+            # does not take back.
+            for slot in hash_of_slot:
+                # Never observed in correct operation; release rather than leak.
+                offload.release_staging(slot)
+        return out
+
     def state_checkpoint_fates(self) -> dict[str, int]:
         """Summed fates across every state class, for the periodic stats line.
 

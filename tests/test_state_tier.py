@@ -25,12 +25,15 @@ def tier(codec):
     return StateOffloadTier(codec, StateOffloadIndex(2, kv_offload_enabled=False))
 
 
-def test_a_successful_spill_indexes_the_hash():
+def test_a_successful_spill_reports_the_hash():
     codec = FakeCodec()
     t = tier(codec)
     t.submit_spill(11, entry_index=64, staging_slot=0)
     t.drain()
-    assert 11 in t.index.hashes
+    indexed, _ = t.take_spill_reports()
+    assert indexed == {11}
+    # Reported, not applied: the index lives in the engine process.
+    assert 11 not in t.index.hashes
 
 
 def test_the_codec_packs_the_staging_entry_not_the_pool_group():
@@ -44,10 +47,9 @@ def test_the_codec_packs_the_staging_entry_not_the_pool_group():
     assert codec.puts == [(11, 64)]
 
 
-def test_a_failed_spill_does_not_index():
-    """No spill acknowledgement is sent back to the scheduler, so the index is
-    the only record — indexing a spill that did not land is a guaranteed
-    false positive on every later request.
+def test_a_failed_spill_is_not_reported_as_indexed():
+    """The report is the only record the engine gets, so reporting a spill that
+    did not land is a guaranteed false positive on every later request.
 
     We seed the index with a *different* hash first so the assertion is
     self-contained: it proves both that 11 was not added and that nothing else
@@ -58,14 +60,16 @@ def test_a_failed_spill_does_not_index():
     t.index.confirm_spill(99)  # seed a different hash so the index is non-empty
     t.submit_spill(11, entry_index=64, staging_slot=0)
     t.drain()
+    indexed, _ = t.take_spill_reports()
+    assert indexed == set()
     assert t.index.hashes == {99}  # 11 absent AND 99 untouched
 
 
-def test_a_spill_always_releases_its_staging_slot():
-    """A leaked slot shrinks the ring permanently and the feature quietly stops
-    spilling with no error anywhere.  We must exhaust the ring via
-    `request_spill` (the real allocator) so that `_free_slots` starts empty
-    and only `release_staging` can refill it."""
+def test_a_spill_always_reports_its_staging_slot():
+    """A slot the worker never reports is one the engine never refills, so the
+    ring shrinks permanently and the feature quietly stops spilling with no
+    error anywhere.  Both slots must come back even though both `put`s failed.
+    """
     codec = FakeCodec(put_ok=False)
     t = tier(codec)
     # Drain both slots out of the ring the same way the real caller does.
@@ -76,7 +80,8 @@ def test_a_spill_always_releases_its_staging_slot():
     t.submit_spill(11, entry_index=64, staging_slot=slot0)
     t.submit_spill(22, entry_index=65, staging_slot=slot1)
     t.drain()
-    assert t.index._free_slots  # release_staging refilled the ring
+    _, released = t.take_spill_reports()
+    assert released == {slot0, slot1}
 
 
 def test_a_successful_load_reports_done():
@@ -161,3 +166,81 @@ def test_a_zero_floor_loads_anything_positive():
 
 def test_a_zero_hit_never_loads():
     assert should_load_state(0, 0) is False
+
+
+# ------------------------ the report/apply boundary ------------------------ #
+# The worker half of the state tier runs in a different process from the
+# StateOffloadIndex, so it may not mutate it -- it reports and the engine
+# applies. These tests pin that boundary.
+#
+# `ReportingCodec` rather than reusing `FakeCodec` above: a second
+# module-level `class FakeCodec` would rebind the name for the whole module
+# and silently retarget every test defined before it.
+
+
+class ReportingCodec:
+    def __init__(self, ok=True):
+        self.ok, self.calls = ok, []
+
+    def put(self, h, entry_index):
+        self.calls.append((h, entry_index))
+        return self.ok
+
+
+def test_a_landed_spill_is_reported_not_applied():
+    tier = StateOffloadTier(ReportingCodec(ok=True), index=None)
+    tier.submit_spill(11, entry_index=5, staging_slot=1)
+    tier.drain()
+    indexed, released = tier.take_spill_reports()
+    assert indexed == {11} and released == {1}
+
+
+def test_a_refused_spill_still_releases_its_slot():
+    """`put` returning False is normal backpressure (LMCache allocator under
+    pressure), not an error -- but the slot must come back either way or the
+    ring shrinks permanently."""
+    tier = StateOffloadTier(ReportingCodec(ok=False), index=None)
+    tier.submit_spill(11, entry_index=5, staging_slot=1)
+    tier.drain()
+    indexed, released = tier.take_spill_reports()
+    assert indexed == set() and released == {1}
+
+
+def test_a_throwing_codec_still_releases_its_slot():
+    class Boom:
+        def put(self, h, entry_index):
+            raise RuntimeError("storage down")
+
+    tier = StateOffloadTier(Boom(), index=None)
+    tier.submit_spill(11, entry_index=5, staging_slot=1)
+    tier.drain()
+    indexed, released = tier.take_spill_reports()
+    assert indexed == set() and released == {1}
+
+
+def test_reports_are_drained_once():
+    tier = StateOffloadTier(ReportingCodec(), index=None)
+    tier.submit_spill(11, entry_index=5, staging_slot=1)
+    tier.drain()
+    tier.take_spill_reports()
+    assert tier.take_spill_reports() == (set(), set())
+
+
+def test_the_ready_event_is_waited_on_before_the_pack():
+    """The D2D staging copy is issued on the forward's compute stream; the
+    pack runs on a worker thread with its own stream. Without the event the
+    pack races the copy and stores whatever was in the staging entry before."""
+
+    class RecordingEvent:
+        def __init__(self):
+            self.synchronized = False
+
+        def synchronize(self):
+            self.synchronized = True
+
+    ev = RecordingEvent()
+    codec = ReportingCodec()
+    tier = StateOffloadTier(codec, index=None)
+    tier.submit_spill(11, entry_index=5, staging_slot=1, ready_event=ev)
+    tier.drain()
+    assert ev.synchronized, "spill packed without waiting on the producer event"

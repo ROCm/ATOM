@@ -5,6 +5,13 @@ Its own executor, separate from the KV connector's `_load_executor` and
 `_save_executor`. The reason is the one recorded at `connector.py:83-88`: a
 load is on the TTFT critical path -- a parked sequence is waiting for it --
 and must never queue behind a backlog of fire-and-forget spills.
+
+On the spill path this class **reports, and the engine applies**. It runs in a
+spawned runner process; `StateOffloadIndex` lives in the engine process, so
+this side cannot free a staging slot or index a hash directly. `take_spill_reports`
+hands both sets to `LMCacheOffloadConnector.get_finished`, which puts them on
+`KVConnectorOutput` for the engine to apply in
+`Scheduler._update_from_kv_xfer_finished`.
 """
 
 import logging
@@ -25,6 +32,9 @@ class StateOffloadTier:
         self._done: set[str] = set()
         self._failed: set[str] = set()
         self._inflight: set = set()
+        # The spill path's two reports, drained by `take_spill_reports`.
+        self._indexed: set[int] = set()
+        self._released: set[int] = set()
 
     def _register(self, fut) -> None:
         """Add *fut* to the inflight set and attach a callback that removes it
@@ -41,12 +51,22 @@ class StateOffloadTier:
 
         fut.add_done_callback(_discard)
 
-    def submit_spill(self, h: int, entry_index: int, staging_slot: int) -> None:
+    def submit_spill(
+        self, h: int, entry_index: int, staging_slot: int, ready_event=None
+    ) -> None:
         """`entry_index` is what the codec packs, `staging_slot` what the ring
         releases. Two index spaces: the staging entries sit past the pool's
         range in the arena (`num_groups + slot`), while the ring counts from 0.
+
+        `ready_event` is the producer fence for the D2D staging copy, which
+        `AttentionBackend.build()` issued on the forward's compute stream.
+        This worker packs on its own stream, so without the wait it reads the
+        staging entry's previous occupant. Same reasoning, same shape as the
+        KV path's `save_ready_event` (`connector.py:236-240`).
         """
-        fut = self._executor.submit(self._do_spill, h, entry_index, staging_slot)
+        fut = self._executor.submit(
+            self._do_spill, h, entry_index, staging_slot, ready_event
+        )
         self._register(fut)
 
     def submit_load(self, req_id: str, h: int, group: int) -> None:
@@ -72,16 +92,33 @@ class StateOffloadTier:
     def shutdown(self) -> None:
         self._executor.shutdown(wait=True)
 
-    def _do_spill(self, h: int, entry_index: int, staging_slot: int) -> None:
+    def _do_spill(
+        self, h: int, entry_index: int, staging_slot: int, ready_event=None
+    ) -> None:
+        stored = False
         try:
-            if self.codec.put(h, entry_index):
-                self.index.confirm_spill(h)
+            if ready_event is not None:
+                ready_event.synchronize()
+            stored = bool(self.codec.put(h, entry_index))
         except Exception:  # a spill is best effort by design
             logger.warning("state offload: spill of hash %d failed", h, exc_info=True)
-        finally:
-            # Always: a leaked slot shrinks the ring permanently and the
-            # feature quietly stops spilling.
-            self.index.release_staging(staging_slot)
+        with self._lock:
+            # Report, never apply: `StateOffloadIndex` lives in the engine
+            # process and this runs in a spawned runner. The engine applies
+            # these via KVConnectorOutput.
+            if stored:
+                self._indexed.add(int(h))
+            # Always, stored or not: a leaked slot shrinks the ring
+            # permanently and the feature quietly stops spilling.
+            self._released.add(int(staging_slot))
+
+    def take_spill_reports(self) -> tuple[set[int], set[int]]:
+        """`(hashes stored, staging slots free)` since the last call."""
+        with self._lock:
+            indexed, released = set(self._indexed), set(self._released)
+            self._indexed.clear()
+            self._released.clear()
+        return indexed, released
 
     def _do_load(self, req_id: str, h: int, group: int) -> None:
         # A load target is a real pool group, not a staging entry: the bytes

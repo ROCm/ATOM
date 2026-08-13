@@ -1895,6 +1895,13 @@ class ModelRunner:
             for key, kv_cache_tensor in zip(kv_cache_keys, kv_cache_tensors)
         }
         transfer_tensors = self.attn_metadata_builder.get_kv_transfer_tensors()
+        if transfer_tensors is not None:
+            # The state offload tier is constructed inside `register_kv_caches`
+            # and needs `state_entry_views` to name the bytes it packs. This is
+            # the only place the builder and the connector are both in scope,
+            # and `transfer_tensors` is already the struct that travels between
+            # them.
+            transfer_tensors.state_backend = self.attn_metadata_builder
         if hasattr(self, "eagle3_draft_builder") and transfer_tensors is not None:
             draft_regions = self.eagle3_draft_builder.get_kv_transfer_tensors()
             if draft_regions:

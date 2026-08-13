@@ -94,6 +94,11 @@ class LMCacheOffloadConnector(KVConnectorBase):
         self._engine = None
         self._codec: ATOMKVByteCodec | None = None
         self._lookup_server = None
+        # Built in `register_kv_caches` when the state tier is enabled and the
+        # backend owns per-request state. Always defined, because
+        # `AttentionBackend._submit_state_spills` probes for it on every batch
+        # and an AttributeError there would be a forward-path crash.
+        self._state_tier = None
 
     # -- lifecycle --------------------------------------------------------
     def register_kv_caches(
@@ -143,6 +148,8 @@ class LMCacheOffloadConnector(KVConnectorBase):
         self._engine.post_init()
         self._validate_and_log_storage_backends(cfg)
 
+        self._maybe_build_state_tier(gpu_connector, transfer_tensors, meta, rank, world)
+
         # ZMQ lookup server so the scheduler process can query our hit counts.
         try:
             from lmcache.v1.lookup_client.factory import LookupClientFactory
@@ -168,6 +175,66 @@ class LMCacheOffloadConnector(KVConnectorBase):
             self._do_save,
             self._do_load,
         )
+
+    def _maybe_build_state_tier(
+        self, gpu_connector, transfer_tensors, meta, rank: int, world: int
+    ) -> None:
+        """Stand up the worker half of the state offload tier, if it is on.
+
+        Gated on `state_offload_staging_groups()`, the same function the arena
+        and the pool size themselves from, so the runner and the engine cannot
+        disagree about whether the tier exists. A second `os.environ` read here
+        would let the engine queue spills into a ring the runner never drains.
+
+        Three things this needs and where each comes from:
+        * the backend, for `state_entry_views` -- carried on
+          `transfer_tensors.state_backend`, set by the model runner, the only
+          scope holding both the builder and this connector;
+        * a `StagedTransfer` -- the KV GPU connector already owns one sized to
+          the bounded staging buffer, and sharing it is what keeps one device
+          buffer per rank rather than two;
+        * the per-entry byte count -- measured off the backend's own views
+          rather than read from the sizing plan, because the pack allocates
+          exactly what the views sum to and a plan figure that rounded
+          differently would fail inside `memory_tensor` on the first spill.
+        """
+        from atom.model_engine.state_offload import state_offload_staging_groups
+
+        if state_offload_staging_groups() <= 0:
+            return
+        backend = getattr(transfer_tensors, "state_backend", None)
+        if backend is None:
+            logger.warning(
+                "state offload: OFFLOAD_STATE is set but no attention backend "
+                "was published; the tier stays off and nothing spills."
+            )
+            return
+        try:
+            views = backend.state_entry_views(0)
+            entry_bytes = sum(int(v.numel()) * v.element_size() for v in views)
+        except NotImplementedError:
+            logger.warning(
+                "state offload: %s owns no per-request state views; the tier "
+                "stays off and nothing spills.",
+                type(backend).__name__,
+            )
+            return
+        from atom.kv_transfer.offload.state_object import StateByteCodec
+        from atom.kv_transfer.offload.state_tier import StateOffloadTier
+
+        codec = StateByteCodec(
+            backend,
+            gpu_connector._staged,
+            entry_bytes,
+            model_name=meta.model_name,
+            world_size=world,
+            worker_id=rank,
+        )
+        codec.bind_storage_manager(self._engine.storage_manager)
+        # `index=None`: the `StateOffloadIndex` lives in the engine process.
+        # The spill path only reports (`take_spill_reports`), and the load
+        # path that does want an index is not wired yet.
+        self._state_tier = StateOffloadTier(codec, index=None)
 
     def _validate_block_geometry(self, transfer_tensors) -> None:
         """Cross-check codec blocks against existing transfer-region metadata."""
@@ -466,11 +533,20 @@ class LMCacheOffloadConnector(KVConnectorBase):
             self._done_save.clear()
             self._done_load.clear()
             self._failed_load.clear()
+        # The state tier's reports: not request-keyed, because the request that
+        # owned a spilled checkpoint is gone by the time its bytes land.
+        indexed, released = (
+            self._state_tier.take_spill_reports()
+            if self._state_tier is not None
+            else (set(), set())
+        )
         return KVConnectorOutput(
             finished_sending=set(),
             finished_loading=dl,
             failed_loading=fl,
             finished_saving=ds,
+            state_indexed=indexed,
+            state_staging_released=released,
         )
 
     def get_finished_recv_blocks(self) -> list[int]:
