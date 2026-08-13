@@ -97,33 +97,29 @@ def test_local_total_layers_adds_mtp_only_on_drafter_stage(monkeypatch):
     assert runner._get_local_total_num_layers() == 5
 
 
-def test_pp_local_index_cache_layout_uses_global_layer_ids(monkeypatch):
-    builder, _ = _builder(
+def test_pp_index_cache_layout_uses_global_layer_ids(monkeypatch):
+    non_draft_builder, _ = _builder(
+        ("full", "shared", "shared", "full", "shared", "full"),
+        total_local_layers=3,
+    )
+    _mock_pp(monkeypatch, rank=0, world_size=2)
+    local_layer_ids, global_layer_ids = non_draft_builder._index_cache_layout()
+
+    assert global_layer_ids == (0, 3, 5, 6)
+    assert local_layer_ids == (0,)
+
+    draft_builder, _ = _builder(
         ("full", "shared", "shared", "full", "shared", "full"),
         total_local_layers=4,
     )
     _mock_pp(monkeypatch, rank=1, world_size=2)
-
-    local_layer_ids, global_layer_ids = builder._index_cache_layout()
+    local_layer_ids, global_layer_ids = draft_builder._index_cache_layout()
 
     assert global_layer_ids == (0, 3, 5, 6)
     assert local_layer_ids == (3, 5, 6)
 
 
-def test_pp_non_draft_stage_keeps_draft_only_in_global_layout(monkeypatch):
-    builder, _ = _builder(
-        ("full", "shared", "shared", "full", "shared", "full"),
-        total_local_layers=3,
-    )
-    _mock_pp(monkeypatch, rank=0, world_size=2)
-
-    local_layer_ids, global_layer_ids = builder._index_cache_layout()
-
-    assert global_layer_ids == (0, 3, 5, 6)
-    assert local_layer_ids == (0,)
-
-
-def test_compute_block_bytes_uses_compact_index_layer_count(monkeypatch):
+def test_sub_pool_entry_bytes_uses_compact_index_layer_count(monkeypatch):
     builder, _ = _builder(
         ("full", "shared", "shared", "full", "shared", "full"),
         total_local_layers=4,
@@ -135,8 +131,13 @@ def test_compute_block_bytes_uses_compact_index_layer_count(monkeypatch):
         "dtypes",
         SimpleNamespace(d_dtypes={"fp8": fake_fp8}, fp8=fake_fp8),
     )
+    hf_config = builder.model_runner.config.hf_config
+    mla_cache_dim = _mla_kv_cache_dim(hf_config)
+    aligned_index_dim = _aligned_index_cache_dim(hf_config.index_head_dim)
 
-    assert builder.compute_block_bytes() == 16 * (4 * 576 + 3 * 144)
+    assert builder.sub_pool_specs()[0].entry_bytes == 16 * (
+        4 * mla_cache_dim + 3 * aligned_index_dim
+    )
 
 
 def test_cache_dimensions_are_derived_and_index_rows_are_aligned():
@@ -148,7 +149,7 @@ def test_cache_dimensions_are_derived_and_index_rows_are_aligned():
     assert _aligned_index_cache_dim(125) == 144
 
 
-def test_block_bytes_support_nonstandard_mla_and_index_dimensions(monkeypatch):
+def test_sub_pool_entry_bytes_support_nonstandard_dimensions(monkeypatch):
     builder, _ = _builder(
         ("full", "shared", "shared", "full", "shared", "full"),
         total_local_layers=4,
@@ -164,7 +165,7 @@ def test_block_bytes_support_nonstandard_mla_and_index_dimensions(monkeypatch):
         SimpleNamespace(d_dtypes={"fp8": fake_fp8}, fp8=fake_fp8),
     )
 
-    assert builder.compute_block_bytes() == 16 * (4 * 512 + 3 * 128)
+    assert builder.sub_pool_specs()[0].entry_bytes == 16 * (4 * 512 + 3 * 128)
 
 
 def test_compact_layout_uses_fewer_bytes_than_full_layout(monkeypatch):
@@ -181,7 +182,9 @@ def test_compact_layout_uses_fewer_bytes_than_full_layout(monkeypatch):
         SimpleNamespace(d_dtypes={"fp8": fake_fp8}, fp8=fake_fp8),
     )
 
-    assert full.compute_block_bytes() - compact.compute_block_bytes() == 16 * 144
+    full_entry_bytes = full.sub_pool_specs()[0].entry_bytes
+    compact_entry_bytes = compact.sub_pool_specs()[0].entry_bytes
+    assert full_entry_bytes - compact_entry_bytes == 16 * 144
 
 
 def test_allocate_index_cache_uses_compact_shape_and_map(monkeypatch):
@@ -291,6 +294,7 @@ def test_build_kv_cache_tensor_binds_compact_index_slice():
     assert module.kv_cache == (("kv", 2), (8, 1, 512))
     assert module.indexer.k_cache.kv_cache[0][0] == ("index", 1)
     assert cache_tensor.layer_num == 2
+    assert cache_tensor.index_cache.identity == ("index", 1)
 
 
 def test_build_shared_layer_keeps_main_kv_without_index_slice():
@@ -316,9 +320,10 @@ def test_build_shared_layer_keeps_main_kv_without_index_slice():
         indexer=None,
     )
 
-    builder.build_kv_cache_tensor(layer_id=1, module=module)
+    cache_tensor = builder.build_kv_cache_tensor(layer_id=1, module=module)
 
     assert module.kv_cache == (("kv", 1), (8, 1, 512))
+    assert cache_tensor.index_cache is None
 
 
 def test_transfer_regions_use_explicit_compact_consumer_map(monkeypatch):
