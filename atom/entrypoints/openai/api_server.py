@@ -30,7 +30,7 @@ from typing import Any, Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from PIL import Image
 from transformers import AutoProcessor, AutoTokenizer
 
@@ -43,6 +43,7 @@ from atom.utils import envs
 from atom.utils.arg_parser import FlexibleArgumentParser
 
 from .chat_encoders import apply_chat_template, load_custom_message_encoder
+from .metrics import AtomMetricsExporter
 from .protocol import (
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_K,
@@ -110,6 +111,9 @@ _stream_loops: dict[str, AbstractEventLoop] = {}
 _request_start_times: dict[str, float] = {}
 _request_logger: logging.Logger | None = None
 _stream_batch_dispatcher: StreamBatchDispatcher | None = None
+_metrics_exporter = AtomMetricsExporter()
+_metrics_refresh_task: asyncio.Task | None = None
+_METRICS_REFRESH_INTERVAL_SECONDS = 5.0
 
 
 # ============================================================================
@@ -1113,15 +1117,48 @@ def _tune_gc() -> None:
         logger.warning("[gc] bad ATOM_GC_THRESHOLD=%r, ignored", thresholds)
 
 
+async def _refresh_metrics_once() -> None:
+    if engine is None:
+        return
+    try:
+        timeout = _METRICS_REFRESH_INTERVAL_SECONDS
+        snapshot = await asyncio.to_thread(engine.get_metrics_statistics, timeout)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - exporter must retain its last snapshot
+        _metrics_exporter.record_refresh_error()
+        logger.warning("Failed to refresh Prometheus metrics", exc_info=True)
+    else:
+        _metrics_exporter.update(snapshot)
+
+
+async def _metrics_refresh_loop() -> None:
+    while True:
+        await asyncio.sleep(_METRICS_REFRESH_INTERVAL_SECONDS)
+        await _refresh_metrics_once()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown."""
+    global _metrics_refresh_task
     logger.info("Server started successfully and ready to accept requests")
     _tune_gc()
-    yield
-    logger.info("Server shutting down, releasing resources...")
-    if engine is not None:
-        engine.close()
+    await _refresh_metrics_once()
+    _metrics_refresh_task = asyncio.create_task(_metrics_refresh_loop())
+    try:
+        yield
+    finally:
+        if _metrics_refresh_task is not None:
+            _metrics_refresh_task.cancel()
+            try:
+                await _metrics_refresh_task
+            except asyncio.CancelledError:
+                pass
+            _metrics_refresh_task = None
+        logger.info("Server shutting down, releasing resources...")
+        if engine is not None:
+            engine.close()
 
 
 app = FastAPI(title="ATOM OpenAI API Server", lifespan=lifespan)
@@ -1821,6 +1858,15 @@ async def list_models():
 async def health():
     """Health check endpoint."""
     return {"status": "ok"}
+
+
+@app.api_route("/metrics", methods=["GET", "HEAD"], include_in_schema=False)
+async def metrics():
+    """Expose cached standalone-engine metrics in Prometheus text format."""
+    return Response(
+        content=_metrics_exporter.render(),
+        headers={"Content-Type": _metrics_exporter.content_type},
+    )
 
 
 @app.get("/debug/mtp_stats")
