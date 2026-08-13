@@ -426,6 +426,13 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
             index_q_out=index_q,
             index_slot_mapping=index_metadata.slot_mapping,
             kv_cache_dtype=kv_cache_dtype,
+            # Pass the index cache's OWN dtype. Otherwise the aiter wrapper
+            # infers it from kv_cache_dtype ("fp8" whenever the main KV cache is
+            # fp8), so --kv-cache-dtype fp8 with a bf16 index cache would write
+            # fp8 bytes into a bf16 buffer.
+            index_cache_dtype=(
+                "fp8" if self.index_cache_layer.kv_cache_dtype == "fp8" else "auto"
+            ),
             k_scale=k_scale if self.kv_cache_dtype == "fp8" else None,
             v_scale=v_scale if self.kv_cache_dtype == "fp8" else None,
             asm_layout=True,
