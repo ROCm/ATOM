@@ -461,13 +461,6 @@ class ScheduledBatch:
 
         # Compute token offsets: prefill uses num_cached_tokens, decode uses existing formula
         self.scheduled_tokens = np.empty(total_tokens_num, dtype=np.int32)
-        # The token immediately after each seq's slice, or -1 when there is none.
-        # A speculative drafter consumes the target's token stream shifted left by
-        # one, so its last row per segment needs the token the segment stops just
-        # short of. On a final chunk that is the token the target is about to
-        # sample (unknown here, filled in after sampling); on a middle chunk it is
-        # the next prompt token, which exists by definition and lives only here.
-        self.next_chunk_tokens = np.full(len(self.req_ids), -1, dtype=np.int32)
         pos = 0
         for i, (seq, num) in enumerate(zip(seqs.values(), num_scheduled_tokens)):
             if seq.type == SequenceType.PREFILL:
@@ -477,11 +470,6 @@ class ScheduledBatch:
             self.scheduled_tokens[pos : pos + num] = seq.token_ids[
                 offset : offset + num
             ]
-            # Bound on num_tokens, not num_prompt_tokens: a preempted sequence
-            # re-forwards its generated tokens too, and those successors are just
-            # as known as prompt ones.
-            if seq.type == SequenceType.PREFILL and offset + num < seq.num_tokens:
-                self.next_chunk_tokens[i] = seq.token_ids[offset + num]
             pos += num
 
         if num_spec_step > 0 and scheduled_spec_decode_tokens is not None:
@@ -1446,22 +1434,19 @@ class Scheduler:
             ]
             # See `ScheduledBatch.next_token_ids`. Only the scheduler can see
             # past a middle chunk -- the batch carries that chunk's tokens alone.
-            next_token_ids = (
-                [
-                    (
-                        -1
-                        if is_final_chunk[i]
-                        else int(
-                            seq.token_ids[
-                                num_cached_tokens_list[i] + int(num_scheduled_tokens[i])
-                            ]
-                        )
+            #
+            # Bound on num_tokens, not num_prompt_tokens (which is what
+            # is_final_chunk tests): a preempted sequence re-forwards its
+            # generated tokens too, so its prompt ending mid-batch does not mean
+            # the successor is unknown -- it is the next generated token.
+            next_token_ids = None
+            if self.drafter_needs_next_token:
+                next_token_ids = []
+                for i, seq in enumerate(scheduled_seqs.values()):
+                    end = num_cached_tokens_list[i] + int(num_scheduled_tokens[i])
+                    next_token_ids.append(
+                        -1 if end >= seq.num_tokens else int(seq.token_ids[end])
                     )
-                    for i, seq in enumerate(scheduled_seqs.values())
-                ]
-                if self.drafter_needs_next_token
-                else None
-            )
 
             prefill_batch = ScheduledBatch(
                 seqs=scheduled_seqs,

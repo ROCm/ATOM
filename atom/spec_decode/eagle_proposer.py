@@ -171,23 +171,31 @@ class EagleProposer(Drafter):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         next_token_ids: list[int] | None,
+        produces_output: bool,
     ) -> None:
         """Run the draft model over this forward so its KV covers it.
 
         This drafter reads the target's token stream shifted by one, so each
         sequence's last row needs `next_token_ids` -- the token one position
-        past the chunk.
+        past the chunk. Without this, a chunked prompt leaves the draft model's
+        KV covering only the chunks that shared a batch with an output-producing
+        sequence, and its attention reads whatever the previous tenant of those
+        blocks wrote.
 
-        A single -1 means some sequence here is on its final chunk, so the batch
-        samples, so `propose()` runs and redoes this forward for every row with
-        the same anchors (`propose_draft_token_ids` applies them too). Hence the
-        early return: repeating it would be duplicate work. The test is on the
-        data -- nothing here asks what kind of chunk this is.
+        A forward that samples reaches `propose()`, which redoes this same
+        forward for every row with the same anchors
+        (`propose_draft_token_ids` applies them too), so absorbing it here would
+        be duplicate work.
 
-        NOTE: unverified against real weights. `build_drafter` routes anything
-        carrying `dspark_block_size` to `DSparkProposer`, and every model on
-        hand takes that branch.
+        Skipped for an MHA eagle3 draft: that one owns a sibling KV pool and
+        needs the slot_mapping / block_tables re-pointing `propose()` does
+        before its own forward, which is not replicated here -- it would write
+        its KV over the target's slots. Same discriminator `propose()` uses. An
+        MLA draft (plain MTP, eagle3 3.1) rides the target's pool and needs no
+        re-pointing, so it runs.
         """
+        if produces_output or hasattr(self.runner, "eagle3_draft_builder"):
+            return
         if not next_token_ids:
             return
         forward_context = get_forward_context()
@@ -195,6 +203,14 @@ class EagleProposer(Drafter):
         bs = context.batch_size
         anchors = next_token_ids[:bs]
         if any(t < 0 for t in anchors):
+            # Unreachable: -1 means the sequence ends in this forward, which
+            # makes the batch produce output. Guarded anyway because a -1 would
+            # scatter embedding row -1 into the draft's input.
+            logger.warning(
+                "Skipping draft chunk KV: %d sequence(s) in a no-output batch "
+                "have no known successor token.",
+                sum(1 for t in anchors if t < 0),
+            )
             return
 
         # Anchor row per sequence = `cu_seqlens_q[1:] - 1`, the rule
@@ -207,71 +223,43 @@ class EagleProposer(Drafter):
         # have to agree on it.
         num_tokens = hidden_states.shape[0]
         aux_hidden_states = self.aux_for(hidden_states)
-        draft_hidden = (
-            self.model.combine_hidden_states(torch.cat(aux_hidden_states, dim=-1))
-            if aux_hidden_states is not None
-            else hidden_states
-        )
+        if aux_hidden_states is not None:
+            hidden_states = self.model.combine_hidden_states(
+                torch.cat(aux_hidden_states, dim=-1)
+            )
         input_ids = self.runner.tokenID_processor.input_ids.gpu[1 : num_tokens + 1]
         input_ids.scatter_(0, last_token_indices, anchor_ids)
-
-        was_draft = context.is_draft
-        context.is_draft = True
-        try:
-            self.model(
-                input_ids=input_ids,
-                positions=positions[:num_tokens] + 1,
-                hidden_states=draft_hidden,
-            )
-        finally:
-            context.is_draft = was_draft
-    @property
-    def fills_chunk_kv(self) -> bool:
-        # Plain MTP only. The eagle3 MHA draft owns a sibling KV pool and needs
-        # the slot_mapping / block_tables re-pointing that propose() does; that
-        # is not replicated here.
-        return self.speculative_config.method == "mtp"
-
-    def fill_chunk_kv(
-        self,
-        target_token_ids: torch.Tensor,
-        target_positions: torch.Tensor,
-        target_hidden_states: torch.Tensor,
-        next_token_ids: torch.Tensor,
-        last_token_indices: torch.Tensor,
-    ) -> None:
-        context = get_forward_context().context
-        context.is_draft = True
-
-        input_ids = target_token_ids
-        input_ids.scatter_(0, last_token_indices, next_token_ids)
-        positions = target_positions + 1
+        positions = positions[:num_tokens] + 1
 
         # Prefill Context Parallel: the chunk reuses the target's 1/pcp-reindexed
         # attn_metadata, so the draft must run on this rank's query shard. Unlike
-        # propose's i==0 there is no hidden state to gather back — the KV writes
+        # propose's i==0 there is no hidden state to gather back -- the KV writes
         # are the whole point and each rank writes its own shard's slots.
-        hidden_states = target_hidden_states
         if _pcp_active_for_draft_model(self.model):
             pcp_ws = get_pcp_world_size()
-            n_pad = pcp_pad_len(input_ids.shape[0], pcp_ws) - input_ids.shape[0]
+            n_pad = pcp_pad_len(num_tokens, pcp_ws) - num_tokens
             input_ids = pcp_round_robin_split(pcp_pad_dense(input_ids, n_pad), pcp_ws)
             positions = pcp_round_robin_split(pcp_pad_dense(positions, n_pad), pcp_ws)
             hidden_states = pcp_round_robin_split(
                 pcp_pad_dense(hidden_states, n_pad), pcp_ws
             )
 
+        was_draft = context.is_draft
+        context.is_draft = True
         # The chunk's own indexer top-k, same as draft step 0. Nothing reuses the
         # buffer afterwards, so there is no compaction to do.
         if self._share_mtp_indices:
             self.model.model.set_skip_topk(False)
-        self.model(
-            input_ids=input_ids,
-            positions=positions,
-            hidden_states=hidden_states,
-        )
-        if self._share_mtp_indices:
-            self.model.model.set_skip_topk(True)
+        try:
+            self.model(
+                input_ids=input_ids,
+                positions=positions,
+                hidden_states=hidden_states,
+            )
+        finally:
+            if self._share_mtp_indices:
+                self.model.model.set_skip_topk(True)
+            context.is_draft = was_draft
 
     def propose(
         self,

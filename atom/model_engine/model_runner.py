@@ -3288,9 +3288,9 @@ class ModelRunner:
                 self.tokenID_processor.send_mtp_status_to_cpu_async(
                     num_reject_tokens, next_token_locs, self.forward_done_event
                 )  # Async copy to CPU
-                next_token_ids = self._next_token_ids_for_draft(
-                    batch, sampled_tokens, next_token_locs, bs
-                )
+                next_token_ids = torch.gather(
+                    sampled_tokens.view(bs, -1), 1, next_token_locs.view(-1, 1)
+                ).view(bs)
                 self.tokenID_processor.prev_token_ids = next_token_ids
                 draft_token_ids = self.propose_draft_token_ids(
                     batch,
@@ -3315,9 +3315,11 @@ class ModelRunner:
             prev_bonus_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
             # PP stages (is_deferred_out=False) still run the drafter.
             if hasattr(self, "drafter"):
-                next_token_ids = self._next_token_ids_for_draft(
-                    batch, sampled_tokens, next_token_locs, bs
-                )
+                # Mid-prompt sequences get their anchor corrected inside
+                # propose_draft_token_ids, from `batch.next_token_ids`.
+                next_token_ids = torch.gather(
+                    sampled_tokens.view(bs, -1), 1, next_token_locs.view(-1, 1)
+                ).view(bs)
                 draft_token_ids = self.propose_draft_token_ids(
                     batch,
                     self.tokenID_processor.input_ids.gpu[
@@ -3380,10 +3382,9 @@ class ModelRunner:
                 get_forward_context().context.positions,
                 hidden_states,
                 batch.next_token_ids,
+                not self._is_pure_middle_chunk(batch),
             )
         if pp_non_last or self._is_pure_middle_chunk(batch):
-            if not pp_non_last:
-                self.fill_draft_chunk_kv(batch, hidden_states)
             reset_forward_context()
             # Mark this slot's GPU work (attention consumed its metadata) done.
             if not batch.is_dummy_run:
@@ -3446,86 +3447,6 @@ class ModelRunner:
 
         return KVConnectorOutput(
             finished_sending=done_sending, finished_recving=done_recving
-        )
-
-    def _mid_chunk_next_tokens(
-        self, batch: ScheduledBatch, bs: int
-    ) -> torch.Tensor | None:
-        """This batch's per-sequence next *prompt* token, or None if no sequence
-        in it is mid-prompt. ``-1`` marks a sequence whose prompt ended here."""
-        following = getattr(batch, "next_chunk_tokens", None)
-        if following is None or bs == 0 or not (following[:bs] >= 0).any():
-            return None
-        buf = self.forward_vars["draft_next_tokens"]
-        buf.np[:bs] = following[:bs]
-        return buf.copy_to_gpu(bs)
-
-    def _next_token_ids_for_draft(
-        self,
-        batch: ScheduledBatch,
-        sampled_tokens: torch.Tensor,
-        next_token_locs: torch.Tensor,
-        bs: int,
-    ) -> torch.Tensor:
-        """Each sequence's token immediately after this forward's last token.
-
-        The draft model reads the target's token stream shifted left by one, so
-        every segment's last row needs the token the segment stops just short of.
-        For a sequence whose prompt finished in this forward that is the token
-        just sampled. For one still mid-prompt the sampled token belongs to a
-        position the request has not reached — the real successor is the next
-        prompt token, which only the scheduler carries.
-        """
-        next_token_ids = torch.gather(
-            sampled_tokens.view(bs, -1), 1, next_token_locs.view(-1, 1)
-        ).view(bs)
-        mid_chunk = self._mid_chunk_next_tokens(batch, bs)
-        if mid_chunk is None:
-            return next_token_ids
-        return torch.where(
-            mid_chunk >= 0, mid_chunk.to(next_token_ids.dtype), next_token_ids
-        )
-
-    def fill_draft_chunk_kv(
-        self, batch: ScheduledBatch, hidden_states: torch.Tensor
-    ) -> None:
-        """Write the draft model's KV for a batch that produces no sampled token.
-
-        A batch of pure middle chunks never reaches postprocess, so without this
-        the draft model's KV covers only the prompt tokens that happened to share
-        a batch with an output-producing sequence, and its attention reads
-        whichever request last owned those blocks.
-        """
-        drafter = getattr(self, "drafter", None)
-        if drafter is None or not drafter.fills_chunk_kv or batch.is_dummy_run:
-            return
-        bs = batch.total_seqs_num
-        # Every sequence in a pure middle-chunk batch is mid-prompt, so this is
-        # populated for all of them; None means there is nothing to write.
-        next_token_ids = self._mid_chunk_next_tokens(batch, bs)
-        if next_token_ids is None:
-            return
-        # A -1 would gather embedding row -1. It cannot appear here today (no
-        # final chunk in this batch, by construction), but the drafter has no way
-        # to notice if that ever stops holding.
-        if bool((next_token_ids < 0).any()):
-            logger.warning(
-                "Skipping draft chunk KV: %d sequence(s) in a no-output batch "
-                "have no following prompt token.",
-                int((next_token_ids < 0).sum()),
-            )
-            return
-        forward_context = get_forward_context()
-        cu_seqlens_q = forward_context.attn_metadata.cu_seqlens_q
-        last_token_indices = (cu_seqlens_q[1 : bs + 1] - 1).to(torch.int64)
-        drafter.fill_chunk_kv(
-            target_token_ids=self.tokenID_processor.input_ids.gpu[
-                1 : batch.total_tokens_num + 1
-            ],
-            target_positions=forward_context.context.positions,
-            target_hidden_states=hidden_states,
-            next_token_ids=next_token_ids,
-            last_token_indices=last_token_indices,
         )
 
     def propose_draft_token_ids(
