@@ -65,16 +65,12 @@ RUN echo "========== [OOT 2/7] Verify base packages (atom/aiter/mori) ==========
     echo "Base image triton backed up: import_version=${BASE_TRITON_VERSION}" && \
     ls /tmp/triton-base-backup/
 
-COPY docker/patches/vllm-torch210-compat.patch /tmp/vllm-torch210-compat.patch
-
-RUN echo "========== [OOT 3/7] Clone and patch vLLM ==========" && \
+RUN echo "========== [OOT 3/7] Clone vLLM ==========" && \
     test -n "${VLLM_COMMIT}" && \
     rm -rf /app/vllm && \
     git clone "${VLLM_REPO}" /app/vllm && \
     cd /app/vllm && \
     git checkout "${VLLM_COMMIT}" && \
-    git apply --check /tmp/vllm-torch210-compat.patch && \
-    git apply /tmp/vllm-torch210-compat.patch && \
     git submodule update --init --recursive && \
     echo "vLLM commit:" && \
     git rev-parse HEAD
