@@ -204,8 +204,10 @@ aiperf profile \
   --slice-duration 1.0 \
   --output-artifact-dir "${OUTPUT_DIR}" \
   --public-dataset semianalysis_cc_traces_weka_062126 \
+  --server-metrics http://127.0.0.1:8000/metrics \
   2>&1 | tee "${OUTPUT_DIR}/aiperf.log"
 ```
+
 
 ## Accuracy
 
