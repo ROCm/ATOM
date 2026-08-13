@@ -271,6 +271,19 @@ class CacheStats:
             self.total_wanted_tokens,
             self.total_full_tokens,
         )
+        if self.block_manager is not None:
+            occ = self.block_manager.pool_occupancy()
+            evicted_iv = occ["evicted_total"] - self._interval_evicted_base
+            self._interval_evicted_base = occ["evicted_total"]
+            total = occ["total"] or 1
+            logger.info(
+                f"[Cache Pool          ] "
+                f"used {occ['used']} ({occ['used'] / total:.0%}), "
+                f"free {occ['free']} ({occ['free'] / total:.0%}), "
+                f"retained-cache {occ['retained']}, "
+                f"evicted this interval {evicted_iv} "
+                f"(total {occ['evicted_total']})"
+            )
 
     @classmethod
     def _log_line(
@@ -290,19 +303,6 @@ class CacheStats:
             f"Lost-to-checkpoint: {cls._rate(wanted - cached, full):.2%}, "
             f"Lost-unrecoverable: {cls._rate(compressed - wanted, full):.2%}"
         )
-        if self.block_manager is not None:
-            occ = self.block_manager.pool_occupancy()
-            evicted_iv = occ["evicted_total"] - self._interval_evicted_base
-            self._interval_evicted_base = occ["evicted_total"]
-            total = occ["total"] or 1
-            logger.info(
-                f"[Cache Pool          ] "
-                f"used {occ['used']} ({occ['used'] / total:.0%}), "
-                f"free {occ['free']} ({occ['free'] / total:.0%}), "
-                f"retained-cache {occ['retained']}, "
-                f"evicted this interval {evicted_iv} "
-                f"(total {occ['evicted_total']})"
-            )
 
 
 def _optimal_cu_fraction(

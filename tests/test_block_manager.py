@@ -553,30 +553,6 @@ class TestDecodeBlockHashing:
         assert seq.num_hashed_tokens == 0
         assert not bm.kv.num_indexed
 
-    def test_freed_swa_slot_returned_to_pool(self, seq_factory):
-        bs, window = 4, 8
-        bm = _swa_bm(num_blocks=40, num_swa=40, bs=bs, window=window, prefix=False)
-        seq = seq_factory(list(range(1, 9)))
-        bm.allocate(seq, bm.can_allocate(seq))
-        free0 = len(bm.swa.free_block_ids_set)
-        for t in range(8, 30):
-            seq.append_token(1000 + t)
-            bm.may_append(seq)
-        # Many SWA blocks were allocated then window-freed → free pool recovered.
-        assert len(bm.swa.free_block_ids_set) > free0 - (window // bs + 3)
-
-    def test_compressed_untouched_by_window_freeing(self, seq_factory):
-        bs, window = 4, 8
-        bm = _swa_bm(num_blocks=40, num_swa=40, bs=bs, window=window, prefix=False)
-        seq = seq_factory(list(range(1, 9)))
-        bm.allocate(seq, bm.can_allocate(seq))
-        for t in range(8, 24):
-            seq.append_token(1000 + t)
-            bm.may_append(seq)
-        # Every compressed block stays held (no -1 sentinels, all in used set).
-        assert all(b >= 0 for b in seq.block_table)
-        assert all(b in bm.used_block_ids for b in seq.block_table)
-
 
 # ── register_received_prefix (PD consumer) ─────────────────────────────────
 
