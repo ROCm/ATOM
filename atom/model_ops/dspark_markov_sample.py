@@ -25,10 +25,12 @@ share is summation order (MFMA's K-blocking vs whatever tiling hipBLASLt
 picks), and fp32 addition is not associative -- so this is equal to the
 reference *up to accumulation order*, not bit-identical. The fp32
 accumulator is what the existing "this bias lands inside the softmax that
-decides acceptance" guarantee asks for, and that is preserved; what is not
-provable without a GPU is that no argmax anywhere flips on a pair of logits
-separated by less than the last-ulp disagreement. Hence the env gate, default
-off (see ``ATOM_DSPARK_FUSED_MARKOV_SAMPLE``).
+decides acceptance" guarantee asks for, and that is preserved; what no argument
+settles is whether an argmax anywhere flips on a pair of logits separated by
+less than the last-ulp disagreement. That one is answered by measurement rather
+than by proof, which is why ``ATOM_DSPARK_FUSED_MARKOV_SAMPLE`` remains a
+switch after being turned on by default (see it for the acceptance-rate
+numbers).
 
 Tie-breaking matches ``torch.argmax``: lowest index wins. Within a V tile the
 lowest index attaining the tile max is taken, and the cross-tile reduce takes
@@ -46,10 +48,11 @@ import triton
 import triton.language as tl
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
-# Untuned on hardware (no GPU available when this was written). Chosen for
-# headroom rather than peak: the stage-1 accumulator is [BLOCK_ROW, BLOCK_V]
-# fp32 (64x128 -> 16 VGPR/lane at 8 warps) and one pipeline stage stages
-# [BLOCK_ROW, BLOCK_K] + [BLOCK_K, BLOCK_V] bf16 = 24KB of the 64KB LDS.
+# Untuned, and chosen for headroom rather than peak: the stage-1 accumulator is
+# [BLOCK_ROW, BLOCK_V] fp32 (64x128 -> 16 VGPR/lane at 8 warps) and one pipeline
+# stage stages [BLOCK_ROW, BLOCK_K] + [BLOCK_K, BLOCK_V] bf16 = 24KB of the 64KB
+# LDS. Left as-is once these shapes measured 145us/step of savings at B=1 and
+# 235us at B=64 on Kimi-K3; a sweep is the obvious next thing if that matters.
 _BLOCK_V = 128
 _BLOCK_K = 64
 # MFMA needs M >= 16, so a batch smaller than that runs padded-and-masked

@@ -45,8 +45,12 @@ Numerics are the per-op path's, kernel for kernel:
 Bit-exactness against the per-op path is not claimed and is not achievable from
 Triton: the fp32 sum-of-squares reduction tree and ``rsqrt``'s approximation
 differ from the HIP kernel's. Both differences are ~1e-7 relative on a quantity
-that is then rounded to 8 mantissa bits, so the stored latent is expected to be
-bitwise equal in practice -- the accompanying GPU test asserts exactly that.
+that is then rounded to 8 mantissa bits, so the stored latent is bitwise equal
+almost everywhere -- measured on Kimi-K3, one element in 5M disagrees by 2 ULP,
+and there it is this kernel that matches an fp64 reference, because aiter's
+RMSNorm rounds ``x * rstd`` to bf16 before applying ``w`` while this one rounds
+once. The GPU test asserts that weaker thing: where the two disagree, the fused
+value is the one equal to fp64.
 
 Only the plain per-token / paged layout is covered (``[num_blocks, block_size,
 kv_lora_rank + qk_rope_head_dim]``, last dim contiguous, which is also what a

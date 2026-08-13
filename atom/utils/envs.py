@@ -130,8 +130,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # not device time. Against the per-op chain the stored latent differs on
     # ~1 element in 5M, where it is the fused kernel that matches an fp64
     # reference: aiter's RMSNorm rounds x*rstd to bf16 before applying w.
+    # Set to "0" to force the per-op chain if a regression is suspected. That
+    # chain is the eligibility fallback above, not debug code, so it stays
+    # reachable (and runs the first write of every layer) either way.
     "ATOM_DSPARK_FUSED_CTX_KV": lambda: (
-        os.getenv("ATOM_DSPARK_FUSED_CTX_KV", "0") == "1"
+        os.getenv("ATOM_DSPARK_FUSED_CTX_KV", "1") == "1"
     ),
     # Kimi-K3 DSpark draft: on the same context-row path, project ONLY the kv
     # half of the fused q_a/kv_a projection (a contiguous row slice of the
@@ -163,10 +166,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # each at B=64, V=163840) that only an argmax ever reads. The fused path
     # keeps W2 bf16, adds the base logits in the GEMM epilogue and reduces to
     # ids in registers, so W2 is read exactly once per block position and no
-    # [B, V] intermediate exists. Applies to ATOM's native K3/V4 DSpark
-    # samplers and, via spec_decode_patch, to the GREEDY branch of vLLM's
-    # DSparkSpeculator._sample_sequential -- probabilistic drafting needs the
-    # real logits for gumbel_sample and keeps the unfused path.
+    # [B, V] intermediate exists. Covers both native DSpark block samplers,
+    # Kimi-K3 (r=256) and DeepSeek-V4 (r=512); the op is shape-generic and
+    # hands anything it cannot index back to the reference, but only K3 has
+    # been run on hardware.
     # The bias GEMV moves from an fp32 matmul over an fp32 copy of W2 to bf16
     # MFMA with an fp32 accumulator. Every product is exact in fp32 either way,
     # so the result is equal to the reference up to accumulation order; whether
@@ -175,10 +178,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 87.08% against 87.06% unfused, accept-length distribution equal to within
     # 0.1pp, flexible-extract inside the run-to-run band (0.9477 / 0.9591 fused,
     # 0.9522 unfused). Saves 145 us per drafting step at B=1 and ~235 us at
-    # B=64. Read once when the Markov head is built and once when the vLLM
-    # patch is installed, so it must be set before the server starts.
+    # B=64. Set to "0" to force the reference spelling if an acceptance-rate
+    # regression is suspected -- the fastest way to rule this kernel in or out,
+    # since the two paths are not bit-identical by construction. Read once when
+    # the Markov head is built, so it must be set before the server starts.
     "ATOM_DSPARK_FUSED_MARKOV_SAMPLE": lambda: (
-        os.getenv("ATOM_DSPARK_FUSED_MARKOV_SAMPLE", "0") == "1"
+        os.getenv("ATOM_DSPARK_FUSED_MARKOV_SAMPLE", "1") == "1"
     ),
     # Replicate the vocab embedding on every TP rank (full table per rank, purely
     # local lookup) instead of TP-sharding it — eliminates the post-embedding
