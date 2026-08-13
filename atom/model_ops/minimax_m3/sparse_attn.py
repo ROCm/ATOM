@@ -126,6 +126,26 @@ def _is_fp8_kv_cache_tensor(kv_cache: torch.Tensor) -> bool:
     return kv_cache.dtype in {dtype for dtype in fp8_dtypes if dtype is not None}
 
 
+def _kv_head_collapsed_scales(
+    k_cache: torch.Tensor,
+    k_scale: torch.Tensor | None,
+    v_scale: torch.Tensor | None,
+    nph16: int,
+    hkv: int,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Collapse the fp8 per-token KV scales exactly like the cache view.
+
+    ``[num_phys16, Hkv, 16] -> [num_phys16 * Hkv, 1, 16]``, so a scale row is
+    addressed by the same kv-head-encoded page id (``phys16 * Hkv + kvh``) that
+    ``sparse_bt`` carries. Zero-copy (the scale tensor is contiguous), and
+    ``(None, None)`` for a bf16 cache.
+    """
+    if not _is_fp8_kv_cache_tensor(k_cache) or k_scale is None:
+        return None, None
+    pbs = k_scale.shape[-1]
+    return k_scale.view(nph16 * hkv, 1, pbs), v_scale.view(nph16 * hkv, 1, pbs)
+
+
 def _sparse_unified_attention(
     q_view: torch.Tensor,  # [num_seqs, gqa_group, head_dim] (kv-head collapsed)
     out_view: torch.Tensor,  # [num_seqs, gqa_group, head_dim]
@@ -135,8 +155,10 @@ def _sparse_unified_attention(
     sparse_ctx: torch.Tensor,  # [num_seqs] per-row effective context length
     sm_scale: float,
     num_seqs: int,
+    k_scale_view: torch.Tensor | None = None,  # [num_pages16, 1, 16] fp32, fp8 only
+    v_scale_view: torch.Tensor | None = None,
 ) -> None:
-    """gfx1250 fallback for the sparse per-token-as-decode gluon kernel.
+    """gfx1250 replacement for the sparse per-token-as-decode gluon kernel.
 
     gfx1250 has no `pa_decode_gluon` kernel (gluon supports gfx942 /
     gfx950 only). The sparse runners have already compacted the indexer's
@@ -146,9 +168,11 @@ def _sparse_unified_attention(
     `shuffled_kv_cache=True`. Each token is a length-1 causal "sequence",
     mirroring the gluon `max_seqlen_q=1` per-token-as-decode setup.
 
-    bf16 KV cache only: fp8 sparse decode plumbs per-token (per-page) descales
-    into the gluon kernel, which does not map onto ``unified_attention``'s descale
-    contract here; the caller raises NotImplementedError for fp8 on gfx1250.
+    fp8: M3 quantizes KV per token, so the descale cannot be a scalar. The
+    per-token scales go in as ``k_descale``/``v_descale`` shaped
+    ``[num_pages16, 1, 16]`` — the same kv-head-collapsed view as the cache —
+    which the gfx1250 3D gluon kernel folds onto the score columns (K) and the
+    softmax probabilities (V).
     """
     from aiter.ops.triton.unified_attention import unified_attention
 
@@ -178,8 +202,8 @@ def _sparse_unified_attention(
         block_table=sparse_bt,
         softcap=0,
         q_descale=None,
-        k_descale=None,
-        v_descale=None,
+        k_descale=k_scale_view,
+        v_descale=v_scale_view,
         sinks=None,
         shuffled_kv_cache=True,
     )
@@ -1239,15 +1263,14 @@ def minimax_m3_sparse_attn_decode_asm(
     num_seqs = T * num_kv_heads
 
     # gfx1250: no gluon pa_decode kernel (gluon supports gfx942 / gfx950
-    # only). Route through the triton unified_attention sparse fallback over the
-    # same SHUFFLE cache + compacted sparse block table.
+    # only). Route through the triton unified_attention sparse path over the
+    # same SHUFFLE cache + compacted sparse block table. fp8 carries the
+    # per-token descales; the scale tensor collapses the kv-head exactly like
+    # the cache, so its page ids line up with sparse_bt.
     if get_gfx() == "gfx1250":
-        if _is_fp8_kv_cache_tensor(k_cache):
-            raise NotImplementedError(
-                "MiniMax-M3 fp8 sparse attention is not yet supported on gfx1250:"
-                "the gluon per-page descale path has no unified_attention "
-                "equivalent here. Use a bf16 KV cache on gfx1250."
-            )
+        k_scale_view, v_scale_view = _kv_head_collapsed_scales(
+            k_cache, k_scale, v_scale, nph16, _hkv
+        )
         _sparse_unified_attention(
             q_view,
             out_view,
@@ -1257,6 +1280,8 @@ def minimax_m3_sparse_attn_decode_asm(
             sparse_ctx,
             sm_scale,
             num_seqs,
+            k_scale_view,
+            v_scale_view,
         )
         return
 
@@ -1279,13 +1304,14 @@ def minimax_m3_sparse_attn_decode_asm(
     # tensor [num_phys16, Hkv, pbs] collapses the same way as the cache.
     is_fp8 = _is_fp8_kv_cache_tensor(k_cache)
     compute_type = aiter.dtypes.fp8 if is_fp8 else torch.bfloat16
-    if is_fp8 and k_scale is not None:
-        # [num_phys16, Hkv, pbs] -> [num_phys16*Hkv, 1, pbs, 1], matching the cache.
-        pbs = k_scale.shape[-1]
-        gluon_k_scale = k_scale.view(nph16 * _hkv, 1, pbs).unsqueeze(-1)
-        gluon_v_scale = v_scale.view(nph16 * _hkv, 1, pbs).unsqueeze(-1)
-    else:
-        gluon_k_scale = gluon_v_scale = None
+    # gluon wants the collapsed scales with a trailing page-block axis:
+    # [num_phys16, Hkv, pbs] -> [num_phys16*Hkv, 1, pbs, 1].
+    gluon_k_scale, gluon_v_scale = _kv_head_collapsed_scales(
+        k_cache, k_scale, v_scale, nph16, _hkv
+    )
+    if gluon_k_scale is not None:
+        gluon_k_scale = gluon_k_scale.unsqueeze(-1)
+        gluon_v_scale = gluon_v_scale.unsqueeze(-1)
     run_pa_decode_gluon(
         output=out_view,
         q=q_view,
@@ -1356,12 +1382,9 @@ def _run_prefill_fp8_gluon(
     num_seqs = T * num_kv_heads
 
     if get_gfx() == "gfx1250":
-        if _is_fp8_kv_cache_tensor(k_cache):
-            raise NotImplementedError(
-                "Paged Attn fp8 prefill is not yet supported on gfx1250: "
-                "the gluon per-page descale path has no unified_attention "
-                "equivalent here. Use a bf16 KV cache on gfx1250."
-            )
+        k_scale_view, v_scale_view = _kv_head_collapsed_scales(
+            k_cache, k_scale, v_scale, nph16, _hkv
+        )
         _sparse_unified_attention(
             q_view,
             out_view,
@@ -1371,6 +1394,8 @@ def _run_prefill_fp8_gluon(
             sparse_ctx,
             sm_scale,
             num_seqs,
+            k_scale_view,
+            v_scale_view,
         )
         return
 
@@ -1393,12 +1418,14 @@ def _run_prefill_fp8_gluon(
     # both bf16 and fp8); the scale tensor collapses like the cache.
     is_fp8 = _is_fp8_kv_cache_tensor(k_cache)
     compute_type = aiter.dtypes.fp8 if is_fp8 else torch.bfloat16
-    if is_fp8 and k_scale is not None:
-        pbs = k_scale.shape[-1]
-        gluon_k_scale = k_scale.view(nph16 * _hkv, 1, pbs).unsqueeze(-1)
-        gluon_v_scale = v_scale.view(nph16 * _hkv, 1, pbs).unsqueeze(-1)
-    else:
-        gluon_k_scale = gluon_v_scale = None
+    # gluon wants the collapsed scales with a trailing page-block axis:
+    # [num_phys16, Hkv, pbs] -> [num_phys16*Hkv, 1, pbs, 1].
+    gluon_k_scale, gluon_v_scale = _kv_head_collapsed_scales(
+        k_cache, k_scale, v_scale, nph16, _hkv
+    )
+    if gluon_k_scale is not None:
+        gluon_k_scale = gluon_k_scale.unsqueeze(-1)
+        gluon_v_scale = gluon_v_scale.unsqueeze(-1)
     run_pa_decode_gluon(
         output=out_view,
         q=q_view,
