@@ -47,6 +47,13 @@ class KVCacheTensor:
     # DSA sparse layers (GLM-5.2 / DeepSeek-V3.2): indexer key cache, block-major
     # ``(num_blocks, block_size, aligned_index_dim)``. Omitted for non-DSA layers.
     index_cache: torch.Tensor | None = None
+    # ReplaySSM record buffers for linear-attention layers: this layer's slice
+    # of the (k, u, g) pools.  None for every other attention type.  Carried
+    # here because the layer-id -> linear-attn-index mapping already lives in
+    # the builder's `build_kv_cache_tensor`.
+    replay_buf_k: torch.Tensor = None
+    replay_buf_u: torch.Tensor = None
+    replay_buf_g: torch.Tensor = None
 
 
 @dataclass
