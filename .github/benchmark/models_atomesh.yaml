@@ -318,6 +318,14 @@ models:
           # GPUs 0-3. KV transfer stays on mooncake, just intra-node.
           pd_worker_layout: single_node
           env: &glm52_agentic_mtp3_env
+            common:
+              # Halve the default 2048 MB (envs.py:109-110) so the sparse
+              # indexer's dense fp32 logits buffer gets chunked more
+              # aggressively during 1M-context prefill (deepseek_v2.py:1490-1520,
+              # which GLM-5.2 shares). The value is read at module import, so it
+              # has to be in the process env before the server starts, and it
+              # goes under `common` because both roles import the model.
+              ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB: "1024"
             prefill:
               HIP_VISIBLE_DEVICES: "0,1,2,3"
             decode:
