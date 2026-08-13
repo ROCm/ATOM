@@ -1379,6 +1379,11 @@ class Config:
     tensor_parallel_size: int = 1
     decode_context_parallel_size: int = 1
     dcp_config: DCPConfig = field(default_factory=DCPConfig)
+    # DCP Query Replication (QREP): replicate the MLA query projection across the
+    # DCP group at load time so each rank locally produces the full DCP-group head
+    # set, removing the per-step decode AllGather Q. Resolved/gated in __post_init__
+    # (needs dcp>1; off for spec-decode / fp4 in the first cut). Default off.
+    enable_dcp_query_replication: bool = False
     pipeline_parallel_size: int = 1
     prefill_context_parallel_size: int = 1
     enforce_eager: bool = False
@@ -1574,6 +1579,34 @@ class Config:
                 "dcp_config.interleave_size=1 with speculative decode, or disable "
                 "speculative decode for block-level interleave."
             )
+
+            # DCP Query Replication (QREP) first-cut gating. Replicating the MLA
+            # query projection across the DCP group removes the per-step decode
+            # AllGather Q. The first cut supports dense + sparse qlen=1 decode with
+            # fp8 weights only; turn the flag OFF (warn, not error) for combos not
+            # yet wired so it can be enabled globally without breaking mixed runs.
+            if self.enable_dcp_query_replication:
+                qrep_off = None
+                if self.speculative_config is not None:
+                    # MTP / eagle3 / dspark run a qlen>1 verify on the cprr kernel.
+                    qrep_off = "speculative decode (qlen>1 cprr path)"
+                elif envs.ATOM_USE_TRITON_MXFP4_BMM:
+                    # fp4 (mxfp4) absorbed BMM has a different scale structure.
+                    qrep_off = "fp4 (mxfp4) BMM weights"
+                if qrep_off is not None:
+                    logger.warning(
+                        "enable_dcp_query_replication disabled: %s not supported "
+                        "in the first cut.",
+                        qrep_off,
+                    )
+                    self.enable_dcp_query_replication = False
+        elif self.enable_dcp_query_replication:
+            # QREP is a DCP-only optimization; it is a no-op without a DCP group.
+            logger.info(
+                "enable_dcp_query_replication has no effect with "
+                "decode_context_parallel_size<=1; disabling."
+            )
+            self.enable_dcp_query_replication = False
         assert 1 <= self.pipeline_parallel_size
         self.hf_config = get_hf_config(
             self.model, trust_remote_code=self.trust_remote_code

@@ -435,6 +435,8 @@ class LinearBase(nn.Module):
         reduce_results: bool = False,
         source_quant_dtype: torch.dtype | None = None,
         prefix: str = "",
+        override_tp_size: int | None = None,
+        override_tp_rank: int | None = None,
     ):
         self.prefix = prefix
         layer_quant_config = (
@@ -456,6 +458,18 @@ class LinearBase(nn.Module):
         self.tp_dim = tp_dim
         self.tp_rank = get_tp_group().rank_in_group
         self.tp_size = get_tp_group().world_size
+        # Optional effective-TP override: shard on a coarser grid than the global
+        # TP group (e.g. DCP query replication uses effective TP = tp/dcp so each
+        # rank materializes its whole DCP group's output shard). Since eff_tp is a
+        # valid TP size and eff_rank a valid rank within it, all downstream param
+        # sizing / weight_loader narrowing is inherited unchanged.
+        if override_tp_size is not None or override_tp_rank is not None:
+            assert override_tp_size is not None and override_tp_rank is not None, (
+                "override_tp_size and override_tp_rank must be set together"
+            )
+            assert 0 <= override_tp_rank < override_tp_size
+            self.tp_size = override_tp_size
+            self.tp_rank = override_tp_rank
         self.output_partition_sizes = (
             output_size if isinstance(output_size, list) else [output_size]
         )
@@ -1097,6 +1111,8 @@ class ColumnParallelLinear(LinearBase):
         quant_config: Optional[QuantizationConfig] = None,
         source_quant_dtype: torch.dtype = None,
         prefix: str = "",
+        override_tp_size: int | None = None,
+        override_tp_rank: int | None = None,
         **kwargs,
     ):
         self.tp_dim = 0
@@ -1108,6 +1124,8 @@ class ColumnParallelLinear(LinearBase):
             quant_config=quant_config,
             source_quant_dtype=source_quant_dtype,
             prefix=prefix,
+            override_tp_size=override_tp_size,
+            override_tp_rank=override_tp_rank,
         )
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):

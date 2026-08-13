@@ -40,7 +40,11 @@ from aiter import (
     top_k_per_row_prefill,
 )
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
-from aiter.dist.parallel_state import get_pp_group, get_tensor_model_parallel_world_size
+from aiter.dist.parallel_state import (
+    get_pp_group,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.fused_fp8_quant import fused_reduce_rms_fp8_group_quant
@@ -2430,6 +2434,22 @@ class DeepseekV2MLAAttention(nn.Module):
         assert num_heads % tp_size == 0
         self.num_local_heads = num_heads // tp_size
 
+        # DCP Query Replication (QREP): shard the query projection on a coarser
+        # effective-TP grid (tp/dcp) so each rank materializes its whole DCP
+        # group's query head set, letting decode skip the per-step AllGather Q.
+        # Gated in Config.__post_init__ (only True with dcp>1, dense/sparse, fp8,
+        # no spec). W_K is separately DCP-gathered at load in
+        # MLAAttention.process_weights_after_loading.
+        self.qrep_enabled = get_current_atom_config().enable_dcp_query_replication
+        q_qrep_override: dict = {}
+        if self.qrep_enabled:
+            dcp_size = get_dcp_world_size()
+            assert tp_size % dcp_size == 0
+            q_qrep_override = dict(
+                override_tp_size=tp_size // dcp_size,
+                override_tp_rank=get_tensor_model_parallel_rank() // dcp_size,
+            )
+
         self.scaling = self.qk_head_dim**-0.5
         self.max_position_embeddings = max_position_embeddings
         self.layer_num = layer_num
@@ -2501,6 +2521,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.q_b_proj",
                 source_quant_dtype=source_quant_dtype,
+                **q_qrep_override,
             )
         else:
             self.q_proj = ColumnParallelLinear(
@@ -2510,6 +2531,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.q_proj",
                 source_quant_dtype=source_quant_dtype,
+                **q_qrep_override,
             )
 
             self.kv_a_proj_with_mqa = ReplicatedLinear(

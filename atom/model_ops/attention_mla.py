@@ -494,6 +494,28 @@ class MLAAttention(nn.Module):
             self.dcp_rank = 0
             self._cp_triton_ctx = None
 
+        # DCP Query Replication (QREP): when enabled (resolved in Config), the
+        # query projection is sharded on effective TP = tp/dcp so each rank
+        # produces the whole DCP-group head set (`qrep_num_heads`); decode then
+        # skips the per-step AllGather Q and feeds those heads straight to the
+        # local kernel. W_K is gathered across the DCP group at load
+        # (process_weights_after_loading); W_V stays per-rank (the decode output
+        # is reduce-scattered back to local heads before W_V).
+        self.qrep_enabled = (
+            self.dcp_world_size > 1
+            and get_current_atom_config().enable_dcp_query_replication
+        )
+        self.qrep_num_heads = self.num_heads * self.dcp_world_size
+        if self.qrep_enabled:
+            # QREP feeds group-head tensors to the kernel directly; head
+            # repeat/pad would wrongly duplicate/pad the group set. R1 has
+            # num_local_heads==16==_MLA_MIN_HEADS so this holds.
+            assert self.head_repeat_factor == 1 and self.head_pad == 0, (
+                "DCP query replication requires num_local_heads >= "
+                f"{_MLA_MIN_HEADS} (no head repeat/pad); got num_heads="
+                f"{self.num_heads}."
+            )
+
         self.dcp_persistent_supported = dcp_persistent_supported()
         self.dcp_prefill_merge_bf16_ok = dcp_prefill_merge_bf16_ok()
 
@@ -611,6 +633,18 @@ class MLAAttention(nn.Module):
             self.W_V, self.W_V_scale = dynamic_per_batched_tensor_quant(
                 W_V, dtype=dtypes.fp8
             )
+            if self.qrep_enabled:
+                # QREP: gather the bf16 W_K across the DCP group so each rank
+                # holds the full group head set [group_H, 512, 128], then quantize
+                # the gathered tensor. Gathering bf16 (not fp8) sidesteps the
+                # per-rank scalar-scale stitching problem. Head order matches the
+                # effective-TP q_proj shard (both are global heads
+                # [g*group_H:(g+1)*group_H] in DCP rank_in_group order). Keep the
+                # per-rank self.W_K/scale above for the prefill path.
+                W_K_qrep = self.dcp_group.all_gather(W_K.contiguous(), dim=0)
+                self.W_K_qrep, self.W_K_qrep_scale = dynamic_per_batched_tensor_quant(
+                    W_K_qrep, dtype=dtypes.fp8
+                )
 
     @mark_trace(prefix="v_up_proj_and_o_proj", torch_compile=False)
     def _v_up_proj_and_o_proj(self, x):
@@ -648,22 +682,35 @@ class MLAAttention(nn.Module):
         return self.o_proj(x)
 
     @mark_trace(prefix="q_proj_and_k_up_proj", torch_compile=False)
-    def _q_proj_and_k_up_proj(self, x, x_scale=None):
-        q_nope, q_pe = (
-            self.q_proj(x, x_scale)
-            .view(-1, self.num_heads, self.qk_head_dim)
-            .split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+    def _q_proj_and_k_up_proj(self, x, x_scale=None, group=False):
+        # DCP Query Replication (QREP): when qrep_enabled, q_proj emits the full
+        # DCP-group head set. `group=True` (decode) keeps all group heads and uses
+        # the DCP-gathered W_K_qrep, so the caller can skip the AllGather Q.
+        # `group=False` (prefill / non-QREP) slices this rank's own heads out of
+        # the group projection and uses the per-rank W_K.
+        n_heads_out = self.qrep_num_heads if self.qrep_enabled else self.num_heads
+        q = self.q_proj(x, x_scale).view(-1, n_heads_out, self.qk_head_dim)
+        if self.qrep_enabled and not group:
+            start = self.dcp_rank * self.num_heads
+            q = q[:, start : start + self.num_heads, :].contiguous()
+        q_nope, q_pe = q.split(
+            [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
         )
 
         # Convert from (B, N, P) to (N, B, P)
         q_nope = q_nope.transpose(0, 1)
 
+        if self.qrep_enabled and group:
+            W_K, W_K_scale = self.W_K_qrep, self.W_K_qrep_scale
+        else:
+            W_K, W_K_scale = self.W_K, self.W_K_scale
+
         if is_rocm_aiter_fp4bmm_enabled():
             # FP4 BMM: (N, B, P) x (N, P, L) -> (N, B, L)
             ql_nope = batched_gemm_a16wfp4(
                 q_nope,
-                self.W_K,
-                self.W_K_scale,
+                W_K,
+                W_K_scale,
                 y=None,
                 transpose_bm=True,
                 prequant=True,
@@ -673,13 +720,17 @@ class MLAAttention(nn.Module):
             # Multiply (N, B, P) x (N, P, L) -> (N, B, L), Convert from (N, B, L) to (B, N, L)
             # ql_nope = torch.bmm(q_nope, self.W_UK_T).transpose(0, 1)
             ql_nope = _aiter_triton_fp8_bmm(
-                q_nope, self.W_K, self.W_K_scale, group_size=128, transpose_bm=True
+                q_nope, W_K, W_K_scale, group_size=128, transpose_bm=True
             )
         return ql_nope, q_pe
 
     def fused_kv_bmm(
         self, x, x_scale, k_nope, k_rope, positions, kv_cache, attn_metadata
     ):
+        # NOTE: currently dead code (only a commented-out call site). If revived,
+        # this view must handle QREP: q_proj emits the full DCP-group head set, so
+        # slice back to per-rank heads like _q_proj_and_k_up_proj(group=False)
+        # (view(-1, qrep_num_heads, ...) then [:, dcp_rank*num_heads : +num_heads]).
         q_nope, q_pe = (
             self.q_proj(x, x_scale)
             .view(-1, self.num_heads, self.qk_head_dim)
@@ -1776,9 +1827,22 @@ class MLAAttention(nn.Module):
         kv_cache = kv_cache_data[f"layer_{self.layer_num}"].k_cache
 
         if context.is_prefill and not use_prefill_mla:
-            prefill_q = self.q_proj(q, x_scale=q_scale).view(
-                -1, self.num_heads, self.qk_head_dim
+            n_heads_out = (
+                self.qrep_num_heads if self.qrep_enabled else self.num_heads
             )
+            prefill_q = self.q_proj(q, x_scale=q_scale).view(
+                -1, n_heads_out, self.qk_head_dim
+            )
+            if self.qrep_enabled:
+                # QREP: q_proj emits the full DCP-group head set. Prefill only needs
+                # this rank's per-rank heads (QREP optimizes decode's AllGather-Q,
+                # not prefill), so slice back like _q_proj_and_k_up_proj(group=False).
+                # Without this the view(-1, num_heads, ...) would inflate the token
+                # dim by dcp_world_size and corrupt the unified-attention output shape.
+                start = self.dcp_rank * self.num_heads
+                prefill_q = prefill_q[
+                    :, start : start + self.num_heads, :
+                ].contiguous()
             prefill_q_pe = prefill_q[..., self.qk_nope_head_dim :]
             self.rotary_emb(positions, prefill_q_pe, k_rope)
 
@@ -1838,7 +1902,19 @@ class MLAAttention(nn.Module):
                     prefill_q, k_nope, k_rope, kv_cache, attn_metadata
                 )
         else:
-            q_nope, q_rope = self._q_proj_and_k_up_proj(q, x_scale=q_scale)
+            # DCP Query Replication (QREP): decode produces the full group-head
+            # query locally so it can skip the AllGather Q below. Correctness holds
+            # even when use_qrep is False (group=False slices back to per-rank heads
+            # and the AG path runs as before); use_qrep only toggles the optimization.
+            # Excludes prefill and the seg path (seg alloc is per-rank sized).
+            use_qrep = (
+                self.qrep_enabled
+                and not context.is_prefill
+                and not self.use_seg_mla
+            )
+            q_nope, q_rope = self._q_proj_and_k_up_proj(
+                q, x_scale=q_scale, group=use_qrep
+            )
 
             # ---- Prefill Context Parallel --------------------------------
             # q is this rank's 1/pcp queries, so q_out is naturally 1/pcp. But
@@ -1882,7 +1958,7 @@ class MLAAttention(nn.Module):
                 q_out = torch.empty(
                     (
                         q_nope.shape[0],
-                        self.num_heads,
+                        self.qrep_num_heads if use_qrep else self.num_heads,
                         self.kv_lora_rank + self.qk_rope_head_dim,
                     ),
                     dtype=attn_metadata.dtype_q,
@@ -1999,6 +2075,9 @@ class MLAAttention(nn.Module):
             elif self.dcp_world_size > 1:
                 # DCP decode: AllGather Q on the head dim, decode locally with LSE,
                 # then combine partial outputs across ranks (AG LSE + correct + RS).
+                # QREP (use_qrep) skips the AllGather Q -- q_out already carries the
+                # full group head set from the replicated q_proj + W_K_qrep. The
+                # local decode, LSE merge and W_V path are identical either way.
                 from atom.model_ops.dcp_ops import (
                     cp_lse_ag_out_rs,
                     dcp_all_gather_query_heads,
@@ -2007,7 +2086,8 @@ class MLAAttention(nn.Module):
                 # Only real heads cross the wire and enter the combine; the pad the
                 # kernel width needs lives inside _forward_decode (see
                 # dcp_kernel_num_heads).
-                q_out = dcp_all_gather_query_heads(self.dcp_group, q_out)
+                if not use_qrep:
+                    q_out = dcp_all_gather_query_heads(self.dcp_group, q_out)
                 o, lse = self._forward_decode(
                     q_out, kv_cache, attn_metadata, return_lse=True
                 )
