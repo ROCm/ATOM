@@ -88,6 +88,16 @@ class AttnRes(nn.Module):
         # Set only on the site that closes out blocks (see maybe_close_block).
         self.block_size = block_size
         self.layer_idx = layer_idx
+        # Kernel-fused cat([block_residual, prefix_out], 1) from the attn_res
+        # call inside forward(), stashed for maybe_close_block() to consume
+        # instead of re-reading block_residual via a separate torch.cat. Reset
+        # at the top of every forward() and cleared once consumed; None means
+        # "no fused block was produced this call" (residuals disabled, no
+        # candidates yet, or a call that wasn't a close-block layer), in which
+        # case maybe_close_block() falls back to the plain torch.cat -- correct
+        # either way, this is purely a perf side-channel between the two calls
+        # that kimi_k3.py always makes back-to-back on the same instance.
+        self._pending_block_residual: torch.Tensor | None = None
 
     def process_weights_after_loading(self) -> None:
         # Fold the static rmsnorm gain and the scoring projection into one [H]
@@ -119,6 +129,8 @@ class AttnRes(nn.Module):
             prefix_sum, add_hidden, add_hidden2 = add_hidden, add_hidden2, None
         assert prefix_sum is not None
 
+        self._pending_block_residual = None  # reset every call, see the field doc
+
         if self.enabled and block_residual is not None and block_residual.shape[1] > 0:
             score_weight = self.score_weight
             if score_weight is None:  # loader hook did not run (plugin hosts)
@@ -126,7 +138,24 @@ class AttnRes(nn.Module):
                 score_weight = self.score_weight
             from atom.model_ops.kimi_k3 import apply_attn_res
 
-            return apply_attn_res(
+            # Ask the kernel to also emit the block-banking concat when this is
+            # a close-block layer, so maybe_close_block() (called right after
+            # this, on this same instance) can skip its torch.cat.
+            will_close = (
+                self.block_size is not None and self.layer_idx % self.block_size == 0
+            )
+            if not will_close:
+                return apply_attn_res(
+                    prefix_sum,
+                    block_residual,
+                    score_weight,
+                    self.eps,
+                    add_hidden,
+                    None if self.out_norm is None else self.out_norm.weight,
+                    self.out_eps,
+                    add_hidden2,
+                )
+            mixed_output, prefix_out, block_out = apply_attn_res(
                 prefix_sum,
                 block_residual,
                 score_weight,
@@ -135,7 +164,10 @@ class AttnRes(nn.Module):
                 None if self.out_norm is None else self.out_norm.weight,
                 self.out_eps,
                 add_hidden2,
+                close_block=True,
             )
+            self._pending_block_residual = block_out
+            return mixed_output, prefix_out
 
         # Nothing to mix (residuals off, or no candidates yet). Apply by hand
         # what the kernel would otherwise have folded into its load and store.
@@ -157,11 +189,24 @@ class AttnRes(nn.Module):
         leaves prefix_sum None: the running sum has been banked as a candidate
         and the next site starts a fresh one from whatever it is handed.
         Residuals disabled, or a layer mid-block, means no change.
+
+        When the immediately preceding ``forward()`` call on this instance ran
+        the attn_res kernel (there were candidates to mix), it already computed
+        this same concat in-kernel (see ``_pending_block_residual`` and
+        ``_apply_attn_res_impl``'s ``close_block``) -- reuse that instead of
+        re-reading ``block_residual`` from HBM via ``torch.cat``. The very first
+        block (block_residual still empty, so forward() took the degenerate
+        no-mix path) has nothing cached, so this falls back to the plain cat,
+        which is cheap there anyway (concatenating with an empty tensor).
         """
         if not self.enabled or self.block_size is None:
             return block_residual, prefix_sum
         if self.layer_idx % self.block_size != 0:
             return block_residual, prefix_sum
         assert block_residual is not None
-        block_residual = torch.cat([block_residual, prefix_sum.unsqueeze(1)], dim=1)
+        if self._pending_block_residual is not None:
+            block_residual = self._pending_block_residual
+            self._pending_block_residual = None
+        else:
+            block_residual = torch.cat([block_residual, prefix_sum.unsqueeze(1)], dim=1)
         return block_residual, None

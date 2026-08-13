@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import torch
 
+from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import mark_trace
 
@@ -60,6 +61,7 @@ if _HAS_TRITON:
         hs2_ptr,
         pref_ptr,
         ow_ptr,
+        bo_ptr,
         B,
         Bp,
         H,
@@ -72,12 +74,15 @@ if _HAS_TRITON:
         stride_hs_t,
         stride_hs2_t,
         stride_pref_t,
+        stride_bo_t,
+        stride_bo_b,
         BL: tl.constexpr,  # candidates per tile
         BD: tl.constexpr,  # next_pow2(H) -- one tile spans all of H
         DO_ADD: tl.constexpr,  # fold prefix += add_hidden on-load
         DO_ADD2: tl.constexpr,  # fold a second addend (shared-expert output)
         WRITE_PREF: tl.constexpr,  # write the (summed) prefix back to pref_ptr
         OUT_NORM: tl.constexpr,  # fold the caller's output rmsnorm into the store
+        WRITE_BLOCK_CAT: tl.constexpr,  # also emit cat([block_residual, ps], 1)
     ):
         # One program per row t: rmsnorm each of the Bp = B+1 candidates, score =
         # <normed, score_weight>, softmax over Bp, then weighted sum -> y[t].
@@ -115,6 +120,15 @@ if _HAS_TRITON:
         # prefix so downstream layers reuse it. DO_ADD2 folds a SECOND addend the
         # same way, so an MoE layer can hand over its routed and shared expert
         # outputs unsummed and skip an entire [T, H] elementwise kernel.
+        #
+        # WRITE_BLOCK_CAT fuses ``torch.cat([block_residual, ps.unsqueeze(1)], 1)``
+        # (the block-banking step in ``AttnRes.maybe_close_block``) into this same
+        # pass: every block_residual tile we already loaded for the softmax is
+        # copy-through-stored to bo_ptr[:, :B, :], and the (possibly add-folded)
+        # ps is stored once more to bo_ptr[:, B, :]. Without this, maybe_close_block
+        # would re-read the whole [T, B, H] block_residual from HBM a second time
+        # (via a separate torch.cat kernel) purely to relocate bytes this kernel
+        # already had in registers a moment earlier.
         t = tl.program_id(0)
         o_d = tl.arange(0, BD)
         m_d = o_d < H
@@ -137,6 +151,14 @@ if _HAS_TRITON:
                 ps.to(pref_ptr.dtype.element_ty),
                 mask=m_d,
             )
+        if WRITE_BLOCK_CAT:
+            # Candidate B of the concatenated output is ps itself; the 0..B-1
+            # rows are copy-through-stored from the tile loop below.
+            tl.store(
+                bo_ptr + t * stride_bo_t + B * stride_bo_b + o_d,
+                ps.to(bo_ptr.dtype.element_ty),
+                mask=m_d,
+            )
 
         b_m = tl.full([], float("-inf"), dtype=tl.float32)  # running max
         b_acc = tl.zeros([], dtype=tl.float32)  # running softmax denominator
@@ -146,11 +168,22 @@ if _HAS_TRITON:
             o_l = i_l * BL + tl.arange(0, BL)
             m_l = o_l < Bp
             is_last = o_l == B
+            m_res = (o_l < B)[:, None] & m_d[None, :]
             v = tl.load(
                 br_ptr + t * stride_br_t + o_l[:, None] * stride_br_b + o_d[None, :],
-                mask=(o_l < B)[:, None] & m_d[None, :],
+                mask=m_res,
                 other=0.0,
             ).to(tl.float32)
+            if WRITE_BLOCK_CAT:
+                # Copy-through: these are exactly the block_residual rows this
+                # tile already paid to load, relocated into the wider output at
+                # the same [t, l, :] slot. m_res keeps the store confined to real
+                # rows (l < B), so this is safe even in the last, partial tile.
+                tl.store(
+                    bo_ptr + t * stride_bo_t + o_l[:, None] * stride_bo_b + o_d[None, :],
+                    v.to(bo_ptr.dtype.element_ty),
+                    mask=m_res,
+                )
             v = tl.where(is_last[:, None], ps[None, :], v)
 
             # score_weight = norm_weight * proj_weight, precomputed at load time
@@ -200,7 +233,8 @@ def _apply_attn_res_impl(
     out_norm_weight: torch.Tensor | None = None,  # [H], folded: y = rmsnorm(y)
     out_eps: float = 1e-6,
     add_hidden2: torch.Tensor | None = None,  # [T, H], folded the same way
-) -> tuple[torch.Tensor, torch.Tensor]:
+    close_block: bool = False,  # also emit cat([block_residual, prefix_out], 1)
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Block-residual soft-attention mix: rmsnorm each of the B+1 candidates,
     score = <normed, score_weight>, softmax over B+1, weighted sum.
 
@@ -208,16 +242,25 @@ def _apply_attn_res_impl(
     ``score_weight`` must already fold the rmsnorm gain into the scoring
     projection (see ``_attn_res_score_weight`` on the model side).
 
-    Returns ``(mixed_output, prefix_out)``. When ``add_hidden`` (and optionally
-    ``add_hidden2``) is given, the caller's ``prefix_sum = prefix_sum + ...``
-    elementwise add is folded into the kernel on-load and ``prefix_out`` is that
-    sum; otherwise ``prefix_out`` is ``prefix_sum`` unchanged. Two addends exist
-    so an MoE layer can pass its routed and shared expert outputs separately and
-    skip the [T, H] elementwise add that would otherwise combine them.
+    Returns ``(mixed_output, prefix_out, block_out)``. When ``add_hidden`` (and
+    optionally ``add_hidden2``) is given, the caller's
+    ``prefix_sum = prefix_sum + ...`` elementwise add is folded into the kernel
+    on-load and ``prefix_out`` is that sum; otherwise ``prefix_out`` is
+    ``prefix_sum`` unchanged. Two addends exist so an MoE layer can pass its
+    routed and shared expert outputs separately and skip the [T, H] elementwise
+    add that would otherwise combine them.
 
     When ``out_norm_weight`` is given, the caller's rmsnorm OF THE RESULT (every
     apply_attn_res call site in kimi_k3.py feeds one) is folded in too, so the
     returned ``y`` is already normed and scaled.
+
+    When ``close_block`` is given, ``block_out`` is
+    ``torch.cat([block_residual, prefix_out.unsqueeze(1)], dim=1)`` -- computed
+    by re-storing the block_residual tile this same pass already loaded for the
+    softmax, plus one more store of ``prefix_out``, instead of a second kernel
+    launch re-reading block_residual from HBM (see ``AttnRes.maybe_close_block``,
+    which is what would otherwise run that ``torch.cat``). Otherwise ``block_out``
+    is ``None``.
     """
     T, B, H = block_residual.shape
     Bp = B + 1
@@ -231,12 +274,18 @@ def _apply_attn_res_impl(
     sw = score_weight.contiguous()
     y = torch.empty((T, H), device=block_residual.device, dtype=prefix_sum.dtype)
     ow = out_norm_weight.contiguous() if out_norm else sw
-    # hs/hs2/pref pointers are always passed (triton needs a tensor); when not
-    # adding they alias ps and are never dereferenced (DO_ADD / DO_ADD2 /
-    # WRITE_PREF are False).
+    # hs/hs2/pref/bo pointers are always passed (triton needs a tensor); when
+    # not adding/closing they alias ps and are never dereferenced (DO_ADD /
+    # DO_ADD2 / WRITE_PREF / WRITE_BLOCK_CAT are False).
     hs = add_hidden.contiguous() if do_add else ps
     hs2 = add_hidden2.contiguous() if do_add2 else ps
     pref = torch.empty_like(ps) if do_add else ps
+    block_out = (
+        torch.empty((T, Bp, H), device=block_residual.device, dtype=block_residual.dtype)
+        if close_block
+        else None
+    )
+    bo = block_out if close_block else br
 
     nw, ns, bl = _pick_attn_res_config(T)
     _attn_res_fused_kernel[(T,)](
@@ -248,6 +297,7 @@ def _apply_attn_res_impl(
         hs2,
         pref,
         ow,
+        bo,
         B,
         Bp,
         H,
@@ -260,6 +310,8 @@ def _apply_attn_res_impl(
         hs.stride(0),
         hs2.stride(0),
         pref.stride(0),
+        bo.stride(0),
+        bo.stride(1),
         BL=bl,
         BD=triton.next_power_of_2(H),
         num_stages=ns,
@@ -268,8 +320,9 @@ def _apply_attn_res_impl(
         DO_ADD2=do_add2,
         WRITE_PREF=do_add,
         OUT_NORM=out_norm,
+        WRITE_BLOCK_CAT=close_block,
     )
-    return y, (pref if do_add else prefix_sum)
+    return y, (pref if do_add else prefix_sum), block_out
 
 
 def _apply_attn_res_op(
@@ -280,7 +333,7 @@ def _apply_attn_res_op(
     out_norm_weight: torch.Tensor | None = None,
     out_eps: float = 1e-6,
 ) -> torch.Tensor:
-    mixed_output, _ = _apply_attn_res_impl(
+    mixed_output, _, _ = _apply_attn_res_impl(
         prefix_sum,
         block_residual,
         score_weight,
@@ -320,7 +373,7 @@ def _apply_attn_res_add_op(
     out_eps: float = 1e-6,
     add_hidden2: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    return _apply_attn_res_impl(
+    mixed_output, prefix_out, _ = _apply_attn_res_impl(
         prefix_sum,
         block_residual,
         score_weight,
@@ -330,6 +383,7 @@ def _apply_attn_res_add_op(
         out_eps=out_eps,
         add_hidden2=add_hidden2,
     )
+    return mixed_output, prefix_out
 
 
 def _apply_attn_res_add_op_fake(
@@ -353,6 +407,58 @@ direct_register_custom_op(
 )
 
 
+def _apply_attn_res_close_block_op(
+    prefix_sum: torch.Tensor,
+    block_residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    eps: float,
+    add_hidden: torch.Tensor | None = None,
+    out_norm_weight: torch.Tensor | None = None,
+    out_eps: float = 1e-6,
+    add_hidden2: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    mixed_output, prefix_out, block_out = _apply_attn_res_impl(
+        prefix_sum,
+        block_residual,
+        score_weight,
+        eps,
+        add_hidden,
+        out_norm_weight=out_norm_weight,
+        out_eps=out_eps,
+        add_hidden2=add_hidden2,
+        close_block=True,
+    )
+    return mixed_output, prefix_out, block_out
+
+
+def _apply_attn_res_close_block_op_fake(
+    prefix_sum: torch.Tensor,
+    block_residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    eps: float,
+    add_hidden: torch.Tensor | None = None,
+    out_norm_weight: torch.Tensor | None = None,
+    out_eps: float = 1e-6,
+    add_hidden2: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    T, B, H = block_residual.shape
+    return (
+        torch.empty_like(prefix_sum),
+        torch.empty_like(prefix_sum),
+        torch.empty(
+            (T, B + 1, H), device=block_residual.device, dtype=block_residual.dtype
+        ),
+    )
+
+
+direct_register_custom_op(
+    op_name="kimi_k3_apply_attn_res_close_block",
+    op_func=_apply_attn_res_close_block_op,
+    mutates_args=[],
+    fake_impl=_apply_attn_res_close_block_op_fake,
+)
+
+
 @mark_trace
 def apply_attn_res(
     prefix_sum: torch.Tensor,
@@ -363,22 +469,75 @@ def apply_attn_res(
     out_norm_weight: torch.Tensor | None = None,
     out_eps: float = 1e-6,
     add_hidden2: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    close_block: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Dispatch an opaque custom op whose CUDA implementation selects by concrete T.
 
     ``out_norm_weight`` folds the caller's rmsnorm of the result into the kernel;
     the returned mixed output is then already normed and scaled by it.
-    ``add_hidden2`` folds a second addend into the prefix (see the impl)."""
-    if add_hidden is None:
-        if add_hidden2 is not None:
-            raise ValueError("add_hidden2 requires add_hidden")
-        return (
-            torch.ops.aiter.kimi_k3_apply_attn_res(
-                prefix_sum, block_residual, score_weight, eps, out_norm_weight, out_eps
-            ),
+    ``add_hidden2`` folds a second addend into the prefix (see the impl).
+
+    ``close_block=False`` (the default) returns the original ``(mixed_output,
+    prefix_out)`` 2-tuple, unchanged for every existing caller.
+
+    ``close_block=True`` additionally fuses the block-banking concat that
+    ``AttnRes.maybe_close_block`` would otherwise perform as a separate
+    ``torch.cat`` (see that method and ``_apply_attn_res_impl``'s docstring),
+    and returns the 3-tuple ``(mixed_output, prefix_out, block_out)`` where
+    ``block_out`` is ``cat([block_residual, prefix_out.unsqueeze(1)], dim=1)``.
+
+    ``ATOM_USE_AITER_ATTN_RES=1`` routes to aiter's ported kernel
+    (``aiter.ops.triton.fusions.attn_res.attn_res_gate``) instead of the local
+    Triton kernel below -- same math, same launch-config-by-token-count
+    dispatch, same ``add_hidden``/``add_hidden2``/``out_eps``/``close_block``
+    surface (kept aligned on purpose; see the aiter-vs-atom-attn-res-kimi-k3
+    comparison notes). Default off: the local kernel is the validated
+    production path.
+    """
+    if envs.ATOM_USE_AITER_ATTN_RES:
+        from aiter.ops.triton.fusions.attn_res import attn_res_gate
+
+        return attn_res_gate(
             prefix_sum,
+            block_residual,
+            score_weight,
+            eps,
+            add_hidden,
+            add_hidden2,
+            output_rms_weight=out_norm_weight,
+            output_rms_eps=out_eps,
+            close_block=close_block,
         )
-    return torch.ops.aiter.kimi_k3_apply_attn_res_add(
+
+    if not close_block:
+        if add_hidden is None:
+            if add_hidden2 is not None:
+                raise ValueError("add_hidden2 requires add_hidden")
+            return (
+                torch.ops.aiter.kimi_k3_apply_attn_res(
+                    prefix_sum,
+                    block_residual,
+                    score_weight,
+                    eps,
+                    out_norm_weight,
+                    out_eps,
+                ),
+                prefix_sum,
+            )
+        return torch.ops.aiter.kimi_k3_apply_attn_res_add(
+            prefix_sum,
+            block_residual,
+            score_weight,
+            eps,
+            add_hidden,
+            out_norm_weight,
+            out_eps,
+            add_hidden2,
+        )
+
+    if add_hidden2 is not None and add_hidden is None:
+        raise ValueError("add_hidden2 requires add_hidden")
+    return torch.ops.aiter.kimi_k3_apply_attn_res_close_block(
         prefix_sum,
         block_residual,
         score_weight,
