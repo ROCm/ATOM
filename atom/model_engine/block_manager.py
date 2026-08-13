@@ -79,10 +79,6 @@ class BlockManager:
         self.hash_block_size = self.block_size * self.dcp_world_size
         self.enable_prefix_caching = config.enable_prefix_caching
         self.total_evicted_blocks: int = 0
-        # Blocks whose hash had to be reconstructed by _chain_parent_hash.
-        # Steady-state this should stay at 0; a rising count means some path is
-        # still dropping hashes for blocks whose KV is already computed.
-        self.total_backfilled_blocks: int = 0
 
         kv_events = getattr(config, "kv_events_config", None)
         self._events_enabled: bool = bool(kv_events and kv_events.enable)
@@ -363,7 +359,6 @@ class BlockManager:
             "hashed": hashed,
             "retained": max(0, hashed - used),
             "evicted_total": self.total_evicted_blocks,
-            "backfilled_total": self.total_backfilled_blocks,
         }
 
     def can_allocate(self, seq: Sequence) -> int:
@@ -532,54 +527,26 @@ class BlockManager:
         seq.per_req_cache_group = src
         seq.state_fork_src = -1
 
-    def _chain_parent_hash(self, seq: Sequence, start: int) -> int:
-        """Return the chained hash of block ``start - 1``, rebuilding if missing.
+    def _chain_parent_hash(self, seq: Sequence, start: int) -> int | None:
+        """Return the chained hash of block ``start - 1``, or ``None`` on a gap.
 
-        Block hashes chain: block N depends on N-1. On a gap, walk back to
-        the nearest hashed ancestor and recompute forward. Cannot re-root
-        at -1: ``hash(tokens, -1)`` collides with prompt-initial blocks.
+        All source paths (register_prefill_hashes, postprocess, offload wake)
+        are expected to hash blocks before this is called. A gap means a
+        source-level bug; callers skip the range rather than mint false hashes.
         """
         if start <= 0:
             return -1
         h = self.kv.block(seq.block_table[start - 1]).hash
         if h != -1:
             return h
-
-        gap_start = start - 1
-        while (
-            gap_start > 0 and self.kv.block(seq.block_table[gap_start - 1]).hash == -1
-        ):
-            gap_start -= 1
-        h = -1 if gap_start == 0 else self.kv.block(seq.block_table[gap_start - 1]).hash
-
-        record = self._event_log is not None
-        run_parent: int | None = h if h != -1 else None
-        run_hashes: list[int] = []
-        run_tokens: list[int] = []
-        for i in range(gap_start, start):
-            token_ids = self._hash_block_tokens(seq, i)
-            block_id = seq.block_table[i]
-            block = self.kv.block(block_id)
-            h = self.compute_hash(token_ids, h)
-            if self.kv.lookup(h) == -1:
-                self.kv.publish(block_id, h, token_ids)
-            else:
-                block.update(h, token_ids)
-            if record:
-                run_hashes.append(h)
-                run_tokens.extend(token_ids)
-        self.total_backfilled_blocks += start - gap_start
-        logger.debug(
-            "Backfilled prefix hash chain: seq=%s blocks=%d:%d",
+        logger.error(
+            "Unhashed parent block %d for seq %s — skipping hash "
+            "registration for blocks %d onward",
+            start - 1,
             seq.id,
-            gap_start,
             start,
         )
-        if record and run_hashes:
-            self._event_log.append(
-                _make_block_stored(run_hashes, run_tokens, run_parent, self.block_size)
-            )
-        return h
+        return None
 
     def hash_blocks(
         self,
@@ -622,6 +589,8 @@ class BlockManager:
         # prefill path feeds it without knowing about it.
         seq.num_hashed_tokens = max(seq.num_hashed_tokens, end * hbs)
         h = self._chain_parent_hash(seq, start)
+        if h is None:
+            return
         record = self._event_log is not None
         store_run_parent: int | None = h if h != -1 else None
         store_run_hashes: list[int] = []
@@ -1018,6 +987,8 @@ class BlockManager:
             return 0
 
         parent_hash = self._chain_parent_hash(seq, start_block)
+        if parent_hash is None:
+            return 0
 
         indexed_tokens = 0
         for i in range(start_block, end_block):
