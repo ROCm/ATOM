@@ -333,6 +333,7 @@ class DSparkProposer(Drafter):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         next_token_ids: list[int] | None,
+        produces_output: bool,
     ) -> None:
         """Absorb the target context into the draft's KV, for EVERY DSpark flavor.
 
@@ -353,8 +354,10 @@ class DSparkProposer(Drafter):
         step that accepts them rewrites them.
 
         `next_token_ids` is unused: DSpark drafts from aux hidden states.
+        `produces_output` is unused: the window has to cover every scheduled
+        row, so a forward that also reaches `propose()` is not skippable here.
         """
-        del next_token_ids
+        del next_token_ids, produces_output
         aux_hidden_states = self.aux_for(hidden_states)
         if aux_hidden_states is None:
             return

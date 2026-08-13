@@ -170,9 +170,6 @@ class Drafter(abc.ABC):
         self.cu_num_draft_tokens = CpuGpuBuffer(max_bs, **i32_kwargs)
         self.target_logits_indices = CpuGpuBuffer(max_bs * self.mtp_k, **i64_kwargs)
         self.bonus_logits_indices = CpuGpuBuffer(max_bs, **i64_kwargs)
-        # Scheduler-supplied anchors. Pinned so the H2D stays async; building a
-        # tensor from the python list would block on a per-forward path.
-        self.anchor_staging = CpuGpuBuffer(max_bs, **i32_kwargs)
 
     # ---- flavor hooks ----
     @abc.abstractmethod
@@ -227,36 +224,6 @@ class Drafter(abc.ABC):
         """Confidence-schedule verify planner (DSpark Level B), or None when the
         drafter uses fixed-length verification."""
         return None
-
-    @property
-    def fills_chunk_kv(self) -> bool:
-        """True when ``fill_chunk_kv`` is implemented, i.e. this drafter can write
-        its own KV for a prompt chunk that produces no sampled token."""
-        return False
-
-    def fill_chunk_kv(
-        self,
-        target_token_ids: torch.Tensor,
-        target_positions: torch.Tensor,
-        target_hidden_states: torch.Tensor,
-        next_token_ids: torch.Tensor,
-        last_token_indices: torch.Tensor,
-    ) -> None:
-        """Write this chunk's draft-model KV without drafting anything.
-
-        A middle chunk of a chunked prefill yields no sampled token, so the
-        request never reaches ``propose``. Without this the draft model's KV
-        covers only the tokens of chunks that happened to share a batch with an
-        output-producing sequence, and its attention reads whatever the previous
-        tenant of those blocks left behind.
-
-        Same inputs as ``propose`` minus the reject counts, and ``next_token_ids``
-        holds each segment's following *prompt* token rather than a sampled one.
-        """
-        raise NotImplementedError(
-            f"{type(self).__name__} does not implement fill_chunk_kv; guard the "
-            "call site on the fills_chunk_kv capability."
-        )
 
     # ---- aux-hidden-state ownership (drafter-owned, hook-based) ----
     def arm_aux_capture(self, target_model: nn.Module) -> None:
@@ -344,16 +311,23 @@ class Drafter(abc.ABC):
         """Scheduler-supplied anchors as an int32 GPU tensor, without blocking.
 
         `-1` entries survive as-is; callers read them as "sampling supplies it".
+
+        Staged through the runner's `forward_vars`, not a buffer of our own, so
+        the PP ring clones it per in-flight slot: the head launches consecutive
+        middle-chunk forwards without a GPU sync, and a shared pinned buffer
+        would be rewritten on the host before its own async H2D ran.
         """
         n = len(anchors)
-        self.anchor_staging.np[:n] = anchors
-        return self.anchor_staging.copy_to_gpu(n)
+        buf = self.runner.forward_vars["draft_next_tokens"]
+        buf.np[:n] = anchors
+        return buf.copy_to_gpu(n)
 
     def precompute_context_kv(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         next_token_ids: list[int] | None,
+        produces_output: bool,
     ) -> None:
         """Absorb one target forward into whatever context this drafter keeps.
 
@@ -362,10 +336,17 @@ class Drafter(abc.ABC):
         context maintained there covers a chunked prefill's final chunk alone.
 
         `next_token_ids` is the token one position past this forward, per seq:
-        -1 where sampling supplies it, None on unlabelled batches. A drafter
-        reading the target's TOKEN stream needs it (it sits one position ahead,
-        so its last row has no token otherwise); one reading hidden states does
-        not. Default is a no-op -- no cross-forward context, nothing to absorb.
+        -1 where the scheduler cannot see one (the sequence ends here, so
+        sampling supplies it), None on unlabelled batches. A drafter reading the
+        target's TOKEN stream needs it (it sits one position ahead, so its last
+        row has no token otherwise); one reading hidden states does not.
+
+        `produces_output` says whether this forward samples, i.e. whether
+        `propose()` will run over it afterwards and redo the same work. A
+        drafter whose absorb step IS that forward should skip it when true; one
+        keeping a rolling window still has to write every row.
+
+        Default is a no-op -- no cross-forward context, nothing to absorb.
         """
         return
 
