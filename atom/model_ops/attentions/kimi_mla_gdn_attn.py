@@ -120,6 +120,9 @@ class _KimiMLAGDNCommon(GDNStateMixin):
                 v_cache=runner.mamba_v_cache[row],
                 k_scale=None,
                 v_scale=None,
+                replay_buf_k=(runner.replayssm_buf_k[row] if self.replayssm else None),
+                replay_buf_u=(runner.replayssm_buf_u[row] if self.replayssm else None),
+                replay_buf_g=(runner.replayssm_buf_g[row] if self.replayssm else None),
             )
 
         if hasattr(module, "base_attention") and getattr(module, "use_mla", False):
