@@ -1906,3 +1906,127 @@ def test_a_zero_entry_state_pool_stays_loud(monkeypatch):
 
     with pytest.raises(IndexError):
         conn._maybe_build_state_tier(_gpu_conn(1 << 20), tt, _state_meta(), 0, 1)
+
+
+# ── a hybrid model's per-request state is not paged KV ────────────────────
+#
+# `build_kv_cache_tensor` on the two hybrid builders (`gdn_attn.py` for
+# Qwen3-Next / Qwen3.5, `kimi_mla_gdn_attn.py` for Kimi-K3) returns the mamba /
+# KDA recurrent-state rows as a `KVCacheTensor`, because the forward path reads
+# its state out of the same `kv_cache_data` registry. Those rows are addressed
+# by request slot, have no block stride, and must never reach the byte codec:
+# the codec would either refuse them (`numel() % num_blocks`) or, worse, count
+# their bytes into `bytes_per_block` and blow the geometry cross-check.
+
+
+def _paged_entry(num_blocks, block_size, latent):
+    import torch
+
+    return SimpleNamespace(
+        k_cache=torch.arange(
+            num_blocks * block_size * latent, dtype=torch.uint8
+        ).reshape(num_blocks * block_size, 1, latent),
+        v_cache=None,
+        k_scale=None,
+        v_scale=None,
+    )
+
+
+def _state_entry(num_slots, state_elems, *, per_request_state=True):
+    """Stand in for `KVCacheTensor(k_cache=runner.mamba_k_cache[i], ...)`."""
+    import torch
+
+    return SimpleNamespace(
+        k_cache=torch.zeros(num_slots, state_elems, dtype=torch.uint8),
+        v_cache=torch.zeros(num_slots, state_elems + 2, dtype=torch.uint8),
+        k_scale=None,
+        v_scale=None,
+        per_request_state=per_request_state,
+    )
+
+
+def test_codec_skips_per_request_state_entries():
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    num_blocks, block_size, latent = 4, 2, 3
+    kv_caches = {
+        "layer_0": _paged_entry(num_blocks, block_size, latent),
+        # 3 slots x 5 elements = 15, which does not divide num_blocks=4. This
+        # is the shape that raises today.
+        "layer_1": _state_entry(3, 5),
+        "layer_2": _paged_entry(num_blocks, block_size, latent),
+    }
+
+    codec = ATOMKVByteCodec(kv_caches, num_blocks=num_blocks)
+
+    # Exactly the two paged K tensors; the state entry's k_cache and v_cache
+    # are both gone.
+    assert len(codec._segments) == 2
+    assert codec.bytes_per_block == 2 * block_size * latent
+
+    # And the geometry cross-check the connector runs at boot now agrees with
+    # what the paged backend describes.
+    conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
+    conn._codec = codec
+    conn._validate_block_geometry(
+        SimpleNamespace(
+            block_regions=[
+                SimpleNamespace(unit_bytes=block_size * latent),
+                SimpleNamespace(unit_bytes=block_size * latent),
+            ]
+        )
+    )
+
+
+def test_codec_state_only_registry_is_refused_loudly():
+    """DeepSeek-V4 style: nothing paged reaches the codec at all. Better to
+    refuse than to move a cache that is entirely per-request state."""
+    import torch
+
+    if not hasattr(torch, "zeros"):
+        pytest.skip("real torch is unavailable")
+
+    with pytest.raises(ValueError, match="no movable KV tensors registered"):
+        ATOMKVByteCodec({"layer_0": _state_entry(3, 5)}, num_blocks=4)
+
+
+def test_codec_dense_model_segment_list_is_unchanged():
+    """The dense regression: no `per_request_state` marker anywhere, so the
+    segment list must be byte-for-byte what it was before the filter existed."""
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    num_blocks = 6
+    kv_caches = {
+        "layer_0": SimpleNamespace(
+            k_cache=torch.arange(num_blocks * 2, dtype=torch.uint8).reshape(
+                num_blocks, 2
+            ),
+            v_cache=torch.arange(num_blocks * 3, dtype=torch.uint8).reshape(
+                num_blocks, 3
+            ),
+            k_scale=torch.zeros(num_blocks, dtype=torch.uint8),
+            v_scale=torch.zeros(num_blocks, dtype=torch.uint8),
+        ),
+        "layer_1": SimpleNamespace(
+            k_cache=torch.arange(num_blocks * 2, dtype=torch.uint8).reshape(
+                num_blocks, 2
+            ),
+            v_cache=torch.arange(num_blocks * 3, dtype=torch.uint8).reshape(
+                num_blocks, 3
+            ),
+            k_scale=None,
+            v_scale=None,
+        ),
+    }
+
+    codec = ATOMKVByteCodec(kv_caches, num_blocks=num_blocks)
+
+    # 4 segments for layer_0 (K, V, kS, vS) + 2 for layer_1.
+    assert len(codec._segments) == 6
+    assert codec.bytes_per_block == (2 + 3 + 1 + 1) + (2 + 3)

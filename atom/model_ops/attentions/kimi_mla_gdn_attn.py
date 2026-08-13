@@ -89,6 +89,10 @@ class _KimiMLAGDNCommon(GDNStateMixin):
                 v_cache=runner.mamba_v_cache[row],
                 k_scale=None,
                 v_scale=None,
+                # KDA recurrent state: slot-addressed, not paged. Registered
+                # because the forward reads it from `kv_cache_data`, but
+                # excluded from every block-addressed transfer.
+                per_request_state=True,
             )
 
         if hasattr(module, "base_attention") and getattr(module, "use_mla", False):

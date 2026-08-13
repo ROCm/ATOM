@@ -729,6 +729,10 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
                 v_cache=runner.mamba_v_cache[gdn_idx],
                 k_scale=None,
                 v_scale=None,
+                # Slot-addressed recurrent state, not paged KV. It has to be
+                # registered (attention_gdn reads its state out of
+                # `kv_cache_data`), but no block-addressed mover may touch it.
+                per_request_state=True,
             )
         return super().build_kv_cache_tensor(layer_id, module)
 
