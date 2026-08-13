@@ -1,7 +1,7 @@
 """ATOM wrappers for rtp-llm external model loading.
 
 Loaded via:
-    RTP_LLM_EXTERNAL_MODEL_PACKAGES=atom.plugin.rtpllm.models
+    --external_model_packages atom.plugin.rtpllm.models
 
 This module intentionally keeps runtime behavior compatible with rtp-llm's
 native qwen3.5-moe implementation while providing a plugin entrypoint that can

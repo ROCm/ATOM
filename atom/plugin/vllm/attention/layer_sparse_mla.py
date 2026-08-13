@@ -12,8 +12,12 @@ forward_impl_sparse handles everything end-to-end: RoPE, KV cache
 write, Q absorption, topk index conversion, sparse kernel, V up-projection.
 """
 
-import torch
+import logging
+from typing import Optional
 
+import torch
+import triton
+import triton.language as tl
 from aiter import (
     cp_gather_indexer_k_quant_cache,
     dtypes,
@@ -27,12 +31,6 @@ from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 from atom.plugin.prepare import is_vllm
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
-
-import triton
-import triton.language as tl
-
-from typing import Optional
-import logging
 
 logger = logging.getLogger("atom")
 
@@ -263,6 +261,7 @@ def sparse_attn_indexer_plugin_mode(
     weights_scale: float,
     is_neox_style: bool,
     use_qk_rope_cache_fusion: bool,
+    stable_topk: bool,
 ) -> torch.Tensor:
     topk_indices = torch.full(
         (hidden_states.shape[0], topk_tokens),
@@ -486,6 +485,7 @@ def sparse_attn_indexer_plugin_mode(
             num_rows,
             logits.stride(0),
             logits.stride(1),
+            stable=stable_topk,
         )
 
         if decode_metadata.requires_padding:
@@ -539,6 +539,7 @@ def sparse_attn_indexer_fake(
     weights_scale: float,
     is_neox_style: bool,
     use_qk_rope_cache_fusion: bool,
+    stable_topk: bool,
 ) -> torch.Tensor:
     # profile run
     # NOTE(Chen): create the max possible flattened_kv. So that

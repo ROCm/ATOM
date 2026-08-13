@@ -43,6 +43,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ATOM remaps the SGLang world into internal TP x PCP groups.
     # 0 means unset.
     "ATOM_SGLANG_PCP_SIZE": lambda: int(os.getenv("ATOM_SGLANG_PCP_SIZE", "0") or "0"),
+    "STATE_CKPT_EXTRA_ENTRIES": lambda: int(
+        os.getenv("STATE_CKPT_EXTRA_ENTRIES", "0") or "0"
+    ),
     # --- Compilation & Execution ---
     "ATOM_USE_TRITON_GEMM": lambda: os.getenv("ATOM_USE_TRITON_GEMM", "0") == "1",
     "ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE": lambda: (
@@ -88,43 +91,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION", "1") == "1"
-    ),
-    # DeepSeek-V4 paged-SWA: retain the FULL sliding-window KV history in the
-    # content-addressed SWA cache instead of the default window-only prefill
-    # write. Default OFF preserves the window-only optimization (writes only each
-    # prefill chunk's trailing `window` tokens). When ON, swa_write persists the
-    # whole chunk and ensure_for_tokens materializes every block, so cross-request
-    # prefix hits can reuse the middle SWA blocks (agentic branch/replay reuse) —
-    # the live sliding-window free is UNCHANGED (out-of-window refs still released
-    # each chunk/decode; freed blocks stay hash+KV resident until overwritten).
-    # Pairs with a larger SWA pool (swa_pool_num_blocks) so freed-but-cached
-    # blocks survive until replay. Costs ~compressed-pool-magnitude SWA memory.
-    "ATOM_SWA_FULL_RETAIN": lambda: (os.getenv("ATOM_SWA_FULL_RETAIN", "0") == "1"),
-    # DeepSeek-V4 paged-SWA full-retain: fraction of the KV budget given to the
-    # SWA tail pool (the rest goes to the compressed pool). One SWA block is ~7x
-    # the bytes of one compressed block, so a 1:1 mirror starves the compressed
-    # prefix index; a small fraction keeps compressed near full while retaining
-    # the hot-boundary tail working set (LRU-evicted). Only consulted when
-    # ATOM_SWA_FULL_RETAIN=1. Default 0.2; tune 0.15-0.25 with cache-hit
-    # instrumentation. Clamped to (0, 0.9).
-    "ATOM_SWA_TAIL_BUDGET_FRAC": lambda: float(
-        os.getenv("ATOM_SWA_TAIL_BUDGET_FRAC", "0.2")
-    ),
-    # DeepSeek-V4 paged-SWA sparse checkpoint retention (only with
-    # ATOM_SWA_FULL_RETAIN=1). Tokens per retained SWA-tail checkpoint: 0 = dense
-    # (retain every written tail, relies on pool size — floods a small pool);
-    # >0 = keep a tail only once per this-many-tokens segment plus at each prompt
-    # boundary, and PIN those so live-window churn cannot overwrite them (mirrors
-    # vLLM VLLM_PREFIX_CACHE_RETENTION_INTERVAL / SlidingWindowManager sparse
-    # reachable_block_mask). Should be a multiple of the KV block size; 32768
-    # matches the vLLM trace-replay tuning. Default 0 (dense).
-    "ATOM_SWA_RETENTION_INTERVAL": lambda: int(
-        os.getenv("ATOM_SWA_RETENTION_INTERVAL", "0")
-    ),
-    # Fraction of the SWA pool that pinned checkpoint tails may occupy (LRU-capped)
-    # when sparse retention is on; the rest stays free for live-window churn.
-    "ATOM_SWA_CHECKPOINT_FRAC": lambda: float(
-        os.getenv("ATOM_SWA_CHECKPOINT_FRAC", "0.5")
     ),
     # DSA sparse-indexer prefill: KV-dimension chunk size (in tokens) for
     # `fp8_mqa_logits`. The dense logits buffer is [prefill_tokens, total_kv];
@@ -178,6 +144,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # --- Profiling & Logging ---
     "ATOM_TORCH_PROFILER_DIR": lambda: os.getenv("ATOM_TORCH_PROFILER_DIR", None),
+    # "t0,t1,t2" for gc.set_threshold(); empty keeps CPython's default.
+    # See _tune_gc in api_server.py.
+    "ATOM_GC_THRESHOLD": lambda: os.getenv("ATOM_GC_THRESHOLD", "").strip(),
     "ATOM_PROFILER_MORE": lambda: os.getenv("ATOM_PROFILER_MORE", "0") == "1",
     # When profiling is active, append detailed attention aggregates (sqsq, sqsk, sk)
     # to the prefill[]/decode[] trace labels emitted by ModelRunner.run_model.

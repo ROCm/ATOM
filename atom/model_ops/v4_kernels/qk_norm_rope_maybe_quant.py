@@ -31,13 +31,12 @@ ops anyway.
 
 import inspect
 from dataclasses import dataclass
-from typing import Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
 
-from atom.model_ops.v4_kernels.state_writes import swa_write
+from atom.model_ops.v4_kernels.state_writes import swa_scatter_rows
 from atom.utils.decorators import mark_trace
 
 
@@ -64,14 +63,14 @@ class QKNormRopeOut:
       - ``k_rope``   [T, 1, 64]  bf16 — rotated K-PE.
     """
 
-    q_sa: Optional[torch.Tensor] = None
-    kv: Optional[torch.Tensor] = None
-    q_scale: Optional[torch.Tensor] = None
-    kv_scale: Optional[torch.Tensor] = None
-    q_packed: Optional[torch.Tensor] = None
-    q_rope: Optional[torch.Tensor] = None
-    k_packed: Optional[torch.Tensor] = None
-    k_rope: Optional[torch.Tensor] = None
+    q_sa: torch.Tensor | None = None
+    kv: torch.Tensor | None = None
+    q_scale: torch.Tensor | None = None
+    kv_scale: torch.Tensor | None = None
+    q_packed: torch.Tensor | None = None
+    q_rope: torch.Tensor | None = None
+    k_packed: torch.Tensor | None = None
+    k_rope: torch.Tensor | None = None
 
 
 # Lazy-imported flydsl path (optional dependency). Set to None when flydsl
@@ -360,16 +359,11 @@ def _qk_norm_rope_maybe_quant_bf16(
     eps: float,
     quant_q: bool = False,
     quant_k: bool = False,
-    swa_kv: Optional[torch.Tensor] = None,
-    state_slot_mapping: Optional[torch.Tensor] = None,
-    batch_id_per_token: Optional[torch.Tensor] = None,
-    swa_cu_seqlens_q: Optional[torch.Tensor] = None,
-    swa_cache_size: Optional[int] = None,
-    swa_write_per_batch: Optional[int] = None,
-    swa_block_tables: Optional[torch.Tensor] = None,
-    swa_block_size: Optional[int] = None,
+    swa_kv: torch.Tensor | None = None,
+    swa_dest_rows: torch.Tensor | None = None,
+    batch_id_per_token: torch.Tensor | None = None,
     prefix: str = "",
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Fused per-token RMSNorm + GPT-J interleaved RoPE (+ optional FP8 quant).
 
     Args:
@@ -386,23 +380,20 @@ def _qk_norm_rope_maybe_quant_bf16(
         eps: RMSNorm epsilon.
         quant_q, quant_k: independently emit per-row FP8 + per-row fp32 scale.
             ``False`` keeps the bf16 output and returns ``None`` for that scale.
-        swa_kv: ``[num_slots, cache_size, D]`` bf16 SWA ring buffer. When
-            provided, the (bf16) KV row is also written into
-            ``swa_kv[slot, pos % cache_size, :]`` where
-            ``slot = state_slot_mapping[batch_id_per_token[t]]``. The flydsl
-            path fuses this into the qk_norm launch; the Triton fallback emits
-            a separate ``swa_write`` so both backends have identical side
-            effects. Decode-only (prefill writes its SWA tail post-attention).
+        swa_kv: ``[rows, D]`` bf16 — this layer's view of the KV plane. When
+            provided, the (bf16) KV row is also written to
+            ``swa_kv[swa_dest_rows[t]]``. The flydsl path fuses this into the
+            qk_norm launch; the Triton fallback emits a separate
+            ``swa_scatter_rows`` so both backends have identical side effects.
+            Decode-only (prefill writes its window tail post-attention).
             BF16 only (requires ``quant_k=False``).
-        state_slot_mapping: ``[bs]`` int32 — per-seq SWA ring slot. Required
-            when ``swa_kv`` is set.
+        swa_dest_rows: ``[>=T]`` int32 — plane row for each token, built once
+            per forward by ``write_v4_paged_decode_indices``. Required when
+            ``swa_kv`` is set. The row is handed in rather than derived because
+            the window's layout is not something a kernel in another repo
+            should have to restate.
         batch_id_per_token: ``[T]`` int32, ``-1`` on CG-pad tokens — token→seq
-            map for the fused (flydsl) SWA scatter. Required by the flydsl path.
-        swa_cu_seqlens_q: ``[bs+1]`` int — per-seq cumulative seqlens used by
-            the Triton-fallback ``swa_write``. Required only on the fallback
-            path when ``swa_kv`` is set.
-        swa_cache_size: SWA ring slot count (``swa_kv.shape[1]``); fallback only.
-        swa_write_per_batch: ``min(max_seqlen_q, cache_size)``; fallback only.
+            map; padded tokens are skipped.
 
     Returns:
         ``(q_out, kv_out, q_scale_or_None, k_scale_or_None)``:
@@ -468,17 +459,10 @@ def _qk_norm_rope_maybe_quant_bf16(
     # ------------------------------------------------------------------
     if _FLYDSL_AVAILABLE:
         # When swa_kv is provided, the flydsl kernel additionally scatters the
-        # post-norm/rope KV row into swa_kv[slot, pos % cache_size, :] in the
-        # same launch (slot = state_slot_mapping[batch_id_per_token[t]]),
-        # replacing a separate swa_write launch. BF16 only (quant_k off).
-        flydsl_swa_kwargs = {
-            "swa_kv": swa_kv,
-            "batch_id_per_token": batch_id_per_token,
-            "swa_block_tables": swa_block_tables,
-            "swa_block_size": swa_block_size,
-        }
-        if _FLYDSL_ACCEPTS_STATE_SLOT_MAPPING:
-            flydsl_swa_kwargs["state_slot_mapping"] = state_slot_mapping
+        # post-norm/rope KV row into `swa_kv[swa_dest_rows[t]]` in the same
+        # launch, replacing a separate scatter launch. BF16 only (quant_k off).
+        if swa_kv is not None and swa_dest_rows is None:
+            raise ValueError("swa_kv requires swa_dest_rows")
         return flydsl_qk_norm_rope_quant(
             q,
             kv,
@@ -492,7 +476,9 @@ def _qk_norm_rope_maybe_quant_bf16(
             quant=quant_q,
             q_out=q_out,
             kv_out=kv_out,
-            **flydsl_swa_kwargs,
+            swa_kv=swa_kv,
+            swa_dest_rows=swa_dest_rows,
+            batch_id_per_token=batch_id_per_token,
         )
 
     q_scale = (
@@ -566,40 +552,18 @@ def _qk_norm_rope_maybe_quant_bf16(
     # requested it (swa_kv provided) AND supplied the fallback's cu_seqlens_q
     # path args.
     if swa_kv is not None:
-        if swa_cu_seqlens_q is None or swa_write_per_batch is None:
+        if swa_dest_rows is None or batch_id_per_token is None:
             raise ValueError(
-                "swa_kv requested on the Triton fallback path requires "
-                "swa_cu_seqlens_q and swa_write_per_batch"
+                "swa_kv on the Triton fallback path requires swa_dest_rows "
+                "and batch_id_per_token"
             )
-        if swa_block_tables is not None:
-            # paged / content-addressed: same standalone swa_write the caller
-            # would otherwise run, but here so the bridge owns the write on
-            # both backends. block_tables + block_size instead of ring slot.
-            if swa_block_size is None:
-                raise ValueError("paged swa_kv fallback requires swa_block_size")
-            swa_write(
-                kv_out,
-                positions,
-                swa_cu_seqlens_q,
-                swa_block_tables,
-                swa_kv,
-                swa_block_size,
-                swa_write_per_batch,
-                prefix=f"{prefix}.swa_write" if prefix else "",
-            )
-        else:
-            if swa_cache_size is None:
-                raise ValueError("ring swa_kv fallback requires swa_cache_size")
-            swa_write(
-                kv_out,
-                positions,
-                swa_cu_seqlens_q,
-                state_slot_mapping,
-                swa_kv,
-                swa_cache_size,
-                swa_write_per_batch,
-                prefix=f"{prefix}.swa_write" if prefix else "",
-            )
+        swa_scatter_rows(
+            kv_out,
+            swa_dest_rows,
+            batch_id_per_token,
+            swa_kv,
+            prefix=f"{prefix}.swa_scatter_rows" if prefix else "",
+        )
 
     return q_out, kv_out, q_scale, kv_scale
 
@@ -618,19 +582,14 @@ def qk_norm_rope_maybe_quant(
     eps: float,
     quant_q: bool = False,
     quant_k: bool = False,
-    swa_kv: Optional[torch.Tensor] = None,
-    state_slot_mapping: Optional[torch.Tensor] = None,
-    batch_id_per_token: Optional[torch.Tensor] = None,
-    swa_cu_seqlens_q: Optional[torch.Tensor] = None,
-    swa_cache_size: Optional[int] = None,
-    swa_write_per_batch: Optional[int] = None,
-    swa_block_tables: Optional[torch.Tensor] = None,
-    swa_block_size: Optional[int] = None,
+    swa_kv: torch.Tensor | None = None,
+    swa_dest_rows: torch.Tensor | None = None,
+    batch_id_per_token: torch.Tensor | None = None,
     prefix: str = "",
     *,
     fp8_2buff: bool = False,
-    swa_nope_scale_buff: Optional[torch.Tensor] = None,
-    swa_rope_buff: Optional[torch.Tensor] = None,
+    swa_nope_scale_buff: torch.Tensor | None = None,
+    swa_rope_buff: torch.Tensor | None = None,
 ) -> QKNormRopeOut:
     """Per-token RMSNorm + GPT-J RoPE, dispatching on the kv-cache layout.
 
@@ -648,8 +607,8 @@ def qk_norm_rope_maybe_quant(
       weighted KV RMSNorm + GPT-J RoPE + 1x64 e8m0 fp8 group-quant into the
       native 2buff layout (NoPE-fp8 [.,512] + RoPE-bf16 [.,64]) consumed by op4
       (prefill) / op5 (decode) with no requant. The decode path additionally
-      fuses the paged SWA scatter into the same launch via ``swa_nope_scale_buff``
-      / ``swa_rope_buff`` + ``swa_block_tables`` / ``swa_block_size`` /
+      fuses the SWA scatter into the same launch via ``swa_nope_scale_buff``
+      / ``swa_rope_buff`` / ``swa_dest_rows`` /
       ``batch_id_per_token`` (pass ``None`` for prefill, which scatters its
       window tail post-attention). Returns a :class:`QKNormRopeOut` with
       ``q_packed`` / ``q_rope`` / ``k_packed`` / ``k_rope`` populated.
@@ -671,13 +630,8 @@ def qk_norm_rope_maybe_quant(
             quant_q=quant_q,
             quant_k=quant_k,
             swa_kv=swa_kv,
-            state_slot_mapping=state_slot_mapping,
+            swa_dest_rows=swa_dest_rows,
             batch_id_per_token=batch_id_per_token,
-            swa_cu_seqlens_q=swa_cu_seqlens_q,
-            swa_cache_size=swa_cache_size,
-            swa_write_per_batch=swa_write_per_batch,
-            swa_block_tables=swa_block_tables,
-            swa_block_size=swa_block_size,
             prefix=prefix,
         )
         return QKNormRopeOut(q_sa=q_out, kv=kv_out, q_scale=q_scale, kv_scale=kv_scale)
@@ -714,8 +668,11 @@ def qk_norm_rope_maybe_quant(
         scale_dtype="e8m0",
         swa_nope_scale_buff=swa_nope_scale_buff,
         swa_rope_buff=swa_rope_buff,
-        swa_block_tables=swa_block_tables,
-        swa_block_size=swa_block_size,
+        # The destination row per token, precomputed. `swa_dest_row` is what
+        # selects it over the block-table path. The window's own arithmetic
+        # (which entry, which run inside it) stays in `v4_pool_geometry`, so a
+        # layout change never needs this kernel rebuilt.
+        swa_dest_row=swa_dest_rows,
         batch_id_per_token=batch_id_per_token,
     )
     return QKNormRopeOut(
@@ -736,7 +693,7 @@ def qk_norm_rope_maybe_quant_reference(
     eps: float,
     quant_q: bool = False,
     quant_k: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Pure-torch reference. Matches the kernel modulo bf16 reduction-order
     noise. Performs RMSNorm (Q weightless, KV weighted), then a manual GPT-J
     interleaved RoPE on the tail ``rope_head_dim``, then optional per-row
@@ -820,7 +777,7 @@ def qk_norm_rope_maybe_quant_fp8_2buff(
     head_dim: int,
     rope_head_dim: int,
     eps: float,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compile-safe Triton fp8 2buff Q/K: per-head weightless Q RMSNorm +
     weighted KV RMSNorm + GPT-J RoPE (bf16), then per-64-elt-tile e8m0 fp8 quant
     of the NoPE half + 2buff pack (RoPE tail kept bf16).
