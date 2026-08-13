@@ -1270,9 +1270,7 @@ class ModelRunner:
             self.forward_vars["num_accepted_tokens"] = CpuGpuBuffer(
                 self.max_bs, **i32_kwargs
             )
-            # Lives in forward_vars so the PP ring clones it per in-flight slot:
-            # consecutive middle-chunk forwards never sync, so a shared pinned
-            # staging buffer could be rewritten before its own async H2D ran.
+            # Per in-flight slot via forward_vars; PP ring clones it.
             self.forward_vars["draft_next_tokens"] = CpuGpuBuffer(
                 self.max_bs, **i32_kwargs
             )
@@ -2978,10 +2976,8 @@ class ModelRunner:
                 intermediate_tensors = None
                 if pp_enabled and not pp_group.is_first_rank:
                     intermediate_tensors = recv_intermediate_tensors()
-                    # GLM-5.2 IndexShare: if this rank starts inside a shared
-                    # group, load the prior rank's top-k into our scratch buffer
-                    # before the leading shared layers read it. Pop regardless so
-                    # the compiled model only ever sees hidden_states/residual.
+                    # GLM-5.2 IndexShare: load prior rank's top-k for leading
+                    # shared layers. Pop so compiled model sees only hidden_states.
                     recv_sparse = intermediate_tensors.tensors.pop(
                         "sparse_kv_indices", None
                     )
@@ -3003,13 +2999,9 @@ class ModelRunner:
                         input_ids, positions, inputs_embeds=inputs_embeds
                     )
                 if pp_enabled and not pp_group.is_last_rank:
-                    # GLM-5.2 IndexShare: if the next rank starts inside a shared
-                    # group, carry this step's top-k (this rank's last "full"
-                    # layer wrote it) so its leading shared layers can reuse it.
+                    # GLM-5.2 IndexShare: carry top-k for next rank's shared layers.
                     if self._pp_send_needs_sparse:
-                        # num_tokens is the count the indexer actually processed
-                        # (== hidden_states rows); robust under PCP where it is a
-                        # 1/pcp shard, unlike input_ids.shape[0].
+                        # Use hidden_states rows (correct under PCP shard).
                         num_tokens = model_output.tensors["hidden_states"].shape[0]
                         n = num_tokens * self._pp_index_topk
                         model_output.tensors["sparse_kv_indices"] = (
@@ -3027,9 +3019,7 @@ class ModelRunner:
                         model_output = self._restore_pcp_balanced_output(
                             model_output, _pcp_bal_groups, _pcp_size
                         )
-                    # No token is sampled from this chunk, so no logits — but the
-                    # hidden states are real and a spec drafter needs them to write
-                    # its own KV for these prompt tokens.
+                    # Middle chunk: no logits, but drafter needs hidden states.
                     hidden_states = model_output
                     logits = None
                 else:
@@ -3164,10 +3154,7 @@ class ModelRunner:
             num_reject_tokens = self.drafter.mtp_k - num_bonus_tokens
             next_token_locs = num_bonus_tokens
 
-        # The drafter scatters these into its own input and writes the resulting
-        # KV on every rank, so they must agree across TP even when the deferred
-        # readback (which only rank 0 feeds) is off. Sampling is per-rank and
-        # diverges as soon as temperature > 0.
+        # Drafter input must agree across TP ranks.
         if get_tp_group().world_size > 1 and (
             self.tokenID_processor.is_deferred_out or hasattr(self, "drafter")
         ):

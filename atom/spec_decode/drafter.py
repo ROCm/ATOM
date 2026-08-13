@@ -311,11 +311,7 @@ class Drafter(abc.ABC):
         """Scheduler-supplied anchors as an int32 GPU tensor, without blocking.
 
         `-1` entries survive as-is; callers read them as "sampling supplies it".
-
-        Staged through the runner's `forward_vars`, not a buffer of our own, so
-        the PP ring clones it per in-flight slot: the head launches consecutive
-        middle-chunk forwards without a GPU sync, and a shared pinned buffer
-        would be rewritten on the host before its own async H2D ran.
+        Uses ``forward_vars`` so the PP ring clones it per in-flight slot.
         """
         n = len(anchors)
         buf = self.runner.forward_vars["draft_next_tokens"]
@@ -336,17 +332,10 @@ class Drafter(abc.ABC):
         context maintained there covers a chunked prefill's final chunk alone.
 
         `next_token_ids` is the token one position past this forward, per seq:
-        -1 where the scheduler cannot see one (the sequence ends here, so
-        sampling supplies it), None on unlabelled batches. A drafter reading the
-        target's TOKEN stream needs it (it sits one position ahead, so its last
-        row has no token otherwise); one reading hidden states does not.
+        -1 where sampling supplies it, None on unlabelled batches.
 
-        `produces_output` says whether this forward samples, i.e. whether
-        `propose()` will run over it afterwards and redo the same work. A
-        drafter whose absorb step IS that forward should skip it when true; one
-        keeping a rolling window still has to write every row.
-
-        Default is a no-op -- no cross-forward context, nothing to absorb.
+        `produces_output`: True when ``propose()`` will follow; drafters that
+        forward during absorb may skip redundant work.
         """
         return
 

@@ -172,8 +172,7 @@ class CacheStats:
         self._interval_full_tokens: int = 0
         self._interval_compressed_tokens: int = 0
         self._interval_wanted_tokens: int = 0
-        # Set by Scheduler so the interval log can report pool occupancy and the
-        # eviction count that drives cross-turn misses.
+        # Set by Scheduler for pool occupancy logging.
         self.block_manager = None
         self._interval_evicted_base: int = 0
 
@@ -666,20 +665,12 @@ class Scheduler:
         self.mtp_k: int = (
             config.speculative_config.num_speculative_tokens if self.use_spec else 0
         )  # type: ignore
-        # Serial EAGLE/MTP reads the target's token stream and needs the
-        # successor token; DSpark drafts from aux hidden states and ignores it.
-        # Must stay `use_dspark()`, the discriminator `build_drafter` branches
-        # on: `--method mtp` on a checkpoint carrying `dspark_block_size` still
-        # resolves to DSpark, so the method name alone would be wrong here.
+        # EAGLE/MTP needs the successor token; DSpark does not.
         self.drafter_needs_next_token = self.use_spec and not (
             config.speculative_config.use_dspark()
         )
-        # Whether THIS engine verifies drafts in its own decode loop, as opposed
-        # to merely producing them (a disaggregated prefill node drafts for the
-        # decode node and hands the tokens over). Verification needs a
-        # rectangular [bs, mtp_k+1] decode layout, which `prepare_input_ids`
-        # only builds under deferred output, and a ForwardMode that accounts for
-        # spec query tokens — neither exists under pipeline parallelism.
+        # True when this engine both drafts and verifies; False under PP
+        # (which only drafts for handoff to the decode node).
         pp_size = getattr(config, "pipeline_parallel_size", 1)
         self.spec_decode_local = self.use_spec and pp_size == 1
         if self.use_spec and not self.spec_decode_local:
@@ -705,17 +696,8 @@ class Scheduler:
         self._last_pool_log_time = 0.0
 
         self.enable_chunked_prefill = config.enable_chunked_prefill
-        # V4 SWA correctness on a prefix-cache hit is now handled entirely in
-        # BlockManager: `_swa_bounded_hit` bounds the hit so the boundary's
-        # trailing window is SWA-present, and `allocate` marks out-of-window
-        # blocks -1. The old `_v4_swa_warmup_blocks` (re-forward the tail to
-        # repopulate the per-request ring) was a pre-paged-ring workaround and is
-        # removed — the paged content-addressed SWA pool reuses the tail window
-        # directly. See PLAN_swa_prefix_cache_tail_gate.md.
-        # Number of running seqs currently mid-prefill (per-seq state lives in
-        # `Sequence.is_partial_prefill`). Maintained as a counter so Phase 1
-        # of `schedule()` can skip the running-queue scan entirely on
-        # pure-decode steps (the common case).
+        # Running seqs currently mid-prefill; counter lets schedule() skip the
+        # running-queue scan on pure-decode steps.
         self._partial_prefill_count: int = 0
         self._schedule_tick: int = 0
 
@@ -1090,9 +1072,7 @@ class Scheduler:
         self._promote_ready_remote_kv_requests()
         self._park_ready_offload_partial_prefills()
 
-        # Node-agnostic pool/eviction heartbeat: fires on BOTH prefill and decode
-        # (unlike CacheStats, which only logs on prefill admissions), so decode-side
-        # eviction is observable. Time-throttled; gated by the per-req log flag.
+        # Pool occupancy heartbeat (every 30s, gated by per-req log flag).
         if self._log_prefix_cache_per_req and self.block_manager.enable_prefix_caching:
             now = time.time()
             if now - self._last_pool_log_time >= 30.0:
@@ -1388,13 +1368,8 @@ class Scheduler:
                 >= seq.num_prompt_tokens
                 for i, seq in enumerate(scheduled_seqs.values())
             ]
-            # See `ScheduledBatch.next_token_ids`. Only the scheduler can see
-            # past a middle chunk -- the batch carries that chunk's tokens alone.
-            #
-            # Bound on num_tokens, not num_prompt_tokens (which is what
-            # is_final_chunk tests): a preempted sequence re-forwards its
-            # generated tokens too, so its prompt ending mid-batch does not mean
-            # the successor is unknown -- it is the next generated token.
+            # Bound on num_tokens (not num_prompt_tokens): preempted seqs
+            # re-forward generated tokens past the prompt boundary.
             next_token_ids = None
             if self.drafter_needs_next_token:
                 next_token_ids = []
@@ -1431,8 +1406,7 @@ class Scheduler:
         # --- Decode scheduling ---
         num_seqs_decode = 0
         num_decode_tokens = 0
-        # Query width per decode sequence: anchor + drafts when this engine
-        # verifies, anchor alone when it only drafts for handoff.
+        # anchor + drafts if verifying locally, anchor alone otherwise.
         spec_width = self.mtp_k if self.spec_decode_local else 0
         tokens_per_decode_seq = spec_width + 1
         num_new_tokens = spec_width + 1
@@ -1810,9 +1784,7 @@ class Scheduler:
     def _log_prefix_cache_admission(
         self, seq: Sequence, num_cached_blocks: int
     ) -> None:
-        """One line per admitted prefill request: its prefix hit plus the pool
-        state and blocks evicted since the previous admission. Gated by
-        ATOM_LOG_PREFIX_CACHE_PER_REQ (off by default; noisy at high QPS)."""
+        """Per-request prefix hit log (ATOM_LOG_PREFIX_CACHE_PER_REQ)."""
         bs = self.block_manager.block_size
         cached = num_cached_blocks * bs
         prompt = seq.num_tokens
@@ -1972,12 +1944,7 @@ class Scheduler:
             self._pp_inflight_token_block.discard(req_id)
 
     def _batch_seq_lookup(self, seqs: Iterable[Sequence] | None) -> dict[int, Sequence]:
-        """Resolve a batch's sequences without going through ``self.running``.
-
-        A sequence may leave ``running`` between schedule and the deferred
-        hash publish (e.g. parked for KV load), but its blocks still need
-        hashing. Falls back to ``running`` when ``seqs`` is None.
-        """
+        """Look up batch seqs directly; falls back to ``running`` if None."""
         if seqs is not None:
             return {seq.id: seq for seq in seqs}
         return {seq.id: seq for seq in self.running}
@@ -2151,9 +2118,7 @@ class Scheduler:
             if token_logprobs is not None and seq.return_logprobs:
                 token_logprob = token_logprobs.get(seq.id)
 
-            # Use in-place negative-offset writes only when placeholders
-            # exist. Without deferral, placeholders are appended at the end
-            # of postprocess, so fall through to plain appends until then.
+            # In-place overwrite only when placeholders already exist.
             if is_deferred_out or (
                 self.spec_decode_local and seq.num_placeholder_tokens > 0
             ):
@@ -2221,10 +2186,7 @@ class Scheduler:
                 seq._injected_t0 = None
 
             if self.mtp_k > 0 and draft_token_ids is not None:
-                # idx already resolved above via get_idx. draft_token_ids is None
-                # whenever the forward did not reach the drafter — a PP stage that
-                # produced no output, or a step whose batch had nothing to draft
-                # from. Leave the previous drafts in place rather than indexing None.
+                # draft_token_ids is None when the drafter did not run.
                 seq.spec_token_ids = draft_token_ids[idx]
 
             if seq.num_completion_tokens <= 3 and seq.kv_transfer_params:
@@ -2288,14 +2250,8 @@ class Scheduler:
                     )
                     leave_reason = f"stop_{token_ids[stop_at_idx]}"
                 elif (num_tokens - seq.num_prompt_tokens) >= seq.max_tokens:
-                    # Use the local `num_tokens` (= seq.num_tokens - mtp_k -
-                    # num_rejected, set at line 716) instead of the property
-                    # `seq.num_completion_tokens` which still reflects the
-                    # raw mtp_k+1 placeholder bump from `prepare_decode`. The
-                    # property over-counts by `mtp_k + num_rejected`, causing
-                    # max_tokens to trip that many tokens early (visible as
-                    # `output tokens=95` for max_tokens=100, mtp_k=3). Non-MTP
-                    # path: mtp_k = num_rejected = 0 → behavior unchanged.
+                    # Use local num_tokens (pre-placeholder), not the property
+                    # which over-counts by mtp_k + num_rejected.
                     leave_reason = "max_tokens"
 
             # Drop accepted-draft tokens past the stop position (MTP only —
@@ -2317,15 +2273,8 @@ class Scheduler:
                 keep = stop_at_idx + 1 + (1 if injected_t0 is not None else 0)
                 new_tokens = new_tokens[:keep]
 
-            # Publish prefix-cache hashes for generated blocks this step filled.
-            # `num_tokens` is the committed *content* length — placeholders,
-            # rejected drafts and any post-stop tail have all been subtracted
-            # above — but a block may only be hashed once its KV exists, and
-            # the two lines differ by the output mode. Deferred output patches
-            # ids one step late, so every token counted here has already been
-            # through a forward. Undeferred output appends the id the forward
-            # that just ran sampled, and no forward has read that token: its KV
-            # slot is written by the next one.
+            # Hash generated blocks. Deferred output: all tokens forwarded;
+            # undeferred: last token not yet forwarded, so exclude it.
             self.block_manager.hash_decode_blocks(
                 seq,
                 num_tokens - (0 if is_deferred_out else 1),
