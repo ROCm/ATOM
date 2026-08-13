@@ -5,7 +5,7 @@ from collections.abc import Callable
 from copy import copy
 from enum import Enum, auto
 from itertools import count
-from typing import Any, Optional
+from typing import Any
 
 import numpy as np
 
@@ -58,7 +58,7 @@ class Sequence:
         multimodal_data: dict | None = None,
         mrope_positions: np.ndarray | None = None,
         mrope_position_delta: int = 0,
-        data_parallel_rank: Optional[int] = None,
+        data_parallel_rank: int | None = None,
     ):
         # Built here rather than as a default argument: one instance shared by
         # every defaulting Sequence would be a mutable default in all but name.
