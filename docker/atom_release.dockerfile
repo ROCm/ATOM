@@ -256,11 +256,29 @@ assert 'rocm' in torch.__version__, torch.__version__; \
 assert lmcache.c_ops.__file__.endswith('.so'), 'c_ops fell back to python backend!'; \
 print('OK: lmcache', lmcache.__version__, 'HIP c_ops; torch', torch.__version__)"
 
-# ========== SemiAnalysis aiperf agentic benchmark tool ==========
-# Install the SemiAnalysis fork pinned to AgentX v1.0.4, matching the
-# InferenceX MI355X SGLang comparison environment.
+# ========== SemiAnalysis InferenceX / AIPerf agentic tools ==========
+# Keep the result aggregation/dashboard code and its AIPerf submodule pinned
+# to the exact revisions validated by the native ATOM AgentX run.
+ARG INSTALL_SA_INFERENCEX=1
+ARG SA_INFERENCEX_REPO="https://github.com/zhuyuhua-v/InferenceX.git"
+ARG SA_INFERENCEX_REF="yuhua/atom-metrics"
+ARG SA_INFERENCEX_COMMIT="beab2c7b96534768aba6147cd3fb6ea562657fac"
+RUN if [ "${INSTALL_SA_INFERENCEX}" = "1" ]; then \
+        echo "========== [ATOM] Install InferenceX ${SA_INFERENCEX_REF} (${SA_INFERENCEX_COMMIT}) =========="; \
+        rm -rf /opt/InferenceX && \
+        git clone --branch "${SA_INFERENCEX_REF}" --single-branch \
+            "${SA_INFERENCEX_REPO}" /opt/InferenceX && \
+        cd /opt/InferenceX && \
+        git checkout "${SA_INFERENCEX_COMMIT}" && \
+        git submodule update --init -- utils/aiperf && \
+        test "$(git rev-parse HEAD)" = "${SA_INFERENCEX_COMMIT}"; \
+    else \
+        echo "========== Skipped SemiAnalysis InferenceX (INSTALL_SA_INFERENCEX=0) =========="; \
+    fi
+
+# Install the same AIPerf revision as the pinned InferenceX submodule.
 ARG INSTALL_SA_AIPERF=1
-ARG SA_AIPERF_COMMIT="49634d1c6c2e6dcc18979d704a65e7c7064efc49"
+ARG SA_AIPERF_COMMIT="754356e9a39acc6cc6afb242d123bb57c3fb6f75"
 RUN if [ "${INSTALL_SA_AIPERF}" = "1" ]; then \
         echo "========== [ATOM] Install SemiAnalysis aiperf (${SA_AIPERF_COMMIT}) =========="; \
         rm -rf /opt/aiperf && \
