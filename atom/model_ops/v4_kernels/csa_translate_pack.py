@@ -63,6 +63,7 @@ def _csa_translate_pack_kernel(
     skip_prefix_len_per_token_ptr,  # [T] int32 — per-token write offset; ignored when INLINE_SKIP_FROM_POS
     kv_indices_csa_ptr,  # [total_indices] int32 — destination
     mnbps,  # i32 — max blocks per seq, runtime int
+    row_base,  # optional row offset for legacy per-layer proxy pools
     index_topk: tl.constexpr,
     csa_block_capacity: tl.constexpr,
     ENVELOPE_ROWS: tl.constexpr,  # rows one block occupies across all layers
@@ -134,7 +135,7 @@ def _csa_translate_pack_kernel(
     )
     tl.store(
         kv_indices_csa_ptr + write_base + k_offs,
-        compress_row(phys, slot, ENVELOPE_ROWS),
+        row_base + compress_row(phys, slot, ENVELOPE_ROWS),
         mask=in_range,
     )
 
@@ -152,6 +153,7 @@ def csa_translate_pack(
     envelope_rows: int,
     csa_block_capacity: int,
     window_size: int = 0,
+    row_base: int = 0,
     prefix: str = "",
 ) -> None:
     """Fused topk translate + packed write into `kv_indices_csa` (in-place).
@@ -260,6 +262,7 @@ def csa_translate_pack(
         skip_ptr,
         kv_indices_csa,
         mnbps,
+        row_base,
         index_topk=index_topk,
         csa_block_capacity=csa_block_capacity,
         ENVELOPE_ROWS=envelope_rows,
@@ -281,6 +284,7 @@ def csa_translate_pack_reference(
     envelope_rows: int,
     csa_block_capacity: int,
     window_size: int = 0,
+    row_base: int = 0,
 ) -> None:
     """Pure-torch reference. Mirrors the kernel — derives per-token valid_k
     inline from the `kv_indptr_csa` delta minus skip. When `window_size > 0`,
@@ -313,6 +317,6 @@ def csa_translate_pack_reference(
         blk_idx = (topk // csa_block_capacity).clamp(0, mnbps - 1)
         slot = topk % csa_block_capacity
         phys = block_tables[bid, blk_idx].to(torch.int64)
-        rows = phys * envelope_rows + slot
+        rows = row_base + phys * envelope_rows + slot
         for k in range(valid_k):
             kv_indices_csa[base + k] = int(rows[k].item())

@@ -163,6 +163,7 @@ class SGLangGDNForwardContext:
             "non_spec_query_start_loc": fm.query_start_loc,
             "spec_state_indices_tensor": None,
             "non_spec_state_indices_tensor": idx,
+            "non_spec_state_indices_in_tensor": idx,
             "spec_sequence_masks": None,
             "spec_token_indx": None,
             "non_spec_token_indx": None,

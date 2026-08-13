@@ -3170,7 +3170,7 @@ class DeepseekV4Attention(nn.Module):
         # warmup runs before `build_kv_cache_tensor` binds compressor.kv_cache,
         # and this method now fires for both decode and prefill (including
         # warmup batches). Equivalent post-bind: `compressor.kv_cache.size(1)`.
-        csa_block_capacity = _V4_BLOCK_SIZE // 4
+        csa_block_capacity = getattr(attn_md, "csa_block_capacity", _V4_BLOCK_SIZE // 4)
 
         if attn_md.state is AttnState.DECODE:
             kv_indptr = attn_md.kv_indptr_csa
@@ -3200,6 +3200,7 @@ class DeepseekV4Attention(nn.Module):
             envelope_rows=attn_md.envelope_rows,
             csa_block_capacity=csa_block_capacity,
             window_size=window_size,
+            row_base=getattr(attn_md, "compressed_row_base", 0),
             prefix=f"{self.layer_name}.csa_translate_pack",
         )
 

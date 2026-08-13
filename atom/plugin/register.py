@@ -21,6 +21,8 @@ from atom.plugin.prepare import is_rtpllm, is_sglang, is_vllm
 
 logger = logging.getLogger("atom")
 
+_aiter_dist_initialized = False
+
 _ATOM_SUPPORTED_MODELS = {
     "Qwen3ForCausalLM": Qwen3ForCausalLM,
     "Qwen3MoeForCausalLM": Qwen3MoeForCausalLM,
@@ -1059,6 +1061,12 @@ def init_aiter_dist(config: Config) -> None:
     all2all ownership stays within the ATOM+vLLM stack. Falls back to init_dist_env if
     reuse fails.
     """
+    global _aiter_dist_initialized
+
+    if _aiter_dist_initialized:
+        logger.info("Skip aiter dist initialization because it is already initialized")
+        return
+
     logger.info(
         "Initialize aiter dist for using aiter custom collective op for plugin mode"
     )
@@ -1087,6 +1095,7 @@ def init_aiter_dist(config: Config) -> None:
         from atom.plugin.vllm.tp_group_reuse import init_aiter_dist_from_vllm
 
         if init_aiter_dist_from_vllm(tensor_parallel_size):
+            _aiter_dist_initialized = True
             return
 
     # Fallback: create aiter's own groups (vLLM reuse failed or non-vLLM plugin)
@@ -1124,3 +1133,4 @@ def init_aiter_dist(config: Config) -> None:
         data_parallel_rank=config.parallel_config.data_parallel_rank,
         prefill_context_model_parallel_size=config.prefill_context_parallel_size,
     )
+    _aiter_dist_initialized = True

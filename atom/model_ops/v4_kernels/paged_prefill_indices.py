@@ -91,6 +91,7 @@ def _v4_paged_prefill_indices_kernel(
     dense_ring_start,  # per-class window bases; the only terms the boundary moves
     csa_ring_start,
     hca_ring_start,
+    compress_base,  # optional row offset for legacy per-layer proxy pools
     HCA_RATIO: tl.constexpr,  # HCA compress ratio (128) for per-token causal cap
     HCA_ROWS_PER_BLOCK: tl.constexpr,  # HCA rows per block (block_size // HCA_RATIO)
     ENVELOPE_ROWS: tl.constexpr,  # rows one block occupies across all layers
@@ -235,7 +236,7 @@ def _v4_paged_prefill_indices_kernel(
         bt = tl.load(block_tables_ptr + bt_row_base + blk, mask=hca_mask, other=0)
         tl.store(
             prefix_hca_indices_ptr + hca_dst_base + k,
-            compress_row(bt, slot, ENVELOPE_ROWS),
+            compress_base + compress_row(bt, slot, ENVELOPE_ROWS),
             mask=hca_mask,
         )
 
@@ -263,6 +264,7 @@ def write_v4_paged_prefill_indices(
     geometry: UnifiedPoolGeometry,
     hca_ratio: int = 128,
     hca_rows_per_block: int = 1,
+    compress_base: int = 0,
     prefix: str = "",
 ) -> None:
     """One-shot GPU build of the V4 paged-prefill index buffers.
@@ -378,6 +380,7 @@ def write_v4_paged_prefill_indices(
         dense_ring_start=dense.ring_start,
         csa_ring_start=csa.ring_start,
         hca_ring_start=hca.ring_start,
+        compress_base=compress_base,
         HCA_RATIO=hca_ratio,
         HCA_ROWS_PER_BLOCK=hca_rows_per_block,
         ENVELOPE_ROWS=geometry.envelope_rows,
@@ -411,6 +414,7 @@ def write_v4_paged_prefill_indices_reference(
     geometry: UnifiedPoolGeometry,
     hca_ratio: int = 128,
     hca_rows_per_block: int = 1,
+    compress_base: int = 0,
 ) -> None:
     """Pure-Python equivalent of ``write_v4_paged_prefill_indices``.
     Per-token Python loop — slow but readable; used for unit-test bit-exact
@@ -502,5 +506,5 @@ def write_v4_paged_prefill_indices_reference(
             bt = block_tables_cpu[bid, blk].to(device).to(prefix_hca_indices.dtype)
             hca_dst = sb_hca + prefix_swa_count
             prefix_hca_indices[hca_dst : hca_dst + n_hca] = (
-                bt * geometry.envelope_rows + row
+                compress_base + bt * geometry.envelope_rows + row
             )
