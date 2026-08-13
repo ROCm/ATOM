@@ -69,9 +69,35 @@ hidden_for_logits, hidden_for_next_step = model(input_ids, positions, hidden_sta
   otherwise identical to `hidden_for_logits`. This is what the propose loop
   feeds back as `hidden_states` on the next speculative step.
 
-`EagleProposer.propose()` (`atom/spec_decode/eagle.py`) unpacks the tuple via
-`isinstance(model_out, tuple)`, so legacy drafters returning a single tensor
-continue to work without changes.
+`EagleProposer.propose()` (`atom/spec_decode/eagle_proposer.py`) unpacks the
+tuple via `isinstance(model_out, tuple)`, so legacy drafters returning a single
+tensor continue to work without changes.
+
+### `compute_draft_ids`
+
+Every draft model `EagleProposer` can build must also implement:
+
+```python
+def compute_draft_ids(self, hidden_states: torch.Tensor) -> torch.Tensor: ...  # [N] int64
+```
+
+The propose loop calls it once per draft step, unconditionally — there is no
+capability probe, so a draft model missing it raises `AttributeError` mid
+rollout.
+
+Every implementation routes through `ParallelLMHead.compute_argmax_token`: each
+rank reduces its own vocab shard to `(max_val, global_idx)` and only `[N, 2]` is
+all-gathered, instead of the `[N, vocab]` that `compute_logits` would gather.
+This is token-identical to `compute_logits(hidden_states).argmax(-1)` — the
+values compared are the same logits, ties break to the lowest global index, and
+the LM head's prefill last-token slice never fires on this path (`is_draft` is
+set for the whole propose loop; plugin mode skips the slice outright). Models
+whose readout is more than a bare head (`DeepseekV4MTP`'s hc_head + norm, the
+EAGLE 3.1 `norm_output=False` norm) apply that prefix identically in both
+methods.
+
+The DSpark archs are exempt: `DSparkProposer` drafts a whole block per forward
+and never enters this loop.
 
 ## Usage
 

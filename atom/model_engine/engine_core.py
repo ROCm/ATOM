@@ -7,11 +7,12 @@ import queue
 import threading
 import time
 from contextlib import ExitStack
-from typing import List
 
 import torch
 import zmq
+
 from atom.config import Config, ParallelConfig
+from atom.kv_transfer.disaggregation import KVOutputAggregator
 from atom.model_engine.async_proc import AsyncIOProcManager
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import EngineUtilityHandler
@@ -27,8 +28,6 @@ from atom.utils.distributed.utils import (
     stateless_destroy_torch_distributed_process_group,
 )
 
-from atom.kv_transfer.disaggregation import KVOutputAggregator
-
 logger = logging.getLogger("atom")
 
 
@@ -36,7 +35,7 @@ class EngineCore:
     def __init__(self, config: Config, input_address: str, output_address: str):
         self.label = "Engine Core"
         self.input_queue = queue.Queue[Sequence]()
-        self.output_queue = queue.Queue[List[Sequence]]()
+        self.output_queue = queue.Queue[list[Sequence]]()
         self.stream_output_queue = (
             queue.Queue()
         )  # Queue for streaming intermediate outputs
@@ -74,10 +73,10 @@ class EngineCore:
         # Initialize model runner processes
         try:
             good = False
-            # Number of worker processes = full model-parallel world size.
-            # PCP is an independent dimension (world = tp x pcp), so spawn
-            # tp x pcp workers; otherwise init_dist_env (which expects a world
-            # of tp x pcp) would hang waiting for the PCP ranks.
+            # Number of worker processes for THIS EngineCore = one pipeline
+            # stage's slice = tp x pcp. Pipeline parallelism spans *separate*
+            # EngineCores (one per stage, spawned by CoreManager), not extra
+            # workers inside a single EngineCore — so pp does NOT multiply here.
             self.runner_mgr = AsyncIOProcManager(
                 self._finalizer,
                 config.tensor_parallel_size * config.prefill_context_parallel_size,
@@ -87,17 +86,15 @@ class EngineCore:
             self._post_model_load_hook()
             block_info = self.runner_mgr.call_func("get_num_blocks", wait_out=True)
             num_blocks = block_info["num_kvcache_blocks"]
-            config.per_req_cache_equiv_blocks = block_info.get(
-                "per_req_cache_equiv_blocks", 0
-            )
-            config.num_per_req_cache_groups = block_info.get(
-                "num_per_req_cache_groups", 0
-            )
-            # paged-SWA: propagate SWA pool sizing from the runner subprocess
-            # so BlockManager (built in Scheduler below) sees the same value as
-            # the runner's attn builder (else swa_enabled=False vs the SWA pool).
-            config.num_swa_blocks = block_info.get("num_swa_blocks", 0)
-            config.swa_window_size = block_info.get("swa_window_size", 0)
+            # Sizing happens in the runner subprocess, so nothing it wrote to
+            # its own `config` is visible here. Carry the per-class entry table
+            # across; BlockManager (built in Scheduler below) and the
+            # sliding-window pool each look up the class they declared, so
+            # adding an architecture never touches this line.
+            config.pool_entries = block_info.get("pool_entries", {})
+            config.pool_entries_per_req = block_info.get("pool_entries_per_req", {})
+            config.state_transfer_kind = block_info.get("state_transfer_kind", "none")
+            config.state_fork_tokens = block_info.get("state_fork_tokens", 0)
             ret = self.runner_mgr.call_func(
                 "allocate_kv_cache", num_blocks, wait_out=True
             )
@@ -151,7 +148,6 @@ class EngineCore:
         """Called after ModelRunner is initialized (model loaded) but before
         get_num_blocks/allocate_kv_cache.  Override in subclasses to inject
         inter-process synchronization at this point in the init sequence."""
-        pass
 
     def _init_data_parallel(self, config: Config):
         pass
@@ -197,7 +193,14 @@ class EngineCore:
         enable_orphan_reaping()
         engine: EngineCore = None
         try:
-            if config.parallel_config.data_parallel_size > 1:
+            if config.pipeline_parallel_size > 1:
+                from atom.model_engine.pp_engine_core import PPEngineCoreProc
+
+                set_process_title(
+                    f"EngineCore_PP{config.parallel_config.pipeline_parallel_rank}"
+                )
+                engine = PPEngineCoreProc(config, input_address, output_address)
+            elif config.parallel_config.data_parallel_size > 1:
                 set_process_title(
                     f"EngineCore_DP{config.parallel_config.data_parallel_rank}"
                 )

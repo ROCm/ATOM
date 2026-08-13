@@ -1368,6 +1368,7 @@ def sparse_attn_indexer(
     weights_scale: float,
     is_neox_style: bool,
     use_qk_rope_cache_fusion: bool,
+    stable_topk: bool,
 ) -> torch.Tensor:
     topk_indices = torch.empty(
         hidden_states.shape[0],
@@ -1543,6 +1544,7 @@ def sparse_attn_indexer(
                 numRows=chunk_end - chunk_start,
                 stride0=logits.stride(0),
                 stride1=logits.stride(1),
+                stable=stable_topk,
             )
         triton_convert_req_index_to_global_index_dsa_prefill(
             attn_metadata.sparse_cu_seqlens_q,
@@ -1594,6 +1596,7 @@ def sparse_attn_indexer(
             num_rows,
             logits.stride(0),
             logits.stride(1),
+            stable=stable_topk,
         )
         if attn_metadata.max_seqlen_q > 1:
             triton_gather_kv_indices_sparse(
@@ -1641,6 +1644,7 @@ def sparse_attn_indexer_fake(
     weights_scale: float,
     is_neox_style: bool,
     use_qk_rope_cache_fusion: bool,
+    stable_topk: bool,
 ) -> torch.Tensor:
     # profile run
     # NOTE(Chen): create the max possible flattened_kv. So that
@@ -1781,17 +1785,15 @@ class IndexerWkWeightsProjLinear(MergedReplicatedLinear):
         super().weight_loader(param, loaded_weight, loaded_shard_id)
 
     def process_weights_after_loading(self):
-        if self._wk_pending_weight is not None or (
-            self._wk_pending_scale is not None and not self._wk_loaded
-        ):
-            raise RuntimeError(
-                "Incomplete FP8 indexer.wk load: both weight and weight_scale "
-                "are required before building wk_weights_proj."
-            )
         if not self._wk_loaded:
-            raise RuntimeError(
-                "Missing indexer.wk load before building wk_weights_proj."
-            )
+            if self._wk_pending_weight is not None or (
+                self._wk_pending_scale is not None
+            ):
+                raise RuntimeError(
+                    "Incomplete FP8 indexer.wk load: both weight and weight_scale "
+                    "are required before building wk_weights_proj."
+                )
+            return
         super().process_weights_after_loading()
 
 
@@ -1951,6 +1953,14 @@ class Indexer(nn.Module):
         self.max_model_len = atom_config.max_model_len
         self.prefix = prefix
         self.max_total_seq_len = atom_config.max_num_seqs * self.max_model_len
+        # The stable top-k path is only needed to keep GLM-5.2 sparse KV
+        # selection identical across tensor-parallel ranks. TP=1 keeps the
+        # regular path. The MTP draft rewrites model_type to deepseek_mtp but
+        # retains the GLM-only index_share_for_mtp_iteration marker.
+        is_glm52 = getattr(config, "model_type", None) == "glm_moe_dsa" or bool(
+            getattr(config, "index_share_for_mtp_iteration", False)
+        )
+        self.stable_topk = is_glm52 and get_tensor_model_parallel_world_size() > 1
         # register_metadata_builder("indexer_attn_metadata", self.k_cache.get_attn_backend().get_builder_cls())
 
         self.sparse_kv_indices_buffer = torch.empty(0, dtype=torch.int32, device="cuda")
@@ -2088,6 +2098,7 @@ class Indexer(nn.Module):
             self._weights_scale,
             rotary_emb.is_neox_style,
             self.use_qk_rope_cache_fusion and not pcp,
+            self.stable_topk,
         )
 
 

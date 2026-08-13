@@ -11,8 +11,9 @@ KV output aggregator.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # Type aliases
@@ -34,6 +35,16 @@ class KVTransferRegion:
     base_addr: int
     total_bytes: int
     unit_bytes: int  # bytes per block (block-indexed) or per slot (slot-indexed)
+    # Unit `i` sits at `base_addr + total_bytes - (i+1) * unit_bytes` instead of
+    # `base_addr + i * unit_bytes`. A pool that numbers its units back from its
+    # end does so to keep adding one from relocating the rest; the region map
+    # has to know, because both ends compute an address from the same id.
+    reverse_indexed: bool = False
+
+    def unit_addr(self, index: int) -> int:
+        if self.reverse_indexed:
+            return self.base_addr + self.total_bytes - (index + 1) * self.unit_bytes
+        return self.base_addr + index * self.unit_bytes
 
 
 @dataclass
@@ -42,9 +53,9 @@ class KVTransferTensors:
     slot_regions: list[KVTransferRegion]
     num_blocks: int
     num_slots: int = 0
-    # paged-SWA: SWA lives in a SEPARATE pool addressed by seq.swa_block_table
-    # (not the compressed block_table), so these regions are transferred keyed by
-    # swa_block_table — only the live window (last ~128-token block) per request.
+    # The sliding window is a per-request ring, not part of the compressed
+    # block_table, so it gets its own regions keyed by the request's state
+    # slot. `unit_bytes` is one whole ring.
     swa_block_regions: list[KVTransferRegion] = field(default_factory=list)
     staging_region: KVTransferRegion | None = None
     staging_pool_size: int = 0
@@ -118,10 +129,12 @@ class ReqMeta:
     tp_size: int
     remote_dp_size: int
     remote_dp_rank: int = 0
+    remote_pp_size: int = 1
+    remote_tp_size: int = 0
     transfer_id: int = 0
     local_slot_index: int = -1
-    # paged-SWA: parallel block ids into the SEPARATE SWA pool. Empty for
-    # non-V4 backends. -1 entries are window-freed and skipped by the transfer.
+    # The request's SWA ring slot, as a one-element list so it zips with the
+    # region loop like block ids do. Empty for backends with no SWA state.
     local_swa_block_ids: list[int] = field(default_factory=list)
     remote_swa_block_ids: list[int] = field(default_factory=list)
 
@@ -181,6 +194,8 @@ class ConnectorMetadata:
             remote_handshake_port=kv_transfer_params.get("remote_handshake_port"),
             remote_dp_size=kv_transfer_params.get("remote_dp_size", 1),
             remote_dp_rank=kv_transfer_params.get("remote_dp_rank", 0),
+            remote_pp_size=kv_transfer_params.get("remote_pp_size", 1),
+            remote_tp_size=kv_transfer_params.get("remote_tp_size", 0),
             tp_size=(
                 kv_transfer_params.get("tp_size")
                 if "tp_size" in kv_transfer_params

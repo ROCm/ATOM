@@ -185,8 +185,14 @@ Currently, the plugin backend supports the following model architectures:
 | `GptOssForCausalLM` | `atom.models.gpt_oss.GptOssForCausalLM` | GPT-OSS |
 | `DeepseekV3ForCausalLM` | `atom.models.deepseek_v2.DeepseekV3ForCausalLM` | DeepSeek-R1 / DeepSeek V3 / Kimi-K2 style models |
 | `Glm4MoeForCausalLM` | `atom.models.glm4_moe.Glm4MoeForCausalLM` | GLM-4-MoE |
+| `KimiK3ForConditionalGeneration` | `atom.plugin.vllm.models.kimi_k3.KimiK3ForCausalLM` | Kimi-K3 text-only KDA + MLA hybrid MoE |
 
 `Kimi-K2` is also supported. Although it is usually loaded with `--trust-remote-code`, it shares the same DeepSeek-style MLA+MoE architecture path and reuses `atom.models.deepseek_v2.DeepseekV3ForCausalLM` in the ATOM vLLM OOT backend.
+
+Kimi-K3 uses vLLM's hybrid/Mamba cache contract for KDA recurrent state and
+ATOM's MLA backend for full-attention layers. See the
+[Kimi-K3 vLLM recipe](../recipes/atom_vllm/Kimi-K3.md) for its TP8, FLA,
+prefix-caching, and text-only requirements.
 
 ## Installation and quick start
 
@@ -284,7 +290,7 @@ export ATOM_DISABLE_VLLM_PLUGIN=1
 | Variable | Type | Default | Description |
 |---|---|---|---|
 | `ATOM_DISABLE_VLLM_PLUGIN` | bool | `0` (false) | Set to `1` to disable the entire ATOM vLLM plugin (platform + model registration). vLLM runs in pure ROCm mode. |
-| `ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION` | bool | `0` (false) | Enable QK-norm + RoPE + cache + quant fusion in attention. Recommended for Qwen3-MoE models. |
+| `ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION` | bool | `0` (false) | Enable QK-norm + RoPE + cache + quant fusion for Qwen3 dense and MoE models. |
 
 ### Online quantization
 

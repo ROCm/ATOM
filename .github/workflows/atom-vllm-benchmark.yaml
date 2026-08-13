@@ -7,8 +7,8 @@ concurrency:
 
 on:
   schedule:
-    # Daily at 00:30 Beijing (16:30 UTC previous day): run the same model set every day.
-    - cron: '30 16 * * *'
+    # Mon/Wed/Fri at 23:30 Beijing (15:30 UTC).
+    - cron: '30 15 * * 1,3,5'
   workflow_dispatch:
     inputs:
       benchmark_client:

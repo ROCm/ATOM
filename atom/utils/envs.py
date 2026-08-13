@@ -73,8 +73,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FUSED_COMPRESS_USE_FLYDSL": lambda: os.getenv(
         "ATOM_FUSED_COMPRESS_USE_FLYDSL", "auto"
     ).lower(),
-    # QK-norm-rope-cache-quant fusion for Qwen3-MoE; disabled by default.
-    # Enable for Qwen3-MoE to get better performance.
+    # QK-norm-rope-cache-quant fusion for Qwen3 dense and MoE; disabled by default.
     "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION", "0") == "1"
     ),
@@ -89,43 +88,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION", "1") == "1"
-    ),
-    # DeepSeek-V4 paged-SWA: retain the FULL sliding-window KV history in the
-    # content-addressed SWA cache instead of the default window-only prefill
-    # write. Default OFF preserves the window-only optimization (writes only each
-    # prefill chunk's trailing `window` tokens). When ON, swa_write persists the
-    # whole chunk and ensure_for_tokens materializes every block, so cross-request
-    # prefix hits can reuse the middle SWA blocks (agentic branch/replay reuse) —
-    # the live sliding-window free is UNCHANGED (out-of-window refs still released
-    # each chunk/decode; freed blocks stay hash+KV resident until overwritten).
-    # Pairs with a larger SWA pool (swa_pool_num_blocks) so freed-but-cached
-    # blocks survive until replay. Costs ~compressed-pool-magnitude SWA memory.
-    "ATOM_SWA_FULL_RETAIN": lambda: (os.getenv("ATOM_SWA_FULL_RETAIN", "0") == "1"),
-    # DeepSeek-V4 paged-SWA full-retain: fraction of the KV budget given to the
-    # SWA tail pool (the rest goes to the compressed pool). One SWA block is ~7x
-    # the bytes of one compressed block, so a 1:1 mirror starves the compressed
-    # prefix index; a small fraction keeps compressed near full while retaining
-    # the hot-boundary tail working set (LRU-evicted). Only consulted when
-    # ATOM_SWA_FULL_RETAIN=1. Default 0.2; tune 0.15-0.25 with cache-hit
-    # instrumentation. Clamped to (0, 0.9).
-    "ATOM_SWA_TAIL_BUDGET_FRAC": lambda: float(
-        os.getenv("ATOM_SWA_TAIL_BUDGET_FRAC", "0.2")
-    ),
-    # DeepSeek-V4 paged-SWA sparse checkpoint retention (only with
-    # ATOM_SWA_FULL_RETAIN=1). Tokens per retained SWA-tail checkpoint: 0 = dense
-    # (retain every written tail, relies on pool size — floods a small pool);
-    # >0 = keep a tail only once per this-many-tokens segment plus at each prompt
-    # boundary, and PIN those so live-window churn cannot overwrite them (mirrors
-    # vLLM VLLM_PREFIX_CACHE_RETENTION_INTERVAL / SlidingWindowManager sparse
-    # reachable_block_mask). Should be a multiple of the KV block size; 32768
-    # matches the vLLM trace-replay tuning. Default 0 (dense).
-    "ATOM_SWA_RETENTION_INTERVAL": lambda: int(
-        os.getenv("ATOM_SWA_RETENTION_INTERVAL", "0")
-    ),
-    # Fraction of the SWA pool that pinned checkpoint tails may occupy (LRU-capped)
-    # when sparse retention is on; the rest stays free for live-window churn.
-    "ATOM_SWA_CHECKPOINT_FRAC": lambda: float(
-        os.getenv("ATOM_SWA_CHECKPOINT_FRAC", "0.5")
     ),
     # DSA sparse-indexer prefill: KV-dimension chunk size (in tokens) for
     # `fp8_mqa_logits`. The dense logits buffer is [prefill_tokens, total_kv];
@@ -179,6 +141,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # --- Profiling & Logging ---
     "ATOM_TORCH_PROFILER_DIR": lambda: os.getenv("ATOM_TORCH_PROFILER_DIR", None),
+    # "t0,t1,t2" for gc.set_threshold(); empty keeps CPython's default.
+    # See _tune_gc in api_server.py.
+    "ATOM_GC_THRESHOLD": lambda: os.getenv("ATOM_GC_THRESHOLD", "").strip(),
     "ATOM_PROFILER_MORE": lambda: os.getenv("ATOM_PROFILER_MORE", "0") == "1",
     # When profiling is active, append detailed attention aggregates (sqsq, sqsk, sk)
     # to the prefill[]/decode[] trace labels emitted by ModelRunner.run_model.
@@ -200,6 +165,37 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # with that many threads; set to 1 to fall back to the original sequential
     # per-expert path.
     "ATOM_LOADER_NUM_THREADS": lambda: int(os.getenv("ATOM_LOADER_NUM_THREADS", "16")),
+    # Warm the page cache with a background sequential reader instead of
+    # leaving it to demand faults through the mmap. Measured on a local NVMe:
+    # the fault-driven pattern sustains 3.2 GB/s where the device does 6.9 and
+    # a single sequential reader alone reaches 6.06, so the gap is the access
+    # pattern rather than queue depth. On DeepSeek-R1 MXFP4 (350 GiB, TP=4)
+    # this takes a cold load from ~156s to ~68s and leaves the warm case
+    # slightly better too, so it is on by default; turn it off for storage
+    # where a second sequential reader competes with the loader instead of
+    # feeding it.
+    "ATOM_LOADER_PREFETCH": lambda: (
+        os.getenv("ATOM_LOADER_PREFETCH", "true").lower() == "true"
+    ),
+    # Shards read concurrently by the prefetcher. Kept small: the device here
+    # saturates at 2 streams, and every thread also competes with the loader.
+    "ATOM_LOADER_PREFETCH_THREADS": lambda: int(
+        os.getenv("ATOM_LOADER_PREFETCH_THREADS", "4")
+    ),
+    "ATOM_LOADER_PREFETCH_BLOCK_MB": lambda: int(
+        os.getenv("ATOM_LOADER_PREFETCH_BLOCK_MB", "16")
+    ),
+    # Hint the kernel to read each shard ahead. Off by default because it never
+    # paid for itself once measured on its own: the read loop runs far ahead of
+    # the workers, so WILLNEED is issued for the whole checkpoint within
+    # seconds, and asking for 350 GiB of read-ahead is bookkeeping the kernel
+    # largely discards. Cold load 193.0s vs 194.2s -- no effect; warm load
+    # 27.3s vs 42.8s -- 15.5s of pure overhead. Kept as a switch rather than
+    # deleted so the behaviour can be restored on storage that behaves
+    # differently. Ignored when prefetching, which supersedes it.
+    "ATOM_LOADER_FADVISE": lambda: (
+        os.getenv("ATOM_LOADER_FADVISE", "false").lower() == "true"
+    ),
     # Fail loading when the checkpoint does not deliver every routed expert of
     # a fused MoE parameter. On by default: the alternative is a model that
     # loads happily with some expert slots left at their init values, which
@@ -315,7 +311,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ragged_graph_sizes, q_buckets, disable_sps_calib) are no longer env vars.
     # They are configured via --dspark-config (JSON dict) and carried in
     # config.dspark (see atom/config.py DSparkConfig). See
-    # recipes/DeepSeek-V4-DSpark.md.
+    # recipes/DSpark.md.
     # --- PrefillDelayer (cross-DP prefill alignment) ---
     # Master switch; default on. Set "0" to disable construction.
     # The delayer is a prefill COALESCER: it holds back prefill admission under
@@ -409,6 +405,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_CRASH_ON_NUMA_BIND_FAILURE": lambda: (
         os.getenv("ATOM_CRASH_ON_NUMA_BIND_FAILURE", "0") == "1"
     ),
+    # PP-boundary hidden_states/residual are TP-replicated; when on, each rank
+    # sends only its 1/tp_size slice and the receiver all-gathers, cutting PP
+    # link traffic by tp_size. Default on; set "0" for full-tensor sends.
+    "ATOM_PP_SEND_ALLGATHER": lambda: os.getenv("ATOM_PP_SEND_ALLGATHER", "1") == "1",
 }
 
 

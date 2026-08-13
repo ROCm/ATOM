@@ -89,9 +89,17 @@ RUN echo "========== [OOT 4/7] Install vLLM ROCm build dependencies ==========" 
     "${VENV_PYTHON}" -m pip install -r requirements/rocm.txt
 
 RUN echo "========== [OOT 5/7] Build and install amd-smi wheel ==========" && \
-    cd /opt/rocm/share/amd_smi && \
-    pip wheel . --wheel-dir=dist && \
-    pip install dist/*.whl
+    AMD_SMI_SRC=$("${VENV_PYTHON}" -c 'from pathlib import Path; \
+        import sysconfig; \
+        candidates = [Path("/opt/rocm/share/amd_smi"), \
+                      *sorted(Path(sysconfig.get_path("purelib")).glob( \
+                          "_rocm_sdk_*/share/amd_smi"))]; \
+        print(next(path for path in candidates \
+                   if (path / "pyproject.toml").is_file() \
+                   or (path / "setup.py").is_file()))') && \
+    echo "Using amd-smi source: ${AMD_SMI_SRC}" && \
+    "${VENV_PYTHON}" -m pip wheel "${AMD_SMI_SRC}" --wheel-dir=/tmp/amd-smi-wheels && \
+    "${VENV_PYTHON}" -m pip install /tmp/amd-smi-wheels/*.whl
 
 RUN echo "========== [OOT 6/7] Build vLLM wheel ==========" && \
     cd /app/vllm && \

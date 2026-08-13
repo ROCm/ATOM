@@ -41,6 +41,7 @@ ATOM resolves the HuggingFace `architectures` field from a model's `config.json`
 | `GlmMoeDsaForCausalLM` | `atom.models.deepseek_v2` | `GlmMoeDsaForCausalLM` | Yes | Yes | Reuses `DeepseekV2ForCausalLM` — GLM-5 is structurally similar to DeepSeek V3.2 |
 | `Glm4MoeForCausalLM` | `atom.models.glm4_moe` | `Glm4MoeForCausalLM` | Yes | No | GQA, partial RoPE (0.5 factor), QK norm, shared+routed experts, sigmoid scoring, grouped top-k |
 | `Qwen3NextForCausalLM` | `atom.models.qwen3_next` | `Qwen3NextForCausalLM` | Yes | No | Hybrid architecture: full attention + Gated DeltaNet linear attention, GQA, QK norm, FusedMoE |
+| `KimiK3ForConditionalGeneration` | `atom.models.kimi_k3` | `KimiK3ForConditionalGeneration` | Yes | Yes | Hybrid architecture: MLA full attention + KDA linear attention, SiTU activation, MXFP4 latent MoE, MoonViT3d vision tower |
 
 **Note:** `DeepSeekMTP` (`atom.models.deepseek_mtp.DeepSeekMTP`), `Qwen3NextMTP` (`atom.models.qwen3_next_mtp.Qwen3NextMTP`), and `Qwen3_5MTP` (`atom.models.qwen3_5_mtp.Qwen3_5MTP`) are not in the registry — they are used exclusively as speculative draft models and are loaded separately via `EagleProposer`.
 
@@ -50,7 +51,7 @@ ATOM resolves the HuggingFace `architectures` field from a model's `config.json`
 
 - **Architecture:** Dense transformer with Grouped-Query Attention (GQA).
 - **Layer structure:** `Qwen3DecoderLayer` containing `Qwen3Attention` + `Qwen3MLP`.
-- **Attention:** `QKVParallelLinear` for fused QKV projection, per-head QK RMSNorm (`q_norm`, `k_norm`), RoPE, `RowParallelLinear` for output projection.
+- **Attention:** `QKVParallelLinear` for fused QKV projection, per-head QK RMSNorm (`q_norm`, `k_norm`), RoPE, `RowParallelLinear` for output projection. Supports QK norm + RoPE + cache + quant fusion when `ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION` is set.
 - **MLP:** `MergedColumnParallelLinear` for gate+up projection, SiLU activation, `RowParallelLinear` for down projection.
 - **Normalization:** RMSNorm on input and post-attention.
 
@@ -98,7 +99,7 @@ ATOM resolves the HuggingFace `architectures` field from a model's `config.json`
 ### DeepSeek MTP (`DeepSeekMTP`)
 
 - **Architecture:** Multi-Token Prediction draft model for speculative decoding.
-- **Layer structure:** `DeepSeekMultiTokenPredictor` containing one or more `DeepSeekMultiTokenPredictorLayer`, each with `enorm` (embedding norm), `hnorm` (hidden state norm), `eh_proj` (linear projection joining embedded+hidden), `mtp_block` (a `DeepseekV2DecoderLayer`), and a `SharedHead` (norm + LM head).
+- **Layer structure:** `DeepSeekMultiTokenPredictor` containing one or more `DeepSeekMultiTokenPredictorLayer`, each with `enorm` (embedding norm), `hnorm` (hidden state norm), `eh_proj` (linear projection joining embedded+hidden), `mtp_block` (a `DeepseekV2DecoderLayer`), and a `SharedHead` (norm + LM head; the norm runs at the end of the layer's `forward`, see below).
 - **Usage:** Not registered in `support_model_arch_dict`. Loaded separately with `spec_decode=True` in `load_model()`, which invokes `rewrite_spec_layer_name()` to remap MTP weight names (e.g., adding `.mtp_block.` prefix for transformer layer weights, remapping `embed_tokens` to top-level).
 - **MTP layers start** at `config.num_hidden_layers` (i.e., the layer indices following the main model layers).
 
@@ -143,6 +144,15 @@ ATOM resolves the HuggingFace `architectures` field from a model's `config.json`
 - **MoE:** `Qwen3_5SparseMoeBlock` with `FusedMoE`, shared expert fusion support.
 - **Normalization:** RMSNorm with optional fused allreduce for MoE models.
 - **MTP:** Separate draft model in `atom/models/qwen3_5_mtp.py` (`Qwen3_5MTP`). The MTP predictor uses only full attention layers (no Gated DeltaNet) for efficiency, supporting both MTP1 and MTP3 variants via `num_speculative_tokens`.
+
+### Kimi-K3 (`KimiK3ForConditionalGeneration`)
+
+- **Architecture:** Multimodal wrapper around the KimiLinear hybrid MoE backbone. `KimiK3ForConditionalGeneration` holds `language_model` (`KimiLinearForCausalLM`) plus `vision_tower` / `mm_projector`; `KimiK3ForCausalLM` is the text-only base it extends.
+- **Layer structure:** `KimiDecoderLayer` containing either `KimiFullAttention` (MLA math stored in the paged-MHA cache with V padded to `q_head_dim`) or `KimiKDAAttention` (KDA linear attention), plus `KimiSparseMoeBlock` / `KimiMLP`.
+- **KDA Recurrent State:** The KDA layers keep per-request recurrent state in the generic per-request slot pool, like Qwen3-Next's Gated DeltaNet.
+- **MoE:** MXFP4 latent MoE (`KimiSparseMoeBlock`) with SiTU activation and optional dual-stream shared/routed overlap (`ATOM_K3_SHARED_EXPERT_OVERLAP`).
+- **Vision:** `atom/models/kimi_k3_vl.py` implements MoonViT3d — patch embed with a bilinearly resampled learnable position grid, 27 blocks with packed `wqkv` and complex 2D RoPE over non-causal varlen attention, then an `sd2_tpool` 2x2 merge and a `patchmergerv2` projector into the 7168-wide text space. Replicated per TP rank (~0.9 GB bf16), built only on the first pipeline rank.
+- **Image tokens:** The HF processor emits one `<|media_pad|>` per image and expands it inside the model. ATOM instead expands it during input processing (`atom/model_engine/multimodal.py`) so the scheduler, KV blocks and positions see the true prompt length. Multimodal prefills are consequently never chunked.
 
 ### Qwen3.5 MTP (`Qwen3_5MTP`)
 
@@ -358,7 +368,7 @@ Multi-Token Prediction (MTP) models serve as lightweight draft models for specul
 
 **DeepSeekMTP** (`DeepSeekMTP`):
 - Each `DeepSeekMultiTokenPredictorLayer` takes the previous hidden state and the next token's embedding, normalizes both (`enorm`, `hnorm`), concatenates them, and passes through a linear projection (`eh_proj`) followed by a standard `DeepseekV2DecoderLayer`.
-- The `SharedHead` provides per-layer norm + LM head for logit computation (one shared head per MTP layer).
+- The `SharedHead` provides a per-layer norm + LM head (one shared head per MTP layer). The norm is applied at the **end of the layer's `forward`**, not in `compute_logits`: draft step 0 consumes the target's post-final-norm hidden, so steps 1+ must consume the draft's post-final-norm hidden too. `compute_logits` / `compute_draft_ids` therefore take an already-normed input and are a bare head.
 - For FP4 quantized main models, MTP blocks fall back to non-FP4 quantization config to maintain draft model accuracy.
 
 **Qwen3NextMTP** (`Qwen3NextMTP`):
@@ -392,6 +402,8 @@ Multi-Token Prediction (MTP) models serve as lightweight draft models for specul
 | `atom/models/glm4_moe.py` | GLM4-MoE model: `Glm4MoeForCausalLM`, `Glm4MoeModel`, `Glm4MoeDecoderLayer`, `Glm4MoeAttention`, `Glm4MoE`, `Glm4MoeMLP` |
 | `atom/models/qwen3_5.py` | Qwen3.5 model: `Qwen3_5ForConditionalGenerationTextOnly`, `Qwen3_5MoeForConditionalGenerationTextOnly`, `Qwen3_5Model`, `Qwen3_5MoeModel`, `Qwen3_5DecoderLayer`, `Qwen3_5RMSNorm`, `Qwen3_5Attention`, `Qwen3_5GatedDeltaNet`, `Qwen3_5SparseMoeBlock`, `Qwen3_5MLP` |
 | `atom/models/qwen3_next.py` | Qwen3-Next model: `Qwen3NextForCausalLM`, `Qwen3NextModel`, `Qwen3NextDecoderLayer`, `Qwen3NextAttention`, `Qwen3NextGatedDeltaNet`, `Qwen3NextSparseMoeBlock`, `Qwen3NextMLP` |
+| `atom/models/kimi_k3.py` | Kimi-K3 model: `KimiK3ForConditionalGeneration`, `KimiK3ForCausalLM`, `KimiLinearForCausalLM`, `KimiLinearModel`, `KimiDecoderLayer`, `KimiFullAttention`, `KimiKDAAttention`, `KimiSparseMoeBlock`, `KimiMLP` |
+| `atom/models/kimi_k3_vl.py` | Kimi-K3 MoonViT3d vision encoder: `KimiK3VisionTower`, `KimiK3VisionEncoder`, `KimiK3VisionBlock`, `KimiK3PatchEmbed`, `KimiK3PatchMergerProjector`, `build_vision_modules` |
 | `atom/models/qwen3_next_mtp.py` | Qwen3-Next MTP draft model |
 | `atom/models/qwen3_5_mtp.py` | Qwen3.5 MTP draft model: `Qwen3_5MTP`, `Qwen3_5MultiTokenPredictor` |
 | `atom/models/utils.py` | Model utilities: `IntermediateTensors`, `PPMissingLayer`, `make_layers`, `maybe_prefix`, `extract_layer_index` |
