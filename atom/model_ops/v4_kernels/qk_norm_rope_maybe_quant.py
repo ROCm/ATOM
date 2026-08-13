@@ -29,7 +29,6 @@ Designed for the decode path only — prefill (large num_tokens) keeps the
 ops anyway.
 """
 
-import inspect
 from dataclasses import dataclass
 
 import torch
@@ -80,13 +79,8 @@ try:
     from aiter.ops.flydsl import flydsl_qk_norm_rope_quant
 
     _FLYDSL_AVAILABLE = True
-    _FLYDSL_ACCEPTS_STATE_SLOT_MAPPING = (
-        "state_slot_mapping"
-        in inspect.signature(flydsl_qk_norm_rope_quant).parameters
-    )
 except Exception:
     _FLYDSL_AVAILABLE = False
-    _FLYDSL_ACCEPTS_STATE_SLOT_MAPPING = False
 
 
 # AMD MI3 native e4m3 variant. aiter's a8w8 path and the existing
