@@ -121,7 +121,8 @@ def build_page_namespace(
     """Return the stable CacheEngineKey domain for ATOM PAGE bytes."""
 
     if isinstance(layout_version, bool) or not isinstance(layout_version, int):
-        raise TypeError("PAGE layout version must be an integer")
+        # Preserve the public configuration-validation API.
+        raise ValueError("PAGE layout version must be an integer")  # noqa: TRY004
     if layout_version <= 0:
         raise ValueError("PAGE layout version must be positive")
     hf = config.hf_config

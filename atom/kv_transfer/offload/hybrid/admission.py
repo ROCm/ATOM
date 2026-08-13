@@ -12,7 +12,8 @@ from numbers import Integral
 
 def _integer(name: str, value: object) -> int:
     if isinstance(value, bool) or not isinstance(value, Integral):
-        raise TypeError(f"{name} must be an integer")
+        # Admission exposes ValueError for all invalid capacity/id values.
+        raise ValueError(f"{name} must be an integer")  # noqa: TRY004
     return int(value)
 
 

@@ -37,13 +37,17 @@ def encode_send_operation(operation: SendOperationId) -> int:
     req_id = operation.req_id
     generation = operation.generation
     if isinstance(req_id, bool) or not isinstance(req_id, int):
-        raise TypeError("generation-aware request IDs must be integers")
+        # Preserve the wire codec's historical validation contract.
+        raise ValueError(  # noqa: TRY004
+            "generation-aware request IDs must be integers"
+        )
     if req_id < 0 or req_id > _MAX_REQUEST_ID:
         raise ValueError(
             "generation-aware request ID exceeds the 31-bit wire range: " f"{req_id}"
         )
     if isinstance(generation, bool) or not isinstance(generation, int):
-        raise TypeError("send operation generation must be an integer")
+        # Preserve the wire codec's historical validation contract.
+        raise ValueError("send operation generation must be an integer")  # noqa: TRY004
     if generation < 0 or generation > _MAX_GENERATION:
         raise ValueError(
             "send operation generation exceeds the 32-bit wire range: " f"{generation}"
@@ -57,7 +61,8 @@ def decode_send_completion(transfer_id: int) -> int | SendOperationId:
     """Decode a signed-64 wire ID, preserving legacy nonnegative IDs."""
 
     if isinstance(transfer_id, bool) or not isinstance(transfer_id, int):
-        raise TypeError("send completion wire ID must be an integer")
+        # Preserve the wire codec's historical validation contract.
+        raise ValueError("send completion wire ID must be an integer")  # noqa: TRY004
     if transfer_id < _MIN_SIGNED_64 or transfer_id > _MAX_SIGNED_64:
         raise ValueError("send completion wire ID must fit signed 64-bit")
     if transfer_id >= 0:
