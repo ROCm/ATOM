@@ -653,6 +653,41 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
                 "LMCache offload scheduler: lookup client unavailable: %s", e
             )
 
+        self._warn_if_per_req_cache_model(config)
+
+    def _warn_if_per_req_cache_model(self, config) -> None:
+        """Say once, at startup, that this model will decline every KV load.
+
+        `_decide_load_after_alloc` refuses loads for a per-request-cache
+        sequence, which for a hybrid model is every sequence. Without this the
+        operator sees a permanent 0% load rate and reads it as a broken cache
+        rather than a deliberate restriction. Once per server -- the refusal
+        itself is logged per request at DEBUG, and a warning at that position
+        would print on every prefill.
+
+        The model-type set is imported rather than restated so the two cannot
+        drift; the per-sequence check stays on `seq.has_per_req_cache`.
+        """
+        model_type = getattr(getattr(config, "hf_config", None), "model_type", None)
+        if model_type is None:
+            return
+        from atom.model_engine.llm_engine import InputOutputProcessor
+
+        if model_type not in InputOutputProcessor._per_req_cache_model_types():
+            return
+        logger.warning(
+            "LMCache offload: model_type=%s keeps a per-request recurrent "
+            "state (linear/compressor layers) alongside its paged KV. The "
+            "state cannot be restored from a paged-KV load, so loading KV "
+            "past the state boundary would run the linear layers over history "
+            "their state never saw. Every KV LOAD is therefore declined for "
+            "this model and a 0%% load rate is expected; KV SAVES still run "
+            "normally and populate the tier. Set OFFLOAD_STATE to enable the "
+            "state offload tier, which restores both together and lifts the "
+            "restriction.",
+            model_type,
+        )
+
     # -- match: how many extra tokens can come from CPU/NVMe -------------
     def get_num_new_matched_tokens(self, seq) -> tuple[int, bool]:
         if self._lookup_client is None:
@@ -786,6 +821,28 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         ls.hbm_cached_tokens = hbm
         chunk = int(self.chunk_size or 256)
         need = lmc - hbm
+        # A hybrid model (GDN/KDA recurrent state, V4 compressor ring) carries
+        # a per-request state that is the compressed history of exactly
+        # `[0, hbm)` -- `BlockManager.allocate` shrank the HBM hit to a
+        # boundary a state checkpoint covers, so right now the state boundary
+        # and the KV-loaded length agree. Raising the KV-loaded length to `lmc`
+        # breaks that: the scheduler would forward only `[lmc, num_prompt)`,
+        # the linear layers would never see `[hbm, lmc)`, and at hbm == 0 the
+        # freshly recycled state group makes `has_initial_state` True over
+        # another request's leftovers. Silent wrong output, no exception.
+        #
+        # Refusing costs the hybrid nothing it could have had: ATOM runs one
+        # forward over the whole batch, so the linear layers must walk
+        # `[hbm, lmc)` token by token regardless of whether the full-attention
+        # layers' KV is present. The load buys no work saving, only risk.
+        # Saves are untouched -- this request's KV still populates the tier for
+        # a stateless reader.
+        #
+        # Temporary. Task 9c wires the joint park (`state_tier._JointPark`),
+        # after which a hybrid can restore KV and state together and reach a
+        # boundary where the two legitimately agree; this guard goes then.
+        if getattr(seq, "has_per_req_cache", False):
+            return False, "per_req_cache_state_boundary", hbm, lmc, need, chunk
         if lmc <= hbm:
             return False, "hbm_satisfies_after_alloc", hbm, lmc, need, chunk
         if hbm % chunk != 0:

@@ -2030,3 +2030,167 @@ def test_codec_dense_model_segment_list_is_unchanged():
     # 4 segments for layer_0 (K, V, kS, vS) + 2 for layer_1.
     assert len(codec._segments) == 6
     assert codec.bytes_per_block == (2 + 3 + 1 + 1) + (2 + 3)
+
+
+# ── a hybrid model declines the KV load, and says so once ─────────────────
+#
+# The state boundary P (`seq.num_cached_tokens` right after
+# `BlockManager.allocate`) is the only history the recurrent state covers. An
+# LMCache load lands on top with no second state gate and pushes the KV-loaded
+# length L past P; the scheduler then forwards only `[L, num_prompt)`, so the
+# GDN/KDA layers never see `[P, L)`. At P=0 the group was just recycled and
+# `has_initial_state` is True, so the recurrence starts from another request's
+# leftovers. No exception, wrong output. Refusing the load is exactly as
+# useful as clamping it (a load clamped to P transfers nothing) and honest
+# about why.
+
+
+def _hybrid_seq(seq_id, num_prompt, block_table):
+    return SimpleNamespace(
+        id=seq_id,
+        num_prompt_tokens=num_prompt,
+        token_ids=list(range(num_prompt)),
+        num_cached_tokens=0,
+        block_table=list(block_table),
+        has_per_req_cache=True,
+    )
+
+
+def test_per_req_cache_sequence_is_refused_the_offload_load(caplog):
+    sched = _scheduler()
+    sched._min_load_tokens = 8
+    lookup = _LookupClient(hit=12)
+    sched._lookup_client = lookup
+    seq = _hybrid_seq(770, 16, [1, 2, 3, 4])
+
+    need, should_park = sched.get_num_new_matched_tokens(seq)
+    assert need == 12
+    assert should_park is True
+
+    # Exactly the configuration that parks a stateless sequence: hbm=4 is
+    # chunk-aligned and the 8-token gap meets `min_load`.
+    seq.num_cached_tokens = 4
+    sched.update_state_after_alloc(seq)
+
+    with caplog.at_level(logging.DEBUG, logger="atom"):
+        assert sched.should_park_for_load_after_alloc(seq) is False
+
+    assert "per_req_cache_state_boundary" in caplog.text
+    meta = sched.build_connector_meta()
+    assert [req for req in meta.requests if req.load_spec is not None] == []
+    # The KV-loaded length never moves past the state boundary.
+    assert seq.offload_loaded_tokens == 4
+    assert str(seq.id) not in sched._load_specs
+    assert str(seq.id) not in sched._reqs_need_recv
+    # And the request is not left holding a lookup pin.
+    assert lookup.cleared == ["770"]
+
+
+def test_a_stateless_sequence_is_still_admitted():
+    """Paired with the refusal above so a change that turns loads off
+    wholesale fails here rather than looking like a pass."""
+    sched = _scheduler()
+    sched._min_load_tokens = 8
+    sched._lookup_client = _LookupClient(hit=12)
+    seq = SimpleNamespace(
+        id=771,
+        num_prompt_tokens=16,
+        token_ids=list(range(16)),
+        num_cached_tokens=0,
+        block_table=[1, 2, 3, 4],
+        has_per_req_cache=False,
+    )
+
+    assert sched.get_num_new_matched_tokens(seq) == (12, True)
+    seq.num_cached_tokens = 4
+    sched.update_state_after_alloc(seq)
+    assert sched.should_park_for_load_after_alloc(seq) is True
+
+    meta = sched.build_connector_meta()
+    load_reqs = [req for req in meta.requests if req.load_spec is not None]
+    assert len(load_reqs) == 1
+    assert load_reqs[0].load_spec.lmcache_cached_tokens == 12
+
+
+def test_per_req_cache_refusal_also_covers_the_unaligned_handoff_resume():
+    """The handoff path decides through the same `_decide_load_after_alloc`,
+    and must not reach `_maybe_start_unaligned_handoff` either: that branch
+    ends in a load too."""
+    sched = _scheduler()
+    sched._min_load_tokens = 8
+    lookup = _LookupClient(hit=16)
+    sched._lookup_client = lookup
+    seq = _hybrid_seq(772, 20, [1, 2, 3, 4, 5])
+
+    assert sched.get_num_new_matched_tokens(seq) == (16, True)
+
+    # hbm=6 is unaligned; for a stateless seq this starts a handoff.
+    seq.num_cached_tokens = 6
+    sched.update_state_after_alloc(seq)
+    assert sched.should_park_for_load_after_alloc(seq) is False
+    assert str(seq.id) not in sched._handoff_loads
+    assert seq.offload_loaded_tokens == 6
+
+    # Nothing is left pending for the partial-prefill park to pick up.
+    assert sched.should_park_partial_prefill_for_load(seq) is False
+    assert sched.build_connector_meta().requests == []
+
+
+def test_per_req_cache_refusal_holds_in_build_connector_meta():
+    """The third `_decide_load_after_alloc` call site: a LoadSpec that reached
+    `can_load` some other way must still be dropped before it is emitted."""
+    sched = _scheduler()
+    sched._min_load_tokens = 8
+    sched._lookup_client = _LookupClient(hit=12)
+    seq = _hybrid_seq(773, 16, [1, 2, 3, 4])
+
+    sched.get_num_new_matched_tokens(seq)
+    seq.num_cached_tokens = 4
+    sched.update_state_after_alloc(seq)
+    # Force the state `should_park_for_load_after_alloc` would have cleared.
+    sched._load_specs[str(seq.id)].can_load = True
+    sched._reqs_need_recv[str(seq.id)] = seq
+
+    meta = sched.build_connector_meta()
+    assert [req for req in meta.requests if req.load_spec is not None] == []
+
+
+def _warn_config(model_type):
+    """A config complete enough to run the real `__init__`. The lookup client
+    is absent in the test env and its own warning is filtered out below."""
+    return SimpleNamespace(
+        kv_transfer_config={"kv_connector": "lmcache_offload"},
+        kv_cache_block_size=16,
+        tensor_parallel_size=1,
+        hf_config=SimpleNamespace(model_type=model_type),
+    )
+
+
+def _hybrid_warnings(caplog):
+    return [
+        r
+        for r in caplog.records
+        if r.levelno >= logging.WARNING and "per-request recurrent" in r.getMessage()
+    ]
+
+
+def test_hybrid_model_startup_warning_fires_once_and_names_the_model(caplog):
+    # Constructed for real, so the `__init__` call site is covered too: a
+    # warning nothing invokes would pass a direct-call test and warn nobody.
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        LMCacheOffloadConnectorScheduler(_warn_config("qwen3_next"))
+
+    warnings = _hybrid_warnings(caplog)
+    assert len(warnings) == 1  # once per server, not once per request
+    text = warnings[0].getMessage()
+    assert "qwen3_next" in text
+    assert "OFFLOAD_STATE" in text
+    # Saves are unaffected; the user should not read this as "offload is off".
+    assert "SAVES still run" in text
+
+
+def test_dense_model_gets_no_hybrid_startup_warning(caplog):
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        LMCacheOffloadConnectorScheduler(_warn_config("deepseek_v3"))
+
+    assert _hybrid_warnings(caplog) == []
