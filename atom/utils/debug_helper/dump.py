@@ -107,11 +107,20 @@ def _tensor_fields(obj) -> dict:
                 if fields:
                     return fields
         return {}
+    # A plain tensor has no extra fields to report, and walking dir() on one is
+    # actively unsafe: Tensor.imag RAISES for non-complex dtypes, and the
+    # getattr default only swallows AttributeError.
+    if isinstance(obj, torch.Tensor):
+        return {}
     out = {}
     for name in getattr(obj, "__dataclass_fields__", ()) or dir(obj):
         if name.startswith("_"):
             continue
-        val = getattr(obj, name, None)
+        try:
+            val = getattr(obj, name, None)
+        except Exception:
+            # Properties on arbitrary state objects may raise on access.
+            continue
         if isinstance(val, torch.Tensor):
             out[name] = val.detach().cpu()
     return out
