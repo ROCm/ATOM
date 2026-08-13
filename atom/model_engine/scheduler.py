@@ -286,6 +286,7 @@ class ScheduledBatch:
         remote_kv_seq_blocks: dict[int, list[int]] | None = None,
         num_cached_tokens: list[int] | None = None,
         is_final_chunk: list[bool] | None = None,
+        gpu_shared_with_prefill: bool = False,
     ):
         if scheduled_spec_decode_tokens is None:
             scheduled_spec_decode_tokens = {}
@@ -428,6 +429,11 @@ class ScheduledBatch:
         # Key into ModelRunner's stream pool for CU-masked disagg streams.
         # None means full-CU fallback (no mask).
         self.cu_stream_fraction = cu_stream_fraction
+        # Intra-GPU disagg only: True when the prefill process has work in
+        # flight on this GPU, so decode should stop forking side streams that
+        # would contend with it. Always False outside rapidserve, which keeps
+        # every kernel-overlap decision unchanged there.
+        self.gpu_shared_with_prefill = gpu_shared_with_prefill
         # Collect multimodal data from prefill sequences
         self.multimodal_data = {}
         for seq in seqs.values():
@@ -2738,6 +2744,12 @@ class DecodeScheduler(Scheduler):
                 num_spec_step=self.mtp_k,
                 scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
                 cu_stream_fraction=self.cu_fraction,
+                # A seq sits in prefill_waiting from BlockAssignment until
+                # PrefillDone — exactly the window the prefill process is busy
+                # on the shared GPU. Decode-local, so this works in both
+                # constrained and unconstrained mode (the CU shm exists only in
+                # the former).
+                gpu_shared_with_prefill=bool(self.prefill_waiting),
             ),
             scheduled_seqs,
         )
