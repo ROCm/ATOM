@@ -116,9 +116,17 @@ def _is_fp8_dtype(dtype: Any) -> bool:
 
 def _get_gfx_name() -> str | None:
     try:
-        from aiter.jit.utils.chip_info import get_gfx
+        from aiter.jit.utils.chip_info import get_gfx_runtime
 
-        return get_gfx()
+        return get_gfx_runtime()
+    except ImportError:
+        # Compatibility with aiter versions that predate get_gfx_runtime().
+        try:
+            from aiter.jit.utils.chip_info import get_gfx
+
+            return get_gfx()
+        except Exception:  # noqa: BLE001 - optional outside ROCm runtime
+            return None
     except Exception:  # noqa: BLE001 - gfx helper is optional outside ROCm runtime
         return None
 

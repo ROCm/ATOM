@@ -4,6 +4,7 @@ Covers config translation, model dict selection, and framework mode status.
 All tests mock sglang dependencies so they run without sglang installed.
 """
 
+import logging
 import pytest
 import sys
 from unittest.mock import MagicMock, patch
@@ -24,7 +25,14 @@ class _Obj:
             setattr(self, k, v)
 
 
-def _make_fake_server_args(**overrides):
+class _ReadOnlyModelLoaderExtraConfig(_Obj):
+    def __setattr__(self, name, value):
+        if name == "model_loader_extra_config" and hasattr(self, name):
+            raise AttributeError("model_loader_extra_config is read-only")
+        super().__setattr__(name, value)
+
+
+def _make_fake_server_args(server_args_type=_Obj, **overrides):
     """Return a minimal mock of sglang's ServerArgs."""
     defaults = dict(
         model_path="/fake/model",
@@ -55,7 +63,7 @@ def _make_fake_server_args(**overrides):
         trust_remote_code=False,
     )
     defaults.update(overrides)
-    return _Obj(**defaults)
+    return server_args_type(**defaults)
 
 
 class _FakeConfig:
@@ -109,6 +117,19 @@ def _make_sglang_sys_modules(
     }
     if mock_distributed_mod is not None:
         mods["sglang.srt.distributed"] = mock_distributed_mod
+        server_args = mock_server_args_mod.get_global_server_args.return_value
+        tp_size = getattr(server_args, "tp_size", 1)
+        tp_rank = mock_distributed_mod.get_tensor_model_parallel_rank.return_value
+        mock_parallel_state_mod = MagicMock()
+        mock_parallel_state_mod.get_attn_context_model_parallel_rank.return_value = 0
+        mock_parallel_state_mod.get_attn_context_model_parallel_world_size.return_value = (
+            1
+        )
+        mock_parallel_state_mod.get_attn_tensor_model_parallel_rank.return_value = tp_rank
+        mock_parallel_state_mod.get_attn_tensor_model_parallel_world_size.return_value = (
+            tp_size
+        )
+        mods["sglang.srt.distributed.parallel_state"] = mock_parallel_state_mod
     if mock_model_config_mod is not None:
         mods["sglang.srt.configs"] = MagicMock()
         mods["sglang.srt.configs.model_config"] = mock_model_config_mod
@@ -182,7 +203,7 @@ def test_generate_sglang_config_translates_core_fields(monkeypatch):
     assert cfg.model == "/fake/model"
     assert cfg.trust_remote_code is True
     assert cfg.tensor_parallel_size == 4
-    assert cfg.kv_cache_dtype == "fp8_e4m3fn"
+    assert cfg.kv_cache_dtype == "fp8"
     assert cfg.max_model_len == 16384
     assert cfg.max_num_seqs == 128
     assert cfg.enforce_eager is True
@@ -266,6 +287,7 @@ def _run_sglang_config_test(
     server_args_overrides=None,
     distributed_rank=0,
     tp_rank=0,
+    server_args_type=_Obj,
 ):
     """Helper: run _generate_atom_config_from_sglang_config with full mocks.
 
@@ -281,7 +303,9 @@ def _run_sglang_config_test(
         atom_config_module, "CompilationConfig", _FakeCompilationConfig, raising=False
     )
 
-    fake_server_args = _make_fake_server_args(**(server_args_overrides or {}))
+    fake_server_args = _make_fake_server_args(
+        server_args_type=server_args_type, **(server_args_overrides or {})
+    )
 
     mock_sglang_server_args = MagicMock()
     mock_sglang_server_args.get_global_server_args.return_value = fake_server_args
@@ -345,8 +369,8 @@ def test_sglang_config_dp_attention_disabled(monkeypatch):
     assert cfg.plugin_config.sglang_enable_dp_attention is False
 
 
-def test_sglang_config_derives_data_parallel_rank(monkeypatch):
-    """dp_size > 1 should derive ATOM's data_parallel_rank from TP-local rank."""
+def test_sglang_config_keeps_external_data_parallelism_outside_atom(monkeypatch):
+    """Pure-DP workers remain external replicas rather than ATOM DP groups."""
     cfg = _run_sglang_config_test(
         monkeypatch,
         {"tp_size": 8, "dp_size": 2},
@@ -354,12 +378,12 @@ def test_sglang_config_derives_data_parallel_rank(monkeypatch):
         tp_rank=1,
     )
     assert cfg.plugin_config.rank == 5
-    assert cfg.parallel_config.data_parallel_size == 2
+    assert cfg.parallel_config.data_parallel_size == 1
     assert cfg.parallel_config.data_parallel_rank == 0
 
 
-def test_sglang_config_derives_data_parallel_rank_with_higher_tp_rank(monkeypatch):
-    """Higher TP-local ranks should map into the correct DP shard."""
+def test_sglang_config_keeps_higher_tp_rank_outside_atom_dp(monkeypatch):
+    """Higher TP-local ranks do not create an internal ATOM DP group."""
     cfg = _run_sglang_config_test(
         monkeypatch,
         {"tp_size": 8, "dp_size": 2},
@@ -367,14 +391,25 @@ def test_sglang_config_derives_data_parallel_rank_with_higher_tp_rank(monkeypatc
         tp_rank=5,
     )
     assert cfg.plugin_config.rank == 13
-    assert cfg.parallel_config.data_parallel_size == 2
-    assert cfg.parallel_config.data_parallel_rank == 1
+    assert cfg.parallel_config.data_parallel_size == 1
+    assert cfg.parallel_config.data_parallel_rank == 0
 
 
 def test_sglang_config_dist_init_addr_none(monkeypatch):
     """dist_init_addr=None should be stored in plugin_config."""
     cfg = _run_sglang_config_test(monkeypatch, {"dist_init_addr": None})
     assert cfg.plugin_config.sglang_dist_init_addr is None
+
+
+def test_sglang_config_warns_when_server_args_config_is_read_only(
+    monkeypatch, caplog
+):
+    """A read-only SGLang field should not hide the sanitization fallback."""
+    caplog.set_level(logging.WARNING, logger="atom")
+    _run_sglang_config_test(
+        monkeypatch, server_args_type=_ReadOnlyModelLoaderExtraConfig
+    )
+    assert "Unable to update SGLang ServerArgs.model_loader_extra_config" in caplog.text
 
 
 def test_sglang_config_torch_compile_flags(monkeypatch):

@@ -29,6 +29,7 @@ Designed for the decode path only — prefill (large num_tokens) keeps the
 ops anyway.
 """
 
+import inspect
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -80,8 +81,13 @@ try:
     from aiter.ops.flydsl import flydsl_qk_norm_rope_quant
 
     _FLYDSL_AVAILABLE = True
+    _FLYDSL_ACCEPTS_STATE_SLOT_MAPPING = (
+        "state_slot_mapping"
+        in inspect.signature(flydsl_qk_norm_rope_quant).parameters
+    )
 except Exception:
     _FLYDSL_AVAILABLE = False
+    _FLYDSL_ACCEPTS_STATE_SLOT_MAPPING = False
 
 
 # AMD MI3 native e4m3 variant. aiter's a8w8 path and the existing
@@ -465,6 +471,14 @@ def _qk_norm_rope_maybe_quant_bf16(
         # post-norm/rope KV row into swa_kv[slot, pos % cache_size, :] in the
         # same launch (slot = state_slot_mapping[batch_id_per_token[t]]),
         # replacing a separate swa_write launch. BF16 only (quant_k off).
+        flydsl_swa_kwargs = {
+            "swa_kv": swa_kv,
+            "batch_id_per_token": batch_id_per_token,
+            "swa_block_tables": swa_block_tables,
+            "swa_block_size": swa_block_size,
+        }
+        if _FLYDSL_ACCEPTS_STATE_SLOT_MAPPING:
+            flydsl_swa_kwargs["state_slot_mapping"] = state_slot_mapping
         return flydsl_qk_norm_rope_quant(
             q,
             kv,
@@ -478,11 +492,7 @@ def _qk_norm_rope_maybe_quant_bf16(
             quant=quant_q,
             q_out=q_out,
             kv_out=kv_out,
-            swa_kv=swa_kv,
-            state_slot_mapping=state_slot_mapping,
-            batch_id_per_token=batch_id_per_token,
-            swa_block_tables=swa_block_tables,
-            swa_block_size=swa_block_size,
+            **flydsl_swa_kwargs,
         )
 
     q_scale = (

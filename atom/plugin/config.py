@@ -355,16 +355,16 @@ def _generate_atom_config_from_sglang_config(config: Any):
     from sglang.srt.configs.modelopt_config import ModelOptConfig
     from sglang.srt.distributed import get_tensor_model_parallel_rank
     from sglang.srt.distributed.parallel_state import (
-        get_attn_context_model_parallel_rank as get_attention_cp_rank,
+        get_attn_context_model_parallel_rank,
     )
     from sglang.srt.distributed.parallel_state import (
-        get_attn_context_model_parallel_world_size as get_attention_cp_size,
+        get_attn_context_model_parallel_world_size,
     )
     from sglang.srt.distributed.parallel_state import (
-        get_attn_tensor_model_parallel_rank as get_attention_tp_rank,
+        get_attn_tensor_model_parallel_rank,
     )
     from sglang.srt.distributed.parallel_state import (
-        get_attn_tensor_model_parallel_world_size as get_attention_tp_size,
+        get_attn_tensor_model_parallel_world_size,
     )
     from sglang.srt.server_args import (
         ZMQ_TCP_PORT_DELTA,
@@ -401,8 +401,12 @@ def _generate_atom_config_from_sglang_config(config: Any):
     sanitized_model_loader_extra_config = json.dumps(sglang_model_loader_extra_config)
     try:
         server_args.model_loader_extra_config = sanitized_model_loader_extra_config
-    except AttributeError:
-        pass
+    except AttributeError as exc:
+        logger.warning(
+            "Unable to update SGLang ServerArgs.model_loader_extra_config; "
+            "using the sanitized value only for ATOM LoadConfig: %s",
+            exc,
+        )
     hf_overrides = json.loads(
         getattr(server_args, "json_model_override_args", None) or "{}"
     )
@@ -432,10 +436,10 @@ def _generate_atom_config_from_sglang_config(config: Any):
     rank = torch.distributed.get_rank()
 
     tp_rank = get_tensor_model_parallel_rank()
-    attn_cp_size = get_attention_cp_size()
-    attn_cp_rank = get_attention_cp_rank()
-    attn_tp_size = get_attention_tp_size()
-    attn_tp_rank = get_attention_tp_rank()
+    attn_cp_size = get_attn_context_model_parallel_world_size()
+    attn_cp_rank = get_attn_context_model_parallel_rank()
+    attn_tp_size = get_attn_tensor_model_parallel_world_size()
+    attn_tp_rank = get_attn_tensor_model_parallel_rank()
     enable_prefill_cp, prefill_cp_mode = _get_sglang_prefill_cp_config(server_args)
     (
         atom_tensor_parallel_size,
