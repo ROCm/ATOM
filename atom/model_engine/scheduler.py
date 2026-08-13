@@ -1370,14 +1370,17 @@ class Scheduler:
         total_tokens_num_prefill = sum(num_scheduled_tokens)
 
         if num_seqs_prefill > 0:
+            # A cursor, not a hit count: it starts at the prefix-cache hit and
+            # then advances by each finished chunk, so a chunked prompt logs the
+            # same req_id repeatedly with this climbing by the previous `new`.
+            # Logged as "done" so those repeats don't read as a growing hit.
             num_cached_tokens_list = [
                 seq.num_cached_tokens for seq in scheduled_seqs.values()
             ]
-            cached_per_req = [s.num_cached_tokens for s in scheduled_seqs.values()]
             logger.info(
                 f"Scheduled prefill batch: {num_seqs_prefill} reqs, "
                 f"{total_tokens_num_prefill} new tokens "
-                f"(cached: {cached_per_req}, new: {num_scheduled_tokens}), "
+                f"(done: {num_cached_tokens_list}, new: {num_scheduled_tokens}), "
                 f"req_ids: {tuple(scheduled_seqs.keys())}"
             )
             self.prev_prompt = True

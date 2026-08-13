@@ -43,7 +43,11 @@ _FATES = re.compile(
 _STATS = re.compile(
     r"\[Cache Stats\s*\] Reqs: (?P<reqs>\d+), "
     r"Cached/Total: (?P<cached>\d+)/(?P<full>\d+)"
+    r"(?:.*?Lost-to-checkpoint: (?P<lost_ckpt>[\d.]+)%)?"
 )
+# The interval variant repeats the tag with a different label; excluded above by
+# requiring the tag to close right after the padding, so only cumulative counts
+# are read and the last one carries the run.
 
 
 def _pct(num: int, den: int) -> str:
@@ -61,7 +65,11 @@ def analyse(lines) -> dict:
             out["peak_paged_used"] = max(out["peak_paged_used"], g["used"])
             out["peak_state_used"] = max(out["peak_state_used"], g["gused"])
         elif (m := _FATES.search(line)) or (m := _STATS.search(line)):
-            out.update({k: int(v) for k, v in m.groupdict().items()})
+            # Optional groups come back None when absent, and the loss field is
+            # a decimal percentage -- neither survives a blanket int().
+            for k, v in m.groupdict().items():
+                if v is not None:
+                    out[k] = float(v) if "." in v else int(v)
     return out
 
 
@@ -76,6 +84,11 @@ def verdict(a: dict) -> list[str]:
 
     evicted, retired = a.get("evicted", 0), a.get("retired", 0)
     orphaned, cevicted = a.get("orphaned", 0), a.get("cevicted", 0)
+    # `cevicted` counts checkpoints displaced by later checkpoints, which any
+    # run longer than the pool does by construction -- it tracks `kept` minus
+    # the pool size, not shortage. `cdropped` is the one that means a keep was
+    # refused for lack of room, so that is what decides the state verdict.
+    cdropped = a.get("dropped", 0)
     paged_headroom = a["total"] - a["peak_paged_used"]
     state_headroom = a["gtotal"] - a["peak_state_used"]
 
@@ -93,38 +106,48 @@ def verdict(a: dict) -> list[str]:
         ),
         (
             f"evictions: paged {evicted} (+{retired} to boundary moves), "
-            f"checkpoints {cevicted} evicted / {orphaned} orphaned"
+            f"checkpoints {cdropped} refused for room "
+            f"({cevicted} displaced, {orphaned} orphaned)"
         ),
     ]
     if "cached" in a:
         out.append(f"hit rate: {_pct(a['cached'], a['full'])} over {a['reqs']} reqs")
 
     out.append("")
-    if evicted == 0 and cevicted == 0:
+    if evicted == 0 and cdropped == 0:
         out += [
-            "VERDICT: neither pool ever evicted.",
+            "VERDICT: neither pool ever ran out.",
             "  Every miss above is reuse that was absent or declined, not lost.",
             "  Growing either pool cannot raise the hit rate on this workload.",
         ]
-    elif evicted and not cevicted:
+    elif evicted and not cdropped:
         out += [
             "VERDICT: the paged pool is the wall.",
             (
-                f"  It spent {evicted} cached blocks while the state pool "
-                f"peaked at {state_pct} of its groups."
+                f"  It spent {evicted} cached blocks, while the state pool never "
+                f"refused a keep (peak {state_pct} of its groups live)."
             ),
             "  Bytes reserved for state that state never used are the ones to move.",
         ]
-    elif cevicted and not evicted:
+    elif cdropped and not evicted:
         out += [
             "VERDICT: the state pool is the wall.",
-            f"  {cevicted} checkpoints were spent to make room while the paged pool",
-            f"  peaked at {paged_pct}.",
+            f"  {cdropped} checkpoints could not be kept for lack of a free group,",
+            f"  while the paged pool peaked at {paged_pct}.",
         ]
     else:
         out += [
-            "VERDICT: both pools evicted -- the budget is short, not the split.",
-            f"  paged {evicted}, checkpoints {cevicted}.",
+            "VERDICT: both pools ran out -- the budget is short, not the split.",
+            f"  paged evicted {evicted}, checkpoint keeps refused {cdropped}.",
+        ]
+
+    # Whatever the pools did, this bounds the fix: the share of tokens that were
+    # present in KV but unusable because the checkpoint to resume from was gone.
+    if "lost_ckpt" in a:
+        out += [
+            "",
+            f"CEILING: {a['lost_ckpt']}% of tokens were lost to a missing checkpoint.",
+            "  No amount of state-pool growth can buy back more than that.",
         ]
 
     if orphaned:
