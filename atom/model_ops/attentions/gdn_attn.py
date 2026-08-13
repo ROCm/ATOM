@@ -319,16 +319,25 @@ class GDNStateMixin:
 
         Concrete builders splice this into their `sub_pool_specs()` alongside
         whatever paged KV pool they own.
+
+        `--state-checkpoint-groups` buys entries beyond the in-flight floor.
+        Without it a retained checkpoint can only sit in a group `max_num_seqs`
+        left spare, so the room to keep one is set by concurrency rather than
+        by how much reuse the traffic has — the reason a *lower* max_num_seqs
+        measures a *worse* hit rate on prefix-reusing traffic.
         """
         shape_k, shape_v = self._state_shape_for_runner()
         dt_k, dt_v = self._state_dtypes()
         per_layer = (
             math.prod(shape_k) * dt_k.itemsize + math.prod(shape_v) * dt_v.itemsize
         )
+        spr = 1 + self.num_spec
+        extra = max(0, getattr(self.model_runner.config, "state_checkpoint_groups", 0))
         return state_pool(
             STATE_SLOT_CLASS,
             self.model_runner.num_gdn_attn_state * per_layer,
-            entries_per_req=1 + self.num_spec,
+            entries_per_req=spr,
+            extra_entries=extra * spr,
         )
 
     def allocate_per_req_cache(

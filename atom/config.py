@@ -1328,6 +1328,11 @@ class Config:
     #       still place checkpoints
     # See BlockManager.checkpointers_at.
     state_checkpoint_interval_tokens: int = 8192
+    # Per-request state entry sets to size the STATE pool with on top of
+    # max_num_seqs. Checkpoints live in the same pool as running requests, so
+    # at 0 the room to keep one is whatever concurrency leaves over — declaring
+    # it here decouples the two. See `SubPoolSpec.extra_entries`.
+    state_checkpoint_groups: int = 0
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
     max_model_len: int | None = None
