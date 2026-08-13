@@ -20,6 +20,11 @@ from aiter import (
 # import torch.distributed as dist
 from aiter.dist.parallel_state import get_tp_group
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.quant import (
+    MX_SCALE_SHUFFLE_N16K4,
+    MX_SCALE_SHUFFLE_N32K8,
+    mx_scale_shuffle_layout_for_gfx,
+)
 from aiter.tuned_gemm import tgemm
 from aiter.utility import fp4_utils
 from torch import nn
@@ -101,6 +106,27 @@ def divide(numerator, denominator):
         numerator % denominator == 0
     ), f"numerator {numerator} denominator {denominator}"
     return numerator // denominator
+
+
+def mx_scale_shuffle_layout_for_preshuffle_gemm(params_dtype) -> int:
+    """MX scale tiling to preshuffle into, for weights/activations of this dtype.
+
+    Only the fp4x2 preshuffle path below reaches ``gemm_afp4wfp4_preshuffle``,
+    which on gfx1250 dispatches to the gluon kernel and reads the N16K4 tiling
+    (16-row stripes -> one scale row per 16 rows). Everything else -- MXFP8
+    blockscale weights, and every non-gfx1250 arch -- reads the CDNA N32K8
+    tiling (one scale row per 32). Both tilings fill the same buffer, so a
+    mismatch is invisible to shape checks on the producing side; it shows up as
+    the consumer striding 2x and reading past the end.
+    """
+    if (
+        params_dtype == dtypes.fp4x2
+        and use_triton_gemm()
+        and not use_fp4_non_shuffle_triton_gemm()
+        and gemm_afp4wfp4_preshuffle is not None
+    ):
+        return mx_scale_shuffle_layout_for_gfx()
+    return MX_SCALE_SHUFFLE_N32K8
 
 
 def gemm_a4w4_quant_fake(
@@ -186,12 +212,17 @@ def gemm_a4w4_quant(
             dtype=otype,
             device=x.device,
         )
+        scale_layout = mx_scale_shuffle_layout_for_preshuffle_gemm(params_dtype)
+        scale_rows_per = (
+            16 if scale_layout == MX_SCALE_SHUFFLE_N16K4 else MXFP4_QUANT_BLOCK_SIZE
+        )
         if x_scale is None:
             quant_func = get_hip_quant(QuantType.per_1x32)
             x, x_scale = quant_func(
                 x,
                 quant_dtype=params_dtype,
                 shuffle=(m >= MXFP4_QUANT_BLOCK_SIZE),
+                scale_shuffle_layout=scale_layout,
             )
         else:
             x_scale = x_scale.view(torch.float8_e8m0fnu)
@@ -199,9 +230,11 @@ def gemm_a4w4_quant(
 
         if m >= MXFP4_QUANT_BLOCK_SIZE:
             x_scale = x_scale.view(torch.uint8).view(
-                x_scale.shape[0] // MXFP4_QUANT_BLOCK_SIZE, -1
+                x_scale.shape[0] // scale_rows_per, -1
             )
         else:
+            # M < 32 is the un-shuffled (m, K // 32) layout on every arch -- no
+            # tiling involved, so scale_layout does not apply here.
             x_scale = x_scale[:m, ...].view(torch.uint8)
 
         y = gemm_afp4wfp4_preshuffle(
@@ -209,7 +242,7 @@ def gemm_a4w4_quant(
             weight.view(torch.uint8).view(weight.shape[0] // 16, -1),
             x_scale,
             weight_scale.view(torch.uint8).view(
-                weight_scale.shape[0] // MXFP4_QUANT_BLOCK_SIZE, -1
+                weight_scale.shape[0] // scale_rows_per, -1
             ),
             y=y,
         )
@@ -795,11 +828,15 @@ class LinearBase(nn.Module):
                 self.is_output_padded = self._maybe_pad_a8w8_preshuffle_output()
                 shuffle_weights(self.weight)
                 # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
-        # shuffle weight scale once so no reshuffling for every gemm
+        # shuffle weight scale once so no reshuffling for every gemm, in the
+        # tiling the GEMM that will consume it reads.
         if self.quant_type == QuantType.per_1x32 and (
             self.params_dtype != dtypes.fp4x2 or not use_fp4_non_shuffle_triton_gemm()
         ):
-            self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
+            self.weight_scale.data = fp4_utils.e8m0_shuffle(
+                self.weight_scale.data,
+                layout=mx_scale_shuffle_layout_for_preshuffle_gemm(self.params_dtype),
+            )
 
     def _maybe_pad_a8w8_preshuffle_output(self) -> bool:
         if not (
