@@ -187,6 +187,22 @@ class BlockManager:
             for cache in self.state_caches:
                 cache.offload = index
             self.state_offload = index
+            # Say out loud what the README says in writing: today every spill
+            # is pure cost. The load direction has no caller
+            # (`state_pool.STATE_OFFLOAD_LOADS_WIRED` is False), so the D2H,
+            # the staging row and the LMCache capacity buy bytes nothing reads
+            # back. An operator who turned this on expecting a hit rate has no
+            # other way to find out -- the counters show spills climbing and no
+            # resumes, which reads like a tuning problem rather than a
+            # not-implemented one. Drop this warning when loads land.
+            logger.warning(
+                "OFFLOAD_STATE is on: state checkpoints will be spilled to "
+                "LMCache, but the load direction is not wired yet, so nothing "
+                "reads them back. Every spill costs a device-to-host copy, a "
+                "staging row out of the state pool, and LMCache capacity, and "
+                "buys nothing. Leave it off unless you are measuring the spill "
+                "path itself."
+            )
 
         # The demand funnel: recorded at admission, cut for when a prefill
         # chunk is shortened to land on it, kept when the state pool files it.

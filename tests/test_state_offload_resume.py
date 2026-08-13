@@ -301,3 +301,28 @@ def test_a_resumed_request_still_reports_its_prefix_cache_hit(monkeypatch):
 
     assert resumer.num_cached_tokens == boundary, "the boundary was not resumed"
     assert resumer.prefix_cache_hit_tokens == boundary
+
+
+def test_turning_the_tier_on_warns_that_it_is_write_only(monkeypatch, caplog):
+    """An operator must be told the spill buys nothing yet.
+
+    The README says so, but nothing reaches someone who set the env var and is
+    watching counters. Delete this test when the load path lands -- together
+    with the warning it guards.
+    """
+    monkeypatch.setenv("OFFLOAD_STATE", "1")
+    with caplog.at_level("WARNING"):
+        bm = BlockManager(tier_config())
+    assert bm.state_offload is not None
+    assert any(
+        "not wired" in r.message and "OFFLOAD_STATE is on" in r.message
+        for r in caplog.records
+    ), caplog.text
+
+
+def test_the_write_only_warning_is_silent_when_the_tier_is_off(caplog):
+    """The default path stays quiet: no env var, no tier, no warning."""
+    with caplog.at_level("WARNING"):
+        bm = BlockManager(tier_config())
+    assert bm.state_offload is None
+    assert "OFFLOAD_STATE is on" not in caplog.text

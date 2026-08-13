@@ -877,8 +877,16 @@ two things follow from that.
 scans right to left and stops at the first boundary the predicate accepts, so a
 spilled rung nothing can deliver would shadow a shorter checkpoint still
 resident in HBM that the walk-back would have reached — a resume thrown away
-that grows with spill volume. Flipping that one flag is the whole re-widening
-edit when loads land.
+that grows with spill volume.
+
+Flipping that flag is the whole of the *re-widening*, but it is not the whole
+of wiring loads, and it is only correct together with them. At least three
+other things still block: the worker builds its tier with `index=None`
+(`connector.py:265-268`), because `StateOffloadIndex` lives in the engine
+process; nothing puts the `(state_hash, target_group)` pair a load needs on the
+outbound `ScheduledBatch`; and the hybrid guard below refuses the KV leg
+outright. `state_pool.py:30-41` states this correctly and is the comment to
+copy.
 
 `BlockManager._attach_state_group` still **disowns the boundary**
 (`seq.num_cached_tokens = 0`) whenever no HBM group backs a hit hash, so the

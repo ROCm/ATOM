@@ -8,8 +8,8 @@
 1. The two branches of the membership test must query the same integer.
    `StateGroupPool._resumable_from(h)` checks HBM and -- once loads are wired,
    `state_pool.STATE_OFFLOAD_LOADS_WIRED` -- this tier; a chunker-derived key
-   would not be the same thing being looked up, and the whole feature stops
-   being a one-line widening.
+   would not be the same thing being looked up, so the membership test could
+   not be widened to cover both tiers at all.
 2. State has a token range -- `[0, pos)`, which is exactly why it can share
    KV's key -- but its bytes cannot be sliced by token. There is no such thing
    as "the first three chunks hit". Chunking would produce N keys useful only
