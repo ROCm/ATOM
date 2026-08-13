@@ -457,6 +457,23 @@ class StateGroupPool:
         """Schedule an Active Slot relocation for the next batch."""
         self._relocations.append((src, dst))
 
+    def occupancy(self) -> dict[str, int]:
+        """How much of this pool is live, held by checkpoints, or spare.
+
+        Separate from `checkpoint_fates` because those are cumulative events
+        and these are an instantaneous reading. Together they answer whether
+        this pool is under pressure at all: a `groups_held` far below
+        `groups_total` with `checkpoints_evicted` at 0 means it is not, and
+        the bytes reserved for it are the ones the paged pool is missing.
+        """
+        held = sum(1 for g in self._free if self.group_hash[g] != -1)
+        return {
+            "groups_total": self.num_groups,
+            "groups_used": self.num_groups - len(self._free),
+            "groups_held": held,
+            "groups_vacant": len(self._free) - held,
+        }
+
     def take_relocations(self) -> tuple[tuple[int, int], ...]:
         relocations, self._relocations = self._relocations, []
         return tuple(relocations)

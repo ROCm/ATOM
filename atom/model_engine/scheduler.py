@@ -22,6 +22,7 @@ import struct
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 
 import numpy as np
 
@@ -147,6 +148,7 @@ class CacheStats:
         "_interval_requests",
         "_interval_wanted_tokens",
         "_log_interval",
+        "_pool_pressure",
         "total_cached_tokens",
         "total_compressed_tokens",
         "total_full_tokens",
@@ -154,8 +156,16 @@ class CacheStats:
         "total_wanted_tokens",
     )
 
-    def __init__(self, log_interval: int = 100):
+    def __init__(
+        self,
+        log_interval: int = 100,
+        pool_pressure: Callable[[], dict[str, int]] | None = None,
+    ):
         self._log_interval = log_interval
+        # Read at log time rather than passed per update: the free-list scan
+        # behind it is O(free blocks), which is ~10k here and would be paid
+        # once per request for a line printed once per `log_interval`.
+        self._pool_pressure = pool_pressure
         self.total_requests: int = 0
         self.total_cached_tokens: int = 0
         self.total_full_tokens: int = 0
@@ -263,6 +273,46 @@ class CacheStats:
             self.total_compressed_tokens,
             self.total_wanted_tokens,
             self.total_full_tokens,
+        )
+        if self._pool_pressure is not None:
+            self._log_pressure(self._pool_pressure())
+
+    @staticmethod
+    def _log_pressure(p: dict[str, int]) -> None:
+        """The two pools' own account of what they destroyed.
+
+        `full - compressed` in the line above is reuse the paged pool did not
+        have, but it cannot say why — a prompt with no shared prefix and a
+        prefix evicted an hour ago read identically. These counters separate
+        them, and are the only evidence that eviction happened at all:
+        `blocks_evicted == 0` at the end of a run means every miss above was
+        absence of reuse, not loss of it.
+
+        Vacant is called out because it is the leading indicator. Evictions
+        can only begin once it reaches 0, so a run that ends with vacant
+        blocks to spare never had paged pressure whatever its hit rate.
+        """
+        logger.info(
+            "[Pool Pressure] "
+            f"paged: {p['blocks_used']}/{p['blocks_total']} used, "
+            f"{p['blocks_free_reusable']} reusable-free, "
+            f"{p['blocks_free'] - p['blocks_free_reusable']} vacant, "
+            f"{p['blocks_indexed']} indexed | "
+            f"evicted: {p['blocks_evicted']}, retired: {p['blocks_retired']} | "
+            f"state: {p['groups_used']}/{p['groups_total']} used, "
+            f"{p['groups_held']} checkpointed, {p['groups_vacant']} vacant"
+        )
+        # The state pool's own losses, which `blocks_evicted` cannot express:
+        # a checkpoint can die without any block dying (`evicted`, the pool ran
+        # out of groups) or *because* a block died (`orphaned`, the prefix it
+        # was filed under left the KV index first). The pair says which pool to
+        # grow — see `StateGroupPool.__init__` for why they are kept apart.
+        logger.info(
+            "[Checkpoint Fates] "
+            f"kept: {p['checkpoints_kept']}, "
+            f"dropped: {p['checkpoints_dropped']}, "
+            f"evicted: {p['checkpoints_evicted']}, "
+            f"orphaned: {p['checkpoints_orphaned']}"
         )
 
     @classmethod
@@ -685,7 +735,9 @@ class Scheduler:
             SpecStats(mtp_k=self.mtp_k) if self.use_spec else None
         )
         self.cache_stats: CacheStats | None = (
-            CacheStats() if config.enable_prefix_caching else None
+            CacheStats(pool_pressure=self.block_manager.pool_pressure)
+            if config.enable_prefix_caching
+            else None
         )
         # Dashboard counters update only at request lifecycle boundaries.
         self.total_prompt_tokens = 0
