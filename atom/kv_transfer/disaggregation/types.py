@@ -88,7 +88,13 @@ class KVConnectorOutput:
         failed_loading: Request IDs whose local/offload KV load failed.
         state_staging_released: State offload staging slots this worker is done
             reading out of.
-        state_indexed: State checkpoint hashes this worker stored.
+        state_indexed: State checkpoint hashes this worker stored successfully.
+        state_index_failed: State checkpoint hashes this worker failed to store.
+            The aggregator takes quorum on ``state_indexed | state_index_failed``
+            so a partial-store (some ranks succeed, some fail) resolves instead
+            of pinning a key forever.  Hashes that appear here are never emitted
+            on ``state_indexed`` — a load reads all shards back, so a partially-
+            stored hash is unloadable.
         expected_finished_count: How many finished notifications should be
             expected per request (used by the aggregator).
     """
@@ -99,12 +105,13 @@ class KVConnectorOutput:
     finished_saving: set[ReqId] = field(default_factory=set)
     finished_loading: set[ReqId] = field(default_factory=set)
     failed_loading: set[ReqId] = field(default_factory=set)
-    # The state offload tier's two reports. Ints, not ReqIds: a staging slot
+    # The state offload tier's three reports. Ints, not ReqIds: a staging slot
     # and a content hash have no request identity -- the request that was
     # evicted is long gone by the time its bytes land. Additive with empty
     # defaults, so the four connectors that never set them are unaffected.
     state_staging_released: set[int] = field(default_factory=set)
     state_indexed: set[int] = field(default_factory=set)
+    state_index_failed: set[int] = field(default_factory=set)
     expected_finished_count: int = 0
 
     def is_empty(self) -> bool:
@@ -118,6 +125,7 @@ class KVConnectorOutput:
             and not self.failed_loading
             and not self.state_staging_released
             and not self.state_indexed
+            and not self.state_index_failed
         )
 
     def __repr__(self) -> str:
@@ -129,7 +137,8 @@ class KVConnectorOutput:
             f"loading={self.finished_loading}, "
             f"failed_loading={self.failed_loading}, "
             f"state_staging_released={self.state_staging_released}, "
-            f"state_indexed={self.state_indexed})"
+            f"state_indexed={self.state_indexed}, "
+            f"state_index_failed={self.state_index_failed})"
         )
 
 

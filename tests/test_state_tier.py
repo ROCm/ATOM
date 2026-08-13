@@ -30,8 +30,9 @@ def test_a_successful_spill_reports_the_hash():
     t = tier(codec)
     t.submit_spill(11, entry_index=64, staging_slot=0)
     t.drain()
-    indexed, _ = t.take_spill_reports()
+    indexed, _, index_failed = t.take_spill_reports()
     assert indexed == {11}
+    assert index_failed == set()
     # Reported, not applied: the index lives in the engine process.
     assert 11 not in t.index.hashes
 
@@ -60,8 +61,9 @@ def test_a_failed_spill_is_not_reported_as_indexed():
     t.index.confirm_spill(99)  # seed a different hash so the index is non-empty
     t.submit_spill(11, entry_index=64, staging_slot=0)
     t.drain()
-    indexed, _ = t.take_spill_reports()
+    indexed, _, index_failed = t.take_spill_reports()
     assert indexed == set()
+    assert index_failed == {11}
     assert t.index.hashes == {99}  # 11 absent AND 99 untouched
 
 
@@ -80,7 +82,7 @@ def test_a_spill_always_reports_its_staging_slot():
     t.submit_spill(11, entry_index=64, staging_slot=slot0)
     t.submit_spill(22, entry_index=65, staging_slot=slot1)
     t.drain()
-    _, released = t.take_spill_reports()
+    _, released, _ = t.take_spill_reports()
     assert released == {slot0, slot1}
 
 
@@ -191,8 +193,8 @@ def test_a_landed_spill_is_reported_not_applied():
     tier = StateOffloadTier(ReportingCodec(ok=True), index=None)
     tier.submit_spill(11, entry_index=5, staging_slot=1)
     tier.drain()
-    indexed, released = tier.take_spill_reports()
-    assert indexed == {11} and released == {1}
+    indexed, released, index_failed = tier.take_spill_reports()
+    assert indexed == {11} and released == {1} and index_failed == set()
 
 
 def test_a_refused_spill_still_releases_its_slot():
@@ -202,8 +204,8 @@ def test_a_refused_spill_still_releases_its_slot():
     tier = StateOffloadTier(ReportingCodec(ok=False), index=None)
     tier.submit_spill(11, entry_index=5, staging_slot=1)
     tier.drain()
-    indexed, released = tier.take_spill_reports()
-    assert indexed == set() and released == {1}
+    indexed, released, index_failed = tier.take_spill_reports()
+    assert indexed == set() and released == {1} and index_failed == {11}
 
 
 def test_a_throwing_codec_still_releases_its_slot():
@@ -214,8 +216,8 @@ def test_a_throwing_codec_still_releases_its_slot():
     tier = StateOffloadTier(Boom(), index=None)
     tier.submit_spill(11, entry_index=5, staging_slot=1)
     tier.drain()
-    indexed, released = tier.take_spill_reports()
-    assert indexed == set() and released == {1}
+    indexed, released, index_failed = tier.take_spill_reports()
+    assert indexed == set() and released == {1} and index_failed == {11}
 
 
 def test_reports_are_drained_once():
@@ -223,7 +225,7 @@ def test_reports_are_drained_once():
     tier.submit_spill(11, entry_index=5, staging_slot=1)
     tier.drain()
     tier.take_spill_reports()
-    assert tier.take_spill_reports() == (set(), set())
+    assert tier.take_spill_reports() == (set(), set(), set())
 
 
 def test_the_ready_event_is_waited_on_before_the_pack():
@@ -244,3 +246,64 @@ def test_the_ready_event_is_waited_on_before_the_pack():
     tier.submit_spill(11, entry_index=5, staging_slot=1, ready_event=ev)
     tier.drain()
     assert ev.synchronized, "spill packed without waiting on the producer event"
+
+
+# --------------------------------------------------------------------------- #
+# Task-9i: partial-store failure channel                                        #
+# --------------------------------------------------------------------------- #
+# The tier must report failures so the aggregator can take quorum on the union
+# of stored and failed sets.  Without this channel, a hash where one rank's put
+# fails sits in the aggregator forever (pinned with one worker in its set,
+# never reaching world_size).
+
+
+def test_failed_put_returns_false_lands_hash_in_index_failed():
+    """A codec whose `put` returns False reports the hash in index_failed.
+
+    Non-vacuousness: remove the `else: self._index_failed.add(int(h))` branch
+    from _do_spill and this test fails because index_failed is empty.
+    """
+    tier = StateOffloadTier(ReportingCodec(ok=False), index=None)
+    tier.submit_spill(11, entry_index=5, staging_slot=1)
+    tier.drain()
+    indexed, released, index_failed = tier.take_spill_reports()
+    assert indexed == set(), "a failed store must not appear as indexed"
+    assert index_failed == {11}, "hash must appear in index_failed on put=False"
+    assert released == {1}, "slot must be released regardless"
+
+
+def test_raising_codec_lands_hash_in_index_failed():
+    """A codec whose `put` raises reports the hash in index_failed.
+
+    Non-vacuousness: remove the `else` branch and this test fails because
+    index_failed is empty even though the exception path ran.
+    """
+
+    class RaisingCodec:
+        def put(self, h, entry_index):
+            raise OSError("storage unavailable")
+
+    tier = StateOffloadTier(RaisingCodec(), index=None)
+    tier.submit_spill(22, entry_index=7, staging_slot=3)
+    tier.drain()
+    indexed, released, index_failed = tier.take_spill_reports()
+    assert indexed == set()
+    assert index_failed == {22}
+    assert released == {3}
+
+
+def test_state_staging_released_unconditional_on_failed_spill():
+    """Slots must be released even when the spill fails.
+
+    This is the load-bearing invariant from the brief: a leaked slot shrinks
+    the staging ring permanently and the feature quietly stops spilling.
+
+    Non-vacuousness: condition the `_released.add` on `stored` and this test
+    fails because released is empty after a put=False run.
+    """
+    tier = StateOffloadTier(ReportingCodec(ok=False), index=None)
+    for slot in range(4):
+        tier.submit_spill(slot, entry_index=slot, staging_slot=slot)
+    tier.drain()
+    _, released, _ = tier.take_spill_reports()
+    assert released == {0, 1, 2, 3}, "all slots must be released even on failure"

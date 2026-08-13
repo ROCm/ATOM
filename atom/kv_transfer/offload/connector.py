@@ -566,10 +566,10 @@ class LMCacheOffloadConnector(KVConnectorBase):
             self._failed_load.clear()
         # The state tier's reports: not request-keyed, because the request that
         # owned a spilled checkpoint is gone by the time its bytes land.
-        indexed, released = (
+        indexed, released, index_failed = (
             self._state_tier.take_spill_reports()
             if self._state_tier is not None
-            else (set(), set())
+            else (set(), set(), set())
         )
         return KVConnectorOutput(
             finished_sending=set(),
@@ -578,6 +578,7 @@ class LMCacheOffloadConnector(KVConnectorBase):
             finished_saving=ds,
             state_indexed=indexed,
             state_staging_released=released,
+            state_index_failed=index_failed,
         )
 
     def get_finished_recv_blocks(self) -> list[int]:

@@ -156,6 +156,112 @@ class TestReset:
         assert agg.pending_count == (0, 0)
 
 
+class TestStateIndexedAggregation:
+    """Tests for the state-indexed / state-index-failed union-quorum logic.
+
+    I3 finding from Task 9b, promoted to Important: when one rank's codec.put
+    fails and another's succeeds the hash sat in _seen_state_indexed forever
+    because the failure was never reported, so quorum could never be reached.
+    """
+
+    def test_partial_store_emits_nothing_and_leaves_no_stale_key(self):
+        """Leak test: rank 0 stored, rank 1 failed → nothing emitted, both
+        internal dicts empty.
+
+        Non-vacuousness: before the fix, _seen_state_indexed retained {9: {0}}
+        forever. Remove the _seen_state_index_failed tracking from aggregate()
+        and this test fails because the dicts are not empty.
+        """
+        agg = KVOutputAggregator(world_size=2)
+        result = agg.aggregate(
+            [
+                KVConnectorOutput(state_indexed={9}),
+                KVConnectorOutput(state_index_failed={9}),
+            ]
+        )
+        # Nothing must be emitted for a partially-stored hash (unloadable).
+        assert result.state_indexed == set()
+        # Both internal tracking dicts must be cleared — no stale key pinned.
+        assert agg._seen_state_indexed == {}
+        assert agg._seen_state_index_failed == {}
+
+    def test_two_step_straddle_still_emits(self):
+        """Guard against the wrong fix: cross-step spills must still resolve.
+
+        Spills run on per-rank ThreadPoolExecutors; rank 0's completion can
+        land in step 1 while rank 1's lands in step 2. Dropping non-quorum
+        keys at end-of-step would destroy this valid pending spill.
+
+        Non-vacuousness: an 'end-of-step prune' fix would empty _seen_state_indexed
+        after step 1, so step 2 would see an empty dict and emit nothing. This
+        test catches that regression by asserting the hash IS emitted at step 2.
+        """
+        agg = KVOutputAggregator(world_size=2)
+
+        # Step 1: only rank 0 reports.
+        result1 = agg.aggregate(
+            [
+                KVConnectorOutput(state_indexed={7}),
+                KVConnectorOutput(),
+            ]
+        )
+        assert result1.state_indexed == set(), "must not emit after one rank"
+        assert 7 in agg._seen_state_indexed, "key must be retained for step 2"
+
+        # Step 2: rank 1 reports.
+        result2 = agg.aggregate(
+            [
+                KVConnectorOutput(),
+                KVConnectorOutput(state_indexed={7}),
+            ]
+        )
+        assert result2.state_indexed == {7}, "must emit once both ranks reported"
+        assert agg._seen_state_indexed == {}
+
+    def test_all_ranks_stored_emits(self):
+        """Happy path: all ranks succeed → hash emitted on state_indexed."""
+        agg = KVOutputAggregator(world_size=3)
+        result = agg.aggregate(
+            [KVConnectorOutput(state_indexed={42}) for _ in range(3)]
+        )
+        assert result.state_indexed == {42}
+        assert agg._seen_state_indexed == {}
+        assert agg._seen_state_index_failed == {}
+
+    def test_all_ranks_failed_emits_nothing_and_clears(self):
+        """All ranks failed → hash dropped, nothing emitted, dicts cleared."""
+        agg = KVOutputAggregator(world_size=2)
+        result = agg.aggregate(
+            [KVConnectorOutput(state_index_failed={5}) for _ in range(2)]
+        )
+        assert result.state_indexed == set()
+        assert agg._seen_state_indexed == {}
+        assert agg._seen_state_index_failed == {}
+
+    def test_state_index_failed_included_in_is_empty(self):
+        """is_empty() must reflect the new field."""
+        assert KVConnectorOutput().is_empty()
+        assert not KVConnectorOutput(state_index_failed={1}).is_empty()
+
+    def test_state_index_failed_included_in_repr(self):
+        """__repr__ must include the new field so log messages are complete."""
+        r = repr(KVConnectorOutput(state_index_failed={3}))
+        assert "state_index_failed" in r
+
+    def test_reset_clears_state_index_failed(self):
+        """reset() must clear _seen_state_index_failed alongside the others."""
+        agg = KVOutputAggregator(world_size=2)
+        agg.aggregate(
+            [
+                KVConnectorOutput(state_index_failed={99}),
+                KVConnectorOutput(),
+            ]
+        )
+        assert agg._seen_state_index_failed  # non-empty before reset
+        agg.reset()
+        assert agg._seen_state_index_failed == {}
+
+
 class TestKVConnectorOutput:
     def test_defaults(self):
         out = KVConnectorOutput()

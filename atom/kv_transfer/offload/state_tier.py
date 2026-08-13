@@ -32,8 +32,9 @@ class StateOffloadTier:
         self._done: set[str] = set()
         self._failed: set[str] = set()
         self._inflight: set = set()
-        # The spill path's two reports, drained by `take_spill_reports`.
+        # The spill path's three reports, drained by `take_spill_reports`.
         self._indexed: set[int] = set()
+        self._index_failed: set[int] = set()
         self._released: set[int] = set()
 
     def _register(self, fut) -> None:
@@ -108,17 +109,32 @@ class StateOffloadTier:
             # these via KVConnectorOutput.
             if stored:
                 self._indexed.add(int(h))
+            else:
+                # The failure channel lets the aggregator take quorum on
+                # `indexed | index_failed` instead of waiting for a second
+                # report that will never come from this rank.
+                self._index_failed.add(int(h))
             # Always, stored or not: a leaked slot shrinks the ring
             # permanently and the feature quietly stops spilling.
             self._released.add(int(staging_slot))
 
-    def take_spill_reports(self) -> tuple[set[int], set[int]]:
-        """`(hashes stored, staging slots free)` since the last call."""
+    def take_spill_reports(self) -> tuple[set[int], set[int], set[int]]:
+        """`(hashes stored, staging slots free, hashes failed)` since the last call.
+
+        A hash appears in exactly one of the first or third set per spill: in
+        ``hashes stored`` if ``codec.put`` returned truthy, in ``hashes failed``
+        otherwise (including exceptions).  The aggregator unions these two sets
+        to take quorum, so a partial-store (some ranks stored, some failed)
+        resolves in the same step rather than pinning the key forever.
+        """
         with self._lock:
-            indexed, released = set(self._indexed), set(self._released)
+            indexed = set(self._indexed)
+            index_failed = set(self._index_failed)
+            released = set(self._released)
             self._indexed.clear()
+            self._index_failed.clear()
             self._released.clear()
-        return indexed, released
+        return indexed, released, index_failed
 
     def _do_load(self, req_id: str, h: int, group: int) -> None:
         # A load target is a real pool group, not a staging entry: the bytes

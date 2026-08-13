@@ -274,6 +274,7 @@ class MultiConnector(KVConnectorBase):
         save_now: list = []
         state_released: set = set()
         state_indexed: set = set()
+        state_index_failed: set = set()
         for c in self._connectors:
             o = _normalize_finished(c.get_finished())
             recv |= o.finished_recving
@@ -282,14 +283,15 @@ class MultiConnector(KVConnectorBase):
             load_failed |= o.failed_loading
             send_now.extend(o.finished_sending)
             save_now.extend(o.finished_saving)
-            # The state tier's two reports. Unioned like the load/recv sets and
-            # unlike send/save: there is no pairing to withhold them for -- a
-            # staging slot and a content hash have no request identity, so no
+            # The state tier's three reports. Unioned like the load/recv sets
+            # and unlike send/save: there is no pairing to withhold them for --
+            # a staging slot and a content hash have no request identity, so no
             # sub-connector's transfer is reading the blocks they name. Dropping
             # them here would leak the slot with no way to ever get it back,
             # since only this report frees it.
             state_released |= o.state_staging_released
             state_indexed |= o.state_indexed
+            state_index_failed |= o.state_index_failed
 
         out = KVConnectorOutput(
             finished_recving=recv,
@@ -298,6 +300,7 @@ class MultiConnector(KVConnectorBase):
             failed_loading=load_failed,
             state_staging_released=state_released,
             state_indexed=state_indexed,
+            state_index_failed=state_index_failed,
         )
 
         if not self.is_producer:
