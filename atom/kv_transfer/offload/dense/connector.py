@@ -36,13 +36,11 @@ from atom.kv_transfer.disaggregation.base import (
 )
 from atom.kv_transfer.disaggregation.types import LoadOperationId
 from atom.kv_transfer.offload import config as offcfg
+from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
 from atom.kv_transfer.offload._offload_common import (
     OffloadWorkerMixin,
     build_offload_engine,
     validated_kv_role,
-)
-from atom.kv_transfer.offload.dense.gpu_connector import (
-    DenseGPUConnector,
 )
 from atom.kv_transfer.offload.dense.kv_byte_codec import DenseKVByteCodec
 from atom.kv_transfer.offload.metadata import (
@@ -98,7 +96,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             engine_id=f"atom-offload-{rank}",
             block_size=self.virtual_block_size,
             bytes_per_block=self._codec.bytes_per_block,
-            gpu_connector_factory=lambda cfg, meta: DenseGPUConnector(
+            gpu_connector_factory=lambda cfg, meta: BlockGPUConnector(
                 self._codec,
                 self.block_size,
                 chunk_size=int(cfg.chunk_size),

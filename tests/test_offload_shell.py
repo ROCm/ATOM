@@ -18,9 +18,9 @@ from atom.kv_transfer.offload.dense.connector import (
     DenseOffloadConnector,
     DenseOffloadScheduler,
 )
-from atom.kv_transfer.offload.hybrid.connector import (
-    HybridOffloadConnector,
-    HybridOffloadScheduler,
+from atom.kv_transfer.offload.hybrid.dsv4.connector import (
+    DSV4OffloadConnector,
+    DSV4OffloadScheduler,
 )
 
 
@@ -59,7 +59,7 @@ def test_worker_shell_selects_family():
     hybrid = LMCacheOffloadConnector(_config(compress_ratios=[4]))
     dense = LMCacheOffloadConnector(_config(compress_ratios=None))
 
-    assert isinstance(hybrid._impl, HybridOffloadConnector)
+    assert isinstance(hybrid._impl, DSV4OffloadConnector)
     assert isinstance(dense._impl, DenseOffloadConnector)
 
 
@@ -73,7 +73,7 @@ def test_scheduler_shell_selects_family(monkeypatch):
     hybrid = LMCacheOffloadConnectorScheduler(_config(compress_ratios=[4]))
     dense = LMCacheOffloadConnectorScheduler(_config(compress_ratios=None))
 
-    assert isinstance(hybrid._impl, HybridOffloadScheduler)
+    assert isinstance(hybrid._impl, DSV4OffloadScheduler)
     assert isinstance(dense._impl, DenseOffloadScheduler)
     assert hybrid.is_offload and not hybrid.is_producer
     assert hybrid.recap_prefill_after_finalize is True

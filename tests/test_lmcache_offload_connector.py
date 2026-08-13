@@ -33,22 +33,20 @@ from atom.kv_transfer.disaggregation.types import (
     connector_metadata_has_work,
 )
 from atom.kv_transfer.offload import config as offcfg
+from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
 from atom.kv_transfer.offload.dense.connector import DenseOffloadConnector
-from atom.kv_transfer.offload.dense.gpu_connector import (
-    DenseGPUConnector,
-)
 from atom.kv_transfer.offload.dense.kv_byte_codec import (
     DenseKVByteCodec,
 )
-from atom.kv_transfer.offload.hybrid import policy as connector_module
-from atom.kv_transfer.offload.hybrid.connector import (
-    HybridOffloadConnector as LMCacheOffloadConnector,
-)
-from atom.kv_transfer.offload.hybrid.connector import (
-    HybridOffloadScheduler as LMCacheOffloadConnectorScheduler,
-)
+from atom.kv_transfer.offload.hybrid.dsv4 import policy as connector_module
 from atom.kv_transfer.offload.hybrid.dsv4.codec import DSV4PageSlotCodec
-from atom.kv_transfer.offload.hybrid.policy import (
+from atom.kv_transfer.offload.hybrid.dsv4.connector import (
+    DSV4OffloadConnector as LMCacheOffloadConnector,
+)
+from atom.kv_transfer.offload.hybrid.dsv4.connector import (
+    DSV4OffloadScheduler as LMCacheOffloadConnectorScheduler,
+)
+from atom.kv_transfer.offload.hybrid.dsv4.policy import (
     _chained_prefix_hashes,
 )
 from atom.kv_transfer.offload.metadata import (
@@ -836,7 +834,7 @@ def test_lmcache_connector_maps_token_ranges_to_block_ids():
         )
     }
     codec = DenseKVByteCodec(kv_caches)
-    connector = DenseGPUConnector(codec, block_size=4, chunk_size=8)
+    connector = BlockGPUConnector(codec, block_size=4, chunk_size=8)
 
     assert connector._ranges_to_block_ids(
         [4],
@@ -871,7 +869,7 @@ def test_lmcache_connector_maps_dcp_ranges_on_virtual_block_grid():
         )
     }
     codec = DenseKVByteCodec(kv_caches)
-    connector = DenseGPUConnector(
+    connector = BlockGPUConnector(
         codec,
         block_size=4,
         virtual_block_size=8,
@@ -941,7 +939,7 @@ def _exception_pipeline(monkeypatch, direction: str, *, failed_stream: str | Non
         gpu_to_chunk_major_device_buffer=_maybe_raise,
         chunk_major_device_buffer_to_gpu=_maybe_raise,
     )
-    connector = DenseGPUConnector(codec, block_size=1, chunk_size=1)
+    connector = BlockGPUConnector(codec, block_size=1, chunk_size=1)
     connector._release_gpu_staging_after_transfer = False
     monkeypatch.setattr(connector, "_assert_fused_chunk_major_available", lambda: None)
     state = _FakeState()
@@ -1079,7 +1077,7 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
         )
     }
     codec = DenseKVByteCodec(kv_caches)
-    connector = DenseGPUConnector(codec, block_size=4, chunk_size=8)
+    connector = BlockGPUConnector(codec, block_size=4, chunk_size=8)
     _install_fake_fused_chunk_major(codec)
     monkeypatch.setattr(connector, "_assert_fused_chunk_major_available", lambda: None)
 
@@ -1209,7 +1207,7 @@ def test_lmcache_connector_requires_fused_chunk_major_staging():
         )
     }
     codec = DenseKVByteCodec(kv_caches)
-    connector = DenseGPUConnector(codec, block_size=4, chunk_size=8)
+    connector = BlockGPUConnector(codec, block_size=4, chunk_size=8)
     memory_objs = [
         SimpleNamespace(
             tensor=torch.empty(2 * codec.bytes_per_block, dtype=torch.uint8)
@@ -1240,7 +1238,7 @@ def test_lmcache_connector_rejects_oversized_memory_obj():
         )
     }
     codec = DenseKVByteCodec(kv_caches)
-    connector = DenseGPUConnector(codec, block_size=4, chunk_size=4)
+    connector = BlockGPUConnector(codec, block_size=4, chunk_size=4)
     memory_obj = SimpleNamespace(
         tensor=torch.empty(2 * codec.bytes_per_block, dtype=torch.uint8)
     )
@@ -1270,7 +1268,7 @@ def test_lmcache_connector_respects_staging_buffer_chunks_env(monkeypatch):
         )
     }
     codec = DenseKVByteCodec(kv_caches)
-    connector = DenseGPUConnector(codec, block_size=4, chunk_size=4)
+    connector = BlockGPUConnector(codec, block_size=4, chunk_size=4)
 
     assert connector.gpu_staging_buffer_chunks == 3
     assert connector.gpu_staging_buffer_bytes == 3 * connector.gpu_staging_chunk_bytes
@@ -1294,7 +1292,7 @@ def test_lmcache_connector_default_staging_buffer_chunks_is_two(monkeypatch):
         )
     }
     codec = DenseKVByteCodec(kv_caches)
-    connector = DenseGPUConnector(codec, block_size=4, chunk_size=4)
+    connector = BlockGPUConnector(codec, block_size=4, chunk_size=4)
 
     assert connector.gpu_staging_buffer_chunks == 2
     assert connector.gpu_staging_buffer_bytes == 2 * connector.gpu_staging_chunk_bytes
@@ -2124,7 +2122,7 @@ def test_sidecar_hashes_are_computed_once_per_sequence_lifecycle(monkeypatch):
         return original(token_ids, hash_block_size)
 
     monkeypatch.setattr(
-        "atom.kv_transfer.offload.hybrid.connector._chained_prefix_hashes",
+        "atom.kv_transfer.offload.hybrid.dsv4.connector._chained_prefix_hashes",
         counted,
     )
 

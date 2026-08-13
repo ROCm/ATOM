@@ -10,17 +10,15 @@ from types import SimpleNamespace
 
 import pytest
 
-torch = pytest.importorskip("torch")
+from atom.kv_transfer.offload.hybrid.dsv4.codec import (
+    DSV4CheckpointCorruptionError,
+    DSV4CheckpointHeader,
+    DSV4CheckpointKey,
+    DSV4CheckpointStore,
+    encode_checkpoint,
+)
 
-from atom.kv_transfer.offload.hybrid.sidecar_format import (
-    SlotSidecarHeader,
-    SlotSidecarKey,
-    encode_sidecar,
-)
-from atom.kv_transfer.offload.hybrid.store import (
-    SlotSidecarCorruptionError,
-    SlotSidecarStore,
-)
+torch = pytest.importorskip("torch")
 
 _FINGERPRINT = bytes.fromhex("00112233445566778899aabbccddeeff")
 _UNSET = object()
@@ -181,8 +179,8 @@ def fake_lmcache(monkeypatch):
     return SimpleNamespace(CacheEngineKey=CacheEngineKey, KV_2LTD=kv_2ltd)
 
 
-def _key(*, tp_rank: int = 1) -> SlotSidecarKey:
-    return SlotSidecarKey(
+def _key(*, tp_rank: int = 1) -> DSV4CheckpointKey:
+    return DSV4CheckpointKey(
         boundary_block_hash=0x1234ABCD,
         fingerprint=_FINGERPRINT,
         tp_size=4,
@@ -191,8 +189,8 @@ def _key(*, tp_rank: int = 1) -> SlotSidecarKey:
 
 
 def _aos1_blob(*, tp_rank: int = 1) -> bytes:
-    return encode_sidecar(
-        SlotSidecarHeader(
+    return encode_checkpoint(
+        DSV4CheckpointHeader(
             boundary_tokens=512,
             boundary_block_hash=0x1234ABCD,
             payload_bytes=None,
@@ -213,8 +211,8 @@ def _store(
     worker_id: int = 1,
     store_location: str | None = None,
     retrieve_locations: list[str] | None = None,
-) -> SlotSidecarStore:
-    return SlotSidecarStore(
+) -> DSV4CheckpointStore:
+    return DSV4CheckpointStore(
         SimpleNamespace(
             storage_manager=storage_manager,
             store_location=store_location,
@@ -229,7 +227,7 @@ def _store(
 def _assert_cache_key(
     cache_key,
     fake_lmcache,
-    sidecar_key: SlotSidecarKey,
+    sidecar_key: DSV4CheckpointKey,
     *,
     worker_id: int = 1,
 ) -> None:
@@ -243,7 +241,7 @@ def _assert_cache_key(
 
 def test_requires_non_none_engine_storage_manager():
     with pytest.raises(ValueError, match="engine.storage_manager"):
-        SlotSidecarStore(
+        DSV4CheckpointStore(
             SimpleNamespace(storage_manager=None),
             model_name="org/model",
             world_size=4,
@@ -251,7 +249,7 @@ def test_requires_non_none_engine_storage_manager():
         )
 
     with pytest.raises(ValueError, match="engine.storage_manager"):
-        SlotSidecarStore(
+        DSV4CheckpointStore(
             SimpleNamespace(),
             model_name="org/model",
             world_size=4,
@@ -495,7 +493,7 @@ def test_get_raises_corruption_and_releases_when_tensor_is_unavailable():
     manager.get_result = fetched
     store = _store(manager)
 
-    with pytest.raises(SlotSidecarCorruptionError, match="expose a tensor"):
+    with pytest.raises(DSV4CheckpointCorruptionError, match="expose a tensor"):
         store.get(_key())
 
     assert fetched.get_tensor_calls == [0]
@@ -519,7 +517,7 @@ def test_borrow_distinguishes_malformed_objects_from_storage_io(malformed):
     manager.get_result = fetched
     store = _store(manager)
 
-    with pytest.raises(SlotSidecarCorruptionError), store.borrow(_key()):
+    with pytest.raises(DSV4CheckpointCorruptionError), store.borrow(_key()):
         pytest.fail("malformed object must not be yielded")
 
     assert fetched.decref_count == 1
@@ -677,7 +675,7 @@ def test_operations_reject_non_sidecar_keys_before_storage(method_name):
     manager = _StorageManager()
     store = _store(manager)
 
-    with pytest.raises(TypeError, match="SlotSidecarKey"):
+    with pytest.raises(TypeError, match="DSV4CheckpointKey"):
         if method_name == "put":
             store.put(object(), b"AOS1")
         else:

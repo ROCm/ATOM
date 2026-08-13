@@ -48,25 +48,23 @@ from atom.kv_transfer.disaggregation.types import (
     SaveOperationId,
 )
 from atom.kv_transfer.offload import config as offcfg
+from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
 from atom.kv_transfer.offload._offload_common import (
     OffloadWorkerMixin,
     build_offload_engine,
     validated_kv_role,
 )
-from atom.kv_transfer.offload.hybrid.admission import SlotSidecarAdmission
 from atom.kv_transfer.offload.hybrid.dsv4.codec import (
     HEADER_BYTES,
     DSV4CheckpointCodec,
     DSV4CheckpointCorruptionError,
+    DSV4CheckpointError,
+    DSV4CheckpointKey,
     DSV4CheckpointStore,
     DSV4PageSlotCodec,
-    SidecarFormatError,
-    SlotSidecarHeader,
-    SlotSidecarKey,
-    decode_sidecar_tensor,
-    finalize_sidecar_tensor_,
 )
 from atom.kv_transfer.offload.hybrid.dsv4.policy import (
+    DSV4StagingAdmission,
     _BoundedLRUSet,
     _chained_prefix_hashes,
     _committed_sidecar_capacity,
@@ -75,7 +73,6 @@ from atom.kv_transfer.offload.hybrid.dsv4.policy import (
     select_pending_sidecar_boundary,
     sidecar_boundary_tokens,
 )
-from atom.kv_transfer.offload.hybrid.gpu_connector import HybridGPUConnector
 from atom.kv_transfer.offload.metadata import (
     LMCacheOffloadMetadata,
     LMCacheReqMeta,
@@ -84,11 +81,6 @@ from atom.kv_transfer.offload.metadata import (
     SlotLoadSpec,
     SlotSaveSpec,
 )
-
-# Migration aliases retained for old tests and downstream type checks.  The
-# implementation and production construction both use the DSV4 classes above.
-SlotSidecarCorruptionError = DSV4CheckpointCorruptionError
-SlotSidecarStore = DSV4CheckpointStore
 
 logger = logging.getLogger("atom")
 
@@ -216,7 +208,7 @@ class _SlotLoadBatchReservation:
 # =====================================================================
 # Worker side
 # =====================================================================
-class HybridOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
+class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
     # Offload is a *consumer* from the scheduler's POV (it loads KV back). Saves
     # are fire-and-forget on the worker and must NOT be reported as
     # finished_sending (the scheduler frees blocks on finished_sending — a P/D
@@ -277,9 +269,9 @@ class HybridOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         self._checkpoint_codec: DSV4CheckpointCodec | None = None
         self._slot_store: DSV4CheckpointStore | None = None
         self._slot_staging: torch.Tensor | None = None
-        self._slot_admission: SlotSidecarAdmission | None = None
+        self._slot_admission: DSV4StagingAdmission | None = None
         self._slot_fingerprint: bytes | None = None
-        self._unresolved_slot_corruption: set[SlotSidecarKey] = set()
+        self._unresolved_slot_corruption: set[DSV4CheckpointKey] = set()
         self._tp_size: int | None = None
 
     # -- lifecycle --------------------------------------------------------
@@ -345,7 +337,7 @@ class HybridOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             engine_id=f"atom-offload-{rank}",
             block_size=self.virtual_block_size,
             bytes_per_block=self._codec.bytes_per_block,
-            gpu_connector_factory=lambda cfg, _meta: HybridGPUConnector(
+            gpu_connector_factory=lambda cfg, _meta: BlockGPUConnector(
                 self._codec,
                 self.block_size,
                 chunk_size=int(cfg.chunk_size),
@@ -530,7 +522,7 @@ class HybridOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             tp_size=tp_size,
             tp_rank=tp_rank,
         )
-        admission = SlotSidecarAdmission(staging_slots)
+        admission = DSV4StagingAdmission(staging_slots)
         store = DSV4CheckpointStore(
             self._engine,
             checkpoint_codec=checkpoint_codec,
@@ -578,47 +570,34 @@ class HybridOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
 
     @staticmethod
     def _slot_payload_bytes(slot_codec) -> int:
-        """Return SLOT width across the unified and migration test codecs."""
+        """Return the unified codec's SLOT width."""
 
         value = getattr(slot_codec, "slot_bytes", None)
-        if value is None:
-            value = getattr(slot_codec, "payload_bytes", None)
         if value is None or int(value) <= 0:
-            raise RuntimeError("SLOT codec does not expose a positive payload width")
+            raise RuntimeError("DSV4 codec does not expose a positive SLOT width")
         return int(value)
 
     def _slot_staging_view(self, staging_id: int) -> torch.Tensor:
-        """Return one connector-owned SLOT temp row.
-
-        The legacy ``staging_view`` fallback is only for migration tests that
-        inject the former SLOT codec directly; production always uses
-        ``self._slot_staging``.
-        """
+        """Return one connector-owned SLOT temp row."""
 
         staging = getattr(self, "_slot_staging", None)
-        if staging is not None:
-            if isinstance(staging_id, bool) or not isinstance(staging_id, Integral):
-                raise ValueError("SLOT staging id must be an integer")
-            staging_id = int(staging_id)
-            if not 0 <= staging_id < int(staging.shape[0]):
-                raise ValueError(
-                    f"SLOT staging id {staging_id} outside pool "
-                    f"[0, {int(staging.shape[0])})"
-                )
-            return staging[staging_id]
+        if staging is None:
+            raise RuntimeError("connector-owned SLOT staging is unavailable")
+        if isinstance(staging_id, bool) or not isinstance(staging_id, Integral):
+            raise ValueError("SLOT staging id must be an integer")  # noqa: TRY004
+        staging_id = int(staging_id)
+        if not 0 <= staging_id < int(staging.shape[0]):
+            raise ValueError(
+                f"SLOT staging id {staging_id} outside pool "
+                f"[0, {int(staging.shape[0])})"
+            )
+        return staging[staging_id]
 
-        slot_codec, _, _, _ = self._require_slot_components()
-        legacy_view = getattr(slot_codec, "staging_view", None)
-        if callable(legacy_view):
-            return legacy_view(staging_id)
-        raise RuntimeError("connector-owned SLOT staging is unavailable")
-
-    def _checkpoint_codec_or_none(self) -> DSV4CheckpointCodec | None:
+    def _require_checkpoint_codec(self) -> DSV4CheckpointCodec:
         checkpoint_codec = getattr(self, "_checkpoint_codec", None)
-        if checkpoint_codec is not None and not isinstance(
-            checkpoint_codec, DSV4CheckpointCodec
-        ):
-            raise RuntimeError("invalid DSV4 checkpoint codec")
+        if not isinstance(checkpoint_codec, DSV4CheckpointCodec):
+            # This is a connector initialization invariant, not input validation.
+            raise RuntimeError("DSV4 checkpoint codec is unavailable")  # noqa: TRY004
         return checkpoint_codec
 
     def _validate_block_geometry(self, transfer_tensors) -> None:
@@ -860,7 +839,7 @@ class HybridOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 ):
                     if save_ready_event is None:
                         # PAGE-only and SLOT-admission-failure saves still need
-                        # the forward producer fence used by the legacy path.
+                        # the forward producer fence before asynchronous store.
                         try:
                             candidate_event = torch.cuda.Event()
                             candidate_event.record(torch.cuda.current_stream())
@@ -1119,16 +1098,7 @@ class HybridOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             stream = torch.cuda.current_stream()
             ready_event = torch.cuda.Event()
             row = self._slot_staging_view(staging_id)
-            gather_slot = getattr(slot_codec, "gather_slot", None)
-            if callable(gather_slot):
-                gather_slot(source_group, row, stream=stream)
-            else:
-                # Migration-only compatibility for injected legacy test codecs.
-                slot_codec.snapshot_to_staging(
-                    source_group,
-                    staging_id,
-                    stream=stream,
-                )
+            slot_codec.gather_slot(source_group, row, stream=stream)
             ready_event.record(stream)
             return _SlotSaveSnapshot(staging_id, ready_event, True)
         except Exception:  # noqa: BLE001
@@ -1654,25 +1624,9 @@ class HybridOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             )
         return loaded
 
-    def _slot_key(self, boundary_block_hash: int) -> SlotSidecarKey:
-        checkpoint_codec = self._checkpoint_codec_or_none()
-        if checkpoint_codec is not None:
-            return checkpoint_codec.make_key(
-                boundary_block_hash=boundary_block_hash,
-            )
-
-        # Migration-only fallback for tests constructing the connector via
-        # ``__new__`` without running stateful initialization.
-        _, _, _, fingerprint = self._require_slot_components()
-        tp_size = getattr(self, "_tp_size", None)
-        tp_rank = getattr(self, "_rank", None)
-        if tp_size is None or tp_rank is None:
-            raise RuntimeError("SLOT sidecar TP geometry is unavailable")
-        return SlotSidecarKey(
+    def _slot_key(self, boundary_block_hash: int) -> DSV4CheckpointKey:
+        return self._require_checkpoint_codec().make_key(
             boundary_block_hash=boundary_block_hash,
-            fingerprint=fingerprint,
-            tp_size=tp_size,
-            tp_rank=tp_rank,
         )
 
     @staticmethod
@@ -1752,16 +1706,7 @@ class HybridOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                     host,
                     non_blocking=slot_codec.device.type == "cuda",
                 )
-                scatter_slot = getattr(slot_codec, "scatter_slot", None)
-                if callable(scatter_slot):
-                    scatter_slot(row, destination_group, stream=stream)
-                else:
-                    # Migration-only compatibility for injected legacy codecs.
-                    slot_codec.restore_from_staging(
-                        destination_group,
-                        staging_id,
-                        stream=stream,
-                    )
+                slot_codec.scatter_slot(row, destination_group, stream=stream)
         finally:
             if stream is not None:
                 try:
@@ -1782,37 +1727,26 @@ class HybridOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         if reservation is None:
             raise RuntimeError("SLOT load requires a pre-reserved staging row")
         staging_id = reservation.staging_id
-        slot_codec, slot_store, _, fingerprint = self._require_slot_components()
+        slot_codec, slot_store, _, _ = self._require_slot_components()
         payload_bytes = self._slot_payload_bytes(slot_codec)
-        checkpoint_codec = self._checkpoint_codec_or_none()
+        checkpoint_codec = self._require_checkpoint_codec()
         key = self._slot_key(spec.boundary_block_hash)
         try:
             with slot_store.borrow(key) as blob:
                 if blob is None:
                     return False
-                if checkpoint_codec is not None:
-                    _, payload = checkpoint_codec.decode_tensor(
-                        blob,
-                        expected_boundary_tokens=spec.boundary_tokens,
-                        expected_boundary_block_hash=spec.boundary_block_hash,
-                        expected_payload_bytes=payload_bytes,
-                    )
-                else:
-                    _, payload = decode_sidecar_tensor(
-                        blob,
-                        expected_fingerprint=fingerprint,
-                        expected_tp_size=self._tp_size,
-                        expected_tp_rank=self._rank,
-                        expected_boundary_tokens=spec.boundary_tokens,
-                        expected_boundary_block_hash=spec.boundary_block_hash,
-                        expected_payload_bytes=payload_bytes,
-                    )
+                _, payload = checkpoint_codec.decode_tensor(
+                    blob,
+                    expected_boundary_tokens=spec.boundary_tokens,
+                    expected_boundary_block_hash=spec.boundary_block_hash,
+                    expected_payload_bytes=payload_bytes,
+                )
                 self._restore_slot_payload(
                     payload,
                     staging_id,
                     spec.destination_group,
                 )
-        except (SlotSidecarCorruptionError, SidecarFormatError):
+        except (DSV4CheckpointCorruptionError, DSV4CheckpointError):
             # Evict all stale copies. Otherwise LMCache's duplicate-key guard
             # would silently skip the recomputed replacement forever. The
             # store fences the key if removal fails, so a later put cannot be
@@ -1823,8 +1757,8 @@ class HybridOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
 
     def _invalidate_corrupt_slot(
         self,
-        slot_store: SlotSidecarStore,
-        key: SlotSidecarKey,
+        slot_store: DSV4CheckpointStore,
+        key: DSV4CheckpointKey,
     ) -> bool:
         """Invalidate corrupt bytes and remember any unresolved removal."""
 
@@ -1849,8 +1783,8 @@ class HybridOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
 
     def _prepare_slot_republication(
         self,
-        slot_store: SlotSidecarStore,
-        key: SlotSidecarKey,
+        slot_store: DSV4CheckpointStore,
+        key: DSV4CheckpointKey,
     ) -> bool:
         """Retry a failed corruption eviction before publishing this key."""
 
@@ -2079,9 +2013,8 @@ class HybridOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             if slot_spec is not None:
                 if slot_preparation_error is not None:
                     raise slot_preparation_error
-                slot_codec, slot_store, _, fingerprint = self._require_slot_components()
-                payload_bytes = self._slot_payload_bytes(slot_codec)
-                checkpoint_codec = self._checkpoint_codec_or_none()
+                _, slot_store, _, _ = self._require_slot_components()
+                checkpoint_codec = self._require_checkpoint_codec()
                 boundary_tokens = int(slot_spec.boundary_tokens)
 
                 def _page_boundary_visible() -> bool:
@@ -2098,23 +2031,11 @@ class HybridOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                     )
                 if slot_blob is None:
                     raise RuntimeError("SLOT CPU frame is unavailable after D2H")
-                if checkpoint_codec is not None:
-                    checkpoint_codec.finalize_tensor_(
-                        slot_blob,
-                        boundary_tokens=slot_spec.boundary_tokens,
-                        boundary_block_hash=slot_spec.boundary_block_hash,
-                    )
-                else:
-                    header = SlotSidecarHeader(
-                        boundary_tokens=slot_spec.boundary_tokens,
-                        boundary_block_hash=slot_spec.boundary_block_hash,
-                        payload_bytes=payload_bytes,
-                        payload_crc32=None,
-                        fingerprint=fingerprint,
-                        tp_size=self._tp_size,
-                        tp_rank=self._rank,
-                    )
-                    finalize_sidecar_tensor_(slot_blob, header)
+                checkpoint_codec.finalize_tensor_(
+                    slot_blob,
+                    boundary_tokens=slot_spec.boundary_tokens,
+                    boundary_block_hash=slot_spec.boundary_block_hash,
+                )
                 key = self._slot_key(slot_spec.boundary_block_hash)
                 if not self._prepare_slot_republication(slot_store, key):
                     save_failure_reason = "sidecar_invalidation"
@@ -2281,7 +2202,7 @@ class HybridOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
 # =====================================================================
 # Scheduler side
 # =====================================================================
-class HybridOffloadScheduler(KVConnectorSchedulerBase):
+class DSV4OffloadScheduler(KVConnectorSchedulerBase):
     # Consumer semantics: finished_recving wakes parked seqs (the engine asserts
     # `not is_producer` on that path). Offload never uses finished_sending.
     is_producer = False
@@ -3206,15 +3127,7 @@ class HybridOffloadScheduler(KVConnectorSchedulerBase):
                 delattr(seq, marker)
 
 
-# DSV4-native names are the stable vertical-package surface.  The historical
-# ``Hybrid*`` names remain the public compatibility contract used by the outer
-# connector factory.
-DSV4OffloadConnector = HybridOffloadConnector
-DSV4OffloadScheduler = HybridOffloadScheduler
-
 __all__ = [
     "DSV4OffloadConnector",
     "DSV4OffloadScheduler",
-    "HybridOffloadConnector",
-    "HybridOffloadScheduler",
 ]

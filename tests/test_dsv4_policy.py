@@ -5,11 +5,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from atom.kv_transfer.offload.hybrid.policy import (
+from atom.kv_transfer.offload.hybrid.dsv4.policy import (
+    build_dsv4_profile,
     select_pending_sidecar_boundary,
     sidecar_boundary_tokens,
 )
-from atom.kv_transfer.offload.hybrid.profiles import build_dsv4_profile
 
 
 def _config(**overrides):

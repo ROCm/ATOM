@@ -23,31 +23,29 @@ from atom.kv_transfer.disaggregation.types import (
     KVTransferRegion,
     SaveOperationId,
 )
-from atom.kv_transfer.offload.hybrid.connector import (
-    HybridOffloadConnector as LMCacheOffloadConnector,
+from atom.kv_transfer.offload.hybrid.dsv4 import connector as connector_module
+from atom.kv_transfer.offload.hybrid.dsv4.codec import (
+    HEADER_BYTES,
+    DSV4CheckpointCodec,
+    DSV4CheckpointCorruptionError,
+    DSV4CheckpointError,
+    DSV4CheckpointHeader,
+    DSV4CheckpointKey,
+    DSV4PageSlotCodec,
+    decode_checkpoint,
+    encode_checkpoint,
 )
-from atom.kv_transfer.offload.hybrid.connector import (
+from atom.kv_transfer.offload.hybrid.dsv4.connector import (
+    DSV4OffloadConnector as LMCacheOffloadConnector,
+)
+from atom.kv_transfer.offload.hybrid.dsv4.connector import (
     _env_nonnegative_float,
     _env_positive_float,
     _wait_for_publication,
 )
-from atom.kv_transfer.offload.hybrid.dsv4 import connector as connector_module
-from atom.kv_transfer.offload.hybrid.dsv4.codec import (
-    DSV4CheckpointCodec,
-    DSV4PageSlotCodec,
-)
-from atom.kv_transfer.offload.hybrid.policy import (
+from atom.kv_transfer.offload.hybrid.dsv4.policy import (
     _compute_slot_fingerprint,
 )
-from atom.kv_transfer.offload.hybrid.sidecar_format import (
-    HEADER_BYTES,
-    SidecarFormatError,
-    SlotSidecarHeader,
-    SlotSidecarKey,
-    decode_sidecar,
-    encode_sidecar,
-)
-from atom.kv_transfer.offload.hybrid.store import SlotSidecarCorruptionError
 from atom.kv_transfer.offload.metadata import (
     LMCacheOffloadMetadata,
     LMCacheReqMeta,
@@ -166,35 +164,41 @@ class _FakeRow:
 
 
 class _FakeSlotCodec:
-    payload_bytes = len(_PAYLOAD)
+    slot_bytes = len(_PAYLOAD)
     device = torch.device("cuda:0")
 
-    def __init__(self, order: list[str]) -> None:
+    def __init__(self, order: list[str], staging_slots: int) -> None:
         self.order = order
         self.snapshot_error: Exception | None = None
         self.restore_error: Exception | None = None
         self.snapshot_groups: list[int] = []
-        self.row = _FakeRow(order)
+        self.rows = [_FakeRow(order) for _ in range(staging_slots)]
+        self.row = self.rows[0]
 
-    def snapshot_to_staging(self, group, staging_id, stream=None) -> None:
+    def gather_slot(self, group, dst, *, stream=None) -> None:
         self.order.append("snapshot")
         self.snapshot_groups.append(group)
-        assert staging_id >= 0
+        assert dst in self.rows
         assert isinstance(stream, _FakeRPCStream)
         if self.snapshot_error is not None:
             raise self.snapshot_error
 
-    def staging_view(self, staging_id):
-        assert staging_id >= 0
-        return self.row
-
-    def restore_from_staging(self, group, staging_id, stream=None) -> None:
+    def scatter_slot(self, src, group, *, stream=None) -> None:
         self.order.append("restore")
         assert group == 3
-        assert staging_id >= 0
+        assert src in self.rows
         assert isinstance(stream, _FakeTransferStream)
         if self.restore_error is not None:
             raise self.restore_error
+
+
+class _FakeSlotStaging:
+    def __init__(self, rows: list[_FakeRow]) -> None:
+        self._rows = rows
+        self.shape = (len(rows), len(_PAYLOAD))
+
+    def __getitem__(self, staging_id: int) -> _FakeRow:
+        return self._rows[staging_id]
 
 
 class _FakeUnifiedCodec:
@@ -434,8 +438,8 @@ def _sidecar_blob(
     boundary_block_hash: int = 0x1234,
     payload: bytes = _PAYLOAD,
 ) -> bytes:
-    return encode_sidecar(
-        SlotSidecarHeader(
+    return encode_checkpoint(
+        DSV4CheckpointHeader(
             boundary_tokens=boundary_tokens,
             boundary_block_hash=boundary_block_hash,
             payload_bytes=None,
@@ -476,9 +480,13 @@ def _worker(
     connector._aborted_checkpoint_staging = set()
     connector._quarantined_checkpoint_staging = set()
     connector._engine = _FakeEngine(order)
-    connector._slot_codec = _FakeSlotCodec(order)
-    connector._checkpoint_codec = None
-    connector._slot_staging = None
+    connector._slot_codec = _FakeSlotCodec(order, staging_slots)
+    connector._checkpoint_codec = DSV4CheckpointCodec(
+        fingerprint=_FINGERPRINT,
+        tp_size=2,
+        tp_rank=1,
+    )
+    connector._slot_staging = _FakeSlotStaging(connector._slot_codec.rows)
     connector._slot_store = _FakeStore(order)
     connector._slot_admission = _FakeAdmission(
         order,
@@ -744,8 +752,8 @@ def test_slot_fingerprint_is_stable_and_covers_required_geometry():
     stale_fingerprint = _compute_slot_fingerprint(
         **{**kwargs, "page_namespace": "org/model"}
     )
-    stale_blob = encode_sidecar(
-        SlotSidecarHeader(
+    stale_blob = encode_checkpoint(
+        DSV4CheckpointHeader(
             boundary_tokens=8,
             boundary_block_hash=0x1234,
             payload_bytes=None,
@@ -756,8 +764,8 @@ def test_slot_fingerprint_is_stable_and_covers_required_geometry():
         ),
         _PAYLOAD,
     )
-    with pytest.raises(SidecarFormatError, match="fingerprint mismatch"):
-        decode_sidecar(
+    with pytest.raises(DSV4CheckpointError, match="fingerprint mismatch"):
+        decode_checkpoint(
             stale_blob,
             expected_fingerprint=fingerprint,
             expected_tp_size=2,
@@ -1991,10 +1999,10 @@ def test_page_and_slot_save_polls_partial_page_and_sidecar_visibility(
     assert connector._slot_admission.released == [0]
 
     key, blob = connector._slot_store.put_calls[0]
-    assert key == SlotSidecarKey(0x1234, _FINGERPRINT, 2, 1)
+    assert key == DSV4CheckpointKey(0x1234, _FINGERPRINT, 2, 1)
     assert isinstance(blob, torch.Tensor)
     assert blob.numel() == HEADER_BYTES + len(_PAYLOAD)
-    header, payload = decode_sidecar(
+    header, payload = decode_checkpoint(
         memoryview(blob.numpy()),
         expected_fingerprint=_FINGERPRINT,
         expected_tp_size=2,
@@ -2537,13 +2545,13 @@ def test_page_and_slot_load_orders_retrieve_get_decode_restore_sync_then_done(
         list(_sidecar_blob()),
         dtype=torch.uint8,
     )
-    real_decode = connector_module.decode_sidecar_tensor
+    real_decode = connector._checkpoint_codec.decode_tensor
 
     def _record_decode(*args, **kwargs):
         order.append("decode")
         return real_decode(*args, **kwargs)
 
-    monkeypatch.setattr(connector_module, "decode_sidecar_tensor", _record_decode)
+    monkeypatch.setattr(connector._checkpoint_codec, "decode_tensor", _record_decode)
 
     connector.start_load_kv(_metadata(_load_request()))
 
@@ -2631,7 +2639,7 @@ def test_malformed_storage_object_is_invalidated_like_corrupt_aos1():
     def _malformed_borrow(key):
         connector._slot_store.get_calls.append(key)
         try:
-            raise SlotSidecarCorruptionError(
+            raise DSV4CheckpointCorruptionError(
                 "LMCache sidecar object did not expose a tensor"
             )
             yield None
@@ -2646,7 +2654,7 @@ def test_malformed_storage_object_is_invalidated_like_corrupt_aos1():
     assert connector._failed_load == {23}
     assert connector._engine.unpinned == ["23"]
     assert connector._slot_store.invalidate_calls == [
-        SlotSidecarKey(0x1234, _FINGERPRINT, 2, 1)
+        DSV4CheckpointKey(0x1234, _FINGERPRINT, 2, 1)
     ]
     assert connector._slot_admission.released == [0]
 
@@ -2665,7 +2673,7 @@ def test_failed_corruption_invalidation_cannot_fake_later_commit(
     connector.start_load_kv(_metadata(_load_request()))
     connector.start_load_kv(_metadata(_save_request()))
 
-    key = SlotSidecarKey(0x1234, _FINGERPRINT, 2, 1)
+    key = DSV4CheckpointKey(0x1234, _FINGERPRINT, 2, 1)
     assert connector._slot_store.invalidate_calls == [key, key]
     if retry_succeeds:
         assert len(connector._slot_store.put_calls) == 1
@@ -2684,13 +2692,13 @@ def test_load_staging_exhaustion_has_one_terminal_sidecar_log(monkeypatch, caplo
     caplog.set_level(logging.WARNING, logger="atom")
     connector = _worker(order, admission_available=False)
     connector._slot_store.get_result = _sidecar_blob()
-    real_decode = connector_module.decode_sidecar_tensor
+    real_decode = connector._checkpoint_codec.decode_tensor
 
     def _record_decode(*args, **kwargs):
         order.append("decode")
         return real_decode(*args, **kwargs)
 
-    monkeypatch.setattr(connector_module, "decode_sidecar_tensor", _record_decode)
+    monkeypatch.setattr(connector._checkpoint_codec, "decode_tensor", _record_decode)
 
     connector.start_load_kv(_metadata(_load_request()))
 

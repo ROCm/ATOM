@@ -83,10 +83,8 @@ all-TP staging completion 管理 lease，GPU temp row 在 D2H 后立即释放。
 ## Connector 端到端实现（重点）
 
 本节把 connector 内部从“拿到 block/group”一直画到“调用 LMCache 存取”完整展开。
-其中 LMCache 调用链描述的是当前分支已有实现；当前分支仍有独立的
-`ATOMPageRegionCodec` 和 `ATOMSlotSidecarCodec`。本计划将两者合并成 DSV4 专用的
-`DSV4PageSlotCodec`；标为 `[PLAN]` 的统一 codec、lease completion 和提前释放点
-都是准备增加的部分。
+当前实现已经删除独立的 `ATOMPageRegionCodec` 和 `ATOMSlotSidecarCodec`，PAGE 与
+SLOT 均由 DSV4 专用的 `DSV4PageSlotCodec` 计算 typed plan 并执行 gather/scatter。
 
 ### C1. 启动时：模型先把可搬运的 GPU 地址注册给 connector
 
@@ -123,9 +121,9 @@ attention builder creates KVTransferTensors
 set_kv_cache_data(..., transfer_tensors, num_blocks)
         |
         v
-HybridOffloadConnector.register_kv_caches()
+DSV4OffloadConnector.register_kv_caches()
         |
-        +--> [PLAN] DSV4PageSlotCodec(
+        +--> DSV4PageSlotCodec(
         |               page_regions=block_regions,
         |               slot_regions=swa_block_regions)
         |       page_bytes_per_block = sum(PAGE region.unit_bytes)
@@ -133,26 +131,26 @@ HybridOffloadConnector.register_kv_caches()
         |       bytes_per_block      = page_bytes_per_block
         |                              # LMCache PAGE protocol compatibility
         |
-        +--> HybridGPUConnector(unified_codec, block_size, chunk_size)
+        +--> BlockGPUConnector(unified_codec, block_size, chunk_size)
         |
         +--> ATOMRawBytesLMCacheMetadata
         |       dtype  = uint8
         |       shape  = nblocks * bytes_per_block
         |       groups = 1
         |
-        +--> LMCacheEngineBuilder.get_or_create(..., HybridGPUConnector, ...)
+        +--> LMCacheEngineBuilder.get_or_create(..., BlockGPUConnector, ...)
         |       engine.fmt = KV_2LTD       # 只作为 allocator 可接受的容器格式
         |       engine.post_init()
         |
-        +--> [PLAN] same unified_codec supplies SLOT plan/staging methods
-        +--> SlotSidecarAdmission(staging_rows)
-        +--> SlotSidecarStore(engine.storage_manager)
+        +--> same unified_codec supplies SLOT plan/staging methods
+        +--> DSV4StagingAdmission(staging_rows)
+        +--> DSV4CheckpointStore(engine.storage_manager)
 ```
 
-当前实现的迁移关系是：
+已经完成的迁移关系是：
 
 ```text
-CURRENT                                      PLAN
+REMOVED                                      CURRENT
 
 ATOMPageRegionCodec   ----\
                              +------------> DSV4PageSlotCodec
@@ -166,7 +164,7 @@ CPU/NVMe tier 和 eviction；ATOM codec 负责解释“这些 bytes 在 GPU 哪�
 
 - `atom/model_ops/attentions/deepseek_v4_attn.py::get_kv_transfer_tensors`
 - `atom/model_engine/model_runner.py::allocate_kv_cache`
-- `atom/kv_transfer/offload/hybrid/connector.py::register_kv_caches`
+- `atom/kv_transfer/offload/hybrid/dsv4/connector.py::register_kv_caches`
 - `atom/kv_transfer/offload/_offload_common.py::build_offload_engine`
 
 ### C2. Scheduler 如何把 block table 交给 worker
@@ -193,7 +191,7 @@ Sequence
 ```
 
 ```text
-HybridOffloadScheduler.build_connector_meta()
+DSV4OffloadScheduler.build_connector_meta()
         |
         +--> token_ids = seq.token_ids[:token_end]
         +--> block_ids = list(seq.block_table)
@@ -209,7 +207,7 @@ LMCacheOffloadMetadata.requests[]
 EngineCore -> ModelRunner.process_kvconnector_output()
         |
         v
-HybridOffloadConnector.start_load_kv_with_state_checkpoints()
+DSV4OffloadConnector.start_load_kv_with_state_checkpoints()
 ```
 
 `block_ids` 的列表下标是逻辑 block number，列表里的值才是 PAGE region 的
@@ -248,7 +246,7 @@ self._engine.store(
 完整调用链：
 
 ```text
-HybridOffloadConnector._do_save_req
+DSV4OffloadConnector._do_save_req
         |
         | engine.store(tokens, mask, block_ids, req_id)
         v
@@ -259,16 +257,15 @@ LMCache ChunkedTokenDatabase
         +--> allocate one uint8 MemoryObj per chunk
         |
         v
-HybridGPUConnector.batched_from_gpu(memory_objs, starts, ends, block_ids=...)
+BlockGPUConnector.batched_from_gpu(memory_objs, starts, ends, block_ids=...)
         |
         +--> _range_block_ids(): token range -> physical block IDs
         |
         +--> group a bounded number of chunks into GPU staging batches
         |
         +--> PAGE gather on pack_stream
-        |       CURRENT: ATOMPageRegionCodec.copy_plan(block_ids)
-        |       PLAN:    DSV4PageSlotCodec.page_plan(block_ids)
-        |       Triton gather_copy_plan(PAGE regions -> GPU staging)
+        |       DSV4PageSlotCodec.page_plan(block_ids)
+        |       Triton PAGE gather(PAGE regions -> GPU staging)
         |
         +--> D2H/copy on copy_stream
                 GPU staging slices -> LMCache MemoryObj tensors
@@ -338,7 +335,7 @@ LMCache 不读取这个 layout；它把 MemoryObj 当 opaque bytes 存储。`KV_
                                 |                  ranges, block_ids)
                                 v
 +-----------------------------------------------------------------------+
-| ATOM HybridGPUConnector（layout adapter）                              |
+| ATOM BlockGPUConnector（layout adapter）                              |
 |                                                                       |
 | block_ids + KVTransferRegion[]                                        |
 |        |                                                              |
@@ -378,7 +375,7 @@ load 完全沿相同边界反向执行：
           | official custom GPU connector call
           | batched_to_gpu(memory_objs, ranges, new_block_ids)
           v
- ATOM HybridGPUConnector
+ ATOM BlockGPUConnector
           |
           +--> H2D: MemoryObj -> GPU staging
           +--> rebuild the same copy plan for new_block_ids
@@ -404,7 +401,7 @@ region/group shape、地址公式和对应 gather/scatter kernel 都上游到 LM
 只是配置。保持 custom connector 可以让 PAGE layout 演进留在 ATOM 内部，同时复用
 LMCache 已有的 token/key/storage/eviction 行为，接口面和回归面最小。
 
-#### C3.2 [PLAN] 一个 DSV4 专用的 `DSV4PageSlotCodec`
+#### C3.2 一个 DSV4 专用的 `DSV4PageSlotCodec`
 
 这里的“合并”分三层，本计划第一版只强制第一层：
 
@@ -478,23 +475,13 @@ atom/kv_transfer/offload/
 +-- atom_lmcache_staging.py
 |     generic staging buffers, streams and CUDA events
 |
-+-- triton_kv_staging.py
-|     after migration: keep dense chunk/segment-major kernels only
-|
 +-- dense/
-|     dense backend remains unchanged
+|     +-- connector.py
+|     +-- kv_byte_codec.py
+|     +-- triton_kv_staging.py
+|           dense chunk/segment-major kernels only
 |
 +-- hybrid/
-      |
-      +-- connector.py
-      |     thin facade / compatibility export
-      |     selects the DSV4 implementation
-      |
-      +-- gpu_connector.py
-      |     thin PAGE name/facade over BlockGPUConnector
-      |
-      +-- admission.py
-      |     model-neutral temp-row admission primitive
       |
       +-- dsv4/
             +-- __init__.py
@@ -507,6 +494,7 @@ atom/kv_transfer/offload/
             +-- policy.py
             |     DSV4OffloadProfile + config parsing
             |     boundary/hash/fingerprint/commit policy
+            |     staging-row admission/quarantine
             |
             +-- codec.py
             |     DSV4PageSlotCodec: GPU layout/plan/gather/scatter
@@ -518,10 +506,10 @@ atom/kv_transfer/offload/
                   DSV4 region gather/scatter kernels and launch wrappers
 ```
 
-因此，当前两个位置都应该下沉：
+因此，原先分散的实现已经按下图收拢：
 
 ```text
-CURRENT                                      PLAN
+REMOVED                                      CURRENT
 
 hybrid/sidecar_format.py      ---\
                                  +------->   hybrid/dsv4/codec.py
@@ -534,7 +522,11 @@ planned dsv4/copy_plan.py     ---/
 hybrid/policy.py              ---\
                                  +------->   hybrid/dsv4/policy.py
 hybrid/profiles/dsv4.py       ---/
-hybrid/profiles/base.py       ----------->   remove if no second hybrid model uses it
+hybrid/profiles/base.py       ----------->   removed
+hybrid/connector.py           ----------->   root offload/connector.py imports dsv4 directly
+hybrid/gpu_connector.py       ----------->   dsv4 uses shared BlockGPUConnector directly
+hybrid/admission.py           ----------->   hybrid/dsv4/policy.py
+offload/copy_plan.py          ----------->   removed; typed plan stays in dsv4/codec.py
 ```
 
 `sidecar_format.py` 不再作为独立文件保留，它和 PAGE/SLOT GPU codec 一起收进
@@ -591,7 +583,7 @@ plan/gather API。
 `DSV4PageSlotCodec` 的 GPU address/kernel contract。
 
 `profiles/dsv4.py` 当前也没有跨模型价值，和 `policy.py` 一起收进
-`dsv4/policy.py`。当前 `HybridProfile` 只有 DSV4 使用时，将其收紧为
+`dsv4/policy.py`。当前 `DSV4OffloadProfile` 只有 DSV4 使用时，将其收紧为
 `DSV4OffloadProfile`；以后出现第二种 hybrid 模型时，由它自己的 model package
 提供 policy/profile，再在根 connector 做显式 registry/factory，而不是提前保留
 一个只有单实现的 `profiles/` 层。
@@ -622,9 +614,6 @@ forbidden reverse dependencies:
 
 ```text
 tests/
-+-- test_dsv4_page_slot_layout.py
-|     CPU geometry/address/order/golden offsets
-|
 +-- test_dsv4_page_slot_codec.py
 |     typed API, BlockByteCodec contract, validation, composite plan
 |
@@ -637,13 +626,14 @@ tests/
 +-- test_lmcache_offload_v4_page_slot.py
 |     connector/admission/event/D2H/store lifecycle
 |
-+-- test_page_region_codec.py
-+-- test_slot_sidecar_codec.py
-|     migration adapter parity; delete with adapter later
-|
 +-- test_dsv4_checkpoint_codec.py
++-- test_dsv4_checkpoint_format.py
 +-- test_dsv4_checkpoint_store.py
-      AOS1 wire and StorageManager ownership
+|     AOS1 wire and StorageManager ownership
+|
++-- test_dsv4_staging_admission.py
++-- test_dsv4_policy.py
+      temp-row ownership/quarantine and checkpoint-grid policy
 ```
 
 这沿用 PR #1683 最重要的职责边界：
@@ -993,7 +983,7 @@ wrapper must not:
 ```
 
 PAGE 的 ready/free event 仍由 `_block_gpu_connector.py` 的双-stream pipeline 管理；
-SLOT gather event 仍由 `HybridOffloadConnector` 在 native `src -> dst` 之后记录。这样
+SLOT gather event 仍由 `DSV4OffloadConnector` 在 native `src -> dst` 之后记录。这样
 codec/kernel 不会偷偷扩大 lease 生命周期。
 
 composite `checkpoint_plan()` 不需要第三套 monolithic kernel。在同一个 stream 上按
@@ -1022,7 +1012,7 @@ PAGE staging owner
   BlockGPUConnector / atom_lmcache_staging pipeline
 
 SLOT temp owner
-  DSV4OffloadConnector + SlotSidecarAdmission
+  DSV4OffloadConnector + DSV4StagingAdmission
 
 DSV4PageSlotCodec
   validates caller buffer and enqueues copies only
@@ -1691,16 +1681,15 @@ LMCache storage tier
 MemoryObj(s) selected by token chunk keys
         |
         v
-HybridGPUConnector.batched_to_gpu(memory_objs, starts, ends, block_ids=...)
+BlockGPUConnector.batched_to_gpu(memory_objs, starts, ends, block_ids=...)
         |
         +--> _range_block_ids(): range -> new request's destination block IDs
         |
         +--> copy_stream: MemoryObj tensors -> bounded GPU staging
         |
         +--> pack_stream:
-                CURRENT: ATOMPageRegionCodec scatter
-                PLAN:    DSV4PageSlotCodec.page_plan + scatter
-                Triton scatter_copy_plan(GPU staging -> PAGE region addresses)
+                DSV4PageSlotCodec.page_plan + scatter
+                Triton PAGE scatter(GPU staging -> PAGE region addresses)
         |
         v
 ret_mask[hbm:lmc].all()
@@ -1724,7 +1713,7 @@ SLOT source group 有两种来源：
 ```text
 regular interval keeper:
     StateCheckpointCopy.destination_group  -> source group for SLOT gather
-    [PLAN] group held by checkpoint lease
+    group held by checkpoint lease
 
 interval terminal without successor batch:
     SlotSaveSpec.source_group               -> stable live group fallback
@@ -1768,9 +1757,8 @@ reverse-indexed SLOT regions for group g
 region0 / plane0 addr = base0 + total0 - (g + 1) * unit0
 optional region1 / plane1 addr = base1 + total1 - (g + 1) * unit1
 
-                    CURRENT: ATOMSlotSidecarCodec
-                    PLAN:    DSV4PageSlotCodec.slot_plan + gather
-                    Triton gather_copy_plan
+                    DSV4PageSlotCodec.slot_plan + gather
+                    Triton SLOT gather
                               |
                               v
 connector GPU temp row
@@ -2030,29 +2018,29 @@ start_load_kv_with_state_checkpoints(metadata, checkpoint_copies)
         v
 state_checkpoint_copies_issued()
         |
-        +--> snapshot_to_staging(dst, staging_id, current_compute_stream)
+        +--> gather_slot(dst, staging_row, current_compute_stream)
         +--> ready_event.record(current_compute_stream)
         |
         v
 save executor waits ready_event
         |
-        +--> [PLAN] report finished_checkpoint_staging(copy_id)
+        +--> report finished_checkpoint_staging(copy_id)
         |            all TP ranks -> release StateGroupPool lease
         |
         +--> engine.store(PAGE chunks) if PAGE is due
         |
-        +--> [PLAN order] D2H: GPU temp row -> pinned CPU
+        +--> D2H: GPU temp row -> pinned CPU
         |                   [128-byte header | payload]
-        +--> [PLAN] release GPU temp row immediately after D2H
+        +--> release GPU temp row immediately after D2H
         |
-        +--> finalize_sidecar_tensor_()
+        +--> finalize_checkpoint_tensor_()
         |       magic/version/boundary/hash/size/fingerprint/TP/CRC32
         |
         +--> wait engine.lookup(tokens[:B], pin=False) >= B
         |       PAGE coverage must be visible before SLOT publication
         |
-        +--> SlotSidecarStore.put(key, CPU frame)
-        +--> poll SlotSidecarStore.contains(key)
+        +--> DSV4CheckpointStore.put(key, CPU frame)
+        +--> poll DSV4CheckpointStore.contains(key)
         |
         v
 worker reports finished_sidecar_saving(save_operation)
@@ -2085,7 +2073,7 @@ NVMe/visibility poll 长时间占用。若预留必须发生在 metadata dispatc
 SLOT key 先由 boundary identity 构造：
 
 ```text
-SlotSidecarKey
+DSV4CheckpointKey
 |
 +-- boundary_block_hash
 +-- layout fingerprint
@@ -2098,14 +2086,14 @@ SlotSidecarKey
 +--> BLAKE2b-8 -> nonnegative 63-bit storage_hash
 ```
 
-`SlotSidecarStore` 再把它包装成 LMCache `CacheEngineKey`：
+`DSV4CheckpointStore` 再把它包装成 LMCache `CacheEngineKey`：
 
 ```text
 CacheEngineKey(
     model_name = PAGE engine model namespace,
     world_size = tp_size,
     worker_id  = tp_rank,
-    chunk_hash = SlotSidecarKey.storage_hash(),
+    chunk_hash = DSV4CheckpointKey.storage_hash(),
     dtype      = uint8,
 )
 ```
@@ -2149,20 +2137,19 @@ _do_load_req(req)
         v
 _load_slot(req, staging reservation)
         |
-        +--> SlotSidecarStore.borrow(SlotSidecarKey)
+        +--> DSV4CheckpointStore.borrow(DSV4CheckpointKey)
         |       contains/locate -> storage_manager.get()
         |       keep MemoryObj borrowed through H2D+scatter
         |
-        +--> decode_sidecar_tensor()
+        +--> decode_checkpoint_tensor()
         |       validate magic/version/reserved bytes
         |       validate B/hash/fingerprint/TP/payload size/CRC32
         |
         +--> CPU payload -> GPU temp row                  (H2D stream)
         |
-        +--> CURRENT: ATOMSlotSidecarCodec.restore_from_staging(...)
-        +--> PLAN: DSV4PageSlotCodec.slot_plan(destination_group)
+        +--> DSV4PageSlotCodec.slot_plan(destination_group)
         |         + scatter(temp, plan)
-        |       Triton scatter_copy_plan(temp -> all SLOT regions)
+        |       Triton SLOT scatter(temp -> all SLOT regions)
         |
         +--> stream.synchronize()
         +--> MemoryObj.ref_count_down()
@@ -2191,7 +2178,7 @@ codec           | same unified      |             | same unified         |
                 | codec.page_plan   |             | codec.slot_plan      |
 LMCache API     | engine.store /    |             | storage_manager      |
                 | engine.retrieve   |             | allocate/put/get     |
-key owner       | ChunkedTokenDB    |             | SlotSidecarKey       |
+key owner       | ChunkedTokenDB    |             | DSV4CheckpointKey       |
 payload object  | one MemoryObj per |             | one AOS1 MemoryObj   |
                 | token chunk       |             | per boundary/rank    |
                 +-------------------+             +----------------------+
@@ -2401,7 +2388,7 @@ PAGE engine.store returns
     + LMCache batched_put 已提交
     != 所有异步 storage tier 已 durable flush
 
-SLOT SlotSidecarStore.put returns True
+SLOT DSV4CheckpointStore.put returns True
     = StorageManager 接受/提交 MemoryObj
     != 当前 retrieve policy 已经能看到对象
 
@@ -2427,7 +2414,7 @@ PAGE lookup visible through B
 MemoryObj ownership 也要区分：
 
 - PAGE MemoryObj 完全由 `LMCacheEngine.store/retrieve` 分配、pin、put/get 和释放；
-  `HybridGPUConnector` 只在 callback 生命周期里借用其中的 flat `uint8` tensor。
+  `BlockGPUConnector` 只在 callback 生命周期里借用其中的 flat `uint8` tensor。
 - SLOT adapter 自己直接调用 StorageManager，所以 `put` 异常必须自己
   `ref_count_down`；`batched_put` 正常返回后由 StorageManager 接管，不能再减一次。
 - SLOT load 使用 `borrow()`，MemoryObj 必须一直持有到 H2D 和 scatter stream
@@ -2783,43 +2770,33 @@ group 放回 free list。**
 | late/duplicate completion | copy_id幂等忽略 | 无影响 | 无影响 |
 | 一个TP失败、其他TP成功 | 等所有TP terminal；最终invalidate或保守处理 | 各rank独立清理 | 全局不commit |
 
-## 11. 预计修改点
+## 11. 实现后的修改点
 
 ### Unified codec
 
 - 新增 `atom/kv_transfer/offload/hybrid/dsv4/` vertical package：
   - `__init__.py`：导出 DSV4 connector/profile/codec stable surface；
   - `connector.py`：从当前 hybrid connector 迁入 DSV4 orchestration；
-  - `policy.py`：`DSV4OffloadProfile`、config parsing、boundary/hash/fingerprint/commit；
+  - `policy.py`：`DSV4OffloadProfile`、config parsing、boundary/hash/fingerprint/commit，
+    以及 connector-owned staging row 的 admission/quarantine；
   - `codec.py`：`DSV4PageSlotCodec` + `DSV4CheckpointCodec` +
     `DSV4CheckpointStore`，并内含 private RegionSet/typed plan；
   - `triton_page_slot.py`：DSV4 region gather/scatter kernels；
   - `bytes_per_block` 保持 PAGE-only，另暴露 `slot_bytes`。
-- `atom/kv_transfer/offload/hybrid/connector.py`
-  - 收缩成外层 facade/compatibility export；
-  - 不再直接包含 DSV4 AOS1、interval 和 state-group 状态机。
-- `atom/kv_transfer/offload/hybrid/profiles/dsv4.py`
-  - profile dataclass/builder 迁入 `hybrid/dsv4/policy.py`；
-  - 当前只有一个 profile consumer 时删除多余 `profiles/base.py` 抽象。
-- `atom/kv_transfer/offload/hybrid/sidecar_format.py`、`store.py`、`policy.py`
-  - format/store 合并进 `dsv4/codec.py` 的两个 checkpoint class；
-  - profile/policy 合并进 `dsv4/policy.py`；
-  - 迁移期只保留 deprecated re-export，所有内部新 import 直接指向 DSV4 package。
-- `atom/kv_transfer/offload/hybrid/page_region_codec.py`
-  - 迁移期保留兼容 re-export/adapter，避免一次性破坏 PAGE codec 测试和外部 import；
-  - 稳定后删除重复实现。
-- `atom/kv_transfer/offload/hybrid/slot_codec.py`
-  - 迁移期保留兼容 re-export/adapter；
-  - 地址/plan 必须委托 unified codec，不能复制公式；
-  - connector 切换完成后删除旧的 codec-owned staging pool。
-- `atom/kv_transfer/offload/copy_plan.py`
-  - DSV4 所需的 geometry/plan DTO 迁入 `dsv4/codec.py`；
-  - 迁移期仅兼容 re-export/reference oracle；
-  - adapter 删除后一起删除，不创建新的 `dsv4/copy_plan.py`；
-  - runtime 不再依赖含 PAGE 语义的 `PageCopy.src_addr`。
-- `atom/kv_transfer/offload/triton_kv_staging.py`
-  - PAGE/SLOT raw-address kernel 迁入 `hybrid/dsv4/triton_page_slot.py`；
-  - 根模块只保留 dense chunk/segment-major kernel和迁移期 re-export。
+- `atom/kv_transfer/offload/connector.py` 直接构造
+  `hybrid/dsv4/connector.py` 的 worker/scheduler；不再保留 hybrid 根层 facade。
+- profile、format/store、policy 已分别收拢到 `dsv4/policy.py` 和
+  `dsv4/codec.py`；`hybrid/profiles/`、`sidecar_format.py`、`store.py`、
+  `policy.py` 均已删除。
+- PAGE-only/SLOT-only adapter 和 codec-owned staging pool 已删除；生产和测试
+  均直接使用 `DSV4PageSlotCodec`。
+- `atom/kv_transfer/offload/copy_plan.py` 已删除；DSV4 typed geometry/plan 只存在于
+  `dsv4/codec.py`。
+- dense chunk/segment-major kernel 已迁至
+  `atom/kv_transfer/offload/dense/triton_kv_staging.py`；旧 raw copy-plan kernel
+  随 adapter 一起删除。
+- dense 和 DSV4 PAGE 直接使用共享 `BlockGPUConnector`，不再保留两个零行为
+  family facade。
 - `atom/kv_transfer/offload/hybrid/dsv4/triton_page_slot.py`
   - 同一个 region-copy kernel body 以 `REVERSE: tl.constexpr` 生成两个 specialization；
   - PAGE launch 固定 `REVERSE=False`，SLOT launch 固定 `REVERSE=True`；
@@ -2841,7 +2818,7 @@ group 放回 free list。**
   - connector 自己持有 SLOT GPU temp rows/admission/quarantine；
   - 迁移期可令 `self._slot_codec = self._codec`，随后移除双字段。
 
-第一版不修改 `BlockGPUConnector`、LMCache raw metadata、`engine.store/retrieve` 与
+实现没有修改 `BlockGPUConnector`、LMCache raw metadata、`engine.store/retrieve` 与
 checkpoint store 的 StorageManager ownership 语义；它们只切换到 DSV4 package 和
 unified codec 的 typed entrypoint。
 
@@ -2862,7 +2839,7 @@ unified codec 的 typed entrypoint。
 - `atom/model_engine/model_runner.py`
   - 保证 native copy 后立刻调用 gather hook；
   - copy abort 与 completion event 路径。
-- `atom/kv_transfer/offload/hybrid/connector.py`
+- `atom/kv_transfer/offload/hybrid/dsv4/connector.py`
   - 预留 temp row；
   - staging event terminal notification；
   - GPU temp row 在 D2H 后提前释放。

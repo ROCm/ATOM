@@ -68,23 +68,16 @@ Four rules carry the module:
 | `connector.py` | Public config-only `dense`/`hybrid` selector and thin worker/scheduler delegation shells. |
 | `_offload_common.py` | Shared LMCache engine construction, role validation, executors, and completion plumbing. |
 | `_block_gpu_connector.py` | Family-neutral raw-block LMCache `GPUConnectorInterface`; DCP-aware bounded staging and two-stage copies. |
-| `copy_plan.py` | Family-neutral contiguous copy-plan and Triton tile descriptors. |
 | `config.py` | Builds the per-rank `LMCacheEngineConfig` + `LMCacheMetadata` from `LMCACHE_*` env and `kv_transfer_config` extras. |
 | `metadata.py` | Opaque PAGE allocation metadata plus PAGE/SLOT request descriptors and exact save-generation IDs. |
 | `dense/connector.py` | Dense MHA/MLA worker and scheduler implementations. |
 | `dense/kv_byte_codec.py` | `DenseKVByteCodec`: maps a token range → AITER KV blocks and packs/unpacks them as raw bytes. The layout-bridging core. |
-| `dense/gpu_connector.py` | Dense-family facade over the shared raw-block GPU adapter. |
+| `dense/triton_kv_staging.py` | Dense fused chunk-major pack/unpack kernels. |
 | `hybrid/dsv4/connector.py` | Production DSV4 PAGE+SLOT worker and scheduler implementations. |
-| `hybrid/dsv4/policy.py` | DSV4 geometry/profile, PAGE/SLOT cadence, prefix hashes, fingerprint, and committed-checkpoint policy. |
+| `hybrid/dsv4/policy.py` | DSV4 geometry/profile, PAGE/SLOT cadence, prefix hashes, fingerprint, committed-checkpoint policy, and bounded staging-row admission. |
 | `hybrid/dsv4/codec.py` | `DSV4PageSlotCodec`, `DSV4CheckpointCodec`, and `DSV4CheckpointStore`: unified GPU layout plans plus AOS1 framing/storage. |
 | `hybrid/dsv4/triton_page_slot.py` | Raw-`uint8` PAGE/SLOT gather/scatter kernels; PAGE is forward-indexed and SLOT is reverse-indexed. |
-| `hybrid/gpu_connector.py` | Hybrid-family facade over the shared raw-block GPU adapter. |
-| `hybrid/connector.py`, `hybrid/policy.py` | Import aliases retained for existing callers; production implementation is under `hybrid/dsv4/`. |
-| `hybrid/page_region_codec.py`, `hybrid/slot_codec.py` | Deprecated PAGE-only/SLOT-only compatibility facades over `DSV4PageSlotCodec`. |
-| `hybrid/sidecar_format.py`, `hybrid/store.py`, `hybrid/profiles/` | Compatibility exports/aliases for checkpoint format/store/profile APIs now implemented in `hybrid/dsv4/{codec,policy}.py`. |
 | `atom_lmcache_staging.py` | Per-thread CUDA streams, staging buffer, ready/free events, env helpers. |
-| `triton_kv_staging.py` | Dense chunk-major kernels plus deprecated raw copy-plan compatibility entry points. |
-| `hybrid/admission.py` | Nonblocking ownership of bounded SLOT staging rows. |
 
 ## Architecture
 
@@ -104,7 +97,7 @@ flowchart LR
         direction TB
         LK["LookupServer<br/>(rank 0 authoritative)"]
         SL["start_load_kv() — enqueue only<br/>load_executor (1) · save_executor (N)"]
-        CE["CacheEngine.retrieve() / .store()<br/>DenseGPUConnector + DenseKVByteCodec"]
+        CE["CacheEngine.retrieve() / .store()<br/>BlockGPUConnector + DenseKVByteCodec"]
         SL --> CE
     end
 
@@ -274,7 +267,7 @@ Following one request end to end ties the pieces together:
    `start_load_kv` submits the load to the load daemon and returns — the RPC
    thread stays free to run `forward`.
 4. **Move.** The daemon runs `engine.retrieve`, which drives
-   `DenseGPUConnector`: MemoryObj → staging buffer → HBM blocks (Triton
+   `BlockGPUConnector`: MemoryObj → staging buffer → HBM blocks (Triton
    unpack), bit-identical.
 5. **Wake.** Post-forward, `get_finished` returns `finished_loading` (success) or
    `failed_loading` (recompute). The scheduler wakes the seq, which prefills only
@@ -330,7 +323,7 @@ flowchart LR
     A["seq.num_cached_tokens<br/>advances"] --> B["scheduler:<br/>SaveSpec(skip_leading_tokens)<br/>new chunk-aligned tokens only"]
     B --> C["worker _do_save_req:<br/>engine.store(tokens, mask, block_ids)"]
     C --> D["batched_from_gpu"]
-    subgraph PIPE_S["DenseGPUConnector (2-stage)"]
+    subgraph PIPE_S["BlockGPUConnector (2-stage)"]
         direction LR
         D --> E["stage A — Triton pack<br/>HBM blocks → uint8 staging buf"]
         E --> F["stage B — copy<br/>staging buf → MemoryObj"]
@@ -345,7 +338,7 @@ flowchart LR
     A["lookup hit &gt; HBM<br/>seq parked WAITING_FOR_REMOTE_KVS<br/>blocks allocated"] --> B["scheduler:<br/>LoadSpec(hbm_cached, lmcache_cached)"]
     B --> C["worker _do_load_req:<br/>engine.retrieve(tokens, mask=skip HBM, block_ids)"]
     C --> D["batched_to_gpu"]
-    subgraph PIPE_L["DenseGPUConnector (2-stage)"]
+    subgraph PIPE_L["BlockGPUConnector (2-stage)"]
         direction LR
         S[("CPU DRAM / NVMe")] --> E["stage A — copy<br/>MemoryObj → uint8 staging buf"]
         E --> F["stage B — Triton unpack<br/>staging buf → HBM blocks"]
@@ -366,7 +359,7 @@ producer event
 -> PAGE engine.store
 -> PAGE lookup verifies coverage through boundary B
 -> D2H directly into [128-byte AOS1 header | payload] CPU tensor
--> CRC + in-place header write -> SlotSidecarStore.put
+-> CRC + in-place header write -> DSV4CheckpointStore.put
 -> staging release/quarantine -> sidecar completion generation
 
 LOAD
@@ -386,8 +379,7 @@ The SAVE sketch compresses two ownership milestones. In the implementation,
 the connector releases the temporary GPU SLOT row immediately after its D2H
 copy has completed and the CPU frame owns the bytes. CRC/header finalization,
 PAGE visibility polling, and `DSV4CheckpointStore.put()` continue from that CPU
-frame. The `SlotSidecarStore` label in the sketch is the legacy compatibility
-name for `DSV4CheckpointStore`.
+frame.
 
 The GPU connector uses a **bounded** staging buffer
 (`OFFLOAD_GPU_STAGING_CHUNKS` chunks, default 2) and a two-stage pipeline: while
@@ -551,7 +543,7 @@ reloaded fp8 block dequantizes identically; no scale is recomputed or dropped.
 | Chunk-aligned load/save only | scheduler + worker | LMCache keys are per-chunk; an unaligned write has no valid key. |
 | Stateful PAGE requires a complete SLOT layout | worker registration | PAGE-only DSV4 reuse would restore compressed KV without request state. |
 | PAGE coverage precedes AOS1 put | worker `_do_save_req` | The sidecar is the commit marker; it must never authorize missing PAGE chunks. |
-| AOS1 identity, size, TP, and CRC match | `decode_sidecar` | Stale geometry, wrong rank, truncation, and corruption all recompute rather than restore. |
+| AOS1 identity, size, TP, and CRC match | `decode_checkpoint` | Stale geometry, wrong rank, truncation, and corruption all recompute rather than restore. |
 | Exact save generations aggregate across TP | `SaveOperationId`, aggregator | A failed or delayed rank from another save cannot commit a boundary. |
 
 ### Failure handling
@@ -691,8 +683,8 @@ SLOT, or composite checkpoint plans, always in item-major then region-minor
 order. `bytes_per_block` is the PAGE width only and deliberately excludes SLOT.
 There is no segment-major fallback and no value conversion.
 
-The same two shared `BlockGPUConnector` entry points, exposed to this family as
-`HybridGPUConnector`, gather and scatter these plans. DSV4 PAGE therefore keeps
+The same two shared `BlockGPUConnector` entry points gather and scatter these
+plans. DSV4 PAGE therefore keeps
 standard LMCache incremental `store/retrieve` orchestration. PAGE explicitly
 excludes compressor state, SWA, DSpark windows, and state-pool ownership.
 
@@ -713,17 +705,13 @@ exactly once.
 
 - **`hybrid/dsv4/connector.py`** owns PAGE-before-SLOT save/load ordering,
   connector-owned SLOT temp rows, checkpoint-store calls, completion reporting,
-  and fail-closed recovery. `hybrid/admission.py` remains the helper that grants
-  nonblocking temp-row ownership and quarantines uncertain GPU completion.
+  and fail-closed recovery.
 - **`hybrid/dsv4/policy.py`** owns physical/virtual geometry, the independent
   PAGE chunk and SLOT checkpoint grids, prefix hashes, layout fingerprint, and
-  the bounded committed-checkpoint index.
-- **Compatibility only:** `hybrid/page_region_codec.py`, `hybrid/slot_codec.py`,
-  `hybrid/sidecar_format.py`, `hybrid/store.py`, and `hybrid/profiles/` preserve
-  old imports and test/downstream APIs. New production code imports the DSV4
-  package directly.
+  the bounded committed-checkpoint index. It also owns nonblocking temp-row
+  admission and quarantines rows whose GPU completion cannot be proven.
 
-### `triton_kv_staging.py` — dense fused chunk-major pack/unpack
+### `dense/triton_kv_staging.py` — dense fused chunk-major pack/unpack
 
 The dense fast path used by `DenseKVByteCodec`. Two JIT kernels (`_pack_chunk_major_kernel`,
 `_unpack_chunk_major_kernel`) move every `(chunk, segment)` tile in **one launch**
@@ -742,8 +730,7 @@ instead of thousands of per-block copies.
 
 The adapter LMCache's `engine.store()` / `engine.retrieve()` actually call. It
 turns LMCache's *token ranges* into ATOM *block ranges* and drives bounded
-staging. `dense/gpu_connector.py` and `hybrid/gpu_connector.py` provide
-family-specific names without duplicating this implementation.
+staging. Dense and DSV4 instantiate this shared adapter directly.
 
 - **Range → blocks** — `_range_block_ids` maps a chunk's `[start, end)` tokens to
   `block_ids[start//bs : ceil(end/bs)]`, enforcing block-aligned starts.
@@ -808,9 +795,9 @@ LMCache version, these are what to re-check.**
 
 | Ours | Replaces (LMCache default) | Why it must change | How it's wired / what changed |
 |---|---|---|---|
-| **`DenseGPUConnector`** | LMCache's stock vLLM `GPUConnectorInterface` (the GPU↔MemoryObj mover) | The stock connectors only emit **token-major** KV (`KV_2LTD` etc.) via `normalize_kv_and_discover_format`, which rejects ATOM's x-packed head-major AITER layout | Passed as the `gpu_connector` arg to `get_or_create`. LMCache's engine calls our `batched_from_gpu` / `batched_to_gpu` instead of its own. **This is the main hook.** |
+| **`BlockGPUConnector`** | LMCache's stock vLLM `GPUConnectorInterface` (the GPU↔MemoryObj mover) | The stock connectors only emit **token-major** KV (`KV_2LTD` etc.) via `normalize_kv_and_discover_format`, which rejects ATOM's x-packed head-major AITER layout | Passed as the `gpu_connector` arg to `get_or_create`. LMCache's engine calls our `batched_from_gpu` / `batched_to_gpu` instead of its own. **This is the main hook.** |
 | **`ATOMRawBytesLMCacheMetadata`** | `LMCacheMetadata`'s allocation shape/dtype | MemoryObjs must be allocated as **opaque `uint8` blobs** (`nblocks × bytes_per_block`), not typed KV tensors | Wraps the base metadata and overrides `get_shapes()` / `get_dtypes()` / `get_num_groups()`; passed as `meta` to `get_or_create` |
-| **`DenseKVByteCodec`** | *(nothing — new component)* | LMCache has no concept of AITER's paged x-packed byte layout | Owned by `DenseGPUConnector`; does the actual block-byte gather/scatter via Triton |
+| **`DenseKVByteCodec`** | *(nothing — new component)* | LMCache has no concept of AITER's paged x-packed byte layout | Owned by `BlockGPUConnector`; does the actual block-byte gather/scatter via Triton |
 | **`DSV4PageSlotCodec`** | *(DSV4-specific component)* | DSV4 PAGE is explicit forward-indexed `block_regions`; SLOT is complete reverse-indexed request state | Selected at DSV4 registration. One codec builds both copy-plan types, but PAGE and SLOT remain separate storage objects with separate cadences |
 | **`DSV4CheckpointCodec` / `DSV4CheckpointStore`** | *(separate request-state checkpoint)* | Request state is one boundary snapshot, not token-chunked PAGE data | AOS1 uses the engine's `StorageManager` directly; it does not replace or fork `LMCacheEngine.store/retrieve` |
 | `engine.fmt = KV_2LTD` + `post_init()` | the format LMCache would pick for allocation | `BINARY` (the honest format for raw bytes) is **rejected** by the LocalCPU allocator; we set an *accepted* format only to pass that check — the real shape is forced by our metadata, so the value is otherwise inert | `_offload_common.py` `build_offload_engine` |
@@ -1234,11 +1221,12 @@ python3 multi-round-qa.py \
 |------|--------|
 | [`tests/test_dsv4_page_slot_codec.py`](../../../tests/test_dsv4_page_slot_codec.py) | Unified PAGE/SLOT plan layout, section offsets, forward/reverse addressing, and validation. |
 | [`tests/test_dsv4_checkpoint_codec.py`](../../../tests/test_dsv4_checkpoint_codec.py) | AOS1 round trip, deterministic rank-local key, identity checks, and CRC rejection. |
+| [`tests/test_dsv4_checkpoint_format.py`](../../../tests/test_dsv4_checkpoint_format.py), [`tests/test_dsv4_checkpoint_store.py`](../../../tests/test_dsv4_checkpoint_store.py) | Detailed AOS1 framing/corruption validation and LMCache StorageManager ownership. |
+| [`tests/test_dsv4_staging_admission.py`](../../../tests/test_dsv4_staging_admission.py), [`tests/test_dsv4_policy.py`](../../../tests/test_dsv4_policy.py) | Bounded temp-row ownership/quarantine and checkpoint-grid policy. |
 | [`tests/test_dsv4_page_slot_triton.py`](../../../tests/test_dsv4_page_slot_triton.py) | PAGE-then-SLOT launch order on one stream, enqueue-only wrappers, and GPU round trip where available. |
-| [`tests/test_page_region_codec.py`](../../../tests/test_page_region_codec.py), [`tests/test_slot_sidecar_codec.py`](../../../tests/test_slot_sidecar_codec.py), [`tests/test_slot_sidecar_format.py`](../../../tests/test_slot_sidecar_format.py), [`tests/test_slot_sidecar_store.py`](../../../tests/test_slot_sidecar_store.py) | Legacy compatibility facades/exports and migration regressions. |
 | [`tests/test_lmcache_offload_config.py`](../../../tests/test_lmcache_offload_config.py) | Stable PAGE namespace derivation, geometry/version separation, and scheduler/worker metadata parity. |
 | [`tests/test_lmcache_offload_v4_page_slot.py`](../../../tests/test_lmcache_offload_v4_page_slot.py) | PAGE-before-SLOT save, PAGE-then-SLOT load, missing/corrupt SLOT, staging exhaustion, and bounded logs. |
-| [`tests/test_lmcache_offload_connector.py`](../../../tests/test_lmcache_offload_connector.py) | Scheduler cadence, session commits, nonzero-HBM guard, exact save generations, and legacy dense regressions. |
+| [`tests/test_lmcache_offload_connector.py`](../../../tests/test_lmcache_offload_connector.py) | Scheduler cadence, session commits, nonzero-HBM guard, exact save generations, and dense regressions. |
 | [`tests/test_kv_aggregator.py`](../../../tests/test_kv_aggregator.py) | TP all-rank completion/failure and cross-generation isolation. |
 | [`tests/test_lmcache_offload_disk_integration.py`](../../../tests/test_lmcache_offload_disk_integration.py) | Real-LMCache local-disk PAGE and AOS1 sidecar round trips; explicit skip without LMCache. |
 | [`tests/test_lmcache_offload_gpu_disk_e2e.py`](../../../tests/test_lmcache_offload_gpu_disk_e2e.py) | Real PAGE-region + full-SLOT GPU `LocalDiskBackend` round trip; explicit prerequisite probes for ROCm/CUDA, LMCache, and Triton. |
@@ -1265,7 +1253,7 @@ python3 multi-round-qa.py \
 - **Per-block staging cost.** The codec stages KV one block at a time through the
   bounded buffer. For very long prefixes this dominates reload latency; a
   bulk/contiguous copy path would cut it substantially. The Triton fused
-  chunk-major kernel (`triton_kv_staging.py`) is the current fast path.
+  chunk-major kernel (`dense/triton_kv_staging.py`) is the current fast path.
 - **Reload only pays off above `OFFLOAD_MIN_LOAD_TOKENS`.** Small hits are skipped
   because, at the current copy speed, recompute is cheaper. The break-even point
   is workload- and hardware-dependent — tune the threshold per deployment.

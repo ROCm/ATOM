@@ -10,6 +10,15 @@ from pathlib import Path
 
 import pytest
 
+from atom.kv_transfer.offload.hybrid.dsv4.codec import (
+    DSV4CheckpointHeader,
+    DSV4CheckpointKey,
+    DSV4CheckpointStore,
+    decode_checkpoint,
+    encode_checkpoint,
+)
+from atom.kv_transfer.offload.metadata import ATOMRawBytesLMCacheMetadata
+
 torch = pytest.importorskip(
     "torch",
     reason="real PyTorch is required for LMCache disk integration",
@@ -27,15 +36,6 @@ pytestmark = pytest.mark.skipif(
     not _LMCACHE_AVAILABLE,
     reason="the external lmcache package is required for disk integration",
 )
-
-from atom.kv_transfer.offload.hybrid.sidecar_format import (
-    SlotSidecarHeader,
-    SlotSidecarKey,
-    decode_sidecar,
-    encode_sidecar,
-)
-from atom.kv_transfer.offload.hybrid.store import SlotSidecarStore
-from atom.kv_transfer.offload.metadata import ATOMRawBytesLMCacheMetadata
 
 _FINGERPRINT = bytes.fromhex("00112233445566778899aabbccddeeff")
 
@@ -88,8 +88,8 @@ def _wait_for_disk_chunks(
 
 
 def _wait_for_disk_sidecar(
-    store: SlotSidecarStore,
-    key: SlotSidecarKey,
+    store: DSV4CheckpointStore,
+    key: DSV4CheckpointKey,
     disk_path: Path,
     *,
     timeout_s: float = 5.0,
@@ -221,14 +221,14 @@ def test_slot_sidecar_aos1_round_trip_through_real_lmcache_disk(tmp_path: Path):
 
         payload = bytes((index * 29 + 7) % 256 for index in range(513))
         boundary_hash = 0x0123456789ABCDEF
-        key = SlotSidecarKey(
+        key = DSV4CheckpointKey(
             boundary_block_hash=boundary_hash,
             fingerprint=_FINGERPRINT,
             tp_size=1,
             tp_rank=0,
         )
-        blob = encode_sidecar(
-            SlotSidecarHeader(
+        blob = encode_checkpoint(
+            DSV4CheckpointHeader(
                 boundary_tokens=512,
                 boundary_block_hash=boundary_hash,
                 payload_bytes=None,
@@ -239,7 +239,7 @@ def test_slot_sidecar_aos1_round_trip_through_real_lmcache_disk(tmp_path: Path):
             ),
             payload,
         )
-        store = SlotSidecarStore(
+        store = DSV4CheckpointStore(
             engine,
             model_name=model_name,
             world_size=1,
@@ -254,7 +254,7 @@ def test_slot_sidecar_aos1_round_trip_through_real_lmcache_disk(tmp_path: Path):
         assert store.contains(key)
         loaded = store.get(key)
         assert loaded is not None
-        header, restored = decode_sidecar(
+        header, restored = decode_checkpoint(
             memoryview(loaded.numpy()),
             expected_fingerprint=_FINGERPRINT,
             expected_tp_size=1,

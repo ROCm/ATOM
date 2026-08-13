@@ -25,14 +25,14 @@ from atom.kv_transfer.offload.hybrid.dsv4.policy import (
 def __getattr__(name: str):
     if name in {"DSV4OffloadConnector", "DSV4OffloadScheduler"}:
         from atom.kv_transfer.offload.hybrid.dsv4.connector import (
-            HybridOffloadConnector,
-            HybridOffloadScheduler,
+            DSV4OffloadConnector,
+            DSV4OffloadScheduler,
         )
 
         return (
-            HybridOffloadConnector
+            DSV4OffloadConnector
             if name == "DSV4OffloadConnector"
-            else HybridOffloadScheduler
+            else DSV4OffloadScheduler
         )
     raise AttributeError(name)
 

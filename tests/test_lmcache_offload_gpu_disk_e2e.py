@@ -12,6 +12,19 @@ from types import SimpleNamespace
 
 import pytest
 
+from atom.kv_transfer.disaggregation.types import KVTransferRegion
+from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
+from atom.kv_transfer.offload.dense.kv_byte_codec import DenseKVByteCodec
+from atom.kv_transfer.offload.hybrid.dsv4.codec import (
+    DSV4CheckpointHeader,
+    DSV4CheckpointKey,
+    DSV4CheckpointStore,
+    DSV4PageSlotCodec,
+    decode_checkpoint,
+    encode_checkpoint,
+)
+from atom.kv_transfer.offload.metadata import ATOMRawBytesLMCacheMetadata
+
 torch = pytest.importorskip(
     "torch",
     reason="real PyTorch with ROCm or CUDA is required for GPU+disk integration",
@@ -33,10 +46,9 @@ if _LMCACHE_AVAILABLE:
     from lmcache.v1.memory_management import MemoryFormat
     from lmcache.v1.metadata import LMCacheMetadata
 if _TRITON_AVAILABLE:
-    from atom.kv_transfer.offload import triton_kv_staging
+    from atom.kv_transfer.offload.dense import triton_kv_staging
 
     assert callable(triton_kv_staging.fused_pack_chunk_major)
-    assert callable(triton_kv_staging.gather_copy_plan)
 
 _SKIP_REASON = (
     "a ROCm or CUDA GPU is required"
@@ -51,24 +63,6 @@ pytestmark = pytest.mark.skipif(
     not _HAS_SUPPORTED_GPU or not _LMCACHE_AVAILABLE or not _TRITON_AVAILABLE,
     reason=_SKIP_REASON,
 )
-
-from atom.kv_transfer.disaggregation.types import KVTransferRegion
-from atom.kv_transfer.offload.dense.gpu_connector import (
-    DenseGPUConnector,
-)
-from atom.kv_transfer.offload.dense.kv_byte_codec import (
-    DenseKVByteCodec,
-)
-from atom.kv_transfer.offload.hybrid.page_region_codec import ATOMPageRegionCodec
-from atom.kv_transfer.offload.hybrid.sidecar_format import (
-    SlotSidecarHeader,
-    SlotSidecarKey,
-    decode_sidecar,
-    encode_sidecar,
-)
-from atom.kv_transfer.offload.hybrid.slot_codec import ATOMSlotSidecarCodec
-from atom.kv_transfer.offload.hybrid.store import SlotSidecarStore
-from atom.kv_transfer.offload.metadata import ATOMRawBytesLMCacheMetadata
 
 _FINGERPRINT = bytes.fromhex("00112233445566778899aabbccddeeff")
 
@@ -155,8 +149,8 @@ def _wait_for_disk_hit(
 
 
 def _wait_for_sidecar_hit(
-    store: SlotSidecarStore,
-    key: SlotSidecarKey,
+    store: DSV4CheckpointStore,
+    key: DSV4CheckpointKey,
     disk_path: Path,
     *,
     min_files: int,
@@ -195,7 +189,7 @@ def test_gpu_kv_round_trip_through_local_disk_backend(tmp_path: Path):
     expected = _clone_segments(kv_caches)
     codec = DenseKVByteCodec(kv_caches, num_blocks=num_blocks)
     assert codec.has_fused_chunk_major_staging
-    gpu_connector = DenseGPUConnector(
+    gpu_connector = BlockGPUConnector(
         codec,
         block_size=block_size,
         chunk_size=chunk_size,
@@ -298,12 +292,6 @@ def test_page_major_page_and_full_slot_round_trip_through_local_disk_backend(
         )
         for tensor in page_tensors
     ]
-    page_codec = ATOMPageRegionCodec(
-        page_regions,
-        num_blocks=num_blocks,
-        device=device,
-    )
-
     num_slots = 3
     slot_tensors = [
         _uint8_payload((num_slots, 181), 37),
@@ -319,17 +307,18 @@ def test_page_major_page_and_full_slot_round_trip_through_local_disk_backend(
         )
         for tensor in slot_tensors
     ]
-    slot_codec = ATOMSlotSidecarCodec(
+    codec = DSV4PageSlotCodec(
+        page_regions,
         slot_regions,
+        num_blocks=num_blocks,
         num_slots=num_slots,
-        staging_slots=1,
         device=device,
     )
-    assert page_codec.has_fused_chunk_major_staging
-    assert slot_codec.has_fused_copy_plan_staging
+    slot_staging = torch.empty(codec.slot_bytes, dtype=torch.uint8, device=device)
+    assert codec.has_fused_chunk_major_staging
 
-    gpu_connector = DenseGPUConnector(
-        page_codec,
+    gpu_connector = BlockGPUConnector(
+        codec,
         block_size=block_size,
         chunk_size=chunk_size,
     )
@@ -350,14 +339,14 @@ def test_page_major_page_and_full_slot_round_trip_through_local_disk_backend(
         worker_id=0,
         local_worker_id=0,
         kv_dtype=torch.uint8,
-        kv_shape=(1, 2, chunk_size, 1, page_codec.bytes_per_block),
+        kv_shape=(1, 2, chunk_size, 1, codec.bytes_per_block),
         chunk_size=chunk_size,
         engine_id=instance_id,
     )
     metadata = ATOMRawBytesLMCacheMetadata(
         base_metadata,
         atom_block_size=block_size,
-        bytes_per_block=page_codec.bytes_per_block,
+        bytes_per_block=codec.bytes_per_block,
     )
     engine = LMCacheEngineBuilder.get_or_create(
         instance_id,
@@ -382,23 +371,23 @@ def test_page_major_page_and_full_slot_round_trip_through_local_disk_backend(
 
         source_group = 0
         destination_group = 1
-        slot_codec.snapshot_to_staging(source_group, 0)
+        codec.gather_slot(source_group, slot_staging)
         torch.cuda.synchronize()
-        payload = bytes(slot_codec.staging_view(0).cpu().tolist())
+        payload = bytes(slot_staging.cpu().tolist())
         expected_payload = bytes(
             torch.cat([tensor[-1] for tensor in expected_slots]).cpu().tolist()
         )
         assert payload == expected_payload
 
         boundary_hash = 0x0123456789ABCDEF
-        sidecar_key = SlotSidecarKey(
+        sidecar_key = DSV4CheckpointKey(
             boundary_block_hash=boundary_hash,
             fingerprint=_FINGERPRINT,
             tp_size=1,
             tp_rank=0,
         )
-        sidecar_blob = encode_sidecar(
-            SlotSidecarHeader(
+        sidecar_blob = encode_checkpoint(
+            DSV4CheckpointHeader(
                 boundary_tokens=len(tokens),
                 boundary_block_hash=boundary_hash,
                 payload_bytes=None,
@@ -409,7 +398,7 @@ def test_page_major_page_and_full_slot_round_trip_through_local_disk_backend(
             ),
             payload,
         )
-        sidecar_store = SlotSidecarStore(
+        sidecar_store = DSV4CheckpointStore(
             engine,
             model_name=model_name,
             world_size=1,
@@ -435,19 +424,19 @@ def test_page_major_page_and_full_slot_round_trip_through_local_disk_backend(
         ret_mask = engine.retrieve(tokens, block_ids=block_ids)
         loaded_sidecar = sidecar_store.get(sidecar_key)
         assert loaded_sidecar is not None
-        _, restored_payload = decode_sidecar(
+        _, restored_payload = decode_checkpoint(
             memoryview(loaded_sidecar.numpy()),
             expected_fingerprint=_FINGERPRINT,
             expected_tp_size=1,
             expected_tp_rank=0,
             expected_boundary_tokens=len(tokens),
             expected_boundary_block_hash=boundary_hash,
-            expected_payload_bytes=slot_codec.payload_bytes,
+            expected_payload_bytes=codec.slot_bytes,
         )
-        slot_codec.staging_view(0).copy_(
+        slot_staging.copy_(
             torch.tensor(list(restored_payload), dtype=torch.uint8, device=device)
         )
-        slot_codec.restore_from_staging(destination_group, 0)
+        codec.scatter_slot(slot_staging, destination_group)
         torch.cuda.synchronize()
 
         assert bool(ret_mask.all())

@@ -36,9 +36,11 @@ def _build_worker(config):
     variant = select_variant(config)
     logger.info("lmcache_offload: worker family=%s", variant)
     if variant == "hybrid":
-        from atom.kv_transfer.offload.hybrid.connector import HybridOffloadConnector
+        from atom.kv_transfer.offload.hybrid.dsv4.connector import (
+            DSV4OffloadConnector,
+        )
 
-        return HybridOffloadConnector(config)
+        return DSV4OffloadConnector(config)
 
     from atom.kv_transfer.offload.dense.connector import DenseOffloadConnector
 
@@ -49,9 +51,11 @@ def _build_scheduler(config):
     variant = select_variant(config)
     logger.info("lmcache_offload: scheduler family=%s", variant)
     if variant == "hybrid":
-        from atom.kv_transfer.offload.hybrid.connector import HybridOffloadScheduler
+        from atom.kv_transfer.offload.hybrid.dsv4.connector import (
+            DSV4OffloadScheduler,
+        )
 
-        return HybridOffloadScheduler(config)
+        return DSV4OffloadScheduler(config)
 
     from atom.kv_transfer.offload.dense.connector import DenseOffloadScheduler
 

@@ -11,12 +11,15 @@ lives in :mod:`.codec`, while LMCache and scheduler orchestration live in
 from __future__ import annotations
 
 import hashlib
+import heapq
 import json
 import os
+import threading
 from collections import OrderedDict
 from collections.abc import Iterator, MutableSet
 from dataclasses import dataclass
 from math import lcm
+from numbers import Integral
 
 
 @dataclass(frozen=True)
@@ -35,9 +38,80 @@ class DSV4OffloadProfile:
     index_head_dim: int
 
 
-# Compatibility name for callers that imported the former single-use generic
-# profile.  New DSV4 code should use ``DSV4OffloadProfile`` directly.
-HybridProfile = DSV4OffloadProfile
+def _integer(name: str, value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        # Admission exposes ValueError for all invalid capacity/id values.
+        raise ValueError(f"{name} must be an integer")  # noqa: TRY004
+    return int(value)
+
+
+class DSV4StagingAdmission:
+    """Allocate connector-owned DSV4 checkpoint staging rows.
+
+    A row remains acquired until its GPU work has been fenced.  Rows whose
+    completion cannot be proven are quarantined instead of being reused.
+    """
+
+    def __init__(self, num_slots: int) -> None:
+        capacity = _integer("num_slots", num_slots)
+        if capacity <= 0:
+            raise ValueError(f"num_slots must be > 0, got {capacity}")
+
+        self._capacity = capacity
+        self._free_ids = list(range(capacity))
+        self._acquired = [False] * capacity
+        self._quarantined = [False] * capacity
+        self._lock = threading.Lock()
+
+    @property
+    def capacity(self) -> int:
+        return self._capacity
+
+    @property
+    def num_free(self) -> int:
+        with self._lock:
+            return len(self._free_ids)
+
+    def try_acquire(self) -> int | None:
+        """Return the smallest available row ID, or ``None`` when full."""
+        with self._lock:
+            if not self._free_ids:
+                return None
+            slot_id = heapq.heappop(self._free_ids)
+            self._acquired[slot_id] = True
+            return slot_id
+
+    def release(self, slot_id: int) -> None:
+        """Return a row after the caller has synchronized its GPU work."""
+        normalized_id = _integer("slot id", slot_id)
+        if not 0 <= normalized_id < self._capacity:
+            raise ValueError(
+                f"slot id {normalized_id} outside pool [0, {self._capacity})"
+            )
+
+        with self._lock:
+            if self._quarantined[normalized_id]:
+                raise ValueError(f"slot id {normalized_id} is quarantined")
+            if not self._acquired[normalized_id]:
+                raise ValueError(f"slot id {normalized_id} is not acquired")
+            self._acquired[normalized_id] = False
+            heapq.heappush(self._free_ids, normalized_id)
+
+    def quarantine(self, slot_id: int) -> None:
+        """Permanently remove a row whose GPU completion is uncertain."""
+        normalized_id = _integer("slot id", slot_id)
+        if not 0 <= normalized_id < self._capacity:
+            raise ValueError(
+                f"slot id {normalized_id} outside pool [0, {self._capacity})"
+            )
+
+        with self._lock:
+            if self._quarantined[normalized_id]:
+                return
+            if not self._acquired[normalized_id]:
+                raise ValueError(f"slot id {normalized_id} is not acquired")
+            self._acquired[normalized_id] = False
+            self._quarantined[normalized_id] = True
 
 
 def build_dsv4_profile(config, *, chunk_size: int) -> DSV4OffloadProfile:
@@ -264,7 +338,7 @@ def _compute_slot_fingerprint(
 
 __all__ = [
     "DSV4OffloadProfile",
-    "HybridProfile",
+    "DSV4StagingAdmission",
     "build_dsv4_profile",
     "select_pending_sidecar_boundary",
     "sidecar_boundary_tokens",
