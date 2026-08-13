@@ -375,14 +375,7 @@ class MLAAttention(nn.Module):
             self.dcp_rank = 0
             self._cp_triton_ctx = None
 
-        # Whether DCP decode can run in persistent mode on this GPU (gfx950 has
-        # the lse persistent kernel, gfx942 does not — see dcp_utils). Cached
-        # once here to avoid a per-forward get_gfx() (graph-break).
         self.dcp_persistent_supported = dcp_persistent_supported()
-
-        # Whether the DCP sparse-prefill merge may accumulate in bf16 on this
-        # GPU (gfx950 yes, gfx942 loses ~3.5pp — see dcp_utils). Cached here for
-        # the same reason as above: no per-forward get_gfx().
         self.dcp_prefill_merge_bf16_ok = dcp_prefill_merge_bf16_ok()
 
         # Compacted per-layer sparse offsets for DCP decode; rebound by the
@@ -1116,13 +1109,6 @@ class MLAAttention(nn.Module):
                 # of each query token's region, so the region lengths are the
                 # per-rank (and per-layer) ones, not the global sparse_kv_indptr.
                 # Same substitution the decode path makes.
-                #
-                # Slice to num_requests+1: mla_prefill_asm_fwd grids from
-                # `kv_indptr->size(0)-1` (asm_mla.cu:1208), so the full
-                # max_num_batched_tokens buffer faulted (MEMORY_VIOLATION, ~32k
-                # stale rows). DCP prefill now uses mla_decode_fwd (grids from
-                # qo_indptr), so the slice is defensive here but kept: correct
-                # length, and mandatory if the asm-prefill path is used again.
                 paged_kv_indptr = self.dcp_sparse_kv_indptr_buffer[
                     : paged_cu_seqlens_q.shape[0]
                 ]
@@ -1216,14 +1202,6 @@ class MLAAttention(nn.Module):
                 "(empty KV cache?)"
             )
             if self.is_sparse_mla and self.dcp_world_size > 1:
-                # Rows this rank owns no candidate of (unavoidable at prefill:
-                # query token 0 has a single candidate, so W-1 ranks are empty for
-                # it) get a zero-length KV region. mla_decode_fwd handles
-                # that correctly for the LSE (-inf, i.e. zero weight downstream)
-                # but leaves `o` as NaN from the 0/0 in acc/e_sum. Zero those rows:
-                # cp_lse_ag_out_rs computes `o * exp(lse - global_lse)`, and
-                # NaN * 0 would poison the whole merged row. Derived from the
-                # kernel's own LSE, so no side-channel buffer and no fake KV.
                 o = torch.where(
                     torch.isfinite(final_lse).unsqueeze(-1), o, torch.zeros_like(o)
                 )
@@ -1364,10 +1342,6 @@ class MLAAttention(nn.Module):
                     paged_kv_indices = self.sparse_kv_indices_buffer
                     paged_kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens
                     if self.dcp_world_size > 1:
-                        # DCP compacts each rank's owned top-k to the front, so
-                        # the region length is shorter than the global clip and
-                        # varies per layer. The indexer just rewrote these
-                        # offsets for this layer.
                         paged_kv_indptr = self.dcp_sparse_kv_indptr_buffer
 
             dp_size = get_dp_group().world_size

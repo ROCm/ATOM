@@ -84,12 +84,6 @@ def dcp_prefill_merge_bf16_ok() -> bool:
     not free: it doubles this collective's bytes and cost ~18% end-to-end wall
     clock on the gfx950 200-shot run (1:48:35 -> 1:28:54).
 
-    Deliberately an *allowlist*: bf16 is enabled only where it has been measured
-    safe. An unrecognised arch keeps the fp32 merge, because the failure mode of
-    guessing wrong is a silent multi-pp accuracy loss, while the cost of being
-    conservative is only prefill throughput. Kept separate from
-    ``dcp_persistent_supported`` -- both happen to be gfx950 today, but one is
-    about kernel availability and the other about numerics.
     """
     from aiter.jit.utils.chip_info import get_gfx
 

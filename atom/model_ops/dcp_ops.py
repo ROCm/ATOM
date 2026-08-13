@@ -119,16 +119,8 @@ def correct_attn_out(out, lses, cp_rank, ctx=None):
     """
     B, H, D = out.shape
     N = lses.shape[0]
-    # N (= cp world size) is baked into the kernel as N_ROUNDED and consumed by
-    # tl.arange, which requires a power of two. DCP world sizes are always 2/4/8;
-    # assert here so a non-pow2 size fails loudly instead of as a cryptic Triton
-    # compile error (and the unmasked LSE load stays in-bounds).
     assert (N & (N - 1)) == 0, f"cp world size must be a power of two, got {N}"
 
-    # Allocate the global-LSE output with the SAME B/H strides as a slice of
-    # `lses`: the kernel writes vlse using lses_stride_B/H (it shares the offset
-    # math), so matching strides keeps that write correct even if `lses` is a
-    # non-contiguous view, instead of relying on both happening to be contiguous.
     lse = torch.empty_strided(
         (B, H), (lses.stride(1), lses.stride(2)), device=lses.device, dtype=lses.dtype
     )

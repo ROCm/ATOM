@@ -265,9 +265,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             )
             # DCP sparse decode compacts each rank's owned top-k slots to the
             # front (no -1 holes), so the per-request region length becomes data-
-            # AND layer-dependent. These
-            # hold the recomputed (per-layer) offsets; the layer-invariant
-            # var["sparse_kv_indptr"] stays as-is for the non-DCP paths.
+            # AND layer-dependent.
             self._dcp_sparse_kv_indptr_gpu = torch.zeros(
                 self.max_num_batched_tokens + 1,
                 dtype=torch.int32,
@@ -404,7 +402,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 impl = getattr(module, "impl", None)
                 # DCP compact buffers ride along with the indices buffer: the
                 # indexer writes all three, the attention impl reads the indices
-                # and the offsets in the same layer (see ch.5).
+                # and the offsets in the same layer.
                 for tgt in (module, impl):
                     if tgt is None or not hasattr(tgt, "sparse_kv_indices_buffer"):
                         continue
@@ -1022,11 +1020,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.dcp_indexer_local_cu_seqlens = torch.from_numpy(
             cu_pad.astype(np.int32)
         ).to(dev, non_blocking=True)
-        # gather_index is an index_select source; int32 halves both the transfer
-        # and the on-device index tensor vs int64. Safe: src indexes the
-        # [W, sum(Lpad)] all-gather buffer, so src < W*local_total ~= total_kv
-        # (the KV token count) -- ~1M even at a 1M context, far below 2^31. The
-        # host math stays in int64 for headroom; only the tensor is int32.
         attn_metadata.dcp_indexer_gather_index = torch.from_numpy(
             src.astype(np.int32)
         ).to(dev, non_blocking=True)

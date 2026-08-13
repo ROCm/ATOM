@@ -1458,11 +1458,6 @@ class Config:
             # uses the round-robin CP (cprr) MLA kernel, which is persistent-only
             # and ships only on gfx950; on gfx942 the non-persistent fallback
             # ignores the cprr masking and silently produces WRONG output.
-            #
-            # Gate on speculative_config: only spec-decode + DCP hits the q>1 cprr
-            # path. Plain (q==1) DCP decode is fine on gfx942, so this assert must
-            # NOT fire for it -- the original #1781 guard was under `if dcp>1` with
-            # no spec-decode check and wrongly rejected plain DCP on gfx942.
             if self.speculative_config is not None:
                 from aiter.jit.utils.chip_info import get_gfx
 
