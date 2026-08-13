@@ -1578,9 +1578,7 @@ class MLAAttention(nn.Module):
             )
             return
 
-        kv_c, k_pe = kv_lora.split(
-            [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-        )
+        kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         kv_c = kv_a_layernorm(kv_c)
         # RoPE the positional lane only -- there is no query on the context
         # path. The rope kernel is 2-component (rotates query AND key, in place
