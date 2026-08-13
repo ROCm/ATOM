@@ -23,7 +23,11 @@ from atom.kv_transfer.disaggregation.types import (
     SaveOperationId,
     KVTransferRegion,
 )
-from atom.kv_transfer.offload.hybrid import connector as connector_module
+from atom.kv_transfer.offload.hybrid.dsv4 import connector as connector_module
+from atom.kv_transfer.offload.hybrid.dsv4.codec import (
+    DSV4CheckpointCodec,
+    DSV4PageSlotCodec,
+)
 from atom.kv_transfer.offload.hybrid.connector import (
     HybridOffloadConnector as LMCacheOffloadConnector,
 )
@@ -43,6 +47,7 @@ from atom.kv_transfer.offload.metadata import (
     SlotLoadSpec,
     SlotSaveSpec,
 )
+from atom.model_engine.state_pool import StateCheckpointCopy
 from atom.kv_transfer.offload.hybrid.sidecar_format import (
     HEADER_BYTES,
     SidecarFormatError,
@@ -89,10 +94,14 @@ class _FakeEvent:
         *,
         record_error: Exception | None = None,
         synchronize_error: Exception | None = None,
+        query_result: bool = True,
+        query_error: Exception | None = None,
     ) -> None:
         self._order = order
         self.record_error = record_error
         self.synchronize_error = synchronize_error
+        self.query_result = query_result
+        self.query_error = query_error
 
     def record(self, stream) -> None:
         self._order.append("event-record")
@@ -103,6 +112,12 @@ class _FakeEvent:
         self._order.append("event-sync")
         if self.synchronize_error is not None:
             raise self.synchronize_error
+
+    def query(self) -> bool:
+        self._order.append("event-query")
+        if self.query_error is not None:
+            raise self.query_error
+        return self.query_result
 
 
 class _FakeRPCStream:
@@ -158,11 +173,12 @@ class _FakeSlotCodec:
         self.order = order
         self.snapshot_error: Exception | None = None
         self.restore_error: Exception | None = None
+        self.snapshot_groups: list[int] = []
         self.row = _FakeRow(order)
 
     def snapshot_to_staging(self, group, staging_id, stream=None) -> None:
         self.order.append("snapshot")
-        assert group == 2
+        self.snapshot_groups.append(group)
         assert staging_id >= 0
         assert isinstance(stream, _FakeRPCStream)
         if self.snapshot_error is not None:
@@ -179,6 +195,25 @@ class _FakeSlotCodec:
         assert isinstance(stream, _FakeTransferStream)
         if self.restore_error is not None:
             raise self.restore_error
+
+
+class _FakeUnifiedCodec:
+    slot_bytes = len(_PAYLOAD)
+    payload_bytes = slot_bytes
+    device = torch.device("cuda:0")
+
+    def __init__(self, order: list[str]) -> None:
+        self.order = order
+        self.gathered: list[tuple[int, torch.Tensor, object]] = []
+        self.scattered: list[tuple[torch.Tensor, int, object]] = []
+
+    def gather_slot(self, group, dst, *, stream=None) -> None:
+        self.order.append("unified-gather")
+        self.gathered.append((group, dst, stream))
+
+    def scatter_slot(self, src, group, *, stream=None) -> None:
+        self.order.append("unified-scatter")
+        self.scattered.append((src, group, stream))
 
 
 class _FakeAdmission:
@@ -435,8 +470,15 @@ def _worker(
     connector._pending_save_ops = {}
     connector._pending_legacy_save_ops = {}
     connector._save_req_locks = {}
+    connector._deferred_checkpoint_saves = []
+    connector._checkpoint_staging_fences = {}
+    connector._done_checkpoint_staging = set()
+    connector._aborted_checkpoint_staging = set()
+    connector._quarantined_checkpoint_staging = set()
     connector._engine = _FakeEngine(order)
     connector._slot_codec = _FakeSlotCodec(order)
+    connector._checkpoint_codec = None
+    connector._slot_staging = None
     connector._slot_store = _FakeStore(order)
     connector._slot_admission = _FakeAdmission(
         order,
@@ -499,6 +541,21 @@ def _save_request(*, page: bool = True) -> LMCacheReqMeta:
             boundary_block_hash=0x1234,
             source_group=2,
         ),
+    )
+
+
+def _checkpoint_copy(
+    *,
+    destination_group: int = 7,
+    copy_id: int = 0,
+) -> StateCheckpointCopy:
+    return StateCheckpointCopy(
+        request_id=17,
+        boundary_tokens=8,
+        boundary_block_hash=0x1234,
+        source_group=2,
+        destination_group=destination_group,
+        copy_id=copy_id,
     )
 
 
@@ -720,25 +777,23 @@ def test_stateful_page_initialization_builds_all_slot_components_after_engine(
     sensitive_model_name = "private-org/sensitive-model"
     caplog.set_level(logging.INFO, logger="atom")
 
-    class _Codec:
-        payload_bytes = 40
-
-        def __init__(self, regions, **kwargs) -> None:
-            order.append("codec")
-            captured["codec"] = (regions, kwargs)
-            self.staging_slots = kwargs["staging_slots"]
-
     class _Store:
         def __init__(self, engine, **kwargs) -> None:
             order.append("store-adapter")
             assert engine is connector._engine
             captured["store"] = (engine, kwargs)
 
-    monkeypatch.setattr(connector_module, "ATOMSlotSidecarCodec", _Codec)
-    monkeypatch.setattr(connector_module, "SlotSidecarStore", _Store)
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(connector_module, "DSV4CheckpointStore", _Store)
     monkeypatch.setenv("OFFLOAD_SLOT_STAGING_SLOTS", "3")
 
+    regions = [
+        KVTransferRegion(
+            base_addr=0x1000,
+            total_bytes=64,
+            unit_bytes=16,
+            reverse_indexed=True,
+        )
+    ]
     connector = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
     connector._config = SimpleNamespace(
         model=sensitive_model_name,
@@ -750,19 +805,19 @@ def test_stateful_page_initialization_builds_all_slot_components_after_engine(
     connector.block_size = 64
     connector.profile = SimpleNamespace(kv_head_dim=512, index_head_dim=128)
     connector._engine = object()
-    connector._codec = SimpleNamespace(bytes_per_block=96)
+    connector._codec = DSV4PageSlotCodec(
+        page_regions=[KVTransferRegion(0x2000, 384, 96)],
+        slot_regions=regions,
+        num_blocks=4,
+        num_slots=4,
+        device="cpu",
+    )
     connector._slot_codec = None
+    connector._checkpoint_codec = None
+    connector._slot_staging = None
     connector._slot_store = None
     connector._slot_admission = None
     connector._slot_fingerprint = None
-    regions = [
-        KVTransferRegion(
-            base_addr=0x1000,
-            total_bytes=64,
-            unit_bytes=16,
-            reverse_indexed=True,
-        )
-    ]
     transfer_tensors = SimpleNamespace(
         swa_block_regions=regions,
         num_slots=4,
@@ -776,10 +831,10 @@ def test_stateful_page_initialization_builds_all_slot_components_after_engine(
         tp_rank=1,
     )
 
-    assert order == ["codec", "store-adapter"]
-    assert captured["codec"][0] is regions
-    assert captured["codec"][1]["num_slots"] == 4
-    assert captured["codec"][1]["staging_slots"] == 3
+    assert order == ["store-adapter"]
+    assert connector._slot_codec is connector._codec
+    assert isinstance(connector._checkpoint_codec, DSV4CheckpointCodec)
+    assert connector._slot_staging.shape == (3, 16)
     assert connector._slot_admission.capacity == 3
     assert connector._slot_store is not None
     assert connector._slot_fingerprint == _compute_slot_fingerprint(
@@ -803,7 +858,7 @@ def test_stateful_page_initialization_builds_all_slot_components_after_engine(
     assert len(registration_logs) == 1
     registration_log = registration_logs[0]
     assert "page_bytes_per_block=96" in registration_log
-    assert "slot_bytes=40" in registration_log
+    assert "slot_bytes=16" in registration_log
     assert "slot_staging_slots=3" in registration_log
     assert f"fingerprint={connector._slot_fingerprint.hex()[:12]}" in registration_log
     assert connector._slot_fingerprint.hex() not in registration_log
@@ -860,6 +915,409 @@ def test_start_load_kv_issues_slot_snapshot_on_rpc_stream_before_return(
     assert order.index("snapshot") < order.index("event-record") < order.index("submit")
     assert len(connector._save_executor.calls) == 1
     assert connector._done_save == set()
+
+
+def test_unified_codec_gathers_into_connector_owned_slot_row(monkeypatch):
+    order = []
+    stream = _patch_rpc_cuda(monkeypatch, order)
+    connector = _worker(order)
+    codec = _FakeUnifiedCodec(order)
+    connector._slot_codec = codec
+    connector._slot_staging = torch.empty((1, len(_PAYLOAD)), dtype=torch.uint8)
+
+    snapshot = connector._snapshot_reserved_slot_save(
+        _save_request(page=False),
+        source_group=7,
+        staging_id=0,
+    )
+
+    assert snapshot.snapshot_ok is True
+    assert len(codec.gathered) == 1
+    group, row, used_stream = codec.gathered[0]
+    assert group == 7
+    assert row.data_ptr() == connector._slot_staging[0].data_ptr()
+    assert used_stream is stream
+
+
+def test_unified_codec_scatters_from_connector_owned_slot_row():
+    order = []
+    connector = _worker(order)
+    codec = _FakeUnifiedCodec(order)
+    connector._slot_codec = codec
+    connector._slot_staging = torch.empty((1, len(_PAYLOAD)), dtype=torch.uint8)
+    payload = torch.tensor(list(_PAYLOAD), dtype=torch.uint8)
+
+    connector._restore_slot_payload(payload, 0, destination_group=3)
+
+    assert connector._slot_staging[0].tolist() == list(_PAYLOAD)
+    assert len(codec.scattered) == 1
+    row, group, stream = codec.scattered[0]
+    assert row.data_ptr() == connector._slot_staging[0].data_ptr()
+    assert group == 3
+    assert isinstance(stream, _FakeTransferStream)
+
+
+def test_native_checkpoint_save_defers_until_copy_then_snapshots_destination(
+    monkeypatch,
+):
+    order = []
+    _patch_rpc_cuda(monkeypatch, order)
+    connector = _worker(order)
+    connector._save_executor = _DeferredExecutor(order)
+    checkpoint = _checkpoint_copy(destination_group=7)
+    request = _save_request(page=False)
+    request.save_operation = SaveOperationId(request.req_id, 9)
+    metadata = _metadata(request)
+    metadata.state_checkpoint_copies = [checkpoint]
+
+    connector.start_load_kv(metadata)
+
+    assert connector._slot_codec.snapshot_groups == []
+    assert connector._save_executor.calls == []
+    assert len(connector._deferred_checkpoint_saves) == 1
+    assert connector._slot_admission.num_free == 1
+    assert connector._pending_save_ops == {}
+
+    connector.state_checkpoint_copies_issued([checkpoint])
+
+    assert connector._slot_codec.snapshot_groups == [7]
+    assert order.index("snapshot") < order.index("event-record") < order.index("submit")
+    assert len(connector._save_executor.calls) == 1
+    assert connector._deferred_checkpoint_saves == []
+
+    fn, args = connector._save_executor.calls[0]
+    fn(*args)
+    result = connector.get_finished()
+    assert result.finished_saving == {request.save_operation}
+    assert result.finished_sidecar_saving == {request.save_operation}
+    assert result.finished_checkpoint_staging == {checkpoint.copy_id}
+    assert result.aborted_checkpoint_staging == set()
+    assert connector._slot_admission.released == [0]
+
+
+def test_nonmatching_checkpoint_copy_keeps_live_slot_fallback(monkeypatch):
+    order = []
+    _patch_rpc_cuda(monkeypatch, order)
+    connector = _worker(order)
+    connector._save_executor = _DeferredExecutor(order)
+    unrelated = StateCheckpointCopy(
+        request_id=99,
+        boundary_tokens=8,
+        boundary_block_hash=0x1234,
+        source_group=2,
+        destination_group=7,
+    )
+
+    connector.start_load_kv_with_state_checkpoints(
+        _metadata(_save_request(page=False)),
+        [unrelated],
+    )
+
+    assert connector._slot_codec.snapshot_groups == [2]
+    assert len(connector._save_executor.calls) == 1
+    assert connector._deferred_checkpoint_saves == []
+
+
+def test_regular_slot_without_checkpoint_copy_fails_closed_but_saves_page(monkeypatch):
+    order = []
+    _patch_rpc_cuda(monkeypatch, order)
+    connector = _worker(order)
+    connector._save_executor = _DeferredExecutor(order)
+    request = _save_request(page=True)
+    request.is_last_prefill = False
+
+    connector.start_load_kv_with_state_checkpoints(_metadata(request), [])
+
+    assert connector._slot_codec.snapshot_groups == []
+    assert connector._slot_admission.num_free == 1
+    assert len(connector._save_executor.calls) == 1
+
+    fn, args = connector._save_executor.calls[0]
+    fn(*args)
+
+    assert len(connector._engine.store_calls) == 1
+    assert connector._slot_store.put_calls == []
+    assert connector._failed_sidecar_save == {17}
+    assert connector._done_save == {17}
+
+
+def test_checkpoint_copy_generation_does_not_consume_stale_intent(monkeypatch):
+    order = []
+    _patch_rpc_cuda(monkeypatch, order)
+    connector = _worker(order, staging_slots=2)
+    connector._save_executor = _DeferredExecutor(order)
+    old_copy = _checkpoint_copy(copy_id=10)
+    new_copy = _checkpoint_copy(copy_id=11)
+    old_request = _save_request(page=False)
+    old_request.save_operation = SaveOperationId(17, 10)
+    new_request = _save_request(page=False)
+    new_request.save_operation = SaveOperationId(17, 11)
+
+    connector.start_load_kv_with_state_checkpoints(
+        _metadata(old_request),
+        [old_copy],
+    )
+    connector.start_load_kv_with_state_checkpoints(
+        _metadata(new_request),
+        [new_copy],
+    )
+    connector.state_checkpoint_copies_issued([new_copy])
+
+    assert len(connector._save_executor.calls) == 1
+    assert [
+        deferred.checkpoint_identity[0]
+        for deferred in connector._deferred_checkpoint_saves
+    ] == [10]
+
+    connector.abort_state_checkpoint_copies([old_copy])
+    result = connector.get_finished()
+    assert result.finished_saving == {old_request.save_operation}
+    assert result.failed_sidecar_saving == {old_request.save_operation}
+    assert result.aborted_checkpoint_staging == {old_copy.copy_id}
+
+
+def test_deferred_checkpoint_submission_failure_releases_snapshot(monkeypatch):
+    order = []
+    _patch_rpc_cuda(monkeypatch, order)
+    connector = _worker(order)
+    connector._save_executor = _RejectingExecutor(order)
+    checkpoint = _checkpoint_copy()
+
+    connector.start_load_kv_with_state_checkpoints(
+        _metadata(_save_request()),
+        [checkpoint],
+    )
+    connector.state_checkpoint_copies_issued([checkpoint])
+
+    assert connector._slot_codec.snapshot_groups == [checkpoint.destination_group]
+    assert order.index("snapshot") < order.index("submit") < order.index("event-sync")
+    assert connector._slot_admission.released == [0]
+    assert connector._failed_sidecar_save == {17}
+    assert connector._done_save == {17}
+    assert connector._pending_save_ops == {}
+
+
+def test_checkpoint_staging_completion_does_not_wait_for_save_executor(monkeypatch):
+    order = []
+    _patch_rpc_cuda(monkeypatch, order)
+    connector = _worker(order)
+    connector._save_executor = _DeferredExecutor(order)
+    checkpoint = _checkpoint_copy(copy_id=33)
+
+    connector.start_load_kv_with_state_checkpoints(
+        _metadata(_save_request(page=False)),
+        [checkpoint],
+    )
+    connector.state_checkpoint_copies_issued([checkpoint])
+
+    result = connector.get_finished()
+    assert result.finished_checkpoint_staging == {33}
+    assert result.finished_saving == set()
+    assert len(connector._save_executor.calls) == 1
+
+
+def test_checkpoint_and_temp_row_release_before_storage_publication(monkeypatch):
+    order = []
+    _patch_rpc_cuda(monkeypatch, order)
+    connector = _worker(order)
+    connector._save_executor = _DeferredExecutor(order)
+    checkpoint = _checkpoint_copy(copy_id=37)
+
+    connector.start_load_kv_with_state_checkpoints(
+        _metadata(_save_request(page=True)),
+        [checkpoint],
+    )
+    connector.state_checkpoint_copies_issued([checkpoint])
+
+    # The native group lease is independently releasable at gather completion,
+    # before the background save even starts D2H or storage work.
+    staged = connector.get_finished()
+    assert staged.finished_checkpoint_staging == {37}
+    assert staged.finished_saving == set()
+
+    fn, args = connector._save_executor.calls[0]
+    fn(*args)
+
+    # The connector-owned temp row is needed only through D2H. PAGE visibility
+    # and AOS1 publication must not keep scarce GPU staging capacity reserved.
+    assert order.index("d2h") < order.index("release")
+    assert order.index("release") < order.index("lookup")
+    assert order.index("release") < order.index("put")
+
+
+def test_checkpoint_staging_waits_for_ready_event(monkeypatch):
+    order = []
+    event = _FakeEvent(order, query_result=False)
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda *args, **kwargs: _FakeRPCStream(order),
+    )
+    monkeypatch.setattr(torch.cuda, "Event", lambda *args, **kwargs: event)
+    connector = _worker(order)
+    connector._save_executor = _DeferredExecutor(order)
+    checkpoint = _checkpoint_copy(copy_id=35)
+
+    connector.start_load_kv_with_state_checkpoints(
+        _metadata(_save_request(page=False)),
+        [checkpoint],
+    )
+    connector.state_checkpoint_copies_issued([checkpoint])
+
+    assert connector.get_finished().finished_checkpoint_staging == set()
+    event.query_result = True
+    assert connector.get_finished().finished_checkpoint_staging == {35}
+
+
+def test_checkpoint_save_backpressure_still_fences_native_copy(monkeypatch):
+    order = []
+    _patch_rpc_cuda(monkeypatch, order)
+    connector = _worker(order)
+    connector._save_admission = threading.BoundedSemaphore(0)
+    checkpoint = _checkpoint_copy(copy_id=36)
+
+    connector.start_load_kv_with_state_checkpoints(
+        _metadata(_save_request(page=False)),
+        [checkpoint],
+    )
+    connector.state_checkpoint_copies_issued([checkpoint])
+
+    result = connector.get_finished()
+    assert result.finished_checkpoint_staging == {36}
+    assert result.failed_sidecar_saving == {17}
+    assert connector._slot_codec.snapshot_groups == []
+
+
+def test_unknown_checkpoint_gpu_completion_quarantines_lease(monkeypatch):
+    order = []
+    event = _FakeEvent(
+        order,
+        query_error=RuntimeError("query failed"),
+        synchronize_error=RuntimeError("sync failed"),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda *args, **kwargs: _FakeRPCStream(order),
+    )
+    monkeypatch.setattr(torch.cuda, "Event", lambda *args, **kwargs: event)
+    connector = _worker(order)
+    connector._save_executor = _DeferredExecutor(order)
+    checkpoint = _checkpoint_copy(copy_id=34)
+
+    connector.start_load_kv_with_state_checkpoints(
+        _metadata(_save_request(page=False)),
+        [checkpoint],
+    )
+    connector.state_checkpoint_copies_issued([checkpoint])
+
+    result = connector.get_finished()
+    assert result.finished_checkpoint_staging == set()
+    assert result.aborted_checkpoint_staging == set()
+    assert connector._quarantined_checkpoint_staging == {34}
+
+
+def test_native_checkpoint_build_failure_aborts_deferred_snapshot(monkeypatch):
+    order = []
+    _patch_rpc_cuda(monkeypatch, order)
+    connector = _worker(order)
+    connector._save_executor = _DeferredExecutor(order)
+    checkpoint = _checkpoint_copy()
+
+    connector.start_load_kv_with_state_checkpoints(
+        _metadata(_save_request(page=False)),
+        [checkpoint],
+    )
+    connector.abort_state_checkpoint_copies([checkpoint])
+
+    assert connector._slot_codec.snapshot_groups == []
+    assert connector._slot_admission.released == []
+    assert connector._slot_admission.num_free == 1
+    assert connector._failed_sidecar_save == {17}
+    assert connector._done_save == {17}
+    assert connector._pending_save_ops == {}
+
+
+def test_multi_checkpoint_hooks_isolate_child_failures():
+    calls = []
+
+    class _Failing:
+        def state_checkpoint_copies_issued(self, _copies):
+            raise RuntimeError("issued failed")
+
+        def abort_state_checkpoint_copies(self, _copies):
+            calls.append("failing-abort")
+            raise RuntimeError("abort failed")
+
+    class _Healthy:
+        def state_checkpoint_copies_issued(self, copies):
+            calls.append(("issued", copies))
+
+        def abort_state_checkpoint_copies(self, copies):
+            calls.append(("abort", copies))
+
+    multi = MultiConnector.__new__(MultiConnector)
+    multi._connectors = [_Failing(), _Healthy()]
+    copies = [_checkpoint_copy()]
+
+    multi.state_checkpoint_copies_issued(copies)
+    multi.abort_state_checkpoint_copies(copies)
+
+    assert calls == [
+        "failing-abort",
+        ("issued", copies),
+        "failing-abort",
+        ("abort", copies),
+    ]
+
+
+def test_checkpoint_hook_failure_terminals_all_selected_intents(monkeypatch):
+    connector = _worker([])
+    first_copy = _checkpoint_copy(copy_id=20)
+    second_copy = StateCheckpointCopy(
+        request_id=18,
+        boundary_tokens=8,
+        boundary_block_hash=0x5678,
+        source_group=3,
+        destination_group=6,
+        copy_id=21,
+    )
+    first = _save_request(page=False)
+    first.save_operation = SaveOperationId(17, 20)
+    second = LMCacheReqMeta(
+        req_id=18,
+        token_ids=list(range(8)),
+        block_ids=[12, 13],
+        slot_save_spec=SlotSaveSpec(
+            boundary_tokens=8,
+            boundary_block_hash=0x5678,
+            source_group=3,
+        ),
+        save_operation=SaveOperationId(18, 21),
+    )
+    connector.start_load_kv_with_state_checkpoints(
+        _metadata(first),
+        [first_copy],
+    )
+    connector.start_load_kv_with_state_checkpoints(
+        _metadata(second),
+        [second_copy],
+    )
+    monkeypatch.setattr(
+        connector,
+        "_submit_deferred_checkpoint_save",
+        lambda _deferred: (_ for _ in ()).throw(RuntimeError("unexpected")),
+    )
+
+    connector.state_checkpoint_copies_issued([first_copy, second_copy])
+
+    result = connector.get_finished()
+    assert result.finished_saving == {first.save_operation, second.save_operation}
+    assert result.failed_sidecar_saving == {
+        first.save_operation,
+        second.save_operation,
+    }
+    assert connector._deferred_checkpoint_saves == []
 
 
 def test_save_submission_failure_releases_snapshot_and_completes_save(monkeypatch):
@@ -1516,9 +1974,15 @@ def test_page_and_slot_save_polls_partial_page_and_sidecar_visibility(
         < order.index("contains")
         < order.index("done")
     )
-    assert order.index("lookup") < order.index("d2h") < order.index("put")
-    assert max(i for i, item in enumerate(order) if item == "contains") < order.index(
-        "release"
+    assert (
+        order.index("event-sync")
+        < order.index("d2h")
+        < order.index("release")
+        < order.index("store")
+        < order.index("put")
+    )
+    assert order.index("release") < min(
+        i for i, item in enumerate(order) if item == "contains"
     )
     assert clock.sleeps == [0.1, 0.1]
     assert connector._done_save == {17}
@@ -1560,6 +2024,66 @@ def test_page_and_slot_save_polls_partial_page_and_sidecar_visibility(
     assert "private-sensitive-model" not in rendered_logs
 
 
+@pytest.mark.parametrize("blocked_operation", ["put", "contains"])
+def test_slot_temp_row_is_free_while_checkpoint_storage_blocks(
+    monkeypatch,
+    blocked_operation,
+):
+    order = []
+    _patch_rpc_cuda(monkeypatch, order)
+    connector = _worker(order)
+    reached_storage = threading.Event()
+    unblock_storage = threading.Event()
+    original = getattr(connector._slot_store, blocked_operation)
+
+    def blocked(*args, **kwargs):
+        order.append(blocked_operation)
+        assert connector._slot_admission.num_free == 1
+        assert connector._slot_admission.released == [0]
+        reached_storage.set()
+        if not unblock_storage.wait(timeout=5):
+            raise TimeoutError("test did not release blocked checkpoint storage")
+        return original(*args, **kwargs)
+
+    setattr(connector._slot_store, blocked_operation, blocked)
+    executor = ThreadPoolExecutor(max_workers=1)
+    connector._save_executor = executor
+    try:
+        connector.start_load_kv(_metadata(_save_request()))
+        assert reached_storage.wait(timeout=5)
+        assert order.index("d2h") < order.index("release")
+        assert order.index("release") < order.index(blocked_operation)
+    finally:
+        unblock_storage.set()
+        executor.shutdown(wait=True)
+
+    assert connector._done_sidecar_save == {17}
+    assert connector._failed_sidecar_save == set()
+
+
+def test_post_d2h_release_failure_quarantines_row_and_keeps_page_save(monkeypatch):
+    order = []
+    _patch_rpc_cuda(monkeypatch, order)
+    connector = _worker(order)
+
+    class _ReleaseFailsBeforeMutation(_FakeAdmission):
+        def release(self, staging_id) -> None:
+            self.order.append("release")
+            assert staging_id in self._acquired
+            raise RuntimeError("release failed before ownership transition")
+
+    admission = _ReleaseFailsBeforeMutation(order)
+    connector._slot_admission = admission
+
+    connector.start_load_kv(_metadata(_save_request()))
+
+    assert len(connector._engine.store_calls) == 1
+    assert connector._slot_store.put_calls == []
+    assert admission.quarantined == [0]
+    assert connector._done_sidecar_save == set()
+    assert connector._failed_sidecar_save == {17}
+
+
 def test_sidecar_submitted_but_not_visible_times_out_without_commit(monkeypatch):
     order = []
     _patch_rpc_cuda(monkeypatch, order)
@@ -1574,8 +2098,8 @@ def test_sidecar_submitted_but_not_visible_times_out_without_commit(monkeypatch)
     assert len(clock.sleeps) == 3
     assert connector._done_sidecar_save == set()
     assert connector._failed_sidecar_save == {17}
-    assert max(i for i, item in enumerate(order) if item == "contains") < order.index(
-        "release"
+    assert order.index("release") < min(
+        i for i, item in enumerate(order) if item == "contains"
     )
 
 
@@ -2079,6 +2603,10 @@ def test_missing_or_corrupt_sidecar_fails_whole_load_and_unpins_once(blob, caplo
 
     connector.start_load_kv(_metadata(_load_request()))
 
+    # PAGE retrieval succeeded first; the missing/corrupt SLOT must still make
+    # the composite checkpoint load fail closed rather than publishing PAGE B.
+    assert order.index("retrieve") < order.index("get")
+    assert len(connector._engine.retrieve_calls) == 1
     assert connector._done_load == set()
     assert connector._failed_load == {23}
     assert connector._engine.unpinned == ["23"]

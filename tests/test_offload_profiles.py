@@ -42,12 +42,33 @@ def test_dsv4_profile_rejects_chunk_that_splits_virtual_dcp_block():
         build_dsv4_profile(_config(), chunk_size=768)
 
 
-def test_sidecar_policy_includes_regular_and_terminal_boundaries():
+def test_state_checkpoint_can_follow_each_lmcache_chunk_with_dcp_one():
+    profile = build_dsv4_profile(
+        _config(
+            kv_cache_block_size=4,
+            decode_context_parallel_size=1,
+            state_checkpoint_interval_tokens=4,
+        ),
+        chunk_size=4,
+    )
+
+    assert profile.hash_block_size == 4
+    assert profile.resume_alignment == 4
+    assert profile.checkpoint_interval == 4
+    assert profile.sidecar_interval == 4
+    assert sidecar_boundary_tokens(
+        num_prompt_tokens=12,
+        resume_alignment=profile.resume_alignment,
+        sidecar_interval=profile.sidecar_interval,
+    ) == (4, 8, 12)
+
+
+def test_sidecar_policy_skips_off_interval_terminal_boundary():
     assert sidecar_boundary_tokens(
         num_prompt_tokens=20,
         resume_alignment=4,
         sidecar_interval=8,
-    ) == (8, 16, 20)
+    ) == (8, 16)
 
 
 def test_pending_policy_does_not_cross_later_boundary_while_one_is_inflight():

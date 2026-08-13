@@ -227,6 +227,14 @@ class MultiConnector(KVConnectorBase):
         self._pairing_tombstone_limit = 4096
         self._terminal_save_order: deque[SaveOperationId] = deque()
         self._terminal_save: set[SaveOperationId] = set()
+        # A native state-checkpoint destination may be read by more than one
+        # child connector on this rank.  Do not forward a child's staging
+        # terminal until every child registered for that exact copy generation
+        # is done; the outer TP aggregator cannot provide this local fan-in.
+        self._checkpoint_staging_expected: dict[int, set[int]] = {}
+        self._checkpoint_staging_terminal: dict[int, dict[int, bool]] = {}
+        self._terminal_checkpoint_staging_order: deque[int] = deque()
+        self._terminal_checkpoint_staging: set[int] = set()
 
     def register_kv_caches(
         self,
@@ -246,6 +254,7 @@ class MultiConnector(KVConnectorBase):
                 type(metadata).__name__,
             )
             return
+        self._register_checkpoint_staging(metas, state_checkpoint_copies)
         legacy_operations: dict[str, _LegacySaveOperation] = {}
         for connector_idx, (c, m) in enumerate(zip(self._connectors, metas)):
             if m is None:
@@ -292,6 +301,8 @@ class MultiConnector(KVConnectorBase):
         load_failed: set = set()
         sidecar_saved: set = set()
         sidecar_failed: set = set()
+        checkpoint_staged: set[int] = set()
+        checkpoint_aborted: set[int] = set()
         send_now: list = []
         completed_save_now: list = []
         unregistered_save_now: list = []
@@ -303,6 +314,19 @@ class MultiConnector(KVConnectorBase):
             load_failed |= o.failed_loading
             sidecar_saved |= o.finished_sidecar_saving
             sidecar_failed |= o.failed_sidecar_saving
+            checkpoint_terminals = set(o.finished_checkpoint_staging) | set(
+                o.aborted_checkpoint_staging
+            )
+            for copy_id in checkpoint_terminals:
+                terminal = self._consume_checkpoint_staging_terminal(
+                    connector_idx,
+                    int(copy_id),
+                    aborted=copy_id in o.aborted_checkpoint_staging,
+                )
+                if terminal is True:
+                    checkpoint_aborted.add(int(copy_id))
+                elif terminal is False:
+                    checkpoint_staged.add(int(copy_id))
             send_now.extend(o.finished_sending)
             for completion in o.finished_saving:
                 completed = self._consume_save_completion(connector_idx, completion)
@@ -325,6 +349,8 @@ class MultiConnector(KVConnectorBase):
             failed_loading=load_failed,
             finished_sidecar_saving=sidecar_saved,
             failed_sidecar_saving=sidecar_failed,
+            finished_checkpoint_staging=checkpoint_staged,
+            aborted_checkpoint_staging=checkpoint_aborted,
         )
 
         out.finished_saving = set(completed_save_now) | set(unregistered_save_now)
@@ -358,6 +384,129 @@ class MultiConnector(KVConnectorBase):
             self._pairing_tombstone_limit = 4096
             self._terminal_save_order = deque()
             self._terminal_save = set()
+        if not hasattr(self, "_checkpoint_staging_expected"):
+            self._checkpoint_staging_expected = {}
+            self._checkpoint_staging_terminal = {}
+            self._terminal_checkpoint_staging_order = deque()
+            self._terminal_checkpoint_staging = set()
+
+    @staticmethod
+    def _checkpoint_identity(copy_record: Any) -> tuple[Any, int, int, int]:
+        return (
+            copy_record.request_id,
+            int(copy_record.boundary_tokens),
+            int(copy_record.boundary_block_hash),
+            int(copy_record.source_group),
+        )
+
+    @staticmethod
+    def _slot_save_identity(req: Any) -> tuple[Any, int, int, int] | None:
+        spec = getattr(req, "slot_save_spec", None)
+        if spec is None:
+            return None
+        return (
+            req.req_id,
+            int(spec.boundary_tokens),
+            int(spec.boundary_block_hash),
+            int(spec.source_group),
+        )
+
+    def _register_checkpoint_staging(self, metas, state_checkpoint_copies) -> None:
+        """Record every child that will gather one leased checkpoint copy."""
+
+        self._ensure_pairing_state()
+        copies_by_identity = {}
+        for copy_record in state_checkpoint_copies or ():
+            try:
+                identity = self._checkpoint_identity(copy_record)
+                copy_id = int(copy_record.copy_id)
+            except (AttributeError, TypeError, ValueError):
+                # ConnectorMetadata deliberately types these records as Any for
+                # compatibility with older connectors. They still receive the
+                # opaque records; only typed checkpoint copies join this fan-in.
+                continue
+            copies_by_identity[identity] = copy_id
+        if not copies_by_identity:
+            return
+
+        for connector_idx, meta in enumerate(metas):
+            checkpoint_callback = getattr(
+                self._connectors[connector_idx],
+                "start_load_kv_with_state_checkpoints",
+                None,
+            )
+            if not callable(checkpoint_callback):
+                # This child receives only its ordinary sub-metadata and cannot
+                # read the leased destination through the extended hook.
+                continue
+            for req in getattr(meta, "requests", ()) or ():
+                try:
+                    identity = self._slot_save_identity(req)
+                except (AttributeError, TypeError, ValueError):
+                    continue
+                copy_id = copies_by_identity.get(identity)
+                if copy_id is None or copy_id in self._terminal_checkpoint_staging:
+                    continue
+                self._checkpoint_staging_expected.setdefault(copy_id, set()).add(
+                    connector_idx
+                )
+
+    def _consume_checkpoint_staging_terminal(
+        self,
+        connector_idx: int,
+        copy_id: int,
+        *,
+        aborted: bool,
+    ) -> bool | None:
+        """Return the aggregate abort flag once every local reader is terminal.
+
+        ``True`` means at least one child aborted, ``False`` means every child
+        completed, and ``None`` means the copy is still pending or tombstoned.
+        Unregistered terminals retain the historical pass-through behaviour;
+        leased copies are always registered before their child hooks can run.
+        """
+
+        self._ensure_pairing_state()
+        if copy_id in self._terminal_checkpoint_staging:
+            return None
+
+        expected = self._checkpoint_staging_expected.get(copy_id)
+        if expected is None:
+            self._remember_terminal_checkpoint_staging(copy_id)
+            return bool(aborted)
+        if connector_idx not in expected:
+            logger.warning(
+                "multi: ignoring checkpoint staging terminal from unregistered "
+                "child=%d copy_id=%d",
+                connector_idx,
+                copy_id,
+            )
+            return None
+
+        terminals = self._checkpoint_staging_terminal.setdefault(copy_id, {})
+        # A contradictory duplicate fails closed while the local fan-in is
+        # pending. Child contracts should emit exactly one terminal.
+        terminals[connector_idx] = bool(aborted) or terminals.get(connector_idx, False)
+        if not expected.issubset(terminals):
+            return None
+
+        aggregate_aborted = any(terminals[index] for index in expected)
+        self._checkpoint_staging_expected.pop(copy_id, None)
+        self._checkpoint_staging_terminal.pop(copy_id, None)
+        self._remember_terminal_checkpoint_staging(copy_id)
+        return aggregate_aborted
+
+    def _remember_terminal_checkpoint_staging(self, copy_id: int) -> None:
+        if copy_id in self._terminal_checkpoint_staging:
+            return
+        self._terminal_checkpoint_staging.add(copy_id)
+        self._terminal_checkpoint_staging_order.append(copy_id)
+        while (
+            len(self._terminal_checkpoint_staging_order) > self._pairing_tombstone_limit
+        ):
+            self._terminal_checkpoint_staging.discard(
+                self._terminal_checkpoint_staging_order.popleft()
+            )
 
     def _consume_save_completion(
         self, connector_idx: int, completion: Any

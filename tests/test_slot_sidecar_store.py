@@ -596,6 +596,20 @@ def test_failed_invalidation_fences_put_until_corrupt_copy_is_removed():
     assert len(manager.batched_put_calls) == 1
 
 
+def test_invalidation_noop_unfences_key_when_concurrently_evicted():
+    manager = _StorageManager()
+    manager.remove_result = 0
+    manager.contains_result = None
+    store = _store(manager)
+    sidecar_key = _key()
+
+    assert store.invalidate(sidecar_key) is True
+    assert store.put(sidecar_key, _aos1_blob()) is True
+    assert len(manager.remove_calls) == 1
+    assert len(manager.allocate_calls) == 1
+    assert len(manager.batched_put_calls) == 1
+
+
 @pytest.mark.parametrize(
     ("location", "retrieve_locations"),
     [

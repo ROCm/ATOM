@@ -153,6 +153,31 @@ class TestSchedule:
         assert Scheduler._pop_load_completion(completions, seq) is False
         assert completions == [88]
 
+    def test_checkpoint_staging_terminals_release_exact_leases(self):
+        completed = []
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.kv_connector = SimpleNamespace(
+            is_producer=False,
+            is_offload=True,
+        )
+        scheduler.block_manager = SimpleNamespace(
+            complete_state_checkpoint_lease=lambda copy_id, preserve: completed.append(
+                (copy_id, preserve)
+            )
+        )
+        scheduler.deferred_free_blocks = {}
+        scheduler.finished_recving_kv_req_ids = []
+        scheduler.failed_recving_kv_req_ids = []
+
+        scheduler._update_from_kv_xfer_finished(
+            KVConnectorOutput(
+                finished_checkpoint_staging={11},
+                aborted_checkpoint_staging={12},
+            )
+        )
+
+        assert completed == [(11, True), (12, False)]
+
     @pytest.mark.parametrize(
         ("winner_is_offload", "expected_jump"),
         [(False, True), (True, False)],

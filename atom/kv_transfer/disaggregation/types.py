@@ -150,6 +150,10 @@ class KVConnectorOutput:
             committed successfully on this worker.
         failed_sidecar_saving: Exact save generations whose full-slot sidecar
             failed terminally on this worker.
+        finished_checkpoint_staging: Native checkpoint copy generations whose
+            destination is no longer read by GPU staging on this worker.
+        aborted_checkpoint_staging: Native checkpoint copy generations whose
+            destination is invalid, but all possible GPU access is terminal.
         expected_finished_count: How many finished notifications should be
             expected per request (used by the aggregator).
     """
@@ -163,6 +167,8 @@ class KVConnectorOutput:
     expected_finished_count: int = 0
     finished_sidecar_saving: set[SaveCompletionId] = field(default_factory=set)
     failed_sidecar_saving: set[SaveCompletionId] = field(default_factory=set)
+    finished_checkpoint_staging: set[int] = field(default_factory=set)
+    aborted_checkpoint_staging: set[int] = field(default_factory=set)
 
     def is_empty(self) -> bool:
         """Return True if no transfers finished on this worker."""
@@ -175,6 +181,8 @@ class KVConnectorOutput:
             and not self.failed_loading
             and not self.finished_sidecar_saving
             and not self.failed_sidecar_saving
+            and not self.finished_checkpoint_staging
+            and not self.aborted_checkpoint_staging
         )
 
     def __repr__(self) -> str:
@@ -186,7 +194,9 @@ class KVConnectorOutput:
             f"loading={self.finished_loading}, "
             f"failed_loading={self.failed_loading}, "
             f"finished_sidecar_saving={self.finished_sidecar_saving}, "
-            f"failed_sidecar_saving={self.failed_sidecar_saving})"
+            f"failed_sidecar_saving={self.failed_sidecar_saving}, "
+            f"finished_checkpoint_staging={self.finished_checkpoint_staging}, "
+            f"aborted_checkpoint_staging={self.aborted_checkpoint_staging})"
         )
 
 

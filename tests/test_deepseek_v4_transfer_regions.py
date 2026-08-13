@@ -16,6 +16,7 @@ import torch
 from atom.kv_transfer.disaggregation.types import KVTransferTensors
 from atom.kv_transfer.offload.hybrid.page_region_codec import ATOMPageRegionCodec
 from atom.kv_transfer.offload.hybrid.slot_codec import ATOMSlotSidecarCodec
+from atom.kv_transfer.offload.hybrid.dsv4.codec import DSV4PageSlotCodec
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_ops.attentions.v4_pool_geometry import UnifiedPoolGeometry
 
@@ -235,12 +236,21 @@ def _assert_transfer_geometry(
         num_slots=transfer.num_slots,
         device="cpu",
     )
+    unified_codec = DSV4PageSlotCodec(
+        transfer.block_regions,
+        transfer.swa_block_regions,
+        num_blocks=transfer.num_blocks,
+        num_slots=transfer.num_slots,
+        device="cpu",
+    )
     assert sum(region.unit_bytes for region in transfer.block_regions) == (
         page_codec.bytes_per_block
     )
     assert sum(region.unit_bytes for region in transfer.swa_block_regions) == (
         slot_codec.payload_bytes
     )
+    assert unified_codec.bytes_per_block == page_codec.bytes_per_block
+    assert unified_codec.slot_bytes == slot_codec.payload_bytes
 
     assert len(transfer.block_regions) == len(planes) + _CSA_REGION_COUNT
     assert len(transfer.swa_block_regions) == len(planes)

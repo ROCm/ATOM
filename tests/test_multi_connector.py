@@ -148,6 +148,14 @@ class FakeWorkerSub:
         return self._recv_blocks
 
 
+class FakeCheckpointWorkerSub(FakeWorkerSub):
+    """Worker mock that consumes native checkpoint records via the new hook."""
+
+    def start_load_kv_with_state_checkpoints(self, metadata, copies):
+        self.loaded_meta = metadata
+        self.checkpoint_copies = copies
+
+
 def _sched(connectors):
     obj = MultiConnectorScheduler.__new__(MultiConnectorScheduler)
     obj._connectors = connectors
@@ -208,6 +216,42 @@ def _operation_save_meta(operation, *, page=True, sidecar=False):
             save_spec=object() if page else None,
             slot_save_spec=object() if sidecar else None,
             save_operation=operation,
+            load_spec=None,
+        )
+    ]
+    return meta
+
+
+def _checkpoint_copy(
+    *,
+    copy_id=41,
+    req_id=9,
+    boundary_tokens=8192,
+    boundary_block_hash=0x1234,
+    source_group=2,
+    destination_group=7,
+):
+    return SimpleNamespace(
+        copy_id=copy_id,
+        request_id=req_id,
+        boundary_tokens=boundary_tokens,
+        boundary_block_hash=boundary_block_hash,
+        source_group=source_group,
+        destination_group=destination_group,
+    )
+
+
+def _checkpoint_save_meta(copy_record):
+    meta = ConnectorMetadata()
+    meta.requests = [
+        SimpleNamespace(
+            req_id=copy_record.request_id,
+            save_spec=None,
+            slot_save_spec=SimpleNamespace(
+                boundary_tokens=copy_record.boundary_tokens,
+                boundary_block_hash=copy_record.boundary_block_hash,
+                source_group=copy_record.source_group,
+            ),
             load_spec=None,
         )
     ]
@@ -630,6 +674,120 @@ def test_sidecar_completions_bypass_producer_send_save_pairing():
     assert out.finished_saving == set()
     assert out.finished_sidecar_saving == {9}
     assert out.failed_sidecar_saving == {10}
+
+
+def test_checkpoint_staging_completions_bypass_send_save_pairing():
+    moriio = FakeWorkerSub(is_producer=True, finished=({9}, set()))
+    off = FakeWorkerSub(
+        finished=KVConnectorOutput(
+            finished_checkpoint_staging={41},
+            aborted_checkpoint_staging={42},
+        )
+    )
+    w = _worker([moriio, off])
+    w.start_load_kv(MultiConnectorMetadata([ConnectorMetadata(), _save_meta(9)]))
+
+    out = w.get_finished()
+
+    assert out.finished_sending == set()
+    assert out.finished_checkpoint_staging == {41}
+    assert out.aborted_checkpoint_staging == {42}
+
+
+def test_checkpoint_staging_waits_for_every_local_reader_child():
+    checkpoint = _checkpoint_copy(copy_id=51)
+    first = FakeCheckpointWorkerSub()
+    second = FakeCheckpointWorkerSub()
+    worker = _worker([first, second])
+    meta = MultiConnectorMetadata(
+        [_checkpoint_save_meta(checkpoint), _checkpoint_save_meta(checkpoint)]
+    )
+    meta.state_checkpoint_copies = [checkpoint]
+    worker.start_load_kv(meta)
+
+    first._finished = KVConnectorOutput(finished_checkpoint_staging={51})
+    partial = worker.get_finished()
+
+    assert partial.finished_checkpoint_staging == set()
+    assert partial.aborted_checkpoint_staging == set()
+
+    # A duplicate from the first child is idempotent and cannot stand in for
+    # the second child's terminal.
+    assert worker.get_finished().finished_checkpoint_staging == set()
+
+    first._finished = KVConnectorOutput()
+    second._finished = KVConnectorOutput(finished_checkpoint_staging={51})
+    terminal = worker.get_finished()
+
+    assert terminal.finished_checkpoint_staging == {51}
+    assert terminal.aborted_checkpoint_staging == set()
+
+
+def test_checkpoint_staging_local_abort_wins_after_every_child_is_terminal():
+    checkpoint = _checkpoint_copy(copy_id=52)
+    first = FakeCheckpointWorkerSub()
+    second = FakeCheckpointWorkerSub()
+    worker = _worker([first, second])
+    meta = MultiConnectorMetadata(
+        [_checkpoint_save_meta(checkpoint), _checkpoint_save_meta(checkpoint)]
+    )
+    meta.state_checkpoint_copies = [checkpoint]
+    worker.start_load_kv(meta)
+
+    first._finished = KVConnectorOutput(aborted_checkpoint_staging={52})
+    assert worker.get_finished().aborted_checkpoint_staging == set()
+
+    first._finished = KVConnectorOutput()
+    second._finished = KVConnectorOutput(finished_checkpoint_staging={52})
+    terminal = worker.get_finished()
+
+    assert terminal.finished_checkpoint_staging == set()
+    assert terminal.aborted_checkpoint_staging == {52}
+
+
+def test_checkpoint_staging_single_reader_child_remains_immediate():
+    checkpoint = _checkpoint_copy(copy_id=53)
+    producer = FakeWorkerSub(is_producer=True)
+    offload = FakeCheckpointWorkerSub()
+    worker = _worker([producer, offload])
+    meta = MultiConnectorMetadata(
+        [ConnectorMetadata(), _checkpoint_save_meta(checkpoint)]
+    )
+    meta.state_checkpoint_copies = [checkpoint]
+    worker.start_load_kv(meta)
+
+    offload._finished = KVConnectorOutput(finished_checkpoint_staging={53})
+    terminal = worker.get_finished()
+
+    assert terminal.finished_checkpoint_staging == {53}
+    assert terminal.aborted_checkpoint_staging == set()
+
+    # A child may replay its last output while the next poll is built. The
+    # bounded terminal tombstone prevents a duplicate outer completion.
+    assert worker.get_finished().finished_checkpoint_staging == set()
+
+
+def test_checkpoint_staging_exact_identity_does_not_wait_for_unrelated_child():
+    checkpoint = _checkpoint_copy(copy_id=54)
+    unrelated = _checkpoint_copy(
+        copy_id=999,
+        req_id=checkpoint.request_id,
+        boundary_block_hash=0xDEAD,
+    )
+    first = FakeCheckpointWorkerSub()
+    second = FakeCheckpointWorkerSub()
+    worker = _worker([first, second])
+    meta = MultiConnectorMetadata(
+        [_checkpoint_save_meta(checkpoint), _checkpoint_save_meta(unrelated)]
+    )
+    meta.state_checkpoint_copies = [checkpoint]
+    worker.start_load_kv(meta)
+
+    first._finished = KVConnectorOutput(finished_checkpoint_staging={54})
+    terminal = worker.get_finished()
+
+    assert terminal.finished_checkpoint_staging == {54}
+    assert terminal.aborted_checkpoint_staging == set()
 
 
 def test_send_without_pending_save_is_released_immediately():

@@ -200,6 +200,62 @@ class TestAggregateBasic:
         assert result.failed_sidecar_saving == set()
         assert agg.pending_count == (0, 1)
 
+    def test_checkpoint_staging_waits_for_all_workers(self):
+        agg = KVOutputAggregator(world_size=2)
+
+        partial = agg.aggregate(
+            [
+                KVConnectorOutput(finished_checkpoint_staging={42}),
+                KVConnectorOutput(),
+            ]
+        )
+        assert partial.finished_checkpoint_staging == set()
+        assert partial.aborted_checkpoint_staging == set()
+        assert agg.pending_count == (0, 1)
+
+        terminal = agg.aggregate(
+            [
+                KVConnectorOutput(),
+                KVConnectorOutput(finished_checkpoint_staging={42}),
+            ]
+        )
+        assert terminal.finished_checkpoint_staging == {42}
+        assert terminal.aborted_checkpoint_staging == set()
+        assert agg.pending_count == (0, 0)
+
+    def test_any_checkpoint_abort_invalidates_after_all_workers_terminal(self):
+        agg = KVOutputAggregator(world_size=3)
+
+        partial = agg.aggregate(
+            [
+                KVConnectorOutput(finished_checkpoint_staging={9}),
+                KVConnectorOutput(aborted_checkpoint_staging={9}),
+                KVConnectorOutput(),
+            ]
+        )
+        assert partial.finished_checkpoint_staging == set()
+        assert partial.aborted_checkpoint_staging == set()
+
+        terminal = agg.aggregate(
+            [
+                KVConnectorOutput(),
+                KVConnectorOutput(),
+                KVConnectorOutput(finished_checkpoint_staging={9}),
+            ]
+        )
+        assert terminal.finished_checkpoint_staging == set()
+        assert terminal.aborted_checkpoint_staging == {9}
+
+        late = agg.aggregate(
+            [KVConnectorOutput(finished_checkpoint_staging={9})]
+            + [
+                KVConnectorOutput(),
+                KVConnectorOutput(),
+            ]
+        )
+        assert late.is_empty()
+        assert agg.pending_count == (0, 0)
+
     def test_partial_workers_not_emitted(self):
         agg = KVOutputAggregator(world_size=3)
         outputs = [
@@ -449,6 +505,8 @@ class TestKVConnectorOutput:
         assert out.finished_loading == set()
         assert out.finished_sidecar_saving == set()
         assert out.failed_sidecar_saving == set()
+        assert out.finished_checkpoint_staging == set()
+        assert out.aborted_checkpoint_staging == set()
         assert out.expected_finished_count == 0
 
     def test_is_empty(self):
@@ -458,6 +516,8 @@ class TestKVConnectorOutput:
         assert not KVConnectorOutput(finished_loading={"x"}).is_empty()
         assert not KVConnectorOutput(finished_sidecar_saving={"x"}).is_empty()
         assert not KVConnectorOutput(failed_sidecar_saving={"x"}).is_empty()
+        assert not KVConnectorOutput(finished_checkpoint_staging={1}).is_empty()
+        assert not KVConnectorOutput(aborted_checkpoint_staging={1}).is_empty()
 
     def test_repr(self):
         out = KVConnectorOutput(

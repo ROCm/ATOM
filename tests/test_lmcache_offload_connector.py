@@ -39,7 +39,7 @@ from atom.kv_transfer.offload.dense.gpu_connector import (
     DenseGPUConnector,
 )
 from atom.kv_transfer.offload.dense.connector import DenseOffloadConnector
-from atom.kv_transfer.offload.hybrid.page_region_codec import ATOMPageRegionCodec
+from atom.kv_transfer.offload.hybrid.dsv4.codec import DSV4PageSlotCodec
 from atom.kv_transfer.offload.hybrid.connector import (
     HybridOffloadConnector as LMCacheOffloadConnector,
     HybridOffloadScheduler as LMCacheOffloadConnectorScheduler,
@@ -447,7 +447,7 @@ def test_register_empty_kv_caches_with_page_regions_selects_page_codec(monkeypat
 
     connector.register_kv_caches({}, transfer_tensors, num_blocks=3)
 
-    assert isinstance(connector._codec, ATOMPageRegionCodec)
+    assert isinstance(connector._codec, DSV4PageSlotCodec)
     assert connector._codec.num_blocks == 3
     assert connector._codec.device == torch.device("cuda:7")
     assert captured["gpu_connector"].codec is connector._codec
@@ -1724,6 +1724,52 @@ def test_stateful_page_hit_shrinks_from_16k_to_committed_8k_sidecar():
     assert sched._pending_slot_loads["700"] == (8192, boundary_hash)
 
 
+def test_stateful_page_hit_selects_newest_committed_boundary_not_after_page():
+    sched = _stateful_scheduler(hit=20_480)
+    # PAGE chunks may advance more frequently than the 8K SLOT cadence.  The
+    # composite hit must be the newest committed SLOT boundary covered by the
+    # continuous PAGE prefix, not the PAGE frontier itself.
+    sched.chunk_size = 256
+    seq = _stateful_seq(req_id=743, num_prompt_tokens=32_768)
+    _commit_sidecar(sched, seq, 8192)
+    newest_hash = _commit_sidecar(sched, seq, 16_384)
+
+    need, should_park = sched.get_num_new_matched_tokens(seq)
+
+    assert (need, should_park) == (16_384, True)
+    assert sched._load_specs["743"].lmcache_cached_tokens == 16_384
+    assert sched._pending_slot_loads["743"] == (16_384, newest_hash)
+
+
+def test_stateful_page_hit_ignores_committed_slot_after_page_frontier():
+    sched = _stateful_scheduler(hit=12_288)
+    sched.chunk_size = 256
+    seq = _stateful_seq(req_id=744, num_prompt_tokens=24_576)
+    previous_hash = _commit_sidecar(sched, seq, 8192)
+    _commit_sidecar(sched, seq, 16_384)
+
+    need, should_park = sched.get_num_new_matched_tokens(seq)
+
+    assert (need, should_park) == (8192, True)
+    assert sched._load_specs["744"].lmcache_cached_tokens == 8192
+    assert sched._pending_slot_loads["744"] == (8192, previous_hash)
+
+
+def test_stateful_page_hit_rejects_slot_from_different_prefix_hash():
+    sched = _stateful_scheduler(hit=16_384)
+    stored = _stateful_seq(req_id=745, num_prompt_tokens=24_576)
+    _commit_sidecar(sched, stored, 8192)
+    query = _stateful_seq(req_id=746, num_prompt_tokens=24_576)
+    query.token_ids = [token + 100_000 for token in query.token_ids]
+
+    result = sched.get_num_new_matched_tokens(query)
+
+    assert result == (0, False)
+    assert sched._load_specs == {}
+    assert sched._pending_slot_loads == {}
+    assert sched._lookup_client.cleared == ["746"]
+
+
 def test_stateful_page_hit_without_sidecar_is_rejected_and_lookup_cleared():
     sched = _stateful_scheduler(hit=16_384)
     seq = _stateful_seq(req_id=701, num_prompt_tokens=24_576)
@@ -1734,6 +1780,26 @@ def test_stateful_page_hit_without_sidecar_is_rejected_and_lookup_cleared():
     assert sched._load_specs == {}
     assert sched._pending_slot_loads == {}
     assert sched._lookup_client.cleared == ["701"]
+
+
+def test_new_scheduler_session_fails_closed_without_rebuilt_slot_index():
+    original = _stateful_scheduler(hit=16_384)
+    seq = _stateful_seq(req_id=747, num_prompt_tokens=24_576)
+    boundary_hash = _commit_sidecar(original, seq, 8192)
+    assert boundary_hash in original._committed_sidecar_hashes
+
+    # A new scheduler can rediscover PAGE through LMCache lookup, but the
+    # worker-side opaque SLOT objects are not part of that token lookup.  Until
+    # a persistent SLOT lookup adapter rebuilds the index, fail closed.
+    restarted = _stateful_scheduler(hit=16_384)
+    replacement = _stateful_seq(req_id=748, num_prompt_tokens=24_576)
+
+    result = restarted.get_num_new_matched_tokens(replacement)
+
+    assert result == (0, False)
+    assert restarted._committed_sidecar_hashes == set()
+    assert restarted._pending_slot_loads == {}
+    assert restarted._lookup_client.cleared == ["748"]
 
 
 def test_stateful_lookup_fails_closed_after_commit_index_eviction():
@@ -2008,6 +2074,37 @@ def test_stateful_load_failure_evicts_committed_boundary_idempotently():
     assert boundary_hash not in sched._committed_sidecar_hashes
 
 
+def test_stateful_load_failure_falls_back_to_older_committed_boundary():
+    sched = _stateful_scheduler(hit=20_480)
+    sched.chunk_size = 256
+    first = _stateful_seq(
+        req_id=749,
+        num_prompt_tokens=32_768,
+        group=3,
+    )
+    older_hash = _commit_sidecar(sched, first, 8192)
+    failed_hash = _commit_sidecar(sched, first, 16_384)
+
+    sched.get_num_new_matched_tokens(first)
+    sched.update_state_after_alloc(first)
+    request = sched.build_connector_meta().requests[0]
+    assert request.slot_load_spec.boundary_tokens == 16_384
+
+    assert sched.load_failed(request.load_operation) is True
+    assert failed_hash not in sched._committed_sidecar_hashes
+    assert older_hash in sched._committed_sidecar_hashes
+
+    retry = _stateful_seq(
+        req_id=750,
+        num_prompt_tokens=32_768,
+        group=4,
+    )
+    need, should_park = sched.get_num_new_matched_tokens(retry)
+
+    assert (need, should_park) == (8192, True)
+    assert sched._pending_slot_loads["750"] == (8192, older_hash)
+
+
 def test_sidecar_hashes_are_computed_once_per_sequence_lifecycle(monkeypatch):
     sched = _stateful_scheduler(hit=16_384)
     seq = _stateful_seq(
@@ -2129,7 +2226,7 @@ def test_slot_save_waits_until_post_allocation_state_copy_forward_completes():
     assert snapshots == ["initialized-from-checkpoint"]
 
 
-def test_sidecar_save_emits_at_terminal_aligned_boundary():
+def test_off_interval_terminal_saves_page_without_slot():
     sched = _stateful_scheduler(hit=0)
     sched.sidecar_interval = 16_384
     seq = _stateful_seq(
@@ -2141,21 +2238,15 @@ def test_sidecar_save_emits_at_terminal_aligned_boundary():
     sched._save_tracker["707"] = [seq, 16_384]
     regular_hash = _chained_prefix_hashes(seq.token_ids, 256)[16_384]
     sched._committed_sidecar_hashes.add(regular_hash)
-    terminal_hash = _chained_prefix_hashes(seq.token_ids, 256)[24_576]
-
     meta = sched.build_connector_meta()
 
     assert len(meta.requests) == 1
     request = meta.requests[0]
     assert request.save_spec.skip_leading_tokens == 16_384
-    assert request.slot_save_spec == SlotSaveSpec(
-        boundary_tokens=24_576,
-        boundary_block_hash=terminal_hash,
-        source_group=2,
-    )
+    assert request.slot_save_spec is None
 
 
-def test_zero_sidecar_interval_disables_regular_but_keeps_terminal_save():
+def test_zero_sidecar_interval_disables_all_slot_saves():
     sched = _stateful_scheduler(hit=0)
     sched.sidecar_interval = 0
     seq = _stateful_seq(
@@ -2169,11 +2260,7 @@ def test_zero_sidecar_interval_disables_regular_but_keeps_terminal_save():
     assert sched.build_connector_meta().requests == []
 
     seq.num_cached_tokens = 24_576
-    meta = sched.build_connector_meta()
-
-    assert len(meta.requests) == 1
-    assert meta.requests[0].save_spec is None
-    assert meta.requests[0].slot_save_spec.boundary_tokens == 24_576
+    assert sched.build_connector_meta().requests == []
 
 
 def test_sidecar_only_save_emits_when_page_boundary_is_already_stored():
@@ -3251,6 +3338,45 @@ def test_tp_partial_sidecar_completion_never_commits():
 
     assert boundary_hash in sched._committed_sidecar_hashes
     assert "716" not in sched._sidecar_save_inflight
+
+
+def test_tp_sidecar_failure_prevents_commit_after_all_workers_terminal():
+    sched = _stateful_scheduler(hit=0)
+    seq = _stateful_seq(
+        req_id=751,
+        num_prompt_tokens=16_384,
+        num_cached_tokens=8192,
+        group=2,
+    )
+    sched._save_tracker["751"] = [seq, 8192]
+    meta = sched.build_connector_meta()
+    save_operation = meta.requests[0].save_operation
+    boundary_hash = meta.requests[0].slot_save_spec.boundary_block_hash
+    host = Scheduler.__new__(Scheduler)
+    host.kv_connector = sched
+    host.deferred_free_blocks = {}
+    aggregator = KVOutputAggregator(world_size=2)
+
+    partial = aggregator.aggregate(
+        [
+            KVConnectorOutput(finished_sidecar_saving={save_operation}),
+            KVConnectorOutput(),
+        ]
+    )
+    host._update_from_kv_xfer_finished(partial)
+    assert boundary_hash not in sched._committed_sidecar_hashes
+
+    terminal = aggregator.aggregate(
+        [
+            KVConnectorOutput(),
+            KVConnectorOutput(failed_sidecar_saving={save_operation}),
+        ]
+    )
+    host._update_from_kv_xfer_finished(terminal)
+
+    assert boundary_hash not in sched._committed_sidecar_hashes
+    assert "751" not in sched._sidecar_save_inflight
+    assert sched._failed_sidecar_saves["751"] == {(8192, boundary_hash)}
 
 
 def test_request_finish_retains_tracker_for_pending_and_inflight_sidecar():

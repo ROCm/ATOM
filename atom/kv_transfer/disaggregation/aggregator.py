@@ -73,6 +73,8 @@ class KVOutputAggregator:
         self._seen_load_failed: dict[LoadCompletionId, set[int]] = {}
         self._seen_sidecar_saving: dict[SaveCompletionId, set[int]] = {}
         self._seen_sidecar_save_failed: dict[SaveCompletionId, set[int]] = {}
+        self._seen_checkpoint_staging: dict[int, set[int]] = {}
+        self._seen_checkpoint_staging_aborted: dict[int, set[int]] = {}
         self._terminal_saving_order: deque[SaveOperationId] = deque()
         self._terminal_saving: set[SaveOperationId] = set()
         self._terminal_sidecar_order: deque[SaveOperationId] = deque()
@@ -81,6 +83,8 @@ class KVOutputAggregator:
         self._terminal_load: set[LoadOperationId] = set()
         self._terminal_sending_order: deque[SendOperationId] = deque()
         self._terminal_sending: set[SendOperationId] = set()
+        self._terminal_checkpoint_staging_order: deque[int] = deque()
+        self._terminal_checkpoint_staging: set[int] = set()
 
     @property
     def world_size(self) -> int:
@@ -151,6 +155,16 @@ class KVOutputAggregator:
                     self._seen_sidecar_save_failed.setdefault(rid, set()).add(
                         worker_idx
                     )
+            for copy_id in wo.finished_checkpoint_staging:
+                if copy_id not in self._terminal_checkpoint_staging:
+                    self._seen_checkpoint_staging.setdefault(copy_id, set()).add(
+                        worker_idx
+                    )
+            for copy_id in wo.aborted_checkpoint_staging:
+                if copy_id not in self._terminal_checkpoint_staging:
+                    self._seen_checkpoint_staging_aborted.setdefault(
+                        copy_id, set()
+                    ).add(worker_idx)
 
         done_sending = {
             rid
@@ -208,6 +222,24 @@ class KVOutputAggregator:
             rid
             for rid, workers in self._seen_sidecar_saving.items()
             if len(workers) >= self._world_size and rid not in failed_sidecar_saving
+        }
+        aborted_checkpoint_staging = set()
+        checkpoint_copy_ids = set(self._seen_checkpoint_staging) | set(
+            self._seen_checkpoint_staging_aborted
+        )
+        for copy_id in checkpoint_copy_ids:
+            done_workers = self._seen_checkpoint_staging.get(copy_id, set())
+            aborted_workers = self._seen_checkpoint_staging_aborted.get(copy_id, set())
+            if (
+                aborted_workers
+                and len(done_workers | aborted_workers) >= self._world_size
+            ):
+                aborted_checkpoint_staging.add(copy_id)
+        done_checkpoint_staging = {
+            copy_id
+            for copy_id, workers in self._seen_checkpoint_staging.items()
+            if len(workers) >= self._world_size
+            and copy_id not in aborted_checkpoint_staging
         }
 
         for rid in done_sending:
@@ -268,6 +300,14 @@ class KVOutputAggregator:
                     self._terminal_sidecar_order,
                     self._terminal_sidecar,
                 )
+        for copy_id in done_checkpoint_staging | aborted_checkpoint_staging:
+            self._seen_checkpoint_staging.pop(copy_id, None)
+            self._seen_checkpoint_staging_aborted.pop(copy_id, None)
+            self._remember_terminal(
+                copy_id,
+                self._terminal_checkpoint_staging_order,
+                self._terminal_checkpoint_staging,
+            )
 
         return KVConnectorOutput(
             finished_sending=done_sending,
@@ -278,11 +318,13 @@ class KVOutputAggregator:
             failed_loading=failed_loading,
             finished_sidecar_saving=done_sidecar_saving,
             failed_sidecar_saving=failed_sidecar_saving,
+            finished_checkpoint_staging=done_checkpoint_staging,
+            aborted_checkpoint_staging=aborted_checkpoint_staging,
         )
 
     def _remember_terminal(
         self,
-        operation: SaveOperationId | LoadOperationId | SendOperationId,
+        operation: SaveOperationId | LoadOperationId | SendOperationId | int,
         order: deque,
         tombstones: set,
     ) -> None:
@@ -304,6 +346,8 @@ class KVOutputAggregator:
         self._seen_load_failed.clear()
         self._seen_sidecar_saving.clear()
         self._seen_sidecar_save_failed.clear()
+        self._seen_checkpoint_staging.clear()
+        self._seen_checkpoint_staging_aborted.clear()
         self._terminal_saving_order.clear()
         self._terminal_saving.clear()
         self._terminal_sidecar_order.clear()
@@ -312,6 +356,8 @@ class KVOutputAggregator:
         self._terminal_load.clear()
         self._terminal_sending_order.clear()
         self._terminal_sending.clear()
+        self._terminal_checkpoint_staging_order.clear()
+        self._terminal_checkpoint_staging.clear()
 
     @property
     def terminal_tombstone_count(self) -> tuple[int, int]:
@@ -333,5 +379,9 @@ class KVOutputAggregator:
             len(set(self._seen_recving) | set(self._seen_recv_failed))
             + len(self._seen_saving)
             + len(set(self._seen_loading) | set(self._seen_load_failed))
-            + len(set(self._seen_sidecar_saving) | set(self._seen_sidecar_save_failed)),
+            + len(set(self._seen_sidecar_saving) | set(self._seen_sidecar_save_failed))
+            + len(
+                set(self._seen_checkpoint_staging)
+                | set(self._seen_checkpoint_staging_aborted)
+            ),
         )

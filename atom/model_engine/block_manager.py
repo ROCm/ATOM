@@ -198,6 +198,21 @@ class BlockManager:
             checkpoint_restores=restores,
         )
 
+    def acquire_state_checkpoint_lease(self, checkpoint) -> bool:
+        """Keep an exact keeper destination resident through GPU staging."""
+
+        return self.state.acquire_checkpoint_lease(checkpoint)
+
+    def complete_state_checkpoint_lease(
+        self,
+        copy_id: int,
+        *,
+        preserve: bool,
+    ) -> bool:
+        """Release or invalidate one exact keeper destination."""
+
+        return self.state.complete_checkpoint_lease(copy_id, preserve=preserve)
+
     def _record_evicted(self, h: int) -> None:
         """A hash the block pool just dropped: report it, and settle the state.
 
