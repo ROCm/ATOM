@@ -900,11 +900,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         row_bytes = self.plane_row_bytes()
         return [
             page_pool(geo.block_bytes(row_bytes) + self._indexer_block_bytes()),
-            state_pool(
-                STATE_SLOT_CLASS,
-                geo.slot_bytes(row_bytes),
-                entries_per_req=1,
-            ),
+            state_pool(STATE_SLOT_CLASS, geo.slot_bytes(row_bytes), entries_per_req=1),
         ]
 
     def _plane_row_widths(self) -> list[int]:
