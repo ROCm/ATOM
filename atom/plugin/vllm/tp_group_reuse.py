@@ -21,6 +21,50 @@ import torch
 logger = logging.getLogger("atom")
 
 
+def _create_aiter_device_communicator(vllm_tp: Any) -> Any:
+    """Create AITER collectives without creating a duplicate PyNccl communicator."""
+    from aiter.dist.device_communicators.base_device_communicator import (
+        DeviceCommunicatorBase,
+    )
+    from aiter.dist.device_communicators.communicator_cuda import CudaCommunicator
+    from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce
+    from aiter.dist.device_communicators.quick_all_reduce import QuickAllReduce
+    from aiter.dist.parallel_state import _ENABLE_CUSTOM_ALL_REDUCE
+
+    pynccl_comm = getattr(vllm_tp.device_communicator, "pynccl_comm", None)
+    if pynccl_comm is None:
+        raise RuntimeError("vLLM TP group does not expose a PyNccl communicator")
+
+    class ReusedPyNcclCudaCommunicator(CudaCommunicator):
+        def __init__(self) -> None:
+            self._all2all_manager = None
+            self._all2all_manager_created = False
+            DeviceCommunicatorBase.__init__(
+                self,
+                cpu_group=vllm_tp.cpu_group,
+                device=vllm_tp.device,
+                device_group=vllm_tp.device_group,
+                unique_name="tp",
+            )
+
+            self.use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
+            self.use_torch_symm_mem = False
+            self.pynccl_comm = pynccl_comm
+            self.ca_comm = (
+                CustomAllreduce(group=self.cpu_group, device=self.device)
+                if self.use_custom_allreduce and self.world_size > 1
+                else None
+            )
+            self.qr_comm = (
+                QuickAllReduce(group=self.cpu_group, device=self.device)
+                if self.world_size > 1
+                else None
+            )
+            self.symm_mem_comm = None
+
+    return ReusedPyNcclCudaCommunicator()
+
+
 def _create_aiter_tp_adapter_from_vllm() -> Any:
     """Create aiter-compatible TP adapter using vLLM's TP groups and aiter's ca_comm."""
     import vllm.distributed.parallel_state as vllm_ps
@@ -29,17 +73,9 @@ def _create_aiter_tp_adapter_from_vllm() -> Any:
     if vllm_tp.world_size == 1:
         return None
 
-    # Import aiter components - must use aiter's CudaCommunicator with aiter's ca_comm
-    from aiter.dist.device_communicators.communicator_cuda import CudaCommunicator
     from aiter.dist.parallel_state import _register_group
 
-    # Create aiter CudaCommunicator with vLLM's ProcessGroups (no new groups created)
-    device_communicator = CudaCommunicator(
-        cpu_group=vllm_tp.cpu_group,
-        device=vllm_tp.device,
-        device_group=vllm_tp.device_group,
-        unique_name="tp",
-    )
+    device_communicator = _create_aiter_device_communicator(vllm_tp)
 
     if device_communicator.ca_comm is None or device_communicator.ca_comm.disabled:
         logger.warning(

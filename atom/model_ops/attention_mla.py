@@ -203,6 +203,41 @@ def _mla_output_width(impl: _MLAOutputShape, hidden_size: int) -> int:
     return hidden_size
 
 
+def supports_dpa_persistent_mode(
+    atom_config,
+    mla_modules: MLAModules,
+    *,
+    kv_cache_dtype: str,
+    num_heads: int,
+    num_kv_heads: int,
+) -> bool:
+    """Whether this model supports the persistent-mode exception under DPA.
+
+    AITER's FP8 Q/FP8 KV GQA64 kernel is available only in persistent mode.
+    Keep this gate exact so other DPA models retain the existing non-persistent
+    policy and all MLA variants continue to use the common 576-wide KV layout.
+    """
+    # Force-enabled for now: persistent mode is turned on for all MLA models
+    # under DPA. Re-introduce the per-model gate here if a model regresses.
+    return True
+
+
+def should_use_persistent_mode(
+    *,
+    dp_size: int,
+    dpa_persistent_supported: bool,
+    page_size: int,
+    dcp_world_size: int,
+    dcp_persistent_supported: bool,
+) -> bool:
+    """Apply the common persistent-mode policy and required exceptions."""
+    return (
+        (dp_size <= 1 or dpa_persistent_supported)
+        and page_size <= 1
+        and (dcp_world_size <= 1 or dcp_persistent_supported)
+    )
+
+
 def dynamic_per_batched_tensor_quant(
     x: torch.Tensor, dtype: torch.dtype = torch.float8_e4m3fn
 ):
@@ -264,6 +299,14 @@ class MLAAttention(nn.Module):
         self.one_scale = torch.tensor(1.0, dtype=torch.float32)
         self._k_scale = self.one_scale
         self._q_scale = self.one_scale
+        atom_config = get_current_atom_config()
+        self._dpa_persistent_supported = supports_dpa_persistent_mode(
+            atom_config,
+            mla_modules,
+            kv_cache_dtype=self.kv_cache_dtype,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+        )
         # Derive sparsity from the model-level flag, not from whether THIS layer
         # owns an indexer: GLM-5.2 IndexShare "shared" layers have indexer=None
         # but must still run sparse MLA, reusing the prior "full" layer's top-k.
@@ -1143,6 +1186,10 @@ class MLAAttention(nn.Module):
         attn_metadata: AttentionMetaData,
         return_lse: bool = False,
     ) -> torch.Tensor:
+        # attn_metadata.causal is True for the target; False only for DSpark's
+        # bidirectional draft block (set by the proposer). The asm kernel picks
+        # a different .co by this flag, so the target must stay causal.
+        causal = attn_metadata.causal
         assert kv_c_and_k_pe_cache.numel() > 0
         assert attn_metadata is not None
         B = q.shape[0]
@@ -1245,11 +1292,13 @@ class MLAAttention(nn.Module):
                     paged_kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens
 
             dp_size = get_dp_group().world_size
-            use_persistent_mode = not (dp_size > 1)
-            if envs.ATOM_MLA_PAGE_SIZE > 1:
-                use_persistent_mode = False
-            if self.dcp_world_size > 1 and not self.dcp_persistent_supported:
-                use_persistent_mode = False
+            use_persistent_mode = should_use_persistent_mode(
+                dp_size=dp_size,
+                dpa_persistent_supported=self._dpa_persistent_supported,
+                page_size=envs.ATOM_MLA_PAGE_SIZE,
+                dcp_world_size=self.dcp_world_size,
+                dcp_persistent_supported=self.dcp_persistent_supported,
+            )
 
             # Sparse layers in MTP verify use separate persistent metadata
             # (per-token, max_seqlen_qo=1) while dense layers use normal metadata
@@ -1335,6 +1384,7 @@ class MLAAttention(nn.Module):
                 g_kv_indptr=g_kv_indptr,
                 cp_world_size=cp_world_size,
                 cp_rank=cp_rank,
+                causal=causal,
             )
 
         o = self._restore_query_heads(o, num_heads_q)

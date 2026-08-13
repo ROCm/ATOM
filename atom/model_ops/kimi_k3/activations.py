@@ -8,6 +8,8 @@ from __future__ import annotations
 import torch
 from aiter import QuantType, dtypes, get_hip_quant
 
+from atom.utils.decorators import mark_trace
+
 try:
     import triton
     import triton.language as tl
@@ -130,6 +132,7 @@ if _HAS_TRITON:
         tl.store(s_ptr + tok, scale)
 
 
+@mark_trace
 def situ_and_mul(
     x: torch.Tensor, beta: float, linear_beta: float | None
 ) -> torch.Tensor:
@@ -162,6 +165,7 @@ def situ_and_mul(
     return y.reshape(*lead, d)
 
 
+@mark_trace
 def rmsnorm_gated(
     x: torch.Tensor,
     weight: torch.Tensor,
