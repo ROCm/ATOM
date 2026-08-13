@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786381548808,
+  "lastUpdate": 1786641045298,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -1529,6 +1529,63 @@ window.BENCHMARK_DATA = {
             "value": 0.7566,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/31408481514 | Threshold: 0.73 | Baseline: 0.75 | BaselineModel: meta-llama/Meta-Llama-3-8B-Instruct | BaselineNote: HF reports 0.796 but 8-shot CoT; CI uses 3-shot, not comparable | Docker: rocm/atom-dev:nightly_202608101525 | GPU: AMD Instinct MI350X | VRAM: 288GB | ROCm: unknown | strict-match: 0.7559 | fewshot: 3 | Model: /models/meta-llama/Meta-Llama-3-8B-Instruct"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "la",
+            "username": "junhaha666",
+            "email": "junchen2@amd.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "6a756fdb53e8fa77fcbc455c5418fd9bc9c6d4c8",
+          "message": "[feat](qwen):Support qwen3.5x model (#1738)\n\n* support qwen3.x\n\n* fix ATOM_USE_UNIFIED_ATTN=1 need prepare_block_tables on prefill\n\n* style: fix ruff findings in qwen3_5 / qwen3_next\n\n- I001: sort the qwen3_next import block (ruff's own suggested order).\n- RUF100: drop the unused `# noqa: F401` on the model_ops.linear import;\n  every name in that block is actually used in the file.\n- RUF012: hoist the mutable class-attribute literals of\n  Qwen3_5ForConditionalGenerationTextOnly to module-level constants and\n  reference them, matching the existing _QWEN3_5_PACKED_MODULES_MAPPING\n  pattern. ClassVar would need a typing import, which drags the file's\n  unsorted import block into reviewdog's diff_context and trips I001.\n  weights_mapping, quant_exclude_name_mapping and skip_weight_prefixes are\n  all done together because diff_context spans them.\n\nNone of these attributes are mutated in place anywhere in atom/, so sharing\none module-level object is behaviour-preserving.\n\nCo-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>\n\n* update readme\n\n* fix\n\n---------\n\nCo-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-08-13T15:51:26Z",
+          "url": "https://github.com/ROCm/ATOM/commit/6a756fdb53e8fa77fcbc455c5418fd9bc9c6d4c8"
+        },
+        "date": 1786641016495,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9492,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/31720300787 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202608131526 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: unknown | strict-match: 0.9447 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP accuracy (GSM8K)",
+            "value": 0.9522,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/31720300787 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202608131526 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: unknown | strict-match: 0.953 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP MTP acceptance (%)",
+            "value": 65.98,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/31720300787 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202608131526 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: unknown | strict-match: 0.953 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP avg toks/fwd (tok/fwd)",
+            "value": 2.98,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOMesh::Meta-Llama-3-8B-Instruct accuracy (GSM8K)",
+            "value": 0.7475,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/31720300787 | Threshold: 0.73 | Baseline: 0.75 | BaselineModel: meta-llama/Meta-Llama-3-8B-Instruct | BaselineNote: HF reports 0.796 but 8-shot CoT; CI uses 3-shot, not comparable | Docker: rocm/atom-dev:nightly_202608131526 | GPU: AMD Instinct MI350X | VRAM: 252GB | ROCm: unknown | strict-match: 0.743 | fewshot: 3 | Model: /models/meta-llama/Meta-Llama-3-8B-Instruct"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.8855,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/31720300787 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202608131526 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: unknown | strict-match: 0.3897 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
