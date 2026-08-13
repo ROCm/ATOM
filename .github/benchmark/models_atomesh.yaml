@@ -248,7 +248,7 @@ models:
             isl: [1048576]
             osl: 1024
             server:
-              common_args:
+              common_args: &glm52_agentic_common_args
                 kv_cache_dtype: fp8
                 block_size: 16
                 gpu_memory_utilization: 0.9
@@ -294,6 +294,27 @@ models:
             run_eval: false
           name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c1
           concurrency: [1]
+          # MTP3 rides on `server.common_args`, which pd_server_atom.sh folds
+          # into the `server_common` array shared by the prefill and decode
+          # commands — under PD both roles must carry the same speculative
+          # config. The prefill worker runs the draft layer to fill its KV
+          # region and hands the first drafts to decode via
+          # kv_transfer_params["draft_token_ids"], and the decode scheduler
+          # sizes every step as `mtp_k + 1` tokens; a prefill without MTP would
+          # ship no drafts and leave the draft layer's KV region unwritten.
+          #
+          # The MXFP4 checkpoint leaves the MTP layer (index 78, past the 78
+          # target layers) in bf16, so the online-quant exclude list has to stop
+          # at layer 77 instead of the blanket `*expert*` — otherwise that
+          # layer's 256 experts stay bf16. Same list the single-node MTP3 cases
+          # in models.json and recipes/GLM-5.md use.
+          topology: 1p1d_mtp3
+          server: &glm52_agentic_mtp3_server
+            common_args:
+              <<: *glm52_agentic_common_args
+              online_quant_config: '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","model.layers.[0-9].mlp.*expert*","model.layers.[1-6][0-9].mlp.*expert*","model.layers.7[0-7].mlp.*expert*"]}'
+              method: mtp
+              num_speculative_tokens: 3
           accuracy:
             task: swebench_lite
             threshold: 0.50
@@ -312,14 +333,20 @@ models:
         - <<: *glm52_agentic_tp4_tp4
           name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c2
           concurrency: [2]
+          topology: 1p1d_mtp3
+          server: *glm52_agentic_mtp3_server
 
         - <<: *glm52_agentic_tp4_tp4
           name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c4
           concurrency: [4]
+          topology: 1p1d_mtp3
+          server: *glm52_agentic_mtp3_server
 
         - <<: *glm52_agentic_tp4_tp4
           name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c8
           concurrency: [8]
+          topology: 1p1d_mtp3
+          server: *glm52_agentic_mtp3_server
 
         - <<: *glm52_agentic_tp4_tp4
           name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c48
