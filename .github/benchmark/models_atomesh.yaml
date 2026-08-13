@@ -309,6 +309,21 @@ models:
           # layer's 256 experts stay bf16. Same list the single-node MTP3 cases
           # in models.json and recipes/GLM-5.md use.
           topology: 1p1d_mtp3
+          # Both roles are TP4, so prefill and decode fit on one 8-GPU node
+          # (0-3 / 4-7) — the same split `glm-52-mxfp4-1p1d-tp4` already uses.
+          # single_node keeps only nodes[0] (pd_matrix.py:280-285) and starts
+          # both servers on it (pd_server_atom.sh:1199-1216); the per-role
+          # HIP_VISIBLE_DEVICES below is what separates them, since the
+          # launcher's default (`seq 0 tp-1`, :219-221) would put both on
+          # GPUs 0-3. KV transfer stays on mooncake, just intra-node.
+          pd_worker_layout: single_node
+          env: &glm52_agentic_mtp3_env
+            prefill:
+              HIP_VISIBLE_DEVICES: "0,1,2,3"
+            decode:
+              HIP_VISIBLE_DEVICES: "4,5,6,7"
+              # Re-stated because this `env` replaces the anchor's env wholesale.
+              MAX_JOBS: "16"
           server: &glm52_agentic_mtp3_server
             common_args:
               <<: *glm52_agentic_common_args
@@ -334,18 +349,24 @@ models:
           name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c2
           concurrency: [2]
           topology: 1p1d_mtp3
+          pd_worker_layout: single_node
+          env: *glm52_agentic_mtp3_env
           server: *glm52_agentic_mtp3_server
 
         - <<: *glm52_agentic_tp4_tp4
           name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c4
           concurrency: [4]
           topology: 1p1d_mtp3
+          pd_worker_layout: single_node
+          env: *glm52_agentic_mtp3_env
           server: *glm52_agentic_mtp3_server
 
         - <<: *glm52_agentic_tp4_tp4
           name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c8
           concurrency: [8]
           topology: 1p1d_mtp3
+          pd_worker_layout: single_node
+          env: *glm52_agentic_mtp3_env
           server: *glm52_agentic_mtp3_server
 
         - <<: *glm52_agentic_tp4_tp4
