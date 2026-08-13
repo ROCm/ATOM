@@ -2781,6 +2781,10 @@ class Scheduler:
         is_producer = self._connector_flag("is_producer")
         is_offload = self._connector_flag("is_offload")
 
+        connector_completions = kv_connector_output.connector_completions or ()
+        declared_completion_channels = frozenset(
+            getattr(self.kv_connector, "completion_channels", ()) or ()
+        )
         for req_id in kv_connector_output.finished_recving or ():
             assert not is_producer, "Only consumer should update recving KV status"
             logger.debug("Finished recving KV transfer for request %s", req_id)
@@ -2822,13 +2826,27 @@ class Scheduler:
                 continue
             self.failed_recving_kv_req_ids.append(req_id)
 
-        for req_id in kv_connector_output.finished_sidecar_saving or ():
-            if hasattr(self.kv_connector, "sidecar_save_finished"):
-                self.kv_connector.sidecar_save_finished(req_id)
-
-        for req_id in kv_connector_output.failed_sidecar_saving or ():
-            if hasattr(self.kv_connector, "sidecar_save_failed"):
-                self.kv_connector.sidecar_save_failed(req_id)
+        connector_completion_callback = getattr(
+            self.kv_connector,
+            "connector_completion",
+            None,
+        )
+        for completion in connector_completions:
+            if completion.channel not in declared_completion_channels:
+                logger.error(
+                    "Ignoring completion for undeclared connector channel %s",
+                    completion.channel,
+                )
+                continue
+            handled = (
+                callable(connector_completion_callback)
+                and connector_completion_callback(completion) is not False
+            )
+            if not handled:
+                logger.warning(
+                    "Ignoring completion for unhandled connector channel %s",
+                    completion.channel,
+                )
 
         finished_saving = kv_connector_output.finished_saving or ()
         # Retire each exact save operation once, before any release decision.

@@ -21,6 +21,7 @@ from atom.kv_transfer.disaggregation.base import (
     KVConnectorBase,
     KVConnectorSchedulerBase,
 )
+from atom.kv_transfer.disaggregation.types import ConnectorCompletion
 from atom.kv_transfer.offload.config import select_offload_layout
 
 logger = logging.getLogger("atom")
@@ -70,6 +71,10 @@ class LMCacheOffloadConnector(KVConnectorBase):
     def __init__(self, config) -> None:
         self._impl = _build_worker(config)
 
+    @property
+    def completion_channels(self) -> frozenset[str]:
+        return frozenset(getattr(self._impl, "completion_channels", ()))
+
     def register_kv_caches(
         self, kv_caches, transfer_tensors=None, num_blocks=None
     ) -> None:
@@ -96,6 +101,10 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         self.recap_prefill_after_finalize = bool(
             getattr(self._impl, "recap_prefill_after_finalize", False)
         )
+
+    @property
+    def completion_channels(self) -> frozenset[str]:
+        return frozenset(getattr(self._impl, "completion_channels", ()))
 
     def get_num_new_matched_tokens(self, seq):
         return self._impl.get_num_new_matched_tokens(seq)
@@ -143,15 +152,11 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         if callback is not None:
             callback(meta)
 
-    def sidecar_save_finished(self, req_id) -> None:
-        callback = getattr(self._impl, "sidecar_save_finished", None)
-        if callback is not None:
-            callback(req_id)
-
-    def sidecar_save_failed(self, req_id) -> None:
-        callback = getattr(self._impl, "sidecar_save_failed", None)
-        if callback is not None:
-            callback(req_id)
+    def connector_completion(self, completion: ConnectorCompletion) -> bool:
+        callback = getattr(self._impl, "connector_completion", None)
+        if callback is None:
+            return False
+        return callback(completion) is not False
 
     def load_finished(self, req_id):
         callback = getattr(self._impl, "load_finished", None)

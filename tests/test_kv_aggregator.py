@@ -7,12 +7,28 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from atom.kv_transfer.disaggregation import KVConnectorOutput, KVOutputAggregator
+from atom.kv_transfer.disaggregation import (
+    ConnectorCompletion,
+    KVConnectorOutput,
+    KVOutputAggregator,
+)
 from atom.kv_transfer.disaggregation.types import (
     LoadOperationId,
     SaveOperationId,
     SendOperationId,
+    STATE_CHECKPOINT_STAGING_CHANNEL,
 )
+from atom.kv_transfer.offload.hybrid.dsv4.connector import (
+    DSV4_CHECKPOINT_SAVE_CHANNEL,
+)
+
+
+def _completion(channel, operation_id, *, succeeded=True):
+    return ConnectorCompletion(
+        channel=channel,
+        operation_id=operation_id,
+        succeeded=succeeded,
+    )
 
 
 class TestKVOutputAggregatorInit:
@@ -155,101 +171,131 @@ class TestAggregateBasic:
 
     def test_all_workers_report_sidecar_save_success(self):
         agg = KVOutputAggregator(world_size=2)
+        completion = _completion(DSV4_CHECKPOINT_SAVE_CHANNEL, "r1")
         result = agg.aggregate(
             [
-                KVConnectorOutput(finished_sidecar_saving={"r1"}),
-                KVConnectorOutput(finished_sidecar_saving={"r1"}),
+                KVConnectorOutput(connector_completions={completion}),
+                KVConnectorOutput(connector_completions={completion}),
             ]
         )
-        assert result.finished_sidecar_saving == {"r1"}
-        assert result.failed_sidecar_saving == set()
+        assert result.connector_completions == {completion}
         assert agg.pending_count == (0, 0)
 
     def test_sidecar_save_failure_waits_for_every_terminal_report(self):
         agg = KVOutputAggregator(world_size=2)
+        failed = _completion(
+            DSV4_CHECKPOINT_SAVE_CHANNEL,
+            "r1",
+            succeeded=False,
+        )
+        succeeded = _completion(DSV4_CHECKPOINT_SAVE_CHANNEL, "r1")
 
         partial = agg.aggregate(
             [
-                KVConnectorOutput(failed_sidecar_saving={"r1"}),
+                KVConnectorOutput(connector_completions={failed}),
                 KVConnectorOutput(),
             ]
         )
 
-        assert partial.finished_sidecar_saving == set()
-        assert partial.failed_sidecar_saving == set()
+        assert partial.connector_completions == set()
         assert agg.pending_count == (0, 1)
 
         terminal = agg.aggregate(
             [
                 KVConnectorOutput(),
-                KVConnectorOutput(finished_sidecar_saving={"r1"}),
+                KVConnectorOutput(connector_completions={succeeded}),
             ]
         )
 
-        assert terminal.finished_sidecar_saving == set()
-        assert terminal.failed_sidecar_saving == {"r1"}
+        assert terminal.connector_completions == {failed}
         assert agg.pending_count == (0, 0)
 
     def test_partial_sidecar_save_success_is_not_emitted(self):
         agg = KVOutputAggregator(world_size=2)
+        completion = _completion(DSV4_CHECKPOINT_SAVE_CHANNEL, "r1")
         result = agg.aggregate(
             [
-                KVConnectorOutput(finished_sidecar_saving={"r1"}),
+                KVConnectorOutput(connector_completions={completion}),
                 KVConnectorOutput(),
             ]
         )
-        assert result.finished_sidecar_saving == set()
-        assert result.failed_sidecar_saving == set()
+        assert result.connector_completions == set()
         assert agg.pending_count == (0, 1)
+
+    def test_connector_completion_channels_never_cross_complete(self):
+        agg = KVOutputAggregator(world_size=2)
+        sidecar = _completion(DSV4_CHECKPOINT_SAVE_CHANNEL, 42)
+        checkpoint = _completion(STATE_CHECKPOINT_STAGING_CHANNEL, 42)
+
+        mixed = agg.aggregate(
+            [
+                KVConnectorOutput(connector_completions={sidecar}),
+                KVConnectorOutput(connector_completions={checkpoint}),
+            ]
+        )
+        assert mixed.connector_completions == set()
+        assert agg.pending_count == (0, 2)
+
+        matched = agg.aggregate(
+            [
+                KVConnectorOutput(connector_completions={checkpoint}),
+                KVConnectorOutput(connector_completions={sidecar}),
+            ]
+        )
+        assert matched.connector_completions == {sidecar, checkpoint}
+        assert agg.pending_count == (0, 0)
 
     def test_checkpoint_staging_waits_for_all_workers(self):
         agg = KVOutputAggregator(world_size=2)
+        completion = _completion(STATE_CHECKPOINT_STAGING_CHANNEL, 42)
 
         partial = agg.aggregate(
             [
-                KVConnectorOutput(finished_checkpoint_staging={42}),
+                KVConnectorOutput(connector_completions={completion}),
                 KVConnectorOutput(),
             ]
         )
-        assert partial.finished_checkpoint_staging == set()
-        assert partial.aborted_checkpoint_staging == set()
+        assert partial.connector_completions == set()
         assert agg.pending_count == (0, 1)
 
         terminal = agg.aggregate(
             [
                 KVConnectorOutput(),
-                KVConnectorOutput(finished_checkpoint_staging={42}),
+                KVConnectorOutput(connector_completions={completion}),
             ]
         )
-        assert terminal.finished_checkpoint_staging == {42}
-        assert terminal.aborted_checkpoint_staging == set()
+        assert terminal.connector_completions == {completion}
         assert agg.pending_count == (0, 0)
 
     def test_any_checkpoint_abort_invalidates_after_all_workers_terminal(self):
         agg = KVOutputAggregator(world_size=3)
+        succeeded = _completion(STATE_CHECKPOINT_STAGING_CHANNEL, 9)
+        aborted = _completion(
+            STATE_CHECKPOINT_STAGING_CHANNEL,
+            9,
+            succeeded=False,
+        )
 
         partial = agg.aggregate(
             [
-                KVConnectorOutput(finished_checkpoint_staging={9}),
-                KVConnectorOutput(aborted_checkpoint_staging={9}),
+                KVConnectorOutput(connector_completions={succeeded}),
+                KVConnectorOutput(connector_completions={aborted}),
                 KVConnectorOutput(),
             ]
         )
-        assert partial.finished_checkpoint_staging == set()
-        assert partial.aborted_checkpoint_staging == set()
+        assert partial.connector_completions == set()
 
         terminal = agg.aggregate(
             [
                 KVConnectorOutput(),
                 KVConnectorOutput(),
-                KVConnectorOutput(finished_checkpoint_staging={9}),
+                KVConnectorOutput(connector_completions={succeeded}),
             ]
         )
-        assert terminal.finished_checkpoint_staging == set()
-        assert terminal.aborted_checkpoint_staging == {9}
+        assert terminal.connector_completions == {aborted}
 
         late = agg.aggregate(
-            [KVConnectorOutput(finished_checkpoint_staging={9})]
+            [KVConnectorOutput(connector_completions={succeeded})]
             + [
                 KVConnectorOutput(),
                 KVConnectorOutput(),
@@ -297,25 +343,30 @@ class TestAggregateBasic:
         agg = KVOutputAggregator(world_size=2)
         gen0 = SaveOperationId(7, 0)
         gen1 = SaveOperationId(7, 1)
+        failed_gen0 = _completion(
+            DSV4_CHECKPOINT_SAVE_CHANNEL,
+            gen0,
+            succeeded=False,
+        )
+        succeeded_gen0 = _completion(DSV4_CHECKPOINT_SAVE_CHANNEL, gen0)
+        succeeded_gen1 = _completion(DSV4_CHECKPOINT_SAVE_CHANNEL, gen1)
 
         mixed = agg.aggregate(
             [
-                KVConnectorOutput(failed_sidecar_saving={gen0}),
-                KVConnectorOutput(finished_sidecar_saving={gen1}),
+                KVConnectorOutput(connector_completions={failed_gen0}),
+                KVConnectorOutput(connector_completions={succeeded_gen1}),
             ]
         )
-        assert mixed.finished_sidecar_saving == set()
-        assert mixed.failed_sidecar_saving == set()
+        assert mixed.connector_completions == set()
 
         matched = agg.aggregate(
             [
-                KVConnectorOutput(finished_sidecar_saving={gen1}),
-                KVConnectorOutput(finished_sidecar_saving={gen0}),
+                KVConnectorOutput(connector_completions={succeeded_gen1}),
+                KVConnectorOutput(connector_completions={succeeded_gen0}),
             ]
         )
 
-        assert matched.finished_sidecar_saving == {gen1}
-        assert matched.failed_sidecar_saving == {gen0}
+        assert matched.connector_completions == {succeeded_gen1, failed_gen0}
         assert agg.pending_count == (0, 0)
 
     def test_counter_cleared_after_emission(self):
@@ -341,22 +392,24 @@ class TestAggregateBasic:
         assert late.finished_saving == set()
         assert agg.pending_count == (0, 0)
 
-    @pytest.mark.parametrize(
-        "terminal_field",
-        ["finished_sidecar_saving", "failed_sidecar_saving"],
-    )
-    def test_late_generation_sidecar_duplicate_is_ignored(self, terminal_field):
+    @pytest.mark.parametrize("succeeded", [True, False])
+    def test_late_generation_sidecar_duplicate_is_ignored(self, succeeded):
         agg = KVOutputAggregator(world_size=2)
         operation = SaveOperationId("r1", 11)
+        completion = _completion(
+            DSV4_CHECKPOINT_SAVE_CHANNEL,
+            operation,
+            succeeded=succeeded,
+        )
         outputs = [
-            KVConnectorOutput(**{terminal_field: {operation}}),
-            KVConnectorOutput(**{terminal_field: {operation}}),
+            KVConnectorOutput(connector_completions={completion}),
+            KVConnectorOutput(connector_completions={completion}),
         ]
 
-        assert getattr(agg.aggregate(outputs), terminal_field) == {operation}
+        assert agg.aggregate(outputs).connector_completions == {completion}
         late = agg.aggregate(
             [
-                KVConnectorOutput(**{terminal_field: {operation}}),
+                KVConnectorOutput(connector_completions={completion}),
                 KVConnectorOutput(),
             ]
         )
@@ -470,9 +523,15 @@ class TestReset:
 
     def test_reset_clears_partial_sidecar_reports(self):
         agg = KVOutputAggregator(world_size=2)
+        failed = _completion(
+            DSV4_CHECKPOINT_SAVE_CHANNEL,
+            "r1",
+            succeeded=False,
+        )
+        succeeded = _completion(DSV4_CHECKPOINT_SAVE_CHANNEL, "r1")
         agg.aggregate(
             [
-                KVConnectorOutput(failed_sidecar_saving={"r1"}),
+                KVConnectorOutput(connector_completions={failed}),
                 KVConnectorOutput(),
             ]
         )
@@ -484,7 +543,7 @@ class TestReset:
         result = agg.aggregate(
             [
                 KVConnectorOutput(),
-                KVConnectorOutput(finished_sidecar_saving={"r1"}),
+                KVConnectorOutput(connector_completions={succeeded}),
             ]
         )
         assert result.is_empty()
@@ -505,10 +564,7 @@ class TestKVConnectorOutput:
         assert out.finished_sending == set()
         assert out.finished_recving == set()
         assert out.finished_loading == set()
-        assert out.finished_sidecar_saving == set()
-        assert out.failed_sidecar_saving == set()
-        assert out.finished_checkpoint_staging == set()
-        assert out.aborted_checkpoint_staging == set()
+        assert out.connector_completions == set()
         assert out.expected_finished_count == 0
 
     def test_is_empty(self):
@@ -516,20 +572,31 @@ class TestKVConnectorOutput:
         assert not KVConnectorOutput(finished_sending={"x"}).is_empty()
         assert not KVConnectorOutput(finished_recving={"x"}).is_empty()
         assert not KVConnectorOutput(finished_loading={"x"}).is_empty()
-        assert not KVConnectorOutput(finished_sidecar_saving={"x"}).is_empty()
-        assert not KVConnectorOutput(failed_sidecar_saving={"x"}).is_empty()
-        assert not KVConnectorOutput(finished_checkpoint_staging={1}).is_empty()
-        assert not KVConnectorOutput(aborted_checkpoint_staging={1}).is_empty()
+        assert not KVConnectorOutput(
+            connector_completions={
+                _completion(DSV4_CHECKPOINT_SAVE_CHANNEL, "x")
+            }
+        ).is_empty()
+        assert not KVConnectorOutput(
+            connector_completions={
+                _completion(
+                    STATE_CHECKPOINT_STAGING_CHANNEL,
+                    1,
+                    succeeded=False,
+                )
+            }
+        ).is_empty()
 
     def test_repr(self):
         out = KVConnectorOutput(
             finished_sending={"a"},
             finished_recving={"b"},
-            finished_sidecar_saving={"c"},
-            failed_sidecar_saving={"d"},
+            connector_completions={
+                _completion(DSV4_CHECKPOINT_SAVE_CHANNEL, "c")
+            },
         )
         r = repr(out)
         assert "sending" in r
         assert "recving" in r
-        assert "finished_sidecar_saving" in r
-        assert "failed_sidecar_saving" in r
+        assert "connector_completions" in r
+        assert DSV4_CHECKPOINT_SAVE_CHANNEL in r

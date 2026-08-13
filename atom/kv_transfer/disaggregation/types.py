@@ -73,9 +73,51 @@ class LoadOperationId:
 
 LoadCompletionId = ReqId | LoadOperationId
 
+# Connector-owned completion channels are opaque to composite connectors and
+# the TP output aggregator.  This one channel belongs to the model-engine
+# checkpoint lease protocol, so the scheduler consumes it directly after TP
+# aggregation.  Backend-specific channels stay in their backend package.
+STATE_CHECKPOINT_STAGING_CHANNEL = "atom.state_checkpoint.staging"
+
+ConnectorCompletionId = (
+    ReqId | SendOperationId | SaveOperationId | LoadOperationId
+)
+ConnectorCompletionKey = tuple[str, ConnectorCompletionId]
+
 # ---------------------------------------------------------------------------
 # Dataclasses
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ConnectorCompletion:
+    """One terminal event emitted on a connector-owned completion channel.
+
+    ``channel`` names the protocol owner without teaching generic transport
+    layers what the event means.  ``operation_id`` correlates the same event
+    across TP workers, and ``succeeded=False`` is failure-dominant when the TP
+    aggregator combines worker reports.
+    """
+
+    channel: str
+    operation_id: ConnectorCompletionId
+    succeeded: bool
+
+    def __post_init__(self) -> None:
+        if not self.channel:
+            raise ValueError("connector completion channel must be non-empty")
+        if type(self.succeeded) is not bool:
+            raise TypeError("connector completion succeeded must be bool")
+        try:
+            hash(self.operation_id)
+        except TypeError as exc:
+            raise TypeError(
+                "connector completion operation_id must be hashable"
+            ) from exc
+
+    @property
+    def key(self) -> ConnectorCompletionKey:
+        return self.channel, self.operation_id
 
 
 @dataclass
@@ -146,14 +188,9 @@ class KVConnectorOutput:
             connectors may still report request IDs).
         failed_loading: Exact offload load generations that failed (legacy
             connectors may still report request IDs).
-        finished_sidecar_saving: Exact save generations whose full-slot sidecar
-            committed successfully on this worker.
-        failed_sidecar_saving: Exact save generations whose full-slot sidecar
-            failed terminally on this worker.
-        finished_checkpoint_staging: Native checkpoint copy generations whose
-            destination is no longer read by GPU staging on this worker.
-        aborted_checkpoint_staging: Native checkpoint copy generations whose
-            destination is invalid, but all possible GPU access is terminal.
+        connector_completions: Terminal events on connector-owned channels.
+            Generic composite/aggregation layers transport these opaquely;
+            channel owners interpret them after TP aggregation.
         expected_finished_count: How many finished notifications should be
             expected per request (used by the aggregator).
     """
@@ -165,10 +202,7 @@ class KVConnectorOutput:
     finished_loading: set[LoadCompletionId] = field(default_factory=set)
     failed_loading: set[LoadCompletionId] = field(default_factory=set)
     expected_finished_count: int = 0
-    finished_sidecar_saving: set[SaveCompletionId] = field(default_factory=set)
-    failed_sidecar_saving: set[SaveCompletionId] = field(default_factory=set)
-    finished_checkpoint_staging: set[int] = field(default_factory=set)
-    aborted_checkpoint_staging: set[int] = field(default_factory=set)
+    connector_completions: set[ConnectorCompletion] = field(default_factory=set)
 
     def is_empty(self) -> bool:
         """Return True if no transfers finished on this worker."""
@@ -179,10 +213,7 @@ class KVConnectorOutput:
             and not self.finished_saving
             and not self.finished_loading
             and not self.failed_loading
-            and not self.finished_sidecar_saving
-            and not self.failed_sidecar_saving
-            and not self.finished_checkpoint_staging
-            and not self.aborted_checkpoint_staging
+            and not self.connector_completions
         )
 
     def __repr__(self) -> str:
@@ -193,10 +224,7 @@ class KVConnectorOutput:
             f"finished_saving={self.finished_saving}, "
             f"loading={self.finished_loading}, "
             f"failed_loading={self.failed_loading}, "
-            f"finished_sidecar_saving={self.finished_sidecar_saving}, "
-            f"failed_sidecar_saving={self.failed_sidecar_saving}, "
-            f"finished_checkpoint_staging={self.finished_checkpoint_staging}, "
-            f"aborted_checkpoint_staging={self.aborted_checkpoint_staging})"
+            f"connector_completions={self.connector_completions})"
         )
 
 
@@ -262,6 +290,19 @@ class ConnectorMetadata:
         self.reqs_in_batch: set[ReqId] = set()
         self.reqs_not_processed: set[ReqId] = set()
         self.request_id_to_transfer_id: dict[ReqId, int] = {}
+
+    def iter_async_save_operations(
+        self,
+    ) -> tuple[tuple[ReqId, SaveCompletionId], ...]:
+        """Return saves that a composite connector must lifetime-pair.
+
+        Most transfer metadata does not participate in ``finished_saving``.
+        An asynchronous storage backend opts in by overriding this method;
+        composite connectors then remain independent of backend request specs.
+        Each item is ``(request_id, completion_id)``.
+        """
+
+        return ()
 
     @staticmethod
     def _build_req_meta(

@@ -302,8 +302,8 @@ correctness — note the deliberate asymmetry vs a P/D producer:
 | `finished_loading` | PAGE, and required SLOT, restored on this worker. Aggregation wakes only after all TP workers succeed. |
 | `failed_loading` | This worker failed PAGE or SLOT. Once every rank is terminal, wake to **recompute** into already allocated storage. |
 | `finished_saving` | This exact `SaveOperationId` finished PAGE work; release deferred PAGE blocks only when the composite save is terminal. |
-| `finished_sidecar_saving` | This exact generation published AOS1 in this worker session; all TP ranks must agree before the scheduler commits the boundary. |
-| `failed_sidecar_saving` | This generation did not publish AOS1; PAGE may remain stored, but the boundary is not reusable. |
+| `connector_completions[atom.dsv4.checkpoint.save]` | This exact generation published or failed to publish AOS1. `succeeded=False` is failure-dominant across TP ranks; only all-rank success commits the boundary. |
+| `connector_completions[atom.state_checkpoint.staging]` | GPU staging stopped reading one exact native checkpoint lease. Success preserves the native checkpoint; failure invalidates it before release. |
 | `finished_sending` | **Never used by standalone offload.** P/D producer semantics free live blocks, so `is_producer = False`. |
 
 Save-generation identity matters because one long prefill can have multiple PAGE
@@ -563,8 +563,8 @@ corrupt write:
   the same recompute path. Corrupt keys are invalidated before replacement; if
   removal fails, the key stays fenced and cannot be falsely re-committed.
 - **SLOT save staging exhausted** — PAGE saving proceeds, but
-  `failed_sidecar_saving` prevents boundary commit. Admission never blocks the
-  RPC thread waiting for a row.
+  a failed `atom.dsv4.checkpoint.save` completion prevents boundary commit.
+  Admission never blocks the RPC thread waiting for a row.
 - **One TP rank fails a sidecar save** — exact-generation aggregation reports a
   global sidecar failure after every rank is terminal; no logical commit occurs.
 - **SLOT GPU completion cannot be confirmed** — the staging row is quarantined

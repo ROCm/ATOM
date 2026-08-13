@@ -14,6 +14,7 @@ import pytest
 from conftest import MockConfig
 
 from atom.kv_transfer.disaggregation.types import (
+    ConnectorCompletion,
     KVConnectorOutput,
     LoadOperationId,
     SaveOperationId,
@@ -153,30 +154,31 @@ class TestSchedule:
         assert Scheduler._pop_load_completion(completions, seq) is False
         assert completions == [88]
 
-    def test_checkpoint_staging_terminals_release_exact_leases(self):
-        completed = []
+    def test_connector_owned_completion_is_delegated_to_channel_owner(self):
+        channel = "test.connector.completion"
+        completion = ConnectorCompletion(
+            channel=channel,
+            operation_id=SaveOperationId(13, 2),
+            succeeded=False,
+        )
+        handled = []
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.kv_connector = SimpleNamespace(
             is_producer=False,
             is_offload=True,
+            completion_channels={channel},
+            connector_completion=lambda value: handled.append(value),
         )
-        scheduler.block_manager = SimpleNamespace(
-            complete_state_checkpoint_lease=lambda copy_id, preserve: completed.append(
-                (copy_id, preserve)
-            )
-        )
+        scheduler.block_manager = SimpleNamespace()
         scheduler.deferred_free_blocks = {}
         scheduler.finished_recving_kv_req_ids = []
         scheduler.failed_recving_kv_req_ids = []
 
         scheduler._update_from_kv_xfer_finished(
-            KVConnectorOutput(
-                finished_checkpoint_staging={11},
-                aborted_checkpoint_staging={12},
-            )
+            KVConnectorOutput(connector_completions={completion})
         )
 
-        assert completed == [(11, True), (12, False)]
+        assert handled == [completion]
 
     @pytest.mark.parametrize(
         ("winner_is_offload", "expected_jump"),

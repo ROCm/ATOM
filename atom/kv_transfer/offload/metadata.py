@@ -164,3 +164,17 @@ class LMCacheOffloadMetadata(ConnectorMetadata):
 
     def add_request(self, meta: LMCacheReqMeta) -> None:
         self.requests.append(meta)
+
+    def iter_async_save_operations(
+        self,
+    ) -> tuple[tuple[ReqId, ReqId | SaveOperationId], ...]:
+        """Expose PAGE/SLOT saves through the generic composite contract."""
+
+        return tuple(
+            (
+                request.req_id,
+                request.save_operation or request.req_id,
+            )
+            for request in self.requests
+            if request.save_spec is not None or request.slot_save_spec is not None
+        )

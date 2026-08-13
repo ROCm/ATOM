@@ -22,6 +22,7 @@ from atom.kv_transfer.disaggregation.types import (
     KVConnectorOutput,
     KVTransferRegion,
     SaveOperationId,
+    STATE_CHECKPOINT_STAGING_CHANNEL,
 )
 from atom.kv_transfer.offload.hybrid.dsv4 import connector as connector_module
 from atom.kv_transfer.offload.hybrid.dsv4.codec import (
@@ -36,6 +37,7 @@ from atom.kv_transfer.offload.hybrid.dsv4.codec import (
     encode_checkpoint,
 )
 from atom.kv_transfer.offload.hybrid.dsv4.connector import (
+    DSV4_CHECKPOINT_SAVE_CHANNEL,
     DSV4OffloadConnector as LMCacheOffloadConnector,
 )
 from atom.kv_transfer.offload.hybrid.dsv4.connector import (
@@ -58,6 +60,14 @@ from atom.model_engine.state_pool import StateCheckpointCopy
 
 _FINGERPRINT = bytes.fromhex("00112233445566778899aabbccddeeff")
 _PAYLOAD = b"\x07\x08\x09\xff"
+
+
+def _completion_ids(output, channel: str, *, succeeded: bool) -> set:
+    return {
+        completion.operation_id
+        for completion in output.connector_completions
+        if completion.channel == channel and completion.succeeded is succeeded
+    }
 
 
 class _FakeClock:
@@ -618,8 +628,12 @@ def test_get_finished_atomically_drains_sidecar_save_results():
     assert result.finished_loading == {1}
     assert result.finished_saving == {2}
     assert result.failed_loading == {3}
-    assert result.finished_sidecar_saving == {4}
-    assert result.failed_sidecar_saving == {5}
+    assert _completion_ids(
+        result, DSV4_CHECKPOINT_SAVE_CHANNEL, succeeded=True
+    ) == {4}
+    assert _completion_ids(
+        result, DSV4_CHECKPOINT_SAVE_CHANNEL, succeeded=False
+    ) == {5}
     assert connector.get_finished().is_empty()
 
 
@@ -636,8 +650,12 @@ def test_unexpected_slot_save_failure_reports_page_and_sidecar_terminals():
     result = connector.get_finished()
 
     assert result.finished_saving == {request.req_id}
-    assert result.finished_sidecar_saving == set()
-    assert result.failed_sidecar_saving == {request.req_id}
+    assert not _completion_ids(
+        result, DSV4_CHECKPOINT_SAVE_CHANNEL, succeeded=True
+    )
+    assert _completion_ids(
+        result, DSV4_CHECKPOINT_SAVE_CHANNEL, succeeded=False
+    ) == {request.req_id}
     assert connector._pending_save_ops == {}
     assert connector._save_req_locks == {}
 
@@ -659,7 +677,9 @@ def test_unexpected_save_failure_reports_exact_operation_generation():
     result = connector.get_finished()
 
     assert result.finished_saving == {request.save_operation}
-    assert result.failed_sidecar_saving == {request.save_operation}
+    assert _completion_ids(
+        result, DSV4_CHECKPOINT_SAVE_CHANNEL, succeeded=False
+    ) == {request.save_operation}
     assert connector._pending_save_ops == {}
     assert connector._save_req_locks == {}
 
@@ -997,9 +1017,15 @@ def test_native_checkpoint_save_defers_until_copy_then_snapshots_destination(
     fn(*args)
     result = connector.get_finished()
     assert result.finished_saving == {request.save_operation}
-    assert result.finished_sidecar_saving == {request.save_operation}
-    assert result.finished_checkpoint_staging == {checkpoint.copy_id}
-    assert result.aborted_checkpoint_staging == set()
+    assert _completion_ids(
+        result, DSV4_CHECKPOINT_SAVE_CHANNEL, succeeded=True
+    ) == {request.save_operation}
+    assert _completion_ids(
+        result, STATE_CHECKPOINT_STAGING_CHANNEL, succeeded=True
+    ) == {checkpoint.copy_id}
+    assert not _completion_ids(
+        result, STATE_CHECKPOINT_STAGING_CHANNEL, succeeded=False
+    )
     assert connector._slot_admission.released == [0]
 
 
@@ -1080,8 +1106,12 @@ def test_checkpoint_copy_generation_does_not_consume_stale_intent(monkeypatch):
     connector.abort_state_checkpoint_copies([old_copy])
     result = connector.get_finished()
     assert result.finished_saving == {old_request.save_operation}
-    assert result.failed_sidecar_saving == {old_request.save_operation}
-    assert result.aborted_checkpoint_staging == {old_copy.copy_id}
+    assert _completion_ids(
+        result, DSV4_CHECKPOINT_SAVE_CHANNEL, succeeded=False
+    ) == {old_request.save_operation}
+    assert _completion_ids(
+        result, STATE_CHECKPOINT_STAGING_CHANNEL, succeeded=False
+    ) == {old_copy.copy_id}
 
 
 def test_deferred_checkpoint_submission_failure_releases_snapshot(monkeypatch):
@@ -1119,7 +1149,9 @@ def test_checkpoint_staging_completion_does_not_wait_for_save_executor(monkeypat
     connector.state_checkpoint_copies_issued([checkpoint])
 
     result = connector.get_finished()
-    assert result.finished_checkpoint_staging == {33}
+    assert _completion_ids(
+        result, STATE_CHECKPOINT_STAGING_CHANNEL, succeeded=True
+    ) == {33}
     assert result.finished_saving == set()
     assert len(connector._save_executor.calls) == 1
 
@@ -1140,7 +1172,9 @@ def test_checkpoint_and_temp_row_release_before_storage_publication(monkeypatch)
     # The native group lease is independently releasable at gather completion,
     # before the background save even starts D2H or storage work.
     staged = connector.get_finished()
-    assert staged.finished_checkpoint_staging == {37}
+    assert _completion_ids(
+        staged, STATE_CHECKPOINT_STAGING_CHANNEL, succeeded=True
+    ) == {37}
     assert staged.finished_saving == set()
 
     fn, args = connector._save_executor.calls[0]
@@ -1172,9 +1206,17 @@ def test_checkpoint_staging_waits_for_ready_event(monkeypatch):
     )
     connector.state_checkpoint_copies_issued([checkpoint])
 
-    assert connector.get_finished().finished_checkpoint_staging == set()
+    assert not _completion_ids(
+        connector.get_finished(),
+        STATE_CHECKPOINT_STAGING_CHANNEL,
+        succeeded=True,
+    )
     event.query_result = True
-    assert connector.get_finished().finished_checkpoint_staging == {35}
+    assert _completion_ids(
+        connector.get_finished(),
+        STATE_CHECKPOINT_STAGING_CHANNEL,
+        succeeded=True,
+    ) == {35}
 
 
 def test_checkpoint_save_backpressure_still_fences_native_copy(monkeypatch):
@@ -1191,8 +1233,12 @@ def test_checkpoint_save_backpressure_still_fences_native_copy(monkeypatch):
     connector.state_checkpoint_copies_issued([checkpoint])
 
     result = connector.get_finished()
-    assert result.finished_checkpoint_staging == {36}
-    assert result.failed_sidecar_saving == {17}
+    assert _completion_ids(
+        result, STATE_CHECKPOINT_STAGING_CHANNEL, succeeded=True
+    ) == {36}
+    assert _completion_ids(
+        result, DSV4_CHECKPOINT_SAVE_CHANNEL, succeeded=False
+    ) == {17}
     assert connector._slot_codec.snapshot_groups == []
 
 
@@ -1220,8 +1266,12 @@ def test_unknown_checkpoint_gpu_completion_quarantines_lease(monkeypatch):
     connector.state_checkpoint_copies_issued([checkpoint])
 
     result = connector.get_finished()
-    assert result.finished_checkpoint_staging == set()
-    assert result.aborted_checkpoint_staging == set()
+    assert not _completion_ids(
+        result, STATE_CHECKPOINT_STAGING_CHANNEL, succeeded=True
+    )
+    assert not _completion_ids(
+        result, STATE_CHECKPOINT_STAGING_CHANNEL, succeeded=False
+    )
     assert connector._quarantined_checkpoint_staging == {34}
 
 
@@ -1246,10 +1296,12 @@ def test_native_checkpoint_build_failure_aborts_deferred_snapshot(monkeypatch):
     assert connector._pending_save_ops == {}
 
 
-def test_multi_checkpoint_hooks_isolate_child_failures():
+def test_multi_checkpoint_hooks_target_only_unique_channel_owner():
     calls = []
 
     class _Failing:
+        completion_channels = {STATE_CHECKPOINT_STAGING_CHANNEL}
+
         def state_checkpoint_copies_issued(self, _copies):
             raise RuntimeError("issued failed")
 
@@ -1258,6 +1310,8 @@ def test_multi_checkpoint_hooks_isolate_child_failures():
             raise RuntimeError("abort failed")
 
     class _Healthy:
+        completion_channels = set()
+
         def state_checkpoint_copies_issued(self, copies):
             calls.append(("issued", copies))
 
@@ -1273,9 +1327,7 @@ def test_multi_checkpoint_hooks_isolate_child_failures():
 
     assert calls == [
         "failing-abort",
-        ("issued", copies),
         "failing-abort",
-        ("abort", copies),
     ]
 
 
@@ -1321,7 +1373,9 @@ def test_checkpoint_hook_failure_terminals_all_selected_intents(monkeypatch):
 
     result = connector.get_finished()
     assert result.finished_saving == {first.save_operation, second.save_operation}
-    assert result.failed_sidecar_saving == {
+    assert _completion_ids(
+        result, DSV4_CHECKPOINT_SAVE_CHANNEL, succeeded=False
+    ) == {
         first.save_operation,
         second.save_operation,
     }
@@ -1387,7 +1441,9 @@ def test_rejected_boundary_save_does_not_finish_prior_page_operation(monkeypatch
     assert connector._pending_save_ops == {17: 1}
     rejected = connector.get_finished()
     assert rejected.finished_saving == {SaveOperationId(17, 1)}
-    assert rejected.failed_sidecar_saving == {SaveOperationId(17, 1)}
+    assert _completion_ids(
+        rejected, DSV4_CHECKPOINT_SAVE_CHANNEL, succeeded=False
+    ) == {SaveOperationId(17, 1)}
 
     fn, args = connector._save_executor.calls[0]
     fn(*args)
@@ -1423,7 +1479,9 @@ def test_max_pending_saves_bounds_running_plus_queued_before_snapshot(monkeypatc
     assert connector._pending_save_ops == {17: 1}
     rejected = connector.get_finished()
     assert rejected.finished_saving == {SaveOperationId(17, 1)}
-    assert rejected.failed_sidecar_saving == {SaveOperationId(17, 1)}
+    assert _completion_ids(
+        rejected, DSV4_CHECKPOINT_SAVE_CHANNEL, succeeded=False
+    ) == {SaveOperationId(17, 1)}
 
     fn, args = connector._save_executor.calls[0]
     fn(*args)
@@ -1556,13 +1614,25 @@ def test_same_request_saves_serialize_and_multi_releases_on_all_ops_done(monkeyp
 
     try:
         multi.start_load_kv(
-            MultiConnectorMetadata([ConnectorMetadata(), _metadata(page)])
+            MultiConnectorMetadata(
+                [ConnectorMetadata(), _metadata(page)],
+                completion_channel_owners={
+                    DSV4_CHECKPOINT_SAVE_CHANNEL: 1,
+                    STATE_CHECKPOINT_STAGING_CHANNEL: 1,
+                },
+            )
         )
         assert first_started.wait(timeout=2)
         assert connector._done_save == set()
 
         multi.start_load_kv(
-            MultiConnectorMetadata([ConnectorMetadata(), _metadata(boundary)])
+            MultiConnectorMetadata(
+                [ConnectorMetadata(), _metadata(boundary)],
+                completion_channel_owners={
+                    DSV4_CHECKPOINT_SAVE_CHANNEL: 1,
+                    STATE_CHECKPOINT_STAGING_CHANNEL: 1,
+                },
+            )
         )
         assert executor.started[1].wait(timeout=2)
         assert not boundary_started.is_set()
@@ -1588,7 +1658,9 @@ def test_same_request_saves_serialize_and_multi_releases_on_all_ops_done(monkeyp
         executor.shutdown()
 
     assert terminal.finished_saving == {SaveOperationId(17, 1)}
-    assert terminal.finished_sidecar_saving == {SaveOperationId(17, 1)}
+    assert _completion_ids(
+        terminal, DSV4_CHECKPOINT_SAVE_CHANNEL, succeeded=True
+    ) == {SaveOperationId(17, 1)}
     assert terminal.finished_sending == {17}
     assert connector._pending_save_ops == {}
     assert connector._save_req_locks == {}

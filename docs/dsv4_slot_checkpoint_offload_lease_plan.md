@@ -2024,7 +2024,8 @@ state_checkpoint_copies_issued()
         v
 save executor waits ready_event
         |
-        +--> report finished_checkpoint_staging(copy_id)
+        +--> report ConnectorCompletion(
+        |        atom.state_checkpoint.staging, copy_id, succeeded=True)
         |            all TP ranks -> release StateGroupPool lease
         |
         +--> engine.store(PAGE chunks) if PAGE is due
@@ -2043,7 +2044,8 @@ save executor waits ready_event
         +--> poll DSV4CheckpointStore.contains(key)
         |
         v
-worker reports finished_sidecar_saving(save_operation)
+worker reports ConnectorCompletion(
+    atom.dsv4.checkpoint.save, save_operation, succeeded=True)
         |
         v
 all TP ranks succeed -> scheduler commits boundary B
@@ -2632,21 +2634,21 @@ event.record(current_compute_stream)
 
 ## 8. Completion 协议
 
-需要新增独立于 sidecar publication 的完成语义。
-
-建议在 `KVConnectorOutput` 增加：
+当前通过通用 `ConnectorCompletion` 表达独立于 checkpoint publication 的完成语义：
 
 ```text
-finished_checkpoint_staging: set[int]  # copy valid，GPU 已不再读 dst
-aborted_checkpoint_staging: set[int]   # native copy 无效，需 invalidate 后释放
+channel      = atom.state_checkpoint.staging
+operation_id = copy_id
+succeeded    = True   # copy valid，GPU 已不再读 dst
+succeeded    = False  # native copy 无效，需 invalidate 后释放
 ```
 
 说明：
 
-- gather/admission 失败但 `src -> dst` 已成功时，仍属于
-  `finished_checkpoint_staging`；native checkpoint 有效，只是 sidecar 失败。
+- gather/admission 失败但 `src -> dst` 已成功时，仍报告 staging success；native
+  checkpoint 有效，只是 remote checkpoint save 失败。
 - native copy 在发出前 abort，或无法建立有效 `dst` 内容时，属于
-  `aborted_checkpoint_staging`。
+  staging failure。
 - 无法确认仍在飞的 GPU 工作时，不属于任何可释放集合。
 
 `KVOutputAggregator` 按 `copy_id` 等待所有 TP workers terminal：

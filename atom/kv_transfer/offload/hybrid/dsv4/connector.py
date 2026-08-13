@@ -40,12 +40,14 @@ from atom.kv_transfer.disaggregation.base import (
     KVConnectorSchedulerBase,
 )
 from atom.kv_transfer.disaggregation.types import (
+    ConnectorCompletion,
     KVConnectorOutput,
     LoadCompletionId,
     LoadOperationId,
     ReqId,
     SaveCompletionId,
     SaveOperationId,
+    STATE_CHECKPOINT_STAGING_CHANNEL,
 )
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
@@ -83,6 +85,8 @@ from atom.kv_transfer.offload.metadata import (
 )
 
 logger = logging.getLogger("atom")
+
+DSV4_CHECKPOINT_SAVE_CHANNEL = "atom.dsv4.checkpoint.save"
 
 
 def _max_pending_saves(kvc, save_workers: int) -> int:
@@ -214,6 +218,12 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
     # finished_sending (the scheduler frees blocks on finished_sending — a P/D
     # producer semantic that would wrongly deallocate live offload blocks).
     is_producer = False
+    completion_channels = frozenset(
+        {
+            DSV4_CHECKPOINT_SAVE_CHANNEL,
+            STATE_CHECKPOINT_STAGING_CHANNEL,
+        }
+    )
 
     def __init__(self, config) -> None:
         self._config = config
@@ -2182,15 +2192,44 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 self._done_checkpoint_staging.clear()
             if hasattr(self, "_aborted_checkpoint_staging"):
                 self._aborted_checkpoint_staging.clear()
+        connector_completions = {
+            ConnectorCompletion(
+                channel=DSV4_CHECKPOINT_SAVE_CHANNEL,
+                operation_id=completion_id,
+                succeeded=True,
+            )
+            for completion_id in dss
+        }
+        connector_completions.update(
+            ConnectorCompletion(
+                channel=DSV4_CHECKPOINT_SAVE_CHANNEL,
+                operation_id=completion_id,
+                succeeded=False,
+            )
+            for completion_id in fss
+        )
+        connector_completions.update(
+            ConnectorCompletion(
+                channel=STATE_CHECKPOINT_STAGING_CHANNEL,
+                operation_id=copy_id,
+                succeeded=True,
+            )
+            for copy_id in dcs
+        )
+        connector_completions.update(
+            ConnectorCompletion(
+                channel=STATE_CHECKPOINT_STAGING_CHANNEL,
+                operation_id=copy_id,
+                succeeded=False,
+            )
+            for copy_id in acs
+        )
         return KVConnectorOutput(
             finished_sending=set(),
             finished_loading=dl,
             failed_loading=fl,
             finished_saving=ds,
-            finished_sidecar_saving=dss,
-            failed_sidecar_saving=fss,
-            finished_checkpoint_staging=dcs,
-            aborted_checkpoint_staging=acs,
+            connector_completions=connector_completions,
         )
 
     def get_finished_recv_blocks(self) -> list[int]:
@@ -2209,6 +2248,12 @@ class DSV4OffloadScheduler(KVConnectorSchedulerBase):
     # Opt the scheduler into offload-wake (suffix prefill) instead of the P/D
     # decode-jump in Scheduler.schedule(); see Scheduler._is_offload_connector.
     is_offload = True
+    completion_channels = frozenset(
+        {
+            DSV4_CHECKPOINT_SAVE_CHANNEL,
+            STATE_CHECKPOINT_STAGING_CHANNEL,
+        }
+    )
 
     def __init__(self, config) -> None:
         self._config = config
@@ -3031,6 +3076,17 @@ class DSV4OffloadScheduler(KVConnectorSchedulerBase):
         if sid in self._sidecar_save_inflight:
             return
         self._save_inflight.pop(sid, None)
+
+    def connector_completion(self, completion: ConnectorCompletion) -> bool:
+        """Apply one TP-aggregated completion owned by the DSV4 scheduler."""
+
+        if completion.channel != DSV4_CHECKPOINT_SAVE_CHANNEL:
+            return False
+        if completion.succeeded:
+            self.sidecar_save_finished(completion.operation_id)
+        else:
+            self.sidecar_save_failed(completion.operation_id)
+        return True
 
     def sidecar_save_finished(self, req_id) -> None:
         sid = str(req_id.req_id if isinstance(req_id, SaveOperationId) else req_id)

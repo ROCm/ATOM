@@ -52,11 +52,10 @@ signals until the pair is done, then emits them together. The scheduler's
 finds nothing to free and no-ops. This is the analogue of vLLM's
 ``_extra_async_saves`` refcount.
 
-SLOT sidecar success/failure is carried in separate completion sets and bypasses
-this pairing. PAGE and SLOT notifications use the same exact
-``SaveOperationId`` generation, so delayed TP reports cannot cross-complete
-overlapping saves. Those sets update scheduler-side commit state only; the
-paired ``finished_saving`` signal remains responsible for block-lifetime release.
+Connector-owned terminal events bypass this pairing and are routed by opaque,
+uniquely owned completion channels. The paired ``finished_saving`` signal
+remains responsible for block-lifetime release; a backend-specific completion
+may update its own scheduler state but cannot release PAGE blocks through Multi.
 """
 
 from __future__ import annotations
@@ -72,6 +71,7 @@ from atom.kv_transfer.disaggregation.base import (
     KVConnectorSchedulerBase,
 )
 from atom.kv_transfer.disaggregation.types import (
+    ConnectorCompletion,
     ConnectorMetadata,
     KVConnectorOutput,
     LoadOperationId,
@@ -97,6 +97,31 @@ class _LegacySaveOperation:
 
     req_id: Any
     nonce: int
+
+
+class _CompletedOperationWindow:
+    """Bounded exact-operation memory with O(1) lookup and FIFO eviction."""
+
+    def __init__(self, limit: int) -> None:
+        if limit <= 0:
+            raise ValueError("completed operation window limit must be positive")
+        self.limit = int(limit)
+        self._order: deque[Any] = deque()
+        self._items: set[Any] = set()
+
+    def __contains__(self, operation: Any) -> bool:
+        return operation in self._items
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def remember(self, operation: Any) -> None:
+        if operation in self._items:
+            return
+        self._items.add(operation)
+        self._order.append(operation)
+        while len(self._order) > self.limit:
+            self._items.discard(self._order.popleft())
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +194,27 @@ def _first_with(connectors: list, name: str):
     return None
 
 
+def _completion_channel_owners(connectors: list) -> dict[str, int]:
+    """Return the unique child owner of every declared completion channel."""
+
+    owners: dict[str, int] = {}
+    for connector_idx, connector in enumerate(connectors):
+        channels = getattr(connector, "completion_channels", ()) or ()
+        for channel in channels:
+            if not isinstance(channel, str) or not channel:
+                raise ValueError(
+                    "connector completion channels must be non-empty strings"
+                )
+            previous = owners.get(channel)
+            if previous is not None:
+                raise ValueError(
+                    "multi connector completion channel must have one owner: "
+                    f"channel={channel!r} children={previous},{connector_idx}"
+                )
+            owners[channel] = connector_idx
+    return owners
+
+
 # ---------------------------------------------------------------------------
 # Metadata
 # ---------------------------------------------------------------------------
@@ -182,9 +228,14 @@ class MultiConnectorMetadata(ConnectorMetadata):
     routes ``metas[i]`` to ``connectors[i].start_load_kv``.
     """
 
-    def __init__(self, metas: list) -> None:
+    def __init__(
+        self,
+        metas: list,
+        completion_channel_owners: dict[str, int] | None = None,
+    ) -> None:
         super().__init__()
         self.metas = list(metas)
+        self.completion_channel_owners = dict(completion_channel_owners or {})
 
     @property
     def requests(self):
@@ -200,6 +251,14 @@ class MultiConnectorMetadata(ConnectorMetadata):
             if sub:
                 agg.extend(sub)
         return agg
+
+    def requests_for_completion_channel(self, channel: str) -> list:
+        """Return only requests owned by one opaque completion channel."""
+
+        owner = self.completion_channel_owners.get(channel)
+        if owner is None or not 0 <= owner < len(self.metas):
+            return []
+        return list(getattr(self.metas[owner], "requests", ()) or ())
 
 
 # ---------------------------------------------------------------------------
@@ -224,17 +283,13 @@ class MultiConnector(KVConnectorBase):
         self._req_operations: dict[str, deque[Any]] = {}
         self._sent: dict[str, Any] = {}
         self._legacy_save_nonce = 0
-        self._pairing_tombstone_limit = 4096
-        self._terminal_save_order: deque[SaveOperationId] = deque()
-        self._terminal_save: set[SaveOperationId] = set()
-        # A native state-checkpoint destination may be read by more than one
-        # child connector on this rank.  Do not forward a child's staging
-        # terminal until every child registered for that exact copy generation
-        # is done; the outer TP aggregator cannot provide this local fan-in.
-        self._checkpoint_staging_expected: dict[int, set[int]] = {}
-        self._checkpoint_staging_terminal: dict[int, dict[int, bool]] = {}
-        self._terminal_checkpoint_staging_order: deque[int] = deque()
-        self._terminal_checkpoint_staging: set[int] = set()
+        self._completed_save_operations = _CompletedOperationWindow(4096)
+        # Completion channels have exactly one child owner. This keeps a
+        # composite connector generic and prevents two children from reading
+        # the same native checkpoint lease behind one completion identity.
+        self._completion_channel_owners = _completion_channel_owners(
+            self._connectors
+        )
 
     def register_kv_caches(
         self,
@@ -254,43 +309,50 @@ class MultiConnector(KVConnectorBase):
                 type(metadata).__name__,
             )
             return
-        self._register_checkpoint_staging(metas, state_checkpoint_copies)
+        if len(metas) != len(self._connectors):
+            raise RuntimeError(
+                "multi connector metadata/child count mismatch: "
+                f"metas={len(metas)} children={len(self._connectors)}"
+            )
+        declared_owners = getattr(metadata, "completion_channel_owners", None)
+        if declared_owners is not None and (
+            dict(declared_owners) != self._completion_channel_owners
+        ):
+            raise RuntimeError(
+                "multi connector completion-channel ownership differs between "
+                "scheduler and worker"
+            )
         legacy_operations: dict[str, _LegacySaveOperation] = {}
         for connector_idx, (c, m) in enumerate(zip(self._connectors, metas)):
             if m is None:
                 continue
-            # Remember which requests offload is about to save, so get_finished
-            # can hold their send completion until the save also finishes.
-            reqs = getattr(m, "requests", None)
-            if reqs:
-                for req in reqs:
-                    if (
-                        getattr(req, "save_spec", None) is not None
-                        or getattr(req, "slot_save_spec", None) is not None
-                    ):
-                        req_id = req.req_id
-                        output = getattr(req, "save_operation", None) or req_id
-                        req_key = str(req_id)
-                        if isinstance(output, SaveOperationId):
-                            if output in self._terminal_save:
-                                continue
-                            operation = output
-                        else:
-                            operation = legacy_operations.get(req_key)
-                            if operation is None:
-                                operation = _LegacySaveOperation(
-                                    req_id,
-                                    self._legacy_save_nonce,
-                                )
-                                self._legacy_save_nonce += 1
-                                legacy_operations[req_key] = operation
-                        if operation not in self._pending_save:
-                            self._pending_save[operation] = set()
-                            self._operation_output[operation] = output
-                            self._req_operations.setdefault(req_key, deque()).append(
-                                operation
-                            )
-                        self._pending_save[operation].add(connector_idx)
+            # Remember backend-declared async saves, so get_finished can hold
+            # producer send completion until every reader of those blocks is
+            # done. Multi never inspects backend-specific request descriptors.
+            iter_saves = getattr(m, "iter_async_save_operations", None)
+            save_operations = iter_saves() if callable(iter_saves) else ()
+            for req_id, output in save_operations:
+                req_key = str(req_id)
+                if isinstance(output, SaveOperationId):
+                    if output in self._completed_save_operations:
+                        continue
+                    operation = output
+                else:
+                    operation = legacy_operations.get(req_key)
+                    if operation is None:
+                        operation = _LegacySaveOperation(
+                            req_id,
+                            self._legacy_save_nonce,
+                        )
+                        self._legacy_save_nonce += 1
+                        legacy_operations[req_key] = operation
+                if operation not in self._pending_save:
+                    self._pending_save[operation] = set()
+                    self._operation_output[operation] = output
+                    self._req_operations.setdefault(req_key, deque()).append(
+                        operation
+                    )
+                self._pending_save[operation].add(connector_idx)
             c.start_load_kv(m)
 
     def get_finished(self) -> KVConnectorOutput:
@@ -299,10 +361,7 @@ class MultiConnector(KVConnectorBase):
         failed: set = set()
         loaded: set = set()
         load_failed: set = set()
-        sidecar_saved: set = set()
-        sidecar_failed: set = set()
-        checkpoint_staged: set[int] = set()
-        checkpoint_aborted: set[int] = set()
+        connector_completions: set[ConnectorCompletion] = set()
         send_now: list = []
         completed_save_now: list = []
         unregistered_save_now: list = []
@@ -312,21 +371,18 @@ class MultiConnector(KVConnectorBase):
             failed |= o.failed_recving
             loaded |= o.finished_loading
             load_failed |= o.failed_loading
-            sidecar_saved |= o.finished_sidecar_saving
-            sidecar_failed |= o.failed_sidecar_saving
-            checkpoint_terminals = set(o.finished_checkpoint_staging) | set(
-                o.aborted_checkpoint_staging
-            )
-            for copy_id in checkpoint_terminals:
-                terminal = self._consume_checkpoint_staging_terminal(
-                    connector_idx,
-                    int(copy_id),
-                    aborted=copy_id in o.aborted_checkpoint_staging,
-                )
-                if terminal is True:
-                    checkpoint_aborted.add(int(copy_id))
-                elif terminal is False:
-                    checkpoint_staged.add(int(copy_id))
+            for completion in o.connector_completions:
+                owner = self._completion_channel_owners.get(completion.channel)
+                if owner != connector_idx:
+                    logger.error(
+                        "multi: dropping completion from non-owner child=%d "
+                        "channel=%s owner=%s",
+                        connector_idx,
+                        completion.channel,
+                        owner,
+                    )
+                    continue
+                connector_completions.add(completion)
             send_now.extend(o.finished_sending)
             for completion in o.finished_saving:
                 completed = self._consume_save_completion(connector_idx, completion)
@@ -335,7 +391,7 @@ class MultiConnector(KVConnectorBase):
                 if completed is None:
                     if (
                         isinstance(completion, SaveOperationId)
-                        and completion in self._terminal_save
+                        and completion in self._completed_save_operations
                     ):
                         continue
                     unregistered_save_now.append(completion)
@@ -347,10 +403,7 @@ class MultiConnector(KVConnectorBase):
             failed_recving=failed,
             finished_loading=loaded,
             failed_loading=load_failed,
-            finished_sidecar_saving=sidecar_saved,
-            failed_sidecar_saving=sidecar_failed,
-            finished_checkpoint_staging=checkpoint_staged,
-            aborted_checkpoint_staging=checkpoint_aborted,
+            connector_completions=connector_completions,
         )
 
         out.finished_saving = set(completed_save_now) | set(unregistered_save_now)
@@ -381,131 +434,11 @@ class MultiConnector(KVConnectorBase):
             self._operation_output = {}
             self._req_operations = {}
             self._legacy_save_nonce = 0
-            self._pairing_tombstone_limit = 4096
-            self._terminal_save_order = deque()
-            self._terminal_save = set()
-        if not hasattr(self, "_checkpoint_staging_expected"):
-            self._checkpoint_staging_expected = {}
-            self._checkpoint_staging_terminal = {}
-            self._terminal_checkpoint_staging_order = deque()
-            self._terminal_checkpoint_staging = set()
-
-    @staticmethod
-    def _checkpoint_identity(copy_record: Any) -> tuple[Any, int, int, int]:
-        return (
-            copy_record.request_id,
-            int(copy_record.boundary_tokens),
-            int(copy_record.boundary_block_hash),
-            int(copy_record.source_group),
-        )
-
-    @staticmethod
-    def _slot_save_identity(req: Any) -> tuple[Any, int, int, int] | None:
-        spec = getattr(req, "slot_save_spec", None)
-        if spec is None:
-            return None
-        return (
-            req.req_id,
-            int(spec.boundary_tokens),
-            int(spec.boundary_block_hash),
-            int(spec.source_group),
-        )
-
-    def _register_checkpoint_staging(self, metas, state_checkpoint_copies) -> None:
-        """Record every child that will gather one leased checkpoint copy."""
-
-        self._ensure_pairing_state()
-        copies_by_identity = {}
-        for copy_record in state_checkpoint_copies or ():
-            try:
-                identity = self._checkpoint_identity(copy_record)
-                copy_id = int(copy_record.copy_id)
-            except (AttributeError, TypeError, ValueError):
-                # ConnectorMetadata deliberately types these records as Any for
-                # compatibility with older connectors. They still receive the
-                # opaque records; only typed checkpoint copies join this fan-in.
-                continue
-            copies_by_identity[identity] = copy_id
-        if not copies_by_identity:
-            return
-
-        for connector_idx, meta in enumerate(metas):
-            checkpoint_callback = getattr(
-                self._connectors[connector_idx],
-                "start_load_kv_with_state_checkpoints",
-                None,
-            )
-            if not callable(checkpoint_callback):
-                # This child receives only its ordinary sub-metadata and cannot
-                # read the leased destination through the extended hook.
-                continue
-            for req in getattr(meta, "requests", ()) or ():
-                try:
-                    identity = self._slot_save_identity(req)
-                except (AttributeError, TypeError, ValueError):
-                    continue
-                copy_id = copies_by_identity.get(identity)
-                if copy_id is None or copy_id in self._terminal_checkpoint_staging:
-                    continue
-                self._checkpoint_staging_expected.setdefault(copy_id, set()).add(
-                    connector_idx
-                )
-
-    def _consume_checkpoint_staging_terminal(
-        self,
-        connector_idx: int,
-        copy_id: int,
-        *,
-        aborted: bool,
-    ) -> bool | None:
-        """Return the aggregate abort flag once every local reader is terminal.
-
-        ``True`` means at least one child aborted, ``False`` means every child
-        completed, and ``None`` means the copy is still pending or tombstoned.
-        Unregistered terminals retain the historical pass-through behaviour;
-        leased copies are always registered before their child hooks can run.
-        """
-
-        self._ensure_pairing_state()
-        if copy_id in self._terminal_checkpoint_staging:
-            return None
-
-        expected = self._checkpoint_staging_expected.get(copy_id)
-        if expected is None:
-            self._remember_terminal_checkpoint_staging(copy_id)
-            return bool(aborted)
-        if connector_idx not in expected:
-            logger.warning(
-                "multi: ignoring checkpoint staging terminal from unregistered "
-                "child=%d copy_id=%d",
-                connector_idx,
-                copy_id,
-            )
-            return None
-
-        terminals = self._checkpoint_staging_terminal.setdefault(copy_id, {})
-        # A contradictory duplicate fails closed while the local fan-in is
-        # pending. Child contracts should emit exactly one terminal.
-        terminals[connector_idx] = bool(aborted) or terminals.get(connector_idx, False)
-        if not expected.issubset(terminals):
-            return None
-
-        aggregate_aborted = any(terminals[index] for index in expected)
-        self._checkpoint_staging_expected.pop(copy_id, None)
-        self._checkpoint_staging_terminal.pop(copy_id, None)
-        self._remember_terminal_checkpoint_staging(copy_id)
-        return aggregate_aborted
-
-    def _remember_terminal_checkpoint_staging(self, copy_id: int) -> None:
-        if copy_id in self._terminal_checkpoint_staging:
-            return
-        self._terminal_checkpoint_staging.add(copy_id)
-        self._terminal_checkpoint_staging_order.append(copy_id)
-        while (
-            len(self._terminal_checkpoint_staging_order) > self._pairing_tombstone_limit
-        ):
-            self._terminal_checkpoint_staging.discard(
-                self._terminal_checkpoint_staging_order.popleft()
+        if not hasattr(self, "_completed_save_operations"):
+            self._completed_save_operations = _CompletedOperationWindow(4096)
+        if not hasattr(self, "_completion_channel_owners"):
+            self._completion_channel_owners = _completion_channel_owners(
+                self._connectors
             )
 
     def _consume_save_completion(
@@ -546,23 +479,15 @@ class MultiConnector(KVConnectorBase):
             if not queue:
                 self._req_operations.pop(req_key, None)
         if isinstance(output, SaveOperationId):
-            self._remember_terminal_save(output)
+            self._completed_save_operations.remember(output)
         return output
 
     def _req_has_pending_save(self, req_key: str) -> bool:
         return bool(self._req_operations.get(req_key))
 
-    def _remember_terminal_save(self, operation: SaveOperationId) -> None:
-        if operation in self._terminal_save:
-            return
-        self._terminal_save.add(operation)
-        self._terminal_save_order.append(operation)
-        while len(self._terminal_save_order) > self._pairing_tombstone_limit:
-            self._terminal_save.discard(self._terminal_save_order.popleft())
-
     @property
     def completed_save_tombstone_count(self) -> int:
-        return len(self._terminal_save)
+        return len(self._completed_save_operations)
 
     @property
     def pairing_state_count(self) -> tuple[int, int]:
@@ -594,6 +519,10 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         self.recap_prefill_after_finalize = any(
             getattr(c, "recap_prefill_after_finalize", False) for c in self._connectors
         )
+        self._completion_channel_owners = _completion_channel_owners(
+            self._connectors
+        )
+        self.completion_channels = frozenset(self._completion_channel_owners)
         self._load_owner_by_req: dict[str, tuple[object, int]] = {}
         self._load_operation_owner: dict[LoadOperationId, tuple[int, object]] = {}
 
@@ -601,6 +530,10 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         if not hasattr(self, "_load_owner_by_req"):
             self._load_owner_by_req = {}
             self._load_operation_owner = {}
+        if not hasattr(self, "_completion_channel_owners"):
+            self._completion_channel_owners = _completion_channel_owners(
+                self._connectors
+            )
 
     def _cancel_connector_load(self, connector_idx: int, seq: Any) -> None:
         callback = getattr(self._connectors[connector_idx], "cancel_pending_load", None)
@@ -736,7 +669,10 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             owner = self._load_owner_by_req.get(str(operation.req_id))
             if owner is not None and owner[0] is lifecycle:
                 lifecycle._load_operation = operation
-        return MultiConnectorMetadata(metas=metas)
+        return MultiConnectorMetadata(
+            metas=metas,
+            completion_channel_owners=self._completion_channel_owners,
+        )
 
     def connector_meta_dispatched(self, meta: MultiConnectorMetadata) -> None:
         for connector, sub_meta in zip(self._connectors, meta.metas):
@@ -817,15 +753,17 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             if hasattr(c, "save_finished"):
                 c.save_finished(req_id)
 
-    def sidecar_save_finished(self, req_id: Any) -> None:
-        for c in self._connectors:
-            if hasattr(c, "sidecar_save_finished"):
-                c.sidecar_save_finished(req_id)
+    def connector_completion(self, completion: ConnectorCompletion) -> bool:
+        """Route one opaque completion to its uniquely declared child owner."""
 
-    def sidecar_save_failed(self, req_id: Any) -> None:
-        for c in self._connectors:
-            if hasattr(c, "sidecar_save_failed"):
-                c.sidecar_save_failed(req_id)
+        self._ensure_load_ownership_state()
+        owner = self._completion_channel_owners.get(completion.channel)
+        if owner is None:
+            return False
+        callback = getattr(self._connectors[owner], "connector_completion", None)
+        if not callable(callback):
+            return False
+        return callback(completion) is not False
 
     def load_finished(self, req_id: Any) -> bool:
         return self._finish_load(req_id, "load_finished")

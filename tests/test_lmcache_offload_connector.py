@@ -20,7 +20,11 @@ except ModuleNotFoundError:
 
 from conftest import MockConfig
 
-from atom.kv_transfer.disaggregation import KVConnectorOutput, KVOutputAggregator
+from atom.kv_transfer.disaggregation import (
+    ConnectorCompletion,
+    KVConnectorOutput,
+    KVOutputAggregator,
+)
 from atom.kv_transfer.disaggregation.multi.multi_connector import (
     MultiConnectorMetadata,
     MultiConnectorScheduler,
@@ -41,6 +45,7 @@ from atom.kv_transfer.offload.dense.kv_byte_codec import (
 from atom.kv_transfer.offload.hybrid.dsv4 import policy as connector_module
 from atom.kv_transfer.offload.hybrid.dsv4.codec import DSV4PageSlotCodec
 from atom.kv_transfer.offload.hybrid.dsv4.connector import (
+    DSV4_CHECKPOINT_SAVE_CHANNEL,
     DSV4OffloadConnector as LMCacheOffloadConnector,
 )
 from atom.kv_transfer.offload.hybrid.dsv4.connector import (
@@ -2496,7 +2501,13 @@ def test_tp_cross_generation_reports_do_not_clear_or_commit_until_matched():
             KVConnectorOutput(finished_saving={page.save_operation}),
             KVConnectorOutput(
                 finished_saving={boundary.save_operation},
-                finished_sidecar_saving={boundary.save_operation},
+                connector_completions={
+                    ConnectorCompletion(
+                        DSV4_CHECKPOINT_SAVE_CHANNEL,
+                        boundary.save_operation,
+                        True,
+                    )
+                },
             ),
         ]
     )
@@ -2512,7 +2523,13 @@ def test_tp_cross_generation_reports_do_not_clear_or_commit_until_matched():
         [
             KVConnectorOutput(
                 finished_saving={boundary.save_operation},
-                finished_sidecar_saving={boundary.save_operation},
+                connector_completions={
+                    ConnectorCompletion(
+                        DSV4_CHECKPOINT_SAVE_CHANNEL,
+                        boundary.save_operation,
+                        True,
+                    )
+                },
             ),
             KVConnectorOutput(finished_saving={page.save_operation}),
         ]
@@ -2576,7 +2593,13 @@ def test_collapsed_sidecar_and_save_completion_clears_page_inflight():
     host._update_from_kv_xfer_finished(
         KVConnectorOutput(
             finished_saving={prior_operation, boundary_operation},
-            finished_sidecar_saving={boundary_operation},
+            connector_completions={
+                ConnectorCompletion(
+                    DSV4_CHECKPOINT_SAVE_CHANNEL,
+                    boundary_operation,
+                    True,
+                )
+            },
         )
     )
 
@@ -3316,7 +3339,15 @@ def test_tp_partial_sidecar_completion_never_commits():
 
     partial = aggregator.aggregate(
         [
-            KVConnectorOutput(finished_sidecar_saving={save_operation}),
+            KVConnectorOutput(
+                connector_completions={
+                    ConnectorCompletion(
+                        DSV4_CHECKPOINT_SAVE_CHANNEL,
+                        save_operation,
+                        True,
+                    )
+                }
+            ),
             KVConnectorOutput(),
         ]
     )
@@ -3332,7 +3363,15 @@ def test_tp_partial_sidecar_completion_never_commits():
     terminal = aggregator.aggregate(
         [
             KVConnectorOutput(),
-            KVConnectorOutput(finished_sidecar_saving={save_operation}),
+            KVConnectorOutput(
+                connector_completions={
+                    ConnectorCompletion(
+                        DSV4_CHECKPOINT_SAVE_CHANNEL,
+                        save_operation,
+                        True,
+                    )
+                }
+            ),
         ]
     )
     host._update_from_kv_xfer_finished(terminal)
@@ -3360,7 +3399,15 @@ def test_tp_sidecar_failure_prevents_commit_after_all_workers_terminal():
 
     partial = aggregator.aggregate(
         [
-            KVConnectorOutput(finished_sidecar_saving={save_operation}),
+            KVConnectorOutput(
+                connector_completions={
+                    ConnectorCompletion(
+                        DSV4_CHECKPOINT_SAVE_CHANNEL,
+                        save_operation,
+                        True,
+                    )
+                }
+            ),
             KVConnectorOutput(),
         ]
     )
@@ -3370,7 +3417,15 @@ def test_tp_sidecar_failure_prevents_commit_after_all_workers_terminal():
     terminal = aggregator.aggregate(
         [
             KVConnectorOutput(),
-            KVConnectorOutput(failed_sidecar_saving={save_operation}),
+            KVConnectorOutput(
+                connector_completions={
+                    ConnectorCompletion(
+                        DSV4_CHECKPOINT_SAVE_CHANNEL,
+                        save_operation,
+                        False,
+                    )
+                }
+            ),
         ]
     )
     host._update_from_kv_xfer_finished(terminal)
@@ -4237,15 +4292,15 @@ def test_finished_saving_releases_deferred_free_with_string_req_id():
 
 
 @pytest.mark.parametrize(
-    ("sidecar_field", "sidecar_callback"),
+    ("succeeded", "completion_callback"),
     [
-        ("finished_sidecar_saving", "sidecar_save_finished"),
-        ("failed_sidecar_saving", "sidecar_save_failed"),
+        (True, "checkpoint_save_finished"),
+        (False, "checkpoint_save_failed"),
     ],
 )
-def test_sidecar_save_callback_precedes_page_save_release(
-    sidecar_field,
-    sidecar_callback,
+def test_connector_completion_precedes_page_save_release(
+    succeeded,
+    completion_callback,
 ):
     events = []
 
@@ -4256,12 +4311,16 @@ def test_sidecar_save_callback_precedes_page_save_release(
     class _Connector:
         is_producer = False
         is_offload = True
+        completion_channels = frozenset({DSV4_CHECKPOINT_SAVE_CHANNEL})
 
-        def sidecar_save_finished(self, req_id) -> None:
-            events.append(("sidecar_save_finished", req_id))
-
-        def sidecar_save_failed(self, req_id) -> None:
-            events.append(("sidecar_save_failed", req_id))
+        def connector_completion(self, completion) -> bool:
+            callback = (
+                "checkpoint_save_finished"
+                if completion.succeeded
+                else "checkpoint_save_failed"
+            )
+            events.append((callback, completion.operation_id))
+            return True
 
         def save_finished(self, req_id) -> None:
             events.append(("save_finished", req_id))
@@ -4279,12 +4338,18 @@ def test_sidecar_save_callback_precedes_page_save_release(
     sched.deferred_free_blocks = {seq.id: seq}
     output = KVConnectorOutput(
         finished_saving={"9"},
-        **{sidecar_field: {"9"}},
+        connector_completions={
+            ConnectorCompletion(
+                DSV4_CHECKPOINT_SAVE_CHANNEL,
+                "9",
+                succeeded,
+            )
+        },
     )
 
     sched._update_from_kv_xfer_finished(output)
 
-    assert events[0] == (sidecar_callback, "9")
+    assert events[0] == (completion_callback, "9")
     assert events[1:] == [
         ("save_finished", "9"),
         ("request_finished", 9),
