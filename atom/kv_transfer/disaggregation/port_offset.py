@@ -25,18 +25,12 @@ def consumer_region_indices(
     num_consumer_regions: int,
     pp_size: int,
 ) -> list[int] | None:
-    """Map a PP stage's local RDMA regions to consumer indices (group-major layout).
+    """Map a PP stage's local RDMA regions to consumer indices (group-major).
 
-    The group stride is derived from the consumer's own region count rather than
-    from ``num_hidden_layers``: a group holds one region per *bound* layer, and a
-    node running speculative decode binds the draft's KV layer too, so its groups
-    are one entry wider than the target's layer count. Reading the stride off the
-    consumer keeps producer and consumer in agreement without either side having
-    to know whether the other drafts.
+    Stride is derived from ``num_consumer_regions``, not ``num_hidden_layers``,
+    so spec-decode's extra draft layer is handled automatically.
 
-    Returns None when the layout is not expressible as uniform group-major —
-    regions not a whole number of groups, groups that do not divide the consumer's
-    list evenly, or a mapping that would run past the consumer's last region.
+    Returns None when the layout is not uniform group-major.
     """
     if pp_size == 1 or num_local_layers == 0 or num_local_regions == 0:
         return list(range(num_local_regions))

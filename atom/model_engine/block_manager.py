@@ -442,16 +442,9 @@ class BlockManager:
     def _chain_parent_hash(self, seq: Sequence, start: int) -> int:
         """Return the chained hash of block ``start - 1``, rebuilding if missing.
 
-        Block hashes form a chain: block N depends on block N-1. A gap appears
-        when the publish path doesn't fire — most commonly a sequence parked for
-        an LMCache offload load leaves ``Scheduler.running`` before its boundary
-        chunk's deferred hash flush runs. Re-rooting the chain at ``-1`` would be
-        wrong: ``compute_hash(tokens, -1)`` is indistinguishable from a genuine
-        prompt-initial block, minting false roots that a later request can match.
-
-        Walk back to the nearest hashed ancestor (or prompt start) and recompute
-        the chain forward. Existing canonical ``hash_to_block_id`` mappings are
-        not overwritten (``setdefault``), matching ``publish_loaded_prefix``.
+        Block hashes chain: block N depends on N-1. On a gap, walk back to
+        the nearest hashed ancestor and recompute forward. Cannot re-root
+        at -1: ``hash(tokens, -1)`` collides with prompt-initial blocks.
         """
         if start <= 0:
             return -1
@@ -461,15 +454,10 @@ class BlockManager:
 
         gap_start = start - 1
         while (
-            gap_start > 0
-            and self.kv.block(seq.block_table[gap_start - 1]).hash == -1
+            gap_start > 0 and self.kv.block(seq.block_table[gap_start - 1]).hash == -1
         ):
             gap_start -= 1
-        h = (
-            -1
-            if gap_start == 0
-            else self.kv.block(seq.block_table[gap_start - 1]).hash
-        )
+        h = -1 if gap_start == 0 else self.kv.block(seq.block_table[gap_start - 1]).hash
 
         record = self._event_log is not None
         run_parent: int | None = h if h != -1 else None

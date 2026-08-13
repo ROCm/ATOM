@@ -271,11 +271,8 @@ def test_region_map_stages_tile_consumer_no_overlap():
 
 
 def test_region_map_stages_tile_consumer_with_mtp_layer():
-    # Spec decode binds the draft's KV layer on the last PP stage only, so that
-    # stage holds one more layer than its partition and every consumer group is
-    # one entry wider. Reading the stride off the consumer's region count keeps
-    # all four stages tiling exactly — the old num_hidden_layers stride put every
-    # stage's second group one slot low.
+    # Last PP stage binds the draft KV layer, making its group one entry
+    # wider. Stride derived from consumer region count keeps all stages aligned.
     partitions, num_hidden, groups = [20, 20, 20, 18], 78, 2
     consumer_layers = num_hidden + 1  # + MTP layer 78
     covered = []
@@ -299,8 +296,7 @@ def test_region_map_undefined_when_producer_drafts_and_consumer_does_not():
 
 
 def test_region_map_consumer_mtp_layer_left_unwritten_is_fine():
-    # The reverse asymmetry is benign: the producer simply never writes the
-    # consumer's MTP layer, which is where it was before this feature.
+    # Benign: the producer simply never writes the consumer's MTP layer.
     got = consumer_region_indices(36, 18, 60, 79 * 2, 4)
     assert got[:18] == list(range(60, 78))
     assert got[18:] == list(range(79 + 60, 79 + 78))

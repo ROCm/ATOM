@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 try:
-    import torch  # noqa: F401
+    import torch
 except ModuleNotFoundError:
     sys.modules["torch"] = types.ModuleType("torch")
 
@@ -1705,11 +1705,8 @@ def test_cpu_budget_split_preserves_total_and_equalizes_horizon(monkeypatch):
 
 
 def test_cpu_budget_split_counts_the_draft_layer_on_the_last_stage(monkeypatch):
-    # GLM-5.2 PD: 78 target layers over 20,20,20,18 plus one MTP layer bound on
-    # the last stage only. The offload codec moves every bound layer, so the
-    # last stage's bytes-per-token covers 19 layers, not 18. Budgeting it for 18
-    # leaves it with a shorter token horizon than its peers, and all-or-nothing
-    # loads drag the whole node down to that stage.
+    # Last stage binds the draft KV layer, so its budget must cover 19
+    # layers, not 18.
     import atom.models.utils as model_utils
     from atom.kv_transfer.offload import config as offcfg
 

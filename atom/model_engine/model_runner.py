@@ -2832,11 +2832,8 @@ class ModelRunner:
         if not hasattr(inner, "start_layer"):
             return
 
-        # Mirror the model's authoritative per-layer "shared" decision
-        # (_should_skip_index_topk in deepseek_v2.py): indexer_types is
-        # authoritative when present (GLM-5.2), else index_topk_pattern, else the
-        # index_topk_freq schedule. Keeping these in sync avoids a mid-group PP
-        # split silently reading a stale buffer.
+        # Replicate the model's per-layer shared/full classification
+        # (_should_skip_index_topk in deepseek_v2.py).
         hf = self.config.hf_config
         num_layers = int(hf.num_hidden_layers)
         indexer_types = getattr(hf, "indexer_types", None)
@@ -3231,11 +3228,7 @@ class ModelRunner:
         else:
             prev_rejected_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
             prev_bonus_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
-            # is_deferred_out governs async token readback, not whether the draft
-            # model runs; it is False for the whole of pipeline parallelism
-            # (tokenIDProcessor.__init__). Drafting from this path keeps the draft
-            # KV filled and the draft ids flowing on a PP stage — the deferred
-            # bookkeeping above is what stays behind the flag.
+            # PP stages (is_deferred_out=False) still run the drafter.
             if hasattr(self, "drafter"):
                 next_token_ids = self._next_token_ids_for_draft(
                     batch, sampled_tokens, next_token_locs, bs
