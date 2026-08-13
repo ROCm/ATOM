@@ -172,8 +172,8 @@
     },
     {
       "choice_label": "Kimi-K3",
-      "source_path": "Kimi-K3",
-      "path": "Kimi-K3",
+      "source_path": "moonshotai/Kimi-K3",
+      "path": "moonshotai/Kimi-K3",
       "bench_args": "",
       "runner": "atom-mi355-8gpu-oot-benchmark",
       "nightly_group": "B",
