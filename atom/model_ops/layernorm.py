@@ -8,6 +8,7 @@ import aiter
 import torch
 from aiter import (
     QuantType,
+    get_hip_quant,
     layernorm2d_fwd,
     layernorm2d_fwd_with_add,
     rmsnorm2d_fwd,
@@ -170,6 +171,15 @@ def _is_mxfp8(quant_type_value: int, value_dtype: torch.dtype | None) -> bool:
     (`native_quant_linear`) reads the scale row-major, unshuffled.
     """
     return quant_type_value == _QV_PER_1X32 and value_dtype in _FP8_VALUE_DTYPES
+
+
+# ``aiter.get_hip_quant`` is @functools.lru_cache'd. Dynamo cannot see through
+# the cache wrapper, so calling it from inside a compiled region makes Dynamo
+# re-trace the dispatch-table construction (a dict of callables, one built with
+# functools.partial) on every compile and emit a "silent incorrectness is a
+# potential risk" warning. The lookup is a pure QuantType -> function mapping,
+# so resolve it once at import and let traced code call the kernel directly.
+_PER_TOKEN_FP8_QUANT = get_hip_quant(QuantType.per_Token)
 
 
 def _aiter_rms_quant_fake(
@@ -998,11 +1008,12 @@ def fused_allreduce_gemma_rms_norm_quant(
         )
         return out_fp8, scale_out, residual_out
 
-    from aiter import get_hip_quant
     from aiter.utility.dtypes import fp8
 
     normed, residual_out = norm(hidden_states, residual)
-    out_fp8, scale_out = get_hip_quant(QuantType.per_Token)(
+    # Resolved at import (see _PER_TOKEN_FP8_QUANT) so Dynamo does not trace
+    # through get_hip_quant's lru_cache wrapper on every compile.
+    out_fp8, scale_out = _PER_TOKEN_FP8_QUANT(
         normed,
         quant_dtype=fp8,
     )
