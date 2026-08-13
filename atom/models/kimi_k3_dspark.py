@@ -70,6 +70,7 @@ from atom.model_ops.linear import (
     RowParallelLinear,
 )
 from atom.models.deepseek_v2 import yarn_get_mscale
+from atom.models.dspark_draft import DSparkDraftModel
 
 if TYPE_CHECKING:
     from atom.config import Config
@@ -400,7 +401,7 @@ class K3DSparkDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-    def write_context_kv(self, ctx_hidden, positions, slot_mapping) -> None:
+    def write_context_kv(self, ctx_hidden, positions) -> None:
         """Populate this layer's context rows.
 
         The context source does NOT go through ``input_layernorm``: the reference
@@ -408,6 +409,11 @@ class K3DSparkDecoderLayer(nn.Module):
         straight into the KV projection, while ``input_layernorm`` applies only
         to the residual stream carrying the draft block.
         """
+        from atom.utils.forward_context import get_forward_context
+
+        slot_mapping = get_forward_context().attn_metadata.slot_mapping[
+            : ctx_hidden.shape[0]
+        ]
         self.self_attn.write_context_kv(ctx_hidden, positions, slot_mapping)
 
     def forward(
@@ -421,7 +427,7 @@ class K3DSparkDecoderLayer(nn.Module):
         return residual + self.mlp(hidden_states)
 
 
-class KimiK3DSpark(nn.Module):
+class KimiK3DSpark(DSparkDraftModel):
     """Top-level standalone DSpark draft (MLA backbone + Markov head).
 
     Parameter names match the checkpoint 1:1, so no ``WeightsMapper`` is needed;
@@ -523,32 +529,16 @@ class KimiK3DSpark(nn.Module):
         """
         return self.context_norm(_linear_out(self.context_proj(aux_concat)))
 
-    def write_context_kv(
-        self,
-        aux_concat: torch.Tensor,  # [N, target_hidden * num_target_layers]
-        positions: torch.Tensor,  # [N]
-        slot_mapping: torch.Tensor,  # [N]
-    ) -> None:
-        from atom.utils.forward_context import get_forward_context
+    @property
+    def context_layers(self):
+        """Every draft layer holds context rows; `layers` is already in order.
 
-        # warmup_model() runs at the END of ModelRunner.__init__, while
-        # allocate_kv_cache() is called later by the engine core after memory
-        # profiling — so on a dummy run every layer's `kv_cache` is still the
-        # empty init tensor and the store would abort in cache_kernels
-        # (`kv_cache.size(2) == kv_lora_rank + qk_rope_head_dim` fails).
-        #
-        # The block forward needs no such guard: MLAAttention already
-        # short-circuits dummy runs and returns an empty output without touching
-        # the cache. Only this path bypasses that, because it writes the context
-        # rows directly rather than going through the attention's forward.
-        #
-        # Skipping is safe — warmup discards the draft's output. Same
-        # short-circuit V4 DSpark uses in precompute_context_kv.
-        if get_forward_context().context.is_dummy_run:
-            return
-        ctx_hidden = self.project_context(aux_concat)
-        for layer in self.layers:
-            layer.write_context_kv(ctx_hidden, positions, slot_mapping)
+        The dummy-run guard and the project-once-share-everywhere loop live in
+        :meth:`DSparkDraftModel.write_context_kv`. The specific abort this draft
+        would hit without the guard is `kv_cache.size(2) == kv_lora_rank +
+        qk_rope_head_dim` in cache_kernels, on the still-empty init tensor.
+        """
+        return self.layers
 
     def forward_spec(
         self,

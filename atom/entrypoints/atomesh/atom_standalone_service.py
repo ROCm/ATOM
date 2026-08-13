@@ -568,7 +568,7 @@ class ChatCompletionStreamState:
                     create_chat_chunk(
                         self.request_id,
                         self.model_name,
-                        delta={"role": "assistant"},
+                        delta={"role": "assistant", "content": ""},
                         index=index,
                     )
                 )

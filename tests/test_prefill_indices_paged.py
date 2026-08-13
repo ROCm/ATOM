@@ -47,8 +47,7 @@ def _indptr(counts, n):
     return torch.tensor(v, dtype=torch.int32, device=DEV)
 
 
-@pytest.fixture(scope="module")
-def two_seq():
+def build(geometry):
     """seq0: fresh chunk (chunk_start=0), pos 0..4 -> prefix_swa_count == 0.
     seq1: prefix-cache hit, chunk_start=16, recompute pos 16..19 -> count > 0."""
     torch.manual_seed(0)
@@ -95,7 +94,7 @@ def two_seq():
             block_tables=block_tables,
             T=total,
             win=WIN,
-            geometry=GEOMETRY,
+            geometry=geometry,
             hca_ratio=HCA_RATIO,
             **ptrs,
             **bufs,
@@ -111,6 +110,45 @@ def two_seq():
     assert prefix_swa_count.max() > 0
     assert not (ref["extend_indices"] == -9).any(), "reference wrote no indices"
     return {"ref": ref, "ker": ker, "ptrs": ptrs, "slot": int(state_slot[1])}
+
+
+@pytest.fixture(scope="module")
+def two_seq():
+    return build(GEOMETRY)
+
+
+# A pool with no dense layer at all — V4-Pro's shape once a DSpark draft moves
+# the only ratio-0 layer's window into a state field. The class then leaves the
+# geometry, and the builders used to ask for it unconditionally.
+NO_DENSE_GEOMETRY = UnifiedPoolGeometry(
+    [CSA_RATIO, HCA_POOL_RATIO, CSA_RATIO, HCA_POOL_RATIO],
+    num_blocks=40,
+    num_slots=4,
+    ring_slots=CACHE_SIZE,
+    block_size=256,
+)
+
+
+@pytest.fixture(scope="module")
+def no_dense():
+    return build(NO_DENSE_GEOMETRY)
+
+
+@pytest.mark.parametrize(
+    "section", ["extend_indices", "prefix_csa_indices", "prefix_hca_indices"]
+)
+def test_the_served_classes_are_unaffected_by_a_missing_one(no_dense, section):
+    ref, ker = no_dense["ref"][section], no_dense["ker"][section]
+    assert (ref != -9).any(), f"{section} was not written"
+    assert torch.equal(ker, ref), f"{section} mismatch\nref={ref}\nker={ker}"
+
+
+def test_a_missing_class_gets_no_rows_rather_than_borrowed_ones(no_dense):
+    """An absent class is launched with a served class's parameters, so what
+    this guards against is not a crash but a plausible row: the SWA prefix
+    buffer filled with CSA addresses, which no reader downstream would flag."""
+    for side in ("ref", "ker"):
+        assert (no_dense[side]["prefix_swa_indices"] == -9).all(), side
 
 
 @pytest.mark.parametrize(
