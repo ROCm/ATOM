@@ -193,6 +193,18 @@ class TestHealthAndModels:
         assert data["data"][0]["id"] == MODEL
         assert data["data"][0]["owned_by"] == "atom"
 
+    def test_metrics(self, base_url):
+        r = requests.get(f"{base_url}/metrics")
+        assert r.status_code == 200
+        assert r.headers["content-type"].startswith("text/plain")
+        assert "atom:metrics_snapshot_available" in r.text
+        assert "atom:requests_running" in r.text
+        assert "vllm:" not in r.text
+
+        head = requests.head(f"{base_url}/metrics")
+        assert head.status_code == 200
+        assert head.content == b""
+
 
 # ---------------------------------------------------------------------------
 # Chat Completion Tests (Non-Streaming)
