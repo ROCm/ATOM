@@ -503,10 +503,14 @@ class BlockManager:
 
         `hit_hash` is the content hash of the last reused block (-1 for a cold
         start). `can_allocate` already shrank the hit to a boundary that
-        `_resumable_from` accepted — which since the offload tier landed is not
-        the same as "in HBM": a hash whose group was spilled to LMCache is
-        accepted there and misses here. Those are told apart below, because
-        only one of them may keep the boundary.
+        `_resumable_from` accepted, and that stops being the same as "in HBM"
+        the moment the offload tier can be loaded from
+        (`state_pool.STATE_OFFLOAD_LOADS_WIRED`): a hash whose group went to
+        LMCache is accepted there and misses here, and so is one LMCache's own
+        LRU has since dropped. Those are told apart below, because only one of
+        them may keep the boundary. While loads are unwired the tier abstains
+        and this miss is unreachable through admission — the check stays as
+        defence in depth, and is what makes re-widening a one-flag edit.
 
         Resuming shares: the checkpoint stays indexed and the request gets a
         group of its own, so a second request hitting the same prefix still

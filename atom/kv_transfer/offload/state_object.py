@@ -6,9 +6,10 @@
 `ChunkedTokenDatabase` is deliberately bypassed. Two reasons, in order:
 
 1. The two branches of the membership test must query the same integer.
-   `StateGroupPool._resumable_from(h)` checks HBM and this tier; a
-   chunker-derived key would not be the same thing being looked up, and the
-   whole feature stops being a one-line widening.
+   `StateGroupPool._resumable_from(h)` checks HBM and -- once loads are wired,
+   `state_pool.STATE_OFFLOAD_LOADS_WIRED` -- this tier; a chunker-derived key
+   would not be the same thing being looked up, and the whole feature stops
+   being a one-line widening.
 2. State has a token range -- `[0, pos)`, which is exactly why it can share
    KV's key -- but its bytes cannot be sliced by token. There is no such thing
    as "the first three chunks hit". Chunking would produce N keys useful only
@@ -79,9 +80,10 @@ class StateByteCodec:
         """The key carries ATOM's hash unmodified.
 
         `StateGroupPool._resumable_from(h)` looks up the same integer in HBM
-        and in this tier, so hashing, salting, or stringifying it here would
-        make the two branches ask different questions. `dtype` is part of the
-        key's identity and must match the object we allocate.
+        and (once loads are wired) in this tier, so hashing, salting, or
+        stringifying it here would make the two branches ask different
+        questions. `dtype` is part of the key's identity and must match the
+        object we allocate.
         """
         from lmcache.utils import CacheEngineKey
 

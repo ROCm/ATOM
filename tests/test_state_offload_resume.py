@@ -1,12 +1,22 @@
 # SPDX-License-Identifier: MIT
 """What a *spilled* checkpoint's hit is allowed to become at admission.
 
-`StateGroupPool._resumable_from` answers True for a hash that lives only in
+`StateGroupPool._resumable_from` may answer True for a hash that lives only in
 `StateOffloadIndex.hashes` -- bytes that are in LMCache and not in HBM. That
 makes `can_allocate` return a boundary whose state group does not exist yet, so
 `BlockManager._attach_state_group` has to decide what a resumer gets. Getting
 that wrong is silent wrong output: a recycled group plus `num_cached_tokens > 0`
 makes `has_initial_state` True over another request's leftovers.
+
+Two worlds are exercised here, and which one a test wants is the whole point:
+
+  loads unwired (the branch today, `STATE_OFFLOAD_LOADS_WIRED` False) -- an
+      offload-only hash is not resumable, so it must not shorten a hit that a
+      still-resident HBM checkpoint further left could have served.
+  loads wired (`loads_wired`) -- an offload-only hash is a candidate, and the
+      `_attach_state_group` guard is what makes a miss behind it safe rather
+      than corrupt. LMCache's own LRU can drop bytes at any time, so that miss
+      never stops being possible.
 
 Kept out of `test_state_checkpoint.py` because every case here needs the tier
 switched on, which that file's fixtures deliberately never do.
@@ -14,6 +24,7 @@ switched on, which that file's fixtures deliberately never do.
 
 from conftest import MockConfig
 
+from atom.model_engine import state_pool
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.sequence import Sequence
 
@@ -52,12 +63,20 @@ def stateful_seq(token_ids):
     return Sequence(token_ids, BLOCK, has_per_req_cache=True)
 
 
-def spilled_publisher(bm: BlockManager, tokens: list[int]) -> int:
-    """Run a prompt to its checkpoint boundary, then spill that checkpoint.
+def loads_wired(monkeypatch) -> None:
+    """Put the pool in the world where the load direction exists.
 
-    Returns the boundary hash, which afterwards is in the tier's index and
-    nowhere in HBM -- exactly the state the branch reaches once a real spill is
-    confirmed by `Scheduler._update_from_kv_xfer_finished`.
+    An offload-only hash votes in `_resumable_from` only there. Tests of the
+    `_attach_state_group` guard need this world: with loads unwired the pool
+    declines a spilled boundary up front and the guard is never reached.
+    """
+    monkeypatch.setattr(state_pool, "STATE_OFFLOAD_LOADS_WIRED", True)
+
+
+def resident_publisher(bm: BlockManager, tokens: list[int]) -> tuple[int, int]:
+    """Run a prompt to its checkpoint boundary and leave that checkpoint in HBM.
+
+    Returns `(boundary hash, boundary in tokens)`.
     """
     seq = stateful_seq(tokens)
     hit = bm.can_allocate(seq)
@@ -70,7 +89,18 @@ def spilled_publisher(bm: BlockManager, tokens: list[int]) -> int:
     h = bm.kv.block(seq.block_table[last]).hash
     bm.release_state_pins()
     bm.release_state_pins()
+    assert bm.state.lookup(h) >= 0, "the publisher kept no checkpoint"
+    return h, boundary
 
+
+def spilled_publisher(bm: BlockManager, tokens: list[int]) -> int:
+    """Run a prompt to its checkpoint boundary, then spill that checkpoint.
+
+    Returns the boundary hash, which afterwards is in the tier's index and
+    nowhere in HBM -- exactly the state the branch reaches once a real spill is
+    confirmed by `Scheduler._update_from_kv_xfer_finished`.
+    """
+    h, _ = resident_publisher(bm, tokens)
     group = bm.state.lookup(h)
     assert group >= 0, "the publisher kept no checkpoint"
     # What `pop()` does to a checkpoint it spends, minus the pool pressure:
@@ -101,10 +131,15 @@ def test_a_spilled_hash_is_not_resumed_from_a_recycled_group(monkeypatch):
     guard the miss fell through to `self.state.pop()` -- another request's
     state, with `num_cached_tokens > 0` marking it as this request's history.
 
-    Nothing loads those bytes back yet, so the only correct answer is to
-    decline the resume and recompute.
+    Driven in the loads-wired world, which is the only one where the hazard is
+    reachable and the only one where it must stay guarded: LMCache's LRU can
+    drop bytes under a hash the index still advertises, so a load that finds
+    nothing lands in exactly this branch. With loads unwired the pool declines
+    the boundary before `_attach_state_group` sees it -- covered by
+    `test_a_spilled_rung_does_not_shadow_a_resident_one`.
     """
     monkeypatch.setenv("OFFLOAD_STATE", "1")
+    loads_wired(monkeypatch)
     bm = BlockManager(tier_config())
     spilled_publisher(bm, list(range(40)))
 
@@ -128,6 +163,7 @@ def test_the_blocks_of_a_disowned_boundary_are_still_reused(monkeypatch):
     would leak a reference. The forward simply recomputes over them.
     """
     monkeypatch.setenv("OFFLOAD_STATE", "1")
+    loads_wired(monkeypatch)
     bm = BlockManager(tier_config())
     spilled_publisher(bm, list(range(40)))
 
@@ -162,3 +198,60 @@ def test_an_hbm_checkpoint_is_still_resumed_with_the_tier_on(monkeypatch):
     assert resumer.num_cached_tokens == boundary
     assert resumer.state_fork_src == src
     assert resumer.per_req_cache_group != src
+
+
+def _two_rungs(bm: BlockManager) -> tuple[int, int]:
+    """Publish two checkpoint rungs over a shared prefix, spilling the longer.
+
+    24 and 40 tokens at `MIN_FORK` 8 put rungs at 16 and 32. Returns
+    `(short boundary, short boundary's HBM group)`; the rung at 32 is left in
+    the tier and nowhere in HBM.
+    """
+    short_h, short_boundary = resident_publisher(bm, list(range(24)))
+    spilled_publisher(bm, list(range(40)))
+    short_group = bm.state.lookup(short_h)
+    assert short_group >= 0, "the shorter rung must survive in HBM"
+    return short_boundary, short_group
+
+
+def test_a_spilled_rung_does_not_shadow_a_resident_one(monkeypatch):
+    """The regression Task 2 introduced, and what the gate exists to stop.
+
+    `resumable_hit` scans right to left and returns the FIRST boundary
+    `_resumable_from` accepts. While the tier is write-only the rightmost rung
+    is spilled and unreachable, so accepting it ends the scan on a boundary
+    `_attach_state_group` then disowns -- and the shorter rung still sitting in
+    HBM, which the walk-back would have reached, is never tried. Not wrong
+    output (the disown keeps it correct) but a real resume thrown away, and it
+    grows with spill volume.
+    """
+    monkeypatch.setenv("OFFLOAD_STATE", "1")
+    bm = BlockManager(tier_config(pool_entries={"state": 8}, max_num_seqs=8))
+    short_boundary, short_group = _two_rungs(bm)
+
+    resumer = stateful_seq(list(range(40)))
+    bm.allocate(resumer, bm.can_allocate(resumer))
+    assert resumer.num_cached_tokens == short_boundary
+    assert resumer.state_fork_src == short_group
+    assert resumer.per_req_cache_group != short_group
+
+
+def test_the_gate_is_the_only_thing_holding_the_spilled_rung_back(monkeypatch):
+    """Same two rungs, loads wired: the rightmost boundary wins again.
+
+    The control for the test above -- it proves the shorter rung is chosen
+    because the spilled one is *unreachable*, not because the scan stopped
+    preferring the right. Re-widening is this one flag, and this test is what
+    says so. The disown here is the guard doing its job over bytes that have
+    not been fetched in this test; with a real load path the boundary is kept.
+    """
+    monkeypatch.setenv("OFFLOAD_STATE", "1")
+    loads_wired(monkeypatch)
+    bm = BlockManager(tier_config(pool_entries={"state": 8}, max_num_seqs=8))
+    short_boundary, _ = _two_rungs(bm)
+
+    resumer = stateful_seq(list(range(40)))
+    hit = bm.can_allocate(resumer)
+    assert hit * bm.hash_block_size > short_boundary, "the scan stopped too early"
+    bm.allocate(resumer, hit)
+    assert resumer.num_cached_tokens == 0

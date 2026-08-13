@@ -20,6 +20,26 @@ FORK = "fork"
 COPY = "copy"
 NONE = "none"
 
+# Whether a hash that lives only in the offload tier can still be turned back
+# into a group this pool can resume from.
+#
+# False on this branch, and that is a statement about the code, not a policy
+# knob: the spill direction is wired end to end, the load direction has no
+# caller at all (`StateOffloadTier.submit_load` is never invoked, nothing
+# carries `(hash, target_group)` from the engine to a runner, and no
+# request-keyed state completion comes back). So an offload-only hash cannot
+# become a resume no matter what anyone does with it — `_attach_state_group`
+# misses on the HBM-only `state.lookup` and `allocate` disowns the boundary.
+#
+# Flipping this to True is the whole re-widening edit once loads land, but it
+# is only correct together with them, and `resumable_hit`'s right-to-left scan
+# is the reason: the scan stops at the first boundary `_resumable_from`
+# accepts, so accepting a boundary nothing can deliver does not merely fail to
+# help, it *shadows* a shorter checkpoint still resident in HBM that the scan
+# would otherwise have reached. Reachable-in-principle is the weakest thing
+# this may ever mean; anything weaker turns a hit into no hit.
+STATE_OFFLOAD_LOADS_WIRED = False
+
 
 @dataclass(frozen=True)
 class StateTransfer:
@@ -492,11 +512,19 @@ class StateGroupPool:
 
     # ------------------------------- offload ------------------------------- #
     def _resumable_from(self, h: int) -> bool:
-        """Whether a checkpoint for `h` can be reached, in HBM or beneath it.
+        """Whether a checkpoint for `h` can be *reached*, in HBM or beneath it.
 
-        HBM wins without a preference rule: `resumable_hit` scans right to left
-        and both tiers are indexed by the same hash, so the rightmost boundary
-        wins wherever it lives.
+        Reached, not merely indexed. `resumable_hit` scans right to left and
+        stops at the first boundary this accepts, so accepting one whose bytes
+        nothing can deliver does not cost a wasted lookup — it costs the whole
+        walk-back, hiding every shorter checkpoint still resident in HBM. The
+        tier only earns a vote here once a load can act on it, which is what
+        `STATE_OFFLOAD_LOADS_WIRED` states, and while that is False this is
+        exactly the HBM-only predicate it was before the tier landed.
+
+        HBM therefore wins without a preference rule: once both tiers are
+        reachable they are indexed by the same hash, and the right-to-left scan
+        takes the rightmost boundary wherever it lives.
         """
         if h in self.hash_to_group:
             return True
@@ -505,7 +533,11 @@ class StateGroupPool:
         # `_spill` returns on `not enabled` first, so `hashes` stays empty and
         # the membership test is false anyway. Anything that adds to `hashes`
         # outside the confirm-after-spill path must re-check `enabled` here.
-        return self.offload is not None and h in self.offload.hashes
+        return (
+            STATE_OFFLOAD_LOADS_WIRED
+            and self.offload is not None
+            and h in self.offload.hashes
+        )
 
     def _spill(self, group: int) -> None:
         """Stage `group`'s bytes for the tier, if there is room. Never blocks.

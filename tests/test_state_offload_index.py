@@ -6,6 +6,7 @@ import logging
 
 import pytest
 
+from atom.model_engine import state_pool
 from atom.model_engine.state_offload import (
     _STARVATION_DROP_THRESHOLD,
     StateOffloadIndex,
@@ -64,7 +65,29 @@ def test_forget_drops_a_hash_that_failed_to_load():
     assert 11 not in idx.hashes
 
 
-def test_resumable_from_is_hbm_or_tier():
+def test_resumable_from_ignores_the_tier_while_loads_are_unwired(monkeypatch):
+    """A spilled hash is indexed but not *reachable*, so it must not vote.
+
+    `resumable_hit` stops its right-to-left scan at the first hash this
+    accepts, so accepting one no load path can deliver hides every shorter
+    checkpoint still in HBM. While `STATE_OFFLOAD_LOADS_WIRED` is False the
+    predicate is exactly the HBM lookup.
+    """
+    assert state_pool.STATE_OFFLOAD_LOADS_WIRED is False, "the branch ships unwired"
+    pool = StateGroupPool(
+        num_groups=2, transfer=StateTransfer.copy(), hash_block_size=4
+    )
+    pool.offload = index()
+    pool.offload.confirm_spill(99)
+    assert not pool._resumable_from(99)
+    pool.hash_to_group[99] = 0
+    assert pool._resumable_from(99), "HBM must still answer"
+
+
+def test_resumable_from_is_hbm_or_tier_once_loads_are_wired(monkeypatch):
+    """The re-widening is this one flag and nothing else. Both tiers are keyed
+    by the same integer, so once a load can act on the tier its hashes count."""
+    monkeypatch.setattr(state_pool, "STATE_OFFLOAD_LOADS_WIRED", True)
     pool = StateGroupPool(
         num_groups=2, transfer=StateTransfer.copy(), hash_block_size=4
     )
@@ -86,10 +109,13 @@ def test_resumable_from_without_a_tier_is_the_plain_lookup():
     assert pool._resumable_from(99)
 
 
-def test_a_spilled_hash_still_takes_the_fork_test():
+def test_a_spilled_hash_still_takes_the_fork_test(monkeypatch):
     """min_fork_tokens is not relaxed for spilled hashes: a boundary too close
     to the end of the prompt leaves GDN's replacement group unfilled, which is
-    a wrong state, not a slow one."""
+    a wrong state, not a slow one. Asked in the loads-wired world, where the
+    tier's hashes are candidates at all and the fork test is what still
+    excludes this one."""
+    monkeypatch.setattr(state_pool, "STATE_OFFLOAD_LOADS_WIRED", True)
 
     class Seq:
         has_per_req_cache = True

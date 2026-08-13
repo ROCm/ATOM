@@ -869,11 +869,22 @@ aggregator waits for every TP rank, and `Scheduler._update_from_kv_xfer_finished
 applies `confirm_spill` then `release_staging`. Nothing pulls those bytes back.
 `StateOffloadTier.submit_load` exists but has no caller, and the three boundary
 helpers (`clamp_state_boundary`, `_JointPark`, `should_load_state`) are tested
-in isolation and unwired. So a spilled checkpoint is, today, write-only: the
-hash stays in the index and `_resumable_from` accepts it, but
-`BlockManager._attach_state_group` finds no HBM group behind it and **disowns
-the boundary** (`seq.num_cached_tokens = 0`) so the forward recomputes rather
-than reading another request's leftovers.
+in isolation and unwired. So a spilled checkpoint is, today, write-only, and
+two things follow from that.
+
+`StateGroupPool._resumable_from` **does not accept an offload-only hash** while
+`state_pool.STATE_OFFLOAD_LOADS_WIRED` is False. It cannot: `resumable_hit`
+scans right to left and stops at the first boundary the predicate accepts, so a
+spilled rung nothing can deliver would shadow a shorter checkpoint still
+resident in HBM that the walk-back would have reached — a resume thrown away
+that grows with spill volume. Flipping that one flag is the whole re-widening
+edit when loads land.
+
+`BlockManager._attach_state_group` still **disowns the boundary**
+(`seq.num_cached_tokens = 0`) whenever no HBM group backs a hit hash, so the
+forward recomputes rather than reading another request's leftovers. That guard
+is not made redundant by the flag: LMCache's LRU can drop bytes under a hash the
+index still advertises, so a load that finds nothing lands there too.
 
 **No cross-restart reuse.** `LocalDiskBackend` never scans its own directory on
 startup, so bytes written by a previous run are unreachable no matter what the
@@ -901,7 +912,7 @@ Saves are unaffected — a hybrid still populates the tier for stateless readers
 |------|--------|
 | [`tests/test_lmcache_offload_connector.py`](../../../tests/test_lmcache_offload_connector.py) | Worker-side round-trip: codec pack/unpack, fp8 scales, byte-identical store→retrieve, staging pipeline. |
 | [`tests/test_state_tier.py`](../../../tests/test_state_tier.py), [`tests/test_state_offload_clamp.py`](../../../tests/test_state_offload_clamp.py), [`tests/test_state_offload_index.py`](../../../tests/test_state_offload_index.py) | State tier: spill submit/report, the staging ring, and the (unwired) boundary helpers. |
-| [`tests/test_state_offload_resume.py`](../../../tests/test_state_offload_resume.py) | Admission against a spilled hash: the boundary is disowned, its KV blocks are still reused, and an HBM checkpoint still resumes. |
+| [`tests/test_state_offload_resume.py`](../../../tests/test_state_offload_resume.py) | Admission against a spilled hash: a spilled rung does not shadow a resident one, and with loads wired the boundary is disowned, its KV blocks are still reused, and an HBM checkpoint still resumes. |
 | [`tests/test_kv_connector_scheduler.py`](../../../tests/test_kv_connector_scheduler.py) | Scheduler-side decisions: lookup→park, the `_decide_load_after_alloc` outcomes, save-frontier tracking, defer-free. |
 
 ## Known Limitations & Future Work

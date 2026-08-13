@@ -33,7 +33,13 @@ _STARVATION_DROP_THRESHOLD = 256
 class StateOffloadIndex:
     """What has been spilled, and what is queued to be.
 
-    `hashes` answers the membership half of `StateGroupPool._resumable_from`.
+    `hashes` answers the membership half of `StateGroupPool._resumable_from`,
+    and only once loads are wired: that predicate gates this set behind
+    `state_pool.STATE_OFFLOAD_LOADS_WIRED`, because a hash no load path can act
+    on would end the right-to-left scan on a boundary nothing can deliver. This
+    set is populated either way — the spill leg is live — so what the flag
+    changes is who may vote on a hit, not what is recorded here.
+
     It is deliberately optimistic: LMCache's own LRU can drop bytes at any
     time, so a hash here means "was spilled once", never "is still there".
     The false positive costs one lookup and a park/unpark and is handled by
