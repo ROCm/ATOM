@@ -356,14 +356,8 @@ def _generate_atom_config_from_sglang_config(config: Any):
     from sglang.srt.distributed import get_tensor_model_parallel_rank
     from sglang.srt.distributed.parallel_state import (
         get_attn_context_model_parallel_rank,
-    )
-    from sglang.srt.distributed.parallel_state import (
         get_attn_context_model_parallel_world_size,
-    )
-    from sglang.srt.distributed.parallel_state import (
         get_attn_tensor_model_parallel_rank,
-    )
-    from sglang.srt.distributed.parallel_state import (
         get_attn_tensor_model_parallel_world_size,
     )
     from sglang.srt.server_args import (

@@ -5,12 +5,13 @@ All tests mock sglang dependencies so they run without sglang installed.
 """
 
 import logging
-import pytest
 import sys
 from unittest.mock import MagicMock, patch
 
-from atom.plugin import prepare as plugin_prepare
+import pytest
+
 import atom.plugin.config as plugin_config
+from atom.plugin import prepare as plugin_prepare
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -34,34 +35,34 @@ class _ReadOnlyModelLoaderExtraConfig(_Obj):
 
 def _make_fake_server_args(server_args_type=_Obj, **overrides):
     """Return a minimal mock of sglang's ServerArgs."""
-    defaults = dict(
-        model_path="/fake/model",
-        tp_size=2,
-        dp_size=1,
-        ep_size=1,
-        context_length=8192,
-        max_running_requests=64,
-        mem_fraction_static=0.85,
-        kv_cache_dtype="bf16",
-        modelopt_quant=None,
-        modelopt_checkpoint_restore_path=None,
-        modelopt_checkpoint_save_path=None,
-        modelopt_export_path=None,
-        nccl_port=29500,
-        dist_init_addr="127.0.0.1:29500",
-        load_format="auto",
-        download_dir=None,
-        model_loader_extra_config=None,
-        remote_instance_weight_loader_seed_instance_ip=None,
-        remote_instance_weight_loader_seed_instance_service_port=None,
-        remote_instance_weight_loader_send_weights_group_ports=None,
-        remote_instance_weight_loader_backend=None,
-        rl_quant_profile=None,
-        enable_torch_compile=False,
-        disable_cuda_graph=False,
-        enable_dp_attention=False,
-        trust_remote_code=False,
-    )
+    defaults = {
+        "model_path": "/fake/model",
+        "tp_size": 2,
+        "dp_size": 1,
+        "ep_size": 1,
+        "context_length": 8192,
+        "max_running_requests": 64,
+        "mem_fraction_static": 0.85,
+        "kv_cache_dtype": "bf16",
+        "modelopt_quant": None,
+        "modelopt_checkpoint_restore_path": None,
+        "modelopt_checkpoint_save_path": None,
+        "modelopt_export_path": None,
+        "nccl_port": 29500,
+        "dist_init_addr": "127.0.0.1:29500",
+        "load_format": "auto",
+        "download_dir": None,
+        "model_loader_extra_config": None,
+        "remote_instance_weight_loader_seed_instance_ip": None,
+        "remote_instance_weight_loader_seed_instance_service_port": None,
+        "remote_instance_weight_loader_send_weights_group_ports": None,
+        "remote_instance_weight_loader_backend": None,
+        "rl_quant_profile": None,
+        "enable_torch_compile": False,
+        "disable_cuda_graph": False,
+        "enable_dp_attention": False,
+        "trust_remote_code": False,
+    }
     defaults.update(overrides)
     return server_args_type(**defaults)
 
@@ -125,7 +126,9 @@ def _make_sglang_sys_modules(
         mock_parallel_state_mod.get_attn_context_model_parallel_world_size.return_value = (
             1
         )
-        mock_parallel_state_mod.get_attn_tensor_model_parallel_rank.return_value = tp_rank
+        mock_parallel_state_mod.get_attn_tensor_model_parallel_rank.return_value = (
+            tp_rank
+        )
         mock_parallel_state_mod.get_attn_tensor_model_parallel_world_size.return_value = (
             tp_size
         )
@@ -401,9 +404,7 @@ def test_sglang_config_dist_init_addr_none(monkeypatch):
     assert cfg.plugin_config.sglang_dist_init_addr is None
 
 
-def test_sglang_config_warns_when_server_args_config_is_read_only(
-    monkeypatch, caplog
-):
+def test_sglang_config_warns_when_server_args_config_is_read_only(monkeypatch, caplog):
     """A read-only SGLang field should not hide the sanitization fallback."""
     caplog.set_level(logging.WARNING, logger="atom")
     _run_sglang_config_test(
