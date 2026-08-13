@@ -26,7 +26,7 @@ SHAPE_K = (2, 5)
 SHAPE_V = (2, 3, 4)
 
 
-def build(num_spec: int = 0):
+def build(num_spec: int = 0, replayssm: bool = False):
     """Caches whose every (layer, slot) plane carries a distinct value."""
     k = torch.zeros((LAYERS, SLOTS) + SHAPE_K)
     v = torch.zeros((LAYERS, SLOTS) + SHAPE_V)
@@ -34,9 +34,25 @@ def build(num_spec: int = 0):
         for slot in range(SLOTS):
             k[layer, slot] = layer * 100 + slot
             v[layer, slot] = -(layer * 100 + slot)
+    runner = SimpleNamespace(mamba_k_cache=k, mamba_v_cache=v)
+    if replayssm:
+        # The record buffers share the (layer, slot) axes, so they carry the
+        # same distinct values; the cursor is per-slot and one-dimensional.
+        for name, shape in (
+            ("replayssm_buf_k", SHAPE_K),
+            ("replayssm_buf_u", SHAPE_V),
+            ("replayssm_buf_g", (2,)),
+        ):
+            buf = torch.zeros((LAYERS, SLOTS) + shape)
+            for layer in range(LAYERS):
+                for slot in range(SLOTS):
+                    buf[layer, slot] = layer * 100 + slot
+            setattr(runner, name, buf)
+        runner.replayssm_write_pos = torch.arange(SLOTS, dtype=torch.int32)
     stub = SimpleNamespace(
         num_spec=num_spec,
-        model_runner=SimpleNamespace(mamba_k_cache=k, mamba_v_cache=v),
+        replayssm=replayssm,
+        model_runner=runner,
     )
     return stub, k, v
 
@@ -98,3 +114,66 @@ def test_no_pairs_is_a_no_op():
 
     assert torch.equal(k, before_k)
     assert torch.equal(v, before_v)
+
+
+# --- ReplaySSM -------------------------------------------------------------
+# Under ReplaySSM a slot's state is not the two caches alone: the (k, u, g)
+# records written since the checkpoint, and the cursor saying how many there
+# are, are as much a part of it. A relocation that moved only the caches would
+# leave the destination reading the previous tenant's decode history -- which
+# is silent, because every tensor involved is validly shaped and populated.
+
+
+def test_relocation_moves_the_record_buffers_too():
+    stub, _, _ = build(num_spec=2, replayssm=True)
+    runner = stub.model_runner
+    before = {
+        name: getattr(runner, name).clone()
+        for name in ("replayssm_buf_k", "replayssm_buf_u", "replayssm_buf_g")
+    }
+
+    GDNStateMixin.relocate_state_slots(stub, [(1, 3)])
+
+    for name, was in before.items():
+        now = getattr(runner, name)
+        assert torch.equal(now[:, 3], was[:, 1])
+        # Every other slot untouched, same as the caches.
+        for slot in range(SLOTS):
+            if slot != 3:
+                assert torch.equal(now[:, slot], was[:, slot])
+
+
+def test_relocation_moves_the_write_cursor():
+    """The cursor is what makes the records mean anything.
+
+    It is indexed by slot rather than by (layer, slot) -- one cursor serves
+    every linear-attention layer -- so it moves by a different call than the
+    buffers and is worth its own case.
+    """
+    stub, _, _ = build(num_spec=2, replayssm=True)
+    write_pos = stub.model_runner.replayssm_write_pos
+    before = write_pos.clone()
+
+    GDNStateMixin.relocate_state_slots(stub, [(1, 3), (0, 7)])
+
+    assert write_pos[3] == before[1]
+    assert write_pos[7] == before[0]
+    for slot in range(SLOTS):
+        if slot not in (3, 7):
+            assert write_pos[slot] == before[slot]
+
+
+def test_relocation_ignores_replay_buffers_when_disabled():
+    """A stub with no ReplaySSM attributes at all must still relocate.
+
+    ReplaySSM is off by default, so the baseline path may not so much as look
+    at `replayssm_buf_*` -- reading them would turn the default configuration
+    into an AttributeError.
+    """
+    stub, k, _ = build(num_spec=2)
+    assert not hasattr(stub.model_runner, "replayssm_buf_k")
+    before_k = k.clone()
+
+    GDNStateMixin.relocate_state_slots(stub, [(1, 3)])
+
+    assert torch.equal(k[:, 3], before_k[:, 1])
