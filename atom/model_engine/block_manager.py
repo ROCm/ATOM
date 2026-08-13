@@ -1044,21 +1044,11 @@ class BlockManager:
         return indexed_tokens
 
     def register_received_prefix(self, seq: Sequence) -> int:
-        """Register the prompt blocks of a remote-prefill (PD consumer) request
-        into the prefix cache after their KV arrived via RDMA.
+        """Hash received prompt blocks into the prefix cache so subsequent
+        turns can match them locally and transfer only the delta.
 
-        The decode node never runs a prefill forward for these requests, so
-        `hash_blocks` is never called for them and their prompt blocks stay
-        unhashed — leaving `can_allocate` at 0 on the consumer and forcing a full
-        KV re-transfer every turn. Hashing the full prompt blocks here (chained
-        exactly like `hash_blocks`, since the consumer holds the same prompt
-        tokens and block_size as the producer) lets the NEXT turn's
-        `can_allocate` match this prefix locally and pull only the delta.
-
-        Only whole blocks are registered; the trailing partial block is left
-        unhashed (matches `hash_blocks`). Emitting KV events for the received
-        blocks is left to the caller (`record_remote_store`). Returns the number
-        of blocks hashed.
+        Only whole blocks are registered; trailing partial block left unhashed
+        (matches ``hash_blocks``). Returns the number of blocks hashed.
         """
         if not self.enable_prefix_caching:
             return 0

@@ -200,12 +200,12 @@ class PPEngineCoreProc(EngineCore):
         if not self.kv_transfer_enabled:
             return
 
-        # Step 1: collect this stage's own TP-aggregated output.
+        # Collect local TP-aggregated output.
         kvoutput = self.runner_mgr.call_func_with_aggregation("async_proc_aggregation")
         if kvoutput is None:
             kvoutput = KVConnectorOutput()
 
-        # Step 2: split — non-offload fields go directly to scheduler.
+        # Non-offload fields go directly to scheduler.
         non_offload = KVConnectorOutput(
             finished_sending=kvoutput.finished_sending,
             finished_recving=kvoutput.finished_recving,
@@ -214,7 +214,7 @@ class PPEngineCoreProc(EngineCore):
         if not non_offload.is_empty():
             self.scheduler._update_from_kv_xfer_finished(non_offload)
 
-        # Step 3: offload fields go through PP aggregator.
+        # Offload fields go through PP aggregator.
         has_offload = (
             kvoutput.finished_loading
             or kvoutput.failed_loading

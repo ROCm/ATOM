@@ -1468,14 +1468,8 @@ class MooncakeConnector(KVConnectorBase):
                 block_dst.append(dst_base + db * consumer_block_bpb[cidx])
                 block_sizes.append(bpb)
 
-        # Transfer the SWA ring, one whole ring per state slot. Unlike the
-        # block pool this replaced there is nothing to skip: a ring has no
-        # freed entries, so every row of a live slot crosses the wire.
-        #
-        # A backend that registered SWA regions but sent no slot would transfer
-        # zero rows and the resuming side would decode against an empty window
-        # -- exactly the failure #1417 was about, and silent. The two facts
-        # only meet here, so this is where it has to be caught.
+        # SWA ring transfer: every row of a live slot crosses the wire.
+        # Catch the case where regions exist but no slot was sent.
         if self._swa_block_regions and not (src_swa_block_ids and dst_swa_block_ids):
             raise RuntimeError(
                 f"backend registered {len(self._swa_block_regions)} SWA ring "

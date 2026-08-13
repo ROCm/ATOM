@@ -681,12 +681,7 @@ def _park(sched, seq):
 
 
 def _pp_prefill_until_parked(sched, prompt_len, block_size):
-    """Schedule chunks until one is deferred, then park the seq mid-prefill.
-
-    Reproduces the LMCache unaligned-handoff shape: the sequence prefills up to
-    a chunk boundary and leaves `running` to wait for the load while the chunk
-    that filled those blocks is still awaiting its deferred hash publish.
-    """
+    """Schedule chunks until one is deferred, then park the seq mid-prefill."""
     seq = _make_seq(prompt_len, block_size=block_size)
     sched.add(seq)
     for _ in range(400):
