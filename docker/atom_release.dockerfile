@@ -24,7 +24,8 @@ ARG GPU_ARCH
 ENV GPU_ARCH_LIST=$GPU_ARCH
 ENV PYTORCH_ROCM_ARCH=$GPU_ARCH
 
-RUN pip install --upgrade pip && \
+# AITER's prebuilt and runtime-JIT modules must use the same pybind ABI.
+RUN pip install --upgrade pip "pybind11==3.0.4" && \
     apt-get update && \
     apt --fix-broken install -y && \
     apt-get install -y \
@@ -204,11 +205,6 @@ RUN git clone $ATOM_REPO /app/ATOM && \
 RUN pip show atom || true
 
 RUN pip install --no-cache-dir msgpack msgspec quart
-
-# flash-linear-attention (import name `fla`): Kimi-K3 KDA prefill uses
-# fla.ops.kda.chunk_kda. Its only core dep is einops (already present); torch and
-# triton sit behind extras, so this does NOT touch the image's ROCm torch/triton.
-RUN pip install --no-cache-dir flash-linear-attention==0.5.2 fla-core==0.5.2
 
 # atomesh: install the binary produced by the ATOM package build hook to /usr/local/bin
 RUN echo "========== Install atomesh binary ==========" && \

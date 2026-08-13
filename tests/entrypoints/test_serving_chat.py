@@ -3,14 +3,68 @@
 
 """Tests for chat completion serving logic (chunk creation, response building)."""
 
+import asyncio
 import json
-
 
 from atom.entrypoints.openai.serving_chat import (
     build_chat_response,
     build_chat_response_multi,
     create_chat_chunk,
+    normalize_chat_tools,
+    stream_chat_response,
+    stream_chat_response_fanout,
 )
+
+# ============================================================================
+# normalize_chat_tools Tests
+# ============================================================================
+
+
+class TestNormalizeChatTools:
+    def test_converts_anthropic_tool_schema(self):
+        tools = [
+            {
+                "name": "search",
+                "description": "Search documents",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                },
+            }
+        ]
+
+        assert normalize_chat_tools(tools) == [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search",
+                    "description": "Search documents",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+
+    def test_preserves_openai_tool_schema(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ]
+
+        assert normalize_chat_tools(tools) == tools
+
+    def test_leaves_malformed_tool_for_validator(self):
+        tools = [{"name": "search", "input_schema": "not-an-object"}]
+
+        assert normalize_chat_tools(tools) == tools
+
 
 # ============================================================================
 # create_chat_chunk Tests
@@ -46,6 +100,14 @@ class TestCreateChatChunk:
         chunk_str = create_chat_chunk("req-1", "model")
         data = json.loads(chunk_str[6:])
         assert data["choices"][0]["delta"] == {}
+
+    def test_role_chunk_includes_empty_content(self):
+        chunk_str = create_chat_chunk(
+            "req-1", "model", delta={"role": "assistant", "content": ""}
+        )
+        data = json.loads(chunk_str[6:])
+        assert data["choices"][0]["delta"]["role"] == "assistant"
+        assert data["choices"][0]["delta"]["content"] == ""
 
     def test_finish_reason(self):
         chunk_str = create_chat_chunk("req-1", "model", finish_reason="stop")
@@ -214,3 +276,75 @@ class TestCreateChatChunkWithIndex:
         chunk_str = create_chat_chunk("req", "model", delta={"content": "hi"}, index=3)
         data = json.loads(chunk_str[6:])
         assert data["choices"][0]["index"] == 3
+
+
+# ============================================================================
+# Streaming Role Chunk Content Regression Tests
+# ============================================================================
+
+
+class TestStreamingRoleChunkContent:
+    """End-to-end regression test for the streamed role-announcement chunk.
+
+    The unit test above (test_role_chunk_includes_empty_content) only checks
+    that create_chat_chunk() can serialize a delta it's handed directly. It
+    does not exercise stream_chat_response / stream_chat_response_fanout, so
+    a regression that drops content="" inside those generators would not be
+    caught. This drives both generators directly with a minimal queue
+    payload and asserts the first emitted SSE chunk includes content="".
+    """
+
+    def test_single_stream_role_chunk_has_empty_content(self):
+        async def run():
+            queue = asyncio.Queue()
+            await queue.put({"text": "Hi", "token_ids": [1], "finished": True})
+            gen = stream_chat_response(
+                request_id="req-1",
+                model="model",
+                stream_queue=queue,
+                seq_id=0,
+                num_prompt_tokens=1,
+                cleanup_fn=lambda *a, **k: None,
+            )
+            first_chunk = await gen.__anext__()
+            await gen.aclose()
+            return first_chunk
+
+        first_chunk = asyncio.run(run())
+        assert first_chunk.startswith("data: ")
+        data = json.loads(first_chunk[6:])
+        delta = data["choices"][0]["delta"]
+        assert delta["role"] == "assistant"
+        assert delta["content"] == ""
+
+    def test_fanout_stream_role_chunks_have_empty_content(self):
+        async def run():
+            queue = asyncio.Queue()
+            # Empty text + finished=False means each queue item triggers
+            # *only* the role-announcement yield (no content/finish chunks
+            # in between), so the first two yields are guaranteed to be
+            # sibling 0's and sibling 1's role chunks respectively.
+            await queue.put((0, {"text": "", "token_ids": [], "finished": False}))
+            await queue.put((1, {"text": "", "token_ids": [], "finished": False}))
+            gen = stream_chat_response_fanout(
+                request_id="req-2",
+                model="model",
+                shared_queue=queue,
+                seq_ids=[0, 1],
+                num_prompt_tokens=1,
+                cleanup_fn=lambda *a, **k: None,
+            )
+            chunk_0 = await gen.__anext__()
+            chunk_1 = await gen.__anext__()
+            await gen.aclose()
+            return chunk_0, chunk_1
+
+        chunk_0, chunk_1 = asyncio.run(run())
+        for raw_chunk, expected_index in ((chunk_0, 0), (chunk_1, 1)):
+            assert raw_chunk.startswith("data: ")
+            data = json.loads(raw_chunk[6:])
+            choice = data["choices"][0]
+            assert choice["index"] == expected_index
+            delta = choice["delta"]
+            assert delta["role"] == "assistant"
+            assert delta["content"] == ""

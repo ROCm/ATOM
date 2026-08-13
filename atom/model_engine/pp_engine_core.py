@@ -35,7 +35,11 @@ class PPEngineCoreProc(EngineCore):
         self._in_flight: deque = deque()
         self._pending_prefix_hash: deque = deque()
         bm = self.scheduler.block_manager
-        self._defer_prefix_hash: bool = bm.enable_prefix_caching and not bm.swa_enabled
+        # Deferring used to be off under SWA: the sliding window published its
+        # blocks into a content index in lockstep with the compressed ones, and
+        # a deferred hash would have let the two disagree. The window is a
+        # per-request ring now and publishes nothing, so the exception is gone.
+        self._defer_prefix_hash: bool = bm.enable_prefix_caching
         logger.info(
             f"{self.label}: PP stage {self.pp_rank}/{self.pp_size} "
             f"(head={self.is_head}, last={self.is_last}) ready"
