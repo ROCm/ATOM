@@ -76,6 +76,7 @@ from atom.kv_transfer.disaggregation.types import (
     KVConnectorOutput,
     LoadOperationId,
     SaveOperationId,
+    SendOperationId,
 )
 
 logger = logging.getLogger("atom")
@@ -84,6 +85,10 @@ _PARTIAL_SAVE = object()
 
 def _save_req_id(value: Any) -> Any:
     return value.req_id if isinstance(value, SaveOperationId) else value
+
+
+def _send_req_id(value: Any) -> Any:
+    return value.req_id if isinstance(value, SendOperationId) else value
 
 
 @dataclass(frozen=True)
@@ -329,7 +334,7 @@ class MultiConnector(KVConnectorBase):
 
         rel_send: set = set()
         for r in send_now:
-            req_key = str(r)
+            req_key = str(_send_req_id(r))
             if self._req_has_pending_save(req_key):
                 self._sent[req_key] = r
             else:
@@ -633,6 +638,14 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             return False
         callback = getattr(owner[1], "should_park_partial_prefill_for_load", None)
         return callback(seq) if callback is not None else False
+
+    def should_pause_partial_prefill_for_save(self, seq: Any) -> bool:
+        return any(
+            getattr(
+                connector, "should_pause_partial_prefill_for_save", lambda _seq: False
+            )(seq)
+            for connector in self._connectors
+        )
 
     def cancel_pending_load(self, seq: Any) -> None:
         owner = self._owner_for_seq(seq)

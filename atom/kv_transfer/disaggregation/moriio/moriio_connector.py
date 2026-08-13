@@ -34,6 +34,10 @@ from atom.kv_transfer.disaggregation.moriio.moriio_common import (
     _MORIIO_AVAILABLE,
     get_port_offset,
 )
+from atom.kv_transfer.disaggregation.send_generation import (
+    decode_send_completion,
+    encode_send_operation,
+)
 from atom.kv_transfer.disaggregation.utils import chunk_tensor_for_rdma
 from atom.kv_transfer.disaggregation.moriio.moriio_engine import MoRIIOWrapper
 from atom.kv_transfer.disaggregation.types import (
@@ -41,6 +45,8 @@ from atom.kv_transfer.disaggregation.types import (
     EngineId,
     ReqId,
     ReqMeta,
+    SendCompletionId,
+    SendOperationId,
     TransferId,
 )
 from atom.model_engine.sequence import Sequence
@@ -179,7 +185,8 @@ class MoRIIOConnector(KVConnectorBase):
         self._recving_transfers_callback_addr: dict[ReqId, tuple[str, str]] = {}
 
         # Completed send-side transfers (populated by handshake listener)
-        self.done_sending: set[int] = set()
+        self.done_sending: set[SendCompletionId] = set()
+        self._done_sending_lock = threading.Lock()
 
         # Transfer ID mapping (worker side)
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
@@ -667,10 +674,13 @@ class MoRIIOConnector(KVConnectorBase):
                 elif msg == MoRIIOConstants.POP_DONE_RECV:
                     if len(parts) < 3:
                         raise ValueError("POP_DONE_RECV missing request ID")
-                    req_id = int(parts[2])
-                    self.done_sending.add(req_id)
+                    transfer_id = int(parts[2])
+                    completion = decode_send_completion(transfer_id)
+                    with self._done_sending_lock:
+                        self.done_sending.add(completion)
                     logger.debug(
-                        "Handshake listener: consumer finished reading req %d", req_id
+                        "Handshake listener: consumer finished reading transfer %d",
+                        transfer_id,
                     )
 
                 else:
@@ -836,7 +846,7 @@ class MoRIIOConnector(KVConnectorBase):
 
             return done_req_ids
 
-    def get_finished(self) -> tuple[set[int], set[str]]:
+    def get_finished(self) -> tuple[set[SendCompletionId], set[str]]:
         """Return the sets of finished sending and receiving request IDs.
 
         Called by the worker each step via ``async_proc_aggregation``.
@@ -845,19 +855,20 @@ class MoRIIOConnector(KVConnectorBase):
             ``(done_sending, done_recving)`` tuple.
         """
         done_recving = self._pop_done_transfers()
-        if self.is_producer:
-            done_sending = self.done_sending.copy()
-            self.done_sending.clear()
-        else:
-            if self.done_sending:
-                logger.warning(
-                    "Consumer received %d stale done_sending notifications "
-                    "(single-machine port collision?) — discarding: %s",
-                    len(self.done_sending),
-                    self.done_sending,
-                )
+        with self._done_sending_lock:
+            if self.is_producer:
+                done_sending = self.done_sending.copy()
                 self.done_sending.clear()
-            done_sending = set()
+            else:
+                if self.done_sending:
+                    logger.warning(
+                        "Consumer received %d stale done_sending notifications "
+                        "(single-machine port collision?) — discarding: %s",
+                        len(self.done_sending),
+                        self.done_sending,
+                    )
+                    self.done_sending.clear()
+                done_sending = set()
         return done_sending, done_recving
 
 
@@ -900,6 +911,7 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
         # Bidirectional transfer_id <-> request_id mapping
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
         self.transfer_id_to_request_id: dict[TransferId, ReqId] = {}
+        self._send_nonce = 0
 
     def get_num_new_matched_tokens(self, seq: Sequence) -> tuple[int, bool]:
         """Check if this sequence needs remote KV prefill.
@@ -980,6 +992,16 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
         draft_token_ids = (
             [int(x) for x in drafts] if drafts is not None and len(drafts) else []
         )
+        if self.is_producer:
+            send_operation = getattr(seq, "_send_operation", None)
+            if not isinstance(send_operation, SendOperationId):
+                send_operation = SendOperationId(seq.id, self._send_nonce)
+                self._send_nonce += 1
+                seq._send_operation = send_operation
+            transfer_id = encode_send_operation(send_operation)
+        else:
+            transfer_id = seq.id
+
         seq.kv_transfer_params_output = {
             "do_remote_prefill": True,
             "do_remote_decode": False,
@@ -990,7 +1012,7 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
             "remote_handshake_port": self.base_handshake_port,
             "tp_size": self.tp_size,
             "dp_rank": self.dp_rank,
-            "transfer_id": seq.id,
+            "transfer_id": transfer_id,
             "first_token_id": first_token_id,
             "draft_token_ids": draft_token_ids,
             "prefix_cache_hit_tokens": getattr(seq, "prefix_cache_hit_tokens", 0),

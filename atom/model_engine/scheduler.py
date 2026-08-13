@@ -27,7 +27,11 @@ import numpy as np
 
 from atom.config import Config
 from atom.kv_transfer.disaggregation import KVConnectorOutput
-from atom.kv_transfer.disaggregation.types import LoadOperationId, SaveOperationId
+from atom.kv_transfer.disaggregation.types import (
+    LoadOperationId,
+    SaveOperationId,
+    SendOperationId,
+)
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
@@ -926,7 +930,12 @@ class Scheduler:
         # this check, busy_loop's `is_finished()` short-circuits to True
         # before EngineCore drains `_rejected` via take_rejected(), and
         # llm.generate() blocks forever.
-        return not self.waiting and not self.running and not self._rejected
+        return (
+            not self.waiting
+            and not self.running
+            and not self._rejected
+            and not self.deferred_free_blocks
+        )
 
     def add(self, seq: Sequence):
         self._assert_request_id_available(seq)
@@ -1157,6 +1166,8 @@ class Scheduler:
                     break
                 if not seq.is_partial_prefill:
                     continue
+                if self._should_pause_partial_prefill_for_save(seq):
+                    continue
                 remaining = seq.num_tokens - seq.num_cached_tokens
                 if 0 < self.long_prefill_token_threshold < remaining:
                     remaining = self.long_prefill_token_threshold
@@ -1237,6 +1248,9 @@ class Scheduler:
             if offload_resume:
                 # Blocks already held from the pre-park allocate; only re-check
                 # the batch budget. No re-match / re-allocate / re-park.
+                if self._should_pause_partial_prefill_for_save(seq):
+                    self.waiting.appendleft(seq)
+                    break
                 num_new_tokens = seq.num_prompt_tokens - seq.num_cached_tokens
                 budget_remaining = self.max_num_batched_tokens - num_batched_tokens
                 chunk = self._prefill_chunk_for_budget(
@@ -1697,12 +1711,14 @@ class Scheduler:
                 seq = self.deferred_free_blocks.get(int(req_id))
             except (TypeError, ValueError):
                 seq = None
+        expected_operation = getattr(seq, "_load_operation", None) if seq else None
         if (
             seq is None
             or not getattr(seq, "_awaiting_aborted_load_cleanup", False)
+            or (expected_operation is not None and completion_id != expected_operation)
             or (
-                isinstance(completion_id, LoadOperationId)
-                and getattr(seq, "_load_operation", None) != completion_id
+                expected_operation is None
+                and isinstance(completion_id, LoadOperationId)
             )
         ):
             return False
@@ -1977,6 +1993,14 @@ class Scheduler:
         ):
             return self.kv_connector.adjust_prefill_chunk_after_alloc(seq, chunk)
         return chunk
+
+    def _should_pause_partial_prefill_for_save(self, seq: Sequence) -> bool:
+        callback = getattr(
+            self.kv_connector,
+            "should_pause_partial_prefill_for_save",
+            None,
+        )
+        return bool(callback(seq)) if callback is not None else False
 
     def _recap_prefill_chunk_after_finalize(self, seq: Sequence, chunk: int) -> int:
         if bool(getattr(self.kv_connector, "recap_prefill_after_finalize", False)):
@@ -2605,7 +2629,9 @@ class Scheduler:
     @classmethod
     def _pop_load_completion(cls, completion_ids: list, seq: Sequence) -> bool:
         expected = getattr(seq, "_load_operation", None)
-        if expected is not None and expected in completion_ids:
+        if expected is not None:
+            if expected not in completion_ids:
+                return False
             completion_ids.remove(expected)
             if getattr(seq, "_active_load_operation", None) == expected:
                 seq._consumed_load_operation = expected
@@ -2615,9 +2641,9 @@ class Scheduler:
     @classmethod
     def _has_load_completion(cls, completion_ids: list, seq: Sequence) -> bool:
         expected = getattr(seq, "_load_operation", None)
-        return (expected is not None and expected in completion_ids) or cls._has_req_id(
-            completion_ids, seq.id
-        )
+        if expected is not None:
+            return expected in completion_ids
+        return cls._has_req_id(completion_ids, seq.id)
 
     def _update_waiting_for_remote_kv(self, seq: Sequence) -> bool:
         """Check whether a remote KV transfer for *seq* has completed.
@@ -2737,13 +2763,19 @@ class Scheduler:
                 return None
 
         def _raw_req_id(value):
-            return value.req_id if isinstance(value, SaveOperationId) else value
+            return (
+                value.req_id
+                if isinstance(value, (SaveOperationId, SendOperationId))
+                else value
+            )
 
         def _release_deferred(seq):
             if hasattr(seq, "_kv_send_completed"):
                 delattr(seq, "_kv_send_completed")
             if hasattr(self.kv_connector, "request_finished"):
                 self.kv_connector.request_finished(seq)
+            if hasattr(seq, "_send_operation"):
+                delattr(seq, "_send_operation")
             self.block_manager.deallocate(seq)
 
         is_producer = self._connector_flag("is_producer")
@@ -2767,7 +2799,7 @@ class Scheduler:
             accepted = True
             if hasattr(self.kv_connector, "load_finished"):
                 accepted = self.kv_connector.load_finished(req_id) is not False
-            if isinstance(req_id, LoadOperationId) and not accepted:
+            if not accepted:
                 continue
             if self._finish_aborted_load_cleanup(req_id):
                 continue
@@ -2784,7 +2816,7 @@ class Scheduler:
             accepted = True
             if hasattr(self.kv_connector, "load_failed"):
                 accepted = self.kv_connector.load_failed(req_id) is not False
-            if isinstance(req_id, LoadOperationId) and not accepted:
+            if not accepted:
                 continue
             if self._finish_aborted_load_cleanup(req_id):
                 continue
@@ -2809,6 +2841,21 @@ class Scheduler:
             ), "Only producer should free blocks after sending KV"
             logger.debug("Finished sending KV transfer for request %s", req_id)
             raw_req_id = _raw_req_id(req_id)
+            seq = self.deferred_free_blocks.get(raw_req_id)
+            if seq is None:
+                try:
+                    seq = self.deferred_free_blocks.get(int(raw_req_id))
+                except (TypeError, ValueError):
+                    seq = None
+            expected_send = getattr(seq, "_send_operation", None) if seq else None
+            if expected_send is not None:
+                if req_id != expected_send:
+                    continue
+            elif isinstance(req_id, SendOperationId):
+                # Exact completions are valid only for the sequence that owns
+                # their marker. Legacy raw completions remain compatible only
+                # when no exact lifecycle was established.
+                continue
             seq = _pop_deferred(raw_req_id)
             assert seq is not None, f"req_id={req_id} not found in deferred_free_blocks"
             if hasattr(
@@ -3092,17 +3139,30 @@ class DecodeScheduler(Scheduler):
     def is_finished(self) -> bool:
         with self._prefill_lock:
             has_prefill = bool(self.prefill_waiting or self.prefill_done)
-        return not self.waiting and not self.running and not has_prefill
+        return (
+            not self.waiting
+            and not self.running
+            and not self._rejected
+            and not self.deferred_free_blocks
+            and not has_prefill
+        )
 
     def has_requests(self) -> bool:
         with self._prefill_lock:
             has_prefill = bool(self.prefill_waiting or self.prefill_done)
-        return bool(self.waiting or self.running or has_prefill)
+        return bool(
+            self.waiting or self.running or self.deferred_free_blocks or has_prefill
+        )
 
     def get_num_unfinished_requests(self) -> int:
         with self._prefill_lock:
             num_prefill = len(self.prefill_waiting) + len(self.prefill_done)
-        return len(self.waiting) + len(self.running) + num_prefill
+        return (
+            len(self.waiting)
+            + len(self.running)
+            + len(self.deferred_free_blocks)
+            + num_prefill
+        )
 
     def allocate_waiting(self) -> list[Sequence]:
         """Allocate KV blocks for sequences in waiting; move them to prefill_waiting.

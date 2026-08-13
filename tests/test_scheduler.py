@@ -3,7 +3,9 @@
 
 
 from collections import deque
+import sys
 import threading
+import types
 from types import SimpleNamespace
 from unittest import mock
 
@@ -15,6 +17,7 @@ from atom.kv_transfer.disaggregation.types import (
     KVConnectorOutput,
     LoadOperationId,
     SaveOperationId,
+    SendOperationId,
 )
 from atom.model_engine.scheduler import (
     DecodeScheduler,
@@ -58,6 +61,60 @@ class TestSchedulerAddQuery:
         scheduler.add(seq_factory([1, 2, 3]))
         assert not scheduler.is_finished()
 
+    def test_deferred_offload_work_keeps_scheduler_alive(self, scheduler):
+        scheduler.deferred_free_blocks[17] = SimpleNamespace(id=17)
+
+        assert not scheduler.is_finished()
+
+    def test_decode_scheduler_deferred_offload_work_keeps_scheduler_alive(self):
+        scheduler = DecodeScheduler.__new__(DecodeScheduler)
+        scheduler.waiting = deque()
+        scheduler.running = deque()
+        scheduler.prefill_waiting = {}
+        scheduler.prefill_done = deque()
+        scheduler._rejected = []
+        scheduler._prefill_lock = threading.Lock()
+        scheduler.deferred_free_blocks = {17: SimpleNamespace(id=17)}
+
+        assert not scheduler.is_finished()
+        assert scheduler.has_requests()
+        assert scheduler.get_num_unfinished_requests() == 1
+
+    @pytest.mark.parametrize("idle_case", ["no_requests", "no_result", "no_batch"])
+    def test_decode_engine_core_advances_idle_kv_transfer_without_forward_batch(
+        self, monkeypatch, idle_case
+    ):
+        fake_async_proc = types.ModuleType("atom.model_engine.async_proc")
+        fake_async_proc.AsyncIOProcManager = object
+        monkeypatch.setitem(
+            sys.modules,
+            "atom.model_engine.async_proc",
+            fake_async_proc,
+        )
+        from atom.model_engine.engine_core import DecodeEngineCore
+
+        schedule_calls = []
+
+        def schedule():
+            schedule_calls.append(None)
+            if idle_case == "no_result":
+                return None
+            if idle_case == "no_batch":
+                return None, {}
+            pytest.fail("schedule() must not run when the scheduler is empty")
+
+        idle_advances = []
+        core = DecodeEngineCore.__new__(DecodeEngineCore)
+        core.scheduler = SimpleNamespace(
+            has_requests=lambda: idle_case != "no_requests",
+            schedule=schedule,
+        )
+        core._advance_idle_kv_transfer = lambda: idle_advances.append(None)
+
+        assert core._process_engine_step() is False
+        assert idle_advances == [None]
+        assert len(schedule_calls) == (idle_case != "no_requests")
+
     def test_extend(self, scheduler, seq_factory):
         scheduler.extend([seq_factory([1]), seq_factory([2])])
         assert scheduler.get_num_unfinished_requests() == 2
@@ -78,6 +135,24 @@ class TestSchedulerAddQuery:
 
 
 class TestSchedule:
+    def test_partial_prefill_save_pause_delegates_to_connector(self):
+        seq = SimpleNamespace(id=87)
+        sched = Scheduler.__new__(Scheduler)
+        sched.kv_connector = SimpleNamespace(
+            should_pause_partial_prefill_for_save=lambda value: value is seq
+        )
+
+        assert sched._should_pause_partial_prefill_for_save(seq) is True
+
+    def test_exact_load_generation_does_not_consume_stale_raw_completion(self):
+        operation = LoadOperationId(88, 3)
+        seq = SimpleNamespace(id=88, _load_operation=operation)
+        completions = [88]
+
+        assert Scheduler._has_load_completion(completions, seq) is False
+        assert Scheduler._pop_load_completion(completions, seq) is False
+        assert completions == [88]
+
     @pytest.mark.parametrize(
         ("winner_is_offload", "expected_jump"),
         [(False, True), (True, False)],
@@ -285,6 +360,78 @@ class TestSchedule:
         sched.add(new)
         assert list(sched.waiting) == [new]
 
+    def test_reused_id_ignores_stale_exact_send_generation(self):
+        old_operation = SendOperationId(95, 4)
+        new_operation = SendOperationId(95, 5)
+        seq = SimpleNamespace(id=95, _send_operation=new_operation)
+        deallocated = []
+
+        class _Connector:
+            is_producer = True
+            is_offload = False
+
+            def should_defer_free(self, _seq):
+                return False
+
+            def request_finished(self, _seq):
+                pass
+
+        sched = Scheduler.__new__(Scheduler)
+        sched.kv_connector = _Connector()
+        sched.deferred_free_blocks = {seq.id: seq}
+        sched.finished_recving_kv_req_ids = []
+        sched.failed_recving_kv_req_ids = []
+        sched.block_manager = SimpleNamespace(deallocate=deallocated.append)
+
+        sched._update_from_kv_xfer_finished(
+            KVConnectorOutput(finished_sending={old_operation})
+        )
+
+        assert sched.deferred_free_blocks == {seq.id: seq}
+        assert deallocated == []
+
+        sched._update_from_kv_xfer_finished(
+            KVConnectorOutput(finished_sending={new_operation})
+        )
+
+        assert sched.deferred_free_blocks == {}
+        assert deallocated == [seq]
+
+    def test_exact_send_lifecycle_rejects_stale_raw_completion(self):
+        operation = SendOperationId(96, 7)
+        seq = SimpleNamespace(id=96, _send_operation=operation)
+        deallocated = []
+
+        class _Connector:
+            is_producer = True
+            is_offload = False
+
+            def should_defer_free(self, _seq):
+                return False
+
+            def request_finished(self, _seq):
+                pass
+
+        sched = Scheduler.__new__(Scheduler)
+        sched.kv_connector = _Connector()
+        sched.deferred_free_blocks = {seq.id: seq}
+        sched.finished_recving_kv_req_ids = []
+        sched.failed_recving_kv_req_ids = []
+        sched.block_manager = SimpleNamespace(deallocate=deallocated.append)
+
+        sched._update_from_kv_xfer_finished(
+            KVConnectorOutput(finished_sending={seq.id})
+        )
+
+        assert sched.deferred_free_blocks == {seq.id: seq}
+        assert deallocated == []
+
+        sched._update_from_kv_xfer_finished(
+            KVConnectorOutput(finished_sending={operation})
+        )
+        assert sched.deferred_free_blocks == {}
+        assert deallocated == [seq]
+
     def test_empty_returns_none(self, scheduler):
         assert scheduler.schedule() is None
 
@@ -422,6 +569,47 @@ class TestSchedule:
         assert batch2.total_tokens_num_prefill == 4
         assert list(batch2.scheduled_tokens) == list(range(6, 10))
         assert list(batch2.num_cached_tokens) == [6]
+
+    def test_partial_prefill_pauses_for_inflight_sidecar_then_resumes(
+        self, seq_factory
+    ):
+        sched = Scheduler(
+            MockConfig(
+                max_num_batched_tokens=6,
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                enable_chunked_prefill=True,
+            )
+        )
+        seq = seq_factory(list(range(10)))
+        sched.add(seq)
+        batch1, _ = sched.schedule()
+        sched.postprocess(
+            list(sched.running),
+            ScheduledBatchOutput(
+                req_ids=[],
+                token_ids=[],
+                num_rejected=None,
+                num_bonus=None,
+                draft_token_ids=None,
+            ),
+            batch=batch1,
+        )
+        paused = {"value": True}
+        sched.kv_connector = SimpleNamespace(
+            should_pause_partial_prefill_for_save=lambda _seq: paused["value"],
+            build_connector_meta=lambda: "sidecar-meta",
+        )
+
+        idle_batch, _ = sched.schedule()
+
+        assert list(idle_batch.req_ids) == []
+        assert idle_batch.connector_meta_output == "sidecar-meta"
+        assert seq.num_cached_tokens == 6
+
+        paused["value"] = False
+        resumed, _ = sched.schedule()
+        assert resumed.total_tokens_num_prefill == 4
 
     def test_prefill_respects_block_availability(self, seq_factory):
         sched = Scheduler(MockConfig(num_kvcache_blocks=1, kv_cache_block_size=4))

@@ -15,22 +15,24 @@ from __future__ import annotations
 from dataclasses import dataclass
 import logging
 import threading
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 import torch
 
 from atom.kv_transfer.offload.atom_lmcache_staging import (
     _StagingBuffer,
+    _PipelineStage,
     _ThreadTransferState,
     _env_flag,
     _env_int,
     _env_optional_int,
+    run_staged_pipeline,
 )
 
 logger = logging.getLogger("atom")
 
 
-class ATOMBlockByteCodec(Protocol):
+class BlockByteCodec(Protocol):
     """Block-byte staging contract shared by dense and PAGE codecs."""
 
     @property
@@ -78,39 +80,48 @@ class _TransferGroup:
     nbytes: int
 
 
-@dataclass(frozen=True)
-class _PipelineStage:
-    """One leg of the two-stage staging pipeline.
-
-    ``stream`` is the CUDA stream the work is issued on; ``run(group,
-    device_buf)`` does the work.
-    """
-
-    stream: Any
-    run: Callable[[_TransferGroup, torch.Tensor], None]
-
-
-class ATOMLMCacheGPUConnector:
+class BlockGPUConnector:
     """LMCache GPUConnectorInterface for ATOM's opaque KV-block byte layout."""
 
     def __init__(
         self,
-        codec: ATOMBlockByteCodec,
+        codec: BlockByteCodec,
         block_size: int,
         *,
         chunk_size: int | None = None,
+        virtual_block_size: int | None = None,
     ) -> None:
         self.codec = codec
-        self.block_size = int(block_size)
-        if self.block_size <= 0:
+        self.physical_block_size = int(block_size)
+        if self.physical_block_size <= 0:
             raise ValueError("ATOM LMCache connector: block_size must be > 0")
-        self.chunk_size = int(chunk_size if chunk_size is not None else block_size)
+        self.virtual_block_size = int(
+            virtual_block_size
+            if virtual_block_size is not None
+            else self.physical_block_size
+        )
+        if self.virtual_block_size <= 0:
+            raise ValueError("ATOM LMCache connector: virtual_block_size must be > 0")
+        if self.virtual_block_size % self.physical_block_size:
+            raise ValueError(
+                "virtual DCP block size must be divisible by physical block size: "
+                f"virtual={self.virtual_block_size}, "
+                f"physical={self.physical_block_size}"
+            )
+        # ``block_size`` remains the token-to-block mapping grid for internal
+        # helpers. Under DCP one scheduler block ID covers one virtual global
+        # block while the codec still moves one rank-local physical page.
+        self.block_size = self.virtual_block_size
+        self.chunk_size = int(
+            chunk_size if chunk_size is not None else self.virtual_block_size
+        )
         if self.chunk_size <= 0:
             raise ValueError("ATOM LMCache connector: chunk_size must be > 0")
         if self.chunk_size % self.block_size != 0:
             raise ValueError(
-                "LMCache chunk size must be divisible by ATOM KV block size: "
-                f"chunk_size={self.chunk_size}, block_size={self.block_size}"
+                "LMCache chunk size must be divisible by the ATOM virtual block "
+                f"size: chunk_size={self.chunk_size}, "
+                f"virtual_block_size={self.virtual_block_size}"
             )
         self._blocks_per_lmcache_chunk = self.chunk_size // self.block_size
         self._gpu_staging_chunk_bytes = (
@@ -439,36 +450,23 @@ class ATOMLMCacheGPUConnector:
         quarantines that tensor and forces fresh allocation on the next call.
         """
         self._assert_fused_chunk_major_available()
-        staging_buffer = state.staging_buffer
-        used_buffer = False
-        buffer_safe_to_release = True
-        try:
-            for group in groups:
-                device_buf = self._ensure_staging_buffer(staging_buffer, group.nbytes)
-                used_buffer = True
-                if staging_buffer.free_event_valid:
-                    stage_a.stream.wait_event(staging_buffer.free_event)
-                with state.stream_ctx(stage_a.stream):
-                    stage_a.run(group, device_buf)
-                staging_buffer.ready_event.record(stage_a.stream)
-                stage_b.stream.wait_event(staging_buffer.ready_event)
-                with state.stream_ctx(stage_b.stream):
-                    stage_b.run(group, device_buf)
-                staging_buffer.free_event.record(stage_b.stream)
-                staging_buffer.free_event_valid = True
-            stage_b.stream.synchronize()
-        except Exception:
-            if self._fence_pipeline_streams(stage_a, stage_b):
-                # Both streams are complete; no event wait is needed before the
-                # existing tensor is reused or explicitly released.
-                staging_buffer.free_event_valid = False
-            else:
-                self._quarantine_staging_buffer(staging_buffer)
-                buffer_safe_to_release = False
-            raise
-        finally:
-            if used_buffer and buffer_safe_to_release:
-                self._release_staging_buffer_if_requested(staging_buffer)
+
+        def recover(staging_buffer, failed_a, failed_b) -> bool:
+            if self._fence_pipeline_streams(failed_a, failed_b):
+                return True
+            self._quarantine_staging_buffer(staging_buffer)
+            return False
+
+        run_staged_pipeline(
+            state,
+            groups,
+            stage_a=stage_a,
+            stage_b=stage_b,
+            ensure_buffer=self._ensure_staging_buffer,
+            group_nbytes=lambda group: group.nbytes,
+            release_buffer=self._release_staging_buffer_if_requested,
+            recover_buffer=recover,
+        )
 
     def from_gpu(self, memory_obj: Any, start: int, end: int, **kwargs) -> None:
         self.batched_from_gpu([memory_obj], [start], [end], **kwargs)

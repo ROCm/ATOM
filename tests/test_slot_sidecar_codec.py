@@ -12,8 +12,8 @@ import pytest
 import torch
 
 from atom.kv_transfer.disaggregation.types import KVTransferRegion
-from atom.kv_transfer.offload.slot_sidecar_admission import SlotSidecarAdmission
-from atom.kv_transfer.offload.slot_sidecar_codec import ATOMSlotSidecarCodec
+from atom.kv_transfer.offload.hybrid.admission import SlotSidecarAdmission
+from atom.kv_transfer.offload.hybrid.slot_codec import ATOMSlotSidecarCodec
 
 
 def _invalid_integer_scalars():

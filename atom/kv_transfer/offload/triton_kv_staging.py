@@ -11,7 +11,7 @@ import torch
 import triton
 import triton.language as tl
 
-from atom.kv_transfer.offload.atom_page_region_codec import build_copy_tiles
+from atom.kv_transfer.offload.copy_plan import build_copy_tiles
 
 _BLOCK_BYTES = 1024
 

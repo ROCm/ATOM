@@ -1113,13 +1113,16 @@ class DecodeEngineCore(EngineCore):
         """Override: handle None from DecodeScheduler when prefill_waiting is
         non-empty but running is empty (sequences are still being prefilled)."""
         if not self.scheduler.has_requests():
+            self._advance_idle_kv_transfer()
             return False
         result = self.scheduler.schedule()
         if result is None:
             # Sequences exist but are still waiting for PrefillDone — spin.
+            self._advance_idle_kv_transfer()
             return False
         scheduled_batch, seqs = result
         if scheduled_batch is None:
+            self._advance_idle_kv_transfer()
             return False
         t0 = time.perf_counter()
         fwd_out = self.runner_mgr.call_func("forward", scheduled_batch, wait_out=True)

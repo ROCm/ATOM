@@ -54,20 +54,22 @@ pytestmark = pytest.mark.skipif(
 )
 
 from atom.kv_transfer.disaggregation.types import KVTransferRegion
-from atom.kv_transfer.offload.atom_kv_byte_codec import ATOMKVByteCodec
-from atom.kv_transfer.offload.atom_lmcache_gpu_connector import (
-    ATOMLMCacheGPUConnector,
+from atom.kv_transfer.offload.dense.kv_byte_codec import (
+    DenseKVByteCodec,
 )
-from atom.kv_transfer.offload.atom_page_region_codec import ATOMPageRegionCodec
+from atom.kv_transfer.offload.dense.gpu_connector import (
+    DenseGPUConnector,
+)
+from atom.kv_transfer.offload.hybrid.page_region_codec import ATOMPageRegionCodec
 from atom.kv_transfer.offload.metadata import ATOMRawBytesLMCacheMetadata
-from atom.kv_transfer.offload.slot_sidecar_codec import ATOMSlotSidecarCodec
-from atom.kv_transfer.offload.slot_sidecar_format import (
+from atom.kv_transfer.offload.hybrid.slot_codec import ATOMSlotSidecarCodec
+from atom.kv_transfer.offload.hybrid.sidecar_format import (
     SlotSidecarHeader,
     SlotSidecarKey,
     decode_sidecar,
     encode_sidecar,
 )
-from atom.kv_transfer.offload.slot_sidecar_store import SlotSidecarStore
+from atom.kv_transfer.offload.hybrid.store import SlotSidecarStore
 
 _FINGERPRINT = bytes.fromhex("00112233445566778899aabbccddeeff")
 
@@ -192,9 +194,9 @@ def test_gpu_kv_round_trip_through_local_disk_backend(tmp_path: Path):
         block_size=block_size,
     )
     expected = _clone_segments(kv_caches)
-    codec = ATOMKVByteCodec(kv_caches, num_blocks=num_blocks)
+    codec = DenseKVByteCodec(kv_caches, num_blocks=num_blocks)
     assert codec.has_fused_chunk_major_staging
-    gpu_connector = ATOMLMCacheGPUConnector(
+    gpu_connector = DenseGPUConnector(
         codec,
         block_size=block_size,
         chunk_size=chunk_size,
@@ -327,7 +329,7 @@ def test_page_major_page_and_full_slot_round_trip_through_local_disk_backend(
     assert page_codec.has_fused_chunk_major_staging
     assert slot_codec.has_fused_copy_plan_staging
 
-    gpu_connector = ATOMLMCacheGPUConnector(
+    gpu_connector = DenseGPUConnector(
         page_codec,
         block_size=block_size,
         chunk_size=chunk_size,

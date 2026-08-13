@@ -14,8 +14,8 @@ import pytest
 import torch
 
 from atom.kv_transfer.disaggregation.types import KVTransferTensors
-from atom.kv_transfer.offload.atom_page_region_codec import ATOMPageRegionCodec
-from atom.kv_transfer.offload.slot_sidecar_codec import ATOMSlotSidecarCodec
+from atom.kv_transfer.offload.hybrid.page_region_codec import ATOMPageRegionCodec
+from atom.kv_transfer.offload.hybrid.slot_codec import ATOMSlotSidecarCodec
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_ops.attentions.v4_pool_geometry import UnifiedPoolGeometry
 

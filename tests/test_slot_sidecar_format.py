@@ -10,8 +10,8 @@ import zlib
 import pytest
 import torch
 
-from atom.kv_transfer.offload import slot_sidecar_format
-from atom.kv_transfer.offload.slot_sidecar_format import (
+from atom.kv_transfer.offload.hybrid import sidecar_format as slot_sidecar_format
+from atom.kv_transfer.offload.hybrid.sidecar_format import (
     HEADER_BYTES,
     LAYOUT_VERSION,
     MAGIC,

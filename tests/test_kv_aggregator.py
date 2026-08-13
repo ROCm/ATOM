@@ -6,7 +6,11 @@
 import pytest
 
 from atom.kv_transfer.disaggregation import KVConnectorOutput, KVOutputAggregator
-from atom.kv_transfer.disaggregation.types import LoadOperationId, SaveOperationId
+from atom.kv_transfer.disaggregation.types import (
+    LoadOperationId,
+    SaveOperationId,
+    SendOperationId,
+)
 
 
 class TestKVOutputAggregatorInit:
@@ -41,6 +45,46 @@ class TestAggregateBasic:
         result = agg.aggregate(outputs)
         assert result.finished_sending == {"r1"}
         assert result.finished_recving == set()
+
+    def test_send_generations_never_cross_complete(self):
+        agg = KVOutputAggregator(world_size=2)
+        gen0 = SendOperationId("r1", 0)
+        gen1 = SendOperationId("r1", 1)
+
+        mixed = agg.aggregate(
+            [
+                KVConnectorOutput(finished_sending={gen0}),
+                KVConnectorOutput(finished_sending={gen1}),
+            ]
+        )
+        assert mixed.finished_sending == set()
+
+        matched = agg.aggregate(
+            [
+                KVConnectorOutput(finished_sending={gen1}),
+                KVConnectorOutput(finished_sending={gen0}),
+            ]
+        )
+        assert matched.finished_sending == {gen0, gen1}
+
+    def test_late_send_generation_duplicate_is_tombstoned(self):
+        agg = KVOutputAggregator(world_size=2)
+        operation = SendOperationId("r1", 3)
+
+        terminal = agg.aggregate(
+            [
+                KVConnectorOutput(finished_sending={operation}),
+                KVConnectorOutput(finished_sending={operation}),
+            ]
+        )
+        assert terminal.finished_sending == {operation}
+
+        late = agg.aggregate(
+            [KVConnectorOutput(finished_sending={operation}), KVConnectorOutput()]
+        )
+        assert late.finished_sending == set()
+        assert agg.pending_count == (0, 0)
+        assert agg.terminal_send_tombstone_count == 1
 
     def test_all_workers_report_same_recving(self):
         agg = KVOutputAggregator(world_size=2)

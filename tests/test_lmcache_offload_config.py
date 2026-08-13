@@ -32,6 +32,8 @@ def _config():
             num_key_value_heads=16,
             hidden_size=7168,
             head_dim=128,
+            kv_head_dim=512,
+            index_head_dim=128,
             kv_lora_rank=512,
             qk_rope_head_dim=64,
             compress_ratios=[4, 128, 0],
@@ -61,6 +63,8 @@ def test_page_namespace_is_stable_for_equivalent_config():
     [
         lambda config, cfg: setattr(config, "kv_cache_dtype", "bf16"),
         lambda config, cfg: setattr(config.hf_config, "indexer_dtype", "bf16"),
+        lambda config, cfg: setattr(config.hf_config, "kv_head_dim", 576),
+        lambda config, cfg: setattr(config.hf_config, "index_head_dim", 160),
         lambda config, cfg: setattr(
             config.hf_config,
             "compress_ratios",
@@ -78,6 +82,8 @@ def test_page_namespace_is_stable_for_equivalent_config():
     ids=[
         "kv-dtype",
         "index-dtype",
+        "kv-head-dim",
+        "index-head-dim",
         "compression",
         "block",
         "chunk",
@@ -105,6 +111,17 @@ def test_page_namespace_changes_when_code_layout_version_changes():
     )
 
     assert future != current
+
+
+def test_page_namespace_separates_explicit_offload_layout_families():
+    dense = _config()
+    hybrid = deepcopy(dense)
+    dense.kv_transfer_config = {"offload_layout": "dense"}
+    hybrid.kv_transfer_config = {"offload_layout": "hybrid"}
+
+    assert offcfg.build_page_namespace(
+        dense, _lmcache_config(), 4
+    ) != offcfg.build_page_namespace(hybrid, _lmcache_config(), 4)
 
 
 def test_scheduler_and_worker_metadata_share_page_namespace(monkeypatch):

@@ -7,12 +7,22 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import logging
+import threading
 
 import torch
 
-from atom.kv_transfer.offload.slot_sidecar_format import SlotSidecarKey
+from atom.kv_transfer.offload.hybrid.sidecar_format import SlotSidecarKey
 
 logger = logging.getLogger("atom")
+
+
+class SlotSidecarCorruptionError(RuntimeError):
+    """Raised when LMCache returns a malformed SLOT sidecar object.
+
+    This is deliberately distinct from a storage lookup/read failure: callers
+    must invalidate a corrupt object before trying to publish the same
+    content-addressed key again.
+    """
 
 
 class SlotSidecarStore:
@@ -47,6 +57,12 @@ class SlotSidecarStore:
         self._worker_id = worker_id
         self._cache_engine_key_type = CacheEngineKey
         self._memory_format = MemoryFormat.KV_2LTD
+        # A failed removal leaves LMCache's duplicate-key guard pointing at
+        # the corrupt object. Keep the key fenced until a later removal
+        # succeeds; otherwise batched_put may be accepted while silently
+        # retaining the old bytes.
+        self._corruption_lock = threading.Lock()
+        self._unresolved_corrupt_keys: set[SlotSidecarKey] = set()
 
     def put(
         self,
@@ -61,6 +77,8 @@ class SlotSidecarStore:
 
         sidecar_key = self._require_key(key)
         payload = self._payload_tensor(blob)
+        if not self._prepare_republication(sidecar_key):
+            return False
         cache_key = self._cache_key(sidecar_key)
         memory_obj = None
 
@@ -129,16 +147,10 @@ class SlotSidecarStore:
 
         result = None
         try:
-            tensor = self._memory_tensor(memory_obj)
-            if not isinstance(tensor, torch.Tensor):
-                raise RuntimeError("LMCache sidecar object did not expose a tensor")
-            if tensor.dtype is not torch.uint8:
-                raise RuntimeError("LMCache sidecar object is not uint8")
-            if tensor.device.type != "cpu":
-                raise RuntimeError("LMCache sidecar object is not on the CPU")
-            if tensor.numel() == 0:
-                raise RuntimeError("LMCache sidecar object is empty")
+            tensor = self._validated_sidecar_tensor(memory_obj)
             result = tensor.reshape(-1).clone()
+        except SlotSidecarCorruptionError:
+            raise
         except Exception as exc:  # noqa: BLE001  # corrupt/storage-owned object
             logger.warning(
                 "LMCache SLOT sidecar decode failed error_type=%s",
@@ -167,19 +179,18 @@ class SlotSidecarStore:
             yield None
             return
 
+        active_exception = False
         try:
-            tensor = self._memory_tensor(memory_obj)
-            if not isinstance(tensor, torch.Tensor):
-                raise RuntimeError("LMCache sidecar object did not expose a tensor")
-            if tensor.dtype is not torch.uint8 or tensor.device.type != "cpu":
-                raise RuntimeError("LMCache sidecar object must be a CPU uint8 tensor")
-            if tensor.numel() == 0 or not tensor.is_contiguous():
-                raise RuntimeError(
-                    "LMCache sidecar object must be nonempty and contiguous"
-                )
+            tensor = self._validated_sidecar_tensor(memory_obj)
             yield tensor.reshape(-1)
+        except BaseException:
+            # Preserve corruption/format errors thrown before or through the
+            # yield so the connector can invalidate them. A release failure is
+            # secondary and must not hide the self-healing signal.
+            active_exception = True
+            raise
         finally:
-            if not self._ref_count_down(memory_obj):
+            if not self._ref_count_down(memory_obj) and not active_exception:
                 raise RuntimeError("LMCache SLOT sidecar release failed")
 
     def contains(self, key: SlotSidecarKey) -> bool:
@@ -191,6 +202,45 @@ class SlotSidecarStore:
 
         cache_key = self._cache_key(self._require_key(key))
         return self._locate(cache_key) is not None
+
+    def invalidate(self, key: SlotSidecarKey) -> bool:
+        """Remove every stored copy so a recompute can republish this key.
+
+        LMCache deliberately skips ``batched_put`` for an existing key. A
+        corrupt sidecar therefore has to be evicted before the scheduler can
+        self-heal it with a freshly computed snapshot.
+        """
+
+        sidecar_key = self._require_key(key)
+        with self._corruption_lock:
+            return self._invalidate_locked(sidecar_key)
+
+    def _prepare_republication(self, key: SlotSidecarKey) -> bool:
+        """Clear a prior corruption fence before accepting replacement bytes."""
+
+        with self._corruption_lock:
+            if key not in self._unresolved_corrupt_keys:
+                return True
+            return self._invalidate_locked(key)
+
+    def _invalidate_locked(self, key: SlotSidecarKey) -> bool:
+        # Fence before calling into the backend so every failure path remains
+        # fail-closed. _corruption_lock serializes this with put's preflight.
+        self._unresolved_corrupt_keys.add(key)
+        cache_key = self._cache_key(key)
+        try:
+            removed = bool(self._storage_manager.remove(cache_key, locations=None))
+        except Exception as exc:  # noqa: BLE001  # third-party storage boundary
+            logger.warning(
+                "LMCache SLOT sidecar invalidation failed error_type=%s",
+                type(exc).__name__,
+            )
+            return False
+        if removed:
+            self._unresolved_corrupt_keys.discard(key)
+            return True
+        logger.warning("LMCache SLOT sidecar invalidation removed no stored copy")
+        return False
 
     def _locate(self, cache_key) -> str | None:
         try:
@@ -258,6 +308,34 @@ class SlotSidecarStore:
             get_tensor = getattr(memory_obj, "get_tensor", None)
             if callable(get_tensor):
                 tensor = get_tensor(0)
+        return tensor
+
+    @classmethod
+    def _validated_sidecar_tensor(cls, memory_obj) -> torch.Tensor:
+        try:
+            tensor = cls._memory_tensor(memory_obj)
+        except Exception as exc:  # noqa: BLE001  # malformed third-party object
+            raise SlotSidecarCorruptionError(
+                "LMCache sidecar object did not expose a readable tensor"
+            ) from exc
+        if not isinstance(tensor, torch.Tensor):
+            raise SlotSidecarCorruptionError(
+                "LMCache sidecar object did not expose a tensor"
+            )
+        if tensor.dtype is not torch.uint8:
+            raise SlotSidecarCorruptionError(
+                "LMCache sidecar object must have dtype torch.uint8"
+            )
+        if tensor.device.type != "cpu":
+            raise SlotSidecarCorruptionError(
+                "LMCache sidecar object must be on the CPU"
+            )
+        if tensor.numel() == 0:
+            raise SlotSidecarCorruptionError("LMCache sidecar object must be nonempty")
+        if not tensor.is_contiguous():
+            raise SlotSidecarCorruptionError(
+                "LMCache sidecar object must be contiguous"
+            )
         return tensor
 
     @staticmethod

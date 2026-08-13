@@ -16,22 +16,64 @@ from __future__ import annotations
 from dataclasses import asdict, is_dataclass
 import hashlib
 import json
+import logging
 from math import isfinite
 from typing import Any
 
-PAGE_LAYOUT_VERSION = 1
+# Version 2 adds explicit DSV4 KV/index dimensions and DCP virtual-block byte
+# mapping to the PAGE identity. Keeping it separate prevents version-1 objects
+# from being reused after the layout correction.
+PAGE_LAYOUT_VERSION = 2
 _PAGE_FINGERPRINT_BYTES = 16
+_OFFLOAD_LAYOUT_ALIASES = {
+    "hybrid": "hybrid",
+    "dense": "dense",
+    # Compatibility with the names used while the layout split was developed.
+    "terminal_unit": "hybrid",
+    "page_slot": "hybrid",
+    "chunked": "dense",
+    "chunked_mla": "dense",
+}
 _HF_PAGE_FIELDS = (
     "num_hidden_layers",
     "num_attention_heads",
     "num_key_value_heads",
     "hidden_size",
     "head_dim",
+    "kv_head_dim",
+    "index_head_dim",
     "kv_lora_rank",
     "qk_rope_head_dim",
     "compress_ratios",
     "indexer_dtype",
 )
+
+logger = logging.getLogger("atom")
+
+
+def select_offload_layout(config) -> str:
+    """Resolve the config-only dense/hybrid layout selection.
+
+    The worker, scheduler, and LMCache key namespace must all use this exact
+    selector. Otherwise an explicit layout override can make two incompatible
+    byte layouts share one storage namespace.
+    """
+
+    kvc = getattr(config, "kv_transfer_config", {}) or {}
+    override = kvc.get("offload_layout")
+    if override is not None:
+        mapped = _OFFLOAD_LAYOUT_ALIASES.get(str(override))
+        if mapped is not None:
+            return mapped
+        logger.warning(
+            "lmcache_offload: unknown offload_layout=%r; falling back to auto",
+            override,
+        )
+
+    hf_config = getattr(config, "hf_config", None)
+    if hf_config is not None and getattr(hf_config, "compress_ratios", None):
+        return "hybrid"
+    return "dense"
 
 
 def _stable_config_value(value: Any) -> Any:
@@ -92,7 +134,7 @@ def build_page_namespace(
         "model": base_model_name,
         "page_mode": (
             "dsv4-page-regions"
-            if getattr(hf, "compress_ratios", None)
+            if select_offload_layout(config) == "hybrid"
             else "dense-opaque-block"
         ),
         "kv_cache_dtype": str(getattr(config, "kv_cache_dtype", "auto")),
@@ -117,7 +159,7 @@ def build_page_namespace(
     digest = hashlib.blake2b(
         canonical,
         digest_size=_PAGE_FINGERPRINT_BYTES,
-        person=b"ATOM-PAGE-CFG-v1",
+        person=b"ATOM-PAGE-CFG-v2",
     ).hexdigest()
     return f"{base_model_name}::atom-page-v{layout_version}-{digest}"
 

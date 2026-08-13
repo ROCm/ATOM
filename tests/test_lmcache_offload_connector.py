@@ -31,15 +31,20 @@ from atom.kv_transfer.disaggregation.types import (
     connector_metadata_has_work,
 )
 from atom.kv_transfer.offload import config as offcfg
-from atom.kv_transfer.offload import connector as connector_module
-from atom.kv_transfer.offload.atom_kv_byte_codec import ATOMKVByteCodec
-from atom.kv_transfer.offload.atom_lmcache_gpu_connector import (
-    ATOMLMCacheGPUConnector,
+from atom.kv_transfer.offload.hybrid import policy as connector_module
+from atom.kv_transfer.offload.dense.kv_byte_codec import (
+    DenseKVByteCodec,
 )
-from atom.kv_transfer.offload.atom_page_region_codec import ATOMPageRegionCodec
-from atom.kv_transfer.offload.connector import (
-    LMCacheOffloadConnector,
-    LMCacheOffloadConnectorScheduler,
+from atom.kv_transfer.offload.dense.gpu_connector import (
+    DenseGPUConnector,
+)
+from atom.kv_transfer.offload.dense.connector import DenseOffloadConnector
+from atom.kv_transfer.offload.hybrid.page_region_codec import ATOMPageRegionCodec
+from atom.kv_transfer.offload.hybrid.connector import (
+    HybridOffloadConnector as LMCacheOffloadConnector,
+    HybridOffloadScheduler as LMCacheOffloadConnectorScheduler,
+)
+from atom.kv_transfer.offload.hybrid.policy import (
     _chained_prefix_hashes,
 )
 from atom.kv_transfer.offload.metadata import (
@@ -232,7 +237,7 @@ def test_committed_sidecar_capacity_rejects_invalid_env(monkeypatch, value):
         connector_module._committed_sidecar_capacity({})
 
 
-def _install_fake_fused_chunk_major(codec: ATOMKVByteCodec) -> None:
+def _install_fake_fused_chunk_major(codec: DenseKVByteCodec) -> None:
     def _pack(
         segments,
         seg_block_bytes,
@@ -283,6 +288,24 @@ def _registration_connector() -> LMCacheOffloadConnector:
         kv_cache_block_size=4,
     )
     connector.block_size = 4
+    connector.chunk_size = None
+    connector._do_save = True
+    connector._do_load = True
+    connector._engine = None
+    connector._codec = None
+    connector._lookup_server = None
+    return connector
+
+
+def _dense_registration_connector() -> DenseOffloadConnector:
+    connector = DenseOffloadConnector.__new__(DenseOffloadConnector)
+    connector._config = SimpleNamespace(
+        kv_transfer_config={},
+        kv_cache_block_size=4,
+        decode_context_parallel_size=1,
+    )
+    connector.block_size = 4
+    connector.virtual_block_size = 4
     connector.chunk_size = None
     connector._do_save = True
     connector._do_load = True
@@ -430,7 +453,7 @@ def test_register_empty_kv_caches_with_page_regions_selects_page_codec(monkeypat
     assert captured["gpu_connector"].codec is connector._codec
 
 
-def test_register_dense_kv_caches_with_regions_selects_legacy_byte_codec(monkeypatch):
+def test_dense_backend_registers_dense_kv_byte_codec(monkeypatch):
     import torch
 
     if not hasattr(torch, "zeros"):
@@ -438,7 +461,7 @@ def test_register_dense_kv_caches_with_regions_selects_legacy_byte_codec(monkeyp
 
     _install_registration_dependencies(monkeypatch)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    connector = _registration_connector()
+    connector = _dense_registration_connector()
     kv_caches = {
         "l0": SimpleNamespace(
             k_cache=torch.zeros((3, 8), dtype=torch.uint8),
@@ -454,7 +477,7 @@ def test_register_dense_kv_caches_with_regions_selects_legacy_byte_codec(monkeyp
         num_blocks=3,
     )
 
-    assert type(connector._codec) is ATOMKVByteCodec
+    assert type(connector._codec) is DenseKVByteCodec
     assert connector._codec.bytes_per_block == 8
 
 
@@ -809,8 +832,8 @@ def test_lmcache_connector_maps_token_ranges_to_block_ids():
             v_scale=None,
         )
     }
-    codec = ATOMKVByteCodec(kv_caches)
-    connector = ATOMLMCacheGPUConnector(codec, block_size=4, chunk_size=8)
+    codec = DenseKVByteCodec(kv_caches)
+    connector = DenseGPUConnector(codec, block_size=4, chunk_size=8)
 
     assert connector._ranges_to_block_ids(
         [4],
@@ -828,6 +851,36 @@ def test_lmcache_connector_maps_token_ranges_to_block_ids():
             [8],
             block_ids=[0, 1, 2, 3, 4, 5],
         )
+
+
+def test_lmcache_connector_maps_dcp_ranges_on_virtual_block_grid():
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    kv_caches = {
+        "l0": SimpleNamespace(
+            k_cache=torch.arange(6 * 2, dtype=torch.uint8).reshape(6, 2),
+            v_cache=torch.arange(6 * 2, dtype=torch.uint8).reshape(6, 2),
+            k_scale=None,
+            v_scale=None,
+        )
+    }
+    codec = DenseKVByteCodec(kv_caches)
+    connector = DenseGPUConnector(
+        codec,
+        block_size=4,
+        virtual_block_size=8,
+        chunk_size=16,
+    )
+
+    assert connector._ranges_to_block_ids(
+        [8],
+        [24],
+        block_ids=[10, 11, 12, 13],
+    ) == [[11, 12]]
+    assert connector.gpu_staging_chunk_bytes == 2 * codec.bytes_per_block
 
 
 def _exception_pipeline(monkeypatch, direction: str, *, failed_stream: str | None):
@@ -885,7 +938,7 @@ def _exception_pipeline(monkeypatch, direction: str, *, failed_stream: str | Non
         gpu_to_chunk_major_device_buffer=_maybe_raise,
         chunk_major_device_buffer_to_gpu=_maybe_raise,
     )
-    connector = ATOMLMCacheGPUConnector(codec, block_size=1, chunk_size=1)
+    connector = DenseGPUConnector(codec, block_size=1, chunk_size=1)
     connector._release_gpu_staging_after_transfer = False
     monkeypatch.setattr(connector, "_assert_fused_chunk_major_available", lambda: None)
     state = _FakeState()
@@ -1022,8 +1075,8 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
             v_scale=None,
         )
     }
-    codec = ATOMKVByteCodec(kv_caches)
-    connector = ATOMLMCacheGPUConnector(codec, block_size=4, chunk_size=8)
+    codec = DenseKVByteCodec(kv_caches)
+    connector = DenseGPUConnector(codec, block_size=4, chunk_size=8)
     _install_fake_fused_chunk_major(codec)
     monkeypatch.setattr(connector, "_assert_fused_chunk_major_available", lambda: None)
 
@@ -1036,7 +1089,7 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
         "gpu_to_chunk_major_device_buffer",
         lambda device_buf, block_id_groups, stream=None: (
             pack_groups.append([list(group) for group in block_id_groups]),
-            ATOMKVByteCodec.gpu_to_chunk_major_device_buffer(
+            DenseKVByteCodec.gpu_to_chunk_major_device_buffer(
                 codec, device_buf, block_id_groups, stream=None
             ),
         )[-1],
@@ -1046,7 +1099,7 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
         "chunk_major_device_buffer_to_gpu",
         lambda device_buf, block_id_groups, stream=None: (
             unpack_groups.append([list(group) for group in block_id_groups]),
-            ATOMKVByteCodec.chunk_major_device_buffer_to_gpu(
+            DenseKVByteCodec.chunk_major_device_buffer_to_gpu(
                 codec, device_buf, block_id_groups, stream=None
             ),
         )[-1],
@@ -1152,8 +1205,8 @@ def test_lmcache_connector_requires_fused_chunk_major_staging():
             v_scale=None,
         )
     }
-    codec = ATOMKVByteCodec(kv_caches)
-    connector = ATOMLMCacheGPUConnector(codec, block_size=4, chunk_size=8)
+    codec = DenseKVByteCodec(kv_caches)
+    connector = DenseGPUConnector(codec, block_size=4, chunk_size=8)
     memory_objs = [
         SimpleNamespace(
             tensor=torch.empty(2 * codec.bytes_per_block, dtype=torch.uint8)
@@ -1183,8 +1236,8 @@ def test_lmcache_connector_rejects_oversized_memory_obj():
             v_scale=None,
         )
     }
-    codec = ATOMKVByteCodec(kv_caches)
-    connector = ATOMLMCacheGPUConnector(codec, block_size=4, chunk_size=4)
+    codec = DenseKVByteCodec(kv_caches)
+    connector = DenseGPUConnector(codec, block_size=4, chunk_size=4)
     memory_obj = SimpleNamespace(
         tensor=torch.empty(2 * codec.bytes_per_block, dtype=torch.uint8)
     )
@@ -1213,8 +1266,8 @@ def test_lmcache_connector_respects_staging_buffer_chunks_env(monkeypatch):
             v_scale=None,
         )
     }
-    codec = ATOMKVByteCodec(kv_caches)
-    connector = ATOMLMCacheGPUConnector(codec, block_size=4, chunk_size=4)
+    codec = DenseKVByteCodec(kv_caches)
+    connector = DenseGPUConnector(codec, block_size=4, chunk_size=4)
 
     assert connector.gpu_staging_buffer_chunks == 3
     assert connector.gpu_staging_buffer_bytes == 3 * connector.gpu_staging_chunk_bytes
@@ -1237,8 +1290,8 @@ def test_lmcache_connector_default_staging_buffer_chunks_is_two(monkeypatch):
             v_scale=None,
         )
     }
-    codec = ATOMKVByteCodec(kv_caches)
-    connector = ATOMLMCacheGPUConnector(codec, block_size=4, chunk_size=4)
+    codec = DenseKVByteCodec(kv_caches)
+    connector = DenseGPUConnector(codec, block_size=4, chunk_size=4)
 
     assert connector.gpu_staging_buffer_chunks == 2
     assert connector.gpu_staging_buffer_bytes == 2 * connector.gpu_staging_chunk_bytes
@@ -1266,7 +1319,7 @@ def test_codec_chunk_major_device_buffer_layout():
             v_scale=None,
         )
     }
-    codec = ATOMKVByteCodec(kv_caches)
+    codec = DenseKVByteCodec(kv_caches)
     _install_fake_fused_chunk_major(codec)
     block_id_groups = [[0, 1], [2, 3]]
     device_buf = torch.empty(
@@ -1324,7 +1377,7 @@ def test_codec_chunk_major_handles_tail_and_sparse_blocks():
         )
         for name, layer in original.items()
     }
-    codec = ATOMKVByteCodec(kv_caches)
+    codec = DenseKVByteCodec(kv_caches)
     _install_fake_fused_chunk_major(codec)
     block_id_groups = [[4, 1, 3], [0]]
     device_buf = torch.empty(
@@ -1364,7 +1417,7 @@ def test_codec_chunk_major_rejects_duplicate_block_ids():
             v_scale=None,
         )
     }
-    codec = ATOMKVByteCodec(kv_caches)
+    codec = DenseKVByteCodec(kv_caches)
     device_buf = torch.empty(3 * codec.bytes_per_block, dtype=torch.uint8)
 
     with pytest.raises(ValueError, match="duplicate block ids"):
@@ -1375,7 +1428,7 @@ def test_scheduler_alignment_uses_dcp_hash_blocks_and_lmcache_chunks(monkeypatch
     monkeypatch.setattr(
         offcfg,
         "build_lmcache_config",
-        lambda _config: SimpleNamespace(chunk_size=12),
+        lambda _config: SimpleNamespace(chunk_size=24),
     )
     config = SimpleNamespace(
         kv_transfer_config={},
@@ -1396,7 +1449,7 @@ def test_scheduler_snaps_checkpoint_interval_before_sidecar_cadence(monkeypatch)
     monkeypatch.setattr(
         offcfg,
         "build_lmcache_config",
-        lambda _config: SimpleNamespace(chunk_size=12),
+        lambda _config: SimpleNamespace(chunk_size=24),
     )
     config = SimpleNamespace(
         kv_transfer_config={},
@@ -1417,7 +1470,7 @@ def test_zero_checkpoint_interval_keeps_terminal_alignment(monkeypatch):
     monkeypatch.setattr(
         offcfg,
         "build_lmcache_config",
-        lambda _config: SimpleNamespace(chunk_size=12),
+        lambda _config: SimpleNamespace(chunk_size=24),
     )
     config = SimpleNamespace(
         kv_transfer_config={},
@@ -1558,6 +1611,80 @@ def test_engine_core_dispatches_idle_lookup_unpin_metadata(monkeypatch):
         ("process_kvconnector_output", meta),
         ("ack", meta),
     ]
+
+
+def test_pp_head_dispatches_idle_offload_work_for_empty_batch(monkeypatch):
+    fake_async_proc = types.ModuleType("atom.model_engine.async_proc")
+    fake_async_proc.AsyncIOProcManager = object
+    monkeypatch.setitem(
+        sys.modules,
+        "atom.model_engine.async_proc",
+        fake_async_proc,
+    )
+    from atom.model_engine.pp_engine_core import PPEngineCoreProc
+
+    events = []
+    empty_batch = SimpleNamespace(req_ids=[])
+    core = PPEngineCoreProc.__new__(PPEngineCoreProc)
+    core.pp_size = 2
+    core._in_flight = deque()
+    core.scheduler = SimpleNamespace(
+        schedule=lambda: (empty_batch, {}),
+        take_rejected=lambda: [],
+    )
+    core.runner_mgr = SimpleNamespace(
+        call_func=lambda name, *args, **kwargs: events.append(("runner", name))
+    )
+    core._dispatch_idle_offload_work = lambda: events.append("idle-dispatch")
+    core._poll_kv_transfer_progress = lambda: events.append("poll")
+
+    core._pp_head_step()
+
+    assert "idle-dispatch" in events
+
+
+def test_pp_head_preserves_one_shot_connector_meta_from_empty_batch(monkeypatch):
+    fake_async_proc = types.ModuleType("atom.model_engine.async_proc")
+    fake_async_proc.AsyncIOProcManager = object
+    monkeypatch.setitem(
+        sys.modules,
+        "atom.model_engine.async_proc",
+        fake_async_proc,
+    )
+    from atom.model_engine.pp_engine_core import PPEngineCoreProc
+
+    meta = LMCacheOffloadMetadata()
+    meta.lookup_requests_in_step = ["one-shot"]
+    empty_batch = SimpleNamespace(req_ids=[], connector_meta_output=meta)
+    events = []
+
+    class _Connector:
+        def connector_meta_dispatched(self, value):
+            events.append(("ack", value))
+
+    core = PPEngineCoreProc.__new__(PPEngineCoreProc)
+    core.pp_size = 2
+    core._in_flight = deque()
+    core.kv_transfer_enabled = True
+    core.scheduler = SimpleNamespace(
+        schedule=lambda: (empty_batch, {}),
+        take_rejected=lambda: [],
+        kv_connector=_Connector(),
+    )
+    core.runner_mgr = SimpleNamespace(
+        call_func=lambda name, *args, **kwargs: events.append(
+            ("runner", name, args[0] if args else None)
+        )
+    )
+    core._advance_idle_kv_transfer = lambda: events.append("rebuilt-idle-meta")
+    core._poll_kv_transfer_progress = lambda: events.append("poll")
+
+    core._pp_head_step()
+
+    assert ("runner", "process_kvconnector_output", meta) in events
+    assert ("ack", meta) in events
+    assert "poll" in events
+    assert "rebuilt-idle-meta" not in events
 
 
 def test_chained_prefix_hashes_match_block_manager_with_dcp_hash_size():
@@ -1849,12 +1976,13 @@ def test_stateful_load_tracks_identity_until_terminal_callback():
     boundary_hash = _commit_sidecar(sched, seq, 8192)
     sched.get_num_new_matched_tokens(seq)
     sched.update_state_after_alloc(seq)
-    sched.build_connector_meta()
+    meta = sched.build_connector_meta()
+    load_operation = meta.requests[0].load_operation
 
     assert sched._active_slot_loads["722"] == (8192, boundary_hash)
 
-    sched.load_finished(seq.id)
-    sched.load_finished(seq.id)
+    assert sched.load_finished(load_operation) is True
+    assert sched.load_finished(load_operation) is False
 
     assert sched._active_slot_loads == {}
     assert boundary_hash in sched._committed_sidecar_hashes
@@ -1870,10 +1998,11 @@ def test_stateful_load_failure_evicts_committed_boundary_idempotently():
     boundary_hash = _commit_sidecar(sched, seq, 8192)
     sched.get_num_new_matched_tokens(seq)
     sched.update_state_after_alloc(seq)
-    sched.build_connector_meta()
+    meta = sched.build_connector_meta()
+    load_operation = meta.requests[0].load_operation
 
-    sched.load_failed(seq.id)
-    sched.load_failed(seq.id)
+    assert sched.load_failed(load_operation) is True
+    assert sched.load_failed(load_operation) is False
 
     assert sched._active_slot_loads == {}
     assert boundary_hash not in sched._committed_sidecar_hashes
@@ -1895,7 +2024,7 @@ def test_sidecar_hashes_are_computed_once_per_sequence_lifecycle(monkeypatch):
         return original(token_ids, hash_block_size)
 
     monkeypatch.setattr(
-        "atom.kv_transfer.offload.connector._chained_prefix_hashes",
+        "atom.kv_transfer.offload.hybrid.connector._chained_prefix_hashes",
         counted,
     )
 
@@ -2141,6 +2270,99 @@ def test_save_callbacks_clear_only_matching_operation_generation():
     sched.save_finished(boundary.save_operation)
     assert sched._save_inflight == {}
     assert sched.should_defer_free(seq) is False
+
+
+def test_raw_callbacks_cannot_retire_exact_active_operations():
+    page_sched = _scheduler()
+    page_seq = SimpleNamespace(
+        id=728,
+        token_ids=list(range(8)),
+        block_table=[1, 2],
+        num_prompt_tokens=8,
+        num_cached_tokens=8,
+        has_per_req_cache=False,
+    )
+    page_sched._save_tracker["728"] = [page_seq, 0]
+    page_request = page_sched.build_connector_meta().requests[0]
+
+    page_sched.save_finished(page_seq.id)
+
+    assert page_sched._save_inflight["728"] == {page_request.save_operation}
+
+    stateful_sched = _stateful_scheduler(hit=0)
+    stateful_seq = _stateful_seq(
+        req_id=729,
+        num_prompt_tokens=8192,
+        num_cached_tokens=8192,
+        group=2,
+    )
+    stateful_sched._save_tracker["729"] = [stateful_seq, 8192]
+    sidecar_request = stateful_sched.build_connector_meta().requests[0]
+    boundary_hash = sidecar_request.slot_save_spec.boundary_block_hash
+
+    stateful_sched.sidecar_save_finished(stateful_seq.id)
+    stateful_sched.sidecar_save_failed(stateful_seq.id)
+
+    assert stateful_sched._sidecar_save_inflight["729"][0] == (
+        sidecar_request.save_operation
+    )
+    assert boundary_hash not in stateful_sched._committed_sidecar_hashes
+    assert stateful_sched._failed_sidecar_saves == {}
+
+    load_operation = LoadOperationId(stateful_seq.id, 99)
+    stateful_sched._active_load_operations["729"] = (
+        stateful_seq,
+        load_operation,
+    )
+    stateful_sched._active_slot_loads["729"] = (8192, boundary_hash)
+    stateful_sched._committed_sidecar_hashes.add(boundary_hash)
+
+    assert stateful_sched.load_finished(stateful_seq.id) is False
+    assert stateful_sched.load_failed(stateful_seq.id) is False
+    assert stateful_sched._active_load_operations["729"] == (
+        stateful_seq,
+        load_operation,
+    )
+    assert stateful_sched._active_slot_loads["729"] == (8192, boundary_hash)
+    assert boundary_hash in stateful_sched._committed_sidecar_hashes
+
+
+def test_raw_callbacks_remain_compatible_with_legacy_operations():
+    sched = _scheduler()
+    seq = SimpleNamespace(
+        id=730,
+        num_prompt_tokens=8,
+        num_cached_tokens=8,
+    )
+    sid = str(seq.id)
+
+    sched._save_inflight[sid] = {seq.id}
+    sched.save_finished(seq.id)
+    assert sid not in sched._save_inflight
+
+    sched._sidecar_save_inflight[sid] = (seq.id, 8, 123)
+    sched.sidecar_save_finished(seq.id)
+    assert sid not in sched._sidecar_save_inflight
+    assert 123 in sched._committed_sidecar_hashes
+
+    sched._sidecar_save_inflight[sid] = (seq.id, 8, 456)
+    sched.sidecar_save_failed(seq.id)
+    assert sid not in sched._sidecar_save_inflight
+    assert sched._failed_sidecar_saves[sid] == {(8, 456)}
+
+    sched._active_slot_loads[sid] = (8, 123)
+    sched._load_save_floors[sid] = 4
+    sched._save_tracker[sid] = [seq, 8]
+    assert sched.load_failed(seq.id) is True
+    assert sid not in sched._active_slot_loads
+    assert 123 not in sched._committed_sidecar_hashes
+    assert sched._save_tracker[sid][1] == 4
+
+    sched._active_slot_loads[sid] = (8, 456)
+    sched._load_save_floors[sid] = 4
+    assert sched.load_finished(seq.id) is True
+    assert sid not in sched._active_slot_loads
+    assert sid not in sched._load_save_floors
 
 
 def test_save_nonce_is_never_reused_after_request_id_cleanup():
@@ -2901,15 +3123,47 @@ def test_sidecar_save_is_not_duplicated_while_inflight_or_after_commit():
     sched._save_tracker["710"] = [seq, 8192]
 
     first = sched.build_connector_meta()
+    save_operation = first.requests[0].save_operation
     boundary_hash = first.requests[0].slot_save_spec.boundary_block_hash
     assert sched.build_connector_meta().requests == []
 
-    sched.save_finished(seq.id)
+    sched.save_finished(save_operation)
     assert sched.build_connector_meta().requests == []
 
-    sched.sidecar_save_finished(seq.id)
+    sched.sidecar_save_finished(save_operation)
     assert boundary_hash in sched._committed_sidecar_hashes
     assert sched.build_connector_meta().requests == []
+
+
+def test_terminal_sidecar_is_emitted_after_earlier_inflight_boundary_completes():
+    sched = _stateful_scheduler(hit=0)
+    seq = _stateful_seq(
+        req_id=720,
+        num_prompt_tokens=16_384,
+        num_cached_tokens=8192,
+        group=2,
+    )
+    sched._save_tracker["720"] = [seq, 8192]
+
+    first = sched.build_connector_meta()
+    first_operation = first.requests[0].save_operation
+    assert first.requests[0].slot_save_spec.boundary_tokens == 8192
+
+    # The request reaches its terminal boundary while B1 is still publishing.
+    seq.num_cached_tokens = 16_384
+    sched.request_finished(seq)
+    assert sched.should_defer_free(seq) is True
+    page_only = sched.build_connector_meta()
+    assert len(page_only.requests) == 1
+    assert page_only.requests[0].slot_save_spec is None
+    sched.save_finished(page_only.requests[0].save_operation)
+
+    sched.sidecar_save_finished(first_operation)
+    assert sched.should_defer_free(seq) is True
+
+    terminal = sched.build_connector_meta()
+    assert len(terminal.requests) == 1
+    assert terminal.requests[0].slot_save_spec.boundary_tokens == 16_384
 
 
 def test_sidecar_save_failure_clears_inflight_without_committing():
@@ -2922,9 +3176,10 @@ def test_sidecar_save_failure_clears_inflight_without_committing():
     )
     sched._save_tracker["715"] = [seq, 8192]
     meta = sched.build_connector_meta()
+    save_operation = meta.requests[0].save_operation
     boundary_hash = meta.requests[0].slot_save_spec.boundary_block_hash
 
-    sched.sidecar_save_failed(seq.id)
+    sched.sidecar_save_failed(save_operation)
 
     assert "715" not in sched._sidecar_save_inflight
     assert boundary_hash not in sched._committed_sidecar_hashes
@@ -2940,11 +3195,12 @@ def test_failed_terminal_sidecar_does_not_pin_or_retry_finished_request():
     )
     sched._save_tracker["719"] = [seq, 8192]
     meta = sched.build_connector_meta()
+    save_operation = meta.requests[0].save_operation
     boundary_hash = meta.requests[0].slot_save_spec.boundary_block_hash
 
     sched.request_finished(seq)
-    sched.sidecar_save_failed(seq.id)
-    sched.save_finished(seq.id)
+    sched.sidecar_save_failed(save_operation)
+    sched.save_finished(save_operation)
 
     assert boundary_hash not in sched._committed_sidecar_hashes
     assert sched.should_defer_free(seq) is False
@@ -3012,17 +3268,18 @@ def test_request_finish_retains_tracker_for_pending_and_inflight_sidecar():
     assert sched.should_defer_free(seq) is True
 
     meta = sched.build_connector_meta()
+    save_operation = meta.requests[0].save_operation
     boundary_hash = meta.requests[0].slot_save_spec.boundary_block_hash
     assert "717" not in sched._save_inflight
     sched.request_finished(seq)
     assert "717" in sched._save_tracker
     assert sched.should_defer_free(seq) is True
 
-    sched.sidecar_save_finished(seq.id)
+    sched.sidecar_save_finished(save_operation)
     assert boundary_hash in sched._committed_sidecar_hashes
     assert sched.should_defer_free(seq) is False
 
-    sched.save_finished(seq.id)
+    sched.save_finished(save_operation)
     sched.request_finished(seq)
     assert sched.should_defer_free(seq) is False
     assert "717" not in sched._save_tracker
@@ -3046,10 +3303,11 @@ def test_request_finish_retains_tracker_for_pending_page_save():
 
     meta = sched.build_connector_meta()
     assert meta.requests[0].save_spec is not None
+    save_operation = meta.requests[0].save_operation
     sched.request_finished(seq)
     assert "718" in sched._save_tracker
 
-    sched.save_finished(seq.id)
+    sched.save_finished(save_operation)
     sched.request_finished(seq)
     assert sched.should_defer_free(seq) is False
     assert "718" not in sched._save_tracker
@@ -3089,6 +3347,33 @@ def test_prefill_chunk_does_not_recut_committed_or_inflight_boundary():
         boundary_hash,
     )
     assert sched.adjust_prefill_chunk_after_alloc(seq, 8192) == 8192
+    assert sched.should_pause_partial_prefill_for_save(seq) is True
+
+
+def test_partial_prefill_resumes_and_captures_next_boundary_after_inflight_commit():
+    sched = _stateful_scheduler(hit=0)
+    seq = _stateful_seq(
+        req_id=731,
+        num_prompt_tokens=24_576,
+        num_cached_tokens=8192,
+        group=2,
+    )
+    sched._save_tracker["731"] = [seq, 8192]
+
+    first = sched.build_connector_meta().requests[0]
+    assert first.slot_save_spec.boundary_tokens == 8192
+
+    # The next forward may already have reached B2 when B1 starts publishing,
+    # but no later forward may mutate the SLOT until B1 retires.
+    seq.num_cached_tokens = 16_384
+    assert sched.should_pause_partial_prefill_for_save(seq) is True
+    assert sched._sidecar_save_candidate(seq, 16_384) is None
+
+    sched.sidecar_save_finished(first.save_operation)
+
+    assert sched.should_pause_partial_prefill_for_save(seq) is False
+    second = sched.build_connector_meta().requests[0]
+    assert second.slot_save_spec.boundary_tokens == 16_384
 
 
 def test_sidecar_chunk_cut_preserves_earlier_load_handoff_cap():
@@ -3200,7 +3485,7 @@ def test_lookup_time_hbm_satisfies_can_resave_locally_computed_prefix():
     assert sched._save_tracker[str(seq.id)][1] == 8
     assert lookup.cleared == ["322"]
 
-    sched.save_finished(seq.id)
+    sched.save_finished(meta1.requests[0].save_operation)
     seq.num_cached_tokens = 12
     meta2 = sched.build_connector_meta()
     save_reqs = [req for req in meta2.requests if req.save_spec is not None]
@@ -3398,10 +3683,11 @@ def test_load_failure_allows_recomputed_hit_range_to_be_saved():
     seq.num_cached_tokens = 4
     sched.update_state_after_alloc(seq)
     assert sched.should_park_for_load_after_alloc(seq) is True
-    sched.build_connector_meta()
+    load_meta = sched.build_connector_meta()
+    load_operation = load_meta.requests[0].load_operation
     assert sched._save_tracker[str(seq.id)][1] == 12
 
-    sched.load_failed(seq.id)
+    sched.load_failed(load_operation)
     assert sched._save_tracker[str(seq.id)][1] == 4
 
     seq.num_cached_tokens = 12
@@ -3752,7 +4038,7 @@ def test_save_inflight_defers_free_until_save_finishes():
     assert meta.requests[0].save_spec is not None
     assert sched.should_defer_free(seq) is True
 
-    sched.save_finished(seq.id)
+    sched.save_finished(meta.requests[0].save_operation)
 
     assert sched.should_defer_free(seq) is False
 
@@ -3782,7 +4068,7 @@ def test_chunked_prefill_save_uses_computed_frontier_and_serializes_inflight():
     meta2 = sched.build_connector_meta()
     assert len(meta2.requests) == 0
 
-    sched.save_finished(seq.id)
+    sched.save_finished(meta1.requests[0].save_operation)
     meta3 = sched.build_connector_meta()
 
     assert len(meta3.requests) == 1
@@ -3900,7 +4186,7 @@ def test_finished_recv_matches_string_req_id():
 # from it (segment_bytes / num_blocks) rather than assuming dim 0 == blocks.
 
 
-def _install_byte_addressing_fused(codec: ATOMKVByteCodec) -> None:
+def _install_byte_addressing_fused(codec: DenseKVByteCodec) -> None:
     """Mock fused staging that addresses each physical block as a raw byte
     slice — block ``b`` maps to bytes ``[b*nbytes : (b+1)*nbytes]`` of the
     flattened segment, exactly like the Triton kernel. Unlike the block-major
@@ -3964,7 +4250,7 @@ def test_codec_mla_token_major_block_accounting():
             v_scale=None,
         )
     }
-    codec = ATOMKVByteCodec(kv_caches, num_blocks=num_blocks)
+    codec = DenseKVByteCodec(kv_caches, num_blocks=num_blocks)
 
     # Block count comes from the explicit arg, not tensor.shape[0] (= tokens).
     assert codec.num_blocks == num_blocks
@@ -3974,7 +4260,7 @@ def test_codec_mla_token_major_block_accounting():
     # Regression: passing the page-size-1 physical row count instead of the
     # scheduler block count shrinks each transfer block by block_size. The
     # connector compares this against its existing transfer-region metadata.
-    wrong_codec = ATOMKVByteCodec(kv_caches, num_blocks=num_blocks * block_size)
+    wrong_codec = DenseKVByteCodec(kv_caches, num_blocks=num_blocks * block_size)
     conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
     conn._codec = wrong_codec
     with pytest.raises(ValueError, match="KV block geometry mismatch"):
@@ -3986,7 +4272,7 @@ def test_codec_mla_token_major_block_accounting():
 
     # A segment whose element count is not divisible by num_blocks is rejected.
     with pytest.raises(ValueError):
-        ATOMKVByteCodec(
+        DenseKVByteCodec(
             {
                 "l0": SimpleNamespace(
                     k_cache=torch.arange(7, dtype=torch.uint8),
@@ -4015,7 +4301,7 @@ def test_codec_mla_round_trip_byte_identical():
             k_cache=original.clone(), v_cache=None, k_scale=None, v_scale=None
         )
     }
-    codec = ATOMKVByteCodec(kv_caches, num_blocks=num_blocks)
+    codec = DenseKVByteCodec(kv_caches, num_blocks=num_blocks)
     _install_byte_addressing_fused(codec)
 
     block_id_groups = [[0, 1], [2, 3]]
@@ -4058,7 +4344,7 @@ def test_codec_dsa_includes_index_cache_segment():
             index_cache=index_cache.clone(),
         )
     }
-    codec = ATOMKVByteCodec(kv_caches, num_blocks=num_blocks)
+    codec = DenseKVByteCodec(kv_caches, num_blocks=num_blocks)
     mla_only = block_size * latent
     index_only = block_size * index_dim
     assert codec.bytes_per_block == mla_only + index_only
@@ -4074,7 +4360,7 @@ def test_codec_dsa_includes_index_cache_segment():
 
     k_flat = k_cache.view(torch.uint8).reshape(num_blocks, -1)
     idx_flat = index_cache.reshape(num_blocks, -1)
-    # Staging is segment-major within a chunk (see ATOMKVByteCodec docstring and
+    # Staging is segment-major within a chunk (see DenseKVByteCodec docstring and
     # the Triton kernel's ``segment_prefix_bytes[seg] * nblocks`` base): within
     # each chunk it is all K blocks, then all index blocks.
     expected = torch.cat(
@@ -4153,7 +4439,7 @@ def test_codec_dsa_fp8_multilayer_including_mtp_round_trip():
         )
         for name, (k, idx) in layers.items()
     }
-    codec = ATOMKVByteCodec(kv_caches, num_blocks=num_blocks)
+    codec = DenseKVByteCodec(kv_caches, num_blocks=num_blocks)
 
     per_block = block_size * latent + block_size * aligned_index_dim
     assert codec.bytes_per_block == len(layers) * per_block

@@ -23,10 +23,14 @@ from atom.kv_transfer.disaggregation.types import (
     SaveOperationId,
     KVTransferRegion,
 )
-from atom.kv_transfer.offload import connector as connector_module
-from atom.kv_transfer.offload.connector import (
-    LMCacheOffloadConnector,
+from atom.kv_transfer.offload.hybrid import connector as connector_module
+from atom.kv_transfer.offload.hybrid.connector import (
+    HybridOffloadConnector as LMCacheOffloadConnector,
+)
+from atom.kv_transfer.offload.hybrid.policy import (
     _compute_slot_fingerprint,
+)
+from atom.kv_transfer.offload.hybrid.connector import (
     _env_nonnegative_float,
     _env_positive_float,
     _wait_for_publication,
@@ -39,7 +43,7 @@ from atom.kv_transfer.offload.metadata import (
     SlotLoadSpec,
     SlotSaveSpec,
 )
-from atom.kv_transfer.offload.slot_sidecar_format import (
+from atom.kv_transfer.offload.hybrid.sidecar_format import (
     HEADER_BYTES,
     SidecarFormatError,
     SlotSidecarHeader,
@@ -47,6 +51,7 @@ from atom.kv_transfer.offload.slot_sidecar_format import (
     decode_sidecar,
     encode_sidecar,
 )
+from atom.kv_transfer.offload.hybrid.store import SlotSidecarCorruptionError
 
 _FINGERPRINT = bytes.fromhex("00112233445566778899aabbccddeeff")
 _PAYLOAD = b"\x07\x08\x09\xff"
@@ -277,9 +282,12 @@ class _FakeStore:
         self.contains_result = True
         self.contains_results: list[bool] = []
         self.contains_error: Exception | None = None
+        self.invalidate_result = True
+        self.invalidate_results: list[bool] = []
         self.put_calls = []
         self.get_calls = []
         self.contains_calls = []
+        self.invalidate_calls = []
 
     def put(self, key, blob) -> bool:
         self.order.append("put")
@@ -312,6 +320,13 @@ class _FakeStore:
         if self.contains_results:
             return self.contains_results.pop(0)
         return self.contains_result
+
+    def invalidate(self, key) -> bool:
+        self.order.append("invalidate")
+        self.invalidate_calls.append(key)
+        if self.invalidate_results:
+            return self.invalidate_results.pop(0)
+        return self.invalidate_result
 
 
 class _InlineExecutor:
@@ -429,6 +444,7 @@ def _worker(
         capacity=staging_slots,
     )
     connector._slot_fingerprint = _FINGERPRINT
+    connector._unresolved_slot_corruption = set()
     connector._rank = 1
     connector._tp_size = 2
     connector.chunk_size = 4
@@ -625,6 +641,8 @@ def test_slot_fingerprint_is_stable_and_covers_required_geometry():
         kv_dtype="fp8",
         compress_ratios=[4, 128, 0],
         block_size=64,
+        kv_head_dim=512,
+        index_head_dim=128,
         num_slots=4,
         slot_regions=regions,
         tp_size=2,
@@ -649,6 +667,8 @@ def test_slot_fingerprint_is_stable_and_covers_required_geometry():
         {**kwargs, "kv_dtype": "bf16"},
         {**kwargs, "compress_ratios": [4, 64, 0]},
         {**kwargs, "block_size": 32},
+        {**kwargs, "kv_head_dim": 576},
+        {**kwargs, "index_head_dim": 160},
         {**kwargs, "num_slots": 3},
         {**kwargs, "tp_size": 4},
         {**kwargs, "tp_rank": 0},
@@ -728,6 +748,7 @@ def test_stateful_page_initialization_builds_all_slot_components_after_engine(
         hf_config=SimpleNamespace(compress_ratios=[4, 128, 0]),
     )
     connector.block_size = 64
+    connector.profile = SimpleNamespace(kv_head_dim=512, index_head_dim=128)
     connector._engine = object()
     connector._codec = SimpleNamespace(bytes_per_block=96)
     connector._slot_codec = None
@@ -767,6 +788,8 @@ def test_stateful_page_initialization_builds_all_slot_components_after_engine(
         kv_dtype="fp8",
         compress_ratios=[4, 128, 0],
         block_size=64,
+        kv_head_dim=512,
+        index_head_dim=128,
         num_slots=4,
         slot_regions=regions,
         tp_size=2,
@@ -1399,8 +1422,7 @@ def test_connector_init_rejects_nonfinite_config_before_starting_executors(
         raise AssertionError("executor started before config validation")
 
     monkeypatch.setattr(
-        connector_module,
-        "ThreadPoolExecutor",
+        "atom.kv_transfer.offload._offload_common.ThreadPoolExecutor",
         _unexpected_executor,
     )
     config = SimpleNamespace(
@@ -2061,6 +2083,7 @@ def test_missing_or_corrupt_sidecar_fails_whole_load_and_unpins_once(blob, caplo
     assert connector._failed_load == {23}
     assert connector._engine.unpinned == ["23"]
     assert connector._slot_admission.released == [0]
+    assert len(connector._slot_store.invalidate_calls) == (0 if blob is None else 1)
     terminal_logs = [
         record.message
         for record in caplog.records
@@ -2071,6 +2094,62 @@ def test_missing_or_corrupt_sidecar_fails_whole_load_and_unpins_once(blob, caplo
     rendered_logs = "\n".join(record.message for record in caplog.records)
     assert _PAYLOAD.hex() not in rendered_logs
     assert str(list(range(8))) not in rendered_logs
+
+
+def test_malformed_storage_object_is_invalidated_like_corrupt_aos1():
+    order = []
+    connector = _worker(order)
+
+    @contextmanager
+    def _malformed_borrow(key):
+        connector._slot_store.get_calls.append(key)
+        try:
+            raise SlotSidecarCorruptionError(
+                "LMCache sidecar object did not expose a tensor"
+            )
+            yield None
+        finally:
+            order.append("store-release")
+
+    connector._slot_store.borrow = _malformed_borrow
+
+    connector.start_load_kv(_metadata(_load_request()))
+
+    assert connector._done_load == set()
+    assert connector._failed_load == {23}
+    assert connector._engine.unpinned == ["23"]
+    assert connector._slot_store.invalidate_calls == [
+        SlotSidecarKey(0x1234, _FINGERPRINT, 2, 1)
+    ]
+    assert connector._slot_admission.released == [0]
+
+
+@pytest.mark.parametrize("retry_succeeds", [False, True])
+def test_failed_corruption_invalidation_cannot_fake_later_commit(
+    monkeypatch,
+    retry_succeeds,
+):
+    order = []
+    _patch_rpc_cuda(monkeypatch, order)
+    connector = _worker(order)
+    connector._slot_store.get_result = _crc_corrupt_sidecar_blob()
+    connector._slot_store.invalidate_results = [False, retry_succeeds]
+
+    connector.start_load_kv(_metadata(_load_request()))
+    connector.start_load_kv(_metadata(_save_request()))
+
+    key = SlotSidecarKey(0x1234, _FINGERPRINT, 2, 1)
+    assert connector._slot_store.invalidate_calls == [key, key]
+    if retry_succeeds:
+        assert len(connector._slot_store.put_calls) == 1
+        assert connector._done_sidecar_save == {17}
+        assert connector._failed_sidecar_save == set()
+        assert connector._unresolved_slot_corruption == set()
+    else:
+        assert connector._slot_store.put_calls == []
+        assert connector._done_sidecar_save == set()
+        assert connector._failed_sidecar_save == {17}
+        assert connector._unresolved_slot_corruption == {key}
 
 
 def test_load_staging_exhaustion_has_one_terminal_sidecar_log(monkeypatch, caplog):

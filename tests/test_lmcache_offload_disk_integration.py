@@ -30,13 +30,13 @@ pytestmark = pytest.mark.skipif(
 )
 
 from atom.kv_transfer.offload.metadata import ATOMRawBytesLMCacheMetadata
-from atom.kv_transfer.offload.slot_sidecar_format import (
+from atom.kv_transfer.offload.hybrid.sidecar_format import (
     SlotSidecarHeader,
     SlotSidecarKey,
     decode_sidecar,
     encode_sidecar,
 )
-from atom.kv_transfer.offload.slot_sidecar_store import SlotSidecarStore
+from atom.kv_transfer.offload.hybrid.store import SlotSidecarStore
 
 _FINGERPRINT = bytes.fromhex("00112233445566778899aabbccddeeff")
 

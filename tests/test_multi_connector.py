@@ -21,6 +21,7 @@ from atom.kv_transfer.disaggregation.types import (
     KVConnectorOutput,
     LoadOperationId,
     SaveOperationId,
+    SendOperationId,
 )
 from atom.kv_transfer.disaggregation.multi.multi_connector import (
     MultiConnector,
@@ -502,6 +503,7 @@ def test_offload_methods_forwarded_to_owning_sub():
     off = FakeSchedSub(match=(5, True), is_offload=True, offload_methods=True)
     off.park = True
     off.partial_park = True
+    off.should_pause_partial_prefill_for_save = lambda _seq: True
     off.defer = True
     off.chunk_ret = 7
     sched = _sched([moriio, off])
@@ -509,6 +511,7 @@ def test_offload_methods_forwarded_to_owning_sub():
     assert sched.get_num_new_matched_tokens(seq) == (5, True)
     assert sched.should_park_for_load_after_alloc(seq) is True
     assert sched.should_park_partial_prefill_for_load(seq) is True
+    assert sched.should_pause_partial_prefill_for_save(seq) is True
     assert sched.should_defer_free(seq) is True
     assert sched.adjust_prefill_chunk_after_alloc(seq, 10) == 7
     sched.save_finished("r1")
@@ -530,6 +533,7 @@ def test_offload_methods_default_when_no_sub_implements():
     seq = object()
     assert sched.should_park_for_load_after_alloc(seq) is False
     assert sched.should_park_partial_prefill_for_load(seq) is False
+    assert sched.should_pause_partial_prefill_for_save(seq) is False
     assert sched.should_defer_free(seq) is False
     assert sched.adjust_prefill_chunk_after_alloc(seq, 10) == 10  # unchanged
 
@@ -736,6 +740,29 @@ def test_generation_saves_pair_send_only_after_every_exact_operation():
     assert terminal.finished_sending == {9}
     assert terminal.finished_saving == {gen1}
     assert terminal.failed_sidecar_saving == {gen1}
+
+
+def test_exact_send_generation_survives_multi_save_pairing():
+    save = SaveOperationId(9, 8)
+    send = SendOperationId(9, 4)
+    moriio = FakeWorkerSub(is_producer=True)
+    offload = FakeWorkerSub()
+    worker = _worker([moriio, offload])
+    worker.start_load_kv(
+        MultiConnectorMetadata(
+            [ConnectorMetadata(), _operation_save_meta(save, page=True)]
+        )
+    )
+
+    moriio._finished = KVConnectorOutput(finished_sending={send})
+    assert worker.get_finished().finished_sending == set()
+
+    moriio._finished = KVConnectorOutput()
+    offload._finished = KVConnectorOutput(finished_saving={save})
+    terminal = worker.get_finished()
+
+    assert terminal.finished_sending == {send}
+    assert terminal.finished_saving == {save}
 
 
 def test_two_saving_connectors_complete_one_outer_operation_only_together():

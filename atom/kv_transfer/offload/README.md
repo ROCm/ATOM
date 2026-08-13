@@ -12,6 +12,11 @@ opaque KV blocks. Stateful DeepSeek V4 (DSV4) uses a stricter pair:
 A DSV4 boundary is reusable only when both PAGE and SLOT restore successfully.
 Missing, incompatible, or corrupt sidecar data fails closed to recomputation.
 
+The public configuration remains `kv_connector: "lmcache_offload"`. The thin
+top-level shell selects `hybrid` when `hf_config.compress_ratios` is present and
+`dense` otherwise; `kv_transfer_config.offload_layout` can override that choice
+without giving scheduler and worker different connector names.
+
 It is the **ATOM-native, in-engine** offload path: the connector plugs straight
 into ATOM's scheduler/worker via the shared
 [`KVConnectorFactory`](../disaggregation/factory.py), with no vLLM in the loop.
@@ -31,7 +36,7 @@ Four rules carry the module:
 1. **LMCache owns token chunking and storage; ATOM owns GPU byte layout.**
    PAGE traffic uses `LMCacheEngine.store()` / `retrieve()`, preserving
    LMCache's `LMCACHE_CHUNK_SIZE` cadence, token-derived keys, lookup pins,
-   CPU/NVMe backends, and eviction. Dense MHA/MLA uses `ATOMKVByteCodec`; DSV4
+   CPU/NVMe backends, and eviction. Dense MHA/MLA uses `DenseKVByteCodec`; DSV4
    selects `ATOMPageRegionCodec` and packs each physical block in page-major
    order: `block0.region0 || block0.region1 || ... || block1.region0 || ...`.
 
@@ -56,18 +61,26 @@ Four rules carry the module:
 | File | Role |
 |------|------|
 | `__init__.py` | Registers the `lmcache_offload` backend with `KVConnectorFactory`. |
-| `connector.py` | The two halves: `LMCacheOffloadConnectorScheduler` (EngineCore process) and `LMCacheOffloadConnector` (worker). The core orchestration. |
+| `connector.py` | Public config-only `dense`/`hybrid` selector and thin worker/scheduler delegation shells. |
+| `_offload_common.py` | Shared LMCache engine construction, role validation, executors, and completion plumbing. |
+| `_block_gpu_connector.py` | Family-neutral raw-block LMCache `GPUConnectorInterface`; DCP-aware bounded staging and two-stage copies. |
+| `copy_plan.py` | Family-neutral contiguous copy-plan and Triton tile descriptors. |
 | `config.py` | Builds the per-rank `LMCacheEngineConfig` + `LMCacheMetadata` from `LMCACHE_*` env and `kv_transfer_config` extras. |
 | `metadata.py` | Opaque PAGE allocation metadata plus PAGE/SLOT request descriptors and exact save-generation IDs. |
-| `atom_kv_byte_codec.py` | `ATOMKVByteCodec`: maps a token range → AITER KV blocks and packs/unpacks them as raw bytes. The layout-bridging core. |
-| `atom_page_region_codec.py` | `ATOMPageRegionCodec`: gathers/scatters DSV4 `block_regions` in block-then-region (page-major) order. |
-| `atom_lmcache_gpu_connector.py` | `ATOMLMCacheGPUConnector`: LMCache `GPUConnectorInterface` impl. Bounded GPU staging + two-stage (pack ↔ copy) pipeline. |
+| `dense/connector.py` | Dense MHA/MLA worker and scheduler implementations. |
+| `dense/kv_byte_codec.py` | `DenseKVByteCodec`: maps a token range → AITER KV blocks and packs/unpacks them as raw bytes. The layout-bridging core. |
+| `dense/gpu_connector.py` | Dense-family facade over the shared raw-block GPU adapter. |
+| `hybrid/connector.py` | DSV4 PAGE+SLOT worker and scheduler implementations. |
+| `hybrid/gpu_connector.py` | Hybrid-family facade over the shared raw-block GPU adapter. |
+| `hybrid/profiles/{base,dsv4}.py` | Config-only DSV4 physical/virtual block geometry, dimensions, and save cadence. |
+| `hybrid/policy.py` | Prefix hashes, layout fingerprint, and bounded committed-sidecar index. |
+| `hybrid/page_region_codec.py` | `ATOMPageRegionCodec`: gathers/scatters DSV4 `block_regions` in block-then-region (page-major) order. |
 | `atom_lmcache_staging.py` | Per-thread CUDA streams, staging buffer, ready/free events, env helpers. |
 | `triton_kv_staging.py` | Triton fused chunk-major pack/unpack kernels (the fast staging path). |
-| `slot_sidecar_codec.py` | Full-SLOT gather/scatter and dedicated GPU staging rows. |
-| `slot_sidecar_format.py` | Deterministic SLOT key plus fixed 128-byte AOS1 header, validation, and CRC32. |
-| `slot_sidecar_store.py` | Opaque sidecar put/get/contains through the engine's configured LMCache `StorageManager`. |
-| `slot_sidecar_admission.py` | Nonblocking ownership of bounded SLOT staging rows. |
+| `hybrid/slot_codec.py` | Full-SLOT gather/scatter and dedicated GPU staging rows. |
+| `hybrid/sidecar_format.py` | Deterministic SLOT key plus fixed 128-byte AOS1 header, validation, and CRC32. |
+| `hybrid/store.py` | Opaque sidecar put/get/contains/invalidate through the engine's configured LMCache `StorageManager`. |
+| `hybrid/admission.py` | Nonblocking ownership of bounded SLOT staging rows. |
 
 ## Architecture
 
@@ -87,7 +100,7 @@ flowchart LR
         direction TB
         LK["LookupServer<br/>(rank 0 authoritative)"]
         SL["start_load_kv() — enqueue only<br/>load_executor (1) · save_executor (N)"]
-        CE["CacheEngine.retrieve() / .store()<br/>ATOMLMCacheGPUConnector + ATOMKVByteCodec"]
+        CE["CacheEngine.retrieve() / .store()<br/>DenseGPUConnector + DenseKVByteCodec"]
         SL --> CE
     end
 
@@ -225,7 +238,7 @@ touches GPU memory.
 
 Runs in each TP-rank worker. It does the actual byte movement.
 
-- **`register_kv_caches`** — builds `ATOMKVByteCodec` for dense KV or
+- **`register_kv_caches`** — builds `DenseKVByteCodec` for dense KV or
   `ATOMPageRegionCodec` for DSV4 PAGE regions, then creates the LMCache engine
   and (on rank 0) the `LookupServer`. Stateful PAGE registration also requires
   complete SLOT geometry and creates its codec, store, admission pool, and
@@ -257,7 +270,7 @@ Following one request end to end ties the pieces together:
    `start_load_kv` submits the load to the load daemon and returns — the RPC
    thread stays free to run `forward`.
 4. **Move.** The daemon runs `engine.retrieve`, which drives
-   `ATOMLMCacheGPUConnector`: MemoryObj → staging buffer → HBM blocks (Triton
+   `DenseGPUConnector`: MemoryObj → staging buffer → HBM blocks (Triton
    unpack), bit-identical.
 5. **Wake.** Post-forward, `get_finished` returns `finished_loading` (success) or
    `failed_loading` (recompute). The scheduler wakes the seq, which prefills only
@@ -313,7 +326,7 @@ flowchart LR
     A["seq.num_cached_tokens<br/>advances"] --> B["scheduler:<br/>SaveSpec(skip_leading_tokens)<br/>new chunk-aligned tokens only"]
     B --> C["worker _do_save_req:<br/>engine.store(tokens, mask, block_ids)"]
     C --> D["batched_from_gpu"]
-    subgraph PIPE_S["ATOMLMCacheGPUConnector (2-stage)"]
+    subgraph PIPE_S["DenseGPUConnector (2-stage)"]
         direction LR
         D --> E["stage A — Triton pack<br/>HBM blocks → uint8 staging buf"]
         E --> F["stage B — copy<br/>staging buf → MemoryObj"]
@@ -328,7 +341,7 @@ flowchart LR
     A["lookup hit &gt; HBM<br/>seq parked WAITING_FOR_REMOTE_KVS<br/>blocks allocated"] --> B["scheduler:<br/>LoadSpec(hbm_cached, lmcache_cached)"]
     B --> C["worker _do_load_req:<br/>engine.retrieve(tokens, mask=skip HBM, block_ids)"]
     C --> D["batched_to_gpu"]
-    subgraph PIPE_L["ATOMLMCacheGPUConnector (2-stage)"]
+    subgraph PIPE_L["DenseGPUConnector (2-stage)"]
         direction LR
         S[("CPU DRAM / NVMe")] --> E["stage A — copy<br/>MemoryObj → uint8 staging buf"]
         E --> F["stage B — Triton unpack<br/>staging buf → HBM blocks"]
@@ -484,7 +497,10 @@ PAGE and SLOT have intentionally different cadences:
 
 The scheduler caps a prefill step at a pending SLOT boundary so the snapshot is
 of exactly that completion frontier. Boundaries at zero, beyond fully computed
-tokens, or without a valid request group are not emitted.
+tokens, or without a valid request group are not emitted. If boundary B is
+still publishing when the forward reaches B+1, that partial prefill pauses; an
+empty metadata step keeps polling B, then snapshots B+1 before any later
+forward can mutate the request SLOT.
 
 ## Correctness, fp8 & Failure Handling
 
@@ -502,16 +518,16 @@ what lets us bypass LMCache's layout assumptions entirely. The round-trip
 ### fp8 KV and per-block scales
 
 Under `--kv_cache_dtype fp8`, each KV block carries its own `k_scale` / `v_scale`.
-`ATOMKVByteCodec` enumerates **four** segments per layer when present — `k_cache`,
+`DenseKVByteCodec` enumerates **four** segments per layer when present — `k_cache`,
 `v_cache`, `k_scale`, `v_scale` — and moves them all as part of one block's bytes
-(`atom_kv_byte_codec.py`). The scales travel with the quantized data, so a
+(`dense/kv_byte_codec.py`). The scales travel with the quantized data, so a
 reloaded fp8 block dequantizes identically; no scale is recomputed or dropped.
 
 ### Invariants enforced in code
 
 | Invariant | Where | Why |
 |-----------|-------|-----|
-| `chunk_size % block_size == 0` | `metadata.py`, `atom_lmcache_gpu_connector.py` ctor | An LMCache chunk must map to a whole number of ATOM blocks, or a chunk would straddle a block boundary. |
+| `chunk_size % virtual_block_size == 0` | `metadata.py`, `_block_gpu_connector.py`, DSV4 profile | Under DCP one scheduler block ID covers `physical_block_size × dcp_size` global tokens; an LMCache chunk must contain whole virtual blocks. |
 | Never load below the HBM floor | scheduler `_decide_load_after_alloc` | Loading under `num_cached_tokens` overwrites prefix-cache blocks shared with other seqs → corruption. |
 | Stateful DSV4 load requires HBM floor 0 (v1) | scheduler `_decide_load_after_alloc` | One later SLOT cannot safely be combined with PAGE/state already resident at an earlier partial boundary. |
 | Load is all-or-nothing per shard | worker `_do_load_req` | A half-loaded prefix is worse than none; a missing shard fails the whole load → recompute. |
@@ -534,7 +550,9 @@ corrupt write:
   stored again rather than being treated as already-persisted.
 - **PAGE present, SLOT absent/corrupt/incompatible** — stateful load reports
   `failed_loading`; the PAGE prefix is not published. Missing AOS1, CRC failure,
-  fingerprint/TP/boundary/size mismatch all take the same recompute path.
+  fingerprint/TP/boundary/size mismatch and malformed storage objects all take
+  the same recompute path. Corrupt keys are invalidated before replacement; if
+  removal fails, the key stays fenced and cannot be falsely re-committed.
 - **SLOT save staging exhausted** — PAGE saving proceeds, but
   `failed_sidecar_saving` prevents boundary commit. Admission never blocks the
   RPC thread waiting for a row.
@@ -567,7 +585,7 @@ corrupt write:
 **byte-movement stack** — the part that makes ATOM's KV layout work with LMCache —
 and the two support files.
 
-### `atom_kv_byte_codec.py` — dense MHA/MLA layout bridge
+### `dense/kv_byte_codec.py` — dense MHA/MLA layout bridge
 
 This is the dense-path bridge. DSV4 does not synthesize this segment list; it
 uses the explicit PAGE regions in the next section.
@@ -646,7 +664,7 @@ rejects duplicate blocks, and requires a `uint8` device buffer. Both directions
 **require** the Triton fused staging kernel — there is no slow Python fallback on
 the production path.
 
-### `atom_page_region_codec.py` — DSV4 page-major PAGE bridge
+### `hybrid/page_region_codec.py` — DSV4 page-major PAGE bridge
 
 DSV4 already exposes each movable compressed-KV plane through
 `block_regions`. The codec snapshots their immutable address geometry and
@@ -655,23 +673,23 @@ validates that every region is forward indexed, large enough for
 physical-block order, with region order nested inside each block. There is no
 segment-major fallback and no value conversion.
 
-The same two `ATOMLMCacheGPUConnector` entry points gather and scatter these
-plans, so DSV4 PAGE retains standard LMCache incremental `store/retrieve`
-orchestration. PAGE explicitly excludes compressor state, SWA, DSpark windows,
-and state-pool ownership.
+The same two shared `BlockGPUConnector` entry points, exposed to this family as
+`HybridGPUConnector`, gather and scatter these plans. DSV4 PAGE therefore keeps
+standard LMCache incremental `store/retrieve` orchestration. PAGE explicitly
+excludes compressor state, SWA, DSpark windows, and state-pool ownership.
 
 ### SLOT sidecar modules — full request state
 
-- **`slot_sidecar_codec.py`** validates complete reverse-indexed SLOT regions,
+- **`hybrid/slot_codec.py`** validates complete reverse-indexed SLOT regions,
   allocates `OFFLOAD_SLOT_STAGING_SLOTS` contiguous GPU rows, and gathers or
   scatters one logical group in region order.
-- **`slot_sidecar_format.py`** owns deterministic rank-local keys and AOS1
+- **`hybrid/sidecar_format.py`** owns deterministic rank-local keys and AOS1
   framing. Decode fails closed before restore on any identity, geometry, size,
   reserved-byte, or CRC mismatch.
-- **`slot_sidecar_store.py`** stores the framed `uint8` object through the PAGE
+- **`hybrid/store.py`** stores the framed `uint8` object through the PAGE
   engine's existing `StorageManager`. It returns an owned clone on get and
   releases LMCache object references exactly once.
-- **`slot_sidecar_admission.py`** gives load/save paths nonblocking ownership of
+- **`hybrid/admission.py`** gives load/save paths nonblocking ownership of
   a staging row. An uncertain GPU completion quarantines the row permanently;
   it is never recycled into another request.
 
@@ -690,10 +708,12 @@ instead of thousands of per-block copies.
   and per-chunk block/byte offsets as device int64 tensors, so the kernel does
   pure address arithmetic. Also validates `device_buf` size and `block_ids` length.
 
-### `atom_lmcache_gpu_connector.py` — the LMCache `GPUConnectorInterface`
+### `_block_gpu_connector.py` — the LMCache `GPUConnectorInterface`
 
 The adapter LMCache's `engine.store()` / `engine.retrieve()` actually call. It
-turns LMCache's *token ranges* into ATOM *block ranges* and drives bounded staging.
+turns LMCache's *token ranges* into ATOM *block ranges* and drives bounded
+staging. `dense/gpu_connector.py` and `hybrid/gpu_connector.py` provide
+family-specific names without duplicating this implementation.
 
 - **Range → blocks** — `_range_block_ids` maps a chunk's `[start, end)` tokens to
   `block_ids[start//bs : ceil(end/bs)]`, enforcing block-aligned starts.
@@ -724,7 +744,8 @@ knobs. This per-thread isolation is exactly why load and save never contend.
   servers derive the **same** ZMQ socket path.
 - **`metadata.py`** — `ATOMRawBytesLMCacheMetadata` overrides LMCache's allocation
   to hand out opaque `uint8` MemoryObjs (`get_shapes` returns
-  `nblocks × bytes_per_block`) and asserts `chunk_size % block_size == 0`. The
+  `nblocks × bytes_per_block`) and asserts
+  `chunk_size % virtual_block_size == 0`. The
   dataclasses `LoadSpec` / `SaveSpec` / `LMCacheReqMeta` / `LMCacheOffloadMetadata`
   are the per-request descriptors that travel scheduler → worker each step.
 
@@ -757,12 +778,12 @@ LMCache version, these are what to re-check.**
 
 | Ours | Replaces (LMCache default) | Why it must change | How it's wired / what changed |
 |---|---|---|---|
-| **`ATOMLMCacheGPUConnector`** | LMCache's stock vLLM `GPUConnectorInterface` (the GPU↔MemoryObj mover) | The stock connectors only emit **token-major** KV (`KV_2LTD` etc.) via `normalize_kv_and_discover_format`, which rejects ATOM's x-packed head-major AITER layout | Passed as the `gpu_connector` arg to `get_or_create`. LMCache's engine calls our `batched_from_gpu` / `batched_to_gpu` instead of its own. **This is the main hook.** |
+| **`DenseGPUConnector`** | LMCache's stock vLLM `GPUConnectorInterface` (the GPU↔MemoryObj mover) | The stock connectors only emit **token-major** KV (`KV_2LTD` etc.) via `normalize_kv_and_discover_format`, which rejects ATOM's x-packed head-major AITER layout | Passed as the `gpu_connector` arg to `get_or_create`. LMCache's engine calls our `batched_from_gpu` / `batched_to_gpu` instead of its own. **This is the main hook.** |
 | **`ATOMRawBytesLMCacheMetadata`** | `LMCacheMetadata`'s allocation shape/dtype | MemoryObjs must be allocated as **opaque `uint8` blobs** (`nblocks × bytes_per_block`), not typed KV tensors | Wraps the base metadata and overrides `get_shapes()` / `get_dtypes()` / `get_num_groups()`; passed as `meta` to `get_or_create` |
-| **`ATOMKVByteCodec`** | *(nothing — new component)* | LMCache has no concept of AITER's paged x-packed byte layout | Owned by `ATOMLMCacheGPUConnector`; does the actual block-byte gather/scatter via Triton |
+| **`DenseKVByteCodec`** | *(nothing — new component)* | LMCache has no concept of AITER's paged x-packed byte layout | Owned by `DenseGPUConnector`; does the actual block-byte gather/scatter via Triton |
 | **`ATOMPageRegionCodec`** | *(DSV4-specific component)* | DSV4 PAGE is already described as explicit page-major `block_regions`, not dense tensor segments | Selected at registration when `kv_caches` is empty and PAGE regions are present |
 | **AOS1 SLOT modules** | *(separate request-state sidecar)* | Request state is one boundary snapshot, not token-chunked PAGE data | Uses the engine's `StorageManager` directly; it does not replace or fork `LMCacheEngine.store/retrieve` |
-| `engine.fmt = KV_2LTD` + `post_init()` | the format LMCache would pick for allocation | `BINARY` (the honest format for raw bytes) is **rejected** by the LocalCPU allocator; we set an *accepted* format only to pass that check — the real shape is forced by our metadata, so the value is otherwise inert | `connector.py` `register_kv_caches` |
+| `engine.fmt = KV_2LTD` + `post_init()` | the format LMCache would pick for allocation | `BINARY` (the honest format for raw bytes) is **rejected** by the LocalCPU allocator; we set an *accepted* format only to pass that check — the real shape is forced by our metadata, so the value is otherwise inert | `_offload_common.py` `build_offload_engine` |
 | `get_or_create(…, lambda t,s: None, lambda o,s: o)` | LMCache's trailing token-processing / output-transform callbacks | We don't use LMCache's token-shaping hooks — our codec moves raw bytes | Passed as no-op / identity callables |
 | `cfg.lookup_server_worker_ids = [0]` | default: every rank answers lookup, client takes `min()` | At TP>1 a non-rank-0 shard returning 0 would zero out a real hit; rank 0 is made authoritative | `config.py` (see [TP > 1 Notes](#tp--1-notes)) |
 | `cfg.use_gds = False` | LMCache may enable cufile GDS | cufile init hangs without NVMe-GDS hardware here | `config.py` |
@@ -1027,10 +1048,12 @@ Common diagnostics:
 
 PAGE keys now use a deterministic model-name namespace containing an explicit
 ATOM PAGE layout version plus a config fingerprint. The fingerprint covers
-PAGE mode, KV/index dtype, model and DSV4 compression geometry, block/chunk,
-TP/DCP, and speculative configuration. Scheduler and workers derive the same
-namespace; `worker_id` remains the rank-local `CacheEngineKey` dimension.
-Semantic PAGE packing changes must bump `PAGE_LAYOUT_VERSION`.
+PAGE mode, KV/index dtype, the actual DSV4 `kv_head_dim` and `index_head_dim`,
+model/compression geometry, block/chunk, TP/DCP, and speculative configuration.
+Version 2 also binds the corrected virtual-DCP block mapping. Scheduler and
+workers derive the same namespace; `worker_id` remains the rank-local
+`CacheEngineKey` dimension. Semantic PAGE packing changes must bump
+`PAGE_LAYOUT_VERSION`.
 
 Earlier unnamespaced or differently namespaced PAGE objects are intentionally
 unreachable and cannot authorize current AOS1 state. AOS1 fingerprints and keys
@@ -1040,7 +1063,7 @@ AOS1 is not compatible with old AOB1/bundle formats. There is no fallback
 decoder. A fresh disk directory is optional for cleanup/capacity reclamation,
 not correctness.
 
-Dense `ATOMKVByteCodec` objects remain valid only under their matching
+Dense `DenseKVByteCodec` objects remain valid only under their matching
 fingerprinted namespace. Model/layout, dtype, compression, slot geometry, or
 parallel/speculation changes derive a different namespace instead of colliding
 with previous bytes.

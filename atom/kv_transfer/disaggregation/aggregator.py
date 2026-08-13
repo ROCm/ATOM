@@ -26,6 +26,8 @@ from atom.kv_transfer.disaggregation.types import (
     ReqId,
     SaveCompletionId,
     SaveOperationId,
+    SendCompletionId,
+    SendOperationId,
 )
 
 logger = logging.getLogger("atom")
@@ -63,7 +65,7 @@ class KVOutputAggregator:
             raise ValueError("terminal_tombstone_limit must be positive")
         self._world_size = world_size
         self._terminal_tombstone_limit = terminal_tombstone_limit
-        self._seen_sending: dict[ReqId, set[int]] = {}
+        self._seen_sending: dict[SendCompletionId, set[int]] = {}
         self._seen_recving: dict[ReqId, set[int]] = {}
         self._seen_recv_failed: dict[ReqId, set[int]] = {}
         self._seen_saving: dict[SaveCompletionId, set[int]] = {}
@@ -77,6 +79,8 @@ class KVOutputAggregator:
         self._terminal_sidecar: set[SaveOperationId] = set()
         self._terminal_load_order: deque[LoadOperationId] = deque()
         self._terminal_load: set[LoadOperationId] = set()
+        self._terminal_sending_order: deque[SendOperationId] = deque()
+        self._terminal_sending: set[SendOperationId] = set()
 
     @property
     def world_size(self) -> int:
@@ -99,6 +103,11 @@ class KVOutputAggregator:
         for worker_idx, wo in enumerate(worker_outputs):
             if wo.finished_sending:
                 for rid in wo.finished_sending:
+                    if (
+                        isinstance(rid, SendOperationId)
+                        and rid in self._terminal_sending
+                    ):
+                        continue
                     self._seen_sending.setdefault(rid, set()).add(worker_idx)
             if wo.finished_recving:
                 for rid in wo.finished_recving:
@@ -203,6 +212,12 @@ class KVOutputAggregator:
 
         for rid in done_sending:
             del self._seen_sending[rid]
+            if isinstance(rid, SendOperationId):
+                self._remember_terminal(
+                    rid,
+                    self._terminal_sending_order,
+                    self._terminal_sending,
+                )
         for rid in done_recving:
             del self._seen_recving[rid]
             self._seen_recv_failed.pop(rid, None)
@@ -267,7 +282,7 @@ class KVOutputAggregator:
 
     def _remember_terminal(
         self,
-        operation: SaveOperationId | LoadOperationId,
+        operation: SaveOperationId | LoadOperationId | SendOperationId,
         order: deque,
         tombstones: set,
     ) -> None:
@@ -295,6 +310,8 @@ class KVOutputAggregator:
         self._terminal_sidecar.clear()
         self._terminal_load_order.clear()
         self._terminal_load.clear()
+        self._terminal_sending_order.clear()
+        self._terminal_sending.clear()
 
     @property
     def terminal_tombstone_count(self) -> tuple[int, int]:
@@ -303,6 +320,10 @@ class KVOutputAggregator:
     @property
     def terminal_load_tombstone_count(self) -> int:
         return len(self._terminal_load)
+
+    @property
+    def terminal_send_tombstone_count(self) -> int:
+        return len(self._terminal_sending)
 
     @property
     def pending_count(self) -> tuple[int, int]:

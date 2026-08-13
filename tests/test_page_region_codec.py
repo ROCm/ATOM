@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from atom.kv_transfer.disaggregation.types import KVTransferRegion
-from atom.kv_transfer.offload.atom_page_region_codec import (
+from atom.kv_transfer.offload.hybrid.page_region_codec import (
     ATOMPageRegionCodec,
     PageCopy,
     build_copy_tiles,

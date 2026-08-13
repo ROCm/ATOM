@@ -13,7 +13,7 @@ from numbers import Integral
 import torch
 
 from atom.kv_transfer.disaggregation.types import KVTransferRegion
-from atom.kv_transfer.offload.atom_page_region_codec import PageCopy
+from atom.kv_transfer.offload.copy_plan import PageCopy
 
 logger = logging.getLogger("atom")
 

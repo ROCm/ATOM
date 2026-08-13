@@ -12,12 +12,13 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from atom.kv_transfer.offload.slot_sidecar_format import (  # noqa: E402
+from atom.kv_transfer.offload.hybrid.sidecar_format import (  # noqa: E402
     SlotSidecarHeader,
     SlotSidecarKey,
     encode_sidecar,
 )
-from atom.kv_transfer.offload.slot_sidecar_store import (  # noqa: E402
+from atom.kv_transfer.offload.hybrid.store import (  # noqa: E402
+    SlotSidecarCorruptionError,
     SlotSidecarStore,
 )
 
@@ -66,6 +67,8 @@ class _StorageManager:
         self.get_error: Exception | None = None
         self.contains_result: str | None = "LocalCPUBackend"
         self.contains_error: Exception | None = None
+        self.remove_result = 1
+        self.remove_error: Exception | None = None
 
         self.allocate_calls: list[tuple[torch.Size, torch.dtype, object, bool]] = []
         self.allocated_objects: list[_MemoryObj] = []
@@ -75,6 +78,7 @@ class _StorageManager:
         self.clear_num_tokens: list[int] = []
         self.get_calls: list[tuple[object, str | None]] = []
         self.contains_calls: list[tuple[object, list[str] | None, bool]] = []
+        self.remove_calls: list[tuple[object, list[str] | None]] = []
 
     def allocate(
         self,
@@ -132,6 +136,12 @@ class _StorageManager:
         if search_range is not None and self.contains_result not in search_range:
             return None
         return self.contains_result
+
+    def remove(self, key: object, locations: list[str] | None = None) -> int:
+        self.remove_calls.append((key, locations))
+        if self.remove_error is not None:
+            raise self.remove_error
+        return self.remove_result
 
 
 @pytest.fixture(autouse=True)
@@ -478,15 +488,40 @@ def test_get_catches_storage_exception():
     assert store.get(_key()) is None
 
 
-def test_get_releases_fetched_object_when_tensor_is_unavailable():
+def test_get_raises_corruption_and_releases_when_tensor_is_unavailable():
     manager = _StorageManager()
     fetched = _MemoryObj(None, tensor_via_getter=True)
     manager.get_result = fetched
     store = _store(manager)
 
-    assert store.get(_key()) is None
+    with pytest.raises(SlotSidecarCorruptionError, match="expose a tensor"):
+        store.get(_key())
 
     assert fetched.get_tensor_calls == [0]
+    assert fetched.decref_count == 1
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        pytest.param(torch.ones(4, dtype=torch.int16), id="wrong-dtype"),
+        pytest.param(torch.empty(0, dtype=torch.uint8), id="empty"),
+        pytest.param(
+            torch.arange(6, dtype=torch.uint8).reshape(2, 3).t(),
+            id="noncontiguous",
+        ),
+    ],
+)
+def test_borrow_distinguishes_malformed_objects_from_storage_io(malformed):
+    manager = _StorageManager()
+    fetched = _MemoryObj(malformed)
+    manager.get_result = fetched
+    store = _store(manager)
+
+    with pytest.raises(SlotSidecarCorruptionError):
+        with store.borrow(_key()):
+            pytest.fail("malformed object must not be yielded")
+
     assert fetched.decref_count == 1
 
 
@@ -524,6 +559,41 @@ def test_contains_raises_sanitized_storage_exception():
     ) as exc_info:
         store.contains(_key())
     assert "private-key" not in str(exc_info.value)
+
+
+def test_invalidate_removes_all_tier_copies_for_republication(fake_lmcache):
+    manager = _StorageManager()
+    store = _store(manager)
+    sidecar_key = _key()
+
+    assert store.invalidate(sidecar_key) is True
+
+    assert len(manager.remove_calls) == 1
+    cache_key, locations = manager.remove_calls[0]
+    _assert_cache_key(cache_key, fake_lmcache, sidecar_key)
+    assert locations is None
+
+
+def test_failed_invalidation_fences_put_until_corrupt_copy_is_removed():
+    manager = _StorageManager()
+    manager.remove_result = 0
+    store = _store(manager)
+    sidecar_key = _key()
+
+    assert store.invalidate(sidecar_key) is False
+    assert store.put(sidecar_key, _aos1_blob()) is False
+
+    # put retries the unresolved eviction, but must not allocate or submit
+    # replacement bytes while LMCache may still retain the corrupt key.
+    assert len(manager.remove_calls) == 2
+    assert manager.allocate_calls == []
+    assert manager.batched_put_calls == []
+
+    manager.remove_result = 1
+    assert store.put(sidecar_key, _aos1_blob()) is True
+    assert len(manager.remove_calls) == 3
+    assert len(manager.allocate_calls) == 1
+    assert len(manager.batched_put_calls) == 1
 
 
 @pytest.mark.parametrize(
