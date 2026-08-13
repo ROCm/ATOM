@@ -210,6 +210,26 @@ class TestAggregateBasic:
         assert terminal.connector_completions == {failed}
         assert agg.pending_count == (0, 0)
 
+    def test_same_worker_contradictory_completion_keeps_failure(self):
+        agg = KVOutputAggregator(world_size=2)
+        succeeded = _completion(DSV4_CHECKPOINT_SAVE_CHANNEL, "r1")
+        failed = _completion(
+            DSV4_CHECKPOINT_SAVE_CHANNEL,
+            "r1",
+            succeeded=False,
+        )
+
+        terminal = agg.aggregate(
+            [
+                KVConnectorOutput(
+                    connector_completions={succeeded, failed},
+                ),
+                KVConnectorOutput(connector_completions={succeeded}),
+            ]
+        )
+
+        assert terminal.connector_completions == {failed}
+
     def test_partial_sidecar_save_success_is_not_emitted(self):
         agg = KVOutputAggregator(world_size=2)
         completion = _completion(DSV4_CHECKPOINT_SAVE_CHANNEL, "r1")

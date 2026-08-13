@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import logging
 from collections import deque
+from collections.abc import Callable, Hashable, Iterable
+from typing import Generic, TypeVar
 
 from atom.kv_transfer.disaggregation.types import (
     ConnectorCompletion,
@@ -36,14 +38,85 @@ logger = logging.getLogger("atom")
 
 __all__ = ["KVOutputAggregator"]
 
+_KeyT = TypeVar("_KeyT", bound=Hashable)
+
+
+class _TPCompletionGroup(Generic[_KeyT]):
+    """Collect one completion channel with optional bounded duplicate memory."""
+
+    def __init__(
+        self,
+        world_size: int,
+        tombstone_limit: int,
+        should_tombstone: Callable[[_KeyT], bool] | None = None,
+    ) -> None:
+        self._world_size = world_size
+        self._tombstone_limit = tombstone_limit
+        self._should_tombstone = should_tombstone
+        # key -> worker index -> success. A failure remains failure if one
+        # worker contradicts or replays its report.
+        self._reports: dict[_KeyT, dict[int, bool]] = {}
+        self._tombstone_order: deque[_KeyT] = deque()
+        self._tombstones: set[_KeyT] = set()
+
+    def report(self, worker_idx: int, key: _KeyT, *, succeeded: bool) -> None:
+        if key in self._tombstones:
+            return
+        reports = self._reports.setdefault(key, {})
+        reports[worker_idx] = reports.get(worker_idx, True) and succeeded
+
+    def report_many(
+        self,
+        worker_idx: int,
+        keys: Iterable[_KeyT],
+        *,
+        succeeded: bool,
+    ) -> None:
+        for key in keys:
+            self.report(worker_idx, key, succeeded=succeeded)
+
+    def drain(self) -> tuple[set[_KeyT], set[_KeyT]]:
+        succeeded: set[_KeyT] = set()
+        failed: set[_KeyT] = set()
+        for key, reports in list(self._reports.items()):
+            if len(reports) < self._world_size:
+                continue
+            (succeeded if all(reports.values()) else failed).add(key)
+            del self._reports[key]
+            if self._should_tombstone is not None and self._should_tombstone(key):
+                self._remember_tombstone(key)
+        return succeeded, failed
+
+    def _remember_tombstone(self, key: _KeyT) -> None:
+        if key in self._tombstones:
+            return
+        self._tombstones.add(key)
+        self._tombstone_order.append(key)
+        while len(self._tombstone_order) > self._tombstone_limit:
+            self._tombstones.discard(self._tombstone_order.popleft())
+
+    def reset(self) -> None:
+        self._reports.clear()
+        self._tombstone_order.clear()
+        self._tombstones.clear()
+
+    @property
+    def pending_count(self) -> int:
+        return len(self._reports)
+
+    @property
+    def tombstone_count(self) -> int:
+        return len(self._tombstones)
+
 
 class KVOutputAggregator:
     """Aggregates :class:`KVConnectorOutput` from all TP workers.
 
     Tracks which unique worker indices have reported each request or exact save
     generation as finished. A transfer is globally complete only when all
-    ``world_size`` workers report the same identity — duplicate reports from
-    one worker and cross-generation PAGE/SLOT reports are ignored.
+    ``world_size`` workers report the same identity. Duplicate reports from
+    one worker do not increase quorum, and different operation generations
+    cannot complete one another.
 
     Args:
         world_size: Number of TP workers to aggregate over.
@@ -66,27 +139,30 @@ class KVOutputAggregator:
         if terminal_tombstone_limit <= 0:
             raise ValueError("terminal_tombstone_limit must be positive")
         self._world_size = world_size
-        self._terminal_tombstone_limit = terminal_tombstone_limit
-        self._seen_sending: dict[SendCompletionId, set[int]] = {}
-        self._seen_recving: dict[ReqId, set[int]] = {}
-        self._seen_recv_failed: dict[ReqId, set[int]] = {}
-        self._seen_saving: dict[SaveCompletionId, set[int]] = {}
-        self._seen_loading: dict[LoadCompletionId, set[int]] = {}
-        self._seen_load_failed: dict[LoadCompletionId, set[int]] = {}
-        self._seen_connector_completion: dict[ConnectorCompletionKey, set[int]] = {}
-        self._seen_connector_completion_failed: dict[
-            ConnectorCompletionKey, set[int]
-        ] = {}
-        self._terminal_saving_order: deque[SaveOperationId] = deque()
-        self._terminal_saving: set[SaveOperationId] = set()
-        self._terminal_load_order: deque[LoadOperationId] = deque()
-        self._terminal_load: set[LoadOperationId] = set()
-        self._terminal_sending_order: deque[SendOperationId] = deque()
-        self._terminal_sending: set[SendOperationId] = set()
-        self._terminal_connector_completion_order: deque[ConnectorCompletionKey] = (
-            deque()
+        self._sending = _TPCompletionGroup[SendCompletionId](
+            world_size,
+            terminal_tombstone_limit,
+            lambda key: isinstance(key, SendOperationId),
         )
-        self._terminal_connector_completion: set[ConnectorCompletionKey] = set()
+        self._receiving = _TPCompletionGroup[ReqId](
+            world_size,
+            terminal_tombstone_limit,
+        )
+        self._saving = _TPCompletionGroup[SaveCompletionId](
+            world_size,
+            terminal_tombstone_limit,
+            lambda key: isinstance(key, SaveOperationId),
+        )
+        self._loading = _TPCompletionGroup[LoadCompletionId](
+            world_size,
+            terminal_tombstone_limit,
+            lambda key: isinstance(key, LoadOperationId),
+        )
+        self._connector_completions = _TPCompletionGroup[ConnectorCompletionKey](
+            world_size,
+            terminal_tombstone_limit,
+            lambda _key: True,
+        )
 
     @property
     def world_size(self) -> int:
@@ -106,157 +182,61 @@ class KVOutputAggregator:
         if not worker_outputs:
             return KVConnectorOutput()
 
-        for worker_idx, wo in enumerate(worker_outputs):
-            if wo.finished_sending:
-                for rid in wo.finished_sending:
-                    if (
-                        isinstance(rid, SendOperationId)
-                        and rid in self._terminal_sending
-                    ):
-                        continue
-                    self._seen_sending.setdefault(rid, set()).add(worker_idx)
-            if wo.finished_recving:
-                for rid in wo.finished_recving:
-                    self._seen_recving.setdefault(rid, set()).add(worker_idx)
-            if wo.failed_recving:
-                for rid in wo.failed_recving:
-                    self._seen_recv_failed.setdefault(rid, set()).add(worker_idx)
-            if wo.finished_saving:
-                for rid in wo.finished_saving:
-                    if (
-                        isinstance(rid, SaveOperationId)
-                        and rid in self._terminal_saving
-                    ):
-                        continue
-                    self._seen_saving.setdefault(rid, set()).add(worker_idx)
-            if wo.finished_loading:
-                for rid in wo.finished_loading:
-                    if isinstance(rid, LoadOperationId) and rid in self._terminal_load:
-                        continue
-                    self._seen_loading.setdefault(rid, set()).add(worker_idx)
-            if wo.failed_loading:
-                for rid in wo.failed_loading:
-                    if isinstance(rid, LoadOperationId) and rid in self._terminal_load:
-                        continue
-                    self._seen_load_failed.setdefault(rid, set()).add(worker_idx)
-            for completion in wo.connector_completions:
-                key = completion.key
-                if key in self._terminal_connector_completion:
-                    continue
-                seen = (
-                    self._seen_connector_completion
-                    if completion.succeeded
-                    else self._seen_connector_completion_failed
-                )
-                seen.setdefault(key, set()).add(worker_idx)
-
-        done_sending = {
-            rid
-            for rid, workers in self._seen_sending.items()
-            if len(workers) >= self._world_size
-        }
-        failed_recving = set()
-        recv_ids = set(self._seen_recving) | set(self._seen_recv_failed)
-        for rid in recv_ids:
-            done_workers = self._seen_recving.get(rid, set())
-            failed_workers = self._seen_recv_failed.get(rid, set())
-            if (
-                failed_workers
-                and len(done_workers | failed_workers) >= self._world_size
-            ):
-                failed_recving.add(rid)
-        done_recving = {
-            rid
-            for rid, workers in self._seen_recving.items()
-            if len(workers) >= self._world_size and rid not in failed_recving
-        }
-        done_saving = {
-            rid
-            for rid, workers in self._seen_saving.items()
-            if len(workers) >= self._world_size
-        }
-        failed_loading = set()
-        load_ids = set(self._seen_loading) | set(self._seen_load_failed)
-        for rid in load_ids:
-            done_workers = self._seen_loading.get(rid, set())
-            failed_workers = self._seen_load_failed.get(rid, set())
-            if (
-                failed_workers
-                and len(done_workers | failed_workers) >= self._world_size
-            ):
-                failed_loading.add(rid)
-        done_loading = {
-            rid
-            for rid, workers in self._seen_loading.items()
-            if len(workers) >= self._world_size and rid not in failed_loading
-        }
-        connector_completions: set[ConnectorCompletion] = set()
-        connector_completion_keys = set(self._seen_connector_completion) | set(
-            self._seen_connector_completion_failed
-        )
-        terminal_connector_completion_keys: set[ConnectorCompletionKey] = set()
-        for key in connector_completion_keys:
-            done_workers = self._seen_connector_completion.get(key, set())
-            failed_workers = self._seen_connector_completion_failed.get(key, set())
-            if len(done_workers | failed_workers) < self._world_size:
-                continue
-            terminal_connector_completion_keys.add(key)
-            connector_completions.add(
-                ConnectorCompletion(
-                    channel=key[0],
-                    operation_id=key[1],
-                    succeeded=not bool(failed_workers),
-                )
+        for worker_idx, output in enumerate(worker_outputs):
+            self._sending.report_many(
+                worker_idx,
+                output.finished_sending,
+                succeeded=True,
             )
-
-        for rid in done_sending:
-            del self._seen_sending[rid]
-            if isinstance(rid, SendOperationId):
-                self._remember_terminal(
-                    rid,
-                    self._terminal_sending_order,
-                    self._terminal_sending,
-                )
-        for rid in done_recving:
-            del self._seen_recving[rid]
-            self._seen_recv_failed.pop(rid, None)
-        for rid in failed_recving:
-            self._seen_recving.pop(rid, None)
-            self._seen_recv_failed.pop(rid, None)
-        for rid in done_saving:
-            del self._seen_saving[rid]
-            if isinstance(rid, SaveOperationId):
-                self._remember_terminal(
-                    rid,
-                    self._terminal_saving_order,
-                    self._terminal_saving,
-                )
-        for rid in done_loading:
-            del self._seen_loading[rid]
-            self._seen_load_failed.pop(rid, None)
-            if isinstance(rid, LoadOperationId):
-                self._remember_terminal(
-                    rid,
-                    self._terminal_load_order,
-                    self._terminal_load,
-                )
-        for rid in failed_loading:
-            self._seen_loading.pop(rid, None)
-            self._seen_load_failed.pop(rid, None)
-            if isinstance(rid, LoadOperationId):
-                self._remember_terminal(
-                    rid,
-                    self._terminal_load_order,
-                    self._terminal_load,
-                )
-        for key in terminal_connector_completion_keys:
-            self._seen_connector_completion.pop(key, None)
-            self._seen_connector_completion_failed.pop(key, None)
-            self._remember_terminal(
-                key,
-                self._terminal_connector_completion_order,
-                self._terminal_connector_completion,
+            self._receiving.report_many(
+                worker_idx,
+                output.finished_recving,
+                succeeded=True,
             )
+            self._receiving.report_many(
+                worker_idx,
+                output.failed_recving,
+                succeeded=False,
+            )
+            self._saving.report_many(
+                worker_idx,
+                output.finished_saving,
+                succeeded=True,
+            )
+            self._loading.report_many(
+                worker_idx,
+                output.finished_loading,
+                succeeded=True,
+            )
+            self._loading.report_many(
+                worker_idx,
+                output.failed_loading,
+                succeeded=False,
+            )
+            for completion in output.connector_completions:
+                self._connector_completions.report(
+                    worker_idx,
+                    completion.key,
+                    succeeded=completion.succeeded,
+                )
+
+        done_sending, _ = self._sending.drain()
+        done_recving, failed_recving = self._receiving.drain()
+        done_saving, _ = self._saving.drain()
+        done_loading, failed_loading = self._loading.drain()
+        done_connector_keys, failed_connector_keys = self._connector_completions.drain()
+        connector_completions = {
+            ConnectorCompletion(
+                channel=key[0],
+                operation_id=key[1],
+                succeeded=succeeded,
+            )
+            for keys, succeeded in (
+                (done_connector_keys, True),
+                (failed_connector_keys, False),
+            )
+            for key in keys
+        }
 
         return KVConnectorOutput(
             finished_sending=done_sending,
@@ -268,63 +248,33 @@ class KVOutputAggregator:
             connector_completions=connector_completions,
         )
 
-    def _remember_terminal(
-        self,
-        operation: (
-            SaveOperationId | LoadOperationId | SendOperationId | ConnectorCompletionKey
-        ),
-        order: deque,
-        tombstones: set,
-    ) -> None:
-        """Bound late-duplicate suppression by exact operation identity."""
-        if operation in tombstones:
-            return
-        order.append(operation)
-        tombstones.add(operation)
-        while len(order) > self._terminal_tombstone_limit:
-            tombstones.discard(order.popleft())
-
     def reset(self) -> None:
         """Clear all internal tracking state."""
-        self._seen_sending.clear()
-        self._seen_recving.clear()
-        self._seen_recv_failed.clear()
-        self._seen_saving.clear()
-        self._seen_loading.clear()
-        self._seen_load_failed.clear()
-        self._seen_connector_completion.clear()
-        self._seen_connector_completion_failed.clear()
-        self._terminal_saving_order.clear()
-        self._terminal_saving.clear()
-        self._terminal_load_order.clear()
-        self._terminal_load.clear()
-        self._terminal_sending_order.clear()
-        self._terminal_sending.clear()
-        self._terminal_connector_completion_order.clear()
-        self._terminal_connector_completion.clear()
+        self._sending.reset()
+        self._receiving.reset()
+        self._saving.reset()
+        self._loading.reset()
+        self._connector_completions.reset()
 
     @property
     def terminal_tombstone_count(self) -> tuple[int, int]:
-        return len(self._terminal_saving), len(self._terminal_connector_completion)
+        return self._saving.tombstone_count, self._connector_completions.tombstone_count
 
     @property
     def terminal_load_tombstone_count(self) -> int:
-        return len(self._terminal_load)
+        return self._loading.tombstone_count
 
     @property
     def terminal_send_tombstone_count(self) -> int:
-        return len(self._terminal_sending)
+        return self._sending.tombstone_count
 
     @property
     def pending_count(self) -> tuple[int, int]:
         """Return ``(num_pending_sending, num_pending_other_transfers)``."""
         return (
-            len(self._seen_sending),
-            len(set(self._seen_recving) | set(self._seen_recv_failed))
-            + len(self._seen_saving)
-            + len(set(self._seen_loading) | set(self._seen_load_failed))
-            + len(
-                set(self._seen_connector_completion)
-                | set(self._seen_connector_completion_failed)
-            ),
+            self._sending.pending_count,
+            self._receiving.pending_count
+            + self._saving.pending_count
+            + self._loading.pending_count
+            + self._connector_completions.pending_count,
         )

@@ -161,6 +161,37 @@ _completed_save_operations = _CompletedOperationWindow(limit=4096)
 checkpoint collections。通用 helper 内部提供 O(1) membership 和 FIFO bounded
 eviction；DSV4 checkpoint/store completion 仍全部走 opaque channel。
 
+### TP aggregator 状态收拢
+
+Review 继续指出 `KVOutputAggregator` 把相同机制展开成多组 `_seen_*`、
+`_terminal_*_order` 和 `_terminal_*`。现统一为通用 `_TPCompletionGroup`：
+
+```text
+KVOutputAggregator
+├── _sending
+├── _receiving
+├── _saving
+├── _loading
+└── _connector_completions
+          |
+          v
+_TPCompletionGroup
+├── reports[key][worker_idx] = succeeded
+├── unique-worker TP quorum
+├── sticky failure (False wins duplicate/contradictory report)
+├── optional exact-operation completed window
+└── drain() -> (succeeded_keys, failed_keys)
+```
+
+语义保持不变：
+
+- 全部 worker output 先 ingest，再统一 drain，避免同一轮后出现的 failure 被提前 success 覆盖。
+- 同一 worker 重复上报不增加 quorum；同一 worker success/failure 冲突时 failure 保持。
+- raw receive/request IDs 不 tombstone。
+- 只有精确 `SendOperationId`、`SaveOperationId`、`LoadOperationId` 进入 bounded completed window。
+- `ConnectorCompletionKey` 始终按精确 channel + operation identity 去重。
+- `reset()`、`pending_count` 和现有 tombstone count 查询保持公共行为。
+
 ### 只读安全复核结论
 
 本轮未执行代码，但对 lease 生命周期做了只读调用链复核：
