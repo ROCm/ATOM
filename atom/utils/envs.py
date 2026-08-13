@@ -136,24 +136,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DSPARK_FUSED_CTX_KV": lambda: (
         os.getenv("ATOM_DSPARK_FUSED_CTX_KV", "1") == "1"
     ),
-    # Kimi-K3 DSpark draft: on the same context-row path, project ONLY the kv
-    # half of the fused q_a/kv_a projection (a contiguous row slice of the
-    # merged weight, MergedReplicatedLinear.forward_shard) instead of computing
-    # all 2112 columns and discarding the 1536-wide q half. Cuts that GEMM's N
-    # by 3.7x for identical math on identical bytes. Separate from
-    # ATOM_DSPARK_FUSED_CTX_KV because the risk is different: a narrower N is a
-    # different tuned-GEMM shape, so an untuned (M, 576, 7168) could in
-    # principle land on a worse solution than the tuned merged one.
-    # Inert whenever the draft's projection is quantized -- which is the served
-    # Kimi-K3 configuration (ptpc_fp8), since forward_shard cannot narrow a
-    # weight whose scales are per-shard or whose rows have been preshuffled, and
-    # returns the merged GEMM's slice instead. Measured there: not one kernel
-    # changes. Unquantized, (M=3, 576, 7168) has no tuned config and loses 3us
-    # per drafting step to the merged GEMM; it only pays at prefill widths
-    # (2.0ms per 32k prefill) and at larger decode batches (+26us/step at B=64).
-    "ATOM_DSPARK_CTX_KV_ONLY_PROJ": lambda: (
-        os.getenv("ATOM_DSPARK_CTX_KV_ONLY_PROJ", "0") == "1"
-    ),
     "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION", "1") == "1"
     ),

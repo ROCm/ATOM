@@ -310,10 +310,6 @@ class K3DSparkMLAAttention(nn.Module):
             is_sparse=False,
             topk_tokens=None,
         )
-        # Resolved once: envs re-reads os.getenv on every attribute access, and
-        # write_context_kv is on the per-step path of all five draft layers.
-        self._ctx_kv_only_proj = bool(envs.ATOM_DSPARK_CTX_KV_ONLY_PROJ)
-
         self.mla_attn = Attention(
             num_heads=self.num_local_heads,
             head_dim=self.kv_lora_rank + self.qk_rope_head_dim,
@@ -351,20 +347,17 @@ class K3DSparkMLAAttention(nn.Module):
 
         The checkpoint keeps q_a and kv_a as one fused weight and so does this
         module (see packed_modules_mapping); the block pass in :meth:`forward`
-        wants both halves. Only THIS path wants the kv half alone, so it asks
-        the merged linear for that shard's rows rather than splitting the
-        module in two -- same weight, same loader, 576 output columns instead of
-        2112. `forward_shard` returns the merged GEMM's slice unchanged when the
-        weight is quantized, so this is a fast path, not a second contract.
+        wants both halves, this path only the kv one -- so 1536 of the 2112
+        output columns are computed and dropped. Narrowing the GEMM to the kv
+        shard is not available where it would pay: the served configuration
+        quantizes this projection per output channel and preshuffles its rows,
+        after which a row slice of the merged weight is not that shard's weight.
         (vLLM's reference computes the full projection here too, and offers a
         cross-layer fused fast path on top; that optimization is not ported.)
         """
-        if self._ctx_kv_only_proj:
-            kv_lora = _linear_out(self.fused_qkv_a_proj.forward_shard(ctx_hidden, 1))
-        else:
-            kv_lora = _linear_out(self.fused_qkv_a_proj(ctx_hidden))[
-                ..., self.q_lora_rank :
-            ]
+        kv_lora = _linear_out(self.fused_qkv_a_proj(ctx_hidden))[
+            ..., self.q_lora_rank :
+        ]
         # norm + rope + concat + store live behind one call so every cache
         # layout stays in the attention impl: the normal store hardcodes
         # attn_metadata.slot_mapping, which is the draft block's, not these

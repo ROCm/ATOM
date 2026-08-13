@@ -111,14 +111,13 @@ materializes two `[B, V]` fp32 tensors that only an `argmax` reads. See
 ### DSpark drafting
 
 The Kimi-K3 DSpark draft writes the target's context rows into its own paged MLA
-cache once per draft layer per drafting step; both switches below shorten that
+cache once per draft layer per drafting step; the switch below shortens that
 path. The first write of each process logs which path it took, and logs again if
 that ever changes, so a fusion left inert by an unrecognised layout says so.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_DSPARK_FUSED_CTX_KV** | bool | 1 (true) | Write the context rows with one Triton kernel (RMSNorm + RoPE + concat + paged store) instead of four launches plus a throwaway `empty_like` for the RoPE's query side. Falls back per call when the cache layout or the RoPE is not the plain one the kernel understands (seg / shuffled-KV layouts keep their own write kernels), and until the RoPE's cos/sin cache has reached the device. Measured on Kimi-K3 (MI355X, TP8, fp8 KV): one 4.65 µs kernel replaces a 14 µs three-kernel chain, saving ~39 µs per drafting step at B=1 and ~36 µs at B=64. Set to `0` to force the per-op chain; that chain is the fallback above rather than debug code, so it stays reachable either way (it runs the first write of every layer). |
-| **ATOM_DSPARK_CTX_KV_ONLY_PROJ** | bool | 0 (false) | If set to `1`, project only the KV half of the fused q_a/kv_a projection on that path (a contiguous row slice of the merged weight) instead of computing all 2112 columns and discarding the 1536-wide q half. Same math on the same bytes with N cut 3.7x, but a narrower N is a different tuned-GEMM shape, so it is measured separately. Inert whenever that projection is quantized — including the served Kimi-K3 configuration (`ptpc_fp8`), where `forward_shard` returns the merged GEMM's slice and not one kernel changes. Unquantized, `(M=3, 576, 7168)` has no tuned config and loses ~3 µs per drafting step; it pays only at prefill widths (2.0 ms per 32k prefill) and larger decode batches (+26 µs/step at B=64). |
 
 ## V4 attention backend (Migration)
 
