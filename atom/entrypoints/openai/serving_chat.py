@@ -263,7 +263,9 @@ async def stream_chat_response(
             chunk_data = await stream_queue.get()
 
             if not role_sent:
-                yield create_chat_chunk(request_id, model, delta={"role": "assistant"})
+                yield create_chat_chunk(
+                    request_id, model, delta={"role": "assistant", "content": ""}
+                )
                 role_sent = True
             new_text = chunk_data["text"]
             num_tokens_output += len(chunk_data.get("token_ids", []))
@@ -534,7 +536,10 @@ async def stream_chat_response_fanout(
 
             if not role_sent[idx]:
                 yield create_chat_chunk(
-                    request_id, model, delta={"role": "assistant"}, index=idx
+                    request_id,
+                    model,
+                    delta={"role": "assistant", "content": ""},
+                    index=idx,
                 )
                 role_sent[idx] = True
 
