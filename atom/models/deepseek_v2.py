@@ -1807,7 +1807,7 @@ def sparse_attn_indexer(
                 logits.stride(0),
                 logits.stride(1),
                 stable=stable_topk,
-        )
+            )
         if attn_metadata.max_seqlen_q > 1:
             triton_gather_kv_indices_sparse(
                 attn_metadata.sparse_kv_indptr,
