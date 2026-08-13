@@ -238,8 +238,6 @@ launch_one_model() {
   local model_path="$2"
   local extra_args="$3"
   local wait_for_ready="${4:-1}"
-  local launch_dir="${PWD}"
-  local i
   local -a extra_arg_array=()
 
   local resolved_model_path
@@ -260,16 +258,6 @@ for token in shlex.split(os.environ["EXTRA_ARGS"]):
 PY
     )
   fi
-
-  for ((i = 0; i < ${#extra_arg_array[@]} - 1; i++)); do
-    if [[ "${extra_arg_array[i]}" == "--chat-template" && "${extra_arg_array[i + 1]}" != /* ]]; then
-      if [[ ! -f "${launch_dir}/${extra_arg_array[i + 1]}" ]]; then
-        echo "Relative chat template not found: ${extra_arg_array[i + 1]}"
-        return 2
-      fi
-      extra_arg_array[i + 1]="${launch_dir}/${extra_arg_array[i + 1]}"
-    fi
-  done
 
   echo ""
   echo "========== Launching vLLM server =========="
