@@ -30,6 +30,57 @@ def _rms_eps(norm: RMSNorm) -> float:
     return getattr(norm, "variance_epsilon", getattr(norm, "eps", 1e-6))
 
 
+def _block_residual_has_headroom(block_residual: torch.Tensor) -> bool:
+    """Whether ``block_residual``'s *storage* -- not just its logical shape --
+    has room for one more row in dim 1, i.e. widening the view by one and
+    storing into that new row touches only real, already-allocated memory.
+
+    Checking this from the tensor's own stride/shape/storage-offset (rather
+    than needing a separate handle to some "parent" buffer) is what lets
+    ``_grow_block_residual_in_place`` work as a self-contained operation on
+    whatever ``block_residual`` object it is handed.
+
+    A pure stride-ratio check (capacity = stride(0) // stride(1)) is NOT
+    enough: PyTorch gives a dim-1-empty tensor the same stride(0) ==
+    stride(1) convention whether it is a genuine prefix slice of a padded
+    ``[T, N_cap, H]`` buffer (real spare storage) or a tensor freshly made via
+    e.g. ``torch.zeros(T, 0, H)`` (no storage at all) -- at ``B == 0`` stride
+    alone cannot tell those apart. Comparing against the tensor's actual
+    ``untyped_storage().nbytes()`` is unambiguous in every case, including
+    that one.
+    """
+    t, b, h = block_residual.shape
+    if t == 0 or block_residual.dim() != 3:
+        return False
+    s0, s1, s2 = block_residual.stride()
+    if s2 != 1 or s1 == 0:
+        return False
+    last_needed_elem = block_residual.storage_offset() + (t - 1) * s0 + b * s1 + (h - 1) * s2 + 1
+    needed_bytes = last_needed_elem * block_residual.element_size()
+    return needed_bytes <= block_residual.untyped_storage().nbytes()
+
+
+def _grow_block_residual_in_place(
+    block_residual: torch.Tensor, new_row: torch.Tensor
+) -> torch.Tensor | None:
+    """Append ``new_row`` as one more candidate without moving existing ones.
+
+    Widens ``block_residual``'s view over its own backing storage and stores
+    only the new row -- no read of the existing B rows, no relocation.
+    Returns the widened view, or ``None`` if there is no spare capacity (see
+    ``_block_residual_has_headroom``), signaling the caller to fall back to
+    ``torch.cat`` instead.
+    """
+    if not _block_residual_has_headroom(block_residual):
+        return None
+    t, b, h = block_residual.shape
+    widened = block_residual.as_strided(
+        (t, b + 1, h), block_residual.stride(), block_residual.storage_offset()
+    )
+    widened[:, b, :] = new_row
+    return widened
+
+
 class AttnRes(nn.Module):
     """One attention-residual mixing site.
 
@@ -93,10 +144,13 @@ class AttnRes(nn.Module):
         # instead of re-reading block_residual via a separate torch.cat. Reset
         # at the top of every forward() and cleared once consumed; None means
         # "no fused block was produced this call" (residuals disabled, no
-        # candidates yet, or a call that wasn't a close-block layer), in which
-        # case maybe_close_block() falls back to the plain torch.cat -- correct
-        # either way, this is purely a perf side-channel between the two calls
-        # that kimi_k3.py always makes back-to-back on the same instance.
+        # candidates yet, a call that wasn't a close-block layer, or -- see
+        # _block_residual_capacity -- block_residual had spare storage to
+        # grow into for free, so forward() didn't bother asking the kernel to
+        # relocate it at all). Either way maybe_close_block() handles it:
+        # first the in-place grow, then the plain torch.cat as a last resort.
+        # This is purely a perf side-channel between the two calls that
+        # kimi_k3.py always makes back-to-back on the same instance.
         self._pending_block_residual: torch.Tensor | None = None
 
     def process_weights_after_loading(self) -> None:
@@ -140,11 +194,19 @@ class AttnRes(nn.Module):
 
             # Ask the kernel to also emit the block-banking concat when this is
             # a close-block layer, so maybe_close_block() (called right after
-            # this, on this same instance) can skip its torch.cat.
+            # this, on this same instance) can skip its torch.cat -- but only
+            # when block_residual has no spare storage to grow into for free
+            # (_block_residual_capacity). When it does, relocating all B
+            # existing rows through the kernel is strictly more expensive than
+            # letting maybe_close_block() append the new candidate with a
+            # single in-place [T, H] store, so skip the fused relocate here.
             will_close = (
                 self.block_size is not None and self.layer_idx % self.block_size == 0
             )
-            if not will_close:
+            needs_relocate = will_close and not _block_residual_has_headroom(
+                block_residual
+            )
+            if not needs_relocate:
                 return apply_attn_res(
                     prefix_sum,
                     block_residual,
@@ -191,13 +253,17 @@ class AttnRes(nn.Module):
         Residuals disabled, or a layer mid-block, means no change.
 
         When the immediately preceding ``forward()`` call on this instance ran
-        the attn_res kernel (there were candidates to mix), it already computed
-        this same concat in-kernel (see ``_pending_block_residual`` and
-        ``_apply_attn_res_impl``'s ``close_block``) -- reuse that instead of
-        re-reading ``block_residual`` from HBM via ``torch.cat``. The very first
-        block (block_residual still empty, so forward() took the degenerate
-        no-mix path) has nothing cached, so this falls back to the plain cat,
-        which is cheap there anyway (concatenating with an empty tensor).
+        the attn_res kernel and had to relocate (no spare storage to grow into
+        for free -- see ``_block_residual_capacity``), it already computed this
+        same concat in-kernel (``_pending_block_residual``); reuse that instead
+        of re-reading ``block_residual`` from HBM via ``torch.cat``. Otherwise
+        try ``_grow_block_residual_in_place`` first -- this covers both the
+        common case (block_residual has spare storage, forward() deliberately
+        skipped the fused relocate) and the very first block (block_residual
+        still empty; whether this succeeds then depends on whether the caller
+        gave it any spare storage up front). Only a tensor with no spare
+        storage at all (e.g. one a pipeline-parallel recv just rematerialized)
+        falls through to the plain cat, which is the same cost either way.
         """
         if not self.enabled or self.block_size is None:
             return block_residual, prefix_sum
@@ -208,5 +274,10 @@ class AttnRes(nn.Module):
             block_residual = self._pending_block_residual
             self._pending_block_residual = None
         else:
-            block_residual = torch.cat([block_residual, prefix_sum.unsqueeze(1)], dim=1)
+            grown = _grow_block_residual_in_place(block_residual, prefix_sum)
+            block_residual = (
+                grown
+                if grown is not None
+                else torch.cat([block_residual, prefix_sum.unsqueeze(1)], dim=1)
+            )
         return block_residual, None

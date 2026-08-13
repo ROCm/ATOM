@@ -224,6 +224,28 @@ def _pick_attn_res_config(tokens: int):
     return _ATTN_RES_CATCHALL
 
 
+def _as_row_major_last_dim(x: torch.Tensor) -> torch.Tensor:
+    """Like ``x.contiguous()``, but skips the copy when the last dimension is
+    already stride-1.
+
+    The kernel only ever indexes ``block_residual`` (and every other tensor
+    passed through here) via its own per-row/per-block strides -- it never
+    assumes the WHOLE tensor is contiguous, only that each row's H elements
+    are. A plain ``.contiguous()`` doesn't know that: given a ``[T, B, H]``
+    view sliced out of a bigger ``[T, N_cap, H]`` buffer (see
+    ``AttnRes``/``_grow_block_residual_in_place`` in ``attention_residual.py``,
+    the model-level wrapper), PyTorch considers it non-contiguous purely
+    because ``stride(0) == N_cap * H != B * H``, even though every row is laid
+    out exactly as this kernel wants. Calling ``.contiguous()`` on it
+    unconditionally would silently relocate the entire ``[T, B, H]`` block on
+    every single call -- exactly the HBM traffic the grow-in-place buffer
+    exists to avoid.
+    """
+    if x.stride(-1) == 1:
+        return x
+    return x.contiguous()
+
+
 def _apply_attn_res_impl(
     prefix_sum: torch.Tensor,  # [T, H]
     block_residual: torch.Tensor,  # [T, B, H]
@@ -269,7 +291,7 @@ def _apply_attn_res_impl(
     if do_add2 and not do_add:
         raise ValueError("add_hidden2 requires add_hidden")
     out_norm = out_norm_weight is not None
-    br = block_residual.contiguous()
+    br = _as_row_major_last_dim(block_residual)
     ps = prefix_sum.contiguous()
     sw = score_weight.contiguous()
     y = torch.empty((T, H), device=block_residual.device, dtype=prefix_sum.dtype)
