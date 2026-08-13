@@ -150,11 +150,11 @@ def _install_draft_extend_fused_swa_patch() -> None:
             )
             if kv_fp8:
                 kwargs.update(
-                    swa_nope_scale_buff=attn.swa_kv,
-                    swa_rope_buff=attn.swa_kv_rope,
+                    swa_nope_scale_buff=attn.swa_plane,
+                    swa_rope_buff=attn.swa_plane_rope,
                 )
             else:
-                kwargs["swa_kv"] = attn.swa_kv
+                kwargs["swa_kv"] = attn.swa_plane
         return original_qk_norm_rope_maybe_quant(*args, **kwargs)
 
     def swa_write(*args, **kwargs):
