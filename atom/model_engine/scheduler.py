@@ -35,6 +35,52 @@ from atom.utils import envs
 logger = logging.getLogger("atom")
 
 
+class _ScheduledComputeTokens:
+    """Accumulate actual scheduled compute tokens and log them periodically."""
+
+    def __init__(self, dp_rank: int | None, log_interval_s: float = 10.0):
+        self.dp_rank = dp_rank
+        self.log_interval_s = log_interval_s
+        self.prefill_total = 0
+        self.decode_total = 0
+        self._logged_prefill = 0
+        self._logged_decode = 0
+        self._last_log_time = time.monotonic()
+
+    def record(self, *, prefill: int = 0, decode: int = 0) -> None:
+        self.prefill_total += prefill
+        self.decode_total += decode
+        self._log_if_due()
+
+    def flush(self) -> None:
+        self._log_if_due(force=True)
+
+    def _log_if_due(self, *, force: bool = False) -> None:
+        now = time.monotonic()
+        interval_s = now - self._last_log_time
+        if not force and interval_s < self.log_interval_s:
+            return
+
+        prefill_tokens = self.prefill_total - self._logged_prefill
+        decode_tokens = self.decode_total - self._logged_decode
+        if prefill_tokens or decode_tokens:
+            logger.info(
+                "[SCHEDULED-COMPUTE] dp_rank=%s interval_s=%.3f "
+                "prefill_tokens=%d decode_tokens=%d "
+                "prefill_total=%d decode_total=%d",
+                self.dp_rank,
+                interval_s,
+                prefill_tokens,
+                decode_tokens,
+                self.prefill_total,
+                self.decode_total,
+            )
+
+        self._logged_prefill = self.prefill_total
+        self._logged_decode = self.decode_total
+        self._last_log_time = now
+
+
 class SpecStats:
     """Tracks speculative decoding acceptance statistics."""
 
@@ -638,6 +684,7 @@ class Scheduler:
             if parallel_cfg is not None
             else None
         )
+        self._scheduled_compute_tokens = _ScheduledComputeTokens(dp_rank)
         if kv_events_cfg is not None and kv_events_cfg.enable:
             self.kv_event_publisher: _EventPublisher = _make_publisher(
                 enabled=True,
@@ -825,6 +872,7 @@ class Scheduler:
     def shutdown_kv_events(self) -> None:
         """Tear down the publisher background thread and ZMQ socket. Called
         by EngineCore on engine shutdown."""
+        self._scheduled_compute_tokens.flush()
         try:
             self.kv_event_publisher.shutdown()
         except Exception:
@@ -1275,6 +1323,7 @@ class Scheduler:
                     scheduled_seqs, num_scheduled_tokens, is_final_chunk
                 )
 
+            self._scheduled_compute_tokens.record(prefill=total_tokens_num_prefill)
             return (prefill_batch, scheduled_seqs)
 
         # --- Decode scheduling ---
@@ -1385,6 +1434,7 @@ class Scheduler:
             remote_kv_block_ids=sorted(remote_kv_blocks) if remote_kv_blocks else [],
             remote_kv_seq_blocks=remote_kv_seq_blocks,
         )
+        self._scheduled_compute_tokens.record(decode=total_tokens_num_decode)
         return (decode_batch, scheduled_seqs)
 
     # -- Remote KV / offload admission helpers ------------------------------
@@ -2488,6 +2538,13 @@ class PrefillScheduler:
     def __init__(self, config: Config, disagg_cu_shm_name: str = ""):
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
+        parallel_cfg = getattr(config, "parallel_config", None)
+        dp_rank = (
+            getattr(parallel_cfg, "data_parallel_rank", None)
+            if parallel_cfg is not None
+            else None
+        )
+        self._scheduled_compute_tokens = _ScheduledComputeTokens(dp_rank)
         self.block_manager = None  # blocks managed by decode process
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
@@ -2523,7 +2580,7 @@ class PrefillScheduler:
 
     def shutdown_kv_events(self) -> None:
         # No-op: see publish_kv_events.
-        pass
+        self._scheduled_compute_tokens.flush()
 
     def add(self, seq: Sequence):
         self.waiting.append(seq)
@@ -2576,6 +2633,7 @@ class PrefillScheduler:
             decode_tokens = struct.unpack_from("I", self._cu_shm.buf, 0)[0]
             cu_fraction = _optimal_cu_fraction(decode_tokens, num_batched_tokens)
 
+        self._scheduled_compute_tokens.record(prefill=num_batched_tokens)
         return (
             ScheduledBatch(
                 seqs=scheduled_seqs,
@@ -2774,6 +2832,7 @@ class DecodeScheduler(Scheduler):
                 pwait = sum(seq.num_tokens for seq in self.prefill_waiting.values())
                 self.cu_fraction = _optimal_cu_fraction(total_tokens_num_decode, pwait)
 
+        self._scheduled_compute_tokens.record(decode=total_tokens_num_decode)
         return (
             ScheduledBatch(
                 seqs=scheduled_seqs,
