@@ -37,7 +37,6 @@ use crate::{
     },
     protocols::{
         chat::ChatCompletionRequest,
-        completion::CompletionRequest,
         generate::GenerateRequest,
         parser::{ParseFunctionCallRequest, SeparateReasoningRequest},
         responses::{ResponsesGetParams, ResponsesRequest},
@@ -48,6 +47,7 @@ use crate::{
     routers::{
         atom_standalone::AtomStandaloneRuntime,
         comm::{conversations, parse, tokenize},
+        completion_request::CompletionRequest,
         router_manager::RouterManager,
         RouterTrait,
     },
@@ -147,7 +147,7 @@ async fn v1_completions(
 ) -> Response {
     state
         .router
-        .route_completion(Some(&headers), &body, Some(&body.model))
+        .route_completion(Some(&headers), &body, Some(body.model()))
         .await
 }
 
