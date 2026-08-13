@@ -73,9 +73,7 @@ class KVOutputAggregator:
         self._seen_saving: dict[SaveCompletionId, set[int]] = {}
         self._seen_loading: dict[LoadCompletionId, set[int]] = {}
         self._seen_load_failed: dict[LoadCompletionId, set[int]] = {}
-        self._seen_connector_completion: dict[
-            ConnectorCompletionKey, set[int]
-        ] = {}
+        self._seen_connector_completion: dict[ConnectorCompletionKey, set[int]] = {}
         self._seen_connector_completion_failed: dict[
             ConnectorCompletionKey, set[int]
         ] = {}
@@ -85,9 +83,9 @@ class KVOutputAggregator:
         self._terminal_load: set[LoadOperationId] = set()
         self._terminal_sending_order: deque[SendOperationId] = deque()
         self._terminal_sending: set[SendOperationId] = set()
-        self._terminal_connector_completion_order: deque[
-            ConnectorCompletionKey
-        ] = deque()
+        self._terminal_connector_completion_order: deque[ConnectorCompletionKey] = (
+            deque()
+        )
         self._terminal_connector_completion: set[ConnectorCompletionKey] = set()
 
     @property
@@ -272,10 +270,9 @@ class KVOutputAggregator:
 
     def _remember_terminal(
         self,
-        operation: SaveOperationId
-        | LoadOperationId
-        | SendOperationId
-        | ConnectorCompletionKey,
+        operation: (
+            SaveOperationId | LoadOperationId | SendOperationId | ConnectorCompletionKey
+        ),
         order: deque,
         tombstones: set,
     ) -> None:

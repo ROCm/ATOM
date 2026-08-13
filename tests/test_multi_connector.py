@@ -21,13 +21,13 @@ from atom.kv_transfer.disaggregation.multi.multi_connector import (
     MultiConnectorScheduler,
 )
 from atom.kv_transfer.disaggregation.types import (
+    STATE_CHECKPOINT_STAGING_CHANNEL,
     ConnectorCompletion,
     ConnectorMetadata,
     KVConnectorOutput,
     LoadOperationId,
     SaveOperationId,
     SendOperationId,
-    STATE_CHECKPOINT_STAGING_CHANNEL,
 )
 from atom.kv_transfer.offload.hybrid.dsv4.connector import (
     DSV4_CHECKPOINT_SAVE_CHANNEL,
@@ -576,9 +576,10 @@ def test_build_connector_meta_records_completion_channel_owner():
     assert meta.completion_channel_owners == {
         STATE_CHECKPOINT_STAGING_CHANNEL: 1,
     }
-    assert meta.requests_for_completion_channel(
-        STATE_CHECKPOINT_STAGING_CHANNEL
-    ) == owner.meta.requests
+    assert (
+        meta.requests_for_completion_channel(STATE_CHECKPOINT_STAGING_CHANNEL)
+        == owner.meta.requests
+    )
     assert meta.requests_for_completion_channel("unknown") == []
 
 
@@ -904,9 +905,7 @@ def test_page_then_sidecar_only_save_keeps_send_paired_until_both_finish():
     assert w.pairing_state_count == (1, 0)
 
     moriio._finished = ({9}, set())
-    off._finished = KVConnectorOutput(
-        connector_completions={sidecar_completion}
-    )
+    off._finished = KVConnectorOutput(connector_completions={sidecar_completion})
     page_done = w.get_finished()
 
     assert page_done.finished_sending == set()

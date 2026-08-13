@@ -15,6 +15,7 @@ from atom.kv_transfer.disaggregation.base import (
 )
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.kv_transfer.disaggregation.types import (
+    STATE_CHECKPOINT_STAGING_CHANNEL,
     ConnectorCompletion,
     ConnectorMetadata,
     KVConnectorOutput,
@@ -22,10 +23,10 @@ from atom.kv_transfer.disaggregation.types import (
     ReqMeta,
     SaveOperationId,
     SendOperationId,
-    STATE_CHECKPOINT_STAGING_CHANNEL,
 )
 
 __all__ = [
+    "STATE_CHECKPOINT_STAGING_CHANNEL",
     "ConnectorCompletion",
     "ConnectorMetadata",
     "KVConnectorBase",
@@ -37,5 +38,4 @@ __all__ = [
     "ReqMeta",
     "SaveOperationId",
     "SendOperationId",
-    "STATE_CHECKPOINT_STAGING_CHANNEL",
 ]

@@ -287,9 +287,7 @@ class MultiConnector(KVConnectorBase):
         # Completion channels have exactly one child owner. This keeps a
         # composite connector generic and prevents two children from reading
         # the same native checkpoint lease behind one completion identity.
-        self._completion_channel_owners = _completion_channel_owners(
-            self._connectors
-        )
+        self._completion_channel_owners = _completion_channel_owners(self._connectors)
 
     def register_kv_caches(
         self,
@@ -349,9 +347,7 @@ class MultiConnector(KVConnectorBase):
                 if operation not in self._pending_save:
                     self._pending_save[operation] = set()
                     self._operation_output[operation] = output
-                    self._req_operations.setdefault(req_key, deque()).append(
-                        operation
-                    )
+                    self._req_operations.setdefault(req_key, deque()).append(operation)
                 self._pending_save[operation].add(connector_idx)
             c.start_load_kv(m)
 
@@ -519,9 +515,7 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         self.recap_prefill_after_finalize = any(
             getattr(c, "recap_prefill_after_finalize", False) for c in self._connectors
         )
-        self._completion_channel_owners = _completion_channel_owners(
-            self._connectors
-        )
+        self._completion_channel_owners = _completion_channel_owners(self._connectors)
         self.completion_channels = frozenset(self._completion_channel_owners)
         self._load_owner_by_req: dict[str, tuple[object, int]] = {}
         self._load_operation_owner: dict[LoadOperationId, tuple[int, object]] = {}

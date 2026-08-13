@@ -9,8 +9,8 @@ from types import SimpleNamespace
 
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.kv_transfer.disaggregation.types import (
-    ConnectorCompletion,
     STATE_CHECKPOINT_STAGING_CHANNEL,
+    ConnectorCompletion,
 )
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload.connector import (

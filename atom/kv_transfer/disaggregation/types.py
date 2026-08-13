@@ -79,9 +79,7 @@ LoadCompletionId = ReqId | LoadOperationId
 # aggregation.  Backend-specific channels stay in their backend package.
 STATE_CHECKPOINT_STAGING_CHANNEL = "atom.state_checkpoint.staging"
 
-ConnectorCompletionId = (
-    ReqId | SendOperationId | SaveOperationId | LoadOperationId
-)
+ConnectorCompletionId = ReqId | SendOperationId | SaveOperationId | LoadOperationId
 ConnectorCompletionKey = tuple[str, ConnectorCompletionId]
 
 # ---------------------------------------------------------------------------

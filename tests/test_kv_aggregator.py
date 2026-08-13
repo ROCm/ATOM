@@ -13,10 +13,10 @@ from atom.kv_transfer.disaggregation import (
     KVOutputAggregator,
 )
 from atom.kv_transfer.disaggregation.types import (
+    STATE_CHECKPOINT_STAGING_CHANNEL,
     LoadOperationId,
     SaveOperationId,
     SendOperationId,
-    STATE_CHECKPOINT_STAGING_CHANNEL,
 )
 from atom.kv_transfer.offload.hybrid.dsv4.connector import (
     DSV4_CHECKPOINT_SAVE_CHANNEL,
@@ -573,9 +573,7 @@ class TestKVConnectorOutput:
         assert not KVConnectorOutput(finished_recving={"x"}).is_empty()
         assert not KVConnectorOutput(finished_loading={"x"}).is_empty()
         assert not KVConnectorOutput(
-            connector_completions={
-                _completion(DSV4_CHECKPOINT_SAVE_CHANNEL, "x")
-            }
+            connector_completions={_completion(DSV4_CHECKPOINT_SAVE_CHANNEL, "x")}
         ).is_empty()
         assert not KVConnectorOutput(
             connector_completions={
@@ -591,9 +589,7 @@ class TestKVConnectorOutput:
         out = KVConnectorOutput(
             finished_sending={"a"},
             finished_recving={"b"},
-            connector_completions={
-                _completion(DSV4_CHECKPOINT_SAVE_CHANNEL, "c")
-            },
+            connector_completions={_completion(DSV4_CHECKPOINT_SAVE_CHANNEL, "c")},
         )
         r = repr(out)
         assert "sending" in r

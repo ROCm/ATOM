@@ -40,6 +40,7 @@ from atom.kv_transfer.disaggregation.base import (
     KVConnectorSchedulerBase,
 )
 from atom.kv_transfer.disaggregation.types import (
+    STATE_CHECKPOINT_STAGING_CHANNEL,
     ConnectorCompletion,
     KVConnectorOutput,
     LoadCompletionId,
@@ -47,7 +48,6 @@ from atom.kv_transfer.disaggregation.types import (
     ReqId,
     SaveCompletionId,
     SaveOperationId,
-    STATE_CHECKPOINT_STAGING_CHANNEL,
 )
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector

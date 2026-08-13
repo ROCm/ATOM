@@ -192,3 +192,34 @@ all TP ranks terminal (KVOutputAggregator)
 9. git diff --check
 10. GitHub Pre Checkin
 ```
+
+## 2026-08-13：首次 review push 后的 Codecheck 修复
+
+提交 `7e48636` 推送后，GitHub Pre Checkin 首先在代码风格阶段失败：
+
+```text
+Black 26.5.1: formatting differences
+Ruff 0.16.2: import ordering / __all__ ordering / TRY004 / RUF012
+```
+
+处理内容：
+
+- 使用与 CI 相同的 Black `26.5.1` 格式化本次 Python 变更。
+- 使用 Ruff `0.16.2` 修复 import、`__all__`、异常类型和测试 class attribute。
+- 聚焦测试发现 `_attach_state_checkpoint_plan()` 在没有 exact checkpoint
+  identity match 时也提前要求 staging channel owner；现改为先计算
+  `matching_checkpoints`，只有确实准备申请 lease 时才校验 owner。
+- 更新旧测试契约：完整 native D2D copy plan 只保留在
+  `ScheduledBatch.state_checkpoint_copies`；connector metadata 只携带真正取得
+  offload lease 的 subset。
+
+本地验证结果：
+
+```text
+Black 26.5.1 --check --diff .                       PASS
+Ruff 0.16.2（本次全部 Python 变更）                 PASS
+聚焦 connector/scheduler tests                     445 passed
+完整 non-GPU CI 等价范围                            1694 passed, 103 skipped
+compileall                                          PASS
+git diff --check                                    PASS
+```
