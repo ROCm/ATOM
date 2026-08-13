@@ -3,15 +3,9 @@
 
 """PP-aware offload KV status aggregator.
 
-Under pipeline parallelism each stage holds DIFFERENT layers, so a request's
-offload load/save is complete only when ALL stages report done.  Any single
-stage failure fails the entire request (the scheduler falls back to recompute).
-
-This is distinct from the TP aggregator (:class:`KVOutputAggregator`) where
-workers hold the SAME layers sharded across heads — there the semantics are
-identical (all-must-succeed), but the data path is different (the TP aggregator
-collects from local workers via shared-memory queues; this one collects from
-remote PP stage processes via ZMQ).
+Each PP stage holds different layers, so a request's offload load/save is
+complete only when all stages report done. Any single stage failure fails
+the entire request.
 """
 
 from __future__ import annotations

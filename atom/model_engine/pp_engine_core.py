@@ -172,17 +172,9 @@ class PPEngineCoreProc(EngineCore):
     def _dispatch_connector_only_batch(self, batch) -> None:
         """Dispatch the KV connector metadata of a batch that has no requests.
 
-        ``Scheduler.schedule()`` attaches connector metadata to every batch it
-        returns, including the request-less one it returns once every sequence
-        is parked waiting on an offload load. That metadata is what starts those
-        loads, so dropping the batch strands them and the head spins forever on
-        a queue it can never drain. Rebuilding it later does not work either:
-        ``build_connector_meta`` consumes the connector's pending state, so by
-        then there is nothing left to rebuild from.
-
-        Every stage must see it or ``PPKVAggregator`` never reaches a global
-        completion, so it goes out on the channel a real batch would use.
-        ``_downstream_busy_loop`` skips the forward for a request-less batch.
+        The metadata starts offload loads; dropping it strands parked
+        sequences. Every stage must see it so ``PPKVAggregator`` reaches
+        global completion.
         """
         if not self.kv_transfer_enabled:
             return

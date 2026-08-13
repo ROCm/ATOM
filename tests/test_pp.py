@@ -751,8 +751,7 @@ def test_parked_seq_prefix_is_discoverable_after_load():
     """End-to-end shape of the offload promote path.
 
     Park mid-prefill, publish the "loaded" range on top, and check a fresh
-    same-prefix request can find the whole thing — the failure mode was
-    `publish_loaded_prefix` returning 0 because the boundary block was unhashed.
+    same-prefix request can find the whole thing.
     """
     bs = 16
     cfg = _pp_config(

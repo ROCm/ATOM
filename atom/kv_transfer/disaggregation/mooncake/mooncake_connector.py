@@ -954,11 +954,7 @@ class MooncakeConnector(KVConnectorBase):
                 "transfer_id": meta.transfer_id,
                 "consumer_host": self.local_ip,
                 "consumer_rpc_port": self.rpc_port,
-                # Per-group width of the consumer's region list. The producer
-                # derives the same number by dividing, which cannot tell an equal
-                # number of wider groups from a different number of groups — the
-                # one region-mapping error that stays in range and so writes
-                # silently wrong KV.
+                # Consumer's layer count per group for producer stride validation.
                 "consumer_num_layers": self._num_local_layers,
                 "dst_block_ids": dst_block_ids,
                 # Source block_ids so downstream stages (no scheduler, no
@@ -1346,18 +1342,9 @@ class MooncakeConnector(KVConnectorBase):
     ) -> list[int]:
         """Map this stage's local RDMA regions onto the consumer's region list.
 
-        Backends register regions group-major (all layers of one kind, then the
-        next), so a pipeline stage's local region ``i`` maps to consumer index
-        ``(i // L) * stride + start_layer + (i % L)`` where ``L`` is this stage's
-        layer count and ``stride`` is the consumer's per-group width.  Returns the
-        identity map for the non-PP case.
-
-        Raises when the layout is not expressible.  Identity is only a valid
-        fallback at ``pp_size == 1`` (handled inside ``consumer_region_indices``);
-        under PP it would write this stage's layers onto the consumer's layers
-        ``0..L`` — in range, so RDMA reports success and the KV is silently wrong.
-        Failing the transfer surfaces as a consumer timeout instead, which is
-        diagnosable.
+        Group-major layout: region ``i`` maps to
+        ``(i // L) * stride + start_layer + (i % L)``.
+        Identity for pp_size == 1. Raises on layout mismatch.
         """
         if (
             consumer_num_layers is not None

@@ -4339,6 +4339,8 @@ def test_cpu_budget_split_preserves_total_and_equalizes_horizon(monkeypatch):
 
 
 def test_cpu_budget_split_counts_the_draft_layer_on_the_last_stage(monkeypatch):
+    # Last stage binds the draft KV layer, so its budget must cover 19
+    # layers, not 18.
     import atom.models.utils as model_utils
     from atom.kv_transfer.offload import config as offcfg
 

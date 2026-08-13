@@ -261,26 +261,12 @@ def build_lmcache_config(
 def scale_cpu_size_for_pp(cfg, config) -> None:
     """Split the CPU offload budget across PP stages by layer count.
 
-    Every stage reads the same ``LMCACHE_MAX_LOCAL_CPU_SIZE``, but a stage only
-    holds its own slice of layers, so its bytes-per-token scales with that
-    slice. Equal GB therefore buys unequal token horizons: under an uneven
-    split like 18,20,20,20 the 18-layer stage caches ~11% more tokens than the
-    others. Loads are all-or-nothing across stages, so those extra tokens are
-    never usable — a prefix that survived only on the widest stage still forces
-    a full recompute, and the bytes that stage read back are wasted. Measured
-    on a 4-stage GLM-5.2 agentic replay: 22.4% of requests fell back this way
-    while one stage had the whole prefix in hand.
+    Give each stage a share proportional to its bound layer count so all
+    stages reach the same token horizon. Loads are all-or-nothing across
+    stages, so unequal horizons waste the longer stage's extra capacity.
 
-    Give each stage a share proportional to its layer count, leaving the total
-    (``pp_size * configured``) unchanged. The horizon then works out to
-    ``configured * pp_size / (total_layers * bytes_per_token_per_layer)`` on
-    every stage, independent of how the layers were split.
-
-    Speculative decode binds the draft's KV layer on the last PP stage only, and
-    the offload codec moves every bound layer — so that stage's bytes-per-token
-    covers one more layer than its slice of the target. Counting only target
-    layers would under-budget it and, since loads are all-or-nothing, drag the
-    whole node's horizon down to the short stage.
+    The last PP stage binds the draft KV layer (spec decode), so its
+    layer count is one more than its target-model slice.
     """
     pp_size = int(getattr(config, "pipeline_parallel_size", 1) or 1)
     if pp_size <= 1:
