@@ -165,6 +165,12 @@ class Sequence:
         # is built.
         # -1 = nothing pending, which is also what `deallocate` restores.
         self.pending_checkpoint = -1
+        # Whether that pending checkpoint sits at a position that only guesses
+        # where the next turn resumes, rather than at this prompt's own end.
+        # Carried alongside `pending_checkpoint` because the copy that files it
+        # happens a step later, by which time the position is gone —
+        # `StateGroupPool.mark_speculative` says what the distinction buys.
+        self.pending_checkpoint_is_guess = False
         self.temperature = sampling_params.temperature
         self.top_k = sampling_params.top_k
         self.top_p = sampling_params.top_p

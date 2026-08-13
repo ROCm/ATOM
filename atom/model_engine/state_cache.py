@@ -95,13 +95,18 @@ class StateCache(Protocol):
         """
         ...
 
-    def publish_midstep(self, reservations: list[tuple]) -> None:
+    def publish_midstep(self, reservations: list[tuple], seq: Sequence = None) -> None:
         """File reservations whose bytes the completed forward has now written.
 
         The other half of `reserve_midstep`, and the split is the point:
         publishing before the forward would index a boundary over bytes nobody
         had written, and a request resuming there would read the destination's
         previous tenant.
+
+        `seq` lets an implementation tell this prompt's own end — the position
+        the next turn actually resumes at — from the ladder and demand rungs,
+        which only guess. Optional: a class that ranks its checkpoints equally
+        ignores it.
         """
         ...
 

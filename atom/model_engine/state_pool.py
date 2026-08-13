@@ -210,6 +210,12 @@ class StateGroupPool:
         self._free: set[int] = set(range(num_groups))
         self._vacant: list[int] = list(range(num_groups))
         self._checkpointed: deque[int] = deque()
+        # Groups whose checkpoint is a guess rather than this prompt's own end;
+        # `mark_speculative` explains what the distinction is worth. Cleared
+        # when the guess pays off (`promote`) or the content goes (`release` of
+        # a group carrying nothing) — both of which end the group's claim to be
+        # spent first.
+        self._speculative: set[int] = set()
         # hash -> group holding the state as of that block boundary.
         self.hash_to_group: dict[int, int] = {}
         # Reverse map, for lazy eviction when a group is handed out. -1 = the
@@ -288,6 +294,10 @@ class StateGroupPool:
             group = self._checkpointed.popleft()
             self._free.discard(group)
             self.checkpoints_evicted += 1
+        # Whatever guess this group carried is spent with it. Not folded into
+        # `invalidate`, which also runs on the re-file inside `_index` and would
+        # clear a mark `_commit_pending` had only just made.
+        self._speculative.discard(group)
         self.invalidate(group)
         return group
 
@@ -320,17 +330,61 @@ class StateGroupPool:
         if self.group_hash[group] != -1:
             self._checkpointed.remove(group)
 
+    def mark_speculative(self, group: int) -> None:
+        """File `group` at the LRU *head* when it is released, not the tail.
+
+        The next shortage then spends it before every checkpoint already held.
+        For a placement that guesses where reuse will resume rather than
+        knowing: the ladder rung and the demand guess, the prompt-end anchor
+        knows.
+
+        The guess and the knowledge are not close in value. Measured on the
+        cc-traces at conc 4, prompt-end anchors are read back 85.2% of the time
+        and demand rungs 2.8%, while the demand is 47% of all writes (1,370 of
+        2,919) — so under plain LRU the placement almost never read evicts the
+        one almost always read. Demoting rather than dropping keeps the demand's
+        own purpose: it exists to fill a gap once, and one spent before it is
+        read cost nothing a checkpoint never taken would have saved.
+
+        A mark, not an argument to `release`, because the group that carries a
+        checkpoint under `fork` is *pinned* rather than released — it goes back
+        through `release_pins` two passes later, which knows only the group
+        index. Marking is the one mechanism both paths can reach.
+        """
+        if self.enabled:
+            self._speculative.add(group)
+
+    def promote(self, group: int) -> None:
+        """A guess paid off: stop spending this one first.
+
+        Called from the resume path when a request actually reads `group`. The
+        group may be on the free list right now, so move it in `_checkpointed`
+        too rather than only clearing the mark — otherwise the promotion would
+        not take effect until something released it again.
+        """
+        if not self.enabled or group not in self._speculative:
+            return
+        self._speculative.discard(group)
+        if group in self._free and self.group_hash[group] != -1:
+            self._checkpointed.remove(group)
+            self._checkpointed.append(group)
+
     def release(self, group: int) -> None:
         """Hand a group back, to whichever half its content puts it in.
 
         A group still carrying a checkpoint goes to the LRU tail, so being
         resumed from refreshes it — `claim` deliberately leaves the hash in
-        place, which is what makes reuse count as use.
+        place, which is what makes reuse count as use. One marked by
+        `mark_speculative` goes to the head instead.
         """
         self._free.add(group)
         if self.group_hash[group] != -1:
-            self._checkpointed.append(group)
+            if group in self._speculative:
+                self._checkpointed.appendleft(group)
+            else:
+                self._checkpointed.append(group)
             return
+        self._speculative.discard(group)
         heappush(self._vacant, group)
         # Every group that took a hash while vacant left an entry behind, so on
         # a long-lived server the stale ones outnumber the live ones without
@@ -544,14 +598,24 @@ class StateGroupPool:
             out.append((self.pop(), pos, h))
         return out
 
-    def publish_midstep(self, reservations: list[tuple]) -> None:
+    def publish_midstep(self, reservations: list[tuple], seq=None) -> None:
         """File each reserved group under its hash, now that its bytes exist.
 
         The group goes back on the free list *as a checkpoint* — the same
         capacity-neutral move `checkpoint` makes, covered by the same lazy
         eviction: whoever pops it next invalidates the hash on the way out.
+
+        A position that is not this prompt's own end is marked speculative and
+        goes to the LRU head — the ladder rung and the demand guess where the
+        next turn will resume, the anchor knows; `mark_speculative` gives what
+        the difference measures. `seq` is optional so a caller with no sequence
+        in hand still publishes, as the anchor, which is the conservative half
+        of the choice.
         """
-        for group, _pos, h in reservations:
+        anchor = getattr(seq, "checkpoint_end_pos", 0) if seq is not None else 0
+        for group, pos, h in reservations:
+            if anchor and pos != anchor:
+                self.mark_speculative(group)
             self._index(h, group)
             self.release(group)
             self.checkpoints_kept += 1
@@ -584,9 +648,10 @@ class StateGroupPool:
         a checkpoint indexed before its bytes exist would hand a resuming
         request whatever the destination happened to hold.
 
-        `boundary_blocks` is unused here: a group is a single entry, not a span
-        of them. It is in the protocol for classes whose checkpoint is a run of
-        entries ending at the boundary.
+        `boundary_blocks` names the position, which is all this needs it for: a
+        group is a single entry, not a span of them, but whether the position
+        is this prompt's own end decides where the checkpoint sits in the LRU
+        order — see `mark_speculative`.
 
         Best-effort under both: with no free group the seq simply keeps writing
         its own and no checkpoint is taken.
@@ -596,12 +661,15 @@ class StateGroupPool:
         old = seq.per_req_cache_group
         if old < 0:
             return
+        anchor = getattr(seq, "checkpoint_end_pos", 0)
+        guess = bool(anchor) and boundary_blocks * self.hash_block_size != anchor
         if self.transfer.copies:
             if seq.pending_checkpoint == -1:
                 self._checkpoint_pending.append(seq)
             # A later boundary supersedes an earlier one: the group holds the
             # state as of the last forward, so only the last position is true.
             seq.pending_checkpoint = h
+            seq.pending_checkpoint_is_guess = guess
             return
         if not self.has_free():
             self.checkpoints_dropped += 1
@@ -615,6 +683,8 @@ class StateGroupPool:
         # could pop it, and then one kernel would read and write it at once.
         # `_index` files it either way; `_set_hash` leaves a non-free group be.
         self._index(h, old)
+        if guess:
+            self.mark_speculative(old)
         self.pin(old, reader_is_next_batch=True)
         self.checkpoints_kept += 1
 
@@ -635,6 +705,10 @@ class StateGroupPool:
             return
         for seq in self._checkpoint_pending:
             h, seq.pending_checkpoint = seq.pending_checkpoint, -1
+            guess, seq.pending_checkpoint_is_guess = (
+                seq.pending_checkpoint_is_guess,
+                False,
+            )
             src = seq.per_req_cache_group
             if h == -1 or src < 0:
                 continue
@@ -643,6 +717,10 @@ class StateGroupPool:
                 continue
             dst = self.pop()
             self.release(dst)
+            # Before `_index`, which re-files the group through `_set_hash` and
+            # is therefore where the LRU position is actually decided.
+            if guess:
+                self.mark_speculative(dst)
             self._index(h, dst)
             self._copies.append((src, dst))
             self.checkpoints_kept += 1
@@ -661,10 +739,19 @@ class StateGroupPool:
         """How much of this pool is live, held by checkpoints, or spare.
 
         Separate from `checkpoint_fates` because those are cumulative events
-        and these are an instantaneous reading. Together they answer whether
-        this pool is under pressure at all: a `groups_held` far below
-        `groups_total` with `checkpoints_evicted` at 0 means it is not, and
-        the bytes reserved for it are the ones the paged pool is missing.
+        and these are an instantaneous reading.
+
+        `groups_vacant` at 0 is not a shortage. A group with no live owner sits
+        on the free list either way; vacant just means it also has no content
+        left to lose. A steady state of all-held-none-vacant is this pool
+        working, and admission never consults the split — `has_free` counts the
+        whole free list.
+
+        The reading that says "too small" is `checkpoints_dropped`: the ladder
+        asked to keep a checkpoint and there was no free group to put it in.
+        Not `checkpoints_evicted`, which only says more checkpoints were taken
+        than a pool this size can hold at once, and which is therefore roughly
+        `kept - num_groups` for any workload that outlives the pool.
         """
         held = sum(1 for g in self._free if self.group_hash[g] != -1)
         return {

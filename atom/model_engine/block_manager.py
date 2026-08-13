@@ -430,6 +430,11 @@ class BlockManager:
             seq.per_req_cache_group = self.state.pop()
             seq.state_fork_src = -1
             return
+        # Being resumed from is the evidence a guessed position was right, so a
+        # checkpoint that pays off stops being spent first — see
+        # `StateGroupPool.mark_speculative`. Here rather than in `claim`, which
+        # `_set_hash` also calls to re-file a group that nobody read.
+        self.state.promote(src)
         shared = self.state.is_pinned(src)
         if not shared:
             self.state.claim(src)
@@ -856,7 +861,7 @@ class BlockManager:
         """
         if not seq.midstep_reservations:
             return
-        self.state.publish_midstep(seq.midstep_reservations)
+        self.state.publish_midstep(seq.midstep_reservations, seq)
         # The rightmost published position, for the decode-side spacing rule in
         # `checkpointers_at`. Generation is never midstep-readable — its
         # forwards end where acceptance puts them — so it still measures from
