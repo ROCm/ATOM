@@ -2655,11 +2655,9 @@ class Scheduler:
 
         logger.debug("KV transfer finished for seq %s, ready for scheduling.", seq.id)
 
-        # Publish the received prompt blocks into the local prefix cache so the
-        # NEXT turn on this decode node matches this prefix and pulls only the
-        # delta. Hashes full blocks (reused local-hit + RDMA-received); the decode
-        # node never runs a prefill forward for these requests, so this is the
-        # only place their prompt blocks get hashed. Runs on the consumer only.
+        # Hash received prompt blocks into prefix cache so the next turn
+        # transfers only the delta. Decode never runs prefill forward, so
+        # this is the only place these blocks get hashed.
         bm = self.block_manager
         prefix_caching = getattr(bm, "enable_prefix_caching", False)
         kv_events = bm.kv_events_enabled
@@ -2667,12 +2665,8 @@ class Scheduler:
             return True
 
         num_cached_blocks = seq.num_cached_tokens // bm.block_size
-        # PD consumer only: the decode node received the FULL prompt KV via RDMA,
-        # so hashing every prompt block for next-turn reuse is correct. The
-        # offload/LMCache wake path shares this method but only has a PREFIX
-        # loaded — its suffix KV is not computed until the resume prefill runs and
-        # is hashed by postprocess() — so registering here would publish garbage
-        # hashes for the uncomputed suffix.
+        # PD consumer only: full prompt KV arrived via RDMA, safe to hash all.
+        # Offload/LMCache path skipped — suffix KV not yet computed.
         if prefix_caching and not self._connector_flag("is_offload"):
             registered = bm.register_received_prefix(seq)
             if self._log_prefix_cache_per_req and registered:
@@ -2688,9 +2682,8 @@ class Scheduler:
                     max(0, registered - num_cached_blocks) * bs,
                 )
 
-        # Emit BlockStored(REMOTE) for the delta blocks (beyond the locally
-        # reused prefix) so external KV-cache consumers can track remote-resident
-        # blocks. Hashes are now published above, so the chain is walkable.
+        # Emit BlockStored(REMOTE) for delta blocks so external consumers
+        # can track remote-resident KV.
         if kv_events:
             remote_hashes: list[int] = []
             remote_tokens: list[int] = []
