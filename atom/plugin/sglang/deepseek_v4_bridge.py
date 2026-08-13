@@ -8,6 +8,8 @@ from typing import Any
 
 import numpy as np
 import torch
+import triton
+import triton.language as tl
 
 from atom.plugin.sglang.runtime.context import is_draft_extend_mode
 
@@ -43,6 +45,63 @@ class _ProxyRingGeometry:
             ring_stride=self.cache_size,
             run_rows=self.cache_size,
         )
+
+
+@triton.jit
+def _offset_proxy_hca_compress_rows_kernel(
+    positions,
+    batch_id_per_token,
+    chunk_start_per_seq,
+    n_committed_hca_per_seq,
+    prefix_hca_indptr,
+    prefix_hca_indices,
+    row_base,
+    win: tl.constexpr,
+    ratio: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    t = tl.program_id(0)
+    bid = tl.load(batch_id_per_token + t)
+    pos = tl.load(positions + t)
+    chunk_start = tl.load(chunk_start_per_seq + bid)
+    swa_low = tl.maximum(pos - win + 1, 0)
+    prefix_swa_count = tl.maximum(chunk_start - swa_low, 0)
+    n_hca = tl.minimum((pos + 1) // ratio, tl.load(n_committed_hca_per_seq + bid))
+    dst = tl.load(prefix_hca_indptr + t) + prefix_swa_count
+    offsets = tl.arange(0, BLOCK_N)
+    for start in tl.range(0, n_hca, BLOCK_N):
+        mask = start + offsets < n_hca
+        index = dst + start + offsets
+        value = tl.load(prefix_hca_indices + index, mask=mask)
+        tl.store(prefix_hca_indices + index, value + row_base, mask=mask)
+
+
+def _offset_proxy_hca_compress_rows(
+    *,
+    positions: torch.Tensor,
+    batch_id_per_token: torch.Tensor,
+    chunk_start_per_seq: torch.Tensor,
+    n_committed_hca_per_seq: torch.Tensor,
+    prefix_hca_indptr: torch.Tensor,
+    prefix_hca_indices: torch.Tensor,
+    row_base: int,
+    total_tokens: int,
+    window: int,
+) -> None:
+    if total_tokens == 0 or row_base == 0:
+        return
+    _offset_proxy_hca_compress_rows_kernel[(total_tokens,)](
+        positions,
+        batch_id_per_token,
+        chunk_start_per_seq,
+        n_committed_hca_per_seq,
+        prefix_hca_indptr,
+        prefix_hca_indices,
+        row_base,
+        win=window,
+        ratio=128,
+        BLOCK_N=triton.next_power_of_2(window),
+    )
 
 
 def _resolve_v4_index_topk(model: Any = None, proxy_pool: Any = None) -> int:
@@ -1844,7 +1903,17 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
         T=total,
         win=win,
         geometry=_ProxyRingGeometry(cs),
-        compress_base=int(md.swa_pages),
+    )
+    _offset_proxy_hca_compress_rows(
+        positions=positions[:total],
+        batch_id_per_token=md.batch_id_per_token,
+        chunk_start_per_seq=chunk_start_gpu,
+        n_committed_hca_per_seq=md.n_committed_hca_per_seq,
+        prefix_hca_indptr=hca_indptr,
+        prefix_hca_indices=bufs.idx_prefix_hca.gpu,
+        row_base=int(md.swa_pages),
+        total_tokens=total,
+        window=win,
     )
     md.kv_indices_extend = bufs.idx_extend.gpu
     md.kv_indices_prefix_swa = bufs.idx_prefix_swa.gpu
@@ -2200,7 +2269,17 @@ def _populate_prefill_indices(md, block_tables, batch_np, pos_np, q_np, device) 
         T=T,
         win=win,
         geometry=_ProxyRingGeometry(cs),
-        compress_base=int(md.swa_pages),
+    )
+    _offset_proxy_hca_compress_rows(
+        positions=t(pos_np),
+        batch_id_per_token=md.batch_id_per_token,
+        chunk_start_per_seq=t(chunk_start_per_seq),
+        n_committed_hca_per_seq=md.n_committed_hca_per_seq,
+        prefix_hca_indptr=t(hca_indptr_np),
+        prefix_hca_indices=hca_indices,
+        row_base=int(md.swa_pages),
+        total_tokens=T,
+        window=win,
     )
     md.kv_indices_extend = ext_indices[: int(ext_indptr_np[-1])]
     md.kv_indices_prefix_swa = swa_indices[: int(swa_indptr_np[-1])]
