@@ -633,20 +633,24 @@ class StateGroupPool:
         """
         if not self._checkpoint_pending:
             return
+        copy_start = len(self._copies)
         for seq in self._checkpoint_pending:
             h, seq.pending_checkpoint = seq.pending_checkpoint, -1
             src = seq.per_req_cache_group
             if h == -1 or src < 0:
                 continue
+            if self.lookup(h) >= 0:
+                continue
             if not self.has_free():
                 self.checkpoints_dropped += 1
                 continue
             dst = self.pop()
-            self.release(dst)
             self._index(h, dst)
             self._copies.append((src, dst))
             self.checkpoints_kept += 1
         self._checkpoint_pending.clear()
+        for _, dst in self._copies[copy_start:]:
+            self.release(dst)
 
     def checkpoint_fates(self) -> dict[str, int]:
         """What became of the checkpoints the ladder asked this pool to keep."""

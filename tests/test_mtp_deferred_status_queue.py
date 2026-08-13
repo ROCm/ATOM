@@ -2,6 +2,9 @@ from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
+import pytest
+
+pytest.importorskip("aiter", reason="requires AITER to import model_runner")
 
 from atom.model_engine.model_runner import tokenIDProcessor
 from atom.model_engine.scheduler import ScheduledBatch

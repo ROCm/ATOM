@@ -63,6 +63,24 @@ from atom.utils.forward_context import (
     get_forward_context,
 )
 
+
+def _sparse_index_workspace(
+    out: torch.Tensor | None,
+    total_out: int,
+    *,
+    device: torch.device,
+    name: str,
+) -> torch.Tensor:
+    if out is None:
+        return torch.empty(total_out, dtype=torch.int32, device=device)
+    if out.numel() < total_out:
+        raise RuntimeError(
+            f"{name} requires {total_out} int32 sparse-index slots, "
+            f"but workspace has only {out.numel()}."
+        )
+    return out[:total_out]
+
+
 from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (  # isort: skip
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant as _aiter_triton_fp8_bmm,
 )
@@ -1710,6 +1728,9 @@ def _convert_req_index_to_global_index_kernel(
     out_kv_indices,  # int32
     # shapes (compile-time where possible)
     NUM_TOPK_TOKENS: tl.constexpr,
+    OUT_NUMEL: tl.constexpr,
+    TOKEN_ROWS: tl.constexpr,
+    KV_INDICES_NUMEL: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,  # tile width along columns
     # strides (in elements)
@@ -1735,20 +1756,37 @@ def _convert_req_index_to_global_index_kernel(
     for token_id in range(qo_start, qo_end):
         # Load token indices for this tile
         ti_ptr = token_indices_ptr + token_id * ti_stride0 + indice_id * ti_stride1
-        tok = tl.load(ti_ptr)  # int32
+        valid_token_row = (token_id >= 0) & (token_id < TOKEN_ROWS)
+        tok = tl.load(ti_ptr, mask=valid_token_row, other=-1)  # int32
 
         # Split masks: store_mask = column-valid, load_mask adds tok-bound
         # guard to prevent OOB GPU fault (masked load yields 0 = valid page).
-        store_mask = (indice_id < kv_len) & (indice_id < NUM_TOPK_TOKENS)
-        load_mask = store_mask & (tok >= 0) & (tok < kv_len)
+        valid_col_mask = (indice_id < kv_len) & (indice_id < NUM_TOPK_TOKENS)
+        kv_offset = kv_start + tok
+        load_mask = (
+            valid_token_row
+            & valid_col_mask
+            & (tok >= 0)
+            & (tok < kv_len)
+            & (kv_offset >= 0)
+            & (kv_offset < KV_INDICES_NUMEL)
+        )
         out_val = tl.load(
-            kv_indices + kv_start + tok,
+            kv_indices + kv_offset,
             mask=load_mask,
             other=0,
         )
+        out_val = tl.where(out_val >= 0, out_val, 0)
 
         # Store results
-        out_ptr_ij = out_kv_indices + out_kv_start + indice_id
+        out_offset = out_kv_start + indice_id
+        store_mask = (
+            valid_token_row
+            & valid_col_mask
+            & (out_offset >= 0)
+            & (out_offset < OUT_NUMEL)
+        )
+        out_ptr_ij = out_kv_indices + out_offset
         tl.store(
             out_ptr_ij,
             out_val,
@@ -1773,9 +1811,8 @@ def triton_convert_req_index_to_global_index(
             token_indices[token_id, indice_id] // BLOCK_SIZE] * BLOCK_SIZE
         + token_indices[token_id, indice_id] % BLOCK_SIZE
 
-    Only when token_indices[token_id, indice_id] == -1 do we output -1.
-    For safety, we also output -1 if the derived block_id would be
-        out-of-bounds.
+    Invalid metadata is mapped to cache slot 0 so it cannot become a negative
+    or out-of-range address in the downstream assembly MLA kernel.
     """
     assert kv_indices.dtype == torch.int32
     assert token_indices.dtype == torch.int32
@@ -1785,20 +1822,31 @@ def triton_convert_req_index_to_global_index(
         f"BLOCK_N ({BLOCK_N})"
     )
 
-    num_batch = kv_indptr.shape[0] - 1
+    # DP attention can expose transient local/global metadata length skew.
+    # Launch only rows represented by every indptr; otherwise the kernel reads
+    # qo/page indptr one row past its allocation before payload guards apply.
+    num_batch = min(
+        qo_indptr.shape[0] - 1,
+        kv_indptr.shape[0] - 1,
+        page_kv_indptr.shape[0] - 1,
+    )
     tiles_per_row = NUM_TOPK_TOKENS // BLOCK_N
 
     # Ensure contiguous tensors on the same device
-    qo_indptr_c = qo_indptr.contiguous()
-    kv_indptr_c = kv_indptr.contiguous()
+    qo_indptr_c = qo_indptr[: num_batch + 1].contiguous()
+    kv_indptr_c = kv_indptr[: num_batch + 1].contiguous()
     kv_indices_c = kv_indices.contiguous()
     token_indices_c = token_indices.contiguous()
-    page_kv_indptr_c = page_kv_indptr.contiguous()
-    # NOTE: MTP (max_seqlen_q > 1) uses triton_convert_req_index_to_global_index_dsa_prefill instead
-    if out is not None:
-        new_kv_indices = out[: kv_indices.shape[0]]
-    else:
-        new_kv_indices = torch.empty_like(kv_indices)
+    page_kv_indptr_c = page_kv_indptr[: num_batch + 1].contiguous()
+    # Sparse output is packed by page_kv_indptr.  Its workspace upper bound is
+    # rows * topk, not the dense kv_indices length.
+    total_out = num_batch * NUM_TOPK_TOKENS
+    new_kv_indices = _sparse_index_workspace(
+        out,
+        total_out,
+        device=token_indices.device,
+        name="triton_convert_req_index_to_global_index",
+    )
 
     # Strides in elements
     ti_stride0, ti_stride1 = token_indices_c.stride()
@@ -1815,6 +1863,9 @@ def triton_convert_req_index_to_global_index(
         new_kv_indices,
         # shapes / constexprs
         NUM_TOPK_TOKENS,
+        new_kv_indices.numel(),
+        token_indices_c.shape[0],
+        kv_indices_c.numel(),
         BLOCK_SIZE,
         BLOCK_N,
         # strides
@@ -1835,6 +1886,9 @@ def _convert_req_index_to_global_index_dsa_prefill_kernel(
     out_kv_indices,  # int32
     # shapes (compile-time where possible)
     NUM_TOPK_TOKENS: tl.constexpr,
+    OUT_NUMEL: tl.constexpr,
+    NUM_REQ: tl.constexpr,
+    MAX_NUM_BLOCKS_PER_REQ: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,  # tile width along columns
     # strides (in elements)
@@ -1849,6 +1903,7 @@ def _convert_req_index_to_global_index_dsa_prefill_kernel(
     col_id = tile_id * BLOCK_N + tl.arange(0, BLOCK_N)
 
     req_id = tl.load(token_to_seq_idxs + token_id)  # int32
+    valid_req = (req_id >= 0) & (req_id < NUM_REQ)
 
     kv_start = tl.load(dsa_kv_indptr + token_id)
     kv_end = tl.load(dsa_kv_indptr + token_id + 1)
@@ -1858,24 +1913,41 @@ def _convert_req_index_to_global_index_dsa_prefill_kernel(
     indice = tl.load(
         topk_indices + token_id * ti_stride0 + col_id * ti_stride1
     )  # int32
-    pre_seqlens_q = tl.load(cu_seqlens_q + req_id)
+    pre_seqlens_q = tl.load(cu_seqlens_q + req_id, mask=valid_req, other=0)
+    req_kv_end = tl.load(cu_seqlens_q + req_id + 1, mask=valid_req, other=0)
+    req_kv_len = req_kv_end - pre_seqlens_q
 
     seq_token_idx = indice - pre_seqlens_q
     block_id = seq_token_idx // PAGE_SIZE
     inblock_offset = seq_token_idx % PAGE_SIZE
 
     # Guard block_table access
-    store_mask = (col_id < kv_len) & (col_id < NUM_TOPK_TOKENS)
-    valid_mask = store_mask & (indice >= 0)
+    out_offset = kv_start + col_id
+    store_mask = (
+        (col_id < kv_len)
+        & (col_id < NUM_TOPK_TOKENS)
+        & (out_offset >= 0)
+        & (out_offset < OUT_NUMEL)
+    )
+    valid_mask = (
+        valid_req
+        & store_mask
+        & (indice >= 0)
+        & (seq_token_idx >= 0)
+        & (seq_token_idx < req_kv_len)
+        & (block_id >= 0)
+        & (block_id < MAX_NUM_BLOCKS_PER_REQ)
+    )
     physical_block = tl.load(
         block_table + req_id * bt_stride0 + block_id * bt_stride1,
         mask=valid_mask,
         other=-1,
     )
-    out_val = tl.where(valid_mask, physical_block * PAGE_SIZE + inblock_offset, -1)
+    physical_valid = valid_mask & (physical_block >= 0)
+    out_val = tl.where(physical_valid, physical_block * PAGE_SIZE + inblock_offset, 0)
 
     # Store results
-    out_ptr_ij = out_kv_indices + kv_start + col_id
+    out_ptr_ij = out_kv_indices + out_offset
     tl.store(
         out_ptr_ij,
         out_val,
@@ -1903,16 +1975,27 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
         f"BLOCK_N ({BLOCK_N})"
     )
 
-    num_tokens = dsa_qo_indptr.shape[0] - 1
+    num_tokens = min(
+        dsa_qo_indptr.shape[0] - 1,
+        dsa_kv_indptr.shape[0] - 1,
+        token_to_seq_idxs.shape[0],
+        topk_indices.shape[0],
+    )
+    dsa_qo_indptr = dsa_qo_indptr[: num_tokens + 1]
+    dsa_kv_indptr = dsa_kv_indptr[: num_tokens + 1]
+    token_to_seq_idxs = token_to_seq_idxs[:num_tokens]
+    topk_indices = topk_indices[:num_tokens]
     tiles_per_row = NUM_TOPK_TOKENS // BLOCK_N
 
     total_out = num_tokens * NUM_TOPK_TOKENS
-    if out is not None:
-        new_kv_indices = out[:total_out]
-    else:
-        new_kv_indices = torch.empty(
-            total_out, dtype=torch.int32, device=topk_indices.device
-        )
+    new_kv_indices = _sparse_index_workspace(
+        out,
+        total_out,
+        device=topk_indices.device,
+        name="triton_convert_req_index_to_global_index_dsa_prefill",
+    )
+    num_req = min(block_table.shape[0], cu_seqlens_q.shape[0] - 1)
+    max_num_blocks_per_req = block_table.shape[1]
 
     # Strides in elements
     ti_stride0, ti_stride1 = topk_indices.stride()
@@ -1930,6 +2013,9 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
         new_kv_indices,
         # shapes / constexprs
         NUM_TOPK_TOKENS,
+        new_kv_indices.numel(),
+        num_req,
+        max_num_blocks_per_req,
         PAGE_SIZE,
         BLOCK_N,
         # strides

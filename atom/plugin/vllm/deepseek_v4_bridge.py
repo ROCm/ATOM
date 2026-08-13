@@ -700,7 +700,12 @@ class _V4DecodeMetaBuffers:
             return CpuGpuBuffer(*shape, dtype=torch.int32, device=device)
 
         # Per-seq scalars (sized to padded request count == num_slots).
-        self.state_slot = i32(S)
+        # Core DeepSeek-V4 metadata distinguishes the state slot read by the
+        # compressor from the slot written by this forward. vLLM does not fork
+        # state today, so both buffers carry the same values, but they must have
+        # independent addresses for CUDA/HIP graph replay.
+        self.state_slot_in = i32(S)
+        self.state_slot_out = i32(S)
         self.n_csa = i32(S)
         self.n_hca = i32(S)
         # Per-token mapping (sized to padded token count). int32: accepted by
@@ -1191,10 +1196,10 @@ def build_atom_v4_attention_metadata(
     applied or out of sync) the build raises rather than reading the device
     block table.
     """
-    from atom.utils.forward_context import AttentionMetaData
+    from atom.model_ops.attentions.deepseek_v4_attn import AttentionMetaData_DSV4
 
     if common_attn_metadata is None:
-        return AttentionMetaData()
+        return AttentionMetaData_DSV4()
     state = _infer_atom_attn_state(common_attn_metadata, num_spec_tokens)
     is_decode = state.value == "decode"
     device = common_attn_metadata.seq_lens.device
@@ -1228,7 +1233,7 @@ def build_atom_v4_attention_metadata(
         seq_lens_cpu = common_attn_metadata.seq_lens.cpu()
     seq_np = seq_lens_cpu[:num_reqs].numpy().astype(np.int32)
     batch_np = np.repeat(np.arange(num_reqs, dtype=np.int32), lens)
-    md = AttentionMetaData(
+    md = AttentionMetaData_DSV4(
         cu_seqlens_q=common_attn_metadata.query_start_loc,
         cu_seqlens_k=common_attn_metadata.query_start_loc,
         max_seqlen_q=int(common_attn_metadata.max_query_len),
@@ -1333,8 +1338,14 @@ def build_atom_v4_attention_metadata(
 
     if decode_persistent:
         bufs = decode_bufs
+        md.state_slot_out_cpu = slot_arr
+        md.state_slot_out = bufs.stage(bufs.state_slot_out, slot_arr)
+        md.state_slot_in = bufs.stage(bufs.state_slot_in, slot_arr)
+        # Bridge-local helpers still use the legacy single-slot spelling. It is
+        # the write slot because paged-index generation addresses the state
+        # populated by this forward.
         md.state_slot_mapping_cpu = slot_arr
-        md.state_slot_mapping = bufs.stage(bufs.state_slot, slot_arr)
+        md.state_slot_mapping = md.state_slot_out
         # Per-token seq map padded to T_pad with the -1 sentinel tail.
         if total:
             bufs.batch_id.np[:total] = batch_np
@@ -1404,7 +1415,10 @@ def build_atom_v4_attention_metadata(
         return md
 
     # ---- eager path: prefill, or decode without persistent buffers ----
-    md.state_slot_mapping = torch.from_numpy(slot_arr).to(device)
+    md.state_slot_out = torch.from_numpy(slot_arr).to(device)
+    md.state_slot_in = md.state_slot_out.clone()
+    md.state_slot_out_cpu = slot_arr
+    md.state_slot_mapping = md.state_slot_out
     md.state_slot_mapping_cpu = slot_arr
     md.batch_id_per_token = torch.from_numpy(batch_np).to(device)
     md.n_committed_csa_per_seq = torch.from_numpy(n_csa_cpu).to(device)
