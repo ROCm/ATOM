@@ -8,7 +8,8 @@ To add a new model, append its architecture class name to _MODEL_NAMES.
 
 import inspect
 import logging
-from typing import Any, Iterable, Optional, Tuple, Union
+from collections.abc import Iterable
+from typing import Any
 
 import torch
 from sglang.srt.distributed import get_pp_group
@@ -23,8 +24,8 @@ from atom.plugin.sglang.runtime import (
     SGLangPluginRuntime,
     bind_current_forward_batch,
     get_current_forward_batch,
+    get_model_arch_spec,
     plugin_runtime_scope,
-    resolve_model_arch_spec,
 )
 
 logger = logging.getLogger("atom.plugin.sglang.models")
@@ -71,7 +72,7 @@ class _AtomCausalLMBaseForSglang(nn.Module):
     def __init__(
         self,
         config,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -80,18 +81,17 @@ class _AtomCausalLMBaseForSglang(nn.Module):
         self.pp_group = get_pp_group()
         self.quant_config = quant_config
         self.config = config
-        self.vocab_size = config.vocab_size
-        self.unpadded_vocab_size = config.vocab_size
-        self.model_arch, self.model_arch_spec = resolve_model_arch_spec(config)
-        if self.model_arch_spec.uses_text_config:
-            text_config = getattr(config, "text_config", None)
-            if text_config is None:
-                raise ValueError(
-                    f"{self.model_arch} requires a nested text_config for SGLang"
-                )
-            self.config = text_config
-            self.vocab_size = text_config.vocab_size
-            self.unpadded_vocab_size = text_config.vocab_size
+        vocab_size = getattr(config, "vocab_size", None)
+        if vocab_size is None and hasattr(config, "text_config"):
+            vocab_size = getattr(config.text_config, "vocab_size", None)
+        if vocab_size is None:
+            raise AttributeError(f"{type(config).__name__} does not define vocab_size")
+        if not hasattr(config, "vocab_size"):
+            config.vocab_size = vocab_size
+        self.vocab_size = vocab_size
+        self.unpadded_vocab_size = vocab_size
+        self.model_arch = getattr(config, "architectures", [""])[0]
+        self.model_arch_spec = get_model_arch_spec(self.model_arch)
         self.capture_aux_hidden_states = False
 
         with plugin_runtime_scope(framework="sglang"):
@@ -300,10 +300,12 @@ class _AtomCausalLMBaseForSglang(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
         get_embedding: bool = False,
-        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        pp_proxy_tensors: PPProxyTensors | None = None,
         **model_kwargs: Any,
-    ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
-        with plugin_runtime_scope(framework="sglang", atom_config=self.atom_config):
+    ) -> LogitsProcessorOutput | PPProxyTensors:
+        with plugin_runtime_scope(  # noqa: SIM117
+            framework="sglang", atom_config=self.atom_config
+        ):
             with SGLangPluginRuntime(
                 atom_config=self.atom_config,
                 forward_batch=forward_batch,
@@ -409,7 +411,7 @@ class _AtomCausalLMBaseForSglang(nn.Module):
                     )
                 return hidden_states
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         # The passed `weights` iterable from sglang is ignored because ATOM
         # uses its own weight loading pipeline (handling AITER-specific quant
         # formats, kv_b_proj splitting, etc.) that is incompatible with
@@ -451,9 +453,7 @@ class _AtomCausalLMBaseForSglang(nn.Module):
 
         with plugin_runtime_scope(framework="sglang", atom_config=self.atom_config):
             return load_model_in_plugin_mode(
-                model=self.model,
-                config=self.atom_config,
-                prefix=self.model_arch_spec.load_weights_prefix,
+                model=self.model, config=self.atom_config, prefix="model."
             )
 
 
