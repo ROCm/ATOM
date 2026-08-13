@@ -17,7 +17,9 @@ from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.kv_transfer.disaggregation.types import (
     ConnectorMetadata,
     KVConnectorOutput,
+    LoadOperationId,
     ReqMeta,
+    SaveOperationId,
 )
 
 __all__ = [
@@ -28,4 +30,6 @@ __all__ = [
     "KVOutputAggregator",
     "ConnectorMetadata",
     "ReqMeta",
+    "LoadOperationId",
+    "SaveOperationId",
 ]

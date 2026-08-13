@@ -16,7 +16,12 @@ from typing import Any
 
 import torch
 
-from atom.kv_transfer.disaggregation.types import ConnectorMetadata, ReqId
+from atom.kv_transfer.disaggregation.types import (
+    ConnectorMetadata,
+    LoadOperationId,
+    ReqId,
+    SaveOperationId,
+)
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -99,6 +104,24 @@ class SaveSpec:
     can_save: bool = True
 
 
+@dataclass(frozen=True)
+class SlotSaveSpec:
+    """Identity and source group for one full-slot sidecar snapshot."""
+
+    boundary_tokens: int
+    boundary_block_hash: int
+    source_group: int
+
+
+@dataclass(frozen=True)
+class SlotLoadSpec:
+    """Identity and destination group for one full-slot sidecar restore."""
+
+    boundary_tokens: int
+    boundary_block_hash: int
+    destination_group: int
+
+
 @dataclass
 class LMCacheReqMeta:
     """Everything the worker needs to load/save one request's KV this step."""
@@ -115,6 +138,13 @@ class LMCacheReqMeta:
     save_spec: SaveSpec | None = None
     # True on the request's final prefill chunk (store the unaligned tail too).
     is_last_prefill: bool = True
+    slot_load_spec: SlotLoadSpec | None = None
+    slot_save_spec: SlotSaveSpec | None = None
+    # Exact scheduler-lifetime generation shared by PAGE and SLOT completion
+    # reports; late TP notifications for another save must not satisfy this one.
+    save_operation: SaveOperationId | None = None
+    # Appended for positional compatibility with existing metadata producers.
+    load_operation: LoadOperationId | None = None
 
 
 class LMCacheOffloadMetadata(ConnectorMetadata):

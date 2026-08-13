@@ -3,13 +3,21 @@
 
 
 from collections import deque
+import threading
 from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
+import pytest
 from conftest import MockConfig
 
+from atom.kv_transfer.disaggregation.types import (
+    KVConnectorOutput,
+    LoadOperationId,
+    SaveOperationId,
+)
 from atom.model_engine.scheduler import (
+    DecodeScheduler,
     ScheduledBatch,
     ScheduledBatchOutput,
     Scheduler,
@@ -70,6 +78,213 @@ class TestSchedulerAddQuery:
 
 
 class TestSchedule:
+    @pytest.mark.parametrize(
+        ("winner_is_offload", "expected_jump"),
+        [(False, True), (True, False)],
+    )
+    def test_remote_terminal_uses_per_request_multi_winner_type(
+        self, winner_is_offload, expected_jump
+    ):
+        seq = SimpleNamespace(
+            id=89,
+            status=SequenceStatus.WAITING_FOR_REMOTE_KVS,
+            _remote_load_is_offload=winner_is_offload,
+            _counted_as_inflight_load=True,
+            num_cached_tokens=4,
+            num_tokens=8,
+            offload_loaded_tokens=4,
+            offload_load_start_tokens=4,
+        )
+        sched = Scheduler.__new__(Scheduler)
+        sched.kv_connector = SimpleNamespace(is_offload=True, is_producer=False)
+        sched.finished_recving_kv_req_ids = [seq.id]
+        sched.failed_recving_kv_req_ids = []
+        sched._num_parked_remote_kv = 1
+        sched.block_manager = SimpleNamespace(kv_events_enabled=False)
+
+        result = sched._resolve_waiting_remote_kv(seq, deque())
+
+        assert result is expected_jump
+        assert not hasattr(seq, "_remote_load_is_offload")
+        assert sched._num_parked_remote_kv == (1 if winner_is_offload else 0)
+
+    def test_decode_reuse_guard_reads_prefill_mapping_under_lock(self):
+        lock = threading.Lock()
+
+        class _GuardedDict(dict):
+            def values(self):
+                assert lock.locked()
+                return super().values()
+
+        active = SimpleNamespace(id=90)
+        sched = DecodeScheduler.__new__(DecodeScheduler)
+        sched.waiting = deque()
+        sched.running = deque()
+        sched.prefill_done = deque()
+        sched.prefill_waiting = _GuardedDict({active.id: active})
+        sched._prefill_lock = lock
+        sched._rejected = []
+        sched.deferred_free_blocks = {}
+        sched._warn_if_unschedulable = lambda _seq: None
+
+        with pytest.raises(ValueError, match="already active"):
+            sched.add(SimpleNamespace(id=90))
+
+        new = SimpleNamespace(id=91)
+        sched.add(new)
+        assert list(sched.waiting) == [new]
+
+    def test_decode_reuse_guard_is_atomic_during_prefill_done_transition(self):
+        transition_entered = threading.Event()
+        release_transition = threading.Event()
+        duplicate_result = []
+
+        class _TransitionSeq(SimpleNamespace):
+            def append_token(self, token):
+                transition_entered.set()
+                assert release_transition.wait(timeout=2)
+                self.token_ids.append(token)
+
+        active = _TransitionSeq(
+            id=93,
+            token_ids=[1, 2],
+            num_cached_tokens=0,
+            first_token_time=0.0,
+        )
+        sched = DecodeScheduler.__new__(DecodeScheduler)
+        sched.waiting = deque()
+        sched.running = deque()
+        sched.prefill_done = deque()
+        sched.prefill_waiting = {active.id: active}
+        sched._prefill_lock = threading.Lock()
+        sched._rejected = []
+        sched.deferred_free_blocks = {}
+        sched._warn_if_unschedulable = lambda _seq: None
+
+        transition = threading.Thread(
+            target=sched.on_prefill_done,
+            args=(active.id, 2, 3),
+        )
+        transition.start()
+        assert transition_entered.wait(timeout=2)
+
+        def add_duplicate():
+            try:
+                sched.add(SimpleNamespace(id=active.id))
+            except Exception as exc:
+                duplicate_result.append(exc)
+
+        duplicate = threading.Thread(target=add_duplicate)
+        duplicate.start()
+        assert duplicate.is_alive()
+
+        release_transition.set()
+        transition.join(timeout=2)
+        duplicate.join(timeout=2)
+
+        assert not transition.is_alive()
+        assert not duplicate.is_alive()
+        assert len(duplicate_result) == 1
+        assert isinstance(duplicate_result[0], ValueError)
+        assert list(sched.prefill_done) == [active]
+        assert list(sched.waiting) == []
+
+        different = SimpleNamespace(id=94)
+        sched.add(different)
+        assert list(sched.waiting) == [different]
+
+    def test_reused_id_cannot_overwrite_deferred_lifecycle(self):
+        old = SimpleNamespace(id=91)
+        new = SimpleNamespace(id=91)
+        deallocated = []
+
+        class _Connector:
+            is_producer = False
+            is_offload = True
+
+            def save_finished(self, _operation):
+                pass
+
+            def should_defer_free(self, _seq):
+                return False
+
+            def request_finished(self, _seq):
+                pass
+
+        sched = Scheduler.__new__(Scheduler)
+        sched.waiting = deque()
+        sched.running = deque()
+        sched._rejected = []
+        sched.deferred_free_blocks = {}
+        sched.finished_recving_kv_req_ids = []
+        sched.failed_recving_kv_req_ids = []
+        sched.kv_connector = _Connector()
+        sched.block_manager = SimpleNamespace(deallocate=deallocated.append)
+        sched._warn_if_unschedulable = lambda _seq: None
+        sched._defer_free(old)
+
+        with pytest.raises(ValueError, match="already active"):
+            sched.add(new)
+        with pytest.raises(AssertionError, match="overwrite"):
+            sched._defer_free(new)
+
+        operation = SaveOperationId(old.id, 4)
+        sched._update_from_kv_xfer_finished(
+            KVConnectorOutput(finished_saving={operation})
+        )
+
+        assert deallocated == [old]
+        assert sched.deferred_free_blocks == {}
+
+        sched.add(new)
+        assert list(sched.waiting) == [new]
+
+    def test_reused_id_waits_for_deferred_load_cleanup(self):
+        operation = LoadOperationId(92, 8)
+        old = SimpleNamespace(
+            id=92,
+            _load_operation=operation,
+            _awaiting_aborted_load_cleanup=True,
+            _counted_as_inflight_load=True,
+        )
+        new = SimpleNamespace(id=92)
+        deallocated = []
+
+        class _Connector:
+            is_producer = False
+            is_offload = True
+
+            def load_finished(self, value):
+                return value == operation
+
+            def request_finished(self, _seq):
+                pass
+
+        sched = Scheduler.__new__(Scheduler)
+        sched.waiting = deque()
+        sched.running = deque()
+        sched._rejected = []
+        sched.deferred_free_blocks = {}
+        sched.finished_recving_kv_req_ids = []
+        sched.failed_recving_kv_req_ids = []
+        sched._num_parked_remote_kv = 1
+        sched.kv_connector = _Connector()
+        sched.block_manager = SimpleNamespace(deallocate=deallocated.append)
+        sched._warn_if_unschedulable = lambda _seq: None
+        sched._defer_free(old)
+
+        with pytest.raises(ValueError, match="already active"):
+            sched.add(new)
+
+        sched._update_from_kv_xfer_finished(
+            KVConnectorOutput(finished_loading={operation})
+        )
+
+        assert deallocated == [old]
+        assert sched._num_parked_remote_kv == 0
+        sched.add(new)
+        assert list(sched.waiting) == [new]
+
     def test_empty_returns_none(self, scheduler):
         assert scheduler.schedule() is None
 
@@ -239,6 +454,97 @@ class TestSchedule:
         statuses = {s1.status, s2.status}
         assert SequenceStatus.RUNNING in statuses
         assert SequenceStatus.WAITING in statuses
+
+    def test_decode_preemption_skips_save_pinned_victim(self, seq_factory):
+        sched = Scheduler(MockConfig(num_kvcache_blocks=2, kv_cache_block_size=4))
+        current = seq_factory([1, 2, 3, 4])
+        pinned_victim = seq_factory([5, 6, 7, 8])
+        sched.add(current)
+        sched.add(pinned_victim)
+        sched.schedule()
+        current.num_cached_tokens = current.num_prompt_tokens
+        pinned_victim.num_cached_tokens = pinned_victim.num_prompt_tokens
+        current.append_token(9)
+        pinned_victim.append_token(10)
+        operation = SaveOperationId(pinned_victim.id, 50)
+
+        class _Connector:
+            is_producer = False
+            is_offload = True
+
+            def __init__(self):
+                self.pending = {operation}
+
+            def should_defer_free(self, seq):
+                return seq is pinned_victim and operation in self.pending
+
+            def save_finished(self, value):
+                self.pending.discard(value)
+
+            def build_connector_meta(self):
+                return None
+
+        sched.kv_connector = _Connector()
+        pinned_blocks = list(pinned_victim.block_table)
+
+        batch, _ = sched.schedule()
+
+        assert current.status == SequenceStatus.WAITING
+        assert pinned_victim.status == SequenceStatus.RUNNING
+        assert list(pinned_victim.block_table[:1]) == pinned_blocks
+        assert list(batch.req_ids) == [pinned_victim.id]
+
+    def test_decode_preemption_stalls_pinned_current_until_save_terminal(
+        self, seq_factory
+    ):
+        sched = Scheduler(MockConfig(num_kvcache_blocks=1, kv_cache_block_size=4))
+        pinned = seq_factory([1, 2, 3, 4])
+        sched.add(pinned)
+        sched.schedule()
+        pinned.num_cached_tokens = pinned.num_prompt_tokens
+        pinned.append_token(9)
+        operation = SaveOperationId(pinned.id, 51)
+
+        class _Connector:
+            is_producer = False
+            is_offload = True
+
+            def __init__(self):
+                self.pending = {operation}
+
+            def should_defer_free(self, seq):
+                return seq is pinned and operation in self.pending
+
+            def save_finished(self, value):
+                self.pending.discard(value)
+
+            def build_connector_meta(self):
+                return None
+
+        sched.kv_connector = _Connector()
+        pinned_blocks = list(pinned.block_table)
+
+        blocked, _ = sched.schedule()
+
+        assert list(blocked.req_ids) == []
+        assert pinned.status == SequenceStatus.RUNNING
+        assert list(pinned.block_table) == pinned_blocks
+        assert sched.preempt(pinned) is False
+        assert list(pinned.block_table) == pinned_blocks
+
+        sched._update_from_kv_xfer_finished(
+            KVConnectorOutput(finished_saving={operation})
+        )
+        sched.schedule()
+
+        assert pinned.status == SequenceStatus.WAITING
+        assert pinned.block_table == []
+        assert sched.waiting.popleft() is pinned
+        sched.kv_connector = None
+        replacement = seq_factory([10, 11, 12, 13])
+        sched.add(replacement)
+        resumed, _ = sched.schedule()
+        assert list(resumed.req_ids) == [replacement.id]
 
     def test_ready_remote_kv_waiter_is_promoted_ahead_of_fresh_head(self):
         sched = Scheduler.__new__(Scheduler)
@@ -643,6 +949,169 @@ class TestLongPrefillTokenThreshold:
         # Step 2: partial-prefill resume, also capped at 8 (not 12 remaining).
         batch2, _ = sched.schedule()
         assert list(batch2.num_scheduled_tokens) == [8]
+
+    def test_partial_prefill_resume_honors_connector_chunk_cut(self, seq_factory):
+        class _Connector:
+            is_producer = False
+
+            def __init__(self):
+                self.adjusted = []
+
+            def adjust_prefill_chunk_after_alloc(self, seq, chunk):
+                self.adjusted.append((seq.id, chunk))
+                return min(chunk, 4)
+
+            def build_connector_meta(self):
+                return None
+
+        sched = Scheduler(
+            MockConfig(
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                max_num_batched_tokens=8,
+                enable_chunked_prefill=True,
+            )
+        )
+        seq = seq_factory(list(range(20)))
+        sched.add(seq)
+        batch1, _ = sched.schedule()
+        assert list(batch1.num_scheduled_tokens) == [8]
+        seq.num_cached_tokens = 8
+        seq.is_partial_prefill = True
+        sched._partial_prefill_count += 1
+        connector = _Connector()
+        sched.kv_connector = connector
+
+        batch2, _ = sched.schedule()
+
+        assert list(batch2.num_scheduled_tokens) == [4]
+        assert connector.adjusted == [(seq.id, 8)]
+
+    def test_partial_prefill_final_sidecar_cap_wins_after_finalize(self, seq_factory):
+        class _Connector:
+            is_producer = False
+            recap_prefill_after_finalize = True
+
+            def __init__(self):
+                self.adjusted = []
+
+            def adjust_prefill_chunk_after_alloc(self, seq, chunk):
+                self.adjusted.append((seq.id, chunk))
+                return min(chunk, 4)
+
+            def build_connector_meta(self):
+                return None
+
+        sched = Scheduler(
+            MockConfig(
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                max_num_batched_tokens=8,
+                enable_chunked_prefill=True,
+            )
+        )
+        seq = seq_factory(list(range(20)))
+        sched.add(seq)
+        batch1, _ = sched.schedule()
+        assert list(batch1.num_scheduled_tokens) == [8]
+        seq.num_cached_tokens = 8
+        seq.is_partial_prefill = True
+        sched._partial_prefill_count += 1
+        connector = _Connector()
+        sched.kv_connector = connector
+
+        def _enlarge_after_copy_state(seq, start, chunk):
+            assert chunk == 4
+            return 8
+
+        sched._finalize_prefill_chunk = _enlarge_after_copy_state
+
+        batch2, _ = sched.schedule()
+
+        assert list(batch2.num_scheduled_tokens) == [4]
+        assert connector.adjusted == [(seq.id, 8), (seq.id, 8)]
+
+    def test_fork_backend_keeps_finalize_minimum_over_sidecar_cap(self, seq_factory):
+        class _Connector:
+            is_producer = False
+            recap_prefill_after_finalize = False
+
+            def __init__(self):
+                self.adjusted = []
+
+            def adjust_prefill_chunk_after_alloc(self, seq, chunk):
+                self.adjusted.append((seq.id, chunk))
+                return min(chunk, 20)
+
+            def build_connector_meta(self):
+                return None
+
+        sched = Scheduler(
+            MockConfig(
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                max_num_batched_tokens=64,
+                max_model_len=128,
+                enable_chunked_prefill=True,
+            )
+        )
+        seq = seq_factory(list(range(128)))
+        sched.add(seq)
+        batch1, _ = sched.schedule()
+        assert list(batch1.num_scheduled_tokens) == [64]
+        seq.num_cached_tokens = 64
+        seq.is_partial_prefill = True
+        sched._partial_prefill_count += 1
+        connector = _Connector()
+        sched.kv_connector = connector
+
+        def _require_fork_room(seq, start, chunk):
+            assert chunk == 20
+            return 64
+
+        sched._finalize_prefill_chunk = _require_fork_room
+
+        batch2, _ = sched.schedule()
+
+        assert list(batch2.num_scheduled_tokens) == [64]
+        assert connector.adjusted == [(seq.id, 64)]
+
+    def test_offload_prefill_resume_honors_connector_chunk_cut(self, seq_factory):
+        class _Connector:
+            is_producer = False
+            is_offload = True
+            recap_prefill_after_finalize = True
+
+            def __init__(self):
+                self.adjusted = []
+
+            def adjust_prefill_chunk_after_alloc(self, seq, chunk):
+                self.adjusted.append((seq.id, chunk))
+                return min(chunk, 4)
+
+            def build_connector_meta(self):
+                return None
+
+        sched = Scheduler(
+            MockConfig(
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                max_num_batched_tokens=8,
+                enable_chunked_prefill=True,
+            )
+        )
+        connector = _Connector()
+        sched.kv_connector = connector
+        seq = seq_factory(list(range(20)))
+        sched.block_manager.allocate(seq, 0)
+        seq.num_cached_tokens = 8
+        seq.offload_loaded = True
+        sched.add(seq)
+
+        batch, _ = sched.schedule()
+
+        assert list(batch.num_scheduled_tokens) == [4]
+        assert connector.adjusted == [(seq.id, 8), (seq.id, 4)]
 
 
 # ── prefix caching ────────────────────────────────────────────────────────

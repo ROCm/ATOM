@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from collections import deque
+from contextlib import nullcontext
 import logging
 import sys
 import threading
@@ -17,21 +19,40 @@ except ModuleNotFoundError:
     sys.modules["torch"] = types.ModuleType("torch")
 
 from atom.kv_transfer.disaggregation import KVConnectorOutput, KVOutputAggregator
+from atom.kv_transfer.disaggregation.multi.multi_connector import (
+    MultiConnectorMetadata,
+    MultiConnectorScheduler,
+)
+from atom.kv_transfer.disaggregation.types import (
+    ConnectorMetadata,
+    KVTransferRegion,
+    LoadOperationId,
+    SaveOperationId,
+    connector_metadata_has_work,
+)
 from atom.kv_transfer.offload import config as offcfg
+from atom.kv_transfer.offload import connector as connector_module
 from atom.kv_transfer.offload.atom_kv_byte_codec import ATOMKVByteCodec
 from atom.kv_transfer.offload.atom_lmcache_gpu_connector import (
     ATOMLMCacheGPUConnector,
 )
+from atom.kv_transfer.offload.atom_page_region_codec import ATOMPageRegionCodec
 from atom.kv_transfer.offload.connector import (
     LMCacheOffloadConnector,
     LMCacheOffloadConnectorScheduler,
+    _chained_prefix_hashes,
 )
 from atom.kv_transfer.offload.metadata import (
     ATOMRawBytesLMCacheMetadata,
     LMCacheOffloadMetadata,
     LMCacheReqMeta,
+    SlotLoadSpec,
+    SlotSaveSpec,
 )
+from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.scheduler import Scheduler
+from atom.model_engine.sequence import SequenceStatus
+from conftest import MockConfig
 
 
 class _LookupClient:
@@ -46,10 +67,17 @@ class _LookupClient:
         self.cleared.append(lookup_id)
 
 
+class _FailingLookupClient(_LookupClient):
+    def lookup(self, token_ids, lookup_id):
+        raise RuntimeError("lookup failed")
+
+
 def _scheduler() -> LMCacheOffloadConnectorScheduler:
     sched = LMCacheOffloadConnectorScheduler.__new__(LMCacheOffloadConnectorScheduler)
     sched._config = SimpleNamespace()
     sched.kv_role = "offload"
+    sched._do_save = True
+    sched._do_load = True
     sched.block_size = 4
     sched.chunk_size = 4
     sched._lookup_client = _LookupClient(hit=0)
@@ -58,11 +86,24 @@ def _scheduler() -> LMCacheOffloadConnectorScheduler:
     sched._load_save_floors = {}
     sched._hit_save_floors = {}
     sched._save_tracker = {}
-    sched._save_inflight = set()
-    sched._load_inflight_tokens = {}
-    sched._save_inflight_tokens = {}
+    sched._save_nonce = 0
+    sched._load_nonce = 0
+    sched._load_lifecycles = {}
+    sched._active_load_operations = {}
+    sched._save_inflight = {}
     sched._lookup_in_step = []
     sched._handoff_loads = set()
+    sched.hash_block_size = 4
+    sched.resume_alignment = 4
+    sched.sidecar_interval = 0
+    sched._committed_sidecar_hashes = set()
+    sched._sidecar_save_inflight = {}
+    sched._failed_sidecar_saves = {}
+    sched._pending_slot_loads = {}
+    sched._active_slot_loads = {}
+    sched._sidecar_hash_cache = {}
+    sched._load_inflight_tokens = {}
+    sched._save_inflight_tokens = {}
     sched.total_load_requests = 0
     sched.total_loaded_tokens = 0
     sched.total_load_failures = 0
@@ -72,6 +113,123 @@ def _scheduler() -> LMCacheOffloadConnectorScheduler:
     sched._lock = threading.Lock()
     sched._done_load = set()
     return sched
+
+
+def _stateful_scheduler(hit: int) -> LMCacheOffloadConnectorScheduler:
+    sched = _scheduler()
+    sched.block_size = 256
+    sched.hash_block_size = 256
+    sched.chunk_size = 8192
+    sched.resume_alignment = 8192
+    sched.sidecar_interval = 8192
+    sched._lookup_client = _LookupClient(hit=hit)
+    return sched
+
+
+def _stateful_seq(
+    *,
+    req_id: int,
+    num_prompt_tokens: int,
+    num_cached_tokens: int = 0,
+    group: int = -1,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=req_id,
+        num_prompt_tokens=num_prompt_tokens,
+        token_ids=list(range(num_prompt_tokens)),
+        num_cached_tokens=num_cached_tokens,
+        block_table=list(range((num_prompt_tokens + 255) // 256)),
+        has_per_req_cache=True,
+        per_req_cache_group=group,
+        prefix_hashes_published=True,
+        _slot_initialized_after_alloc=True,
+    )
+
+
+def _commit_sidecar(
+    sched: LMCacheOffloadConnectorScheduler,
+    seq: SimpleNamespace,
+    boundary: int,
+) -> int:
+    boundary_hash = _chained_prefix_hashes(
+        seq.token_ids,
+        sched.hash_block_size,
+    )[boundary]
+    sched._committed_sidecar_hashes.add(boundary_hash)
+    return boundary_hash
+
+
+def test_bounded_commit_index_evicts_oldest_and_supports_set_operations():
+    index = connector_module._BoundedLRUSet(2)
+
+    index.add(1)
+    index.add(2)
+    index.add(3)
+
+    assert set(index) == {2, 3}
+    assert 1 not in index
+    index.discard(2)
+    assert set(index) == {3}
+    index.clear()
+    assert len(index) == 0
+
+
+def test_bounded_commit_index_touching_duplicate_refreshes_recency():
+    index = connector_module._BoundedLRUSet(2)
+    index.add(1)
+    index.add(2)
+
+    index.add(1)
+    index.add(3)
+
+    assert set(index) == {1, 3}
+    assert len(index) == 2
+
+
+@pytest.mark.parametrize(
+    "value",
+    [True, False, 0, -1, 1.5, "1.5", "not-an-int"],
+)
+def test_committed_sidecar_capacity_rejects_invalid_values(
+    monkeypatch,
+    value,
+):
+    monkeypatch.delenv("OFFLOAD_COMMITTED_SIDECAR_CAPACITY", raising=False)
+    kvc = {
+        "kv_connector_extra_config": {
+            "committed_sidecar_index_capacity": value,
+        }
+    }
+
+    with pytest.raises(ValueError, match="committed sidecar index capacity"):
+        connector_module._committed_sidecar_capacity(kvc)
+
+
+def test_committed_sidecar_capacity_precedence(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_COMMITTED_SIDECAR_CAPACITY", "7")
+
+    assert connector_module._committed_sidecar_capacity({}) == 7
+    assert (
+        connector_module._committed_sidecar_capacity(
+            {
+                "kv_connector_extra_config": {
+                    "committed_sidecar_index_capacity": 3,
+                }
+            }
+        )
+        == 3
+    )
+
+    monkeypatch.delenv("OFFLOAD_COMMITTED_SIDECAR_CAPACITY")
+    assert connector_module._committed_sidecar_capacity({}) == 65536
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "1.5", "not-an-int"])
+def test_committed_sidecar_capacity_rejects_invalid_env(monkeypatch, value):
+    monkeypatch.setenv("OFFLOAD_COMMITTED_SIDECAR_CAPACITY", value)
+
+    with pytest.raises(ValueError, match="committed sidecar index capacity"):
+        connector_module._committed_sidecar_capacity({})
 
 
 def _install_fake_fused_chunk_major(codec: ATOMKVByteCodec) -> None:
@@ -116,6 +274,366 @@ def _install_fake_fused_chunk_major(codec: ATOMKVByteCodec) -> None:
         fused_pack_chunk_major=_pack,
         fused_unpack_chunk_major=_unpack,
     )
+
+
+def _registration_connector() -> LMCacheOffloadConnector:
+    connector = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
+    connector._config = SimpleNamespace(
+        kv_transfer_config={},
+        kv_cache_block_size=4,
+    )
+    connector.block_size = 4
+    connector.chunk_size = None
+    connector._do_save = True
+    connector._do_load = True
+    connector._engine = None
+    connector._codec = None
+    connector._lookup_server = None
+    return connector
+
+
+def _install_registration_dependencies(monkeypatch) -> dict:
+    captured = {}
+
+    parallel_state_module = types.ModuleType("aiter.dist.parallel_state")
+    parallel_state_module.get_tp_group = lambda: SimpleNamespace(
+        rank_in_group=0,
+        world_size=1,
+    )
+    aiter_dist_module = types.ModuleType("aiter.dist")
+    aiter_dist_module.__path__ = []
+    aiter_dist_module.parallel_state = parallel_state_module
+    aiter_module = types.ModuleType("aiter")
+    aiter_module.__path__ = []
+    aiter_module.dist = aiter_dist_module
+
+    class _FakeEngine:
+        def __init__(self, gpu_connector) -> None:
+            self.gpu_connector = gpu_connector
+            self.storage_manager = SimpleNamespace(list_backends=lambda: {})
+            self.post_initialized = False
+
+        def post_init(self) -> None:
+            self.post_initialized = True
+
+    class _FakeEngineBuilder:
+        @staticmethod
+        def get_or_create(
+            instance_id,
+            cfg,
+            metadata,
+            gpu_connector,
+            process_tokens,
+            create_gpu_connector,
+        ):
+            captured.update(
+                instance_id=instance_id,
+                cfg=cfg,
+                metadata=metadata,
+                gpu_connector=gpu_connector,
+                process_tokens=process_tokens,
+                create_gpu_connector=create_gpu_connector,
+            )
+            engine = _FakeEngine(gpu_connector)
+            captured["engine"] = engine
+            return engine
+
+    cache_engine_module = types.ModuleType("lmcache.v1.cache_engine")
+    cache_engine_module.LMCacheEngineBuilder = _FakeEngineBuilder
+    memory_management_module = types.ModuleType("lmcache.v1.memory_management")
+    memory_management_module.MemoryFormat = SimpleNamespace(KV_2LTD=object())
+
+    class _FakeLookupClientFactory:
+        @staticmethod
+        def create_lookup_server(engine, metadata):
+            captured["lookup_server_args"] = (engine, metadata)
+            return SimpleNamespace()
+
+    lookup_factory_module = types.ModuleType("lmcache.v1.lookup_client.factory")
+    lookup_factory_module.LookupClientFactory = _FakeLookupClientFactory
+    lookup_client_module = types.ModuleType("lmcache.v1.lookup_client")
+    lookup_client_module.__path__ = []
+    lookup_client_module.factory = lookup_factory_module
+    lmcache_v1_module = types.ModuleType("lmcache.v1")
+    lmcache_v1_module.__path__ = []
+    lmcache_v1_module.cache_engine = cache_engine_module
+    lmcache_v1_module.memory_management = memory_management_module
+    lmcache_v1_module.lookup_client = lookup_client_module
+    lmcache_module = types.ModuleType("lmcache")
+    lmcache_module.__path__ = []
+    lmcache_module.v1 = lmcache_v1_module
+
+    for name, module in (
+        ("aiter", aiter_module),
+        ("aiter.dist", aiter_dist_module),
+        ("aiter.dist.parallel_state", parallel_state_module),
+        ("lmcache", lmcache_module),
+        ("lmcache.v1", lmcache_v1_module),
+        ("lmcache.v1.cache_engine", cache_engine_module),
+        ("lmcache.v1.memory_management", memory_management_module),
+        ("lmcache.v1.lookup_client", lookup_client_module),
+        ("lmcache.v1.lookup_client.factory", lookup_factory_module),
+    ):
+        monkeypatch.setitem(sys.modules, name, module)
+
+    cfg = SimpleNamespace(
+        chunk_size=8,
+        local_cpu=True,
+        max_local_cpu_size=1,
+        local_disk=None,
+        max_local_disk_size=0,
+        store_location=None,
+        retrieve_locations=None,
+    )
+    base_metadata = SimpleNamespace(chunk_size=cfg.chunk_size)
+    base_metadata.is_first_rank = lambda: True
+    monkeypatch.setattr(offcfg, "build_lmcache_config", lambda _config: cfg)
+    monkeypatch.setattr(
+        offcfg,
+        "build_lmcache_metadata",
+        lambda _config, _cfg, _world, _rank: base_metadata,
+    )
+    return captured
+
+
+def _page_transfer_tensors(
+    *unit_bytes: int,
+    num_blocks: int,
+) -> SimpleNamespace:
+    regions = [
+        KVTransferRegion(
+            base_addr=0x1000 + index * 0x1000,
+            total_bytes=num_blocks * nbytes,
+            unit_bytes=nbytes,
+        )
+        for index, nbytes in enumerate(unit_bytes)
+    ]
+    return SimpleNamespace(block_regions=regions, num_blocks=num_blocks)
+
+
+def test_register_empty_kv_caches_with_page_regions_selects_page_codec(monkeypatch):
+    import torch
+
+    if not hasattr(torch, "device"):
+        pytest.skip("real torch is unavailable")
+
+    captured = _install_registration_dependencies(monkeypatch)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 7)
+    connector = _registration_connector()
+    transfer_tensors = _page_transfer_tensors(24, 40, num_blocks=3)
+
+    connector.register_kv_caches({}, transfer_tensors, num_blocks=3)
+
+    assert isinstance(connector._codec, ATOMPageRegionCodec)
+    assert connector._codec.num_blocks == 3
+    assert connector._codec.device == torch.device("cuda:7")
+    assert captured["gpu_connector"].codec is connector._codec
+
+
+def test_register_dense_kv_caches_with_regions_selects_legacy_byte_codec(monkeypatch):
+    import torch
+
+    if not hasattr(torch, "zeros"):
+        pytest.skip("real torch is unavailable")
+
+    _install_registration_dependencies(monkeypatch)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    connector = _registration_connector()
+    kv_caches = {
+        "l0": SimpleNamespace(
+            k_cache=torch.zeros((3, 8), dtype=torch.uint8),
+            v_cache=None,
+            k_scale=None,
+            v_scale=None,
+        )
+    }
+
+    connector.register_kv_caches(
+        kv_caches,
+        _page_transfer_tensors(8, num_blocks=3),
+        num_blocks=3,
+    )
+
+    assert type(connector._codec) is ATOMKVByteCodec
+    assert connector._codec.bytes_per_block == 8
+
+
+def test_register_page_regions_rejects_invalid_region_geometry(monkeypatch):
+    import torch
+
+    if not hasattr(torch, "device"):
+        pytest.skip("real torch is unavailable")
+
+    _install_registration_dependencies(monkeypatch)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    connector = _registration_connector()
+    transfer_tensors = SimpleNamespace(
+        block_regions=[
+            KVTransferRegion(
+                base_addr=0x1000,
+                total_bytes=63,
+                unit_bytes=32,
+            )
+        ],
+        num_blocks=2,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"PAGE region 0 total_bytes is too small; got 63, need 64",
+    ):
+        connector.register_kv_caches({}, transfer_tensors, num_blocks=2)
+
+
+def test_register_stateful_page_requires_full_slot_regions_before_engine_start(
+    monkeypatch,
+):
+    import torch
+
+    if not hasattr(torch, "device"):
+        pytest.skip("real torch is unavailable")
+
+    captured = _install_registration_dependencies(monkeypatch)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    connector = _registration_connector()
+    transfer_tensors = _page_transfer_tensors(32, num_blocks=2)
+    transfer_tensors.num_slots = 4
+    transfer_tensors.swa_block_regions = []
+    transfer_tensors.slot_regions = []
+
+    with pytest.raises(
+        ValueError,
+        match="full per-request SLOT regions",
+    ):
+        connector.register_kv_caches({}, transfer_tensors, num_blocks=2)
+
+    assert "instance_id" not in captured
+    assert "engine" not in captured
+    assert connector._engine is None
+
+
+@pytest.mark.parametrize(
+    ("regions", "expected_count", "message"),
+    [
+        pytest.param(
+            [KVTransferRegion(0x1000, 128, 32, reverse_indexed=True)],
+            2,
+            "expected 2 full per-request SLOT regions, got 1",
+            id="missing-fp8-plane",
+        ),
+        pytest.param(
+            [KVTransferRegion(0x1000, 128, 32, reverse_indexed=True)],
+            None,
+            "expected_full_slot_region_count",
+            id="missing-expected-count",
+        ),
+        pytest.param(
+            [KVTransferRegion(0x1000, 128, 32, reverse_indexed=True)],
+            0,
+            "expected_full_slot_region_count must be a positive integer",
+            id="invalid-expected-count",
+        ),
+        pytest.param(
+            [KVTransferRegion(0x1000, 128, 32, reverse_indexed=True)],
+            True,
+            "expected_full_slot_region_count must be a positive integer",
+            id="boolean-expected-count",
+        ),
+        pytest.param(
+            [KVTransferRegion(0x1000, 128, 32, reverse_indexed=False)],
+            1,
+            "reverse_indexed=True",
+            id="forward-indexed",
+        ),
+        pytest.param(
+            [KVTransferRegion(0, 128, 32, reverse_indexed=True)],
+            1,
+            "base_addr must be a positive integer",
+            id="zero-base",
+        ),
+        pytest.param(
+            [KVTransferRegion(0x1000 + 0.5, 128, 32, reverse_indexed=True)],
+            1,
+            "base_addr must be a positive integer",
+            id="noninteger-base",
+        ),
+        pytest.param(
+            [KVTransferRegion(0x1000, 128, 0, reverse_indexed=True)],
+            1,
+            "unit_bytes must be a positive integer",
+            id="zero-unit",
+        ),
+        pytest.param(
+            [KVTransferRegion(0x1000, 128, 32.5, reverse_indexed=True)],
+            1,
+            "unit_bytes must be a positive integer",
+            id="noninteger-unit",
+        ),
+        pytest.param(
+            [KVTransferRegion(0x1000, 0, 32, reverse_indexed=True)],
+            1,
+            "total_bytes must be a positive integer",
+            id="zero-total",
+        ),
+        pytest.param(
+            [KVTransferRegion(0x1000, 128.5, 32, reverse_indexed=True)],
+            1,
+            "total_bytes must be a positive integer",
+            id="noninteger-total",
+        ),
+        pytest.param(
+            [KVTransferRegion(0x1000, 127, 32, reverse_indexed=True)],
+            1,
+            "total_bytes is too small; got 127, need 128",
+            id="insufficient-capacity",
+        ),
+    ],
+)
+def test_register_rejects_malformed_full_slot_geometry_before_engine_start(
+    monkeypatch,
+    regions,
+    expected_count,
+    message,
+):
+    import torch
+
+    if not hasattr(torch, "device"):
+        pytest.skip("real torch is unavailable")
+
+    captured = _install_registration_dependencies(monkeypatch)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    connector = _registration_connector()
+    transfer_tensors = _page_transfer_tensors(32, num_blocks=2)
+    transfer_tensors.num_slots = 4
+    transfer_tensors.swa_block_regions = regions
+    transfer_tensors.slot_regions = []
+    transfer_tensors.expected_full_slot_region_count = expected_count
+
+    with pytest.raises(ValueError, match=message):
+        connector.register_kv_caches({}, transfer_tensors, num_blocks=2)
+
+    assert "instance_id" not in captured
+    assert "engine" not in captured
+    assert connector._engine is None
+
+
+def test_lmcache_engine_uses_selected_page_codec_bytes_per_block(monkeypatch):
+    import torch
+
+    if not hasattr(torch, "device"):
+        pytest.skip("real torch is unavailable")
+
+    captured = _install_registration_dependencies(monkeypatch)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 2)
+    connector = _registration_connector()
+    transfer_tensors = _page_transfer_tensors(24, 40, num_blocks=4)
+
+    connector.register_kv_caches({}, transfer_tensors, num_blocks=4)
+
+    assert connector._codec.bytes_per_block == 64
+    assert captured["metadata"].atom_bytes_per_block == 64
+    assert captured["gpu_connector"].gpu_staging_chunk_bytes == 128
+    assert captured["engine"].post_initialized is True
 
 
 def test_raw_bytes_metadata_shapes_are_block_rounded():
@@ -312,9 +830,176 @@ def test_lmcache_connector_maps_token_ranges_to_block_ids():
         )
 
 
-def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
-    from contextlib import nullcontext
+def _exception_pipeline(monkeypatch, direction: str, *, failed_stream: str | None):
+    import torch
 
+    class _FakeStream:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.fail_sync = name == failed_stream
+            self.sync_calls = 0
+
+        def wait_event(self, event) -> None:
+            pass
+
+        def synchronize(self) -> None:
+            self.sync_calls += 1
+            if self.fail_sync:
+                raise RuntimeError(f"{self.name} fence failed")
+
+    class _FakeEvent:
+        def __init__(self) -> None:
+            self.record_calls = 0
+
+        def record(self, stream) -> None:
+            self.record_calls += 1
+
+    class _FakeState:
+        def __init__(self) -> None:
+            self.pack_stream = _FakeStream("pack")
+            self.copy_stream = _FakeStream("copy")
+            self.staging_buffer = SimpleNamespace(
+                tensor=None,
+                ready_event=_FakeEvent(),
+                free_event=_FakeEvent(),
+                free_event_valid=False,
+            )
+
+        def stream_ctx(self, stream):
+            return nullcontext()
+
+    callback_calls = 0
+    raise_on_second_group = True
+
+    def _maybe_raise(device_buf, block_id_groups, stream=None):
+        nonlocal callback_calls
+        callback_calls += 1
+        if raise_on_second_group and callback_calls == 2:
+            raise RuntimeError(f"second {direction} group failed")
+
+    codec = SimpleNamespace(
+        device=torch.device("cpu"),
+        num_blocks=2,
+        bytes_per_block=1,
+        has_fused_chunk_major_staging=True,
+        gpu_to_chunk_major_device_buffer=_maybe_raise,
+        chunk_major_device_buffer_to_gpu=_maybe_raise,
+    )
+    connector = ATOMLMCacheGPUConnector(codec, block_size=1, chunk_size=1)
+    connector._release_gpu_staging_after_transfer = False
+    monkeypatch.setattr(connector, "_assert_fused_chunk_major_available", lambda: None)
+    state = _FakeState()
+
+    def _groups(count: int):
+        return [
+            SimpleNamespace(
+                chunks=[
+                    SimpleNamespace(
+                        block_ids=[index],
+                        nbytes=1,
+                        tensor=torch.zeros(1, dtype=torch.uint8),
+                    )
+                ],
+                nbytes=1,
+            )
+            for index in range(count)
+        ]
+
+    current_groups = _groups(2)
+    monkeypatch.setattr(
+        connector,
+        "_prepare_transfer",
+        lambda *args, **kwargs: (state, current_groups),
+    )
+    ensured_tensors = []
+    original_ensure = connector._ensure_staging_buffer
+
+    def _ensure(staging_buffer, nbytes):
+        device_buf = original_ensure(staging_buffer, nbytes)
+        ensured_tensors.append(staging_buffer.tensor)
+        return device_buf
+
+    monkeypatch.setattr(connector, "_ensure_staging_buffer", _ensure)
+
+    def _invoke() -> None:
+        if direction == "save":
+            connector.batched_from_gpu([], [], [])
+        else:
+            connector.batched_to_gpu([], [], [])
+
+    def _prepare_retry() -> None:
+        nonlocal current_groups, raise_on_second_group
+        current_groups = _groups(1)
+        raise_on_second_group = False
+
+    return SimpleNamespace(
+        connector=connector,
+        state=state,
+        invoke=_invoke,
+        prepare_retry=_prepare_retry,
+        ensured_tensors=ensured_tensors,
+    )
+
+
+@pytest.mark.parametrize("direction", ["save", "load"])
+def test_pipeline_exception_successful_fences_allow_safe_buffer_reuse(
+    monkeypatch,
+    direction,
+):
+    case = _exception_pipeline(monkeypatch, direction, failed_stream=None)
+
+    with pytest.raises(RuntimeError, match=f"second {direction} group failed"):
+        case.invoke()
+
+    old_tensor = case.ensured_tensors[0]
+    assert case.state.staging_buffer.free_event.record_calls == 1
+    assert case.state.pack_stream.sync_calls == 1
+    assert case.state.copy_stream.sync_calls == 1
+    assert case.state.staging_buffer.tensor is old_tensor
+    assert case.state.staging_buffer.free_event_valid is False
+    assert case.connector._quarantined_staging_tensors == []
+
+    case.prepare_retry()
+    case.invoke()
+
+    assert case.ensured_tensors[-1] is old_tensor
+
+
+@pytest.mark.parametrize(
+    ("direction", "failed_stream"),
+    [("save", "pack"), ("load", "copy")],
+)
+def test_pipeline_exception_failed_fence_quarantines_even_in_release_mode(
+    monkeypatch,
+    direction,
+    failed_stream,
+):
+    case = _exception_pipeline(monkeypatch, direction, failed_stream=failed_stream)
+    case.connector._release_gpu_staging_after_transfer = True
+
+    with pytest.raises(RuntimeError, match=f"second {direction} group failed"):
+        case.invoke()
+
+    old_tensor = case.ensured_tensors[0]
+    assert case.state.staging_buffer.free_event.record_calls == 1
+    assert case.state.pack_stream.sync_calls == 1
+    assert case.state.copy_stream.sync_calls == 1
+    assert case.state.staging_buffer.tensor is None
+    assert case.state.staging_buffer.free_event_valid is False
+    assert len(case.connector._quarantined_staging_tensors) == 1
+    assert case.connector._quarantined_staging_tensors[0] is old_tensor
+
+    case.state.pack_stream.fail_sync = False
+    case.state.copy_stream.fail_sync = False
+    case.prepare_retry()
+    case.invoke()
+
+    assert case.ensured_tensors[-1] is not old_tensor
+    assert case.state.staging_buffer.tensor is None
+    assert case.connector._quarantined_staging_tensors[0] is old_tensor
+
+
+def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
     import torch
 
     if not hasattr(torch, "arange"):
@@ -686,6 +1371,1741 @@ def test_codec_chunk_major_rejects_duplicate_block_ids():
         codec.gpu_to_chunk_major_device_buffer(device_buf, [[0, 1], [1]])
 
 
+def test_scheduler_alignment_uses_dcp_hash_blocks_and_lmcache_chunks(monkeypatch):
+    monkeypatch.setattr(
+        offcfg,
+        "build_lmcache_config",
+        lambda _config: SimpleNamespace(chunk_size=12),
+    )
+    config = SimpleNamespace(
+        kv_transfer_config={},
+        kv_cache_block_size=4,
+        decode_context_parallel_size=2,
+        state_checkpoint_interval_tokens=16,
+        tensor_parallel_size=1,
+    )
+
+    sched = LMCacheOffloadConnectorScheduler(config)
+
+    assert sched.hash_block_size == 8
+    assert sched.resume_alignment == 24
+    assert sched.sidecar_interval == 48
+
+
+def test_scheduler_snaps_checkpoint_interval_before_sidecar_cadence(monkeypatch):
+    monkeypatch.setattr(
+        offcfg,
+        "build_lmcache_config",
+        lambda _config: SimpleNamespace(chunk_size=12),
+    )
+    config = SimpleNamespace(
+        kv_transfer_config={},
+        kv_cache_block_size=4,
+        decode_context_parallel_size=2,
+        state_checkpoint_interval_tokens=25,
+        tensor_parallel_size=1,
+    )
+
+    sched = LMCacheOffloadConnectorScheduler(config)
+
+    assert sched.hash_block_size == 8
+    assert sched.resume_alignment == 24
+    assert sched.sidecar_interval == 24
+
+
+def test_zero_checkpoint_interval_keeps_terminal_alignment(monkeypatch):
+    monkeypatch.setattr(
+        offcfg,
+        "build_lmcache_config",
+        lambda _config: SimpleNamespace(chunk_size=12),
+    )
+    config = SimpleNamespace(
+        kv_transfer_config={},
+        kv_cache_block_size=4,
+        decode_context_parallel_size=2,
+        state_checkpoint_interval_tokens=0,
+        tensor_parallel_size=1,
+    )
+
+    sched = LMCacheOffloadConnectorScheduler(config)
+
+    assert sched.resume_alignment == 24
+    assert sched.sidecar_interval == 0
+
+
+@pytest.mark.parametrize(
+    "connector_cls",
+    [LMCacheOffloadConnector, LMCacheOffloadConnectorScheduler],
+)
+def test_unknown_kv_role_fails_fast(connector_cls):
+    config = SimpleNamespace(
+        kv_transfer_config={"kv_role": "unknown"},
+        kv_cache_block_size=4,
+    )
+
+    with pytest.raises(ValueError, match="kv_role"):
+        connector_cls(config)
+
+
+def test_scheduler_producer_role_only_tracks_saves():
+    sched = _scheduler()
+    sched.kv_role = "kv_producer"
+    sched._do_save = True
+    sched._do_load = False
+    sched._lookup_client = _LookupClient(hit=12)
+    seq = SimpleNamespace(
+        id=735,
+        num_prompt_tokens=16,
+        token_ids=list(range(16)),
+        num_cached_tokens=0,
+        block_table=[1, 2, 3, 4],
+        has_per_req_cache=False,
+    )
+
+    assert sched.get_num_new_matched_tokens(seq) == (0, False)
+    sched.update_state_after_alloc(seq)
+    meta = sched.build_connector_meta()
+
+    assert sched._load_specs == {}
+    assert [req for req in meta.requests if req.load_spec is not None] == []
+    assert "735" in sched._save_tracker
+
+
+def test_scheduler_consumer_role_only_emits_loads_without_save_deferral():
+    sched = _scheduler()
+    sched.kv_role = "kv_consumer"
+    sched._do_save = False
+    sched._do_load = True
+    sched._lookup_client = _LookupClient(hit=12)
+    seq = SimpleNamespace(
+        id=736,
+        num_prompt_tokens=16,
+        token_ids=list(range(16)),
+        num_cached_tokens=0,
+        block_table=[1, 2, 3, 4],
+        has_per_req_cache=False,
+    )
+
+    assert sched.get_num_new_matched_tokens(seq) == (12, True)
+    sched.update_state_after_alloc(seq)
+    assert sched.should_park_for_load_after_alloc(seq) is True
+    meta = sched.build_connector_meta()
+
+    assert len([req for req in meta.requests if req.load_spec is not None]) == 1
+    assert sched._save_tracker == {}
+    assert sched.should_defer_free(seq) is False
+
+
+def test_connector_metadata_has_work_finds_nested_idle_lookup_unpin():
+    idle = LMCacheOffloadMetadata()
+    idle.lookup_requests_in_step = ["lookup-1"]
+    nested = MultiConnectorMetadata(
+        [ConnectorMetadata(), MultiConnectorMetadata([idle])]
+    )
+
+    assert connector_metadata_has_work(idle) is True
+    assert connector_metadata_has_work(nested) is True
+    assert connector_metadata_has_work(MultiConnectorMetadata([])) is False
+
+
+def test_lookup_unpin_ids_drain_only_after_metadata_dispatch():
+    sched = _scheduler()
+    sched._lookup_in_step = ["lookup-2"]
+
+    meta = sched.build_connector_meta()
+
+    assert meta.requests == []
+    assert meta.lookup_requests_in_step == ["lookup-2"]
+    assert sched._lookup_in_step == ["lookup-2"]
+
+    sched.connector_meta_dispatched(meta)
+    assert sched._lookup_in_step == []
+
+
+def test_engine_core_dispatches_idle_lookup_unpin_metadata(monkeypatch):
+    fake_async_proc = types.ModuleType("atom.model_engine.async_proc")
+    fake_async_proc.AsyncIOProcManager = object
+    monkeypatch.setitem(
+        sys.modules,
+        "atom.model_engine.async_proc",
+        fake_async_proc,
+    )
+    from atom.model_engine.engine_core import EngineCore
+
+    meta = LMCacheOffloadMetadata()
+    meta.lookup_requests_in_step = ["lookup-3"]
+    dispatched = []
+
+    class _Connector:
+        is_offload = True
+
+        def build_connector_meta(self):
+            return meta
+
+        def connector_meta_dispatched(self, value):
+            dispatched.append(("ack", value))
+
+    core = EngineCore.__new__(EngineCore)
+    core.kv_transfer_enabled = True
+    core.scheduler = SimpleNamespace(kv_connector=_Connector())
+    core.runner_mgr = SimpleNamespace(
+        call_func=lambda name, value: dispatched.append((name, value))
+    )
+
+    core._dispatch_idle_offload_work()
+
+    assert dispatched == [
+        ("process_kvconnector_output", meta),
+        ("ack", meta),
+    ]
+
+
+def test_chained_prefix_hashes_match_block_manager_with_dcp_hash_size():
+    config = MockConfig(
+        kv_cache_block_size=4,
+        decode_context_parallel_size=2,
+        num_kvcache_blocks=20,
+    )
+    block_manager = BlockManager(config)
+    tokens = list(range(32))
+
+    actual = _chained_prefix_hashes(tokens, block_manager.hash_block_size)
+    expected = {}
+    parent = -1
+    for boundary in range(
+        block_manager.hash_block_size,
+        len(tokens) + 1,
+        block_manager.hash_block_size,
+    ):
+        block_tokens = tokens[boundary - block_manager.hash_block_size : boundary]
+        parent = BlockManager.compute_hash(block_tokens, parent)
+        expected[boundary] = parent
+
+    assert block_manager.hash_block_size == 8
+    assert actual == expected
+
+
+def test_stateful_page_hit_shrinks_from_16k_to_committed_8k_sidecar():
+    sched = _stateful_scheduler(hit=16_384)
+    seq = _stateful_seq(req_id=700, num_prompt_tokens=24_576)
+    boundary_hash = _commit_sidecar(sched, seq, 8192)
+
+    need, should_park = sched.get_num_new_matched_tokens(seq)
+
+    assert (need, should_park) == (8192, True)
+    assert sched._load_specs["700"].lmcache_cached_tokens == 8192
+    assert sched._pending_slot_loads["700"] == (8192, boundary_hash)
+
+
+def test_stateful_page_hit_without_sidecar_is_rejected_and_lookup_cleared():
+    sched = _stateful_scheduler(hit=16_384)
+    seq = _stateful_seq(req_id=701, num_prompt_tokens=24_576)
+
+    result = sched.get_num_new_matched_tokens(seq)
+
+    assert result == (0, False)
+    assert sched._load_specs == {}
+    assert sched._pending_slot_loads == {}
+    assert sched._lookup_client.cleared == ["701"]
+
+
+def test_stateful_lookup_fails_closed_after_commit_index_eviction():
+    sched = _stateful_scheduler(hit=16_384)
+    sched._committed_sidecar_hashes = connector_module._BoundedLRUSet(1)
+    stale = _stateful_seq(req_id=740, num_prompt_tokens=24_576)
+    recent = _stateful_seq(req_id=741, num_prompt_tokens=24_576)
+    recent.token_ids = [token + 100_000 for token in recent.token_ids]
+    stale_hash = _commit_sidecar(sched, stale, 8192)
+    recent_hash = _commit_sidecar(sched, recent, 8192)
+
+    result = sched.get_num_new_matched_tokens(stale)
+
+    assert stale_hash not in sched._committed_sidecar_hashes
+    assert recent_hash in sched._committed_sidecar_hashes
+    assert result == (0, False)
+    assert sched._pending_slot_loads == {}
+    assert sched._lookup_client.cleared == ["740"]
+
+
+def test_request_cleanup_retains_recent_global_commit():
+    sched = _stateful_scheduler(hit=16_384)
+    sched._committed_sidecar_hashes = connector_module._BoundedLRUSet(2)
+    seq = _stateful_seq(req_id=742, num_prompt_tokens=24_576)
+    boundary_hash = _commit_sidecar(sched, seq, 8192)
+
+    sched.request_finished(seq)
+
+    assert boundary_hash in sched._committed_sidecar_hashes
+
+
+@pytest.mark.parametrize(
+    ("lookup", "num_cached_tokens"),
+    [
+        (_LookupClient(hit=0), 0),
+        (_FailingLookupClient(hit=0), 0),
+        (_LookupClient(hit=8192), 8192),
+    ],
+    ids=["no-hit", "exception", "need-not-positive"],
+)
+def test_page_lookup_retry_clears_stale_load_state(lookup, num_cached_tokens):
+    sched = _stateful_scheduler(hit=0)
+    sched._lookup_client = lookup
+    seq = SimpleNamespace(
+        id=720,
+        num_prompt_tokens=16_384,
+        token_ids=list(range(16_384)),
+        num_cached_tokens=num_cached_tokens,
+        block_table=list(range(64)),
+        has_per_req_cache=False,
+    )
+    sched._load_specs["720"] = object()
+    sched._pending_slot_loads["720"] = (8192, 123)
+    sched._hit_save_floors["720"] = 8192
+
+    result = sched.get_num_new_matched_tokens(seq)
+
+    assert result == (0, False)
+    assert "720" not in sched._load_specs
+    assert "720" not in sched._pending_slot_loads
+    assert "720" not in sched._hit_save_floors
+    assert lookup.cleared == ["720"]
+
+    seq.num_cached_tokens = 8192
+    sched.update_state_after_alloc(seq)
+    save_meta = sched.build_connector_meta()
+
+    assert sched._save_tracker["720"][1] == 8192
+    assert len(save_meta.requests) == 1
+    assert save_meta.requests[0].save_spec.skip_leading_tokens == 0
+    assert save_meta.requests[0].token_ids == seq.token_ids[:8192]
+
+
+def test_stateless_page_lookup_remains_unchanged():
+    sched = _stateful_scheduler(hit=16_384)
+    seq = SimpleNamespace(
+        id=702,
+        num_prompt_tokens=24_576,
+        token_ids=list(range(24_576)),
+        num_cached_tokens=0,
+        has_per_req_cache=False,
+    )
+
+    result = sched.get_num_new_matched_tokens(seq)
+
+    assert result == (16_384, True)
+    assert sched._load_specs["702"].lmcache_cached_tokens == 16_384
+    assert sched._pending_slot_loads == {}
+
+
+def test_stateful_full_prompt_hit_uses_prior_aligned_sidecar():
+    sched = _stateful_scheduler(hit=16_384)
+    seq = _stateful_seq(req_id=703, num_prompt_tokens=16_384)
+    previous_hash = _commit_sidecar(sched, seq, 8192)
+    _commit_sidecar(sched, seq, 16_384)
+
+    need, should_park = sched.get_num_new_matched_tokens(seq)
+
+    assert (need, should_park) == (8192, True)
+    assert sched._load_specs["703"].lmcache_cached_tokens == 8192
+    assert sched._pending_slot_loads["703"] == (8192, previous_hash)
+
+
+def test_stateful_load_metadata_includes_slot_destination_group():
+    sched = _stateful_scheduler(hit=16_384)
+    seq = _stateful_seq(req_id=704, num_prompt_tokens=24_576)
+    boundary_hash = _commit_sidecar(sched, seq, 8192)
+    sched.get_num_new_matched_tokens(seq)
+    seq.per_req_cache_group = 3
+
+    sched.update_state_after_alloc(seq)
+    assert sched.should_park_for_load_after_alloc(seq) is True
+    meta = sched.build_connector_meta()
+
+    assert len(meta.requests) == 1
+    request = meta.requests[0]
+    assert request.load_spec.lmcache_cached_tokens == 8192
+    assert request.slot_load_spec == SlotLoadSpec(
+        boundary_tokens=8192,
+        boundary_block_hash=boundary_hash,
+        destination_group=3,
+    )
+    assert sched._pending_slot_loads == {}
+
+
+def test_load_metadata_uses_scheduler_lifetime_generation_on_reused_req_id():
+    sched = _stateful_scheduler(hit=16_384)
+    operations = []
+    for group in (3, 4):
+        seq = _stateful_seq(
+            req_id=733,
+            num_prompt_tokens=24_576,
+            group=group,
+        )
+        seq.offload_loaded = True
+        seq.offload_load_failed = True
+        seq._consumed_load_operation = LoadOperationId(733, 99)
+        _commit_sidecar(sched, seq, 8192)
+        sched.get_num_new_matched_tokens(seq)
+        sched.update_state_after_alloc(seq)
+        request = sched.build_connector_meta().requests[0]
+        operations.append(request.load_operation)
+        assert seq.offload_loaded is False
+        assert seq.offload_load_failed is False
+        assert seq._active_load_operation == request.load_operation
+        assert seq._consumed_load_operation is None
+        sched.load_finished(request.load_operation)
+        sched.request_finished(seq)
+
+    assert operations == [
+        LoadOperationId(733, 0),
+        LoadOperationId(733, 1),
+    ]
+
+
+def test_late_load_terminal_cannot_mutate_reused_request_lifecycle():
+    sched = _scheduler()
+    sched._lookup_client = _LookupClient(hit=12)
+
+    def emit(seq):
+        sched.get_num_new_matched_tokens(seq)
+        sched.update_state_after_alloc(seq)
+        return sched.build_connector_meta().requests[0].load_operation
+
+    old = SimpleNamespace(
+        id=737,
+        num_prompt_tokens=16,
+        token_ids=list(range(16)),
+        num_cached_tokens=0,
+        block_table=[1, 2, 3, 4],
+        has_per_req_cache=False,
+    )
+    new = SimpleNamespace(
+        id=737,
+        num_prompt_tokens=16,
+        token_ids=list(range(16)),
+        num_cached_tokens=0,
+        block_table=[5, 6, 7, 8],
+        has_per_req_cache=False,
+    )
+    old_operation = emit(old)
+    new_operation = emit(new)
+
+    sched.load_failed(old_operation)
+
+    assert sched._active_load_operations["737"] == (new, new_operation)
+    assert sched._load_save_floors["737"] == 0
+
+    sched.load_finished(new_operation)
+    assert sched._active_load_operations == {}
+
+
+def test_save_tracker_resets_when_raw_req_id_gets_new_sequence_lifecycle():
+    sched = _scheduler()
+    old = _stateful_seq(
+        req_id=734,
+        num_prompt_tokens=16_384,
+        num_cached_tokens=8192,
+        group=2,
+    )
+    new = _stateful_seq(req_id=734, num_prompt_tokens=16_384, group=3)
+    sched._save_tracker["734"] = [old, 8192]
+    sched._sidecar_hash_cache["734"] = (old, {8192: 1}, [(8192, 1)])
+    sched._failed_sidecar_saves["734"] = {(8192, 1)}
+
+    sched.update_state_after_alloc(new)
+
+    assert sched._save_tracker["734"] == [new, 0]
+    assert "734" not in sched._sidecar_hash_cache
+    assert "734" not in sched._failed_sidecar_saves
+
+
+def test_stateful_load_rejects_nonzero_post_alloc_hbm_floor():
+    sched = _stateful_scheduler(hit=16_384)
+    seq = _stateful_seq(req_id=721, num_prompt_tokens=24_576)
+    _commit_sidecar(sched, seq, 8192)
+    sched.get_num_new_matched_tokens(seq)
+    seq.per_req_cache_group = 3
+    # Faithfully models BlockManager's post-allocation state-copy/prefix hit:
+    # a group is assigned and the HBM frontier advances before offload decides.
+    seq.num_cached_tokens = 256
+
+    sched.update_state_after_alloc(seq)
+
+    assert sched.should_park_for_load_after_alloc(seq) is False
+    assert sched.build_connector_meta().requests == []
+    assert sched._pending_slot_loads == {}
+    assert sched._load_specs == {}
+    assert seq.offload_loaded_tokens == 256
+    assert sched._lookup_client.cleared == ["721"]
+
+
+def test_stateful_load_tracks_identity_until_terminal_callback():
+    sched = _stateful_scheduler(hit=16_384)
+    seq = _stateful_seq(
+        req_id=722,
+        num_prompt_tokens=24_576,
+        group=3,
+    )
+    boundary_hash = _commit_sidecar(sched, seq, 8192)
+    sched.get_num_new_matched_tokens(seq)
+    sched.update_state_after_alloc(seq)
+    sched.build_connector_meta()
+
+    assert sched._active_slot_loads["722"] == (8192, boundary_hash)
+
+    sched.load_finished(seq.id)
+    sched.load_finished(seq.id)
+
+    assert sched._active_slot_loads == {}
+    assert boundary_hash in sched._committed_sidecar_hashes
+
+
+def test_stateful_load_failure_evicts_committed_boundary_idempotently():
+    sched = _stateful_scheduler(hit=16_384)
+    seq = _stateful_seq(
+        req_id=723,
+        num_prompt_tokens=24_576,
+        group=3,
+    )
+    boundary_hash = _commit_sidecar(sched, seq, 8192)
+    sched.get_num_new_matched_tokens(seq)
+    sched.update_state_after_alloc(seq)
+    sched.build_connector_meta()
+
+    sched.load_failed(seq.id)
+    sched.load_failed(seq.id)
+
+    assert sched._active_slot_loads == {}
+    assert boundary_hash not in sched._committed_sidecar_hashes
+
+
+def test_sidecar_hashes_are_computed_once_per_sequence_lifecycle(monkeypatch):
+    sched = _stateful_scheduler(hit=16_384)
+    seq = _stateful_seq(
+        req_id=724,
+        num_prompt_tokens=32_768,
+        num_cached_tokens=16_384,
+        group=3,
+    )
+    calls = []
+    original = _chained_prefix_hashes
+
+    def counted(token_ids, hash_block_size):
+        calls.append(len(token_ids) // hash_block_size)
+        return original(token_ids, hash_block_size)
+
+    monkeypatch.setattr(
+        "atom.kv_transfer.offload.connector._chained_prefix_hashes",
+        counted,
+    )
+
+    records = sched._sidecar_boundary_records(seq)
+    sched._sidecar_boundary_records(seq)
+    sched._next_pending_sidecar_boundary(seq, 0, 32_768)
+    sched._sidecar_save_candidate(seq, 16_384)
+
+    assert records
+    assert calls == [128]
+
+    replacement = _stateful_seq(
+        req_id=724,
+        num_prompt_tokens=8192,
+        num_cached_tokens=8192,
+        group=3,
+    )
+    sched._sidecar_boundary_records(replacement)
+    assert calls == [128, 32]
+    sched.request_finished(replacement)
+    assert sched._sidecar_hash_cache == {}
+
+
+def test_stateful_load_without_destination_group_fails_closed():
+    sched = _stateful_scheduler(hit=16_384)
+    seq = _stateful_seq(req_id=705, num_prompt_tokens=24_576)
+    _commit_sidecar(sched, seq, 8192)
+    sched.get_num_new_matched_tokens(seq)
+
+    sched.update_state_after_alloc(seq)
+
+    assert sched.should_park_for_load_after_alloc(seq) is False
+    assert sched.build_connector_meta().requests == []
+    assert sched._pending_slot_loads == {}
+    assert sched._lookup_client.cleared == ["705"]
+
+
+def test_sidecar_save_emits_at_regular_checkpoint_boundary():
+    sched = _stateful_scheduler(hit=0)
+    sched.sidecar_interval = 16_384
+    seq = _stateful_seq(
+        req_id=706,
+        num_prompt_tokens=24_576,
+        num_cached_tokens=16_384,
+        group=2,
+    )
+    sched._save_tracker["706"] = [seq, 0]
+    boundary_hash = _chained_prefix_hashes(seq.token_ids, 256)[16_384]
+
+    meta = sched.build_connector_meta()
+
+    assert len(meta.requests) == 1
+    request = meta.requests[0]
+    assert request.save_spec is not None
+    assert request.slot_save_spec == SlotSaveSpec(
+        boundary_tokens=16_384,
+        boundary_block_hash=boundary_hash,
+        source_group=2,
+    )
+    assert sched._sidecar_save_inflight["706"] == (
+        request.save_operation,
+        16_384,
+        boundary_hash,
+    )
+
+
+def test_slot_save_waits_until_post_allocation_state_copy_forward_completes():
+    sched = _stateful_scheduler(hit=0)
+    seq = _stateful_seq(
+        req_id=732,
+        num_prompt_tokens=16_384,
+        num_cached_tokens=8192,
+        group=5,
+    )
+    seq._slot_initialized_after_alloc = False
+    sched._save_tracker["732"] = [seq, 0]
+    destination_slot = {"value": "garbage"}
+    snapshots = []
+
+    before_forward = sched.build_connector_meta()
+    before_request = before_forward.requests[0]
+    if before_request.slot_save_spec is not None:
+        snapshots.append(destination_slot["value"])
+
+    assert before_request.save_spec is not None
+    assert before_request.slot_save_spec is None
+    assert snapshots == []
+
+    # StateTransfer.copy initializes the live destination inside forward;
+    # postprocess publishes hashes only after that forward has completed.
+    destination_slot["value"] = "initialized-from-checkpoint"
+    seq._slot_initialized_after_alloc = True
+
+    after_forward = sched.build_connector_meta()
+    after_request = after_forward.requests[0]
+    if after_request.slot_save_spec is not None:
+        snapshots.append(destination_slot["value"])
+
+    assert after_request.save_spec is None
+    assert after_request.slot_save_spec.boundary_tokens == 8192
+    assert after_request.slot_save_spec.source_group == 5
+    assert snapshots == ["initialized-from-checkpoint"]
+
+
+def test_sidecar_save_emits_at_terminal_aligned_boundary():
+    sched = _stateful_scheduler(hit=0)
+    sched.sidecar_interval = 16_384
+    seq = _stateful_seq(
+        req_id=707,
+        num_prompt_tokens=24_576,
+        num_cached_tokens=24_576,
+        group=2,
+    )
+    sched._save_tracker["707"] = [seq, 16_384]
+    regular_hash = _chained_prefix_hashes(seq.token_ids, 256)[16_384]
+    sched._committed_sidecar_hashes.add(regular_hash)
+    terminal_hash = _chained_prefix_hashes(seq.token_ids, 256)[24_576]
+
+    meta = sched.build_connector_meta()
+
+    assert len(meta.requests) == 1
+    request = meta.requests[0]
+    assert request.save_spec.skip_leading_tokens == 16_384
+    assert request.slot_save_spec == SlotSaveSpec(
+        boundary_tokens=24_576,
+        boundary_block_hash=terminal_hash,
+        source_group=2,
+    )
+
+
+def test_zero_sidecar_interval_disables_regular_but_keeps_terminal_save():
+    sched = _stateful_scheduler(hit=0)
+    sched.sidecar_interval = 0
+    seq = _stateful_seq(
+        req_id=714,
+        num_prompt_tokens=24_576,
+        num_cached_tokens=16_384,
+        group=2,
+    )
+    sched._save_tracker["714"] = [seq, 24_576]
+
+    assert sched.build_connector_meta().requests == []
+
+    seq.num_cached_tokens = 24_576
+    meta = sched.build_connector_meta()
+
+    assert len(meta.requests) == 1
+    assert meta.requests[0].save_spec is None
+    assert meta.requests[0].slot_save_spec.boundary_tokens == 24_576
+
+
+def test_sidecar_only_save_emits_when_page_boundary_is_already_stored():
+    sched = _stateful_scheduler(hit=0)
+    seq = _stateful_seq(
+        req_id=708,
+        num_prompt_tokens=16_384,
+        num_cached_tokens=8192,
+        group=2,
+    )
+    sched._save_tracker["708"] = [seq, 8192]
+    boundary_hash = _chained_prefix_hashes(seq.token_ids, 256)[8192]
+
+    meta = sched.build_connector_meta()
+
+    assert len(meta.requests) == 1
+    request = meta.requests[0]
+    assert request.save_spec is None
+    assert request.token_ids == seq.token_ids[:8192]
+    assert request.slot_save_spec == SlotSaveSpec(8192, boundary_hash, 2)
+
+
+def test_page_save_inflight_still_cuts_and_emits_exact_sidecar_boundary():
+    sched = _stateful_scheduler(hit=0)
+    seq = _stateful_seq(
+        req_id=721,
+        num_prompt_tokens=16_384,
+        num_cached_tokens=4096,
+        group=2,
+    )
+    sched._save_tracker["721"] = [seq, 4096]
+    prior_operation = SaveOperationId(seq.id, 0)
+    sched._save_nonce = 1
+    sched._save_inflight["721"] = {prior_operation}
+
+    assert sched.adjust_prefill_chunk_after_alloc(seq, 8192) == 4096
+
+    seq.num_cached_tokens = 8192
+    meta = sched.build_connector_meta()
+
+    assert len(meta.requests) == 1
+    request = meta.requests[0]
+    assert request.save_spec.skip_leading_tokens == 4096
+    assert request.token_ids == seq.token_ids[:8192]
+    assert request.slot_save_spec.boundary_tokens == 8192
+    assert sched._save_tracker["721"][1] == 8192
+    assert sched._save_inflight["721"] == {
+        prior_operation,
+        request.save_operation,
+    }
+    assert sched._sidecar_save_inflight["721"][:2] == (
+        request.save_operation,
+        8192,
+    )
+
+
+def test_save_callbacks_clear_only_matching_operation_generation():
+    sched = _stateful_scheduler(hit=0)
+    sched.chunk_size = 4096
+    sched._save_inflight = {}
+    sched._save_nonce = 0
+    seq = _stateful_seq(
+        req_id=725,
+        num_prompt_tokens=16_384,
+        num_cached_tokens=4096,
+        group=2,
+    )
+    sched._save_tracker["725"] = [seq, 0]
+
+    page = sched.build_connector_meta().requests[0]
+    assert page.save_operation == SaveOperationId(seq.id, 0)
+
+    seq.num_cached_tokens = 8192
+    boundary = sched.build_connector_meta().requests[0]
+    assert boundary.save_operation == SaveOperationId(seq.id, 1)
+    assert sched._save_inflight["725"] == {
+        SaveOperationId(seq.id, 0),
+        SaveOperationId(seq.id, 1),
+    }
+    assert sched._sidecar_save_inflight["725"][0] == SaveOperationId(seq.id, 1)
+
+    sched.sidecar_save_finished(page.save_operation)
+    assert "725" in sched._sidecar_save_inflight
+    assert sched._committed_sidecar_hashes == set()
+
+    sched.save_finished(page.save_operation)
+    assert sched._save_inflight["725"] == {SaveOperationId(seq.id, 1)}
+
+    boundary_hash = boundary.slot_save_spec.boundary_block_hash
+    sched.sidecar_save_finished(boundary.save_operation)
+    assert boundary_hash in sched._committed_sidecar_hashes
+    assert "725" not in sched._sidecar_save_inflight
+
+    sched.save_finished(boundary.save_operation)
+    assert sched._save_inflight == {}
+    assert sched.should_defer_free(seq) is False
+
+
+def test_save_nonce_is_never_reused_after_request_id_cleanup():
+    sched = _stateful_scheduler(hit=0)
+    first_seq = _stateful_seq(req_id=727, num_prompt_tokens=8192, group=2)
+    first = sched._next_save_operation(first_seq)
+
+    sched.request_finished(first_seq)
+
+    reused_seq = _stateful_seq(req_id=727, num_prompt_tokens=8192, group=2)
+    second = sched._next_save_operation(reused_seq)
+    sched._save_inflight["727"] = {second}
+    sched.save_finished(first)
+
+    assert first.req_id == second.req_id
+    assert second.generation > first.generation
+    assert sched._save_inflight["727"] == {second}
+
+
+def test_tp_cross_generation_reports_do_not_clear_or_commit_until_matched():
+    sched = _stateful_scheduler(hit=0)
+    sched.chunk_size = 4096
+    seq = _stateful_seq(
+        req_id=726,
+        num_prompt_tokens=16_384,
+        num_cached_tokens=4096,
+        group=2,
+    )
+    sched._save_tracker["726"] = [seq, 0]
+    page = sched.build_connector_meta().requests[0]
+    seq.num_cached_tokens = 8192
+    boundary = sched.build_connector_meta().requests[0]
+    boundary_hash = boundary.slot_save_spec.boundary_block_hash
+    aggregator = KVOutputAggregator(world_size=2)
+    host = Scheduler.__new__(Scheduler)
+    host.kv_connector = sched
+    host.deferred_free_blocks = {}
+    host.finished_recving_kv_req_ids = []
+    host.failed_recving_kv_req_ids = []
+
+    mixed = aggregator.aggregate(
+        [
+            KVConnectorOutput(finished_saving={page.save_operation}),
+            KVConnectorOutput(
+                finished_saving={boundary.save_operation},
+                finished_sidecar_saving={boundary.save_operation},
+            ),
+        ]
+    )
+    host._update_from_kv_xfer_finished(mixed)
+
+    assert sched._save_inflight["726"] == {
+        page.save_operation,
+        boundary.save_operation,
+    }
+    assert boundary_hash not in sched._committed_sidecar_hashes
+
+    matched = aggregator.aggregate(
+        [
+            KVConnectorOutput(
+                finished_saving={boundary.save_operation},
+                finished_sidecar_saving={boundary.save_operation},
+            ),
+            KVConnectorOutput(finished_saving={page.save_operation}),
+        ]
+    )
+    host._update_from_kv_xfer_finished(matched)
+
+    assert sched._save_inflight == {}
+    assert sched._sidecar_save_inflight == {}
+    assert boundary_hash in sched._committed_sidecar_hashes
+    assert aggregator.pending_count == (0, 0)
+
+
+def test_earlier_save_completion_clears_only_its_page_generation():
+    sched = _stateful_scheduler(hit=0)
+    seq = _stateful_seq(
+        req_id=722,
+        num_prompt_tokens=16_384,
+        num_cached_tokens=8192,
+        group=2,
+    )
+    sched._save_tracker["722"] = [seq, 4096]
+    prior_operation = SaveOperationId(seq.id, 0)
+    sched._save_nonce = 1
+    sched._save_inflight["722"] = {prior_operation}
+    meta = sched.build_connector_meta()
+    assert meta.requests[0].save_spec.skip_leading_tokens == 4096
+    boundary_operation = meta.requests[0].save_operation
+
+    sched.save_finished(prior_operation)
+
+    assert sched._save_inflight["722"] == {boundary_operation}
+    assert "722" in sched._sidecar_save_inflight
+
+    sched.sidecar_save_finished(boundary_operation)
+    assert sched._save_inflight["722"] == {boundary_operation}
+
+    sched.save_finished(boundary_operation)
+    assert "722" not in sched._save_inflight
+    assert "722" not in sched._sidecar_save_inflight
+
+
+def test_collapsed_sidecar_and_save_completion_clears_page_inflight():
+    sched = _stateful_scheduler(hit=0)
+    seq = _stateful_seq(
+        req_id=723,
+        num_prompt_tokens=16_384,
+        num_cached_tokens=8192,
+        group=2,
+    )
+    sched._save_tracker["723"] = [seq, 4096]
+    prior_operation = SaveOperationId(seq.id, 0)
+    sched._save_nonce = 1
+    sched._save_inflight["723"] = {prior_operation}
+    boundary_operation = sched.build_connector_meta().requests[0].save_operation
+    host = Scheduler.__new__(Scheduler)
+    host.kv_connector = sched
+    host.deferred_free_blocks = {}
+    host.finished_recving_kv_req_ids = []
+    host.failed_recving_kv_req_ids = []
+
+    host._update_from_kv_xfer_finished(
+        KVConnectorOutput(
+            finished_saving={prior_operation, boundary_operation},
+            finished_sidecar_saving={boundary_operation},
+        )
+    )
+
+    assert "723" not in sched._save_inflight
+    assert "723" not in sched._sidecar_save_inflight
+
+
+def test_paired_multi_completion_cleans_offload_state_before_deallocation():
+    offload = _scheduler()
+    seq = SimpleNamespace(
+        id=724,
+        num_prompt_tokens=8,
+        num_cached_tokens=8,
+        token_ids=list(range(8)),
+        block_table=[0, 1],
+        has_per_req_cache=False,
+    )
+    offload._save_tracker["724"] = [seq, 8]
+    save_operation = SaveOperationId(seq.id, 0)
+    offload._save_inflight["724"] = {save_operation}
+    offload._failed_sidecar_saves["724"] = {(8, 123)}
+
+    class _Producer:
+        is_producer = True
+
+        def __init__(self):
+            self.finished = []
+
+        def request_finished(self, released):
+            self.finished.append(released)
+
+    producer = _Producer()
+    multi = MultiConnectorScheduler.__new__(MultiConnectorScheduler)
+    multi._connectors = [producer, offload]
+    multi.is_producer = True
+    multi.is_offload = True
+    host = Scheduler.__new__(Scheduler)
+    host.kv_connector = multi
+    host.deferred_free_blocks = {seq.id: seq}
+    host.finished_recving_kv_req_ids = []
+    host.failed_recving_kv_req_ids = []
+    deallocated = []
+    host.block_manager = SimpleNamespace(deallocate=deallocated.append)
+
+    host._update_from_kv_xfer_finished(
+        KVConnectorOutput(
+            finished_sending={seq.id},
+            finished_saving={save_operation},
+        )
+    )
+
+    assert producer.finished == [seq]
+    assert deallocated == [seq]
+    assert offload._save_tracker == {}
+    assert offload._failed_sidecar_saves == {}
+    assert offload._save_inflight == {}
+    assert offload._sidecar_save_inflight == {}
+
+
+def test_paired_send_save_calls_exact_save_operation_once_before_release():
+    events = []
+    operation = SaveOperationId(725, 4)
+    seq = SimpleNamespace(id=725)
+
+    class _Connector:
+        is_producer = True
+        is_offload = True
+
+        def save_finished(self, value):
+            events.append(("save_finished", value))
+
+        def should_defer_free(self, _seq):
+            return False
+
+        def request_finished(self, value):
+            events.append(("request_finished", value.id))
+
+    host = Scheduler.__new__(Scheduler)
+    host.kv_connector = _Connector()
+    host.deferred_free_blocks = {seq.id: seq}
+    host.finished_recving_kv_req_ids = []
+    host.failed_recving_kv_req_ids = []
+    host.block_manager = SimpleNamespace(
+        deallocate=lambda value: events.append(("deallocate", value.id))
+    )
+
+    host._update_from_kv_xfer_finished(
+        KVConnectorOutput(
+            finished_sending={seq.id},
+            finished_saving={operation},
+        )
+    )
+
+    assert events == [
+        ("save_finished", operation),
+        ("request_finished", seq.id),
+        ("deallocate", seq.id),
+    ]
+
+
+def test_producer_send_then_save_releases_same_sequence_lifecycle():
+    operation = SaveOperationId(726, 40)
+    seq = SimpleNamespace(id=726)
+    events = []
+
+    class _Connector:
+        is_producer = True
+        is_offload = True
+
+        def __init__(self):
+            self.pending = {operation}
+
+        def save_finished(self, value):
+            events.append(("save_finished", value))
+            self.pending.discard(value)
+
+        def should_defer_free(self, _seq):
+            return bool(self.pending)
+
+        def request_finished(self, value):
+            events.append(("request_finished", value))
+
+    host = Scheduler.__new__(Scheduler)
+    host.kv_connector = _Connector()
+    host.deferred_free_blocks = {seq.id: seq}
+    host.finished_recving_kv_req_ids = []
+    host.failed_recving_kv_req_ids = []
+    host.block_manager = SimpleNamespace(
+        deallocate=lambda value: events.append(("deallocate", value))
+    )
+
+    host._update_from_kv_xfer_finished(KVConnectorOutput(finished_sending={seq.id}))
+    assert host.deferred_free_blocks[seq.id] is seq
+    assert seq._kv_send_completed is True
+
+    host._update_from_kv_xfer_finished(KVConnectorOutput(finished_saving={operation}))
+
+    assert events == [
+        ("save_finished", operation),
+        ("request_finished", seq),
+        ("deallocate", seq),
+    ]
+    assert host.deferred_free_blocks == {}
+    assert not hasattr(seq, "_kv_send_completed")
+
+
+def test_producer_save_before_send_never_deallocates_early():
+    operation = SaveOperationId(727, 41)
+    seq = SimpleNamespace(id=727)
+    deallocated = []
+
+    class _Connector:
+        is_producer = True
+        is_offload = True
+
+        def __init__(self):
+            self.pending = {operation}
+
+        def save_finished(self, value):
+            self.pending.discard(value)
+
+        def should_defer_free(self, _seq):
+            return bool(self.pending)
+
+        def request_finished(self, _seq):
+            pass
+
+    host = Scheduler.__new__(Scheduler)
+    host.kv_connector = _Connector()
+    host.deferred_free_blocks = {seq.id: seq}
+    host.finished_recving_kv_req_ids = []
+    host.failed_recving_kv_req_ids = []
+    host.block_manager = SimpleNamespace(deallocate=deallocated.append)
+
+    host._update_from_kv_xfer_finished(KVConnectorOutput(finished_saving={operation}))
+
+    assert deallocated == []
+    assert host.deferred_free_blocks[seq.id] is seq
+
+    host._update_from_kv_xfer_finished(KVConnectorOutput(finished_sending={seq.id}))
+    assert deallocated == [seq]
+    assert host.deferred_free_blocks == {}
+
+
+def test_late_save_from_reused_id_cannot_release_new_sequence_before_send():
+    old_operation = SaveOperationId(728, 42)
+    new_operation = SaveOperationId(728, 43)
+    new_seq = SimpleNamespace(id=728)
+    deallocated = []
+
+    class _Connector:
+        is_producer = True
+        is_offload = True
+
+        def __init__(self):
+            self.pending = {new_operation}
+
+        def save_finished(self, value):
+            self.pending.discard(value)
+
+        def should_defer_free(self, _seq):
+            return bool(self.pending)
+
+        def request_finished(self, _seq):
+            pass
+
+    host = Scheduler.__new__(Scheduler)
+    host.kv_connector = _Connector()
+    host.deferred_free_blocks = {new_seq.id: new_seq}
+    host.finished_recving_kv_req_ids = []
+    host.failed_recving_kv_req_ids = []
+    host.block_manager = SimpleNamespace(deallocate=deallocated.append)
+
+    host._update_from_kv_xfer_finished(
+        KVConnectorOutput(finished_saving={old_operation})
+    )
+    host._update_from_kv_xfer_finished(
+        KVConnectorOutput(finished_saving={new_operation})
+    )
+
+    assert deallocated == []
+    assert host.deferred_free_blocks[new_seq.id] is new_seq
+
+    host._update_from_kv_xfer_finished(KVConnectorOutput(finished_sending={new_seq.id}))
+    assert deallocated == [new_seq]
+
+
+@pytest.mark.parametrize(
+    ("field", "callback"),
+    [
+        ("finished_loading", "load_finished"),
+        ("failed_loading", "load_failed"),
+    ],
+)
+def test_scheduler_calls_load_terminal_callback_exactly_once(field, callback):
+    calls = []
+
+    class _Connector:
+        is_producer = False
+        is_offload = True
+
+        def load_finished(self, req_id):
+            calls.append(("load_finished", req_id))
+
+        def load_failed(self, req_id):
+            calls.append(("load_failed", req_id))
+
+    host = Scheduler.__new__(Scheduler)
+    host.kv_connector = _Connector()
+    host.finished_recving_kv_req_ids = []
+    host.failed_recving_kv_req_ids = []
+    host.deferred_free_blocks = {}
+
+    host._update_from_kv_xfer_finished(KVConnectorOutput(**{field: {725}}))
+
+    assert calls == [(callback, 725)]
+
+
+def test_scheduler_preserves_load_generation_and_ignores_reused_id_terminal():
+    old_operation = LoadOperationId(725, 10)
+    new_operation = LoadOperationId(725, 11)
+    callbacks = []
+
+    class _Connector:
+        is_producer = False
+        is_offload = True
+
+        def load_finished(self, operation):
+            callbacks.append(operation)
+
+    host = Scheduler.__new__(Scheduler)
+    host.kv_connector = _Connector()
+    host.finished_recving_kv_req_ids = []
+    host.failed_recving_kv_req_ids = []
+    host.deferred_free_blocks = {}
+    host.block_manager = SimpleNamespace(kv_events_enabled=False)
+    new_seq = SimpleNamespace(id=725, _load_operation=new_operation)
+
+    host._update_from_kv_xfer_finished(
+        KVConnectorOutput(finished_loading={old_operation})
+    )
+    assert host._update_waiting_for_remote_kv(new_seq) is False
+
+    host._update_from_kv_xfer_finished(
+        KVConnectorOutput(finished_loading={new_operation})
+    )
+
+    assert callbacks == [old_operation, new_operation]
+    assert host._update_waiting_for_remote_kv(new_seq) is True
+    assert host.finished_recving_kv_req_ids == [old_operation]
+
+
+@pytest.mark.parametrize(
+    ("field", "terminal_callback"),
+    [
+        ("finished_loading", "load_finished"),
+        ("failed_loading", "load_failed"),
+    ],
+)
+def test_aborted_parked_load_defers_owned_resources_until_terminal(
+    field,
+    terminal_callback,
+):
+    events = []
+    seq = SimpleNamespace(
+        id=729,
+        status=SequenceStatus.ABORTED,
+        block_table=[10, 11],
+        has_per_req_cache=True,
+        per_req_cache_group=3,
+        _counted_as_inflight_load=True,
+    )
+
+    class _Connector:
+        is_producer = False
+        is_offload = True
+
+        def load_finished(self, req_id):
+            events.append(("load_finished", req_id))
+
+        def load_failed(self, req_id):
+            events.append(("load_failed", req_id))
+
+        def request_finished(self, value):
+            events.append(("request_finished", value.id))
+
+    def deallocate(value):
+        events.append(("deallocate", value.id))
+        value.block_table.clear()
+        value.per_req_cache_group = -1
+
+    host = Scheduler.__new__(Scheduler)
+    host.kv_connector = _Connector()
+    host.block_manager = SimpleNamespace(deallocate=deallocate)
+    host.deferred_free_blocks = {}
+    host.finished_recving_kv_req_ids = []
+    host.failed_recving_kv_req_ids = []
+    host._num_parked_remote_kv = 1
+    host._rejected = []
+
+    host._reject_aborted_waiting(seq)
+
+    assert host._rejected == [seq]
+    assert host.deferred_free_blocks[seq.id] is seq
+    assert seq._awaiting_aborted_load_cleanup is True
+    assert seq.block_table == [10, 11]
+    assert seq.per_req_cache_group == 3
+    assert host._num_parked_remote_kv == 1
+
+    host._update_from_kv_xfer_finished(KVConnectorOutput(**{field: {seq.id}}))
+
+    assert events == [
+        (terminal_callback, seq.id),
+        ("request_finished", seq.id),
+        ("deallocate", seq.id),
+    ]
+    assert host.deferred_free_blocks == {}
+    assert host._num_parked_remote_kv == 0
+    assert seq.block_table == []
+    assert seq.per_req_cache_group == -1
+    assert host.finished_recving_kv_req_ids == []
+    assert host.failed_recving_kv_req_ids == []
+
+
+@pytest.mark.parametrize(
+    "queued_field",
+    ["finished_recving_kv_req_ids", "failed_recving_kv_req_ids"],
+)
+def test_aborted_parked_load_consumes_already_queued_terminal(queued_field):
+    events = []
+    seq = SimpleNamespace(
+        id=731,
+        status=SequenceStatus.ABORTED,
+        block_table=[12, 13],
+        has_per_req_cache=True,
+        per_req_cache_group=4,
+        _counted_as_inflight_load=True,
+    )
+
+    class _Connector:
+        is_producer = False
+        is_offload = True
+
+        def load_finished(self, req_id):
+            events.append(("unexpected_load_finished", req_id))
+
+        def load_failed(self, req_id):
+            events.append(("unexpected_load_failed", req_id))
+
+        def request_finished(self, value):
+            events.append(("request_finished", value.id))
+
+    def deallocate(value):
+        events.append(("deallocate", value.id))
+        value.block_table.clear()
+        value.per_req_cache_group = -1
+
+    host = Scheduler.__new__(Scheduler)
+    host.kv_connector = _Connector()
+    host.block_manager = SimpleNamespace(deallocate=deallocate)
+    host.deferred_free_blocks = {}
+    host.finished_recving_kv_req_ids = []
+    host.failed_recving_kv_req_ids = []
+    getattr(host, queued_field).append(seq.id)
+    host._num_parked_remote_kv = 1
+    host._rejected = []
+
+    host._reject_aborted_waiting(seq)
+
+    assert events == [
+        ("request_finished", seq.id),
+        ("deallocate", seq.id),
+    ]
+    assert host._rejected == [seq]
+    assert host.deferred_free_blocks == {}
+    assert host.finished_recving_kv_req_ids == []
+    assert host.failed_recving_kv_req_ids == []
+    assert host._num_parked_remote_kv == 0
+    assert seq.block_table == []
+    assert seq.per_req_cache_group == -1
+    assert not hasattr(seq, "_awaiting_aborted_load_cleanup")
+
+
+@pytest.mark.parametrize(
+    ("terminal_field", "terminal_callback", "consumed_flag"),
+    [
+        ("finished_loading", "load_finished", "offload_loaded"),
+        ("failed_loading", "load_failed", "offload_load_failed"),
+    ],
+)
+def test_abort_cleans_load_whose_terminal_was_already_consumed(
+    terminal_field,
+    terminal_callback,
+    consumed_flag,
+):
+    events = []
+    seq = SimpleNamespace(
+        id=738,
+        status=SequenceStatus.WAITING_FOR_REMOTE_KVS,
+        block_table=[14, 15],
+        has_per_req_cache=True,
+        per_req_cache_group=5,
+        _counted_as_inflight_load=True,
+        num_cached_tokens=4,
+        num_tokens=8,
+        offload_loaded_tokens=4,
+        offload_load_start_tokens=4,
+    )
+
+    class _Connector:
+        is_producer = False
+        is_offload = True
+
+        def load_finished(self, req_id):
+            events.append(("load_finished", req_id))
+            return True
+
+        def load_failed(self, req_id):
+            events.append(("load_failed", req_id))
+            return True
+
+        def request_finished(self, value):
+            events.append(("request_finished", value.id))
+
+    def deallocate(value):
+        events.append(("deallocate", value.id))
+        value.block_table.clear()
+        value.per_req_cache_group = -1
+
+    host = Scheduler.__new__(Scheduler)
+    host.kv_connector = _Connector()
+    host.block_manager = SimpleNamespace(
+        kv_events_enabled=False,
+        deallocate=deallocate,
+    )
+    host.deferred_free_blocks = {}
+    host.finished_recving_kv_req_ids = []
+    host.failed_recving_kv_req_ids = []
+    host._num_parked_remote_kv = 1
+    host._rejected = []
+
+    host._update_from_kv_xfer_finished(KVConnectorOutput(**{terminal_field: {seq.id}}))
+    assert host._resolve_waiting_remote_kv(seq, deque()) is False
+    assert getattr(seq, consumed_flag) is True
+    assert host.finished_recving_kv_req_ids == []
+    assert host.failed_recving_kv_req_ids == []
+
+    seq.status = SequenceStatus.ABORTED
+    host._reject_aborted_waiting(seq)
+
+    assert events == [
+        (terminal_callback, seq.id),
+        ("request_finished", seq.id),
+        ("deallocate", seq.id),
+    ]
+    assert host.deferred_free_blocks == {}
+    assert host._num_parked_remote_kv == 0
+    assert seq.block_table == []
+    assert seq.per_req_cache_group == -1
+    assert not hasattr(seq, "_awaiting_aborted_load_cleanup")
+
+
+@pytest.mark.parametrize(
+    ("terminal_field", "terminal_callback"),
+    [
+        ("finished_loading", "load_finished"),
+        ("failed_loading", "load_failed"),
+    ],
+)
+def test_abort_during_second_load_ignores_first_consumed_generation(
+    terminal_field,
+    terminal_callback,
+):
+    first = LoadOperationId(739, 30)
+    second = LoadOperationId(739, 31)
+    events = []
+    seq = SimpleNamespace(
+        id=739,
+        status=SequenceStatus.ABORTED,
+        block_table=[16, 17],
+        has_per_req_cache=True,
+        per_req_cache_group=6,
+        _counted_as_inflight_load=True,
+        _load_operation=second,
+        _active_load_operation=second,
+        _consumed_load_operation=first,
+        offload_loaded=True,
+        offload_load_failed=True,
+    )
+
+    class _Connector:
+        is_producer = False
+        is_offload = True
+
+        def load_finished(self, operation):
+            events.append(("load_finished", operation))
+            return operation == second
+
+        def load_failed(self, operation):
+            events.append(("load_failed", operation))
+            return operation == second
+
+        def request_finished(self, value):
+            events.append(("request_finished", value.id))
+
+    def deallocate(value):
+        events.append(("deallocate", value.id))
+        value.block_table.clear()
+        value.per_req_cache_group = -1
+
+    host = Scheduler.__new__(Scheduler)
+    host.kv_connector = _Connector()
+    host.block_manager = SimpleNamespace(deallocate=deallocate)
+    host.deferred_free_blocks = {}
+    host.finished_recving_kv_req_ids = []
+    host.failed_recving_kv_req_ids = []
+    host._num_parked_remote_kv = 1
+    host._rejected = []
+
+    host._reject_aborted_waiting(seq)
+
+    assert host.deferred_free_blocks[seq.id] is seq
+    assert seq.block_table == [16, 17]
+    assert host._num_parked_remote_kv == 1
+
+    host._update_from_kv_xfer_finished(KVConnectorOutput(**{terminal_field: {second}}))
+
+    assert events == [
+        (terminal_callback, second),
+        ("request_finished", seq.id),
+        ("deallocate", seq.id),
+    ]
+    assert host.deferred_free_blocks == {}
+    assert host._num_parked_remote_kv == 0
+    assert seq.block_table == []
+    assert seq.per_req_cache_group == -1
+    assert not hasattr(seq, "_active_load_operation")
+    assert not hasattr(seq, "_consumed_load_operation")
+
+
+def test_consume_failed_remote_kv_does_not_repeat_terminal_callback():
+    calls = []
+    seq = SimpleNamespace(
+        id=730,
+        status=SequenceStatus.WAITING_FOR_REMOTE_KVS,
+        num_cached_tokens=4,
+    )
+
+    class _Connector:
+        is_producer = False
+        is_offload = True
+
+        def load_failed(self, req_id):
+            calls.append(req_id)
+
+    host = Scheduler.__new__(Scheduler)
+    host.kv_connector = _Connector()
+    host.failed_recving_kv_req_ids = [seq.id]
+    host._num_parked_remote_kv = 0
+
+    assert host._consume_failed_remote_kv(seq) is True
+    assert calls == []
+
+
+def test_sidecar_save_waits_for_exact_completed_boundary():
+    sched = _stateful_scheduler(hit=0)
+    seq = _stateful_seq(
+        req_id=709,
+        num_prompt_tokens=16_384,
+        num_cached_tokens=8191,
+        group=2,
+    )
+    sched._save_tracker["709"] = [seq, 8192]
+
+    assert sched.build_connector_meta().requests == []
+
+    seq.num_cached_tokens = 8192
+    meta = sched.build_connector_meta()
+
+    assert len(meta.requests) == 1
+    assert meta.requests[0].slot_save_spec.boundary_tokens == 8192
+
+
+def test_sidecar_save_is_not_duplicated_while_inflight_or_after_commit():
+    sched = _stateful_scheduler(hit=0)
+    seq = _stateful_seq(
+        req_id=710,
+        num_prompt_tokens=16_384,
+        num_cached_tokens=8192,
+        group=2,
+    )
+    sched._save_tracker["710"] = [seq, 8192]
+
+    first = sched.build_connector_meta()
+    boundary_hash = first.requests[0].slot_save_spec.boundary_block_hash
+    assert sched.build_connector_meta().requests == []
+
+    sched.save_finished(seq.id)
+    assert sched.build_connector_meta().requests == []
+
+    sched.sidecar_save_finished(seq.id)
+    assert boundary_hash in sched._committed_sidecar_hashes
+    assert sched.build_connector_meta().requests == []
+
+
+def test_sidecar_save_failure_clears_inflight_without_committing():
+    sched = _stateful_scheduler(hit=0)
+    seq = _stateful_seq(
+        req_id=715,
+        num_prompt_tokens=16_384,
+        num_cached_tokens=8192,
+        group=2,
+    )
+    sched._save_tracker["715"] = [seq, 8192]
+    meta = sched.build_connector_meta()
+    boundary_hash = meta.requests[0].slot_save_spec.boundary_block_hash
+
+    sched.sidecar_save_failed(seq.id)
+
+    assert "715" not in sched._sidecar_save_inflight
+    assert boundary_hash not in sched._committed_sidecar_hashes
+
+
+def test_failed_terminal_sidecar_does_not_pin_or_retry_finished_request():
+    sched = _stateful_scheduler(hit=0)
+    seq = _stateful_seq(
+        req_id=719,
+        num_prompt_tokens=8192,
+        num_cached_tokens=8192,
+        group=2,
+    )
+    sched._save_tracker["719"] = [seq, 8192]
+    meta = sched.build_connector_meta()
+    boundary_hash = meta.requests[0].slot_save_spec.boundary_block_hash
+
+    sched.request_finished(seq)
+    sched.sidecar_save_failed(seq.id)
+    sched.save_finished(seq.id)
+
+    assert boundary_hash not in sched._committed_sidecar_hashes
+    assert sched.should_defer_free(seq) is False
+    sched.request_finished(seq)
+    assert "719" not in sched._save_tracker
+    assert sched.build_connector_meta().requests == []
+
+
+def test_tp_partial_sidecar_completion_never_commits():
+    sched = _stateful_scheduler(hit=0)
+    seq = _stateful_seq(
+        req_id=716,
+        num_prompt_tokens=16_384,
+        num_cached_tokens=8192,
+        group=2,
+    )
+    sched._save_tracker["716"] = [seq, 8192]
+    meta = sched.build_connector_meta()
+    save_operation = meta.requests[0].save_operation
+    boundary_hash = meta.requests[0].slot_save_spec.boundary_block_hash
+    host = Scheduler.__new__(Scheduler)
+    host.kv_connector = sched
+    host.deferred_free_blocks = {}
+    aggregator = KVOutputAggregator(world_size=2)
+
+    partial = aggregator.aggregate(
+        [
+            KVConnectorOutput(finished_sidecar_saving={save_operation}),
+            KVConnectorOutput(),
+        ]
+    )
+    host._update_from_kv_xfer_finished(partial)
+
+    assert boundary_hash not in sched._committed_sidecar_hashes
+    assert sched._sidecar_save_inflight["716"] == (
+        save_operation,
+        8192,
+        boundary_hash,
+    )
+
+    terminal = aggregator.aggregate(
+        [
+            KVConnectorOutput(),
+            KVConnectorOutput(finished_sidecar_saving={save_operation}),
+        ]
+    )
+    host._update_from_kv_xfer_finished(terminal)
+
+    assert boundary_hash in sched._committed_sidecar_hashes
+    assert "716" not in sched._sidecar_save_inflight
+
+
+def test_request_finish_retains_tracker_for_pending_and_inflight_sidecar():
+    sched = _stateful_scheduler(hit=0)
+    seq = _stateful_seq(
+        req_id=717,
+        num_prompt_tokens=8192,
+        num_cached_tokens=8192,
+        group=2,
+    )
+    sched._save_tracker["717"] = [seq, 8192]
+
+    sched.request_finished(seq)
+    assert "717" in sched._save_tracker
+    assert sched.should_defer_free(seq) is True
+
+    meta = sched.build_connector_meta()
+    boundary_hash = meta.requests[0].slot_save_spec.boundary_block_hash
+    assert "717" not in sched._save_inflight
+    sched.request_finished(seq)
+    assert "717" in sched._save_tracker
+    assert sched.should_defer_free(seq) is True
+
+    sched.sidecar_save_finished(seq.id)
+    assert boundary_hash in sched._committed_sidecar_hashes
+    assert sched.should_defer_free(seq) is False
+
+    sched.save_finished(seq.id)
+    sched.request_finished(seq)
+    assert sched.should_defer_free(seq) is False
+    assert "717" not in sched._save_tracker
+
+
+def test_request_finish_retains_tracker_for_pending_page_save():
+    sched = _scheduler()
+    seq = SimpleNamespace(
+        id=718,
+        token_ids=list(range(8)),
+        block_table=[3, 4],
+        num_prompt_tokens=8,
+        num_cached_tokens=8,
+        has_per_req_cache=False,
+    )
+    sched._save_tracker["718"] = [seq, 0]
+
+    sched.request_finished(seq)
+    assert "718" in sched._save_tracker
+    assert sched.should_defer_free(seq) is True
+
+    meta = sched.build_connector_meta()
+    assert meta.requests[0].save_spec is not None
+    sched.request_finished(seq)
+    assert "718" in sched._save_tracker
+
+    sched.save_finished(seq.id)
+    sched.request_finished(seq)
+    assert sched.should_defer_free(seq) is False
+    assert "718" not in sched._save_tracker
+
+
+def test_prefill_chunk_is_cut_at_nearest_pending_sidecar_boundary():
+    sched = _stateful_scheduler(hit=0)
+    sched.sidecar_interval = 16_384
+    seq = _stateful_seq(
+        req_id=711,
+        num_prompt_tokens=24_576,
+        num_cached_tokens=12_288,
+        group=2,
+    )
+
+    assert sched.adjust_prefill_chunk_after_alloc(seq, 8192) == 4096
+
+
+def test_prefill_chunk_does_not_recut_committed_or_inflight_boundary():
+    sched = _stateful_scheduler(hit=0)
+    sched.sidecar_interval = 16_384
+    seq = _stateful_seq(
+        req_id=712,
+        num_prompt_tokens=24_576,
+        num_cached_tokens=12_288,
+        group=2,
+    )
+    boundary_hash = _chained_prefix_hashes(seq.token_ids, 256)[16_384]
+
+    sched._committed_sidecar_hashes.add(boundary_hash)
+    assert sched.adjust_prefill_chunk_after_alloc(seq, 8192) == 8192
+
+    sched._committed_sidecar_hashes.clear()
+    sched._sidecar_save_inflight["712"] = (
+        SaveOperationId(seq.id, 0),
+        16_384,
+        boundary_hash,
+    )
+    assert sched.adjust_prefill_chunk_after_alloc(seq, 8192) == 8192
+
+
+def test_sidecar_chunk_cut_preserves_earlier_load_handoff_cap():
+    sched = _stateful_scheduler(hit=0)
+    sched.sidecar_interval = 16_384
+    seq = _stateful_seq(
+        req_id=713,
+        num_prompt_tokens=32_768,
+        num_cached_tokens=12_288,
+        group=2,
+    )
+    seq.offload_handoff_boundary_tokens = 20_000
+    sched._handoff_loads.add("713")
+
+    assert sched.adjust_prefill_chunk_after_alloc(seq, 16_000) == 4096
+
+
 def test_full_prompt_hit_is_clamped_before_load_spec():
     sched = _scheduler()
     sched._lookup_client = _LookupClient(hit=8)
@@ -754,7 +3174,7 @@ def test_load_is_skipped_if_hbm_satisfies_after_allocation():
     assert str(seq.id) not in sched._reqs_need_recv
 
 
-def test_lookup_time_hbm_satisfies_does_not_resave_hit_prefix():
+def test_lookup_time_hbm_satisfies_can_resave_locally_computed_prefix():
     sched = _scheduler()
     lookup = _LookupClient(hit=8)
     sched._lookup_client = lookup
@@ -773,11 +3193,14 @@ def test_lookup_time_hbm_satisfies_does_not_resave_hit_prefix():
     sched.update_state_after_alloc(seq)
     meta1 = sched.build_connector_meta()
 
-    assert meta1.requests == []
+    assert len(meta1.requests) == 1
+    assert meta1.requests[0].token_ids == list(range(8))
+    assert meta1.requests[0].save_spec.skip_leading_tokens == 0
     assert meta1.lookup_requests_in_step == ["322"]
     assert sched._save_tracker[str(seq.id)][1] == 8
     assert lookup.cleared == ["322"]
 
+    sched.save_finished(seq.id)
     seq.num_cached_tokens = 12
     meta2 = sched.build_connector_meta()
     save_reqs = [req for req in meta2.requests if req.save_spec is not None]
@@ -1015,6 +3438,31 @@ def test_worker_completes_noop_load_when_hbm_satisfies():
     assert conn._engine.unpinned == ["321"]
 
 
+def test_worker_load_terminal_paths_report_exact_operation_once():
+    conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
+    conn._lock = threading.Lock()
+    conn._done_load = set()
+    conn._failed_load = set()
+    conn._done_save = set()
+    conn._engine = SimpleNamespace(lookup_unpin=lambda _lookup_id: None)
+    operation = LoadOperationId(322, 9)
+    req = LMCacheReqMeta(
+        req_id=322,
+        token_ids=list(range(8)),
+        block_ids=[1, 2],
+        load_spec=SimpleNamespace(hbm_cached_tokens=8, lmcache_cached_tokens=8),
+        load_operation=operation,
+    )
+
+    conn._do_load_req(req)
+    conn._finish_rejected_load(req, None)
+
+    output = conn.get_finished()
+    assert output.finished_loading == set()
+    assert output.failed_loading == {operation}
+    assert conn.get_finished().is_empty()
+
+
 def test_worker_unpins_only_lookups_without_an_emitted_load():
     class _Executor:
         def __init__(self) -> None:
@@ -1108,7 +3556,8 @@ def test_worker_save_uses_lmcache_engine_store():
         save_spec=SimpleNamespace(skip_leading_tokens=4),
     )
 
-    conn._do_save_req(req)
+    req_lock = conn._begin_save_operation(req.req_id)
+    conn._run_save_req(req, None, None, req_lock)
 
     assert conn._done_save == {987}
     assert len(conn._engine.calls) == 1
@@ -1149,7 +3598,8 @@ def test_worker_save_waits_for_forward_event_before_store():
         save_spec=SimpleNamespace(skip_leading_tokens=0),
     )
 
-    conn._do_save_req(req, _Event())
+    req_lock = conn._begin_save_operation(req.req_id)
+    conn._run_save_req(req, _Event(), None, req_lock)
 
     assert order == ["forward-ready", "store"]
     assert conn._done_save == {988}
@@ -1370,6 +3820,63 @@ def test_finished_saving_releases_deferred_free_with_string_req_id():
     sched._update_from_kv_xfer_finished(KVConnectorOutput(finished_saving={"9"}))
 
     assert sched.block_manager.deallocated == [9]
+    assert sched.deferred_free_blocks == {}
+
+
+@pytest.mark.parametrize(
+    ("sidecar_field", "sidecar_callback"),
+    [
+        ("finished_sidecar_saving", "sidecar_save_finished"),
+        ("failed_sidecar_saving", "sidecar_save_failed"),
+    ],
+)
+def test_sidecar_save_callback_precedes_page_save_release(
+    sidecar_field,
+    sidecar_callback,
+):
+    events = []
+
+    class _BlockManager:
+        def deallocate(self, seq) -> None:
+            events.append(("deallocate", seq.id))
+
+    class _Connector:
+        is_producer = False
+        is_offload = True
+
+        def sidecar_save_finished(self, req_id) -> None:
+            events.append(("sidecar_save_finished", req_id))
+
+        def sidecar_save_failed(self, req_id) -> None:
+            events.append(("sidecar_save_failed", req_id))
+
+        def save_finished(self, req_id) -> None:
+            events.append(("save_finished", req_id))
+
+        def should_defer_free(self, seq) -> bool:
+            return False
+
+        def request_finished(self, seq) -> None:
+            events.append(("request_finished", seq.id))
+
+    sched = Scheduler.__new__(Scheduler)
+    sched.block_manager = _BlockManager()
+    sched.kv_connector = _Connector()
+    seq = SimpleNamespace(id=9)
+    sched.deferred_free_blocks = {seq.id: seq}
+    output = KVConnectorOutput(
+        finished_saving={"9"},
+        **{sidecar_field: {"9"}},
+    )
+
+    sched._update_from_kv_xfer_finished(output)
+
+    assert events[0] == (sidecar_callback, "9")
+    assert events[1:] == [
+        ("save_finished", "9"),
+        ("request_finished", 9),
+        ("deallocate", 9),
+    ]
     assert sched.deferred_free_blocks == {}
 
 

@@ -13,12 +13,12 @@ how those blocks are packed as opaque bytes.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 import threading
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
 
 import torch
 
-from atom.kv_transfer.offload.atom_kv_byte_codec import ATOMKVByteCodec
 from atom.kv_transfer.offload.atom_lmcache_staging import (
     _StagingBuffer,
     _ThreadTransferState,
@@ -26,6 +26,38 @@ from atom.kv_transfer.offload.atom_lmcache_staging import (
     _env_int,
     _env_optional_int,
 )
+
+logger = logging.getLogger("atom")
+
+
+class ATOMBlockByteCodec(Protocol):
+    """Block-byte staging contract shared by dense and PAGE codecs."""
+
+    @property
+    def device(self) -> torch.device: ...
+
+    @property
+    def num_blocks(self) -> int: ...
+
+    @property
+    def bytes_per_block(self) -> int: ...
+
+    @property
+    def has_fused_chunk_major_staging(self) -> bool: ...
+
+    def gpu_to_chunk_major_device_buffer(
+        self,
+        device_buf: torch.Tensor,
+        block_id_groups: list[list[int]],
+        stream: torch.cuda.Stream | None = None,
+    ) -> None: ...
+
+    def chunk_major_device_buffer_to_gpu(
+        self,
+        device_buf: torch.Tensor,
+        block_id_groups: list[list[int]],
+        stream: torch.cuda.Stream | None = None,
+    ) -> None: ...
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -63,7 +95,7 @@ class ATOMLMCacheGPUConnector:
 
     def __init__(
         self,
-        codec: ATOMKVByteCodec,
+        codec: ATOMBlockByteCodec,
         block_size: int,
         *,
         chunk_size: int | None = None,
@@ -90,6 +122,14 @@ class ATOMLMCacheGPUConnector:
             )
         self.device = torch.device(codec.device)
         self._tls = threading.local()
+        # A tensor is held here only when stream synchronization failed, so
+        # freeing it could race still-running GPU work. Each failed pipeline
+        # recovery adds at most one tensor; healthy devices fence successfully
+        # and never grow this list. On an uncertain device the list is
+        # intentionally unbounded for connector lifetime: correctness takes
+        # priority over reclaiming potentially live GPU storage.
+        self._quarantined_staging_tensors: list[torch.Tensor] = []
+        self._quarantined_staging_lock = threading.Lock()
         requested_buffer_chunks = _env_int("OFFLOAD_GPU_STAGING_CHUNKS", 2)
         max_staging_bytes = _env_optional_int("OFFLOAD_GPU_STAGING_MAX_BYTES")
         if max_staging_bytes is not None:
@@ -176,6 +216,37 @@ class ATOMLMCacheGPUConnector:
     ) -> None:
         if not self._release_gpu_staging_after_transfer:
             return
+        staging_buffer.tensor = None
+        staging_buffer.free_event_valid = False
+
+    @staticmethod
+    def _fence_pipeline_streams(
+        stage_a: _PipelineStage,
+        stage_b: _PipelineStage,
+    ) -> bool:
+        """Attempt both stream fences; return whether completion is confirmed."""
+        all_fenced = True
+        for stage_name, stream in (
+            ("stage_a", stage_a.stream),
+            ("stage_b", stage_b.stream),
+        ):
+            try:
+                stream.synchronize()
+            except Exception:
+                all_fenced = False
+                logger.exception(
+                    "ATOM LMCache connector: %s stream fence failed after "
+                    "pipeline exception; staging will be quarantined",
+                    stage_name,
+                )
+        return all_fenced
+
+    def _quarantine_staging_buffer(self, staging_buffer: _StagingBuffer) -> None:
+        """Detach and retain a buffer whose GPU completion is uncertain."""
+        tensor = staging_buffer.tensor
+        if tensor is not None:
+            with self._quarantined_staging_lock:
+                self._quarantined_staging_tensors.append(tensor)
         staging_buffer.tensor = None
         staging_buffer.free_event_valid = False
 
@@ -363,11 +434,14 @@ class ATOMLMCacheGPUConnector:
         Each group flows ``stage_a`` -> ``stage_b`` on their respective streams,
         handed off via the staging buffer's ready event; the free event gates a
         later group's reuse of the same buffer. ``stage_b``'s stream produces
-        the observable result, so it is the one synchronized at the end.
+        the observable result, so it is the one synchronized at the end. An
+        exception fences both streams; an unconfirmed fence permanently
+        quarantines that tensor and forces fresh allocation on the next call.
         """
         self._assert_fused_chunk_major_available()
         staging_buffer = state.staging_buffer
         used_buffer = False
+        buffer_safe_to_release = True
         try:
             for group in groups:
                 device_buf = self._ensure_staging_buffer(staging_buffer, group.nbytes)
@@ -384,10 +458,16 @@ class ATOMLMCacheGPUConnector:
                 staging_buffer.free_event_valid = True
             stage_b.stream.synchronize()
         except Exception:
-            staging_buffer.free_event_valid = False
+            if self._fence_pipeline_streams(stage_a, stage_b):
+                # Both streams are complete; no event wait is needed before the
+                # existing tensor is reused or explicitly released.
+                staging_buffer.free_event_valid = False
+            else:
+                self._quarantine_staging_buffer(staging_buffer)
+                buffer_safe_to_release = False
             raise
         finally:
-            if used_buffer:
+            if used_buffer and buffer_safe_to_release:
                 self._release_staging_buffer_if_requested(staging_buffer)
 
     def from_gpu(self, memory_obj: Any, start: int, end: int, **kwargs) -> None:

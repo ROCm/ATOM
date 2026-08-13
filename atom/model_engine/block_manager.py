@@ -416,6 +416,7 @@ class BlockManager:
         # admission bound for state cache.
         if seq.has_per_req_cache and self.paged_state_checkpoints is None:
             self._attach_state_group(seq, h if num_cached_blocks > 0 else -1)
+            seq._slot_initialized_after_alloc = False
 
     def _attach_state_group(self, seq: Sequence, hit_hash: int) -> None:
         """Give `seq` a state group, resuming from a checkpoint when one exists.

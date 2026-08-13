@@ -146,6 +146,7 @@ class Sequence:
         # already been flipped to DECODE. A seq.type / len(output_tokens) gate
         # would never fire for the prefill blocks; this flag does.
         self.prefix_hashes_published = False
+        self._slot_initialized_after_alloc = False
         self.return_logprobs = bool(getattr(sampling_params, "logprobs", False))
         self.logprobs: list[float] = []
         # stream callback

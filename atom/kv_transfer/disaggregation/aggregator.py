@@ -16,9 +16,17 @@ This module provides:
 
 from __future__ import annotations
 
+from collections import deque
 import logging
 
-from atom.kv_transfer.disaggregation.types import KVConnectorOutput, ReqId
+from atom.kv_transfer.disaggregation.types import (
+    KVConnectorOutput,
+    LoadCompletionId,
+    LoadOperationId,
+    ReqId,
+    SaveCompletionId,
+    SaveOperationId,
+)
 
 logger = logging.getLogger("atom")
 
@@ -28,10 +36,10 @@ __all__ = ["KVOutputAggregator"]
 class KVOutputAggregator:
     """Aggregates :class:`KVConnectorOutput` from all TP workers.
 
-    Tracks which unique worker indices have reported each request as
-    finished.  A request is globally complete only when all
-    ``world_size`` workers have reported it — duplicate reports from
-    the same worker (e.g. from retried notifications) are ignored.
+    Tracks which unique worker indices have reported each request or exact save
+    generation as finished. A transfer is globally complete only when all
+    ``world_size`` workers report the same identity — duplicate reports from
+    one worker and cross-generation PAGE/SLOT reports are ignored.
 
     Args:
         world_size: Number of TP workers to aggregate over.
@@ -44,16 +52,31 @@ class KVOutputAggregator:
         # result.finished_recving contains only IDs done on ALL 8 workers
     """
 
-    def __init__(self, world_size: int = 8) -> None:
+    def __init__(
+        self,
+        world_size: int = 8,
+        terminal_tombstone_limit: int = 4096,
+    ) -> None:
         if world_size <= 0:
             raise ValueError(f"world_size must be positive, got {world_size}")
+        if terminal_tombstone_limit <= 0:
+            raise ValueError("terminal_tombstone_limit must be positive")
         self._world_size = world_size
+        self._terminal_tombstone_limit = terminal_tombstone_limit
         self._seen_sending: dict[ReqId, set[int]] = {}
         self._seen_recving: dict[ReqId, set[int]] = {}
         self._seen_recv_failed: dict[ReqId, set[int]] = {}
-        self._seen_saving: dict[ReqId, set[int]] = {}
-        self._seen_loading: dict[ReqId, set[int]] = {}
-        self._seen_load_failed: dict[ReqId, set[int]] = {}
+        self._seen_saving: dict[SaveCompletionId, set[int]] = {}
+        self._seen_loading: dict[LoadCompletionId, set[int]] = {}
+        self._seen_load_failed: dict[LoadCompletionId, set[int]] = {}
+        self._seen_sidecar_saving: dict[SaveCompletionId, set[int]] = {}
+        self._seen_sidecar_save_failed: dict[SaveCompletionId, set[int]] = {}
+        self._terminal_saving_order: deque[SaveOperationId] = deque()
+        self._terminal_saving: set[SaveOperationId] = set()
+        self._terminal_sidecar_order: deque[SaveOperationId] = deque()
+        self._terminal_sidecar: set[SaveOperationId] = set()
+        self._terminal_load_order: deque[LoadOperationId] = deque()
+        self._terminal_load: set[LoadOperationId] = set()
 
     @property
     def world_size(self) -> int:
@@ -85,13 +108,40 @@ class KVOutputAggregator:
                     self._seen_recv_failed.setdefault(rid, set()).add(worker_idx)
             if wo.finished_saving:
                 for rid in wo.finished_saving:
+                    if (
+                        isinstance(rid, SaveOperationId)
+                        and rid in self._terminal_saving
+                    ):
+                        continue
                     self._seen_saving.setdefault(rid, set()).add(worker_idx)
             if wo.finished_loading:
                 for rid in wo.finished_loading:
+                    if isinstance(rid, LoadOperationId) and rid in self._terminal_load:
+                        continue
                     self._seen_loading.setdefault(rid, set()).add(worker_idx)
             if wo.failed_loading:
                 for rid in wo.failed_loading:
+                    if isinstance(rid, LoadOperationId) and rid in self._terminal_load:
+                        continue
                     self._seen_load_failed.setdefault(rid, set()).add(worker_idx)
+            if wo.finished_sidecar_saving:
+                for rid in wo.finished_sidecar_saving:
+                    if (
+                        isinstance(rid, SaveOperationId)
+                        and rid in self._terminal_sidecar
+                    ):
+                        continue
+                    self._seen_sidecar_saving.setdefault(rid, set()).add(worker_idx)
+            if wo.failed_sidecar_saving:
+                for rid in wo.failed_sidecar_saving:
+                    if (
+                        isinstance(rid, SaveOperationId)
+                        and rid in self._terminal_sidecar
+                    ):
+                        continue
+                    self._seen_sidecar_save_failed.setdefault(rid, set()).add(
+                        worker_idx
+                    )
 
         done_sending = {
             rid
@@ -133,6 +183,23 @@ class KVOutputAggregator:
             for rid, workers in self._seen_loading.items()
             if len(workers) >= self._world_size and rid not in failed_loading
         }
+        failed_sidecar_saving = set()
+        sidecar_ids = set(self._seen_sidecar_saving) | set(
+            self._seen_sidecar_save_failed
+        )
+        for rid in sidecar_ids:
+            done_workers = self._seen_sidecar_saving.get(rid, set())
+            failed_workers = self._seen_sidecar_save_failed.get(rid, set())
+            if (
+                failed_workers
+                and len(done_workers | failed_workers) >= self._world_size
+            ):
+                failed_sidecar_saving.add(rid)
+        done_sidecar_saving = {
+            rid
+            for rid, workers in self._seen_sidecar_saving.items()
+            if len(workers) >= self._world_size and rid not in failed_sidecar_saving
+        }
 
         for rid in done_sending:
             del self._seen_sending[rid]
@@ -144,12 +211,48 @@ class KVOutputAggregator:
             self._seen_recv_failed.pop(rid, None)
         for rid in done_saving:
             del self._seen_saving[rid]
+            if isinstance(rid, SaveOperationId):
+                self._remember_terminal(
+                    rid,
+                    self._terminal_saving_order,
+                    self._terminal_saving,
+                )
         for rid in done_loading:
             del self._seen_loading[rid]
             self._seen_load_failed.pop(rid, None)
+            if isinstance(rid, LoadOperationId):
+                self._remember_terminal(
+                    rid,
+                    self._terminal_load_order,
+                    self._terminal_load,
+                )
         for rid in failed_loading:
             self._seen_loading.pop(rid, None)
             self._seen_load_failed.pop(rid, None)
+            if isinstance(rid, LoadOperationId):
+                self._remember_terminal(
+                    rid,
+                    self._terminal_load_order,
+                    self._terminal_load,
+                )
+        for rid in done_sidecar_saving:
+            self._seen_sidecar_saving.pop(rid, None)
+            self._seen_sidecar_save_failed.pop(rid, None)
+            if isinstance(rid, SaveOperationId):
+                self._remember_terminal(
+                    rid,
+                    self._terminal_sidecar_order,
+                    self._terminal_sidecar,
+                )
+        for rid in failed_sidecar_saving:
+            self._seen_sidecar_saving.pop(rid, None)
+            self._seen_sidecar_save_failed.pop(rid, None)
+            if isinstance(rid, SaveOperationId):
+                self._remember_terminal(
+                    rid,
+                    self._terminal_sidecar_order,
+                    self._terminal_sidecar,
+                )
 
         return KVConnectorOutput(
             finished_sending=done_sending,
@@ -158,7 +261,23 @@ class KVOutputAggregator:
             finished_saving=done_saving,
             finished_loading=done_loading,
             failed_loading=failed_loading,
+            finished_sidecar_saving=done_sidecar_saving,
+            failed_sidecar_saving=failed_sidecar_saving,
         )
+
+    def _remember_terminal(
+        self,
+        operation: SaveOperationId | LoadOperationId,
+        order: deque,
+        tombstones: set,
+    ) -> None:
+        """Bound late-duplicate suppression by exact save generation."""
+        if operation in tombstones:
+            return
+        order.append(operation)
+        tombstones.add(operation)
+        while len(order) > self._terminal_tombstone_limit:
+            tombstones.discard(order.popleft())
 
     def reset(self) -> None:
         """Clear all internal tracking state."""
@@ -168,13 +287,30 @@ class KVOutputAggregator:
         self._seen_saving.clear()
         self._seen_loading.clear()
         self._seen_load_failed.clear()
+        self._seen_sidecar_saving.clear()
+        self._seen_sidecar_save_failed.clear()
+        self._terminal_saving_order.clear()
+        self._terminal_saving.clear()
+        self._terminal_sidecar_order.clear()
+        self._terminal_sidecar.clear()
+        self._terminal_load_order.clear()
+        self._terminal_load.clear()
+
+    @property
+    def terminal_tombstone_count(self) -> tuple[int, int]:
+        return len(self._terminal_saving), len(self._terminal_sidecar)
+
+    @property
+    def terminal_load_tombstone_count(self) -> int:
+        return len(self._terminal_load)
 
     @property
     def pending_count(self) -> tuple[int, int]:
-        """Return ``(num_pending_sending, num_pending_recving)``."""
+        """Return ``(num_pending_sending, num_pending_other_transfers)``."""
         return (
             len(self._seen_sending),
             len(set(self._seen_recving) | set(self._seen_recv_failed))
             + len(self._seen_saving)
-            + len(set(self._seen_loading) | set(self._seen_load_failed)),
+            + len(set(self._seen_loading) | set(self._seen_load_failed))
+            + len(set(self._seen_sidecar_saving) | set(self._seen_sidecar_save_failed)),
         )

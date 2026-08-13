@@ -51,11 +51,19 @@ signals until the pair is done, then emits them together. The scheduler's
 ``finished_sending`` handler frees first; the ``finished_saving`` handler then
 finds nothing to free and no-ops. This is the analogue of vLLM's
 ``_extra_async_saves`` refcount.
+
+SLOT sidecar success/failure is carried in separate completion sets and bypasses
+this pairing. PAGE and SLOT notifications use the same exact
+``SaveOperationId`` generation, so delayed TP reports cannot cross-complete
+overlapping saves. Those sets update scheduler-side commit state only; the
+paired ``finished_saving`` signal remains responsible for block-lifetime release.
 """
 
 from __future__ import annotations
 
+from collections import deque
 import copy
+from dataclasses import dataclass
 import logging
 from typing import Any
 
@@ -63,9 +71,27 @@ from atom.kv_transfer.disaggregation.base import (
     KVConnectorBase,
     KVConnectorSchedulerBase,
 )
-from atom.kv_transfer.disaggregation.types import ConnectorMetadata, KVConnectorOutput
+from atom.kv_transfer.disaggregation.types import (
+    ConnectorMetadata,
+    KVConnectorOutput,
+    LoadOperationId,
+    SaveOperationId,
+)
 
 logger = logging.getLogger("atom")
+_PARTIAL_SAVE = object()
+
+
+def _save_req_id(value: Any) -> Any:
+    return value.req_id if isinstance(value, SaveOperationId) else value
+
+
+@dataclass(frozen=True)
+class _LegacySaveOperation:
+    """Internal serial identity for one raw-ReqId metadata registration."""
+
+    req_id: Any
+    nonce: int
 
 
 # ---------------------------------------------------------------------------
@@ -188,11 +214,14 @@ class MultiConnector(KVConnectorBase):
         )
 
         # Send/save pairing state (see module docstring).
-        # _pending_save: str(req_id) for requests offload will save this lifetime.
-        self._pending_save: set[str] = set()
-        # _sent / _saved: completed-but-unpaired transfers, str(req_id) -> raw id.
+        self._pending_save: dict[Any, set[int]] = {}
+        self._operation_output: dict[Any, Any] = {}
+        self._req_operations: dict[str, deque[Any]] = {}
         self._sent: dict[str, Any] = {}
-        self._saved: dict[str, Any] = {}
+        self._legacy_save_nonce = 0
+        self._pairing_tombstone_limit = 4096
+        self._terminal_save_order: deque[SaveOperationId] = deque()
+        self._terminal_save: set[SaveOperationId] = set()
 
     def register_kv_caches(
         self,
@@ -204,6 +233,7 @@ class MultiConnector(KVConnectorBase):
             c.register_kv_caches(kv_caches, transfer_tensors, num_blocks)
 
     def start_load_kv(self, metadata: ConnectorMetadata) -> None:
+        self._ensure_pairing_state()
         metas = getattr(metadata, "metas", None)
         if metas is None:
             logger.warning(
@@ -211,7 +241,8 @@ class MultiConnector(KVConnectorBase):
                 type(metadata).__name__,
             )
             return
-        for c, m in zip(self._connectors, metas):
+        legacy_operations: dict[str, _LegacySaveOperation] = {}
+        for connector_idx, (c, m) in enumerate(zip(self._connectors, metas)):
             if m is None:
                 continue
             # Remember which requests offload is about to save, so get_finished
@@ -219,63 +250,169 @@ class MultiConnector(KVConnectorBase):
             reqs = getattr(m, "requests", None)
             if reqs:
                 for req in reqs:
-                    if getattr(req, "save_spec", None) is not None:
-                        self._pending_save.add(str(getattr(req, "req_id")))
+                    if (
+                        getattr(req, "save_spec", None) is not None
+                        or getattr(req, "slot_save_spec", None) is not None
+                    ):
+                        req_id = getattr(req, "req_id")
+                        output = getattr(req, "save_operation", None) or req_id
+                        req_key = str(req_id)
+                        if isinstance(output, SaveOperationId):
+                            if output in self._terminal_save:
+                                continue
+                            operation = output
+                        else:
+                            operation = legacy_operations.get(req_key)
+                            if operation is None:
+                                operation = _LegacySaveOperation(
+                                    req_id,
+                                    self._legacy_save_nonce,
+                                )
+                                self._legacy_save_nonce += 1
+                                legacy_operations[req_key] = operation
+                        if operation not in self._pending_save:
+                            self._pending_save[operation] = set()
+                            self._operation_output[operation] = output
+                            self._req_operations.setdefault(req_key, deque()).append(
+                                operation
+                            )
+                        self._pending_save[operation].add(connector_idx)
             c.start_load_kv(m)
 
     def get_finished(self) -> KVConnectorOutput:
+        self._ensure_pairing_state()
         recv: set = set()
         failed: set = set()
         loaded: set = set()
         load_failed: set = set()
+        sidecar_saved: set = set()
+        sidecar_failed: set = set()
         send_now: list = []
-        save_now: list = []
-        for c in self._connectors:
+        completed_save_now: list = []
+        unregistered_save_now: list = []
+        for connector_idx, c in enumerate(self._connectors):
             o = _normalize_finished(c.get_finished())
             recv |= o.finished_recving
             failed |= o.failed_recving
             loaded |= o.finished_loading
             load_failed |= o.failed_loading
+            sidecar_saved |= o.finished_sidecar_saving
+            sidecar_failed |= o.failed_sidecar_saving
             send_now.extend(o.finished_sending)
-            save_now.extend(o.finished_saving)
+            for completion in o.finished_saving:
+                completed = self._consume_save_completion(connector_idx, completion)
+                if completed is _PARTIAL_SAVE:
+                    continue
+                if completed is None:
+                    if (
+                        isinstance(completion, SaveOperationId)
+                        and completion in self._terminal_save
+                    ):
+                        continue
+                    unregistered_save_now.append(completion)
+                else:
+                    completed_save_now.append(completed)
 
         out = KVConnectorOutput(
             finished_recving=recv,
             failed_recving=failed,
             finished_loading=loaded,
             failed_loading=load_failed,
+            finished_sidecar_saving=sidecar_saved,
+            failed_sidecar_saving=sidecar_failed,
         )
 
+        out.finished_saving = set(completed_save_now) | set(unregistered_save_now)
         if not self.is_producer:
-            # No moriio send to pair with: offload save / recv pass straight
-            # through (the scheduler frees consumer/offload requests on
-            # finished_saving via should_defer_free).
             out.finished_sending = set(send_now)
-            out.finished_saving = set(save_now)
             return out
 
-        # Producer + offload: pair each request's send and save before
-        # releasing either (see module docstring).
-        for r in send_now:
-            self._sent[str(r)] = r
-        for r in save_now:
-            self._saved[str(r)] = r
-
         rel_send: set = set()
-        rel_save: set = set()
+        for r in send_now:
+            req_key = str(r)
+            if self._req_has_pending_save(req_key):
+                self._sent[req_key] = r
+            else:
+                rel_send.add(r)
+
         for key, raw in list(self._sent.items()):
-            needs_save = key in self._pending_save
-            if needs_save and key not in self._saved:
-                continue  # hold: save still in flight for this request
+            if self._req_has_pending_save(key):
+                continue
             rel_send.add(raw)
             del self._sent[key]
-            self._pending_save.discard(key)
-            if key in self._saved:
-                rel_save.add(self._saved.pop(key))
 
         out.finished_sending = rel_send
-        out.finished_saving = rel_save
         return out
+
+    def _ensure_pairing_state(self) -> None:
+        """Initialize pairing state for lightweight ``__new__`` test doubles."""
+        if not hasattr(self, "_operation_output"):
+            self._operation_output = {}
+            self._req_operations = {}
+            self._legacy_save_nonce = 0
+            self._pairing_tombstone_limit = 4096
+            self._terminal_save_order = deque()
+            self._terminal_save = set()
+
+    def _consume_save_completion(
+        self, connector_idx: int, completion: Any
+    ) -> Any | None:
+        operation = None
+        if isinstance(completion, SaveOperationId):
+            pending = self._pending_save.get(completion)
+            if pending is not None and connector_idx not in pending:
+                return _PARTIAL_SAVE
+            if connector_idx in (pending or ()):
+                operation = completion
+        else:
+            req_key = str(completion)
+            # Legacy child notifications are serial: map only to this
+            # connector's oldest outstanding operation for the request.
+            for candidate in self._req_operations.get(req_key, ()):
+                if connector_idx in self._pending_save.get(candidate, set()):
+                    operation = candidate
+                    break
+        if operation is None:
+            return None
+
+        contributors = self._pending_save[operation]
+        contributors.discard(connector_idx)
+        if contributors:
+            return _PARTIAL_SAVE
+
+        self._pending_save.pop(operation, None)
+        output = self._operation_output.pop(operation)
+        req_key = str(_save_req_id(output))
+        queue = self._req_operations.get(req_key)
+        if queue is not None:
+            try:
+                queue.remove(operation)
+            except ValueError:
+                pass
+            if not queue:
+                self._req_operations.pop(req_key, None)
+        if isinstance(output, SaveOperationId):
+            self._remember_terminal_save(output)
+        return output
+
+    def _req_has_pending_save(self, req_key: str) -> bool:
+        return bool(self._req_operations.get(req_key))
+
+    def _remember_terminal_save(self, operation: SaveOperationId) -> None:
+        if operation in self._terminal_save:
+            return
+        self._terminal_save.add(operation)
+        self._terminal_save_order.append(operation)
+        while len(self._terminal_save_order) > self._pairing_tombstone_limit:
+            self._terminal_save.discard(self._terminal_save_order.popleft())
+
+    @property
+    def completed_save_tombstone_count(self) -> int:
+        return len(self._terminal_save)
+
+    @property
+    def pairing_state_count(self) -> tuple[int, int]:
+        return len(self._pending_save), len(self._sent)
 
     def get_finished_recv_blocks(self) -> list[int]:
         blocks: list[int] = []
@@ -300,22 +437,158 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         # Opt into the scheduler's offload suffix-prefill path if any sub is the
         # offload backend (Scheduler._is_offload_connector reads this).
         self.is_offload = any(getattr(c, "is_offload", False) for c in self._connectors)
+        self.recap_prefill_after_finalize = any(
+            getattr(c, "recap_prefill_after_finalize", False) for c in self._connectors
+        )
+        self._load_owner_by_req: dict[str, tuple[object, int]] = {}
+        self._load_operation_owner: dict[LoadOperationId, tuple[int, object]] = {}
+
+    def _ensure_load_ownership_state(self) -> None:
+        if not hasattr(self, "_load_owner_by_req"):
+            self._load_owner_by_req = {}
+            self._load_operation_owner = {}
+
+    def _cancel_connector_load(self, connector_idx: int, seq: Any) -> None:
+        callback = getattr(self._connectors[connector_idx], "cancel_pending_load", None)
+        if callback is not None:
+            callback(seq)
+
+    @staticmethod
+    def _load_lifecycle_key(seq: Any) -> str:
+        return str(getattr(seq, "id", f"@object:{id(seq)}"))
+
+    def _clear_load_owner(self, seq: Any) -> None:
+        self._ensure_load_ownership_state()
+        sid = self._load_lifecycle_key(seq)
+        owner = self._load_owner_by_req.get(sid)
+        if owner is not None and owner[0] is seq:
+            self._load_owner_by_req.pop(sid, None)
+        for operation, (_idx, lifecycle) in list(self._load_operation_owner.items()):
+            if lifecycle is seq:
+                self._load_operation_owner.pop(operation, None)
+
+    def _owner_for_seq(self, seq: Any) -> tuple[int, Any] | None:
+        self._ensure_load_ownership_state()
+        owner = self._load_owner_by_req.get(self._load_lifecycle_key(seq))
+        if owner is None or owner[0] is not seq:
+            return None
+        return owner[1], self._connectors[owner[1]]
 
     # -- base interface -----------------------------------------------------
 
     def get_num_new_matched_tokens(self, seq: Any) -> tuple[int, bool]:
         """First-hit-wins: the first sub that reports a match owns the load."""
+        self._ensure_load_ownership_state()
+        sid = self._load_lifecycle_key(seq)
+        previous = self._load_owner_by_req.get(sid)
+        if previous is not None and previous[0] is not seq:
+            self._cancel_connector_load(previous[1], previous[0])
+            if hasattr(previous[0], "_remote_load_is_offload"):
+                delattr(previous[0], "_remote_load_is_offload")
+            self._clear_load_owner(previous[0])
+
         result = (0, False)
-        for c in self._connectors:
+        probed: list[int] = []
+        winner = None
+        for connector_idx, c in enumerate(self._connectors):
             toks, needs_load = c.get_num_new_matched_tokens(seq)
-            if result[0] == 0 and toks > 0:
+            probed.append(connector_idx)
+            if toks > 0:
                 result = (toks, needs_load)
+                winner = connector_idx
+                break
+        if winner is not None:
+            self._load_owner_by_req[sid] = (seq, winner)
+            try:
+                seq._remote_load_is_offload = bool(
+                    getattr(self._connectors[winner], "is_offload", False)
+                )
+            except (AttributeError, TypeError):
+                pass
+            losers = (idx for idx in range(len(self._connectors)) if idx != winner)
+            for connector_idx in losers:
+                self._cancel_connector_load(connector_idx, seq)
+        else:
+            for connector_idx in probed:
+                self._cancel_connector_load(connector_idx, seq)
+            self._load_owner_by_req.pop(sid, None)
+            if hasattr(seq, "_remote_load_is_offload"):
+                delattr(seq, "_remote_load_is_offload")
         return result
 
     def build_connector_meta(self) -> MultiConnectorMetadata:
-        return MultiConnectorMetadata(
-            metas=[c.build_connector_meta() for c in self._connectors]
-        )
+        self._ensure_load_ownership_state()
+        metas = [c.build_connector_meta() for c in self._connectors]
+        for connector_idx, meta in enumerate(metas):
+            stripped_req_ids: set[Any] = set()
+            for field in (
+                "reqs_to_recv",
+                "reqs_to_load",
+                "load_requests",
+                "loads",
+            ):
+                load_map = getattr(meta, field, None)
+                if not isinstance(load_map, dict):
+                    continue
+                for req_id in list(load_map):
+                    owner = self._load_owner_by_req.get(str(req_id))
+                    if owner is not None and owner[1] == connector_idx:
+                        continue
+                    load_map.pop(req_id, None)
+                    stripped_req_ids.add(req_id)
+                    if owner is not None:
+                        self._cancel_connector_load(connector_idx, owner[0])
+            for field in ("reqs_not_processed",):
+                values = getattr(meta, field, None)
+                if isinstance(values, set):
+                    values.difference_update(stripped_req_ids)
+            for req in getattr(meta, "requests", ()) or ():
+                if (
+                    getattr(req, "load_spec", None) is None
+                    and getattr(req, "slot_load_spec", None) is None
+                ):
+                    continue
+                owner = self._load_owner_by_req.get(str(req.req_id))
+                if owner is None or owner[1] != connector_idx:
+                    if owner is not None:
+                        self._cancel_connector_load(connector_idx, owner[0])
+                        loser_operation = getattr(req, "load_operation", None)
+                        if (
+                            loser_operation is not None
+                            and getattr(owner[0], "_active_load_operation", None)
+                            == loser_operation
+                        ):
+                            for marker in (
+                                "_active_load_operation",
+                                "_consumed_load_operation",
+                                "_load_operation",
+                            ):
+                                if hasattr(owner[0], marker):
+                                    delattr(owner[0], marker)
+                    req.load_spec = None
+                    req.slot_load_spec = None
+                    req.load_operation = None
+                    continue
+                operation = getattr(req, "load_operation", None)
+                if isinstance(operation, LoadOperationId):
+                    self._load_operation_owner[operation] = (
+                        connector_idx,
+                        owner[0],
+                    )
+        for operation, (
+            _connector_idx,
+            lifecycle,
+        ) in self._load_operation_owner.items():
+            owner = self._load_owner_by_req.get(str(operation.req_id))
+            if owner is not None and owner[0] is lifecycle:
+                lifecycle._load_operation = operation
+        return MultiConnectorMetadata(metas=metas)
+
+    def connector_meta_dispatched(self, meta: MultiConnectorMetadata) -> None:
+        for connector, sub_meta in zip(self._connectors, meta.metas):
+            callback = getattr(connector, "connector_meta_dispatched", None)
+            if callback is not None:
+                callback(sub_meta)
 
     def update_state_after_alloc(self, seq: Any) -> None:
         for c in self._connectors:
@@ -325,24 +598,49 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         for c in self._connectors:
             if hasattr(c, "request_finished"):
                 c.request_finished(seq)
+        self._clear_load_owner(seq)
+        for marker in (
+            "_remote_load_is_offload",
+            "_active_load_operation",
+            "_consumed_load_operation",
+            "_load_operation",
+        ):
+            if hasattr(seq, marker):
+                delattr(seq, marker)
 
     # -- offload-specific methods, forwarded to the owning sub --------------
     # The scheduler guards every one of these with hasattr(), so MultiConnector
     # only needs to expose them when a sub-connector implements them.
 
     def should_park_for_load_after_alloc(self, seq: Any) -> bool:
-        c = _first_with(self._connectors, "should_park_for_load_after_alloc")
-        return c.should_park_for_load_after_alloc(seq) if c is not None else False
+        owner = self._owner_for_seq(seq)
+        if owner is None:
+            return False
+        c = owner[1]
+        callback = getattr(c, "should_park_for_load_after_alloc", None)
+        return callback(seq) if callback is not None else False
 
     def adjust_prefill_chunk_after_alloc(self, seq: Any, chunk: int) -> int:
-        c = _first_with(self._connectors, "adjust_prefill_chunk_after_alloc")
-        return (
-            c.adjust_prefill_chunk_after_alloc(seq, chunk) if c is not None else chunk
-        )
+        owner = self._owner_for_seq(seq)
+        if owner is None:
+            return chunk
+        callback = getattr(owner[1], "adjust_prefill_chunk_after_alloc", None)
+        return callback(seq, chunk) if callback is not None else chunk
 
     def should_park_partial_prefill_for_load(self, seq: Any) -> bool:
-        c = _first_with(self._connectors, "should_park_partial_prefill_for_load")
-        return c.should_park_partial_prefill_for_load(seq) if c is not None else False
+        owner = self._owner_for_seq(seq)
+        if owner is None:
+            return False
+        callback = getattr(owner[1], "should_park_partial_prefill_for_load", None)
+        return callback(seq) if callback is not None else False
+
+    def cancel_pending_load(self, seq: Any) -> None:
+        owner = self._owner_for_seq(seq)
+        if owner is not None:
+            self._cancel_connector_load(owner[0], seq)
+        self._clear_load_owner(seq)
+        if hasattr(seq, "_remote_load_is_offload"):
+            delattr(seq, "_remote_load_is_offload")
 
     def should_defer_free(self, seq: Any) -> bool:
         # Defer if ANY sub wants to defer (so neither a pending save nor a
@@ -357,7 +655,47 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             if hasattr(c, "save_finished"):
                 c.save_finished(req_id)
 
-    def load_failed(self, req_id: Any) -> None:
+    def sidecar_save_finished(self, req_id: Any) -> None:
         for c in self._connectors:
-            if hasattr(c, "load_failed"):
-                c.load_failed(req_id)
+            if hasattr(c, "sidecar_save_finished"):
+                c.sidecar_save_finished(req_id)
+
+    def sidecar_save_failed(self, req_id: Any) -> None:
+        for c in self._connectors:
+            if hasattr(c, "sidecar_save_failed"):
+                c.sidecar_save_failed(req_id)
+
+    def load_finished(self, req_id: Any) -> bool:
+        return self._finish_load(req_id, "load_finished")
+
+    def load_failed(self, req_id: Any) -> bool:
+        return self._finish_load(req_id, "load_failed")
+
+    def _finish_load(self, completion: Any, callback_name: str) -> bool:
+        self._ensure_load_ownership_state()
+        lifecycle = None
+        if isinstance(completion, LoadOperationId):
+            owned = self._load_operation_owner.get(completion)
+            if owned is None:
+                return False
+            connector_idx, lifecycle = owned
+        else:
+            owner = self._load_owner_by_req.get(str(completion))
+            if owner is None:
+                return False
+            lifecycle, connector_idx = owner
+        callback = getattr(self._connectors[connector_idx], callback_name, None)
+        if callback is None:
+            return False
+        result = callback(completion)
+        handled = (
+            result is True
+            if isinstance(completion, LoadOperationId)
+            else (result is not False)
+        )
+        if handled:
+            if isinstance(completion, LoadOperationId):
+                self._load_operation_owner.pop(completion, None)
+            if lifecycle is not None:
+                self._clear_load_owner(lifecycle)
+        return handled

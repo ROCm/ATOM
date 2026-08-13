@@ -13,7 +13,113 @@ force ``use_gds=False`` (cufile GDS init hangs without NVMe-GDS hardware).
 
 from __future__ import annotations
 
+from dataclasses import asdict, is_dataclass
+import hashlib
+import json
+from math import isfinite
 from typing import Any
+
+PAGE_LAYOUT_VERSION = 1
+_PAGE_FINGERPRINT_BYTES = 16
+_HF_PAGE_FIELDS = (
+    "num_hidden_layers",
+    "num_attention_heads",
+    "num_key_value_heads",
+    "hidden_size",
+    "head_dim",
+    "kv_lora_rank",
+    "qk_rope_head_dim",
+    "compress_ratios",
+    "indexer_dtype",
+)
+
+
+def _stable_config_value(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        if not isfinite(value):
+            raise ValueError("PAGE namespace config values must be finite")
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_stable_config_value(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            str(key): _stable_config_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if is_dataclass(value):
+        return _stable_config_value(asdict(value))
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        return _stable_config_value(model_dump(mode="json"))
+    if hasattr(value, "value") and isinstance(value.value, (bool, int, float, str)):
+        return _stable_config_value(value.value)
+    if hasattr(value, "__dict__"):
+        return _stable_config_value(
+            {
+                key: item
+                for key, item in vars(value).items()
+                if not key.startswith("_") and not callable(item)
+            }
+        )
+    raise TypeError(
+        "PAGE namespace config contains unsupported value type "
+        f"{type(value).__module__}.{type(value).__qualname__}"
+    )
+
+
+def build_page_namespace(
+    config,
+    cfg,
+    world_size: int,
+    *,
+    layout_version: int = PAGE_LAYOUT_VERSION,
+) -> str:
+    """Return the stable CacheEngineKey domain for ATOM PAGE bytes."""
+
+    if isinstance(layout_version, bool) or not isinstance(layout_version, int):
+        raise ValueError("PAGE layout version must be an integer")
+    if layout_version <= 0:
+        raise ValueError("PAGE layout version must be positive")
+    hf = config.hf_config
+    base_model_name = str(
+        getattr(config, "model_tag", None) or getattr(config, "model", "atom-model")
+    )
+    document = {
+        "schema": "atom-page-namespace",
+        "layout_version": layout_version,
+        "model": base_model_name,
+        "page_mode": (
+            "dsv4-page-regions"
+            if getattr(hf, "compress_ratios", None)
+            else "dense-opaque-block"
+        ),
+        "kv_cache_dtype": str(getattr(config, "kv_cache_dtype", "auto")),
+        "block_size": int(config.kv_cache_block_size),
+        "chunk_size": int(cfg.chunk_size),
+        "tp_size": int(world_size),
+        "dcp_size": int(getattr(config, "decode_context_parallel_size", 1) or 1),
+        "hf_geometry": {
+            name: _stable_config_value(getattr(hf, name, None))
+            for name in _HF_PAGE_FIELDS
+        },
+        "speculative_config": _stable_config_value(
+            getattr(config, "speculative_config", None)
+        ),
+    }
+    canonical = json.dumps(
+        document,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    digest = hashlib.blake2b(
+        canonical,
+        digest_size=_PAGE_FINGERPRINT_BYTES,
+        person=b"ATOM-PAGE-CFG-v1",
+    ).hexdigest()
+    return f"{base_model_name}::atom-page-v{layout_version}-{digest}"
 
 
 def build_lmcache_config(
@@ -118,7 +224,7 @@ def build_lmcache_metadata(config, cfg, world_size: int, worker_id: int):
     num_layers = int(getattr(hf, "num_hidden_layers"))
     tp = int(getattr(config, "tensor_parallel_size", world_size) or 1)
     kv_dtype = dtypes.d_dtypes[config.kv_cache_dtype]
-    model_name = str(getattr(config, "model", "atom-model"))
+    model_name = build_page_namespace(config, cfg, world_size)
 
     # MLA (DeepSeek R1/V3, Kimi) stores a single replicated per-layer latent
     # cache (kv_lora_rank + qk_rope_head_dim), not TP-sharded K/V heads. These

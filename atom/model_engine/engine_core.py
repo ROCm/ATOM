@@ -13,6 +13,7 @@ import zmq
 
 from atom.config import Config, ParallelConfig
 from atom.kv_transfer.disaggregation import KVOutputAggregator
+from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
 from atom.model_engine.async_proc import AsyncIOProcManager
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import EngineUtilityHandler
@@ -311,6 +312,10 @@ class EngineCore:
             self.runner_mgr.call_func(
                 "process_kvconnector_output", scheduled_batch.connector_meta_output
             )
+            connector = getattr(self.scheduler, "kv_connector", None)
+            callback = getattr(connector, "connector_meta_dispatched", None)
+            if callback is not None:
+                callback(scheduled_batch.connector_meta_output)
 
         # Run the model forward pass if there are actual sequences
         has_seqs = len(scheduled_batch.req_ids) > 0
@@ -369,9 +374,12 @@ class EngineCore:
         if connector is None or not getattr(connector, "is_offload", False):
             return
         meta = connector.build_connector_meta()
-        if meta is None or not getattr(meta, "requests", None):
+        if not connector_metadata_has_work(meta):
             return
         self.runner_mgr.call_func("process_kvconnector_output", meta)
+        callback = getattr(connector, "connector_meta_dispatched", None)
+        if callback is not None:
+            callback(meta)
 
     def pull_and_process_input_queue(self):
         recv_reqs = []

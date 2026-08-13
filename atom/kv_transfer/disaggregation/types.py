@@ -23,6 +23,41 @@ EngineId = str
 ReqId = str | int
 TransferId = int
 
+
+@dataclass(frozen=True)
+class SaveOperationId:
+    """Exact identity of one scheduler-issued PAGE/SLOT save generation.
+
+    A request can emit several overlapping asynchronous saves, and a request ID
+    can later be reused. The scheduler-lifetime ``generation`` prevents delayed
+    or duplicated TP-worker completions for one save from completing another.
+    """
+
+    req_id: ReqId
+    generation: int
+
+    def __post_init__(self) -> None:
+        if self.generation < 0:
+            raise ValueError("save operation generation must be nonnegative")
+
+
+SaveCompletionId = ReqId | SaveOperationId
+
+
+@dataclass(frozen=True)
+class LoadOperationId:
+    """Exact identity of one scheduler-issued PAGE/SLOT load generation."""
+
+    req_id: ReqId
+    generation: int
+
+    def __post_init__(self) -> None:
+        if self.generation < 0:
+            raise ValueError("load operation generation must be nonnegative")
+
+
+LoadCompletionId = ReqId | LoadOperationId
+
 # ---------------------------------------------------------------------------
 # Dataclasses
 # ---------------------------------------------------------------------------
@@ -49,18 +84,32 @@ class KVTransferRegion:
 
 @dataclass
 class KVTransferTensors:
+    """Physical PAGE, SLOT, and compressor-only staging region contract.
+
+    ``block_regions`` contain forward-indexed, block-indexed PAGE units.
+    ``swa_block_regions`` is a legacy field name for complete reverse-indexed
+    per-request SLOT units, including both compressor state and SWA.
+    ``expected_full_slot_region_count`` makes a stateful layout's complete
+    plane count explicit so registration can reject a missing plane.
+    ``staging_region`` plus ``gather_slot``/``scatter_slot`` cover only the
+    compressor-state PD staging pool and are invalid as sidecar SLOT sources.
+    """
+
+    # Block-indexed PAGE regions, indexed forward by physical block id.
     block_regions: list[KVTransferRegion]
     slot_regions: list[KVTransferRegion]
     num_blocks: int
     num_slots: int = 0
-    # The sliding window is a per-request ring, not part of the compressed
-    # block_table, so it gets its own regions keyed by the request's state
-    # slot. `unit_bytes` is one whole ring.
+    # Legacy field name: full per-request SLOT regions keyed by pool group.
+    # `unit_bytes` includes compressor state and SWA, not just one ring.
     swa_block_regions: list[KVTransferRegion] = field(default_factory=list)
+    # Compressor-only PD staging; never a complete sidecar SLOT source.
     staging_region: KVTransferRegion | None = None
     staging_pool_size: int = 0
     gather_slot: Callable[[int, int], None] | None = None
     scatter_slot: Callable[[int, int], None] | None = None
+    # Appended for positional compatibility with existing generic descriptors.
+    expected_full_slot_region_count: int | None = None
 
 
 @dataclass
@@ -75,9 +124,14 @@ class KVConnectorOutput:
         finished_sending: Request IDs whose KV send completed on this worker.
         finished_recving: Request IDs whose KV receive completed on this worker.
         failed_recving: Request IDs whose KV receive failed on this worker.
-        finished_saving: Request IDs whose local fire-and-forget save completed.
+        finished_saving: Exact save generations whose local fire-and-forget
+            PAGE work completed (legacy connectors may still report request IDs).
         finished_loading: Request IDs whose local/offload KV load completed.
         failed_loading: Request IDs whose local/offload KV load failed.
+        finished_sidecar_saving: Exact save generations whose full-slot sidecar
+            committed successfully on this worker.
+        failed_sidecar_saving: Exact save generations whose full-slot sidecar
+            failed terminally on this worker.
         expected_finished_count: How many finished notifications should be
             expected per request (used by the aggregator).
     """
@@ -85,10 +139,12 @@ class KVConnectorOutput:
     finished_sending: set[ReqId] = field(default_factory=set)
     finished_recving: set[ReqId] = field(default_factory=set)
     failed_recving: set[ReqId] = field(default_factory=set)
-    finished_saving: set[ReqId] = field(default_factory=set)
-    finished_loading: set[ReqId] = field(default_factory=set)
-    failed_loading: set[ReqId] = field(default_factory=set)
+    finished_saving: set[SaveCompletionId] = field(default_factory=set)
+    finished_loading: set[LoadCompletionId] = field(default_factory=set)
+    failed_loading: set[LoadCompletionId] = field(default_factory=set)
     expected_finished_count: int = 0
+    finished_sidecar_saving: set[SaveCompletionId] = field(default_factory=set)
+    failed_sidecar_saving: set[SaveCompletionId] = field(default_factory=set)
 
     def is_empty(self) -> bool:
         """Return True if no transfers finished on this worker."""
@@ -99,6 +155,8 @@ class KVConnectorOutput:
             and not self.finished_saving
             and not self.finished_loading
             and not self.failed_loading
+            and not self.finished_sidecar_saving
+            and not self.failed_sidecar_saving
         )
 
     def __repr__(self) -> str:
@@ -108,7 +166,9 @@ class KVConnectorOutput:
             f"failed_recving={self.failed_recving}, "
             f"finished_saving={self.finished_saving}, "
             f"loading={self.finished_loading}, "
-            f"failed_loading={self.failed_loading})"
+            f"failed_loading={self.failed_loading}, "
+            f"finished_sidecar_saving={self.finished_sidecar_saving}, "
+            f"failed_sidecar_saving={self.failed_sidecar_saving})"
         )
 
 
@@ -226,3 +286,24 @@ class ConnectorMetadata:
         self.reqs_to_recv[request_id] = self._build_req_meta(
             request_id, local_block_ids, kv_transfer_params, local_swa_block_ids
         )
+
+
+def connector_metadata_has_work(metadata: object | None) -> bool:
+    """Return whether connector metadata contains dispatchable work."""
+    if metadata is None:
+        return False
+    metas = getattr(metadata, "metas", None)
+    if metas is not None and any(connector_metadata_has_work(meta) for meta in metas):
+        return True
+    return any(
+        bool(getattr(metadata, name, None))
+        for name in (
+            "requests",
+            "lookup_requests_in_step",
+            "reqs_to_recv",
+            "reqs_to_save",
+            "reqs_to_send",
+            "reqs_in_batch",
+            "reqs_not_processed",
+        )
+    )

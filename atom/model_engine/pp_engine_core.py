@@ -98,6 +98,10 @@ class PPEngineCoreProc(EngineCore):
                     "process_kvconnector_output",
                     scheduled_batch.connector_meta_output,
                 )
+                connector = getattr(self.scheduler, "kv_connector", None)
+                callback = getattr(connector, "connector_meta_dispatched", None)
+                if callback is not None:
+                    callback(scheduled_batch.connector_meta_output)
             self.pp_transport.send_metadata(scheduled_batch)
             self.runner_mgr.call_func("forward", scheduled_batch, wait_out=True)
             self.scheduler.mark_pp_inflight(scheduled_batch)
