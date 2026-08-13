@@ -151,7 +151,7 @@ jobs:
             runner: atom-mi355-8gpu-vllm-sgl-ci
           - display_name: "Kimi-K3 TP8"
             model_name: "Kimi-K3"
-            model_path: "/data/amd_int/models/Kimi-K3"
+            model_path: "Kimi-K3"
             client_command: "lm_eval --model local-completions --model_args model=${MODEL_PATH},base_url=http://127.0.0.1:${VLLM_PORT}/v1/completions,num_concurrent=64,max_retries=3,tokenized_requests=False,trust_remote_code=True --tasks gsm8k --num_fewshot ${LM_EVAL_NUM_FEWSHOT} --output_path ${OUTPUT_PATH}"
             extra_args: "--trust-remote-code --language-model-only --tensor-parallel-size 8 --kv-cache-dtype fp8 --max-model-len 16384 --max-num-seqs 64 --max-num-batched-tokens 16384 --gpu-memory-utilization 0.93 --block-size 128 --no-enable-prefix-caching --compilation-config '{\"cudagraph_mode\":\"FULL_AND_PIECEWISE\"}' --additional-config '{\"online_quant_config\":{\"global_quant_config\":\"ptpc_fp8\",\"exclude_layer\":[\"lm_head\",\"model.embed_tokens\",\"*self_attn.[qkv]_conv1d*\",\"*block_sparse_moe.experts*\",\"*block_sparse_moe.routed_expert_*\",\"*vision_tower*\",\"*mm_projector*\"]}}'"
             env_vars: ""
@@ -421,19 +421,11 @@ jobs:
           elif [ -d "/shareddata/models" ]; then
             MODEL_CACHE_MOUNT="-v /shareddata/models:/models"
             MODEL_CACHE_DESC="/shareddata/models (host path)"
-          elif [ -d "/data/amd_int/models" ]; then
-            MODEL_CACHE_MOUNT="-v /data/amd_int/models:/data/amd_int/models"
-            MODEL_CACHE_DESC="/data/amd_int/models (host path)"
           elif [ -d "/data/models" ]; then
             MODEL_CACHE_MOUNT="-v /data/models:/models"
             MODEL_CACHE_DESC="/data/models (host path)"
           else
             echo "Warning: /models and /it-share/models and /mnt/dcgpuval/models and /shareddata/models and /data/models directory not found on runner; using container-local /models."
-          fi
-
-          if [ -d "/data/amd_int/models" ] && [[ "${MODEL_CACHE_MOUNT}" != *"/data/amd_int/models:/data/amd_int/models"* ]]; then
-            MODEL_CACHE_MOUNT="${MODEL_CACHE_MOUNT:+${MODEL_CACHE_MOUNT} }-v /data/amd_int/models:/data/amd_int/models"
-            MODEL_CACHE_DESC="${MODEL_CACHE_DESC}; /data/amd_int/models (Kimi-K3 host path)"
           fi
 
           echo "Using model cache backend: ${MODEL_CACHE_DESC}"
@@ -479,12 +471,7 @@ jobs:
         if: success()
         run: |
           set -euo pipefail
-          configured_model_path="${{ matrix.model_path }}"
-          if [[ "${configured_model_path}" = /* ]]; then
-            model_dir="${configured_model_path}"
-          else
-            model_dir="/models/${configured_model_path}"
-          fi
+          model_dir="/models/${{ matrix.model_path }}"
           if [ -n "${MODEL_CACHE_MOUNT}" ]; then
             model_use_lock="true"
             if [ "${{ matrix.runner }}" = "atom-mi355-8gpu.predownload" ] || [ "${{ matrix.runner }}" = "atom-mi35x-8gpu-oot-acc" ]; then
@@ -517,10 +504,7 @@ jobs:
       - name: Resolve OOT model path
         if: success()
         run: |
-          if [[ "${{ matrix.model_path }}" = /* ]]; then
-            echo "OOT_RESOLVED_MODEL_PATH=${{ matrix.model_path }}" >> "$GITHUB_ENV"
-            echo "Using absolute model path: ${{ matrix.model_path }}"
-          elif [ -n "${MODEL_CACHE_MOUNT}" ]; then
+          if [ -n "${MODEL_CACHE_MOUNT}" ]; then
             echo "OOT_RESOLVED_MODEL_PATH=/models/${{ matrix.model_path }}" >> "$GITHUB_ENV"
             echo "Using mounted model path: /models/${{ matrix.model_path }}"
           else

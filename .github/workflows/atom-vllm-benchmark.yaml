@@ -1192,11 +1192,6 @@ jobs:
             echo "No shared host model cache found; using container-local /models."
           fi
 
-          if [ -d "/data/amd_int/models" ] && [[ "${MODEL_CACHE_MOUNT}" != *"/data/amd_int/models:/data/amd_int/models"* ]]; then
-            MODEL_CACHE_MOUNT="${MODEL_CACHE_MOUNT:+${MODEL_CACHE_MOUNT} }-v /data/amd_int/models:/data/amd_int/models"
-            MODEL_CACHE_DESC="${MODEL_CACHE_DESC}; /data/amd_int/models (Kimi-K3 host path)"
-          fi
-
           echo "Using model cache backend: ${MODEL_CACHE_DESC}"
           echo "MODEL_CACHE_MOUNT=${MODEL_CACHE_MOUNT}" >> "$GITHUB_ENV"
           echo "MODEL_CACHE_DESC=${MODEL_CACHE_DESC}" >> "$GITHUB_ENV"
