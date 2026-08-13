@@ -295,6 +295,71 @@ class TestFreeListHalves:
         assert pool.pop() == 1  # 11 is now the older of the two
         assert pool.lookup_group(10) == 0
 
+    def test_a_speculative_checkpoint_is_spent_before_any_anchor(self):
+        """A guess must never evict knowledge, however old the knowledge is.
+
+        Group 0 holds an anchor released first, so plain LRU would spend it.
+        Group 1 is marked speculative and lands at the head instead, which is
+        what makes the demand rung cost the anchors nothing.
+
+        Indexed before it is released, which is the order the fork path takes:
+        the group is still its owner's when the hash is filed.
+        """
+        pool = StateGroupPool(4)
+        drain(pool)
+        pool.release(0)
+        pool._index(10, 0)
+        pool._index(11, 1)
+        pool.mark_speculative(1)
+        pool.release(1)
+
+        assert pool.pop() == 1
+        assert pool.lookup(10) == 0
+
+    def test_speculative_checkpoints_keep_lru_among_themselves(self):
+        pool = StateGroupPool(4)
+        drain(pool)
+        for group, h in ((0, 10), (1, 11)):
+            pool._index(h, group)
+            pool.mark_speculative(group)
+            pool.release(group)
+
+        # Filed at the head, so the *later* one is spent first: neither has
+        # been read, and the older has had longer to prove it never will be.
+        assert pool.pop() == 1
+        assert pool.pop() == 0
+
+    def test_a_read_speculative_checkpoint_is_promoted(self):
+        """Being resumed from is the evidence the guess was right.
+
+        `BlockManager._attach_state_group` promotes the source it is about to
+        fork off, so a demand rung that pays off stops being spent first.
+        """
+        pool = StateGroupPool(4)
+        drain(pool)
+        pool._index(10, 0)
+        pool.mark_speculative(0)
+        pool.release(0)
+        pool.release(1)
+        pool._index(11, 1)
+
+        pool.promote(0)  # a resumer reads the speculative checkpoint
+
+        assert pool.pop() == 1  # 10 is no longer the first thing spent
+        assert pool.lookup(10) == 0
+
+    def test_promoting_a_group_nobody_marked_leaves_the_order_alone(self):
+        """`_attach_state_group` promotes every source, most of them anchors."""
+        pool = StateGroupPool(4)
+        drain(pool)
+        for group, h in ((0, 10), (1, 11)):
+            pool.release(group)
+            pool._index(h, group)
+
+        pool.promote(1)
+
+        assert pool.pop() == 0  # still the older of the two
+
     def test_republishing_a_hash_returns_the_orphan_to_the_vacant_half(self):
         pool = StateGroupPool(4)
         drain(pool)
@@ -1314,7 +1379,7 @@ class StubStateCache:
     def reserve_midstep(self, seq, positions):
         return []
 
-    def publish_midstep(self, reservations):
+    def publish_midstep(self, reservations, seq=None):
         pass
 
     def cancel_midstep(self, reservations):
