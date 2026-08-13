@@ -1484,7 +1484,7 @@ class MooncakeConnector(KVConnectorBase):
                 "resuming request would read an empty sliding window"
             )
         swa_cmap = self._consumer_region_map(
-            len(self._swa_block_regions), len(consumer_swa_block_addrs)
+            len(self._swa_block_regions), len(consumer_swa_regions)
         )
         for region_idx, src_region in enumerate(self._swa_block_regions):
             dst_region = consumer_swa_regions[swa_cmap[region_idx]]
