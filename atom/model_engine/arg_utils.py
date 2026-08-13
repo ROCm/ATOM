@@ -51,6 +51,7 @@ class EngineArgs:
     long_prefill_token_threshold: int = 0
     attn_prefill_chunk_size: int = 16384
     state_checkpoint_interval_tokens: int = 8192
+    state_checkpoint_groups: int = 0
     enable_chunked_prefill: bool = True
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
@@ -347,6 +348,21 @@ class EngineArgs:
                 "rung costs the prompt that keeps it an extra prefill chunk, "
                 "and on measured traces the interval ladder is ~30x the writes "
                 "for reuse the other two placements already reach."
+            ),
+        )
+        parser.add_argument(
+            "--state-checkpoint-groups",
+            type=int,
+            default=0,
+            help=(
+                "Extra per-request state entries to size the STATE pool with, "
+                "beyond the one set each in-flight request needs. Checkpoints "
+                "and live requests share one pool, so without this the room to "
+                "retain a checkpoint is whatever max_num_seqs happens to leave "
+                "— which is why lowering max_num_seqs lowers the hit rate on "
+                "traffic that reuses prefixes. 0 keeps the old coupling. "
+                "Costs the model's per-request state bytes per group, taken "
+                "out of the paged KV pool."
             ),
         )
         parser.add_argument(

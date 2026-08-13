@@ -108,6 +108,22 @@ class TestPlanPools:
         plan = plan_pools(specs, available_bytes=100_000, max_num_seqs=8)
         assert plan.entries[ENTRY_SWA] == 8 * 3 + 64
 
+    def test_checkpoint_headroom_is_whole_groups_not_stray_entries(self):
+        """What `--state-checkpoint-groups` has to buy to be worth anything.
+
+        `BlockManager` derives its group count as `entries // entries_per_req`,
+        so headroom declared in anything but multiples of the per-request width
+        is rounded away and buys nothing — the reason `gdn_attn.state_spec`
+        multiplies the flag by `1 + num_spec` rather than passing it through.
+        """
+        spr = 3  # 1 + num_spec, the GDN width
+        specs = [
+            page_pool(100),
+            state_pool(ENTRY_STATE, 10, entries_per_req=spr, extra_entries=32 * spr),
+        ]
+        plan = plan_pools(specs, available_bytes=100_000, max_num_seqs=8)
+        assert plan.entries[ENTRY_STATE] // spr == 8 + 32
+
     def test_paged_pool_floors_at_zero_rather_than_going_negative(self):
         specs = [page_pool(1_000_000), state_pool(ENTRY_STATE, 100, entries_per_req=1)]
         plan = plan_pools(specs, available_bytes=10_000, max_num_seqs=8)
