@@ -11,12 +11,11 @@ import logging
 from typing import Any, Iterable, Optional, Tuple, Union
 
 import torch
-from torch import nn
-
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from torch import nn
 
 from atom.plugin.sglang.runtime import (
     MODEL_ARCH_SPECS,
@@ -24,8 +23,8 @@ from atom.plugin.sglang.runtime import (
     SGLangPluginRuntime,
     bind_current_forward_batch,
     get_current_forward_batch,
-    get_model_arch_spec,
     plugin_runtime_scope,
+    resolve_model_arch_spec,
 )
 
 logger = logging.getLogger("atom.plugin.sglang.models")
@@ -83,8 +82,7 @@ class _AtomCausalLMBaseForSglang(nn.Module):
         self.config = config
         self.vocab_size = config.vocab_size
         self.unpadded_vocab_size = config.vocab_size
-        self.model_arch = getattr(config, "architectures", [""])[0]
-        self.model_arch_spec = get_model_arch_spec(self.model_arch)
+        self.model_arch, self.model_arch_spec = resolve_model_arch_spec(config)
         if self.model_arch_spec.uses_text_config:
             text_config = getattr(config, "text_config", None)
             if text_config is None:

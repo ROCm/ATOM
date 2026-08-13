@@ -589,6 +589,74 @@ def _build_eagle3_llama_metadata(
     )
 
 
+def _build_kimi_k3_metadata(
+    atom_config: Any, forward_batch: ForwardBatch, positions: torch.Tensor
+):
+    from atom.plugin.sglang.kimi_k3_bridge import (
+        build_kimi_k3_attention_metadata,
+        maybe_get_kimi_k3_pools,
+    )
+
+    attn_metadata = getattr(forward_batch, "atom_kimi_k3_graph_metadata", None)
+    if attn_metadata is None:
+        backend = _get_sglang_attention_backend()
+        attn_metadata = getattr(backend, "atom_kimi_k3_graph_metadata", None)
+    if attn_metadata is None and _is_current_stream_capturing():
+        from atom.plugin.sglang.attention_backend.kimi_k3_backend import (
+            ATOMKimiK3BackendForSgl,
+        )
+
+        attn_metadata = ATOMKimiK3BackendForSgl._last_atom_kimi_k3_graph_metadata
+
+    token_to_kv_pool, req_to_token_pool = maybe_get_kimi_k3_pools(forward_batch)
+    if token_to_kv_pool is None or req_to_token_pool is None:
+        raise RuntimeError("Kimi-K3 SGLang pools are unavailable")
+    if attn_metadata is None:
+        attn_metadata = build_kimi_k3_attention_metadata(
+            forward_batch,
+            positions,
+            token_to_kv_pool=token_to_kv_pool,
+            req_to_token_pool=req_to_token_pool,
+        )
+
+    from atom.plugin.sglang.attention_backend.attention_gdn import (
+        SGLangGDNForwardContext,
+    )
+
+    attn_backend = SGLangGDNForwardContext._resolve_attn_backend(forward_batch)
+    if forward_batch.forward_mode.is_decode_or_idle():
+        full_attn_backend = getattr(attn_backend, "full_attn_backend", attn_backend)
+        forward_metadata = getattr(full_attn_backend, "forward_metadata", None)
+        kv_indices = getattr(forward_metadata, "kv_indices", None)
+        if kv_indices is None:
+            raise RuntimeError(
+                "Kimi-K3 decode metadata has no KV indices; "
+                f"backend={type(full_attn_backend).__name__}, "
+                f"forward_metadata={forward_metadata is not None}"
+            )
+        attn_metadata.kv_indptr = forward_metadata.kv_indptr
+        attn_metadata.kv_indices = kv_indices
+        attn_metadata.kv_last_page_lens = getattr(
+            forward_metadata, "kv_last_page_len", None
+        )
+        for name in (
+            "work_meta_data",
+            "work_info_set",
+            "work_indptr",
+            "reduce_indptr",
+            "reduce_final_map",
+            "reduce_partial_map",
+            "num_kv_splits",
+        ):
+            setattr(attn_metadata, name, getattr(forward_metadata, name, None))
+
+    linear_backend = SGLangGDNForwardContext._linear_attn_backend(attn_backend)
+    attn_metadata.gdn_metadata = SGLangGDNForwardContext._build_gdn_metadata(
+        forward_batch, linear_backend
+    )
+    return attn_metadata
+
+
 def _set_atom_forward_context(
     atom_config: Any,
     forward_batch: ForwardBatch,
@@ -608,129 +676,20 @@ def _set_atom_forward_context(
             include_v2=True
         )
     )
+    from atom.plugin.sglang.runtime.model_arch import resolve_model_arch_spec
+
+    hf_config = getattr(atom_config, "hf_config", None)
+    model_arch, model_adapter = resolve_model_arch_spec(hf_config)
     attn_metadata = None
-    try:
-        from atom.plugin.sglang.kimi_k3_bridge import (
-            build_kimi_k3_attention_metadata,
-            is_kimi_k3_config,
-            maybe_get_kimi_k3_pools,
-        )
-
-        if is_kimi_k3_config(atom_config.hf_config):
-            attn_metadata = getattr(forward_batch, "atom_kimi_k3_graph_metadata", None)
-            if attn_metadata is None:
-                backend = _get_sglang_attention_backend()
-                attn_metadata = getattr(backend, "atom_kimi_k3_graph_metadata", None)
-            if attn_metadata is None and _is_current_stream_capturing():
-                from atom.plugin.sglang.attention_backend.kimi_k3_backend import (
-                    ATOMKimiK3BackendForSgl,
-                )
-
-                attn_metadata = (
-                    ATOMKimiK3BackendForSgl._last_atom_kimi_k3_graph_metadata
-                )
-            token_to_kv_pool, req_to_token_pool = maybe_get_kimi_k3_pools(forward_batch)
-            if token_to_kv_pool is None or req_to_token_pool is None:
-                raise RuntimeError("Kimi-K3 SGLang pools are unavailable")
-            if attn_metadata is None:
-                attn_metadata = build_kimi_k3_attention_metadata(
-                    forward_batch,
-                    positions,
-                    token_to_kv_pool=token_to_kv_pool,
-                    req_to_token_pool=req_to_token_pool,
-                )
-            from atom.plugin.sglang.attention_backend.attention_gdn import (
-                SGLangGDNForwardContext,
-            )
-
-            attn_backend = SGLangGDNForwardContext._resolve_attn_backend(forward_batch)
-            if forward_mode.is_decode_or_idle():
-                # K3 uses SGLang's HybridLinearAttnBackend. The wrapper owns
-                # dispatch only; full-attention (MLA) metadata is maintained
-                # by its full_attn_backend child.
-                full_attn_backend = getattr(
-                    attn_backend, "full_attn_backend", attn_backend
-                )
-                # Do not depend on get_attn_backend() in the bridge: while
-                # CUDA graphs are captured, the global SGLang forward context
-                # can still point at the capture wrapper rather than K3's
-                # concrete backend. Resolve metadata through the backend used
-                # for this batch and fail before calling the MLA kernel if its
-                # CSR buffers were not initialized.
-                forward_metadata = getattr(full_attn_backend, "forward_metadata", None)
-                kv_indices = getattr(forward_metadata, "kv_indices", None)
-                if kv_indices is None:
-                    raise RuntimeError(
-                        "Kimi-K3 decode metadata has no KV indices; "
-                        f"backend={type(full_attn_backend).__name__}, "
-                        f"forward_metadata={forward_metadata is not None}"
-                    )
-                attn_metadata.kv_indptr = forward_metadata.kv_indptr
-                attn_metadata.kv_indices = kv_indices
-                attn_metadata.kv_last_page_lens = getattr(
-                    forward_metadata, "kv_last_page_len", None
-                )
-                for name in (
-                    "work_meta_data",
-                    "work_info_set",
-                    "work_indptr",
-                    "reduce_indptr",
-                    "reduce_final_map",
-                    "reduce_partial_map",
-                    "num_kv_splits",
-                ):
-                    setattr(attn_metadata, name, getattr(forward_metadata, name, None))
-            linear_backend = SGLangGDNForwardContext._linear_attn_backend(attn_backend)
-            attn_metadata.gdn_metadata = SGLangGDNForwardContext._build_gdn_metadata(
-                forward_batch, linear_backend
-            )
-    except Exception as exc:
-        raise RuntimeError(
-            "Failed to build native ATOM Kimi-K3 metadata for SGLang"
-        ) from exc
-
-    if attn_metadata is None:
+    if model_adapter.build_forward_metadata is not None:
         try:
-            attn_metadata = _build_minimax_m3_metadata(
-                atom_config,
-                forward_batch,
-                positions,
+            attn_metadata = model_adapter.build_forward_metadata(
+                atom_config, forward_batch, positions
             )
         except Exception as exc:
             raise RuntimeError(
-                "Failed to build ATOM MiniMax-M3 sparse metadata for SGLang"
-            ) from exc
-
-    if attn_metadata is None:
-        try:
-            attn_metadata = _build_glm52_dsa_metadata(
-                atom_config,
-                forward_batch,
-                positions,
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                "Failed to build ATOM GLM-5.2 DSA metadata for SGLang"
-            ) from exc
-
-    if attn_metadata is None:
-        try:
-            attn_metadata = _build_deepseek_v4_metadata(forward_batch, positions)
-        except Exception as exc:
-            raise RuntimeError(
-                "Failed to build ATOM DeepSeek-V4 metadata for SGLang"
-            ) from exc
-
-    if attn_metadata is None:
-        try:
-            attn_metadata = _build_eagle3_llama_metadata(
-                atom_config,
-                forward_batch,
-                positions,
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                "Failed to build ATOM EAGLE3 draft metadata for SGLang"
+                "Failed to build ATOM metadata for SGLang model "
+                f"{model_arch or '<unknown>'}"
             ) from exc
 
     if attn_metadata is None:

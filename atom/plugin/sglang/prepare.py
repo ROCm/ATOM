@@ -32,7 +32,10 @@ def prepare_model(config: Any):
     logger.info("Prepare model for plugin mode, the upper engine is sglang")
     _set_framework_backbone("sglang")
 
-    model_arch = config.architectures[0]
+    from atom.plugin.sglang.runtime import resolve_model_arch_spec
+
+    source_model_arch = (getattr(config, "architectures", None) or [""])[0]
+    model_arch, model_adapter = resolve_model_arch_spec(config)
     if model_arch == "DeepseekV4ForCausalLM":
         from atom.plugin.sglang.deepseek_v4_bridge import (
             install_deepseek_v4_proxy_pool_patch,
@@ -66,7 +69,9 @@ def prepare_model(config: Any):
     if model_arch not in _ATOM_SUPPORTED_MODELS:
         supported_archs = list(_ATOM_SUPPORTED_MODELS.keys())
         raise ValueError(
-            f"ATOM does not support the required model architecture: {model_arch}. "
+            "ATOM does not support the required model architecture: "
+            f"{source_model_arch or '<unknown>'} (resolved as "
+            f"{model_arch or '<unknown>'}). "
             f"For now supported model architectures: {supported_archs}"
         )
 
@@ -77,9 +82,6 @@ def prepare_model(config: Any):
     model_cls = _ATOM_SUPPORTED_MODELS[model_arch]
     logger.info("ATOM model class for %s is %s", model_arch, model_cls)
 
-    from atom.plugin.sglang.runtime import get_model_arch_spec
-
-    model_adapter = get_model_arch_spec(model_arch)
     if model_adapter.prepare_draft_model_config is not None:
         model_adapter.prepare_draft_model_config(atom_config, config)
     if model_adapter.prepare_config is not None:

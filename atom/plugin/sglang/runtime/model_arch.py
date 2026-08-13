@@ -10,9 +10,24 @@ from typing import Any
 GLM52_DSA_ARCH = "GlmMoeDsaForCausalLM"
 GLM52_DSA_MODEL_TYPE = "glm_moe_dsa"
 
+MODEL_TYPE_ADAPTER_ARCHES = {
+    GLM52_DSA_MODEL_TYPE: GLM52_DSA_ARCH,
+    "deepseek_v4": "DeepseekV4ForCausalLM",
+    "kimi_k3": "KimiK3ForConditionalGeneration",
+    "minimax_m3": "MiniMaxM3SparseForCausalLM",
+    "minimax_m3_vl": "MiniMaxM3SparseForConditionalGeneration",
+    "qwen3": "Qwen3ForCausalLM",
+    "qwen3_moe": "Qwen3MoeForCausalLM",
+    "qwen3_next": "Qwen3NextForCausalLM",
+    "qwen3_5": "Qwen3_5ForConditionalGeneration",
+    "qwen3_5_text": "Qwen3_5ForConditionalGeneration",
+    "qwen3_5_moe": "Qwen3_5MoeForConditionalGeneration",
+    "qwen3_5_moe_text": "Qwen3_5MoeForConditionalGeneration",
+}
+
 
 def is_glm52_dsa_config(config: Any) -> bool:
-    """Return whether an HF config describes GLM-5.2 DSA."""
+    """Return whether an HF config describes the GLM-5 DSA family."""
 
     archs = getattr(config, "architectures", None) or []
     return (
@@ -43,6 +58,48 @@ class SGLangModelAdapterSpec:
     construction_context: Callable[[], AbstractContextManager[Any]] | None = None
     install_adapters: Callable[[Any], None] | None = None
     bind_cache_views: Callable[[Any, Any], None] | None = None
+    build_forward_metadata: Callable[[Any, Any, Any], Any] | None = None
+
+
+def _build_kimi_k3_forward_metadata(
+    atom_config: Any, forward_batch: Any, positions: Any
+) -> Any:
+    from atom.plugin.sglang.runtime.forward_context import _build_kimi_k3_metadata
+
+    return _build_kimi_k3_metadata(atom_config, forward_batch, positions)
+
+
+def _build_minimax_m3_forward_metadata(
+    atom_config: Any, forward_batch: Any, positions: Any
+) -> Any:
+    from atom.plugin.sglang.runtime.forward_context import _build_minimax_m3_metadata
+
+    return _build_minimax_m3_metadata(atom_config, forward_batch, positions)
+
+
+def _build_glm52_dsa_forward_metadata(
+    atom_config: Any, forward_batch: Any, positions: Any
+) -> Any:
+    from atom.plugin.sglang.runtime.forward_context import _build_glm52_dsa_metadata
+
+    return _build_glm52_dsa_metadata(atom_config, forward_batch, positions)
+
+
+def _build_deepseek_v4_forward_metadata(
+    atom_config: Any, forward_batch: Any, positions: Any
+) -> Any:
+    del atom_config
+    from atom.plugin.sglang.runtime.forward_context import _build_deepseek_v4_metadata
+
+    return _build_deepseek_v4_metadata(forward_batch, positions)
+
+
+def _build_eagle3_llama_forward_metadata(
+    atom_config: Any, forward_batch: Any, positions: Any
+) -> Any:
+    from atom.plugin.sglang.runtime.forward_context import _build_eagle3_llama_metadata
+
+    return _build_eagle3_llama_metadata(atom_config, forward_batch, positions)
 
 
 def _prepare_qwen35_config(atom_config: Any, model_arch: str) -> None:
@@ -367,6 +424,7 @@ MODEL_ADAPTER_SPECS = {
         construction_context=_glm52_dsa_construction_context,
         install_adapters=_install_glm52_dsa_native_adapters,
         bind_cache_views=_bind_glm52_dsa_cache_views,
+        build_forward_metadata=_build_glm52_dsa_forward_metadata,
         uses_context_only_forward=True,
     ),
     "KimiK25ForConditionalGeneration": SGLangModelAdapterSpec(
@@ -380,6 +438,7 @@ MODEL_ADAPTER_SPECS = {
         prepare_config=_prepare_kimi_k3_config,
         construction_context=_kimi_k3_construction_context,
         bind_cache_views=_bind_kimi_k3_cache_views,
+        build_forward_metadata=_build_kimi_k3_forward_metadata,
     ),
     "Qwen3ForCausalLM": SGLangModelAdapterSpec(),
     "Qwen3MoeForCausalLM": SGLangModelAdapterSpec(),
@@ -399,6 +458,7 @@ MODEL_ADAPTER_SPECS = {
     "DeepseekV4ForCausalLM": SGLangModelAdapterSpec(
         install_adapters=_install_deepseek_v4_adapters,
         bind_cache_views=_bind_deepseek_v4_cache_views,
+        build_forward_metadata=_build_deepseek_v4_forward_metadata,
     ),
     "MiniMaxM3SparseForCausalLM": SGLangModelAdapterSpec(
         uses_context_only_forward=True,
@@ -406,6 +466,7 @@ MODEL_ADAPTER_SPECS = {
         construction_context=_minimax_m3_construction_context,
         install_adapters=_install_minimax_m3_adapters,
         bind_cache_views=_bind_minimax_m3_cache_views,
+        build_forward_metadata=_build_minimax_m3_forward_metadata,
     ),
     "MiniMaxM3SparseForConditionalGeneration": SGLangModelAdapterSpec(
         uses_context_only_forward=True,
@@ -413,12 +474,14 @@ MODEL_ADAPTER_SPECS = {
         construction_context=_minimax_m3_construction_context,
         install_adapters=_install_minimax_m3_adapters,
         bind_cache_views=_bind_minimax_m3_cache_views,
+        build_forward_metadata=_build_minimax_m3_forward_metadata,
     ),
     "LlamaForCausalLMEagle3": SGLangModelAdapterSpec(
         uses_context_only_forward=True,
         prepare_draft_model_config=_prepare_eagle3_llama_draft_model_config,
         construction_context=_eagle3_llama_construction_context,
         bind_cache_views=_bind_eagle3_llama_cache_views,
+        build_forward_metadata=_build_eagle3_llama_forward_metadata,
     ),
 }
 
@@ -446,3 +509,23 @@ MODEL_ARCH_SPECS = {
 
 def get_model_arch_spec(model_arch: str) -> SGLangModelAdapterSpec:
     return MODEL_ADAPTER_SPECS.get(model_arch, SGLangModelAdapterSpec())
+
+
+def resolve_model_arch_spec(config: Any) -> tuple[str, SGLangModelAdapterSpec]:
+    """Resolve an adapter by exact architecture, then stable model family."""
+
+    architectures = getattr(config, "architectures", None) or []
+    for architecture in architectures:
+        model_arch = str(architecture)
+        if model_arch in MODEL_ADAPTER_SPECS:
+            return model_arch, MODEL_ADAPTER_SPECS[model_arch]
+
+    configs = (config, getattr(config, "text_config", None))
+    for candidate in configs:
+        model_type = str(getattr(candidate, "model_type", "") or "").lower()
+        model_arch = MODEL_TYPE_ADAPTER_ARCHES.get(model_type)
+        if model_arch is not None:
+            return model_arch, MODEL_ADAPTER_SPECS[model_arch]
+
+    model_arch = str(architectures[0]) if architectures else ""
+    return model_arch, get_model_arch_spec(model_arch)
