@@ -484,15 +484,29 @@ class BlockManager:
         # paged-block cost. The slot cap
         # (the state pool's free list, size = `max_num_seqs`) is the sole
         # admission bound for state cache.
-        if seq.has_per_req_cache:
-            self._attach_state_group(seq, h if num_cached_blocks > 0 else -1)
+        if seq.has_per_req_cache and not self._attach_state_group(
+            seq, h if num_cached_blocks > 0 else -1
+        ):
+            # The state behind the boundary could not be produced, so the
+            # boundary is not this request's history. Disown it — the blocks
+            # stay claimed and the forward simply recomputes over them, which
+            # is what `failed_loading` means on the KV side. Keeping the
+            # boundary instead is silent wrong output: `has_initial_state`
+            # (`gdn_attn.py`) is `num_cached_tokens > 0`.
+            seq.num_cached_tokens = 0
 
-    def _attach_state_group(self, seq: Sequence, hit_hash: int) -> None:
+    def _attach_state_group(self, seq: Sequence, hit_hash: int) -> bool:
         """Give `seq` a state group, resuming from a checkpoint when one exists.
 
+        Returns whether `hit_hash`'s state is really the one `seq` now holds.
+        False means the caller must drop the boundary; see `allocate`.
+
         `hit_hash` is the content hash of the last reused block (-1 for a cold
-        start). `can_allocate` already shrank the hit to a boundary that carries
-        a checkpoint, so a lookup miss here just means the pool is off.
+        start). `can_allocate` already shrank the hit to a boundary that
+        `_resumable_from` accepted — which since the offload tier landed is not
+        the same as "in HBM": a hash whose group was spilled to LMCache is
+        accepted there and misses here. Those are told apart below, because
+        only one of them may keep the boundary.
 
         Resuming shares: the checkpoint stays indexed and the request gets a
         group of its own, so a second request hitting the same prefix still
@@ -514,7 +528,10 @@ class BlockManager:
         if src < 0:
             seq.per_req_cache_group = self.state.pop()
             seq.state_fork_src = -1
-            return
+            # A fresh group holds the previous occupant's bytes. That is fine
+            # for a cold start (nothing claims otherwise) and wrong for a hit,
+            # so the hit only survives if there was none to begin with.
+            return hit_hash == -1
         shared = self.state.is_pinned(src)
         if not shared:
             self.state.claim(src)
@@ -527,7 +544,7 @@ class BlockManager:
                 seq.state_fork_src = src
             # Held off the free list until the forward that reads it is issued.
             self.state.pin(src)
-            return
+            return True
         # `can_allocate` admitted this seq against a non-empty free list and
         # nothing else has run since, so the list can only be empty here if this
         # seq itself just took the last group — which is `src`, unshared.
@@ -535,6 +552,7 @@ class BlockManager:
         self.state.invalidate(src)
         seq.per_req_cache_group = src
         seq.state_fork_src = -1
+        return True
 
     def hash_blocks(
         self,
