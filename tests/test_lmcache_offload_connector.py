@@ -2131,8 +2131,43 @@ def test_per_req_cache_refusal_also_covers_the_unaligned_handoff_resume():
     assert str(seq.id) not in sched._handoff_loads
     assert seq.offload_loaded_tokens == 6
 
-    # Nothing is left pending for the partial-prefill park to pick up.
+    # Nothing is left pending for the partial-prefill park to pick up. This
+    # passes through `should_park_partial_prefill_for_load`'s
+    # `sid not in _handoff_loads` early return, which is the point here -- the
+    # handoff was never started. The guard *inside* that method is a separate
+    # call site and needs its own test, below.
     assert sched.should_park_partial_prefill_for_load(seq) is False
+    assert sched.build_connector_meta().requests == []
+
+
+def test_per_req_cache_refusal_holds_at_the_partial_prefill_park():
+    """The fourth `_decide_load_after_alloc` call site, reached on its own.
+
+    `should_park_partial_prefill_for_load` refuses a hybrid three times over:
+    at the `sid not in _handoff_loads` early return, at
+    `_decide_load_after_alloc`'s `unaligned_hbm_prefill`, and at the guard
+    itself. The test above trips the first, and an unaligned `hbm` would trip
+    the second -- either leaves the guard's own revert green. So park the sid
+    by hand AND keep `hbm` chunk-aligned, leaving the guard as the only thing
+    that can say no. With it reverted this seq parks and emits a load.
+    """
+    sched = _scheduler()
+    sched._min_load_tokens = 8
+    sched._lookup_client = _LookupClient(hit=16)
+    seq = _hybrid_seq(774, 20, [1, 2, 3, 4, 5])
+
+    assert sched.get_num_new_matched_tokens(seq) == (16, True)
+    # Aligned to `chunk_size` (4), so `unaligned_hbm_prefill` cannot be what
+    # refuses this; 16 - 4 = 12 also clears `_min_load_tokens`.
+    seq.num_cached_tokens = 4
+    sched.update_state_after_alloc(seq)
+
+    # What a stateless sequence's unaligned handoff would have left behind.
+    sched._handoff_loads.add(str(seq.id))
+
+    assert sched.should_park_partial_prefill_for_load(seq) is False
+    # Refused, not merely deferred: the park is cleared and no load is emitted.
+    assert str(seq.id) not in sched._handoff_loads
     assert sched.build_connector_meta().requests == []
 
 
