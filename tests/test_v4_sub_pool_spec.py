@@ -7,6 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 ATTENTION_DIR = ROOT / "atom" / "model_ops" / "attentions"
 V4_SOURCE = ATTENTION_DIR / "deepseek_v4_attn.py"
+SUB_POOL_SPEC_SOURCE = ATTENTION_DIR / "sub_pool_spec.py"
 CONFIG_SOURCE = ROOT / "atom" / "config.py"
 ARG_UTILS_SOURCE = ROOT / "atom" / "model_engine" / "arg_utils.py"
 ENV_FIELD = "STATE_CKPT_EXTRA_ENTRIES"
@@ -31,17 +32,27 @@ def _runtime_field_refs(node: ast.AST, field: str) -> list[ast.AST]:
     return refs
 
 
-def test_checkpoint_extra_entries_are_wired_only_to_the_v4_state_slot():
-    users = []
-    trees = {}
-    for path in sorted(ATTENTION_DIR.glob("*.py")):
-        tree = ast.parse(path.read_text())
-        trees[path] = tree
-        if _runtime_field_refs(tree, ENV_FIELD):
-            users.append(path.name)
-    assert users == [V4_SOURCE.name]
+def test_checkpoint_extra_entries_override_is_owned_by_state_pool():
+    spec_tree = ast.parse(SUB_POOL_SPEC_SOURCE.read_text())
+    state_pool_builder = next(
+        node
+        for node in spec_tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "state_pool"
+    )
+    assert _runtime_field_refs(state_pool_builder, ENV_FIELD)
+    override_guards = [
+        call
+        for call in ast.walk(state_pool_builder)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "is_set"
+        and call.args
+        and isinstance(call.args[0], ast.Constant)
+        and call.args[0].value == ENV_FIELD
+    ]
+    assert len(override_guards) == 1
 
-    tree = trees[V4_SOURCE]
+    tree = ast.parse(V4_SOURCE.read_text())
     builder = next(
         node
         for node in tree.body
@@ -67,14 +78,7 @@ def test_checkpoint_extra_entries_are_wired_only_to_the_v4_state_slot():
 
     keywords = {kw.arg: kw.value for kw in state_calls[0].keywords}
     assert ast.literal_eval(keywords["entries_per_req"]) == 1
-    extra_entries = keywords["extra_entries"]
-    assert isinstance(extra_entries, ast.Call)
-    assert isinstance(extra_entries.func, ast.Name)
-    assert extra_entries.func.id == "int"
-    assert _runtime_field_refs(extra_entries, ENV_FIELD)
-
-    assert not _runtime_field_refs(extra_entries, "state_checkpoint_interval_tokens")
-    assert not _runtime_field_refs(extra_entries, "enable_prefix_caching")
+    assert "extra_entries" not in keywords
 
 
 def test_checkpoint_extra_entries_has_no_config_or_cli_surface():

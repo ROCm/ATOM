@@ -93,7 +93,7 @@ from atom.model_ops.v4_kernels import (
     write_v4_paged_decode_indices,
     write_v4_paged_prefill_indices,
 )
-from atom.utils import CpuGpuBuffer, envs
+from atom.utils import CpuGpuBuffer
 from atom.utils.forward_context import (
     AttentionMetaData,
     AttnState,
@@ -904,7 +904,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 STATE_SLOT_CLASS,
                 geo.slot_bytes(row_bytes),
                 entries_per_req=1,
-                extra_entries=int(envs.STATE_CKPT_EXTRA_ENTRIES),
             ),
         ]
 
