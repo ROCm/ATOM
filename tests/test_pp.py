@@ -710,7 +710,7 @@ def test_parked_seq_still_registers_prefix_hashes():
     bm = sched.block_manager
     filled = seq.num_cached_tokens // bs
     assert filled > 0
-    assert all(bm.blocks[b].hash != -1 for b in seq.block_table[:filled])
+    assert all(bm.kv.block(b).hash != -1 for b in seq.block_table[:filled])
 
 
 def test_postprocess_hashes_parked_seq():
@@ -739,7 +739,7 @@ def test_postprocess_hashes_parked_seq():
 
     bm = sched.block_manager
     filled = seq.num_cached_tokens // bs
-    assert all(bm.blocks[b].hash != -1 for b in seq.block_table[:filled])
+    assert all(bm.kv.block(b).hash != -1 for b in seq.block_table[:filled])
 
 
 def test_parked_seq_prefix_is_discoverable_after_load():
