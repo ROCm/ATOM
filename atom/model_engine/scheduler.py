@@ -2111,9 +2111,21 @@ class Scheduler:
                     ell_r = fwd_output.dspark_ell.get(seq.id)
                     if ell_r is not None:
                         seq.dspark_next_ell = int(ell_r)
+                required_placeholders = num_placeholder + offset
+                missing_placeholders = required_placeholders - len(seq.output_tokens)
+                if missing_placeholders > 0:
+                    logger.warning(
+                        "Repairing missing deferred-output placeholders for seq %s: "
+                        "required=%d, available=%d",
+                        seq.id,
+                        required_placeholders,
+                        len(seq.output_tokens),
+                    )
+                    for _ in range(missing_placeholders):
+                        seq.append_token(self.eos_token_id)
                 for i, el in enumerate(token_ids):
-                    seq.token_ids[-num_placeholder - offset + i] = el
-                    seq.output_tokens[-num_placeholder - offset + i] = el
+                    seq.token_ids[-required_placeholders + i] = el
+                    seq.output_tokens[-required_placeholders + i] = el
                 if seq.return_logprobs and token_logprob is not None:
                     if seq.logprobs:
                         seq.logprobs[-1] = token_logprob

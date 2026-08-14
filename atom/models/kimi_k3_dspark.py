@@ -55,12 +55,14 @@ Checkpoint layout (Inferact/Kimi-K3-DSpark, 68 tensors, single-file BF16):
 from typing import TYPE_CHECKING, ClassVar
 
 import torch
+from aiter import QuantType, dtypes
 from aiter.rotary_embedding import get_rope
 from torch import nn
 
 from atom.model_ops.activation import SiluAndMul
-from atom.model_ops.attention_mla import MLAModules
+from atom.model_ops.attention_mla import MLAModules, mla_min_query_heads
 from atom.model_ops.base_attention import Attention
+from atom.model_ops.dspark_markov_sample import dspark_markov_argmax
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import (
     ColumnParallelLinear,
@@ -69,8 +71,10 @@ from atom.model_ops.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from atom.models.deepseek_v2 import yarn_get_mscale
+from atom.models.deepseek_v2 import _fuse_rmsnorm_quant, yarn_get_mscale
 from atom.models.dspark_draft import DSparkDraftModel
+from atom.models.kimi_k3 import _RMS_FUSABLE_QUANT_TYPES, _effective_layer_quant
+from atom.utils import envs
 
 if TYPE_CHECKING:
     from atom.config import Config
@@ -103,6 +107,9 @@ class DSparkMarkovHead(nn.Module):
         self.rank = rank
         self.markov_w1 = nn.Embedding(vocab_size, rank)
         self.markov_w2 = nn.Embedding(vocab_size, rank)
+        # Read once here rather than per sampled position: envs re-reads the
+        # environment on every attribute access.
+        self.fused_sample = envs.ATOM_DSPARK_FUSED_MARKOV_SAMPLE
 
     def forward(self, token_ids: torch.Tensor):
         """Args:
@@ -117,6 +124,45 @@ class DSparkMarkovHead(nn.Module):
             markov_embed.float(), self.markov_w2.weight.float().t()
         )
         return logits_bias, markov_embed
+
+    def sample_next(self, token_ids: torch.Tensor, base_logits: torch.Tensor):
+        """One greedy block position: the argmax of the biased logits, and W1[x].
+
+        The bias itself is never returned, which is what lets the fused path
+        skip materializing it: ``dspark_markov_argmax`` keeps ``W2`` bf16 and
+        reduces straight to ids, with the same fp32 accumulation the softmax
+        guarantee above asks for (see that module for the numerics argument).
+        ``markov_embed`` is still returned because V4's confidence head
+        consumes it.
+
+        Args:
+            token_ids:   [B]     ids of the previously sampled token x_{k-1}.
+            base_logits: [B, V]  this position's base logits.
+        Returns:
+            next_ids:     [B]     argmax over the biased logits.
+            markov_embed: [B, r]  W1[x_{k-1}].
+        """
+        if self.fused_sample:
+            markov_embed = self.markov_w1(token_ids)
+            next_ids = dspark_markov_argmax(
+                base_logits, markov_embed, self.markov_w2.weight
+            )
+            return next_ids, markov_embed
+        bias, markov_embed = self(token_ids)
+        # bf16 + fp32 promotes the slice to fp32 before the add, so an explicit
+        # .float() would only materialize it twice for the same sum.
+        return (base_logits + bias).argmax(dim=-1), markov_embed
+
+
+def _dspark_block_width(draft_config, atom_config) -> int:
+    """The draft block width T, resolved as `DSparkProposer._resolve_mtp_k` does.
+
+    Returns 0 when neither source names a width, which only happens outside a
+    speculative run; callers treat that as "no block pass to size for".
+    """
+    spec_config = getattr(atom_config, "speculative_config", None)
+    num_spec = getattr(spec_config, "num_speculative_tokens", None)
+    return int(num_spec or getattr(draft_config, "dspark_block_size", 0) or 0)
 
 
 class K3DSparkMLAAttention(nn.Module):
@@ -144,9 +190,10 @@ class K3DSparkMLAAttention(nn.Module):
     one parallel pass, so intra-block order is carried by RoPE, not by a mask.
     That is settled -- sglang types these layers ``ENCODER_ONLY``, vLLM passes
     ``non_causal_multi_token_decode=True``, and vLLM ships a
-    ``test_dspark_noncausal_sparse_mla``. Wiring that through ATOM's MLA decode
-    kernel is the one piece NOT resolved here; see the comment in
-    :meth:`forward`.
+    ``test_dspark_noncausal_sparse_mla``. ATOM expresses it in
+    :class:`DSparkProposer`, which clears ``attn_metadata.causal`` and plans the
+    decode's work descriptors non-causally; the head padding chosen in
+    :meth:`__init__` is what keeps a non-causal kernel dispatchable.
     """
 
     def __init__(
@@ -191,6 +238,11 @@ class K3DSparkMLAAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.fused_qkv_a_proj",
         )
+        # Both A-norms stay plain modules: on the block pass they are applied by
+        # one `_fuse_rmsnorm_quant` launch (q norm + q activation quant + kv
+        # norm), which reads their `.weight` / `.eps` directly. The module form
+        # is still what `write_context_kv` calls, where only kv_a_layernorm runs
+        # and its output must stay bf16 for the cache write.
         self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
         self.q_b_proj = ColumnParallelLinear(
             self.q_lora_rank,
@@ -270,19 +322,48 @@ class K3DSparkMLAAttention(nn.Module):
             head_dim=self.kv_lora_rank + self.qk_rope_head_dim,
             scale=self.scaling,
             num_kv_heads=1,
-            # Draft KV stays bf16 regardless of --kv_cache_dtype: it owns a bf16
-            # sibling pool (Eagle3DraftBuilder), and this string drives
-            # MLAAttention's whole dtype path (fp8 decode overload +
-            # concat_and_cache_mla dtype). "fp8" over a bf16 pool aborts in
-            # cache_kernels; bf16 also dodges aiter's fp8 split-KV table
-            # (get_block_n_fp8, no 16*7 entry), keeping block width 7 usable.
-            kv_cache_dtype="bf16",
+            # The draft binds into the engine's own MLA pool, so it caches in
+            # whatever dtype that pool was allocated with. This string has to
+            # agree with the bound tensor: it selects the fp8 decode overload
+            # and is passed straight to concat_and_cache_mla on the
+            # context-write path, and "fp8" over a bf16 tensor (or the reverse)
+            # aborts inside cache_kernels.
+            kv_cache_dtype=atom_config.kv_cache_dtype,
+            # The block pass runs this decode non-causally, which narrows the
+            # aiter kernels available for it; the draft's own block width picks
+            # the head padding that keeps one dispatchable.
+            min_query_heads=mla_min_query_heads(
+                atom_config.kv_cache_dtype, _dspark_block_width(config, atom_config)
+            ),
             layer_num=layer_num,
             use_mla=True,
             mla_modules=mla_modules,
             config=atom_config,
             prefix=f"{prefix}.mla_attn",
         )
+
+        # Which scheme -- if any -- the two fusable activation quants run in.
+        # Resolved from the CONSUMER linear, the way kimi_k3 does it, so an
+        # excluded or differently-quantized layer silently falls back to plain
+        # norms instead of feeding a GEMM the wrong layout.
+        #
+        # q side: q_b_proj consumes the normed query, inside the MLA impl.
+        qknorm_type, qknorm_dtype = _effective_layer_quant(
+            quant_config, f"{prefix}.q_b_proj"
+        )
+        self.fuse_qknorm_quant = qknorm_dtype in (dtypes.fp8, dtypes.fp4x2)
+        self.qknorm_dtype = qknorm_dtype if self.fuse_qknorm_quant else torch.bfloat16
+        self.qknorm_quant_type_value = (
+            qknorm_type.value if self.fuse_qknorm_quant else QuantType.No.value
+        )
+        # Attention-input side: fused_qkv_a_proj is the only consumer of the
+        # decoder's input_layernorm here (the draft has no g_proj gate), so one
+        # scheme decides it. The layer reads these two back off the attention.
+        self.fuse_input_norm_quant = (
+            _effective_layer_quant(quant_config, f"{prefix}.fused_qkv_a_proj")[0]
+            in _RMS_FUSABLE_QUANT_TYPES
+        )
+        self.input_quant_prefix = f"{prefix}.fused_qkv_a_proj"
 
     # ---- context rows (target-derived) -------------------------------------
 
@@ -294,31 +375,30 @@ class K3DSparkMLAAttention(nn.Module):
     ) -> None:
         """Project the target context into this layer's latent cache rows.
 
-        The q half of the fused projection is computed and dropped. Avoiding
-        that would mean keeping q and kv as separate projections, which would
-        diverge from the checkpoint's own fused layout for no real gain -- this
-        runs over the handful of tokens verified per step, not the sequence.
-        (vLLM's reference makes the same trade in its non-fused path, and offers
-        a cross-layer fused fast path on top; that optimization is not ported.)
+        The checkpoint keeps q_a and kv_a as one fused weight and so does this
+        module (see packed_modules_mapping); the block pass in :meth:`forward`
+        wants both halves, this path only the kv one -- so 1536 of the 2112
+        output columns are computed and dropped. Narrowing the GEMM to the kv
+        shard is not available where it would pay: the served configuration
+        quantizes this projection per output channel and preshuffles its rows,
+        after which a row slice of the merged weight is not that shard's weight.
+        (vLLM's reference computes the full projection here too, and offers a
+        cross-layer fused fast path on top; that optimization is not ported.)
         """
-        qkv_lora = _linear_out(self.fused_qkv_a_proj(ctx_hidden))
-        kv_lora = qkv_lora[..., self.q_lora_rank :]
-        kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        kv_c = self.kv_a_layernorm(kv_c)
-        # RoPE the positional lane only -- there is no query on the context
-        # path. The rope kernel is 2-component (rotates query AND key, in place
-        # on the rotary_dim views) and the YaRN variant
-        # (DeepseekScalingRotaryEmbedding) declares `key` as a REQUIRED
-        # positional, unlike the base class whose `forward_native` takes it as
-        # optional. So pass a throwaway for the query side, exactly as
-        # deepseek_v2 does for its own k-only rope under PCP.
-        k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
-        _, k_pe = self.rotary_emb(positions, torch.empty_like(k_pe), k_pe)
-        # reuse _pcp_write_full_kv (not for PCP): only helper taking an explicit
-        # slot_mapping + handling all cache layouts; normal store hardcodes
-        # attn_metadata.slot_mapping, which is the block's, not the context rows'.
-        self.mla_attn.impl._pcp_write_full_kv(
-            self.mla_attn.kv_cache, kv_c, k_pe, slot_mapping
+        kv_lora = _linear_out(self.fused_qkv_a_proj(ctx_hidden))[
+            ..., self.q_lora_rank :
+        ]
+        # norm + rope + concat + store live behind one call so every cache
+        # layout stays in the attention impl: the normal store hardcodes
+        # attn_metadata.slot_mapping, which is the draft block's, not these
+        # context rows'. It fuses the four ops into one kernel when the layout
+        # allows and otherwise runs exactly the chain this used to run inline.
+        self.mla_attn.impl.write_context_kv_latent(
+            self.mla_attn.kv_cache,
+            kv_lora,
+            positions,
+            slot_mapping,
+            self.kv_a_layernorm,
         )
 
     # ---- block pass --------------------------------------------------------
@@ -326,9 +406,17 @@ class K3DSparkMLAAttention(nn.Module):
     def forward(
         self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
-        qkv_lora = _linear_out(self.fused_qkv_a_proj(hidden_states))
-        q_lora, kv_lora = qkv_lora.split(
-            [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
+        # `hidden_states` is a (fp8, scale) tuple when the decoder's
+        # input_layernorm fused its activation quant; fused_qkv_a_proj is its
+        # only consumer and takes the scale directly.
+        hidden_states_scale = None
+        if isinstance(hidden_states, tuple):
+            hidden_states, hidden_states_scale = hidden_states
+        qkv_lora = _linear_out(
+            self.fused_qkv_a_proj(hidden_states, hidden_states_scale)
+        )
+        q_lora, kv_c, k_pe = qkv_lora.split(
+            [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
         )
         # Stop at q_a_layernorm and hand the LORA-rank query to the attention.
         # `q_b_proj`, the RoPE on k_pe, the cache write, and `o_proj` all live
@@ -337,10 +425,39 @@ class K3DSparkMLAAttention(nn.Module):
         # of them out here applies them twice. (Same call shape as
         # deepseek_v2: `mla_attn(q_a_layernorm(q_c), kv_a_layernorm(kv_c),
         # k_pe, positions)`.)
-        q_c = self.q_a_layernorm(q_lora)
-        kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        kv_c = self.kv_a_layernorm(kv_c)
-        return self.mla_attn(q_c, kv_c, k_pe, positions)
+        #
+        # One kernel for both A-norms plus the query's activation quant, as in
+        # kimi_k3's own MLA: q_b_proj takes the (fp8, scale) pair via `q_scale=`,
+        # while kv stays bf16 because the cache is written from it. When the q
+        # scheme is not fusable, qknorm_dtype is bf16 / QuantType.No and this
+        # degrades to a plain fused norm pair with q_scale None.
+        q_shuffle = False
+        q_scale_shuffle_padding = False
+        if self.qknorm_dtype == dtypes.fp4x2:
+            from atom.model_ops.linear import use_triton_gemm
+            from atom.models.deepseek_v2 import _mxfp4_activation_quant_layout
+
+            if not use_triton_gemm():
+                q_shuffle, q_scale_shuffle_padding = _mxfp4_activation_quant_layout(
+                    q_lora.shape[0]
+                )
+        (q_c, q_scale), _, kv_c, _ = _fuse_rmsnorm_quant(
+            q_lora,
+            self.q_a_layernorm.weight,
+            self.q_a_layernorm.eps,
+            kv_c,
+            self.kv_a_layernorm.weight,
+            self.kv_a_layernorm.eps,
+            None,
+            dtype_quant=self.qknorm_dtype,
+            shuffle=q_shuffle,
+            scale_shuffle_padding=q_scale_shuffle_padding,
+            group_size=128,
+            quant_type=self.qknorm_quant_type_value,
+            output_unquantized_inp1=False,
+            transpose_scale=True,
+        )
+        return self.mla_attn(q_c, kv_c, k_pe, positions, q_scale=q_scale)
 
 
 class K3DSparkMLP(nn.Module):
@@ -371,8 +488,13 @@ class K3DSparkMLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # `x` is a (fp8, scale) tuple when post_attention_layernorm fused its
+        # activation quant; gate_up_proj is its only consumer.
+        x_scale = None
+        if isinstance(x, tuple):
+            x, x_scale = x
         return _linear_out(
-            self.down_proj(self.act_fn(_linear_out(self.gate_up_proj(x))))
+            self.down_proj(self.act_fn(_linear_out(self.gate_up_proj(x, x_scale))))
         )
 
 
@@ -387,18 +509,40 @@ class K3DSparkDecoderLayer(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        quant_config = atom_config.quant_config
         self.self_attn = K3DSparkMLAAttention(
             atom_config, config, layer_num, prefix=f"{prefix}.self_attn"
         )
         self.mlp = K3DSparkMLP(
             config.hidden_size,
             config.intermediate_size,
-            quant_config=atom_config.quant_config,
+            quant_config=quant_config,
             prefix=f"{prefix}.mlp",
         )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # Both pre-norms fuse their activation quant into the GEMM that consumes
+        # them (fused_qkv_a_proj / gate_up_proj), each the sole consumer of its
+        # normed output -- the residual stream is branched off BEFORE the norm,
+        # so nothing else needs the bf16 form. The quant op then disappears from
+        # the drafting step instead of running as its own pass over [T, 7168].
+        self.input_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_quant=self.self_attn.fuse_input_norm_quant,
+            quant_config=(
+                quant_config if self.self_attn.fuse_input_norm_quant else None
+            ),
+            prefix=self.self_attn.input_quant_prefix,
+        )
+        self.fuse_ffn_norm_quant = (
+            _effective_layer_quant(quant_config, f"{prefix}.mlp.gate_up_proj")[0]
+            in _RMS_FUSABLE_QUANT_TYPES
+        )
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_quant=self.fuse_ffn_norm_quant,
+            quant_config=quant_config if self.fuse_ffn_norm_quant else None,
+            prefix=f"{prefix}.mlp.gate_up_proj",
         )
 
     def write_context_kv(self, ctx_hidden, positions) -> None:
@@ -588,7 +732,8 @@ class KimiK3DSpark(DSparkDraftModel):
         out_ids = anchor_ids.new_empty(bs, T + 1)
         out_ids[:, 0] = anchor_ids
         for k in range(T):
-            bias, _ = self.markov_head(out_ids[:, k])
             # Greedy: temperature/sampling is applied by the target's verify.
-            out_ids[:, k + 1] = (base_logits[:, k].float() + bias).argmax(dim=-1)
+            out_ids[:, k + 1], _ = self.markov_head.sample_next(
+                out_ids[:, k], base_logits[:, k]
+            )
         return out_ids[:, 1:]

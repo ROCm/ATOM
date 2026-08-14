@@ -19,10 +19,10 @@ only thing implemented here:
 Below that line the flavors diverge at every step, so the per-layer write stays
 in the subclass. V4 writes a 512-wide MQA row into a private rolling window
 addressed by absolute position, with the RMSNorm covering the RoPE lanes and
-fp8 QAT on the rest; K3 writes a 576-wide MLA latent into a paged sibling pool
-addressed by slot mapping, norms only the compressed half and stays bf16. The
-steps line up one for one and not one of them is the same computation -- which
-is why the seam is here, above the per-layer write, and not inside it.
+fp8 QAT on the rest; K3 writes a 576-wide MLA latent into its rows of the
+engine's paged pool addressed by slot mapping, and norms only the compressed
+half. The steps line up one for one and not one of them is the same computation
+-- which is why the seam is here, above the per-layer write, and not inside it.
 """
 
 import torch

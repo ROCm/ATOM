@@ -501,14 +501,10 @@ async def generate_async(
             sampling_params,
             stream_callback=completion_callback,
             kv_transfer_params=kv_transfer_params,
+            data_parallel_rank=data_parallel_rank,
         )
 
     seq = await loop.run_in_executor(None, do_preprocess)
-    if data_parallel_rank is not None:
-        seq.data_parallel_rank = data_parallel_rank
-        logger.info(
-            "Request %s pinned to data_parallel_rank=%s", seq.id, data_parallel_rank
-        )
     try:
         _validate_sequence_context_length(seq)
     except Exception:
@@ -584,6 +580,7 @@ async def generate_async_multimodal(
     multimodal_data: dict[str, Any],
     sampling_params: SamplingParams,
     request_id: str,
+    data_parallel_rank: int | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Generate text asynchronously for one multimodal request."""
     token_queue: asyncio.Queue = asyncio.Queue()
@@ -614,6 +611,7 @@ async def generate_async_multimodal(
             sampling_params,
             stream_callback=completion_callback,
             multimodal_data=multimodal_data,
+            data_parallel_rank=data_parallel_rank,
         )
 
     seq = await loop.run_in_executor(None, do_preprocess)
@@ -731,18 +729,10 @@ async def generate_async_fanout(
             kv_transfer_params=kv_transfer_params,
             multimodal_data=multimodal_data,
             parent_request_id=request_id,
+            data_parallel_rank=data_parallel_rank,
         )
 
     seqs = await loop.run_in_executor(None, do_preprocess)
-    if data_parallel_rank is not None:
-        for seq in seqs:
-            seq.data_parallel_rank = data_parallel_rank
-        logger.info(
-            "Request %s fanout pinned %d sequence(s) to data_parallel_rank=%s",
-            request_id,
-            len(seqs),
-            data_parallel_rank,
-        )
     try:
         _validate_sequence_context_length(seqs[0])
     except Exception:
@@ -830,6 +820,7 @@ async def setup_streaming_request(
     request_id: str,
     kv_transfer_params: dict[str, Any] | None = None,
     multimodal_data: dict[str, Any] | None = None,
+    data_parallel_rank: int | None = None,
 ) -> tuple[int, asyncio.Queue, int]:
     """Set up a streaming request with the engine.
 
@@ -858,6 +849,7 @@ async def setup_streaming_request(
             stream_callback=stream_callback,
             kv_transfer_params=kv_transfer_params,
             multimodal_data=multimodal_data,
+            data_parallel_rank=data_parallel_rank,
         )
         _seq_id_to_request_id[seq.id] = request_id
         return seq
@@ -1018,6 +1010,7 @@ async def setup_streaming_request_fanout(
     request_id: str,
     kv_transfer_params: dict[str, Any] | None = None,
     multimodal_data: dict[str, Any] | None = None,
+    data_parallel_rank: int | None = None,
 ) -> tuple[list[int], asyncio.Queue, int]:
     """Fan-out variant of :func:`setup_streaming_request`.
 
@@ -1061,6 +1054,7 @@ async def setup_streaming_request_fanout(
             kv_transfer_params=kv_transfer_params,
             multimodal_data=multimodal_data,
             parent_request_id=request_id,
+            data_parallel_rank=data_parallel_rank,
         )
         for seq in seqs:
             _seq_id_to_request_id[seq.id] = request_id
@@ -1208,6 +1202,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         )
 
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
+        dp_rank = request.data_parallel_rank
 
         _log_request_event("request", request_id, request.model_dump())
 
@@ -1256,6 +1251,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                         request_id,
                         multimodal_data=stream_multimodal_data,
                         kv_transfer_params=request.kv_transfer_params,
+                        data_parallel_rank=dp_rank,
                     )
                 )
                 gen = stream_chat_response_fanout(
@@ -1274,6 +1270,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     request_id,
                     multimodal_data=stream_multimodal_data,
                     kv_transfer_params=request.kv_transfer_params,
+                    data_parallel_rank=dp_rank,
                 )
                 gen = stream_chat_response(
                     request_id,
@@ -1300,6 +1297,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     request_id,
                     multimodal_data=multimodal_data,
                     kv_transfer_params=request.kv_transfer_params,
+                    data_parallel_rank=dp_rank,
                 ),
                 raw_request,
                 request_id,
@@ -1320,6 +1318,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     multimodal_data,
                     sampling_params,
                     request_id,
+                    data_parallel_rank=dp_rank,
                 ),
                 raw_request,
                 request_id,
@@ -1341,6 +1340,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     sampling_params,
                     request_id,
                     kv_transfer_params=request.kv_transfer_params,
+                    data_parallel_rank=dp_rank,
                 ),
                 raw_request,
                 request_id,
@@ -1361,6 +1361,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     sampling_params,
                     request_id,
                     kv_transfer_params=request.kv_transfer_params,
+                    data_parallel_rank=dp_rank,
                 ),
                 raw_request,
                 request_id,
@@ -1409,6 +1410,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
         )
 
         request_id = f"cmpl-{uuid.uuid4().hex}"
+        dp_rank = request.data_parallel_rank
 
         _log_request_event("request", request_id, request.model_dump())
 
@@ -1421,6 +1423,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
                         sampling_params,
                         request_id,
                         kv_transfer_params=request.kv_transfer_params,
+                        data_parallel_rank=dp_rank,
                     )
                 )
                 gen = stream_completion_response_fanout(
@@ -1437,6 +1440,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
                     sampling_params,
                     request_id,
                     kv_transfer_params=request.kv_transfer_params,
+                    data_parallel_rank=dp_rank,
                 )
                 gen = stream_completion_response(
                     request_id,
@@ -1880,6 +1884,23 @@ async def kv_transfer_info():
         "dp_size": cfg.parallel_config.data_parallel_size,
         "kv_role": kv_role,
         "handshake_port": handshake_port,
+    }
+
+
+@app.get("/server_info")
+async def server_info():
+    """Server metadata for the Atomesh router.
+
+    The router's dp-aware discovery reads ``dp_size`` here to expand the
+    per-DP-rank worker set and enable cache-aware routing to the rank that
+    holds a request's prefix.
+    """
+    cfg = engine.config
+    return {
+        "model_id": model_name,
+        "served_model_name": model_name,
+        "tp_size": cfg.tensor_parallel_size,
+        "dp_size": cfg.parallel_config.data_parallel_size,
     }
 
 
