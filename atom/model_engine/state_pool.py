@@ -727,7 +727,23 @@ class StateGroupPool:
         self._checkpoint_pending.clear()
 
     def checkpoint_fates(self) -> dict[str, int]:
-        """What became of the checkpoints the ladder asked this pool to keep."""
+        """What became of the checkpoints the ladder asked this pool to keep.
+
+        `checkpoints_dropped` reads 0 at every pool size, including one far too
+        small, and is not the capacity signal it looks like: `_commit_pending`
+        only counts a drop when `has_free()` is false, but a finished request
+        hands its group back, and `pop` never refuses — with nothing vacant it
+        spends the LRU checkpoint and counts an eviction instead. This pool
+        overwrites checkpoints, it does not turn them away.
+
+        The capacity reading is `checkpoints_evicted` against
+        `checkpoints_kept - num_groups`. When they match, every checkpoint but
+        the resident set was destroyed to make room and more groups will buy
+        hit rate directly. When eviction runs below that line, the pool is
+        holding its working set and the misses are somewhere else — most
+        likely `checkpoints_orphaned`, whose KV prefix died first and which
+        more groups cannot prevent.
+        """
         return {
             "checkpoints_kept": self.checkpoints_kept,
             "checkpoints_dropped": self.checkpoints_dropped,
@@ -747,11 +763,11 @@ class StateGroupPool:
         working, and admission never consults the split — `has_free` counts the
         whole free list.
 
-        The reading that says "too small" is `checkpoints_dropped`: the ladder
-        asked to keep a checkpoint and there was no free group to put it in.
-        Not `checkpoints_evicted`, which only says more checkpoints were taken
-        than a pool this size can hold at once, and which is therefore roughly
-        `kept - num_groups` for any workload that outlives the pool.
+        Nor is any field here the reading that says "too small" — see
+        `checkpoint_fates`, which owns that question. This docstring used to
+        point at `checkpoints_dropped`, which is wrong: that counter is
+        structurally near-unreachable, because `pop` evicts rather than
+        refusing. `kept - num_groups == evicted` is the thrash signal.
         """
         held = sum(1 for g in self._free if self.group_hash[g] != -1)
         return {
