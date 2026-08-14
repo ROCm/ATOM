@@ -298,10 +298,9 @@ class LMCacheOffloadConnector(KVConnectorBase):
             worker_id=rank,
         )
         codec.bind_storage_manager(self._engine.storage_manager)
-        # `index=None`: the `StateOffloadIndex` lives in the engine process.
-        # The spill path only reports (`take_spill_reports`), and the load
-        # path that does want an index is not wired yet.
-        self._state_tier = StateOffloadTier(codec, index=None)
+        # No index: `StateOffloadIndex` lives in the engine process. Both
+        # directions report and the engine applies.
+        self._state_tier = StateOffloadTier(codec)
 
     def _validate_block_geometry(self, transfer_tensors) -> None:
         """Cross-check codec blocks against existing transfer-region metadata."""
@@ -356,6 +355,7 @@ class LMCacheOffloadConnector(KVConnectorBase):
     def start_load_kv(self, metadata) -> None:
         if not isinstance(metadata, LMCacheOffloadMetadata):
             return
+        self._start_state_loads(metadata)
         loading_lookup_ids = {
             str(req.req_id)
             for req in metadata.requests
@@ -384,6 +384,42 @@ class LMCacheOffloadConnector(KVConnectorBase):
                     req,
                     save_ready_event,
                 )
+
+    def _start_state_loads(self, metadata) -> None:
+        """Hand this step's state-tier loads to the tier's own executor.
+
+        No producer fence, unlike the save path: a load *writes* the state
+        entry and nothing on the compute stream is reading it yet. The group
+        belongs to a request that is parked precisely so no forward touches it,
+        and `StagedTransfer.unpack` synchronizes the stream that produced the
+        bytes before it returns, so by the time the report reaches the engine
+        the entry is readable from any stream.
+
+        With no tier the loads are reported failed rather than dropped. The
+        tier can legitimately refuse to build (wrong connector, pipeline
+        parallelism, a backend with no state views, an entry larger than the
+        staging buffer) while the engine's index exists and keeps offering
+        loads; each of those requests is already parked, and only a report
+        unparks it.
+        """
+        loads = getattr(metadata, "state_loads", None)
+        if not loads:
+            return
+        if self._state_tier is None:
+            logger.warning(
+                "state offload: %d load(s) arrived but this worker built no "
+                "state tier; failing them so their requests recompute instead "
+                "of waiting forever.",
+                len(loads),
+            )
+            self._fail_state_loads(loads)
+            return
+        for req_id, h, group in loads:
+            self._state_tier.submit_load(req_id, int(h), int(group))
+
+    def _fail_state_loads(self, loads) -> None:
+        with self._lock:
+            self._failed_load.update(req_id for req_id, _h, _group in loads)
 
     def _guard(self, kind: str, fn, req, *args) -> None:
         try:
@@ -600,13 +636,22 @@ class LMCacheOffloadConnector(KVConnectorBase):
             self._done_save.clear()
             self._done_load.clear()
             self._failed_load.clear()
-        # The state tier's reports: not request-keyed, because the request that
-        # owned a spilled checkpoint is gone by the time its bytes land.
-        indexed, released, index_failed = (
-            self._state_tier.take_spill_reports()
-            if self._state_tier is not None
-            else (set(), set(), set())
-        )
+        # The state tier's spill reports: not request-keyed, because the
+        # request that owned a spilled checkpoint is gone by the time its bytes
+        # land. Its *load* reports are, so they merge into the two channels a
+        # KV load already uses -- which is what gives the state leg the
+        # aggregator's per-request quorum for free. Nothing distinguishes the
+        # two legs downstream and nothing needs to: a request never has both
+        # (the offload scheduler refuses every KV load for a per-request-cache
+        # sequence), and the engine's `settle_state_load` is a no-op for an id
+        # its state index never issued.
+        if self._state_tier is not None:
+            indexed, released, index_failed = self._state_tier.take_spill_reports()
+            state_done, state_failed = self._state_tier.get_finished()
+            dl |= state_done
+            fl |= state_failed
+        else:
+            indexed, released, index_failed = set(), set(), set()
         return KVConnectorOutput(
             finished_sending=set(),
             finished_loading=dl,

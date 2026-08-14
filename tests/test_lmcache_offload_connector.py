@@ -2278,3 +2278,86 @@ def test_dense_model_gets_no_hybrid_startup_warning(caplog):
         LMCacheOffloadConnectorScheduler(_warn_config("deepseek_v3"))
 
     assert _hybrid_warnings(caplog) == []
+
+
+# ---------------------------------------------------------------------------
+# The state tier's load leg, worker side
+# ---------------------------------------------------------------------------
+
+
+class _FakeTier:
+    """Enough of `StateOffloadTier` to see what the connector hands it."""
+
+    def __init__(self, done=(), failed=()):
+        self.submitted = []
+        self.failed_without_attempt = []
+        self._done, self._failed = set(done), set(failed)
+
+    def submit_load(self, req_id, h, group):
+        self.submitted.append((req_id, h, group))
+
+    def fail_loads(self, req_ids):
+        self.failed_without_attempt.extend(req_ids)
+
+    def get_finished(self):
+        return set(self._done), set(self._failed)
+
+    def take_spill_reports(self):
+        return set(), set(), set()
+
+
+def _load_worker(tier=None):
+    conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
+    conn._do_load = True
+    conn._do_save = False
+    conn._lock = threading.Lock()
+    conn._done_load = set()
+    conn._failed_load = set()
+    conn._done_save = set()
+    conn._engine = SimpleNamespace(lookup_unpin=lambda _lookup_id: None)
+    conn._state_tier = tier
+    return conn
+
+
+def _state_load_meta(*loads):
+    meta = LMCacheOffloadMetadata()
+    meta.state_loads = list(loads)
+    return meta
+
+
+def test_state_loads_reach_the_tier_with_a_real_pool_group():
+    tier = _FakeTier()
+    conn = _load_worker(tier)
+
+    conn.start_load_kv(_state_load_meta((7, 111, 3), (8, 222, 5)))
+
+    assert tier.submitted == [(7, 111, 3), (8, 222, 5)]
+
+
+def test_a_worker_with_no_tier_fails_the_load_rather_than_dropping_it(caplog):
+    """The tier can legitimately refuse to build -- pipeline parallelism, an
+    entry larger than the staging buffer, a backend with no state views --
+    while the engine's index goes on offering loads. Each of those requests is
+    already parked, and only a report unparks it, so silence here is a hang.
+    """
+    conn = _load_worker(tier=None)
+
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        conn.start_load_kv(_state_load_meta((7, 111, 3)))
+
+    assert conn._failed_load == {7}
+    assert "no state tier" in caplog.text
+
+
+def test_state_load_reports_merge_into_the_kv_loading_channels():
+    """Sharing the channels is what gives the state leg the aggregator's
+    per-request quorum for free. Nothing downstream distinguishes the two legs
+    and nothing needs to: one request never has both."""
+    conn = _load_worker(_FakeTier(done={7}, failed={8}))
+    conn._done_load.add(100)
+    conn._failed_load.add(200)
+
+    out = conn.get_finished()
+
+    assert out.finished_loading == {7, 100}
+    assert out.failed_loading == {8, 200}

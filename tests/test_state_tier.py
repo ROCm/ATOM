@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: MIT
 # The worker-side driver: its own executor, and completions reported by req_id.
 
-import pytest
-
 from atom.kv_transfer.offload.state_tier import StateOffloadTier
 from atom.model_engine.state_offload import StateOffloadIndex
 
@@ -24,7 +22,7 @@ class FakeCodec:
 
 
 def tier(codec):
-    return StateOffloadTier(codec, StateOffloadIndex(2, kv_offload_enabled=False))
+    return StateOffloadTier(codec)
 
 
 def test_a_successful_spill_reports_the_hash():
@@ -35,8 +33,10 @@ def test_a_successful_spill_reports_the_hash():
     indexed, _, index_failed = t.take_spill_reports()
     assert indexed == {11}
     assert index_failed == set()
-    # Reported, not applied: the index lives in the engine process.
-    assert 11 not in t.index.hashes
+    # Reported, not applied. The tier holds no index at all -- that object
+    # lives in the engine process, and a worker-side copy of it would be a
+    # second opinion about what is stored.
+    assert not hasattr(t, "index")
 
 
 def test_the_codec_packs_the_staging_entry_not_the_pool_group():
@@ -52,21 +52,14 @@ def test_the_codec_packs_the_staging_entry_not_the_pool_group():
 
 def test_a_failed_spill_is_not_reported_as_indexed():
     """The report is the only record the engine gets, so reporting a spill that
-    did not land is a guaranteed false positive on every later request.
-
-    We seed the index with a *different* hash first so the assertion is
-    self-contained: it proves both that 11 was not added and that nothing else
-    was disturbed, without relying on an empty-index starting state.
-    """
+    did not land is a guaranteed false positive on every later request."""
     codec = FakeCodec(put_ok=False)
     t = tier(codec)
-    t.index.confirm_spill(99)  # seed a different hash so the index is non-empty
     t.submit_spill(11, entry_index=64, staging_slot=0)
     t.drain()
     indexed, _, index_failed = t.take_spill_reports()
     assert indexed == set()
     assert index_failed == {11}
-    assert t.index.hashes == {99}  # 11 absent AND 99 untouched
 
 
 def test_a_spill_always_reports_its_staging_slot():
@@ -76,39 +69,26 @@ def test_a_spill_always_reports_its_staging_slot():
     """
     codec = FakeCodec(put_ok=False)
     t = tier(codec)
-    # Drain both slots out of the ring the same way the real caller does.
-    slot0 = t.index.request_spill(11, group=0)  # returns 0, ring now empty
-    slot1 = t.index.request_spill(22, group=1)  # returns 1, ring now empty
+    # Every slot the ring can hand out, in flight at once: nothing can come
+    # back until the reports do.
+    ring = StateOffloadIndex(2, kv_offload_enabled=False)
+    slot0 = ring.request_spill(11, group=0)
+    slot1 = ring.request_spill(22, group=1)
     assert slot0 >= 0 and slot1 >= 0
-    assert not t.index._free_slots  # ring genuinely empty before transfers
+    assert ring.request_spill(33, group=2) == -1, "ring not empty before transfers"
     t.submit_spill(11, entry_index=64, staging_slot=slot0)
     t.submit_spill(22, entry_index=65, staging_slot=slot1)
     t.drain()
     _, released, _ = t.take_spill_reports()
     assert released == {slot0, slot1}
-
-
-def test_the_load_path_is_not_callable_as_production_builds_the_tier():
-    """The load tests below construct the tier with a live index; production
-    does not, and this pins that gap so they cannot be mistaken for coverage.
-
-    `connector.py` builds `StateOffloadTier(codec, index=None)` (and
-    `multi_connector.py` adopts that same object), while `submit_load` does
-    `self.index.loads_attempted += 1` unconditionally. The load direction is
-    deliberately unwired -- `state_pool.STATE_OFFLOAD_LOADS_WIRED` is False and
-    nothing calls `submit_load` -- so this is documentation of the current
-    shape, not a defect. Wiring loads means giving the tier a real index here;
-    when that happens this test should fail and be deleted.
-    """
-    t = StateOffloadTier(FakeCodec(), index=None)
-    with pytest.raises(AttributeError):
-        t.submit_load("req-a", 11, group=3)
+    for slot in released:
+        ring.release_staging(slot)
+    assert ring.request_spill(33, group=2) >= 0, "the ring never recovered"
 
 
 def test_a_successful_load_reports_done():
     codec = FakeCodec()
     t = tier(codec)
-    t.index.confirm_spill(11)
     t.submit_load("req-a", 11, group=3)
     t.drain()
     assert t.get_finished() == ({"req-a"}, set())
@@ -117,15 +97,27 @@ def test_a_successful_load_reports_done():
     assert codec.gets == [(11, 3)]
 
 
-def test_a_failed_load_reports_failed_and_forgets_the_hash():
+def test_a_failed_load_reports_failed_by_request():
     """Three triggers funnel here — LMCache's own LRU, a spill that never
-    landed, a transfer error — and all three are the same normal path."""
+    landed, a transfer error — and all three are the same normal path.
+
+    The report names the request and nothing else. Retracting the hash from
+    the index is the engine's job: it owns that object, and a worker that
+    edited its own copy would be a second opinion nobody reads.
+    """
     t = tier(FakeCodec(get_ok=False))
-    t.index.confirm_spill(11)
     t.submit_load("req-a", 11, group=3)
     t.drain()
     assert t.get_finished() == (set(), {"req-a"})
-    assert 11 not in t.index.hashes
+
+
+def test_a_load_that_was_never_attempted_can_still_be_failed():
+    """The no-tier and refused-tier paths need somewhere to send a load they
+    cannot serve. Silence is the one answer the engine cannot recover from:
+    the request is already parked and only a report unparks it."""
+    t = tier(FakeCodec())
+    t.fail_loads(["req-a", "req-b"])
+    assert t.get_finished() == (set(), {"req-a", "req-b"})
 
 
 def test_get_finished_drains():
@@ -140,7 +132,6 @@ def test_inflight_is_empty_after_drain():
     """After drain(), _inflight must be empty — every completed future must
     have been discarded, not accumulated for the lifetime of the process."""
     t = tier(FakeCodec())
-    t.index.confirm_spill(11)
     t.submit_spill(11, entry_index=64, staging_slot=0)
     t.submit_load("req-a", 11, group=3)
     t.drain()
@@ -156,8 +147,6 @@ def test_inflight_does_not_grow_on_get_finished_path():
     drains in drain()) and this test fails because _inflight keeps growing.
     """
     t = tier(FakeCodec())
-    t.index.confirm_spill(11)
-    t.index.confirm_spill(22)
     for req_id in ("req-1", "req-2", "req-3"):
         t.submit_load(req_id, 11, group=0)
         # Allow the worker thread to finish so the callback fires before we
@@ -190,7 +179,7 @@ class ReportingCodec:
 
 
 def test_a_landed_spill_is_reported_not_applied():
-    tier = StateOffloadTier(ReportingCodec(ok=True), index=None)
+    tier = StateOffloadTier(ReportingCodec(ok=True))
     tier.submit_spill(11, entry_index=5, staging_slot=1)
     tier.drain()
     indexed, released, index_failed = tier.take_spill_reports()
@@ -201,7 +190,7 @@ def test_a_refused_spill_still_releases_its_slot():
     """`put` returning False is normal backpressure (LMCache allocator under
     pressure), not an error -- but the slot must come back either way or the
     ring shrinks permanently."""
-    tier = StateOffloadTier(ReportingCodec(ok=False), index=None)
+    tier = StateOffloadTier(ReportingCodec(ok=False))
     tier.submit_spill(11, entry_index=5, staging_slot=1)
     tier.drain()
     indexed, released, index_failed = tier.take_spill_reports()
@@ -213,7 +202,7 @@ def test_a_throwing_codec_still_releases_its_slot():
         def put(self, h, entry_index):
             raise RuntimeError("storage down")
 
-    tier = StateOffloadTier(Boom(), index=None)
+    tier = StateOffloadTier(Boom())
     tier.submit_spill(11, entry_index=5, staging_slot=1)
     tier.drain()
     indexed, released, index_failed = tier.take_spill_reports()
@@ -221,7 +210,7 @@ def test_a_throwing_codec_still_releases_its_slot():
 
 
 def test_reports_are_drained_once():
-    tier = StateOffloadTier(ReportingCodec(), index=None)
+    tier = StateOffloadTier(ReportingCodec())
     tier.submit_spill(11, entry_index=5, staging_slot=1)
     tier.drain()
     tier.take_spill_reports()
@@ -242,7 +231,7 @@ def test_the_ready_event_is_waited_on_before_the_pack():
 
     ev = RecordingEvent()
     codec = ReportingCodec()
-    tier = StateOffloadTier(codec, index=None)
+    tier = StateOffloadTier(codec)
     tier.submit_spill(11, entry_index=5, staging_slot=1, ready_event=ev)
     tier.drain()
     assert ev.synchronized, "spill packed without waiting on the producer event"
@@ -263,7 +252,7 @@ def test_failed_put_returns_false_lands_hash_in_index_failed():
     Non-vacuousness: remove the `else: self._index_failed.add(int(h))` branch
     from _do_spill and this test fails because index_failed is empty.
     """
-    tier = StateOffloadTier(ReportingCodec(ok=False), index=None)
+    tier = StateOffloadTier(ReportingCodec(ok=False))
     tier.submit_spill(11, entry_index=5, staging_slot=1)
     tier.drain()
     indexed, released, index_failed = tier.take_spill_reports()
@@ -283,7 +272,7 @@ def test_raising_codec_lands_hash_in_index_failed():
         def put(self, h, entry_index):
             raise OSError("storage unavailable")
 
-    tier = StateOffloadTier(RaisingCodec(), index=None)
+    tier = StateOffloadTier(RaisingCodec())
     tier.submit_spill(22, entry_index=7, staging_slot=3)
     tier.drain()
     indexed, released, index_failed = tier.take_spill_reports()
@@ -301,7 +290,7 @@ def test_state_staging_released_unconditional_on_failed_spill():
     Non-vacuousness: condition the `_released.add` on `stored` and this test
     fails because released is empty after a put=False run.
     """
-    tier = StateOffloadTier(ReportingCodec(ok=False), index=None)
+    tier = StateOffloadTier(ReportingCodec(ok=False))
     for slot in range(4):
         tier.submit_spill(slot, entry_index=slot, staging_slot=slot)
     tier.drain()

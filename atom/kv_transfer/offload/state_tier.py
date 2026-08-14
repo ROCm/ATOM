@@ -29,9 +29,18 @@ logger = logging.getLogger(__name__)
 
 
 class StateOffloadTier:
-    def __init__(self, codec, index, *, max_workers: int = 1) -> None:
+    """Moves bytes; decides nothing, records nothing.
+
+    There is deliberately no index here. `StateOffloadIndex` lives in the
+    engine process and this runs in a spawned runner, so every counter and
+    every hash retraction the load path needs is applied there, from the
+    reports below. Both directions therefore have the same shape -- the worker
+    reports, the engine applies -- and neither can hold a second opinion about
+    what is stored.
+    """
+
+    def __init__(self, codec, *, max_workers: int = 1) -> None:
         self.codec = codec
-        self.index = index
         self._executor = ThreadPoolExecutor(
             max_workers=max_workers, thread_name_prefix="lmc-state"
         )
@@ -78,9 +87,26 @@ class StateOffloadTier:
         self._register(fut)
 
     def submit_load(self, req_id: str, h: int, group: int) -> None:
-        self.index.loads_attempted += 1
+        """Fetch `h` into pool group `group` for the parked request `req_id`.
+
+        On its own executor, and that is the point of having two: a load is on
+        the TTFT critical path -- a request is parked waiting for exactly this
+        -- and must not queue behind a backlog of fire-and-forget spills.
+        """
         fut = self._executor.submit(self._do_load, req_id, h, group)
         self._register(fut)
+
+    def fail_loads(self, req_ids) -> None:
+        """Report loads that were never attempted as failed.
+
+        For the caller that has nowhere to send them -- a tier that refused to
+        build, a connector that cannot serve. Silence there is the one outcome
+        the engine cannot recover from: the request is already parked and only
+        a report unparks it. `failed_loading` means "wake and recompute over
+        the blocks already allocated", which is the right answer.
+        """
+        with self._lock:
+            self._failed.update(req_ids)
 
     def drain(self) -> None:
         """Block until every submitted transfer has settled. Tests and shutdown
@@ -147,6 +173,11 @@ class StateOffloadTier:
         # A load target is a real pool group, not a staging entry: the bytes
         # land where the resuming request will read them. Only the spill
         # direction needs the staging indirection.
+        #
+        # A miss is a normal path, not an error: LMCache's LRU can drop bytes
+        # under a hash the engine's index still advertises. Retracting that
+        # claim is the engine's job -- it owns the index -- and it does it from
+        # the report below.
         ok = False
         try:
             ok = bool(self.codec.get(h, group))
@@ -156,9 +187,6 @@ class StateOffloadTier:
             if ok:
                 self._done.add(req_id)
             else:
-                self.index.loads_failed += 1
-                # So the next request does not repeat the attempt.
-                self.index.forget(h)
                 self._failed.add(req_id)
 
 
