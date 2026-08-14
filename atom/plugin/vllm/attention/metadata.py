@@ -1481,7 +1481,12 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         # it blocks on all previous kernels.
         device = self.device
         block_table_tensor = common_attn_metadata.block_table_tensor
-        slot_mapping = common_attn_metadata.slot_mapping
+        # vLLM hands out a slot mapping padded to the CUDA Graph bucket while
+        # query rows are counted unpadded, and expects its consumers to trim it
+        # (its own CommonAttentionMetadata slicing does exactly this). The MLA
+        # cache-store kernels take the token count from this tensor, so an
+        # untrimmed one makes them walk past the queries they were given.
+        slot_mapping = common_attn_metadata.slot_mapping[:num_tokens]
 
         query_start_loc = common_attn_metadata.query_start_loc
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
