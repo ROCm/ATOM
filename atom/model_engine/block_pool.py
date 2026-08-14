@@ -89,7 +89,7 @@ class BlockPool:
         # Reusable content this pool destroyed, split by what destroyed it.
         # Both are evictions in the sense that a later prefix hit is now
         # impossible, and they read the same in a hit rate, but they want
-        # opposite fixes — the same reason `StateGroupPool` keeps `evicted`
+        # opposite fixes — the same reason `StateSlotPool` keeps `evicted`
         # and `orphaned` apart:
         #   `blocks_evicted`  the pool was out of vacant blocks and spent a
         #                     cached one. Says the paged pool is too small.

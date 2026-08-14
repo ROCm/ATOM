@@ -67,8 +67,8 @@ class TestBlockManagerPerReqCacheSlots:
         bm = BlockManager(per_req_cache_config())
         seq = stateful_seq([1, 2, 3, 4])
         bm.allocate(seq)
-        assert seq.per_req_cache_group >= 0
-        assert seq.per_req_cache_group < 8
+        assert seq.state_slot >= 0
+        assert seq.state_slot < 8
         assert bm.state.num_free() == 7
 
     def test_allocate_claims_slot_no_extra_blocks(self):
@@ -83,7 +83,7 @@ class TestBlockManagerPerReqCacheSlots:
         bm.allocate(seq)
         # Only the 1 KV block is deducted — no equiv-block competition.
         assert bm.kv.num_free == initial_free - 1
-        assert seq.per_req_cache_group >= 0
+        assert seq.state_slot >= 0
         assert bm.state.num_free() == 7
 
     def test_deallocate_returns_slot_and_blocks(self):
@@ -92,7 +92,7 @@ class TestBlockManagerPerReqCacheSlots:
         seq = stateful_seq([1, 2, 3, 4])
         bm.allocate(seq)
         bm.deallocate(seq)
-        assert seq.per_req_cache_group == -1
+        assert seq.state_slot == -1
         assert bm.kv.num_free == initial_free
         assert bm.state.num_free() == 8
 
@@ -122,7 +122,7 @@ class TestBlockManagerPerReqCacheSlots:
         initial_slots = bm.state.num_free()
         seq = plain_seq([1, 2, 3, 4])
         bm.allocate(seq)
-        assert seq.per_req_cache_group == -1
+        assert seq.state_slot == -1
         assert bm.state.num_free() == initial_slots
 
     def test_multiple_allocate_deallocate(self):
@@ -132,7 +132,7 @@ class TestBlockManagerPerReqCacheSlots:
         slots = set()
         for seq in seqs:
             bm.allocate(seq)
-            slots.add(seq.per_req_cache_group)
+            slots.add(seq.state_slot)
         # All 8 slots used
         assert len(slots) == 8
         assert bm.state.num_free() == 0
@@ -153,13 +153,13 @@ class TestBlockManagerPerReqCacheSlots:
         bm.allocate(s2)
         assert bm.state.num_free() == 0
 
-        slot1 = s1.per_req_cache_group
+        slot1 = s1.state_slot
         bm.deallocate(s1)
         assert bm.state.num_free() == 1
 
         s3 = stateful_seq([9, 10, 11, 12])
         bm.allocate(s3)
-        assert s3.per_req_cache_group == slot1  # reused
+        assert s3.state_slot == slot1  # reused
 
     def test_state_slots_independent_of_kv_pool(self):
         """State slots and the KV block pool are decoupled: a stateful seq
@@ -181,19 +181,19 @@ class TestBlockManagerPerReqCacheSlots:
         assert bm.state.num_free() == 7  # one slot claimed
 
 
-# ── Sequence: per_req_cache_group field ──────────────────────────────────────
+# ── Sequence: state_slots field ──────────────────────────────────────────────
 
 
 class TestSequencePerReqCacheSlot:
 
     def test_default_slot_negative(self):
         seq = Sequence([1, 2, 3], 4, has_per_req_cache=True)
-        assert seq.per_req_cache_group == -1
+        assert seq.state_slot == -1
         assert seq.has_per_req_cache is True
 
     def test_plain_seq_no_slot(self):
         seq = Sequence([1, 2, 3], 4, has_per_req_cache=False)
-        assert seq.per_req_cache_group == -1
+        assert seq.state_slot == -1
         assert seq.has_per_req_cache is False
 
     def test_no_legacy_num_mamba_blocks(self):
@@ -203,14 +203,14 @@ class TestSequencePerReqCacheSlot:
         assert not hasattr(seq, "num_mamba_blocks")
 
 
-# ── ScheduledBatch: per_req_cache_groups ─────────────────────────────────────
+# ── ScheduledBatch: state slot columns ───────────────────────────────────────
 
 
 class TestScheduledBatchPerReqCacheSlots:
 
     def test_per_req_cache_slots_collected(self):
         s1 = stateful_seq([1, 2, 3, 4])
-        s1.per_req_cache_group = 3
+        s1.state_slot = 3
         s1.status = s1.status  # keep as WAITING
         s2 = plain_seq([5, 6, 7, 8])
         seqs = {s1.id: s1, s2.id: s2}
@@ -221,7 +221,8 @@ class TestScheduledBatchPerReqCacheSlots:
             total_seqs_num=2,
             total_seqs_num_prefill=2,
         )
-        assert batch.per_req_cache_groups == [3]
+        assert batch.state_slots == [[3]]
+        assert batch.state_slots_committed == [3]
 
     def test_no_stateful_seqs(self):
         s1 = plain_seq([1, 2, 3, 4])
@@ -233,7 +234,7 @@ class TestScheduledBatchPerReqCacheSlots:
             total_seqs_num=1,
             total_seqs_num_prefill=1,
         )
-        assert batch.per_req_cache_groups == []
+        assert batch.state_slots == []
 
 
 # ── State index mapping ──────────────────────────────────────────────────
@@ -285,8 +286,8 @@ class TestSchedulerPerReqCacheIntegration:
         sched.add(seq)
         batch, _ = sched.schedule()
         assert batch.total_seqs_num_prefill == 1
-        assert seq.per_req_cache_group >= 0
-        assert len(batch.per_req_cache_groups) == 1
+        assert seq.state_slot >= 0
+        assert len(batch.state_slots) == 1
 
     def test_preempt_releases_slot(self):
         """Preempted stateful sequence releases its per-req cache slot."""
@@ -294,10 +295,10 @@ class TestSchedulerPerReqCacheIntegration:
         seq = stateful_seq([1, 2, 3, 4])
         sched.add(seq)
         sched.schedule()
-        assert seq.per_req_cache_group >= 0
+        assert seq.state_slot >= 0
         initial_slots = sched.block_manager.state.num_free()
         sched.preempt(seq)
-        assert seq.per_req_cache_group == -1
+        assert seq.state_slot == -1
         assert sched.block_manager.state.num_free() == initial_slots + 1
 
     def test_slot_exhaustion_blocks_prefill(self):

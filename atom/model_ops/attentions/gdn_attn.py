@@ -320,11 +320,19 @@ class GDNStateMixin:
         Concrete builders splice this into their `sub_pool_specs()` alongside
         whatever paged KV pool they own.
 
-        `--state-checkpoint-groups` buys entries beyond the in-flight floor.
-        Without it a retained checkpoint can only sit in a group `max_num_seqs`
+        `--state-checkpoint-slots` buys entries beyond the in-flight floor.
+        Without it a retained checkpoint can only sit in a slot `max_num_seqs`
         left spare, so the room to keep one is set by concurrency rather than
         by how much reuse the traffic has — the reason a *lower* max_num_seqs
         measures a *worse* hit rate on prefix-reusing traffic.
+
+        The extra entries are counted one per checkpoint, NOT `spr` each: a
+        checkpoint only ever holds a committed state, and the `num_spec`
+        rollback slots beside it are scratch a resumed prefix has no use for.
+        At `--num-speculative-tokens 2` that is the difference between a
+        checkpoint costing three slots and costing one, and the slots it does
+        not take stay available to the KV cache, which is sized out of what is
+        left after this.
         """
         shape_k, shape_v = self._state_shape_for_runner()
         dt_k, dt_v = self._state_dtypes()
@@ -332,12 +340,12 @@ class GDNStateMixin:
             math.prod(shape_k) * dt_k.itemsize + math.prod(shape_v) * dt_v.itemsize
         )
         spr = 1 + self.num_spec
-        extra = max(0, getattr(self.model_runner.config, "state_checkpoint_groups", 0))
+        extra = max(0, getattr(self.model_runner.config, "state_checkpoint_slots", 0))
         return state_pool(
             STATE_SLOT_CLASS,
             self.model_runner.num_gdn_attn_state * per_layer,
             entries_per_req=spr,
-            extra_entries=extra * spr,
+            extra_entries=extra,
         )
 
     def allocate_per_req_cache(
@@ -362,28 +370,29 @@ class GDNStateMixin:
         }
 
     def relocate_state_slots(self, pairs: Sequence[tuple[int, int]]) -> None:
-        """Relocate a live GDN group between logical Active Slot spans.
+        """Relocate one slot's whole GDN state, both families, all layers.
 
-        A group is `1 + num_spec` consecutive slots — the extra ones hold the
-        per-draft states a rejected speculation rolls back to — so a group moves
-        as that whole span or the rollback slots go with the wrong owner.
+        A slot is one complete recurrent state and moves on its own. A request
+        holding several — a committed state plus `num_spec` rollback slots —
+        is several such moves, and the caller names each one, because nothing
+        about the set is contiguous.
 
         GDN checkpoints by forking, not by copying, so this is not on the
         checkpoint path: it exists because moving the pool's boundary has to be
-        able to relocate a group that is in the way.
+        able to relocate a slot that is in the way, and relocation is a byte
+        move whatever mechanism the class uses to checkpoint. A backend
+        declaring `StateTransfer.fork` therefore still owes this method.
 
-        Both caches are layer-major with the slot as the second axis, so a
-        group's rows are strided rather than contiguous and there is no single
+        Both caches are layer-major with the slot as the second axis, so one
+        slot's rows are strided rather than contiguous and there is no single
         range to copy. `_foreach_copy_` keeps it to one launch for the batch.
         """
-        span = 1 + self.num_spec
         caches = (self.model_runner.mamba_k_cache, self.model_runner.mamba_v_cache)
         destinations, sources = [], []
-        for src_group, dst_group in pairs:
-            src_slot, dst_slot = src_group * span, dst_group * span
+        for src, dst in pairs:
             for cache in caches:
-                destinations.append(cache[:, dst_slot : dst_slot + span])
-                sources.append(cache[:, src_slot : src_slot + span])
+                destinations.append(cache[:, dst])
+                sources.append(cache[:, src])
         if destinations:
             torch._foreach_copy_(destinations, sources)
 
@@ -393,10 +402,10 @@ class GDNStateMixin:
         Every reserved position this step covers, `cached < p <= cached +
         scheduled`, is a target — INCLUDING one at the step's end. That end
         case needs its own copy like any other: the chunk kernel leaves the
-        final state in the sequence's RUNTIME slot, and a checkpoint group is
-        never the runtime group. Assuming otherwise leaves the checkpoint
+        final state in the sequence's RUNTIME slot, and a checkpoint slot is
+        never the runtime slot. Assuming otherwise leaves the checkpoint
         unwritten while `commit_midstep` publishes it anyway, so a later
-        request resumes from whatever the group's previous tenant left behind.
+        request resumes from whatever the slot's previous tenant left behind.
 
         `is_end` marks those targets, because their source differs: the state
         at the end of a sequence's tokens is not in `h`, which holds chunk
@@ -423,12 +432,11 @@ class GDNStateMixin:
         wrong, and worse than no checkpoint at all, because it is findable.
 
         Slots, not a separate checkpoint region: a checkpoint here IS an
-        ordinary pool group, so its destination is `group * slots_per_req`,
-        the same arithmetic every other slot on this path uses. (The upstream
-        branch appends checkpoints after the runtime slots and offsets them by
-        a `state_cache_base`; that region does not exist in this pool.) Only
-        the group's first slot is written — the extra `num_spec` slots are
-        speculation rollback state, which a resumed prefix has no use for.
+        ordinary pool slot, indexed exactly as every other slot on this path
+        is. (The upstream branch appends checkpoints after the runtime slots
+        and offsets them by a `state_cache_base`; that region does not exist
+        in this pool.) One slot is the whole checkpoint — a resumed prefix has
+        no speculation to roll back, so it needs no scratch beside it.
         """
         all_saves = getattr(batch, "state_save_all", None)
         if not all_saves:
@@ -438,20 +446,19 @@ class GDNStateMixin:
         state_len = self.model_runner.config.hf_config.linear_conv_kernel_dim - 1
         cached = batch.num_cached_tokens
         sched = batch.num_scheduled_tokens
-        groups = batch.per_req_cache_groups
-        spr = 1 + self.num_spec
+        runtime_slots = batch.state_slots_committed
         limit = self.model_runner.mamba_k_cache.shape[1]
 
         found = []
         # A seq may hold several reservations (a grid rung, a demand, the
         # prompt-end anchor); take every one this step reaches.
         for i, reservations in enumerate(all_saves):
-            if i >= len(groups):
+            if i >= len(runtime_slots):
                 continue
             start = int(cached[i])
             end = start + int(sched[i])
-            for dst_group, p in reservations:
-                dst = int(dst_group) * spr
+            for dst_slot, p in reservations:
+                dst = int(dst_slot)
                 p = int(p)
                 # `dst >= limit` would mean the scheduler's pool outgrew this
                 # rank's tensor; skipping degrades to "no checkpoint", which
@@ -460,7 +467,7 @@ class GDNStateMixin:
                     continue
                 if not (start + state_len <= p <= end):
                     continue
-                found.append((i, dst, p - start, int(p == end), groups[i] * spr))
+                found.append((i, dst, p - start, int(p == end), runtime_slots[i]))
         if not found:
             return None
 
@@ -477,33 +484,38 @@ class GDNStateMixin:
         }
 
     def prepare_state_indices(self, batch: ScheduledBatch, with_spec: bool = False):
+        """Fill the index tensors the GDN kernels gather their state through.
+
+        The seq's own slot list is written straight in — no base, no stride.
+        The pool hands out slots one at a time and a request's set is not
+        adjacent; the kernels never assumed it was (the ssm kernel loads each
+        index out of this tensor, and the conv path is handed column 0 alone),
+        so this is where a contiguity assumption would have been *invented*
+        rather than a place one has to be honoured.
+        """
         non_spec_state_indices = self.non_spec_state_indices_tensor.np
         non_spec_state_indices_in = self.non_spec_state_indices_in_tensor.np
         spec_state_indices = self.spec_state_indices_tensor.np
-        slots_per_group = 1 + self.num_spec
         fork_srcs = getattr(batch, "state_fork_srcs", None) or ()
         assert not (with_spec and any(s >= 0 for s in fork_srcs)), (
             "state fork on the spec-decode path: spec_state_indices_tensor has "
             "no read-side counterpart (BlockManager only forks onto prefill)"
         )
-        for idx, slot_group in enumerate(batch.per_req_cache_groups):
+        for idx, slots in enumerate(batch.state_slots):
             non_spec_state_indices[idx] = 0
             non_spec_state_indices_in[idx] = 0
             spec_state_indices[idx] = 0
-            base = slot_group * slots_per_group
+            committed = slots[0]
 
             if not with_spec:
-                non_spec_state_indices[idx] = base
-                # A forked seq reads the group it published (or resumed from)
-                # and writes the fresh one for this forward only.
+                non_spec_state_indices[idx] = committed
+                # A forked seq reads the slot it published (or resumed from)
+                # and writes the fresh one for this forward only. The source is
+                # a checkpoint, which is one slot, so it needs no translation.
                 src = fork_srcs[idx] if idx < len(fork_srcs) else -1
-                non_spec_state_indices_in[idx] = (
-                    src * slots_per_group if src >= 0 else base
-                )
+                non_spec_state_indices_in[idx] = src if src >= 0 else committed
             else:
-                spec_state_indices[idx, : 1 + self.num_spec] = np.arange(
-                    base, base + 1 + self.num_spec
-                )
+                spec_state_indices[idx, : len(slots)] = slots
 
     def prepare_num_accepted_tokens(self, batch: ScheduledBatch):
         self.num_accepted_tokens.fill_(1)

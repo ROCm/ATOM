@@ -51,7 +51,7 @@ class EngineArgs:
     long_prefill_token_threshold: int = 0
     attn_prefill_chunk_size: int = 16384
     state_checkpoint_interval_tokens: int = 8192
-    state_checkpoint_groups: int = 0
+    state_checkpoint_slots: int = 0
     state_checkpoint_demand: bool = True
     enable_chunked_prefill: bool = True
     scheduler_delay_factor: float = 0.0
@@ -361,18 +361,22 @@ class EngineArgs:
             ),
         )
         parser.add_argument(
+            "--state-checkpoint-slots",
             "--state-checkpoint-groups",
+            dest="state_checkpoint_slots",
             type=int,
             default=0,
             help=(
-                "Extra per-request state entries to size the STATE pool with, "
-                "beyond the one set each in-flight request needs. Checkpoints "
-                "and live requests share one pool, so without this the room to "
-                "retain a checkpoint is whatever max_num_seqs happens to leave "
-                "— which is why lowering max_num_seqs lowers the hit rate on "
-                "traffic that reuses prefixes. 0 keeps the old coupling. "
-                "Costs the model's per-request state bytes per group, taken "
-                "out of the paged KV pool."
+                "Extra state slots to size the STATE pool with, beyond what the "
+                "in-flight requests need. Checkpoints and live requests share "
+                "one pool, so without this the room to retain a checkpoint is "
+                "whatever max_num_seqs happens to leave — which is why lowering "
+                "max_num_seqs lowers the hit rate on traffic that reuses "
+                "prefixes. 0 keeps the old coupling. One slot per checkpoint, "
+                "whatever --num-speculative-tokens says: a checkpoint holds a "
+                "committed state and has no speculation to roll back. Costs the "
+                "model's per-slot state bytes, taken out of the paged KV pool. "
+                "--state-checkpoint-groups is the old spelling, still accepted."
             ),
         )
         parser.add_argument(
