@@ -1,5 +1,6 @@
-# Default base image
-ARG BASE_IMAGE="rocm/pytorch:latest"
+# Keep the release reproducible on the ROCm 7.2.4 / PyTorch 2.10 stack.
+# The digest prevents this historical tag from being moved underneath us.
+ARG BASE_IMAGE="rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0"
 ARG GPU_ARCH="gfx942;gfx950"
 
 # ====================================================================
