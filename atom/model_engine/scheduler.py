@@ -691,10 +691,6 @@ class Scheduler:
         # Cache the env flag once (env vars are fixed at process start) so the
         # per-iteration compute_detailed_aggregates never pays an os.getenv.
         self._detailed_annotation_enabled = envs.ATOM_ENABLE_DETAILED_ANNOTATION
-        self._log_prefix_cache_per_req = envs.ATOM_LOG_PREFIX_CACHE_PER_REQ
-        self._per_req_evicted_base = 0
-        self._last_pool_log_time = 0.0
-
         self.enable_chunked_prefill = config.enable_chunked_prefill
         # Running seqs currently mid-prefill; counter lets schedule() skip the
         # running-queue scan on pure-decode steps.
@@ -1072,19 +1068,6 @@ class Scheduler:
         self._promote_ready_remote_kv_requests()
         self._park_ready_offload_partial_prefills()
 
-        # Pool occupancy heartbeat (every 30s, gated by per-req log flag).
-        if self._log_prefix_cache_per_req and self.block_manager.enable_prefix_caching:
-            now = time.time()
-            if now - self._last_pool_log_time >= 30.0:
-                self._last_pool_log_time = now
-                occ = self.block_manager.pool_occupancy()
-                total = occ["total"] or 1
-                logger.info(
-                    f"[Cache Pool Tick] used {occ['used']} ({occ['used'] * 100 // total}%), "
-                    f"free {occ['free']}, retained-cache {occ['retained']}, "
-                    f"evicted total {occ['evicted_total']}"
-                )
-
         # should_allow_prefill() runs a cross-DP all_reduce and MUST be called
         # every tick on every rank for lockstep — hence before the early-return.
         if self.prefill_delayer is not None:
@@ -1290,9 +1273,6 @@ class Scheduler:
                 seq.prefix_cache_hit_tokens = (
                     num_cached_blocks * self.block_manager.block_size
                 )
-
-            if self._log_prefix_cache_per_req:
-                self._log_prefix_cache_admission(seq, num_cached_blocks)
 
             self._notify_connector_after_prefill_alloc(seq)
 
@@ -1779,23 +1759,6 @@ class Scheduler:
         assert chunk > 0, (
             f"chunk must be positive: {chunk=}, "
             f"{num_new_tokens=}, {budget_remaining=}"
-        )
-
-    def _log_prefix_cache_admission(
-        self, seq: Sequence, num_cached_blocks: int
-    ) -> None:
-        """Per-request prefix hit log (ATOM_LOG_PREFIX_CACHE_PER_REQ)."""
-        bs = self.block_manager.block_size
-        cached = num_cached_blocks * bs
-        prompt = seq.num_tokens
-        occ = self.block_manager.pool_occupancy()
-        evicted_delta = occ["evicted_total"] - self._per_req_evicted_base
-        self._per_req_evicted_base = occ["evicted_total"]
-        logger.info(
-            f"[Prefix Req] req {seq.id}: prompt {prompt}, cached {cached} "
-            f"({cached / prompt if prompt else 0:.1%}), "
-            f"free {occ['free']}, retained-cache {occ['retained']}, "
-            f"evicted-since-last-req {evicted_delta}"
         )
 
     def _schedule_prefill_seq(
@@ -2477,9 +2440,9 @@ class Scheduler:
         # Offload/LMCache path skipped — suffix KV not yet computed.
         if prefix_caching and not self._connector_flag("is_offload"):
             registered = bm.register_received_prefix(seq)
-            if self._log_prefix_cache_per_req and registered:
+            if registered:
                 bs = bm.block_size
-                logger.info(
+                logger.debug(
                     "[PD Incremental] req %s: prompt %d blocks, reused-local %d "
                     "(%d tok), delta-received %d (%d tok)",
                     seq.id,
