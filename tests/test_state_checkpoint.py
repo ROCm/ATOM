@@ -905,6 +905,33 @@ class TestCheckpointsDieWithTheirPrefix:
         assert pool.lookup_group(10) == 0
         assert pool.checkpoint_fates()["checkpoints_orphaned"] == 0
 
+    def test_a_thrashing_pool_reports_no_drops_at_all(self):
+        """`checkpoints_dropped` is not the capacity signal it looks like.
+
+        Take four times as many checkpoints as the pool can hold, each one
+        returned to the free list the way a finished request returns its
+        group. `pop` never refuses — it spends the LRU checkpoint — so this
+        pool overwrites rather than turning anything away, and `dropped`
+        stays 0 through the whole thrash.
+
+        Read `checkpoints_evicted` against `kept - num_groups` instead. On
+        hardware that identity held exactly (kept 198, evicted 166, 32 groups)
+        at the moment the state hit rate fell 6 points, while the 0 in
+        `dropped` was read as proof the pool had room to spare.
+        """
+        pool = StateGroupPool(4)
+        for h in range(16):
+            group = pool.pop()
+            pool.release(group)
+            pool._index(h, group)
+
+        fates = pool.checkpoint_fates()
+        assert fates["checkpoints_dropped"] == 0
+        assert pool.num_free() == 4  # never once out of groups to hand out
+        # 16 taken, 4 resident: every other one was destroyed for space.
+        assert fates["checkpoints_evicted"] == 16 - 4
+        assert sum(1 for h in range(16) if pool.lookup(h) != -1) == 4
+
 
 # ── The scheduler side: what a checkpoint costs the publisher ──────────────
 
