@@ -1,6 +1,8 @@
 import functools
 import logging
 
+from atom.utils import envs
+
 logger = logging.getLogger("atom")
 
 
@@ -66,6 +68,77 @@ def _patch_eagle3_model_type_checks() -> None:
 
     llm_base_proposer._atom_eagle3_model_types_patched = True
     logger.info("ATOM plugin: patched vLLM EAGLE3 proposer type checks.")
+
+
+def _patch_dspark_fused_markov_sample() -> None:
+    """Sample the DSpark block with the fused Markov bias+argmax kernel.
+
+    vLLM's ``_sample_sequential`` spells each block position as
+    ``argmax(base_logits[:, i] + markov_bias(markov_embed(prev)))``, which per
+    position casts the whole ``[V, r]`` W2 table to fp32, materializes a
+    ``[B, V]`` fp32 bias and a ``[B, V]`` fp32 sum, and reads the sum back --
+    ~566MB of traffic at B=64, V=163840, all so an argmax can pick one id.
+    ``model.markov_argmax`` does the same thing in one fused kernel plus a tiny
+    cross-tile reduce (~106MB), with W2 left bf16 and no ``[B, V]`` tensor.
+
+    Only the greedy branch. The probabilistic branch feeds ``gumbel_sample``,
+    which both samples from the logits and writes the processed logits out for
+    the target's rejection sampler, so it needs them materialized -- it is
+    delegated to upstream's loop verbatim rather than reimplemented here, which
+    also keeps that path from drifting as vLLM changes it.
+
+    Gated because the bias GEMV moves from an fp32 matmul to bf16 MFMA with an
+    fp32 accumulator: equal up to accumulation order, not bit-identical. The
+    gate is read here, at plugin-load time, so a disabled gate leaves vLLM's
+    method untouched rather than adding a per-position branch to it.
+
+    Capture-safe: the loop keeps upstream's shape and buffer discipline (fixed
+    persistent index buffers, ``num_reqs`` a host int baked into each captured
+    graph), and the op itself has host-int grids, no ``.item()`` and no
+    data-dependent shapes. Plugin patches are installed from the
+    ``vllm.general_plugins`` entry point, which runs in worker init -- before
+    the draft model is loaded and long before graph capture.
+    """
+    if not envs.ATOM_DSPARK_FUSED_MARKOV_SAMPLE:
+        return
+    try:
+        from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+    except ImportError:
+        return
+
+    original_sample = DSparkSpeculator._sample_sequential
+    if getattr(original_sample, "_atom_dspark_fused_markov_patched", False):
+        return
+
+    @functools.wraps(original_sample)
+    def wrapped_sample_sequential(self, num_reqs: int, head_hidden):
+        markov_argmax = getattr(self.model, "markov_argmax", None)
+        if markov_argmax is None or self.draft_logits is not None:
+            return original_sample(self, num_reqs, head_hidden)
+
+        n_spec = self.num_speculative_steps
+        num_sample = num_reqs * n_spec
+        sample_hidden = head_hidden[self.sample_indices[:num_sample]]
+        base_logits = self.model.compute_draft_logits(sample_hidden)
+        base_logits = base_logits.view(num_reqs, n_spec, base_logits.shape[-1])
+        # Anchor (bonus) token per request, read through upstream's precomputed
+        # persistent index so the capture sees a fixed buffer.
+        prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
+        for i in range(n_spec):
+            # map_draft_to_target is kept in the loop, not just on the output:
+            # upstream feeds the MAPPED id back as the next step's Markov
+            # conditioning token, and that ordering is part of the draft.
+            prev = self.model.map_draft_to_target(
+                markov_argmax(base_logits[:, i], prev)
+            )
+            self.draft_tokens[:num_reqs, i] = prev
+
+    wrapped_sample_sequential._atom_dspark_fused_markov_patched = True
+    DSparkSpeculator._sample_sequential = wrapped_sample_sequential
+    logger.info(
+        "ATOM plugin: sampling the DSpark block with the fused Markov "
+        "bias+argmax kernel (greedy drafting only)."
+    )
 
 
 def _get_attn_backend_block_size(backend) -> int:
@@ -566,6 +639,7 @@ def _patch_vllm_deepseek_v4_mtp_first_pass_inputs() -> None:
 
 def apply_vllm_spec_decode_patch() -> None:
     """Patch vLLM speculative decoding for ATOM metadata compatibility."""
+    _patch_dspark_fused_markov_sample()
     _patch_vllm_llm_base_model_sharing()
     _patch_vllm_draft_kv_group_validation()
     _patch_vllm_draft_positions_on_metadata()
