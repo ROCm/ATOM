@@ -20,7 +20,10 @@ from conftest import MockConfig
 
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.block_pool import BlockPool
-from atom.model_engine.page_unit_checkpoint import PageUnitCheckpointStore
+from atom.model_engine.page_unit_checkpoint import (
+    PagedStateCheckpointSpec,
+    PageUnitCheckpointStore,
+)
 from atom.model_engine.scheduler import CacheStats, ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import Sequence, SequenceType
 from atom.model_engine.state_cache import StateCache
@@ -28,6 +31,7 @@ from atom.model_engine.state_pool import StateGroupPool, StateTransfer
 
 BLOCK = 4
 MIN_FORK = 8
+PAGED_COPY_SPEC = PagedStateCheckpointSpec(10, 25, "test-layout-v1")
 
 
 def ckpt_config(**overrides):
@@ -836,14 +840,8 @@ class TestPrefillChunkAlignment:
 
 def paged_copy_config(**overrides):
     defaults = {
-        # Small synthetic byte geometry; these control-plane tests do not
-        # allocate DSV4 tensors, but exercise the same K-unit protocol.
         "state_transfer_kind": "copy",
         "state_fork_tokens": 0,
-        "paged_state_page_unit_bytes": 10,
-        "paged_state_slot_bytes": 25,
-        "paged_state_units_per_checkpoint": 3,
-        "paged_state_layout_id": "test-layout-v1",
     }
     defaults.update(overrides)
     return ckpt_config(**defaults)
@@ -855,8 +853,36 @@ class TestPagedCopyCheckpoint:
         bm.allocate(seq, bm.can_allocate(seq))
         return seq
 
+    def test_runtime_spec_is_explicit_from_wire_through_scheduler(self):
+        config = paged_copy_config()
+        engine_spec = PagedStateCheckpointSpec.from_wire(PAGED_COPY_SPEC.to_wire())
+
+        scheduler = Scheduler(
+            config,
+            paged_state_checkpoint_spec=engine_spec,
+        )
+
+        assert scheduler.block_manager.page_checkpoints.spec is engine_spec
+        assert scheduler.block_manager.page_checkpoints.units_per_checkpoint == 3
+        assert not any(
+            hasattr(config, field)
+            for field in (
+                "paged_state_page_unit_bytes",
+                "paged_state_slot_bytes",
+                "paged_state_units_per_checkpoint",
+                "paged_state_layout_id",
+            )
+        )
+
+    def test_copy_transfer_without_runtime_spec_fails_fast(self):
+        with pytest.raises(ValueError, match="runtime paged-state geometry"):
+            BlockManager(paged_copy_config())
+
     def test_checkpoint_uses_page_units_not_an_active_slot(self):
-        bm = BlockManager(paged_copy_config())
+        bm = BlockManager(
+            paged_copy_config(),
+            paged_state_checkpoint_spec=PAGED_COPY_SPEC,
+        )
         seq = self._admitted(bm)
         free_slots = bm.state.num_free()
         free_pages = bm.kv.num_free
@@ -874,7 +900,10 @@ class TestPagedCopyCheckpoint:
         assert bm.state.lookup(h) >= 0
 
     def test_hit_gathers_into_a_distinct_contiguous_active_slot(self):
-        bm = BlockManager(paged_copy_config())
+        bm = BlockManager(
+            paged_copy_config(),
+            paged_state_checkpoint_spec=PAGED_COPY_SPEC,
+        )
         first = self._admitted(bm)
         bm.hash_blocks(first, bm.checkpoint_limit(first) - first.num_cached_tokens)
         h = boundary_hash(bm, first)
@@ -901,7 +930,11 @@ class TestPagedCopyCheckpoint:
         seq = stateful_seq(list(range(40)))
         seq.type = SequenceType.DECODE
         forking = Scheduler(ckpt_config(state_fork_tokens=1, speculative_config=spec))
-        copying = Scheduler(paged_copy_config(speculative_config=spec))
+        copying = Scheduler(
+            paged_copy_config(speculative_config=spec),
+            paged_state_checkpoint_spec=PAGED_COPY_SPEC,
+        )
+        assert copying.block_manager.page_checkpoints.spec is PAGED_COPY_SPEC
         assert forking._checkpoint_room(seq, False) == 0
         assert copying._checkpoint_room(seq, False) == 1
         assert copying._checkpoint_room(seq, True) == 0
@@ -1158,7 +1191,7 @@ class TestStateCacheProtocol:
         """`resumable_hit`'s fork test is vacuous under `copy`, not skipped."""
         forking = StateGroupPool(4, StateTransfer.fork(4), hash_block_size=1)
         store = PageUnitCheckpointStore(
-            BlockPool(4), unit_bytes=1, slot_bytes=1, layout_id="test-layout"
+            BlockPool(4), PagedStateCheckpointSpec(1, 1, "test-layout")
         )
         copying = StateGroupPool(
             4,

@@ -14,6 +14,7 @@ visible or reclaimable.
 from __future__ import annotations
 
 from collections import OrderedDict
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from atom.model_engine.block_pool import BlockPool
@@ -21,6 +22,60 @@ from atom.model_engine.block_pool import BlockPool
 COPYING = "COPYING"
 READY = "READY"
 EVICTING = "EVICTING"
+
+
+@dataclass(frozen=True)
+class PagedStateCheckpointSpec:
+    """Runtime geometry shared by state-checkpoint producers and consumers.
+
+    The spec is deliberately not part of :class:`Config`: its values only
+    exist after the runner has sized the physical cache pools.  The PAGE count
+    is derived at each consumer so it can never drift from the two byte sizes
+    while crossing a process boundary.
+    """
+
+    page_unit_bytes: int
+    slot_bytes: int
+    layout_id: str
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("page_unit_bytes", self.page_unit_bytes),
+            ("slot_bytes", self.slot_bytes),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if not isinstance(self.layout_id, str) or not self.layout_id:
+            raise ValueError("paged state checkpoints need a non-empty layout id")
+
+    @property
+    def units_per_checkpoint(self) -> int:
+        return (self.slot_bytes + self.page_unit_bytes - 1) // self.page_unit_bytes
+
+    def to_wire(self) -> dict[str, int | str]:
+        """Return the explicit pickle-safe payload used by runner RPC."""
+        return {
+            "page_unit_bytes": self.page_unit_bytes,
+            "slot_bytes": self.slot_bytes,
+            "layout_id": self.layout_id,
+        }
+
+    @classmethod
+    def from_wire(cls, wire: object) -> PagedStateCheckpointSpec:
+        """Rebuild and validate a spec received from another process."""
+        if not isinstance(wire, Mapping):
+            raise TypeError("paged state checkpoint spec must be a mapping")
+        expected = {"page_unit_bytes", "slot_bytes", "layout_id"}
+        if set(wire) != expected:
+            raise ValueError(
+                "invalid paged state checkpoint spec fields: "
+                f"expected={sorted(expected)}, got={sorted(wire)}"
+            )
+        return cls(
+            page_unit_bytes=wire["page_unit_bytes"],  # type: ignore[arg-type]
+            slot_bytes=wire["slot_bytes"],  # type: ignore[arg-type]
+            layout_id=wire["layout_id"],  # type: ignore[arg-type]
+        )
 
 
 @dataclass(frozen=True)
@@ -81,22 +136,13 @@ class PageUnitCheckpointStore:
     def __init__(
         self,
         pool: BlockPool,
-        *,
-        unit_bytes: int,
-        slot_bytes: int,
-        layout_id: str,
+        spec: PagedStateCheckpointSpec,
     ):
-        if unit_bytes <= 0 or slot_bytes <= 0:
-            raise ValueError("PAGE unit and state slot sizes must be positive")
-        if not layout_id:
-            raise ValueError("paged state checkpoints need a layout id")
         self.pool = pool
-        self.unit_bytes = int(unit_bytes)
-        self.slot_bytes = int(slot_bytes)
-        self.layout_id = str(layout_id)
-        self.units_per_checkpoint = (
-            self.slot_bytes + self.unit_bytes - 1
-        ) // self.unit_bytes
+        self.spec = spec
+        self.unit_bytes = spec.page_unit_bytes
+        self.slot_bytes = spec.slot_bytes
+        self.layout_id = spec.layout_id
         self.last_unit_valid_bytes = (
             self.slot_bytes - (self.units_per_checkpoint - 1) * self.unit_bytes
         )
@@ -110,6 +156,11 @@ class PageUnitCheckpointStore:
         self._next_checkpoint_id = 0
         self._next_generation = 1
         self.evictions = 0
+
+    @property
+    def units_per_checkpoint(self) -> int:
+        """Derive the complete-image allocation from this process's spec."""
+        return self.spec.units_per_checkpoint
 
     # ------------------------------ lookup ---------------------------------
     def lookup(self, prefix_hash: int) -> int:

@@ -39,6 +39,7 @@ from atom.distributed.pp_comm import (
 )
 from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
+from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 from atom.model_engine.run_labels import build_run_label
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
@@ -741,6 +742,7 @@ class ModelRunner:
         # builder through paths that ask for their entry counts, and those must
         # read 0 ("no pool yet") rather than trip over a missing attribute.
         self.pool_plan = PoolPlan.empty()
+        self.paged_state_checkpoint_spec: PagedStateCheckpointSpec | None = None
         # Sanity-check: any builder that allocates a per-request cache must
         # have its model_type listed in `InputOutputProcessor`'s
         # `per_req_cache_model_types` set; otherwise sequences will be
@@ -1565,7 +1567,7 @@ class ModelRunner:
             )
         return int(overhead)
 
-    def get_num_blocks(self) -> dict[str, int]:
+    def get_num_blocks(self) -> dict[str, object]:
         torch.set_default_device(self.device)
         config = self.config
         hf_config = config.hf_config
@@ -1688,27 +1690,26 @@ class ModelRunner:
                 "PAGE-backed state checkpoints do not yet support RapidServe "
                 "prefill/decode disaggregation"
             )
+        paged_state_checkpoint_spec = None
         if uses_paged_state:
             if plan.paged_class is None:
                 raise RuntimeError(
                     "PAGE-backed state checkpoints require a PAGE sub-pool"
                 )
-            page_bytes = int(plan.entry_bytes[plan.paged_class])
-            state_bytes = int(plan.entry_bytes[STATE_SLOT_CLASS])
-            config.paged_state_page_unit_bytes = page_bytes
-            config.paged_state_slot_bytes = state_bytes
-            config.paged_state_units_per_checkpoint = math.ceil(
-                state_bytes / page_bytes
+            paged_state_checkpoint_spec = PagedStateCheckpointSpec(
+                page_unit_bytes=int(plan.entry_bytes[plan.paged_class]),
+                slot_bytes=int(plan.entry_bytes[STATE_SLOT_CLASS]),
+                layout_id=str(paged_layout_id),
             )
-            config.paged_state_layout_id = str(paged_layout_id)
             logger.info(
                 "PAGE-backed state checkpoints enabled: unit_bytes=%d, "
                 "slot_bytes=%d, units_per_checkpoint=%d, layout=%s",
-                page_bytes,
-                state_bytes,
-                config.paged_state_units_per_checkpoint,
-                paged_layout_id,
+                paged_state_checkpoint_spec.page_unit_bytes,
+                paged_state_checkpoint_spec.slot_bytes,
+                paged_state_checkpoint_spec.units_per_checkpoint,
+                paged_state_checkpoint_spec.layout_id,
             )
+        self.paged_state_checkpoint_spec = paged_state_checkpoint_spec
         for name in sorted(plan.entries):
             logger.info(
                 f"sub-pool {name}: entries={plan.entries[name]}, "
@@ -1781,14 +1782,13 @@ class ModelRunner:
             "num_kvcache_blocks": num_kvcache_blocks,
             "pool_entries": dict(plan.entries),
             "pool_entries_per_req": dict(plan.entries_per_req),
-            "state_transfer_kind": config.state_transfer_kind,
-            "state_fork_tokens": config.state_fork_tokens,
-            "paged_state_page_unit_bytes": config.paged_state_page_unit_bytes,
-            "paged_state_slot_bytes": config.paged_state_slot_bytes,
-            "paged_state_units_per_checkpoint": (
-                config.paged_state_units_per_checkpoint
+            "state_transfer_kind": transfer.kind,
+            "state_fork_tokens": transfer.fork_tokens,
+            "paged_state_checkpoint_spec": (
+                None
+                if paged_state_checkpoint_spec is None
+                else paged_state_checkpoint_spec.to_wire()
             ),
-            "paged_state_layout_id": config.paged_state_layout_id,
         }
 
     def allocate_kv_cache(self, num_kvcache_blocks):
@@ -4147,7 +4147,7 @@ class RapidServeModelRunner(ModelRunner):
         safety_margin = int(total_bytes * 0.02)
         return 4 * safety_margin
 
-    def get_num_blocks(self) -> dict[str, int]:
+    def get_num_blocks(self) -> dict[str, object]:
         # Decode in disagg mode owns no GPU memory — kvcache is imported from
         # prefill.
         if self.config.disagg_is_decode:

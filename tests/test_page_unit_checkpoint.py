@@ -2,11 +2,17 @@
 
 """Control-plane invariants for PAGE-backed state checkpoint images."""
 
+import pickle
+from dataclasses import FrozenInstanceError
+
+import pytest
+
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.page_unit_checkpoint import (
     COPYING,
     EVICTING,
     READY,
+    PagedStateCheckpointSpec,
     PageUnitCheckpointStore,
 )
 
@@ -14,7 +20,12 @@ from atom.model_engine.page_unit_checkpoint import (
 def make_store(num_units=20, unit_bytes=10, slot_bytes=25):
     pool = BlockPool(num_units)
     return pool, PageUnitCheckpointStore(
-        pool, unit_bytes=unit_bytes, slot_bytes=slot_bytes, layout_id="layout-v1"
+        pool,
+        PagedStateCheckpointSpec(
+            page_unit_bytes=unit_bytes,
+            slot_bytes=slot_bytes,
+            layout_id="layout-v1",
+        ),
     )
 
 
@@ -25,6 +36,49 @@ def ready(store, prefix_hash, src_slot=0):
     store.complete_inflight()
     assert store.record(op.checkpoint_id).state == READY
     return op
+
+
+def test_runtime_spec_derives_units_and_has_a_minimal_wire_form():
+    spec = PagedStateCheckpointSpec(10, 25, "layout-v1")
+
+    assert spec.units_per_checkpoint == 3
+    assert spec.to_wire() == {
+        "page_unit_bytes": 10,
+        "slot_bytes": 25,
+        "layout_id": "layout-v1",
+    }
+    assert "units_per_checkpoint" not in spec.to_wire()
+    assert (
+        PagedStateCheckpointSpec.from_wire(pickle.loads(pickle.dumps(spec.to_wire())))
+        == spec
+    )
+    with pytest.raises(FrozenInstanceError):
+        spec.slot_bytes = 30
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        (0, 25, "layout-v1"),
+        (10, -1, "layout-v1"),
+        (10, 25, ""),
+    ],
+)
+def test_runtime_spec_rejects_invalid_geometry(args):
+    with pytest.raises(ValueError):
+        PagedStateCheckpointSpec(*args)
+
+
+def test_runtime_spec_rejects_a_drifted_wire_shape():
+    with pytest.raises(ValueError, match="fields"):
+        PagedStateCheckpointSpec.from_wire(
+            {
+                "page_unit_bytes": 10,
+                "slot_bytes": 25,
+                "units_per_checkpoint": 3,
+                "layout_id": "layout-v1",
+            }
+        )
 
 
 def test_copying_is_not_hash_visible_and_ready_is():

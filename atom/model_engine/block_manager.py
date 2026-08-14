@@ -18,7 +18,10 @@ from atom.distributed.kv_events import (
 )
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
-from atom.model_engine.page_unit_checkpoint import PageUnitCheckpointStore
+from atom.model_engine.page_unit_checkpoint import (
+    PagedStateCheckpointSpec,
+    PageUnitCheckpointStore,
+)
 from atom.model_engine.sequence import Sequence
 from atom.model_engine.state_cache import StateCache
 from atom.model_engine.state_pool import StateGroupPool, StateTransfer
@@ -52,7 +55,12 @@ def _make_all_cleared() -> AllBlocksCleared:
 
 
 class BlockManager:
-    def __init__(self, config: Config):
+    def __init__(
+        self,
+        config: Config,
+        *,
+        paged_state_checkpoint_spec: PagedStateCheckpointSpec | None = None,
+    ):
         block_size = config.kv_cache_block_size
         num_blocks = config.num_kvcache_blocks
         assert num_blocks > 0
@@ -109,21 +117,18 @@ class BlockManager:
         )
         self.page_checkpoints: PageUnitCheckpointStore | None = None
         if transfer.copies:
+            if paged_state_checkpoint_spec is None:
+                raise ValueError(
+                    "StateTransfer.copy() requires runtime paged-state geometry"
+                )
             self.page_checkpoints = PageUnitCheckpointStore(
                 self.kv,
-                unit_bytes=int(config.paged_state_page_unit_bytes),
-                slot_bytes=int(config.paged_state_slot_bytes),
-                layout_id=str(config.paged_state_layout_id),
+                paged_state_checkpoint_spec,
             )
-            published_units = int(
-                getattr(config, "paged_state_units_per_checkpoint", 0) or 0
+        elif paged_state_checkpoint_spec is not None:
+            raise ValueError(
+                "runtime paged-state geometry requires StateTransfer.copy()"
             )
-            if published_units != self.page_checkpoints.units_per_checkpoint:
-                raise ValueError(
-                    "paged state checkpoint geometry changed across processes: "
-                    f"published={published_units}, computed="
-                    f"{self.page_checkpoints.units_per_checkpoint}"
-                )
         self.state = StateGroupPool(
             self.num_per_req_cache_groups,
             transfer=transfer,

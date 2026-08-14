@@ -1336,12 +1336,6 @@ class Config:
     stop_token_ids: list[int] = field(default_factory=list)
     kv_cache_block_size: int = 16
     num_kvcache_blocks: int = -1
-    # PAGE-backed state-checkpoint geometry, filled by ModelRunner.get_num_blocks
-    # for backends whose StateTransfer is `copy` and shipped to the scheduler.
-    paged_state_page_unit_bytes: int = 0
-    paged_state_slot_bytes: int = 0
-    paged_state_units_per_checkpoint: int = 0
-    paged_state_layout_id: str = ""
     kv_cache_dtype: str = "bf16"
     index_cache_dtype: str | None = None
     enable_prefix_caching: bool = True

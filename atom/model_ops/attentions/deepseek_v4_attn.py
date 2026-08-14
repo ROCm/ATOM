@@ -1125,18 +1125,20 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         actual_slot_bytes = sum(
             geo.slot_bytes(width) for width in self._plane_row_widths()
         )
-        cfg = self.model_runner.config
+        checkpoint_spec = self.model_runner.paged_state_checkpoint_spec
+        if checkpoint_spec is None:
+            raise RuntimeError("DSV4 PAGE/state checkpoint sizing spec is missing")
         if (
-            actual_page_bytes != cfg.paged_state_page_unit_bytes
-            or actual_slot_bytes != cfg.paged_state_slot_bytes
-            or self.paged_state_checkpoint_layout_id() != cfg.paged_state_layout_id
+            actual_page_bytes != checkpoint_spec.page_unit_bytes
+            or actual_slot_bytes != checkpoint_spec.slot_bytes
+            or self.paged_state_checkpoint_layout_id() != checkpoint_spec.layout_id
         ):
             raise RuntimeError(
                 "DSV4 PAGE/state checkpoint geometry differs from sizing: "
-                f"page={actual_page_bytes}/{cfg.paged_state_page_unit_bytes}, "
-                f"slot={actual_slot_bytes}/{cfg.paged_state_slot_bytes}, "
+                f"page={actual_page_bytes}/{checkpoint_spec.page_unit_bytes}, "
+                f"slot={actual_slot_bytes}/{checkpoint_spec.slot_bytes}, "
                 f"layout={self.paged_state_checkpoint_layout_id()!r}/"
-                f"{cfg.paged_state_layout_id!r}"
+                f"{checkpoint_spec.layout_id!r}"
             )
 
         row_widths = self._plane_row_widths()

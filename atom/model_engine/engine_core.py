@@ -16,6 +16,7 @@ from atom.kv_transfer.disaggregation import KVOutputAggregator
 from atom.model_engine.async_proc import AsyncIOProcManager
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import EngineUtilityHandler
+from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Scheduler
 from atom.model_engine.sequence import Sequence, SequenceStatus, get_exit_sequence
 from atom.utils import (
@@ -95,13 +96,12 @@ class EngineCore:
             config.pool_entries_per_req = block_info.get("pool_entries_per_req", {})
             config.state_transfer_kind = block_info.get("state_transfer_kind", "none")
             config.state_fork_tokens = block_info.get("state_fork_tokens", 0)
-            for field in (
-                "paged_state_page_unit_bytes",
-                "paged_state_slot_bytes",
-                "paged_state_units_per_checkpoint",
-                "paged_state_layout_id",
-            ):
-                setattr(config, field, block_info.get(field, getattr(config, field)))
+            paged_state_wire = block_info.get("paged_state_checkpoint_spec")
+            self.paged_state_checkpoint_spec = (
+                None
+                if paged_state_wire is None
+                else PagedStateCheckpointSpec.from_wire(paged_state_wire)
+            )
             ret = self.runner_mgr.call_func(
                 "allocate_kv_cache", num_blocks, wait_out=True
             )
@@ -130,7 +130,10 @@ class EngineCore:
         # consumers can reference it before DecodeEngineCore creates the real one.
         self.scheduler = None
         if not config.disagg_is_decode:
-            self.scheduler = Scheduler(config)
+            self.scheduler = Scheduler(
+                config,
+                paged_state_checkpoint_spec=self.paged_state_checkpoint_spec,
+            )
 
         self.kv_transfer_enabled = bool(config.kv_transfer_config)
         if self.kv_transfer_enabled:
@@ -924,7 +927,9 @@ class DecodeEngineCore(EngineCore):
 
         # --- Create DecodeScheduler now that num_kvcache_blocks is set ---
         self.scheduler = DecodeScheduler(
-            config, disagg_cu_shm_name=config.disagg_cu_shm_name
+            config,
+            disagg_cu_shm_name=config.disagg_cu_shm_name,
+            paged_state_checkpoint_spec=self.paged_state_checkpoint_spec,
         )
         # EngineUtilityHandler was built in super().__init__() with scheduler=None
         # (decode defers scheduler creation); wire the real one in for MTP stats.
