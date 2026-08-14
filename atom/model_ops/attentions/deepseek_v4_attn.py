@@ -1118,9 +1118,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         geo = self.pool_geometry.with_capacity(num_blocks, num_slots)
         self.pool_geometry = geo
 
-        actual_page_bytes = sum(
-            geo.block_bytes(width) for width in self._plane_row_widths()
-        ) + self._indexer_block_bytes()
+        actual_page_bytes = (
+            sum(geo.block_bytes(width) for width in self._plane_row_widths())
+            + self._indexer_block_bytes()
+        )
         actual_slot_bytes = sum(
             geo.slot_bytes(width) for width in self._plane_row_widths()
         )

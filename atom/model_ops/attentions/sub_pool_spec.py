@@ -45,6 +45,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from enum import Enum
 
+
 class Pool(Enum):
     """Which budget region an entry class draws from."""
 

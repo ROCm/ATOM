@@ -97,9 +97,9 @@ class PageUnitCheckpointStore:
         self.units_per_checkpoint = (
             self.slot_bytes + self.unit_bytes - 1
         ) // self.unit_bytes
-        self.last_unit_valid_bytes = self.slot_bytes - (
-            self.units_per_checkpoint - 1
-        ) * self.unit_bytes
+        self.last_unit_valid_bytes = (
+            self.slot_bytes - (self.units_per_checkpoint - 1) * self.unit_bytes
+        )
 
         self.hash_to_checkpoint: dict[int, int] = {}
         self.records: dict[int, CheckpointRecord] = {}
@@ -151,8 +151,7 @@ class PageUnitCheckpointStore:
             len(self.records[cid].unit_ids)
             for cid in self._lru
             if cid != protected
-            if self.records[cid].state == READY
-            and self.records[cid].pin_count == 0
+            if self.records[cid].state == READY and self.records[cid].pin_count == 0
         )
         return self.pool.num_free + reclaimable >= count
 

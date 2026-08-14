@@ -907,8 +907,6 @@ class TestPagedCopyCheckpoint:
         assert copying._checkpoint_room(seq, True) == 0
 
 
-
-
 # ── Checkpoints past the prompt ────────────────────────────────────────────
 
 

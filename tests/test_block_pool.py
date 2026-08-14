@@ -153,7 +153,8 @@ class TestGrowing:
 class TestRawPageUnits:
     def test_reservation_uses_arbitrary_non_contiguous_free_ids(self):
         pool = BlockPool(num_blocks=8)
-        held = [pool.allocate(pool.pop()).block_id for _ in range(8)]
+        for _ in range(8):
+            pool.allocate(pool.pop())
         for block_id in (0, 2, 5, 7):
             pool.free(block_id)
 

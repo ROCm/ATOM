@@ -1493,9 +1493,7 @@ class Scheduler:
             # the copies exist to prevent. Leave them pending for the next
             # batch that actually runs.
             **(
-                self.block_manager.state_transfers_for_batch()
-                if scheduled_seqs
-                else {}
+                self.block_manager.state_transfers_for_batch() if scheduled_seqs else {}
             ),
         )
         self._consume_state_forks(scheduled_seqs)

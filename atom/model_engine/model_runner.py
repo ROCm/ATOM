@@ -1671,18 +1671,12 @@ class ModelRunner:
         transfer = self.attn_metadata_builder.state_transfer()
         config.state_transfer_kind = transfer.kind
         config.state_fork_tokens = transfer.fork_tokens
-        paged_layout_id = (
-            self.attn_metadata_builder.paged_state_checkpoint_layout_id()
-        )
+        paged_layout_id = self.attn_metadata_builder.paged_state_checkpoint_layout_id()
         uses_paged_state = transfer.copies
         if uses_paged_state and paged_layout_id is None:
-            raise RuntimeError(
-                "StateTransfer.copy() requires a PAGE/state wire layout"
-            )
+            raise RuntimeError("StateTransfer.copy() requires a PAGE/state wire layout")
         if paged_layout_id is not None and not uses_paged_state:
-            raise RuntimeError(
-                "a PAGE/state wire layout requires StateTransfer.copy()"
-            )
+            raise RuntimeError("a PAGE/state wire layout requires StateTransfer.copy()")
         if uses_paged_state and config.pipeline_parallel_size > 1:
             raise RuntimeError(
                 "PAGE-backed state checkpoints do not yet support pipeline "
