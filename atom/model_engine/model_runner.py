@@ -1671,32 +1671,34 @@ class ModelRunner:
         transfer = self.attn_metadata_builder.state_transfer()
         config.state_transfer_kind = transfer.kind
         config.state_fork_tokens = transfer.fork_tokens
-        paged_state_requested = bool(envs.ATOM_V4_PAGED_STATE_CHECKPOINTS)
         paged_layout_id = (
             self.attn_metadata_builder.paged_state_checkpoint_layout_id()
         )
-        if paged_state_requested and paged_layout_id is None:
+        uses_paged_state = transfer.copies
+        if uses_paged_state and paged_layout_id is None:
             raise RuntimeError(
-                "ATOM_V4_PAGED_STATE_CHECKPOINTS=1 is only supported by a "
-                "backend that declares a PAGE/state wire layout (DeepSeek-V4)"
+                "StateTransfer.copy() requires a PAGE/state wire layout"
             )
-        if paged_state_requested and not transfer.copies:
+        if paged_layout_id is not None and not uses_paged_state:
             raise RuntimeError(
-                "PAGE-backed state checkpoints require StateTransfer.copy()"
+                "a PAGE/state wire layout requires StateTransfer.copy()"
             )
-        if paged_state_requested and config.pipeline_parallel_size > 1:
+        if uses_paged_state and config.pipeline_parallel_size > 1:
             raise RuntimeError(
                 "PAGE-backed state checkpoints do not yet support pipeline "
                 "parallelism: every stage must first agree on one atomic "
                 "checkpoint/unit ownership transaction"
             )
-        if paged_state_requested and config.enable_rapidserve:
+        if uses_paged_state and config.enable_rapidserve:
             raise RuntimeError(
                 "PAGE-backed state checkpoints do not yet support RapidServe "
                 "prefill/decode disaggregation"
             )
-        config.paged_state_checkpoints_enabled = paged_state_requested
-        if paged_state_requested:
+        if uses_paged_state:
+            if plan.paged_class is None:
+                raise RuntimeError(
+                    "PAGE-backed state checkpoints require a PAGE sub-pool"
+                )
             page_bytes = int(plan.entry_bytes[plan.paged_class])
             state_bytes = int(plan.entry_bytes[STATE_SLOT_CLASS])
             config.paged_state_page_unit_bytes = page_bytes
@@ -1738,9 +1740,9 @@ class ModelRunner:
         # KV in the pool. Per-req block usage = ceil(ctx_len/block_size).
         # STATE Active Slots sit in their own reservation (already excluded
         # from the paged count at sizing time), so the empty-cache capacity is
-        # described by this table. PAGE-backed state checkpoints, when the
-        # experiment is enabled, dynamically borrow blocks from that paged
-        # count and are evicted atomically as PAGE demand grows.
+        # described by this table. Copy-transfer state checkpoints dynamically
+        # borrow blocks from that paged count and are evicted atomically as PAGE
+        # demand grows.
         max_model_len = config.max_model_len
         cap = config.max_num_seqs
         pct_lines = []
@@ -1787,9 +1789,6 @@ class ModelRunner:
             "pool_entries_per_req": dict(plan.entries_per_req),
             "state_transfer_kind": config.state_transfer_kind,
             "state_fork_tokens": config.state_fork_tokens,
-            "paged_state_checkpoints_enabled": (
-                config.paged_state_checkpoints_enabled
-            ),
             "paged_state_page_unit_bytes": config.paged_state_page_unit_bytes,
             "paged_state_slot_bytes": config.paged_state_slot_bytes,
             "paged_state_units_per_checkpoint": (

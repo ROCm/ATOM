@@ -39,27 +39,9 @@ GIB = 1 << 30
 
 
 class TestStatePool:
-    def test_declared_extra_entries_are_preserved_without_env(self, monkeypatch):
-        monkeypatch.delenv("STATE_CKPT_EXTRA_ENTRIES", raising=False)
+    def test_declared_extra_entries_are_preserved(self):
         spec = state_pool(ENTRY_STATE, 10, entries_per_req=1, extra_entries=64)
         assert spec.extra_entries == 64
-
-    @pytest.mark.parametrize(("value", "expected"), [("268", 268), ("0", 0)])
-    def test_env_overrides_declared_extra_entries(self, monkeypatch, value, expected):
-        monkeypatch.setenv("STATE_CKPT_EXTRA_ENTRIES", value)
-        spec = state_pool(ENTRY_STATE, 10, entries_per_req=1, extra_entries=64)
-        assert spec.extra_entries == expected
-
-    def test_empty_env_does_not_override_declared_extra_entries(self, monkeypatch):
-        monkeypatch.setenv("STATE_CKPT_EXTRA_ENTRIES", "")
-        spec = state_pool(ENTRY_STATE, 10, entries_per_req=1, extra_entries=64)
-        assert spec.extra_entries == 64
-
-    def test_paged_checkpoints_need_no_extra_active_slots(self, monkeypatch):
-        monkeypatch.setenv("STATE_CKPT_EXTRA_ENTRIES", "268")
-        monkeypatch.setenv("ATOM_V4_PAGED_STATE_CHECKPOINTS", "1")
-        spec = state_pool(ENTRY_STATE, 10, entries_per_req=1, extra_entries=64)
-        assert spec.extra_entries == 0
 
 
 class TestMergeSpecs:

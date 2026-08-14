@@ -96,7 +96,6 @@ class EngineCore:
             config.state_transfer_kind = block_info.get("state_transfer_kind", "none")
             config.state_fork_tokens = block_info.get("state_fork_tokens", 0)
             for field in (
-                "paged_state_checkpoints_enabled",
                 "paged_state_page_unit_bytes",
                 "paged_state_slot_bytes",
                 "paged_state_units_per_checkpoint",

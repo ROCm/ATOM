@@ -8,10 +8,9 @@
 # it, a hit hands the resumed forward a group straight off the free list and it
 # reads the previous occupant's state.
 #
-# Capacity model under test: a checkpoint is a FREE group whose content is
-# still valid (the KV block pool's lazy eviction, applied to state groups). So
-# checkpoints must never reduce the number of admissible requests, and the
-# eviction event is hand-out, not free.
+# Fork-transfer checkpoints are FREE groups whose content is still valid.
+# Copy-transfer checkpoints are immutable PAGE-unit images; Active Slots are
+# reserved only for resident requests and never serve as checkpoint backing.
 
 from math import inf, isinf
 from types import SimpleNamespace
@@ -20,6 +19,8 @@ import pytest
 from conftest import MockConfig
 
 from atom.model_engine.block_manager import BlockManager
+from atom.model_engine.block_pool import BlockPool
+from atom.model_engine.page_unit_checkpoint import PageUnitCheckpointStore
 from atom.model_engine.scheduler import CacheStats, ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import Sequence, SequenceType
 from atom.model_engine.state_cache import StateCache
@@ -830,28 +831,22 @@ class TestPrefillChunkAlignment:
         assert sched._finalize_prefill_chunk(seq, limit, 16) == 16
 
 
-# ── Copy lifecycle ─────────────────────────────────────────────────────────
-
-
-def copy_config(**overrides):
-    """A backend whose state is one byte range: it checkpoints by copying."""
-    overrides.setdefault("state_transfer_kind", "copy")
-    overrides.setdefault("state_fork_tokens", 0)
-    return ckpt_config(**overrides)
+# ── PAGE-backed copy lifecycle ─────────────────────────────────────────────
 
 
 def paged_copy_config(**overrides):
     defaults = {
-        "paged_state_checkpoints_enabled": True,
         # Small synthetic byte geometry; these control-plane tests do not
         # allocate DSV4 tensors, but exercise the same K-unit protocol.
+        "state_transfer_kind": "copy",
+        "state_fork_tokens": 0,
         "paged_state_page_unit_bytes": 10,
         "paged_state_slot_bytes": 25,
         "paged_state_units_per_checkpoint": 3,
         "paged_state_layout_id": "test-layout-v1",
     }
     defaults.update(overrides)
-    return copy_config(**defaults)
+    return ckpt_config(**defaults)
 
 
 class TestPagedCopyCheckpoint:
@@ -901,217 +896,17 @@ class TestPagedCopyCheckpoint:
         # adopted as the request's kernel-visible slot.
         assert bm.state.lookup(h) == store.checkpoint_id
 
-
-class TestCopyLifecycle:
-    """The other half of the protocol: a duplicate goes to the index.
-
-    Everything the fork binds — a successor forward long enough to refill the
-    replacement, and therefore a boundary with room behind it — is gone. What
-    replaces it is a deferral: the bytes need a forward to move them, so the
-    index entry cannot appear until the copy has been scheduled.
-    """
-
-    def _admitted(self, bm, tokens=None):
-        seq = stateful_seq(tokens or list(range(40)))
-        bm.allocate(seq, bm.can_allocate(seq))
-        return seq
-
-    def test_the_owner_is_not_disturbed(self):
-        bm = BlockManager(copy_config())
-        seq = self._admitted(bm)
-        group = seq.per_req_cache_group
-        bm.hash_blocks(seq, bm.checkpoint_limit(seq) - seq.num_cached_tokens)
-        # No hand-over: the group and the read slot are exactly as they were.
-        assert seq.per_req_cache_group == group
-        assert seq.state_fork_src == -1
-        assert seq.pending_checkpoint != -1
-        # And nothing is claimable yet — the bytes do not exist.
-        assert not bm.state.hash_to_group
-
-    def test_the_next_batch_turns_it_into_a_pair(self):
-        bm = BlockManager(copy_config())
-        seq = self._admitted(bm)
-        src = seq.per_req_cache_group
-        bm.hash_blocks(seq, bm.checkpoint_limit(seq) - seq.num_cached_tokens)
-        h = boundary_hash(bm, seq)
-
-        copies = bm.state_copies_for_batch()
-        assert seq.pending_checkpoint == -1
-        assert len(copies) == 1
-        got_src, dst = copies[0]
-        assert got_src == src and dst != src
-        assert bm.state.lookup(h) == dst
-        # Capacity-neutral: the destination went straight back on the free list.
-        assert bm.state.is_free(dst)
-        assert not bm.state_copies_for_batch()  # drained once, not twice
-
-    def test_a_request_freed_before_the_commit_indexes_nothing(self):
-        """Its group is back on the free list, so there is nothing to copy."""
-        bm = BlockManager(copy_config())
-        seq = self._admitted(bm)
-        bm.hash_blocks(seq, bm.checkpoint_limit(seq) - seq.num_cached_tokens)
-        bm.deallocate(seq)
-
-        # committed by state_copies_for_batch()
-        assert not bm.state.hash_to_group
-        assert not bm.state_copies_for_batch()
-
-    def test_a_full_pool_keeps_no_checkpoint(self):
-        """Best-effort, exactly as under a fork: no group, no checkpoint."""
-        bm = BlockManager(copy_config())
-        seq = self._admitted(bm)
-        bm.hash_blocks(seq, bm.checkpoint_limit(seq) - seq.num_cached_tokens)
-        while bm.state.has_free():
-            bm.state.pop()
-
-        # committed by state_copies_for_batch()
-        assert not bm.state.hash_to_group
-        assert not bm.state_copies_for_batch()
-
-    @pytest.mark.parametrize(("extra_groups", "kept"), [(0, False), (1, True)])
-    def test_checkpoint_capacity_starts_above_the_live_floor(self, extra_groups, kept):
-        live_floor = 4
-        config = copy_config(
-            max_num_seqs=live_floor,
-            pool_entries={"state": live_floor + extra_groups},
-        )
-        bm = BlockManager(config)
-        owners = [
-            self._admitted(bm, list(range(100 * i, 100 * i + 40)))
-            for i in range(config.max_num_seqs)
-        ]
-        owner_groups = {seq.per_req_cache_group for seq in owners}
-        assert len(owner_groups) == live_floor
-        assert bm.state.num_free() == extra_groups
-
-        publisher = owners[0]
-        bm.hash_blocks(
-            publisher,
-            bm.checkpoint_limit(publisher) - publisher.num_cached_tokens,
-        )
-        h = boundary_hash(bm, publisher)
-        assert publisher.pending_checkpoint != -1
-
-        copies = bm.state_copies_for_batch()
-        assert publisher.pending_checkpoint == -1
-        assert bool(copies) is kept
-        assert (bm.state.lookup(h) >= 0) is kept
-        assert bm.state.checkpoint_fates() == {
-            "checkpoints_kept": int(kept),
-            "checkpoints_dropped": int(not kept),
-            "checkpoints_evicted": 0,
-            "checkpoints_orphaned": 0,
-        }
-        if kept:
-            src, dst = copies[0]
-            assert src == publisher.per_req_cache_group
-            assert dst == bm.state.lookup(h)
-            assert dst not in owner_groups
-
-    def test_an_existing_free_checkpoint_needs_no_second_copy(self):
-        config = copy_config(max_num_seqs=2, pool_entries={"state": 3})
-        bm = BlockManager(config)
-        first = self._admitted(bm, list(range(40)))
-        second = self._admitted(bm, list(range(40)))
-
-        bm.hash_blocks(first, bm.checkpoint_limit(first) - first.num_cached_tokens)
-        h = boundary_hash(bm, first)
-        copies = bm.state_copies_for_batch()
-        assert len(copies) == 1
-        dst = copies[0][1]
-        assert bm.state.lookup(h) == dst
-        assert bm.state.is_free(dst)
-
-        bm.hash_blocks(second, bm.checkpoint_limit(second) - second.num_cached_tokens)
-        assert boundary_hash(bm, second) == h
-        assert bm.state_copies_for_batch() == []
-        assert second.pending_checkpoint == -1
-        assert bm.state.lookup(h) == dst
-        assert bm.state.checkpoint_fates() == {
-            "checkpoints_kept": 1,
-            "checkpoints_dropped": 0,
-            "checkpoints_evicted": 0,
-            "checkpoints_orphaned": 0,
-        }
-
-    def test_a_resume_is_handed_a_duplicate_not_a_fork(self):
-        bm = BlockManager(copy_config())
-        first = self._admitted(bm)
-        bm.hash_blocks(first, bm.checkpoint_limit(first) - first.num_cached_tokens)
-        # committed by state_copies_for_batch()
-        src = bm.state_copies_for_batch()[0][1]
-
-        # A follow-up turn, not a repeat: with no room reserved behind it the
-        # checkpoint sits on the prompt's last block, and a request of the same
-        # length can never reach it (its own hit stops one block short).
-        second = stateful_seq(list(range(48)))
-        hit = bm.can_allocate(second)
-        assert hit > 0
-        bm.allocate(second, hit)
-        # The read side stays untouched; the bytes arrive by copy instead.
-        assert second.state_fork_src == -1
-        assert bm.state_copies_for_batch() == [(src, second.per_req_cache_group)]
-        # And the source is held until the forward that reads it has been issued.
-        assert bm.state.is_pinned(src)
-
-    def test_the_checkpoint_is_only_claimable_once_its_batch_is_decided(self):
-        """Why the commit waits for the batch instead of opening the pass.
-
-        The source of a keeper copy is the owner's *live* group. Anything that
-        can preempt that owner between the commit and the batch — an admission,
-        in the same pass — would put the group back on the free list, and the
-        copy would then duplicate the next request's state into a group already
-        indexed as a checkpoint. Waiting until the batch is decided leaves no
-        such window, at the price of the checkpoint landing one pass later.
-        """
-        bm = BlockManager(copy_config())
-        first = self._admitted(bm)
-        bm.hash_blocks(first, bm.checkpoint_limit(first) - first.num_cached_tokens)
-
-        # An admission in the same pass cannot see it yet.
-        second = stateful_seq(list(range(48)))
-        assert bm.can_allocate(second) == 0
-
-        bm.state_copies_for_batch()  # the batch is decided; now it exists
-        assert bm.can_allocate(second) > 0
-
-    def test_admissions_get_the_free_list_before_checkpoints_do(self):
-        """Committing after admissions is also the right priority order."""
-        bm = BlockManager(copy_config())
-        first = self._admitted(bm)
-        bm.hash_blocks(first, bm.checkpoint_limit(first) - first.num_cached_tokens)
-        # Leave exactly one group: the admission takes it, the checkpoint yields.
-        while bm.state.num_free() > 1:
-            bm.state.pop()
-
-        newcomer = stateful_seq(list(range(40)))
-        bm.allocate(newcomer, bm.can_allocate(newcomer))
-        assert newcomer.per_req_cache_group >= 0
-        assert bm.state_copies_for_batch() == []
-        assert not bm.state.hash_to_group
-
-    def test_the_batch_carries_what_was_drained(self):
-        """The copies have to reach the forward, which means riding a batch."""
-        sched = Scheduler(copy_config())
-        sched.add(stateful_seq(list(range(BLOCK))))
-        sched.block_manager.state.record_copy(2, 3)
-        batch, _ = sched.schedule()
-        assert batch.state_copy_pairs == [(2, 3)]
-        # Carried once: the next batch is not asked to repeat them.
-        batch, _ = sched.schedule()
-        assert batch.state_copy_pairs == []
-
-    def test_a_copy_checkpoints_where_a_fork_cannot(self):
-        """Speculation and a one-token step both stop a fork, neither a copy."""
+    def test_copy_transfer_can_checkpoint_a_speculative_decode_boundary(self):
         spec = SimpleNamespace(num_speculative_tokens=3, use_dspark=lambda: False)
         seq = stateful_seq(list(range(40)))
         seq.type = SequenceType.DECODE
         forking = Scheduler(ckpt_config(state_fork_tokens=1, speculative_config=spec))
-        copying = Scheduler(copy_config(speculative_config=spec))
+        copying = Scheduler(paged_copy_config(speculative_config=spec))
         assert forking._checkpoint_room(seq, False) == 0
         assert copying._checkpoint_room(seq, False) == 1
-        # A finishing request still keeps nothing: no next batch to copy on.
         assert copying._checkpoint_room(seq, True) == 0
+
+
 
 
 # ── Checkpoints past the prompt ────────────────────────────────────────────
@@ -1323,6 +1118,10 @@ def second_class(**overrides):
 
 class TestStateCacheProtocol:
 
+    def test_copy_transfer_has_no_slot_backed_fallback(self):
+        with pytest.raises(ValueError, match="requires PAGE-unit"):
+            StateGroupPool(4, StateTransfer.copy())
+
     def test_both_classes_satisfy_the_protocol(self):
         assert isinstance(second_class(), StateCache)
         assert isinstance(StateGroupPool(4), StateCache)
@@ -1354,16 +1153,26 @@ class TestStateCacheProtocol:
         are opposite ends of the room scale.
         """
         assert isinf(StateGroupPool(4, StateTransfer.none()).successor_room)
-        assert StateGroupPool(4, StateTransfer.copy()).successor_room == 0
+        assert StateTransfer.copy().successor_room == 0
         assert StateGroupPool(4, StateTransfer.fork(7)).successor_room == 7
 
     def test_a_copy_never_asks_the_resumer_for_room(self):
         """`resumable_hit`'s fork test is vacuous under `copy`, not skipped."""
         forking = StateGroupPool(4, StateTransfer.fork(4), hash_block_size=1)
-        copying = StateGroupPool(4, StateTransfer.copy(), hash_block_size=1)
-        for pool in (forking, copying):
-            pool._index(10, 0)
-            pool._index(50, 1)
+        store = PageUnitCheckpointStore(
+            BlockPool(4), unit_bytes=1, slot_bytes=1, layout_id="test-layout"
+        )
+        copying = StateGroupPool(
+            4,
+            StateTransfer.copy(),
+            hash_block_size=1,
+            page_checkpoints=store,
+        )
+        forking._index(10, 0)
+        forking._index(50, 1)
+        assert store.begin_store(10, 1, 0) is not None
+        assert store.begin_store(50, 5, 1) is not None
+        store.complete_inflight()
         # Five one-token blocks; the rightmost checkpoint leaves no room to
         # forward, so a fork walks back to the first and a copy does not.
         assert forking.resumable_hit(idx_seq(5), 5, [10, 20, 30, 40, 50]) == 1

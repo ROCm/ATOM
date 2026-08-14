@@ -154,12 +154,12 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         boundary until it fits.
 
         `StateTransfer.copy()` — one request's state is a contiguous byte range,
-        so the index gets a duplicate and the owner is left alone. No forward is
-        bound and no boundary is disqualified for lack of room, which is what
-        makes a decode boundary checkpointable at all: a decode step commits
-        `1 + accepted_drafts` tokens and acceptance is not knowable when the
-        checkpoint has to be decided. The backend must implement
-        `copy_state_entries`.
+        so its checkpoint is scattered into PAGE units and the owner is left
+        alone. No forward is bound and no boundary is disqualified for lack of
+        room, which is what makes a decode boundary checkpointable at all: a
+        decode step commits `1 + accepted_drafts` tokens and acceptance is not
+        knowable when the checkpoint has to be decided. The backend must declare
+        a PAGE/state wire layout and implement `copy_paged_state_entries`.
 
         `StateTransfer.none()` (default) — no per-request state, or none that can
         be handed over; the checkpoint index stays empty and prefix hits shrink
@@ -172,19 +172,11 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         return None
 
     def copy_state_entries(self, pairs: list[tuple[int, int]]) -> None:
-        """Copy each `(src, dst)` group's whole per-request state, src → dst.
+        """Relocate each `(src, dst)` Active Slot before the forward.
 
-        Issued by `build` before the forward, on the compute stream, so a copy
-        lands after the forward that produced its source and before the one that
-        consumes its destination.
-
-        Owed by every backend that declares a state pool, not just the ones
-        declaring `StateTransfer.copy()`. Two callers want it and only the first
-        is about checkpointing: a copy-transfer class duplicates a group to keep
-        a checkpoint, and *any* class has to be able to hand a group's bytes to
-        a different group index when the pool's boundary moves past the one it
-        is sitting on. The second is a byte move regardless of how the class
-        checkpoints, so a fork-transfer backend owes this too.
+        This is not a checkpoint path. It moves a live group when the state
+        pool's boundary changes, regardless of whether that backend checkpoints
+        by fork or by PAGE image.
         """
         raise NotImplementedError(
             f"{type(self).__name__} owns per-request state but does not "
@@ -194,9 +186,9 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
     def copy_paged_state_entries(self, store_ops: list, restore_ops: list) -> None:
         """Run PAGE-granularity state scatter/gather maintenance copies.
 
-        Only DeepSeek-V4 currently declares this representation.  Keeping the
-        default explicit makes an accidentally enabled backend fail before its
-        forward can consume an uninitialized Active Slot.
+        Only DeepSeek-V4 currently declares this representation. Keeping the
+        default explicit makes an unsupported backend fail before its forward
+        can consume an uninitialized Active Slot.
         """
         if store_ops or restore_ops:
             raise NotImplementedError(
@@ -533,12 +525,10 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         )
 
     def build(self, batch: ScheduledBatch, bs: int):
-        # State checkpoints the scheduler decided on ride the batch as group
-        # pairs and are copied here, on the compute stream, before the forward.
-        # This is the one place every path — prefill, decode, dummy, DP-sync, PP
-        # microbatch, TBO — passes through exactly once per batch, which is what
-        # makes "each copy is issued once per rank" true by construction rather
-        # than by inspection of every prepare_* variant.
+        # Slot relocations and PAGE checkpoint maintenance run on the compute
+        # stream before the forward. This is the one place every path — prefill,
+        # decode, dummy, DP-sync, PP microbatch, TBO — passes through exactly
+        # once per batch.
         if batch.state_copy_pairs:
             self.copy_state_entries(batch.state_copy_pairs)
         if batch.checkpoint_store_ops or batch.checkpoint_restore_ops:

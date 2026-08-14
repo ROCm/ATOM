@@ -32,10 +32,9 @@ class StateTransfer:
                   takes a fresh one, reading the old and writing the new for
                   exactly one forward — which has to leave the new group
                   self-contained, and that takes `n` committed tokens.
-      `copy()`    one request's state is a contiguous byte range another group
-                  can be handed a duplicate of. Nothing is given away, so
-                  nothing downstream has to cooperate: no successor forward, and
-                  the resuming side is handed a duplicate too.
+      `copy()`    one request's state has a canonical byte stream that can be
+                  scattered into PAGE units and gathered into another Active
+                  Slot. Nothing is given away and no successor forward is bound.
 
     The two mechanisms are not interchangeable, and which one a backend can
     offer decides where it may checkpoint. A fork's contract binds the *next*
@@ -120,12 +119,10 @@ class StateGroupPool:
     checkpointed the state — which is what the index over the free list
     answers.
 
-    Default capacity model: a checkpoint is a group sitting on the free list
-    with its content still valid, filed under the content hash of the last
-    block it covers. With `page_checkpoints`, groups are instead Active Slots
-    only: immutable checkpoint content lives in an ordered set of arbitrary
-    PAGE units, and this class schedules typed scatter/gather ops between the
-    two representations.
+    A fork-transfer checkpoint is a group sitting on the free list with valid
+    content. A copy-transfer checkpoint never uses that representation: groups
+    are Active Slots only, immutable images live in ordered sets of arbitrary
+    PAGE units, and this class schedules typed scatter/gather ops between them.
 
     *How* a group reaches the index is the backend's `StateTransfer`, and it is
     the only thing that differs between the two mechanisms this class runs:
@@ -133,13 +130,9 @@ class StateGroupPool:
       `fork`  the owner gives its group away and takes a fresh one, so the
               checkpoint costs no bytes but binds the very next forward, which
               has to leave the replacement self-contained (`min_fork_tokens`).
-      `copy`  the state is a byte range, so a duplicate goes to the index and
-              the owner is not disturbed at all. Nothing is bound: no successor
-              forward, and the resuming side copies rather than forking too.
-
-    Both meet the same index and the same free list. Under `copy` the bytes are
-    moved by a forward, so this class only schedules the pairs (`take_copies`)
-    and the next batch issues them.
+      `copy`  the state has a canonical byte stream, so it is scattered into
+              PAGE units without disturbing the owner and gathered into the
+              resumer's own Active Slot. No successor forward is bound.
 
     The count of groups is not fixed for life: `extend` and `retire_top` move it
     when the state pool's share of the byte budget changes. Retiring is
@@ -171,7 +164,9 @@ class StateGroupPool:
         self.successor_room: float = self.transfer.successor_room
         self.hash_block_size: int = hash_block_size
         self.page_checkpoints = page_checkpoints
-        if self.page_checkpoints is not None and not self.transfer.copies:
+        if self.transfer.copies and self.page_checkpoints is None:
+            raise ValueError("copy transfer requires PAGE-unit state checkpoints")
+        if not self.transfer.copies and self.page_checkpoints is not None:
             raise ValueError("PAGE-unit state checkpoints require copy transfer")
         # The free list, split by whether the group still carries content worth
         # something. Two containers rather than one queue because the two halves
@@ -216,20 +211,13 @@ class StateGroupPool:
         # rather than a second count because the depth is only ever one pass
         # more — see `release_pins`.
         self._deferred: set[int] = set()
-        # `copy` only. Seqs whose last forward left their state on a boundary
-        # worth keeping. `take_copies` turns each into a copy pair when the next
-        # batch is built, which is the latest moment the owner is still known to
-        # hold the group being duplicated.
-        self._checkpoint_pending: list = []
-        # (src, dst) group pairs the next batch must copy before its forward.
-        # Both halves of the protocol feed this under `copy`: keeping a
-        # checkpoint copies the owner's state out, resuming from one copies it
-        # back in.
+        # (src, dst) Active Slot relocation pairs. Checkpoints never feed this:
+        # copy-transfer checkpoints use the typed PAGE ops below, while fork
+        # checkpoints move ownership without copying.
         self._copies: list[tuple[int, int]] = []
-        # PAGE-backed mode separates the Active Slot free list above from the
-        # immutable checkpoint image.  The pending dict coalesces later
-        # boundaries from the same request exactly as `pending_checkpoint` did,
-        # while retaining the boundary metadata the record now owns.
+        # Copy-transfer state separates the Active Slot free list above from
+        # the immutable checkpoint image. The pending dict coalesces later
+        # boundaries from the same request while retaining boundary metadata.
         self._paged_pending: dict[int, tuple[object, int, int]] = {}
         self._paged_store_ops: list[CheckpointStoreOp] = []
         self._paged_restore_ops: list[CheckpointRestoreOp] = []
@@ -504,19 +492,13 @@ class StateGroupPool:
         replacement, which is the whole reason `min_fork_tokens` gates the
         position.
 
-        `copy` — the owner keeps writing where it is and a duplicate of its
-        state goes to the index instead. Only the intent is recorded here; the
-        destination group and the copy pair come from `take_copies` when the next
-        batch is built. Deferred because the bytes have to be moved by a forward, and
-        a checkpoint indexed before its bytes exist would hand a resuming
-        request whatever the destination happened to hold.
+        `copy` — the owner keeps writing where it is and an immutable image is
+        scattered into PAGE units. Only the intent is recorded here; units are
+        atomically reserved when the next batch is built. The checkpoint stays
+        invisible until that batch has issued the scatter.
 
-        `boundary_blocks` is unused here: a group is a single entry, not a span
-        of them. It is in the protocol for classes whose checkpoint is a run of
-        entries ending at the boundary.
-
-        Best-effort under both: with no free group the seq simply keeps writing
-        its own and no checkpoint is taken.
+        `boundary_blocks` is carried by PAGE checkpoint records. Fork-backed
+        groups are single entries and do not otherwise need it.
         """
         if not self.applies(seq):
             return
@@ -524,14 +506,7 @@ class StateGroupPool:
         if old < 0:
             return
         if self.transfer.copies:
-            if self.page_checkpoints is not None:
-                self._paged_pending[id(seq)] = (seq, boundary_blocks, h)
-                seq.pending_checkpoint = h
-                return
-            if seq.pending_checkpoint == -1:
-                self._checkpoint_pending.append(seq)
-            # A later boundary supersedes an earlier one: the group holds the
-            # state as of the last forward, so only the last position is true.
+            self._paged_pending[id(seq)] = (seq, boundary_blocks, h)
             seq.pending_checkpoint = h
             return
         if not self.has_free():
@@ -548,43 +523,6 @@ class StateGroupPool:
         self._index(h, old)
         self.pin(old, reader_is_next_batch=True)
         self.checkpoints_kept += 1
-
-    def _commit_pending(self) -> None:
-        """Turn the last step's checkpoint intents into copy pairs.
-
-        Each pending seq gets a destination group, which goes straight back on
-        the free list and into the index — the same capacity-neutral move
-        `checkpoint` makes under `fork`, covered by the same lazy eviction:
-        whoever pops the group next invalidates the hash on the way out.
-
-        A seq preempted or finished in between carries no group any more and is
-        skipped, so nothing is ever indexed over state that is gone. That check
-        is only sound because this runs with the batch already decided — see
-        `take_copies`.
-        """
-        if self.page_checkpoints is not None:
-            self._commit_paged_pending()
-            return
-        if not self._checkpoint_pending:
-            return
-        copy_start = len(self._copies)
-        for seq in self._checkpoint_pending:
-            h, seq.pending_checkpoint = seq.pending_checkpoint, -1
-            src = seq.per_req_cache_group
-            if h == -1 or src < 0:
-                continue
-            if self.lookup(h) >= 0:
-                continue
-            if not self.has_free():
-                self.checkpoints_dropped += 1
-                continue
-            dst = self.pop()
-            self._index(h, dst)
-            self._copies.append((src, dst))
-            self.checkpoints_kept += 1
-        self._checkpoint_pending.clear()
-        for _, dst in self._copies[copy_start:]:
-            self.release(dst)
 
     def _commit_paged_pending(self) -> None:
         """Reserve arbitrary PAGE units and schedule Active Slot scatter ops."""
@@ -624,43 +562,17 @@ class StateGroupPool:
         }
 
     def record_copy(self, src: int, dst: int) -> None:
-        """Schedule a state copy for the next batch's forward to issue."""
+        """Schedule an Active Slot relocation for the next batch."""
         self._copies.append((src, dst))
 
     def take_copies(self) -> list[tuple[int, int]]:
-        """Every copy the batch now being built must issue before its forward.
-
-        Called at the moment the batch is constructed, which is the whole point:
-        a checkpoint's source is the owner's live group, and it has to still be
-        that owner's when the copy runs. Committing earlier in the pass would
-        leave a window — an admission preempting that owner would return the
-        group to the free list, and the copy would then duplicate whatever the
-        next request wrote there into a group already indexed as a checkpoint.
-        Nothing runs between here and the batch, so the window is empty.
-
-        A checkpoint therefore becomes visible one pass later than the step that
-        formed it, and this pass's own admissions get first claim on the free
-        list. Both are the right way round: admission is throughput, a
-        checkpoint is speculative reuse.
-
-        The two kinds of pair cannot collide, so their order does not matter. A
-        resume source is a claimed or pinned checkpoint and a keeper source is a
-        live group; neither is on the free list, so `_commit_pending`'s `pop`
-        can return neither.
-        """
-        # PAGE-backed mode has typed endpoints, so a legacy caller asking only
-        # for slot pairs must not commit a store it cannot carry to a worker.
-        # `take_paged_ops` is the sole commit/drain point in that mode.
-        if self.page_checkpoints is not None:
-            return []
-        self._commit_pending()
+        """Drain Active Slot relocations; checkpoint copies are typed PAGE ops."""
         copies, self._copies = self._copies, []
         return copies
 
     def record_restore(self, h: int, dst: int) -> bool:
         """Pin a PAGE-backed checkpoint and queue its gather into `dst`."""
-        if self.page_checkpoints is None:
-            return False
+        assert self.page_checkpoints is not None
         op = self.page_checkpoints.begin_restore(h, dst)
         if op is None:
             return False
@@ -671,18 +583,14 @@ class StateGroupPool:
         self,
     ) -> tuple[list[CheckpointStoreOp], list[CheckpointRestoreOp]]:
         """PAGE-unit store/restore ops for the batch now being built."""
-        self._commit_pending()
+        if self.page_checkpoints is not None:
+            self._commit_paged_pending()
         stores, self._paged_store_ops = self._paged_store_ops, []
         restores, self._paged_restore_ops = self._paged_restore_ops, []
         return stores, restores
 
     def forget_pending(self, seq) -> None:
-        """Drop `seq`'s uncommitted checkpoint — its group is being released.
-
-        The seq stays in `_checkpoint_pending` until the next commit, which
-        skips it on the cleared hash. Cheaper than removing it, and the list is
-        emptied every pass either way.
-        """
+        """Drop `seq`'s uncommitted checkpoint before releasing its slot."""
         seq.pending_checkpoint = -1
         self._paged_pending.pop(id(seq), None)
 
@@ -737,9 +645,6 @@ class StateGroupPool:
 
     def clear_index(self) -> None:
         """Drop all checkpoint hashes, preserving only in-flight readers."""
-        for seq in self._checkpoint_pending:
-            seq.pending_checkpoint = -1
-        self._checkpoint_pending.clear()
         for seq, _, _ in self._paged_pending.values():
             seq.pending_checkpoint = -1
         self._paged_pending.clear()

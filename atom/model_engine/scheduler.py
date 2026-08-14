@@ -318,9 +318,8 @@ class ScheduledBatch:
         num_spec_step: Number of speculative decode steps (0 = disabled).
         scheduled_spec_decode_tokens: Draft token IDs per request for
             speculative decoding (must not use a mutable default).
-        state_copy_pairs: (src, dst) per-request state groups this batch's
-            forward must duplicate before running (`BlockManager
-            .state_copies_for_batch`).
+        state_copy_pairs: (src, dst) Active Slot relocations this batch must
+            perform before running.
         checkpoint_store_ops: Active Slot -> ordered PAGE-unit checkpoint ops.
         checkpoint_restore_ops: ordered PAGE-unit checkpoint -> Active Slot ops.
     """

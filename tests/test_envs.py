@@ -28,8 +28,6 @@ _ATOM_ENV_VARS = [
     "ATOM_DISABLE_VLLM_PLUGIN",
     "ATOM_USE_CUSTOM_ALL_GATHER",
     "ATOM_ENABLE_RELAXED_MTP",
-    "ATOM_V4_PAGED_STATE_CHECKPOINTS",
-    "STATE_CKPT_EXTRA_ENTRIES",
 ]
 
 
@@ -65,14 +63,8 @@ class TestEnvsDefaults:
     def test_dp_master_port_default(self):
         assert _get_envs().ATOM_DP_MASTER_PORT == 29500
 
-    def test_state_ckpt_extra_entries_default(self):
-        assert _get_envs().STATE_CKPT_EXTRA_ENTRIES == 0
-
     def test_dp_base_port_default(self):
         assert _get_envs().ATOM_DP_BASE_PORT == 0
-
-    def test_v4_paged_state_checkpoints_default(self):
-        assert _get_envs().ATOM_V4_PAGED_STATE_CHECKPOINTS is False
 
     def test_use_triton_gemm_default(self):
         assert _get_envs().ATOM_USE_TRITON_GEMM is False
@@ -120,23 +112,11 @@ class TestEnvsOverrides:
         monkeypatch.setenv("ATOM_DP_SIZE", "8")
         assert _get_envs().ATOM_DP_SIZE == 8
 
-    def test_state_ckpt_extra_entries_override(self, monkeypatch):
-        monkeypatch.setenv("STATE_CKPT_EXTRA_ENTRIES", "268")
-        assert _get_envs().STATE_CKPT_EXTRA_ENTRIES == 268
-
-    def test_state_ckpt_extra_entries_empty_means_default(self, monkeypatch):
-        monkeypatch.setenv("STATE_CKPT_EXTRA_ENTRIES", "")
-        assert _get_envs().STATE_CKPT_EXTRA_ENTRIES == 0
-
     def test_dp_port_overrides(self, monkeypatch):
         monkeypatch.setenv("ATOM_DP_MASTER_PORT", "29700")
         monkeypatch.setenv("ATOM_DP_BASE_PORT", "29800")
         assert _get_envs().ATOM_DP_MASTER_PORT == 29700
         assert _get_envs().ATOM_DP_BASE_PORT == 29800
-
-    def test_v4_paged_state_checkpoints_override(self, monkeypatch):
-        monkeypatch.setenv("ATOM_V4_PAGED_STATE_CHECKPOINTS", "1")
-        assert _get_envs().ATOM_V4_PAGED_STATE_CHECKPOINTS is True
 
     def test_torch_profiler_dir_override(self, monkeypatch):
         monkeypatch.setenv("ATOM_TORCH_PROFILER_DIR", "/tmp/prof")

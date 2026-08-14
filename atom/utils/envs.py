@@ -45,15 +45,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ATOM remaps the SGLang world into internal TP x PCP groups.
     # 0 means unset.
     "ATOM_SGLANG_PCP_SIZE": lambda: int(os.getenv("ATOM_SGLANG_PCP_SIZE", "0") or "0"),
-    "STATE_CKPT_EXTRA_ENTRIES": lambda: int(
-        os.getenv("STATE_CKPT_EXTRA_ENTRIES", "0") or "0"
-    ),
-    # Experimental DeepSeek-V4 checkpoint representation: keep running
-    # requests in the existing contiguous Active Slots, but store immutable
-    # checkpoint images in arbitrary PAGE-sized units from the PAGE pool.
-    "ATOM_V4_PAGED_STATE_CHECKPOINTS": lambda: (
-        os.getenv("ATOM_V4_PAGED_STATE_CHECKPOINTS", "0") == "1"
-    ),
     # --- Compilation & Execution ---
     "ATOM_USE_TRITON_GEMM": lambda: os.getenv("ATOM_USE_TRITON_GEMM", "0") == "1",
     "ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE": lambda: (

@@ -99,20 +99,16 @@ class BlockManager:
         self.state_checkpoint_interval_tokens = max(
             0, int(getattr(config, "state_checkpoint_interval_tokens", 0) or 0)
         )
-        # The rolling state class. In the default representation its content
-        # index points at free groups. In paged-checkpoint mode the same groups
-        # are Active Slots only, while the content index owns arbitrary PAGE
-        # units through `PageUnitCheckpointStore`.
+        # Fork-transfer backends keep checkpoints in free state groups. A
+        # copy-transfer backend uses groups only as Active Slots; its immutable
+        # checkpoint index owns arbitrary PAGE units through
+        # `PageUnitCheckpointStore`.
         transfer = StateTransfer.from_config(
             getattr(config, "state_transfer_kind", "none") or "none",
             int(getattr(config, "state_fork_tokens", 0) or 0),
         )
         self.page_checkpoints: PageUnitCheckpointStore | None = None
-        if bool(getattr(config, "paged_state_checkpoints_enabled", False)):
-            if not transfer.copies:
-                raise ValueError(
-                    "paged state checkpoints require a copyable state backend"
-                )
+        if transfer.copies:
             self.page_checkpoints = PageUnitCheckpointStore(
                 self.kv,
                 unit_bytes=int(config.paged_state_page_unit_bytes),
@@ -122,9 +118,7 @@ class BlockManager:
             published_units = int(
                 getattr(config, "paged_state_units_per_checkpoint", 0) or 0
             )
-            if published_units and (
-                published_units != self.page_checkpoints.units_per_checkpoint
-            ):
+            if published_units != self.page_checkpoints.units_per_checkpoint:
                 raise ValueError(
                     "paged state checkpoint geometry changed across processes: "
                     f"published={published_units}, computed="
@@ -197,17 +191,7 @@ class BlockManager:
         self.state.release_pins()
 
     def state_copies_for_batch(self) -> list[tuple[int, int]]:
-        """State copies the batch now being built has to issue before its
-        forward — checkpoints being kept and checkpoints being resumed from.
-
-        Must be called with the batch already decided; see
-        `StateGroupPool.take_copies`. Always empty for a forking backend.
-        """
-        if self.page_checkpoints is not None:
-            raise RuntimeError(
-                "paged state checkpoints require state_transfers_for_batch(); "
-                "slot copy pairs cannot represent PAGE-unit endpoints"
-            )
+        """Active Slot relocation copies for the batch being built."""
         return self.state.take_copies()
 
     def state_transfers_for_batch(self) -> dict[str, list]:
@@ -406,7 +390,9 @@ class BlockManager:
         for i in range(num_cached_blocks):
             if self.kv.is_used(self.kv.lookup(block_hashes[i])):
                 num_new_blocks -= 1
-        protected_hash = block_hashes[num_cached_blocks - 1] if num_cached_blocks else None
+        protected_hash = (
+            block_hashes[num_cached_blocks - 1] if num_cached_blocks else None
+        )
         if not self._has_page_units(num_new_blocks, protected_hash):
             return -1
         return num_cached_blocks
@@ -455,14 +441,11 @@ class BlockManager:
         start). `can_allocate` already shrank the hit to a boundary that carries
         a checkpoint, so a lookup miss here just means the pool is off.
 
-        Resuming shares: the checkpoint stays indexed and the request gets a
-        group of its own, so a second request hitting the same prefix still
-        finds it. How the state reaches that group is the backend's
-        `StateTransfer` — a fork reads the checkpoint for one forward, a copy is
-        handed the bytes — and the two differ by one line here. When no second
-        group is free the request adopts the checkpoint instead: still correct,
-        the state is exactly the one it wanted, it just spends the checkpoint
-        rather than sharing it, and under either mechanism it needs nothing.
+        A PAGE-backed checkpoint stays indexed and is gathered into a fresh,
+        complete Active Slot. A fork-backed checkpoint stays in its state group
+        and the resumer writes a fresh group while reading it. Only the fork
+        representation can adopt its source group when no second group exists;
+        PAGE fragments are never a kernel-visible request slot.
 
         A checkpoint is read-only, so several requests in one step may resume
         off the same one. The first takes it off the free list and the pin
@@ -474,8 +457,8 @@ class BlockManager:
         if self.page_checkpoints is not None:
             # The Active Slot is always a complete contiguous slot.  A hit
             # merely schedules a gather from the checkpoint's ordered PAGE
-            # units into it; unlike the legacy group-backed representation,
-            # there is no legal "adopt source" fallback.
+            # units into it; PAGE fragments have no legal "adopt source"
+            # fallback.
             dst = self.state.pop()
             seq.per_req_cache_group = dst
             seq.state_fork_src = -1
@@ -495,10 +478,7 @@ class BlockManager:
         if self.state.has_free():
             dst = self.state.pop()
             seq.per_req_cache_group = dst
-            if self.state.transfer.copies:
-                self.state.record_copy(src, dst)
-            else:
-                seq.state_fork_src = src
+            seq.state_fork_src = src
             # Held off the free list until the forward that reads it is issued.
             self.state.pin(src)
             return

@@ -45,9 +45,6 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from enum import Enum
 
-from atom.utils import envs
-
-
 class Pool(Enum):
     """Which budget region an entry class draws from."""
 
@@ -96,14 +93,6 @@ def state_pool(
     extra_entries: int = 0,
 ) -> SubPoolSpec:
     """A per-request state entry class."""
-    # PAGE-backed checkpoints no longer consume spare Active Slots.  Keeping
-    # the legacy checkpoint cushion here would reserve large contiguous slots
-    # that can never be used by the new representation, directly defeating
-    # the split between resident slots and cold PAGE-unit images.
-    if envs.ATOM_V4_PAGED_STATE_CHECKPOINTS:
-        extra_entries = 0
-    elif envs.is_set("STATE_CKPT_EXTRA_ENTRIES"):
-        extra_entries = int(envs.STATE_CKPT_EXTRA_ENTRIES)
     return SubPoolSpec(Pool.STATE, name, entry_bytes, entries_per_req, extra_entries)
 
 

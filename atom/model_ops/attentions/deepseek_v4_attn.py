@@ -769,9 +769,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     def state_transfer(self) -> StateTransfer:
         """A copy: one request's compressor state is one contiguous entry.
 
-        `StateArena` already lays a request's whole compressor state out as one
-        byte range (`entry(i)`), which is what makes the duplicate a single
-        `copy_` — see `copy_state_entries`.
+        `StateArena` and the slot planes define one canonical byte stream per
+        request. That stream can be scattered into arbitrary PAGE units and
+        gathered into a fresh Active Slot without dtype conversion.
 
         A fork would also work on a prompt and would move no bytes, but it binds
         the forward after the checkpoint: that forward has to leave the fresh
@@ -804,27 +804,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
 
     def copy_state_entries(self, pairs: list[tuple[int, int]]) -> None:
-        """Duplicate a request's whole per-request state: compressor + windows.
+        """Relocate a request's whole Active Slot: compressor + windows.
 
-        One range per plane, and a plane is all there is: a slot holds the
-        compressor state and then every layer's windows, contiguously, so the
-        two halves of a request's state copy as one slice. Copying the state
-        whole rather than just the rows a resumer reads (the CSA ring's
-        trailing `K - ratio` = 4, HCA's none) is what makes that true — those
-        rows are scattered, and picking them out would cost 84 strided copies
-        against this one.
-
-        **The window half is what makes the private ring safe.** A per-request
-        ring is exactly what #1417 removed, because a request resuming a cached
-        prefix had never written that prefix into its own. Reinstating it is only
-        correct because the checkpoint carries the window across — drop this and
-        the bug returns, silently, as garbage attention over the reused prefix.
-
-        That is also why a window whose dtype differs from the pool's is a state
-        field rather than a plane of its own: a plane of its own would sit
-        outside every slot and so outside this copy, and a resumed request would
-        draft against the slot's previous occupant. Verification would keep the
-        output right and the acceptance rate would just quietly collapse.
+        One range per plane: a slot holds the compressor state followed by every
+        layer's windows, so moving the whole request takes one slice per plane.
+        Checkpoint store/restore does not call this method; it uses the PAGE
+        descriptor kernel below.
         """
         views = self._slot_views()
         dsts, srcs = [], []
@@ -881,7 +866,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         unit_bytes = sum(s.num_bytes for s in self._one_page_unit_segments(0))
         expected_units = (op.total_bytes + unit_bytes - 1) // unit_bytes
         expected_tail = op.total_bytes - (expected_units - 1) * unit_bytes
-        if len(op.unit_ids) != expected_units or op.last_unit_valid_bytes != expected_tail:
+        if (
+            len(op.unit_ids) != expected_units
+            or op.last_unit_valid_bytes != expected_tail
+        ):
             raise RuntimeError(
                 "state checkpoint PAGE-unit geometry does not match this worker"
             )
@@ -1130,29 +1118,25 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         geo = self.pool_geometry.with_capacity(num_blocks, num_slots)
         self.pool_geometry = geo
 
-        if getattr(
-            self.model_runner.config, "paged_state_checkpoints_enabled", False
+        actual_page_bytes = sum(
+            geo.block_bytes(width) for width in self._plane_row_widths()
+        ) + self._indexer_block_bytes()
+        actual_slot_bytes = sum(
+            geo.slot_bytes(width) for width in self._plane_row_widths()
+        )
+        cfg = self.model_runner.config
+        if (
+            actual_page_bytes != cfg.paged_state_page_unit_bytes
+            or actual_slot_bytes != cfg.paged_state_slot_bytes
+            or self.paged_state_checkpoint_layout_id() != cfg.paged_state_layout_id
         ):
-            actual_page_bytes = sum(
-                geo.block_bytes(width) for width in self._plane_row_widths()
-            ) + self._indexer_block_bytes()
-            actual_slot_bytes = sum(
-                geo.slot_bytes(width) for width in self._plane_row_widths()
+            raise RuntimeError(
+                "DSV4 PAGE/state checkpoint geometry differs from sizing: "
+                f"page={actual_page_bytes}/{cfg.paged_state_page_unit_bytes}, "
+                f"slot={actual_slot_bytes}/{cfg.paged_state_slot_bytes}, "
+                f"layout={self.paged_state_checkpoint_layout_id()!r}/"
+                f"{cfg.paged_state_layout_id!r}"
             )
-            cfg = self.model_runner.config
-            if (
-                actual_page_bytes != cfg.paged_state_page_unit_bytes
-                or actual_slot_bytes != cfg.paged_state_slot_bytes
-                or self.paged_state_checkpoint_layout_id()
-                != cfg.paged_state_layout_id
-            ):
-                raise RuntimeError(
-                    "DSV4 PAGE/state checkpoint geometry differs from sizing: "
-                    f"page={actual_page_bytes}/{cfg.paged_state_page_unit_bytes}, "
-                    f"slot={actual_slot_bytes}/{cfg.paged_state_slot_bytes}, "
-                    f"layout={self.paged_state_checkpoint_layout_id()!r}/"
-                    f"{cfg.paged_state_layout_id!r}"
-                )
 
         row_widths = self._plane_row_widths()
         offsets, total_bytes = plan_regions([geo.plane_bytes(w) for w in row_widths])
