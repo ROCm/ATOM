@@ -46,8 +46,10 @@ class EagleProposer(Drafter):
 
     def __init__(self, atom_config, device: torch.device, runner):
         super().__init__(atom_config, device, runner)
-        # GLM-5.2 draft index sharing: step 0 runs the MTP indexer, steps 1+
-        # reuse sparse_kv_indices_buffer via skip_topk + compact_topk_indices.
+        # GLM-5.2 draft index sharing: step 0 runs the MTP indexer, and normal
+        # requests let steps 1+ reuse sparse_kv_indices_buffer via skip_topk +
+        # compact_topk_indices. Short prefill keeps the indexer enabled because
+        # it did not produce indices at step 0.
         # Gated on method=mtp, DSA index_topk and the config flag, so other
         # draft backends are unchanged. (DSpark is DSparkProposer, not this
         # class, so it cannot reach here.)
@@ -60,10 +62,13 @@ class EagleProposer(Drafter):
             and mtp_inner is not None
             and hasattr(mtp_inner, "set_skip_topk")
         )
+        self._mtp_index_topk = int(getattr(draft_hf, "index_topk", 0))
         if self._share_mtp_indices:
             logger.info(
                 "MTP draft index_share_for_mtp_iteration enabled: "
-                "step 0 computes indexer top-k, steps 1+ reuse the buffer."
+                "for requests longer than index_topk=%d, steps 1+ reuse "
+                "step-0 indexer top-k.",
+                self._mtp_index_topk,
             )
 
     def _resolve_mtp_k(self) -> int:
@@ -225,6 +230,7 @@ class EagleProposer(Drafter):
             )
         finally:
             context.is_draft = was_draft
+
     @property
     def fills_chunk_kv(self) -> bool:
         # Plain MTP only. The eagle3 MHA draft owns a sibling KV pool and needs
@@ -341,6 +347,11 @@ class EagleProposer(Drafter):
         # non-equivalent). Hoisted out of the loop so the value is bound for
         # every iteration (used at i>=1 too, even though i==0 sets it).
         has_flat_kv = "kv_indices" in var
+        bypass_mtp_index_reuse = (
+            self._share_mtp_indices
+            and context.is_prefill
+            and attn_metadata.max_seqlen_k <= self._mtp_index_topk
+        )
 
         for i in range(self.mtp_k):
             with record_function(f"draft[{i}/{self.mtp_k} bs={bs}]"):
@@ -376,8 +387,9 @@ class EagleProposer(Drafter):
                         positions,
                         hidden_states,
                     )
-                # index_share_for_mtp_iteration: step 0 runs the MTP indexer;
-                # steps 1+ skip it and read the compacted sparse_kv buffer.
+                # Normal index sharing reuses step 0's compacted sparse buffer.
+                # On short prefill the indexer has no step-0 output, so leave it
+                # enabled for subsequent draft decode steps.
                 if self._share_mtp_indices and i == 0:
                     self.model.model.set_skip_topk(False)
                 ret_hidden_states = self.model(
@@ -389,7 +401,7 @@ class EagleProposer(Drafter):
                     ret_hidden_states = pcp_allgather_rerange(
                         ret_hidden_states, pcp_ws
                     )[:n_global_draft]
-                if self._share_mtp_indices and i == 0:
+                if self._share_mtp_indices and i == 0 and not bypass_mtp_index_reuse:
                     self.model.model.set_skip_topk(True)
                     self.model.model.compact_topk_indices(last_token_indices)
 
