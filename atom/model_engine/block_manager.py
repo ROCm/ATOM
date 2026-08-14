@@ -585,12 +585,12 @@ class BlockManager:
         end = min(end, len(seq.block_table))
         if start >= end:
             return
-        # Watermark for the decode-side continuation, maintained here so every
-        # prefill path feeds it without knowing about it.
-        seq.num_hashed_tokens = max(seq.num_hashed_tokens, end * hbs)
         h = self._chain_parent_hash(seq, start)
         if h is None:
             return
+        # Watermark for the decode-side continuation, maintained here so every
+        # prefill path feeds it without knowing about it.
+        seq.num_hashed_tokens = max(seq.num_hashed_tokens, end * hbs)
         record = self._event_log is not None
         store_run_parent: int | None = h if h != -1 else None
         store_run_hashes: list[int] = []
