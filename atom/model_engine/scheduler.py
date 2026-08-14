@@ -234,7 +234,7 @@ class CacheStats:
         #                 cached < wanted: a checkpoint at that boundary would
         #                 have unlocked reuse the paged pool was still
         #                 holding. The state cache's own miss, and the only
-        #                 counter that argues for spending bytes on groups.
+        #                 counter that argues for spending bytes on slots.
         #   state_miss    cached < compressed: the paged pool had more prefix
         #                 than the state gates would admit, for any reason.
         #                 Superset of the above; the difference is the part no
@@ -460,7 +460,7 @@ class CacheStats:
         cache's score and point tuning at the wrong pool.
 
         `+ckpt` is where `state` would land if every ladder were dense. It is
-        the ceiling on what checkpoint placement or more groups can buy; if it
+        the ceiling on what checkpoint placement or more slots can buy; if it
         sits near `state`, the state cache is already doing all it can and the
         remaining loss is the paged pool's.
         """
@@ -1698,7 +1698,7 @@ class Scheduler:
 
             # Reserve midstep checkpoint destinations for the chunks just
             # settled. Here rather than inside `_finalize_prefill_chunk`
-            # because a reservation takes a group off the free list, and
+            # because a reservation takes a slot off the free list, and
             # admission for this pass only finishes above — planning any
             # earlier would let a checkpoint's destination compete with a
             # request still to be let in. The batch below snapshots what this
@@ -1855,7 +1855,7 @@ class Scheduler:
         """Clear the fork flags the batch just snapshotted.
 
         A fork describes one forward: the batch carries `state_fork_src`, and
-        every later batch for the same seq must read and write the same group
+        every later batch for the same seq must read and write the same slot
         again. Cleared here rather than in the batch constructor so the snapshot
         stays free of side effects on Sequence.
         """
@@ -2040,7 +2040,7 @@ class Scheduler:
            position this seq itself was seen to want), shortening to the
            previous rung; `BlockManager.checkpoint_cut` owns the arithmetic, so
            that it cannot drift from the rule deciding what actually gets kept.
-        2. The forward carrying a fork has to fill the request's new group by
+        2. The forward carrying a fork has to fill the request's new slot by
            itself. If the budget left a chunk too short for that, drop the fork
            rather than the request — unless the source is shared with another
            request forking off it this step, which rules out taking it over. Then
@@ -2072,7 +2072,7 @@ class Scheduler:
         0 means "do not checkpoint here", for any of three reasons:
 
         - the request stops on this step, so there is nothing after it: no
-          forward to fork into the group a checkpoint would hand away, and no
+          forward to fork into the slot a checkpoint would hand away, and no
           batch to issue a copy on either;
         - the seq is still on its prompt, where the prefill call site has
           already decided using the prompt's own remainder;
@@ -2091,7 +2091,7 @@ class Scheduler:
         destination is complete when the copy lands, so any decode step will do.
 
         Otherwise plain decode carries exactly one token, and whether that is
-        enough to fill a fresh group is the backend's `min_fork_tokens` to say.
+        enough to fill a fresh slot is the backend's `min_fork_tokens` to say.
         """
         if finished or seq.type != SequenceType.DECODE:
             return 0
@@ -2817,7 +2817,7 @@ class Scheduler:
         Offload waiters already own allocated blocks. If a fresh request at the
         head cannot allocate while a completed waiter sits behind it, the waiter
         cannot finish and free blocks. Preserve FIFO order within the ready and
-        blocked groups.
+        blocked slots.
         """
         if not self.waiting or not (
             self.finished_recving_kv_req_ids or self.failed_recving_kv_req_ids
@@ -3352,6 +3352,8 @@ class DecodeScheduler(Scheduler):
                 num_spec_step=self.mtp_k,
                 scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
                 cu_stream_fraction=self.cu_fraction,
+                # Queued maintenance has to reach a batch, or the slot it was
+                # filed against still holds the previous occupant's state.
                 state_maintenance_ops=self.block_manager.take_state_maintenance_ops(),
             ),
             scheduled_seqs,
