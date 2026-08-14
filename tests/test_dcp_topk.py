@@ -249,20 +249,27 @@ def _filter_owned(token_indices, ctx, rank, world, block_size=16):
     dev = token_indices.device
     vbs = block_size * world
     n_blocks = (ctx + vbs - 1) // vbs
-    block_table = (
-        torch.arange(rows * n_blocks, dtype=torch.int32, device=dev)
-        .reshape(rows, n_blocks)
+    block_table = torch.arange(rows * n_blocks, dtype=torch.int32, device=dev).reshape(
+        rows, n_blocks
     )
     qo_indptr = torch.arange(rows + 1, dtype=torch.int32, device=dev)
-    g_kv_indptr = (torch.arange(rows + 1, dtype=torch.int32, device=dev) * ctx)
+    g_kv_indptr = torch.arange(rows + 1, dtype=torch.int32, device=dev) * ctx
     out_kv_indptr = torch.zeros(rows + 1, dtype=torch.int32, device=dev)
     owned_counts = torch.zeros(rows, dtype=torch.int32, device=dev)
     out = torch.zeros(rows * TOPK, dtype=torch.int32, device=dev)
 
     triton_filter_and_convert_dcp_index(
-        qo_indptr, g_kv_indptr, block_table, token_indices,
-        rank, world, block_size, out_kv_indptr, owned_counts,
-        NUM_TOPK_TOKENS=TOPK, out=out,
+        qo_indptr,
+        g_kv_indptr,
+        block_table,
+        token_indices,
+        rank,
+        world,
+        block_size,
+        out_kv_indptr,
+        owned_counts,
+        NUM_TOPK_TOKENS=TOPK,
+        out=out,
     )
 
     # slot = block_table[req, g // vbs] * block_size + (g % vbs) // W, and the
@@ -295,7 +302,9 @@ def test_filter_partitions_topk_disjointly(name, rows, ctx, world):
     for rank in range(world):
         for r, g in enumerate(_filter_owned(out, ctx, rank, world)):
             ids = set(g.cpu().tolist())
-            assert all(i % world == rank for i in ids), f"[{name}] rank {rank} kept a foreign position"
+            assert all(
+                i % world == rank for i in ids
+            ), f"[{name}] rank {rank} kept a foreign position"
             assert not (union[r] & ids), f"[{name}] rank {rank} overlaps another rank"
             union[r] |= ids
 
@@ -335,7 +344,9 @@ def _build_prefill_topk(kv_lens, bases, layout, k=TOPK, seed=7):
         if kv_len <= k:
             sel = torch.arange(n, dtype=torch.int32)
         else:
-            sel = torch.randperm(kv_len, generator=gen)[:k].sort().values.to(torch.int32)
+            sel = (
+                torch.randperm(kv_len, generator=gen)[:k].sort().values.to(torch.int32)
+            )
         cols = (
             torch.arange(n)
             if layout == "compact"
@@ -345,8 +356,9 @@ def _build_prefill_topk(kv_lens, bases, layout, k=TOPK, seed=7):
     return ti.to(DEV)
 
 
-def _filter_owned_prefill(ti, kv_lens, token_req, cu_seqlens_k, ctx_max, rank,
-                          world, block_size=16):
+def _filter_owned_prefill(
+    ti, kv_lens, token_req, cu_seqlens_k, ctx_max, rank, world, block_size=16
+):
     """Run the production prefill filter for one rank; return owned positions."""
     from atom.model_ops.dcp_ops import triton_filter_and_convert_dcp_index_prefill
 
@@ -354,10 +366,9 @@ def _filter_owned_prefill(ti, kv_lens, token_req, cu_seqlens_k, ctx_max, rank,
     vbs = block_size * world
     n_blocks = (ctx_max + vbs - 1) // vbs
     num_req = cu_seqlens_k.numel() - 1
-    block_table = (
-        torch.arange(num_req * n_blocks, dtype=torch.int32, device=DEV)
-        .reshape(num_req, n_blocks)
-    )
+    block_table = torch.arange(
+        num_req * n_blocks, dtype=torch.int32, device=DEV
+    ).reshape(num_req, n_blocks)
     dsa_kv_indptr = torch.zeros(rows + 1, dtype=torch.int32, device=DEV)
     dsa_kv_indptr[1:] = torch.tensor(kv_lens, device=DEV).cumsum(0).to(torch.int32)
     out_kv_indptr = torch.zeros(rows + 1, dtype=torch.int32, device=DEV)
@@ -365,9 +376,18 @@ def _filter_owned_prefill(ti, kv_lens, token_req, cu_seqlens_k, ctx_max, rank,
     out = torch.zeros(rows * TOPK, dtype=torch.int32, device=DEV)
 
     triton_filter_and_convert_dcp_index_prefill(
-        dsa_kv_indptr, token_req, ti, cu_seqlens_k, block_table,
-        rank, world, block_size, out_kv_indptr, owned_counts,
-        NUM_TOPK_TOKENS=TOPK, out=out,
+        dsa_kv_indptr,
+        token_req,
+        ti,
+        cu_seqlens_k,
+        block_table,
+        rank,
+        world,
+        block_size,
+        out_kv_indptr,
+        owned_counts,
+        NUM_TOPK_TOKENS=TOPK,
+        out=out,
     )
 
     per_row = []
@@ -391,8 +411,9 @@ def _filter_owned_prefill(ti, kv_lens, token_req, cu_seqlens_k, ctx_max, rank,
         ("W=2", [1000], [0], [999], 2),
     ],
 )
-def test_prefill_filter_is_layout_independent(name, ctxs, token_req, kv_lens,
-                                              world, layout):
+def test_prefill_filter_is_layout_independent(
+    name, ctxs, token_req, kv_lens, world, layout
+):
     cu = [0]
     for c in ctxs:
         cu.append(cu[-1] + c)
@@ -408,16 +429,17 @@ def test_prefill_filter_is_layout_independent(name, ctxs, token_req, kv_lens,
 
     union = [set() for _ in kv_lens]
     for rank in range(world):
-        owned = _filter_owned_prefill(ti, kv_lens, treq, cu_seqlens_k,
-                                      max(ctxs), rank, world)
+        owned = _filter_owned_prefill(
+            ti, kv_lens, treq, cu_seqlens_k, max(ctxs), rank, world
+        )
         for t, pos in enumerate(owned):
             ids = set(pos.cpu().tolist())
-            assert all(i % world == rank for i in ids), (
-                f"[{name}/{layout}] rank {rank} token {t} kept a foreign position"
-            )
-            assert not (union[t] & ids), (
-                f"[{name}/{layout}] rank {rank} token {t} overlaps another rank"
-            )
+            assert all(
+                i % world == rank for i in ids
+            ), f"[{name}/{layout}] rank {rank} token {t} kept a foreign position"
+            assert not (
+                union[t] & ids
+            ), f"[{name}/{layout}] rank {rank} token {t} overlaps another rank"
             union[t] |= ids
 
     for t in range(len(kv_lens)):
