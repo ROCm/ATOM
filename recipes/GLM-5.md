@@ -48,7 +48,7 @@ python -m atom.entrypoints.openai_server \
 
 #### GLM-5.2 MXFP4 with DPA
 
-The native ATOM backend supports GLM-5.2 MXFP4 with Data Parallel Attention (DPA) and an FP8 KV cache on MI355/gfx950.
+The native ATOM backend supports GLM-5.2 MXFP4 with Data Parallel Attention (DPA) and FP8 KV cache.
 
 Use `-tp 4` or `-tp 8` for the validated TP4 and TP8 configurations:
 
@@ -67,9 +67,7 @@ python3 -m atom.entrypoints.openai_server \
   --server-port 8010 \
   -tp <4-or-8> \
   --max-num-seqs 512 \
-  --enable-dp-attention \
-  --attn-prefill-chunk-size 131072 \
-  --long-prefill-token-threshold 131072
+  --enable-dp-attention
 ```
 
 The full 1319-sample GSM8K 20-shot evaluation with 65 concurrent requests produced the following results:
@@ -85,10 +83,9 @@ TP8 + DPA:
 
 |Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
 |-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
-|gsm8k|      3|flexible-extract|    20|exact_match|↑  |0.9340|±  |0.0068|
-|     |       |strict-match    |    20|exact_match|↑  |0.9363|±  |0.0067|
+|gsm8k|      3|flexible-extract|    20|exact_match|↑  |0.9295|±  |0.0071|
+|     |       |strict-match    |    20|exact_match|↑  |0.9303|±  |0.0070|
 
-DPA cannot currently be combined with PCP. PCP-only continues to use the existing MLA/PCP path.
 
 #### GLM-5.2 MXFP4 MTP Server
 
