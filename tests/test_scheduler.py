@@ -416,7 +416,12 @@ class TestSchedule:
         assert list(sched.waiting) == [new]
 
     @pytest.mark.parametrize("first_terminal", ["load", "save"])
-    def test_aborted_load_and_save_both_finish_before_release(self, first_terminal):
+    @pytest.mark.parametrize("producer_mode", [False, True])
+    def test_aborted_load_and_save_both_finish_before_release(
+        self,
+        first_terminal,
+        producer_mode,
+    ):
         load = LoadOperationId(97, 3)
         save = SaveOperationId(97, 4)
         seq = SimpleNamespace(
@@ -430,11 +435,11 @@ class TestSchedule:
         events = []
 
         class _Connector:
-            is_producer = False
             is_offload = True
             completion_channels = frozenset()
 
             def __init__(self):
+                self.is_producer = producer_mode
                 self.pending_save = True
 
             def load_finished(self, operation):
@@ -468,7 +473,8 @@ class TestSchedule:
         sched._reject_aborted_waiting(seq)
 
         assert sched.deferred_free_blocks == {seq.id: seq}
-        assert seq._deferred_release_obligations == {"load"}
+        assert seq._awaiting_aborted_load_cleanup is True
+        assert not hasattr(seq, "_kv_send_completed")
 
         outputs = {
             "load": KVConnectorOutput(finished_loading={load}),
@@ -1762,6 +1768,57 @@ class TestPostprocess:
         seq = self._prefill(scheduler, seq_factory([1, 2, 3, 4]))
         scheduler.postprocess(list(scheduler.running), self._output(seq.id, [2]))
         assert scheduler.get_request_counts() == (0, 0)
+
+    def test_finished_composite_request_uses_connector_release_contract(
+        self,
+        scheduler,
+        seq_factory,
+    ):
+        seq = self._prefill(scheduler, seq_factory([1, 2, 3, 4]))
+        operation = SaveOperationId(seq.id, 1)
+        finish_calls = []
+
+        class _CompositeConnector:
+            is_producer = True
+            is_offload = True
+            completion_channels = frozenset()
+
+            def __init__(self):
+                self.pending_save = True
+
+            def request_finished(self, value):
+                finish_calls.append(value)
+
+            def should_defer_free(self, value):
+                assert value is seq
+                return self.pending_save
+
+            def save_finished(self, value):
+                assert value == operation
+                self.pending_save = False
+
+        scheduler.kv_connector = _CompositeConnector()
+
+        finished = scheduler.postprocess(
+            list(scheduler.running),
+            self._output(seq.id, [2]),
+        )
+
+        assert finished == [seq]
+        assert scheduler.deferred_free_blocks == {seq.id: seq}
+        assert seq._kv_send_completed is False
+        assert finish_calls == [seq]
+
+        scheduler._update_from_kv_xfer_finished(
+            KVConnectorOutput(
+                finished_sending={seq.id},
+                finished_saving={operation},
+            )
+        )
+
+        assert scheduler.deferred_free_blocks == {}
+        assert not hasattr(seq, "_kv_send_completed")
+        assert finish_calls == [seq, seq]
 
 
 # ── get_next_batch_info ────────────────────────────────────────────────────

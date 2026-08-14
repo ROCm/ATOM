@@ -389,3 +389,9 @@ class OffloadSchedulerMixin:
         if entry is None:
             return False
         return self._save_frontier(seq) > int(entry[1])
+
+    def _has_active_load(self, seq) -> bool:
+        """Return whether this concrete request lifecycle still owns a load."""
+
+        active = self._active_load_operations.get(str(seq.id))
+        return active is not None and active[0] is seq

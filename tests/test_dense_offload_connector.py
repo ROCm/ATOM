@@ -190,6 +190,20 @@ def test_dense_consumer_role_does_not_defer_for_saves(monkeypatch):
     assert scheduler.should_defer_free(seq) is False
 
 
+def test_dense_active_load_defers_only_its_concrete_lifecycle(monkeypatch):
+    scheduler = _scheduler(monkeypatch, "kv_consumer")
+    seq = _load_seq(20)
+    replacement = _load_seq(20)
+    operation = LoadOperationId(seq.id, 3)
+    scheduler._active_load_operations[str(seq.id)] = (seq, operation)
+
+    assert scheduler.should_defer_free(seq) is True
+    assert scheduler.should_defer_free(replacement) is False
+
+    assert scheduler.load_finished(operation) is True
+    assert scheduler.should_defer_free(seq) is False
+
+
 def test_dense_reused_request_id_resets_save_frontier(monkeypatch):
     scheduler = _scheduler(monkeypatch)
     first = SimpleNamespace(

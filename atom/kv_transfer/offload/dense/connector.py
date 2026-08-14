@@ -652,6 +652,8 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         return meta
 
     def should_defer_free(self, seq) -> bool:
+        if self._has_active_load(seq):
+            return True
         if not self._do_save:
             return False
         sid = str(seq.id)

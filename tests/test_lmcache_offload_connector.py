@@ -1643,8 +1643,12 @@ def test_scheduler_consumer_role_only_emits_loads_without_save_deferral():
     assert sched.should_park_for_load_after_alloc(seq) is True
     meta = sched.build_connector_meta()
 
-    assert len([req for req in meta.requests if req.load_spec is not None]) == 1
+    loads = [req for req in meta.requests if req.load_spec is not None]
+    assert len(loads) == 1
     assert sched._save_tracker == {}
+    assert sched.should_defer_free(seq) is True
+
+    assert sched.load_finished(loads[0].load_operation) is True
     assert sched.should_defer_free(seq) is False
 
 
@@ -2842,7 +2846,7 @@ def test_producer_send_then_save_releases_same_sequence_lifecycle():
 
 def test_producer_save_before_send_never_deallocates_early():
     operation = SaveOperationId(727, 41)
-    seq = SimpleNamespace(id=727)
+    seq = SimpleNamespace(id=727, _kv_send_completed=False)
     deallocated = []
 
     class _Connector:
@@ -2881,7 +2885,7 @@ def test_producer_save_before_send_never_deallocates_early():
 def test_late_save_from_reused_id_cannot_release_new_sequence_before_send():
     old_operation = SaveOperationId(728, 42)
     new_operation = SaveOperationId(728, 43)
-    new_seq = SimpleNamespace(id=728)
+    new_seq = SimpleNamespace(id=728, _kv_send_completed=False)
     deallocated = []
 
     class _Connector:

@@ -1010,61 +1010,20 @@ class Scheduler:
         except (TypeError, ValueError):
             return None
 
-    def _pop_deferred_sequence(self, req_id) -> Sequence | None:
-        seq = self.deferred_free_blocks.pop(req_id, None)
-        if seq is not None:
-            return seq
-        try:
-            return self.deferred_free_blocks.pop(int(req_id), None)
-        except (TypeError, ValueError):
-            return None
-
-    def _deferred_release_obligations(self, seq: Sequence) -> set[str]:
-        """Return the load/save/send obligations protecting ``seq``.
-
-        The lazy inference preserves deferred lifecycles created by older
-        connectors and tests. New scheduler paths create the set explicitly,
-        which is important for an aborted load on a composite connector: it
-        must not acquire a producer-send obligation merely because another
-        child connector is a producer.
-        """
-
-        obligations = getattr(seq, "_deferred_release_obligations", None)
-        if obligations is None:
-            obligations = set()
-            awaiting_load = bool(getattr(seq, "_awaiting_aborted_load_cleanup", False))
-            if awaiting_load:
-                obligations.add("load")
-            if (
-                self._connector_flag("is_producer")
-                and not awaiting_load
-                and not getattr(seq, "_kv_send_completed", False)
-            ):
-                obligations.add("send")
-            seq._deferred_release_obligations = obligations
-        return obligations
-
-    def _set_release_obligation(self, seq: Sequence, obligation: str) -> None:
-        self._deferred_release_obligations(seq).add(obligation)
-
-    def _clear_release_obligation(self, seq: Sequence, obligation: str) -> None:
-        self._deferred_release_obligations(seq).discard(obligation)
-
-    def _refresh_save_release_obligation(self, seq: Sequence) -> None:
-        obligations = self._deferred_release_obligations(seq)
+    def _connector_should_defer_free(self, seq: Sequence) -> bool:
         callback = getattr(self.kv_connector, "should_defer_free", None)
-        if callable(callback) and callback(seq):
-            obligations.add("save")
-        else:
-            obligations.discard("save")
+        return bool(callable(callback) and callback(seq))
 
-    def _release_deferred_if_ready(self, seq: Sequence) -> bool:
-        """Deallocate ``seq`` only after every async reader is terminal."""
+    def _maybe_release_deferred(self, seq: Sequence) -> bool:
+        """Deallocate after the connector and producer send are terminal."""
 
         if self._deferred_sequence(seq.id) is not seq:
             return False
-        self._refresh_save_release_obligation(seq)
-        if self._deferred_release_obligations(seq):
+        if getattr(seq, "_awaiting_aborted_load_cleanup", False):
+            return False
+        if getattr(seq, "_kv_send_completed", True) is False:
+            return False
+        if self._connector_should_defer_free(seq):
             return False
 
         # A second finish notification is intentional for a lifecycle that was
@@ -1074,18 +1033,16 @@ class Scheduler:
         callback = getattr(self.kv_connector, "request_finished", None)
         if callable(callback):
             callback(seq)
-        self._refresh_save_release_obligation(seq)
-        if self._deferred_release_obligations(seq):
+        if self._connector_should_defer_free(seq):
             return False
 
-        released = self._pop_deferred_sequence(seq.id)
+        released = self.deferred_free_blocks.pop(seq.id, None)
         assert (
             released is seq
         ), f"deferred request ID {seq.id!r} changed lifecycle before release"
         for marker in (
             "_kv_send_completed",
             "_send_operation",
-            "_deferred_release_obligations",
         ):
             if hasattr(seq, marker):
                 delattr(seq, marker)
@@ -1753,10 +1710,6 @@ class Scheduler:
         seq.leave_reason = "aborted"
         self._rejected.append(seq)
         if owns_remote_resources or has_inflight_load:
-            # This is a load lifecycle, even when a composite connector also
-            # has a producer child. Start from an explicit empty set so legacy
-            # producer inference cannot invent a send obligation for an abort.
-            seq._deferred_release_obligations = set()
             self._defer_free(seq)
             active_operation = getattr(seq, "_active_load_operation", None)
             consumed_operation = getattr(seq, "_consumed_load_operation", None)
@@ -1779,12 +1732,10 @@ class Scheduler:
                 self._cleanup_aborted_load(seq)
                 return
             seq._awaiting_aborted_load_cleanup = True
-            self._set_release_obligation(seq, "load")
         else:
             self._uncount_inflight_load(seq)
 
     def _cleanup_aborted_load(self, seq: Sequence) -> None:
-        self._clear_release_obligation(seq, "load")
         if hasattr(seq, "_awaiting_aborted_load_cleanup"):
             delattr(seq, "_awaiting_aborted_load_cleanup")
         self._uncount_inflight_load(seq)
@@ -1796,7 +1747,7 @@ class Scheduler:
         ):
             if hasattr(seq, marker):
                 delattr(seq, marker)
-        self._release_deferred_if_ready(seq)
+        self._maybe_release_deferred(seq)
 
     def _finish_aborted_load_cleanup(self, completion_id) -> bool:
         req_id = (
@@ -2612,22 +2563,22 @@ class Scheduler:
             if self.kv_connector is not None:
                 if hasattr(self.kv_connector, "request_finished"):
                     self.kv_connector.request_finished(seq)
-                # Establish every reader obligation before deciding whether the
-                # allocation can be returned. A composite connector may need
-                # both a producer send and an offload save to finish.
-                seq._deferred_release_obligations = set()
+                # Producer completion is scheduler-owned; save/load liveness is
+                # exposed by the connector's existing should_defer_free API.
                 if self._connector_flag("is_producer"):
-                    self._set_release_obligation(seq, "send")
-                self._refresh_save_release_obligation(seq)
-                if self._deferred_release_obligations(seq):
+                    seq._kv_send_completed = False
+                send_pending = getattr(seq, "_kv_send_completed", True) is False
+                connector_pending = self._connector_should_defer_free(seq)
+                if send_pending or connector_pending:
                     logger.debug(
-                        "Deferring block free for seq %s; pending KV obligations=%s",
+                        "Deferring block free for seq %s; send_pending=%s "
+                        "connector_pending=%s",
                         seq.id,
-                        sorted(self._deferred_release_obligations(seq)),
+                        send_pending,
+                        connector_pending,
                     )
                     self._defer_free(seq)
                 else:
-                    delattr(seq, "_deferred_release_obligations")
                     self.block_manager.deallocate(seq)
             else:
                 self.block_manager.deallocate(seq)
@@ -2951,14 +2902,13 @@ class Scheduler:
                 continue
             assert seq is not None, f"req_id={req_id} not found in deferred_free_blocks"
             seq._kv_send_completed = True
-            self._clear_release_obligation(seq, "send")
-            self._release_deferred_if_ready(seq)
+            self._maybe_release_deferred(seq)
 
         for req_id in finished_saving:
             raw_req_id = _raw_req_id(req_id)
             seq = self._deferred_sequence(raw_req_id)
             if seq is not None:
-                self._release_deferred_if_ready(seq)
+                self._maybe_release_deferred(seq)
 
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""

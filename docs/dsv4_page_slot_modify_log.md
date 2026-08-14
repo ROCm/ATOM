@@ -13,8 +13,9 @@
 
 本轮按 merge-base 之后的完整净 diff 复核并处理了以下问题：
 
-- Scheduler 将 load/save/send 建模为独立 deferred-release obligations；任一异步
-  terminal 都不能越过另一个仍在读写 PAGE/SLOT 的 operation 提前 deallocate。
+- Dense/DSV4 的 `should_defer_free()` 统一覆盖 active load/save；Scheduler 只保留
+  producer send 的三态 marker 和一个最终 release helper。任一异步 terminal 都不能
+  越过另一个仍在读写 PAGE/SLOT 的 operation 提前 deallocate。
 - Dense save 全面使用 `SaveOperationId`；Multi 对同一 request 保留所有 exact
   `SendOperationId`，迟到旧 generation 不再覆盖当前 generation。
 - checkpoint lease 批量申请中途失败时，以 `preserve=False` 回滚本轮已取得 lease。
@@ -50,9 +51,9 @@
 当前聚焦验证结果：
 
 ```text
-最终聚焦回归矩阵                             642 passed
+最终聚焦回归矩阵                             647 passed
 Triton/Store/Policy 扩展矩阵                    77 passed, 7 skipped
-全仓非插件/非服务集成单测                     1769 passed, 107 skipped
+全仓非插件/非服务集成单测                     1774 passed, 107 skipped
 Black --check --fast（全仓）                      PASS
 Ruff（本次全部 Python 变更）                     PASS
 compileall                                       PASS
@@ -61,6 +62,42 @@ git diff --check                                 PASS
 
 全仓 Ruff 仍报告 19 个不在本分支净 diff 中的既有错误；GitHub workflow 使用
 `reviewdog -filter-mode=diff_context`，本轮变更行无 Ruff violation。
+
+## 2026-08-13：复用 Dense offload release contract 收缩 Scheduler
+
+第一版 correctness 修复曾在 `Scheduler` 中维护：
+
+```text
+_deferred_release_obligations = {load, save, send}
+```
+
+该集合能覆盖 terminal 的所有到达顺序，但重复表达了 Dense/DSV4 scheduler 已经拥有
+的 load/save 生命周期。收缩后由 connector 回答它是否仍持有 GPU block reader：
+
+```text
+Dense/DSV4 OffloadScheduler.should_defer_free(seq)
+    = exact active load for this Sequence object
+      OR pending/inflight PAGE save
+      OR pending/inflight SLOT save (DSV4)
+
+MultiConnectorScheduler.should_defer_free(seq)
+    = any(child.should_defer_free(seq))
+
+Scheduler._maybe_release_deferred(seq)
+    if aborted load terminal 尚未到达: hold
+    if producer send marker == False: hold
+    if connector.should_defer_free(seq): hold
+    else: request_finished cleanup -> deallocate
+```
+
+`_kv_send_completed` 现在是三态语义：属性不存在表示该 lifecycle 从未要求 send，
+`False` 表示 producer send pending，`True` 表示 send terminal 已到达。这样 composite
+connector 上被 abort 的 offload load 不会凭全局 `is_producer=True` 虚构一个 send。
+
+本次相对第一版在 `scheduler.py` 净删除 50 行，并新增 real `postprocess` 入口、
+load/save 两种 terminal 顺序、producer composite abort、active-load exact lifecycle
+回归覆盖。checkpoint freelist lease 仍由 Scheduler/BlockManager 管理，因为它不属于
+worker-side LMCache payload 生命周期。
 
 ## 2026-08-13：移除 MultiConnector 中的 DSV4 completion 语义
 

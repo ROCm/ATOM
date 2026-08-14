@@ -2761,6 +2761,8 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         return self._sidecar_save_candidate(seq, computed) is not None
 
     def should_defer_free(self, seq) -> bool:
+        if self._has_active_load(seq):
+            return True
         if not self._do_save:
             return False
         sid = str(seq.id)
