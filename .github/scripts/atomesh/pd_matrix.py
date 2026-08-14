@@ -206,7 +206,9 @@ def role_env(
         model_cfg.get("env", {}).get(role, {}),
         suite_cfg.get("env", {}).get(role, {}),
     )
-    env = resolve_env_refs_in_value(env, preserve_names={"ROLE_IP"})
+    env = resolve_env_refs_in_value(
+        env, preserve_names={"ROLE_IP", "HANDSHAKE_PORT"}
+    )
     return {str(key): str(value) for key, value in env.items()}
 
 
