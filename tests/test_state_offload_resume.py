@@ -94,14 +94,17 @@ def resident_publisher(bm: BlockManager, tokens: list[int]) -> tuple[int, int]:
     return h, boundary
 
 
-def spilled_publisher(bm: BlockManager, tokens: list[int]) -> int:
+def spilled_publisher(bm: BlockManager, tokens: list[int]) -> tuple[int, int]:
     """Run a prompt to its checkpoint boundary, then spill that checkpoint.
 
-    Returns the boundary hash, which afterwards is in the tier's index and
-    nowhere in HBM -- exactly the state the branch reaches once a real spill is
-    confirmed by `Scheduler._update_from_kv_xfer_finished`.
+    Returns `(boundary hash, boundary in tokens)`. The hash is afterwards in
+    the tier's index and nowhere in HBM -- exactly the state the branch reaches
+    once a real spill is confirmed by
+    `Scheduler._update_from_kv_xfer_finished`. The boundary comes back too so a
+    caller can pin the resumer's hit against a figure it did not measure from
+    the thing under test.
     """
-    h, _ = resident_publisher(bm, tokens)
+    h, boundary = resident_publisher(bm, tokens)
     group = bm.state.lookup(h)
     assert group >= 0, "the publisher kept no checkpoint"
     # What `pop()` does to a checkpoint it spends, minus the pool pressure:
@@ -114,7 +117,7 @@ def spilled_publisher(bm: BlockManager, tokens: list[int]) -> int:
     bm.state.invalidate(group)
     assert bm.state.lookup(h) == -1  # gone from HBM
     assert h in bm.state_offload.hashes  # present in the tier
-    return h
+    return h, boundary
 
 
 def test_the_tier_is_installed_when_the_connector_hosts_it(monkeypatch):
@@ -166,16 +169,24 @@ def test_the_blocks_of_a_disowned_boundary_are_still_reused(monkeypatch):
     monkeypatch.setenv("OFFLOAD_STATE", "1")
     loads_wired(monkeypatch)
     bm = BlockManager(tier_config())
-    spilled_publisher(bm, list(range(40)))
+    _, boundary = spilled_publisher(bm, list(range(40)))
 
     free_before = bm.kv.num_free
     resumer = stateful_seq(list(range(40)))
     hit = bm.can_allocate(resumer)
+    total = bm._dcp_num_blocks(len(resumer))
+    # Pin the hit independently. The free-pool assertion below is written in
+    # terms of `hit`, so it would hold for whatever `can_allocate` returned --
+    # including 0, where "the hit's blocks were reused" is vacuously true
+    # because there were none. The publisher only hashed as far as its
+    # checkpoint boundary, so that boundary in blocks is the whole hit.
+    assert hit == boundary // bm.hash_block_size
+    assert 0 < hit < total
     bm.allocate(resumer, hit)
-    assert len(resumer.block_table) == bm._dcp_num_blocks(len(resumer))
+    assert len(resumer.block_table) == total
     # Only the blocks past the hit came off the free pool; the hit's own were
     # claimed out of the index.
-    assert bm.kv.num_free == free_before - (bm._dcp_num_blocks(len(resumer)) - hit)
+    assert bm.kv.num_free == free_before - (total - hit)
 
 
 def test_an_hbm_checkpoint_is_still_resumed_with_the_tier_on(monkeypatch):
@@ -278,8 +289,12 @@ def test_a_disowned_request_reports_no_prefix_cache_hit(monkeypatch):
 
     resumer = stateful_seq(list(range(40)))
     sched.add(resumer)
-    sched.schedule()
+    _, scheduled = sched.schedule()
 
+    # Both assertions below check for 0, which is also the untouched default:
+    # a resumer the scheduler never admitted would satisfy them without the
+    # disown path running at all. Pin that it was actually scheduled first.
+    assert resumer.id in scheduled, "the resumer was never scheduled"
     assert resumer.num_cached_tokens == 0, "the boundary was not disowned"
     assert resumer.prefix_cache_hit_tokens == 0
 
