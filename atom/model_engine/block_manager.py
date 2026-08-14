@@ -111,10 +111,6 @@ class BlockManager:
         self.state_checkpoint_interval_tokens = max(
             0, int(getattr(config, "state_checkpoint_interval_tokens", 0) or 0)
         )
-        # Fork-transfer backends keep checkpoints in free state groups. A
-        # copy-transfer backend uses groups only as Active Slots; its immutable
-        # checkpoint index owns arbitrary PAGE units through
-        # `PageUnitCheckpointStore`.
         self.state_runtime = state_runtime
         checkpoint_spec = state_runtime.checkpoint_spec
         self.page_checkpoints: PageUnitCheckpointStore | None = None
@@ -190,13 +186,7 @@ class BlockManager:
         self.state.release_pins()
 
     def take_state_maintenance_ops(self) -> StateMaintenanceOps:
-        """Drain every state-maintenance op into one scheduled batch.
-
-        Keeping this one call is important for PAGE-backed checkpoints: their
-        records are reserved in COPYING state while this batch is being built,
-        and are made READY only when the next scheduling pass confirms the
-        batch carrying their scatter has been issued.
-        """
+        """Drain state maintenance for the batch being built."""
         return self.state.take_state_maintenance_ops()
 
     def _record_evicted(self, h: int) -> None:
@@ -325,10 +315,7 @@ class BlockManager:
         Caller (scheduler) passes the returned hit count to `allocate()`,
         avoiding a second hash pass.
         """
-        # State cache (mamba / V4 compressor ring) has its own pre-allocated
-        # Active Slot tensor, so the running request only needs a free slot
-        # index. PAGE-backed immutable checkpoints do consume PAGE units, and
-        # `_has_page_units` below counts only records that can be evicted whole.
+        # Active Slots are preallocated; PAGE checkpoints share the KV pool.
         if seq.has_per_req_cache and not self.state.has_free():
             return -1
         if not self.enable_prefix_caching:
@@ -404,9 +391,7 @@ class BlockManager:
             block_id = self.kv.lookup(h)
             self.kv.claim(block_id)
             seq.block_table.append(block_id)
-        # Pin and schedule the PAGE-unit restore before taking fresh blocks.
-        # Otherwise `_fresh_block` could choose the very checkpoint that made
-        # this hit resumable as its LRU victim between gating and attach.
+        # Pin the restore before fresh blocks can evict its checkpoint.
         if seq.has_per_req_cache and self.page_checkpoints is not None:
             self._attach_state_group(seq, h if num_cached_blocks > 0 else -1)
         for _ in range(num_cached_blocks, self._dcp_num_blocks(len(seq))):
@@ -430,11 +415,8 @@ class BlockManager:
         start). `can_allocate` already shrank the hit to a boundary that carries
         a checkpoint, so a lookup miss here just means the pool is off.
 
-        A PAGE-backed checkpoint stays indexed and is gathered into a fresh,
-        complete Active Slot. A fork-backed checkpoint stays in its state group
-        and the resumer writes a fresh group while reading it. Only the fork
-        representation can adopt its source group when no second group exists;
-        PAGE fragments are never a kernel-visible request slot.
+        PAGE checkpoints gather into a fresh slot; only fork checkpoints can
+        be adopted as request slots.
 
         A checkpoint is read-only, so several requests in one step may resume
         off the same one. The first takes it off the free list and the pin
@@ -444,10 +426,6 @@ class BlockManager:
         still has to read it, or copy out of it.
         """
         if self.page_checkpoints is not None:
-            # The Active Slot is always a complete contiguous slot.  A hit
-            # merely schedules a gather from the checkpoint's ordered PAGE
-            # units into it; PAGE fragments have no legal "adopt source"
-            # fallback.
             dst = self.state.pop()
             seq.per_req_cache_group = dst
             seq.state_fork_src = -1

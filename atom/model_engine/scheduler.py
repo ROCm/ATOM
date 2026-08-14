@@ -323,8 +323,7 @@ class ScheduledBatch:
         num_spec_step: Number of speculative decode steps (0 = disabled).
         scheduled_spec_decode_tokens: Draft token IDs per request for
             speculative decoding (must not use a mutable default).
-        state_maintenance_ops: Active Slot relocations and PAGE checkpoint
-            scatter/gather operations that must execute before this batch.
+        state_maintenance_ops: State moves that must execute before this batch.
     """
 
     def __init__(
@@ -383,10 +382,7 @@ class ScheduledBatch:
             for seq in seqs.values()
             if seq.has_per_req_cache and seq.per_req_cache_group >= 0
         ]
-        # Not per-seq: these physical moves accumulate in the state pool while
-        # scheduling, then ride exactly one real forward as a single typed
-        # bundle. Fork sources remain positionally aligned above because they
-        # are logical inputs to individual sequences rather than maintenance.
+        # Physical moves are drained once per real batch.
         self.state_maintenance_ops = (
             state_maintenance_ops
             if state_maintenance_ops is not None
@@ -1495,12 +1491,7 @@ class Scheduler:
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             remote_kv_block_ids=sorted(remote_kv_blocks) if remote_kv_blocks else [],
             remote_kv_seq_blocks=remote_kv_seq_blocks,
-            # An empty batch is not forwarded (`engine_core` skips on zero
-            # req_ids), so draining here would file the destinations in the
-            # index and then never issue the copies that fill them — a resumer
-            # would read the previous occupant's state, the exact #1417 shape
-            # the copies exist to prevent. Leave them pending for the next
-            # batch that actually runs.
+            # An empty batch cannot execute queued maintenance.
             state_maintenance_ops=(
                 self.block_manager.take_state_maintenance_ops()
                 if scheduled_seqs
@@ -2988,9 +2979,6 @@ class DecodeScheduler(Scheduler):
                 num_spec_step=self.mtp_k,
                 scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
                 cu_stream_fraction=self.cu_fraction,
-                # The other half of the pair above: queued state maintenance
-                # has to reach a real batch or a destination can still hold its
-                # previous occupant's state.
                 state_maintenance_ops=self.block_manager.take_state_maintenance_ops(),
             ),
             scheduled_seqs,

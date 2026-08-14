@@ -1669,9 +1669,7 @@ class ModelRunner:
         self.pool_plan = plan
         config.pool_entries = dict(plan.entries)
         config.pool_entries_per_req = dict(plan.entries_per_req)
-        # Transfer capability and any PAGE checkpoint geometry travel to the
-        # engine as one validated runtime payload; cache behavior is never
-        # smuggled through Config.
+        # Keep runtime state metadata out of Config.
         transfer = self.attn_metadata_builder.state_transfer()
         uses_paged_state = transfer.copies
         if uses_paged_state and config.pipeline_parallel_size > 1:
@@ -1732,11 +1730,7 @@ class ModelRunner:
         # Concurrent-capacity table: at each context-length percentage of
         # max_model_len, how many requests can simultaneously hold their
         # KV in the pool. Per-req block usage = ceil(ctx_len/block_size).
-        # STATE Active Slots sit in their own reservation (already excluded
-        # from the paged count at sizing time), so the empty-cache capacity is
-        # described by this table. Copy-transfer state checkpoints dynamically
-        # borrow blocks from that paged count and are evicted atomically as PAGE
-        # demand grows.
+        # Active Slots are reserved; PAGE checkpoints borrow from the paged pool.
         max_model_len = config.max_model_len
         cap = config.max_num_seqs
         pct_lines = []

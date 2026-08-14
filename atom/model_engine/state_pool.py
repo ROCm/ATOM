@@ -14,8 +14,9 @@ from atom.model_engine.page_unit_checkpoint import (
     PageUnitCheckpointStore,
 )
 
-# `StateTransfer.kind` values. Plain strings keep the explicit runner RPC wire
-# representation language-neutral and easy to validate.
+# `StateTransfer.kind` values. Plain strings rather than an enum because the
+# choice crosses a process boundary inside a dict (ModelRunner's `block_info`),
+# where a scalar survives and a class does not.
 FORK = "fork"
 COPY = "copy"
 NONE = "none"
@@ -33,27 +34,16 @@ class StateTransfer:
                   takes a fresh one, reading the old and writing the new for
                   exactly one forward — which has to leave the new group
                   self-contained, and that takes `n` committed tokens.
-      `copy(id)`  one request's state has the versioned canonical byte layout
-                  `id`, which can be scattered into PAGE units and gathered
-                  into another Active Slot. Nothing is given away and no
-                  successor forward is bound.
+      `copy(id)`  the versioned state layout can be scattered into PAGE units
+                  and gathered into another Active Slot without a successor.
 
     The two mechanisms are not interchangeable, and which one a backend can
-    offer decides where it may checkpoint. A copy's layout id is part of that
-    capability rather than a second backend hook: the control plane, runner and
-    copy kernel must all agree on the same canonical byte stream. A fork's
-    contract binds the *next* forward, so it can only be taken where that
-    forward is known to be long enough — true on a prompt, false during
-    generation, where a step commits `1 + accepted_drafts` and acceptance is
-    not knowable in advance. That is why DeepSeek-V4 copies: it is the only way
-    to checkpoint at a decode boundary.
-
-    GDN recurrent state uses `fork(1)`: its kernels rewrite the destination
-    state whole, so one committed token leaves the new group self-contained.
-    DeepSeek-V4 uses `copy(layout_id)`: its arena and slot planes form one
-    canonical raw-byte stream, and a copy does not bind an unknowable successor
-    decode length. Those backend declarations are capability summaries; this
-    object is the complete scheduling and wire contract.
+    offer decides where it may checkpoint. A fork's contract binds the *next*
+    forward, so it can only be taken where that forward is known to be long
+    enough — true on a prompt, false during generation, where a step commits
+    `1 + accepted_drafts` and acceptance is not knowable in advance. That is why
+    DeepSeek-V4 copies: it is the only way to checkpoint at a decode boundary.
+    See `/app/logs_claude/verify_v4_min_fork.py` for the arithmetic.
 
     These used to be one integer, `min_fork_tokens`, with 0 spelling `none()` —
     which is exactly the value `copy(id)` has to report, so the two were
@@ -99,7 +89,6 @@ class StateTransfer:
         return cls(COPY, paged_layout_id=layout_id)
 
     def to_wire(self) -> dict[str, str | int | None]:
-        """Return the validated capability payload used by runner RPC."""
         return {
             "kind": self.kind,
             "fork_tokens": self.fork_tokens,
@@ -108,7 +97,6 @@ class StateTransfer:
 
     @classmethod
     def from_wire(cls, wire: object) -> "StateTransfer":
-        """Rebuild and validate a capability received from another process."""
         if not isinstance(wire, Mapping):
             raise TypeError("state transfer capability must be a mapping")
         expected = {"kind", "fork_tokens", "paged_layout_id"}
@@ -139,14 +127,7 @@ class StateTransfer:
 
 @dataclass(frozen=True)
 class StateRuntime:
-    """Validated runtime contract for per-request state and its checkpoints.
-
-    A copy capability is usable only with the exact PAGE checkpoint geometry
-    and layout that its runner sized.  Fork and none never own PAGE checkpoint
-    storage.  This object is therefore the single typed value passed from the
-    runner IPC boundary through the engine and scheduler to ``BlockManager``;
-    consumers cannot observe a partially validated transfer/spec pair.
-    """
+    """Validated state transfer and optional checkpoint geometry."""
 
     transfer: StateTransfer = field(default_factory=StateTransfer.none)
     checkpoint_spec: PagedStateCheckpointSpec | None = None
@@ -177,7 +158,6 @@ class StateRuntime:
             )
 
     def to_wire(self) -> dict[str, object]:
-        """Return the explicit pickle-safe runner RPC payload."""
         return {
             "transfer": self.transfer.to_wire(),
             "checkpoint_spec": (
@@ -187,7 +167,6 @@ class StateRuntime:
 
     @classmethod
     def from_wire(cls, wire: object) -> "StateRuntime":
-        """Rebuild and validate the complete runtime at the IPC boundary."""
         if not isinstance(wire, Mapping):
             raise TypeError("state runtime must be a mapping")
         expected = {"transfer", "checkpoint_spec"}
@@ -213,15 +192,7 @@ DEFAULT_STATE_RUNTIME = StateRuntime()
 
 @dataclass(frozen=True)
 class StateMaintenanceOps:
-    """All state movement that must run before one model batch.
-
-    ``relocations`` move one contiguous Active Slot to another.  Checkpoint
-    stores scatter an Active Slot into arbitrary PAGE units, while checkpoint
-    restores gather those units into an Active Slot.  Keeping the three
-    directions in one immutable bundle gives scheduling one drain point: an
-    operation can neither ride a different batch nor be accidentally drained
-    twice by independent consumers.
-    """
+    """State movement drained once before a model batch."""
 
     relocations: tuple[tuple[int, int], ...] = ()
     checkpoint_stores: tuple[CheckpointStoreOp, ...] = ()
@@ -265,10 +236,7 @@ class StateGroupPool:
     checkpointed the state — which is what the index over the free list
     answers.
 
-    A fork-transfer checkpoint is a group sitting on the free list with valid
-    content. A copy-transfer checkpoint never uses that representation: groups
-    are Active Slots only, immutable images live in ordered sets of arbitrary
-    PAGE units, and this class schedules typed scatter/gather ops between them.
+    Fork checkpoints live in free groups; copy checkpoints live in PAGE units.
 
     *How* a group reaches the index is the backend's `StateTransfer`, and it is
     the only thing that differs between the two mechanisms this class runs:
@@ -276,9 +244,7 @@ class StateGroupPool:
       `fork`  the owner gives its group away and takes a fresh one, so the
               checkpoint costs no bytes but binds the very next forward, which
               has to leave the replacement self-contained (`min_fork_tokens`).
-      `copy`  the state has a canonical byte stream, so it is scattered into
-              PAGE units without disturbing the owner and gathered into the
-              resumer's own Active Slot. No successor forward is bound.
+      `copy`  the state is scattered into PAGE units and gathered into a slot.
 
     The count of groups is not fixed for life: `extend` and `retire_top` move it
     when the state pool's share of the byte budget changes. Retiring is
@@ -357,13 +323,8 @@ class StateGroupPool:
         # rather than a second count because the depth is only ever one pass
         # more — see `release_pins`.
         self._deferred: set[int] = set()
-        # (src, dst) Active Slot relocation pairs. Checkpoints never feed this:
-        # copy-transfer checkpoints use the typed PAGE ops below, while fork
-        # checkpoints move ownership without copying.
+        # (src, dst) Active Slot relocation pairs.
         self._copies: list[tuple[int, int]] = []
-        # Copy-transfer state separates the Active Slot free list above from
-        # the immutable checkpoint image. The pending dict coalesces later
-        # boundaries from the same request while retaining boundary metadata.
         self._paged_pending: dict[int, tuple[object, int, int]] = {}
         self._paged_store_ops: list[CheckpointStoreOp] = []
         self._paged_restore_ops: list[CheckpointRestoreOp] = []
@@ -638,13 +599,7 @@ class StateGroupPool:
         replacement, which is the whole reason `min_fork_tokens` gates the
         position.
 
-        `copy` — the owner keeps writing where it is and an immutable image is
-        scattered into PAGE units. Only the intent is recorded here; units are
-        atomically reserved when the next batch is built. The checkpoint stays
-        invisible until that batch has issued the scatter.
-
-        `boundary_blocks` is carried by PAGE checkpoint records. Fork-backed
-        groups are single entries and do not otherwise need it.
+        `copy` records a PAGE scatter that becomes visible after it is issued.
         """
         if not self.applies(seq):
             return
@@ -671,14 +626,12 @@ class StateGroupPool:
         self.checkpoints_kept += 1
 
     def _commit_paged_pending(self) -> None:
-        """Reserve arbitrary PAGE units and schedule Active Slot scatter ops."""
         if not self._paged_pending:
             return
         pending, self._paged_pending = self._paged_pending, {}
         store = self.page_checkpoints
         assert store is not None
         for seq, boundary_blocks, h in pending.values():
-            # A later call may have cleared/superseded this intent.
             if seq.pending_checkpoint != h:
                 continue
             seq.pending_checkpoint = -1

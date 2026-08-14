@@ -730,13 +730,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         because a plane is one width and a field is the one thing in this
         layout that is priced in bytes.
 
-        Putting it here rather than in a plane of its own is what makes it
-        travel: slot relocation and checkpoint scatter both copy the whole
-        canonical stream, so a checkpoint carries the window with the state. A
-        private plane would not be copied, and a request resuming a cached
-        prefix would draft against whatever the slot's previous occupant left —
-        the same shape of bug #1417 was, minus the correctness half, since
-        drafts are verified.
+        Keeping it in the slot makes checkpoint scatter carry the window too.
 
         Field order is the wire order of a whole entry, so it is also the
         order a PD transfer or a checkpoint sees the bytes in.
@@ -783,13 +777,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         return StateTransfer.copy(layout_id)
 
     def relocate_state_slots(self, pairs: list[tuple[int, int]]) -> None:
-        """Relocate a request's whole Active Slot: compressor + windows.
-
-        One range per plane: a slot holds the compressor state followed by every
-        layer's windows, so moving the whole request takes one slice per plane.
-        Checkpoint store/restore does not call this method; it uses the PAGE
-        descriptor kernel below.
-        """
+        """Relocate a request's whole Active Slot."""
         views = self._slot_views()
         dsts, srcs = [], []
         for src, dst in pairs:
@@ -799,12 +787,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             torch._foreach_copy_(dsts, srcs)
 
     def execute_paged_state_copies(self, store_ops: list, restore_ops: list) -> None:
-        """Scatter/gather checkpoints between slots and non-contiguous PAGEs.
-
-        Both directions use one canonical segmented-stream planner and one
-        descriptor launch.  The copy is raw bytes: BF16, FP8, packed FP4,
-        scales and ``-inf`` score state are never converted.
-        """
+        """Copy raw checkpoint bytes between slots and non-contiguous PAGEs."""
         from atom.model_ops.attentions.paged_state_copy import (
             launch_copy_spans,
             plan_segmented_copy,
@@ -867,8 +850,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         start = block_id * geo.envelope_rows
         stop = start + geo.envelope_rows
         segments = [tensor_segment(plane[start:stop]) for plane in self._kv_planes()]
-        # Canonical Indexer order: all layer data, followed by all layer scales
-        # when FP4 has a separate scale pool.
         segments.extend(
             tensor_segment(runner.v4_csa_idx_kv[layer, block_id])
             for layer in range(len(self.csa_layers))

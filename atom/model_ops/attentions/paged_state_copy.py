@@ -44,12 +44,7 @@ def plan_segmented_copy(
     dst: list[ByteSegment],
     total_bytes: int,
 ) -> list[CopySpan]:
-    """Intersect two ordered logical streams into physical copy spans.
-
-    Segment boundaries on the two sides need not agree.  This pure host planner
-    is shared by scatter and gather, which prevents their wire orders from
-    silently diverging.
-    """
+    """Intersect two ordered byte streams into physical copy spans."""
     total_bytes = int(total_bytes)
     if total_bytes < 0:
         raise ValueError("copy length must be non-negative")

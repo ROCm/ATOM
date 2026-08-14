@@ -143,24 +143,14 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         return StateTransfer.none()
 
     def relocate_state_slots(self, pairs: list[tuple[int, int]]) -> None:
-        """Move live state from one contiguous Active Slot to another.
-
-        This is not a checkpoint path. It moves a live group when the state
-        pool's boundary changes, regardless of whether that backend checkpoints
-        by fork or by PAGE image.
-        """
+        """Move live state between contiguous Active Slots."""
         raise NotImplementedError(
             f"{type(self).__name__} owns per-request state but does not "
             "implement relocate_state_slots"
         )
 
     def execute_paged_state_copies(self, store_ops: list, restore_ops: list) -> None:
-        """Scatter/gather checkpoints between Active Slots and arbitrary PAGEs.
-
-        Only DeepSeek-V4 currently declares this representation. Keeping the
-        default explicit makes an unsupported backend fail before its forward
-        can consume an uninitialized Active Slot.
-        """
+        """Copy checkpoints between Active Slots and arbitrary PAGEs."""
         if store_ops or restore_ops:
             raise NotImplementedError(
                 f"{type(self).__name__} does not implement PAGE-backed state copy"
@@ -496,10 +486,7 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         )
 
     def build(self, batch: ScheduledBatch, bs: int):
-        # Slot relocations and PAGE checkpoint maintenance run on the compute
-        # stream before the forward. This is the one place every path — prefill,
-        # decode, dummy, DP-sync, PP microbatch, TBO — passes through exactly
-        # once per batch.
+        # Run state maintenance on the compute stream before the forward.
         state_ops = batch.state_maintenance_ops
         if state_ops.relocations:
             self.relocate_state_slots(state_ops.relocations)

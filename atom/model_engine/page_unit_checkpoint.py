@@ -1,15 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""State checkpoints backed by arbitrary PAGE-sized physical units.
-
-The running request still owns one ordinary contiguous Active Slot.  Only the
-immutable checkpoint image is split: its canonical byte stream is stored in an
-ordered tuple of PAGE units, so allocation succeeds whenever the *total* free
-unit count is large enough.  Hashing, LRU, pinning and eviction remain atomic at
-the checkpoint-record level; individual fragments are never independently
-visible or reclaimable.
-"""
+"""State checkpoints backed by arbitrary PAGE-sized physical units."""
 
 from __future__ import annotations
 
@@ -26,13 +18,7 @@ EVICTING = "EVICTING"
 
 @dataclass(frozen=True)
 class PagedStateCheckpointSpec:
-    """Runtime geometry shared by state-checkpoint producers and consumers.
-
-    The spec is deliberately not part of :class:`Config`: its values only
-    exist after the runner has sized the physical cache pools.  The PAGE count
-    is derived at each consumer so it can never drift from the two byte sizes
-    while crossing a process boundary.
-    """
+    """Runtime geometry for PAGE-backed state checkpoints."""
 
     page_unit_bytes: int
     slot_bytes: int
@@ -53,7 +39,6 @@ class PagedStateCheckpointSpec:
         return (self.slot_bytes + self.page_unit_bytes - 1) // self.page_unit_bytes
 
     def to_wire(self) -> dict[str, int | str]:
-        """Return the explicit pickle-safe payload used by runner RPC."""
         return {
             "page_unit_bytes": self.page_unit_bytes,
             "slot_bytes": self.slot_bytes,
@@ -62,7 +47,6 @@ class PagedStateCheckpointSpec:
 
     @classmethod
     def from_wire(cls, wire: object) -> PagedStateCheckpointSpec:
-        """Rebuild and validate a spec received from another process."""
         if not isinstance(wire, Mapping):
             raise TypeError("paged state checkpoint spec must be a mapping")
         expected = {"page_unit_bytes", "slot_bytes", "layout_id"}
@@ -125,13 +109,7 @@ class CheckpointRecord:
 
 
 class PageUnitCheckpointStore:
-    """Content index and ownership table for split state images.
-
-    A store becomes hash-visible only in :meth:`complete_inflight`, which the
-    scheduler calls at the beginning of the pass after the copy op rode a
-    model batch.  That is the control-plane commit point corresponding to the
-    compute stream having issued the previous batch.
-    """
+    """Content index and ownership table for split state images."""
 
     def __init__(
         self,
@@ -159,10 +137,8 @@ class PageUnitCheckpointStore:
 
     @property
     def units_per_checkpoint(self) -> int:
-        """Derive the complete-image allocation from this process's spec."""
         return self.spec.units_per_checkpoint
 
-    # ------------------------------ lookup ---------------------------------
     def lookup(self, prefix_hash: int) -> int:
         checkpoint_id = self.hash_to_checkpoint.get(prefix_hash, -1)
         record = self.records.get(checkpoint_id)
@@ -183,7 +159,6 @@ class PageUnitCheckpointStore:
     def record(self, checkpoint_id: int) -> CheckpointRecord:
         return self.records[checkpoint_id]
 
-    # ---------------------------- allocation -------------------------------
     def _new_identity(self) -> tuple[int, int]:
         checkpoint_id = self._next_checkpoint_id
         generation = self._next_generation
@@ -194,7 +169,6 @@ class PageUnitCheckpointStore:
     def has_available_units(
         self, count: int, protected_hash: int | None = None
     ) -> bool:
-        """Whether PAGE allocation can obtain `count`, including atomic LRU victims."""
         if count <= self.pool.num_free:
             return True
         protected = self.lookup(protected_hash) if protected_hash is not None else -1
@@ -207,7 +181,6 @@ class PageUnitCheckpointStore:
         return self.pool.num_free + reclaimable >= count
 
     def ensure_free_units(self, count: int) -> bool:
-        """Evict whole unpinned checkpoints until `count` PAGE units are free."""
         while self.pool.num_free < count:
             victim = next(
                 (
@@ -226,7 +199,6 @@ class PageUnitCheckpointStore:
     def begin_store(
         self, prefix_hash: int, boundary_blocks: int, src_slot: int
     ) -> CheckpointStoreOp | None:
-        """Reserve all fragments and create a non-visible COPYING record."""
         if self.lookup(prefix_hash) >= 0 or prefix_hash in self._pending_by_hash:
             return None
         needed = self.units_per_checkpoint
@@ -283,9 +255,7 @@ class PageUnitCheckpointStore:
             layout_id=record.layout_id,
         )
 
-    # ------------------------- commit / cancellation ------------------------
     def complete_inflight(self) -> None:
-        """Commit stores and release restore readers from the previous batch."""
         stores, self._inflight_stores = self._inflight_stores, []
         for checkpoint_id in stores:
             record = self.records.get(checkpoint_id)
@@ -298,9 +268,7 @@ class PageUnitCheckpointStore:
                 continue
             if record.state != COPYING:
                 continue
-            # Publish only after the scatter has ridden a batch.  A canonical
-            # READY record that appeared meanwhile wins; the duplicate image
-            # is discarded as one atomic allocation.
+            # Publish only after the scatter has ridden a batch.
             if self.lookup(record.prefix_hash) >= 0:
                 self._release_record(checkpoint_id)
                 continue
@@ -320,7 +288,6 @@ class PageUnitCheckpointStore:
                 self._release_record(checkpoint_id)
 
     def unindex(self, prefix_hash: int) -> int:
-        """Make a state boundary unreachable and reclaim it when readers drain."""
         checkpoint_id = self.hash_to_checkpoint.pop(prefix_hash, -1)
         if checkpoint_id < 0:
             checkpoint_id = self._pending_by_hash.pop(prefix_hash, -1)
@@ -331,14 +298,12 @@ class PageUnitCheckpointStore:
             return -1
         record.state = EVICTING
         self._lru.pop(checkpoint_id, None)
-        # A COPYING record still has a queued GPU writer.  Its units cannot be
-        # returned until that writer has been issued and ordered.
+        # Keep units alive while a queued GPU writer can still access them.
         if checkpoint_id not in self._inflight_stores and record.pin_count == 0:
             self._release_record(checkpoint_id)
         return checkpoint_id
 
     def clear(self) -> None:
-        """Remove every hash entry and reclaim records once readers/writers drain."""
         self.hash_to_checkpoint.clear()
         self._pending_by_hash.clear()
         self._lru.clear()
