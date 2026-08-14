@@ -58,6 +58,39 @@ def test_writing_through_the_views_writes_the_cache():
     assert not torch.all(k[:, 0:span] == 7.0)
 
 
+@pytest.mark.parametrize("num_spec", [0, 2])
+def test_gdn_a_staging_group_gets_a_full_span_not_a_short_view(num_spec):
+    """The GDN counterpart of the V4 staging test below, and a quieter failure.
+
+    `state_spec` sizes the ring `state_offload_staging_groups() * span` rows,
+    because a group is `span` consecutive slots. Size it in bare entries and
+    the last staging group runs off the end of the tensor — but `cache[layer,
+    lo : lo + span]` *clamps*, so there is no IndexError to catch. The tier
+    would pack a short segment, `entry_bytes` would not match, and the first
+    spill would fail inside the packer.
+
+    So this asserts the shape, not merely that indexing succeeded: a staging
+    group must be span rows wide, byte-identical in size to an admitted one.
+    """
+    span = 1 + num_spec
+    staging_groups = 2
+    slots = (GROUPS + staging_groups) * span
+    k = torch.zeros((LAYERS, slots) + SHAPE_K)
+    v = torch.zeros((LAYERS, slots) + SHAPE_V)
+    stub = SimpleNamespace(
+        num_spec=num_spec,
+        model_runner=SimpleNamespace(mamba_k_cache=k, mamba_v_cache=v),
+    )
+
+    in_pool = GDNStateMixin.state_entry_views(stub, GROUPS - 1)
+    for offset in range(staging_groups):
+        staging = GDNStateMixin.state_entry_views(stub, GROUPS + offset)
+        assert all(x.is_contiguous() for x in staging)
+        assert [tuple(x.shape) for x in staging] == [tuple(x.shape) for x in in_pool]
+        assert all(int(x.shape[0]) == span for x in staging)
+        assert staging[0].data_ptr() != in_pool[0].data_ptr()
+
+
 # --- DeepSeek-V4 ---------------------------------------------------------
 #
 # The V4 side goes through the real `_slot_views` / `UnifiedPoolGeometry`
