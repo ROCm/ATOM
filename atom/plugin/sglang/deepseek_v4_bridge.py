@@ -864,6 +864,10 @@ def bind_deepseek_v4_proxy_cache_views(model, proxy_pool: Any) -> bool:
             if swa_rope_view is not None
             else None
         )
+        # Native V4 now reads the unified-plane names directly. Keep the
+        # SGLang proxy's existing per-layer ring views as their backing storage.
+        attn.swa_plane = attn.swa_kv
+        attn.swa_plane_rope = attn.swa_kv_rope
         attn.swa_cache_size = proxy_pool.swa_cache_size
         if ratio == 4:
             indexer_topk = int(attn.indexer.index_topk)

@@ -82,6 +82,7 @@ def _v4_decode_indices_fused_kernel(
     swa_indices_ptr,  # [swa_total] int32 OUT
     csa_indices_ptr,  # [csa_total] int32 OUT (SWA-prefix segment only)
     hca_indices_ptr,  # [hca_total] int32 OUT (SWA prefix tail + HCA head)
+    swa_dest_rows_ptr,  # [>=T] int32 OUT — current-token SWA write row
     n_committed_hca_per_seq_ptr,  # [num_reqs] int32 — per-seq HCA entry count
     block_tables_ptr,  # [num_reqs, MAX_BLOCKS] int — per-seq paged block ids
     bt_stride_bs,  # block_tables row stride (elements)
@@ -115,6 +116,7 @@ def _v4_decode_indices_fused_kernel(
     abs_pos = pos - n + 1 + i
     ring_idx = abs_pos % cs
     paged = slot * cs + ring_idx
+    tl.store(swa_dest_rows_ptr + t, slot * cs + pos % cs)
     tl.store(swa_indices_ptr + swa_end - n + i, paged, mask=mask)
     tl.store(csa_indices_ptr + csa_end - n + i, paged, mask=mask)
     tl.store(hca_indices_ptr + hca_end - n + i, paged, mask=mask)
@@ -141,6 +143,7 @@ def write_v4_decode_indices_fused(
     swa_indices: torch.Tensor,
     csa_indices: torch.Tensor,
     hca_indices: torch.Tensor,
+    swa_dest_rows: torch.Tensor,
     n_committed_hca_per_seq: torch.Tensor,
     block_tables: torch.Tensor,
     T: int,
@@ -167,6 +170,7 @@ def write_v4_decode_indices_fused(
     assert swa_indices.dim() == 1
     assert csa_indices.dim() == 1
     assert hca_indices.dim() == 1
+    assert swa_dest_rows.dim() == 1 and swa_dest_rows.shape[0] >= T
     assert n_committed_hca_per_seq.dim() == 1
     assert block_tables.dim() == 2
 
@@ -181,6 +185,7 @@ def write_v4_decode_indices_fused(
         swa_indices,
         csa_indices,
         hca_indices,
+        swa_dest_rows,
         n_committed_hca_per_seq,
         block_tables,
         block_tables.stride(0),
