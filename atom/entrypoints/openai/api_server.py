@@ -861,16 +861,12 @@ async def setup_streaming_request(
             multimodal_data=multimodal_data,
             data_parallel_rank=data_parallel_rank,
         )
-        if data_parallel_rank is not None:
-            seq.data_parallel_rank = data_parallel_rank
         _seq_id_to_request_id[seq.id] = request_id
         return seq
 
     seq = None
     try:
         seq = await executor_loop.run_in_executor(None, do_preprocess)
-        if data_parallel_rank is not None:
-            seq.data_parallel_rank = data_parallel_rank
         _validate_sequence_context_length(seq)
     except Exception:
         _stream_loops.pop(request_id, None)
@@ -1081,17 +1077,12 @@ async def setup_streaming_request_fanout(
             data_parallel_rank=data_parallel_rank,
         )
         for seq in seqs:
-            if data_parallel_rank is not None:
-                seq.data_parallel_rank = data_parallel_rank
             _seq_id_to_request_id[seq.id] = request_id
         return seqs
 
     seqs = []
     try:
         seqs = await executor_loop.run_in_executor(None, do_preprocess)
-        if data_parallel_rank is not None:
-            for seq in seqs:
-                seq.data_parallel_rank = data_parallel_rank
         _validate_sequence_context_length(seqs[0])
     except Exception:
         _stream_loops.pop(request_id, None)
