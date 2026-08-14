@@ -1117,10 +1117,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w2_scale_in = raw_w2_scale.transpose(-2, -1)
 
             w13_scale, w13_swizzle_layout = shuffle_scale_moe(
-                w13_scale_in, return_layout=True
+                w13_scale_in, return_layout=True, scale_kwidth=4 if self.is_gfx1250 else 8
             )
             w2_scale, w2_swizzle_layout = shuffle_scale_moe(
-                w2_scale_in, return_layout=True
+                w2_scale_in, return_layout=True, scale_kwidth=4 if self.is_gfx1250 else 8
             )
 
             del layer.w13_weight
