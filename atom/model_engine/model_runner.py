@@ -1642,7 +1642,7 @@ class ModelRunner:
         config.pool_entries = dict(plan.entries)
         config.pool_entries_per_req = dict(plan.entries_per_req)
         # Scalars rather than the StateTransfer itself: this travels to the
-        # engine process in a plain dict, where `StateGroupPool` rebuilds it.
+        # engine process in a plain dict, where `StateSlotPool` rebuilds it.
         transfer = self.attn_metadata_builder.state_transfer()
         config.state_transfer_kind = transfer.kind
         config.state_fork_tokens = transfer.fork_tokens

@@ -1317,16 +1317,18 @@ class Config:
     #       still place checkpoints
     # See BlockManager.checkpointers_at.
     state_checkpoint_interval_tokens: int = 8192
-    # Per-request state entry sets to size the STATE pool with on top of
-    # max_num_seqs. Checkpoints live in the same pool as running requests, so
-    # at 0 the room to keep one is whatever concurrency leaves over — declaring
-    # it here decouples the two. See `SubPoolSpec.extra_entries`.
-    state_checkpoint_groups: int = 0
+    # Extra state slots to size the STATE pool with on top of what the
+    # in-flight requests take. Checkpoints live in the same pool as running
+    # requests, so at 0 the room to keep one is whatever concurrency leaves
+    # over — declaring it here decouples the two. Counted one per checkpoint,
+    # not one per request width: a checkpoint holds only the committed state.
+    # See `SubPoolSpec.extra_entries`.
+    state_checkpoint_slots: int = 0
     # Whether a refused hit may place a rung of its own. Off leaves the
     # prompt-end anchor as the only placement: on the cc-traces a demand is
     # 47% of all checkpoint writes but reads back 2.8% of the time against the
     # anchor's 85.2%, so the rung's worth is an open question that only differs
-    # from demoting it (see `StateGroupPool.mark_speculative`) on hardware.
+    # from demoting it (see `StateSlotPool.mark_speculative`) on hardware.
     # See `BlockManager._record_checkpoint_demand`.
     state_checkpoint_demand: bool = True
     scheduler_delay_factor: float = 0.0

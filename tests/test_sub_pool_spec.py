@@ -108,21 +108,33 @@ class TestPlanPools:
         plan = plan_pools(specs, available_bytes=100_000, max_num_seqs=8)
         assert plan.entries[ENTRY_SWA] == 8 * 3 + 64
 
-    def test_checkpoint_headroom_is_whole_groups_not_stray_entries(self):
-        """What `--state-checkpoint-groups` has to buy to be worth anything.
+    def test_checkpoint_headroom_is_counted_one_slot_per_checkpoint(self):
+        """What `--state-checkpoint-slots` buys, at the GDN width.
 
-        `BlockManager` derives its group count as `entries // entries_per_req`,
-        so headroom declared in anything but multiples of the per-request width
-        is rounded away and buys nothing — the reason `gdn_attn.state_spec`
-        multiplies the flag by `1 + num_spec` rather than passing it through.
+        `extra_entries` is passed through, NOT multiplied by the per-request
+        width: a live request takes `1 + num_spec` slots because it speculates,
+        a checkpoint takes one because it holds a committed state and has
+        nothing to roll back. `BlockManager` counts slots raw — there is no
+        `entries // entries_per_req` rounding to align to any more.
+
+        The saving is the difference asserted below: at `spr == 3`, 32
+        checkpoints cost 32 slots rather than 96, and the 64 not spent stay in
+        the paged pool, which is sized out of what is left after this.
         """
         spr = 3  # 1 + num_spec, the GDN width
         specs = [
             page_pool(100),
-            state_pool(ENTRY_STATE, 10, entries_per_req=spr, extra_entries=32 * spr),
+            state_pool(ENTRY_STATE, 10, entries_per_req=spr, extra_entries=32),
         ]
         plan = plan_pools(specs, available_bytes=100_000, max_num_seqs=8)
-        assert plan.entries[ENTRY_STATE] // spr == 8 + 32
+        assert plan.entries[ENTRY_STATE] == 8 * spr + 32
+
+        wide = [
+            page_pool(100),
+            state_pool(ENTRY_STATE, 10, entries_per_req=spr, extra_entries=32 * spr),
+        ]
+        wide_plan = plan_pools(wide, available_bytes=100_000, max_num_seqs=8)
+        assert wide_plan.entries[ENTRY_KV] < plan.entries[ENTRY_KV]
 
     def test_paged_pool_floors_at_zero_rather_than_going_negative(self):
         specs = [page_pool(1_000_000), state_pool(ENTRY_STATE, 100, entries_per_req=1)]

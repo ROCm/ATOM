@@ -357,7 +357,7 @@ class CacheStats:
         `state_hit_rate + state_recoverable_loss_rate` is the rate the state
         cache would reach with a dense ladder. The distance from that to 1.0
         is the part no checkpoint can buy, and the honest cap on what any
-        amount of `--state-checkpoint-groups` is worth.
+        amount of `--state-checkpoint-slots` is worth.
         """
         return self._rate(
             self.total_wanted_tokens - self.total_cached_tokens,
@@ -534,14 +534,14 @@ class CacheStats:
             f"{p['blocks_free'] - p['blocks_free_reusable']} vacant, "
             f"{p['blocks_indexed']} indexed | "
             f"evicted: {p['blocks_evicted']}, retired: {p['blocks_retired']} | "
-            f"state: {p['groups_used']}/{p['groups_total']} used, "
-            f"{p['groups_held']} checkpointed, {p['groups_vacant']} vacant"
+            f"state: {p['slots_used']}/{p['slots_total']} used, "
+            f"{p['slots_held']} checkpointed, {p['slots_vacant']} vacant"
         )
         # The state pool's own losses, which `blocks_evicted` cannot express:
         # a checkpoint can die without any block dying (`evicted`, the pool ran
-        # out of groups) or *because* a block died (`orphaned`, the prefix it
+        # out of slots) or *because* a block died (`orphaned`, the prefix it
         # was filed under left the KV index first). The pair says which pool to
-        # grow — see `StateGroupPool.__init__` for why they are kept apart.
+        # grow — see `StateSlotPool.__init__` for why they are kept apart.
         logger.info(
             "[Checkpoint Fates] "
             f"kept: {p['checkpoints_kept']}, "
@@ -666,33 +666,41 @@ class ScheduledBatch:
         self.num_bonus = np.asarray(
             [seq.num_bonus_tokens for seq in seqs.values()], dtype=np.int32
         )
-        self.per_req_cache_groups = [
-            seq.per_req_cache_group
+        # One entry per state-holding seq: that seq's whole slot set, in
+        # allocation order. `[0]` is the committed state and `[1:]` is
+        # speculation rollback, one slot per speculated token. The sets are not
+        # adjacent and no backend may reconstruct them by arithmetic on a base
+        # — see `StateSlotPool`.
+        # Gated on `state_slot >= 0`, not on the list being non-empty: a seq
+        # whose committed slot was never claimed carries the -1 sentinel in a
+        # one-element list, which is truthy, and letting it through would shift
+        # every list positionally aligned with this one.
+        state_seqs = [
+            seq
             for seq in seqs.values()
-            if seq.has_per_req_cache and seq.per_req_cache_group >= 0
+            if seq.has_per_req_cache and seq.state_slot >= 0
         ]
-        # Read-side twin of the above, positionally aligned with it: the group
-        # this forward takes its incoming state from. Differs only on the one
-        # forward after a state fork; -1 elsewhere, which attention backends
-        # read as "same as the write group".
-        self.state_fork_srcs = [
-            seq.state_fork_src
-            for seq in seqs.values()
-            if seq.has_per_req_cache and seq.per_req_cache_group >= 0
-        ]
-        # Midstep checkpoints this forward must write, `[(group, position)]` per
-        # seq, positionally aligned with `per_req_cache_groups` like the fork
-        # sources above. A list per seq, not one entry: a readable backend takes
-        # every position the chunk covers rather than only the one it ends on.
+        self.state_slots = [seq.state_slots for seq in state_seqs]
+        # Column 0 broken out, because it is what every non-speculative backend
+        # wants and rebuilding it per step in each of them would cost the same
+        # Python loop several times over.
+        self.state_slots_committed = [seq.state_slot for seq in state_seqs]
+        # Read-side twin of the committed column, positionally aligned with it:
+        # the slot this forward takes its incoming state from. Differs only on
+        # the one forward after a state fork; -1 elsewhere, which attention
+        # backends read as "same as the write slot".
+        self.state_fork_srcs = [seq.state_fork_src for seq in state_seqs]
+        # Midstep checkpoints this forward must write, `[(slot, position)]` per
+        # seq, positionally aligned with `state_slots` like the fork sources
+        # above. A list per seq, not one entry: a readable backend takes every
+        # position the chunk covers rather than only the one it ends on.
         # Positions are absolute prompt offsets; the backend rebases them onto
         # the step's own tokens, which is the only frame its intermediates are
         # in. Empty everywhere except a `readable_midstep` prefill.
         self.state_save_all = [
-            [(g, p) for g, p, _h in seq.midstep_reservations]
-            for seq in seqs.values()
-            if seq.has_per_req_cache and seq.per_req_cache_group >= 0
+            [(g, p) for g, p, _h in seq.midstep_reservations] for seq in state_seqs
         ]
-        # (src, dst) state groups this batch's forward must duplicate before it
+        # (src, dst) state slots this batch's forward must duplicate before it
         # runs — the copy twin of `state_fork_srcs`, for backends that checkpoint
         # by copying. Not per-seq: a copy is between two pool slots and needs no
         # alignment with anything else on the batch. Passed in rather than read
@@ -1324,7 +1332,7 @@ class Scheduler:
         if (
             seq.has_per_req_cache
             and not bm.state.has_free()
-            and bm.num_per_req_cache_groups == 0
+            and bm.num_state_slots == 0
         ):
             logger.warning(
                 "Request %s will never be scheduled: needs per-req cache "

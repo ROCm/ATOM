@@ -143,7 +143,7 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
 
         A checkpoint is a second group holding the state as of some boundary, so
         every backend with per-request state has to say how one gets there.
-        There are three answers and `StateGroupPool` runs whichever it is told:
+        There are three answers and `StateSlotPool` runs whichever it is told:
 
         `StateTransfer.fork(n)` — the state rolls and is not one range to
         duplicate, so the old group goes to the index and the request takes a
