@@ -27,6 +27,17 @@ logger = logging.getLogger(__name__)
 # fp8 KV cache on any other arch degrades to a bf16 cache instead of hard-failing.
 _V4_FP8_SUPPORTED_GFX = ("gfx950", "gfx1250")
 _V4_FP8_DOWNGRADE_WARNED = False
+_V4_SWA_DEST_RATIOS = (0, 4, 128)
+
+
+def _shared_vllm_swa_dest_rows(rows: torch.Tensor) -> dict[int, torch.Tensor]:
+    """Expose vLLM's per-layer SWA ring rows to every V4 compress class.
+
+    Unlike native ATOM's interleaved class pools, each vLLM proxy-cache layer
+    owns a separate ``[num_slots, ring_size]`` SWA plane, so the destination
+    formula is identical for dense, CSA, and HCA layers.
+    """
+    return {ratio: rows for ratio in _V4_SWA_DEST_RATIOS}
 
 
 def _v4_kv_fp8(vllm_config) -> bool:
@@ -712,6 +723,11 @@ class _V4DecodeMetaBuffers:
         # torch advanced-indexing AND by the fused flydsl SWA scatter (which
         # loads batch_id as int32); matches the in-tree model_runner path.
         self.batch_id = CpuGpuBuffer(T, dtype=torch.int32, device=device)
+        # Per-token row for the fused decode SWA write. vLLM gives each layer a
+        # plain slot-major ring, so one stable buffer serves all V4 classes.
+        self.swa_dest_row = i32(T)
+        self.n_committed_per_token = i32(T)
+        self.block_tables_per_token = i32(T, self.max_blocks)
         # Ragged cumsums (T + 1) and ragged index pools (worst-case per-token
         # slot counts): SWA = win, CSA = win + index_topk, HCA = win + hca.
         self.indptr_swa = i32(T + 1)
@@ -828,6 +844,15 @@ def bind_deepseek_v4_proxy_cache_views(
         kv_fp8=kv_fp8,
         rope_head_dim=rope_head_dim,
     )
+    from atom.model_ops.attentions.v4_pool_geometry import WindowParams
+
+    swa_window = WindowParams(
+        ring_start=0,
+        slot_rows=win_with_spec,
+        ring_slots=win_with_spec,
+        ring_stride=win_with_spec,
+        run_rows=win_with_spec,
+    )
     for fallback_layer_id, block in enumerate(_deepseek_v4_blocks(model)):
         attn = block.attn
         layer_id = int(getattr(attn, "layer_id", fallback_layer_id))
@@ -838,6 +863,8 @@ def bind_deepseek_v4_proxy_cache_views(
         # already had; it is exposed flat because the kernels index rows.
         swa_view = views["swa"][layer_id]
         attn.swa_kv = swa_view.reshape(-1, swa_view.shape[-1])
+        attn.swa_plane = attn.swa_kv
+        attn.swa_window = swa_window
         attn.swa_cache_size = int(win_with_spec)
         # #1600 contract: DeepseekV4Attention.forward reads unified_kv_rope /
         # swa_kv_rope unconditionally (the parallel bf16 rope pool of the fp8
@@ -851,9 +878,11 @@ def bind_deepseek_v4_proxy_cache_views(
             attn.unified_kv_rope = views["unified_rope"][layer_id]
             swa_rope_view = views["swa_rope"][layer_id]
             attn.swa_kv_rope = swa_rope_view.reshape(-1, swa_rope_view.shape[-1])
+            attn.swa_plane_rope = attn.swa_kv_rope
         else:
             attn.unified_kv_rope = None
             attn.swa_kv_rope = None
+            attn.swa_plane_rope = None
         if ratio == 4:
             csa_i = _compressed_layer_cache_index(ratios, layer_id, ratio)
             _bind_compressor_state(
@@ -1376,6 +1405,33 @@ def build_atom_v4_attention_metadata(
             pos_np = (chunk_start_np[batch_np] + within).astype(np.int32)
         else:
             pos_np = np.zeros(0, dtype=np.int32)
+        # Aiter's fused fp8 decode write requires the caller-resolved SWA row.
+        # The proxy cache is slot-major with a shared ring stride for every V4
+        # class: row = slot * cs + position % cs. Keep the padded tail at -1;
+        # batch_id_per_token carries the same sentinel and gates every consumer.
+        dest_np = np.full(T_pad, -1, dtype=np.int32)
+        if total:
+            dest_np[:total] = slot_arr[batch_np] * int(md.swa_cs) + pos_np % int(
+                md.swa_cs
+            )
+        dest_gpu = bufs.stage(bufs.swa_dest_row, dest_np)
+        md.swa_dest_rows = _shared_vllm_swa_dest_rows(dest_gpu)
+        visible_np = np.zeros(T_pad, dtype=np.int32)
+        if total:
+            visible_np[:total] = np.minimum(
+                (pos_np + 1) // 4, n_csa_cpu[batch_np]
+            ).astype(np.int32)
+        md.n_committed_per_token = bufs.stage(bufs.n_committed_per_token, visible_np)
+        block_cols = int(common_attn_metadata.block_table_tensor.shape[1])
+        block_rows = bufs.block_tables_per_token.gpu[:T_pad, :block_cols]
+        safe_batch_ids = md.batch_id_per_token[:T_pad].clamp_min(0).long()
+        torch.index_select(
+            common_attn_metadata.block_table_tensor,
+            0,
+            safe_batch_ids,
+            out=block_rows,
+        )
+        md.block_tables_per_token = block_rows
         _populate_decode_persistent(
             md,
             common_attn_metadata,
@@ -1431,6 +1487,15 @@ def build_atom_v4_attention_metadata(
         positions = torch.arange(total, dtype=torch.int64, device=device)
     pos_np = positions[:total].detach().cpu().numpy().astype(np.int32)
     if is_decode:
+        dest_np = (
+            slot_arr[batch_np] * int(md.swa_cs) + pos_np % int(md.swa_cs)
+        ).astype(np.int32, copy=False)
+        dest_gpu = torch.from_numpy(dest_np).to(device)
+        md.swa_dest_rows = _shared_vllm_swa_dest_rows(dest_gpu)
+        visible_np = np.minimum((pos_np + 1) // 4, n_csa_cpu[batch_np]).astype(np.int32)
+        md.n_committed_per_token = torch.from_numpy(visible_np).to(device)
+        batch_ids = torch.from_numpy(batch_np).to(device=device, dtype=torch.long)
+        md.block_tables_per_token = common_attn_metadata.block_table_tensor[batch_ids]
         _populate_decode(md, common_attn_metadata, batch_np, pos_np, positions)
         # Eager fp8 decode (no persistent buffers -- standalone/tests, or a
         # batch that skips CG capture): fresh per-token op5 index tensors. Not
@@ -1752,9 +1817,10 @@ def _populate_prefill(md, common, batch_np, pos_np, q_np, positions_gpu):
     csa_indptr = torch.from_numpy(csa_indptr_np).to(device)
     hca_indptr = torch.from_numpy(hca_indptr_np).to(device)
 
-    # scatter on-GPU with native ATOM's Triton kernel (one
-    # program per token; avoids an O(T) Python loop).
-    from atom.model_ops.v4_kernels import write_v4_paged_prefill_indices
+    # Scatter on-GPU with the plugin-local kernel: vLLM's proxy layout keeps
+    # each layer's SWA ring before its compressed pages, unlike native ATOM's
+    # interleaved unified-pool geometry.
+    from atom.plugin.vllm.deepseek_v4_ops import write_v4_prefill_indices_fused
 
     ext_indices = torch.empty(max(ext_total, 1), dtype=torch.int32, device=device)
     swa_indices = torch.empty(max(swa_total, 1), dtype=torch.int32, device=device)
@@ -1767,7 +1833,7 @@ def _populate_prefill(md, common, batch_np, pos_np, q_np, positions_gpu):
     n_hca_seq_g = torch.from_numpy(
         np.ascontiguousarray(md.n_committed_hca_per_seq_cpu[:num_reqs])
     ).to(device)
-    write_v4_paged_prefill_indices(
+    write_v4_prefill_indices_fused(
         positions=positions_gpu[:T].to(torch.int32),
         bid_per_token=md.batch_id_per_token[:T],
         chunk_start_per_seq=chunk_start_g,
@@ -1785,7 +1851,7 @@ def _populate_prefill(md, common, batch_np, pos_np, q_np, positions_gpu):
         prefix_hca_indices=hca_indices,
         T=T,
         win=win,
-        cache_size=cs,
+        cs=cs,
         swa_pages=swa_pages,
     )
     md.kv_indices_extend = ext_indices[:ext_total]
@@ -1827,18 +1893,13 @@ def _populate_decode(md, common, batch_np, pos_np, positions_gpu):
     hca_indptr = torch.from_numpy(hca_indptr_np).to(device)
     T = len(batch_np)
 
-    # On-GPU build (mirrors the persistent decode path): one kernel writes
-    # the shared SWA window prefix into all three buffers, a second appends
-    # the HCA compress tail straight from the GPU block table
-    from atom.model_ops.v4_kernels import write_v4_paged_decode_indices
-    from atom.plugin.vllm.deepseek_v4_ops import (
-        write_v4_decode_hca_compress_tail,
-    )
+    # On-GPU build mirrors the persistent path and uses vLLM's proxy layout.
+    from atom.plugin.vllm.deepseek_v4_ops import write_v4_decode_indices_fused
 
     swa_indices = torch.empty(max(swa_total, 1), dtype=torch.int32, device=device)
     csa_indices = torch.empty(max(csa_total, 1), dtype=torch.int32, device=device)
     hca_indices = torch.empty(max(hca_total, 1), dtype=torch.int32, device=device)
-    write_v4_paged_decode_indices(
+    write_v4_decode_indices_fused(
         state_slot_per_seq=md.state_slot_mapping,
         batch_id_per_token=md.batch_id_per_token,
         positions=positions_gpu,
@@ -1848,19 +1909,11 @@ def _populate_decode(md, common, batch_np, pos_np, positions_gpu):
         swa_indices=swa_indices,
         csa_indices=csa_indices,
         hca_indices=hca_indices,
-        T=T,
-        win=win,
-        cache_size=cs,
-    )
-    write_v4_decode_hca_compress_tail(
-        batch_id_per_token=md.batch_id_per_token,
-        positions=positions_gpu,
-        hca_indptr=hca_indptr,
         n_committed_hca_per_seq=md.n_committed_hca_per_seq,
         block_tables=common.block_table_tensor,
-        hca_indices=hca_indices,
         T=T,
         win=win,
+        cs=cs,
         swa_pages=swa_pages,
     )
     md.kv_indices_swa = swa_indices[:swa_total]
