@@ -437,3 +437,45 @@ def test_a_slot_is_released_only_when_every_rank_reports():
         ]
     )
     assert out.state_staging_released == {1} and out.state_indexed == {99}
+
+
+def test_the_offload_counters_reach_the_periodic_stats_line():
+    """`stats()` had no caller, so `spills_dropped` was invisible below the
+    256-consecutive-drop starvation warning -- and a ring that drops one spill
+    in three never trips that. `checkpoint_fates` is what the scheduler reads
+    every 100 ticks, so the counters have to arrive there.
+
+    Non-vacuousness: drop the `self.offload is not None` merge in
+    `checkpoint_fates` and this fails on the missing key.
+    """
+    pool = spilling_pool()
+    pool.group_hash[1] = 111
+    pool._spill(1)
+    pool._spill(1)  # depth is 2, so both land
+    pool.group_hash[2] = 222
+    pool._spill(2)  # ring is full: dropped
+
+    fates = pool.checkpoint_fates()
+    assert fates["state_offload_spills_dropped"] == 1
+    assert fates["state_offload_spills_requested"] == 2
+    # The pool's own counters must still be there -- this merges, not replaces.
+    assert "checkpoints_evicted" in fates
+
+
+def test_the_offload_keys_are_namespaced():
+    """`state_checkpoint_fates` sums by key across every state class, so an
+    unprefixed `indexed` would silently add itself to any future pool's."""
+    pool = spilling_pool()
+    assert "state_offload_indexed" in pool.checkpoint_fates()
+    assert "indexed" not in pool.checkpoint_fates()
+
+
+def test_a_pool_with_no_tier_reports_only_its_own_fates():
+    """Zero cost when disabled: with no tier attached the dict is exactly what
+    it was before the merge, so the log line does not grow five zero columns
+    on every server that leaves OFFLOAD_STATE off."""
+    pool = StateGroupPool(
+        num_groups=4, transfer=StateTransfer.copy(), hash_block_size=4
+    )
+    assert pool.offload is None
+    assert not any(k.startswith("state_offload_") for k in pool.checkpoint_fates())

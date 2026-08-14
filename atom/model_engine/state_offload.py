@@ -133,6 +133,19 @@ class StateOffloadIndex:
         self.hashes.discard(h)
 
     def stats(self) -> dict[str, int]:
+        """Counters for the periodic `state checkpoints:` line.
+
+        Reached via `StateGroupPool.checkpoint_fates`, which prefixes every key
+        with `state_offload_`.
+
+        `loads_attempted` and `loads_failed` are structurally 0 on this branch,
+        not merely unexercised: their only writers are in
+        `StateOffloadTier.submit_load`/`_do_load`, the worker builds its tier
+        with `index=None`, and nothing calls `submit_load` at all. They are
+        reported anyway so that wiring loads needs no change here -- and a
+        non-zero value in a log would itself be news, since it would mean a
+        load path exists that this comment says does not.
+        """
         return {
             "spills_requested": self.spills_requested,
             "spills_dropped": self.spills_dropped,

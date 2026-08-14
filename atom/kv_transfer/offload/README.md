@@ -859,6 +859,16 @@ nothing unless checkpoints are actually being evicted. The signal is the
 near zero, the pool is big enough for the workload and the tier is pure
 overhead. Enable it only when that counter is materially non-zero.
 
+Once the tier is on, that same line carries its counters, prefixed
+`state_offload_` (`StateOffloadIndex.stats` via `checkpoint_fates`):
+`spills_requested`, `spills_dropped`, `indexed`, and `loads_attempted` /
+`loads_failed`. Watch `spills_dropped`: a non-trivial ratio against
+`spills_requested` means `OFFLOAD_STATE_STAGING_GROUPS` is too shallow for the
+eviction rate — spills are being refused for want of a staging slot. The
+starvation warning only fires after 256 consecutive drops, so a ring dropping
+one spill in three is silent there and visible only here. The two `loads_*`
+counters are structurally 0 while the load direction is unwired (below).
+
 **Requires the `lmcache_offload` connector.** `kv_connector_hosts_state_tier()`
 gates installation; `OFFLOAD_STATE` set against any other `--kv-transfer-config`
 warns at startup and the tier stays off (`block_manager.py`).

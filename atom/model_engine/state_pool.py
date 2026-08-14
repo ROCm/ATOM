@@ -678,13 +678,31 @@ class StateGroupPool:
         self._checkpoint_pending.clear()
 
     def checkpoint_fates(self) -> dict[str, int]:
-        """What became of the checkpoints the ladder asked this pool to keep."""
-        return {
+        """What became of the checkpoints the ladder asked this pool to keep.
+
+        Folds in the offload tier's own counters when a tier is attached.
+        `StateOffloadIndex.stats()` had no caller, which left `spills_dropped`
+        -- the "the staging ring is too shallow for this workload" signal --
+        invisible until 256 consecutive drops tripped the starvation warning.
+        A ring that drops one spill in three never trips that and never says
+        so. `state_checkpoint_fates` sums whatever keys each pool returns, so
+        merging here is the whole wiring.
+
+        The keys are prefixed `state_offload_` because that aggregation is by
+        key across every state class: an unprefixed `indexed` would collide
+        with anything a future pool names the same.
+        """
+        fates = {
             "checkpoints_kept": self.checkpoints_kept,
             "checkpoints_dropped": self.checkpoints_dropped,
             "checkpoints_evicted": self.checkpoints_evicted,
             "checkpoints_orphaned": self.checkpoints_orphaned,
         }
+        if self.offload is not None:
+            fates.update(
+                (f"state_offload_{k}", v) for k, v in self.offload.stats().items()
+            )
+        return fates
 
     def record_copy(self, src: int, dst: int) -> None:
         """Schedule a state copy for the next batch's forward to issue."""
