@@ -1298,6 +1298,35 @@ class Scheduler:
             )
 
             if needs_remote_load:
+                if seq.state_load_hash != -1:
+                    # Two transfers, one park, one report to resolve it: the
+                    # first completion would unpark the request while the other
+                    # is still writing. Unreachable today and asserted rather
+                    # than handled -- `_decide_load_after_alloc` refuses every
+                    # KV load for a `has_per_req_cache` sequence (the offload
+                    # README's "State offload tier" section), and a state load
+                    # exists only for such a sequence. Whoever lifts that
+                    # refusal owes a joint park (`state_tier._JointPark`)
+                    # rather than this branch.
+                    logger.warning(
+                        "seq %s has both a remote KV load and a state load "
+                        "pending; dropping the state load. The per-request "
+                        "cache guard in the offload connector should have made "
+                        "this impossible.",
+                        seq.id,
+                    )
+                    self.block_manager.cancel_state_load(seq)
+                self._park_for_remote_load(seq, skipped_waiting_requests)
+                continue
+
+            if seq.state_load_hash != -1:
+                # The state boundary this request kept is in LMCache, not HBM.
+                # It parks exactly as a KV load does -- same queue, same
+                # backpressure count, same `finished_loading`/`failed_loading`
+                # wake-up -- because from the scheduler's side the two are the
+                # same event: a transfer into blocks this request already
+                # holds. `_is_offload_prefill_resume` then resumes it as a
+                # suffix prefill without re-allocating anything.
                 self._park_for_remote_load(seq, skipped_waiting_requests)
                 continue
 
@@ -1372,6 +1401,7 @@ class Scheduler:
 
             connector_meta_output = None
             if self.kv_connector is not None:
+                self._publish_state_loads()
                 connector_meta_output = self.kv_connector.build_connector_meta()
 
             # Freeze, per seq, whether this chunk finishes the prompt. Uses the
@@ -1518,6 +1548,7 @@ class Scheduler:
 
         connector_meta_output = None
         if self.kv_connector is not None:
+            self._publish_state_loads()
             connector_meta_output = self.kv_connector.build_connector_meta()
 
         decode_batch = ScheduledBatch(
@@ -1603,6 +1634,19 @@ class Scheduler:
         seq.status = SequenceStatus.WAITING
         if not self._connector_flag("is_offload"):
             self._uncount_inflight_load(seq)
+        if seq.state_load_hash != -1:
+            # The state behind this request's boundary never arrived, so the
+            # boundary is not its history. Disown it exactly as
+            # `BlockManager.allocate` does at admission: the blocks stay
+            # claimed and the forward recomputes over them. Without this the
+            # request resumes a suffix prefill with `num_cached_tokens > 0`
+            # over a group nobody filled, which `has_initial_state` reads as
+            # "the recurrence continues" -- silent wrong output.
+            #
+            # Before `offload_loaded_tokens` is set below, so that field
+            # records the disowned figure and not the one the load promised.
+            seq.num_cached_tokens = 0
+            seq.state_load_hash = -1
         seq.offload_loaded = False
         seq.offload_loaded_tokens = seq.num_cached_tokens
         seq.offload_load_start_tokens = None
@@ -1640,6 +1684,12 @@ class Scheduler:
             seq.num_cached_tokens = loaded
         seq.offload_load_start_tokens = None
         seq.offload_loaded = True
+        # A state load moves no KV, so the block above does nothing for it:
+        # `offload_loaded_tokens` was never raised and `num_cached_tokens` is
+        # already the boundary the state now covers. All that is left is to
+        # stop calling the load pending -- the index was settled when the
+        # report arrived.
+        seq.state_load_hash = -1
 
     def _is_offload_prefill_resume(self, seq: Sequence) -> bool:
         """True when offload already owns blocks and should resume suffix prefill.
@@ -1850,6 +1900,40 @@ class Scheduler:
         if hasattr(self.kv_connector, "should_park_for_load_after_alloc"):
             return self.kv_connector.should_park_for_load_after_alloc(seq)
         return True
+
+    def _publish_state_loads(self) -> None:
+        """Hand this pass's state-tier loads to the connector, before it builds
+        its metadata.
+
+        Drained here rather than at the park, because the connector publishes
+        once per pass and a load handed over twice would write the same entry
+        into a group the first transfer is already filling.
+        """
+        if self.kv_connector is None:
+            return
+        loads = self.block_manager.take_state_loads()
+        if not loads:
+            return
+        if not hasattr(self.kv_connector, "enqueue_state_loads"):
+            # Nothing will carry them, and the requests are already parked
+            # against a report that would never come. Fail them here instead:
+            # `failed_loading` means "wake and recompute over the blocks
+            # already allocated", which is the correct answer to a tier that
+            # cannot serve. `BlockManager` refuses to build the index at all
+            # unless the connector hosts the tier, so this is a misconfiguration
+            # that got past that check rather than a normal path.
+            logger.warning(
+                "state offload: %s cannot carry state loads; failing %d of "
+                "them. The tier's index should not have been installed against "
+                "this connector.",
+                type(self.kv_connector).__name__,
+                len(loads),
+            )
+            for req_id, _h, _group in loads:
+                self.block_manager.settle_state_load(req_id, ok=False)
+                self.failed_recving_kv_req_ids.append(req_id)
+            return
+        self.kv_connector.enqueue_state_loads(loads)
 
     def _park_for_remote_load(
         self, seq: Sequence, skipped_waiting_requests: deque[Sequence]
@@ -2589,9 +2673,18 @@ class Scheduler:
             )
             self.failed_recving_kv_req_ids.append(req_id)
 
+        # The two loading channels carry state-tier loads as well as KV ones.
+        # Sharing them is what buys the state leg the aggregator's existing
+        # per-request quorum for free -- a load is only done when every rank
+        # has its shard, which is exactly true of a state entry too. The two
+        # cannot be confused for one request: a KV load is refused for any
+        # sequence with a per-request cache, and a state load exists only for
+        # such a sequence. `settle_state_load` is a no-op for an id the state
+        # index never issued.
         for req_id in kv_connector_output.finished_loading or ():
             assert is_offload, "Only offload connector should update loading KV status"
-            logger.debug("Finished offload KV load for request %s", req_id)
+            logger.debug("Finished offload load for request %s", req_id)
+            self.block_manager.settle_state_load(req_id, ok=True)
             self.finished_recving_kv_req_ids.append(req_id)
 
         for req_id in kv_connector_output.failed_loading or ():
@@ -2599,9 +2692,10 @@ class Scheduler:
                 is_offload
             ), "Only offload connector should update failed KV load status"
             logger.warning(
-                "Offload KV load failed for request %s; falling back to prefill.",
+                "Offload load failed for request %s; falling back to prefill.",
                 req_id,
             )
+            self.block_manager.settle_state_load(req_id, ok=False)
             self.failed_recving_kv_req_ids.append(req_id)
 
         for req_id in kv_connector_output.finished_sending or ():

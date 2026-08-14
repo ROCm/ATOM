@@ -661,6 +661,10 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         self._save_inflight: set[str] = set()
         self._lookup_in_step: list[str] = []
         self._handoff_loads: set[str] = set()
+        # State offload tier loads admitted this pass, drained by
+        # `build_connector_meta`. Not keyed by req_id: two requests may resume
+        # off the same hash in one pass, each into its own group.
+        self._pending_state_loads: list[tuple] = []
         # Unaligned handoff is always on: when the HBM prefix-cache hit is not
         # chunk-aligned, recompute the misaligned head up to the next chunk
         # boundary, then load the aligned remainder from CPU. (Previously gated
@@ -1023,8 +1027,26 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         seq.offload_loaded_tokens = max(hbm, lmc)
         return True
 
+    def enqueue_state_loads(self, loads) -> None:
+        """Take this pass's state-tier loads, for the next `build_connector_meta`.
+
+        `(req_id, state_hash, target_group)`, already decided by the engine:
+        `BlockManager._attach_state_group` chose the group and
+        `StateOffloadIndex.request_load` vouched for the hash. Nothing is
+        re-decided here -- unlike the KV leg, whose `LoadSpec` is re-checked at
+        build time because `num_cached_tokens` moves under it between match and
+        allocate. A state load is decided *after* allocate, against a group
+        this request already holds, so there is nothing left to move.
+        """
+        self._pending_state_loads.extend(loads)
+
     def build_connector_meta(self) -> LMCacheOffloadMetadata:
         meta = LMCacheOffloadMetadata()
+        # Drained, not copied: every load handed over is submitted exactly once,
+        # and a second submission would write the same entry into a group the
+        # first transfer is already filling.
+        meta.state_loads = self._pending_state_loads
+        self._pending_state_loads = []
 
         # Loads
         logger.debug("[OFFLOAD-BUILD] reqs_need_recv=%d", len(self._reqs_need_recv))

@@ -24,10 +24,11 @@ switched on, which that file's fixtures deliberately never do.
 
 from conftest import MockConfig
 
+from atom.kv_transfer.disaggregation.types import KVConnectorOutput
 from atom.model_engine import state_pool
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.scheduler import Scheduler
-from atom.model_engine.sequence import Sequence
+from atom.model_engine.sequence import Sequence, SequenceStatus
 
 BLOCK = 4
 MIN_FORK = 8
@@ -396,6 +397,105 @@ def test_a_report_for_a_plain_kv_load_settles_nothing(monkeypatch):
     bm = BlockManager(tier_config())
     bm.settle_state_load(4242, ok=False)
     assert bm.state_offload.loads_failed == 0
+
+
+# ── Park, and the two ways the park ends ───────────────────────────────────
+
+
+def parked_resumer(monkeypatch, tokens=None):
+    """A scheduler holding one request parked on a state load.
+
+    Returns `(scheduler, resumer, boundary, batch)`. Everything below starts
+    here, because the park is the one state the load path adds to the
+    scheduler.
+    """
+    tokens = list(range(40)) if tokens is None else tokens
+    monkeypatch.setenv("OFFLOAD_STATE", "1")
+    loads_wired(monkeypatch)
+    sched = Scheduler(tier_config(pool_entries={"state": 8}, max_num_seqs=8))
+    _, boundary = spilled_publisher(sched.block_manager, tokens)
+
+    resumer = stateful_seq(tokens)
+    sched.add(resumer)
+    batch, scheduled = sched.schedule()
+    assert resumer.id not in scheduled, "forwarded before its state arrived"
+    return sched, resumer, boundary, batch
+
+
+def test_a_state_load_parks_the_request_and_reaches_the_connector(monkeypatch):
+    """A boundary whose bytes are still in LMCache cannot be forwarded yet.
+
+    The park is the KV load's park -- same queue, same status, same
+    backpressure count -- because from the scheduler's side the two are one
+    event: a transfer into blocks this request already holds.
+
+    The load rides the batch's connector metadata, which the engine dispatches
+    even for a batch with no sequences in it -- and this one has none, because
+    the only request there was is the parked one.
+    """
+    sched, resumer, _, batch = parked_resumer(monkeypatch)
+    assert resumer.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+    assert sched._num_parked_remote_kv == 1
+    loads = batch.connector_meta_output.state_loads
+    assert [r for r, _h, _g in loads] == [resumer.id]
+    # Drained on the way out: a load submitted twice would write the same entry
+    # into a group the first transfer is already filling.
+    assert sched.kv_connector.build_connector_meta().state_loads == []
+
+
+def test_a_completed_state_load_resumes_the_suffix(monkeypatch):
+    """The payoff: the prompt up to the boundary is not recomputed."""
+    sched, resumer, boundary, _ = parked_resumer(monkeypatch)
+
+    sched._update_from_kv_xfer_finished(
+        KVConnectorOutput(finished_loading={resumer.id})
+    )
+    _, scheduled = sched.schedule()
+
+    assert resumer.id in scheduled, "never woke up"
+    assert resumer.num_cached_tokens == boundary, "the boundary was thrown away"
+    assert resumer.prefix_cache_hit_tokens == boundary
+    assert resumer.state_load_hash == -1
+    assert sched.block_manager.state_offload.loads_completed == 1
+    assert sched._num_parked_remote_kv == 0
+
+
+def test_a_failed_state_load_disowns_the_boundary(monkeypatch):
+    """The LRU-drop path, and the one that is silent if it is got wrong.
+
+    The blocks stay claimed and the forward recomputes over them -- exactly
+    what `failed_loading` means on the KV side. Keeping the boundary instead
+    would leave `has_initial_state` true (`gdn_attn.py` reads
+    `num_cached_tokens > 0`) over a group nobody filled: wrong output, no
+    exception.
+    """
+    sched, resumer, boundary, _ = parked_resumer(monkeypatch)
+    h = resumer.state_load_hash
+    assert h != -1
+
+    sched._update_from_kv_xfer_finished(KVConnectorOutput(failed_loading={resumer.id}))
+    _, scheduled = sched.schedule()
+
+    assert resumer.id in scheduled, "never woke up"
+    assert resumer.num_cached_tokens == 0, "resumed over state nobody delivered"
+    assert resumer.prefix_cache_hit_tokens == 0
+    assert resumer.state_load_hash == -1
+    # The index retracts the claim, so the next request over this prefix does
+    # not park, miss and recompute all over again.
+    assert h not in sched.block_manager.state_offload.hashes
+    assert sched.block_manager.state_offload.loads_failed == 1
+    assert boundary > 0
+
+
+def test_a_failed_state_load_keeps_the_blocks_it_claimed(monkeypatch):
+    """Disowning the boundary must not drop the KV blocks with it -- they were
+    claimed at admission and dropping them would leak a reference."""
+    sched, resumer, _, _batch = parked_resumer(monkeypatch)
+    blocks = list(resumer.block_table)
+
+    sched._update_from_kv_xfer_finished(KVConnectorOutput(failed_loading={resumer.id}))
+    sched.schedule()
+    assert list(resumer.block_table) == blocks
 
 
 # ── What the disowned request tells the user it got ────────────────────────

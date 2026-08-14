@@ -628,6 +628,22 @@ class BlockManager:
         self._state_loads.append((seq.id, hit_hash, seq.per_req_cache_group))
         return True
 
+    def cancel_state_load(self, seq: Sequence) -> None:
+        """Withdraw a load requested this pass, before anything was issued.
+
+        Only legal before `take_state_loads` has handed it over -- afterwards
+        the bytes are on their way and the group must be held (`deallocate`).
+        The boundary is disowned exactly as `allocate` would have: the state
+        behind it is not coming, so it is not this request's history.
+        """
+        if seq.state_load_hash == -1:
+            return
+        self._state_loads = [e for e in self._state_loads if e[0] != seq.id]
+        if self.state_offload is not None:
+            self.state_offload.abandon_load(seq.id)
+        seq.state_load_hash = -1
+        seq.num_cached_tokens = 0
+
     def settle_state_load(self, req_id, ok: bool) -> None:
         """Apply one worker load report. Keyed by request, like the KV load.
 

@@ -54,6 +54,7 @@ class FakeSchedSub:
             self.chunk_ret = None
             self.saved = []
             self.load_failed_ids = []
+            self.state_loads = []
 
     def get_num_new_matched_tokens(self, seq):
         return self._match
@@ -86,6 +87,9 @@ class FakeSchedSub:
     def load_failed(self, req_id):
         self.load_failed_ids.append(req_id)
 
+    def enqueue_state_loads(self, loads):
+        self.state_loads.extend(loads)
+
     def __getattribute__(self, name):
         # Hide offload-specific methods unless this mock opts in, so
         # MultiConnector's hasattr() guards are exercised realistically.
@@ -96,6 +100,7 @@ class FakeSchedSub:
             "should_defer_free",
             "save_finished",
             "load_failed",
+            "enqueue_state_loads",
         }
         if name in offload_api and not object.__getattribute__(self, "_offload"):
             raise AttributeError(name)
@@ -316,6 +321,29 @@ def test_state_reports_survive_the_producer_send_save_pairing():
 
     assert out.state_staging_released == {2, 3}
     assert out.state_indexed == {7}
+
+
+def test_state_loads_go_to_the_sub_that_can_carry_them():
+    """The scheduler calls `enqueue_state_loads` on whatever connector it
+    holds. Under `multi` that is this object, and a load it swallowed would
+    leave its request parked against a transfer nobody was asked to make.
+    """
+    plain = FakeSchedSub()
+    off = FakeSchedSub(is_offload=True, offload_methods=True)
+    loads = [(1, 111, 0), (2, 222, 3)]
+
+    _sched([plain, off]).enqueue_state_loads(loads)
+
+    assert off.state_loads == loads
+    assert not hasattr(plain, "enqueue_state_loads")
+
+
+def test_state_loads_with_no_sub_to_carry_them_are_dropped_here():
+    """Not an error at this level: the scheduler decides what to do about a
+    connector that cannot carry them, and it fails the loads rather than
+    leaving their requests parked."""
+    plain = FakeSchedSub()
+    _sched([plain, FakeSchedSub()]).enqueue_state_loads([(1, 111, 0)])
 
 
 def test_the_composite_exposes_the_sub_connectors_state_tier():

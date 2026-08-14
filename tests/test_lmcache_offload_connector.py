@@ -61,6 +61,7 @@ def _scheduler() -> LMCacheOffloadConnectorScheduler:
     sched._save_inflight = set()
     sched._lookup_in_step = []
     sched._handoff_loads = set()
+    sched._pending_state_loads = []
     sched._min_load_tokens = 0
     sched._lock = threading.Lock()
     sched._done_load = set()
