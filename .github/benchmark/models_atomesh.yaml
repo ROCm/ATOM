@@ -248,7 +248,7 @@ models:
             isl: [1048576]
             osl: 1024
             server:
-              common_args:
+              common_args: &glm52_agentic_common_args
                 kv_cache_dtype: fp8
                 block_size: 16
                 gpu_memory_utilization: 0.9
@@ -269,7 +269,7 @@ models:
             env:
               decode:
                 MAX_JOBS: "16"
-            benchmark:
+            benchmark: &glm52_agentic_benchmark
               kind: aiperf_agentic
               aiperf_commit: b7b16cf851885567988a643282266bce74e34437
               scenario: inferencex-agentx-mvp
@@ -348,10 +348,10 @@ models:
               PYTHONHASHSEED: "0"
             prefill:
               LMCACHE_LOCAL_CPU: "True"
-              LMCACHE_MAX_LOCAL_CPU_SIZE: "256"
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "200"
               LMCACHE_CHUNK_SIZE: "256"
               PREFILL_KV_TRANSFER_CONFIG: >-
-                {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":6301},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
+                {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT}},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
               HIP_VISIBLE_DEVICES: "0,1,2,3"
             decode:
               MAX_JOBS: "16"
@@ -364,6 +364,76 @@ models:
         - <<: *glm52_agentic_lmcache_tp4_dpa
           name: glm-52-mxfp4-1p1d-tp4-dpa-agentic-lmcache-1m-c48
           concurrency: [48]
+
+        # Keep MTP cases separate from the non-speculative LMCache cases so
+        # each concurrency starts a fresh service with matching graph sizes.
+        # refer to: https://github.com/SemiAnalysisAI/InferenceX/pull/2576
+        - <<: &glm52_agentic_lmcache_mtp_tp4_dpa
+            <<: *glm52_agentic_lmcache_tp4_dpa
+            topology: 1p1d_dpa_mtp3
+            pd_worker_layout: single_node
+            env:
+              common:
+                ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB: "1024"
+                PYTHONHASHSEED: "0"
+              prefill:
+                LMCACHE_LOCAL_CPU: "True"
+                LMCACHE_MAX_LOCAL_CPU_SIZE: "200"
+                LMCACHE_CHUNK_SIZE: "256"
+                OFFLOAD_MIN_LOAD_TOKENS: "8192"
+                PREFILL_KV_TRANSFER_CONFIG: >-
+                  {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT}},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
+                HIP_VISIBLE_DEVICES: "0,1,2,3"
+              decode:
+                MAX_JOBS: "16"
+                HIP_VISIBLE_DEVICES: "4,5,6,7"
+            benchmark:
+              <<: *glm52_agentic_benchmark
+              aiperf_commit: 49634d1c6c2e6dcc18979d704a65e7c7064efc49
+          name: glm-52-mxfp4-mtp-1p1d-tp4-dpa-agentic-lmcache-1m-c12
+          concurrency: [12]
+          decode: &glm52_agentic_lmcache_mtp_decode
+            workers: 1
+            tp: 4
+            cudagraph: >-
+              [1,2,4,8,12,16,20,24]
+            extra_args: "--enable-dp-attention"
+          server:
+            common_args:
+              <<: &glm52_agentic_lmcache_mtp_common_args
+                <<: *glm52_agentic_common_args
+                method: mtp
+                num_speculative_tokens: 3
+                extra_args: "--spec-decode-acceptance-rate 0.6633"
+                max_num_batched_tokens: 16384
+              max_num_seqs: 24
+              decode_max_num_seqs: 24
+
+        - <<: *glm52_agentic_lmcache_mtp_tp4_dpa
+          name: glm-52-mxfp4-mtp-1p1d-tp4-dpa-agentic-lmcache-1m-c16
+          concurrency: [16]
+          decode:
+            <<: *glm52_agentic_lmcache_mtp_decode
+            cudagraph: >-
+              [1,2,4,8,12,16,20,24,28,32]
+          server:
+            common_args:
+              <<: *glm52_agentic_lmcache_mtp_common_args
+              max_num_seqs: 32
+              decode_max_num_seqs: 32
+
+        - <<: *glm52_agentic_lmcache_mtp_tp4_dpa
+          name: glm-52-mxfp4-mtp-1p1d-tp4-dpa-agentic-lmcache-1m-c24
+          concurrency: [24]
+          decode:
+            <<: *glm52_agentic_lmcache_mtp_decode
+            cudagraph: >-
+              [1,2,4,8,12,16,20,24,28,32,36,40,44,48]
+          server:
+            common_args:
+              <<: *glm52_agentic_lmcache_mtp_common_args
+              max_num_seqs: 48
+              decode_max_num_seqs: 48
 
     accuracy:
       task: gsm8k
