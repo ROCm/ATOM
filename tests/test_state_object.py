@@ -6,6 +6,12 @@ import torch
 
 from atom.kv_transfer.offload.state_object import StateByteCodec
 
+# `state_object` imports lmcache lazily, inside `key()` and `_allocate()`, so
+# the import above succeeds without it and nearly every test here then dies on
+# `ImportError` instead of skipping. Same guard, same reason, as
+# `test_lmcache_offload_disk_integration.py`.
+pytest.importorskip("lmcache")
+
 
 class FakeStaged:
     """Records what the packer was asked to move; no device involved."""
