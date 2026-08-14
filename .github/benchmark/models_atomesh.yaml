@@ -271,7 +271,16 @@ models:
                 MAX_JOBS: "16"
             benchmark:
               kind: aiperf_agentic
-              aiperf_commit: b7b16cf851885567988a643282266bce74e34437
+              # agentx-v1.0.4, matching recipes/Agentic-GLM-5.2.md. Pinned by
+              # SHA rather than tag name because pd_server_atom.sh:736 caches
+              # the checkout by comparing `git rev-parse HEAD` against this
+              # value. The previous pin (b7b16cf8) was the merge commit of
+              # PR #35 on a PR branch, not on any tag's ancestry — same tree as
+              # agentx-v1.0.1, so it carried #35's hard
+              # `minimum_profile_metric_coverage_ratio` exit-non-zero check
+              # without the later relaxations (#39: accept TTFT *or* ITL as
+              # liveness), which the CONC=1/2 cases are most likely to trip.
+              aiperf_commit: 49634d1c6c2e6dcc18979d704a65e7c7064efc49
               scenario: inferencex-agentx-mvp
               public_dataset: semianalysis_cc_traces_weka_062126
               max_context_length: 1048576
@@ -303,11 +312,13 @@ models:
           # sizes every step as `mtp_k + 1` tokens; a prefill without MTP would
           # ship no drafts and leave the draft layer's KV region unwritten.
           #
-          # The MXFP4 checkpoint leaves the MTP layer (index 78, past the 78
-          # target layers) in bf16, so the online-quant exclude list has to stop
-          # at layer 77 instead of the blanket `*expert*` — otherwise that
-          # layer's 256 experts stay bf16. Same list the single-node MTP3 cases
-          # in models.json and recipes/GLM-5.md use.
+          # `online_quant_config` is deliberately NOT overridden here: it stays
+          # on the blanket `*expert*` exclude list from
+          # `*glm52_agentic_common_args`, matching the MTP command in
+          # recipes/Agentic-GLM-5.2.md. That leaves the bf16 MTP layer (index
+          # 78, past the 78 target layers) unquantized rather than folding it
+          # into ptpc_fp8; keep it that way so CI and the recipe report the same
+          # numbers.
           topology: 1p1d_mtp3
           # Both roles are TP4, so prefill and decode fit on one 8-GPU node
           # (0-3 / 4-7) — the same split `glm-52-mxfp4-1p1d-tp4` already uses.
@@ -326,18 +337,61 @@ models:
               # has to be in the process env before the server starts, and it
               # goes under `common` because both roles import the model.
               ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB: "1024"
+              # LMCache hashes prompt chunks, so the CPU tier only survives a
+              # server restart with hashing pinned.
+              PYTHONHASHSEED: "0"
             prefill:
               HIP_VISIBLE_DEVICES: "0,1,2,3"
+              # 200 GiB CPU tier behind the HBM prefix cache, per
+              # recipes/Agentic-GLM-5.2.md. Only prefill runs the offload
+              # connector: it is the role that populates KV for the 1M-token
+              # AgentX traces, and decode receives those blocks over mooncake.
+              LMCACHE_LOCAL_CPU: "True"
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "200"
+              LMCACHE_CHUNK_SIZE: "256"
+              # Explicitly pinned at the engine default (offload/README.md:545)
+              # so the recipe and CI stay comparable if that default moves.
+              OFFLOAD_MIN_LOAD_TOKENS: "8192"
+              # `multi` because the PD producer role still needs mooncake; the
+              # launcher's default single-connector config has no slot for the
+              # offload tier. ${ROLE_IP} and ${HANDSHAKE_PORT} are substituted
+              # per role in pd_server_atom.sh:apply_prefixed_env.
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT}},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
             decode:
               HIP_VISIBLE_DEVICES: "4,5,6,7"
               # Re-stated because this `env` replaces the anchor's env wholesale.
               MAX_JOBS: "16"
+          # Capture sizes are sequence counts, not token counts
+          # (model_runner.py:3627-3660), and the scheduler bounds a decode batch
+          # by min(max_num_seqs, max_num_batched_tokens / (mtp_k + 1)). With
+          # max_num_batched_tokens at the 16384 default that second bound is
+          # 4096, so max_num_seqs is what binds — which is why the recipe's list
+          # tops out at exactly CONC * 2. Only decode captures: under PD the
+          # prefill worker never runs a decode-shaped batch, so graphs there
+          # would be captured and never replayed.
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: >-
+              [1,2]
           server: &glm52_agentic_mtp3_server
-            common_args:
+            common_args: &glm52_agentic_mtp3_common_args
               <<: *glm52_agentic_common_args
-              online_quant_config: '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","model.layers.[0-9].mlp.*expert*","model.layers.[1-6][0-9].mlp.*expert*","model.layers.7[0-7].mlp.*expert*"]}'
               method: mtp
               num_speculative_tokens: 3
+              # `extra_args` lands in EXTRA_SERVER_ARGS (pd_submit.sh:202) and
+              # is appended to both roles (pd_server_atom.sh:115-116); only the
+              # decode rejection sampler consumes it, but keeping it on both
+              # matches how `method`/`num_speculative_tokens` are shared.
+              # 1 + 3 * 0.6633 = 2.9899 accepted tokens per target forward.
+              # Performance-only: re-enabling `run_eval` below means removing
+              # this, since synthetic acceptance does not preserve accuracy.
+              extra_args: "--spec-decode-acceptance-rate 0.6633"
+              # `--max-num-seqs $((CONC * 2))`, per concurrency point.
+              max_num_seqs: 2
+              decode_max_num_seqs: 2
+          # Kept intact but not run: flip `run_eval` back to true to re-enable.
           accuracy:
             task: swebench_lite
             threshold: 0.50
@@ -349,7 +403,12 @@ models:
             max_workers: 4
             instance_timeout: 900
           eval_concurrency: [1]
-          run_eval: true
+          # SWE-bench-lite is temporarily off while the MTP3 PD path is being
+          # brought in line with recipes/Agentic-GLM-5.2.md. With this false the
+          # case no longer splits into benchmark+eval phases
+          # (pd_slurm_job.sh:16-21), so it runs on the base ports with no
+          # ATOMESH_RESTART_PORT_OFFSET applied.
+          run_eval: false
           runner:
             time_limit: "12:00:00"
 
@@ -359,7 +418,16 @@ models:
           topology: 1p1d_mtp3
           pd_worker_layout: single_node
           env: *glm52_agentic_mtp3_env
-          server: *glm52_agentic_mtp3_server
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: >-
+              [1,2,4]
+          server:
+            common_args:
+              <<: *glm52_agentic_mtp3_common_args
+              max_num_seqs: 4
+              decode_max_num_seqs: 4
 
         - <<: *glm52_agentic_tp4_tp4
           name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c4
@@ -367,7 +435,16 @@ models:
           topology: 1p1d_mtp3
           pd_worker_layout: single_node
           env: *glm52_agentic_mtp3_env
-          server: *glm52_agentic_mtp3_server
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: >-
+              [1,2,4,8]
+          server:
+            common_args:
+              <<: *glm52_agentic_mtp3_common_args
+              max_num_seqs: 8
+              decode_max_num_seqs: 8
 
         - <<: *glm52_agentic_tp4_tp4
           name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c8
@@ -375,7 +452,16 @@ models:
           topology: 1p1d_mtp3
           pd_worker_layout: single_node
           env: *glm52_agentic_mtp3_env
-          server: *glm52_agentic_mtp3_server
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: >-
+              [1,2,4,8,12,16]
+          server:
+            common_args:
+              <<: *glm52_agentic_mtp3_common_args
+              max_num_seqs: 16
+              decode_max_num_seqs: 16
 
         - <<: *glm52_agentic_tp4_tp4
           name: glm-52-mxfp4-1p1d-tp4-agentic-1m-c48
@@ -407,7 +493,7 @@ models:
               LMCACHE_MAX_LOCAL_CPU_SIZE: "256"
               LMCACHE_CHUNK_SIZE: "256"
               PREFILL_KV_TRANSFER_CONFIG: >-
-                {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":6301},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
+                {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT}},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
               HIP_VISIBLE_DEVICES: "0,1,2,3"
             decode:
               MAX_JOBS: "16"
