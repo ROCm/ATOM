@@ -19,15 +19,15 @@ from atom.distributed.kv_events import (
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.page_unit_checkpoint import (
-    PagedStateCheckpointSpec,
     PageUnitCheckpointStore,
 )
 from atom.model_engine.sequence import Sequence
 from atom.model_engine.state_cache import StateCache
 from atom.model_engine.state_pool import (
+    DEFAULT_STATE_RUNTIME,
     StateGroupPool,
     StateMaintenanceOps,
-    StateTransfer,
+    StateRuntime,
 )
 
 logger = logging.getLogger("atom")
@@ -63,8 +63,7 @@ class BlockManager:
         self,
         config: Config,
         *,
-        state_transfer: StateTransfer | None = None,
-        paged_state_checkpoint_spec: PagedStateCheckpointSpec | None = None,
+        state_runtime: StateRuntime = DEFAULT_STATE_RUNTIME,
     ):
         block_size = config.kv_cache_block_size
         num_blocks = config.num_kvcache_blocks
@@ -116,30 +115,17 @@ class BlockManager:
         # copy-transfer backend uses groups only as Active Slots; its immutable
         # checkpoint index owns arbitrary PAGE units through
         # `PageUnitCheckpointStore`.
-        transfer = state_transfer or StateTransfer.none()
+        self.state_runtime = state_runtime
+        checkpoint_spec = state_runtime.checkpoint_spec
         self.page_checkpoints: PageUnitCheckpointStore | None = None
-        if transfer.copies:
-            if paged_state_checkpoint_spec is None:
-                raise ValueError(
-                    "StateTransfer.copy(layout_id) requires runtime paged-state geometry"
-                )
-            if paged_state_checkpoint_spec.layout_id != transfer.paged_layout_id:
-                raise ValueError(
-                    "paged-state layout changed across runner and engine: "
-                    f"spec={paged_state_checkpoint_spec.layout_id!r}, "
-                    f"transfer={transfer.paged_layout_id!r}"
-                )
+        if checkpoint_spec is not None:
             self.page_checkpoints = PageUnitCheckpointStore(
                 self.kv,
-                paged_state_checkpoint_spec,
-            )
-        elif paged_state_checkpoint_spec is not None:
-            raise ValueError(
-                "runtime paged-state geometry requires StateTransfer.copy(layout_id)"
+                checkpoint_spec,
             )
         self.state = StateGroupPool(
             self.num_per_req_cache_groups,
-            transfer=transfer,
+            transfer=state_runtime.transfer,
             hash_block_size=self.hash_block_size,
             enabled=self.enable_prefix_caching,
             page_checkpoints=self.page_checkpoints,

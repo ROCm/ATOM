@@ -825,7 +825,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         launch_copy_spans(spans, device)
 
     def _validate_paged_state_op(self, op) -> None:
-        layout_id = self.state_transfer().paged_layout_id
+        layout_id = self.model_runner.state_runtime.transfer.paged_layout_id
         if op.layout_id != layout_id:
             raise RuntimeError(
                 f"state checkpoint layout mismatch: {op.layout_id!r} != "
@@ -1104,10 +1104,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         actual_slot_bytes = sum(
             geo.slot_bytes(width) for width in self._plane_row_widths()
         )
-        checkpoint_spec = self.model_runner.paged_state_checkpoint_spec
+        state_runtime = self.model_runner.state_runtime
+        checkpoint_spec = state_runtime.checkpoint_spec
         if checkpoint_spec is None:
             raise RuntimeError("DSV4 PAGE/state checkpoint sizing spec is missing")
-        layout_id = self.state_transfer().paged_layout_id
+        layout_id = state_runtime.transfer.paged_layout_id
         if (
             actual_page_bytes != checkpoint_spec.page_unit_bytes
             or actual_slot_bytes != checkpoint_spec.slot_bytes

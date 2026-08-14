@@ -6,7 +6,14 @@ import pickle
 
 import pytest
 
-from atom.model_engine.state_pool import StateMaintenanceOps, StateTransfer
+from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
+from atom.model_engine.state_pool import (
+    StateMaintenanceOps,
+    StateRuntime,
+    StateTransfer,
+)
+
+COPY_SPEC = PagedStateCheckpointSpec(10, 25, "layout-v2")
 
 
 def test_wire_round_trip_keeps_the_complete_capability():
@@ -53,6 +60,57 @@ def test_wire_shape_is_exact():
                 "other": 1,
             }
         )
+
+
+def test_state_runtime_accepts_copy_fork_and_none_contracts():
+    none_runtime = StateRuntime()
+    fork_runtime = StateRuntime(transfer=StateTransfer.fork(7))
+    copy_runtime = StateRuntime(
+        transfer=StateTransfer.copy(COPY_SPEC.layout_id),
+        checkpoint_spec=COPY_SPEC,
+    )
+
+    assert none_runtime.transfer == StateTransfer.none()
+    assert none_runtime.checkpoint_spec is None
+    assert fork_runtime.transfer.forks and fork_runtime.checkpoint_spec is None
+    assert copy_runtime.transfer.copies
+    assert copy_runtime.checkpoint_spec is COPY_SPEC
+
+
+def test_state_runtime_rejects_every_transfer_spec_mismatch():
+    invalid = (
+        (StateTransfer.copy(COPY_SPEC.layout_id), None),
+        (StateTransfer.copy("different-layout"), COPY_SPEC),
+        (StateTransfer.fork(1), COPY_SPEC),
+        (StateTransfer.none(), COPY_SPEC),
+    )
+
+    for transfer, checkpoint_spec in invalid:
+        with pytest.raises(ValueError):
+            StateRuntime(transfer=transfer, checkpoint_spec=checkpoint_spec)
+
+
+def test_state_runtime_wire_round_trip_revalidates_the_complete_contract():
+    runtimes = (
+        StateRuntime(),
+        StateRuntime(transfer=StateTransfer.fork(7)),
+        StateRuntime(
+            transfer=StateTransfer.copy(COPY_SPEC.layout_id),
+            checkpoint_spec=COPY_SPEC,
+        ),
+    )
+
+    for runtime in runtimes:
+        wire = pickle.loads(pickle.dumps(runtime.to_wire()))
+        assert StateRuntime.from_wire(wire) == runtime
+
+    invalid_wire = runtimes[-1].to_wire()
+    invalid_wire["checkpoint_spec"] = None
+    with pytest.raises(ValueError, match="requires a PAGE checkpoint spec"):
+        StateRuntime.from_wire(invalid_wire)
+
+    with pytest.raises(ValueError, match="fields"):
+        StateRuntime.from_wire({"transfer": StateTransfer.none().to_wire()})
 
 
 def test_state_maintenance_bundle_is_typed_and_immutable():

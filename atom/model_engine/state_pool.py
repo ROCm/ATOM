@@ -3,13 +3,14 @@
 
 from collections import deque
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from heapq import heapify, heappop, heappush
 from math import inf
 
 from atom.model_engine.page_unit_checkpoint import (
     CheckpointRestoreOp,
     CheckpointStoreOp,
+    PagedStateCheckpointSpec,
     PageUnitCheckpointStore,
 )
 
@@ -134,6 +135,80 @@ class StateTransfer:
     def successor_room(self) -> float:
         """`StateCache.successor_room` for a class transferred this way."""
         return inf if self.kind == NONE else float(self.fork_tokens)
+
+
+@dataclass(frozen=True)
+class StateRuntime:
+    """Validated runtime contract for per-request state and its checkpoints.
+
+    A copy capability is usable only with the exact PAGE checkpoint geometry
+    and layout that its runner sized.  Fork and none never own PAGE checkpoint
+    storage.  This object is therefore the single typed value passed from the
+    runner IPC boundary through the engine and scheduler to ``BlockManager``;
+    consumers cannot observe a partially validated transfer/spec pair.
+    """
+
+    transfer: StateTransfer = field(default_factory=StateTransfer.none)
+    checkpoint_spec: PagedStateCheckpointSpec | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.transfer, StateTransfer):
+            raise TypeError("state runtime transfer must be a StateTransfer")
+        if self.checkpoint_spec is not None and not isinstance(
+            self.checkpoint_spec, PagedStateCheckpointSpec
+        ):
+            raise TypeError(
+                "state runtime checkpoint_spec must be a PagedStateCheckpointSpec"
+            )
+        if self.transfer.copies:
+            if self.checkpoint_spec is None:
+                raise ValueError(
+                    "StateTransfer.copy(layout_id) requires a PAGE checkpoint spec"
+                )
+            if self.transfer.paged_layout_id != self.checkpoint_spec.layout_id:
+                raise ValueError(
+                    "state runtime PAGE layout mismatch: "
+                    f"transfer={self.transfer.paged_layout_id!r}, "
+                    f"spec={self.checkpoint_spec.layout_id!r}"
+                )
+        elif self.checkpoint_spec is not None:
+            raise ValueError(
+                f"StateTransfer.{self.transfer.kind} cannot carry a PAGE checkpoint spec"
+            )
+
+    def to_wire(self) -> dict[str, object]:
+        """Return the explicit pickle-safe runner RPC payload."""
+        return {
+            "transfer": self.transfer.to_wire(),
+            "checkpoint_spec": (
+                None if self.checkpoint_spec is None else self.checkpoint_spec.to_wire()
+            ),
+        }
+
+    @classmethod
+    def from_wire(cls, wire: object) -> "StateRuntime":
+        """Rebuild and validate the complete runtime at the IPC boundary."""
+        if not isinstance(wire, Mapping):
+            raise TypeError("state runtime must be a mapping")
+        expected = {"transfer", "checkpoint_spec"}
+        if set(wire) != expected:
+            raise ValueError(
+                "invalid state runtime fields: "
+                f"expected={sorted(expected)}, got={sorted(wire)}"
+            )
+        checkpoint_wire = wire["checkpoint_spec"]
+        checkpoint_spec = (
+            None
+            if checkpoint_wire is None
+            else PagedStateCheckpointSpec.from_wire(checkpoint_wire)
+        )
+        return cls(
+            transfer=StateTransfer.from_wire(wire["transfer"]),
+            checkpoint_spec=checkpoint_spec,
+        )
+
+
+DEFAULT_STATE_RUNTIME = StateRuntime()
 
 
 @dataclass(frozen=True)

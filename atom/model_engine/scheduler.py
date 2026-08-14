@@ -28,10 +28,13 @@ import numpy as np
 from atom.config import Config
 from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.model_engine.block_manager import BlockManager
-from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
-from atom.model_engine.state_pool import StateMaintenanceOps, StateTransfer
+from atom.model_engine.state_pool import (
+    DEFAULT_STATE_RUNTIME,
+    StateMaintenanceOps,
+    StateRuntime,
+)
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -617,8 +620,7 @@ class Scheduler:
         self,
         config: Config,
         *,
-        state_transfer: StateTransfer | None = None,
-        paged_state_checkpoint_spec: PagedStateCheckpointSpec | None = None,
+        state_runtime: StateRuntime = DEFAULT_STATE_RUNTIME,
     ):
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
@@ -629,8 +631,7 @@ class Scheduler:
         self.stop_token_ids = config.stop_token_ids
         self.block_manager = BlockManager(
             config,
-            state_transfer=state_transfer,
-            paged_state_checkpoint_spec=paged_state_checkpoint_spec,
+            state_runtime=state_runtime,
         )
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
@@ -2811,13 +2812,11 @@ class DecodeScheduler(Scheduler):
         config: Config,
         disagg_cu_shm_name: str = "",
         *,
-        state_transfer: StateTransfer | None = None,
-        paged_state_checkpoint_spec: PagedStateCheckpointSpec | None = None,
+        state_runtime: StateRuntime = DEFAULT_STATE_RUNTIME,
     ):
         super().__init__(
             config,
-            state_transfer=state_transfer,
-            paged_state_checkpoint_spec=paged_state_checkpoint_spec,
+            state_runtime=state_runtime,
         )
         # seq_id → Sequence; blocks allocated, BlockAssignment sent, awaiting PrefillDone.
         self.prefill_waiting: dict[int, Sequence] = {}

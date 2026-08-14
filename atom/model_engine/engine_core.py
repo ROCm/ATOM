@@ -16,10 +16,9 @@ from atom.kv_transfer.disaggregation import KVOutputAggregator
 from atom.model_engine.async_proc import AsyncIOProcManager
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import EngineUtilityHandler
-from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Scheduler
 from atom.model_engine.sequence import Sequence, SequenceStatus, get_exit_sequence
-from atom.model_engine.state_pool import StateTransfer
+from atom.model_engine.state_pool import StateRuntime
 from atom.utils import (
     envs,
     init_exit_handler,
@@ -95,13 +94,7 @@ class EngineCore:
             # adding an architecture never touches this line.
             config.pool_entries = block_info.get("pool_entries", {})
             config.pool_entries_per_req = block_info.get("pool_entries_per_req", {})
-            self.state_transfer = StateTransfer.from_wire(block_info["state_transfer"])
-            paged_state_wire = block_info.get("paged_state_checkpoint_spec")
-            self.paged_state_checkpoint_spec = (
-                None
-                if paged_state_wire is None
-                else PagedStateCheckpointSpec.from_wire(paged_state_wire)
-            )
+            self.state_runtime = StateRuntime.from_wire(block_info["state_runtime"])
             ret = self.runner_mgr.call_func(
                 "allocate_kv_cache", num_blocks, wait_out=True
             )
@@ -132,8 +125,7 @@ class EngineCore:
         if not config.disagg_is_decode:
             self.scheduler = Scheduler(
                 config,
-                state_transfer=self.state_transfer,
-                paged_state_checkpoint_spec=self.paged_state_checkpoint_spec,
+                state_runtime=self.state_runtime,
             )
 
         self.kv_transfer_enabled = bool(config.kv_transfer_config)
@@ -930,8 +922,7 @@ class DecodeEngineCore(EngineCore):
         self.scheduler = DecodeScheduler(
             config,
             disagg_cu_shm_name=config.disagg_cu_shm_name,
-            state_transfer=self.state_transfer,
-            paged_state_checkpoint_spec=self.paged_state_checkpoint_spec,
+            state_runtime=self.state_runtime,
         )
         # EngineUtilityHandler was built in super().__init__() with scheduler=None
         # (decode defers scheduler creation); wire the real one in for MTP stats.

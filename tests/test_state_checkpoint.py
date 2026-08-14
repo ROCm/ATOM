@@ -32,6 +32,7 @@ from atom.model_engine.state_cache import StateCache
 from atom.model_engine.state_pool import (
     StateGroupPool,
     StateMaintenanceOps,
+    StateRuntime,
     StateTransfer,
 )
 
@@ -40,6 +41,11 @@ MIN_FORK = 8
 PAGED_COPY_SPEC = PagedStateCheckpointSpec(10, 25, "test-layout-v1")
 DEFAULT_STATE_TRANSFER = StateTransfer.fork(MIN_FORK)
 PAGED_COPY_TRANSFER = StateTransfer.copy(PAGED_COPY_SPEC.layout_id)
+DEFAULT_STATE_RUNTIME = StateRuntime(transfer=DEFAULT_STATE_TRANSFER)
+PAGED_COPY_RUNTIME = StateRuntime(
+    transfer=PAGED_COPY_TRANSFER,
+    checkpoint_spec=PAGED_COPY_SPEC,
+)
 
 
 def ckpt_config(**overrides):
@@ -65,26 +71,22 @@ def ckpt_config(**overrides):
 def make_block_manager(
     config,
     *,
-    state_transfer=DEFAULT_STATE_TRANSFER,
-    paged_state_checkpoint_spec=None,
+    state_runtime=DEFAULT_STATE_RUNTIME,
 ):
     return BlockManager(
         config,
-        state_transfer=state_transfer,
-        paged_state_checkpoint_spec=paged_state_checkpoint_spec,
+        state_runtime=state_runtime,
     )
 
 
 def make_scheduler(
     config,
     *,
-    state_transfer=DEFAULT_STATE_TRANSFER,
-    paged_state_checkpoint_spec=None,
+    state_runtime=DEFAULT_STATE_RUNTIME,
 ):
     return Scheduler(
         config,
-        state_transfer=state_transfer,
-        paged_state_checkpoint_spec=paged_state_checkpoint_spec,
+        state_runtime=state_runtime,
     )
 
 
@@ -429,7 +431,7 @@ class TestHitShrink:
     def test_stateless_model_keeps_the_full_hit(self):
         bm = make_block_manager(
             ckpt_config(pool_entries={}),
-            state_transfer=StateTransfer.none(),
+            state_runtime=StateRuntime(),
         )
         first = Sequence(list(range(40)), BLOCK, has_per_req_cache=False)
         run_prompt(bm, first)
@@ -658,7 +660,7 @@ class TestForkLifecycle:
     def test_no_boundary_when_the_backend_cannot_fork(self):
         bm = make_block_manager(
             ckpt_config(),
-            state_transfer=StateTransfer.none(),
+            state_runtime=StateRuntime(),
         )
         seq = stateful_seq(list(range(40)))
         assert bm.checkpoint_limit(seq) == 0
@@ -882,19 +884,21 @@ class TestPagedCopyCheckpoint:
         bm.allocate(seq, bm.can_allocate(seq))
         return seq
 
-    def test_runtime_spec_is_explicit_from_wire_through_scheduler(self):
+    def test_validated_runtime_is_explicit_from_wire_through_block_manager(self):
         config = paged_copy_config()
-        engine_spec = PagedStateCheckpointSpec.from_wire(PAGED_COPY_SPEC.to_wire())
-        engine_transfer = StateTransfer.from_wire(PAGED_COPY_TRANSFER.to_wire())
+        engine_runtime = StateRuntime.from_wire(PAGED_COPY_RUNTIME.to_wire())
 
         scheduler = make_scheduler(
             config,
-            state_transfer=engine_transfer,
-            paged_state_checkpoint_spec=engine_spec,
+            state_runtime=engine_runtime,
         )
 
-        assert scheduler.block_manager.state.transfer is engine_transfer
-        assert scheduler.block_manager.page_checkpoints.spec is engine_spec
+        assert scheduler.block_manager.state_runtime is engine_runtime
+        assert scheduler.block_manager.state.transfer is engine_runtime.transfer
+        assert (
+            scheduler.block_manager.page_checkpoints.spec
+            is engine_runtime.checkpoint_spec
+        )
         assert scheduler.block_manager.page_checkpoints.units_per_checkpoint == 3
         assert not any(
             hasattr(config, field)
@@ -908,26 +912,10 @@ class TestPagedCopyCheckpoint:
             )
         )
 
-    def test_copy_transfer_without_runtime_spec_fails_fast(self):
-        with pytest.raises(ValueError, match="runtime paged-state geometry"):
-            make_block_manager(
-                paged_copy_config(),
-                state_transfer=PAGED_COPY_TRANSFER,
-            )
-
-    def test_transfer_and_runtime_spec_layout_must_match(self):
-        with pytest.raises(ValueError, match="layout changed"):
-            make_block_manager(
-                paged_copy_config(),
-                state_transfer=StateTransfer.copy("different-layout"),
-                paged_state_checkpoint_spec=PAGED_COPY_SPEC,
-            )
-
     def test_empty_batch_does_not_drain_state_maintenance(self):
         scheduler = make_scheduler(
             paged_copy_config(state_checkpoint_interval_tokens=0),
-            state_transfer=PAGED_COPY_TRANSFER,
-            paged_state_checkpoint_spec=PAGED_COPY_SPEC,
+            state_runtime=PAGED_COPY_RUNTIME,
         )
         scheduler.block_manager.state.record_copy(1, 2)
 
@@ -941,8 +929,7 @@ class TestPagedCopyCheckpoint:
     def test_real_batch_drains_all_state_maintenance_once(self):
         scheduler = make_scheduler(
             paged_copy_config(state_checkpoint_interval_tokens=0),
-            state_transfer=PAGED_COPY_TRANSFER,
-            paged_state_checkpoint_spec=PAGED_COPY_SPEC,
+            state_runtime=PAGED_COPY_RUNTIME,
         )
         store = CheckpointStoreOp(
             checkpoint_id=11,
@@ -984,8 +971,7 @@ class TestPagedCopyCheckpoint:
     def test_checkpoint_uses_page_units_not_an_active_slot(self):
         bm = make_block_manager(
             paged_copy_config(),
-            state_transfer=PAGED_COPY_TRANSFER,
-            paged_state_checkpoint_spec=PAGED_COPY_SPEC,
+            state_runtime=PAGED_COPY_RUNTIME,
         )
         seq = self._admitted(bm)
         free_slots = bm.state.num_free()
@@ -1006,8 +992,7 @@ class TestPagedCopyCheckpoint:
     def test_hit_gathers_into_a_distinct_contiguous_active_slot(self):
         bm = make_block_manager(
             paged_copy_config(),
-            state_transfer=PAGED_COPY_TRANSFER,
-            paged_state_checkpoint_spec=PAGED_COPY_SPEC,
+            state_runtime=PAGED_COPY_RUNTIME,
         )
         first = self._admitted(bm)
         bm.hash_blocks(first, bm.checkpoint_limit(first) - first.num_cached_tokens)
@@ -1036,12 +1021,11 @@ class TestPagedCopyCheckpoint:
         seq.type = SequenceType.DECODE
         forking = make_scheduler(
             ckpt_config(speculative_config=spec),
-            state_transfer=StateTransfer.fork(1),
+            state_runtime=StateRuntime(transfer=StateTransfer.fork(1)),
         )
         copying = make_scheduler(
             paged_copy_config(speculative_config=spec),
-            state_transfer=PAGED_COPY_TRANSFER,
-            paged_state_checkpoint_spec=PAGED_COPY_SPEC,
+            state_runtime=PAGED_COPY_RUNTIME,
         )
         assert copying.block_manager.page_checkpoints.spec is PAGED_COPY_SPEC
         assert forking._checkpoint_room(seq, False) == 0
@@ -1079,7 +1063,7 @@ class TestDecodePointPublishing:
     def test_a_rung_past_the_prompt_publishes(self):
         bm = make_block_manager(
             ckpt_config(),
-            state_transfer=StateTransfer.fork(1),
+            state_runtime=StateRuntime(transfer=StateTransfer.fork(1)),
         )
         seq = self._prompt_of_10(bm)
         group = seq.per_req_cache_group
@@ -1107,7 +1091,7 @@ class TestDecodePointPublishing:
         """Nothing will fork from it, and the fresh group would go straight back."""
         bm = make_block_manager(
             ckpt_config(),
-            state_transfer=StateTransfer.fork(1),
+            state_runtime=StateRuntime(transfer=StateTransfer.fork(1)),
         )
         seq = self._prompt_of_10(bm)
         group = seq.per_req_cache_group
@@ -1127,7 +1111,7 @@ class TestDecodePointPublishing:
         """The payoff: turn 2 reuses KV *and* the state that goes with it."""
         bm = make_block_manager(
             ckpt_config(),
-            state_transfer=StateTransfer.fork(1),
+            state_runtime=StateRuntime(transfer=StateTransfer.fork(1)),
         )
         seq = self._prompt_of_10(bm)
         self._generate_to(bm, seq, 4 * BLOCK)
@@ -1149,7 +1133,7 @@ class TestDecodePublishGate:
     def _sched(self, **overrides):
         return make_scheduler(
             ckpt_config(**overrides),
-            state_transfer=StateTransfer.fork(1),
+            state_runtime=StateRuntime(transfer=StateTransfer.fork(1)),
         )
 
     def _decoding_seq(self):
@@ -1524,7 +1508,7 @@ class TestDemandDrivenCheckpoints:
     def test_a_stateless_model_records_no_demand(self):
         bm = make_block_manager(
             demand_config(pool_entries={}),
-            state_transfer=StateTransfer.none(),
+            state_runtime=StateRuntime(),
         )
         cold = Sequence(PROMPT, BLOCK, has_per_req_cache=False)
         run_prompt_on_the_ladder(bm, cold)

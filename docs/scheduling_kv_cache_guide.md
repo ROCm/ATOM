@@ -218,7 +218,7 @@ Methods:
 
 ```python
 class BlockManager:
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, *, state_runtime: StateRuntime = DEFAULT_STATE_RUNTIME):
         block_size = config.kv_cache_block_size      # Tokens per block (default 16)
         num_blocks = config.num_kvcache_blocks        # Total blocks in pool
         self.block_size = block_size
@@ -237,14 +237,18 @@ class BlockManager:
         state_entries = int(pool_entries.get(STATE_SLOT_CLASS, 0))
         state_per_req = int(pool_per_req.get(STATE_SLOT_CLASS, 1)) or 1
         self.num_per_req_cache_groups = state_entries // state_per_req
+        checkpoint_spec = state_runtime.checkpoint_spec
+        self.page_checkpoints = (
+            None
+            if checkpoint_spec is None
+            else PageUnitCheckpointStore(self.kv, checkpoint_spec)
+        )
         self.state = StateGroupPool(
             self.num_per_req_cache_groups,
-            transfer=StateTransfer.from_config(
-                getattr(config, "state_transfer_kind", "none") or "none",
-                int(getattr(config, "state_fork_tokens", 0) or 0),
-            ),
+            transfer=state_runtime.transfer,
             hash_block_size=self.hash_block_size,
             enabled=self.enable_prefix_caching,
+            page_checkpoints=self.page_checkpoints,
         )
 ```
 
@@ -310,6 +314,8 @@ That number, `successor_room`, is mutability quantified. A rolling state (GDN re
 Index order in the vacant half is not a fairness choice. Allocating lowest-first keeps the top of the pool cold — a high index is only reached at a concurrency high-water mark — which is what lets `retire_top` hand the pool's top group back when the KV/state boundary moves. When something *is* sitting there, `retire_top` relocates it and spends the least recently used checkpoint instead, wherever that one lives; retiring by index alone would be anti-LRU, since an index records the high-water mark at hand-out and is never refreshed by use.
 
 **Two ways to keep one.** How a group reaches the index is the backend's `StateTransfer`, declared by `AttentionMetadataBuilder.state_transfer()`, and it decides *where* that backend may checkpoint.
+
+After pool sizing, the runner combines that capability with the optional `PagedStateCheckpointSpec` in one validated `StateRuntime`. COPY requires a spec with the same versioned layout id; FORK and NONE forbid one. The nested runtime wire payload is reconstructed once in `EngineCore` and passed explicitly through the scheduler to `BlockManager`, so neither `Config` nor downstream constructors can observe an invalid transfer/spec combination.
 
 *Fork* (`StateTransfer.fork(n)`, GDN). At a rung the request hands its group to the index and takes a fresh one; for exactly one forward it then reads the handed-over group and writes the new one (`non_spec_state_indices_in_tensor` / `non_spec_state_indices_tensor`). A checkpointed group is never written again, which is what makes it safe to share. Resuming is the same move in reverse. The cost is that the *next* forward is bound: it has to leave the replacement self-contained, which takes `n` committed tokens.
 
