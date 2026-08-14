@@ -206,7 +206,9 @@ def role_env(
         model_cfg.get("env", {}).get(role, {}),
         suite_cfg.get("env", {}).get(role, {}),
     )
-    env = resolve_env_refs_in_value(env, preserve_names={"ROLE_IP"})
+    # ROLE_IP and HANDSHAKE_PORT are resolved per role at launch time by
+    # pd_server_atom.sh:apply_prefixed_env, not from the runner's environment.
+    env = resolve_env_refs_in_value(env, preserve_names={"ROLE_IP", "HANDSHAKE_PORT"})
     return {str(key): str(value) for key, value in env.items()}
 
 
