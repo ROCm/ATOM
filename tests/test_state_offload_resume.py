@@ -129,18 +129,20 @@ def test_the_tier_is_installed_when_the_connector_hosts_it(monkeypatch):
     assert bm.state.offload is bm.state_offload
 
 
-def test_a_spilled_hash_is_not_resumed_from_a_recycled_group(monkeypatch):
-    """The Critical. `_resumable_from` accepts the spilled hash, so the hit is
-    non-zero, but `self.state.lookup(h)` is HBM-only and misses. Before the
-    guard the miss fell through to `self.state.pop()` -- another request's
-    state, with `num_cached_tokens > 0` marking it as this request's history.
+def test_a_spilled_hash_is_never_resumed_from_an_unfilled_group(monkeypatch):
+    """The Critical, in the form that survives the load path.
 
-    Driven in the loads-wired world, which is the only one where the hazard is
-    reachable and the only one where it must stay guarded: LMCache's LRU can
-    drop bytes under a hash the index still advertises, so a load that finds
-    nothing lands in exactly this branch. With loads unwired the pool declines
-    the boundary before `_attach_state_group` sees it -- covered by
-    `test_a_spilled_rung_does_not_shadow_a_resident_one`.
+    `_resumable_from` accepts a spilled hash, so the hit is non-zero, but
+    `self.state.lookup(h)` is HBM-only and misses. Before the guard the miss
+    fell through to `self.state.pop()` -- another request's state, with
+    `num_cached_tokens > 0` marking it as this request's history.
+
+    The invariant is a disjunction and always was: a positive boundary is legal
+    exactly when something is going to fill the group. Either a load was
+    requested, or the boundary is disowned. Never a boundary over a group
+    nobody filled. The `not` case has its own test
+    (`test_a_hash_the_tier_never_had_is_still_disowned`), which is what
+    LMCache's LRU produces at any moment.
     """
     monkeypatch.setenv("OFFLOAD_STATE", "1")
     loads_wired(monkeypatch)
@@ -152,12 +154,9 @@ def test_a_spilled_hash_is_not_resumed_from_a_recycled_group(monkeypatch):
     assert hit > 0, "the spilled hash must still produce a hit to be a hazard"
     bm.allocate(resumer, hit)
 
-    # Either the boundary is disowned or the bytes are really there. Never a
-    # positive boundary over a group nobody filled.
     assert resumer.per_req_cache_group >= 0
-    assert (
-        resumer.num_cached_tokens == 0
-    ), "resumed from a recycled group: the state is another request's"
+    if resumer.num_cached_tokens:
+        assert resumer.state_load_hash != -1, "a boundary over an unfilled group"
 
 
 def test_the_blocks_of_a_disowned_boundary_are_still_reused(monkeypatch):
@@ -249,13 +248,12 @@ def test_a_spilled_rung_does_not_shadow_a_resident_one(monkeypatch):
 
 
 def test_the_gate_is_the_only_thing_holding_the_spilled_rung_back(monkeypatch):
-    """Same two rungs, loads wired: the rightmost boundary wins again.
+    """Same two rungs, loads wired: the rightmost boundary wins, and is kept.
 
     The control for the test above -- it proves the shorter rung is chosen
-    because the spilled one is *unreachable*, not because the scan stopped
-    preferring the right. Re-widening is this one flag, and this test is what
-    says so. The disown here is the guard doing its job over bytes that have
-    not been fetched in this test; with a real load path the boundary is kept.
+    there because the spilled one is *unreachable*, not because the scan
+    stopped preferring the right. The pair is what makes the shadowing property
+    testable at all, so both halves must survive any change to the gate.
     """
     monkeypatch.setenv("OFFLOAD_STATE", "1")
     loads_wired(monkeypatch)
@@ -266,7 +264,138 @@ def test_the_gate_is_the_only_thing_holding_the_spilled_rung_back(monkeypatch):
     hit = bm.can_allocate(resumer)
     assert hit * bm.hash_block_size > short_boundary, "the scan stopped too early"
     bm.allocate(resumer, hit)
+    assert resumer.num_cached_tokens == hit * bm.hash_block_size
+    assert resumer.state_load_hash != -1, "the longer rung was not fetched"
+
+
+# ── Admission against a hash the tier can fetch back ───────────────────────
+
+
+def test_a_spilled_hash_becomes_a_load_and_keeps_its_boundary(monkeypatch):
+    """The point of the whole tier. A checkpoint the pool had to spend is
+    fetched back into the group the resumer will read, and the boundary the
+    scan found survives -- which is the prefill that is not recomputed."""
+    monkeypatch.setenv("OFFLOAD_STATE", "1")
+    loads_wired(monkeypatch)
+    bm = BlockManager(tier_config())
+    h, boundary = spilled_publisher(bm, list(range(40)))
+
+    resumer = stateful_seq(list(range(40)))
+    bm.allocate(resumer, bm.can_allocate(resumer))
+
+    assert resumer.num_cached_tokens == boundary, "the boundary was disowned"
+    assert resumer.state_load_hash == h
+    assert resumer.per_req_cache_group >= 0
+    # The target is a real pool group, never a staging entry: the bytes have to
+    # land where the resuming forward reads them.
+    assert resumer.per_req_cache_group < bm.state.num_groups
+    assert bm.take_state_loads() == [(resumer.id, h, resumer.per_req_cache_group)]
+
+
+def test_a_load_target_is_not_forked_from(monkeypatch):
+    """The loaded group *is* the incoming state. A fork source would send the
+    forward to read some other group instead of the bytes just written."""
+    monkeypatch.setenv("OFFLOAD_STATE", "1")
+    loads_wired(monkeypatch)
+    bm = BlockManager(tier_config())
+    spilled_publisher(bm, list(range(40)))
+
+    resumer = stateful_seq(list(range(40)))
+    bm.allocate(resumer, bm.can_allocate(resumer))
+    assert resumer.state_fork_src == -1
+
+
+def test_take_state_loads_drains(monkeypatch):
+    """Every drain site issues the loads it took; a second reader would submit
+    the same transfer twice into a group the first one is already filling."""
+    monkeypatch.setenv("OFFLOAD_STATE", "1")
+    loads_wired(monkeypatch)
+    bm = BlockManager(tier_config())
+    spilled_publisher(bm, list(range(40)))
+
+    resumer = stateful_seq(list(range(40)))
+    bm.allocate(resumer, bm.can_allocate(resumer))
+    assert len(bm.take_state_loads()) == 1
+    assert bm.take_state_loads() == []
+
+
+def test_a_hash_the_tier_never_had_is_still_disowned(monkeypatch):
+    """The guard of §6 stays. `_gated_hit` accepts a boundary the tier
+    advertises; LMCache's LRU can drop those bytes at any time, and so can a
+    stale index entry. The miss must land on the disown, not on a load nobody
+    can serve -- a load offered for an unknown hash would park the request
+    against a report that never comes.
+    """
+    monkeypatch.setenv("OFFLOAD_STATE", "1")
+    loads_wired(monkeypatch)
+    bm = BlockManager(tier_config())
+    h, _ = spilled_publisher(bm, list(range(40)))
+    bm.state_offload.forget(h)  # what the LRU does, without the LRU
+
+    resumer = stateful_seq(list(range(40)))
+    bm.allocate(resumer, bm.can_allocate(resumer))
     assert resumer.num_cached_tokens == 0
+    assert resumer.state_load_hash == -1
+    assert bm.take_state_loads() == []
+
+
+def test_an_aborted_resumer_gives_its_load_back(monkeypatch):
+    """A request deallocated with a load outstanding must leave nothing behind:
+    the index would otherwise hold a pending entry per aborted request, and its
+    counters would drift from what actually happened."""
+    monkeypatch.setenv("OFFLOAD_STATE", "1")
+    loads_wired(monkeypatch)
+    bm = BlockManager(tier_config())
+    h, _ = spilled_publisher(bm, list(range(40)))
+
+    resumer = stateful_seq(list(range(40)))
+    bm.allocate(resumer, bm.can_allocate(resumer))
+    bm.take_state_loads()
+    bm.deallocate(resumer)
+
+    assert bm.state_offload.pending_loads == {}
+    assert resumer.state_load_hash == -1
+    # Abandoning is not failing: the bytes are still there for the next request.
+    assert h in bm.state_offload.hashes
+    assert bm.state_offload.loads_failed == 0
+
+
+def test_an_aborted_resumers_group_is_held_until_the_bytes_land(monkeypatch):
+    """The transfer does not stop because the request went away.
+
+    A worker thread is still writing that group on its own stream. Handing it
+    straight back would let the next admission be given a buffer someone else
+    is filling -- another request's state arriving after the fact, under a
+    `has_initial_state` that is already true. Held until the report.
+    """
+    monkeypatch.setenv("OFFLOAD_STATE", "1")
+    loads_wired(monkeypatch)
+    bm = BlockManager(tier_config())
+    spilled_publisher(bm, list(range(40)))
+
+    resumer = stateful_seq(list(range(40)))
+    bm.allocate(resumer, bm.can_allocate(resumer))
+    group = resumer.per_req_cache_group
+    bm.take_state_loads()
+    bm.deallocate(resumer)
+    assert not bm.state.is_free(group), "handed out while a transfer writes it"
+
+    bm.settle_state_load(resumer.id, ok=True)
+    assert bm.state.is_free(group)
+    # Settling an abandoned load moves neither counter: it neither arrived
+    # anywhere useful nor proved anything about the bytes.
+    assert bm.state_offload.loads_completed == 0
+    assert bm.state_offload.loads_failed == 0
+
+
+def test_a_report_for_a_plain_kv_load_settles_nothing(monkeypatch):
+    """State loads share `finished_loading` with KV loads, so every id lands
+    here. One the index never issued must move nothing."""
+    monkeypatch.setenv("OFFLOAD_STATE", "1")
+    loads_wired(monkeypatch)
+    bm = BlockManager(tier_config())
+    bm.settle_state_load(4242, ok=False)
+    assert bm.state_offload.loads_failed == 0
 
 
 # ── What the disowned request tells the user it got ────────────────────────
@@ -281,11 +410,20 @@ def test_a_disowned_request_reports_no_prefix_cache_hit(monkeypatch):
     -- and one that disagrees with `CacheStats`, which reads the post-disown
     `num_cached_tokens`. Driven through `Scheduler.schedule` rather than
     `BlockManager.allocate` because the scheduler is where the field is set.
+
+    The tier is made to decline the fetch, which is the general form of every
+    reason `_attach_state_group` can fail to produce the state behind an
+    accepted boundary. Forgetting the hash instead would not reach the guard at
+    all -- the scan would decline the rung first and there would be no boundary
+    to disown.
     """
     monkeypatch.setenv("OFFLOAD_STATE", "1")
     loads_wired(monkeypatch)
     sched = Scheduler(tier_config(pool_entries={"state": 8}, max_num_seqs=8))
     spilled_publisher(sched.block_manager, list(range(40)))
+    monkeypatch.setattr(
+        sched.block_manager.state_offload, "request_load", lambda *_: False
+    )
 
     resumer = stateful_seq(list(range(40)))
     sched.add(resumer)

@@ -157,6 +157,15 @@ class BlockManager:
             getattr(config, "kv_transfer_config", None)
         )
         self.state_offload: StateOffloadIndex | None = None
+        # (req_id, hash, target_group) admitted this pass and not yet handed to
+        # the connector. Kept here rather than in the index because the group
+        # is this object's fact, the same reason `state_spills_for_batch` joins
+        # the spill's two halves engine-side.
+        self._state_loads: list[tuple] = []
+        # req_id -> group, for loads whose request was deallocated before the
+        # bytes landed. The group is off the free list until the report comes
+        # back; see `deallocate`.
+        self._orphan_load_groups: dict = {}
         if staging > 0 and not kv_offload_enabled:
             # Refuse to install the ring rather than install an inert one.
             # Without a connector that hosts the tier there is nobody to drain
@@ -561,6 +570,8 @@ class BlockManager:
         if src < 0:
             seq.per_req_cache_group = self.state.pop()
             seq.state_fork_src = -1
+            if self._request_state_load(seq, hit_hash):
+                return True
             # A fresh group holds the previous occupant's bytes. That is fine
             # for a cold start (nothing claims otherwise) and wrong for a hit,
             # so the hit only survives if there was none to begin with.
@@ -586,6 +597,70 @@ class BlockManager:
         seq.per_req_cache_group = src
         seq.state_fork_src = -1
         return True
+
+    def _request_state_load(self, seq: Sequence, hit_hash: int) -> bool:
+        """Ask the tier to fetch `hit_hash` into the group `seq` just took.
+
+        Only reached when the HBM index missed, which is exactly the case the
+        tier exists for: the checkpoint was spent to admit somebody else and
+        its bytes went to LMCache. The group is a real pool group, never a
+        staging entry -- the bytes land where the resuming forward reads them,
+        and only the spill direction needs the staging indirection.
+
+        `state_fork_src` stays -1, set by the caller. The loaded group *is* the
+        incoming state: both backends read the group they write when there is
+        no fork (`prepare_state_indices` maps the read index to the same base),
+        so naming a source here would send the forward to a different group
+        than the one being filled.
+
+        False means the tier cannot serve it -- no tier, or a hash it does not
+        believe in. Believing is not delivering: `request_load` refuses an
+        unknown hash because a load is only ever resolved by a report, so
+        offering one for bytes no `get` can produce would park the request
+        against a wake-up that never comes. The caller then disowns the
+        boundary, which is the same answer as before this tier existed.
+        """
+        if hit_hash == -1 or self.state_offload is None:
+            return False
+        if not self.state_offload.request_load(seq.id, hit_hash):
+            return False
+        seq.state_load_hash = hit_hash
+        self._state_loads.append((seq.id, hit_hash, seq.per_req_cache_group))
+        return True
+
+    def settle_state_load(self, req_id, ok: bool) -> None:
+        """Apply one worker load report. Keyed by request, like the KV load.
+
+        Called for every `finished_loading` / `failed_loading` id, including
+        the many that are plain KV loads: for those the index holds no pending
+        entry and this is a no-op, which is what keeps the scheduler from
+        having to know which leg a report belongs to.
+
+        An abandoned load (its request was deallocated mid-flight) is already
+        out of the index, so it neither completes nor fails -- but its group is
+        still being written and comes back here, and only here.
+        """
+        if self.state_offload is None:
+            return
+        if ok:
+            self.state_offload.complete_load(req_id)
+        else:
+            self.state_offload.fail_load(req_id)
+        group = self._orphan_load_groups.pop(req_id, None)
+        if group is not None:
+            self.state.release(group)
+
+    def take_state_loads(self) -> list[tuple]:
+        """`(req_id, hash, target_group)` for loads admitted since the last call.
+
+        Drained once per pass by the scheduler, which hands them to the
+        connector. Draining rather than reading is what keeps a load from being
+        submitted twice into a group the first transfer is already filling.
+        """
+        if self.state_offload is None:
+            return []
+        out, self._state_loads = self._state_loads, []
+        return out
 
     def hash_blocks(
         self,
@@ -1079,10 +1154,27 @@ class BlockManager:
             # `release_state_pins`, because the forward that owed the read is
             # not going to happen and the group should not sit out a pass for
             # a reader that no longer exists.
-            self.state.release(seq.per_req_cache_group)
+            #
+            # Unless a state load is still in flight into it. A worker thread
+            # is writing that group on its own stream, so handing it back now
+            # lets the next request be given a buffer someone else is filling
+            # -- another request's state, arriving after the fact, with
+            # `has_initial_state` already true over it. Held until the report
+            # lands (`settle_state_load`), which always comes: the worker
+            # reports every load either way, and a tier that refused to build
+            # reports the failure itself.
+            if seq.state_load_hash != -1 and self.state_offload is not None:
+                self._orphan_load_groups[seq.id] = seq.per_req_cache_group
+                # Abandoned, not failed: an abort says nothing about the bytes,
+                # and forgetting the hash would cost the next request over this
+                # prefix a full recompute.
+                self.state_offload.abandon_load(seq.id)
+            else:
+                self.state.release(seq.per_req_cache_group)
             self.state.drop_reader(seq.state_fork_src)
             seq.per_req_cache_group = -1
             seq.state_fork_src = -1
+        seq.state_load_hash = -1
 
     def can_append(self, seq: Sequence, num_new_tokens: int = 1) -> bool:
         seq_len = len(seq)
