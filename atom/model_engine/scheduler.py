@@ -146,6 +146,7 @@ class CacheStats:
         "_interval_compressed_tokens",
         "_interval_full_tokens",
         "_interval_requests",
+        "_interval_reusable_tokens",
         "_interval_wanted_tokens",
         "_log_interval",
         "_pool_pressure",
@@ -157,6 +158,7 @@ class CacheStats:
         "total_compressed_tokens",
         "total_full_tokens",
         "total_requests",
+        "total_reusable_tokens",
         "total_wanted_tokens",
     )
 
@@ -173,9 +175,26 @@ class CacheStats:
         self.total_requests: int = 0
         self.total_cached_tokens: int = 0
         self.total_full_tokens: int = 0
-        # Pre-gate compressed-prefix hit tokens. compressed - cached is reuse
-        # the Pool.STATE gates declined; full - compressed is reuse lost to
-        # compressed eviction or never there.
+        # The reuse ceiling, and the only honest denominator for a hit rate.
+        #
+        # `full` is not reachable: `BlockManager.can_allocate` matches over
+        # `range(n_hash_blocks - 1)`, because prefill must forward at least one
+        # block to produce sampler logits, so a request's own trailing block
+        # never comes from cache. Dividing by `full` therefore charges both
+        # pools for a block neither was ever offered, and reports a ceiling of
+        # 100% that no run can reach.
+        #
+        # It also silently rescales with sequence length -- the unreachable
+        # block is a fixed `hash_block_size`, so it is ~13% of a 1k prompt and
+        # ~0.05% of a 275k one. A hit rate divided by `full` thus moves with
+        # the length mix even when both pools behave identically, which is
+        # exactly the confound that makes two runs incomparable.
+        self.total_reusable_tokens: int = 0
+        # Pre-gate compressed-prefix hit tokens, and the boundary between the
+        # two pools: everything below it is the paged pool's doing, everything
+        # between it and `cached` is the state gates'. `reusable - compressed`
+        # is reuse the paged pool could not offer; `compressed - cached` is
+        # reuse it offered and the Pool.STATE gates declined.
         self.total_compressed_tokens: int = 0
         # Where the gates would have landed with every state ladder dense. It
         # sits between cached and compressed and splits the declined reuse in
@@ -188,6 +207,7 @@ class CacheStats:
         self._interval_full_tokens: int = 0
         self._interval_compressed_tokens: int = 0
         self._interval_wanted_tokens: int = 0
+        self._interval_reusable_tokens: int = 0
         # Per-request frequencies, cumulative. The token totals above answer
         # "how much reuse was lost"; these answer "how often, and to which
         # pool" -- a question a token ratio cannot, because one 275k-token
@@ -200,9 +220,16 @@ class CacheStats:
         # single bucket would have to pick a winner and would undercount
         # whichever lost. They do not sum to `total_requests`.
         #
-        #   full_reuse    cached == full. Everything was reused -- or there
-        #                 was nothing to reuse, since a cold first turn also
-        #                 lands here. Read it with the token totals.
+        # Every threshold is `reusable`, never `full`. Against `full`, two of
+        # these are not measurements but tautologies: `compressed < full` holds
+        # for every request that has ever existed, because the trailing block
+        # is never a reuse candidate. So `no_paged` reads 100% and
+        # `full_reuse` reads 0% on any workload, including a perfect one. This
+        # class shipped that way; the fix is the denominator, not the counter.
+        #
+        #   full_reuse    cached == reusable. Everything reusable was reused --
+        #                 or there was nothing to reuse, since a cold first
+        #                 turn also lands here. Read it with the token totals.
         #   state_miss_recoverable
         #                 cached < wanted: a checkpoint at that boundary would
         #                 have unlocked reuse the paged pool was still
@@ -212,9 +239,10 @@ class CacheStats:
         #                 than the state gates would admit, for any reason.
         #                 Superset of the above; the difference is the part no
         #                 checkpoint could have fixed.
-        #   no_paged      compressed < full: the paged pool did not have the
-        #                 prefix. State-cache tuning is powerless here -- this
-        #                 is KV capacity, eviction, or a genuinely new prefix.
+        #   no_paged      compressed < reusable: the paged pool did not have
+        #                 the prefix. State-cache tuning is powerless here --
+        #                 this is KV capacity, eviction, or a genuinely new
+        #                 prefix.
         self.reqs_full_reuse: int = 0
         self.reqs_state_miss_recoverable: int = 0
         self.reqs_state_miss: int = 0
@@ -226,22 +254,39 @@ class CacheStats:
         num_full_tokens: int,
         num_compressed_tokens: int,
         num_wanted_tokens: int,
+        num_reusable_tokens: int,
     ) -> None:
         """Record cache stats for one prefill sequence.
 
-        All four are required because the reported rates are differences
-        between them: `cached <= wanted <= compressed <= full`. A defaulted
-        argument would silently report a negative rate rather than a missing
-        one.
+        All five are required because the reported rates are differences
+        between them: `cached <= wanted <= compressed <= reusable <= full`. A
+        defaulted argument would silently report a negative rate rather than a
+        missing one.
+
+        `reusable` is the caller's, not this class's, because the gap between
+        it and `full` is a `BlockManager` matching detail (the trailing block
+        has no stable hash, so it is never a reuse candidate). Recomputing it
+        here would mean duplicating that rule in a second place and letting the
+        two drift.
         """
+        assert num_cached_tokens <= num_wanted_tokens <= num_compressed_tokens, (
+            "CacheStats nesting violated: "
+            f"{num_cached_tokens=} {num_wanted_tokens=} {num_compressed_tokens=}"
+        )
+        assert num_compressed_tokens <= num_reusable_tokens <= num_full_tokens, (
+            "CacheStats ceiling violated: "
+            f"{num_compressed_tokens=} {num_reusable_tokens=} {num_full_tokens=}"
+        )
         self.total_requests += 1
         self.total_cached_tokens += num_cached_tokens
         self.total_full_tokens += num_full_tokens
+        self.total_reusable_tokens += num_reusable_tokens
         self.total_compressed_tokens += num_compressed_tokens
         self.total_wanted_tokens += num_wanted_tokens
         self._interval_requests += 1
         self._interval_cached_tokens += num_cached_tokens
         self._interval_full_tokens += num_full_tokens
+        self._interval_reusable_tokens += num_reusable_tokens
         self._interval_compressed_tokens += num_compressed_tokens
         self._interval_wanted_tokens += num_wanted_tokens
 
@@ -249,13 +294,13 @@ class CacheStats:
         # at log time because the per-request shape is gone by then: the
         # totals cannot say whether 10% lost tokens was every request losing a
         # tenth or a tenth of requests losing everything.
-        if num_cached_tokens >= num_full_tokens:
+        if num_cached_tokens >= num_reusable_tokens:
             self.reqs_full_reuse += 1
         if num_cached_tokens < num_wanted_tokens:
             self.reqs_state_miss_recoverable += 1
         if num_cached_tokens < num_compressed_tokens:
             self.reqs_state_miss += 1
-        if num_compressed_tokens < num_full_tokens:
+        if num_compressed_tokens < num_reusable_tokens:
             self.reqs_no_paged += 1
 
         if self.total_requests % self._log_interval == 0:
@@ -264,9 +309,65 @@ class CacheStats:
 
     @property
     def hit_rate(self) -> float:
-        if self.total_full_tokens == 0:
-            return 0.0
-        return self.total_cached_tokens / self.total_full_tokens
+        """End-to-end reuse, against what was reusable at all.
+
+        Not against `total_full_tokens`: that denominator includes each
+        request's trailing block, which no cache is ever allowed to serve, so
+        it reports a ceiling nothing can reach and drifts with the prompt
+        length mix. `paged_hit_rate * state_hit_rate == hit_rate` exactly.
+        """
+        return self._rate(self.total_cached_tokens, self.total_reusable_tokens)
+
+    @property
+    def paged_hit_rate(self) -> float:
+        """The paged KV pool's own hit rate, with the state cache factored out.
+
+        Denominator is what the paged pool was asked for (`reusable`);
+        numerator is what it had (`compressed`). The state gates run strictly
+        after this and cannot change either term, so this number is unaffected
+        by checkpoint policy -- change `--state-checkpoint-*` and this should
+        not move. It answers "is the prefix still in KV?" and nothing else.
+
+        What it charges the pool for: eviction, capacity, and genuinely novel
+        prefixes. That last one is a workload property, not a defect, so this
+        rate has a ceiling below 100% set by how much of the traffic is new
+        text -- compare it against the dataset's theoretical prefix hit, not
+        against 100%.
+        """
+        return self._rate(self.total_compressed_tokens, self.total_reusable_tokens)
+
+    @property
+    def state_hit_rate(self) -> float:
+        """The state cache's own hit rate, with the paged pool factored out.
+
+        Denominator is what the paged pool actually offered (`compressed`),
+        NOT `reusable` -- the state gates never see a prefix the paged pool
+        already lost, and charging them for it would mean a KV eviction shows
+        up as a state-cache failure and sends tuning at the wrong pool. This
+        is the conditional probability: given the prefix was there, did a
+        checkpoint let us resume from it?
+
+        Unlike `paged_hit_rate`, 100% is genuinely reachable here: it means
+        every boundary the paged pool offered had a resumable checkpoint. The
+        gap decomposes into `state_recoverable_loss_rate` (a checkpoint would
+        have fixed it) and the remainder (nothing would have).
+        """
+        return self._rate(self.total_cached_tokens, self.total_compressed_tokens)
+
+    @property
+    def state_recoverable_loss_rate(self) -> float:
+        """The part of the state cache's miss that checkpoint placement owns.
+
+        Same denominator as `state_hit_rate`, so the two compose:
+        `state_hit_rate + state_recoverable_loss_rate` is the rate the state
+        cache would reach with a dense ladder. The distance from that to 1.0
+        is the part no checkpoint can buy, and the honest cap on what any
+        amount of `--state-checkpoint-groups` is worth.
+        """
+        return self._rate(
+            self.total_wanted_tokens - self.total_cached_tokens,
+            self.total_compressed_tokens,
+        )
 
     def get_statistics(self) -> dict:
         """Counters, not rates — the caller derives those.
@@ -280,6 +381,10 @@ class CacheStats:
             "cached_tokens": self.total_cached_tokens,
             "compressed_tokens": self.total_compressed_tokens,
             "wanted_tokens": self.total_wanted_tokens,
+            # The denominator for every rate here. `full_tokens` is reported
+            # too, but only so a consumer can see the unreachable gap; it is
+            # not a hit-rate denominator -- see `total_reusable_tokens`.
+            "reusable_tokens": self.total_reusable_tokens,
             "full_tokens": self.total_full_tokens,
             # Request counts, summable across DP ranks for the same reason the
             # token counts are. Not mutually exclusive -- see `__init__`.
@@ -293,6 +398,7 @@ class CacheStats:
         self._interval_requests = 0
         self._interval_cached_tokens = 0
         self._interval_full_tokens = 0
+        self._interval_reusable_tokens = 0
         self._interval_compressed_tokens = 0
         self._interval_wanted_tokens = 0
 
@@ -311,13 +417,14 @@ class CacheStats:
         #   Lost-unrecoverable  compressed - wanted, declined for a reason no
         #                       checkpoint touches: the SWA tail is gone, or the
         #                       boundary is too near the prompt's end to fork.
-        # (full - compressed) is the rest: compressed eviction, or no reuse.
+        # (reusable - compressed) is the rest: compressed eviction, or no reuse.
         self._log_line(
             "Interval",
             self._interval_requests,
             self._interval_cached_tokens,
             self._interval_compressed_tokens,
             self._interval_wanted_tokens,
+            self._interval_reusable_tokens,
             self._interval_full_tokens,
         )
         self._log_line(
@@ -326,11 +433,53 @@ class CacheStats:
             self.total_cached_tokens,
             self.total_compressed_tokens,
             self.total_wanted_tokens,
+            self.total_reusable_tokens,
             self.total_full_tokens,
         )
+        self._log_pools()
         self._log_frequency()
         if self._pool_pressure is not None:
             self._log_pressure(self._pool_pressure())
+
+    def _log_pools(self) -> None:
+        """Each pool's hit rate against its own denominator.
+
+        The `[Cache Stats]` line reports one end-to-end rate, which cannot say
+        which pool to fix: the same 85% is a KV pool that lost the prefix or a
+        state cache that refused to resume from it, and those want opposite
+        changes. Splitting needs two denominators, because the pools are in
+        series and the second only ever sees what the first passed on:
+
+            paged = compressed / reusable      "was the prefix still in KV?"
+            state = cached     / compressed    "given it was, could we resume?"
+            paged * state = cached / reusable = the end-to-end rate
+
+        So the product is exact, and the smaller factor is the bottleneck --
+        that comparison is the whole point of the line. Reading `state`
+        against `reusable` instead would fold KV evictions into the state
+        cache's score and point tuning at the wrong pool.
+
+        `+ckpt` is where `state` would land if every ladder were dense. It is
+        the ceiling on what checkpoint placement or more groups can buy; if it
+        sits near `state`, the state cache is already doing all it can and the
+        remaining loss is the paged pool's.
+        """
+        paged = self.paged_hit_rate
+        state = self.state_hit_rate
+        # Which factor is further from 1.0 loses more reuse, since the rates
+        # multiply. Named here rather than left to the reader because the
+        # comparison is against each other, not against 100%.
+        worse = "paged" if paged <= state else "state"
+        logger.info(
+            "[Cache Pools] "
+            f"paged-hit: {paged:.2%} "
+            f"({self.total_compressed_tokens}/{self.total_reusable_tokens}), "
+            f"state-hit: {state:.2%} "
+            f"({self.total_cached_tokens}/{self.total_compressed_tokens}), "
+            f"state-hit+ckpt: {state + self.state_recoverable_loss_rate:.2%}, "
+            f"combined: {self.hit_rate:.2%}, "
+            f"binding: {worse}"
+        )
 
     def _log_frequency(self) -> None:
         """How OFTEN each pool cost a request reuse, against how much.
@@ -347,6 +496,11 @@ class CacheStats:
         state-cache capacity is the binding constraint exactly to the extent
         this is large. When `no-paged` dominates instead, no amount of
         checkpoint tuning helps, because the prefix itself is gone.
+
+        All four are measured against `reusable`, not `full`. That is not a
+        detail: against `full`, `full-reuse` and `paged-miss` are tautologies
+        that read 0% and 100% on every possible workload, which is what this
+        line did when first shipped.
         """
         n = self.total_requests
         logger.info(
@@ -409,15 +563,26 @@ class CacheStats:
         cached: int,
         compressed: int,
         wanted: int,
+        reusable: int,
         full: int,
     ) -> None:
+        """Every rate here is over `reusable`; `full` is shown, not divided by.
+
+        `Unreachable` is the gap between them -- the trailing block of each
+        request, which prefill must always compute. It is reported so the
+        older `full`-denominated numbers in past logs remain translatable, and
+        because a large value is itself a signal: it means short prompts
+        dominate, and a run whose length mix differs this much is not
+        comparable to another on hit rate alone.
+        """
         logger.info(
             f"[Cache Stats {label}] Reqs: {reqs}, "
-            f"Cached/Total: {cached}/{full}, "
-            f"Hit: {cls._rate(cached, full):.2%}, "
-            f"Compressed-hit: {cls._rate(compressed, full):.2%}, "
-            f"Lost-to-checkpoint: {cls._rate(wanted - cached, full):.2%}, "
-            f"Lost-unrecoverable: {cls._rate(compressed - wanted, full):.2%}"
+            f"Cached/Reusable: {cached}/{reusable}, "
+            f"Hit: {cls._rate(cached, reusable):.2%}, "
+            f"Compressed-hit: {cls._rate(compressed, reusable):.2%}, "
+            f"Lost-to-checkpoint: {cls._rate(wanted - cached, reusable):.2%}, "
+            f"Lost-unrecoverable: {cls._rate(compressed - wanted, reusable):.2%}, "
+            f"Unreachable: {cls._rate(full - reusable, full):.2%} of {full}"
         )
 
 
@@ -1950,11 +2115,20 @@ class Scheduler:
             # `block_size * dcp_world_size` tokens — so scaling by block_size
             # would under-report by the DCP factor.
             hbs = self.block_manager.hash_block_size
+            # The reuse ceiling, mirroring `can_allocate`'s match loop, which
+            # runs over `range(n_hash_blocks - 1)`: prefill must forward at
+            # least one block to produce sampler logits, so the trailing block
+            # is never a reuse candidate and no cache can be charged for it.
+            # Floored at 0 for a sequence shorter than one hash block, whose
+            # ceiling is genuinely zero — nothing about it is reusable.
+            n_hash_blocks = (seq.num_tokens + hbs - 1) // hbs
+            num_reusable_tokens = min(max(n_hash_blocks - 1, 0) * hbs, seq.num_tokens)
             self.cache_stats.update(
                 seq.num_cached_tokens,
                 seq.num_tokens,
                 seq.num_compressed_hit_blocks * hbs,
                 seq.num_wanted_hit_blocks * hbs,
+                num_reusable_tokens,
             )
         num_batched_tokens += chunk
         seq.status = SequenceStatus.RUNNING
