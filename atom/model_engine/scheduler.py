@@ -1583,6 +1583,9 @@ class Scheduler:
                 )
             seq.offload_promoted_tokens = promoted
             seq.num_cached_tokens = loaded
+            # Report the extended CPU-offload hit without reducing any
+            # prefix-cache hit inherited from an upstream prefill node.
+            seq.prefix_cache_hit_tokens = max(seq.prefix_cache_hit_tokens, loaded)
         seq.offload_load_start_tokens = None
         seq.offload_loaded = True
 
