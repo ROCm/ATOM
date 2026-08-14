@@ -450,6 +450,7 @@ class InputOutputProcessor:
         kv_transfer_params=None,
         multimodal_data=None,
         request_id: str | None = None,
+        data_parallel_rank: int | None = None,
     ):
         """responsible for:
         1) Tokenize
@@ -471,6 +472,7 @@ class InputOutputProcessor:
             kv_transfer_params=kv_transfer_params,
             multimodal_data=multimodal_data,
             parent_request_id=request_id,
+            data_parallel_rank=data_parallel_rank,
         )
         return seqs[0]
 
@@ -483,6 +485,7 @@ class InputOutputProcessor:
         kv_transfer_params=None,
         multimodal_data=None,
         parent_request_id: str | None = None,
+        data_parallel_rank: int | None = None,
     ) -> list[Sequence]:
         """Tokenize once and materialize ``sampling_params.n`` Sequences.
 
@@ -554,6 +557,7 @@ class InputOutputProcessor:
                 parent_request_id=parent_request_id,
                 sibling_index=i,
                 request_id=parent_request_id if n == 1 else None,
+                data_parallel_rank=data_parallel_rank,
             )
             seq.arrive_time = time.time()
             self.requests[seq.id] = seq

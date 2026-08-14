@@ -1285,6 +1285,7 @@ def sparse_attn_indexer_sglang_plugin_mode(
     weights_scale: float,
     is_neox_style: bool,
     use_qk_rope_cache_fusion: bool,
+    stable_topk: bool,
 ) -> torch.Tensor:
     from atom.plugin.sglang.models.base_model_wrapper import get_current_forward_batch
 
@@ -1396,6 +1397,7 @@ def sparse_attn_indexer_sglang_plugin_mode(
             bs,
             logits.stride(0),
             logits.stride(1),
+            stable=stable_topk,
         )
         return weights
 
@@ -1444,6 +1446,7 @@ def sparse_attn_indexer_sglang_plugin_mode(
         numRows=logits.shape[0],
         stride0=logits.stride(0),
         stride1=logits.stride(1),
+        stable=stable_topk,
     )
     topk_indices.copy_(
         torch.where(topk_indices >= 0, topk_indices - cu_starts[:, None], topk_indices)
@@ -1474,6 +1477,7 @@ def sparse_attn_indexer_sglang_fake(
     weights_scale: float,
     is_neox_style: bool,
     use_qk_rope_cache_fusion: bool,
+    stable_topk: bool,
 ) -> torch.Tensor:
     del (
         hidden_states,
@@ -1497,6 +1501,7 @@ def sparse_attn_indexer_sglang_fake(
         weights_scale,
         is_neox_style,
         use_qk_rope_cache_fusion,
+        stable_topk,
     )
     return torch.empty(weights.shape, device=weights.device, dtype=torch.float32)
 

@@ -167,8 +167,29 @@ def _v4_attention_fake(
 
 
 # PIECEWISE cudagraph: persistent per-(layer, num_tokens) buffers holding each
-# attention op's output.
+# attention op's output (eager core -> next graph piece boundary).
 _v4_attn_piecewise_out: dict = {}
+
+# PIECEWISE cudagraph: persistent per-(layer, num_tokens, arg) buffers holding a
+# snapshot of the eager core's transient projection inputs (q/kv_pre/qr/qr_scale/
+# idx_*). Those are outputs of the preceding graph piece and live in the SHARED
+# graph pool, which overlays them across num_tokens buckets; snapshotting them
+# out of the pool on core entry pins the graph->eager boundary. Keyed on
+# (layer_name, num_tokens, arg_index).
+_v4_attn_piecewise_in: dict = {}
+
+
+def _pin_core_input(layer_name: str, arg_idx: int, num_tokens: int, t):
+    """Snapshot a pool-backed core input into a persistent buffer (or None)."""
+    if t is None:
+        return None
+    key = (layer_name, num_tokens, arg_idx)
+    buf = _v4_attn_piecewise_in.get(key)
+    if buf is None or buf.shape != t.shape or buf.dtype != t.dtype:
+        buf = torch.empty_like(t)
+        _v4_attn_piecewise_in[key] = buf
+    buf.copy_(t)
+    return buf
 
 
 @mark_spliting_op(is_custom=True, gen_fake=_v4_attention_fake, mutates_args=[])
@@ -222,15 +243,31 @@ def v4_core_attention(
 ) -> torch.Tensor:
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
-    out = self._attn_core(
-        x, q, kv_pre, qr, qr_scale, positions, idx_q_quant, idx_weights, idx_q_scale
-    )
 
     from atom.config import CUDAGraphMode
     from atom.utils.forward_context import get_forward_context
 
     fc = get_forward_context()
-    if getattr(fc, "cudagraph_runtime_mode", None) == CUDAGraphMode.PIECEWISE:
+    _piecewise = getattr(fc, "cudagraph_runtime_mode", None) == CUDAGraphMode.PIECEWISE
+    if _piecewise:
+        # Snapshot the transient projection inputs out of the shared graph pool
+        # before the core reads them (the pool overlays them across num_tokens
+        # buckets). `x` is a dense-piece residual (kept live into attn_post's
+        # piece, so not overlaid) and is left in place.
+        _n = int(q.shape[0])
+        q = _pin_core_input(layer_name, 0, _n, q)
+        kv_pre = _pin_core_input(layer_name, 1, _n, kv_pre)
+        qr = _pin_core_input(layer_name, 2, _n, qr)
+        qr_scale = _pin_core_input(layer_name, 3, _n, qr_scale)
+        idx_q_quant = _pin_core_input(layer_name, 4, _n, idx_q_quant)
+        idx_weights = _pin_core_input(layer_name, 5, _n, idx_weights)
+        idx_q_scale = _pin_core_input(layer_name, 6, _n, idx_q_scale)
+
+    out = self._attn_core(
+        x, q, kv_pre, qr, qr_scale, positions, idx_q_quant, idx_weights, idx_q_scale
+    )
+
+    if _piecewise:
         key = (layer_name, int(out.shape[0]))
         buf = _v4_attn_piecewise_out.get(key)
         if buf is None:
@@ -1712,15 +1749,15 @@ class Indexer(nn.Module):
         (deepseek_v2.py:1047-1084).
 
         Top-k uses aiter `top_k_per_row_decode` (radix kernel, parametric `k`):
-        the kernel honors `n_committed_per_seq` per row, so logits cells past
-        each row's valid range are never selected — no `fill_(-inf)` required.
+        ATOM passes the exact ratio-4 per-token row ends as `seqLens` with
+        `next_n=1`, so logits cells past each row's valid range are never
+        selected — no `fill_(-inf)` required.
         Rows whose valid range is shorter than `index_topk` get -1 sentinels
         for tail cols. Output is RAW seq-local (each row's cols are 0-indexed
         into that batch's compressed K), exactly the layout
         `csa_translate_pack` consumes.
         """
         total_tokens = q_fp8.size(0)
-        n_committed_per_seq_gpu = indexer_meta["n_committed_per_seq_gpu"]  # int32 [bs]
         attn_md = get_forward_context().attn_metadata
 
         # DSpark RAGGED (paper §5.2): the decode indexer kernel
@@ -1737,23 +1774,19 @@ class Indexer(nn.Module):
                 q_fp8,
                 weights,
                 block_tables,
-                n_committed_per_seq_gpu,
                 ragged_lens,
                 int(attn_md.dspark_full_q),
                 topk,
             )
 
-        # NOTE: derive the query batch size from the ACTUAL number of query
-        # tokens, NOT from block_tables.size(0). Under TBO the per-ubatch
-        # block_tables / n_committed are padded to a DP-unified bucket and will
-        # get errors if we try to use the padded rows.
-        next_n = max(1, int(attn_md.max_seqlen_q))
-        bs = total_tokens // next_n
+        # Treat each query row as an independent batch item (`next_n=1`).
+        # The expanded block table preserves its source sequence mapping while
+        # the uncapped row end supplies the exact ratio-4 causal boundary.
         # deepgemm requires Q in [bs, next_n, heads, head_dim], KV in
         # [num_blocks, block_size, n_head=1, hidden_dim+scale_dim] (4D).
         q_4d = q_fp8.view(
-            bs, next_n, self.n_heads, self.head_dim
-        )  # [bs, next_n, n_heads, head_dim] fp8
+            total_tokens, 1, self.n_heads, self.head_dim
+        )  # [total_tokens, 1, n_heads, head_dim] fp8
         kv_cache_4d = self.kv_cache.unsqueeze(
             -2
         )  # [num_blocks, csa_rows_per_block, 1, head_dim+scale_dim] uint8
@@ -1761,7 +1794,7 @@ class Indexer(nn.Module):
         # Under CUDAGraph capture, torch allocates from the graph's private
         # memory pool and the address is stable across replays at this
         # captured `total_tokens`. No `fill_(-inf)` needed —
-        # `top_k_per_row_decode` bounds each row by `n_committed_per_seq[batch]`
+        # `top_k_per_row_decode` receives the exact per-token CSA row end below,
         # so unwritten cols are never picked.
         logits = torch.empty(
             total_tokens,
@@ -1774,8 +1807,8 @@ class Indexer(nn.Module):
             kv_cache_4d,
             weights,
             logits,
-            n_committed_per_seq_gpu,  # int32, sized [bs] (staged in builder)
-            block_tables,
+            attn_md.n_committed_per_token[:total_tokens],
+            attn_md.block_tables_per_token[:total_tokens],
             self._max_model_len_idx,
             KVBlockSize=self.kv_cache.size(1),  # csa_rows_per_block = 64
             Preshuffle=True,
@@ -1788,8 +1821,8 @@ class Indexer(nn.Module):
         )
         top_k_per_row_decode(
             logits,
-            next_n,
-            n_committed_per_seq_gpu,
+            1,
+            attn_md.n_committed_per_token[:total_tokens],
             topk_local,
             total_tokens,
             logits.stride(0),
@@ -1931,8 +1964,8 @@ class Indexer(nn.Module):
         topk: int,
     ) -> torch.Tensor:
         """Decode/varctx FP4: `flydsl_pa_mqa_logits_fp4` reads the paged FP4
-        cache directly over each seq's `[0, n_committed)` window. Output is
-        seq-local `[bs*next_n, max_model_len_idx]`, consumed by
+        cache directly over each query row's exact CSA-visible window. Output is
+        seq-local `[total_tokens, max_model_len_idx]`, consumed by
         `top_k_per_row_decode` exactly like the FP8 deepgemm path.
 
         CUDAGraph-safe: the persistent-grid schedule (`cta_info`/`total_ctas`)
@@ -1950,7 +1983,6 @@ class Indexer(nn.Module):
 
         fc = get_forward_context()
         total_tokens = q_fp4.size(0)
-        n_committed_per_seq_gpu = indexer_meta["n_committed_per_seq_gpu"]  # int32 [bs]
         # DSpark RAGGED decode (per-request variable query lengths): route to the
         # varqlen FP4 path (aiter `flydsl_pa_mqa_logits_fp4_varqlen` via the
         # ragged-prefill kernel). The rectangular path below does
@@ -1966,12 +1998,10 @@ class Indexer(nn.Module):
             return self._score_topk_decode_ragged_fp4(
                 q_fp4, q_scale, block_tables, weights, indexer_meta, topk
             )
-        next_n = max(1, int(attn_md.max_seqlen_q))
-        bs = total_tokens // next_n
         k_tiles = self.head_dim // 128
         qs_pad = q_scale.shape[-1]
-        q_4d = q_fp4.view(bs, next_n, self.n_heads, self.head_dim // 2)
-        q_scale_6d = q_scale.view(bs, next_n, k_tiles, 4, 16, qs_pad)
+        q_4d = q_fp4.view(total_tokens, 1, self.n_heads, self.head_dim // 2)
+        q_scale_6d = q_scale.view(total_tokens, 1, k_tiles, 4, 16, qs_pad)
         max_seq_len = self._max_model_len_idx
         kv_block_size = self.kv_cache.size(3)  # csa_rows_per_block = 64
         # The packed-dword scale readers in pa_mqa_logits_fp4* require N_PHYS==1
@@ -1994,8 +2024,8 @@ class Indexer(nn.Module):
         total_ctas = indexer_meta["fp4_total_ctas"]
         # Write-once GPU scratch, NOT -inf-filled (mirrors the FP8 decode path).
         # The kernel writes every column in `[0, context_len)` per row and
-        # `top_k_per_row_decode` bounds each row by `n_committed_per_seq` (==
-        # context_len) — so cells past it are never read. A `torch.full(-inf)`
+        # `top_k_per_row_decode` scans only the exact ratio-4 per-token prefix
+        # below, so cells past it are never read. A `torch.full(-inf)`
         # pre-fill would be wasted ~290μs FillFunc work at width
         # `max_model_len_idx`. CG-safe: torch.empty lands in the graph's private
         # pool at a stable address across replays at this captured shape.
@@ -2007,12 +2037,12 @@ class Indexer(nn.Module):
             q_scale_6d,
             self.kv_cache,
             self.kv_scale,
-            block_tables,
+            attn_md.block_tables_per_token[:total_tokens],
             weights,
-            n_committed_per_seq_gpu,
+            attn_md.n_committed_per_token[:total_tokens],
             max_seq_len,
             weight_scale=self._weights_scale,
-            next_n=next_n,
+            next_n=1,
             block_k=FP4_MQA_BLOCK_K,
             kv_block_size=kv_block_size,
             # Grid is driven by the pre-built `cta_info`/`total_ctas`; the kernel
@@ -2029,8 +2059,8 @@ class Indexer(nn.Module):
         )
         top_k_per_row_decode(
             logits,
-            next_n,
-            n_committed_per_seq_gpu,
+            1,
+            attn_md.n_committed_per_token[:total_tokens],
             topk_local,
             total_tokens,
             logits.stride(0),
@@ -2157,7 +2187,6 @@ class Indexer(nn.Module):
         q_fp8: torch.Tensor,  # [total_tokens, n_heads, head_dim] fp8
         weights: torch.Tensor,  # [total_tokens, n_heads] fp32
         block_tables: torch.Tensor,  # [bs, max_blocks_per_seq] int32
-        n_committed_per_seq_gpu: torch.Tensor,  # int32 [bs]
         ragged_lens: torch.Tensor,  # int32 [bs] — per-seq len_i (= ell_i+1)
         full_q: int,  # full draft span width (mtp_k + 1)
         topk: int,
@@ -2172,11 +2201,10 @@ class Indexer(nn.Module):
 
         The decode indexer kernel is rectangular-only (see `_score_topk_decode`).
         We scatter the ragged Q/weights into a [bs, full_q] rectangle at each
-        token's original in-span slot j, run the kernel at next_n=full_q, then
-        gather each seq's first len_i rows back. Numerically identical to a
-        regular rectangular decode (the causal bound lines up because ragged
-        positions are span-head-anchored and slot j == pid_next_n). Padding rows
-        carry zero Q; their logits are computed but never gathered.
+        token's original in-span slot j, flatten its rows into independent
+        `next_n=1` batch items, then gather real rows back. The expanded per-row
+        block table preserves sequence ownership and the right-aligned row-end
+        metadata supplies each row's exact CSA-visible range.
         """
         device = q_fp8.device
         total_tokens = q_fp8.size(0)
@@ -2212,7 +2240,7 @@ class Indexer(nn.Module):
         w_rect = torch.zeros(R + 1, weights.size(1), dtype=weights.dtype, device=device)
         q_rect[dst] = q_fp8
         w_rect[dst] = weights
-        q_4d = q_rect[:R].view(bs, full_q, H, D)
+        q_4d = q_rect[:R].view(R, 1, H, D)
 
         kv_cache_4d = self.kv_cache.unsqueeze(-2)
         # kernel operates on the real [R] rect (bs*full_q rows); the dump row R is
@@ -2225,8 +2253,8 @@ class Indexer(nn.Module):
             kv_cache_4d,
             w_rect[:R],
             logits,
-            n_committed_per_seq_gpu,
-            block_tables,
+            attn_md.n_committed_per_token[:R],
+            attn_md.block_tables_per_token[:R],
             self._max_model_len_idx,
             KVBlockSize=self.kv_cache.size(1),
             Preshuffle=True,
@@ -2239,8 +2267,8 @@ class Indexer(nn.Module):
         )
         top_k_per_row_decode(
             logits,
-            full_q,
-            n_committed_per_seq_gpu,
+            1,
+            attn_md.n_committed_per_token[:R],
             topk_rect[:R],
             R,
             logits.stride(0),
@@ -2575,9 +2603,13 @@ class DeepseekV4Attention(nn.Module):
         positions: torch.Tensor,
     ) -> torch.Tensor:
         # Split-op granularity depends on the cudagraph mode
-        #  - PIECEWISE cudagraph -> NARROW split attention
+        #  - PIECEWISE cudagraph -> NARROW split attention: only the paged /
+        #    dynamic-shape attention core stays eager; the Q/KV/indexer
+        #    projections are compiled into the preceding graph piece. Their
+        #    outputs cross the graph->eager boundary and are pinned out of the
+        #    shared graph pool on core entry (see v4_core_attention).
         #  - FULL / NONE -> WIDE split attention: the whole attention is one eager
-        #  for torch compile.
+        #    op for torch compile.
         cg_mode = get_current_atom_config().compilation_config.cudagraph_mode
         if cg_mode is not None and cg_mode.requires_piecewise_compilation():
             (

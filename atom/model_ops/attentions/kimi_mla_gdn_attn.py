@@ -44,27 +44,42 @@ class _KimiMLAGDNCommon(GDNStateMixin):
             for index, layer in enumerate(model_runner.kda_attention_layers)
         }
 
+    def _num_cache_rows(self) -> int:
+        """Rows in the MLA pool: the target's full-attention layers plus any
+        draft layers that share this pool.
+
+        Derived from `_get_total_num_layers()` rather than from the
+        `num_draft_layers` argument ModelRunner passes to
+        `allocate_kv_cache_tensors`, so the row count the pool is SIZED for
+        (`sub_pool_specs`) and the row count it is ALLOCATED with can never
+        disagree: a draft that owns a sibling pool is excluded from both at
+        once. Mirrors `AiterMLAMetadataBuilder`, which reads the same
+        method in both places.
+        """
+        runner = self.model_runner
+        hf = runner.config.hf_config
+        num_draft = runner._get_total_num_layers() - hf.num_hidden_layers
+        return runner.num_full_attn + num_draft
+
     def sub_pool_specs(self) -> list[SubPoolSpec]:
         """MLA paged KV for the full-attention layers, plus the KDA/GDN
         per-request state pool (`GDNStateMixin.state_spec`)."""
         runner = self.model_runner
         config = runner.config
         hf = config.hf_config
-        num_draft = runner._get_total_num_layers() - hf.num_hidden_layers
-        num_layers = runner.num_full_attn + num_draft
         entry = hf.kv_lora_rank + hf.qk_rope_head_dim
         kv_dtype_size = dtypes.d_dtypes[config.kv_cache_dtype].itemsize
-        block_bytes = num_layers * runner.block_size * entry * kv_dtype_size
+        block_bytes = self._num_cache_rows() * runner.block_size * entry * kv_dtype_size
         return [page_pool(block_bytes), self.state_spec()]
 
     def allocate_kv_cache_tensors(
         self, num_kv_heads: int, num_draft_layers: int
     ) -> dict:
-        del num_kv_heads
+        del num_kv_heads, num_draft_layers
         runner = self.model_runner
         config = runner.config
         hf = config.hf_config
-        num_layers = runner.num_full_attn + num_draft_layers
+        num_layers = self._num_cache_rows()
         entry = hf.kv_lora_rank + hf.qk_rope_head_dim
         return {
             "kv_cache": torch.zeros(

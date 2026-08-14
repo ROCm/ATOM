@@ -47,6 +47,9 @@ from typing import TYPE_CHECKING
 import torch
 from torch import nn
 
+from atom.models.dspark_draft import DSparkDraftModel
+from atom.utils import envs
+
 if TYPE_CHECKING:
     from atom.config import Config
 
@@ -74,6 +77,9 @@ class DSparkMarkovHead(nn.Module):
         super().__init__()
         self.vocab_size = vocab_size
         self.rank = rank
+        # Read once here rather than per sampled position: envs re-reads the
+        # environment on every attribute access.
+        self.fused_sample = envs.ATOM_DSPARK_FUSED_MARKOV_SAMPLE
         # W1: per-token embedding lookup table [V, r].
         self.markov_w1 = nn.Embedding(vocab_size, rank)
         # W2: logit projection stored as [V, r] (matches checkpoint); applied as
@@ -97,6 +103,38 @@ class DSparkMarkovHead(nn.Module):
             markov_embed.float(), self.markov_w2.weight.float().t()
         )
         return logits_bias, markov_embed
+
+    def sample_next(self, token_ids: torch.Tensor, base_logits: torch.Tensor):
+        """One greedy block position: the argmax of the biased logits, and W1[x].
+
+        Same contract as the Kimi-K3 head's ``sample_next``; the fused path
+        never materializes the ``[*, V]`` bias, keeping ``W2`` bf16 and reducing
+        straight to ids with an fp32 accumulator (see the op's module docstring
+        for the numerics). ``markov_embed`` is still returned because the
+        confidence head consumes it.
+
+        Args:
+            token_ids:   [B]     ids of the previously sampled token x_{k-1}.
+            base_logits: [B, V]  this position's base logits.
+        Returns:
+            next_ids:     [B]     argmax over the biased logits.
+            markov_embed: [B, r]  W1[x_{k-1}].
+        """
+        if self.fused_sample:
+            # Imported here, not at module scope: this file keeps its Triton /
+            # AITER dependencies behind the guarded import block below so the
+            # head stays constructible on a runner with no AITER build.
+            from atom.model_ops.dspark_markov_sample import dspark_markov_argmax
+
+            markov_embed = self.markov_w1(token_ids)
+            next_ids = dspark_markov_argmax(
+                base_logits, markov_embed, self.markov_w2.weight
+            )
+            return next_ids, markov_embed
+        bias, markov_embed = self(token_ids)
+        # bf16 + fp32 promotes the slice to fp32 before the add, so an explicit
+        # .float() would only materialize it twice for the same sum.
+        return (base_logits + bias).argmax(dim=-1), markov_embed
 
 
 class DSparkConfidenceHead(nn.Module):
@@ -416,6 +454,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
         markov_rank: int,
         target_layer_ids: tuple,
         block_size: int,
+        write_per_batch: int,
         prefix: str = "",
         alt_stream=None,
         indexer_stream=None,
@@ -431,6 +470,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
         self.num_stages = num_stages
         self.block_size = block_size
         self.window_size = args.window_size
+        self.write_per_batch = write_per_batch
 
         if stage_id == 0:
             self.main_proj = ReplicatedLinear(
@@ -459,7 +499,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
 
         # The draft window KV lives in an SWA ring bound by
         # DeepseekV4AttentionMetadataBuilder.build_kv_cache_tensor at
-        # allocate_kv_cache; see precompute_context_kv / dspark_attention.
+        # allocate_kv_cache; see write_context_kv / dspark_attention.
         #
         # What this layer's window has to be made of, which the pool reserves
         # rather than infers. DSpark's block attention runs bf16 — there is no
@@ -505,20 +545,19 @@ class DSparkLayer(Block):  # type: ignore[misc]
         _apply_dspark_kv_qat_(kv, rope_dim)
         return kv.view(-1, a.head_dim)
 
-    def precompute_context_kv(
+    def write_context_kv(
         self,
         main_x: torch.Tensor,  # [T, dim]  target hidden(s)
         positions: torch.Tensor,  # [T]
-        cu_seqlens_q: torch.Tensor,  # [B+1] int32 per-req spans into main_x
-        write_per_batch: int,
     ) -> None:
         """Write target-KV rows into each request's rolling window.
 
-        ``main_x`` is the flat [T, dim] ragged batch of every scheduled token and
-        ``cu_seqlens_q`` ([B+1]) delimits the per-request spans; the last
-        ``min(seq_len, write_per_batch)`` rows of each span are written. Callers
-        pass ``write_per_batch = window_size``, which covers a prefill tail and a
-        decode verify span alike.
+        ``main_x`` is the flat [T, dim] ragged batch of every scheduled token;
+        ``cu_seqlens_q`` ([B+1]) delimits the per-request spans and is read off
+        the live forward context, per the
+        :meth:`DSparkDraftModel.write_context_kv` contract. The last
+        ``min(seq_len, self.write_per_batch)`` rows of each span are written,
+        which covers a prefill tail and a decode verify span alike.
 
         Every scheduled row is written on every step: the window must hold a row
         for every position it spans, and the read side gathers slots by absolute
@@ -540,13 +579,9 @@ class DSparkLayer(Block):  # type: ignore[misc]
         from atom.utils.forward_context import get_forward_context
 
         fc = get_forward_context()
-        # warmup_model runs BEFORE allocate_kv_cache, so `self.attn.swa_plane`
-        # / `swa_window` are unbound. Same short-circuit as the V4 target
-        # (deepseek_v4.py is_dummy_run guard): skip the SWA write on dummy runs
-        # — warmup discards draft output.
-        if fc.context.is_dummy_run:
-            return
         attn_md = fc.attn_metadata
+        B = fc.context.batch_size
+        cu_seqlens_q = attn_md.cu_seqlens_q[: B + 1]
         a = self.attn
         main_kv = self._compute_main_kv(main_x, positions)  # [T, head_dim]
         # The window was reserved at the dtype this layer declared in
@@ -562,7 +597,6 @@ class DSparkLayer(Block):  # type: ignore[misc]
                 "to reserve. Change `window_kv_dtype` to match the projections, "
                 "not cast here."
             )
-        B = cu_seqlens_q.shape[0] - 1
         swa_write(
             main_kv,  # [T, head_dim]
             positions,  # [T] int64
@@ -570,7 +604,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
             attn_md.state_slot_out[:B],  # [B] ring slot per request
             a.swa_plane,  # [plane_rows, head_dim]
             a.swa_window,
-            write_per_batch,
+            self.write_per_batch,
         )
 
     def dspark_attention(
@@ -717,7 +751,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
         return hc_state
 
 
-class DeepseekV4DSpark(nn.Module):
+class DeepseekV4DSpark(DSparkDraftModel):
     """Top-level DSpark draft wrapper (mirrors DeepseekV4MTP's contract).
 
     Owns the DSpark backbone layers (loaded from the V4 checkpoint's ``mtp.*``
@@ -766,6 +800,12 @@ class DeepseekV4DSpark(nn.Module):
         # Rolling target-KV window width. Exposed on the wrapper (top level) so the
         # proposer never reaches through `self.model.model.mtp[0]` to read it.
         self.window_size = int(self.args.window_size)
+        num_spec = getattr(
+            getattr(config, "speculative_config", None),
+            "num_speculative_tokens",
+            None,
+        )
+        self.write_per_batch = self.window_size + int(num_spec or self.block_size)
         self.markov_rank = int(self.hf_config.dspark_markov_rank)
         self.noise_token_id = int(self.hf_config.dspark_noise_token_id)
         self.target_layer_ids = tuple(
@@ -793,6 +833,7 @@ class DeepseekV4DSpark(nn.Module):
             markov_rank=self.markov_rank,
             target_layer_ids=self.target_layer_ids,
             block_size=self.block_size,
+            write_per_batch=self.write_per_batch,
             noise_token_id=self.noise_token_id,
         )
 
@@ -834,22 +875,20 @@ class DeepseekV4DSpark(nn.Module):
 
     # ---- drafting entry points (called by the proposer) --------------------
 
-    def precompute_context_kv(
-        self,
-        main_hidden,
-        positions,
-        cu_seqlens_q,
-        write_per_batch: int,
-    ) -> None:
-        """Populate every stage's rolling target-KV window from target hidden.
+    def project_context(self, aux_concat: torch.Tensor) -> torch.Tensor:
+        """``main_norm(main_proj(concat(aux)))`` -- the shared context.
 
-        Pass the flat ragged batch of all scheduled tokens with the real
-        ``cu_seqlens_q`` and ``write_per_batch = window_size``. See
-        :meth:`DSparkLayer.precompute_context_kv`.
+        Stage 0 owns main_proj/main_norm; the projection runs once and every
+        stage then writes its own rolling-KV rows from it (each stage has its
+        own kv cache and attention linears).
         """
-        self.model.precompute_context_kv(
-            main_hidden, positions, cu_seqlens_q, write_per_batch
-        )
+        stage0 = self.model.mtp[0]
+        return stage0.main_norm(_linear_out(stage0.main_proj(aux_concat)))
+
+    @property
+    def context_layers(self):
+        """Every backbone stage keeps its own window; `mtp` is already in order."""
+        return self.model.mtp
 
     def forward_spec(
         self,
@@ -860,7 +899,7 @@ class DeepseekV4DSpark(nn.Module):
         """One DSpark draft block: parallel backbone + sequential Markov head.
 
         Takes no target hidden: the target context reaches the block through the
-        rolling KV window, which ``precompute_context_kv`` must have populated
+        rolling KV window, which ``write_context_kv`` must have populated
         for this step beforehand.
 
         ``num_draft`` selects the draft width; when the verify horizon
@@ -886,6 +925,7 @@ class _DSparkInner(nn.Module):
         markov_rank: int,
         target_layer_ids: tuple,
         block_size: int,
+        write_per_batch: int,
         noise_token_id: int,
     ):
         super().__init__()
@@ -907,6 +947,7 @@ class _DSparkInner(nn.Module):
                     markov_rank=markov_rank,
                     target_layer_ids=target_layer_ids,
                     block_size=block_size,
+                    write_per_batch=write_per_batch,
                     prefix=f"mtp.{i}",
                 )
                 for i in range(num_stages)
@@ -916,23 +957,6 @@ class _DSparkInner(nn.Module):
         self.embed = None  # set by share_with_target
         self.head = None
 
-    def precompute_context_kv(
-        self,
-        main_hidden,
-        positions,
-        cu_seqlens_q,
-        write_per_batch: int,
-    ) -> None:
-        # Stage 0 owns main_proj/main_norm; project once, reuse the rolling-KV
-        # write per stage (each stage has its own kv cache + attn linears).
-        stage0 = self.mtp[0]
-        main_x = _linear_out(stage0.main_proj(main_hidden))
-        main_x = stage0.main_norm(main_x)
-        for layer in self.mtp:
-            layer.precompute_context_kv(
-                main_x, positions, cu_seqlens_q, write_per_batch
-            )
-
     def forward_spec(self, input_ids, positions, num_draft=None):
         B = input_ids.shape[0]
         # Draft width defaults to the training block size but may be widened up to
@@ -941,7 +965,7 @@ class _DSparkInner(nn.Module):
         # extrapolated). Cap at window_size so the [window ++ draft] KV stays sane.
         T = int(num_draft) if num_draft is not None else self.block_size
         # No main_proj here: the target context reaches the draft block through
-        # the rolling KV window (written by precompute_context_kv and gathered in
+        # the rolling KV window (written by write_context_kv and gathered in
         # each stage's attention), not through this forward's activations.
 
         # Build the draft block input ids: [anchor, noise, noise, ...].
@@ -1003,11 +1027,10 @@ class _DSparkInner(nn.Module):
         out_ids[:, 0] = anchor_ids
         markov_embeds = []
         for k in range(T):
-            bias, m_embed = last.markov_head(out_ids[:, k])  # [B, V], [B, r]
-            logits_k = base_logits[:, k].float() + bias
-            out_ids[:, k + 1] = logits_k.argmax(
-                dim=-1
-            )  # greedy (temp handled upstream)
+            # Greedy (temperature handled upstream).
+            out_ids[:, k + 1], m_embed = last.markov_head.sample_next(
+                out_ids[:, k], base_logits[:, k]
+            )
             markov_embeds.append(m_embed)
         confidence = last.confidence_head(
             hc_hidden, torch.stack(markov_embeds, dim=1)
