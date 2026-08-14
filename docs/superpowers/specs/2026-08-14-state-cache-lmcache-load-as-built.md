@@ -82,8 +82,10 @@ The spill direction is untouched and keeps the batch channel.
    load.
 4. **Publish.** `_publish_state_loads()` drains
    `BlockManager.take_state_loads()` into the connector, immediately before
-   `build_connector_meta()`. A connector that cannot carry them fails them on
-   the spot rather than leaving the requests parked.
+   `build_connector_meta()`. `enqueue_state_loads` returns whether they were
+   taken, and a refusal wakes those requests for recompute on the spot --
+   under `multi` the scheduler's `hasattr` guard cannot detect a composite
+   whose subs all decline, and a swallowed load is a permanent park.
 5. **Fetch.** `LMCacheOffloadConnector._start_state_loads` submits each to
    `StateOffloadTier.submit_load`, on the tier's own executor — separate from
    the KV connector's two, though shared with this tier's own spills; see
@@ -100,7 +102,39 @@ The spill direction is untouched and keeps the batch channel.
    `num_cached_tokens`, which is the same disown `allocate` performs, one step
    later.
 
-## 5. The three settlements, and why there are three
+## 5. The collision the load introduces, and the two guards
+
+A load is the **first writer of a state group that does not go through a
+forward**. Everything else does, and `CommonAttentionBuilder.build()` orders
+the spill copy ahead of the batch's other copies precisely because `pop()`
+routinely hands out the group it has just queued a spill for. The load has no
+such ordering: it is dispatched by `process_kvconnector_output` *before* the
+forward and runs on the tier's own thread.
+
+So under pressure — the only situation this tier exists for — `pop()` evicts
+the LRU checkpoint from group G, queues G's bytes for the staging ring under
+G's **old** hash, and hands G out as the load's target. The load fills G with
+the resuming request's state; the spill copy is issued afterwards and stores
+that state under the evicted checkpoint's hash. Present, valid-looking,
+someone else's, and undetectable on any later load.
+
+Two guards, because there are two windows:
+
+1. **`pop(spill=False)`** for a group about to be loaded into. The eviction
+   gives up the checkpoint rather than staging it — exactly the pre-tier
+   behaviour, counted as `state_offload_spills_forgone`. `_tier_can_serve` is
+   asked *before* the pop and again inside `_request_state_load`, one predicate
+   so the two cannot drift and lose a checkpoint for a load that is then
+   refused.
+2. **`StateGroupPool.has_pending_spill(group)`** for a copy left over from an
+   earlier pass (a batch that was never forwarded does not drain them). There
+   is nothing left to reorder at that point, so the load is declined and the
+   boundary disowned.
+
+The window closes once the copy is issued: from then on the spill reads the
+*staging entry*, not the group.
+
+## 6. The three settlements, and why there are three
 
 `StateOffloadIndex` distinguishes:
 
@@ -119,7 +153,7 @@ is still writing it on its own stream, so `deallocate` parks the group in
 lands. Handing it to the next admission would deliver another request's state
 after the fact, under a `has_initial_state` that is already true.
 
-## 6. Where the floor lives, and why it is 0
+## 7. Where the floor lives, and why it is 0
 
 `OFFLOAD_STATE_MIN_LOAD_TOKENS` is consulted inside `_resumable_from`, not at
 the load site. A floor has to **decline** a rung so the right-to-left scan
@@ -135,7 +169,7 @@ while the prefill it saves grows *with* the boundary. There is no length below
 which the transfer is the expensive half. The knob is for an unusually large
 entry, or an index with a bad false-positive rate.
 
-## 7. Sizing: two cushions that must add
+## 8. Sizing: two cushions that must add
 
 `main`'s `STATE_CKPT_EXTRA_ENTRIES` (#1874, V4 checkpoint headroom) and this
 branch's staging ring arrived through the same `SubPoolSpec.extra_entries`, and
@@ -152,7 +186,7 @@ one reader:
 | `extra_entries` (`STATE_CKPT_EXTRA_ENTRIES`) | yes | **yes** |
 | `staging_entries` (`OFFLOAD_STATE_STAGING_GROUPS`, gated by `OFFLOAD_STATE`) | yes | no |
 
-## 8. What did not change
+## 9. What did not change
 
 - The disown guard in `_attach_state_group`. LMCache's LRU can drop bytes under
   an advertised hash at any time.
@@ -161,7 +195,7 @@ one reader:
   refusal — all as the companion describes them.
 - Default-off. With `OFFLOAD_STATE` unset every site added here is unreached.
 
-## 9. Verification
+## 10. Verification
 
 - Full CPU suite: **1339 passed**, 1 pre-existing failure
   (`test_state_spill_copy_order`, an `aiter` import in this sandbox, fails

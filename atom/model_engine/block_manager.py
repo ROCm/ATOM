@@ -551,9 +551,14 @@ class BlockManager:
         """
         src = self.state.lookup(hit_hash) if hit_hash != -1 else -1
         if src < 0:
-            seq.per_req_cache_group = self.state.pop()
+            # Decided before the pop, not after: an eviction that makes room
+            # for a load must not spill, because the spill's copy out of that
+            # group is issued by a later forward while the load writes it from
+            # the tier's thread first. See `StateGroupPool.pop`.
+            wants_load = self._tier_can_serve(hit_hash)
+            seq.per_req_cache_group = self.state.pop(spill=not wants_load)
             seq.state_fork_src = -1
-            if self._request_state_load(seq, hit_hash):
+            if wants_load and self._request_state_load(seq, hit_hash):
                 return True
             # A fresh group holds the previous occupant's bytes. That is fine
             # for a cold start (nothing claims otherwise) and wrong for a hit,
@@ -581,6 +586,21 @@ class BlockManager:
         seq.state_fork_src = -1
         return True
 
+    def _tier_can_serve(self, hit_hash: int) -> bool:
+        """Whether the tier believes it holds `hit_hash`.
+
+        Asked twice per admission -- once before `pop`, to decide whether that
+        eviction may spill, and once inside `_request_state_load`. One
+        predicate rather than two so the two questions cannot drift: a pop that
+        forwent its spill for a load that is then refused would lose a
+        checkpoint for nothing.
+        """
+        return (
+            hit_hash != -1
+            and self.state_offload is not None
+            and hit_hash in self.state_offload.hashes
+        )
+
     def _request_state_load(self, seq: Sequence, hit_hash: int) -> bool:
         """Ask the tier to fetch `hit_hash` into the group `seq` just took.
 
@@ -603,7 +623,20 @@ class BlockManager:
         against a wake-up that never comes. The caller then disowns the
         boundary, which is the same answer as before this tier existed.
         """
-        if hit_hash == -1 or self.state_offload is None:
+        if not self._tier_can_serve(hit_hash):
+            return False
+        if self.state.has_pending_spill(seq.per_req_cache_group):
+            # A spill copy queued in an earlier pass still has to read this
+            # group, and the load would overwrite it first -- the same
+            # collision `pop(spill=False)` avoids at the eviction, one pass
+            # later, where there is nothing left to reorder. Decline; the
+            # caller disowns the boundary, which is the pre-tier answer.
+            logger.warning(
+                "state offload: group %d still owes a spill copy; declining "
+                "the load for seq %s and recomputing instead.",
+                seq.per_req_cache_group,
+                seq.id,
+            )
             return False
         if not self.state_offload.request_load(seq.id, hit_hash):
             return False
@@ -626,6 +659,22 @@ class BlockManager:
             self.state_offload.abandon_load(seq.id)
         seq.state_load_hash = -1
         seq.num_cached_tokens = 0
+
+    def abandon_state_load(self, req_id) -> None:
+        """Give up on a load without blaming the bytes for it.
+
+        For a load that was never attempted -- nothing could carry it. Calling
+        `settle_state_load(ok=False)` there would `forget` the hash on the
+        strength of a miss that never happened, erasing the index one request
+        at a time and inflating the counter operators read as its
+        false-positive rate.
+        """
+        if self.state_offload is None:
+            return
+        self.state_offload.abandon_load(req_id)
+        group = self._orphan_load_groups.pop(req_id, None)
+        if group is not None:
+            self.state.release(group)
 
     def settle_state_load(self, req_id, ok: bool) -> None:
         """Apply one worker load report. Keyed by request, like the KV load.

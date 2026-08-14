@@ -289,11 +289,20 @@ class StateGroupPool:
         """Whether `group` is on the free list *and* still worth something."""
         return group in self._free and self.group_hash[group] != -1
 
-    def pop(self) -> int:
+    def pop(self, *, spill: bool = True) -> int:
         """Hand out a group, evicting its checkpoint if it carried one.
 
         Vacant first, lowest index first; only when nothing is vacant does a
         checkpoint get spent, and then it is the least recently used one.
+
+        `spill=False` gives up the evicted checkpoint's bytes instead of
+        staging them, and exists for one caller: a group about to be filled by
+        an offload *load*. The spill copy is issued by the next forward while
+        the load runs on the tier's own thread ahead of it, so the two would
+        race over the same group and the spill would store the loaded state
+        under the evicted checkpoint's hash. Nothing downstream could tell.
+        Forgoing the spill costs one checkpoint -- exactly the pre-tier
+        behaviour, counted as `spills_forgone`.
 
         The state twin of `BlockManager._pop_free_block`: groups sit on the free
         list carrying whatever the last owner left in them, and re-allocation —
@@ -309,9 +318,12 @@ class StateGroupPool:
             group = self._checkpointed.popleft()
             self._free.discard(group)
             self.checkpoints_evicted += 1
-            # Before invalidate() clears group_hash[group]: the hash is the key
-            # the tier stores under.
-            self._spill(group)
+            if spill:
+                # Before invalidate() clears group_hash[group]: the hash is the
+                # key the tier stores under.
+                self._spill(group)
+            elif self.offload is not None and self.offload.enabled:
+                self.offload.spills_forgone += 1
         self.invalidate(group)
         return group
 
@@ -586,6 +598,18 @@ class StateGroupPool:
                     len(self._spill_copies),
                     self.offload.staging_depth,
                 )
+
+    def has_pending_spill(self, group: int) -> bool:
+        """Whether a queued spill copy still has to read `group`.
+
+        The window a load must not enter. It closes when the copy is issued on
+        the compute stream (`take_spill_copies` -> the next forward), after
+        which only the staging entry is read and the group is free to be
+        overwritten. Normally empty for a group `pop(spill=False)` just handed
+        out; a copy left undrained by a batch that was never forwarded is the
+        case this catches.
+        """
+        return any(g == group for g, _slot in self._spill_copies)
 
     def take_spill_copies(self) -> list[tuple[int, int]]:
         """`(group, staging_slot)` pairs the next forward must copy.

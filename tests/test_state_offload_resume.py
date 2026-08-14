@@ -309,6 +309,75 @@ def test_a_spilled_hash_becomes_a_load_and_keeps_its_boundary(monkeypatch):
     assert bm.take_state_loads() == [(resumer.id, h, resumer.per_req_cache_group)]
 
 
+def test_a_load_target_never_has_a_spill_still_to_read_it(monkeypatch):
+    """The Critical of the load half.
+
+    Under pressure -- the only situation this tier exists for -- `pop()` evicts
+    the LRU checkpoint from group G, queues G's bytes for the staging ring
+    under G's *old* hash, and hands G straight out. Aim a load at G and the two
+    writers race with nothing ordering them: the load runs on the tier's thread
+    and is dispatched (`process_kvconnector_output`) *before* the forward that
+    issues the spill copy. The spill then reads the resumer's freshly loaded
+    state and stores it under the evicted checkpoint's hash -- bytes that are
+    present, valid-looking, and someone else's. Nothing on any later load path
+    could detect that.
+
+    So the eviction that makes room for a load does not spill at all. The
+    checkpoint is lost exactly as it was before the tier existed, which is a
+    cost `state_offload_spills_forgone` names.
+    """
+    monkeypatch.setenv("OFFLOAD_STATE", "1")
+    loads_wired(monkeypatch)
+    bm = BlockManager(tier_config(pool_entries={"state": 4}, max_num_seqs=4))
+    spilled_publisher(bm, list(range(40)))
+    resident_publisher(bm, list(range(24)))
+    # Leave the pool with nothing vacant, so admitting the resumer must spend a
+    # checkpoint -- which is the only state in which `pop()` spills at all, and
+    # therefore the only one in which the collision exists.
+    for group in range(bm.state.num_groups):
+        if bm.state.is_free(group) and not bm.state.holds_checkpoint(group):
+            bm.state.claim(group)
+    assert bm.state.num_free() == 1, "the free list must hold only the checkpoint"
+
+    resumer = stateful_seq(list(range(40)))
+    bm.allocate(resumer, bm.can_allocate(resumer))
+
+    assert resumer.state_load_hash != -1, "the load never happened"
+    group = resumer.per_req_cache_group
+    assert not bm.state.has_pending_spill(group), "a spill will read the loaded bytes"
+    assert bm.state.take_spill_copies() == []
+    assert bm.state_offload.spills_forgone == 1
+
+
+def test_a_load_is_declined_rather_than_race_a_spill_left_over(monkeypatch):
+    """The same collision one pass later, which the eviction gate cannot see.
+
+    A group freed and handed out again while its spill copy from an earlier
+    pass is still undrained (an empty batch does not drain them) would be
+    written by the load before that copy is issued. There is nothing to
+    reorder at that point, so the boundary is disowned instead -- the same
+    answer as before the tier existed.
+    """
+    monkeypatch.setenv("OFFLOAD_STATE", "1")
+    loads_wired(monkeypatch)
+    bm = BlockManager(tier_config())
+    spilled_publisher(bm, list(range(40)))
+
+    resumer = stateful_seq(list(range(40)))
+    hit = bm.can_allocate(resumer)
+    # Stage a spill against every group the pool could hand out, and leave the
+    # copies undrained, which is what an unforwarded batch does.
+    for group in range(bm.state.num_groups):
+        bm.state.claim(group)
+        bm.state._index(4000 + group, group)
+        bm.state.release(group)
+        bm.state._spill(group)
+    bm.allocate(resumer, hit)
+
+    assert resumer.state_load_hash == -1, "a load raced an undrained spill copy"
+    assert resumer.num_cached_tokens == 0
+
+
 def test_a_load_target_is_not_forked_from(monkeypatch):
     """The loaded group *is* the incoming state. A fork source would send the
     forward to read some other group instead of the bytes just written."""
@@ -501,6 +570,34 @@ def test_a_failed_state_load_disowns_the_boundary(monkeypatch):
     assert h not in sched.block_manager.state_offload.hashes
     assert sched.block_manager.state_offload.loads_failed == 1
     assert boundary > 0
+
+
+def test_aborting_a_parked_request_gives_back_what_it_held(monkeypatch):
+    """A client disconnect while the state is in flight must not cost a group.
+
+    The waiting-queue abort path used to finish the sequence outright on the
+    grounds that it "holds no KV yet". A parked one holds both a full block
+    table and a state group, and the group is the expensive half:
+    `can_allocate` refuses a hybrid outright when the pool has none free, so
+    enough disconnects wedge every hybrid request.
+    """
+    sched, resumer, _, _batch = parked_resumer(monkeypatch)
+    bm = sched.block_manager
+    group = resumer.per_req_cache_group
+    free_blocks_before = bm.kv.num_free
+    assert group >= 0 and len(resumer.block_table) > 0
+
+    resumer.status = SequenceStatus.ABORTED
+    sched.schedule()
+
+    assert resumer.block_table == []
+    assert bm.kv.num_free > free_blocks_before, "its KV blocks leaked too"
+    assert bm.state_offload.pending_loads == {}
+    # The group is not free yet -- the transfer is still writing it -- but it
+    # is accounted for, and the report brings it back.
+    assert not bm.state.is_free(group)
+    bm.settle_state_load(resumer.id, ok=True)
+    assert bm.state.is_free(group)
 
 
 def test_a_failed_state_load_keeps_the_blocks_it_claimed(monkeypatch):

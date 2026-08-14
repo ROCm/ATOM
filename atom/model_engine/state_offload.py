@@ -78,6 +78,11 @@ class StateOffloadIndex:
         self.min_load_tokens = state_offload_min_load_tokens()
         self.spills_requested = 0
         self.spills_dropped = 0
+        # Evictions that deliberately did not spill because the group was
+        # being handed to a load. Apart from `spills_dropped`, which is the
+        # ring being too shallow: this one is not fixed by a deeper ring, and
+        # it is the price of the load rather than a shortfall.
+        self.spills_forgone = 0
         self.loads_attempted = 0
         self.loads_completed = 0
         self.loads_failed = 0
@@ -230,6 +235,7 @@ class StateOffloadIndex:
         return {
             "spills_requested": self.spills_requested,
             "spills_dropped": self.spills_dropped,
+            "spills_forgone": self.spills_forgone,
             "loads_attempted": self.loads_attempted,
             "loads_completed": self.loads_completed,
             "loads_failed": self.loads_failed,

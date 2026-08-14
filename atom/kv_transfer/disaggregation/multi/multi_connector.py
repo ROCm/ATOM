@@ -396,16 +396,22 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             c.adjust_prefill_chunk_after_alloc(seq, chunk) if c is not None else chunk
         )
 
-    def enqueue_state_loads(self, loads) -> None:
-        """First sub that can carry them owns them.
+    def enqueue_state_loads(self, loads) -> bool:
+        """First sub that can carry them owns them; False if none can.
 
         Only one sub may host the state tier at all -- the worker side raises a
         `ValueError` at model load when two do, because a spill would go to one
         tier and a load could ask the other. So "first" is also "only".
+
+        The False is not a formality. Every load handed here belongs to a
+        parked request that only a report can wake, so swallowing one is a
+        permanent park; the scheduler's `hasattr` guard cannot catch it either,
+        because this method always exists. Say so and let the caller fail them.
         """
         c = _first_with(self._connectors, "enqueue_state_loads")
-        if c is not None:
-            c.enqueue_state_loads(loads)
+        if c is None:
+            return False
+        return bool(c.enqueue_state_loads(loads))
 
     def should_park_partial_prefill_for_load(self, seq: Any) -> bool:
         c = _first_with(self._connectors, "should_park_partial_prefill_for_load")

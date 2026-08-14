@@ -1130,14 +1130,24 @@ class Scheduler:
         ):
             seq = self.waiting.popleft()
 
-            # Client disconnected before this seq ever ran: it holds no KV yet
-            # and needs no forward pass, so finish it outright and route via
-            # `_rejected` (emits a finished RequestOutput through the same
-            # output_queue). Must intercept here BEFORE the waiting->running
-            # promotion below, which would overwrite ABORTED with RUNNING and
-            # lose the abort intent.
+            # Client disconnected before this seq ever ran: it needs no forward
+            # pass, so finish it outright and route via `_rejected` (emits a
+            # finished RequestOutput through the same output_queue). Must
+            # intercept here BEFORE the waiting->running promotion below, which
+            # would overwrite ABORTED with RUNNING and lose the abort intent.
+            #
+            # It does not follow that it holds nothing. A sequence parked for a
+            # transfer -- an offload KV load, or a state-tier load -- was
+            # allocated before it parked and is sitting in this very queue with
+            # a full block table and, for a hybrid, a state group. Finishing it
+            # without `deallocate` leaks both, and the state group is the
+            # expensive one: `can_allocate` refuses a hybrid outright when the
+            # pool has none free, so enough disconnects wedge every hybrid
+            # request. `deallocate` is a no-op for a sequence that really did
+            # hold nothing.
             if seq.status == SequenceStatus.ABORTED:
                 self._uncount_inflight_load(seq)
+                self.block_manager.deallocate(seq)
                 seq.status = SequenceStatus.FINISHED
                 seq.leave_reason = "aborted"
                 self._rejected.append(seq)
@@ -1914,26 +1924,32 @@ class Scheduler:
         loads = self.block_manager.take_state_loads()
         if not loads:
             return
-        if not hasattr(self.kv_connector, "enqueue_state_loads"):
-            # Nothing will carry them, and the requests are already parked
-            # against a report that would never come. Fail them here instead:
-            # `failed_loading` means "wake and recompute over the blocks
-            # already allocated", which is the correct answer to a tier that
-            # cannot serve. `BlockManager` refuses to build the index at all
-            # unless the connector hosts the tier, so this is a misconfiguration
-            # that got past that check rather than a normal path.
-            logger.warning(
-                "state offload: %s cannot carry state loads; failing %d of "
-                "them. The tier's index should not have been installed against "
-                "this connector.",
-                type(self.kv_connector).__name__,
-                len(loads),
-            )
-            for req_id, _h, _group in loads:
-                self.block_manager.settle_state_load(req_id, ok=False)
-                self.failed_recving_kv_req_ids.append(req_id)
+        accepted = False
+        if hasattr(self.kv_connector, "enqueue_state_loads"):
+            accepted = bool(self.kv_connector.enqueue_state_loads(loads))
+        if accepted:
             return
-        self.kv_connector.enqueue_state_loads(loads)
+        # Nothing will carry them, and the requests are already parked against
+        # a report that would never come, so wake them for recompute here:
+        # `failed_loading` means "recompute over the blocks already allocated",
+        # which is the right answer to a tier that cannot serve.
+        #
+        # `abandon_state_load`, not `settle(ok=False)`: nothing was attempted,
+        # so the hash has done nothing to deserve being forgotten and this is
+        # not a miss to count against the index. `BlockManager` refuses to
+        # build the index at all unless the connector hosts the tier, so this
+        # is a misconfiguration that got past that check rather than a normal
+        # path -- but a silent one would be a permanent park.
+        logger.warning(
+            "state offload: %s did not carry %d state load(s); waking those "
+            "requests to recompute. The tier's index should not have been "
+            "installed against this connector.",
+            type(self.kv_connector).__name__,
+            len(loads),
+        )
+        for req_id, _h, _group in loads:
+            self.block_manager.abandon_state_load(req_id)
+            self.failed_recving_kv_req_ids.append(req_id)
 
     def _park_for_remote_load(
         self, seq: Sequence, skipped_waiting_requests: deque[Sequence]

@@ -89,6 +89,7 @@ class FakeSchedSub:
 
     def enqueue_state_loads(self, loads):
         self.state_loads.extend(loads)
+        return True
 
     def __getattribute__(self, name):
         # Hide offload-specific methods unless this mock opts in, so
@@ -332,18 +333,19 @@ def test_state_loads_go_to_the_sub_that_can_carry_them():
     off = FakeSchedSub(is_offload=True, offload_methods=True)
     loads = [(1, 111, 0), (2, 222, 3)]
 
-    _sched([plain, off]).enqueue_state_loads(loads)
+    assert _sched([plain, off]).enqueue_state_loads(loads) is True
 
     assert off.state_loads == loads
     assert not hasattr(plain, "enqueue_state_loads")
 
 
-def test_state_loads_with_no_sub_to_carry_them_are_dropped_here():
-    """Not an error at this level: the scheduler decides what to do about a
-    connector that cannot carry them, and it fails the loads rather than
-    leaving their requests parked."""
+def test_no_sub_to_carry_a_state_load_is_reported_not_swallowed():
+    """Every one of these belongs to a parked request that only a report can
+    wake, and the scheduler's `hasattr` guard cannot catch this case because
+    this method always exists on the composite. So it has to say no."""
     plain = FakeSchedSub()
-    _sched([plain, FakeSchedSub()]).enqueue_state_loads([(1, 111, 0)])
+    accepted = _sched([plain, FakeSchedSub()]).enqueue_state_loads([(1, 111, 0)])
+    assert accepted is False
 
 
 def test_the_composite_exposes_the_sub_connectors_state_tier():

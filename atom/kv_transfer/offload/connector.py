@@ -1072,8 +1072,13 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         seq.offload_loaded_tokens = max(hbm, lmc)
         return True
 
-    def enqueue_state_loads(self, loads) -> None:
+    def enqueue_state_loads(self, loads) -> bool:
         """Take this pass's state-tier loads, for the next `build_connector_meta`.
+
+        Returns whether they were taken. Always True here; the answer exists
+        for `MultiConnectorScheduler`, which can be asked when no sub-connector
+        carries state loads at all. The caller must fail a refusal rather than
+        drop it -- every one of these requests is parked on a report.
 
         `(req_id, state_hash, target_group)`, already decided by the engine:
         `BlockManager._attach_state_group` chose the group and
@@ -1084,6 +1089,7 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         this request already holds, so there is nothing left to move.
         """
         self._pending_state_loads.extend(loads)
+        return True
 
     def build_connector_meta(self) -> LMCacheOffloadMetadata:
         meta = LMCacheOffloadMetadata()

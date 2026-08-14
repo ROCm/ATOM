@@ -872,14 +872,21 @@ for the workload and the tier is pure overhead. Measure that with the tier
 
 Once the tier is on, that same line carries its counters, prefixed
 `state_offload_` (`StateOffloadIndex.stats` via `checkpoint_fates`):
-`spills_requested`, `spills_dropped`, `indexed`, and `loads_attempted` /
-`loads_completed` / `loads_failed`.
+`spills_requested`, `spills_dropped`, `spills_forgone`, `indexed`, and
+`loads_attempted` / `loads_completed` / `loads_failed`.
 
 Watch `spills_dropped`: a non-trivial ratio against `spills_requested` means
 `OFFLOAD_STATE_STAGING_GROUPS` is too shallow for the eviction rate — spills
 are being refused for want of a staging slot. The starvation warning only
 fires after 256 consecutive drops, so a ring dropping one spill in three is
 silent there and visible only here.
+
+`spills_forgone` is a different thing and a deeper ring does not fix it: an
+eviction that made room for a **load** deliberately does not spill. The load
+writes that group from the tier's thread before the forward that would have
+copied it out, so a spill there would store the resuming request's state under
+the evicted checkpoint's hash. One checkpoint is given up per resume served,
+which is the price of the resume.
 
 Read the three `loads_*` together. Every attempt was made against a hash the
 index advertised, so `loads_failed` is this index's **false-positive rate**:
