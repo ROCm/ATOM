@@ -8,8 +8,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-import triton
-import triton.language as tl
+
+try:
+    import triton
+    import triton.language as tl
+except ModuleNotFoundError:
+    triton = None
+    tl = None
 
 _TILE_BYTES = 4096
 
@@ -84,29 +89,36 @@ def plan_segmented_copy(
     return spans
 
 
-@triton.jit
-def _copy_tiles_kernel(
-    src_ptrs,
-    dst_ptrs,
-    valid_bytes,
-    TILE_BYTES: tl.constexpr,
-):
-    tile = tl.program_id(0)
-    offsets = tl.arange(0, TILE_BYTES)
-    valid = tl.load(valid_bytes + tile)
-    mask = offsets < valid
-    src_addr = tl.load(src_ptrs + tile).to(tl.int64)
-    dst_addr = tl.load(dst_ptrs + tile).to(tl.int64)
-    src = (src_addr + offsets).to(tl.pointer_type(tl.uint8))
-    dst = (dst_addr + offsets).to(tl.pointer_type(tl.uint8))
-    value = tl.load(src, mask=mask)
-    tl.store(dst, value, mask=mask)
+if triton is not None:
+
+    @triton.jit
+    def _copy_tiles_kernel(
+        src_ptrs,
+        dst_ptrs,
+        valid_bytes,
+        TILE_BYTES: tl.constexpr,
+    ):
+        tile = tl.program_id(0)
+        offsets = tl.arange(0, TILE_BYTES)
+        valid = tl.load(valid_bytes + tile)
+        mask = offsets < valid
+        src_addr = tl.load(src_ptrs + tile).to(tl.int64)
+        dst_addr = tl.load(dst_ptrs + tile).to(tl.int64)
+        src = (src_addr + offsets).to(tl.pointer_type(tl.uint8))
+        dst = (dst_addr + offsets).to(tl.pointer_type(tl.uint8))
+        value = tl.load(src, mask=mask)
+        tl.store(dst, value, mask=mask)
+
+else:
+    _copy_tiles_kernel = None
 
 
 def launch_copy_spans(spans: list[CopySpan], device: torch.device) -> None:
     """Copy all spans with one descriptor-driven Triton launch."""
     if not spans:
         return
+    if _copy_tiles_kernel is None:
+        raise RuntimeError("paged state copy requires Triton")
     src_ptrs: list[int] = []
     dst_ptrs: list[int] = []
     valid_bytes: list[int] = []
