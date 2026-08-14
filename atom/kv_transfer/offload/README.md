@@ -863,6 +863,19 @@ overhead. Enable it only when that counter is materially non-zero.
 gates installation; `OFFLOAD_STATE` set against any other `--kv-transfer-config`
 warns at startup and the tier stays off (`block_manager.py`).
 
+**Not supported with pipeline parallelism.** With `pipeline_parallel_size > 1`
+the tier refuses to build and warns (`connector.py`, `_maybe_build_state_tier`);
+paged-KV offload is unaffected. Two independent reasons, neither of which
+raises. The `CacheEngineKey` is `(model, world_size, worker_id, hash)` with
+`worker_id = tp.rank_in_group` — no PP component — so two stages holding
+different layer slices write different bytes under one key and clobber each
+other. And `pp_engine_core.py` has every stage call `forward` on the
+head-pickled batch, so spills fire on all of them, while only the head runs
+`_poll_kv_transfer_progress`: the other stages' `state_staging_released`
+reports are never drained and the ring starves after `staging_depth`
+evictions. Lifting this needs a PP component in the key *and* a report path
+from the non-head stages.
+
 **The load direction is not wired.** Spill works end to end: the worker reports
 via `KVConnectorOutput.state_indexed` / `.state_staging_released`, the
 aggregator waits for every TP rank, and `Scheduler._update_from_kv_xfer_finished`

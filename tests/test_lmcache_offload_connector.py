@@ -1831,10 +1831,13 @@ class _StateBackend:
         return [torch.empty(self._entry_bytes, dtype=torch.uint8)]
 
 
-def _state_tier_conn():
+def _state_tier_conn(pipeline_parallel_size: int = 1):
     conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
     conn._state_tier = None
     conn._engine = SimpleNamespace(storage_manager=object())
+    # `__init__` always sets `_config`, and the builder reads
+    # `pipeline_parallel_size` off it, so the fake has to carry one too.
+    conn._config = SimpleNamespace(pipeline_parallel_size=pipeline_parallel_size)
     return conn
 
 
@@ -1891,6 +1894,42 @@ def test_state_tier_is_disabled_when_the_backend_has_no_state_views(
 
     assert conn._state_tier is None
     assert "no per-request state views" in caplog.text
+
+
+def test_the_state_tier_is_refused_under_pipeline_parallelism(monkeypatch, caplog):
+    """PP breaks the tier twice over, and neither failure raises.
+
+    The key is `(model, world_size, worker_id, hash)` with `worker_id =
+    tp.rank_in_group` -- no PP component -- so two stages holding different
+    layer slices collide on one key and overwrite each other's bytes. And only
+    the head stage polls `_poll_kv_transfer_progress`, so the other stages'
+    `state_staging_released` reports are never drained and the ring starves.
+
+    Non-vacuousness: drop the `pp_size > 1` guard and this fails, because the
+    entry fits the staging buffer and the tier builds.
+    """
+    monkeypatch.setenv("OFFLOAD_STATE", "1")
+    conn = _state_tier_conn(pipeline_parallel_size=2)
+    tt = SimpleNamespace(state_backend=_StateBackend(1024))
+
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        conn._maybe_build_state_tier(_gpu_conn(4096), tt, _state_meta(), 0, 1)
+
+    assert conn._state_tier is None
+    assert "pipeline parallelism" in caplog.text
+
+
+def test_the_state_tier_still_builds_without_pipeline_parallelism(monkeypatch):
+    """The guard's control: pp=1 is the overwhelmingly common config, and a
+    guard that also refused it would disable the feature outright while every
+    refusal test above still passed."""
+    monkeypatch.setenv("OFFLOAD_STATE", "1")
+    conn = _state_tier_conn(pipeline_parallel_size=1)
+    tt = SimpleNamespace(state_backend=_StateBackend(1024))
+
+    conn._maybe_build_state_tier(_gpu_conn(4096), tt, _state_meta(), 0, 1)
+
+    assert conn._state_tier is not None
 
 
 def test_a_zero_entry_state_pool_stays_loud(monkeypatch):

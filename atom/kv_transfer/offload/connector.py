@@ -202,6 +202,37 @@ class LMCacheOffloadConnector(KVConnectorBase):
 
         if state_offload_staging_groups() <= 0:
             return
+        # Pipeline parallelism breaks the tier in two independent ways, so it is
+        # refused outright rather than half-supported.
+        #
+        # First the key. `StateByteCodec.key` builds a `CacheEngineKey` from
+        # (model, world_size, worker_id, hash), and `worker_id` here is
+        # `tp.rank_in_group` -- there is no PP component anywhere in it. Every PP
+        # stage holds a *different* slice of the layers, so stage 0 and stage 1
+        # at the same TP rank would write different bytes under an identical key
+        # and silently overwrite each other. A later load would then restore one
+        # stage's state into another's layers: wrong output, no error.
+        #
+        # Adding a PP component to the key would fix that half and still leave
+        # the second. `pp_engine_core.py` has every stage call `forward` on the
+        # head-pickled batch, so `_submit_state_spills` fires on all of them,
+        # but only the head runs `_poll_kv_transfer_progress`. The non-head
+        # stages' `state_staging_released` reports are never drained, so the
+        # ring never gets those slots back and the tier quietly stops spilling
+        # after `staging_depth` evictions. Wiring that up is a scheduler change,
+        # not a key change, so PP + OFFLOAD_STATE is out of scope for now.
+        #
+        # Paged-KV offload is unaffected: this returns before the tier is built
+        # and touches nothing else.
+        pp_size = int(getattr(self._config, "pipeline_parallel_size", 1) or 1)
+        if pp_size > 1:
+            logger.warning(
+                "state offload: OFFLOAD_STATE is not supported with pipeline "
+                "parallelism (pipeline_parallel_size=%d); the state tier stays "
+                "off and nothing spills. Paged-KV offload is unaffected.",
+                pp_size,
+            )
+            return
         backend = getattr(transfer_tensors, "state_backend", None)
         if backend is None:
             logger.warning(
