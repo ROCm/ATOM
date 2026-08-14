@@ -19,7 +19,7 @@ CPU = torch.device("cpu")
 
 def test_buffer_is_allocated_once_and_reused():
     st = StagedTransfer(CPU, staging_buffer_bytes=1024)
-    buf = _StagingBuffer()
+    buf = _StagingBuffer(use_cuda=False)
     first = st.ensure_buffer(buf, 512)
     second = st.ensure_buffer(buf, 256)
     assert first.data_ptr() == second.data_ptr()
@@ -31,12 +31,12 @@ def test_a_request_larger_than_the_buffer_is_an_error_not_a_realloc():
     HBM ceiling back in the hands of whatever the largest group happened to be."""
     st = StagedTransfer(CPU, staging_buffer_bytes=1024)
     with pytest.raises(RuntimeError, match="exceeds bounded GPU staging buffer"):
-        st.ensure_buffer(_StagingBuffer(), 2048)
+        st.ensure_buffer(_StagingBuffer(use_cuda=False), 2048)
 
 
 def test_release_drops_the_tensor_when_asked():
     st = StagedTransfer(CPU, staging_buffer_bytes=1024, release_after_transfer=True)
-    buf = _StagingBuffer()
+    buf = _StagingBuffer(use_cuda=False)
     st.ensure_buffer(buf, 512)
     st.release_buffer_if_requested(buf)
     assert buf.tensor is None
@@ -44,7 +44,7 @@ def test_release_drops_the_tensor_when_asked():
 
 def test_release_is_a_no_op_by_default():
     st = StagedTransfer(CPU, staging_buffer_bytes=1024)
-    buf = _StagingBuffer()
+    buf = _StagingBuffer(use_cuda=False)
     st.ensure_buffer(buf, 512)
     st.release_buffer_if_requested(buf)
     assert buf.tensor is not None

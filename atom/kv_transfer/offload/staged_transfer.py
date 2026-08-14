@@ -73,10 +73,14 @@ class _StagingBuffer:
 
     ``use_cuda`` creates them here rather than letting a caller attach them
     afterwards, because a buffer silently carrying ``None`` events would make
-    the hand-off a no-op. Correct by construction.
+    the hand-off a no-op. Correct by construction -- which is why the argument
+    has no default: a defaulted ``False`` would hand back exactly the
+    event-less buffer this class exists to rule out, to any caller who simply
+    forgot it. ``_ThreadTransferState`` takes it the same way. Tests that want
+    the CPU shape pass ``False`` and say so.
     """
 
-    def __init__(self, use_cuda: bool = False) -> None:
+    def __init__(self, use_cuda: bool) -> None:
         self.tensor: torch.Tensor | None = None
         self.ready_event = None
         self.free_event = None
