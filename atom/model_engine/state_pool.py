@@ -8,6 +8,8 @@ from heapq import heapify, heappop, heappush
 from math import inf
 from typing import TYPE_CHECKING
 
+from atom.model_engine.state_offload import should_load_state
+
 if TYPE_CHECKING:
     from atom.model_engine.state_offload import StateOffloadIndex
 
@@ -498,7 +500,9 @@ class StateGroupPool:
             return hit
         hbs = self.hash_block_size
         for i in range(hit - 1, -1, -1):
-            if not assume_checkpointed and not self._resumable_from(block_hashes[i]):
+            if not assume_checkpointed and not self._resumable_from(
+                block_hashes[i], (i + 1) * hbs
+            ):
                 continue
             if seq.num_tokens - (i + 1) * hbs >= self.min_fork_tokens:
                 return i + 1
@@ -511,7 +515,7 @@ class StateGroupPool:
         return self.hash_to_group.get(h, -1)
 
     # ------------------------------- offload ------------------------------- #
-    def _resumable_from(self, h: int) -> bool:
+    def _resumable_from(self, h: int, tokens: int) -> bool:
         """Whether a checkpoint for `h` can be *reached*, in HBM or beneath it.
 
         Reached, not merely indexed. `resumable_hit` scans right to left and
@@ -519,12 +523,19 @@ class StateGroupPool:
         nothing can deliver does not cost a wasted lookup — it costs the whole
         walk-back, hiding every shorter checkpoint still resident in HBM. The
         tier only earns a vote here once a load can act on it, which is what
-        `STATE_OFFLOAD_LOADS_WIRED` states, and while that is False this is
-        exactly the HBM-only predicate it was before the tier landed.
+        `STATE_OFFLOAD_LOADS_WIRED` states.
 
         HBM therefore wins without a preference rule: once both tiers are
         reachable they are indexed by the same hash, and the right-to-left scan
         takes the rightmost boundary wherever it lives.
+
+        `tokens` is the boundary this hash sits on, and the tier's floor
+        (`OFFLOAD_STATE_MIN_LOAD_TOKENS`) is applied here rather than where the
+        load is issued for the same reason the rest of this predicate exists: a
+        floor has to *decline* a rung so the scan keeps walking. Accepting one
+        and then declining to fetch it ends the scan on a boundary nobody
+        fills. The HBM branch is deliberately not gated by it — that hit costs
+        no transfer, so there is nothing for a floor to amortize.
         """
         if h in self.hash_to_group:
             return True
@@ -537,6 +548,7 @@ class StateGroupPool:
             STATE_OFFLOAD_LOADS_WIRED
             and self.offload is not None
             and h in self.offload.hashes
+            and should_load_state(tokens, self.offload.min_load_tokens)
         )
 
     def _spill(self, group: int) -> None:

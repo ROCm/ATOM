@@ -237,16 +237,3 @@ class _JointPark:
         self._ready.clear()
         self._ready_failed.clear()
         return ready, failed
-
-
-def should_load_state(hit_tokens: int, floor_tokens: int) -> bool:
-    """Whether a state hit of `hit_tokens` is worth an H2D.
-
-    Mirrors KV's OFFLOAD_MIN_LOAD_TOKENS (read in the scheduler-side connector,
-    `connector.py`). Two jobs: a
-    short prefix does not repay the round trip, and the same floor bounds what
-    a false positive costs -- the index cannot know LMCache's LRU dropped the
-    bytes until the load misses.
-    """
-    hit_tokens = int(hit_tokens)
-    return hit_tokens > 0 and hit_tokens >= int(floor_tokens)

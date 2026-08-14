@@ -31,7 +31,7 @@ _STARVATION_DROP_THRESHOLD = 256
 
 
 class StateOffloadIndex:
-    """What has been spilled, and what is queued to be.
+    """What has been spilled, what is queued to be, and what is coming back.
 
     `hashes` answers the membership half of `StateGroupPool._resumable_from`,
     and only once loads are wired: that predicate gates this set behind
@@ -43,7 +43,7 @@ class StateOffloadIndex:
     It is deliberately optimistic: LMCache's own LRU can drop bytes at any
     time, so a hash here means "was spilled once", never "is still there".
     The false positive costs one lookup and a park/unpark and is handled by
-    the `failed_loading` path, which calls `forget`.
+    the `failed_loading` path, which calls `fail_load` -> `forget`.
     """
 
     def __init__(self, staging_depth: int, kv_offload_enabled: bool) -> None:
@@ -65,9 +65,20 @@ class StateOffloadIndex:
         self.hashes: set[int] = set()
         self._free_slots: deque[int] = deque(range(self.staging_depth))
         self._pending: deque[tuple[int, int]] = deque()
+        # req_id -> hash, for loads the engine has offered and not yet settled.
+        # Keyed by request because that is what comes back: the worker reports
+        # a load through `finished_loading`/`failed_loading`, the same
+        # request-keyed channel a KV load uses. (The spill's reports are keyed
+        # by hash and slot instead -- by the time a spill lands, the request
+        # that owned the checkpoint is long gone.)
+        self.pending_loads: dict = {}
+        # Read once, here, rather than per call: `_resumable_from` consults it
+        # inside a per-block scan.
+        self.min_load_tokens = state_offload_min_load_tokens()
         self.spills_requested = 0
         self.spills_dropped = 0
         self.loads_attempted = 0
+        self.loads_completed = 0
         self.loads_failed = 0
         # Drops since the last `release_staging`. A full ring is normal
         # backpressure only while slots are still coming back; if none has come
@@ -141,24 +152,72 @@ class StateOffloadIndex:
         """Drop a hash whose load failed, so the next request does not retry."""
         self.hashes.discard(h)
 
+    # -------------------------------- loads -------------------------------- #
+    def request_load(self, req_id, h: int) -> bool:
+        """Offer to fetch `h` back for `req_id`. False if this tier cannot.
+
+        The refusal is the guard between believing and delivering. A load is
+        resolved only by a report from the worker, so offering one for a hash
+        the tier never stored would park the request against bytes no `get`
+        can produce, and nothing would ever wake it.
+        """
+        if h not in self.hashes:
+            return False
+        self.pending_loads[req_id] = int(h)
+        self.loads_attempted += 1
+        return True
+
+    def complete_load(self, req_id) -> None:
+        """The bytes landed in the request's group.
+
+        The hash stays indexed: a load reads LMCache, it does not consume it,
+        and the next request over the same prefix must still find it.
+        """
+        if self.pending_loads.pop(req_id, None) is not None:
+            self.loads_completed += 1
+
+    def fail_load(self, req_id) -> None:
+        """No bytes came back. Retract the claim as well as counting it.
+
+        A miss is the only evidence anyone gets that LMCache's LRU dropped what
+        this index still advertises, so it has to be what un-advertises it.
+        Leaving the hash in place makes every later request over that prefix
+        park, miss, and recompute -- the cost of the false positive paid once
+        per request instead of once.
+        """
+        h = self.pending_loads.pop(req_id, None)
+        if h is None:
+            return
+        self.loads_failed += 1
+        self.forget(h)
+
+    def abandon_load(self, req_id) -> None:
+        """The request went away before its bytes did. Neither outcome.
+
+        Deliberately not `fail_load`: an abort says nothing about the bytes, and
+        forgetting a hash that is still perfectly loadable would send the next
+        request over that prefix back to a full recompute.
+        """
+        self.pending_loads.pop(req_id, None)
+
     def stats(self) -> dict[str, int]:
         """Counters for the periodic `state checkpoints:` line.
 
         Reached via `StateGroupPool.checkpoint_fates`, which prefixes every key
         with `state_offload_`.
 
-        `loads_attempted` and `loads_failed` are structurally 0 on this branch,
-        not merely unexercised: their only writers are in
-        `StateOffloadTier.submit_load`/`_do_load`, the worker builds its tier
-        with `index=None`, and nothing calls `submit_load` at all. They are
-        reported anyway so that wiring loads needs no change here -- and a
-        non-zero value in a log would itself be news, since it would mean a
-        load path exists that this comment says does not.
+        The three load counters are read together or not at all.
+        `completed / attempted` is this index's false-positive rate: every
+        attempt was made against a hash the index advertised, so a failure
+        means LMCache's LRU had already dropped the bytes. `attempted -
+        completed - failed` is what is still in flight or was abandoned by an
+        aborted request.
         """
         return {
             "spills_requested": self.spills_requested,
             "spills_dropped": self.spills_dropped,
             "loads_attempted": self.loads_attempted,
+            "loads_completed": self.loads_completed,
             "loads_failed": self.loads_failed,
             "indexed": len(self.hashes),
         }
@@ -195,6 +254,62 @@ def kv_connector_hosts_state_tier(kv_transfer_config) -> bool:
             for s in subs
         )
     return name in _STATE_TIER_BACKENDS
+
+
+def should_load_state(hit_tokens: int, floor_tokens: int) -> bool:
+    """Whether a state hit of `hit_tokens` tokens is worth an H2D.
+
+    Lives here, engine-side, and not with the worker's transfer driver: the
+    decision is taken inside `StateGroupPool._resumable_from`, in the engine
+    process, before anything has been asked to move. The worker only ever
+    executes a load somebody else already decided on.
+
+    The zero case is not redundant with the floor. A floor of 0 means "no
+    minimum", not "load a boundary of nothing": a 0-token boundary is a cold
+    start, where there is no state to restore and the group is used as-is.
+    """
+    hit_tokens = int(hit_tokens)
+    return hit_tokens > 0 and hit_tokens >= int(floor_tokens)
+
+
+def state_offload_min_load_tokens() -> int:
+    """Boundary below which a state load is not worth its H2D. 0 = load any.
+
+    Deliberately **not** modelled on KV's `OFFLOAD_MIN_LOAD_TOKENS` (8192), and
+    the arithmetic is different enough to be worth stating. A KV load moves
+    bytes proportional to the hit, so a short one spends a whole round trip
+    moving very little; a floor is the natural shape. A state load moves one
+    flat entry -- 53.6 MiB measured, a few ms of H2D -- whatever the boundary
+    is, while the prefill it saves grows *with* the boundary. There is no
+    length below which the transfer is the expensive half, so the default
+    declines nothing.
+
+    What the knob is for: an entry much larger than that, or an index with a
+    bad false-positive rate (`loads_completed / loads_attempted` on the
+    periodic stats line), where a floor bounds what each miss costs.
+
+    Consulted inside `StateGroupPool._resumable_from`, which is why a bad value
+    floors to 0 rather than to something large: a mistyped floor that silently
+    became huge would turn every load off and read as a broken tier.
+    """
+    raw = os.environ.get("OFFLOAD_STATE_MIN_LOAD_TOKENS")
+    if raw is None:
+        return 0
+    try:
+        floor = int(raw)
+    except ValueError:
+        logger.warning(
+            "state offload: invalid OFFLOAD_STATE_MIN_LOAD_TOKENS=%r; using 0",
+            raw,
+        )
+        return 0
+    if floor < 0:
+        logger.warning(
+            "state offload: negative OFFLOAD_STATE_MIN_LOAD_TOKENS=%r; using 0",
+            raw,
+        )
+        return 0
+    return floor
 
 
 def state_offload_staging_groups() -> int:

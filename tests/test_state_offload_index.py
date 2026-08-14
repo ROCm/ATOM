@@ -11,6 +11,8 @@ from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.state_offload import (
     _STARVATION_DROP_THRESHOLD,
     StateOffloadIndex,
+    should_load_state,
+    state_offload_min_load_tokens,
     state_offload_staging_groups,
 )
 from atom.model_engine.state_pool import StateGroupPool, StateTransfer
@@ -66,6 +68,88 @@ def test_forget_drops_a_hash_that_failed_to_load():
     assert 11 not in idx.hashes
 
 
+# ------------------------------ the load leg ------------------------------- #
+# The engine reserves a load, the worker moves the bytes, the engine settles it.
+# Everything here is the engine's half: the worker cannot reach this object.
+
+
+def test_a_load_is_only_offered_for_a_hash_the_tier_believes_in():
+    """`request_load` is the guard between the two index spaces. Asking for a
+    hash the tier never stored would park a request against bytes no `get` can
+    return, and the park is only ever resolved by a report."""
+    idx = index()
+    assert idx.request_load("r1", 11) is False
+    assert idx.loads_attempted == 0
+    idx.confirm_spill(11)
+    assert idx.request_load("r1", 11) is True
+    assert idx.loads_attempted == 1
+
+
+def test_a_completed_load_leaves_the_hash_in_the_index():
+    """A hit does not consume the bytes: LMCache still holds them and the next
+    request over the same prefix must find them."""
+    idx = index()
+    idx.confirm_spill(11)
+    idx.request_load("r1", 11)
+    idx.complete_load("r1")
+    assert idx.loads_completed == 1
+    assert 11 in idx.hashes
+    assert idx.request_load("r2", 11) is True
+
+
+def test_a_failed_load_forgets_the_hash():
+    """The index is optimistic by construction -- LMCache's LRU can drop bytes
+    under a hash it still advertises. The miss is the only signal that happened,
+    so it has to be the one that retracts the claim; otherwise every subsequent
+    request over that prefix parks, misses, and recomputes."""
+    idx = index()
+    idx.confirm_spill(11)
+    idx.request_load("r1", 11)
+    idx.fail_load("r1")
+    assert idx.loads_failed == 1
+    assert 11 not in idx.hashes
+    assert idx.request_load("r2", 11) is False
+
+
+def test_an_abandoned_load_does_not_retract_the_hash():
+    """A request aborted mid-flight says nothing about the bytes. Counting it
+    as a failure would forget a hash that is still perfectly loadable, and the
+    next request would recompute a prefix the tier is holding."""
+    idx = index()
+    idx.confirm_spill(11)
+    idx.request_load("r1", 11)
+    idx.abandon_load("r1")
+    assert idx.loads_failed == 0
+    assert 11 in idx.hashes
+    assert idx.pending_loads == {}
+
+
+def test_settling_an_unknown_request_is_a_no_op():
+    """Reports are keyed by request id and arrive from every rank through an
+    aggregator; a duplicate or a stale one must not move a counter."""
+    idx = index()
+    idx.complete_load("ghost")
+    idx.fail_load("ghost")
+    idx.abandon_load("ghost")
+    assert (idx.loads_completed, idx.loads_failed) == (0, 0)
+
+
+def test_the_load_counters_read_as_the_index_false_positive_rate():
+    """`attempted - completed - failed` is what is still in flight or was
+    abandoned, which is the only way to read the three together."""
+    idx = index()
+    for h in (11, 22, 33):
+        idx.confirm_spill(h)
+        idx.request_load(f"r{h}", h)
+    idx.complete_load("r11")
+    idx.fail_load("r22")
+    stats = idx.stats()
+    assert stats["loads_attempted"] == 3
+    assert stats["loads_completed"] == 1
+    assert stats["loads_failed"] == 1
+    assert len(idx.pending_loads) == 1
+
+
 def test_resumable_from_ignores_the_tier_while_loads_are_unwired(monkeypatch):
     """A spilled hash is indexed but not *reachable*, so it must not vote.
 
@@ -74,15 +158,15 @@ def test_resumable_from_ignores_the_tier_while_loads_are_unwired(monkeypatch):
     checkpoint still in HBM. While `STATE_OFFLOAD_LOADS_WIRED` is False the
     predicate is exactly the HBM lookup.
     """
-    assert state_pool.STATE_OFFLOAD_LOADS_WIRED is False, "the branch ships unwired"
+    monkeypatch.setattr(state_pool, "STATE_OFFLOAD_LOADS_WIRED", False)
     pool = StateGroupPool(
         num_groups=2, transfer=StateTransfer.copy(), hash_block_size=4
     )
     pool.offload = index()
     pool.offload.confirm_spill(99)
-    assert not pool._resumable_from(99)
+    assert not pool._resumable_from(99, 64)
     pool.hash_to_group[99] = 0
-    assert pool._resumable_from(99), "HBM must still answer"
+    assert pool._resumable_from(99, 64), "HBM must still answer"
 
 
 def test_resumable_from_is_hbm_or_tier_once_loads_are_wired(monkeypatch):
@@ -93,9 +177,9 @@ def test_resumable_from_is_hbm_or_tier_once_loads_are_wired(monkeypatch):
         num_groups=2, transfer=StateTransfer.copy(), hash_block_size=4
     )
     pool.offload = index()
-    assert not pool._resumable_from(99)
+    assert not pool._resumable_from(99, 64)
     pool.offload.confirm_spill(99)
-    assert pool._resumable_from(99)
+    assert pool._resumable_from(99, 64)
 
 
 def test_resumable_from_without_a_tier_is_the_plain_lookup():
@@ -105,9 +189,104 @@ def test_resumable_from_without_a_tier_is_the_plain_lookup():
         num_groups=2, transfer=StateTransfer.copy(), hash_block_size=4
     )
     assert pool.offload is None
-    assert not pool._resumable_from(99)
+    assert not pool._resumable_from(99, 64)
     pool.hash_to_group[99] = 0
-    assert pool._resumable_from(99)
+    assert pool._resumable_from(99, 64)
+
+
+# ------------------------------- the floor --------------------------------- #
+
+
+def test_a_hit_at_or_above_the_floor_loads():
+    assert should_load_state(8192, 8192) is True
+
+
+def test_a_short_hit_does_not_repay_the_transfer():
+    assert should_load_state(4096, 8192) is False
+
+
+def test_a_zero_floor_loads_anything_positive():
+    assert should_load_state(1, 0) is True
+
+
+def test_a_zero_hit_never_loads():
+    """A floor of 0 means "no minimum", not "load a boundary of nothing": a
+    0-token boundary is a cold start, with no state to restore."""
+    assert should_load_state(0, 0) is False
+
+
+def floored_pool(floor, monkeypatch):
+    """A loads-wired pool whose tier declines boundaries under `floor` tokens."""
+    monkeypatch.setattr(state_pool, "STATE_OFFLOAD_LOADS_WIRED", True)
+    monkeypatch.setenv("OFFLOAD_STATE_MIN_LOAD_TOKENS", str(floor))
+    pool = StateGroupPool(
+        num_groups=4, transfer=StateTransfer.copy(), hash_block_size=4
+    )
+    pool.offload = StateOffloadIndex(staging_depth=2, kv_offload_enabled=True)
+    return pool
+
+
+def test_a_boundary_under_the_floor_does_not_repay_the_load(monkeypatch):
+    pool = floored_pool(64, monkeypatch)
+    pool.offload.confirm_spill(99)
+    assert not pool._resumable_from(99, 32)
+    assert pool._resumable_from(99, 64)
+
+
+def test_the_floor_never_gates_a_resident_checkpoint(monkeypatch):
+    """The floor is about whether an H2D repays itself. An HBM checkpoint costs
+    no transfer at all, so applying the floor there would decline a free hit."""
+    pool = floored_pool(1 << 20, monkeypatch)
+    pool.hash_to_group[99] = 0
+    assert pool._resumable_from(99, 4)
+
+
+def test_a_short_spilled_rung_lets_the_scan_reach_a_resident_one(monkeypatch):
+    """Why the floor lives inside the predicate and not at the load site.
+
+    `resumable_hit` stops at the first boundary the predicate accepts. Accepting
+    a too-short spilled rung and declining the transfer afterwards is the §6
+    shadowing bug all over again -- the shorter *resident* rung the walk-back
+    would have reached is never tried. Declining inside the predicate is what
+    lets the scan keep walking.
+    """
+
+    class Seq:
+        has_per_req_cache = True
+        num_tokens = 64
+
+    pool = floored_pool(32, monkeypatch)
+    # Rungs at 8 tokens (resident, hash 1) and 12 tokens (spilled, hash 2).
+    pool.hash_to_group[1] = 0
+    pool.offload.confirm_spill(2)
+    assert pool.resumable_hit(Seq(), 3, [0, 1, 2]) == 2, "took the short spilled rung"
+
+
+def test_the_floor_is_off_by_default(monkeypatch):
+    """Unlike KV's OFFLOAD_MIN_LOAD_TOKENS: a state load moves one flat entry
+    whatever the boundary is, while the prefill it replaces grows with the
+    boundary. There is no length below which the transfer is the expensive
+    half, so the default declines nothing."""
+    monkeypatch.delenv("OFFLOAD_STATE_MIN_LOAD_TOKENS", raising=False)
+    assert state_offload_min_load_tokens() == 0
+    monkeypatch.setattr(state_pool, "STATE_OFFLOAD_LOADS_WIRED", True)
+    pool = StateGroupPool(
+        num_groups=2, transfer=StateTransfer.copy(), hash_block_size=4
+    )
+    pool.offload = StateOffloadIndex(staging_depth=1, kv_offload_enabled=True)
+    pool.offload.confirm_spill(99)
+    assert pool._resumable_from(99, 4)
+
+
+@pytest.mark.parametrize("raw", ["-5", "banana"])
+def test_a_bad_floor_falls_back_to_zero_loudly(monkeypatch, caplog, raw):
+    """Model load must not die on a typo, and must not swallow it either: a
+    mistyped floor that silently became huge would turn every load off and read
+    as a broken tier."""
+    monkeypatch.setenv("OFFLOAD_STATE_MIN_LOAD_TOKENS", raw)
+    with caplog.at_level(logging.WARNING):
+        assert state_offload_min_load_tokens() == 0
+    assert "OFFLOAD_STATE_MIN_LOAD_TOKENS" in caplog.text
 
 
 def test_a_spilled_hash_still_takes_the_fork_test(monkeypatch):
