@@ -10,8 +10,6 @@ import copy
 import types
 
 import torch
-import triton
-import triton.language as tl
 from torch import nn
 
 _draft_extend_fused_swa_ctx = contextvars.ContextVar(
@@ -19,37 +17,6 @@ _draft_extend_fused_swa_ctx = contextvars.ContextVar(
     default=None,
 )
 _v4_nm_last_page_lens_cache: dict[tuple[str, int | None, int], torch.Tensor] = {}
-
-
-@triton.jit
-def _offset_proxy_csa_rows_kernel(
-    positions,
-    kv_indptr_csa,
-    batch_id_per_token,
-    skip_prefix_len_per_token,
-    kv_indices_csa,
-    row_base,
-    window_size: tl.constexpr,
-    INLINE_SKIP: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-):
-    t = tl.program_id(0)
-    bid = tl.load(batch_id_per_token + t)
-    if bid < 0:
-        return
-    if INLINE_SKIP:
-        pos = tl.load(positions + t)
-        skip = tl.minimum(pos + 1, window_size)
-    else:
-        skip = tl.load(skip_prefix_len_per_token + t)
-    start = tl.load(kv_indptr_csa + t)
-    valid = tl.load(kv_indptr_csa + t + 1) - start - skip
-    offsets = tl.arange(0, BLOCK_N)
-    for block_start in tl.range(0, valid, BLOCK_N):
-        mask = block_start + offsets < valid
-        index = start + block_start + offsets
-        value = tl.load(kv_indices_csa + index, mask=mask)
-        tl.store(kv_indices_csa + index, value + row_base, mask=mask)
 
 
 def _install_v4_nm_aiter_compat_patch() -> None:
@@ -164,7 +131,6 @@ def _install_draft_extend_fused_swa_patch() -> None:
     original_swa_write = dsv4.swa_write
     original_indexer_score_topk = dsv4.Indexer.indexer_score_topk
     original_score_topk_decode = dsv4.Indexer._score_topk_decode
-    original_csa_translate_pack = dsv4.csa_translate_pack
 
     def qk_norm_rope_maybe_quant(*args, **kwargs):
         ctx = _draft_extend_fused_swa_ctx.get()
@@ -195,56 +161,6 @@ def _install_draft_extend_fused_swa_patch() -> None:
         if _draft_extend_fused_swa_ctx.get() is not None:
             return None
         return original_swa_write(*args, **kwargs)
-
-    def csa_translate_pack(
-        topk_local,
-        block_tables,
-        positions,
-        kv_indptr_csa,
-        batch_id_per_token,
-        skip_prefix_len_per_token,
-        kv_indices_csa,
-        *,
-        envelope_rows,
-        csa_block_capacity,
-        window_size=0,
-        prefix="",
-    ):
-        original_csa_translate_pack(
-            topk_local,
-            block_tables,
-            positions,
-            kv_indptr_csa,
-            batch_id_per_token,
-            skip_prefix_len_per_token,
-            kv_indices_csa,
-            envelope_rows=envelope_rows,
-            csa_block_capacity=csa_block_capacity,
-            window_size=window_size,
-            prefix=prefix,
-        )
-        row_base = int(
-            getattr(dsv4.get_forward_context().attn_metadata, "compressed_row_base", 0)
-        )
-        if row_base == 0 or topk_local.shape[0] == 0:
-            return
-        inline_skip = window_size > 0
-        skip_ptr = (
-            positions
-            if inline_skip or skip_prefix_len_per_token is None
-            else skip_prefix_len_per_token
-        )
-        _offset_proxy_csa_rows_kernel[(topk_local.shape[0],)](
-            positions,
-            kv_indptr_csa,
-            batch_id_per_token,
-            skip_ptr,
-            kv_indices_csa,
-            row_base,
-            window_size=window_size,
-            INLINE_SKIP=inline_skip,
-            BLOCK_N=256,
-        )
 
     def indexer_score_topk(self, q_quant, weights, q_scale, topk):
         # q_quant: FP8, or packed FP4 (uint8) when the FP4 indexer is on; q_scale
@@ -324,7 +240,6 @@ def _install_draft_extend_fused_swa_patch() -> None:
 
     dsv4.qk_norm_rope_maybe_quant = qk_norm_rope_maybe_quant
     dsv4.swa_write = swa_write
-    dsv4.csa_translate_pack = csa_translate_pack
     dsv4.Indexer.indexer_score_topk = indexer_score_topk
     dsv4.Indexer._score_topk_decode = _score_topk_decode
     dsv4._atom_sglang_draft_extend_fused_swa_patched = True
