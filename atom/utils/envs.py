@@ -202,9 +202,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_DETAILED_ANNOTATION": lambda: (
         os.getenv("ATOM_ENABLE_DETAILED_ANNOTATION", "0") == "1"
     ),
-    "ATOM_LOG_PREFIX_CACHE_PER_REQ": lambda: (
-        os.getenv("ATOM_LOG_PREFIX_CACHE_PER_REQ", "0") == "1"
-    ),
     "ATOM_PROFILER_TIMEOUT": lambda: float(os.getenv("ATOM_PROFILER_TIMEOUT", "300")),
     "ATOM_LOG_MORE": lambda: int(os.getenv("ATOM_LOG_MORE", "0")) != 0,
     # RTL (rocm-trace-lite) GPU kernel tracing — set to output directory to enable.
