@@ -283,6 +283,66 @@ path at all: run the target workload with `OFFLOAD_STATE` **off** and read
 `checkpoints_evicted` off the `state checkpoints:` line. Near zero → the pool
 is big enough and this tier should stay off.
 
+### Run A — the precondition (tier off)
+
+A hybrid model, because that is what has a per-request state:
+Qwen3-Next / Qwen3.5 / Kimi-K3 (GDN/KDA) or DeepSeek-V4.
+
+```bash
+export AITER_LOG_LEVEL=WARNING
+rm -rf /root/.cache/atom/*
+
+python3 -m atom.entrypoints.openai_server \
+  --model "${MODEL_PATH}" --host 0.0.0.0 --server-port 8010 \
+  --trust-remote-code --tensor-parallel-size 8 --kv_cache_dtype fp8 \
+  --kv-transfer-config '{"kv_connector":"lmcache_offload","kv_role":"offload"}' \
+  2>&1 | tee run_a.log
+
+# confirm the model is really resident, not just that /health says OK
+rocm-smi --showmemuse        # VRAM% must be > 0
+```
+
+Drive a workload with **repeated long prefixes** (a multi-turn or agentic
+replay) — a tier that is never asked to resume proves nothing. Then:
+
+```bash
+grep "state checkpoints:" run_a.log | tail -5
+```
+
+`checkpoints_evicted` near zero → stop here, the tier is pure overhead for
+this workload. Materially non-zero → it is the ceiling on what run B can
+recover.
+
+### Run B — the tier on
+
+Same command plus:
+
+```bash
+export OFFLOAD_STATE=1
+# export OFFLOAD_STATE_STAGING_GROUPS=2   # only if spills_dropped says so
+```
+
+One entry is MB-scale (53.6 MiB measured), so watch startup for the refusal
+`one state entry is N bytes but the shared GPU staging buffer holds only M` —
+if it fires, raise `OFFLOAD_GPU_STAGING_CHUNKS` until the buffer covers an
+entry, or the tier stays off and nothing spills.
+
+### What to read
+
+| Read | Means |
+|---|---|
+| `state_offload_spills_dropped` / `spills_requested` | ring too shallow → raise `OFFLOAD_STATE_STAGING_GROUPS` |
+| `state_offload_loads_failed` / `loads_attempted` | index false-positive rate: the LRU dropped bytes the index still advertised |
+| `state_offload_loads_completed` | resumes actually recovered — the whole point |
+| `checkpoints_evicted`, run A vs run B | what was on the table |
+| `prompt_tokens_details.cached_tokens` on the API response | the per-request view of the same thing |
+| TTFT p50/p99, run A vs run B | the H2D and the park are on the critical path of a resuming request |
+
+A resume that lands should show as `loads_completed` climbing **and** TTFT
+falling on the repeated prefixes. `loads_completed` climbing with no TTFT
+change means the boundaries are too short to be worth the round trip — raise
+`OFFLOAD_STATE_MIN_LOAD_TOKENS`.
+
 Then, with it on, the numbers that decide it:
 
 | Read | Means |
