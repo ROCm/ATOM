@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: MIT
 # The worker-side driver: its own executor, and completions reported by req_id.
 
-from atom.kv_transfer.offload.state_tier import StateOffloadTier
+import pytest
+
+from atom.kv_transfer.offload.state_tier import StateOffloadTier, should_load_state
 from atom.model_engine.state_offload import StateOffloadIndex
 
 
@@ -86,6 +88,23 @@ def test_a_spill_always_reports_its_staging_slot():
     assert released == {slot0, slot1}
 
 
+def test_the_load_path_is_not_callable_as_production_builds_the_tier():
+    """The load tests below construct the tier with a live index; production
+    does not, and this pins that gap so they cannot be mistaken for coverage.
+
+    `connector.py` builds `StateOffloadTier(codec, index=None)` (and
+    `multi_connector.py` adopts that same object), while `submit_load` does
+    `self.index.loads_attempted += 1` unconditionally. The load direction is
+    deliberately unwired -- `state_pool.STATE_OFFLOAD_LOADS_WIRED` is False and
+    nothing calls `submit_load` -- so this is documentation of the current
+    shape, not a defect. Wiring loads means giving the tier a real index here;
+    when that happens this test should fail and be deleted.
+    """
+    t = StateOffloadTier(FakeCodec(), index=None)
+    with pytest.raises(AttributeError):
+        t.submit_load("req-a", 11, group=3)
+
+
 def test_a_successful_load_reports_done():
     codec = FakeCodec()
     t = tier(codec)
@@ -149,9 +168,6 @@ def test_inflight_does_not_grow_on_get_finished_path():
 
     with t._lock:
         assert len(t._inflight) == 0
-
-
-from atom.kv_transfer.offload.state_tier import should_load_state
 
 
 def test_a_hit_at_or_above_the_floor_loads():

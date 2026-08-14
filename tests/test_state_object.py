@@ -170,6 +170,18 @@ def test_put_writes_exactly_one_object():
     assert len(c._storage.puts) == 1
 
 
+def test_a_successful_put_returns_true():
+    """`_do_spill` does `stored = bool(self.codec.put(...))` and sends a falsy
+    result to `_index_failed`. The refusal paths pin False; without this, a
+    regression to an implicit `return None` on the success path would send
+    *every* successful spill to the failure report -- permanently disabling
+    indexing while the bytes are actually in LMCache -- and nothing would
+    fail, because `test_state_tier.py`'s FakeCodec.put returns a literal True.
+    """
+    c = codec()
+    assert c.put(1234, entry_index=2) is True
+
+
 def test_put_allocates_one_uint8_object_of_entry_bytes():
     c = codec()
     c.put(1234, entry_index=2)

@@ -7,6 +7,7 @@ import logging
 import pytest
 
 from atom.model_engine import state_pool
+from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.state_offload import (
     _STARVATION_DROP_THRESHOLD,
     StateOffloadIndex,
@@ -208,9 +209,49 @@ def test_disabled_by_default_costs_nothing():
     assert idx.hashes == set()
 
 
-def test_kv_offload_flag_is_carried_for_the_orphan_decision():
+def test_the_kv_offload_flag_is_stored():
     assert StateOffloadIndex(1, kv_offload_enabled=True).kv_offload_enabled is True
     assert StateOffloadIndex(1, kv_offload_enabled=False).kv_offload_enabled is False
+
+
+def orphaning_pool(kv_offload_enabled):
+    """A pool holding one checkpoint whose KV blocks have just been dropped."""
+    pool = StateGroupPool(
+        num_groups=2, transfer=StateTransfer.copy(), hash_block_size=4
+    )
+    pool.offload = StateOffloadIndex(
+        staging_depth=2, kv_offload_enabled=kv_offload_enabled
+    )
+    pool.claim(0)
+    pool._index(555, 0)
+    pool.release(0)
+    return pool
+
+
+@pytest.mark.parametrize("kv_offload_enabled", [True, False])
+def test_an_orphan_is_spilled_only_when_kv_offload_can_bring_the_blocks_back(
+    kv_offload_enabled,
+):
+    """`unindex` gates its `_spill` on the flag (`state_pool.py`), and the gate
+    is the whole reason the flag is plumbed this far down.
+
+    A checkpoint is a joint claim on state *and* KV. When the KV blocks are
+    gone and KV offload is off, they can never come back, so the hash is
+    unreachable forever -- spilling it would spend LMCache capacity on bytes no
+    load could ever use. With KV offload on, the blocks can be fetched again,
+    so the state is worth keeping. Without this gate every orphan spills.
+    """
+    pool = orphaning_pool(kv_offload_enabled)
+    assert pool.unindex(555) == 0
+
+    copies = pool.take_spill_copies()
+    pending = pool.offload.take_pending()
+    if kv_offload_enabled:
+        assert copies == [(0, 0)]
+        assert pending == [(555, 0)]
+    else:
+        assert copies == []
+        assert pending == []
 
 
 def test_staging_groups_is_zero_unless_the_tier_is_switched_on(monkeypatch):
@@ -280,27 +321,75 @@ def test_a_negative_depth_is_floored_to_zero(monkeypatch):
     assert state_offload_staging_groups() == 0
 
 
-def test_spills_for_batch_joins_the_copy_and_the_hash_on_the_slot():
-    """The pool knows (group, slot); the ring knows (hash, slot). A spill
-    needs all three, and the only thing that relates them is the slot."""
-    from atom.model_engine.state_pool import StateGroupPool, StateTransfer
+class OnlyStateCaches:
+    """`state_spills_for_batch` reads `self.state_caches` and nothing else."""
 
+    def __init__(self, caches):
+        self.state_caches = caches
+
+    spills_for_batch = BlockManager.state_spills_for_batch
+
+
+def spilling_pool(num_groups=4):
     pool = StateGroupPool(
-        num_groups=4, transfer=StateTransfer.copy(), hash_block_size=4
+        num_groups=num_groups, transfer=StateTransfer.copy(), hash_block_size=4
     )
     pool.offload = StateOffloadIndex(staging_depth=2, kv_offload_enabled=False)
+    return pool
+
+
+def test_spills_for_batch_joins_the_copy_and_the_hash_on_the_slot():
+    """The pool knows (group, slot); the ring knows (hash, slot). A spill
+    needs all three, and the only thing that relates them is the slot.
+
+    Driving the real `BlockManager.state_spills_for_batch`, because the join
+    and the `num_groups + slot` addressing both live there -- re-deriving them
+    in the test would assert the expression against itself.
+    """
+    pool = spilling_pool()
     pool.group_hash[1] = 111
     pool.group_hash[2] = 222
     pool._spill(1)
     pool._spill(2)
 
-    copies = dict(pool.take_spill_copies())  # group -> slot
-    pending = {s: h for h, s in pool.offload.take_pending()}  # slot -> hash
-    joined = sorted((g, pool.num_groups + s, s, pending[s]) for g, s in copies.items())
-    assert [t[0] for t in joined] == [1, 2]
-    assert [t[3] for t in joined] == [111, 222]
-    # The destination is addressed in the same space state_entry_views uses.
-    assert all(dst == pool.num_groups + slot for _, dst, slot, _ in joined)
+    # (src_group, dst_entry, staging_slot, hash). The destination is addressed
+    # in the same space `state_entry_views` uses: past the pool's own groups.
+    assert sorted(OnlyStateCaches([pool]).spills_for_batch()) == [
+        (1, 4, 0, 111),
+        (2, 5, 1, 222),
+    ]
+
+
+def test_a_copy_with_no_pending_hash_is_dropped_and_its_slot_released(caplog):
+    """The two lists are appended by one `_spill()` and drained together, so a
+    slot in one and not the other means something already went wrong. Guessing
+    which half is right would store bytes under a hash they do not belong to;
+    dropping the spill costs one later prefix hit. The slot must still come
+    back, or the ring leaks a staging entry per occurrence.
+    """
+    pool = spilling_pool()
+    pool.group_hash[1] = 111
+    pool._spill(1)
+    pool.offload.take_pending()  # the hash half vanishes; the copy remains
+
+    free_before = len(pool.offload._free_slots)
+    with caplog.at_level(logging.WARNING):
+        assert OnlyStateCaches([pool]).spills_for_batch() == []
+    assert len(pool.offload._free_slots) == free_before + 1
+    assert "no pending hash" in caplog.text
+
+
+def test_a_pending_hash_with_no_copy_releases_its_slot_too():
+    """The mirror image: nothing to feed the staging entry, so nothing is
+    spilled, but the slot is still the ring's to reclaim."""
+    pool = spilling_pool()
+    pool.group_hash[1] = 111
+    pool._spill(1)
+    pool.take_spill_copies()  # the copy half vanishes; the hash remains
+
+    free_before = len(pool.offload._free_slots)
+    assert OnlyStateCaches([pool]).spills_for_batch() == []
+    assert len(pool.offload._free_slots) == free_before + 1
 
 
 def test_a_slot_returns_only_after_the_report_comes_back():

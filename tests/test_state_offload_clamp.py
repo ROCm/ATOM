@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # P <= L. Violating it is silent wrong output, so it gets its own test file.
 
-from atom.kv_transfer.offload.state_tier import clamp_state_boundary
+from atom.kv_transfer.offload.state_tier import _JointPark, clamp_state_boundary
 
 
 def test_a_state_boundary_within_the_loaded_kv_is_kept():
@@ -30,9 +30,6 @@ def test_negatives_floor_at_zero():
     forward is not a shorter prefix but an out-of-range one."""
     assert clamp_state_boundary(-1, 8) == 0
     assert clamp_state_boundary(8, -1) == 0
-
-
-from atom.kv_transfer.offload.state_tier import _JointPark
 
 
 def test_a_request_needing_both_wakes_on_neither_alone():
