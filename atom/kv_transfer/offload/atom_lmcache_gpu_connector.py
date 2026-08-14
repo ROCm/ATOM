@@ -24,7 +24,6 @@ from atom.kv_transfer.offload.staged_transfer import (
     _env_int,
     _env_optional_int,
     _PipelineStage,
-    _StagingBuffer,
     _ThreadTransferState,
 )
 
@@ -126,19 +125,6 @@ class ATOMLMCacheGPUConnector:
 
     def _thread_state(self) -> _ThreadTransferState:
         return self._staged.thread_state()
-
-    def _ensure_staging_buffer(
-        self,
-        staging_buffer: _StagingBuffer,
-        nbytes: int,
-    ) -> torch.Tensor:
-        return self._staged.ensure_buffer(staging_buffer, nbytes)
-
-    def _release_staging_buffer_if_requested(
-        self,
-        staging_buffer: _StagingBuffer,
-    ) -> None:
-        return self._staged.release_buffer_if_requested(staging_buffer)
 
     def _assert_fused_chunk_major_available(self) -> None:
         if self._use_cuda() and self.codec.has_fused_chunk_major_staging:

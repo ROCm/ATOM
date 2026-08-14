@@ -359,14 +359,18 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
             ),
         )[-1],
     )
-    orig_ensure_staging_buffer = connector._ensure_staging_buffer
+    # Wrap `StagedTransfer.ensure_buffer`, not a connector-side delegate:
+    # `run_pipeline` calls it on itself, so a patch on the connector is never
+    # reached and `buffer_requests` stays empty -- which is what made the two
+    # bound assertions below vacuous (`all()` over `[]` is True).
+    orig_ensure_buffer = connector._staged.ensure_buffer
 
-    def _ensure_staging_buffer(staging_buffer, nbytes):
-        device_buf = orig_ensure_staging_buffer(staging_buffer, nbytes)
+    def _ensure_buffer(staging_buffer, nbytes):
+        device_buf = orig_ensure_buffer(staging_buffer, nbytes)
         buffer_requests.append((nbytes, int(staging_buffer.tensor.numel())))
         return device_buf
 
-    monkeypatch.setattr(connector, "_ensure_staging_buffer", _ensure_staging_buffer)
+    monkeypatch.setattr(connector._staged, "ensure_buffer", _ensure_buffer)
 
     class _FakeEvent:
         def record(self, stream) -> None:
@@ -424,6 +428,9 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
         ]
     )
     assert pack_groups == [[[1, 2], [3]]]
+    # Both bounds below are `all()` over this list, so an empty list passes
+    # them for free. Pin it non-empty first.
+    assert buffer_requests
     assert all(nbytes <= 4 * codec.bytes_per_block for nbytes, _ in buffer_requests)
     assert all(capacity == 4 * codec.bytes_per_block for _, capacity in buffer_requests)
     assert torch.equal(memory_objs[0].tensor, expected0)
@@ -449,9 +456,9 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
 def test_lmcache_connector_staged_pipeline_really_reaches_staged_transfer(monkeypatch):
     """`_run_staged_pipeline` must actually delegate to `StagedTransfer`.
 
-    The fastpath test above monkeypatches `_thread_state` and
-    `_ensure_staging_buffer` **on the connector**, replacing the very methods
-    that delegate — so it never exercises `StagedTransfer.run_pipeline` at all.
+    The fastpath test above monkeypatches `_thread_state` **on the
+    connector**, replacing the very method that delegates — so it never
+    exercises `StagedTransfer.run_pipeline` at all.
     This test leaves every delegating method intact and instead seeds the
     thread-local state *inside* `StagedTransfer`, so a delegation that is
     removed, inlined, or misrouted fails here. It also pins the intra-worker
