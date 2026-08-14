@@ -224,7 +224,7 @@ class StateSlotPool:
         self._free: set[int] = set(range(num_slots))
         self._vacant: list[int] = list(range(num_slots))
         self._checkpointed: deque[int] = deque()
-        # Groups whose checkpoint is a guess rather than this prompt's own end;
+        # Slots whose checkpoint is a guess rather than this prompt's own end;
         # `mark_speculative` explains what the distinction is worth. Cleared
         # when the guess pays off (`promote`) or the content goes (`release` of
         # a slot carrying nothing) — both of which end the slot's claim to be
@@ -235,7 +235,7 @@ class StateSlotPool:
         # Reverse map, for lazy eviction when a slot is handed out. -1 = the
         # slot carries no checkpoint.
         self.slot_hash: list[int] = [-1] * num_slots
-        # Groups serving as a fork source in the in-flight step, counted by how
+        # Slots serving as a fork source in the in-flight step, counted by how
         # many requests fork off each. They stay off the free list until
         # `release_pins`, so the step that reads them cannot race a request that
         # was handed the same slot. The count matters because a checkpoint is
