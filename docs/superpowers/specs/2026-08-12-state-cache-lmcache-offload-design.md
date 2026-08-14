@@ -1,7 +1,12 @@
 # State-Cache LMCache Offload — Design
 
 Date: 2026-08-12
-Status: design approved, not yet planned or implemented
+Status: **SUPERSEDED — this is the pre-implementation design.** It describes
+intent, not the built system, and several of its open questions were settled
+differently during implementation. For the system as built on
+`feat/state-cache-lmcache-offload`, read
+[`2026-08-14-state-cache-lmcache-offload-final-design.md`](2026-08-14-state-cache-lmcache-offload-final-design.md).
+Kept for the rationale in its Problem and Alternatives sections.
 Scope: DeepSeek-V4 and GDN/Qwen3-Next, uniform from the start
 
 ## Problem
