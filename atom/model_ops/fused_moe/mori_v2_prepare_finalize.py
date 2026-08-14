@@ -50,48 +50,76 @@ EpDispatchCombineOp = None
 _V2_IMPORTED = False
 
 
-def _import_v2() -> None:
-    """Bind the v2 op-layer, preferring aiter's vendored copy.
+def _import_v2_from_aiter():
+    from aiter.ops.flydsl.dispatch_combine_v2 import (  # type: ignore
+        EpDispatchCombineConfig as _Cfg,
+        EpDispatchCombineOp as _Op,
+    )
 
-    Two copies exist. aiter vendors the op-layer plus its FlyDSL kernels
+    return _Cfg, _Op
+
+
+def _import_v2_from_mori():
+    try:
+        from mori.ops.dispatch_combine_v2.dispatch_combine_op import (  # type: ignore
+            EpDispatchCombineConfig as _Cfg,
+            EpDispatchCombineOp as _Op,
+        )
+    except ImportError:
+        # Older mori shipped dispatch_combine_v2 as loose test-only modules
+        # with no __init__.py, importing each other by top-level name --
+        # they only resolve with their own directory on sys.path.
+        v2_dir = os.path.join(
+            os.path.dirname(mori.__file__), "ops", "dispatch_combine_v2"
+        )
+        if v2_dir not in sys.path:
+            sys.path.insert(0, v2_dir)
+        from dispatch_combine_op import (  # type: ignore  # noqa: E402
+            EpDispatchCombineConfig as _Cfg,
+            EpDispatchCombineOp as _Op,
+        )
+
+    return _Cfg, _Op
+
+
+def _import_v2() -> None:
+    """Bind the v2 op-layer; ATOM_MORI_V2_FUSED picks which of the two copies.
+
+    aiter vendors the op-layer plus its FlyDSL kernels
     (aiter.ops.flydsl.dispatch_combine_v2) and is the only one carrying the
     gemm2-fused combine, since that mode is a contract between the op and
-    aiter's gemm2 epilogue. mori ships its own copy and stays the fallback; only
-    the cco communication substrate (mori.cco) is required from mori either way.
+    aiter's gemm2 epilogue -- so FUSED=1 needs it. mori ships its own copy,
+    which tops out at combine_mode="scatter" and serves as the untouched
+    upstream baseline, so FUSED=0 binds that one. Either copy is preferred
+    rather than required: the other is still taken if it is the only one
+    installed. Only the cco communication substrate (mori.cco) always comes
+    from mori.
     """
     global EpDispatchCombineConfig, EpDispatchCombineOp, _V2_IMPORTED
     if _V2_IMPORTED:
         return
     if not MORI_AVAILABLE:
         raise ImportError("mori is required for MoriV2PrepareAndFinalize")
-    try:
-        from aiter.ops.flydsl.dispatch_combine_v2 import (  # type: ignore
-            EpDispatchCombineConfig as _Cfg,
-            EpDispatchCombineOp as _Op,
-        )
-    except ImportError:
-        try:
-            from mori.ops.dispatch_combine_v2.dispatch_combine_op import (  # type: ignore
-                EpDispatchCombineConfig as _Cfg,
-                EpDispatchCombineOp as _Op,
-            )
-        except ImportError:
-            # Older mori shipped dispatch_combine_v2 as loose test-only modules
-            # with no __init__.py, importing each other by top-level name --
-            # they only resolve with their own directory on sys.path.
-            v2_dir = os.path.join(
-                os.path.dirname(mori.__file__), "ops", "dispatch_combine_v2"
-            )
-            if v2_dir not in sys.path:
-                sys.path.insert(0, v2_dir)
-            from dispatch_combine_op import (  # type: ignore  # noqa: E402
-                EpDispatchCombineConfig as _Cfg,
-                EpDispatchCombineOp as _Op,
-            )
+    from atom.utils import envs as _atom_envs
 
-    EpDispatchCombineConfig = _Cfg
-    EpDispatchCombineOp = _Op
-    _V2_IMPORTED = True
+    sources = [("aiter", _import_v2_from_aiter), ("mori", _import_v2_from_mori)]
+    if not _atom_envs.ATOM_MORI_V2_FUSED:
+        sources.reverse()
+
+    for name, load in sources:
+        try:
+            _Cfg, _Op = load()
+        except ImportError:
+            continue
+        EpDispatchCombineConfig = _Cfg
+        EpDispatchCombineOp = _Op
+        _V2_IMPORTED = True
+        logger.info("[MORI-V2] op-layer from %s (%s)", name, _Op.__module__)
+        return
+
+    raise ImportError(
+        "dispatch_combine_v2 op-layer not found in either aiter or mori"
+    )
 
 
 def _resolve_combine_mode() -> str:
@@ -109,8 +137,8 @@ def _resolve_combine_mode() -> str:
     # gemm2-fused mode and would reject the combine_mode outright.
     if not hasattr(EpDispatchCombineConfig, "is_fused"):
         logger.warning(
-            "[MORI-V2] ATOM_MORI_V2_FUSED=1 but the available v2 op-layer has no "
-            "gemm2-fused combine; falling back to gather."
+            "[MORI-V2] ATOM_MORI_V2_FUSED=1 but aiter's v2 op-layer is unavailable "
+            "and the bound one has no gemm2-fused combine; falling back to gather."
         )
         return "gather"
     return "scatter_fused"
