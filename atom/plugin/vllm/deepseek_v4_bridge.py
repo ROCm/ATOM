@@ -720,7 +720,6 @@ class _V4DecodeMetaBuffers:
         self.idx_swa = i32(T * max(1, win))
         self.idx_csa = i32(T * max(1, win + topk))
         self.idx_hca = i32(T * max(1, win + hca))
-        self.swa_dest_rows = i32(T)
         # Per-token paged-decode index tensors for the fp8 asm decode kernel
         # (aiter op5 `mla_decode_fwd_v4_nm`, page_size=1). Mirrors native
         # deepseek_v4_attn.py: values depend ONLY on the (padded) decode token
@@ -855,8 +854,6 @@ def bind_deepseek_v4_proxy_cache_views(
         else:
             attn.unified_kv_rope = None
             attn.swa_kv_rope = None
-        attn.swa_plane = attn.swa_kv
-        attn.swa_plane_rope = attn.swa_kv_rope
         if ratio == 4:
             csa_i = _compressed_layer_cache_index(ratios, layer_id, ratio)
             _bind_compressor_state(
@@ -1584,7 +1581,6 @@ def _populate_decode_persistent(
         swa_indices=swa_indices_gpu,
         csa_indices=csa_indices_gpu,
         hca_indices=bufs.idx_hca.gpu,
-        swa_dest_rows=bufs.swa_dest_rows.gpu,
         n_committed_hca_per_seq=md.n_committed_hca_per_seq,
         block_tables=common.block_table_tensor,
         T=total,
@@ -1598,7 +1594,6 @@ def _populate_decode_persistent(
     md.kv_indptr_swa = swa_indptr_gpu
     md.kv_indptr_csa = csa_indptr_gpu
     md.kv_indptr_hca = hca_indptr_gpu
-    md.swa_dest_rows = {ratio: bufs.swa_dest_rows.gpu for ratio in (0, 4, 128)}
     md.swa_pages = swa_pages
 
 
