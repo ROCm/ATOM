@@ -921,10 +921,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         No flat margin on the slot: a ring cannot transiently exceed itself the
         way a block-addressed window could while sliding across a boundary, and
         there is no admission-vs-materialization gap to cushion — a slot exists
-        for its request's whole life.
+        for its request's whole life. The checkpoint headroom and the offload
+        tier's staging ring are both added by `state_pool` itself, which is the
+        only reader of the two env vars that size them.
         """
-        from atom.model_engine.state_offload import state_offload_staging_groups
-
         geo = self.pool_geometry
         row_bytes = self.plane_row_bytes()
         return [
@@ -933,15 +933,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 STATE_SLOT_CLASS,
                 geo.slot_bytes(row_bytes),
                 entries_per_req=1,
-                # K staging groups past the pool's group range: inside the
-                # arena so `state_entry_views(num_groups + slot)` addresses
-                # them with no second scheme, outside admission so no request
-                # is ever handed one. Cost is K groups of HBM from the very
-                # budget the pool wants -- and a small pool is the problem
-                # being solved -- so K stays small (default 1) and measured.
-                # Groups, not entries: `state_entry_views` indexes by group,
-                # so a group costs `entries_per_req` rows (1 here).
-                extra_entries=state_offload_staging_groups() * 1,
             ),
         ]
 

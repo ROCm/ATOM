@@ -288,17 +288,15 @@ class GDNStateMixin:
         per_layer = (
             math.prod(shape_k) * dt_k.itemsize + math.prod(shape_v) * dt_v.itemsize
         )
-        from atom.model_engine.state_offload import state_offload_staging_groups
-
-        span = 1 + self.num_spec
+        # The offload tier's staging ring is added by `state_pool` from
+        # `entries_per_req`: `span` rows per staging group, because
+        # `copy_state_entries` slices `cache[:, dst_slot : dst_slot + span]` and
+        # a ring sized in bare entries would run the last staging group off the
+        # end of the tensor.
         return state_pool(
             STATE_SLOT_CLASS,
             self.model_runner.num_gdn_attn_state * per_layer,
-            entries_per_req=span,
-            # `span` rows per staging group -- `copy_state_entries` slices
-            # `cache[:, dst_slot : dst_slot + span]`, so a ring sized in bare
-            # entries would run the last staging group off the tensor.
-            extra_entries=state_offload_staging_groups() * span,
+            entries_per_req=1 + self.num_spec,
         )
 
     def allocate_per_req_cache(
