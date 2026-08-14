@@ -47,10 +47,10 @@ def merge_attn_states(
         prefix_head_stride,
         output_head_stride,
         output_scale,
+        prefill_tokens_with_context,
         head_size,
         padded_head_size,
         output_lse is not None,
-        prefill_tokens_with_context,
         output_scale is not None,
     )
 
@@ -66,10 +66,15 @@ def merge_attn_states_kernel(
     prefix_head_stride,
     output_head_stride,
     output_scale,  # scale tensor or None
+    # RUNTIME, not tl.constexpr. This is a per-batch token count, so as a
+    # constexpr it was baked into the artifact and every distinct batch size
+    # minted a fresh kernel -- 184 variants in one 8-minute agentic run, at
+    # ~42ms to compile against 0.022ms to execute. It feeds exactly one
+    # comparison below, which needs no compile-time value.
+    prefill_tokens_with_context,
     HEAD_SIZE: tl.constexpr,
     PADDED_HEAD_SIZE: tl.constexpr,
     OUTPUT_LSE: tl.constexpr,
-    prefill_tokens_with_context: tl.constexpr,
     USE_FP8: tl.constexpr,
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,

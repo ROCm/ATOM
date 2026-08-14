@@ -164,6 +164,14 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         `StateTransfer.none()` (default) — no per-request state, or none that can
         be handed over; the checkpoint index stays empty and prefix hits shrink
         to 0 for its models.
+
+        `fork` and `copy` each take a second and independent argument,
+        `readable_midstep`: can this backend snapshot a boundary *inside* a
+        forward, or only at the forward's last token? False, the default, makes
+        `BlockManager` shorten a prefill chunk onto every checkpoint position —
+        one forward per rung. True says those positions can be read out of
+        intermediates the kernel already materializes, so the chunk runs full
+        length and the backend owes `write_state_checkpoints` instead.
         """
         return StateTransfer.none()
 
