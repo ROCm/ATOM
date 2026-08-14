@@ -191,8 +191,14 @@ def state_offload_staging_groups() -> int:
     equality against "1": someone who exports `OFFLOAD_STATE=true` means to
     turn the tier on, and a silent 0 gives them a server that looks healthy
     and never spills.
+
+    Stripped, and empty reads as off -- for a default-off feature the
+    dangerous direction is the other one: `OFFLOAD_STATE=` (how a shell script
+    clears a flag inline) and `OFFLOAD_STATE="off "` both used to turn the
+    tier ON, spilling on a server whose operator had just written it off.
     """
-    if os.environ.get("OFFLOAD_STATE", "0").lower() in ("0", "false", "no", "off"):
+    raw_flag = os.environ.get("OFFLOAD_STATE", "0").strip().lower()
+    if not raw_flag or raw_flag in ("0", "false", "no", "off"):
         return 0
     raw = os.environ.get("OFFLOAD_STATE_STAGING_GROUPS")
     if raw is None:

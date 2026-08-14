@@ -257,8 +257,18 @@ def test_the_usual_spellings_of_on_turn_the_tier_on(monkeypatch, value):
     assert state_offload_staging_groups() == 1
 
 
-@pytest.mark.parametrize("value", ["0", "false", "no", "off", "OFF"])
+@pytest.mark.parametrize(
+    "value",
+    ["0", "false", "no", "off", "OFF", "", " ", "off ", " off", "\tOFF\n"],
+)
 def test_the_usual_spellings_of_off_keep_it_off(monkeypatch, value):
+    """Empty and padded spellings included, and they are the dangerous ones.
+
+    `OFFLOAD_STATE=` is how a shell script clears a flag inline, and a bare
+    `not in ("0", "false", ...)` test reads the empty string as ON. On a
+    default-off feature that fails in the wrong direction: the operator who
+    just wrote the flag off gets a server that spills.
+    """
     monkeypatch.setenv("OFFLOAD_STATE", value)
     monkeypatch.setenv("OFFLOAD_STATE_STAGING_GROUPS", "4")
     assert state_offload_staging_groups() == 0

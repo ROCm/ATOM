@@ -24,7 +24,12 @@ import torch
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
-    return os.environ.get(name, default).lower() not in ("0", "false", "no", "off")
+    # Strip, and read empty as off. `VAR=` is how a shell script clears a flag
+    # inline, and a bare `not in (...)` test reads the empty string as ON --
+    # the opposite of what the operator wrote. A stray trailing space in
+    # `VAR="off "` did the same.
+    raw = os.environ.get(name, default).strip().lower()
+    return bool(raw) and raw not in ("0", "false", "no", "off")
 
 
 def _env_int(name: str, default: int, *, min_value: int = 1) -> int:
@@ -61,10 +66,14 @@ def _env_optional_int(name: str, *, min_value: int = 1) -> int | None:
 class _StagingBuffer:
     """Device buffer plus the two events that gate the pipeline hand-off.
 
-    ``use_cuda`` creates the events here rather than letting a caller attach
-    them afterwards: the producer ``ready_event`` is what commit 7427e05e added
-    to fix KV corruption on reload, and a buffer that silently carries ``None``
-    events would make that protocol a no-op. Correct by construction.
+    Both events are *intra-worker*: they order this thread's ``pack_stream``
+    against its own ``copy_stream`` in ``_handoff``/``run_pipeline``. They are
+    NOT the cross-thread producer fence -- see `StagedTransfer`'s docstring for
+    where that lives and who owns it.
+
+    ``use_cuda`` creates them here rather than letting a caller attach them
+    afterwards, because a buffer silently carrying ``None`` events would make
+    the hand-off a no-op. Correct by construction.
     """
 
     def __init__(self, use_cuda: bool = False) -> None:
@@ -135,9 +144,16 @@ class StagedTransfer:
     constant, so a single object of a different size breaks both invariants.
     State is not a member of that loop.
 
-    The producer `cuda.Event` recorded on the RPC thread and `synchronize()`d
-    on the save worker is load-bearing — it is what commit 7427e05e added to
-    fix KV corruption on reload. Do not drop it from either caller.
+    **The cross-thread producer fence is the caller's, not this class's.**
+    Nothing here waits on the forward's compute stream: `pack` issues its
+    gather on a private `pack_stream`, and the two `_StagingBuffer` events only
+    order this worker's own streams against each other. The fence commit
+    7427e05e added to fix KV corruption on reload is recorded on the RPC thread
+    and `synchronize()`d by the caller -- `connector.py`'s `save_ready_event`
+    for KV, and `state_tier._do_spill`'s `ready_event.synchronize()` before
+    `codec.put` for state. Do not delete either believing this class covers it:
+    without them the gather reads the staging entry's previous occupant, which
+    is silent state corruption.
     """
 
     def __init__(
@@ -255,9 +271,11 @@ class StagedTransfer:
         `storage_manager.allocate` normally hands back *host* memory, and the
         packer requires a CUDA uint8 contiguous destination, so the general
         path packs into the bounded GPU staging buffer and D2H's from there.
-        The producer event around that copy is the same one commit 7427e05e
-        added to fix KV corruption on reload: whoever reads the MemoryObj next
-        must not see a copy that is still in flight.
+        The event around that copy makes the *consumer* side safe: whoever
+        reads the MemoryObj next must not see a D2H still in flight. It says
+        nothing about the *producer* side -- this gather runs on a private
+        stream and does not wait for the forward that wrote the entry. That
+        wait is the caller's (`state_tier._do_spill`); see the class docstring.
         """
         from atom.kv_transfer.offload.triton_kv_staging import fused_pack_chunk_major
 

@@ -2605,10 +2605,12 @@ class Scheduler:
                 if seq is not None:
                     self.block_manager.deallocate(seq)
 
-        # The state offload tier's two reports. Unlike everything above these
-        # are not keyed by request: by the time a spill lands, the request that
-        # owned the checkpoint is long gone and only the hash and the staging
-        # slot remain.
+        # The two state-offload reports the engine acts on. (The tier emits a
+        # third, `state_index_failed`; the aggregator consumes it to take
+        # quorum and never forwards it -- see `aggregator.py`.) Unlike
+        # everything above these are not keyed by request: by the time a spill
+        # lands, the request that owned the checkpoint is long gone and only
+        # the hash and the staging slot remain.
         offload = getattr(self.block_manager, "state_offload", None)
         if offload is not None:
             # Index before releasing, always. The reverse order opens a window

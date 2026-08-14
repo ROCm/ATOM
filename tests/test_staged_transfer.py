@@ -50,6 +50,29 @@ def test_release_is_a_no_op_by_default():
     assert buf.tensor is not None
 
 
+@pytest.mark.parametrize("value", ["", " ", "off ", " off", "0", "false", "no", "OFF"])
+def test_env_flag_reads_empty_and_padded_values_as_off(monkeypatch, value):
+    """`VAR=` must mean off, not on.
+
+    Clearing a flag inline (`OFFLOAD_RELEASE_GPU_STAGING_AFTER_TRANSFER=`) is
+    ordinary shell, and the original `not in ("0", "false", "no", "off")` test
+    read the empty string as ON -- the opposite of what was written. A stray
+    trailing space did the same.
+    """
+    from atom.kv_transfer.offload.staged_transfer import _env_flag
+
+    monkeypatch.setenv("ATOM_TEST_STAGED_FLAG", value)
+    assert _env_flag("ATOM_TEST_STAGED_FLAG") is False
+
+
+@pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on", " on "])
+def test_env_flag_still_reads_the_usual_on_spellings_as_on(monkeypatch, value):
+    from atom.kv_transfer.offload.staged_transfer import _env_flag
+
+    monkeypatch.setenv("ATOM_TEST_STAGED_FLAG", value)
+    assert _env_flag("ATOM_TEST_STAGED_FLAG") is True
+
+
 def test_memory_tensor_rejects_a_non_uint8_object():
     st = StagedTransfer(CPU, staging_buffer_bytes=1024)
 
@@ -166,10 +189,15 @@ def test_pack_refuses_an_entry_larger_than_the_bounded_staging_buffer():
 
 
 # ---------------------------------------------------------------------------
-# The producer-event protocol. Recorded stubs stand in for the CUDA streams and
-# events, so the record/wait/synchronize *ordering* -- the load-bearing part of
-# commit 7427e05e, and the part a skipped GPU test never covers -- is pinned on
-# CPU. Only the kernels and the real events need a GPU; the sequence does not.
+# The intra-worker stage hand-off. Recorded stubs stand in for the CUDA streams
+# and events, so the record/wait/synchronize *ordering* -- the part a skipped
+# GPU test never covers -- is pinned on CPU. Only the kernels and the real
+# events need a GPU; the sequence does not.
+#
+# Note this is NOT commit 7427e05e's fence. That one is recorded on the RPC
+# thread and synchronized by the caller (`connector.py`'s `save_ready_event`,
+# `state_tier._do_spill`'s `ready_event`); these events only order one worker
+# thread's pack_stream against its own copy_stream.
 # ---------------------------------------------------------------------------
 
 

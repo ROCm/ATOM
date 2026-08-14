@@ -68,14 +68,16 @@ class FakeStorageManager:
     """Mirrors the pinned LMCache StorageManager surface.
 
     `contains` returns an Optional[str] location, not a bool; `allocate`
-    returns None under memory pressure and raises on a format the real
-    `MixedMemoryAllocator` would refuse; `get` hands out a +1 reference the
-    caller must discharge. All four are load-bearing here.
+    returns None under memory pressure, raises on a format the real
+    `MixedMemoryAllocator` would refuse, and takes the `busy_loop` a store
+    must not leave defaulted; `get` hands out a +1 reference the caller must
+    discharge. All of them are load-bearing here.
     """
 
     def __init__(self, out_of_memory=False):
         self.store = {}
         self.puts = []
+        self.busy_loops = []
         self.out_of_memory = out_of_memory
 
     def contains(self, key, search_range=None, pin=False):
@@ -97,6 +99,15 @@ class FakeStorageManager:
     def allocate(self, shapes, dtypes, fmt=None, eviction=True, busy_loop=True):
         if fmt not in _allocatable_formats():
             raise ValueError(f"Unsupported memory format: {fmt}")
+        # Real LMCache accepts either value; we refuse True so that *every*
+        # test that reaches a spill is a detector for it. See the assert's
+        # message and `test_a_spill_never_waits_for_lmcache_to_find_room`.
+        assert busy_loop is False, (
+            "the state tier's spill is a store, and a store must pass "
+            "busy_loop=False -- LocalCPUBackend.allocate spins `while True` on "
+            "0.1s sleeps under the default"
+        )
+        self.busy_loops.append(busy_loop)
         if self.out_of_memory:
             return None
         return FakeMemoryObj(shapes, dtypes, fmt)
@@ -177,6 +188,24 @@ def test_put_allocates_under_a_format_the_lmcache_allocator_accepts():
     c = codec()
     c.put(1234, entry_index=2)
     assert c._storage.store[c.key(1234)].fmt is MemoryFormat.KV_2LTD
+
+
+def test_a_spill_never_waits_for_lmcache_to_find_room():
+    """A store must pass `busy_loop=False`, which is not LMCache's default.
+
+    `LocalCPUBackend.allocate`'s own docstring says busy_loop "should only be
+    used for retrieve" because "many stores happen concurrently (if they
+    busy_loop, deadlock happens)". Under the default, a pool with no eviction
+    candidate loops `while True` on 0.1s sleeps with no attempt bound: it never
+    returns the None `put` is written to handle, and instead hangs the state
+    tier's save worker for as long as CPU memory stays full.
+
+    Stated here as well as in the fake's assert so that deleting one still
+    leaves a detector.
+    """
+    c = codec()
+    c.put(1234, entry_index=2)
+    assert c._storage.busy_loops == [False]
 
 
 def test_get_on_a_miss_is_false_and_moves_nothing():

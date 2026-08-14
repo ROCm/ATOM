@@ -98,9 +98,11 @@ class StateByteCodec:
     def put(self, h: int, entry_index: int) -> bool:
         """Spill one entry. Returns False when nothing was stored.
 
-        A refusal is not an error: `allocate` returns None under memory
-        pressure, and spilling is best-effort by design -- the pool already
-        counted the eviction either way, so the cost is one later prefix miss.
+        A refusal is not an error: `_allocate` returns None when LMCache is
+        under memory pressure with nothing evictable, and spilling is
+        best-effort by design -- the pool already counted the eviction either
+        way, so the cost is one later prefix miss. Returning promptly is the
+        whole point; see `_allocate` on why it must not wait for room.
         """
         if self._storage is None:
             return False
@@ -156,6 +158,19 @@ class StateByteCodec:
         # force a flat opaque blob regardless of `fmt`, so the value is inert
         # apart from passing that check -- same reasoning as the KV path's
         # `self._engine.fmt = MemoryFormat.KV_2LTD` in connector.py.
+        # `busy_loop=False` because this is a *store*. LMCache's own
+        # `LocalCPUBackend.allocate` docstring is explicit that busy_loop "should
+        # only be used for retrieve", since "many stores happen concurrently (if
+        # they busy_loop, deadlock happens)". Its default is True, and under that
+        # default a pool with no eviction candidate spins `while True` on 0.1s
+        # sleeps with no attempt bound -- so it would never return the None this
+        # method's caller is written to handle, and would instead hang the state
+        # tier's save worker for as long as CPU memory stays full. LMCache's own
+        # store paths pass False here for the same reason (`cache_engine.py:666`,
+        # `local_disk_backend.py:468`, `storage_manager.py:96`).
         return self._storage.allocate(
-            torch.Size([nbytes]), torch.uint8, fmt=MemoryFormat.KV_2LTD
+            torch.Size([nbytes]),
+            torch.uint8,
+            fmt=MemoryFormat.KV_2LTD,
+            busy_loop=False,
         )

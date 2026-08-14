@@ -454,9 +454,11 @@ def test_lmcache_connector_staged_pipeline_really_reaches_staged_transfer(monkey
     that delegate — so it never exercises `StagedTransfer.run_pipeline` at all.
     This test leaves every delegating method intact and instead seeds the
     thread-local state *inside* `StagedTransfer`, so a delegation that is
-    removed, inlined, or misrouted fails here. It also pins the producer-event
-    order (record ready -> stage_b waits on it -> record free), which is what
-    commit 7427e05e added to fix KV corruption on reload.
+    removed, inlined, or misrouted fails here. It also pins the intra-worker
+    stage hand-off order (record ready -> stage_b waits on it -> record free).
+    That is not commit 7427e05e's fence, which lives on the caller side
+    (`save_ready_event`); these events order one worker thread's pack_stream
+    against its own copy_stream.
     """
     from contextlib import nullcontext
 

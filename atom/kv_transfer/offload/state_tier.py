@@ -8,10 +8,16 @@ and must never queue behind a backlog of fire-and-forget spills.
 
 On the spill path this class **reports, and the engine applies**. It runs in a
 spawned runner process; `StateOffloadIndex` lives in the engine process, so
-this side cannot free a staging slot or index a hash directly. `take_spill_reports`
-hands both sets to `LMCacheOffloadConnector.get_finished`, which puts them on
-`KVConnectorOutput` for the engine to apply in
-`Scheduler._update_from_kv_xfer_finished`.
+this side cannot free a staging slot or index a hash directly.
+`take_spill_reports` hands three sets to `LMCacheOffloadConnector.get_finished`,
+which puts them on `KVConnectorOutput`.
+
+Only two of the three reach the engine. `KVOutputAggregator` takes quorum on
+`state_indexed | state_index_failed` and then drops the failures, so
+`Scheduler._update_from_kv_xfer_finished` applies `state_indexed` and
+`state_staging_released` only. The third set exists to resolve the quorum, not
+to be acted on: without it a partial store (some ranks stored, some failed)
+would pin the hash in the aggregator forever.
 """
 
 import logging
