@@ -304,7 +304,7 @@ def scale_cpu_size_for_pp(cfg, config) -> None:
     scaled = configured * pp_size * local_layers / total_layers
     try:
         cfg.max_local_cpu_size = scaled
-    except Exception:
+    except AttributeError:
         return
     logger.info(
         "LMCache CPU budget for PP stage %d/%d: %.2fGB -> %.2fGB "
