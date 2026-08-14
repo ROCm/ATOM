@@ -111,6 +111,12 @@ class BlockManager:
         self.state_checkpoint_interval_tokens = max(
             -1, int(getattr(config, "state_checkpoint_interval_tokens", 0) or 0)
         )
+        # Independent of the interval, because the demand rung is not part of
+        # the grid: it is the one placement a *refused* hit makes for itself.
+        # See `_record_checkpoint_demand` for what turning it off is testing.
+        self.state_checkpoint_demand = bool(
+            getattr(config, "state_checkpoint_demand", True)
+        )
         # The rolling state class: per-request groups plus a content index over
         # the free ones. A checkpoint IS a free group whose content is still
         # valid, so it holds no capacity of its own and never blocks admission.
@@ -660,6 +666,15 @@ class BlockManager:
         and none collects. What bounds that is convergence rather than a
         threshold: found once, filled once, gone. `chunks_cut_for_demand`
         against `demands_recorded` is where it would show if it did not.
+
+        `--no-state-checkpoint-demand` drops the rung and leaves the prompt-end
+        anchor alone. Worth measuring because on the cc-traces a demand is 47%
+        of checkpoint writes and reads back 2.8% of the time, against 85.2% for
+        an anchor — so most of the write traffic buys almost nothing, and each
+        write evicts something. Whether *removing* those writes beats merely
+        demoting them (`StateGroupPool.mark_speculative`) is the open question:
+        the CPU replay scores the two identically, which is the signature of a
+        harness that models eviction order but not the cost of the write.
         """
         wanted = (
             self._gated_hit(seq, compressed_hit, block_hashes, assume_checkpointed=True)
@@ -674,7 +689,9 @@ class BlockManager:
         interval_on = self.state_checkpoint_interval_tokens != 0
         previously_demanded = seq.checkpoint_demand_pos
         seq.checkpoint_demand_pos = (
-            wanted * self.hash_block_size if interval_on and wanted > hit else 0
+            wanted * self.hash_block_size
+            if interval_on and self.state_checkpoint_demand and wanted > hit
+            else 0
         )
         # `can_allocate` re-runs for a sequence the queue keeps deferring, so
         # count the demand when it first appears rather than once per attempt —

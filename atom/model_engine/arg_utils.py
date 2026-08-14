@@ -52,6 +52,7 @@ class EngineArgs:
     attn_prefill_chunk_size: int = 16384
     state_checkpoint_interval_tokens: int = 8192
     state_checkpoint_groups: int = 0
+    state_checkpoint_demand: bool = True
     enable_chunked_prefill: bool = True
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
@@ -363,6 +364,19 @@ class EngineArgs:
                 "traffic that reuses prefixes. 0 keeps the old coupling. "
                 "Costs the model's per-request state bytes per group, taken "
                 "out of the paged KV pool."
+            ),
+        )
+        parser.add_argument(
+            "--state-checkpoint-demand",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help=(
+                "Let a hit that was refused for want of a checkpoint place a "
+                "rung of its own. --no-state-checkpoint-demand leaves the "
+                "prompt-end anchor as the only placement. On measured traces a "
+                "demand is 47% of all checkpoint writes but reads back 2.8% of "
+                "the time, against 85.2% for an anchor, so the rung's write "
+                "traffic may cost more in evictions than its reuse is worth."
             ),
         )
         parser.add_argument(

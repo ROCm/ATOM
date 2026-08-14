@@ -1431,6 +1431,26 @@ class TestDemandDrivenCheckpoints:
         assert 28 % INTERVAL
         assert bm.checkpoint_limit(second) == 32
 
+    def test_the_rung_can_be_switched_off_without_the_grid(self):
+        """`--no-state-checkpoint-demand` drops the rung, nothing else.
+
+        The refusal is still measured — `num_wanted_hit_blocks` is what
+        `CacheStats` splits declined reuse by, and turning the placement off
+        must not blind that. What goes is only the placement, leaving the grid
+        and this prompt's own anchor to carry the checkpoints.
+        """
+        bm = BlockManager(demand_config(state_checkpoint_demand=False))
+        run_prompt_on_the_ladder(bm, stateful_seq(PROMPT))
+
+        second = stateful_seq(BRANCH)
+        bm.allocate(second, bm.can_allocate(second))
+        assert second.num_cached_tokens == 0
+        assert second.num_wanted_hit_blocks == 7  # still measured...
+        assert second.checkpoint_demand_pos == 0  # ...but no longer placed
+        assert bm.demands_recorded == 0
+        # 28 is the demand's rung and it is gone; the grid and anchor remain.
+        assert forward_on_the_ladder(bm, second) == [32, 36]
+
     def test_the_third_request_finds_what_the_second_was_missing(self):
         """Self-limiting: nothing to want, want it once, want nothing again."""
         bm = BlockManager(demand_config())
