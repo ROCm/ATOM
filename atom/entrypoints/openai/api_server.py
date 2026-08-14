@@ -26,11 +26,11 @@ import uuid
 from asyncio import AbstractEventLoop
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import Any, Optional
+from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from PIL import Image
 from transformers import AutoProcessor, AutoTokenizer
 
@@ -43,6 +43,7 @@ from atom.utils import envs
 from atom.utils.arg_parser import FlexibleArgumentParser
 
 from .chat_encoders import apply_chat_template, load_custom_message_encoder
+from .metrics import AtomMetricsExporter
 from .protocol import (
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_K,
@@ -110,6 +111,9 @@ _stream_loops: dict[str, AbstractEventLoop] = {}
 _request_start_times: dict[str, float] = {}
 _request_logger: logging.Logger | None = None
 _stream_batch_dispatcher: StreamBatchDispatcher | None = None
+_metrics_exporter = AtomMetricsExporter()
+_metrics_refresh_task: asyncio.Task | None = None
+_METRICS_REFRESH_INTERVAL_SECONDS = 5.0
 
 
 # ============================================================================
@@ -169,7 +173,7 @@ def _build_sampling_params(
     )
 
 
-def _coerce_n(requested_n: Optional[int], temperature: Optional[float]) -> int:
+def _coerce_n(requested_n: int | None, temperature: float | None) -> int:
     """Return an effective ``n`` for a request.
 
     * ``None``/``<1`` coerce to ``1`` (matches OpenAI default).
@@ -183,8 +187,7 @@ def _coerce_n(requested_n: Optional[int], temperature: Optional[float]) -> int:
         n = int(n)
     except (TypeError, ValueError):
         n = 1
-    if n < 1:
-        n = 1
+    n = max(n, 1)
     if n > 1 and (temperature is None or temperature <= 0.0):
         logger.info(
             "n=%s requested with temperature=%s; collapsing to n=1 because "
@@ -199,7 +202,7 @@ def _coerce_n(requested_n: Optional[int], temperature: Optional[float]) -> int:
 def _validate_context_length(
     num_prompt_tokens: int,
     max_tokens: int,
-    max_model_len: Optional[int],
+    max_model_len: int | None,
 ) -> None:
     if max_model_len is None:
         return
@@ -262,8 +265,7 @@ def _load_image_from_url(url: str) -> Image.Image:
             image_bytes = response.read()
         return Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
-    if url.startswith("file://"):
-        url = url[len("file://") :]
+    url = url.removeprefix("file://")
     return Image.open(url).convert("RGB")
 
 
@@ -501,14 +503,10 @@ async def generate_async(
             sampling_params,
             stream_callback=completion_callback,
             kv_transfer_params=kv_transfer_params,
+            data_parallel_rank=data_parallel_rank,
         )
 
     seq = await loop.run_in_executor(None, do_preprocess)
-    if data_parallel_rank is not None:
-        seq.data_parallel_rank = data_parallel_rank
-        logger.info(
-            "Request %s pinned to data_parallel_rank=%s", seq.id, data_parallel_rank
-        )
     try:
         _validate_sequence_context_length(seq)
     except Exception:
@@ -584,6 +582,7 @@ async def generate_async_multimodal(
     multimodal_data: dict[str, Any],
     sampling_params: SamplingParams,
     request_id: str,
+    data_parallel_rank: int | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Generate text asynchronously for one multimodal request."""
     token_queue: asyncio.Queue = asyncio.Queue()
@@ -614,6 +613,7 @@ async def generate_async_multimodal(
             sampling_params,
             stream_callback=completion_callback,
             multimodal_data=multimodal_data,
+            data_parallel_rank=data_parallel_rank,
         )
 
     seq = await loop.run_in_executor(None, do_preprocess)
@@ -731,18 +731,10 @@ async def generate_async_fanout(
             kv_transfer_params=kv_transfer_params,
             multimodal_data=multimodal_data,
             parent_request_id=request_id,
+            data_parallel_rank=data_parallel_rank,
         )
 
     seqs = await loop.run_in_executor(None, do_preprocess)
-    if data_parallel_rank is not None:
-        for seq in seqs:
-            seq.data_parallel_rank = data_parallel_rank
-        logger.info(
-            "Request %s fanout pinned %d sequence(s) to data_parallel_rank=%s",
-            request_id,
-            len(seqs),
-            data_parallel_rank,
-        )
     try:
         _validate_sequence_context_length(seqs[0])
     except Exception:
@@ -809,7 +801,7 @@ async def generate_async_fanout(
     return outputs
 
 
-def validate_model(requested_model: Optional[str]) -> None:
+def validate_model(requested_model: str | None) -> None:
     """Validate that the requested model matches the server's model."""
     if requested_model is None:
         return
@@ -830,6 +822,7 @@ async def setup_streaming_request(
     request_id: str,
     kv_transfer_params: dict[str, Any] | None = None,
     multimodal_data: dict[str, Any] | None = None,
+    data_parallel_rank: int | None = None,
 ) -> tuple[int, asyncio.Queue, int]:
     """Set up a streaming request with the engine.
 
@@ -858,6 +851,7 @@ async def setup_streaming_request(
             stream_callback=stream_callback,
             kv_transfer_params=kv_transfer_params,
             multimodal_data=multimodal_data,
+            data_parallel_rank=data_parallel_rank,
         )
         _seq_id_to_request_id[seq.id] = request_id
         return seq
@@ -1018,6 +1012,7 @@ async def setup_streaming_request_fanout(
     request_id: str,
     kv_transfer_params: dict[str, Any] | None = None,
     multimodal_data: dict[str, Any] | None = None,
+    data_parallel_rank: int | None = None,
 ) -> tuple[list[int], asyncio.Queue, int]:
     """Fan-out variant of :func:`setup_streaming_request`.
 
@@ -1061,6 +1056,7 @@ async def setup_streaming_request_fanout(
             kv_transfer_params=kv_transfer_params,
             multimodal_data=multimodal_data,
             parent_request_id=request_id,
+            data_parallel_rank=data_parallel_rank,
         )
         for seq in seqs:
             _seq_id_to_request_id[seq.id] = request_id
@@ -1119,15 +1115,48 @@ def _tune_gc() -> None:
         logger.warning("[gc] bad ATOM_GC_THRESHOLD=%r, ignored", thresholds)
 
 
+async def _refresh_metrics_once() -> None:
+    if engine is None:
+        return
+    try:
+        timeout = _METRICS_REFRESH_INTERVAL_SECONDS
+        snapshot = await asyncio.to_thread(engine.get_metrics_statistics, timeout)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _metrics_exporter.record_refresh_error()
+        logger.warning("Failed to refresh Prometheus metrics", exc_info=True)
+    else:
+        _metrics_exporter.update(snapshot)
+
+
+async def _metrics_refresh_loop() -> None:
+    while True:
+        await asyncio.sleep(_METRICS_REFRESH_INTERVAL_SECONDS)
+        await _refresh_metrics_once()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown."""
+    global _metrics_refresh_task
     logger.info("Server started successfully and ready to accept requests")
     _tune_gc()
-    yield
-    logger.info("Server shutting down, releasing resources...")
-    if engine is not None:
-        engine.close()
+    await _refresh_metrics_once()
+    _metrics_refresh_task = asyncio.create_task(_metrics_refresh_loop())
+    try:
+        yield
+    finally:
+        if _metrics_refresh_task is not None:
+            _metrics_refresh_task.cancel()
+            try:
+                await _metrics_refresh_task
+            except asyncio.CancelledError:
+                pass
+            _metrics_refresh_task = None
+        logger.info("Server shutting down, releasing resources...")
+        if engine is not None:
+            engine.close()
 
 
 app = FastAPI(title="ATOM OpenAI API Server", lifespan=lifespan)
@@ -1208,6 +1237,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         )
 
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
+        dp_rank = request.data_parallel_rank
 
         _log_request_event("request", request_id, request.model_dump())
 
@@ -1256,6 +1286,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                         request_id,
                         multimodal_data=stream_multimodal_data,
                         kv_transfer_params=request.kv_transfer_params,
+                        data_parallel_rank=dp_rank,
                     )
                 )
                 gen = stream_chat_response_fanout(
@@ -1274,6 +1305,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     request_id,
                     multimodal_data=stream_multimodal_data,
                     kv_transfer_params=request.kv_transfer_params,
+                    data_parallel_rank=dp_rank,
                 )
                 gen = stream_chat_response(
                     request_id,
@@ -1300,6 +1332,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     request_id,
                     multimodal_data=multimodal_data,
                     kv_transfer_params=request.kv_transfer_params,
+                    data_parallel_rank=dp_rank,
                 ),
                 raw_request,
                 request_id,
@@ -1320,6 +1353,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     multimodal_data,
                     sampling_params,
                     request_id,
+                    data_parallel_rank=dp_rank,
                 ),
                 raw_request,
                 request_id,
@@ -1341,6 +1375,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     sampling_params,
                     request_id,
                     kv_transfer_params=request.kv_transfer_params,
+                    data_parallel_rank=dp_rank,
                 ),
                 raw_request,
                 request_id,
@@ -1361,6 +1396,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     sampling_params,
                     request_id,
                     kv_transfer_params=request.kv_transfer_params,
+                    data_parallel_rank=dp_rank,
                 ),
                 raw_request,
                 request_id,
@@ -1409,6 +1445,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
         )
 
         request_id = f"cmpl-{uuid.uuid4().hex}"
+        dp_rank = request.data_parallel_rank
 
         _log_request_event("request", request_id, request.model_dump())
 
@@ -1421,6 +1458,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
                         sampling_params,
                         request_id,
                         kv_transfer_params=request.kv_transfer_params,
+                        data_parallel_rank=dp_rank,
                     )
                 )
                 gen = stream_completion_response_fanout(
@@ -1437,6 +1475,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
                     sampling_params,
                     request_id,
                     kv_transfer_params=request.kv_transfer_params,
+                    data_parallel_rank=dp_rank,
                 )
                 gen = stream_completion_response(
                     request_id,
@@ -1558,7 +1597,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
             lambda: engine.config.max_model_len,
             lambda: engine.model_config.max_model_len,
             lambda: engine.scheduler.max_model_len,
-            lambda: getattr(engine, "max_model_len"),
+            lambda: engine.max_model_len,
         ):
             try:
                 _v = _path()
@@ -1819,6 +1858,15 @@ async def health():
     return {"status": "ok"}
 
 
+@app.api_route("/metrics", methods=["GET", "HEAD"], include_in_schema=False)
+async def metrics():
+    """Expose cached standalone-engine metrics in Prometheus text format."""
+    return Response(
+        content=_metrics_exporter.render(),
+        headers={"Content-Type": _metrics_exporter.content_type},
+    )
+
+
 @app.get("/debug/mtp_stats")
 async def get_mtp_stats():
     """Return current speculative decoding acceptance statistics."""
@@ -1880,6 +1928,23 @@ async def kv_transfer_info():
         "dp_size": cfg.parallel_config.data_parallel_size,
         "kv_role": kv_role,
         "handshake_port": handshake_port,
+    }
+
+
+@app.get("/server_info")
+async def server_info():
+    """Server metadata for the Atomesh router.
+
+    The router's dp-aware discovery reads ``dp_size`` here to expand the
+    per-DP-rank worker set and enable cache-aware routing to the rank that
+    holds a request's prefix.
+    """
+    cfg = engine.config
+    return {
+        "model_id": model_name,
+        "served_model_name": model_name,
+        "tp_size": cfg.tensor_parallel_size,
+        "dp_size": cfg.parallel_config.data_parallel_size,
     }
 
 
