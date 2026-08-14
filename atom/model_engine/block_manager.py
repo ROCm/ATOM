@@ -142,6 +142,9 @@ class BlockManager:
         # Kept plural because GDN's recurrent state is a second member the
         # moment it stops forking (see the state-cache protocol).
         self.state_caches: tuple[StateCache, ...] = (self.state,)
+        # Class names already warned about in `state_checkpoint_fates`. See
+        # there for why the warning latches.
+        self._warned_no_checkpoint_fates: set[str] = set()
 
         from atom.model_engine.state_offload import (
             StateOffloadIndex,
@@ -289,16 +292,26 @@ class BlockManager:
         without a matching change in this method.  Classes that do not expose
         ``checkpoint_fates`` are skipped, but a warning is emitted so the
         omission is visible rather than silently under-counting the totals.
+
+        That warning is latched per class. The caller is the scheduler's every-
+        100-ticks stats line and `self.state_caches` does not change during a
+        run, so an unlatched warning is the same line forever -- and the thing
+        it is trying to report is a static property of the build, true on the
+        first tick and no truer on the ten-thousandth.
         """
         totals: dict[str, int] = {}
         for cache in self.state_caches:
             fates_fn = getattr(cache, "checkpoint_fates", None)
             if fates_fn is None:
-                logger.warning(
-                    "state_checkpoint_fates: %s does not implement "
-                    "checkpoint_fates(); its counters are excluded from totals",
-                    type(cache).__name__,
-                )
+                name = type(cache).__name__
+                if name not in self._warned_no_checkpoint_fates:
+                    self._warned_no_checkpoint_fates.add(name)
+                    logger.warning(
+                        "state_checkpoint_fates: %s does not implement "
+                        "checkpoint_fates(); its counters are excluded from "
+                        "totals",
+                        name,
+                    )
                 continue
             for k, v in fates_fn().items():
                 totals[k] = totals.get(k, 0) + v

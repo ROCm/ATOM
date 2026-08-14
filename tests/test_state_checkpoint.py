@@ -1585,6 +1585,26 @@ def test_state_checkpoint_fates_warns_on_missing_method(caplog):
     )
 
 
+def test_state_checkpoint_fates_warns_once_per_class(caplog):
+    """The caller is the scheduler's every-100-ticks stats line and
+    `state_caches` never changes during a run, so an unlatched warning is the
+    same line forever -- drowning the log it is trying to draw attention to.
+    What it reports is a static property of the build: true on tick 1, no
+    truer on tick 10000.
+    """
+    import logging
+
+    bm = BlockManager(ckpt_config())
+    bm.state_caches = (bm.state_caches[0], StubStateCache())
+
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        for _ in range(5):
+            bm.state_checkpoint_fates()
+
+    hits = [r for r in caplog.records if "StubStateCache" in r.message]
+    assert len(hits) == 1, [r.message for r in hits]
+
+
 def test_state_checkpoint_fates_log_order_is_stable(caplog):
     """The periodic log line emitted by `Scheduler.schedule()` sorts its keys.
 
