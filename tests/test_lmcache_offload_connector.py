@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 try:
-    import torch  # noqa: F401
+    import torch
 except ModuleNotFoundError:
     sys.modules["torch"] = types.ModuleType("torch")
 
