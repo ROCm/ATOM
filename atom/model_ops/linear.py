@@ -81,6 +81,14 @@ if use_triton_gemm():
         logger.warning(f"Triton w8a8 blockscale GEMM not available: {e}")
         gemm_a8w8_blockscale_triton = None
 
+    try:
+        from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
+            gemm_a8w8_blockscale_preshuffle as gemm_a8w8_blockscale_bpreshuffle_triton,
+        )  # noqa: E402
+    except ImportError as e:
+        logger.warning(f"Triton w8a8 GEMM not available: {e}")
+        gemm_a8w8_blockscale_bpreshuffle_triton = None
+        
     # Per-tensor / per-token a8w8 (per-row activation x per-column weight scale).
     try:
         from aiter.ops.triton.gemm.basic.gemm_a8w8 import (
@@ -92,6 +100,7 @@ if use_triton_gemm():
 else:
     gemm_afp4wfp4_preshuffle = None
     gemm_a8w8_blockscale_triton = None
+    gemm_a8w8_blockscale_bpreshuffle_triton = None
     gemm_a8w8_triton = None
 from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE  # noqa
 
@@ -270,8 +279,14 @@ def gemm_a8w8_blockscale_preshuffle_impl(
     dtype: torch.dtype = torch.bfloat16,
     prefix: str = "",
 ) -> torch.Tensor:
-    return gemm_a8w8_blockscale_bpreshuffle(x, weight, x_scale, w_scale, dtype)
-
+    if gemm_a8w8_blockscale_bpreshuffle_triton is not None:
+        weight_shuffled = weight.reshape(weight.shape[0] // 16, weight.shape[1] * 16)
+        y = gemm_a8w8_blockscale_bpreshuffle_triton(
+            x, weight_shuffled, x_scale, w_scale, dtype
+        )
+    else:
+        y = gemm_a8w8_blockscale_bpreshuffle(x, weight, x_scale, w_scale, dtype)
+    return y
 
 def gemm_a8w8_blockscale_triton_fake(
     x: torch.Tensor,
