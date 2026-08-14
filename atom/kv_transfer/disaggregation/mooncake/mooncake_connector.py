@@ -382,14 +382,10 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             params["do_remote_prefill"] = False
             params["local_slot_index"] = slot_index
             # PD incremental: skip leading blocks already in the decode node's
-            # prefix cache. Stateful backends (SWA / per-request cache) fall
-            # back to full transfer — block-only delta cannot cover their state.
+            # prefix cache. Per-request state (including the SWA ring slot) is
+            # not covered by a block-only delta, so it takes a full transfer.
             num_computed_blocks = 0
-            if (
-                not getattr(seq, "swa_block_table", None)
-                and not getattr(seq, "has_per_req_cache", False)
-                and self.block_size > 0
-            ):
+            if not seq.has_per_req_cache and self.block_size > 0:
                 num_computed_blocks = seq.num_cached_tokens // self.block_size
             params["num_computed_blocks"] = num_computed_blocks
             logger.info(
