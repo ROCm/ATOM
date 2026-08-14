@@ -76,8 +76,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # gemm2-fused EP combine (v2 combine_mode="scatter_fused"): the a8w4 grouped
     # gemm2 epilogue P2P-writes its weighted per-(token,k) results straight into
     # the peers' combine staging, so combine only barriers + sums. Requires the
-    # aiter-vendored v2 op-layer and the a8w4 (fp8 act + mxfp4 weight) path;
-    # ignored unless ATOM_MORI_V2 is on.
+    # a8w4 (fp8 act + mxfp4 weight) path; ignored unless ATOM_MORI_V2 is on.
+    # This also selects which of the two v2 op-layer copies is bound: 1 takes
+    # aiter's vendored one (the only one with the fused combine), 0 takes mori's
+    # own copy running plain gather, i.e. the untouched upstream baseline.
     "ATOM_MORI_V2_FUSED": lambda: os.getenv("ATOM_MORI_V2_FUSED", "0") == "1",
     "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
     # --- Kernel Fusion Toggles ---
