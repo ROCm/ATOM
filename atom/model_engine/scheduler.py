@@ -1194,6 +1194,21 @@ class Scheduler:
                 self._assert_positive_prefill_chunk(
                     chunk, num_new_tokens, budget_remaining
                 )
+                # This branch `continue`s past both assignments further down,
+                # so the refresh has to happen here too. `_mark_offload_load_
+                # ready` raised `num_cached_tokens` from the pre-park HBM-only
+                # hit to the post-load one -- the entire point of having
+                # parked -- and `_schedule_prefill_seq` feeds CacheStats that
+                # fresh value. Leaving the field stale makes the two disagree
+                # about one request, and the stale one is what reaches the API
+                # as `prompt_tokens_details.cached_tokens`: the offload tier
+                # would look like it returned nothing. Unconditional for the
+                # same reason as the second site below -- a seq re-admitted
+                # after `preempt()` keeps this field -- and no PD decode
+                # consumer reaches this branch to have its inherited hit
+                # clobbered, since `_is_offload_prefill_resume` requires the
+                # offload connector's own load flags.
+                seq.prefix_cache_hit_tokens = seq.num_cached_tokens
                 num_seqs_prefill, num_batched_tokens = self._schedule_prefill_seq(
                     seq,
                     chunk,

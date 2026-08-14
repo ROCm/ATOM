@@ -4,6 +4,7 @@ import sys
 import types
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 
@@ -54,13 +55,45 @@ def _install_forward_context_stubs():
     sys.modules["atom.utils.forward_context"] = utils_forward_context
 
 
-_install_forward_context_stubs()
+_STUBBED = (
+    "atom.model_ops.attention_gdn",
+    "atom.model_ops.paged_attention",
+    "atom.model_ops.attentions.gdn_attn",
+    "atom.plugin.attention",
+    "atom.utils.forward_context",
+)
+_REAL_MODULES = {n: sys.modules[n] for n in _STUBBED if n in sys.modules}
 
-from atom.plugin.rtpllm.utils.forward_context import (  # noqa: E402
+_install_forward_context_stubs()
+_STUB_MODULES = {n: sys.modules[n] for n in _STUBBED if n in sys.modules}
+
+
+def _restore(mapping):
+    for name in _STUBBED:
+        sys.modules.pop(name, None)
+    sys.modules.update(mapping)
+
+
+from atom.plugin.rtpllm.utils.forward_context import (
     RTPForwardContext,
     RTPForwardMLAContext,
     RTPForwardQwen35HybridContext,
 )
+
+# The import above must happen with the stubs live -- that is what they exist
+# for. Leaving them in `sys.modules` afterwards is the problem: every later
+# test file that imports the real `atom.utils.forward_context` gets the stub
+# instead, which under the full suite is ~50 failures in `test_scheduler.py`
+# alone plus three collection errors. So put the real modules back now, and
+# re-install the stubs around this file's own tests only.
+_restore(_REAL_MODULES)
+
+
+@pytest.fixture(autouse=True)
+def _forward_context_stubs():
+    _restore(_STUB_MODULES)
+    yield
+    _restore(_REAL_MODULES)
 
 
 def _make_attn_inputs(
