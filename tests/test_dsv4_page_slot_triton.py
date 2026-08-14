@@ -82,12 +82,14 @@ def _region(
     *,
     reverse_indexed: bool,
     padding_bytes: int = 0,
+    semantic_role: str | None = None,
 ) -> KVTransferRegion:
     return KVTransferRegion(
         base_addr=base_addr,
         total_bytes=unit_bytes * item_count + padding_bytes,
         unit_bytes=unit_bytes,
         reverse_indexed=reverse_indexed,
+        semantic_role=semantic_role,
     )
 
 
@@ -96,7 +98,15 @@ def _cuda_contract_codec() -> DSV4PageSlotCodec:
     # monkeypatched below, so this remains a CPU-only orchestration test.
     return DSV4PageSlotCodec(
         [_region(1_000, 4, 4, reverse_indexed=False)],
-        [_region(2_000, 6, 3, reverse_indexed=True)],
+        [
+            _region(
+                2_000,
+                6,
+                3,
+                reverse_indexed=True,
+                semantic_role="dsv4.main_kv.nope",
+            )
+        ],
         num_blocks=4,
         num_slots=3,
         device="cuda",
@@ -115,16 +125,20 @@ class _NoOwnershipStream:
 
 @pytest.mark.parametrize(
     ("method_name", "wrapper_name"),
-    [("gather", "gather_region_items"), ("scatter", "scatter_region_items")],
+    [
+        ("gather", "_gather_region_items_unchecked"),
+        ("scatter", "_scatter_region_items_unchecked"),
+    ],
 )
-def test_checkpoint_plan_launches_page_then_slot_on_the_same_caller_stream(
+def test_page_and_slot_plans_launch_on_the_same_caller_stream(
     monkeypatch,
     method_name: str,
     wrapper_name: str,
 ):
     triton_page_slot = _install_contract_module(monkeypatch)
     codec = _cuda_contract_codec()
-    plan = codec.checkpoint_plan([2, 0], 1, buffer_offset=7)
+    page_plan = codec.page_plan([2, 0], buffer_offset=7)
+    slot_plan = codec.slot_plan(1, buffer_offset=page_plan.required_buffer_bytes)
     stream = _NoOwnershipStream()
     buffer = object()
     page_device_plan = object()
@@ -166,18 +180,22 @@ def test_checkpoint_plan_launches_page_then_slot_on_the_same_caller_stream(
     monkeypatch.setattr(codec, "_region_plan", region_plan)
     monkeypatch.setattr(triton_page_slot, wrapper_name, launch)
     other_wrapper = (
-        "scatter_region_items"
-        if wrapper_name == "gather_region_items"
-        else "gather_region_items"
+        "_scatter_region_items_unchecked"
+        if wrapper_name == "_gather_region_items_unchecked"
+        else "_gather_region_items_unchecked"
     )
     monkeypatch.setattr(triton_page_slot, other_wrapper, forbidden)
+    monkeypatch.setattr(triton_page_slot, "gather_region_items", forbidden)
+    monkeypatch.setattr(triton_page_slot, "scatter_region_items", forbidden)
     monkeypatch.setattr(torch.cuda, "synchronize", forbidden)
     monkeypatch.setattr(torch.cuda, "Event", forbidden)
 
     if method_name == "gather":
-        codec.gather(plan, buffer, stream=stream)
+        codec.gather(page_plan, buffer, stream=stream)
+        codec.gather(slot_plan, buffer, stream=stream)
     else:
-        codec.scatter(buffer, plan, stream=stream)
+        codec.scatter(buffer, page_plan, stream=stream)
+        codec.scatter(buffer, slot_plan, stream=stream)
 
     assert calls == [
         ("plan", DSV4PayloadKind.PAGE, stream),
@@ -185,6 +203,25 @@ def test_checkpoint_plan_launches_page_then_slot_on_the_same_caller_stream(
         ("plan", DSV4PayloadKind.SLOT, stream),
         (wrapper_name, slot_device_plan, (1,), buffer, 15, stream),
     ]
+
+
+def test_codec_rejects_cross_device_stream_before_unchecked_launch(monkeypatch):
+    _install_contract_module(monkeypatch)
+    codec = DSV4PageSlotCodec(
+        [_region(1_000, 4, 4, reverse_indexed=False)],
+        [],
+        num_blocks=4,
+        num_slots=0,
+        device="cuda:0",
+    )
+    monkeypatch.setattr(codec, "_validate_buffer", lambda *args, **kwargs: None)
+
+    with pytest.raises(ValueError, match="stream device"):
+        codec.gather(
+            codec.page_plan([0]),
+            object(),
+            stream=SimpleNamespace(device=torch.device("cuda:1")),
+        )
 
 
 def test_region_plan_is_published_once_under_concurrent_first_use(monkeypatch):
@@ -350,6 +387,51 @@ def test_triton_wrapper_only_enqueues_on_the_supplied_stream(
     }
 
 
+@pytest.mark.parametrize("unit_bytes", [1023, 1024, 1025, 2049])
+def test_region_plan_tiles_boundary_sized_units_without_gaps(
+    monkeypatch,
+    unit_bytes: int,
+):
+    """CPU contract for the exact metadata consumed by the Triton kernels."""
+
+    triton_page_slot = _triton_page_slot_cpu_contract()
+    monkeypatch.setattr(
+        triton_page_slot,
+        "_static_device_i64",
+        lambda values, _device: torch.tensor(tuple(values), dtype=torch.int64),
+    )
+    monkeypatch.setattr(
+        triton_page_slot,
+        "_static_device_i32",
+        lambda values, _device: torch.tensor(tuple(values), dtype=torch.int32),
+    )
+    region = SimpleNamespace(
+        base_addr=0x1000,
+        total_bytes=2 * unit_bytes,
+        unit_bytes=unit_bytes,
+    )
+
+    plan = triton_page_slot.build_region_plan(
+        [region],
+        item_count=2,
+        device="cuda",
+        reverse=False,
+    )
+
+    expected_offsets = list(range(0, unit_bytes, triton_page_slot.TILE_BYTES))
+    expected_valid = [
+        min(triton_page_slot.TILE_BYTES, unit_bytes - offset)
+        for offset in expected_offsets
+    ]
+    assert plan.bytes_per_item == unit_bytes
+    assert plan.tiles_per_item == len(expected_offsets)
+    assert plan.tile_region.tolist() == [0] * len(expected_offsets)
+    assert plan.tile_unit_offset.tolist() == expected_offsets
+    assert plan.tile_output_offset.tolist() == expected_offsets
+    assert plan.tile_valid_bytes.tolist() == expected_valid
+    assert sum(expected_valid) == unit_bytes
+
+
 def _gpu_region(
     tensor: torch.Tensor,
     unit_bytes: int,
@@ -374,11 +456,41 @@ def _reverse_slice(tensor: torch.Tensor, unit_bytes: int, item_id: int):
     return tensor[start : start + unit_bytes]
 
 
+@pytest.mark.parametrize("unit_bytes", [1023, 1024, 1025, 2049])
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not _REAL_TRITON_AVAILABLE,
+    reason="requires a real CUDA/HIP device and Triton",
+)
+def test_page_region_tile_boundaries_round_trip_on_gpu(unit_bytes: int):
+    device = torch.device("cuda", torch.cuda.current_device())
+    source_cpu = torch.arange(2 * unit_bytes, dtype=torch.int64).to(torch.uint8)
+    source = source_cpu.to(device)
+    codec = DSV4PageSlotCodec(
+        [_gpu_region(source, unit_bytes, reverse_indexed=False)],
+        [],
+        num_blocks=2,
+        num_slots=0,
+        device=device,
+    )
+    staging = torch.empty(unit_bytes, dtype=torch.uint8, device=device)
+    plan = codec.page_plan([1])
+
+    codec.gather(plan, staging)
+    torch.cuda.synchronize(device)
+    assert torch.equal(staging.cpu(), source_cpu[unit_bytes:])
+
+    expected = staging.clone()
+    source[unit_bytes:].zero_()
+    codec.scatter(expected, plan)
+    torch.cuda.synchronize(device)
+    assert torch.equal(source.cpu(), source_cpu)
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available() or not _REAL_TRITON_AVAILABLE,
     reason="requires a real CUDA/HIP device and Triton for the round trip",
 )
-def test_composite_non_default_stream_gather_scatter_round_trip():
+def test_page_slot_non_default_stream_gather_scatter_round_trip():
     importlib.import_module(_TRITON_MODULE_NAME)
     device = torch.device("cuda", torch.cuda.current_device())
     stream = torch.cuda.Stream(device=device)
@@ -404,15 +516,21 @@ def test_composite_non_default_stream_gather_scatter_round_trip():
             num_blocks=3,
             num_slots=3,
             device=device,
+            slot_region_roles=("dsv4.main_kv.nope", "dsv4.main_kv.rope"),
         )
-        plan = codec.checkpoint_plan([2, 0], 1, buffer_offset=9)
+        page_plan = codec.page_plan([2, 0], buffer_offset=9)
+        slot_plan = codec.slot_plan(
+            1,
+            buffer_offset=page_plan.required_buffer_bytes,
+        )
         staging = torch.full(
-            (plan.required_buffer_bytes,),
+            (slot_plan.required_buffer_bytes,),
             0xEE,
             dtype=torch.uint8,
             device=device,
         )
-        codec.gather(plan, staging, stream=stream)
+        codec.gather(page_plan, staging, stream=stream)
+        codec.gather(slot_plan, staging, stream=stream)
     stream.synchronize()
 
     expected_payload = torch.cat(
@@ -432,7 +550,8 @@ def test_composite_non_default_stream_gather_scatter_round_trip():
         page_b.zero_()
         slot_a.zero_()
         slot_b.zero_()
-        codec.scatter(staging, plan, stream=stream)
+        codec.scatter(staging, page_plan, stream=stream)
+        codec.scatter(staging, slot_plan, stream=stream)
     stream.synchronize()
 
     expected_page_a = torch.zeros_like(page_a_cpu)

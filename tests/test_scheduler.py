@@ -20,6 +20,7 @@ from atom.kv_transfer.disaggregation.types import (
     SaveOperationId,
     SendOperationId,
 )
+from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
 from atom.model_engine.scheduler import (
     DecodeScheduler,
     ScheduledBatch,
@@ -66,6 +67,33 @@ class TestSchedulerAddQuery:
         scheduler.deferred_free_blocks[17] = SimpleNamespace(id=17)
 
         assert not scheduler.is_finished()
+
+    def test_pollable_connector_work_keeps_scheduler_alive_but_quarantine_does_not(
+        self,
+    ):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.waiting = deque()
+        scheduler.running = deque()
+        scheduler._rejected = []
+        scheduler.deferred_free_blocks = {}
+        scheduler.finished_recving_kv_req_ids = []
+        scheduler.failed_recving_kv_req_ids = []
+        scheduler.kv_connector = SimpleNamespace(
+            is_producer=False,
+            is_offload=True,
+            completion_channels=set(),
+        )
+        # A quarantined lease stays pinned in the state pool, but only the
+        # worker's pollable-work signal controls engine liveness.
+        scheduler.block_manager = SimpleNamespace(
+            state=SimpleNamespace(checkpoint_lease_count=lambda: 1)
+        )
+
+        scheduler._update_from_kv_xfer_finished(KVConnectorOutput(pending_work=True))
+        assert not scheduler.is_finished()
+
+        scheduler._update_from_kv_xfer_finished(KVConnectorOutput(pending_work=False))
+        assert scheduler.is_finished()
 
     def test_decode_scheduler_deferred_offload_work_keeps_scheduler_alive(self):
         scheduler = DecodeScheduler.__new__(DecodeScheduler)
@@ -386,6 +414,79 @@ class TestSchedule:
         assert sched._num_parked_remote_kv == 0
         sched.add(new)
         assert list(sched.waiting) == [new]
+
+    @pytest.mark.parametrize("first_terminal", ["load", "save"])
+    def test_aborted_load_and_save_both_finish_before_release(self, first_terminal):
+        load = LoadOperationId(97, 3)
+        save = SaveOperationId(97, 4)
+        seq = SimpleNamespace(
+            id=97,
+            status=SequenceStatus.ABORTED,
+            block_table=[1],
+            has_per_req_cache=False,
+            _load_operation=load,
+            _counted_as_inflight_load=True,
+        )
+        events = []
+
+        class _Connector:
+            is_producer = False
+            is_offload = True
+            completion_channels = frozenset()
+
+            def __init__(self):
+                self.pending_save = True
+
+            def load_finished(self, operation):
+                events.append(("load_finished", operation))
+                return operation == load
+
+            def save_finished(self, operation):
+                events.append(("save_finished", operation))
+                if operation == save:
+                    self.pending_save = False
+
+            def should_defer_free(self, value):
+                assert value is seq
+                return self.pending_save
+
+            def request_finished(self, value):
+                events.append(("request_finished", value.id))
+
+        sched = Scheduler.__new__(Scheduler)
+        sched.waiting = deque()
+        sched.running = deque()
+        sched._rejected = []
+        sched.deferred_free_blocks = {}
+        sched.finished_recving_kv_req_ids = []
+        sched.failed_recving_kv_req_ids = []
+        sched._num_parked_remote_kv = 1
+        sched.kv_connector = _Connector()
+        sched.block_manager = SimpleNamespace(
+            deallocate=lambda value: events.append(("deallocate", value.id))
+        )
+        sched._reject_aborted_waiting(seq)
+
+        assert sched.deferred_free_blocks == {seq.id: seq}
+        assert seq._deferred_release_obligations == {"load"}
+
+        outputs = {
+            "load": KVConnectorOutput(finished_loading={load}),
+            "save": KVConnectorOutput(finished_saving={save}),
+        }
+        second_terminal = "save" if first_terminal == "load" else "load"
+
+        sched._update_from_kv_xfer_finished(outputs[first_terminal])
+
+        assert sched.deferred_free_blocks == {seq.id: seq}
+        assert not any(event[0] == "deallocate" for event in events)
+
+        sched._update_from_kv_xfer_finished(outputs[second_terminal])
+
+        assert sched.deferred_free_blocks == {}
+        assert sched._num_parked_remote_kv == 0
+        assert events.count(("request_finished", seq.id)) == 1
+        assert events.count(("deallocate", seq.id)) == 1
 
     def test_reused_id_ignores_stale_exact_send_generation(self):
         old_operation = SendOperationId(95, 4)

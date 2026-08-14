@@ -57,6 +57,19 @@ class TestAggregateBasic:
         result = agg.aggregate([KVConnectorOutput() for _ in range(3)])
         assert result.is_empty()
 
+    def test_pending_work_from_any_worker_keeps_aggregate_live(self):
+        agg = KVOutputAggregator(world_size=3)
+
+        result = agg.aggregate(
+            [
+                KVConnectorOutput(),
+                KVConnectorOutput(pending_work=True),
+                KVConnectorOutput(),
+            ]
+        )
+
+        assert result.pending_work is True
+
     def test_all_workers_report_same_sending(self):
         agg = KVOutputAggregator(world_size=3)
         outputs = [KVConnectorOutput(finished_sending={"r1"}) for _ in range(3)]
@@ -586,12 +599,14 @@ class TestKVConnectorOutput:
         assert out.finished_loading == set()
         assert out.connector_completions == set()
         assert out.expected_finished_count == 0
+        assert out.pending_work is False
 
     def test_is_empty(self):
         assert KVConnectorOutput().is_empty()
         assert not KVConnectorOutput(finished_sending={"x"}).is_empty()
         assert not KVConnectorOutput(finished_recving={"x"}).is_empty()
         assert not KVConnectorOutput(finished_loading={"x"}).is_empty()
+        assert not KVConnectorOutput(pending_work=True).is_empty()
         assert not KVConnectorOutput(
             connector_completions={_completion(DSV4_CHECKPOINT_SAVE_CHANNEL, "x")}
         ).is_empty()

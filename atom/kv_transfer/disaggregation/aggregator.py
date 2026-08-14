@@ -246,6 +246,11 @@ class KVOutputAggregator:
             finished_loading=done_loading,
             failed_loading=failed_loading,
             connector_completions=connector_completions,
+            # A single rank with a live fence is enough to require another
+            # poll.  Ranks that quarantined an unobservable operation report
+            # False, so a permanently pinned scheduler lease cannot spin the
+            # engine forever.
+            pending_work=any(output.pending_work for output in worker_outputs),
         )
 
     def reset(self) -> None:

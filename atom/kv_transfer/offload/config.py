@@ -18,6 +18,7 @@ import json
 import logging
 from dataclasses import asdict, is_dataclass
 from math import isfinite
+from numbers import Integral
 from typing import Any
 
 # Version 2 adds explicit DSV4 KV/index dimensions and DCP virtual-block byte
@@ -47,8 +48,24 @@ _HF_PAGE_FIELDS = (
     "compress_ratios",
     "indexer_dtype",
 )
+_HF_INTEGER_GEOMETRY_FIELDS = frozenset(_HF_PAGE_FIELDS) - {
+    "compress_ratios",
+    "indexer_dtype",
+}
 
 logger = logging.getLogger("atom")
+
+
+def _strict_integer(name: str, value: object, *, minimum: int = 0) -> int:
+    """Parse integer geometry without silently truncating or coercing text."""
+
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise ValueError(f"{name} must be an integer")  # noqa: TRY004
+    normalized = int(value)
+    if normalized < minimum:
+        relation = "positive" if minimum == 1 else f">= {minimum}"
+        raise ValueError(f"{name} must be {relation}")
+    return normalized
 
 
 def select_offload_layout(config) -> str:
@@ -62,12 +79,14 @@ def select_offload_layout(config) -> str:
     kvc = getattr(config, "kv_transfer_config", {}) or {}
     override = kvc.get("offload_layout")
     if override is not None:
-        mapped = _OFFLOAD_LAYOUT_ALIASES.get(str(override))
+        mapped = (
+            _OFFLOAD_LAYOUT_ALIASES.get(override) if isinstance(override, str) else None
+        )
         if mapped is not None:
             return mapped
-        logger.warning(
-            "lmcache_offload: unknown offload_layout=%r; falling back to auto",
-            override,
+        raise ValueError(
+            f"lmcache_offload: unknown offload_layout={override!r}; "
+            f"expected one of {sorted(_OFFLOAD_LAYOUT_ALIASES)}"
         )
 
     hf_config = getattr(config, "hf_config", None)
@@ -111,6 +130,23 @@ def _stable_config_value(value: Any) -> Any:
     )
 
 
+def _stable_hf_geometry(hf: object) -> dict[str, Any]:
+    geometry: dict[str, Any] = {}
+    for name in _HF_PAGE_FIELDS:
+        value = getattr(hf, name, None)
+        if value is not None and name in _HF_INTEGER_GEOMETRY_FIELDS:
+            value = _strict_integer(f"PAGE {name}", value)
+        elif value is not None and name == "compress_ratios":
+            if not isinstance(value, (list, tuple)):
+                raise ValueError("PAGE compress_ratios must be a sequence of integers")
+            value = [
+                _strict_integer(f"PAGE compress_ratios[{index}]", ratio)
+                for index, ratio in enumerate(value)
+            ]
+        geometry[name] = _stable_config_value(value)
+    return geometry
+
+
 def build_page_namespace(
     config,
     cfg,
@@ -120,11 +156,11 @@ def build_page_namespace(
 ) -> str:
     """Return the stable CacheEngineKey domain for ATOM PAGE bytes."""
 
-    if isinstance(layout_version, bool) or not isinstance(layout_version, int):
-        # Preserve the public configuration-validation API.
-        raise ValueError("PAGE layout version must be an integer")  # noqa: TRY004
-    if layout_version <= 0:
-        raise ValueError("PAGE layout version must be positive")
+    layout_version = _strict_integer(
+        "PAGE layout version",
+        layout_version,
+        minimum=1,
+    )
     hf = config.hf_config
     base_model_name = str(
         getattr(config, "model_tag", None) or getattr(config, "model", "atom-model")
@@ -139,14 +175,27 @@ def build_page_namespace(
             else "dense-opaque-block"
         ),
         "kv_cache_dtype": str(getattr(config, "kv_cache_dtype", "auto")),
-        "block_size": int(config.kv_cache_block_size),
-        "chunk_size": int(cfg.chunk_size),
-        "tp_size": int(world_size),
-        "dcp_size": int(getattr(config, "decode_context_parallel_size", 1) or 1),
-        "hf_geometry": {
-            name: _stable_config_value(getattr(hf, name, None))
-            for name in _HF_PAGE_FIELDS
-        },
+        "block_size": _strict_integer(
+            "PAGE block size",
+            config.kv_cache_block_size,
+            minimum=1,
+        ),
+        "chunk_size": _strict_integer(
+            "PAGE chunk size",
+            cfg.chunk_size,
+            minimum=1,
+        ),
+        "tp_size": _strict_integer("PAGE TP size", world_size, minimum=1),
+        "dcp_size": _strict_integer(
+            "PAGE DCP size",
+            (
+                1
+                if getattr(config, "decode_context_parallel_size", 1) is None
+                else getattr(config, "decode_context_parallel_size", 1)
+            ),
+            minimum=1,
+        ),
+        "hf_geometry": _stable_hf_geometry(hf),
         "speculative_config": _stable_config_value(
             getattr(config, "speculative_config", None)
         ),
@@ -213,8 +262,9 @@ def apply_extra_overrides(cfg, kv_transfer_config: dict[str, Any] | None) -> Non
     for key, value in (extra or {}).items():
         if isinstance(key, str) and key.startswith("lmcache."):
             field = key[len("lmcache.") :]
-            if hasattr(cfg, field):
-                setattr(cfg, field, value)
+            if not field or not hasattr(cfg, field):
+                raise ValueError(f"unknown LMCache override {key!r}")
+            setattr(cfg, field, value)
 
 
 def validate_lmcache_storage_config(cfg: Any) -> None:
@@ -264,8 +314,22 @@ def build_lmcache_metadata(config, cfg, world_size: int, worker_id: int):
     from lmcache.v1.metadata import LMCacheMetadata
 
     hf = config.hf_config
-    num_layers = int(hf.num_hidden_layers)
-    tp = int(getattr(config, "tensor_parallel_size", world_size) or 1)
+    num_layers = _strict_integer(
+        "LMCache layer count",
+        hf.num_hidden_layers,
+        minimum=1,
+    )
+    raw_tp = getattr(config, "tensor_parallel_size", world_size)
+    tp = _strict_integer(
+        "LMCache tensor parallel size",
+        world_size if raw_tp is None else raw_tp,
+        minimum=1,
+    )
+    chunk_size = _strict_integer("LMCache chunk size", cfg.chunk_size, minimum=1)
+    world_size = _strict_integer("LMCache world size", world_size, minimum=1)
+    worker_id = _strict_integer("LMCache worker id", worker_id)
+    if worker_id >= world_size:
+        raise ValueError("LMCache worker id must be within the world")
     kv_dtype = dtypes.d_dtypes[config.kv_cache_dtype]
     model_name = build_page_namespace(config, cfg, world_size)
 
@@ -275,15 +339,43 @@ def build_lmcache_metadata(config, cfg, world_size: int, worker_id: int):
     # keep use_mla=False because our BINARY storage bypasses LMCache's own MLA
     # GPU-connector format path; only kv_shape needs to reflect reality.
     if getattr(hf, "kv_lora_rank", None) is not None:
-        latent = int(hf.kv_lora_rank) + int(getattr(hf, "qk_rope_head_dim", 0))
-        kv_shape = (num_layers, 1, int(cfg.chunk_size), 1, latent)
-    else:
-        num_kv_heads = int(getattr(hf, "num_key_value_heads", hf.num_attention_heads))
-        num_kv_heads_local = max(1, num_kv_heads // tp)
-        head_dim = int(
-            getattr(hf, "head_dim", 0) or (hf.hidden_size // hf.num_attention_heads)
+        latent = _strict_integer(
+            "LMCache KV LoRA rank",
+            hf.kv_lora_rank,
+            minimum=1,
+        ) + _strict_integer(
+            "LMCache RoPE head dimension",
+            getattr(hf, "qk_rope_head_dim", 0),
         )
-        kv_shape = (num_layers, 2, int(cfg.chunk_size), num_kv_heads_local, head_dim)
+        kv_shape = (num_layers, 1, chunk_size, 1, latent)
+    else:
+        num_kv_heads = _strict_integer(
+            "LMCache KV head count",
+            getattr(hf, "num_key_value_heads", hf.num_attention_heads),
+            minimum=1,
+        )
+        num_kv_heads_local = max(1, num_kv_heads // tp)
+        raw_head_dim = getattr(hf, "head_dim", 0)
+        normalized_head_dim = (
+            0
+            if raw_head_dim is None
+            else _strict_integer("LMCache head dimension", raw_head_dim)
+        )
+        if normalized_head_dim == 0:
+            hidden_size = _strict_integer(
+                "LMCache hidden size",
+                hf.hidden_size,
+                minimum=1,
+            )
+            attention_heads = _strict_integer(
+                "LMCache attention head count",
+                hf.num_attention_heads,
+                minimum=1,
+            )
+            head_dim = hidden_size // attention_heads
+        else:
+            head_dim = normalized_head_dim
+        kv_shape = (num_layers, 2, chunk_size, num_kv_heads_local, head_dim)
 
     return LMCacheMetadata(
         model_name=model_name,
@@ -294,7 +386,7 @@ def build_lmcache_metadata(config, cfg, world_size: int, worker_id: int):
         kv_dtype=kv_dtype,
         kv_shape=kv_shape,
         use_mla=False,
-        chunk_size=int(cfg.chunk_size),
+        chunk_size=chunk_size,
         # Shared id so the scheduler's ZMQ LookupClient and each worker's
         # LookupServer derive the SAME ipc socket path (get_zmq_rpc_path_lmcache).
         engine_id="atom-offload",

@@ -21,7 +21,7 @@ import operator
 import struct
 import threading
 import zlib
-from collections.abc import Iterator, Sequence
+from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
@@ -34,11 +34,6 @@ from atom.kv_transfer.disaggregation.types import KVTransferRegion
 logger = logging.getLogger("atom")
 
 
-class _AddressMode(Enum):
-    FORWARD = "forward"
-    REVERSE = "reverse"
-
-
 @dataclass(frozen=True)
 class _RegionSnapshot:
     """Validated immutable address geometry for one registered region."""
@@ -46,21 +41,17 @@ class _RegionSnapshot:
     base_addr: int
     total_bytes: int
     unit_bytes: int
-    address_mode: _AddressMode
-
-    @property
-    def reverse_indexed(self) -> bool:
-        return self.address_mode is _AddressMode.REVERSE
+    reverse_indexed: bool
+    semantic_role: str
 
     def unit_addr(self, item_id: int) -> int:
-        if self.address_mode is _AddressMode.FORWARD:
+        if not self.reverse_indexed:
             return self.base_addr + item_id * self.unit_bytes
         return self.base_addr + self.total_bytes - (item_id + 1) * self.unit_bytes
 
 
 @dataclass(frozen=True)
 class _RegionSet:
-    payload_kind: DSV4PayloadKind
     item_count: int
     regions: tuple[_RegionSnapshot, ...]
     bytes_per_item: int
@@ -88,18 +79,6 @@ class DSV4CopyPlan:
     sections: tuple[DSV4PayloadSection, ...]
     payload_bytes: int
     required_buffer_bytes: int
-
-
-@dataclass(frozen=True)
-class DSV4CopySpan:
-    """CPU reference expansion used by validation and golden-layout tests."""
-
-    kind: DSV4PayloadKind
-    item_id: int
-    region_index: int
-    device_addr: int
-    buffer_offset: int
-    nbytes: int
 
 
 class _NullCtx:
@@ -132,25 +111,43 @@ def _snapshot_region_set(
     *,
     kind: DSV4PayloadKind,
     item_count: int,
+    semantic_roles: Sequence[str] | None = None,
 ) -> _RegionSet:
     raw_regions = tuple(regions)
     if not raw_regions:
         raise ValueError(
             f"DSV4PageSlotCodec: at least one {kind.value.upper()} region is required"
         )
-    mode = (
-        _AddressMode.FORWARD if kind is DSV4PayloadKind.PAGE else _AddressMode.REVERSE
-    )
+    expected_reverse = kind is DSV4PayloadKind.SLOT
+    if semantic_roles is not None and len(semantic_roles) != len(raw_regions):
+        raise ValueError(
+            f"DSV4PageSlotCodec: {kind.value.upper()} semantic role count "
+            "must match the region count"
+        )
     snapshots: list[_RegionSnapshot] = []
     for region_index, region in enumerate(raw_regions):
         prefix = f"DSV4PageSlotCodec: {kind.value.upper()} region {region_index}"
         base_addr = _integer(f"{prefix} base_addr", region.base_addr, minimum=1)
         unit_bytes = _integer(f"{prefix} unit_bytes", region.unit_bytes, minimum=1)
         total_bytes = _integer(f"{prefix} total_bytes", region.total_bytes, minimum=1)
-        reverse = bool(region.reverse_indexed)
-        if reverse != (mode is _AddressMode.REVERSE):
-            expected = mode is _AddressMode.REVERSE
-            raise ValueError(f"{prefix} must have reverse_indexed={expected}")
+        reverse = region.reverse_indexed
+        if type(reverse) is not bool:
+            raise ValueError(f"{prefix} reverse_indexed must be a boolean")
+        if reverse != expected_reverse:
+            raise ValueError(f"{prefix} must have reverse_indexed={expected_reverse}")
+        role = (
+            semantic_roles[region_index]
+            if semantic_roles is not None
+            else getattr(region, "semantic_role", None)
+        )
+        if role is None:
+            if kind is DSV4PayloadKind.SLOT:
+                raise ValueError(
+                    f"{prefix} semantic_role is required for stable fingerprints"
+                )
+            role = f"{kind.value}-region-{region_index}"
+        if not isinstance(role, str) or not role.strip():
+            raise ValueError(f"{prefix} semantic_role must be a non-empty string")
         required_bytes = item_count * unit_bytes
         if total_bytes < required_bytes:
             raise ValueError(
@@ -162,11 +159,16 @@ def _snapshot_region_set(
                 base_addr=base_addr,
                 total_bytes=total_bytes,
                 unit_bytes=unit_bytes,
-                address_mode=mode,
+                reverse_indexed=reverse,
+                semantic_role=role,
             )
         )
+    roles = [region.semantic_role for region in snapshots]
+    if len(set(roles)) != len(roles):
+        raise ValueError(
+            f"DSV4PageSlotCodec: duplicate {kind.value.upper()} semantic roles"
+        )
     return _RegionSet(
-        payload_kind=kind,
         item_count=item_count,
         regions=tuple(snapshots),
         bytes_per_item=sum(region.unit_bytes for region in snapshots),
@@ -188,6 +190,8 @@ class DSV4PageSlotCodec:
         num_blocks: int,
         num_slots: int,
         device: torch.device | str,
+        page_region_roles: Sequence[str] | None = None,
+        slot_region_roles: Sequence[str] | None = None,
     ) -> None:
         self.num_blocks = _integer("num_blocks", num_blocks, minimum=0)
         self.num_slots = _integer("num_slots", num_slots, minimum=0)
@@ -204,6 +208,7 @@ class DSV4PageSlotCodec:
                 page_regions,
                 kind=DSV4PayloadKind.PAGE,
                 item_count=self.num_blocks,
+                semantic_roles=page_region_roles,
             )
             if page_regions
             else None
@@ -213,6 +218,7 @@ class DSV4PageSlotCodec:
                 slot_regions,
                 kind=DSV4PayloadKind.SLOT,
                 item_count=self.num_slots,
+                semantic_roles=slot_region_roles,
             )
             if slot_regions
             else None
@@ -226,6 +232,17 @@ class DSV4PageSlotCodec:
             self.device = torch.device("cuda", torch.cuda.current_device())
         self._compiled_region_plans: dict[DSV4PayloadKind, object] = {}
         self._compiled_region_plans_lock = threading.Lock()
+        self._triton_page_slot = None
+        if self.device.type == "cuda":
+            try:
+                from atom.kv_transfer.offload.hybrid.dsv4 import triton_page_slot
+
+                self._triton_page_slot = triton_page_slot
+            except Exception:
+                logger.warning(
+                    "DSV4PageSlotCodec: Triton PAGE/SLOT staging unavailable",
+                    exc_info=True,
+                )
 
     @property
     def page_regions(self) -> tuple[_RegionSnapshot, ...]:
@@ -251,7 +268,7 @@ class DSV4PageSlotCodec:
 
     @property
     def has_fused_chunk_major_staging(self) -> bool:
-        return self.device.type == "cuda"
+        return self._triton_page_slot is not None
 
     def _require_regions(self, kind: DSV4PayloadKind) -> _RegionSet:
         region_set = self._page if kind is DSV4PayloadKind.PAGE else self._slot
@@ -292,25 +309,20 @@ class DSV4PageSlotCodec:
         if not raw:
             return ()
         try:
-            return self._normalize_ids(
-                [operator.index(value) for value in raw],
-                kind=DSV4PayloadKind.PAGE,
-                allow_empty=True,
-            )
+            for value in raw:
+                operator.index(value)
         except TypeError:
-            flattened: list[int] = []
+            flattened = []
             for group in raw:
                 try:
-                    flattened.extend(operator.index(value) for value in group)
+                    flattened.extend(group)
                 except TypeError as exc:
                     raise ValueError(
                         "block_ids must be integers or groups of integers"
                     ) from exc
-            return self._normalize_ids(
-                flattened,
-                kind=DSV4PayloadKind.PAGE,
-                allow_empty=True,
-            )
+            return tuple(flattened)
+        # page_plan is the single normalization/duplicate-validation owner.
+        return tuple(raw)
 
     @staticmethod
     def _offset(value: object) -> int:
@@ -356,24 +368,10 @@ class DSV4PageSlotCodec:
         )
         return DSV4CopyPlan((section,), self.slot_bytes, offset + self.slot_bytes)
 
-    def checkpoint_plan(
+    def _validate_plan(
         self,
-        block_ids: Sequence[int],
-        group: int,
-        *,
-        buffer_offset: int = 0,
-    ) -> DSV4CopyPlan:
-        page = self.page_plan(block_ids, buffer_offset=buffer_offset)
-        slot = self.slot_plan(group, buffer_offset=page.required_buffer_bytes)
-        sections = page.sections + slot.sections
-        payload_bytes = page.payload_bytes + slot.payload_bytes
-        return DSV4CopyPlan(
-            sections,
-            payload_bytes,
-            self._offset(buffer_offset) + payload_bytes,
-        )
-
-    def _validate_plan(self, plan: DSV4CopyPlan) -> None:
+        plan: DSV4CopyPlan,
+    ) -> tuple[tuple[DSV4PayloadKind, tuple[int, ...], int], ...]:
         """Revalidate public plan DTOs before any raw-pointer GPU launch."""
 
         if not isinstance(plan, DSV4CopyPlan):
@@ -389,6 +387,7 @@ class DSV4PageSlotCodec:
             DSV4PayloadKind.PAGE: set(),
             DSV4PayloadKind.SLOT: set(),
         }
+        validated_sections: list[tuple[DSV4PayloadKind, tuple[int, ...], int]] = []
         for section_index, section in enumerate(plan.sections):
             if not isinstance(section, DSV4PayloadSection):
                 raise TypeError(
@@ -436,6 +435,7 @@ class DSV4PageSlotCodec:
             occupied.append((offset, end))
             expected_payload += nbytes
             expected_required = max(expected_required, end)
+            validated_sections.append((section.kind, ids, offset))
 
         if payload_bytes != expected_payload:
             raise ValueError(
@@ -447,24 +447,7 @@ class DSV4PageSlotCodec:
                 "plan.required_buffer_bytes="
                 f"{required_buffer_bytes} does not match section end={expected_required}"
             )
-
-    def iter_reference_spans(self, plan: DSV4CopyPlan) -> Iterator[DSV4CopySpan]:
-        self._validate_plan(plan)
-        for section in plan.sections:
-            region_set = self._require_regions(section.kind)
-            item_base = section.buffer_offset
-            for item_pos, item_id in enumerate(section.item_ids):
-                region_offset = item_base + item_pos * region_set.bytes_per_item
-                for region_index, region in enumerate(region_set.regions):
-                    yield DSV4CopySpan(
-                        kind=section.kind,
-                        item_id=item_id,
-                        region_index=region_index,
-                        device_addr=region.unit_addr(item_id),
-                        buffer_offset=region_offset,
-                        nbytes=region.unit_bytes,
-                    )
-                    region_offset += region.unit_bytes
+        return tuple(validated_sections)
 
     def _matches_device(self, device: torch.device) -> bool:
         candidate = torch.device(device)
@@ -498,7 +481,9 @@ class DSV4PageSlotCodec:
         cached = self._compiled_region_plans.get(kind)
         if cached is not None:
             return cached
-        from atom.kv_transfer.offload.hybrid.dsv4 import triton_page_slot
+        triton_page_slot = self._triton_page_slot
+        if triton_page_slot is None:
+            raise RuntimeError("DSV4 PAGE/SLOT Triton staging is unavailable")
 
         # PAGE save workers and SLOT load/save streams share this codec. Build
         # each immutable device plan exactly once so a losing first-use race
@@ -527,31 +512,35 @@ class DSV4PageSlotCodec:
         gather: bool,
         stream: torch.cuda.Stream | None,
     ) -> None:
-        self._validate_plan(plan)
+        sections = self._validate_plan(plan)
         self._validate_buffer(buffer, plan, name="dst" if gather else "src")
-        if not plan.sections:
+        if not sections:
             return
         if self.device.type != "cuda":
             raise RuntimeError("DSV4PageSlotCodec GPU movement requires CUDA/HIP")
-        from atom.kv_transfer.offload.hybrid.dsv4 import triton_page_slot
+        triton_page_slot = self._triton_page_slot
+        if triton_page_slot is None:
+            raise RuntimeError("DSV4 PAGE/SLOT Triton staging is unavailable")
+        if stream is not None and not self._matches_device(torch.device(stream.device)):
+            raise ValueError("stream device does not match the DSV4 codec device")
 
         with (
             torch.cuda.device(self.device)
             if self.device.index is not None
             else _NullCtx()
         ):
-            for section in plan.sections:
-                region_plan = self._region_plan(section.kind, stream=stream)
+            for kind, item_ids, buffer_offset in sections:
+                region_plan = self._region_plan(kind, stream=stream)
                 copy = (
-                    triton_page_slot.gather_region_items
+                    triton_page_slot._gather_region_items_unchecked
                     if gather
-                    else triton_page_slot.scatter_region_items
+                    else triton_page_slot._scatter_region_items_unchecked
                 )
                 copy(
                     region_plan,
-                    section.item_ids,
+                    item_ids,
                     buffer,
-                    buffer_offset=section.buffer_offset,
+                    buffer_offset=buffer_offset,
                     stream=stream,
                 )
 
@@ -1232,8 +1221,17 @@ class DSV4CheckpointStore:
             raise ValueError("model_name must be provided")
         if world_size is None or worker_id is None:
             raise ValueError("world_size and worker_id must be provided")
+        normalized_world_size, normalized_worker_id = _tp_geometry(
+            world_size,
+            worker_id,
+            prefix="store_",
+        )
+        if checkpoint_codec is not None and (
+            normalized_world_size != checkpoint_codec.tp_size
+            or normalized_worker_id != checkpoint_codec.tp_rank
+        ):
+            raise ValueError("checkpoint store TP geometry must match checkpoint_codec")
 
-        self.checkpoint_codec = checkpoint_codec
         self._storage_manager = storage_manager
         self._store_location = getattr(engine, "store_location", None)
         retrieve_locations = getattr(engine, "retrieve_locations", None)
@@ -1241,8 +1239,8 @@ class DSV4CheckpointStore:
             None if retrieve_locations is None else list(retrieve_locations)
         )
         self._model_name = str(model_name)
-        self._world_size = int(world_size)
-        self._worker_id = int(worker_id)
+        self._world_size = normalized_world_size
+        self._worker_id = normalized_worker_id
         self._cache_engine_key_type = CacheEngineKey
         self._memory_format = MemoryFormat.KV_2LTD
         self._corruption_lock = threading.Lock()
@@ -1521,7 +1519,6 @@ __all__ = [
     "DSV4CheckpointKey",
     "DSV4CheckpointStore",
     "DSV4CopyPlan",
-    "DSV4CopySpan",
     "DSV4PageSlotCodec",
     "DSV4PayloadKind",
     "DSV4PayloadSection",

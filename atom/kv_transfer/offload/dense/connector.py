@@ -34,10 +34,15 @@ from atom.kv_transfer.disaggregation.base import (
     KVConnectorBase,
     KVConnectorSchedulerBase,
 )
-from atom.kv_transfer.disaggregation.types import LoadOperationId
+from atom.kv_transfer.disaggregation.types import (
+    LoadOperationId,
+    SaveCompletionId,
+    SaveOperationId,
+)
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
 from atom.kv_transfer.offload._offload_common import (
+    OffloadSchedulerMixin,
     OffloadWorkerMixin,
     build_offload_engine,
     validated_kv_role,
@@ -153,52 +158,6 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             if req.save_spec is not None and self._do_save:
                 self._save_executor.submit(self._guard, "save", self._do_save_req, req)
 
-    def _on_load_fail(self, req_id) -> None:
-        # Release the LMCache lookup pin held by this load (mixin _guard hook).
-        self._lookup_unpin(req_id)
-
-    def _lookup_unpin(self, req_id) -> None:
-        if getattr(self, "_engine", None) is None:
-            return
-        try:
-            self._engine.lookup_unpin(str(req_id))  # LMCache pin keyed by str id
-        except Exception:
-            logger.debug(
-                "LMCache offload: lookup unpin failed for req=%s",
-                req_id,
-                exc_info=True,
-            )
-
-    def _profile_enabled(self) -> bool:
-        return os.environ.get("OFFLOAD_PROFILE", "0").lower() not in (
-            "0",
-            "false",
-            "no",
-            "off",
-        )
-
-    def _last_gpu_connector_transfer_stats(self) -> dict[str, int | float]:
-        gpu_connector = getattr(getattr(self, "_engine", None), "gpu_connector", None)
-        if gpu_connector is None or not hasattr(gpu_connector, "last_transfer_stats"):
-            return {}
-        try:
-            return dict(gpu_connector.last_transfer_stats())
-        except Exception:
-            logger.debug(
-                "LMCache offload: transfer stats collection failed",
-                exc_info=True,
-            )
-            return {}
-
-    def _reset_gpu_connector_transfer_stats(self) -> None:
-        gpu_connector = getattr(getattr(self, "_engine", None), "gpu_connector", None)
-        if gpu_connector is None or not hasattr(gpu_connector, "reset_transfer_stats"):
-            return
-        try:
-            gpu_connector.reset_transfer_stats()
-        except Exception:
-            logger.debug("LMCache offload: transfer stats reset failed", exc_info=True)
-
     # -- copy daemon thread ----------------------------------------------
     def _do_load_req(self, req: LMCacheReqMeta) -> None:
         ls = req.load_spec
@@ -289,7 +248,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         skip = (ss.skip_leading_tokens // self.chunk_size) * self.chunk_size
         if skip >= len(toks):
             with self._lock:
-                self._done_save.add(req.req_id)
+                self._done_save.add(self._save_completion_id(req))
             return
 
         t_total0 = time.perf_counter()
@@ -307,7 +266,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         store_ms = (time.perf_counter() - t_store0) * 1000
         transfer_stats = self._last_gpu_connector_transfer_stats()
         with self._lock:
-            self._done_save.add(req.req_id)
+            self._done_save.add(self._save_completion_id(req))
         total_ms = (time.perf_counter() - t_total0) * 1000
         if self._profile_enabled():
             logger.info(
@@ -347,7 +306,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
 # =====================================================================
 # Scheduler side
 # =====================================================================
-class DenseOffloadScheduler(KVConnectorSchedulerBase):
+class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
     # Consumer semantics: finished_recving wakes parked seqs (the engine asserts
     # `not is_producer` on that path). Offload never uses finished_sending.
     is_producer = False
@@ -361,7 +320,11 @@ class DenseOffloadScheduler(KVConnectorSchedulerBase):
         self.kv_role = validated_kv_role(kvc)
         self._do_save = self.kv_role in ("offload", "kv_both", "kv_producer")
         self._do_load = self.kv_role in ("offload", "kv_both", "kv_consumer")
-        self.block_size = int(config.kv_cache_block_size)
+        self.block_size = offcfg._strict_integer(
+            "Dense block size",
+            config.kv_cache_block_size,
+            minimum=1,
+        )
         self.chunk_size: int | None = None
         self._lookup_client = None
 
@@ -381,7 +344,11 @@ class DenseOffloadScheduler(KVConnectorSchedulerBase):
         # prefix is stored to LMCache once prefill computes it
         # (seq.prefix_hashes_published flips True), chunk by chunk.
         self._save_tracker: dict[str, list] = {}
-        self._save_inflight: set[str] = set()
+        # sid -> exact save generation.  Exact matching prevents a delayed TP
+        # notification for an older request lifecycle from releasing the
+        # current request's deferred blocks.
+        self._save_inflight: dict[str, SaveCompletionId] = {}
+        self._save_nonce = 0
         self._load_nonce = 0
         self._load_lifecycles: dict[str, object] = {}
         self._active_load_operations: dict[str, tuple[object, LoadOperationId]] = {}
@@ -403,13 +370,21 @@ class DenseOffloadScheduler(KVConnectorSchedulerBase):
             )
             self._min_load_tokens = 8192
 
+        # Configuration is required even though the lookup service is optional.
+        # Do not turn invalid storage or geometry into a cache miss at startup.
+        cfg = offcfg.build_lmcache_config(kvc)
+        self.chunk_size = offcfg._strict_integer(
+            "LMCache chunk size",
+            cfg.chunk_size,
+            minimum=1,
+        )
+        world = getattr(config, "tensor_parallel_size", 1)
+        if world is None:
+            world = 1
+        meta = offcfg.build_lmcache_metadata(config, cfg, world, 0)
         try:
-            cfg = offcfg.build_lmcache_config(kvc)
-            self.chunk_size = int(cfg.chunk_size)
             from lmcache.v1.lookup_client.factory import LookupClientFactory
 
-            world = int(getattr(config, "tensor_parallel_size", 1) or 1)
-            meta = offcfg.build_lmcache_metadata(config, cfg, world, 0)
             self._lookup_client = LookupClientFactory.create_lookup_client(cfg, meta)
         except Exception as e:  # noqa: BLE001  # optional lookup service
             logger.warning(
@@ -516,23 +491,6 @@ class DenseOffloadScheduler(KVConnectorSchedulerBase):
             else:
                 entry[1] = max(int(entry[1]), initial_saved)
 
-    def _chunk_floor(self, tokens: int) -> int:
-        chunk = int(self.chunk_size or 256)
-        return (max(0, int(tokens)) // chunk) * chunk
-
-    def _lmcache_hit_save_floor(self, ls: LoadSpec | None) -> int:
-        if ls is None:
-            return 0
-        return self._chunk_floor(ls.lmcache_cached_tokens)
-
-    def _set_save_frontier(self, sid: str, seq, saved: int) -> None:
-        saved = self._chunk_floor(saved)
-        if sid not in self._save_tracker:
-            self._save_tracker[sid] = [seq, saved]
-        else:
-            self._save_tracker[sid][0] = seq
-            self._save_tracker[sid][1] = saved
-
     def _clear_pending_load(self, sid: str) -> None:
         self._load_specs.pop(sid, None)
         self._reqs_need_recv.pop(sid, None)
@@ -569,40 +527,6 @@ class DenseOffloadScheduler(KVConnectorSchedulerBase):
             return False, "too_small", hbm, lmc, need, chunk
         return True, "aligned_large_hit", hbm, lmc, need, chunk
 
-    def _maybe_start_unaligned_handoff(
-        self,
-        seq,
-        ls: LoadSpec,
-        hbm: int,
-        lmc: int,
-        chunk: int,
-    ) -> bool:
-        boundary = ((hbm + chunk - 1) // chunk) * chunk
-        remaining_after_boundary = lmc - boundary
-        min_load = int(getattr(self, "_min_load_tokens", 8192))
-        if boundary <= hbm or remaining_after_boundary < min_load:
-            return False
-
-        sid = str(seq.id)
-        ls.hbm_cached_tokens = boundary
-        ls.can_load = True
-        self._reqs_need_recv.pop(sid, None)
-        self._handoff_loads.add(sid)
-        seq.offload_loaded_tokens = hbm
-        seq.offload_handoff_boundary_tokens = boundary
-        logger.debug(
-            "[OFFLOAD-LOAD-HANDOFF] seq=%s hbm_cached=%d boundary=%d "
-            "lmc_cached=%d need_after_boundary=%d min_load=%d chunk=%d",
-            seq.id,
-            hbm,
-            boundary,
-            lmc,
-            remaining_after_boundary,
-            min_load,
-            chunk,
-        )
-        return True
-
     def adjust_prefill_chunk_after_alloc(self, seq, chunk: int) -> int:
         sid = str(seq.id)
         if sid not in self._handoff_loads:
@@ -616,89 +540,6 @@ class DenseOffloadScheduler(KVConnectorSchedulerBase):
             return chunk
         adjusted = min(int(chunk), limit)
         return max(1, adjusted)
-
-    def should_park_partial_prefill_for_load(self, seq) -> bool:
-        if not self._do_load:
-            return False
-        sid = str(seq.id)
-        if sid not in self._handoff_loads:
-            return False
-        ls = self._load_specs.get(sid)
-        if ls is None:
-            self._handoff_loads.discard(sid)
-            return False
-        boundary = int(getattr(seq, "offload_handoff_boundary_tokens", 0) or 0)
-        hbm = int(getattr(seq, "num_cached_tokens", 0))
-        if boundary > 0 and hbm < boundary:
-            return False
-
-        should_load, reason, hbm, lmc, need, chunk = self._decide_load_after_alloc(
-            seq, ls
-        )
-        if not should_load:
-            self._mark_load_skip(seq, reason, hbm, lmc, need, chunk)
-            self._clear_pending_load(sid)
-            return False
-
-        ls.can_load = True
-        self._reqs_need_recv[sid] = seq
-        self._handoff_loads.discard(sid)
-        seq.offload_loaded_tokens = max(hbm, lmc)
-        logger.debug(
-            "[OFFLOAD-LOAD-HANDOFF-READY] seq=%s hbm_cached=%d "
-            "lmc_cached=%d offload_loaded=%d need=%d",
-            seq.id,
-            hbm,
-            lmc,
-            seq.offload_loaded_tokens,
-            need,
-        )
-        return True
-
-    def _mark_load_skip(
-        self,
-        seq,
-        reason: str,
-        hbm: int,
-        lmc: int,
-        need: int,
-        chunk: int,
-    ) -> None:
-        seq.offload_loaded_tokens = hbm
-        min_load = int(getattr(self, "_min_load_tokens", 8192))
-        logger.debug(
-            "[OFFLOAD-LOAD-SKIP] seq=%s hbm_cached=%d lmc_cached=%d "
-            "need=%d min_load=%d chunk=%d reason=%s",
-            seq.id,
-            hbm,
-            lmc,
-            need,
-            min_load,
-            chunk,
-            reason,
-        )
-
-    def should_park_for_load_after_alloc(self, seq) -> bool:
-        if not self._do_load:
-            return False
-        sid = str(seq.id)
-        ls = self._load_specs.get(sid)
-        if ls is None:
-            return False
-        should_load, reason, hbm, lmc, need, chunk = self._decide_load_after_alloc(
-            seq, ls
-        )
-        if not should_load:
-            if (
-                reason == "unaligned_hbm_prefill"
-                and self._maybe_start_unaligned_handoff(seq, ls, hbm, lmc, chunk)
-            ):
-                return False
-            self._mark_load_skip(seq, reason, hbm, lmc, need, chunk)
-            self._clear_pending_load(sid)
-            return False
-        seq.offload_loaded_tokens = max(hbm, lmc)
-        return True
 
     def build_connector_meta(self) -> LMCacheOffloadMetadata:
         meta = LMCacheOffloadMetadata()
@@ -793,6 +634,8 @@ class DenseOffloadScheduler(KVConnectorSchedulerBase):
                 aligned,
                 saved,
             )
+            save_operation = SaveOperationId(seq.id, self._save_nonce)
+            self._save_nonce += 1
             meta.add_request(
                 LMCacheReqMeta(
                     req_id=seq.id,
@@ -800,33 +643,13 @@ class DenseOffloadScheduler(KVConnectorSchedulerBase):
                     block_ids=list(seq.block_table),
                     save_spec=SaveSpec(skip_leading_tokens=saved, can_save=True),
                     is_last_prefill=is_last_prefill,
+                    save_operation=save_operation,
                 )
             )
             entry[1] = aligned
-            self._save_inflight.add(sid)
+            self._save_inflight[sid] = save_operation
         self._reqs_need_recv.clear()
         return meta
-
-    def connector_meta_dispatched(self, meta) -> None:
-        dispatched = set(getattr(meta, "lookup_requests_in_step", ()) or ())
-        if dispatched:
-            self._lookup_in_step = [
-                sid for sid in self._lookup_in_step if sid not in dispatched
-            ]
-
-    def _save_frontier(self, seq) -> int:
-        computed = min(
-            int(getattr(seq, "num_cached_tokens", 0)),
-            int(getattr(seq, "num_prompt_tokens", 0)),
-        )
-        return self._chunk_floor(computed)
-
-    def _has_pending_save(self, seq) -> bool:
-        sid = str(seq.id)
-        entry = self._save_tracker.get(sid)
-        if entry is None:
-            return False
-        return self._save_frontier(seq) > int(entry[1])
 
     def should_defer_free(self, seq) -> bool:
         if not self._do_save:
@@ -835,7 +658,17 @@ class DenseOffloadScheduler(KVConnectorSchedulerBase):
         return sid in self._save_inflight or self._has_pending_save(seq)
 
     def save_finished(self, req_id) -> None:
-        self._save_inflight.discard(str(req_id))
+        sid = str(req_id.req_id if isinstance(req_id, SaveOperationId) else req_id)
+        active = self._save_inflight.get(sid)
+        if isinstance(req_id, SaveOperationId):
+            if active != req_id:
+                return
+        elif isinstance(active, SaveOperationId):
+            # Once this lifecycle has an exact identity, a raw request ID
+            # cannot complete it.  Raw IDs still clear explicitly legacy
+            # entries should one be restored from older scheduler state.
+            return
+        self._save_inflight.pop(sid, None)
 
     def load_failed(self, req_id) -> bool:
         sid = str(req_id.req_id if isinstance(req_id, LoadOperationId) else req_id)

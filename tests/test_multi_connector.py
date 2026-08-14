@@ -12,6 +12,7 @@ blocks from being freed while a transfer is still reading them.
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -19,6 +20,7 @@ from atom.kv_transfer.disaggregation.multi.multi_connector import (
     MultiConnector,
     MultiConnectorMetadata,
     MultiConnectorScheduler,
+    MultiSaveOperationId,
 )
 from atom.kv_transfer.disaggregation.types import (
     STATE_CHECKPOINT_STAGING_CHANNEL,
@@ -160,6 +162,8 @@ class FakeWorkerSub:
 class FakeCheckpointWorkerSub(FakeWorkerSub):
     """Worker mock that consumes native checkpoint records via the new hook."""
 
+    state_checkpoint_completion_channel = STATE_CHECKPOINT_STAGING_CHANNEL
+
     def __init__(self, **kwargs):
         super().__init__(
             completion_channels={STATE_CHECKPOINT_STAGING_CHANNEL},
@@ -172,28 +176,19 @@ class FakeCheckpointWorkerSub(FakeWorkerSub):
 
 
 def _sched(connectors):
-    obj = MultiConnectorScheduler.__new__(MultiConnectorScheduler)
-    obj._connectors = connectors
-    obj.is_producer = any(getattr(c, "is_producer", False) for c in connectors)
-    obj.is_offload = any(getattr(c, "is_offload", False) for c in connectors)
-    obj.completion_channels = frozenset(
-        channel
-        for connector in connectors
-        for channel in (getattr(connector, "completion_channels", ()) or ())
-    )
-    return obj
+    with patch(
+        "atom.kv_transfer.disaggregation.multi.multi_connector._build_subconnectors",
+        return_value=connectors,
+    ):
+        return MultiConnectorScheduler(SimpleNamespace())
 
 
 def _worker(connectors):
-    obj = MultiConnector.__new__(MultiConnector)
-    obj._connectors = connectors
-    obj.is_producer = any(getattr(c, "is_producer", False) for c in connectors)
-    obj._pending_save = {}
-    obj._operation_output = {}
-    obj._req_operations = {}
-    obj._sent = {}
-    obj._legacy_save_nonce = 0
-    return obj
+    with patch(
+        "atom.kv_transfer.disaggregation.multi.multi_connector._build_subconnectors",
+        return_value=connectors,
+    ):
+        return MultiConnector(SimpleNamespace())
 
 
 def _save_meta(*req_ids):
@@ -242,6 +237,14 @@ def _operation_save_meta(operation, *, page=True, sidecar=False):
     return meta
 
 
+def _multi_save(operation: SaveOperationId, connector_idx: int):
+    return MultiSaveOperationId(
+        operation.req_id,
+        operation.generation,
+        connector_idx,
+    )
+
+
 def _checkpoint_copy(
     *,
     copy_id=41,
@@ -263,6 +266,7 @@ def _checkpoint_copy(
 
 def _checkpoint_save_meta(copy_record):
     meta = ConnectorMetadata()
+    meta.state_checkpoint_completion_channel = STATE_CHECKPOINT_STAGING_CHANNEL
     meta.requests = [
         SimpleNamespace(
             req_id=copy_record.request_id,
@@ -583,6 +587,23 @@ def test_build_connector_meta_records_completion_channel_owner():
     assert meta.requests_for_completion_channel("unknown") == []
 
 
+def test_multi_metadata_delegates_checkpoint_selection_to_protocol_owner():
+    class _CheckpointMetadata(ConnectorMetadata):
+        state_checkpoint_completion_channel = STATE_CHECKPOINT_STAGING_CHANNEL
+
+        def select_state_checkpoint_copies(self, checkpoints):
+            return checkpoints[1:]
+
+    checkpoints = [object(), object()]
+    meta = MultiConnectorMetadata(
+        [ConnectorMetadata(), _CheckpointMetadata()],
+        completion_channel_owners={STATE_CHECKPOINT_STAGING_CHANNEL: 1},
+    )
+
+    assert meta.state_checkpoint_owner == 1
+    assert meta.select_state_checkpoint_copies(checkpoints) == checkpoints[1:]
+
+
 def test_scheduler_rejects_duplicate_completion_channel_owners():
     first = FakeSchedSub(
         completion_channels={STATE_CHECKPOINT_STAGING_CHANNEL},
@@ -590,10 +611,8 @@ def test_scheduler_rejects_duplicate_completion_channel_owners():
     second = FakeSchedSub(
         completion_channels={STATE_CHECKPOINT_STAGING_CHANNEL},
     )
-    sched = _sched([first, second])
-
     with pytest.raises(ValueError, match="must have one owner"):
-        sched.build_connector_meta()
+        _sched([first, second])
 
 
 def test_role_attrs_aggregate():
@@ -686,15 +705,13 @@ def test_start_load_kv_routes_by_index_and_records_saves():
 
 
 def test_worker_rejects_duplicate_completion_channel_owners():
-    worker = _worker(
-        [
-            FakeCheckpointWorkerSub(),
-            FakeCheckpointWorkerSub(),
-        ]
-    )
-
     with pytest.raises(ValueError, match="must have one owner"):
-        worker.get_finished()
+        _worker(
+            [
+                FakeCheckpointWorkerSub(),
+                FakeCheckpointWorkerSub(),
+            ]
+        )
 
 
 def test_worker_rejects_scheduler_worker_completion_owner_mismatch():
@@ -708,6 +725,27 @@ def test_worker_rejects_scheduler_worker_completion_owner_mismatch():
         worker.start_load_kv(meta)
 
 
+def test_worker_rejects_checkpoint_channel_mismatch_with_same_owner():
+    scheduler_channel = "test.scheduler.checkpoint"
+    worker_channel = "test.worker.checkpoint"
+    owner = FakeCheckpointWorkerSub()
+    owner.completion_channels = frozenset({scheduler_channel, worker_channel})
+    owner.state_checkpoint_completion_channel = worker_channel
+    worker = _worker([owner])
+    owner_meta = ConnectorMetadata()
+    owner_meta.state_checkpoint_completion_channel = scheduler_channel
+    meta = MultiConnectorMetadata(
+        [owner_meta],
+        completion_channel_owners={
+            scheduler_channel: 0,
+            worker_channel: 0,
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="channel differs"):
+        worker.start_load_kv(meta)
+
+
 def test_get_finished_unions_and_normalizes_tuple():
     # moriio returns a legacy tuple; offload returns KVConnectorOutput.
     moriio = FakeWorkerSub(finished=(set(), {"d1"}))  # recving d1
@@ -718,6 +756,27 @@ def test_get_finished_unions_and_normalizes_tuple():
     out = w.get_finished()
     assert out.finished_recving == {"d1", "d2"}
     assert out.failed_recving == {"f1"}
+
+
+def test_get_finished_ors_child_pending_work():
+    worker = _worker(
+        [
+            FakeWorkerSub(finished=KVConnectorOutput()),
+            FakeWorkerSub(finished=KVConnectorOutput(pending_work=True)),
+        ]
+    )
+
+    assert worker.get_finished().pending_work is True
+
+
+def test_has_pending_work_ors_child_liveness_hooks():
+    first = FakeWorkerSub()
+    second = FakeWorkerSub()
+    first.has_pending_work = lambda: False
+    second.has_pending_work = lambda: True
+    worker = _worker([first, second])
+
+    assert worker.has_pending_work() is True
 
 
 def test_producer_offload_load_completion_uses_loading_state():
@@ -797,9 +856,11 @@ def test_checkpoint_staging_completions_bypass_send_save_pairing():
         finished=KVConnectorOutput(connector_completions={staged, aborted}),
     )
     w = _worker([moriio, off])
+    off_meta = _save_meta(9)
+    off_meta.state_checkpoint_completion_channel = STATE_CHECKPOINT_STAGING_CHANNEL
     w.start_load_kv(
         MultiConnectorMetadata(
-            [ConnectorMetadata(), _save_meta(9)],
+            [ConnectorMetadata(), off_meta],
             completion_channel_owners={STATE_CHECKPOINT_STAGING_CHANNEL: 1},
         )
     )
@@ -917,7 +978,7 @@ def test_page_then_sidecar_only_save_keeps_send_paired_until_both_finish():
     sidecar_done = w.get_finished()
 
     assert sidecar_done.finished_sending == {9}
-    assert sidecar_done.finished_saving == {operation}
+    assert sidecar_done.finished_saving == {_multi_save(operation, 1)}
     assert w.pairing_state_count == (0, 0)
 
 
@@ -955,7 +1016,7 @@ def test_generation_saves_pair_send_only_after_every_exact_operation():
     first = w.get_finished()
 
     assert first.finished_sending == set()
-    assert first.finished_saving == {gen0}
+    assert first.finished_saving == {_multi_save(gen0, 1)}
 
     moriio._finished = (set(), set())
     off._finished = KVConnectorOutput(
@@ -965,7 +1026,7 @@ def test_generation_saves_pair_send_only_after_every_exact_operation():
     terminal = w.get_finished()
 
     assert terminal.finished_sending == {9}
-    assert terminal.finished_saving == {gen1}
+    assert terminal.finished_saving == {_multi_save(gen1, 1)}
     assert terminal.connector_completions == {failed_sidecar}
 
 
@@ -989,10 +1050,64 @@ def test_exact_send_generation_survives_multi_save_pairing():
     terminal = worker.get_finished()
 
     assert terminal.finished_sending == {send}
-    assert terminal.finished_saving == {save}
+    assert terminal.finished_saving == {_multi_save(save, 1)}
 
 
-def test_two_saving_connectors_complete_one_outer_operation_only_together():
+def test_late_exact_send_generation_cannot_overwrite_current_generation():
+    save = SaveOperationId(9, 9)
+    stale_send = SendOperationId(9, 3)
+    current_send = SendOperationId(9, 4)
+    producer = FakeWorkerSub(is_producer=True)
+    saver = FakeWorkerSub()
+    worker = _worker([producer, saver])
+    worker.start_load_kv(
+        MultiConnectorMetadata(
+            [ConnectorMetadata(), _operation_save_meta(save, page=True)]
+        )
+    )
+
+    producer._finished = KVConnectorOutput(finished_sending={current_send})
+    assert worker.get_finished().finished_sending == set()
+
+    # The older notification arrives later.  The former scalar table replaced
+    # current_send here and released only stale_send when the save completed.
+    producer._finished = KVConnectorOutput(finished_sending={stale_send})
+    assert worker.get_finished().finished_sending == set()
+
+    producer._finished = KVConnectorOutput()
+    saver._finished = KVConnectorOutput(finished_saving={save})
+    terminal = worker.get_finished()
+
+    assert terminal.finished_sending == {stale_send, current_send}
+    assert terminal.finished_saving == {_multi_save(save, 1)}
+
+
+def test_exact_held_send_suppresses_legacy_raw_id_for_same_request():
+    save = SaveOperationId(9, 10)
+    exact_send = SendOperationId(9, 5)
+    producer = FakeWorkerSub(is_producer=True)
+    saver = FakeWorkerSub()
+    worker = _worker([producer, saver])
+    worker.start_load_kv(
+        MultiConnectorMetadata(
+            [ConnectorMetadata(), _operation_save_meta(save, page=True)]
+        )
+    )
+
+    producer._finished = KVConnectorOutput(finished_sending={9})
+    assert worker.get_finished().finished_sending == set()
+    producer._finished = KVConnectorOutput(finished_sending={exact_send})
+    assert worker.get_finished().finished_sending == set()
+    producer._finished = KVConnectorOutput(finished_sending={9})
+    assert worker.get_finished().finished_sending == set()
+
+    producer._finished = KVConnectorOutput()
+    saver._finished = KVConnectorOutput(finished_saving={save})
+
+    assert worker.get_finished().finished_sending == {exact_send}
+
+
+def test_two_saving_connectors_emit_child_namespaced_operations():
     operation = SaveOperationId(9, 20)
     first = FakeWorkerSub()
     second = FakeWorkerSub()
@@ -1007,13 +1122,47 @@ def test_two_saving_connectors_complete_one_outer_operation_only_together():
     )
 
     first._finished = KVConnectorOutput(finished_saving={operation})
-    assert worker.get_finished().finished_saving == set()
+    assert worker.get_finished().finished_saving == {_multi_save(operation, 0)}
 
     assert worker.get_finished().finished_saving == set()
 
     first._finished = KVConnectorOutput()
     second._finished = KVConnectorOutput(finished_saving={operation})
-    assert worker.get_finished().finished_saving == {operation}
+    assert worker.get_finished().finished_saving == {_multi_save(operation, 1)}
+
+
+def test_completed_generation_in_one_child_does_not_tombstone_another_child():
+    operation = SaveOperationId(9, 0)
+    first = FakeWorkerSub()
+    second = FakeWorkerSub()
+    worker = _worker([first, second])
+
+    worker.start_load_kv(
+        MultiConnectorMetadata([_operation_save_meta(operation), None])
+    )
+    first._finished = KVConnectorOutput(finished_saving={operation})
+    assert worker.get_finished().finished_saving == {_multi_save(operation, 0)}
+
+    first._finished = KVConnectorOutput()
+    worker.start_load_kv(
+        MultiConnectorMetadata([None, _operation_save_meta(operation)])
+    )
+    assert worker.pairing_state_count == (1, 0)
+    second._finished = KVConnectorOutput(finished_saving={operation})
+
+    assert worker.get_finished().finished_saving == {_multi_save(operation, 1)}
+
+
+def test_namespaced_save_completion_routes_only_to_owning_scheduler_child():
+    operation = SaveOperationId(9, 3)
+    first = FakeSchedSub(offload_methods=True)
+    second = FakeSchedSub(offload_methods=True)
+    scheduler = _sched([first, second])
+
+    scheduler.save_finished(_multi_save(operation, 1))
+
+    assert first.saved == []
+    assert second.saved == [operation]
 
 
 def test_legacy_child_completion_maps_oldest_operation_for_its_connector():
@@ -1029,8 +1178,8 @@ def test_legacy_child_completion_maps_oldest_operation_for_its_connector():
     child._finished = KVConnectorOutput(finished_saving={second})
     newest = worker.get_finished()
 
-    assert oldest.finished_saving == {first}
-    assert newest.finished_saving == {second}
+    assert oldest.finished_saving == {_multi_save(first, 0)}
+    assert newest.finished_saving == {_multi_save(second, 0)}
 
 
 def test_send_released_before_late_save_registration_still_emits_save():
@@ -1049,7 +1198,7 @@ def test_send_released_before_late_save_registration_still_emits_save():
     late_save = worker.get_finished()
 
     assert late_save.finished_sending == set()
-    assert late_save.finished_saving == {operation}
+    assert late_save.finished_saving == {_multi_save(operation, 1)}
     assert worker.pairing_state_count == (0, 0)
 
 
@@ -1065,7 +1214,7 @@ def test_reused_req_id_late_generation_duplicate_cannot_complete_new_save():
     )
     producer._finished = ({9}, set())
     saver._finished = KVConnectorOutput(finished_saving={first})
-    assert worker.get_finished().finished_saving == {first}
+    assert worker.get_finished().finished_saving == {_multi_save(first, 1)}
 
     worker.start_load_kv(
         MultiConnectorMetadata([ConnectorMetadata(), _operation_save_meta(second)])
@@ -1080,7 +1229,7 @@ def test_reused_req_id_late_generation_duplicate_cannot_complete_new_save():
     saver._finished = KVConnectorOutput(finished_saving={second})
     terminal = worker.get_finished()
     assert terminal.finished_sending == {9}
-    assert terminal.finished_saving == {second}
+    assert terminal.finished_saving == {_multi_save(second, 1)}
 
 
 def test_independent_send_release_retains_no_raw_request_state():
@@ -1097,14 +1246,13 @@ def test_independent_send_release_retains_no_raw_request_state():
 def test_completed_save_tombstones_are_bounded():
     saver = FakeWorkerSub()
     worker = _worker([saver])
-    worker._ensure_pairing_state()
     worker._completed_save_operations.limit = 2
 
     for generation in range(4):
         operation = SaveOperationId(9, 30 + generation)
         worker.start_load_kv(MultiConnectorMetadata([_operation_save_meta(operation)]))
         saver._finished = KVConnectorOutput(finished_saving={operation})
-        assert worker.get_finished().finished_saving == {operation}
+        assert worker.get_finished().finished_saving == {_multi_save(operation, 0)}
 
     assert worker.completed_save_tombstone_count == 2
 
@@ -1148,7 +1296,7 @@ def test_connector_completion_cannot_release_send_before_save_completion(
     save_terminal = w.get_finished()
 
     assert save_terminal.finished_sending == {9}
-    assert save_terminal.finished_saving == {operation}
+    assert save_terminal.finished_saving == {_multi_save(operation, 1)}
     assert w._pending_save == {}
     assert w._sent == {}
 

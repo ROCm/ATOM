@@ -43,7 +43,6 @@ from atom.kv_transfer.disaggregation.types import (
     STATE_CHECKPOINT_STAGING_CHANNEL,
     ConnectorCompletion,
     KVConnectorOutput,
-    LoadCompletionId,
     LoadOperationId,
     ReqId,
     SaveCompletionId,
@@ -52,6 +51,7 @@ from atom.kv_transfer.disaggregation.types import (
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
 from atom.kv_transfer.offload._offload_common import (
+    OffloadSchedulerMixin,
     OffloadWorkerMixin,
     build_offload_engine,
     validated_kv_role,
@@ -218,6 +218,7 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
     # finished_sending (the scheduler frees blocks on finished_sending — a P/D
     # producer semantic that would wrongly deallocate live offload blocks).
     is_producer = False
+    state_checkpoint_completion_channel = STATE_CHECKPOINT_STAGING_CHANNEL
     completion_channels = frozenset(
         {
             DSV4_CHECKPOINT_SAVE_CHANNEL,
@@ -228,8 +229,10 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
     def __init__(self, config) -> None:
         self._config = config
         kvc = getattr(config, "kv_transfer_config", {}) or {}
-        validated_kv_role(kvc)
-        self.block_size = int(config.kv_cache_block_size)
+        raw_block_size = config.kv_cache_block_size
+        if isinstance(raw_block_size, bool) or not isinstance(raw_block_size, Integral):
+            raise ValueError("DSV4 block size must be an integer")
+        self.block_size = int(raw_block_size)
         self.virtual_block_size: int | None = None
         self.profile = None
         self.chunk_size: int | None = None
@@ -275,14 +278,10 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         self._engine = None
         self._codec: DSV4PageSlotCodec | None = None
         self._lookup_server = None
-        self._slot_codec: DSV4PageSlotCodec | None = None
         self._checkpoint_codec: DSV4CheckpointCodec | None = None
         self._slot_store: DSV4CheckpointStore | None = None
         self._slot_staging: torch.Tensor | None = None
         self._slot_admission: DSV4StagingAdmission | None = None
-        self._slot_fingerprint: bytes | None = None
-        self._unresolved_slot_corruption: set[DSV4CheckpointKey] = set()
-        self._tp_size: int | None = None
 
     # -- lifecycle --------------------------------------------------------
     def register_kv_caches(
@@ -293,7 +292,6 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         tp = get_tp_group()
         rank, world = tp.rank_in_group, tp.world_size
         self._rank = rank
-        self._tp_size = world
         cfg = offcfg.build_lmcache_config(
             getattr(self._config, "kv_transfer_config", None)
         )
@@ -335,13 +333,17 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 num_slots=slot_count,
                 device=torch.device("cuda", torch.cuda.current_device()),
             )
+            if not self._codec.has_fused_chunk_major_staging:
+                raise RuntimeError(
+                    "DSV4 PAGE/SLOT offload requires Triton fused staging at "
+                    "worker startup"
+                )
         else:
             raise ValueError(
                 "hybrid PAGE+SLOT offload requires empty kv_caches and "
                 "transfer_tensors.block_regions; use offload_layout='dense' "
                 "for ordinary MHA/MLA KV caches"
             )
-        self._validate_block_geometry(transfer_tensors)
         self._engine, cfg, meta = build_offload_engine(
             self._config,
             engine_id=f"atom-offload-{rank}",
@@ -373,6 +375,7 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 ),
                 tp_size=world,
                 tp_rank=rank,
+                geometry_validated=True,
             )
             self._require_slot_components()
 
@@ -448,26 +451,8 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 f"Stateful PAGE offload num_slots must be > 0, got {num_slots}"
             )
 
-        for region_index, region in enumerate(regions):
-            prefix = f"Stateful PAGE offload SLOT region {region_index}"
-            normalized = {}
-            for name in ("base_addr", "unit_bytes", "total_bytes"):
-                value = getattr(region, name, None)
-                if (
-                    isinstance(value, bool)
-                    or not isinstance(value, Integral)
-                    or value <= 0
-                ):
-                    raise ValueError(f"{prefix} {name} must be a positive integer")
-                normalized[name] = int(value)
-            if getattr(region, "reverse_indexed", None) is not True:
-                raise ValueError(f"{prefix} must have reverse_indexed=True")
-            required_bytes = num_slots * normalized["unit_bytes"]
-            if normalized["total_bytes"] < required_bytes:
-                raise ValueError(
-                    f"{prefix} total_bytes is too small; "
-                    f"got {normalized['total_bytes']}, need {required_bytes}"
-                )
+        # Per-region address, byte geometry, and reverse-index validation is
+        # owned by the immutable DSV4PageSlotCodec snapshot constructed next.
         return True
 
     def _slot_staging_slots(self) -> int:
@@ -476,10 +461,16 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         configured = extra.get("slot_sidecar_staging_slots")
         if configured is None:
             configured = os.environ.get("OFFLOAD_SLOT_STAGING_SLOTS", "1")
-        try:
+            try:
+                count = int(configured)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "SLOT sidecar staging count must be an integer"
+                ) from exc
+        else:
+            if isinstance(configured, bool) or not isinstance(configured, Integral):
+                raise ValueError("SLOT sidecar staging count must be an integer")
             count = int(configured)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("SLOT sidecar staging count must be an integer") from exc
         if count <= 0:
             raise ValueError(f"SLOT sidecar staging count must be > 0, got {count}")
         return count
@@ -491,13 +482,15 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         model_name: str,
         tp_size: int,
         tp_rank: int,
+        geometry_validated: bool = False,
     ) -> None:
         """Build the stateful V4 SLOT runtime after the PAGE engine exists."""
         if self._engine is None:
             raise RuntimeError("SLOT sidecar initialization requires an LMCache engine")
-        if not self._validate_stateful_page_slot_geometry(transfer_tensors):
+        if not geometry_validated and not self._validate_stateful_page_slot_geometry(
+            transfer_tensors
+        ):
             raise ValueError("SLOT sidecar initialization requires a stateful PAGE")
-        regions = getattr(transfer_tensors, "swa_block_regions", None) or []
         num_slots = getattr(transfer_tensors, "num_slots", None)
         codec = self._codec
         if not isinstance(codec, DSV4PageSlotCodec) or codec.slot_bytes <= 0:
@@ -523,7 +516,7 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             kv_head_dim=self.profile.kv_head_dim,
             index_head_dim=self.profile.index_head_dim,
             num_slots=num_slots,
-            slot_regions=regions,
+            slot_regions=codec.slot_regions,
             tp_size=tp_size,
             tp_rank=tp_rank,
         )
@@ -541,12 +534,10 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
 
         # Publish only a complete runtime. A partially initialized stateful
         # PAGE connector must fail startup rather than silently drop SLOT data.
-        self._slot_codec = codec
         self._checkpoint_codec = checkpoint_codec
         self._slot_staging = staging
         self._slot_admission = admission
         self._slot_store = store
-        self._slot_fingerprint = fingerprint
         logger.info(
             "LMCache offload PAGE+SLOT registered rank=%d "
             "page_bytes_per_block=%d slot_bytes=%d slot_staging_slots=%d "
@@ -559,24 +550,24 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         )
 
     def _require_slot_components(self):
-        components = {
-            "codec": getattr(self, "_slot_codec", None),
-            "store": getattr(self, "_slot_store", None),
-            "admission": getattr(self, "_slot_admission", None),
-            "fingerprint": getattr(self, "_slot_fingerprint", None),
-        }
-        missing = [name for name, component in components.items() if component is None]
+        codec = getattr(self, "_codec", None)
+        store = getattr(self, "_slot_store", None)
+        admission = getattr(self, "_slot_admission", None)
+        missing = [
+            name
+            for name, component in (
+                ("codec", codec),
+                ("store", store),
+                ("admission", admission),
+            )
+            if component is None
+        ]
         if missing:
             raise RuntimeError(
                 "Stateful PAGE offload has incomplete SLOT components: "
                 + ", ".join(missing)
             )
-        return (
-            components["codec"],
-            components["store"],
-            components["admission"],
-            components["fingerprint"],
-        )
+        return codec, store, admission
 
     @staticmethod
     def _slot_payload_bytes(slot_codec) -> int:
@@ -609,20 +600,6 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             # This is a connector initialization invariant, not input validation.
             raise RuntimeError("DSV4 checkpoint codec is unavailable")  # noqa: TRY004
         return checkpoint_codec
-
-    def _validate_block_geometry(self, transfer_tensors) -> None:
-        """Cross-check codec blocks against existing transfer-region metadata."""
-        block_regions = getattr(transfer_tensors, "block_regions", None) or []
-        if not block_regions:
-            return
-        expected = sum(int(region.unit_bytes) for region in block_regions)
-        if self._codec.bytes_per_block != expected:
-            raise ValueError(
-                "LMCache offload KV block geometry mismatch: "
-                f"codec={self._codec.bytes_per_block} bytes, "
-                f"transfer_regions={expected} bytes, "
-                f"num_blocks={self._codec.num_blocks}"
-            )
 
     def _validate_and_log_storage_backends(self, cfg) -> None:
         """Report the realized LMCache tier topology and validate NVMe startup."""
@@ -728,7 +705,7 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         if slot_loads:
             staging_id = None
             try:
-                _, _, admission, _ = self._require_slot_components()
+                _, _, admission = self._require_slot_components()
                 staging_id = admission.try_acquire()
             except Exception:
                 logger.debug(
@@ -1083,7 +1060,7 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         """Reserve one connector-owned row without issuing a GPU copy yet."""
 
         try:
-            _, _, admission, _ = self._require_slot_components()
+            _, _, admission = self._require_slot_components()
             return admission.try_acquire()
         except Exception:  # noqa: BLE001
             return None
@@ -1098,7 +1075,7 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         """Gather ``source_group`` into an already reserved staging row."""
 
         try:
-            slot_codec, _, admission, _ = self._require_slot_components()
+            slot_codec, _, admission = self._require_slot_components()
         except Exception:  # noqa: BLE001
             return _SlotSaveSnapshot(staging_id, None, False)
 
@@ -1166,7 +1143,7 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         if not identities:
             return []
         with self._lock:
-            pending = list(getattr(self, "_deferred_checkpoint_saves", ()))
+            pending = list(self._deferred_checkpoint_saves)
             selected = [
                 save for save in pending if save.checkpoint_identity in identities
             ]
@@ -1187,11 +1164,8 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         copy_id = int(copy_id)
         with self._lock:
             self._checkpoint_staging_fences.pop(copy_id, None)
-            if copy_id in getattr(self, "_quarantined_checkpoint_staging", ()):
+            if copy_id in self._quarantined_checkpoint_staging:
                 return
-            if not hasattr(self, "_done_checkpoint_staging"):
-                self._done_checkpoint_staging = set()
-                self._aborted_checkpoint_staging = set()
             if aborted:
                 self._done_checkpoint_staging.discard(copy_id)
                 self._aborted_checkpoint_staging.add(copy_id)
@@ -1204,11 +1178,7 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         copy_id = int(copy_id)
         with self._lock:
             self._checkpoint_staging_fences.pop(copy_id, None)
-            quarantined = getattr(self, "_quarantined_checkpoint_staging", None)
-            if quarantined is None:
-                quarantined = set()
-                self._quarantined_checkpoint_staging = quarantined
-            quarantined.add(copy_id)
+            self._quarantined_checkpoint_staging.add(copy_id)
         logger.error(
             "LMCache offload: checkpoint staging completion is unknown; "
             "quarantining native lease copy_id=%d rank=%s",
@@ -1248,18 +1218,17 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                     self._complete_checkpoint_staging(copy_id, aborted=aborted)
                 return None
         with self._lock:
-            fences = getattr(self, "_checkpoint_staging_fences", None)
-            if fences is None:
-                fences = {}
-                self._checkpoint_staging_fences = fences
-            fences.setdefault(copy_id, (event, bool(aborted)))
+            self._checkpoint_staging_fences.setdefault(
+                copy_id,
+                (event, bool(aborted)),
+            )
         return event
 
     def _poll_checkpoint_staging(self) -> None:
         """Non-blockingly retire completed fences; sync only on query failure."""
 
         with self._lock:
-            pending = list(getattr(self, "_checkpoint_staging_fences", {}).items())
+            pending = list(self._checkpoint_staging_fences.items())
         for copy_id, (event, aborted) in pending:
             try:
                 query = getattr(event, "query", None)
@@ -1420,19 +1389,8 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             with self._lock:
                 if kind == "load":
                     self._complete_load_locked(req, succeeded=False)
-                else:
-                    if getattr(req, "slot_save_spec", None) is not None:
-                        failed_sidecar = getattr(self, "_failed_sidecar_save", None)
-                        if failed_sidecar is not None:
-                            failed_sidecar.add(self._save_completion_id(req))
-
-    @staticmethod
-    def _save_completion_id(req: LMCacheReqMeta) -> SaveCompletionId:
-        return getattr(req, "save_operation", None) or req.req_id
-
-    @staticmethod
-    def _load_completion_id(req: LMCacheReqMeta) -> LoadCompletionId:
-        return getattr(req, "load_operation", None) or req.req_id
+                elif getattr(req, "slot_save_spec", None) is not None:
+                    self._failed_sidecar_save.add(self._save_completion_id(req))
 
     def _complete_load_locked(self, req: LMCacheReqMeta, *, succeeded: bool) -> None:
         completion_id = self._load_completion_id(req)
@@ -1453,12 +1411,6 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
     ) -> threading.Lock:
         completion_id = save_operation or req_id
         with self._lock:
-            if not hasattr(self, "_pending_save_ops"):
-                self._pending_save_ops = {}
-            if not hasattr(self, "_save_req_locks"):
-                self._save_req_locks = {}
-            if not hasattr(self, "_pending_legacy_save_ops"):
-                self._pending_legacy_save_ops = {}
             self._done_save.discard(completion_id)
             self._pending_save_ops[req_id] = self._pending_save_ops.get(req_id, 0) + 1
             if save_operation is None:
@@ -1523,45 +1475,6 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             finally:
                 if admission_owned:
                     self._save_admission.release()
-
-    def _lookup_unpin(self, req_id) -> None:
-        if getattr(self, "_engine", None) is None:
-            return
-        try:
-            self._engine.lookup_unpin(str(req_id))
-        except Exception:  # best-effort third-party cleanup
-            logger.debug(
-                "LMCache offload: lookup unpin failed for %s",
-                req_id,
-                exc_info=True,
-            )
-
-    def _profile_enabled(self) -> bool:
-        return os.environ.get("OFFLOAD_PROFILE", "0").lower() not in (
-            "0",
-            "false",
-            "no",
-            "off",
-        )
-
-    def _last_gpu_connector_transfer_stats(self) -> dict[str, int | float]:
-        gpu_connector = getattr(getattr(self, "_engine", None), "gpu_connector", None)
-        if gpu_connector is None or not hasattr(gpu_connector, "last_transfer_stats"):
-            return {}
-        try:
-            return dict(gpu_connector.last_transfer_stats())
-        except Exception:  # optional instrumentation hook
-            logger.debug("Failed to read GPU transfer stats", exc_info=True)
-            return {}
-
-    def _reset_gpu_connector_transfer_stats(self) -> None:
-        gpu_connector = getattr(getattr(self, "_engine", None), "gpu_connector", None)
-        if gpu_connector is None or not hasattr(gpu_connector, "reset_transfer_stats"):
-            return
-        try:
-            gpu_connector.reset_transfer_stats()
-        except Exception:  # optional instrumentation hook
-            logger.debug("Failed to reset GPU transfer stats", exc_info=True)
 
     # -- copy daemon thread ----------------------------------------------
     def _load_page(self, req: LMCacheReqMeta) -> bool:
@@ -1655,7 +1568,7 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         return view if view.format == "B" and view.ndim == 1 else view.cast("B")
 
     def _create_slot_stream(self):
-        slot_codec, _, _, _ = self._require_slot_components()
+        slot_codec, _, _ = self._require_slot_components()
         if slot_codec.device.type != "cuda":
             return None
         return torch.cuda.Stream(device=slot_codec.device)
@@ -1665,7 +1578,7 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         return nullcontext() if stream is None else torch.cuda.stream(stream)
 
     def _copy_slot_staging_to_cpu(self, staging_id: int) -> torch.Tensor:
-        slot_codec, _, _, _ = self._require_slot_components()
+        slot_codec, _, _ = self._require_slot_components()
         row = self._slot_staging_view(staging_id)
         payload_bytes = self._slot_payload_bytes(slot_codec)
         host = torch.empty(
@@ -1698,7 +1611,7 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         staging_id: int,
         destination_group: int,
     ) -> None:
-        slot_codec, _, _, _ = self._require_slot_components()
+        slot_codec, _, _ = self._require_slot_components()
         payload_bytes = self._slot_payload_bytes(slot_codec)
         host = payload.reshape(-1)
         if host.dtype is not torch.uint8 or host.device.type != "cpu":
@@ -1737,7 +1650,7 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         if reservation is None:
             raise RuntimeError("SLOT load requires a pre-reserved staging row")
         staging_id = reservation.staging_id
-        slot_codec, slot_store, _, _ = self._require_slot_components()
+        slot_codec, slot_store, _ = self._require_slot_components()
         payload_bytes = self._slot_payload_bytes(slot_codec)
         checkpoint_codec = self._require_checkpoint_codec()
         key = self._slot_key(spec.boundary_block_hash)
@@ -1761,49 +1674,20 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             # would silently skip the recomputed replacement forever. The
             # store fences the key if removal fails, so a later put cannot be
             # mistaken for a committed replacement of the same corrupt bytes.
-            self._invalidate_corrupt_slot(slot_store, key)
+            try:
+                invalidated = slot_store.invalidate(key)
+            except Exception as exc:  # noqa: BLE001  # storage boundary
+                logger.warning(
+                    "LMCache SLOT sidecar invalidation failed error_type=%s",
+                    type(exc).__name__,
+                )
+            else:
+                if not invalidated:
+                    logger.warning(
+                        "LMCache SLOT sidecar corruption remains fenced by the store"
+                    )
             return False
         return True
-
-    def _invalidate_corrupt_slot(
-        self,
-        slot_store: DSV4CheckpointStore,
-        key: DSV4CheckpointKey,
-    ) -> bool:
-        """Invalidate corrupt bytes and remember any unresolved removal."""
-
-        try:
-            invalidated = bool(slot_store.invalidate(key))
-        except Exception as exc:  # noqa: BLE001  # third-party storage boundary
-            logger.warning(
-                "LMCache SLOT sidecar invalidation failed error_type=%s",
-                type(exc).__name__,
-            )
-            invalidated = False
-        with self._lock:
-            unresolved = getattr(self, "_unresolved_slot_corruption", None)
-            if unresolved is None:
-                unresolved = set()
-                self._unresolved_slot_corruption = unresolved
-            if invalidated:
-                unresolved.discard(key)
-            else:
-                unresolved.add(key)
-        return invalidated
-
-    def _prepare_slot_republication(
-        self,
-        slot_store: DSV4CheckpointStore,
-        key: DSV4CheckpointKey,
-    ) -> bool:
-        """Retry a failed corruption eviction before publishing this key."""
-
-        with self._lock:
-            unresolved = getattr(self, "_unresolved_slot_corruption", ())
-            blocked = key in unresolved
-        if not blocked:
-            return True
-        return self._invalidate_corrupt_slot(slot_store, key)
 
     def _do_load_req(
         self,
@@ -1862,7 +1746,7 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             self._complete_load(req, succeeded=loaded)
             if slot_spec is not None:
                 if loaded:
-                    slot_codec, _, _, _ = self._require_slot_components()
+                    slot_codec, _, _ = self._require_slot_components()
                     logger.info(
                         "LMCache offload: SLOT sidecar load restored rank=%s "
                         "req=%s boundary=%d bytes=%d",
@@ -1901,10 +1785,10 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
     def _wait_for_session_publication(self, probe) -> bool:
         return _wait_for_publication(
             probe,
-            timeout_s=getattr(self, "_publication_timeout_s", 5.0),
-            poll_interval_s=getattr(self, "_publication_poll_interval_s", 0.01),
-            clock=getattr(self, "_publication_clock", time.monotonic),
-            sleep=getattr(self, "_publication_sleep", time.sleep),
+            timeout_s=self._publication_timeout_s,
+            poll_interval_s=self._publication_poll_interval_s,
+            clock=self._publication_clock,
+            sleep=self._publication_sleep,
         )
 
     def _do_save_req(
@@ -2023,7 +1907,7 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             if slot_spec is not None:
                 if slot_preparation_error is not None:
                     raise slot_preparation_error
-                _, slot_store, _, _ = self._require_slot_components()
+                _, slot_store, _ = self._require_slot_components()
                 checkpoint_codec = self._require_checkpoint_codec()
                 boundary_tokens = int(slot_spec.boundary_tokens)
 
@@ -2047,9 +1931,6 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                     boundary_block_hash=slot_spec.boundary_block_hash,
                 )
                 key = self._slot_key(slot_spec.boundary_block_hash)
-                if not self._prepare_slot_republication(slot_store, key):
-                    save_failure_reason = "sidecar_invalidation"
-                    raise RuntimeError("corrupt SLOT sidecar could not be invalidated")
                 if not slot_store.put(key, slot_blob):
                     save_failure_reason = "sidecar_submission"
                     raise RuntimeError("SLOT sidecar store rejected put")
@@ -2180,18 +2061,19 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         self._poll_checkpoint_staging()
         with self._lock:
             dl, fl, ds = self._drain_common_completions_locked()
-            dss = set(getattr(self, "_done_sidecar_save", ()))
-            fss = set(getattr(self, "_failed_sidecar_save", ()))
-            dcs = set(getattr(self, "_done_checkpoint_staging", ()))
-            acs = set(getattr(self, "_aborted_checkpoint_staging", ()))
-            if hasattr(self, "_done_sidecar_save"):
-                self._done_sidecar_save.clear()
-            if hasattr(self, "_failed_sidecar_save"):
-                self._failed_sidecar_save.clear()
-            if hasattr(self, "_done_checkpoint_staging"):
-                self._done_checkpoint_staging.clear()
-            if hasattr(self, "_aborted_checkpoint_staging"):
-                self._aborted_checkpoint_staging.clear()
+            dss = set(self._done_sidecar_save)
+            fss = set(self._failed_sidecar_save)
+            dcs = set(self._done_checkpoint_staging)
+            acs = set(self._aborted_checkpoint_staging)
+            self._done_sidecar_save.clear()
+            self._failed_sidecar_save.clear()
+            self._done_checkpoint_staging.clear()
+            self._aborted_checkpoint_staging.clear()
+            pending_work = bool(
+                self._checkpoint_staging_fences
+                or self._deferred_checkpoint_saves
+                or self._pending_save_ops
+            )
         connector_completions = {
             ConnectorCompletion(
                 channel=DSV4_CHECKPOINT_SAVE_CHANNEL,
@@ -2230,6 +2112,7 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             failed_loading=fl,
             finished_saving=ds,
             connector_completions=connector_completions,
+            pending_work=pending_work,
         )
 
     def get_finished_recv_blocks(self) -> list[int]:
@@ -2241,13 +2124,14 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
 # =====================================================================
 # Scheduler side
 # =====================================================================
-class DSV4OffloadScheduler(KVConnectorSchedulerBase):
+class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
     # Consumer semantics: finished_recving wakes parked seqs (the engine asserts
     # `not is_producer` on that path). Offload never uses finished_sending.
     is_producer = False
     # Opt the scheduler into offload-wake (suffix prefill) instead of the P/D
     # decode-jump in Scheduler.schedule(); see Scheduler._is_offload_connector.
     is_offload = True
+    state_checkpoint_completion_channel = STATE_CHECKPOINT_STAGING_CHANNEL
     completion_channels = frozenset(
         {
             DSV4_CHECKPOINT_SAVE_CHANNEL,
@@ -2268,20 +2152,19 @@ class DSV4OffloadScheduler(KVConnectorSchedulerBase):
             if explicit_recap is None
             else bool(explicit_recap)
         )
-        self.block_size = int(config.kv_cache_block_size)
-        dcp_size = int(getattr(config, "decode_context_parallel_size", 1) or 1)
-        self.hash_block_size = self.block_size * dcp_size
-        self.chunk_size: int | None = None
-        self.resume_alignment = self.hash_block_size
-        checkpoint_interval = max(
-            0,
-            int(getattr(config, "state_checkpoint_interval_tokens", 0) or 0),
+        # LMCache storage and DSV4 geometry are required configuration.  Keep
+        # them outside the optional lookup-client boundary, and pass raw values
+        # to the strict profile builder so fractional geometry is not truncated.
+        cfg = offcfg.build_lmcache_config(kvc)
+        self.profile = build_dsv4_profile(
+            config,
+            chunk_size=cfg.chunk_size,
         )
-        if checkpoint_interval % self.hash_block_size:
-            checkpoint_interval = (
-                checkpoint_interval // self.hash_block_size
-            ) * self.hash_block_size
-        self.sidecar_interval = 0
+        self.block_size = self.profile.block_size
+        self.hash_block_size = self.profile.hash_block_size
+        self.chunk_size = self.profile.chunk_size
+        self.resume_alignment = self.profile.resume_alignment
+        self.sidecar_interval = self.profile.sidecar_interval
         self._lookup_client = None
 
         # req_id -> LoadSpec (pending load decided at match time)
@@ -2340,36 +2223,18 @@ class DSV4OffloadScheduler(KVConnectorSchedulerBase):
             )
             self._min_load_tokens = 8192
 
+        world = getattr(config, "tensor_parallel_size", 1)
+        if world is None:
+            world = 1
+        meta = offcfg.build_lmcache_metadata(config, cfg, world, 0)
         try:
-            cfg = offcfg.build_lmcache_config(kvc)
-        except Exception as e:  # noqa: BLE001  # optional third-party config
-            logger.warning(
-                "LMCache offload scheduler: configuration unavailable: %s", e
-            )
-        else:
-            # Geometry validation is intentionally outside the optional lookup
-            # client boundary: an invalid DCP/chunk mapping must fail startup.
-            self.profile = build_dsv4_profile(
-                config,
-                chunk_size=int(cfg.chunk_size),
-            )
-            self.block_size = self.profile.block_size
-            self.hash_block_size = self.profile.hash_block_size
-            self.chunk_size = self.profile.chunk_size
-            self.resume_alignment = self.profile.resume_alignment
-            self.sidecar_interval = self.profile.sidecar_interval
-            try:
-                from lmcache.v1.lookup_client.factory import LookupClientFactory
+            from lmcache.v1.lookup_client.factory import LookupClientFactory
 
-                world = int(getattr(config, "tensor_parallel_size", 1) or 1)
-                meta = offcfg.build_lmcache_metadata(config, cfg, world, 0)
-                self._lookup_client = LookupClientFactory.create_lookup_client(
-                    cfg, meta
-                )
-            except Exception as e:  # noqa: BLE001  # optional third-party client
-                logger.warning(
-                    "LMCache offload scheduler: lookup client unavailable: %s", e
-                )
+            self._lookup_client = LookupClientFactory.create_lookup_client(cfg, meta)
+        except Exception as e:  # noqa: BLE001  # optional third-party client
+            logger.warning(
+                "LMCache offload scheduler: lookup client unavailable: %s", e
+            )
 
     # -- match: how many extra tokens can come from CPU/NVMe -------------
     def _begin_load_lifecycle(self, seq) -> None:
@@ -2505,10 +2370,6 @@ class DSV4OffloadScheduler(KVConnectorSchedulerBase):
             else:
                 entry[1] = max(int(entry[1]), initial_saved)
 
-    def _chunk_floor(self, tokens: int) -> int:
-        chunk = int(self.chunk_size or 256)
-        return (max(0, int(tokens)) // chunk) * chunk
-
     def _sidecar_hash_data(self, seq) -> tuple[dict[int, int], list[tuple[int, int]]]:
         sid = str(seq.id)
         cached = self._sidecar_hash_cache.get(sid)
@@ -2557,7 +2418,7 @@ class DSV4OffloadScheduler(KVConnectorSchedulerBase):
         sid = str(seq.id)
         source_group = getattr(seq, "per_req_cache_group", -1)
         if (
-            not bool(getattr(seq, "_slot_initialized_after_alloc", False))
+            not bool(getattr(seq, "_state_initialized_after_alloc", False))
             or not isinstance(source_group, int)
             or source_group < 0
             or sid in self._sidecar_save_inflight
@@ -2582,7 +2443,7 @@ class DSV4OffloadScheduler(KVConnectorSchedulerBase):
     ) -> tuple[int, int] | None:
         source_group = getattr(seq, "per_req_cache_group", -1)
         if (
-            not bool(getattr(seq, "_slot_initialized_after_alloc", False))
+            not bool(getattr(seq, "_state_initialized_after_alloc", False))
             or not isinstance(source_group, int)
             or source_group < 0
         ):
@@ -2597,24 +2458,11 @@ class DSV4OffloadScheduler(KVConnectorSchedulerBase):
             failed=self._failed_sidecar_saves.get(sid, set()),
         )
 
-    def _lmcache_hit_save_floor(self, ls: LoadSpec | None) -> int:
-        if ls is None:
-            return 0
-        return self._chunk_floor(ls.lmcache_cached_tokens)
-
     def _next_save_operation(self, seq) -> SaveOperationId:
         """Issue an exact, scheduler-lifetime identity for one save generation."""
         operation = SaveOperationId(seq.id, self._save_nonce)
         self._save_nonce += 1
         return operation
-
-    def _set_save_frontier(self, sid: str, seq, saved: int) -> None:
-        saved = self._chunk_floor(saved)
-        if sid not in self._save_tracker:
-            self._save_tracker[sid] = [seq, saved]
-        else:
-            self._save_tracker[sid][0] = seq
-            self._save_tracker[sid][1] = saved
 
     def _clear_lookup_status(self, sid: str) -> None:
         if self._lookup_client is None:
@@ -2672,40 +2520,6 @@ class DSV4OffloadScheduler(KVConnectorSchedulerBase):
             return False, "too_small", hbm, lmc, need, chunk
         return True, "aligned_large_hit", hbm, lmc, need, chunk
 
-    def _maybe_start_unaligned_handoff(
-        self,
-        seq,
-        ls: LoadSpec,
-        hbm: int,
-        lmc: int,
-        chunk: int,
-    ) -> bool:
-        boundary = ((hbm + chunk - 1) // chunk) * chunk
-        remaining_after_boundary = lmc - boundary
-        min_load = int(getattr(self, "_min_load_tokens", 8192))
-        if boundary <= hbm or remaining_after_boundary < min_load:
-            return False
-
-        sid = str(seq.id)
-        ls.hbm_cached_tokens = boundary
-        ls.can_load = True
-        self._reqs_need_recv.pop(sid, None)
-        self._handoff_loads.add(sid)
-        seq.offload_loaded_tokens = hbm
-        seq.offload_handoff_boundary_tokens = boundary
-        logger.debug(
-            "[OFFLOAD-LOAD-HANDOFF] seq=%s hbm_cached=%d boundary=%d "
-            "lmc_cached=%d need_after_boundary=%d min_load=%d chunk=%d",
-            seq.id,
-            hbm,
-            boundary,
-            lmc,
-            remaining_after_boundary,
-            min_load,
-            chunk,
-        )
-        return True
-
     def adjust_prefill_chunk_after_alloc(self, seq, chunk: int) -> int:
         sid = str(seq.id)
         start = int(getattr(seq, "num_cached_tokens", 0))
@@ -2738,89 +2552,6 @@ class DSV4OffloadScheduler(KVConnectorSchedulerBase):
 
         return str(seq.id) in self._sidecar_save_inflight
 
-    def should_park_partial_prefill_for_load(self, seq) -> bool:
-        if not self._do_load:
-            return False
-        sid = str(seq.id)
-        if sid not in self._handoff_loads:
-            return False
-        ls = self._load_specs.get(sid)
-        if ls is None:
-            self._handoff_loads.discard(sid)
-            return False
-        boundary = int(getattr(seq, "offload_handoff_boundary_tokens", 0) or 0)
-        hbm = int(getattr(seq, "num_cached_tokens", 0))
-        if boundary > 0 and hbm < boundary:
-            return False
-
-        should_load, reason, hbm, lmc, need, chunk = self._decide_load_after_alloc(
-            seq, ls
-        )
-        if not should_load:
-            self._mark_load_skip(seq, reason, hbm, lmc, need, chunk)
-            self._clear_pending_load(sid)
-            return False
-
-        ls.can_load = True
-        self._reqs_need_recv[sid] = seq
-        self._handoff_loads.discard(sid)
-        seq.offload_loaded_tokens = max(hbm, lmc)
-        logger.debug(
-            "[OFFLOAD-LOAD-HANDOFF-READY] seq=%s hbm_cached=%d "
-            "lmc_cached=%d offload_loaded=%d need=%d",
-            seq.id,
-            hbm,
-            lmc,
-            seq.offload_loaded_tokens,
-            need,
-        )
-        return True
-
-    def _mark_load_skip(
-        self,
-        seq,
-        reason: str,
-        hbm: int,
-        lmc: int,
-        need: int,
-        chunk: int,
-    ) -> None:
-        seq.offload_loaded_tokens = hbm
-        min_load = int(getattr(self, "_min_load_tokens", 8192))
-        logger.debug(
-            "[OFFLOAD-LOAD-SKIP] seq=%s hbm_cached=%d lmc_cached=%d "
-            "need=%d min_load=%d chunk=%d reason=%s",
-            seq.id,
-            hbm,
-            lmc,
-            need,
-            min_load,
-            chunk,
-            reason,
-        )
-
-    def should_park_for_load_after_alloc(self, seq) -> bool:
-        if not self._do_load:
-            return False
-        sid = str(seq.id)
-        ls = self._load_specs.get(sid)
-        if ls is None:
-            return False
-        should_load, reason, hbm, lmc, need, chunk = self._decide_load_after_alloc(
-            seq, ls
-        )
-        if not should_load:
-            if (
-                reason == "unaligned_hbm_prefill"
-                and self._maybe_start_unaligned_handoff(seq, ls, hbm, lmc, chunk)
-            ):
-                return False
-            self._mark_load_skip(seq, reason, hbm, lmc, need, chunk)
-            self._clear_pending_load(sid)
-            return False
-        seq.offload_loaded_tokens = max(hbm, lmc)
-        return True
-
     def cancel_pending_load(self, seq) -> None:
         """Cancel load-only state for one concrete request lifecycle."""
         sid = str(seq.id)
@@ -2842,7 +2573,11 @@ class DSV4OffloadScheduler(KVConnectorSchedulerBase):
         self._active_slot_loads.pop(sid, None)
 
     def build_connector_meta(self) -> LMCacheOffloadMetadata:
-        meta = LMCacheOffloadMetadata()
+        meta = LMCacheOffloadMetadata(
+            state_checkpoint_completion_channel=(
+                self.state_checkpoint_completion_channel
+            )
+        )
 
         # Loads
         logger.debug("[OFFLOAD-BUILD] reqs_need_recv=%d", len(self._reqs_need_recv))
@@ -3014,27 +2749,6 @@ class DSV4OffloadScheduler(KVConnectorSchedulerBase):
                 )
         self._reqs_need_recv.clear()
         return meta
-
-    def connector_meta_dispatched(self, meta) -> None:
-        dispatched = set(getattr(meta, "lookup_requests_in_step", ()) or ())
-        if dispatched:
-            self._lookup_in_step = [
-                sid for sid in self._lookup_in_step if sid not in dispatched
-            ]
-
-    def _save_frontier(self, seq) -> int:
-        computed = min(
-            int(getattr(seq, "num_cached_tokens", 0)),
-            int(getattr(seq, "num_prompt_tokens", 0)),
-        )
-        return self._chunk_floor(computed)
-
-    def _has_pending_save(self, seq) -> bool:
-        sid = str(seq.id)
-        entry = self._save_tracker.get(sid)
-        if entry is None:
-            return False
-        return self._save_frontier(seq) > int(entry[1])
 
     def _has_pending_sidecar_save(self, seq) -> bool:
         sid = str(seq.id)

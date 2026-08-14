@@ -42,6 +42,23 @@ def test_dsv4_profile_rejects_chunk_that_splits_virtual_dcp_block():
         build_dsv4_profile(_config(), chunk_size=768)
 
 
+@pytest.mark.parametrize("invalid", [True, 256.0, "256"])
+@pytest.mark.parametrize(
+    "field",
+    ["kv_cache_block_size", "decode_context_parallel_size", "chunk_size"],
+)
+def test_dsv4_profile_rejects_coerced_integer_geometry(field, invalid):
+    config = _config()
+    chunk_size = 8192
+    if field == "chunk_size":
+        chunk_size = invalid
+    else:
+        setattr(config, field, invalid)
+
+    with pytest.raises(ValueError, match="must be an integer"):
+        build_dsv4_profile(config, chunk_size=chunk_size)
+
+
 def test_state_checkpoint_can_follow_each_lmcache_chunk_with_dcp_one():
     profile = build_dsv4_profile(
         _config(

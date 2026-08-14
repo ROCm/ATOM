@@ -6,8 +6,61 @@
 
 - 分支：`feature/dsv4-lmcache-page-slot`
 - 基线提交：`3675567 refactor(offload): remove legacy hybrid compatibility layer`
-- 本轮状态：代码修改中，**按 review 要求尚未运行任何测试、lint、compile 或 formatter**。
-- 提交状态：尚未提交、尚未推送；等后续修改和统一验证完成后处理。
+- 本轮状态：review correctness、结构 cleanup 与统一验证均已完成。
+- 提交目标：本记录与实现、测试一起提交到当前 feature 分支。
+
+## 2026-08-13：全量 review 修复与结构收口
+
+本轮按 merge-base 之后的完整净 diff 复核并处理了以下问题：
+
+- Scheduler 将 load/save/send 建模为独立 deferred-release obligations；任一异步
+  terminal 都不能越过另一个仍在读写 PAGE/SLOT 的 operation 提前 deallocate。
+- Dense save 全面使用 `SaveOperationId`；Multi 对同一 request 保留所有 exact
+  `SendOperationId`，迟到旧 generation 不再覆盖当前 generation。
+- checkpoint lease 批量申请中途失败时，以 `preserve=False` 回滚本轮已取得 lease。
+- `KVConnectorOutput.pending_work` 经 worker、Multi、TP aggregator 传到 Scheduler；
+  可完成 fence 维持 idle polling，永久 quarantine 不造成 busy-spin。
+- `DSV4CheckpointStore` 成为 corruption fence 的唯一 owner，connector 不再保存
+  第二份 unresolved-corruption 状态。
+- SLOT fingerprint 使用 immutable codec snapshot、稳定 semantic region role 与
+  versioned layout schema；相同 byte geometry 的 plane 换序也会改变 fingerprint。
+- Triton capability 在 codec 初始化时实际探测，并在 DSV4 worker startup fail-fast；
+  增加 1023/1024/1025/2049-byte tile contract/round-trip 覆盖。
+- 配置对未知 `offload_layout`、未知 `lmcache.*` override 和 bool/float/string integer
+  geometry 全部 fail-fast；scheduler 只把 lookup client 创建视为 optional，配置、
+  metadata 与 DSV4 profile 校验错误不再被 broad exception 吞掉。
+- Dense/DSV4 共用 `OffloadWorkerMixin` 与 `OffloadSchedulerMixin`；移除重复 lookup
+  unpin、profiling、handoff、frontier 与 save-pending 实现。
+- Scheduler 通过 connector metadata 的通用 checkpoint protocol 选择 copy，不再读取
+  `slot_save_spec`；Multi 通过 protocol owner 路由，Scheduler 按 connector 声明的
+  checkpoint channel 消费 terminal，不再硬编码 DSV4 staging channel。metadata、
+  scheduler、worker 三端的 protocol channel 必须完全一致。
+- Multi 对 child-local `SaveOperationId` 增加 `connector_idx` wire namespace；两个
+  saving child 即使都从 generation 0 开始，也不会互相命中 pending/tombstone，
+  completion 只回调对应 child。
+- 删除 test-only `__new__` lazy initializer、destructive pairs-only copy API、未调用的
+  composite plan/reference-span API、codec alias/unused fields 和恒等 geometry check；
+  DSV4 worker 的 completion/checkpoint collections 只允许由 `__init__` 建立，不再在
+  热路径用 `hasattr/getattr` 补造半初始化状态。
+- raw-pointer codec 严格要求 `reverse_indexed` 为原生 `bool`；numpy bool、Tensor、
+  `0/1` 不能通过 truthiness 改变 PAGE/SLOT 地址方向。
+- DeepSeek-V4 不再读取 `KVConnectorFactory._registry`；connector alias/capability 与
+  Multi topology validation 统一由 factory 负责。
+
+当前聚焦验证结果：
+
+```text
+最终聚焦回归矩阵                             642 passed
+Triton/Store/Policy 扩展矩阵                    77 passed, 7 skipped
+全仓非插件/非服务集成单测                     1769 passed, 107 skipped
+Black --check --fast（全仓）                      PASS
+Ruff（本次全部 Python 变更）                     PASS
+compileall                                       PASS
+git diff --check                                 PASS
+```
+
+全仓 Ruff 仍报告 19 个不在本分支净 diff 中的既有错误；GitHub workflow 使用
+`reviewdog -filter-mode=diff_context`，本轮变更行无 Ruff violation。
 
 ## 2026-08-13：移除 MultiConnector 中的 DSV4 completion 语义
 
@@ -205,11 +258,13 @@ all TP ranks terminal (KVOutputAggregator)
 
 未发现正常路径提前释放或永久泄漏。unknown channel、non-owner event、非法 staging ID 和无法确认的 GPU completion 都不会释放 lease。
 
-保留一个既有 fatal-path 待办：`_attach_state_checkpoint_plan()` 如果连续申请多个 lease，并在中途某个 acquire 失败，之前已取得的 lease 尚未显式 rollback。该路径原本就直接抛 scheduler invariant error，不影响当前 DSV4 happy path；后续决定是否增加批量 claim/rollback。
+该阶段记录的 fatal-path 待办已在后续全量 review 中关闭：
+`_attach_state_checkpoint_plan()` 连续申请多个 lease 时，如果中途 acquire 失败，
+会对本轮已取得 lease 逐个执行 `preserve=False` rollback。
 
 ## 统一验证待办
 
-按 review 要求，本阶段不运行验证。全部修改确认后统一执行：
+以下是当时约定的统一验证清单；现已在后续全量 review 阶段执行：
 
 ```text
 1. DSV4 PAGE/SLOT 聚焦单测

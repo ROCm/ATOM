@@ -313,6 +313,7 @@ def test_page_major_page_and_full_slot_round_trip_through_local_disk_backend(
         num_blocks=num_blocks,
         num_slots=num_slots,
         device=device,
+        slot_region_roles=("dsv4.main_kv.nope", "dsv4.main_kv.rope"),
     )
     slot_staging = torch.empty(codec.slot_bytes, dtype=torch.uint8, device=device)
     assert codec.has_fused_chunk_major_staging

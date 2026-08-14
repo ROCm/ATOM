@@ -83,6 +83,7 @@ def test_scheduler_shell_selects_family(monkeypatch):
         "build_lmcache_config",
         lambda _config=None: SimpleNamespace(chunk_size=8),
     )
+    monkeypatch.setattr(offcfg, "build_lmcache_metadata", lambda *_args: object())
 
     hybrid = LMCacheOffloadConnectorScheduler(_config(compress_ratios=[4]))
     dense = LMCacheOffloadConnectorScheduler(_config(compress_ratios=None))
@@ -109,6 +110,7 @@ def test_factory_registration_resolves_public_thin_shells(monkeypatch):
         "build_lmcache_config",
         lambda _config=None: SimpleNamespace(chunk_size=8),
     )
+    monkeypatch.setattr(offcfg, "build_lmcache_metadata", lambda *_args: object())
     config = _config(compress_ratios=None)
 
     worker = KVConnectorFactory.create_connector(config, role="worker")
@@ -150,3 +152,8 @@ def test_scheduler_shell_forwards_generic_completion_hook():
         ("completion", failed),
         ("load-ok", "c"),
     ]
+def test_worker_shell_forwards_pending_work_hook():
+    shell = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
+    shell._impl = SimpleNamespace(has_pending_work=lambda: True)
+
+    assert shell.has_pending_work() is True

@@ -3288,11 +3288,22 @@ class ModelRunner:
             return KVConnectorOutput()
 
         finished = connector.get_finished()
+        pending_callback = getattr(connector, "has_pending_work", None)
+        try:
+            pending_work = (
+                bool(pending_callback()) if callable(pending_callback) else False
+            )
+        except Exception:
+            # Losing this signal can strand a live asynchronous operation by
+            # letting the engine go idle. Keep polling after a hook failure.
+            logger.exception("KV connector pending-work hook failed")
+            pending_work = True
         # New connectors may return the full KVConnectorOutput so they can
         # report richer states. LMCache offload uses failed_recving to wake a
         # request for local recompute, and finished_saving to release blocks
         # whose free was deferred while a background save read their KV.
         if isinstance(finished, KVConnectorOutput):
+            finished.pending_work = finished.pending_work or pending_work
             return finished
 
         # Legacy P/D connectors still return the old
@@ -3301,7 +3312,9 @@ class ModelRunner:
         done_sending, done_recving = finished
 
         return KVConnectorOutput(
-            finished_sending=done_sending, finished_recving=done_recving
+            finished_sending=done_sending,
+            finished_recving=done_recving,
+            pending_work=pending_work,
         )
 
     def propose_draft_token_ids(

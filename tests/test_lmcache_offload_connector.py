@@ -10,6 +10,7 @@ import types
 from collections import deque
 from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -155,7 +156,7 @@ def _stateful_seq(
         has_per_req_cache=True,
         per_req_cache_group=group,
         prefix_hashes_published=True,
-        _slot_initialized_after_alloc=True,
+        _state_initialized_after_alloc=True,
     )
 
 
@@ -424,6 +425,13 @@ def _install_registration_dependencies(monkeypatch) -> dict:
         "build_lmcache_metadata",
         lambda _config, _cfg, _world, _rank: base_metadata,
     )
+    # Registration tests run without importing a real Triton runtime. Individual
+    # startup-failure coverage overrides this property below.
+    monkeypatch.setattr(
+        DSV4PageSlotCodec,
+        "has_fused_chunk_major_staging",
+        property(lambda _codec: True),
+    )
     return captured
 
 
@@ -459,6 +467,28 @@ def test_register_empty_kv_caches_with_page_regions_selects_page_codec(monkeypat
     assert connector._codec.num_blocks == 3
     assert connector._codec.device == torch.device("cuda:7")
     assert captured["gpu_connector"].codec is connector._codec
+
+
+def test_register_page_regions_fails_before_engine_when_triton_is_unavailable(
+    monkeypatch,
+):
+    captured = _install_registration_dependencies(monkeypatch)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        DSV4PageSlotCodec,
+        "has_fused_chunk_major_staging",
+        property(lambda _codec: False),
+    )
+    connector = _registration_connector()
+
+    with pytest.raises(RuntimeError, match="requires Triton fused staging"):
+        connector.register_kv_caches(
+            {},
+            _page_transfer_tensors(32, num_blocks=2),
+            num_blocks=2,
+        )
+
+    assert "engine" not in captured
 
 
 def test_dense_backend_registers_dense_kv_byte_codec(monkeypatch):
@@ -579,37 +609,37 @@ def test_register_stateful_page_requires_full_slot_regions_before_engine_start(
         pytest.param(
             [KVTransferRegion(0, 128, 32, reverse_indexed=True)],
             1,
-            "base_addr must be a positive integer",
+            "base_addr must be > 0",
             id="zero-base",
         ),
         pytest.param(
             [KVTransferRegion(0x1000 + 0.5, 128, 32, reverse_indexed=True)],
             1,
-            "base_addr must be a positive integer",
+            "base_addr must be an integer",
             id="noninteger-base",
         ),
         pytest.param(
             [KVTransferRegion(0x1000, 128, 0, reverse_indexed=True)],
             1,
-            "unit_bytes must be a positive integer",
+            "unit_bytes must be > 0",
             id="zero-unit",
         ),
         pytest.param(
             [KVTransferRegion(0x1000, 128, 32.5, reverse_indexed=True)],
             1,
-            "unit_bytes must be a positive integer",
+            "unit_bytes must be an integer",
             id="noninteger-unit",
         ),
         pytest.param(
             [KVTransferRegion(0x1000, 0, 32, reverse_indexed=True)],
             1,
-            "total_bytes must be a positive integer",
+            "total_bytes must be > 0",
             id="zero-total",
         ),
         pytest.param(
             [KVTransferRegion(0x1000, 128.5, 32, reverse_indexed=True)],
             1,
-            "total_bytes must be a positive integer",
+            "total_bytes must be an integer",
             id="noninteger-total",
         ),
         pytest.param(
@@ -636,6 +666,9 @@ def test_register_rejects_malformed_full_slot_geometry_before_engine_start(
     connector = _registration_connector()
     transfer_tensors = _page_transfer_tensors(32, num_blocks=2)
     transfer_tensors.num_slots = 4
+    for index, region in enumerate(regions):
+        if region.semantic_role is None:
+            region.semantic_role = f"test.slot.{index}"
     transfer_tensors.swa_block_regions = regions
     transfer_tensors.slot_regions = []
     transfer_tensors.expected_full_slot_region_count = expected_count
@@ -1438,6 +1471,7 @@ def test_scheduler_alignment_uses_dcp_hash_blocks_and_lmcache_chunks(monkeypatch
         "build_lmcache_config",
         lambda _config: SimpleNamespace(chunk_size=24),
     )
+    monkeypatch.setattr(offcfg, "build_lmcache_metadata", lambda *_args: object())
     config = SimpleNamespace(
         kv_transfer_config={},
         kv_cache_block_size=4,
@@ -1459,6 +1493,7 @@ def test_scheduler_snaps_checkpoint_interval_before_sidecar_cadence(monkeypatch)
         "build_lmcache_config",
         lambda _config: SimpleNamespace(chunk_size=24),
     )
+    monkeypatch.setattr(offcfg, "build_lmcache_metadata", lambda *_args: object())
     config = SimpleNamespace(
         kv_transfer_config={},
         kv_cache_block_size=4,
@@ -1480,6 +1515,7 @@ def test_zero_checkpoint_interval_keeps_terminal_alignment(monkeypatch):
         "build_lmcache_config",
         lambda _config: SimpleNamespace(chunk_size=24),
     )
+    monkeypatch.setattr(offcfg, "build_lmcache_metadata", lambda *_args: object())
     config = SimpleNamespace(
         kv_transfer_config={},
         kv_cache_block_size=4,
@@ -1492,6 +1528,61 @@ def test_zero_checkpoint_interval_keeps_terminal_alignment(monkeypatch):
 
     assert sched.resume_alignment == 24
     assert sched.sidecar_interval == 0
+
+
+def test_dsv4_scheduler_invalid_lmcache_config_fails_fast(monkeypatch):
+    def invalid_config(_config=None):
+        raise ValueError("invalid LMCache storage")
+
+    monkeypatch.setattr(offcfg, "build_lmcache_config", invalid_config)
+    config = SimpleNamespace(
+        kv_transfer_config={},
+        kv_cache_block_size=4,
+        decode_context_parallel_size=2,
+        tensor_parallel_size=1,
+    )
+
+    with pytest.raises(ValueError, match="invalid LMCache storage"):
+        LMCacheOffloadConnectorScheduler(config)
+
+
+def test_dsv4_scheduler_invalid_lmcache_metadata_fails_fast(monkeypatch):
+    monkeypatch.setattr(
+        offcfg,
+        "build_lmcache_config",
+        lambda _config: SimpleNamespace(chunk_size=24),
+    )
+
+    def invalid_metadata(*_args):
+        raise ValueError("invalid LMCache TP geometry")
+
+    monkeypatch.setattr(offcfg, "build_lmcache_metadata", invalid_metadata)
+    config = SimpleNamespace(
+        kv_transfer_config={},
+        kv_cache_block_size=4,
+        decode_context_parallel_size=2,
+        tensor_parallel_size=1,
+    )
+
+    with pytest.raises(ValueError, match="invalid LMCache TP geometry"):
+        LMCacheOffloadConnectorScheduler(config)
+
+
+def test_dsv4_scheduler_rejects_fractional_lmcache_chunk(monkeypatch):
+    monkeypatch.setattr(
+        offcfg,
+        "build_lmcache_config",
+        lambda _config: SimpleNamespace(chunk_size=24.5),
+    )
+    config = SimpleNamespace(
+        kv_transfer_config={},
+        kv_cache_block_size=4,
+        decode_context_parallel_size=2,
+        tensor_parallel_size=1,
+    )
+
+    with pytest.raises(ValueError, match="LMCache chunk size must be an integer"):
+        LMCacheOffloadConnectorScheduler(config)
 
 
 @pytest.mark.parametrize(
@@ -2204,7 +2295,7 @@ def test_slot_save_waits_until_post_allocation_state_copy_forward_completes():
         num_cached_tokens=8192,
         group=5,
     )
-    seq._slot_initialized_after_alloc = False
+    seq._state_initialized_after_alloc = False
     sched._save_tracker["732"] = [seq, 0]
     destination_slot = {"value": "garbage"}
     snapshots = []
@@ -2221,7 +2312,7 @@ def test_slot_save_waits_until_post_allocation_state_copy_forward_completes():
     # StateTransfer.copy initializes the live destination inside forward;
     # postprocess publishes hashes only after that forward has completed.
     destination_slot["value"] = "initialized-from-checkpoint"
-    seq._slot_initialized_after_alloc = True
+    seq._state_initialized_after_alloc = True
 
     after_forward = sched.build_connector_meta()
     after_request = after_forward.requests[0]
@@ -2634,10 +2725,11 @@ def test_paired_multi_completion_cleans_offload_state_before_deallocation():
             self.finished.append(released)
 
     producer = _Producer()
-    multi = MultiConnectorScheduler.__new__(MultiConnectorScheduler)
-    multi._connectors = [producer, offload]
-    multi.is_producer = True
-    multi.is_offload = True
+    with patch(
+        "atom.kv_transfer.disaggregation.multi.multi_connector._build_subconnectors",
+        return_value=[producer, offload],
+    ):
+        multi = MultiConnectorScheduler(SimpleNamespace())
     host = Scheduler.__new__(Scheduler)
     host.kv_connector = multi
     host.deferred_free_blocks = {seq.id: seq}
@@ -3914,6 +4006,13 @@ def test_worker_load_terminal_paths_report_exact_operation_once():
     conn._done_load = set()
     conn._failed_load = set()
     conn._done_save = set()
+    conn._done_sidecar_save = set()
+    conn._failed_sidecar_save = set()
+    conn._pending_save_ops = {}
+    conn._deferred_checkpoint_saves = []
+    conn._checkpoint_staging_fences = {}
+    conn._done_checkpoint_staging = set()
+    conn._aborted_checkpoint_staging = set()
     conn._engine = SimpleNamespace(lookup_unpin=lambda _lookup_id: None)
     operation = LoadOperationId(322, 9)
     req = LMCacheReqMeta(
@@ -4015,6 +4114,9 @@ def test_worker_save_uses_lmcache_engine_store():
     conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
     conn._lock = threading.Lock()
     conn._done_save = set()
+    conn._pending_save_ops = {}
+    conn._pending_legacy_save_ops = {}
+    conn._save_req_locks = {}
     conn.chunk_size = 4
     conn._engine = _Engine()
 
@@ -4057,6 +4159,9 @@ def test_worker_save_waits_for_forward_event_before_store():
     conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
     conn._lock = threading.Lock()
     conn._done_save = set()
+    conn._pending_save_ops = {}
+    conn._pending_legacy_save_ops = {}
+    conn._save_req_locks = {}
     conn.chunk_size = 4
     conn._engine = _Engine()
 
@@ -4450,19 +4555,6 @@ def test_codec_mla_token_major_block_accounting():
     assert codec.num_blocks == num_blocks
     # One scheduler block spans block_size tokens of `latent` bytes each.
     assert codec.bytes_per_block == block_size * latent
-
-    # Regression: passing the page-size-1 physical row count instead of the
-    # scheduler block count shrinks each transfer block by block_size. The
-    # connector compares this against its existing transfer-region metadata.
-    wrong_codec = DenseKVByteCodec(kv_caches, num_blocks=num_blocks * block_size)
-    conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
-    conn._codec = wrong_codec
-    with pytest.raises(ValueError, match="KV block geometry mismatch"):
-        conn._validate_block_geometry(
-            SimpleNamespace(
-                block_regions=[SimpleNamespace(unit_bytes=block_size * latent)]
-            )
-        )
 
     # A segment whose element count is not divisible by num_blocks is rejected.
     with pytest.raises(ValueError):

@@ -5,16 +5,22 @@ from types import SimpleNamespace
 
 import pytest
 
+from atom.kv_transfer.disaggregation.aggregator import KVOutputAggregator
 from atom.kv_transfer.disaggregation.types import (
     KVConnectorOutput,
     LoadOperationId,
+    SaveOperationId,
 )
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload.dense.connector import (
     DenseOffloadConnector,
     DenseOffloadScheduler,
 )
-from atom.kv_transfer.offload.metadata import LMCacheReqMeta, LoadSpec
+from atom.kv_transfer.offload.metadata import (
+    LMCacheReqMeta,
+    LoadSpec,
+    SaveSpec,
+)
 from atom.model_engine.scheduler import Scheduler
 
 
@@ -32,6 +38,11 @@ def _scheduler(monkeypatch, role="offload"):
         offcfg,
         "build_lmcache_config",
         lambda _config=None: SimpleNamespace(chunk_size=8),
+    )
+    monkeypatch.setattr(
+        offcfg,
+        "build_lmcache_metadata",
+        lambda *_args: object(),
     )
     return DenseOffloadScheduler(_config(role))
 
@@ -78,6 +89,60 @@ def test_dense_backend_rejects_unknown_role(monkeypatch, connector_cls):
 
     with pytest.raises(ValueError, match="invalid kv_role"):
         connector_cls(_config("invalid"))
+
+
+def test_dense_scheduler_invalid_lmcache_config_fails_fast(monkeypatch):
+    def invalid_config(_config=None):
+        raise ValueError("invalid LMCache storage")
+
+    monkeypatch.setattr(offcfg, "build_lmcache_config", invalid_config)
+
+    with pytest.raises(ValueError, match="invalid LMCache storage"):
+        DenseOffloadScheduler(_config())
+
+
+def test_dense_scheduler_invalid_lmcache_metadata_fails_fast(monkeypatch):
+    monkeypatch.setattr(
+        offcfg,
+        "build_lmcache_config",
+        lambda _config=None: SimpleNamespace(chunk_size=8),
+    )
+
+    def invalid_metadata(*_args):
+        raise ValueError("invalid LMCache layer geometry")
+
+    monkeypatch.setattr(offcfg, "build_lmcache_metadata", invalid_metadata)
+
+    with pytest.raises(ValueError, match="invalid LMCache layer geometry"):
+        DenseOffloadScheduler(_config())
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("kv_cache_block_size", 4.5, "Dense block size must be an integer"),
+        ("chunk_size", 8.5, "LMCache chunk size must be an integer"),
+    ],
+)
+def test_dense_scheduler_rejects_coerced_geometry(
+    monkeypatch,
+    field,
+    value,
+    message,
+):
+    config = _config()
+    if field == "kv_cache_block_size":
+        config.kv_cache_block_size = value
+    monkeypatch.setattr(
+        offcfg,
+        "build_lmcache_config",
+        lambda _config=None: SimpleNamespace(
+            chunk_size=value if field == "chunk_size" else 8
+        ),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        DenseOffloadScheduler(config)
 
 
 def test_dense_worker_resolves_virtual_dcp_block_size():
@@ -160,6 +225,90 @@ def test_dense_build_load_metadata_uses_increasing_exact_generations(monkeypatch
     assert first == LoadOperationId(req_id=11, generation=0)
     assert second == LoadOperationId(req_id=11, generation=1)
     assert scheduler._active_load_operations["11"] == (seq, second)
+
+
+def test_dense_build_save_metadata_uses_increasing_exact_generations(monkeypatch):
+    scheduler = _scheduler(monkeypatch, "kv_producer")
+    seq = _load_seq(12, num_prompt_tokens=16)
+    scheduler.update_state_after_alloc(seq)
+    seq.num_cached_tokens = 8
+
+    first_meta = scheduler.build_connector_meta()
+    first = first_meta.requests[0].save_operation
+    scheduler.save_finished(first)
+    seq.num_cached_tokens = 16
+    second_meta = scheduler.build_connector_meta()
+    second = second_meta.requests[0].save_operation
+
+    assert first == SaveOperationId(req_id=12, generation=0)
+    assert second == SaveOperationId(req_id=12, generation=1)
+    assert scheduler._save_inflight["12"] == second
+
+
+def test_dense_stale_or_raw_save_completion_cannot_clear_exact_lifecycle(
+    monkeypatch,
+):
+    scheduler = _scheduler(monkeypatch, "kv_producer")
+    seq = _load_seq(13, num_prompt_tokens=16)
+    scheduler.update_state_after_alloc(seq)
+    seq.num_cached_tokens = 8
+    stale = scheduler.build_connector_meta().requests[0].save_operation
+    scheduler.save_finished(stale)
+
+    seq.num_cached_tokens = 16
+    current = scheduler.build_connector_meta().requests[0].save_operation
+    scheduler.save_finished(stale)
+    scheduler.save_finished(seq.id)
+
+    assert scheduler._save_inflight["13"] == current
+
+    scheduler.save_finished(current)
+    assert "13" not in scheduler._save_inflight
+
+    # A raw completion remains compatible with an explicitly legacy lifecycle.
+    scheduler._save_inflight["legacy"] = "legacy"
+    scheduler.save_finished("legacy")
+    assert "legacy" not in scheduler._save_inflight
+
+
+def test_dense_worker_exact_save_generations_do_not_form_cross_tp_quorum():
+    workers = [DenseOffloadConnector(_config("kv_producer")) for _ in range(2)]
+    operations = [
+        SaveOperationId(req_id=14, generation=6),
+        SaveOperationId(req_id=14, generation=7),
+    ]
+
+    try:
+        outputs = []
+        for worker_idx, (worker, operation) in enumerate(zip(workers, operations)):
+            worker.chunk_size = 8
+            skip = 8
+            if worker_idx:
+                skip = 0
+                worker._engine = SimpleNamespace(
+                    gpu_connector=None,
+                    store=lambda _tokens, **_kwargs: None,
+                )
+            worker._do_save_req(
+                LMCacheReqMeta(
+                    req_id=14,
+                    token_ids=list(range(8)),
+                    block_ids=[3],
+                    save_spec=SaveSpec(skip_leading_tokens=skip),
+                    save_operation=operation,
+                )
+            )
+            outputs.append(worker.get_finished())
+
+        assert outputs[0].finished_saving == {operations[0]}
+        assert outputs[1].finished_saving == {operations[1]}
+        assert (
+            KVOutputAggregator(world_size=2).aggregate(outputs).finished_saving == set()
+        )
+    finally:
+        for worker in workers:
+            worker._save_executor.shutdown(wait=True)
+            worker._load_executor.shutdown(wait=True)
 
 
 @pytest.mark.parametrize("outcome", ["exception", "miss"])

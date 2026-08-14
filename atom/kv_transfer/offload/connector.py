@@ -86,6 +86,11 @@ class LMCacheOffloadConnector(KVConnectorBase):
     def get_finished(self):
         return self._impl.get_finished()
 
+    def has_pending_work(self) -> bool:
+        """Preserve the worker liveness hook across the public shell."""
+
+        return bool(self._impl.has_pending_work())
+
     def get_finished_recv_blocks(self):
         return self._impl.get_finished_recv_blocks()
 

@@ -124,6 +124,61 @@ def test_page_namespace_separates_explicit_offload_layout_families():
     ) != offcfg.build_page_namespace(hybrid, _lmcache_config(), 4)
 
 
+@pytest.mark.parametrize("override", ["typo", True, 1])
+def test_unknown_explicit_offload_layout_is_rejected(override):
+    config = _config()
+    config.kv_transfer_config = {"offload_layout": override}
+
+    with pytest.raises(ValueError, match="unknown offload_layout"):
+        offcfg.select_offload_layout(config)
+
+
+@pytest.mark.parametrize("invalid", [True, 256.0, "256"])
+@pytest.mark.parametrize("field", ["block", "chunk", "world", "hf"])
+def test_page_namespace_rejects_coerced_integer_geometry(field, invalid):
+    config = _config()
+    cfg = _lmcache_config()
+    world_size = 4
+    if field == "block":
+        config.kv_cache_block_size = invalid
+    elif field == "chunk":
+        cfg.chunk_size = invalid
+    elif field == "world":
+        world_size = invalid
+    else:
+        config.hf_config.kv_head_dim = invalid
+
+    with pytest.raises(ValueError, match="must be an integer"):
+        offcfg.build_page_namespace(config, cfg, world_size)
+
+
+def test_page_namespace_rejects_numpy_boolean_geometry():
+    np = pytest.importorskip("numpy")
+    config = _config()
+    config.hf_config.kv_head_dim = np.bool_(True)
+
+    with pytest.raises(ValueError, match="must be an integer"):
+        offcfg.build_page_namespace(config, _lmcache_config(), 4)
+
+
+def test_page_namespace_accepts_numpy_integer_geometry():
+    np = pytest.importorskip("numpy")
+    config = _config()
+    config.hf_config.kv_head_dim = np.int64(512)
+
+    assert offcfg.build_page_namespace(config, _lmcache_config(), 4)
+
+
+def test_unknown_lmcache_override_is_rejected():
+    cfg = SimpleNamespace(chunk_size=8192)
+
+    with pytest.raises(ValueError, match="unknown LMCache override"):
+        offcfg.apply_extra_overrides(
+            cfg,
+            {"kv_connector_extra_config": {"lmcache.chunk_szie": 4096}},
+        )
+
+
 def test_scheduler_and_worker_metadata_share_page_namespace(monkeypatch):
     @dataclass
     class _Metadata:

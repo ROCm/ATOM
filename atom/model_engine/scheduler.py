@@ -716,6 +716,11 @@ class Scheduler:
         from atom.utils.forward_context import get_kvconnector
 
         self.kv_connector = get_kvconnector("scheduler", config)
+        # Last TP-aggregated worker liveness snapshot. This deliberately does
+        # not mirror the raw checkpoint lease count: a lease can be retained as
+        # a permanent safety quarantine after GPU completion becomes
+        # unknowable, and such a lease must not keep the engine polling forever.
+        self._connector_pending_work = False
 
         from atom.distributed.kv_events import (
             EventPublisher as _EventPublisher,
@@ -935,6 +940,7 @@ class Scheduler:
             and not self.running
             and not self._rejected
             and not self.deferred_free_blocks
+            and not getattr(self, "_connector_pending_work", False)
         )
 
     def add(self, seq: Sequence):
@@ -994,6 +1000,97 @@ class Scheduler:
             )
             return
         self.deferred_free_blocks[seq.id] = seq
+
+    def _deferred_sequence(self, req_id) -> Sequence | None:
+        seq = self.deferred_free_blocks.get(req_id)
+        if seq is not None:
+            return seq
+        try:
+            return self.deferred_free_blocks.get(int(req_id))
+        except (TypeError, ValueError):
+            return None
+
+    def _pop_deferred_sequence(self, req_id) -> Sequence | None:
+        seq = self.deferred_free_blocks.pop(req_id, None)
+        if seq is not None:
+            return seq
+        try:
+            return self.deferred_free_blocks.pop(int(req_id), None)
+        except (TypeError, ValueError):
+            return None
+
+    def _deferred_release_obligations(self, seq: Sequence) -> set[str]:
+        """Return the load/save/send obligations protecting ``seq``.
+
+        The lazy inference preserves deferred lifecycles created by older
+        connectors and tests. New scheduler paths create the set explicitly,
+        which is important for an aborted load on a composite connector: it
+        must not acquire a producer-send obligation merely because another
+        child connector is a producer.
+        """
+
+        obligations = getattr(seq, "_deferred_release_obligations", None)
+        if obligations is None:
+            obligations = set()
+            awaiting_load = bool(getattr(seq, "_awaiting_aborted_load_cleanup", False))
+            if awaiting_load:
+                obligations.add("load")
+            if (
+                self._connector_flag("is_producer")
+                and not awaiting_load
+                and not getattr(seq, "_kv_send_completed", False)
+            ):
+                obligations.add("send")
+            seq._deferred_release_obligations = obligations
+        return obligations
+
+    def _set_release_obligation(self, seq: Sequence, obligation: str) -> None:
+        self._deferred_release_obligations(seq).add(obligation)
+
+    def _clear_release_obligation(self, seq: Sequence, obligation: str) -> None:
+        self._deferred_release_obligations(seq).discard(obligation)
+
+    def _refresh_save_release_obligation(self, seq: Sequence) -> None:
+        obligations = self._deferred_release_obligations(seq)
+        callback = getattr(self.kv_connector, "should_defer_free", None)
+        if callable(callback) and callback(seq):
+            obligations.add("save")
+        else:
+            obligations.discard("save")
+
+    def _release_deferred_if_ready(self, seq: Sequence) -> bool:
+        """Deallocate ``seq`` only after every async reader is terminal."""
+
+        if self._deferred_sequence(seq.id) is not seq:
+            return False
+        self._refresh_save_release_obligation(seq)
+        if self._deferred_release_obligations(seq):
+            return False
+
+        # A second finish notification is intentional for a lifecycle that was
+        # deferred: offload connectors use it to discard now-terminal save
+        # tracking, while producer connectors keep their existing exact send
+        # generation idempotently.
+        callback = getattr(self.kv_connector, "request_finished", None)
+        if callable(callback):
+            callback(seq)
+        self._refresh_save_release_obligation(seq)
+        if self._deferred_release_obligations(seq):
+            return False
+
+        released = self._pop_deferred_sequence(seq.id)
+        assert (
+            released is seq
+        ), f"deferred request ID {seq.id!r} changed lifecycle before release"
+        for marker in (
+            "_kv_send_completed",
+            "_send_operation",
+            "_deferred_release_obligations",
+        ):
+            if hasattr(seq, marker):
+                delattr(seq, marker)
+        self.block_manager.deallocate(seq)
+        return True
 
     def _unschedulable_reason(self, seq: Sequence) -> str | None:
         """Return a human-readable reason if `seq` is permanently unschedulable.
@@ -1656,6 +1753,11 @@ class Scheduler:
         seq.leave_reason = "aborted"
         self._rejected.append(seq)
         if owns_remote_resources or has_inflight_load:
+            # This is a load lifecycle, even when a composite connector also
+            # has a producer child. Start from an explicit empty set so legacy
+            # producer inference cannot invent a send obligation for an abort.
+            seq._deferred_release_obligations = set()
+            self._defer_free(seq)
             active_operation = getattr(seq, "_active_load_operation", None)
             consumed_operation = getattr(seq, "_consumed_load_operation", None)
             terminal_consumed = (
@@ -1677,13 +1779,12 @@ class Scheduler:
                 self._cleanup_aborted_load(seq)
                 return
             seq._awaiting_aborted_load_cleanup = True
-            self._defer_free(seq)
+            self._set_release_obligation(seq, "load")
         else:
             self._uncount_inflight_load(seq)
 
     def _cleanup_aborted_load(self, seq: Sequence) -> None:
-        if self.deferred_free_blocks.get(seq.id) is seq:
-            self.deferred_free_blocks.pop(seq.id, None)
+        self._clear_release_obligation(seq, "load")
         if hasattr(seq, "_awaiting_aborted_load_cleanup"):
             delattr(seq, "_awaiting_aborted_load_cleanup")
         self._uncount_inflight_load(seq)
@@ -1695,9 +1796,7 @@ class Scheduler:
         ):
             if hasattr(seq, marker):
                 delattr(seq, marker)
-        if hasattr(self.kv_connector, "request_finished"):
-            self.kv_connector.request_finished(seq)
-        self.block_manager.deallocate(seq)
+        self._release_deferred_if_ready(seq)
 
     def _finish_aborted_load_cleanup(self, completion_id) -> bool:
         req_id = (
@@ -1705,12 +1804,7 @@ class Scheduler:
             if isinstance(completion_id, LoadOperationId)
             else completion_id
         )
-        seq = self.deferred_free_blocks.get(req_id)
-        if seq is None:
-            try:
-                seq = self.deferred_free_blocks.get(int(req_id))
-            except (TypeError, ValueError):
-                seq = None
+        seq = self._deferred_sequence(req_id)
         expected_operation = getattr(seq, "_load_operation", None) if seq else None
         if (
             seq is None
@@ -2162,7 +2256,7 @@ class Scheduler:
                     # StateTransfer.copy runs inside this prefill forward. Mark
                     # the live destination ready only after that forward has
                     # returned, before connector metadata for a later batch.
-                    seq._slot_initialized_after_alloc = True
+                    seq._state_initialized_after_alloc = True
         if batch is not None and self.advance_on_schedule:
             # Progress already advanced at schedule time; publish prefix-cache
             # hashes at the chunk's pre-advance offset and record non-final chunks.
@@ -2518,23 +2612,23 @@ class Scheduler:
             if self.kv_connector is not None:
                 if hasattr(self.kv_connector, "request_finished"):
                     self.kv_connector.request_finished(seq)
-                if not self.kv_connector.is_producer:
-                    if hasattr(self.kv_connector, "should_defer_free") and (
-                        self.kv_connector.should_defer_free(seq)
-                    ):
-                        logger.debug(
-                            "Deferring block free for seq %s until KV save completes.",
-                            seq.id,
-                        )
-                        self._defer_free(seq)
-                    else:
-                        self.block_manager.deallocate(seq)
-                else:
+                # Establish every reader obligation before deciding whether the
+                # allocation can be returned. A composite connector may need
+                # both a producer send and an offload save to finish.
+                seq._deferred_release_obligations = set()
+                if self._connector_flag("is_producer"):
+                    self._set_release_obligation(seq, "send")
+                self._refresh_save_release_obligation(seq)
+                if self._deferred_release_obligations(seq):
                     logger.debug(
-                        "Deferring block free for seq %s until KV send completes.",
+                        "Deferring block free for seq %s; pending KV obligations=%s",
                         seq.id,
+                        sorted(self._deferred_release_obligations(seq)),
                     )
                     self._defer_free(seq)
+                else:
+                    delattr(seq, "_deferred_release_obligations")
+                    self.block_manager.deallocate(seq)
             else:
                 self.block_manager.deallocate(seq)
             self.running.remove(seq)
@@ -2753,14 +2847,9 @@ class Scheduler:
         if kv_connector_output is None:
             return
 
-        def _pop_deferred(req_id):
-            seq = self.deferred_free_blocks.pop(req_id, None)
-            if seq is not None:
-                return seq
-            try:
-                return self.deferred_free_blocks.pop(int(req_id), None)
-            except (TypeError, ValueError):
-                return None
+        self._connector_pending_work = bool(
+            getattr(kv_connector_output, "pending_work", False)
+        )
 
         def _raw_req_id(value):
             return (
@@ -2768,15 +2857,6 @@ class Scheduler:
                 if isinstance(value, (SaveOperationId, SendOperationId))
                 else value
             )
-
-        def _release_deferred(seq):
-            if hasattr(seq, "_kv_send_completed"):
-                delattr(seq, "_kv_send_completed")
-            if hasattr(self.kv_connector, "request_finished"):
-                self.kv_connector.request_finished(seq)
-            if hasattr(seq, "_send_operation"):
-                delattr(seq, "_send_operation")
-            self.block_manager.deallocate(seq)
 
         is_producer = self._connector_flag("is_producer")
         is_offload = self._connector_flag("is_offload")
@@ -2859,12 +2939,7 @@ class Scheduler:
             ), "Only producer should free blocks after sending KV"
             logger.debug("Finished sending KV transfer for request %s", req_id)
             raw_req_id = _raw_req_id(req_id)
-            seq = self.deferred_free_blocks.get(raw_req_id)
-            if seq is None:
-                try:
-                    seq = self.deferred_free_blocks.get(int(raw_req_id))
-                except (TypeError, ValueError):
-                    seq = None
+            seq = self._deferred_sequence(raw_req_id)
             expected_send = getattr(seq, "_send_operation", None) if seq else None
             if expected_send is not None:
                 if req_id != expected_send:
@@ -2874,33 +2949,16 @@ class Scheduler:
                 # their marker. Legacy raw completions remain compatible only
                 # when no exact lifecycle was established.
                 continue
-            seq = _pop_deferred(raw_req_id)
             assert seq is not None, f"req_id={req_id} not found in deferred_free_blocks"
-            if hasattr(
-                self.kv_connector, "should_defer_free"
-            ) and self.kv_connector.should_defer_free(seq):
-                seq._kv_send_completed = True
-                self._defer_free(seq)
-                continue
-            _release_deferred(seq)
+            seq._kv_send_completed = True
+            self._clear_release_obligation(seq, "send")
+            self._release_deferred_if_ready(seq)
 
         for req_id in finished_saving:
             raw_req_id = _raw_req_id(req_id)
-            seq = self.deferred_free_blocks.get(raw_req_id)
-            if seq is None:
-                try:
-                    seq = self.deferred_free_blocks.get(int(raw_req_id))
-                except (TypeError, ValueError):
-                    seq = None
-            if seq is not None and not (
-                hasattr(self.kv_connector, "should_defer_free")
-                and self.kv_connector.should_defer_free(seq)
-            ):
-                if is_producer and not getattr(seq, "_kv_send_completed", False):
-                    continue
-                seq = _pop_deferred(raw_req_id)
-                if seq is not None:
-                    _release_deferred(seq)
+            seq = self._deferred_sequence(raw_req_id)
+            if seq is not None:
+                self._release_deferred_if_ready(seq)
 
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""
@@ -3162,6 +3220,7 @@ class DecodeScheduler(Scheduler):
             and not self.running
             and not self._rejected
             and not self.deferred_free_blocks
+            and not getattr(self, "_connector_pending_work", False)
             and not has_prefill
         )
 
@@ -3169,7 +3228,11 @@ class DecodeScheduler(Scheduler):
         with self._prefill_lock:
             has_prefill = bool(self.prefill_waiting or self.prefill_done)
         return bool(
-            self.waiting or self.running or self.deferred_free_blocks or has_prefill
+            self.waiting
+            or self.running
+            or self.deferred_free_blocks
+            or getattr(self, "_connector_pending_work", False)
+            or has_prefill
         )
 
     def get_num_unfinished_requests(self) -> int:

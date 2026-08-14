@@ -8,6 +8,9 @@ PAGE/SLOT 使用统一 codec，SLOT 仅按 interval 保存，checkpoint destinat
 all-TP staging completion 管理 lease，GPU temp row 在 D2H 后立即释放。第一版仍然
 使用标准 PAGE chunks 与独立 AOS1 checkpoint object。跨 scheduler restart 的 SLOT
 发现保持 session-local fail-closed，本版未实现 persistent manifest/contains adapter。
+Review 收口后，未被第一版 storage path 使用的 `checkpoint_plan()`、
+`DSV4CopySpan` 和 reference-span API 已删除；如果未来重新批准 PAGE+SLOT bundle，
+应连同 wire/storage contract 一起新增，避免长期保留半套预留接口。
 
 ## 1. 目标
 
@@ -2938,8 +2941,8 @@ unified codec 的 typed entrypoint。
 6. PAGE 与 SLOT 是否合并为一个 GPU layout codec：**已确认，第一版合并为
    DSV4 专用的 `DSV4PageSlotCodec`**；PAGE/SLOT typed plan 共用 copy engine。
 7. 是否同时强制一次 composite gather 和一个 Storage bundle：**第一版不做**；
-   保留 `checkpoint_plan()`，等 lease 生命周期稳定后只为稀疏/terminal checkpoint
-   单独评审 bundle storage policy。
+   未使用的 `checkpoint_plan()` 已删除。后续只有在稀疏/terminal bundle storage
+   policy 与 wire format 同时获批时才重新引入 composite plan。
 8. 如果启用 bundle，PAGE/SLOT 是否合成一个带 runtime 方向分支的大 kernel：
    **已确认不合成**。同一个 checkpoint stream 上依次运行 PAGE forward specialization
    和 SLOT reverse specialization，共用一个 staging buffer，最后只记录一个

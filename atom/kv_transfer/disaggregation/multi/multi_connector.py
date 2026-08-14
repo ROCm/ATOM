@@ -99,6 +99,38 @@ class _LegacySaveOperation:
     nonce: int
 
 
+@dataclass(frozen=True)
+class MultiSaveOperationId(SaveOperationId):
+    """Wire identity for one exact save owned by a Multi child.
+
+    Child schedulers allocate generations independently, so the child index is
+    part of the composite identity.  As a ``SaveOperationId`` subclass it keeps
+    the generic aggregator and scheduler request-ID handling compatible.
+    """
+
+    connector_idx: int
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.connector_idx < 0:
+            raise ValueError("save operation connector index must be nonnegative")
+
+    @property
+    def child_operation(self) -> SaveOperationId:
+        return SaveOperationId(self.req_id, self.generation)
+
+
+def _namespace_save_operation(
+    connector_idx: int,
+    operation: SaveOperationId,
+) -> MultiSaveOperationId:
+    return MultiSaveOperationId(
+        req_id=operation.req_id,
+        generation=operation.generation,
+        connector_idx=connector_idx,
+    )
+
+
 class _CompletedOperationWindow:
     """Bounded exact-operation memory with O(1) lookup and FIFO eviction."""
 
@@ -156,7 +188,11 @@ def _build_subconnectors(config: Any, role: str) -> list:
                 f"connectors[{i}] must be a dict with a 'kv_connector' key, "
                 f"got {sub!r}"
             )
-        if sub["kv_connector"] == "multi":
+        backend_name = KVConnectorFactory.canonical_name(
+            sub["kv_connector"],
+            path=f"kv_transfer_config.connectors[{i}]",
+        )
+        if backend_name == "multi":
             raise ValueError("multi connector cannot nest another 'multi'")
         cfg_i = copy.copy(config)
         cfg_i.kv_transfer_config = sub
@@ -164,7 +200,7 @@ def _build_subconnectors(config: Any, role: str) -> list:
         logger.debug(
             "multi: built sub-connector[%d] backend=%s role=%s",
             i,
-            sub["kv_connector"],
+            backend_name,
             role,
         )
     return connectors
@@ -260,7 +296,6 @@ class MultiConnectorMetadata(ConnectorMetadata):
             return []
         return list(getattr(self.metas[owner], "requests", ()) or ())
 
-
 # ---------------------------------------------------------------------------
 # Worker side
 # ---------------------------------------------------------------------------
@@ -281,12 +316,14 @@ class MultiConnector(KVConnectorBase):
         self._pending_save: dict[Any, set[int]] = {}
         self._operation_output: dict[Any, Any] = {}
         self._req_operations: dict[str, deque[Any]] = {}
-        self._sent: dict[str, Any] = {}
+        # A request ID can be reused while an earlier send notification is
+        # still in flight.  Keep every exact generation: a late notification
+        # for the old lifecycle must not replace the current one.
+        self._sent: dict[str, set[Any]] = {}
         self._legacy_save_nonce = 0
         self._completed_save_operations = _CompletedOperationWindow(4096)
-        # Completion channels have exactly one child owner. This keeps a
-        # composite connector generic and prevents two children from reading
-        # the same native checkpoint lease behind one completion identity.
+        # Completion channels have exactly one child owner so opaque terminal
+        # notifications are routed to the backend that declared them.
         self._completion_channel_owners = _completion_channel_owners(self._connectors)
 
     def register_kv_caches(
@@ -332,9 +369,10 @@ class MultiConnector(KVConnectorBase):
             for req_id, output in save_operations:
                 req_key = str(req_id)
                 if isinstance(output, SaveOperationId):
-                    if output in self._completed_save_operations:
+                    operation = _namespace_save_operation(connector_idx, output)
+                    if operation in self._completed_save_operations:
                         continue
-                    operation = output
+                    outer_output = operation
                 else:
                     operation = legacy_operations.get(req_key)
                     if operation is None:
@@ -344,19 +382,41 @@ class MultiConnector(KVConnectorBase):
                         )
                         self._legacy_save_nonce += 1
                         legacy_operations[req_key] = operation
+                    outer_output = output
                 if operation not in self._pending_save:
                     self._pending_save[operation] = set()
-                    self._operation_output[operation] = output
+                    self._operation_output[operation] = outer_output
                     self._req_operations.setdefault(req_key, deque()).append(operation)
                 self._pending_save[operation].add(connector_idx)
             c.start_load_kv(m)
 
+    def has_pending_work(self) -> bool:
+        """Compose child hook-based liveness at the composite boundary."""
+
+        for connector_idx, connector in enumerate(self._connectors):
+            callback = getattr(connector, "has_pending_work", None)
+            if not callable(callback):
+                continue
+            try:
+                if callback():
+                    return True
+            except Exception:
+                # Keep the outer engine polling, matching ModelRunner's direct
+                # connector behavior when a liveness hook itself fails.
+                logger.exception(
+                    "multi: pending-work hook failed child=%d backend=%s",
+                    connector_idx,
+                    type(connector).__name__,
+                )
+                return True
+        return False
+
     def get_finished(self) -> KVConnectorOutput:
-        self._ensure_pairing_state()
         recv: set = set()
         failed: set = set()
         loaded: set = set()
         load_failed: set = set()
+        pending_work = False
         connector_completions: set[ConnectorCompletion] = set()
         send_now: list = []
         completed_save_now: list = []
@@ -367,6 +427,7 @@ class MultiConnector(KVConnectorBase):
             failed |= o.failed_recving
             loaded |= o.finished_loading
             load_failed |= o.failed_loading
+            pending_work |= bool(getattr(o, "pending_work", False))
             for completion in o.connector_completions:
                 owner = self._completion_channel_owners.get(completion.channel)
                 if owner != connector_idx:
@@ -381,16 +442,21 @@ class MultiConnector(KVConnectorBase):
                 connector_completions.add(completion)
             send_now.extend(o.finished_sending)
             for completion in o.finished_saving:
+                outer_completion = (
+                    _namespace_save_operation(connector_idx, completion)
+                    if isinstance(completion, SaveOperationId)
+                    else completion
+                )
                 completed = self._consume_save_completion(connector_idx, completion)
                 if completed is _PARTIAL_SAVE:
                     continue
                 if completed is None:
                     if (
-                        isinstance(completion, SaveOperationId)
-                        and completion in self._completed_save_operations
+                        isinstance(outer_completion, SaveOperationId)
+                        and outer_completion in self._completed_save_operations
                     ):
                         continue
-                    unregistered_save_now.append(completion)
+                    unregistered_save_now.append(outer_completion)
                 else:
                     completed_save_now.append(completed)
 
@@ -400,6 +466,7 @@ class MultiConnector(KVConnectorBase):
             finished_loading=loaded,
             failed_loading=load_failed,
             connector_completions=connector_completions,
+            pending_work=pending_work,
         )
 
         out.finished_saving = set(completed_save_now) | set(unregistered_save_now)
@@ -411,42 +478,47 @@ class MultiConnector(KVConnectorBase):
         for r in send_now:
             req_key = str(_send_req_id(r))
             if self._req_has_pending_save(req_key):
-                self._sent[req_key] = r
+                held = self._sent.setdefault(req_key, set())
+                if isinstance(r, SendOperationId):
+                    # Exact lifecycle identity supersedes a legacy raw-ID
+                    # notification, but never another exact generation.
+                    held.difference_update(
+                        {
+                            completion
+                            for completion in held
+                            if not isinstance(completion, SendOperationId)
+                        }
+                    )
+                    held.add(r)
+                elif not any(
+                    isinstance(completion, SendOperationId) for completion in held
+                ):
+                    # Raw IDs remain supported only when this request has no
+                    # exact send lifecycle in the held state.
+                    held.add(r)
             else:
                 rel_send.add(r)
 
-        for key, raw in list(self._sent.items()):
+        for key, completions in list(self._sent.items()):
             if self._req_has_pending_save(key):
                 continue
-            rel_send.add(raw)
+            rel_send.update(completions)
             del self._sent[key]
 
         out.finished_sending = rel_send
         return out
-
-    def _ensure_pairing_state(self) -> None:
-        """Initialize pairing state for lightweight ``__new__`` test doubles."""
-        if not hasattr(self, "_operation_output"):
-            self._operation_output = {}
-            self._req_operations = {}
-            self._legacy_save_nonce = 0
-        if not hasattr(self, "_completed_save_operations"):
-            self._completed_save_operations = _CompletedOperationWindow(4096)
-        if not hasattr(self, "_completion_channel_owners"):
-            self._completion_channel_owners = _completion_channel_owners(
-                self._connectors
-            )
 
     def _consume_save_completion(
         self, connector_idx: int, completion: Any
     ) -> Any | None:
         operation = None
         if isinstance(completion, SaveOperationId):
-            pending = self._pending_save.get(completion)
+            operation_id = _namespace_save_operation(connector_idx, completion)
+            pending = self._pending_save.get(operation_id)
             if pending is not None and connector_idx not in pending:
                 return _PARTIAL_SAVE
             if connector_idx in (pending or ()):
-                operation = completion
+                operation = operation_id
         else:
             req_key = str(completion)
             # Legacy child notifications are serial: map only to this
@@ -520,15 +592,6 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         self._load_owner_by_req: dict[str, tuple[object, int]] = {}
         self._load_operation_owner: dict[LoadOperationId, tuple[int, object]] = {}
 
-    def _ensure_load_ownership_state(self) -> None:
-        if not hasattr(self, "_load_owner_by_req"):
-            self._load_owner_by_req = {}
-            self._load_operation_owner = {}
-        if not hasattr(self, "_completion_channel_owners"):
-            self._completion_channel_owners = _completion_channel_owners(
-                self._connectors
-            )
-
     def _cancel_connector_load(self, connector_idx: int, seq: Any) -> None:
         callback = getattr(self._connectors[connector_idx], "cancel_pending_load", None)
         if callback is not None:
@@ -539,7 +602,6 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         return str(getattr(seq, "id", f"@object:{id(seq)}"))
 
     def _clear_load_owner(self, seq: Any) -> None:
-        self._ensure_load_ownership_state()
         sid = self._load_lifecycle_key(seq)
         owner = self._load_owner_by_req.get(sid)
         if owner is not None and owner[0] is seq:
@@ -549,7 +611,6 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
                 self._load_operation_owner.pop(operation, None)
 
     def _owner_for_seq(self, seq: Any) -> tuple[int, Any] | None:
-        self._ensure_load_ownership_state()
         owner = self._load_owner_by_req.get(self._load_lifecycle_key(seq))
         if owner is None or owner[0] is not seq:
             return None
@@ -559,7 +620,6 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
 
     def get_num_new_matched_tokens(self, seq: Any) -> tuple[int, bool]:
         """First-hit-wins: the first sub that reports a match owns the load."""
-        self._ensure_load_ownership_state()
         sid = self._load_lifecycle_key(seq)
         previous = self._load_owner_by_req.get(sid)
         if previous is not None and previous[0] is not seq:
@@ -598,7 +658,6 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         return result
 
     def build_connector_meta(self) -> MultiConnectorMetadata:
-        self._ensure_load_ownership_state()
         metas = [c.build_connector_meta() for c in self._connectors]
         for connector_idx, meta in enumerate(metas):
             stripped_req_ids: set[Any] = set()
@@ -743,6 +802,14 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         )
 
     def save_finished(self, req_id: Any) -> None:
+        if isinstance(req_id, MultiSaveOperationId):
+            connector_idx = req_id.connector_idx
+            if not 0 <= connector_idx < len(self._connectors):
+                return
+            connector = self._connectors[connector_idx]
+            if hasattr(connector, "save_finished"):
+                connector.save_finished(req_id.child_operation)
+            return
         for c in self._connectors:
             if hasattr(c, "save_finished"):
                 c.save_finished(req_id)
@@ -750,7 +817,6 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
     def connector_completion(self, completion: ConnectorCompletion) -> bool:
         """Route one opaque completion to its uniquely declared child owner."""
 
-        self._ensure_load_ownership_state()
         owner = self._completion_channel_owners.get(completion.channel)
         if owner is None:
             return False
@@ -766,7 +832,6 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         return self._finish_load(req_id, "load_failed")
 
     def _finish_load(self, completion: Any, callback_name: str) -> bool:
-        self._ensure_load_ownership_state()
         lifecycle = None
         if isinstance(completion, LoadOperationId):
             owned = self._load_operation_owner.get(completion)

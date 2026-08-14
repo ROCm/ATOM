@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -16,6 +17,7 @@ import torch
 from atom.kv_transfer.disaggregation.multi.multi_connector import (
     MultiConnector,
     MultiConnectorMetadata,
+    MultiSaveOperationId,
 )
 from atom.kv_transfer.disaggregation.types import (
     STATE_CHECKPOINT_STAGING_CHANNEL,
@@ -337,8 +339,11 @@ class _FakeStore:
         self.get_calls = []
         self.contains_calls = []
         self.invalidate_calls = []
+        self.unresolved_corruption = set()
 
     def put(self, key, blob) -> bool:
+        if key in self.unresolved_corruption and not self.invalidate(key):
+            return False
         self.order.append("put")
         self.put_calls.append((key, blob))
         if self.put_error is not None:
@@ -374,8 +379,14 @@ class _FakeStore:
         self.order.append("invalidate")
         self.invalidate_calls.append(key)
         if self.invalidate_results:
-            return self.invalidate_results.pop(0)
-        return self.invalidate_result
+            result = self.invalidate_results.pop(0)
+        else:
+            result = self.invalidate_result
+        if result:
+            self.unresolved_corruption.discard(key)
+        else:
+            self.unresolved_corruption.add(key)
+        return result
 
 
 class _InlineExecutor:
@@ -490,23 +501,20 @@ def _worker(
     connector._aborted_checkpoint_staging = set()
     connector._quarantined_checkpoint_staging = set()
     connector._engine = _FakeEngine(order)
-    connector._slot_codec = _FakeSlotCodec(order, staging_slots)
+    connector._codec = _FakeSlotCodec(order, staging_slots)
     connector._checkpoint_codec = DSV4CheckpointCodec(
         fingerprint=_FINGERPRINT,
         tp_size=2,
         tp_rank=1,
     )
-    connector._slot_staging = _FakeSlotStaging(connector._slot_codec.rows)
+    connector._slot_staging = _FakeSlotStaging(connector._codec.rows)
     connector._slot_store = _FakeStore(order)
     connector._slot_admission = _FakeAdmission(
         order,
         available=admission_available,
         capacity=staging_slots,
     )
-    connector._slot_fingerprint = _FINGERPRINT
-    connector._unresolved_slot_corruption = set()
     connector._rank = 1
-    connector._tp_size = 2
     connector.chunk_size = 4
     connector._do_save = True
     connector._do_load = True
@@ -517,6 +525,8 @@ def _worker(
     connector._lookup_server = None
     connector._publication_timeout_s = 0.0
     connector._publication_poll_interval_s = 0.01
+    connector._publication_clock = connector_module.time.monotonic
+    connector._publication_sleep = connector_module.time.sleep
 
     def _copy_slot_staging_to_cpu(staging_id):
         order.append("d2h")
@@ -596,7 +606,9 @@ def _load_request(*, page: bool = True, req_id: int = 23) -> LMCacheReqMeta:
 
 
 def _metadata(req: LMCacheReqMeta) -> LMCacheOffloadMetadata:
-    metadata = LMCacheOffloadMetadata()
+    metadata = LMCacheOffloadMetadata(
+        state_checkpoint_completion_channel=STATE_CHECKPOINT_STAGING_CHANNEL
+    )
     metadata.add_request(req)
     metadata.lookup_requests_in_step = [str(req.req_id)]
     return metadata
@@ -631,6 +643,18 @@ def test_get_finished_atomically_drains_sidecar_save_results():
     assert _completion_ids(result, DSV4_CHECKPOINT_SAVE_CHANNEL, succeeded=True) == {4}
     assert _completion_ids(result, DSV4_CHECKPOINT_SAVE_CHANNEL, succeeded=False) == {5}
     assert connector.get_finished().is_empty()
+
+
+def test_get_finished_reports_only_actionable_checkpoint_pending_work():
+    connector = _worker([])
+    pending_event = _FakeEvent([], query_result=False)
+    connector._checkpoint_staging_fences[41] = (pending_event, False)
+
+    assert connector.get_finished().pending_work is True
+
+    connector._checkpoint_staging_fences.clear()
+    connector._quarantined_checkpoint_staging.add(41)
+    assert connector.get_finished().pending_work is False
 
 
 def test_unexpected_slot_save_failure_reports_page_and_sidecar_terminals():
@@ -706,12 +730,14 @@ def test_slot_fingerprint_is_stable_and_covers_required_geometry():
             unit_bytes=16,
             total_bytes=64,
             reverse_indexed=True,
+            semantic_role="dsv4.main_kv.nope",
         ),
         SimpleNamespace(
             base_addr=0x2000,
             unit_bytes=24,
             total_bytes=96,
             reverse_indexed=True,
+            semantic_role="dsv4.main_kv.rope",
         ),
     ]
     kwargs = {
@@ -790,6 +816,83 @@ def test_slot_fingerprint_is_stable_and_covers_required_geometry():
         )
 
 
+def test_slot_fingerprint_tracks_equal_geometry_plane_roles_from_codec_snapshot():
+    page_regions = [
+        KVTransferRegion(0x1000, 64, 16),
+        KVTransferRegion(0x2000, 64, 16),
+    ]
+    slot_a = KVTransferRegion(
+        0x1040,
+        32,
+        8,
+        reverse_indexed=True,
+        semantic_role="dsv4.main_kv.nope",
+    )
+    slot_b = KVTransferRegion(
+        0x2040,
+        32,
+        8,
+        reverse_indexed=True,
+        semantic_role="dsv4.main_kv.rope",
+    )
+    canonical = DSV4PageSlotCodec(
+        page_regions,
+        [slot_a, slot_b],
+        num_blocks=4,
+        num_slots=4,
+        device="cpu",
+    )
+    reordered = DSV4PageSlotCodec(
+        page_regions,
+        [slot_b, slot_a],
+        num_blocks=4,
+        num_slots=4,
+        device="cpu",
+    )
+    kwargs = {
+        "model_tag": "org/model",
+        "page_namespace": "org/model::atom-page-v2-current",
+        "kv_dtype": "fp8",
+        "compress_ratios": [4, 128, 0],
+        "block_size": 64,
+        "kv_head_dim": 512,
+        "index_head_dim": 128,
+        "num_slots": 4,
+        "tp_size": 2,
+        "tp_rank": 1,
+    }
+
+    canonical_fingerprint = _compute_slot_fingerprint(
+        **kwargs,
+        slot_regions=canonical.slot_regions,
+    )
+    reordered_fingerprint = _compute_slot_fingerprint(
+        **kwargs,
+        slot_regions=reordered.slot_regions,
+    )
+
+    assert [region.semantic_role for region in canonical.slot_regions] == [
+        "dsv4.main_kv.nope",
+        "dsv4.main_kv.rope",
+    ]
+    assert [region.semantic_role for region in reordered.slot_regions] == [
+        "dsv4.main_kv.rope",
+        "dsv4.main_kv.nope",
+    ]
+    assert canonical_fingerprint != reordered_fingerprint
+
+    # The fingerprint input is the immutable codec snapshot, not the mutable
+    # transfer descriptor that happened to create it.
+    slot_a.unit_bytes = 7
+    assert (
+        _compute_slot_fingerprint(
+            **kwargs,
+            slot_regions=canonical.slot_regions,
+        )
+        == canonical_fingerprint
+    )
+
+
 def test_stateful_page_initialization_builds_all_slot_components_after_engine(
     monkeypatch,
     caplog,
@@ -814,6 +917,7 @@ def test_stateful_page_initialization_builds_all_slot_components_after_engine(
             total_bytes=64,
             unit_bytes=16,
             reverse_indexed=True,
+            semantic_role="dsv4.main_kv.nope",
         )
     ]
     connector = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
@@ -834,12 +938,10 @@ def test_stateful_page_initialization_builds_all_slot_components_after_engine(
         num_slots=4,
         device="cpu",
     )
-    connector._slot_codec = None
     connector._checkpoint_codec = None
     connector._slot_staging = None
     connector._slot_store = None
     connector._slot_admission = None
-    connector._slot_fingerprint = None
     transfer_tensors = SimpleNamespace(
         swa_block_regions=regions,
         num_slots=4,
@@ -854,12 +956,11 @@ def test_stateful_page_initialization_builds_all_slot_components_after_engine(
     )
 
     assert order == ["store-adapter"]
-    assert connector._slot_codec is connector._codec
     assert isinstance(connector._checkpoint_codec, DSV4CheckpointCodec)
     assert connector._slot_staging.shape == (3, 16)
     assert connector._slot_admission.capacity == 3
     assert connector._slot_store is not None
-    assert connector._slot_fingerprint == _compute_slot_fingerprint(
+    assert connector._checkpoint_codec.fingerprint == _compute_slot_fingerprint(
         model_tag=sensitive_model_name,
         page_namespace=sensitive_model_name,
         kv_dtype="fp8",
@@ -868,7 +969,7 @@ def test_stateful_page_initialization_builds_all_slot_components_after_engine(
         kv_head_dim=512,
         index_head_dim=128,
         num_slots=4,
-        slot_regions=regions,
+        slot_regions=connector._codec.slot_regions,
         tp_size=2,
         tp_rank=1,
     )
@@ -882,9 +983,25 @@ def test_stateful_page_initialization_builds_all_slot_components_after_engine(
     assert "page_bytes_per_block=96" in registration_log
     assert "slot_bytes=16" in registration_log
     assert "slot_staging_slots=3" in registration_log
-    assert f"fingerprint={connector._slot_fingerprint.hex()[:12]}" in registration_log
-    assert connector._slot_fingerprint.hex() not in registration_log
+    fingerprint = connector._checkpoint_codec.fingerprint
+    assert f"fingerprint={fingerprint.hex()[:12]}" in registration_log
+    assert fingerprint.hex() not in registration_log
     assert sensitive_model_name not in registration_log
+
+
+@pytest.mark.parametrize("invalid", [True, 2.0, "2"])
+def test_explicit_slot_staging_geometry_rejects_integer_coercion(invalid):
+    connector = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
+    connector._config = SimpleNamespace(
+        kv_transfer_config={
+            "kv_connector_extra_config": {
+                "slot_sidecar_staging_slots": invalid,
+            }
+        }
+    )
+
+    with pytest.raises(ValueError, match="staging count must be an integer"):
+        connector._slot_staging_slots()
 
 
 @pytest.mark.parametrize(
@@ -944,7 +1061,7 @@ def test_unified_codec_gathers_into_connector_owned_slot_row(monkeypatch):
     stream = _patch_rpc_cuda(monkeypatch, order)
     connector = _worker(order)
     codec = _FakeUnifiedCodec(order)
-    connector._slot_codec = codec
+    connector._codec = codec
     connector._slot_staging = torch.empty((1, len(_PAYLOAD)), dtype=torch.uint8)
 
     snapshot = connector._snapshot_reserved_slot_save(
@@ -965,7 +1082,7 @@ def test_unified_codec_scatters_from_connector_owned_slot_row():
     order = []
     connector = _worker(order)
     codec = _FakeUnifiedCodec(order)
-    connector._slot_codec = codec
+    connector._codec = codec
     connector._slot_staging = torch.empty((1, len(_PAYLOAD)), dtype=torch.uint8)
     payload = torch.tensor(list(_PAYLOAD), dtype=torch.uint8)
 
@@ -994,7 +1111,7 @@ def test_native_checkpoint_save_defers_until_copy_then_snapshots_destination(
 
     connector.start_load_kv(metadata)
 
-    assert connector._slot_codec.snapshot_groups == []
+    assert connector._codec.snapshot_groups == []
     assert connector._save_executor.calls == []
     assert len(connector._deferred_checkpoint_saves) == 1
     assert connector._slot_admission.num_free == 1
@@ -1002,7 +1119,7 @@ def test_native_checkpoint_save_defers_until_copy_then_snapshots_destination(
 
     connector.state_checkpoint_copies_issued([checkpoint])
 
-    assert connector._slot_codec.snapshot_groups == [7]
+    assert connector._codec.snapshot_groups == [7]
     assert order.index("snapshot") < order.index("event-record") < order.index("submit")
     assert len(connector._save_executor.calls) == 1
     assert connector._deferred_checkpoint_saves == []
@@ -1041,7 +1158,7 @@ def test_nonmatching_checkpoint_copy_keeps_live_slot_fallback(monkeypatch):
         [unrelated],
     )
 
-    assert connector._slot_codec.snapshot_groups == [2]
+    assert connector._codec.snapshot_groups == [2]
     assert len(connector._save_executor.calls) == 1
     assert connector._deferred_checkpoint_saves == []
 
@@ -1056,7 +1173,7 @@ def test_regular_slot_without_checkpoint_copy_fails_closed_but_saves_page(monkey
 
     connector.start_load_kv_with_state_checkpoints(_metadata(request), [])
 
-    assert connector._slot_codec.snapshot_groups == []
+    assert connector._codec.snapshot_groups == []
     assert connector._slot_admission.num_free == 1
     assert len(connector._save_executor.calls) == 1
 
@@ -1121,7 +1238,7 @@ def test_deferred_checkpoint_submission_failure_releases_snapshot(monkeypatch):
     )
     connector.state_checkpoint_copies_issued([checkpoint])
 
-    assert connector._slot_codec.snapshot_groups == [checkpoint.destination_group]
+    assert connector._codec.snapshot_groups == [checkpoint.destination_group]
     assert order.index("snapshot") < order.index("submit") < order.index("event-sync")
     assert connector._slot_admission.released == [0]
     assert connector._failed_sidecar_save == {17}
@@ -1233,7 +1350,7 @@ def test_checkpoint_save_backpressure_still_fences_native_copy(monkeypatch):
     assert _completion_ids(result, DSV4_CHECKPOINT_SAVE_CHANNEL, succeeded=False) == {
         17
     }
-    assert connector._slot_codec.snapshot_groups == []
+    assert connector._codec.snapshot_groups == []
 
 
 def test_unknown_checkpoint_gpu_completion_quarantines_lease(monkeypatch):
@@ -1280,7 +1397,7 @@ def test_native_checkpoint_build_failure_aborts_deferred_snapshot(monkeypatch):
     )
     connector.abort_state_checkpoint_copies([checkpoint])
 
-    assert connector._slot_codec.snapshot_groups == []
+    assert connector._codec.snapshot_groups == []
     assert connector._slot_admission.released == []
     assert connector._slot_admission.num_free == 1
     assert connector._failed_sidecar_save == {17}
@@ -1293,6 +1410,7 @@ def test_multi_checkpoint_hooks_target_only_unique_channel_owner():
 
     class _Failing:
         completion_channels = frozenset({STATE_CHECKPOINT_STAGING_CHANNEL})
+        state_checkpoint_completion_channel = STATE_CHECKPOINT_STAGING_CHANNEL
 
         def state_checkpoint_copies_issued(self, _copies):
             raise RuntimeError("issued failed")
@@ -1310,8 +1428,11 @@ def test_multi_checkpoint_hooks_target_only_unique_channel_owner():
         def abort_state_checkpoint_copies(self, copies):
             calls.append(("abort", copies))
 
-    multi = MultiConnector.__new__(MultiConnector)
-    multi._connectors = [_Failing(), _Healthy()]
+    with patch(
+        "atom.kv_transfer.disaggregation.multi.multi_connector._build_subconnectors",
+        return_value=[_Failing(), _Healthy()],
+    ):
+        multi = MultiConnector(SimpleNamespace())
     copies = [_checkpoint_copy()]
 
     multi.state_checkpoint_copies_issued(copies)
@@ -1595,11 +1716,11 @@ def test_same_request_saves_serialize_and_multi_releases_on_all_ops_done(monkeyp
             return []
 
     producer = _Producer()
-    multi = MultiConnector.__new__(MultiConnector)
-    multi._connectors = [producer, connector]
-    multi.is_producer = True
-    multi._pending_save = {}
-    multi._sent = {}
+    with patch(
+        "atom.kv_transfer.disaggregation.multi.multi_connector._build_subconnectors",
+        return_value=[producer, connector],
+    ):
+        multi = MultiConnector(SimpleNamespace())
     connector._done_save.add(SaveOperationId(17, 0))
 
     try:
@@ -1636,7 +1757,7 @@ def test_same_request_saves_serialize_and_multi_releases_on_all_ops_done(monkeyp
         executor.futures[0].result(timeout=2)
         assert boundary_started.wait(timeout=2)
         after_page = multi.get_finished()
-        assert after_page.finished_saving == {SaveOperationId(17, 0)}
+        assert after_page.finished_saving == {MultiSaveOperationId(17, 0, 1)}
         assert after_page.finished_sending == set()
 
         release_boundary.set()
@@ -1647,7 +1768,7 @@ def test_same_request_saves_serialize_and_multi_releases_on_all_ops_done(monkeyp
         release_boundary.set()
         executor.shutdown()
 
-    assert terminal.finished_saving == {SaveOperationId(17, 1)}
+    assert terminal.finished_saving == {MultiSaveOperationId(17, 1, 1)}
     assert _completion_ids(terminal, DSV4_CHECKPOINT_SAVE_CHANNEL, succeeded=True) == {
         SaveOperationId(17, 1)
     }
@@ -2370,7 +2491,7 @@ def test_snapshot_failure_fails_sidecar_but_still_saves_page_and_releases(
     order = []
     _patch_rpc_cuda(monkeypatch, order)
     connector = _worker(order)
-    connector._slot_codec.snapshot_error = RuntimeError("snapshot failed")
+    connector._codec.snapshot_error = RuntimeError("snapshot failed")
 
     connector.start_load_kv(_metadata(_save_request()))
 
@@ -2384,7 +2505,7 @@ def test_snapshot_failure_fails_sidecar_but_still_saves_page_and_releases(
 def test_snapshot_cleanup_sync_error_is_total_and_page_save_proceeds(monkeypatch):
     order = []
     connector = _worker(order)
-    connector._slot_codec.snapshot_error = RuntimeError("snapshot failed")
+    connector._codec.snapshot_error = RuntimeError("snapshot failed")
     stream = _FakeRPCStream(
         order,
         synchronize_error=RuntimeError("stream synchronize failed"),
@@ -2413,7 +2534,7 @@ def test_snapshot_cleanup_sync_error_is_total_and_page_save_proceeds(monkeypatch
 def test_snapshot_cleanup_release_error_is_total_and_page_save_proceeds(monkeypatch):
     order = []
     connector = _worker(order)
-    connector._slot_codec.snapshot_error = RuntimeError("snapshot failed")
+    connector._codec.snapshot_error = RuntimeError("snapshot failed")
     connector._slot_admission.release_error = RuntimeError("release failed")
     stream = _FakeRPCStream(order)
     events = iter(
@@ -2632,7 +2753,7 @@ def test_page_and_slot_load_orders_retrieve_get_decode_restore_sync_then_done(
     assert connector._failed_load == set()
     assert connector._engine.unpinned == ["23"]
     assert connector._slot_admission.released == [0]
-    assert connector._slot_codec.row.copied == _PAYLOAD
+    assert connector._codec.row.copied == _PAYLOAD
     terminal_logs = [
         record.message
         for record in caplog.records
@@ -2741,12 +2862,12 @@ def test_failed_corruption_invalidation_cannot_fake_later_commit(
         assert len(connector._slot_store.put_calls) == 1
         assert connector._done_sidecar_save == {17}
         assert connector._failed_sidecar_save == set()
-        assert connector._unresolved_slot_corruption == set()
+        assert connector._slot_store.unresolved_corruption == set()
     else:
         assert connector._slot_store.put_calls == []
         assert connector._done_sidecar_save == set()
         assert connector._failed_sidecar_save == {17}
-        assert connector._unresolved_slot_corruption == {key}
+        assert connector._slot_store.unresolved_corruption == {key}
 
 
 def test_load_staging_exhaustion_has_one_terminal_sidecar_log(monkeypatch, caplog):
@@ -2793,7 +2914,7 @@ def test_restore_failure_synchronizes_and_releases_admission():
     order = []
     connector = _worker(order)
     connector._slot_store.get_result = _sidecar_blob()
-    connector._slot_codec.restore_error = RuntimeError("restore failed")
+    connector._codec.restore_error = RuntimeError("restore failed")
 
     connector.start_load_kv(_metadata(_load_request()))
 

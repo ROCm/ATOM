@@ -4,13 +4,16 @@
 from __future__ import annotations
 
 import sys
+import threading
 import types
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
 
 from atom.kv_transfer.offload.hybrid.dsv4.codec import (
+    DSV4CheckpointCodec,
     DSV4CheckpointCorruptionError,
     DSV4CheckpointHeader,
     DSV4CheckpointKey,
@@ -247,12 +250,39 @@ def test_requires_non_none_engine_storage_manager():
             world_size=4,
             worker_id=1,
         )
-
     with pytest.raises(ValueError, match="engine.storage_manager"):
         DSV4CheckpointStore(
             SimpleNamespace(),
             model_name="org/model",
             world_size=4,
+            worker_id=1,
+        )
+
+
+@pytest.mark.parametrize("invalid", [True, 4.0, "4"])
+def test_store_rejects_coerced_tp_geometry(invalid):
+    with pytest.raises(ValueError, match="store_tp_size.*integer"):
+        DSV4CheckpointStore(
+            SimpleNamespace(storage_manager=_StorageManager()),
+            model_name="org/model",
+            world_size=invalid,
+            worker_id=1,
+        )
+
+
+def test_store_rejects_geometry_that_disagrees_with_checkpoint_codec():
+    codec = DSV4CheckpointCodec(
+        fingerprint=_FINGERPRINT,
+        tp_size=4,
+        tp_rank=1,
+    )
+
+    with pytest.raises(ValueError, match="must match checkpoint_codec"):
+        DSV4CheckpointStore(
+            SimpleNamespace(storage_manager=_StorageManager()),
+            checkpoint_codec=codec,
+            model_name="org/model",
+            world_size=8,
             worker_id=1,
         )
 
@@ -592,6 +622,31 @@ def test_failed_invalidation_fences_put_until_corrupt_copy_is_removed():
     assert len(manager.remove_calls) == 3
     assert len(manager.allocate_calls) == 1
     assert len(manager.batched_put_calls) == 1
+
+
+def test_concurrent_republication_attempts_share_the_store_corruption_fence():
+    manager = _StorageManager()
+    manager.remove_result = 0
+    store = _store(manager)
+    sidecar_key = _key()
+    assert store.invalidate(sidecar_key) is False
+    start = threading.Barrier(3)
+
+    def republish() -> bool:
+        start.wait()
+        return store.put(sidecar_key, _aos1_blob())
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(republish) for _ in range(2)]
+        start.wait()
+        results = [future.result() for future in futures]
+
+    assert results == [False, False]
+    # One initial invalidation plus one serialized retry per put. Neither
+    # caller can bypass the store-owned fence and allocate replacement bytes.
+    assert len(manager.remove_calls) == 3
+    assert manager.allocate_calls == []
+    assert manager.batched_put_calls == []
 
 
 def test_invalidation_noop_unfences_key_when_concurrently_evicted():

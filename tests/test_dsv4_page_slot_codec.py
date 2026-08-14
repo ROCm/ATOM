@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -22,12 +24,14 @@ def _region(
     *,
     reverse_indexed: bool,
     padding_bytes: int = 0,
+    semantic_role: str | None = None,
 ) -> KVTransferRegion:
     return KVTransferRegion(
         base_addr=base_addr,
         total_bytes=unit_bytes * item_count + padding_bytes,
         unit_bytes=unit_bytes,
         reverse_indexed=reverse_indexed,
+        semantic_role=semantic_role,
     )
 
 
@@ -38,8 +42,22 @@ def _codec() -> DSV4PageSlotCodec:
             _region(2_000, 2, 4, reverse_indexed=False),
         ],
         slot_regions=[
-            _region(3_000, 5, 3, reverse_indexed=True, padding_bytes=5),
-            _region(4_000, 3, 3, reverse_indexed=True, padding_bytes=3),
+            _region(
+                3_000,
+                5,
+                3,
+                reverse_indexed=True,
+                padding_bytes=5,
+                semantic_role="dsv4.main_kv.nope",
+            ),
+            _region(
+                4_000,
+                3,
+                3,
+                reverse_indexed=True,
+                padding_bytes=3,
+                semantic_role="dsv4.main_kv.rope",
+            ),
         ],
         num_blocks=4,
         num_slots=3,
@@ -47,11 +65,35 @@ def _codec() -> DSV4PageSlotCodec:
     )
 
 
+def _reference_spans(codec: DSV4PageSlotCodec, plan: DSV4CopyPlan):
+    """Test-only expansion of the public plan and immutable region snapshots."""
+
+    for section in plan.sections:
+        regions = (
+            codec.page_regions
+            if section.kind is DSV4PayloadKind.PAGE
+            else codec.slot_regions
+        )
+        bytes_per_item = sum(region.unit_bytes for region in regions)
+        for item_pos, item_id in enumerate(section.item_ids):
+            offset = section.buffer_offset + item_pos * bytes_per_item
+            for region_index, region in enumerate(regions):
+                yield SimpleNamespace(
+                    kind=section.kind,
+                    item_id=item_id,
+                    region_index=region_index,
+                    device_addr=region.unit_addr(item_id),
+                    buffer_offset=offset,
+                    nbytes=region.unit_bytes,
+                )
+                offset += region.unit_bytes
+
+
 def test_page_plan_is_block_major_region_minor_and_excludes_slot_width():
     codec = _codec()
 
     plan = codec.page_plan([2, 0], buffer_offset=7)
-    spans = list(codec.iter_reference_spans(plan))
+    spans = list(_reference_spans(codec, plan))
 
     assert codec.page_bytes_per_block == 6
     assert codec.bytes_per_block == 6
@@ -76,11 +118,15 @@ def test_page_plan_is_block_major_region_minor_and_excludes_slot_width():
     ]
 
 
+def test_cpu_codec_does_not_advertise_fused_triton_staging():
+    assert _codec().has_fused_chunk_major_staging is False
+
+
 def test_slot_plan_uses_reverse_addresses_and_region_minor_layout():
     codec = _codec()
 
     plan = codec.slot_plan(1, buffer_offset=19)
-    spans = list(codec.iter_reference_spans(plan))
+    spans = list(_reference_spans(codec, plan))
 
     assert plan.payload_bytes == 8
     assert plan.required_buffer_bytes == 27
@@ -93,21 +139,26 @@ def test_slot_plan_uses_reverse_addresses_and_region_minor_layout():
     ]
 
 
-def test_checkpoint_plan_places_slot_immediately_after_all_page_bytes():
+def test_page_and_slot_plans_compose_with_an_explicit_prefix_offset():
     codec = _codec()
 
-    plan = codec.checkpoint_plan([2, 0], 1, buffer_offset=7)
+    page = codec.page_plan([2, 0], buffer_offset=7)
+    slot = codec.slot_plan(1, buffer_offset=page.required_buffer_bytes)
 
-    assert plan.payload_bytes == 20
-    assert plan.required_buffer_bytes == 27
     assert [
         (section.kind, section.item_ids, section.buffer_offset, section.nbytes)
-        for section in plan.sections
+        for section in page.sections + slot.sections
     ] == [
         (DSV4PayloadKind.PAGE, (2, 0), 7, 12),
         (DSV4PayloadKind.SLOT, (1,), 19, 8),
     ]
-    assert [span.buffer_offset for span in codec.iter_reference_spans(plan)] == [
+    assert page.payload_bytes + slot.payload_bytes == 20
+    assert slot.required_buffer_bytes == 27
+    assert [
+        span.buffer_offset
+        for plan in (page, slot)
+        for span in _reference_spans(codec, plan)
+    ] == [
         7,
         11,
         13,
@@ -129,6 +180,32 @@ def test_codec_rejects_wrong_address_direction(
         DSV4PageSlotCodec(
             [_region(1_000, 4, 2, reverse_indexed=page_reverse)],
             [_region(2_000, 8, 2, reverse_indexed=slot_reverse)],
+            num_blocks=2,
+            num_slots=2,
+            device="cpu",
+        )
+
+
+@pytest.mark.parametrize(
+    ("page_reverse", "slot_reverse"),
+    [(0, True), (False, 1)],
+)
+def test_codec_rejects_non_boolean_address_direction(
+    page_reverse,
+    slot_reverse,
+):
+    with pytest.raises(ValueError, match="reverse_indexed must be a boolean"):
+        DSV4PageSlotCodec(
+            [_region(1_000, 4, 2, reverse_indexed=page_reverse)],
+            [
+                _region(
+                    2_000,
+                    8,
+                    2,
+                    reverse_indexed=slot_reverse,
+                    semantic_role="dsv4.main_kv.nope",
+                )
+            ],
             num_blocks=2,
             num_slots=2,
             device="cpu",
@@ -165,6 +242,17 @@ def test_codec_rejects_region_smaller_than_declared_pool():
             [],
             num_blocks=3,
             num_slots=0,
+            device="cpu",
+        )
+
+
+def test_codec_requires_stable_semantic_role_for_slot_regions():
+    with pytest.raises(ValueError, match="semantic_role is required"):
+        DSV4PageSlotCodec(
+            [_region(1_000, 4, 2, reverse_indexed=False)],
+            [_region(2_000, 8, 2, reverse_indexed=True)],
+            num_blocks=2,
+            num_slots=2,
             device="cpu",
         )
 

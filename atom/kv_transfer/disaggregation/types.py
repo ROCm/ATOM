@@ -13,7 +13,10 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from atom.model_engine.state_pool import StateCheckpointCopy
 
 # ---------------------------------------------------------------------------
 # Type aliases
@@ -130,6 +133,10 @@ class KVTransferRegion:
     # end does so to keep adding one from relocating the rest; the region map
     # has to know, because both ends compute an address from the same id.
     reverse_indexed: bool = False
+    # Stable semantic identity used by layout fingerprints. Physical addresses
+    # and list positions are process-local implementation details; a named role
+    # makes equal-sized planes distinguishable across code versions.
+    semantic_role: str | None = None
 
     def unit_addr(self, index: int) -> int:
         if self.reverse_indexed:
@@ -189,6 +196,9 @@ class KVConnectorOutput:
         connector_completions: Terminal events on connector-owned channels.
             Generic composite/aggregation layers transport these opaquely;
             channel owners interpret them after TP aggregation.
+        pending_work: This worker still owns asynchronous work that can make
+            progress and should be polled again. Permanently quarantined work
+            must not set this flag.
         expected_finished_count: How many finished notifications should be
             expected per request (used by the aggregator).
     """
@@ -201,6 +211,7 @@ class KVConnectorOutput:
     failed_loading: set[LoadCompletionId] = field(default_factory=set)
     expected_finished_count: int = 0
     connector_completions: set[ConnectorCompletion] = field(default_factory=set)
+    pending_work: bool = False
 
     def is_empty(self) -> bool:
         """Return True if no transfers finished on this worker."""
@@ -212,6 +223,7 @@ class KVConnectorOutput:
             and not self.finished_loading
             and not self.failed_loading
             and not self.connector_completions
+            and not self.pending_work
         )
 
     def __repr__(self) -> str:
@@ -222,7 +234,8 @@ class KVConnectorOutput:
             f"finished_saving={self.finished_saving}, "
             f"loading={self.finished_loading}, "
             f"failed_loading={self.failed_loading}, "
-            f"connector_completions={self.connector_completions})"
+            f"connector_completions={self.connector_completions}, "
+            f"pending_work={self.pending_work})"
         )
 
 
@@ -281,6 +294,8 @@ class ConnectorMetadata:
     and the worker-side connector consumes it in ``start_load_kv``.
     """
 
+    state_checkpoint_completion_channel: str | None = None
+
     def __init__(self) -> None:
         self.reqs_to_recv: dict[ReqId, ReqMeta] = {}
         self.reqs_to_save: dict[ReqId, ReqMeta] = {}
@@ -288,7 +303,6 @@ class ConnectorMetadata:
         self.reqs_in_batch: set[ReqId] = set()
         self.reqs_not_processed: set[ReqId] = set()
         self.request_id_to_transfer_id: dict[ReqId, int] = {}
-
     def iter_async_save_operations(
         self,
     ) -> tuple[tuple[ReqId, SaveCompletionId], ...]:

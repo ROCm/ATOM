@@ -198,21 +198,6 @@ class BlockManager:
             checkpoint_restores=restores,
         )
 
-    def acquire_state_checkpoint_lease(self, checkpoint) -> bool:
-        """Keep an exact keeper destination resident through GPU staging."""
-
-        return self.state.acquire_checkpoint_lease(checkpoint)
-
-    def complete_state_checkpoint_lease(
-        self,
-        copy_id: int,
-        *,
-        preserve: bool,
-    ) -> bool:
-        """Release or invalidate one exact keeper destination."""
-
-        return self.state.complete_checkpoint_lease(copy_id, preserve=preserve)
-
     def _record_evicted(self, h: int) -> None:
         """A hash the block pool just dropped: report it, and settle the state.
 
@@ -431,7 +416,7 @@ class BlockManager:
         # admission bound for state cache.
         if seq.has_per_req_cache and self.paged_state_checkpoints is None:
             self._attach_state_group(seq, h if num_cached_blocks > 0 else -1)
-            seq._slot_initialized_after_alloc = False
+            seq._state_initialized_after_alloc = False
 
     def _attach_state_group(self, seq: Sequence, hit_hash: int) -> None:
         """Give `seq` a state group, resuming from a checkpoint when one exists.

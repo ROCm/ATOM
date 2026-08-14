@@ -109,77 +109,12 @@ from atom.utils.forward_context import (
 logger = logging.getLogger("atom")
 
 
-_KV_CONNECTOR_ALIASES = {
-    "lmcacheoffloadconnector": "lmcache_offload",
-    "lmcacheconnectorv1": "lmcache_offload",
-    "mooncakeconnector": "mooncake",
-    "moriioconnector": "moriio",
-    "multiconnector": "multi",
-}
-
-
-def _canonical_kv_connector_name(value: object, *, path: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{path} requires a non-empty 'kv_connector' string")
-
-    normalized = value.strip().casefold()
-    aliased = _KV_CONNECTOR_ALIASES.get(normalized)
-    if aliased is not None:
-        return aliased
-
-    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
-
-    registered = {name.casefold(): name for name in KVConnectorFactory._registry}
-    canonical = registered.get(normalized)
-    if canonical is None:
-        raise ValueError(f"{path} has unknown KV connector {value!r}")
-    return canonical
-
-
-def _uses_pd_staging_at_path(kv_transfer_config: dict, *, path: str) -> bool:
-    connector = _canonical_kv_connector_name(
-        kv_transfer_config.get("kv_connector"), path=path
-    )
-    if connector == "lmcache_offload":
-        return False
-    if connector != "multi":
-        return True
-
-    children = kv_transfer_config.get("connectors")
-    if not isinstance(children, list) or not children:
-        raise ValueError(
-            f"{path}: multi connector requires a non-empty 'connectors' list"
-        )
-
-    child_results = []
-    for index, child in enumerate(children):
-        child_path = f"{path}.connectors[{index}]"
-        if not isinstance(child, dict):
-            # Preserve the existing configuration-validation API.
-            raise ValueError(  # noqa: TRY004
-                f"{child_path} must be a dict, got {child!r}"
-            )
-        child_connector = _canonical_kv_connector_name(
-            child.get("kv_connector"), path=child_path
-        )
-        if child_connector == "multi":
-            raise ValueError("multi connector cannot nest another 'multi'")
-        child_results.append(_uses_pd_staging_at_path(child, path=child_path))
-    return any(child_results)
-
-
 def _uses_pd_staging(kv_transfer_config: dict | None) -> bool:
     """Whether this transfer topology needs compressor-only P/D staging."""
 
-    if kv_transfer_config is None or kv_transfer_config == {}:
-        return False
-    if not isinstance(kv_transfer_config, dict):
-        # Preserve the existing configuration-validation API.
-        raise ValueError(  # noqa: TRY004
-            "kv_transfer_config must be a dict or None, "
-            f"got {type(kv_transfer_config).__name__}"
-        )
-    return _uses_pd_staging_at_path(kv_transfer_config, path="kv_transfer_config")
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    return KVConnectorFactory.topology_uses_pd_staging(kv_transfer_config)
 
 
 # State field carrying the windows of layers whose KV dtype is not the pool's.
@@ -1542,22 +1477,43 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # of that subset, so its plane is its own; `_consumer_region_map`'s
         # per-layer alignment has nothing left to align, which is why PP is
         # rejected below.
-        planes = list(zip(self._kv_planes(), self._plane_row_widths(), strict=True))
-        for plane, row_bytes in planes:
+        plane_roles = [
+            role
+            for role, row_bytes in (
+                ("dsv4.main_kv.nope", self.nope_row_bytes()),
+                ("dsv4.main_kv.rope", self.rope_row_bytes()),
+            )
+            if row_bytes
+        ]
+        planes = list(
+            zip(
+                self._kv_planes(),
+                self._plane_row_widths(),
+                plane_roles,
+                strict=True,
+            )
+        )
+        for plane, row_bytes, role in planes:
             block_regions.append(
                 KVTransferRegion(
                     plane.data_ptr(),
                     runner.num_physical_kvcache_blocks * geo.block_bytes(row_bytes),
                     geo.block_bytes(row_bytes),
+                    semantic_role=role,
                 )
             )
 
         # Compressed PAGE regions: CSA Indexer KV (FP8).
-        for pos in range(len(self.csa_layers)):
+        for pos, layer_id in enumerate(self.csa_layers):
             t = runner.v4_csa_idx_kv[pos]
             bpb = self.csa_rows_per_block * self._index_row_bytes
             block_regions.append(
-                KVTransferRegion(t.data_ptr(), t.numel() * t.element_size(), bpb)
+                KVTransferRegion(
+                    t.data_ptr(),
+                    t.numel() * t.element_size(),
+                    bpb,
+                    semantic_role=f"dsv4.csa_indexer.layer_{layer_id}",
+                )
             )
 
         # Full per-request SLOT (legacy field name: `swa_block_regions`) is one
@@ -1575,7 +1531,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         slot_start, _ = (
             geo.slot_span(geo.physical_slot(num_slots - 1)) if num_slots else (0, 0)
         )
-        for plane, row_bytes in planes:
+        for plane, row_bytes, role in planes:
             unit = geo.slot_bytes(row_bytes)
             swa_block_regions.append(
                 KVTransferRegion(
@@ -1583,6 +1539,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                     num_slots * unit,
                     unit,
                     reverse_indexed=True,
+                    semantic_role=role,
                 )
             )
 
@@ -1599,6 +1556,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 pool.data_ptr(),
                 pool.numel() * elem_fp32,
                 stride * elem_fp32,
+                semantic_role="dsv4.pd_staging.compressor_state",
             )
             gather_slot = self._make_gather_slot(
                 pool, stride, runner.v4_state_arena, self.pool_geometry
