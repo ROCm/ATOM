@@ -45,6 +45,7 @@ class EngineUtilityHandler:
         "get_mtp_stats": "_handle_get_mtp_stats",
         "get_mtp_statistics": "_handle_get_mtp_statistics",
         "get_cache_statistics": "_handle_get_cache_statistics",
+        "get_metrics_statistics": "_handle_get_metrics_statistics",
         "abort_request": "_handle_abort_request",
     }
 
@@ -105,7 +106,8 @@ class EngineUtilityHandler:
     def _execute_utility_command(self, cmd: str, args: dict):
         import time as _time
 
-        logger.info(f"{self.label}: executing utility command: {cmd}")
+        log = logger.debug if cmd == "get_metrics_statistics" else logger.info
+        log(f"{self.label}: executing utility command: {cmd}")
         t0 = _time.monotonic()
 
         handler_name = self._UTILITY_HANDLERS.get(cmd)
@@ -116,7 +118,7 @@ class EngineUtilityHandler:
             logger.warning(f"{self.label}: Unknown utility command: {cmd}")
 
         elapsed = _time.monotonic() - t0
-        logger.info(f"{self.label}: utility command '{cmd}' finished in {elapsed:.2f}s")
+        log(f"{self.label}: utility command '{cmd}' finished in {elapsed:.2f}s")
 
     def _handle_update_weights(self, args: dict):
         """Handle direct weight update command."""
@@ -316,4 +318,65 @@ class EngineUtilityHandler:
             result |= self.scheduler.block_manager.checkpoint_funnel()
         self.output_queue.put_nowait(
             ("UTILITY_RESPONSE", {"cmd": "get_cache_statistics", "result": result})
+        )
+
+    def _handle_get_metrics_statistics(self, args: dict):
+        """Return one rank's scheduler, KV, MTP, and cache metrics."""
+        if self.scheduler is None:
+            result = {"enabled": False}
+        else:
+            running, waiting = self.scheduler.get_request_counts()
+            kv_pool = self.scheduler.block_manager.kv
+            kv_connector = getattr(self.scheduler, "kv_connector", None)
+
+            spec_stats = self.scheduler.spec_stats
+            if spec_stats is None:
+                mtp = {"enabled": False}
+            else:
+                mtp = {"enabled": True, **spec_stats.get_statistics()}
+
+            cache_stats = self.scheduler.cache_stats
+            if cache_stats is None:
+                cache = {"enabled": False}
+            else:
+                cache = {
+                    "enabled": True,
+                    **cache_stats.get_statistics(),
+                    **self.scheduler.block_manager.checkpoint_funnel(),
+                }
+
+            offload = (
+                kv_connector.get_statistics()
+                if kv_connector is not None and hasattr(kv_connector, "get_statistics")
+                else {}
+            )
+            result = {
+                "enabled": True,
+                "requests_running": running,
+                "requests_waiting": waiting,
+                "requests_parked_kv_load": int(
+                    getattr(self.scheduler, "_num_parked_remote_kv", 0)
+                ),
+                "requests_partial_prefill": int(
+                    getattr(self.scheduler, "_partial_prefill_count", 0)
+                ),
+                "requests_finished": int(
+                    getattr(self.scheduler, "total_finished_requests", 0)
+                ),
+                "prompt_tokens": int(getattr(self.scheduler, "total_prompt_tokens", 0)),
+                "generation_tokens": int(
+                    getattr(self.scheduler, "total_generation_tokens", 0)
+                ),
+                "preemptions": int(getattr(self.scheduler, "total_preemptions", 0)),
+                "kv_blocks_used": kv_pool.num_used,
+                "kv_blocks_free": kv_pool.num_free,
+                "kv_blocks_total": kv_pool.num_blocks,
+                "kv_blocks_indexed": kv_pool.num_indexed,
+                "mtp": mtp,
+                "cache": cache,
+                "offload": offload,
+            }
+
+        self.output_queue.put_nowait(
+            ("UTILITY_RESPONSE", {"cmd": "get_metrics_statistics", "result": result})
         )

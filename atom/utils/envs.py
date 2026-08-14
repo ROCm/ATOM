@@ -29,6 +29,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_SIZE": lambda: int(os.getenv("ATOM_DP_SIZE", "1")),
     "ATOM_DP_MASTER_IP": lambda: os.getenv("ATOM_DP_MASTER_IP", "127.0.0.1"),
     "ATOM_DP_MASTER_PORT": lambda: int(os.getenv("ATOM_DP_MASTER_PORT", "29500")),
+    # Rendezvous base port; set per role when prefill/decode share a node.
+    "ATOM_DP_BASE_PORT": lambda: int(os.getenv("ATOM_DP_BASE_PORT", "0")),
     # Token-equivalent cost of one in-flight request for the "least_tokens" DP
     # load-balance strategy. The per-rank load score is
     #   sum(prompt_tokens) + ATOM_DP_LB_REQ_EQUIV * num_in_flight_requests
