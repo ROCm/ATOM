@@ -2693,7 +2693,9 @@ class DeepseekV4Attention(nn.Module):
                 dtype=o.dtype,
                 layout="mbn",
             )  # [B, M, N] view of a [M, B, N] physical buffer
-            return y.transpose(0, 1)  # -> [M, B, N]
+            # transpose back to the physical [M, B, N] (contiguous) and flatten
+            # to the 2-D [M, B*N] wo_b expects, like the BF16 paths below.
+            return y.transpose(0, 1).flatten(1)
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
         if num_tokens <= 32 or self._is_gfx1250:
             y = torch.empty(
