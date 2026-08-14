@@ -224,10 +224,9 @@ class MultiConnector(KVConnectorBase):
         tiers and no answer to "which one packs this spill".
 
         Picking the first would be wrong rather than merely arbitrary: the
-        spill is submitted to one tier and the load — unwired today, see
-        `state_pool.STATE_OFFLOAD_LOADS_WIRED` — would be free to ask the
+        spill is submitted to one tier and the load would be free to ask the
         other, so a hash could be reported indexed by a tier that never stored
-        it. Raise instead — this runs at model load, before a single
+        it and then fetched from one that cannot produce it. Raise instead — this runs at model load, before a single
         staging slot has been reserved, so a config error is loud and costs
         nothing. Every other failure mode in this file is a silent leak; this
         one does not have to be.

@@ -85,9 +85,10 @@ The spill direction is untouched and keeps the batch channel.
    `build_connector_meta()`. A connector that cannot carry them fails them on
    the spot rather than leaving the requests parked.
 5. **Fetch.** `LMCacheOffloadConnector._start_state_loads` submits each to
-   `StateOffloadTier.submit_load`, on the tier's own executor — a load is on
-   the TTFT critical path and must not queue behind fire-and-forget spills. A
-   worker with no tier reports them failed.
+   `StateOffloadTier.submit_load`, on the tier's own executor — separate from
+   the KV connector's two, though shared with this tier's own spills; see
+   `submit_load` for why that split was not copied. A worker with no tier
+   reports them failed.
 6. **Report.** `_do_load` puts the request id in `_done` or `_failed`;
    `get_finished` merges those into `finished_loading` / `failed_loading`.
 7. **Apply.** `Scheduler._update_from_kv_xfer_finished` calls
@@ -149,7 +150,7 @@ one reader:
 | field | allocated | admissible |
 |---|:---:|:---:|
 | `extra_entries` (`STATE_CKPT_EXTRA_ENTRIES`) | yes | **yes** |
-| `staging_entries` (`OFFLOAD_STATE`) | yes | no |
+| `staging_entries` (`OFFLOAD_STATE_STAGING_GROUPS`, gated by `OFFLOAD_STATE`) | yes | no |
 
 ## 8. What did not change
 

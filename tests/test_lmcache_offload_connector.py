@@ -2290,14 +2290,10 @@ class _FakeTier:
 
     def __init__(self, done=(), failed=()):
         self.submitted = []
-        self.failed_without_attempt = []
         self._done, self._failed = set(done), set(failed)
 
     def submit_load(self, req_id, h, group):
         self.submitted.append((req_id, h, group))
-
-    def fail_loads(self, req_ids):
-        self.failed_without_attempt.extend(req_ids)
 
     def get_finished(self):
         return set(self._done), set(self._failed)

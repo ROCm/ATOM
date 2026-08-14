@@ -10,13 +10,14 @@ makes `has_initial_state` True over another request's leftovers.
 
 Two worlds are exercised here, and which one a test wants is the whole point:
 
-  loads unwired (the branch today, `STATE_OFFLOAD_LOADS_WIRED` False) -- an
+  loads wired (`loads_wired`, the tree today) -- an offload-only hash is a
+      candidate: it becomes a load, and the `_attach_state_group` guard is what
+      makes a miss behind it safe rather than corrupt. LMCache's own LRU can
+      drop bytes at any time, so that miss never stops being possible.
+  loads unwired (`loads_unwired`) -- the control world, which nobody ships. An
       offload-only hash is not resumable, so it must not shorten a hit that a
-      still-resident HBM checkpoint further left could have served.
-  loads wired (`loads_wired`) -- an offload-only hash is a candidate, and the
-      `_attach_state_group` guard is what makes a miss behind it safe rather
-      than corrupt. LMCache's own LRU can drop bytes at any time, so that miss
-      never stops being possible.
+      still-resident HBM checkpoint further left could have served. That is the
+      only way to observe the shadowing property the gate exists for.
 
 Kept out of `test_state_checkpoint.py` because every case here needs the tier
 switched on, which that file's fixtures deliberately never do.

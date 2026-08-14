@@ -85,6 +85,21 @@ def test_a_load_is_only_offered_for_a_hash_the_tier_believes_in():
     assert idx.loads_attempted == 1
 
 
+def test_one_request_may_only_have_one_load_in_flight(caplog):
+    """Reports are keyed by request id and nothing tells two of them apart, so
+    the first completion would unpark the request while the second is still
+    writing its group. Refusing costs a disown, which is always safe."""
+    idx = index()
+    idx.confirm_spill(11)
+    idx.confirm_spill(22)
+    assert idx.request_load("r1", 11) is True
+    with caplog.at_level(logging.WARNING):
+        assert idx.request_load("r1", 22) is False
+    assert "already has a load in flight" in caplog.text
+    assert idx.pending_loads == {"r1": 11}
+    assert idx.loads_attempted == 1
+
+
 def test_a_completed_load_leaves_the_hash_in_the_index():
     """A hit does not consume the bytes: LMCache still holds them and the next
     request over the same prefix must find them."""

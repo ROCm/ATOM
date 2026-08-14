@@ -4,8 +4,9 @@ Date: 2026-08-14
 Status: **the spill half, as built. The load half landed afterwards** — see
 [`2026-08-14-state-cache-lmcache-load-as-built.md`](2026-08-14-state-cache-lmcache-load-as-built.md),
 which supersedes §2 ("write-only, on purpose"), §11 ("what wiring the load path
-requires"), and the "structurally 0" remarks about `loads_*` in §7. Everything
-else here still describes the tree.
+requires"), and the `loads_*` row of §7. §2 is kept verbatim as the record of
+what the spill-only branch was; every other section has been corrected in place
+where the load half changed it, and still describes the tree.
 Branch: `feat/state-cache-lmcache-offload`, base `805ae015`, 43 commits, 40 files, +5614/−249
 Supersedes: [`2026-08-12-state-cache-lmcache-offload-design.md`](2026-08-12-state-cache-lmcache-offload-design.md)
 (that document says "not yet planned or implemented" and describes intent, not
@@ -30,8 +31,8 @@ That loss is exactly what the `checkpoints_evicted` counter measures. This
 branch adds a tier beneath the pool: on eviction the checkpoint's bytes are
 copied into a small staging ring inside the same HBM arena, packed by a worker
 thread, and stored in LMCache under the checkpoint's ATOM block hash. The
-engine then records the hash in an in-memory index. **Nothing reads them back
-yet.**
+engine then records the hash in an in-memory index. (This document stops
+there; the load half that reads them back is described in the companion.)
 
 The state cannot be rebuilt from cached KV — the KV cache holds the
 compressor's *output* while the state is its rolling *input window* — which is
@@ -76,10 +77,10 @@ unset the branch is behaviourally identical to before it:
 | Site | With `OFFLOAD_STATE` unset |
 |---|---|
 | `state_offload_staging_groups()` | returns `0` |
-| `SubPoolSpec.extra_entries` (V4, GDN) | `0` → arena identical, `admission_entries == entries` |
+| `SubPoolSpec.staging_entries` (V4, GDN) | `0` → arena identical, `admission_entries == entries` |
 | `BlockManager.state_offload` | `None`; no ring installed, no warning |
 | `StateGroupPool.offload` | `None`; `_spill()` returns immediately |
-| `StateGroupPool._resumable_from(h)` | reduces to the pre-branch `h in self.hash_to_group` |
+| `StateGroupPool._resumable_from(h, tokens)` | reduces to the pre-branch `h in self.hash_to_group` |
 | `ScheduledBatch.state_spill_pairs` | empty list → `CommonAttentionBuilder.build()` skips the whole block |
 | `LMCacheOffloadConnector._state_tier` | `None`; `_submit_state_spills` returns on the first probe |
 | `KVConnectorOutput.state_*` | empty sets; additive fields, the four other connectors never set them |
@@ -112,10 +113,10 @@ the worker-side tier construction all call that one function — a second
 runner never drains.
 
 Two env vars the original plan sketched are **not implemented and have no
-effect**: `OFFLOAD_STATE_MIN_LOAD_TOKENS` (belongs to the unwired load path;
-`should_load_state` takes the floor as an argument and has no call site) and
-`OFFLOAD_STATE_WORKERS` (only the `max_workers=1` default on
-`StateOffloadTier`).
+effect**: `OFFLOAD_STATE_WORKERS` (only the `max_workers=1` default on
+`StateOffloadTier`). `OFFLOAD_STATE_MIN_LOAD_TOKENS` was in that list too and
+no longer is — it is read by `state_offload_min_load_tokens()` and consulted in
+`_resumable_from`; see the load document.
 
 ### Refusals — the tier declines to build, loudly, in four cases
 
@@ -215,7 +216,7 @@ applies**.
 ### 5.3 Spill by copy, not by pin
 
 The staging ring is K groups appended to the state arena past the pool's own
-range. `SubPoolSpec.extra_entries` allocates them; `PoolPlan.admission_entries`
+range. `SubPoolSpec.staging_entries` allocates them; `PoolPlan.admission_entries`
 withholds them from the BlockManager, so no request is ever handed one.
 Backends keep sizing their tensors from `pool_plan.entries` (the allocation
 count) while admission reads `admission_entries`.
@@ -227,11 +228,13 @@ immediately, and the ring bounds the cost at K groups of HBM. The original
 2026-08-12 spec flagged this as "the least-settled part of the design"; it is
 now settled, implemented, and tested (`tests/test_state_spill_copy_order.py`).
 
-`extra_entries` is counted in **groups**, and each sizing site multiplies by
-its own `entries_per_req`:
+`staging_entries` is counted in **groups**, and `state_pool()` multiplies by
+the class's own `entries_per_req` (the backends no longer pass it themselves;
+`extra_entries` is a different cushion, `STATE_CKPT_EXTRA_ENTRIES`, and it *is*
+admissible):
 
-- V4: `entries_per_req=1`, so `extra_entries = K * 1`.
-- GDN: `entries_per_req = span = 1 + num_spec`, so `extra_entries = K * span`.
+- V4: `entries_per_req=1`, so `staging_entries = K * 1`.
+- GDN: `entries_per_req = span = 1 + num_spec`, so `staging_entries = K * span`.
   Sizing this in bare entries runs the last staging group off the end of the
   tensor — and `cache[layer, lo : lo + span]` **clamps** rather than raising,
   so the failure is a short segment, an `entry_bytes` mismatch, and a crash
@@ -246,7 +249,7 @@ its own `entries_per_req`:
 
 `StateByteCodec`'s parameter is called `entry_index` and not `group` for
 exactly this reason: on the spill path it is a staging-ring entry, on the
-(future) load path it is a real pool group. Both resolve through the same
+load path it is a real pool group. Both resolve through the same
 `state_entry_views` space.
 
 ### 5.5 Aggregation across TP ranks
@@ -277,7 +280,7 @@ to one tier and a future load could ask the other.
 `StateByteCodec.key(h)` builds
 `CacheEngineKey(model_name, world_size, worker_id, h, torch.uint8)` with
 `worker_id = tp.rank_in_group`. The ATOM hash goes in **unmodified** —
-`_resumable_from(h)` looks up the same integer in HBM and in this tier, so
+`_resumable_from(h, tokens)` looks up the same integer in HBM and in this tier, so
 hashing, salting or stringifying it here would make the two branches ask
 different questions.
 
@@ -297,16 +300,16 @@ still resident in HBM that the walk-back would have reached. A resume thrown
 away, growing with spill volume.
 
 That is why `_resumable_from` gates the tier's `hashes` set behind
-`STATE_OFFLOAD_LOADS_WIRED`. While that flag is False the predicate is exactly
-the HBM-only test it was before the branch. `hashes` is still populated — the
-spill leg is live — so the flag changes *who may vote on a hit*, not what is
-recorded.
+`STATE_OFFLOAD_LOADS_WIRED`. The flag is True today; with it False the
+predicate is exactly the HBM-only test it was before the branch. `hashes` is
+populated either way — the spill leg is live — so the flag changes *who may
+vote on a hit*, not what is recorded.
 
 Two tests are the control pair for this, and they must both survive any change
 to the flag:
 
-- `test_a_spilled_rung_does_not_shadow_a_resident_one` — loads unwired: the
-  shorter, resident rung wins.
+- `test_a_spilled_rung_does_not_shadow_a_resident_one` — the gate closed
+  (`loads_unwired`): the shorter, resident rung wins.
 - `test_the_gate_is_the_only_thing_holding_the_spilled_rung_back` — loads
   wired: the rightmost boundary wins again. This proves the first test passes
   because the spilled rung is *unreachable*, not because the scan stopped
@@ -338,7 +341,7 @@ pool names the same).
 | `state_offload_spills_requested` | Spills that got a slot. |
 | `state_offload_spills_dropped` | Ring too shallow for the eviction rate → raise `OFFLOAD_STATE_STAGING_GROUPS`. **The starvation warning only fires after 256 consecutive drops, so a ring dropping one in three is silent there and visible only here.** |
 | `state_offload_indexed` | Hashes every rank stored. |
-| `state_offload_loads_attempted` / `_failed` | **Structurally 0** on this branch — their only writers are in the unwired load path. A non-zero value would itself be news. |
+| `state_offload_loads_attempted` / `_completed` / `_failed` | The load leg, added later; `failed / attempted` is the index's false-positive rate. See the companion document. |
 
 Two latched warnings guard the contract that would otherwise fail silently:
 `StateGroupPool` warns once if `take_spill_copies()` is not drained every step
@@ -497,9 +500,9 @@ For the agent picking this up. In dependency order:
 | `tests/test_state_entry_views.py` | `state_entry_views` contiguity and full-span coverage for V4 and GDN, including staging groups past the admission count. |
 | `tests/test_state_spill_copy_order.py` | Spills issued before checkpoint copies. |
 | `tests/test_state_offload_resume.py` | Admission against a spilled hash; the shadowing control pair; the disown guard; reported `cached_tokens`. |
-| `tests/test_state_offload_clamp.py` | `clamp_state_boundary`, `_JointPark`, `should_load_state` (all unwired). |
+| `tests/test_state_offload_clamp.py` | `clamp_state_boundary` and `_JointPark`, both still uncalled. (`should_load_state` moved to `state_offload.py` and is wired; it is tested in `test_state_offload_index.py`.) |
 | `tests/test_kv_aggregator.py` | Union quorum on `state_indexed \| state_index_failed`. |
-| `tests/test_sub_pool_spec.py` | `extra_entries` vs `admission_entries`. |
+| `tests/test_sub_pool_spec.py` | `extra_entries` vs `staging_entries` vs `admission_entries`. |
 | `tests/test_staged_transfer.py` | Pack/unpack round trip, stream ordering, the per-thread buffer property. |
 
 ## 14. Open decisions — for the user, not the next agent

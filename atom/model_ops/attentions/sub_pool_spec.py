@@ -118,11 +118,14 @@ def state_pool(
     for the same reason: each is driven by an environment variable, and a
     second reader anywhere would let two sites disagree about the same number.
 
-      `STATE_CKPT_EXTRA_ENTRIES`  checkpoint capacity. Admissible — these are
-                                  groups the pool hands out.
-      `OFFLOAD_STATE`             the offload tier's staging ring, counted in
-                                  *groups*, so it costs `entries_per_req` rows
-                                  each. Never admissible.
+      `STATE_CKPT_EXTRA_ENTRIES`   checkpoint capacity. Admissible — these are
+                                   groups the pool hands out.
+      `OFFLOAD_STATE_STAGING_GROUPS`
+                                   the offload tier's staging ring, counted in
+                                   *groups*, so it costs `entries_per_req` rows
+                                   each. Never admissible. Gated to 0 by
+                                   `OFFLOAD_STATE`; both are read through
+                                   `state_offload_staging_groups()`.
 
     The env assigns `extra_entries` rather than adding to it, which is the
     contract `tests/test_v4_sub_pool_spec.py` pins: the declared value is a

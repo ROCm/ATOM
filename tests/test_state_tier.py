@@ -111,15 +111,6 @@ def test_a_failed_load_reports_failed_by_request():
     assert t.get_finished() == (set(), {"req-a"})
 
 
-def test_a_load_that_was_never_attempted_can_still_be_failed():
-    """The no-tier and refused-tier paths need somewhere to send a load they
-    cannot serve. Silence is the one answer the engine cannot recover from:
-    the request is already parked and only a report unparks it."""
-    t = tier(FakeCodec())
-    t.fail_loads(["req-a", "req-b"])
-    assert t.get_finished() == (set(), {"req-a", "req-b"})
-
-
 def test_get_finished_drains():
     t = tier(FakeCodec())
     t.submit_load("req-a", 11, group=3)

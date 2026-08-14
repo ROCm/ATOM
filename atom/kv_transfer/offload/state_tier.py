@@ -1,17 +1,17 @@
 # SPDX-License-Identifier: MIT
 """Worker-side spill and load driver for the state offload tier.
 
-Its own executor, separate from the KV connector's `_load_executor` and
-`_save_executor`. The reason is the one recorded where those two are built
-(`LMCacheOffloadConnector.__init__`): a
-load is on the TTFT critical path -- a parked sequence is waiting for it --
-and must never queue behind a backlog of fire-and-forget spills.
+One executor of its own, separate from the KV connector's `_load_executor` and
+`_save_executor` so that state transfers and KV transfers cannot block each
+other -- but a single one, shared by this tier's own spills and loads. See
+`submit_load` for why the KV connector's load/save split is not copied here.
 
-On the spill path this class **reports, and the engine applies**. It runs in a
-spawned runner process; `StateOffloadIndex` lives in the engine process, so
-this side cannot free a staging slot or index a hash directly.
+This class **reports, and the engine applies**, in both directions. It runs in
+a spawned runner process; `StateOffloadIndex` lives in the engine process, so
+this side cannot free a staging slot, index a hash, or retract one directly.
 `take_spill_reports` hands three sets to `LMCacheOffloadConnector.get_finished`,
-which puts them on `KVConnectorOutput`.
+which puts them on `KVConnectorOutput`; `get_finished` hands it the two
+request-keyed load sets, which merge into `finished_loading`/`failed_loading`.
 
 Only two of the three reach the engine. `KVOutputAggregator` takes quorum on
 `state_indexed | state_index_failed` and then drops the failures, so
@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 
 class StateOffloadTier:
-    """Moves bytes; decides nothing, records nothing.
+    """Moves bytes; decides nothing, and holds no index.
 
     There is deliberately no index here. `StateOffloadIndex` lives in the
     engine process and this runs in a spawned runner, so every counter and
@@ -89,24 +89,18 @@ class StateOffloadTier:
     def submit_load(self, req_id: str, h: int, group: int) -> None:
         """Fetch `h` into pool group `group` for the parked request `req_id`.
 
-        On its own executor, and that is the point of having two: a load is on
-        the TTFT critical path -- a request is parked waiting for exactly this
-        -- and must not queue behind a backlog of fire-and-forget spills.
+        Shares this class's single serial executor with the spills, unlike the
+        KV connector, which splits its two. The reason the split is not copied
+        here is the cost of copying it: `StagedTransfer` keeps its staging
+        buffer in `threading.local`, so a second worker thread means a second
+        resident buffer per rank out of the same HBM budget the state pool is
+        short of. The queue it would shorten is also much shorter -- at
+        `OFFLOAD_STATE_STAGING_GROUPS` deep, at most that many spills can be
+        outstanding, one entry each. If a load is ever measured waiting behind
+        spills, splitting is the fix and the buffer is the price.
         """
         fut = self._executor.submit(self._do_load, req_id, h, group)
         self._register(fut)
-
-    def fail_loads(self, req_ids) -> None:
-        """Report loads that were never attempted as failed.
-
-        For the caller that has nowhere to send them -- a tier that refused to
-        build, a connector that cannot serve. Silence there is the one outcome
-        the engine cannot recover from: the request is already parked and only
-        a report unparks it. `failed_loading` means "wake and recompute over
-        the blocks already allocated", which is the right answer.
-        """
-        with self._lock:
-            self._failed.update(req_ids)
 
     def drain(self) -> None:
         """Block until every submitted transfer has settled. Tests and shutdown
@@ -193,13 +187,15 @@ class StateOffloadTier:
 def clamp_state_boundary(state_blocks: int, kv_loaded_blocks: int) -> int:
     """`P <= L`: a state boundary may not claim history the KV does not cover.
 
-    Today it holds for free and the `P > L` hazard is gated off, twice over:
-    `state_pool.STATE_OFFLOAD_LOADS_WIRED` is False so the tier does not admit
-    spilled hashes at all, and `LMCacheOffloadConnectorScheduler
-    ._decide_load_after_alloc` refuses the KV load for any `has_per_req_cache`
-    sequence, so both boundaries still derive from `block_hashes`.
+    Today it holds for free, and one gate is what makes it hold:
+    `LMCacheOffloadConnectorScheduler._decide_load_after_alloc` refuses the KV
+    load for any `has_per_req_cache` sequence, so both boundaries still derive
+    from `block_hashes` -- which `can_allocate` builds out of HBM `kv.lookup`
+    hits only. (There used to be a second gate,
+    `state_pool.STATE_OFFLOAD_LOADS_WIRED`, and it is now open: the state leg
+    does load from the tier. Only the KV leg is still refused.)
 
-    Re-arming either gate arms the hazard, and the failure is silent: state is
+    Lifting that gate arms the hazard, and the failure is silent: state is
     the compressed history of [0,P), so with P > L the forward reads a
     compressed prefix whose raw KV was never loaded and produces wrong output
     without raising. This helper is the clamp for that world; it has no

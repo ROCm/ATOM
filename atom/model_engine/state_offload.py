@@ -34,11 +34,12 @@ class StateOffloadIndex:
     """What has been spilled, what is queued to be, and what is coming back.
 
     `hashes` answers the membership half of `StateGroupPool._resumable_from`,
-    and only once loads are wired: that predicate gates this set behind
-    `state_pool.STATE_OFFLOAD_LOADS_WIRED`, because a hash no load path can act
-    on would end the right-to-left scan on a boundary nothing can deliver. This
-    set is populated either way — the spill leg is live — so what the flag
-    changes is who may vote on a hit, not what is recorded here.
+    which gates this set behind `state_pool.STATE_OFFLOAD_LOADS_WIRED` — now
+    True, because the load that acts on the vote exists. The gate remains
+    because a hash no load path can act on would end the right-to-left scan on
+    a boundary nothing can deliver, so the two may only ever move together.
+    The set is populated regardless of the flag: what the flag changes is who
+    may vote on a hit, not what is recorded here.
 
     It is deliberately optimistic: LMCache's own LRU can drop bytes at any
     time, so a hash here means "was spilled once", never "is still there".
@@ -163,6 +164,19 @@ class StateOffloadIndex:
         """
         if h not in self.hashes:
             return False
+        if req_id in self.pending_loads:
+            # One request, one outstanding load. Reports are keyed by request
+            # id and nothing distinguishes two of them, so the first completion
+            # would unpark the request while the second is still writing its
+            # group. No in-tree path reaches this today -- a parked request is
+            # in `waiting` and only running requests are preempted -- and the
+            # refusal costs a disown, which is always a safe answer.
+            logger.warning(
+                "state offload: request %s already has a load in flight; "
+                "refusing a second one and letting the boundary be disowned.",
+                req_id,
+            )
+            return False
         self.pending_loads[req_id] = int(h)
         self.loads_attempted += 1
         return True
@@ -207,11 +221,11 @@ class StateOffloadIndex:
         with `state_offload_`.
 
         The three load counters are read together or not at all.
-        `completed / attempted` is this index's false-positive rate: every
-        attempt was made against a hash the index advertised, so a failure
-        means LMCache's LRU had already dropped the bytes. `attempted -
-        completed - failed` is what is still in flight or was abandoned by an
-        aborted request.
+        `failed / attempted` is this index's false-positive rate: every attempt
+        was made against a hash the index advertised, so a failure means
+        LMCache's LRU had already dropped the bytes. `attempted - completed -
+        failed` is what is still in flight or was abandoned by an aborted
+        request.
         """
         return {
             "spills_requested": self.spills_requested,
@@ -285,8 +299,8 @@ def state_offload_min_load_tokens() -> int:
     declines nothing.
 
     What the knob is for: an entry much larger than that, or an index with a
-    bad false-positive rate (`loads_completed / loads_attempted` on the
-    periodic stats line), where a floor bounds what each miss costs.
+    bad false-positive rate (`loads_failed / loads_attempted` on the periodic
+    stats line), where a floor bounds what each miss costs.
 
     Consulted inside `StateGroupPool._resumable_from`, which is why a bad value
     floors to 0 rather than to something large: a mistyped floor that silently
