@@ -580,7 +580,7 @@ class DSV4PageSlotCodec:
         stream: torch.cuda.Stream | None = None,
     ) -> None:
         flattened = self._flatten_block_ids(block_id_groups)
-        self.scatter(self.page_plan(flattened), device_buf, stream=stream)
+        self.scatter(device_buf, self.page_plan(flattened), stream=stream)
 
     def gather_slot(
         self,

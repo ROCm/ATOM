@@ -1078,6 +1078,32 @@ def test_unified_codec_gathers_into_connector_owned_slot_row(monkeypatch):
     assert used_stream is stream
 
 
+def test_unified_codec_page_restore_passes_buffer_before_plan(monkeypatch):
+    codec = DSV4PageSlotCodec(
+        page_regions=[KVTransferRegion(0x2000, 384, 96)],
+        slot_regions=[],
+        num_blocks=4,
+        num_slots=0,
+        device="cpu",
+    )
+    device_buf = torch.empty(2 * codec.page_bytes_per_block, dtype=torch.uint8)
+    stream = object()
+    calls = []
+
+    def _scatter(src, plan, *, stream=None):
+        calls.append((src, plan, stream))
+
+    monkeypatch.setattr(codec, "scatter", _scatter)
+
+    codec.chunk_major_device_buffer_to_gpu(
+        device_buf,
+        [[1], [3]],
+        stream=stream,
+    )
+
+    assert calls == [(device_buf, codec.page_plan((1, 3)), stream)]
+
+
 def test_unified_codec_scatters_from_connector_owned_slot_row():
     order = []
     connector = _worker(order)
