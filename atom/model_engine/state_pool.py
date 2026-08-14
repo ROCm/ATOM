@@ -25,22 +25,25 @@ NONE = "none"
 # Whether a hash that lives only in the offload tier can still be turned back
 # into a group this pool can resume from.
 #
-# False on this branch, and that is a statement about the code, not a policy
-# knob: the spill direction is wired end to end, the load direction has no
-# caller at all (`StateOffloadTier.submit_load` is never invoked, nothing
-# carries `(hash, target_group)` from the engine to a runner, and no
-# request-keyed state completion comes back). So an offload-only hash cannot
-# become a resume no matter what anyone does with it — `_attach_state_group`
-# misses on the HBM-only `state.lookup` and `allocate` disowns the boundary.
+# True: the load direction is wired end to end.
+# `BlockManager._attach_state_group` turns an accepted offload-only boundary
+# into a `StateOffloadIndex.request_load`, the scheduler parks the request, the
+# worker's `StateOffloadTier.submit_load` fetches the entry into the group the
+# request already holds, and `finished_loading` / `failed_loading` bring it
+# back.
 #
-# Flipping this to True is the whole re-widening edit once loads land, but it
-# is only correct together with them, and `resumable_hit`'s right-to-left scan
-# is the reason: the scan stops at the first boundary `_resumable_from`
-# accepts, so accepting a boundary nothing can deliver does not merely fail to
-# help, it *shadows* a shorter checkpoint still resident in HBM that the scan
-# would otherwise have reached. Reachable-in-principle is the weakest thing
-# this may ever mean; anything weaker turns a hit into no hit.
-STATE_OFFLOAD_LOADS_WIRED = False
+# This is a statement about the code, not a policy knob, and it is not the
+# feature's on/off switch -- `OFFLOAD_STATE` is. What it guards is the
+# invariant that makes `resumable_hit`'s right-to-left scan sound: the scan
+# stops at the first boundary `_resumable_from` accepts, so accepting a
+# boundary nothing can deliver does not merely fail to help, it *shadows* a
+# shorter checkpoint still resident in HBM that the scan would otherwise have
+# reached. Reachable-in-principle is the weakest thing this may ever mean;
+# anything weaker turns a hit into no hit. Set it False again and the pool
+# reverts, exactly, to the HBM-only predicate -- which is what the control pair
+# in `tests/test_state_offload_resume.py` drives, and why it stays a name
+# rather than being folded into the expression it guards.
+STATE_OFFLOAD_LOADS_WIRED = True
 
 
 @dataclass(frozen=True)

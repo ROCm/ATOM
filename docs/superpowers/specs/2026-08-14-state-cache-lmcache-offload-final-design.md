@@ -1,7 +1,11 @@
 # State-Cache LMCache Offload — Final Design (as built)
 
 Date: 2026-08-14
-Status: **implemented and merged to `feat/state-cache-lmcache-offload`; spill wired, load NOT wired**
+Status: **the spill half, as built. The load half landed afterwards** — see
+[`2026-08-14-state-cache-lmcache-load-as-built.md`](2026-08-14-state-cache-lmcache-load-as-built.md),
+which supersedes §2 ("write-only, on purpose"), §11 ("what wiring the load path
+requires"), and the "structurally 0" remarks about `loads_*` in §7. Everything
+else here still describes the tree.
 Branch: `feat/state-cache-lmcache-offload`, base `805ae015`, 43 commits, 40 files, +5614/−249
 Supersedes: [`2026-08-12-state-cache-lmcache-offload-design.md`](2026-08-12-state-cache-lmcache-offload-design.md)
 (that document says "not yet planned or implemented" and describes intent, not

@@ -66,13 +66,24 @@ def stateful_seq(token_ids):
 
 
 def loads_wired(monkeypatch) -> None:
-    """Put the pool in the world where the load direction exists.
+    """Assert the world these tests are written for, rather than assume it.
 
-    An offload-only hash votes in `_resumable_from` only there. Tests of the
-    `_attach_state_group` guard need this world: with loads unwired the pool
-    declines a spilled boundary up front and the guard is never reached.
+    `STATE_OFFLOAD_LOADS_WIRED` is True in the tree; setting it explicitly is
+    what keeps every test below saying which world it means, so the control
+    pair further down reads as a pair.
     """
     monkeypatch.setattr(state_pool, "STATE_OFFLOAD_LOADS_WIRED", True)
+
+
+def loads_unwired(monkeypatch) -> None:
+    """The other half of the control pair: the tier abstains from voting.
+
+    Not a configuration anybody ships -- it is how the shadowing property is
+    made observable. With the tier abstaining, an offload-only rung must not
+    end the right-to-left scan; with it voting, the same rung must win. One
+    test each, and neither means anything without the other.
+    """
+    monkeypatch.setattr(state_pool, "STATE_OFFLOAD_LOADS_WIRED", False)
 
 
 def resident_publisher(bm: BlockManager, tokens: list[int]) -> tuple[int, int]:
@@ -227,17 +238,21 @@ def _two_rungs(bm: BlockManager) -> tuple[int, int]:
 
 
 def test_a_spilled_rung_does_not_shadow_a_resident_one(monkeypatch):
-    """The regression Task 2 introduced, and what the gate exists to stop.
+    """What the gate exists to stop, driven with the gate closed.
 
     `resumable_hit` scans right to left and returns the FIRST boundary
-    `_resumable_from` accepts. While the tier is write-only the rightmost rung
-    is spilled and unreachable, so accepting it ends the scan on a boundary
-    `_attach_state_group` then disowns -- and the shorter rung still sitting in
-    HBM, which the walk-back would have reached, is never tried. Not wrong
-    output (the disown keeps it correct) but a real resume thrown away, and it
-    grows with spill volume.
+    `_resumable_from` accepts. If the tier votes for a rung it cannot deliver,
+    the scan ends there and the shorter rung still sitting in HBM -- which the
+    walk-back would have reached -- is never tried. Not wrong output (the
+    disown keeps it correct) but a real resume thrown away, and it grows with
+    spill volume.
+
+    That is why the tier's vote is gated on the load path existing rather than
+    on the hash being indexed. Closing the gate here is how the property is
+    made observable; the open-gate half is the test below.
     """
     monkeypatch.setenv("OFFLOAD_STATE", "1")
+    loads_unwired(monkeypatch)
     bm = BlockManager(tier_config(pool_entries={"state": 8}, max_num_seqs=8))
     short_boundary, short_group = _two_rungs(bm)
 
@@ -556,26 +571,11 @@ def test_a_resumed_request_still_reports_its_prefix_cache_hit(monkeypatch):
     assert resumer.prefix_cache_hit_tokens == boundary
 
 
-def test_turning_the_tier_on_warns_that_it_is_write_only(monkeypatch, caplog):
-    """An operator must be told the spill buys nothing yet.
-
-    The README says so, but nothing reaches someone who set the env var and is
-    watching counters. Delete this test when the load path lands -- together
-    with the warning it guards.
-    """
-    monkeypatch.setenv("OFFLOAD_STATE", "1")
-    with caplog.at_level("WARNING"):
-        bm = BlockManager(tier_config())
-    assert bm.state_offload is not None
-    assert any(
-        "not wired" in r.message and "OFFLOAD_STATE is on" in r.message
-        for r in caplog.records
-    ), caplog.text
-
-
-def test_the_write_only_warning_is_silent_when_the_tier_is_off(caplog):
-    """The default path stays quiet: no env var, no tier, no warning."""
+def test_the_tier_stays_off_and_quiet_by_default(caplog):
+    """No env var, no tier, no warning -- the standing requirement is that a
+    hybrid model works exactly as before with only paged-KV offload."""
     with caplog.at_level("WARNING"):
         bm = BlockManager(tier_config())
     assert bm.state_offload is None
-    assert "OFFLOAD_STATE is on" not in caplog.text
+    assert bm.state.offload is None
+    assert "OFFLOAD_STATE" not in caplog.text

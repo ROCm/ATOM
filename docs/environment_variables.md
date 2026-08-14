@@ -133,6 +133,23 @@ land. See `atom/model_ops/v4_backend_gate.py` for the selector.
 | **ATOM_V4_BACKEND** | str | `legacy` | `legacy` keeps the per-seq dispatch loop. `new` routes through `V4AttentionBackend`. Layer-restricted by `ATOM_V4_BACKEND_LAYERS` if set. |
 | **ATOM_V4_BACKEND_LAYERS** | csv int | "" (= all) | Comma-separated layer ids that use the new backend (others stay legacy). Empty means: apply `ATOM_V4_BACKEND` uniformly. Used for layer-by-layer bisect during migration (e.g. `0,3,15,30`). |
 
+## Per-request state cache & its offload tier
+
+Hybrid models (GDN/KDA: Qwen3-Next, Qwen3.5, Kimi-K3) and DeepSeek-V4 keep one
+**per-request state** entry alongside their paged KV, held in a fixed pool of
+groups. A prefix hit is only resumable up to a boundary where that state was
+checkpointed, so how many groups exist, and whether an evicted checkpoint can
+be fetched back, decide the hit rate. Full treatment, including the counters to
+read before turning any of this on:
+[`atom/kv_transfer/offload/README.md`](../atom/kv_transfer/offload/README.md).
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **STATE_CKPT_EXTRA_ENTRIES** | int | 0 | Extra state-pool rows beyond the `max_num_seqs` floor, as **checkpoint capacity**: the pool leases these out, so more checkpoints survive concurrency. Read once, in `state_pool()`, and it *assigns* rather than adds — it overrides whatever the backend declared. Independent of, and additive with, the offload staging ring below. |
+| **OFFLOAD_STATE** | bool | 0 | Enable the state offload tier: spill an evicted checkpoint to LMCache and fetch it back on a later hit. Off means byte-identical to no tier at all. Truthy **by spelling** (`0`/`false`/`no`/`off`, empty, and whitespace-padded variants are off), not by equality against `"1"`. Requires `--kv-transfer-config` to name the `lmcache_offload` connector; refused under pipeline parallelism. |
+| **OFFLOAD_STATE_STAGING_GROUPS** | int | 1 | Depth of the spill staging ring, in **groups** — `state_pool()` multiplies by the class's `entries_per_req` to get rows. Allocated inside the state arena and never leased to a request. Raise it if `state_offload_spills_dropped` is a material fraction of `spills_requested`. A negative value disables the tier outright and says so loudly. |
+| **OFFLOAD_STATE_MIN_LOAD_TOKENS** | int | 0 | Boundary below which a spilled checkpoint is not worth fetching. Deliberately unlike KV's `OFFLOAD_MIN_LOAD_TOKENS` (8192): a KV load moves bytes proportional to the hit, while a state load moves one flat entry whatever the boundary is and the prefill it saves grows with the boundary. Raise it when the entry is very large, or when `state_offload_loads_failed / loads_attempted` shows the index advertising bytes LMCache has already dropped. |
+
 ## Profiling & debugging
 
 | Variable | Type | Default | Description |
