@@ -18,7 +18,7 @@ from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import EngineUtilityHandler
 from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Scheduler
 from atom.model_engine.sequence import Sequence, SequenceStatus, get_exit_sequence
-from atom.model_engine.state_pool import StateRuntime
+from atom.model_engine.state_runtime import StateRuntime
 from atom.utils import (
     envs,
     init_exit_handler,

@@ -10,6 +10,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 from atom.model_engine.block_pool import BlockPool
+from atom.model_engine.sequence import Sequence
 
 COPYING = "COPYING"
 READY = "READY"
@@ -66,13 +67,9 @@ class PagedStateCheckpointSpec:
 class CheckpointStoreOp:
     """Scatter one contiguous Active Slot into ordered PAGE units."""
 
-    checkpoint_id: int
-    generation: int
-    prefix_hash: int
     src_slot: int
     unit_ids: tuple[int, ...]
     total_bytes: int
-    last_unit_valid_bytes: int
     layout_id: str
 
 
@@ -80,32 +77,18 @@ class CheckpointStoreOp:
 class CheckpointRestoreOp:
     """Gather one ordered PAGE-unit image into an Active Slot."""
 
-    checkpoint_id: int
-    generation: int
-    prefix_hash: int
     dst_slot: int
     unit_ids: tuple[int, ...]
     total_bytes: int
-    last_unit_valid_bytes: int
     layout_id: str
 
 
 @dataclass
 class CheckpointRecord:
-    checkpoint_id: int
-    generation: int
     prefix_hash: int
-    boundary_blocks: int
-    layout_id: str
-    total_bytes: int
     unit_ids: tuple[int, ...]
-    last_unit_valid_bytes: int
     state: str = COPYING
     pin_count: int = 0
-
-    @property
-    def owner(self) -> tuple[str, int, int]:
-        return ("state-checkpoint", self.checkpoint_id, self.generation)
 
 
 class PageUnitCheckpointStore:
@@ -118,12 +101,6 @@ class PageUnitCheckpointStore:
     ):
         self.pool = pool
         self.spec = spec
-        self.unit_bytes = spec.page_unit_bytes
-        self.slot_bytes = spec.slot_bytes
-        self.layout_id = spec.layout_id
-        self.last_unit_valid_bytes = (
-            self.slot_bytes - (self.units_per_checkpoint - 1) * self.unit_bytes
-        )
 
         self.hash_to_checkpoint: dict[int, int] = {}
         self.records: dict[int, CheckpointRecord] = {}
@@ -132,7 +109,6 @@ class PageUnitCheckpointStore:
         self._inflight_stores: list[int] = []
         self._inflight_restores: list[int] = []
         self._next_checkpoint_id = 0
-        self._next_generation = 1
         self.evictions = 0
 
     @property
@@ -142,11 +118,7 @@ class PageUnitCheckpointStore:
     def lookup(self, prefix_hash: int) -> int:
         checkpoint_id = self.hash_to_checkpoint.get(prefix_hash, -1)
         record = self.records.get(checkpoint_id)
-        if (
-            record is None
-            or record.state != READY
-            or record.layout_id != self.layout_id
-        ):
+        if record is None or record.state != READY:
             return -1
         return checkpoint_id
 
@@ -156,15 +128,10 @@ class PageUnitCheckpointStore:
     def contains_or_pending(self, prefix_hash: int) -> bool:
         return self.contains(prefix_hash) or prefix_hash in self._pending_by_hash
 
-    def record(self, checkpoint_id: int) -> CheckpointRecord:
-        return self.records[checkpoint_id]
-
-    def _new_identity(self) -> tuple[int, int]:
+    def _new_identity(self) -> int:
         checkpoint_id = self._next_checkpoint_id
-        generation = self._next_generation
         self._next_checkpoint_id += 1
-        self._next_generation += 1
-        return checkpoint_id, generation
+        return checkpoint_id
 
     def has_available_units(
         self, count: int, protected_hash: int | None = None
@@ -196,42 +163,30 @@ class PageUnitCheckpointStore:
             self._evict(victim)
         return True
 
-    def begin_store(
-        self, prefix_hash: int, boundary_blocks: int, src_slot: int
-    ) -> CheckpointStoreOp | None:
+    def begin_store(self, prefix_hash: int, src_slot: int) -> CheckpointStoreOp | None:
         if self.lookup(prefix_hash) >= 0 or prefix_hash in self._pending_by_hash:
             return None
         needed = self.units_per_checkpoint
         if not self.ensure_free_units(needed):
             return None
 
-        checkpoint_id, generation = self._new_identity()
-        owner = ("state-checkpoint", checkpoint_id, generation)
+        checkpoint_id = self._new_identity()
+        owner = ("state-checkpoint", checkpoint_id)
         unit_ids = self.pool.reserve_units(needed, owner)
         if unit_ids is None:
             return None
         record = CheckpointRecord(
-            checkpoint_id=checkpoint_id,
-            generation=generation,
             prefix_hash=prefix_hash,
-            boundary_blocks=boundary_blocks,
-            layout_id=self.layout_id,
-            total_bytes=self.slot_bytes,
             unit_ids=tuple(unit_ids),
-            last_unit_valid_bytes=self.last_unit_valid_bytes,
         )
         self.records[checkpoint_id] = record
         self._pending_by_hash[prefix_hash] = checkpoint_id
         self._inflight_stores.append(checkpoint_id)
         return CheckpointStoreOp(
-            checkpoint_id=checkpoint_id,
-            generation=generation,
-            prefix_hash=prefix_hash,
             src_slot=src_slot,
             unit_ids=record.unit_ids,
-            total_bytes=record.total_bytes,
-            last_unit_valid_bytes=record.last_unit_valid_bytes,
-            layout_id=record.layout_id,
+            total_bytes=self.spec.slot_bytes,
+            layout_id=self.spec.layout_id,
         )
 
     def begin_restore(
@@ -245,14 +200,10 @@ class PageUnitCheckpointStore:
         self._lru.move_to_end(checkpoint_id)
         self._inflight_restores.append(checkpoint_id)
         return CheckpointRestoreOp(
-            checkpoint_id=checkpoint_id,
-            generation=record.generation,
-            prefix_hash=prefix_hash,
             dst_slot=dst_slot,
             unit_ids=record.unit_ids,
-            total_bytes=record.total_bytes,
-            last_unit_valid_bytes=record.last_unit_valid_bytes,
-            layout_id=record.layout_id,
+            total_bytes=self.spec.slot_bytes,
+            layout_id=self.spec.layout_id,
         )
 
     def complete_inflight(self) -> None:
@@ -287,21 +238,21 @@ class PageUnitCheckpointStore:
             if record.state == EVICTING and record.pin_count == 0:
                 self._release_record(checkpoint_id)
 
-    def unindex(self, prefix_hash: int) -> int:
+    def unindex(self, prefix_hash: int) -> bool:
         checkpoint_id = self.hash_to_checkpoint.pop(prefix_hash, -1)
         if checkpoint_id < 0:
             checkpoint_id = self._pending_by_hash.pop(prefix_hash, -1)
         if checkpoint_id < 0:
-            return -1
+            return False
         record = self.records.get(checkpoint_id)
         if record is None:
-            return -1
+            return False
         record.state = EVICTING
         self._lru.pop(checkpoint_id, None)
         # Keep units alive while a queued GPU writer can still access them.
         if checkpoint_id not in self._inflight_stores and record.pin_count == 0:
             self._release_record(checkpoint_id)
-        return checkpoint_id
+        return True
 
     def clear(self) -> None:
         self.hash_to_checkpoint.clear()
@@ -314,7 +265,7 @@ class PageUnitCheckpointStore:
             if checkpoint_id not in inflight_stores and record.pin_count == 0:
                 self._release_record(checkpoint_id)
 
-    def _evict(self, checkpoint_id: int) -> int:
+    def _evict(self, checkpoint_id: int) -> None:
         record = self.records[checkpoint_id]
         if record.state != READY or record.pin_count:
             raise AssertionError("only an unpinned READY checkpoint is evictable")
@@ -322,10 +273,8 @@ class PageUnitCheckpointStore:
             del self.hash_to_checkpoint[record.prefix_hash]
         record.state = EVICTING
         self._lru.pop(checkpoint_id, None)
-        count = len(record.unit_ids)
         self._release_record(checkpoint_id)
         self.evictions += 1
-        return count
 
     def _release_record(self, checkpoint_id: int) -> None:
         record = self.records.pop(checkpoint_id)
@@ -334,12 +283,108 @@ class PageUnitCheckpointStore:
             del self.hash_to_checkpoint[record.prefix_hash]
         if self._pending_by_hash.get(record.prefix_hash) == checkpoint_id:
             del self._pending_by_hash[record.prefix_hash]
-        self.pool.release_units(record.unit_ids, record.owner)
+        self.pool.release_units(record.unit_ids, ("state-checkpoint", checkpoint_id))
 
-    @property
-    def num_ready(self) -> int:
-        return len(self._lru)
 
-    @property
-    def num_units(self) -> int:
-        return sum(len(record.unit_ids) for record in self.records.values())
+class PagedStateCheckpointCoordinator:
+    """Schedules PAGE-backed checkpoints for per-request state."""
+
+    successor_room = 0.0
+
+    def __init__(
+        self,
+        pool: BlockPool,
+        spec: PagedStateCheckpointSpec,
+        enabled: bool,
+    ) -> None:
+        self.enabled = enabled
+        self.store = PageUnitCheckpointStore(pool, spec)
+        self._pending: dict[int, tuple[Sequence, int]] = {}
+        self._store_ops: list[CheckpointStoreOp] = []
+        self._restore_ops: list[CheckpointRestoreOp] = []
+        self.checkpoints_kept = 0
+        self.checkpoints_dropped = 0
+        self.checkpoints_orphaned = 0
+
+    def applies(self, seq: Sequence) -> bool:
+        return self.enabled and seq.has_per_req_cache
+
+    def resumable_hit(
+        self,
+        seq: Sequence,
+        hit: int,
+        block_hashes: list[int],
+        assume_checkpointed: bool = False,
+    ) -> int:
+        if not self.applies(seq):
+            return hit
+        for i in range(hit - 1, -1, -1):
+            if assume_checkpointed or self.store.contains(block_hashes[i]):
+                return i + 1
+        return 0
+
+    def checkpoint(self, seq: Sequence, boundary_blocks: int, h: int) -> None:
+        del boundary_blocks
+        if self.applies(seq) and seq.per_req_cache_group >= 0:
+            self._pending[id(seq)] = (seq, h)
+
+    def forget_pending(self, seq: Sequence) -> None:
+        self._pending.pop(id(seq), None)
+
+    def begin_restore(self, h: int, dst_slot: int) -> bool:
+        op = self.store.begin_restore(h, dst_slot)
+        if op is None:
+            return False
+        self._restore_ops.append(op)
+        return True
+
+    def take_checkpoint_ops(
+        self,
+    ) -> tuple[tuple[CheckpointStoreOp, ...], tuple[CheckpointRestoreOp, ...]]:
+        pending, self._pending = self._pending, {}
+        for seq, h in pending.values():
+            src_slot = seq.per_req_cache_group
+            if src_slot < 0 or self.store.contains_or_pending(h):
+                continue
+            op = self.store.begin_store(h, src_slot)
+            if op is None:
+                self.checkpoints_dropped += 1
+                continue
+            self._store_ops.append(op)
+            self.checkpoints_kept += 1
+        stores, self._store_ops = self._store_ops, []
+        restores, self._restore_ops = self._restore_ops, []
+        return tuple(stores), tuple(restores)
+
+    def complete_previous_batch(self) -> None:
+        self.store.complete_inflight()
+
+    def has_available_units(
+        self, count: int, protected_hash: int | None = None
+    ) -> bool:
+        return self.store.has_available_units(count, protected_hash)
+
+    def ensure_free_units(self, count: int) -> bool:
+        return self.store.ensure_free_units(count)
+
+    def unindex(self, h: int) -> None:
+        pending_ids = [
+            seq_id for seq_id, (_, pending_h) in self._pending.items() if pending_h == h
+        ]
+        for seq_id in pending_ids:
+            del self._pending[seq_id]
+        removed = self.store.unindex(h)
+        if pending_ids or removed:
+            self.checkpoints_orphaned += 1
+
+    def clear_index(self) -> None:
+        self._pending.clear()
+        self.store.clear()
+
+    def checkpoint_fates(self) -> dict[str, int]:
+        return {
+            "checkpoints_kept": self.checkpoints_kept,
+            "checkpoints_dropped": self.checkpoints_dropped,
+            "checkpoints_evicted": self.store.evictions,
+            "checkpoints_orphaned": self.checkpoints_orphaned,
+        }

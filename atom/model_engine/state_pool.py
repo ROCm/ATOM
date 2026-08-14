@@ -2,207 +2,10 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from collections import deque
-from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from heapq import heapify, heappop, heappush
-from math import inf
 
-from atom.model_engine.page_unit_checkpoint import (
-    CheckpointRestoreOp,
-    CheckpointStoreOp,
-    PagedStateCheckpointSpec,
-    PageUnitCheckpointStore,
-)
-
-# `StateTransfer.kind` values. Plain strings rather than an enum because the
-# choice crosses a process boundary inside a dict (ModelRunner's `block_info`),
-# where a scalar survives and a class does not.
-FORK = "fork"
-COPY = "copy"
-NONE = "none"
-
-
-@dataclass(frozen=True)
-class StateTransfer:
-    """How a backend hands one request's state over to another group.
-
-    Three answers, and every checkpoint decision downstream follows from which:
-
-      `none()`    no per-request state, or none that can be handed over at all.
-                  Nothing is ever checkpointed and prefix hits shrink to 0.
-      `fork(n)`   the state rolls. The owner gives its group to the index and
-                  takes a fresh one, reading the old and writing the new for
-                  exactly one forward — which has to leave the new group
-                  self-contained, and that takes `n` committed tokens.
-      `copy(id)`  the versioned state layout can be scattered into PAGE units
-                  and gathered into another Active Slot without a successor.
-
-    The two mechanisms are not interchangeable, and which one a backend can
-    offer decides where it may checkpoint. A fork's contract binds the *next*
-    forward, so it can only be taken where that forward is known to be long
-    enough — true on a prompt, false during generation, where a step commits
-    `1 + accepted_drafts` and acceptance is not knowable in advance. That is why
-    DeepSeek-V4 copies: it is the only way to checkpoint at a decode boundary.
-    See `/app/logs_claude/verify_v4_min_fork.py` for the arithmetic.
-
-    These used to be one integer, `min_fork_tokens`, with 0 spelling `none()` —
-    which is exactly the value `copy(id)` has to report, so the two were
-    indistinguishable. Splitting the kind out is what lets a backend say "no
-    successor needed" without saying "no state".
-    """
-
-    kind: str
-    fork_tokens: int = 0
-    paged_layout_id: str | None = None
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.fork_tokens, int) or isinstance(self.fork_tokens, bool):
-            raise TypeError("fork_tokens must be an integer")
-        if self.kind == COPY:
-            if self.fork_tokens != 0:
-                raise ValueError("copy transfer cannot bind successor tokens")
-            if not isinstance(self.paged_layout_id, str) or not self.paged_layout_id:
-                raise ValueError("copy transfer requires a non-empty PAGE layout id")
-            return
-        if self.kind == FORK:
-            if self.fork_tokens <= 0:
-                raise ValueError("fork transfer requires positive fork_tokens")
-            if self.paged_layout_id is not None:
-                raise ValueError("fork transfer cannot declare a PAGE layout")
-            return
-        if self.kind == NONE:
-            if self.fork_tokens != 0 or self.paged_layout_id is not None:
-                raise ValueError("none transfer cannot carry tokens or a PAGE layout")
-            return
-        raise ValueError(f"unknown state transfer kind {self.kind!r}")
-
-    @classmethod
-    def none(cls) -> "StateTransfer":
-        return cls(NONE)
-
-    @classmethod
-    def fork(cls, tokens: int) -> "StateTransfer":
-        return cls(FORK, tokens)
-
-    @classmethod
-    def copy(cls, layout_id: str) -> "StateTransfer":
-        return cls(COPY, paged_layout_id=layout_id)
-
-    def to_wire(self) -> dict[str, str | int | None]:
-        return {
-            "kind": self.kind,
-            "fork_tokens": self.fork_tokens,
-            "paged_layout_id": self.paged_layout_id,
-        }
-
-    @classmethod
-    def from_wire(cls, wire: object) -> "StateTransfer":
-        if not isinstance(wire, Mapping):
-            raise TypeError("state transfer capability must be a mapping")
-        expected = {"kind", "fork_tokens", "paged_layout_id"}
-        if set(wire) != expected:
-            raise ValueError(
-                "invalid state transfer capability fields: "
-                f"expected={sorted(expected)}, got={sorted(wire)}"
-            )
-        return cls(
-            kind=wire["kind"],  # type: ignore[arg-type]
-            fork_tokens=wire["fork_tokens"],  # type: ignore[arg-type]
-            paged_layout_id=wire["paged_layout_id"],  # type: ignore[arg-type]
-        )
-
-    @property
-    def copies(self) -> bool:
-        return self.kind == COPY
-
-    @property
-    def forks(self) -> bool:
-        return self.kind == FORK
-
-    @property
-    def successor_room(self) -> float:
-        """`StateCache.successor_room` for a class transferred this way."""
-        return inf if self.kind == NONE else float(self.fork_tokens)
-
-
-@dataclass(frozen=True)
-class StateRuntime:
-    """Validated state transfer and optional checkpoint geometry."""
-
-    transfer: StateTransfer = field(default_factory=StateTransfer.none)
-    checkpoint_spec: PagedStateCheckpointSpec | None = None
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.transfer, StateTransfer):
-            raise TypeError("state runtime transfer must be a StateTransfer")
-        if self.checkpoint_spec is not None and not isinstance(
-            self.checkpoint_spec, PagedStateCheckpointSpec
-        ):
-            raise TypeError(
-                "state runtime checkpoint_spec must be a PagedStateCheckpointSpec"
-            )
-        if self.transfer.copies:
-            if self.checkpoint_spec is None:
-                raise ValueError(
-                    "StateTransfer.copy(layout_id) requires a PAGE checkpoint spec"
-                )
-            if self.transfer.paged_layout_id != self.checkpoint_spec.layout_id:
-                raise ValueError(
-                    "state runtime PAGE layout mismatch: "
-                    f"transfer={self.transfer.paged_layout_id!r}, "
-                    f"spec={self.checkpoint_spec.layout_id!r}"
-                )
-        elif self.checkpoint_spec is not None:
-            raise ValueError(
-                f"StateTransfer.{self.transfer.kind} cannot carry a PAGE checkpoint spec"
-            )
-
-    def to_wire(self) -> dict[str, object]:
-        return {
-            "transfer": self.transfer.to_wire(),
-            "checkpoint_spec": (
-                None if self.checkpoint_spec is None else self.checkpoint_spec.to_wire()
-            ),
-        }
-
-    @classmethod
-    def from_wire(cls, wire: object) -> "StateRuntime":
-        if not isinstance(wire, Mapping):
-            raise TypeError("state runtime must be a mapping")
-        expected = {"transfer", "checkpoint_spec"}
-        if set(wire) != expected:
-            raise ValueError(
-                "invalid state runtime fields: "
-                f"expected={sorted(expected)}, got={sorted(wire)}"
-            )
-        checkpoint_wire = wire["checkpoint_spec"]
-        checkpoint_spec = (
-            None
-            if checkpoint_wire is None
-            else PagedStateCheckpointSpec.from_wire(checkpoint_wire)
-        )
-        return cls(
-            transfer=StateTransfer.from_wire(wire["transfer"]),
-            checkpoint_spec=checkpoint_spec,
-        )
-
-
-DEFAULT_STATE_RUNTIME = StateRuntime()
-
-
-@dataclass(frozen=True)
-class StateMaintenanceOps:
-    """State movement drained once before a model batch."""
-
-    relocations: tuple[tuple[int, int], ...] = ()
-    checkpoint_stores: tuple[CheckpointStoreOp, ...] = ()
-    checkpoint_restores: tuple[CheckpointRestoreOp, ...] = ()
-
-    @property
-    def empty(self) -> bool:
-        return not (
-            self.relocations or self.checkpoint_stores or self.checkpoint_restores
-        )
+from atom.model_engine.state_runtime import StateTransfer
 
 
 @dataclass(frozen=True)
@@ -223,40 +26,7 @@ class GroupRetirement:
 
 
 class StateGroupPool:
-    """Per-request state groups, plus a content index over the free ones.
-
-    A *group* is what one request occupies in the pre-allocated state tensor:
-    `entries // entries_per_req` contiguous indices (GDN conv+ssm, the
-    DeepSeek-V4 compressor ring and sliding window). This pool owns the free
-    list, so it is the single answer to "can one more request be admitted".
-
-    A per-request state cannot be rebuilt from cached KV blocks: the cache holds
-    the compressor's *output*, the state is its rolling *input* window. So a
-    prefix-cache hit is only recoverable up to a boundary where somebody
-    checkpointed the state — which is what the index over the free list
-    answers.
-
-    Fork checkpoints live in free groups; copy checkpoints live in PAGE units.
-
-    *How* a group reaches the index is the backend's `StateTransfer`, and it is
-    the only thing that differs between the two mechanisms this class runs:
-
-      `fork`  the owner gives its group away and takes a fresh one, so the
-              checkpoint costs no bytes but binds the very next forward, which
-              has to leave the replacement self-contained (`min_fork_tokens`).
-      `copy`  the state is scattered into PAGE units and gathered into a slot.
-
-    The count of groups is not fixed for life: `extend` and `retire_top` move it
-    when the state pool's share of the byte budget changes. Retiring is
-    index-forced but its cost is not — see `retire_top`.
-
-    Vocabulary: *checkpoint* is the state sense throughout — a boundary this
-    class kept resumable. *Publish* is reserved for a block entering the
-    content-addressed KV index (`BlockManager.hash_blocks`, the KV events).
-
-    `enabled` covers the *index* only. The free list stays live either way:
-    admission needs a group whether or not anything is ever checkpointed.
-    """
+    """Own Active Slot allocation and the fork-checkpoint index."""
 
     def __init__(
         self,
@@ -264,22 +34,16 @@ class StateGroupPool:
         transfer: StateTransfer | None = None,
         hash_block_size: int = 1,
         enabled: bool = True,
-        page_checkpoints: PageUnitCheckpointStore | None = None,
     ):
         self.enabled: bool = enabled and num_groups > 0
         self.num_groups: int = num_groups
         self.transfer: StateTransfer = transfer or StateTransfer.none()
-        # Committed tokens the forward after a fork must cover for the new group
-        # to come out self-contained. 0 under `copy`, where the destination is
-        # complete the moment the copy lands and no forward is involved.
+        # Committed tokens needed to make a fork destination self-contained.
         self.min_fork_tokens: int = self.transfer.fork_tokens
         self.successor_room: float = self.transfer.successor_room
         self.hash_block_size: int = hash_block_size
-        self.page_checkpoints = page_checkpoints
-        if self.transfer.copies and self.page_checkpoints is None:
-            raise ValueError("copy transfer requires PAGE-unit state checkpoints")
-        if not self.transfer.copies and self.page_checkpoints is not None:
-            raise ValueError("PAGE-unit state checkpoints require copy transfer")
+        if self.transfer.copies:
+            raise ValueError("PAGE-copy checkpoints do not belong to StateGroupPool")
         # The free list, split by whether the group still carries content worth
         # something. Two containers rather than one queue because the two halves
         # want opposite orders and mixing them serves neither:
@@ -323,11 +87,7 @@ class StateGroupPool:
         # rather than a second count because the depth is only ever one pass
         # more — see `release_pins`.
         self._deferred: set[int] = set()
-        # (src, dst) Active Slot relocation pairs.
-        self._copies: list[tuple[int, int]] = []
-        self._paged_pending: dict[int, tuple[object, int, int]] = {}
-        self._paged_store_ops: list[CheckpointStoreOp] = []
-        self._paged_restore_ops: list[CheckpointRestoreOp] = []
+        self._relocations: list[tuple[int, int]] = []
         # `dropped` had no group to go to; `evicted` landed and was later
         # spent on an allocation. Counted apart because they read the same in a
         # hit rate and want opposite fixes — the first says the pool is too
@@ -553,9 +313,7 @@ class StateGroupPool:
         The fork test is what `min_fork_tokens` buys: resuming reads the
         checkpoint and writes a fresh group, and that forward has to leave the
         fresh group whole. A boundary too close to the end of the prompt fails
-        it and the scan keeps walking back. Under `copy` the resumer is handed
-        the bytes instead of reading across two groups, so `min_fork_tokens` is
-        0 and the test is vacuous — one expression covers both.
+        it and the scan keeps walking back.
 
         Without this a hit hands the resumed forward a group freshly popped off
         the free list and it reads the previous occupant's state.
@@ -568,47 +326,29 @@ class StateGroupPool:
             return hit
         hbs = self.hash_block_size
         for i in range(hit - 1, -1, -1):
-            checkpointed = (
-                self.page_checkpoints.contains(block_hashes[i])
-                if self.page_checkpoints is not None
-                else block_hashes[i] in self.hash_to_group
-            )
+            checkpointed = block_hashes[i] in self.hash_to_group
             if not assume_checkpointed and not checkpointed:
                 continue
             if seq.num_tokens - (i + 1) * hbs >= self.min_fork_tokens:
                 return i + 1
         return 0
 
-    def lookup(self, h: int) -> int:
+    def lookup_group(self, h: int) -> int:
         """Group holding the checkpoint for hash `h`, or -1."""
         if not self.enabled:
             return -1
-        if self.page_checkpoints is not None:
-            return self.page_checkpoints.lookup(h)
         return self.hash_to_group.get(h, -1)
 
     # ---------------------------- checkpointing ---------------------------- #
     def checkpoint(self, seq, boundary_blocks: int, h: int) -> None:
         """Keep `seq`'s state as of this boundary, filed under hash `h`.
 
-        Two mechanisms, chosen by the backend's `StateTransfer`:
-
-        `fork` — the group cannot be shared while its owner still writes it, so
-        the owner moves to a fresh group and the old one, never written again,
-        becomes the checkpoint. The next forward reads it and fills the
-        replacement, which is the whole reason `min_fork_tokens` gates the
-        position.
-
-        `copy` records a PAGE scatter that becomes visible after it is issued.
+        The owner moves to a fresh group and the old group becomes read-only.
         """
-        if not self.applies(seq):
+        if not self.applies(seq) or not self.transfer.forks:
             return
         old = seq.per_req_cache_group
         if old < 0:
-            return
-        if self.transfer.copies:
-            self._paged_pending[id(seq)] = (seq, boundary_blocks, h)
-            seq.pending_checkpoint = h
             return
         if not self.has_free():
             self.checkpoints_dropped += 1
@@ -625,71 +365,22 @@ class StateGroupPool:
         self.pin(old, reader_is_next_batch=True)
         self.checkpoints_kept += 1
 
-    def _commit_paged_pending(self) -> None:
-        if not self._paged_pending:
-            return
-        pending, self._paged_pending = self._paged_pending, {}
-        store = self.page_checkpoints
-        assert store is not None
-        for seq, boundary_blocks, h in pending.values():
-            if seq.pending_checkpoint != h:
-                continue
-            seq.pending_checkpoint = -1
-            src = seq.per_req_cache_group
-            if src < 0:
-                continue
-            if store.contains_or_pending(h):
-                continue
-            op = store.begin_store(h, boundary_blocks, src)
-            if op is None:
-                self.checkpoints_dropped += 1
-                continue
-            self._paged_store_ops.append(op)
-            self.checkpoints_kept += 1
-
     def checkpoint_fates(self) -> dict[str, int]:
         """What became of the checkpoints the ladder asked this pool to keep."""
         return {
             "checkpoints_kept": self.checkpoints_kept,
             "checkpoints_dropped": self.checkpoints_dropped,
-            "checkpoints_evicted": (
-                self.page_checkpoints.evictions
-                if self.page_checkpoints is not None
-                else self.checkpoints_evicted
-            ),
+            "checkpoints_evicted": self.checkpoints_evicted,
             "checkpoints_orphaned": self.checkpoints_orphaned,
         }
 
-    def record_copy(self, src: int, dst: int) -> None:
+    def record_relocation(self, src: int, dst: int) -> None:
         """Schedule an Active Slot relocation for the next batch."""
-        self._copies.append((src, dst))
+        self._relocations.append((src, dst))
 
-    def record_restore(self, h: int, dst: int) -> bool:
-        """Pin a PAGE-backed checkpoint and queue its gather into `dst`."""
-        assert self.page_checkpoints is not None
-        op = self.page_checkpoints.begin_restore(h, dst)
-        if op is None:
-            return False
-        self._paged_restore_ops.append(op)
-        return True
-
-    def take_state_maintenance_ops(self) -> StateMaintenanceOps:
-        """Drain every state move for the one real batch now being built."""
-        if self.page_checkpoints is not None:
-            self._commit_paged_pending()
-        relocations, self._copies = self._copies, []
-        stores, self._paged_store_ops = self._paged_store_ops, []
-        restores, self._paged_restore_ops = self._paged_restore_ops, []
-        return StateMaintenanceOps(
-            relocations=tuple(relocations),
-            checkpoint_stores=tuple(stores),
-            checkpoint_restores=tuple(restores),
-        )
-
-    def forget_pending(self, seq) -> None:
-        """Drop `seq`'s uncommitted checkpoint before releasing its slot."""
-        seq.pending_checkpoint = -1
-        self._paged_pending.pop(id(seq), None)
+    def take_relocations(self) -> tuple[tuple[int, int], ...]:
+        relocations, self._relocations = self._relocations, []
+        return tuple(relocations)
 
     def _index(self, h: int, group: int) -> None:
         """File `group` as the checkpoint for hash `h`.
@@ -710,7 +401,7 @@ class StateGroupPool:
         if prev != -1 and prev != group:
             self._set_hash(prev, -1)
 
-    def unindex(self, h: int) -> int:
+    def unindex(self, h: int) -> None:
         """Drop the checkpoint filed under `h`. The dual of `_index`.
 
         Called when the KV block of that hash leaves the block index. The two
@@ -726,28 +417,15 @@ class StateGroupPool:
         it exact would have the state pool watch every block of every prefix,
         which costs more than the tail it would catch.
 
-        Returns the group freed, or -1.
         """
-        if self.page_checkpoints is not None:
-            checkpoint_id = self.page_checkpoints.unindex(h)
-            if checkpoint_id >= 0:
-                self.checkpoints_orphaned += 1
-            return checkpoint_id
         group = self.hash_to_group.get(h, -1)
         if group < 0:
-            return -1
+            return
         self.invalidate(group)
         self.checkpoints_orphaned += 1
-        return group
 
     def clear_index(self) -> None:
         """Drop all checkpoint hashes, preserving only in-flight readers."""
-        for seq, _, _ in self._paged_pending.values():
-            seq.pending_checkpoint = -1
-        self._paged_pending.clear()
-        if self.page_checkpoints is not None:
-            self.page_checkpoints.clear()
-            return
         for group in list(self.hash_to_group.values()):
             self.invalidate(group)
 
@@ -831,8 +509,6 @@ class StateGroupPool:
         is why this stays a clock rather than moving to `_consume_state_forks`,
         where it would be tighter and leak.
         """
-        if self.page_checkpoints is not None:
-            self.page_checkpoints.complete_inflight()
         if not self._pinned:
             return
         held, self._deferred = self._deferred, set()

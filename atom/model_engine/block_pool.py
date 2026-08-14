@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Hashable, Iterable
 from dataclasses import dataclass
 from heapq import heapify, heappop, heappush
 
@@ -85,7 +85,7 @@ class BlockPool:
         self._free: set[int] = set(range(num_blocks))
         self._used: set[int] = set()
         # Raw PAGE units reserved by multi-unit objects such as state checkpoints.
-        self._raw_unit_owner: dict[int, object] = {}
+        self._raw_unit_owner: dict[int, tuple[Hashable, int]] = {}
 
     # ------------------------------- counts -------------------------------- #
     @property
@@ -109,13 +109,6 @@ class BlockPool:
 
     def block(self, block_id: int) -> Block:
         return self.blocks[block_id]
-
-    def is_reserved_unit(self, block_id: int) -> bool:
-        """Whether `block_id` is raw storage rather than a live PAGE."""
-        return block_id in self._raw_unit_owner
-
-    def reserved_unit_owner(self, block_id: int) -> object | None:
-        return self._raw_unit_owner.get(block_id)
 
     # ------------------------------- index --------------------------------- #
     def lookup(self, h: int) -> int:
@@ -245,7 +238,7 @@ class BlockPool:
             self._vacant = [b for b in self._free if self.blocks[b].hash == -1]
             heapify(self._vacant)
 
-    def reserve_units(self, count: int, owner: object) -> list[int] | None:
+    def reserve_units(self, count: int, owner: Hashable) -> list[int] | None:
         """Atomically reserve arbitrary PAGE-sized units for raw storage."""
         if count < 0:
             raise ValueError(f"unit count must be non-negative, got {count}")
@@ -261,7 +254,7 @@ class BlockPool:
             unit_ids.append(block_id)
         return unit_ids
 
-    def release_units(self, unit_ids, owner: object) -> None:
+    def release_units(self, unit_ids: Iterable[int], owner: Hashable) -> None:
         """Release a complete raw-unit reservation back to the PAGE pool."""
         ids = list(unit_ids)
         if len(ids) != len(set(ids)):

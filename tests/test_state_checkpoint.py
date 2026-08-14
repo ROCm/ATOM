@@ -21,17 +21,14 @@ from conftest import MockConfig
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.page_unit_checkpoint import (
-    CheckpointRestoreOp,
-    CheckpointStoreOp,
     PagedStateCheckpointSpec,
-    PageUnitCheckpointStore,
+    PagedStateCheckpointCoordinator,
 )
 from atom.model_engine.scheduler import CacheStats, ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import Sequence, SequenceType
 from atom.model_engine.state_cache import StateCache
-from atom.model_engine.state_pool import (
-    StateGroupPool,
-    StateMaintenanceOps,
+from atom.model_engine.state_pool import StateGroupPool
+from atom.model_engine.state_runtime import (
     StateRuntime,
     StateTransfer,
 )
@@ -123,10 +120,10 @@ def publisher_has_read_its_source(bm: BlockManager) -> None:
     reading and writing it at once.
 
     Tests about a resumer, not about the publisher, step over that here rather
-    than each spelling out two `release_state_pins` calls.
+    than each spelling out two lifecycle calls.
     """
-    bm.release_state_pins()
-    bm.release_state_pins()
+    bm.complete_previous_state_batch()
+    bm.complete_previous_state_batch()
 
 
 def run_prompt_on_the_ladder(bm: BlockManager, seq: Sequence) -> list[int]:
@@ -174,7 +171,7 @@ class TestPoolIndex:
     def test_disabled_is_identity(self):
         pool = StateGroupPool(0)
         assert pool.resumable_hit(idx_seq(), 5, [1, 2, 3, 4, 5]) == 5
-        assert pool.lookup(1) == -1
+        assert pool.lookup_group(1) == -1
 
     def test_resumable_hit_picks_rightmost_checkpoint(self):
         pool = StateGroupPool(4, StateTransfer.fork(1), hash_block_size=1)
@@ -200,20 +197,20 @@ class TestPoolIndex:
         pool = StateGroupPool(4)
         pool._index(10, 2)
         pool.invalidate(2)
-        assert pool.lookup(10) == -1
+        assert pool.lookup_group(10) == -1
         # A later invalidate of the same group must not delete a new tenant.
         pool._index(10, 3)
         pool.invalidate(2)
-        assert pool.lookup(10) == 3
+        assert pool.lookup_group(10) == 3
 
     def test_republishing_a_hash_orphans_the_old_group(self):
         pool = StateGroupPool(4)
         pool._index(10, 1)
         pool._index(10, 2)
-        assert pool.lookup(10) == 2
+        assert pool.lookup_group(10) == 2
         # Group 1 no longer backs hash 10; invalidating it leaves 2 indexed.
         pool.invalidate(1)
-        assert pool.lookup(10) == 2
+        assert pool.lookup_group(10) == 2
 
     def test_pins_drain_once(self):
         pool = StateGroupPool(4)
@@ -258,7 +255,7 @@ class TestFreeListHalves:
         pool.release(1)
 
         assert pool.pop() == 1
-        assert pool.lookup(10) == 0
+        assert pool.lookup_group(10) == 0
 
     def test_admission_packs_towards_index_zero(self):
         pool = StateGroupPool(4)
@@ -294,7 +291,7 @@ class TestFreeListHalves:
         pool.release_pins()
 
         assert pool.pop() == 1  # 11 is now the older of the two
-        assert pool.lookup(10) == 0
+        assert pool.lookup_group(10) == 0
 
     def test_republishing_a_hash_returns_the_orphan_to_the_vacant_half(self):
         pool = StateGroupPool(4)
@@ -305,7 +302,7 @@ class TestFreeListHalves:
         pool._index(10, 1)  # group 0 no longer backs anything
 
         assert pool.pop() == 0  # vacant again, so it goes before the checkpoint
-        assert pool.lookup(10) == 1
+        assert pool.lookup_group(10) == 1
 
 
 class TestShrinking:
@@ -346,8 +343,8 @@ class TestShrinking:
 
         assert out.retired == 3 and out.held_checkpoint
         assert out.relocated_to == 0
-        assert pool.lookup(13) == 0  # the hot one survived, at a new address
-        assert pool.lookup(10) == -1  # the cold one is what we spent
+        assert pool.lookup_group(13) == 0  # the hot one survived, at a new address
+        assert pool.lookup_group(10) == -1  # the cold one is what we spent
         assert pool.num_groups == 3
 
     def test_the_top_is_spent_when_it_is_itself_the_oldest(self):
@@ -358,7 +355,7 @@ class TestShrinking:
 
         out = pool.retire_top()
         assert (out.retired, out.relocated_to, out.held_checkpoint) == (1, -1, True)
-        assert pool.lookup(13) == -1
+        assert pool.lookup_group(13) == -1
 
     def test_a_pinned_top_is_refused_rather_than_moved(self):
         """It is being read by the in-flight step; the pin drains next pass."""
@@ -409,7 +406,7 @@ class TestShrinking:
         drain(pool)
         pool.release(2)
         pool._index(12, 2)
-        assert pool.lookup(12) == 2
+        assert pool.lookup_group(12) == 2
 
 
 # ── BlockManager: the hit is shrunk to a resumable boundary ────────────────
@@ -452,7 +449,7 @@ class TestHitShrink:
         bm = make_block_manager(ckpt_config())
         first = stateful_seq(list(range(40)))
         h = publish_at_boundary(bm, first)
-        src = bm.state.lookup(h)
+        src = bm.state.lookup_group(h)
         assert src >= 0
 
         second = stateful_seq(list(range(40)))
@@ -460,7 +457,7 @@ class TestHitShrink:
         assert second.state_fork_src == src
         assert second.per_req_cache_group != src
         # The checkpoint survives the resume, so a third request still finds it.
-        assert bm.state.lookup(h) == src
+        assert bm.state.lookup_group(h) == src
 
 
 # ── Capacity: checkpoints live on the free list, never hold it back ────────
@@ -490,7 +487,7 @@ class TestCapacity:
         bm = make_block_manager(ckpt_config())
         first = stateful_seq(list(range(40)))
         h = publish_at_boundary(bm, first)
-        group = bm.state.lookup(h)
+        group = bm.state.lookup_group(h)
         bm.deallocate(first)
         # Drain the queue until the checkpoint's group comes back around.
         while bm.state.has_free():
@@ -498,7 +495,7 @@ class TestCapacity:
             bm.allocate(seq, 0)
             if seq.per_req_cache_group == group:
                 break
-        assert bm.state.lookup(h) == -1
+        assert bm.state.lookup_group(h) == -1
 
     def test_resume_without_a_spare_group_adopts_the_checkpoint(self):
         # Two groups: the publisher keeps one, so the only free group when the
@@ -507,7 +504,7 @@ class TestCapacity:
         first = stateful_seq(list(range(40)))
         h = publish_at_boundary(bm, first)
         publisher_has_read_its_source(bm)
-        group = bm.state.lookup(h)
+        group = bm.state.lookup_group(h)
         assert bm.state.num_free() == 1
 
         second = stateful_seq(list(range(40)))
@@ -516,7 +513,7 @@ class TestCapacity:
         # still exactly the state it wanted, just no longer shareable.
         assert second.per_req_cache_group == group
         assert second.state_fork_src == -1
-        assert bm.state.lookup(h) == -1
+        assert bm.state.lookup_group(h) == -1
 
 
 # ── Fork lifecycle ─────────────────────────────────────────────────────────
@@ -534,7 +531,7 @@ class TestForkLifecycle:
         bm.hash_blocks(seq, boundary - seq.num_cached_tokens)
         assert seq.per_req_cache_group != before
         assert seq.state_fork_src == before
-        assert bm.state.lookup(boundary_hash(bm, seq)) == before
+        assert bm.state.lookup_group(boundary_hash(bm, seq)) == before
 
     def test_no_publish_when_the_forward_misses_the_boundary(self):
         bm = make_block_manager(ckpt_config())
@@ -572,13 +569,13 @@ class TestForkLifecycle:
             # the next forward, and that forward is what lets the group go.
             # Without the boundary four publishes would hold four sources at
             # once and the pool would run out mid-ladder.
-            bm.release_state_pins()
+            bm.complete_previous_state_batch()
             bm.hash_blocks(seq, 2 * BLOCK, start_tokens=seq.num_cached_tokens)
             seq.num_cached_tokens += 2 * BLOCK
         # Four publishes into four groups: the oldest was recycled to serve the
         # last one, the rest stand as distinct resume points.
         assert len(bm.state.hash_to_group) == 3
-        assert bm.state.lookup(boundary_hash(bm, seq)) >= 0  # the rightmost one
+        assert bm.state.lookup_group(boundary_hash(bm, seq)) >= 0
 
     def test_interval_thins_the_ladder(self):
         bm = make_block_manager(ckpt_config(state_checkpoint_interval_tokens=3 * BLOCK))
@@ -690,7 +687,7 @@ class TestForkLifecycle:
         # group the first one already took off the free list.
         bm = make_block_manager(ckpt_config(pool_entries={"state": 8}))
         first = stateful_seq(list(range(40)))
-        src = bm.state.lookup(publish_at_boundary(bm, first))
+        src = bm.state.lookup_group(publish_at_boundary(bm, first))
         publisher_has_read_its_source(bm)
 
         resumers = [stateful_seq(list(range(40))) for _ in range(3)]
@@ -705,13 +702,13 @@ class TestForkLifecycle:
         assert src not in groups
         # However many read it, the group goes back exactly once.
         before = bm.state.num_free()
-        bm.release_state_pins()
+        bm.complete_previous_state_batch()
         assert bm.state.num_free() == before + 1
 
     def test_cancel_refuses_to_adopt_a_shared_source(self):
         bm = make_block_manager(ckpt_config())
         first = stateful_seq(list(range(40)))
-        src = bm.state.lookup(publish_at_boundary(bm, first))
+        src = bm.state.lookup_group(publish_at_boundary(bm, first))
         publisher_has_read_its_source(bm)
 
         sharers = [stateful_seq(list(range(40))) for _ in range(2)]
@@ -730,7 +727,7 @@ class TestForkLifecycle:
     def test_cancel_of_a_resume_releases_the_pin(self):
         bm = make_block_manager(ckpt_config())
         first = stateful_seq(list(range(40)))
-        src = bm.state.lookup(publish_at_boundary(bm, first))
+        src = bm.state.lookup_group(publish_at_boundary(bm, first))
         publisher_has_read_its_source(bm)
 
         second = stateful_seq(list(range(40)))
@@ -740,18 +737,18 @@ class TestForkLifecycle:
         assert second.per_req_cache_group == src
         assert not bm.state.is_pinned(src)
         # The pin must not also hand the group back — it has an owner now.
-        bm.release_state_pins()
+        bm.complete_previous_state_batch()
         assert not bm.state.is_free(src)
 
     def test_pinned_source_returns_to_the_free_list_next_step(self):
         bm = make_block_manager(ckpt_config())
         first = stateful_seq(list(range(40)))
-        src = bm.state.lookup(publish_at_boundary(bm, first))
+        src = bm.state.lookup_group(publish_at_boundary(bm, first))
         publisher_has_read_its_source(bm)
         second = stateful_seq(list(range(40)))
         bm.allocate(second, bm.can_allocate(second))
         assert not bm.state.is_free(src)
-        bm.release_state_pins()
+        bm.complete_previous_state_batch()
         assert bm.state.is_free(src)
 
     def test_a_published_source_is_not_handed_out_before_its_reader_runs(self):
@@ -765,17 +762,17 @@ class TestForkLifecycle:
         """
         bm = make_block_manager(ckpt_config())
         first = stateful_seq(list(range(40)))
-        src = bm.state.lookup(publish_at_boundary(bm, first))
+        src = bm.state.lookup_group(publish_at_boundary(bm, first))
         assert first.state_fork_src == src
 
         assert not bm.state.is_free(src)  # the pass that admits cannot get it
-        bm.release_state_pins()  # the batch carrying the fork is built
+        bm.complete_previous_state_batch()  # the batch carrying the fork is built
         assert not bm.state.is_free(src)  # its forward has not been issued yet
-        bm.release_state_pins()  # it has now
+        bm.complete_previous_state_batch()  # it has now
         assert bm.state.is_free(src)
         # And it comes back as a checkpoint, at the LRU tail — publishing is
         # not what spends it.
-        assert bm.state.lookup(bm.state.group_hash[src]) == src
+        assert bm.state.lookup_group(bm.state.group_hash[src]) == src
 
     def test_a_finished_publisher_gives_its_source_back_at_once(self):
         """Nobody is left to read it, so the clock should not hold it.
@@ -787,7 +784,7 @@ class TestForkLifecycle:
         first = stateful_seq(list(range(40)))
         whole = bm.state.num_free()  # nothing handed out yet
         h = publish_at_boundary(bm, first)
-        src = bm.state.lookup(h)
+        src = bm.state.lookup_group(h)
         assert not bm.state.is_free(src)
 
         bm.deallocate(first)
@@ -795,7 +792,7 @@ class TestForkLifecycle:
         # Source and write group both back: the pool is whole again, without
         # waiting out the two passes the clock would have taken.
         assert bm.state.num_free() == whole
-        assert bm.state.lookup(h) == src  # the checkpoint itself survives
+        assert bm.state.lookup_group(h) == src
 
 
 class TestCheckpointsDieWithTheirPrefix:
@@ -813,11 +810,11 @@ class TestCheckpointsDieWithTheirPrefix:
         first = stateful_seq(list(range(40)))
         h = publish_at_boundary(bm, first)
         publisher_has_read_its_source(bm)
-        src = bm.state.lookup(h)
+        src = bm.state.lookup_group(h)
         assert bm.state.holds_checkpoint(src)
 
         bm._record_evicted(h)
-        assert bm.state.lookup(h) == -1
+        assert bm.state.lookup_group(h) == -1
         assert bm.state.is_free(src)
         assert not bm.state.holds_checkpoint(src)  # vacant, spent before live ones
         assert bm.state.checkpoint_fates()["checkpoints_orphaned"] == 1
@@ -832,13 +829,13 @@ class TestCheckpointsDieWithTheirPrefix:
 
         pool.unindex(10)  # group 0's prefix is gone
         assert pool.pop() == 0
-        assert pool.lookup(11) == 1
+        assert pool.lookup_group(11) == 1
 
     def test_unindex_of_an_unknown_hash_is_a_no_op(self):
         pool = StateGroupPool(4)
         pool._index(10, 0)
-        assert pool.unindex(999) == -1
-        assert pool.lookup(10) == 0
+        pool.unindex(999)
+        assert pool.lookup_group(10) == 0
         assert pool.checkpoint_fates()["checkpoints_orphaned"] == 0
 
 
@@ -893,13 +890,13 @@ class TestPagedCopyCheckpoint:
             state_runtime=engine_runtime,
         )
 
-        assert scheduler.block_manager.state_runtime is engine_runtime
-        assert scheduler.block_manager.state.transfer is engine_runtime.transfer
-        assert (
-            scheduler.block_manager.page_checkpoints.spec
-            is engine_runtime.checkpoint_spec
-        )
-        assert scheduler.block_manager.page_checkpoints.units_per_checkpoint == 3
+        checkpoints = scheduler.block_manager.paged_state_checkpoints
+        assert scheduler.block_manager.state_caches == (checkpoints,)
+        assert checkpoints.store.spec is engine_runtime.checkpoint_spec
+        assert checkpoints.store.units_per_checkpoint == 3
+        assert scheduler.block_manager.state.transfer == StateTransfer.none()
+        assert not hasattr(scheduler.block_manager, "state_runtime")
+        assert not hasattr(scheduler.block_manager, "page_checkpoints")
         assert not any(
             hasattr(config, field)
             for field in (
@@ -917,7 +914,7 @@ class TestPagedCopyCheckpoint:
             paged_copy_config(state_checkpoint_interval_tokens=0),
             state_runtime=PAGED_COPY_RUNTIME,
         )
-        scheduler.block_manager.state.record_copy(1, 2)
+        scheduler.block_manager.state.record_relocation(1, 2)
 
         scheduled = scheduler.schedule()
 
@@ -931,42 +928,61 @@ class TestPagedCopyCheckpoint:
             paged_copy_config(state_checkpoint_interval_tokens=0),
             state_runtime=PAGED_COPY_RUNTIME,
         )
-        store = CheckpointStoreOp(
-            checkpoint_id=11,
-            generation=12,
-            prefix_hash=13,
-            src_slot=1,
-            unit_ids=(21, 22, 23),
-            total_bytes=25,
-            last_unit_valid_bytes=5,
-            layout_id=PAGED_COPY_SPEC.layout_id,
-        )
-        restore = CheckpointRestoreOp(
-            checkpoint_id=31,
-            generation=32,
-            prefix_hash=33,
-            dst_slot=2,
-            unit_ids=(41, 42, 43),
-            total_bytes=25,
-            last_unit_valid_bytes=5,
-            layout_id=PAGED_COPY_SPEC.layout_id,
-        )
-        scheduler.block_manager.state.record_copy(3, 4)
-        scheduler.block_manager.state._paged_store_ops.append(store)
-        scheduler.block_manager.state._paged_restore_ops.append(restore)
+        checkpoints = scheduler.block_manager.paged_state_checkpoints
+        seed = checkpoints.store.begin_store(33, src_slot=0)
+        assert seed is not None
+        checkpoints.store.complete_inflight()
+        assert checkpoints.begin_restore(33, dst_slot=2)
+        publisher = stateful_seq(list(range(BLOCK)))
+        publisher.per_req_cache_group = 1
+        checkpoints.checkpoint(publisher, boundary_blocks=1, h=13)
+        scheduler.block_manager.state.record_relocation(3, 4)
         scheduler.add(stateful_seq(list(range(BLOCK))))
 
         batch, scheduled = scheduler.schedule()
 
         assert scheduled
-        assert batch.state_maintenance_ops == StateMaintenanceOps(
-            relocations=((3, 4),),
-            checkpoint_stores=(store,),
-            checkpoint_restores=(restore,),
-        )
+        ops = batch.state_maintenance_ops
+        assert ops.relocations == ((3, 4),)
+        assert len(ops.checkpoint_stores) == 1
+        assert ops.checkpoint_stores[0].src_slot == 1
+        assert len(ops.checkpoint_restores) == 1
+        assert ops.checkpoint_restores[0].dst_slot == 2
         assert scheduler.block_manager.take_state_maintenance_ops().empty
         assert not hasattr(scheduler.block_manager, "state_copies_for_batch")
         assert not hasattr(scheduler.block_manager, "state_transfers_for_batch")
+
+    def test_latest_pending_checkpoint_replaces_the_previous_intent(self):
+        bm = make_block_manager(
+            paged_copy_config(),
+            state_runtime=PAGED_COPY_RUNTIME,
+        )
+        seq = self._admitted(bm)
+        checkpoints = bm.paged_state_checkpoints
+
+        checkpoints.checkpoint(seq, boundary_blocks=1, h=101)
+        checkpoints.checkpoint(seq, boundary_blocks=2, h=202)
+        ops = bm.take_state_maintenance_ops()
+
+        assert len(ops.checkpoint_stores) == 1
+        assert not hasattr(seq, "pending_checkpoint")
+        bm.complete_previous_state_batch()
+        assert not checkpoints.store.contains(101)
+        assert checkpoints.store.contains(202)
+
+    def test_prefix_eviction_drops_an_uncommitted_checkpoint(self):
+        bm = make_block_manager(
+            paged_copy_config(),
+            state_runtime=PAGED_COPY_RUNTIME,
+        )
+        seq = self._admitted(bm)
+        checkpoints = bm.paged_state_checkpoints
+
+        checkpoints.checkpoint(seq, boundary_blocks=1, h=101)
+        bm._record_evicted(101)
+
+        assert bm.take_state_maintenance_ops().checkpoint_stores == ()
+        assert checkpoints.checkpoint_fates()["checkpoints_orphaned"] == 1
 
     def test_checkpoint_uses_page_units_not_an_active_slot(self):
         bm = make_block_manager(
@@ -984,10 +1000,11 @@ class TestPagedCopyCheckpoint:
         assert len(transfers.checkpoint_stores) == 1
         assert bm.state.num_free() == free_slots
         assert bm.kv.num_free == free_pages - 3
-        assert bm.state.lookup(h) == -1  # COPYING is deliberately invisible.
+        checkpoints = bm.paged_state_checkpoints
+        assert checkpoints.store.lookup(h) == -1
 
-        bm.release_state_pins()
-        assert bm.state.lookup(h) >= 0
+        bm.complete_previous_state_batch()
+        assert checkpoints.store.contains(h)
 
     def test_hit_gathers_into_a_distinct_contiguous_active_slot(self):
         bm = make_block_manager(
@@ -998,7 +1015,7 @@ class TestPagedCopyCheckpoint:
         bm.hash_blocks(first, bm.checkpoint_limit(first) - first.num_cached_tokens)
         h = boundary_hash(bm, first)
         store = bm.take_state_maintenance_ops().checkpoint_stores[0]
-        bm.release_state_pins()
+        bm.complete_previous_state_batch()
 
         second = stateful_seq(list(range(48)))
         hit = bm.can_allocate(second)
@@ -1013,7 +1030,7 @@ class TestPagedCopyCheckpoint:
         assert second.state_fork_src == -1
         # The checkpoint stays canonical and shareable. Its fragments were not
         # adopted as the request's kernel-visible slot.
-        assert bm.state.lookup(h) == store.checkpoint_id
+        assert bm.paged_state_checkpoints.store.contains(h)
 
     def test_copy_transfer_can_checkpoint_a_speculative_decode_boundary(self):
         spec = SimpleNamespace(num_speculative_tokens=3, use_dspark=lambda: False)
@@ -1027,7 +1044,9 @@ class TestPagedCopyCheckpoint:
             paged_copy_config(speculative_config=spec),
             state_runtime=PAGED_COPY_RUNTIME,
         )
-        assert copying.block_manager.page_checkpoints.spec is PAGED_COPY_SPEC
+        assert (
+            copying.block_manager.paged_state_checkpoints.store.spec is PAGED_COPY_SPEC
+        )
         assert forking._checkpoint_room(seq, False) == 0
         assert copying._checkpoint_room(seq, False) == 1
         assert copying._checkpoint_room(seq, True) == 0
@@ -1071,7 +1090,7 @@ class TestDecodePointPublishing:
         self._generate_to(bm, seq, 3 * BLOCK)
         assert seq.per_req_cache_group != group
         assert seq.state_fork_src == group
-        assert bm.state.lookup(bm.kv.block(seq.block_table[2]).hash) == group
+        assert bm.state.lookup_group(bm.kv.block(seq.block_table[2]).hash) == group
 
     def test_a_backend_needing_a_long_fork_never_publishes_mid_generation(self):
         """Self-gating: no `min_fork` special case, the number decides.
@@ -1122,7 +1141,7 @@ class TestDecodePointPublishing:
         # left a checkpoint.
         assert bm.can_allocate(followup) == 3
         bm.allocate(followup, 3)
-        assert followup.state_fork_src == bm.state.lookup(
+        assert followup.state_fork_src == bm.state.lookup_group(
             bm.kv.block(seq.block_table[2]).hash
         )
 
@@ -1198,7 +1217,7 @@ class TestDecodePublishGate:
             batch, _ = sched.schedule()
             forks.extend(s for s in batch.state_fork_srcs if s >= 0)
 
-        published = bm.state.lookup(bm.kv.block(seq.block_table[1]).hash)
+        published = bm.state.lookup_group(bm.kv.block(seq.block_table[1]).hash)
         assert published >= 0
         # The seq moved off the group it gave away, and the forward right after
         # the publish was told to read it.
@@ -1255,7 +1274,7 @@ def second_class(**overrides):
 class TestStateCacheProtocol:
 
     def test_copy_transfer_has_no_slot_backed_fallback(self):
-        with pytest.raises(ValueError, match="requires PAGE-unit"):
+        with pytest.raises(ValueError, match="do not belong"):
             StateGroupPool(4, StateTransfer.copy("test-layout"))
 
     def test_both_classes_satisfy_the_protocol(self):
@@ -1295,20 +1314,17 @@ class TestStateCacheProtocol:
     def test_a_copy_never_asks_the_resumer_for_room(self):
         """`resumable_hit`'s fork test is vacuous under `copy`, not skipped."""
         forking = StateGroupPool(4, StateTransfer.fork(4), hash_block_size=1)
-        store = PageUnitCheckpointStore(
-            BlockPool(4), PagedStateCheckpointSpec(1, 1, "test-layout")
+        copying = PagedStateCheckpointCoordinator(
+            BlockPool(4),
+            PagedStateCheckpointSpec(1, 1, "test-layout"),
+            enabled=True,
         )
-        copying = StateGroupPool(
-            4,
-            StateTransfer.copy("test-layout"),
-            hash_block_size=1,
-            page_checkpoints=store,
-        )
+        assert isinstance(copying, StateCache)
         forking._index(10, 0)
         forking._index(50, 1)
-        assert store.begin_store(10, 1, 0) is not None
-        assert store.begin_store(50, 5, 1) is not None
-        store.complete_inflight()
+        assert copying.store.begin_store(10, 0) is not None
+        assert copying.store.begin_store(50, 1) is not None
+        copying.store.complete_inflight()
         # Five one-token blocks; the rightmost checkpoint leaves no room to
         # forward, so a fork walks back to the first and a copy does not.
         assert forking.resumable_hit(idx_seq(5), 5, [10, 20, 30, 40, 50]) == 1

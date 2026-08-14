@@ -18,16 +18,15 @@ from atom.distributed.kv_events import (
 )
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
-from atom.model_engine.page_unit_checkpoint import (
-    PageUnitCheckpointStore,
-)
+from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointCoordinator
 from atom.model_engine.sequence import Sequence
-from atom.model_engine.state_cache import StateCache
-from atom.model_engine.state_pool import (
+from atom.model_engine.state_cache import StateCache, StateCheckpointCache
+from atom.model_engine.state_pool import StateGroupPool
+from atom.model_engine.state_runtime import (
     DEFAULT_STATE_RUNTIME,
-    StateGroupPool,
     StateMaintenanceOps,
     StateRuntime,
+    StateTransfer,
 )
 
 logger = logging.getLogger("atom")
@@ -111,20 +110,27 @@ class BlockManager:
         self.state_checkpoint_interval_tokens = max(
             0, int(getattr(config, "state_checkpoint_interval_tokens", 0) or 0)
         )
-        self.state_runtime = state_runtime
         checkpoint_spec = state_runtime.checkpoint_spec
-        self.page_checkpoints: PageUnitCheckpointStore | None = None
+        self.paged_state_checkpoints: PagedStateCheckpointCoordinator | None = None
         if checkpoint_spec is not None:
-            self.page_checkpoints = PageUnitCheckpointStore(
+            self.paged_state_checkpoints = PagedStateCheckpointCoordinator(
                 self.kv,
                 checkpoint_spec,
+                enabled=self.enable_prefix_caching
+                and self.num_per_req_cache_groups > 0,
             )
         self.state = StateGroupPool(
             self.num_per_req_cache_groups,
-            transfer=state_runtime.transfer,
+            transfer=(
+                StateTransfer.none()
+                if self.paged_state_checkpoints is not None
+                else state_runtime.transfer
+            ),
             hash_block_size=self.hash_block_size,
             enabled=self.enable_prefix_caching,
-            page_checkpoints=self.page_checkpoints,
+        )
+        self._state_checkpoint_cache: StateCheckpointCache = (
+            self.paged_state_checkpoints or self.state
         )
         # A checkpoint is filed under the content hash of the last block it
         # covers, so a rung that isn't a hash-block boundary can never be looked
@@ -157,7 +163,7 @@ class BlockManager:
         # by the state checkpoint, so it has nothing to say about hit length.
         # Kept plural because GDN's recurrent state is a second member the
         # moment it stops forking (see the state-cache protocol).
-        self.state_caches: tuple[StateCache, ...] = (self.state,)
+        self.state_caches: tuple[StateCache, ...] = (self._state_checkpoint_cache,)
 
         # The demand funnel: recorded at admission, cut for when a prefill
         # chunk is shortened to land on it, kept when the state pool files it.
@@ -174,20 +180,23 @@ class BlockManager:
         h.update(np.array(token_ids).tobytes())
         return h.intdigest()
 
-    def release_state_pins(self) -> None:
-        """Return the previous step's resume sources to the free list.
-
-        Called once per engine step before scheduling. A source is read by the
-        forward that was already issued when it is handed out again — read
-        directly under a fork, copied out of under a copy — and the next owner's
-        forward is issued after that one on the same stream, so stream ordering
-        covers the overlap either way.
-        """
+    def complete_previous_state_batch(self) -> None:
+        """Complete state reads and copies issued by the previous batch."""
         self.state.release_pins()
+        if self.paged_state_checkpoints is not None:
+            self.paged_state_checkpoints.complete_previous_batch()
 
     def take_state_maintenance_ops(self) -> StateMaintenanceOps:
         """Drain state maintenance for the batch being built."""
-        return self.state.take_state_maintenance_ops()
+        relocations = self.state.take_relocations()
+        stores = restores = ()
+        if self.paged_state_checkpoints is not None:
+            stores, restores = self.paged_state_checkpoints.take_checkpoint_ops()
+        return StateMaintenanceOps(
+            relocations=relocations,
+            checkpoint_stores=stores,
+            checkpoint_restores=restores,
+        )
 
     def _record_evicted(self, h: int) -> None:
         """A hash the block pool just dropped: report it, and settle the state.
@@ -200,7 +209,7 @@ class BlockManager:
         """
         if self._event_log is not None:
             self._event_log.append(_make_block_removed([h]))
-        self.state.unindex(h)
+        self._state_checkpoint_cache.unindex(h)
 
     def _fresh_block(self) -> int:
         """Take a block for content this step is about to compute."""
@@ -213,16 +222,16 @@ class BlockManager:
     def _has_page_units(
         self, count: int, protected_checkpoint_hash: int | None = None
     ) -> bool:
-        if self.page_checkpoints is None:
+        if self.paged_state_checkpoints is None:
             return self.kv.has_free(count)
-        return self.page_checkpoints.has_available_units(
+        return self.paged_state_checkpoints.has_available_units(
             count, protected_hash=protected_checkpoint_hash
         )
 
     def _ensure_page_units(self, count: int) -> bool:
-        if self.page_checkpoints is None:
+        if self.paged_state_checkpoints is None:
             return self.kv.has_free(count)
-        return self.page_checkpoints.ensure_free_units(count)
+        return self.paged_state_checkpoints.ensure_free_units(count)
 
     def _dcp_num_blocks(self, seq_len: int) -> int:
         if self.dcp_world_size <= 1:
@@ -392,7 +401,7 @@ class BlockManager:
             self.kv.claim(block_id)
             seq.block_table.append(block_id)
         # Pin the restore before fresh blocks can evict its checkpoint.
-        if seq.has_per_req_cache and self.page_checkpoints is not None:
+        if seq.has_per_req_cache and self.paged_state_checkpoints is not None:
             self._attach_state_group(seq, h if num_cached_blocks > 0 else -1)
         for _ in range(num_cached_blocks, self._dcp_num_blocks(len(seq))):
             seq.block_table.append(self._fresh_block())
@@ -405,7 +414,7 @@ class BlockManager:
         # paged-block cost. The slot cap
         # (the state pool's free list, size = `max_num_seqs`) is the sole
         # admission bound for state cache.
-        if seq.has_per_req_cache and self.page_checkpoints is None:
+        if seq.has_per_req_cache and self.paged_state_checkpoints is None:
             self._attach_state_group(seq, h if num_cached_blocks > 0 else -1)
 
     def _attach_state_group(self, seq: Sequence, hit_hash: int) -> None:
@@ -420,21 +429,21 @@ class BlockManager:
 
         A checkpoint is read-only, so several requests in one step may resume
         off the same one. The first takes it off the free list and the pin
-        covers every reader until `release_state_pins`; a later one in that same
-        step finds it already pinned and only needs a group to write into.
+        covers every reader until the previous state batch completes; a later
+        one in that step finds it pinned and only needs a group to write into.
         Adopting is then off the table — the pin means someone else's forward
         still has to read it, or copy out of it.
         """
-        if self.page_checkpoints is not None:
+        if self.paged_state_checkpoints is not None:
             dst = self.state.pop()
             seq.per_req_cache_group = dst
             seq.state_fork_src = -1
             if hit_hash != -1:
-                restored = self.state.record_restore(hit_hash, dst)
+                restored = self.paged_state_checkpoints.begin_restore(hit_hash, dst)
                 assert restored, "gated PAGE checkpoint disappeared before attach"
             return
 
-        src = self.state.lookup(hit_hash) if hit_hash != -1 else -1
+        src = self.state.lookup_group(hit_hash) if hit_hash != -1 else -1
         if src < 0:
             seq.per_req_cache_group = self.state.pop()
             seq.state_fork_src = -1
@@ -720,7 +729,7 @@ class BlockManager:
         return {
             "demands_recorded": self.demands_recorded,
             "chunks_cut_for_demand": self.chunks_cut_for_demand,
-        } | self.state.checkpoint_fates()
+        } | self._state_checkpoint_cache.checkpoint_fates()
 
     def checkpointers_at(
         self,
@@ -936,15 +945,11 @@ class BlockManager:
         seq.last_checkpoint_pos = 0
         # An uncommitted checkpoint describes state in a group that is about to
         # go back on the free list, so the intent dies with it.
-        self.state.forget_pending(seq)
+        if self.paged_state_checkpoints is not None:
+            self.paged_state_checkpoints.forget_pending(seq)
         seq.block_table.clear()
         if seq.has_per_req_cache and seq.per_req_cache_group >= 0:
-            # Only the group the seq was writing. A checkpoint it took is
-            # already back on the free list under the state index; the source
-            # it was going to fork off is dropped here rather than left to
-            # `release_state_pins`, because the forward that owed the read is
-            # not going to happen and the group should not sit out a pass for
-            # a reader that no longer exists.
+            # No next forward will read a pending fork source after deallocation.
             self.state.release(seq.per_req_cache_group)
             self.state.drop_reader(seq.state_fork_src)
             seq.per_req_cache_group = -1
@@ -991,7 +996,7 @@ class BlockManager:
         they remain valid via their block_table refs, just unhashable for
         future requests."""
         self.kv.clear_index()
-        self.state.clear_index()
+        self._state_checkpoint_cache.clear_index()
         if self._event_log is not None:
             self._event_log.append(_make_all_cleared())
 

@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -10,7 +11,7 @@ from aiter.dist.parallel_state import get_tp_group
 
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.scheduler import ScheduledBatch
-from atom.model_engine.state_pool import StateTransfer
+from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attention_gdn import GatedDeltaNet
 from atom.utils import CpuGpuBuffer
 from atom.utils.forward_context import AttentionMetaData, Context
@@ -299,7 +300,7 @@ class GDNStateMixin:
             ),
         }
 
-    def relocate_state_slots(self, pairs: list[tuple[int, int]]) -> None:
+    def relocate_state_slots(self, pairs: Sequence[tuple[int, int]]) -> None:
         """Relocate a live GDN group between logical Active Slot spans.
 
         A group is `1 + num_spec` consecutive slots — the extra ones hold the

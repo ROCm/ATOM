@@ -3,6 +3,7 @@
 
 import logging
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Generic, Optional, TypeVar
 
 if TYPE_CHECKING:
@@ -14,8 +15,12 @@ from aiter.dist.parallel_state import get_tp_group
 from torch import nn
 
 from atom.distributed.dcp_utils import get_dcp_rank, get_dcp_world_size
+from atom.model_engine.page_unit_checkpoint import (
+    CheckpointRestoreOp,
+    CheckpointStoreOp,
+)
 from atom.model_engine.scheduler import ScheduledBatch
-from atom.model_engine.state_pool import StateTransfer
+from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attention_mla import MLAModules
 from atom.model_ops.attentions.sub_pool_spec import SubPoolSpec
 from atom.utils import CpuGpuBuffer
@@ -142,14 +147,18 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         """Declare this backend's per-request state checkpoint capability."""
         return StateTransfer.none()
 
-    def relocate_state_slots(self, pairs: list[tuple[int, int]]) -> None:
+    def relocate_state_slots(self, pairs: Sequence[tuple[int, int]]) -> None:
         """Move live state between contiguous Active Slots."""
         raise NotImplementedError(
             f"{type(self).__name__} owns per-request state but does not "
             "implement relocate_state_slots"
         )
 
-    def execute_paged_state_copies(self, store_ops: list, restore_ops: list) -> None:
+    def execute_paged_state_copies(
+        self,
+        store_ops: Sequence[CheckpointStoreOp],
+        restore_ops: Sequence[CheckpointRestoreOp],
+    ) -> None:
         """Copy checkpoints between Active Slots and arbitrary PAGEs."""
         if store_ops or restore_ops:
             raise NotImplementedError(

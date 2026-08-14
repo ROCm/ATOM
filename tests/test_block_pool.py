@@ -161,9 +161,12 @@ class TestRawPageUnits:
         units = pool.reserve_units(4, owner=("checkpoint", 1))
 
         assert units == [0, 2, 5, 7]
-        assert all(pool.is_reserved_unit(i) for i in units)
         assert all(pool.is_used(i) for i in units)
-        assert [pool.reserved_unit_owner(i)[1] for i in units] == [0, 1, 2, 3]
+        assert pool.num_free == 0
+        with pytest.raises(AssertionError, match="belongs"):
+            pool.release_units(reversed(units), owner=("checkpoint", 1))
+        pool.release_units(units, owner=("checkpoint", 1))
+        assert pool.num_free == 4
 
     def test_failed_reservation_is_atomic(self):
         pool = BlockPool(num_blocks=2)

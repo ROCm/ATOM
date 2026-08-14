@@ -40,6 +40,7 @@ Per-slot cost (V4-Pro, BF16 SWA + fp32 tail buffers, 30 CSA + 31 HCA + 1 dense):
 import logging
 import math
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -58,8 +59,12 @@ from atom.distributed.pcp_utils import (
     pcp_round_robin_query_indices,
 )
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
+from atom.model_engine.page_unit_checkpoint import (
+    CheckpointRestoreOp,
+    CheckpointStoreOp,
+)
 from atom.model_engine.scheduler import ScheduledBatch
-from atom.model_engine.state_pool import StateTransfer
+from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attentions.backends import (
     AttentionBackend,
     AttentionMetadataBuilder,
@@ -776,7 +781,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
         return StateTransfer.copy(layout_id)
 
-    def relocate_state_slots(self, pairs: list[tuple[int, int]]) -> None:
+    def relocate_state_slots(self, pairs: Sequence[tuple[int, int]]) -> None:
         """Relocate a request's whole Active Slot."""
         views = self._slot_views()
         dsts, srcs = [], []
@@ -786,7 +791,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         if dsts:
             torch._foreach_copy_(dsts, srcs)
 
-    def execute_paged_state_copies(self, store_ops: list, restore_ops: list) -> None:
+    def execute_paged_state_copies(
+        self,
+        store_ops: Sequence[CheckpointStoreOp],
+        restore_ops: Sequence[CheckpointRestoreOp],
+    ) -> None:
         """Copy raw checkpoint bytes between slots and non-contiguous PAGEs."""
         from atom.model_ops.attentions.paged_state_copy import (
             launch_copy_spans,
@@ -807,34 +816,29 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             spans.extend(plan_segmented_copy(src, dst, op.total_bytes))
         launch_copy_spans(spans, device)
 
-    def _validate_paged_state_op(self, op) -> None:
-        layout_id = self.model_runner.state_runtime.transfer.paged_layout_id
-        if op.layout_id != layout_id:
+    def _validate_paged_state_op(
+        self, op: CheckpointStoreOp | CheckpointRestoreOp
+    ) -> None:
+        spec = self.model_runner.state_runtime.checkpoint_spec
+        if spec is None:
+            raise RuntimeError("DSV4 PAGE/state checkpoint spec is missing")
+        if op.layout_id != spec.layout_id:
             raise RuntimeError(
                 f"state checkpoint layout mismatch: {op.layout_id!r} != "
-                f"{layout_id!r}"
+                f"{spec.layout_id!r}"
             )
-        slot_bytes = sum(
-            view.numel() * view.element_size()
-            for view in self._slot_views()[
-                getattr(op, "src_slot", getattr(op, "dst_slot", -1))
-            ]
-        )
-        if op.total_bytes != slot_bytes:
+        if op.total_bytes != spec.slot_bytes:
             raise RuntimeError(
                 f"state checkpoint size mismatch: op={op.total_bytes}, "
-                f"active_slot={slot_bytes}"
+                f"active_slot={spec.slot_bytes}"
             )
-        unit_bytes = sum(s.num_bytes for s in self._one_page_unit_segments(0))
-        expected_units = (op.total_bytes + unit_bytes - 1) // unit_bytes
-        expected_tail = op.total_bytes - (expected_units - 1) * unit_bytes
-        if (
-            len(op.unit_ids) != expected_units
-            or op.last_unit_valid_bytes != expected_tail
-        ):
+        if len(op.unit_ids) != spec.units_per_checkpoint:
             raise RuntimeError(
                 "state checkpoint PAGE-unit geometry does not match this worker"
             )
+        num_blocks = self.model_runner.num_physical_kvcache_blocks
+        if any(unit_id < 0 or unit_id >= num_blocks for unit_id in op.unit_ids):
+            raise RuntimeError("state checkpoint PAGE unit is out of range")
 
     def _active_slot_segments(self, group: int):
         from atom.model_ops.attentions.paged_state_copy import tensor_segment

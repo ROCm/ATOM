@@ -30,7 +30,7 @@ from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
-from atom.model_engine.state_pool import (
+from atom.model_engine.state_runtime import (
     DEFAULT_STATE_RUNTIME,
     StateMaintenanceOps,
     StateRuntime,
@@ -1049,8 +1049,8 @@ class Scheduler:
         """
         self._schedule_tick += 1
         # Sources borrowed by the previous batch: its forward has been issued,
-        # so they can go back on the free list (see release_state_pins).
-        self.block_manager.release_state_pins()
+        # so they can go back on the free list.
+        self.block_manager.complete_previous_state_batch()
         scheduled_seqs = {}
         num_seqs_prefill = 0
         num_batched_tokens = 0
@@ -2898,7 +2898,7 @@ class DecodeScheduler(Scheduler):
         # through the same `block_manager.allocate` and the same `postprocess`,
         # so it owes the state pool the same two hooks. Without this one the
         # pins taken by every resume accumulate forever and admission starves.
-        self.block_manager.release_state_pins()
+        self.block_manager.complete_previous_state_batch()
 
         prefill_finished = False
         while self.prefill_done:

@@ -7,7 +7,7 @@ import pickle
 import pytest
 
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
-from atom.model_engine.state_pool import (
+from atom.model_engine.state_runtime import (
     StateMaintenanceOps,
     StateRuntime,
     StateTransfer,
