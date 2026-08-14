@@ -191,8 +191,13 @@ class LMCacheOffloadConnector(KVConnectorBase):
           `transfer_tensors.state_backend`, set by the model runner, the only
           scope holding both the builder and this connector;
         * a `StagedTransfer` -- the KV GPU connector already owns one sized to
-          the bounded staging buffer, and sharing it is what keeps one device
-          buffer per rank rather than two;
+          the bounded staging buffer, and reusing it is what keeps the state
+          path on the same HBM bound as KV. Note it does not share the *buffer*:
+          `StagedTransfer` keeps those in `threading.local`, and the tier packs
+          on its own `lmc-state` worker, so the tier adds one more resident
+          staging buffer of `gpu_staging_buffer_bytes` per rank. What reuse
+          buys is a single place that bound is configured, which is what makes
+          the `entry_bytes > staging_bytes` refusal below meaningful;
         * the per-entry byte count -- measured off the backend's own views
           rather than read from the sizing plan, because the pack allocates
           exactly what the views sum to and a plan figure that rounded

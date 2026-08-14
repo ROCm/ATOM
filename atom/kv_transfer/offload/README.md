@@ -210,18 +210,22 @@ groups, so HBM staging cost is capped regardless of prefix length.
 **`OFFLOAD_GPU_STAGING_CHUNKS` sizes *each* staging buffer, and there is more than
 one.** The buffer is thread-local (`threading.local`), and load and save run on
 separate executors (§ worker side). So the **load path** owns one staging buffer
-and the **save path** owns one per save worker — they are never shared. Resident
-staging HBM is therefore:
+and the **save path** owns one per save worker — they are never shared. With
+`OFFLOAD_STATE` on, the state tier adds one more: it reuses the KV connector's
+`StagedTransfer` *object*, but packs on its own `lmc-state` worker thread, and
+thread-local means a per-thread buffer no matter whose object it came from.
+Resident staging HBM is therefore:
 
 ```
 staging_chunk_bytes = (LMCACHE_CHUNK_SIZE / block_size) * bytes_per_block
 per_buffer_bytes    = OFFLOAD_GPU_STAGING_CHUNKS * staging_chunk_bytes
-resident_HBM        ≈ (1 load + OFFLOAD_COPY_WORKERS save) * per_buffer_bytes
+resident_HBM        ≈ (1 load + OFFLOAD_COPY_WORKERS save
+                       + 1 if OFFLOAD_STATE else 0) * per_buffer_bytes
 ```
 
 For the chunk2 run that is `2 * 16.76 MiB ≈ 33.5 MiB` per buffer × (1 load + 1
-save) ≈ **67 MiB** total. Raising `OFFLOAD_GPU_STAGING_CHUNKS` speeds up transfers
-but multiplies *both* buffers.
+save) ≈ **67 MiB** total, or ≈ **100 MiB** with the state tier on. Raising
+`OFFLOAD_GPU_STAGING_CHUNKS` speeds up transfers but multiplies *every* buffer.
 
 ## When Does a Reload Actually Happen?
 

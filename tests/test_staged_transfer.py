@@ -98,6 +98,33 @@ def test_thread_state_is_per_device_and_cached():
     assert st.thread_state() is st.thread_state()
 
 
+def test_one_staged_transfer_still_means_one_buffer_per_thread():
+    """Sharing the object does not share the buffer.
+
+    The state tier is handed the KV connector's `StagedTransfer` and packs on
+    its own `lmc-state` worker; `connector.py`'s `_maybe_build_state_tier` and
+    the README's resident-HBM formula both count that as one *additional*
+    staging buffer for the rank, not a shared one. If `_tls` ever became a
+    plain attribute the arithmetic would silently over-count and this fails.
+    """
+    import threading
+
+    st = StagedTransfer(CPU, staging_buffer_bytes=1024)
+    ptrs = {}
+
+    def grab(name):
+        ptrs[name] = st.ensure_buffer(st.thread_state().staging_buffer, 512).data_ptr()
+
+    threads = [threading.Thread(target=grab, args=(n,)) for n in ("save", "state")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(ptrs) == 2
+    assert ptrs["save"] != ptrs["state"]
+
+
 # ---------------------------------------------------------------------------
 # pack / unpack -- the state tier's whole-entry transfer. Only the round-trips
 # are GPU-gated: `_build_meta` refuses a non-CUDA segment by design. The guard
