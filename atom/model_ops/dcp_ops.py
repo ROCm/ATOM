@@ -302,208 +302,6 @@ def get_dcp_local_seq_lens(seq_lens, dcp_size, dcp_rank, interleave_size=1):
     return base + remainder
 
 
-# ---------------------------------------------------------------------------
-# Deterministic global top-k over exchanged DCP candidates.
-#
-# Every rank runs the merge independently, so the selection must be a *function*
-# of its input, not merely "usually the same": an ambiguous choice resolved
-# differently on two ranks breaks the disjoint-partition property that
-# `cp_lse_ag_out_rs` relies on (6.1.3). Ambiguity can only arise among
-# candidates whose score exactly equals the selection threshold, so ties are
-# broken by the globally unique token id:
-#
-#     keep  score > T
-#     keep  score == T  and  gid <= G     where G is the `need`-th smallest gid
-#
-# Measured on real data (25,600 rows): 0.06% of rows have a boundary
-# tie and the tied set is never larger than 2.
-# ---------------------------------------------------------------------------
-
-# Ties measured <= 2; 256 leaves a 128x margin. Must be a power of two (`tl.sort`).
-# WARNING: silent correctness limit. If a row has >CAP candidates tied at the
-# threshold score, the extra ties are dropped and that row's top-k is wrong; the
-# `overflow` flag records it but the hot path can't read it back (D2H breaks
-# CUDAGraph). Accepted since >256 exact fp32 ties is extremely rare.
-DCP_TOPK_TIE_CAP = 256
-
-
-@triton.jit
-def _dcp_stable_topk_kernel(
-    scores,  # fp32 [rows, n]
-    gids,  # int32 gid plane, addressed via (g_s0, g_s1, g_k_loc) below
-    thr,  # fp32 [rows] -- k-th largest score, from topk_plain
-    out,  # int32 [rows, k]
-    tie_buf,  # int32 [rows, CAP] scratch
-    overflow,  # int32 [rows]
-    k,
-    n,
-    s_s0: tl.int64,
-    g_s0: tl.int64,
-    o_s0: tl.int64,
-    g_s1: tl.int64,
-    g_k_loc: tl.int64,
-    BLOCK: tl.constexpr,
-    CAP: tl.constexpr,
-):
-    """One program per row: find the tie boundary, then emit.
-
-    Loop 1 reads the score plane; its gid loads are masked to the handful of
-    tied lanes, so they touch almost no extra cache lines. Loop 2 reads both.
-
-    `gids` is addressed as a flat column `col` split into `(col // g_k_loc,
-    col % g_k_loc)` with strides `(g_s1, 1)` -- i.e. logically `[rows, W,
-    g_k_loc]` with the innermost dim contiguous, W = the DCP candidate-exchange
-    world size. This lets the caller pass a non-contiguous AllGather view
-    (`recv[:, 1].permute(1, 0, 2)`) directly, skipping a `.contiguous()` copy.
-    The plain-2D-contiguous case (`gids` shape `[rows, n]`, stride1 == 1) is
-    the same formula with `g_k_loc = n`, so `col // n == 0` for every
-    `col < n` and `g_s1` is unused -- identical to the offset math before this
-    parameter was added.
-    """
-    row = tl.program_id(0)
-    sbase = row * s_s0
-    gbase = row * g_s0
-    obase = row * o_s0
-    t = tl.load(thr + row)
-    # A row whose candidate set is smaller than k emits fewer than k ids. `out`
-    # is reused across steps, so pad first or stale ids from the previous step
-    # survive in the tail.
-    for start in range(0, k, BLOCK):
-        cols = start + tl.arange(0, BLOCK)
-        tl.store(out + obase + cols, tl.full([BLOCK], -1, tl.int32), mask=cols < k)
-
-    # t == -inf means the row has fewer than k real candidates. Everything real
-    # is then strictly greater and the padding (-inf) must be dropped, so the
-    # tie branch has to stay off -- otherwise every pad lane looks "tied" and
-    # floods tie_buf.
-    finite_t = t > -float("inf")
-    tl.debug_barrier()
-
-    # ---- loop 1: count strict winners, scatter tied gids to scratch ----
-    # The tied gids go to GLOBAL scratch, not a register array: Triton cannot
-    # index registers dynamically, so a register buffer needs an O(CAP) fold per
-    # tile -- measured 2117 us at CAP=256 against a ~54 us two-pass floor.
-    # A global store takes the computed per-lane slot directly.
-    c_strict = 0
-    n_tie = 0
-    for start in range(0, n, BLOCK):
-        cols = start + tl.arange(0, BLOCK)
-        m = cols < n
-        sc = tl.load(scores + sbase + cols, mask=m, other=-float("inf"))
-        gt = m & (sc > t)
-        eq = m & (sc == t) & finite_t
-        c_strict += tl.sum(gt.to(tl.int32))
-        ei = eq.to(tl.int32)
-        dst = n_tie + tl.cumsum(ei, 0) - ei
-        g_off = gbase + (cols // g_k_loc) * g_s1 + (cols % g_k_loc)
-        g = tl.load(gids + g_off, mask=eq, other=0)
-        tl.store(tie_buf + row * CAP + dst, g, mask=eq & (dst < CAP))
-        n_tie += tl.sum(ei)
-
-    tl.store(overflow + row, (n_tie > CAP).to(tl.int32))
-    tl.debug_barrier()
-
-    # ---- G = the `need`-th smallest tied gid ----
-    slot = tl.arange(0, CAP)
-    buf = tl.load(tie_buf + row * CAP + slot, mask=slot < n_tie, other=2147483647)
-    need = k - c_strict
-    srt = tl.sort(buf, 0)  # ascending; padding is INT32_MAX and sorts last
-    g_thr = tl.sum(tl.where(slot == (need - 1), srt, 0))
-    g_thr = tl.where(need > 0, g_thr, -1)
-
-    # ---- loop 2: emit ----
-    written = 0
-    for start in range(0, n, BLOCK):
-        cols = start + tl.arange(0, BLOCK)
-        m = cols < n
-        sc = tl.load(scores + sbase + cols, mask=m, other=-float("inf"))
-        g_off = gbase + (cols // g_k_loc) * g_s1 + (cols % g_k_loc)
-        g = tl.load(gids + g_off, mask=m, other=-1)
-        take = m & (g >= 0) & ((sc > t) | ((sc == t) & finite_t & (g <= g_thr)))
-        ti = take.to(tl.int32)
-        dst = written + tl.cumsum(ti, 0) - ti
-        tl.store(out + obase + dst, g, mask=take & (dst < k))
-        written += tl.sum(ti)
-
-
-def dcp_stable_topk(scores, gids, k, out=None):
-    """Deterministic top-k over a candidate set. scores: [rows, n].
-
-    `gids` accepts two layouts:
-      - 2D `[rows, n]`, stride1 == 1 (contiguous) -- the original layout.
-      - 3D `[rows, W, k_loc]` with `n == W * k_loc` and stride(2) == 1 --
-        e.g. `recv[:, 1].permute(1, 0, 2)` straight off a DCP candidate
-        AllGather, with NO `.contiguous()` needed: the kernel reads it via
-        `(row_stride, w_stride, k_loc)` and does the (w, j) split internally.
-        This is the only difference from the 2D path -- it just skips a
-        materializing copy, the result is identical either way.
-
-    Returns (out int32 [rows, k] of global ids, overflow int32 [rows]).
-    `out` is padded with -1 when a row holds fewer than k real candidates.
-
-    CUDAGraph note: every shape here is static, and `torch.empty` inside a
-    captured region lands in the graph's private pool at a stable address. The
-    caller must NOT read `overflow` back to host per step -- that is a D2H sync
-    and breaks capture. Read it only under a diagnostic switch.
-    """
-    from aiter import topk_plain
-
-    rows, n = scores.shape
-    dev = scores.device
-    if gids.dim() == 3:
-        assert gids.shape[0] == rows and gids.shape[1] * gids.shape[2] == n
-        assert gids.stride(2) == 1, "gids innermost dim must be contiguous"
-        g_s0, g_s1, g_k_loc = gids.stride(0), gids.stride(1), gids.shape[2]
-    else:
-        assert gids.shape == (rows, n) and gids.stride(1) == 1
-        g_s0, g_s1, g_k_loc = gids.stride(0), 0, n
-    if out is None:
-        out = torch.empty(rows, k, dtype=torch.int32, device=dev)
-    val_buf = torch.empty(rows, k, dtype=torch.float32, device=dev)
-    idx_buf = torch.empty(rows, k, dtype=torch.int32, device=dev)
-    row_starts = torch.zeros(rows, dtype=torch.int32, device=dev)
-    row_ends = torch.full((rows,), n, dtype=torch.int32, device=dev)
-    tie_buf = torch.empty(rows, DCP_TOPK_TIE_CAP, dtype=torch.int32, device=dev)
-    overflow = torch.zeros(rows, dtype=torch.int32, device=dev)
-
-    # aiter's tuned topk_plain is fp32-only, so it cannot take a 64-bit
-    # composite key; it supplies the score threshold and the kernel above adds
-    # the deterministic tie-break. A from-scratch Triton radix-select measured
-    # 524 us against a ~26.9 us/pass memory floor.
-    topk_plain(
-        scores,
-        idx_buf,
-        val_buf,
-        k,
-        True,
-        row_starts,
-        row_ends,
-        scores.stride(0),
-        1,
-    )
-    thr = val_buf.min(dim=-1).values
-
-    _dcp_stable_topk_kernel[(rows,)](
-        scores,
-        gids,
-        thr,
-        out,
-        tie_buf,
-        overflow,
-        k,
-        n,
-        scores.stride(0),
-        g_s0,
-        out.stride(0),
-        g_s1,
-        g_k_loc,
-        BLOCK=1024,
-        CAP=DCP_TOPK_TIE_CAP,
-        num_warps=8,
-    )
-    return out, overflow
-
-
 def dcp_pack_topk_candidates(
     local_logits, local_idx, local_lens, dcp_rank, dcp_world_size, out_pair
 ):
@@ -511,7 +309,8 @@ def dcp_pack_topk_candidates(
 
     out_pair: fp32 [2, rows, k] -- plane 0 holds scores, plane 1 holds int32
     global ids reinterpreted as fp32 so both travel in one collective. Slots the
-    local top-k did not fill get (-inf, -1); `dcp_stable_topk` drops gid < 0.
+    local top-k did not fill get (-inf, -1); the merge sinks them via -inf and
+    never selects the -1 gids.
 
     Under round-robin (interleave=1) sharding a local position j on rank r is
     global position j*W + r, so the id is globally unique -- which is what makes
@@ -559,14 +358,12 @@ def _count_owned_dcp_kernel(
     exactly one query token.
     """
     batch_id = tl.program_id(0)
-    g_kv_start = tl.load(global_kv_indptr + batch_id)
-    g_kv_len = tl.load(global_kv_indptr + batch_id + 1) - g_kv_start
     token_id = tl.load(qo_indptr + batch_id)
 
     count = 0
     for tile_start in range(0, NUM_TOPK_TOKENS, BLOCK_N):
         indice_id = tile_start + tl.arange(0, BLOCK_N)
-        col_valid = (indice_id < g_kv_len) & (indice_id < NUM_TOPK_TOKENS)
+        col_valid = indice_id < NUM_TOPK_TOKENS
         ti_ptr = token_indices_ptr + token_id * ti_stride0 + indice_id * ti_stride1
         tok = tl.load(ti_ptr, mask=col_valid, other=-1)
         owned = col_valid & (tok >= 0) & ((tok % DCP_WORLD) == DCP_RANK)
@@ -615,8 +412,6 @@ def _compact_filter_dcp_kernel(
     # through block_tables in-kernel).
     batch_id = tl.program_id(0)
 
-    g_kv_start = tl.load(global_kv_indptr + batch_id)
-    g_kv_len = tl.load(global_kv_indptr + batch_id + 1) - g_kv_start
     out_kv_start = tl.load(out_kv_indptr + batch_id)
     token_id = tl.load(qo_indptr + batch_id)
 
@@ -624,8 +419,11 @@ def _compact_filter_dcp_kernel(
     written = 0
     for tile_start in range(0, NUM_TOPK_TOKENS, BLOCK_N):
         indice_id = tile_start + tl.arange(0, BLOCK_N)
-        # Columns within [0, min(global_ctx, topk)) carry a real top-k position.
-        col_valid = (indice_id < g_kv_len) & (indice_id < NUM_TOPK_TOKENS)
+        # Full top-k width; `tok >= 0` is the only valid-id guard. Must stay in
+        # lock-step with `_count_owned_dcp_kernel` (see the note there on why the
+        # old `indice_id < g_kv_len` mask is wrong) -- if the two disagree, the
+        # counted offsets and the written entries diverge.
+        col_valid = indice_id < NUM_TOPK_TOKENS
 
         ti_ptr = token_indices_ptr + token_id * ti_stride0 + indice_id * ti_stride1
         tok = tl.load(ti_ptr, mask=col_valid, other=-1)  # GLOBAL position
@@ -776,14 +574,12 @@ def _count_owned_dcp_prefill_kernel(
     """
     token_id = tl.program_id(0)
     req_id = tl.load(token_to_seq_idxs + token_id)
-    kv_start = tl.load(dsa_kv_indptr + token_id)
-    kv_len = tl.load(dsa_kv_indptr + token_id + 1) - kv_start
     base = tl.load(cu_seqlens_k + req_id)
 
     count = 0
     for tile_start in range(0, NUM_TOPK_TOKENS, BLOCK_N):
         col_id = tile_start + tl.arange(0, BLOCK_N)
-        col_valid = (col_id < kv_len) & (col_id < NUM_TOPK_TOKENS)
+        col_valid = col_id < NUM_TOPK_TOKENS
         indice = tl.load(
             topk_indices + token_id * ti_stride0 + col_id * ti_stride1,
             mask=col_valid,
@@ -828,8 +624,6 @@ def _compact_filter_dcp_prefill_kernel(
     """
     token_id = tl.program_id(0)
     req_id = tl.load(token_to_seq_idxs + token_id)
-    kv_start = tl.load(dsa_kv_indptr + token_id)
-    kv_len = tl.load(dsa_kv_indptr + token_id + 1) - kv_start
     base = tl.load(cu_seqlens_k + req_id)
     out_kv_start = tl.load(out_kv_indptr + token_id)
 
@@ -837,7 +631,11 @@ def _compact_filter_dcp_prefill_kernel(
     written = 0
     for tile_start in range(0, NUM_TOPK_TOKENS, BLOCK_N):
         col_id = tile_start + tl.arange(0, BLOCK_N)
-        col_valid = (col_id < kv_len) & (col_id < NUM_TOPK_TOKENS)
+        # Full-width scan; `indice >= 0` is the only validity guard. Must stay in
+        # lockstep with pass 1 -- if the two disagree on which candidates are
+        # valid, `out_kv_indptr` (built from pass 1's counts) and the writes here
+        # go out of sync and rows overwrite each other.
+        col_valid = col_id < NUM_TOPK_TOKENS
         indice = tl.load(
             topk_indices + token_id * ti_stride0 + col_id * ti_stride1,
             mask=col_valid,

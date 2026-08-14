@@ -86,7 +86,6 @@ from atom.model_ops.attention_mla import (
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.dcp_ops import (
     dcp_pack_topk_candidates,
-    dcp_stable_topk,
     triton_filter_and_convert_dcp_index,
     triton_filter_and_convert_dcp_index_prefill,
 )
@@ -1406,6 +1405,7 @@ def _dcp_decode_candidate_exchange(
     topk_tokens: int,
     max_model_len: int,
     runner_block_size: int,
+    stable_topk: bool,
 ) -> None:
     """DCP decode candidate exchange -> deterministic merge into global top-k.
 
@@ -1469,6 +1469,7 @@ def _dcp_decode_candidate_exchange(
         local_logits.stride(0),
         local_logits.stride(1),
         k_loc,
+        stable=stable_topk,
     )
     # [2, rows, k_loc]: plane 0 = score, plane 1 = int32 gid bits.
     send = torch.empty(
@@ -1490,17 +1491,31 @@ def _dcp_decode_candidate_exchange(
     # candidate dim. Selection is provably order-independent, so any consistent
     # permutation works — but scores and gids must use the SAME one.
     gathered_sc = recv[:, 0].permute(1, 0, 2).reshape(num_rows, n_cand).contiguous()
-    # gid plane: `dcp_stable_topk` reads a non-contiguous [rows, W, k_loc] view
-    # directly, so this skips the materializing copy the
-    # score plane still needs (topk_plain requires a contiguous last dim).
+    # gid plane: [rows, W, k_loc] AllGather view, innermost dim contiguous.
     gathered_gid = recv[:, 1].permute(1, 0, 2)
     topk_indices_decode = topk_indices[:num_decode_tokens, :topk_tokens]
-    _, _dcp_topk_overflow = dcp_stable_topk(
-        gathered_sc.view(torch.float32),
-        gathered_gid,
-        topk_tokens,
-        out=topk_indices_decode,
+    cand_idx = torch.empty(
+        num_rows, topk_tokens, dtype=torch.int32, device=gathered_sc.device
     )
+    cand_lens = torch.full(
+        (num_rows,), n_cand, dtype=torch.int32, device=gathered_sc.device
+    )
+    top_k_per_row_decode(
+        gathered_sc.view(torch.float32),
+        1,
+        cand_lens,
+        cand_idx,
+        num_rows,
+        gathered_sc.stride(0),
+        gathered_sc.stride(1),
+        topk_tokens,
+        stable=True,
+    )
+    # Map row-local candidate index -> global id. gathered_gid is the 3D
+    # [rows, W, k_loc] view; reshape materializes a contiguous copy (a few us,
+    # << the second-pass topk this eliminated). gather requires an int64 index.
+    gathered_gid_flat = gathered_gid.reshape(num_rows, n_cand)
+    topk_indices_decode.copy_(torch.gather(gathered_gid_flat, 1, cand_idx.long()))
 
 
 def sparse_attn_indexer(
@@ -1777,6 +1792,7 @@ def sparse_attn_indexer(
                 topk_tokens,
                 max_model_len,
                 runner_block_size,
+                stable_topk,
             )
         else:
             logits = torch.empty(
