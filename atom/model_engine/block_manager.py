@@ -28,6 +28,7 @@ from atom.model_engine.state_runtime import (
     StateRuntime,
     StateTransfer,
 )
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -126,9 +127,22 @@ class BlockManager:
         # Independent of the interval, because the demand rung is not part of
         # the grid: it is the one placement a *refused* hit makes for itself.
         # See `_record_checkpoint_demand` for what turning it off is testing.
+        #
+        # ATOM_STATE_CHECKPOINT_DEMAND wins over the config field when it is
+        # exported, so the policy can be flipped for one run without editing a
+        # launch script: =0 forces the rung off, =1 forces it on. Unset leaves
+        # --state-checkpoint-demand in charge, so an unexported variable costs
+        # nothing.
         self.state_checkpoint_demand = bool(
             getattr(config, "state_checkpoint_demand", True)
         )
+        if envs.is_set("ATOM_STATE_CHECKPOINT_DEMAND"):
+            self.state_checkpoint_demand = envs.ATOM_STATE_CHECKPOINT_DEMAND
+        if not self.state_checkpoint_demand:
+            logger.info(
+                "[State Cache] demand rung disabled: the prompt-end anchor is "
+                "the only checkpoint placement."
+            )
         checkpoint_spec = state_runtime.checkpoint_spec
         self.paged_state_checkpoints: PagedStateCheckpointCoordinator | None = None
         if checkpoint_spec is not None:
