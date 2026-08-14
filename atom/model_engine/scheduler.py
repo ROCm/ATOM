@@ -670,7 +670,7 @@ class Scheduler:
             SpecStats(mtp_k=self.mtp_k) if self.use_spec else None
         )
         self.cache_stats: CacheStats | None = (
-            CacheStats() if config.enable_prefix_caching else None
+            CacheStats(log_interval=25) if config.enable_prefix_caching else None
         )
         self.profile_active = False
         # Cache the env flag once (env vars are fixed at process start) so the
