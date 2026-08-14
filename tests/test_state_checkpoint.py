@@ -931,10 +931,9 @@ class TestPagedCopyCheckpoint:
         )
         scheduler.block_manager.state.record_copy(1, 2)
 
-        batch, scheduled = scheduler.schedule()
+        scheduled = scheduler.schedule()
 
-        assert scheduled == {}
-        assert batch.state_maintenance_ops.empty
+        assert scheduled is None
         pending = scheduler.block_manager.take_state_maintenance_ops()
         assert pending.relocations == ((1, 2),)
         assert scheduler.block_manager.take_state_maintenance_ops().empty
