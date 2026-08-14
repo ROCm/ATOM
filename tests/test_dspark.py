@@ -2,7 +2,8 @@
 """Unit tests for DeepSeek-V4 DSpark drafter (Phase 1).
 
 Covers the self-contained, GPU-free pieces: Markov head + Confidence head
-numerics, and SpeculativeConfig DSpark detection/routing.
+numerics, and SpeculativeConfig DSpark detection/routing. The fused
+context-row KV write at the end needs a GPU and skips without one.
 """
 
 import pytest
@@ -686,3 +687,113 @@ def test_batch_dim_padded_only_for_a_dummy_run_at_b1(is_dummy, B, expect_B):
         assert seen["positions"] == [11] * expect_B
     # Outputs always come back sliced to the real batch.
     assert (seen["normed_rows"], seen["hc_B"], seen["anchor_B"]) == (B * T, B, B)
+
+
+KV_LORA_RANK = 512
+PE_DIM = 64
+CTX_KV_ENTRY = KV_LORA_RANK + PE_DIM
+CTX_KV_EPS = 1e-6
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="the fused context-KV write is a GPU kernel"
+)
+def test_fused_ctx_kv_write_into_a_byte_allocated_fp8_cache():
+    """The fused MLA context-row KV write into a cache allocated as raw bytes.
+
+    vLLM allocates the fp8 KV cache as uint8 and leaves it to the store to say
+    what those bytes mean, so the draft's context rows land in a buffer that is
+    fp8 only by agreement. Triton reads its element type off the pointer, which
+    is why the vLLM MLA layer reinterprets the buffer before it gets here
+    (``AttentionForVllmMLA.write_context_kv_latent``) -- handed the raw bytes,
+    this kernel would convert each value to an integer instead of writing the
+    fp8 bit pattern, and every row the draft read back would be garbage.
+
+    So: write through the fp8 view the layer hands over, and compare the
+    underlying bytes against the per-op chain the fusion replaces, which reaches
+    the same buffer through aiter's own ``kv_cache_dtype`` contract. Byte for
+    byte, since fp8's 3 mantissa bits swallow the fp32 differences a bf16 cache
+    would be allowed and anything visible here is a real divergence.
+
+    Shapes are Kimi-K3-DSpark's: a 512-wide latent plus a 64-wide positional
+    lane.
+    """
+    from aiter import concat_and_cache_mla, dtypes, rmsnorm2d_fwd
+    from aiter.rotary_embedding import get_rope
+
+    from atom.model_ops.triton_fused_mla_ctx_kv import fused_mla_ctx_norm_rope_cache
+
+    num_tokens, num_blocks, block_size = 512, 64, 128
+    gen = torch.Generator(device="cuda").manual_seed(num_tokens)
+
+    kv_lora = torch.randn(
+        num_tokens, CTX_KV_ENTRY, generator=gen, device="cuda", dtype=torch.float32
+    ).to(torch.bfloat16)
+    # The op ATOM's RMSNorm layer dispatches to on this path, called directly so
+    # the test needs no tensor-parallel group to build the layer.
+    norm_weight = torch.empty(KV_LORA_RANK, device="cuda", dtype=torch.bfloat16)
+    norm_weight.normal_(mean=1.0, std=0.1, generator=gen)
+    # get_rope builds its cos/sin buffers on CPU in fp32; in the model they reach
+    # the device and the model dtype with the rest of the module, and aiter's
+    # rope asserts the cache matches the activation dtype.
+    rope = (
+        get_rope(
+            PE_DIM,
+            rotary_dim=PE_DIM,
+            max_position=4096,
+            base=10000.0,
+            rope_scaling=None,
+            is_neox_style=False,
+        )
+        .cuda()
+        .to(torch.bfloat16)
+    )
+    positions = torch.randint(
+        0, 4096, (num_tokens,), generator=gen, device="cuda", dtype=torch.int64
+    )
+    slot_mapping = torch.randperm(num_blocks * block_size, device="cuda")[
+        :num_tokens
+    ].to(torch.int64)
+    # Not a power of two, so the kernel's `x * (1/s)` against aiter's `x / s` is
+    # actually exercised rather than agreeing by construction.
+    scale = torch.tensor(1.3, dtype=torch.float32, device="cuda")
+
+    fused_cache = torch.full(
+        (num_blocks, block_size, CTX_KV_ENTRY), 200, device="cuda", dtype=torch.uint8
+    )
+    ref_cache = fused_cache.clone()
+
+    fused_mla_ctx_norm_rope_cache(
+        kv_lora,
+        norm_weight,
+        positions,
+        rope.cos_cache,
+        rope.sin_cache,
+        slot_mapping,
+        fused_cache.view(dtypes.fp8),
+        scale,
+        CTX_KV_EPS,
+        KV_LORA_RANK,
+        PE_DIM,
+        rope.is_neox_style,
+        True,
+    )
+
+    kv_c, k_pe = kv_lora.split([KV_LORA_RANK, PE_DIM], dim=-1)
+    k_pe = k_pe.view(-1, 1, PE_DIM)
+    _, k_pe = rope(positions, torch.empty_like(k_pe), k_pe)
+    concat_and_cache_mla(
+        rmsnorm2d_fwd(kv_c, norm_weight, CTX_KV_EPS),
+        k_pe.squeeze(1),
+        ref_cache,
+        slot_mapping,
+        kv_cache_dtype="fp8",
+        scale=scale,
+    )
+
+    torch.testing.assert_close(
+        fused_cache.view(dtypes.fp8).float(),
+        ref_cache.view(dtypes.fp8).float(),
+        rtol=0,
+        atol=0,
+    )
