@@ -840,6 +840,68 @@ def copy_config(**overrides):
     return ckpt_config(**overrides)
 
 
+def paged_copy_config(**overrides):
+    defaults = {
+        "paged_state_checkpoints_enabled": True,
+        # Small synthetic byte geometry; these control-plane tests do not
+        # allocate DSV4 tensors, but exercise the same K-unit protocol.
+        "paged_state_page_unit_bytes": 10,
+        "paged_state_slot_bytes": 25,
+        "paged_state_units_per_checkpoint": 3,
+        "paged_state_layout_id": "test-layout-v1",
+    }
+    defaults.update(overrides)
+    return copy_config(**defaults)
+
+
+class TestPagedCopyCheckpoint:
+    def _admitted(self, bm, tokens=None):
+        seq = stateful_seq(tokens or list(range(40)))
+        bm.allocate(seq, bm.can_allocate(seq))
+        return seq
+
+    def test_checkpoint_uses_page_units_not_an_active_slot(self):
+        bm = BlockManager(paged_copy_config())
+        seq = self._admitted(bm)
+        free_slots = bm.state.num_free()
+        free_pages = bm.kv.num_free
+        bm.hash_blocks(seq, bm.checkpoint_limit(seq) - seq.num_cached_tokens)
+        h = boundary_hash(bm, seq)
+
+        transfers = bm.state_transfers_for_batch()
+        assert transfers["state_copy_pairs"] == []
+        assert len(transfers["checkpoint_store_ops"]) == 1
+        assert bm.state.num_free() == free_slots
+        assert bm.kv.num_free == free_pages - 3
+        assert bm.state.lookup(h) == -1  # COPYING is deliberately invisible.
+
+        bm.release_state_pins()
+        assert bm.state.lookup(h) >= 0
+
+    def test_hit_gathers_into_a_distinct_contiguous_active_slot(self):
+        bm = BlockManager(paged_copy_config())
+        first = self._admitted(bm)
+        bm.hash_blocks(first, bm.checkpoint_limit(first) - first.num_cached_tokens)
+        h = boundary_hash(bm, first)
+        store = bm.state_transfers_for_batch()["checkpoint_store_ops"][0]
+        bm.release_state_pins()
+
+        second = stateful_seq(list(range(48)))
+        hit = bm.can_allocate(second)
+        assert hit > 0
+        bm.allocate(second, hit)
+        transfers = bm.state_transfers_for_batch()
+        assert transfers["checkpoint_store_ops"] == []
+        assert len(transfers["checkpoint_restore_ops"]) == 1
+        restore = transfers["checkpoint_restore_ops"][0]
+        assert restore.unit_ids == store.unit_ids
+        assert restore.dst_slot == second.per_req_cache_group
+        assert second.state_fork_src == -1
+        # The checkpoint stays canonical and shareable. Its fragments were not
+        # adopted as the request's kernel-visible slot.
+        assert bm.state.lookup(h) == store.checkpoint_id
+
+
 class TestCopyLifecycle:
     """The other half of the protocol: a duplicate goes to the index.
 

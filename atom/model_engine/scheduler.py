@@ -321,6 +321,8 @@ class ScheduledBatch:
         state_copy_pairs: (src, dst) per-request state groups this batch's
             forward must duplicate before running (`BlockManager
             .state_copies_for_batch`).
+        checkpoint_store_ops: Active Slot -> ordered PAGE-unit checkpoint ops.
+        checkpoint_restore_ops: ordered PAGE-unit checkpoint -> Active Slot ops.
     """
 
     def __init__(
@@ -344,6 +346,8 @@ class ScheduledBatch:
         is_final_chunk: list[bool] | None = None,
         next_token_ids: list[int] | None = None,
         state_copy_pairs: list[tuple[int, int]] | None = None,
+        checkpoint_store_ops: list | None = None,
+        checkpoint_restore_ops: list | None = None,
     ):
         if scheduled_spec_decode_tokens is None:
             scheduled_spec_decode_tokens = {}
@@ -386,6 +390,8 @@ class ScheduledBatch:
         # off the seqs because both halves (checkpoint taken, checkpoint resumed
         # from) accumulate in the pool during this pass.
         self.state_copy_pairs = state_copy_pairs or []
+        self.checkpoint_store_ops = checkpoint_store_ops or []
+        self.checkpoint_restore_ops = checkpoint_restore_ops or []
         self.top_ks = np.asarray([seq.top_k for seq in seqs.values()], dtype=np.int32)
         self.top_ps = np.asarray([seq.top_p for seq in seqs.values()], dtype=np.float32)
         # True if any seq in the batch is a fan-out child (SamplingParams.n>1)
@@ -1361,7 +1367,7 @@ class Scheduler:
                 num_cached_tokens=num_cached_tokens_list,
                 is_final_chunk=is_final_chunk,
                 next_token_ids=next_token_ids,
-                state_copy_pairs=self.block_manager.state_copies_for_batch(),
+                **self.block_manager.state_transfers_for_batch(),
             )
             self._consume_state_forks(scheduled_seqs)
 
@@ -1487,8 +1493,10 @@ class Scheduler:
             # would read the previous occupant's state, the exact #1417 shape
             # the copies exist to prevent. Leave them pending for the next
             # batch that actually runs.
-            state_copy_pairs=(
-                self.block_manager.state_copies_for_batch() if scheduled_seqs else ()
+            **(
+                self.block_manager.state_transfers_for_batch()
+                if scheduled_seqs
+                else {}
             ),
         )
         self._consume_state_forks(scheduled_seqs)
@@ -2966,7 +2974,7 @@ class DecodeScheduler(Scheduler):
                 # The other half of the pair above: queued copies have to reach
                 # a batch or the group they were filed under holds the previous
                 # occupant's state.
-                state_copy_pairs=self.block_manager.state_copies_for_batch(),
+                **self.block_manager.state_transfers_for_batch(),
             ),
             scheduled_seqs,
         )

@@ -18,6 +18,7 @@ from atom.distributed.kv_events import (
 )
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
+from atom.model_engine.page_unit_checkpoint import PageUnitCheckpointStore
 from atom.model_engine.sequence import Sequence
 from atom.model_engine.state_cache import StateCache
 from atom.model_engine.state_pool import StateGroupPool, StateTransfer
@@ -98,17 +99,43 @@ class BlockManager:
         self.state_checkpoint_interval_tokens = max(
             0, int(getattr(config, "state_checkpoint_interval_tokens", 0) or 0)
         )
-        # The rolling state class: per-request groups plus a content index over
-        # the free ones. A checkpoint IS a free group whose content is still
-        # valid, so it holds no capacity of its own and never blocks admission.
+        # The rolling state class. In the default representation its content
+        # index points at free groups. In paged-checkpoint mode the same groups
+        # are Active Slots only, while the content index owns arbitrary PAGE
+        # units through `PageUnitCheckpointStore`.
+        transfer = StateTransfer.from_config(
+            getattr(config, "state_transfer_kind", "none") or "none",
+            int(getattr(config, "state_fork_tokens", 0) or 0),
+        )
+        self.page_checkpoints: PageUnitCheckpointStore | None = None
+        if bool(getattr(config, "paged_state_checkpoints_enabled", False)):
+            if not transfer.copies:
+                raise ValueError(
+                    "paged state checkpoints require a copyable state backend"
+                )
+            self.page_checkpoints = PageUnitCheckpointStore(
+                self.kv,
+                unit_bytes=int(config.paged_state_page_unit_bytes),
+                slot_bytes=int(config.paged_state_slot_bytes),
+                layout_id=str(config.paged_state_layout_id),
+            )
+            published_units = int(
+                getattr(config, "paged_state_units_per_checkpoint", 0) or 0
+            )
+            if published_units and (
+                published_units != self.page_checkpoints.units_per_checkpoint
+            ):
+                raise ValueError(
+                    "paged state checkpoint geometry changed across processes: "
+                    f"published={published_units}, computed="
+                    f"{self.page_checkpoints.units_per_checkpoint}"
+                )
         self.state = StateGroupPool(
             self.num_per_req_cache_groups,
-            transfer=StateTransfer.from_config(
-                getattr(config, "state_transfer_kind", "none") or "none",
-                int(getattr(config, "state_fork_tokens", 0) or 0),
-            ),
+            transfer=transfer,
             hash_block_size=self.hash_block_size,
             enabled=self.enable_prefix_caching,
+            page_checkpoints=self.page_checkpoints,
         )
         # A checkpoint is filed under the content hash of the last block it
         # covers, so a rung that isn't a hash-block boundary can never be looked
@@ -176,7 +203,28 @@ class BlockManager:
         Must be called with the batch already decided; see
         `StateGroupPool.take_copies`. Always empty for a forking backend.
         """
+        if self.page_checkpoints is not None:
+            raise RuntimeError(
+                "paged state checkpoints require state_transfers_for_batch(); "
+                "slot copy pairs cannot represent PAGE-unit endpoints"
+            )
         return self.state.take_copies()
+
+    def state_transfers_for_batch(self) -> dict[str, list]:
+        """Drain every state-maintenance op into one scheduled batch.
+
+        Keeping this one call is important for PAGE-backed checkpoints: their
+        records are reserved in COPYING state while this batch is being built,
+        and are made READY only when the next scheduling pass confirms the
+        batch carrying their scatter has been issued.
+        """
+        copies = self.state.take_copies()
+        stores, restores = self.state.take_paged_ops()
+        return {
+            "state_copy_pairs": copies,
+            "checkpoint_store_ops": stores,
+            "checkpoint_restore_ops": restores,
+        }
 
     def _record_evicted(self, h: int) -> None:
         """A hash the block pool just dropped: report it, and settle the state.
@@ -193,9 +241,25 @@ class BlockManager:
 
     def _fresh_block(self) -> int:
         """Take a block for content this step is about to compute."""
+        if not self._ensure_page_units(1):
+            raise AssertionError("No PAGE unit available for a fresh KV block")
         block_id = self.kv.pop()
         self.kv.allocate(block_id)
         return block_id
+
+    def _has_page_units(
+        self, count: int, protected_checkpoint_hash: int | None = None
+    ) -> bool:
+        if self.page_checkpoints is None:
+            return self.kv.has_free(count)
+        return self.page_checkpoints.has_available_units(
+            count, protected_hash=protected_checkpoint_hash
+        )
+
+    def _ensure_page_units(self, count: int) -> bool:
+        if self.page_checkpoints is None:
+            return self.kv.has_free(count)
+        return self.page_checkpoints.ensure_free_units(count)
 
     def _dcp_num_blocks(self, seq_len: int) -> int:
         if self.dcp_world_size <= 1:
@@ -289,12 +353,13 @@ class BlockManager:
         avoiding a second hash pass.
         """
         # State cache (mamba / V4 compressor ring) has its own pre-allocated
-        # tensor; admission only needs a free slot index, not extra paged
-        # blocks. See `allocate()` for the budget reasoning.
+        # Active Slot tensor, so the running request only needs a free slot
+        # index. PAGE-backed immutable checkpoints do consume PAGE units, and
+        # `_has_page_units` below counts only records that can be evicted whole.
         if seq.has_per_req_cache and not self.state.has_free():
             return -1
         if not self.enable_prefix_caching:
-            if not self.kv.has_free(self._dcp_num_blocks(len(seq))):
+            if not self._has_page_units(self._dcp_num_blocks(len(seq))):
                 return -1
             return 0
         # Step 1: compressed prefix (CSA/HCA/indexer share the block hash and
@@ -341,7 +406,8 @@ class BlockManager:
         for i in range(num_cached_blocks):
             if self.kv.is_used(self.kv.lookup(block_hashes[i])):
                 num_new_blocks -= 1
-        if not self.kv.has_free(num_new_blocks):
+        protected_hash = block_hashes[num_cached_blocks - 1] if num_cached_blocks else None
+        if not self._has_page_units(num_new_blocks, protected_hash):
             return -1
         return num_cached_blocks
 
@@ -363,6 +429,11 @@ class BlockManager:
             block_id = self.kv.lookup(h)
             self.kv.claim(block_id)
             seq.block_table.append(block_id)
+        # Pin and schedule the PAGE-unit restore before taking fresh blocks.
+        # Otherwise `_fresh_block` could choose the very checkpoint that made
+        # this hit resumable as its LRU victim between gating and attach.
+        if seq.has_per_req_cache and self.page_checkpoints is not None:
+            self._attach_state_group(seq, h if num_cached_blocks > 0 else -1)
         for _ in range(num_cached_blocks, self._dcp_num_blocks(len(seq))):
             seq.block_table.append(self._fresh_block())
         seq.num_cached_tokens = num_cached_blocks * self._hash_block_size()
@@ -374,7 +445,7 @@ class BlockManager:
         # paged-block cost. The slot cap
         # (the state pool's free list, size = `max_num_seqs`) is the sole
         # admission bound for state cache.
-        if seq.has_per_req_cache:
+        if seq.has_per_req_cache and self.page_checkpoints is None:
             self._attach_state_group(seq, h if num_cached_blocks > 0 else -1)
 
     def _attach_state_group(self, seq: Sequence, hit_hash: int) -> None:
@@ -400,6 +471,19 @@ class BlockManager:
         Adopting is then off the table — the pin means someone else's forward
         still has to read it, or copy out of it.
         """
+        if self.page_checkpoints is not None:
+            # The Active Slot is always a complete contiguous slot.  A hit
+            # merely schedules a gather from the checkpoint's ordered PAGE
+            # units into it; unlike the legacy group-backed representation,
+            # there is no legal "adopt source" fallback.
+            dst = self.state.pop()
+            seq.per_req_cache_group = dst
+            seq.state_fork_src = -1
+            if hit_hash != -1:
+                restored = self.state.record_restore(hit_hash, dst)
+                assert restored, "gated PAGE checkpoint disappeared before attach"
+            return
+
         src = self.state.lookup(hit_hash) if hit_hash != -1 else -1
         if src < 0:
             seq.per_req_cache_group = self.state.pop()
@@ -925,7 +1009,7 @@ class BlockManager:
         ebs = self._effective_block_size()
         needed_blocks = (seq_len + num_new_tokens + ebs - 1) // ebs
         new_blocks_needed = max(0, needed_blocks - current_blocks)
-        return self.kv.has_free(new_blocks_needed)
+        return self._has_page_units(new_blocks_needed)
 
     def may_append(self, seq: Sequence, num_new_tokens: int = 1):
         # Note: in disaggregated (P/D) mode the scheduler skips this call on
@@ -960,6 +1044,7 @@ class BlockManager:
         they remain valid via their block_table refs, just unhashable for
         future requests."""
         self.kv.clear_index()
+        self.state.clear_index()
         if self._event_log is not None:
             self._event_log.append(_make_all_cleared())
 

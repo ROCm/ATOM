@@ -84,6 +84,13 @@ class BlockPool:
         self._cached: OrderedDict[int, None] = OrderedDict()
         self._free: set[int] = set(range(num_blocks))
         self._used: set[int] = set()
+        # PAGE-sized units temporarily owned by something other than a token
+        # block.  DeepSeek-V4 paged state checkpoints use this to keep one
+        # logical state image in several arbitrary (not necessarily adjacent)
+        # physical blocks.  A reserved unit remains in `_used`, so none of the
+        # ordinary PAGE allocation paths can hand out one fragment behind the
+        # checkpoint owner's back.
+        self._raw_unit_owner: dict[int, object] = {}
 
     # ------------------------------- counts -------------------------------- #
     @property
@@ -107,6 +114,13 @@ class BlockPool:
 
     def block(self, block_id: int) -> Block:
         return self.blocks[block_id]
+
+    def is_reserved_unit(self, block_id: int) -> bool:
+        """Whether `block_id` is raw storage rather than a live PAGE."""
+        return block_id in self._raw_unit_owner
+
+    def reserved_unit_owner(self, block_id: int) -> object | None:
+        return self._raw_unit_owner.get(block_id)
 
     # ------------------------------- index --------------------------------- #
     def lookup(self, h: int) -> int:
@@ -215,6 +229,10 @@ class BlockPool:
         return block
 
     def free(self, block_id: int) -> None:
+        if block_id in self._raw_unit_owner:
+            raise AssertionError(
+                f"block {block_id} is a reserved raw unit; use release_units"
+            )
         block = self.blocks[block_id]
         block.ref_count -= 1
         if block.ref_count:
@@ -231,6 +249,51 @@ class BlockPool:
         if len(self._vacant) > 2 * self.num_blocks + 2:
             self._vacant = [b for b in self._free if self.blocks[b].hash == -1]
             heapify(self._vacant)
+
+    def reserve_units(self, count: int, owner: object) -> list[int] | None:
+        """Atomically reserve any `count` PAGE-sized units for raw storage.
+
+        The ids deliberately carry no contiguity promise.  Cached PAGE content
+        is evicted through the normal `allocate` path, including `on_evict`, so
+        the PAGE hash and the state-checkpoint hash cannot drift apart.
+
+        Returns ``None`` without changing the pool when the total free-unit
+        count is insufficient.  Callers that can evict a multi-unit state
+        checkpoint do that first and retry.
+        """
+        if count < 0:
+            raise ValueError(f"unit count must be non-negative, got {count}")
+        if owner is None:
+            raise ValueError("a raw-unit reservation needs an owner")
+        if not self.has_free(count):
+            return None
+        unit_ids: list[int] = []
+        for piece_index in range(count):
+            block_id = self.pop()
+            self.allocate(block_id)
+            # The reverse map names both the atomic allocation and this
+            # fragment's ordered position in its logical byte stream.
+            self._raw_unit_owner[block_id] = (owner, piece_index)
+            unit_ids.append(block_id)
+        return unit_ids
+
+    def release_units(self, unit_ids, owner: object) -> None:
+        """Release a complete raw-unit reservation back to the PAGE pool."""
+        ids = list(unit_ids)
+        if len(ids) != len(set(ids)):
+            raise ValueError("a raw-unit release contains duplicate ids")
+        for piece_index, block_id in enumerate(ids):
+            actual = self._raw_unit_owner.get(block_id)
+            expected = (owner, piece_index)
+            if actual != expected:
+                raise AssertionError(
+                    f"raw unit {block_id} belongs to {actual!r}, not {expected!r}"
+                )
+        # Validate the complete set before releasing any member: a checkpoint
+        # image is an atomic allocation and a partial release corrupts it.
+        for block_id in ids:
+            del self._raw_unit_owner[block_id]
+            self.free(block_id)
 
     # ------------------------------ resizing ------------------------------- #
     def extend(self, count: int) -> int:
@@ -261,6 +324,12 @@ class BlockPool:
         """
         top = self.num_blocks - 1
         if top < 0:
+            return None
+        # A raw unit is one fragment of a larger atomic object.  Relocating it
+        # here would require updating that object's ordered unit table and
+        # copying bytes before the old address disappeared.  The first paged
+        # checkpoint implementation therefore refuses the resize explicitly.
+        if top in self._raw_unit_owner:
             return None
         if top in self._free:
             self._take_named(top)

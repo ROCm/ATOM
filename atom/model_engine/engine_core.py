@@ -95,6 +95,14 @@ class EngineCore:
             config.pool_entries_per_req = block_info.get("pool_entries_per_req", {})
             config.state_transfer_kind = block_info.get("state_transfer_kind", "none")
             config.state_fork_tokens = block_info.get("state_fork_tokens", 0)
+            for field in (
+                "paged_state_checkpoints_enabled",
+                "paged_state_page_unit_bytes",
+                "paged_state_slot_bytes",
+                "paged_state_units_per_checkpoint",
+                "paged_state_layout_id",
+            ):
+                setattr(config, field, block_info.get(field, getattr(config, field)))
             ret = self.runner_mgr.call_func(
                 "allocate_kv_cache", num_blocks, wait_out=True
             )

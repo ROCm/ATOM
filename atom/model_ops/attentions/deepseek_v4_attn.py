@@ -789,6 +789,20 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         """
         return StateTransfer.copy()
 
+    def paged_state_checkpoint_layout_id(self) -> str:
+        """Versioned identity of the canonical slot/PAGE byte streams."""
+        ratios = ",".join(str(r) for r in self._geometry_ratios())
+        return (
+            "dsv4-paged-state-v1"
+            f":block={self.block_size}:ring={self.win_with_spec}"
+            f":dims={self.head_dim},{self.rope_head_dim},{self.index_head_dim}"
+            f":state={self.csa_main_state_shape},{self.csa_idx_state_shape},"
+            f"{self.hca_main_state_shape}"
+            f":main={'fp8-2buff' if self._kv_fp8 else 'bf16'}"
+            f":index={'fp4' if self._indexer_fp4 else 'fp8'}"
+            f":ratios={ratios}"
+        )
+
     def copy_state_entries(self, pairs: list[tuple[int, int]]) -> None:
         """Duplicate a request's whole per-request state: compressor + windows.
 
@@ -819,6 +833,93 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             srcs += views[src]
         if dsts:
             torch._foreach_copy_(dsts, srcs)
+
+    def copy_paged_state_entries(self, store_ops: list, restore_ops: list) -> None:
+        """Scatter/gather complete slots through non-contiguous PAGE units.
+
+        Both directions use one canonical segmented-stream planner and one
+        descriptor launch.  The copy is raw bytes: BF16, FP8, packed FP4,
+        scales and ``-inf`` score state are never converted.
+        """
+        from atom.model_ops.attentions.paged_state_copy import (
+            launch_copy_spans,
+            plan_segmented_copy,
+        )
+
+        spans = []
+        device = self._kv_planes()[0].device
+        for op in store_ops:
+            self._validate_paged_state_op(op)
+            src = self._active_slot_segments(op.src_slot)
+            dst = self._page_unit_segments(op.unit_ids)
+            spans.extend(plan_segmented_copy(src, dst, op.total_bytes))
+        for op in restore_ops:
+            self._validate_paged_state_op(op)
+            src = self._page_unit_segments(op.unit_ids)
+            dst = self._active_slot_segments(op.dst_slot)
+            spans.extend(plan_segmented_copy(src, dst, op.total_bytes))
+        launch_copy_spans(spans, device)
+
+    def _validate_paged_state_op(self, op) -> None:
+        layout_id = self.paged_state_checkpoint_layout_id()
+        if op.layout_id != layout_id:
+            raise RuntimeError(
+                f"state checkpoint layout mismatch: {op.layout_id!r} != "
+                f"{layout_id!r}"
+            )
+        slot_bytes = sum(
+            view.numel() * view.element_size()
+            for view in self._slot_views()[
+                getattr(op, "src_slot", getattr(op, "dst_slot", -1))
+            ]
+        )
+        if op.total_bytes != slot_bytes:
+            raise RuntimeError(
+                f"state checkpoint size mismatch: op={op.total_bytes}, "
+                f"active_slot={slot_bytes}"
+            )
+        unit_bytes = sum(s.num_bytes for s in self._one_page_unit_segments(0))
+        expected_units = (op.total_bytes + unit_bytes - 1) // unit_bytes
+        expected_tail = op.total_bytes - (expected_units - 1) * unit_bytes
+        if len(op.unit_ids) != expected_units or op.last_unit_valid_bytes != expected_tail:
+            raise RuntimeError(
+                "state checkpoint PAGE-unit geometry does not match this worker"
+            )
+
+    def _active_slot_segments(self, group: int):
+        from atom.model_ops.attentions.paged_state_copy import tensor_segment
+
+        return [tensor_segment(view) for view in self._slot_views()[group]]
+
+    def _one_page_unit_segments(self, block_id: int):
+        """All physical regions owned by one logical DSV4 PAGE block id."""
+        from atom.model_ops.attentions.paged_state_copy import tensor_segment
+
+        runner = self.model_runner
+        geo = self.pool_geometry
+        start = block_id * geo.envelope_rows
+        stop = start + geo.envelope_rows
+        segments = [tensor_segment(plane[start:stop]) for plane in self._kv_planes()]
+        # Canonical Indexer order: all layer data, followed by all layer scales
+        # when FP4 has a separate scale pool.
+        segments.extend(
+            tensor_segment(runner.v4_csa_idx_kv[layer, block_id])
+            for layer in range(len(self.csa_layers))
+        )
+        if self._indexer_fp4:
+            segments.extend(
+                tensor_segment(runner.v4_csa_idx_kv_scale[layer, block_id])
+                for layer in range(len(self.csa_layers))
+            )
+        return segments
+
+    def _page_unit_segments(self, unit_ids):
+        segments = []
+        for block_id in unit_ids:
+            if not 0 <= block_id < self.model_runner.num_physical_kvcache_blocks:
+                raise RuntimeError(f"PAGE unit id {block_id} is out of range")
+            segments.extend(self._one_page_unit_segments(block_id))
+        return segments
 
     def _slot_views(self) -> list[list[torch.Tensor]]:
         """Per-group views of that request's whole slot in each plane.
@@ -1028,6 +1129,30 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # index formula any kernel evaluates — reads its offsets from here.
         geo = self.pool_geometry.with_capacity(num_blocks, num_slots)
         self.pool_geometry = geo
+
+        if getattr(
+            self.model_runner.config, "paged_state_checkpoints_enabled", False
+        ):
+            actual_page_bytes = sum(
+                geo.block_bytes(width) for width in self._plane_row_widths()
+            ) + self._indexer_block_bytes()
+            actual_slot_bytes = sum(
+                geo.slot_bytes(width) for width in self._plane_row_widths()
+            )
+            cfg = self.model_runner.config
+            if (
+                actual_page_bytes != cfg.paged_state_page_unit_bytes
+                or actual_slot_bytes != cfg.paged_state_slot_bytes
+                or self.paged_state_checkpoint_layout_id()
+                != cfg.paged_state_layout_id
+            ):
+                raise RuntimeError(
+                    "DSV4 PAGE/state checkpoint geometry differs from sizing: "
+                    f"page={actual_page_bytes}/{cfg.paged_state_page_unit_bytes}, "
+                    f"slot={actual_slot_bytes}/{cfg.paged_state_slot_bytes}, "
+                    f"layout={self.paged_state_checkpoint_layout_id()!r}/"
+                    f"{cfg.paged_state_layout_id!r}"
+                )
 
         row_widths = self._plane_row_widths()
         offsets, total_bytes = plan_regions([geo.plane_bytes(w) for w in row_widths])

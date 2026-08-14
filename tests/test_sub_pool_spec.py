@@ -55,6 +55,12 @@ class TestStatePool:
         spec = state_pool(ENTRY_STATE, 10, entries_per_req=1, extra_entries=64)
         assert spec.extra_entries == 64
 
+    def test_paged_checkpoints_need_no_extra_active_slots(self, monkeypatch):
+        monkeypatch.setenv("STATE_CKPT_EXTRA_ENTRIES", "268")
+        monkeypatch.setenv("ATOM_V4_PAGED_STATE_CHECKPOINTS", "1")
+        spec = state_pool(ENTRY_STATE, 10, entries_per_req=1, extra_entries=64)
+        assert spec.extra_entries == 0
+
 
 class TestMergeSpecs:
     def test_same_name_sums_entry_bytes(self):

@@ -38,6 +38,7 @@ from atom.distributed.pp_comm import (
     recv_intermediate_tensors,
 )
 from atom.kv_transfer.disaggregation import KVConnectorOutput
+from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.run_labels import build_run_label
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
@@ -1670,6 +1671,48 @@ class ModelRunner:
         transfer = self.attn_metadata_builder.state_transfer()
         config.state_transfer_kind = transfer.kind
         config.state_fork_tokens = transfer.fork_tokens
+        paged_state_requested = bool(envs.ATOM_V4_PAGED_STATE_CHECKPOINTS)
+        paged_layout_id = (
+            self.attn_metadata_builder.paged_state_checkpoint_layout_id()
+        )
+        if paged_state_requested and paged_layout_id is None:
+            raise RuntimeError(
+                "ATOM_V4_PAGED_STATE_CHECKPOINTS=1 is only supported by a "
+                "backend that declares a PAGE/state wire layout (DeepSeek-V4)"
+            )
+        if paged_state_requested and not transfer.copies:
+            raise RuntimeError(
+                "PAGE-backed state checkpoints require StateTransfer.copy()"
+            )
+        if paged_state_requested and config.pipeline_parallel_size > 1:
+            raise RuntimeError(
+                "PAGE-backed state checkpoints do not yet support pipeline "
+                "parallelism: every stage must first agree on one atomic "
+                "checkpoint/unit ownership transaction"
+            )
+        if paged_state_requested and config.enable_rapidserve:
+            raise RuntimeError(
+                "PAGE-backed state checkpoints do not yet support RapidServe "
+                "prefill/decode disaggregation"
+            )
+        config.paged_state_checkpoints_enabled = paged_state_requested
+        if paged_state_requested:
+            page_bytes = int(plan.entry_bytes[plan.paged_class])
+            state_bytes = int(plan.entry_bytes[STATE_SLOT_CLASS])
+            config.paged_state_page_unit_bytes = page_bytes
+            config.paged_state_slot_bytes = state_bytes
+            config.paged_state_units_per_checkpoint = math.ceil(
+                state_bytes / page_bytes
+            )
+            config.paged_state_layout_id = str(paged_layout_id)
+            logger.info(
+                "PAGE-backed state checkpoints enabled: unit_bytes=%d, "
+                "slot_bytes=%d, units_per_checkpoint=%d, layout=%s",
+                page_bytes,
+                state_bytes,
+                config.paged_state_units_per_checkpoint,
+                paged_layout_id,
+            )
         for name in sorted(plan.entries):
             logger.info(
                 f"sub-pool {name}: entries={plan.entries[name]}, "
@@ -1693,11 +1736,11 @@ class ModelRunner:
         # Concurrent-capacity table: at each context-length percentage of
         # max_model_len, how many requests can simultaneously hold their
         # KV in the pool. Per-req block usage = ceil(ctx_len/block_size).
-        # STATE classes sit in their own reservation (already excluded from
-        # the paged count at sizing time), so they add no per-block cost and
-        # never bind either: sizing reserves every STATE floor at exactly
-        # `max_num_seqs` requests' worth, so the request cap is max_num_seqs
-        # and the paged pool is the only thing that can run out first.
+        # STATE Active Slots sit in their own reservation (already excluded
+        # from the paged count at sizing time), so the empty-cache capacity is
+        # described by this table. PAGE-backed state checkpoints, when the
+        # experiment is enabled, dynamically borrow blocks from that paged
+        # count and are evicted atomically as PAGE demand grows.
         max_model_len = config.max_model_len
         cap = config.max_num_seqs
         pct_lines = []
@@ -1744,6 +1787,15 @@ class ModelRunner:
             "pool_entries_per_req": dict(plan.entries_per_req),
             "state_transfer_kind": config.state_transfer_kind,
             "state_fork_tokens": config.state_fork_tokens,
+            "paged_state_checkpoints_enabled": (
+                config.paged_state_checkpoints_enabled
+            ),
+            "paged_state_page_unit_bytes": config.paged_state_page_unit_bytes,
+            "paged_state_slot_bytes": config.paged_state_slot_bytes,
+            "paged_state_units_per_checkpoint": (
+                config.paged_state_units_per_checkpoint
+            ),
+            "paged_state_layout_id": config.paged_state_layout_id,
         }
 
     def allocate_kv_cache(self, num_kvcache_blocks):

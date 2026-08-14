@@ -6,6 +6,12 @@ from dataclasses import dataclass
 from heapq import heapify, heappop, heappush
 from math import inf
 
+from atom.model_engine.page_unit_checkpoint import (
+    CheckpointRestoreOp,
+    CheckpointStoreOp,
+    PageUnitCheckpointStore,
+)
+
 # `StateTransfer.kind` values. Plain strings rather than an enum because the
 # choice crosses a process boundary inside a dict (ModelRunner's `block_info`),
 # where a scalar survives and a class does not.
@@ -114,13 +120,12 @@ class StateGroupPool:
     checkpointed the state — which is what the index over the free list
     answers.
 
-    Capacity model: a checkpoint is a group sitting on the free list with its
-    content still valid, filed under the content hash of the last block it
-    covers. This is the KV block pool's lazy-eviction model (`pop` drops the
-    hash at hand-out time, not at free time) applied to state groups. The index
-    therefore holds nothing back — `pop` invalidates whatever it hands out, so a
-    checkpoint can never shrink admission, and under full concurrency the
-    checkpoint set drains to empty on its own.
+    Default capacity model: a checkpoint is a group sitting on the free list
+    with its content still valid, filed under the content hash of the last
+    block it covers. With `page_checkpoints`, groups are instead Active Slots
+    only: immutable checkpoint content lives in an ordered set of arbitrary
+    PAGE units, and this class schedules typed scatter/gather ops between the
+    two representations.
 
     *How* a group reaches the index is the backend's `StateTransfer`, and it is
     the only thing that differs between the two mechanisms this class runs:
@@ -154,6 +159,7 @@ class StateGroupPool:
         transfer: StateTransfer | None = None,
         hash_block_size: int = 1,
         enabled: bool = True,
+        page_checkpoints: PageUnitCheckpointStore | None = None,
     ):
         self.enabled: bool = enabled and num_groups > 0
         self.num_groups: int = num_groups
@@ -164,6 +170,9 @@ class StateGroupPool:
         self.min_fork_tokens: int = self.transfer.fork_tokens
         self.successor_room: float = self.transfer.successor_room
         self.hash_block_size: int = hash_block_size
+        self.page_checkpoints = page_checkpoints
+        if self.page_checkpoints is not None and not self.transfer.copies:
+            raise ValueError("PAGE-unit state checkpoints require copy transfer")
         # The free list, split by whether the group still carries content worth
         # something. Two containers rather than one queue because the two halves
         # want opposite orders and mixing them serves neither:
@@ -217,6 +226,13 @@ class StateGroupPool:
         # checkpoint copies the owner's state out, resuming from one copies it
         # back in.
         self._copies: list[tuple[int, int]] = []
+        # PAGE-backed mode separates the Active Slot free list above from the
+        # immutable checkpoint image.  The pending dict coalesces later
+        # boundaries from the same request exactly as `pending_checkpoint` did,
+        # while retaining the boundary metadata the record now owns.
+        self._paged_pending: dict[int, tuple[object, int, int]] = {}
+        self._paged_store_ops: list[CheckpointStoreOp] = []
+        self._paged_restore_ops: list[CheckpointRestoreOp] = []
         # `dropped` had no group to go to; `evicted` landed and was later
         # spent on an allocation. Counted apart because they read the same in a
         # hit rate and want opposite fixes — the first says the pool is too
@@ -457,7 +473,12 @@ class StateGroupPool:
             return hit
         hbs = self.hash_block_size
         for i in range(hit - 1, -1, -1):
-            if not assume_checkpointed and block_hashes[i] not in self.hash_to_group:
+            checkpointed = (
+                self.page_checkpoints.contains(block_hashes[i])
+                if self.page_checkpoints is not None
+                else block_hashes[i] in self.hash_to_group
+            )
+            if not assume_checkpointed and not checkpointed:
                 continue
             if seq.num_tokens - (i + 1) * hbs >= self.min_fork_tokens:
                 return i + 1
@@ -467,6 +488,8 @@ class StateGroupPool:
         """Group holding the checkpoint for hash `h`, or -1."""
         if not self.enabled:
             return -1
+        if self.page_checkpoints is not None:
+            return self.page_checkpoints.lookup(h)
         return self.hash_to_group.get(h, -1)
 
     # ---------------------------- checkpointing ---------------------------- #
@@ -501,6 +524,10 @@ class StateGroupPool:
         if old < 0:
             return
         if self.transfer.copies:
+            if self.page_checkpoints is not None:
+                self._paged_pending[id(seq)] = (seq, boundary_blocks, h)
+                seq.pending_checkpoint = h
+                return
             if seq.pending_checkpoint == -1:
                 self._checkpoint_pending.append(seq)
             # A later boundary supersedes an earlier one: the group holds the
@@ -535,6 +562,9 @@ class StateGroupPool:
         is only sound because this runs with the batch already decided — see
         `take_copies`.
         """
+        if self.page_checkpoints is not None:
+            self._commit_paged_pending()
+            return
         if not self._checkpoint_pending:
             return
         copy_start = len(self._copies)
@@ -556,12 +586,40 @@ class StateGroupPool:
         for _, dst in self._copies[copy_start:]:
             self.release(dst)
 
+    def _commit_paged_pending(self) -> None:
+        """Reserve arbitrary PAGE units and schedule Active Slot scatter ops."""
+        if not self._paged_pending:
+            return
+        pending, self._paged_pending = self._paged_pending, {}
+        store = self.page_checkpoints
+        assert store is not None
+        for seq, boundary_blocks, h in pending.values():
+            # A later call may have cleared/superseded this intent.
+            if seq.pending_checkpoint != h:
+                continue
+            seq.pending_checkpoint = -1
+            src = seq.per_req_cache_group
+            if src < 0:
+                continue
+            if store.contains_or_pending(h):
+                continue
+            op = store.begin_store(h, boundary_blocks, src)
+            if op is None:
+                self.checkpoints_dropped += 1
+                continue
+            self._paged_store_ops.append(op)
+            self.checkpoints_kept += 1
+
     def checkpoint_fates(self) -> dict[str, int]:
         """What became of the checkpoints the ladder asked this pool to keep."""
         return {
             "checkpoints_kept": self.checkpoints_kept,
             "checkpoints_dropped": self.checkpoints_dropped,
-            "checkpoints_evicted": self.checkpoints_evicted,
+            "checkpoints_evicted": (
+                self.page_checkpoints.evictions
+                if self.page_checkpoints is not None
+                else self.checkpoints_evicted
+            ),
             "checkpoints_orphaned": self.checkpoints_orphaned,
         }
 
@@ -590,9 +648,33 @@ class StateGroupPool:
         live group; neither is on the free list, so `_commit_pending`'s `pop`
         can return neither.
         """
+        # PAGE-backed mode has typed endpoints, so a legacy caller asking only
+        # for slot pairs must not commit a store it cannot carry to a worker.
+        # `take_paged_ops` is the sole commit/drain point in that mode.
+        if self.page_checkpoints is not None:
+            return []
         self._commit_pending()
         copies, self._copies = self._copies, []
         return copies
+
+    def record_restore(self, h: int, dst: int) -> bool:
+        """Pin a PAGE-backed checkpoint and queue its gather into `dst`."""
+        if self.page_checkpoints is None:
+            return False
+        op = self.page_checkpoints.begin_restore(h, dst)
+        if op is None:
+            return False
+        self._paged_restore_ops.append(op)
+        return True
+
+    def take_paged_ops(
+        self,
+    ) -> tuple[list[CheckpointStoreOp], list[CheckpointRestoreOp]]:
+        """PAGE-unit store/restore ops for the batch now being built."""
+        self._commit_pending()
+        stores, self._paged_store_ops = self._paged_store_ops, []
+        restores, self._paged_restore_ops = self._paged_restore_ops, []
+        return stores, restores
 
     def forget_pending(self, seq) -> None:
         """Drop `seq`'s uncommitted checkpoint — its group is being released.
@@ -602,6 +684,7 @@ class StateGroupPool:
         emptied every pass either way.
         """
         seq.pending_checkpoint = -1
+        self._paged_pending.pop(id(seq), None)
 
     def _index(self, h: int, group: int) -> None:
         """File `group` as the checkpoint for hash `h`.
@@ -640,12 +723,31 @@ class StateGroupPool:
 
         Returns the group freed, or -1.
         """
+        if self.page_checkpoints is not None:
+            checkpoint_id = self.page_checkpoints.unindex(h)
+            if checkpoint_id >= 0:
+                self.checkpoints_orphaned += 1
+            return checkpoint_id
         group = self.hash_to_group.get(h, -1)
         if group < 0:
             return -1
         self.invalidate(group)
         self.checkpoints_orphaned += 1
         return group
+
+    def clear_index(self) -> None:
+        """Drop all checkpoint hashes, preserving only in-flight readers."""
+        for seq in self._checkpoint_pending:
+            seq.pending_checkpoint = -1
+        self._checkpoint_pending.clear()
+        for seq, _, _ in self._paged_pending.values():
+            seq.pending_checkpoint = -1
+        self._paged_pending.clear()
+        if self.page_checkpoints is not None:
+            self.page_checkpoints.clear()
+            return
+        for group in list(self.hash_to_group.values()):
+            self.invalidate(group)
 
     def invalidate(self, group: int) -> None:
         """Drop `group`'s checkpoint. Called when the group is handed out."""
@@ -727,6 +829,8 @@ class StateGroupPool:
         is why this stays a clock rather than moving to `_consume_state_forks`,
         where it would be tighter and leak.
         """
+        if self.page_checkpoints is not None:
+            self.page_checkpoints.complete_inflight()
         if not self._pinned:
             return
         held, self._deferred = self._deferred, set()

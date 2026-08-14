@@ -167,6 +167,10 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         """
         return StateTransfer.none()
 
+    def paged_state_checkpoint_layout_id(self) -> str | None:
+        """Stable wire-layout id when this backend supports PAGE images."""
+        return None
+
     def copy_state_entries(self, pairs: list[tuple[int, int]]) -> None:
         """Copy each `(src, dst)` group's whole per-request state, src → dst.
 
@@ -186,6 +190,18 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
             f"{type(self).__name__} owns per-request state but does not "
             "implement copy_state_entries"
         )
+
+    def copy_paged_state_entries(self, store_ops: list, restore_ops: list) -> None:
+        """Run PAGE-granularity state scatter/gather maintenance copies.
+
+        Only DeepSeek-V4 currently declares this representation.  Keeping the
+        default explicit makes an accidentally enabled backend fail before its
+        forward can consume an uninitialized Active Slot.
+        """
+        if store_ops or restore_ops:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not implement PAGE-backed state copy"
+            )
 
     def get_kv_transfer_tensors(self) -> "KVTransferTensors | None":
         """Return RDMA transfer regions for PD disaggregation.
@@ -525,6 +541,10 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         # than by inspection of every prepare_* variant.
         if batch.state_copy_pairs:
             self.copy_state_entries(batch.state_copy_pairs)
+        if batch.checkpoint_store_ops or batch.checkpoint_restore_ops:
+            self.copy_paged_state_entries(
+                batch.checkpoint_store_ops, batch.checkpoint_restore_ops
+            )
         is_prefill = batch.total_tokens_num_prefill > 0
         if is_prefill:
             return self.prepare_prefill(batch)
