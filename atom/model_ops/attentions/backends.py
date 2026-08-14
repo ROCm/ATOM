@@ -542,18 +542,34 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         # microbatch, TBO — passes through exactly once per batch, which is what
         # makes "each copy is issued once per rank" true by construction rather
         # than by inspection of every prepare_* variant.
-        if batch.state_copy_pairs:
-            self.copy_state_entries(batch.state_copy_pairs)
-        # Spills, after the checkpoint copies and still before the forward:
-        # `pop()` already handed this group to its new owner, so these bytes
-        # only exist until that owner's forward runs. Same once-per-batch
-        # guarantee as above -- prefill, decode, dummy, DP-sync, PP
-        # microbatch and TBO all reach the forward through this method.
+        #
+        # Spills FIRST, and the order is load-bearing, not stylistic. A spill
+        # is filed under the group's *old* hash -- `pop()` calls `_spill()`
+        # before `invalidate()` precisely so the pre-existing bytes are what
+        # gets stored. That same `pop()` then hands the group out as a
+        # checkpoint destination, so `_commit_pending` (`state_pool.py`) and
+        # `_attach_state_group` (`block_manager.py`) both routinely produce a
+        # batch in which one group is a spill SOURCE and a checkpoint
+        # DESTINATION. Issue the copies first and the staging entry receives
+        # the new occupant's state while the tier stores it under the evicted
+        # checkpoint's hash -- bytes that are present, valid-looking, and
+        # someone else's. Nothing on the load path could ever detect that.
+        #
+        # Spilling first is right in general, not just for the collision: the
+        # bytes a spill wants are always the ones already in the group, so any
+        # copy into it in this batch is an overwrite. The reverse collision
+        # cannot occur -- a spill's destination is a staging entry past the
+        # pool's range, which is never a copy source.
         if batch.state_spill_pairs:
             self.copy_state_entries(
                 [(src, dst) for src, dst, _, _ in batch.state_spill_pairs]
             )
             self._submit_state_spills(batch.state_spill_pairs)
+        # Checkpoint copies, still before the forward. Same once-per-batch
+        # guarantee as above -- prefill, decode, dummy, DP-sync, PP microbatch
+        # and TBO all reach the forward through this method.
+        if batch.state_copy_pairs:
+            self.copy_state_entries(batch.state_copy_pairs)
         is_prefill = batch.total_tokens_num_prefill > 0
         if is_prefill:
             return self.prepare_prefill(batch)

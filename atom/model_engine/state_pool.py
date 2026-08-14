@@ -706,10 +706,19 @@ class StateGroupPool:
         list. Both are the right way round: admission is throughput, a
         checkpoint is speculative reuse.
 
-        The two kinds of pair cannot collide, so their order does not matter. A
-        resume source is a claimed or pinned checkpoint and a keeper source is a
-        live group; neither is on the free list, so `_commit_pending`'s `pop`
-        can return neither.
+        No copy's *source* can be another copy's destination: a resume source is
+        a claimed or pinned checkpoint and a keeper source is a live group;
+        neither is on the free list, so `_commit_pending`'s `pop` can return
+        neither. Order within this list therefore does not matter.
+
+        Spill copies are a different matter and their order against this list
+        very much does. `pop()` spills the group it is about to hand out, so a
+        group returned here as a checkpoint *destination* is frequently the same
+        step's spill *source*. The spill must be issued first or it stores the
+        new occupant's bytes under the evicted checkpoint's hash. That ordering
+        is enforced at the single point both lists are consumed --
+        `AttentionBackend.build()` -- which is also the only place with the
+        stream to enforce it on.
         """
         self._commit_pending()
         copies, self._copies = self._copies, []
