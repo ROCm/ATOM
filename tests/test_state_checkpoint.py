@@ -1451,6 +1451,35 @@ class TestDemandDrivenCheckpoints:
         # 28 is the demand's rung and it is gone; the grid and anchor remain.
         assert forward_on_the_ladder(bm, second) == [32, 36]
 
+    def test_the_env_var_overrides_the_flag_in_both_directions(self, monkeypatch):
+        """`ATOM_STATE_CHECKPOINT_DEMAND` beats the config field.
+
+        Both directions are pinned because the override is asymmetric in
+        practice: =0 turns the rung off for one run without editing a launch
+        script, and =1 has to be able to turn it back on over a script that
+        already passes --no-state-checkpoint-demand. An unset variable must
+        change nothing, or merely having it exported on the box would pin the
+        policy for every server running there.
+        """
+        # =0 beats a config that asks for the rung.
+        monkeypatch.setenv("ATOM_STATE_CHECKPOINT_DEMAND", "0")
+        bm = BlockManager(demand_config(state_checkpoint_demand=True))
+        assert bm.state_checkpoint_demand is False
+
+        # =1 beats a config that refuses it.
+        monkeypatch.setenv("ATOM_STATE_CHECKPOINT_DEMAND", "1")
+        bm = BlockManager(demand_config(state_checkpoint_demand=False))
+        assert bm.state_checkpoint_demand is True
+
+        # Exported-but-empty is not "set" — the flag still decides.
+        monkeypatch.setenv("ATOM_STATE_CHECKPOINT_DEMAND", "")
+        bm = BlockManager(demand_config(state_checkpoint_demand=False))
+        assert bm.state_checkpoint_demand is False
+
+        monkeypatch.delenv("ATOM_STATE_CHECKPOINT_DEMAND")
+        bm = BlockManager(demand_config(state_checkpoint_demand=True))
+        assert bm.state_checkpoint_demand is True
+
     def test_the_third_request_finds_what_the_second_was_missing(self):
         """Self-limiting: nothing to want, want it once, want nothing again."""
         bm = BlockManager(demand_config())
