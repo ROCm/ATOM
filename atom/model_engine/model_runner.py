@@ -1668,17 +1668,10 @@ class ModelRunner:
         self.pool_plan = plan
         config.pool_entries = dict(plan.entries)
         config.pool_entries_per_req = dict(plan.entries_per_req)
-        # Two scalars rather than the StateTransfer itself: this travels to the
-        # engine process in a plain dict, where `StateGroupPool` rebuilds it.
+        # State-transfer capability travels to the engine as one validated wire
+        # payload; runtime cache behavior is never smuggled through Config.
         transfer = self.attn_metadata_builder.state_transfer()
-        config.state_transfer_kind = transfer.kind
-        config.state_fork_tokens = transfer.fork_tokens
-        paged_layout_id = self.attn_metadata_builder.paged_state_checkpoint_layout_id()
         uses_paged_state = transfer.copies
-        if uses_paged_state and paged_layout_id is None:
-            raise RuntimeError("StateTransfer.copy() requires a PAGE/state wire layout")
-        if paged_layout_id is not None and not uses_paged_state:
-            raise RuntimeError("a PAGE/state wire layout requires StateTransfer.copy()")
         if uses_paged_state and config.pipeline_parallel_size > 1:
             raise RuntimeError(
                 "PAGE-backed state checkpoints do not yet support pipeline "
@@ -1699,7 +1692,7 @@ class ModelRunner:
             paged_state_checkpoint_spec = PagedStateCheckpointSpec(
                 page_unit_bytes=int(plan.entry_bytes[plan.paged_class]),
                 slot_bytes=int(plan.entry_bytes[STATE_SLOT_CLASS]),
-                layout_id=str(paged_layout_id),
+                layout_id=transfer.paged_layout_id,
             )
             logger.info(
                 "PAGE-backed state checkpoints enabled: unit_bytes=%d, "
@@ -1782,8 +1775,7 @@ class ModelRunner:
             "num_kvcache_blocks": num_kvcache_blocks,
             "pool_entries": dict(plan.entries),
             "pool_entries_per_req": dict(plan.entries_per_req),
-            "state_transfer_kind": transfer.kind,
-            "state_fork_tokens": transfer.fork_tokens,
+            "state_transfer": transfer.to_wire(),
             "paged_state_checkpoint_spec": (
                 None
                 if paged_state_checkpoint_spec is None
@@ -4151,7 +4143,11 @@ class RapidServeModelRunner(ModelRunner):
         # Decode in disagg mode owns no GPU memory — kvcache is imported from
         # prefill.
         if self.config.disagg_is_decode:
-            return {"num_kvcache_blocks": 0}
+            return {
+                "num_kvcache_blocks": 0,
+                "state_transfer": self.attn_metadata_builder.state_transfer().to_wire(),
+                "paged_state_checkpoint_spec": None,
+            }
         return super().get_num_blocks()
 
     def allocate_kv_cache(self, num_kvcache_blocks):

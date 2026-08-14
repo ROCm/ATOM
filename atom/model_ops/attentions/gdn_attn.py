@@ -257,23 +257,7 @@ class GDNStateMixin:
         )
 
     def state_transfer(self) -> StateTransfer:
-        """A fork whose successor forward need only carry one token.
-
-        Both halves of the GDN state come out of a forward self-contained at any
-        length. The recurrent state is rewritten whole, and every write path in
-        `causal_conv1d` stores the full `state_len` window to the output slot —
-        the short-chunk paths get there by loading the previous window from the
-        *input* slot, shifting left and appending x — so the new group stops
-        depending on the old one the moment the forward returns.
-
-        Reading the state layout alone suggests `conv_kernel_dim - 1` instead,
-        on the theory that a shorter forward leaves the new group holding a
-        window the old group still owns part of. The kernel closes that gap.
-
-        A fork rather than a copy because the state is two per-family tensors
-        rather than one contiguous entry, so there is no single range to
-        duplicate — and at one token the fork binds almost nothing anyway.
-        """
+        """Declare one-token fork checkpoint support for recurrent state."""
         return StateTransfer.fork(1)
 
     def state_spec(self) -> SubPoolSpec:
@@ -315,8 +299,8 @@ class GDNStateMixin:
             ),
         }
 
-    def copy_state_entries(self, pairs: list[tuple[int, int]]) -> None:
-        """Duplicate a group's whole GDN state, both families, all layers.
+    def relocate_state_slots(self, pairs: list[tuple[int, int]]) -> None:
+        """Relocate a live GDN group between logical Active Slot spans.
 
         A group is `1 + num_spec` consecutive slots — the extra ones hold the
         per-draft states a rejected speculation rolls back to — so a group moves
@@ -324,9 +308,7 @@ class GDNStateMixin:
 
         GDN checkpoints by forking, not by copying, so this is not on the
         checkpoint path: it exists because moving the pool's boundary has to be
-        able to relocate a group that is in the way, and relocation is a byte
-        move whatever mechanism the class uses to checkpoint. A backend
-        declaring `StateTransfer.fork` therefore still owes this method.
+        able to relocate a group that is in the way.
 
         Both caches are layer-major with the slot as the second axis, so a
         group's rows are strided rather than contiguous and there is no single

@@ -139,40 +139,11 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         return {}
 
     def state_transfer(self) -> StateTransfer:
-        """How this backend hands one request's state to another group.
-
-        A checkpoint is a second group holding the state as of some boundary, so
-        every backend with per-request state has to say how one gets there.
-        There are three answers and `StateGroupPool` runs whichever it is told:
-
-        `StateTransfer.fork(n)` — the state rolls and is not one range to
-        duplicate, so the old group goes to the index and the request takes a
-        fresh one, reading the old and writing the new for exactly one forward.
-        That forward has to leave the new group self-contained (a single read
-        index cannot span both), which takes `n` *committed* tokens.
-        `BlockManager` walks a checkpoint/hit point back to the previous block
-        boundary until it fits.
-
-        `StateTransfer.copy()` — one request's state is a contiguous byte range,
-        so its checkpoint is scattered into PAGE units and the owner is left
-        alone. No forward is bound and no boundary is disqualified for lack of
-        room, which is what makes a decode boundary checkpointable at all: a
-        decode step commits `1 + accepted_drafts` tokens and acceptance is not
-        knowable when the checkpoint has to be decided. The backend must declare
-        a PAGE/state wire layout and implement `copy_paged_state_entries`.
-
-        `StateTransfer.none()` (default) — no per-request state, or none that can
-        be handed over; the checkpoint index stays empty and prefix hits shrink
-        to 0 for its models.
-        """
+        """Declare this backend's per-request state checkpoint capability."""
         return StateTransfer.none()
 
-    def paged_state_checkpoint_layout_id(self) -> str | None:
-        """Stable wire-layout id when this backend supports PAGE images."""
-        return None
-
-    def copy_state_entries(self, pairs: list[tuple[int, int]]) -> None:
-        """Relocate each `(src, dst)` Active Slot before the forward.
+    def relocate_state_slots(self, pairs: list[tuple[int, int]]) -> None:
+        """Move live state from one contiguous Active Slot to another.
 
         This is not a checkpoint path. It moves a live group when the state
         pool's boundary changes, regardless of whether that backend checkpoints
@@ -180,11 +151,11 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         """
         raise NotImplementedError(
             f"{type(self).__name__} owns per-request state but does not "
-            "implement copy_state_entries"
+            "implement relocate_state_slots"
         )
 
-    def copy_paged_state_entries(self, store_ops: list, restore_ops: list) -> None:
-        """Run PAGE-granularity state scatter/gather maintenance copies.
+    def execute_paged_state_copies(self, store_ops: list, restore_ops: list) -> None:
+        """Scatter/gather checkpoints between Active Slots and arbitrary PAGEs.
 
         Only DeepSeek-V4 currently declares this representation. Keeping the
         default explicit makes an unsupported backend fail before its forward
@@ -530,9 +501,9 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         # decode, dummy, DP-sync, PP microbatch, TBO — passes through exactly
         # once per batch.
         if batch.state_copy_pairs:
-            self.copy_state_entries(batch.state_copy_pairs)
+            self.relocate_state_slots(batch.state_copy_pairs)
         if batch.checkpoint_store_ops or batch.checkpoint_restore_ops:
-            self.copy_paged_state_entries(
+            self.execute_paged_state_copies(
                 batch.checkpoint_store_ops, batch.checkpoint_restore_ops
             )
         is_prefill = batch.total_tokens_num_prefill > 0

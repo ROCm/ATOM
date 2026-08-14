@@ -31,6 +31,7 @@ from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
+from atom.model_engine.state_pool import StateTransfer
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -620,6 +621,7 @@ class Scheduler:
         self,
         config: Config,
         *,
+        state_transfer: StateTransfer | None = None,
         paged_state_checkpoint_spec: PagedStateCheckpointSpec | None = None,
     ):
         self.max_num_seqs = config.max_num_seqs
@@ -631,6 +633,7 @@ class Scheduler:
         self.stop_token_ids = config.stop_token_ids
         self.block_manager = BlockManager(
             config,
+            state_transfer=state_transfer,
             paged_state_checkpoint_spec=paged_state_checkpoint_spec,
         )
         self.waiting: deque[Sequence] = deque()
@@ -2810,10 +2813,12 @@ class DecodeScheduler(Scheduler):
         config: Config,
         disagg_cu_shm_name: str = "",
         *,
+        state_transfer: StateTransfer | None = None,
         paged_state_checkpoint_spec: PagedStateCheckpointSpec | None = None,
     ):
         super().__init__(
             config,
+            state_transfer=state_transfer,
             paged_state_checkpoint_spec=paged_state_checkpoint_spec,
         )
         # seq_id → Sequence; blocks allocated, BlockAssignment sent, awaiting PrefillDone.

@@ -731,11 +731,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         layout that is priced in bytes.
 
         Putting it here rather than in a plane of its own is what makes it
-        travel: `copy_state_entries` copies a whole slot, so a checkpoint
-        carries the window with the state. A private plane would not be
-        copied, and a request resuming a cached prefix would draft against
-        whatever the slot's previous occupant left — the same shape of bug
-        #1417 was, minus the correctness half, since drafts are verified.
+        travel: slot relocation and checkpoint scatter both copy the whole
+        canonical stream, so a checkpoint carries the window with the state. A
+        private plane would not be copied, and a request resuming a cached
+        prefix would draft against whatever the slot's previous occupant left —
+        the same shape of bug #1417 was, minus the correctness half, since
+        drafts are verified.
 
         Field order is the wire order of a whole entry, so it is also the
         order a PD transfer or a checkpoint sees the bytes in.
@@ -767,32 +768,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         return fields
 
     def state_transfer(self) -> StateTransfer:
-        """A copy: one request's compressor state is one contiguous entry.
-
-        `StateArena` and the slot planes define one canonical byte stream per
-        request. That stream can be scattered into arbitrary PAGE units and
-        gathered into a fresh Active Slot without dtype conversion.
-
-        A fork would also work on a prompt and would move no bytes, but it binds
-        the forward after the checkpoint: that forward has to leave the fresh
-        group self-contained, which takes `K - ratio` = 4 *committed* tokens for
-        the overlapping CSA ring (0 for HCA). A decode step commits
-        `1 + accepted_drafts`, and acceptance is not knowable when the
-        checkpoint has to be decided — nor recoverable afterwards, since by then
-        the state is split across two groups and a single read index spans
-        neither. So a fork can never checkpoint a decode boundary, and this
-        model's reuse is multi-turn, where the boundary worth keeping is exactly
-        the one generation ends on.
-
-        Arithmetic for both numbers, replayed from `compress_plan.py`:
-        `/app/logs_claude/verify_v4_min_fork.py`.
-        """
-        return StateTransfer.copy()
-
-    def paged_state_checkpoint_layout_id(self) -> str:
-        """Versioned identity of the canonical slot/PAGE byte streams."""
+        """Declare PAGE-copy checkpoints with the versioned DSV4 layout."""
         ratios = ",".join(str(r) for r in self._geometry_ratios())
-        return (
+        layout_id = (
             "dsv4-paged-state-v1"
             f":block={self.block_size}:ring={self.win_with_spec}"
             f":dims={self.head_dim},{self.rope_head_dim},{self.index_head_dim}"
@@ -802,8 +780,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             f":index={'fp4' if self._indexer_fp4 else 'fp8'}"
             f":ratios={ratios}"
         )
+        return StateTransfer.copy(layout_id)
 
-    def copy_state_entries(self, pairs: list[tuple[int, int]]) -> None:
+    def relocate_state_slots(self, pairs: list[tuple[int, int]]) -> None:
         """Relocate a request's whole Active Slot: compressor + windows.
 
         One range per plane: a slot holds the compressor state followed by every
@@ -819,8 +798,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         if dsts:
             torch._foreach_copy_(dsts, srcs)
 
-    def copy_paged_state_entries(self, store_ops: list, restore_ops: list) -> None:
-        """Scatter/gather complete slots through non-contiguous PAGE units.
+    def execute_paged_state_copies(self, store_ops: list, restore_ops: list) -> None:
+        """Scatter/gather checkpoints between slots and non-contiguous PAGEs.
 
         Both directions use one canonical segmented-stream planner and one
         descriptor launch.  The copy is raw bytes: BF16, FP8, packed FP4,
@@ -846,7 +825,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         launch_copy_spans(spans, device)
 
     def _validate_paged_state_op(self, op) -> None:
-        layout_id = self.paged_state_checkpoint_layout_id()
+        layout_id = self.state_transfer().paged_layout_id
         if op.layout_id != layout_id:
             raise RuntimeError(
                 f"state checkpoint layout mismatch: {op.layout_id!r} != "
@@ -1128,17 +1107,17 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         checkpoint_spec = self.model_runner.paged_state_checkpoint_spec
         if checkpoint_spec is None:
             raise RuntimeError("DSV4 PAGE/state checkpoint sizing spec is missing")
+        layout_id = self.state_transfer().paged_layout_id
         if (
             actual_page_bytes != checkpoint_spec.page_unit_bytes
             or actual_slot_bytes != checkpoint_spec.slot_bytes
-            or self.paged_state_checkpoint_layout_id() != checkpoint_spec.layout_id
+            or layout_id != checkpoint_spec.layout_id
         ):
             raise RuntimeError(
                 "DSV4 PAGE/state checkpoint geometry differs from sizing: "
                 f"page={actual_page_bytes}/{checkpoint_spec.page_unit_bytes}, "
                 f"slot={actual_slot_bytes}/{checkpoint_spec.slot_bytes}, "
-                f"layout={self.paged_state_checkpoint_layout_id()!r}/"
-                f"{checkpoint_spec.layout_id!r}"
+                f"layout={layout_id!r}/{checkpoint_spec.layout_id!r}"
             )
 
         row_widths = self._plane_row_widths()

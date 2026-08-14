@@ -19,6 +19,7 @@ from atom.model_engine.engine_utility import EngineUtilityHandler
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Scheduler
 from atom.model_engine.sequence import Sequence, SequenceStatus, get_exit_sequence
+from atom.model_engine.state_pool import StateTransfer
 from atom.utils import (
     envs,
     init_exit_handler,
@@ -94,8 +95,7 @@ class EngineCore:
             # adding an architecture never touches this line.
             config.pool_entries = block_info.get("pool_entries", {})
             config.pool_entries_per_req = block_info.get("pool_entries_per_req", {})
-            config.state_transfer_kind = block_info.get("state_transfer_kind", "none")
-            config.state_fork_tokens = block_info.get("state_fork_tokens", 0)
+            self.state_transfer = StateTransfer.from_wire(block_info["state_transfer"])
             paged_state_wire = block_info.get("paged_state_checkpoint_spec")
             self.paged_state_checkpoint_spec = (
                 None
@@ -132,6 +132,7 @@ class EngineCore:
         if not config.disagg_is_decode:
             self.scheduler = Scheduler(
                 config,
+                state_transfer=self.state_transfer,
                 paged_state_checkpoint_spec=self.paged_state_checkpoint_spec,
             )
 
@@ -929,6 +930,7 @@ class DecodeEngineCore(EngineCore):
         self.scheduler = DecodeScheduler(
             config,
             disagg_cu_shm_name=config.disagg_cu_shm_name,
+            state_transfer=self.state_transfer,
             paged_state_checkpoint_spec=self.paged_state_checkpoint_spec,
         )
         # EngineUtilityHandler was built in super().__init__() with scheduler=None

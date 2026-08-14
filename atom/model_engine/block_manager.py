@@ -59,6 +59,7 @@ class BlockManager:
         self,
         config: Config,
         *,
+        state_transfer: StateTransfer | None = None,
         paged_state_checkpoint_spec: PagedStateCheckpointSpec | None = None,
     ):
         block_size = config.kv_cache_block_size
@@ -111,15 +112,18 @@ class BlockManager:
         # copy-transfer backend uses groups only as Active Slots; its immutable
         # checkpoint index owns arbitrary PAGE units through
         # `PageUnitCheckpointStore`.
-        transfer = StateTransfer.from_config(
-            getattr(config, "state_transfer_kind", "none") or "none",
-            int(getattr(config, "state_fork_tokens", 0) or 0),
-        )
+        transfer = state_transfer or StateTransfer.none()
         self.page_checkpoints: PageUnitCheckpointStore | None = None
         if transfer.copies:
             if paged_state_checkpoint_spec is None:
                 raise ValueError(
-                    "StateTransfer.copy() requires runtime paged-state geometry"
+                    "StateTransfer.copy(layout_id) requires runtime paged-state geometry"
+                )
+            if paged_state_checkpoint_spec.layout_id != transfer.paged_layout_id:
+                raise ValueError(
+                    "paged-state layout changed across runner and engine: "
+                    f"spec={paged_state_checkpoint_spec.layout_id!r}, "
+                    f"transfer={transfer.paged_layout_id!r}"
                 )
             self.page_checkpoints = PageUnitCheckpointStore(
                 self.kv,
@@ -127,7 +131,7 @@ class BlockManager:
             )
         elif paged_state_checkpoint_spec is not None:
             raise ValueError(
-                "runtime paged-state geometry requires StateTransfer.copy()"
+                "runtime paged-state geometry requires StateTransfer.copy(layout_id)"
             )
         self.state = StateGroupPool(
             self.num_per_req_cache_groups,

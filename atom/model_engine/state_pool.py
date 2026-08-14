@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import dataclass
 from heapq import heapify, heappop, heappush
 from math import inf
@@ -12,9 +13,8 @@ from atom.model_engine.page_unit_checkpoint import (
     PageUnitCheckpointStore,
 )
 
-# `StateTransfer.kind` values. Plain strings rather than an enum because the
-# choice crosses a process boundary inside a dict (ModelRunner's `block_info`),
-# where a scalar survives and a class does not.
+# `StateTransfer.kind` values. Plain strings keep the explicit runner RPC wire
+# representation language-neutral and easy to validate.
 FORK = "fork"
 COPY = "copy"
 NONE = "none"
@@ -32,26 +32,58 @@ class StateTransfer:
                   takes a fresh one, reading the old and writing the new for
                   exactly one forward — which has to leave the new group
                   self-contained, and that takes `n` committed tokens.
-      `copy()`    one request's state has a canonical byte stream that can be
-                  scattered into PAGE units and gathered into another Active
-                  Slot. Nothing is given away and no successor forward is bound.
+      `copy(id)`  one request's state has the versioned canonical byte layout
+                  `id`, which can be scattered into PAGE units and gathered
+                  into another Active Slot. Nothing is given away and no
+                  successor forward is bound.
 
     The two mechanisms are not interchangeable, and which one a backend can
-    offer decides where it may checkpoint. A fork's contract binds the *next*
-    forward, so it can only be taken where that forward is known to be long
-    enough — true on a prompt, false during generation, where a step commits
-    `1 + accepted_drafts` and acceptance is not knowable in advance. That is why
-    DeepSeek-V4 copies: it is the only way to checkpoint at a decode boundary.
-    See `/app/logs_claude/verify_v4_min_fork.py` for the arithmetic.
+    offer decides where it may checkpoint. A copy's layout id is part of that
+    capability rather than a second backend hook: the control plane, runner and
+    copy kernel must all agree on the same canonical byte stream. A fork's
+    contract binds the *next* forward, so it can only be taken where that
+    forward is known to be long enough — true on a prompt, false during
+    generation, where a step commits `1 + accepted_drafts` and acceptance is
+    not knowable in advance. That is why DeepSeek-V4 copies: it is the only way
+    to checkpoint at a decode boundary.
+
+    GDN recurrent state uses `fork(1)`: its kernels rewrite the destination
+    state whole, so one committed token leaves the new group self-contained.
+    DeepSeek-V4 uses `copy(layout_id)`: its arena and slot planes form one
+    canonical raw-byte stream, and a copy does not bind an unknowable successor
+    decode length. Those backend declarations are capability summaries; this
+    object is the complete scheduling and wire contract.
 
     These used to be one integer, `min_fork_tokens`, with 0 spelling `none()` —
-    which is exactly the value `copy()` has to report, so the two were
+    which is exactly the value `copy(id)` has to report, so the two were
     indistinguishable. Splitting the kind out is what lets a backend say "no
     successor needed" without saying "no state".
     """
 
     kind: str
     fork_tokens: int = 0
+    paged_layout_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.fork_tokens, int) or isinstance(self.fork_tokens, bool):
+            raise TypeError("fork_tokens must be an integer")
+        if self.kind == COPY:
+            if self.fork_tokens != 0:
+                raise ValueError("copy transfer cannot bind successor tokens")
+            if not isinstance(self.paged_layout_id, str) or not self.paged_layout_id:
+                raise ValueError("copy transfer requires a non-empty PAGE layout id")
+            return
+        if self.kind == FORK:
+            if self.fork_tokens <= 0:
+                raise ValueError("fork transfer requires positive fork_tokens")
+            if self.paged_layout_id is not None:
+                raise ValueError("fork transfer cannot declare a PAGE layout")
+            return
+        if self.kind == NONE:
+            if self.fork_tokens != 0 or self.paged_layout_id is not None:
+                raise ValueError("none transfer cannot carry tokens or a PAGE layout")
+            return
+        raise ValueError(f"unknown state transfer kind {self.kind!r}")
 
     @classmethod
     def none(cls) -> "StateTransfer":
@@ -59,20 +91,36 @@ class StateTransfer:
 
     @classmethod
     def fork(cls, tokens: int) -> "StateTransfer":
-        assert tokens > 0, "a fork binds its successor forward; use none()"
         return cls(FORK, tokens)
 
     @classmethod
-    def copy(cls) -> "StateTransfer":
-        return cls(COPY)
+    def copy(cls, layout_id: str) -> "StateTransfer":
+        return cls(COPY, paged_layout_id=layout_id)
+
+    def to_wire(self) -> dict[str, str | int | None]:
+        """Return the validated capability payload used by runner RPC."""
+        return {
+            "kind": self.kind,
+            "fork_tokens": self.fork_tokens,
+            "paged_layout_id": self.paged_layout_id,
+        }
 
     @classmethod
-    def from_config(cls, kind: str, fork_tokens: int) -> "StateTransfer":
-        """Rebuild from the two scalars that crossed the process boundary."""
-        if kind == FORK:
-            return cls.fork(fork_tokens)
-        assert kind in (COPY, NONE), f"unknown state transfer kind {kind!r}"
-        return cls(kind)
+    def from_wire(cls, wire: object) -> "StateTransfer":
+        """Rebuild and validate a capability received from another process."""
+        if not isinstance(wire, Mapping):
+            raise TypeError("state transfer capability must be a mapping")
+        expected = {"kind", "fork_tokens", "paged_layout_id"}
+        if set(wire) != expected:
+            raise ValueError(
+                "invalid state transfer capability fields: "
+                f"expected={sorted(expected)}, got={sorted(wire)}"
+            )
+        return cls(
+            kind=wire["kind"],  # type: ignore[arg-type]
+            fork_tokens=wire["fork_tokens"],  # type: ignore[arg-type]
+            paged_layout_id=wire["paged_layout_id"],  # type: ignore[arg-type]
+        )
 
     @property
     def copies(self) -> bool:

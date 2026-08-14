@@ -40,11 +40,11 @@ def build(num_spec: int):
 
 
 @pytest.mark.parametrize("num_spec", [0, 2])
-def test_copy_moves_every_layer_and_every_slot_of_the_group(num_spec):
+def test_relocation_moves_every_layer_and_every_slot_of_the_group(num_spec):
     stub, k, v, span = build(num_spec)
     before_k, before_v = k.clone(), v.clone()
 
-    GDNStateMixin.copy_state_entries(stub, [(1, 3)])
+    GDNStateMixin.relocate_state_slots(stub, [(1, 3)])
 
     src, dst = 1 * span, 3 * span
     assert torch.equal(k[:, dst : dst + span], before_k[:, src : src + span])
@@ -54,11 +54,11 @@ def test_copy_moves_every_layer_and_every_slot_of_the_group(num_spec):
     assert torch.equal(k[:, src : src + span], before_k[:, src : src + span])
 
 
-def test_copy_leaves_neighbouring_groups_alone():
+def test_relocation_leaves_neighbouring_groups_alone():
     stub, k, v, span = build(num_spec=2)
     before_k, before_v = k.clone(), v.clone()
 
-    GDNStateMixin.copy_state_entries(stub, [(1, 3)])
+    GDNStateMixin.relocate_state_slots(stub, [(1, 3)])
 
     for group in (0, 2):
         lo = group * span
@@ -70,7 +70,7 @@ def test_several_pairs_in_one_call():
     stub, k, _, span = build(num_spec=1)
     before_k = k.clone()
 
-    GDNStateMixin.copy_state_entries(stub, [(0, 2), (1, 3)])
+    GDNStateMixin.relocate_state_slots(stub, [(0, 2), (1, 3)])
 
     for src, dst in ((0, 2), (1, 3)):
         lo_s, lo_d = src * span, dst * span
@@ -81,7 +81,7 @@ def test_no_pairs_is_a_no_op():
     stub, k, v, _ = build(num_spec=2)
     before_k, before_v = k.clone(), v.clone()
 
-    GDNStateMixin.copy_state_entries(stub, [])
+    GDNStateMixin.relocate_state_slots(stub, [])
 
     assert torch.equal(k, before_k)
     assert torch.equal(v, before_v)
@@ -98,7 +98,7 @@ def test_a_group_is_not_one_slot_when_speculating():
     assert span == 3
     before_k = k.clone()
 
-    GDNStateMixin.copy_state_entries(stub, [(0, 2)])
+    GDNStateMixin.relocate_state_slots(stub, [(0, 2)])
 
     for offset in range(span):
         assert torch.equal(k[:, 2 * span + offset], before_k[:, offset])
