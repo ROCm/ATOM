@@ -52,6 +52,15 @@ class StateOffloadIndex:
         # prefix can also come back: `resumable_hit` scans `block_hashes`, which
         # `can_allocate` builds from HBM `kv.lookup` hits only. With KV offload
         # off, a hash whose KV left HBM never reappears and the bytes are wasted.
+        #
+        # In production today this is always True: `BlockManager.__init__`
+        # refuses to construct the index at all when the connector does not
+        # host the tier, so the only path here has already established it. The
+        # flag is kept, and the `unindex` gate with it, because the two
+        # conditions are independent in principle -- a future connector could
+        # host the tier's transport without offloading KV -- and because the
+        # failure it prevents (spending LMCache capacity on hashes no load can
+        # ever reach) is silent. Its False arm is covered by tests only.
         self.kv_offload_enabled = bool(kv_offload_enabled)
         self.hashes: set[int] = set()
         self._free_slots: deque[int] = deque(range(self.staging_depth))
