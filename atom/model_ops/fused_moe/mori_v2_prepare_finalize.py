@@ -7,12 +7,26 @@ gfx1250-capable cco/FlyDSL implementation. This module wires it into ATOM's
 FusedMoEModularKernel as a drop-in replacement for MoriPrepareAndFinalize,
 gated by ``ATOM_MORI_V2=1``.
 
-Pipeline (mirrors the validated standalone test_moe_layer_ep.py):
+Pipeline of the gather transport (mirrors the validated standalone
+test_moe_layer_ep.py):
     recv_x, recv_w, _, recv_idx, total_recv, routing = op.dispatch(
         a1, topk_weights, None, topk_ids, return_routing=True)
     dispatch_a1 = recv_x[:total_recv].clone()   # out of the cco VMM window
     fused_out = aiter.fused_moe(dispatch_a1, ...)   # driven by the modular kernel
     out, _ = op.combine(fused_out, routing=routing)
+
+Two transports sit behind the same prepare/finalize pair:
+
+  * ATOM_MORI_V2_FUSED=0 -- mori's own v2 op-layer, combine_mode="gather". The
+    untouched upstream baseline.
+  * ATOM_MORI_V2_FUSED=1 -- aiter's MegaMoEGfx1250, whose gemm2 epilogue
+    P2P-writes each weighted (token,k) result straight into the peers' combine
+    staging, so combine only barriers + sums. It owns the whole layer
+    (dispatch -> expert GEMM -> fused combine), so MoriV2ModularKernel hands it
+    the layer and returns its output; prepare()/finalize() are not reached and
+    the transport is configured, not bypassed -- the model-wide recipe
+    (activation, gate mode, quant type, padding, swiglu limit) is fixed at
+    construction and the per-layer weights/biases go to each forward().
 
 Shared experts are NOT fused in the mori EP+DP path (ATOM disables fusion there,
 see topK.is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config), so
@@ -30,7 +44,10 @@ import torch.distributed as dist
 
 import atom.model_ops.fused_moe.modular_kernel as mk
 from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
-from aiter import QuantType
+from atom.utils.forward_context import get_forward_context
+from aiter import ActivationType, QuantType
+from aiter.dist.parallel_state import get_dp_group
+from aiter.ops.flydsl.moe_common import GateMode
 
 try:
     import mori
@@ -50,13 +67,21 @@ EpDispatchCombineOp = None
 _V2_IMPORTED = False
 
 
-def _import_v2_from_aiter():
-    from aiter.ops.flydsl.dispatch_combine_v2 import (  # type: ignore
-        EpDispatchCombineConfig as _Cfg,
-        EpDispatchCombineOp as _Op,
+def _import_mega():
+    """The gemm2-fused transport, which lives in aiter rather than the op-layer.
+
+    aiter used to vendor its own copy of the v2 op-layer carrying the fused
+    combine (aiter.ops.flydsl.dispatch_combine_v2), since that mode is a contract
+    between the op and aiter's gemm2 epilogue. That copy is gone: it was
+    refactored into kernels.mega_moe_gfx1250, which widened the contract to the
+    whole layer -- dispatch, expert GEMM and combine are one object now, so ATOM
+    configures and calls it instead of interleaving its own steps with it.
+    """
+    from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import (  # type: ignore
+        MegaMoEGfx1250,
     )
 
-    return _Cfg, _Op
+    return MegaMoEGfx1250
 
 
 def _import_v2_from_mori():
@@ -83,65 +108,29 @@ def _import_v2_from_mori():
 
 
 def _import_v2() -> None:
-    """Bind the v2 op-layer; ATOM_MORI_V2_FUSED picks which of the two copies.
+    """Bind mori's v2 op-layer -- the non-fused (gather) baseline.
 
-    aiter vendors the op-layer plus its FlyDSL kernels
-    (aiter.ops.flydsl.dispatch_combine_v2) and is the only one carrying the
-    gemm2-fused combine, since that mode is a contract between the op and
-    aiter's gemm2 epilogue -- so FUSED=1 needs it. mori ships its own copy,
-    which tops out at combine_mode="scatter" and serves as the untouched
-    upstream baseline, so FUSED=0 binds that one. Either copy is preferred
-    rather than required: the other is still taken if it is the only one
-    installed. Only the cco communication substrate (mori.cco) always comes
-    from mori.
+    The gemm2-fused mode is no longer an op-layer combine_mode, so FUSED=1 does
+    not come through here at all: it binds aiter's MegaMoE instead (see
+    _import_mega). Only the cco communication substrate (mori.cco) is shared by
+    both transports.
     """
     global EpDispatchCombineConfig, EpDispatchCombineOp, _V2_IMPORTED
     if _V2_IMPORTED:
         return
     if not MORI_AVAILABLE:
         raise ImportError("mori is required for MoriV2PrepareAndFinalize")
+
+    EpDispatchCombineConfig, EpDispatchCombineOp = _import_v2_from_mori()
+    _V2_IMPORTED = True
+    logger.info("[MORI-V2] op-layer from mori (%s)", EpDispatchCombineOp.__module__)
+
+
+def _resolve_transport() -> str:
+    """"mega" when ATOM_MORI_V2_FUSED is on, else mori's plain gather op-layer."""
     from atom.utils import envs as _atom_envs
 
-    sources = [("aiter", _import_v2_from_aiter), ("mori", _import_v2_from_mori)]
-    if not _atom_envs.ATOM_MORI_V2_FUSED:
-        sources.reverse()
-
-    for name, load in sources:
-        try:
-            _Cfg, _Op = load()
-        except ImportError:
-            continue
-        EpDispatchCombineConfig = _Cfg
-        EpDispatchCombineOp = _Op
-        _V2_IMPORTED = True
-        logger.info("[MORI-V2] op-layer from %s (%s)", name, _Op.__module__)
-        return
-
-    raise ImportError(
-        "dispatch_combine_v2 op-layer not found in either aiter or mori"
-    )
-
-
-def _resolve_combine_mode() -> str:
-    """"scatter_fused" when ATOM_MORI_V2_FUSED is on and the op-layer supports it.
-
-    Falls back to plain gather with a warning rather than failing to serve, so an
-    environment whose op-layer predates the fused mode still starts.
-    """
-    from atom.utils import envs as _atom_envs
-
-    if not _atom_envs.ATOM_MORI_V2_FUSED:
-        return "gather"
-    _import_v2()
-    # is_fused only exists on the aiter-vendored config; mori's copy has no
-    # gemm2-fused mode and would reject the combine_mode outright.
-    if not hasattr(EpDispatchCombineConfig, "is_fused"):
-        logger.warning(
-            "[MORI-V2] ATOM_MORI_V2_FUSED=1 but aiter's v2 op-layer is unavailable "
-            "and the bound one has no gemm2-fused combine; falling back to gather."
-        )
-        return "gather"
-    return "scatter_fused"
+    return "mega" if _atom_envs.ATOM_MORI_V2_FUSED else "gather"
 
 
 @lru_cache(maxsize=1)
@@ -176,6 +165,128 @@ def _init_cco_comm(
     return comm
 
 
+def _cco_per_rank_vmm(
+    ep_size: int,
+    hidden_dim: int,
+    max_num_inp_token_per_rank: int,
+    itemsize: int,
+) -> int:
+    """Size the cco symmetric VMM for the worst-case all-to-all: every rank could
+    send all its tokens to one peer -> ws * M recv slots, plus a 2x headroom
+    (tokens + combine buffers) and a fixed slack, matching test_moe_layer_ep.py.
+
+    MegaMoE's arena needs strictly less than this (one recv-sized token buffer
+    plus an M*topk combine staging), so the same budget covers both transports.
+    """
+    tok_bytes = max_num_inp_token_per_rank * hidden_dim * itemsize
+    win_bytes = ep_size * tok_bytes * 2 + (1 << 24)
+    return 2 * win_bytes + (1 << 28)
+
+
+# Keyed by everything MegaMoE fixes at construction, so the MoE layers of one
+# model share a single instance -- and a single cco symmetric arena. Not an
+# lru_cache because the Situv2 betas are tensors and cannot be cache keys; they
+# are config-wide, so the first layer's are the model's.
+_MEGA_TRANSPORTS: dict = {}
+
+
+def init_mega_transport(
+    *,
+    ep_rank: int,
+    ep_size: int,
+    ep_src_global_rank: int,
+    hidden_dim: int,
+    max_num_inp_token_per_rank: int,
+    num_experts: int,
+    num_experts_per_token: int,
+    data_type_itemsize: int,
+    inter_dim: int,
+    activation: Any,
+    gate_mode: Any,
+    quant_type: Any,
+    hidden_pad: int,
+    intermediate_pad: int,
+    swiglu_limit: float,
+    situ_beta: torch.Tensor | None = None,
+    situ_linear_beta: torch.Tensor | None = None,
+) -> Any:
+    """Create (and share) the MegaMoE that runs every MoE layer of this model.
+
+    Everything here is per-model: the EP geometry, the cco arena, and the expert
+    GEMM recipe. Only the weights differ per layer and those are forward()
+    arguments, so one instance covers the whole model. Which dispatch kernel it
+    uses is aiter's own call (MEGA_DISPATCH=flydsl|mori).
+    """
+    key = (
+        ep_rank,
+        ep_size,
+        hidden_dim,
+        max_num_inp_token_per_rank,
+        num_experts,
+        num_experts_per_token,
+        inter_dim,
+        activation,
+        gate_mode,
+        quant_type,
+        hidden_pad,
+        intermediate_pad,
+        swiglu_limit,
+    )
+    cached = _MEGA_TRANSPORTS.get(key)
+    if cached is not None:
+        return cached
+
+    MegaMoEGfx1250 = _import_mega()
+    comm = _init_cco_comm(
+        ep_size,
+        ep_rank,
+        ep_src_global_rank,
+        _cco_per_rank_vmm(
+            ep_size, hidden_dim, max_num_inp_token_per_rank, data_type_itemsize
+        ),
+    )
+    mega = MegaMoEGfx1250(
+        communicator=comm,
+        rank=ep_rank,
+        world_size=ep_size,
+        model_dim=hidden_dim,
+        inter_dim=inter_dim,
+        experts=num_experts,
+        topk=num_experts_per_token,
+        max_tokens_per_rank=max_num_inp_token_per_rank,
+        activation=activation,
+        gate_mode=gate_mode,
+        quant_type=quant_type,
+        hidden_pad=hidden_pad,
+        intermediate_pad=intermediate_pad,
+        swiglu_limit=swiglu_limit,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+    )
+    comm.barrier()
+    _MEGA_TRANSPORTS[key] = mega
+    logger.info(
+        "[MORI-V2] Created MegaMoE: ep_rank=%d ep_size=%d hidden=%d inter=%d "
+        "experts=%d topk=%d M=%d act=%s gate=%s quant=%s pad=(%d,%d) "
+        "swiglu_limit=%s dispatch=%s",
+        ep_rank,
+        ep_size,
+        hidden_dim,
+        inter_dim,
+        num_experts,
+        num_experts_per_token,
+        max_num_inp_token_per_rank,
+        activation,
+        gate_mode,
+        quant_type,
+        hidden_pad,
+        intermediate_pad,
+        swiglu_limit,
+        mega._config.dispatch_backend,
+    )
+    return mega
+
+
 @lru_cache(maxsize=4)
 def init_mori_v2_op(
     ep_rank: int,
@@ -197,13 +308,9 @@ def init_mori_v2_op(
             data_type = dt
             break
 
-    # Size the cco symmetric VMM for the worst-case all-to-all: every rank could
-    # send all its tokens to one peer -> ws * M recv slots, plus a 2x headroom
-    # (tokens + combine buffers) and a fixed slack, matching test_moe_layer_ep.py.
-    tok_bytes = max_num_inp_token_per_rank * hidden_dim * data_type.itemsize
-    win_bytes = ep_size * tok_bytes * 2 + (1 << 24)
-    per_rank_vmm = 2 * win_bytes + (1 << 28)
-
+    per_rank_vmm = _cco_per_rank_vmm(
+        ep_size, hidden_dim, max_num_inp_token_per_rank, data_type.itemsize
+    )
     comm = _init_cco_comm(ep_size, ep_rank, ep_src_global_rank, per_rank_vmm)
 
     cfg = EpDispatchCombineConfig(
@@ -240,6 +347,7 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         mori_v2_op: Any,
         max_tokens_per_rank: int,
         num_dispatchers: int,
+        mega_geometry: dict | None = None,
     ):
         if not MORI_AVAILABLE:
             raise ImportError(
@@ -251,10 +359,47 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         self.num_dispatchers_ = num_dispatchers
         # Routing handle stashed between prepare() and finalize() of one forward.
         self._routing = None
-        self.is_fused = bool(getattr(mori_v2_op.cfg, "is_fused", False))
-        # gemm2 epilogue handles, refreshed per prepare() (the reverse map is
-        # per-routing). Read by the modular kernel between prepare and finalize.
-        self._ep_scatter_kwargs: dict = {}
+        # The fused transport's EP geometry; the rest of what MegaMoE fixes at
+        # construction only shows up on the layer -- see bind_mega_transport().
+        self._mega_geometry = mega_geometry
+        self.mega: Any = None
+        self.is_fused = mega_geometry is not None
+
+    def bind_mega_transport(self, layer: torch.nn.Module, quant_method: Any) -> None:
+        """Build the shared MegaMoE once the layer reveals the model-wide recipe.
+
+        Called from init_prepare_finalize, the one place that sees both the layer
+        and its quant method: the EP geometry is known when this object is built,
+        but the expert-GEMM recipe (activation, gate mode, quant type, padding,
+        swiglu limit) lives on those two. That hook also runs after weight
+        post-processing and before any cudagraph capture, which is where the cco
+        arena allocation and the FlyDSL JIT belong.
+        """
+        if self._mega_geometry is None or self.mega is not None:
+            return
+        inter_dim = getattr(quant_method, "intermediate_size", 0)
+        if inter_dim <= 0:
+            raise ValueError(
+                "the fused transport needs the per-partition intermediate size, "
+                f"got {inter_dim}; ATOM_MORI_V2_FUSED=1 requires the a8w4 "
+                "(Mxfp4MoEMethod) quant path."
+            )
+        self.mega = init_mega_transport(
+            **self._mega_geometry,
+            inter_dim=inter_dim,
+            activation=layer.activation,
+            gate_mode=(
+                GateMode.INTERLEAVE.value
+                if quant_method.is_guinterleave
+                else GateMode.SEPARATED.value
+            ),
+            quant_type=quant_method.quant_type,
+            hidden_pad=quant_method.hidden_pad,
+            intermediate_pad=quant_method.intermediate_pad,
+            swiglu_limit=float(getattr(layer, "swiglu_limit", 0.0)),
+            situ_beta=getattr(layer, "activation_situ_beta", None),
+            situ_linear_beta=getattr(layer, "activation_situ_linear_beta", None),
+        )
 
     @property
     def activation_format(self) -> mk.FusedMoEActivationFormat:
@@ -289,6 +434,9 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         assert (
             not apply_router_weight_on_input
         ), "mori does not support apply_router_weight_on_input=True now."
+        assert (
+            self.mega is None
+        ), "the fused transport runs the layer in MoriV2ModularKernel.forward()"
 
         # bf16 dispatch, no wire quant: scales=None. indices carry global expert
         # ids (0..global_num_experts-1); mori routes id -> rank = id // EPR.
@@ -300,14 +448,14 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             return_routing=True,
         )
         self._routing = routing
-        total_recv = int(total_recv_t.item())
-        self._ep_scatter_kwargs = self._make_ep_scatter_kwargs(routing)
 
-        # aiter FlyDSL kernels must not read cco symmetric VMM memory: clone the
-        # dispatched tokens/routing out of the arena window before the GEMM.
-        dispatch_a1 = recv_x[:total_recv].clone()
-        dispatch_ids = recv_idx[:total_recv].clone()
-        dispatch_weights = recv_w[:total_recv].clone()
+        # Capture-safe: do NOT call total_recv_t.item() (a GPU->CPU sync that is
+        # illegal during cudagraph capture). fused_moe is handed the FULL
+        # fixed-size arena buffers, aliased in place rather than sliced to the
+        # received count, so the shapes stay static across capture/replay.
+        dispatch_a1 = recv_x
+        dispatch_ids = recv_idx
+        dispatch_weights = recv_w
 
         # num_local_tokens is left unset (expert_num_tokens=None): the grouped
         # a8w4 path derives per-expert routing from the (already trimmed) global
@@ -323,33 +471,6 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             dispatch_weights,
         )
 
-    def _make_ep_scatter_kwargs(self, routing) -> dict:
-        """fused_moe kwargs that let the gemm2 epilogue P2P-write its weighted
-        per-(token,k) results straight into the peers' combine staging.
-
-        Empty unless the op runs combine_mode="scatter_fused". The staging is NOT
-        zeroed: that relies on gemm2 writing every (token,k) slot, so a dropped
-        route would let the combine sum read the previous forward's value.
-        """
-        if not self.is_fused:
-            return {}
-        params = self._op.ep_scatter_params()
-        return dict(
-            ep_scatter=True,
-            ep_arena_handle=params["ep_arena_handle"],
-            ep_comb_inp_off=params["ep_comb_inp_off"],
-            ep_wire_nbytes=params["ep_wire_nbytes"],
-            ep_rank=params["ep_rank"],
-            ep_max_tok=params["ep_max_tok"],
-            ep_topk=params["ep_topk"],
-            # recv-slot -> origin token, so gemm2 knows where each result lands.
-            ep_tis=routing.disp_tok_id_to_src_tok_id_local,
-        )
-
-    def ep_scatter_kwargs(self) -> dict:
-        """Extra fused_moe kwargs for this forward (empty when not fused)."""
-        return self._ep_scatter_kwargs
-
     def finalize(
         self,
         output: torch.Tensor,
@@ -361,23 +482,55 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         # topk_ids here is the ORIGINAL (pre-dispatch) routing, so shape[0] == ct.
         num_token = topk_ids.shape[0]
         assert self._routing is not None, "finalize() called before prepare()"
-        # Fused: gemm2 already wrote the results into the peers' staging, so
-        # combine() ignores fused_expert_output and only barriers + sums.
         out, _ = self._op.combine(fused_expert_output, routing=self._routing)
         self._routing = None
-        self._ep_scatter_kwargs = {}
         return out[:num_token]
 
 
 class MoriV2ModularKernel(mk.FusedMoEModularKernel):
-    """Modular kernel for the v2 path: prepare() already trims to the exact
-    received-token count, so skip the graph_bs-based dead-tail trim (which would
-    otherwise cut valid rows)."""
+    """Modular kernel for the v2 path.
 
-    def _extra_fused_moe_kwargs(self) -> dict:
-        pf = self.prepare_finalize
-        getter = getattr(pf, "ep_scatter_kwargs", None)
-        return getter() if getter is not None else {}
+    On the fused transport it steps out of the way: MegaMoE runs the whole layer,
+    so forward() hands it this layer's weights and returns its output instead of
+    walking prepare -> fused_moe -> finalize.
+
+    Both transports get the same grid shrink. The dispatch arena is padded to a
+    huge static token_num (ws * max_num_inp_token_per_rank) while the received
+    tokens occupy only the first ``total_recv`` rows, so under a uniform
+    all-ranks-decode batch it is capped at the static ``graph_bs * topk * dp``
+    bound (the V1/base policy): the grid-bound aiter kernels (route-ksplit
+    preshuffle, gather-reduce) then launch a grid sized to the decode bucket
+    instead of the full arena, and the single-block route/psum kernels shrink too.
+    Gather slices the buffers here; the fused path passes the bound down as
+    ``recv_token_bound`` because it never sees them.
+    """
+
+    def _decode_recv_bound(self, topk_ids: torch.Tensor, arena_rows: int) -> int | None:
+        """Static recv-row bound for a uniform decode batch, else None (no shrink).
+
+        Correctness / capture-safety:
+          * ``graph_bs`` is a python int, constant per captured cudagraph, so the
+            bound is static across capture/replay and no GPU->CPU sync is needed
+            (unlike reading the device ``total_recv``).
+          * Under uniform decode each of ``dp`` ranks holds ``graph_bs`` tokens,
+            each routed to ``topk`` experts; worst case every route lands on this
+            rank, so ``total_recv <= graph_bs * topk * dp``. The bound therefore
+            never drops a valid row, and the aiter kernels' device-side
+            ``num_valid_routes`` guard still skips the exact within-buffer tail
+            [total_recv, bound).
+          * Mixed/prefill batches keep the full arena, matching the base-class
+            guard.
+        """
+        context = get_forward_context().context
+        if context is None:
+            return None
+        all_ranks_decode = getattr(
+            context, "dp_uniform_decode", not context.is_prefill
+        )
+        if not all_ranks_decode:
+            return None
+        bound = context.graph_bs * topk_ids.shape[1] * get_dp_group().world_size
+        return bound if bound < arena_rows else None
 
     def _maybe_trim_dispatch_output(
         self,
@@ -388,7 +541,90 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
         topk_ids: torch.Tensor,
         expert_tokens_meta,
     ):
+        bound = self._decode_recv_bound(topk_ids, dispatch_a1.shape[0])
+        if bound is not None:
+            dispatch_a1 = dispatch_a1[:bound]
+            dispatch_ids = dispatch_ids[:bound]
+            dispatch_weights = dispatch_weights[:bound]
+            if dispatch_scale is not None:
+                dispatch_scale = dispatch_scale[:bound]
         return dispatch_a1, dispatch_scale, dispatch_ids, dispatch_weights
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        mega = self.prepare_finalize.mega
+        if mega is None:
+            return super().forward(
+                hidden_states, w1, w2, topk_weights, topk_ids, **kwargs
+            )
+
+        assert not kwargs.get(
+            "apply_router_weight_on_input", False
+        ), "mori does not support apply_router_weight_on_input=True now."
+        self._assert_recipe_matches(mega, kwargs)
+
+        return mega(
+            hidden_states.contiguous(),
+            topk_weights.to(torch.float32).contiguous(),
+            topk_ids.to(torch.int32).contiguous(),
+            w1=w1,
+            w2=w2,
+            w1_scale=kwargs.get("w1_scale"),
+            w2_scale=kwargs.get("w2_scale"),
+            bias1=kwargs.get("bias1"),
+            bias2=kwargs.get("bias2"),
+            a1_scale=kwargs.get("a1_scale"),
+            a2_scale=kwargs.get("a2_scale"),
+            recv_token_bound=self._decode_recv_bound(
+                topk_ids,
+                self.prepare_finalize.num_dispatchers() * mega.max_tokens_per_rank,
+            ),
+        )
+
+    @staticmethod
+    def _assert_recipe_matches(mega, kwargs: dict) -> None:
+        """Fail loudly if this layer's recipe is not the one MegaMoE was built with.
+
+        MegaMoE fixes the expert-GEMM recipe at construction, on the premise that
+        every MoE layer of a model shares it, while ATOM re-sends it per layer.
+        Comparing the two turns a violated premise into an error here rather than
+        into silently ignored arguments (a wrong swiglu_limit or gate mode still
+        produces plausible-looking logits).
+        """
+        extra = kwargs.get("moe_extra_args") or {}
+        actual = {
+            "activation": kwargs.get("activation", ActivationType.Silu),
+            "quant_type": kwargs.get("quant_type", QuantType.No),
+            "gate_mode": extra.get("gate_mode", GateMode.SEPARATED.value),
+            "swiglu_limit": float(extra.get("swiglu_limit", 0.0) or 0.0),
+            "hidden_pad": int(kwargs.get("hidden_pad", 0) or 0),
+            "intermediate_pad": int(kwargs.get("intermediate_pad", 0) or 0),
+        }
+        built = {
+            "activation": mega.activation,
+            "quant_type": mega.quant_type,
+            "gate_mode": mega.gate_mode,
+            "swiglu_limit": mega.swiglu_limit,
+            "hidden_pad": mega.hidden_pad,
+            "intermediate_pad": mega.intermediate_pad,
+        }
+        differing = {
+            name: (value, built[name])
+            for name, value in actual.items()
+            if value != built[name]
+        }
+        if differing:
+            raise ValueError(
+                "this layer's expert-GEMM recipe differs from the one MegaMoE was "
+                f"built with (this layer vs built): {differing}"
+            )
 
 
 def make_mori_v2_prepare_finalize(moe, all2all_manager) -> MoriV2PrepareAndFinalize:
@@ -397,20 +633,39 @@ def make_mori_v2_prepare_finalize(moe, all2all_manager) -> MoriV2PrepareAndFinal
 
     ep_group = get_ep_group()
     ep_src_global_rank = ep_group.ranks[0]
+    ep_size = all2all_manager.world_size
+
+    if _resolve_transport() == "mega":
+        # Geometry only; the expert-GEMM recipe comes from the layer later.
+        return MoriV2PrepareAndFinalize(
+            None,
+            max_tokens_per_rank=moe.max_num_tokens,
+            num_dispatchers=ep_size,
+            mega_geometry=dict(
+                ep_rank=all2all_manager.rank,
+                ep_size=ep_size,
+                ep_src_global_rank=ep_src_global_rank,
+                hidden_dim=moe.hidden_dim,
+                max_num_inp_token_per_rank=moe.max_num_tokens,
+                num_experts=moe.num_experts,
+                num_experts_per_token=moe.experts_per_token,
+                data_type_itemsize=moe.in_dtype.itemsize,
+            ),
+        )
 
     op = init_mori_v2_op(
         ep_rank=all2all_manager.rank,
-        ep_size=all2all_manager.world_size,
+        ep_size=ep_size,
         ep_src_global_rank=ep_src_global_rank,
         hidden_dim=moe.hidden_dim,
         max_num_inp_token_per_rank=moe.max_num_tokens,
-        num_local_experts=moe.num_experts // all2all_manager.world_size,
+        num_local_experts=moe.num_experts // ep_size,
         num_experts_per_token=moe.experts_per_token,
         data_type_itemsize=moe.in_dtype.itemsize,
-        combine_mode=_resolve_combine_mode(),
+        combine_mode="gather",
     )
     return MoriV2PrepareAndFinalize(
         op,
         max_tokens_per_rank=moe.max_num_tokens,
-        num_dispatchers=all2all_manager.world_size,
+        num_dispatchers=ep_size,
     )

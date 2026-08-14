@@ -764,6 +764,14 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 quant_config=self.moe_quant_config,
             )
 
+            # The v2 fused transport (MegaMoE) runs the whole layer, so it must be
+            # told the expert-GEMM recipe that only the layer + this quant method
+            # know. Here is also the last point before any cudagraph capture, and
+            # it allocates a cco arena and JIT-compiles its kernels.
+            bind_mega = getattr(prepare_finalize, "bind_mega_transport", None)
+            if bind_mega is not None:
+                bind_mega(layer, self)
+
     @property
     def using_modular_kernel(self) -> bool:
         return self.fused_experts is not None
