@@ -24,7 +24,11 @@ from atom.model_engine.page_unit_checkpoint import (
 )
 from atom.model_engine.sequence import Sequence
 from atom.model_engine.state_cache import StateCache
-from atom.model_engine.state_pool import StateGroupPool, StateTransfer
+from atom.model_engine.state_pool import (
+    StateGroupPool,
+    StateMaintenanceOps,
+    StateTransfer,
+)
 
 logger = logging.getLogger("atom")
 
@@ -199,11 +203,7 @@ class BlockManager:
         """
         self.state.release_pins()
 
-    def state_copies_for_batch(self) -> list[tuple[int, int]]:
-        """Active Slot relocation copies for the batch being built."""
-        return self.state.take_copies()
-
-    def state_transfers_for_batch(self) -> dict[str, list]:
+    def take_state_maintenance_ops(self) -> StateMaintenanceOps:
         """Drain every state-maintenance op into one scheduled batch.
 
         Keeping this one call is important for PAGE-backed checkpoints: their
@@ -211,13 +211,7 @@ class BlockManager:
         and are made READY only when the next scheduling pass confirms the
         batch carrying their scatter has been issued.
         """
-        copies = self.state.take_copies()
-        stores, restores = self.state.take_paged_ops()
-        return {
-            "state_copy_pairs": copies,
-            "checkpoint_store_ops": stores,
-            "checkpoint_restore_ops": restores,
-        }
+        return self.state.take_state_maintenance_ops()
 
     def _record_evicted(self, h: int) -> None:
         """A hash the block pool just dropped: report it, and settle the state.

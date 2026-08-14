@@ -133,9 +133,9 @@ class Sequence:
         # Content hash of a boundary this seq's last forward landed on and whose
         # state is worth keeping, for state classes that checkpoint by copying
         # (`StateGroupPool.checkpoint`). The copy needs a forward to issue it, so
-        # the intent outlives the step that formed it; `StateGroupPool.take_copies`
-        # turns it into a destination group and a copy pair when the next batch
-        # is built.
+        # the intent outlives the step that formed it;
+        # `StateGroupPool.take_state_maintenance_ops` turns it into a typed PAGE
+        # checkpoint store when the next real batch is built.
         # -1 = nothing pending, which is also what `deallocate` restores.
         self.pending_checkpoint = -1
         self.temperature = sampling_params.temperature

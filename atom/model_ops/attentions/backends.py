@@ -500,11 +500,12 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         # stream before the forward. This is the one place every path — prefill,
         # decode, dummy, DP-sync, PP microbatch, TBO — passes through exactly
         # once per batch.
-        if batch.state_copy_pairs:
-            self.relocate_state_slots(batch.state_copy_pairs)
-        if batch.checkpoint_store_ops or batch.checkpoint_restore_ops:
+        state_ops = batch.state_maintenance_ops
+        if state_ops.relocations:
+            self.relocate_state_slots(state_ops.relocations)
+        if state_ops.checkpoint_stores or state_ops.checkpoint_restores:
             self.execute_paged_state_copies(
-                batch.checkpoint_store_ops, batch.checkpoint_restore_ops
+                state_ops.checkpoint_stores, state_ops.checkpoint_restores
             )
         is_prefill = batch.total_tokens_num_prefill > 0
         if is_prefill:

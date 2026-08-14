@@ -137,6 +137,29 @@ class StateTransfer:
 
 
 @dataclass(frozen=True)
+class StateMaintenanceOps:
+    """All state movement that must run before one model batch.
+
+    ``relocations`` move one contiguous Active Slot to another.  Checkpoint
+    stores scatter an Active Slot into arbitrary PAGE units, while checkpoint
+    restores gather those units into an Active Slot.  Keeping the three
+    directions in one immutable bundle gives scheduling one drain point: an
+    operation can neither ride a different batch nor be accidentally drained
+    twice by independent consumers.
+    """
+
+    relocations: tuple[tuple[int, int], ...] = ()
+    checkpoint_stores: tuple[CheckpointStoreOp, ...] = ()
+    checkpoint_restores: tuple[CheckpointRestoreOp, ...] = ()
+
+    @property
+    def empty(self) -> bool:
+        return not (
+            self.relocations or self.checkpoint_stores or self.checkpoint_restores
+        )
+
+
+@dataclass(frozen=True)
 class GroupRetirement:
     """What `retire_top` did, and what the caller still owes.
 
@@ -613,11 +636,6 @@ class StateGroupPool:
         """Schedule an Active Slot relocation for the next batch."""
         self._copies.append((src, dst))
 
-    def take_copies(self) -> list[tuple[int, int]]:
-        """Drain Active Slot relocations; checkpoint copies are typed PAGE ops."""
-        copies, self._copies = self._copies, []
-        return copies
-
     def record_restore(self, h: int, dst: int) -> bool:
         """Pin a PAGE-backed checkpoint and queue its gather into `dst`."""
         assert self.page_checkpoints is not None
@@ -627,15 +645,18 @@ class StateGroupPool:
         self._paged_restore_ops.append(op)
         return True
 
-    def take_paged_ops(
-        self,
-    ) -> tuple[list[CheckpointStoreOp], list[CheckpointRestoreOp]]:
-        """PAGE-unit store/restore ops for the batch now being built."""
+    def take_state_maintenance_ops(self) -> StateMaintenanceOps:
+        """Drain every state move for the one real batch now being built."""
         if self.page_checkpoints is not None:
             self._commit_paged_pending()
+        relocations, self._copies = self._copies, []
         stores, self._paged_store_ops = self._paged_store_ops, []
         restores, self._paged_restore_ops = self._paged_restore_ops, []
-        return stores, restores
+        return StateMaintenanceOps(
+            relocations=tuple(relocations),
+            checkpoint_stores=tuple(stores),
+            checkpoint_restores=tuple(restores),
+        )
 
     def forget_pending(self, seq) -> None:
         """Drop `seq`'s uncommitted checkpoint before releasing its slot."""

@@ -31,7 +31,7 @@ from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
-from atom.model_engine.state_pool import StateTransfer
+from atom.model_engine.state_pool import StateMaintenanceOps, StateTransfer
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -320,10 +320,8 @@ class ScheduledBatch:
         num_spec_step: Number of speculative decode steps (0 = disabled).
         scheduled_spec_decode_tokens: Draft token IDs per request for
             speculative decoding (must not use a mutable default).
-        state_copy_pairs: (src, dst) Active Slot relocations this batch must
-            perform before running.
-        checkpoint_store_ops: Active Slot -> ordered PAGE-unit checkpoint ops.
-        checkpoint_restore_ops: ordered PAGE-unit checkpoint -> Active Slot ops.
+        state_maintenance_ops: Active Slot relocations and PAGE checkpoint
+            scatter/gather operations that must execute before this batch.
     """
 
     def __init__(
@@ -346,9 +344,7 @@ class ScheduledBatch:
         num_cached_tokens: list[int] | None = None,
         is_final_chunk: list[bool] | None = None,
         next_token_ids: list[int] | None = None,
-        state_copy_pairs: list[tuple[int, int]] | None = None,
-        checkpoint_store_ops: list | None = None,
-        checkpoint_restore_ops: list | None = None,
+        state_maintenance_ops: StateMaintenanceOps | None = None,
     ):
         if scheduled_spec_decode_tokens is None:
             scheduled_spec_decode_tokens = {}
@@ -384,15 +380,15 @@ class ScheduledBatch:
             for seq in seqs.values()
             if seq.has_per_req_cache and seq.per_req_cache_group >= 0
         ]
-        # (src, dst) state groups this batch's forward must duplicate before it
-        # runs — the copy twin of `state_fork_srcs`, for backends that checkpoint
-        # by copying. Not per-seq: a copy is between two pool slots and needs no
-        # alignment with anything else on the batch. Passed in rather than read
-        # off the seqs because both halves (checkpoint taken, checkpoint resumed
-        # from) accumulate in the pool during this pass.
-        self.state_copy_pairs = state_copy_pairs or []
-        self.checkpoint_store_ops = checkpoint_store_ops or []
-        self.checkpoint_restore_ops = checkpoint_restore_ops or []
+        # Not per-seq: these physical moves accumulate in the state pool while
+        # scheduling, then ride exactly one real forward as a single typed
+        # bundle. Fork sources remain positionally aligned above because they
+        # are logical inputs to individual sequences rather than maintenance.
+        self.state_maintenance_ops = (
+            state_maintenance_ops
+            if state_maintenance_ops is not None
+            else StateMaintenanceOps()
+        )
         self.top_ks = np.asarray([seq.top_k for seq in seqs.values()], dtype=np.int32)
         self.top_ps = np.asarray([seq.top_p for seq in seqs.values()], dtype=np.float32)
         # True if any seq in the batch is a fan-out child (SamplingParams.n>1)
@@ -1378,7 +1374,7 @@ class Scheduler:
                 num_cached_tokens=num_cached_tokens_list,
                 is_final_chunk=is_final_chunk,
                 next_token_ids=next_token_ids,
-                **self.block_manager.state_transfers_for_batch(),
+                state_maintenance_ops=self.block_manager.take_state_maintenance_ops(),
             )
             self._consume_state_forks(scheduled_seqs)
 
@@ -1504,8 +1500,10 @@ class Scheduler:
             # would read the previous occupant's state, the exact #1417 shape
             # the copies exist to prevent. Leave them pending for the next
             # batch that actually runs.
-            **(
-                self.block_manager.state_transfers_for_batch() if scheduled_seqs else {}
+            state_maintenance_ops=(
+                self.block_manager.take_state_maintenance_ops()
+                if scheduled_seqs
+                else None
             ),
         )
         self._consume_state_forks(scheduled_seqs)
@@ -2991,10 +2989,10 @@ class DecodeScheduler(Scheduler):
                 num_spec_step=self.mtp_k,
                 scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
                 cu_stream_fraction=self.cu_fraction,
-                # The other half of the pair above: queued copies have to reach
-                # a batch or the group they were filed under holds the previous
-                # occupant's state.
-                **self.block_manager.state_transfers_for_batch(),
+                # The other half of the pair above: queued state maintenance
+                # has to reach a real batch or a destination can still hold its
+                # previous occupant's state.
+                state_maintenance_ops=self.block_manager.take_state_maintenance_ops(),
             ),
             scheduled_seqs,
         )

@@ -6,7 +6,7 @@ import pickle
 
 import pytest
 
-from atom.model_engine.state_pool import StateTransfer
+from atom.model_engine.state_pool import StateMaintenanceOps, StateTransfer
 
 
 def test_wire_round_trip_keeps_the_complete_capability():
@@ -53,3 +53,14 @@ def test_wire_shape_is_exact():
                 "other": 1,
             }
         )
+
+
+def test_state_maintenance_bundle_is_typed_and_immutable():
+    empty = StateMaintenanceOps()
+    populated = StateMaintenanceOps(relocations=((1, 2), (3, 4)))
+
+    assert empty.empty
+    assert not populated.empty
+    assert populated.relocations == ((1, 2), (3, 4))
+    with pytest.raises(AttributeError):
+        populated.relocations = ()

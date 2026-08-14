@@ -21,13 +21,19 @@ from conftest import MockConfig
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.page_unit_checkpoint import (
+    CheckpointRestoreOp,
+    CheckpointStoreOp,
     PagedStateCheckpointSpec,
     PageUnitCheckpointStore,
 )
 from atom.model_engine.scheduler import CacheStats, ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import Sequence, SequenceType
 from atom.model_engine.state_cache import StateCache
-from atom.model_engine.state_pool import StateGroupPool, StateTransfer
+from atom.model_engine.state_pool import (
+    StateGroupPool,
+    StateMaintenanceOps,
+    StateTransfer,
+)
 
 BLOCK = 4
 MIN_FORK = 8
@@ -917,6 +923,65 @@ class TestPagedCopyCheckpoint:
                 paged_state_checkpoint_spec=PAGED_COPY_SPEC,
             )
 
+    def test_empty_batch_does_not_drain_state_maintenance(self):
+        scheduler = make_scheduler(
+            paged_copy_config(state_checkpoint_interval_tokens=0),
+            state_transfer=PAGED_COPY_TRANSFER,
+            paged_state_checkpoint_spec=PAGED_COPY_SPEC,
+        )
+        scheduler.block_manager.state.record_copy(1, 2)
+
+        batch, scheduled = scheduler.schedule()
+
+        assert scheduled == {}
+        assert batch.state_maintenance_ops.empty
+        pending = scheduler.block_manager.take_state_maintenance_ops()
+        assert pending.relocations == ((1, 2),)
+        assert scheduler.block_manager.take_state_maintenance_ops().empty
+
+    def test_real_batch_drains_all_state_maintenance_once(self):
+        scheduler = make_scheduler(
+            paged_copy_config(state_checkpoint_interval_tokens=0),
+            state_transfer=PAGED_COPY_TRANSFER,
+            paged_state_checkpoint_spec=PAGED_COPY_SPEC,
+        )
+        store = CheckpointStoreOp(
+            checkpoint_id=11,
+            generation=12,
+            prefix_hash=13,
+            src_slot=1,
+            unit_ids=(21, 22, 23),
+            total_bytes=25,
+            last_unit_valid_bytes=5,
+            layout_id=PAGED_COPY_SPEC.layout_id,
+        )
+        restore = CheckpointRestoreOp(
+            checkpoint_id=31,
+            generation=32,
+            prefix_hash=33,
+            dst_slot=2,
+            unit_ids=(41, 42, 43),
+            total_bytes=25,
+            last_unit_valid_bytes=5,
+            layout_id=PAGED_COPY_SPEC.layout_id,
+        )
+        scheduler.block_manager.state.record_copy(3, 4)
+        scheduler.block_manager.state._paged_store_ops.append(store)
+        scheduler.block_manager.state._paged_restore_ops.append(restore)
+        scheduler.add(stateful_seq(list(range(BLOCK))))
+
+        batch, scheduled = scheduler.schedule()
+
+        assert scheduled
+        assert batch.state_maintenance_ops == StateMaintenanceOps(
+            relocations=((3, 4),),
+            checkpoint_stores=(store,),
+            checkpoint_restores=(restore,),
+        )
+        assert scheduler.block_manager.take_state_maintenance_ops().empty
+        assert not hasattr(scheduler.block_manager, "state_copies_for_batch")
+        assert not hasattr(scheduler.block_manager, "state_transfers_for_batch")
+
     def test_checkpoint_uses_page_units_not_an_active_slot(self):
         bm = make_block_manager(
             paged_copy_config(),
@@ -929,9 +994,9 @@ class TestPagedCopyCheckpoint:
         bm.hash_blocks(seq, bm.checkpoint_limit(seq) - seq.num_cached_tokens)
         h = boundary_hash(bm, seq)
 
-        transfers = bm.state_transfers_for_batch()
-        assert transfers["state_copy_pairs"] == []
-        assert len(transfers["checkpoint_store_ops"]) == 1
+        transfers = bm.take_state_maintenance_ops()
+        assert transfers.relocations == ()
+        assert len(transfers.checkpoint_stores) == 1
         assert bm.state.num_free() == free_slots
         assert bm.kv.num_free == free_pages - 3
         assert bm.state.lookup(h) == -1  # COPYING is deliberately invisible.
@@ -948,17 +1013,17 @@ class TestPagedCopyCheckpoint:
         first = self._admitted(bm)
         bm.hash_blocks(first, bm.checkpoint_limit(first) - first.num_cached_tokens)
         h = boundary_hash(bm, first)
-        store = bm.state_transfers_for_batch()["checkpoint_store_ops"][0]
+        store = bm.take_state_maintenance_ops().checkpoint_stores[0]
         bm.release_state_pins()
 
         second = stateful_seq(list(range(48)))
         hit = bm.can_allocate(second)
         assert hit > 0
         bm.allocate(second, hit)
-        transfers = bm.state_transfers_for_batch()
-        assert transfers["checkpoint_store_ops"] == []
-        assert len(transfers["checkpoint_restore_ops"]) == 1
-        restore = transfers["checkpoint_restore_ops"][0]
+        transfers = bm.take_state_maintenance_ops()
+        assert transfers.checkpoint_stores == ()
+        assert len(transfers.checkpoint_restores) == 1
+        restore = transfers.checkpoint_restores[0]
         assert restore.unit_ids == store.unit_ids
         assert restore.dst_slot == second.per_req_cache_group
         assert second.state_fork_src == -1
