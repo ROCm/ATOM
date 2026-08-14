@@ -197,12 +197,17 @@ one reader:
 
 ## 10. Verification
 
-- Full CPU suite: **1339 passed**, 1 pre-existing failure
-  (`test_state_spill_copy_order`, an `aiter` import in this sandbox, fails
-  identically on the base commit).
+- Full CPU suite: **1342 passed**, 1 failure — `test_state_spill_copy_order`,
+  an `aiter` import this sandbox cannot satisfy. Verified pre-existing by
+  running that file in a detached worktree at the base commit: identical
+  failure.
 - `black` and `ruff` clean on every changed file.
 - Each fix proven non-vacuous by reverting it and observing the expected
-  failure — including the floor (two tests) and the sizing split (the merged
-  tree's own `test_checkpoint_extra_entries_override_is_owned_by_state_pool`).
+  failure: the floor (two tests), the sizing split (the merged tree's own
+  `test_checkpoint_extra_entries_override_is_owned_by_state_pool`), both
+  spill/load collision guards, and the abort-leak fix.
+- Reviewed adversarially for correctness and for stale claims; the findings of
+  both passes are folded in, including §5, the abort leak, and the
+  never-attempted-load misclassification.
 - **GPU end-to-end validation has not been run.** See the plan's Task 9 for the
   precondition measurement and the counters to read.
