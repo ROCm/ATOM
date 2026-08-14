@@ -149,6 +149,10 @@ class CacheStats:
         "_interval_wanted_tokens",
         "_log_interval",
         "_pool_pressure",
+        "reqs_full_reuse",
+        "reqs_no_paged",
+        "reqs_state_miss",
+        "reqs_state_miss_recoverable",
         "total_cached_tokens",
         "total_compressed_tokens",
         "total_full_tokens",
@@ -184,6 +188,37 @@ class CacheStats:
         self._interval_full_tokens: int = 0
         self._interval_compressed_tokens: int = 0
         self._interval_wanted_tokens: int = 0
+        # Per-request frequencies, cumulative. The token totals above answer
+        # "how much reuse was lost"; these answer "how often, and to which
+        # pool" -- a question a token ratio cannot, because one 275k-token
+        # conversation can outweigh fifty short ones and make a rare failure
+        # look like the common case.
+        #
+        # NOT mutually exclusive, and deliberately so: one request can lose
+        # tokens at both pools (the paged prefix ran out early AND a
+        # checkpoint was missing below where it ended), so forcing it into a
+        # single bucket would have to pick a winner and would undercount
+        # whichever lost. They do not sum to `total_requests`.
+        #
+        #   full_reuse    cached == full. Everything was reused -- or there
+        #                 was nothing to reuse, since a cold first turn also
+        #                 lands here. Read it with the token totals.
+        #   state_miss_recoverable
+        #                 cached < wanted: a checkpoint at that boundary would
+        #                 have unlocked reuse the paged pool was still
+        #                 holding. The state cache's own miss, and the only
+        #                 counter that argues for spending bytes on groups.
+        #   state_miss    cached < compressed: the paged pool had more prefix
+        #                 than the state gates would admit, for any reason.
+        #                 Superset of the above; the difference is the part no
+        #                 checkpoint could have fixed.
+        #   no_paged      compressed < full: the paged pool did not have the
+        #                 prefix. State-cache tuning is powerless here -- this
+        #                 is KV capacity, eviction, or a genuinely new prefix.
+        self.reqs_full_reuse: int = 0
+        self.reqs_state_miss_recoverable: int = 0
+        self.reqs_state_miss: int = 0
+        self.reqs_no_paged: int = 0
 
     def update(
         self,
@@ -210,6 +245,19 @@ class CacheStats:
         self._interval_compressed_tokens += num_compressed_tokens
         self._interval_wanted_tokens += num_wanted_tokens
 
+        # Which pool cost this request reuse. Counted here rather than derived
+        # at log time because the per-request shape is gone by then: the
+        # totals cannot say whether 10% lost tokens was every request losing a
+        # tenth or a tenth of requests losing everything.
+        if num_cached_tokens >= num_full_tokens:
+            self.reqs_full_reuse += 1
+        if num_cached_tokens < num_wanted_tokens:
+            self.reqs_state_miss_recoverable += 1
+        if num_cached_tokens < num_compressed_tokens:
+            self.reqs_state_miss += 1
+        if num_compressed_tokens < num_full_tokens:
+            self.reqs_no_paged += 1
+
         if self.total_requests % self._log_interval == 0:
             self._log()
             self._reset_interval()
@@ -233,6 +281,12 @@ class CacheStats:
             "compressed_tokens": self.total_compressed_tokens,
             "wanted_tokens": self.total_wanted_tokens,
             "full_tokens": self.total_full_tokens,
+            # Request counts, summable across DP ranks for the same reason the
+            # token counts are. Not mutually exclusive -- see `__init__`.
+            "reqs_full_reuse": self.reqs_full_reuse,
+            "reqs_state_miss": self.reqs_state_miss,
+            "reqs_state_miss_recoverable": self.reqs_state_miss_recoverable,
+            "reqs_no_paged": self.reqs_no_paged,
         }
 
     def _reset_interval(self) -> None:
@@ -274,8 +328,40 @@ class CacheStats:
             self.total_wanted_tokens,
             self.total_full_tokens,
         )
+        self._log_frequency()
         if self._pool_pressure is not None:
             self._log_pressure(self._pool_pressure())
+
+    def _log_frequency(self) -> None:
+        """How OFTEN each pool cost a request reuse, against how much.
+
+        The `[Cache Stats]` line above is token-weighted, so a handful of
+        275k-token conversations decide it. This one is request-weighted, and
+        the two disagreeing is itself the finding: a low hit rate with a low
+        `state-miss` count is a few enormous requests missing, not a broad
+        failure, and wants a different fix.
+
+        `paged-match+state-miss` is the decisive one for sizing the state
+        pool. It counts requests where the paged pool still had the prefix and
+        only the missing checkpoint stood between the request and reuse --
+        state-cache capacity is the binding constraint exactly to the extent
+        this is large. When `no-paged` dominates instead, no amount of
+        checkpoint tuning helps, because the prefix itself is gone.
+        """
+        n = self.total_requests
+        logger.info(
+            "[Cache Freq] "
+            f"Reqs: {n}, "
+            f"full-reuse: {self.reqs_full_reuse} "
+            f"({self._rate(self.reqs_full_reuse, n):.1%}), "
+            f"paged-match+state-miss: {self.reqs_state_miss} "
+            f"({self._rate(self.reqs_state_miss, n):.1%}), "
+            f"  of which a checkpoint would fix: "
+            f"{self.reqs_state_miss_recoverable} "
+            f"({self._rate(self.reqs_state_miss_recoverable, n):.1%}), "
+            f"paged-miss: {self.reqs_no_paged} "
+            f"({self._rate(self.reqs_no_paged, n):.1%})"
+        )
 
     @staticmethod
     def _log_pressure(p: dict[str, int]) -> None:

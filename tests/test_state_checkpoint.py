@@ -2007,6 +2007,46 @@ class TestCacheStatsAttribution:
         assert lost_hard == 4
         assert lost_to_checkpoint + lost_hard == 40 - 32
 
+    def test_each_pool_is_counted_where_it_cost_the_request_reuse(self):
+        """`cached <= wanted <= compressed <= full`, one request per case.
+
+        Request-weighted, because the token totals are decided by the largest
+        conversations and cannot say whether a loss was broad or concentrated.
+        """
+        stats = CacheStats(log_interval=10**6)
+        # Everything reusable was reused.
+        stats.update(44, 44, 44, 44)
+        # Paged pool had it; a checkpoint at that boundary would have unlocked
+        # it. The state cache's own miss.
+        stats.update(32, 44, 44, 40)
+        # Paged pool had it, but nothing a checkpoint reaches: wanted == cached.
+        stats.update(32, 44, 40, 32)
+        # The prefix itself was absent -- state tuning is powerless.
+        stats.update(20, 44, 20, 20)
+
+        assert stats.reqs_full_reuse == 1
+        assert stats.reqs_state_miss_recoverable == 1
+        # Superset: both middle requests had paged prefix the gates declined.
+        assert stats.reqs_state_miss == 2
+        assert stats.reqs_no_paged == 2  # the absent-prefix one, and case 3
+
+    def test_a_request_losing_at_both_pools_is_counted_at_both(self):
+        """The buckets overlap on purpose.
+
+        A prompt whose paged prefix ran out early *and* whose remaining reuse
+        needed a checkpoint has two independent problems. Charging it to one
+        pool would undercount the other and point sizing at the wrong one, so
+        the counters are not required to sum to the request count.
+        """
+        stats = CacheStats(log_interval=10**6)
+        stats.update(20, 100, 60, 40)  # cached < wanted < compressed < full
+        assert stats.reqs_state_miss_recoverable == 1
+        assert stats.reqs_no_paged == 1
+        assert stats.reqs_full_reuse == 0
+        assert (
+            stats.reqs_state_miss + stats.reqs_no_paged > stats.total_requests
+        ), "buckets must be free to overlap"
+
     def test_hit_tokens_are_counted_in_hash_blocks(self):
         """Under DCP one block_table entry spans `dcp` blocks of tokens."""
         sched = make_scheduler(demand_config(decode_context_parallel_size=2))
