@@ -282,17 +282,6 @@ class FusedMoEModularKernel(torch.nn.Module):
                 output = result()
         return output
 
-    def _extra_fused_moe_kwargs(self) -> dict:
-        """Extra kwargs for the fused_moe call, contributed by the prepare/finalize
-        pair rather than the quant method.
-
-        Empty for every all2all backend whose expert GEMM is self-contained. The
-        v2 gemm2-fused EP combine needs it: its gemm2 epilogue writes into the
-        combine staging, so it must be handed the arena handles that only the
-        dispatch side knows.
-        """
-        return {}
-
     def _maybe_trim_dispatch_output(
         self,
         dispatch_a1: torch.Tensor,
@@ -406,7 +395,6 @@ class FusedMoEModularKernel(torch.nn.Module):
         # gate_mode=INTERLEAVE + swiglu_limit) are forwarded verbatim from the
         # quant method's apply() via `moe_extra_args`.
         extra_kwargs = dict(moe_extra_args or {})
-        extra_kwargs.update(self._extra_fused_moe_kwargs())
         fused_out = fused_moe(
             dispatch_a1,
             w1,
