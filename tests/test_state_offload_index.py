@@ -321,6 +321,18 @@ def test_a_negative_depth_is_floored_to_zero(monkeypatch):
     assert state_offload_staging_groups() == 0
 
 
+def test_a_negative_depth_is_not_silent(monkeypatch, caplog):
+    """Louder than the `banana` case deserves to be, not quieter. `banana`
+    costs you 1 group instead of 20; `-3` returns 0, which is the same value
+    `OFFLOAD_STATE=0` returns -- the tier is off entirely while the flag says
+    on, and the only symptom is a server that never spills."""
+    monkeypatch.setenv("OFFLOAD_STATE", "1")
+    monkeypatch.setenv("OFFLOAD_STATE_STAGING_GROUPS", "-3")
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        assert state_offload_staging_groups() == 0
+    assert "-3" in caplog.text
+
+
 class OnlyStateCaches:
     """`state_spills_for_batch` reads `self.state_caches` and nothing else."""
 

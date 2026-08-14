@@ -187,10 +187,16 @@ def state_offload_staging_groups() -> int:
     the arena would be short exactly the rows the spill path addresses.
 
     Truthiness follows the offload module's own convention
-    (`staged_transfer.py:_env_flag`, `connector.py:284`) rather than an
+    (`staged_transfer.py:_env_flag`) rather than an
     equality against "1": someone who exports `OFFLOAD_STATE=true` means to
     turn the tier on, and a silent 0 gives them a server that looks healthy
     and never spills.
+
+    Both bad depths warn rather than raise, because this runs during model
+    load: a non-integer falls back to 1, and a negative floors to 0. The
+    negative case is the louder of the two even though it looks milder --
+    0 is what `OFFLOAD_STATE=0` returns, so the tier is off outright while the
+    flag says on.
 
     Stripped, and empty reads as off -- for a default-off feature the
     dangerous direction is the other one: `OFFLOAD_STATE=` (how a shell script
@@ -204,7 +210,7 @@ def state_offload_staging_groups() -> int:
     if raw is None:
         return 1
     try:
-        return max(0, int(raw))
+        depth = int(raw)
     except ValueError:
         # Warn rather than raise: this runs during model load, and a typo must
         # not be fatal. It must not be silent either -- a mistyped depth buys
@@ -215,3 +221,15 @@ def state_offload_staging_groups() -> int:
             raw,
         )
         return 1
+    if depth < 0:
+        # Same reasoning as the typo above, and a worse outcome: a negative
+        # depth turns the whole tier off even though OFFLOAD_STATE says on, so
+        # the operator gets the healthy-looking server that never spills. Loud
+        # for the same reason `banana` is.
+        logger.warning(
+            "state offload: negative OFFLOAD_STATE_STAGING_GROUPS=%r disables "
+            "the tier entirely; using 0",
+            raw,
+        )
+        return 0
+    return depth

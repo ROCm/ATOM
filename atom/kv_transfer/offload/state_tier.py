@@ -2,7 +2,8 @@
 """Worker-side spill and load driver for the state offload tier.
 
 Its own executor, separate from the KV connector's `_load_executor` and
-`_save_executor`. The reason is the one recorded at `connector.py:83-88`: a
+`_save_executor`. The reason is the one recorded where those two are built
+(`LMCacheOffloadConnector.__init__`): a
 load is on the TTFT critical path -- a parked sequence is waiting for it --
 and must never queue behind a backlog of fire-and-forget spills.
 
@@ -69,7 +70,7 @@ class StateOffloadTier:
         `AttentionBackend.build()` issued on the forward's compute stream.
         This worker packs on its own stream, so without the wait it reads the
         staging entry's previous occupant. Same reasoning, same shape as the
-        KV path's `save_ready_event` (`connector.py:236-240`).
+        KV path's `save_ready_event` (`connector.py`, `start_load_kv`).
         """
         fut = self._executor.submit(
             self._do_spill, h, entry_index, staging_slot, ready_event
@@ -241,7 +242,8 @@ class _JointPark:
 def should_load_state(hit_tokens: int, floor_tokens: int) -> bool:
     """Whether a state hit of `hit_tokens` is worth an H2D.
 
-    Mirrors KV's OFFLOAD_MIN_LOAD_TOKENS (`connector.py:526`). Two jobs: a
+    Mirrors KV's OFFLOAD_MIN_LOAD_TOKENS (read in the scheduler-side connector,
+    `connector.py`). Two jobs: a
     short prefix does not repay the round trip, and the same floor bounds what
     a false positive costs -- the index cannot know LMCache's LRU dropped the
     bytes until the load misses.

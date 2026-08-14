@@ -895,8 +895,8 @@ that grows with spill volume.
 Flipping that flag is the whole of the *re-widening*, but it is not the whole
 of wiring loads, and it is only correct together with them. At least three
 other things still block: the worker builds its tier with `index=None`
-(`connector.py:265-268`), because `StateOffloadIndex` lives in the engine
-process; nothing puts the `(state_hash, target_group)` pair a load needs on the
+(`connector.py`, end of `_maybe_build_state_tier`), because
+`StateOffloadIndex` lives in the engine process; nothing puts the `(state_hash, target_group)` pair a load needs on the
 outbound `ScheduledBatch`; and the hybrid guard below refuses the KV leg
 outright. `state_pool.py:30-41` states this correctly and is the comment to
 copy.
