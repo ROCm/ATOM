@@ -196,6 +196,13 @@ class EagleProposer(Drafter):
         anchors = next_token_ids[:bs]
         if any(t < 0 for t in anchors):
             return
+        if self.config.parallel_config.data_parallel_size > 1:
+            # ModelRunner advances a pure middle chunk through propose() under
+            # DP so every rank executes the same mtp_k metadata/model
+            # collectives. Running this one-pass shortcut as well would make a
+            # middle rank execute mtp_k + 1 draft forwards while output/dummy
+            # ranks execute only mtp_k.
+            return
 
         # Anchor row per sequence = `cu_seqlens_q[1:] - 1`, the rule
         # `propose_draft_token_ids` uses on a pure prefill step.

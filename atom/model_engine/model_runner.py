@@ -3172,6 +3172,18 @@ class ModelRunner:
                 batch.next_token_ids,
             )
         if pp_non_last or self._is_pure_middle_chunk(batch):
+            # Under DP, every rank must enter the drafter's collectives in the
+            # same order. Output-producing and dummy ranks reach propose() from
+            # postprocess; a pure middle prefill chunk samples nothing and used
+            # to return here instead, leaving its peers blocked in
+            # DPMetadata.make(). Run the same proposal sequence to advance the
+            # draft KV, then discard the speculative ids.
+            if (
+                not pp_non_last
+                and hasattr(self, "drafter")
+                and self.config.parallel_config.data_parallel_size > 1
+            ):
+                self._advance_drafter_for_middle_chunk(batch, hidden_states)
             reset_forward_context()
             # Mark this slot's GPU work (attention consumed its metadata) done.
             if not batch.is_dummy_run:
@@ -3203,6 +3215,53 @@ class ModelRunner:
     @staticmethod
     def _is_pure_middle_chunk(batch) -> bool:
         return batch is not None and not batch.produces_output()
+
+    def _advance_drafter_for_middle_chunk(
+        self, batch: ScheduledBatch, hidden_states: torch.Tensor
+    ) -> None:
+        """Advance a non-output prefill chunk through the normal MTP proposal path.
+
+        A pure middle chunk skips postprocess(), while peer DP ranks may enter
+        drafter.propose() and its per-draft-step collectives. Execute the same
+        proposal sequence here to keep every rank in collective lockstep and to
+        advance draft KV state. The speculative token ids are intentionally
+        discarded because this chunk must not produce user-visible output.
+        """
+        forward_context = get_forward_context()
+        bs = batch.total_seqs_num
+        # Match the per-sequence rejection-status input used by normal postprocess.
+        num_reject_tokens = self.tokenID_processor.default_num_rejected_tokens[:bs]
+        # Besides returning each sequence's final row, prepare_inputs initializes
+        # the drafter metadata needed by every speculative step.
+        last_token_indices = self.drafter.prepare_inputs(bs, 1)
+
+        if batch.next_token_ids is not None:
+            # A known successor token is the normal anchor for the draft stream.
+            next_token_ids = self.drafter.anchors_to_gpu(batch.next_token_ids[:bs])
+        else:
+            # Block-parallel drafters do not need the successor prompt token.
+            # Use the current segment's final row as a shape-valid fallback.
+            # This cannot affect output because the resulting proposal is discarded.
+            next_token_ids = torch.index_select(
+                self.tokenID_processor.input_ids.gpu[
+                    1 : batch.total_tokens_num + 1
+                ],
+                0,
+                last_token_indices,
+            )
+
+        # Do not consume the return value: this call exists to mirror the peer
+        # ranks' MTP collectives and state transitions, not to emit draft tokens.
+        self.drafter.propose(
+            target_token_ids=self.tokenID_processor.input_ids.gpu[
+                1 : batch.total_tokens_num + 1
+            ],
+            target_positions=forward_context.context.positions,
+            target_hidden_states=hidden_states,
+            num_reject_tokens=num_reject_tokens,
+            next_token_ids=next_token_ids,
+            last_token_indices=last_token_indices,
+        )
 
     @torch.inference_mode()
     def process_kvconnector_output(self, connector_meta_output):
