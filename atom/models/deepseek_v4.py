@@ -2727,8 +2727,8 @@ class DeepseekV4Attention(nn.Module):
             # `o` arrives un-inverse-RoPE'd (see `_attn_core`):
             # `inverse_rope_group_quant` fuses the output inverse RoPE into the
             # per-token e8m0 group-quant, saving a bf16 round trip. The output
-            # is token-major [M, G, N] with N contiguous, so `_attn_post`'s
-            # `.flatten(1)` is a free view.
+            # is token-major [M, G, N] with N contiguous, so the `.flatten(1)`
+            # this branch ends with is a free view.
             assert positions is not None, "wo_a mxscale needs positions for fused RoPE"
             H = self.n_local_heads
             G = self.n_local_groups
@@ -2754,7 +2754,7 @@ class DeepseekV4Attention(nn.Module):
             )
             # Guarded aiter entry returns a fresh token-major [M, G, o_lora_rank]
             # (same layout as the old out= buffer); N is contiguous so the
-            # caller's `.flatten(1)` stays a free view.
+            # flatten below is a free view.
             y = batched_gemm_a8w8_mxscale(
                 x_fp8,
                 self._wo_a_w_fp8,
@@ -2762,7 +2762,11 @@ class DeepseekV4Attention(nn.Module):
                 self._wo_a_w_scale,
                 dtype=o.dtype,
             )
-            return y
+            # Flattened here, like both BF16 branches below: wo_b takes
+            # [M, G * o_lora_rank]. Handing it the 3-D tensor instead makes aiter
+            # read (M, K) off the first two dims, so K comes out as the group
+            # count and the GEMM is rejected for a shape that never existed.
+            return y.flatten(1)
         o = o.view(num_tokens, self.n_local_groups, -1)
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
         if num_tokens <= 32 or self._is_gfx1250:
