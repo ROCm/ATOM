@@ -2,11 +2,40 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+from dataclasses import dataclass, field
 from typing import Optional
 
 import torch
 
 logger = logging.getLogger("atom")
+
+
+@dataclass
+class WeightBucketResult:
+    """Result of applying one bucket of HF-named weights."""
+
+    updated: int = 0
+    received_names: set[str] = field(default_factory=set)
+    loaded_internal: set[str] = field(default_factory=set)
+    skipped_names: set[str] = field(default_factory=set)
+    ignored_scale_names: set[str] = field(default_factory=set)
+    packed_shards: dict[str, set[object]] = field(default_factory=dict)
+    packed_expected: dict[str, set[object]] = field(default_factory=dict)
+
+
+@dataclass
+class WeightUpdateTransaction:
+    """Cross-bucket state for one atomic-at-the-serving-boundary reload."""
+
+    version: int
+    buckets: int = 0
+    payload_bytes: int = 0
+    received_names: set[str] = field(default_factory=set)
+    loaded_internal: set[str] = field(default_factory=set)
+    skipped_names: set[str] = field(default_factory=set)
+    ignored_scale_names: set[str] = field(default_factory=set)
+    packed_shards: dict[str, set[object]] = field(default_factory=dict)
+    packed_expected: dict[str, set[object]] = field(default_factory=dict)
 
 
 class WeightUpdaterMixin:
@@ -131,8 +160,12 @@ class WeightUpdaterMixin:
                     shard_gpu = shard_t.to(device=self.device, dtype=torch.float32)
                     weight_loader(buf, shard_gpu, sid)
 
-                self._requantize_fp8_weight(module, param_name, param, buf.data)
+                requantized = self._requantize_fp8_weight(
+                    module, param_name, param, buf.data
+                )
                 del self._packed_weight_accum[atom_name]
+                if not requantized:
+                    return "skipped"
                 logger.debug(
                     f"{self.label}: FP8 packed weight updated: {atom_name} "
                     f"(composed from {len(expected)} shards)"
@@ -196,7 +229,7 @@ class WeightUpdaterMixin:
         param_name: str,
         param: torch.nn.Parameter,
         tensor: torch.Tensor,
-    ) -> None:
+    ) -> bool:
         """Requantize a full-precision weight to FP8 with updated weight_scale.
 
         Called when FSDP sends float32/bfloat16 trained weights to an FP8 model.
@@ -224,7 +257,7 @@ class WeightUpdaterMixin:
                 f"{self.label}: Shape mismatch in FP8 requantize for {param_name}: "
                 f"param={param.shape}, tensor={tensor_gpu.shape}"
             )
-            return
+            return False
 
         from aiter import QuantType as _QT
 
@@ -262,13 +295,14 @@ class WeightUpdaterMixin:
             logger.warning(
                 f"{self.label}: Unknown quant_type {quant_type} for FP8 requantize"
             )
-            return
+            return False
 
         self._post_process_fp8_weight(module, param)
         logger.debug(
             f"{self.label}: FP8 requantized {param_name} on {type(module).__name__}, "
             f"quant_type={quant_type}, scale_shape={weight_scale.shape}"
         )
+        return True
 
     def _post_process_fp8_weight(
         self,
@@ -315,6 +349,305 @@ class WeightUpdaterMixin:
         if needs_shuffle:
             shuffle_weights(param)
 
+    @staticmethod
+    def _module_parameter_name(name: str, param_name: str, sibling: str) -> str:
+        prefix = name[: -len(param_name)] if param_name and name.endswith(param_name) else ""
+        return f"{prefix}{sibling}"
+
+    def _record_fp8_side_effects(
+        self,
+        loaded_internal: set[str],
+        name: str,
+        module: torch.nn.Module,
+        param_name: str,
+        param: torch.nn.Parameter,
+        *,
+        scale_updated: bool,
+    ) -> None:
+        """Record parameters modified indirectly by FP8 post-processing."""
+        loaded_internal.add(name)
+        if not scale_updated or not self._is_fp8_param(module, param):
+            return
+        weight_scale = getattr(module, "weight_scale", None)
+        if isinstance(weight_scale, torch.nn.Parameter):
+            loaded_internal.add(
+                self._module_parameter_name(name, param_name, "weight_scale")
+            )
+
+    def _apply_named_tensors(
+        self, named_tensors: list[tuple[str, torch.Tensor]]
+    ) -> WeightBucketResult:
+        """Apply one bucket without finalizing the cross-bucket lifecycle."""
+        param_to_module = self._get_param_to_module_mapping()
+        result = WeightBucketResult()
+
+        for name, tensor in named_tensors:
+            result.received_names.add(name)
+            if name not in param_to_module:
+                packed = self._resolve_packed_name(name, param_to_module)
+                if packed is not None:
+                    atom_name, shard_id, target_suffix = packed
+                    result.packed_shards.setdefault(atom_name, set()).add(shard_id)
+                    result.packed_expected[atom_name] = set(
+                        self._get_packed_shard_order().get(target_suffix, [])
+                    )
+                packed_result = self._apply_packed_weight(name, tensor, param_to_module)
+                if packed_result == "updated":
+                    result.updated += 1
+                    if packed is not None:
+                        atom_name, _, _ = packed
+                        module, param_name, param = param_to_module[atom_name]
+                        self._record_fp8_side_effects(
+                            result.loaded_internal,
+                            atom_name,
+                            module,
+                            param_name,
+                            param,
+                            scale_updated=tensor.dtype != param.dtype,
+                        )
+                elif packed_result == "accumulated":
+                    pass
+                elif "weight_scale" in name or "input_scale" in name:
+                    result.ignored_scale_names.add(name)
+                else:
+                    logger.debug(f"{self.label}: Unmatched parameter: {name}")
+                    result.skipped_names.add(name)
+                continue
+
+            module, param_name, param = param_to_module[name]
+            weight_loader = getattr(module, "weight_loader", None)
+            loaded = False
+            scale_updated = False
+
+            if self._is_fp8_param(module, param) and tensor.dtype != param.dtype:
+                loaded = self._requantize_fp8_weight(
+                    module, param_name, param, tensor
+                )
+                scale_updated = loaded
+            elif self._is_fp8_param(module, param) and tensor.dtype == param.dtype:
+                tensor = tensor.to(device=self.device)
+                param.data.copy_(tensor)
+                self._post_process_fp8_weight(module, param)
+                loaded = True
+            elif tensor.shape == param.shape:
+                tensor = tensor.to(device=self.device, dtype=param.dtype)
+                param.data.copy_(tensor)
+                loaded = True
+            elif weight_loader is not None and callable(weight_loader):
+                try:
+                    tensor = tensor.to(device=self.device)
+                    weight_loader(param, tensor)
+                    loaded = True
+                except Exception as exc:
+                    logger.warning(
+                        f"{self.label}: weight_loader failed for {name}: {exc}"
+                    )
+            else:
+                tp_size = self.world_size
+                tp_rank = self.rank
+                loaded = tp_size > 1 and self._try_shard_weight(
+                    param, tensor, tp_rank, tp_size
+                )
+
+            if loaded:
+                result.updated += 1
+                self._record_fp8_side_effects(
+                    result.loaded_internal,
+                    name,
+                    module,
+                    param_name,
+                    param,
+                    scale_updated=scale_updated,
+                )
+            else:
+                if tensor.shape != param.shape:
+                    logger.warning(
+                        f"{self.label}: Shape mismatch for {name}: "
+                        f"expected {param.shape}, got {tensor.shape}"
+                    )
+                result.skipped_names.add(name)
+
+        return result
+
+    def begin_weight_update(self, version: int) -> dict:
+        """Begin a versioned, cross-bucket weight update transaction."""
+        version = int(version)
+        active = getattr(self, "_weight_update_transaction", None)
+        if active is not None:
+            raise RuntimeError(
+                f"weight update version {active.version} is already in progress"
+            )
+        last_version = getattr(self, "_last_started_weight_version", None)
+        if last_version is not None and version <= last_version:
+            raise RuntimeError(
+                f"weight update version must increase: "
+                f"last_started={last_version}, got={version}"
+            )
+        if hasattr(self, "_packed_weight_accum"):
+            self._packed_weight_accum.clear()
+        self._weight_update_transaction = WeightUpdateTransaction(version=version)
+        self._last_started_weight_version = version
+        logger.info(f"{self.label}: began weight update version={version}")
+        return {"version": version, "state": "receiving"}
+
+    def apply_weight_bucket(
+        self,
+        named_tensors: list[tuple[str, torch.Tensor]],
+        payload_bytes: int = 0,
+    ) -> dict:
+        """Apply one bucket and retain packed/fused state for later buckets."""
+        transaction = getattr(self, "_weight_update_transaction", None)
+        if transaction is None:
+            raise RuntimeError("no weight update transaction is in progress")
+        try:
+            bucket = self._apply_named_tensors(named_tensors)
+        except Exception as exc:
+            self.abort_weight_update(transaction.version, exc)
+            raise
+        transaction.buckets += 1
+        transaction.payload_bytes += int(payload_bytes)
+        transaction.received_names.update(bucket.received_names)
+        transaction.loaded_internal.update(bucket.loaded_internal)
+        transaction.skipped_names.update(bucket.skipped_names)
+        transaction.ignored_scale_names.update(bucket.ignored_scale_names)
+        for name, shards in bucket.packed_shards.items():
+            transaction.packed_shards.setdefault(name, set()).update(shards)
+        transaction.packed_expected.update(bucket.packed_expected)
+        return {
+            "version": transaction.version,
+            "bucket": transaction.buckets,
+            "updated": bucket.updated,
+            "received": len(bucket.received_names),
+            "loaded_internal": len(bucket.loaded_internal),
+            "skipped": sorted(bucket.skipped_names),
+            "ignored_scales": sorted(bucket.ignored_scale_names),
+        }
+
+    def commit_weight_update(self, version: int, verify_full_load: bool = True) -> dict:
+        """Finalize a reload once, making the new version eligible for serving."""
+        version = int(version)
+        transaction = getattr(self, "_weight_update_transaction", None)
+        if transaction is None:
+            raise RuntimeError("no weight update transaction is in progress")
+        if transaction.version != version:
+            error = RuntimeError(
+                f"weight update version mismatch: active={transaction.version}, got={version}"
+            )
+            self.abort_weight_update(transaction.version, error)
+            raise error
+
+        try:
+            incomplete_shards = {
+                name: sorted(
+                    transaction.packed_expected[name]
+                    - transaction.packed_shards.get(name, set()),
+                    key=str,
+                )
+                for name in transaction.packed_expected
+                if transaction.packed_expected[name]
+                - transaction.packed_shards.get(name, set())
+            }
+            if incomplete_shards:
+                raise RuntimeError(
+                    "incomplete packed shards after RDMA reload: "
+                    f"{incomplete_shards}"
+                )
+            incomplete_packed = sorted(
+                getattr(self, "_packed_weight_accum", {}).keys()
+            )
+            if incomplete_packed:
+                raise RuntimeError(
+                    "incomplete packed parameters after RDMA reload: "
+                    f"{incomplete_packed[:20]}"
+                )
+
+            expected_names = {name for name, _ in self.model.named_parameters()}
+            missing = sorted(expected_names - transaction.loaded_internal)
+            if verify_full_load and (missing or transaction.skipped_names):
+                raise RuntimeError(
+                    "incomplete ATOM RDMA weight reload: "
+                    f"loaded {len(transaction.loaded_internal)}/{len(expected_names)} "
+                    f"internal parameters from {len(transaction.received_names)} HF tensors; "
+                    f"missing={missing[:20]}, "
+                    f"skipped={sorted(transaction.skipped_names)[:20]}"
+                )
+
+            self.clear_kv_cache()
+            self._invalidate_cudagraphs_after_weight_update()
+        except Exception as exc:
+            self.abort_weight_update(version, exc)
+            raise
+
+        manifest = {
+            "version": version,
+            "buckets": transaction.buckets,
+            "bytes": transaction.payload_bytes,
+            "received": len(transaction.received_names),
+            "loaded_internal": len(transaction.loaded_internal),
+            "loaded_internal_names": sorted(transaction.loaded_internal),
+            "skipped": sorted(transaction.skipped_names),
+            "ignored_scales": sorted(transaction.ignored_scale_names),
+            "packed_shards": {
+                name: sorted(shards, key=str)
+                for name, shards in transaction.packed_shards.items()
+            },
+            "missing": missing,
+        }
+        self._last_committed_weight_version = version
+        self._weight_update_healthy = True
+        self._weight_update_transaction = None
+        if hasattr(self, "_packed_weight_accum"):
+            self._packed_weight_accum.clear()
+        logger.info(
+            f"{self.label}: committed weight update version={version}, "
+            f"buckets={manifest['buckets']}, loaded={manifest['loaded_internal']}"
+        )
+        return manifest
+
+    def abort_weight_update(self, version: int, error) -> dict:
+        """Discard transaction state and fence serving after a partial write."""
+        active = getattr(self, "_weight_update_transaction", None)
+        active_version = active.version if active is not None else int(version)
+        self._weight_update_transaction = None
+        self._weight_update_healthy = False
+        self._weight_update_failure = str(error)
+        if hasattr(self, "_packed_weight_accum"):
+            self._packed_weight_accum.clear()
+        logger.error(
+            f"{self.label}: aborted weight update version={active_version}: {error}"
+        )
+        return {
+            "version": active_version,
+            "state": "aborted",
+            "error": str(error),
+        }
+
+    def assert_weight_update_ready(self) -> None:
+        transaction = getattr(self, "_weight_update_transaction", None)
+        if transaction is not None:
+            raise RuntimeError(
+                "ATOM serving is fenced while weight update "
+                f"version={transaction.version} is in progress"
+            )
+        if getattr(self, "_weight_update_healthy", True):
+            return
+        raise RuntimeError(
+            "ATOM serving is fenced after a partial weight update; "
+            "complete a newer full reload or restart the worker. "
+            f"failure={getattr(self, '_weight_update_failure', 'unknown')}"
+        )
+
+    def get_weight_update_status(self) -> dict:
+        transaction = getattr(self, "_weight_update_transaction", None)
+        return {
+            "healthy": getattr(self, "_weight_update_healthy", True),
+            "active_version": transaction.version if transaction is not None else None,
+            "last_committed_version": getattr(
+                self, "_last_committed_weight_version", None
+            ),
+            "failure": getattr(self, "_weight_update_failure", None),
+        }
+
     def update_weights(
         self, named_tensors: list[tuple[str, torch.Tensor]], clear_kv_cache: bool = True
     ) -> int:
@@ -336,77 +669,25 @@ class WeightUpdaterMixin:
         Returns:
             Number of parameters successfully updated
         """
-        param_to_module = self._get_param_to_module_mapping()
-
-        updated = 0
-        skipped = 0
-        ignored_scales = 0
-
-        for name, tensor in named_tensors:
-            if name not in param_to_module:
-                result = self._apply_packed_weight(name, tensor, param_to_module)
-                if result == "updated":
-                    updated += 1
-                elif result == "accumulated":
-                    pass
-                elif "weight_scale" in name or "input_scale" in name:
-                    ignored_scales += 1
-                else:
-                    logger.debug(f"{self.label}: Unmatched parameter: {name}")
-                    skipped += 1
-                continue
-
-            module, param_name, param = param_to_module[name]
-            weight_loader = getattr(module, "weight_loader", None)
-
-            if self._is_fp8_param(module, param) and tensor.dtype != param.dtype:
-                self._requantize_fp8_weight(module, param_name, param, tensor)
-                updated += 1
-            elif self._is_fp8_param(module, param) and tensor.dtype == param.dtype:
-                tensor = tensor.to(device=self.device)
-                param.data.copy_(tensor)
-                self._post_process_fp8_weight(module, param)
-                updated += 1
-            elif tensor.shape == param.shape:
-                tensor = tensor.to(device=self.device, dtype=param.dtype)
-                param.data.copy_(tensor)
-                updated += 1
-            elif weight_loader is not None and callable(weight_loader):
-                try:
-                    tensor = tensor.to(device=self.device)
-                    weight_loader(param, tensor)
-                    updated += 1
-                except Exception as e:
-                    logger.warning(
-                        f"{self.label}: weight_loader failed for {name}: {e}"
-                    )
-                    skipped += 1
-            else:
-                tp_size = self.world_size
-                tp_rank = self.rank
-                if tp_size > 1 and self._try_shard_weight(
-                    param, tensor, tp_rank, tp_size
-                ):
-                    updated += 1
-                else:
-                    logger.warning(
-                        f"{self.label}: Shape mismatch for {name}: "
-                        f"expected {param.shape}, got {tensor.shape}"
-                    )
-                    skipped += 1
+        result = self._apply_named_tensors(named_tensors)
 
         if clear_kv_cache:
             self.clear_kv_cache()
 
-        if hasattr(self, "_packed_weight_accum"):
+        if clear_kv_cache and hasattr(self, "_packed_weight_accum"):
+            if self._packed_weight_accum:
+                logger.warning(
+                    f"{self.label}: Incomplete packed weight accumulators: "
+                    f"{list(self._packed_weight_accum.keys())}"
+                )
             self._packed_weight_accum.clear()
 
         logger.info(
             f"{self.label}: Weight update complete - "
-            f"updated={updated}, skipped={skipped}, "
-            f"ignored_scales={ignored_scales}"
+            f"updated={result.updated}, skipped={len(result.skipped_names)}, "
+            f"ignored_scales={len(result.ignored_scale_names)}"
         )
-        return updated
+        return result.updated
 
     def update_weights_from_shm(
         self,
