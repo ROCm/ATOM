@@ -165,9 +165,7 @@ def _proxy_page_bytes(vllm_config) -> int:
     rope_head_dim = _v4_rope_head_dim(hf)
     index_head_dim = int(getattr(hf, "index_head_dim", 128))
     kv_fp8 = _v4_kv_fp8(vllm_config)
-    _arena_planes, arena_rows, _row_widths = _v4_state_layout(
-        vllm_config, kv_fp8
-    )
+    _arena_planes, arena_rows, _row_widths = _v4_state_layout(vllm_config, kv_fp8)
     win = _v4_win_with_spec(vllm_config, int(getattr(hf, "sliding_window", 128)))
     max_num_seqs = int(getattr(vllm_config.scheduler_config, "max_num_seqs", 1))
     max_model_len = int(vllm_config.model_config.max_model_len)
@@ -1349,9 +1347,7 @@ def build_atom_v4_attention_metadata(
         [md.pool_geometry.physical_slot(int(slot)) for slot in slot_arr],
         dtype=np.int32,
     )
-    md.reset_slots = {
-        md.pool_geometry.physical_slot(int(slot)) for slot in reset_slots
-    }
+    md.reset_slots = {md.pool_geometry.physical_slot(int(slot)) for slot in reset_slots}
 
     n_csa_cpu = (seq_np // 4).astype(np.int32)
     n_hca_cpu = (seq_np // 128).astype(np.int32)
