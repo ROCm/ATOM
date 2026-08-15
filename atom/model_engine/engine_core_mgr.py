@@ -860,7 +860,7 @@ class CoreManager:
                         f"{self.label}: no usable control socket for DP rank "
                         f"{dp_rank}; shutdown not delivered"
                     )
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - teardown must not raise
                 logger.debug(
                     f"{self.label}: Error sending shutdown to DP rank {dp_rank}: {e}"
                 )

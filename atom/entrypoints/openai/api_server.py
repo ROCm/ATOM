@@ -833,9 +833,6 @@ async def setup_streaming_request(
     response generator does not have to re-tokenize the prompt on the event
     loop.
     """
-    global engine, _seq_id_to_request_id
-    global _stream_loops, _request_start_times
-
     stream_collector = StreamOutputCollector(request_id)
     stream_loop = asyncio.get_running_loop()
     _stream_loops[request_id] = stream_loop
@@ -895,9 +892,6 @@ def cleanup_streaming_request(
     no-op that just floods the control path (one broadcast per engine core, per
     request).
     """
-    global engine, _seq_id_to_request_id
-    global _stream_loops, _request_start_times
-
     _seq_id_to_request_id.pop(seq_id, None)
     _stream_loops.pop(request_id, None)
     _request_start_times.pop(request_id, None)
@@ -1026,9 +1020,6 @@ async def setup_streaming_request_fanout(
     tokenize the same prompt once, so ``num_prompt_tokens`` is shared and lets
     the stream response generator skip re-tokenizing on the event loop.
     """
-    global engine, _seq_id_to_request_id
-    global _stream_loops, _request_start_times
-
     n = int(sampling_params.n)
     assert n >= 1
 
