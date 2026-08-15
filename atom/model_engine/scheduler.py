@@ -670,6 +670,11 @@ class Scheduler:
         self.cache_stats: CacheStats | None = (
             CacheStats() if config.enable_prefix_caching else None
         )
+        # Dashboard counters update only at request lifecycle boundaries.
+        self.total_prompt_tokens = 0
+        self.total_generation_tokens = 0
+        self.total_finished_requests = 0
+        self.total_preemptions = 0
         self.profile_active = False
         # Cache the env flag once (env vars are fixed at process start) so the
         # per-iteration compute_detailed_aggregates never pays an os.getenv.
@@ -1585,6 +1590,9 @@ class Scheduler:
                 )
             seq.offload_promoted_tokens = promoted
             seq.num_cached_tokens = loaded
+            # Report the extended CPU-offload hit without reducing any
+            # prefix-cache hit inherited from an upstream prefill node.
+            seq.prefix_cache_hit_tokens = max(seq.prefix_cache_hit_tokens, loaded)
         seq.offload_load_start_tokens = None
         seq.offload_loaded = True
 
@@ -1823,6 +1831,7 @@ class Scheduler:
         return chunk
 
     def preempt(self, seq: Sequence):
+        self.total_preemptions += 1
         seq.status = SequenceStatus.WAITING
         # Strip placeholder + rejected draft tokens added by postprocess.
         # Real token count = seq.num_tokens - mtp_k - num_rejected
@@ -2274,6 +2283,11 @@ class Scheduler:
                 seq.num_tokens = num_tokens
                 seq.leave_reason = leave_reason
                 seq.status = SequenceStatus.FINISHED
+                self.total_finished_requests += 1
+                self.total_prompt_tokens += int(seq.num_prompt_tokens)
+                self.total_generation_tokens += max(
+                    0, int(num_tokens) - int(seq.num_prompt_tokens)
+                )
                 finished_seqs.append(seq)
 
         if stream_output_queue is not None and stream_outputs:
@@ -2539,6 +2553,8 @@ class Scheduler:
         for req_id in kv_connector_output.finished_loading or ():
             assert is_offload, "Only offload connector should update loading KV status"
             logger.debug("Finished offload KV load for request %s", req_id)
+            if hasattr(self.kv_connector, "load_finished"):
+                self.kv_connector.load_finished(req_id)
             self.finished_recving_kv_req_ids.append(req_id)
 
         for req_id in kv_connector_output.failed_loading or ():
@@ -2675,6 +2691,10 @@ class PrefillScheduler:
         self.mtp_k = 0
         self.spec_stats = None
         self.cache_stats = None
+        self.total_prompt_tokens = 0
+        self.total_generation_tokens = 0
+        self.total_finished_requests = 0
+        self.total_preemptions = 0
 
         # Shared memory for dynamic CU partitioning.
         # Layout: [0:4] = decode_tokens (uint32)

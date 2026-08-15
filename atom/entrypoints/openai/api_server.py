@@ -26,11 +26,11 @@ import uuid
 from asyncio import AbstractEventLoop
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import Any, Optional
+from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from PIL import Image
 from transformers import AutoProcessor, AutoTokenizer
 
@@ -43,6 +43,7 @@ from atom.utils import envs
 from atom.utils.arg_parser import FlexibleArgumentParser
 
 from .chat_encoders import apply_chat_template, load_custom_message_encoder
+from .metrics import AtomMetricsExporter
 from .protocol import (
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_K,
@@ -110,6 +111,9 @@ _stream_loops: dict[str, AbstractEventLoop] = {}
 _request_start_times: dict[str, float] = {}
 _request_logger: logging.Logger | None = None
 _stream_batch_dispatcher: StreamBatchDispatcher | None = None
+_metrics_exporter = AtomMetricsExporter()
+_metrics_refresh_task: asyncio.Task | None = None
+_METRICS_REFRESH_INTERVAL_SECONDS = 5.0
 
 
 # ============================================================================
@@ -169,7 +173,7 @@ def _build_sampling_params(
     )
 
 
-def _coerce_n(requested_n: Optional[int], temperature: Optional[float]) -> int:
+def _coerce_n(requested_n: int | None, temperature: float | None) -> int:
     """Return an effective ``n`` for a request.
 
     * ``None``/``<1`` coerce to ``1`` (matches OpenAI default).
@@ -183,8 +187,7 @@ def _coerce_n(requested_n: Optional[int], temperature: Optional[float]) -> int:
         n = int(n)
     except (TypeError, ValueError):
         n = 1
-    if n < 1:
-        n = 1
+    n = max(n, 1)
     if n > 1 and (temperature is None or temperature <= 0.0):
         logger.info(
             "n=%s requested with temperature=%s; collapsing to n=1 because "
@@ -199,7 +202,7 @@ def _coerce_n(requested_n: Optional[int], temperature: Optional[float]) -> int:
 def _validate_context_length(
     num_prompt_tokens: int,
     max_tokens: int,
-    max_model_len: Optional[int],
+    max_model_len: int | None,
 ) -> None:
     if max_model_len is None:
         return
@@ -262,8 +265,7 @@ def _load_image_from_url(url: str) -> Image.Image:
             image_bytes = response.read()
         return Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
-    if url.startswith("file://"):
-        url = url[len("file://") :]
+    url = url.removeprefix("file://")
     return Image.open(url).convert("RGB")
 
 
@@ -799,7 +801,7 @@ async def generate_async_fanout(
     return outputs
 
 
-def validate_model(requested_model: Optional[str]) -> None:
+def validate_model(requested_model: str | None) -> None:
     """Validate that the requested model matches the server's model."""
     if requested_model is None:
         return
@@ -1113,15 +1115,48 @@ def _tune_gc() -> None:
         logger.warning("[gc] bad ATOM_GC_THRESHOLD=%r, ignored", thresholds)
 
 
+async def _refresh_metrics_once() -> None:
+    if engine is None:
+        return
+    try:
+        timeout = _METRICS_REFRESH_INTERVAL_SECONDS
+        snapshot = await asyncio.to_thread(engine.get_metrics_statistics, timeout)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _metrics_exporter.record_refresh_error()
+        logger.warning("Failed to refresh Prometheus metrics", exc_info=True)
+    else:
+        _metrics_exporter.update(snapshot)
+
+
+async def _metrics_refresh_loop() -> None:
+    while True:
+        await asyncio.sleep(_METRICS_REFRESH_INTERVAL_SECONDS)
+        await _refresh_metrics_once()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown."""
+    global _metrics_refresh_task
     logger.info("Server started successfully and ready to accept requests")
     _tune_gc()
-    yield
-    logger.info("Server shutting down, releasing resources...")
-    if engine is not None:
-        engine.close()
+    await _refresh_metrics_once()
+    _metrics_refresh_task = asyncio.create_task(_metrics_refresh_loop())
+    try:
+        yield
+    finally:
+        if _metrics_refresh_task is not None:
+            _metrics_refresh_task.cancel()
+            try:
+                await _metrics_refresh_task
+            except asyncio.CancelledError:
+                pass
+            _metrics_refresh_task = None
+        logger.info("Server shutting down, releasing resources...")
+        if engine is not None:
+            engine.close()
 
 
 app = FastAPI(title="ATOM OpenAI API Server", lifespan=lifespan)
@@ -1562,7 +1597,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
             lambda: engine.config.max_model_len,
             lambda: engine.model_config.max_model_len,
             lambda: engine.scheduler.max_model_len,
-            lambda: getattr(engine, "max_model_len"),
+            lambda: engine.max_model_len,
         ):
             try:
                 _v = _path()
@@ -1821,6 +1856,15 @@ async def list_models():
 async def health():
     """Health check endpoint."""
     return {"status": "ok"}
+
+
+@app.api_route("/metrics", methods=["GET", "HEAD"], include_in_schema=False)
+async def metrics():
+    """Expose cached standalone-engine metrics in Prometheus text format."""
+    return Response(
+        content=_metrics_exporter.render(),
+        headers={"Content-Type": _metrics_exporter.content_type},
+    )
 
 
 @app.get("/debug/mtp_stats")

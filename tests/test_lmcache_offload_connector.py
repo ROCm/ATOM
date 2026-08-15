@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 try:
-    import torch  # noqa: F401
+    import torch
 except ModuleNotFoundError:
     sys.modules["torch"] = types.ModuleType("torch")
 
@@ -59,8 +59,15 @@ def _scheduler() -> LMCacheOffloadConnectorScheduler:
     sched._hit_save_floors = {}
     sched._save_tracker = {}
     sched._save_inflight = set()
+    sched._load_inflight_tokens = {}
+    sched._save_inflight_tokens = {}
     sched._lookup_in_step = []
     sched._handoff_loads = set()
+    sched.total_load_requests = 0
+    sched.total_loaded_tokens = 0
+    sched.total_load_failures = 0
+    sched.total_save_requests = 0
+    sched.total_saved_tokens = 0
     sched._min_load_tokens = 0
     sched._lock = threading.Lock()
     sched._done_load = set()
@@ -1663,3 +1670,23 @@ def test_codec_dsa_fp8_multilayer_including_mtp_round_trip():
             kv_caches[name].index_cache.view(torch.uint8),
             idx.view(torch.uint8),
         )
+
+
+def test_scheduler_offload_statistics_are_cumulative():
+    sched = _scheduler()
+    sched._load_inflight_tokens["1"] = 8192
+    sched._save_inflight_tokens["2"] = 4096
+    sched._save_inflight.add("2")
+
+    sched.load_finished("1")
+    sched.save_finished("2")
+
+    assert sched.get_statistics() == {
+        "load_requests": 1,
+        "loaded_tokens": 8192,
+        "load_failures": 0,
+        "save_requests": 1,
+        "saved_tokens": 4096,
+        "loads_pending": 0,
+        "saves_pending": 0,
+    }
