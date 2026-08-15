@@ -5,8 +5,8 @@ from torch import nn
 from torch.profiler import record_function
 
 from atom.spec_decode.drafter import AuxCaptureSpec, Drafter
-from atom.utils import envs
 from atom.spec_decode.dspark_verify import VerifyScheduler
+from atom.utils import envs
 from atom.utils.block_convert import kv_indices_generate_triton
 from atom.utils.forward_context import get_forward_context
 

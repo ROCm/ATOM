@@ -477,36 +477,55 @@ def test_num_draft_change_raises():
         fc.get_forward_context = saved
 
 
-def test_precompute_context_kv_stays_eager_and_still_writes():
-    # precompute_context_kv is deliberately NOT compiled -- the decorator
-    # replaces only __call__, so every other method is untouched. That is what
-    # keeps its is_dummy_run early-return, its wildly dynamic num_tokens, and
-    # swa_write's variable Triton grid out of the traced region.
+def test_write_context_kv_stays_eager_and_still_writes():
+    # write_context_kv is deliberately NOT compiled -- the decorator replaces
+    # only __call__, so every other method is untouched. That is what keeps its
+    # is_dummy_run early-return, its wildly dynamic num_tokens, and swa_write's
+    # variable Triton grid out of the traced region.
     #
-    # Assert it is reachable as a plain method on both the wrapper and the inner
-    # module, and that it still fans out to one write per stage.
+    # It lives on DSparkDraftModel (the wrapper's base) rather than on the inner
+    # module: the inner is the compiled one, and nothing about absorbing the
+    # target's context belongs inside the traced block forward. Assert it is
+    # reachable as a plain method, is not the compiled entry point, and still
+    # fans out to one write per stage.
     from atom.models.deepseek_v4_dspark import DeepseekV4DSpark, _DSparkInner
+    from atom.models.dspark_draft import DSparkDraftModel
 
-    assert callable(_DSparkInner.precompute_context_kv)
-    assert callable(DeepseekV4DSpark.precompute_context_kv)
-    # Not routed through the compiled dispatch.
-    assert _DSparkInner.precompute_context_kv is not _DSparkInner.forward
+    assert callable(DeepseekV4DSpark.write_context_kv)
+    assert DeepseekV4DSpark.write_context_kv is DSparkDraftModel.write_context_kv
+    # The traced entry point is the inner's forward, and this is not it.
+    assert DeepseekV4DSpark.write_context_kv is not _DSparkInner.forward
 
     calls = []
 
     class _StageStub:
-        def precompute_context_kv(self, main_x, positions, cu, wpb):
-            calls.append(wpb)
+        def write_context_kv(self, ctx_hidden, positions):
+            calls.append(ctx_hidden.shape[0])
 
-    class _Stage0Stub(_StageStub):
-        main_proj = staticmethod(lambda x: x)
-        main_norm = staticmethod(lambda x: x)
+    class _StubCtx:
+        is_dummy_run = False
 
-    inner = _DSparkInner.__new__(_DSparkInner)
-    inner.mtp = [_Stage0Stub(), _StageStub(), _StageStub()]
+    stages = [_StageStub(), _StageStub(), _StageStub()]
 
-    _DSparkInner.precompute_context_kv(inner, torch.zeros(4, 2), None, None, 135)
-    assert calls == [135, 135, 135], "one rolling-KV write per stage"
+    class _Wrapper(DSparkDraftModel):
+        # project_context is stage 0's main_proj/main_norm; stub it so the test
+        # covers the fan-out, not the projection.
+        def project_context(self, aux_concat):
+            return aux_concat
+
+        @property
+        def context_layers(self):
+            return stages
+
+    import atom.utils.forward_context as fc
+
+    saved = fc.get_forward_context
+    fc.get_forward_context = lambda: type("_FC", (), {"context": _StubCtx()})()
+    try:
+        DSparkDraftModel.write_context_kv(_Wrapper(), torch.zeros(4, 2), None)
+    finally:
+        fc.get_forward_context = saved
+    assert calls == [4, 4, 4], "one rolling-KV write per stage"
 
 
 def test_attention_is_reached_only_through_the_opaque_op():
