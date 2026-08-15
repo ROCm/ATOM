@@ -799,6 +799,11 @@ class ParallelConfig:
     pp_token_addr: str = ""
     """ZMQ endpoint where the head receives sampled tokens back from the last
     stage. Populated by CoreManager for pp_size > 1."""
+    control_address: str = ""
+    """ZMQ endpoint carrying control traffic (utility commands, abort, shutdown)
+    for this EngineCore, separate from the request endpoint. Keeping the two
+    apart leaves the request socket with a single writer thread, so admitting a
+    request needs no synchronization. Populated by launch_engine_core."""
     world_size: int = field(init=False)
     """Vestigial: never assigned or read; engine_core derives worker count directly."""
     data_parallel_master_port: int = 29500
