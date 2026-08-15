@@ -3,17 +3,18 @@
 
 """Text completion handler for the OpenAI-compatible API."""
 
-import asyncio
-import json
 import logging
 import time
-from typing import Any, AsyncGenerator, Dict, List, Optional
+from collections.abc import AsyncGenerator
+from typing import Any
 
 from .protocol import (
     STREAM_DONE_MESSAGE,
     TEXT_COMPLETION_OBJECT,
     CompletionResponse,
 )
+from .sse import data_frame
+from .streaming_dispatch import StreamOutputCollector
 
 logger = logging.getLogger("atom")
 
@@ -22,8 +23,8 @@ def create_completion_chunk(
     request_id: str,
     model: str,
     text: str,
-    finish_reason: Optional[str] = None,
-    usage: Optional[Dict] = None,
+    finish_reason: str | None = None,
+    usage: dict | None = None,
     index: int = 0,
     **extra_fields: Any,
 ) -> str:
@@ -49,13 +50,13 @@ def create_completion_chunk(
     chunk.update(extra_fields)
     if usage is not None:
         chunk["usage"] = usage
-    return f"data: {json.dumps(chunk)}\n\n"
+    return data_frame(chunk)
 
 
 async def stream_completion_response(
     request_id: str,
     model: str,
-    stream_queue: asyncio.Queue,
+    stream_collector: StreamOutputCollector,
     seq_id: int,
     num_prompt_tokens: int,
     cleanup_fn,
@@ -76,11 +77,11 @@ async def stream_completion_response(
     aborted = True
     try:
         while True:
-            chunk_data = await stream_queue.get()
+            chunk_data = await stream_collector.get()
             new_text = chunk_data["text"]
             num_tokens_output += len(chunk_data.get("token_ids", []))
 
-            extra_fields: Dict[str, Any] = {}
+            extra_fields: dict[str, Any] = {}
             if "kv_transfer_params" in chunk_data:
                 extra_fields["kv_transfer_params"] = chunk_data["kv_transfer_params"]
 
@@ -113,7 +114,7 @@ async def stream_completion_response(
                 yield (
                     content_chunk
                     + create_completion_chunk(request_id, model, "", "stop")
-                    + f"data: {json.dumps(usage_chunk)}\n\n"
+                    + data_frame(usage_chunk)
                     + STREAM_DONE_MESSAGE
                 )
                 return
@@ -126,7 +127,7 @@ async def stream_completion_response(
 def build_completion_response(
     request_id: str,
     model: str,
-    final_output: Dict[str, Any],
+    final_output: dict[str, Any],
 ) -> CompletionResponse:
     """Build a non-streaming text completion response (single choice)."""
     response = CompletionResponse(
@@ -162,7 +163,7 @@ def build_completion_response(
 def build_completion_response_multi(
     request_id: str,
     model: str,
-    final_outputs: List[Dict[str, Any]],
+    final_outputs: list[dict[str, Any]],
 ) -> CompletionResponse:
     """Build a non-streaming response with one choice per fan-out sibling."""
     assert final_outputs, "build_completion_response_multi requires at least one output"
@@ -202,14 +203,14 @@ def build_completion_response_multi(
 async def stream_completion_response_fanout(
     request_id: str,
     model: str,
-    shared_queue: asyncio.Queue,
-    seq_ids: List[int],
+    shared_collector: StreamOutputCollector,
+    seq_ids: list[int],
     num_prompt_tokens: int,
     cleanup_fn,
 ) -> AsyncGenerator[str, None]:
     """Streaming variant multiplexing ``len(seq_ids)`` siblings into one SSE.
 
-    Each chunk pulled from ``shared_queue`` is a ``(sibling_index, chunk_data)``
+    Each chunk pulled from ``shared_collector`` is a ``(sibling_index, chunk_data)``
     tuple; we re-emit with ``choices[0].index = sibling_index``. Finishes
     only when every sibling has reported ``finished=True``.
 
@@ -228,13 +229,13 @@ async def stream_completion_response_fanout(
     aborted = True
     try:
         while not all(finished):
-            idx, chunk_data = await shared_queue.get()
+            idx, chunk_data = await shared_collector.get()
             if finished[idx]:
                 continue
             new_text = chunk_data["text"]
             num_tokens_output[idx] += len(chunk_data.get("token_ids", []))
 
-            extra_fields: Dict[str, Any] = {}
+            extra_fields: dict[str, Any] = {}
             if "kv_transfer_params" in chunk_data:
                 extra_fields["kv_transfer_params"] = chunk_data["kv_transfer_params"]
 
@@ -272,7 +273,7 @@ async def stream_completion_response_fanout(
                 create_completion_chunk(request_id, model, "", "stop", index=i)
                 for i in range(n)
             )
-            + f"data: {json.dumps(usage_chunk)}\n\n"
+            + data_frame(usage_chunk)
             + STREAM_DONE_MESSAGE
         )
     finally:

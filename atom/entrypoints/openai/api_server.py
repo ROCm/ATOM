@@ -85,7 +85,8 @@ from .serving_completion import (
     stream_completion_response,
     stream_completion_response_fanout,
 )
-from .streaming_dispatch import StreamBatchDispatcher
+from .sse import event_frame
+from .streaming_dispatch import StreamBatchDispatcher, StreamOutputCollector
 
 # Configure logging
 logger = logging.getLogger("atom")
@@ -105,12 +106,12 @@ processor: Any | None = None
 model_name: str = ""
 default_chat_template_kwargs: dict[str, Any] = {}
 custom_message_encoder: Any | None = None
-_stream_queues: dict[str, asyncio.Queue] = {}
 _seq_id_to_request_id: dict[int, str] = {}
 _stream_loops: dict[str, AbstractEventLoop] = {}
 _request_start_times: dict[str, float] = {}
 _request_logger: logging.Logger | None = None
 _stream_batch_dispatcher: StreamBatchDispatcher | None = None
+_ANTHROPIC_PING_FRAME = event_frame("ping", {"type": "ping"})
 _metrics_exporter = AtomMetricsExporter()
 _metrics_refresh_task: asyncio.Task | None = None
 _METRICS_REFRESH_INTERVAL_SECONDS = 5.0
@@ -413,21 +414,21 @@ def _build_stream_chunk(request_output: RequestOutput, request_id: str) -> dict:
 def _send_stream_chunk_direct(
     request_output: RequestOutput,
     request_id: str,
-    stream_queue: asyncio.Queue,
+    stream_collector: StreamOutputCollector,
     loop: AbstractEventLoop,
 ) -> None:
     """Buffer a single-request chunk for this engine step."""
     assert _stream_batch_dispatcher is not None
     _stream_batch_dispatcher.enqueue(
         loop=loop,
-        queue=stream_queue,
+        collector=stream_collector,
         state_key=request_id,
         chunk=_build_stream_chunk(request_output, request_id),
     )
 
 
 def flush_stream_batch() -> None:
-    """Flush this output thread's engine-step batch into asyncio queues."""
+    """Flush this output thread's engine-step batch to the stream collectors."""
     if _stream_batch_dispatcher is not None:
         _stream_batch_dispatcher.flush()
 
@@ -436,14 +437,15 @@ def _send_stream_chunk_tagged(
     request_output: RequestOutput,
     request_id: str,
     sibling_index: int,
-    stream_queue: asyncio.Queue,
+    stream_collector: StreamOutputCollector,
     loop: AbstractEventLoop,
 ) -> None:
     """Variant of :func:`_send_stream_chunk_direct` for fan-out siblings.
 
-    Pushes ``(sibling_index, chunk_data)`` tuples onto a single shared
-    queue so the merge-stream consumer in :mod:`serving_chat` /
-    :mod:`serving_completion` can demultiplex by index.
+    Pushes ``(sibling_index, chunk_data)`` tuples into a single shared
+    collector so the merge-stream consumer in :mod:`serving_chat` /
+    :mod:`serving_completion` can demultiplex by index. The collector folds
+    per tag, so a lagging consumer never mixes two siblings' deltas.
 
     This path serves ``SamplingParams.n > 1`` by tagging each sibling's chunks
     so the shared stream consumer can merge them in order.
@@ -451,7 +453,7 @@ def _send_stream_chunk_tagged(
     assert _stream_batch_dispatcher is not None
     _stream_batch_dispatcher.enqueue(
         loop=loop,
-        queue=stream_queue,
+        collector=stream_collector,
         state_key=(request_id, sibling_index),
         chunk=_build_stream_chunk(request_output, request_id),
         tag=sibling_index,
@@ -823,24 +825,23 @@ async def setup_streaming_request(
     kv_transfer_params: dict[str, Any] | None = None,
     multimodal_data: dict[str, Any] | None = None,
     data_parallel_rank: int | None = None,
-) -> tuple[int, asyncio.Queue, int]:
+) -> tuple[int, StreamOutputCollector, int]:
     """Set up a streaming request with the engine.
 
-    Returns ``(seq_id, stream_queue, num_prompt_tokens)``. ``num_prompt_tokens``
-    is the engine-computed prompt length so the stream response generator does
-    not have to re-tokenize the prompt on the event loop.
+    Returns ``(seq_id, stream_collector, num_prompt_tokens)``.
+    ``num_prompt_tokens`` is the engine-computed prompt length so the stream
+    response generator does not have to re-tokenize the prompt on the event
+    loop.
     """
-    global engine, _stream_queues, _seq_id_to_request_id
-    global _stream_loops, _request_start_times
-
-    stream_queue: asyncio.Queue = asyncio.Queue()
+    stream_collector = StreamOutputCollector(request_id)
     stream_loop = asyncio.get_running_loop()
-    _stream_queues[request_id] = stream_queue
     _stream_loops[request_id] = stream_loop
     _request_start_times[request_id] = time.time()
 
     def stream_callback(request_output: RequestOutput) -> None:
-        _send_stream_chunk_direct(request_output, request_id, stream_queue, stream_loop)
+        _send_stream_chunk_direct(
+            request_output, request_id, stream_collector, stream_loop
+        )
 
     executor_loop = asyncio.get_event_loop()
 
@@ -861,7 +862,6 @@ async def setup_streaming_request(
         seq = await executor_loop.run_in_executor(None, do_preprocess)
         _validate_sequence_context_length(seq)
     except Exception:
-        _stream_queues.pop(request_id, None)
         _stream_loops.pop(request_id, None)
         _request_start_times.pop(request_id, None)
         if seq is not None:
@@ -873,7 +873,7 @@ async def setup_streaming_request(
     logger.info(f"API: Created request_id={request_id}, seq_id={seq_id}")
     engine.core_mgr.add_request([seq])
 
-    return seq_id, stream_queue, seq.num_prompt_tokens
+    return seq_id, stream_collector, seq.num_prompt_tokens
 
 
 def cleanup_streaming_request(
@@ -892,10 +892,6 @@ def cleanup_streaming_request(
     no-op that just floods the control path (one broadcast per engine core, per
     request).
     """
-    global engine, _stream_queues, _seq_id_to_request_id
-    global _stream_loops, _request_start_times
-
-    _stream_queues.pop(request_id, None)
     _seq_id_to_request_id.pop(seq_id, None)
     _stream_loops.pop(request_id, None)
     _request_start_times.pop(request_id, None)
@@ -1013,33 +1009,29 @@ async def setup_streaming_request_fanout(
     kv_transfer_params: dict[str, Any] | None = None,
     multimodal_data: dict[str, Any] | None = None,
     data_parallel_rank: int | None = None,
-) -> tuple[list[int], asyncio.Queue, int]:
+) -> tuple[list[int], StreamOutputCollector, int]:
     """Fan-out variant of :func:`setup_streaming_request`.
 
     Creates ``sampling_params.n`` sibling sequences sharing one output
-    queue. Every callback pushes ``(sibling_index, chunk_data)`` tuples so
+    collector. Every callback pushes ``(sibling_index, chunk_data)`` tuples so
     the merge-stream consumer can rewrite ``choices[0].index`` correctly.
 
-    Returns ``(seq_ids, shared_queue, num_prompt_tokens)``. All siblings
+    Returns ``(seq_ids, shared_collector, num_prompt_tokens)``. All siblings
     tokenize the same prompt once, so ``num_prompt_tokens`` is shared and lets
     the stream response generator skip re-tokenizing on the event loop.
     """
-    global engine, _stream_queues, _seq_id_to_request_id
-    global _stream_loops, _request_start_times
-
     n = int(sampling_params.n)
     assert n >= 1
 
-    shared_queue: asyncio.Queue = asyncio.Queue()
+    shared_collector = StreamOutputCollector(request_id)
     stream_loop = asyncio.get_running_loop()
-    _stream_queues[request_id] = shared_queue
     _stream_loops[request_id] = stream_loop
     _request_start_times[request_id] = time.time()
 
     def make_callback(idx: int):
         def _cb(request_output: RequestOutput) -> None:
             _send_stream_chunk_tagged(
-                request_output, request_id, idx, shared_queue, stream_loop
+                request_output, request_id, idx, shared_collector, stream_loop
             )
 
         return _cb
@@ -1067,7 +1059,6 @@ async def setup_streaming_request_fanout(
         seqs = await executor_loop.run_in_executor(None, do_preprocess)
         _validate_sequence_context_length(seqs[0])
     except Exception:
-        _stream_queues.pop(request_id, None)
         _stream_loops.pop(request_id, None)
         _request_start_times.pop(request_id, None)
         for seq in seqs:
@@ -1079,7 +1070,7 @@ async def setup_streaming_request_fanout(
         f"API: Created fan-out request_id={request_id}, n={n}, seq_ids={seq_ids}"
     )
     engine.core_mgr.add_request(seqs)
-    return seq_ids, shared_queue, seqs[0].num_prompt_tokens
+    return seq_ids, shared_collector, seqs[0].num_prompt_tokens
 
 
 # ============================================================================
@@ -1119,8 +1110,9 @@ async def _refresh_metrics_once() -> None:
     if engine is None:
         return
     try:
-        timeout = _METRICS_REFRESH_INTERVAL_SECONDS
-        snapshot = await asyncio.to_thread(engine.get_metrics_statistics, timeout)
+        # A local read of the snapshots EngineCore pushes, so it runs inline on
+        # the loop -- no executor thread, and no writer on the control socket.
+        snapshot = engine.get_metrics_statistics()
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -1279,7 +1271,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             stream_input = token_ids if is_multimodal else prompt
             stream_multimodal_data = multimodal_data if is_multimodal else None
             if effective_n > 1:
-                seq_ids, stream_queue, num_prompt_tokens = (
+                seq_ids, stream_collector, num_prompt_tokens = (
                     await setup_streaming_request_fanout(
                         stream_input,
                         sampling_params,
@@ -1292,25 +1284,27 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 gen = stream_chat_response_fanout(
                     request_id,
                     model_name,
-                    stream_queue,
+                    stream_collector,
                     seq_ids,
                     num_prompt_tokens,
                     cleanup_streaming_request,
                     tools=request.tools,
                 )
             else:
-                seq_id, stream_queue, num_prompt_tokens = await setup_streaming_request(
-                    stream_input,
-                    sampling_params,
-                    request_id,
-                    multimodal_data=stream_multimodal_data,
-                    kv_transfer_params=request.kv_transfer_params,
-                    data_parallel_rank=dp_rank,
+                seq_id, stream_collector, num_prompt_tokens = (
+                    await setup_streaming_request(
+                        stream_input,
+                        sampling_params,
+                        request_id,
+                        multimodal_data=stream_multimodal_data,
+                        kv_transfer_params=request.kv_transfer_params,
+                        data_parallel_rank=dp_rank,
+                    )
                 )
                 gen = stream_chat_response(
                     request_id,
                     model_name,
-                    stream_queue,
+                    stream_collector,
                     seq_id,
                     num_prompt_tokens,
                     cleanup_streaming_request,
@@ -1452,7 +1446,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
         # Streaming
         if request.stream:
             if effective_n > 1:
-                seq_ids, stream_queue, num_prompt_tokens = (
+                seq_ids, stream_collector, num_prompt_tokens = (
                     await setup_streaming_request_fanout(
                         request.prompt,
                         sampling_params,
@@ -1464,23 +1458,25 @@ async def completions(request: CompletionRequest, raw_request: Request):
                 gen = stream_completion_response_fanout(
                     request_id,
                     model_name,
-                    stream_queue,
+                    stream_collector,
                     seq_ids,
                     num_prompt_tokens,
                     cleanup_streaming_request,
                 )
             else:
-                seq_id, stream_queue, num_prompt_tokens = await setup_streaming_request(
-                    request.prompt,
-                    sampling_params,
-                    request_id,
-                    kv_transfer_params=request.kv_transfer_params,
-                    data_parallel_rank=dp_rank,
+                seq_id, stream_collector, num_prompt_tokens = (
+                    await setup_streaming_request(
+                        request.prompt,
+                        sampling_params,
+                        request_id,
+                        kv_transfer_params=request.kv_transfer_params,
+                        data_parallel_rank=dp_rank,
+                    )
                 )
                 gen = stream_completion_response(
                     request_id,
                     model_name,
-                    stream_queue,
+                    stream_collector,
                     seq_id,
                     num_prompt_tokens,
                     cleanup_streaming_request,
@@ -1621,8 +1617,8 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
 
         if request.stream:
             # Streaming response
-            seq_id, stream_queue, _num_prompt_tokens = await setup_streaming_request(
-                prompt, sampling_params, request_id
+            seq_id, stream_collector, _num_prompt_tokens = (
+                await setup_streaming_request(prompt, sampling_params, request_id)
             )
 
             async def generate_anthropic_stream():
@@ -1650,7 +1646,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
 
                 try:
                     while True:
-                        chunk_data = await stream_queue.get()
+                        chunk_data = await stream_collector.get()
                         if not message_started:
                             cache_read = chunk_data.get("num_cached_tokens", 0)
                             yield stream_message_start(
@@ -1672,9 +1668,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
 
                             if field == "reasoning_content":
                                 if not _thinking_enabled:
-                                    yield "event: ping\ndata: " + json.dumps(
-                                        {"type": "ping"}
-                                    ) + "\n\n"
+                                    yield _ANTHROPIC_PING_FRAME
                                     continue
                                 if not started_thinking and not started_text:
                                     yield stream_content_block_start(
@@ -2056,7 +2050,7 @@ def main():
     # Wire the batched stream-flush hook: per-seq stream callbacks only buffer
     # their chunks into a thread-local; the engine core manager's output thread
     # calls this flush after each step's callbacks to drain the buffer into the
-    # per-request asyncio queues (one call_soon_threadsafe per event loop).
+    # per-request stream collectors (one call_soon_threadsafe per event loop).
     # Registered lazily here to avoid the api_server <-> engine_core_mgr import
     # cycle; the core manager leaves the hook as None until this resolves it.
     engine.core_mgr._flush_stream_batch_fn = flush_stream_batch
