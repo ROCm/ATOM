@@ -11,9 +11,9 @@ indices, mirroring `aiter.mla.mla_decode_fwd`'s API style.
 Caller contract:
   unified_kv:       [total_pages, D] BF16  (page_size=1)
     Conceptually merges the SWA ring buffer and the compressor paged cache
-    of a single V4 layer. Slots in `[0, swa_pages)` reference SWA entries
-    (state_slot * win + ring); slots in `[swa_pages, ...)` reference
-    compressed-K entries (block_id * K_PER_BLOCK + slot_in_block).
+    of a single V4 layer: one row space holding this layer's sliding-window
+    rows and its compressed blocks alike (see `v4_pool_geometry`), so a row
+    index says nothing about which of the two it names.
   kv_indices: [total_indices] int32 — per-token slot lists, flat.
     Per-token entries live in
     `kv_indices[kv_indptr[t] : kv_indptr[t+1]]`.
@@ -54,12 +54,13 @@ import os
 import torch
 import triton
 import triton.language as tl
-
-from atom.utils.decorators import mark_trace
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.triton.utils.device_info import get_num_sms
-from atom.model_ops.sparse_attn_v4 import _sparse_attn_ragged_torch
 from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
+from aiter.ops.triton.utils.device_info import get_num_sms
+
+from atom.model_ops.sparse_attn_v4 import _sparse_attn_ragged_torch
+from atom.model_ops.v4_kernels.pool_index import row_offset
+from atom.utils.decorators import mark_trace
 
 LOG2E = 1.4426950408889634  # log2(e); folded into qk_scale so softmax can use exp2.
 _MAX_KV_SPLITS = 64  # Hard cap on kv_splits (see _kv_splits_heuristic).
@@ -269,7 +270,7 @@ def _paged_decode_fused_kernel(
 
         kv_raw = tl.load(
             unified_kv_ptr
-            + slot[:, None] * kv_stride_n
+            + row_offset(slot, kv_stride_n)[:, None]
             + d_offs[None, :] * kv_stride_d,
             mask=valid[:, None] & d_mask[None, :],
             other=0.0,
@@ -282,7 +283,9 @@ def _paged_decode_fused_kernel(
             # [BLOCK_K, BLOCK_D] scales tile but in IR is a coalesced
             # NUM_GROUPS-wide load per row.
             scales_full = tl.load(
-                kv_scales_ptr + slot[:, None] * ks_stride_n + g_idx_per_d[None, :],
+                kv_scales_ptr
+                + row_offset(slot, ks_stride_n)[:, None]
+                + g_idx_per_d[None, :],
                 mask=valid[:, None] & d_mask[None, :],
                 other=0.0,
             ).to(q.dtype)
@@ -435,14 +438,16 @@ def _paged_decode_split_kernel(
 
         kv_raw = tl.load(
             unified_kv_ptr
-            + slot[:, None] * kv_stride_n
+            + row_offset(slot, kv_stride_n)[:, None]
             + d_offs[None, :] * kv_stride_d,
             mask=valid[:, None] & d_mask[None, :],
             other=0.0,
         )
         if QUANT_KV:
             scales_full = tl.load(
-                kv_scales_ptr + slot[:, None] * ks_stride_n + g_idx_per_d[None, :],
+                kv_scales_ptr
+                + row_offset(slot, ks_stride_n)[:, None]
+                + g_idx_per_d[None, :],
                 mask=valid[:, None] & d_mask[None, :],
                 other=0.0,
             ).to(q.dtype)

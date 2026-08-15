@@ -3,11 +3,22 @@
 
 """Batched cross-thread dispatch for streaming model output."""
 
+import os
 import threading
+import time
 from asyncio import AbstractEventLoop, Queue
 from collections.abc import Hashable
 from dataclasses import dataclass, field
 from typing import Any
+
+# SSE coalescing. Two tokenizer.decode calls, a queue put/get, a json.dumps
+# and a socket write are paid once per (request, engine step); at high
+# concurrency that fixed cost, not the GPU, is what caps throughput. Holding
+# the buffer open across steps collapses N tokens into one of each (update()
+# takes a list and decodes twice regardless of length). Costs up to this much
+# extra inter-token latency, so it is opt-in. A finished chunk always flushes.
+_COALESCE_S = max(0.0, float(os.environ.get("ATOM_SSE_COALESCE_MS", "0") or 0)) / 1000.0
+_COALESCE_MAX_STEPS = int(os.environ.get("ATOM_SSE_COALESCE_MAX_STEPS", "8") or 8)
 
 
 @dataclass
@@ -56,7 +67,6 @@ class StreamBatchDispatcher:
         self.tokenizer = tokenizer
         self._thread_local = threading.local()
         self._states: dict[Hashable, IncrementalStreamDetokenizer] = {}
-        self._states_lock = threading.Lock()
 
     def enqueue(
         self,
@@ -83,54 +93,89 @@ class StreamBatchDispatcher:
 
     def flush(self) -> None:
         """Detokenize buffered chunks and schedule one drain per event loop."""
-        buf = getattr(self._thread_local, "buf", None)
+        tl = self._thread_local
+        buf = getattr(tl, "buf", None)
         if not buf:
             return
-        self._thread_local.buf = []
+
+        now = time.monotonic()
+        if _COALESCE_S > 0:
+            steps = getattr(tl, "steps", 0) + 1
+            tl.steps = steps
+            if (
+                steps < _COALESCE_MAX_STEPS
+                and now - getattr(tl, "last_flush", 0.0) < _COALESCE_S
+                and not any(i.chunk.get("finished") for i in buf)
+            ):
+                return  # keep accumulating; nothing here is final yet
+        tl.buf = []
+        tl.steps = 0
+        tl.last_flush = now
+
+        # One group per stream. state_key already distinguishes fan-out
+        # siblings, and loop/queue are constant per stream, so the last item
+        # of a group carries the right destination plus the terminal
+        # finish_reason/finished flags.
+        groups: dict[Hashable, list[_BufferedChunk]] = {}
+        for item in buf:
+            groups.setdefault(item.state_key, []).append(item)
 
         by_loop: dict[AbstractEventLoop, list[tuple[Queue, Any]]] = {}
-        for item in buf:
-            state = self._get_state(item.state_key)
-            item.chunk["text"] = state.update(
-                item.chunk.get("token_ids") or [],
-                bool(item.chunk.get("finished")),
-            )
-            if item.chunk.get("finished"):
-                self._drop_state(item.state_key, state)
+        for state_key, items in groups.items():
+            last = items[-1]
+            token_ids = last.chunk.get("token_ids") or []
+            if len(items) > 1:
+                token_ids = []
+                for i in items:
+                    token_ids.extend(i.chunk.get("token_ids") or [])
+                last.chunk["token_ids"] = token_ids
+                for i in items[:-1]:
+                    if "kv_transfer_params" in i.chunk:
+                        last.chunk.setdefault(
+                            "kv_transfer_params", i.chunk["kv_transfer_params"]
+                        )
 
-            payload = item.chunk if item.tag is None else (item.tag, item.chunk)
-            by_loop.setdefault(item.loop, []).append((item.queue, payload))
+            state = self._get_state(state_key)
+            last.chunk["text"] = state.update(
+                token_ids, bool(last.chunk.get("finished"))
+            )
+            if last.chunk.get("finished"):
+                self._drop_state(state_key, state)
+
+            payload = last.chunk if last.tag is None else (last.tag, last.chunk)
+            by_loop.setdefault(last.loop, []).append((last.queue, payload))
 
         for loop, items in by_loop.items():
             loop.call_soon_threadsafe(self._drain_into_queues, items)
 
+    # These three ran under a shared lock, which cost 27% of the API server's
+    # CPU -- _get_state is called once per stream per flush, with all output
+    # threads contending. No lock is needed: each operation below is a single
+    # C-level dict method that no other Python thread can interrupt, and
+    # list() snapshots atomically so discard_request cannot hit "dict changed
+    # size". GIL-dependent; a free-threaded build would need real locks.
+
     def discard_request(self, request_id: str) -> None:
         """Drop direct and fan-out detokenizer state after request cleanup."""
-        with self._states_lock:
-            keys = [
-                key
-                for key in self._states
-                if key == request_id
-                or (isinstance(key, tuple) and key and key[0] == request_id)
-            ]
-            for key in keys:
+        for key in list(self._states):
+            if key == request_id or (
+                isinstance(key, tuple) and key and key[0] == request_id
+            ):
                 self._states.pop(key, None)
 
     def _get_state(self, state_key: Hashable) -> IncrementalStreamDetokenizer:
-        with self._states_lock:
-            state = self._states.get(state_key)
-            if state is None:
-                state = self._states[state_key] = IncrementalStreamDetokenizer(
-                    self.tokenizer
-                )
-            return state
+        state = self._states.get(state_key)
+        if state is None:
+            state = self._states.setdefault(
+                state_key, IncrementalStreamDetokenizer(self.tokenizer)
+            )
+        return state
 
     def _drop_state(
         self, state_key: Hashable, state: IncrementalStreamDetokenizer
     ) -> None:
-        with self._states_lock:
-            if self._states.get(state_key) is state:
-                self._states.pop(state_key)
+        if self._states.get(state_key) is state:
+            self._states.pop(state_key, None)
 
     @staticmethod
     def _drain_into_queues(items: list[tuple[Queue, Any]]) -> None:

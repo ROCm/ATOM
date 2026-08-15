@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 import threading
 import types
@@ -11,11 +12,12 @@ from types import SimpleNamespace
 import pytest
 
 try:
-    import torch  # noqa: F401
+    import torch
 except ModuleNotFoundError:
     sys.modules["torch"] = types.ModuleType("torch")
 
 from atom.kv_transfer.disaggregation import KVConnectorOutput, KVOutputAggregator
+from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload.atom_kv_byte_codec import ATOMKVByteCodec
 from atom.kv_transfer.offload.atom_lmcache_gpu_connector import (
     ATOMLMCacheGPUConnector,
@@ -57,8 +59,15 @@ def _scheduler() -> LMCacheOffloadConnectorScheduler:
     sched._hit_save_floors = {}
     sched._save_tracker = {}
     sched._save_inflight = set()
+    sched._load_inflight_tokens = {}
+    sched._save_inflight_tokens = {}
     sched._lookup_in_step = []
     sched._handoff_loads = set()
+    sched.total_load_requests = 0
+    sched.total_loaded_tokens = 0
+    sched.total_load_failures = 0
+    sched.total_save_requests = 0
+    sched.total_saved_tokens = 0
     sched._min_load_tokens = 0
     sched._lock = threading.Lock()
     sched._done_load = set()
@@ -143,6 +152,129 @@ def test_raw_bytes_metadata_rejects_unaligned_chunk_size():
             atom_block_size=4,
             bytes_per_block=32,
         )
+
+
+@pytest.mark.parametrize(
+    ("cfg", "message"),
+    [
+        (
+            SimpleNamespace(
+                local_disk="/nvme/lmcache",
+                max_local_disk_size=0,
+                max_local_cpu_size=1,
+            ),
+            "LMCACHE_MAX_LOCAL_DISK_SIZE must be > 0",
+        ),
+        (
+            SimpleNamespace(
+                local_disk=None,
+                max_local_disk_size=1,
+                max_local_cpu_size=1,
+            ),
+            "LMCACHE_LOCAL_DISK is missing",
+        ),
+        (
+            SimpleNamespace(
+                local_disk="/nvme/lmcache",
+                max_local_disk_size=1,
+                max_local_cpu_size=0,
+            ),
+            "LMCACHE_MAX_LOCAL_CPU_SIZE > 0",
+        ),
+    ],
+)
+def test_lmcache_disk_config_requires_complete_host_staging(cfg, message):
+    with pytest.raises(ValueError, match=message):
+        offcfg.validate_lmcache_storage_config(cfg)
+
+
+def test_build_lmcache_config_validates_extras_and_keeps_gds_disabled(monkeypatch):
+    fake_config_module = types.ModuleType("lmcache.v1.config")
+
+    class _FakeEngineConfig:
+        @staticmethod
+        def from_env():
+            return SimpleNamespace(
+                chunk_size=256,
+                local_cpu=True,
+                max_local_cpu_size=1,
+                local_disk=None,
+                max_local_disk_size=0,
+                use_gds=True,
+                lookup_server_worker_ids=None,
+            )
+
+    fake_config_module.LMCacheEngineConfig = _FakeEngineConfig
+    monkeypatch.setitem(sys.modules, "lmcache", types.ModuleType("lmcache"))
+    monkeypatch.setitem(sys.modules, "lmcache.v1", types.ModuleType("lmcache.v1"))
+    monkeypatch.setitem(sys.modules, "lmcache.v1.config", fake_config_module)
+
+    cfg = offcfg.build_lmcache_config(
+        {
+            "kv_connector_extra_config": {
+                "lmcache.local_cpu": False,
+                "lmcache.max_local_cpu_size": 2,
+                "lmcache.local_disk": "/nvme/lmcache",
+                "lmcache.max_local_disk_size": 10,
+                "lmcache.use_gds": True,
+            }
+        }
+    )
+
+    assert cfg.local_cpu is False
+    assert cfg.max_local_cpu_size == 2
+    assert cfg.local_disk == "/nvme/lmcache"
+    assert cfg.max_local_disk_size == 10
+    assert cfg.use_gds is False
+    assert cfg.lookup_server_worker_ids == [0]
+
+
+def test_lmcache_disk_startup_fails_if_backend_was_not_created():
+    conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
+    conn._rank = 2
+    conn._engine = SimpleNamespace(
+        storage_manager=SimpleNamespace(
+            list_backends=lambda: {"LocalCPUBackend": "LocalCPUBackend"}
+        )
+    )
+    cfg = SimpleNamespace(
+        local_cpu=False,
+        max_local_cpu_size=1,
+        local_disk="/nvme/lmcache",
+        max_local_disk_size=10,
+        store_location=None,
+        retrieve_locations=None,
+    )
+
+    with pytest.raises(RuntimeError, match="LocalDiskBackend was not created"):
+        conn._validate_and_log_storage_backends(cfg)
+
+
+def test_lmcache_disk_startup_logs_realized_backend_topology(caplog):
+    conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
+    conn._rank = 0
+    conn._engine = SimpleNamespace(
+        storage_manager=SimpleNamespace(
+            list_backends=lambda: {
+                "LocalCPUBackend": "LocalCPUBackend",
+                "LocalDiskBackend": "LocalDiskBackend",
+            }
+        )
+    )
+    cfg = SimpleNamespace(
+        local_cpu=False,
+        max_local_cpu_size=1,
+        local_disk="/nvme/lmcache",
+        max_local_disk_size=10,
+        store_location="LocalDiskBackend",
+        retrieve_locations=["LocalDiskBackend"],
+    )
+
+    with caplog.at_level(logging.INFO, logger="atom"):
+        conn._validate_and_log_storage_backends(cfg)
+
+    assert "LocalDiskBackend" in caplog.text
+    assert "local_disk=/nvme/lmcache" in caplog.text
 
 
 def test_lmcache_connector_maps_token_ranges_to_block_ids():
@@ -1538,3 +1670,23 @@ def test_codec_dsa_fp8_multilayer_including_mtp_round_trip():
             kv_caches[name].index_cache.view(torch.uint8),
             idx.view(torch.uint8),
         )
+
+
+def test_scheduler_offload_statistics_are_cumulative():
+    sched = _scheduler()
+    sched._load_inflight_tokens["1"] = 8192
+    sched._save_inflight_tokens["2"] = 4096
+    sched._save_inflight.add("2")
+
+    sched.load_finished("1")
+    sched.save_finished("2")
+
+    assert sched.get_statistics() == {
+        "load_requests": 1,
+        "loaded_tokens": 8192,
+        "load_failures": 0,
+        "save_requests": 1,
+        "saved_tokens": 4096,
+        "loads_pending": 0,
+        "saves_pending": 0,
+    }

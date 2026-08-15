@@ -107,9 +107,8 @@ class LMCacheOffloadConnector(KVConnectorBase):
         rank, world = tp.rank_in_group, tp.world_size
         self._rank = rank
 
-        cfg = offcfg.build_lmcache_config()
-        offcfg.apply_extra_overrides(
-            cfg, getattr(self._config, "kv_transfer_config", None)
+        cfg = offcfg.build_lmcache_config(
+            getattr(self._config, "kv_transfer_config", None)
         )
         self.chunk_size = int(cfg.chunk_size)
         # num_blocks is the scheduler-visible block count, threaded from the
@@ -142,6 +141,7 @@ class LMCacheOffloadConnector(KVConnectorBase):
         # opaque uint8 object, so keep a supported tensor MemoryFormat.
         self._engine.fmt = MemoryFormat.KV_2LTD
         self._engine.post_init()
+        self._validate_and_log_storage_backends(cfg)
 
         # ZMQ lookup server so the scheduler process can query our hit counts.
         try:
@@ -182,6 +182,41 @@ class LMCacheOffloadConnector(KVConnectorBase):
                 f"transfer_regions={expected} bytes, "
                 f"num_blocks={self._codec.num_blocks}"
             )
+
+    def _validate_and_log_storage_backends(self, cfg) -> None:
+        """Report the realized LMCache tier topology and validate NVMe startup."""
+        storage_manager = getattr(self._engine, "storage_manager", None)
+        backend_names: list[str] = []
+        if storage_manager is not None:
+            list_backends = getattr(storage_manager, "list_backends", None)
+            if callable(list_backends):
+                backend_names = sorted(str(name) for name in list_backends())
+            else:
+                storage_backends = getattr(storage_manager, "storage_backends", {})
+                backend_names = sorted(str(name) for name in storage_backends)
+
+        local_disk = getattr(cfg, "local_disk", None)
+        disk_size_gib = float(getattr(cfg, "max_local_disk_size", 0.0) or 0.0)
+        disk_configured = bool(local_disk) and disk_size_gib > 0
+        if disk_configured and "LocalDiskBackend" not in backend_names:
+            raise RuntimeError(
+                "LMCache local-disk offload was configured but LocalDiskBackend "
+                f"was not created on rank {self._rank}; backends={backend_names}"
+            )
+
+        logger.info(
+            "LMCache offload worker rank=%d storage: backends=%s "
+            "local_cpu=%s max_local_cpu_gib=%s local_disk=%s "
+            "max_local_disk_gib=%s store_location=%s retrieve_locations=%s",
+            self._rank,
+            backend_names,
+            getattr(cfg, "local_cpu", None),
+            getattr(cfg, "max_local_cpu_size", None),
+            local_disk,
+            getattr(cfg, "max_local_disk_size", None),
+            getattr(cfg, "store_location", None),
+            getattr(cfg, "retrieve_locations", None),
+        )
 
     # -- per-step (RPC thread): only enqueue, never copy ------------------
     def start_load_kv(self, metadata) -> None:
@@ -480,8 +515,15 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         # (seq.prefix_hashes_published flips True), chunk by chunk.
         self._save_tracker: dict[str, list] = {}
         self._save_inflight: set[str] = set()
+        self._load_inflight_tokens: dict[str, int] = {}
+        self._save_inflight_tokens: dict[str, int] = {}
         self._lookup_in_step: list[str] = []
         self._handoff_loads: set[str] = set()
+        self.total_load_requests = 0
+        self.total_loaded_tokens = 0
+        self.total_load_failures = 0
+        self.total_save_requests = 0
+        self.total_saved_tokens = 0
         # Unaligned handoff is always on: when the HBM prefix-cache hit is not
         # chunk-aligned, recompute the misaligned head up to the next chunk
         # boundary, then load the aligned remainder from CPU. (Previously gated
@@ -499,8 +541,7 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
             self._min_load_tokens = 8192
 
         try:
-            cfg = offcfg.build_lmcache_config()
-            offcfg.apply_extra_overrides(cfg, kvc)
+            cfg = offcfg.build_lmcache_config(kvc)
             self.chunk_size = int(cfg.chunk_size)
             from lmcache.v1.lookup_client.factory import LookupClientFactory
 
@@ -833,6 +874,7 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
             )
             loading_sids.add(sid)
             self._load_save_floors[sid] = self._chunk_floor(hbm)
+            self._load_inflight_tokens[sid] = max(0, lmc - hbm)
             meta.add_request(
                 LMCacheReqMeta(
                     req_id=seq.id,
@@ -884,6 +926,7 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
             )
             entry[1] = aligned
             self._save_inflight.add(sid)
+            self._save_inflight_tokens[sid] = max(0, aligned - int(saved))
         self._reqs_need_recv.clear()
         return meta
 
@@ -906,10 +949,22 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         return sid in self._save_inflight or self._has_pending_save(seq)
 
     def save_finished(self, req_id) -> None:
-        self._save_inflight.discard(str(req_id))
+        sid = str(req_id)
+        self._save_inflight.discard(sid)
+        saved_tokens = self._save_inflight_tokens.pop(sid, 0)
+        self.total_save_requests += 1
+        self.total_saved_tokens += saved_tokens
+
+    def load_finished(self, req_id) -> None:
+        sid = str(req_id)
+        loaded_tokens = self._load_inflight_tokens.pop(sid, 0)
+        self.total_load_requests += 1
+        self.total_loaded_tokens += loaded_tokens
 
     def load_failed(self, req_id) -> None:
         sid = str(req_id)
+        self._load_inflight_tokens.pop(sid, None)
+        self.total_load_failures += 1
         floor = self._load_save_floors.get(sid)
         entry = self._save_tracker.get(sid)
         if floor is not None and entry is not None:
@@ -922,5 +977,19 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
     def request_finished(self, seq) -> None:
         sid = str(seq.id)
         self._clear_pending_load(sid)
+        self._load_inflight_tokens.pop(sid, None)
         if not self.should_defer_free(seq):
+            self._save_inflight_tokens.pop(sid, None)
             self._save_tracker.pop(sid, None)
+
+    def get_statistics(self) -> dict[str, int]:
+        """Return cumulative and queue-depth stats without worker RPCs."""
+        return {
+            "load_requests": self.total_load_requests,
+            "loaded_tokens": self.total_loaded_tokens,
+            "load_failures": self.total_load_failures,
+            "save_requests": self.total_save_requests,
+            "saved_tokens": self.total_saved_tokens,
+            "loads_pending": len(self._load_inflight_tokens),
+            "saves_pending": len(self._save_inflight_tokens),
+        }

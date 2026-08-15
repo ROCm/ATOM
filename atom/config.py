@@ -881,6 +881,12 @@ class ParallelConfig:
             self.data_parallel_rank = envs.ATOM_DP_RANK
         if envs.is_set("ATOM_DP_RANK_LOCAL"):
             self.data_parallel_rank_local = envs.ATOM_DP_RANK_LOCAL
+        if envs.is_set("ATOM_DP_MASTER_IP"):
+            self.data_parallel_master_ip = envs.ATOM_DP_MASTER_IP
+        if envs.is_set("ATOM_DP_MASTER_PORT"):
+            self.data_parallel_master_port = envs.ATOM_DP_MASTER_PORT
+        if envs.is_set("ATOM_DP_BASE_PORT"):
+            self.data_parallel_base_port = envs.ATOM_DP_BASE_PORT
 
 
 _DSPARK_DEFAULT_MAX_BLOCK = 16
@@ -981,6 +987,12 @@ class SpeculativeConfig:
     draft_model_hf_config: PretrainedConfig | None = None
     use_aux_hidden_state: bool = False
     eagle3_aux_layer_ids: list[int] = field(default_factory=list)
+    # Debug/benchmark knob: when set (float in [0, 1]), the rejection sampler
+    # force-accepts draft tokens with a position-decaying probability calibrated
+    # so the measured mean acceptance rate matches this value, independent of the
+    # real draft/target agreement. Mirrors vLLM's synthetic_acceptance_rate. See
+    # ROCm/ATOM#555.
+    synthetic_acceptance_rate: float | None = None
 
     # model_type → mtp_model_type mapping
     _MTP_TYPE_MAP: ClassVar[dict[str, str]] = {
@@ -1043,6 +1055,13 @@ class SpeculativeConfig:
         return bool(getattr(cfg, "dspark_with_draft", False))
 
     def __post_init__(self):
+        if self.synthetic_acceptance_rate is not None and not (
+            0.0 <= self.synthetic_acceptance_rate <= 1.0
+        ):
+            raise ValueError(
+                "synthetic_acceptance_rate (--spec-decode-acceptance-rate) must "
+                f"be in [0, 1], but got {self.synthetic_acceptance_rate}."
+            )
         if self.draft_model_hf_config is None:
             self.draft_model_hf_config = get_hf_config(
                 self.model, trust_remote_code=True
@@ -1295,6 +1314,11 @@ class Config:
     max_num_batched_tokens: int = 16384
     long_prefill_token_threshold: int = 0
     attn_prefill_chunk_size: int = 16384
+    # Tokens between rungs of the state-checkpoint ladder, shared by every
+    # Pool.STATE class; 0 = no ladder. Must be a multiple of the prefix-cache
+    # hash block size (asserted in BlockManager). See
+    # BlockManager.checkpointers_at.
+    state_checkpoint_interval_tokens: int = 8192
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
     max_model_len: int | None = None

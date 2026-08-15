@@ -10,12 +10,21 @@ value at the last slot with unfilled slots zeroed. No model / engine needed."""
 import pytest
 import torch
 
+# Broad on purpose: under bare non-GPU pytest this import chain fails in more
+# ways than ImportError, and every one of them means the same thing here.
 try:
-    import atom.model_ops.v4_kernels  # noqa: F401  (heavy import chain)
     from aiter import dtypes
-except Exception as _e:  # pragma: no cover - bare-pytest import env
+
+    import atom.model_ops.v4_kernels  # noqa: F401  (heavy import chain)
+except Exception as _e:  # noqa: BLE001
     pytest.skip(f"requires full atom import env: {_e}", allow_module_level=True)
 
+from atom.model_ops.attentions.v4_pool_geometry import (
+    CSA_RATIO,
+    DENSE_RATIO,
+    HCA_RATIO,
+    UnifiedPoolGeometry,
+)
 from atom.model_ops.v4_kernels.state_writes import (
     dspark_paged_window_gather_2buff,
     dspark_paged_window_gather_2buff_reference,
@@ -34,27 +43,42 @@ pytestmark = pytest.mark.skipif(
 )
 
 dev = "cuda"
+RATIOS = [DENSE_RATIO, CSA_RATIO, HCA_RATIO, CSA_RATIO, HCA_RATIO]
 
 
-def _pools(num_pages, block_tables_seed):
+def _geometry(ring_slots, num_slots):
+    """A pool whose window rows are the CSA class's — the widest layer stride,
+    so the interleaving the gather has to follow is actually non-trivial."""
+    return UnifiedPoolGeometry(
+        RATIOS,
+        num_blocks=3,
+        num_slots=num_slots,
+        ring_slots=ring_slots,
+        block_size=256,
+    )
+
+
+def _pools(geometry, block_tables_seed):
     torch.manual_seed(block_tables_seed)
-    src = torch.randn(num_pages, V4_DIM_QK, dtype=torch.bfloat16, device=dev)
+    src = torch.randn(geometry.plane_rows, V4_DIM_QK, dtype=torch.bfloat16, device=dev)
     nope, rope = quantize_bf16_to_v4_2buff_triton(src)
     return nope, rope
 
 
 def test_gather_2buff_matches_reference():
-    bs, block_size, max_blocks, num_pages, W = 3, 8, 6, 128, 10
-    nope, rope = _pools(num_pages, 0)
+    # `W <= cache_size` is a precondition of the gather (a wider draft window
+    # would read rows the ring already recycled); keep the test inside it.
+    bs, ring_slots, num_slots, W = 3, 11, 6, 10
+    geometry = _geometry(ring_slots, num_slots)
+    window = geometry.window_params(CSA_RATIO)
+    nope, rope = _pools(geometry, 0)
     anchor = torch.tensor([20, 3, 40], dtype=torch.int32, device=dev)
-    bt = torch.zeros(bs, max_blocks, dtype=torch.int32, device=dev)
-    bt[0] = torch.tensor([1, 2, 3, 4, 5, 0], dtype=torch.int32)
-    bt[1] = torch.tensor([6, 7, 8, 9, 0, 0], dtype=torch.int32)
-    bt[2] = torch.tensor([10, 11, 12, 13, 14, 15], dtype=torch.int32)
+    # Non-identity slots: indexing by batch id instead would still pass on arange.
+    slots = torch.tensor([3, 0, 5], dtype=torch.int32, device=dev)
 
-    out = dspark_paged_window_gather_2buff(nope, rope, bt, anchor, W, block_size)
+    out = dspark_paged_window_gather_2buff(nope, rope, slots, anchor, W, window)
     ref = dspark_paged_window_gather_2buff_reference(
-        nope, rope, bt, anchor, W, block_size
+        nope, rope, slots, anchor, W, window
     )
     torch.cuda.synchronize()
     assert out.shape == (bs, W, V4_DIM_QK) and out.dtype == torch.bfloat16
@@ -62,21 +86,22 @@ def test_gather_2buff_matches_reference():
 
 
 def test_write_then_gather_roundtrip():
-    bs, block_size, max_blocks, num_pages, W = 2, 8, 8, 256, 12
+    bs, ring_slots, num_slots, W = 2, 13, 8, 12
+    geometry = _geometry(ring_slots, num_slots)
+    params = geometry.window_params(CSA_RATIO)
+    num_pages = geometry.plane_rows
     anchor = torch.tensor([15, 30], dtype=torch.int32, device=dev)
     cu = torch.tensor([0, 1, 2], dtype=torch.int32, device=dev)  # 1 tok/req
-    bt = torch.zeros(bs, max_blocks, dtype=torch.int32, device=dev)
-    bt[0] = torch.arange(1, 1 + max_blocks, dtype=torch.int32)
-    bt[1] = torch.arange(20, 20 + max_blocks, dtype=torch.int32)
+    slots = torch.tensor([6, 1], dtype=torch.int32, device=dev)
 
     nope = torch.zeros(num_pages, V4_DIM_QK_PACKED, dtype=dtypes.fp8, device=dev)
     rope = torch.zeros(num_pages, V4_DIM_ROPE, dtype=torch.bfloat16, device=dev)
     main_kv = torch.randn(bs, V4_DIM_QK, dtype=torch.bfloat16, device=dev)
     k_packed, k_rope = quantize_bf16_to_v4_2buff_triton(main_kv.contiguous())
     swa_write_2buff_prepacked(
-        k_packed, k_rope, anchor.clone(), cu, bt, nope, rope, block_size, 1
+        k_packed, k_rope, anchor.clone(), cu, slots, nope, rope, params, 1
     )
-    window = dspark_paged_window_gather_2buff(nope, rope, bt, anchor, W, block_size)
+    window = dspark_paged_window_gather_2buff(nope, rope, slots, anchor, W, params)
     torch.cuda.synchronize()
 
     want = dequantize_v4_2buff_to_bf16(k_packed, k_rope).to(torch.bfloat16)
