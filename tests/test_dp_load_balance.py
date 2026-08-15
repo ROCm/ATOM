@@ -44,6 +44,8 @@ def _make_mgr(n_ranks, strategy="least_tokens", req_equiv=512):
     mgr._rank_tokens = [0] * n_ranks
     mgr._seq_load = {}
     mgr._lb_lock = Lock()
+    mgr._input_send_lock = Lock()
+    mgr._utility_command_lock = Lock()
     return mgr
 
 

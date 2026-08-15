@@ -383,8 +383,25 @@ class EngineCore:
             while alive:
                 for input_socket, _ in poller.poll():
                     # (RequestType, RequestData)
-                    obj = input_socket.recv(copy=False)
-                    request_type, reqs = pickle.loads(obj)
+                    frames = input_socket.recv_multipart(copy=False)
+                    if len(frames) != 1:
+                        logger.error(
+                            "%s: dropping malformed input message with %d frames",
+                            self.label,
+                            len(frames),
+                        )
+                        continue
+                    try:
+                        request_type, reqs = pickle.loads(frames[0])
+                    except (pickle.UnpicklingError, EOFError, TypeError, ValueError):
+                        prefix = bytes(frames[0].buffer[:16]).hex()
+                        logger.exception(
+                            "%s: dropping malformed input payload (size=%d, prefix=%s)",
+                            self.label,
+                            len(frames[0].buffer),
+                            prefix,
+                        )
+                        continue
                     if request_type == EngineCoreRequestType.ADD:
                         req_ids = [req.id for req in reqs]
                         logger.debug(

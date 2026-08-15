@@ -96,6 +96,30 @@ class CoreManager:
         # what dispatch added, and only for ranks that were actually charged.
         self._seq_load = {}
         self._lb_lock = Lock()
+        # ROUTER sockets are shared by request dispatch, abort handling, and
+        # Prometheus' background utility refresh. ZMQ sockets are not safe for
+        # concurrent use from multiple threads: interleaved multipart frames can
+        # leak a routing-identity frame to the EngineCore as message data.
+        self._input_send_lock = Lock()
+        # A synchronous utility transaction drains and then consumes a shared
+        # response queue. Keep whole transactions ordered so concurrent callers
+        # cannot steal each other's rank responses.
+        self._utility_command_lock = Lock()
+
+    def _send_input_message(
+        self, dp_rank: int, payload: bytes, *, copy: bool = False
+    ) -> None:
+        """Send one routed EngineCore message without multipart interleaving."""
+        with self._input_send_lock:
+            socket = self.input_sockets[dp_rank]
+            if getattr(socket, "closed", False):
+                raise RuntimeError(
+                    f"{self.label}: input socket for DP rank {dp_rank} is closed"
+                )
+            socket.send_multipart(
+                [self.engine_core_identities[dp_rank], payload],
+                copy=copy,
+            )
 
     def __init__(self, config: Config):
         pp_size = config.pipeline_parallel_size
@@ -437,9 +461,11 @@ class CoreManager:
         for dp_rank in range(self.local_engine_count):
             self._shutdown_engine_core_rank(dp_rank)
 
-        for input_socket in self.input_sockets:
-            if not input_socket.closed:
-                input_socket.close()
+        # Serialize close with any in-flight request/metrics send.
+        with self._input_send_lock:
+            for input_socket in self.input_sockets:
+                if not input_socket.closed:
+                    input_socket.close()
 
         for shutdown_path in self.shutdown_paths:
             if shutdown_path:
@@ -501,21 +527,17 @@ class CoreManager:
             # Pipeline parallel (dp=1): requests enter only at stage 0, which
             # drives the pipeline downstream.
             logger.debug(f"{self.label}: Add {len(seqs)} requests to PP head 0")
-            self.input_sockets[0].send_multipart(
-                [
-                    self.engine_core_identities[0],
-                    pickle.dumps((EngineCoreRequestType.ADD, seqs)),
-                ],
+            self._send_input_message(
+                0,
+                pickle.dumps((EngineCoreRequestType.ADD, seqs)),
                 copy=False,
             )
         elif self.local_engine_count == 1:
             # Single DP rank, send all requests
             logger.debug(f"{self.label}: Add {len(seqs)} requests to DP rank 0")
-            self.input_sockets[0].send_multipart(
-                [
-                    self.engine_core_identities[0],
-                    pickle.dumps((EngineCoreRequestType.ADD, seqs)),
-                ],
+            self._send_input_message(
+                0,
+                pickle.dumps((EngineCoreRequestType.ADD, seqs)),
                 copy=False,
             )
         else:
@@ -589,11 +611,9 @@ class CoreManager:
             for dp_rank, rank_seqs in enumerate(dp_seqs):
                 if not rank_seqs:
                     continue
-                self.input_sockets[dp_rank].send_multipart(
-                    [
-                        self.engine_core_identities[dp_rank],
-                        pickle.dumps((EngineCoreRequestType.ADD, rank_seqs)),
-                    ],
+                self._send_input_message(
+                    dp_rank,
+                    pickle.dumps((EngineCoreRequestType.ADD, rank_seqs)),
                     copy=False,
                 )
                 dispatched[dp_rank] = True
@@ -729,22 +749,18 @@ class CoreManager:
                 logger.debug(
                     f"{self.label}: Send utility command '{cmd}' to DP rank {rank}"
                 )
-                self.input_sockets[rank].send_multipart(
-                    [
-                        self.engine_core_identities[rank],
-                        pickle.dumps((EngineCoreRequestType.UTILITY, {"cmd": cmd})),
-                    ],
+                self._send_input_message(
+                    rank,
+                    pickle.dumps((EngineCoreRequestType.UTILITY, {"cmd": cmd})),
                     copy=False,
                 )
         else:
             logger.debug(
                 f"{self.label}: Send utility command '{cmd}' to DP rank {dp_rank}"
             )
-            self.input_sockets[dp_rank].send_multipart(
-                [
-                    self.engine_core_identities[dp_rank],
-                    pickle.dumps((EngineCoreRequestType.UTILITY, {"cmd": cmd})),
-                ],
+            self._send_input_message(
+                dp_rank,
+                pickle.dumps((EngineCoreRequestType.UTILITY, {"cmd": cmd})),
                 copy=False,
             )
 
@@ -772,38 +788,37 @@ class CoreManager:
             logger.debug(
                 f"{self.label}: Broadcast utility command '{cmd}' to DP rank {rank}"
             )
-            self.input_sockets[rank].send_multipart(
-                [
-                    self.engine_core_identities[rank],
-                    serialized_payload,
-                ],
+            self._send_input_message(
+                rank,
+                serialized_payload,
                 copy=True,  # Use copy=True since we're reusing the same buffer
             )
 
     def broadcast_utility_command_sync(
         self, cmd: str, timeout: float = 300.0, **kwargs
     ):
-        # Drain any stale responses that might be left over
-        while not self.utility_response_queue.empty():
-            try:
-                self.utility_response_queue.get_nowait()
-            except queue.Empty:
-                break
+        with self._utility_command_lock:
+            # Drain any stale responses that might be left over.
+            while not self.utility_response_queue.empty():
+                try:
+                    self.utility_response_queue.get_nowait()
+                except queue.Empty:
+                    break
 
-        self.broadcast_utility_command(cmd, **kwargs)
+            self.broadcast_utility_command(cmd, **kwargs)
 
-        # Collect one response per DP rank
-        responses = []
-        for _ in range(self.local_engine_count):
-            try:
-                resp = self.utility_response_queue.get(timeout=timeout)
-                responses.append(resp)
-            except queue.Empty:
-                raise TimeoutError(
-                    f"{self.label}: Timed out waiting for UTILITY_RESPONSE "
-                    f"for command '{cmd}' (timeout={timeout}s)"
-                )
-        return responses
+            # Collect one response per DP rank.
+            responses = []
+            for _ in range(self.local_engine_count):
+                try:
+                    resp = self.utility_response_queue.get(timeout=timeout)
+                    responses.append(resp)
+                except queue.Empty:
+                    raise TimeoutError(
+                        f"{self.label}: Timed out waiting for UTILITY_RESPONSE "
+                        f"for command '{cmd}' (timeout={timeout}s)"
+                    )
+            return responses
 
     def _shutdown_engine_core_rank(self, dp_rank: int):
         if dp_rank >= len(self.engine_core_processes):
@@ -814,11 +829,9 @@ class CoreManager:
             try:
                 input_socket = self.input_sockets[dp_rank]
                 if not input_socket.closed:
-                    input_socket.send_multipart(
-                        [
-                            self.engine_core_identities[dp_rank],
-                            pickle.dumps((EngineCoreRequestType.SHUTDOWN, None)),
-                        ],
+                    self._send_input_message(
+                        dp_rank,
+                        pickle.dumps((EngineCoreRequestType.SHUTDOWN, None)),
                         copy=False,
                     )
                     logger.debug(f"{self.label}: Sent shutdown to DP rank {dp_rank}")
@@ -1079,8 +1092,9 @@ class DisaggCoreManager(CoreManager):
 
         # Send decode payload as-is.
         decode_payload = pickle.dumps((EngineCoreRequestType.ADD, seqs))
-        self.input_sockets[1].send_multipart(
-            [self.engine_core_identities[1], decode_payload],
+        self._send_input_message(
+            1,
+            decode_payload,
             copy=False,
         )
 
@@ -1096,8 +1110,9 @@ class DisaggCoreManager(CoreManager):
             ps.max_tokens = 1
             prefill_seqs.append(ps)
         prefill_payload = pickle.dumps((EngineCoreRequestType.ADD, prefill_seqs))
-        self.input_sockets[0].send_multipart(
-            [self.engine_core_identities[0], prefill_payload],
+        self._send_input_message(
+            0,
+            prefill_payload,
             copy=False,
         )
 
