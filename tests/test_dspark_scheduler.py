@@ -669,6 +669,11 @@ def test_ell_stage_never_reuses_a_slot_whose_copy_is_still_in_flight():
     Guard: a busy slot is skipped for a one-off buffer, and the index parks so
     the same slot is retried next step rather than being silently burned.
     """
+    import pytest
+
+    if not (_torch.cuda.is_available() is True):
+        # _ell_stage allocates pinned memory, which needs a real device.
+        pytest.skip("needs a real CUDA/HIP device to pin the ell staging ring")
 
     class _StubRunnerCfg:
         max_num_seqs = 8
