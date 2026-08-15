@@ -5,6 +5,10 @@ Covers the self-contained, GPU-free pieces: Markov head + Confidence head
 numerics, and SpeculativeConfig DSpark detection/routing.
 """
 
+import pytest
+
+pytest.importorskip("aiter", reason="the compiled draft imports aiter at module load")
+
 import torch
 
 from atom.models.deepseek_v4_dspark import (
@@ -617,20 +621,34 @@ def test_lm_head_and_markov_sampler_are_outside_the_compiled_region():
     assert callable(_DSparkInner.head_and_sample)
 
 
-def test_dummy_run_at_b1_is_padded_off_the_0_1_specialization():
-    # Warmup (is_dummy_run=True) is the first traced call; padding it to B==2
-    # keeps the batch dim symbolic. Safe there because the opaque attention op
-    # synthesizes a zero window and never reads attn_metadata.
+@pytest.mark.parametrize(
+    "is_dummy, B, expect_B",
+    [
+        # Warmup is the first traced call; padding B==1 to 2 keeps the batch dim
+        # symbolic (mark_dynamic specializes size-1). Sound only on a dummy run:
+        # the opaque attention op synthesizes a zero window and never reads
+        # attn_metadata. On a real step attn_metadata has exactly B rows, so
+        # swa_block_tables[:B] would return the real count and the
+        # [window ++ draft] concat would die on mismatched batch dims.
+        (True, 1, 2),
+        (False, 1, 1),
+        (True, 4, 4),
+        (False, 4, 4),
+    ],
+)
+def test_batch_dim_padded_only_for_a_dummy_run_at_b1(is_dummy, B, expect_B):
     from atom.models.deepseek_v4_dspark import DeepseekV4DSpark
 
+    T = 5
     seen = {}
 
     class _StubInner:
         def __call__(self, input_ids, positions, num_draft):
             seen["B"] = input_ids.shape[0]
             seen["positions"] = positions.tolist()
-            B, T = input_ids.shape[0], num_draft
-            return torch.zeros(B * T, 4), torch.zeros(B, T, 4)
+            return torch.zeros(input_ids.shape[0] * num_draft, 4), torch.zeros(
+                input_ids.shape[0], num_draft, 4
+            )
 
         forward = __call__
 
@@ -641,118 +659,30 @@ def test_dummy_run_at_b1_is_padded_off_the_0_1_specialization():
             seen["anchor_B"] = anchor_ids.shape[0]
             return "draft", "conf"
 
-    class _StubCtx:
-        is_dummy_run = True
+    stub = DeepseekV4DSpark.__new__(DeepseekV4DSpark)
+    stub.model = _StubInner()
+    stub.block_size = T
+    stub._compiled_num_draft = None
 
     import atom.utils.forward_context as fc
 
-    stub = DeepseekV4DSpark.__new__(DeepseekV4DSpark)
-    stub.model = _StubInner()
-    stub.block_size = 5
-    stub._compiled_num_draft = None
-
     saved = fc.get_forward_context
-    fc.get_forward_context = lambda: type("_FC", (), {"context": _StubCtx()})()
+    fc.get_forward_context = lambda: type(
+        "_FC", (), {"context": type("_C", (), {"is_dummy_run": is_dummy})()}
+    )()
     try:
         stub.forward_spec(
-            torch.tensor([7], dtype=torch.int32),
-            torch.tensor([11], dtype=torch.int64),
-            num_draft=5,
+            torch.full((B,), 7, dtype=torch.int32),
+            torch.full((B,), 11, dtype=torch.int64),
+            num_draft=T,
         )
     finally:
         fc.get_forward_context = saved
 
-    assert seen["B"] == 2, "dummy B==1 must be padded off the 0/1 specialization"
-    # The pad row must be a copy of the real request, not zeros: a zero position
-    # would gather an uninitialised block-table entry and can fault the GPU.
-    assert seen["positions"] == [11, 11]
-    # ...and the outputs must be sliced back to the real batch.
-    assert seen["normed_rows"] == 5  # 1 * T
-    assert seen["hc_B"] == 1
-    assert seen["anchor_B"] == 1
-
-
-def test_real_step_at_b1_is_never_padded():
-    # THE regression this guards: attn_metadata is built for the real batch, so
-    # swa_block_tables[:B] silently returns the REAL row count, not the padded
-    # one -- the [window ++ draft] concat then dies on mismatched batch dims.
-    from atom.models.deepseek_v4_dspark import DeepseekV4DSpark
-
-    seen = {}
-
-    class _StubInner:
-        def __call__(self, input_ids, positions, num_draft):
-            seen["B"] = input_ids.shape[0]
-            B, T = input_ids.shape[0], num_draft
-            return torch.zeros(B * T, 4), torch.zeros(B, T, 4)
-
-        forward = __call__
-
-        @staticmethod
-        def head_and_sample(normed, hc_hidden, anchor_ids):
-            return "draft", "conf"
-
-    class _StubCtx:
-        is_dummy_run = False
-
-    import atom.utils.forward_context as fc
-
-    stub = DeepseekV4DSpark.__new__(DeepseekV4DSpark)
-    stub.model = _StubInner()
-    stub.block_size = 5
-    stub._compiled_num_draft = None
-
-    saved = fc.get_forward_context
-    fc.get_forward_context = lambda: type("_FC", (), {"context": _StubCtx()})()
-    try:
-        stub.forward_spec(
-            torch.zeros(1, dtype=torch.int32),
-            torch.zeros(1, dtype=torch.int64),
-            num_draft=5,
-        )
-    finally:
-        fc.get_forward_context = saved
-
-    assert seen["B"] == 1, "a real step must never be padded"
-
-
-def test_batch_dim_is_not_padded_when_already_above_one():
-    from atom.models.deepseek_v4_dspark import DeepseekV4DSpark
-
-    seen = {}
-
-    class _StubInner:
-        def __call__(self, input_ids, positions, num_draft):
-            seen["B"] = input_ids.shape[0]
-            B, T = input_ids.shape[0], num_draft
-            return torch.zeros(B * T, 4), torch.zeros(B, T, 4)
-
-        forward = __call__
-
-        @staticmethod
-        def head_and_sample(normed, hc_hidden, anchor_ids):
-            seen["hc_B"] = hc_hidden.shape[0]
-            return "draft", "conf"
-
-    class _StubCtx:
-        is_dummy_run = False
-
-    import atom.utils.forward_context as fc
-
-    stub = DeepseekV4DSpark.__new__(DeepseekV4DSpark)
-    stub.model = _StubInner()
-    stub.block_size = 5
-    stub._compiled_num_draft = None
-
-    saved = fc.get_forward_context
-    fc.get_forward_context = lambda: type("_FC", (), {"context": _StubCtx()})()
-    try:
-        stub.forward_spec(
-            torch.zeros(4, dtype=torch.int32),
-            torch.zeros(4, dtype=torch.int64),
-            num_draft=5,
-        )
-    finally:
-        fc.get_forward_context = saved
-
-    assert seen["B"] == 4 and seen["hc_B"] == 4
+    assert seen["B"] == expect_B
+    if expect_B != B:
+        # The pad row copies the real request: a zero position would gather an
+        # uninitialised block-table entry and can fault the GPU.
+        assert seen["positions"] == [11] * expect_B
+    # Outputs always come back sliced to the real batch.
+    assert (seen["normed_rows"], seen["hc_B"], seen["anchor_B"]) == (B * T, B, B)
