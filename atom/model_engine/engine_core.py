@@ -30,6 +30,11 @@ from atom.utils.distributed.utils import (
 
 logger = logging.getLogger("atom")
 
+# How often each EngineCore publishes its metrics snapshot. Kept at the API
+# server's scrape interval: the exporter reads a cache, so this bounds how
+# stale a Prometheus sample can be.
+METRICS_PUSH_INTERVAL_S = 5.0
+
 
 class EngineCore:
     def __init__(self, config: Config, input_address: str, output_address: str):
@@ -238,9 +243,14 @@ class EngineCore:
 
     def busy_loop(self):
         shutdown = False
+        next_metrics_push = 0.0
         try:
             while True:
                 self.utility_handler.process_queue(self.utility_queue, self)
+                now = time.monotonic()
+                if now >= next_metrics_push:
+                    next_metrics_push = now + METRICS_PUSH_INTERVAL_S
+                    self.utility_handler.push_metrics()
                 shutdown = shutdown or self.pull_and_process_input_queue()
                 if shutdown:
                     break
@@ -461,6 +471,11 @@ class EngineCore:
                     logger.debug(f"{self.label}: sent READY signal")
                     continue
 
+                if isinstance(item, tuple) and item[0] == "METRICS":
+                    obj = pickle.dumps((EngineCoreRequestType.METRICS, item[1]))
+                    socket.send(obj)
+                    continue
+
                 if isinstance(item, tuple) and item[0] == "UTILITY_RESPONSE":
                     # Send utility command response back to CoreManager
                     response_data = item[1]
@@ -539,9 +554,14 @@ class DPEngineCoreProc(EngineCore):
 
     def busy_loop(self):
         shutdown = False
+        next_metrics_push = 0.0
         try:
             while True:
                 self.utility_handler.process_queue(self.utility_queue, self)
+                now = time.monotonic()
+                if now >= next_metrics_push:
+                    next_metrics_push = now + METRICS_PUSH_INTERVAL_S
+                    self.utility_handler.push_metrics()
                 shutdown = shutdown or self.pull_and_process_input_queue()
                 local_unfinished = (
                     not self.scheduler.is_finished()

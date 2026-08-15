@@ -1119,8 +1119,9 @@ async def _refresh_metrics_once() -> None:
     if engine is None:
         return
     try:
-        timeout = _METRICS_REFRESH_INTERVAL_SECONDS
-        snapshot = await asyncio.to_thread(engine.get_metrics_statistics, timeout)
+        # A local read of the snapshots EngineCore pushes, so it runs inline on
+        # the loop -- no executor thread, and no writer on the control socket.
+        snapshot = engine.get_metrics_statistics()
     except asyncio.CancelledError:
         raise
     except Exception:

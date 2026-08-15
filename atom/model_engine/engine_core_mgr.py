@@ -103,6 +103,10 @@ class CoreManager:
         self.control_sockets = []
         self.control_identities = []
         self._control_send_lock = Lock()
+        # dp_rank -> newest metrics snapshot, refreshed by the output threads
+        # from EngineCore's own periodic push. Read directly by the exporter, so
+        # scraping costs no round trip and cannot time out.
+        self.latest_metrics: dict[int, dict] = {}
 
     def __init__(self, config: Config):
         pp_size = config.pipeline_parallel_size
@@ -378,6 +382,8 @@ class CoreManager:
                                     f"{self.label}: flush_stream_batch failed: {e}",
                                     exc_info=True,
                                 )
+                    elif request_type == EngineCoreRequestType.METRICS:
+                        self.latest_metrics[dp_rank] = data
                     elif request_type == EngineCoreRequestType.UTILITY_RESPONSE:
                         self.utility_response_queue.put_nowait(data)
                     elif request_type == EngineCoreRequestType.ADD:
