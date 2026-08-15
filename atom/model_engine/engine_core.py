@@ -95,6 +95,9 @@ class EngineCore:
             config.pool_entries_per_req = block_info.get("pool_entries_per_req", {})
             config.state_transfer_kind = block_info.get("state_transfer_kind", "none")
             config.state_fork_tokens = block_info.get("state_fork_tokens", 0)
+            config.state_readable_midstep = block_info.get(
+                "state_readable_midstep", False
+            )
             ret = self.runner_mgr.call_func(
                 "allocate_kv_cache", num_blocks, wait_out=True
             )

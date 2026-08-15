@@ -15,8 +15,10 @@
 
 from math import inf, isinf
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
+import torch
 from conftest import MockConfig
 
 from atom.model_engine.block_manager import BlockManager
@@ -1232,9 +1234,12 @@ class TestDecodePublishGate:
 class StubStateCache:
     """Minimal `StateCache`: a fixed room and a hit it can be told to cap."""
 
-    def __init__(self, successor_room=inf, cap=None, enabled=True):
+    def __init__(
+        self, successor_room=inf, cap=None, enabled=True, readable_midstep=False
+    ):
         self.successor_room = successor_room
         self.enabled = enabled
+        self.readable_midstep = readable_midstep
         self._cap = cap
 
     def applies(self, seq):
@@ -1244,6 +1249,15 @@ class StubStateCache:
         return P if self._cap is None else min(P, self._cap)
 
     def checkpoint(self, seq, boundary_blocks, h):
+        pass
+
+    def reserve_midstep(self, seq, positions):
+        return []
+
+    def publish_midstep(self, reservations):
+        pass
+
+    def cancel_midstep(self, reservations):
         pass
 
 
@@ -1366,6 +1380,13 @@ class TestGatedHitFixpoint:
 
 INTERVAL = 4 * BLOCK
 PROMPT = list(range(44))  # 11 blocks; last never reused, so 10 are hittable
+# A prompt that diverges from `PROMPT` at token 28, mid-interval and nowhere
+# near either prompt's end. This is the traffic the demand is for now that the
+# prompt-end anchor exists: on a conversation that just grows, the position the
+# next turn resumes at *is* the previous turn's end, and the anchor reserves it
+# up front rather than one disappointed request late. What the anchor cannot
+# reserve is a branch point, because no prompt ever ended there.
+BRANCH = list(range(28)) + list(range(900, 916))
 
 
 def demand_config(**overrides):
@@ -1390,19 +1411,25 @@ class TestDemandDrivenCheckpoints:
     answers is reuse being declined only for want of a checkpoint. The request
     that finds the gap is the one that pays for it — it collects none of that
     reuse and has to compute the prefix anyway.
+
+    Scoped to branch points since the prompt-end anchor landed. A conversation
+    that only grows resumes at the previous turn's end, and the anchor reserves
+    that proactively — see `TestPromptEndAnchor`, which inherited the cases
+    these tests used to make. What no anchor can reserve is a position no prompt
+    ever ended at, and that is what these now use.
     """
 
     def test_the_gap_becomes_a_rung_off_the_grid(self):
         bm = BlockManager(demand_config())
         run_prompt_on_the_ladder(bm, stateful_seq(PROMPT))
 
-        second = stateful_seq(PROMPT)
-        assert bm.can_allocate(second) == 8  # the grid's last rung, 32 tokens
-        assert second.num_wanted_hit_blocks == 9  # what a checkpoint would give
-        assert second.checkpoint_demand_pos == 36
-        # Off the grid, and to the right of the last rung the grid offers: the
-        # demand carries its own fork room, so `limit` does not cap it.
-        assert 36 % INTERVAL
+        second = stateful_seq(BRANCH)
+        assert bm.can_allocate(second) == 0  # nothing resumable at the branch
+        assert second.num_wanted_hit_blocks == 7  # what a checkpoint would give
+        assert second.checkpoint_demand_pos == 28
+        # Off the grid: the demand carries its own fork room, so it sits where
+        # the request asked rather than where the interval would have put it.
+        assert 28 % INTERVAL
         assert bm.checkpoint_limit(second) == 32
 
     def test_the_third_request_finds_what_the_second_was_missing(self):
@@ -1410,16 +1437,18 @@ class TestDemandDrivenCheckpoints:
         bm = BlockManager(demand_config())
 
         first = stateful_seq(PROMPT)
-        assert run_prompt_on_the_ladder(bm, first) == [32]  # the grid alone
+        # 32 is the grid's last rung; 36 is `first`'s own end, anchored.
+        assert run_prompt_on_the_ladder(bm, first) == [32, 36]
         assert first.checkpoint_demand_pos == 0  # nothing was cached to fall short
 
-        second = stateful_seq(PROMPT)
+        second = stateful_seq(BRANCH)
         bm.allocate(second, bm.can_allocate(second))
-        assert second.num_cached_tokens == 32  # the grid got it this far...
-        assert second.checkpoint_demand_pos == 36  # ...one block short of the rest
-        assert forward_on_the_ladder(bm, second) == [36]  # one cut, for the gap
+        assert second.num_cached_tokens == 0  # the branch point is unreachable...
+        assert second.checkpoint_demand_pos == 28  # ...and this is where it is
+        # The demand at 28, then the grid rung and this prompt's own anchor.
+        assert forward_on_the_ladder(bm, second) == [28, 32, 36]
 
-        third = stateful_seq(PROMPT)
+        third = stateful_seq(BRANCH)
         bm.allocate(third, bm.can_allocate(third))
         assert third.num_cached_tokens == 36
         assert third.checkpoint_demand_pos == 0  # nothing left to want
@@ -1456,15 +1485,21 @@ class TestDemandDrivenCheckpoints:
         """
         bm = BlockManager(demand_config())
         short = list(range(16))
-        run_prompt_on_the_ladder(bm, stateful_seq(short))
+        short_branch = list(range(4)) + list(range(900, 912))
+        first = stateful_seq(short)
+        run_prompt_on_the_ladder(bm, first)
+        assert bm.checkpoint_limit(first) == 0  # the grid places no rung here
 
-        second = stateful_seq(short)
+        second = stateful_seq(short_branch)
         assert bm.can_allocate(second) == 0
-        assert bm.checkpoint_limit(second) == 0  # the grid places no rung here
-        assert second.checkpoint_demand_pos == 8  # the demand is its own rung
-        assert run_prompt_on_the_ladder(bm, second) == [8]
+        assert bm.checkpoint_limit(second) == 0
+        assert second.checkpoint_demand_pos == 4  # the demand is its own rung
+        # 4 is the demand, 8 is this prompt's own end anchored — and the anchor
+        # is reachable here only because it is the demand's neighbour, not its
+        # substitute: no prompt has ever ended at 4.
+        assert run_prompt_on_the_ladder(bm, second) == [4, 8]
 
-        third = stateful_seq(short)
+        third = stateful_seq(short_branch)
         assert bm.can_allocate(third) == 2  # ...and the next one collects it
         assert third.checkpoint_demand_pos == 0  # nothing left to want
         assert run_prompt_on_the_ladder(bm, third) == []
@@ -1473,14 +1508,19 @@ class TestDemandDrivenCheckpoints:
         """The cut and the keep read the same call, so they cannot drift."""
         bm = BlockManager(demand_config())
         run_prompt_on_the_ladder(bm, stateful_seq(PROMPT))
-        seq = stateful_seq(PROMPT)
+        seq = stateful_seq(BRANCH)
         bm.allocate(seq, bm.can_allocate(seq))
-        assert seq.checkpoint_demand_pos == 36
+        assert seq.checkpoint_demand_pos == 28
+        assert seq.checkpoint_end_pos == 36
 
-        n = len(PROMPT)
+        n = len(BRANCH)
         cuts = {bm.checkpoint_cut(seq, pos - 1, pos) for pos in range(1, n + 1)}
         rungs = {pos for pos in range(1, n + 1) if bm.checkpointers_at(seq, pos)}
-        assert cuts - {0} == rungs == {16, 32, 36}
+        # 16 and 32 from the grid, 28 the demand, 36 the anchor. Swept one
+        # token at a time, so every position is offered to both sides — which
+        # is what would catch `checkpoint_cut` picking a target `checkpointers_at`
+        # then refuses, the failure the two-candidate ladder made possible.
+        assert cuts - {0} == rungs == {16, 28, 32, 36}
 
     def test_a_recorded_demand_is_always_a_position_something_keeps(self):
         """Otherwise the cut is an extra forward that stores nothing.
@@ -1509,6 +1549,261 @@ class TestDemandDrivenCheckpoints:
         warm = Sequence(PROMPT, BLOCK, has_per_req_cache=False)
         assert bm.can_allocate(warm) == 10  # nothing was gating it
         assert warm.checkpoint_demand_pos == 0
+
+
+class TestPromptEndAnchor:
+    """A rung reserved at this prompt's own end, before anyone asks for it.
+
+    The demand is reactive: it exists only once a hit has already been refused
+    for want of a checkpoint, which is one request too late for the position
+    that serves the next turn of a conversation. On agentic traffic that
+    position is where nearly all the reuse is — over the SemiAnalysis cc-traces
+    93.5% of resumes land on a previous prompt's end and 0.0% on the interval
+    ladder — so it is reserved up front instead of waited for.
+
+    These cases are the ones `TestDemandDrivenCheckpoints` used to make, before
+    the anchor started serving the growing-conversation traffic they replayed.
+    """
+
+    def test_the_second_request_resumes_where_the_first_ended(self):
+        """No disappointed request in between — this is the whole point."""
+        bm = BlockManager(demand_config())
+        first = stateful_seq(PROMPT)
+        run_prompt_on_the_ladder(bm, first)
+        assert first.checkpoint_end_pos == 36
+
+        second = stateful_seq(PROMPT)
+        # 9 blocks = 36 tokens, the anchor. The grid alone would have given 8,
+        # and the demand would have taken until the third request to find it.
+        assert bm.can_allocate(second) == 9
+        assert second.num_wanted_hit_blocks == 9  # nothing left on the table
+        assert second.checkpoint_demand_pos == 0  # so nothing to demand
+
+    def test_the_anchor_steps_back_to_a_position_that_is_keepable(self):
+        """The exact end is never keepable, so insisting on it anchors nothing.
+
+        A checkpoint at P binds the forward after it to carry `successor_room`
+        tokens, and a grid-floored prompt end leaves at most `hash_block_size`
+        minus one. Wherever the room reaches a block or more — MIN_FORK 8
+        against BLOCK 4 here, V4's 131 against 256 in production — the floored
+        end fails that test for *every* prompt: `checkpoint_cut` would shorten
+        a chunk and `checkpointers_at` would then refuse to keep anything, with
+        no error to show for it. Stepping back to the rightmost keepable grid
+        position costs at most one block of the next turn's reuse.
+        """
+        bm = BlockManager(demand_config())
+        for n in (12, 40, 44, 45, 50):
+            seq = stateful_seq(list(range(1000 * n, 1000 * n + n)))
+            bm.can_allocate(seq)
+            anchor = seq.checkpoint_end_pos
+            assert anchor % BLOCK == 0, n  # on the hash grid
+            assert n - anchor >= MIN_FORK, n  # and it leaves the fork its room
+            assert bm.checkpointers_at(seq, anchor), n  # so it is really kept
+
+    def test_a_prompt_with_no_room_for_an_anchor_gets_none(self):
+        bm = BlockManager(demand_config())
+        seq = stateful_seq(list(range(MIN_FORK)))
+        bm.can_allocate(seq)
+        assert seq.checkpoint_end_pos == 0
+
+    def test_the_cut_and_the_keep_agree_at_every_anchor(self):
+        """Swept, because a cut nothing keeps is a forward spent on nothing."""
+        for n in range(BLOCK, 80):
+            bm = BlockManager(demand_config())
+            tokens = list(range(1000 * n, 1000 * n + n))
+            for _ in range(3):
+                seq = stateful_seq(tokens)
+                bm.allocate(seq, bm.can_allocate(seq))
+                cuts = set(forward_on_the_ladder(bm, seq))
+                keeps = {p for p in range(1, n + 1) if bm.checkpointers_at(seq, p)}
+                assert not cuts - keeps, (n, sorted(cuts), sorted(keeps))
+
+    def test_the_anchor_does_not_displace_the_grid_rung(self):
+        """Both are cut for, because they serve different classes.
+
+        `checkpoint_cut` takes the *earliest* candidate for exactly this: with
+        the anchor at 36 and a rung at 32, returning the later one means the
+        forward never ends at 32 and the rung is not deferred but lost. A class
+        the anchor is out of reach for would then lose the rung it had been
+        resuming from, on every request, permanently.
+        """
+        bm = BlockManager(demand_config())
+        first = stateful_seq(PROMPT)
+        assert run_prompt_on_the_ladder(bm, first) == [32, 36]
+
+        bm.state_caches = (*bm.state_caches, StubStateCache(cap=8))
+        second = stateful_seq(PROMPT)
+        assert bm.can_allocate(second) == 8  # the rung, still there
+        assert second.num_wanted_hit_blocks == 8  # and no gap to demand
+        assert second.checkpoint_demand_pos == 0
+
+    def test_a_stateless_model_records_no_anchor(self):
+        bm = BlockManager(
+            demand_config(
+                pool_entries={}, state_transfer_kind="none", state_fork_tokens=0
+            )
+        )
+        cold = Sequence(PROMPT, BLOCK, has_per_req_cache=False)
+        bm.can_allocate(cold)
+        assert cold.checkpoint_end_pos == 0
+
+    def test_deallocate_clears_the_anchor(self):
+        """Sequences are recycled; a stale anchor would cut the next prompt."""
+        bm = BlockManager(demand_config())
+        seq = stateful_seq(PROMPT)
+        run_prompt_on_the_ladder(bm, seq)
+        assert seq.checkpoint_end_pos == 36
+        bm.deallocate(seq)
+        assert seq.checkpoint_end_pos == 0
+
+    def test_anchor_cuts_are_counted_apart_from_demand_cuts(self):
+        """The demand counter is a convergence signal and must stay readable.
+
+        The anchor fires on nearly every prompt while the demand is supposed to
+        fall silent once the gap it found is filled. Folding the two together
+        would leave `chunks_cut_for_demand` growing forever on healthy traffic,
+        which is precisely the shape it exists to expose.
+        """
+        bm = BlockManager(demand_config())
+        run_prompt_on_the_ladder(bm, stateful_seq(PROMPT))
+        assert bm.checkpoint_funnel()["chunks_cut_for_demand"] == 0
+        assert bm.checkpoint_funnel()["chunks_cut_for_end"] == 1
+
+        second = stateful_seq(BRANCH)
+        bm.allocate(second, bm.can_allocate(second))
+        forward_on_the_ladder(bm, second)
+        assert bm.checkpoint_funnel()["chunks_cut_for_demand"] == 1
+        assert bm.checkpoint_funnel()["chunks_cut_for_end"] == 2
+
+
+class TestLadderOffButCheckpointingOn:
+    """`-1`: no interval rungs, demand and anchor still place checkpoints.
+
+    Every rung costs the prompt that keeps it an extra prefill chunk, and the
+    interval is a guess about where reuse will resume. The other two placements
+    are not guesses — one is a position a request was refused at, the other is
+    where the next turn of a conversation demonstrably starts. On the
+    SemiAnalysis cc-traces the ladder placed ~30x the writes of the two of them
+    together and caught reuse they already reach: 0.0% of resumes landed on an
+    8192 rung.
+
+    Spelled `-1` rather than folded into `0` because `0` is the documented off
+    switch *and* reachable by accident — `test_interval_snaps_onto_the_hash_-
+    block_grid` shows an off-grid interval snapping down to it. Giving `0` a
+    second meaning would turn a `--block-size` typo from failing safe into
+    silently enabling a policy.
+    """
+
+    def test_minus_one_survives_the_grid_snap(self):
+        bm = BlockManager(ckpt_config(state_checkpoint_interval_tokens=-1))
+        assert bm.state_checkpoint_interval_tokens == -1
+
+    def test_the_grid_places_no_rung(self):
+        bm = BlockManager(demand_config(state_checkpoint_interval_tokens=-1))
+        seq = stateful_seq(PROMPT)
+        bm.can_allocate(seq)
+        assert bm.checkpoint_limit(seq) == 0
+        # 32 is a rung under the default interval, and nothing under -1. The
+        # anchor at 36 is the only aimed position left.
+        assert not bm.checkpointers_at(seq, 32)
+        assert bm.checkpointers_at(seq, 36)
+
+    def test_the_anchor_still_reaches_the_same_hit(self):
+        """The point of the mode: the ladder's reuse for one cut, not two."""
+        bm = BlockManager(demand_config(state_checkpoint_interval_tokens=-1))
+        first = stateful_seq(PROMPT)
+        assert run_prompt_on_the_ladder(bm, first) == [36]  # the ladder cut 32 too
+
+        second = stateful_seq(PROMPT)
+        assert bm.can_allocate(second) == 9  # what the full ladder also gave
+        assert second.checkpoint_demand_pos == 0
+
+    def test_the_demand_still_fires(self):
+        """This is what -1 buys over 0, and why it is not spelled 0."""
+        bm = BlockManager(demand_config(state_checkpoint_interval_tokens=-1))
+        run_prompt_on_the_ladder(bm, stateful_seq(PROMPT))
+
+        second = stateful_seq(BRANCH)
+        assert bm.can_allocate(second) == 0
+        assert second.checkpoint_demand_pos == 28
+        bm.allocate(second, 0)
+        assert forward_on_the_ladder(bm, second) == [28, 36]  # no rung at 32
+
+        third = stateful_seq(BRANCH)
+        # 9, not the demand's 7: by now `second` has left its own anchor at 36,
+        # which is further along than the branch point. The demand's rung is
+        # what got `second` past 28 to reach the end and place that anchor —
+        # under interval=0 the pair would still be stuck at 0.
+        assert bm.can_allocate(third) == 9
+
+    def test_zero_would_have_left_that_reuse_on_the_floor(self):
+        """The same three requests under 0, as the contrast -1 exists for."""
+        bm = BlockManager(demand_config(state_checkpoint_interval_tokens=0))
+        run_prompt_on_the_ladder(bm, stateful_seq(PROMPT))
+        for _ in range(3):
+            seq = stateful_seq(BRANCH)
+            assert bm.can_allocate(seq) == 0
+            bm.allocate(seq, 0)
+            assert forward_on_the_ladder(bm, seq) == []
+
+    def test_generation_keeps_no_checkpoints(self):
+        """Decode spacing is measured in intervals, and there is no interval.
+
+        Both aimed placements are prompt positions, so an unaimed position past
+        the prompt has nothing to match. Stated as a test because the arithmetic
+        that would otherwise run — `pos - last < -1` — is true for every pos,
+        which would checkpoint on every decode step.
+        """
+        bm = BlockManager(demand_config(state_checkpoint_interval_tokens=-1))
+        seq = stateful_seq(PROMPT)
+        bm.allocate(seq, bm.can_allocate(seq))
+        assert not any(
+            bm.checkpointers_at(seq, pos, aimed=False)
+            for pos in range(BLOCK, 200, BLOCK)
+        )
+
+    def test_it_costs_fewer_cuts_than_the_ladder(self):
+        """The whole justification, swept rather than asserted at one length."""
+        totals = {}
+        for interval in (INTERVAL, -1):
+            cuts = 0
+            for n in range(BLOCK, 80):
+                bm = BlockManager(
+                    demand_config(state_checkpoint_interval_tokens=interval)
+                )
+                tokens = list(range(1000 * n, 1000 * n + n))
+                for _ in range(3):
+                    seq = stateful_seq(tokens)
+                    bm.allocate(seq, bm.can_allocate(seq))
+                    cuts += len(forward_on_the_ladder(bm, seq))
+            totals[interval] = cuts
+        assert totals[-1] < totals[INTERVAL]
+
+    def test_every_cut_is_still_kept(self):
+        for n in range(BLOCK, 80):
+            bm = BlockManager(demand_config(state_checkpoint_interval_tokens=-1))
+            tokens = list(range(1000 * n, 1000 * n + n))
+            for _ in range(3):
+                seq = stateful_seq(tokens)
+                bm.allocate(seq, bm.can_allocate(seq))
+                cuts = set(forward_on_the_ladder(bm, seq))
+                keeps = {p for p in range(1, n + 1) if bm.checkpointers_at(seq, p)}
+                assert not cuts - keeps, (n, sorted(cuts), sorted(keeps))
+
+    def test_interval_zero_anchors_nothing(self):
+        """0 is off for *all three* placements, not just the grid.
+
+        The anchor is recorded outside the grid, so it does not inherit the
+        grid's off switch — it has to check the interval itself. Without that
+        check `checkpoint_cut` shortens a chunk on every prompt and
+        `checkpointers_at` then refuses to keep anything, which is a per-request
+        cost with nothing stored and no error raised.
+        """
+        bm = BlockManager(demand_config(state_checkpoint_interval_tokens=0))
+        seq = stateful_seq(PROMPT)
+        bm.can_allocate(seq)
+        assert seq.checkpoint_end_pos == 0
+        assert run_prompt_on_the_ladder(bm, stateful_seq(PROMPT)) == []
 
 
 class TestCacheStatsAttribution:
@@ -1603,3 +1898,476 @@ class TestGenerationIsHeldToSpacingNotTheGrid:
         second = stateful_seq(PROMPT)
         bm.allocate(second, bm.can_allocate(second))
         assert second.checkpoint_demand_pos < second.num_prompt_tokens
+
+
+# ── midstep checkpoints ────────────────────────────────────────────────────
+
+
+def midstep_config(**overrides):
+    """`demand_config` for a backend that reads its state mid-forward."""
+    overrides.setdefault("state_readable_midstep", True)
+    return demand_config(**overrides)
+
+
+def forward_midstep(bm: BlockManager, seq: Sequence) -> list[int]:
+    """Run an admitted seq's prompt the way a readable backend does.
+
+    The scheduler's loop with the cut still consulted — it should never fire —
+    and `plan_midstep` where `Scheduler.schedule` puts it, once the chunk is
+    settled. Returns the positions checkpointed, which under this backend is
+    what the ladder yields *without* the forwards it used to cost.
+    """
+    kept = []
+    while seq.num_cached_tokens < seq.num_prompt_tokens:
+        start = seq.num_cached_tokens
+        chunk = seq.num_prompt_tokens - start
+        assert not bm.checkpoint_cut(seq, start, start + chunk)
+        bm.plan_midstep(seq, start, start + chunk)
+        kept.extend(p for _g, p, _h in seq.midstep_reservations)
+        bm.hash_blocks(seq, chunk, start_tokens=start)
+        seq.num_cached_tokens = start + chunk
+    return kept
+
+
+class TestMidstepCheckpoints:
+    """Every rung of the ladder, kept inside one full-length forward.
+
+    A checkpoint is state as of position P, and the only reason the scheduler
+    shortens a prefill chunk onto P is that most backends can hand back state
+    only as of the forward's last token. A chunk kernel does not have that
+    limitation: it materializes the recurrent state at every interior chunk
+    boundary on its way through, so P is a copy rather than a forward.
+
+    So the ladder's cost model changes and its reach does not. `checkpoint_cut`
+    returns 0 for every seq and `checkpointers_at` defers to the midstep path;
+    the two gates are one change, because suppressing the cut alone leaves
+    `checkpointers_at` refusing off-grid positions it is then handed and keeping
+    nothing at all, silently.
+    """
+
+    def test_the_ladder_costs_no_forwards(self):
+        bm = BlockManager(midstep_config())
+        seq = stateful_seq(PROMPT)
+        bm.allocate(seq, bm.can_allocate(seq))
+        # The unreadable backend cuts at 32 and again at 36 for this prompt.
+        assert forward_midstep(bm, seq) == [32, 36]
+        assert bm.checkpoint_funnel()["chunks_cut_for_end"] == 0
+        assert bm.checkpoint_funnel()["chunks_cut_for_demand"] == 0
+
+    def test_the_reuse_is_the_same_reuse(self):
+        """The point: same hit as the cutting ladder, without the cuts."""
+        for readable in (False, True):
+            bm = BlockManager(demand_config(state_readable_midstep=readable))
+            first = stateful_seq(PROMPT)
+            bm.allocate(first, bm.can_allocate(first))
+            (forward_midstep if readable else forward_on_the_ladder)(bm, first)
+
+            second = stateful_seq(PROMPT)
+            assert bm.can_allocate(second) == 9, readable
+
+    def test_both_positions_are_separately_resumable(self):
+        """Not one checkpoint at the rightmost — one per position, each keyed.
+
+        A single group filed under the last position would look identical on a
+        prompt that reuses the whole prefix, and fail the moment a request
+        branches before it.
+        """
+        bm = BlockManager(midstep_config())
+        first = stateful_seq(PROMPT)
+        bm.allocate(first, bm.can_allocate(first))
+        forward_midstep(bm, first)
+
+        assert len(set(bm.state.hash_to_group.values())) == 2
+
+        # A request sharing 32 tokens and then diverging cannot use the anchor
+        # at 36, so its hit of 8 blocks is 32's checkpoint and could have come
+        # from nowhere else. Filing both positions under one group would leave
+        # this at 0.
+        branch_at_32 = stateful_seq(list(range(32)) + list(range(900, 916)))
+        assert bm.can_allocate(branch_at_32) == 8
+        # And the whole-prefix case still reaches the further one.
+        assert bm.can_allocate(stateful_seq(PROMPT)) == 9
+
+    def test_the_boundary_is_not_kept_twice(self):
+        """`checkpointers_at` has to defer, or both paths keep the same rung.
+
+        The midstep path already filed 32, and a forward that also ends there
+        is exactly what the ladder used to produce — so without the gate the
+        rung is kept a second time. Two groups on one hash, the loser sitting
+        free and unindexed; and under `fork` the seq gives its live group away
+        and takes a fresh one, binding the next forward to refill a replacement
+        it had no reason to need.
+        """
+        bm = BlockManager(midstep_config())
+        seq = stateful_seq(PROMPT)
+        bm.allocate(seq, bm.can_allocate(seq))
+        group = seq.per_req_cache_group
+        bm.plan_midstep(seq, 0, 32)
+        bm.hash_blocks(seq, 32, start_tokens=0)
+
+        assert bm.checkpoint_funnel()["checkpoints_kept"] == 1
+        assert seq.per_req_cache_group == group  # not forked out from under it
+        assert seq.state_fork_src == -1
+
+    def test_a_position_the_hash_chain_cannot_name_is_skipped(self):
+        """No hash, no way back — so reserving one would spend a group on air."""
+        bm = BlockManager(midstep_config())
+        seq = stateful_seq(PROMPT)
+        bm.can_allocate(seq)
+        seq.block_hashes = seq.block_hashes[:2]  # 8 tokens' worth
+        assert bm.midstep_positions(seq, 0, 44) == []
+
+    def test_the_chain_covers_the_whole_prompt_past_the_miss(self):
+        """`block_hashes` stops at the first miss; the anchor is past it."""
+        bm = BlockManager(midstep_config())
+        seq = stateful_seq(PROMPT)
+        bm.can_allocate(seq)
+        assert len(seq.block_hashes) == len(PROMPT) // BLOCK
+        # And it is the same chain `hash_blocks` publishes, or a resumer would
+        # look the checkpoint up under a hash nothing files it under.
+        bm.allocate(seq, 0)
+        bm.hash_blocks(seq, seq.num_prompt_tokens)
+        published = [bm.kv.block(b).hash for b in seq.block_table]
+        assert published == seq.block_hashes
+
+    def test_an_unreadable_backend_keeps_its_chain_empty(self):
+        """A hash pass over every prompt, for a field nothing would read."""
+        bm = BlockManager(demand_config())
+        seq = stateful_seq(PROMPT)
+        bm.can_allocate(seq)
+        assert seq.block_hashes == []
+
+    def test_nothing_is_findable_until_the_forward_has_run(self):
+        """Publishing at reservation time indexes bytes nobody wrote."""
+        bm = BlockManager(midstep_config())
+        seq = stateful_seq(PROMPT)
+        bm.allocate(seq, bm.can_allocate(seq))
+        bm.plan_midstep(seq, 0, 44)
+        assert seq.midstep_reservations
+        assert bm.state.hash_to_group == {}
+
+        bm.hash_blocks(seq, 44)
+        assert len(bm.state.hash_to_group) == 2
+        assert seq.midstep_reservations == []  # drained, not left to re-publish
+
+    def test_a_cancelled_reservation_is_returned_vacant(self):
+        bm = BlockManager(midstep_config())
+        seq = stateful_seq(PROMPT)
+        bm.allocate(seq, bm.can_allocate(seq))
+        free_before = bm.state.num_free()
+        bm.plan_midstep(seq, 0, 44)
+        assert bm.state.num_free() == free_before - 2
+
+        bm.cancel_midstep(seq)
+        assert bm.state.num_free() == free_before
+        assert bm.state.hash_to_group == {}  # holding nothing findable
+
+    def test_replanning_returns_the_previous_forward_s_groups(self):
+        """A plan is good for one forward; a second means the first never ran."""
+        bm = BlockManager(midstep_config())
+        seq = stateful_seq(PROMPT)
+        bm.allocate(seq, bm.can_allocate(seq))
+        bm.plan_midstep(seq, 0, 44)
+        free_with_one_plan = bm.state.num_free()
+        bm.plan_midstep(seq, 0, 44)
+        assert bm.state.num_free() == free_with_one_plan
+
+    def test_deallocate_returns_them_too(self):
+        """Preemption frees through here, and the forward is not going to run."""
+        bm = BlockManager(midstep_config())
+        seq = stateful_seq(PROMPT)
+        bm.allocate(seq, bm.can_allocate(seq))
+        free_before = bm.state.num_free()
+        bm.plan_midstep(seq, 0, 44)
+        bm.deallocate(seq)
+        # `free_before` counted the seq's own group as taken; deallocate hands
+        # that back as well, so the reservations are the difference.
+        assert bm.state.num_free() == free_before + 1
+        assert seq.midstep_reservations == []
+
+    def test_a_shortage_keeps_the_earliest_position(self):
+        """Best-effort, in the order a later forward would reach them.
+
+        The earliest is the one an earlier chunk arrives at, and the one a
+        branching request is most likely to still be able to use.
+        """
+        bm = BlockManager(midstep_config(pool_entries={"state": 2}))
+        seq = stateful_seq(PROMPT)
+        bm.allocate(seq, bm.can_allocate(seq))
+        bm.plan_midstep(seq, 0, 44)
+        assert [p for _g, p, _h in seq.midstep_reservations] == [32]
+        assert bm.checkpoint_funnel()["checkpoints_dropped"] == 1
+
+    def test_reservations_never_starve_an_admission(self):
+        """`has_free` is the gate, so the worst case is a deferred admission."""
+        bm = BlockManager(midstep_config(pool_entries={"state": 3}))
+        first = stateful_seq(PROMPT)
+        bm.allocate(first, bm.can_allocate(first))
+        bm.plan_midstep(first, 0, 44)
+        # Two groups reserved, one held by `first` — the pool is empty, and a
+        # second request is refused rather than handed a reserved group.
+        second = stateful_seq(PROMPT)
+        assert bm.can_allocate(second) == -1
+        assert bm.state.num_free() == 0
+
+    def test_generation_still_checkpoints_the_ordinary_way(self):
+        """Midstep is a prefill affair; a decode step ends where acceptance says.
+
+        `checkpointers_at` defers only on the aimed path, so an unaimed caller
+        gets the same answer a fork backend has always given.
+        """
+        bm = BlockManager(midstep_config())
+        seq = stateful_seq(PROMPT)
+        bm.allocate(seq, bm.can_allocate(seq))
+        assert bm.checkpointers_at(seq, INTERVAL + BLOCK, MIN_FORK, aimed=False)
+
+    def test_the_prompt_s_checkpoints_space_the_decode_ones(self):
+        """`last_checkpoint_pos` is the decode spacing rule's only input.
+
+        A prompt that filed a midstep checkpoint at its end and left the
+        watermark at 0 would let the first decode boundary keep another one
+        immediately, which is what the interval exists to prevent.
+        """
+        bm = BlockManager(midstep_config())
+        seq = stateful_seq(PROMPT)
+        bm.allocate(seq, bm.can_allocate(seq))
+        forward_midstep(bm, seq)
+        assert seq.last_checkpoint_pos == 36
+
+    def test_one_unreadable_class_keeps_the_cut(self):
+        """The gate is `all`, not `any`: that class still needs the forward.
+
+        A readable class loses nothing by being handed a position it would have
+        taken anyway, and an unreadable one loses everything by being handed a
+        forward that does not end there.
+        """
+        bm = BlockManager(midstep_config())
+        bm.state_caches = (*bm.state_caches, StubStateCache(successor_room=0))
+        seq = stateful_seq(PROMPT)
+        bm.allocate(seq, bm.can_allocate(seq))
+        assert bm.checkpoint_cut(seq, 0, 44) == 32
+        assert bm.checkpointers_at(seq, 32)
+
+    def test_interval_zero_reserves_nothing(self):
+        """0 is off for the midstep path too, as it is for the other three."""
+        bm = BlockManager(midstep_config(state_checkpoint_interval_tokens=0))
+        seq = stateful_seq(PROMPT)
+        bm.allocate(seq, bm.can_allocate(seq))
+        assert bm.midstep_positions(seq, 0, 44) == []
+
+    def test_minus_one_reserves_the_anchor_alone(self):
+        """The two changes compose: no grid, no cuts, and the reuse still there."""
+        bm = BlockManager(midstep_config(state_checkpoint_interval_tokens=-1))
+        first = stateful_seq(PROMPT)
+        bm.allocate(first, bm.can_allocate(first))
+        assert forward_midstep(bm, first) == [36]
+
+        second = stateful_seq(PROMPT)
+        assert bm.can_allocate(second) == 9
+
+    def test_a_stateless_model_reserves_nothing(self):
+        bm = BlockManager(
+            midstep_config(
+                pool_entries={}, state_transfer_kind="none", state_fork_tokens=0
+            )
+        )
+        cold = Sequence(PROMPT, BLOCK, has_per_req_cache=False)
+        bm.can_allocate(cold)
+        assert cold.block_hashes == []
+        assert bm.midstep_positions(cold, 0, 44) == []
+
+
+#: The two backend modules `gdn_backends` re-imports under the aiter stub.
+#: Evicted before the import so the fixture gets real source rather than a
+#: copy some earlier test already bound to real aiter.
+_UNDER_TEST = (
+    "atom.model_ops.attentions.gdn_attn",
+    "atom.model_ops.attentions.kimi_mla_gdn_attn",
+)
+
+
+@pytest.fixture
+def gdn_backends():
+    """`(GDNStateMixin, _KimiMLAGDNCommon)`, importable without a GPU.
+
+    Both modules do `from aiter import ...` at module scope, and importing
+    `aiter` anywhere runs its arch probe, which on a CPU-only box raises
+    (`0 active drivers`) and then falls back to a `jax` import that is not
+    installed. The two dtype/transfer declarations under test are plain Python
+    on `atom` classes and need none of that, so `aiter` is stubbed for the
+    duration of the import.
+
+    A finder rather than a fixed `sys.modules` list: the transitive set is 19
+    submodules today and is aiter's business, not this test's, so enumerating
+    it would turn an unrelated aiter refactor into a failure here. Everything
+    it fabricates is a MagicMock, so any test that leaned on real aiter
+    behaviour through it would be asserting against a mock rather than
+    silently passing — but nothing here does: the assertions read
+    `_state_dtypes` and `state_transfer`, which touch only `torch` and
+    `atom.model_engine.state_pool`.
+
+    Scoped and restored. `tests/test_pp.py` installs its stubs at module
+    scope and leaves them, which is invisible when it runs alone and makes
+    collection order matter when it does not.
+    """
+    import importlib.abc
+    import importlib.machinery
+    import sys
+    import types
+
+    class _Stub(types.ModuleType):
+        def __getattr__(self, name):
+            if name.startswith("__"):
+                raise AttributeError(name)
+            mock = MagicMock(name=f"{self.__name__}.{name}")
+            setattr(self, name, mock)
+            return mock
+
+    class _Loader(importlib.abc.Loader):
+        def create_module(self, spec):
+            return _Stub(spec.name)
+
+        def exec_module(self, module):
+            pass
+
+    class _Finder(importlib.abc.MetaPathFinder):
+        def find_spec(self, fullname, path, target=None):
+            if fullname == "aiter" or fullname.startswith("aiter."):
+                return importlib.machinery.ModuleSpec(
+                    fullname, _Loader(), is_package=True
+                )
+            return None
+
+    def _fake(mod):
+        """A `sys.modules` entry no import system produced.
+
+        Other test files install bare `ModuleType`s over real `atom` modules
+        (`atom.utils.forward_context`, `atom.model_ops.attention_gdn`, ... —
+        six of them by the time the suite reaches this file) and never take
+        them out. Any of those on the import path below re-raises as
+        `ImportError: cannot import name X (unknown location)`, so they get
+        evicted here and restored after, exactly like the aiter ones. Keyed on
+        the absence of `__file__`/`__path__` rather than on a list of names,
+        since the set is other files' business and grows.
+        """
+        return (
+            mod is not None
+            and getattr(mod, "__file__", None) is None
+            and not hasattr(mod, "__path__")
+        )
+
+    finder = _Finder()
+    # Drop any real aiter already imported, the atom modules that closed over
+    # it, and any atom module some earlier test left stubbed, so the imports
+    # below run against real source.
+    stale = [
+        k
+        for k in sys.modules
+        if k.split(".")[0] == "aiter"
+        or k.startswith(_UNDER_TEST)
+        or (k.split(".")[0] == "atom" and _fake(sys.modules[k]))
+    ]
+    saved = {k: sys.modules[k] for k in stale}
+    for k in stale:
+        del sys.modules[k]
+    # Snapshot after the eviction: anything `atom` that appears between here
+    # and the `finally` was imported while aiter was a mock.
+    preexisting = {k for k in sys.modules if k.split(".")[0] == "atom"}
+    sys.meta_path.insert(0, finder)
+    try:
+        from atom.model_ops.attentions.gdn_attn import GDNStateMixin
+        from atom.model_ops.attentions.kimi_mla_gdn_attn import _KimiMLAGDNCommon
+
+        yield GDNStateMixin, _KimiMLAGDNCommon
+    finally:
+        sys.meta_path.remove(finder)
+        # Everything imported under the stub must go, not just the two entry
+        # points: the aiter mocks reached whatever `atom` modules were pulled
+        # in transitively, and a later test importing one would get a class
+        # holding MagicMocks. Those are real modules with a real `__file__`,
+        # so they are identified by the snapshot rather than by `_fake`.
+        # Restoring `saved` last puts the other files' stubs back, so this
+        # fixture is not observable either way.
+        for k in [
+            k
+            for k in sys.modules
+            if k.split(".")[0] == "aiter"
+            or (k.split(".")[0] == "atom" and k not in preexisting)
+        ]:
+            del sys.modules[k]
+        sys.modules.update(saved)
+
+
+class TestMidstepExactnessPremise:
+    """The interior-checkpoint path is only lossless while two dtypes agree.
+
+    A checkpoint taken mid-prompt is sliced out of the chunk kernel's `h`,
+    which is `k.new_empty(...)` — the activation dtype. The alternative it
+    replaced, cutting the prefill so the position became a step end, stores an
+    fp32 final state. Those differ, and the only reason the substitution is
+    exact is that the destination pool is the activation dtype too, so both
+    paths round identically on the way in. Verified on GPU in
+    `tests/test_gdn_state_checkpoint_gpu.py`; this pins the premise where CI
+    can see it, since that file skips without a device.
+
+    Widen the pool without widening `h` and nothing breaks loudly: the writes
+    still land, the shapes still match, and cached requests quietly resume from
+    a state carrying bf16 rounding the uncached ones do not. That is an
+    accuracy regression visible only as an eval delta between runs that hit the
+    cache and runs that miss, which is close to the hardest kind to trace back.
+    """
+
+    @staticmethod
+    def _dtypes(gdn_cls, model_type):
+        """`_state_dtypes` without constructing a builder.
+
+        The method reads only `model_runner.config`, so a namespace standing in
+        for the runner is enough and keeps this off the GPU.
+        """
+        runner = SimpleNamespace(
+            config=SimpleNamespace(
+                torch_dtype=torch.bfloat16,
+                hf_config=SimpleNamespace(model_type=model_type),
+            )
+        )
+        return gdn_cls._state_dtypes(SimpleNamespace(model_runner=runner))
+
+    def test_gdn_pool_matches_the_activation_dtype(self, gdn_backends):
+        """Both halves, because a checkpoint writes both."""
+        gdn_cls, _ = gdn_backends
+
+        assert self._dtypes(gdn_cls, "qwen3_next") == (torch.bfloat16, torch.bfloat16)
+
+    def test_kimi_is_the_one_pool_wider_than_h(self, gdn_backends):
+        """And is excluded from the midstep path — for an unrelated reason.
+
+        KDA is off it because `chunk_kda` never exposes per-chunk states at all
+        (`_KimiMLAGDNCommon.state_transfer`). That its pool would also break the
+        exactness argument is a second, independent reason, so porting
+        `chunk_kda_paged` to lift the first would not be enough on its own.
+        """
+        gdn_cls, _ = gdn_backends
+
+        assert self._dtypes(gdn_cls, "kimi_linear") == (torch.bfloat16, torch.float32)
+
+    def test_midstep_backends_are_the_ones_with_a_matching_pool(self, gdn_backends):
+        """The rule, rather than today's two answers to it.
+
+        A backend that declares `readable_midstep` and allocates a pool wider
+        than its activations gets silent per-request accuracy drift. Asserted
+        as an invariant over the classes that declare it, so a third GDN-like
+        backend added later has to satisfy it rather than merely resemble one.
+        """
+        gdn_cls, kimi_cls = gdn_backends
+
+        for cls, model_type in (
+            (gdn_cls, "qwen3_next"),
+            (kimi_cls, "kimi_linear"),
+        ):
+            midstep = cls.state_transfer(SimpleNamespace()).readable_midstep
+            dtypes = self._dtypes(gdn_cls, model_type)
+            uniform = set(dtypes) == {torch.bfloat16}
+            assert not midstep or uniform, (
+                f"{cls.__name__} reads checkpoints out of bf16 `h` but pools "
+                f"state at {dtypes}"
+            )

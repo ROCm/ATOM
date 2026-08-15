@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import logging
 import math
 from dataclasses import dataclass
 
@@ -12,7 +13,11 @@ from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.state_pool import StateTransfer
 from atom.model_ops.attention_gdn import GatedDeltaNet
-from atom.utils import CpuGpuBuffer
+from atom.model_ops.fla_ops.replayssm import (
+    replayssm_buffer_shapes,
+    replayssm_commit,
+)
+from atom.utils import CpuGpuBuffer, envs
 from atom.utils.forward_context import AttentionMetaData, Context
 
 from .aiter_attention import (
@@ -21,6 +26,8 @@ from .aiter_attention import (
     kv_indices_generate_triton,
 )
 from .sub_pool_spec import SubPoolSpec, page_pool, state_pool
+
+logger = logging.getLogger("atom")
 
 
 class GDNAttentionBackend(AiterBackend):
@@ -67,6 +74,28 @@ class GDNAttentionMetadata:
     non_spec_token_indx: torch.Tensor | None = None
 
     num_accepted_tokens: torch.Tensor | None = None  # shape: [batch,]
+
+    # Recurrent-state checkpoints this step must write, as the device index
+    # tensors `_checkpoint_targets` builds, or None when it reaches none. Built
+    # once per step and read by every layer.
+    ssm_checkpoints: dict | None = None
+    # First chunk index of each sequence within this step's `h`, the same
+    # mapping the chunk kernel builds internally. Only computed when there are
+    # checkpoints to place against it.
+    ssm_chunk_offsets: torch.Tensor | None = None
+
+    # --- ReplaySSM ---------------------------------------------------------
+    # When enabled the recurrent state is NOT snapshotted per speculative
+    # token, so `spec_state_indices_tensor` collapses to a single slot per
+    # request and `slot_idx` (1-D) addresses both the checkpoint pool and the
+    # record buffers.  `write_pos` is the per-slot committed-record cursor,
+    # advanced once per forward by `replayssm_commit` (never by a layer).
+    replayssm: bool = False
+    slot_idx: torch.Tensor | None = None  # shape: [batch,]
+    write_pos: torch.Tensor | None = None  # shape: [num_slots,]
+    replayssm_cache_len: int = 0
+    replayssm_route: str = "auto"
+    replayssm_max_query_len: int = 1
 
     # The following attributes are for triton implementation of causal_conv1d
     nums_dict: dict | None = None
@@ -133,6 +162,35 @@ class GDNStateMixin:
         if hasattr(model_runner, "drafter"):
             self.num_spec = model_runner.drafter.mtp_k
         self.use_spec_decode = self.num_spec > 0
+
+        # --- ReplaySSM ------------------------------------------------------
+        # The verify window is mtp_k+1 tokens (anchor + drafts); the record
+        # buffer has to hold two of them for the early-flush invariant.
+        self.replayssm = envs.ATOM_ENABLE_REPLAYSSM
+        self.replayssm_max_query_len = self.num_spec + 1
+        self.replayssm_route = envs.ATOM_REPLAYSSM_ROUTE
+        self.replayssm_cache_len = 0
+        if self.replayssm:
+            requested_cache_len = envs.ATOM_REPLAYSSM_CACHE_LEN
+            min_cache_len = 2 * self.replayssm_max_query_len
+            self.replayssm_cache_len = max(requested_cache_len, min_cache_len)
+            if self.replayssm_cache_len != requested_cache_len:
+                logger.warning(
+                    "ATOM_REPLAYSSM_CACHE_LEN=%d is below the required "
+                    "2*(mtp_k+1)=%d; raising it to %d.",
+                    requested_cache_len,
+                    min_cache_len,
+                    self.replayssm_cache_len,
+                )
+            logger.info(
+                "ReplaySSM enabled for linear attention: cache_len=%d, "
+                "route=%s, verify window=%d (1 state slot per request instead "
+                "of %d).",
+                self.replayssm_cache_len,
+                self.replayssm_route,
+                self.replayssm_max_query_len,
+                self.num_spec + 1,
+            )
 
         self.spec_state_indices_tensor = CpuGpuBuffer(
             (self.max_bs, self.num_spec + 1),
@@ -256,6 +314,40 @@ class GDNStateMixin:
             self.model_runner.num_spec_tokens,
         )
 
+    def _replayssm_buffer_shapes(self):
+        """Per-slot (k, u, g) record buffer shapes, or None when disabled."""
+        if not self.replayssm:
+            return None
+        hf = self.model_runner.config.hf_config
+        tp = get_tp_group().world_size
+        return replayssm_buffer_shapes(
+            self.replayssm_cache_len,
+            hf.linear_num_value_heads // tp,
+            hf.linear_key_head_dim,
+            hf.linear_value_head_dim,
+            self._is_kda(),
+        )
+
+    def _is_kda(self) -> bool:
+        return (
+            getattr(self.model_runner.config.hf_config, "model_type", None)
+            == "kimi_linear"
+        )
+
+    def _replayssm_bytes_per_slot(self) -> int:
+        """Record-buffer bytes per slot, summed over all linear-attn layers."""
+        shapes = self._replayssm_buffer_shapes()
+        if shapes is None:
+            return 0
+        rec_dtype = self.model_runner.config.torch_dtype
+        sk, su, sg = shapes
+        per_layer = (
+            math.prod(sk) * rec_dtype.itemsize
+            + math.prod(su) * rec_dtype.itemsize
+            + math.prod(sg) * 4  # g stays fp32: it is exponentiated on rebuild
+        )
+        return self.model_runner.num_gdn_attn_state * per_layer
+
     def state_transfer(self) -> StateTransfer:
         """A fork whose successor forward need only carry one token.
 
@@ -273,12 +365,43 @@ class GDNStateMixin:
         A fork rather than a copy because the state is two per-family tensors
         rather than one contiguous entry, so there is no single range to
         duplicate — and at one token the fork binds almost nothing anyway.
+
+        Midstep-readable, which is a separate claim and rests on separate
+        machinery: the chunk kernel materializes the recurrent state at every
+        64-token boundary and `write_state_checkpoints` copies those out, so a
+        checkpoint inside a prompt is a copy rather than a shortened forward.
+        The engine stops cutting prefill chunks onto the checkpoint ladder for
+        this backend — see `BlockManager.checkpoint_cut`. True here only
+        because `_checkpoint_targets` and the copy-out kernel exist; a backend
+        that declares it without them keeps zero checkpoints and says nothing.
+
+        Costs no accuracy, which is worth stating because the obvious reading
+        says it must: `h` is bf16 while the recurrence carries fp32, so a state
+        sliced out of it is pre-rounded. The shortened forward it replaces
+        rounds the same fp32 value on the way into the pool, though, because
+        the two dtypes are the same one — `h` is allocated as `k.new_empty`
+        and `_state_dtypes` returns `config.torch_dtype` — so the rounding is
+        common to both paths and the difference is nil. Measured on MI355: the
+        checkpoint matches a cut prefill's stored state exactly across 56
+        (seed, length, boundary) combinations, and resuming from one reproduces
+        the remaining tokens' outputs bit for bit. See
+        `tests/test_gdn_state_checkpoint_gpu.py`.
+
+        That argument is about the two dtypes agreeing, not about the copy, so
+        it does not survive a pool allocated at higher precision than `h`.
+        `_state_dtypes` builds exactly one such pool — kimi_linear's fp32 v
+        side — and that model is already off this path for a different reason
+        (`_KimiMLAGDNCommon.state_transfer`).
         """
-        return StateTransfer.fork(1)
+        return StateTransfer.fork(1, readable_midstep=True)
 
     def state_spec(self) -> SubPoolSpec:
         """The GDN state pool: conv_state + temporal_state over all GDN
         layers, with one extra slot per speculative token for rollback.
+
+        Under ReplaySSM there is no per-draft fan-out: `slots_per_req()` drops
+        to 1 and the (k, u, g) record buffers ride along in the same per-slot
+        budget.
 
         Concrete builders splice this into their `sub_pool_specs()` alongside
         whatever paged KV pool they own.
@@ -290,14 +413,27 @@ class GDNStateMixin:
         )
         return state_pool(
             STATE_SLOT_CLASS,
-            self.model_runner.num_gdn_attn_state * per_layer,
-            entries_per_req=1 + self.num_spec,
+            self.model_runner.num_gdn_attn_state * per_layer
+            + self._replayssm_bytes_per_slot(),
+            entries_per_req=self.slots_per_req(),
         )
+
+    def slots_per_req(self) -> int:
+        """Baseline GDN reserves one extra state slot per speculative token so
+        a rejected draft can be rolled back by resuming from a different slot.
+
+        ReplaySSM reconstructs the state from cached inputs instead, so one
+        slot per request is enough regardless of the MTP window.  (This also
+        drops the conv-state over-allocation that came along for the ride:
+        `causal_conv1d_update` only ever addresses column 0, because it rolls
+        the conv window back in place via `num_accepted_tokens`.)
+        """
+        return 1 if self.replayssm else 1 + self.num_spec
 
     def allocate_per_req_cache(
         self, entries: dict[str, int]
     ) -> dict[str, torch.Tensor]:
-        """Allocate mamba_k_cache / mamba_v_cache.
+        """Allocate mamba_k_cache / mamba_v_cache (+ ReplaySSM buffers).
 
         Names preserved for backward compat with `attention_gdn.py` which
         accesses them as `model_runner.mamba_{k,v}_cache`.
@@ -306,7 +442,7 @@ class GDNStateMixin:
         shape_k, shape_v = self._state_shape_for_runner()
         dt_k, dt_v = self._state_dtypes()
         n = self.model_runner.num_gdn_attn_state
-        return {
+        out = {
             "mamba_k_cache": torch.zeros(
                 (n, num_slots) + shape_k, dtype=dt_k, device="cuda"
             ),
@@ -314,13 +450,37 @@ class GDNStateMixin:
                 (n, num_slots) + shape_v, dtype=dt_v, device="cuda"
             ),
         }
+        shapes = self._replayssm_buffer_shapes()
+        if shapes is not None:
+            sk, su, sg = shapes
+            rec_dtype = self.model_runner.config.torch_dtype
+            out["replayssm_buf_k"] = torch.zeros(
+                (n, num_slots) + sk, dtype=rec_dtype, device="cuda"
+            )
+            out["replayssm_buf_u"] = torch.zeros(
+                (n, num_slots) + su, dtype=rec_dtype, device="cuda"
+            )
+            out["replayssm_buf_g"] = torch.zeros(
+                (n, num_slots) + sg, dtype=torch.float32, device="cuda"
+            )
+            # One cursor per slot, shared by every linear-attention layer:
+            # the record index depends on the sequence's decode history, not
+            # on which layer is running.
+            out["replayssm_write_pos"] = torch.zeros(
+                num_slots, dtype=torch.int32, device="cuda"
+            )
+        return out
 
     def copy_state_entries(self, pairs: list[tuple[int, int]]) -> None:
         """Duplicate a group's whole GDN state, both families, all layers.
 
-        A group is `1 + num_spec` consecutive slots — the extra ones hold the
-        per-draft states a rejected speculation rolls back to — so a group moves
-        as that whole span or the rollback slots go with the wrong owner.
+        A group is `slots_per_req()` consecutive slots — under the baseline the
+        extra ones hold the per-draft states a rejected speculation rolls back
+        to, so a group moves as that whole span or the rollback slots go with
+        the wrong owner. Under ReplaySSM the group is a single slot (rollback
+        is a cursor move, not a spare state), and reading the span off
+        `slots_per_req()` rather than `num_spec` is what keeps the relocation
+        from walking into the next request's slot.
 
         GDN checkpoints by forking, not by copying, so this is not on the
         checkpoint path: it exists because moving the pool's boundary has to be
@@ -332,7 +492,7 @@ class GDNStateMixin:
         group's rows are strided rather than contiguous and there is no single
         range to copy. `_foreach_copy_` keeps it to one launch for the batch.
         """
-        span = 1 + self.num_spec
+        span = self.slots_per_req()
         caches = (self.model_runner.mamba_k_cache, self.model_runner.mamba_v_cache)
         destinations, sources = [], []
         for src_group, dst_group in pairs:
@@ -343,11 +503,104 @@ class GDNStateMixin:
         if destinations:
             torch._foreach_copy_(destinations, sources)
 
+    def _checkpoint_targets(self, batch: ScheduledBatch) -> dict | None:
+        """Checkpoints this step reaches, as device index tensors.
+
+        Every reserved position this step covers, `cached < p <= cached +
+        scheduled`, is a target — INCLUDING one at the step's end. That end
+        case needs its own copy like any other: the chunk kernel leaves the
+        final state in the sequence's RUNTIME slot, and a checkpoint group is
+        never the runtime group. Assuming otherwise leaves the checkpoint
+        unwritten while `commit_midstep` publishes it anyway, so a later
+        request resumes from whatever the group's previous tenant left behind.
+
+        `is_end` marks those targets, because their source differs: the state
+        at the end of a sequence's tokens is not in `h`, which holds chunk
+        boundaries strictly before the end — `chunk_offsets[row] + T // 64` is
+        already the NEXT sequence's first chunk. It exists only in the runtime
+        slot, so the kernel reads `runtime_slots[i]` instead.
+
+        Built once per step, not per layer: every GDN layer copies the same
+        targets, so the H2D transfer is hoisted here and each layer just
+        launches one kernel over it.
+
+        Offsets are relative to the start of the sequence's slice OF THIS
+        STEP. `h` and the conv input only ever hold this step's tokens, and
+        `cu_seqlens` / `chunk_offsets` locate each sequence within them — so
+        the kernel reconstructs an absolute index as `cu_seqlens[row] + off`
+        (conv) or `chunk_offsets[row] + off // 64` (SSM). Both bases are
+        per-sequence: omitting them is what made an earlier Python-loop
+        version silently capture one sequence's state into another's
+        checkpoint whenever a batch held two prefills.
+
+        A target is dropped when this step holds too few tokens before it to
+        fill the conv window. Both halves of a checkpoint must land together —
+        an SSM state at P paired with a conv window from elsewhere is silently
+        wrong, and worse than no checkpoint at all, because it is findable.
+
+        Slots, not a separate checkpoint region: a checkpoint here IS an
+        ordinary pool group, so its destination is `group * slots_per_req()`,
+        the same arithmetic every other slot on this path uses. (The upstream
+        branch appends checkpoints after the runtime slots and offsets them by
+        a `state_cache_base`; that region does not exist in this pool.) Only
+        the group's first slot is written — under the baseline the extra
+        `num_spec` slots are speculation rollback state a resumed prefix has no
+        use for; under ReplaySSM the group is a single slot and there are none.
+        Either way the group-to-slot stride is `slots_per_req()`, not a bare
+        `1 + num_spec` — ReplaySSM collapses it to 1, so hardcoding the wider
+        stride here would scatter checkpoints into the wrong requests' slots.
+        """
+        all_saves = getattr(batch, "state_save_all", None)
+        if not all_saves:
+            return None
+        # Tokens of conv history a checkpoint needs behind it: the conv state
+        # width. From the config, so it tracks the model rather than assuming.
+        state_len = self.model_runner.config.hf_config.linear_conv_kernel_dim - 1
+        cached = batch.num_cached_tokens
+        sched = batch.num_scheduled_tokens
+        groups = batch.per_req_cache_groups
+        spr = self.slots_per_req()
+        limit = self.model_runner.mamba_k_cache.shape[1]
+
+        found = []
+        # A seq may hold several reservations (a grid rung, a demand, the
+        # prompt-end anchor); take every one this step reaches.
+        for i, reservations in enumerate(all_saves):
+            if i >= len(groups):
+                continue
+            start = int(cached[i])
+            end = start + int(sched[i])
+            for dst_group, p in reservations:
+                dst = int(dst_group) * spr
+                p = int(p)
+                # `dst >= limit` would mean the scheduler's pool outgrew this
+                # rank's tensor; skipping degrades to "no checkpoint", which
+                # is always safe, where writing would corrupt another slot.
+                if not 0 <= dst < limit:
+                    continue
+                if not (start + state_len <= p <= end):
+                    continue
+                found.append((i, dst, p - start, int(p == end), groups[i] * spr))
+        if not found:
+            return None
+
+        def mk(col):
+            return torch.tensor(col, dtype=torch.int32, device=self.device)
+
+        rows, slots, offs, is_end, runtime = zip(*found)
+        return {
+            "rows": mk(rows),
+            "slots": mk(slots),
+            "offs": mk(offs),
+            "is_end": mk(is_end),
+            "runtime": mk(runtime),
+        }
+
     def prepare_state_indices(self, batch: ScheduledBatch, with_spec: bool = False):
         non_spec_state_indices = self.non_spec_state_indices_tensor.np
         non_spec_state_indices_in = self.non_spec_state_indices_in_tensor.np
         spec_state_indices = self.spec_state_indices_tensor.np
-        slots_per_group = 1 + self.num_spec
+        slots_per_group = self.slots_per_req()
         fork_srcs = getattr(batch, "state_fork_srcs", None) or ()
         assert not (with_spec and any(s >= 0 for s in fork_srcs)), (
             "state fork on the spec-decode path: spec_state_indices_tensor has "
@@ -367,6 +620,11 @@ class GDNStateMixin:
                 non_spec_state_indices_in[idx] = (
                     src * slots_per_group if src >= 0 else base
                 )
+            elif self.replayssm:
+                # No per-draft fan-out: one slot addresses conv state,
+                # checkpoint and record buffers alike.
+                non_spec_state_indices[idx] = base
+                spec_state_indices[idx, 0] = base
             else:
                 spec_state_indices[idx, : 1 + self.num_spec] = np.arange(
                     base, base + 1 + self.num_spec
@@ -437,6 +695,10 @@ class GDNStateMixin:
             spec_state_indices_tensor = self.spec_state_indices_tensor.copy_to_gpu(
                 num_reqs
             )
+            if self.replayssm:
+                # `prepare_state_indices` mirrored the single slot into the
+                # 1-D tensor too; ship that to the device for `slot_idx`.
+                self.non_spec_state_indices_tensor.copy_to_gpu(num_reqs)
             non_spec_state_indices_tensor = None
             non_spec_state_indices_in_tensor = None
             spec_query_start_loc = query_start_loc
@@ -492,7 +754,47 @@ class GDNStateMixin:
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,
         )
+        if self.replayssm:
+            self._attach_replayssm(gdn_attn_metadata, num_reqs, is_prefill)
         return gdn_attn_metadata
+
+    def _attach_replayssm(
+        self, md: GDNAttentionMetadata, num_reqs: int, is_prefill: bool
+    ) -> None:
+        """Fill the ReplaySSM fields and move the record cursor exactly once.
+
+        The cursor advance is a *forward-level* action, not a layer-level one:
+        every linear-attention layer in the step must see the same `write_pos`,
+        so it happens here (metadata prep, outside any captured graph) rather
+        than inside the layer kernel.
+        """
+        slot_idx = self.non_spec_state_indices_tensor.gpu[:num_reqs]
+        write_pos = self.model_runner.replayssm_write_pos
+        md.replayssm = True
+        md.slot_idx = slot_idx
+        md.write_pos = write_pos
+        md.replayssm_cache_len = self.replayssm_cache_len
+        md.replayssm_route = self.replayssm_route
+        md.replayssm_max_query_len = self.replayssm_max_query_len
+
+        if is_prefill:
+            # A prefill (re)initialises the checkpoint wholesale via
+            # `chunk_gated_delta_rule`, so any records left over from a prior
+            # tenant of this slot are stale.  Zeroing the cursor here is also
+            # what makes slot reuse safe without a block-manager hook.
+            write_pos.index_fill_(0, slot_idx.to(torch.int64), 0)
+            return
+
+        # Decode: apply the PREVIOUS step's accepted counts.  For non-spec
+        # decode `num_accepted_tokens` stays at its initialised value of 1,
+        # which is exactly one committed token per step.
+        replayssm_commit(
+            write_pos,
+            slot_idx,
+            self.num_accepted_tokens[:num_reqs],
+            self.replayssm_max_query_len,
+            self.replayssm_cache_len,
+        )
 
     def _attach_gdn_decode_metadata(
         self,
@@ -509,6 +811,10 @@ class GDNStateMixin:
         )
 
         # transfer data to ps buffer
+        if self.replayssm:
+            # Idle graph-padding entries must resolve to PAD so the kernel
+            # skips them instead of touching slot 0's checkpoint.
+            self.non_spec_state_indices_tensor.gpu[num_decodes:].fill_(PAD_SLOT_ID)
         if self.use_spec_decode:
             self.spec_state_indices_tensor.gpu[num_decodes:, :].fill_(PAD_SLOT_ID)
 
@@ -606,6 +912,17 @@ class GDNStateMixin:
                 batch_ptr=None,
                 token_chunk_offset_ptr=None,
             )
+        if self.replayssm:
+            # Capture-time only wires up the (address-stable) buffers; the
+            # cursor is deliberately NOT advanced here.  Warmup and capture
+            # replay dummy batches, and letting them commit would leave real
+            # sequences resuming from records that were never written.
+            gdn_metadata.replayssm = True
+            gdn_metadata.slot_idx = self.non_spec_state_indices_tensor.gpu[:bs]
+            gdn_metadata.write_pos = self.model_runner.replayssm_write_pos
+            gdn_metadata.replayssm_cache_len = self.replayssm_cache_len
+            gdn_metadata.replayssm_route = self.replayssm_route
+            gdn_metadata.replayssm_max_query_len = self.replayssm_max_query_len
         return gdn_metadata
 
 
@@ -702,6 +1019,15 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
                 v_cache=runner.mamba_v_cache[gdn_idx],
                 k_scale=None,
                 v_scale=None,
+                replay_buf_k=(
+                    runner.replayssm_buf_k[gdn_idx] if self.replayssm else None
+                ),
+                replay_buf_u=(
+                    runner.replayssm_buf_u[gdn_idx] if self.replayssm else None
+                ),
+                replay_buf_g=(
+                    runner.replayssm_buf_g[gdn_idx] if self.replayssm else None
+                ),
             )
         return super().build_kv_cache_tensor(layer_id, module)
 
@@ -714,6 +1040,21 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             attn_metadata.gdn_metadata = None
             return attn_metadata, positions
         gdn_metadata = self.prepare_gdn_metadata(batch, attn_metadata, is_prefill=True)
+
+        # Interior checkpoints: the impl slices them out of the chunk kernel's
+        # per-chunk states, so a checkpoint mid-prompt costs no extra forward.
+        # Positions at the step's end are sourced from the runtime slot; both
+        # kinds are tagged and written by one kernel.
+        gdn_metadata.ssm_checkpoints = self._checkpoint_targets(batch)
+        if gdn_metadata.ssm_checkpoints is not None:
+            # Same mapping the chunk kernel builds internally, computed once
+            # per step rather than per layer.
+            from atom.model_ops.fla_ops.chunk import CHUNK_SIZE
+            from atom.model_ops.fla_ops.index import prepare_chunk_offsets
+
+            gdn_metadata.ssm_chunk_offsets = prepare_chunk_offsets(
+                gdn_metadata.non_spec_query_start_loc, CHUNK_SIZE
+            )
 
         attn_metadata.gdn_metadata = gdn_metadata
         return attn_metadata, positions

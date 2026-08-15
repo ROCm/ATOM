@@ -7,7 +7,7 @@
 # moves is the whole group -- `1 + num_spec` consecutive slots, because the
 # extra ones hold the per-draft states a rejected speculation rolls back to.
 
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -34,8 +34,13 @@ def build(num_spec: int):
             v[layer, slot] = -(layer * 100 + slot)
     stub = SimpleNamespace(
         num_spec=num_spec,
+        replayssm=False,
         model_runner=SimpleNamespace(mamba_k_cache=k, mamba_v_cache=v),
     )
+    # `copy_state_entries` reads the group stride off `slots_per_req()` (added
+    # when ReplaySSM made it 1 instead of `1 + num_spec`); bind the real method
+    # so the test exercises that path rather than a hardcoded span.
+    stub.slots_per_req = MethodType(GDNStateMixin.slots_per_req, stub)
     return stub, k, v, span
 
 

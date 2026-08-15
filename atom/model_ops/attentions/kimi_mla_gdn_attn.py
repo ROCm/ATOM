@@ -6,6 +6,7 @@ import torch
 from aiter import dtypes
 
 from atom.model_engine.scheduler import ScheduledBatch
+from atom.model_engine.state_pool import StateTransfer
 from atom.model_ops.attention_mla import MLAAttention
 from atom.utils import envs
 
@@ -44,6 +45,35 @@ class _KimiMLAGDNCommon(GDNStateMixin):
             for index, layer in enumerate(model_runner.kda_attention_layers)
         }
 
+    def state_transfer(self) -> StateTransfer:
+        """`GDNStateMixin`'s fork, minus its midstep claim.
+
+        KDA does not run the chunk kernel this file's GDN sibling does: it
+        calls `fla.ops.kda.chunk_kda`, which returns only the final state and
+        never exposes the per-chunk states an interior checkpoint is sliced
+        out of. `_checkpoint_targets` is also unreachable here, because
+        `prepare_prefill` below overrides the one that calls it.
+
+        Inheriting the mixin's answer would therefore be actively wrong rather
+        than merely optimistic: `BlockManager` would stop cutting prefill
+        chunks onto checkpoint positions and `checkpointers_at` would stop
+        keeping them, so KDA would keep *zero* checkpoints — silently, since
+        nothing on that path can tell a checkpoint that was skipped from one
+        that was never wanted. Overridden here rather than fixed by making the
+        mixin's flag conditional, so that the class which cannot do the thing
+        is the class that says so.
+
+        Two reasons, not one, and the second outlives the first. Porting the
+        branch's `chunk_kda_paged` would expose per-chunk states here and make
+        this override look removable — but KDA is also the single model whose
+        state pool is *wider* than those states: `_state_dtypes` gives
+        kimi_linear an fp32 v side while the chunked states are bf16. The GDN
+        sibling's checkpoints are exact only because those two dtypes match
+        (see `GDNStateMixin.state_transfer`), so here the same copy would
+        silently hand cached requests a bf16-rounded state where uncached ones
+        get fp32. Whoever ports the kernel has to answer that too.
+        """
+        return StateTransfer.fork(1)
     def _num_cache_rows(self) -> int:
         """Rows in the MLA pool: the target's full-attention layers plus any
         draft layers that share this pool.
@@ -104,6 +134,9 @@ class _KimiMLAGDNCommon(GDNStateMixin):
                 v_cache=runner.mamba_v_cache[row],
                 k_scale=None,
                 v_scale=None,
+                replay_buf_k=(runner.replayssm_buf_k[row] if self.replayssm else None),
+                replay_buf_u=(runner.replayssm_buf_u[row] if self.replayssm else None),
+                replay_buf_g=(runner.replayssm_buf_g[row] if self.replayssm else None),
             )
 
         if hasattr(module, "base_attention") and getattr(module, "use_mla", False):
