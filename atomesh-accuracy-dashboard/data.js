@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786641045298,
+  "lastUpdate": 1786813313840,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -1586,6 +1586,46 @@ window.BENCHMARK_DATA = {
             "value": 0.8855,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/31720300787 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202608131526 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: unknown | strict-match: 0.3897 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Lingpeng Jin",
+            "username": "valarLip",
+            "email": "103567126+valarLip@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "ba9ae20278965d06fe07fb0e50bd9b3c5a92ebbf",
+          "message": "perf(benchmark): batch the tokenizer calls that build the random dataset (#1907)\n\nGenerating the dataset runs before a single request is sent, so it is dead\ntime on every benchmark, and it grows with --num-prompts. At the c=8192 shape\n(24576 prompts, input_len 1024) it was roughly two minutes of a single Python\nthread. Measured on DeepSeek-V4-Flash's tokenizer, 2000 prompts at input_len\n1024 took 9.74s, split:\n\n  retry loop (encode + re-decode)   6.05s   62.2%\n  the final encode                  2.71s   27.9%\n  first decode                      0.50s    5.2%\n  building the token ids            0.46s    4.8%\n\nThree changes, no behavioural difference in the dataset -- same length\ndistribution, same avg_token_mismatch of 0.00.\n\nThe tokenizer calls are now issued a batch at a time. A fast tokenizer\nparallelises a batch internally, and one call per prompt forfeits that plus a\nPython/Rust crossing each time. The round trip becomes: batch_decode\neverything, batch encode, keep only the prompts whose length did not converge,\nrepeat. This is the whole win -- 9.74s to 1.85s, 5.25x.\n\nThe final encode is deleted. When the retry loop broke it broke *because*\nencode(prompt) had already come back at the target length one line earlier, so\nre-encoding the same string could only produce the same number again. It is\nstill paid when a prompt never converged, or when a chat template rewrites the\nprompt afterwards, because in both of those cases the length really is unknown.\n\nBuilding the token ids uses numpy rather than a per-token Python comprehension\nwith a modulo. This is the smallest of the three: 4.8%, or 25M interpreter-level\noperations at the c=8192 shape.\n\nSeparately, the dataset now draws from its own np.random.default_rng(seed)\ninstead of the global numpy RNG. Sharing the global one makes the prompts a\nfunction of whatever else drew from it first, so re-running the same command\nneed not produce the same dataset -- which is not a property a benchmark should\nlack. The seed comes from the existing --seed. vLLM's RandomDataset isolates\nits generator for the same reason and says so in a comment.\n\nTwo notes for review. The typing modernisation across the file (List/Tuple/Dict\n-> builtins, AsyncGenerator/Callable -> collections.abc) is a formatter sweep,\nnot a deliberate change; the timezone fix on the result-file stamp is ruff\nDTZ005 on a line the sweep pulled into diff context, and astimezone() keeps the\nstamp in local time exactly as before.\n\nTests use a synthetic tokenizer so nothing is downloaded. It is deliberately\nnot injective -- decode joins ids with spaces, encode splits on them -- so the\nround-trip correction is actually exercised rather than skipped, including the\ncase where it never converges and the reported length has to be the real one\nrather than the target it missed.",
+          "timestamp": "2026-08-15T15:42:39Z",
+          "url": "https://github.com/ROCm/ATOM/commit/ba9ae20278965d06fe07fb0e50bd9b3c5a92ebbf"
+        },
+        "date": 1786813271222,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9447,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/31894611888 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202608151459 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9424 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::Meta-Llama-3-8B-Instruct accuracy (GSM8K)",
+            "value": 0.7521,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/31894611888 | Threshold: 0.73 | Baseline: 0.75 | BaselineModel: meta-llama/Meta-Llama-3-8B-Instruct | BaselineNote: HF reports 0.796 but 8-shot CoT; CI uses 3-shot, not comparable | Docker: rocm/atom-dev:nightly_202608151459 | GPU: AMD Instinct MI355X | VRAM: 252GB | ROCm: 7.2.4 | strict-match: 0.7491 | fewshot: 3 | Model: /models/meta-llama/Meta-Llama-3-8B-Instruct"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.8855,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/31894611888 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202608151459 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.2813 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
