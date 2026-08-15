@@ -11,18 +11,23 @@
 
 """Inference-only Cohere model compatible with HuggingFace weights."""
 
-from typing import Any, Optional, Union
+from typing import ClassVar
 
 import torch
-from aiter import QuantType
 from aiter.dist.parallel_state import get_pp_group, get_tensor_model_parallel_world_size
 from aiter.rotary_embedding import get_rope
+from torch import nn
+from transformers import CohereConfig
+
 from atom.config import Config, QuantizationConfig
 from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
-from atom.model_ops.layernorm import LayerNorm, RMSNorm
-from atom.model_ops.layernorm import layernorm2d_fwd_, layernorm2d_fwd_with_add_
+from atom.model_ops.layernorm import (
+    RMSNorm,
+    layernorm2d_fwd_,
+    layernorm2d_fwd_with_add_,
+)
 from atom.model_ops.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -37,8 +42,6 @@ from atom.models.utils import (
     maybe_prefix,
 )
 from atom.utils.decorators import support_torch_compile
-from torch import nn
-from transformers import CohereConfig
 
 
 class CohereLayerNorm(nn.Module):
@@ -116,7 +119,7 @@ class CohereAttention(nn.Module):
         num_kv_heads: int,
         rope_theta: float = 10000,
         max_position_embeddings: int = 8192,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         bias: bool = False,
         cache_config: str = "bf16",
         prefix: str = "",
@@ -182,9 +185,10 @@ class CohereAttention(nn.Module):
         # cache_config.sliding_window (from config.sliding_window = 4096)
         # for layers that are NOT sliding_attention layers.
         sliding_window = -1
-        if layer_types := getattr(config, "layer_types", None):
-            if layer_types[layer_idx] == "sliding_attention":
-                sliding_window = config.sliding_window
+        if (layer_types := getattr(config, "layer_types", None)) and layer_types[
+            layer_idx
+        ] == "sliding_attention":
+            sliding_window = config.sliding_window
 
         self.attn = Attention(
             self.num_heads,
@@ -263,7 +267,7 @@ class CohereDecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
+        residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Cohere parallel residual: one pre-norm feeds both attn and MLP.
         # residual accumulates the sum; hidden_states carries the new contribution.
@@ -336,13 +340,11 @@ class CohereModel(nn.Module):
 
     def forward(
         self,
-        input_ids: Optional[torch.Tensor],
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
-        intermediate_tensors: Optional[IntermediateTensors],
-        inputs_embeds: Optional[torch.Tensor] = None,
-    ) -> Union[
-        torch.Tensor, IntermediateTensors, tuple[torch.Tensor, list[torch.Tensor]]
-    ]:
+        intermediate_tensors: IntermediateTensors | None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -367,7 +369,7 @@ class CohereModel(nn.Module):
 
 
 class CohereForCausalLM(nn.Module):
-    packed_modules_mapping = {
+    packed_modules_mapping: ClassVar[dict[str, tuple[str, str | int]]] = {
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
         "v_proj": ("qkv_proj", "v"),
@@ -413,9 +415,9 @@ class CohereForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, IntermediateTensors]:
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors:
         model_output = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
@@ -424,7 +426,6 @@ class CohereForCausalLM(nn.Module):
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         logits = self.lm_head(hidden_states)
         return logits
-
