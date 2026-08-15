@@ -436,11 +436,15 @@ class BlockManager:
         """
         if self.paged_state_checkpoints is not None:
             dst = self.state.pop()
+            if hit_hash != -1 and not self.paged_state_checkpoints.begin_restore(
+                hit_hash, dst
+            ):
+                self.state.release(dst)
+                raise RuntimeError(
+                    "gated PAGE checkpoint disappeared before state attach"
+                )
             seq.per_req_cache_group = dst
             seq.state_fork_src = -1
-            if hit_hash != -1:
-                restored = self.paged_state_checkpoints.begin_restore(hit_hash, dst)
-                assert restored, "gated PAGE checkpoint disappeared before attach"
             return
 
         src = self.state.lookup_group(hit_hash) if hit_hash != -1 else -1

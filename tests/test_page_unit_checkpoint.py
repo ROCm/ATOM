@@ -12,6 +12,7 @@ from atom.model_engine.page_unit_checkpoint import (
     COPYING,
     EVICTING,
     READY,
+    PagedStateCheckpointCoordinator,
     PagedStateCheckpointSpec,
     PageUnitCheckpointStore,
 )
@@ -112,8 +113,41 @@ def test_multiple_restore_readers_pin_the_whole_record():
     assert store.records[checkpoint_id].state == EVICTING
     assert pool.num_free == 17
 
-    # Both readers rode the same batch; no fragment is returned early.
+    restores = store.take_restore_ops()
+    assert {op.dst_slot for op in restores} == {4, 8}
     store.complete_inflight()
+    assert checkpoint_id not in store.records
+    assert pool.num_free == 20
+
+
+def test_empty_batch_does_not_complete_a_queued_restore():
+    pool = BlockPool(20)
+    coordinator = PagedStateCheckpointCoordinator(
+        pool,
+        PagedStateCheckpointSpec(10, 25, "layout-v1"),
+        enabled=True,
+    )
+    checkpoint_id, _ = ready(coordinator.store, 101)
+    assert coordinator.begin_restore(101, dst_slot=4)
+
+    coordinator.complete_previous_batch()
+    assert coordinator.store.records[checkpoint_id].pin_count == 1
+
+    _, restores = coordinator.take_checkpoint_ops()
+    assert len(restores) == 1
+    coordinator.complete_previous_batch()
+    assert coordinator.store.records[checkpoint_id].pin_count == 0
+
+
+def test_cancel_queued_restore_drops_its_op_and_pin():
+    pool, store = make_store()
+    checkpoint_id, _ = ready(store, 101)
+    assert store.begin_restore(101, dst_slot=4) is not None
+    store.unindex(101)
+
+    store.cancel_queued_restore(4)
+
+    assert store.take_restore_ops() == ()
     assert checkpoint_id not in store.records
     assert pool.num_free == 20
 
@@ -166,6 +200,7 @@ def test_clear_releases_ready_images_but_defers_a_pinned_reader():
     assert first_id not in store.records
     assert second_id in store.records
 
+    assert len(store.take_restore_ops()) == 1
     store.complete_inflight()
     assert not store.records
     assert pool.num_free == 20

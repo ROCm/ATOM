@@ -1032,6 +1032,54 @@ class TestPagedCopyCheckpoint:
         # adopted as the request's kernel-visible slot.
         assert bm.paged_state_checkpoints.store.contains(h)
 
+    def test_deallocate_cancels_a_queued_restore_before_reusing_its_slot(self):
+        bm = make_block_manager(
+            paged_copy_config(),
+            state_runtime=PAGED_COPY_RUNTIME,
+        )
+        first = self._admitted(bm)
+        bm.hash_blocks(first, bm.checkpoint_limit(first) - first.num_cached_tokens)
+        h = boundary_hash(bm, first)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+
+        second = stateful_seq(list(range(48)))
+        bm.allocate(second, bm.can_allocate(second))
+        dst = second.per_req_cache_group
+        checkpoint_id = bm.paged_state_checkpoints.store.lookup(h)
+        assert bm.paged_state_checkpoints.store.records[checkpoint_id].pin_count == 1
+
+        bm.deallocate(second)
+
+        assert bm.take_state_maintenance_ops().checkpoint_restores == ()
+        assert bm.paged_state_checkpoints.store.records[checkpoint_id].pin_count == 0
+        assert bm.state.is_free(dst)
+
+        third = stateful_seq(list(range(100, 140)))
+        bm.allocate(third, bm.can_allocate(third))
+        assert third.per_req_cache_group == dst
+        assert bm.take_state_maintenance_ops().checkpoint_restores == ()
+
+    def test_missing_gated_checkpoint_releases_the_new_slot_and_raises(self):
+        bm = make_block_manager(
+            paged_copy_config(),
+            state_runtime=PAGED_COPY_RUNTIME,
+        )
+        first = self._admitted(bm)
+        bm.hash_blocks(first, bm.checkpoint_limit(first) - first.num_cached_tokens)
+        h = boundary_hash(bm, first)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        free_slots = bm.state.num_free()
+        bm.paged_state_checkpoints.unindex(h)
+
+        second = stateful_seq(list(range(48)))
+        with pytest.raises(RuntimeError, match="disappeared"):
+            bm._attach_state_group(second, h)
+
+        assert second.per_req_cache_group == -1
+        assert bm.state.num_free() == free_slots
+
     def test_copy_transfer_can_checkpoint_a_speculative_decode_boundary(self):
         spec = SimpleNamespace(num_speculative_tokens=3, use_dspark=lambda: False)
         seq = stateful_seq(list(range(40)))

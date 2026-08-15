@@ -239,7 +239,7 @@ class BlockPool:
             heapify(self._vacant)
 
     def reserve_units(self, count: int, owner: Hashable) -> list[int] | None:
-        """Atomically reserve arbitrary PAGE-sized units for raw storage."""
+        """Reserve arbitrary PAGE-sized units for raw storage."""
         if count < 0:
             raise ValueError(f"unit count must be non-negative, got {count}")
         if owner is None:
@@ -259,6 +259,7 @@ class BlockPool:
         ids = list(unit_ids)
         if len(ids) != len(set(ids)):
             raise ValueError("a raw-unit release contains duplicate ids")
+        # Validate ownership before releasing any unit.
         for piece_index, block_id in enumerate(ids):
             actual = self._raw_unit_owner.get(block_id)
             expected = (owner, piece_index)
@@ -266,7 +267,6 @@ class BlockPool:
                 raise AssertionError(
                     f"raw unit {block_id} belongs to {actual!r}, not {expected!r}"
                 )
-        # Validate ownership before releasing any unit.
         for block_id in ids:
             del self._raw_unit_owner[block_id]
             self.free(block_id)

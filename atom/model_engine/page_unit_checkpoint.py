@@ -107,6 +107,7 @@ class PageUnitCheckpointStore:
         self._pending_by_hash: dict[int, int] = {}
         self._lru: OrderedDict[int, None] = OrderedDict()
         self._inflight_stores: list[int] = []
+        self._queued_restores: list[tuple[int, CheckpointRestoreOp]] = []
         self._inflight_restores: list[int] = []
         self._next_checkpoint_id = 0
         self.evictions = 0
@@ -198,13 +199,28 @@ class PageUnitCheckpointStore:
         record = self.records[checkpoint_id]
         record.pin_count += 1
         self._lru.move_to_end(checkpoint_id)
-        self._inflight_restores.append(checkpoint_id)
-        return CheckpointRestoreOp(
+        op = CheckpointRestoreOp(
             dst_slot=dst_slot,
             unit_ids=record.unit_ids,
             total_bytes=self.spec.slot_bytes,
             layout_id=self.spec.layout_id,
         )
+        self._queued_restores.append((checkpoint_id, op))
+        return op
+
+    def take_restore_ops(self) -> tuple[CheckpointRestoreOp, ...]:
+        queued, self._queued_restores = self._queued_restores, []
+        self._inflight_restores.extend(checkpoint_id for checkpoint_id, _ in queued)
+        return tuple(op for _, op in queued)
+
+    def cancel_queued_restore(self, dst_slot: int) -> None:
+        kept: list[tuple[int, CheckpointRestoreOp]] = []
+        for checkpoint_id, op in self._queued_restores:
+            if op.dst_slot == dst_slot:
+                self._release_restore_pin(checkpoint_id)
+            else:
+                kept.append((checkpoint_id, op))
+        self._queued_restores = kept
 
     def complete_inflight(self) -> None:
         stores, self._inflight_stores = self._inflight_stores, []
@@ -229,14 +245,17 @@ class PageUnitCheckpointStore:
 
         restores, self._inflight_restores = self._inflight_restores, []
         for checkpoint_id in restores:
-            record = self.records.get(checkpoint_id)
-            if record is None:
-                continue
-            if record.pin_count <= 0:
-                raise AssertionError("checkpoint restore pin underflow")
-            record.pin_count -= 1
-            if record.state == EVICTING and record.pin_count == 0:
-                self._release_record(checkpoint_id)
+            self._release_restore_pin(checkpoint_id)
+
+    def _release_restore_pin(self, checkpoint_id: int) -> None:
+        record = self.records.get(checkpoint_id)
+        if record is None:
+            return
+        if record.pin_count <= 0:
+            raise AssertionError("checkpoint restore pin underflow")
+        record.pin_count -= 1
+        if record.state == EVICTING and record.pin_count == 0:
+            self._release_record(checkpoint_id)
 
     def unindex(self, prefix_hash: int) -> bool:
         checkpoint_id = self.hash_to_checkpoint.pop(prefix_hash, -1)
@@ -301,7 +320,6 @@ class PagedStateCheckpointCoordinator:
         self.store = PageUnitCheckpointStore(pool, spec)
         self._pending: dict[int, tuple[Sequence, int]] = {}
         self._store_ops: list[CheckpointStoreOp] = []
-        self._restore_ops: list[CheckpointRestoreOp] = []
         self.checkpoints_kept = 0
         self.checkpoints_dropped = 0
         self.checkpoints_orphaned = 0
@@ -330,13 +348,10 @@ class PagedStateCheckpointCoordinator:
 
     def forget_pending(self, seq: Sequence) -> None:
         self._pending.pop(id(seq), None)
+        self.store.cancel_queued_restore(seq.per_req_cache_group)
 
     def begin_restore(self, h: int, dst_slot: int) -> bool:
-        op = self.store.begin_restore(h, dst_slot)
-        if op is None:
-            return False
-        self._restore_ops.append(op)
-        return True
+        return self.store.begin_restore(h, dst_slot) is not None
 
     def take_checkpoint_ops(
         self,
@@ -353,8 +368,7 @@ class PagedStateCheckpointCoordinator:
             self._store_ops.append(op)
             self.checkpoints_kept += 1
         stores, self._store_ops = self._store_ops, []
-        restores, self._restore_ops = self._restore_ops, []
-        return tuple(stores), tuple(restores)
+        return tuple(stores), self.store.take_restore_ops()
 
     def complete_previous_batch(self) -> None:
         self.store.complete_inflight()
