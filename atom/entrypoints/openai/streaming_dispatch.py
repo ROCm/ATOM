@@ -1,24 +1,24 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Batched cross-thread dispatch for streaming model output."""
+"""Cross-thread dispatch and per-request delivery for streaming model output.
 
-import os
+Two halves of one hand-off. :class:`StreamBatchDispatcher` runs on the engine
+output threads: it buffers a whole engine step, detokenizes it, and schedules a
+single callback per event loop. :class:`StreamOutputCollector` is the loop-side
+landing point each stream's SSE generator reads from.
+"""
+
 import threading
-import time
-from asyncio import AbstractEventLoop, Queue
+from asyncio import AbstractEventLoop, Event
 from collections.abc import Hashable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, NamedTuple
 
-# SSE coalescing. Two tokenizer.decode calls, a queue put/get, a json.dumps
-# and a socket write are paid once per (request, engine step); at high
-# concurrency that fixed cost, not the GPU, is what caps throughput. Holding
-# the buffer open across steps collapses N tokens into one of each (update()
-# takes a list and decodes twice regardless of length). Costs up to this much
-# extra inter-token latency, so it is opt-in. A finished chunk always flushes.
-_COALESCE_S = max(0.0, float(os.environ.get("ATOM_SSE_COALESCE_MS", "0") or 0)) / 1000.0
-_COALESCE_MAX_STEPS = int(os.environ.get("ATOM_SSE_COALESCE_MAX_STEPS", "8") or 8)
+# Fields a later chunk overrides on the one it merges into, when it has a value
+# of its own. The SSE consumers keep the newest non-empty value they see, so
+# merging this way hands them what reading each chunk separately would have.
+_LATEST_WINS = ("finish_reason", "kv_transfer_params", "num_cached_tokens")
 
 
 @dataclass
@@ -51,10 +51,74 @@ class IncrementalStreamDetokenizer:
         return ""
 
 
-@dataclass
-class _BufferedChunk:
+def merge_chunk(into: dict, new: dict) -> None:
+    """Fold ``new`` into the chunk already waiting. ``into`` is modified.
+
+    ``text`` and ``token_ids`` are deltas, so concatenating them is exact.
+    ``token_ids`` is rebuilt rather than extended: the first chunk's list is the
+    engine's own ``output_tokens``, which must not be appended to.
+    """
+    into["token_ids"] = [*into.get("token_ids", ()), *new.get("token_ids", ())]
+    into["text"] = into.get("text", "") + new.get("text", "")
+    into["finished"] = bool(into.get("finished") or new.get("finished"))
+    for key in _LATEST_WINS:
+        if new.get(key):
+            into[key] = new[key]
+
+
+class StreamOutputCollector:
+    """Per-request delivery point that merges chunks when the consumer lags.
+
+    Replaces the unbounded ``asyncio.Queue`` that used to sit between the engine
+    output threads and the SSE response generators. A queue hands over one item
+    per ``get()``, so when the frontend cannot keep up with the GPU the backlog
+    grows without bound and every queued item still costs its own coroutine
+    wakeup, JSON encode and socket write. Here a stream holds at most one chunk:
+    anything arriving behind an unread one merges into it.
+
+    Nothing is ever held back. With a consumer that keeps up nothing ever
+    merges, and delivery is identical to the queue this replaces. Merging only
+    covers chunks that were already waiting, so a token is never delivered later
+    than it would have been.
+
+    ``tag`` is the fan-out sibling index (``SamplingParams.n>1``) or ``None`` for
+    a plain single-sequence stream. Chunks merge per tag, so siblings never mix.
+    """
+
+    def __init__(self, request_id: str = "") -> None:
+        self.request_id = request_id
+        self._pending: dict[Any, dict] = {}
+        self._ready = Event()
+
+    def put_nowait(self, payload: dict | tuple[int, dict]) -> None:
+        """Accept one prepared chunk. Called on the event loop, never off it."""
+        if type(payload) is tuple:
+            tag, chunk = payload
+        else:
+            tag, chunk = None, payload
+        waiting = self._pending.get(tag)
+        if waiting is None:
+            self._pending[tag] = chunk
+        else:
+            merge_chunk(waiting, chunk)
+        self._ready.set()
+
+    async def get(self) -> dict | tuple[int, dict]:
+        """Await the next chunk, carrying whatever merged into it."""
+        while not self._pending:
+            await self._ready.wait()
+        tag, chunk = next(iter(self._pending.items()))
+        del self._pending[tag]
+        if not self._pending:
+            self._ready.clear()
+        return chunk if tag is None else (tag, chunk)
+
+
+class _BufferedChunk(NamedTuple):
+    """One stream's chunk, waiting for the end of the current engine step."""
+
     loop: AbstractEventLoop
-    queue: Queue
+    collector: Any
     state_key: Hashable
     chunk: dict
     tag: int | None
@@ -72,7 +136,7 @@ class StreamBatchDispatcher:
         self,
         *,
         loop: AbstractEventLoop,
-        queue: Queue,
+        collector: Any,
         state_key: Hashable,
         chunk: dict,
         tag: int | None = None,
@@ -81,75 +145,34 @@ class StreamBatchDispatcher:
         buf = getattr(self._thread_local, "buf", None)
         if buf is None:
             buf = self._thread_local.buf = []
-        buf.append(
-            _BufferedChunk(
-                loop=loop,
-                queue=queue,
-                state_key=state_key,
-                chunk=chunk,
-                tag=tag,
-            )
-        )
+        buf.append(_BufferedChunk(loop, collector, state_key, chunk, tag))
 
     def flush(self) -> None:
-        """Detokenize buffered chunks and schedule one drain per event loop."""
+        """Detokenize buffered chunks and schedule one delivery per event loop."""
         tl = self._thread_local
         buf = getattr(tl, "buf", None)
         if not buf:
             return
-
-        now = time.monotonic()
-        if _COALESCE_S > 0:
-            steps = getattr(tl, "steps", 0) + 1
-            tl.steps = steps
-            if (
-                steps < _COALESCE_MAX_STEPS
-                and now - getattr(tl, "last_flush", 0.0) < _COALESCE_S
-                and not any(i.chunk.get("finished") for i in buf)
-            ):
-                return  # keep accumulating; nothing here is final yet
         tl.buf = []
-        tl.steps = 0
-        tl.last_flush = now
 
-        # One group per stream. state_key already distinguishes fan-out
-        # siblings, and loop/queue are constant per stream, so the last item
-        # of a group carries the right destination plus the terminal
-        # finish_reason/finished flags.
-        groups: dict[Hashable, list[_BufferedChunk]] = {}
+        by_loop: dict[AbstractEventLoop, list[tuple[Any, Any]]] = {}
         for item in buf:
-            groups.setdefault(item.state_key, []).append(item)
-
-        by_loop: dict[AbstractEventLoop, list[tuple[Queue, Any]]] = {}
-        for state_key, items in groups.items():
-            last = items[-1]
-            token_ids = last.chunk.get("token_ids") or []
-            if len(items) > 1:
-                token_ids = []
-                for i in items:
-                    token_ids.extend(i.chunk.get("token_ids") or [])
-                last.chunk["token_ids"] = token_ids
-                for i in items[:-1]:
-                    if "kv_transfer_params" in i.chunk:
-                        last.chunk.setdefault(
-                            "kv_transfer_params", i.chunk["kv_transfer_params"]
-                        )
-
-            state = self._get_state(state_key)
-            last.chunk["text"] = state.update(
-                token_ids, bool(last.chunk.get("finished"))
+            state = self._get_state(item.state_key)
+            finished = bool(item.chunk.get("finished"))
+            item.chunk["text"] = state.update(
+                item.chunk.get("token_ids") or [], finished
             )
-            if last.chunk.get("finished"):
-                self._drop_state(state_key, state)
+            if finished:
+                self._drop_state(item.state_key, state)
 
-            payload = last.chunk if last.tag is None else (last.tag, last.chunk)
-            by_loop.setdefault(last.loop, []).append((last.queue, payload))
+            payload = item.chunk if item.tag is None else (item.tag, item.chunk)
+            by_loop.setdefault(item.loop, []).append((item.collector, payload))
 
         for loop, items in by_loop.items():
-            loop.call_soon_threadsafe(self._drain_into_queues, items)
+            loop.call_soon_threadsafe(self._deliver, items)
 
     # These three ran under a shared lock, which cost 27% of the API server's
-    # CPU -- _get_state is called once per stream per flush, with all output
+    # CPU -- _get_state is called once per buffered chunk, with all output
     # threads contending. No lock is needed: each operation below is a single
     # C-level dict method that no other Python thread can interrupt, and
     # list() snapshots atomically so discard_request cannot hit "dict changed
@@ -178,7 +201,16 @@ class StreamBatchDispatcher:
             self._states.pop(state_key, None)
 
     @staticmethod
-    def _drain_into_queues(items: list[tuple[Queue, Any]]) -> None:
-        """Run on the target event loop and deliver each prepared payload."""
-        for queue, payload in items:
-            queue.put_nowait(payload)
+    def _deliver(items: list[tuple[Any, Any]]) -> None:
+        """Run on the target event loop and hand a whole step to its collectors.
+
+        A step is delivered in one callback, never split across loop iterations.
+        Splitting was tried as a fairness measure -- deliver 128, re-arm the rest
+        with call_soon -- and it silently corrupts streams: the output thread can
+        schedule the next step's delivery in between, so a collector receives
+        step N+1's chunk before step N's leftovers. Deltas then merge in the
+        wrong order, and an end-of-stream that lands before a straggler is
+        overwritten by it, hanging that client for good.
+        """
+        for collector, payload in items:
+            collector.put_nowait(payload)

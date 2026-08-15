@@ -44,6 +44,7 @@ from atom.entrypoints.openai.serving_completion import (
     build_completion_response_multi,
     create_completion_chunk,
 )
+from atom.entrypoints.openai.sse import data_frame
 from atom.entrypoints.openai.tool_parser import ToolCallStreamParser
 
 logger = logging.getLogger("atom")
@@ -715,7 +716,7 @@ class ChatCompletionStreamState:
                 "model": self.model_name,
                 "usage": usage,
             }
-            chunks.append(f"data: {json.dumps(usage_chunk)}\n\n")
+            chunks.append(data_frame(usage_chunk))
             chunks.append(STREAM_DONE_MESSAGE)
             self._pending_final_chunks = chunks
 
@@ -856,7 +857,7 @@ class CompletionStreamState:
                 "model": self.model_name,
                 "usage": usage,
             }
-            chunks.append(f"data: {json.dumps(usage_chunk)}\n\n")
+            chunks.append(data_frame(usage_chunk))
             chunks.append(STREAM_DONE_MESSAGE)
             self._pending_final_chunks = chunks
 

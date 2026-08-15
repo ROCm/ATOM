@@ -14,6 +14,8 @@ from typing import Any, List, Optional
 
 from pydantic import BaseModel
 
+from .sse import event_frame
+
 logger = logging.getLogger("atom")
 
 
@@ -253,7 +255,7 @@ def build_anthropic_response(
 
 def format_sse(event: str, data: Any) -> str:
     """Format a server-sent event."""
-    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+    return event_frame(event, data)
 
 
 def stream_message_start(

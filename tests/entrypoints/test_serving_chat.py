@@ -14,6 +14,7 @@ from atom.entrypoints.openai.serving_chat import (
     stream_chat_response,
     stream_chat_response_fanout,
 )
+from atom.entrypoints.openai.streaming_dispatch import StreamOutputCollector
 
 # ============================================================================
 # normalize_chat_tools Tests
@@ -296,12 +297,12 @@ class TestStreamingRoleChunkContent:
 
     def test_single_stream_role_chunk_has_empty_content(self):
         async def run():
-            queue = asyncio.Queue()
-            await queue.put({"text": "Hi", "token_ids": [1], "finished": True})
+            collector = StreamOutputCollector("req-1")
+            collector.put_nowait({"text": "Hi", "token_ids": [1], "finished": True})
             gen = stream_chat_response(
                 request_id="req-1",
                 model="model",
-                stream_queue=queue,
+                stream_collector=collector,
                 seq_id=0,
                 num_prompt_tokens=1,
                 cleanup_fn=lambda *a, **k: None,
@@ -319,17 +320,17 @@ class TestStreamingRoleChunkContent:
 
     def test_fanout_stream_role_chunks_have_empty_content(self):
         async def run():
-            queue = asyncio.Queue()
-            # Empty text + finished=False means each queue item triggers
+            collector = StreamOutputCollector("req-2")
+            # Empty text + finished=False means each pending chunk triggers
             # *only* the role-announcement yield (no content/finish chunks
             # in between), so the first two yields are guaranteed to be
             # sibling 0's and sibling 1's role chunks respectively.
-            await queue.put((0, {"text": "", "token_ids": [], "finished": False}))
-            await queue.put((1, {"text": "", "token_ids": [], "finished": False}))
+            collector.put_nowait((0, {"text": "", "token_ids": [], "finished": False}))
+            collector.put_nowait((1, {"text": "", "token_ids": [], "finished": False}))
             gen = stream_chat_response_fanout(
                 request_id="req-2",
                 model="model",
-                shared_queue=queue,
+                shared_collector=collector,
                 seq_ids=[0, 1],
                 num_prompt_tokens=1,
                 cleanup_fn=lambda *a, **k: None,

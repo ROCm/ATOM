@@ -370,7 +370,7 @@ class CoreManager:
                                     )
                         # Batched stream dispatch: the per-seq callbacks only buffer
                         # their chunks into a thread-local; flush the whole step's
-                        # buffer into the per-request asyncio queues now (one
+                        # buffer into the per-request stream collectors now (one
                         # call_soon_threadsafe per loop). Resolved lazily by the API
                         # server to avoid the api_server <-> engine_core_mgr import
                         # cycle. No-op when no streaming request is in flight.
