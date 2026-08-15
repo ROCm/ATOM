@@ -515,8 +515,15 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         # (seq.prefix_hashes_published flips True), chunk by chunk.
         self._save_tracker: dict[str, list] = {}
         self._save_inflight: set[str] = set()
+        self._load_inflight_tokens: dict[str, int] = {}
+        self._save_inflight_tokens: dict[str, int] = {}
         self._lookup_in_step: list[str] = []
         self._handoff_loads: set[str] = set()
+        self.total_load_requests = 0
+        self.total_loaded_tokens = 0
+        self.total_load_failures = 0
+        self.total_save_requests = 0
+        self.total_saved_tokens = 0
         # Unaligned handoff is always on: when the HBM prefix-cache hit is not
         # chunk-aligned, recompute the misaligned head up to the next chunk
         # boundary, then load the aligned remainder from CPU. (Previously gated
@@ -867,6 +874,7 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
             )
             loading_sids.add(sid)
             self._load_save_floors[sid] = self._chunk_floor(hbm)
+            self._load_inflight_tokens[sid] = max(0, lmc - hbm)
             meta.add_request(
                 LMCacheReqMeta(
                     req_id=seq.id,
@@ -918,6 +926,7 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
             )
             entry[1] = aligned
             self._save_inflight.add(sid)
+            self._save_inflight_tokens[sid] = max(0, aligned - int(saved))
         self._reqs_need_recv.clear()
         return meta
 
@@ -940,10 +949,22 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         return sid in self._save_inflight or self._has_pending_save(seq)
 
     def save_finished(self, req_id) -> None:
-        self._save_inflight.discard(str(req_id))
+        sid = str(req_id)
+        self._save_inflight.discard(sid)
+        saved_tokens = self._save_inflight_tokens.pop(sid, 0)
+        self.total_save_requests += 1
+        self.total_saved_tokens += saved_tokens
+
+    def load_finished(self, req_id) -> None:
+        sid = str(req_id)
+        loaded_tokens = self._load_inflight_tokens.pop(sid, 0)
+        self.total_load_requests += 1
+        self.total_loaded_tokens += loaded_tokens
 
     def load_failed(self, req_id) -> None:
         sid = str(req_id)
+        self._load_inflight_tokens.pop(sid, None)
+        self.total_load_failures += 1
         floor = self._load_save_floors.get(sid)
         entry = self._save_tracker.get(sid)
         if floor is not None and entry is not None:
@@ -956,5 +977,19 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
     def request_finished(self, seq) -> None:
         sid = str(seq.id)
         self._clear_pending_load(sid)
+        self._load_inflight_tokens.pop(sid, None)
         if not self.should_defer_free(seq):
+            self._save_inflight_tokens.pop(sid, None)
             self._save_tracker.pop(sid, None)
+
+    def get_statistics(self) -> dict[str, int]:
+        """Return cumulative and queue-depth stats without worker RPCs."""
+        return {
+            "load_requests": self.total_load_requests,
+            "loaded_tokens": self.total_loaded_tokens,
+            "load_failures": self.total_load_failures,
+            "save_requests": self.total_save_requests,
+            "saved_tokens": self.total_saved_tokens,
+            "loads_pending": len(self._load_inflight_tokens),
+            "saves_pending": len(self._save_inflight_tokens),
+        }

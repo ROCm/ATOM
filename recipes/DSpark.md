@@ -71,8 +71,9 @@ python -m atom.entrypoints.openai_server \
 ```
 
 Notes for Kimi-K3:
-- The draft is a standalone MLA model; its KV cache is allocated independently of
-  the target and is kept in **bf16** regardless of the target's `--kv_cache_dtype`.
+- The draft is a standalone MLA model. Its 576-wide latent is the same shape the
+  target's own full-attention layers cache, so the draft's 5 layers bind into
+  the target's KV pool as extra rows and inherit `--kv_cache_dtype`.
 - `--draft-model` accepts a local path or an HF repo id (downloaded on startup).
 - The confidence-scheduled ragged verify (`--dspark-config`) also applies here;
   omit it to run the plain batch-uniform verify.

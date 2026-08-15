@@ -169,10 +169,16 @@ def _v4_attention_fake(
 
 # PIECEWISE cudagraph: persistent per-(layer, num_tokens, arg) buffers holding a
 # snapshot of the eager core's transient projection inputs (q/kv_pre/qr/qr_scale/
-# idx_*). Those are outputs of the preceding graph piece and live in the SHARED
-# graph pool, which overlays them across num_tokens buckets; snapshotting them
-# out of the pool on core entry pins the graph->eager boundary. Keyed on
-# (layer_name, num_tokens, arg_index).
+# idx_*). Those are outputs of the preceding graph piece and live in the graph
+# pool; snapshotting them out of it on core entry pins the graph->eager boundary.
+# Keyed on (layer_name, num_tokens, arg_index).
+#
+# NOTE: main reverted this in #1902 — with one cudagraph pool per num_tokens
+# bucket (now the default) nothing overlays these across buckets, so the copies
+# buy nothing there. Kept here only because AF_PIECEWISE has not been re-measured
+# without them; drop once it has. The output side has no such question: the
+# per-(layer, num_tokens) output buffers main still carries are superseded on
+# this branch by CudagraphCaptureRunner's own buffers + stabilize().
 _v4_attn_piecewise_in: dict = {}
 
 
@@ -2783,7 +2789,7 @@ class DeepseekV4Attention(nn.Module):
         #    dynamic-shape attention core stays eager; the Q/KV/indexer
         #    projections are compiled into the preceding graph piece. Their
         #    outputs cross the graph->eager boundary and are pinned out of the
-        #    shared graph pool on core entry (see v4_core_attention).
+        #    graph pool on core entry (see v4_core_attention).
         #  - FULL / NONE -> WIDE split attention: the whole attention is one eager
         #    op for torch compile.
         cg_mode = get_current_atom_config().compilation_config.cudagraph_mode

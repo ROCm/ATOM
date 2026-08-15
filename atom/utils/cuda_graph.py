@@ -64,16 +64,30 @@ class CUDAGraphOptions:
     weak_ref_output: bool = True
 
 
-# Shared cudagraph pool across all piecewise pieces (default). Combined with the
-# weak_ref_tensor op it lets the pool OVERLAY piece outputs across shapes, so the
-# retained pool stays small (~10GB vs ~35GB unshared on DSV4 TP8). First
-# torch.cuda.graph makes the pool; the rest reuse it.
-_shared_graph_pool: Any | None = None
-
-# Per-num_tokens pools (ATOM_PER_BUCKET_POOL=1 fallback). Isolates each shape's
-# pool so shapes can't overlap — costs more memory but avoids any cross-shape
-# reuse. Kept as a safety escape hatch; default is the shared pool above.
+# One cudagraph pool per num_tokens bucket (default). A bucket's graphs only
+# ever reuse memory among themselves, so nothing one bucket's graph wrote can be
+# handed to another bucket's.
+#
+# Sharing one pool across buckets corrupts DeepSeek-V4 decode. Measured on
+# V4-Pro-DSpark tp8, GSM8K 3-shot 250q, --cudagraph-mode PIECEWISE:
+#
+#   pool shared, 11 buckets   0.664      pool shared, 2 buckets [32,64]  0.956
+#   pool shared, 1 bucket     0.976      per-bucket, 11 buckets          0.960
+#
+# Generations stay coherent for a few decode tokens and then collapse, prefill
+# is unaffected, and it is intermittent. Removing cross-bucket sharing by either
+# route (one bucket, or one pool each) fixes it; the corrupted memory is inside
+# the compiled pieces, not on the graph->eager boundary — pinning every boundary
+# tensor of the one V4 split op changes nothing (0.636).
 _graph_pools: dict = {}
+
+# ATOM_PER_BUCKET_POOL=0 restores the single shared pool. It buys little: on the
+# config above the two modes differ by 1.11GB reserved per rank (202.83 ->
+# 203.94GB) and the capture-time allocated delta is identical at 14.71GB, so the
+# overlay was not reducing live footprint at all. The wider claim it was added
+# for (~10GB vs ~35GB unshared on DSV4 TP8) does not reproduce there; a config
+# with far more or larger buckets, or DP, may still see a real gap.
+_shared_graph_pool: Any | None = None
 
 
 class CUDAGraphWrapper:
@@ -144,6 +158,10 @@ class CUDAGraphWrapper:
         return self.runnable
 
     def __call__(self, *args, **kwargs):
+        # Rebound on the first capture when the shared pool is opted into;
+        # `_graph_pools` is only mutated in place, so it needs no declaration.
+        global _shared_graph_pool
+
         forward_context = get_forward_context()
         batch_descriptor = forward_context.batch_descriptor
         cudagraph_runtime_mode = forward_context.cudagraph_runtime_mode
@@ -200,24 +218,21 @@ class CUDAGraphWrapper:
                     stack.enter_context(patch("gc.collect", lambda: None))
                     stack.enter_context(patch("torch.cuda.empty_cache", lambda: None))
 
-                import atom.utils.cuda_graph as _cg_mod
-
-                # Default: single shared pool (overlays piece outputs across
-                # shapes -> low memory; safe here because pieces replay serially
-                # and inter-piece tensors are pinned via persistent buffers).
-                # ATOM_PER_BUCKET_POOL=1 isolates a pool per num_tokens bucket
-                # (more memory) as a fallback.
-                _per_bucket = os.environ.get("ATOM_PER_BUCKET_POOL") == "1"
+                # Default: one pool per num_tokens bucket, so no bucket's graph
+                # can be handed memory another bucket's graph wrote. See the
+                # module header for the accuracy data behind this default and
+                # for what ATOM_PER_BUCKET_POOL=0 costs.
+                _per_bucket = os.environ.get("ATOM_PER_BUCKET_POOL", "1") == "1"
                 _bkey = batch_descriptor.num_tokens if batch_descriptor else 0
                 if _per_bucket:
-                    _pool = _cg_mod._graph_pools.get(_bkey)
+                    _pool = _graph_pools.get(_bkey)
                 else:
                     # Match vLLM (platforms/interface.py:get_global_graph_pool):
                     # use a DEDICATED shareable pool handle created ONCE up front
                     # for EVERY graph.
-                    if _cg_mod._shared_graph_pool is None:
-                        _cg_mod._shared_graph_pool = torch.cuda.graph_pool_handle()
-                    _pool = _cg_mod._shared_graph_pool
+                    if _shared_graph_pool is None:
+                        _shared_graph_pool = torch.cuda.graph_pool_handle()
+                    _pool = _shared_graph_pool
                 # thread_local, not the "global" default: global mode invalidates
                 # the capture when ANY thread makes an unsafe HIP call, and under
                 # DP attention the NCCL watchdog thread polls hipEventQuery on
@@ -250,8 +265,8 @@ class CUDAGraphWrapper:
             # to save memory
             # first graph of a per-bucket pool -> remember its pool. (shared pool
             # is created up front via graph_pool_handle() above, nothing to do.)
-            if _per_bucket and _bkey not in _cg_mod._graph_pools:
-                _cg_mod._graph_pools[_bkey] = cudagraph.pool()
+            if _per_bucket and _bkey not in _graph_pools:
+                _graph_pools[_bkey] = cudagraph.pool()
 
             entry.output = weak_ref_tensors(output)
             entry.cudagraph = cudagraph

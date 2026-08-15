@@ -395,6 +395,136 @@ class LLMEngine:
             ),
         }
 
+    def get_metrics_statistics(self, timeout: float = 5.0) -> dict[str, Any]:
+        """Return a DP-aggregated snapshot for the Prometheus exporter."""
+        responses = self.core_mgr.broadcast_utility_command_sync(
+            "get_metrics_statistics", timeout=timeout
+        )
+        rank_stats = [
+            resp.get("result", resp)
+            for resp in responses
+            if resp.get("result", resp).get("enabled", False)
+        ]
+
+        def summed(key: str) -> int:
+            return sum(int(stats.get(key, 0)) for stats in rank_stats)
+
+        kv_total = summed("kv_blocks_total")
+        kv_used = summed("kv_blocks_used")
+
+        mtp_rank_stats = [
+            stats.get("mtp", {})
+            for stats in rank_stats
+            if stats.get("mtp", {}).get("enabled", False)
+        ]
+        mtp_distribution: Counter[int] = Counter()
+        for stats in mtp_rank_stats:
+            mtp_distribution.update(
+                {
+                    int(accepted): int(steps)
+                    for accepted, steps in stats.get("distribution", {}).items()
+                }
+            )
+        mtp_draft = sum(
+            int(stats.get("total_draft_tokens", 0)) for stats in mtp_rank_stats
+        )
+        mtp_accepted = sum(
+            int(stats.get("total_accepted_tokens", 0)) for stats in mtp_rank_stats
+        )
+        mtp_steps = sum(mtp_distribution.values())
+
+        cache_rank_stats = [
+            stats.get("cache", {})
+            for stats in rank_stats
+            if stats.get("cache", {}).get("enabled", False)
+        ]
+        cache_keys = (
+            "requests",
+            "cached_tokens",
+            "compressed_tokens",
+            "wanted_tokens",
+            "full_tokens",
+            "checkpoints_kept",
+            "checkpoints_dropped",
+            "checkpoints_evicted",
+            "checkpoints_orphaned",
+            "demands_recorded",
+            "chunks_cut_for_demand",
+        )
+        cache_totals = {
+            key: sum(int(stats.get(key, 0)) for stats in cache_rank_stats)
+            for key in cache_keys
+        }
+        cache_full = cache_totals["full_tokens"]
+        offload_rank_stats = [
+            stats.get("offload", {}) for stats in rank_stats if stats.get("offload")
+        ]
+        offload_keys = (
+            "load_requests",
+            "loaded_tokens",
+            "load_failures",
+            "save_requests",
+            "saved_tokens",
+            "loads_pending",
+            "saves_pending",
+        )
+        offload_totals = {
+            key: sum(int(stats.get(key, 0)) for stats in offload_rank_stats)
+            for key in offload_keys
+        }
+
+        return {
+            "enabled": bool(rank_stats),
+            "requests_running": summed("requests_running"),
+            "requests_waiting": summed("requests_waiting"),
+            "requests_parked_kv_load": summed("requests_parked_kv_load"),
+            "requests_partial_prefill": summed("requests_partial_prefill"),
+            "requests_finished": summed("requests_finished"),
+            "prompt_tokens": summed("prompt_tokens"),
+            "generation_tokens": summed("generation_tokens"),
+            "preemptions": summed("preemptions"),
+            "kv_blocks_used": kv_used,
+            "kv_blocks_free": summed("kv_blocks_free"),
+            "kv_blocks_total": kv_total,
+            "kv_blocks_indexed": summed("kv_blocks_indexed"),
+            "kv_cache_usage_ratio": kv_used / kv_total if kv_total else 0.0,
+            "mtp": {
+                "enabled": bool(mtp_rank_stats),
+                "total_draft_tokens": mtp_draft,
+                "total_accepted_tokens": mtp_accepted,
+                "acceptance_rate": mtp_accepted / mtp_draft if mtp_draft else 0.0,
+                "average_tokens_per_forward": (
+                    1 + mtp_accepted / mtp_steps if mtp_steps else 0.0
+                ),
+                "distribution": dict(sorted(mtp_distribution.items())),
+            },
+            "cache": {
+                "enabled": bool(cache_rank_stats),
+                **cache_totals,
+                "hit": (
+                    cache_totals["cached_tokens"] / cache_full if cache_full else 0.0
+                ),
+                "compressed_hit": (
+                    cache_totals["compressed_tokens"] / cache_full
+                    if cache_full
+                    else 0.0
+                ),
+                "lost_to_checkpoint": (
+                    (cache_totals["wanted_tokens"] - cache_totals["cached_tokens"])
+                    / cache_full
+                    if cache_full
+                    else 0.0
+                ),
+                "lost_unrecoverable": (
+                    (cache_totals["compressed_tokens"] - cache_totals["wanted_tokens"])
+                    / cache_full
+                    if cache_full
+                    else 0.0
+                ),
+            },
+            "offload": offload_totals,
+        }
+
 
 class InputOutputProcessor:
 
@@ -450,6 +580,7 @@ class InputOutputProcessor:
         kv_transfer_params=None,
         multimodal_data=None,
         request_id: str | None = None,
+        data_parallel_rank: int | None = None,
     ):
         """responsible for:
         1) Tokenize
@@ -471,6 +602,7 @@ class InputOutputProcessor:
             kv_transfer_params=kv_transfer_params,
             multimodal_data=multimodal_data,
             parent_request_id=request_id,
+            data_parallel_rank=data_parallel_rank,
         )
         return seqs[0]
 
@@ -483,6 +615,7 @@ class InputOutputProcessor:
         kv_transfer_params=None,
         multimodal_data=None,
         parent_request_id: str | None = None,
+        data_parallel_rank: int | None = None,
     ) -> list[Sequence]:
         """Tokenize once and materialize ``sampling_params.n`` Sequences.
 
@@ -554,6 +687,7 @@ class InputOutputProcessor:
                 parent_request_id=parent_request_id,
                 sibling_index=i,
                 request_id=parent_request_id if n == 1 else None,
+                data_parallel_rank=data_parallel_rank,
             )
             seq.arrive_time = time.time()
             self.requests[seq.id] = seq
