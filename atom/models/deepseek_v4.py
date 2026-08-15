@@ -167,34 +167,6 @@ def _v4_attention_fake(
     return torch.empty_like(x)
 
 
-# PIECEWISE cudagraph: persistent per-(layer, num_tokens, arg) buffers holding a
-# snapshot of the eager core's transient projection inputs (q/kv_pre/qr/qr_scale/
-# idx_*). Those are outputs of the preceding graph piece and live in the graph
-# pool; snapshotting them out of it on core entry pins the graph->eager boundary.
-# Keyed on (layer_name, num_tokens, arg_index).
-#
-# NOTE: main reverted this in #1902 — with one cudagraph pool per num_tokens
-# bucket (now the default) nothing overlays these across buckets, so the copies
-# buy nothing there. Kept here only because AF_PIECEWISE has not been re-measured
-# without them; drop once it has. The output side has no such question: the
-# per-(layer, num_tokens) output buffers main still carries are superseded on
-# this branch by CudagraphCaptureRunner's own buffers + stabilize().
-_v4_attn_piecewise_in: dict = {}
-
-
-def _pin_core_input(layer_name: str, arg_idx: int, num_tokens: int, t):
-    """Snapshot a pool-backed core input into a persistent buffer (or None)."""
-    if t is None:
-        return None
-    key = (layer_name, num_tokens, arg_idx)
-    buf = _v4_attn_piecewise_in.get(key)
-    if buf is None or buf.shape != t.shape or buf.dtype != t.dtype:
-        buf = torch.empty_like(t)
-        _v4_attn_piecewise_in[key] = buf
-    buf.copy_(t)
-    return buf
-
-
 # AF_PIECEWISE: attn-core capture/replay (keyed layer, bucket_bs, q_eff, nt_pad).
 # Owns its isolated graph pool + per-key graph cache + output buffers.
 _v4_attn_runner = CudagraphCaptureRunner()
@@ -350,24 +322,13 @@ def v4_core_attention(
 
     fc = get_forward_context()
 
+    # The core's inputs are outputs of the preceding graph piece and live in the
+    # cudagraph pool. #1884 snapshotted them out of it on entry; #1902 dropped
+    # that once each num_tokens bucket got its own pool, since a bucket's graphs
+    # only ever reuse memory among themselves. They are passed through as-is.
     is_piecewise = (
         getattr(fc, "cudagraph_runtime_mode", None) == CUDAGraphMode.PIECEWISE
     )
-    if is_piecewise:
-        # (#1884) Snapshot the transient projection inputs out of the shared graph
-        # pool before the core reads them (the pool overlays them across num_tokens
-        # buckets). `x` is a dense-piece residual (kept live into attn_post's
-        # piece, so not overlaid) and is left in place. Done BEFORE attn_args so
-        # both the eager fallback and the AF capture/replay path below see pinned
-        # tensors.
-        _n = int(q.shape[0])
-        q = _pin_core_input(layer_name, 0, _n, q)
-        kv_pre = _pin_core_input(layer_name, 1, _n, kv_pre)
-        qr = _pin_core_input(layer_name, 2, _n, qr)
-        qr_scale = _pin_core_input(layer_name, 3, _n, qr_scale)
-        idx_q_quant = _pin_core_input(layer_name, 4, _n, idx_q_quant)
-        idx_weights = _pin_core_input(layer_name, 5, _n, idx_weights)
-        idx_q_scale = _pin_core_input(layer_name, 6, _n, idx_q_scale)
 
     attn_args = (x, q, kv_pre, qr, qr_scale, positions,
                  idx_q_quant, idx_weights, idx_q_scale)  # fmt: skip
