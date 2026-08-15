@@ -1269,20 +1269,8 @@ class ModelRunner:
                 self.max_bs, **i32_kwargs
             )
             if self.config.dspark.ragged and self.drafter.uses_confidence_schedule:
-                # Pinned staging for the three per-step DSpark RAGGED host->device
-                # transfers. They used to go through
-                # `torch.as_tensor(np_array, device=cuda)`, which is a PAGEABLE
-                # H2D: PyTorch issues cudaMemcpyAsync and then synchronizes the
-                # stream, draining every kernel already queued for this step
-                # before the host may continue. Living in forward_vars gets them
-                # the same per-slot ring treatment as `input_ids`, which bounds
-                # reuse against an in-flight forward.
-                #   ragged_lens    : per-seq verify lengths (propose_draft_token_ids)
-                #   ragged_extend  : the same lengths, but built and consumed in
-                #                    the V4 attention metadata build -- a separate
-                #                    slot because the two live at opposite ends of
-                #                    a step (attn build in prepare, propose in
-                #                    postprocess) and must not alias
+                # Pinned staging for the ragged H2D transfers (pageable would
+                # sync). Separate slots: the two are live at once within a step.
                 self.forward_vars["ragged_lens"] = CpuGpuBuffer(
                     self.max_bs, **i32_kwargs
                 )

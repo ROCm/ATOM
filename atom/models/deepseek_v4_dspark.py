@@ -1010,28 +1010,8 @@ class DeepseekV4DSpark(DSparkDraftModel):
                 f"the compiled graph at CompilationLevel >= DYNAMO_ONCE."
             )
 
-        # ---- Keep the batch dim off the 0/1 specialization ------------------
-        # torch._dynamo.mark_dynamic -- which the decorator applies on the FIRST
-        # call only (decorators.py:510) -- SPECIALIZES a size-0/1 dimension
-        # instead of making it symbolic. A graph first traced at B==1 therefore
-        # holds no SymInt at all, and PiecewiseBackend indexes
-        # sym_shape_indices[0] on its first replay and dies with IndexError.
-        # Observed: the dumped computation_graph.py read `L_input_ids_: "i32[1]"`
-        # where it should read `s0`.
-        #
-        # The fix is to make WARMUP the first traced call and pad it to B==2.
-        # Padding is sound there and ONLY there: on a dummy run the opaque
-        # attention op synthesizes a zero window (kv.new_zeros(B, W, ...)) and
-        # never touches attn_metadata, so an extra synthetic row costs nothing.
-        # On a REAL step it would be a bug -- attn_metadata is built for the
-        # actual batch, so swa_block_tables[:B] silently returns the REAL row
-        # count rather than the padded one, and the [window ++ draft] concat
-        # blows up on mismatched batch dims. (Tried it; that is exactly what
-        # happens.)
-        #
-        # Tracing at warmup is safe only because dspark_attention sits behind
-        # the opaque op: is_dummy_run is read eagerly inside it, every step, and
-        # so can never bake into the graph.
+        # mark_dynamic specializes a size-1 dim, so pad WARMUP (the first traced
+        # call) to B==2. Dummy runs only -- a real step would mismatch metadata.
         is_dummy = get_forward_context().context.is_dummy_run
         anchor_ids = input_ids
         pad = is_dummy and input_ids.shape[0] == 1

@@ -6,16 +6,11 @@ import torch
 
 logger = logging.getLogger("atom")
 
-# Max in-flight async ell copies to keep queued. The CPU runs at most a step or
-# two ahead of the GPU, so anything older is already superseded by the entries
-# behind it; the cap just bounds the queue if the GPU falls far behind.
+# Bounds the queued async ell copies if the GPU falls far behind.
 _MAX_ELL_INFLIGHT = 4
 
-# How many steps back the adopted ell comes from, counted at the TOP of a step:
-# `_ell_pending[-1]` is the previous step's copy (fired at its very end, so still
-# in flight), `[-2]` is the one before that (landed). Must be >= 2 so the
-# synchronize in `_resolve_ell` is free, and < _MAX_ELL_INFLIGHT so the ring slot
-# being read cannot be the one `record_ell` is about to reuse.
+# Steps back the adopted ell comes from. >= 2 so its copy has landed (the wait is
+# free), < _MAX_ELL_INFLIGHT so record_ell cannot reuse the slot being read.
 _ELL_GENERATION = 2
 
 
@@ -36,30 +31,10 @@ class VerifyScheduler:
     are bound later by the runner's warmup/calibration; until then a synthetic
     monotone SPS stub keeps the path lossless.
 
-    Effectively sync-free on the decode hot path, by DEFERRING rather than by
-    polling: ``record_ell`` fires an ASYNC D2H of ell, and the {req_id: ell} map
-    read at the top of a step is the one from ``_ELL_GENERATION`` steps back --
-    old enough that its copy has long landed, so the wait on it is a no-op.
-
-    Why not simply wait on the LATEST copy: ``record_ell`` runs at the end of a
-    step, after the whole step (target forward + block draft) is queued on the
-    default stream, and the copy stream waits on it -- so that copy completes
-    only when the step drains. Waiting on it at the top of the next step would
-    pin the host to the GPU's tail every step, collapsing the run-ahead the rest
-    of this loop is built on (``recv_async_output`` and friends all consume a
-    copy fired a step earlier, never the current one) and leaving the GPU idle
-    for the whole of the next step's host-side prep. Measured as a large
-    dspark -> next-decode bubble under ``confidence_schedule``.
-
-    Why not take whichever copy has landed: that is a function of how far THIS
-    rank's CPU has run ahead, so TP ranks pick different generations, and ell is
-    a shape under ragged -- see ``_resolve_ell``.
-
-    Consuming a few-steps-stale ell is lossless: ell is only the PREDICTED accept
-    count used to SIZE the next verify, a missing entry already falls back to
-    full length (never under-verify), the hard anchor lower bound comes from the
-    current step's ``num_bonus``, and any draft suffix dropped by a short ell is
-    simply re-drafted next step.
+    Sync-free by deferring: ell is adopted from a FIXED generation back, not from
+    the latest copy (would pin the host to the GPU tail) nor from whichever has
+    landed (per-rank, and ell is a shape under ragged). Stale ell is lossless --
+    it only SIZES the next verify, and a short one is re-drafted next step.
     """
 
     def __init__(self, runner):
