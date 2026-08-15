@@ -39,6 +39,7 @@ from atom.quantization.quark.utils import (
 )
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 logger = logging.getLogger("atom")
 
@@ -81,6 +82,14 @@ if use_triton_gemm():
         logger.warning(f"Triton w8a8 blockscale GEMM not available: {e}")
         gemm_a8w8_blockscale_triton = None
 
+    try:
+        from aiter.ops.triton.gemm.basic.gemm_afp8wfp8 import (
+            gemm_afp8wfp8_preshuffle,
+        )
+    except ImportError as e:
+        logger.warning(f"Gluon mxfp8 preshuffle GEMM not available: {e}")
+        gemm_afp8wfp8_preshuffle = None
+
     # Per-tensor / per-token a8w8 (per-row activation x per-column weight scale).
     try:
         from aiter.ops.triton.gemm.basic.gemm_a8w8 import (
@@ -92,8 +101,19 @@ if use_triton_gemm():
 else:
     gemm_afp4wfp4_preshuffle = None
     gemm_a8w8_blockscale_triton = None
+    gemm_afp8wfp8_preshuffle = None
     gemm_a8w8_triton = None
 from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE  # noqa
+
+
+def use_gluon_mxfp8_gemm() -> bool:
+    return (
+        use_triton_gemm()
+        and gemm_afp8wfp8_preshuffle is not None
+        and envs.ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE
+        and envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
+        and get_arch() == "gfx1250"
+    )
 
 
 def divide(numerator, denominator):
@@ -270,6 +290,16 @@ def gemm_a8w8_blockscale_preshuffle_impl(
     dtype: torch.dtype = torch.bfloat16,
     prefix: str = "",
 ) -> torch.Tensor:
+    if use_gluon_mxfp8_gemm():
+        return gemm_afp8wfp8_preshuffle(
+            x,
+            weight,
+            x_scale.view(torch.uint8),
+            w_scale.view(torch.uint8),
+            dtype,
+            x_scale_group_size=128,
+            is_x_scale_transposed=True,
+        )
     return gemm_a8w8_blockscale_bpreshuffle(x, weight, x_scale, w_scale, dtype)
 
 
