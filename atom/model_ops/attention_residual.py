@@ -55,7 +55,9 @@ def _block_residual_has_headroom(block_residual: torch.Tensor) -> bool:
     s0, s1, s2 = block_residual.stride()
     if s2 != 1 or s1 == 0:
         return False
-    last_needed_elem = block_residual.storage_offset() + (t - 1) * s0 + b * s1 + (h - 1) * s2 + 1
+    last_needed_elem = (
+        block_residual.storage_offset() + (t - 1) * s0 + b * s1 + (h - 1) * s2 + 1
+    )
     needed_bytes = last_needed_elem * block_residual.element_size()
     return needed_bytes <= block_residual.untyped_storage().nbytes()
 
