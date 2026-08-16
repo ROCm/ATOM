@@ -36,6 +36,13 @@ def test_vllm_proxy_embeds_compressor_state_in_unified_slot_planes():
     assert 'kv_state=arena.view("hca_main_kv")[hca_i]' in BRIDGE_SOURCE
 
 
+def test_vllm_proxy_aligns_embedded_state_after_packed_kv_offset():
+    assert "total += ATOM_DEEPSEEK_V4_PROXY_ALIGNMENT - 1" in BRIDGE_SOURCE
+    assert "alignment_pad = (" in BRIDGE_SOURCE
+    assert ") % ATOM_DEEPSEEK_V4_PROXY_ALIGNMENT" in BRIDGE_SOURCE
+    assert "raw = raw[alignment_pad:]" in BRIDGE_SOURCE
+
+
 def test_vllm_decode_hca_indices_use_unified_geometry_rows():
     assert "envelope_rows=md.pool_geometry.envelope_rows" in BRIDGE_SOURCE
     assert (

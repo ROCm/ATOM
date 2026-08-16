@@ -19,6 +19,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME = "model.layers.0.atom_deepseek_v4_proxy"
 ATOM_DEEPSEEK_V4_DRAFT_PROXY_LAYER_PREFIX = "atom_deepseek_v4_draft_proxy"
 ATOM_DEEPSEEK_V4_BLOCK_SIZE = 128
+ATOM_DEEPSEEK_V4_PROXY_ALIGNMENT = 256
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +157,35 @@ def _v4_state_layout(vllm_config, kv_fp8: bool):
     return planes, arena_rows, row_widths
 
 
+def _proxy_region_byte_sizes(
+    *,
+    geometry,
+    csa_layers: int,
+    num_blocks: int,
+    head_dim: int,
+    rope_head_dim: int,
+    index_head_dim: int,
+    kv_fp8: bool,
+) -> list[int]:
+    """Linear proxy layout: [NoPE plane][RoPE plane?][CSA indexers].
+
+    Matches native ``allocate_per_req_cache``: both KV planes are adjacent and
+    ``plan_regions``-aligned; indexer bytes follow. Inserting indexers between
+    the planes breaks ``StateArena``'s 256 B retype boundary on the RoPE plane.
+    """
+    nope_row_bytes = head_dim * (1 if kv_fp8 else 2)
+    regions = [geometry.plane_bytes(nope_row_bytes)]
+    if kv_fp8:
+        regions.append(geometry.plane_bytes(rope_head_dim * 2))
+    regions.append(
+        csa_layers
+        * num_blocks
+        * (ATOM_DEEPSEEK_V4_BLOCK_SIZE // 4)
+        * _index_row_bytes(index_head_dim)
+    )
+    return regions
+
+
 def _proxy_page_bytes(vllm_config) -> int:
     from atom.model_ops.attentions.v4_pool_geometry import UnifiedPoolGeometry
 
@@ -182,16 +212,28 @@ def _proxy_page_bytes(vllm_config) -> int:
         block_size=ATOM_DEEPSEEK_V4_BLOCK_SIZE,
         arena_rows=arena_rows,
     )
-    plane_bytes = geometry.plane_bytes(head_dim * (1 if kv_fp8 else 2))
-    if kv_fp8:
-        plane_bytes += geometry.plane_bytes(rope_head_dim * 2)
-    indexer_bytes = (
-        csa_layers
-        * min_blocks
-        * (ATOM_DEEPSEEK_V4_BLOCK_SIZE // 4)
-        * _index_row_bytes(index_head_dim)
+    from atom.model_ops.attentions.state_arena import plan_regions
+
+    regions = _proxy_region_byte_sizes(
+        geometry=geometry,
+        csa_layers=csa_layers,
+        num_blocks=min_blocks,
+        head_dim=head_dim,
+        rope_head_dim=rope_head_dim,
+        index_head_dim=index_head_dim,
+        kv_fp8=kv_fp8,
     )
-    return (plane_bytes + indexer_bytes + min_blocks - 1) // min_blocks
+    _, total = plan_regions(regions)
+    # vLLM 0.26 may pack this cache after another layer at a non-aligned
+    # storage offset. Budget one-time leading slack so the runtime carve can
+    # move its first plane to the 256B boundary StateArena requires.
+    total += ATOM_DEEPSEEK_V4_PROXY_ALIGNMENT - 1
+    page_bytes = (total + min_blocks - 1) // min_blocks
+    if page_bytes % ATOM_DEEPSEEK_V4_PROXY_ALIGNMENT:
+        page_bytes += ATOM_DEEPSEEK_V4_PROXY_ALIGNMENT - (
+            page_bytes % ATOM_DEEPSEEK_V4_PROXY_ALIGNMENT
+        )
+    return page_bytes
 
 
 def slice_deepseek_v4_proxy_cache_views(
@@ -211,7 +253,11 @@ def slice_deepseek_v4_proxy_cache_views(
     row_widths: list[int] | None = None,
 ) -> dict[str, object]:
     """Carve native-equivalent unified V4 planes from vLLM proxy storage."""
-    from atom.model_ops.attentions.state_arena import SplitStateArena, StateArena
+    from atom.model_ops.attentions.state_arena import (
+        SplitStateArena,
+        StateArena,
+        plan_regions,
+    )
     from atom.model_ops.attentions.v4_pool_geometry import UnifiedPoolGeometry
 
     if compress_ratios is None:
@@ -224,6 +270,13 @@ def slice_deepseek_v4_proxy_cache_views(
         raise ValueError("DeepSeek V4 proxy cache must be block-major contiguous")
     num_blocks = int(physical.shape[0])
     raw = physical.reshape(-1)
+    if raw.dtype is not torch.uint8:
+        raise ValueError(f"DeepSeek V4 proxy cache must be uint8, got {raw.dtype}")
+    # Packed vLLM KV allocations can start an individual layer on only a 128B
+    # boundary. Consume the sizing slack above so every plane and embedded
+    # StateArena starts on the 256B boundary its retyped field views require.
+    alignment_pad = (-raw.storage_offset()) % ATOM_DEEPSEEK_V4_PROXY_ALIGNMENT
+    raw = raw[alignment_pad:]
     offset = 0
     geometry = UnifiedPoolGeometry(
         ratios,
@@ -234,9 +287,10 @@ def slice_deepseek_v4_proxy_cache_views(
         arena_rows=arena_rows,
     )
     csa_indexer: list[torch.Tensor] = []
+    csa_rows = ATOM_DEEPSEEK_V4_BLOCK_SIZE // 4
+    n_csa = sum(1 for r in ratios if r == 4)
 
     nope_dtype = dtypes.fp8 if kv_fp8 else torch.bfloat16
-    nope_elt = 1 if kv_fp8 else 2  # bytes per NoPE-pool element
 
     def take_bytes(n: int) -> torch.Tensor:
         nonlocal offset
@@ -248,26 +302,46 @@ def slice_deepseek_v4_proxy_cache_views(
         offset += n
         return out
 
-    kv_plane = (
-        take_bytes(geometry.plane_rows * head_dim * nope_elt)
-        .view(nope_dtype)
-        .view(geometry.plane_rows, head_dim)
+    regions = _proxy_region_byte_sizes(
+        geometry=geometry,
+        csa_layers=n_csa,
+        num_blocks=num_blocks,
+        head_dim=head_dim,
+        rope_head_dim=rope_head_dim,
+        index_head_dim=index_head_dim,
+        kv_fp8=kv_fp8,
     )
-    csa_rows = ATOM_DEEPSEEK_V4_BLOCK_SIZE // 4
-    for ratio in ratios:
-        if ratio == 4:
+    region_offsets, layout_total = plan_regions(regions)
+
+    def take_region(region_idx: int) -> torch.Tensor:
+        nonlocal offset
+        start = region_offsets[region_idx]
+        if offset < start:
+            offset = start
+        return take_bytes(regions[region_idx])
+
+    kv_plane = take_region(0).view(nope_dtype).view(geometry.plane_rows, head_dim)
+    region_idx = 1
+    kv_plane_rope = None
+    if kv_fp8:
+        kv_plane_rope = (
+            take_region(region_idx)
+            .view(torch.bfloat16)
+            .view(geometry.plane_rows, rope_head_dim)
+        )
+        region_idx += 1
+    if n_csa:
+        per_layer_indexer = num_blocks * csa_rows * index_dim
+        indexer_blob = take_region(region_idx)
+        for layer_idx in range(n_csa):
+            sl = indexer_blob[
+                layer_idx * per_layer_indexer : (layer_idx + 1) * per_layer_indexer
+            ]
             csa_indexer.append(
-                take_bytes(num_blocks * csa_rows * index_dim)
-                .view(dtypes.fp8)
-                .view(num_blocks, csa_rows, index_dim)
+                sl.view(dtypes.fp8).view(num_blocks, csa_rows, index_dim)
             )
-    kv_plane_rope = (
-        take_bytes(geometry.plane_rows * rope_head_dim * 2)
-        .view(torch.bfloat16)
-        .view(geometry.plane_rows, rope_head_dim)
-        if kv_fp8
-        else None
-    )
+    if offset < layout_total:
+        offset = layout_total
     planes = [kv_plane]
     if kv_plane_rope is not None:
         planes.append(kv_plane_rope)
@@ -817,6 +891,15 @@ def bind_deepseek_v4_proxy_cache_views(
     # CSA/HCA Main scatter mode: fp8 2buff -> "main_2buff_fp8" (nope fp8 + parallel
     # bf16 rope), else the plain bf16 scatter. The indexer is always "indexer_fp8".
     main_write_mode = "main_2buff_fp8" if kv_fp8 else "bf16"
+    physical = proxy.kv_cache.permute(1, 0, 2, 3, 4)
+    if not physical.is_contiguous():
+        raise ValueError("DeepSeek V4 proxy cache must be block-major contiguous")
+    raw = physical.reshape(-1)
+    if raw.storage_offset() % 256:
+        raise RuntimeError(
+            f"DeepSeek V4 proxy KV storage offset {raw.storage_offset()} is not "
+            "256B-aligned; StateArena cannot retype carved planes safely"
+        )
     views = slice_deepseek_v4_proxy_cache_views(
         proxy.kv_cache,
         compress_ratios=ratios,
