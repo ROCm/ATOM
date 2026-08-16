@@ -316,8 +316,7 @@ def slice_deepseek_v4_proxy_cache_views(
     def take_region(region_idx: int) -> torch.Tensor:
         nonlocal offset
         start = region_offsets[region_idx]
-        if offset < start:
-            offset = start
+        offset = max(offset, start)
         return take_bytes(regions[region_idx])
 
     kv_plane = take_region(0).view(nope_dtype).view(geometry.plane_rows, head_dim)
@@ -340,8 +339,7 @@ def slice_deepseek_v4_proxy_cache_views(
             csa_indexer.append(
                 sl.view(dtypes.fp8).view(num_blocks, csa_rows, index_dim)
             )
-    if offset < layout_total:
-        offset = layout_total
+    offset = max(offset, layout_total)
     planes = [kv_plane]
     if kv_plane_rope is not None:
         planes.append(kv_plane_rope)

@@ -13,7 +13,6 @@ from atom.model_ops.attentions.v4_pool_geometry import UnifiedPoolGeometry
 from atom.plugin.vllm.deepseek_v4_bridge import (
     ATOM_DEEPSEEK_V4_BLOCK_SIZE,
     ATOM_DEEPSEEK_V4_PROXY_ALIGNMENT,
-    _index_row_bytes,
     _proxy_region_byte_sizes,
     slice_deepseek_v4_proxy_cache_views,
 )
