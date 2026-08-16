@@ -180,7 +180,10 @@ if _HAS_TRITON:
                 # the same [t, l, :] slot. m_res keeps the store confined to real
                 # rows (l < B), so this is safe even in the last, partial tile.
                 tl.store(
-                    bo_ptr + t * stride_bo_t + o_l[:, None] * stride_bo_b + o_d[None, :],
+                    bo_ptr
+                    + t * stride_bo_t
+                    + o_l[:, None] * stride_bo_b
+                    + o_d[None, :],
                     v.to(bo_ptr.dtype.element_ty),
                     mask=m_res,
                 )
@@ -281,7 +284,9 @@ def _apply_attn_res_impl(
     hs2 = add_hidden2.contiguous() if do_add2 else ps
     pref = torch.empty_like(ps) if do_add else ps
     block_out = (
-        torch.empty((T, Bp, H), device=block_residual.device, dtype=block_residual.dtype)
+        torch.empty(
+            (T, Bp, H), device=block_residual.device, dtype=block_residual.dtype
+        )
         if close_block
         else None
     )
@@ -470,7 +475,9 @@ def apply_attn_res(
     out_eps: float = 1e-6,
     add_hidden2: torch.Tensor | None = None,
     close_block: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> (
+    tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+):
     """Dispatch an opaque custom op whose CUDA implementation selects by concrete T.
 
     ``out_norm_weight`` folds the caller's rmsnorm of the result into the kernel;
