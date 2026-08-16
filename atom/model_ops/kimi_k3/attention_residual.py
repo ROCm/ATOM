@@ -180,10 +180,7 @@ if _HAS_TRITON:
                 # the same [t, l, :] slot. m_res keeps the store confined to real
                 # rows (l < B), so this is safe even in the last, partial tile.
                 tl.store(
-                    bo_ptr
-                    + t * stride_bo_t
-                    + o_l[:, None] * stride_bo_b
-                    + o_d[None, :],
+                    bo_ptr + t * stride_bo_t + o_l[:, None] * stride_bo_b + o_d[None, :],
                     v.to(bo_ptr.dtype.element_ty),
                     mask=m_res,
                 )
@@ -225,28 +222,6 @@ def _pick_attn_res_config(tokens: int):
         if tokens <= max_tokens:
             return nw, ns, bl
     return _ATTN_RES_CATCHALL
-
-
-def _as_row_major_last_dim(x: torch.Tensor) -> torch.Tensor:
-    """Like ``x.contiguous()``, but skips the copy when the last dimension is
-    already stride-1.
-
-    The kernel only ever indexes ``block_residual`` (and every other tensor
-    passed through here) via its own per-row/per-block strides -- it never
-    assumes the WHOLE tensor is contiguous, only that each row's H elements
-    are. A plain ``.contiguous()`` doesn't know that: given a ``[T, B, H]``
-    view sliced out of a bigger ``[T, N_cap, H]`` buffer (see
-    ``AttnRes``/``_grow_block_residual_in_place`` in ``attention_residual.py``,
-    the model-level wrapper), PyTorch considers it non-contiguous purely
-    because ``stride(0) == N_cap * H != B * H``, even though every row is laid
-    out exactly as this kernel wants. Calling ``.contiguous()`` on it
-    unconditionally would silently relocate the entire ``[T, B, H]`` block on
-    every single call -- exactly the HBM traffic the grow-in-place buffer
-    exists to avoid.
-    """
-    if x.stride(-1) == 1:
-        return x
-    return x.contiguous()
 
 
 def _apply_attn_res_impl(
@@ -294,7 +269,7 @@ def _apply_attn_res_impl(
     if do_add2 and not do_add:
         raise ValueError("add_hidden2 requires add_hidden")
     out_norm = out_norm_weight is not None
-    br = _as_row_major_last_dim(block_residual)
+    br = block_residual.contiguous()
     ps = prefix_sum.contiguous()
     sw = score_weight.contiguous()
     y = torch.empty((T, H), device=block_residual.device, dtype=prefix_sum.dtype)
@@ -306,9 +281,7 @@ def _apply_attn_res_impl(
     hs2 = add_hidden2.contiguous() if do_add2 else ps
     pref = torch.empty_like(ps) if do_add else ps
     block_out = (
-        torch.empty(
-            (T, Bp, H), device=block_residual.device, dtype=block_residual.dtype
-        )
+        torch.empty((T, Bp, H), device=block_residual.device, dtype=block_residual.dtype)
         if close_block
         else None
     )
@@ -497,9 +470,7 @@ def apply_attn_res(
     out_eps: float = 1e-6,
     add_hidden2: torch.Tensor | None = None,
     close_block: bool = False,
-) -> (
-    tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-):
+) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Dispatch an opaque custom op whose CUDA implementation selects by concrete T.
 
     ``out_norm_weight`` folds the caller's rmsnorm of the result into the kernel;

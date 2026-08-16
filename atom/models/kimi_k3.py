@@ -1533,23 +1533,13 @@ class KimiLinearModel(nn.Module):
                 if inputs_embeds is not None
                 else self.embed_tokens(input_ids)
             )
-            block_size = getattr(self.config, "attn_res_block_size", None)
-            if block_size is not None:
-                # Reserve storage for every candidate the block-banking layers
-                # will ever bank across this whole forward pass (one per
-                # `block_size` layers) up front, so each AttnRes.maybe_close_block
-                # can grow block_residual in place (widen the view, store the one
-                # new row) instead of reallocating and relocating all existing
-                # rows through a fresh torch.cat every time -- see
-                # _grow_block_residual_in_place. Starts at 0 valid rows; the
-                # slack rows are uninitialized (new_empty, not new_zeros) since
-                # each is written exactly once, right before it is first read.
-                n_max_blocks = -(-self.config.num_hidden_layers // block_size)
-                block_residual = hidden_states.new_empty(
-                    hidden_states.shape[0], n_max_blocks, hidden_states.shape[1]
-                )[:, :0, :]
-            else:
-                block_residual = None
+            block_residual = (
+                hidden_states.new_zeros(
+                    hidden_states.shape[0], 0, hidden_states.shape[1]
+                )
+                if getattr(self.config, "attn_res_block_size", None) is not None
+                else None
+            )
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
