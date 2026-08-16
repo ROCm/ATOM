@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import aiter
 import torch
@@ -93,13 +93,13 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         kv_cache_dtype="bf16",
         layer_num=0,
         use_mla: bool = False,
-        mla_modules: Optional[MLAModules] = None,
-        sinks: Optional[nn.Parameter] = None,
-        per_layer_sliding_window: Optional[int] = None,
-        rotary_emb: Optional[torch.nn.Module] = None,
-        prefix: Optional[str] = None,
-        q_norm: Optional[torch.nn.Module] = None,
-        k_norm: Optional[torch.nn.Module] = None,
+        mla_modules: MLAModules | None = None,
+        sinks: nn.Parameter | None = None,
+        per_layer_sliding_window: int | None = None,
+        rotary_emb: torch.nn.Module | None = None,
+        prefix: str | None = None,
+        q_norm: torch.nn.Module | None = None,
+        k_norm: torch.nn.Module | None = None,
         **kwargs,
     ):
         from vllm.v1.attention.backend import AttentionType
@@ -193,7 +193,7 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         key: torch.Tensor,
         value: torch.Tensor,
         positions: torch.Tensor = None,
-        q_scale: Optional[torch.Tensor] = None,
+        q_scale: torch.Tensor | None = None,
         qkv: torch.Tensor = None,
         **kwargs,
     ):
@@ -527,8 +527,6 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
             high_precision=0,
         )
 
-        return
-
     def extend_for_sliding_window(
         self,
         attn_metadata: "AiterMhaMetadataForVllm",
@@ -539,8 +537,8 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         cu_seqlens_q: torch.Tensor,
         max_seqlen_q: int,
         block_table: torch.Tensor,
-        k_scale: Optional[torch.Tensor],
-        v_scale: Optional[torch.Tensor],
+        k_scale: torch.Tensor | None,
+        v_scale: torch.Tensor | None,
     ):
         assert attn_metadata.extend_metadata is not None
         assert attn_metadata.extend_metadata.chunk_context_metadata is not None
@@ -613,8 +611,8 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         min_seqlen_q: int,
         block_table: torch.Tensor,
         slot_mapping: torch.Tensor,
-        k_scale: Optional[torch.Tensor],
-        v_scale: Optional[torch.Tensor],
+        k_scale: torch.Tensor | None,
+        v_scale: torch.Tensor | None,
     ):
         from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 

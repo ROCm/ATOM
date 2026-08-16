@@ -28,7 +28,6 @@ from atom.models.kimi_k3 import (
 )
 from atom.models.utils import IntermediateTensors
 from atom.plugin.vllm.kda_backend import AtomKimiK3KDAAttentionBackend
-from atom.plugin.vllm.model_wrapper import ATOMMoEForCausalLM
 from atom.utils.forward_context import get_forward_context as get_atom_forward_context
 
 
@@ -389,6 +388,28 @@ class KimiK3ForCausalLM(KimiK3ForCausalLMBase):
             kimi_k3_base.KimiKDAAttention = original_kda_cls
             kimi_k3_base.KimiLinearModel = original_model_cls
 
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        # Required by vLLM SupportsMultiModal.get_language_model discovery.
+        return self.get_input_embeddings(input_ids)
+
+    @property
+    def model(self) -> nn.Module:
+        """The body the DSpark loader reaches for ``embed_tokens`` on.
+
+        ``load_dspark_model`` reads ``get_language_model().model.embed_tokens``
+        and ``get_language_model().lm_head``. Multimodal discovery stops at this
+        class, one level above the causal LM that actually owns both, so expose
+        them here rather than redirecting ``get_language_model`` -- which the
+        vision path also uses. A property, so it stays out of ``named_modules``
+        and the checkpoint prefixes are unchanged.
+        """
+        return self.language_model.model
+
+    @property
+    def lm_head(self) -> nn.Module:
+        """The head the DSpark draft borrows to score its block."""
+        return self.language_model.lm_head
+
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
         self.language_model.model.set_aux_hidden_state_layers(layers)
 
@@ -398,16 +419,121 @@ class KimiK3ForCausalLM(KimiK3ForCausalLMBase):
         return (2, num_layers // 2, num_layers - 3)
 
 
-class KimiK3ForCausalLMVllm(ATOMMoEForCausalLM, IsHybrid):
-    def get_language_model(self):
-        """The causal LM that owns ``model.embed_tokens`` and ``lm_head``.
+@MULTIMODAL_REGISTRY.register_processor(
+    KimiK3MultiModalProcessor,
+    info=KimiK3ProcessingInfo,
+    dummy_inputs=KimiK3DummyInputsBuilder,
+)
+class KimiK3ForConditionalGeneration_(vLLMKimiK3):
+    hf_to_atom_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            # ATOM nests language_model.language_model (ATOM KimiK3ForCausalLM
+            # wraps KimiLinearForCausalLM); checkpoint stores language_model.model.
+            "language_model.": "language_model.language_model.",
+            "mm_projector.proj.0": "mm_projector.linear_1",
+            "mm_projector.proj.2": "mm_projector.linear_2",
+        }
+    )
+    packed_modules_mapping = KimiK3ForCausalLMBase.packed_modules_mapping
+    quant_exclude_name_mapping: ClassVar[dict[str, str]] = {
+        "language_model.model.": "language_model.language_model.model.",
+        "language_model.lm_head": "language_model.language_model.lm_head",
+    }
 
-        DSpark's loader binds the target's embedding and head into the draft
-        through this hook; Kimi-K3 keeps both one level in, under
-        ``language_model``, so without it the loader would look for them on this
-        wrapper and silently leave the draft with neither.
-        """
-        return self.model.language_model
+    def __init__(self, atom_config: Config, prefix: str = "model"):
+        nn.Module.__init__(self)
+        hf_config = getattr(atom_config, "hf_config", None)
+        assert hf_config is not None, "hf_config is not found in atom_config"
+        vision_config = hf_config.vision_config
+        self.config = hf_config
+        self.atom_config = atom_config
+
+        vllm_config = atom_config.plugin_config.vllm_config
+        quant_config = vllm_config.quant_config
+        atom_quant_config = atom_config.quant_config
+        multimodal_config = vllm_config.model_config.multimodal_config
+        self.multimodal_config = multimodal_config
+        self.use_data_parallel = is_vit_use_data_parallel(
+            vision_config.num_attention_heads
+        )
+
+        with self._mark_tower_model(vllm_config, "image"):
+            self.vision_tower = MoonViT3dPretrainedModel(
+                vision_config,
+                quant_config=self._maybe_ignore_quant_config(
+                    quant_config,
+                    atom_quant_config.exclude_layers or [],
+                    "vision_tower",
+                ),
+                prefix=maybe_prefix(prefix, "vision_tower"),
+            )
+            self.mm_projector = KimiK25MultiModalProjector(
+                config=vision_config,
+                use_data_parallel=self.use_data_parallel,
+                quant_config=self._maybe_ignore_quant_config(
+                    quant_config,
+                    atom_quant_config.exclude_layers or [],
+                    "mm_projector",
+                ),
+                prefix=maybe_prefix(prefix, "mm_projector"),
+            )
+
+        self.quant_config = quant_config
+        with self._mark_language_model(vllm_config):
+            self.language_model = KimiK3ForCausalLM(
+                atom_config=atom_config,
+                prefix=maybe_prefix(prefix, "language_model"),
+            )
+
+        self.make_empty_intermediate_tensors = (
+            self.language_model.make_empty_intermediate_tensors
+        )
+        self.media_placeholder = self.config.media_placeholder_token_id
+        self.packed_modules_mapping = self.language_model.packed_modules_mapping
+        self.weights_mapping = self.language_model.weights_mapping
+
+    def _maybe_ignore_quant_config(
+        self, quant_config: Any, exclude_layers: list[str], layer_name: str
+    ):
+        for exclude_layer in exclude_layers:
+            if QuantizationConfig._matches_exclude(
+                layer_name, exclude_layer, check_contains=True
+            ):
+                return None
+        return quant_config
+
+    def load_weights(self, weights):
+        return load_model_in_plugin_mode(
+            model=self,
+            config=self.atom_config,
+            prefix="model.",
+            weights_mapper=self.hf_to_atom_mapper,
+        )
+
+    def get_expert_mapping(self):
+        return self.language_model.get_expert_mapping()
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.language_model.set_aux_hidden_state_layers(layers)
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        return self.language_model.get_eagle3_aux_hidden_state_layers()
+
+
+@MULTIMODAL_REGISTRY.register_processor(
+    KimiK3MultiModalProcessor,
+    info=KimiK3ProcessingInfo,
+    dummy_inputs=KimiK3DummyInputsBuilder,
+)
+class KimiK3ForCausalLMVllm(ATOMForConditionalGeneration, IsHybrid):
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
+        if modality == "image":
+            return "<|kimi_image_placeholder|>"
+        raise ValueError(f"Unsupported modality: {modality}")
+
+    def load_weights(self, weights):
+        return self.model.load_weights(weights)
 
     @classmethod
     def get_mamba_state_dtype_from_config(
