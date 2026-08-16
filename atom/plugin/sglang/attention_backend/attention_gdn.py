@@ -76,6 +76,24 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
 
         draft_token_num = int(forward_batch.spec_info.draft_token_num)
         bs = int(forward_batch.batch_size)
+        # Validate the token count before the views below. `mixed_qkv`, `a` and
+        # `b` are reshaped with a trailing -1, which silently produces a wrong
+        # trailing dimension (rather than raising) whenever the row count is a
+        # different multiple of bs * draft_token_num.
+        expected_tokens = bs * draft_token_num
+        for name, tensor in (
+            ("mixed_qkv", mixed_qkv),
+            ("a", a),
+            ("b", b),
+            ("core_attn_out", core_attn_out),
+        ):
+            if tensor.shape[0] != expected_tokens:
+                raise RuntimeError(
+                    "ATOM GDN TARGET_VERIFY expected "
+                    f"{expected_tokens} tokens (batch_size {bs} x "
+                    f"draft_token_num {draft_token_num}) but {name} has "
+                    f"{tensor.shape[0]}."
+                )
         cache_indices = linear_backend.forward_metadata.mamba_cache_indices[:bs]
         conv_states = layer_cache.conv[0]
         ssm_states = layer_cache.temporal
@@ -103,10 +121,6 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
             draft_token_num=draft_token_num,
         )
 
-        if core_attn_out.shape != output_blocks.view_as(core_attn_out).shape:
-            raise RuntimeError(
-                "ATOM GDN TARGET_VERIFY produced an incompatible output shape."
-            )
         return core_attn_out
 
     def _spec_ssm_slot_table(
