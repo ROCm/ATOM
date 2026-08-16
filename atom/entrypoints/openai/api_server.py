@@ -877,7 +877,13 @@ async def setup_streaming_request(
         raise
     seq_id = seq.id
 
-    logger.info(f"API: Created request_id={request_id}, seq_id={seq_id}")
+    # debug, not info: this runs once per request, on the event loop, and
+    # logging takes a lock the engine's output threads are also contending for.
+    # A loop-stall watchdog at concurrency 8192 caught 26 stalls over a run and
+    # 9 of them were sitting on this line, up to 3.3 s each -- long enough that
+    # the server accepts no new request at all and the GPUs run dry waiting for
+    # work. Anything per-request logged from here has to stay off info.
+    logger.debug(f"API: Created request_id={request_id}, seq_id={seq_id}")
     engine.core_mgr.add_request([seq])
 
     return seq_id, stream_collector, seq.num_prompt_tokens
@@ -1086,7 +1092,9 @@ async def setup_streaming_request_fanout(
             engine.io_processor.requests.pop(seq.id, None)
         raise
     seq_ids = [seq.id for seq in seqs]
-    logger.info(
+    # debug for the same reason as its single-sequence counterpart: per-request
+    # logging on the event loop stalls it under load.
+    logger.debug(
         f"API: Created fan-out request_id={request_id}, n={n}, seq_ids={seq_ids}"
     )
     engine.core_mgr.add_request(seqs)
