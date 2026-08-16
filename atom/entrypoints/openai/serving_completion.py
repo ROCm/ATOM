@@ -59,7 +59,8 @@ async def stream_completion_response(
     stream_collector: StreamOutputCollector,
     seq_id: int,
     num_prompt_tokens: int,
-    cleanup_fn,
+    cleanup_stream,
+    cleanup_request,
 ) -> AsyncGenerator[str, None]:
     """Generate streaming text completion response.
 
@@ -121,7 +122,8 @@ async def stream_completion_response(
 
             yield content_chunk
     finally:
-        cleanup_fn(request_id, seq_id, aborted=aborted)
+        cleanup_stream(seq_id, aborted=aborted)
+        cleanup_request(request_id)
 
 
 def build_completion_response(
@@ -206,7 +208,8 @@ async def stream_completion_response_fanout(
     shared_collector: StreamOutputCollector,
     seq_ids: list[int],
     num_prompt_tokens: int,
-    cleanup_fn,
+    cleanup_stream,
+    cleanup_request,
 ) -> AsyncGenerator[str, None]:
     """Streaming variant multiplexing ``len(seq_ids)`` siblings into one SSE.
 
@@ -278,4 +281,5 @@ async def stream_completion_response_fanout(
         )
     finally:
         for sid in seq_ids:
-            cleanup_fn(request_id, sid, aborted=aborted)
+            cleanup_stream(sid, aborted=aborted)
+        cleanup_request(request_id)

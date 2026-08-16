@@ -416,13 +416,14 @@ def _send_stream_chunk_direct(
     request_id: str,
     stream_collector: StreamOutputCollector,
     loop: AbstractEventLoop,
+    state: Any,
 ) -> None:
     """Buffer a single-request chunk for this engine step."""
     assert _stream_batch_dispatcher is not None
     _stream_batch_dispatcher.enqueue(
         loop=loop,
         collector=stream_collector,
-        state_key=request_id,
+        state=state,
         chunk=_build_stream_chunk(request_output, request_id),
     )
 
@@ -439,6 +440,7 @@ def _send_stream_chunk_tagged(
     sibling_index: int,
     stream_collector: StreamOutputCollector,
     loop: AbstractEventLoop,
+    state: Any,
 ) -> None:
     """Variant of :func:`_send_stream_chunk_direct` for fan-out siblings.
 
@@ -454,7 +456,7 @@ def _send_stream_chunk_tagged(
     _stream_batch_dispatcher.enqueue(
         loop=loop,
         collector=stream_collector,
-        state_key=(request_id, sibling_index),
+        state=state,
         chunk=_build_stream_chunk(request_output, request_id),
         tag=sibling_index,
     )
@@ -538,7 +540,7 @@ async def generate_async(
         #      its own KV on finish, but this dict is only cleaned up here for
         #      non-stream requests -- without an unconditional pop, every
         #      completed non-stream request leaks a Sequence (pending grows
-        #      forever). Streaming pops via cleanup_streaming_request instead.
+        #      forever). Streaming pops via cleanup_stream instead.
         if seq is not None:
             if not _finished_ok:
                 try:
@@ -838,9 +840,14 @@ async def setup_streaming_request(
     _stream_loops[request_id] = stream_loop
     _request_start_times[request_id] = time.time()
 
+    # The detokenizer lives in this closure, so it is freed when the engine
+    # drops the callback on the stream's last chunk -- no registry, no cleanup.
+    assert _stream_batch_dispatcher is not None
+    detokenizer = _stream_batch_dispatcher.new_state()
+
     def stream_callback(request_output: RequestOutput) -> None:
         _send_stream_chunk_direct(
-            request_output, request_id, stream_collector, stream_loop
+            request_output, request_id, stream_collector, stream_loop, detokenizer
         )
 
     executor_loop = asyncio.get_event_loop()
@@ -876,14 +883,8 @@ async def setup_streaming_request(
     return seq_id, stream_collector, seq.num_prompt_tokens
 
 
-def cleanup_streaming_request(
-    request_id: str, seq_id: int, aborted: bool = False
-) -> None:
-    """Clean up resources for a streaming request.
-
-    Safe to call multiple times for the same ``request_id`` with different
-    ``seq_id`` values (as happens in fan-out cleanup): the per-request
-    dicts use ``dict.pop(..., None)`` so repeated removal is a no-op.
+def cleanup_stream(seq_id: int, aborted: bool = False) -> None:
+    """Tear down one stream. A fan-out request runs this once per sibling.
 
     ``aborted`` says the stream did NOT reach its normal end (client disconnect
     or abnormal generator teardown), so the seq is likely still running in the
@@ -893,16 +894,25 @@ def cleanup_streaming_request(
     request).
     """
     _seq_id_to_request_id.pop(seq_id, None)
-    _stream_loops.pop(request_id, None)
-    _request_start_times.pop(request_id, None)
-    if _stream_batch_dispatcher is not None:
-        _stream_batch_dispatcher.discard_request(request_id)
     if aborted:
         try:
             engine.core_mgr.abort_request(seq_id)
         except Exception:
             pass
     engine.io_processor.requests.pop(seq_id, None)
+
+
+def cleanup_request(request_id: str) -> None:
+    """Tear down what a request owns beyond its individual streams.
+
+    Runs once, after every one of the request's streams has been cleaned up.
+    Separate from :func:`cleanup_stream` because a fan-out has n streams but
+    one request: folding both into one call meant these two pops ran n times,
+    n-1 of them no-ops, and made a caller pass a seq id and a request id
+    together when each half only needs one of them.
+    """
+    _stream_loops.pop(request_id, None)
+    _request_start_times.pop(request_id, None)
 
 
 class _ClientDisconnected(Exception):
@@ -1028,10 +1038,20 @@ async def setup_streaming_request_fanout(
     _stream_loops[request_id] = stream_loop
     _request_start_times[request_id] = time.time()
 
+    assert _stream_batch_dispatcher is not None
+
     def make_callback(idx: int):
+        # One detokenizer per sibling, held by the closure that feeds it.
+        detokenizer = _stream_batch_dispatcher.new_state()
+
         def _cb(request_output: RequestOutput) -> None:
             _send_stream_chunk_tagged(
-                request_output, request_id, idx, shared_collector, stream_loop
+                request_output,
+                request_id,
+                idx,
+                shared_collector,
+                stream_loop,
+                detokenizer,
             )
 
         return _cb
@@ -1287,7 +1307,8 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     stream_collector,
                     seq_ids,
                     num_prompt_tokens,
-                    cleanup_streaming_request,
+                    cleanup_stream,
+                    cleanup_request,
                     tools=request.tools,
                 )
             else:
@@ -1307,7 +1328,8 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     stream_collector,
                     seq_id,
                     num_prompt_tokens,
-                    cleanup_streaming_request,
+                    cleanup_stream,
+                    cleanup_request,
                     tools=request.tools,
                     tool_choice=request.tool_choice,
                     starts_thinking=_starts_thinking,
@@ -1461,7 +1483,8 @@ async def completions(request: CompletionRequest, raw_request: Request):
                     stream_collector,
                     seq_ids,
                     num_prompt_tokens,
-                    cleanup_streaming_request,
+                    cleanup_stream,
+                    cleanup_request,
                 )
             else:
                 seq_id, stream_collector, num_prompt_tokens = (
@@ -1479,7 +1502,8 @@ async def completions(request: CompletionRequest, raw_request: Request):
                     stream_collector,
                     seq_id,
                     num_prompt_tokens,
-                    cleanup_streaming_request,
+                    cleanup_stream,
+                    cleanup_request,
                 )
             return StreamingResponse(
                 _logged_stream(gen, request_id),
@@ -1782,7 +1806,8 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                             aborted = False
                             break
                 finally:
-                    cleanup_streaming_request(request_id, seq_id, aborted=aborted)
+                    cleanup_stream(seq_id, aborted=aborted)
+                    cleanup_request(request_id)
 
             return StreamingResponse(
                 generate_anthropic_stream(),

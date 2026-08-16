@@ -305,7 +305,8 @@ class TestStreamingRoleChunkContent:
                 stream_collector=collector,
                 seq_id=0,
                 num_prompt_tokens=1,
-                cleanup_fn=lambda *a, **k: None,
+                cleanup_stream=lambda *a, **k: None,
+                cleanup_request=lambda *a, **k: None,
             )
             first_chunk = await gen.__anext__()
             await gen.aclose()
@@ -333,7 +334,8 @@ class TestStreamingRoleChunkContent:
                 shared_collector=collector,
                 seq_ids=[0, 1],
                 num_prompt_tokens=1,
-                cleanup_fn=lambda *a, **k: None,
+                cleanup_stream=lambda *a, **k: None,
+                cleanup_request=lambda *a, **k: None,
             )
             chunk_0 = await gen.__anext__()
             chunk_1 = await gen.__anext__()
@@ -349,3 +351,50 @@ class TestStreamingRoleChunkContent:
             delta = choice["delta"]
             assert delta["role"] == "assistant"
             assert delta["content"] == ""
+
+
+class TestFanoutCleanupSplit:
+    """A fan-out has n streams but one request, and teardown reflects that.
+
+    Per-sequence work (dropping the detokenizer state, aborting a seq that is
+    still running) has to happen once per sibling; the per-request bookkeeping
+    only once. Folding both into a single callback ran the request half n
+    times, n-1 of them no-ops, and forced every caller to pass a seq id and a
+    request id together when each half needs only one of them.
+    """
+
+    def _cleanup_calls(self, seq_ids):
+        stream_calls, request_calls = [], []
+
+        async def run():
+            collector = StreamOutputCollector("req-3")
+            for index in range(len(seq_ids)):
+                collector.put_nowait(
+                    (index, {"text": "", "token_ids": [], "finished": True})
+                )
+            gen = stream_chat_response_fanout(
+                request_id="req-3",
+                model="model",
+                shared_collector=collector,
+                seq_ids=seq_ids,
+                num_prompt_tokens=1,
+                cleanup_stream=lambda seq_id, **kwargs: stream_calls.append(seq_id),
+                cleanup_request=request_calls.append,
+            )
+            async for _ in gen:
+                pass
+
+        asyncio.run(run())
+        return stream_calls, request_calls
+
+    def test_every_sibling_seq_is_torn_down(self):
+        seq_ids = [70, 71, 72, 73]
+
+        stream_calls, _ = self._cleanup_calls(seq_ids)
+
+        assert stream_calls == seq_ids
+
+    def test_the_request_is_torn_down_exactly_once(self):
+        _, request_calls = self._cleanup_calls([70, 71, 72, 73])
+
+        assert request_calls == ["req-3"]
