@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786813313840,
+  "lastUpdate": 1786900112863,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -1626,6 +1626,40 @@ window.BENCHMARK_DATA = {
             "value": 0.8855,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/31894611888 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202608151459 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.2813 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Lingpeng Jin",
+            "username": "valarLip",
+            "email": "103567126+valarLip@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "17e3e0771b11b2ed74d313f571327b481aa03efb",
+          "message": "perf(frontend+server): stop the event loop stalling between request waves (#1912)\n\n* fix(benchmark): report requests that failed instead of hiding them\n\nEvery metric the run prints is computed over the requests that succeeded, so\na run that lost some of them reported the survivors' throughput as if nothing\nhad gone wrong -- at concurrency 8192 that silently hid thousands of dropped\nrequests behind a healthy-looking number.\n\nCount the failures by the last line of their traceback, which is the part\nthat identifies them, and print the total with a breakdown of the top\nreasons. Nothing else about the output changes, so the existing consumers of\nthis stdout keep working.\n\n* feat(server): expose uvicorn's keep-alive window and access log\n\nBoth were hardcoded to uvicorn's defaults and both matter at high\nconcurrency, so make them settable without changing what they default to.\n\n--timeout-keep-alive: a pooling client keeps an idle connection far longer\nthan the server does (aiohttp defaults to 15s against uvicorn's 5s), and only\nfinds out the server closed it by reading EOF from a request it already sent.\nRaising the server past the caller's idle window avoids that; requests here\nrun for minutes, so 5s is short.\n\n--disable-uvicorn-access-log: the access log copies a LogRecord and writes to\nthe same stdout the engine logs to, on the event loop, and says less than the\nengine's own per-request line.\n\n* perf(frontend): give each stream's detokenizer to the callback that feeds it\n\nDropping a request's detokenizer state meant finding it first, and the state\nlived in a dict shared by the engine's output threads and the event loop.\nFinding it was a scan of every live stream -- O(live) per cleanup, so draining\nN concurrent streams cost O(N^2): 894 ms at N=8192, four times that per\ndoubling. Keeping it findable by index instead is worse than it looks: a\nfan-out has several streams under one request id, so the index is a\nrequest-to-keys map that two threads maintain without a lock, and teardown has\nto remember to clear it or leak a detokenizer whose token list is unbounded.\n\nThere is no need to find it. The engine callback that produces a stream's\nchunks is already per-stream -- stream_callback for n=1, make_callback(i) for\neach fan-out sibling -- so let the closure hold the detokenizer and send it\nalong with the chunk. The dispatcher keeps no per-stream state at all, the\nper-chunk lookup is gone from the flush path, and the lifetime takes care of\nitself: when the engine drops a finished stream's callback the detokenizer\ngoes with it.\n\nTeardown splits the same way. cleanup_streaming_request took a seq id and a\nrequest id together, and a fan-out ran the whole thing once per sibling --\nincluding the two per-request pops, n-1 of them no-ops. cleanup_stream(seq_id)\nand cleanup_request(request_id) each take only what they need, and the\nfan-out finally reads as what the comment there always said it did: clean up\nevery sibling, then the request.\n\nAt concurrency 8192, 16384/16384 requests complete with no server-side\ntraceback, and GPU busy / idle / worst wave-boundary gap all land inside the\nrange of the pre-change runs.\n\n* perf(server): drop per-request admission logging to debug\n\nThese two lines run once per request, on the event loop, and logging takes a\nlock the engine's output threads are contending for on the same handler. A\nloop-stall watchdog at concurrency 8192 caught 26 stalls of 0.4s or more over\none run; 9 of them were sitting on the single-sequence line, up to 3.3 s each.\nA stall that long is not a latency blip -- the server accepts no new request\nfor its duration, so the engine drains its queue and the GPUs sit idle waiting\nfor work that is stuck behind a log write.\n\nMoving both to debug removed that whole class: stalls dropped to 18 and the\nworst to 1.45 s, with none of them landing in logging any more. What is left\nis h11/starlette protocol work and waking the SSE generators, which is\nstructural.\n\nuvicorn's own access log costs the same way (13 of the same 26 stalls) but is\nleft alone here -- it already has --disable-uvicorn-access-log, and turning it\noff by default is a visible change to server behaviour.",
+          "timestamp": "2026-08-16T15:25:19Z",
+          "url": "https://github.com/ROCm/ATOM/commit/17e3e0771b11b2ed74d313f571327b481aa03efb"
+        },
+        "date": 1786900067180,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9477,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/31957679972 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202608161502 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9431 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::Meta-Llama-3-8B-Instruct accuracy (GSM8K)",
+            "value": 0.7528,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/31957679972 | Threshold: 0.73 | Baseline: 0.75 | BaselineModel: meta-llama/Meta-Llama-3-8B-Instruct | BaselineNote: HF reports 0.796 but 8-shot CoT; CI uses 3-shot, not comparable | Docker: rocm/atom-dev:nightly_202608161502 | GPU: AMD Instinct MI355X | VRAM: 252GB | ROCm: 7.2.4 | strict-match: 0.7506 | fewshot: 3 | Model: /models/meta-llama/Meta-Llama-3-8B-Instruct"
           }
         ]
       }
