@@ -2141,9 +2141,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             and _drafter.uses_confidence_schedule
         )
         if ragged_lens is not None or _dspark_ragged_graph:
-            attn_metadata.dspark_ragged_lens_gpu = torch.as_tensor(
-                extend_lens_np, device=positions.device
-            )
+            # Pinned staging, not `torch.as_tensor(np, device=cuda)`: that is a
+            # pageable H2D and syncs here, which was the ragged decode bubble.
+            _n = extend_lens_np.size
+            _buf = var["ragged_extend"]
+            _buf.np[:_n] = extend_lens_np
+            attn_metadata.dspark_ragged_lens_gpu = _buf.copy_to_gpu(_n)
             attn_metadata.dspark_full_q = int(full_q)
 
         padded_bs = int(bs)

@@ -416,13 +416,14 @@ def _send_stream_chunk_direct(
     request_id: str,
     stream_collector: StreamOutputCollector,
     loop: AbstractEventLoop,
+    state: Any,
 ) -> None:
     """Buffer a single-request chunk for this engine step."""
     assert _stream_batch_dispatcher is not None
     _stream_batch_dispatcher.enqueue(
         loop=loop,
         collector=stream_collector,
-        state_key=request_id,
+        state=state,
         chunk=_build_stream_chunk(request_output, request_id),
     )
 
@@ -439,6 +440,7 @@ def _send_stream_chunk_tagged(
     sibling_index: int,
     stream_collector: StreamOutputCollector,
     loop: AbstractEventLoop,
+    state: Any,
 ) -> None:
     """Variant of :func:`_send_stream_chunk_direct` for fan-out siblings.
 
@@ -454,7 +456,7 @@ def _send_stream_chunk_tagged(
     _stream_batch_dispatcher.enqueue(
         loop=loop,
         collector=stream_collector,
-        state_key=(request_id, sibling_index),
+        state=state,
         chunk=_build_stream_chunk(request_output, request_id),
         tag=sibling_index,
     )
@@ -538,7 +540,7 @@ async def generate_async(
         #      its own KV on finish, but this dict is only cleaned up here for
         #      non-stream requests -- without an unconditional pop, every
         #      completed non-stream request leaks a Sequence (pending grows
-        #      forever). Streaming pops via cleanup_streaming_request instead.
+        #      forever). Streaming pops via cleanup_stream instead.
         if seq is not None:
             if not _finished_ok:
                 try:
@@ -838,9 +840,14 @@ async def setup_streaming_request(
     _stream_loops[request_id] = stream_loop
     _request_start_times[request_id] = time.time()
 
+    # The detokenizer lives in this closure, so it is freed when the engine
+    # drops the callback on the stream's last chunk -- no registry, no cleanup.
+    assert _stream_batch_dispatcher is not None
+    detokenizer = _stream_batch_dispatcher.new_state()
+
     def stream_callback(request_output: RequestOutput) -> None:
         _send_stream_chunk_direct(
-            request_output, request_id, stream_collector, stream_loop
+            request_output, request_id, stream_collector, stream_loop, detokenizer
         )
 
     executor_loop = asyncio.get_event_loop()
@@ -870,20 +877,20 @@ async def setup_streaming_request(
         raise
     seq_id = seq.id
 
-    logger.info(f"API: Created request_id={request_id}, seq_id={seq_id}")
+    # debug, not info: this runs once per request, on the event loop, and
+    # logging takes a lock the engine's output threads are also contending for.
+    # A loop-stall watchdog at concurrency 8192 caught 26 stalls over a run and
+    # 9 of them were sitting on this line, up to 3.3 s each -- long enough that
+    # the server accepts no new request at all and the GPUs run dry waiting for
+    # work. Anything per-request logged from here has to stay off info.
+    logger.debug(f"API: Created request_id={request_id}, seq_id={seq_id}")
     engine.core_mgr.add_request([seq])
 
     return seq_id, stream_collector, seq.num_prompt_tokens
 
 
-def cleanup_streaming_request(
-    request_id: str, seq_id: int, aborted: bool = False
-) -> None:
-    """Clean up resources for a streaming request.
-
-    Safe to call multiple times for the same ``request_id`` with different
-    ``seq_id`` values (as happens in fan-out cleanup): the per-request
-    dicts use ``dict.pop(..., None)`` so repeated removal is a no-op.
+def cleanup_stream(seq_id: int, aborted: bool = False) -> None:
+    """Tear down one stream. A fan-out request runs this once per sibling.
 
     ``aborted`` says the stream did NOT reach its normal end (client disconnect
     or abnormal generator teardown), so the seq is likely still running in the
@@ -893,16 +900,25 @@ def cleanup_streaming_request(
     request).
     """
     _seq_id_to_request_id.pop(seq_id, None)
-    _stream_loops.pop(request_id, None)
-    _request_start_times.pop(request_id, None)
-    if _stream_batch_dispatcher is not None:
-        _stream_batch_dispatcher.discard_request(request_id)
     if aborted:
         try:
             engine.core_mgr.abort_request(seq_id)
         except Exception:
             pass
     engine.io_processor.requests.pop(seq_id, None)
+
+
+def cleanup_request(request_id: str) -> None:
+    """Tear down what a request owns beyond its individual streams.
+
+    Runs once, after every one of the request's streams has been cleaned up.
+    Separate from :func:`cleanup_stream` because a fan-out has n streams but
+    one request: folding both into one call meant these two pops ran n times,
+    n-1 of them no-ops, and made a caller pass a seq id and a request id
+    together when each half only needs one of them.
+    """
+    _stream_loops.pop(request_id, None)
+    _request_start_times.pop(request_id, None)
 
 
 class _ClientDisconnected(Exception):
@@ -1028,10 +1044,20 @@ async def setup_streaming_request_fanout(
     _stream_loops[request_id] = stream_loop
     _request_start_times[request_id] = time.time()
 
+    assert _stream_batch_dispatcher is not None
+
     def make_callback(idx: int):
+        # One detokenizer per sibling, held by the closure that feeds it.
+        detokenizer = _stream_batch_dispatcher.new_state()
+
         def _cb(request_output: RequestOutput) -> None:
             _send_stream_chunk_tagged(
-                request_output, request_id, idx, shared_collector, stream_loop
+                request_output,
+                request_id,
+                idx,
+                shared_collector,
+                stream_loop,
+                detokenizer,
             )
 
         return _cb
@@ -1066,7 +1092,9 @@ async def setup_streaming_request_fanout(
             engine.io_processor.requests.pop(seq.id, None)
         raise
     seq_ids = [seq.id for seq in seqs]
-    logger.info(
+    # debug for the same reason as its single-sequence counterpart: per-request
+    # logging on the event loop stalls it under load.
+    logger.debug(
         f"API: Created fan-out request_id={request_id}, n={n}, seq_ids={seq_ids}"
     )
     engine.core_mgr.add_request(seqs)
@@ -1287,7 +1315,8 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     stream_collector,
                     seq_ids,
                     num_prompt_tokens,
-                    cleanup_streaming_request,
+                    cleanup_stream,
+                    cleanup_request,
                     tools=request.tools,
                 )
             else:
@@ -1307,7 +1336,8 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     stream_collector,
                     seq_id,
                     num_prompt_tokens,
-                    cleanup_streaming_request,
+                    cleanup_stream,
+                    cleanup_request,
                     tools=request.tools,
                     tool_choice=request.tool_choice,
                     starts_thinking=_starts_thinking,
@@ -1461,7 +1491,8 @@ async def completions(request: CompletionRequest, raw_request: Request):
                     stream_collector,
                     seq_ids,
                     num_prompt_tokens,
-                    cleanup_streaming_request,
+                    cleanup_stream,
+                    cleanup_request,
                 )
             else:
                 seq_id, stream_collector, num_prompt_tokens = (
@@ -1479,7 +1510,8 @@ async def completions(request: CompletionRequest, raw_request: Request):
                     stream_collector,
                     seq_id,
                     num_prompt_tokens,
-                    cleanup_streaming_request,
+                    cleanup_stream,
+                    cleanup_request,
                 )
             return StreamingResponse(
                 _logged_stream(gen, request_id),
@@ -1782,7 +1814,8 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                             aborted = False
                             break
                 finally:
-                    cleanup_streaming_request(request_id, seq_id, aborted=aborted)
+                    cleanup_stream(seq_id, aborted=aborted)
+                    cleanup_request(request_id)
 
             return StreamingResponse(
                 generate_anthropic_stream(),
@@ -1988,6 +2021,28 @@ def main():
         help="Server port (note: --port is used for internal engine communication)",
     )
     parser.add_argument(
+        "--timeout-keep-alive",
+        type=int,
+        default=5,
+        help=(
+            "Seconds the server holds an idle keep-alive connection. Pooling "
+            "clients hold their end far longer (aiohttp 15s), so a caller that "
+            "pauses longer than this reuses a socket the server already closed "
+            "and has to re-send. Raise it past the caller's idle time to stop "
+            "that; requests here run for minutes, so uvicorn's 5s is short."
+        ),
+    )
+    parser.add_argument(
+        "--disable-uvicorn-access-log",
+        action="store_true",
+        help=(
+            "Stop uvicorn logging a line per HTTP request. It copies a "
+            "LogRecord and writes to the same stdout the engine logs to, on "
+            "the event loop, and says less than the engine's own "
+            "'Request N arrived' line."
+        ),
+    )
+    parser.add_argument(
         "--chat-template",
         type=str,
         default=None,
@@ -2093,7 +2148,14 @@ def main():
     logger.info(
         f"Starting server on {args.host}:{args.server_port} (loop={loop_impl})..."
     )
-    uvicorn.run(app, host=args.host, port=args.server_port, loop=loop_impl)
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=args.server_port,
+        loop=loop_impl,
+        access_log=not args.disable_uvicorn_access_log,
+        timeout_keep_alive=args.timeout_keep_alive,
+    )
 
 
 if __name__ == "__main__":

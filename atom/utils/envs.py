@@ -359,6 +359,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DEBUG_FORCE_SKIP_DRAFT_MODEL": lambda: (
         os.getenv("ATOM_DEBUG_FORCE_SKIP_DRAFT_MODEL", "0") == "1"
     ),
+    # Run the DSpark draft model eager, bypassing torch.compile, while leaving
+    # the target compiled. Rollback lever for the draft's compiled path; prefer
+    # it over --level 0, which disables compilation for BOTH models. Note that
+    # --enforce-eager does NOT disable it: support_torch_compile keys off
+    # compilation_config.level only (see atom/utils/decorators.py:485).
+    # Default: False (compile the draft).
+    "ATOM_DSPARK_DISABLE_COMPILE": lambda: (
+        os.getenv("ATOM_DSPARK_DISABLE_COMPILE", "0") == "1"
+    ),
     # NOTE: DSpark runtime knobs (confidence_schedule, ragged,
     # ragged_graph_sizes, q_buckets, disable_sps_calib) are no longer env vars.
     # They are configured via --dspark-config (JSON dict) and carried in

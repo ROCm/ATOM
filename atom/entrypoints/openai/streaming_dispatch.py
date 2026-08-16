@@ -11,7 +11,6 @@ landing point each stream's SSE generator reads from.
 
 import threading
 from asyncio import AbstractEventLoop, Event
-from collections.abc import Hashable
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple
 
@@ -119,25 +118,41 @@ class _BufferedChunk(NamedTuple):
 
     loop: AbstractEventLoop
     collector: Any
-    state_key: Hashable
+    state: IncrementalStreamDetokenizer
     chunk: dict
     tag: int | None
 
 
 class StreamBatchDispatcher:
-    """Collect one engine step per output thread and dispatch it by event loop."""
+    """Collect one engine step per output thread and dispatch it by event loop.
+
+    Holds no per-stream state. Each stream's detokenizer belongs to the engine
+    callback that feeds it, and rides along on every chunk, so nothing here is
+    shared between the output threads and the event loop and nothing has to be
+    cleaned up: when the engine drops a finished stream's callback the
+    detokenizer goes with it.
+
+    It used to live in a dict here, which cost a lock -- 27% of the API
+    server's CPU, since every buffered chunk looked its state up with all
+    output threads contending -- and then, without the lock, cost an entry
+    that two threads had to keep in agreement and that teardown had to
+    remember to remove.
+    """
 
     def __init__(self, tokenizer: Any):
         self.tokenizer = tokenizer
         self._thread_local = threading.local()
-        self._states: dict[Hashable, IncrementalStreamDetokenizer] = {}
+
+    def new_state(self) -> IncrementalStreamDetokenizer:
+        """Make the detokenizer for one stream, for its callback to hold."""
+        return IncrementalStreamDetokenizer(self.tokenizer)
 
     def enqueue(
         self,
         *,
         loop: AbstractEventLoop,
         collector: Any,
-        state_key: Hashable,
+        state: IncrementalStreamDetokenizer,
         chunk: dict,
         tag: int | None = None,
     ) -> None:
@@ -145,7 +160,7 @@ class StreamBatchDispatcher:
         buf = getattr(self._thread_local, "buf", None)
         if buf is None:
             buf = self._thread_local.buf = []
-        buf.append(_BufferedChunk(loop, collector, state_key, chunk, tag))
+        buf.append(_BufferedChunk(loop, collector, state, chunk, tag))
 
     def flush(self) -> None:
         """Detokenize buffered chunks and schedule one delivery per event loop."""
@@ -157,48 +172,15 @@ class StreamBatchDispatcher:
 
         by_loop: dict[AbstractEventLoop, list[tuple[Any, Any]]] = {}
         for item in buf:
-            state = self._get_state(item.state_key)
-            finished = bool(item.chunk.get("finished"))
-            item.chunk["text"] = state.update(
-                item.chunk.get("token_ids") or [], finished
+            item.chunk["text"] = item.state.update(
+                item.chunk.get("token_ids") or [],
+                bool(item.chunk.get("finished")),
             )
-            if finished:
-                self._drop_state(item.state_key, state)
-
             payload = item.chunk if item.tag is None else (item.tag, item.chunk)
             by_loop.setdefault(item.loop, []).append((item.collector, payload))
 
         for loop, items in by_loop.items():
             loop.call_soon_threadsafe(self._deliver, items)
-
-    # These three ran under a shared lock, which cost 27% of the API server's
-    # CPU -- _get_state is called once per buffered chunk, with all output
-    # threads contending. No lock is needed: each operation below is a single
-    # C-level dict method that no other Python thread can interrupt, and
-    # list() snapshots atomically so discard_request cannot hit "dict changed
-    # size". GIL-dependent; a free-threaded build would need real locks.
-
-    def discard_request(self, request_id: str) -> None:
-        """Drop direct and fan-out detokenizer state after request cleanup."""
-        for key in list(self._states):
-            if key == request_id or (
-                isinstance(key, tuple) and key and key[0] == request_id
-            ):
-                self._states.pop(key, None)
-
-    def _get_state(self, state_key: Hashable) -> IncrementalStreamDetokenizer:
-        state = self._states.get(state_key)
-        if state is None:
-            state = self._states.setdefault(
-                state_key, IncrementalStreamDetokenizer(self.tokenizer)
-            )
-        return state
-
-    def _drop_state(
-        self, state_key: Hashable, state: IncrementalStreamDetokenizer
-    ) -> None:
-        if self._states.get(state_key) is state:
-            self._states.pop(state_key, None)
 
     @staticmethod
     def _deliver(items: list[tuple[Any, Any]]) -> None:

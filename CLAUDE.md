@@ -41,7 +41,7 @@ Key entry points:
 
 ## Critical Rules
 
-- **NEVER modify `@support_torch_compile` decorated model files** — breaks Dynamo tracing even with `--enforce-eager`. Instrument at call sites instead (e.g., `ModelRunner.run_model()`, `EagleProposer.propose()`)
+- **NEVER modify `@support_torch_compile` decorated model files** — breaks Dynamo tracing even with `--enforce-eager`. Instrument at call sites instead (e.g., `ModelRunner.run_model()`, `EagleProposer.propose()`, `DSparkProposer.propose()`). `deepseek_v4_dspark.py` carries a COMPILE BOUNDARY block at the top naming exactly which functions are traced — read it before touching that file
 - **Multiprocessing must use `spawn`** — `fork` causes CUDA re-initialization crashes
 - **Set `AITER_LOG_LEVEL=WARNING` before starting server** — suppresses aiter kernel log flooding
 - **Clear compile cache before server restart:** `rm -rf /root/.cache/atom/*` — stale cache causes silent failures after code changes
