@@ -1988,6 +1988,28 @@ def main():
         help="Server port (note: --port is used for internal engine communication)",
     )
     parser.add_argument(
+        "--timeout-keep-alive",
+        type=int,
+        default=5,
+        help=(
+            "Seconds the server holds an idle keep-alive connection. Pooling "
+            "clients hold their end far longer (aiohttp 15s), so a caller that "
+            "pauses longer than this reuses a socket the server already closed "
+            "and has to re-send. Raise it past the caller's idle time to stop "
+            "that; requests here run for minutes, so uvicorn's 5s is short."
+        ),
+    )
+    parser.add_argument(
+        "--disable-uvicorn-access-log",
+        action="store_true",
+        help=(
+            "Stop uvicorn logging a line per HTTP request. It copies a "
+            "LogRecord and writes to the same stdout the engine logs to, on "
+            "the event loop, and says less than the engine's own "
+            "'Request N arrived' line."
+        ),
+    )
+    parser.add_argument(
         "--chat-template",
         type=str,
         default=None,
@@ -2093,7 +2115,14 @@ def main():
     logger.info(
         f"Starting server on {args.host}:{args.server_port} (loop={loop_impl})..."
     )
-    uvicorn.run(app, host=args.host, port=args.server_port, loop=loop_impl)
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=args.server_port,
+        loop=loop_impl,
+        access_log=not args.disable_uvicorn_access_log,
+        timeout_keep_alive=args.timeout_keep_alive,
+    )
 
 
 if __name__ == "__main__":
