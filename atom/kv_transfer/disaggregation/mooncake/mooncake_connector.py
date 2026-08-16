@@ -743,10 +743,9 @@ class MooncakeConnector(KVConnectorBase):
         self._block_region_consumer_indices = getattr(
             tt, "block_region_consumer_indices", None
         )
-        if (
-            self._block_region_consumer_indices is not None
-            and len(self._block_region_consumer_indices) != len(self._block_regions)
-        ):
+        if self._block_region_consumer_indices is not None and len(
+            self._block_region_consumer_indices
+        ) != len(self._block_regions):
             raise ValueError(
                 "block_region_consumer_indices must match block_regions: "
                 f"{len(self._block_region_consumer_indices)} != "

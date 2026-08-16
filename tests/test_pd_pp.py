@@ -328,21 +328,16 @@ def test_compact_index_region_maps_tile_consumer_without_overlap():
     partitions = [18, 20, 20, 20]
     num_hidden = 78
     full_layer_ids = tuple(range(0, num_hidden, 4))
-    full_layer_slots = {
-        layer_id: slot for slot, layer_id in enumerate(full_layer_ids)
-    }
+    full_layer_slots = {layer_id: slot for slot, layer_id in enumerate(full_layer_ids)}
     covered = []
 
     for start, n_local in zip(_starts(partitions), partitions):
         local_layers = tuple(range(start, start + n_local))
         local_full_layers = tuple(
-            layer_id
-            for layer_id in local_layers
-            if layer_id in full_layer_slots
+            layer_id for layer_id in local_layers if layer_id in full_layer_slots
         )
         explicit = list(local_layers) + [
-            num_hidden + full_layer_slots[layer_id]
-            for layer_id in local_full_layers
+            num_hidden + full_layer_slots[layer_id] for layer_id in local_full_layers
         ]
         covered.extend(explicit)
 
