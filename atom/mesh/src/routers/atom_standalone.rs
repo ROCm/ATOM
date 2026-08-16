@@ -1,371 +1,279 @@
 use std::{
-    io,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicUsize, Ordering},
+    sync::Arc,
 };
 
 use async_trait::async_trait;
 use axum::{
     body::Body,
     extract::Request,
-    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
-use bytes::Bytes;
-use pyo3::{
-    types::{PyAnyMethods, PyDict, PyDictMethods, PyList, PyListMethods, PyTypeMethods},
-    Bound, IntoPyObject, Py, PyAny, PyResult, Python,
-};
-use serde::Serialize;
-use serde_json::{json, Map, Number, Value};
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use serde::Deserialize;
+use serde_json::json;
 
 use crate::{
+    app_context::AppContext,
     protocols::{
         chat::ChatCompletionRequest,
         completion::CompletionRequest,
         generate::GenerateRequest,
         responses::{ResponsesGetParams, ResponsesRequest},
     },
-    routers::RouterTrait,
+    routers::{
+        direct_engine::{
+            into_token_handle, DirectEngineClient, DirectEngineSubmit, DirectSamplingParams,
+        },
+        grpc::completion_adapter::{
+            completion_to_generate, wrap_generate_response_as_completion,
+            wrap_streaming_generate_as_completion,
+        },
+        prepare::{
+            generation_payload::GenerationPayload, prepare_chat, prepare_generate,
+            response_context::ResponseContext,
+        },
+        render::{chat_aggregator, chat_streaming, generate_aggregator, generate_streaming},
+        RouterTrait,
+    },
 };
 
-type RouterResult<T> = Result<T, Response>;
-
-pub struct AtomStandaloneRouter {
-    pub service: Py<PyAny>,
-    close_service_on_shutdown: bool,
-    closed: AtomicBool,
-}
+const DEFAULT_MAX_TOKENS: i32 = 8192;
 
 pub struct AtomStandaloneRuntime {
-    pub service: Py<PyAny>,
-    pub close_service_on_shutdown: bool,
+    pub engine_core_ipc_endpoints: Vec<EngineCoreIpcEndpoint>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct EngineCoreIpcEndpoint {
+    pub address: String,
+    pub dp_rank: usize,
+    pub pp_rank: usize,
+    pub protocol_version: u32,
+}
+
+pub struct AtomStandaloneRouter {
+    clients: Vec<(EngineCoreIpcEndpoint, DirectEngineClient)>,
+    components: Arc<AppContext>,
+    rank_cursor: AtomicUsize,
 }
 
 impl AtomStandaloneRouter {
-    pub fn from_runtime(runtime: &AtomStandaloneRuntime) -> Self {
-        Python::attach(|py| Self {
-            service: runtime.service.clone_ref(py),
-            close_service_on_shutdown: runtime.close_service_on_shutdown,
-            closed: AtomicBool::new(false),
-        })
+    pub fn from_runtime(runtime: &AtomStandaloneRuntime, components: Arc<AppContext>) -> Self {
+        Self {
+            clients: runtime
+                .engine_core_ipc_endpoints
+                .iter()
+                .cloned()
+                .map(|endpoint| (endpoint.clone(), DirectEngineClient::new(endpoint)))
+                .collect(),
+            components,
+            rank_cursor: AtomicUsize::new(0),
+        }
     }
 
-    fn not_implemented(endpoint: &'static str) -> Response {
+    fn unsupported(endpoint: &'static str) -> Response {
         (
             StatusCode::NOT_IMPLEMENTED,
-            Json(json!({
-                "error": {
-                    "type": "not_implemented",
-                    "message": format!("ATOM standalone route for {endpoint} is not implemented yet"),
-                }
-            })),
+            Json(json!({"error": {
+                "type": "not_implemented",
+                "message": format!("ATOM standalone direct IPC does not support {endpoint}")
+            }})),
         )
             .into_response()
     }
 
-    fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
+    fn client(&self, requested_dp_rank: Option<usize>) -> Result<DirectEngineClient, Response> {
+        if let Some(dp_rank) = requested_dp_rank {
+            return self
+                .clients
+                .iter()
+                .find(|(endpoint, _)| endpoint.dp_rank == dp_rank && endpoint.pp_rank == 0)
+                .map(|(_, client)| client.clone())
+                .ok_or_else(|| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({"error": {
+                            "message": format!("unknown data_parallel_rank={dp_rank}")
+                        }})),
+                    )
+                        .into_response()
+                });
+        }
+        let count = self.clients.len();
+        let start = self.rank_cursor.fetch_add(1, Ordering::Relaxed);
+        (0..count)
+            .map(|offset| &self.clients[(start + offset) % count])
+            .find(|(endpoint, _)| endpoint.pp_rank == 0)
+            .map(|(_, client)| client.clone())
+            .ok_or_else(|| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"error": {"message": "no direct EngineCore endpoint"}})),
+                )
+                    .into_response()
+            })
+    }
+
+    async fn submit(
+        &self,
+        payload: GenerationPayload,
+        context: ResponseContext,
+        data_parallel_rank: Option<usize>,
+    ) -> Result<
         (
-            status,
-            Json(json!({
-                "error": {
-                    "message": message.into(),
-                    "type": if status.is_client_error() {
-                        "invalid_request_error"
-                    } else {
-                        "internal_server_error"
-                    },
-                    "code": status.as_u16(),
-                }
-            })),
-        )
-            .into_response()
-    }
-
-    fn run_chat_completion(&self, body: &ChatCompletionRequest) -> RouterResult<Value> {
-        self.call_service("chat_completions", body, "chat completion")
-    }
-
-    fn run_chat_completion_stream(&self, body: &ChatCompletionRequest) -> Response {
-        self.run_sse_service_stream(
-            body,
-            "start_chat_completions_stream",
-            "drain_chat_completions_stream",
-            "close_chat_completions_stream",
-            "chat completion",
-        )
-    }
-
-    fn close_python_stream(service: &Py<PyAny>, close_method: &'static str, stream_id: &str) {
-        Python::attach(|py| {
-            let _ = service.bind(py).call_method1(close_method, (stream_id,));
-        });
-    }
-
-    fn py_error_status(error: &pyo3::PyErr) -> StatusCode {
-        Python::attach(|py| {
-            error
-                .get_type(py)
-                .name()
-                .map(|name| {
-                    if name == "ValueError" {
-                        StatusCode::BAD_REQUEST
-                    } else {
-                        StatusCode::INTERNAL_SERVER_ERROR
-                    }
-                })
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
-        })
-    }
-
-    fn run_completion(&self, body: &CompletionRequest) -> RouterResult<Value> {
-        self.call_service("completions", body, "completion")
-    }
-
-    fn run_completion_stream(&self, body: &CompletionRequest) -> Response {
-        self.run_sse_service_stream(
-            body,
-            "start_completions_stream",
-            "drain_completions_stream",
-            "close_completions_stream",
-            "completion",
-        )
-    }
-
-    fn run_sse_service_stream<T: Serialize>(
-        &self,
-        body: &T,
-        start_method: &'static str,
-        drain_method: &'static str,
-        close_method: &'static str,
-        endpoint: &'static str,
-    ) -> Response {
-        let request_value = match serde_json::to_value(body) {
-            Ok(value) => value,
-            Err(e) => {
-                return Self::error_response(
-                    StatusCode::BAD_REQUEST,
-                    format!("Failed to serialize {endpoint} request: {e}"),
-                )
-            }
-        };
-
-        let stream_id = match Python::attach(|py| -> PyResult<String> {
-            let request = Self::json_to_py(py, &request_value)?;
-            self.service
-                .bind(py)
-                .call_method1(start_method, (request,))?
-                .extract::<String>()
-        }) {
-            Ok(stream_id) => stream_id,
-            Err(e) => {
-                return Self::error_response(
-                    Self::py_error_status(&e),
-                    format!("ATOM standalone {endpoint} stream failed: {e}"),
-                )
-            }
-        };
-
-        let service = Python::attach(|py| self.service.clone_ref(py));
-        let stream_id_for_worker = stream_id.clone();
-        let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
-        let _ = tokio::task::spawn_blocking(move || loop {
-            let chunks = Python::attach(|py| -> PyResult<Vec<String>> {
-                service
-                    .bind(py)
-                    .call_method1(
-                        drain_method,
-                        (stream_id_for_worker.as_str(), 16usize, 0.05f64),
-                    )?
-                    .extract::<Vec<String>>()
-            });
-
-            match chunks {
-                Ok(chunks) => {
-                    if chunks.is_empty() {
-                        continue;
-                    }
-                    for chunk in chunks {
-                        let done = chunk.trim() == "data: [DONE]";
-                        if tx.send(Ok(Bytes::from(chunk))).is_err() {
-                            Self::close_python_stream(
-                                &service,
-                                close_method,
-                                &stream_id_for_worker,
-                            );
-                            return;
-                        }
-                        if done {
-                            Self::close_python_stream(
-                                &service,
-                                close_method,
-                                &stream_id_for_worker,
-                            );
-                            return;
-                        }
-                    }
-                }
-                Err(error) => {
-                    let error_chunk = json!({
-                        "error": {
-                            "message": error.to_string(),
-                            "type": "internal_server_error",
-                        }
-                    });
-                    let _ = tx.send(Ok(Bytes::from(format!("data: {}\n\n", error_chunk))));
-                    Self::close_python_stream(&service, close_method, &stream_id_for_worker);
-                    return;
-                }
-            }
-        });
-
-        let stream = UnboundedReceiverStream::new(rx);
-        let mut response = Response::new(Body::from_stream(stream));
-        *response.status_mut() = StatusCode::OK;
-        response
-            .headers_mut()
-            .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
-        response
-            .headers_mut()
-            .insert("Cache-Control", HeaderValue::from_static("no-cache"));
-        response
-            .headers_mut()
-            .insert("Connection", HeaderValue::from_static("keep-alive"));
-        response
-    }
-
-    fn call_service<T: Serialize>(
-        &self,
-        method_name: &'static str,
-        body: &T,
-        endpoint: &'static str,
-    ) -> RouterResult<Value> {
-        let request_value = serde_json::to_value(body).map_err(|e| {
-            Self::error_response(
-                StatusCode::BAD_REQUEST,
-                format!("Failed to serialize {endpoint} request: {e}"),
+            crate::routers::token_handle::token_handle::TokenHandle,
+            ResponseContext,
+        ),
+        Response,
+    > {
+        let stop_token_sequences = payload
+            .stop
+            .stop_token_ids
+            .as_ref()
+            .map(|tokens| vec![tokens.clone()])
+            .unwrap_or_default();
+        let mut submit = DirectEngineSubmit::new(
+            payload.request_id.clone(),
+            payload.token_ids,
+            DirectSamplingParams {
+                temperature: payload.sampling.temperature,
+                top_k: payload.sampling.top_k,
+                top_p: payload.sampling.top_p,
+                max_tokens: payload
+                    .sampling
+                    .max_new_tokens
+                    .unwrap_or(DEFAULT_MAX_TOKENS)
+                    .max(0) as u32,
+                ignore_eos: payload.sampling.ignore_eos,
+                n: payload.sampling.n.max(1) as u32,
+                stop_strings: None,
+            },
+            stop_token_sequences,
+        );
+        submit.data_parallel_rank = data_parallel_rank;
+        let client = self.client(submit.data_parallel_rank)?;
+        let stream = client.submit(&submit).await.map_err(|error| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": {"message": error.to_string()}})),
             )
+                .into_response()
         })?;
+        Ok((into_token_handle(stream), context))
+    }
 
-        Python::attach(|py| -> PyResult<Value> {
-            let request = Self::json_to_py(py, &request_value)?;
-            let response = self
-                .service
-                .bind(py)
-                .call_method1(method_name, (request,))?;
-            Self::py_to_json(&response)
+    fn normalize_dp_rank(raw: Option<i32>) -> Result<Option<usize>, Response> {
+        raw.map(|rank| {
+            usize::try_from(rank).map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": {
+                        "message": "data_parallel_rank must be a non-negative integer"
+                    }})),
+                )
+                    .into_response()
+            })
         })
-        .map_err(|e| {
-            Self::error_response(
-                Self::py_error_status(&e),
-                format!("ATOM standalone {endpoint} failed: {e}"),
-            )
-        })
+        .transpose()
     }
 
-    fn json_to_py(py: Python<'_>, value: &Value) -> PyResult<Py<PyAny>> {
-        match value {
-            Value::Null => Ok(py.None()),
-            Value::Bool(value) => Ok(value.into_pyobject(py)?.to_owned().into_any().unbind()),
-            Value::Number(value) => {
-                if let Some(value) = value.as_i64() {
-                    Ok(value.into_pyobject(py)?.into_any().unbind())
-                } else if let Some(value) = value.as_u64() {
-                    Ok(value.into_pyobject(py)?.into_any().unbind())
-                } else if let Some(value) = value.as_f64() {
-                    Ok(value.into_pyobject(py)?.into_any().unbind())
-                } else {
-                    Ok(py.None())
-                }
-            }
-            Value::String(value) => Ok(value.into_pyobject(py)?.into_any().unbind()),
-            Value::Array(values) => {
-                let items: PyResult<Vec<_>> = values
-                    .iter()
-                    .map(|value| Self::json_to_py(py, value))
-                    .collect();
-                Ok(PyList::new(py, items?)?.into_any().unbind())
-            }
-            Value::Object(values) => {
-                let dict = PyDict::new(py);
-                for (key, value) in values {
-                    dict.set_item(key, Self::json_to_py(py, value)?)?;
-                }
-                Ok(dict.into_any().unbind())
-            }
+    fn chat_dp_rank(headers: Option<&HeaderMap>) -> Result<Option<usize>, Response> {
+        let Some(value) = headers.and_then(|headers| headers.get("x-atom-dp-rank")) else {
+            return Ok(None);
+        };
+        value
+            .to_str()
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .map(Some)
+            .ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": {
+                        "message": "x-atom-dp-rank must be a non-negative integer"
+                    }})),
+                )
+                    .into_response()
+            })
+    }
+
+    async fn chat(&self, body: &ChatCompletionRequest, dp_rank: Option<usize>) -> Response {
+        if body.n.unwrap_or(1) != 1 {
+            return Self::unsupported("chat completions with n > 1");
+        }
+        let (payload, context) = match prepare_chat(
+            Arc::new(body.clone()),
+            None,
+            Some(body.model.clone()),
+            self.components.as_ref(),
+        ) {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+        let (stream, context) = match self.submit(payload, context, dp_rank).await {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+        if body.stream {
+            chat_streaming::process(stream, context, "atom_direct")
+        } else {
+            chat_aggregator::process(stream, context).await
         }
     }
 
-    fn py_to_json(value: &Bound<'_, PyAny>) -> PyResult<Value> {
-        if value.is_none() {
-            return Ok(Value::Null);
+    async fn generate(&self, body: &GenerateRequest) -> Response {
+        if body
+            .sampling_params
+            .as_ref()
+            .and_then(|params| params.n)
+            .unwrap_or(1)
+            != 1
+        {
+            return Self::unsupported("generate with n > 1");
         }
-        if let Ok(value) = value.extract::<bool>() {
-            return Ok(Value::Bool(value));
+        let (payload, context) = match prepare_generate(
+            Arc::new(body.clone()),
+            None,
+            body.model.clone(),
+            self.components.as_ref(),
+        ) {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+        let dp_rank = match Self::normalize_dp_rank(body.data_parallel_rank) {
+            Ok(rank) => rank,
+            Err(response) => return response,
+        };
+        let (stream, context) = match self.submit(payload, context, dp_rank).await {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+        if body.stream {
+            generate_streaming::process(stream, context, "atom_direct")
+        } else {
+            generate_aggregator::process(stream, context).await
         }
-        if let Ok(value) = value.extract::<i64>() {
-            return Ok(Value::Number(Number::from(value)));
-        }
-        if let Ok(value) = value.extract::<u64>() {
-            return Ok(Value::Number(Number::from(value)));
-        }
-        if let Ok(value) = value.extract::<f64>() {
-            if let Some(number) = Number::from_f64(value) {
-                return Ok(Value::Number(number));
-            }
-        }
-        if let Ok(value) = value.extract::<String>() {
-            return Ok(Value::String(value));
-        }
-        if let Ok(values) = value.cast::<PyList>() {
-            let mut result = Vec::with_capacity(values.len());
-            for item in values.iter() {
-                result.push(Self::py_to_json(&item)?);
-            }
-            return Ok(Value::Array(result));
-        }
-        if let Ok(dict) = value.cast::<PyDict>() {
-            let mut result = Map::new();
-            for (key, item) in dict.iter() {
-                result.insert(key.extract::<String>()?, Self::py_to_json(&item)?);
-            }
-            return Ok(Value::Object(result));
-        }
-        let item = value.call_method0("item")?;
-        Self::py_to_json(&item)
     }
 
-    fn python_type_name(&self) -> String {
-        Python::attach(|py| {
-            self.service
-                .bind(py)
-                .get_type()
-                .name()
-                .map(|name| name.to_string())
-                .unwrap_or_else(|_| "unknown".to_string())
-        })
-    }
-
-    fn close_service(&self, reason: &'static str) {
-        if self.closed.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        if !self.close_service_on_shutdown {
-            tracing::info!(
-                "Skipping ATOM standalone Python service close because it is externally owned ({})",
-                reason
-            );
-            return;
-        }
-
-        tracing::info!("Closing ATOM standalone Python service ({})", reason);
-        Python::attach(|py| {
-            if let Err(e) = self.service.bind(py).call_method0("close") {
-                tracing::warn!("Failed to close ATOM standalone Python service: {}", e);
+    async fn completion(&self, body: &CompletionRequest) -> Response {
+        let generate = match completion_to_generate(body) {
+            Ok(request) => request,
+            Err(message) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": {"message": message}})),
+                )
+                    .into_response()
             }
-        });
+        };
+        let response = self.generate(&generate).await;
+        if body.stream {
+            wrap_streaming_generate_as_completion(response, body.model.clone()).await
+        } else {
+            wrap_generate_response_as_completion(response, body.model.clone()).await
+        }
     }
 }
 
@@ -376,24 +284,14 @@ impl std::fmt::Debug for AtomStandaloneRouter {
     }
 }
 
-impl Drop for AtomStandaloneRouter {
-    fn drop(&mut self) {
-        self.close_service("drop");
-    }
-}
-
 #[async_trait]
 impl RouterTrait for AtomStandaloneRouter {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 
-    async fn shutdown(&self) {
-        self.close_service("server shutdown");
-    }
-
     async fn health_generate(&self, _req: Request<Body>) -> Response {
-        Self::not_implemented("health_generate")
+        Self::unsupported("generate")
     }
 
     async fn get_server_info(&self, _req: Request<Body>) -> Response {
@@ -401,48 +299,38 @@ impl RouterTrait for AtomStandaloneRouter {
             StatusCode::OK,
             Json(json!({
                 "router_type": self.router_type(),
-                "service_type": self.python_type_name(),
+                "direct_engine_ipc": true,
+                "dp_endpoints": self.clients.len(),
             })),
         )
             .into_response()
     }
 
     async fn get_models(&self, _req: Request<Body>) -> Response {
-        (
-            StatusCode::OK,
-            Json(json!({
-                "object": "list",
-                "data": []
-            })),
-        )
-            .into_response()
+        (StatusCode::OK, Json(json!({"object": "list", "data": []}))).into_response()
     }
 
     async fn get_model_info(&self, _req: Request<Body>) -> Response {
-        Self::not_implemented("get_model_info")
+        Self::unsupported("model_info")
     }
 
     async fn route_generate(
         &self,
         _headers: Option<&HeaderMap>,
-        _body: &GenerateRequest,
+        body: &GenerateRequest,
         _model_id: Option<&str>,
     ) -> Response {
-        Self::not_implemented("generate")
+        self.generate(body).await
     }
 
     async fn route_chat(
         &self,
-        _headers: Option<&HeaderMap>,
+        headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
         _model_id: Option<&str>,
     ) -> Response {
-        if body.stream {
-            return self.run_chat_completion_stream(body);
-        }
-
-        match self.run_chat_completion(body) {
-            Ok(body) => (StatusCode::OK, Json(body)).into_response(),
+        match Self::chat_dp_rank(headers) {
+            Ok(dp_rank) => self.chat(body, dp_rank).await,
             Err(response) => response,
         }
     }
@@ -453,14 +341,7 @@ impl RouterTrait for AtomStandaloneRouter {
         body: &CompletionRequest,
         _model_id: Option<&str>,
     ) -> Response {
-        if body.stream {
-            return self.run_completion_stream(body);
-        }
-
-        match self.run_completion(body) {
-            Ok(body) => (StatusCode::OK, Json(body)).into_response(),
-            Err(response) => response,
-        }
+        self.completion(body).await
     }
 
     async fn route_responses(
@@ -469,7 +350,7 @@ impl RouterTrait for AtomStandaloneRouter {
         _body: &ResponsesRequest,
         _model_id: Option<&str>,
     ) -> Response {
-        Self::not_implemented("responses")
+        Self::unsupported("responses")
     }
 
     async fn get_response(
@@ -478,15 +359,15 @@ impl RouterTrait for AtomStandaloneRouter {
         _response_id: &str,
         _params: &ResponsesGetParams,
     ) -> Response {
-        Self::not_implemented("responses_get")
+        Self::unsupported("responses_get")
     }
 
     async fn cancel_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
-        Self::not_implemented("responses_cancel")
+        Self::unsupported("responses_cancel")
     }
 
     async fn delete_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
-        Self::not_implemented("responses_delete")
+        Self::unsupported("responses_delete")
     }
 
     async fn list_response_input_items(
@@ -494,7 +375,7 @@ impl RouterTrait for AtomStandaloneRouter {
         _headers: Option<&HeaderMap>,
         _response_id: &str,
     ) -> Response {
-        Self::not_implemented("responses_input_items")
+        Self::unsupported("responses_input_items")
     }
 
     fn router_type(&self) -> &'static str {

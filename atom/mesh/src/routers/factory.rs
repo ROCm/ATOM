@@ -79,7 +79,7 @@ impl RouterFactory {
             .atom_standalone_runtime
             .as_ref()
             .ok_or_else(|| "ATOM standalone requires a Python-owned runtime".to_string())?;
-        let router = AtomStandaloneRouter::from_runtime(runtime);
+        let router = AtomStandaloneRouter::from_runtime(runtime, Arc::clone(ctx));
 
         Ok(Box::new(router))
     }

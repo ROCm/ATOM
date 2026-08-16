@@ -14,10 +14,16 @@ import zmq
 from atom.config import Config, ParallelConfig
 from atom.kv_transfer.disaggregation import KVOutputAggregator
 from atom.model_engine.async_proc import AsyncIOProcManager
+from atom.model_engine.direct_ipc import (
+    EngineCoreIpcEndpoint,
+    DirectEngineRequest,
+    DirectEngineServer,
+)
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import EngineUtilityHandler
 from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Scheduler
 from atom.model_engine.sequence import Sequence, SequenceStatus, get_exit_sequence
+from atom.sampling_params import SamplingParams
 from atom.utils import (
     envs,
     init_exit_handler,
@@ -32,7 +38,13 @@ logger = logging.getLogger("atom")
 
 
 class EngineCore:
-    def __init__(self, config: Config, input_address: str, output_address: str):
+    def __init__(
+        self,
+        config: Config,
+        input_address: str,
+        output_address: str,
+        direct_endpoint: EngineCoreIpcEndpoint | None = None,
+    ):
         self.label = "Engine Core"
         self.input_queue = queue.Queue[Sequence]()
         self.output_queue = queue.Queue[list[Sequence]]()
@@ -49,6 +61,9 @@ class EngineCore:
         )
         self.input_address = input_address
         self.output_address = output_address
+        self.config = config
+        self._direct_request_seq_ids: dict[str, list[int]] = {}
+        self.direct_server: DirectEngineServer | None = None
         self.output_thread = threading.Thread(
             target=self.process_output_sockets, args=(self.output_address,), daemon=True
         )
@@ -137,6 +152,15 @@ class EngineCore:
             label=self.label,
             scheduler=self.scheduler,
         )
+        if direct_endpoint is not None:
+            if self.scheduler is None:
+                raise RuntimeError("direct EngineCore IPC requires an initialized scheduler")
+            self.direct_server = DirectEngineServer(
+                direct_endpoint,
+                submit=self._submit_direct_request,
+                abort=self._abort_direct_request,
+            )
+            self.direct_server.start()
 
         self._send_ready_signal()
         logger.info(f"{self.label}: EngineCore fully initialized and ready")
@@ -149,6 +173,102 @@ class EngineCore:
         get_num_blocks/allocate_kv_cache.  Override in subclasses to inject
         inter-process synchronization at this point in the init sequence."""
 
+    def _submit_direct_request(self, request: DirectEngineRequest) -> list[int]:
+        """Build local sequences for a language-neutral direct IPC request."""
+        allowed_sampling_fields = {
+            "temperature",
+            "top_k",
+            "top_p",
+            "max_tokens",
+            "ignore_eos",
+            "stop_strings",
+            "logprobs",
+        }
+        sampling = SamplingParams(
+            **{
+                key: value
+                for key, value in request.sampling.items()
+                if key in allowed_sampling_fields
+            },
+            n=request.n,
+        )
+        sequence_count = sampling.n
+        num_draft_tokens = request.num_draft_tokens
+        if num_draft_tokens == 0 and getattr(
+            self.config, "speculative_config", None
+        ) is not None:
+            num_draft_tokens = self.config.speculative_config.num_speculative_tokens
+        has_per_req_cache = self.config.hf_config.model_type in {
+            "qwen3_next",
+            "qwen3_5_text",
+            "qwen3_5_moe_text",
+            "kimi_linear",
+            "deepseek_v4",
+        }
+        sequences = [
+            Sequence(
+                request.token_ids,
+                self.config.kv_cache_block_size,
+                sampling_params=sampling,
+                stop_token_sequences=request.stop_token_sequences,
+                kv_transfer_params=request.kv_transfer_params,
+                num_draft_tokens=num_draft_tokens,
+                has_per_req_cache=has_per_req_cache,
+                needs_independent_noise=sequence_count > 1,
+                parent_request_id=request.request_id,
+                sibling_index=index,
+                request_id=request.request_id,
+            )
+            for index in range(sequence_count)
+        ]
+        for seq in sequences:
+            seq.is_direct_engine_request = True
+            seq.arrive_time = time.time()
+        self._direct_request_seq_ids[request.request_id] = [seq.id for seq in sequences]
+        self.input_queue.put_nowait(sequences)
+        return [seq.id for seq in sequences]
+
+    def _abort_direct_request(self, request_id: str) -> None:
+        for seq_id in self._direct_request_seq_ids.pop(request_id, []):
+            self.utility_queue.put_nowait(
+                ("abort_request", {"cmd": "abort_request", "req_id": seq_id})
+            )
+            self._has_pending_utility = True
+
+    def _publish_direct_stream_outputs(self, stream_outputs) -> None:
+        if self.direct_server is None:
+            return
+        for seq_id, output in stream_outputs:
+            self.direct_server.publish_stream(
+                seq_id=seq_id,
+                token_ids=output.output_tokens,
+                finished=output.finished,
+                finish_reason=output.finish_reason,
+                num_cached_tokens=output.num_cached_tokens,
+                kv_transfer_params=output.kv_transfer_params_output,
+            )
+
+    def _publish_direct_finished(self, seqs) -> None:
+        if self.direct_server is None:
+            return
+        for seq in seqs:
+            if getattr(seq, "external_request_id", None):
+                request_seq_ids = self._direct_request_seq_ids.get(
+                    seq.external_request_id, []
+                )
+                if seq.id in request_seq_ids:
+                    request_seq_ids.remove(seq.id)
+                if not request_seq_ids:
+                    self._direct_request_seq_ids.pop(seq.external_request_id, None)
+                self.direct_server.publish_stream(
+                    seq_id=seq.id,
+                    token_ids=[],
+                    finished=True,
+                    finish_reason=seq.leave_reason or "stop",
+                    num_cached_tokens=seq.num_cached_tokens,
+                    kv_transfer_params=seq.kv_transfer_params_output,
+                )
+
     def _init_data_parallel(self, config: Config):
         pass
 
@@ -156,6 +276,8 @@ class EngineCore:
         if not self.still_running:
             return
         self.still_running = False
+        if self.direct_server is not None:
+            self.direct_server.close()
         if not hasattr(self, "runner_mgr"):
             self._send_engine_dead()
             return
@@ -180,7 +302,12 @@ class EngineCore:
         self.output_thread.join(timeout=0.5)
 
     @staticmethod
-    def run_engine(config: Config, input_address: str, output_address: str):
+    def run_engine(
+        config: Config,
+        input_address: str,
+        output_address: str,
+        direct_endpoint: EngineCoreIpcEndpoint | None = None,
+    ):
         # Bind this EngineCore's lifetime to its parent (the server /
         # CoreManager): if the parent exits, have the kernel reap this process —
         # and, transitively, the ModelRunner workers it spawns — instead of
@@ -196,6 +323,10 @@ class EngineCore:
             if config.pipeline_parallel_size > 1:
                 from atom.model_engine.pp_engine_core import PPEngineCoreProc
 
+                if direct_endpoint is not None:
+                    raise RuntimeError(
+                        "direct EngineCore IPC does not support pipeline parallelism yet"
+                    )
                 set_process_title(
                     f"EngineCore_PP{config.parallel_config.pipeline_parallel_rank}"
                 )
@@ -204,10 +335,12 @@ class EngineCore:
                 set_process_title(
                     f"EngineCore_DP{config.parallel_config.data_parallel_rank}"
                 )
-                engine = DPEngineCoreProc(config, input_address, output_address)
+                engine = DPEngineCoreProc(
+                    config, input_address, output_address, direct_endpoint
+                )
             else:
                 set_process_title("EngineCore")
-                engine = EngineCore(config, input_address, output_address)
+                engine = EngineCore(config, input_address, output_address, direct_endpoint)
             engine.busy_loop()
         except Exception as e:
             logger.error(f"run_engine: exception: {e}", exc_info=True)
@@ -269,7 +402,12 @@ class EngineCore:
         # the rejected seq will never produce.
         rejected = self.scheduler.take_rejected()
         if rejected:
-            self.output_queue.put_nowait(rejected)
+            self._publish_direct_finished(rejected)
+            regular_rejected = [
+                seq for seq in rejected if not getattr(seq, "is_direct_engine_request", False)
+            ]
+            if regular_rejected:
+                self.output_queue.put_nowait(regular_rejected)
 
         if result is None:
             self._advance_idle_kv_transfer()
@@ -319,12 +457,20 @@ class EngineCore:
             while not self.stream_output_queue.empty():
                 stream_outputs = self.stream_output_queue.get_nowait()
                 # Send stream outputs as intermediate results
+                self._publish_direct_stream_outputs(stream_outputs)
                 self.output_queue.put_nowait(("STREAM", stream_outputs))
         except queue.Empty:
             pass
 
         if finished_seqs:
-            self.output_queue.put_nowait(finished_seqs)
+            self._publish_direct_finished(finished_seqs)
+            regular_finished = [
+                seq
+                for seq in finished_seqs
+                if not getattr(seq, "is_direct_engine_request", False)
+            ]
+            if regular_finished:
+                self.output_queue.put_nowait(regular_finished)
 
         return True
 
@@ -455,11 +601,17 @@ class EngineCore:
 
 
 class DPEngineCoreProc(EngineCore):
-    def __init__(self, config: Config, input_address: str, output_address: str):
+    def __init__(
+        self,
+        config: Config,
+        input_address: str,
+        output_address: str,
+        direct_endpoint: EngineCoreIpcEndpoint | None = None,
+    ):
         # self.dp_group = config.parallel_config.dp_group
         self.dp_rank = config.parallel_config.data_parallel_rank
         # self.dp_group = config.parallel_config.stateless_init_dp_group()
-        super().__init__(config, input_address, output_address)
+        super().__init__(config, input_address, output_address, direct_endpoint)
         # Initialize to True so first iteration reaches all_reduce
         self.engines_running = True
         self._shutting_down = False
@@ -633,7 +785,13 @@ class PrefillEngineCore(EngineCore):
     - Does NOT sample tokens; completed sequences are discarded here.
     """
 
-    def __init__(self, config: Config, input_address: str, output_address: str):
+    def __init__(
+        self,
+        config: Config,
+        input_address: str,
+        output_address: str,
+        direct_endpoint: EngineCoreIpcEndpoint | None = None,
+    ):
 
         # Force eager mode — no CUDA graph capture on the prefill side.
         config.enforce_eager = True
@@ -654,7 +812,7 @@ class PrefillEngineCore(EngineCore):
         # after EngineCore.__init__ sets it.
         self._config = config
 
-        super().__init__(config, input_address, output_address)
+        super().__init__(config, input_address, output_address, direct_endpoint)
         # Replace the base Scheduler created by EngineCore.__init__ with
         # PrefillScheduler, which has no BlockManager and only schedules
         # sequences that already have a block_table from decode.
@@ -866,7 +1024,13 @@ class DecodeEngineCore(EngineCore):
     - Runs normal CUDA-graph-accelerated decode.
     """
 
-    def __init__(self, config: Config, input_address: str, output_address: str):
+    def __init__(
+        self,
+        config: Config,
+        input_address: str,
+        output_address: str,
+        direct_endpoint: EngineCoreIpcEndpoint | None = None,
+    ):
         self._disagg_d2p_addr = config.disagg_d2p_addr  # PUSH: send BlockAssignment
         self._disagg_p2d_addr = config.disagg_p2d_addr  # PULL: receive PrefillDone
         self._disagg_weight_ipc_addr = config.disagg_weight_ipc_addr
@@ -881,7 +1045,7 @@ class DecodeEngineCore(EngineCore):
         # Suppress _send_ready_signal during super().__init__() — we send the
         # real READY only after kvcache IPC import and cudagraph capture.
         self._ready_deferred = True
-        super().__init__(config, input_address, output_address)
+        super().__init__(config, input_address, output_address, direct_endpoint)
         self._ready_deferred = False
 
         # --- Round 2: receive kvcache bundle from prefill ---

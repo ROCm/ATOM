@@ -17,6 +17,7 @@ import zmq.asyncio
 from atom.config import Config
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.sequence import Sequence
+from atom.model_engine.direct_ipc import EngineCoreIpcEndpoint, allocate_endpoint
 from atom.utils import (
     envs,
     get_open_zmq_inproc_path,
@@ -69,6 +70,10 @@ class CoreManager:
         self.engine_core_identities = []
         self.shutdown_paths = []
         self.output_threads = []
+        # Loopback endpoints for the Rust standalone frontend. They use a
+        # language-neutral protocol and are deliberately separate from the
+        # private pickle/ZMQ CoreManager channels.
+        self.engine_core_ipc_endpoints: list[EngineCoreIpcEndpoint] = []
         # Fair-rotation cursor, advanced once per selection. round_robin picks the
         # rank directly (cursor % n); the load-aware strategies use it only to seed
         # the argmin start offset so fully-tied ranks rotate instead of always
@@ -158,8 +163,11 @@ class CoreManager:
                     rank_config.parallel_config.pp_meta_addrs = self.pp_meta_addrs
                     rank_config.parallel_config.pp_token_addr = self.pp_token_addr
 
+                direct_endpoint = (
+                    allocate_endpoint(dp_rank, pp_rank) if self.pp_size == 1 else None
+                )
                 engine_core_process, addresses, local_dp_rank = launch_engine_core(
-                    rank_config, dp_rank
+                    rank_config, dp_rank, direct_endpoint=direct_endpoint
                 )
 
                 processes_info.append(
@@ -202,6 +210,10 @@ class CoreManager:
 
                     shutdown_path = get_open_zmq_inproc_path()
                     self.shutdown_paths.append(shutdown_path)
+                    if info["addresses"].get("direct_endpoint") is not None:
+                        self.engine_core_ipc_endpoints.append(
+                            info["addresses"]["direct_endpoint"]
+                        )
 
                 self._wait_for_all_ready_signals()
                 logger.info(
@@ -239,6 +251,10 @@ class CoreManager:
         self.async_output_queue = asyncio.Queue() if config.asyncio_mode else None
         self._output_handler_task = None
         self._asyncio_mode = config.asyncio_mode
+
+    def get_engine_core_ipc_endpoints(self) -> list[dict[str, int | str]]:
+        """Return standalone-safe endpoint descriptors after all cores are READY."""
+        return [endpoint.as_dict() for endpoint in self.engine_core_ipc_endpoints]
 
     def _wait_for_all_ready_signals(self):
         """Wait for READY signals from all DP ranks in parallel (no timeout)."""
@@ -848,7 +864,11 @@ class CoreManager:
         )
 
 
-def launch_engine_core(config: Config, dp_rank: int = 0):
+def launch_engine_core(
+    config: Config,
+    dp_rank: int = 0,
+    direct_endpoint: EngineCoreIpcEndpoint | None = None,
+):
     input_address = get_open_zmq_ipc_path()
     output_address = get_open_zmq_ipc_path()
     import torch
@@ -876,12 +896,17 @@ def launch_engine_core(config: Config, dp_rank: int = 0):
             "config": config,
             "input_address": input_address,
             "output_address": output_address,
+            "direct_endpoint": direct_endpoint,
         },
     )
 
     return (
         process,
-        {"input_address": input_address, "output_address": output_address},
+        {
+            "input_address": input_address,
+            "output_address": output_address,
+            "direct_endpoint": direct_endpoint,
+        },
         dp_rank,
     )
 

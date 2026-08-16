@@ -1,8 +1,8 @@
 """Python entrypoint for running Atomesh with a Python-owned engine.
 
 This module intentionally mirrors the engine/tokenizer initialization used by
-``atom.entrypoints.openai.api_server``. The Rust side receives the already
-constructed Python objects and uses them in ``AtomStandaloneRouter``.
+``atom.entrypoints.openai.api_server``. It owns the Python process bootstrap
+and advertises EngineCore endpoints to the Rust standalone router.
 """
 
 from __future__ import annotations
@@ -95,21 +95,6 @@ def initialize_engine(args: argparse.Namespace) -> tuple[Any, Any]:
     return engine, tokenizer
 
 
-def initialize_standalone_service(
-    args: argparse.Namespace,
-    default_chat_template_kwargs: dict[str, Any],
-) -> Any:
-    from atom.entrypoints.atomesh.atom_standalone_service import AtomStandaloneService
-
-    global engine, tokenizer
-    return AtomStandaloneService(
-        engine=engine,
-        tokenizer=tokenizer,
-        model_name=args.model,
-        default_chat_template_kwargs=default_chat_template_kwargs,
-    )
-
-
 def split_standalone_mesh_args(raw_args: list[str]) -> tuple[list[str], list[str]]:
     """Keep mesh-owned network args from being consumed by Python parsers.
 
@@ -178,19 +163,22 @@ def parse_standalone_args(raw_args: list[str]) -> StandaloneArgs:
 
 def launch_atom_standalone(atomesh_runner: Any, raw_args: list[str]) -> None:
     standalone_args = parse_standalone_args(raw_args)
-    parsed_args = atomesh_runner.parse_from(standalone_args.mesh_args)
+    mesh_args = [
+        *standalone_args.mesh_args,
+        "--model-path",
+        standalone_args.engine_args.model,
+        "--tokenizer-path",
+        standalone_args.engine_args.model,
+    ]
+    parsed_args = atomesh_runner.parse_from(mesh_args)
     cli_args = parsed_args["cli_args"]
     initialize_engine(standalone_args.engine_args)
-    standalone_service = initialize_standalone_service(
-        standalone_args.engine_args,
-        standalone_args.default_chat_template_kwargs,
-    )
-
     print("\033[32mATOM starting...\033[0m")
     print(f"\033[32mHost: {cli_args['host']}:{cli_args['port']}\033[0m")
+    engine_core_ipc_endpoints = engine.core_mgr.get_engine_core_ipc_endpoints()
     atomesh_runner.launch_mesh(
         server_config=parsed_args["server_config"],
-        standalone_service=standalone_service,
+        engine_core_ipc_endpoints=json.dumps(engine_core_ipc_endpoints),
     )
 
 
@@ -219,7 +207,6 @@ def launch_atomesh(atomesh_runner: Any, raw_args: list[str]) -> None:
 
     atomesh_runner.launch_mesh(
         server_config=parsed_args["server_config"],
-        standalone_service=None,
     )
 
 

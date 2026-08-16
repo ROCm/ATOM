@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use pyo3::{exceptions::PyRuntimeError, prelude::*, types::PyDict};
+use serde_json;
 
 use crate::{
     cliargs::{
@@ -9,7 +10,7 @@ use crate::{
         parse_prefill_args_from, Backend, Cli, CliArgs, Commands,
     },
     config::RoutingMode,
-    routers::atom_standalone::AtomStandaloneRuntime,
+    routers::atom_standalone::{AtomStandaloneRuntime, EngineCoreIpcEndpoint},
     server::{self, ServerConfig},
     version,
 };
@@ -54,17 +55,26 @@ impl PyServerConfig {
 #[pyo3(signature = (
     *,
     server_config,
-    standalone_service = None
+    engine_core_ipc_endpoints = None
 ))]
 pub fn launch_mesh(
     py: Python<'_>,
     mut server_config: PyRefMut<'_, PyServerConfig>,
-    standalone_service: Option<Py<PyAny>>,
+    engine_core_ipc_endpoints: Option<String>,
 ) -> PyResult<()> {
-    let runtime = standalone_service.map(|service| {
+    let engine_core_ipc_endpoints = engine_core_ipc_endpoints
+        .map(|raw| {
+            serde_json::from_str::<Vec<EngineCoreIpcEndpoint>>(&raw).map_err(|error| {
+                PyRuntimeError::new_err(format!(
+                    "Invalid direct EngineCore endpoint configuration: {error}"
+                ))
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let runtime = (!engine_core_ipc_endpoints.is_empty()).then(|| {
         Arc::new(AtomStandaloneRuntime {
-            service,
-            close_service_on_shutdown: false,
+            engine_core_ipc_endpoints,
         })
     });
 

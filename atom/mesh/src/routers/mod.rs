@@ -19,6 +19,7 @@ use crate::protocols::{
 
 pub mod atom_standalone;
 pub mod comm;
+pub mod direct_engine;
 pub mod factory;
 pub mod grpc;
 pub mod http_pd_router;
