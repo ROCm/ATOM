@@ -228,7 +228,8 @@ async def stream_chat_response(
     stream_collector: StreamOutputCollector,
     seq_id: int,
     num_prompt_tokens: int,
-    cleanup_fn,
+    cleanup_stream,
+    cleanup_request,
     tools=None,
     tool_choice=None,
     starts_thinking: bool = False,
@@ -357,7 +358,8 @@ async def stream_chat_response(
             + STREAM_DONE_MESSAGE
         )
     finally:
-        cleanup_fn(request_id, seq_id, aborted=aborted)
+        cleanup_stream(seq_id, aborted=aborted)
+        cleanup_request(request_id)
 
 
 def _build_chat_choice(
@@ -501,7 +503,8 @@ async def stream_chat_response_fanout(
     shared_collector: StreamOutputCollector,
     seq_ids: list[int],
     num_prompt_tokens: int,
-    cleanup_fn,
+    cleanup_stream,
+    cleanup_request,
     tools=None,
 ) -> AsyncGenerator[str, None]:
     """Streaming variant that multiplexes ``len(seq_ids)`` fan-out siblings
@@ -647,6 +650,6 @@ async def stream_chat_response_fanout(
             + STREAM_DONE_MESSAGE
         )
     finally:
-        # Clean up all sibling seq_id entries then the shared request state.
         for sid in seq_ids:
-            cleanup_fn(request_id, sid, aborted=aborted)
+            cleanup_stream(sid, aborted=aborted)
+        cleanup_request(request_id)

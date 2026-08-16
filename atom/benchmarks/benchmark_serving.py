@@ -27,6 +27,7 @@ On the client side, run:
 
 import argparse
 import asyncio
+import collections
 import contextlib
 import functools
 import gc
@@ -305,6 +306,14 @@ async def get_request(
         interval = np.random.gamma(shape=burstiness, scale=theta)
         # The next request will be sent after the interval.
         await asyncio.sleep(interval)
+
+
+def _failure_reason(error: str) -> str:
+    """The last line of a traceback, which is the part that identifies it."""
+    lines = [
+        line.strip() for line in (error or "").strip().splitlines() if line.strip()
+    ]
+    return lines[-1][:110] if lines else "unknown (no error recorded)"
 
 
 def calculate_metrics(
@@ -636,6 +645,15 @@ async def benchmark(
 
     print("{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
     print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
+    failures = collections.Counter(
+        _failure_reason(output.error) for output in outputs if not output.success
+    )
+    if failures:
+        # Every metric below is over the survivors, so a run that lost requests
+        # must not report its throughput as though it had not.
+        print("{:<40} {:<10}".format("FAILED requests:", sum(failures.values())))
+        for reason, count in failures.most_common(5):
+            print(f"{'':4}{count:<8} {reason}")
     print("{:<40} {:<10.2f}".format("Benchmark duration (s):", benchmark_duration))
     print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
     print("{:<40} {:<10}".format("Total generated tokens:", metrics.total_output))

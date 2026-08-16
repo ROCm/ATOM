@@ -72,13 +72,13 @@ def test_dispatcher_batches_direct_and_tagged_chunks_per_loop():
     dispatcher.enqueue(
         loop=loop,
         collector=direct_queue,
-        state_key="request-1",
+        state=dispatcher.new_state(),
         chunk={"token_ids": [ord("A")], "finished": True},
     )
     dispatcher.enqueue(
         loop=loop,
         collector=tagged_queue,
-        state_key=("request-2", 0),
+        state=dispatcher.new_state(),
         chunk={"token_ids": [ord("B")], "finished": True},
         tag=0,
     )
@@ -95,18 +95,19 @@ def test_dispatcher_keeps_fanout_detokenizer_state_separate():
     dispatcher = StreamBatchDispatcher(_Utf8ByteTokenizer())
     loop = _ImmediateLoop()
     queue = asyncio.Queue()
+    sibling_0, sibling_1 = dispatcher.new_state(), dispatcher.new_state()
 
     dispatcher.enqueue(
         loop=loop,
         collector=queue,
-        state_key=("request", 0),
+        state=sibling_0,
         chunk={"token_ids": [0xE4], "finished": False},
         tag=0,
     )
     dispatcher.enqueue(
         loop=loop,
         collector=queue,
-        state_key=("request", 1),
+        state=sibling_1,
         chunk={"token_ids": [ord("X")], "finished": True},
         tag=1,
     )
@@ -115,10 +116,11 @@ def test_dispatcher_keeps_fanout_detokenizer_state_separate():
     assert queue.get_nowait()[1]["text"] == ""
     assert queue.get_nowait()[1]["text"] == "X"
 
+    # Sibling 0's half character survives sibling 1 finishing in between.
     dispatcher.enqueue(
         loop=loop,
         collector=queue,
-        state_key=("request", 0),
+        state=sibling_0,
         chunk={"token_ids": [0xBD, 0xA0], "finished": True},
         tag=0,
     )
@@ -127,26 +129,26 @@ def test_dispatcher_keeps_fanout_detokenizer_state_separate():
     assert queue.get_nowait()[1]["text"] == "你"
 
 
-def test_discard_request_drops_partial_direct_and_fanout_state():
+def test_a_fresh_stream_does_not_inherit_a_half_decoded_character():
+    """Each stream's detokenizer is its own object, so bytes cannot leak over."""
     dispatcher = StreamBatchDispatcher(_Utf8ByteTokenizer())
     loop = _ImmediateLoop()
     queue = asyncio.Queue()
 
-    for state_key in ("request", ("request", 0)):
+    for _ in range(2):
         dispatcher.enqueue(
             loop=loop,
             collector=queue,
-            state_key=state_key,
+            state=dispatcher.new_state(),
             chunk={"token_ids": [0xE4], "finished": False},
         )
     dispatcher.flush()
-    dispatcher.discard_request("request")
 
-    for state_key in ("request", ("request", 0)):
+    for _ in range(2):
         dispatcher.enqueue(
             loop=loop,
             collector=queue,
-            state_key=state_key,
+            state=dispatcher.new_state(),
             chunk={"token_ids": [ord("A")], "finished": True},
         )
     dispatcher.flush()
@@ -243,6 +245,7 @@ def _stream_through_collector(payload: bytes, drain_every: int):
     dispatcher = StreamBatchDispatcher(_Utf8ByteTokenizer())
     loop = _ImmediateLoop()
     collector = StreamOutputCollector("request-1")
+    state = dispatcher.new_state()
 
     texts = []
     token_ids = []
@@ -252,7 +255,7 @@ def _stream_through_collector(payload: bytes, drain_every: int):
         dispatcher.enqueue(
             loop=loop,
             collector=collector,
-            state_key="request-1",
+            state=state,
             chunk={"token_ids": [byte], "finished": last},
         )
         dispatcher.flush()
@@ -299,7 +302,7 @@ def test_a_step_is_delivered_in_a_single_loop_callback():
         dispatcher.enqueue(
             loop=loop,
             collector=collector,
-            state_key=f"request-{index}",
+            state=dispatcher.new_state(),
             chunk={"token_ids": [ord("A")], "finished": True},
         )
     dispatcher.flush()
@@ -314,12 +317,13 @@ def test_two_steps_keep_their_order_within_one_stream():
     dispatcher = StreamBatchDispatcher(_Utf8ByteTokenizer())
     loop = _RecordingLoop()
     collector = StreamOutputCollector("request-1")
+    state = dispatcher.new_state()
 
     for byte, finished in ((ord("a"), False), (ord("b"), True)):
         dispatcher.enqueue(
             loop=loop,
             collector=collector,
-            state_key="request-1",
+            state=state,
             chunk={"token_ids": [byte], "finished": finished},
         )
         dispatcher.flush()
@@ -340,3 +344,38 @@ def test_merge_keeps_end_of_stream_and_never_extends_the_engines_list():
     assert into["text"] == "ab"
     assert into["token_ids"] == [1, 2]
     assert engine_tokens == [1]
+
+
+def test_dispatcher_keeps_no_per_stream_state():
+    """The dispatcher must stay stateless between streams.
+
+    Detokenizers used to live in a dict here: first behind a lock that cost 27%
+    of the API server's CPU, then lock-free with an index two threads had to
+    keep in agreement and teardown had to remember to clear -- draining 8192
+    streams cost 894 ms of scanning, and a missed removal leaked a detokenizer
+    whose token list grows without bound. Now each one belongs to the engine
+    callback that feeds it, so there is nothing here to leak or to race on.
+    """
+    dispatcher = StreamBatchDispatcher(_Utf8ByteTokenizer())
+    loop = _ImmediateLoop()
+    queue = asyncio.Queue()
+
+    for _ in range(64):
+        dispatcher.enqueue(
+            loop=loop,
+            collector=queue,
+            state=dispatcher.new_state(),
+            chunk={"token_ids": [ord("A")], "finished": True},
+        )
+    dispatcher.flush()
+
+    assert vars(dispatcher).keys() == {"tokenizer", "_thread_local"}
+
+
+def test_each_stream_gets_its_own_detokenizer():
+    dispatcher = StreamBatchDispatcher(_Utf8ByteTokenizer())
+
+    first, second = dispatcher.new_state(), dispatcher.new_state()
+
+    assert first is not second
+    assert first.tokens == [] and second.tokens == []

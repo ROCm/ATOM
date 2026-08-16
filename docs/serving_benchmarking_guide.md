@@ -139,6 +139,8 @@ Server-specific CLI arguments:
 |----------|---------|-------------|
 | `--host` | `0.0.0.0` | Bind address |
 | `--server-port` | `8000` | HTTP port (note: `--port` is for internal engine communication) |
+| `--timeout-keep-alive` | `5` | Seconds an idle keep-alive connection is held. Pooling clients hold their end longer (aiohttp defaults to 15s), so a caller that pauses for longer than this reuses a socket the server already closed and has to re-send. Raise it past the caller's idle window to avoid that |
+| `--disable-uvicorn-access-log` | off | Stop uvicorn logging a line per HTTP request. It copies a `LogRecord` and writes to the same stdout as the engine, on the event loop |
 
 All `EngineArgs` arguments are also accepted (see Section 7 for the full list).
 
