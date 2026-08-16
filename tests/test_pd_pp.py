@@ -195,12 +195,70 @@ def test_mooncake_rdma_preserves_explicit_device():
     assert mc._select_ib_device("rdma", "ionic_3", None) == "ionic_3"
 
 
+def test_mooncake_rdma_normalizes_explicit_device_list():
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    assert (
+        mc._select_ib_device("rdma", " ionic_4, ionic_0,ionic_4 ", None)
+        == "ionic_4,ionic_0"
+    )
+
+
 def test_mooncake_rdma_auto_selects_from_physical_gpu(monkeypatch):
     mc = pytest.importorskip(
         "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
     )
     monkeypatch.setattr(mc, "_auto_select_ib_device", lambda idx: f"auto{idx}")
     assert mc._select_ib_device("rdma", "", 5) == "auto5"
+
+
+def test_mooncake_rdma_adds_alternate_hca_for_upper_rail_gpu(monkeypatch):
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    monkeypatch.setattr(mc, "_auto_select_ib_device", lambda idx: f"ionic_{idx}")
+    monkeypatch.setattr(mc, "_ib_device_exists", lambda _device: True)
+
+    assert mc._select_ib_devices(
+        "rdma",
+        "",
+        4,
+        enable_alternate_hca=True,
+        rail_offset=4,
+    ) == ["ionic_4", "ionic_0"]
+
+
+def test_mooncake_rdma_does_not_add_alternate_hca_for_lower_rail_gpu(monkeypatch):
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    monkeypatch.setattr(mc, "_auto_select_ib_device", lambda idx: f"ionic_{idx}")
+    monkeypatch.setattr(mc, "_ib_device_exists", lambda _device: True)
+
+    assert mc._select_ib_devices(
+        "rdma",
+        "",
+        3,
+        enable_alternate_hca=True,
+        rail_offset=4,
+    ) == ["ionic_3"]
+
+
+def test_mooncake_rdma_rejects_nonpositive_rail_offset(monkeypatch):
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    monkeypatch.setattr(mc, "_auto_select_ib_device", lambda idx: f"ionic_{idx}")
+
+    with pytest.raises(ValueError, match="ib_rail_offset"):
+        mc._select_ib_devices(
+            "rdma",
+            "",
+            4,
+            enable_alternate_hca=True,
+            rail_offset=0,
+        )
 
 
 def test_mooncake_rdma_requires_gpu_index_without_explicit_device():
