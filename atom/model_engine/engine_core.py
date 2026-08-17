@@ -25,6 +25,7 @@ from atom.utils import (
     init_exit_handler,
     make_zmq_socket,
     set_process_title,
+    tune_gc,
 )
 from atom.utils.distributed.utils import (
     stateless_destroy_torch_distributed_process_group,
@@ -221,6 +222,11 @@ class EngineCore:
         from atom.utils import enable_orphan_reaping
 
         enable_orphan_reaping()
+
+        # The process whose GC pauses idle the GPUs: a gen-2 pass here stops
+        # the scheduler, and every ModelRunner worker then has nothing to run.
+        tune_gc()
+
         engine: EngineCore = None
         try:
             if config.pipeline_parallel_size > 1:

@@ -194,7 +194,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # --- Profiling & Logging ---
     "ATOM_TORCH_PROFILER_DIR": lambda: os.getenv("ATOM_TORCH_PROFILER_DIR", None),
     # "t0,t1,t2" for gc.set_threshold(); empty keeps CPython's default.
-    # See _tune_gc in api_server.py.
+    # Read independently by the API server, each EngineCore and each
+    # ModelRunner worker -- thresholds are per-interpreter.  The EngineCore is
+    # the one that matters.  See tune_gc in atom/utils/__init__.py.
     "ATOM_GC_THRESHOLD": lambda: os.getenv("ATOM_GC_THRESHOLD", "").strip(),
     "ATOM_PROFILER_MORE": lambda: os.getenv("ATOM_PROFILER_MORE", "0") == "1",
     # When profiling is active, append detailed attention aggregates (sqsq, sqsk, sk)
