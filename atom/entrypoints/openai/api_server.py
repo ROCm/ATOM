@@ -114,6 +114,7 @@ _stream_batch_dispatcher: StreamBatchDispatcher | None = None
 _metrics_exporter = AtomMetricsExporter()
 _metrics_refresh_task: asyncio.Task | None = None
 _METRICS_REFRESH_INTERVAL_SECONDS = 5.0
+_METRICS_REFRESH_TIMEOUT_SECONDS = 60.0
 
 
 # ============================================================================
@@ -1127,8 +1128,9 @@ async def _refresh_metrics_once() -> None:
     if engine is None:
         return
     try:
-        timeout = _METRICS_REFRESH_INTERVAL_SECONDS
-        snapshot = await asyncio.to_thread(engine.get_metrics_statistics, timeout)
+        snapshot = await asyncio.to_thread(
+            engine.get_metrics_statistics, _METRICS_REFRESH_TIMEOUT_SECONDS
+        )
     except asyncio.CancelledError:
         raise
     except Exception:  # noqa: BLE001 - exporter must retain its last snapshot
@@ -1144,14 +1146,25 @@ async def _metrics_refresh_loop() -> None:
         await _refresh_metrics_once()
 
 
+async def _ensure_metrics_refresh_started() -> None:
+    """Start metrics collection only after a client requests `/metrics`."""
+    global _metrics_refresh_task
+    if _metrics_refresh_task is not None and not _metrics_refresh_task.done():
+        return
+
+    # The first scrape is normally performed while the server is idle. Populate
+    # a real baseline before returning, then keep refreshing in the background.
+    await _refresh_metrics_once()
+    if _metrics_refresh_task is None or _metrics_refresh_task.done():
+        _metrics_refresh_task = asyncio.create_task(_metrics_refresh_loop())
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown."""
     global _metrics_refresh_task
     logger.info("Server started successfully and ready to accept requests")
     _tune_gc()
-    await _refresh_metrics_once()
-    _metrics_refresh_task = asyncio.create_task(_metrics_refresh_loop())
     try:
         yield
     finally:
@@ -1857,8 +1870,10 @@ async def health():
 
 
 @app.api_route("/metrics", methods=["GET", "HEAD"], include_in_schema=False)
-async def metrics():
-    """Expose cached standalone-engine metrics in Prometheus text format."""
+async def metrics(request: Request):
+    """Expose metrics and lazily start collection on the first GET scrape."""
+    if request.method == "GET":
+        await _ensure_metrics_refresh_started()
     return Response(
         content=_metrics_exporter.render(),
         headers={"Content-Type": _metrics_exporter.content_type},
