@@ -13,33 +13,51 @@ request.
 ## HBM layout
 
 `DeepseekV4AttentionMetadataBuilder.allocate_per_req_cache()` creates one byte
-allocation and carves the main NoPE and optional RoPE planes from it. Within
-each plane, PAGE blocks grow from low addresses and request SLOTs grow from high
-addresses.
+allocation and carves the main NoPE and optional RoPE planes from it. Each plane
+contains a PAGE address space and pre-reserved Active SLOT capacity. Sharing the
+physical allocation does not make an Active SLOT a PAGE ID.
 
 ```text
-One allocation: per_req_pool
+One physical allocation: per_req_pool
 
-  Low address                                                High address
-       |                                                          |
-       v                                                          v
+  Low address                                                   High address
+       |                                                             |
+       v                                                             v
 
   NoPE plane
-  +--------+--------+--------+---------+--------+--------+--------+
-  | PAGE 0 | PAGE 1 |  ...   |  gap    | SLOT 2 | SLOT 1 | SLOT 0 |
-  +--------+--------+--------+---------+--------+--------+--------+
-       PAGE grows this way --->          <--- SLOT grows this way
+  +------------------------------------------+--------------------------+
+  | PAGE address space                       | Active SLOT capacity     |
+  | PAGE 0 | PAGE 1 | ... | PAGE N-1        | ... | group 1 | group 0 |
+  +------------------------------------------+--------------------------+
+    managed by BlockPool                       managed by StateGroupPool
+    forward indexed                            reverse indexed
 
   RoPE plane, when FP8 KV is enabled
-  +--------+--------+--------+---------+--------+--------+--------+
-  | PAGE 0 | PAGE 1 |  ...   |  gap    | SLOT 2 | SLOT 1 | SLOT 0 |
-  +--------+--------+--------+---------+--------+--------+--------+
+  +------------------------------------------+--------------------------+
+  | PAGE address space                       | Active SLOT capacity     |
+  | PAGE 0 | PAGE 1 | ... | PAGE N-1        | ... | group 1 | group 0 |
+  +------------------------------------------+--------------------------+
 
   Separate PAGE-only allocation
   +--------------------+--------------------+--------------------+
   | CSA indexer PAGE 0 | CSA indexer PAGE 1 |        ...         |
   +--------------------+--------------------+--------------------+
 ```
+
+Free PAGE units remain inside the PAGE address space. `BlockPool` tracks their
+logical state; their position in this diagram does not imply their state:
+
+```text
+PAGE ID       0          1          2          3          4
+          +----------+----------+----------+----------+----------+
+state     | live KV  | free     | prefix   | state    | free     |
+          |          |          | cached   | ckpt unit|          |
+          +----------+----------+----------+----------+----------+
+```
+
+The right side contains only capacity for request-owned Active SLOT groups. A
+free group there is available for admitting another active request; it is not a
+free PAGE unit and is not where a retained PAGE-backed checkpoint lives.
 
 One PAGE contains compressed KV envelopes and the corresponding CSA indexer
 regions. One SLOT contains the complete mutable request state:
@@ -67,12 +85,56 @@ The address ABI is:
 PAGE address(block_id):
     base + block_id * unit_bytes
 
-SLOT address(group_id):
+Active SLOT address(group_id):
     base + total_bytes - (group_id + 1) * unit_bytes
 ```
 
-Reverse SLOT indexing keeps existing groups at stable addresses when the SLOT
-side grows toward the PAGE side.
+Reverse Active SLOT indexing keeps existing groups at stable addresses when the
+SLOT side grows toward the PAGE side.
+
+### Active SLOT, native checkpoint, and offload sidecar
+
+The three storage roles are distinct:
+
+```text
+Active request state
+--------------------
+
+Active SLOT group G
++-----------------------------+
+| compressor state + SWA ring |
++-----------------------------+
+       contiguous, right side
+
+
+Native HBM state checkpoint
+---------------------------
+
+Active SLOT group G
+          |
+          | BlockPool.reserve_units(K)
+          | segmented copy
+          v
+   +--------+  +---------+       +---------+
+   | PAGE 7 |  | PAGE 31 |  ...  | PAGE 92 |
+   +--------+  +---------+       +---------+
+      arbitrary PAGE IDs in the left-side PAGE address space
+
+
+LMCache SLOT offload
+--------------------
+
+Active SLOT group G
+          |
+          v
+GPU staging row --> pinned CPU frame --> CPU/NVMe AOS1 sidecar
+```
+
+`PagedStateCheckpointCoordinator` stores native state checkpoints in arbitrary
+free PAGE units obtained from `BlockPool`; it does not keep them in free Active
+SLOT groups. The LMCache sidecar path does not retain HBM PAGE units at all. It
+uses a bounded temporary GPU row and then persists the complete SLOT in CPU or
+NVMe storage.
 
 ## Storage representation
 
@@ -253,6 +315,11 @@ only when both succeed; otherwise the request falls back to recomputation.
   - `get_kv_transfer_tensors()` exports forward PAGE and reverse SLOT regions.
 - `atom/model_ops/attentions/v4_pool_geometry.py`
   - `UnifiedPoolGeometry` owns all PAGE/SLOT address arithmetic.
+- `atom/model_engine/block_pool.py`
+  - `BlockPool` tracks live, cached, free, and raw-checkpoint PAGE units.
+- `atom/model_engine/page_unit_checkpoint.py`
+  - `PagedStateCheckpointCoordinator` reserves PAGE units for native HBM state
+    checkpoints and releases them as one atomic object.
 - `atom/kv_transfer/offload/hybrid/dsv4/codec.py`
   - `DSV4PageSlotCodec` builds PAGE/SLOT copy plans.
   - `DSV4CheckpointCodec` implements the AOS1 frame.
