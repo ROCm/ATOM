@@ -187,6 +187,13 @@ class MultiConnector(KVConnectorBase):
             getattr(c, "is_producer", False) for c in self._connectors
         )
 
+        pp_rank = getattr(
+            getattr(config, "parallel_config", None),
+            "pipeline_parallel_rank",
+            0,
+        )
+        self._pp_is_head = pp_rank == 0
+
         # Send/save pairing state (see module docstring).
         # _pending_save: str(req_id) for requests offload will save this lifetime.
         self._pending_save: set[str] = set()
@@ -220,7 +227,7 @@ class MultiConnector(KVConnectorBase):
             if reqs:
                 for req in reqs:
                     if getattr(req, "save_spec", None) is not None:
-                        self._pending_save.add(str(getattr(req, "req_id")))
+                        self._pending_save.add(str(req.req_id))
             c.start_load_kv(m)
 
     def get_finished(self) -> KVConnectorOutput:
@@ -246,10 +253,10 @@ class MultiConnector(KVConnectorBase):
             failed_loading=load_failed,
         )
 
-        if not self.is_producer:
-            # No moriio send to pair with: offload save / recv pass straight
-            # through (the scheduler frees consumer/offload requests on
-            # finished_saving via should_defer_free).
+        if not self.is_producer or not self._pp_is_head:
+            # Non-producer: no moriio send to pair with.
+            # Non-head PP stage: mooncake only reports done_sending on stage 0
+            # (via _record_release), so downstream stages would wait forever.
             out.finished_sending = set(send_now)
             out.finished_saving = set(save_now)
             return out
