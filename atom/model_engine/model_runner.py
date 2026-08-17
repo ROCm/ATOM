@@ -1201,18 +1201,24 @@ class ModelRunner:
 
         num_seqs = min(warmup_max_tokens // max_model_len, self.config.max_num_seqs)
 
-        if num_seqs == 0:
-            num_seqs = 1
-            seq_len = min(warmup_max_tokens, max_model_len)
-            if seq_len == 0:
-                seq_len = 1
+        # torch.compile's mark_dynamic can't make a size-1 batch dim dynamic, so
+        # a DSpark block drafter (rows == num_seqs) must first-compile at B >= 2
+        # (EAGLE gets that free -- its first draft step is a many-row prefill).
+        # Other cases only need the usual >= 1 floor.
+        drafter = getattr(self, "drafter", None)
+        min_seqs = 2 if getattr(drafter, "is_block_drafter", False) else 1
+        num_seqs = max(num_seqs, min_seqs)
+
+        # Split the token budget across the seqs so >1 sequences never exceed it
+        # (peak memory unchanged); a lone seq keeps up to max_model_len.
+        seq_len = max(1, min(max_model_len, warmup_max_tokens // num_seqs))
+
+        if warmup_max_tokens < max_model_len:
             logger.warning(
                 f"{self.label}: dp_size={dp_size}, dp_attn={self.config.enable_dp_attention}, "
                 f"warmup_max_tokens={warmup_max_tokens} < max_model_len={max_model_len}. "
-                f"Using {num_seqs} seq with length {seq_len} for warmup."
+                f"Using {num_seqs} seq(s) with length {seq_len} for warmup."
             )
-        else:
-            seq_len = max_model_len
 
         seqs = [
             Sequence(

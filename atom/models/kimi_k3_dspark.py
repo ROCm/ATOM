@@ -637,6 +637,9 @@ class KimiK3DSpark(DSparkDraftModel):
         )
         self.final_norm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
         self.markov_head = DSparkMarkovHead(config.vocab_size, self.markov_rank)
+        # Markov-head vocab, exposed at the top level so the proposer can clamp
+        # the anchor uniformly across DSpark flavors (V4 exposes it too).
+        self.vocab_size = int(config.vocab_size)
 
         # Bound by share_with_target(); both are skipped at load.
         self.embed_tokens = None
