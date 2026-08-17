@@ -816,6 +816,22 @@ function atomeshMergeScore(row) {
   return parseAtomeshNumber(row.totalTput);
 }
 
+// Frontier for the tradeoff chart: a point survives only if no other point beats
+// it on both axes — interactivity (x) and throughput per GPU (y) are both
+// maximize-better. Returned in ascending x so the polyline draws left to right.
+function atomeshParetoFrontier(points) {
+  const sorted = points.slice().sort((a, b) => b.x - a.x || b.y - a.y);
+  const front = [];
+  let bestY = -Infinity;
+  for (const p of sorted) {
+    if (p.y > bestY) {
+      front.push(p);
+      bestY = p.y;
+    }
+  }
+  return front.reverse();
+}
+
 function mergeAtomeshTopologyRows(rows) {
   const merged = {};
   for (const row of rows) {
@@ -3749,14 +3765,53 @@ function renderAtomeshPerformanceTab() {
         pointHoverRadius: 6,
         pointBorderWidth: 0,
         pointHoverBorderWidth: 0,
-        showLine: groupRows.length > 1,
+        // Agentic topologies are connected by a separate Pareto frontier dataset below.
+        showLine: !isAgenticTraceRow(first) && groupRows.length > 1,
       };
     });
+    // Every agentic PD topology is a valid operating point for the same model +
+    // ISL/OSL, so the curve across them is their Pareto frontier, not a per-topology
+    // polyline. Appended last so existing datasetIndex values — and with them the
+    // legendFocus highlight — stay stable.
+    const agenticGroups = {};
+    for (const row of modelRows) {
+      if (!isAgenticTraceRow(row)) continue;
+      const key = `${row.model}|${row.islOsl}`;
+      if (!agenticGroups[key]) agenticGroups[key] = [];
+      agenticGroups[key].push(row);
+    }
+    for (const groupRows of Object.values(agenticGroups)) {
+      const frontier = atomeshParetoFrontier(
+        groupRows.map(c => ({ x: c.interactivity, y: c.totalTputPerGpu, row: c }))
+      );
+      if (frontier.length < 2) continue; // a single point is not a line
+      const first = groupRows[0];
+      const color = getModelColor(ATOMESH_DATA.backend, first.model);
+      datasets.push({
+        label: `${first.model} Agentic Pareto ${fmtIslOsl(first.islOsl)}`,
+        data: frontier,
+        borderColor: color.border,
+        backgroundColor: color.border,
+        // Same hue as its model — the frontier is a derived curve, not a series of
+        // its own — so the dash is what separates it from the solid series lines.
+        borderWidth: 2.5,
+        borderDash: [6, 4],
+        pointRadius: 0,
+        pointHoverRadius: 0,
+        pointHitRadius: 0,               // the topology datasets own hover/click for these rows
+        showLine: true,
+        fill: false,
+        order: -1,                       // draw under the point series
+        datalabels: { display: false },  // 'cN' labels already come from the topology datasets
+        _isFrontier: true,
+      });
+    }
     return {
       id: `atomesh-tradeoff-${chartIdx}`,
       model,
       rows: modelRows,
       datasets,
+      seriesCount: datasets.filter(d => !d._isFrontier).length,
     };
   });
 
@@ -3766,7 +3821,7 @@ function renderAtomeshPerformanceTab() {
   </div>
   <div class="chart-grid">${chartSpecs.map(spec => `
     <div class="chart-card ${chartSpecs.length === 1 ? 'hero' : 'half'}">
-      <h3>${escHTML(spec.model)} · ${spec.datasets.length} selected series</h3>
+      <h3>${escHTML(spec.model)} · ${spec.seriesCount} selected series</h3>
       <div class="chart-wrap"><canvas id="${spec.id}"></canvas></div>
     </div>`).join('')}</div></div>`;
 
