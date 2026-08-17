@@ -424,26 +424,6 @@ class tokenIDProcessor:
         ), f"{n_deferred} deferred + {n_new} new != {num_cur} requests"
         return TokenLocations(deferred_curr, deferred_prev, new_curr)
 
-    def _draft_tokens_for(self, batch, curr_indices, tokens_per_seq):
-        """Draft tokens [len(curr_indices), tokens_per_seq-1] for the given batch
-        positions, mapped by REQ ID (not position).
-
-        scheduled_spec_decode_tokens is COMPACTED — one row per seq that has a
-        draft — with spec_decode_req_ids[r] naming row r's seq. Indexing it by
-        batch position breaks when prefill/decode interleave and shift positions
-        (IndexError: index N out of bounds size N). We map each seq's req id to
-        its row; a seq with no draft (not in the map) gets a zero placeholder row.
-        """
-        spec = batch.scheduled_spec_decode_tokens
-        row_of_req = {rid: r for r, rid in enumerate(batch.spec_decode_req_ids)}
-        req_ids = batch.req_ids
-        out = np.zeros((len(curr_indices), tokens_per_seq - 1), dtype=spec.dtype)
-        for i, pos in enumerate(curr_indices):
-            row = row_of_req.get(req_ids[pos])
-            if row is not None:
-                out[i] = spec[row]
-        return out
-
     def prepare_input_ids(
         self,
         batch: ScheduledBatch,

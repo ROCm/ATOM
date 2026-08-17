@@ -475,10 +475,9 @@ class ScheduledBatch:
                 width = min(drafts.size, num_spec_step)
                 self.scheduled_spec_decode_tokens[i, :width] = drafts[:width]
             # The array is DENSE (one row per seq, filled by batch position
-            # above), so name rows by the batch-ordered req ids: row r <-> seq
-            # self.req_ids[r]. `_draft_tokens_for` maps a seq -> row via this,
-            # which stays correct when prefill/decode interleave and shift
-            # positions (a no-draft seq maps to its own zero row).
+            # above), so row r IS batch position r and a no-draft seq keeps its
+            # own zero row. Name the rows anyway: a consumer that maps seq ->
+            # row by id stays correct if the layout ever goes back to compacted.
             self.spec_decode_req_ids = list(self.req_ids)
         self.block_tables = [
             seq.block_table for seq in seqs.values() if seq.block_table
