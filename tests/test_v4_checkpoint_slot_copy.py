@@ -20,16 +20,14 @@ from __future__ import annotations
 import ctypes
 from itertools import pairwise
 
+import numpy as np
 import pytest
 import torch
 
 from atom.model_ops.attentions.deepseek_v4_attn import (
     DeepseekV4AttentionMetadataBuilder as Builder,
 )
-from atom.model_ops.attentions.paged_state_copy import (
-    ByteSegment,
-    plan_segmented_copy,
-)
+from atom.model_ops.attentions.paged_state_copy import plan_segmented_copy
 from atom.model_ops.attentions.state_arena import (
     StateField,
     checkpoint_bytes_for,
@@ -58,12 +56,18 @@ FIELDS = [
 ARENA_BYTES = entry_bytes_for(FIELDS)
 ARENA_ROWS = -(-ARENA_BYTES // ROW_BYTES)
 ENTRY_ROWS = 5  # the windows that share the slot, in row-space rows
+# Rows of that entry a window position actually reaches. Row 2 is interleave
+# padding: the real geometry has some, and an image that carried it would pass
+# every test below while still being bigger than it has to be.
+ENTRY_ROW_RUNS = [(0, 2), (3, 2)]
+ENTRY_LIVE_ROWS = sum(count for _, count in ENTRY_ROW_RUNS)
+ENTRY_PAD_ROWS = [2]
 SLOT_ROWS = ARENA_ROWS + ENTRY_ROWS + 1  # +1 so there is tail padding to drop
 SLOT_BYTES = SLOT_ROWS * ROW_BYTES
 
 
 class _Geo:
-    """Only the three numbers `_checkpoint_slot_ranges` and `_slot_views` read."""
+    """Only what `_checkpoint_slot_ranges` and `_slot_views` read."""
 
     arena_rows = ARENA_ROWS
     entry_rows = ENTRY_ROWS
@@ -75,6 +79,9 @@ class _Geo:
     def physical_slot(self, group: int) -> int:
         return group
 
+    def entry_row_runs(self) -> list[tuple[int, int]]:
+        return list(ENTRY_ROW_RUNS)
+
 
 class _StubBuilder:
     """Stands in for the parts of the builder these two methods touch."""
@@ -84,13 +91,14 @@ class _StubBuilder:
     # ones it stands in for.
     _assert_ratios_divide_block = Builder._assert_ratios_divide_block
     _checkpoint_slot_ranges = Builder._checkpoint_slot_ranges
-    _checkpoint_slot_segments = Builder._checkpoint_slot_segments
+    _checkpoint_slot_bases = Builder._checkpoint_slot_bases
     checkpoint_image_bytes = Builder.checkpoint_image_bytes
 
     def __init__(self, plane: torch.Tensor):
         self.pool_geometry = _Geo()
         self._arena_planes = [FIELDS]
         self._checkpoint_range_cache = None
+        self._checkpoint_slot_base_cache = None
         self.block_size = 256
         self._plane = plane
 
@@ -134,10 +142,28 @@ def dead_arena_span() -> tuple[int, int]:
     return spans["hca_main_kv"][0], spans["hca_main_score"][1]
 
 
-def execute(spans):
-    """Run the planner's spans as plain host copies."""
-    for span in spans:
-        ctypes.memmove(span.dst_ptr, span.src_ptr, span.num_bytes)
+def store_and_restore(stub, image_ptrs, image_sizes, live_bytes, src, dst):
+    """Scatter group `src` into the image, gather it back into group `dst`.
+
+    Host `memmove` rather than the copy kernel: what is under test is which
+    bytes the descriptor names, and running it on the CPU keeps the test off
+    a GPU. The same plan serves both directions, as it does in production.
+    """
+    ranges = Builder._checkpoint_slot_ranges(stub)
+    plan = plan_segmented_copy(
+        [nbytes for plane in ranges for _, nbytes in plane], image_sizes, live_bytes
+    )
+    slot_bases = Builder._checkpoint_slot_bases(stub)
+    for group, forward in ((src, True), (dst, False)):
+        descriptor = np.empty((plan.num_spans, 3), dtype=np.int64)
+        plan.write_descriptor(
+            descriptor,
+            slot_bases[group],
+            np.asarray(image_ptrs, dtype=np.int64),
+            forward=forward,
+        )
+        for source, destination, nbytes in descriptor:
+            ctypes.memmove(int(destination), int(source), int(nbytes))
 
 
 class TestCheckpointSlotRanges:
@@ -150,9 +176,16 @@ class TestCheckpointSlotRanges:
             covered |= set(range(start, start + nbytes))
 
         assert not covered & set(range(dead_start, dead_end)), "HCA is carried"
-        # The windows share the slot and are a sliding window: all of them.
-        window = range(ARENA_ROWS * ROW_BYTES, (ARENA_ROWS + ENTRY_ROWS) * ROW_BYTES)
-        assert set(window) <= covered
+        # A window is a sliding window, so every row a position reaches is
+        # carried — and the interleave padding between them is not.
+        for start, count in ENTRY_ROW_RUNS:
+            first = (ARENA_ROWS + start) * ROW_BYTES
+            assert set(range(first, first + count * ROW_BYTES)) <= covered
+        for row in ENTRY_PAD_ROWS:
+            first = (ARENA_ROWS + row) * ROW_BYTES
+            assert not covered & set(
+                range(first, first + ROW_BYTES)
+            ), "interleave padding is carried"
         # Neither the padding the arena is rounded up by nor the slot's own
         # tail alignment belongs to anyone.
         assert not covered & set(
@@ -172,7 +205,7 @@ class TestCheckpointSlotRanges:
         stub = _StubBuilder(plane)
 
         assert Builder.checkpoint_image_bytes(stub) == (
-            checkpoint_bytes_for(FIELDS) + ENTRY_ROWS * ROW_BYTES
+            checkpoint_bytes_for(FIELDS) + ENTRY_LIVE_ROWS * ROW_BYTES
         )
         assert Builder.checkpoint_image_bytes(stub) < SLOT_BYTES
 
@@ -201,12 +234,15 @@ class TestRoundTrip:
         # A checkpoint image: arbitrary units, deliberately not contiguous and
         # not in address order, which is the whole point of PAGE backing.
         units = torch.full((4, live_bytes // 2), 0x11, dtype=torch.uint8)
-        image = [ByteSegment(units[i].data_ptr(), units[i].numel()) for i in (2, 0, 3)]
-
-        src = Builder._checkpoint_slot_segments(stub, 0)
-        execute(plan_segmented_copy(src, image, live_bytes))
-        dst = Builder._checkpoint_slot_segments(stub, 1)
-        execute(plan_segmented_copy(image, dst, live_bytes))
+        chosen = (2, 0, 3)
+        store_and_restore(
+            stub,
+            [units[i].data_ptr() for i in chosen],
+            [units.shape[1]] * len(chosen),
+            live_bytes,
+            src=0,
+            dst=1,
+        )
 
         after = plane[1 * SLOT_ROWS : 2 * SLOT_ROWS].reshape(-1)
         source = plane[0 * SLOT_ROWS : 1 * SLOT_ROWS].reshape(-1)
@@ -218,11 +254,18 @@ class TestRoundTrip:
         # way on both sides, which is exactly the bug worth catching here.
         dead_start, dead_end = dead_arena_span()
         spans = field_spans()
+        entry_runs = [
+            (
+                (ARENA_ROWS + start) * ROW_BYTES,
+                (ARENA_ROWS + start + count) * ROW_BYTES,
+            )
+            for start, count in ENTRY_ROW_RUNS
+        ]
         for start, end in (
             spans["csa_main_kv"],
             spans["csa_main_score"],
             spans["state_window"],  # a draft window, behind the dead fields
-            (ARENA_ROWS * ROW_BYTES, (ARENA_ROWS + ENTRY_ROWS) * ROW_BYTES),
+            *entry_runs,
         ):
             assert torch.equal(
                 after[start:end], source[start:end]
@@ -237,21 +280,35 @@ class TestRoundTrip:
         assert torch.equal(
             after[tail:], untouched[tail:]
         ), "the slot's tail padding was overwritten"
+        for row in ENTRY_PAD_ROWS:
+            first = (ARENA_ROWS + row) * ROW_BYTES
+            assert torch.equal(
+                after[first : first + ROW_BYTES],
+                untouched[first : first + ROW_BYTES],
+            ), "the entry's interleave padding was overwritten"
 
     def test_a_restore_does_not_read_past_the_image(self, plane):
         """`total_bytes` is the image, so the tail of the last unit is spare."""
         stub = _StubBuilder(plane)
         live_bytes = Builder.checkpoint_image_bytes(stub)
         units = torch.full((live_bytes + 4096,), 0x77, dtype=torch.uint8)
-        image = [ByteSegment(units.data_ptr(), units.numel())]
+        ranges = Builder._checkpoint_slot_ranges(stub)
 
-        spans = plan_segmented_copy(
-            image, Builder._checkpoint_slot_segments(stub, 2), live_bytes
+        plan = plan_segmented_copy(
+            [nbytes for p in ranges for _, nbytes in p], [units.numel()], live_bytes
+        )
+        descriptor = np.empty((plan.num_spans, 3), dtype=np.int64)
+        plan.write_descriptor(
+            descriptor,
+            Builder._checkpoint_slot_bases(stub)[2],
+            np.array([units.data_ptr()], dtype=np.int64),
+            forward=False,
         )
 
-        assert sum(s.num_bytes for s in spans) == live_bytes
-        end = max(s.src_ptr + s.num_bytes for s in spans)
-        assert end - units.data_ptr() == live_bytes
+        assert descriptor[:, 2].sum() == live_bytes
+        assert (descriptor[:, 0] + descriptor[:, 2]).max() - units.data_ptr() == (
+            live_bytes
+        )
 
 
 class TestTheBuilderDeclaresWhatItDrops:
@@ -349,7 +406,8 @@ class TestPageUnitAddressesAreArithmetic:
 
         class _Stub:
             _page_unit_regions = Builder._page_unit_regions
-            _one_page_unit_segments = Builder._one_page_unit_segments
+            _page_unit_bases = Builder._page_unit_bases
+            _page_unit_stream_sizes = Builder._page_unit_stream_sizes
             _kv_planes = Builder._kv_planes
             model_runner = _Runner()
             pool_geometry = _Geo()
@@ -363,7 +421,7 @@ class TestPageUnitAddressesAreArithmetic:
         return _Stub(), plane, idx
 
     def sliced(self, plane, idx, block_id):
-        """What `_one_page_unit_segments` used to build, view by view."""
+        """What a PAGE unit's regions were before, view by view."""
         start = block_id * self.ENVELOPE_ROWS
         views = [plane[start : start + self.ENVELOPE_ROWS]]
         views += [idx[layer, block_id] for layer in range(self.N_CSA)]
@@ -371,13 +429,29 @@ class TestPageUnitAddressesAreArithmetic:
 
     def test_every_region_lands_where_a_slice_would_have(self):
         stub, plane, idx = self.build()
+        _, sizes = Builder._page_unit_regions(stub)
 
         for block_id in range(self.NUM_BLOCKS):
-            got = [
-                (s.ptr, s.num_bytes)
-                for s in Builder._one_page_unit_segments(stub, block_id)
-            ]
+            bases = Builder._page_unit_bases(stub, [block_id])
+            got = list(zip(map(int, bases), map(int, sizes), strict=True))
             assert got == self.sliced(plane, idx, block_id), f"block {block_id}"
+
+    def test_an_image_is_its_units_in_order_addresses_and_sizes_together(self):
+        """The plan is cut by one of these and addressed through the other.
+
+        Unit major, region minor in both. Were the two to disagree, a plan cut
+        against one order and addressed through the other would put whole
+        regions in the wrong unit — a silently wrong checkpoint, not a crash.
+        """
+        stub, plane, idx = self.build()
+        chosen = [3, 0, 4]
+
+        bases = Builder._page_unit_bases(stub, chosen)
+        sizes = Builder._page_unit_stream_sizes(stub, len(chosen))
+
+        assert list(zip(map(int, bases), map(int, sizes), strict=True)) == [
+            pair for block in chosen for pair in self.sliced(plane, idx, block)
+        ]
 
     def test_the_regions_are_worked_out_once(self):
         stub, _, _ = self.build()

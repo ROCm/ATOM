@@ -70,6 +70,11 @@ from atom.model_ops.attentions.backends import (
     AttentionMetadataBuilder,
     CommonAttentionBuilder,
 )
+from atom.model_ops.attentions.paged_state_copy import (
+    SegmentedCopyPlan,
+    launch_copy_descriptor,
+    plan_segmented_copy,
+)
 from atom.model_ops.attentions.state_arena import (
     SplitStateArena,
     StateArena,
@@ -90,6 +95,7 @@ from atom.model_ops.attentions.v4_pool_geometry import (
     HCA_RATIO,
     UnifiedPoolGeometry,
     WindowParams,
+    merge_abutting,
 )
 from atom.model_ops.v4_kernels import (
     FP4_MQA_BLOCK_K,
@@ -610,7 +616,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # Filled on the first checkpoint copy — the pools do not exist yet here.
         self._slot_view_cache: list[list[torch.Tensor]] | None = None
         self._checkpoint_range_cache: list[list[tuple[int, int]]] | None = None
-        self._page_unit_region_cache: list[tuple[int, int]] | None = None
+        self._page_unit_region_cache: tuple[np.ndarray, np.ndarray] | None = None
+        self._checkpoint_plan_cache: SegmentedCopyPlan | None = None
+        self._checkpoint_slot_base_cache: np.ndarray | None = None
 
     @property
     def prep_stream(self):
@@ -797,7 +805,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             # v2: an image holds part of a slot, not all of it. Two workers
             # disagreeing about which part would read one image at two
             # layouts, so `nocopy` names the rule and the version fences it.
-            "dsv4-paged-state-v2"
+            # v3: it also drops the entry's interleave padding, so the image
+            # is no longer a subsequence of the slot's rows and a v2 reader
+            # would gather every window row shifted.
+            "dsv4-paged-state-v3"
             f":block={self.block_size}:ring={self.win_with_spec}"
             f":dims={self.head_dim},{self.rope_head_dim},{self.index_head_dim}"
             f":state={self.csa_main_state_shape},{self.csa_idx_state_shape},"
@@ -806,6 +817,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             f":index={'fp4' if self._indexer_fp4 else 'fp8'}"
             f":ratios={ratios}"
             f":nocopy={nocopy}"
+            ":entry=packed"
         )
         return StateTransfer.copy(layout_id)
 
@@ -824,25 +836,31 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         store_ops: Sequence[CheckpointStoreOp],
         restore_ops: Sequence[CheckpointRestoreOp],
     ) -> None:
-        """Copy raw checkpoint bytes between slots and non-contiguous PAGEs."""
-        from atom.model_ops.attentions.paged_state_copy import (
-            launch_copy_spans,
-            plan_segmented_copy,
-        )
+        """Copy raw checkpoint bytes between slots and non-contiguous PAGEs.
 
-        spans = []
-        device = self._kv_planes()[0].device
-        for op in store_ops:
+        Every op of either direction goes into one descriptor and one launch.
+        A store and a restore are the same intersection read opposite ways, so
+        they share the plan too.
+        """
+        ops = [(op, True) for op in store_ops] + [(op, False) for op in restore_ops]
+        if not ops:
+            return
+        for op, _ in ops:
             self._validate_paged_state_op(op)
-            src = self._checkpoint_slot_segments(op.src_slot)
-            dst = self._page_unit_segments(op.unit_ids)
-            spans.extend(plan_segmented_copy(src, dst, op.total_bytes))
-        for op in restore_ops:
-            self._validate_paged_state_op(op)
-            src = self._page_unit_segments(op.unit_ids)
-            dst = self._checkpoint_slot_segments(op.dst_slot)
-            spans.extend(plan_segmented_copy(src, dst, op.total_bytes))
-        launch_copy_spans(spans, device)
+
+        plan = self._checkpoint_copy_plan()
+        slot_bases = self._checkpoint_slot_bases()
+        per_op = plan.num_spans
+        descriptor = np.empty((len(ops) * per_op, 3), dtype=np.int64)
+        for i, (op, storing) in enumerate(ops):
+            group = op.src_slot if storing else op.dst_slot
+            plan.write_descriptor(
+                descriptor[i * per_op : (i + 1) * per_op],
+                slot_bases[group],
+                self._page_unit_bases(op.unit_ids),
+                forward=storing,
+            )
+        launch_copy_descriptor(descriptor, plan.widest, self._kv_planes()[0].device)
 
     def _validate_paged_state_op(
         self, op: CheckpointStoreOp | CheckpointRestoreOp
@@ -873,23 +891,39 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
         A slot is a request's compressor state and then its sliding windows
         (`v4_pool_geometry`). The two halves answer differently: a window is a
-        sliding window, so a resumer needs it whole, while most of the state
-        is dead at a boundary and says so through `StateField.in_checkpoint`.
-        What falls between them — the padding the state's byte count is
-        rounded up by, and the slot's own tail alignment — belongs to neither.
+        sliding window, so a resumer needs every row of it, while most of the
+        state is dead at a boundary and says so through
+        `StateField.in_checkpoint`.
+
+        Three kinds of byte belong to neither and are left out: the padding
+        the state's byte count is rounded up by, the slot's own tail
+        alignment, and the entry's interleave padding — rows no `ring_row`
+        reaches, so no window is missing anything without them
+        (`UnifiedPoolGeometry.entry_row_runs`).
 
         A property of the layout, not of any one slot, so it is computed once.
         """
         if self._checkpoint_range_cache is None:
             self._assert_ratios_divide_block()
             geo = self.pool_geometry
-            cache = []
-            for fields, width in zip(
-                self._arena_planes, self._plane_row_widths(), strict=True
-            ):
-                windows = (geo.arena_rows * width, geo.entry_rows * width)
-                cache.append([*checkpoint_ranges_for(fields), windows])
-            self._checkpoint_range_cache = cache
+            # Rows, so the same for every plane; only the width they are
+            # priced at differs.
+            window_runs = geo.entry_row_runs()
+            self._checkpoint_range_cache = [
+                # The last state field can end exactly where the entry begins.
+                merge_abutting(
+                    [
+                        *checkpoint_ranges_for(fields),
+                        *(
+                            ((geo.arena_rows + start) * width, count * width)
+                            for start, count in window_runs
+                        ),
+                    ]
+                )
+                for fields, width in zip(
+                    self._arena_planes, self._plane_row_widths(), strict=True
+                )
+            ]
         return self._checkpoint_range_cache
 
     def checkpoint_image_bytes(self) -> int:
@@ -918,19 +952,63 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 "is no longer dead"
             )
 
-    def _checkpoint_slot_segments(self, group: int):
-        from atom.model_ops.attentions.paged_state_copy import ByteSegment
+    def _checkpoint_copy_plan(self) -> SegmentedCopyPlan:
+        """Where a slot's checkpoint ranges meet a whole image's PAGE regions.
 
-        return [
-            ByteSegment(view.data_ptr() + offset, nbytes)
-            for view, ranges in zip(
-                self._slot_views()[group], self._checkpoint_slot_ranges(), strict=True
+        Both streams are geometry. The ranges come from the layout, and every
+        image is `units_per_checkpoint` units of identical region sizes —
+        `_validate_paged_state_op` refuses anything else. So the cut points are
+        the same for every store and every restore this worker will ever do,
+        and the walk that finds them runs once instead of once an op.
+        """
+        if self._checkpoint_plan_cache is None:
+            spec = self.model_runner.state_runtime.checkpoint_spec
+            self._checkpoint_plan_cache = plan_segmented_copy(
+                [
+                    nbytes
+                    for ranges in self._checkpoint_slot_ranges()
+                    for _, nbytes in ranges
+                ],
+                # Sizes from the same array `_page_unit_bases` takes addresses
+                # from, tiled the way it ravels. Spelling the destination
+                # stream out a second time here would let the two orders
+                # diverge, and a plan cut against one order and addressed
+                # through the other lands whole regions in the wrong unit.
+                self._page_unit_stream_sizes(spec.units_per_checkpoint),
+                spec.image_bytes,
             )
-            for offset, nbytes in ranges
-        ]
+        return self._checkpoint_plan_cache
 
-    def _page_unit_regions(self) -> list[tuple[int, int]]:
-        """`(base, num_bytes)` per region a PAGE block id owns.
+    def _checkpoint_slot_bases(self) -> np.ndarray:
+        """`[group, segment]` start address of every source segment of a copy.
+
+        One row per pool group, segments in the order
+        `_checkpoint_slot_ranges` walks the planes — which is the order
+        `_checkpoint_copy_plan` built the source stream in, so a plan's
+        segment indices address a row of this directly.
+
+        Materialized rather than recomputed because a group's slot sits at a
+        fixed address for the pool's whole life, which leaves the entire
+        per-op source side as one row lookup.
+        """
+        if self._checkpoint_slot_base_cache is None:
+            self._checkpoint_slot_base_cache = np.array(
+                [
+                    [
+                        view.data_ptr() + offset
+                        for view, ranges in zip(
+                            views, self._checkpoint_slot_ranges(), strict=True
+                        )
+                        for offset, _ in ranges
+                    ]
+                    for views in self._slot_views()
+                ],
+                dtype=np.int64,
+            )
+        return self._checkpoint_slot_base_cache
+
+    def _page_unit_regions(self) -> tuple[np.ndarray, np.ndarray]:
+        """Base address and per-block stride of every region a PAGE id owns.
 
         Blocks sit back to back in every pool, so a block's stride there is
         its size and its address is `base + block_id * num_bytes` — affine,
@@ -939,18 +1017,22 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         built 22 views per unit per op and threw them away to learn addresses
         that are one multiplication each.
 
-        `tensor_segment`'s contiguity check comes along: the same check, asked
-        once of the layout instead of every time of a slice.
+        Two arrays rather than a list of pairs because both callers want
+        columns: one multiplies the strides by an id, the other tiles them.
+
+        The contiguity a slice would have been checked for is asked here
+        instead: once of the layout, rather than every time of a slice.
         """
         if self._page_unit_region_cache is None:
             geo = self.pool_geometry
-            regions: list[tuple[int, int]] = []
+            bases, strides = [], []
             for plane, width in zip(
                 self._kv_planes(), self._plane_row_widths(), strict=True
             ):
                 if not plane.is_contiguous():
                     raise RuntimeError("a KV plane must be contiguous to be copied")
-                regions.append((plane.data_ptr(), geo.envelope_rows * width))
+                bases.append(plane.data_ptr())
+                strides.append(geo.envelope_rows * width)
             runner = self.model_runner
             pools = [runner.v4_csa_idx_kv]
             if self._indexer_fp4:
@@ -962,29 +1044,29 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                     )
                 per_layer = pool.stride(0) * pool.element_size()
                 per_block = pool.stride(1) * pool.element_size()
-                regions += [
-                    (pool.data_ptr() + layer * per_layer, per_block)
-                    for layer in range(len(self.csa_layers))
-                ]
-            self._page_unit_region_cache = regions
+                for layer in range(len(self.csa_layers)):
+                    bases.append(pool.data_ptr() + layer * per_layer)
+                    strides.append(per_block)
+            self._page_unit_region_cache = (
+                np.array(bases, dtype=np.int64),
+                np.array(strides, dtype=np.int64),
+            )
         return self._page_unit_region_cache
 
-    def _one_page_unit_segments(self, block_id: int):
-        """Every physical region one logical DSV4 PAGE block id owns."""
-        from atom.model_ops.attentions.paged_state_copy import ByteSegment
+    def _page_unit_bases(self, unit_ids: Sequence[int]) -> np.ndarray:
+        """Start address of every destination segment of one image.
 
-        return [
-            ByteSegment(base + block_id * nbytes, nbytes)
-            for base, nbytes in self._page_unit_regions()
-        ]
+        A unit's regions are each at `base + id * stride`, so an image's worth
+        is one outer product. Unit major, region minor — the order
+        `_checkpoint_copy_plan` built the destination stream in.
+        """
+        base, stride = self._page_unit_regions()
+        ids = np.asarray(unit_ids, dtype=np.int64)
+        return (base + np.multiply.outer(ids, stride)).ravel()
 
-    def _page_unit_segments(self, unit_ids):
-        segments = []
-        for block_id in unit_ids:
-            if not 0 <= block_id < self.model_runner.num_physical_kvcache_blocks:
-                raise RuntimeError(f"PAGE unit id {block_id} is out of range")
-            segments.extend(self._one_page_unit_segments(block_id))
-        return segments
+    def _page_unit_stream_sizes(self, units: int) -> np.ndarray:
+        """Bytes in each destination segment of an image of `units` units."""
+        return np.tile(self._page_unit_regions()[1], units)
 
     def _slot_views(self) -> list[list[torch.Tensor]]:
         """Per-group views of that request's whole slot in each plane.

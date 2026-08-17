@@ -10,6 +10,8 @@ view that addresses it. So the tests enumerate addresses and check them
 pairwise rather than comparing against a restatement of the same expression.
 """
 
+from itertools import pairwise
+
 import pytest
 
 from atom.model_ops.attentions.v4_pool_geometry import (
@@ -17,6 +19,7 @@ from atom.model_ops.attentions.v4_pool_geometry import (
     CSA_RATIO,
     DENSE_RATIO,
     HCA_RATIO,
+    ClassLayout,
     UnifiedPoolGeometry,
     entry_rows_for,
     ring_offset_for,
@@ -123,6 +126,104 @@ class TestRingConstruction:
                     assert row not in seen, (row, seen.get(row), (layer, pos))
                     seen[row] = (layer, pos)
                     assert row < entry_rows_for(num_layers, stride, ring_slots)
+
+
+class TestTheRowsAWindowActuallyReaches:
+    """`entry_row_runs` against the addresses, not against its own algebra.
+
+    A checkpoint image leaves out whatever these runs do not cover, so the
+    claim under test is exactly "no `(layer, position)` maps there". Getting
+    it wrong loses window rows silently — a resumer reads stale KV at the far
+    end of its window, which costs a fraction of a point and crashes nothing.
+    """
+
+    @staticmethod
+    def reached(num_layers, stride, ring_slots):
+        return {
+            layer * stride + ring_offset_for(num_layers, stride, pos)
+            for layer in range(num_layers)
+            for pos in range(ring_slots)
+        }
+
+    @staticmethod
+    def covered(runs):
+        return {row for start, count in runs for row in range(start, start + count)}
+
+    def test_the_runs_are_exactly_the_reachable_rows(self):
+        for num_layers in (1, 2, 3, 5, 20, 21):
+            for stride in (1, 2, 3, 7, 64):
+                for ring_slots in (1, 2, 5, 64, 128, 131, 133):
+                    if ring_slots < stride:
+                        continue
+                    cls = ClassLayout(
+                        ratio=4,
+                        layers=tuple(range(num_layers)),
+                        block_rows=0,
+                        ring_stride=stride,
+                        ring_slots=ring_slots,
+                        envelope_offset=0,
+                        entry_offset=0,
+                    )
+                    what = (num_layers, stride, ring_slots)
+                    assert self.covered(cls.entry_row_runs()) == self.reached(
+                        num_layers, stride, ring_slots
+                    ), what
+
+    def test_the_runs_are_ordered_disjoint_and_inside_the_entry(self):
+        for cls in flash_geometry().classes.values():
+            runs = cls.entry_row_runs()
+            assert runs == sorted(runs)
+            for (a_start, a_count), (b_start, _) in pairwise(runs):
+                assert a_start + a_count <= b_start
+            for start, count in runs:
+                assert 0 <= start and start + count <= cls.entry_rows
+
+    def test_what_they_leave_out_is_what_the_interleave_costs(self):
+        for cls in flash_geometry().classes.values():
+            packed = sum(count for _, count in cls.entry_row_runs())
+            assert packed == cls.num_layers * cls.ring_slots
+            assert cls.entry_rows - packed >= 0
+
+    def test_a_window_that_divides_the_stride_leaves_nothing_out(self):
+        """No partial ring run, so the whole class is one contiguous range."""
+        cls = ClassLayout(
+            ratio=4,
+            layers=tuple(range(21)),
+            block_rows=0,
+            ring_stride=64,
+            ring_slots=128,
+            envelope_offset=0,
+            entry_offset=0,
+        )
+
+        assert cls.entry_row_runs() == [(0, 21 * 128)]
+
+    def test_the_pool_offsets_each_class_and_merges_where_they_meet(self):
+        geo = flash_geometry()
+
+        runs = geo.entry_row_runs()
+        covered = self.covered(runs)
+
+        assert sum(count for _, count in runs) == sum(
+            c.num_layers * c.ring_slots for c in geo.classes.values()
+        )
+        assert covered == {
+            cls.entry_offset + row
+            for cls in geo.classes.values()
+            for row in self.reached(cls.num_layers, cls.ring_stride, cls.ring_slots)
+        }
+        assert max(row for row in covered) < geo.entry_rows
+
+    def test_every_window_index_lands_in_a_run(self):
+        """The formula the kernels use, checked against the runs directly."""
+        geo = flash_geometry()
+        covered = self.covered(geo.entry_row_runs())
+
+        for layer_id, ratio in enumerate(FLASH_RATIOS):
+            cls = geo.layer_class(layer_id)
+            for pos in range(geo.ring_slots):
+                row = cls.entry_offset + cls.ring_row(cls.layer_index(layer_id), pos)
+                assert row in covered, (layer_id, ratio, pos, row)
 
 
 class TestFlashLayout:
