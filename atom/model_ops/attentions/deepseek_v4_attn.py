@@ -613,7 +613,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self._alloc_v4_metadata_buffers()
 
         self._ubatch_decode_meta: list | None = None
-        # Filled on the first checkpoint copy — the pools do not exist yet here.
+        # Filled on the first checkpoint copy — the pools do not exist yet
+        # here. Four of the five hold raw addresses read out of the pool
+        # tensors, so they are only valid because `allocate_per_req_cache`
+        # runs exactly once and nothing reallocates a plane afterwards. An
+        # elastic pool, which `v4_pool_geometry` is built to allow, has to
+        # reset them: a stale one is not a crash, it is a copy to the wrong
+        # address.
         self._slot_view_cache: list[list[torch.Tensor]] | None = None
         self._checkpoint_range_cache: list[list[tuple[int, int]]] | None = None
         self._page_unit_region_cache: tuple[np.ndarray, np.ndarray] | None = None

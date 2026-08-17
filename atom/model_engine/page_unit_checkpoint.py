@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 
 from atom.model_engine.block_pool import BlockPool
@@ -174,29 +174,52 @@ class PageUnitCheckpointStore:
 
     def ensure_free_units(self, count: int) -> bool:
         while self.pool.num_free < count:
-            victim = next(
-                (
-                    cid
-                    for cid in self._lru
-                    if self.records[cid].state == READY
-                    and self.records[cid].pin_count == 0
-                ),
-                -1,
-            )
+            victim = next(self._evictable(), -1)
             if victim < 0:
                 return False
             self._evict(victim)
         return True
+
+    def _evictable(self) -> Iterator[int]:
+        """Checkpoints a caller may reclaim units from, oldest first."""
+        return (
+            cid
+            for cid in self._lru
+            if self.records[cid].state == READY and self.records[cid].pin_count == 0
+        )
+
+    def reclaimable_units(self) -> int:
+        """Units `ensure_free_units` could still add to the free list.
+
+        The ceiling on what any request for free units can reach, which is
+        what lets a caller find out it will fail before eviction has done
+        anything on its behalf.
+        """
+        return sum(len(self.records[cid].unit_ids) for cid in self._evictable())
 
     def begin_store(self, prefix_hash: int, src_slot: int) -> CheckpointStoreOp | None:
         if self.lookup(prefix_hash) >= 0 or prefix_hash in self._pending_by_hash:
             return None
         needed = self.units_per_checkpoint
         # Leave `reserve_units` behind. A checkpoint is best-effort and a live
-        # KV block is not: `_fresh_block` raises when the pool is dry, so a
-        # store that took the last units would turn "no checkpoint this time"
-        # into a crash. Dropping instead is the same answer the pool already
-        # gives when nothing can be evicted, one step earlier.
+        # KV block is not: `_fresh_block` raises when the pool is dry and
+        # nothing is evictable, and `BlockManager.allocate` pins a restore
+        # before asking for fresh blocks in the same pass — so a pass of
+        # prefix hits can make the whole cache unevictable and then need a
+        # block. The floor is one pass's worth of them, which is what keeps
+        # that pass from ever having to evict. See
+        # `BlockManager._checkpoint_reserve_units`.
+        #
+        # Ask whether the floor is reachable BEFORE asking to reach it.
+        # `ensure_free_units` gives up only once it has evicted every
+        # checkpoint it can, so a bare request for `needed + reserve` empties
+        # the whole cache and still refuses, every batch, for as long as live
+        # KV holds the rest of the pool — the units it freed go to live KV,
+        # but `_fresh_block` already takes those on demand, one at a time, at
+        # the moment they are actually needed. A store that will be dropped
+        # has to cost nothing.
+        if self.pool.num_free + self.reclaimable_units() < needed + self.reserve_units:
+            return None
         if not self.ensure_free_units(needed + self.reserve_units):
             return None
 

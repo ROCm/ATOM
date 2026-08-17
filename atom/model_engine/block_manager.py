@@ -113,12 +113,12 @@ class BlockManager:
         checkpoint_spec = state_runtime.checkpoint_spec
         self.paged_state_checkpoints: PagedStateCheckpointCoordinator | None = None
         if checkpoint_spec is not None:
+            enabled = self.enable_prefix_caching and self.num_per_req_cache_groups > 0
             self.paged_state_checkpoints = PagedStateCheckpointCoordinator(
                 self.kv,
                 checkpoint_spec,
-                enabled=self.enable_prefix_caching
-                and self.num_per_req_cache_groups > 0,
-                reserve_units=self._checkpoint_reserve_units(config),
+                enabled=enabled,
+                reserve_units=self._checkpoint_reserve_units(config, enabled),
             )
         self.state = StateGroupPool(
             self.num_per_req_cache_groups,
@@ -220,30 +220,42 @@ class BlockManager:
         self.kv.allocate(block_id)
         return block_id
 
-    def _checkpoint_reserve_units(self, config) -> int:
+    def _checkpoint_reserve_units(self, config, enabled: bool) -> int:
         """PAGE units a checkpoint store has to leave for live KV.
 
         A checkpoint is best-effort; a KV block is not — `_fresh_block` raises
-        when the pool is dry. But a store's units are unreclaimable until the
-        next `complete_previous_state_batch` publishes them, so a burst of
-        stores can empty the free list and the raise lands on whichever live
-        request asks next.
+        when the pool is dry and nothing is evictable. It can normally always
+        evict one, because a checkpoint is only unevictable while it is
+        `COPYING` or pinned by a restore, and `schedule` publishes the
+        previous batch's stores before it allocates anything.
 
-        One batch is exactly how long that window is, so one batch's worth of
-        new blocks is what has to survive it: a chunk of prefill, plus at most
-        one append per running sequence.
+        `allocate` is where that breaks. It pins a restore and then asks for
+        fresh blocks *in the same pass*, and the pin holds until the next
+        `complete_previous_state_batch`. So a pass of prefix hits can pin
+        every checkpoint it resumes from and then find nothing left to evict —
+        and the raise lands on whichever live request asks next.
+
+        Hence a floor of one pass's worth of new blocks: a chunk of prefill,
+        plus at most one append per running sequence. Entering a pass above
+        it, that pass never has to evict at all, so how much of the cache it
+        pins stops mattering. The floor is not sized for the unevictable set;
+        it is sized so the set is never consulted.
         """
         batched = int(getattr(config, "max_num_batched_tokens", 0) or 0)
         seqs = int(getattr(config, "max_num_seqs", 0) or 0)
-        reserve = -(-batched // self.block_size) + seqs
+        prefill = -(-batched // self.block_size)
+        reserve = prefill + seqs
         # Logged because it is derived, not configured: a zero here says the
         # batch shape was not readable and the floor is not actually in place.
-        logger.info(
-            "state checkpoint reserve: %d PAGE units (%d prefill + %d append)",
-            reserve,
-            -(-batched // self.block_size),
-            seqs,
-        )
+        # Not logged when no store will ever ask for it, which would report a
+        # floor that is never consulted.
+        if enabled:
+            logger.info(
+                "state checkpoint reserve: %d PAGE units (%d prefill + %d append)",
+                reserve,
+                prefill,
+                seqs,
+            )
         return reserve
 
     def _has_page_units(
