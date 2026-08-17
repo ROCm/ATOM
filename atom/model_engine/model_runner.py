@@ -1471,9 +1471,9 @@ class ModelRunner:
                 return int(num_stages)
             from atom.models.deepseek_v4_dspark import _count_dspark_stages
 
-            counted = _count_dspark_stages(getattr(self.config, "model", None))
-            if counted > 0:
-                return counted
+            num_stages = _count_dspark_stages(getattr(self.config, "model", None))
+            if num_stages > 0:
+                return num_stages
         return getattr(draft_hf, "num_nextn_predict_layers", 1)
 
     def _get_local_num_target_layers(self) -> int:
