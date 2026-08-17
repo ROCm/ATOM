@@ -200,6 +200,35 @@ def _coerce_n(requested_n: int | None, temperature: float | None) -> int:
     return n
 
 
+def _completion_effective_n(request: CompletionRequest) -> int:
+    """Resolve ``n`` while preserving explicit heterogeneous token rows.
+
+    Greedy ``n > 1`` is normally collapsed because cloning one prompt would
+    only duplicate work.  A nested token prompt is different: every row is an
+    independent request, and ``n`` selects the number of rows rather than the
+    number of samples from one prompt.  Those rows must remain separate even
+    at temperature zero so deterministic heterogeneous-batch profiling is
+    possible.
+    """
+    prompt = request.prompt
+    is_nested_token_prompt = (
+        isinstance(prompt, list)
+        and bool(prompt)
+        and isinstance(prompt[0], list)
+    )
+    if not is_nested_token_prompt:
+        return _coerce_n(request.n, request.temperature)
+
+    # Normalize malformed/zero values without applying the greedy collapse.
+    effective_n = _coerce_n(request.n, 1.0)
+    if effective_n != len(prompt):
+        raise ValueError(
+            "nested prompt count must match n: "
+            f"len(prompt)={len(prompt)} vs n={effective_n}"
+        )
+    return effective_n
+
+
 def _validate_context_length(
     num_prompt_tokens: int,
     max_tokens: int,
@@ -679,7 +708,7 @@ async def generate_async_multimodal(
 
 
 async def generate_async_fanout(
-    prompt_or_tokens: str | list[int],
+    prompt_or_tokens: str | list[int] | list[list[int]],
     sampling_params: SamplingParams,
     request_id: str,
     kv_transfer_params: dict[str, Any] | None = None,
@@ -728,6 +757,31 @@ async def generate_async_fanout(
     stream_callbacks = [make_callback(i) for i in range(n)]
 
     def do_preprocess():
+        if (
+            isinstance(prompt_or_tokens, list)
+            and prompt_or_tokens
+            and isinstance(prompt_or_tokens[0], list)
+        ):
+            from dataclasses import replace
+
+            if len(prompt_or_tokens) != n:
+                raise ValueError(
+                    "nested prompt count must match n: "
+                    f"{len(prompt_or_tokens)=} vs {n=}"
+                )
+            per_request_sampling = replace(sampling_params, n=1)
+            return [
+                engine.io_processor.preprocess(
+                    prompt,
+                    per_request_sampling,
+                    stream_callback=stream_callbacks[index],
+                    kv_transfer_params=kv_transfer_params,
+                    multimodal_data=multimodal_data,
+                    request_id=f"{request_id}-{index}",
+                    data_parallel_rank=data_parallel_rank,
+                )
+                for index, prompt in enumerate(prompt_or_tokens)
+            ]
         return engine.io_processor.preprocess_fanout(
             prompt_or_tokens,
             sampling_params,
@@ -1457,7 +1511,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
     validate_model(request.model)
 
     try:
-        effective_n = _coerce_n(request.n, request.temperature)
+        effective_n = _completion_effective_n(request)
         sampling_params = _build_sampling_params(
             temperature=request.temperature,
             max_tokens=request.get_max_tokens(),

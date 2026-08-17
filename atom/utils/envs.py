@@ -64,6 +64,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
     "ATOM_USE_TRITON_MOE_DECODE": lambda: os.getenv("ATOM_USE_TRITON_MOE_DECODE", "0")
     == "1",
+    # Experimental only: publish plain-MTP target/verify results before the
+    # next draft extension. DSV4 c4/c8/c16 A/B is workload-equivalent after
+    # retaining async-D2H source tensors, but keep this off by default until a
+    # full eval covers model/backend combinations beyond the validated path.
+    "ATOM_DEFER_MTP_PROPOSAL": lambda: (
+        os.getenv("ATOM_DEFER_MTP_PROPOSAL", "0") == "1"
+    ),
+    # Experimental companion to deferred proposal: once the scheduler proves
+    # every sequence in the just-run batch is terminal, drain the unconsumed
+    # lookahead generation instead of extending it with another draft.
+    "ATOM_CANCEL_TERMINAL_MTP_PROPOSAL": lambda: (
+        os.getenv("ATOM_CANCEL_TERMINAL_MTP_PROPOSAL", "0") == "1"
+    ),
+    # Safe narrow optimization: a pure final-prefill batch where every request
+    # has max_tokens=1 can publish the sampled token directly and skip a draft
+    # generation that no request can consume.  Checkpoint-producing batches
+    # remain excluded by ModelRunner's follow-up-state guard.
+    "ATOM_TERMINAL_MTP_FAST_PATH": lambda: (
+        os.getenv("ATOM_TERMINAL_MTP_FAST_PATH", "1") == "1"
+    ),
     "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
     # --- Kernel Fusion Toggles ---
     # fused_compress_attn: switch between Triton (default historical) and a

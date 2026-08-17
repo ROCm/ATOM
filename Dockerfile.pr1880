@@ -1,0 +1,13 @@
+FROM rocm/atom-dev:latest
+
+ARG ATOM_PR_SHA=47c18899b766a6ffd13b522c7d4295a3d4116048
+
+RUN rm -rf /app/ATOM
+COPY . /app/ATOM
+RUN test "$(git -C /app/ATOM rev-parse HEAD)" = "${ATOM_PR_SHA}" \
+    && python -m pip install --no-deps -e /app/ATOM
+
+LABEL org.opencontainers.image.source="https://github.com/ROCm/ATOM/pull/1880" \
+      org.opencontainers.image.revision="${ATOM_PR_SHA}"
+
+WORKDIR /app/ATOM

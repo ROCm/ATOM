@@ -142,6 +142,27 @@ class TestCoerceN:
         assert api_server._coerce_n(1, 0.0) == 1
 
 
+class TestCompletionEffectiveN:
+    def test_greedy_nested_token_rows_remain_independent(self):
+        request = api_server.CompletionRequest(
+            prompt=[[10, 11], [20]], temperature=0.0, n=2
+        )
+        assert api_server._completion_effective_n(request) == 2
+
+    def test_greedy_single_prompt_still_collapses_duplicate_samples(self):
+        request = api_server.CompletionRequest(
+            prompt=[10, 11], temperature=0.0, n=2
+        )
+        assert api_server._completion_effective_n(request) == 1
+
+    def test_nested_token_row_count_must_match_n(self):
+        request = api_server.CompletionRequest(
+            prompt=[[10, 11], [20]], temperature=0.0, n=3
+        )
+        with pytest.raises(ValueError, match="nested prompt count must match n"):
+            api_server._completion_effective_n(request)
+
+
 class TestBuildSamplingParams:
     """``_build_sampling_params`` threads ``n`` into SamplingParams."""
 
