@@ -149,13 +149,14 @@ jobs:
             lm_eval_num_fewshot: 5
             accuracy_test_threshold: 0.93
             runner: atom-mi355-8gpu-vllm-sgl-ci
-          - display_name: "Kimi-K2.7-MXFP4 TP4"
-            model_name: "Kimi-K2.7-Code-MXFP4"
-            model_path: "amd/Kimi-K2.7-Code-MXFP4"
-            extra_args: "--trust-remote-code --tensor-parallel-size 4 --max-num-batched-tokens 16384 --max-model-len 16384"
-            env_vars: "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
-            lm_eval_num_fewshot: 3
-            accuracy_test_threshold: 0.92
+          - display_name: "Kimi-K3 TP8"
+            model_name: "Kimi-K3"
+            model_path: "moonshotai/Kimi-K3"
+            client_command: "lm_eval --model local-completions --model_args model=${MODEL_PATH},base_url=http://127.0.0.1:${VLLM_PORT}/v1/completions,num_concurrent=64,max_retries=3,tokenized_requests=False,trust_remote_code=True --tasks gsm8k --num_fewshot ${LM_EVAL_NUM_FEWSHOT} --output_path ${OUTPUT_PATH}"
+            extra_args: "--trust-remote-code --language-model-only --tensor-parallel-size 8 --kv-cache-dtype fp8 --max-model-len 16384 --max-num-seqs 64 --max-num-batched-tokens 16384 --gpu-memory-utilization 0.93 --block-size 128 --no-enable-prefix-caching --compilation-config '{\"cudagraph_mode\":\"FULL_AND_PIECEWISE\"}' --additional-config '{\"online_quant_config\":{\"global_quant_config\":\"ptpc_fp8\",\"exclude_layer\":[\"lm_head\",\"model.embed_tokens\",\"*self_attn.[qkv]_conv1d*\",\"*block_sparse_moe.experts*\",\"*block_sparse_moe.routed_expert_*\",\"*vision_tower*\",\"*mm_projector*\"]}}'"
+            env_vars: "AITER_DISABLE_FMHA_OPUS=1"
+            lm_eval_num_fewshot: 5
+            accuracy_test_threshold: 0.95
             runner: atom-mi355-8gpu-vllm-sgl-ci
           - display_name: "Qwen3.5-397B-A17B-MXFP4 TP4"
             model_name: "Qwen3.5-397B-A17B-MXFP4"

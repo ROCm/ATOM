@@ -58,6 +58,7 @@ class Sequence:
         multimodal_data: dict | None = None,
         mrope_positions: np.ndarray | None = None,
         mrope_position_delta: int = 0,
+        data_parallel_rank: int | None = None,
     ):
         # Built here rather than as a default argument: one instance shared by
         # every defaulting Sequence would be a mutable default in all but name.
@@ -129,14 +130,6 @@ class Sequence:
         # exactly one forward. -1 = read and write the same group, the case for
         # every step in between.
         self.state_fork_src = -1
-        # Content hash of a boundary this seq's last forward landed on and whose
-        # state is worth keeping, for state classes that checkpoint by copying
-        # (`StateGroupPool.checkpoint`). The copy needs a forward to issue it, so
-        # the intent outlives the step that formed it; `StateGroupPool.take_copies`
-        # turns it into a destination group and a copy pair when the next batch
-        # is built.
-        # -1 = nothing pending, which is also what `deallocate` restores.
-        self.pending_checkpoint = -1
         self.temperature = sampling_params.temperature
         self.top_k = sampling_params.top_k
         self.top_p = sampling_params.top_p
@@ -198,6 +191,9 @@ class Sequence:
         # to safe values for single-sample requests.
         self.parent_request_id = parent_request_id
         self.sibling_index = sibling_index
+        # Explicitly requested DP rank, e.g. for cache aware DP routing.
+        # Consumed by CoreManager._dispatch_to_dp_ranks as a routing hint.
+        self.data_parallel_rank = data_parallel_rank
 
     def __len__(self):
         return self._num_tokens
