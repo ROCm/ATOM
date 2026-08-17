@@ -3702,7 +3702,9 @@ class ModelRunner:
         _piecewise = self._piecewise_cg_active()
         # AF_PIECEWISE: also capture the attn core (ragged combos below)
         cudagraph_mode = getattr(self.config.compilation_config, "cudagraph_mode", None)
-        af_piecewise = cudagraph_mode is not None and cudagraph_mode.is_af_piecewise()
+        attn_ffn_piecewise = (
+            cudagraph_mode is not None and cudagraph_mode.is_attn_ffn_piecewise()
+        )
         if _piecewise:
             logger.info(
                 "PIECEWISE cudagraph: capturing per-piece graphs (attention "
@@ -3916,7 +3918,7 @@ class ModelRunner:
                         self._piecewise_captured_tokens.add(num_tokens)
                         # also capture attn-core for this bs's ragged combos
                         # (see _capture_attn_core_ragged_combos)
-                        if af_piecewise and supports_ragged_capture:
+                        if attn_ffn_piecewise and supports_ragged_capture:
                             self._capture_attn_core_ragged_combos(
                                 bs=bs,
                                 max_q_len=max_q_len,

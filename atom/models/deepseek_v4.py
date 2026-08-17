@@ -73,6 +73,10 @@ from atom.model_loader.loader import WeightsMapper
 # code as opaque; Indexer.forward_batched dispatches via the latter to hide
 # its dynamic-shape internals from Dynamo / fake-tensor mode.
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
+from atom.model_ops.attn_ffn_piecewise import (
+    BufferShape,
+    DecodeAttnFfnPiecewise,
+)
 from atom.model_ops.communication_op import (
     tensor_model_parallel_all_reduce,
 )
@@ -171,80 +175,86 @@ def _v4_attention_fake(
 # Owns its isolated graph pool + per-key graph cache + output buffers.
 _v4_attn_runner = CudagraphCaptureRunner()
 
-# Max decode num_tokens the pub buffers cover (= their row count). Larger
-# num_tokens (prefill / huge concat) skip zero-copy and take the copy path.
-_V4_ATTN_QPUB_MAX = 512
 
-# zero-copy arg indices. All 9 args are zero-copy EXCEPT positions(5): including it
-# drops ~2pts (cumulative padding-tail regression, see memory). x(0) is zero-copy —
-# it's the upstream dense-piece output, already at a fixed address.
-# ATOM_ATTN_ZC overrides (=empty: all-copy). See memory af-piecewise-zerocopy-tail.
-_V4_ATTN_ZC = (
-    frozenset(int(i) for i in os.environ["ATOM_ATTN_ZC"].split(",") if i.strip() != "")
-    if "ATOM_ATTN_ZC" in os.environ
-    else frozenset({0, 1, 2, 3, 4, 6, 7, 8})
-)
+class V4AttnFfn(DecodeAttnFfnPiecewise):
+    """V4's captured attention core. Owned by DeepseekV4Attention, not inherited
+    by it -- the layer holds one of these and forwards to it."""
 
+    # Inputs come from `core` below; none excluded from zero-copy (`positions`
+    # was, until 71a3e941 fixed the stale ragged lens that actually caused it).
+    # Rows the buffers cover; longer steps (prefill) take the copy path.
+    max_tokens = 512
 
-class _V4AttnZeroCopyBuffers:
-    """Fixed-address public buffers for one attention layer's AF_PIECEWISE zero-copy
-    inputs, plus the inplace-out flags. Allocated post-load from a dummy forward
-    (shapes/dtypes vary by quant cfg). _attn_pre stages each per-step input into its
-    buffer so the attn-core cudagraph reads a constant address (no per-step copy).
-    Token axis is ALWAYS dim 0 for every staged tensor."""
+    def describe_staging_buffers(self) -> dict:
+        """Measure the buffers by running V4's own projection chain once on a
+        dummy input -- shapes and dtypes vary with the quant config, so they
+        cannot be declared. The base turns the result into the pool; only the
+        chain is V4's business."""
+        layer = self.layer
+        n = self.max_tokens
+        device = self.device
+        dummy_x = torch.empty(n, layer.dim, dtype=dtypes.bf16, device=device)
+        idx_q_quant = idx_weights = idx_q_scale = None
+        with torch.no_grad():
+            qkv_a = layer.wqkv_a(dummy_x)
+            q_lora, kv_pre = torch.split(
+                qkv_a, [layer.q_lora_rank, layer.head_dim], dim=-1
+            )
+            qr, qr_scale = layer.q_norm(q_lora)
+            if layer.indexer is not None and not layer.skip_topk:
+                dummy_pos = torch.zeros(n, dtype=torch.int64, device=device)
+                idx_q_quant, idx_weights, idx_q_scale = layer.indexer.forward_pre(
+                    dummy_x, qr, dummy_pos, qr_scale
+                )
+        return {
+            # The WHOLE merged wqkv_a output, so that on the inplace path kv_pre
+            # is a stable view into it rather than a buffer of its own.
+            "qkv_a": qkv_a,
+            # Fallback path only, and contiguous where the sample is a view.
+            "kv_pre": BufferShape(kv_pre.shape[-1], kv_pre.dtype),
+            "q": BufferShape(layer.n_local_heads * layer.head_dim, dtypes.bf16),
+            "qr": qr,
+            "qr_scale": qr_scale,
+            "idx_q_quant": idx_q_quant,
+            "idx_weights": idx_weights,
+            "idx_q_scale": idx_q_scale,
+        }
 
-    MAX = _V4_ATTN_QPUB_MAX
-
-    def __init__(self):
-        self.qkv_a = self.kv_pre = self.q = None
-        self.qr = self.qr_scale = None
-        self.idx_q_quant = self.idx_weights = self.idx_q_scale = None
-        self.wqkv_a_inplace = False
-        self.wq_b_inplace = False
-
-    @staticmethod
-    def _like(sample):
-        return torch.empty_like(sample) if sample is not None else None
-
-    def alloc(
-        self, *, qkv_a, kv_pre, qr, qr_scale, idx, q_width, device,
-        wqkv_a_inplace, wq_b_inplace,
-    ):  # fmt: skip
-        # Whole merged wqkv_a output (inplace path -> kv_pre is a stable view).
-        self.qkv_a = self._like(qkv_a)
-        # Fallback path only: contiguous kv_pre buffer ([MAX, head_dim]).
-        self.kv_pre = torch.empty(
-            self.MAX, kv_pre.shape[-1], dtype=kv_pre.dtype, device=device
+    def alloc(self) -> None:
+        super().alloc()
+        # Whether a GEMM can write its destination directly (out=) is a property
+        # of these two Linears, not of the buffers. Cached ON THE LAYER because
+        # the traced _attn_pre reads it, and Dynamo folds a plain bool attribute
+        # more predictably than a hop through this object.
+        layer = self.layer
+        inplace_ok = self.buffers is not None and bool(
+            envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
         )
-        self.q = torch.empty(self.MAX, q_width, dtype=dtypes.bf16, device=device)
-        self.qr = self._like(qr)
-        self.qr_scale = self._like(qr_scale)
-        self.idx_q_quant = self._like(idx[0])
-        self.idx_weights = self._like(idx[1])
-        self.idx_q_scale = self._like(idx[2])
-        self.wqkv_a_inplace = wqkv_a_inplace
-        self.wq_b_inplace = wq_b_inplace
+        layer._wqkv_a_inplace = (
+            layer.wqkv_a.quant_type.value == QuantType.per_1x128.value and inplace_ok
+        )
+        layer._wq_b_inplace = (
+            layer.wq_b.quant_type.value == QuantType.per_1x128.value and inplace_ok
+        )
 
-    def fits(self, n: int) -> bool:
-        return n <= self.MAX
-
-    def stage(self, buf, tensor):
-        """Copy `tensor` (n tokens on dim 0) into `buf[:n]`, return the fixed slice.
-        None-safe: returns `tensor` unchanged if either is None."""
-        if buf is None or tensor is None:
-            return tensor
-        n = tensor.shape[0]
-        buf[:n].copy_(tensor)
-        return buf[:n]
-
-    def stage_inplace(self, buf, inplace, n, produce_out, produce_plain):
-        """Single-tensor producer writes its OWN fixed buffer (inplace out=), or
-        plain-produce then copy. Returns `buf[:n]`."""
-        if inplace:
-            produce_out(buf[:n])
-        else:
-            buf[:n].copy_(produce_plain())
-        return buf[:n]
+    def core(
+        self,
+        *,
+        x,
+        q,
+        kv_pre,
+        qr,
+        qr_scale,
+        positions,
+        idx_q_quant,
+        idx_weights,
+        idx_q_scale,
+    ):
+        """Keyword-only: these parameter names AND their order are the
+        contract -- the runner expands the staged inputs by them."""
+        return self.layer._attn_core(
+            x, q, kv_pre, qr, qr_scale, positions, idx_q_quant, idx_weights, idx_q_scale
+        )
 
 
 @mark_spliting_op(is_custom=True, gen_fake=_v4_attention_fake, mutates_args=[])
@@ -266,22 +276,6 @@ def v4_attention_with_output(
 # Narrow PIECEWISE split: only the paged / dynamic-shape attention core stays
 # eager.
 # ---------------------------------------------------------------------------
-
-
-def _v4_attn_bucket_bs_q(fc, self) -> tuple[int, int]:
-    """(bucket_bs, q_eff) — the attention-cudagraph key basis. bucket_bs is the
-    ceil-to-captured-graph_bs value (forward_mode.effective_bs at replay; capture
-    Context has no forward_mode so batch_size==graph_bs==bucket). See the
-    v4_core_attention key comment for the full rationale."""
-    attn_metadata = fc.attn_metadata
-    context = getattr(fc, "context", None)
-    q_eff = int(getattr(attn_metadata, "max_seqlen_q", 1) or 1)
-    forward_mode = getattr(context, "forward_mode", None)
-    if forward_mode is not None and getattr(forward_mode, "effective_bs", 0):
-        bucket_bs = int(forward_mode.effective_bs)
-    else:
-        bucket_bs = int(getattr(context, "batch_size", 0) or 0)
-    return bucket_bs, q_eff
 
 
 def _v4_core_attention_fake(
@@ -330,37 +324,25 @@ def v4_core_attention(
         getattr(fc, "cudagraph_runtime_mode", None) == CUDAGraphMode.PIECEWISE
     )
 
-    attn_args = (x, q, kv_pre, qr, qr_scale, positions,
-                 idx_q_quant, idx_weights, idx_q_scale)  # fmt: skip
-    # Persistent output buffer key (downstream dense piece reads this fixed addr).
-    out_key = (layer_name, int(x.shape[0]))
-
-    # AF_PIECEWISE: capture _attn_core into its own cudagraph (op body not traced).
-    cudagraph_mode = atom_config.compilation_config.cudagraph_mode
-    use_attn_cudagraph = (
-        cudagraph_mode is not None
-        and cudagraph_mode.is_af_piecewise()
-        and not getattr(getattr(fc, "context", None), "is_dummy_run", False)
-        and getattr(fc, "attn_metadata", None) is not None
-        and int(x.shape[0]) <= _V4_ATTN_QPUB_MAX
+    return self.attn_ffn.run(
+        forward_context=fc,
+        layer_name=layer_name,
+        named_args={
+            "x": x,
+            "q": q,
+            "kv_pre": kv_pre,
+            "qr": qr,
+            "qr_scale": qr_scale,
+            "positions": positions,
+            "idx_q_quant": idx_q_quant,
+            "idx_weights": idx_weights,
+            "idx_q_scale": idx_q_scale,
+        },
+        # Persistent output buffer key: the downstream dense piece was captured
+        # reading this fixed address.
+        out_key=(layer_name, int(x.shape[0])),
+        piecewise=is_piecewise,
     )
-    if use_attn_cudagraph:
-        # num_tokens_pad (=x rows) is a KEY DIM: the attn-core graph is captured at
-        # exactly this flat row count so q's public-buffer read len == dense write
-        # len (no rectangle-pad tail). See _v4_attn_bucket_bs_q for bucket_bs/q_eff.
-        bucket_bs, q_eff = _v4_attn_bucket_bs_q(fc, self)
-        key = (layer_name, bucket_bs, q_eff, int(x.shape[0]))
-        return _v4_attn_runner.run(
-            key=key,
-            out_key=out_key,
-            args=attn_args,
-            zc=_V4_ATTN_ZC,
-            compute_fn=self._attn_core,
-            piecewise=is_piecewise,
-            in_hipgraph=getattr(fc, "in_hipgraph", False),
-        )
-
-    return _v4_attn_runner.stabilize(out_key, self._attn_core(*attn_args), is_piecewise)
 
 
 # ---------------------------------------------------------------------------
@@ -2390,6 +2372,12 @@ class DeepseekV4Attention(nn.Module):
       - attn_sink: per-head learnable logit added only to softmax denominator
     """
 
+    # Whether wqkv_a / wq_b may write a staging buffer directly (out=). Class
+    # defaults so `_attn_pre` is safe before `attn_ffn.alloc()` runs; alloc
+    # resolves them, and leaves them False when nothing is staged.
+    _wqkv_a_inplace = False
+    _wq_b_inplace = False
+
     def __init__(
         self,
         layer_id: int,
@@ -2444,7 +2432,6 @@ class DeepseekV4Attention(nn.Module):
             prefix=f"{p}.wqkv_a",
         )
         # AF_PIECEWISE zero-copy pub buffers (built post-load in the hook; None off).
-        self.zerocopy_buffers: _V4AttnZeroCopyBuffers | None = None
         # Fuse q_norm + per_1x128 FP8 quant: kernel emits (qr_fp8, qr_scale)
         # in one launch, both wq_b consumers (outer ColumnParallel + Indexer
         # ReplicatedLinear) skip their own input quant.
@@ -2567,10 +2554,13 @@ class DeepseekV4Attention(nn.Module):
         atom_config.compilation_config.static_forward_context[self.layer_name] = self
         # AF_PIECEWISE gate resolved once -> plain bool (traced paths read this)
         cudagraph_mode = atom_config.compilation_config.cudagraph_mode
-        self.af_piecewise = (
-            cudagraph_mode is not None and cudagraph_mode.is_af_piecewise()
+        self.attn_ffn_piecewise = (
+            cudagraph_mode is not None and cudagraph_mode.is_attn_ffn_piecewise()
         )
-        if self.af_piecewise:
+        self.attn_ffn = V4AttnFfn(
+            self, runner=_v4_attn_runner, enabled=self.attn_ffn_piecewise
+        )
+        if self.attn_ffn_piecewise:
             # single-stream: captured graph can't hold the compressor fork/join
             self._use_async_compress = False
         # Frozen bool: when KV cache dtype is fp8, route writes/attention to the
@@ -2631,54 +2621,8 @@ class DeepseekV4Attention(nn.Module):
         self.wo_a.quant_type = QuantType.No
         self.wo_a.need_normalize_e4m3fn_to_e4m3fnuz = False
 
-        # AF_PIECEWISE: build fixed-address zero-copy buffers post-load (pre-capture).
-        # Sample shapes from a dummy forward (dtype/scale-layout vary by quant cfg),
-        # then alloc empty_like's them. _attn_pre stages buf[:n]; attn-core graph
-        # reads the same address (no per-step copy).
-        if self.af_piecewise:
-            # GEMMs can write INPLACE into a pub buffer (out=) only on the per_1x128
-            # preshuffle path; else _attn_pre falls back to copy_.
-            inplace_ok = bool(envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE)
-            device = self.wqkv_a.weight.device
-            dummy_x = torch.empty(
-                _V4_ATTN_QPUB_MAX, self.dim, dtype=dtypes.bf16, device=device
-            )
-            # Sample tensors from a dummy forward — used only to learn buffer
-            # shapes/dtypes (vary by quant cfg), then discarded.
-            sample_idx_q_quant = sample_idx_weights = sample_idx_q_scale = None
-            with torch.no_grad():
-                sample_qkv_a = self.wqkv_a(dummy_x)
-                sample_q_lora, sample_kv_pre = torch.split(
-                    sample_qkv_a, [self.q_lora_rank, self.head_dim], dim=-1
-                )
-                sample_qr, sample_qr_scale = self.q_norm(sample_q_lora)
-                if self.indexer is not None and not self.skip_topk:
-                    dummy_pos = torch.zeros(
-                        _V4_ATTN_QPUB_MAX, dtype=torch.int64, device=device
-                    )
-                    sample_idx_q_quant, sample_idx_weights, sample_idx_q_scale = (
-                        self.indexer.forward_pre(
-                            dummy_x, sample_qr, dummy_pos, sample_qr_scale
-                        )
-                    )
-            self.zerocopy_buffers = _V4AttnZeroCopyBuffers()
-            self.zerocopy_buffers.alloc(
-                qkv_a=sample_qkv_a,
-                kv_pre=sample_kv_pre,
-                qr=sample_qr,
-                qr_scale=sample_qr_scale,
-                idx=(sample_idx_q_quant, sample_idx_weights, sample_idx_q_scale),
-                q_width=self.n_local_heads * self.head_dim,
-                device=device,
-                wqkv_a_inplace=(
-                    self.wqkv_a.quant_type.value == QuantType.per_1x128.value
-                    and inplace_ok
-                ),
-                wq_b_inplace=(
-                    self.wq_b.quant_type.value == QuantType.per_1x128.value
-                    and inplace_ok
-                ),
-            )
+        # AF_PIECEWISE: build the staging buffers post-load, pre-capture.
+        self.attn_ffn.alloc()
 
     def maybe_compressors_async(
         self, x, plan, state_slot_in, state_slot_out, block_tables
@@ -2755,7 +2699,9 @@ class DeepseekV4Attention(nn.Module):
         #    op for torch compile.
         cg_mode = get_current_atom_config().compilation_config.cudagraph_mode
         # resolve to plain bool (Dynamo folds it; traced _attn_pre reads this)
-        self.af_piecewise = cg_mode is not None and cg_mode.is_af_piecewise()
+        self.attn_ffn_piecewise = (
+            cg_mode is not None and cg_mode.is_attn_ffn_piecewise()
+        )
         if cg_mode is not None and cg_mode.requires_piecewise_compilation():
             (
                 q,
@@ -2809,43 +2755,50 @@ class DeepseekV4Attention(nn.Module):
             x = x.clone()
             act_quant_inplace(x, 128, "ue8m0")
 
-        # AF_PIECEWISE zero-copy: stage each input into its fixed-address buffer so
-        # the attn-core cudagraph reads a constant address (no per-step copy). `bufs`
-        # is None (and the whole path skipped) when AF_PIECEWISE is off.
-        bufs = self.zerocopy_buffers
-        af_piecewise_zerocopy = bufs is not None and bufs.fits(x.shape[0])
+        # AF_PIECEWISE zero-copy: stage each input into its fixed-address buffer
+        # so the attn-core cudagraph reads a constant address (no per-step copy).
+        # `attn_ffn_bufs` is None on both paths that must NOT stage: a layer
+        # whose core is not captured, and a step whose token count overflows the
+        # buffers (prefill). Explicit at each site rather than hidden behind a
+        # no-op pool -- this is traced, and which mode it runs in should be
+        # readable here.
         n = x.shape[0]
+        attn_ffn_bufs = self.attn_ffn.staging(n)
 
-        # kv_pre: fix the WHOLE wqkv_a output inplace so kv_pre = split[1] is a
-        # stable view (no kv_pre copy); else plain GEMM + stage kv_pre by copy.
-        if af_piecewise_zerocopy and bufs.wqkv_a_inplace:
-            qkv_a = self.wqkv_a(x, out=bufs.qkv_a[:n])
-            q_lora, kv_pre = torch.split(
-                qkv_a, [self.q_lora_rank, self.head_dim], dim=-1
-            )
+        # kv_pre: fixing the WHOLE wqkv_a output inplace makes kv_pre = split[1]
+        # a stable view, so it needs no staging of its own. The fallback stages
+        # only kv_pre -- copying all of qkv_a to reach it would cost more than
+        # the copy it saves. Ask the pool for the buffer rather than trusting the
+        # flag alone: the flag says the GEMM CAN write out=, not that this step
+        # has anywhere to write it.
+        attn_ffn_qkv_a_buf = (
+            attn_ffn_bufs.get("qkv_a")
+            if (attn_ffn_bufs is not None and self._wqkv_a_inplace)
+            else None
+        )
+        if attn_ffn_qkv_a_buf is not None:
+            qkv_a = self.wqkv_a(x, out=attn_ffn_qkv_a_buf[:n])
         else:
             qkv_a = self.wqkv_a(x)
-            q_lora, kv_pre = torch.split(
-                qkv_a, [self.q_lora_rank, self.head_dim], dim=-1
-            )
-            if af_piecewise_zerocopy:
-                kv_pre = bufs.stage(bufs.kv_pre, kv_pre)
+        q_lora, kv_pre = torch.split(qkv_a, [self.q_lora_rank, self.head_dim], dim=-1)
+        if attn_ffn_bufs is not None and attn_ffn_qkv_a_buf is None:
+            kv_pre = attn_ffn_bufs.stage("kv_pre", kv_pre)
         assert (
             not _V4_FORCE_UE8M0_QUANT
         ), "_V4_FORCE_UE8M0_QUANT incompatible with fused q_norm quant (qr is already FP8)"
 
         qr, qr_scale = self.q_norm(q_lora)
-        if af_piecewise_zerocopy:
+        if attn_ffn_bufs is not None:
             # qr/qr_scale staged BEFORE their consumers (wq_b / indexer / the op).
-            qr = bufs.stage(bufs.qr, qr)
-            qr_scale = bufs.stage(bufs.qr_scale, qr_scale)
+            qr = attn_ffn_bufs.stage("qr", qr)
+            qr_scale = attn_ffn_bufs.stage("qr_scale", qr_scale)
             # q: wq_b writes its buffer inplace (out=) or plain GEMM + copy.
-            q = bufs.stage_inplace(
-                bufs.q,
-                bufs.wq_b_inplace,
+            q = attn_ffn_bufs.stage_inplace(
+                "q",
                 n,
                 lambda o: self.wq_b(qr, x_scale=qr_scale, out=o),
                 lambda: self.wq_b(qr, x_scale=qr_scale),
+                inplace=self._wq_b_inplace,
             )
         else:
             q = self.wq_b(qr, x_scale=qr_scale)
@@ -2856,10 +2809,10 @@ class DeepseekV4Attention(nn.Module):
             idx_q_quant, idx_weights, idx_q_scale = self.indexer.forward_pre(
                 x, qr, positions, qr_scale
             )
-            if af_piecewise_zerocopy:
-                idx_q_quant = bufs.stage(bufs.idx_q_quant, idx_q_quant)
-                idx_weights = bufs.stage(bufs.idx_weights, idx_weights)
-                idx_q_scale = bufs.stage(bufs.idx_q_scale, idx_q_scale)
+            if attn_ffn_bufs is not None:
+                idx_q_quant = attn_ffn_bufs.stage("idx_q_quant", idx_q_quant)
+                idx_weights = attn_ffn_bufs.stage("idx_weights", idx_weights)
+                idx_q_scale = attn_ffn_bufs.stage("idx_q_scale", idx_q_scale)
         return q, kv_pre, qr, qr_scale, x, idx_q_quant, idx_weights, idx_q_scale
 
     @mark_trace

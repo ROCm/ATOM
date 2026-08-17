@@ -71,7 +71,7 @@ class CUDAGraphMode(enum.Enum):
     FULL_AND_PIECEWISE = (FULL, PIECEWISE)
     # AF_PIECEWISE ("attention/FFN-wise"): PIECEWISE + attention core in its own
     # cudagraph (DSpark). Tuple so decode/mixed_mode resolve to PIECEWISE (existing
-    # == PIECEWISE checks treat it as such); extra capture gated by is_af_piecewise().
+    # == PIECEWISE checks treat it as such); extra capture gated by is_attn_ffn_piecewise().
     AF_PIECEWISE = (PIECEWISE, PIECEWISE)
 
     def decode_mode(self) -> "CUDAGraphMode":
@@ -80,7 +80,7 @@ class CUDAGraphMode(enum.Enum):
     def mixed_mode(self) -> "CUDAGraphMode":
         return CUDAGraphMode(self.value[1]) if self.separate_routine() else self
 
-    def is_af_piecewise(self) -> bool:
+    def is_attn_ffn_piecewise(self) -> bool:
         """True only for AF_PIECEWISE — gates the extra attention-core cudagraph
         (attention/FFN-wise capture) on top of the standard piecewise pieces."""
         return self is CUDAGraphMode.AF_PIECEWISE

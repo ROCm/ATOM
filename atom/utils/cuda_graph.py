@@ -297,10 +297,12 @@ class CudagraphCaptureRunner:
     """Generic capture/replay for a split-op body captured into its OWN cudagraph.
 
     Extracted from the AF_PIECEWISE attention-core path (DeepSeek-V4 DSpark). A
-    model's custom op builds a graph key, the arg tuple, and the zero-copy index
-    set, then calls run(); the runner owns the per-key graph cache and a dedicated
-    graph pool (isolated from the dense-piece pool). zero-copy args are captured on
-    directly (no per-step copy); others are cloned at capture and copied at replay.
+    caller builds a graph key and the named inputs, then calls run() -- usually
+    via run_attn_ffn_piecewise (atom/model_ops/attn_ffn_piecewise.py), which owns
+    the model-facing contract. The runner owns the per-key graph cache and a
+    dedicated graph pool (isolated from the dense-piece pool). zero-copy args are
+    captured on directly (no per-step copy); others cloned at capture, copied at
+    replay.
     The output copy is baked INSIDE the graph so replay refreshes a persistent
     buffer with no Python. Behavior is identical to the old inline V4 state machine.
     """
@@ -333,7 +335,8 @@ class CudagraphCaptureRunner:
         *,
         key,
         out_key,
-        args: tuple,
+        named_args: dict,
+        input_names: tuple,
         zc: frozenset,
         compute_fn: Callable,
         piecewise: bool,
@@ -342,24 +345,32 @@ class CudagraphCaptureRunner:
         """Dispatch capture / replay / eager for one op invocation. The runner
         computes the schedule and owns the output buffers + stabilize.
 
-        key         : hashable graph key (caller-built, V4-specific)
+        key         : hashable graph key (caller-built)
         out_key     : (layer, num_tokens) key for the persistent output buffer
-        args        : input tensors (entries may be None)
-        zc          : zero-copy arg indices (captured directly, skipped at replay)
-        compute_fn  : callable(*bufs) -> output tensor (the core compute)
+        named_args  : {name: input tensor} (values may be None)
+        input_names : the names in the order compute_fn declares them
+        zc          : zero-copy input NAMES (captured directly, skipped at replay)
+        compute_fn  : callable(**named) -> output tensor (the core compute)
         piecewise   : forward is in PIECEWISE cudagraph mode
         in_hipgraph : this is the capture forward (vs real decode replay)
+
+        Names rather than positions: an index set silently means something else
+        the moment an argument is added, and cannot be read without counting.
         """
         is_capture = piecewise and in_hipgraph and key not in self._graphs
         is_replay = piecewise and not in_hipgraph and key in self._graphs
 
         if is_capture:
             # zc args captured directly; others cloned into owned stable buffers
-            in_bufs = [
-                (t if (i in zc) else (t.clone() if t is not None else None))
-                for i, t in enumerate(args)
-            ]
-            warm_out = compute_fn(*in_bufs)  # warmup before capture
+            in_bufs = {
+                n: (
+                    named_args[n]
+                    if n in zc
+                    else (named_args[n].clone() if named_args[n] is not None else None)
+                )
+                for n in input_names
+            }
+            warm_out = compute_fn(**in_bufs)  # warmup before capture
             out_buf = self._out_buf(out_key, warm_out)  # persistent, stable addr
             graph = torch.cuda.CUDAGraph()
             if self._pool is None:
@@ -370,19 +381,20 @@ class CudagraphCaptureRunner:
                 stream=torch.cuda.current_stream(),
                 capture_error_mode=self._capture_error_mode,
             ):
-                cg_out = compute_fn(*in_bufs)
+                cg_out = compute_fn(**in_bufs)
                 out_buf.copy_(cg_out)  # output copy baked into graph
             self._graphs[key] = {"graph": graph, "in": in_bufs, "out": out_buf}
-            return self.stabilize(out_key, compute_fn(*args), piecewise)
+            return self.stabilize(out_key, compute_fn(**named_args), piecewise)
 
         if is_replay:
             entry = self._graphs[key]
-            for i, (buf, src) in enumerate(zip(entry["in"], args)):
-                if i in zc:
+            for n, buf in entry["in"].items():
+                if n in zc:
                     continue
+                src = named_args[n]
                 if buf is not None and src is not None:
                     buf.copy_(src)
             entry["graph"].replay()
             return entry["out"]  # persistent buf, refreshed in-graph
 
-        return self.stabilize(out_key, compute_fn(*args), piecewise)  # eager
+        return self.stabilize(out_key, compute_fn(**named_args), piecewise)  # eager

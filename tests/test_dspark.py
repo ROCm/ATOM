@@ -324,3 +324,97 @@ def test_scheduler_multi_request_global_topk():
     sps = torch.linspace(1.0, 0.3, steps=32)
     ell = schedule_prefix_lengths(conf, sps, early_stop=True)
     assert ell[0] >= ell[1]
+
+
+# ---------------------------------------------------------------------------
+# AF_PIECEWISE generic contract (atom/model_ops/attn_ffn_piecewise.py)
+# ---------------------------------------------------------------------------
+
+
+def test_zero_copy_buffers_stage_returns_a_fixed_address():
+    from atom.model_ops.attn_ffn_piecewise import ZeroCopyBuffers
+
+    bufs = ZeroCopyBuffers(max_tokens=8)
+    bufs.alloc("q", width=4, dtype=torch.float32, device="cpu")
+    assert bufs.fits(8) and not bufs.fits(9)
+
+    first = bufs.stage("q", torch.ones(3, 4))
+    second = bufs.stage("q", torch.full((3, 4), 2.0))
+    # Same address across steps is the entire point: the graph was captured
+    # reading it. A fresh tensor per step would replay against stale memory.
+    assert first.data_ptr() == second.data_ptr()
+    torch.testing.assert_close(second, torch.full((3, 4), 2.0))
+    # Unregistered name / None tensor pass through rather than raising: an input
+    # absent in this config (no indexer, say) still flows through the signature.
+    assert bufs.stage("not_registered", torch.ones(2)) is not None
+    assert bufs.stage("q", None) is None
+
+
+def test_zero_copy_names_resolve_by_name_not_position():
+    from atom.model_ops.attn_ffn_piecewise import resolve_zero_copy_names
+
+    names = ("x", "q", "positions")
+    assert resolve_zero_copy_names(names, None, default_excluded=("positions",)) == {
+        "x",
+        "q",
+    }
+    # Env override selects explicitly; empty means copy everything.
+    assert resolve_zero_copy_names(names, "x,q") == {"x", "q"}
+    assert resolve_zero_copy_names(names, "") == frozenset()
+    # A name that is not an input is a typo, not a silently-ignored entry --
+    # which is exactly what the old positional index set could not detect.
+    try:
+        resolve_zero_copy_names(names, "postions")
+        assert False, "expected ValueError for an unknown name"
+    except ValueError as e:
+        assert "postions" in str(e)
+
+
+def test_v4_core_inputs_come_from_the_signature_and_are_all_zero_copy():
+    # There is no second declaration to drift from any more: the inputs and
+    # their order ARE core's parameter list. Pin the resolved contract instead,
+    # since the runner expands staged inputs by it.
+    import types
+
+    import pytest
+
+    try:
+        from atom.models.deepseek_v4 import V4AttnFfn
+    except ImportError as e:
+        if "aiter" not in str(e):
+            raise
+        pytest.skip(f"requires aiter to import deepseek_v4: {e}")
+
+    assert V4AttnFfn.core_input_names() == (
+        "x",
+        "q",
+        "kv_pre",
+        "qr",
+        "qr_scale",
+        "positions",
+        "idx_q_quant",
+        "idx_weights",
+        "idx_q_scale",
+    )
+
+    inst = V4AttnFfn.__new__(V4AttnFfn)
+    V4AttnFfn.__init__(inst, layer=types.SimpleNamespace(), runner=None, enabled=False)
+    # positions included: its old exclusion was a stale dspark_ragged_lens_gpu
+    # (71a3e941), not positions itself.
+    assert set(inst.zero_copy_names) == set(inst.input_names)
+
+
+def test_core_with_var_kwargs_is_rejected():
+    # **kwargs carries no order, and the runner expands by order. Better to fail
+    # at class use than to mis-assign inputs at replay.
+    from atom.model_ops.attn_ffn_piecewise import AttnFfnPiecewise
+
+    class _Bad(AttnFfnPiecewise):
+        def core(self, **named):
+            return None
+
+    try:
+        _Bad.core_input_names()
+        assert False, "expected TypeError for **kwargs core"
+    except TypeError as e:
+        assert "explicitly" in str(e)
