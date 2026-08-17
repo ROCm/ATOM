@@ -17,6 +17,7 @@ import asyncio
 import sys
 import types
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -223,6 +224,59 @@ class TestAnthropicSamplingParams:
         assert captured["temperature"] == 0.0
         assert captured["top_p"] == 0.95
         assert captured["top_k"] == -1
+
+
+class TestMetricsLifecycle:
+    def test_lifespan_does_not_collect_metrics_before_a_scrape(self, monkeypatch):
+        refresh = AsyncMock()
+        monkeypatch.setattr(api_server, "engine", None)
+        monkeypatch.setattr(api_server, "_metrics_refresh_task", None)
+        monkeypatch.setattr(api_server, "_refresh_metrics_once", refresh)
+
+        async def run_lifespan():
+            async with api_server.lifespan(api_server.app):
+                pass
+
+        asyncio.run(run_lifespan())
+
+        refresh.assert_not_awaited()
+
+    def test_first_get_starts_collection_and_later_gets_reuse_it(
+        self, monkeypatch
+    ):
+        refresh = AsyncMock()
+        stop = asyncio.Event()
+
+        async def fake_refresh_loop():
+            await stop.wait()
+
+        monkeypatch.setattr(api_server, "engine", None)
+        monkeypatch.setattr(api_server, "_metrics_refresh_task", None)
+        monkeypatch.setattr(api_server, "_refresh_metrics_once", refresh)
+        monkeypatch.setattr(
+            api_server, "_metrics_refresh_loop", fake_refresh_loop
+        )
+
+        async def scrape_twice():
+            request = SimpleNamespace(method="GET")
+            await api_server.metrics(request)
+            await api_server.metrics(request)
+            refresh.assert_awaited_once()
+            assert api_server._metrics_refresh_task is not None
+            stop.set()
+            await api_server._metrics_refresh_task
+
+        asyncio.run(scrape_twice())
+
+    def test_head_does_not_start_collection(self, monkeypatch):
+        refresh = AsyncMock()
+        monkeypatch.setattr(api_server, "_metrics_refresh_task", None)
+        monkeypatch.setattr(api_server, "_refresh_metrics_once", refresh)
+
+        asyncio.run(api_server.metrics(SimpleNamespace(method="HEAD")))
+
+        refresh.assert_not_awaited()
+        assert api_server._metrics_refresh_task is None
 
 
 class TestValidateContextLength:
