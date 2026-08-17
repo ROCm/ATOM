@@ -94,6 +94,11 @@ class LMCacheOffloadConnector(KVConnectorBase):
         self._engine = None
         self._codec: ATOMKVByteCodec | None = None
         self._lookup_server = None
+        # Built in `register_kv_caches` when the state tier is enabled and the
+        # backend owns per-request state. Always defined, because
+        # `AttentionBackend._submit_state_spills` probes for it on every batch
+        # and an AttributeError there would be a forward-path crash.
+        self._state_tier = None
 
     # -- lifecycle --------------------------------------------------------
     def register_kv_caches(
@@ -143,6 +148,8 @@ class LMCacheOffloadConnector(KVConnectorBase):
         self._engine.post_init()
         self._validate_and_log_storage_backends(cfg)
 
+        self._maybe_build_state_tier(gpu_connector, transfer_tensors, meta, rank, world)
+
         # ZMQ lookup server so the scheduler process can query our hit counts.
         try:
             from lmcache.v1.lookup_client.factory import LookupClientFactory
@@ -168,6 +175,132 @@ class LMCacheOffloadConnector(KVConnectorBase):
             self._do_save,
             self._do_load,
         )
+
+    def _maybe_build_state_tier(
+        self, gpu_connector, transfer_tensors, meta, rank: int, world: int
+    ) -> None:
+        """Stand up the worker half of the state offload tier, if it is on.
+
+        Gated on `state_offload_staging_groups()`, the same function the arena
+        and the pool size themselves from, so the runner and the engine cannot
+        disagree about whether the tier exists. A second `os.environ` read here
+        would let the engine queue spills into a ring the runner never drains.
+
+        Three things this needs and where each comes from:
+        * the backend, for `state_entry_views` -- carried on
+          `transfer_tensors.state_backend`, set by the model runner, the only
+          scope holding both the builder and this connector;
+        * a `StagedTransfer` -- the KV GPU connector already owns one sized to
+          the bounded staging buffer, and reusing it is what keeps the state
+          path on the same HBM bound as KV. Note it does not share the *buffer*:
+          `StagedTransfer` keeps those in `threading.local`, and the tier packs
+          on its own `lmc-state` worker, so the tier adds one more resident
+          staging buffer of `gpu_staging_buffer_bytes` per rank. What reuse
+          buys is a single place that bound is configured, which is what makes
+          the `entry_bytes > staging_bytes` refusal below meaningful;
+        * the per-entry byte count -- measured off the backend's own views
+          rather than read from the sizing plan, because the pack allocates
+          exactly what the views sum to and a plan figure that rounded
+          differently would fail inside `memory_tensor` on the first spill.
+        """
+        from atom.model_engine.state_offload import state_offload_staging_groups
+
+        if state_offload_staging_groups() <= 0:
+            return
+        # Pipeline parallelism breaks the tier in two independent ways, so it is
+        # refused outright rather than half-supported.
+        #
+        # First the key. `StateByteCodec.key` builds a `CacheEngineKey` from
+        # (model, world_size, worker_id, hash), and `worker_id` here is
+        # `tp.rank_in_group` -- there is no PP component anywhere in it. Every PP
+        # stage holds a *different* slice of the layers, so stage 0 and stage 1
+        # at the same TP rank would write different bytes under an identical key
+        # and silently overwrite each other. A later load would then restore one
+        # stage's state into another's layers: wrong output, no error.
+        #
+        # Adding a PP component to the key would fix that half and still leave
+        # the second. `pp_engine_core.py` has every stage call `forward` on the
+        # head-pickled batch, so `_submit_state_spills` fires on all of them,
+        # but only the head runs `_poll_kv_transfer_progress`. The non-head
+        # stages' `state_staging_released` reports are never drained, so the
+        # ring never gets those slots back and the tier quietly stops spilling
+        # after `staging_depth` evictions. Wiring that up is a scheduler change,
+        # not a key change, so PP + OFFLOAD_STATE is out of scope for now.
+        #
+        # Paged-KV offload is unaffected: this returns before the tier is built
+        # and touches nothing else.
+        pp_size = int(getattr(self._config, "pipeline_parallel_size", 1) or 1)
+        if pp_size > 1:
+            logger.warning(
+                "state offload: OFFLOAD_STATE is not supported with pipeline "
+                "parallelism (pipeline_parallel_size=%d); the state tier stays "
+                "off and nothing spills. Paged-KV offload is unaffected.",
+                pp_size,
+            )
+            return
+        backend = getattr(transfer_tensors, "state_backend", None)
+        if backend is None:
+            logger.warning(
+                "state offload: OFFLOAD_STATE is set but no attention backend "
+                "was published; the tier stays off and nothing spills."
+            )
+            return
+        try:
+            views = backend.state_entry_views(0)
+            entry_bytes = sum(int(v.numel()) * v.element_size() for v in views)
+        except (NotImplementedError, AttributeError):
+            # `NotImplementedError` is the base class's own refusal;
+            # `AttributeError` is a builder that predates the method. Both mean
+            # the same thing to us -- this backend has no per-request state we
+            # can name bytes for -- and neither is worth killing model load
+            # over, so both warn and disable rather than propagate.
+            # `IndexError` is deliberately NOT caught: it means group 0 does not
+            # exist, i.e. a zero-entry state pool with the tier switched on,
+            # which is a sizing bug that must be loud rather than degrade into a
+            # server that silently never spills.
+            logger.warning(
+                "state offload: %s owns no per-request state views; the tier "
+                "stays off and nothing spills.",
+                type(backend).__name__,
+            )
+            return
+        # One entry is MB-scale (53.6 MiB measured) while the shared staging
+        # buffer is sized for KV chunks, so the two can easily fail to fit.
+        # `StagedTransfer.pack` would then raise inside `ensure_buffer`, and
+        # `StateOffloadTier._do_spill`'s broad `except` would turn every single
+        # spill into a warning plus a slot release -- a tier that looks healthy,
+        # burns a D2D copy per eviction, and stores nothing, forever. Refuse to
+        # build it instead, and name both numbers so the fix is obvious.
+        staging_bytes = int(getattr(gpu_connector, "gpu_staging_buffer_bytes", 0))
+        if entry_bytes > staging_bytes:
+            logger.warning(
+                "state offload: one state entry is %d bytes (%.2f MiB) but the "
+                "shared GPU staging buffer holds only %d bytes (%.2f MiB); "
+                "every spill would fail in StagedTransfer.ensure_buffer. The "
+                "tier stays off. Raise OFFLOAD_GPU_STAGING_CHUNKS (or "
+                "OFFLOAD_GPU_STAGING_MAX_BYTES) until the buffer covers one "
+                "entry, or unset OFFLOAD_STATE.",
+                entry_bytes,
+                entry_bytes / (1 << 20),
+                staging_bytes,
+                staging_bytes / (1 << 20),
+            )
+            return
+        from atom.kv_transfer.offload.state_object import StateByteCodec
+        from atom.kv_transfer.offload.state_tier import StateOffloadTier
+
+        codec = StateByteCodec(
+            backend,
+            gpu_connector._staged,
+            entry_bytes,
+            model_name=meta.model_name,
+            world_size=world,
+            worker_id=rank,
+        )
+        codec.bind_storage_manager(self._engine.storage_manager)
+        # No index: `StateOffloadIndex` lives in the engine process. Both
+        # directions report and the engine applies.
+        self._state_tier = StateOffloadTier(codec)
 
     def _validate_block_geometry(self, transfer_tensors) -> None:
         """Cross-check codec blocks against existing transfer-region metadata."""
@@ -222,6 +355,7 @@ class LMCacheOffloadConnector(KVConnectorBase):
     def start_load_kv(self, metadata) -> None:
         if not isinstance(metadata, LMCacheOffloadMetadata):
             return
+        self._start_state_loads(metadata)
         loading_lookup_ids = {
             str(req.req_id)
             for req in metadata.requests
@@ -250,6 +384,42 @@ class LMCacheOffloadConnector(KVConnectorBase):
                     req,
                     save_ready_event,
                 )
+
+    def _start_state_loads(self, metadata) -> None:
+        """Hand this step's state-tier loads to the tier's own executor.
+
+        No producer fence, unlike the save path: a load *writes* the state
+        entry and nothing on the compute stream is reading it yet. The group
+        belongs to a request that is parked precisely so no forward touches it,
+        and `StagedTransfer.unpack` synchronizes the stream that produced the
+        bytes before it returns, so by the time the report reaches the engine
+        the entry is readable from any stream.
+
+        With no tier the loads are reported failed rather than dropped. The
+        tier can legitimately refuse to build (wrong connector, pipeline
+        parallelism, a backend with no state views, an entry larger than the
+        staging buffer) while the engine's index exists and keeps offering
+        loads; each of those requests is already parked, and only a report
+        unparks it.
+        """
+        loads = getattr(metadata, "state_loads", None)
+        if not loads:
+            return
+        if self._state_tier is None:
+            logger.warning(
+                "state offload: %d load(s) arrived but this worker built no "
+                "state tier; failing them so their requests recompute instead "
+                "of waiting forever.",
+                len(loads),
+            )
+            self._fail_state_loads(loads)
+            return
+        for req_id, h, group in loads:
+            self._state_tier.submit_load(req_id, int(h), int(group))
+
+    def _fail_state_loads(self, loads) -> None:
+        with self._lock:
+            self._failed_load.update(req_id for req_id, _h, _group in loads)
 
     def _guard(self, kind: str, fn, req, *args) -> None:
         try:
@@ -466,11 +636,30 @@ class LMCacheOffloadConnector(KVConnectorBase):
             self._done_save.clear()
             self._done_load.clear()
             self._failed_load.clear()
+        # The state tier's spill reports: not request-keyed, because the
+        # request that owned a spilled checkpoint is gone by the time its bytes
+        # land. Its *load* reports are, so they merge into the two channels a
+        # KV load already uses -- which is what gives the state leg the
+        # aggregator's per-request quorum for free. Nothing distinguishes the
+        # two legs downstream and nothing needs to: a request never has both
+        # (the offload scheduler refuses every KV load for a per-request-cache
+        # sequence), and the engine's `settle_state_load` is a no-op for an id
+        # its state index never issued.
+        if self._state_tier is not None:
+            indexed, released, index_failed = self._state_tier.take_spill_reports()
+            state_done, state_failed = self._state_tier.get_finished()
+            dl |= state_done
+            fl |= state_failed
+        else:
+            indexed, released, index_failed = set(), set(), set()
         return KVConnectorOutput(
             finished_sending=set(),
             finished_loading=dl,
             failed_loading=fl,
             finished_saving=ds,
+            state_indexed=indexed,
+            state_staging_released=released,
+            state_index_failed=index_failed,
         )
 
     def get_finished_recv_blocks(self) -> list[int]:
@@ -524,6 +713,10 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         self.total_load_failures = 0
         self.total_save_requests = 0
         self.total_saved_tokens = 0
+        # State offload tier loads admitted this pass, drained by
+        # `build_connector_meta`. Not keyed by req_id: two requests may resume
+        # off the same hash in one pass, each into its own slot.
+        self._pending_state_loads: list[tuple] = []
         # Unaligned handoff is always on: when the HBM prefix-cache hit is not
         # chunk-aligned, recompute the misaligned head up to the next chunk
         # boundary, then load the aligned remainder from CPU. (Previously gated
@@ -552,6 +745,41 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
             logger.warning(
                 "LMCache offload scheduler: lookup client unavailable: %s", e
             )
+
+        self._warn_if_per_req_cache_model(config)
+
+    def _warn_if_per_req_cache_model(self, config) -> None:
+        """Say once, at startup, that this model will decline every KV load.
+
+        `_decide_load_after_alloc` refuses loads for a per-request-cache
+        sequence, which for a hybrid model is every sequence. Without this the
+        operator sees a permanent 0% load rate and reads it as a broken cache
+        rather than a deliberate restriction. Once per server -- the refusal
+        itself is logged per request at DEBUG, and a warning at that position
+        would print on every prefill.
+
+        The model-type set is imported rather than restated so the two cannot
+        drift; the per-sequence check stays on `seq.has_per_req_cache`.
+        """
+        model_type = getattr(getattr(config, "hf_config", None), "model_type", None)
+        if model_type is None:
+            return
+        from atom.model_engine.llm_engine import InputOutputProcessor
+
+        if model_type not in InputOutputProcessor._per_req_cache_model_types():
+            return
+        logger.warning(
+            "LMCache offload: model_type=%s keeps a per-request recurrent "
+            "state (linear/compressor layers) alongside its paged KV. The "
+            "state cannot be restored from a paged-KV load, so loading KV "
+            "past the state boundary would run the linear layers over history "
+            "their state never saw. Every KV LOAD is therefore declined for "
+            "this model and a 0%% load rate is expected; KV SAVES still run "
+            "normally and populate the tier. Set OFFLOAD_STATE to enable the "
+            "state offload tier, which restores both together and lifts the "
+            "restriction.",
+            model_type,
+        )
 
     # -- match: how many extra tokens can come from CPU/NVMe -------------
     def get_num_new_matched_tokens(self, seq) -> tuple[int, bool]:
@@ -686,6 +914,35 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         ls.hbm_cached_tokens = hbm
         chunk = int(self.chunk_size or 256)
         need = lmc - hbm
+        # A hybrid model (GDN/KDA recurrent state, V4 compressor ring) carries
+        # a per-request state that is the compressed history of exactly
+        # `[0, hbm)` -- `BlockManager.allocate` shrank the HBM hit to a
+        # boundary a state checkpoint covers, so right now the state boundary
+        # and the KV-loaded length agree. Raising the KV-loaded length to `lmc`
+        # breaks that: the scheduler would forward only `[lmc, num_prompt)`,
+        # the linear layers would never see `[hbm, lmc)`, and at hbm == 0 the
+        # freshly recycled state group makes `has_initial_state` True over
+        # another request's leftovers. Silent wrong output, no exception.
+        #
+        # Refusing costs the hybrid nothing it could have had: ATOM runs one
+        # forward over the whole batch, so the linear layers must walk
+        # `[hbm, lmc)` token by token regardless of whether the full-attention
+        # layers' KV is present. The load buys no work saving, only risk.
+        # Saves are untouched -- this request's KV still populates the tier for
+        # a stateless reader.
+        #
+        # The guard stays, and is not blocked merely on a joint park existing.
+        # The two legs are decided by independent matchers at different
+        # granularities: the KV leg comes from LMCache's `lookup()` floored to
+        # `chunk_size` (256), the state leg from `BlockManager._gated_hit` -- a
+        # fixpoint over the state caches, snapped to `hash_block_size` and then
+        # to a `state_checkpoint_interval_tokens` rung, and gated by
+        # `min_fork_tokens`. They agree only by configuration coincidence.
+        # `state_tier._JointPark` makes `L == P` representable, not guaranteed.
+        # Lifting this needs a load path that clamps both legs to a common
+        # boundary and proves it; see the README's "State offload tier" section.
+        if getattr(seq, "has_per_req_cache", False):
+            return False, "per_req_cache_state_boundary", hbm, lmc, need, chunk
         if lmc <= hbm:
             return False, "hbm_satisfies_after_alloc", hbm, lmc, need, chunk
         if hbm % chunk != 0:
@@ -822,8 +1079,32 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         seq.offload_loaded_tokens = max(hbm, lmc)
         return True
 
+    def enqueue_state_loads(self, loads) -> bool:
+        """Take this pass's state-tier loads, for the next `build_connector_meta`.
+
+        Returns whether they were taken. Always True here; the answer exists
+        for `MultiConnectorScheduler`, which can be asked when no sub-connector
+        carries state loads at all. The caller must fail a refusal rather than
+        drop it -- every one of these requests is parked on a report.
+
+        `(req_id, state_hash, target_group)`, already decided by the engine:
+        `BlockManager._attach_state_group` chose the group and
+        `StateOffloadIndex.request_load` vouched for the hash. Nothing is
+        re-decided here -- unlike the KV leg, whose `LoadSpec` is re-checked at
+        build time because `num_cached_tokens` moves under it between match and
+        allocate. A state load is decided *after* allocate, against a group
+        this request already holds, so there is nothing left to move.
+        """
+        self._pending_state_loads.extend(loads)
+        return True
+
     def build_connector_meta(self) -> LMCacheOffloadMetadata:
         meta = LMCacheOffloadMetadata()
+        # Drained, not copied: every load handed over is submitted exactly once,
+        # and a second submission would write the same entry into a group the
+        # first transfer is already filling.
+        meta.state_loads = self._pending_state_loads
+        self._pending_state_loads = []
 
         # Loads
         logger.debug("[OFFLOAD-BUILD] reqs_need_recv=%d", len(self._reqs_need_recv))

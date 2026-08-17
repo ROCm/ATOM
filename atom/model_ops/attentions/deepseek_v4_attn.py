@@ -956,13 +956,19 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         No flat margin on the slot: a ring cannot transiently exceed itself the
         way a block-addressed window could while sliding across a boundary, and
         there is no admission-vs-materialization gap to cushion — a slot exists
-        for its request's whole life.
+        for its request's whole life. The checkpoint headroom and the offload
+        tier's staging ring are both added by `state_pool` itself, which is the
+        only reader of the two env vars that size them.
         """
         geo = self.pool_geometry
         row_bytes = self.plane_row_bytes()
         return [
             page_pool(geo.block_bytes(row_bytes) + self._indexer_block_bytes()),
-            state_pool(STATE_SLOT_CLASS, geo.slot_bytes(row_bytes), entries_per_req=1),
+            state_pool(
+                STATE_SLOT_CLASS,
+                geo.slot_bytes(row_bytes),
+                entries_per_req=1,
+            ),
         ]
 
     def _plane_row_widths(self) -> list[int]:

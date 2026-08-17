@@ -48,6 +48,15 @@ class _LookupClient:
 
 def _scheduler() -> LMCacheOffloadConnectorScheduler:
     sched = LMCacheOffloadConnectorScheduler.__new__(LMCacheOffloadConnectorScheduler)
+    # In-flight byte counters this branch's connector keeps and the lmcache
+    # branch's fixture predates, plus the cumulative totals it reports.
+    sched._load_inflight_tokens = {}
+    sched._save_inflight_tokens = {}
+    sched.total_load_requests = 0
+    sched.total_loaded_tokens = 0
+    sched.total_load_failures = 0
+    sched.total_save_requests = 0
+    sched.total_saved_tokens = 0
     sched._config = SimpleNamespace()
     sched.kv_role = "offload"
     sched.block_size = 4
@@ -59,15 +68,9 @@ def _scheduler() -> LMCacheOffloadConnectorScheduler:
     sched._hit_save_floors = {}
     sched._save_tracker = {}
     sched._save_inflight = set()
-    sched._load_inflight_tokens = {}
-    sched._save_inflight_tokens = {}
     sched._lookup_in_step = []
     sched._handoff_loads = set()
-    sched.total_load_requests = 0
-    sched.total_loaded_tokens = 0
-    sched.total_load_failures = 0
-    sched.total_save_requests = 0
-    sched.total_saved_tokens = 0
+    sched._pending_state_loads = []
     sched._min_load_tokens = 0
     sched._lock = threading.Lock()
     sched._done_load = set()
@@ -366,14 +369,18 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
             ),
         )[-1],
     )
-    orig_ensure_staging_buffer = connector._ensure_staging_buffer
+    # Wrap `StagedTransfer.ensure_buffer`, not a connector-side delegate:
+    # `run_pipeline` calls it on itself, so a patch on the connector is never
+    # reached and `buffer_requests` stays empty -- which is what made the two
+    # bound assertions below vacuous (`all()` over `[]` is True).
+    orig_ensure_buffer = connector._staged.ensure_buffer
 
-    def _ensure_staging_buffer(staging_buffer, nbytes):
-        device_buf = orig_ensure_staging_buffer(staging_buffer, nbytes)
+    def _ensure_buffer(staging_buffer, nbytes):
+        device_buf = orig_ensure_buffer(staging_buffer, nbytes)
         buffer_requests.append((nbytes, int(staging_buffer.tensor.numel())))
         return device_buf
 
-    monkeypatch.setattr(connector, "_ensure_staging_buffer", _ensure_staging_buffer)
+    monkeypatch.setattr(connector._staged, "ensure_buffer", _ensure_buffer)
 
     class _FakeEvent:
         def record(self, stream) -> None:
@@ -431,6 +438,9 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
         ]
     )
     assert pack_groups == [[[1, 2], [3]]]
+    # Both bounds below are `all()` over this list, so an empty list passes
+    # them for free. Pin it non-empty first.
+    assert buffer_requests
     assert all(nbytes <= 4 * codec.bytes_per_block for nbytes, _ in buffer_requests)
     assert all(capacity == 4 * codec.bytes_per_block for _, capacity in buffer_requests)
     assert torch.equal(memory_objs[0].tensor, expected0)
@@ -451,6 +461,159 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
         assert torch.equal(kv_caches["l0"].v_cache[bid], original["l0"].v_cache[bid])
     assert torch.count_nonzero(kv_caches["l0"].k_cache[0]) == 0
     assert torch.count_nonzero(kv_caches["l0"].v_cache[0]) == 0
+
+
+def test_lmcache_connector_staged_pipeline_really_reaches_staged_transfer(monkeypatch):
+    """`_run_staged_pipeline` must actually delegate to `StagedTransfer`.
+
+    The fastpath test above monkeypatches `_thread_state` **on the
+    connector**, replacing the very method that delegates — so it never
+    exercises `StagedTransfer.run_pipeline` at all.
+    This test leaves every delegating method intact and instead seeds the
+    thread-local state *inside* `StagedTransfer`, so a delegation that is
+    removed, inlined, or misrouted fails here. It also pins the intra-worker
+    stage hand-off order (record ready -> stage_b waits on it -> record free).
+    That is not commit 7427e05e's fence, which lives on the caller side
+    (`save_ready_event`); these events order one worker thread's pack_stream
+    against its own copy_stream.
+    """
+    from contextlib import nullcontext
+
+    import torch
+
+    from atom.kv_transfer.offload.staged_transfer import StagedTransfer
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    monkeypatch.setenv("OFFLOAD_GPU_STAGING_CHUNKS", "2")
+    monkeypatch.delenv("OFFLOAD_GPU_STAGING_MAX_BYTES", raising=False)
+    original = {
+        "l0": SimpleNamespace(
+            k_cache=torch.arange(6 * 2, dtype=torch.uint8).reshape(6, 2),
+            v_cache=(torch.arange(6 * 3, dtype=torch.uint8).reshape(6, 3) + 51),
+            k_scale=None,
+            v_scale=None,
+        )
+    }
+    kv_caches = {
+        "l0": SimpleNamespace(
+            k_cache=original["l0"].k_cache.clone(),
+            v_cache=original["l0"].v_cache.clone(),
+            k_scale=None,
+            v_scale=None,
+        )
+    }
+    codec = ATOMKVByteCodec(kv_caches)
+    connector = ATOMLMCacheGPUConnector(codec, block_size=4, chunk_size=8)
+    _install_fake_fused_chunk_major(codec)
+    monkeypatch.setattr(connector, "_assert_fused_chunk_major_available", lambda: None)
+
+    # The fake streams are not real CUDA streams, so keep them out of the codec.
+    monkeypatch.setattr(
+        codec,
+        "gpu_to_chunk_major_device_buffer",
+        lambda device_buf, block_id_groups, stream=None: (
+            ATOMKVByteCodec.gpu_to_chunk_major_device_buffer(
+                codec, device_buf, block_id_groups, stream=None
+            )
+        ),
+    )
+
+    trace: list[str] = []
+
+    class _FakeEvent:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def record(self, stream) -> None:
+            trace.append(f"record:{self.name}")
+
+    class _FakeStream:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def wait_event(self, event) -> None:
+            trace.append(f"wait:{self.name}:{event.name}")
+
+        def synchronize(self) -> None:
+            trace.append(f"sync:{self.name}")
+
+    class _FakeState:
+        def __init__(self) -> None:
+            self.device = connector.device
+            self.pack_stream = _FakeStream("pack")
+            self.copy_stream = _FakeStream("copy")
+            self.staging_buffer = SimpleNamespace(
+                tensor=None,
+                ready_event=_FakeEvent("ready"),
+                free_event=_FakeEvent("free"),
+                free_event_valid=False,
+            )
+
+        def stream_ctx(self, stream):
+            return nullcontext()
+
+    fake_state = _FakeState()
+    # Seed StagedTransfer's own thread-local cache so the connector's
+    # `_thread_state()` delegation is exercised for real.
+    connector._staged._tls.states = {str(connector.device): fake_state}
+
+    reached: list[tuple[bool, int]] = []
+    real_run_pipeline = StagedTransfer.run_pipeline
+
+    def _spy_run_pipeline(self, state, groups, stage_a, stage_b):
+        reached.append((self is connector._staged, len(groups)))
+        return real_run_pipeline(self, state, groups, stage_a, stage_b)
+
+    monkeypatch.setattr(StagedTransfer, "run_pipeline", _spy_run_pipeline)
+
+    memory_objs = [
+        SimpleNamespace(
+            tensor=torch.empty(2 * codec.bytes_per_block, dtype=torch.uint8)
+        ),
+        SimpleNamespace(
+            tensor=torch.empty(1 * codec.bytes_per_block, dtype=torch.uint8)
+        ),
+    ]
+
+    connector.batched_from_gpu(
+        memory_objs,
+        [4, 12],
+        [12, 16],
+        block_ids=[0, 1, 2, 3, 4, 5],
+    )
+
+    # The delegation was genuinely taken, on this connector's StagedTransfer.
+    assert reached == [(True, 1)]
+    # The producer event is recorded before stage_b waits on it, and the free
+    # event only after stage_b has been issued.
+    assert trace == [
+        "record:ready",
+        "wait:copy:ready",
+        "record:free",
+        "sync:copy",
+    ]
+    # The real (non-monkeypatched) ensure_buffer allocated the bounded buffer.
+    assert int(fake_state.staging_buffer.tensor.numel()) == (
+        connector.gpu_staging_buffer_bytes
+    )
+    assert fake_state.staging_buffer.free_event_valid is True
+
+    expected0 = torch.cat(
+        [
+            original["l0"].k_cache[[1, 2]].reshape(-1),
+            original["l0"].v_cache[[1, 2]].reshape(-1),
+        ]
+    )
+    expected1 = torch.cat(
+        [
+            original["l0"].k_cache[[3]].reshape(-1),
+            original["l0"].v_cache[[3]].reshape(-1),
+        ]
+    )
+    assert torch.equal(memory_objs[0].tensor, expected0)
+    assert torch.equal(memory_objs[1].tensor, expected1)
 
 
 def test_lmcache_connector_requires_fused_chunk_major_staging():
@@ -1672,21 +1835,534 @@ def test_codec_dsa_fp8_multilayer_including_mtp_round_trip():
         )
 
 
-def test_scheduler_offload_statistics_are_cumulative():
-    sched = _scheduler()
-    sched._load_inflight_tokens["1"] = 8192
-    sched._save_inflight_tokens["2"] = 4096
-    sched._save_inflight.add("2")
+# ── the state offload tier is built only when it can actually work ────────
 
-    sched.load_finished("1")
-    sched.save_finished("2")
 
-    assert sched.get_statistics() == {
-        "load_requests": 1,
-        "loaded_tokens": 8192,
-        "load_failures": 0,
-        "save_requests": 1,
-        "saved_tokens": 4096,
-        "loads_pending": 0,
-        "saves_pending": 0,
+class _StateBackend:
+    """Publishes one entry's worth of contiguous views, like a real backend."""
+
+    def __init__(self, entry_bytes: int) -> None:
+        self._entry_bytes = entry_bytes
+
+    def state_entry_views(self, group: int):
+        return [torch.empty(self._entry_bytes, dtype=torch.uint8)]
+
+
+def _state_tier_conn(pipeline_parallel_size: int = 1):
+    conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
+    conn._state_tier = None
+    conn._engine = SimpleNamespace(storage_manager=object())
+    # `__init__` always sets `_config`, and the builder reads
+    # `pipeline_parallel_size` off it, so the fake has to carry one too.
+    conn._config = SimpleNamespace(pipeline_parallel_size=pipeline_parallel_size)
+    return conn
+
+
+def _gpu_conn(staging_bytes: int):
+    return SimpleNamespace(_staged=object(), gpu_staging_buffer_bytes=staging_bytes)
+
+
+def _state_meta():
+    return SimpleNamespace(model_name="m")
+
+
+def test_state_tier_is_refused_when_an_entry_exceeds_the_staging_buffer(
+    monkeypatch, caplog
+):
+    """`StagedTransfer.ensure_buffer` raises when nbytes > capacity, and
+    `_do_spill`'s broad except turns that into a warning plus a slot release --
+    so the tier would look healthy, burn a D2D copy per eviction, and store
+    nothing forever. Compare the two numbers at construction instead."""
+    monkeypatch.setenv("OFFLOAD_STATE", "1")
+    conn = _state_tier_conn()
+    tt = SimpleNamespace(state_backend=_StateBackend(4096))
+
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        conn._maybe_build_state_tier(_gpu_conn(1024), tt, _state_meta(), 0, 1)
+
+    assert conn._state_tier is None
+    msg = caplog.text
+    assert "4096" in msg and "1024" in msg
+
+
+def test_state_tier_is_built_when_an_entry_fits(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_STATE", "1")
+    conn = _state_tier_conn()
+    tt = SimpleNamespace(state_backend=_StateBackend(1024))
+
+    conn._maybe_build_state_tier(_gpu_conn(4096), tt, _state_meta(), 0, 1)
+
+    assert conn._state_tier is not None
+    assert conn._state_tier.codec.entry_bytes == 1024
+
+
+def test_state_tier_is_disabled_when_the_backend_has_no_state_views(
+    monkeypatch, caplog
+):
+    """A builder that predates `state_entry_views` raises AttributeError, not
+    NotImplementedError. Both mean the same thing here and neither is worth
+    killing model load over."""
+    monkeypatch.setenv("OFFLOAD_STATE", "1")
+    conn = _state_tier_conn()
+    tt = SimpleNamespace(state_backend=SimpleNamespace())  # no state_entry_views
+
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        conn._maybe_build_state_tier(_gpu_conn(1 << 20), tt, _state_meta(), 0, 1)
+
+    assert conn._state_tier is None
+    assert "no per-request state views" in caplog.text
+
+
+def test_the_state_tier_is_refused_under_pipeline_parallelism(monkeypatch, caplog):
+    """PP breaks the tier twice over, and neither failure raises.
+
+    The key is `(model, world_size, worker_id, hash)` with `worker_id =
+    tp.rank_in_group` -- no PP component -- so two stages holding different
+    layer slices collide on one key and overwrite each other's bytes. And only
+    the head stage polls `_poll_kv_transfer_progress`, so the other stages'
+    `state_staging_released` reports are never drained and the ring starves.
+
+    Non-vacuousness: drop the `pp_size > 1` guard and this fails, because the
+    entry fits the staging buffer and the tier builds.
+    """
+    monkeypatch.setenv("OFFLOAD_STATE", "1")
+    conn = _state_tier_conn(pipeline_parallel_size=2)
+    tt = SimpleNamespace(state_backend=_StateBackend(1024))
+
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        conn._maybe_build_state_tier(_gpu_conn(4096), tt, _state_meta(), 0, 1)
+
+    assert conn._state_tier is None
+    assert "pipeline parallelism" in caplog.text
+
+
+def test_the_state_tier_still_builds_without_pipeline_parallelism(monkeypatch):
+    """The guard's control: pp=1 is the overwhelmingly common config, and a
+    guard that also refused it would disable the feature outright while every
+    refusal test above still passed."""
+    monkeypatch.setenv("OFFLOAD_STATE", "1")
+    conn = _state_tier_conn(pipeline_parallel_size=1)
+    tt = SimpleNamespace(state_backend=_StateBackend(1024))
+
+    conn._maybe_build_state_tier(_gpu_conn(4096), tt, _state_meta(), 0, 1)
+
+    assert conn._state_tier is not None
+
+
+def test_a_zero_entry_state_pool_stays_loud(monkeypatch):
+    """IndexError is deliberately not caught: group 0 missing with the tier on
+    is a sizing bug, and degrading it to a server that silently never spills is
+    exactly the failure this round is about."""
+
+    class _Empty:
+        def state_entry_views(self, group):
+            raise IndexError("no such group")
+
+    monkeypatch.setenv("OFFLOAD_STATE", "1")
+    conn = _state_tier_conn()
+    tt = SimpleNamespace(state_backend=_Empty())
+
+    with pytest.raises(IndexError):
+        conn._maybe_build_state_tier(_gpu_conn(1 << 20), tt, _state_meta(), 0, 1)
+
+
+# ── a hybrid model's per-request state is not paged KV ────────────────────
+#
+# `build_kv_cache_tensor` on the two hybrid builders (`gdn_attn.py` for
+# Qwen3-Next / Qwen3.5, `kimi_mla_gdn_attn.py` for Kimi-K3) returns the mamba /
+# KDA recurrent-state rows as a `KVCacheTensor`, because the forward path reads
+# its state out of the same `kv_cache_data` registry. Those rows are addressed
+# by request slot, have no block stride, and must never reach the byte codec:
+# the codec would either refuse them (`numel() % num_blocks`) or, worse, count
+# their bytes into `bytes_per_block` and blow the geometry cross-check.
+
+
+def _paged_entry(num_blocks, block_size, latent):
+    import torch
+
+    return SimpleNamespace(
+        k_cache=torch.arange(
+            num_blocks * block_size * latent, dtype=torch.uint8
+        ).reshape(num_blocks * block_size, 1, latent),
+        v_cache=None,
+        k_scale=None,
+        v_scale=None,
+    )
+
+
+def _state_entry(num_slots, state_elems, *, per_request_state=True):
+    """Stand in for `KVCacheTensor(k_cache=runner.mamba_k_cache[i], ...)`."""
+    import torch
+
+    return SimpleNamespace(
+        k_cache=torch.zeros(num_slots, state_elems, dtype=torch.uint8),
+        v_cache=torch.zeros(num_slots, state_elems + 2, dtype=torch.uint8),
+        k_scale=None,
+        v_scale=None,
+        per_request_state=per_request_state,
+    )
+
+
+def test_codec_skips_per_request_state_entries():
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    num_blocks, block_size, latent = 4, 2, 3
+    kv_caches = {
+        "layer_0": _paged_entry(num_blocks, block_size, latent),
+        # 3 slots x 5 elements = 15, which does not divide num_blocks=4. This
+        # is the shape that raises today.
+        "layer_1": _state_entry(3, 5),
+        "layer_2": _paged_entry(num_blocks, block_size, latent),
     }
+
+    codec = ATOMKVByteCodec(kv_caches, num_blocks=num_blocks)
+
+    # Exactly the two paged K tensors; the state entry's k_cache and v_cache
+    # are both gone.
+    assert len(codec._segments) == 2
+    assert codec.bytes_per_block == 2 * block_size * latent
+
+    # And the geometry cross-check the connector runs at boot now agrees with
+    # what the paged backend describes.
+    conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
+    conn._codec = codec
+    conn._validate_block_geometry(
+        SimpleNamespace(
+            block_regions=[
+                SimpleNamespace(unit_bytes=block_size * latent),
+                SimpleNamespace(unit_bytes=block_size * latent),
+            ]
+        )
+    )
+
+
+def test_codec_state_only_registry_is_refused_loudly():
+    """DeepSeek-V4 style: nothing paged reaches the codec at all. Better to
+    refuse than to move a cache that is entirely per-request state."""
+    import torch
+
+    if not hasattr(torch, "zeros"):
+        pytest.skip("real torch is unavailable")
+
+    with pytest.raises(ValueError, match="no movable KV tensors registered"):
+        ATOMKVByteCodec({"layer_0": _state_entry(3, 5)}, num_blocks=4)
+
+
+def test_codec_dense_model_segment_list_is_unchanged():
+    """The dense regression: no `per_request_state` marker anywhere, so the
+    segment list must be byte-for-byte what it was before the filter existed."""
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+
+    num_blocks = 6
+    kv_caches = {
+        "layer_0": SimpleNamespace(
+            k_cache=torch.arange(num_blocks * 2, dtype=torch.uint8).reshape(
+                num_blocks, 2
+            ),
+            v_cache=torch.arange(num_blocks * 3, dtype=torch.uint8).reshape(
+                num_blocks, 3
+            ),
+            k_scale=torch.zeros(num_blocks, dtype=torch.uint8),
+            v_scale=torch.zeros(num_blocks, dtype=torch.uint8),
+        ),
+        "layer_1": SimpleNamespace(
+            k_cache=torch.arange(num_blocks * 2, dtype=torch.uint8).reshape(
+                num_blocks, 2
+            ),
+            v_cache=torch.arange(num_blocks * 3, dtype=torch.uint8).reshape(
+                num_blocks, 3
+            ),
+            k_scale=None,
+            v_scale=None,
+        ),
+    }
+
+    codec = ATOMKVByteCodec(kv_caches, num_blocks=num_blocks)
+
+    # 4 segments for layer_0 (K, V, kS, vS) + 2 for layer_1.
+    assert len(codec._segments) == 6
+    assert codec.bytes_per_block == (2 + 3 + 1 + 1) + (2 + 3)
+
+
+# ── a hybrid model declines the KV load, and says so once ─────────────────
+#
+# The state boundary P (`seq.num_cached_tokens` right after
+# `BlockManager.allocate`) is the only history the recurrent state covers. An
+# LMCache load lands on top with no second state gate and pushes the KV-loaded
+# length L past P; the scheduler then forwards only `[L, num_prompt)`, so the
+# GDN/KDA layers never see `[P, L)`. At P=0 the group was just recycled and
+# `has_initial_state` is True, so the recurrence starts from another request's
+# leftovers. No exception, wrong output. Refusing the load is exactly as
+# useful as clamping it (a load clamped to P transfers nothing) and honest
+# about why.
+
+
+def _hybrid_seq(seq_id, num_prompt, block_table):
+    return SimpleNamespace(
+        id=seq_id,
+        num_prompt_tokens=num_prompt,
+        token_ids=list(range(num_prompt)),
+        num_cached_tokens=0,
+        block_table=list(block_table),
+        has_per_req_cache=True,
+    )
+
+
+def test_per_req_cache_sequence_is_refused_the_offload_load(caplog):
+    sched = _scheduler()
+    sched._min_load_tokens = 8
+    lookup = _LookupClient(hit=12)
+    sched._lookup_client = lookup
+    seq = _hybrid_seq(770, 16, [1, 2, 3, 4])
+
+    need, should_park = sched.get_num_new_matched_tokens(seq)
+    assert need == 12
+    assert should_park is True
+
+    # Exactly the configuration that parks a stateless sequence: hbm=4 is
+    # chunk-aligned and the 8-token gap meets `min_load`.
+    seq.num_cached_tokens = 4
+    sched.update_state_after_alloc(seq)
+
+    with caplog.at_level(logging.DEBUG, logger="atom"):
+        assert sched.should_park_for_load_after_alloc(seq) is False
+
+    assert "per_req_cache_state_boundary" in caplog.text
+    meta = sched.build_connector_meta()
+    assert [req for req in meta.requests if req.load_spec is not None] == []
+    # The KV-loaded length never moves past the state boundary.
+    assert seq.offload_loaded_tokens == 4
+    assert str(seq.id) not in sched._load_specs
+    assert str(seq.id) not in sched._reqs_need_recv
+    # And the request is not left holding a lookup pin.
+    assert lookup.cleared == ["770"]
+
+
+def test_a_stateless_sequence_is_still_admitted():
+    """Paired with the refusal above so a change that turns loads off
+    wholesale fails here rather than looking like a pass."""
+    sched = _scheduler()
+    sched._min_load_tokens = 8
+    sched._lookup_client = _LookupClient(hit=12)
+    seq = SimpleNamespace(
+        id=771,
+        num_prompt_tokens=16,
+        token_ids=list(range(16)),
+        num_cached_tokens=0,
+        block_table=[1, 2, 3, 4],
+        has_per_req_cache=False,
+    )
+
+    assert sched.get_num_new_matched_tokens(seq) == (12, True)
+    seq.num_cached_tokens = 4
+    sched.update_state_after_alloc(seq)
+    assert sched.should_park_for_load_after_alloc(seq) is True
+
+    meta = sched.build_connector_meta()
+    load_reqs = [req for req in meta.requests if req.load_spec is not None]
+    assert len(load_reqs) == 1
+    assert load_reqs[0].load_spec.lmcache_cached_tokens == 12
+
+
+def test_per_req_cache_refusal_also_covers_the_unaligned_handoff_resume():
+    """The handoff path decides through the same `_decide_load_after_alloc`,
+    and must not reach `_maybe_start_unaligned_handoff` either: that branch
+    ends in a load too."""
+    sched = _scheduler()
+    sched._min_load_tokens = 8
+    lookup = _LookupClient(hit=16)
+    sched._lookup_client = lookup
+    seq = _hybrid_seq(772, 20, [1, 2, 3, 4, 5])
+
+    assert sched.get_num_new_matched_tokens(seq) == (16, True)
+
+    # hbm=6 is unaligned; for a stateless seq this starts a handoff.
+    seq.num_cached_tokens = 6
+    sched.update_state_after_alloc(seq)
+    assert sched.should_park_for_load_after_alloc(seq) is False
+    assert str(seq.id) not in sched._handoff_loads
+    assert seq.offload_loaded_tokens == 6
+
+    # Nothing is left pending for the partial-prefill park to pick up. This
+    # passes through `should_park_partial_prefill_for_load`'s
+    # `sid not in _handoff_loads` early return, which is the point here -- the
+    # handoff was never started. The guard *inside* that method is a separate
+    # call site and needs its own test, below.
+    assert sched.should_park_partial_prefill_for_load(seq) is False
+    assert sched.build_connector_meta().requests == []
+
+
+def test_per_req_cache_refusal_holds_at_the_partial_prefill_park():
+    """The fourth `_decide_load_after_alloc` call site, reached on its own.
+
+    `should_park_partial_prefill_for_load` refuses a hybrid three times over:
+    at the `sid not in _handoff_loads` early return, at
+    `_decide_load_after_alloc`'s `unaligned_hbm_prefill`, and at the guard
+    itself. The test above trips the first, and an unaligned `hbm` would trip
+    the second -- either leaves the guard's own revert green. So park the sid
+    by hand AND keep `hbm` chunk-aligned, leaving the guard as the only thing
+    that can say no. With it reverted this seq parks and emits a load.
+    """
+    sched = _scheduler()
+    sched._min_load_tokens = 8
+    sched._lookup_client = _LookupClient(hit=16)
+    seq = _hybrid_seq(774, 20, [1, 2, 3, 4, 5])
+
+    assert sched.get_num_new_matched_tokens(seq) == (16, True)
+    # Aligned to `chunk_size` (4), so `unaligned_hbm_prefill` cannot be what
+    # refuses this; 16 - 4 = 12 also clears `_min_load_tokens`.
+    seq.num_cached_tokens = 4
+    sched.update_state_after_alloc(seq)
+
+    # What a stateless sequence's unaligned handoff would have left behind.
+    sched._handoff_loads.add(str(seq.id))
+
+    assert sched.should_park_partial_prefill_for_load(seq) is False
+    # Refused, not merely deferred: the park is cleared and no load is emitted.
+    assert str(seq.id) not in sched._handoff_loads
+    assert sched.build_connector_meta().requests == []
+
+
+def test_per_req_cache_refusal_holds_in_build_connector_meta():
+    """The third `_decide_load_after_alloc` call site: a LoadSpec that reached
+    `can_load` some other way must still be dropped before it is emitted."""
+    sched = _scheduler()
+    sched._min_load_tokens = 8
+    sched._lookup_client = _LookupClient(hit=12)
+    seq = _hybrid_seq(773, 16, [1, 2, 3, 4])
+
+    sched.get_num_new_matched_tokens(seq)
+    seq.num_cached_tokens = 4
+    sched.update_state_after_alloc(seq)
+    # Force the state `should_park_for_load_after_alloc` would have cleared.
+    sched._load_specs[str(seq.id)].can_load = True
+    sched._reqs_need_recv[str(seq.id)] = seq
+
+    meta = sched.build_connector_meta()
+    assert [req for req in meta.requests if req.load_spec is not None] == []
+
+
+def _warn_config(model_type):
+    """A config complete enough to run the real `__init__`. The lookup client
+    is absent in the test env and its own warning is filtered out below."""
+    return SimpleNamespace(
+        kv_transfer_config={"kv_connector": "lmcache_offload"},
+        kv_cache_block_size=16,
+        tensor_parallel_size=1,
+        hf_config=SimpleNamespace(model_type=model_type),
+    )
+
+
+def _hybrid_warnings(caplog):
+    return [
+        r
+        for r in caplog.records
+        if r.levelno >= logging.WARNING and "per-request recurrent" in r.getMessage()
+    ]
+
+
+def test_hybrid_model_startup_warning_fires_once_and_names_the_model(caplog):
+    # Constructed for real, so the `__init__` call site is covered too: a
+    # warning nothing invokes would pass a direct-call test and warn nobody.
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        LMCacheOffloadConnectorScheduler(_warn_config("qwen3_next"))
+
+    warnings = _hybrid_warnings(caplog)
+    assert len(warnings) == 1  # once per server, not once per request
+    text = warnings[0].getMessage()
+    assert "qwen3_next" in text
+    assert "OFFLOAD_STATE" in text
+    # Saves are unaffected; the user should not read this as "offload is off".
+    assert "SAVES still run" in text
+
+
+def test_dense_model_gets_no_hybrid_startup_warning(caplog):
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        LMCacheOffloadConnectorScheduler(_warn_config("deepseek_v3"))
+
+    assert _hybrid_warnings(caplog) == []
+
+
+# ---------------------------------------------------------------------------
+# The state tier's load leg, worker side
+# ---------------------------------------------------------------------------
+
+
+class _FakeTier:
+    """Enough of `StateOffloadTier` to see what the connector hands it."""
+
+    def __init__(self, done=(), failed=()):
+        self.submitted = []
+        self._done, self._failed = set(done), set(failed)
+
+    def submit_load(self, req_id, h, group):
+        self.submitted.append((req_id, h, group))
+
+    def get_finished(self):
+        return set(self._done), set(self._failed)
+
+    def take_spill_reports(self):
+        return set(), set(), set()
+
+
+def _load_worker(tier=None):
+    conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
+    conn._do_load = True
+    conn._do_save = False
+    conn._lock = threading.Lock()
+    conn._done_load = set()
+    conn._failed_load = set()
+    conn._done_save = set()
+    conn._engine = SimpleNamespace(lookup_unpin=lambda _lookup_id: None)
+    conn._state_tier = tier
+    return conn
+
+
+def _state_load_meta(*loads):
+    meta = LMCacheOffloadMetadata()
+    meta.state_loads = list(loads)
+    return meta
+
+
+def test_state_loads_reach_the_tier_with_a_real_pool_group():
+    tier = _FakeTier()
+    conn = _load_worker(tier)
+
+    conn.start_load_kv(_state_load_meta((7, 111, 3), (8, 222, 5)))
+
+    assert tier.submitted == [(7, 111, 3), (8, 222, 5)]
+
+
+def test_a_worker_with_no_tier_fails_the_load_rather_than_dropping_it(caplog):
+    """The tier can legitimately refuse to build -- pipeline parallelism, an
+    entry larger than the staging buffer, a backend with no state views --
+    while the engine's index goes on offering loads. Each of those requests is
+    already parked, and only a report unparks it, so silence here is a hang.
+    """
+    conn = _load_worker(tier=None)
+
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        conn.start_load_kv(_state_load_meta((7, 111, 3)))
+
+    assert conn._failed_load == {7}
+    assert "no state tier" in caplog.text
+
+
+def test_state_load_reports_merge_into_the_kv_loading_channels():
+    """Sharing the channels is what gives the state leg the aggregator's
+    per-request quorum for free. Nothing downstream distinguishes the two legs
+    and nothing needs to: one request never has both."""
+    conn = _load_worker(_FakeTier(done={7}, failed={8}))
+    conn._done_load.add(100)
+    conn._failed_load.add(200)
+
+    out = conn.get_finished()
+
+    assert out.finished_loading == {7, 100}
+    assert out.failed_loading == {8, 200}

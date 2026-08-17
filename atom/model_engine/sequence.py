@@ -165,6 +165,13 @@ class Sequence:
         # forward. -1 = read and write the same slot, the case for every step in
         # between. Always a single slot: a checkpoint is one slot wide.
         self.state_fork_src = -1
+        # Content hash of a checkpoint the offload tier has been asked to fetch
+        # back into this seq's committed state slot, or -1. Set by
+        # `BlockManager._attach_state_slots` when the boundary this seq hit
+        # lives in LMCache rather than HBM; it is what tells the scheduler to
+        # park the request, and what tells the failure path that
+        # `num_cached_tokens` is claiming state nobody delivered.
+        self.state_load_hash = -1
         self.temperature = sampling_params.temperature
         self.top_k = sampling_params.top_k
         self.top_p = sampling_params.top_p

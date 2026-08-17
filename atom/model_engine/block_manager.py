@@ -203,6 +203,50 @@ class BlockManager:
         # moment it stops forking (see the state-cache protocol).
         self.state_caches: tuple[StateCache, ...] = (self._state_checkpoint_cache,)
 
+        from atom.model_engine.state_offload import (
+            StateOffloadIndex,
+            kv_connector_hosts_state_tier,
+            state_offload_staging_groups,
+        )
+
+        staging = state_offload_staging_groups()
+        kv_offload_enabled = kv_connector_hosts_state_tier(
+            getattr(config, "kv_transfer_config", None)
+        )
+        self.state_offload: StateOffloadIndex | None = None
+        # (req_id, hash, target_slot) admitted this pass and not yet handed to
+        # the connector. Kept here rather than in the index because the slot is
+        # this object's fact.
+        self._state_loads: list[tuple] = []
+        # req_id -> slot, for loads whose request was deallocated before the
+        # bytes landed. The slot is off the free list until the report comes
+        # back; see `deallocate`.
+        self._orphan_load_slots: dict = {}
+        if staging > 0 and not kv_offload_enabled:
+            # Refuse to install the ring rather than install an inert one.
+            # Without a connector that hosts the tier there is nobody to drain a
+            # spill, so every staging slot leaks and the only symptom is one
+            # starvation warning 256 dropped spills later. The configuration is
+            # pointless even if the bytes did land: with KV offload off, a hash
+            # whose KV left HBM never reappears, so a spilled checkpoint can
+            # never be resumed from.
+            logger.warning(
+                "OFFLOAD_STATE is set but the configured --kv-transfer-config "
+                "does not host the state offload tier, so the tier will not run "
+                "and no state is spilled. Configure "
+                '--kv-transfer-config \'{"kv_connector":"lmcache_offload",'
+                '"kv_role":"offload"}\' (or a "multi" that lists it), or unset '
+                "OFFLOAD_STATE."
+            )
+        elif staging > 0:
+            index = StateOffloadIndex(
+                staging_depth=staging,
+                kv_offload_enabled=kv_offload_enabled,
+            )
+            for cache in self.state_caches:
+                cache.offload = index
+            self.state_offload = index
+
         # The demand funnel: recorded at admission, cut for when a prefill
         # chunk is shortened to land on it, kept when the state pool files it.
         # Counted at all three because a gap between any two is a different
@@ -242,7 +286,89 @@ class BlockManager:
             relocations=relocations,
             checkpoint_stores=stores,
             checkpoint_restores=restores,
+            # Drained here so the one consumer that issues them
+            # (`CommonAttentionBuilder.build`) is also the one place the
+            # spill-before-copy order is enforced.
+            spills=tuple(self.state_spills_for_batch()),
         )
+
+    def state_spills_for_batch(self) -> list[tuple[int, int, int, int]]:
+        """`(src_group, dst_entry, staging_slot, hash)` the batch being built
+        must copy out before its forward.
+
+        Three facts about one spill live in two places -- the pool knows
+        `(group, slot)`, the ring knows `(hash, slot)` -- and the slot is the
+        only thing relating them. Joined here, engine-side, because
+        `num_slots` is authoritative here and the runner would have to
+        re-derive it from a published entry count. (`num_slots` is only
+        mutated by `StateGroupPool.extend`/`retire_top`, neither of which has
+        an in-tree caller, so the address stays valid for the whole step.)
+
+        Both lists are appended by the same `_spill()` call and are drained
+        together at every site, so they stay in lockstep; a slot present in
+        one and not the other is a bug, and dropping it is safer than
+        guessing which half is right.
+        """
+        out: list[tuple[int, int, int, int]] = []
+        for cache in self.state_caches:
+            offload = getattr(cache, "offload", None)
+            if offload is None:
+                continue
+            hash_of_slot = {slot: h for h, slot in offload.take_pending()}
+            for src_slot, slot in cache.take_spill_copies():
+                h = hash_of_slot.pop(slot, None)
+                if h is None:
+                    logger.warning(
+                        "state offload: staging slot %d has a copy but no "
+                        "pending hash; dropping the spill",
+                        slot,
+                    )
+                    offload.release_staging(slot)
+                    continue
+                # `num_slots`, not `num_groups`: the ring is K slots
+                # appended past the pool's own range, and a slot is this
+                # branch's unit.
+                out.append((src_slot, cache.num_slots + slot, slot, h))
+            # Whatever is left is a pending hash with no copy to feed it. The
+            # keys are the slots; the values are the hashes, which the ring
+            # does not take back.
+            for slot in hash_of_slot:
+                # Never observed in correct operation; release rather than leak.
+                offload.release_staging(slot)
+        return out
+
+    def state_checkpoint_fates(self) -> dict[str, int]:
+        """Summed fates across every state class, for the periodic stats line.
+
+        Accumulates keys from whatever each class's ``checkpoint_fates()``
+        returns, so adding a counter to any pool automatically appears here
+        without a matching change in this method.  Classes that do not expose
+        ``checkpoint_fates`` are skipped, but a warning is emitted so the
+        omission is visible rather than silently under-counting the totals.
+
+        That warning is latched per class. The caller is the scheduler's every-
+        100-ticks stats line and `self.state_caches` does not change during a
+        run, so an unlatched warning is the same line forever -- and the thing
+        it is trying to report is a static property of the build, true on the
+        first tick and no truer on the ten-thousandth.
+        """
+        totals: dict[str, int] = {}
+        for cache in self.state_caches:
+            fates_fn = getattr(cache, "checkpoint_fates", None)
+            if fates_fn is None:
+                name = type(cache).__name__
+                if name not in self._warned_no_checkpoint_fates:
+                    self._warned_no_checkpoint_fates.add(name)
+                    logger.warning(
+                        "state_checkpoint_fates: %s does not implement "
+                        "checkpoint_fates(); its counters are excluded from "
+                        "totals",
+                        name,
+                    )
+                continue
+            for k, v in fates_fn().items():
+                totals[k] = totals.get(k, 0) + v
+        return totals
 
     def _record_evicted(self, h: int) -> None:
         """A hash the block pool just dropped: report it, and settle the state.
@@ -474,14 +600,30 @@ class BlockManager:
         # blocks of this same admission could evict the checkpoint it restores
         # from.
         if seq.has_per_req_cache and self.paged_state_checkpoints is None:
-            self._attach_state_slots(seq, h if num_cached_blocks > 0 else -1)
+            if not self._attach_state_slots(
+                seq, h if num_cached_blocks > 0 else -1
+            ):
+                # The state behind the boundary could not be produced, so the
+                # boundary is not this request's history. Disown it — the blocks
+                # stay claimed and the forward simply recomputes over them,
+                # which is what `failed_loading` means on the KV side.
+                seq.num_cached_tokens = 0
 
-    def _attach_state_slots(self, seq: Sequence, hit_hash: int) -> None:
+    def _attach_state_slots(self, seq: Sequence, hit_hash: int) -> bool:
         """Give `seq` its state slots, resuming from a checkpoint when one exists.
 
+        Returns whether `hit_hash`'s state is really the one `seq` now holds.
+        False means the caller must drop the boundary; see `allocate`.
+
         `hit_hash` is the content hash of the last reused block (-1 for a cold
-        start). `can_allocate` already shrank the hit to a boundary that carries
-        a checkpoint, so a lookup miss here just means the pool is off.
+        start). `can_allocate` already shrank the hit to a boundary that
+        `_resumable_from` accepted, and that is not the same as "in HBM": the
+        tier votes too (`state_pool.STATE_OFFLOAD_LOADS_WIRED`). So a hash
+        whose group went to LMCache arrives here as a miss and becomes a load
+        (`_request_state_load`), and so does one whose bytes LMCache's own LRU
+        has since dropped — which the tier cannot know until the fetch misses.
+        The two are told apart by whether the tier still holds the hash,
+        because only one of them may keep the boundary.
 
         A seq takes `state_slots_per_req` slots — one committed state plus a
         rollback slot per speculated token — however it starts. The checkpoint
@@ -518,13 +660,29 @@ class BlockManager:
                     "gated PAGE checkpoint disappeared before state attach"
                 )
             seq.state_fork_src = -1
-            return
+            # True, not a bare return: the restore above IS the state behind
+            # `hit_hash`, and this method's contract is now "did the boundary
+            # survive". Falling out with None would disown a boundary that was
+            # just satisfied.
+            return True
 
         src = self.state.lookup(hit_hash) if hit_hash != -1 else -1
         if src < 0:
-            seq.state_slots = self.state.pop_many(width)
+            # Decided before the pop, not after: an eviction that makes room
+            # for a load must not spill, because the spill's copy out of that
+            # slot is issued by a later forward while the load writes it from
+            # the tier's thread first. See `StateSlotPool.pop`. Only element 0
+            # is suppressed -- that is the committed slot, the only one a load
+            # writes into.
+            wants_load = self._tier_can_serve(hit_hash)
+            seq.state_slots = self.state.pop_many(width, spill_first=not wants_load)
             seq.state_fork_src = -1
-            return
+            if wants_load and self._request_state_load(seq, hit_hash):
+                return True
+            # A fresh slot holds the previous occupant's bytes. That is fine for
+            # a cold start (nothing claims otherwise) and wrong for a hit, so
+            # the hit only survives if there was none to begin with.
+            return hit_hash == -1
         # Being resumed from is the evidence a guessed position was right, so a
         # checkpoint that pays off stops being spent first — see
         # `StateSlotPool.mark_speculative`. Here rather than in `claim`, which
@@ -538,7 +696,7 @@ class BlockManager:
             seq.state_fork_src = src
             # Held off the free list until the forward that reads it is issued.
             self.state.pin(src)
-            return
+            return True
         # `can_allocate` admitted this seq against a free list holding at least
         # `width`, and nothing else has run since, so the list can only be short
         # here if this seq's own `claim` above took the slot that made up the
@@ -548,6 +706,131 @@ class BlockManager:
         self.state.invalidate(src)
         seq.state_slots = [src] + self.state.pop_many(width - 1)
         seq.state_fork_src = -1
+        return True
+
+    def _tier_can_serve(self, hit_hash: int) -> bool:
+        """Whether the tier believes it holds `hit_hash`.
+
+        Asked twice per admission -- once before `pop`, to decide whether that
+        eviction may spill, and once inside `_request_state_load`. One
+        predicate rather than two so the two questions cannot drift: a pop that
+        forwent its spill for a load that is then refused would lose a
+        checkpoint for nothing.
+        """
+        return (
+            hit_hash != -1
+            and self.state_offload is not None
+            and hit_hash in self.state_offload.hashes
+        )
+
+    def _request_state_load(self, seq: Sequence, hit_hash: int) -> bool:
+        """Ask the tier to fetch `hit_hash` into the group `seq` just took.
+
+        Only reached when the HBM index missed, which is exactly the case the
+        tier exists for: the checkpoint was spent to admit somebody else and
+        its bytes went to LMCache. The group is a real pool group, never a
+        staging entry -- the bytes land where the resuming forward reads them,
+        and only the spill direction needs the staging indirection.
+
+        `state_fork_src` stays -1, set by the caller. The loaded group *is* the
+        incoming state: both backends read the group they write when there is
+        no fork (`prepare_state_indices` maps the read index to the same base),
+        so naming a source here would send the forward to a different group
+        than the one being filled.
+
+        False means the tier cannot serve it -- no tier, or a hash it does not
+        believe in. Believing is not delivering: `request_load` refuses an
+        unknown hash because a load is only ever resolved by a report, so
+        offering one for bytes no `get` can produce would park the request
+        against a wake-up that never comes. The caller then disowns the
+        boundary, which is the same answer as before this tier existed.
+        """
+        if not self._tier_can_serve(hit_hash):
+            return False
+        if self.state.has_pending_spill(seq.state_slot):
+            # A spill copy queued in an earlier pass still has to read this
+            # group, and the load would overwrite it first -- the same
+            # collision `pop(spill=False)` avoids at the eviction, one pass
+            # later, where there is nothing left to reorder. Decline; the
+            # caller disowns the boundary, which is the pre-tier answer.
+            logger.warning(
+                "state offload: group %d still owes a spill copy; declining "
+                "the load for seq %s and recomputing instead.",
+                seq.state_slot,
+                seq.id,
+            )
+            return False
+        if not self.state_offload.request_load(seq.id, hit_hash):
+            return False
+        seq.state_load_hash = hit_hash
+        self._state_loads.append((seq.id, hit_hash, seq.state_slot))
+        return True
+
+    def cancel_state_load(self, seq: Sequence) -> None:
+        """Withdraw a load requested this pass, before anything was issued.
+
+        Only legal before `take_state_loads` has handed it over -- afterwards
+        the bytes are on their way and the group must be held (`deallocate`).
+        The boundary is disowned exactly as `allocate` would have: the state
+        behind it is not coming, so it is not this request's history.
+        """
+        if seq.state_load_hash == -1:
+            return
+        self._state_loads = [e for e in self._state_loads if e[0] != seq.id]
+        if self.state_offload is not None:
+            self.state_offload.abandon_load(seq.id)
+        seq.state_load_hash = -1
+        seq.num_cached_tokens = 0
+
+    def abandon_state_load(self, req_id) -> None:
+        """Give up on a load without blaming the bytes for it.
+
+        For a load that was never attempted -- nothing could carry it. Calling
+        `settle_state_load(ok=False)` there would `forget` the hash on the
+        strength of a miss that never happened, erasing the index one request
+        at a time and inflating the counter operators read as its
+        false-positive rate.
+        """
+        if self.state_offload is None:
+            return
+        self.state_offload.abandon_load(req_id)
+        group = self._orphan_load_groups.pop(req_id, None)
+        if group is not None:
+            self.state.release(group)
+
+    def settle_state_load(self, req_id, ok: bool) -> None:
+        """Apply one worker load report. Keyed by request, like the KV load.
+
+        Called for every `finished_loading` / `failed_loading` id, including
+        the many that are plain KV loads: for those the index holds no pending
+        entry and this is a no-op, which is what keeps the scheduler from
+        having to know which leg a report belongs to.
+
+        An abandoned load (its request was deallocated mid-flight) is already
+        out of the index, so it neither completes nor fails -- but its group is
+        still being written and comes back here, and only here.
+        """
+        if self.state_offload is None:
+            return
+        if ok:
+            self.state_offload.complete_load(req_id)
+        else:
+            self.state_offload.fail_load(req_id)
+        group = self._orphan_load_groups.pop(req_id, None)
+        if group is not None:
+            self.state.release(group)
+
+    def take_state_loads(self) -> list[tuple]:
+        """`(req_id, hash, target_group)` for loads admitted since the last call.
+
+        Drained once per pass by the scheduler, which hands them to the
+        connector. Draining rather than reading is what keeps a load from being
+        submitted twice into a group the first transfer is already filling.
+        """
+        if self.state_offload is None:
+            return []
+        out, self._state_loads = self._state_loads, []
+        return out
 
     def hash_blocks(
         self,
@@ -1071,6 +1354,10 @@ class BlockManager:
         Assembled here because the stages live in two objects — the ladder
         decides what to ask for, the pool decides what survives — and a reader
         needs them side by side to tell which stage lost it.
+
+        Pool-level fates are collected via ``state_checkpoint_fates()`` so that
+        a second state class is automatically included — calling
+        ``self.state.checkpoint_fates()`` directly would miss it.
         """
         return {
             "demands_recorded": self.demands_recorded,
@@ -1360,15 +1647,31 @@ class BlockManager:
         if seq.has_per_req_cache and seq.state_slots:
             # Every slot the seq held — the committed one and its speculation
             # scratch, which is this request's alone and has no meaning to the
-            # next one. A checkpoint it took is already back on the free list
-            # under the state index; the source it was going to fork off is
-            # dropped here rather than left to `release_pins`, because the
-            # forward that owed the read is not going to happen and the slot
-            # should not sit out a pass for a reader that no longer exists.
-            self.state.release_many(seq.state_slots)
+            # next one.
+            #
+            # Unless a state load is still in flight into the committed slot. A
+            # worker thread is writing it on its own stream, so handing it back
+            # now lets the next request be given a buffer someone else is
+            # filling -- another request's state, arriving after the fact, with
+            # `has_initial_state` already true over it. Held until the report
+            # lands (`settle_state_load`), which always comes: the worker
+            # reports every load either way, and a tier that refused to build
+            # reports the failure itself.
+            if seq.state_load_hash != -1 and self.state_offload is not None:
+                self._orphan_load_slots[seq.id] = seq.state_slot
+                # Abandoned, not failed: an abort says nothing about the bytes,
+                # and forgetting the hash would cost the next request over this
+                # prefix a full recompute.
+                self.state_offload.abandon_load(seq.id)
+                rest = [s for s in seq.state_slots if s != seq.state_slot]
+                if rest:
+                    self.state.release_many(rest)
+            else:
+                self.state.release_many(seq.state_slots)
             self.state.drop_reader(seq.state_fork_src)
             seq.state_slots = []
             seq.state_fork_src = -1
+        seq.state_load_hash = -1
 
     def can_append(self, seq: Sequence, num_new_tokens: int = 1) -> bool:
         seq_len = len(seq)

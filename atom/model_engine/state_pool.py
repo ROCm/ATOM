@@ -1,11 +1,35 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import logging
 from collections import deque
 from dataclasses import dataclass
 from heapq import heapify, heappop, heappush
 
 from atom.model_engine.state_runtime import StateTransfer
+
+# Whether a hash that lives only in the offload tier can still be turned back
+# into a group this pool can resume from.
+#
+# True: the load direction is wired end to end.
+# `BlockManager._attach_state_group` turns an accepted offload-only boundary
+# into a `StateOffloadIndex.request_load`, the scheduler parks the request, the
+# worker's `StateOffloadTier.submit_load` fetches the entry into the group the
+# request already holds, and `finished_loading` / `failed_loading` bring it
+# back.
+#
+# This is a statement about the code, not a policy knob, and it is not the
+# feature's on/off switch -- `OFFLOAD_STATE` is. What it guards is the
+# invariant that makes `resumable_hit`'s right-to-left scan sound: the scan
+# stops at the first boundary `_resumable_from` accepts, so accepting a
+# boundary nothing can deliver does not merely fail to help, it *shadows* a
+# shorter checkpoint still resident in HBM that the scan would otherwise have
+# reached. Reachable-in-principle is the weakest thing this may ever mean;
+# anything weaker turns a hit into no hit. Set it False again and the pool
+# reverts, exactly, to the HBM-only predicate -- which is what the control pair
+# in `tests/test_state_offload_resume.py` drives, and why it stays a name
+# rather than being folded into the expression it guards.
+STATE_OFFLOAD_LOADS_WIRED = True
 
 
 @dataclass(frozen=True)
@@ -139,6 +163,17 @@ class StateSlotPool:
         # Reverse map, for lazy eviction when a slot is handed out. -1 = the
         # slot carries no checkpoint.
         self.slot_hash: list[int] = [-1] * num_slots
+        # Backing store beneath the pool, or None. Owned here rather than
+        # placed in `BlockManager.state_caches` because every member of that
+        # tuple is a veto — it answers "the rightmost boundary <= X that I
+        # accept" — and this tier does the opposite: it makes more boundaries
+        # reachable. As a sibling it could only ever return identity.
+        self.offload = None
+        # (slot, staging_slot) pairs the next forward must copy out of HBM.
+        self._spill_copies: list[tuple[int, int]] = []
+        # One-shot latch so the undrained-consumer diagnosis cannot flood the
+        # log from `pop()`, which is itself a hot path.
+        self._warned_spill_copies_undrained = False
         # Slots serving as a fork source in the in-flight step, counted by how
         # many requests fork off each. They stay off the free list until
         # `release_pins`, so the step that reads them cannot race a request that
@@ -190,11 +225,20 @@ class StateSlotPool:
         """Whether `slot` is on the free list *and* still worth something."""
         return slot in self._free and self.slot_hash[slot] != -1
 
-    def pop(self) -> int:
+    def pop(self, *, spill: bool = True) -> int:
         """Hand out a slot, evicting its checkpoint if it carried one.
 
         Vacant first, lowest index first; only when nothing is vacant does a
         checkpoint get spent, and then it is the least recently used one.
+
+        `spill=False` gives up the evicted checkpoint's bytes instead of
+        staging them, and exists for one caller: a slot about to be filled by
+        an offload *load*. The spill copy is issued by the next forward while
+        the load runs on the tier's own thread ahead of it, so the two would
+        race over the same slot and the spill would store the loaded state
+        under the evicted checkpoint's hash. Nothing downstream could tell.
+        Forgoing the spill costs one checkpoint -- exactly the pre-tier
+        behaviour, counted as `spills_forgone`.
 
         The state twin of `BlockManager._pop_free_block`: slots sit on the free
         list carrying whatever the last owner left in them, and re-allocation —
@@ -212,6 +256,12 @@ class StateSlotPool:
             slot = self._checkpointed.popleft()
             self._free.discard(slot)
             self.checkpoints_evicted += 1
+            if spill:
+                # Before invalidate() clears slot_hash[slot]: the hash is the
+                # key the tier stores under.
+                self._spill(slot)
+            elif self.offload is not None and self.offload.enabled:
+                self.offload.spills_forgone += 1
         # Whatever guess this slot carried is spent with it. Not folded into
         # `invalidate`, which also runs on the re-file inside `_index` and would
         # clear a mark `checkpoint` had only just made.
@@ -219,7 +269,7 @@ class StateSlotPool:
         self.invalidate(slot)
         return slot
 
-    def pop_many(self, count: int) -> list[int]:
+    def pop_many(self, count: int, *, spill_first: bool = True) -> list[int]:
         """Hand out `count` slots as one request's set. Caller checked `has_free`.
 
         Returned in allocation order, and the caller keeps that order: element 0
@@ -232,8 +282,20 @@ class StateSlotPool:
         refuses — with nothing vacant it spends the LRU checkpoint. The worst
         case is a wide request evicting checkpoints for slots it then keeps,
         which is what admitting it means.
+
+        `spill_first=False` reaches element 0 only, because element 0 is the
+        committed slot and therefore the only one an offload load ever writes
+        into. The rollback slots are speculation scratch no load targets, so
+        their evictions spill normally -- suppressing those would throw away
+        checkpoints for no reason.
         """
-        return [self.pop() for _ in range(count)]
+        if count <= 0:
+            # `_attach_state_slots` asks for `width - 1` on the adopt path, which
+            # is 0 at width 1 -- and there the pool is empty by construction, so
+            # popping "just one" would raise rather than return nothing.
+            return []
+        first = self.pop(spill=spill_first)
+        return [first] + [self.pop() for _ in range(count - 1)]
 
     def _pop_vacant(self) -> int:
         """Lowest vacant index, or -1, dropping entries that are stale.
@@ -476,7 +538,9 @@ class StateSlotPool:
             return hit
         hbs = self.hash_block_size
         for i in range(hit - 1, -1, -1):
-            if not assume_checkpointed and block_hashes[i] not in self.hash_to_slot:
+            if not assume_checkpointed and not self._resumable_from(
+                block_hashes[i], (i + 1) * hbs
+            ):
                 continue
             if seq.num_tokens - (i + 1) * hbs >= self.min_fork_tokens:
                 return i + 1
@@ -572,7 +636,7 @@ class StateSlotPool:
         for slot, _pos, _h in reservations:
             self.release(slot)
 
-    # ---------------------------- checkpointing ---------------------------- #
+    # ------------------------------- offload ------------------------------- #
     def checkpoint(self, seq, boundary_blocks: int, h: int) -> None:
         """Keep `seq`'s state as of this boundary, filed under hash `h`.
 
@@ -633,17 +697,117 @@ class StateSlotPool:
         holding its working set and the misses are somewhere else — most
         likely `checkpoints_orphaned`, whose KV prefix died first and which
         more slots cannot prevent.
+
+        Folds in the offload tier's own counters when a tier is attached, so
+        `spills_dropped` -- the "staging ring too shallow" signal -- is visible
+        without waiting for 256 consecutive drops to trip the starvation
+        warning. The keys are prefixed `state_offload_` because the aggregation
+        upstream is by key across every state class.
         """
-        return {
+        fates = {
             "checkpoints_kept": self.checkpoints_kept,
             "checkpoints_dropped": self.checkpoints_dropped,
             "checkpoints_evicted": self.checkpoints_evicted,
             "checkpoints_orphaned": self.checkpoints_orphaned,
         }
+        if self.offload is not None:
+            fates.update(
+                (f"state_offload_{k}", v) for k, v in self.offload.stats().items()
+            )
+        return fates
 
     def record_relocation(self, src: int, dst: int) -> None:
         """Schedule an Active Slot relocation for the next batch."""
         self._relocations.append((src, dst))
+
+    def has_pending_spill(self, slot: int) -> bool:
+        """Whether a queued spill copy still has to read `slot`.
+
+        The window a load must not enter. It closes when the copy is issued on
+        the compute stream (`take_spill_copies` -> the next forward), after
+        which only the staging entry is read and the slot is free to be
+        overwritten. Normally empty for a slot `pop(spill=False)` just handed
+        out; a copy left undrained by a batch that was never forwarded is the
+        case this catches.
+        """
+        return any(s == slot for s, _staging in self._spill_copies)
+
+    def take_spill_copies(self) -> list[tuple[int, int]]:
+        """`(slot, staging_slot)` pairs the next forward must copy.
+
+        The consumer turns each into a relocation into `num_slots + staging`:
+        the ring is K slots appended to the arena past the pool's own range, so
+        a staging entry is addressable by the existing slot-indexed move with no
+        second addressing scheme.
+
+        Contract, and it is not optional. Whoever attaches a tier MUST call this
+        every step, and MUST call `StateOffloadIndex.release_staging(slot)` for
+        each slot once its bytes are safe. Skip the drain and this list grows
+        without bound; skip the release and the ring is starved permanently --
+        `request_spill` then returns -1 forever and every checkpoint is silently
+        evicted instead of spilled.
+        """
+        out, self._spill_copies = self._spill_copies, []
+        return out
+
+    def _resumable_from(self, h: int, tokens: int) -> bool:
+        """Whether a checkpoint for `h` can be *reached*, in HBM or beneath it.
+
+        Reached, not merely indexed. `resumable_hit` scans right to left and
+        stops at the first boundary this accepts, so accepting one whose bytes
+        nothing can deliver does not cost a wasted lookup — it costs the whole
+        walk-back, hiding every shorter checkpoint still resident in HBM.
+
+        `tokens` is the boundary this hash sits on, and the tier's floor
+        (`OFFLOAD_STATE_MIN_LOAD_TOKENS`) is applied here rather than where the
+        load is issued for the same reason: a floor has to *decline* a rung so
+        the scan keeps walking. The HBM branch is deliberately not gated by it —
+        that hit costs no transfer, so there is nothing to amortize.
+        """
+        if h in self.hash_to_slot:
+            return True
+        if self.offload is None:
+            return False
+        # Imported here, not at module scope: `state_offload` reaches back into
+        # the engine, and a top-level import would close the cycle.
+        from atom.model_engine.state_offload import should_load_state
+
+        return h in self.offload.hashes and should_load_state(
+            tokens, self.offload.min_load_tokens
+        )
+
+    def _spill(self, slot: int) -> None:
+        """Stage `slot`'s bytes for the tier, if there is room. Never blocks.
+
+        Beyond the staging depth the spill is simply dropped and
+        `checkpoints_evicted` still counts it — identical to the behaviour
+        without a tier, so there is no regression to reason about.
+        """
+        if self.offload is None or not self.offload.enabled:
+            return
+        h = self.slot_hash[slot]
+        if h == -1:
+            return
+        staging = self.offload.request_spill(h, slot)
+        if staging < 0:
+            return
+        self._spill_copies.append((slot, staging))
+        # Exact leak detector, not a heuristic: a staging slot must be released
+        # before it can be handed out again, so at most `staging_depth` copies
+        # can be outstanding if the consumer drains every step.
+        if (
+            len(self._spill_copies) > self.offload.staging_depth
+            and not self._warned_spill_copies_undrained
+        ):
+            self._warned_spill_copies_undrained = True
+            logger.warning(
+                "StateSlotPool has %d undrained spill copies for a staging ring "
+                "of depth %d. take_spill_copies() must be called every step and "
+                "each slot released with release_staging(); until it is, the "
+                "ring leaks and every spill is dropped.",
+                len(self._spill_copies),
+                self.offload.staging_depth,
+            )
 
     def occupancy(self) -> dict[str, int]:
         """How much of this pool is live, held by checkpoints, or spare.
@@ -721,6 +885,8 @@ class StateSlotPool:
         slot = self.hash_to_slot.get(h, -1)
         if slot < 0:
             return
+        if self.offload is not None and self.offload.kv_offload_enabled:
+            self._spill(slot)
         self.invalidate(slot)
         self.checkpoints_orphaned += 1
 

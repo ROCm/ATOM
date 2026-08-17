@@ -54,6 +54,14 @@ class KVCacheTensor:
     replay_buf_k: torch.Tensor = None
     replay_buf_u: torch.Tensor = None
     replay_buf_g: torch.Tensor = None
+    # True when the tensors above are a hybrid model's PER-REQUEST state (the
+    # GDN/KDA recurrent state) rather than paged KV. They still belong in
+    # ``kv_cache_data`` -- the linear-attention forward reads its state from
+    # exactly there -- but they are addressed by request slot, have no block
+    # stride, and no block-addressed mover may touch them. ``ATOMKVByteCodec``
+    # skips them; the state offload tier reaches the same bytes through the
+    # backend's ``state_entry_views``.
+    per_request_state: bool = False
 
 
 @dataclass

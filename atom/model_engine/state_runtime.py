@@ -184,9 +184,18 @@ class StateMaintenanceOps:
     relocations: tuple[tuple[int, int], ...] = ()
     checkpoint_stores: tuple[CheckpointStoreOp, ...] = ()
     checkpoint_restores: tuple[CheckpointRestoreOp, ...] = ()
+    # (src_slot, dst_entry, staging_slot, hash) for checkpoints the state pool
+    # evicted to the offload tier. Carried here rather than beside this struct
+    # so that the one consumer -- `CommonAttentionBuilder.build` -- is also the
+    # one place the spill-before-copy order is enforced. Empty unless
+    # `OFFLOAD_STATE` is on.
+    spills: tuple[tuple[int, int, int, int], ...] = ()
 
     @property
     def empty(self) -> bool:
         return not (
-            self.relocations or self.checkpoint_stores or self.checkpoint_restores
+            self.relocations
+            or self.checkpoint_stores
+            or self.checkpoint_restores
+            or self.spills
         )
