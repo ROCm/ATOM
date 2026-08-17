@@ -70,7 +70,7 @@ jobs:
         id: gate
         env:
           CI_GATE_LABELS: ci:full,ci:atom
-          CI_GATE_DUPLICATE_SUCCESS_JOB_PATTERN: '^(Offline inference smoke test|Accuracy)$'
+          CI_GATE_DUPLICATE_SUCCESS_JOB_PATTERN: '^(Offline inference smoke test|Accuracy)($| \(| / )'
           CI_GATE_PATHS_IGNORE: |
             **/*.md
             docs/**
