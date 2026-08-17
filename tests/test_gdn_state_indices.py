@@ -38,14 +38,19 @@ MAX_BATCH = 8
 WIDTH = 3  # 1 + num_spec, at --num-speculative-tokens 2
 
 
-def builder():
+def builder(replayssm: bool = False):
     """A GDNStateMixin with only the three staging arrays the method touches.
 
     Prefilled with a sentinel no real slot can be, so "the method wrote this"
     and "the method left this alone" stay distinguishable — zero would not,
     since slot 0 is a legitimate index.
+
+    `replayssm` is a real `__init__` attribute, not a stub convenience: the
+    spec path forks on it, so leaving it off the stub would make these tests
+    raise rather than measure.
     """
     stub = object.__new__(GDNStateMixin)
+    stub.replayssm = replayssm
     stub.non_spec_state_indices_tensor = SimpleNamespace(
         np=np.full(MAX_BATCH, -99, dtype=np.int32)
     )
@@ -136,6 +141,35 @@ class TestSpecPath:
         b = builder()
         b.prepare_state_indices(batch([[4]]), with_spec=True)
         assert list(b.spec_state_indices_tensor.np[0]) == [4, 0, 0]
+
+    def test_replayssm_addresses_one_slot_and_fans_out_to_neither_column(self):
+        """Under ReplaySSM a request holds ONE slot: rollback is a cursor move
+        over the cached (k, u, g) records, not a resume from a spare state. So
+        the committed slot is the whole answer and columns 1..n stay cleared —
+        writing scratch indices there would hand the kernel slots this request
+        was never given.
+        """
+        b = builder(replayssm=True)
+        b.prepare_state_indices(batch([[4]]), with_spec=True)
+        assert list(b.spec_state_indices_tensor.np[0]) == [4, 0, 0]
+
+    def test_replayssm_also_fills_the_1d_tensor_on_the_spec_path(self):
+        """`_attach_replayssm` reads `slot_idx` out of the 1-D tensor even
+        here, where the baseline spec path leaves it untouched. Pinned
+        separately from the row above because the two tensors are written by
+        different lines and only this one is load-bearing off the spec path.
+        """
+        b = builder(replayssm=True)
+        b.prepare_state_indices(batch([[4], [7]]), with_spec=True)
+        assert list(b.non_spec_state_indices_tensor.np[:2]) == [4, 7]
+
+    def test_baseline_still_fans_out_across_the_row(self):
+        """The contrast case: with ReplaySSM off the rollback slots are real
+        and must reach the kernel, so this must NOT collapse to column 0.
+        """
+        b = builder(replayssm=False)
+        b.prepare_state_indices(batch([[4, 1, 6]]), with_spec=True)
+        assert list(b.spec_state_indices_tensor.np[0]) == [4, 1, 6]
 
     def test_a_fork_on_the_spec_path_is_refused(self):
         """There is no read-side spec tensor, so a fork here would silently
