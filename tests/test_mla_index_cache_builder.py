@@ -15,7 +15,7 @@ pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
 try:
     from atom.model_ops.attentions import aiter_mla
     from atom.model_ops.attentions.aiter_mla import AiterMLAMetadataBuilder
-except Exception as exc:  # ImportError / RuntimeError when AITER cannot init
+except (ImportError, RuntimeError) as exc:
     pytest.skip(f"aiter MLA backend unavailable: {exc}", allow_module_level=True)
 
 from atom.model_ops.attentions.mla_cache_layout import (
