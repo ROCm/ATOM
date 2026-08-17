@@ -73,10 +73,6 @@ from atom.model_loader.loader import WeightsMapper
 # code as opaque; Indexer.forward_batched dispatches via the latter to hide
 # its dynamic-shape internals from Dynamo / fake-tensor mode.
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
-from atom.utils.attn_ffn_piecewise import (
-    BufferShape,
-    DecodeAttnFfnPiecewise,
-)
 from atom.model_ops.communication_op import (
     tensor_model_parallel_all_reduce,
 )
@@ -116,6 +112,10 @@ from atom.model_ops.v4_kernels import (
     update_compressor_states,
 )
 from atom.utils import envs, mark_spliting_op
+from atom.utils.attn_ffn_piecewise import (
+    BufferShape,
+    DecodeAttnFfnPiecewise,
+)
 from atom.utils.cuda_graph import CudagraphCaptureRunner
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import mark_trace, support_torch_compile
