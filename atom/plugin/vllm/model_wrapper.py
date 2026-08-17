@@ -526,7 +526,8 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             self._enable_eagle3_draft_interface()
         elif (self.is_eagle3 and self._eagle3_uses_aux_hidden_state()) or (
             # DSpark targets are tapped through the same SupportsEagle3 surface.
-            self.is_dspark and not self.is_dspark_draft_model
+            self.is_dspark
+            and not self.is_dspark_draft_model
         ):
             self._enable_eagle3_target_interface()
         if self.is_mtp:
