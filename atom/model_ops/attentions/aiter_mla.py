@@ -28,7 +28,11 @@ from atom.distributed.pcp_utils import (
     pcp_round_robin_query_indices,
 )
 from atom.model_engine.scheduler import ScheduledBatch
-from atom.model_ops.attention_mla import _MLA_MIN_HEADS, MLAAttention
+from atom.model_ops.attention_mla import (
+    _MLA_MIN_HEADS,
+    MLAAttention,
+    mla_dcp_pad_num_heads,
+)
 from atom.utils import CpuGpuBuffer, envs
 from atom.utils.block_convert import (
     kv_indices_generate_triton,
@@ -167,17 +171,19 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self.dcp_world_size = get_dcp_world_size()
         self.dcp_rank = get_dcp_rank()
 
-        # DCP decode all-gathers Q on the head dim across the DCP group, so the
-        # head count that reaches mla_decode_fwd (and thus the persistent decode
-        # metadata) is padded_num_attention_heads * dcp_world_size. The module's
-        # head-repeat compensates the _MLA_MIN_HEADS padding, so this product
-        # matches the kernel's actual nhead in every case. dcp=1 -> unchanged.
+        # DCP decode pads Q per rank and then all-gathers on the head dim, so the
+        # head count reaching mla_decode_fwd (and thus the persistent decode
+        # metadata) is the gathered width, not the per-rank one.
         # Only gfx950 runs DCP in persistent mode (gfx942 lacks the lse persistent
         # kernel and stays non-persistent, where this metadata is unused); scale
         # by dcp only there so gfx942 keeps the original per-rank head sizing.
-        self.persistent_num_heads = self.padded_num_attention_heads * (
-            self.dcp_world_size if dcp_persistent_supported() else 1
-        )
+        if self.dcp_world_size > 1 and dcp_persistent_supported():
+            self.persistent_num_heads = (
+                mla_dcp_pad_num_heads(self.num_attention_heads, self.dcp_world_size)
+                * self.dcp_world_size
+            )
+        else:
+            self.persistent_num_heads = self.padded_num_attention_heads
 
         max_seqlen_qo = getattr(model_runner, "num_spec_tokens", 0) + 1
         (
@@ -2044,14 +2050,22 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # DCP + MTP (max_q_len>1) capture: the cprr kernel masks on GLOBAL
         # positions, so capture needs a self-consistent (local, global) KV layout
         # or the graph shape won't match replay. Give every seq 1 local token per
-        # rank -> global length = dcp_world_size (page_size=1 only; round-robin
-        # requires it). Replay overwrites these buffers with real values.
+        # rank -> global length = dcp_world_size. Replay overwrites these buffers
+        # with real values.
         cp_round_robin = self.dcp_world_size > 1 and max_q_len > 1
-        if cp_round_robin and self.block_size == 1:
-            var["kv_indptr"].np[: bs + 1] = np.arange(bs + 1, dtype=np.int32)
-            var["kv_indptr"].copy_to_gpu(bs + 1)
-            var["kv_indices"].gpu[:bs].zero_()
-            var["kv_last_page_lens"].gpu[:bs].fill_(1)
+        if cp_round_robin:
+            if self.block_size == 1:
+                var["kv_indptr"].np[: bs + 1] = np.arange(bs + 1, dtype=np.int32)
+                var["kv_indptr"].copy_to_gpu(bs + 1)
+                var["kv_indices"].gpu[:bs].zero_()
+                var["kv_last_page_lens"].gpu[:bs].fill_(1)
+            # g_kv_indptr is the only thing telling the cprr kernel how long each
+            # sequence is GLOBALLY, and nothing else initializes it -- capturing
+            # with it left at its allocation value walks the kernel off the KV
+            # list (illegal access). The round-robin is token-level whatever the
+            # block size, so the one-local-token-per-rank layout set up here (or
+            # by the block_size > 1 branch above) is a global length of
+            # dcp_world_size in both cases.
             var["g_kv_indptr"].np[: bs + 1] = (
                 np.arange(bs + 1, dtype=np.int32) * self.dcp_world_size
             )
