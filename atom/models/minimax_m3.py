@@ -232,6 +232,56 @@ class MiniMaxM3MLP(nn.Module):
         return self.down_proj(x)
 
 
+def _interleave_gate_up_rows_(layer: nn.Module, n_experts: int | None = None) -> None:
+    """Reorder w13 gate/up rows from SEPARATED (gguu) to INTERLEAVED (gugu).
+
+    MiniMax-M3 MXFP4 checkpoints store w13 rows as ``[gate(0..I-1) | up(0..I-1)]``
+    (gguu), but the routed triton a16w4 SwiGLU kernel splits each tile as
+    ``[gate0, up0, gate1, up1, ...]`` (gugu). This reorders ``layer.w13_weight``,
+    ``layer.w13_weight_scale`` and ``layer.w13_bias`` (if present) in place along
+    the row axis so the kernel reads matching gate/up pairs. ``w2`` (down_proj)
+    has no gate/up split and is untouched.
+
+    ``n_experts`` limits the reorder to the FIRST ``n_experts`` experts (default
+    None = all). MiniMax-M3 passes the routed count so the trailing fused shared
+    experts stay gguu for the dense shared-expert path (which half-splits
+    ``[gate | up]`` in ``swiglu_oai_split``).
+
+    The reorder is on whole rows; the MXFP4-packed pairs live on the LAST axis
+    (``H//2`` bytes/row), so it never splits a packed byte. For FP4 we reorder a
+    ``uint8`` view (bit-exact, no dequant/requant — torch has no ``index_select``
+    for ``float4_e2m1fn_x2``). It is applied in place per expert, reusing the
+    existing storage (a full-tensor ``index_select().contiguous()`` would double
+    peak memory and OOM across many layers at load time). Sets
+    ``layer._w13_gate_up_interleaved`` as an idempotency guard.
+    """
+    if getattr(layer, "_w13_gate_up_interleaved", False):
+        return
+
+    def _interleave_inplace(t: torch.Tensor) -> None:
+        # Only FP4 needs the uint8 view (torch has no index_select/reshape for it,
+        # and its bytes are row-contiguous so the row reorder is exact). Other
+        # dtypes (uint8 e8m0 scale, bf16/float bias) reorder directly.
+        _fp4 = getattr(torch, "float4_e2m1fn_x2", None)
+        buf = t.view(torch.uint8) if (_fp4 is not None and t.dtype == _fp4) else t
+
+        E, two_i = buf.shape[0], buf.shape[1]
+        assert two_i % 2 == 0, f"w13 row dim {two_i} not even"
+        n = E if n_experts is None else min(n_experts, E)
+        i = two_i // 2
+        rest = buf.shape[2:]
+        for e in range(n):
+            rows = buf[e]  # view into storage, shape (2I, *rest)
+            gugu = rows.view(2, i, *rest).transpose(0, 1).reshape(two_i, *rest)
+            rows.copy_(gugu)  # write back into the same storage
+
+    _interleave_inplace(layer.w13_weight.data)
+    _interleave_inplace(layer.w13_weight_scale.data)
+    if getattr(layer, "w13_bias", None) is not None:
+        _interleave_inplace(layer.w13_bias.data)
+    layer._w13_gate_up_interleaved = True
+
+
 class MiniMaxM3MoE(nn.Module):
     """MiniMax-M3 routed MoE for MXFP4 checkpoints."""
 
@@ -291,6 +341,12 @@ class MiniMaxM3MoE(nn.Module):
             # padded intermediate avoids backend pad-skip precision issues.
             self.experts.quant_method.intermediate_pad = 0
         self.experts.swiglu_limit = getattr(config, "swiglu_limit", 7.0)
+        # SwiGLU-OAI params for the standalone dense shared-expert GEMM
+        # (Mxfp4MoEMethod._apply_shared_experts_dense). The routed experts use
+        # alpha (default 1.702) and swiglu_add_residual=True (beta == 1.0); the
+        # dense shared experts must match.
+        self.experts.swiglu_alpha = getattr(config, "swiglu_alpha", 1.702)
+        self.experts.swiglu_beta = getattr(config, "swiglu_beta", 1.0)
         self.fuse_shared_experts = (
             getattr(self.experts, "num_fused_shared_experts", 0) > 0
         )
@@ -304,6 +360,30 @@ class MiniMaxM3MoE(nn.Module):
                 reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
             )
+
+    def process_weights_after_loading(self):
+        """Interleave routed w13 gate/up rows (gguu -> gugu) for the triton path.
+
+        MiniMax-M3 MXFP4 checkpoints store w13 gate/up rows SEPARATED
+        ("gguu": [all-gate | all-up]), but the routed triton a16w4 SwiGLU kernel
+        splits each tile INTERLEAVED ("gugu": even rows = gate, odd = up). We
+        interleave the routed experts in place once at load time so the kernel
+        reads matching gate/up pairs. The non-triton (aiter CK) path consumes
+        gguu directly, so it is left untouched.
+
+        Only the ROUTED experts are interleaved. The fused shared experts occupy
+        the trailing ``num_fused_shared_experts`` slots and must stay gguu: the
+        dense shared-expert path (``_apply_shared_experts_dense`` ->
+        ``swiglu_oai_split``) half-splits ``[gate | up]``, and
+        ``Mxfp4MoEMethod.process_weights_after_loading`` (invoked by the loader
+        AFTER this model hook) clones those trailing slots in gguu for it.
+        """
+        qm = getattr(self.experts, "quant_method", None)
+        if not getattr(qm, "use_triton", False):
+            return
+        n_total = self.experts.w13_weight.shape[0]
+        n_shared = getattr(self.experts, "num_fused_shared_experts", 0)
+        _interleave_gate_up_rows_(self.experts, n_experts=n_total - n_shared)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
@@ -395,7 +475,7 @@ class MiniMaxM3Attention(nn.Module):
         hidden_states_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states, x_scale=hidden_states_scale)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
         attn_output = self.attn(q, k, v, positions=positions, qkv=qkv)
         return self.o_proj(attn_output)
 
@@ -536,7 +616,8 @@ class MiniMaxM3SparseAttention(nn.Module):
         # Keep index Q/K packed with main QKV. Layers that reuse cached top-k skip
         # the indexer norm/rope/top-k path, but still compute the packed GEMM.
         qkv = self.qkv_proj(hidden_states, x_scale=hidden_states_scale)
-        q, k, v, _, _ = qkv.split(
+        q, k, v, _, _ = torch.split(
+            qkv,
             [
                 self.q_size,
                 self.kv_size,

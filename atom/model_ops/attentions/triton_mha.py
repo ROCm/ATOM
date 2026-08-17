@@ -11,7 +11,7 @@ from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mha import PagedAttentionImpl
 from atom.utils import envs
 
-from .aiter_attention import AiterAttentionMetadataBuilder
+from .aiter_attention import AiterAttentionMetadataBuilder, _is_indexed_sparse_attention
 from .backends import AttentionBackend
 
 logger = logging.getLogger("atom")
@@ -79,6 +79,24 @@ class TritonMHAMetadataBuilder(AiterAttentionMetadataBuilder):
         return attn_metadata, positions
 
     def build_kv_cache_tensor(self, layer_id: int, module):
+        if _is_indexed_sparse_attention(module):
+            # MiniMax-M3 sparse attention. It keeps its own SparseMHAPagedAttentionImpl
+            # (model-supplied impl_cls wins over the backend), so it does NOT use
+            # unified_attention — it only needs the same KV binding as standard MHA
+            # plus its separate indexer-key cache bound here, then falls through to the
+            # standard branch for K/V + scale binding. The standard binding is page-128
+            # SHUFFLE; SparseMHAPagedAttentionImpl.rope_cache re-views it to page-16
+            # SHUFFLE (zero-copy) at attention time.
+            runner = self.model_runner
+            sparse_idx = runner._sparse_attention_cache_next
+            runner._sparse_attention_cache_next += 1
+            module.impl.index_cache = runner.sparse_attention_index_cache[sparse_idx]
+            module.impl.max_model_len = runner.config.max_model_len
+            module.impl.index_topk_cache_state = getattr(
+                runner, "_sparse_attention_topk_cache_state", None
+            )
+            # NOTE: no return — fall through to the standard MHA binding below.
+
         if not (
             hasattr(module, "base_attention")
             and hasattr(module, "use_mla")
@@ -96,15 +114,6 @@ class TritonMHAMetadataBuilder(AiterAttentionMetadataBuilder):
             )
 
         impl = getattr(module, "impl", None)
-        if impl is not None and (
-            getattr(impl, "rotary_emb", None) is not None
-            and getattr(impl, "q_norm", None) is not None
-            and getattr(impl, "k_norm", None) is not None
-        ):
-            raise NotImplementedError(
-                "TritonMHABackend is incompatible with the fused qk_norm+rope+shuffle "
-                "cache path; use AiterBackend for this model."
-            )
 
         if runner.is_qwen_next():
             mtp_start = runner.mtp_start_layer_idx

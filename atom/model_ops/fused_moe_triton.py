@@ -47,6 +47,23 @@ if (
 
 from atom.model_ops.moe import MoEActivationQuant
 
+# e4m3 max representable magnitude, used to derive a per-tensor FP8 scale.
+_FP8_E4M3_MAX = 448.0
+
+
+def _dynamic_per_tensor_fp8(x: torch.Tensor):
+    """Quantize ``x`` to FP8 e4m3 with a runtime per-tensor scale.
+                # Static path (checkpoint ships per-tensor input scales, e.g.
+                # gpt-oss): pre-quantize to FP8 and let GEMM1 emit the FP8
+                # intermediate directly (scale = a2_scale), fully fused.
+    Returns ``(x_fp8, scale)`` where ``scale`` is a scalar float32 tensor such
+    that ``x ≈ x_fp8 * scale``.
+    """
+    amax = x.abs().amax().to(torch.float32)
+    scale = (amax / _FP8_E4M3_MAX).clamp(min=1e-12)
+    x_fp8 = downcast_to_static_fp8(x, scale)
+    return x_fp8, scale
+
 
 def _swizzle_mxfp4(
     w1,
@@ -224,45 +241,89 @@ def triton_kernel_fused_experts(
     if activation == ActivationType.Swiglu:
         # SwiGLU (GPT OSS): fused activation with interleaved [gate, up] layout
         if act_quant == MoEActivationQuant.FP8:
-            assert a13_scale is not None
-            assert a2_scale is not None
-
             quant_dtype = torch.float8_e4m3fn
             if get_arch() == "gfx942":
                 quant_dtype = torch.float8_e4m3fnuz
 
-            hidden_states = downcast_to_static_fp8(hidden_states, a13_scale)
-            interm_cache = moe_gemm_a8w4(
-                hidden_states,
-                w1,
-                None,
-                w13_scale,
-                a13_scale,
-                a2_scale,
-                w1_bias,
-                routing_data,
-                gather_indx=gather_indx,
-                gammas=gammas if apply_router_weight_on_input else None,
-                swizzle_mx_scale=w13_swizzle_layout,
-                out_dtype=quant_dtype,
-                apply_swiglu=True,
-                alpha=swiglu_alpha,
-                limit=swiglu_limit,
-                swiglu_add_residual=True,
-            )
-            output_tensor = moe_gemm_a8w4(
-                interm_cache,
-                w2,
-                None,
-                w2_scale,
-                a2_scale,
-                None,
-                w2_bias,
-                routing_data,
-                scatter_indx=scatter_indx,
-                gammas=None if apply_router_weight_on_input else gammas,
-                swizzle_mx_scale=w2_swizzle_layout,
-            )
+            if a13_scale is not None and a2_scale is not None:
+                hidden_states = downcast_to_static_fp8(hidden_states, a13_scale)
+                interm_cache = moe_gemm_a8w4(
+                    hidden_states,
+                    w1,
+                    None,
+                    w13_scale,
+                    a13_scale,
+                    a2_scale,
+                    w1_bias,
+                    routing_data,
+                    gather_indx=gather_indx,
+                    gammas=gammas if apply_router_weight_on_input else None,
+                    swizzle_mx_scale=w13_swizzle_layout,
+                    out_dtype=quant_dtype,
+                    apply_swiglu=True,
+                    alpha=swiglu_alpha,
+                    limit=swiglu_limit,
+                    swiglu_add_residual=True,
+                )
+                output_tensor = moe_gemm_a8w4(
+                    interm_cache,
+                    w2,
+                    None,
+                    w2_scale,
+                    a2_scale,
+                    None,
+                    w2_bias,
+                    routing_data,
+                    scatter_indx=scatter_indx,
+                    gammas=None if apply_router_weight_on_input else gammas,
+                    swizzle_mx_scale=w2_swizzle_layout,
+                )
+            else:
+                # Dynamic path (no static input scales, e.g. MiniMax-M3): derive
+                # per-tensor FP8 scales at runtime. GEMM1 quantizes the input to
+                # FP8 and emits a BF16 swiglu intermediate, which is re-quantized
+                # to FP8 for GEMM2. Static-scale API throughout (x_scales=None) so
+                # the gfx1250 mxfp8+gather M>1024 restriction never applies. The
+                # prefill gluon kernel only supports static-scale-fp8 or bf16
+                # write-back (no out_mx_quant), so BF16 is the intermediate dtype.
+                hidden_states_fp8, a13_scale_dyn = _dynamic_per_tensor_fp8(
+                    hidden_states
+                )
+                # Static path (checkpoint ships per-tensor input scales, e.g.
+                # gpt-oss): pre-quantize to FP8 and let GEMM1 emit the FP8
+                # intermediate directly (scale = a2_scale), fully fused.
+                interm_bf16 = moe_gemm_a8w4(
+                    hidden_states_fp8,
+                    w1,
+                    None,
+                    w13_scale,
+                    a13_scale_dyn,
+                    None,
+                    w1_bias,
+                    routing_data,
+                    gather_indx=gather_indx,
+                    gammas=gammas if apply_router_weight_on_input else None,
+                    swizzle_mx_scale=w13_swizzle_layout,
+                    out_dtype=torch.bfloat16,
+                    apply_swiglu=True,
+                    alpha=swiglu_alpha,
+                    limit=swiglu_limit,
+                    swiglu_add_residual=True,
+                )
+                interm_fp8, a2_scale_dyn = _dynamic_per_tensor_fp8(interm_bf16)
+                output_tensor = moe_gemm_a8w4(
+                    interm_fp8,
+                    w2,
+                    None,
+                    w2_scale,
+                    a2_scale_dyn,
+                    None,
+                    w2_bias,
+                    routing_data,
+                    scatter_indx=scatter_indx,
+                    gammas=None if apply_router_weight_on_input else gammas,
+                    swizzle_mx_scale=w2_swizzle_layout,
+                )
         else:
             interm_cache = moe_gemm_a16w4(
                 hidden_states,
