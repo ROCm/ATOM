@@ -309,3 +309,86 @@ class TestTheBuilderDeclaresWhatItDrops:
         # `state_transfer` builds the id from exactly this expression, so a
         # change to the rule cannot leave the id saying what it used to.
         assert nocopy == "hca_main_kv,hca_main_score"
+
+
+class TestPageUnitAddressesAreArithmetic:
+    """The addresses `_page_unit_regions` computes are the ones slicing gave.
+
+    Replacing 22 throwaway tensor views per unit with three multiplications is
+    only safe if it lands on the same bytes, so this asks both and compares.
+    The old expression is written out here rather than kept in production: it
+    is the oracle, not a fallback.
+    """
+
+    N_CSA = 3
+    NUM_BLOCKS = 5
+    ENVELOPE_ROWS = 7
+    ROW_BYTES = 16
+    IDX_ROWS = 4
+    IDX_ROW_BYTES = 8
+
+    def build(self):
+        plane = torch.zeros(
+            self.NUM_BLOCKS * self.ENVELOPE_ROWS, self.ROW_BYTES, dtype=torch.uint8
+        )
+        idx = torch.zeros(
+            self.N_CSA,
+            self.NUM_BLOCKS,
+            self.IDX_ROWS,
+            self.IDX_ROW_BYTES,
+            dtype=torch.uint8,
+        )
+
+        class _Runner:
+            v4_csa_idx_kv = idx
+            v4_kv_plane = plane
+            v4_kv_plane_rope = None
+
+        class _Geo:
+            envelope_rows = self.ENVELOPE_ROWS
+
+        class _Stub:
+            _page_unit_regions = Builder._page_unit_regions
+            _one_page_unit_segments = Builder._one_page_unit_segments
+            _kv_planes = Builder._kv_planes
+            model_runner = _Runner()
+            pool_geometry = _Geo()
+            csa_layers = tuple(range(self.N_CSA))
+            _indexer_fp4 = False
+            _page_unit_region_cache = None
+
+            def _plane_row_widths(self):
+                return [16]
+
+        return _Stub(), plane, idx
+
+    def sliced(self, plane, idx, block_id):
+        """What `_one_page_unit_segments` used to build, view by view."""
+        start = block_id * self.ENVELOPE_ROWS
+        views = [plane[start : start + self.ENVELOPE_ROWS]]
+        views += [idx[layer, block_id] for layer in range(self.N_CSA)]
+        return [(int(v.data_ptr()), v.numel() * v.element_size()) for v in views]
+
+    def test_every_region_lands_where_a_slice_would_have(self):
+        stub, plane, idx = self.build()
+
+        for block_id in range(self.NUM_BLOCKS):
+            got = [
+                (s.ptr, s.num_bytes)
+                for s in Builder._one_page_unit_segments(stub, block_id)
+            ]
+            assert got == self.sliced(plane, idx, block_id), f"block {block_id}"
+
+    def test_the_regions_are_worked_out_once(self):
+        stub, _, _ = self.build()
+
+        first = Builder._page_unit_regions(stub)
+        assert Builder._page_unit_regions(stub) is first
+
+    def test_a_non_contiguous_pool_is_refused_not_mis_addressed(self):
+        """Affine addressing assumes the layout; say so rather than guess."""
+        stub, _, idx = self.build()
+        stub.model_runner.v4_csa_idx_kv = idx.transpose(0, 1)
+
+        with pytest.raises(RuntimeError, match="contiguous"):
+            Builder._page_unit_regions(stub)

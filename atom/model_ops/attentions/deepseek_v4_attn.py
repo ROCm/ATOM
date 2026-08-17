@@ -610,6 +610,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # Filled on the first checkpoint copy — the pools do not exist yet here.
         self._slot_view_cache: list[list[torch.Tensor]] | None = None
         self._checkpoint_range_cache: list[list[tuple[int, int]]] | None = None
+        self._page_unit_region_cache: list[tuple[int, int]] | None = None
 
     @property
     def prep_stream(self):
@@ -928,25 +929,54 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             for offset, nbytes in ranges
         ]
 
-    def _one_page_unit_segments(self, block_id: int):
-        """All physical regions owned by one logical DSV4 PAGE block id."""
-        from atom.model_ops.attentions.paged_state_copy import tensor_segment
+    def _page_unit_regions(self) -> list[tuple[int, int]]:
+        """`(base, num_bytes)` per region a PAGE block id owns.
 
-        runner = self.model_runner
-        geo = self.pool_geometry
-        start = block_id * geo.envelope_rows
-        stop = start + geo.envelope_rows
-        segments = [tensor_segment(plane[start:stop]) for plane in self._kv_planes()]
-        segments.extend(
-            tensor_segment(runner.v4_csa_idx_kv[layer, block_id])
-            for layer in range(len(self.csa_layers))
-        )
-        if self._indexer_fp4:
-            segments.extend(
-                tensor_segment(runner.v4_csa_idx_kv_scale[layer, block_id])
-                for layer in range(len(self.csa_layers))
-            )
-        return segments
+        Blocks sit back to back in every pool, so a block's stride there is
+        its size and its address is `base + block_id * num_bytes` — affine,
+        and a property of the pools rather than of any block, so it is worked
+        out once. Slicing the tensors instead, which is what this replaced,
+        built 22 views per unit per op and threw them away to learn addresses
+        that are one multiplication each.
+
+        `tensor_segment`'s contiguity check comes along: the same check, asked
+        once of the layout instead of every time of a slice.
+        """
+        if self._page_unit_region_cache is None:
+            geo = self.pool_geometry
+            regions: list[tuple[int, int]] = []
+            for plane, width in zip(
+                self._kv_planes(), self._plane_row_widths(), strict=True
+            ):
+                if not plane.is_contiguous():
+                    raise RuntimeError("a KV plane must be contiguous to be copied")
+                regions.append((plane.data_ptr(), geo.envelope_rows * width))
+            runner = self.model_runner
+            pools = [runner.v4_csa_idx_kv]
+            if self._indexer_fp4:
+                pools.append(runner.v4_csa_idx_kv_scale)
+            for pool in pools:
+                if not pool.is_contiguous():
+                    raise RuntimeError(
+                        "an indexer pool must be contiguous to be copied"
+                    )
+                per_layer = pool.stride(0) * pool.element_size()
+                per_block = pool.stride(1) * pool.element_size()
+                regions += [
+                    (pool.data_ptr() + layer * per_layer, per_block)
+                    for layer in range(len(self.csa_layers))
+                ]
+            self._page_unit_region_cache = regions
+        return self._page_unit_region_cache
+
+    def _one_page_unit_segments(self, block_id: int):
+        """Every physical region one logical DSV4 PAGE block id owns."""
+        from atom.model_ops.attentions.paged_state_copy import ByteSegment
+
+        return [
+            ByteSegment(base + block_id * nbytes, nbytes)
+            for base, nbytes in self._page_unit_regions()
+        ]
 
     def _page_unit_segments(self, unit_ids):
         segments = []
