@@ -73,7 +73,7 @@ from atom.model_loader.loader import WeightsMapper
 # code as opaque; Indexer.forward_batched dispatches via the latter to hide
 # its dynamic-shape internals from Dynamo / fake-tensor mode.
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
-from atom.model_ops.attn_ffn_piecewise import (
+from atom.utils.attn_ffn_piecewise import (
     BufferShape,
     DecodeAttnFfnPiecewise,
 )
@@ -2755,22 +2755,16 @@ class DeepseekV4Attention(nn.Module):
             x = x.clone()
             act_quant_inplace(x, 128, "ue8m0")
 
-        # AF_PIECEWISE zero-copy: stage each input into its fixed-address buffer
-        # so the attn-core cudagraph reads a constant address (no per-step copy).
-        # `attn_ffn_bufs` is None on both paths that must NOT stage: a layer
-        # whose core is not captured, and a step whose token count overflows the
-        # buffers (prefill). Explicit at each site rather than hidden behind a
-        # no-op pool -- this is traced, and which mode it runs in should be
-        # readable here.
+        # AF_PIECEWISE zero-copy: stage inputs so the attn-core graph reads
+        # constant addresses. None = don't stage (core not captured, or prefill
+        # overflows the buffers); explicit at each site since this is traced.
         n = x.shape[0]
         attn_ffn_bufs = self.attn_ffn.staging(n)
 
-        # kv_pre: fixing the WHOLE wqkv_a output inplace makes kv_pre = split[1]
-        # a stable view, so it needs no staging of its own. The fallback stages
-        # only kv_pre -- copying all of qkv_a to reach it would cost more than
-        # the copy it saves. Ask the pool for the buffer rather than trusting the
-        # flag alone: the flag says the GEMM CAN write out=, not that this step
-        # has anywhere to write it.
+        # Fixing the whole wqkv_a output inplace makes kv_pre a stable view, so
+        # only the fallback stages it (copying all of qkv_a would cost more).
+        # Ask the pool, not the flag: the flag says the GEMM can write out=, not
+        # that this step has anywhere to write it.
         attn_ffn_qkv_a_buf = (
             attn_ffn_bufs.get("qkv_a")
             if (attn_ffn_bufs is not None and self._wqkv_a_inplace)

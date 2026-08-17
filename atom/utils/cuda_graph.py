@@ -298,8 +298,8 @@ class CudagraphCaptureRunner:
 
     Extracted from the AF_PIECEWISE attention-core path (DeepSeek-V4 DSpark). A
     caller builds a graph key and the named inputs, then calls run() -- usually
-    via run_attn_ffn_piecewise (atom/model_ops/attn_ffn_piecewise.py), which owns
-    the model-facing contract. The runner owns the per-key graph cache and a
+    via AttnFfnPiecewise.run (atom/utils/attn_ffn_piecewise.py), which owns the
+    model-facing contract. The runner owns the per-key graph cache and a
     dedicated graph pool (isolated from the dense-piece pool). zero-copy args are
     captured on directly (no per-step copy); others cloned at capture, copied at
     replay.

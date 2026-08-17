@@ -327,12 +327,12 @@ def test_scheduler_multi_request_global_topk():
 
 
 # ---------------------------------------------------------------------------
-# AF_PIECEWISE generic contract (atom/model_ops/attn_ffn_piecewise.py)
+# AF_PIECEWISE generic contract (atom/utils/attn_ffn_piecewise.py)
 # ---------------------------------------------------------------------------
 
 
 def test_zero_copy_buffers_stage_returns_a_fixed_address():
-    from atom.model_ops.attn_ffn_piecewise import ZeroCopyBuffers
+    from atom.utils.attn_ffn_piecewise import ZeroCopyBuffers
 
     bufs = ZeroCopyBuffers(max_tokens=8)
     bufs.alloc("q", width=4, dtype=torch.float32, device="cpu")
@@ -351,7 +351,7 @@ def test_zero_copy_buffers_stage_returns_a_fixed_address():
 
 
 def test_zero_copy_names_resolve_by_name_not_position():
-    from atom.model_ops.attn_ffn_piecewise import resolve_zero_copy_names
+    from atom.utils.attn_ffn_piecewise import resolve_zero_copy_names
 
     names = ("x", "q", "positions")
     assert resolve_zero_copy_names(names, None, default_excluded=("positions",)) == {
@@ -407,7 +407,7 @@ def test_v4_core_inputs_come_from_the_signature_and_are_all_zero_copy():
 def test_core_with_var_kwargs_is_rejected():
     # **kwargs carries no order, and the runner expands by order. Better to fail
     # at class use than to mis-assign inputs at replay.
-    from atom.model_ops.attn_ffn_piecewise import AttnFfnPiecewise
+    from atom.utils.attn_ffn_piecewise import AttnFfnPiecewise
 
     class _Bad(AttnFfnPiecewise):
         def core(self, **named):
