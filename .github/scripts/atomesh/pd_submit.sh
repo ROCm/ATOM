@@ -566,7 +566,7 @@ read_slurm_exit_code() {
 
   SLURM_STATE="unknown"
   SLURM_EXIT_CODE="unknown"
-  SLURM_JOB_RC=1
+  SLURM_JOB_RC=2
 
   if ! command -v sacct >/dev/null 2>&1; then
     echo "WARNING: sacct not found; unable to read Slurm job exit code" >&2
