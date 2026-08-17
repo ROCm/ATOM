@@ -590,6 +590,7 @@ read_slurm_exit_code() {
   if [[ -z "${sacct_line}" ]]; then
     return 0
   fi
+  echo "sacct_line=${sacct_line}"
 
   SLURM_STATE="${sacct_line%%|*}"
   SLURM_EXIT_CODE="${sacct_line##*|}"
