@@ -1,0 +1,541 @@
+name: ATOM SGLang Test Reusable
+
+on:
+  workflow_call:
+    inputs:
+      caller_sha:
+        required: true
+        type: string
+      pr_head_ref:
+        required: true
+        type: string
+      pr_head_sha:
+        required: true
+        type: string
+      pr_head_repo_fork:
+        required: true
+        type: boolean
+      repo_url:
+        required: true
+        type: string
+      commit_sha:
+        required: true
+        type: string
+
+env:
+  ATOM_BASE_NIGHTLY_IMAGE: rocm/atom-dev:latest
+  ATOM_PYTHON_TAG: "cp312"
+  SGLANG_IMAGE_CACHE_KEEP: "3"
+  GITHUB_REPO_URL: ${{ inputs.repo_url }}
+  GITHUB_COMMIT_SHA: ${{ inputs.commit_sha }}
+  NIGHTLY_SGLANG_IMAGE_TAG: rocm/atom-dev:sglang-latest
+
+jobs:
+  check-signal:
+    name: Check Pre Checkin Signal
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+
+      - name: Wait for Pre Checkin workflow
+        run: bash ./.github/scripts/check_signal.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_SHA: ${{ inputs.caller_sha }}
+          CHECK_SIGNAL_EVENT_NAME: pull_request
+          CHECK_SIGNAL_HEAD_REF: ${{ inputs.pr_head_ref }}
+          CHECK_SIGNAL_SHA: ${{ inputs.pr_head_sha }}
+
+  download_aiter_wheel:
+    if: ${{ needs.check-signal.result == 'success' }}
+    needs: [check-signal]
+    name: Download aiter wheel
+    runs-on: ubuntu-latest
+    outputs:
+      aiter_artifact_id: ${{ steps.download.outputs.aiter_artifact_id }}
+      aiter_wheel_name: ${{ steps.download.outputs.aiter_wheel_name }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Prefer latest main aiter wheel manifest and fallback to artifact
+        id: download
+        timeout-minutes: 30
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash .github/scripts/download_aiter_wheel.sh
+
+      - name: Upload aiter wheel
+        uses: actions/upload-artifact@v7
+        with:
+          name: aiter-whl
+          path: aiter-whl/amd_aiter*.whl
+          retention-days: 7
+
+  atom-sglang-accuracy:
+    needs: [check-signal, download_aiter_wheel]
+    if: ${{ needs.check-signal.result == 'success' && needs.download_aiter_wheel.result == 'success' }}
+    name: Accuracy (${{ matrix.model_name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - model_name: "GLM-5.1-FP8 TP8"
+            model_path: "zai-org/GLM-5.1-FP8"
+            extra_args: "--trust-remote-code --tensor-parallel-size 8 --attention-backend aiter --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.85 --page-size 1 --disable-radix-cache"
+            env_vars: |
+              SGLANG_AITER_FP8_PREFILL_ATTN=0
+              SGLANG_USE_AITER=1
+              ATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1
+              SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
+            lm_eval_num_fewshot: 5
+            accuracy_test_threshold: 0.93
+            runner: atom-mi355-8gpu-vllm-sgl-ci
+          - model_name: "DeepSeek-R1-FP4-V2 TP8 MTP3"
+            model_path: "amd/DeepSeek-R1-0528-MXFP4-v2"
+            extra_args: "--trust-remote-code --tensor-parallel-size 8 --attention-backend aiter --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.85 --page-size 1 --disable-radix-cache --speculative-draft-model-path SGLang/DeepSeek-R1-NextN --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --max-running-requests 256 --cuda-graph-bs 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99 100 101 102 103 104 105 106 107 108 109 110 111 112 113 114 115 116 117 118 119 120 121 122 123 124 125 126 127 128 160 192 224 256"
+            env_vars: |
+              SGLANG_DEFAULT_SERVER_ARGS=
+              ATOM_ENABLE_DS_QKNORM_QUANT_FUSION=1
+              SGLANG_AITER_FP8_PREFILL_ATTN=0
+              SGLANG_USE_AITER=1
+              SGLANG_ENABLE_SPEC_V2=1
+              SGLANG_ENABLE_TORCH_COMPILE=1
+              SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
+              TORCHINDUCTOR_COMPILE_THREADS=128
+            accuracy_test_threshold: 0.93
+            runner: atom-mi355-8gpu-vllm-sgl-ci
+          - model_name: "MiniMax-M3-MXFP4 TP4"
+            model_path: "amd/MiniMax-M3-MXFP4"
+            extra_args: "--trust-remote-code --tensor-parallel-size 4 --attention-backend aiter --page-size 128 --mem-fraction-static 0.8 --max-running-requests 128 --disable-radix-cache"
+            env_vars: |
+              SGLANG_DEFAULT_SERVER_ARGS=
+              AITER_QUICK_REDUCE_QUANTIZATION=INT4
+              SGLANG_USE_AITER=1
+              ATOM_FORCE_ATTN_TRITON=1
+              SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
+              SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=atom.plugin.sglang.models
+            lm_eval_num_fewshot: 5
+            lm_eval_num_concurrent: 32
+            lm_eval_use_chat_completions: "1"
+            lm_eval_extra_model_args: "max_gen_toks=16384"
+            accuracy_test_threshold: 0.93
+            runner: atom-mi355-8gpu-vllm-sgl-ci
+          - model_name: "Qwen3.5-35B-A3B-FP8 TP2"
+            model_path: "Qwen/Qwen3.5-35B-A3B-FP8"
+            extra_args: "--tensor-parallel-size 2 --mem-fraction-static 0.9 --reasoning-parser qwen3 --disable-radix-cache"
+            env_vars: |
+              SGLANG_DEFAULT_SERVER_ARGS=
+              SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
+              ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0
+            accuracy_test_threshold: 0.76
+            runner: atom-mi355-8gpu-vllm-sgl-ci
+          - model_name: "DeepSeek-V4-Flash TP8"
+            model_path: "deepseek-ai/DeepSeek-V4-Flash"
+            extra_args: "--trust-remote-code --tensor-parallel-size 8 --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.9 --swa-full-tokens-ratio 0.1 --max-running-requests 256 --page-size 256 --disable-radix-cache --disable-shared-experts-fusion --tool-call-parser deepseekv4 --reasoning-parser deepseek-v4"
+            env_vars: |
+              SGLANG_DEFAULT_SERVER_ARGS=
+              AITER_BF16_FP8_MOE_BOUND=0
+              ATOM_MOE_GU_ITLV=1
+              SGLANG_DEFAULT_THINKING=1
+              SGLANG_DSV4_REASONING_EFFORT=max
+              SGLANG_USE_AITER=1
+              SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
+              TORCHINDUCTOR_COMPILE_THREADS=128
+            lm_eval_num_fewshot: 5
+            lm_eval_num_concurrent: 8
+            accuracy_test_threshold: 0.94
+            runner: atom-mi355-8gpu-vllm-sgl-ci
+          - model_name: "DeepSeek-V4-Pro MTP3 TP8"
+            model_path: "deepseek-ai/DeepSeek-V4-Pro"
+            extra_args: "--trust-remote-code --tensor-parallel-size 8 --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.9 --swa-full-tokens-ratio 0.1 --max-running-requests 256 --page-size 256 --disable-radix-cache --disable-shared-experts-fusion --tool-call-parser deepseekv4 --reasoning-parser deepseek-v4 --speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4"
+            env_vars: |
+              SGLANG_DEFAULT_SERVER_ARGS=
+              AITER_BF16_FP8_MOE_BOUND=0
+              ATOM_MOE_GU_ITLV=1
+              SGLANG_DEFAULT_THINKING=1
+              SGLANG_DSV4_REASONING_EFFORT=max
+              SGLANG_USE_AITER=1
+              SGLANG_DSV4_FP4_EXPERTS=true
+              SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
+              TORCHINDUCTOR_COMPILE_THREADS=128
+              ATOM_USE_TRITON_MOE=0
+              ATOM_SGLANG_V4_DISABLE_PRO_DRAFT_TRITON_MOE=1
+              ATOM_SGLANG_V4_ENABLE_DRAFT_EXTEND_CG=1
+            lm_eval_num_fewshot: 5
+            lm_eval_num_concurrent: 8
+            accuracy_test_threshold: 0.94
+            runner: atom-mi355-8gpu-vllm-sgl-ci
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      actions: read
+      contents: read
+    timeout-minutes: 180
+    env:
+      CONTAINER_NAME: atom_sglang_${{ strategy.job-index }}
+      AITER_ARTIFACT_ID: ${{ needs.download_aiter_wheel.outputs.aiter_artifact_id }}
+
+    steps:
+      - name: Configure Docker client config path
+        run: |
+          # Self-hosted runners often have a small or full $HOME; buildx defaults to ~/.docker/buildx
+          # and fails with "no space left on device" on .lock. Point DOCKER_CONFIG + BUILDKIT_TMPDIR
+          # at the job workspace (typically a larger volume than /home).
+          case "${{ matrix.runner }}" in
+            atom-mi308-8gpu-plugins-benchmark|atom-mi355-8gpu.predownload)
+              echo "DOCKER_CONFIG=${GITHUB_WORKSPACE}/.atom-docker-client" >> "$GITHUB_ENV"
+              echo "BUILDKIT_TMPDIR=${GITHUB_WORKSPACE}/.buildkit-tmp" >> "$GITHUB_ENV"
+              echo "Set DOCKER_CONFIG and BUILDKIT_TMPDIR under workspace."
+              ;;
+            *)
+              echo "Runner ${{ matrix.runner }}: leave DOCKER_CONFIG unset (default ~/.docker)."
+              ;;
+          esac
+      
+      - name: Clean up containers and workspace
+        if: contains(fromJSON('["atom-mi355-8gpu.predownload"]'), matrix.runner)
+        run: |
+          echo "=== Cleaning up containers on $(hostname) ==="
+          containers=$(docker ps -q)
+          if [ -n "$containers" ]; then
+            docker kill $containers || true
+          fi
+          docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged rocm/pytorch:latest bash -lc "ls -la /workspace/ && find /workspace -mindepth 1 -delete" || true
+
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+
+      - name: Ensure Docker client config directory
+        if: contains(fromJSON('["atom-mi308-8gpu-plugins-benchmark","atom-mi355-8gpu.predownload"]'), matrix.runner)
+        run: |
+          set -euo pipefail
+          mkdir -p "$DOCKER_CONFIG"
+          chmod 700 "$DOCKER_CONFIG"
+          mkdir -p "${BUILDKIT_TMPDIR}"
+          chmod 700 "${BUILDKIT_TMPDIR}"
+
+      - name: Resolve SGLang version metadata
+        run: python3 .github/scripts/resolve_sglang_metadata.py
+
+      - name: Set HF_TOKEN
+        run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> $GITHUB_ENV
+
+      - name: Docker Login
+        if: ${{ !inputs.pr_head_repo_fork }}
+        run: |
+          echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
+
+      - name: Download aiter wheel
+        timeout-minutes: 30
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AITER_WHEEL_DOWNLOAD_MODE: workflow_artifact
+          AITER_WORKFLOW_ARTIFACT_NAME: aiter-whl
+        run: bash .github/scripts/download_aiter_wheel.sh
+
+      - name: Generate SGLANG overlay Dockerfile
+        run: |
+          cat <<'EOF' > Dockerfile.mod
+          ARG SGLANG_BASE_IMAGE
+          FROM ${SGLANG_BASE_IMAGE}
+          ARG GITHUB_REPO_URL
+          ARG GITHUB_COMMIT_SHA
+          ARG SGLANG_REF
+          ARG AITER_ARTIFACT_ID
+          ARG INSTALL_LM_EVAL=1
+          LABEL com.rocm.atom.sglang_ref="${SGLANG_REF}"
+          LABEL com.rocm.atom.aiter_artifact_id="${AITER_ARTIFACT_ID}"
+          COPY aiter-whl/ /tmp/aiter-whl/
+          RUN if [ "${INSTALL_LM_EVAL}" = "1" ]; then pip install -U "lm-eval[api]"; else echo "Skip lm-eval install"; fi
+          RUN pip show lm-eval || true
+          RUN pip install hf_transfer
+          RUN pip show hf_transfer || true
+          RUN pip install --upgrade "pybind11>=3.0.1"
+          RUN pip show pybind11
+          RUN echo "=== Aiter version BEFORE uninstall ===" && pip show amd-aiter || true && \
+              pip uninstall -y amd-aiter || true && \
+              rm -rf /app/aiter-test && \
+              AITER_WHL="$(ls -t /tmp/aiter-whl/amd_aiter*.whl 2>/dev/null | head -1)" && \
+              if [ -z "${AITER_WHL}" ]; then echo "ERROR: No amd_aiter wheel found under /tmp/aiter-whl"; ls -la /tmp/aiter-whl || true; exit 1; fi && \
+              pip install "${AITER_WHL}" && \
+              echo "=== Aiter version AFTER installation ===" && pip show amd-aiter || true && \
+              rm -rf /tmp/aiter-whl
+          RUN echo "=== ATOM version BEFORE uninstall ===" && pip show atom || true && \
+              pip uninstall -y atom || true && \
+              rm -rf /app/ATOM && \
+              git clone "${GITHUB_REPO_URL}" /app/ATOM && \
+              cd /app/ATOM && \
+              git checkout "${GITHUB_COMMIT_SHA}" && \
+              echo "=== nofile BEFORE: soft=$(ulimit -Sn) hard=$(ulimit -Hn)" && \
+              (ulimit -n 1048576 2>/dev/null || ulimit -n 65536 2>/dev/null || true) && \
+              echo "=== nofile AFTER: soft=$(ulimit -Sn) hard=$(ulimit -Hn)" && \
+              pip install -e . --no-deps && \
+              echo "=== ATOM version AFTER installation ===" && pip show atom || true
+          RUN pip show amd-aiter atom sglang torch triton mori || true
+          EOF
+
+      - name: Build SGLANG image locally
+        run: |
+          set -euo pipefail
+          docker rmi "atom_sglang_base:ci" || true
+          docker rmi "atom_sglang:ci" || true
+
+          BUILD_MODE="full"
+          if ! docker pull "${NIGHTLY_SGLANG_IMAGE_TAG}"; then
+            echo "Unable to pull ${NIGHTLY_SGLANG_IMAGE_TAG}; rebuilding SGLang locally."
+          else
+            echo "Inspecting ${NIGHTLY_SGLANG_IMAGE_TAG} labels before deciding whether to reuse it locally."
+            docker inspect --format 'Image ID: {{.Id}}' "${NIGHTLY_SGLANG_IMAGE_TAG}" || true
+            docker inspect --format 'Image labels: {{json .Config.Labels}}' "${NIGHTLY_SGLANG_IMAGE_TAG}" || true
+            LATEST_SGLANG_REF="$(docker inspect --format '{{ index .Config.Labels "com.rocm.atom.sglang_ref" }}' "${NIGHTLY_SGLANG_IMAGE_TAG}" 2>/dev/null || true)"
+            echo "Expected SGLang commit label: ${SGLANG_REF}"
+            echo "Resolved ${NIGHTLY_SGLANG_IMAGE_TAG} label com.rocm.atom.sglang_ref: ${LATEST_SGLANG_REF:-<missing>}"
+            if [ -n "${LATEST_SGLANG_REF}" ] && [ "${LATEST_SGLANG_REF}" = "${SGLANG_REF}" ]; then
+              BUILD_MODE="fast"
+              echo "Reusing ${NIGHTLY_SGLANG_IMAGE_TAG} locally for SGLANG CI."
+            else
+              echo "SGLANG CI latest image label mismatch or missing. Expected ${SGLANG_REF}, got ${LATEST_SGLANG_REF:-<missing>}; rebuilding SGLang locally."
+            fi
+          fi
+
+          if [ "${BUILD_MODE}" = "fast" ]; then
+            DOCKER_BUILDKIT=1 docker build --network=host \
+              -t atom_sglang:ci \
+              --build-arg SGLANG_BASE_IMAGE="${NIGHTLY_SGLANG_IMAGE_TAG}" \
+              --build-arg GITHUB_REPO_URL="${GITHUB_REPO_URL}" \
+              --build-arg GITHUB_COMMIT_SHA="${GITHUB_COMMIT_SHA}" \
+              --build-arg SGLANG_REF="${SGLANG_REF}" \
+              --build-arg AITER_ARTIFACT_ID="${AITER_ARTIFACT_ID}" \
+              --build-arg INSTALL_LM_EVAL=1 \
+              -f Dockerfile.mod .
+            exit 0
+          fi
+
+          DOCKER_BUILDKIT=1 docker build --pull --network=host \
+            --no-cache \
+            -t atom_sglang_base:ci \
+            --build-arg SGLANG_BASE_IMAGE="${ATOM_BASE_NIGHTLY_IMAGE}" \
+            --build-arg GITHUB_REPO_URL="${GITHUB_REPO_URL}" \
+            --build-arg GITHUB_COMMIT_SHA="${GITHUB_COMMIT_SHA}" \
+            --build-arg SGLANG_REF="${SGLANG_REF}" \
+            --build-arg AITER_ARTIFACT_ID="${AITER_ARTIFACT_ID}" \
+            --build-arg INSTALL_LM_EVAL=1 \
+            -f Dockerfile.mod .
+
+          DOCKER_BUILDKIT=1 docker build --network=host \
+            --no-cache \
+            -t atom_sglang:ci \
+            --build-arg SGLANG_BASE_IMAGE="atom_sglang_base:ci" \
+            --build-arg MAX_JOBS=64 \
+            --build-arg SGLANG_REF="${SGLANG_REF}" \
+            --build-arg INSTALL_LM_EVAL=1 \
+            --build-arg INSTALL_FASTSAFETENSORS=1 \
+            -f docker/sglang_release.dockerfile .
+
+      - name: Set SGLANG image tag
+        run: |
+          echo "SGLANG_IMAGE_TAG=atom_sglang:ci" >> "$GITHUB_ENV"
+
+      - name: Prepare model cache mount
+        run: |
+          MODEL_CACHE_MOUNT=""
+          MODEL_CACHE_DESC="container-local /models (no host cache mount)"
+
+          if [ -d "/models" ]; then
+            MODEL_CACHE_MOUNT="-v /models:/models"
+            MODEL_CACHE_DESC="/models (host mount)"
+          elif [ -d "/it-share/models" ]; then
+            MODEL_CACHE_MOUNT="-v /it-share/models:/models"
+            MODEL_CACHE_DESC="/it-share/models (host path)"
+          elif [ -d "/mnt/dcgpuval/models" ]; then
+            MODEL_CACHE_MOUNT="-v /mnt/dcgpuval/models:/models"
+            MODEL_CACHE_DESC="/mnt/dcgpuval/models (host path)"
+          elif [ -d "/shareddata/models" ]; then
+            MODEL_CACHE_MOUNT="-v /shareddata/models:/models"
+            MODEL_CACHE_DESC="/shareddata/models (host path)"
+          elif [ -d "/data/models" ]; then
+            MODEL_CACHE_MOUNT="-v /data/models:/models"
+            MODEL_CACHE_DESC="/data/models (host path)"
+          else
+            echo "Warning: /models and /it-share/models and /mnt/dcgpuval/models and /shareddata/models and /data/models directory not found on runner; using container-local /models."
+          fi
+
+          echo "Using model cache backend: ${MODEL_CACHE_DESC}"
+          echo "MODEL_CACHE_MOUNT=${MODEL_CACHE_MOUNT}" >> "$GITHUB_ENV"
+          echo "MODEL_CACHE_DESC=${MODEL_CACHE_DESC}" >> "$GITHUB_ENV"
+
+      - name: Start SGLANG test container
+        run: |
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+
+          MODEL_MOUNT="${MODEL_CACHE_MOUNT}"
+          echo "Using model cache backend: ${MODEL_CACHE_DESC}"
+
+          docker run -dt --device=/dev/kfd $DEVICE_FLAG \
+            -v "${GITHUB_WORKSPACE:-$PWD}":/workspace \
+            $MODEL_MOUNT \
+            -w /workspace \
+            --ipc=host --network=host --group-add video \
+            --shm-size=16G \
+            --privileged \
+            --cap-add=SYS_PTRACE \
+            -e HF_TOKEN="${HF_TOKEN:-}" \
+            --security-opt seccomp=unconfined \
+            --ulimit memlock=-1 \
+            --ulimit stack=67108864 \
+            --name "$CONTAINER_NAME" \
+            "$SGLANG_IMAGE_TAG"
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Download model if needed
+        if: success()
+        run: |
+          set -euo pipefail
+          model_dir="/models/${{ matrix.model_path }}"
+          if [ -n "${MODEL_CACHE_MOUNT}" ]; then
+            model_use_lock="true"
+            if [ "${{ matrix.runner }}" = "atom-mi355-8gpu.predownload" ]; then
+              model_use_lock="false"
+            fi
+            echo "Using shared model download script for ${model_dir} (MODEL_USE_LOCK=${model_use_lock})"
+            if ! docker exec \
+              -e HF_TOKEN="${HF_TOKEN:-}" \
+              -e MODEL_ID="${{ matrix.model_path }}" \
+              -e TARGET_DIR="${model_dir}" \
+              -e MODEL_USE_LOCK="${model_use_lock}" \
+              -e MODEL_DOWNLOAD_TIMEOUT="${MODEL_DOWNLOAD_TIMEOUT}" \
+              -e MODEL_LOCK_WAIT_SECONDS="${MODEL_LOCK_WAIT_SECONDS}" \
+              -e MODEL_LOCK_POLL_INTERVAL="${MODEL_LOCK_POLL_INTERVAL}" \
+              -e MODEL_PROGRESS_INTERVAL="${MODEL_PROGRESS_INTERVAL}" \
+              "$CONTAINER_NAME" \
+              bash -lc 'bash /workspace/.github/scripts/download_model_with_lock.sh "$MODEL_ID" "$TARGET_DIR"'; then
+              echo "Model download failed for '${{ matrix.model_path }}'. Aborting."
+              exit 1
+            fi
+          else
+            echo "/models directory not mounted; skipping model download"
+          fi
+        env:
+          MODEL_DOWNLOAD_TIMEOUT: "3h"
+          MODEL_LOCK_WAIT_SECONDS: "7200"
+          MODEL_LOCK_POLL_INTERVAL: "30"
+          MODEL_PROGRESS_INTERVAL: "60"
+
+      - name: Resolve SGLANG model path
+        if: success()
+        run: |
+          if [ -n "${MODEL_CACHE_MOUNT}" ]; then
+            echo "SGLANG_RESOLVED_MODEL_PATH=/models/${{ matrix.model_path }}" >> "$GITHUB_ENV"
+            echo "Using mounted model path: /models/${{ matrix.model_path }}"
+          else
+            echo "SGLANG_RESOLVED_MODEL_PATH=${{ matrix.model_path }}" >> "$GITHUB_ENV"
+            echo "Using model id: ${{ matrix.model_path }}"
+          fi
+
+      - name: Run SGLANG launch and gsm8k accuracy via script (ci mode)
+        if: success()
+        timeout-minutes: 120
+        env:
+          SGLANG_MODEL_NAME: ${{ matrix.model_name }}
+          SGLANG_MODEL_PATH: ${{ matrix.model_path }}
+          SGLANG_EXTRA_ARGS: ${{ matrix.extra_args }}
+          SGLANG_ENV_VARS: ${{ matrix.env_vars }}
+          MAX_WAIT_RETRIES: "120"
+          STREAM_SGLANG_LOGS: "1"
+          LM_EVAL_TASK: "gsm8k"
+          LM_EVAL_NUM_FEWSHOT: ${{ matrix.lm_eval_num_fewshot || '3' }}
+          LM_EVAL_NUM_CONCURRENT: ${{ matrix.lm_eval_num_concurrent || '65' }}
+          LM_EVAL_USE_CHAT_COMPLETIONS: ${{ matrix.lm_eval_use_chat_completions || '0' }}
+          LM_EVAL_EXTRA_MODEL_ARGS: ${{ matrix.lm_eval_extra_model_args || '' }}
+        run: |
+          docker exec \
+            -e SGLANG_MODEL_NAME="${SGLANG_MODEL_NAME}" \
+            -e SGLANG_MODEL_PATH="${SGLANG_RESOLVED_MODEL_PATH:-$SGLANG_MODEL_PATH}" \
+            -e SGLANG_EXTRA_ARGS="${SGLANG_EXTRA_ARGS}" \
+            -e SGLANG_ENV_VARS="${SGLANG_ENV_VARS}" \
+            -e MAX_WAIT_RETRIES="${MAX_WAIT_RETRIES}" \
+            -e STREAM_SGLANG_LOGS="${STREAM_SGLANG_LOGS}" \
+            -e LM_EVAL_TASK="${LM_EVAL_TASK}" \
+            -e LM_EVAL_NUM_FEWSHOT="${LM_EVAL_NUM_FEWSHOT}" \
+            -e LM_EVAL_NUM_CONCURRENT="${LM_EVAL_NUM_CONCURRENT}" \
+            -e LM_EVAL_USE_CHAT_COMPLETIONS="${LM_EVAL_USE_CHAT_COMPLETIONS}" \
+            -e LM_EVAL_EXTRA_MODEL_ARGS="${LM_EVAL_EXTRA_MODEL_ARGS}" \
+            "$CONTAINER_NAME" bash -lc "
+              set -euo pipefail
+              bash .github/scripts/atom_sglang_test.sh accuracy
+            "
+
+      - name: Check SGLANG accuracy test results
+        if: success()
+        run: |
+          docker cp "$CONTAINER_NAME":/tmp/atom_sglang_accuracy_results ./atom_sglang_accuracy_results || true
+          result_file=$(ls -1t atom_sglang_accuracy_results/*.json 2>/dev/null | head -n 1)
+          if [ -z "$result_file" ] || [ ! -f "$result_file" ]; then
+            echo "ERROR: No results JSON file found in atom_sglang_accuracy_results/"
+            exit 2
+          fi
+
+          echo "RESULT_FILE: $result_file"
+          flexible_extract_value=$(python3 - "$result_file" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as f:
+              data = json.load(f)
+          print(data["results"]["gsm8k"]["exact_match,flexible-extract"])
+          PY
+          )
+          echo "Flexible extract value: $flexible_extract_value"
+          echo "Accuracy test threshold: ${{ matrix.accuracy_test_threshold }}"
+
+          result=$(awk -v val="$flexible_extract_value" -v threshold="${{ matrix.accuracy_test_threshold }}" 'BEGIN {print (val < threshold) ? 1 : 0}')
+          if [ "$result" -eq 1 ]; then
+            echo "Accuracy test failed: Flexible extract value $flexible_extract_value is less than threshold ${{ matrix.accuracy_test_threshold }}."
+            exit 1
+          else
+            echo "Accuracy test passed: Flexible extract value $flexible_extract_value is greater than or equal to threshold ${{ matrix.accuracy_test_threshold }}."
+            exit 0
+          fi
+
+      - name: Collect SGLANG accuracy summary
+        if: success()
+        run: |
+          echo "SGLANG Accuracy Test Summary for ${{ matrix.model_name }}:" >> $GITHUB_STEP_SUMMARY
+          docker exec "$CONTAINER_NAME" bash -lc "awk '/\|Tasks\|Version\|/,/^$/ { if (NF > 0) print }' /tmp/atom_sglang_accuracy_output.txt" >> $GITHUB_STEP_SUMMARY || true
+
+      - name: Collect SGLANG logs and results
+        if: always()
+        run: |
+          docker cp "$CONTAINER_NAME":/tmp/atom_sglang.log ./atom_sglang.log || true
+          docker cp "$CONTAINER_NAME":/tmp/atom_sglang_accuracy_output.txt ./atom_sglang_accuracy_output.txt || true
+          docker cp "$CONTAINER_NAME":/tmp/atom_sglang_accuracy_results ./atom_sglang_accuracy_results || true
+
+      - name: Upload SGLANG artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sglang-${{ matrix.model_name }}-artifacts
+          path: |
+            atom_sglang.log
+            atom_sglang_accuracy_output.txt
+            atom_sglang_accuracy_results
+
+      - name: Clean up SGLANG test
+        if: always()
+        run: |
+          docker exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/atom_sglang.pid ]; then kill \$(cat /tmp/atom_sglang.pid) || true; fi" || true
+          docker stop "$CONTAINER_NAME" || true
+          docker rm "$CONTAINER_NAME" || true
+          rm -f Dockerfile.mod || true
+          docker rmi "atom_sglang_base:ci" || true
+          docker rmi "atom_sglang:ci" || true
