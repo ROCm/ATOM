@@ -3793,16 +3793,16 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # during capture. Positions are per-seq span-head anchored (like the
         # ragged prepare_decode branch): token j of seq i -> win + j.
         start_pos = win
-        # Ragged (zero-copy-q) or uniform: build positions/cu_seqlens/context_lens
-        # from extend_lens_np. When extend_lens is uniform (== max_q_len) this
-        # reduces to the classic rectangle, so one path covers both.
+        # Built from extend_lens_np, so ragged and uniform share one path.
         cu_seqlens_q_np = np.zeros(bs + 1, dtype=np.int32)
         np.cumsum(extend_lens_np, out=cu_seqlens_q_np[1:])
-        _batch_ids = np.repeat(np.arange(bs, dtype=np.int32), extend_lens_np)
-        _j_in_seq = np.arange(total_tokens, dtype=np.int64) - cu_seqlens_q_np[
-            _batch_ids
-        ].astype(np.int64)
-        positions_np = _j_in_seq + start_pos
+        # A token's position is start_pos + how far into its OWN seq it sits,
+        # i.e. flat index minus where that seq starts. Uniform lens: that
+        # difference is flat_idx % max_q_len, the classic rectangle.
+        batch_id_per_token = np.repeat(np.arange(bs, dtype=np.int32), extend_lens_np)
+        flat_idx = np.arange(total_tokens, dtype=np.int64)
+        seq_start = cu_seqlens_q_np[batch_id_per_token].astype(np.int64)
+        positions_np = (flat_idx - seq_start) + start_pos
         context_lens_np = (start_pos + extend_lens_np).astype(np.int32)
         # Slot mapping: pool groups [0..bs-1] crossed to the plane positions
         # every kernel addresses by, the same crossing `prepare_decode` makes.
