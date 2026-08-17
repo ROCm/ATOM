@@ -213,6 +213,9 @@ class BlockManager:
         kv_offload_enabled = kv_connector_hosts_state_tier(
             getattr(config, "kv_transfer_config", None)
         )
+        # Class names already warned about in `state_checkpoint_fates`. See
+        # there for why the warning latches.
+        self._warned_no_checkpoint_fates: set[str] = set()
         self.state_offload: StateOffloadIndex | None = None
         # (req_id, hash, target_slot) admitted this pass and not yet handed to
         # the connector. Kept here rather than in the index because the slot is
@@ -794,9 +797,9 @@ class BlockManager:
         if self.state_offload is None:
             return
         self.state_offload.abandon_load(req_id)
-        group = self._orphan_load_groups.pop(req_id, None)
-        if group is not None:
-            self.state.release(group)
+        slot = self._orphan_load_slots.pop(req_id, None)
+        if slot is not None:
+            self.state.release(slot)
 
     def settle_state_load(self, req_id, ok: bool) -> None:
         """Apply one worker load report. Keyed by request, like the KV load.
@@ -816,9 +819,9 @@ class BlockManager:
             self.state_offload.complete_load(req_id)
         else:
             self.state_offload.fail_load(req_id)
-        group = self._orphan_load_groups.pop(req_id, None)
-        if group is not None:
-            self.state.release(group)
+        slot = self._orphan_load_slots.pop(req_id, None)
+        if slot is not None:
+            self.state.release(slot)
 
     def take_state_loads(self) -> list[tuple]:
         """`(req_id, hash, target_group)` for loads admitted since the last call.
