@@ -44,6 +44,7 @@ class PPEngineCoreProc(EngineCore):
         # per-request ring now and publishes nothing, so the exception is gone.
         self._defer_prefix_hash: bool = bm.enable_prefix_caching
         self._pp_kv_aggregator: PPKVAggregator | None = None
+        self._held_sending: dict = {}
         logger.info(
             f"{self.label}: PP stage {self.pp_rank}/{self.pp_size} "
             f"(head={self.is_head}, last={self.is_last}) ready"
@@ -205,9 +206,8 @@ class PPEngineCoreProc(EngineCore):
         if kvoutput is None:
             kvoutput = KVConnectorOutput()
 
-        # Non-offload fields go directly to scheduler.
+        # Recv/failed_recving go directly to scheduler.
         non_offload = KVConnectorOutput(
-            finished_sending=kvoutput.finished_sending,
             finished_recving=kvoutput.finished_recving,
             failed_recving=kvoutput.failed_recving,
         )
@@ -222,11 +222,23 @@ class PPEngineCoreProc(EngineCore):
         )
         pp_messages = self.pp_transport.recv_kv_status(timeout_ms=0)
 
-        if not has_offload and not pp_messages:
+        if not has_offload and not pp_messages and not kvoutput.finished_sending:
+            return
+
+        # No offload connector → finished_sending goes straight to scheduler.
+        if self._pp_kv_aggregator is None and not has_offload and not pp_messages:
+            if kvoutput.finished_sending:
+                self.scheduler._update_from_kv_xfer_finished(
+                    KVConnectorOutput(finished_sending=kvoutput.finished_sending)
+                )
             return
 
         if self._pp_kv_aggregator is None:
             self._pp_kv_aggregator = PPKVAggregator(self.pp_size)
+
+        # Hold finished_sending until all PP stages' saves complete.
+        for rid in kvoutput.finished_sending or ():
+            self._held_sending[str(rid)] = rid
 
         # Ingest head (stage 0) offload output.
         offload_local = KVConnectorOutput(
@@ -235,15 +247,25 @@ class PPEngineCoreProc(EngineCore):
             finished_saving=kvoutput.finished_saving,
         )
         if not offload_local.is_empty():
-            result = self._pp_kv_aggregator.ingest(0, offload_local)
-            if not result.is_empty():
-                self.scheduler._update_from_kv_xfer_finished(result)
+            self._ingest_and_release(offload_local, 0)
 
         # Ingest downstream PP stages' offload output.
         for pp_rank, downstream_output in pp_messages:
-            result = self._pp_kv_aggregator.ingest(pp_rank, downstream_output)
-            if not result.is_empty():
-                self.scheduler._update_from_kv_xfer_finished(result)
+            self._ingest_and_release(downstream_output, pp_rank)
+
+    def _ingest_and_release(self, output: KVConnectorOutput, pp_rank: int):
+        result = self._pp_kv_aggregator.ingest(pp_rank, output)
+        if result.is_empty():
+            return
+        # Release held finished_sending whose global save is now complete.
+        rel = set()
+        for rid in result.finished_saving or ():
+            held = self._held_sending.pop(str(rid), None)
+            if held is not None:
+                rel.add(held)
+        if rel:
+            result.finished_sending = rel
+        self.scheduler._update_from_kv_xfer_finished(result)
 
     # -- Downstream busy loop ------------------------------------------------
 
