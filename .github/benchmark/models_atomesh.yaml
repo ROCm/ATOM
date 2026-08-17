@@ -440,6 +440,66 @@ models:
               max_num_seqs: 48
               decode_max_num_seqs: 48
 
+        - <<: &glm52_agentic_lmcache_mtp_tp8
+            <<: *glm52_agentic_tp4_tp4
+            topology: 1p1d_mtp3
+            pd_worker_layout: multi_node
+            prefill:
+              workers: 1
+              tp: 8
+              extra_args: >-
+                --attn-prefill-chunk-size 131072
+                --long-prefill-token-threshold 131072
+            decode:
+              workers: 1
+              tp: 8
+            env:
+              common:
+                ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB: "1024"
+                PYTHONHASHSEED: "0"
+              prefill:
+                LMCACHE_LOCAL_CPU: "True"
+                LMCACHE_MAX_LOCAL_CPU_SIZE: "200"
+                LMCACHE_CHUNK_SIZE: "256"
+                OFFLOAD_MIN_LOAD_TOKENS: "8192"
+                PREFILL_KV_TRANSFER_CONFIG: >-
+                  {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT}},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
+              decode:
+                MAX_JOBS: "16"
+            benchmark:
+              <<: *glm52_agentic_benchmark
+              aiperf_commit: 49634d1c6c2e6dcc18979d704a65e7c7064efc49
+          name: glm-52-mxfp4-mtp-1p1d-tp8-agentic-lmcache-1m-c12
+          concurrency: [12]
+          decode: &glm52_agentic_lmcache_mtp_tp8_decode
+            workers: 1
+            tp: 8
+            cudagraph: >-
+              [1,2,4,8,12,16,20,24]
+          server:
+            common_args:
+              <<: &glm52_agentic_lmcache_mtp_tp8_common_args
+                <<: *glm52_agentic_common_args
+                method: mtp
+                num_speculative_tokens: 3
+                extra_args: "--spec-decode-acceptance-rate 0.6633"
+                max_num_batched_tokens: 16384
+              max_num_seqs: 24
+              decode_max_num_seqs: 24
+
+        - <<: *glm52_agentic_lmcache_mtp_tp8
+          name: glm-52-mxfp4-mtp-1p1d-tp8-agentic-lmcache-1m-c16
+          concurrency: [16]
+          decode:
+            <<: *glm52_agentic_lmcache_mtp_tp8_decode
+            cudagraph: >-
+              [1,2,4,8,12,16,20,24,28,32]
+          server:
+            common_args:
+              <<: *glm52_agentic_lmcache_mtp_tp8_common_args
+              max_num_seqs: 32
+              decode_max_num_seqs: 32
+
     accuracy:
       task: gsm8k
       fewshot: 20
