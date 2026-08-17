@@ -1716,9 +1716,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # set_forward_context() — can't read main_stream from the context yet.
         # ATOM_ATTN_PREP_STREAM=0 issues the copies on the current stream
         # instead, fully serializing them against the CPU plan build below.
-        # Runs on the host every step (outside graph replay), so unlike the
-        # in-graph overlaps this one can follow the per-batch signal directly.
-        overlap_prep = envs.ATOM_ATTN_PREP_STREAM and not batch.gpu_shared_with_prefill
+        overlap_prep = envs.ATOM_ATTN_PREP_STREAM
         current_stream = torch.cuda.current_stream()
         prep_stream = self.prep_stream if overlap_prep else current_stream
         if overlap_prep:

@@ -3118,18 +3118,7 @@ class ModelRunner:
                     logits = self.model.compute_logits(hidden_states)
                     return logits, hidden_states
 
-                # Pick the overlap variant for this step. The side-stream
-                # topology is baked in at capture, so this is a graph *choice*,
-                # not a runtime branch: when prefill is concurrently sharing the
-                # GPU we replay the graph captured with the overlaps inlined.
-                # Falls back to the always-captured overlap=True graph if the
-                # variant is missing (non-rapidserve, or a partial capture).
-                _allow_overlap = not (
-                    batch is not None and batch.gpu_shared_with_prefill
-                )
-                graph_key = (graph_bs, max_q_len, _allow_overlap)
-                if graph_key not in self.graphs:
-                    graph_key = (graph_bs, max_q_len, True)
+                graph_key = (graph_bs, max_q_len)
                 self.graphs[graph_key].replay()
                 hidden_states = self.forward_vars["outputs"][:num_tokens]
                 # Drafter aux buffers (if any) refresh on replay: their in-place
@@ -3793,18 +3782,8 @@ class ModelRunner:
         if self.is_deepseek_v32 and "sparse_kv_indptr" in self.forward_vars:
             self.forward_vars["sparse_kv_indptr"].gpu.zero_()
 
-        # Keyed (bs, max_q_len, allow_kernel_overlap). Under intra-GPU disagg
-        # we capture BOTH overlap variants per shape: the side-stream topology
-        # (V4 Compressors on alt_stream/indexer_stream, MoE dual-stream) is
-        # recorded into the graph at capture and cannot be switched at replay.
-        # Decode then selects the non-overlap graph on steps where prefill is
-        # sharing the GPU. Outside rapidserve only overlap=True is captured, so
-        # capture time and graph memory are unchanged there.
-        self._overlap_variants: tuple[bool, ...] = (
-            (True, False) if self.config.enable_rapidserve else (True,)
-        )
-        self.graphs: dict[tuple[int, int, bool], torch.cuda.CUDAGraph] = {}
-        self.graph_logits: dict[tuple[int, int, bool], torch.Tensor] = {}
+        self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
+        self.graph_logits: dict[tuple[int, int], torch.Tensor] = {}
         self.graph_pool = None
         is_tbo = self.config.enable_tbo and isinstance(self.model, UBatchWrapper)
         # TBO graphs don't capture compute_logits, so disable logits_in_graph.
@@ -3943,67 +3922,45 @@ class ModelRunner:
                             self._capture_trace_tag = None
                         continue
 
-                    for _allow_overlap in self._overlap_variants:
-                        # The outer set_forward_context/warmup above already
-                        # armed overlap=True, so only the extra variant needs a
-                        # re-arm + re-warm. Re-warming matters: it forces any
-                        # lazy allocation on the inline path to happen BEFORE
-                        # the capture window rather than inside it.
-                        if not _allow_overlap:
-                            set_forward_context(
-                                attn_metadata=attn_metadata,
-                                atom_config=self.config,
-                                context=context,
-                                num_tokens=num_tokens,
-                                num_tokens_across_dp=num_tokens_across_dp,
-                                ubatch_slices=ubatch_slices,
-                                in_hipgraph=True,
-                                allow_kernel_overlap=False,
+                    # Capture
+                    with (
+                        record_function(f"capture_graph_bs_{bs}")
+                        if self.mark_trace
+                        else nullcontext()
+                    ):
+                        if ubatch_slices is not None:
+                            # TBO capture: threads + multi-stream captured in graph.
+                            # Drafter aux (if any) is written inside the graph by
+                            # capture_tbo_graph replaying the model's forward hooks.
+                            graph, _ = self.model.capture_tbo_graph(
+                                input_ids[:num_tokens],
+                                positions[:num_tokens],
+                                self.graph_pool,
+                                capture_ctx.stream,
+                                output_buffer=outputs[:num_tokens],
                             )
-                            outputs[:num_tokens] = self.model(
-                                input_ids[:num_tokens], model_positions
-                            )
-                            if self.logits_in_graph:
-                                self.model.compute_logits(outputs[:num_tokens])
-                        # Capture
-                        with (
-                            record_function(f"capture_graph_bs_{bs}")
-                            if self.mark_trace
-                            else nullcontext()
-                        ):
-                            if ubatch_slices is not None:
-                                # TBO capture: threads + multi-stream captured in graph.
-                                # Drafter aux (if any) is written inside the graph by
-                                # capture_tbo_graph replaying the model's forward hooks.
-                                graph, _ = self.model.capture_tbo_graph(
-                                    input_ids[:num_tokens],
-                                    positions[:num_tokens],
-                                    self.graph_pool,
-                                    capture_ctx.stream,
-                                    output_buffer=outputs[:num_tokens],
+                        else:
+                            # Standard single-stream capture. The drafter's aux
+                            # capture hook runs inside the forward and writes its
+                            # own buffers (captured in-graph); model_output is a
+                            # plain Tensor.
+                            graph = torch.cuda.CUDAGraph()
+                            with torch.cuda.graph(
+                                graph, self.graph_pool, stream=capture_ctx.stream
+                            ):
+                                model_output = self.model(
+                                    input_ids[:num_tokens], model_positions
                                 )
-                            else:
-                                # Standard single-stream capture. The drafter's aux
-                                # capture hook runs inside the forward and writes its
-                                # own buffers (captured in-graph); model_output is a
-                                # plain Tensor.
-                                graph = torch.cuda.CUDAGraph()
-                                with torch.cuda.graph(
-                                    graph, self.graph_pool, stream=capture_ctx.stream
-                                ):
-                                    model_output = self.model(
-                                        input_ids[:num_tokens], model_positions
+                                outputs[:num_tokens] = model_output
+                                if self.logits_in_graph:
+                                    graph_logits = self.model.compute_logits(
+                                        outputs[:num_tokens]
                                     )
-                                    outputs[:num_tokens] = model_output
-                                    if self.logits_in_graph:
-                                        graph_logits = self.model.compute_logits(
-                                            outputs[:num_tokens]
-                                        )
-                        if self.graph_pool is None:
-                            self.graph_pool = graph.pool()
-                        self.graphs[(bs, max_q_len, _allow_overlap)] = graph
-                        if self.logits_in_graph and ubatch_slices is None:
-                            self.graph_logits[(bs, max_q_len, _allow_overlap)] = graph_logits
+                    if self.graph_pool is None:
+                        self.graph_pool = graph.pool()
+                    self.graphs[(bs, max_q_len)] = graph
+                    if self.logits_in_graph and ubatch_slices is None:
+                        self.graph_logits[(bs, max_q_len)] = graph_logits
                     torch.cuda.synchronize()
                     # After the sync: the warmup forward's kernels must have
                     # completed before the window closes, or they spill into the
@@ -4069,7 +4026,7 @@ class ModelRunner:
         """Profile SPS(B) by timing the captured target graphs, then hand a dense
         cost table to the DSpark drafter (paper §3.2.2, scheduler input).
 
-        Each captured graph ``self.graphs[(bs, max_q_len, overlap)]`` is a forward over
+        Each captured graph ``self.graphs[(bs, max_q_len)]`` is a forward over
         ``B = bs * max_q_len`` tokens — exactly one verification step at batch B.
         We replay each a few times, take the median step time, and densify the
         (B, steps/sec) samples into ``sps_table[B]``. No-op unless a DSpark
@@ -4106,7 +4063,7 @@ class ModelRunner:
         token_points: list[int] = []
         sps_points: list[float] = []
         for bs in self.graph_bs:
-            graph = self.graphs.get((bs, max_q_len, True))
+            graph = self.graphs.get((bs, max_q_len))
             if graph is None:
                 continue
             B = bs * max_q_len
@@ -4597,6 +4554,12 @@ class RapidServeModelRunner(ModelRunner):
         per sequence, in batch order) — these are included in PrefillDone so
         the decode process can append them before the first decode step,
         matching the num_tokens state that non-disagg postprocess would produce.
+
+        With spec decode on, also runs the drafter here and returns its drafts,
+        so decode's first step can speculate instead of burning a step on
+        placeholder drafts. Returns ``(sampled_token_ids, draft_token_ids)``
+        where draft_token_ids is one list per sequence (empty when no drafter
+        ran).
         """
         prefill_streams = getattr(self, "_prefill_streams", None)
         if prefill_streams is not None:
@@ -4612,11 +4575,68 @@ class RapidServeModelRunner(ModelRunner):
                 all_greedy,
                 needs_independent_noise,
             ) = self.prepare_model(batch)
-            logits, _ = self.run_model(input_ids, batch)
+            # hidden_states is kept (not discarded as before): the drafter needs
+            # it as target_hidden_states.
+            logits, hidden_states = self.run_model(input_ids, batch)
             # Sample the first generated token from each sequence's last logit
             sampled = self.sampler(logits, temperatures, top_ks, top_ps, all_greedy)
             sampled_cpu = sampled.view(-1).tolist()
+            drafts_cpu = self._prefill_propose_drafts(batch, sampled, hidden_states)
         # Synchronize so decode's default stream sees all KV writes.
         stream.synchronize()
         reset_forward_context()
-        return sampled_cpu
+        return sampled_cpu, drafts_cpu
+
+    def _prefill_propose_drafts(self, batch, sampled, hidden_states) -> list:
+        """Run the drafter on the prefill forward's output.
+
+        Returns one draft list per sequence, or [] when no drafter ran — decode
+        then falls back to placeholder drafts.
+
+        Calls the drafter directly rather than going through
+        propose_draft_token_ids: that wrapper ends in
+        tokenIDProcessor.prepare_draft_ids, which is deferred-output plumbing —
+        it stashes this step's drafts, fires an async D2H, and returns the
+        PREVIOUS step's drafts (and reads `prev_req_ids`, which only
+        prepare_sampled_ids inside postprocess ever sets). Prefill runs no such
+        pipeline: it needs this batch's drafts synchronously, to put on the wire.
+
+        Restricted to plain (EAGLE/MTP) drafters. DSpark is excluded on purpose:
+        its ragged verification carries per-request `ell` state recorded via
+        `verify_scheduler.record_ell`, and that bookkeeping is consumed in the
+        DECODE process — recording it here, in a process whose scheduler never
+        runs the verify step, would desynchronise it.
+        """
+        drafter = getattr(self, "drafter", None)
+        if (
+            drafter is None
+            or drafter.is_block_drafter
+            or drafter.uses_confidence_schedule
+        ):
+            return []
+        bs = batch.total_seqs_num
+        if bs == 0:
+            return []
+        # Nothing was verified this step, so nothing is rejected: the anchor is
+        # each prompt's last token (prepare_inputs counts back 1+num_reject from
+        # each segment end). Prefill batches skip both the RAGGED and
+        # confidence-schedule branches in propose_draft_token_ids, since
+        # total_tokens_num_prefill != 0.
+        num_reject = self.tokenID_processor.default_num_rejected_tokens[:bs]
+        # Anchor = each prompt's last token. prepare_inputs counts back
+        # `1 + num_reject` from every segment end (cu_seqlens_q[1:]), and
+        # nothing was verified this step, so num_reject is all-zero.
+        last_token_indices = drafter.prepare_inputs(bs, 1 + num_reject)
+        drafts = drafter.propose(
+            target_token_ids=self.tokenID_processor.input_ids.gpu[
+                1 : batch.total_tokens_num + 1
+            ],
+            target_positions=get_forward_context().context.positions,
+            target_hidden_states=hidden_states,
+            num_reject_tokens=num_reject,
+            next_token_ids=sampled.view(-1),
+            last_token_indices=last_token_indices,
+        )
+        if drafts is None:
+            return []
+        return drafts.view(bs, -1).tolist()

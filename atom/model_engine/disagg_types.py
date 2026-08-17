@@ -56,3 +56,8 @@ class PrefillDone:
     seq_id: int
     num_tokens_computed: int  # tokens written into the KV cache
     sampled_token_id: int  # first generated token sampled from prefill logits
+    # Speculative drafts for the token(s) AFTER sampled_token_id, proposed by
+    # the drafter in the prefill process. Empty when spec decode is off, or for
+    # drafters prefill does not run (see RapidServeModelRunner.prefill_forward),
+    # in which case decode falls back to placeholder drafts.
+    draft_token_ids: list = field(default_factory=list)

@@ -560,14 +560,6 @@ class ForwardContext:
     # forward, so it ignores the flag entirely.
     in_hipgraph: bool = False
 
-    # Intra-GPU disagg: False asks the side-stream overlaps (V4 Compressors on
-    # alt_stream/indexer_stream, MoE shared-vs-routed dual-stream) to run inline
-    # on the main stream instead. Under FULL cudagraph capture this is a
-    # CAPTURE-TIME choice — replay never re-runs Python — so the runner captures
-    # one graph variant per value and picks at replay based on whether prefill
-    # is concurrently sharing the GPU. Always True outside rapidserve.
-    allow_kernel_overlap: bool = True
-
     # Piecewise-cudagraph dispatch, read per forward by CUDAGraphWrapper:
     # cudagraph_runtime_mode picks the capture/replay mode, batch_descriptor is
     # the key (num_tokens). None defaults keep wrappers inert until model_runner
@@ -669,7 +661,6 @@ def set_forward_context(
     ubatch_slices: list[Any] | None = None,
     in_hipgraph: bool = False,
     ub_max_tokens_across_dp: tuple | None = None,
-    allow_kernel_overlap: bool = True,
 ) -> None:
     global _forward_context
     dp_metadata: DPMetadata | None = None
@@ -692,7 +683,6 @@ def set_forward_context(
         ub_max_tokens_across_dp=ub_max_tokens_across_dp,
         main_stream=(torch.cuda.current_stream() if _CUDA_AVAILABLE else None),
         in_hipgraph=in_hipgraph,
-        allow_kernel_overlap=allow_kernel_overlap,
     )  # _forward_context.attn_metadata = attn_metadata
     # _forward_context.no_compile_layers = atom_config.compilation_config.static_forward_context
     # _forward_context = ForwardContext(no_compile_layers=atom_config.compilation_config.static_forward_context, attn_metadata=attn_metadata)

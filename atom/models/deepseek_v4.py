@@ -2512,12 +2512,7 @@ class DeepseekV4Attention(nn.Module):
         from atom.utils.tbo.ubatching import tbo_active
 
         use_async_compress = (
-            self._use_async_compress
-            and fc.in_hipgraph
-            and not tbo_active()
-            # Intra-GPU disagg: False when prefill is concurrently
-            # sharing the GPU (captured as a separate graph variant).
-            and fc.allow_kernel_overlap
+            self._use_async_compress and fc.in_hipgraph and not tbo_active()
         )
         has_compressor = self.compressor is not None
         has_indexer = self.indexer is not None and not self.skip_topk
@@ -2803,12 +2798,7 @@ class DeepseekV4Attention(nn.Module):
             from atom.utils.tbo.ubatching import tbo_active
 
             use_async_compress = (
-                self._use_async_compress
-                and fc.in_hipgraph
-                and not tbo_active()
-                # Intra-GPU disagg: False when prefill is concurrently
-                # sharing the GPU (captured as a separate graph variant).
-                and fc.allow_kernel_overlap
+                self._use_async_compress and fc.in_hipgraph and not tbo_active()
             )
         else:
             use_async_compress = self.maybe_compressors_async(

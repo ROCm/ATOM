@@ -63,19 +63,11 @@ def maybe_dual_stream_forward(
         get_current_cudagraph_runtime_mode() == CUDAGraphMode.PIECEWISE
     )
 
-    # Intra-GPU disagg: the decode process asks for inline execution when
-    # prefill is concurrently sharing the GPU. Under FULL capture this is read
-    # once per captured variant, not per replay.
-    from atom.utils.forward_context import get_forward_context
-
-    allow_overlap = getattr(get_forward_context(), "allow_kernel_overlap", True)
-
     if (
         self._use_dual_stream
         and 0 < num_tokens <= threshold
         and not tbo_active()
         and not is_piecewise_cudagraph
-        and allow_overlap
     ):
         return self.dual_stream_moe_forward(hidden_states)
     return self.single_stream_moe_forward(hidden_states)

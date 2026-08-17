@@ -286,7 +286,6 @@ class ScheduledBatch:
         remote_kv_seq_blocks: dict[int, list[int]] | None = None,
         num_cached_tokens: list[int] | None = None,
         is_final_chunk: list[bool] | None = None,
-        gpu_shared_with_prefill: bool = False,
     ):
         if scheduled_spec_decode_tokens is None:
             scheduled_spec_decode_tokens = {}
@@ -429,11 +428,6 @@ class ScheduledBatch:
         # Key into ModelRunner's stream pool for CU-masked disagg streams.
         # None means full-CU fallback (no mask).
         self.cu_stream_fraction = cu_stream_fraction
-        # Intra-GPU disagg only: True when the prefill process has work in
-        # flight on this GPU, so decode should stop forking side streams that
-        # would contend with it. Always False outside rapidserve, which keeps
-        # every kernel-overlap decision unchanged there.
-        self.gpu_shared_with_prefill = gpu_shared_with_prefill
         # Collect multimodal data from prefill sequences
         self.multimodal_data = {}
         for seq in seqs.values():
@@ -2594,7 +2588,11 @@ class DecodeScheduler(Scheduler):
         return newly_allocated
 
     def on_prefill_done(
-        self, seq_id: int, num_tokens_computed: int, sampled_token_id: int
+        self,
+        seq_id: int,
+        num_tokens_computed: int,
+        sampled_token_id: int,
+        draft_token_ids: list | None = None,
     ) -> None:
         """Promote a sequence from prefill_waiting directly to running.
 
@@ -2623,23 +2621,23 @@ class DecodeScheduler(Scheduler):
             # inter-node P/D path uses at _schedule_first_decode_after_remote_kv.
             seq._injected_t0 = sampled_token_id
             if self.mtp_k > 0:
-                # Rapidserve has no draft-token plumbing: PrefillDone carries
-                # only T0 and prefill_forward never runs the drafter, so this
-                # seq reaches its first decode step with no drafts. But
                 # schedule() always asks for mtp_k+1 query tokens, and the
-                # per-seq query count CANNOT be shrunk for plain MTP: the
-                # q-shrink offset correction (model_runner.py:3134) and the
-                # defensive index clamp (drafter.py:456) are both gated on the
-                # DSpark drafter, so EagleProposer would scatter an
-                # out-of-range anchor index and fault the GPU.
+                # per-seq count CANNOT be shrunk for plain MTP: the q-shrink
+                # offset correction (model_runner.py) and the defensive index
+                # clamp (drafter.py) are both gated on the DSpark drafter, so
+                # EagleProposer would scatter an out-of-range anchor index and
+                # fault the GPU. So the seq must always arrive with mtp_k
+                # drafts appended.
                 #
-                # Instead keep the shape uniform and hand the verifier mtp_k
-                # placeholder drafts. Rejection sampling makes draft *quality*
+                # Prefer the real drafts the prefill process proposed. When it
+                # ran no drafter (DSpark, or spec off on that side) fall back to
+                # placeholders: rejection sampling makes draft *quality*
                 # irrelevant to correctness — a draft is emitted only if it
-                # matches what the target model would have sampled — so these
-                # are simply rejected and the step falls back to the bonus
-                # token. Cost is one step of lost speculation per request.
-                drafts = [self.eos_token_id] * self.mtp_k
+                # matches what the target would have sampled — so placeholders
+                # are simply rejected, at the cost of one unspeculated step.
+                drafts = [int(d) for d in (draft_token_ids or [])][: self.mtp_k]
+                if len(drafts) < self.mtp_k:
+                    drafts += [self.eos_token_id] * (self.mtp_k - len(drafts))
                 for d in drafts:
                     seq.append_token(int(d))
                 seq.spec_token_ids = np.asarray(drafts, dtype=np.int32)
@@ -2744,12 +2742,6 @@ class DecodeScheduler(Scheduler):
                 num_spec_step=self.mtp_k,
                 scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
                 cu_stream_fraction=self.cu_fraction,
-                # A seq sits in prefill_waiting from BlockAssignment until
-                # PrefillDone — exactly the window the prefill process is busy
-                # on the shared GPU. Decode-local, so this works in both
-                # constrained and unconstrained mode (the CU shm exists only in
-                # the former).
-                gpu_shared_with_prefill=bool(self.prefill_waiting),
             ),
             scheduled_seqs,
         )

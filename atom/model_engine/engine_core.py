@@ -823,7 +823,7 @@ class PrefillEngineCore(EngineCore):
 
         # Run on the dedicated prefill stream; returns sampled token IDs (one per seq).
         t0 = time.perf_counter()
-        sampled_token_ids = self.runner_mgr.call_func(
+        sampled_token_ids, draft_token_ids = self.runner_mgr.call_func(
             "prefill_forward", scheduled_batch, wait_out=True
         )
         iter_ms = (time.perf_counter() - t0) * 1000
@@ -835,15 +835,23 @@ class PrefillEngineCore(EngineCore):
 
         # Notify decode that prefill is done, including the first generated token
         # so decode can append it before its first decode step.
-        for seq_id, num_tokens, token_id in zip(
-            scheduled_batch.req_ids,
-            scheduled_batch.num_scheduled_tokens,
-            sampled_token_ids,
+        for i, (seq_id, num_tokens, token_id) in enumerate(
+            zip(
+                scheduled_batch.req_ids,
+                scheduled_batch.num_scheduled_tokens,
+                sampled_token_ids,
+            )
         ):
             done = PrefillDone(
                 seq_id=seq_id,
                 num_tokens_computed=int(num_tokens),
                 sampled_token_id=int(token_id),
+                # Empty when no drafter ran here; decode substitutes placeholders.
+                draft_token_ids=(
+                    [int(d) for d in draft_token_ids[i]]
+                    if i < len(draft_token_ids)
+                    else []
+                ),
             )
             self._p2d_sock.send(pickle.dumps((DisaggMsgType.PREFILL_DONE, done)))
 
@@ -1044,7 +1052,10 @@ class DecodeEngineCore(EngineCore):
                 continue
             done: PrefillDone = payload
             self.scheduler.on_prefill_done(
-                done.seq_id, done.num_tokens_computed, done.sampled_token_id
+                done.seq_id,
+                done.num_tokens_computed,
+                done.sampled_token_id,
+                done.draft_token_ids,
             )
             logger.info(
                 f"DecodeEngineCore: seq {done.seq_id} prefill done "
