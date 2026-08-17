@@ -8,10 +8,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
-from atom.kv_transfer.disaggregation.types import (
-    STATE_CHECKPOINT_STAGING_CHANNEL,
-    ConnectorCompletion,
-)
+from atom.kv_transfer.disaggregation.types import ConnectorCompletion
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload.connector import (
     LMCacheOffloadConnector,
@@ -28,12 +25,7 @@ from atom.kv_transfer.offload.hybrid.dsv4.connector import (
     DSV4OffloadScheduler,
 )
 
-_HYBRID_COMPLETION_CHANNELS = frozenset(
-    {
-        DSV4_CHECKPOINT_SAVE_CHANNEL,
-        STATE_CHECKPOINT_STAGING_CHANNEL,
-    }
-)
+_HYBRID_COMPLETION_CHANNELS = frozenset({DSV4_CHECKPOINT_SAVE_CHANNEL})
 
 
 def _config(*, compress_ratios=None, layout=None):
@@ -152,6 +144,24 @@ def test_scheduler_shell_forwards_generic_completion_hook():
         ("completion", failed),
         ("load-ok", "c"),
     ]
+
+
+def test_scheduler_shell_forwards_statistics():
+    expected = {
+        "load_requests": 2,
+        "loaded_tokens": 512,
+        "load_failures": 1,
+        "save_requests": 3,
+        "saved_tokens": 768,
+        "loads_pending": 0,
+        "saves_pending": 1,
+    }
+    shell = LMCacheOffloadConnectorScheduler.__new__(LMCacheOffloadConnectorScheduler)
+    shell._impl = SimpleNamespace(get_statistics=lambda: expected)
+
+    assert shell.get_statistics() is expected
+
+
 def test_worker_shell_forwards_pending_work_hook():
     shell = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
     shell._impl = SimpleNamespace(has_pending_work=lambda: True)

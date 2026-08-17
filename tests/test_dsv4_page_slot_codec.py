@@ -168,6 +168,68 @@ def test_page_and_slot_plans_compose_with_an_explicit_prefix_offset():
     ]
 
 
+def test_page_and_slot_share_one_backing_allocation_without_aliasing_spans():
+    base_addr = 10_000
+    backing_bytes = 64
+    role = "dsv4.main_kv.nope"
+    codec = DSV4PageSlotCodec(
+        page_regions=[
+            KVTransferRegion(
+                base_addr=base_addr,
+                total_bytes=backing_bytes,
+                unit_bytes=4,
+                reverse_indexed=False,
+                semantic_role=role,
+            )
+        ],
+        slot_regions=[
+            KVTransferRegion(
+                base_addr=base_addr,
+                total_bytes=backing_bytes,
+                unit_bytes=8,
+                reverse_indexed=True,
+                semantic_role=role,
+            )
+        ],
+        num_blocks=4,
+        num_slots=3,
+        device="cpu",
+    )
+    page_spans = list(_reference_spans(codec, codec.page_plan([1, 3])))
+    slot_spans = list(_reference_spans(codec, codec.slot_plan(1)))
+
+    assert codec.page_regions[0].base_addr == codec.slot_regions[0].base_addr
+    assert codec.page_regions[0].total_bytes == codec.slot_regions[0].total_bytes
+    assert codec.page_regions[0].semantic_role == role
+    assert codec.slot_regions[0].semantic_role == role
+    assert {(span.kind, span.device_addr) for span in page_spans + slot_spans} == {
+        (DSV4PayloadKind.PAGE, base_addr + 4),
+        (DSV4PayloadKind.PAGE, base_addr + 12),
+        (DSV4PayloadKind.SLOT, base_addr + 48),
+    }
+
+    backing = bytearray([0xA5] * backing_bytes)
+
+    def scatter(spans, payload):
+        for span in spans:
+            start = span.device_addr - base_addr
+            source = span.buffer_offset
+            backing[start : start + span.nbytes] = payload[
+                source : source + span.nbytes
+            ]
+
+    slot_before_page = bytes(backing[48:56])
+    scatter(page_spans, bytes(range(8)))
+    assert bytes(backing[4:8]) == bytes(range(4))
+    assert bytes(backing[12:16]) == bytes(range(4, 8))
+    assert bytes(backing[48:56]) == slot_before_page
+
+    page_before_slot = bytes(backing[:16])
+    scatter(slot_spans, bytes(range(8, 16)))
+    assert bytes(backing[48:56]) == bytes(range(8, 16))
+    assert bytes(backing[:16]) == page_before_slot
+
+
 @pytest.mark.parametrize(
     ("page_reverse", "slot_reverse"),
     [(True, True), (False, False)],

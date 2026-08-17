@@ -23,7 +23,6 @@ from atom.kv_transfer.disaggregation.multi.multi_connector import (
     MultiSaveOperationId,
 )
 from atom.kv_transfer.disaggregation.types import (
-    STATE_CHECKPOINT_STAGING_CHANNEL,
     ConnectorCompletion,
     ConnectorMetadata,
     KVConnectorOutput,
@@ -35,6 +34,8 @@ from atom.kv_transfer.offload.hybrid.dsv4.connector import (
     DSV4_CHECKPOINT_SAVE_CHANNEL,
 )
 from atom.model_engine.scheduler import Scheduler
+
+_TEST_COMPLETION_CHANNEL = "test.connector.completion"
 
 # ---------------------------------------------------------------------------
 # Mock sub-connectors
@@ -159,20 +160,14 @@ class FakeWorkerSub:
         return self._recv_blocks
 
 
-class FakeCheckpointWorkerSub(FakeWorkerSub):
-    """Worker mock that consumes native checkpoint records via the new hook."""
-
-    state_checkpoint_completion_channel = STATE_CHECKPOINT_STAGING_CHANNEL
+class FakeCompletionWorkerSub(FakeWorkerSub):
+    """Worker mock that owns one opaque connector-completion channel."""
 
     def __init__(self, **kwargs):
         super().__init__(
-            completion_channels={STATE_CHECKPOINT_STAGING_CHANNEL},
+            completion_channels={_TEST_COMPLETION_CHANNEL},
             **kwargs,
         )
-
-    def start_load_kv_with_state_checkpoints(self, metadata, copies):
-        self.loaded_meta = metadata
-        self.checkpoint_copies = copies
 
 
 def _sched(connectors):
@@ -243,46 +238,6 @@ def _multi_save(operation: SaveOperationId, connector_idx: int):
         operation.generation,
         connector_idx,
     )
-
-
-def _checkpoint_copy(
-    *,
-    copy_id=41,
-    req_id=9,
-    boundary_tokens=8192,
-    boundary_block_hash=0x1234,
-    source_group=2,
-    destination_group=7,
-):
-    return SimpleNamespace(
-        copy_id=copy_id,
-        request_id=req_id,
-        boundary_tokens=boundary_tokens,
-        boundary_block_hash=boundary_block_hash,
-        source_group=source_group,
-        destination_group=destination_group,
-    )
-
-
-def _checkpoint_save_meta(copy_record):
-    meta = ConnectorMetadata()
-    meta.state_checkpoint_completion_channel = STATE_CHECKPOINT_STAGING_CHANNEL
-    meta.requests = [
-        SimpleNamespace(
-            req_id=copy_record.request_id,
-            save_spec=None,
-            slot_save_spec=SimpleNamespace(
-                boundary_tokens=copy_record.boundary_tokens,
-                boundary_block_hash=copy_record.boundary_block_hash,
-                source_group=copy_record.source_group,
-            ),
-            load_spec=None,
-        )
-    ]
-    meta.iter_async_save_operations = lambda: (
-        (copy_record.request_id, copy_record.request_id),
-    )
-    return meta
 
 
 def _completion(channel, operation_id, *, succeeded=True):
@@ -570,7 +525,7 @@ def test_build_connector_meta_wraps_subs_in_order():
 def test_build_connector_meta_records_completion_channel_owner():
     unrelated = FakeSchedSub()
     owner = FakeSchedSub(
-        completion_channels={STATE_CHECKPOINT_STAGING_CHANNEL},
+        completion_channels={_TEST_COMPLETION_CHANNEL},
     )
     owner.meta.requests = [object()]
     sched = _sched([unrelated, owner])
@@ -578,38 +533,21 @@ def test_build_connector_meta_records_completion_channel_owner():
     meta = sched.build_connector_meta()
 
     assert meta.completion_channel_owners == {
-        STATE_CHECKPOINT_STAGING_CHANNEL: 1,
+        _TEST_COMPLETION_CHANNEL: 1,
     }
     assert (
-        meta.requests_for_completion_channel(STATE_CHECKPOINT_STAGING_CHANNEL)
+        meta.requests_for_completion_channel(_TEST_COMPLETION_CHANNEL)
         == owner.meta.requests
     )
     assert meta.requests_for_completion_channel("unknown") == []
 
 
-def test_multi_metadata_delegates_checkpoint_selection_to_protocol_owner():
-    class _CheckpointMetadata(ConnectorMetadata):
-        state_checkpoint_completion_channel = STATE_CHECKPOINT_STAGING_CHANNEL
-
-        def select_state_checkpoint_copies(self, checkpoints):
-            return checkpoints[1:]
-
-    checkpoints = [object(), object()]
-    meta = MultiConnectorMetadata(
-        [ConnectorMetadata(), _CheckpointMetadata()],
-        completion_channel_owners={STATE_CHECKPOINT_STAGING_CHANNEL: 1},
-    )
-
-    assert meta.state_checkpoint_owner == 1
-    assert meta.select_state_checkpoint_copies(checkpoints) == checkpoints[1:]
-
-
 def test_scheduler_rejects_duplicate_completion_channel_owners():
     first = FakeSchedSub(
-        completion_channels={STATE_CHECKPOINT_STAGING_CHANNEL},
+        completion_channels={_TEST_COMPLETION_CHANNEL},
     )
     second = FakeSchedSub(
-        completion_channels={STATE_CHECKPOINT_STAGING_CHANNEL},
+        completion_channels={_TEST_COMPLETION_CHANNEL},
     )
     with pytest.raises(ValueError, match="must have one owner"):
         _sched([first, second])
@@ -708,41 +646,20 @@ def test_worker_rejects_duplicate_completion_channel_owners():
     with pytest.raises(ValueError, match="must have one owner"):
         _worker(
             [
-                FakeCheckpointWorkerSub(),
-                FakeCheckpointWorkerSub(),
+                FakeCompletionWorkerSub(),
+                FakeCompletionWorkerSub(),
             ]
         )
 
 
 def test_worker_rejects_scheduler_worker_completion_owner_mismatch():
-    worker = _worker([FakeWorkerSub(), FakeCheckpointWorkerSub()])
+    worker = _worker([FakeWorkerSub(), FakeCompletionWorkerSub()])
     meta = MultiConnectorMetadata(
         [ConnectorMetadata(), ConnectorMetadata()],
-        completion_channel_owners={STATE_CHECKPOINT_STAGING_CHANNEL: 0},
+        completion_channel_owners={_TEST_COMPLETION_CHANNEL: 0},
     )
 
     with pytest.raises(RuntimeError, match="ownership differs"):
-        worker.start_load_kv(meta)
-
-
-def test_worker_rejects_checkpoint_channel_mismatch_with_same_owner():
-    scheduler_channel = "test.scheduler.checkpoint"
-    worker_channel = "test.worker.checkpoint"
-    owner = FakeCheckpointWorkerSub()
-    owner.completion_channels = frozenset({scheduler_channel, worker_channel})
-    owner.state_checkpoint_completion_channel = worker_channel
-    worker = _worker([owner])
-    owner_meta = ConnectorMetadata()
-    owner_meta.state_checkpoint_completion_channel = scheduler_channel
-    meta = MultiConnectorMetadata(
-        [owner_meta],
-        completion_channel_owners={
-            scheduler_channel: 0,
-            worker_channel: 0,
-        },
-    )
-
-    with pytest.raises(RuntimeError, match="channel differs"):
         worker.start_load_kv(meta)
 
 
@@ -844,39 +761,38 @@ def test_connector_completions_bypass_producer_send_save_pairing():
     assert out.connector_completions == {succeeded, failed}
 
 
-def test_checkpoint_staging_completions_bypass_send_save_pairing():
-    staged = _completion(STATE_CHECKPOINT_STAGING_CHANNEL, 41)
-    aborted = _completion(
-        STATE_CHECKPOINT_STAGING_CHANNEL,
+def test_generic_connector_completions_bypass_send_save_pairing():
+    succeeded = _completion(_TEST_COMPLETION_CHANNEL, 41)
+    failed = _completion(
+        _TEST_COMPLETION_CHANNEL,
         42,
         succeeded=False,
     )
     moriio = FakeWorkerSub(is_producer=True, finished=({9}, set()))
-    off = FakeCheckpointWorkerSub(
-        finished=KVConnectorOutput(connector_completions={staged, aborted}),
+    off = FakeCompletionWorkerSub(
+        finished=KVConnectorOutput(connector_completions={succeeded, failed}),
     )
     w = _worker([moriio, off])
     off_meta = _save_meta(9)
-    off_meta.state_checkpoint_completion_channel = STATE_CHECKPOINT_STAGING_CHANNEL
     w.start_load_kv(
         MultiConnectorMetadata(
             [ConnectorMetadata(), off_meta],
-            completion_channel_owners={STATE_CHECKPOINT_STAGING_CHANNEL: 1},
+            completion_channel_owners={_TEST_COMPLETION_CHANNEL: 1},
         )
     )
 
     out = w.get_finished()
 
     assert out.finished_sending == set()
-    assert out.connector_completions == {staged, aborted}
+    assert out.connector_completions == {succeeded, failed}
 
 
 def test_completion_from_non_owner_child_is_dropped():
-    completion = _completion(STATE_CHECKPOINT_STAGING_CHANNEL, 51)
+    completion = _completion(_TEST_COMPLETION_CHANNEL, 51)
     non_owner = FakeWorkerSub(
         finished=KVConnectorOutput(connector_completions={completion})
     )
-    owner = FakeCheckpointWorkerSub()
+    owner = FakeCompletionWorkerSub()
     worker = _worker([non_owner, owner])
 
     assert worker.get_finished().connector_completions == set()
@@ -887,17 +803,15 @@ def test_completion_from_non_owner_child_is_dropped():
     assert worker.get_finished().connector_completions == {completion}
 
 
-def test_checkpoint_staging_owner_completion_is_forwarded_immediately():
-    checkpoint = _checkpoint_copy(copy_id=53)
-    completion = _completion(STATE_CHECKPOINT_STAGING_CHANNEL, 53)
+def test_completion_channel_owner_event_is_forwarded_immediately():
+    completion = _completion(_TEST_COMPLETION_CHANNEL, 53)
     producer = FakeWorkerSub(is_producer=True)
-    offload = FakeCheckpointWorkerSub()
+    offload = FakeCompletionWorkerSub()
     worker = _worker([producer, offload])
     meta = MultiConnectorMetadata(
-        [ConnectorMetadata(), _checkpoint_save_meta(checkpoint)],
-        completion_channel_owners={STATE_CHECKPOINT_STAGING_CHANNEL: 1},
+        [ConnectorMetadata(), ConnectorMetadata()],
+        completion_channel_owners={_TEST_COMPLETION_CHANNEL: 1},
     )
-    meta.state_checkpoint_copies = [checkpoint]
     worker.start_load_kv(meta)
 
     offload._finished = KVConnectorOutput(connector_completions={completion})

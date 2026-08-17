@@ -20,7 +20,6 @@ from atom.kv_transfer.disaggregation.multi.multi_connector import (
     MultiSaveOperationId,
 )
 from atom.kv_transfer.disaggregation.types import (
-    STATE_CHECKPOINT_STAGING_CHANNEL,
     ConnectorMetadata,
     KVConnectorOutput,
     KVTransferRegion,
@@ -58,7 +57,6 @@ from atom.kv_transfer.offload.metadata import (
     SlotLoadSpec,
     SlotSaveSpec,
 )
-from atom.model_engine.state_pool import StateCheckpointCopy
 
 _FINGERPRINT = bytes.fromhex("00112233445566778899aabbccddeeff")
 _PAYLOAD = b"\x07\x08\x09\xff"
@@ -495,11 +493,6 @@ def _worker(
     connector._pending_save_ops = {}
     connector._pending_legacy_save_ops = {}
     connector._save_req_locks = {}
-    connector._deferred_checkpoint_saves = []
-    connector._checkpoint_staging_fences = {}
-    connector._done_checkpoint_staging = set()
-    connector._aborted_checkpoint_staging = set()
-    connector._quarantined_checkpoint_staging = set()
     connector._engine = _FakeEngine(order)
     connector._codec = _FakeSlotCodec(order, staging_slots)
     connector._checkpoint_codec = DSV4CheckpointCodec(
@@ -572,21 +565,6 @@ def _save_request(*, page: bool = True) -> LMCacheReqMeta:
     )
 
 
-def _checkpoint_copy(
-    *,
-    destination_group: int = 7,
-    copy_id: int = 0,
-) -> StateCheckpointCopy:
-    return StateCheckpointCopy(
-        request_id=17,
-        boundary_tokens=8,
-        boundary_block_hash=0x1234,
-        source_group=2,
-        destination_group=destination_group,
-        copy_id=copy_id,
-    )
-
-
 def _load_request(*, page: bool = True, req_id: int = 23) -> LMCacheReqMeta:
     return LMCacheReqMeta(
         req_id=req_id,
@@ -606,9 +584,7 @@ def _load_request(*, page: bool = True, req_id: int = 23) -> LMCacheReqMeta:
 
 
 def _metadata(req: LMCacheReqMeta) -> LMCacheOffloadMetadata:
-    metadata = LMCacheOffloadMetadata(
-        state_checkpoint_completion_channel=STATE_CHECKPOINT_STAGING_CHANNEL
-    )
+    metadata = LMCacheOffloadMetadata()
     metadata.add_request(req)
     metadata.lookup_requests_in_step = [str(req.req_id)]
     return metadata
@@ -645,15 +621,13 @@ def test_get_finished_atomically_drains_sidecar_save_results():
     assert connector.get_finished().is_empty()
 
 
-def test_get_finished_reports_only_actionable_checkpoint_pending_work():
+def test_get_finished_reports_only_active_save_work_as_pending():
     connector = _worker([])
-    pending_event = _FakeEvent([], query_result=False)
-    connector._checkpoint_staging_fences[41] = (pending_event, False)
+    connector._pending_save_ops[41] = 1
 
     assert connector.get_finished().pending_work is True
 
-    connector._checkpoint_staging_fences.clear()
-    connector._quarantined_checkpoint_staging.add(41)
+    connector._pending_save_ops.clear()
     assert connector.get_finished().pending_work is False
 
 
@@ -1122,401 +1096,61 @@ def test_unified_codec_scatters_from_connector_owned_slot_row():
     assert isinstance(stream, _FakeTransferStream)
 
 
-def test_native_checkpoint_save_defers_until_copy_then_snapshots_destination(
-    monkeypatch,
-):
+def test_slot_snapshot_uses_live_source_group_and_staging_row(monkeypatch):
     order = []
     _patch_rpc_cuda(monkeypatch, order)
     connector = _worker(order)
     connector._save_executor = _DeferredExecutor(order)
-    checkpoint = _checkpoint_copy(destination_group=7)
     request = _save_request(page=False)
-    request.save_operation = SaveOperationId(request.req_id, 9)
-    metadata = _metadata(request)
-    metadata.state_checkpoint_copies = [checkpoint]
 
-    connector.start_load_kv(metadata)
+    connector.start_load_kv(_metadata(request))
 
-    assert connector._codec.snapshot_groups == []
-    assert connector._save_executor.calls == []
-    assert len(connector._deferred_checkpoint_saves) == 1
-    assert connector._slot_admission.num_free == 1
-    assert connector._pending_save_ops == {}
-
-    connector.state_checkpoint_copies_issued([checkpoint])
-
-    assert connector._codec.snapshot_groups == [7]
+    assert connector._codec.snapshot_groups == [request.slot_save_spec.source_group]
     assert order.index("snapshot") < order.index("event-record") < order.index("submit")
-    assert len(connector._save_executor.calls) == 1
-    assert connector._deferred_checkpoint_saves == []
+    assert connector._slot_admission.num_free == 0
 
     fn, args = connector._save_executor.calls[0]
     fn(*args)
-    result = connector.get_finished()
-    assert result.finished_saving == {request.save_operation}
-    assert _completion_ids(result, DSV4_CHECKPOINT_SAVE_CHANNEL, succeeded=True) == {
-        request.save_operation
-    }
-    assert _completion_ids(
-        result, STATE_CHECKPOINT_STAGING_CHANNEL, succeeded=True
-    ) == {checkpoint.copy_id}
-    assert not _completion_ids(
-        result, STATE_CHECKPOINT_STAGING_CHANNEL, succeeded=False
-    )
+    assert order.index("d2h") < order.index("release")
+    assert order.index("release") < order.index("put")
     assert connector._slot_admission.released == [0]
 
 
-def test_nonmatching_checkpoint_copy_keeps_live_slot_fallback(monkeypatch):
+def test_slot_background_save_waits_for_snapshot_event_before_d2h(monkeypatch):
     order = []
-    _patch_rpc_cuda(monkeypatch, order)
+    event = _FakeEvent(order)
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda *args, **kwargs: _FakeRPCStream(order),
+    )
+    monkeypatch.setattr(torch.cuda, "Event", lambda *args, **kwargs: event)
     connector = _worker(order)
     connector._save_executor = _DeferredExecutor(order)
-    unrelated = StateCheckpointCopy(
-        request_id=99,
-        boundary_tokens=8,
-        boundary_block_hash=0x1234,
-        source_group=2,
-        destination_group=7,
-    )
-
-    connector.start_load_kv_with_state_checkpoints(
-        _metadata(_save_request(page=False)),
-        [unrelated],
-    )
-
-    assert connector._codec.snapshot_groups == [2]
-    assert len(connector._save_executor.calls) == 1
-    assert connector._deferred_checkpoint_saves == []
-
-
-def test_regular_slot_without_checkpoint_copy_fails_closed_but_saves_page(monkeypatch):
-    order = []
-    _patch_rpc_cuda(monkeypatch, order)
-    connector = _worker(order)
-    connector._save_executor = _DeferredExecutor(order)
-    request = _save_request(page=True)
-    request.is_last_prefill = False
-
-    connector.start_load_kv_with_state_checkpoints(_metadata(request), [])
-
-    assert connector._codec.snapshot_groups == []
-    assert connector._slot_admission.num_free == 1
-    assert len(connector._save_executor.calls) == 1
+    connector.start_load_kv(_metadata(_save_request(page=False)))
 
     fn, args = connector._save_executor.calls[0]
     fn(*args)
 
+    assert order.index("event-sync") < order.index("d2h")
+
+
+def test_slot_staging_exhaustion_keeps_page_save_and_fails_sidecar(monkeypatch):
+    order = []
+    _patch_rpc_cuda(monkeypatch, order)
+    connector = _worker(order, admission_available=False)
+    request = _save_request(page=True)
+
+    connector.start_load_kv(_metadata(request))
+
+    assert connector._codec.snapshot_groups == []
     assert len(connector._engine.store_calls) == 1
     assert connector._slot_store.put_calls == []
-    assert connector._failed_sidecar_save == {17}
-    assert connector._done_save == {17}
-
-
-def test_checkpoint_copy_generation_does_not_consume_stale_intent(monkeypatch):
-    order = []
-    _patch_rpc_cuda(monkeypatch, order)
-    connector = _worker(order, staging_slots=2)
-    connector._save_executor = _DeferredExecutor(order)
-    old_copy = _checkpoint_copy(copy_id=10)
-    new_copy = _checkpoint_copy(copy_id=11)
-    old_request = _save_request(page=False)
-    old_request.save_operation = SaveOperationId(17, 10)
-    new_request = _save_request(page=False)
-    new_request.save_operation = SaveOperationId(17, 11)
-
-    connector.start_load_kv_with_state_checkpoints(
-        _metadata(old_request),
-        [old_copy],
-    )
-    connector.start_load_kv_with_state_checkpoints(
-        _metadata(new_request),
-        [new_copy],
-    )
-    connector.state_checkpoint_copies_issued([new_copy])
-
-    assert len(connector._save_executor.calls) == 1
-    assert [
-        deferred.checkpoint_identity[0]
-        for deferred in connector._deferred_checkpoint_saves
-    ] == [10]
-
-    connector.abort_state_checkpoint_copies([old_copy])
     result = connector.get_finished()
-    assert result.finished_saving == {old_request.save_operation}
+    assert result.finished_saving == {request.req_id}
     assert _completion_ids(result, DSV4_CHECKPOINT_SAVE_CHANNEL, succeeded=False) == {
-        old_request.save_operation
+        request.req_id
     }
-    assert _completion_ids(
-        result, STATE_CHECKPOINT_STAGING_CHANNEL, succeeded=False
-    ) == {old_copy.copy_id}
-
-
-def test_deferred_checkpoint_submission_failure_releases_snapshot(monkeypatch):
-    order = []
-    _patch_rpc_cuda(monkeypatch, order)
-    connector = _worker(order)
-    connector._save_executor = _RejectingExecutor(order)
-    checkpoint = _checkpoint_copy()
-
-    connector.start_load_kv_with_state_checkpoints(
-        _metadata(_save_request()),
-        [checkpoint],
-    )
-    connector.state_checkpoint_copies_issued([checkpoint])
-
-    assert connector._codec.snapshot_groups == [checkpoint.destination_group]
-    assert order.index("snapshot") < order.index("submit") < order.index("event-sync")
-    assert connector._slot_admission.released == [0]
-    assert connector._failed_sidecar_save == {17}
-    assert connector._done_save == {17}
-    assert connector._pending_save_ops == {}
-
-
-def test_checkpoint_staging_completion_does_not_wait_for_save_executor(monkeypatch):
-    order = []
-    _patch_rpc_cuda(monkeypatch, order)
-    connector = _worker(order)
-    connector._save_executor = _DeferredExecutor(order)
-    checkpoint = _checkpoint_copy(copy_id=33)
-
-    connector.start_load_kv_with_state_checkpoints(
-        _metadata(_save_request(page=False)),
-        [checkpoint],
-    )
-    connector.state_checkpoint_copies_issued([checkpoint])
-
-    result = connector.get_finished()
-    assert _completion_ids(
-        result, STATE_CHECKPOINT_STAGING_CHANNEL, succeeded=True
-    ) == {33}
-    assert result.finished_saving == set()
-    assert len(connector._save_executor.calls) == 1
-
-
-def test_checkpoint_and_temp_row_release_before_storage_publication(monkeypatch):
-    order = []
-    _patch_rpc_cuda(monkeypatch, order)
-    connector = _worker(order)
-    connector._save_executor = _DeferredExecutor(order)
-    checkpoint = _checkpoint_copy(copy_id=37)
-
-    connector.start_load_kv_with_state_checkpoints(
-        _metadata(_save_request(page=True)),
-        [checkpoint],
-    )
-    connector.state_checkpoint_copies_issued([checkpoint])
-
-    # The native group lease is independently releasable at gather completion,
-    # before the background save even starts D2H or storage work.
-    staged = connector.get_finished()
-    assert _completion_ids(
-        staged, STATE_CHECKPOINT_STAGING_CHANNEL, succeeded=True
-    ) == {37}
-    assert staged.finished_saving == set()
-
-    fn, args = connector._save_executor.calls[0]
-    fn(*args)
-
-    # The connector-owned temp row is needed only through D2H. PAGE visibility
-    # and AOS1 publication must not keep scarce GPU staging capacity reserved.
-    assert order.index("d2h") < order.index("release")
-    assert order.index("release") < order.index("lookup")
-    assert order.index("release") < order.index("put")
-
-
-def test_checkpoint_staging_waits_for_ready_event(monkeypatch):
-    order = []
-    event = _FakeEvent(order, query_result=False)
-    monkeypatch.setattr(
-        torch.cuda,
-        "current_stream",
-        lambda *args, **kwargs: _FakeRPCStream(order),
-    )
-    monkeypatch.setattr(torch.cuda, "Event", lambda *args, **kwargs: event)
-    connector = _worker(order)
-    connector._save_executor = _DeferredExecutor(order)
-    checkpoint = _checkpoint_copy(copy_id=35)
-
-    connector.start_load_kv_with_state_checkpoints(
-        _metadata(_save_request(page=False)),
-        [checkpoint],
-    )
-    connector.state_checkpoint_copies_issued([checkpoint])
-
-    assert not _completion_ids(
-        connector.get_finished(),
-        STATE_CHECKPOINT_STAGING_CHANNEL,
-        succeeded=True,
-    )
-    event.query_result = True
-    assert _completion_ids(
-        connector.get_finished(),
-        STATE_CHECKPOINT_STAGING_CHANNEL,
-        succeeded=True,
-    ) == {35}
-
-
-def test_checkpoint_save_backpressure_still_fences_native_copy(monkeypatch):
-    order = []
-    _patch_rpc_cuda(monkeypatch, order)
-    connector = _worker(order)
-    connector._save_admission = threading.BoundedSemaphore(0)
-    checkpoint = _checkpoint_copy(copy_id=36)
-
-    connector.start_load_kv_with_state_checkpoints(
-        _metadata(_save_request(page=False)),
-        [checkpoint],
-    )
-    connector.state_checkpoint_copies_issued([checkpoint])
-
-    result = connector.get_finished()
-    assert _completion_ids(
-        result, STATE_CHECKPOINT_STAGING_CHANNEL, succeeded=True
-    ) == {36}
-    assert _completion_ids(result, DSV4_CHECKPOINT_SAVE_CHANNEL, succeeded=False) == {
-        17
-    }
-    assert connector._codec.snapshot_groups == []
-
-
-def test_unknown_checkpoint_gpu_completion_quarantines_lease(monkeypatch):
-    order = []
-    event = _FakeEvent(
-        order,
-        query_error=RuntimeError("query failed"),
-        synchronize_error=RuntimeError("sync failed"),
-    )
-    monkeypatch.setattr(
-        torch.cuda,
-        "current_stream",
-        lambda *args, **kwargs: _FakeRPCStream(order),
-    )
-    monkeypatch.setattr(torch.cuda, "Event", lambda *args, **kwargs: event)
-    connector = _worker(order)
-    connector._save_executor = _DeferredExecutor(order)
-    checkpoint = _checkpoint_copy(copy_id=34)
-
-    connector.start_load_kv_with_state_checkpoints(
-        _metadata(_save_request(page=False)),
-        [checkpoint],
-    )
-    connector.state_checkpoint_copies_issued([checkpoint])
-
-    result = connector.get_finished()
-    assert not _completion_ids(result, STATE_CHECKPOINT_STAGING_CHANNEL, succeeded=True)
-    assert not _completion_ids(
-        result, STATE_CHECKPOINT_STAGING_CHANNEL, succeeded=False
-    )
-    assert connector._quarantined_checkpoint_staging == {34}
-
-
-def test_native_checkpoint_build_failure_aborts_deferred_snapshot(monkeypatch):
-    order = []
-    _patch_rpc_cuda(monkeypatch, order)
-    connector = _worker(order)
-    connector._save_executor = _DeferredExecutor(order)
-    checkpoint = _checkpoint_copy()
-
-    connector.start_load_kv_with_state_checkpoints(
-        _metadata(_save_request(page=False)),
-        [checkpoint],
-    )
-    connector.abort_state_checkpoint_copies([checkpoint])
-
-    assert connector._codec.snapshot_groups == []
-    assert connector._slot_admission.released == []
-    assert connector._slot_admission.num_free == 1
-    assert connector._failed_sidecar_save == {17}
-    assert connector._done_save == {17}
-    assert connector._pending_save_ops == {}
-
-
-def test_multi_checkpoint_hooks_target_only_unique_channel_owner():
-    calls = []
-
-    class _Failing:
-        completion_channels = frozenset({STATE_CHECKPOINT_STAGING_CHANNEL})
-        state_checkpoint_completion_channel = STATE_CHECKPOINT_STAGING_CHANNEL
-
-        def state_checkpoint_copies_issued(self, _copies):
-            raise RuntimeError("issued failed")
-
-        def abort_state_checkpoint_copies(self, _copies):
-            calls.append("failing-abort")
-            raise RuntimeError("abort failed")
-
-    class _Healthy:
-        completion_channels = frozenset()
-
-        def state_checkpoint_copies_issued(self, copies):
-            calls.append(("issued", copies))
-
-        def abort_state_checkpoint_copies(self, copies):
-            calls.append(("abort", copies))
-
-    with patch(
-        "atom.kv_transfer.disaggregation.multi.multi_connector._build_subconnectors",
-        return_value=[_Failing(), _Healthy()],
-    ):
-        multi = MultiConnector(SimpleNamespace())
-    copies = [_checkpoint_copy()]
-
-    multi.state_checkpoint_copies_issued(copies)
-    multi.abort_state_checkpoint_copies(copies)
-
-    assert calls == [
-        "failing-abort",
-        "failing-abort",
-    ]
-
-
-def test_checkpoint_hook_failure_terminals_all_selected_intents(monkeypatch):
-    connector = _worker([])
-    first_copy = _checkpoint_copy(copy_id=20)
-    second_copy = StateCheckpointCopy(
-        request_id=18,
-        boundary_tokens=8,
-        boundary_block_hash=0x5678,
-        source_group=3,
-        destination_group=6,
-        copy_id=21,
-    )
-    first = _save_request(page=False)
-    first.save_operation = SaveOperationId(17, 20)
-    second = LMCacheReqMeta(
-        req_id=18,
-        token_ids=list(range(8)),
-        block_ids=[12, 13],
-        slot_save_spec=SlotSaveSpec(
-            boundary_tokens=8,
-            boundary_block_hash=0x5678,
-            source_group=3,
-        ),
-        save_operation=SaveOperationId(18, 21),
-    )
-    connector.start_load_kv_with_state_checkpoints(
-        _metadata(first),
-        [first_copy],
-    )
-    connector.start_load_kv_with_state_checkpoints(
-        _metadata(second),
-        [second_copy],
-    )
-    monkeypatch.setattr(
-        connector,
-        "_submit_deferred_checkpoint_save",
-        lambda _deferred: (_ for _ in ()).throw(RuntimeError("unexpected")),
-    )
-
-    connector.state_checkpoint_copies_issued([first_copy, second_copy])
-
-    result = connector.get_finished()
-    assert result.finished_saving == {first.save_operation, second.save_operation}
-    assert _completion_ids(result, DSV4_CHECKPOINT_SAVE_CHANNEL, succeeded=False) == {
-        first.save_operation,
-        second.save_operation,
-    }
-    assert connector._deferred_checkpoint_saves == []
 
 
 def test_save_submission_failure_releases_snapshot_and_completes_save(monkeypatch):
@@ -1755,7 +1389,6 @@ def test_same_request_saves_serialize_and_multi_releases_on_all_ops_done(monkeyp
                 [ConnectorMetadata(), _metadata(page)],
                 completion_channel_owners={
                     DSV4_CHECKPOINT_SAVE_CHANNEL: 1,
-                    STATE_CHECKPOINT_STAGING_CHANNEL: 1,
                 },
             )
         )
@@ -1767,7 +1400,6 @@ def test_same_request_saves_serialize_and_multi_releases_on_all_ops_done(monkeyp
                 [ConnectorMetadata(), _metadata(boundary)],
                 completion_channel_owners={
                     DSV4_CHECKPOINT_SAVE_CHANNEL: 1,
-                    STATE_CHECKPOINT_STAGING_CHANNEL: 1,
                 },
             )
         )

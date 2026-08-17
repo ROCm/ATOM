@@ -296,6 +296,7 @@ class MultiConnectorMetadata(ConnectorMetadata):
             return []
         return list(getattr(self.metas[owner], "requests", ()) or ())
 
+
 # ---------------------------------------------------------------------------
 # Worker side
 # ---------------------------------------------------------------------------
@@ -336,7 +337,6 @@ class MultiConnector(KVConnectorBase):
             c.register_kv_caches(kv_caches, transfer_tensors, num_blocks)
 
     def start_load_kv(self, metadata: ConnectorMetadata) -> None:
-        self._ensure_pairing_state()
         metas = getattr(metadata, "metas", None)
         if metas is None:
             logger.warning(

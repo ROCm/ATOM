@@ -235,6 +235,58 @@ class OffloadSchedulerMixin:
     handoff mechanics whose invariants are identical for both layouts.
     """
 
+    def _init_offload_statistics(self) -> None:
+        """Initialize layout-independent scheduler counters."""
+
+        self.total_load_requests = 0
+        self.total_loaded_tokens = 0
+        self.total_load_failures = 0
+        self.total_save_requests = 0
+        self.total_saved_tokens = 0
+        self._load_inflight_tokens: dict[object, int] = {}
+        self._save_inflight_tokens: dict[object, int] = {}
+
+    def _track_load_statistics(self, operation, tokens: int) -> None:
+        self._load_inflight_tokens[operation] = max(0, int(tokens))
+
+    def _track_save_statistics(self, operation, tokens: int) -> None:
+        self._save_inflight_tokens[operation] = max(0, int(tokens))
+
+    def _finish_load_statistics(self, operation, *, succeeded: bool) -> None:
+        if operation not in self._load_inflight_tokens:
+            return
+        tokens = self._load_inflight_tokens.pop(operation)
+        if succeeded:
+            self.total_load_requests += 1
+            self.total_loaded_tokens += tokens
+        else:
+            self.total_load_failures += 1
+
+    def _cancel_load_statistics(self, operation) -> None:
+        """Forget an operation retired by request cleanup without a terminal."""
+
+        self._load_inflight_tokens.pop(operation, None)
+
+    def _finish_save_statistics(self, operation) -> None:
+        if operation not in self._save_inflight_tokens:
+            return
+        tokens = self._save_inflight_tokens.pop(operation)
+        self.total_save_requests += 1
+        self.total_saved_tokens += tokens
+
+    def get_statistics(self) -> dict[str, int]:
+        """Return cumulative counters and exact-operation queue depths."""
+
+        return {
+            "load_requests": self.total_load_requests,
+            "loaded_tokens": self.total_loaded_tokens,
+            "load_failures": self.total_load_failures,
+            "save_requests": self.total_save_requests,
+            "saved_tokens": self.total_saved_tokens,
+            "loads_pending": len(self._load_inflight_tokens),
+            "saves_pending": len(self._save_inflight_tokens),
+        }
+
     def _chunk_floor(self, tokens: int) -> int:
         chunk = int(self.chunk_size or 256)
         return (max(0, int(tokens)) // chunk) * chunk

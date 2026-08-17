@@ -156,20 +156,8 @@ class LMCacheOffloadMetadata(ConnectorMetadata):
     descriptors the worker consumes in ``start_load_kv``.
     """
 
-    def __init__(
-        self,
-        *,
-        state_checkpoint_completion_channel: str | None = None,
-    ) -> None:
+    def __init__(self) -> None:
         super().__init__()
-        if state_checkpoint_completion_channel is not None and (
-            not isinstance(state_checkpoint_completion_channel, str)
-            or not state_checkpoint_completion_channel
-        ):
-            raise ValueError(
-                "state checkpoint completion channel must be a non-empty string"
-            )
-        self.state_checkpoint_completion_channel = state_checkpoint_completion_channel
         self.requests: list[LMCacheReqMeta] = []
         # req_ids whose worker-side lookup pin can be released this step.
         self.lookup_requests_in_step: list[str] = []
@@ -190,30 +178,3 @@ class LMCacheOffloadMetadata(ConnectorMetadata):
             for request in self.requests
             if request.save_spec is not None or request.slot_save_spec is not None
         )
-
-    def select_state_checkpoint_copies(self, checkpoints):
-        """Match native keeper copies to state-save requests in this step."""
-
-        if self.state_checkpoint_completion_channel is None:
-            return []
-        save_identities = {
-            (
-                request.req_id,
-                int(request.slot_save_spec.boundary_tokens),
-                int(request.slot_save_spec.boundary_block_hash),
-                int(request.slot_save_spec.source_group),
-            )
-            for request in self.requests
-            if request.slot_save_spec is not None
-        }
-        return [
-            checkpoint
-            for checkpoint in checkpoints
-            if (
-                checkpoint.request_id,
-                int(checkpoint.boundary_tokens),
-                int(checkpoint.boundary_block_hash),
-                int(checkpoint.source_group),
-            )
-            in save_identities
-        ]

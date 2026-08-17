@@ -114,7 +114,8 @@ def _cuda_contract_codec() -> DSV4PageSlotCodec:
 
 
 class _NoOwnershipStream:
-    device = torch.device("cuda")
+    def __init__(self, device: str | torch.device = "cuda") -> None:
+        self.device = torch.device(device)
 
     def synchronize(self):
         raise AssertionError("the DSV4 wrapper must not synchronize its stream")
@@ -139,7 +140,7 @@ def test_page_and_slot_plans_launch_on_the_same_caller_stream(
     codec = _cuda_contract_codec()
     page_plan = codec.page_plan([2, 0], buffer_offset=7)
     slot_plan = codec.slot_plan(1, buffer_offset=page_plan.required_buffer_bytes)
-    stream = _NoOwnershipStream()
+    stream = _NoOwnershipStream(codec.device)
     buffer = object()
     page_device_plan = object()
     slot_device_plan = object()

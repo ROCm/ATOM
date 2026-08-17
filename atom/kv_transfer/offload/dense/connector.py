@@ -315,6 +315,7 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
     is_offload = True
 
     def __init__(self, config) -> None:
+        self._init_offload_statistics()
         self._config = config
         kvc = getattr(config, "kv_transfer_config", {}) or {}
         self.kv_role = validated_kv_role(kvc)
@@ -596,6 +597,7 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             seq._active_load_operation = load_operation
             seq._consumed_load_operation = None
             self._active_load_operations[sid] = (seq, load_operation)
+            self._track_load_statistics(load_operation, lmc - hbm)
             meta.add_request(
                 LMCacheReqMeta(
                     req_id=seq.id,
@@ -636,6 +638,7 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             )
             save_operation = SaveOperationId(seq.id, self._save_nonce)
             self._save_nonce += 1
+            self._track_save_statistics(save_operation, aligned - saved)
             meta.add_request(
                 LMCacheReqMeta(
                     req_id=seq.id,
@@ -671,6 +674,7 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             # entries should one be restored from older scheduler state.
             return
         self._save_inflight.pop(sid, None)
+        self._finish_save_statistics(req_id)
 
     def load_failed(self, req_id) -> bool:
         sid = str(req_id.req_id if isinstance(req_id, LoadOperationId) else req_id)
@@ -683,6 +687,7 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             # Once this lifecycle has an exact generation, a legacy raw request
             # ID cannot complete it (including after request-ID reuse).
             return False
+        self._finish_load_statistics(req_id, succeeded=False)
         floor = self._load_save_floors.get(sid)
         entry = self._save_tracker.get(sid)
         if floor is not None and entry is not None:
@@ -702,6 +707,7 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             self._active_load_operations.pop(sid, None)
         elif active is not None:
             return False
+        self._finish_load_statistics(req_id, succeeded=True)
         self._load_save_floors.pop(sid, None)
         return True
 
@@ -714,6 +720,7 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         if active is not None and active[0] is seq:
             self._active_load_operations.pop(sid, None)
             operation = active[1]
+            self._cancel_load_statistics(operation)
             if getattr(seq, "_active_load_operation", None) == operation:
                 for marker in (
                     "_active_load_operation",
@@ -730,6 +737,7 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             active = self._active_load_operations.get(sid)
             if active is not None and active[0] is seq:
                 self._active_load_operations.pop(sid, None)
+                self._cancel_load_statistics(active[1])
             self._load_lifecycles.pop(sid, None)
         entry = self._save_tracker.get(sid)
         if entry is not None and entry[0] is seq and not self.should_defer_free(seq):

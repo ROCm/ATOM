@@ -13,7 +13,6 @@ from atom.kv_transfer.disaggregation import (
     KVOutputAggregator,
 )
 from atom.kv_transfer.disaggregation.types import (
-    STATE_CHECKPOINT_STAGING_CHANNEL,
     LoadOperationId,
     SaveOperationId,
     SendOperationId,
@@ -21,6 +20,8 @@ from atom.kv_transfer.disaggregation.types import (
 from atom.kv_transfer.offload.hybrid.dsv4.connector import (
     DSV4_CHECKPOINT_SAVE_CHANNEL,
 )
+
+_TEST_COMPLETION_CHANNEL = "test.connector.completion"
 
 
 def _completion(channel, operation_id, *, succeeded=True):
@@ -258,7 +259,7 @@ class TestAggregateBasic:
     def test_connector_completion_channels_never_cross_complete(self):
         agg = KVOutputAggregator(world_size=2)
         sidecar = _completion(DSV4_CHECKPOINT_SAVE_CHANNEL, 42)
-        checkpoint = _completion(STATE_CHECKPOINT_STAGING_CHANNEL, 42)
+        checkpoint = _completion(_TEST_COMPLETION_CHANNEL, 42)
 
         mixed = agg.aggregate(
             [
@@ -278,9 +279,9 @@ class TestAggregateBasic:
         assert matched.connector_completions == {sidecar, checkpoint}
         assert agg.pending_count == (0, 0)
 
-    def test_checkpoint_staging_waits_for_all_workers(self):
+    def test_generic_connector_completion_waits_for_all_workers(self):
         agg = KVOutputAggregator(world_size=2)
-        completion = _completion(STATE_CHECKPOINT_STAGING_CHANNEL, 42)
+        completion = _completion(_TEST_COMPLETION_CHANNEL, 42)
 
         partial = agg.aggregate(
             [
@@ -300,11 +301,11 @@ class TestAggregateBasic:
         assert terminal.connector_completions == {completion}
         assert agg.pending_count == (0, 0)
 
-    def test_any_checkpoint_abort_invalidates_after_all_workers_terminal(self):
+    def test_any_connector_failure_wins_after_all_workers_terminal(self):
         agg = KVOutputAggregator(world_size=3)
-        succeeded = _completion(STATE_CHECKPOINT_STAGING_CHANNEL, 9)
+        succeeded = _completion(_TEST_COMPLETION_CHANNEL, 9)
         aborted = _completion(
-            STATE_CHECKPOINT_STAGING_CHANNEL,
+            _TEST_COMPLETION_CHANNEL,
             9,
             succeeded=False,
         )
@@ -613,7 +614,7 @@ class TestKVConnectorOutput:
         assert not KVConnectorOutput(
             connector_completions={
                 _completion(
-                    STATE_CHECKPOINT_STAGING_CHANNEL,
+                    _TEST_COMPLETION_CHANNEL,
                     1,
                     succeeded=False,
                 )

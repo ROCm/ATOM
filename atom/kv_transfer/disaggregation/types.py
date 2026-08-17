@@ -13,10 +13,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    from atom.model_engine.state_pool import StateCheckpointCopy
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # Type aliases
@@ -75,12 +72,6 @@ class LoadOperationId:
 
 
 LoadCompletionId = ReqId | LoadOperationId
-
-# Connector-owned completion channels are opaque to composite connectors and
-# the TP output aggregator.  This one channel belongs to the model-engine
-# checkpoint lease protocol, so the scheduler consumes it directly after TP
-# aggregation.  Backend-specific channels stay in their backend package.
-STATE_CHECKPOINT_STAGING_CHANNEL = "atom.state_checkpoint.staging"
 
 ConnectorCompletionId = ReqId | SendOperationId | SaveOperationId | LoadOperationId
 ConnectorCompletionKey = tuple[str, ConnectorCompletionId]
@@ -294,8 +285,6 @@ class ConnectorMetadata:
     and the worker-side connector consumes it in ``start_load_kv``.
     """
 
-    state_checkpoint_completion_channel: str | None = None
-
     def __init__(self) -> None:
         self.reqs_to_recv: dict[ReqId, ReqMeta] = {}
         self.reqs_to_save: dict[ReqId, ReqMeta] = {}
@@ -303,6 +292,7 @@ class ConnectorMetadata:
         self.reqs_in_batch: set[ReqId] = set()
         self.reqs_not_processed: set[ReqId] = set()
         self.request_id_to_transfer_id: dict[ReqId, int] = {}
+
     def iter_async_save_operations(
         self,
     ) -> tuple[tuple[ReqId, SaveCompletionId], ...]:

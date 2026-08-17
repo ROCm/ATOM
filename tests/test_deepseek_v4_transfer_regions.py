@@ -16,6 +16,8 @@ import torch
 from atom.kv_transfer.disaggregation.types import KVTransferTensors
 from atom.kv_transfer.offload.hybrid.dsv4.codec import DSV4PageSlotCodec
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
+from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
+from atom.model_engine.state_runtime import StateRuntime, StateTransfer
 from atom.model_ops.attentions.v4_pool_geometry import UnifiedPoolGeometry
 
 _MISSING = object()
@@ -176,8 +178,23 @@ def _transfer_builder(
         kv_transfer_config=transfer_config or {},
         pipeline_parallel_size=pipeline_parallel_size,
     )
+    layout_id = "test.dsv4.unified-page-slot"
+    state_runtime = StateRuntime(
+        transfer=StateTransfer.copy(layout_id),
+        checkpoint_spec=PagedStateCheckpointSpec(
+            page_unit_bytes=(
+                sum(geo.block_bytes(width) for width in row_widths)
+                + len(builder.csa_layers)
+                * builder.csa_rows_per_block
+                * builder._index_row_bytes
+            ),
+            slot_bytes=sum(geo.slot_bytes(width) for width in row_widths),
+            layout_id=layout_id,
+        ),
+    )
     builder.model_runner = SimpleNamespace(
         config=config,
+        state_runtime=state_runtime,
         num_physical_kvcache_blocks=num_blocks,
         pool_plan=SimpleNamespace(entries={STATE_SLOT_CLASS: num_slots}),
         v4_unified_kv=planes[0],

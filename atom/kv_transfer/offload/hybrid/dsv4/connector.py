@@ -14,10 +14,12 @@ Design:
 * **Fail-closed DSV4 PAGE+SLOT** — stateful DSV4 stores token-chunked PAGE bytes
   through ``LMCacheEngine`` and one complete request SLOT as an AOS1 sidecar.
   The sidecar is published only after PAGE coverage reaches the same boundary.
-* **Daemon-after-forward copies** — ``start_load_kv`` submits to background load
-  and save executors and returns immediately, so the worker RPC thread is free for
-  ``forward``. Saves serialize per request while different requests can use the
-  configured worker pool in parallel; completions are polled in ``get_finished``.
+* **Snapshot-before-forward, publish in background** — ``start_load_kv`` gathers
+  each live Active SLOT into connector-owned staging on the caller's CUDA stream
+  before ``forward`` is enqueued. Background workers wait for that snapshot and
+  then publish it without reading the live SLOT again. Saves serialize per request
+  while different requests can use the configured worker pool in parallel;
+  completions are polled in ``get_finished``.
 * **Cross-process hit lookup** — scheduler (EngineCore process) queries worker hits
   via LMCache's ZMQ ``LookupClient``/``LookupServer`` (no homegrown mirror).
 """
@@ -40,7 +42,6 @@ from atom.kv_transfer.disaggregation.base import (
     KVConnectorSchedulerBase,
 )
 from atom.kv_transfer.disaggregation.types import (
-    STATE_CHECKPOINT_STAGING_CHANNEL,
     ConnectorCompletion,
     KVConnectorOutput,
     LoadOperationId,
@@ -171,14 +172,6 @@ class _SlotSaveSnapshot:
     source_completion_uncertain: bool = False
 
 
-@dataclass(frozen=True)
-class _DeferredCheckpointSave:
-    """A lightweight save intent armed before its native copy is issued."""
-
-    req: LMCacheReqMeta
-    checkpoint_identity: tuple[int, ReqId, int, int, int, int]
-
-
 class _SlotStagingSyncError(RuntimeError):
     """GPU completion was not confirmed, so the staging row is unsafe."""
 
@@ -218,20 +211,15 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
     # finished_sending (the scheduler frees blocks on finished_sending — a P/D
     # producer semantic that would wrongly deallocate live offload blocks).
     is_producer = False
-    state_checkpoint_completion_channel = STATE_CHECKPOINT_STAGING_CHANNEL
-    completion_channels = frozenset(
-        {
-            DSV4_CHECKPOINT_SAVE_CHANNEL,
-            STATE_CHECKPOINT_STAGING_CHANNEL,
-        }
-    )
+    completion_channels = frozenset({DSV4_CHECKPOINT_SAVE_CHANNEL})
 
     def __init__(self, config) -> None:
         self._config = config
         kvc = getattr(config, "kv_transfer_config", {}) or {}
         raw_block_size = config.kv_cache_block_size
         if isinstance(raw_block_size, bool) or not isinstance(raw_block_size, Integral):
-            raise ValueError("DSV4 block size must be an integer")
+            # Preserve the public configuration error contract.
+            raise ValueError("DSV4 block size must be an integer")  # noqa: TRY004
         self.block_size = int(raw_block_size)
         self.virtual_block_size: int | None = None
         self.profile = None
@@ -269,11 +257,6 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         self._pending_save_ops: dict[ReqId, int] = {}
         self._pending_legacy_save_ops: dict[ReqId, int] = {}
         self._save_req_locks: dict[ReqId, threading.Lock] = {}
-        self._deferred_checkpoint_saves: list[_DeferredCheckpointSave] = []
-        self._checkpoint_staging_fences: dict[int, tuple[object, bool]] = {}
-        self._done_checkpoint_staging: set[int] = set()
-        self._aborted_checkpoint_staging: set[int] = set()
-        self._quarantined_checkpoint_staging: set[int] = set()
 
         self._engine = None
         self._codec: DSV4PageSlotCodec | None = None
@@ -638,45 +621,6 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
 
     # -- per-step (RPC thread): enqueue PAGE work, snapshot SLOT ----------
     def start_load_kv(self, metadata) -> None:
-        self.start_load_kv_with_state_checkpoints(
-            metadata,
-            getattr(metadata, "state_checkpoint_copies", ()),
-        )
-
-    @staticmethod
-    def _checkpoint_copy_identity(copy) -> tuple[int, ReqId, int, int, int, int]:
-        return (
-            int(copy.copy_id),
-            copy.request_id,
-            int(copy.boundary_tokens),
-            int(copy.boundary_block_hash),
-            int(copy.source_group),
-            int(copy.destination_group),
-        )
-
-    def start_load_kv_with_state_checkpoints(
-        self,
-        metadata,
-        state_checkpoint_copies,
-    ) -> None:
-        """Arm exact keeper-copy saves for capture after the native D2D copy."""
-
-        checkpoint_copies: dict[
-            tuple[ReqId, int, int, int], tuple[int, ReqId, int, int, int, int]
-        ] = {}
-        for copy in state_checkpoint_copies or ():
-            identity = self._checkpoint_copy_identity(copy)
-            checkpoint_copies[identity[1:5]] = identity
-        self._start_load_kv(metadata, checkpoint_copies)
-
-    def _start_load_kv(
-        self,
-        metadata,
-        checkpoint_copies: dict[
-            tuple[ReqId, int, int, int],
-            tuple[int, ReqId, int, int, int, int],
-        ],
-    ) -> None:
         if not isinstance(metadata, LMCacheOffloadMetadata):
             return
         load_requests = [
@@ -759,36 +703,6 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 getattr(req, "save_spec", None) is not None
                 or getattr(req, "slot_save_spec", None) is not None
             ) and self._do_save:
-                slot_spec = getattr(req, "slot_save_spec", None)
-                checkpoint_identity = None
-                if slot_spec is not None:
-                    checkpoint_identity = checkpoint_copies.get(
-                        (
-                            req.req_id,
-                            int(slot_spec.boundary_tokens),
-                            int(slot_spec.boundary_block_hash),
-                            int(slot_spec.source_group),
-                        )
-                    )
-                if checkpoint_identity is not None:
-                    deferred = _DeferredCheckpointSave(
-                        req=req,
-                        checkpoint_identity=checkpoint_identity,
-                    )
-                    with self._lock:
-                        pending = getattr(
-                            self,
-                            "_deferred_checkpoint_saves",
-                            None,
-                        )
-                        if pending is None:
-                            pending = []
-                            self._deferred_checkpoint_saves = pending
-                        pending.append(deferred)
-                    continue
-                missing_regular_checkpoint = slot_spec is not None and not bool(
-                    getattr(req, "is_last_prefill", False)
-                )
                 if not self._save_admission.acquire(blocking=False):
                     self._finish_unadmitted_save(req)
                     continue
@@ -797,16 +711,11 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                     getattr(req, "save_operation", None),
                 )
                 try:
-                    # A regular interval must snapshot the leased native
-                    # checkpoint destination. If free-list pressure produced no
-                    # exact StateCheckpointCopy, fail SLOT closed while PAGE is
-                    # still allowed to save. Only an interval-aligned terminal
-                    # may use its lifecycle-protected live group fallback.
-                    slot_snapshot = (
-                        _SlotSaveSnapshot(None, None, False)
-                        if missing_regular_checkpoint
-                        else self._prepare_slot_save(req)
-                    )
+                    # Metadata is dispatched before this batch's forward. Copy
+                    # the live Active SLOT into connector-owned staging on the
+                    # current stream, then let the forward mutate the shared
+                    # PAGE/SLOT backing only after the snapshot has been issued.
+                    slot_snapshot = self._prepare_slot_save(req)
                 except Exception:
                     logger.exception(
                         "LMCache offload: failed to prepare save req=%s",
@@ -1130,253 +1039,6 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 None,
                 False,
                 source_completion_uncertain=not cleanup_complete,
-            )
-
-    def _take_deferred_checkpoint_saves(
-        self,
-        state_checkpoint_copies,
-    ) -> list[_DeferredCheckpointSave]:
-        identities = {
-            self._checkpoint_copy_identity(copy)
-            for copy in (state_checkpoint_copies or ())
-        }
-        if not identities:
-            return []
-        with self._lock:
-            pending = list(self._deferred_checkpoint_saves)
-            selected = [
-                save for save in pending if save.checkpoint_identity in identities
-            ]
-            self._deferred_checkpoint_saves = [
-                save for save in pending if save.checkpoint_identity not in identities
-            ]
-        return selected
-
-    @staticmethod
-    def _record_current_stream_event():
-        event = torch.cuda.Event()
-        event.record(torch.cuda.current_stream())
-        return event
-
-    def _complete_checkpoint_staging(self, copy_id: int, *, aborted: bool) -> None:
-        """Publish one local staging terminal after GPU access is proven done."""
-
-        copy_id = int(copy_id)
-        with self._lock:
-            self._checkpoint_staging_fences.pop(copy_id, None)
-            if copy_id in self._quarantined_checkpoint_staging:
-                return
-            if aborted:
-                self._done_checkpoint_staging.discard(copy_id)
-                self._aborted_checkpoint_staging.add(copy_id)
-            elif copy_id not in self._aborted_checkpoint_staging:
-                self._done_checkpoint_staging.add(copy_id)
-
-    def _quarantine_checkpoint_staging(self, copy_id: int) -> None:
-        """Keep the scheduler lease pinned when GPU completion is unknowable."""
-
-        copy_id = int(copy_id)
-        with self._lock:
-            self._checkpoint_staging_fences.pop(copy_id, None)
-            self._quarantined_checkpoint_staging.add(copy_id)
-        logger.error(
-            "LMCache offload: checkpoint staging completion is unknown; "
-            "quarantining native lease copy_id=%d rank=%s",
-            copy_id,
-            getattr(self, "_rank", "?"),
-        )
-
-    def _track_checkpoint_staging(
-        self,
-        copy_id: int,
-        event=None,
-        *,
-        aborted: bool = False,
-    ):
-        """Fence native-copy/gather work without blocking the RPC thread."""
-
-        copy_id = int(copy_id)
-        if event is None:
-            try:
-                event = self._record_current_stream_event()
-            except Exception:
-                logger.exception(
-                    "LMCache offload: checkpoint staging event creation failed "
-                    "copy_id=%d",
-                    copy_id,
-                )
-                try:
-                    torch.cuda.current_stream().synchronize()
-                except Exception:
-                    logger.exception(
-                        "LMCache offload: checkpoint staging fallback sync failed "
-                        "copy_id=%d",
-                        copy_id,
-                    )
-                    self._quarantine_checkpoint_staging(copy_id)
-                else:
-                    self._complete_checkpoint_staging(copy_id, aborted=aborted)
-                return None
-        with self._lock:
-            self._checkpoint_staging_fences.setdefault(
-                copy_id,
-                (event, bool(aborted)),
-            )
-        return event
-
-    def _poll_checkpoint_staging(self) -> None:
-        """Non-blockingly retire completed fences; sync only on query failure."""
-
-        with self._lock:
-            pending = list(self._checkpoint_staging_fences.items())
-        for copy_id, (event, aborted) in pending:
-            try:
-                query = getattr(event, "query", None)
-                if callable(query):
-                    if not query():
-                        continue
-                else:
-                    event.synchronize()
-            except Exception:
-                logger.exception(
-                    "LMCache offload: checkpoint staging query failed copy_id=%d",
-                    copy_id,
-                )
-                try:
-                    event.synchronize()
-                except Exception:
-                    logger.exception(
-                        "LMCache offload: checkpoint staging completion cannot be "
-                        "confirmed copy_id=%d",
-                        copy_id,
-                    )
-                    self._quarantine_checkpoint_staging(copy_id)
-                    continue
-            self._complete_checkpoint_staging(copy_id, aborted=aborted)
-
-    def _submit_deferred_checkpoint_save(
-        self,
-        deferred: _DeferredCheckpointSave,
-    ) -> None:
-        req = deferred.req
-        copy_id = int(deferred.checkpoint_identity[0])
-        if not self._save_admission.acquire(blocking=False):
-            self._track_checkpoint_staging(copy_id)
-            self._finish_unadmitted_save(
-                req,
-                reason="checkpoint_save_admission",
-            )
-            return
-        try:
-            req_lock = self._begin_save_operation(
-                req.req_id,
-                getattr(req, "save_operation", None),
-            )
-        except Exception:  # noqa: BLE001
-            try:
-                self._save_admission.release()
-            except Exception:
-                logger.exception(
-                    "LMCache offload: checkpoint admission rollback failed req=%s",
-                    req.req_id,
-                )
-            self._track_checkpoint_staging(copy_id)
-            self._finish_unadmitted_save(req, reason="checkpoint_operation_begin")
-            return
-
-        snapshot: _SlotSaveSnapshot | None = None
-        producer_event = None
-        try:
-            staging_id = self._reserve_slot_staging()
-            snapshot = (
-                self._snapshot_reserved_slot_save(
-                    req,
-                    source_group=deferred.checkpoint_identity[5],
-                    staging_id=staging_id,
-                )
-                if staging_id is not None
-                else _SlotSaveSnapshot(None, None, False)
-            )
-            producer_event = snapshot.ready_event
-            if snapshot.source_completion_uncertain:
-                self._quarantine_checkpoint_staging(copy_id)
-            else:
-                producer_event = self._track_checkpoint_staging(
-                    copy_id,
-                    producer_event,
-                )
-            self._save_executor.submit(
-                self._run_save_req,
-                req,
-                producer_event,
-                snapshot,
-                req_lock,
-                True,
-            )
-        except Exception:
-            logger.exception(
-                "LMCache offload: deferred checkpoint save preparation failed req=%s",
-                req.req_id,
-            )
-            try:
-                self._finish_rejected_save(req, producer_event, snapshot)
-            except Exception:
-                # The regular finalizer is deliberately comprehensive. If an
-                # invariant inside that last-resort path also fails, still emit
-                # exact terminal notifications so this rank cannot strand TP
-                # aggregation or later checkpoint intents in this same batch.
-                logger.exception(
-                    "LMCache offload: deferred checkpoint finalizer failed req=%s",
-                    req.req_id,
-                )
-                with self._lock:
-                    completion_id = self._save_completion_id(req)
-                    self._done_save.add(completion_id)
-                    self._failed_sidecar_save.add(completion_id)
-
-    def state_checkpoint_copies_issued(self, state_checkpoint_copies) -> None:
-        """Snapshot native checkpoint destinations before the model mutates state.
-
-        ``ModelRunner`` calls this immediately after ``copy_state_entries`` on
-        the same current stream.  The gather therefore observes the completed
-        boundary checkpoint, and its event lets the existing save executor take
-        over without pinning the reusable native state group.
-        """
-
-        deferred_saves = self._take_deferred_checkpoint_saves(state_checkpoint_copies)
-        for index, deferred in enumerate(deferred_saves):
-            try:
-                self._submit_deferred_checkpoint_save(deferred)
-            except Exception:
-                logger.exception(
-                    "LMCache offload: unexpected checkpoint hook failure req=%s",
-                    deferred.req.req_id,
-                )
-                # `_submit_deferred_checkpoint_save` is designed not to throw.
-                # Preserve a terminal outcome even if its last-resort cleanup
-                # violates an invariant, and fail every not-yet-started intent
-                # already removed from the shared list by this hook.
-                for unstarted in deferred_saves[index:]:
-                    self._track_checkpoint_staging(
-                        int(unstarted.checkpoint_identity[0])
-                    )
-                    self._finish_unadmitted_save(
-                        unstarted.req,
-                        reason="checkpoint_hook_failure",
-                    )
-                return
-
-    def abort_state_checkpoint_copies(self, state_checkpoint_copies) -> None:
-        """Fail lightweight intents when native checkpoint build fails."""
-
-        for deferred in self._take_deferred_checkpoint_saves(state_checkpoint_copies):
-            self._track_checkpoint_staging(
-                int(deferred.checkpoint_identity[0]),
-                aborted=True,
-            )
-            self._finish_unadmitted_save(
-                deferred.req,
-                reason="native_checkpoint_aborted",
             )
 
     def _guard(self, kind: str, fn, req, *args) -> None:
@@ -2058,22 +1720,13 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         # - finished_loading wakes successfully loaded requests.
         # - failed_loading wakes them for recompute using already allocated blocks.
         # - finished_saving releases blocks whose free was deferred during save.
-        self._poll_checkpoint_staging()
         with self._lock:
             dl, fl, ds = self._drain_common_completions_locked()
             dss = set(self._done_sidecar_save)
             fss = set(self._failed_sidecar_save)
-            dcs = set(self._done_checkpoint_staging)
-            acs = set(self._aborted_checkpoint_staging)
             self._done_sidecar_save.clear()
             self._failed_sidecar_save.clear()
-            self._done_checkpoint_staging.clear()
-            self._aborted_checkpoint_staging.clear()
-            pending_work = bool(
-                self._checkpoint_staging_fences
-                or self._deferred_checkpoint_saves
-                or self._pending_save_ops
-            )
+            pending_work = bool(self._pending_save_ops)
         connector_completions = {
             ConnectorCompletion(
                 channel=DSV4_CHECKPOINT_SAVE_CHANNEL,
@@ -2089,22 +1742,6 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 succeeded=False,
             )
             for completion_id in fss
-        )
-        connector_completions.update(
-            ConnectorCompletion(
-                channel=STATE_CHECKPOINT_STAGING_CHANNEL,
-                operation_id=copy_id,
-                succeeded=True,
-            )
-            for copy_id in dcs
-        )
-        connector_completions.update(
-            ConnectorCompletion(
-                channel=STATE_CHECKPOINT_STAGING_CHANNEL,
-                operation_id=copy_id,
-                succeeded=False,
-            )
-            for copy_id in acs
         )
         return KVConnectorOutput(
             finished_sending=set(),
@@ -2131,15 +1768,10 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
     # Opt the scheduler into offload-wake (suffix prefill) instead of the P/D
     # decode-jump in Scheduler.schedule(); see Scheduler._is_offload_connector.
     is_offload = True
-    state_checkpoint_completion_channel = STATE_CHECKPOINT_STAGING_CHANNEL
-    completion_channels = frozenset(
-        {
-            DSV4_CHECKPOINT_SAVE_CHANNEL,
-            STATE_CHECKPOINT_STAGING_CHANNEL,
-        }
-    )
+    completion_channels = frozenset({DSV4_CHECKPOINT_SAVE_CHANNEL})
 
     def __init__(self, config) -> None:
+        self._init_offload_statistics()
         self._config = config
         kvc = getattr(config, "kv_transfer_config", {}) or {}
         self.kv_role = validated_kv_role(kvc)
@@ -2541,17 +2173,6 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             adjusted = min(adjusted, sidecar[0] - start)
         return max(1, adjusted)
 
-    def should_pause_partial_prefill_for_save(self, seq) -> bool:
-        """Hold a partial prefill while its previous SLOT snapshot publishes.
-
-        The forward that reaches boundary B+1 may run in the same scheduler
-        step that dispatches B's snapshot. Before another forward mutates the
-        request SLOT, wait for B to retire; the next empty/normal metadata step
-        can then snapshot B+1 exactly.
-        """
-
-        return str(seq.id) in self._sidecar_save_inflight
-
     def cancel_pending_load(self, seq) -> None:
         """Cancel load-only state for one concrete request lifecycle."""
         sid = str(seq.id)
@@ -2562,6 +2183,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         if active is not None and active[0] is seq:
             self._active_load_operations.pop(sid, None)
             operation = active[1]
+            self._cancel_load_statistics(operation)
             if getattr(seq, "_active_load_operation", None) == operation:
                 for marker in (
                     "_active_load_operation",
@@ -2573,11 +2195,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         self._active_slot_loads.pop(sid, None)
 
     def build_connector_meta(self) -> LMCacheOffloadMetadata:
-        meta = LMCacheOffloadMetadata(
-            state_checkpoint_completion_channel=(
-                self.state_checkpoint_completion_channel
-            )
-        )
+        meta = LMCacheOffloadMetadata()
 
         # Loads
         logger.debug("[OFFLOAD-BUILD] reqs_need_recv=%d", len(self._reqs_need_recv))
@@ -2661,6 +2279,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             seq._active_load_operation = load_operation
             seq._consumed_load_operation = None
             self._active_load_operations[sid] = (seq, load_operation)
+            self._track_load_statistics(load_operation, lmc - hbm)
             meta.add_request(
                 LMCacheReqMeta(
                     req_id=seq.id,
@@ -2723,6 +2342,10 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
                 sidecar_candidate,
             )
             save_operation = self._next_save_operation(seq)
+            self._track_save_statistics(
+                save_operation,
+                aligned - saved if page_save_due else 0,
+            )
             meta.add_request(
                 LMCacheReqMeta(
                     req_id=seq.id,
@@ -2781,6 +2404,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
                 inflight.discard(req_id)
                 if not inflight:
                     self._save_inflight.pop(sid, None)
+            self._finish_save_statistics(req_id)
             return
 
         sid = str(req_id)
@@ -2792,6 +2416,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         if sid in self._sidecar_save_inflight:
             return
         self._save_inflight.pop(sid, None)
+        self._finish_save_statistics(req_id)
 
     def connector_completion(self, completion: ConnectorCompletion) -> bool:
         """Apply one TP-aggregated completion owned by the DSV4 scheduler."""
@@ -2848,6 +2473,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             self._active_load_operations.pop(sid, None)
         elif active is not None:
             return False
+        self._finish_load_statistics(req_id, succeeded=False)
         active_slot = self._active_slot_loads.pop(sid, None)
         if active_slot is not None:
             self._committed_sidecar_hashes.discard(active_slot[1])
@@ -2870,6 +2496,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             self._active_load_operations.pop(sid, None)
         elif active is not None:
             return False
+        self._finish_load_statistics(req_id, succeeded=True)
         self._active_slot_loads.pop(sid, None)
         self._load_save_floors.pop(sid, None)
         return True
@@ -2882,6 +2509,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             active = self._active_load_operations.get(sid)
             if active is not None and active[0] is seq:
                 self._active_load_operations.pop(sid, None)
+                self._cancel_load_statistics(active[1])
             self._load_lifecycles.pop(sid, None)
         cached = self._sidecar_hash_cache.get(sid)
         if cached is not None and cached[0] is seq:

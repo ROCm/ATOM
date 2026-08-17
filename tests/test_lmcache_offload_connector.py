@@ -3627,7 +3627,6 @@ def test_prefill_chunk_does_not_recut_committed_or_inflight_boundary():
         boundary_hash,
     )
     assert sched.adjust_prefill_chunk_after_alloc(seq, 8192) == 8192
-    assert sched.should_pause_partial_prefill_for_save(seq) is True
 
 
 def test_partial_prefill_resumes_and_captures_next_boundary_after_inflight_commit():
@@ -3643,15 +3642,14 @@ def test_partial_prefill_resumes_and_captures_next_boundary_after_inflight_commi
     first = sched.build_connector_meta().requests[0]
     assert first.slot_save_spec.boundary_tokens == 8192
 
-    # The next forward may already have reached B2 when B1 starts publishing,
-    # but no later forward may mutate the SLOT until B1 retires.
+    # The live SLOT was copied to connector-owned staging before the next
+    # forward, so B1 publication does not pause progress. A second sidecar is
+    # still suppressed until the exact B1 generation retires.
     seq.num_cached_tokens = 16_384
-    assert sched.should_pause_partial_prefill_for_save(seq) is True
     assert sched._sidecar_save_candidate(seq, 16_384) is None
 
     sched.sidecar_save_finished(first.save_operation)
 
-    assert sched.should_pause_partial_prefill_for_save(seq) is False
     second = sched.build_connector_meta().requests[0]
     assert second.slot_save_spec.boundary_tokens == 16_384
 
@@ -4759,7 +4757,6 @@ def test_scheduler_offload_statistics_are_cumulative():
     sched = _scheduler()
     sched._load_inflight_tokens["1"] = 8192
     sched._save_inflight_tokens["2"] = 4096
-    sched._save_inflight.add("2")
 
     sched.load_finished("1")
     sched.save_finished("2")
@@ -4773,3 +4770,37 @@ def test_scheduler_offload_statistics_are_cumulative():
         "loads_pending": 0,
         "saves_pending": 0,
     }
+
+
+def test_sidecar_only_save_statistics_use_exact_generation_once():
+    sched = _scheduler()
+    operation = SaveOperationId(2, 4)
+    stale = SaveOperationId(2, 3)
+    sched._track_save_statistics(operation, 0)
+    sched._sidecar_save_inflight["2"] = (operation, 8192, 0x1234)
+
+    sched.save_finished(stale)
+    assert sched.get_statistics()["saves_pending"] == 1
+    assert sched.get_statistics()["save_requests"] == 0
+
+    sched.save_finished(operation)
+    sched.save_finished(operation)
+
+    assert sched.get_statistics()["saves_pending"] == 0
+    assert sched.get_statistics()["save_requests"] == 1
+    assert sched.get_statistics()["saved_tokens"] == 0
+
+
+def test_request_cleanup_drops_abandoned_load_statistics():
+    sched = _scheduler()
+    seq = SimpleNamespace(id=3)
+    operation = LoadOperationId(seq.id, 7)
+    sched._load_lifecycles["3"] = seq
+    sched._active_load_operations["3"] = (seq, operation)
+    sched._track_load_statistics(operation, 4096)
+
+    sched.request_finished(seq)
+
+    assert sched.get_statistics()["loads_pending"] == 0
+    assert sched.get_statistics()["load_requests"] == 0
+    assert sched.get_statistics()["load_failures"] == 0

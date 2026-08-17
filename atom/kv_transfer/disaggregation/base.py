@@ -27,7 +27,6 @@ from atom.kv_transfer.disaggregation.types import ConnectorMetadata, KVConnector
 class KVConnectorBase(ABC):
     """Worker-side KV connector interface (one instance per TP rank)."""
 
-    state_checkpoint_completion_channel: str | None = None
     is_producer: bool
 
     @abstractmethod
@@ -89,8 +88,6 @@ class KVConnectorBase(ABC):
 
 class KVConnectorSchedulerBase(ABC):
     """Scheduler-side KV connector interface."""
-
-    state_checkpoint_completion_channel: str | None = None
 
     is_producer: bool
 

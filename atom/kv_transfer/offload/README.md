@@ -53,12 +53,14 @@ Four rules carry the module:
    scheduler commits a boundary only after every TP rank reports the same
    sidecar save generation.
 
-4. **Copies run off the RPC thread after `forward`.** `start_load_kv` submits
-   PAGE work to copy daemons and returns. The only synchronous DSV4 save action
-   is a D2D snapshot into a bounded SLOT staging row, preventing the next
-   forward from mutating the source slot while its sidecar is assembled. Once
-   that row has completed D2H into its owned CPU frame, the temporary GPU row is
-   released; PAGE publication and AOS1 storage do not retain it.
+4. **The SLOT snapshot is ordered before the next `forward`.** Connector
+   metadata is dispatched before the batch forward. `start_load_kv` copies the
+   live Active SLOT into a bounded connector-owned staging row on the current
+   CUDA stream, records an event, and submits the remaining work to a copy
+   daemon. The following forward is ordered after that snapshot on the same
+   stream, so it may safely mutate the shared PAGE/SLOT allocation. Once the
+   staging row has completed D2H into its owned CPU frame, the temporary GPU row
+   is released; PAGE publication and AOS1 storage do not retain it.
 
 ## Module Map
 
@@ -96,7 +98,7 @@ flowchart LR
     subgraph WORK["WORKER · one per TP rank"]
         direction TB
         LK["LookupServer<br/>(rank 0 authoritative)"]
-        SL["start_load_kv() — enqueue only<br/>load_executor (1) · save_executor (N)"]
+        SL["start_load_kv() — enqueue work<br/>DSV4 snapshots SLOT before return"]
         CE["CacheEngine.retrieve() / .store()<br/>BlockGPUConnector + DenseKVByteCodec"]
         SL --> CE
     end
@@ -124,6 +126,12 @@ swa_block_regions  SLOT: complete request-slot units, reverse indexed
 staging_region     compressor-only P/D staging; never a full sidecar source
 ```
 
+In current DSV4 the PAGE and SLOT views may describe the same underlying HBM
+allocation. They remain distinct logical regions: PAGE addresses grow from the
+low end by physical block ID, while SLOT addresses grow backward from the high
+end by request-group ID. The codec snapshots both geometries independently and
+never treats an equal base allocation or semantic plane role as a duplicate.
+
 For physical block IDs `[b0, b1]` and regions `[r0, r1]`, one PAGE object is:
 
 ```text
@@ -141,8 +149,8 @@ plane0 complete slot | plane1 complete slot | ... | DSpark field windows
 ```
 
 `slot_bytes = sum(region.unit_bytes for region in swa_block_regions)`. The
-payload intentionally contains no PAGE bytes, physical group ID, or
-`StateGroupPool` index. Restore always targets the newly allocated request group.
+payload intentionally contains no PAGE bytes or physical Active SLOT group ID.
+Restore always targets the newly allocated request group.
 
 ### AOS1 sidecar contract
 
@@ -191,12 +199,13 @@ remain harmless after scheduler restart, but are not rediscovered or reused.
 
 ### HBM L1 versus LMCache L2/L3
 
-Native `BlockPool` and `StateGroupPool` checkpoints remain the HBM L1. They are
-not disabled, replaced, or populated from LMCache. A complete native HBM hit wins
-without offload. LMCache PAGE+AOS1 is L2/L3 for a boundary no longer available as
-a complete L1 checkpoint. After an LMCache restore, the request owns its new
-active group directly; later forwards create ordinary `StateGroupPool`
-checkpoints again.
+Native DSV4 state checkpoints are PAGE-backed and coordinated by
+`PagedStateCheckpointCoordinator`; Active SLOT groups remain reserved for live
+requests. They are not disabled, replaced, leased to, or populated from
+LMCache. A complete native HBM hit wins without offload. LMCache PAGE+AOS1 is an
+independent L2/L3 representation for a boundary no longer available as a
+complete L1 checkpoint. After an LMCache restore, the request owns its new
+Active SLOT directly and later native checkpoints again use PAGE units.
 
 ### Scheduler side (`LMCacheOffloadConnectorScheduler`)
 
@@ -240,10 +249,10 @@ Runs in each TP-rank worker. It does the actual byte movement.
   engine and (on rank 0) the `LookupServer`. Stateful PAGE registration also
   requires complete SLOT geometry and creates its checkpoint codec/store,
   admission pool, and fingerprint; partial initialization fails startup.
-- **`start_load_kv(metadata)`** — *enqueue only*. For each request, `submit`s a
-  load to `_load_executor` and/or a save to `_save_executor`, then returns.
-  DSV4 save is the exception only for its source-safe D2D SLOT snapshot, issued
-  on the current stream before return.
+- **`start_load_kv(metadata)`** — enqueues each load on `_load_executor` and each
+  save on `_save_executor`. DSV4 first issues its source-safe D2D SLOT snapshot
+  on the current stream before returning; all subsequent D2H, PAGE transfer,
+  encoding, and publication work stays on the executors.
 - **`_do_load_req` / `_do_save_req`** — run on the daemon threads. They call
   `engine.retrieve()` / `engine.store()`, which flow through the ATOM GPU
   connector. Stateful save performs PAGE before sidecar put. Stateful load
@@ -303,7 +312,6 @@ correctness — note the deliberate asymmetry vs a P/D producer:
 | `failed_loading` | This worker failed PAGE or SLOT. Once every rank is terminal, wake to **recompute** into already allocated storage. |
 | `finished_saving` | This exact `SaveOperationId` finished PAGE work; release deferred PAGE blocks only when the composite save is terminal. |
 | `connector_completions[atom.dsv4.checkpoint.save]` | This exact generation published or failed to publish AOS1. `succeeded=False` is failure-dominant across TP ranks; only all-rank success commits the boundary. |
-| `connector_completions[atom.state_checkpoint.staging]` | GPU staging stopped reading one exact native checkpoint lease. Success preserves the native checkpoint; failure invalidates it before release. |
 | `finished_sending` | **Never used by standalone offload.** P/D producer semantics free live blocks, so `is_producer = False`. |
 
 Save-generation identity matters because one long prefill can have multiple PAGE
@@ -1269,7 +1277,7 @@ python3 multi-round-qa.py \
 | Term | Meaning |
 |------|---------|
 | **HBM prefix cache (L1)** | ATOM's native on-GPU KV reuse. `num_cached_tokens` = how many prompt tokens it already holds for a request. |
-| **StateGroupPool (L1)** | Native HBM request-state checkpoints. They remain enabled and independent of LMCache sidecars. |
+| **Native PAGE state checkpoint (L1)** | `PagedStateCheckpointCoordinator`-managed HBM state snapshots. They remain enabled and independent of LMCache sidecars. |
 | **HBM-cached (`hbm`)** | Tokens resident in the HBM prefix cache for this request — the floor a load must never go below. |
 | **lookup hit / lmcache-cached (`lmc`)** | Tokens LMCache holds in CPU/NVMe for this request's prefix, reported by the lookup. |
 | **chunk** | LMCache PAGE storage/key granularity (`LMCACHE_CHUNK_SIZE`, default 256). One MemoryObj per chunk. |
@@ -1282,7 +1290,7 @@ python3 multi-round-qa.py \
 | **park** | Suspend a sequence in `WAITING_FOR_REMOTE_KVS` until its load completes. |
 | **suffix prefill / offload-wake** | Resuming a parked seq to prefill only the still-uncached suffix (vs the P/D decode-jump). |
 | **P/D** | Prefill/Decode disaggregation — the sibling connector this module shares base/factory/types with. |
-| **RPC thread** | The worker thread that runs per-step engine calls; must stay free for `forward`, so copies run on daemons. |
+| **RPC thread** | The worker thread that runs per-step engine calls. DSV4 only enqueues the source-safe SLOT D2D snapshot there; blocking D2H/storage work runs on daemons. |
 | **completion sets** | `finished_loading` / `failed_loading` plus exact-generation PAGE/SLOT save sets, aggregated across TP workers. |
 
 ## See Also

@@ -167,6 +167,9 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         callback = getattr(self._impl, "load_finished", None)
         return callback(req_id) if callback is not None else True
 
+    def get_statistics(self) -> dict[str, int]:
+        return self._impl.get_statistics()
+
 
 __all__ = [
     "LMCacheOffloadConnector",
