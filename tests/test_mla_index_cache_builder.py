@@ -64,6 +64,7 @@ def _builder(
         is_deepseek_v32=True,
         _get_local_total_num_layers=lambda: total_local_layers,
         _get_local_num_target_layers=lambda: 3,
+        _num_draft_kv_layers=lambda: max(0, total_local_layers - 3),
     )
     builder = object.__new__(AiterMLAMetadataBuilder)
     builder.model_runner = runner

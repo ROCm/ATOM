@@ -1858,24 +1858,23 @@ class ModelRunner:
             owns_pool = hasattr(self, "eagle3_draft_builder")
             spec_config = self.config.speculative_config
             num_draft_layers = self._num_draft_kv_layers()
-            has_real_stack = (
-                owns_pool
-                or getattr(spec_config, "use_dspark_with_draft", lambda: False)()
-            )
             num_shared_pool_draft_layers = total_num_layers - num_local_target_layers
+            if owns_pool:
+                draft_kv_note = (
+                    f"; {num_draft_layers} draft layers use a separate sibling pool"
+                )
+            elif spec_config.use_dspark_with_draft():
+                draft_kv_note = (
+                    f"; {num_draft_layers} standalone DSpark draft layers "
+                    f"bind into the shared target pool"
+                )
+            else:
+                draft_kv_note = ""
             logger.info(
                 f"Allocating target KV cache for {num_local_target_layers} "
                 f"local target layers + {num_shared_pool_draft_layers} "
                 f"shared-pool draft layers = {total_num_layers} total layers"
-                + (
-                    f"; {num_draft_layers} draft layers use a separate sibling pool"
-                    if owns_pool
-                    else (
-                        f"; {num_draft_layers} DSpark stages use private caches"
-                        if has_real_stack
-                        else ""
-                    )
-                )
+                + draft_kv_note
             )
 
         # Primary KV cache allocation (model-agnostic, delegated to the

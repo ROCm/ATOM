@@ -26,6 +26,11 @@ def test_global_index_cache_layout_without_schedule_is_unchanged():
     assert _global_index_cache_layer_ids(None, 4, 1) == (0, 1, 2, 3, 4)
 
 
+def test_global_index_cache_layout_includes_real_stack_draft_layers():
+    """Standalone DSpark MLA drafts share the target pool as N extra rows."""
+    assert _global_index_cache_layer_ids(None, 61, 5) == tuple(range(61 + 5))
+
+
 def test_cache_dimensions_are_derived_and_index_rows_are_aligned():
     hf_config = SimpleNamespace(kv_lora_rank=480, qk_rope_head_dim=32)
 
