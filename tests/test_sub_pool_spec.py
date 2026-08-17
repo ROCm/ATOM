@@ -38,6 +38,12 @@ ENTRY_STATE = "recurrent"
 GIB = 1 << 30
 
 
+class TestStatePool:
+    def test_declared_extra_entries_are_preserved(self):
+        spec = state_pool(ENTRY_STATE, 10, entries_per_req=1, extra_entries=64)
+        assert spec.extra_entries == 64
+
+
 class TestMergeSpecs:
     def test_same_name_sums_entry_bytes(self):
         """Two builders contributing to one pool share its entry index space,
@@ -107,6 +113,16 @@ class TestPlanPools:
         ]
         plan = plan_pools(specs, available_bytes=100_000, max_num_seqs=8)
         assert plan.entries[ENTRY_SWA] == 8 * 3 + 64
+
+    def test_flat_extra_state_entries_take_exactly_their_paged_budget(self):
+        specs = [
+            page_pool(100),
+            state_pool(ENTRY_STATE, 10, entries_per_req=1, extra_entries=3),
+        ]
+        plan = plan_pools(specs, available_bytes=1_000, max_num_seqs=8)
+        assert plan.entries[ENTRY_STATE] == 8 + 3
+        assert plan.reserved_bytes[ENTRY_STATE] == (8 + 3) * 10
+        assert plan.entries[ENTRY_KV] == 8
 
     def test_paged_pool_floors_at_zero_rather_than_going_negative(self):
         specs = [page_pool(1_000_000), state_pool(ENTRY_STATE, 100, entries_per_req=1)]

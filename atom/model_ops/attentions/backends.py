@@ -3,6 +3,7 @@
 
 import logging
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Generic, Optional, TypeVar
 
 if TYPE_CHECKING:
@@ -14,8 +15,12 @@ from aiter.dist.parallel_state import get_tp_group
 from torch import nn
 
 from atom.distributed.dcp_utils import get_dcp_rank, get_dcp_world_size
+from atom.model_engine.page_unit_checkpoint import (
+    CheckpointRestoreOp,
+    CheckpointStoreOp,
+)
 from atom.model_engine.scheduler import ScheduledBatch
-from atom.model_engine.state_pool import StateTransfer
+from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attention_mla import MLAModules
 from atom.model_ops.attentions.sub_pool_spec import SubPoolSpec
 from atom.utils import CpuGpuBuffer
@@ -139,53 +144,26 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         return {}
 
     def state_transfer(self) -> StateTransfer:
-        """How this backend hands one request's state to another group.
-
-        A checkpoint is a second group holding the state as of some boundary, so
-        every backend with per-request state has to say how one gets there.
-        There are three answers and `StateGroupPool` runs whichever it is told:
-
-        `StateTransfer.fork(n)` — the state rolls and is not one range to
-        duplicate, so the old group goes to the index and the request takes a
-        fresh one, reading the old and writing the new for exactly one forward.
-        That forward has to leave the new group self-contained (a single read
-        index cannot span both), which takes `n` *committed* tokens.
-        `BlockManager` walks a checkpoint/hit point back to the previous block
-        boundary until it fits.
-
-        `StateTransfer.copy()` — one request's state is a contiguous byte range,
-        so the index gets a duplicate and the owner is left alone. No forward is
-        bound and no boundary is disqualified for lack of room, which is what
-        makes a decode boundary checkpointable at all: a decode step commits
-        `1 + accepted_drafts` tokens and acceptance is not knowable when the
-        checkpoint has to be decided. The backend must implement
-        `copy_state_entries`.
-
-        `StateTransfer.none()` (default) — no per-request state, or none that can
-        be handed over; the checkpoint index stays empty and prefix hits shrink
-        to 0 for its models.
-        """
+        """Declare this backend's per-request state checkpoint capability."""
         return StateTransfer.none()
 
-    def copy_state_entries(self, pairs: list[tuple[int, int]]) -> None:
-        """Copy each `(src, dst)` group's whole per-request state, src → dst.
-
-        Issued by `build` before the forward, on the compute stream, so a copy
-        lands after the forward that produced its source and before the one that
-        consumes its destination.
-
-        Owed by every backend that declares a state pool, not just the ones
-        declaring `StateTransfer.copy()`. Two callers want it and only the first
-        is about checkpointing: a copy-transfer class duplicates a group to keep
-        a checkpoint, and *any* class has to be able to hand a group's bytes to
-        a different group index when the pool's boundary moves past the one it
-        is sitting on. The second is a byte move regardless of how the class
-        checkpoints, so a fork-transfer backend owes this too.
-        """
+    def relocate_state_slots(self, pairs: Sequence[tuple[int, int]]) -> None:
+        """Move live state between contiguous Active Slots."""
         raise NotImplementedError(
             f"{type(self).__name__} owns per-request state but does not "
-            "implement copy_state_entries"
+            "implement relocate_state_slots"
         )
+
+    def execute_paged_state_copies(
+        self,
+        store_ops: Sequence[CheckpointStoreOp],
+        restore_ops: Sequence[CheckpointRestoreOp],
+    ) -> None:
+        """Copy checkpoints between Active Slots and arbitrary PAGEs."""
+        if store_ops or restore_ops:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not implement PAGE-backed state copy"
+            )
 
     def get_kv_transfer_tensors(self) -> "KVTransferTensors | None":
         """Return RDMA transfer regions for PD disaggregation.
@@ -517,14 +495,14 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         )
 
     def build(self, batch: ScheduledBatch, bs: int):
-        # State checkpoints the scheduler decided on ride the batch as group
-        # pairs and are copied here, on the compute stream, before the forward.
-        # This is the one place every path — prefill, decode, dummy, DP-sync, PP
-        # microbatch, TBO — passes through exactly once per batch, which is what
-        # makes "each copy is issued once per rank" true by construction rather
-        # than by inspection of every prepare_* variant.
-        if batch.state_copy_pairs:
-            self.copy_state_entries(batch.state_copy_pairs)
+        # Run state maintenance on the compute stream before the forward.
+        state_ops = batch.state_maintenance_ops
+        if state_ops.relocations:
+            self.relocate_state_slots(state_ops.relocations)
+        if state_ops.checkpoint_stores or state_ops.checkpoint_restores:
+            self.execute_paged_state_copies(
+                state_ops.checkpoint_stores, state_ops.checkpoint_restores
+            )
         is_prefill = batch.total_tokens_num_prefill > 0
         if is_prefill:
             return self.prepare_prefill(batch)

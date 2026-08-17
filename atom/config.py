@@ -799,6 +799,11 @@ class ParallelConfig:
     pp_token_addr: str = ""
     """ZMQ endpoint where the head receives sampled tokens back from the last
     stage. Populated by CoreManager for pp_size > 1."""
+    control_address: str = ""
+    """ZMQ endpoint carrying control traffic (utility commands, abort, shutdown)
+    for this EngineCore, separate from the request endpoint. Keeping the two
+    apart leaves the request socket with a single writer thread, so admitting a
+    request needs no synchronization. Populated by launch_engine_core."""
     world_size: int = field(init=False)
     """Vestigial: never assigned or read; engine_core derives worker count directly."""
     data_parallel_master_port: int = 29500
@@ -881,6 +886,12 @@ class ParallelConfig:
             self.data_parallel_rank = envs.ATOM_DP_RANK
         if envs.is_set("ATOM_DP_RANK_LOCAL"):
             self.data_parallel_rank_local = envs.ATOM_DP_RANK_LOCAL
+        if envs.is_set("ATOM_DP_MASTER_IP"):
+            self.data_parallel_master_ip = envs.ATOM_DP_MASTER_IP
+        if envs.is_set("ATOM_DP_MASTER_PORT"):
+            self.data_parallel_master_port = envs.ATOM_DP_MASTER_PORT
+        if envs.is_set("ATOM_DP_BASE_PORT"):
+            self.data_parallel_base_port = envs.ATOM_DP_BASE_PORT
 
 
 _DSPARK_DEFAULT_MAX_BLOCK = 16
@@ -1374,6 +1385,9 @@ class Config:
     enable_tbo: bool = False
     enable_tbo_decode: bool = False
     enable_low_latency: bool = False
+    # Post-routing routed-MoE implementation. This is deliberately separate
+    # from all2all backend/mode: Mega owns dispatch, both GEMMs, and combine.
+    moe_backend: str = "standard"
     runner_qualname: str = "atom.model_engine.model_runner.ModelRunner"
     # EPLB master switch + sub-config
     eplb_enable: bool = False
@@ -1426,6 +1440,18 @@ class Config:
         if self.index_cache_dtype is None:
             self.index_cache_dtype = self.kv_cache_dtype
 
+        self.moe_backend = self.moe_backend.strip().lower()
+        if self.moe_backend not in ("standard", "mega"):
+            raise ValueError(
+                "moe_backend must be one of {'standard', 'mega'}, "
+                f"got {self.moe_backend!r}"
+            )
+        if self.moe_backend == "mega" and not self.enable_expert_parallel:
+            raise ValueError(
+                "moe_backend='mega' requires expert parallelism; "
+                "pass --enable-expert-parallel."
+            )
+
         if isinstance(self.compilation_config, dict):
             self.compilation_config = CompilationConfig(**self.compilation_config)
         if isinstance(self.eplb_config, dict):
@@ -1459,14 +1485,15 @@ class Config:
             # uses the round-robin CP (cprr) MLA kernel, which is persistent-only
             # and ships only on gfx950; on gfx942 the non-persistent fallback
             # ignores the cprr masking and silently produces WRONG output.
-            from aiter.jit.utils.chip_info import get_gfx
+            if self.speculative_config is not None:
+                from aiter.jit.utils.chip_info import get_gfx
 
-            gfx = get_gfx()
-            assert gfx == "gfx950", (
-                f"Speculative decode + DCP is only supported on gfx950 (needs "
-                f"the persistent cprr MLA kernel); got {gfx}. Disable DCP or "
-                f"speculative decode on this GPU."
-            )
+                gfx = get_gfx()
+                assert gfx == "gfx950", (
+                    f"Speculative decode + DCP is only supported on gfx950 (needs "
+                    f"the persistent cprr MLA kernel); got {gfx}. Disable DCP or "
+                    f"speculative decode on this GPU."
+                )
         assert 1 <= self.pipeline_parallel_size
         self.hf_config = get_hf_config(
             self.model, trust_remote_code=self.trust_remote_code

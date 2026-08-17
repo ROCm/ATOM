@@ -30,6 +30,11 @@ from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
+from atom.model_engine.state_runtime import (
+    DEFAULT_STATE_RUNTIME,
+    StateMaintenanceOps,
+    StateRuntime,
+)
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -385,9 +390,7 @@ class ScheduledBatch:
         num_spec_step: Number of speculative decode steps (0 = disabled).
         scheduled_spec_decode_tokens: Draft token IDs per request for
             speculative decoding (must not use a mutable default).
-        state_copy_pairs: (src, dst) per-request state groups this batch's
-            forward must duplicate before running (`BlockManager
-            .state_copies_for_batch`).
+        state_maintenance_ops: State moves that must execute before this batch.
     """
 
     def __init__(
@@ -410,7 +413,7 @@ class ScheduledBatch:
         num_cached_tokens: list[int] | None = None,
         is_final_chunk: list[bool] | None = None,
         next_token_ids: list[int] | None = None,
-        state_copy_pairs: list[tuple[int, int]] | None = None,
+        state_maintenance_ops: StateMaintenanceOps | None = None,
     ):
         if scheduled_spec_decode_tokens is None:
             scheduled_spec_decode_tokens = {}
@@ -446,13 +449,12 @@ class ScheduledBatch:
             for seq in seqs.values()
             if seq.has_per_req_cache and seq.per_req_cache_group >= 0
         ]
-        # (src, dst) state groups this batch's forward must duplicate before it
-        # runs — the copy twin of `state_fork_srcs`, for backends that checkpoint
-        # by copying. Not per-seq: a copy is between two pool slots and needs no
-        # alignment with anything else on the batch. Passed in rather than read
-        # off the seqs because both halves (checkpoint taken, checkpoint resumed
-        # from) accumulate in the pool during this pass.
-        self.state_copy_pairs = state_copy_pairs or []
+        # Physical moves are drained once per real batch.
+        self.state_maintenance_ops = (
+            state_maintenance_ops
+            if state_maintenance_ops is not None
+            else StateMaintenanceOps()
+        )
         self.top_ks = np.asarray([seq.top_k for seq in seqs.values()], dtype=np.int32)
         self.top_ps = np.asarray([seq.top_p for seq in seqs.values()], dtype=np.float32)
         # True if any seq in the batch is a fan-out child (SamplingParams.n>1)
@@ -677,7 +679,12 @@ class Scheduler:
     :meth:`_update_from_kv_xfer_finished` (both sides).
     """
 
-    def __init__(self, config: Config):
+    def __init__(
+        self,
+        config: Config,
+        *,
+        state_runtime: StateRuntime = DEFAULT_STATE_RUNTIME,
+    ):
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.long_prefill_token_threshold = config.long_prefill_token_threshold
@@ -685,7 +692,10 @@ class Scheduler:
         self.bos_token_id = config.bos_token_id
         self.eos_token_id = config.eos_token_id
         self.stop_token_ids = config.stop_token_ids
-        self.block_manager = BlockManager(config)
+        self.block_manager = BlockManager(
+            config,
+            state_runtime=state_runtime,
+        )
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
         self.config = config
@@ -727,6 +737,11 @@ class Scheduler:
         self.cache_stats: CacheStats | None = (
             CacheStats() if config.enable_prefix_caching else None
         )
+        # Dashboard counters update only at request lifecycle boundaries.
+        self.total_prompt_tokens = 0
+        self.total_generation_tokens = 0
+        self.total_finished_requests = 0
+        self.total_preemptions = 0
         self.profile_active = False
         # Cache the env flag once (env vars are fixed at process start) so the
         # per-iteration compute_detailed_aggregates never pays an os.getenv.
@@ -1130,8 +1145,8 @@ class Scheduler:
         """
         self._schedule_tick += 1
         # Sources borrowed by the previous batch: its forward has been issued,
-        # so they can go back on the free list (see release_state_pins).
-        self.block_manager.release_state_pins()
+        # so they can go back on the free list.
+        self.block_manager.complete_previous_state_batch()
         scheduled_seqs = {}
         num_seqs_prefill = 0
         num_batched_tokens = 0
@@ -1454,7 +1469,7 @@ class Scheduler:
                 num_cached_tokens=num_cached_tokens_list,
                 is_final_chunk=is_final_chunk,
                 next_token_ids=next_token_ids,
-                state_copy_pairs=self.block_manager.state_copies_for_batch(),
+                state_maintenance_ops=self.block_manager.take_state_maintenance_ops(),
             )
             self._consume_state_forks(scheduled_seqs)
 
@@ -1574,14 +1589,11 @@ class Scheduler:
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             remote_kv_block_ids=sorted(remote_kv_blocks) if remote_kv_blocks else [],
             remote_kv_seq_blocks=remote_kv_seq_blocks,
-            # An empty batch is not forwarded (`engine_core` skips on zero
-            # req_ids), so draining here would file the destinations in the
-            # index and then never issue the copies that fill them — a resumer
-            # would read the previous occupant's state, the exact #1417 shape
-            # the copies exist to prevent. Leave them pending for the next
-            # batch that actually runs.
-            state_copy_pairs=(
-                self.block_manager.state_copies_for_batch() if scheduled_seqs else ()
+            # An empty batch cannot execute queued maintenance.
+            state_maintenance_ops=(
+                self.block_manager.take_state_maintenance_ops()
+                if scheduled_seqs
+                else None
             ),
         )
         self._consume_state_forks(scheduled_seqs)
@@ -1672,6 +1684,9 @@ class Scheduler:
                 )
             seq.offload_promoted_tokens = promoted
             seq.num_cached_tokens = loaded
+            # Report the extended CPU-offload hit without reducing any
+            # prefix-cache hit inherited from an upstream prefill node.
+            seq.prefix_cache_hit_tokens = max(seq.prefix_cache_hit_tokens, loaded)
         seq.offload_load_start_tokens = None
         seq.offload_loaded = True
 
@@ -1910,6 +1925,7 @@ class Scheduler:
         return chunk
 
     def preempt(self, seq: Sequence):
+        self.total_preemptions += 1
         seq.status = SequenceStatus.WAITING
         # Strip placeholder + rejected draft tokens added by postprocess.
         # Real token count = seq.num_tokens - mtp_k - num_rejected
@@ -2180,9 +2196,21 @@ class Scheduler:
                     ell_r = fwd_output.dspark_ell.get(seq.id)
                     if ell_r is not None:
                         seq.dspark_next_ell = int(ell_r)
+                required_placeholders = num_placeholder + offset
+                missing_placeholders = required_placeholders - len(seq.output_tokens)
+                if missing_placeholders > 0:
+                    logger.warning(
+                        "Repairing missing deferred-output placeholders for seq %s: "
+                        "required=%d, available=%d",
+                        seq.id,
+                        required_placeholders,
+                        len(seq.output_tokens),
+                    )
+                    for _ in range(missing_placeholders):
+                        seq.append_token(self.eos_token_id)
                 for i, el in enumerate(token_ids):
-                    seq.token_ids[-num_placeholder - offset + i] = el
-                    seq.output_tokens[-num_placeholder - offset + i] = el
+                    seq.token_ids[-required_placeholders + i] = el
+                    seq.output_tokens[-required_placeholders + i] = el
                 if seq.return_logprobs and token_logprob is not None:
                     if seq.logprobs:
                         seq.logprobs[-1] = token_logprob
@@ -2349,6 +2377,11 @@ class Scheduler:
                 seq.num_tokens = num_tokens
                 seq.leave_reason = leave_reason
                 seq.status = SequenceStatus.FINISHED
+                self.total_finished_requests += 1
+                self.total_prompt_tokens += int(seq.num_prompt_tokens)
+                self.total_generation_tokens += max(
+                    0, int(num_tokens) - int(seq.num_prompt_tokens)
+                )
                 finished_seqs.append(seq)
 
         if stream_output_queue is not None and stream_outputs:
@@ -2614,6 +2647,8 @@ class Scheduler:
         for req_id in kv_connector_output.finished_loading or ():
             assert is_offload, "Only offload connector should update loading KV status"
             logger.debug("Finished offload KV load for request %s", req_id)
+            if hasattr(self.kv_connector, "load_finished"):
+                self.kv_connector.load_finished(req_id)
             self.finished_recving_kv_req_ids.append(req_id)
 
         for req_id in kv_connector_output.failed_loading or ():
@@ -2750,6 +2785,10 @@ class PrefillScheduler:
         self.mtp_k = 0
         self.spec_stats = None
         self.cache_stats = None
+        self.total_prompt_tokens = 0
+        self.total_generation_tokens = 0
+        self.total_finished_requests = 0
+        self.total_preemptions = 0
 
         # Shared memory for dynamic CU partitioning.
         # Layout: [0:4] = decode_tokens (uint32)
@@ -2873,8 +2912,17 @@ class DecodeScheduler(Scheduler):
     running.  schedule() only schedules the running queue as decode batches.
     """
 
-    def __init__(self, config: Config, disagg_cu_shm_name: str = ""):
-        super().__init__(config)
+    def __init__(
+        self,
+        config: Config,
+        disagg_cu_shm_name: str = "",
+        *,
+        state_runtime: StateRuntime = DEFAULT_STATE_RUNTIME,
+    ):
+        super().__init__(
+            config,
+            state_runtime=state_runtime,
+        )
         # seq_id → Sequence; blocks allocated, BlockAssignment sent, awaiting PrefillDone.
         self.prefill_waiting: dict[int, Sequence] = {}
         self.prefill_done: deque[Sequence] = deque()
@@ -2964,7 +3012,7 @@ class DecodeScheduler(Scheduler):
         # through the same `block_manager.allocate` and the same `postprocess`,
         # so it owes the state pool the same two hooks. Without this one the
         # pins taken by every resume accumulate forever and admission starves.
-        self.block_manager.release_state_pins()
+        self.block_manager.complete_previous_state_batch()
 
         prefill_finished = False
         while self.prefill_done:
@@ -3045,10 +3093,7 @@ class DecodeScheduler(Scheduler):
                 num_spec_step=self.mtp_k,
                 scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
                 cu_stream_fraction=self.cu_fraction,
-                # The other half of the pair above: queued copies have to reach
-                # a batch or the group they were filed under holds the previous
-                # occupant's state.
-                state_copy_pairs=self.block_manager.state_copies_for_batch(),
+                state_maintenance_ops=self.block_manager.take_state_maintenance_ops(),
             ),
             scheduled_seqs,
         )
