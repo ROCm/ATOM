@@ -97,10 +97,6 @@ crusoe_runner_labels = {
     "atomesh-cicd-crusoe-mi355",
     "atomesh-cicd-mi355-crusoe",
 }
-if slurm_submit_runner in crusoe_runner_labels:
-    default_spur_accounting_addr = "http://crs-m2m-cpu-spur-005.crusoe.amd.com:6819"
-else:
-    default_spur_accounting_addr = "http://134.199.196.72:6819"
 if not spur_controller_addr:
     if slurm_submit_runner in crusoe_runner_labels:
         spur_controller_addr = "http://crs-m2m-cpu-spur-005.crusoe.amd.com:6817"
@@ -231,10 +227,6 @@ exports = {
     "SLURM_TIME_LIMIT": runner.get("time_limit", "06:00:00"),
     "SLURM_LOG_ROOT": runner.get("log_root", "/it-share/ATOMESH_LOG/"),
     "SPUR_CONTROLLER_ADDR": spur_controller_addr,
-    "SPUR_ACCOUNTING_ADDR": runner.get(
-        "spur_accounting_addr",
-        os.environ.get("SPUR_ACCOUNTING_ADDR", default_spur_accounting_addr),
-    ),
 }
 
 for key, value in exports.items():
@@ -263,8 +255,6 @@ else
   export SLURM_ERROR="${LOG_ROOT}/slurm-%j.err"
 fi
 SLURM_LOG_POLL_INTERVAL="${SLURM_LOG_POLL_INTERVAL:-30}"
-SLURM_ACCOUNTING_TIMEOUT="${SLURM_ACCOUNTING_TIMEOUT:-120}"
-SLURM_ACCOUNTING_POLL_INTERVAL="${SLURM_ACCOUNTING_POLL_INTERVAL:-2}"
 USES_SPUR_CONTROLLER=0
 if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-crusoe-mi355" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi355-crusoe" ]]; then
   USES_SPUR_CONTROLLER=1
@@ -280,9 +270,6 @@ echo "slurm_job_name=${SLURM_JOB_NAME}"
 echo "log_root=${LOG_ROOT}"
 if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
   echo "spur_controller=${SPUR_CONTROLLER_ADDR}"
-fi
-if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
-  echo "spur_accounting=${SPUR_ACCOUNTING_ADDR}"
 fi
 
 mkdir -p "${RESULT_DIR}"
@@ -571,45 +558,9 @@ monitor_slurm_job() {
   fi
 }
 
-read_slurm_controller_record() {
-  local job_id="$1"
-  local output rc state exit_code
-  local scontrol_cmd=(scontrol)
-
-  if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
-    scontrol_cmd+=(--controller "${SPUR_CONTROLLER_ADDR}")
-  fi
-
-  set +e
-  output="$("${scontrol_cmd[@]}" show job "${job_id}" -o 2>&1)"
-  rc=$?
-  set -e
-  echo "scontrol_rc=${rc}" >&2
-  echo "scontrol_output=${output}" >&2
-  [[ "${rc}" -eq 0 ]] || return 1
-
-  state=""
-  exit_code=""
-  if [[ "${output}" =~ JobState=([^[:space:]]+) ]]; then
-    state="${BASH_REMATCH[1]}"
-  fi
-  if [[ "${output}" =~ ExitCode=([^[:space:]]+) ]]; then
-    exit_code="${BASH_REMATCH[1]}"
-  fi
-  [[ -n "${state}" && -n "${exit_code}" ]] || return 1
-
-  case "${state%%+*}" in
-    PENDING|RUNNING|CONFIGURING|COMPLETING)
-      return 1
-      ;;
-  esac
-  printf '%s|%s\n' "${state}" "${exit_code}"
-}
-
 read_slurm_exit_code() {
   local job_id="$1"
-  local sacct_line sacct_output sacct_job_record sacct_rc
-  local controller_line exit_status exit_signal deadline attempt=0
+  local sacct_line exit_status exit_signal
 
   SLURM_STATE="unknown"
   SLURM_EXIT_CODE="unknown"
@@ -620,42 +571,16 @@ read_slurm_exit_code() {
     return 0
   fi
 
-  deadline=$(( $(date +%s) + SLURM_ACCOUNTING_TIMEOUT ))
-  while true; do
-    attempt=$((attempt + 1))
-    if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
-      set +e
-      sacct_output="$(sacct --accounting "${SPUR_ACCOUNTING_ADDR}" --brief --noheader 2>&1)"
-      sacct_rc=$?
-      set -e
-      sacct_job_record="$(printf '%s\n' "${sacct_output}" | awk -v job_id="${job_id}" 'index($0, job_id) { print; exit }')"
-      sacct_line="$(printf '%s\n' "${sacct_job_record}" | awk -v job_id="${job_id}" '$1 == job_id { print $2 "|" $3; exit }')"
-      echo "sacct_rc=${sacct_rc}"
-      echo "sacct_job_record=${sacct_job_record}"
-      if [[ "${attempt}" -eq 1 || "${sacct_rc}" -ne 0 ]]; then
-        echo "sacct_output_sample=$(printf '%s\n' "${sacct_output}" | awk 'NR <= 5')"
-      fi
-    else
-      sacct_line="$(sacct -j "${job_id}" -X -n -P -o State,ExitCode 2>/dev/null | awk -F'|' 'NF { print; exit }' || true)"
-    fi
-    echo "sacct_line=${sacct_line}"
-    [[ -n "${sacct_line}" ]] && break
+  if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
+    sacct_line="$(sacct --account "${SLURM_ACCOUNT}" --brief --noheader 2>/dev/null | awk -v job_id="${job_id}" '$1 == job_id { print $2 "|" $3; exit }' || true)"
+  else
+    sacct_line="$(sacct -j "${job_id}" -X -n -P -o State,ExitCode 2>/dev/null | awk -F'|' 'NF { print; exit }' || true)"
+  fi
 
-    if [[ "${USES_SPUR_CONTROLLER}" == "1" && ( "${attempt}" -eq 1 || "$(date +%s)" -ge "${deadline}" ) ]]; then
-      controller_line="$(read_slurm_controller_record "${job_id}" || true)"
-      echo "scontrol_line=${controller_line}"
-      if [[ -n "${controller_line}" ]]; then
-        sacct_line="${controller_line}"
-        break
-      fi
-    fi
-
-    if [[ "$(date +%s)" -ge "${deadline}" ]]; then
-      echo "ERROR: Slurm accounting record for job ${job_id} was not available after ${SLURM_ACCOUNTING_TIMEOUT}s" >&2
-      return 0
-    fi
-    sleep "${SLURM_ACCOUNTING_POLL_INTERVAL}"
-  done
+  if [[ -z "${sacct_line}" ]]; then
+    echo "ERROR: unable to read final Slurm state for job ${job_id}" >&2
+    return 0
+  fi
 
   SLURM_STATE="${sacct_line%%|*}"
   SLURM_STATE="${SLURM_STATE%%+*}"
