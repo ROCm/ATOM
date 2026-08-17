@@ -35,19 +35,11 @@ class AiterMhaBackendForVllm:
 
     @staticmethod
     def get_supported_kernel_block_sizes():
-        # The AITER asm_pa kernel only ships a bf16/bf16 paged-attention variant
-        # for kernel block size 16, but the Triton paged-attention path reads
-        # block_size from the cache shape at runtime and handles any multiple of
-        # 16. AttentionForVllmMHA routes to the Triton path whenever the bf16 KV
-        # cache block size is not 16 (see layer_mha.use_triton_attn), so this
-        # backend genuinely supports any MultipleOf(16). Declaring it as such
-        # lets vLLM pick the kv-manager block size (e.g. 128) as the common
-        # kernel block size, so a layer using this backend (the Eagle3 draft)
-        # can share the uniform-type KV cache group with the block-128
-        # sparse/dense layers instead of forcing a singleton group or a
-        # "No common block size" failure. This matches native vLLM, whose draft
-        # attention also supports the model block size.
-        return [MultipleOf(16)]
+        # Keep the physical kernel page at 16 even when vLLM's hybrid KV manager
+        # uses a larger logical page. Advertising arbitrary multiples makes
+        # fp8 hybrid models execute cache kernels against the unsplit logical
+        # page and corrupts TP output.
+        return [16]
 
     @classmethod
     def supports_block_size(cls, block_size: int | None) -> bool:
@@ -99,6 +91,14 @@ class AiterMhaBackendForVllm:
     def is_ssm(cls) -> bool:
         return False
 
+    @classmethod
+    def supports_sliding_window(cls) -> bool:
+        return True
+
+    @classmethod
+    def supports_pcp(cls) -> bool:
+        return False
+
     @staticmethod
     def get_required_kv_cache_layout():
         return None
@@ -130,6 +130,14 @@ class AiterMhaBackendForVllm:
     @classmethod
     def full_cls_name(cls) -> tuple[str, str]:
         return (cls.__module__, cls.__qualname__)
+
+
+class AiterMhaFlexibleBlockBackendForVllm(AiterMhaBackendForVllm):
+    """Draft-only backend whose Triton path accepts the logical KV page size."""
+
+    @staticmethod
+    def get_supported_kernel_block_sizes():
+        return [MultipleOf(16)]
 
 
 class AiterMlaBackendForVllm:
@@ -185,6 +193,14 @@ class AiterMlaBackendForVllm:
 
     @classmethod
     def is_ssm(cls) -> bool:
+        return False
+
+    @classmethod
+    def supports_sliding_window(cls) -> bool:
+        return False
+
+    @classmethod
+    def supports_pcp(cls) -> bool:
         return False
 
     @staticmethod
@@ -448,6 +464,14 @@ class MiniMaxM3SparseAttentionBackend:
 
     @classmethod
     def is_ssm(cls) -> bool:
+        return False
+
+    @classmethod
+    def supports_sliding_window(cls) -> bool:
+        return False
+
+    @classmethod
+    def supports_pcp(cls) -> bool:
         return False
 
     @staticmethod

@@ -126,6 +126,11 @@ def register_plugin() -> None:
     _install_model_config_quant_patch()
     _install_loader_quant_patch()
     _install_decode_graph_forward_context_patch()
+    from atom.plugin.sglang.models.kimi_k3_processor import (
+        register_kimi_k3_text_only_processor,
+    )
+
+    register_kimi_k3_text_only_processor()
 
     try:
         from atom.plugin.sglang.runtime import apply_load_config_patch

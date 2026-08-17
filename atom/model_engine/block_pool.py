@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Hashable, Iterable
 from dataclasses import dataclass
 from heapq import heapify, heappop, heappush
 
@@ -84,6 +84,8 @@ class BlockPool:
         self._cached: OrderedDict[int, None] = OrderedDict()
         self._free: set[int] = set(range(num_blocks))
         self._used: set[int] = set()
+        # Raw PAGE units reserved by multi-unit objects such as state checkpoints.
+        self._raw_unit_owner: dict[int, tuple[Hashable, int]] = {}
 
     # ------------------------------- counts -------------------------------- #
     @property
@@ -215,6 +217,10 @@ class BlockPool:
         return block
 
     def free(self, block_id: int) -> None:
+        if block_id in self._raw_unit_owner:
+            raise AssertionError(
+                f"block {block_id} is a reserved raw unit; use release_units"
+            )
         block = self.blocks[block_id]
         block.ref_count -= 1
         if block.ref_count:
@@ -231,6 +237,39 @@ class BlockPool:
         if len(self._vacant) > 2 * self.num_blocks + 2:
             self._vacant = [b for b in self._free if self.blocks[b].hash == -1]
             heapify(self._vacant)
+
+    def reserve_units(self, count: int, owner: Hashable) -> list[int] | None:
+        """Reserve arbitrary PAGE-sized units for raw storage."""
+        if count < 0:
+            raise ValueError(f"unit count must be non-negative, got {count}")
+        if owner is None:
+            raise ValueError("a raw-unit reservation needs an owner")
+        if not self.has_free(count):
+            return None
+        unit_ids: list[int] = []
+        for piece_index in range(count):
+            block_id = self.pop()
+            self.allocate(block_id)
+            self._raw_unit_owner[block_id] = (owner, piece_index)
+            unit_ids.append(block_id)
+        return unit_ids
+
+    def release_units(self, unit_ids: Iterable[int], owner: Hashable) -> None:
+        """Release a complete raw-unit reservation back to the PAGE pool."""
+        ids = list(unit_ids)
+        if len(ids) != len(set(ids)):
+            raise ValueError("a raw-unit release contains duplicate ids")
+        # Validate ownership before releasing any unit.
+        for piece_index, block_id in enumerate(ids):
+            actual = self._raw_unit_owner.get(block_id)
+            expected = (owner, piece_index)
+            if actual != expected:
+                raise AssertionError(
+                    f"raw unit {block_id} belongs to {actual!r}, not {expected!r}"
+                )
+        for block_id in ids:
+            del self._raw_unit_owner[block_id]
+            self.free(block_id)
 
     # ------------------------------ resizing ------------------------------- #
     def extend(self, count: int) -> int:
@@ -261,6 +300,9 @@ class BlockPool:
         """
         top = self.num_blocks - 1
         if top < 0:
+            return None
+        # Raw units cannot move without updating their owning record.
+        if top in self._raw_unit_owner:
             return None
         if top in self._free:
             self._take_named(top)

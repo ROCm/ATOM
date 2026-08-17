@@ -6,6 +6,7 @@ from torch.profiler import record_function
 
 from atom.spec_decode.drafter import AuxCaptureSpec, Drafter
 from atom.spec_decode.dspark_verify import VerifyScheduler
+from atom.utils import envs
 from atom.utils.block_convert import kv_indices_generate_triton
 from atom.utils.forward_context import get_forward_context
 
@@ -85,9 +86,11 @@ class DSparkProposer(Drafter):
         )
 
         max_bs = self.config.max_num_seqs
-        # padded_num_heads lives on the draft MLA module (>=_MLA_MIN_HEADS==16),
-        # matching the gqa ratio the asm kernel dispatches on. The ModelRunner
-        # itself has no such attribute.
+        # padded_num_heads lives on the draft MLA module (see
+        # mla_min_query_heads), matching the gqa ratio the asm kernel dispatches
+        # on -- read it rather than recomputing, so the work descriptors planned
+        # here describe the kernel that will actually run. The ModelRunner itself
+        # has no such attribute.
         self._blk_padded_heads = self.model.layers[
             0
         ].self_attn.mla_attn.impl.padded_num_heads
@@ -140,8 +143,20 @@ class DSparkProposer(Drafter):
     def _build_draft_model(self, model_class) -> nn.Module:
         if not self._with_draft:
             # V4: the draft is part of the target checkpoint and shares its
-            # config wholesale.
-            return model_class(self.config)
+            # config wholesale, so it inherits the target's compilation level
+            # and its `_DSparkInner` is compiled (see deepseek_v4_dspark.py).
+            model = model_class(self.config)
+            if envs.ATOM_DSPARK_DISABLE_COMPILE:
+                # Flip the decorator's own bypass rather than handing the draft a
+                # cloned config with NO_COMPILATION (what the with-draft branch
+                # below does). A cloned compilation_config would no longer be the
+                # object get_current_atom_config() returns, splitting the shared
+                # static_forward_context registry. This flag is read at the top of
+                # the decorator's __call__ (decorators.py:505), so it degrades to
+                # a plain self.forward(...) with no other side effects.
+                model.model.do_not_compile = True
+                logger.info("DSpark draft: torch.compile disabled by env.")
+            return model
 
         # Standalone draft: build from the DRAFT's own hf_config, exactly as
         # EagleProposer does for eagle3. Shallow-copy rather than deepcopy --
@@ -150,7 +165,6 @@ class DSparkProposer(Drafter):
         import copy
 
         from atom.config import CompilationLevel
-        from atom.spec_decode.eagle3_kv_builder import Eagle3DraftBuilder
 
         draft_hf = self.speculative_config.draft_model_hf_config
         draft_atom_config = copy.copy(self.config)
@@ -161,19 +175,21 @@ class DSparkProposer(Drafter):
             draft_atom_config,
             layer_offset=self.config.hf_config.num_hidden_layers,
         )
-        # The draft owns a sibling KV pool. It stores the MLA latent
-        # (kv_lora_rank 512 + qk_rope_head_dim 64 = 576 per token), and the
-        # Kimi-K3 target has NO pool of that shape to borrow: being a
-        # kimi_linear hybrid it goes through the GDN/KDA builder, which
-        # allocates its full-attention layers as split K/V at
-        # head_dim = qk_nope + qk_rope = 192, not as a compressed latent. So
-        # sharing is not merely suboptimal, it is a shape mismatch --
-        # concat_and_cache_mla asserts `kv_cache.size(2) == 576`.
+        # An MLA draft stores the same 576-wide latent (kv_lora_rank 512 +
+        # qk_rope_head_dim 64) as an MLA target's own layers, so it binds into
+        # the TARGET's pool as extra rows -- the target builder already sizes
+        # and addresses them (see `_num_cache_rows` / `build_kv_cache_tensor`),
+        # and the draft inherits `--kv_cache_dtype` for free that way.
         #
-        # Eagle3DraftBuilder covers both layouts and picks MLA off the draft
-        # config's `kv_lora_rank`. ModelRunner keys its draft-pool allocation
-        # and per-module binding off the presence of this attribute.
-        self.runner.eagle3_draft_builder = Eagle3DraftBuilder(self.runner, draft_hf)
+        # An MHA draft has no such row to borrow and needs the sibling pool.
+        # Same fork, same spelling as EagleProposer.
+        draft_is_mla = bool(getattr(draft_hf, "kv_lora_rank", None))
+        if not draft_is_mla:
+            from atom.spec_decode.eagle3_kv_builder import Eagle3DraftBuilder
+
+            # ModelRunner keys its draft-pool allocation and per-module binding
+            # off the presence of this attribute.
+            self.runner.eagle3_draft_builder = Eagle3DraftBuilder(self.runner, draft_hf)
         return model
 
     def _resolve_mtp_k(self) -> int:
@@ -228,9 +244,10 @@ class DSparkProposer(Drafter):
             logger.warning(
                 "DSpark draft layer_%d is bound to a %s KV cache, but "
                 "--kv_cache_dtype=%s implies %s. Using the bound tensor's dtype "
-                "for q_out so the fused write agrees, but the draft's sibling "
-                "pool and the requested cache dtype disagree -- check that "
-                "layer_%d maps to eagle3_kv_cache and not to a target layer.",
+                "for q_out so the fused write agrees -- but the two should not "
+                "be able to differ, since the draft binds into the pool the "
+                "engine allocated from that same flag. Check that layer_%d "
+                "resolved to a draft row and not to a target layer.",
                 layer_num,
                 bound.dtype,
                 self.config.kv_cache_dtype,
@@ -406,7 +423,8 @@ class DSparkProposer(Drafter):
 
         # Anchor token x0 per request = the just-verified target token, located
         # at last_token_indices in the flat batch.
-        anchor_ids = next_token_ids
+        # Seatbelt: markov_w1 is a raw nn.Embedding, so a -1 anchor traps it.
+        anchor_ids = next_token_ids.clamp(0, int(self.model.args.vocab_size) - 1)
         anchor_positions = torch.index_select(target_positions, 0, last_token_indices)
 
         if self._with_draft:

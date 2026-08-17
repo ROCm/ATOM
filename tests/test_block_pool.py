@@ -148,3 +148,47 @@ class TestGrowing:
     def test_growing_beyond_the_allocation_is_refused(self):
         with pytest.raises(ValueError, match="outside"):
             BlockPool(num_blocks=5, max_blocks=4)
+
+
+class TestRawPageUnits:
+    def test_reservation_uses_arbitrary_non_contiguous_free_ids(self):
+        pool = BlockPool(num_blocks=8)
+        for _ in range(8):
+            pool.allocate(pool.pop())
+        for block_id in (0, 2, 5, 7):
+            pool.free(block_id)
+
+        units = pool.reserve_units(4, owner=("checkpoint", 1))
+
+        assert units == [0, 2, 5, 7]
+        assert all(pool.is_used(i) for i in units)
+        assert pool.num_free == 0
+        with pytest.raises(AssertionError, match="belongs"):
+            pool.release_units(reversed(units), owner=("checkpoint", 1))
+        pool.release_units(units, owner=("checkpoint", 1))
+        assert pool.num_free == 4
+
+    def test_failed_reservation_is_atomic(self):
+        pool = BlockPool(num_blocks=2)
+        pool.allocate(pool.pop())
+        assert pool.reserve_units(2, owner=("checkpoint", 1)) is None
+        assert pool.num_free == 1
+
+    def test_only_the_whole_owner_can_release_units(self):
+        pool = BlockPool(num_blocks=3)
+        units = pool.reserve_units(2, owner=("checkpoint", 1))
+        with pytest.raises(AssertionError, match="belongs"):
+            pool.release_units(units, owner=("checkpoint", 2))
+        assert pool.num_free == 1
+        pool.release_units(units, owner=("checkpoint", 1))
+        assert pool.num_free == 3
+
+    def test_retirement_refuses_a_fragment_without_relocation_protocol(self):
+        pool = BlockPool(num_blocks=3)
+        # Reserve the highest id specifically by occupying the lower two.
+        pool.allocate(0)
+        pool.allocate(1)
+        units = pool.reserve_units(1, owner=("checkpoint", 1))
+        assert units == [2]
+        assert pool.retire_top() is None
+        assert pool.num_blocks == 3

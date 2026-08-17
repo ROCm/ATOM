@@ -4,7 +4,7 @@
 import logging
 from dataclasses import dataclass
 from functools import partial as functools_partial
-from typing import Optional, Protocol
+from typing import ClassVar, Optional, Protocol
 
 import torch
 import triton
@@ -44,6 +44,7 @@ from torch import nn
 from atom.config import get_current_atom_config
 from atom.distributed.dcp_utils import (
     dcp_persistent_supported,
+    dcp_prefill_merge_bf16_ok,
     get_dcp_group,
     get_dcp_rank,
     get_dcp_world_size,
@@ -53,7 +54,9 @@ from atom.distributed.pcp_utils import (
     pcp_allgather_rerange,
     pcp_is_enabled,
 )
+from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import use_triton_gemm
+from atom.model_ops.triton_fused_mla_ctx_kv import fused_mla_ctx_norm_rope_cache
 from atom.model_ops.utils import get_and_maybe_dequant_weights
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
@@ -125,6 +128,27 @@ triton_fused_qk_rope_cat_and_cache_mla = mark_trace(
 logger = logging.getLogger("atom")
 
 _MLA_MIN_HEADS = 16  # AITER MLA kernels require at least 16 attention heads
+
+
+def mla_min_query_heads(kv_cache_dtype: str, block_width: int) -> int:
+    """Query-head padding that lets aiter dispatch a NON-causal MLA decode.
+
+    aiter picks its .co from (gqa, block width, causality), and on an fp8 cache
+    a 2-wide non-causal block has no kernel at gqa=16: the asm dispatch hits
+    AITER_CHECK and aborts the whole process. Padding to 32 instead reaches the
+    4-wide non-causal kernel through aiter's own (gqa=32, width 2) remap.
+
+    Only width 2 needs this. Widths 1, 3 and 4 have gqa=16 kernels, and aiter
+    remaps anything wider onto gqa=32 itself. Padding rather than remapping
+    width 2 to the 4-wide kernel at gqa=16 is deliberate: the persistent work
+    descriptors are sized from the block width, so a 2-wide plan driving a
+    4-wide kernel writes its partials past the reduce buffers (illegal access
+    at some batch sizes, a non-terminating kernel at others).
+    """
+    if block_width == 2 and kv_cache_dtype.startswith("fp8"):
+        return 32
+    return _MLA_MIN_HEADS
+
 
 # The fused seg MLA kernels (fused_qk_rope_concat_and_cache_mla_seg +
 # concat_and_cache_mla_seg + the gfx1250 mla_decode_fwd asm) share a single
@@ -288,7 +312,9 @@ class MLAAttention(nn.Module):
         self.kv_cache_dtype = "fp8" if kv_cache_dtype.startswith("fp8") else "auto"
         self.dtype = dtype
 
-        self.padded_num_heads = max(num_heads, _MLA_MIN_HEADS)
+        self.padded_num_heads = max(
+            num_heads, kwargs.get("min_query_heads", _MLA_MIN_HEADS)
+        )
         self.head_repeat_factor = 1
         self.head_pad = 0
         if self.padded_num_heads != num_heads:
@@ -317,6 +343,14 @@ class MLAAttention(nn.Module):
         self.one_scale = torch.tensor(1.0, dtype=torch.float32)
         self._k_scale = self.one_scale
         self._q_scale = self.one_scale
+        # A device copy for write_context_kv_latent's fused store, which reads
+        # the scale from a Triton pointer. The scales above are host tensors --
+        # the aiter store kernels take them as host scalars -- and a host
+        # pointer is not addressable from the GPU. Made here so the fused path
+        # neither allocates nor synchronizes on the per-step path.
+        self._k_scale_device = self._k_scale.to(
+            torch.cuda.current_device(), non_blocking=True
+        )
         atom_config = get_current_atom_config()
         self._dpa_persistent_supported = supports_dpa_persistent_mode(
             atom_config,
@@ -377,6 +411,27 @@ class MLAAttention(nn.Module):
                     "aiter or set ATOM_MLA_PAGE_SIZE=1."
                 )
 
+        # Context-row KV fusion (write_context_kv_latent). Resolved once here,
+        # like use_seg_mla above, so a drafter pays no env/attr lookup per layer
+        # per step. The seg and shuffled-KV layouts are excluded rather than
+        # supported: their store kernels own byte layouts the fused kernel does
+        # not reproduce, and guessing at them is worse than the per-op path.
+        # RoPE must be the plain single-position kind covering exactly the pe
+        # lane, with the half-width (reuse_freqs_front_part) cos/sin cache
+        # get_rope builds -- anything else (M-RoPE, partial rotary, full-width
+        # freqs) indexes the cache differently.
+        rope = self.rotary_emb
+        self._ctx_kv_fusion_enabled = (
+            envs.ATOM_DSPARK_FUSED_CTX_KV
+            and not self.use_seg_mla
+            and not (self.use_triton_mla and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV)
+            and rope is not None
+            and getattr(rope, "rotary_dim", None) == self.qk_rope_head_dim
+            and getattr(rope, "mrope_section", None) is None
+            and getattr(rope, "cos_cache", None) is not None
+            and rope.cos_cache.shape[-1] == self.qk_rope_head_dim // 2
+        )
+
         # Decode context parallel (DCP): KV cache is sharded across TP ranks, so
         # decode attention runs locally then combines via all-gather LSE +
         # reduce-scatter. Disabled (world_size==1) unless -dcp is set.
@@ -392,10 +447,13 @@ class MLAAttention(nn.Module):
             self.dcp_rank = 0
             self._cp_triton_ctx = None
 
-        # Whether DCP decode can run in persistent mode on this GPU (gfx950 has
-        # the lse persistent kernel, gfx942 does not — see dcp_utils). Cached
-        # once here to avoid a per-forward get_gfx() (graph-break).
         self.dcp_persistent_supported = dcp_persistent_supported()
+        self.dcp_prefill_merge_bf16_ok = dcp_prefill_merge_bf16_ok()
+
+        # Compacted per-layer sparse offsets for DCP decode; rebound by the
+        # metadata builder to the shared buffer (see aiter_mla.py).
+        self.dcp_sparse_kv_indptr_buffer = None
+        self.dcp_owned_counts_buffer = None
 
     def _pad_query_heads(self, q: torch.Tensor) -> torch.Tensor:
         if self.head_repeat_factor > 1:
@@ -1082,6 +1140,7 @@ class MLAAttention(nn.Module):
         q: torch.Tensor,
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: AttentionMetaData,
+        return_lse: bool = False,
     ) -> torch.Tensor:
         assert attn_metadata is not None
         B = q.shape[0]
@@ -1117,15 +1176,32 @@ class MLAAttention(nn.Module):
             # Sparse attention needs one last-page len per query token; the dense
             # kv_last_page_lens (per-seq) would over-read -> illegal access.
             kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens
+            if self.dcp_world_size > 1:
+                # The indexer compacted this rank's owned candidates to the front
+                # of each query token's region, so the region lengths are the
+                # per-rank (and per-layer) ones, not the global sparse_kv_indptr.
+                # Same substitution the decode path makes.
+                paged_kv_indptr = self.dcp_sparse_kv_indptr_buffer[
+                    : paged_cu_seqlens_q.shape[0]
+                ]
             max_q_len = 1
 
+        final_lse = None
         if kv_c_and_k_pe_cache.numel() > 0:
             if envs.ATOM_MLA_PAGE_SIZE is not None:
                 page_size = envs.ATOM_MLA_PAGE_SIZE
             else:
                 page_size = 1
-            if self.kv_cache_dtype.startswith("fp8"):
-                mla_decode_fwd(
+            # `mla_prefill_asm_fwd` NEVER writes its LSE output, so DCP also needs
+            # `mla_decode_fwd` kernel.
+            use_decode_kernel = self.kv_cache_dtype.startswith("fp8") or return_lse
+            if use_decode_kernel:
+                is_fp8 = self.kv_cache_dtype.startswith("fp8")
+                # DCP compacts each rank's candidates per layer, so the once-per-step
+                # persistent work metadata (built from the GLOBAL sparse_kv_indptr)
+                # does not describe this rank's regions -- run non-persistent.
+                use_work_meta = is_fp8 and self.dcp_world_size <= 1
+                _, final_lse = mla_decode_fwd(
                     q,
                     kv_c_and_k_pe_cache.view(-1, page_size, 1, q.shape[-1]),
                     o,
@@ -1135,27 +1211,43 @@ class MLAAttention(nn.Module):
                     kv_last_page_lens,
                     max_q_len,
                     page_size=page_size,
+                    num_kv_splits=max(2, 16 // max(1, self.dcp_world_size)),
                     sm_scale=self.scale,
-                    q_scale=self._q_scale,
-                    kv_scale=self._k_scale,
-                    work_meta_data=getattr(
-                        attn_metadata, "sparse_prefill_work_meta_data", None
+                    q_scale=self._q_scale if is_fp8 else None,
+                    kv_scale=self._k_scale if is_fp8 else None,
+                    work_meta_data=(
+                        getattr(attn_metadata, "sparse_prefill_work_meta_data", None)
+                        if use_work_meta
+                        else None
                     ),
-                    work_indptr=getattr(
-                        attn_metadata, "sparse_prefill_work_indptr", None
+                    work_indptr=(
+                        getattr(attn_metadata, "sparse_prefill_work_indptr", None)
+                        if use_work_meta
+                        else None
                     ),
-                    work_info_set=getattr(
-                        attn_metadata, "sparse_prefill_work_info_set", None
+                    work_info_set=(
+                        getattr(attn_metadata, "sparse_prefill_work_info_set", None)
+                        if use_work_meta
+                        else None
                     ),
-                    reduce_indptr=getattr(
-                        attn_metadata, "sparse_prefill_reduce_indptr", None
+                    reduce_indptr=(
+                        getattr(attn_metadata, "sparse_prefill_reduce_indptr", None)
+                        if use_work_meta
+                        else None
                     ),
-                    reduce_final_map=getattr(
-                        attn_metadata, "sparse_prefill_reduce_final_map", None
+                    reduce_final_map=(
+                        getattr(attn_metadata, "sparse_prefill_reduce_final_map", None)
+                        if use_work_meta
+                        else None
                     ),
-                    reduce_partial_map=getattr(
-                        attn_metadata, "sparse_prefill_reduce_partial_map", None
+                    reduce_partial_map=(
+                        getattr(
+                            attn_metadata, "sparse_prefill_reduce_partial_map", None
+                        )
+                        if use_work_meta
+                        else None
                     ),
+                    return_lse=return_lse,
                 )
             else:
                 mla_prefill_fwd(
@@ -1173,6 +1265,19 @@ class MLAAttention(nn.Module):
                 )
 
         o = self._restore_query_heads(o, num_heads_q)
+        if final_lse is not None:
+            final_lse = self._restore_query_heads(final_lse, num_heads_q)
+
+        if return_lse:
+            assert final_lse is not None, (
+                "return_lse requested but the attention kernel produced no LSE "
+                "(empty KV cache?)"
+            )
+            if self.is_sparse_mla and self.dcp_world_size > 1:
+                o = torch.where(
+                    torch.isfinite(final_lse).unsqueeze(-1), o, torch.zeros_like(o)
+                )
+            return o, final_lse
 
         return self._v_up_proj_and_o_proj(o)
 
@@ -1308,6 +1413,8 @@ class MLAAttention(nn.Module):
                     paged_kv_indptr = attn_metadata.sparse_kv_indptr
                     paged_kv_indices = self.sparse_kv_indices_buffer
                     paged_kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens
+                    if self.dcp_world_size > 1:
+                        paged_kv_indptr = self.dcp_sparse_kv_indptr_buffer
 
             dp_size = get_dp_group().world_size
             use_persistent_mode = should_use_persistent_mode(
@@ -1317,6 +1424,15 @@ class MLAAttention(nn.Module):
                 dcp_world_size=self.dcp_world_size,
                 dcp_persistent_supported=self.dcp_persistent_supported,
             )
+            # sparse + DCP compacts the per-rank top-k, which makes the sparse
+            # region length depend on the *per-layer* selection. The persistent
+            # work/reduce metadata is built once per step from sparse_kv_indptr
+            # (aiter_mla.set_mla_persistent_worker_buffers), so it cannot describe
+            # a length that changes layer to layer -- the timing simply does not
+            # line up. Run non-persistent until either the metadata build moves
+            # per-layer or aiter grows a per-request valid length.
+            if self.is_sparse_mla and self.dcp_world_size > 1:
+                use_persistent_mode = False
 
             # Sparse layers in MTP verify use separate persistent metadata
             # (per-token, max_seqlen_qo=1) while dense layers use normal metadata
@@ -1454,13 +1570,107 @@ class MLAAttention(nn.Module):
                 scale=self._k_scale,
             )
 
+    # One diagnostic line per outcome per process, not per layer: see the log
+    # below. Two entries at most -- the first write necessarily takes the per-op
+    # path (it is what moves the rope cache to the device), so logging only the
+    # very first call would report a fusion that is in fact running.
+    _ctx_kv_fusion_logged: ClassVar[set[bool]] = set()
+
+    def write_context_kv_latent(
+        self,
+        kv_cache: torch.Tensor,
+        kv_lora: torch.Tensor,
+        positions: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        kv_a_layernorm: nn.Module,
+    ) -> None:
+        """Norm + RoPE + store raw latent rows at an explicit slot_mapping.
+
+        A drafter that writes target-derived CONTEXT rows into its own paged
+        cache (Kimi-K3 DSpark's ``write_context_kv``) has no query and no
+        attn_metadata for those rows, so it cannot reach the cache through
+        ``forward_impl``; it holds the raw ``kv_lora`` and the slots itself.
+        This lives here rather than in the model so that every cache layout
+        stays behind one door, as ``_pcp_write_full_kv`` already is.
+
+        ``kv_lora`` is ``[N, kv_lora_rank + qk_rope_head_dim]`` straight off the
+        projection -- normally the strided ``[..., q_lora_rank:]`` half of a
+        fused q/kv projection, which both paths below read without copying.
+        """
+        use_fused = self._ctx_kv_fusion_enabled and (
+            # A plain [num_blocks, block_size, entry] cache (a per-token cache
+            # is that with block_size 1). The empty pre-allocation every layer
+            # holds before allocate_kv_cache fails here too, so a premature
+            # write still aborts in the per-op kernels rather than scribbling.
+            kv_cache.dim() == 3
+            and kv_cache.shape[-1] == self.kv_lora_rank + self.qk_rope_head_dim
+            and kv_cache.stride(-1) == 1
+            and kv_lora.dim() == 2
+            and kv_lora.stride(-1) == 1
+            # get_rope leaves cos/sin on the host until its first forward, which
+            # also casts them to the activation dtype. Until that has happened
+            # the kernel cannot read them (and would read fp32 where the per-op
+            # path reads bf16), so the first write of a layer takes the per-op
+            # path and moves them; every later one fuses.
+            and self.rotary_emb.cos_cache.device == kv_cache.device
+            # The fused kernel inlines ATOM RMSNorm's math; a Gemma-style norm
+            # (x * (1 + w)) or any other flavour must keep calling its module.
+            and isinstance(kv_a_layernorm, RMSNorm)
+        )
+        # Every rejection above is silent and per call, so a layout the kernel
+        # does not recognise would otherwise leave the fusion inert with nothing
+        # in the log to say so. One line, first write of the process.
+        if use_fused not in MLAAttention._ctx_kv_fusion_logged:
+            MLAAttention._ctx_kv_fusion_logged.add(use_fused)
+            logger.info(
+                "MLA context-row KV write: %s (ATOM_DSPARK_FUSED_CTX_KV=%d, "
+                "cache %s %s, kv_lora %s)",
+                "FUSED" if use_fused else "per-op",
+                int(envs.ATOM_DSPARK_FUSED_CTX_KV),
+                tuple(kv_cache.shape),
+                kv_cache.dtype,
+                tuple(kv_lora.shape),
+            )
+        if use_fused:
+            fused_mla_ctx_norm_rope_cache(
+                kv_lora,
+                kv_a_layernorm.weight,
+                positions,
+                self.rotary_emb.cos_cache,
+                self.rotary_emb.sin_cache,
+                slot_mapping.flatten(),
+                kv_cache,
+                self._k_scale_device,
+                kv_a_layernorm.eps,
+                self.kv_lora_rank,
+                self.qk_rope_head_dim,
+                self.rotary_emb.is_neox_style,
+                # An "auto" cache is a straight copy in aiter's kAuto branch and
+                # ignores _k_scale entirely; only fp8 dequant-scales the store.
+                self.kv_cache_dtype.startswith("fp8"),
+            )
+            return
+
+        kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        kv_c = kv_a_layernorm(kv_c)
+        # RoPE the positional lane only -- there is no query on the context
+        # path. The rope kernel is 2-component (rotates query AND key, in place
+        # on the rotary_dim views) and the YaRN variant
+        # (DeepseekScalingRotaryEmbedding) declares `key` as a REQUIRED
+        # positional, unlike the base class whose `forward_native` takes it as
+        # optional. So pass a throwaway for the query side, exactly as
+        # deepseek_v2 does for its own k-only rope under PCP.
+        k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
+        _, k_pe = self.rotary_emb(positions, torch.empty_like(k_pe), k_pe)
+        self._pcp_write_full_kv(kv_cache, kv_c, k_pe, slot_mapping)
+
     def forward_impl(
         self,
         q: torch.Tensor,
         k_nope: torch.Tensor,
         k_rope: torch.Tensor,
         positions: torch.Tensor = None,
-        q_scale: Optional[torch.Tensor] = None,
+        q_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # kv_cache = self.kv_cache
         forward_context: ForwardContext = get_forward_context()
@@ -1680,16 +1890,37 @@ class MLAAttention(nn.Module):
                     )
 
             if context.is_prefill:
-                output = self._forward_prefill_mla(q_out, kv_cache, attn_metadata)
+                if self.is_sparse_mla and self.dcp_world_size > 1:
+                    # DCP sparse prefill: each rank holds a disjoint slice of the
+                    # global top-k, so merge partials like decode.
+                    from atom.model_ops.dcp_ops import cp_lse_ag_out_rs
+
+                    q_out = self.dcp_group.all_gather(q_out, dim=1)
+                    o, lse = self._forward_prefill_mla(
+                        q_out, kv_cache, attn_metadata, return_lse=True
+                    )
+                    # Merge dtype is platform-dependent: on gfx942 the bf16
+                    # ReduceScatter sum costs ~3.5pp, on gfx950 it is free even at
+                    # ctx~32k with fp8 KV. Pay the fp32 upcast only where it buys
+                    # something -- see dcp_prefill_merge_bf16_ok for the numbers.
+                    if self.dcp_prefill_merge_bf16_ok:
+                        o = cp_lse_ag_out_rs(o, lse, self.dcp_group, ctx=None)
+                    else:
+                        o = cp_lse_ag_out_rs(
+                            o.float(), lse, self.dcp_group, ctx=None
+                        ).to(o.dtype)
+                    output = self._v_up_proj_and_o_proj(o)
+                else:
+                    output = self._forward_prefill_mla(q_out, kv_cache, attn_metadata)
             elif self.dcp_world_size > 1:
                 # DCP decode: AllGather Q on the head dim, decode locally with LSE,
                 # then combine partial outputs across ranks (AG LSE + correct + RS).
+                from atom.model_ops.dcp_ops import cp_lse_ag_out_rs
+
                 q_out = self.dcp_group.all_gather(q_out, dim=1)
                 o, lse = self._forward_decode(
                     q_out, kv_cache, attn_metadata, return_lse=True
                 )
-                from atom.model_ops.dcp_ops import cp_lse_ag_out_rs
-
                 o = cp_lse_ag_out_rs(o, lse, self.dcp_group, ctx=self._cp_triton_ctx)
                 output = self._v_up_proj_and_o_proj(o)
             else:

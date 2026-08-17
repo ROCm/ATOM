@@ -562,11 +562,18 @@ def _build_rank_dispatch_map(
     num_local_physical: int,
     ep_rank: int,
 ) -> torch.Tensor:
-    """Per-rank locality-aware replica choice ([L, Lg] -> physical slot id).
+    """Per-rank locality choice ([L, Lg] -> physical slot id, or -1 sentinel).
 
-    For each logical expert this rank picks ONE physical replica to dispatch to:
-    prefer a replica owned by this rank (local, no cross-GPU cost); otherwise
-    spread deterministically across replicas by `ep_rank % replica_count`.
+    For each logical expert this rank picks the physical replica owned by THIS
+    rank if one exists (local, no cross-GPU dispatch cost). If NO replica is
+    local, emits -1 as a "forced-remote" sentinel: the dispatch path then spreads
+    this rank's tokens for that expert across the remote replicas at TOKEN
+    granularity (hash(token_idx) % replica_count) rather than collapsing them all
+    onto a single replica. This preserves locality where available (e.g. biased
+    full replication -> every rank has a local replica -> always local) while
+    balancing load across replicas in the forced-remote (partial replication)
+    case. Consumers (the dispatch Triton kernels and the torch fallback) MUST
+    handle the -1 sentinel; -1 never reaches the model as a physical id.
     """
     num_layers, num_logical, _ = logical_to_physical_map.shape
     device = logical_to_physical_map.device
@@ -587,8 +594,8 @@ def _build_rank_dispatch_map(
                 if p // num_local_physical == ep_rank:
                     chosen = p
                     break
-            if chosen < 0:
-                chosen = reps[ep_rank % cnt]
+            # chosen < 0 => no local replica: keep the -1 sentinel so the
+            # dispatch path spreads tokens across remote replicas per token.
             row[e] = chosen
         out_rows.append(row)
     return torch.tensor(out_rows, dtype=torch.int32, device=device)
@@ -1827,6 +1834,27 @@ class EPLBManager:
     def _collect_expert_weight_tensors(self, layer: Any) -> list[torch.Tensor]:
         assert self.live_metadata is not None
         num_local = self.live_metadata.num_local_physical_experts
+        # Specialized quant methods own their live weight layout. Ask the method
+        # for expert-major views so EPLB never needs to know Mega-private fields
+        # or shuffle details. Methods without this hook use the legacy collector.
+        quant_method = getattr(layer, "quant_method", None)
+        provider = getattr(quant_method, "get_eplb_weight_views", None)
+        if callable(provider):
+            method_views = provider(layer, num_local)
+            if method_views is not None:
+                if not method_views:
+                    raise RuntimeError(
+                        "EPLB quant method returned no live expert weights"
+                    )
+                for tensor in method_views:
+                    if tensor.dim() == 0 or int(tensor.shape[0]) != num_local:
+                        raise RuntimeError(
+                            "EPLB quant method must return expert-major "
+                            f"weights with shape[0]={num_local}, got "
+                            f"shape={tuple(tensor.shape)}."
+                        )
+                return method_views
+
         names = (
             "w13_weight",
             "w2_weight",
@@ -2414,7 +2442,9 @@ def eplb_map_logical_to_physical(layer: Any, topk_ids: torch.Tensor) -> torch.Te
     """Remap router logical expert ids to physical slot ids for EP dispatch.
 
     Returns topk_ids unchanged when EPLB metadata is unavailable (non-EP or
-    pre-rebalance), so callers need no EPLB-awareness guard.
+    pre-rebalance), so callers need no EPLB-awareness guard. A logical expert
+    maps to this rank's local replica when it owns one (dispatch[e] >= 0), else
+    (sentinel -1) spreads across replicas per token (Knuth hash of token index).
     """
     meta = get_live_expert_location_metadata()
     layer_id = getattr(layer, "layer_id", None)
@@ -2428,7 +2458,19 @@ def eplb_map_logical_to_physical(layer: Any, topk_ids: torch.Tensor) -> torch.Te
     topk_i64 = topk_ids.to(torch.int64)
     valid = (topk_i64 >= 0) & (topk_i64 < num_logical)
     safe_logical = torch.where(valid, topk_i64, torch.zeros_like(topk_i64))
-    mapped = dispatch[safe_logical].to(topk_ids.dtype)
+    mapped = dispatch[safe_logical]  # local physical slot, or -1 (forced remote)
+    # Forced-remote (-1): pick a replica per token (deterministic Knuth hash).
+    l2p = meta.logical_to_physical_map[layer_id].to(device=topk_ids.device)
+    cnt = meta.logical_replica_count[layer_id].to(device=topk_ids.device)
+    token_idx = (
+        torch.arange(topk_i64.numel(), device=topk_i64.device).reshape(topk_i64.shape)
+        // topk_ids.shape[-1]
+    )
+    replica_idx = ((token_idx * 2654435769) & 0xFFFFFFFF) % cnt[safe_logical].clamp(
+        min=1
+    )
+    remote = l2p[safe_logical, replica_idx]
+    mapped = torch.where(mapped >= 0, mapped, remote).to(topk_ids.dtype)
     shifted_tail = (topk_i64 + id_delta).to(topk_ids.dtype)
     tail_or_invalid = torch.where(topk_i64 >= num_logical, shifted_tail, topk_ids)
     return torch.where(valid, mapped, tail_or_invalid)
@@ -2464,13 +2506,17 @@ if _EPLB_HAS_TRITON:
 
     @triton.jit
     def _eplb_remap_kernel(
-        topk_ids_ptr,  # [numel]        logical ids (in dtype)
-        dispatch_ptr,  # [num_logical]  this rank's logical->physical (int32)
-        out_ids_ptr,  # [numel]        output physical ids (in dtype)
+        topk_ids_ptr,  # [numel]           logical ids (in dtype)
+        dispatch_ptr,  # [num_logical]     this rank's logical->local physical, or -1
+        l2p_ptr,  # [num_logical*R]   logical->physical replicas (-1 padded), this layer
+        cnt_ptr,  # [num_logical]     replica count per logical
+        out_ids_ptr,  # [numel]           output physical ids (in dtype)
         num_logical,
         id_delta,
+        R,
         numel,
         BLOCK: tl.constexpr,
+        TOP_K: tl.constexpr,
     ):
         pid = tl.program_id(0)
         offs = pid * BLOCK + tl.arange(0, BLOCK)
@@ -2481,25 +2527,43 @@ if _EPLB_HAS_TRITON:
         is_tail = lid >= num_logical
 
         safe_lid = tl.where(valid, lid, 0)
+        # dispatch: this rank's local physical slot, or -1 => forced remote.
         mapped = tl.load(dispatch_ptr + safe_lid, mask=mask & valid, other=0).to(
             tl.int64
         )
-        # valid -> dispatch[lid]; tail -> lid + id_delta; invalid(<0) -> lid (keep)
+        # Forced-remote (mapped < 0): spread this rank's tokens across the
+        # expert's replicas at TOKEN granularity via a deterministic Knuth
+        # multiplicative hash of the token index (matches vLLM; cudagraph-safe,
+        # no RNG/counter). token_idx = offs // TOP_K (flat -> per-token row).
+        need_spread = valid & (mapped < 0)
+        cnt = tl.load(cnt_ptr + safe_lid, mask=mask & valid, other=1).to(tl.int64)
+        cnt = tl.maximum(cnt, 1)
+        token_idx = (offs // TOP_K).to(tl.int64)
+        replica_idx = ((token_idx * 2654435769) & 0xFFFFFFFF) % cnt
+        remote = tl.load(
+            l2p_ptr + safe_lid * R + replica_idx, mask=mask & need_spread, other=0
+        ).to(tl.int64)
+        mapped = tl.where(need_spread, remote, mapped)
+        # valid -> mapped; tail -> lid + id_delta; invalid(<0) -> lid (keep)
         phys = tl.where(valid, mapped, tl.where(is_tail, lid + id_delta, lid))
         tl.store(out_ids_ptr + offs, phys, mask=mask)
 
     @triton.jit
     def _eplb_map_record_hist_kernel(
-        topk_ids_ptr,  # [numel]        logical ids (in dtype)
-        dispatch_ptr,  # [num_logical]  this rank's logical->physical (int32)
-        out_ids_ptr,  # [numel]        output physical ids (in dtype)
-        load_ptr,  # [num_physical] _cur_pass_count[layer_id]
+        topk_ids_ptr,  # [numel]          logical ids (in dtype)
+        dispatch_ptr,  # [num_logical]    this rank's logical->local physical, or -1
+        l2p_ptr,  # [num_logical*R]  logical->physical replicas (-1 padded)
+        cnt_ptr,  # [num_logical]    replica count per logical
+        out_ids_ptr,  # [numel]          output physical ids (in dtype)
+        load_ptr,  # [num_physical]   _cur_pass_count[layer_id]
         num_logical,
         id_delta,
         num_physical,
+        R,
         numel,
         BLOCK: tl.constexpr,
         NUM_BINS: tl.constexpr,  # next_pow2(num_physical + 1); last bins hold oob
+        TOP_K: tl.constexpr,
     ):
         pid = tl.program_id(0)
         offs = pid * BLOCK + tl.arange(0, BLOCK)
@@ -2511,6 +2575,15 @@ if _EPLB_HAS_TRITON:
         mapped = tl.load(dispatch_ptr + safe_lid, mask=mask & valid, other=0).to(
             tl.int64
         )
+        need_spread = valid & (mapped < 0)
+        cnt = tl.load(cnt_ptr + safe_lid, mask=mask & valid, other=1).to(tl.int64)
+        cnt = tl.maximum(cnt, 1)
+        token_idx = (offs // TOP_K).to(tl.int64)
+        replica_idx = ((token_idx * 2654435769) & 0xFFFFFFFF) % cnt
+        remote = tl.load(
+            l2p_ptr + safe_lid * R + replica_idx, mask=mask & need_spread, other=0
+        ).to(tl.int64)
+        mapped = tl.where(need_spread, remote, mapped)
         phys = tl.where(valid, mapped, tl.where(is_tail, lid + id_delta, lid))
         tl.store(out_ids_ptr + offs, phys, mask=mask)
         # out-of-range / masked-off lanes -> sentinel bin (== num_physical),
@@ -2519,8 +2592,7 @@ if _EPLB_HAS_TRITON:
         bin_idx = tl.where(in_range, phys, num_physical).to(tl.int32)
         hist = tl.histogram(bin_idx, NUM_BINS)
         bins = tl.arange(0, NUM_BINS)
-        hmask = (bins < num_physical) & (hist > 0)
-        tl.atomic_add(load_ptr + bins, hist, mask=hmask)
+        tl.atomic_add(load_ptr + bins, hist, mask=bins < num_physical)
 
 
 def eplb_map_and_record_fused(layer: Any, topk_ids: torch.Tensor) -> torch.Tensor:
@@ -2555,6 +2627,18 @@ def eplb_map_and_record_fused(layer: Any, topk_ids: torch.Tensor) -> torch.Tenso
     num_logical = int(dispatch.numel())
     num_physical = int(meta.num_physical_experts)
     id_delta = num_physical - num_logical
+    top_k = int(topk_ids.shape[-1])
+
+    # Full replica table + counts feed the forced-remote token-spread path
+    # (dispatch[e] == -1 -> pick a replica per token). Fixed-address meta views
+    # committed in place by update() (like `dispatch`), so cudagraph-safe.
+    l2p = meta.logical_to_physical_map[layer_id]
+    cnt = meta.logical_replica_count[layer_id]
+    if l2p.device != topk_ids.device:
+        l2p = l2p.to(topk_ids.device)
+    if cnt.device != topk_ids.device:
+        cnt = cnt.to(topk_ids.device)
+    num_replicas = int(l2p.shape[-1])
 
     # Resolve record buffer (== _cur_pass_count[layer_id]); None disables it.
     # eplb_enable is static (server lifetime), so RECORD is a compile-time
@@ -2583,23 +2667,31 @@ def eplb_map_and_record_fused(layer: Any, topk_ids: torch.Tensor) -> torch.Tenso
         _eplb_map_record_hist_kernel[grid](
             topk_c,
             dispatch,
+            l2p,
+            cnt,
             out,
             load_buf,
             num_logical,
             id_delta,
             num_physical,
+            num_replicas,
             numel,
             BLOCK=256,
             NUM_BINS=num_bins,
+            TOP_K=top_k,
         )
     else:
         _eplb_remap_kernel[grid](
             topk_c,
             dispatch,
+            l2p,
+            cnt,
             out,
             num_logical,
             id_delta,
+            num_replicas,
             numel,
             BLOCK=256,
+            TOP_K=top_k,
         )
     return out
