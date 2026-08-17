@@ -197,11 +197,7 @@ class CompletionRequest(BaseModel):
     model_config = {"extra": "ignore"}
 
     model: str | None = None
-    # Token-id prompts are useful for exact-work profiling and avoid a
-    # decode/re-encode round trip that could change the measured sequence.
-    # Nested rows submit a heterogeneous batch through the n-way completion
-    # path; ordinary OpenAI clients continue to use strings.
-    prompt: str | list[int] | list[list[int]]
+    prompt: str
     temperature: float | None = DEFAULT_TEMPERATURE
     top_k: int | None = DEFAULT_TOP_K
     top_p: float | None = DEFAULT_TOP_P
