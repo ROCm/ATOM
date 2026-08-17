@@ -112,9 +112,19 @@ class PageUnitCheckpointStore:
         self,
         pool: BlockPool,
         spec: PagedStateCheckpointSpec,
+        reserve_units: int = 0,
     ):
+        if reserve_units < 0:
+            raise ValueError(f"reserve_units must not be negative, got {reserve_units}")
         self.pool = pool
         self.spec = spec
+        # Free units a store has to leave behind. A checkpoint's units are
+        # unreclaimable while it is COPYING — `ensure_free_units` only takes
+        # from READY records — so between the reservation and the next
+        # `complete_inflight` they are simply gone from the pool. Without a
+        # floor a burst of stores drains the free list to nothing and the next
+        # live KV block raises instead of degrading. See `begin_store`.
+        self.reserve_units = reserve_units
 
         self.hash_to_checkpoint: dict[int, int] = {}
         self.records: dict[int, CheckpointRecord] = {}
@@ -182,7 +192,12 @@ class PageUnitCheckpointStore:
         if self.lookup(prefix_hash) >= 0 or prefix_hash in self._pending_by_hash:
             return None
         needed = self.units_per_checkpoint
-        if not self.ensure_free_units(needed):
+        # Leave `reserve_units` behind. A checkpoint is best-effort and a live
+        # KV block is not: `_fresh_block` raises when the pool is dry, so a
+        # store that took the last units would turn "no checkpoint this time"
+        # into a crash. Dropping instead is the same answer the pool already
+        # gives when nothing can be evicted, one step earlier.
+        if not self.ensure_free_units(needed + self.reserve_units):
             return None
 
         checkpoint_id = self._new_identity()
@@ -329,9 +344,10 @@ class PagedStateCheckpointCoordinator:
         pool: BlockPool,
         spec: PagedStateCheckpointSpec,
         enabled: bool,
+        reserve_units: int = 0,
     ) -> None:
         self.enabled = enabled
-        self.store = PageUnitCheckpointStore(pool, spec)
+        self.store = PageUnitCheckpointStore(pool, spec, reserve_units)
         self._pending: dict[int, tuple[Sequence, int]] = {}
         self._store_ops: list[CheckpointStoreOp] = []
         self.checkpoints_kept = 0

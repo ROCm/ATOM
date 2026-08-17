@@ -118,6 +118,7 @@ class BlockManager:
                 checkpoint_spec,
                 enabled=self.enable_prefix_caching
                 and self.num_per_req_cache_groups > 0,
+                reserve_units=self._checkpoint_reserve_units(config),
             )
         self.state = StateGroupPool(
             self.num_per_req_cache_groups,
@@ -218,6 +219,32 @@ class BlockManager:
         block_id = self.kv.pop()
         self.kv.allocate(block_id)
         return block_id
+
+    def _checkpoint_reserve_units(self, config) -> int:
+        """PAGE units a checkpoint store has to leave for live KV.
+
+        A checkpoint is best-effort; a KV block is not — `_fresh_block` raises
+        when the pool is dry. But a store's units are unreclaimable until the
+        next `complete_previous_state_batch` publishes them, so a burst of
+        stores can empty the free list and the raise lands on whichever live
+        request asks next.
+
+        One batch is exactly how long that window is, so one batch's worth of
+        new blocks is what has to survive it: a chunk of prefill, plus at most
+        one append per running sequence.
+        """
+        batched = int(getattr(config, "max_num_batched_tokens", 0) or 0)
+        seqs = int(getattr(config, "max_num_seqs", 0) or 0)
+        reserve = -(-batched // self.block_size) + seqs
+        # Logged because it is derived, not configured: a zero here says the
+        # batch shape was not readable and the floor is not actually in place.
+        logger.info(
+            "state checkpoint reserve: %d PAGE units (%d prefill + %d append)",
+            reserve,
+            -(-batched // self.block_size),
+            seqs,
+        )
+        return reserve
 
     def _has_page_units(
         self, count: int, protected_checkpoint_hash: int | None = None

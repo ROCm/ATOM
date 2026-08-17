@@ -218,3 +218,66 @@ def test_clear_releases_ready_images_but_defers_a_pinned_reader():
     store.complete_inflight()
     assert not store.records
     assert pool.num_free == 20
+
+
+def test_a_store_leaves_the_reserve_for_live_kv():
+    """A checkpoint is best-effort; the KV block after it is not.
+
+    A store's units are unreclaimable until the next `complete_inflight`, so
+    without a floor a burst empties the free list and `_fresh_block` raises on
+    whichever live request asks next. Dropping the checkpoint is the same
+    answer the pool already gives when nothing can be evicted, one step
+    earlier — and the reason `checkpoints_dropped` exists.
+    """
+    reserve = 12
+    pool = BlockPool(20)
+    spec = PagedStateCheckpointSpec(10, 25, "layout-v1", image_bytes=25)
+    store = PageUnitCheckpointStore(pool, spec, reserve_units=reserve)
+
+    stored = 0
+    for prefix_hash in range(100, 110):
+        if store.begin_store(prefix_hash, src_slot=0) is None:
+            break
+        stored += 1
+        assert pool.num_free >= reserve, "a store dipped under the floor"
+    else:
+        raise AssertionError("the floor never stopped a store")
+
+    assert stored, "the floor stopped the very first store"
+    # Every one of them is COPYING, so nothing above can be reclaimed either:
+    # the floor is all live KV has, and it is still there.
+    assert pool.num_free >= reserve
+    assert store.ensure_free_units(reserve)
+
+
+def test_without_a_reserve_a_burst_can_empty_the_pool():
+    """The behaviour the reserve exists to prevent, pinned so it stays fixed."""
+    pool = BlockPool(6)
+    spec = PagedStateCheckpointSpec(10, 25, "layout-v1", image_bytes=25)
+    store = PageUnitCheckpointStore(pool, spec, reserve_units=0)
+
+    assert store.begin_store(101, src_slot=0) is not None
+    assert store.begin_store(202, src_slot=1) is not None
+
+    # Both are COPYING, so `ensure_free_units` has no victim and a live block
+    # request now fails where a reserve would have kept one in hand.
+    assert pool.num_free == 0
+    assert not store.ensure_free_units(1)
+
+
+def test_the_reserve_does_not_block_a_restore():
+    """Only new images are rationed; reading one back takes no units."""
+    pool = BlockPool(20)
+    spec = PagedStateCheckpointSpec(10, 25, "layout-v1", image_bytes=25)
+    store = PageUnitCheckpointStore(pool, spec, reserve_units=12)
+    ready(store, 101)
+
+    assert store.begin_restore(101, dst_slot=4) is not None
+
+
+def test_a_negative_reserve_is_refused():
+    pool = BlockPool(20)
+    spec = PagedStateCheckpointSpec(10, 25, "layout-v1", image_bytes=25)
+
+    with pytest.raises(ValueError, match="reserve_units"):
+        PageUnitCheckpointStore(pool, spec, reserve_units=-1)
