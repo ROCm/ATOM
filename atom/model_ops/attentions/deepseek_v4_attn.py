@@ -2064,8 +2064,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             and _drafter.uses_confidence_schedule
         )
         if ragged_lens is not None or _dspark_ragged_graph:
-            attn_metadata.dspark_ragged_lens_gpu = torch.as_tensor(
-                extend_lens_np, device=positions.device
+            attn_metadata.dspark_ragged_lens_gpu = self._stage(
+                "v4_dspark_ragged_lens", extend_lens_np.astype(np.int32, copy=False)
             )
             attn_metadata.dspark_full_q = int(full_q)
 
@@ -2254,8 +2254,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             if dspark_ragged:
                 ragged_lens_buf = np.zeros(padded_bs, dtype=np.int32)
                 ragged_lens_buf[:ub_real_reqs] = ub_extend_lens_np
-                attn_metadata.dspark_ragged_lens_gpu = torch.as_tensor(
-                    ragged_lens_buf, device=positions_gpu.device
+                attn_metadata.dspark_ragged_lens_gpu = self._stage(
+                    f"{p}v4_dspark_ragged_lens", ragged_lens_buf
                 )
                 attn_metadata.dspark_full_q = full_q
 
@@ -3784,8 +3784,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             and drafter.uses_confidence_schedule
         ):
             full_q_real = drafter.mtp_k + 1
-            attn_metadata.dspark_ragged_lens_gpu = torch.as_tensor(
-                extend_lens_np, device=positions.device
+            attn_metadata.dspark_ragged_lens_gpu = self._stage(
+                "v4_dspark_ragged_lens", extend_lens_np.astype(np.int32, copy=False)
             )
             attn_metadata.dspark_full_q = int(full_q_real)
 
@@ -3881,6 +3881,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # buffer on every path, forked or not, so the captured decode graph sees
         # a stable address.
         bufs["v4_meta_state_slot_in"] = CpuGpuBuffer(bs, **i32)
+        # DSpark ragged verify lengths are read inside the captured AF attention
+        # core via attn_metadata. Stage them into a fixed-address buffer so graph
+        # replay sees refreshed per-step contents instead of the capture-time
+        # torch.as_tensor allocation.
+        bufs["v4_dspark_ragged_lens"] = CpuGpuBuffer(bs, **i32)
 
         # Phase B: paged-decode index buffers (consumed by Phase C/E).
         # Sized to worst-case decode shape `T = max_bs * (1 + max_spec_steps)`
@@ -4063,6 +4068,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             # V4 decode metadata buffers.
             bufs[f"{p}v4_meta_state_slot_out"] = CpuGpuBuffer(bs, **i32)
             bufs[f"{p}v4_meta_state_slot_in"] = CpuGpuBuffer(bs, **i32)
+            bufs[f"{p}v4_dspark_ragged_lens"] = CpuGpuBuffer(bs, **i32)
             bufs[f"{p}v4_kv_indices_swa"] = CpuGpuBuffer(T_dec * win, **i32)
             bufs[f"{p}v4_kv_indices_csa"] = CpuGpuBuffer(
                 T_dec * (win + self.index_topk), **i32
