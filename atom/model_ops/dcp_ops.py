@@ -385,7 +385,9 @@ def dcp_pack_topk_candidates(
     out_pair[0].copy_(torch.where(valid, sc, torch.full_like(sc, -float("inf"))))
     gid = torch.where(
         valid,
-        dcp_global_pos(local_idx, dcp_rank, dcp_world_size, cp_kv_cache_interleave_size),
+        dcp_global_pos(
+            local_idx, dcp_rank, dcp_world_size, cp_kv_cache_interleave_size
+        ),
         torch.full_like(local_idx, -1),
     )
     out_pair.view(torch.int32)[1].copy_(gid)
@@ -494,11 +496,15 @@ def _compact_filter_dcp_kernel(
         ti_ptr = token_indices_ptr + token_id * ti_stride0 + indice_id * ti_stride1
         tok = tl.load(ti_ptr, mask=col_valid, other=-1)  # GLOBAL position
 
-        idx_valid = col_valid & (tok >= 0) & (((tok // INTERLEAVE) % DCP_WORLD) == DCP_RANK)
+        idx_valid = (
+            col_valid & (tok >= 0) & (((tok // INTERLEAVE) % DCP_WORLD) == DCP_RANK)
+        )
 
         block_id = tok // vbs
         vb = tok % vbs
-        inblock_offset = (vb // (DCP_WORLD * INTERLEAVE)) * INTERLEAVE + (vb % INTERLEAVE)
+        inblock_offset = (vb // (DCP_WORLD * INTERLEAVE)) * INTERLEAVE + (
+            vb % INTERLEAVE
+        )
         physical_block = tl.load(
             block_table + batch_id * bt_stride0 + block_id * bt_stride1,
             mask=idx_valid,
@@ -657,7 +663,9 @@ def _count_owned_dcp_prefill_kernel(
             other=-1,
         )
         pos = indice - base  # position within the sequence
-        owned = col_valid & (indice >= 0) & (((pos // INTERLEAVE) % DCP_WORLD) == DCP_RANK)
+        owned = (
+            col_valid & (indice >= 0) & (((pos // INTERLEAVE) % DCP_WORLD) == DCP_RANK)
+        )
         count += tl.sum(owned.to(tl.int32))
 
     tl.store(out_counts + token_id, count)
@@ -716,11 +724,15 @@ def _compact_filter_dcp_prefill_kernel(
             other=-1,
         )
         pos = indice - base
-        idx_valid = col_valid & (indice >= 0) & (((pos // INTERLEAVE) % DCP_WORLD) == DCP_RANK)
+        idx_valid = (
+            col_valid & (indice >= 0) & (((pos // INTERLEAVE) % DCP_WORLD) == DCP_RANK)
+        )
 
         block_id = pos // vbs
         vb = pos % vbs
-        inblock_offset = (vb // (DCP_WORLD * INTERLEAVE)) * INTERLEAVE + (vb % INTERLEAVE)
+        inblock_offset = (vb // (DCP_WORLD * INTERLEAVE)) * INTERLEAVE + (
+            vb % INTERLEAVE
+        )
         physical_block = tl.load(
             block_table + req_id * bt_stride0 + block_id * bt_stride1,
             mask=idx_valid,

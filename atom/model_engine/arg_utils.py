@@ -479,10 +479,7 @@ class EngineArgs:
                 "Supported keys:\n"
                 '  - "interleave_size": int, KV-cache interleave granularity S: '
                 "token i is stored on DCP rank (i // S) %% W. Default 1 = "
-                "token-level round-robin. Set to block_size for block-level "
-                "interleave (each physical block holds one rank's contiguous "
-                "run), which lets PD-disaggregation pull whole KV blocks "
-                "without in-block token rearrangement. Must divide block_size.\n"
+                "token-level round-robin.\n"
                 "Example:\n"
                 """  '{"interleave_size": 16}'"""
             ),

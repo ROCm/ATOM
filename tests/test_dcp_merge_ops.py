@@ -260,9 +260,9 @@ def test_dcp_owner_and_local_index_match_storage_rule(dcp_size, interleave):
     for i in range(len(pos)):
         r = (i // interleave) % dcp_size
         assert int(owners[i]) == r, f"owner i={i} S={interleave} W={dcp_size}"
-        assert int(local[i]) == _brute_local_index(i, dcp_size, r, interleave), (
-            f"local_index i={i} S={interleave} W={dcp_size}"
-        )
+        assert int(local[i]) == _brute_local_index(
+            i, dcp_size, r, interleave
+        ), f"local_index i={i} S={interleave} W={dcp_size}"
 
 
 @pytest.mark.parametrize("dcp_size", [1, 2, 4, 8])
@@ -275,9 +275,9 @@ def test_dcp_global_pos_inverts_local_index(dcp_size, interleave):
     for g in pos:
         r = int(dcp_owner_rank(g, dcp_size, interleave))
         j = int(dcp_local_index(g, dcp_size, interleave))
-        assert int(dcp_global_pos(j, r, dcp_size, interleave)) == int(g), (
-            f"g={g} S={interleave} W={dcp_size} r={r} j={j}"
-        )
+        assert int(dcp_global_pos(j, r, dcp_size, interleave)) == int(
+            g
+        ), f"g={g} S={interleave} W={dcp_size} r={r} j={j}"
     # And S=1 reduces to the round-robin j*W + r.
     j = pos
     for r in range(dcp_size):
@@ -307,7 +307,9 @@ def test_dcp_local_index_max_equals_local_seq_len(dcp_size, interleave):
         local = dcp_local_index(pos, dcp_size, interleave)
         for r in range(dcp_size):
             owned = local[owners == r]
-            expect = int(get_dcp_local_seq_lens(np.array([L]), dcp_size, r, interleave)[0])
+            expect = int(
+                get_dcp_local_seq_lens(np.array([L]), dcp_size, r, interleave)[0]
+            )
             got = int(owned.max()) + 1 if owned.size else 0
             assert got == expect, f"L={L} r={r} S={interleave} W={dcp_size}"
 
@@ -322,7 +324,7 @@ def test_dcp_slot_matches_vllm_reference(dcp_size, interleave, block_size):
     if block_size % interleave != 0:
         pytest.skip("block_size must be a multiple of cp_kv_cache_interleave_size")
     vbs = block_size * dcp_size
-    for i in range(0, 4 * vbs + 3):
+    for i in range(4 * vbs + 3):
         r = (i // interleave) % dcp_size
         # ours
         loc = dcp_local_index(i, dcp_size, interleave)
@@ -331,13 +333,16 @@ def test_dcp_slot_matches_vllm_reference(dcp_size, interleave, block_size):
         assert loc // block_size == our_blk  # block_size % S == 0 keeps these aligned
         # vLLM reference on the virtual-block offset
         vb_off = i % vbs
-        assert ((vb_off // interleave) % dcp_size == r)
-        ref_loc = (vb_off // (dcp_size * interleave)) * interleave + (vb_off % interleave)
+        assert (vb_off // interleave) % dcp_size == r
+        ref_loc = (vb_off // (dcp_size * interleave)) * interleave + (
+            vb_off % interleave
+        )
         ref_blk = i // vbs + ref_loc // block_size
         ref_off = ref_loc % block_size
-        assert (our_blk, our_off) == (ref_blk, ref_off), (
-            f"i={i} S={interleave} W={dcp_size} bs={block_size}"
-        )
+        assert (our_blk, our_off) == (
+            ref_blk,
+            ref_off,
+        ), f"i={i} S={interleave} W={dcp_size} bs={block_size}"
 
 
 # ─────────────────────────────────────────────────────────────── reorg_kvcache ──
