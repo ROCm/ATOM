@@ -255,6 +255,8 @@ else
   export SLURM_ERROR="${LOG_ROOT}/slurm-%j.err"
 fi
 SLURM_LOG_POLL_INTERVAL="${SLURM_LOG_POLL_INTERVAL:-30}"
+SLURM_ACCOUNTING_TIMEOUT="${SLURM_ACCOUNTING_TIMEOUT:-30}"
+SLURM_ACCOUNTING_POLL_INTERVAL="${SLURM_ACCOUNTING_POLL_INTERVAL:-2}"
 USES_SPUR_CONTROLLER=0
 if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-crusoe-mi355" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi355-crusoe" ]]; then
   USES_SPUR_CONTROLLER=1
@@ -560,7 +562,7 @@ monitor_slurm_job() {
 
 read_slurm_exit_code() {
   local job_id="$1"
-  local sacct_line exit_status exit_signal
+  local sacct_line exit_status exit_signal deadline
 
   SLURM_STATE="unknown"
   SLURM_EXIT_CODE="unknown"
@@ -571,16 +573,21 @@ read_slurm_exit_code() {
     return 0
   fi
 
-  if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
-    sacct_line="$(sacct --account "${SLURM_ACCOUNT}" --brief --noheader 2>/dev/null | awk -v job_id="${job_id}" '$1 == job_id { print $2 "|" $3; exit }' || true)"
-  else
-    sacct_line="$(sacct -j "${job_id}" -X -n -P -o State,ExitCode 2>/dev/null | awk -F'|' 'NF { print; exit }' || true)"
-  fi
+  deadline=$(( $(date +%s) + SLURM_ACCOUNTING_TIMEOUT ))
+  while true; do
+    if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
+      sacct_line="$(sacct --account "${SLURM_ACCOUNT}" --brief --noheader 2>/dev/null | awk -v job_id="${job_id}" '$1 == job_id { print $2 "|" $3; exit }' || true)"
+    else
+      sacct_line="$(sacct -j "${job_id}" -X -n -P -o State,ExitCode 2>/dev/null | awk -F'|' 'NF { print; exit }' || true)"
+    fi
+    [[ -n "${sacct_line}" ]] && break
 
-  if [[ -z "${sacct_line}" ]]; then
-    echo "ERROR: unable to read final Slurm state for job ${job_id}" >&2
-    return 0
-  fi
+    if [[ "$(date +%s)" -ge "${deadline}" ]]; then
+      echo "ERROR: unable to read final Slurm state for job ${job_id} after ${SLURM_ACCOUNTING_TIMEOUT}s" >&2
+      return 0
+    fi
+    sleep "${SLURM_ACCOUNTING_POLL_INTERVAL}"
+  done
 
   SLURM_STATE="${sacct_line%%|*}"
   SLURM_STATE="${SLURM_STATE%%+*}"
