@@ -1443,25 +1443,37 @@ class ModelRunner:
     def _num_draft_kv_layers(self) -> int:
         """How many KV cache slots the draft model needs, one per draft layer.
 
-        A draft with a REAL layer stack — the Eagle3 drafts and the standalone
-        DSpark drafts — runs every one of its layers on every drafting step, so
-        each needs its own slot. Serial MTP instead reuses one layer `mtp_k`
-        times and declares how many it has in `num_nextn_predict_layers`.
+        A draft with a REAL layer stack — Eagle3, standalone DSpark drafts
+        (--draft-model), and integrated V4-Pro-DSpark — runs every one of its
+        layers on every drafting step, so each needs its own slot. Serial MTP
+        instead reuses one layer `mtp_k` times and declares how many it has in
+        ``num_nextn_predict_layers``.
 
         Single source of truth on purpose: this count drives both the pool
         sizing (`_get_local_total_num_layers` -> the builders' `sub_pool_specs`)
         and the allocation itself. Two independent spellings of it silently
         disagreed for the standalone DSpark draft, sizing 1 slot while
-        allocating 5.
+        allocating 5; integrated DSpark had the same bug via ``num_nextn=1``.
         """
         spec_config = self.config.speculative_config
         draft_hf = spec_config.draft_model_hf_config
-        has_real_stack = (
-            hasattr(self, "eagle3_draft_builder")
-            or getattr(spec_config, "use_dspark_with_draft", lambda: False)()
-        )
-        if has_real_stack:
+        if hasattr(self, "eagle3_draft_builder"):
             return draft_hf.num_hidden_layers
+        if getattr(spec_config, "use_dspark_with_draft", lambda: False)():
+            return draft_hf.num_hidden_layers
+        if getattr(spec_config, "use_dspark", lambda: False)():
+            dspark_layers = int(getattr(draft_hf, "dspark_num_layers", 0) or 0)
+            if dspark_layers > 0:
+                return dspark_layers
+            drafter_model = getattr(getattr(self, "drafter", None), "model", None)
+            num_stages = getattr(drafter_model, "num_stages", None)
+            if num_stages:
+                return int(num_stages)
+            from atom.models.deepseek_v4_dspark import _count_dspark_stages
+
+            counted = _count_dspark_stages(getattr(self.config, "model", None))
+            if counted > 0:
+                return counted
         return getattr(draft_hf, "num_nextn_predict_layers", 1)
 
     def _get_local_num_target_layers(self) -> int:

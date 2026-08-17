@@ -64,7 +64,9 @@ def _builder(
         is_deepseek_v32=True,
         _get_local_total_num_layers=lambda: total_local_layers,
         _get_local_num_target_layers=lambda: 3,
-        _num_draft_kv_layers=lambda: max(0, total_local_layers - 3),
+        # Global draft-layer count (ModelRunner._num_draft_kv_layers), not the
+        # PP-local row count (_get_local_total_num_layers - target_layers).
+        _num_draft_kv_layers=lambda: 1,
     )
     builder = object.__new__(AiterMLAMetadataBuilder)
     builder.model_runner = runner
@@ -98,6 +100,26 @@ def test_local_total_layers_adds_mtp_only_on_drafter_stage(monkeypatch):
         lambda: SimpleNamespace(rank_in_group=1, world_size=2),
     )
     assert runner._get_local_total_num_layers() == 5
+
+
+def test_num_draft_kv_layers_counts_integrated_dspark_stages():
+    from atom.model_engine.model_runner import ModelRunner
+
+    runner = object.__new__(ModelRunner)
+    runner.config = SimpleNamespace(
+        model="/data/DeepSeek-V4-Pro-DSpark",
+        hf_config=SimpleNamespace(num_hidden_layers=61),
+        speculative_config=SimpleNamespace(
+            draft_model_hf_config=SimpleNamespace(
+                dspark_block_size=8,
+                dspark_num_layers=3,
+                num_nextn_predict_layers=1,
+            ),
+            use_dspark_with_draft=lambda: False,
+            use_dspark=lambda: True,
+        ),
+    )
+    assert runner._num_draft_kv_layers() == 3
 
 
 def test_pp_index_cache_layout_uses_global_layer_ids(monkeypatch):
