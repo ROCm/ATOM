@@ -3729,14 +3729,14 @@ class ModelRunner:
             return True
         return False
 
-    def _capture_attn_core_ragged_combos(
+    def _capture_attn_ffn_graphs(
         self, bs, max_q_len, rectangle_tokens, build_capture, input_ids
     ):
-        """AF_PIECEWISE: capture the attn-core graphs for the smaller ragged buckets
+        """AF_PIECEWISE: capture the attn_ffn graphs for the smaller ragged buckets
         (num_tokens_pad = b*max_q_len < this bs's rectangle) a real ragged step at
         this bs may replay. Runs one PIECEWISE forward per new bucket on a ragged
         synthetic batch: dense pieces REPLAY (already captured, deduped by
-        num_tokens); the attn-core op captures its fresh (bs, q_eff, num_tokens_pad)
+        num_tokens); the attn_ffn op captures its fresh (bs, q_eff, num_tokens_pad)
         key. The rectangle bucket was already captured by the caller.
         """
         positions = self.forward_vars["positions"].gpu
@@ -3773,7 +3773,7 @@ class ModelRunner:
                 in_hipgraph=True,
             )
             # Warmup, then the PIECEWISE forward: dense pieces replay (deduped by
-            # num_tokens); attn-core op captures its (bs, q_eff, num_tokens_pad) graph.
+            # num_tokens); attn_ffn op captures its (bs, q_eff, num_tokens_pad) graph.
             self.model(input_ids[:num_tokens_dp], model_positions)
             fc = get_forward_context()
             fc.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
@@ -4018,10 +4018,9 @@ class ModelRunner:
                         fc.cudagraph_runtime_mode = CUDAGraphMode.NONE
                         fc.batch_descriptor = None
                         self._piecewise_captured_tokens.add(num_tokens)
-                        # also capture attn-core for this bs's ragged combos
-                        # (see _capture_attn_core_ragged_combos)
+                        # also capture the attn_ffn graphs this bs can replay ragged
                         if attn_ffn_piecewise and supports_ragged_capture:
-                            self._capture_attn_core_ragged_combos(
+                            self._capture_attn_ffn_graphs(
                                 bs=bs,
                                 max_q_len=max_q_len,
                                 rectangle_tokens=num_tokens,
