@@ -350,11 +350,9 @@ class ScheduledBatch:
     ):
         if scheduled_spec_decode_tokens is None:
             scheduled_spec_decode_tokens = {}
-        # Defaults so these attrs always exist (set for real in the num_spec_step
-        # branch below; only read there). spec_decode_req_ids[r] = seq id of row r
-        # in the compacted scheduled_spec_decode_tokens array.
+        # Default so the attr always exists (set for real in the num_spec_step
+        # branch below; only read there).
         self.scheduled_spec_decode_tokens: np.ndarray | None = None
-        self.spec_decode_req_ids: list[int] = []
         self.remote_kv_block_ids = remote_kv_block_ids or []
         self.remote_kv_seq_blocks = remote_kv_seq_blocks or {}
 
@@ -476,11 +474,6 @@ class ScheduledBatch:
                     continue
                 width = min(drafts.size, num_spec_step)
                 self.scheduled_spec_decode_tokens[i, :width] = drafts[:width]
-            # The array is DENSE (one row per seq, filled by batch position
-            # above), so row r IS batch position r and a no-draft seq keeps its
-            # own zero row. Name the rows anyway: a consumer that maps seq ->
-            # row by id stays correct if the layout ever goes back to compacted.
-            self.spec_decode_req_ids = list(self.req_ids)
         self.block_tables = [
             seq.block_table for seq in seqs.values() if seq.block_table
         ]
