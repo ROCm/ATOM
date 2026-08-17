@@ -97,10 +97,6 @@ crusoe_runner_labels = {
     "atomesh-cicd-crusoe-mi355",
     "atomesh-cicd-mi355-crusoe",
 }
-if slurm_submit_runner in crusoe_runner_labels:
-    default_spur_accounting_addr = "http://crs-m2m-cpu-spur-005.crusoe.amd.com:6819"
-else:
-    default_spur_accounting_addr = "http://134.199.196.72:6819"
 if not spur_controller_addr:
     if slurm_submit_runner in crusoe_runner_labels:
         spur_controller_addr = "http://crs-m2m-cpu-spur-005.crusoe.amd.com:6817"
@@ -231,10 +227,6 @@ exports = {
     "SLURM_TIME_LIMIT": runner.get("time_limit", "06:00:00"),
     "SLURM_LOG_ROOT": runner.get("log_root", "/it-share/ATOMESH_LOG/"),
     "SPUR_CONTROLLER_ADDR": spur_controller_addr,
-    "SPUR_ACCOUNTING_ADDR": runner.get(
-        "spur_accounting_addr",
-        os.environ.get("SPUR_ACCOUNTING_ADDR", default_spur_accounting_addr),
-    ),
 }
 
 for key, value in exports.items():
@@ -278,9 +270,6 @@ echo "slurm_job_name=${SLURM_JOB_NAME}"
 echo "log_root=${LOG_ROOT}"
 if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
   echo "spur_controller=${SPUR_CONTROLLER_ADDR}"
-fi
-if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
-  echo "spur_accounting=${SPUR_ACCOUNTING_ADDR}"
 fi
 
 mkdir -p "${RESULT_DIR}"
@@ -583,15 +572,18 @@ read_slurm_exit_code() {
   fi
 
   if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
-    sacct_line="$(sacct --accounting "${SPUR_ACCOUNTING_ADDR}" --brief --noheader 2>/dev/null | awk -v job_id="${job_id}" '$1 == job_id { print $2 "|" $3; exit }' || true)"
+    sacct_line="$(sacct --account "${SLURM_ACCOUNT}" --brief --noheader 2>/dev/null | awk -v job_id="${job_id}" '$1 == job_id { print $2 "|" $3; exit }' || true)"
   else
     sacct_line="$(sacct -j "${job_id}" -X -n -P -o State,ExitCode 2>/dev/null | awk -F'|' 'NF { print; exit }' || true)"
   fi
+
   if [[ -z "${sacct_line}" ]]; then
+    echo "ERROR: unable to read final Slurm state for job ${job_id}" >&2
     return 0
   fi
 
   SLURM_STATE="${sacct_line%%|*}"
+  SLURM_STATE="${SLURM_STATE%%+*}"
   SLURM_EXIT_CODE="${sacct_line##*|}"
   exit_status="${SLURM_EXIT_CODE%%:*}"
   exit_signal="${SLURM_EXIT_CODE##*:}"
