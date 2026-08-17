@@ -480,56 +480,59 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         # assert not moe.use_flashinfer_cutlass_kernels, "Must be created in modelopt.py"
         if moe.use_mori_kernels:
             assert quant_config is not None
+
+            from atom.model_ops.fused_moe.mori_prepare_finalize import (
+                resolve_mori_dispatch,
+            )
+
+            # One branch decides the whole wire format: the dtype dispatch() will
+            # see (which is what selects the MoRI kernel), the pre-dispatch
+            # quantizer, and the staging scale geometry. Keeping these together is
+            # load-bearing -- a scale_dim/scale_type_size that disagrees with what
+            # prepare() sends makes MoRI stride the staging scale buffer wrong and
+            # walk off the end of it (GPU memory fault on the first real batch).
+            dispatch_format = resolve_mori_dispatch(
+                in_dtype=moe.in_dtype,
+                hidden_dim=moe.hidden_dim,
+                quant_config=quant_config,
+            )
+            mori_dtype = dispatch_format.dtype
+            scale_type_size = dispatch_format.scale_type_size
             # For PTPC (per token per channel) quant, the scale dim for each token is 1
             # For 1x128 quant, the scale dim for each token is hidden_dim // 128
-            scale_dim = 1 if quant_config.is_per_act_token else moe.hidden_dim // 128
-
-            # Check if quant_dtype is an FP8 type
-            from aiter import QuantType
-
-            fp8_dtypes = (
-                torch.float8_e4m3fn,
-                torch.float8_e4m3fnuz,
-                torch.float8_e5m2,
-                torch.float8_e5m2fnuz,
+            scale_dim = (
+                dispatch_format.scale_dim
+                if dispatch_format.is_fp4
+                else (1 if quant_config.is_per_act_token else moe.hidden_dim // 128)
             )
-            is_fp8 = quant_config.quant_dtype in fp8_dtypes
-            # For FP8: enable FP8 dispatch in Mori (quantize before communication)
-            # Note: per_Tensor quant doesn't support num_local_tokens, so we use per_Token
-            use_fp8_dispatch = is_fp8
-            quant_type = None
-            if use_fp8_dispatch:
-                if quant_config.is_block_quantized:
-                    quant_type = QuantType.per_1x128
-                elif quant_config.is_per_act_token:
-                    quant_type = QuantType.per_Token
+            # Combine-side codec, passed through aiter's all2all manager into the
+            # MoRI config. "none" (the MoRI default) sends bf16 back; "fp8_blockwise"
+            # selects EpCombineIntraNodeKernel_*_fp8bwq_*. Independent of the dispatch
+            # dtype above -- MoRI infers dispatch from the tensor, combine from this.
+            mori_combine_quant_type = envs.ATOM_MORI_COMBINE_QUANT
 
-            # For FP8: use FP8 dtype for communication
-            # For FP4/no quant: use bfloat16
-            # mori_dtype = (
-            #     quant_config.quant_dtype
-            #     if is_fp8 and quant_type is not None
-            #     else torch.bfloat16
-            # )
-            # mori_dtype = torch.bfloat16
-
-            all_to_all_args = dict(
-                rank=all2all_manager.rank,
-                num_ep_ranks=all2all_manager.world_size,
-                # quant_dtype=mori_dtype,
-                # We now use bfloat16 for mori
-                # TODO: To support quant
-                quant_dtype=moe.in_dtype,
-                token_hidden_size=moe.hidden_dim,
-                scale_dim=scale_dim,
-                scale_type_size=torch.float32.itemsize,
-                max_num_tokens_per_dp_rank=moe.max_num_tokens,
+            all_to_all_args = {
+                "rank": all2all_manager.rank,
+                "num_ep_ranks": all2all_manager.world_size,
+                # Must be dispatch_format.dtype: MoRI sizes its staging buffers
+                # from this and picks the kernel from the tensor prepare() sends.
+                "quant_dtype": mori_dtype,
+                "token_hidden_size": moe.hidden_dim,
+                "scale_dim": scale_dim,
+                "scale_type_size": scale_type_size,
+                "max_num_tokens_per_dp_rank": moe.max_num_tokens,
                 # input_dtype=moe.in_dtype,
-                input_dtype=moe.in_dtype,
-                num_local_experts=moe.num_experts // all2all_manager.world_size,
-                num_experts_per_token=moe.experts_per_token,
-                gpu_per_node=moe.moe_parallel_config.local_ep_size,
-            )
+                "input_dtype": moe.in_dtype,
+                "num_local_experts": moe.num_experts // all2all_manager.world_size,
+                "num_experts_per_token": moe.experts_per_token,
+                "gpu_per_node": moe.moe_parallel_config.local_ep_size,
+            }
+            if mori_combine_quant_type != "none":
+                # Only inject when actually requested: aiter's _make_all2all_kwargs
+                # takes fixed named params, so an unpatched aiter raises TypeError on
+                # an unexpected "quant_type" kwarg.
+                all_to_all_args["quant_type"] = mori_combine_quant_type
+
             from atom.utils.tbo.ubatching import tbo_enabled
 
             handle = all2all_manager.get_handle(all_to_all_args)
@@ -537,24 +540,22 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             atom_config = get_current_atom_config()
             low_latency = getattr(atom_config, "enable_low_latency", False)
 
-            # We not use quant for mori now
-            use_fp8_dispatch = False
-            quant_type = None
-
-            common_args = dict(
-                rank=all2all_manager.rank,
-                world_size=all2all_manager.world_size,
-                hidden_dim=moe.hidden_dim,
-                scale_dim=scale_dim,
+            common_args = {
+                "rank": all2all_manager.rank,
+                "world_size": all2all_manager.world_size,
+                "hidden_dim": moe.hidden_dim,
+                "scale_dim": scale_dim,
                 # Match max_num_tokens_per_dp_rank / max_tokens_per_rank (= moe.max_num_tokens);
                 # leaving this hardcoded 16384 truncates the TBO mori buffer at mbt>16384.
-                max_num_inp_token_per_rank=moe.max_num_tokens,
-                num_local_experts=moe.num_experts // all2all_manager.world_size,
-                num_experts_per_token=moe.experts_per_token,
-                gpu_per_node=moe.moe_parallel_config.local_ep_size,
-                data_type_itemsize=moe.in_dtype.itemsize,
-                max_token_type_size=moe.in_dtype.itemsize,
-            )
+                "max_num_inp_token_per_rank": moe.max_num_tokens,
+                "num_local_experts": moe.num_experts // all2all_manager.world_size,
+                "num_experts_per_token": moe.experts_per_token,
+                "gpu_per_node": moe.moe_parallel_config.local_ep_size,
+                "data_type_itemsize": moe.in_dtype.itemsize,
+                "max_token_type_size": moe.in_dtype.itemsize,
+                "scale_type_size": scale_type_size,
+                "quant_type": mori_combine_quant_type,
+            }
 
             tbo_mori_ops = None
             sync_handle = handle  # IntraNode handle for prefill (sync path)
@@ -577,8 +578,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 sync_handle,
                 max_tokens_per_rank=moe.max_num_tokens,
                 num_dispatchers=all2all_manager.world_size,
-                use_fp8_dispatch=use_fp8_dispatch,
-                quant_type=quant_type,
+                dispatch_format=dispatch_format,
                 is_async=is_async,
                 tbo_mori_ops=tbo_mori_ops,
                 low_latency=low_latency,
