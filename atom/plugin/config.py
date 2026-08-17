@@ -1,6 +1,7 @@
 import copy
 import json
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -13,6 +14,20 @@ logger = logging.getLogger("atom")
 # vLLM does not expose a stable prefill/decode flag for MORI launch-config
 # selection, so use a plugin-scoped token-count threshold instead
 VLLM_MORI_LAUNCH_CONFIG_TOKEN_THRESHOLD = 4096
+
+
+def _get_sglang_tbo_flags(enable_two_batch_overlap: bool) -> tuple[bool, bool]:
+    """Translate SGLang's TBO switch and ATOM mode into ATOM config flags."""
+    if not enable_two_batch_overlap:
+        return False, False
+
+    mode = os.getenv("SGLANG_ATOM_TBO_MODE", "all").strip().lower()
+    if mode not in {"prefill", "all"}:
+        raise ValueError(
+            f"SGLANG_ATOM_TBO_MODE must be one of {{'prefill', 'all'}}, got {mode!r}"
+        )
+
+    return True, mode == "all"
 
 
 @dataclass
@@ -156,7 +171,7 @@ def _normalize_sglang_parallel_config(
 
         if attn_cp_size <= 1:
             raise ValueError(
-                "SGLang+ATOM PCP requires attn_cp_size > 1, got " f"{attn_cp_size}"
+                f"SGLang+ATOM PCP requires attn_cp_size > 1, got {attn_cp_size}"
             )
         if tp_size % attn_cp_size != 0:
             raise ValueError(
@@ -537,6 +552,16 @@ def _generate_atom_config_from_sglang_config(config: Any):
     else:
         atom_enable_dp_attention = server_args.enable_dp_attention
 
+    atom_enable_tbo, atom_enable_tbo_decode = _get_sglang_tbo_flags(
+        server_args.enable_two_batch_overlap
+    )
+    if atom_enable_tbo:
+        logger.info(
+            "SGLang+ATOM TBO mode: prefill=%s, decode=%s",
+            atom_enable_tbo,
+            atom_enable_tbo_decode,
+        )
+
     max_num_batched_tokens = max(
         int(getattr(server_args, "max_prefill_tokens", 0) or 0),
         int(getattr(server_args, "chunked_prefill_size", 0) or 0),
@@ -572,6 +597,8 @@ def _generate_atom_config_from_sglang_config(config: Any):
         enable_expert_parallel=bool(server_args.ep_size > 1),
         master_addr=None,
         enable_dp_attention=atom_enable_dp_attention,
+        enable_tbo=atom_enable_tbo,
+        enable_tbo_decode=atom_enable_tbo_decode,
         plugin_config=plugin_config,
         online_quant_config=online_quant_config,
         hf_overrides=hf_overrides,

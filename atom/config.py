@@ -1484,14 +1484,15 @@ class Config:
             # uses the round-robin CP (cprr) MLA kernel, which is persistent-only
             # and ships only on gfx950; on gfx942 the non-persistent fallback
             # ignores the cprr masking and silently produces WRONG output.
-            from aiter.jit.utils.chip_info import get_gfx
+            if self.speculative_config is not None:
+                from aiter.jit.utils.chip_info import get_gfx
 
-            gfx = get_gfx()
-            assert gfx == "gfx950", (
-                f"Speculative decode + DCP is only supported on gfx950 (needs "
-                f"the persistent cprr MLA kernel); got {gfx}. Disable DCP or "
-                f"speculative decode on this GPU."
-            )
+                gfx = get_gfx()
+                assert gfx == "gfx950", (
+                    f"Speculative decode + DCP is only supported on gfx950 (needs "
+                    f"the persistent cprr MLA kernel); got {gfx}. Disable DCP or "
+                    f"speculative decode on this GPU."
+                )
         assert 1 <= self.pipeline_parallel_size
         self.hf_config = get_hf_config(
             self.model, trust_remote_code=self.trust_remote_code

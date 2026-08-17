@@ -1201,18 +1201,24 @@ class ModelRunner:
 
         num_seqs = min(warmup_max_tokens // max_model_len, self.config.max_num_seqs)
 
-        if num_seqs == 0:
-            num_seqs = 1
-            seq_len = min(warmup_max_tokens, max_model_len)
-            if seq_len == 0:
-                seq_len = 1
+        # torch.compile's mark_dynamic can't make a size-1 batch dim dynamic, so
+        # a DSpark block drafter (rows == num_seqs) must first-compile at B >= 2
+        # (EAGLE gets that free -- its first draft step is a many-row prefill).
+        # Other cases only need the usual >= 1 floor.
+        drafter = getattr(self, "drafter", None)
+        min_seqs = 2 if getattr(drafter, "is_block_drafter", False) else 1
+        num_seqs = max(num_seqs, min_seqs)
+
+        # Split the token budget across the seqs so >1 sequences never exceed it
+        # (peak memory unchanged); a lone seq keeps up to max_model_len.
+        seq_len = max(1, min(max_model_len, warmup_max_tokens // num_seqs))
+
+        if warmup_max_tokens < max_model_len:
             logger.warning(
                 f"{self.label}: dp_size={dp_size}, dp_attn={self.config.enable_dp_attention}, "
                 f"warmup_max_tokens={warmup_max_tokens} < max_model_len={max_model_len}. "
-                f"Using {num_seqs} seq with length {seq_len} for warmup."
+                f"Using {num_seqs} seq(s) with length {seq_len} for warmup."
             )
-        else:
-            seq_len = max_model_len
 
         seqs = [
             Sequence(
@@ -1750,10 +1756,12 @@ class ModelRunner:
         # Active Slots are reserved; PAGE checkpoints borrow from the paged pool.
         max_model_len = config.max_model_len
         cap = config.max_num_seqs
+        dcp_w = max(1, getattr(config, "decode_context_parallel_size", 1) or 1)
         pct_lines = []
         for pct in (10, 30, 50, 70, 90, 100):
             ctx = max(1, max_model_len * pct // 100)
-            blocks_per_req = math.ceil(ctx / self.block_size)
+            local_ctx = math.ceil(ctx / dcp_w)
+            blocks_per_req = math.ceil(local_ctx / self.block_size)
             block_bound = (
                 num_kvcache_blocks // blocks_per_req if blocks_per_req > 0 else 0
             )
@@ -1761,14 +1769,17 @@ class ModelRunner:
             bound_label = (
                 "slots" if cap > 0 and max_conc == cap < block_bound else "blocks"
             )
+            local_note = f" (local {local_ctx:>7})" if dcp_w > 1 else ""
             pct_lines.append(
-                f"  {pct:>3}% ({ctx:>7} tok): {blocks_per_req:>6} blk/req "
+                f"  {pct:>3}% ({ctx:>7} tok){local_note}: {blocks_per_req:>6} blk/req "
                 f"→ max_concurrent={max_conc:<5} (bound by {bound_label})"
             )
         logger.info(
             f"Concurrent capacity vs context length "
             f"(max_model_len={max_model_len}, block_size={self.block_size}, "
-            f"max_slots={cap}, pool_blocks={num_kvcache_blocks}):\n"
+            f"max_slots={cap}, pool_blocks={num_kvcache_blocks}"
+            + (f", dcp={dcp_w} (blk/req is per-rank)" if dcp_w > 1 else "")
+            + "):\n"
             + "\n".join(pct_lines)
         )
 

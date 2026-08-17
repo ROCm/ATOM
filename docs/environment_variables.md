@@ -65,6 +65,21 @@ no wall-clock skew). See `atom/model_engine/prefill_delayer.py`. Active only whe
 | **ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM** | bool | 0 (false) | If set to `1`, use AITER Triton FP4 GEMM with non-shuffled weights. Takes precedence over the FP4 preshuffled GEMM path selected by `ATOM_USE_TRITON_GEMM`. |
 | **ATOM_USE_TRITON_MXFP4_BMM** | bool | 0 (false) | If set to `1`, use FP4 BMM in MLA attention module. |
 
+## MoE all2all (MoRI) wire format
+
+Both are opt-in and default to off; they only apply with DP attention + expert
+parallelism. They are *not* symmetric — FP4 dispatch only moves a quantization
+the MoE GEMM was going to perform anyway (it consumes FP4 activations either
+way, and `per_1x32` is per-row, so it does not matter which rank runs it), while
+FP8 combine adds a quantization that would not otherwise happen, since the
+expert output is bf16. Treat the dispatch knob as format matching and the
+combine knob as a quality/throughput tradeoff.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_MORI_FP4_DISPATCH** | bool | 0 (false) | If set to `1`, quantize activations to packed FP4 (E2M1, `per_1x32`) before the MoE all2all instead of sending bf16 — a quarter of the bytes on the dispatch wire — which selects `EpDispatchIntraNodeKernel_fp4`. MoRI picks its dispatch kernel from the dtype of the tensor handed to `dispatch()` but sizes its staging buffers from the config built at init, so this also switches `scale_dim` to `hidden_dim/32` and the scale type to e8m0. All three are resolved together by `mori_prepare_finalize.resolve_mori_dispatch()`; never set one without the others, as a mismatch strides the staging scale buffer wrong and faults on the first real batch instead of erroring cleanly. |
+| **ATOM_MORI_COMBINE_QUANT** | str | `none` | Combine-side codec passed into the MoRI config. `none` returns bf16; `fp8_blockwise` selects `EpCombineIntraNodeKernel_*_fp8bwq_*`; MoRI also accepts `fp8_direct_cast`. |
+
 ## Fusion passes
 
 ### TP AllReduce fusion
