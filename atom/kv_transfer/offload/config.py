@@ -21,6 +21,8 @@ from math import isfinite
 from numbers import Integral
 from typing import Any
 
+import torch
+
 # Version 2 adds explicit DSV4 KV/index dimensions and DCP virtual-block byte
 # mapping to the PAGE identity. Keeping it separate prevents version-1 objects
 # from being reused after the layout correction.
@@ -98,6 +100,8 @@ def select_offload_layout(config) -> str:
 def _stable_config_value(value: Any) -> Any:
     if value is None or isinstance(value, (bool, int, str)):
         return value
+    if isinstance(value, torch.dtype):
+        return str(value)
     if isinstance(value, float):
         if not isfinite(value):
             raise ValueError("PAGE namespace config values must be finite")

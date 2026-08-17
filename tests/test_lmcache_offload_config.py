@@ -58,6 +58,20 @@ def test_page_namespace_is_stable_for_equivalent_config():
     assert first.startswith("org/model::atom-page-v")
 
 
+def test_page_namespace_supports_torch_dtype_in_speculative_config():
+    torch = pytest.importorskip("torch")
+    config = _config()
+    config.speculative_config.draft_model_hf_config = SimpleNamespace(
+        torch_dtype=torch.bfloat16
+    )
+
+    bf16_namespace = offcfg.build_page_namespace(config, _lmcache_config(), 4)
+    config.speculative_config.draft_model_hf_config.torch_dtype = torch.float16
+    fp16_namespace = offcfg.build_page_namespace(config, _lmcache_config(), 4)
+
+    assert bf16_namespace != fp16_namespace
+
+
 @pytest.mark.parametrize(
     "mutate",
     [
