@@ -94,6 +94,129 @@ def replayssm_buffer_shapes(
 
 
 # --------------------------------------------------------------------------- #
+# Record replay                                                                #
+# --------------------------------------------------------------------------- #
+#
+# Unrolling the recurrence over the h committed records,
+#
+#     S_{j+1} = diag(exp(g_j)) S_j + u_j (x) k_j
+#
+# leaves a form with no sequential dependency in it at all:
+#
+#     S_h = exp(C) * S_0 + sum_j exp(C - C_j) * u_j (x) k_j,   C_j = sum_{i<=j} g_i
+#
+# so the replay is ONE diagonal scale plus ONE GEMM rather than h dependent
+# rank-1 updates.  What makes this legal is that the buffer stores `u` (already
+# delta-corrected) and not raw `v`: with `v`, each `u_j = beta_j (v_j - S_{j-1}^T
+# k_j)` would depend on the previous state and the chain could not be cut.
+#
+# This is not a micro-optimisation.  The serial form measured 4.95 us per record
+# at K = V = 128 -- not bandwidth, but h dependent full-tile multiplies with no
+# instruction-level parallelism to hide the latency.  Against a 23 us baseline
+# step at T=1 (mean h ~7.5) that made plain decoding 8% SLOWER than the kernel
+# ReplaySSM is supposed to beat, which is the opposite of the whole point:
+# skipping the state write-back on 14 of every 15 steps is only a win if
+# rebuilding is cheap.
+
+
+@triton.jit
+def _replay_tiles(
+    buf_k,
+    buf_u,
+    buf_g,
+    slot,
+    h,
+    stride_bufk_slot,
+    stride_bufk_pos,
+    stride_bufu_slot,
+    stride_bufu_pos,
+    stride_bufg_slot,
+    stride_bufg_pos,
+    i_hv,
+    o_k,
+    o_v,
+    mask_k,
+    mask_v,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BH: tl.constexpr,
+    IS_KDA: tl.constexpr,
+):
+    """The h committed records as dense `[BH, *]` tiles, ready for one GEMM.
+
+    Returns ``(b_kw, b_u, b_decay)`` with ``b_kw[j] = exp(C - C_j) * k_j``,
+    ``b_u[j] = u_j`` and ``b_decay = exp(C)``, the factor the incoming
+    checkpoint is scaled by.
+
+    Rows ``j >= h`` are zeroed rather than skipped, so they contribute nothing
+    to the GEMM and no caller has to branch on how many records were live.
+    Their gate loads default to 0, which leaves both the running sum and the
+    total untouched -- `b_ctot` is the sum over the whole tile precisely
+    because the padding is additively neutral.
+    """
+    o_h = tl.arange(0, BH)
+    m_h = o_h < h
+
+    if IS_KDA:
+        b_g = tl.load(
+            buf_g
+            + slot * stride_bufg_slot
+            + o_h[:, None] * stride_bufg_pos
+            + i_hv * K
+            + o_k[None, :],
+            mask=m_h[:, None] & mask_k[None, :],
+            other=0.0,
+        ).to(tl.float32)
+    else:
+        # Scalar gate: broadcast the per-record value across K so the cumsum
+        # and the weighting below stay one code path. BH is small (16-64) and
+        # the tile is dwarfed by the [BK, BV] state, so the waste is not worth
+        # a second branch.
+        b_g1 = tl.load(
+            buf_g + slot * stride_bufg_slot + o_h * stride_bufg_pos + i_hv,
+            mask=m_h,
+            other=0.0,
+        ).to(tl.float32)
+        b_g = b_g1[:, None] + tl.zeros([BH, BK], dtype=tl.float32)
+
+    # Gates are log-decays (<= 0), so C - C_j <= 0 and every weight is in (0, 1]
+    # -- the exponentials cannot overflow however long the buffer gets.
+    b_c = tl.cumsum(b_g, axis=0)
+    b_ctot = tl.sum(b_g, axis=0)
+    b_w = exp(b_ctot[None, :] - b_c)
+
+    b_k = tl.load(
+        buf_k
+        + slot * stride_bufk_slot
+        + o_h[:, None] * stride_bufk_pos
+        + i_hv * K
+        + o_k[None, :],
+        mask=m_h[:, None] & mask_k[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    b_u = tl.load(
+        buf_u
+        + slot * stride_bufu_slot
+        + o_h[:, None] * stride_bufu_pos
+        + i_hv * V
+        + o_v[None, :],
+        mask=m_h[:, None] & mask_v[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    # fp32 operands, fp32 accumulation. A plain bf16 cast runs the contraction on
+    # the matrix cores (CDNA does fp32 MFMA at an eighth of the bf16 rate) and
+    # measured ~20 points faster, but it broke 17 of the 27 differential tests.
+    # Splitting each operand into bf16 hi+lo and summing four products restores
+    # the accuracy -- and gives back the speed with it: measured indistinguishable
+    # from this single fp32 dot both in the microbenchmark (+17% vs +15% over the
+    # aiter kernel, inside the 6% run-to-run spread) and end to end (-7.2%, +3.3%,
+    # +4.5% across conc 32/64/128, no consistent direction). Four dots plus the
+    # hi/lo decomposition is not worth carrying for a wash.
+    return b_k * b_w, b_u, exp(b_ctot)
+
+
+# --------------------------------------------------------------------------- #
 # Commit kernel -- runs once per forward, shared by every linear-attn layer    #
 # --------------------------------------------------------------------------- #
 
@@ -178,6 +301,7 @@ def _replayssm_fwd_kernel(
     V: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
+    BH: tl.constexpr,
     stride_ckpt_slot: tl.constexpr,
     stride_bufk_slot: tl.constexpr,
     stride_bufk_pos: tl.constexpr,
@@ -219,25 +343,32 @@ def _replayssm_fwd_kernel(
     p_ckpt_hv = p_ckpt + o_k[:, None] * V + o_v[None, :]
     b_h = tl.load(p_ckpt_hv, mask=mask_h, other=0.0).to(tl.float32)
 
-    for j in range(h):
-        p_bg = buf_g + slot * stride_bufg_slot + j * stride_bufg_pos
-        if IS_KDA:
-            b_rg = tl.load(p_bg + i_hv * K + o_k, mask=mask_k, other=0.0).to(tl.float32)
-            b_h *= exp(b_rg)[:, None]
-        else:
-            b_rg = tl.load(p_bg + i_hv).to(tl.float32)
-            b_h *= exp(b_rg)
-        b_rk = tl.load(
-            buf_k + slot * stride_bufk_slot + j * stride_bufk_pos + i_hv * K + o_k,
-            mask=mask_k,
-            other=0.0,
-        ).to(tl.float32)
-        b_ru = tl.load(
-            buf_u + slot * stride_bufu_slot + j * stride_bufu_pos + i_hv * V + o_v,
-            mask=mask_v,
-            other=0.0,
-        ).to(tl.float32)
-        b_h += b_rk[:, None] * b_ru[None, :]
+    b_kw, b_ru, b_decay = _replay_tiles(
+        buf_k,
+        buf_u,
+        buf_g,
+        slot,
+        h,
+        stride_bufk_slot,
+        stride_bufk_pos,
+        stride_bufu_slot,
+        stride_bufu_pos,
+        stride_bufg_slot,
+        stride_bufg_pos,
+        i_hv,
+        o_k,
+        o_v,
+        mask_k,
+        mask_v,
+        K,
+        V,
+        BK,
+        BH,
+        IS_KDA,
+    )
+    # State is [BK, BV] here, so the contraction runs k~^T @ u.
+    b_h = b_h * b_decay[:, None]
+    b_h += tl.dot(tl.trans(b_kw), b_ru)
 
     # ---- 2. flush: the checkpoint absorbs the committed prefix --------------
     if do_flush:
@@ -366,6 +497,7 @@ def _replayssm_ut_fwd_kernel(
     V: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
+    BH: tl.constexpr,
     BT: tl.constexpr,
     stride_ckpt_slot: tl.constexpr,
     stride_bufk_slot: tl.constexpr,
@@ -427,20 +559,31 @@ def _replayssm_ut_fwd_kernel(
     )
     m_h = m_k[:, None] & m_v[None, :]
     b_h = tl.load(p_ckpt_hv, mask=m_h, other=0.0).to(tl.float32)
-    for j in range(h):
-        b_rg = tl.load(buf_g + slot * stride_bufg_slot + j * stride_bufg_pos + i_hv)
-        b_h *= exp(b_rg.to(tl.float32))
-        b_rk = tl.load(
-            buf_k + slot * stride_bufk_slot + j * stride_bufk_pos + i_hv * K + o_k,
-            mask=m_k,
-            other=0.0,
-        ).to(tl.float32)
-        b_ru = tl.load(
-            buf_u + slot * stride_bufu_slot + j * stride_bufu_pos + i_hv * V + o_v,
-            mask=m_v,
-            other=0.0,
-        ).to(tl.float32)
-        b_h += b_rk[:, None] * b_ru[None, :]
+    b_kw, b_ru, b_decay = _replay_tiles(
+        buf_k,
+        buf_u,
+        buf_g,
+        slot,
+        h,
+        stride_bufk_slot,
+        stride_bufk_pos,
+        stride_bufu_slot,
+        stride_bufu_pos,
+        stride_bufg_slot,
+        stride_bufg_pos,
+        i_hv,
+        o_k,
+        o_v,
+        m_k,
+        m_v,
+        K,
+        V,
+        BK,
+        BH,
+        False,
+    )
+    b_h = b_h * b_decay[:, None]
+    b_h += tl.dot(tl.trans(b_kw), b_ru)
 
     if do_flush:
         tl.store(p_ckpt_hv, b_h.to(p_ckpt_hv.dtype.element_ty), mask=m_h)
@@ -585,6 +728,7 @@ def replayssm_gated_delta_rule(
         # BV=32/NV=4 than BV=V/NV=1.
         BV_UT = triton.next_power_of_2(V)
         BT = triton.next_power_of_2(max_query_len)
+        BH_UT = max(16, triton.next_power_of_2(cap - max_query_len))
         _replayssm_ut_fwd_kernel[(1, N * HV)](
             q=q,
             k=k,
@@ -610,6 +754,7 @@ def replayssm_gated_delta_rule(
             V=V,
             BK=BK,
             BV=BV_UT,
+            BH=BH_UT,
             BT=BT,
             stride_ckpt_slot=ckpt.stride(0),
             stride_bufk_slot=buf_k.stride(0),
@@ -630,6 +775,10 @@ def replayssm_gated_delta_rule(
     # per-token l2norm/loads; BV=128 overflows the register budget.
     BV = min(triton.next_power_of_2(V), 64)
     NV = triton.cdiv(V, BV)
+    # Replay tile height: the cursor can reach cap - max_query_len before a
+    # flush resets it, and `tl.dot` wants at least 16 rows on CDNA, so a
+    # short buffer pads rather than shrinks.
+    BH = max(16, triton.next_power_of_2(cap - max_query_len))
     _replayssm_fwd_kernel[(NV, N * HV)](
         q=q,
         k=k,
@@ -655,6 +804,7 @@ def replayssm_gated_delta_rule(
         V=V,
         BK=BK,
         BV=BV,
+        BH=BH,
         stride_ckpt_slot=ckpt.stride(0),
         stride_bufk_slot=buf_k.stride(0),
         stride_bufk_pos=buf_k.stride(1),
@@ -736,6 +886,7 @@ def _replayssm_kda_fwd_kernel(
     V: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
+    BH: tl.constexpr,
     stride_ckpt_slot: tl.constexpr,
     stride_bufk_slot: tl.constexpr,
     stride_bufk_pos: tl.constexpr,
@@ -777,24 +928,32 @@ def _replayssm_kda_fwd_kernel(
     )
     b_h = tl.load(p_ckpt_hv, mask=mask_h, other=0.0).to(tl.float32)
 
-    for j in range(h):
-        b_rg = tl.load(
-            buf_g + slot * stride_bufg_slot + j * stride_bufg_pos + i_hv * K + o_k,
-            mask=mask_k,
-            other=0.0,
-        ).to(tl.float32)
-        b_h *= exp(b_rg)[None, :]
-        b_rk = tl.load(
-            buf_k + slot * stride_bufk_slot + j * stride_bufk_pos + i_hv * K + o_k,
-            mask=mask_k,
-            other=0.0,
-        ).to(tl.float32)
-        b_ru = tl.load(
-            buf_u + slot * stride_bufu_slot + j * stride_bufu_pos + i_hv * V + o_v,
-            mask=mask_v,
-            other=0.0,
-        ).to(tl.float32)
-        b_h += b_ru[:, None] * b_rk[None, :]
+    b_kw, b_ru, b_decay = _replay_tiles(
+        buf_k,
+        buf_u,
+        buf_g,
+        slot,
+        h,
+        stride_bufk_slot,
+        stride_bufk_pos,
+        stride_bufu_slot,
+        stride_bufu_pos,
+        stride_bufg_slot,
+        stride_bufg_pos,
+        i_hv,
+        o_k,
+        o_v,
+        mask_k,
+        mask_v,
+        K,
+        V,
+        BK,
+        BH,
+        True,
+    )
+    # KDA keeps the state transposed as [BV, BK], so the contraction is u^T @ k~.
+    b_h = b_h * b_decay[None, :]
+    b_h += tl.dot(tl.trans(b_ru), b_kw)
 
     if do_flush:
         tl.store(p_ckpt_hv, b_h.to(p_ckpt_hv.dtype.element_ty), mask=mask_h)
@@ -895,6 +1054,10 @@ def replayssm_sigmoid_gating_delta_rule(
     assert triton.cdiv(K, BK) == 1, "K must fit one block"
     BV = min(triton.next_power_of_2(V), 64)
     NV = triton.cdiv(V, BV)
+    # Replay tile height: the cursor can reach cap - max_query_len before a
+    # flush resets it, and `tl.dot` wants at least 16 rows on CDNA, so a
+    # short buffer pads rather than shrinks.
+    BH = max(16, triton.next_power_of_2(cap - max_query_len))
 
     q, k, v, a, b = (x.contiguous() for x in (q, k, v, a, b))
     out = q.new_empty(1, T_tot, HV, V) if o is None else o.unsqueeze(0)
@@ -927,6 +1090,7 @@ def replayssm_sigmoid_gating_delta_rule(
         V=V,
         BK=BK,
         BV=BV,
+        BH=BH,
         stride_ckpt_slot=ckpt.stride(0),
         stride_bufk_slot=buf_k.stride(0),
         stride_bufk_pos=buf_k.stride(1),
