@@ -571,9 +571,45 @@ monitor_slurm_job() {
   fi
 }
 
+read_slurm_controller_record() {
+  local job_id="$1"
+  local output rc state exit_code
+  local scontrol_cmd=(scontrol)
+
+  if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
+    scontrol_cmd+=(--controller "${SPUR_CONTROLLER_ADDR}")
+  fi
+
+  set +e
+  output="$("${scontrol_cmd[@]}" show job "${job_id}" -o 2>&1)"
+  rc=$?
+  set -e
+  echo "scontrol_rc=${rc}" >&2
+  echo "scontrol_output=${output}" >&2
+  [[ "${rc}" -eq 0 ]] || return 1
+
+  state=""
+  exit_code=""
+  if [[ "${output}" =~ JobState=([^[:space:]]+) ]]; then
+    state="${BASH_REMATCH[1]}"
+  fi
+  if [[ "${output}" =~ ExitCode=([^[:space:]]+) ]]; then
+    exit_code="${BASH_REMATCH[1]}"
+  fi
+  [[ -n "${state}" && -n "${exit_code}" ]] || return 1
+
+  case "${state%%+*}" in
+    PENDING|RUNNING|CONFIGURING|COMPLETING)
+      return 1
+      ;;
+  esac
+  printf '%s|%s\n' "${state}" "${exit_code}"
+}
+
 read_slurm_exit_code() {
   local job_id="$1"
-  local sacct_line exit_status exit_signal deadline
+  local sacct_line sacct_output sacct_job_record sacct_rc
+  local controller_line exit_status exit_signal deadline attempt=0
 
   SLURM_STATE="unknown"
   SLURM_EXIT_CODE="unknown"
@@ -586,13 +622,34 @@ read_slurm_exit_code() {
 
   deadline=$(( $(date +%s) + SLURM_ACCOUNTING_TIMEOUT ))
   while true; do
+    attempt=$((attempt + 1))
     if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
-      sacct_line="$(sacct --accounting "${SPUR_ACCOUNTING_ADDR}" --brief --noheader 2>/dev/null | awk -v job_id="${job_id}" '$1 == job_id { print $2 "|" $3; exit }' || true)"
+      set +e
+      sacct_output="$(sacct --accounting "${SPUR_ACCOUNTING_ADDR}" --brief --noheader 2>&1)"
+      sacct_rc=$?
+      set -e
+      sacct_job_record="$(printf '%s\n' "${sacct_output}" | awk -v job_id="${job_id}" 'index($0, job_id) { print; exit }')"
+      sacct_line="$(printf '%s\n' "${sacct_job_record}" | awk -v job_id="${job_id}" '$1 == job_id { print $2 "|" $3; exit }')"
+      echo "sacct_rc=${sacct_rc}"
+      echo "sacct_job_record=${sacct_job_record}"
+      if [[ "${attempt}" -eq 1 || "${sacct_rc}" -ne 0 ]]; then
+        echo "sacct_output_sample=$(printf '%s\n' "${sacct_output}" | awk 'NR <= 5')"
+      fi
     else
       sacct_line="$(sacct -j "${job_id}" -X -n -P -o State,ExitCode 2>/dev/null | awk -F'|' 'NF { print; exit }' || true)"
     fi
     echo "sacct_line=${sacct_line}"
     [[ -n "${sacct_line}" ]] && break
+
+    if [[ "${USES_SPUR_CONTROLLER}" == "1" && ( "${attempt}" -eq 1 || "$(date +%s)" -ge "${deadline}" ) ]]; then
+      controller_line="$(read_slurm_controller_record "${job_id}" || true)"
+      echo "scontrol_line=${controller_line}"
+      if [[ -n "${controller_line}" ]]; then
+        sacct_line="${controller_line}"
+        break
+      fi
+    fi
+
     if [[ "$(date +%s)" -ge "${deadline}" ]]; then
       echo "ERROR: Slurm accounting record for job ${job_id} was not available after ${SLURM_ACCOUNTING_TIMEOUT}s" >&2
       return 0
