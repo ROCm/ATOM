@@ -19,6 +19,11 @@ from atom.model_ops.attentions.gdn_attn import (
 )
 from atom.model_ops.fla_ops import fused_recurrent_gated_delta_rule
 from atom.model_ops.mamba_ops.causal_conv1d import causal_conv1d_update
+from atom.plugin.sglang.attention_backend.backend_resolver import (
+    reconstruct_linear_metadata,
+    resolve_attn_backend,
+    resolve_mamba_req_pool,
+)
 from atom.utils.forward_context import (
     AttentionMetaData,
     Context,
@@ -378,22 +383,7 @@ class SGLangGDNForwardContext:
 
     @staticmethod
     def _resolve_attn_backend(forward_batch: Any) -> Any:
-        backend = getattr(forward_batch, "attn_backend", None)
-        if backend is not None:
-            return backend
-
-        try:
-            from sglang.srt.model_executor.forward_context import (
-                get_attn_backend,
-                has_forward_context,
-            )
-
-            if has_forward_context():
-                return get_attn_backend()
-        except Exception:  # noqa: BLE001, S110 - forward context is optional
-            pass
-
-        return None
+        return resolve_attn_backend(forward_batch)
 
     @staticmethod
     def _patch_forward_batch_pools(forward_batch: Any, attn_backend: Any) -> None:
@@ -410,10 +400,8 @@ class SGLangGDNForwardContext:
     def _build_kv_cache_tensors(
         forward_batch: Any, attn_backend: Any
     ) -> dict[str, KVCacheTensor]:
-        pool = getattr(forward_batch, "req_to_token_pool", None)
-        if pool is None:
-            pool = getattr(attn_backend, "req_to_token_pool", None)
-        if pool is None:
+        pool = resolve_mamba_req_pool(forward_batch, attn_backend)
+        if pool is None or getattr(pool, "mamba_map", None) is None:
             try:
                 from sglang.srt.model_executor.forward_context import (
                     get_req_to_token_pool,
@@ -449,7 +437,7 @@ class SGLangGDNForwardContext:
         mode = forward_batch.forward_mode
         is_prefill = mode.is_prefill()
         if mode.is_extend():
-            num_tokens = forward_batch.seq_lens_sum
+            num_tokens = int(forward_batch.seq_lens_sum)
         elif mode.is_target_verify():
             # Total flattened tokens, i.e. batch_size * draft_token_num.
             # `numel()` is right whether SGLang hands us the usual flat
@@ -457,7 +445,7 @@ class SGLangGDNForwardContext:
             # would report just the per-sequence length for the latter.
             num_tokens = int(forward_batch.positions.numel())
         else:
-            num_tokens = forward_batch.batch_size
+            num_tokens = int(forward_batch.batch_size)
         return (
             Context(
                 positions=forward_batch.positions,
@@ -472,10 +460,6 @@ class SGLangGDNForwardContext:
     def _build_gdn_metadata(
         forward_batch: Any, linear_backend: Any
     ) -> GDNAttentionMetadata | None:
-        fm = getattr(linear_backend, "forward_metadata", None)
-        if fm is None:
-            return None
-
         mode = forward_batch.forward_mode
         if mode.is_target_verify():
             # SGLangGatedDeltaNet fills SGLang's transactional snapshots using
@@ -483,14 +467,22 @@ class SGLangGDNForwardContext:
             # MoE, norms and collectives without native GDN metadata.
             return None
 
-        device = fm.query_start_loc.device
-        idx = fm.mamba_cache_indices.to(dtype=torch.int32, device=device)
         bs = forward_batch.batch_size
+        fm = getattr(linear_backend, "forward_metadata", None)
+        query_start_loc = getattr(fm, "query_start_loc", None)
+        idx = getattr(fm, "mamba_cache_indices", None)
+        if query_start_loc is None or idx is None:
+            reconstructed = reconstruct_linear_metadata(forward_batch, linear_backend)
+            if reconstructed is None:
+                return None
+            query_start_loc, idx = reconstructed
+        device = query_start_loc.device
+        idx = idx.to(dtype=torch.int32, device=device)
         common_kwargs = {
             "num_spec_decodes": 0,
             "num_spec_decode_tokens": 0,
             "spec_query_start_loc": None,
-            "non_spec_query_start_loc": fm.query_start_loc,
+            "non_spec_query_start_loc": query_start_loc,
             "spec_state_indices_tensor": None,
             "non_spec_state_indices_tensor": idx,
             "spec_sequence_masks": None,
@@ -514,11 +506,13 @@ class SGLangGDNForwardContext:
             )
 
         if mode.is_extend():
-            seq_sum = forward_batch.seq_lens_sum
+            # SGLang's seq_lens_sum includes cached prefix tokens for some
+            # hybrid batches; GDN only receives the active query tokens.
+            seq_sum = int(query_start_loc[-1].item())
             epl = forward_batch.extend_prefix_lens
             has_initial_state = None if epl is None else epl > 0
             nums_dict, batch_ptr, token_chunk_offset_ptr = (
-                compute_causal_conv1d_metadata(fm.query_start_loc)
+                compute_causal_conv1d_metadata(query_start_loc)
             )
             return GDNAttentionMetadata(
                 num_prefills=bs,
@@ -564,7 +558,7 @@ class SGLangGDNForwardContext:
         if gdn_metadata is None and not forward_batch.forward_mode.is_target_verify():
             return None
 
-        kv_cache_data = cls._build_kv_cache_tensors(forward_batch, attn_backend)
+        kv_cache_data = cls._build_kv_cache_tensors(forward_batch, linear_backend)
         if not kv_cache_data:
             return None
 

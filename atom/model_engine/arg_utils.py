@@ -2,25 +2,24 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
-import logging
 import json
+import logging
 from dataclasses import dataclass, fields
-from typing import List, Optional
 
 from atom import LLMEngine
 from atom.config import (
     CompilationConfig,
     CUDAGraphMode,
     DSparkConfig,
-    SpeculativeConfig,
     EPLBConfig,
+    SpeculativeConfig,
 )
 from atom.model_engine.engine_core_mgr import DP_LB_DEFAULT, DP_LB_STRATEGIES
 
 logger = logging.getLogger("atom")
 
 
-def parse_size_list(size_str: str) -> List[int]:
+def parse_size_list(size_str: str) -> list[int]:
     """Parse a string representation of a list into a Python list."""
     import ast
 
@@ -45,12 +44,13 @@ class EngineArgs:
     enable_prefix_caching: bool = True
     port: int = 8006
     kv_cache_dtype: str = "bf16"
-    index_cache_dtype: Optional[str] = None
+    index_cache_dtype: str | None = None
     block_size: int = 16
-    max_model_len: Optional[int] = None
+    max_model_len: int | None = None
     max_num_batched_tokens: int = 16384
     long_prefill_token_threshold: int = 0
     attn_prefill_chunk_size: int = 16384
+    state_checkpoint_interval_tokens: int = 8192
     enable_chunked_prefill: bool = True
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
@@ -58,31 +58,33 @@ class EngineArgs:
     cudagraph_capture_sizes: str = "[1,2,4,8,16,32,48,64,128,256]"
     level: int = 3
     cudagraph_mode: str = "FULL"
-    load_dummy: Optional[str] = None
+    load_dummy: str | None = None
     enable_expert_parallel: bool = False
-    torch_profiler_dir: Optional[str] = None
+    torch_profiler_dir: str | None = None
     enable_dp_attention: bool = False
     dp_load_balance: str = DP_LB_DEFAULT
-    enable_tbo: Optional[str] = None
-    all2all_backend: Optional[str] = None
-    method: Optional[str] = None
+    enable_tbo: str | None = None
+    all2all_backend: str | None = None
+    moe_backend: str = "standard"
+    method: str | None = None
     num_speculative_tokens: int = 1
     kv_transfer_config: str = "{}"
-    draft_model: Optional[str] = None
+    draft_model: str | None = None
+    spec_decode_acceptance_rate: float | None = None
     mark_trace: bool = False
     enable_rapidserve: bool = False
-    disagg_prefill_max_num_seqs: Optional[int] = None
+    disagg_prefill_max_num_seqs: int | None = None
     disagg_constrained: bool = False
-    online_quant_config: Optional[dict] = None
-    hf_overrides: Optional[dict] = None
-    dspark_config: Optional[dict] = None
+    online_quant_config: dict | None = None
+    hf_overrides: dict | None = None
+    dspark_config: dict | None = None
 
     def __post_init__(self) -> None:
         if self.index_cache_dtype is None:
             self.index_cache_dtype = self.kv_cache_dtype
 
     eplb_enable: bool = False
-    eplb_config: Optional[dict] = None
+    eplb_config: dict | None = None
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -265,6 +267,14 @@ class EngineArgs:
             "Use '--all2all-backend low-latency' for AsyncLL MORI kernel overlap.",
         )
         parser.add_argument(
+            "--moe-backend",
+            type=str,
+            default="standard",
+            choices=["standard", "mega"],
+            help="MoE implementation. 'standard' uses the existing "
+            "prepare/GEMM/finalize path; 'mega' uses fused FlyDSL MegaMoE.",
+        )
+        parser.add_argument(
             "--method",
             type=str,
             default=None,
@@ -285,6 +295,19 @@ class EngineArgs:
             "--method eagle3; optional for --method dspark (needed for the "
             "DFlash-backbone drafts such as Kimi-K3-DSpark, omitted for "
             "V4-Pro-DSpark which ships inside the target checkpoint).",
+        )
+        parser.add_argument(
+            "--spec-decode-acceptance-rate",
+            type=float,
+            default=None,
+            help="Debug/benchmark knob: force a fixed speculative-decoding "
+            "acceptance rate in [0, 1]. When set, the rejection sampler ignores "
+            "the real draft/target agreement and force-accepts each draft token "
+            "with a position-decaying probability calibrated so the measured "
+            "mean acceptance rate (accepted_draft/total_draft) matches this "
+            "value (equivalent accept length = 1 + num_speculative_tokens * "
+            "rate). Mirrors vLLM's 'synthetic' rejection_sample_method. Only "
+            "meaningful with a speculative method; leave unset to disable.",
         )
         parser.add_argument(
             "--max-num-batched-tokens",
@@ -310,6 +333,22 @@ class EngineArgs:
             help=(
                 "MLA chunked-prefill budget in tokens. Default uses "
                 "max_num_batched_tokens."
+            ),
+        )
+        parser.add_argument(
+            "--state-checkpoint-interval-tokens",
+            type=int,
+            default=8192,
+            help=(
+                "For models with per-request state (DeepSeek-V4 compressor "
+                "ring and sliding window, GDN recurrent state), keep a state "
+                "checkpoint every N tokens of context so a later prefix hit "
+                "can resume there. "
+                "A prompt shorter than N publishes nothing, which is what keeps "
+                "the feature free on workloads that never reuse a prefix. Must "
+                "be a multiple of the prefix-cache hash block size; 0 disables "
+                "checkpoints entirely. Prefill chunks are aligned to these "
+                "positions, so this also quantizes chunk boundaries."
             ),
         )
         parser.add_argument(
@@ -501,6 +540,7 @@ class EngineArgs:
             method = kwargs.pop("method")
             num_spec_tokens = kwargs.pop("num_speculative_tokens")
             draft_model = kwargs.pop("draft_model")
+            synthetic_acceptance_rate = kwargs.pop("spec_decode_acceptance_rate")
             if method == "eagle3" and not draft_model:
                 raise ValueError("--draft-model is required when --method eagle3.")
             if draft_model and method == "mtp":
@@ -512,11 +552,13 @@ class EngineArgs:
                 method=method,
                 model=draft_model or self.model,
                 num_speculative_tokens=num_spec_tokens,
+                synthetic_acceptance_rate=synthetic_acceptance_rate,
             )
         else:
             kwargs.pop("method")
             kwargs.pop("num_speculative_tokens")
             kwargs.pop("draft_model")
+            kwargs.pop("spec_decode_acceptance_rate")
             kwargs["speculative_config"] = None
 
         # --enable-tbo [prefill|all] → enable_tbo + enable_tbo_decode

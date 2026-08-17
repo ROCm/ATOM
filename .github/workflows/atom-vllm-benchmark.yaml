@@ -34,7 +34,7 @@ on:
           - DeepSeek-V3.2 FP8 PTPC TP4
           - DeepSeek-V3.2 FP8 PTPC MTP TP4
           - DeepSeek-V4-Pro TP8
-          - Kimi-K2.7-MXFP4 TP4
+          - Kimi-K3 TP8
           - GLM-5.2-MXFP4 TP4
           - GLM-5.2-MXFP4-MTP TP4
           - Qwen3.5-397B-A17B-MXFP4 TP4
@@ -48,7 +48,7 @@ on:
           - DeepSeek-V3.2 FP8 PTPC TP4
           - DeepSeek-V3.2 FP8 PTPC MTP TP4
           - DeepSeek-V4-Pro TP8
-          - Kimi-K2.7-MXFP4 TP4
+          - Kimi-K3 TP8
           - GLM-5.2-MXFP4 TP4
           - GLM-5.2-MXFP4-MTP TP4
           - Qwen3.5-397B-A17B-MXFP4 TP4
@@ -62,7 +62,7 @@ on:
           - DeepSeek-V3.2 FP8 PTPC TP4
           - DeepSeek-V3.2 FP8 PTPC MTP TP4
           - DeepSeek-V4-Pro TP8
-          - Kimi-K2.7-MXFP4 TP4
+          - Kimi-K3 TP8
           - GLM-5.2-MXFP4 TP4
           - GLM-5.2-MXFP4-MTP TP4
           - Qwen3.5-397B-A17B-MXFP4 TP4
@@ -76,7 +76,7 @@ on:
           - DeepSeek-V3.2 FP8 PTPC TP4
           - DeepSeek-V3.2 FP8 PTPC MTP TP4
           - DeepSeek-V4-Pro TP8
-          - Kimi-K2.7-MXFP4 TP4
+          - Kimi-K3 TP8
           - GLM-5.2-MXFP4 TP4
           - GLM-5.2-MXFP4-MTP TP4
           - Qwen3.5-397B-A17B-MXFP4 TP4
@@ -90,7 +90,7 @@ on:
           - DeepSeek-V3.2 FP8 PTPC TP4
           - DeepSeek-V3.2 FP8 PTPC MTP TP4
           - DeepSeek-V4-Pro TP8
-          - Kimi-K2.7-MXFP4 TP4
+          - Kimi-K3 TP8
           - GLM-5.2-MXFP4 TP4
           - GLM-5.2-MXFP4-MTP TP4
           - Qwen3.5-397B-A17B-MXFP4 TP4
@@ -104,7 +104,7 @@ on:
           - DeepSeek-V3.2 FP8 PTPC TP4
           - DeepSeek-V3.2 FP8 PTPC MTP TP4
           - DeepSeek-V4-Pro TP8
-          - Kimi-K2.7-MXFP4 TP4
+          - Kimi-K3 TP8
           - GLM-5.2-MXFP4 TP4
           - GLM-5.2-MXFP4-MTP TP4
           - Qwen3.5-397B-A17B-MXFP4 TP4
@@ -118,7 +118,7 @@ on:
           - DeepSeek-V3.2 FP8 PTPC TP4
           - DeepSeek-V3.2 FP8 PTPC MTP TP4
           - DeepSeek-V4-Pro TP8
-          - Kimi-K2.7-MXFP4 TP4
+          - Kimi-K3 TP8
           - GLM-5.2-MXFP4 TP4
           - GLM-5.2-MXFP4-MTP TP4
           - Qwen3.5-397B-A17B-MXFP4 TP4
@@ -132,7 +132,7 @@ on:
           - DeepSeek-V3.2 FP8 PTPC TP4
           - DeepSeek-V3.2 FP8 PTPC MTP TP4
           - DeepSeek-V4-Pro TP8
-          - Kimi-K2.7-MXFP4 TP4
+          - Kimi-K3 TP8
           - GLM-5.2-MXFP4 TP4
           - GLM-5.2-MXFP4-MTP TP4
           - Qwen3.5-397B-A17B-MXFP4 TP4
@@ -679,7 +679,7 @@ jobs:
               "DeepSeek-V3.2 FP8 PTPC TP4",
               "DeepSeek-V3.2 FP8 PTPC MTP TP4",
               "DeepSeek-V4-Pro TP8",
-              "Kimi-K2.7-MXFP4 TP4",
+              "Kimi-K3 TP8",
               "GLM-5.2-MXFP4 TP4",
               "GLM-5.2-MXFP4-MTP TP4",
               "Qwen3.5-397B-A17B-MXFP4 TP4",

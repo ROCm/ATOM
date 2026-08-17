@@ -3,8 +3,6 @@
 
 """Chat completion handler for the OpenAI-compatible API."""
 
-import asyncio
-import json
 import logging
 import time
 from collections.abc import AsyncGenerator
@@ -23,6 +21,8 @@ from .reasoning import (
     ReasoningFilter,
     separate_reasoning,
 )
+from .sse import data_frame
+from .streaming_dispatch import StreamOutputCollector
 from .tool_parser import ToolCallStreamParser, parse_tool_calls
 
 logger = logging.getLogger("atom")
@@ -219,16 +219,17 @@ def create_chat_chunk(
     }
     if usage is not None:
         chunk["usage"] = usage
-    return f"data: {json.dumps(chunk)}\n\n"
+    return data_frame(chunk)
 
 
 async def stream_chat_response(
     request_id: str,
     model: str,
-    stream_queue: asyncio.Queue,
+    stream_collector: StreamOutputCollector,
     seq_id: int,
     num_prompt_tokens: int,
-    cleanup_fn,
+    cleanup_stream,
+    cleanup_request,
     tools=None,
     tool_choice=None,
     starts_thinking: bool = False,
@@ -260,10 +261,12 @@ async def stream_chat_response(
     try:
         role_sent = False
         while True:
-            chunk_data = await stream_queue.get()
+            chunk_data = await stream_collector.get()
 
             if not role_sent:
-                yield create_chat_chunk(request_id, model, delta={"role": "assistant"})
+                yield create_chat_chunk(
+                    request_id, model, delta={"role": "assistant", "content": ""}
+                )
                 role_sent = True
             new_text = chunk_data["text"]
             num_tokens_output += len(chunk_data.get("token_ids", []))
@@ -351,11 +354,12 @@ async def stream_chat_response(
         # the syscalls that saturate the API event loop.
         yield (
             create_chat_chunk(request_id, model, finish_reason=finish_reason)
-            + f"data: {json.dumps(usage_chunk)}\n\n"
+            + data_frame(usage_chunk)
             + STREAM_DONE_MESSAGE
         )
     finally:
-        cleanup_fn(request_id, seq_id, aborted=aborted)
+        cleanup_stream(seq_id, aborted=aborted)
+        cleanup_request(request_id)
 
 
 def _build_chat_choice(
@@ -496,10 +500,11 @@ def build_chat_response_multi(
 async def stream_chat_response_fanout(
     request_id: str,
     model: str,
-    shared_queue: asyncio.Queue,
+    shared_collector: StreamOutputCollector,
     seq_ids: list[int],
     num_prompt_tokens: int,
-    cleanup_fn,
+    cleanup_stream,
+    cleanup_request,
     tools=None,
 ) -> AsyncGenerator[str, None]:
     """Streaming variant that multiplexes ``len(seq_ids)`` fan-out siblings
@@ -530,11 +535,14 @@ async def stream_chat_response_fanout(
     try:
         role_sent = [False] * n
         while not all(finished):
-            idx, chunk_data = await shared_queue.get()
+            idx, chunk_data = await shared_collector.get()
 
             if not role_sent[idx]:
                 yield create_chat_chunk(
-                    request_id, model, delta={"role": "assistant"}, index=idx
+                    request_id,
+                    model,
+                    delta={"role": "assistant", "content": ""},
+                    index=idx,
                 )
                 role_sent[idx] = True
 
@@ -638,10 +646,10 @@ async def stream_chat_response_fanout(
                 )
                 for i in range(n)
             )
-            + f"data: {json.dumps(usage_chunk)}\n\n"
+            + data_frame(usage_chunk)
             + STREAM_DONE_MESSAGE
         )
     finally:
-        # Clean up all sibling seq_id entries then the shared request state.
         for sid in seq_ids:
-            cleanup_fn(request_id, sid, aborted=aborted)
+            cleanup_stream(sid, aborted=aborted)
+        cleanup_request(request_id)

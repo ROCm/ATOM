@@ -47,9 +47,12 @@ def _module(name: str, **attrs) -> ModuleType:
 
 def _make_fake_runtime_module(model_arch: str, prepare_config):
     module = ModuleType("atom.plugin.sglang.runtime")
-    module.get_model_arch_spec = MagicMock(
-        return_value=_Obj(prepare_config=prepare_config)
+    model_spec = _Obj(
+        prepare_config=prepare_config,
+        prepare_draft_model_config=None,
+        construction_context=None,
     )
+    module.resolve_model_arch_spec = MagicMock(return_value=(model_arch, model_spec))
     return module
 
 
@@ -119,4 +122,45 @@ def test_prepare_model_register_ops_gate(model_arch: str):
         )
     else:
         fake_qwen35_mod.apply_prepare_model_adaptations.assert_not_called()
+    fake_model_cls.assert_called_once()
+
+
+def test_prepare_model_uses_canonical_family_architecture():
+    source_arch = "FutureQwen35MoeForConditionalGeneration"
+    canonical_arch = "Qwen3_5MoeForConditionalGeneration"
+    fake_atom_config = _Obj(plugin_config=_Obj(is_plugin_mode=True))
+    fake_register, _fake_model, fake_model_cls = _make_fake_register_module(
+        canonical_arch
+    )
+    fake_config_mod = MagicMock()
+    fake_config_mod.generate_atom_config_for_plugin_mode = MagicMock(
+        return_value=fake_atom_config
+    )
+    prepare_config = MagicMock()
+    model_spec = _Obj(
+        prepare_config=prepare_config,
+        prepare_draft_model_config=None,
+        construction_context=None,
+    )
+    fake_runtime_mod = ModuleType("atom.plugin.sglang.runtime")
+    fake_runtime_mod.resolve_model_arch_spec = MagicMock(
+        return_value=(canonical_arch, model_spec)
+    )
+
+    config = _Obj(architectures=[source_arch], model_type="qwen3_5_moe")
+    with patch.dict(
+        sys.modules,
+        {
+            "atom.plugin.register": fake_register,
+            "atom.plugin.config": fake_config_mod,
+            "atom.plugin.sglang.runtime": fake_runtime_mod,
+            "atom.plugin.sglang.graph_capture_patch": MagicMock(
+                apply_graph_capture_patch=MagicMock()
+            ),
+        },
+    ):
+        sglang_prepare.prepare_model(config=config)
+
+    fake_runtime_mod.resolve_model_arch_spec.assert_called_once_with(config)
+    prepare_config.assert_called_once_with(fake_atom_config, canonical_arch)
     fake_model_cls.assert_called_once()

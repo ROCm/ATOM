@@ -218,38 +218,127 @@ Methods:
 
 ```python
 class BlockManager:
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, *, state_runtime: StateRuntime = DEFAULT_STATE_RUNTIME):
         block_size = config.kv_cache_block_size      # Tokens per block (default 16)
         num_blocks = config.num_kvcache_blocks        # Total blocks in pool
         self.block_size = block_size
-        self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
-        self.hash_to_block_id: dict[int, int] = dict()
-        self.free_block_ids: deque[int] = deque(range(num_blocks))
-        self.used_block_ids: set[int] = set()
         self.enable_prefix_caching = config.enable_prefix_caching
+        self.kv = BlockPool(num_blocks, on_evict=self._record_evicted)
         
-        # Per-request cache: per-request slot pool + equiv-block accounting.
-        # Used by attention types whose state lives outside the paged KV pool
-        # (currently GDN recurrent state; future stateful attentions plug in
-        # via AttentionMetadataBuilder.compute_per_req_cache_bytes()).
-        # Each slot group contains (1+num_spec) contiguous tensor indices.
-        self.per_req_cache_equiv_blocks: int = getattr(
-            config, "per_req_cache_equiv_blocks", 0
+        # Per-request cache slot pool. Used by attention types whose state
+        # lives outside the paged KV pool (GDN recurrent state, the
+        # DeepSeek-V4 compressor ring); they declare it as a STATE entry
+        # class via AttentionMetadataBuilder.sub_pool_specs().
+        # One group = one request = `entries_per_req` contiguous tensor
+        # indices (1, or 1+num_spec where a rollback slot per speculated
+        # token is kept).
+        pool_entries: dict = getattr(config, "pool_entries", None) or {}
+        pool_per_req: dict = getattr(config, "pool_entries_per_req", None) or {}
+        state_entries = int(pool_entries.get(STATE_SLOT_CLASS, 0))
+        state_per_req = int(pool_per_req.get(STATE_SLOT_CLASS, 1)) or 1
+        self.num_per_req_cache_groups = state_entries // state_per_req
+        checkpoint_spec = state_runtime.checkpoint_spec
+        self.paged_state_checkpoints = (
+            None
+            if checkpoint_spec is None
+            else PagedStateCheckpointCoordinator(
+                self.kv,
+                checkpoint_spec,
+                enabled=self.enable_prefix_caching
+                and self.num_per_req_cache_groups > 0,
+            )
         )
-        num_per_req_cache_groups: int = getattr(config, "num_per_req_cache_groups", 0)
-        self.free_per_req_cache_groups: list[int] = list(
-            range(num_per_req_cache_groups)
+        self.state = StateGroupPool(
+            self.num_per_req_cache_groups,
+            transfer=(
+                StateTransfer.none()
+                if self.paged_state_checkpoints is not None
+                else state_runtime.transfer
+            ),
+            hash_block_size=self.hash_block_size,
+            enabled=self.enable_prefix_caching,
         )
-        # seq_id → list of accounting block_ids (memory bookkeeping only)
-        self.per_req_cache_accounting: dict[int, list[int]] = {}
 ```
 
-The block pool is pre-allocated at startup. `free_block_ids` is a deque for O(1) pop/push, `used_block_ids` tracks active blocks, and `hash_to_block_id` maps content hashes to block IDs for prefix caching.
+The block pool is pre-allocated at startup. [`BlockPool`](../atom/model_engine/block_pool.py) holds the blocks, their ref counts, a free list (a deque for O(1) pop/push plus a set for membership, since a cache hit can claim an id the queue still lists) and the content-hash index.
 
-**Per-Request Cache Pools (Stateful-Attention Models):** For models whose attention type maintains per-request state outside the paged KV pool (currently GDN: Qwen3-Next, Qwen3.5; future: DeepseekV4 ring buffer + compressor state, etc.):
-- `free_per_req_cache_groups` — list of available per-request slot group indices (0 to `num_per_req_cache_groups - 1`). Each group corresponds to one request and contains `1 + num_speculative_tokens` contiguous tensor slot indices.
-- `per_req_cache_accounting` — maps sequence ID to a list of equivalent block IDs used for memory accounting. The unified pool manages both KV cache blocks and per-request state through dynamic competition; per-request memory is accounted for as block equivalents.
-- `per_req_cache_equiv_blocks` — number of KV cache block equivalents reserved per request for its per-request cache (computed from `AttentionMetadataBuilder.compute_per_req_cache_bytes() / block_bytes`).
+`BlockManager` holds one, for the compressed KV. The sliding window used to hold a second — see **Sliding window: a ring, not a pool** below for why it no longer does.
+
+#### Sliding window: a ring, not a pool
+
+DeepSeek-V4's sliding window is a per-request ring inside that request's **slot** — a fixed run of rows at the high end of the shared row space, holding its compressor state and then every layer's window. `win_with_spec = window + max_spec_steps` positions are addressable per layer, and one formula serves every layer of a compress class ([`v4_pool_geometry.py`](../atom/model_ops/attentions/v4_pool_geometry.py)):
+
+```
+row = slot * slot_rows + ring_start + (q // ring_stride) * run_rows + q % ring_stride
+```
+
+where `q = pos % win_with_spec`. The layer term is not in it: a layer's view is anchored at its own base row, which is what lets one index buffer serve the whole class.
+
+It was a content-addressed block pool until this change, which is worth writing down because the choice is not obvious and it is not permanent. **The question is where reuse comes from: a block pool reuses by sharing rows, a ring reuses by copying them.** Everything else follows.
+
+Sharing rows was the only mechanism available before per-request state could be checkpointed by copying (`PagedStateCheckpointCoordinator` under `StateTransfer.copy(layout_id)`). A private ring at that time meant a request resuming someone else's cached prefix had never written that prefix into its own ring and read stale rows — issue #1417, which is exactly what replaced the ring with a pool. The ring is back only because `execute_paged_state_copies` now gathers the saved window and compressor state into the resumer's Active Slot. **Reverting the addressing without that copy reintroduces #1417 silently**, so the two are one change, not two.
+
+What the ring buys:
+
+- **Memory is sized in tokens, not blocks.** A block-addressed window straddling a boundary occupies `ceil(win/block)+1` blocks — at V4's 128-token window and 256-token block that is 512 tokens of full-resolution KV to hold 128. Measured on V4-Flash-DSpark tp2: the SWA sub-pool went 4.04 GB → 0.92 GB (fp8) and 6.47 GB → 1.58 GB (bf16), all of it returned to the paged pool as ~3,100 more blocks.
+- **It shares a slot with the compressor state, so both are one entry class.** They are allocated and given up together and no request can have one without the other; pricing them apart would only invite a split that cannot happen. It also collapses a checkpoint copy to one range per plane.
+- **The pool itself disappears** — free list, content index, window-freeing walk, per-request block table, `-1` out-of-window sentinels, and the admission term that had to account for all of it.
+- **The bound is constructed, not measured.** The block pool carried a flat 64-block cushion because admission checked free blocks per request without reserving them, while materialization for the whole scheduling pass happened later. A ring is allocated with the request's state slot and cannot transiently exceed itself.
+- **It stops gating prefix hits.** A block-addressed window vetoed any boundary whose trailing window was not resident. In the cache-stats line that veto is visible as `Lost-unrecoverable`; it moved to `Lost-to-checkpoint` (0.32% on V4-Flash-DSpark GSM8K) — the same reuse, now recoverable.
+
+What it costs:
+
+- **Positions alias.** `pos → row` is injective under block addressing and is not under a ring, so two invariants exist that did not before, and violating either corrupts silently rather than failing: `write_per_batch <= win_with_spec` (else one seq's own tokens race for a row) and, for the DSpark draft gather, `window <= win_with_spec` (the draft's `window_size` and the target's `win_with_spec` are separate configs). Both are asserted.
+- **Ring size is coupled to speculation depth.** `win_with_spec` must grow with the draft count; a block pool did not care where drafts landed.
+- **Nothing older than the window survives**, and every resume pays a copy where claiming a cached block paid nothing.
+
+**When the trade reverses.** The memory win is entirely the `window / block_size` ratio: at V4's 128/256 a ring is 4× smaller, but at a 2048-token window a block pool needs `ceil(2048/256)+1 = 9` blocks = 2304 tokens for 2048, and the ring saves almost nothing while keeping all of its aliasing invariants. Note also that sharing rows was worth less than it looks: a resuming request shares only the trailing window and starts writing its own rows immediately, so a block pool never held one window for N requests either. **If V4's window ever grows past its block size, revisit this.**
+
+**Per-Request Cache Pools (Stateful-Attention Models):** For models whose attention type maintains per-request state outside the paged KV pool (GDN: Qwen3-Next, Qwen3.5, Kimi-Linear; DeepSeek-V4's compressor ring):
+- `state` — a [`StateGroupPool`](../atom/model_engine/state_pool.py), owning the Active Slot free list and the fork-checkpoint index. PAGE-copy checkpoints are owned separately by [`PagedStateCheckpointCoordinator`](../atom/model_engine/page_unit_checkpoint.py). Each group is one request's worth: `entries_per_req` contiguous tensor slot indices (1 for a single committed state, `1 + num_speculative_tokens` where a rollback slot per speculated token is kept). See **State checkpoints** below.
+- `num_per_req_cache_groups` — total capacity, so callers can tell "all slots busy" (transient) from "no slots were ever created" (permanent).
+
+The state class costs no paged blocks at admission time: sizing reserves every STATE class's floor before the paged class is sized (see [`sub_pool_spec.py`](../atom/model_ops/attentions/sub_pool_spec.py)), so a sequence only needs a free slot index. Because that floor is exactly `max_num_seqs` requests' worth, the slot pool never binds before `max_num_seqs` does.
+
+### State checkpoints (stateful-attention prefix caching)
+
+Neither the GDN recurrent state nor the V4 compressor ring can be rebuilt from cached KV blocks — the cache holds the compressor's *output*, the state is its rolling *input* window. So for a stateful model a prefix-cache hit is only resumable at a boundary where some earlier request saved its state, and `can_allocate` gates on that as a third shrink, chained after the SWA one:
+
+```
+for cache in state_caches:                        # to a fixpoint, not in series
+    boundary = cache.resumable_hit(seq, boundary, hashes)
+```
+
+Run to a fixpoint rather than `min()`-ed or chained: the answer has to satisfy every class at once, and the largest boundary one class allows need not be one another class can resume from — nor is the nearest boundary below it necessarily acceptable to the first. Every answer is `<=` its input, so each round either terminates or strictly decreases. There is one member today (the compressor ring), which is why the loop currently converges in one pass; it is written for N because the next class is a matter of when, not whether.
+
+**N classes, one protocol.** A `Pool.STATE` class (see [`sub_pool_spec.py`](../atom/model_ops/attentions/sub_pool_spec.py)) scales with in-flight requests rather than with history, and can therefore veto a prefix hit. [`StateCache`](../atom/model_engine/state_cache.py) is that shape — `resumable_hit` to answer how far back this class can resume from, `checkpoint` to keep a boundary that way, and one number saying what keeping one costs the forward that follows. The sliding window was the second member until it became a per-request ring carried by the checkpoint, which left it with nothing to veto; GDN's recurrent state becomes one the moment it stops forking. The tests exercise the multi-class behaviour through a stub rather than whichever class happens to exist, so they stay honest across that turnover.
+
+That number, `successor_room`, is mutability quantified. A rolling state (GDN recurrence) is still being written by its owner and is not one range to duplicate, so keeping it means handing the group over and taking a fresh one — and the next forward has to refill the replacement, which is `min_fork_tokens` of it. An immutable entry, or one that can simply be copied, needs no hand-over and no successor, i.e. `0`. `inf` means the class cannot be checkpointed at all — it would gate hits and never keep one. No class reports it today; `StateTransfer.none()` decodes to it, so a backend with no transferable state lands there rather than being special-cased.
+
+**Checkpoint capacity follows the transfer kind.** A fork checkpoint *is* a group sitting on the free list with its content intact, indexed by the content hash of the last block it covers — the same lazy-eviction model the block pool uses, where hand-out (`StateGroupPool.pop`), not free, is the eviction event. The pool therefore never holds a group back, and under full concurrency the fork checkpoint set drains on its own. A copy checkpoint does not occupy an Active Slot: it owns an ordered set of arbitrary PAGE units and is reclaimed only as a whole record. Active Slots remain reserved for resident requests.
+
+**The free list is two halves.** Groups carrying nothing sit in one container ordered by index; groups carrying a checkpoint sit in another ordered least-recently-used. `pop` always drains the first before touching the second, so a checkpoint can only be spent once there is nothing free left to take — a single release-ordered queue cannot express that, because a checkpoint handed back before a never-used group sits ahead of it and is spent first. Reuse counts as use: `claim` leaves the hash in place, so a resumed checkpoint returns through `release` to the LRU tail.
+
+Index order in the vacant half is not a fairness choice. Allocating lowest-first keeps the top of the pool cold — a high index is only reached at a concurrency high-water mark — which is what lets `retire_top` hand the pool's top group back when the KV/state boundary moves. When something *is* sitting there, `retire_top` relocates it and spends the least recently used checkpoint instead, wherever that one lives; retiring by index alone would be anti-LRU, since an index records the high-water mark at hand-out and is never refreshed by use.
+
+**Two ways to keep one.** How a group reaches the index is the backend's `StateTransfer`, declared by `AttentionMetadataBuilder.state_transfer()`, and it decides *where* that backend may checkpoint.
+
+After pool sizing, the runner combines that capability with the optional `PagedStateCheckpointSpec` in one validated `StateRuntime`. COPY requires a spec with the same versioned layout id; FORK and NONE forbid one. The nested runtime wire payload is reconstructed once in `EngineCore` and passed explicitly through the scheduler to `BlockManager`, so neither `Config` nor downstream constructors can observe an invalid transfer/spec combination.
+
+*Fork* (`StateTransfer.fork(n)`, GDN). At a rung the request hands its group to the index and takes a fresh one; for exactly one forward it then reads the handed-over group and writes the new one (`non_spec_state_indices_in_tensor` / `non_spec_state_indices_tensor`). A checkpointed group is never written again, which is what makes it safe to share. Resuming is the same move in reverse. The cost is that the *next* forward is bound: it has to leave the replacement self-contained, which takes `n` committed tokens.
+
+*Copy* (`StateTransfer.copy(layout_id)`, DeepSeek-V4). The resident request keeps one contiguous Active Slot ([`StateArena`](../atom/model_ops/attentions/state_arena.py)); an immutable checkpoint scatters that slot's canonical byte stream across an ordered set of arbitrary PAGE units, so the owner is not disturbed and checkpoint allocation does not require a large contiguous extent. Nothing downstream has to cooperate, which is what makes a decode boundary checkpointable at all — see below. The bytes still need a forward to move them, so `checkpoint` records the intent and keeps the record invisible in `COPYING` state. When the next real batch is built, `BlockManager.take_state_maintenance_ops` is the only drain: it returns one typed `StateMaintenanceOps` containing Active Slot relocations, checkpoint stores and checkpoint restores. `ScheduledBatch.state_maintenance_ops` carries that bundle, and `AttentionMetadataBuilder.build` issues every operation on the compute stream before the forward — one place every execution path passes through exactly once per batch. An empty batch does not drain the bundle. Publishing the checkpoint only after its store has ridden a real batch stops a resumer claiming bytes that do not exist yet.
+
+Under fork, when no second group is free the request can adopt the checkpoint group, spending it rather than sharing it. Copy never adopts PAGE fragments as an Active Slot: a hit first obtains a complete contiguous Active Slot and then gathers the checkpoint into it; without a free Active Slot, admission waits.
+
+**Where checkpoints land.** One ladder for every state class: a rung every `--state-checkpoint-interval-tokens` (default 8192) of context. Whether a class takes a given rung comes down to one comparison — how many tokens the *next* forward carries, against that class's `successor_room`. `BlockManager.checkpointers_at` takes the first as an argument (prefill passes what is left of the prompt, decode passes one token) and returns the classes that qualify; `checkpoint_limit` is the same rule solved for prefill's last qualifying rung and `checkpoint_cut` turns it into a chunk boundary, which the scheduler needs up front (`_finalize_prefill_chunk`). Everything else follows from the one comparison: GDN's `fork(1)` always qualifies — its `causal_conv1d` write paths all store the full window to the output slot — V4's `copy(layout_id)` reports 0 and so does too, and a rolling class needing a long hand-over simply never qualifies mid-generation. A backend with no transferable state at all declares `StateTransfer.none()`, which is `inf` on this scale; it is a separate kind rather than a token count precisely because `copy(layout_id)` has to report a real 0 and the two would otherwise be the same number. `hash_blocks` calls `checkpoint` only on an exact position match: a forward that overshoots a rung holds state ahead of the hash it would be filed under. An interval off the hash-block grid is snapped down in `BlockManager.__init__` so every rung has a block hash.
+
+
+**Checkpoints past the prompt.** A long answer crosses rungs the prompt never reached, and a follow-up turn replaying the conversation wants to resume from them — which is also why generated blocks enter the prefix cache at all (`hash_decode_blocks`, bounded by the committed KV length). The room test gates this with no special case: one decode token satisfies GDN's `fork(1)` and V4's `copy()` alike. Two things are gated explicitly in `Scheduler._checkpoint_room` — a request stopping on this step (nothing follows it: no forward to fork into, no batch to copy on) and speculative decode *for a forking class*. The spec exclusion has two independent reasons and either alone is decisive: the spec path's state index tensor has no read-side counterpart, so a fork must never reach it; and a spec step commits `1 + accepted_drafts` tokens, which is what a fork's successor actually gets — the rest is rolled back and re-forwarded — so no promise made when the checkpoint is decided can be kept, and by the time acceptance is known the state is already split across two groups that no single read index spans. That second reason is why DeepSeek-V4 copies rather than forks: it is the only way to checkpoint a decode boundary, which is exactly the boundary multi-turn reuse resumes from. Prefill checkpointing stays live on forking models because `min_fork_tokens` keeps prompt behind every rung and prompt always forwards down the non-spec path. Arithmetic for both compressor rings, replayed from `compress_plan.py`: `logs_claude/verify_v4_min_fork.py`.
+
+**Checkpoints where someone asked for one.** The grid is a guess about where reuse will want to resume; the requests themselves know. Whenever the state gates cut a hit short, `can_allocate` asks the same question a second time with every ladder assumed dense (`resumable_hit(..., assume_checkpointed=True)`), and the gap between the two answers is reuse that exists and is being declined only for want of a checkpoint. `BlockManager._record_checkpoint_demand` turns that into one extra rung for that seq (`Sequence.checkpoint_demand_pos`), which `checkpoint_cut` cuts a chunk at and `checkpointers_at` accepts — off the same field, so the cut and the keep cannot drift. It is decided at admission, where the counterfactual and the admitted hit are both in hand: the hit survives only as `num_cached_tokens`, which the scheduler advances as chunks land, and under pipeline parallelism is already past the chunk by the time `hash_blocks` runs. The request that discovers the gap is the one that pays for it, which is the right way round: it collects none of that reuse and has to compute the prefix anyway. The counterfactual must keep every *other* class's gate applied — a boundary some other class cannot resume from either is not worth checkpointing this one at — and demand below one interval is dropped, so a workload that keeps no checkpoints today gains no chunk cuts from this. The property is self-limiting: the first request finds nothing cached, the second finds the gap and pays one cut, and the third hits outright and finds no gap. `Lost-to-checkpoint` in the cache-stats line is the gap, measured; it falling to zero is the feature working.
+
+**What the interval is pacing.** A checkpoint costs the request that takes it a forward: its prompt gets cut at the rung, and the extra forward is paid whether or not anyone ever resumes from it. That cost is the same under both mechanisms — a checkpoint holds the state as of the end of a forward, so the forward has to end on the boundary either way. Copy additionally consumes PAGE capacity and runs one descriptor-driven scatter or gather per checkpoint or resume; the physical PAGE ids need not be contiguous. That is why the interval counts tokens rather than blocks, and why a prompt shorter than one interval checkpoints nothing at all — on a workload of short, mutually-distinct prompts the hit rate is 0 by construction, so the feature has to be free there. Measured on Qwen3.5-27B tp2 at ISL/OSL 1024/1024, checkpointing unconditionally at the last eligible boundary cost 17.5% of total throughput for zero resumes.
 
 ### Allocation (`allocate`)
 
@@ -263,16 +352,14 @@ def allocate(self, seq: Sequence):
 
 1. Iterates over `seq.num_blocks` blocks.
 2. For each block, computes hash if the block is full (`len(token_ids) == block_size`). Partial (last) blocks get `hash = -1`.
-3. If prefix caching is enabled, looks up `hash_to_block_id`:
-   - **Cache hit:** Verifies `token_ids` match. If the block is already in `used_block_ids`, increments `ref_count`. If it was evicted but still in the free list, re-allocates it. Increments `seq.num_cached_tokens` by `block_size`.
-   - **Cache miss:** Allocates from `free_block_ids[0]`.
-4. Full blocks are registered in `hash_to_block_id`.
+3. If prefix caching is enabled, looks up `kv.lookup(h)`:
+   - **Cache hit:** Verifies `token_ids` match, then `kv.claim(block_id)` — `ref_count += 1` if live, otherwise take it off the free list with its contents intact. Deliberately not `kv.allocate`, whose reset would drop the hash and destroy the entry for everyone else. Increments `seq.num_cached_tokens` by `block_size`.
+   - **Cache miss:** `kv.pop()` then `kv.allocate()`.
+4. Full blocks are registered by `kv.publish(block_id, h, token_ids)`.
 
 **Per-request cache allocation (if `seq.has_per_req_cache`):**
 
-1. Allocates `per_req_cache_equiv_blocks` accounting blocks from the free pool (for memory accounting only).
-2. Stores these block IDs in `per_req_cache_accounting[seq.id]` to track per-request memory usage.
-3. Pops one slot group index from `free_per_req_cache_groups` and assigns it to `seq.per_req_cache_group` (per-request state indexing into the builder-allocated tensors).
+Pops one slot group index from the state pool's free list and assigns it to `seq.per_req_cache_group` (per-request state indexing into the builder-allocated tensors). The resident Active Slot's bytes were already taken out of the budget at sizing time. On a fork checkpoint hit, the group holding the checkpoint is claimed as `seq.state_fork_src` and the request writes a fresh group for one forward. On a copy checkpoint hit, the request keeps its newly allocated contiguous Active Slot and queues a PAGE gather into it in the batch's `StateMaintenanceOps`.
 
 ### Deallocation (`deallocate`)
 
@@ -281,18 +368,11 @@ Called when a sequence finishes or is preempted:
 ```python
 def deallocate(self, seq: Sequence):
     for block_id in reversed(seq.block_table):
-        block = self.blocks[block_id]
-        block.ref_count -= 1
-        if block.ref_count == 0:
-            self._deallocate_block(block_id)
+        self.kv.free(block_id)
     seq.num_cached_tokens = 0
     seq.block_table.clear()
     if seq.has_per_req_cache and seq.per_req_cache_group >= 0:
-        for block_id in self.per_req_cache_accounting.pop(seq.id, []):
-            block = self.blocks[block_id]
-            block.ref_count = 0  # accounting blocks bypass ref-counting
-            self._deallocate_block(block_id)
-        self.free_per_req_cache_groups.append(seq.per_req_cache_group)
+        self.state.release(seq.per_req_cache_group)
         seq.per_req_cache_group = -1
 ```
 
@@ -300,38 +380,34 @@ def deallocate(self, seq: Sequence):
 
 **Per-request cache deallocation (if `seq.has_per_req_cache`):**
 
-1. Releases all accounting blocks for this sequence from `per_req_cache_accounting[seq.id]` directly (bypassing ref-counting, as they are internal to the accounting system).
-2. Returns the slot group index `seq.per_req_cache_group` to `free_per_req_cache_groups` for reuse.
-3. Clears `seq.per_req_cache_group` to `-1` to mark it as released.
+1. Returns the slot group index `seq.per_req_cache_group` to the state pool's free list for reuse.
+2. Clears `seq.per_req_cache_group` to `-1` to mark it as released.
 
 ### Can-allocate and can-append checks
 
 ```python
-def can_allocate(self, seq: Sequence) -> bool:
-    per_req_cache_cost = (
-        self.per_req_cache_equiv_blocks if seq.has_per_req_cache else 0
-    )
-    per_req_cache_slot_ok = (
-        (not seq.has_per_req_cache) or len(self.free_per_req_cache_groups) > 0
-    )
+def can_allocate(self, seq: Sequence) -> int:
+    """Return the number of cache-hit blocks (>=0) if seq fits, else -1."""
+    # State cache has its own reservation; admission only needs a free slot
+    # index, not extra paged blocks.
+    if seq.has_per_req_cache and not self.state.has_free():
+        return -1
     if not self.enable_prefix_caching:
-        return (
-            len(self.free_block_ids_set) >= seq.num_blocks + per_req_cache_cost
-            and per_req_cache_slot_ok
-        )
-    # ... (prefix caching dry-run logic with per_req_cache_cost included)
+        if not self.kv.has_free(self._dcp_num_blocks(len(seq))):
+            return -1
+    # ... (prefix caching dry-run returns the contiguous hit-block count)
 
 def can_append(self, seq: Sequence, num_new_tokens: int = 1) -> bool:
     seq_len = len(seq)
     current_blocks = len(seq.block_table)
     needed_blocks = (seq_len + num_new_tokens + self.block_size - 1) // self.block_size
     new_blocks_needed = max(0, needed_blocks - current_blocks)
-    return len(self.free_block_ids_set) >= new_blocks_needed
+    return self.kv.has_free(new_blocks_needed)
 ```
 
 - `can_allocate` checks that:
-  - Enough free KV blocks exist for the full sequence (`seq.num_blocks + per_req_cache_cost` accounting blocks for per-request state if applicable).
-  - At least one per-request cache slot group is available if the sequence has `has_per_req_cache=True`.
+  - Enough free KV blocks exist for the full sequence. A windowed architecture adds nothing here: its window is a ring inside the per-request state slot, so the slot check below covers it.
+  - At least one per-request cache slot group is available if the sequence has `has_per_req_cache=True`. Per-request state costs no paged blocks — its bytes were reserved ahead of the paged pool at sizing time.
   
 - `can_append` checks whether a decode step needs a new block. Calculates the required block count given `num_new_tokens` (typically `mtp_k + 1` for speculative decode) and returns whether enough free blocks remain.
 
@@ -344,7 +420,7 @@ def may_append(self, seq: Sequence, num_new_tokens: int = 1):
 Called during decode scheduling to extend a sequence's block table:
 
 1. If the sequence length modulo `block_size` falls within `(0, num_new_tokens]`, or `block_size == 1`, a new block is needed:
-   - Allocates from `free_block_ids` and appends to `block_table`.
+   - Takes a block via `kv.pop()` + `kv.allocate()` and appends to `block_table`.
    - For `block_size == 1`, immediately computes and stores the hash.
 2. If `seq_len % block_size == 0`, the last block is now full — computes and stores its hash using the chained prefix.
 3. Otherwise the last block is partially filled with `hash = -1` (hash deferred until full).
@@ -380,9 +456,9 @@ Blocks form a hash chain: each block's hash incorporates the previous block's ha
 During `allocate()`, for each full block:
 
 1. Compute the block hash via the chain.
-2. Look up `hash_to_block_id.get(h, -1)`.
-3. If found, verify `self.blocks[block_id].token_ids == token_ids` (guard against hash collisions).
-4. **Hit:** Reuse the block. If already in `used_block_ids`, increment `ref_count`. Add `block_size` to `seq.num_cached_tokens`.
+2. Look up `kv.lookup(h)` (-1 on a miss).
+3. If found, verify `kv.block(block_id).token_ids == token_ids` (guard against hash collisions).
+4. **Hit:** `kv.claim(block_id)`. Add `block_size` to `seq.num_cached_tokens`.
 5. **Miss (or first miss in chain):** Once a cache miss occurs, all subsequent blocks in the sequence are also misses (`cache_miss = True` is sticky). Allocate fresh blocks from the free list.
 
 ### Reference counting
@@ -563,7 +639,8 @@ class Sequence:
 | `num_cached_tokens` | `int` | Tokens served from prefix cache |
 | `block_table` | `list[int]` | Ordered list of block IDs assigned to this sequence |
 | `has_per_req_cache` | `bool` | Whether the model's attention type maintains per-request state outside the paged KV pool (set at sequence init; True for GDN-based models, future stateful attentions) |
-| `per_req_cache_group` | `int` | Per-request stateful-attention slot group index (assigned by BlockManager during allocation, `-1` if unallocated) |
+| `per_req_cache_group` | `int` | Per-request stateful-attention slot group index the sequence WRITES (assigned by BlockManager during allocation, `-1` if unallocated) |
+| `state_fork_src` | `int` | Group the next forward READS its incoming state from when a state fork is pending; `-1` (read == write) otherwise. Set by BlockManager on publish/resume, cleared by the scheduler once a batch has carried it |
 | `last_token` | `int` | Most recently appended token ID |
 | `temperature` | `float` | Sampling temperature (from `SamplingParams`) |
 | `max_tokens` | `int` | Max completion tokens (from `SamplingParams`, default 64) |

@@ -778,7 +778,9 @@ class MiniMaxM3DenseAttentionForVllm(nn.Module, AttentionLayerBase):
             cache_dtype, vllm_config.model_config
         )
         self.calculate_kv_scales = (
-            cache_config.calculate_kv_scales if cache_config is not None else False
+            getattr(cache_config, "calculate_kv_scales", False)
+            if cache_config is not None
+            else False
         )
         self.quant_config = None
         self.kv_cache = torch.tensor([])

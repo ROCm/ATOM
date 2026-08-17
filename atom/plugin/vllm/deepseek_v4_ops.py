@@ -35,13 +35,13 @@ def _v4_decode_hca_compress_tail_kernel(
     block_tables_ptr,  # [num_reqs, MAX_BLOCKS] int — per-seq paged block ids
     bt_stride_bs,  # block_tables row stride (elements)
     hca_indices_ptr,  # [>=hca_indptr[T]] int32 OUT — HCA compress section (head)
-    swa_pages,  # num_slots * cs — boundary into the compress region
+    envelope_rows,  # rows occupied by one physical proxy block
     win: tl.constexpr,  # SWA window — per-token prefix length cap
     BLOCK_J: tl.constexpr,  # next_pow2(win) — HCA loop chunk size
 ):
     """One program per token. Writes the HCA compress segment at the slice
     HEAD ``[hca_indptr[t], +n_hca)``; the j-th committed HCA entry maps to
-    physical page ``swa_pages + block_tables[bid, j]``.
+    physical row ``block_tables[bid, j] * envelope_rows``.
 
     Ragged-packed layout (since the MI355 decode-kernel retune, #1116): the
     compress section occupies the head of each token's slice and the SWA
@@ -68,7 +68,7 @@ def _v4_decode_hca_compress_tail_kernel(
         k = j + i
         mask = k < n_hca
         bt = tl.load(block_tables_ptr + bt_row_base + k, mask=mask, other=0)
-        tl.store(hca_indices_ptr + base + k, swa_pages + bt, mask=mask)
+        tl.store(hca_indices_ptr + base + k, bt * envelope_rows, mask=mask)
 
 
 @triton.jit
@@ -201,7 +201,7 @@ def write_v4_decode_hca_compress_tail(
     hca_indices: torch.Tensor,
     T: int,
     win: int,
-    swa_pages: int,
+    envelope_rows: int,
 ) -> None:
     """In-place GPU fill of the decode HCA compress-section paged offsets.
 
@@ -233,7 +233,7 @@ def write_v4_decode_hca_compress_tail(
                                            (slice tail) left to sibling.
       T:                       int — real token count (grid size).
       win:                     int — SWA window size.
-      swa_pages:               int — ``num_slots * cs`` boundary in unified_kv.
+      envelope_rows:           int — row stride of one physical proxy block.
     """
     if T == 0:
         return
@@ -253,7 +253,7 @@ def write_v4_decode_hca_compress_tail(
         block_tables,
         block_tables.stride(0),
         hca_indices,
-        swa_pages,
+        envelope_rows,
         win=win,
         BLOCK_J=BLOCK_J,
     )
