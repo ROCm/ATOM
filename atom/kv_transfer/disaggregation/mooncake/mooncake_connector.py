@@ -116,9 +116,7 @@ def _parse_ib_devices(configured_devices: str) -> list[str]:
     """Normalize a comma-separated Mooncake RDMA device filter."""
     return list(
         dict.fromkeys(
-            device.strip()
-            for device in configured_devices.split(",")
-            if device.strip()
+            device.strip() for device in configured_devices.split(",") if device.strip()
         )
     )
 
