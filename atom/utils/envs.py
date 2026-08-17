@@ -75,6 +75,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FUSED_COMPRESS_USE_FLYDSL": lambda: os.getenv(
         "ATOM_FUSED_COMPRESS_USE_FLYDSL", "auto"
     ).lower(),
+    # Fused KDA decode: conv1d + recurrence + gated RMSNorm in one kernel.
+    # Disabled by default.
+    "ATOM_ENABLE_FUSED_KDA_DECODE_TRITON": lambda: (
+        os.getenv("ATOM_ENABLE_FUSED_KDA_DECODE_TRITON", "0") == "1"
+    ),
     # QK-norm-rope-cache-quant fusion for Qwen3 dense and MoE; disabled by default.
     "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION", "0") == "1"
