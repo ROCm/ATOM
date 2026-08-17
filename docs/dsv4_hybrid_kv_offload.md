@@ -1,85 +1,86 @@
-# DeepSeek V4 Hybrid KV Cache Offload
+# DeepSeek V4 混合 KV Cache Offload 说明
 
-DeepSeek V4 offload treats a reusable checkpoint as an atomic pair:
+DeepSeek V4 的 offload 将一个可复用检查点定义为不可拆分的组合：
 
 ```text
-checkpoint = PAGE data + one complete SLOT sidecar
+检查点 = PAGE 数据 + 一个完整的 SLOT sidecar
 ```
 
-PAGE and SLOT share the main HBM allocation, but remain separate logical and
-storage objects. A PAGE-only hit is not sufficient to resume a stateful DSV4
-request.
+PAGE 和 Active SLOT 共用主 HBM allocation，但仍是不同的逻辑对象。对于
+有状态的 DSV4 请求，只命中 PAGE 不足以恢复执行。
 
-## HBM layout
+## HBM 布局
 
-`DeepseekV4AttentionMetadataBuilder.allocate_per_req_cache()` creates one byte
-allocation and carves the main NoPE and optional RoPE planes from it. Each plane
-contains a PAGE address space and pre-reserved Active SLOT capacity. Sharing the
-physical allocation does not make an Active SLOT a PAGE ID.
+`DeepseekV4AttentionMetadataBuilder.allocate_per_req_cache()` 只创建一个字节
+allocation，再从中切出主 NoPE plane 和可选的 RoPE plane。每个 plane 包含
+PAGE 地址空间和预留的 Active SLOT 容量。共用物理 allocation 不代表 Active
+SLOT 也是一个 PAGE ID。
 
 ```text
-One physical allocation: per_req_pool
+一个物理 allocation: per_req_pool
 
-  Low address                                                   High address
-       |                                                             |
-       v                                                             v
+  低地址                                                       高地址
+     |                                                            |
+     v                                                            v
 
   NoPE plane
   +------------------------------------------+--------------------------+
-  | PAGE address space                       | Active SLOT capacity     |
+  | PAGE 地址空间                            | Active SLOT 容量         |
   | PAGE 0 | PAGE 1 | ... | PAGE N-1        | ... | group 1 | group 0 |
   +------------------------------------------+--------------------------+
-    managed by BlockPool                       managed by StateGroupPool
-    forward indexed                            reverse indexed
+    BlockPool 管理                              StateGroupPool 管理
+    正向索引                                    反向索引
 
-  RoPE plane, when FP8 KV is enabled
+  启用 FP8 KV 时的 RoPE plane
   +------------------------------------------+--------------------------+
-  | PAGE address space                       | Active SLOT capacity     |
+  | PAGE 地址空间                            | Active SLOT 容量         |
   | PAGE 0 | PAGE 1 | ... | PAGE N-1        | ... | group 1 | group 0 |
   +------------------------------------------+--------------------------+
 
-  Separate PAGE-only allocation
+  独立的 PAGE-only allocation
   +--------------------+--------------------+--------------------+
   | CSA indexer PAGE 0 | CSA indexer PAGE 1 |        ...         |
   +--------------------+--------------------+--------------------+
 ```
 
-Free PAGE units remain inside the PAGE address space. `BlockPool` tracks their
-logical state; their position in this diagram does not imply their state:
+空闲 PAGE unit 仍位于左侧 PAGE 地址空间。`BlockPool` 记录每个 PAGE ID 的
+逻辑状态，物理位置本身不表示它当前是否空闲：
 
 ```text
 PAGE ID       0          1          2          3          4
           +----------+----------+----------+----------+----------+
-state     | live KV  | free     | prefix   | state    | free     |
-          |          |          | cached   | ckpt unit|          |
+状态      | 在用 KV  | 空闲     | 前缀缓存 | 状态检查 | 空闲     |
+          |          |          |          | 点 unit  |          |
           +----------+----------+----------+----------+----------+
 ```
 
-The right side contains only capacity for request-owned Active SLOT groups. A
-free group there is available for admitting another active request; it is not a
-free PAGE unit and is not where a retained PAGE-backed checkpoint lives.
+右侧只用于预留请求持有的 Active SLOT。右侧的空闲 group 可以分配给新的活跃
+请求，但它不是空闲 PAGE，也不用于保存 PAGE-backed 状态检查点。
 
-One PAGE contains compressed KV envelopes and the corresponding CSA indexer
-regions. One SLOT contains the complete mutable request state:
+一个 PAGE 包含压缩 KV envelope 以及对应的 CSA indexer region。一个 Active
+SLOT 包含请求的全部可变状态：
 
 ```text
 +------------------+-----------------------+-------------------+
-| compressor state | SWA rings, all layers | MTP extra entries |
+| compressor state | 所有层的 SWA ring     | MTP 额外条目      |
 +------------------+-----------------------+-------------------+
 ```
 
-MTP is covered by the normal SLOT path because the ring width is
-`win_with_spec = window_size + mtp_k`.
-
-`get_kv_transfer_tensors()` exports the two logical views:
+MTP 不需要单独的 offload 路径，因为 ring 宽度已经包含 speculative token：
 
 ```text
-block_regions       PAGE, indexed forward by physical block ID
-swa_block_regions   full SLOT, indexed backward by request group ID
-staging_region      compressor-only P/D staging; not a sidecar source
+win_with_spec = window_size + mtp_k
 ```
 
-The address ABI is:
+`get_kv_transfer_tensors()` 导出两个逻辑视图：
+
+```text
+block_regions       PAGE，按物理 block ID 正向索引
+swa_block_regions   完整 Active SLOT，按请求 group ID 反向索引
+staging_region      仅含 compressor state 的 P/D staging，不能作为 sidecar 来源
+```
+
+对应的地址 ABI 为：
 
 ```text
 PAGE address(block_id):
@@ -89,26 +90,26 @@ Active SLOT address(group_id):
     base + total_bytes - (group_id + 1) * unit_bytes
 ```
 
-Reverse Active SLOT indexing keeps existing groups at stable addresses when the
-SLOT side grows toward the PAGE side.
+Active SLOT 使用反向索引，因此 SLOT 侧向 PAGE 侧扩展时，已有 group 的地址
+仍能保持稳定。
 
-### Active SLOT, native checkpoint, and offload sidecar
+### Active SLOT、原生检查点与 offload sidecar
 
-The three storage roles are distinct:
+三者的存储职责不同：
 
 ```text
-Active request state
---------------------
+活跃请求状态
+------------
 
 Active SLOT group G
 +-----------------------------+
 | compressor state + SWA ring |
 +-----------------------------+
-       contiguous, right side
+       右侧连续地址
 
 
-Native HBM state checkpoint
----------------------------
+原生 HBM 状态检查点
+-------------------
 
 Active SLOT group G
           |
@@ -118,7 +119,7 @@ Active SLOT group G
    +--------+  +---------+       +---------+
    | PAGE 7 |  | PAGE 31 |  ...  | PAGE 92 |
    +--------+  +---------+       +---------+
-      arbitrary PAGE IDs in the left-side PAGE address space
+       左侧 PAGE 地址空间中的任意 PAGE ID，不要求连续
 
 
 LMCache SLOT offload
@@ -130,16 +131,16 @@ Active SLOT group G
 GPU staging row --> pinned CPU frame --> CPU/NVMe AOS1 sidecar
 ```
 
-`PagedStateCheckpointCoordinator` stores native state checkpoints in arbitrary
-free PAGE units obtained from `BlockPool`; it does not keep them in free Active
-SLOT groups. The LMCache sidecar path does not retain HBM PAGE units at all. It
-uses a bounded temporary GPU row and then persists the complete SLOT in CPU or
-NVMe storage.
+`PagedStateCheckpointCoordinator` 从 `BlockPool` 申请任意空闲 PAGE unit 来
+保存原生状态检查点，不会把检查点留在空闲 Active SLOT group 中。
 
-## Storage representation
+LMCache sidecar 路径不长期占用 HBM PAGE。它只使用有界的临时 GPU staging
+row，随后把完整 SLOT 持久化到 CPU 或 NVMe。
 
-`DSV4PageSlotCodec` owns both geometry descriptions and uses Triton gather and
-scatter kernels for raw byte movement.
+## Offload 存储格式
+
+`DSV4PageSlotCodec` 同时持有 PAGE 和 SLOT 的 geometry，并通过 Triton
+gather/scatter kernel 搬运原始字节。
 
 ```text
 get_kv_transfer_tensors()
@@ -158,119 +159,119 @@ get_kv_transfer_tensors()
                          |                                               |
                          v                                               v
 
-              PAGE objects in LMCache                         SLOT sidecar
-              token/chunk addressed                           boundary addressed
+              LMCache PAGE 对象                              SLOT sidecar
+              token/chunk 寻址                               boundary 寻址
 
   +------------------------------------------+     +----------------------------+
-  | block 0                                  |     | AOS1 header, 128 bytes     |
+  | block 0                                  |     | AOS1 header，128 bytes     |
   |   NoPE | RoPE | indexer layer 0 | ...    |     | boundary tokens/hash       |
   +------------------------------------------+     | layout fingerprint         |
   | block 1                                  |     | TP size/rank               |
   |   NoPE | RoPE | indexer layer 0 | ...    |     | payload size + CRC32       |
   +------------------------------------------+     +----------------------------+
-                                                   | full SLOT payload          |
+                                                   | 完整 SLOT payload          |
                                                    | NoPE slot | RoPE slot       |
                                                    +----------------------------+
 ```
 
-PAGE objects keep LMCache's normal token-derived chunk keys. A SLOT uses a
-content-derived key containing the chained boundary hash, layout fingerprint,
-and TP identity. The payload does not store the source group ID; restore always
-targets the new request's allocated destination group.
+PAGE 对象继续使用 LMCache 根据 token 生成的 chunk key。SLOT 使用内容寻址
+key，其中包含链式 boundary hash、layout fingerprint 和 TP 身份。
 
-## Save path
+SLOT payload 不保存源 `group_id`。恢复时总是写入新请求刚分配的
+`destination_group`。
 
-At an aligned checkpoint boundary, the scheduler emits `SaveSpec` and
-`SlotSaveSpec`. Connector metadata is dispatched before the next forward, so
-the worker snapshots the mutable SLOT on the current stream before that forward
-can update it.
+## 保存路径
+
+请求到达对齐的检查点边界后，scheduler 生成 `SaveSpec` 和 `SlotSaveSpec`。
+connector metadata 会在下一次 forward 前下发，因此 worker 可以先在当前
+stream 上快照可变的 Active SLOT，再允许后续 forward 修改它。
 
 ```text
-Scheduler                         Worker current stream
----------                         ---------------------
+Scheduler                         Worker 当前 stream
+---------                         -----------------
 
-prefill reaches boundary B
+prefill 到达边界 B
         |
         | build_connector_meta()
         | SaveSpec + SlotSaveSpec
         v
-                              previous forward finished
+                              上一次 forward 完成
                                         |
                                         v
                               gather_slot(source_group)
                               HBM SLOT --> GPU staging row
                                         |
-                                  record CUDA event
+                                  记录 CUDA event
                                         |
-                                        +------> next forward may mutate SLOT
+                                        +------> 下一次 forward 可修改 SLOT
 
 
-Background save worker
-----------------------
+后台保存线程
+------------
 
-wait CUDA event
+等待 CUDA event
       |
       v
 GPU staging row --D2H--> pinned CPU AOS1 frame
       |
-      +--> release GPU staging row
+      +--> 释放 GPU staging row
       |
       v
-gather completed PAGE blocks
+gather 已完成的 PAGE blocks
       |
       v
 Triton pack --> D2H --> LMCache.store(PAGE chunks)
       |
       v
-wait until PAGE is visible through boundary B
+等待 PAGE 在边界 B 前全部可见
       |
       v
-finalize AOS1 header and CRC
+写入 AOS1 header 和 CRC
       |
       v
 StorageManager.put(SLOT sidecar)
       |
       v
-wait until sidecar is visible
+等待 sidecar 可见
       |
       v
-all TP ranks report the same SaveOperationId
+所有 TP rank 上报同一个 SaveOperationId
       |
       v
-scheduler commits boundary hash B
+scheduler 提交 boundary hash B
 ```
 
-The visibility order is deliberate. Publishing the sidecar before all PAGE
-chunks are visible could authorize an incomplete checkpoint.
+可见性顺序不能颠倒。只有边界 B 之前的 PAGE 全部可见后才能发布 sidecar，
+否则 sidecar 可能错误地授权一个不完整检查点。
 
-## Load path
+## 加载路径
 
-The scheduler first queries the normal LMCache PAGE prefix. For a stateful DSV4
-request, it reduces that hit to the newest aligned boundary whose sidecar was
-committed by all TP ranks in the current scheduler session.
+scheduler 首先查询普通 LMCache PAGE prefix。对于有状态的 DSV4 请求，它会
+把 PAGE hit 收缩到当前 scheduler session 中所有 TP rank 已提交 sidecar 的
+最新对齐边界。
 
 ```text
 Scheduler
 ---------
 
-same prompt
+相同 prompt
     |
     v
 LMCache lookup --> PAGE hit H
     |
     v
-select newest committed PAGE+SLOT boundary B
+选择最新已提交的 PAGE+SLOT 边界 B
     |
-    +--> no committed SLOT: miss and recompute
-    |
-    v
-allocate destination PAGE blocks and SLOT group
+    +--> 没有已提交 SLOT：miss，重新计算
     |
     v
-emit LoadSpec + SlotLoadSpec(destination_group)
+分配目标 PAGE blocks 和 Active SLOT group
     |
     v
-park request in WAITING_FOR_REMOTE_KVS
+生成 LoadSpec + SlotLoadSpec(destination_group)
+    |
+    v
+请求进入 WAITING_FOR_REMOTE_KVS
 
 
 Worker
@@ -279,64 +280,63 @@ Worker
 LMCache.retrieve(PAGE)
         |
         v
-CPU MemoryObj --> bounded GPU staging
+CPU MemoryObj --> 有界 GPU staging
         |
         v
-Triton scatter PAGE by physical block ID
+Triton 按物理 block ID scatter PAGE
         |
-        +--> missing PAGE: fail
+        +--> PAGE 缺失：失败
         |
         v
-borrow and validate AOS1 sidecar
+借用并校验 AOS1 sidecar
         |
-        | magic/version, boundary, payload size,
-        | fingerprint, TP identity, and CRC32
+        | magic/version、boundary、payload size、
+        | fingerprint、TP 身份和 CRC32
         |
-        +--> missing or invalid sidecar: fail
+        +--> sidecar 缺失或无效：失败
         |
         v
 CPU payload --> GPU staging --> scatter_slot(destination_group)
         |
         v
-all TP ranks finish
+所有 TP rank 完成
         |
         v
-wake request and continue suffix prefill/decode
+唤醒请求，继续 suffix prefill/decode
 ```
 
-The worker restores PAGE first and SLOT second. The composite load succeeds
-only when both succeed; otherwise the request falls back to recomputation.
+worker 先恢复 PAGE，再恢复 SLOT。只有两者都成功，composite load 才成功；
+否则请求回退到重新计算。
 
-## Main code paths
+## 主要代码入口
 
 - `atom/model_ops/attentions/deepseek_v4_attn.py`
-  - `allocate_per_req_cache()` creates the shared planes and embeds the state
-    arena in each complete SLOT.
-  - `get_kv_transfer_tensors()` exports forward PAGE and reverse SLOT regions.
+  - `allocate_per_req_cache()` 创建共享 plane，并把 state arena 嵌入每个完整
+    Active SLOT。
+  - `get_kv_transfer_tensors()` 导出正向 PAGE region 和反向 SLOT region。
 - `atom/model_ops/attentions/v4_pool_geometry.py`
-  - `UnifiedPoolGeometry` owns all PAGE/SLOT address arithmetic.
+  - `UnifiedPoolGeometry` 统一维护 PAGE/SLOT 地址计算。
 - `atom/model_engine/block_pool.py`
-  - `BlockPool` tracks live, cached, free, and raw-checkpoint PAGE units.
+  - `BlockPool` 管理在用、缓存、空闲和状态检查点 PAGE unit。
 - `atom/model_engine/page_unit_checkpoint.py`
-  - `PagedStateCheckpointCoordinator` reserves PAGE units for native HBM state
-    checkpoints and releases them as one atomic object.
+  - `PagedStateCheckpointCoordinator` 为原生 HBM 状态检查点申请 PAGE unit，
+    并将其作为一个原子对象释放。
 - `atom/kv_transfer/offload/hybrid/dsv4/codec.py`
-  - `DSV4PageSlotCodec` builds PAGE/SLOT copy plans.
-  - `DSV4CheckpointCodec` implements the AOS1 frame.
-  - `DSV4CheckpointStore` persists sidecars through LMCache storage tiers.
+  - `DSV4PageSlotCodec` 构造 PAGE/SLOT copy plan。
+  - `DSV4CheckpointCodec` 实现 AOS1 frame。
+  - `DSV4CheckpointStore` 通过 LMCache storage tier 持久化 sidecar。
 - `atom/kv_transfer/offload/hybrid/dsv4/triton_page_slot.py`
-  - Implements forward and reverse raw-byte gather/scatter.
+  - 实现正向和反向的原始字节 gather/scatter。
 - `atom/kv_transfer/offload/hybrid/dsv4/connector.py`
-  - `DSV4OffloadScheduler` selects boundaries and builds request metadata.
-  - `DSV4OffloadConnector` performs snapshot, PAGE transfer, sidecar commit,
-    validation, and restore.
+  - `DSV4OffloadScheduler` 选择边界并构造请求 metadata。
+  - `DSV4OffloadConnector` 执行快照、PAGE 传输、sidecar 提交、校验和恢复。
 - `atom/kv_transfer/offload/_block_gpu_connector.py`
-  - Bridges LMCache MemoryObjs and ATOM PAGE blocks through bounded GPU staging.
+  - 通过有界 GPU staging 在 LMCache `MemoryObj` 和 ATOM PAGE block 之间传输。
 
-## Current safety constraints
+## 当前安全约束
 
-- Stateful DSV4 restore requires both PAGE and SLOT at the same boundary.
-- A stateful offload load is skipped when the real HBM prefix floor is nonzero;
-  version 1 does not merge an HBM state checkpoint with a later SLOT sidecar.
-- SLOT commits are scheduler-session-local.
-- FP4 indexer offload and pipeline parallelism greater than one are rejected.
+- 有状态 DSV4 必须在同一边界同时恢复 PAGE 和 SLOT。
+- 当实际 HBM prefix floor 非零时，跳过有状态 offload load；版本 1 尚不支持
+  把 HBM 状态检查点与更晚边界的 SLOT sidecar 合并。
+- SLOT commit 只在当前 scheduler session 内有效。
+- 尚不支持 FP4 indexer offload，也不支持 `pipeline_parallel_size > 1`。
