@@ -91,16 +91,22 @@ jobs:
         run: bash ./.github/scripts/check_heavy_ci_gate.sh
 
 
-  duplicate-success:
-    if: ${{ needs.ci-gate.outputs.reason == 'duplicate-successful-run' }}
+  gate-result:
+    if: ${{ needs.ci-gate.outputs.should_run != 'true' }}
     needs: [ci-gate]
-    name: Heavy CI already passed for this SHA
+    name: Heavy CI not required
     runs-on: ubuntu-latest
+    env:
+      GATE_REASON: ${{ needs.ci-gate.outputs.reason }}
+      DUPLICATE_RUN_URL: ${{ needs.ci-gate.outputs.duplicate_run_url }}
     steps:
-      - name: Report reused heavy CI run
+      - name: Report gate decision
         run: |
-          echo "Heavy CI already passed for this PR head SHA."
-          echo "Previous successful run: ${{ needs.ci-gate.outputs.duplicate_run_url }}"
+          echo "Heavy CI was not required for this trigger."
+          echo "Reason: ${GATE_REASON}"
+          if [ -n "${DUPLICATE_RUN_URL}" ]; then
+            echo "Previous successful run: ${DUPLICATE_RUN_URL}"
+          fi
 
   run-tests:
     if: ${{ needs.ci-gate.outputs.should_run == 'true' }}
