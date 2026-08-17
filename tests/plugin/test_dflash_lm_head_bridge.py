@@ -204,8 +204,57 @@ def test_install_is_noop_without_sglang_dflash(monkeypatch):
 
 
 def test_install_warns_when_target_method_is_gone(dflash_module, caplog):
-    """If SGLang renames the method the patch must warn, not fail silently."""
+    """Method renamed and the server args unreadable: warn, do not raise.
+
+    The fake sglang package has no ``server_args`` module, so this exercises
+    the "cannot tell whether DFLASH is on" branch.
+    """
     del dflash_module.DFlashWorkerV2._greedy_sample_from_vocab_parallel_head
+    with caplog.at_level("WARNING"):
+        install_dflash_lm_head_patch()
+    assert "DFLASH" in caplog.text
+    assert not getattr(dflash_module.DFlashWorkerV2, _PATCH_FLAG, False)
+
+
+def _fake_server_args(monkeypatch, *, algorithm, tp_size):
+    """Make ``sglang.srt.server_args.get_global_server_args`` importable."""
+    module = types.ModuleType("sglang.srt.server_args")
+    module.get_global_server_args = lambda: types.SimpleNamespace(
+        speculative_algorithm=algorithm, tp_size=tp_size
+    )
+    monkeypatch.setitem(sys.modules, "sglang.srt.server_args", module)
+
+
+@pytest.mark.parametrize("algorithm", ["DFLASH", "SpeculativeAlgorithm.DFLASH"])
+def test_install_fails_closed_for_dflash_across_ranks(
+    dflash_module, monkeypatch, algorithm
+):
+    """Method renamed while DFLASH runs at TP>1: refuse to start.
+
+    Continuing would hand SGLang's stock sampler an ATOM-sharded head, which
+    returns per-rank local vocab indices as global token ids.
+    """
+    del dflash_module.DFlashWorkerV2._greedy_sample_from_vocab_parallel_head
+    _fake_server_args(monkeypatch, algorithm=algorithm, tp_size=8)
+    with pytest.raises(RuntimeError, match="Refusing to start"):
+        install_dflash_lm_head_patch()
+
+
+@pytest.mark.parametrize(
+    "algorithm, tp_size",
+    [
+        ("DFLASH", 1),  # single rank: no vocab sharding to get wrong
+        (None, 8),  # no speculative decoding: the sampler never runs
+        ("EAGLE3", 8),  # a different algorithm, not routed through this head
+    ],
+)
+def test_install_only_warns_when_the_broken_path_is_unreachable(
+    dflash_module, monkeypatch, caplog, algorithm, tp_size
+):
+    """The patch is installed for all of Qwen3.5, so a renamed method must not
+    take down servers that never reach the broken sampler."""
+    del dflash_module.DFlashWorkerV2._greedy_sample_from_vocab_parallel_head
+    _fake_server_args(monkeypatch, algorithm=algorithm, tp_size=tp_size)
     with caplog.at_level("WARNING"):
         install_dflash_lm_head_patch()
     assert "DFLASH" in caplog.text

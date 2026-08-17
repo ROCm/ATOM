@@ -51,11 +51,44 @@ logger = logging.getLogger(__name__)
 _PATCH_FLAG = "_atom_dflash_external_lm_head_patch"
 
 
+def _dflash_across_ranks_configured() -> bool | None:
+    """Is this server configured to run DFLASH over more than one TP rank?
+
+    That is the exact combination the patch exists for: at TP 1 there is no
+    vocab sharding to get wrong, and without DFLASH the draft sampler never
+    runs. Returns ``None`` when the server args cannot be read, so the caller
+    can tell "not configured" apart from "unknown".
+    """
+    try:
+        from sglang.srt.server_args import get_global_server_args
+
+        server_args = get_global_server_args()
+    except Exception:  # noqa: BLE001 - any failure here means "cannot tell"
+        return None
+    if server_args is None:
+        return None
+    algorithm = getattr(server_args, "speculative_algorithm", None)
+    if algorithm is None:
+        return False
+    try:
+        tp_size = int(getattr(server_args, "tp_size", 1) or 1)
+    except (TypeError, ValueError):
+        return None
+    # `speculative_algorithm` is a plain string when it comes from the CLI and a
+    # SpeculativeAlgorithm enum member once resolved; match either spelling.
+    return tp_size > 1 and "DFLASH" in str(algorithm).upper()
+
+
 def install_dflash_lm_head_patch() -> None:
     """Prefer ``lm_head.compute_argmax_token`` in DFLASH draft greedy sampling.
 
-    Idempotent, and a no-op when SGLang has no DFLASH worker (older releases)
-    or when the method it patches has been renamed.
+    Idempotent, and a no-op when SGLang has no DFLASH worker (older releases).
+
+    Raises ``RuntimeError`` when the method it patches has been renamed *and*
+    the server is configured for DFLASH at TP>1 -- the one case where carrying
+    on would silently produce wrong draft tokens. Any other configuration only
+    gets a warning, because this patch is installed for the whole Qwen3.5
+    family regardless of whether DFLASH is enabled.
     """
     try:
         from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
@@ -68,11 +101,29 @@ def install_dflash_lm_head_patch() -> None:
 
     original = getattr(DFlashWorkerV2, "_greedy_sample_from_vocab_parallel_head", None)
     if original is None:
-        logger.warning(
-            "SGLang DFlashWorkerV2 has no _greedy_sample_from_vocab_parallel_head; "
-            "ATOM cannot route DFLASH draft sampling through its lm_head. "
-            "TP>1 draft tokens would be wrong, so DFLASH must not be used."
+        problem = (
+            "SGLang DFlashWorkerV2 has no _greedy_sample_from_vocab_parallel_head, "
+            "so ATOM cannot route DFLASH draft sampling through its lm_head. At "
+            "TP>1 the stock sampler emits per-rank local vocab indices as global "
+            "token ids, i.e. silently wrong draft tokens."
         )
+        configured = _dflash_across_ranks_configured()
+        if configured:
+            # Fail closed: this server really is about to run the broken path,
+            # and wrong draft tokens are far worse than refusing to start.
+            raise RuntimeError(
+                f"{problem} Refusing to start. Either drop "
+                "--speculative-algorithm DFLASH, or use an SGLang build that "
+                "still provides that method."
+            )
+        if configured is None:
+            logger.warning(
+                "%s Could not read the SGLang server args to check whether "
+                "DFLASH is enabled; if it is, draft tokens will be wrong.",
+                problem,
+            )
+        else:
+            logger.warning("%s DFLASH is not enabled here, so continuing.", problem)
         return
 
     def patched(
