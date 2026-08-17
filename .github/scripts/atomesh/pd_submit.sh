@@ -587,10 +587,10 @@ read_slurm_exit_code() {
   else
     sacct_line="$(sacct -j "${job_id}" -X -n -P -o State,ExitCode 2>/dev/null | awk -F'|' 'NF { print; exit }' || true)"
   fi
+  echo "sacct_line=${sacct_line}"
   if [[ -z "${sacct_line}" ]]; then
     return 0
   fi
-  echo "sacct_line=${sacct_line}"
 
   SLURM_STATE="${sacct_line%%|*}"
   SLURM_EXIT_CODE="${sacct_line##*|}"
