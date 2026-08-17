@@ -485,6 +485,12 @@ class SGLangGDNForwardContext:
             "non_spec_query_start_loc": query_start_loc,
             "spec_state_indices_tensor": None,
             "non_spec_state_indices_tensor": idx,
+            # SGLang owns the mamba slots on this path and never forks a
+            # request's state, so the slots the state is read from are the ones
+            # it is written to. GatedDeltaNet.forward indexes this
+            # unconditionally, so leaving it at its `None` default makes the
+            # non-verify path raise as soon as a GDN layer runs.
+            "non_spec_state_indices_in_tensor": idx,
             "spec_sequence_masks": None,
             "spec_token_indx": None,
             "non_spec_token_indx": None,
