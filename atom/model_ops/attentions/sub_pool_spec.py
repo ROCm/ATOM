@@ -45,8 +45,6 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from enum import Enum
 
-from atom.utils import envs
-
 
 class Pool(Enum):
     """Which budget region an entry class draws from."""
@@ -96,8 +94,6 @@ def state_pool(
     extra_entries: int = 0,
 ) -> SubPoolSpec:
     """A per-request state entry class."""
-    if envs.is_set("STATE_CKPT_EXTRA_ENTRIES"):
-        extra_entries = int(envs.STATE_CKPT_EXTRA_ENTRIES)
     return SubPoolSpec(Pool.STATE, name, entry_bytes, entries_per_req, extra_entries)
 
 

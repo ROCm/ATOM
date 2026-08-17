@@ -40,6 +40,7 @@ Per-slot cost (V4-Pro, BF16 SWA + fp32 tail buffers, 30 CSA + 31 HCA + 1 dense):
 import logging
 import math
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -58,8 +59,12 @@ from atom.distributed.pcp_utils import (
     pcp_round_robin_query_indices,
 )
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
+from atom.model_engine.page_unit_checkpoint import (
+    CheckpointRestoreOp,
+    CheckpointStoreOp,
+)
 from atom.model_engine.scheduler import ScheduledBatch
-from atom.model_engine.state_pool import StateTransfer
+from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attentions.backends import (
     AttentionBackend,
     AttentionMetadataBuilder,
@@ -730,12 +735,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         because a plane is one width and a field is the one thing in this
         layout that is priced in bytes.
 
-        Putting it here rather than in a plane of its own is what makes it
-        travel: `copy_state_entries` copies a whole slot, so a checkpoint
-        carries the window with the state. A private plane would not be
-        copied, and a request resuming a cached prefix would draft against
-        whatever the slot's previous occupant left — the same shape of bug
-        #1417 was, minus the correctness half, since drafts are verified.
+        Keeping it in the slot makes checkpoint scatter carry the window too.
 
         Field order is the wire order of a whole entry, so it is also the
         order a PD transfer or a checkpoint sees the bytes in.
@@ -767,51 +767,22 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         return fields
 
     def state_transfer(self) -> StateTransfer:
-        """A copy: one request's compressor state is one contiguous entry.
+        """Declare PAGE-copy checkpoints with the versioned DSV4 layout."""
+        ratios = ",".join(str(r) for r in self._geometry_ratios())
+        layout_id = (
+            "dsv4-paged-state-v1"
+            f":block={self.block_size}:ring={self.win_with_spec}"
+            f":dims={self.head_dim},{self.rope_head_dim},{self.index_head_dim}"
+            f":state={self.csa_main_state_shape},{self.csa_idx_state_shape},"
+            f"{self.hca_main_state_shape}"
+            f":main={'fp8-2buff' if self._kv_fp8 else 'bf16'}"
+            f":index={'fp4' if self._indexer_fp4 else 'fp8'}"
+            f":ratios={ratios}"
+        )
+        return StateTransfer.copy(layout_id)
 
-        `StateArena` already lays a request's whole compressor state out as one
-        byte range (`entry(i)`), which is what makes the duplicate a single
-        `copy_` — see `copy_state_entries`.
-
-        A fork would also work on a prompt and would move no bytes, but it binds
-        the forward after the checkpoint: that forward has to leave the fresh
-        group self-contained, which takes `K - ratio` = 4 *committed* tokens for
-        the overlapping CSA ring (0 for HCA). A decode step commits
-        `1 + accepted_drafts`, and acceptance is not knowable when the
-        checkpoint has to be decided — nor recoverable afterwards, since by then
-        the state is split across two groups and a single read index spans
-        neither. So a fork can never checkpoint a decode boundary, and this
-        model's reuse is multi-turn, where the boundary worth keeping is exactly
-        the one generation ends on.
-
-        Arithmetic for both numbers, replayed from `compress_plan.py`:
-        `/app/logs_claude/verify_v4_min_fork.py`.
-        """
-        return StateTransfer.copy()
-
-    def copy_state_entries(self, pairs: list[tuple[int, int]]) -> None:
-        """Duplicate a request's whole per-request state: compressor + windows.
-
-        One range per plane, and a plane is all there is: a slot holds the
-        compressor state and then every layer's windows, contiguously, so the
-        two halves of a request's state copy as one slice. Copying the state
-        whole rather than just the rows a resumer reads (the CSA ring's
-        trailing `K - ratio` = 4, HCA's none) is what makes that true — those
-        rows are scattered, and picking them out would cost 84 strided copies
-        against this one.
-
-        **The window half is what makes the private ring safe.** A per-request
-        ring is exactly what #1417 removed, because a request resuming a cached
-        prefix had never written that prefix into its own. Reinstating it is only
-        correct because the checkpoint carries the window across — drop this and
-        the bug returns, silently, as garbage attention over the reused prefix.
-
-        That is also why a window whose dtype differs from the pool's is a state
-        field rather than a plane of its own: a plane of its own would sit
-        outside every slot and so outside this copy, and a resumed request would
-        draft against the slot's previous occupant. Verification would keep the
-        output right and the acceptance rate would just quietly collapse.
-        """
+    def relocate_state_slots(self, pairs: Sequence[tuple[int, int]]) -> None:
+        """Relocate a request's whole Active Slot."""
         views = self._slot_views()
         dsts, srcs = [], []
         for src, dst in pairs:
@@ -819,6 +790,88 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             srcs += views[src]
         if dsts:
             torch._foreach_copy_(dsts, srcs)
+
+    def execute_paged_state_copies(
+        self,
+        store_ops: Sequence[CheckpointStoreOp],
+        restore_ops: Sequence[CheckpointRestoreOp],
+    ) -> None:
+        """Copy raw checkpoint bytes between slots and non-contiguous PAGEs."""
+        from atom.model_ops.attentions.paged_state_copy import (
+            launch_copy_spans,
+            plan_segmented_copy,
+        )
+
+        spans = []
+        device = self._kv_planes()[0].device
+        for op in store_ops:
+            self._validate_paged_state_op(op)
+            src = self._active_slot_segments(op.src_slot)
+            dst = self._page_unit_segments(op.unit_ids)
+            spans.extend(plan_segmented_copy(src, dst, op.total_bytes))
+        for op in restore_ops:
+            self._validate_paged_state_op(op)
+            src = self._page_unit_segments(op.unit_ids)
+            dst = self._active_slot_segments(op.dst_slot)
+            spans.extend(plan_segmented_copy(src, dst, op.total_bytes))
+        launch_copy_spans(spans, device)
+
+    def _validate_paged_state_op(
+        self, op: CheckpointStoreOp | CheckpointRestoreOp
+    ) -> None:
+        spec = self.model_runner.state_runtime.checkpoint_spec
+        if spec is None:
+            raise RuntimeError("DSV4 PAGE/state checkpoint spec is missing")
+        if op.layout_id != spec.layout_id:
+            raise RuntimeError(
+                f"state checkpoint layout mismatch: {op.layout_id!r} != "
+                f"{spec.layout_id!r}"
+            )
+        if op.total_bytes != spec.slot_bytes:
+            raise RuntimeError(
+                f"state checkpoint size mismatch: op={op.total_bytes}, "
+                f"active_slot={spec.slot_bytes}"
+            )
+        if len(op.unit_ids) != spec.units_per_checkpoint:
+            raise RuntimeError(
+                "state checkpoint PAGE-unit geometry does not match this worker"
+            )
+        num_blocks = self.model_runner.num_physical_kvcache_blocks
+        if any(unit_id < 0 or unit_id >= num_blocks for unit_id in op.unit_ids):
+            raise RuntimeError("state checkpoint PAGE unit is out of range")
+
+    def _active_slot_segments(self, group: int):
+        from atom.model_ops.attentions.paged_state_copy import tensor_segment
+
+        return [tensor_segment(view) for view in self._slot_views()[group]]
+
+    def _one_page_unit_segments(self, block_id: int):
+        """All physical regions owned by one logical DSV4 PAGE block id."""
+        from atom.model_ops.attentions.paged_state_copy import tensor_segment
+
+        runner = self.model_runner
+        geo = self.pool_geometry
+        start = block_id * geo.envelope_rows
+        stop = start + geo.envelope_rows
+        segments = [tensor_segment(plane[start:stop]) for plane in self._kv_planes()]
+        segments.extend(
+            tensor_segment(runner.v4_csa_idx_kv[layer, block_id])
+            for layer in range(len(self.csa_layers))
+        )
+        if self._indexer_fp4:
+            segments.extend(
+                tensor_segment(runner.v4_csa_idx_kv_scale[layer, block_id])
+                for layer in range(len(self.csa_layers))
+            )
+        return segments
+
+    def _page_unit_segments(self, unit_ids):
+        segments = []
+        for block_id in unit_ids:
+            if not 0 <= block_id < self.model_runner.num_physical_kvcache_blocks:
+                raise RuntimeError(f"PAGE unit id {block_id} is out of range")
+            segments.extend(self._one_page_unit_segments(block_id))
+        return segments
 
     def _slot_views(self) -> list[list[torch.Tensor]]:
         """Per-group views of that request's whole slot in each plane.
@@ -1028,6 +1081,30 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # index formula any kernel evaluates — reads its offsets from here.
         geo = self.pool_geometry.with_capacity(num_blocks, num_slots)
         self.pool_geometry = geo
+
+        actual_page_bytes = (
+            sum(geo.block_bytes(width) for width in self._plane_row_widths())
+            + self._indexer_block_bytes()
+        )
+        actual_slot_bytes = sum(
+            geo.slot_bytes(width) for width in self._plane_row_widths()
+        )
+        state_runtime = self.model_runner.state_runtime
+        checkpoint_spec = state_runtime.checkpoint_spec
+        if checkpoint_spec is None:
+            raise RuntimeError("DSV4 PAGE/state checkpoint sizing spec is missing")
+        layout_id = state_runtime.transfer.paged_layout_id
+        if (
+            actual_page_bytes != checkpoint_spec.page_unit_bytes
+            or actual_slot_bytes != checkpoint_spec.slot_bytes
+            or layout_id != checkpoint_spec.layout_id
+        ):
+            raise RuntimeError(
+                "DSV4 PAGE/state checkpoint geometry differs from sizing: "
+                f"page={actual_page_bytes}/{checkpoint_spec.page_unit_bytes}, "
+                f"slot={actual_slot_bytes}/{checkpoint_spec.slot_bytes}, "
+                f"layout={layout_id!r}/{checkpoint_spec.layout_id!r}"
+            )
 
         row_widths = self._plane_row_widths()
         offsets, total_bytes = plan_regions([geo.plane_bytes(w) for w in row_widths])
@@ -2064,6 +2141,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             and _drafter.uses_confidence_schedule
         )
         if ragged_lens is not None or _dspark_ragged_graph:
+            # Staged, never `torch.as_tensor(np, device=cuda)`, for two
+            # reasons: that is a pageable H2D and syncs here (the ragged decode
+            # bubble), and it returns a NEW tensor each step, whose address the
+            # captured AF attention core would freeze at capture (71a3e941).
             attn_metadata.dspark_ragged_lens_gpu = self._stage(
                 "v4_dspark_ragged_lens", extend_lens_np.astype(np.int32, copy=False)
             )
