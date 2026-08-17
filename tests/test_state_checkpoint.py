@@ -1496,6 +1496,39 @@ class TestDemandDrivenCheckpoints:
         assert third.checkpoint_demand_pos == 0  # nothing left to want
         assert forward_on_the_ladder(bm, third) == []
 
+    def test_a_demand_the_floor_would_refuse_is_not_recorded(self):
+        """A cut costs a forward; buying one for a refused store is pure loss.
+
+        `begin_store` drops a checkpoint that would leave the pool under the
+        floor. Recording a demand for it anyway would still shorten the
+        request's prefill chunk, so the ladder asks the same question the
+        store will — and the reuse attribution is unaffected, because that
+        reuse really was declined for want of a checkpoint.
+        """
+        bm = make_block_manager(demand_config(), state_runtime=PAGED_COPY_RUNTIME)
+        run_prompt_on_the_ladder(bm, stateful_seq(PROMPT))
+        checkpoints = bm.paged_state_checkpoints
+        assert checkpoints.has_room_for_store()
+
+        # Live KV takes the pool down to where a store can no longer clear
+        # the floor, which is the state under real pressure.
+        checkpoints.store.reserve_units = bm.kv.num_free + 1
+        assert not checkpoints.has_room_for_store()
+
+        second = stateful_seq(PROMPT)
+        hit = bm.can_allocate(second)
+        bm.allocate(second, hit)
+
+        # The reuse is still attributed to a missing checkpoint...
+        assert second.num_wanted_hit_blocks > hit, "the attribution was suppressed too"
+        # ...but nothing is cut for a store that would be refused.
+        assert second.checkpoint_demand_pos == 0, "a refused store still cut a chunk"
+        funnel = bm.checkpoint_funnel()
+        assert funnel["demands_declined_no_room"] == 1
+        assert funnel["demands_recorded"] == 0
+        assert funnel["chunks_cut_for_demand"] == 0
+        assert forward_on_the_ladder(bm, second) == [32], "the grid rung, no demand cut"
+
     def test_reuse_another_class_declines_is_not_charged_to_the_ladder(self):
         """The counterfactual keeps every other gate applied.
 

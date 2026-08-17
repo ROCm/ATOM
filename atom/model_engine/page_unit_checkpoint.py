@@ -118,12 +118,9 @@ class PageUnitCheckpointStore:
             raise ValueError(f"reserve_units must not be negative, got {reserve_units}")
         self.pool = pool
         self.spec = spec
-        # Free units a store has to leave behind. A checkpoint's units are
-        # unreclaimable while it is COPYING — `ensure_free_units` only takes
-        # from READY records — so between the reservation and the next
-        # `complete_inflight` they are simply gone from the pool. Without a
-        # floor a burst of stores drains the free list to nothing and the next
-        # live KV block raises instead of degrading. See `begin_store`.
+        # Free units a store has to leave behind, so that a scheduling pass
+        # which pins the whole cache still finds blocks for live KV. See
+        # `begin_store` and `BlockManager._checkpoint_reserve_units`.
         self.reserve_units = reserve_units
 
         self.hash_to_checkpoint: dict[int, int] = {}
@@ -188,6 +185,17 @@ class PageUnitCheckpointStore:
             if self.records[cid].state == READY and self.records[cid].pin_count == 0
         )
 
+    def has_room_for_store(self) -> bool:
+        """Whether a store asked for now would clear the floor.
+
+        The ladder asks this before it cuts a prefill chunk onto a rung: that
+        cut costs the request a forward, and buying one for a store `begin_store`
+        is about to refuse is the one part of the funnel that is pure loss.
+        Same expression as the refusal, so the two cannot come to disagree.
+        """
+        needed = self.units_per_checkpoint + self.reserve_units
+        return self.pool.num_free + self.reclaimable_units() >= needed
+
     def reclaimable_units(self) -> int:
         """Units `ensure_free_units` could still add to the free list.
 
@@ -218,7 +226,7 @@ class PageUnitCheckpointStore:
         # but `_fresh_block` already takes those on demand, one at a time, at
         # the moment they are actually needed. A store that will be dropped
         # has to cost nothing.
-        if self.pool.num_free + self.reclaimable_units() < needed + self.reserve_units:
+        if not self.has_room_for_store():
             return None
         if not self.ensure_free_units(needed + self.reserve_units):
             return None
@@ -430,6 +438,9 @@ class PagedStateCheckpointCoordinator:
         self, count: int, protected_hash: int | None = None
     ) -> bool:
         return self.store.has_available_units(count, protected_hash)
+
+    def has_room_for_store(self) -> bool:
+        return self.store.has_room_for_store()
 
     def ensure_free_units(self, count: int) -> bool:
         return self.store.ensure_free_units(count)

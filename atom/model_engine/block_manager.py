@@ -172,6 +172,7 @@ class BlockManager:
         # bug, and they are indistinguishable in the hit rate alone.
         self.demands_recorded: int = 0
         self.chunks_cut_for_demand: int = 0
+        self.demands_declined_no_room: int = 0
 
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
@@ -257,6 +258,16 @@ class BlockManager:
                 seqs,
             )
         return reserve
+
+    def _checkpoint_has_room(self) -> bool:
+        """Whether a store taken now would survive the floor.
+
+        `True` when no PAGE-backed checkpoints exist at all: a fork checkpoint
+        costs the pool nothing, so there is nothing for a floor to gate.
+        """
+        if self.paged_state_checkpoints is None:
+            return True
+        return self.paged_state_checkpoints.has_room_for_store()
 
     def _has_page_units(
         self, count: int, protected_checkpoint_hash: int | None = None
@@ -718,9 +729,16 @@ class BlockManager:
         # keeps nothing then, so a cut for a demand would buy nothing either.
         interval_on = self.state_checkpoint_interval_tokens > 0
         previously_demanded = seq.checkpoint_demand_pos
-        seq.checkpoint_demand_pos = (
-            wanted * self.hash_block_size if interval_on and wanted > hit else 0
-        )
+        demand = wanted * self.hash_block_size if interval_on and wanted > hit else 0
+        # A demand is an instruction to cut a prefill chunk onto a rung, and
+        # that cut costs the request a forward. Buying one for a store the
+        # floor is about to refuse is the only part of this funnel that is
+        # pure loss — the attribution above stays either way, because the
+        # reuse really was declined for want of a checkpoint.
+        if demand and not self._checkpoint_has_room():
+            self.demands_declined_no_room += 1
+            demand = 0
+        seq.checkpoint_demand_pos = demand
         # `can_allocate` re-runs for a sequence the queue keeps deferring, so
         # count the demand when it first appears rather than once per attempt —
         # otherwise one request under pressure inflates the denominator the
@@ -771,6 +789,7 @@ class BlockManager:
         """
         return {
             "demands_recorded": self.demands_recorded,
+            "demands_declined_no_room": self.demands_declined_no_room,
             "chunks_cut_for_demand": self.chunks_cut_for_demand,
         } | self._state_checkpoint_cache.checkpoint_fates()
 
