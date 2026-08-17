@@ -451,10 +451,11 @@ class SGLangGDNForwardContext:
         if mode.is_extend():
             num_tokens = forward_batch.seq_lens_sum
         elif mode.is_target_verify():
-            positions = forward_batch.positions
-            num_tokens = int(
-                positions.shape[-1] if positions.ndim == 2 else positions.shape[0]
-            )
+            # Total flattened tokens, i.e. batch_size * draft_token_num.
+            # `numel()` is right whether SGLang hands us the usual flat
+            # `[bs * draft]` positions or a `[bs, draft]` view; `shape[-1]`
+            # would report just the per-sequence length for the latter.
+            num_tokens = int(forward_batch.positions.numel())
         else:
             num_tokens = forward_batch.batch_size
         return (
