@@ -16,12 +16,12 @@ from typing import TYPE_CHECKING
 import sglang.srt.layers.attention.aiter_backend as _sglang_aiter
 import torch
 from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
-from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
-from sglang.srt.layers.attention.utils import (
+from sglang.kernels.ops.attention.utils import (
     create_flashinfer_kv_indices_triton,
     launch_reshape_and_cache_flash,
     pad_sequence_with_mask,
 )
+from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import get_bool_env_var
 
@@ -110,6 +110,8 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         topk: int = 1,
     ):
         super().__init__(model_runner, skip_prefill, kv_indptr_buf, topk)
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
+        self.req_to_token_pool = model_runner.req_to_token_pool
         mapping = getattr(
             model_runner.token_to_kv_pool, "full_attention_layer_id_mapping", None
         )
