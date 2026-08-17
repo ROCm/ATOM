@@ -14,6 +14,7 @@ import torch
 from aiter.dist.parallel_state import get_tp_group
 from torch import nn
 
+from atom.config import DCPConfig
 from atom.distributed.dcp_utils import get_dcp_rank, get_dcp_world_size
 from atom.model_engine.page_unit_checkpoint import (
     CheckpointRestoreOp,
@@ -236,8 +237,8 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         self.dcp_rank = get_dcp_rank()
         # DCP KV-cache interleave granularity S (1 = token-level round-robin).
         self.cp_kv_cache_interleave_size = getattr(
-            config, "cp_kv_cache_interleave_size", 1
-        )
+            config, "dcp_config", DCPConfig()
+        ).interleave_size
         self.max_num_batched_tokens = model_runner.max_num_batched_tokens
         self.max_bs = model_runner.max_bs
         self.max_num_blocks_per_seq = (

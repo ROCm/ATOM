@@ -7,7 +7,7 @@ from math import inf, isinf
 import numpy as np
 import xxhash
 
-from atom.config import Config
+from atom.config import Config, DCPConfig
 from atom.distributed.kv_events import (
     MEDIUM_GPU,
     MEDIUM_REMOTE,
@@ -71,8 +71,8 @@ class BlockManager:
         self.dcp_world_size = config.decode_context_parallel_size
         # DCP KV-cache interleave granularity S (1 = token-level round-robin).
         self.cp_kv_cache_interleave_size = getattr(
-            config, "cp_kv_cache_interleave_size", 1
-        )
+            config, "dcp_config", DCPConfig()
+        ).interleave_size
         # dcp_rank is always 0 here: BlockManager runs only on the scheduler
         # (rank 0). DCP rank is used only to compute local token counts for
         # memory reservation; the actual per-rank routing is done in the workers.

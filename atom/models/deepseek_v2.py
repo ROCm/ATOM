@@ -1576,7 +1576,9 @@ def sparse_attn_indexer(
         context.batch_size * attn_metadata.max_seqlen_q if not context.is_prefill else 0
     )
     runner_block_size = get_current_atom_config().kv_cache_block_size
-    cp_kv_cache_interleave_size = get_current_atom_config().cp_kv_cache_interleave_size
+    cp_kv_cache_interleave_size = (
+        get_current_atom_config().dcp_config.interleave_size
+    )
     kv_cache = kv_cache.view(-1, runner_block_size, kv_cache.shape[-1])
     # PCP prefill: `k` (and `positions`) arrive as the full PADDED key set
     # [S_pad] produced by an all-gather of the round-robin shards. The KV-cache
