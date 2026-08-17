@@ -36,12 +36,29 @@ SLOT 也是一个 PAGE ID。
   | PAGE 地址空间                            | Active SLOT 容量         |
   | PAGE 0 | PAGE 1 | ... | PAGE N-1        | ... | group 1 | group 0 |
   +------------------------------------------+--------------------------+
-
-  独立的 PAGE-only allocation
-  +--------------------+--------------------+--------------------+
-  | CSA indexer PAGE 0 | CSA indexer PAGE 1 |        ...         |
-  +--------------------+--------------------+--------------------+
 ```
+
+CSA indexer KV 在物理上仍是独立 tensor `v4_csa_idx_kv`，但与主 KV 共用同一
+套 `BlockPool` block ID。一个逻辑 PAGE 由多个物理 region 共同组成：
+
+```text
+Logical PAGE i
++-------------------------+
+| NoPE plane region       |  per_req_pool
++-------------------------+
+| RoPE plane region       |  per_req_pool，启用 FP8 KV 时存在
++-------------------------+
+| CSA indexer layer 0     |  v4_csa_idx_kv
++-------------------------+
+| CSA indexer layer 1     |  v4_csa_idx_kv
++-------------------------+
+| ...                     |
++-------------------------+
+```
+
+这里是按同一个 `block_id` 组合 region，不是单独的 indexer allocator。
+`BlockPool` 分配、复用或释放 PAGE `i` 时，上述 region 作为同一个逻辑 PAGE
+一起生效；offload 和原生 PAGE checkpoint 也按这个完整 PAGE unit 搬运。
 
 空闲 PAGE unit 仍位于左侧 PAGE 地址空间。`BlockPool` 记录每个 PAGE ID 的
 逻辑状态，物理位置本身不表示它当前是否空闲：
@@ -57,8 +74,8 @@ PAGE ID       0          1          2          3          4
 右侧只用于预留请求持有的 Active SLOT。右侧的空闲 group 可以分配给新的活跃
 请求，但它不是空闲 PAGE，也不用于保存 PAGE-backed 状态检查点。
 
-一个 PAGE 包含压缩 KV envelope 以及对应的 CSA indexer region。一个 Active
-SLOT 包含请求的全部可变状态：
+因此，一个逻辑 PAGE 包含压缩 KV envelope 以及对应的 CSA indexer region。
+一个 Active SLOT 包含请求的全部可变状态：
 
 ```text
 +------------------+-----------------------+-------------------+
