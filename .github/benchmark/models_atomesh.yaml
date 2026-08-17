@@ -52,7 +52,6 @@ models:
       common:
         AITER_BF16_FP8_MOE_BOUND: "0"
         ATOM_MOE_GU_ITLV: "1"
-        MC_MS_AUTO_DISC: "1"
         MC_ENABLE_DEST_DEVICE_AFFINITY: "1"
       prefill: {}
       decode: {}
@@ -215,7 +214,6 @@ models:
             tp: 4
           env:
             common:
-              MC_MS_AUTO_DISC: "1"
               MC_ENABLE_DEST_DEVICE_AFFINITY: "1"
             prefill:
               HIP_VISIBLE_DEVICES: "0,1,2,3"
@@ -241,7 +239,6 @@ models:
             tp: 8
           env:
             common:
-              MC_MS_AUTO_DISC: "1"
               MC_ENABLE_DEST_DEVICE_AFFINITY: "1"
           benchmark:
             wait_server_timeout: 1800
@@ -390,7 +387,6 @@ models:
         AITER_QUICK_REDUCE_QUANTIZATION: "INT4"
         # PR #1566: enable MXFP4 intermediate output for INT4 quick reduce.
         AITER_MXFP4_INTERMEDIATE: "1"
-        MC_MS_AUTO_DISC: "1"
         MC_ENABLE_DEST_DEVICE_AFFINITY: "1"
       prefill: {}
       decode:
@@ -524,7 +520,6 @@ models:
       common:
         AITER_QUICK_REDUCE_QUANTIZATION: INT4
         ATOM_FORCE_ATTN_TRITON: "1"
-        MC_MS_AUTO_DISC: "1"
         MC_ENABLE_DEST_DEVICE_AFFINITY: "1"
       prefill: {}
       decode: {}
@@ -666,7 +661,6 @@ models:
       common:
         AITER_QUICK_REDUCE_QUANTIZATION: INT4
         ATOM_FORCE_ATTN_TRITON: "1"
-        MC_MS_AUTO_DISC: "1"
         MC_ENABLE_DEST_DEVICE_AFFINITY: "1"
       prefill: {}
       decode: {}
