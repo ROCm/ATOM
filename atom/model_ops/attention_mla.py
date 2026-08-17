@@ -163,29 +163,39 @@ def mla_kernel_num_heads(num_heads: int) -> int:
 
 # Gathered widths aiter serves with a dedicated kernel. The other multiples of
 # 16 (48, 80, 96, 112) are folded onto the 16-head kernel instead, and that fold
-# overrides the round-robin causal mask, so DCP decode must avoid them.
+# reinterprets head groups as extra sequence rows (total_s *= ori_nhead//16)
+# without touching kv_indptr, which desynchronises the row -> global position
+# mapping the round-robin causal mask runs on. DCP decode must avoid them.
 _MLA_DCP_KERNEL_WIDTHS = (16, 32, 64, 128)
 
+_dcp_kernel_width_warned = False
 
-def mla_dcp_pad_num_heads(
+
+def mla_dcp_kernel_num_heads(
     num_heads: int, dcp_world_size: int, min_kernel_heads: int = _MLA_MIN_HEADS
 ) -> int:
-    """Per-rank query-head width to pad to BEFORE the DCP head all-gather.
+    """Width to pad the GATHERED query heads to for a DCP decode.
 
-    Under DCP the kernel never sees a single rank's heads: it sees the gathered
-    ``this * dcp_world_size``. So it is the GATHERED width that has to be one
-    aiter dispatches, which makes the per-rank minimum the wrong thing to pad to
-    -- for a 2-head draft at dcp8 it overshoots to 32*8=256 (unsupported), and
-    for a 12-head target it undershoots to 96 (folded). Pick the smallest
-    gathered width that clears ``min_kernel_heads`` and still covers every rank's
-    real heads.
+    DCP decode all-gathers Q on the head dim before calling the kernel, so what
+    gets dispatched on is ``num_heads * dcp_world_size``; a single rank's head
+    count is never seen and is the wrong thing to pad. Round that gathered width
+    up to one aiter serves natively -- the folded widths are no use here because
+    the fold breaks the round-robin causal mask (see above).
     """
+    gathered = max(num_heads * dcp_world_size, min_kernel_heads)
     for width in _MLA_DCP_KERNEL_WIDTHS:
-        if width < min_kernel_heads:
-            continue
-        if width % dcp_world_size == 0 and width // dcp_world_size >= num_heads:
-            return width // dcp_world_size
-    return mla_kernel_num_heads(num_heads)
+        if width >= gathered:
+            return width
+    global _dcp_kernel_width_warned
+    if not _dcp_kernel_width_warned:
+        _dcp_kernel_width_warned = True
+        logger.warning(
+            f"DCP decode gathers {gathered} query heads, past the widest natively "
+            f"dispatched MLA kernel ({_MLA_DCP_KERNEL_WIDTHS[-1]}); falling back to "
+            "the folded kernel, which is incorrect for MTP (round-robin causal "
+            "mask). Lower decode_context_parallel_size or raise tp."
+        )
+    return mla_kernel_num_heads(gathered)
 
 
 # The fused seg MLA kernels (fused_qk_rope_concat_and_cache_mla_seg +
@@ -492,23 +502,28 @@ class MLAAttention(nn.Module):
         self.dcp_sparse_kv_indptr_buffer = None
         self.dcp_owned_counts_buffer = None
 
-        # DCP decode pads Q on each rank and only then all-gathers on the head
-        # dim, so the width reaching mla_decode_fwd is dcp_pad_num_heads * dcp.
-        # The pad heads ride through the reduce-scatter (which hands each rank
-        # its own dcp_pad_num_heads back) and are dropped there.
-        self.dcp_pad_num_heads = self.num_heads
+        # DCP decode all-gathers Q on the head dim, so the width reaching
+        # mla_decode_fwd is the gathered num_heads * dcp rounded up to a
+        # dispatchable one. The pad sits entirely inside _forward_decode: it goes
+        # on after the gather and comes off before the cross-rank combine, so it
+        # never costs collective traffic.
+        self.dcp_kernel_num_heads = self.num_heads
         self.dcp_head_pad = 0
         if self.dcp_world_size > 1:
-            self.dcp_pad_num_heads = mla_dcp_pad_num_heads(
+            self.dcp_kernel_num_heads = mla_dcp_kernel_num_heads(
                 self.num_heads, self.dcp_world_size, self.min_query_heads
             )
-            self.dcp_head_pad = self.dcp_pad_num_heads - self.num_heads
+            self.dcp_head_pad = (
+                self.dcp_kernel_num_heads - self.num_heads * self.dcp_world_size
+            )
 
     def _pad_decode_query_heads(self, q: torch.Tensor) -> torch.Tensor:
-        """Head padding for the decode kernel. Under DCP the padding already
-        happened per rank before the all-gather, so the gathered q is at its
-        kernel width and this is a no-op."""
+        """Head padding for the decode kernel. Under DCP q arrives already
+        gathered across the DCP group, so it is that width -- not the per-rank
+        one -- that has to reach a dispatchable kernel."""
         if self.dcp_world_size > 1:
+            if self.dcp_head_pad > 0:
+                return torch.nn.functional.pad(q, (0, 0, 0, self.dcp_head_pad))
             return q
         return self._pad_query_heads(q)
 
@@ -517,20 +532,10 @@ class MLAAttention(nn.Module):
     ) -> torch.Tensor:
         """Undo `_pad_decode_query_heads` on an output or per-head LSE."""
         if self.dcp_world_size > 1:
+            if self.dcp_head_pad > 0:
+                return x[:, :num_heads, ...].contiguous()
             return x
         return self._restore_query_heads(x, num_heads)
-
-    def _dcp_pad_query_heads(self, q: torch.Tensor) -> torch.Tensor:
-        """Pad q to this rank's DCP width, ahead of the head all-gather."""
-        if self.dcp_head_pad > 0:
-            return torch.nn.functional.pad(q, (0, 0, 0, self.dcp_head_pad))
-        return q
-
-    def _dcp_restore_query_heads(self, o: torch.Tensor) -> torch.Tensor:
-        """Drop the DCP pad heads the reduce-scatter handed back to this rank."""
-        if self.dcp_head_pad > 0:
-            return o[:, : self.num_heads, ...].contiguous()
-        return o
 
     def _pad_query_heads(self, q: torch.Tensor) -> torch.Tensor:
         if self.head_repeat_factor > 1:
@@ -1996,16 +2001,14 @@ class MLAAttention(nn.Module):
                 # then combine partial outputs across ranks (AG LSE + correct + RS).
                 from atom.model_ops.dcp_ops import cp_lse_ag_out_rs
 
-                # The head pad goes on BEFORE the gather so the kernel sees a
-                # gathered width it dispatches directly (see dcp_pad_num_heads);
-                # the reduce-scatter hands each rank its own padded heads back.
-                q_out = self._dcp_pad_query_heads(q_out)
+                # Only real heads cross the wire and enter the combine; the pad the
+                # kernel width needs lives inside _forward_decode (see
+                # dcp_kernel_num_heads).
                 q_out = self.dcp_group.all_gather(q_out, dim=1)
                 o, lse = self._forward_decode(
                     q_out, kv_cache, attn_metadata, return_lse=True
                 )
                 o = cp_lse_ag_out_rs(o, lse, self.dcp_group, ctx=self._cp_triton_ctx)
-                o = self._dcp_restore_query_heads(o)
                 output = self._v_up_proj_and_o_proj(o)
             else:
                 output = self._forward_decode(q_out, kv_cache, attn_metadata)

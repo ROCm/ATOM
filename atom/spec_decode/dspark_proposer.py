@@ -99,9 +99,9 @@ class DSparkProposer(Drafter):
         # has no such attribute.
         impl = self.model.layers[0].self_attn.mla_attn.impl
         if self.dcp_world_size > 1:
-            # DCP decode pads per rank and then all-gathers on the head dim, so
-            # the descriptors must be planned for the GATHERED width.
-            self._blk_padded_heads = impl.dcp_pad_num_heads * self.dcp_world_size
+            # DCP decode all-gathers on the head dim, so the descriptors must be
+            # planned for the padded GATHERED width.
+            self._blk_padded_heads = impl.dcp_kernel_num_heads
         else:
             self._blk_padded_heads = impl.padded_num_heads
         # max_split_per_batch only exists in newer aiter builds; feature-detect
