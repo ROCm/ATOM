@@ -74,6 +74,7 @@ from atom.model_ops.attentions.state_arena import (
     SplitStateArena,
     StateArena,
     StateField,
+    checkpoint_ranges_for,
     plan_field_planes,
     plan_regions,
 )
@@ -608,6 +609,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self._ubatch_decode_meta: list | None = None
         # Filled on the first checkpoint copy — the pools do not exist yet here.
         self._slot_view_cache: list[list[torch.Tensor]] | None = None
+        self._checkpoint_range_cache: list[list[tuple[int, int]]] | None = None
 
     @property
     def prep_stream(self):
@@ -748,8 +750,28 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             StateField("csa_main_score", n_csa, self.csa_main_state_shape, dt, neg_inf),
             StateField("csa_idx_kv", n_csa, self.csa_idx_state_shape, dt),
             StateField("csa_idx_score", n_csa, self.csa_idx_state_shape, dt, neg_inf),
-            StateField("hca_main_kv", n_hca, self.hca_main_state_shape, dt),
-            StateField("hca_main_score", n_hca, self.hca_main_state_shape, dt, neg_inf),
+            # HCA owes a checkpoint nothing. It pools `ratio` tokens with no
+            # overlap, so the first compression at or after a boundary P
+            # covers `[P, P + 128)` — every row of it written by the very
+            # forward that reads it — and a checkpoint sits on a multiple of
+            # `hash_block_size`, which `_assert_ratios_divide_block` keeps a
+            # multiple of 128. The rows past `K_pool` are speculative
+            # rollback slack and are never read at all.
+            StateField(
+                "hca_main_kv",
+                n_hca,
+                self.hca_main_state_shape,
+                dt,
+                in_checkpoint=False,
+            ),
+            StateField(
+                "hca_main_score",
+                n_hca,
+                self.hca_main_state_shape,
+                dt,
+                neg_inf,
+                in_checkpoint=False,
+            ),
         ]
         if self._field_window_dtype is not None:
             fields.append(
@@ -769,8 +791,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     def state_transfer(self) -> StateTransfer:
         """Declare PAGE-copy checkpoints with the versioned DSV4 layout."""
         ratios = ",".join(str(r) for r in self._geometry_ratios())
+        nocopy = ",".join(f.name for f in self._state_fields() if not f.in_checkpoint)
         layout_id = (
-            "dsv4-paged-state-v1"
+            # v2: an image holds part of a slot, not all of it. Two workers
+            # disagreeing about which part would read one image at two
+            # layouts, so `nocopy` names the rule and the version fences it.
+            "dsv4-paged-state-v2"
             f":block={self.block_size}:ring={self.win_with_spec}"
             f":dims={self.head_dim},{self.rope_head_dim},{self.index_head_dim}"
             f":state={self.csa_main_state_shape},{self.csa_idx_state_shape},"
@@ -778,6 +804,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             f":main={'fp8-2buff' if self._kv_fp8 else 'bf16'}"
             f":index={'fp4' if self._indexer_fp4 else 'fp8'}"
             f":ratios={ratios}"
+            f":nocopy={nocopy}"
         )
         return StateTransfer.copy(layout_id)
 
@@ -806,13 +833,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         device = self._kv_planes()[0].device
         for op in store_ops:
             self._validate_paged_state_op(op)
-            src = self._active_slot_segments(op.src_slot)
+            src = self._checkpoint_slot_segments(op.src_slot)
             dst = self._page_unit_segments(op.unit_ids)
             spans.extend(plan_segmented_copy(src, dst, op.total_bytes))
         for op in restore_ops:
             self._validate_paged_state_op(op)
             src = self._page_unit_segments(op.unit_ids)
-            dst = self._active_slot_segments(op.dst_slot)
+            dst = self._checkpoint_slot_segments(op.dst_slot)
             spans.extend(plan_segmented_copy(src, dst, op.total_bytes))
         launch_copy_spans(spans, device)
 
@@ -827,10 +854,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 f"state checkpoint layout mismatch: {op.layout_id!r} != "
                 f"{spec.layout_id!r}"
             )
-        if op.total_bytes != spec.slot_bytes:
+        if op.total_bytes != spec.image_bytes:
             raise RuntimeError(
                 f"state checkpoint size mismatch: op={op.total_bytes}, "
-                f"active_slot={spec.slot_bytes}"
+                f"image={spec.image_bytes}"
             )
         if len(op.unit_ids) != spec.units_per_checkpoint:
             raise RuntimeError(
@@ -840,10 +867,66 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         if any(unit_id < 0 or unit_id >= num_blocks for unit_id in op.unit_ids):
             raise RuntimeError("state checkpoint PAGE unit is out of range")
 
-    def _active_slot_segments(self, group: int):
-        from atom.model_ops.attentions.paged_state_copy import tensor_segment
+    def _checkpoint_slot_ranges(self) -> list[list[tuple[int, int]]]:
+        """Per plane, the `(offset, num_bytes)` of a slot a checkpoint holds.
 
-        return [tensor_segment(view) for view in self._slot_views()[group]]
+        A slot is a request's compressor state and then its sliding windows
+        (`v4_pool_geometry`). The two halves answer differently: a window is a
+        sliding window, so a resumer needs it whole, while most of the state
+        is dead at a boundary and says so through `StateField.in_checkpoint`.
+        What falls between them — the padding the state's byte count is
+        rounded up by, and the slot's own tail alignment — belongs to neither.
+
+        A property of the layout, not of any one slot, so it is computed once.
+        """
+        if self._checkpoint_range_cache is None:
+            self._assert_ratios_divide_block()
+            geo = self.pool_geometry
+            cache = []
+            for fields, width in zip(
+                self._arena_planes, self._plane_row_widths(), strict=True
+            ):
+                windows = (geo.arena_rows * width, geo.entry_rows * width)
+                cache.append([*checkpoint_ranges_for(fields), windows])
+            self._checkpoint_range_cache = cache
+        return self._checkpoint_range_cache
+
+    def checkpoint_image_bytes(self) -> int:
+        """Bytes one checkpoint image holds. Priced before the pool exists."""
+        return sum(
+            nbytes for ranges in self._checkpoint_slot_ranges() for _, nbytes in ranges
+        )
+
+    def _assert_ratios_divide_block(self) -> None:
+        """A checkpoint boundary has to be a compression boundary too.
+
+        `StateField.in_checkpoint` says a compressor without overlap owes a
+        checkpoint nothing, because the first pool at or after the boundary
+        starts exactly on it. That holds only while every ratio divides the
+        block size a checkpoint is aligned to. Let the block size drop under
+        128 and HCA silently starts needing rows it is no longer given — no
+        crash, just a resumer reading stale KV for its first pool, which
+        reads as a small accuracy loss and nothing else.
+        """
+        bad = [r for r in (CSA_RATIO, HCA_RATIO) if self.block_size % r]
+        if bad:
+            raise ValueError(
+                f"block size {self.block_size} is not a multiple of compress "
+                f"ratios {bad}, so a checkpoint boundary is not a compression "
+                "boundary, so what `_state_fields` leaves out of the image "
+                "is no longer dead"
+            )
+
+    def _checkpoint_slot_segments(self, group: int):
+        from atom.model_ops.attentions.paged_state_copy import ByteSegment
+
+        return [
+            ByteSegment(view.data_ptr() + offset, nbytes)
+            for view, ranges in zip(
+                self._slot_views()[group], self._checkpoint_slot_ranges(), strict=True
+            )
+            for offset, nbytes in ranges
+        ]
 
     def _one_page_unit_segments(self, block_id: int):
         """All physical regions owned by one logical DSV4 PAGE block id."""
@@ -1094,15 +1177,18 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         if checkpoint_spec is None:
             raise RuntimeError("DSV4 PAGE/state checkpoint sizing spec is missing")
         layout_id = state_runtime.transfer.paged_layout_id
+        actual_image_bytes = self.checkpoint_image_bytes()
         if (
             actual_page_bytes != checkpoint_spec.page_unit_bytes
             or actual_slot_bytes != checkpoint_spec.slot_bytes
+            or actual_image_bytes != checkpoint_spec.image_bytes
             or layout_id != checkpoint_spec.layout_id
         ):
             raise RuntimeError(
                 "DSV4 PAGE/state checkpoint geometry differs from sizing: "
                 f"page={actual_page_bytes}/{checkpoint_spec.page_unit_bytes}, "
                 f"slot={actual_slot_bytes}/{checkpoint_spec.slot_bytes}, "
+                f"image={actual_image_bytes}/{checkpoint_spec.image_bytes}, "
                 f"layout={layout_id!r}/{checkpoint_spec.layout_id!r}"
             )
 

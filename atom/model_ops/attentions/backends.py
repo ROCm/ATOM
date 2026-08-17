@@ -147,6 +147,17 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         """Declare this backend's per-request state checkpoint capability."""
         return StateTransfer.none()
 
+    def checkpoint_image_bytes(self) -> int | None:
+        """Bytes of an Active Slot a checkpoint image has to hold.
+
+        `None` means all of them: the safe answer, and the one a backend that
+        has not worked out which of its bytes a resumer skips should keep
+        giving. A backend returns less only when it can name bytes no resumer
+        reads — for a ring whose next reader starts exactly at the checkpoint
+        boundary, that is the whole ring.
+        """
+        return None
+
     def relocate_state_slots(self, pairs: Sequence[tuple[int, int]]) -> None:
         """Move live state between contiguous Active Slots."""
         raise NotImplementedError(

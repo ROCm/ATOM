@@ -35,7 +35,7 @@ from atom.model_engine.state_runtime import (
 
 BLOCK = 4
 MIN_FORK = 8
-PAGED_COPY_SPEC = PagedStateCheckpointSpec(10, 25, "test-layout-v1")
+PAGED_COPY_SPEC = PagedStateCheckpointSpec(10, 25, "test-layout-v1", image_bytes=25)
 DEFAULT_STATE_TRANSFER = StateTransfer.fork(MIN_FORK)
 PAGED_COPY_TRANSFER = StateTransfer.copy(PAGED_COPY_SPEC.layout_id)
 DEFAULT_STATE_RUNTIME = StateRuntime(transfer=DEFAULT_STATE_TRANSFER)
@@ -1364,7 +1364,7 @@ class TestStateCacheProtocol:
         forking = StateGroupPool(4, StateTransfer.fork(4), hash_block_size=1)
         copying = PagedStateCheckpointCoordinator(
             BlockPool(4),
-            PagedStateCheckpointSpec(1, 1, "test-layout"),
+            PagedStateCheckpointSpec(1, 1, "test-layout", image_bytes=1),
             enabled=True,
         )
         assert isinstance(copying, StateCache)

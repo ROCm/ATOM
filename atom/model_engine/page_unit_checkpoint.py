@@ -24,25 +24,38 @@ class PagedStateCheckpointSpec:
     page_unit_bytes: int
     slot_bytes: int
     layout_id: str
+    # Bytes of a slot a checkpoint image actually holds, which is less than
+    # all of them: a resumer reads only part of the slot it resumes into, and
+    # a compressor whose next pool starts exactly at the boundary reads none
+    # of its own. `slot_bytes` stays because sizing and the PD path still
+    # price the whole slot.
+    image_bytes: int
 
     def __post_init__(self) -> None:
         for name, value in (
             ("page_unit_bytes", self.page_unit_bytes),
             ("slot_bytes", self.slot_bytes),
+            ("image_bytes", self.image_bytes),
         ):
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
+        if self.image_bytes > self.slot_bytes:
+            raise ValueError(
+                f"image_bytes {self.image_bytes} exceeds the {self.slot_bytes} "
+                "a slot holds"
+            )
         if not isinstance(self.layout_id, str) or not self.layout_id:
             raise ValueError("paged state checkpoints need a non-empty layout id")
 
     @property
     def units_per_checkpoint(self) -> int:
-        return (self.slot_bytes + self.page_unit_bytes - 1) // self.page_unit_bytes
+        return (self.image_bytes + self.page_unit_bytes - 1) // self.page_unit_bytes
 
     def to_wire(self) -> dict[str, int | str]:
         return {
             "page_unit_bytes": self.page_unit_bytes,
             "slot_bytes": self.slot_bytes,
+            "image_bytes": self.image_bytes,
             "layout_id": self.layout_id,
         }
 
@@ -50,7 +63,7 @@ class PagedStateCheckpointSpec:
     def from_wire(cls, wire: object) -> PagedStateCheckpointSpec:
         if not isinstance(wire, Mapping):
             raise TypeError("paged state checkpoint spec must be a mapping")
-        expected = {"page_unit_bytes", "slot_bytes", "layout_id"}
+        expected = {"page_unit_bytes", "slot_bytes", "image_bytes", "layout_id"}
         if set(wire) != expected:
             raise ValueError(
                 "invalid paged state checkpoint spec fields: "
@@ -59,13 +72,14 @@ class PagedStateCheckpointSpec:
         return cls(
             page_unit_bytes=wire["page_unit_bytes"],  # type: ignore[arg-type]
             slot_bytes=wire["slot_bytes"],  # type: ignore[arg-type]
+            image_bytes=wire["image_bytes"],  # type: ignore[arg-type]
             layout_id=wire["layout_id"],  # type: ignore[arg-type]
         )
 
 
 @dataclass(frozen=True)
 class CheckpointStoreOp:
-    """Scatter one contiguous Active Slot into ordered PAGE units."""
+    """Scatter the checkpointed part of an Active Slot into PAGE units."""
 
     src_slot: int
     unit_ids: tuple[int, ...]
@@ -75,7 +89,7 @@ class CheckpointStoreOp:
 
 @dataclass(frozen=True)
 class CheckpointRestoreOp:
-    """Gather one ordered PAGE-unit image into an Active Slot."""
+    """Gather one ordered PAGE-unit image back into an Active Slot."""
 
     dst_slot: int
     unit_ids: tuple[int, ...]
@@ -186,7 +200,7 @@ class PageUnitCheckpointStore:
         return CheckpointStoreOp(
             src_slot=src_slot,
             unit_ids=record.unit_ids,
-            total_bytes=self.spec.slot_bytes,
+            total_bytes=self.spec.image_bytes,
             layout_id=self.spec.layout_id,
         )
 
@@ -202,7 +216,7 @@ class PageUnitCheckpointStore:
         op = CheckpointRestoreOp(
             dst_slot=dst_slot,
             unit_ids=record.unit_ids,
-            total_bytes=self.spec.slot_bytes,
+            total_bytes=self.spec.image_bytes,
             layout_id=self.spec.layout_id,
         )
         self._queued_restores.append((checkpoint_id, op))

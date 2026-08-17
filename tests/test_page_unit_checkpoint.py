@@ -26,6 +26,7 @@ def make_store(num_units=20, unit_bytes=10, slot_bytes=25):
             page_unit_bytes=unit_bytes,
             slot_bytes=slot_bytes,
             layout_id="layout-v1",
+            image_bytes=slot_bytes,
         ),
     )
 
@@ -45,12 +46,13 @@ def ready(store, prefix_hash, src_slot=0):
 
 
 def test_runtime_spec_derives_units_and_has_a_minimal_wire_form():
-    spec = PagedStateCheckpointSpec(10, 25, "layout-v1")
+    spec = PagedStateCheckpointSpec(10, 25, "layout-v1", image_bytes=25)
 
     assert spec.units_per_checkpoint == 3
     assert spec.to_wire() == {
         "page_unit_bytes": 10,
         "slot_bytes": 25,
+        "image_bytes": 25,
         "layout_id": "layout-v1",
     }
     assert "units_per_checkpoint" not in spec.to_wire()
@@ -62,12 +64,24 @@ def test_runtime_spec_derives_units_and_has_a_minimal_wire_form():
         spec.slot_bytes = 30
 
 
+def test_units_are_priced_off_the_image_not_the_whole_slot():
+    """An image holds part of a slot, so that part is what has to fit."""
+    whole = PagedStateCheckpointSpec(10, 25, "layout-v1", image_bytes=25)
+    narrowed = PagedStateCheckpointSpec(10, 25, "layout-v1", image_bytes=11)
+
+    assert whole.units_per_checkpoint == 3
+    assert narrowed.units_per_checkpoint == 2
+
+
 @pytest.mark.parametrize(
     "args",
     [
-        (0, 25, "layout-v1"),
-        (10, -1, "layout-v1"),
-        (10, 25, ""),
+        (0, 25, "layout-v1", 25),
+        (10, -1, "layout-v1", 25),
+        (10, 25, "", 25),
+        (10, 25, "layout-v1", 0),
+        # An image cannot hold more than the slot it was taken from.
+        (10, 25, "layout-v1", 26),
     ],
 )
 def test_runtime_spec_rejects_invalid_geometry(args):
@@ -124,7 +138,7 @@ def test_empty_batch_does_not_complete_a_queued_restore():
     pool = BlockPool(20)
     coordinator = PagedStateCheckpointCoordinator(
         pool,
-        PagedStateCheckpointSpec(10, 25, "layout-v1"),
+        PagedStateCheckpointSpec(10, 25, "layout-v1", image_bytes=25),
         enabled=True,
     )
     checkpoint_id, _ = ready(coordinator.store, 101)
