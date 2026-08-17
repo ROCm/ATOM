@@ -1291,7 +1291,9 @@ class KimiKDAAttention(nn.Module):
                     o=out,
                     initial_state=ssm_state,
                     inplace_final_state=True,
-                    cu_seqlens=spec_query_start_loc[: kda_metadata.num_spec_decodes + 1],
+                    cu_seqlens=spec_query_start_loc[
+                        : kda_metadata.num_spec_decodes + 1
+                    ],
                     # 2D [bs, 1+num_spec]: per-token snapshot slots. Paired with
                     # num_accepted_tokens the kernel reads the resume state from
                     # slot[num_accepted-1] and writes a snapshot after each token.
