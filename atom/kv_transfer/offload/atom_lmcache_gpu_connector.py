@@ -13,18 +13,18 @@ how those blocks are packed as opaque bytes.
 from __future__ import annotations
 
 from dataclasses import dataclass
-import threading
-from typing import Any, Callable
+from typing import Any
 
 import torch
 
 from atom.kv_transfer.offload.atom_kv_byte_codec import ATOMKVByteCodec
-from atom.kv_transfer.offload.atom_lmcache_staging import (
-    _StagingBuffer,
-    _ThreadTransferState,
+from atom.kv_transfer.offload.staged_transfer import (
+    StagedTransfer,
     _env_flag,
     _env_int,
     _env_optional_int,
+    _PipelineStage,
+    _ThreadTransferState,
 )
 
 
@@ -44,18 +44,6 @@ class _TransferChunk:
 class _TransferGroup:
     chunks: list[_TransferChunk]
     nbytes: int
-
-
-@dataclass(frozen=True)
-class _PipelineStage:
-    """One leg of the two-stage staging pipeline.
-
-    ``stream`` is the CUDA stream the work is issued on; ``run(group,
-    device_buf)`` does the work.
-    """
-
-    stream: Any
-    run: Callable[[_TransferGroup, torch.Tensor], None]
 
 
 class ATOMLMCacheGPUConnector:
@@ -89,7 +77,6 @@ class ATOMLMCacheGPUConnector:
                 "ATOM LMCache connector: GPU staging chunk bytes must be > 0"
             )
         self.device = torch.device(codec.device)
-        self._tls = threading.local()
         requested_buffer_chunks = _env_int("OFFLOAD_GPU_STAGING_CHUNKS", 2)
         max_staging_bytes = _env_optional_int("OFFLOAD_GPU_STAGING_MAX_BYTES")
         if max_staging_bytes is not None:
@@ -110,6 +97,11 @@ class ATOMLMCacheGPUConnector:
         )
         self._release_gpu_staging_after_transfer = _env_flag(
             "OFFLOAD_RELEASE_GPU_STAGING_AFTER_TRANSFER"
+        )
+        self._staged = StagedTransfer(
+            self.device,
+            staging_buffer_bytes=self._gpu_staging_buffer_bytes,
+            release_after_transfer=self._release_gpu_staging_after_transfer,
         )
 
     @property
@@ -132,52 +124,7 @@ class ATOMLMCacheGPUConnector:
         return self.device.type == "cuda"
 
     def _thread_state(self) -> _ThreadTransferState:
-        states = getattr(self._tls, "states", None)
-        if states is None:
-            states = {}
-            self._tls.states = states
-        key = str(self.device)
-        state = states.get(key)
-        if state is None:
-            state = _ThreadTransferState(
-                self.device,
-                self._use_cuda(),
-            )
-            states[key] = state
-        return state
-
-    def _ensure_staging_buffer(
-        self,
-        staging_buffer: _StagingBuffer,
-        nbytes: int,
-    ) -> torch.Tensor:
-        nbytes = int(nbytes)
-        if nbytes > self._gpu_staging_buffer_bytes:
-            raise RuntimeError(
-                "ATOM LMCache connector internal error: transfer group exceeds "
-                "bounded GPU staging buffer: "
-                f"nbytes={nbytes}, capacity={self._gpu_staging_buffer_bytes}"
-            )
-        if (
-            staging_buffer.tensor is None
-            or int(staging_buffer.tensor.numel()) != self._gpu_staging_buffer_bytes
-        ):
-            staging_buffer.tensor = torch.empty(
-                (self._gpu_staging_buffer_bytes,),
-                dtype=torch.uint8,
-                device=self.device,
-            )
-            staging_buffer.free_event_valid = False
-        return staging_buffer.tensor[:nbytes]
-
-    def _release_staging_buffer_if_requested(
-        self,
-        staging_buffer: _StagingBuffer,
-    ) -> None:
-        if not self._release_gpu_staging_after_transfer:
-            return
-        staging_buffer.tensor = None
-        staging_buffer.free_event_valid = False
+        return self._staged.thread_state()
 
     def _assert_fused_chunk_major_available(self) -> None:
         if self._use_cuda() and self.codec.has_fused_chunk_major_staging:
@@ -189,27 +136,7 @@ class ATOMLMCacheGPUConnector:
         )
 
     def _memory_tensor(self, memory_obj: Any, nbytes: int) -> torch.Tensor:
-        tensor = getattr(memory_obj, "tensor", None)
-        if tensor is None and hasattr(memory_obj, "get_tensor"):
-            tensor = memory_obj.get_tensor(0)
-        if tensor is None:
-            raise RuntimeError("ATOM LMCache connector: invalid MemoryObj tensor")
-        if tensor.dtype != torch.uint8:
-            raise TypeError(
-                "ATOM LMCache connector: MemoryObj tensor must be uint8, "
-                f"got {tensor.dtype}"
-            )
-        if not tensor.is_contiguous():
-            raise RuntimeError(
-                "ATOM LMCache connector: MemoryObj tensor not contiguous"
-            )
-        flat = tensor.reshape(-1)
-        if int(flat.numel()) < int(nbytes):
-            raise ValueError(
-                "ATOM LMCache connector: MemoryObj tensor is too small "
-                f"for {nbytes} bytes; got {int(flat.numel())}"
-            )
-        return flat[: int(nbytes)]
+        return self._staged.memory_tensor(memory_obj, nbytes)
 
     def _range_block_ids(
         self,
@@ -358,37 +285,8 @@ class ATOMLMCacheGPUConnector:
         stage_a: _PipelineStage,
         stage_b: _PipelineStage,
     ) -> None:
-        """Drive an event-synced two-stage staging pipeline.
-
-        Each group flows ``stage_a`` -> ``stage_b`` on their respective streams,
-        handed off via the staging buffer's ready event; the free event gates a
-        later group's reuse of the same buffer. ``stage_b``'s stream produces
-        the observable result, so it is the one synchronized at the end.
-        """
         self._assert_fused_chunk_major_available()
-        staging_buffer = state.staging_buffer
-        used_buffer = False
-        try:
-            for group in groups:
-                device_buf = self._ensure_staging_buffer(staging_buffer, group.nbytes)
-                used_buffer = True
-                if staging_buffer.free_event_valid:
-                    stage_a.stream.wait_event(staging_buffer.free_event)
-                with state.stream_ctx(stage_a.stream):
-                    stage_a.run(group, device_buf)
-                staging_buffer.ready_event.record(stage_a.stream)
-                stage_b.stream.wait_event(staging_buffer.ready_event)
-                with state.stream_ctx(stage_b.stream):
-                    stage_b.run(group, device_buf)
-                staging_buffer.free_event.record(stage_b.stream)
-                staging_buffer.free_event_valid = True
-            stage_b.stream.synchronize()
-        except Exception:
-            staging_buffer.free_event_valid = False
-            raise
-        finally:
-            if used_buffer:
-                self._release_staging_buffer_if_requested(staging_buffer)
+        self._staged.run_pipeline(state, groups, stage_a, stage_b)
 
     def from_gpu(self, memory_obj: Any, start: int, end: int, **kwargs) -> None:
         self.batched_from_gpu([memory_obj], [start], [end], **kwargs)

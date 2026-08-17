@@ -50,7 +50,9 @@ Two ideas carry the whole module:
 | `metadata.py` | `ATOMRawBytesLMCacheMetadata` (opaque uint8 allocation) + per-request transfer descriptors (`LoadSpec`, `SaveSpec`, `LMCacheReqMeta`, `LMCacheOffloadMetadata`). |
 | `atom_kv_byte_codec.py` | `ATOMKVByteCodec`: maps a token range → AITER KV blocks and packs/unpacks them as raw bytes. The layout-bridging core. |
 | `atom_lmcache_gpu_connector.py` | `ATOMLMCacheGPUConnector`: LMCache `GPUConnectorInterface` impl. Bounded GPU staging + two-stage (pack ↔ copy) pipeline. |
-| `atom_lmcache_staging.py` | Per-thread CUDA streams, staging buffer, ready/free events, env helpers. |
+| `staged_transfer.py` | `StagedTransfer`: the tier-agnostic staging half — bounded GPU buffer, per-thread CUDA streams, the two-stage producer-event pipeline, and the `OFFLOAD_*` env helpers. Shared by the KV and state offload tiers. |
+| `state_object.py` | `StateByteCodec`: the state tier's analog of the KV codec. Packs/unpacks one per-request state entry (GDN/KDA recurrent state, DeepSeek-V4 compressor ring) as raw bytes under a `CacheEngineKey` keyed on the checkpoint's block hash. |
+| `state_tier.py` | `StateOffloadTier`: the worker-side spill/load executor for the state tier — it moves bytes and reports, and holds no index. Also the two boundary helpers for a future joint KV+state load, `clamp_state_boundary` and `_JointPark`, which have no production caller. See [State offload tier](#state-offload-tier-opt-in). |
 | `triton_kv_staging.py` | Triton fused chunk-major pack/unpack kernels (the fast staging path). |
 
 ## Architecture
@@ -208,18 +210,22 @@ groups, so HBM staging cost is capped regardless of prefix length.
 **`OFFLOAD_GPU_STAGING_CHUNKS` sizes *each* staging buffer, and there is more than
 one.** The buffer is thread-local (`threading.local`), and load and save run on
 separate executors (§ worker side). So the **load path** owns one staging buffer
-and the **save path** owns one per save worker — they are never shared. Resident
-staging HBM is therefore:
+and the **save path** owns one per save worker — they are never shared. With
+`OFFLOAD_STATE` on, the state tier adds one more: it reuses the KV connector's
+`StagedTransfer` *object*, but packs on its own `lmc-state` worker thread, and
+thread-local means a per-thread buffer no matter whose object it came from.
+Resident staging HBM is therefore:
 
 ```
 staging_chunk_bytes = (LMCACHE_CHUNK_SIZE / block_size) * bytes_per_block
 per_buffer_bytes    = OFFLOAD_GPU_STAGING_CHUNKS * staging_chunk_bytes
-resident_HBM        ≈ (1 load + OFFLOAD_COPY_WORKERS save) * per_buffer_bytes
+resident_HBM        ≈ (1 load + OFFLOAD_COPY_WORKERS save
+                       + 1 if OFFLOAD_STATE else 0) * per_buffer_bytes
 ```
 
 For the chunk2 run that is `2 * 16.76 MiB ≈ 33.5 MiB` per buffer × (1 load + 1
-save) ≈ **67 MiB** total. Raising `OFFLOAD_GPU_STAGING_CHUNKS` speeds up transfers
-but multiplies *both* buffers.
+save) ≈ **67 MiB** total, or ≈ **100 MiB** with the state tier on. Raising
+`OFFLOAD_GPU_STAGING_CHUNKS` speeds up transfers but multiplies *every* buffer.
 
 ## When Does a Reload Actually Happen?
 
@@ -452,13 +458,19 @@ turns LMCache's *token ranges* into ATOM *block ranges* and drives bounded stagi
 - **Observability** — keeps per-transfer stats (bytes, groups, pack/copy/sync ms,
   effective GiB/s) surfaced by the connector's `OFFLOAD_PROFILE` logging.
 
-### `atom_lmcache_staging.py` — staging primitives
+### `staged_transfer.py` — staging primitives
 
-Small but load-bearing. `_ThreadTransferState` lazily creates, per thread, the two
-CUDA streams (`pack_stream`, `copy_stream`) and a `_StagingBuffer` holding the
-device tensor plus `ready`/`free` CUDA events that gate the pipeline hand-off.
-Also the `_env_flag/_env_int/_env_optional_int` helpers that parse the `OFFLOAD_*`
-knobs. This per-thread isolation is exactly why load and save never contend.
+Small but load-bearing, and deliberately tier-agnostic: `StagedTransfer` owns the
+bounded device buffer (`ensure_buffer` / `release_buffer_if_requested`), the
+MemoryObj byte view (`memory_tensor`), and `run_pipeline` — the two-stage,
+event-synced hand-off that `ATOMLMCacheGPUConnector._run_staged_pipeline`
+delegates to. `_ThreadTransferState` lazily creates, per thread, the two CUDA
+streams (`pack_stream`, `copy_stream`) and a `_StagingBuffer` holding the device
+tensor plus `ready`/`free` CUDA events that gate the pipeline hand-off; the
+events are created in `_StagingBuffer.__init__` so the producer-event protocol
+cannot be silently skipped by a caller. Also the
+`_env_flag/_env_int/_env_optional_int` helpers that parse the `OFFLOAD_*` knobs.
+This per-thread isolation is exactly why load and save never contend.
 
 ### `config.py` & `metadata.py` — wiring and descriptors
 
@@ -548,6 +560,13 @@ Connector-specific tuning (env):
 | `OFFLOAD_GPU_STAGING_MAX_BYTES` | — | Hard cap on staging bytes (clamps the chunk count). |
 | `OFFLOAD_RELEASE_GPU_STAGING_AFTER_TRANSFER` | 0 | Free the staging buffer after each transfer (lower idle HBM, higher churn). |
 | `OFFLOAD_PROFILE` | 0 | Emit `[OFFLOAD-LOAD-PROF]` / `[OFFLOAD-SAVE-PROF]` per-transfer timing. |
+| `OFFLOAD_STATE` | 0 | Enable the per-request state offload tier. Off means byte-identical to no tier at all. Truthy by spelling (`0`/`false`/`no`/`off` are off), not by equality against `"1"`. |
+| `OFFLOAD_STATE_STAGING_GROUPS` | 1 | Staging *groups* (not rows) reserved as the spill ring; `state_pool()` multiplies by the class's `entries_per_req`. Read by `state_offload_staging_groups()`; ignored (0) when `OFFLOAD_STATE` is off. A non-integer warns and falls back to 1 rather than raising — this runs during model load. |
+| `OFFLOAD_STATE_MIN_LOAD_TOKENS` | 0 | Boundary below which a state load is not worth its H2D. Deliberately **not** KV's 8192: a KV load moves bytes proportional to the hit, a state load moves one flat entry whatever the boundary is, while the prefill it saves grows with the boundary. Raise it when the entry is very large or `loads_failed / loads_attempted` is high. |
+
+> **Not an env var today.** The plan sketches `OFFLOAD_STATE_WORKERS`; it is
+> only the `max_workers` keyword on `StateOffloadTier`, which every caller
+> leaves at its default of 1. Setting it has no effect.
 
 > **Removed:** `OFFLOAD_UNALIGNED_HANDOFF` — the unaligned handoff is now **always on**; no switch needed. Old scripts/docs that still set it are ignored (harmless).
 
@@ -827,11 +846,157 @@ python3 multi-round-qa.py \
 # cases swept: 32k:2:2  64k:2:4  128k:2:2  (ctx:c:s)
 ```
 
+## State offload tier (opt-in)
+
+Separate from the KV tier above. A hybrid model (GDN/KDA) or DeepSeek-V4 keeps
+one **per-request state** entry — recurrent state or a compressor ring — that a
+resuming request forks from instead of recomputing. `StateGroupPool` holds a
+fixed number of these; when they run out, a checkpoint is evicted and its reuse
+value is gone. This tier spills the evicted checkpoint's bytes to LMCache under
+its block hash and pulls them back when a later prefix hit lands on that
+boundary. The state cannot be rebuilt from cached KV — the KV holds the
+compressor's *output* while the state is its rolling *input* window — which is
+why it needs a tier of its own rather than riding the paged-KV offload.
+
+What it recovers is exactly the resume `checkpoints_evicted` counts: a request
+whose KV prefix is still in HBM but whose state checkpoint was spent to admit
+somebody else. Without the tier that prefix is recomputed from token 0.
+
+**Off by default, and only worth turning on under real pressure.** The tier
+costs a staging group out of the state pool plus a D2H per eviction, and an
+H2D plus a park round trip per resume. It buys nothing unless checkpoints are
+actually being evicted. The signal is the `state checkpoints:` log line the
+scheduler emits: if `checkpoints_evicted` is near zero, the pool is big enough
+for the workload and the tier is pure overhead. Measure that with the tier
+**off** first, and enable it only when the counter is materially non-zero.
+
+Once the tier is on, that same line carries its counters, prefixed
+`state_offload_` (`StateOffloadIndex.stats` via `checkpoint_fates`):
+`spills_requested`, `spills_dropped`, `spills_forgone`, `indexed`, and
+`loads_attempted` / `loads_completed` / `loads_failed`.
+
+Watch `spills_dropped`: a non-trivial ratio against `spills_requested` means
+`OFFLOAD_STATE_STAGING_GROUPS` is too shallow for the eviction rate — spills
+are being refused for want of a staging slot. The starvation warning only
+fires after 256 consecutive drops, so a ring dropping one spill in three is
+silent there and visible only here.
+
+`spills_forgone` is a different thing and a deeper ring does not fix it: an
+eviction that made room for a **load** deliberately does not spill. The load
+writes that group from the tier's thread before the forward that would have
+copied it out, so a spill there would store the resuming request's state under
+the evicted checkpoint's hash. One checkpoint is given up per resume served,
+which is the price of the resume.
+
+Read the three `loads_*` together. Every attempt was made against a hash the
+index advertised, so `loads_failed` is this index's **false-positive rate**:
+LMCache's LRU had already dropped the bytes. A high ratio means the tier is
+storing more than the backend keeps, and each miss costs a park round trip
+before the request recomputes anyway. `attempted - completed - failed` is what
+is in flight or was abandoned by a request that went away first.
+
+**Requires the `lmcache_offload` connector.** `kv_connector_hosts_state_tier()`
+gates installation; `OFFLOAD_STATE` set against any other `--kv-transfer-config`
+warns at startup and the tier stays off (`block_manager.py`).
+
+**Not supported with pipeline parallelism.** With `pipeline_parallel_size > 1`
+the tier refuses to build and warns (`connector.py`, `_maybe_build_state_tier`);
+paged-KV offload is unaffected. Two independent reasons, neither of which
+raises. The `CacheEngineKey` is `(model, world_size, worker_id, hash)` with
+`worker_id = tp.rank_in_group` — no PP component — so two stages holding
+different layer slices write different bytes under one key and clobber each
+other. And `pp_engine_core.py` has every stage call `forward` on the
+head-pickled batch, so spills fire on all of them, while only the head runs
+`_poll_kv_transfer_progress`: the other stages' `state_staging_released`
+reports are never drained and the ring starves after `staging_depth`
+evictions. Lifting this needs a PP component in the key *and* a report path
+from the non-head stages.
+
+### Both directions, end to end
+
+**Spill.** `StateGroupPool.pop()` calls `_spill(group)` before `invalidate()`
+clears the hash it will be stored under, reserving a staging slot;
+`CommonAttentionBuilder.build()` issues the D2D copy into the ring **before**
+that batch's checkpoint copies (the same group is routinely both this batch's
+spill source and its copy destination) and hands one `torch.cuda.Event` to
+every `submit_spill`. The worker packs and stores, then reports via
+`KVConnectorOutput.state_indexed` / `.state_staging_released`; the aggregator
+waits for every TP rank, and `Scheduler._update_from_kv_xfer_finished` applies
+`confirm_spill` **then** `release_staging` — index before release, or the slot
+is reusable while its hash is not yet findable.
+
+**Load.** `BlockManager._attach_state_group` finds no HBM group for an accepted
+boundary, asks `StateOffloadIndex.request_load`, and on a yes keeps the
+boundary and takes a group. The scheduler parks the request in
+`WAITING_FOR_REMOTE_KVS` — the KV load's park, because from the scheduler's
+side the two are one event — and publishes `(req_id, hash, target_group)` on
+`LMCacheOffloadMetadata.state_loads`. The worker's `StateOffloadTier
+.submit_load` fetches the entry into that group and reports by request id;
+those reports merge into `finished_loading` / `failed_loading`, which is what
+buys the state leg the aggregator's per-request quorum for free. The request
+then resumes as a suffix prefill through `_is_offload_prefill_resume`, with no
+re-allocation.
+
+The load rides the **connector metadata, not the batch**, unlike the spill. A
+load is issued precisely when its request is *not* in the batch, and a batch
+that is never forwarded would strand it; a load also needs no compute-stream
+ordering, since the target group belongs to a parked request and
+`StagedTransfer.unpack` synchronizes the stream that produced the bytes before
+returning.
+
+**Why `STATE_OFFLOAD_LOADS_WIRED` is still a name.** `resumable_hit` scans
+right to left and stops at the first boundary `_resumable_from` accepts, so a
+rung nothing can deliver does not merely fail to help — it shadows a shorter
+checkpoint still resident in HBM that the walk-back would have reached. The
+flag is what states that the tier may only vote once a load can act on its
+vote. Its False arm is kept because the control pair in
+`tests/test_state_offload_resume.py` is what makes that property observable.
+
+**`OFFLOAD_STATE_MIN_LOAD_TOKENS` is checked inside that predicate**, not at
+the load site, for the same reason: a floor has to *decline* a rung so the scan
+keeps walking. Accepting one and then skipping the transfer would end the scan
+on a boundary nobody fills.
+
+`BlockManager._attach_state_group` still **disowns the boundary**
+(`seq.num_cached_tokens = 0`) when no group can be produced, and
+`_consume_failed_remote_kv` does the same when a load comes back failed. That
+guard is not made redundant by wiring loads — LMCache's LRU can drop bytes
+under a hash the index still advertises, so a load that finds nothing lands
+there too, and the failed request recomputes over the blocks it already holds.
+
+**No cross-restart reuse.** `LocalDiskBackend` never scans its own directory on
+startup, so bytes written by a previous run are unreachable no matter what the
+index says. The index is in-memory and dies with the process, which is the
+*correct* behaviour: persisting it would advertise hashes whose bytes the
+backend cannot find, turning every stale entry into a load miss.
+
+**A hybrid model still declines paged-KV loads, and that is what keeps the
+state load safe.** The `_decide_load_after_alloc` guard refuses the offload KV
+load for any sequence with `has_per_req_cache`, and it stays. With it in place
+the state boundary comes from `_gated_hit` over `block_hashes`, which
+`can_allocate` builds out of **HBM `kv.lookup` hits only** — so `P <= L` holds
+by construction and there is no clamp in the loop to get wrong. It is not
+blocked merely on the joint park existing: the KV leg's
+boundary comes from LMCache's `lookup()` and is floored to `chunk_size` (256),
+while the state leg's comes from `BlockManager._gated_hit` — a fixpoint over the
+state caches, snapped to `hash_block_size` and then to a
+`state_checkpoint_interval_tokens` rung, and additionally gated by
+`min_fork_tokens`. Two independent matchers at two different granularities can
+and normally will settle at different boundaries, and `L > P` is silent wrong
+output (the model reads a compressed prefix whose raw KV was never loaded). A
+joint park makes `L == P` *representable*, not *guaranteed*; lifting the guard
+needs a load path that clamps the two legs to a common boundary and proves it —
+`clamp_state_boundary` and `_JointPark` are the tools for that day and have no
+production caller. Saves are unaffected — a hybrid still populates the tier for
+stateless readers.
+
 ## Testing
 
 | Test | Covers |
 |------|--------|
 | [`tests/test_lmcache_offload_connector.py`](../../../tests/test_lmcache_offload_connector.py) | Worker-side round-trip: codec pack/unpack, fp8 scales, byte-identical store→retrieve, staging pipeline. |
+| [`tests/test_state_tier.py`](../../../tests/test_state_tier.py), [`tests/test_state_offload_clamp.py`](../../../tests/test_state_offload_clamp.py), [`tests/test_state_offload_index.py`](../../../tests/test_state_offload_index.py) | State tier: spill and load submit/report, the staging ring, the load bookkeeping and its floor, and the (unwired) joint-park helpers. |
+| [`tests/test_state_offload_resume.py`](../../../tests/test_state_offload_resume.py) | Admission against a spilled hash: the park, the completed resume, the failed load's disown, the control pair for the shadowing property, and that an HBM checkpoint still resumes untouched. |
 | [`tests/test_kv_connector_scheduler.py`](../../../tests/test_kv_connector_scheduler.py) | Scheduler-side decisions: lookup→park, the `_decide_load_after_alloc` outcomes, save-frontier tracking, defer-free. |
 
 ## Known Limitations & Future Work
@@ -846,6 +1011,12 @@ python3 multi-round-qa.py \
 - **`min_load` is ATOM-standalone only.** The vLLM-plugin path
   (`LMCacheConnectorV1`) does not consume `OFFLOAD_MIN_LOAD_TOKENS`; its analog is
   LMCache's `min_retrieve_tokens` (default 0 — no threshold).
+- **The executors are never shut down.** `StateOffloadTier.shutdown()` has no
+  caller, and neither `_load_executor` nor `_save_executor` is joined — the
+  connector has no `close`/`shutdown` hook to hang them off. `ThreadPoolExecutor`
+  registers its own interpreter-exit join, so a clean exit still drains queued
+  work rather than leaking threads — but nothing bounds how long that takes, and
+  nothing cancels in-flight transfers on a fast teardown.
 - **GDS / NVMe-direct is disabled.** `config.py` forces `use_gds=False` (cufile
   init hangs without NVMe-GDS hardware here); the NVMe tier goes through LMCache's
   host path.

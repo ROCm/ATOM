@@ -54,6 +54,21 @@ class KVOutputAggregator:
         self._seen_saving: dict[ReqId, set[int]] = {}
         self._seen_loading: dict[ReqId, set[int]] = {}
         self._seen_load_failed: dict[ReqId, set[int]] = {}
+        # The state offload tier's three reports, keyed by staging slot and by
+        # content hash rather than by request id. All-ranks, not first-rank-
+        # wins, for two distinct reasons: every TP rank packs its own shard out
+        # of the *same* staging slot, so the slot is reusable only after the
+        # last rank's D2H; and a hash is loadable only if every rank stored its
+        # shard, since a load reads all of them back.
+        #
+        # Quorum for a hash is taken on `_seen_state_indexed | _seen_state_index_failed`
+        # so a partial-store (some ranks succeed, some fail) resolves in the
+        # same step rather than pinning the key forever.  A hash is emitted on
+        # `state_indexed` only if every rank stored it; otherwise it is dropped
+        # silently (partial shards are unloadable).
+        self._seen_state_released: dict[int, set[int]] = {}
+        self._seen_state_indexed: dict[int, set[int]] = {}
+        self._seen_state_index_failed: dict[int, set[int]] = {}
 
     @property
     def world_size(self) -> int:
@@ -92,6 +107,15 @@ class KVOutputAggregator:
             if wo.failed_loading:
                 for rid in wo.failed_loading:
                     self._seen_load_failed.setdefault(rid, set()).add(worker_idx)
+            if wo.state_staging_released:
+                for slot in wo.state_staging_released:
+                    self._seen_state_released.setdefault(slot, set()).add(worker_idx)
+            if wo.state_indexed:
+                for h in wo.state_indexed:
+                    self._seen_state_indexed.setdefault(h, set()).add(worker_idx)
+            if wo.state_index_failed:
+                for h in wo.state_index_failed:
+                    self._seen_state_index_failed.setdefault(h, set()).add(worker_idx)
 
         done_sending = {
             rid
@@ -133,6 +157,27 @@ class KVOutputAggregator:
             for rid, workers in self._seen_loading.items()
             if len(workers) >= self._world_size and rid not in failed_loading
         }
+        state_released = {
+            slot
+            for slot, workers in self._seen_state_released.items()
+            if len(workers) >= self._world_size
+        }
+        # Take quorum on the union of stored and failed sets: a hash becomes
+        # decidable once every rank has answered either way.  Emit only hashes
+        # every rank stored; partial stores are silently dropped (unloadable).
+        state_index_ids = set(self._seen_state_indexed) | set(
+            self._seen_state_index_failed
+        )
+        state_indexed = set()
+        state_index_resolved = set()
+        for h in state_index_ids:
+            done_w = self._seen_state_indexed.get(h, set())
+            fail_w = self._seen_state_index_failed.get(h, set())
+            if len(done_w | fail_w) >= self._world_size:
+                state_index_resolved.add(h)
+                if not fail_w:
+                    # Every rank stored its shard.
+                    state_indexed.add(h)
 
         for rid in done_sending:
             del self._seen_sending[rid]
@@ -150,6 +195,11 @@ class KVOutputAggregator:
         for rid in failed_loading:
             self._seen_loading.pop(rid, None)
             self._seen_load_failed.pop(rid, None)
+        for slot in state_released:
+            del self._seen_state_released[slot]
+        for h in state_index_resolved:
+            self._seen_state_indexed.pop(h, None)
+            self._seen_state_index_failed.pop(h, None)
 
         return KVConnectorOutput(
             finished_sending=done_sending,
@@ -158,6 +208,13 @@ class KVOutputAggregator:
             finished_saving=done_saving,
             finished_loading=done_loading,
             failed_loading=failed_loading,
+            state_staging_released=state_released,
+            state_indexed=state_indexed,
+            # state_index_failed is never forwarded to the engine: the
+            # scheduler only needs to confirm hashes that every rank stored.
+            # Partial-store keys are dropped here; orphaned shards are left to
+            # LMCache's LRU (no explicit cleanup needed -- the engine never
+            # indexed them, so they are unreachable and naturally evicted).
         )
 
     def reset(self) -> None:
@@ -168,6 +225,9 @@ class KVOutputAggregator:
         self._seen_saving.clear()
         self._seen_loading.clear()
         self._seen_load_failed.clear()
+        self._seen_state_released.clear()
+        self._seen_state_indexed.clear()
+        self._seen_state_index_failed.clear()
 
     @property
     def pending_count(self) -> tuple[int, int]:

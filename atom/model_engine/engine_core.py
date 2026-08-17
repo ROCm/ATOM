@@ -368,8 +368,17 @@ class EngineCore:
         connector = getattr(self.scheduler, "kv_connector", None)
         if connector is None or not getattr(connector, "is_offload", False):
             return
+        self.scheduler._publish_state_loads()
         meta = connector.build_connector_meta()
-        if meta is None or not getattr(meta, "requests", None):
+        if meta is None:
+            return
+        # State loads count as work even though they carry no `LMCacheReqMeta`:
+        # they are a different list on the same metadata, and a request is
+        # parked waiting for each one. Dropping the meta here would leave those
+        # requests parked against a report nobody was asked to produce.
+        if not getattr(meta, "requests", None) and not getattr(
+            meta, "state_loads", None
+        ):
             return
         self.runner_mgr.call_func("process_kvconnector_output", meta)
 

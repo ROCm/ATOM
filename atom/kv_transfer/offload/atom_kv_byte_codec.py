@@ -64,6 +64,18 @@ class ATOMKVByteCodec:
         preserving the original non-MLA behaviour."""
         self._segments: list[torch.Tensor] = []
         for _name, kvt in kv_caches.items():
+            # A hybrid model (Qwen3-Next / Qwen3.5, Kimi-K3) registers its
+            # per-request recurrent state in the same dict, because the linear
+            # attention forward reads its state from `kv_cache_data`. That
+            # state is indexed by request slot, not by block: it has no
+            # per-block stride to derive and is not part of what a block's
+            # bytes mean. Moving it here would either fail the divisibility
+            # check below or -- worse, if the slot count happens to divide
+            # `num_blocks` -- inflate `bytes_per_block` past what the backend's
+            # own `block_regions` describe. The state tier reaches these bytes
+            # through `state_entry_views` instead.
+            if getattr(kvt, "per_request_state", False):
+                continue
             for t in (
                 getattr(kvt, "k_cache", None),
                 getattr(kvt, "v_cache", None),

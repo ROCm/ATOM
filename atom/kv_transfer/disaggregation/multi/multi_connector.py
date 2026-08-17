@@ -38,6 +38,10 @@ Merge strategy mirrors vLLM's ``MultiConnector``, adapted to ATOM's
   index in ``start_load_kv``.
 * ``get_finished`` — union the completion sets, **but** see the send/save
   pairing below.
+* ``_state_tier`` — the state offload tier, if a sub built one, re-exposed on
+  the composite. ``AttentionBackend._submit_state_spills`` reads this attribute
+  off whatever connector the forward context holds, so without it the engine's
+  spills are staged and never submitted.
 
 Send/save pairing (the one tricky correctness point)
 ----------------------------------------------------
@@ -193,6 +197,13 @@ class MultiConnector(KVConnectorBase):
         # _sent / _saved: completed-but-unpaired transfers, str(req_id) -> raw id.
         self._sent: dict[str, Any] = {}
         self._saved: dict[str, Any] = {}
+        # The state offload tier of whichever sub owns one, adopted in
+        # `register_kv_caches`. Always defined, because
+        # `AttentionBackend._submit_state_spills` probes it on every batch and
+        # the engine's staging ring only gets its slots back once a submitted
+        # spill reports; a MultiConnector with no such attribute would swallow
+        # every spill and starve the ring permanently.
+        self._state_tier = None
 
     def register_kv_caches(
         self,
@@ -202,6 +213,36 @@ class MultiConnector(KVConnectorBase):
     ) -> None:
         for c in self._connectors:
             c.register_kv_caches(kv_caches, transfer_tensors, num_blocks)
+        self._adopt_state_tier()
+
+    def _adopt_state_tier(self) -> None:
+        """Take over the one sub-connector's state tier, or refuse two.
+
+        Only the offload backend ever builds a tier, and a sane ``multi``
+        config lists it once. Nothing in ``_build_subconnectors`` enforces
+        that, though, so two ``lmcache_offload`` entries would leave two live
+        tiers and no answer to "which one packs this spill".
+
+        Picking the first would be wrong rather than merely arbitrary: the
+        spill is submitted to one tier and the load would be free to ask the
+        other, so a hash could be reported indexed by a tier that never stored
+        it and then fetched from one that cannot produce it. Raise instead — this runs at model load, before a single
+        staging slot has been reserved, so a config error is loud and costs
+        nothing. Every other failure mode in this file is a silent leak; this
+        one does not have to be.
+        """
+        tiers = [
+            c for c in self._connectors if getattr(c, "_state_tier", None) is not None
+        ]
+        if len(tiers) > 1:
+            names = [type(c).__name__ for c in tiers]
+            raise ValueError(
+                f"multi connector: {len(tiers)} sub-connectors built a state "
+                f"offload tier ({names}); exactly one may. List the offload "
+                "backend once in kv_transfer_config.connectors, or unset "
+                "OFFLOAD_STATE."
+            )
+        self._state_tier = tiers[0]._state_tier if tiers else None
 
     def start_load_kv(self, metadata: ConnectorMetadata) -> None:
         metas = getattr(metadata, "metas", None)
@@ -220,7 +261,7 @@ class MultiConnector(KVConnectorBase):
             if reqs:
                 for req in reqs:
                     if getattr(req, "save_spec", None) is not None:
-                        self._pending_save.add(str(getattr(req, "req_id")))
+                        self._pending_save.add(str(req.req_id))
             c.start_load_kv(m)
 
     def get_finished(self) -> KVConnectorOutput:
@@ -230,6 +271,9 @@ class MultiConnector(KVConnectorBase):
         load_failed: set = set()
         send_now: list = []
         save_now: list = []
+        state_released: set = set()
+        state_indexed: set = set()
+        state_index_failed: set = set()
         for c in self._connectors:
             o = _normalize_finished(c.get_finished())
             recv |= o.finished_recving
@@ -238,12 +282,24 @@ class MultiConnector(KVConnectorBase):
             load_failed |= o.failed_loading
             send_now.extend(o.finished_sending)
             save_now.extend(o.finished_saving)
+            # The state tier's three reports. Unioned like the load/recv sets
+            # and unlike send/save: there is no pairing to withhold them for --
+            # a staging slot and a content hash have no request identity, so no
+            # sub-connector's transfer is reading the blocks they name. Dropping
+            # them here would leak the slot with no way to ever get it back,
+            # since only this report frees it.
+            state_released |= o.state_staging_released
+            state_indexed |= o.state_indexed
+            state_index_failed |= o.state_index_failed
 
         out = KVConnectorOutput(
             finished_recving=recv,
             failed_recving=failed,
             finished_loading=loaded,
             failed_loading=load_failed,
+            state_staging_released=state_released,
+            state_indexed=state_indexed,
+            state_index_failed=state_index_failed,
         )
 
         if not self.is_producer:
@@ -339,6 +395,23 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         return (
             c.adjust_prefill_chunk_after_alloc(seq, chunk) if c is not None else chunk
         )
+
+    def enqueue_state_loads(self, loads) -> bool:
+        """First sub that can carry them owns them; False if none can.
+
+        Only one sub may host the state tier at all -- the worker side raises a
+        `ValueError` at model load when two do, because a spill would go to one
+        tier and a load could ask the other. So "first" is also "only".
+
+        The False is not a formality. Every load handed here belongs to a
+        parked request that only a report can wake, so swallowing one is a
+        permanent park; the scheduler's `hasattr` guard cannot catch it either,
+        because this method always exists. Say so and let the caller fail them.
+        """
+        c = _first_with(self._connectors, "enqueue_state_loads")
+        if c is None:
+            return False
+        return bool(c.enqueue_state_loads(loads))
 
     def should_park_partial_prefill_for_load(self, seq: Any) -> bool:
         c = _first_with(self._connectors, "should_park_partial_prefill_for_load")

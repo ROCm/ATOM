@@ -426,6 +426,9 @@ class GDNStateMixin:
         per_layer = (
             math.prod(shape_k) * dt_k.itemsize + math.prod(shape_v) * dt_v.itemsize
         )
+        # The offload tier's spill ring is added on top of this by
+        # `state_pool()`, in slots: a checkpoint here is one slot, so a staging
+        # entry is one row.
         extra = max(0, getattr(self.model_runner.config, "state_checkpoint_slots", 0))
         return state_pool(
             STATE_SLOT_CLASS,
@@ -487,6 +490,28 @@ class GDNStateMixin:
                 num_slots, dtype=torch.int32, device="cuda"
             )
         return out
+
+    def state_entry_views(self, slot: int) -> list[torch.Tensor]:
+        """Contiguous views covering the whole of one slot's GDN state.
+
+        The byte-level counterpart of `relocate_state_slots`: that method moves
+        a slot between two pool indices, this one names the same bytes so
+        something outside the pool -- the LMCache offload tier -- can read or
+        write them.
+
+        One view per (cache, layer) rather than one for the slot: both caches
+        are layer-major with the slot on axis 1, so a slot's rows are strided
+        and no single range covers them. The Triton staging packer builds its
+        segment table from `seg.is_contiguous()` and refuses a strided view.
+        """
+        views = []
+        for cache in (
+            self.model_runner.mamba_k_cache,
+            self.model_runner.mamba_v_cache,
+        ):
+            for layer in range(cache.shape[0]):
+                views.append(cache[layer, slot : slot + 1])
+        return views
 
     def relocate_state_slots(self, pairs: Sequence[tuple[int, int]]) -> None:
         """Relocate one slot's whole GDN state, both families, all layers.
@@ -1073,6 +1098,10 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
                 replay_buf_g=(
                     runner.replayssm_buf_g[gdn_idx] if self.replayssm else None
                 ),
+                # Slot-addressed recurrent state, not paged KV. It has to be
+                # registered (attention_gdn reads its state out of
+                # `kv_cache_data`), but no block-addressed mover may touch it.
+                per_request_state=True,
             )
         return super().build_kv_cache_tensor(layer_id, module)
 
