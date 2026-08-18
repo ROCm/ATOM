@@ -602,13 +602,16 @@ class BlockManager:
         # A PAGE-checkpointing backend attached above instead, before the fresh
         # blocks of this same admission could evict the checkpoint it restores
         # from.
-        if seq.has_per_req_cache and self.paged_state_checkpoints is None:
-            if not self._attach_state_slots(seq, h if num_cached_blocks > 0 else -1):
-                # The state behind the boundary could not be produced, so the
-                # boundary is not this request's history. Disown it — the blocks
-                # stay claimed and the forward simply recomputes over them,
-                # which is what `failed_loading` means on the KV side.
-                seq.num_cached_tokens = 0
+        if (
+            seq.has_per_req_cache
+            and self.paged_state_checkpoints is None
+            and not self._attach_state_slots(seq, h if num_cached_blocks > 0 else -1)
+        ):
+            # The state behind the boundary could not be produced, so the
+            # boundary is not this request's history. Disown it — the blocks
+            # stay claimed and the forward simply recomputes over them,
+            # which is what `failed_loading` means on the KV side.
+            seq.num_cached_tokens = 0
 
     def _attach_state_slots(self, seq: Sequence, hit_hash: int) -> bool:
         """Give `seq` its state slots, resuming from a checkpoint when one exists.

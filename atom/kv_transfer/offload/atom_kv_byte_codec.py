@@ -63,7 +63,7 @@ class ATOMKVByteCodec:
         to ``segment.shape[0]`` (the block-major assumption) when not supplied,
         preserving the original non-MLA behaviour."""
         self._segments: list[torch.Tensor] = []
-        for _name, kvt in kv_caches.items():
+        for kvt in kv_caches.values():
             # A hybrid model (Qwen3-Next / Qwen3.5, Kimi-K3) registers its
             # per-request recurrent state in the same dict, because the linear
             # attention forward reads its state from `kv_cache_data`. That
