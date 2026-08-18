@@ -153,7 +153,7 @@ def test_descriptor_kernel_round_trips_random_bytes_with_partial_tail():
             unit_bases[None],
             forward=forward,
         )
-        launch_copy_descriptor(descriptor, plan, device)
+        launch_copy_descriptor(torch.from_numpy(descriptor).to(device), plan)
 
     torch.cuda.synchronize()
     assert torch.equal(restored, original)
@@ -188,7 +188,7 @@ def test_several_copies_ride_in_one_descriptor():
                 dtype=np.int64,
             ),
         )
-    launch_copy_descriptor(descriptor, plan, device)
+    launch_copy_descriptor(torch.from_numpy(descriptor).to(device), plan)
 
     torch.cuda.synchronize()
     for src, image in zip(sources, images, strict=True):
@@ -224,3 +224,56 @@ def test_a_batch_describes_each_copy_the_way_one_call_would():
             )
 
         assert np.array_equal(batched, one_at_a_time), f"forward={forward}"
+
+
+def test_a_zero_byte_copy_is_an_empty_plan_not_a_broadcast_error():
+    """0 is a legal `total_bytes` by this function's own contract.
+
+    It validates negatives and empty segments, so a caller reads 0 as allowed
+    -- and the tiling used to build its exclusive prefix sum by prepending a
+    zero, which has no answer when there are no spans and failed to broadcast
+    instead. An empty plan is the answer; `launch_copy_descriptor` returns on
+    a zero-row descriptor before it can divide by `num_spans`.
+    """
+    plan = plan_segmented_copy([5], [5], total_bytes=0)
+
+    assert plan.num_spans == 0
+    assert plan.num_tiles == 0
+
+
+def test_bases_that_do_not_cover_every_copy_are_refused():
+    """Numpy would broadcast them, and every copy would go to image zero.
+
+    Verified before the guard: a one-row `dst_bases` against three copies
+    produced three identical destination rows -- three GPU copies into the
+    same image, no exception, two images left holding stale bytes their
+    checkpoint records still claim. This is where host arithmetic becomes a
+    raw pointer, so it is where the shape is checked.
+    """
+    plan = plan_segmented_copy([5, 7], [3, 4, 5], total_bytes=12)
+    out = np.empty((3 * plan.num_spans, 3), dtype=np.int64)
+    three = np.zeros((3, 2), dtype=np.int64)
+
+    with pytest.raises(ValueError, match="one row of bases per copy"):
+        plan.write_descriptor(out, three, np.zeros((1, 3), dtype=np.int64))
+
+    with pytest.raises(ValueError, match="must be"):
+        plan.write_descriptor(
+            np.empty((2, 3), dtype=np.int64), three, np.zeros((3, 3), dtype=np.int64)
+        )
+
+
+def test_a_flat_dst_bases_is_refused_by_this_guard_not_by_numpy():
+    """Both sides are asked the same way, down to the rank.
+
+    A guard that checked only the leading axis of `dst_bases` accepted a 1-D
+    one -- three entries, three copies, the shapes agree -- and it then failed
+    two lines later inside `dst_bases[:, dst_seg]`, raising an index error
+    about an array the caller never passed. Same rejection, unreadable reason.
+    """
+    plan = plan_segmented_copy([5, 7], [3, 4, 5], total_bytes=12)
+    out = np.empty((3 * plan.num_spans, 3), dtype=np.int64)
+    three = np.zeros((3, 2), dtype=np.int64)
+
+    with pytest.raises(ValueError, match="one row of bases per copy"):
+        plan.write_descriptor(out, three, np.zeros(3, dtype=np.int64))

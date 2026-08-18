@@ -94,13 +94,31 @@ def merge_abutting(runs: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:
     Rows of a row space and bytes of a copy are both described this way, and
     both want as few of them as possible: every range a checkpoint copy is cut
     into costs a span, and a span costs grid.
+
+    Ascending and disjoint is required, not assumed. Each run is compared only
+    against the one before it, so an out-of-order input merges nothing and
+    reads as legal: `[(0, 400), (256, 64), (320, 64)]` used to return
+    `[(0, 400), (256, 128)]`, which double-counts 128 bytes and overlaps the
+    first range. Nothing downstream can see that -- `checkpoint_image_bytes`
+    would over-count, and both the op validator and the sizing cross-check
+    compare against that same wrong number -- so the ordering is checked here
+    rather than left as a property of whoever happens to build the list.
     """
     merged: list[tuple[int, int]] = []
     for start, count in runs:
-        if merged and merged[-1][0] + merged[-1][1] == start:
-            merged[-1] = (merged[-1][0], merged[-1][1] + count)
-        else:
-            merged.append((start, count))
+        if count < 0 or start < 0:
+            raise ValueError(f"a run must be non-negative, got ({start}, {count})")
+        if merged:
+            end = merged[-1][0] + merged[-1][1]
+            if start < end:
+                raise ValueError(
+                    f"runs must ascend and not overlap: ({start}, {count}) "
+                    f"starts inside the run ending at {end}"
+                )
+            if start == end:
+                merged[-1] = (merged[-1][0], merged[-1][1] + count)
+                continue
+        merged.append((start, count))
     return merged
 
 

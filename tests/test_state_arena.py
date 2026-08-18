@@ -513,3 +513,20 @@ class TestCheckpointRanges:
 
         assert checkpoint_ranges_for(fields) == []
         assert carried_bytes(fields) == 0
+
+    def test_a_zero_byte_carried_run_is_not_a_range(self):
+        """A range of no bytes is refused downstream, and only on first use.
+
+        `plan_segmented_copy` rejects empty segments, and it is reached lazily
+        on the first checkpoint copy -- so a field list that produced one would
+        size, cross-check and start cleanly, then abort mid-serving on the
+        first request to cross a rung.
+        """
+        empty = StateField("no_layers", 0, (4, 4), torch.float32)
+        dead = StateField("dead", 1, (8, 8), torch.float32, in_checkpoint=False)
+
+        assert checkpoint_ranges_for([empty]) == []
+        # Between two dropped fields it is a run of its own, so nothing merges
+        # it away either.
+        assert checkpoint_ranges_for([dead, empty, dead]) == []
+        assert all(n > 0 for _, n in checkpoint_ranges_for([empty, *V4_LIKE]))

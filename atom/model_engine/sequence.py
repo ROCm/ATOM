@@ -105,6 +105,15 @@ class Sequence:
         # `BlockManager._record_checkpoint_demand` at admission; this one is
         # read by `checkpoint_cut` and `checkpointers_at`, which must agree.
         self.checkpoint_demand_pos = 0
+        # Which of the two demand counters this seq has already been put
+        # against. `can_allocate` re-runs for a sequence the queue keeps
+        # deferring, and the position above cannot serve as the marker for
+        # either one: a declined demand writes 0 back, so it does not remember
+        # the decline, and a decline retracts a demand the recorded counter had
+        # already taken. Both are cleared by `deallocate`, so a re-admitted
+        # request counts again, which it should.
+        self.checkpoint_demand_counted = False
+        self.checkpoint_demand_declined = False
         # Where this seq last kept a checkpoint. Prefill lands on the grid so
         # this tracks it, but a speculative decode step lands wherever
         # `1 + accepted` puts it, and there the grid is unreachable — see

@@ -236,15 +236,30 @@ class BlockManager:
         self.kv.allocate(block_id)
         return block_id
 
-    def _checkpoint_has_room(self) -> bool:
-        """Whether a store taken now could get its units.
+    def _checkpoint_has_room(
+        self, live_blocks: int = 0, protected_hash: int | None = None
+    ) -> bool:
+        """Whether an image still fits once `live_blocks` have been taken.
+
+        `live_blocks` is what the admission asking this is about to allocate.
+        Counting it is the difference between "there is room for an image" and
+        "there is room for this request and an image", and only the second is
+        the question: the request's blocks are taken first.
+
+        `protected_hash` is the checkpoint the same admission is about to pin,
+        excluded from what eviction could reclaim — the same argument
+        `can_allocate` passes to `_has_page_units` on the next line, so the
+        two gates in one pass agree on what is spendable.
 
         `True` when no PAGE-backed checkpoints exist at all: a fork checkpoint
         costs the pool nothing, so there is nothing to gate.
         """
         if self.paged_state_checkpoints is None:
             return True
-        return self.paged_state_checkpoints.has_room_for_store()
+        return self.paged_state_checkpoints.has_available_units(
+            live_blocks + self.paged_state_checkpoints.store.units_per_checkpoint,
+            protected_hash=protected_hash,
+        )
 
     def _has_page_units(
         self, count: int, protected_checkpoint_hash: int | None = None
@@ -390,12 +405,6 @@ class BlockManager:
         # the gates declined (compressed_hit - num_cached_blocks) from reuse
         # lost to compressed eviction (everything above compressed_hit).
         seq.num_compressed_hit_blocks = compressed_hit
-        self._record_checkpoint_demand(
-            seq,
-            hit=num_cached_blocks,
-            compressed_hit=compressed_hit,
-            block_hashes=block_hashes,
-        )
         # Free-pool demand: blocks we actually reuse minus those already used
         # (shared ref); blocks we drop from the hit become fresh → counted.
         num_new_blocks = self._n_hash_blocks(seq)
@@ -404,6 +413,17 @@ class BlockManager:
                 num_new_blocks -= 1
         protected_hash = (
             block_hashes[num_cached_blocks - 1] if num_cached_blocks else None
+        )
+        # After `num_new_blocks`, not before: the demand's room check has to
+        # account for what this very admission is about to take, or it reads a
+        # pool it then drains itself.
+        self._record_checkpoint_demand(
+            seq,
+            hit=num_cached_blocks,
+            compressed_hit=compressed_hit,
+            block_hashes=block_hashes,
+            live_blocks=num_new_blocks,
+            protected_hash=protected_hash,
         )
         if not self._has_page_units(num_new_blocks, protected_hash):
             return -1
@@ -661,7 +681,13 @@ class BlockManager:
         return max(int((seq.num_prompt_tokens - room) // interval) * interval, 0)
 
     def _record_checkpoint_demand(
-        self, seq: Sequence, hit: int, compressed_hit: int, block_hashes: list[int]
+        self,
+        seq: Sequence,
+        hit: int,
+        compressed_hit: int,
+        block_hashes: list[int],
+        live_blocks: int,
+        protected_hash: int | None,
     ) -> None:
         """Ask the hit counterfactually, and turn the gap into a rung.
 
@@ -705,7 +731,6 @@ class BlockManager:
         # Zero interval switches the ladder off entirely — `checkpointers_at`
         # keeps nothing then, so a cut for a demand would buy nothing either.
         interval_on = self.state_checkpoint_interval_tokens > 0
-        previously_demanded = seq.checkpoint_demand_pos
         demand = wanted * self.hash_block_size if interval_on and wanted > hit else 0
         # A demand is an instruction to cut a prefill chunk onto a rung, and
         # that cut costs the request a forward. Buying one for a store
@@ -713,24 +738,38 @@ class BlockManager:
         # that is pure loss — the attribution above stays either way, because
         # the reuse really was declined for want of a checkpoint.
         #
-        # Only ever declined on the way in, for the same reason the counter
-        # below only fires on the way in: `can_allocate` re-runs for a
-        # deferred sequence, so declining per attempt would put hundreds
-        # against a denominator that counts one. Retracting one already
-        # recorded would be worse — the sequence would be counted again the
-        # next time the pool has room.
-        if demand and not previously_demanded and not self._checkpoint_has_room():
-            self.demands_declined_no_room += 1
+        # Asked afresh on every attempt, because that is the question: a
+        # demand recorded while the pool had room is not still affordable once
+        # it does not, and letting the earlier answer stand is exactly the cut
+        # this gate exists to withhold. What must not repeat is the *counting*,
+        # which is why the seq carries its own marker rather than the gate
+        # reading the position it is about to overwrite.
+        #
+        # Asked with this admission's own blocks included, because they are
+        # taken first: a pool with room for an image but not for the request
+        # *and* the image would answer yes here and refuse at `begin_store`,
+        # with the cut already bought and the funnel showing nothing.
+        #
+        # It is still a sample. The store happens many forwards later, at the
+        # rung this cut creates, against a pool that has moved since — no
+        # question asked here can be the one `begin_store` asks. What this
+        # gate removes is the loss that was knowable at admission;
+        # `checkpoints_dropped` is what counts the rest, and the two are meant
+        # to be read together.
+        if demand and not self._checkpoint_has_room(live_blocks, protected_hash):
+            self.demands_declined_no_room += not seq.checkpoint_demand_declined
+            seq.checkpoint_demand_declined = True
             demand = 0
         seq.checkpoint_demand_pos = demand
-        # `can_allocate` re-runs for a sequence the queue keeps deferring, so
-        # count the demand when it first appears rather than once per attempt —
-        # otherwise one request under pressure inflates the denominator the
-        # convergence check above is read against. `deallocate` clears the
-        # field, so a re-admitted request does count again, which it should.
-        self.demands_recorded += bool(seq.checkpoint_demand_pos) and not (
-            previously_demanded
-        )
+        # Counted when the demand first appears rather than once per attempt —
+        # otherwise one deferred request inflates the denominator the
+        # convergence check above is read against. A separate marker from the
+        # decline above: a decline zeroes the position, so the position alone
+        # would let a recorded demand be counted twice the next time the pool
+        # has room.
+        if demand:
+            self.demands_recorded += not seq.checkpoint_demand_counted
+            seq.checkpoint_demand_counted = True
 
     def checkpoint_cut(self, seq: Sequence, start: int, end: int) -> int:
         """Latest ladder position in `(start, end]`, or 0 if there is none.
@@ -986,8 +1025,11 @@ class BlockManager:
         # Covers preemption too, which frees through here and re-prefills.
         seq.num_hashed_tokens = 0
         # Likewise the demand: it describes one admission against one cache
-        # state, and a re-admitted seq gets a fresh answer from `can_allocate`.
+        # state, and a re-admitted seq gets a fresh answer from `can_allocate`
+        # — including a fresh place in both funnel counters.
         seq.checkpoint_demand_pos = 0
+        seq.checkpoint_demand_counted = False
+        seq.checkpoint_demand_declined = False
         seq.last_checkpoint_pos = 0
         # An uncommitted checkpoint describes state in a group that is about to
         # go back on the free list, so the intent dies with it.

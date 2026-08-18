@@ -22,6 +22,7 @@ from atom.model_ops.attentions.v4_pool_geometry import (
     ClassLayout,
     UnifiedPoolGeometry,
     entry_rows_for,
+    merge_abutting,
     ring_offset_for,
 )
 
@@ -620,3 +621,30 @@ class TestAClassCanBeAbsent:
         assert geo.envelope_rows == without.envelope_rows
         for ratio in (CSA_RATIO, HCA_RATIO):
             assert geo.window_params(ratio) == without.window_params(ratio)
+
+
+class TestMergeAbuttingRefusesDisorder:
+    """Ordering is a requirement of `merge_abutting`, not a property of callers.
+
+    Each run is compared only against the one before it, so an unordered input
+    merges nothing and reads as legal. Nothing downstream can see the result is
+    wrong: `checkpoint_image_bytes` over-counts, and both the op validator and
+    the sizing cross-check compare against that same number.
+    """
+
+    def test_an_overlapping_run_is_refused(self):
+        # Returned [(0, 400), (256, 128)] before: 528 bytes claimed for 400.
+        with pytest.raises(ValueError, match="ascend and not overlap"):
+            merge_abutting([(0, 400), (256, 64), (320, 64)])
+
+    def test_a_descending_run_is_refused(self):
+        with pytest.raises(ValueError, match="ascend and not overlap"):
+            merge_abutting([(256, 64), (0, 64)])
+
+    def test_a_negative_run_is_refused(self):
+        with pytest.raises(ValueError, match="non-negative"):
+            merge_abutting([(0, -1)])
+
+    def test_abutting_and_separated_runs_are_unchanged(self):
+        assert merge_abutting([(0, 4), (4, 4), (12, 4)]) == [(0, 8), (12, 4)]
+        assert merge_abutting([]) == []

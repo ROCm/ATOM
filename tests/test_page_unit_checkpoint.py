@@ -338,3 +338,45 @@ def test_a_restore_takes_no_units():
     pool.reserve_units(pool.num_free, ("live-kv", 0))
 
     assert store.begin_restore(101, dst_slot=4) is not None
+
+
+def test_an_unreachable_count_evicts_nothing_whoever_asks():
+    """The refusal lives in `ensure_free_units`, not in one of its callers.
+
+    `begin_store` used to carry the reachability test itself, which left
+    `BlockManager._ensure_page_units` calling the raw loop -- harmless only
+    because its single caller passes 1, where there is nothing to spend before
+    giving up. Ask for more than the cache can reach and the bare loop empties
+    it and refuses anyway, which is the behaviour 0c46f4ed3 removed from one
+    call site and left available at the other.
+    """
+    pool, store = _filled(num_units=100, unit_bytes=10, image_bytes=10, count=50)
+    pool.reserve_units(pool.num_free, ("live-kv", 0))
+    assert pool.num_free == 0 and len(store.records) == 50
+
+    # 50 spendable units against a request for 60: unreachable, and reachable
+    # only after spending every one of them.
+    assert not store.ensure_free_units(60)
+
+    assert store.evictions == 0, "a refused request emptied the cache"
+    assert len(store.records) == 50
+
+
+def test_a_store_refuses_when_the_policy_leaves_the_loop_short():
+    """`begin_store` reads the answer rather than assuming it.
+
+    `_next_victim` exists to be replaced. A policy that passes over an
+    eligible checkpoint makes the loop end short of `count`, and a
+    `begin_store` that assumed success would take an identity for a store that
+    cannot happen -- the record is safe only because `pool.reserve_units`
+    happens to refuse second.
+    """
+    pool, store = _filled(num_units=100, unit_bytes=10, image_bytes=10, count=100)
+    assert pool.num_free == 0
+    store._next_victim = lambda protected=-1: -1  # a policy that spends nothing
+    before = store._next_checkpoint_id
+
+    assert store.begin_store(999, src_slot=0) is None
+
+    assert store._next_checkpoint_id == before, "a refused store took an identity"
+    assert len(store.records) == 100

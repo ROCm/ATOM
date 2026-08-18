@@ -68,7 +68,13 @@ class SegmentedCopyPlan:
         return int(self.span_of_tile.size)
 
     def tiling_on(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-        """`(span_of_tile, tile_start)` resident on `device`."""
+        """`(span_of_tile, tile_start)` resident on `device`.
+
+        Uploaded pageably, which synchronizes the stream — acceptable only
+        because it happens once per plan and the first copy is a warmup, not a
+        request. A caller that reaches this from a live batch pays the whole
+        outstanding queue for it.
+        """
         tables = self._resident.get(device)
         if tables is None:
             tables = (
@@ -104,8 +110,32 @@ class SegmentedCopyPlan:
         the kernel stopped being the bottleneck. Batched it is about 7x
         cheaper, and it is the same three lines with one more axis.
         """
+        # Numpy would broadcast a short `dst_bases` rather than complain, and
+        # every copy in the batch would then be aimed at the first image's
+        # addresses -- silent cross-request corruption, at raw pointers, with
+        # the other images' checkpoint records still claiming them. This is
+        # where the pointers are made, so it is where the shapes are checked;
+        # `launch_copy_descriptor` only inherits them. Both sides are asked
+        # the same way, down to the rank: checking only the leading axis of
+        # `dst_bases` would let a 1-D one reach `dst_bases[:, dst_seg]`, which
+        # raises an index error about an array the caller did not pass.
+        if (
+            src_bases.ndim != 2
+            or dst_bases.ndim != 2
+            or len(dst_bases) != len(src_bases)
+        ):
+            raise ValueError(
+                f"a copy needs one row of bases per copy on both sides, got "
+                f"{src_bases.shape} and {dst_bases.shape}"
+            )
+        copies = len(src_bases)
+        if out.shape != (copies * self.num_spans, 3):
+            raise ValueError(
+                f"a descriptor for {copies} copies of {self.num_spans} spans "
+                f"must be {(copies * self.num_spans, 3)}, got {out.shape}"
+            )
         src_col, dst_col = (0, 1) if forward else (1, 0)
-        rows = out.reshape(len(src_bases), self.num_spans, 3)
+        rows = out.reshape(copies, self.num_spans, 3)
         np.add(src_bases[:, self.src_seg], self.src_off, out=rows[:, :, src_col])
         np.add(dst_bases[:, self.dst_seg], self.dst_off, out=rows[:, :, dst_col])
         rows[:, :, 2] = self.length
@@ -178,7 +208,11 @@ def _tiling(lengths: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     counts = -(-lengths // _TILE_BYTES)
     total = int(counts.sum())
     span_of_tile = np.repeat(np.arange(lengths.size, dtype=np.int32), counts)
-    first = np.concatenate([np.zeros(1, dtype=np.int64), np.cumsum(counts)[:-1]])
+    # Exclusive prefix sum. Written as cumsum-minus-self rather than by
+    # prepending a zero and dropping the last, which has no answer for a plan
+    # with no spans at all: the prepended zero survives, and the subtraction
+    # below then fails to broadcast against an empty `counts`.
+    first = np.cumsum(counts) - counts
     within = np.arange(total, dtype=np.int64) - np.repeat(first, counts)
     return span_of_tile, within * _TILE_BYTES
 
@@ -190,23 +224,29 @@ if triton is not None:
         descriptor,
         span_of_tile,
         tile_start,
-        N_TILES: tl.constexpr,
-        N_SPANS: tl.constexpr,
+        num_tiles,
+        num_spans,
         TILE: tl.constexpr,
     ):
         # One program per tile that exists. The tiling is the plan's, resident
         # on the device, so which span this tile belongs to and where it
         # starts are two loads rather than a search.
         #
+        # The two counts are ordinary arguments, not `tl.constexpr`: only
+        # `TILE` has to be one, for `tl.arange`. Specialising on the other two
+        # would key the compiled kernel to a pool geometry, so every image
+        # shape would miss the on-disk cache and pay the JIT again -- for a
+        # divide the copy does not notice.
+        #
         # A row is `write_descriptor`'s: source, destination, length. Triton
         # cannot read a plain module constant, so the three stay literal here
         # and the round-trip test is what holds the two ends to the same order.
         pid = tl.program_id(0)
-        op = pid // N_TILES
-        tile = pid % N_TILES
+        op = pid // num_tiles
+        tile = pid % num_tiles
         span = tl.load(span_of_tile + tile)
         start = tl.load(tile_start + tile)
-        row = descriptor + (op * N_SPANS + span) * 3
+        row = descriptor + (op * num_spans + span) * 3
         src_ptr = tl.load(row)
         dst_ptr = tl.load(row + 1)
         length = tl.load(row + 2)
@@ -220,22 +260,27 @@ else:
     _copy_tiles_kernel = None
 
 
-def launch_copy_descriptor(
-    descriptor: np.ndarray, plan: SegmentedCopyPlan, device: torch.device
-) -> None:
-    """Copy every span a descriptor names, in one launch.
+def launch_copy_descriptor(descriptor: torch.Tensor, plan: SegmentedCopyPlan) -> None:
+    """Copy every span a resident descriptor names, in one launch.
 
-    The descriptor is one row per span, row-major so the whole thing crosses
-    in a single transfer, and it may hold several copies back to back — every
+    One row per span, row-major, holding several copies back to back — every
     op of a step goes out together.
+
+    The upload is the caller's, and `descriptor` arrives on the device
+    already. That is not tidiness: a pageable `torch.from_numpy(x).to(dev)`
+    synchronizes the current stream, and this runs from `build()` with the
+    previous forward still enqueued, so the host waits out the whole queue
+    rather than the 800 KB. Measured behind 4 ms of work it cost 2.9 ms
+    against 0.1 ms staged through pinned memory — a cost the transfer's own
+    size says nothing about. `CpuGpuBuffer` is what the caller stages with,
+    and what the rest of this repo already uses to avoid exactly this.
 
     The grid is one program per tile that exists. It used to be rectangular,
     `(spans, ceil(widest / TILE))`, which gives every span as many programs as
     the *widest* one needs: on a DeepSeek-V4 image, whose spans run 8 KiB to
     1.4 MB, that is 46,364 programs to do 2,631 tiles of work. One op could
     afford the waste; a batch cannot, and this path now always batches. At 256
-    ops the rectangular grid measured 5.37 ms against 1.41 ms for this one,
-    with the kernel at 97% of the whole path's cost.
+    ops the rectangular grid measured 5.14 ms against 1.19 ms for this one.
 
     What makes the dense grid cheap is that the tiling is not a function of
     the copy — the plan's spans are fixed, so `span_of_tile` and `tile_start`
@@ -243,10 +288,6 @@ def launch_copy_descriptor(
     `widest` for a caller to get wrong: passing one too small used to truncate
     every longer span silently, byte-correct on its prefix and stale on its
     tail.
-
-    Pageable on purpose. Measured at 804 KB — a 256-op batch — the transfer is
-    0.044 ms, 0.3% of the path; pinning it would buy that back and make the
-    buffer's lifetime the caller's problem.
     """
     rows = descriptor.shape[0]
     if rows == 0:
@@ -254,25 +295,25 @@ def launch_copy_descriptor(
     if _copy_tiles_kernel is None:
         raise RuntimeError("paged state copy requires Triton")
     # Checked because this is where host arithmetic becomes device pointers:
-    # the kernel reads `descriptor` as a C-contiguous int64 (rows, 3) and
-    # indexes it by op, so a wrong shape or dtype is a wrong address rather
-    # than an error.
-    if descriptor.dtype != np.int64 or descriptor.ndim != 2:
-        raise ValueError("a copy descriptor must be a 2-D int64 array")
-    if descriptor.shape[1] != 3 or not descriptor.flags.c_contiguous:
-        raise ValueError("a copy descriptor must be C-contiguous with 3 columns")
+    # the kernel reads `descriptor` as a contiguous int64 (rows, 3) and indexes
+    # it by op, so a wrong shape or dtype is a wrong address rather than an
+    # error.
+    if descriptor.dtype != torch.int64 or descriptor.ndim != 2:
+        raise ValueError("a copy descriptor must be a 2-D int64 tensor")
+    if descriptor.shape[1] != 3 or not descriptor.is_contiguous():
+        raise ValueError("a copy descriptor must be contiguous with 3 columns")
     if rows % plan.num_spans:
         raise ValueError(
             f"descriptor of {rows} rows is not a whole number of "
             f"{plan.num_spans}-span copies"
         )
-    span_of_tile, tile_start = plan.tiling_on(device)
+    span_of_tile, tile_start = plan.tiling_on(descriptor.device)
     _copy_tiles_kernel[(rows // plan.num_spans * plan.num_tiles,)](
-        torch.from_numpy(descriptor).to(device),
+        descriptor,
         span_of_tile,
         tile_start,
-        N_TILES=plan.num_tiles,
-        N_SPANS=plan.num_spans,
+        plan.num_tiles,
+        plan.num_spans,
         TILE=_TILE_BYTES,
         # Four warps, not more: this kernel is nothing but load and store, and
         # its speed turns out to be set by the width of one lane's access,

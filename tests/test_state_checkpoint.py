@@ -1463,6 +1463,17 @@ def demand_config(**overrides):
     return ckpt_config(**overrides)
 
 
+def an_image_fits_on_its_own(checkpoints) -> bool:
+    """What the demand gate used to ask, kept as the contrast it is read against.
+
+    The gate now asks whether an image fits *after* the admission has taken
+    its own blocks, and the tests below turn on the pool state where the two
+    answers differ. Written out here rather than left as a method on the
+    store, which would be a production API nothing in production asks.
+    """
+    return checkpoints.has_available_units(checkpoints.store.units_per_checkpoint)
+
+
 class TestDemandDrivenCheckpoints:
     """A rung placed where a request was seen to want one.
 
@@ -1519,7 +1530,7 @@ class TestDemandDrivenCheckpoints:
         bm = make_block_manager(demand_config(), state_runtime=BIG_IMAGE_RUNTIME)
         run_prompt_on_the_ladder(bm, stateful_seq(PROMPT))
         checkpoints = bm.paged_state_checkpoints
-        assert checkpoints.has_room_for_store()
+        assert an_image_fits_on_its_own(checkpoints)
 
         # Live KV takes the pool down to where an image no longer fits but the
         # resumer's own blocks still do -- the state under real pressure, where
@@ -1527,7 +1538,7 @@ class TestDemandDrivenCheckpoints:
         spare = -(-len(PROMPT) // BLOCK) + 1
         assert spare < checkpoints.store.units_per_checkpoint
         bm.kv.reserve_units(bm.kv.num_free - spare, ("live-kv", 0))
-        assert not checkpoints.has_room_for_store()
+        assert not an_image_fits_on_its_own(checkpoints)
 
         second = stateful_seq(PROMPT)
         hit = bm.can_allocate(second)
@@ -1542,6 +1553,149 @@ class TestDemandDrivenCheckpoints:
         assert funnel["demands_recorded"] == 0
         assert funnel["chunks_cut_for_demand"] == 0
         assert forward_on_the_ladder(bm, second) == [32], "the grid rung, no demand cut"
+
+    def _tighten_past_an_image(self, bm):
+        """Leave room for a resumer's blocks but not for a checkpoint image."""
+        checkpoints = bm.paged_state_checkpoints
+        spare = -(-len(PROMPT) // BLOCK) + 1
+        assert spare < checkpoints.store.units_per_checkpoint
+        bm.kv.reserve_units(bm.kv.num_free - spare, ("live-kv", 0))
+        assert not an_image_fits_on_its_own(checkpoints)
+
+    def test_a_demand_is_refused_when_the_admission_itself_drains_the_pool(self):
+        """The blocks this request takes come first, so they count.
+
+        A pool with room for an image but not for the request *and* the image
+        answers yes to "does an image fit" -- and then the admission takes its
+        block table, `begin_store` refuses many forwards later, and the cut
+        this gate exists to withhold has already been bought. The funnel shows
+        nothing, because the decline happened somewhere that does not count.
+        """
+        bm = make_block_manager(demand_config(), state_runtime=BIG_IMAGE_RUNTIME)
+        run_prompt_on_the_ladder(bm, stateful_seq(PROMPT))
+        checkpoints = bm.paged_state_checkpoints
+        image = checkpoints.store.units_per_checkpoint
+        blocks = -(-len(PROMPT) // BLOCK)
+
+        # Enough for an image on its own, not for this request and an image.
+        bm.kv.reserve_units(bm.kv.num_free - (image + blocks // 2), ("live-kv", 0))
+        assert an_image_fits_on_its_own(checkpoints), "the old question still says yes"
+
+        second = stateful_seq(PROMPT)
+        assert bm.can_allocate(second) >= 0, "admission itself must still go through"
+
+        assert second.checkpoint_demand_pos == 0, "bought a cut the store cannot use"
+        assert bm.checkpoint_funnel()["demands_declined_no_room"] == 1
+
+    def test_both_gates_in_one_pass_protect_the_same_checkpoint(self):
+        """`_checkpoint_has_room` and `_has_page_units` agree on what is spendable.
+
+        The second excludes the checkpoint this admission is about to pin --
+        it is about to be read, so eviction cannot have it. The first used to
+        count it as reclaimable, so with the pool resting on exactly that one
+        image the two gates in a single pass gave opposite answers.
+        """
+        bm = make_block_manager(demand_config(), state_runtime=BIG_IMAGE_RUNTIME)
+        first = stateful_seq(PROMPT)
+        published = publish_at_boundary(bm, first)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        checkpoints = bm.paged_state_checkpoints
+        assert checkpoints.store.contains(published)
+
+        # Nothing spare: the only spendable units are that one checkpoint's.
+        bm.kv.reserve_units(bm.kv.num_free, ("live-kv", 0))
+
+        assert bm._checkpoint_has_room(0, protected_hash=None), "the setup is wrong"
+        assert not bm._checkpoint_has_room(
+            0, protected_hash=published
+        ), "the checkpoint about to be pinned was counted as spendable"
+
+    def test_the_checkpoint_being_resumed_from_is_not_counted_as_spendable(self):
+        """Through `can_allocate`, where the two gates actually meet.
+
+        The seq hits a checkpoint and wants a further one, so the pin and the
+        demand happen in the same call. Rest the pool on exactly that one
+        image and the answer turns on whether the gate knows it is spoken for:
+        counting it leaves the ladder cutting a chunk for a store that has no
+        units left to take.
+        """
+        bm = make_block_manager(demand_config(), state_runtime=BIG_IMAGE_RUNTIME)
+        first = stateful_seq(PROMPT)
+        run_prompt_on_the_ladder(bm, first)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        image = bm.paged_state_checkpoints.store.units_per_checkpoint
+        assert len(bm.paged_state_checkpoints.store.records) == 1, "one image only"
+
+        second = stateful_seq(PROMPT)
+        # Leave the request's own blocks plus half an image: reachable only by
+        # spending the very checkpoint `second` is about to resume from.
+        spare = -(-len(PROMPT) // BLOCK) + image // 2
+        bm.kv.reserve_units(bm.kv.num_free - spare, ("live-kv", 0))
+
+        hit = bm.can_allocate(second)
+
+        assert hit > 0, "the seq is supposed to resume from that checkpoint"
+        assert second.num_wanted_hit_blocks > hit, "and to want a further one"
+        assert second.checkpoint_demand_pos == 0, "spent an image already spoken for"
+        assert bm.checkpoint_funnel()["demands_declined_no_room"] == 1
+
+    def test_a_demand_recorded_while_there_was_room_is_withdrawn_when_it_goes(self):
+        """The gate is the store's question, so it has to be asked afresh.
+
+        `can_allocate` re-runs for a sequence the queue keeps deferring. One
+        that recorded a demand while the pool had room, and is then re-admitted
+        against a pool that does not, is exactly the case the gate exists for:
+        the cut it would buy is now pure loss. Reading the position the gate is
+        about to overwrite made it a one-shot and let that cut through.
+        """
+        bm = make_block_manager(demand_config(), state_runtime=BIG_IMAGE_RUNTIME)
+        run_prompt_on_the_ladder(bm, stateful_seq(PROMPT))
+        second = stateful_seq(PROMPT)
+        assert bm.can_allocate(second) >= 0
+        recorded = second.checkpoint_demand_pos
+        assert recorded, "the first attempt was supposed to record a demand"
+
+        self._tighten_past_an_image(bm)
+        bm.can_allocate(second)
+
+        assert second.checkpoint_demand_pos == 0, "a stale answer bought the cut"
+        assert bm.checkpoint_funnel()["demands_declined_no_room"] == 1
+
+    def test_a_deferred_sequence_is_counted_once_however_often_it_asks(self):
+        """One request under pressure, not one per admission attempt.
+
+        `demands_declined_no_room` is read against `demands_recorded`, so a
+        counter that fires per attempt makes the funnel unreadable under the
+        only pressure anyone reads it in -- and a decline writes 0 into the
+        position, so the position cannot be the marker that stops it.
+        """
+        bm = make_block_manager(demand_config(), state_runtime=BIG_IMAGE_RUNTIME)
+        run_prompt_on_the_ladder(bm, stateful_seq(PROMPT))
+        self._tighten_past_an_image(bm)
+
+        second = stateful_seq(PROMPT)
+        for _ in range(5):
+            bm.can_allocate(second)
+
+        funnel = bm.checkpoint_funnel()
+        assert funnel["demands_declined_no_room"] == 1, "counted per attempt"
+        assert funnel["demands_recorded"] == 0
+
+    def test_a_demand_survives_being_asked_twice_without_being_counted_twice(self):
+        """The mirror: room throughout, so the recorded counter must not move."""
+        bm = make_block_manager(demand_config(), state_runtime=BIG_IMAGE_RUNTIME)
+        run_prompt_on_the_ladder(bm, stateful_seq(PROMPT))
+
+        second = stateful_seq(PROMPT)
+        for _ in range(5):
+            assert bm.can_allocate(second) >= 0
+
+        assert second.checkpoint_demand_pos, "the demand was lost"
+        funnel = bm.checkpoint_funnel()
+        assert funnel["demands_recorded"] == 1, "counted per attempt"
+        assert funnel["demands_declined_no_room"] == 0
 
     def test_reuse_another_class_declines_is_not_charged_to_the_ladder(self):
         """The counterfactual keeps every other gate applied.

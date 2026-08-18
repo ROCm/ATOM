@@ -176,6 +176,16 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
                 f"{type(self).__name__} does not implement PAGE-backed state copy"
             )
 
+    def warmup_per_req_cache(self) -> None:
+        """Pay whatever the first checkpoint copy would pay, before serving.
+
+        Called once by ModelRunner after `allocate_per_req_cache`'s pools are
+        installed, which is the earliest a backend can reach its own addresses.
+        Nothing else warms this path: `execute_paged_state_copies` runs only
+        from `build()`, so a backend that compiles a kernel or fills a cache
+        there does it inside a live request's batch. A no-op by default.
+        """
+
     def get_kv_transfer_tensors(self) -> "KVTransferTensors | None":
         """Return RDMA transfer regions for PD disaggregation.
 

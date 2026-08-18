@@ -36,6 +36,7 @@ from atom.model_ops.attentions.state_arena import (
     entry_bytes_for,
     field_extents,
 )
+from atom.model_ops.attentions.v4_pool_geometry import CSA_RATIO, HCA_RATIO
 
 NEG_INF = float("-inf")
 ROW_BYTES = 64
@@ -108,6 +109,10 @@ class _StubBuilder:
                 kv_cache_block_size=alignment, decode_context_parallel_size=1
             )
         )
+        # The ratios the guard reads come from the model, not from this file's
+        # constants -- two dense layers and then the CSA/HCA alternation a V4
+        # config declares.
+        self.compress_ratios = [0, 0, CSA_RATIO, HCA_RATIO, CSA_RATIO, HCA_RATIO]
         self._plane = plane
 
     def _plane_row_widths(self):
@@ -231,15 +236,49 @@ class TestCheckpointSlotRanges:
     ):
         """HCA owes nothing only while a checkpoint lands on a pool boundary.
 
-        The guard has to read the alignment the ladder uses, not this class's
-        own `block_size` — asking the latter is `256 % 128`, which no
-        configuration can make fail.
+        The guard reads the alignment the ladder uses, `kv_cache_block_size *
+        decode_context_parallel_size`, against the ratios the model declares.
         """
         stub = _StubBuilder(plane)
         stub.model_runner.config.kv_cache_block_size = block_size
         stub.model_runner.config.decode_context_parallel_size = dcp
 
         with pytest.raises(ValueError, match="not a multiple of compress"):
+            Builder.checkpoint_image_bytes(stub)
+
+    @pytest.mark.parametrize("ratio", [3, 512, 96])
+    def test_a_model_ratio_the_shipped_alignment_misses_is_refused(self, ratio, plane):
+        """The reachable way to break the premise, at the block size that ships.
+
+        `config.py` forces `kv_cache_block_size` to 256 for every `DeepseekV4*`
+        architecture, so a guard written against this file's `CSA_RATIO` /
+        `HCA_RATIO` could never fire -- 256 is a multiple of both, and no
+        configuration changes that. What a variant *can* change is
+        `hf_config.compress_ratios`, and a stride 256 does not divide leaves
+        HCA's first pool straddling the boundary, which is the silent-accuracy
+        failure the guard exists for.
+        """
+        stub = _StubBuilder(plane)
+        assert stub.model_runner.config.kv_cache_block_size == 256
+        stub.compress_ratios = [0, CSA_RATIO, ratio]
+
+        with pytest.raises(ValueError, match="not a multiple of compress"):
+            Builder.checkpoint_image_bytes(stub)
+
+    @pytest.mark.parametrize("block_size, dcp", [(0, 1), (256, 0)])
+    def test_an_alignment_of_zero_is_refused_as_itself(self, plane, block_size, dcp):
+        """Every ratio divides zero, so the ratio check cannot speak for this.
+
+        Folded into that check it would find nothing wrong and raise anyway,
+        reporting an alignment that "is not a multiple of compress ratios
+        `[]`" -- an accusation with no ratio in it, about a pool geometry that
+        simply cannot exist. Its own check, so it can say that instead.
+        """
+        stub = _StubBuilder(plane)
+        stub.model_runner.config.kv_cache_block_size = block_size
+        stub.model_runner.config.decode_context_parallel_size = dcp
+
+        with pytest.raises(ValueError, match="not a pool geometry that can exist"):
             Builder.checkpoint_image_bytes(stub)
 
     def test_dcp_can_make_an_alignment_legal(self, plane):
@@ -480,6 +519,7 @@ class TestPageUnitAddressesAreArithmetic:
             csa_layers = tuple(range(self.N_CSA))
             _indexer_fp4 = False
             _page_unit_region_cache = None
+            _page_unit_region_owners = ()
 
             def _plane_row_widths(self):
                 return [16]
@@ -532,3 +572,81 @@ class TestPageUnitAddressesAreArithmetic:
 
         with pytest.raises(RuntimeError, match="contiguous"):
             Builder._page_unit_regions(stub)
+
+
+class TestWarmup:
+    """That the checkpoint copy path is paid for before a request can pay it."""
+
+    def test_a_backend_without_paged_checkpoints_warms_nothing(self):
+        """The hook is on the base builder, so every backend answers it."""
+        from atom.model_ops.attentions.backends import AttentionMetadataBuilder
+
+        # No-op by contract: a backend that never copies has nothing to warm,
+        # and ModelRunner calls this unconditionally.
+        assert AttentionMetadataBuilder.warmup_per_req_cache(object()) is None
+
+    def test_the_runner_warms_the_builder_once_the_pools_are_reachable(self):
+        """After the setattr loop, not before: the builder reads them off it.
+
+        Guarded here rather than left to review because nothing else calls
+        `warmup_per_req_cache` -- a runner that stopped would restore the
+        first-request JIT silently, with every test still green.
+        """
+        import inspect
+
+        from atom.model_engine import model_runner
+
+        src = inspect.getsource(model_runner.ModelRunner.allocate_kv_cache)
+        install = src.index("setattr(self, name, value)")
+        warm = src.index("warmup_per_req_cache()")
+        assert install < warm, "warmed before the pools were installed"
+
+
+class TestPageUnitRegionsValidateTheirOwnAddresses:
+    """The region cache holds addresses from two allocations, one uncovered.
+
+    `_invalidate_pool_caches` is called from `allocate_per_req_cache`, which
+    owns the KV planes; the indexer pools come from `allocate_kv_cache_tensors`
+    and it does not. A cache relying on that hook would hold freed base
+    pointers after any path that re-runs the first allocation alone, and the
+    copy kernel would scatter into whatever the allocator handed that range to
+    -- no fault, silent corruption. So it keys on its own addresses.
+    """
+
+    def _stub(self, plane, idx):
+        stub = _StubBuilder.__new__(_StubBuilder)
+        stub.pool_geometry = SimpleNamespace(envelope_rows=2)
+        stub._page_unit_region_cache = None
+        stub._page_unit_region_owners = ()
+        stub._indexer_fp4 = False
+        stub.csa_layers = [0]
+        stub.model_runner = SimpleNamespace(v4_csa_idx_kv=idx)
+        stub._kv_planes = lambda: [plane]
+        stub._plane_row_widths = lambda: [ROW_BYTES]
+        return stub
+
+    def test_a_moved_indexer_pool_is_noticed_without_the_hook(self):
+        first = torch.zeros(4, ROW_BYTES, dtype=torch.uint8)
+        idx = torch.zeros(1, 4, 8, dtype=torch.uint8)
+        stub = self._stub(first, idx)
+        bases, _ = Builder._page_unit_regions(stub)
+        assert idx.data_ptr() in set(bases.tolist())
+
+        # The pool is reallocated by the other allocation; nothing calls the
+        # invalidator, exactly as today's ordering would allow.
+        moved = torch.zeros(1, 4, 8, dtype=torch.uint8)
+        assert moved.data_ptr() != idx.data_ptr(), "the test needs a real move"
+        stub.model_runner.v4_csa_idx_kv = moved
+
+        again, _ = Builder._page_unit_regions(stub)
+
+        assert moved.data_ptr() in set(again.tolist()), "answered from a freed base"
+        assert idx.data_ptr() not in set(again.tolist())
+
+    def test_an_unmoved_pool_is_answered_from_the_cache(self):
+        plane = torch.zeros(4, ROW_BYTES, dtype=torch.uint8)
+        stub = self._stub(plane, torch.zeros(1, 4, 8, dtype=torch.uint8))
+
+        first = Builder._page_unit_regions(stub)
+
+        assert Builder._page_unit_regions(stub) is first, "rebuilt for nothing"

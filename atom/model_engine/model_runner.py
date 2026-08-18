@@ -1872,6 +1872,10 @@ class ModelRunner:
         )
         for name, value in per_req_state.items():
             setattr(self, name, value)
+        # The pools are reachable through `self` only now, which is the
+        # earliest the builder can touch its own addresses — and the last
+        # moment before a request could.
+        self.attn_metadata_builder.warmup_per_req_cache()
 
         # Build KVCacheConfig
         # lirong TODO: This is a simple solution to build KVCacheConfig,

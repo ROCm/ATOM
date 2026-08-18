@@ -35,7 +35,9 @@ A row space with planes of differing width cannot hold one entry contiguously
 at all: a field is one strided tensor, so it lands in one plane or the other.
 `plan_field_planes` decides which, `SplitStateArena` hides the split from
 consumers asking for a field by name, and what stays contiguous is a *slot* —
-which is the range a checkpoint copies and a PD transfer registers anyway.
+which is the range a PD transfer registers, and the range a checkpoint's own
+is carved out of by `checkpoint_ranges_for`, since an image holds only the
+fields a resumer reads (`StateField.in_checkpoint`).
 
 Backends stay in charge of what the fields are; this module only owns the
 arithmetic. The layout is deliberately the one DeepSeek-V4's PD staging path
@@ -266,7 +268,13 @@ def checkpoint_ranges_for(fields: list[StateField]) -> list[tuple[int, int]]:
             continue
         extents = list(run)
         start = extents[0][1]
-        ranges.append((start, extents[-1][2] - start))
+        nbytes = extents[-1][2] - start
+        # A run of zero-byte fields spans nothing, and a zero-length range is
+        # not one: `plan_segmented_copy` refuses empty segments, and it is only
+        # reached on the first copy, so emitting one here would let a config
+        # size, cross-check and start cleanly and then abort mid-serving.
+        if nbytes:
+            ranges.append((start, nbytes))
     return ranges
 
 

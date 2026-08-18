@@ -214,23 +214,22 @@ class PageUnitCheckpointStore:
         cached ones, so a store reaches for the cache only once the pool has
         nothing spare. Each eviction returns a whole image's units, so the
         loop overshoots by at most one checkpoint.
+
+        Unreachable counts are refused before anything is spent. The loop
+        alone gives up only once it has evicted everything it can, so a count
+        the cache cannot reach would destroy the cache on the way to saying
+        no. The test lives here rather than in the one caller that used to
+        carry it, because every caller needs it and only the argument being
+        1 keeps `_fresh_block` from needing it today.
         """
+        if not self.has_available_units(count):
+            return False
         while self.pool.num_free < count:
             victim = self._next_victim()
             if victim < 0:
                 return False
             self._evict(victim)
         return True
-
-    def has_room_for_store(self) -> bool:
-        """Whether a store asked for now could get its units.
-
-        The ladder asks this before it cuts a prefill chunk onto a rung: that
-        cut costs the request a forward, and buying one for a store
-        `begin_store` is about to refuse is the one part of the funnel that is
-        pure loss. It is the refusal's own question, not a second copy of it.
-        """
-        return self.has_available_units(self.units_per_checkpoint)
 
     def begin_store(self, prefix_hash: int, src_slot: int) -> CheckpointStoreOp | None:
         if self.lookup(prefix_hash) >= 0 or prefix_hash in self._pending_by_hash:
@@ -247,16 +246,14 @@ class PageUnitCheckpointStore:
         # sits behind a pin-aware check in its own pass, so the reachable
         # outcome is a refused admission, never the raise.
         #
-        # Ask whether the units are reachable BEFORE asking to reach them.
-        # `ensure_free_units` gives up only once it has evicted every
-        # checkpoint it can, so an unreachable request would empty the cache
-        # and still refuse. A store that will be dropped has to cost nothing.
-        if not self.has_room_for_store():
+        # A store that will be dropped has to cost nothing, which is what
+        # `ensure_free_units` refusing before it evicts buys. Its answer is
+        # read rather than assumed: `_next_victim` is meant to be replaced,
+        # and a policy that passes over an eligible checkpoint would leave the
+        # loop short after spending some -- taking an identity and a record
+        # for a store that cannot happen would then be the second cost.
+        if not self.ensure_free_units(needed):
             return None
-        # Cannot fail after that: what it evicts from is exactly what the
-        # check counted. `pool.reserve_units` below is the backstop if it ever
-        # can, since it refuses rather than over-issuing.
-        self.ensure_free_units(needed)
 
         checkpoint_id = self._new_identity()
         owner = ("state-checkpoint", checkpoint_id)
@@ -464,9 +461,6 @@ class PagedStateCheckpointCoordinator:
         self, count: int, protected_hash: int | None = None
     ) -> bool:
         return self.store.has_available_units(count, protected_hash)
-
-    def has_room_for_store(self) -> bool:
-        return self.store.has_room_for_store()
 
     def ensure_free_units(self, count: int) -> bool:
         return self.store.ensure_free_units(count)

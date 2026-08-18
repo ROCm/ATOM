@@ -621,8 +621,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self._slot_view_cache: list[list[torch.Tensor]] | None = None
         self._checkpoint_range_cache: list[list[tuple[int, int]]] | None = None
         self._page_unit_region_cache: tuple[np.ndarray, np.ndarray] | None = None
+        self._page_unit_region_owners: tuple[int, ...] = ()
         self._checkpoint_plan_cache: SegmentedCopyPlan | None = None
         self._checkpoint_slot_base_cache: np.ndarray | None = None
+        self._checkpoint_descriptor: CpuGpuBuffer | None = None
 
     @property
     def prep_stream(self):
@@ -857,7 +859,14 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         slot_bases = self._checkpoint_slot_bases()
         per_op = plan.num_spans
         total = (len(store_ops) + len(restore_ops)) * per_op
-        descriptor = np.empty((total, 3), dtype=np.int64)
+        staging = self._checkpoint_descriptor_buffer()
+        if total > staging.np.shape[0]:
+            raise RuntimeError(
+                f"a step asked to copy {total // per_op} checkpoints, more "
+                f"than the {staging.np.shape[0] // per_op} its descriptor was "
+                "sized for"
+            )
+        descriptor = staging.np[:total]
         at = 0
         for ops, storing in ((store_ops, True), (restore_ops, False)):
             if not ops:
@@ -871,7 +880,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 forward=storing,
             )
             at = end
-        launch_copy_descriptor(descriptor, plan, self._kv_planes()[0].device)
+        launch_copy_descriptor(staging.copy_to_gpu(total), plan)
 
     def _validate_paged_state_op(
         self, op: CheckpointStoreOp | CheckpointRestoreOp
@@ -967,14 +976,34 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         The quantity is `BlockManager`'s `hash_block_size`, not this class's
         own `block_size`: the ladder rounds a checkpoint to the prefix-cache
         hash granularity, which is `kv_cache_block_size * dcp_world_size`.
-        Asking about `self.block_size` would be asking `256 % 128` — a
-        constant folded at import, and a guard that cannot fire.
+
+        The ratios come from the model rather than from the two constants this
+        file happens to name, and that is what makes the guard reachable at
+        all. `config.py` forces `kv_cache_block_size` to 256 for every
+        `DeepseekV4*` architecture, so the alignment is always a multiple of
+        4 and of 128 and a check written against `CSA_RATIO`/`HCA_RATIO` could
+        never fire — it would only restate what the config already pins. What
+        is genuinely free to change is `hf_config.compress_ratios`: a variant
+        that pools on some other stride is the edit that breaks the premise,
+        and this is what catches it.
         """
         config = self.model_runner.config
+        # Raw, like `BlockManager.__init__` reads it: a zero would give an
+        # alignment of zero, which every ratio divides, so a `or 1` here would
+        # answer a question about a pool geometry that cannot exist.
         alignment = int(config.kv_cache_block_size) * int(
-            getattr(config, "decode_context_parallel_size", 1) or 1
+            config.decode_context_parallel_size
         )
-        bad = [r for r in (CSA_RATIO, HCA_RATIO) if alignment % r]
+        # Its own check, not folded into the one below: every ratio divides
+        # zero, so a non-positive alignment reaches that test with nothing to
+        # report and would raise saying it is not a multiple of `[]`.
+        if alignment <= 0:
+            raise ValueError(
+                f"a checkpoint aligns to {alignment} tokens "
+                "(kv_cache_block_size x decode_context_parallel_size), which "
+                "is not a pool geometry that can exist"
+            )
+        bad = sorted({r for r in self.compress_ratios if r > 0 and alignment % r})
         if bad:
             raise ValueError(
                 f"a checkpoint aligns to {alignment} tokens "
@@ -991,13 +1020,72 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         (`UnifiedPoolGeometry.physical_slot` counts back from the topmost
         position), so a re-carve moves every one of them. Whoever wires an
         elastic pool has to call this; it is here so that is one line rather
-        than five fields to remember.
+        than a list of fields to remember.
+
+        `_page_unit_region_cache` is deliberately not in it: half of what it
+        holds comes from pools this method's caller does not own, so being on
+        the list would make it look covered when it is not. It keys on its own
+        addresses instead.
         """
         self._slot_view_cache = None
         self._checkpoint_range_cache = None
-        self._page_unit_region_cache = None
         self._checkpoint_plan_cache = None
         self._checkpoint_slot_base_cache = None
+        self._checkpoint_descriptor = None
+
+    def warmup_per_req_cache(self) -> None:
+        """Run one checkpoint copy now, so the first real one is only a copy.
+
+        `execute_paged_state_copies` is reachable only from `build()`, so
+        everything it builds lazily -- the copy plan, the slot views, the slot
+        base table, the tiling's upload, the pinned descriptor, and the Triton
+        JIT of `_copy_tiles_kernel` -- otherwise lands inside the batch of
+        whichever request first crosses a rung. Hundreds of milliseconds, once,
+        on one unlucky request.
+
+        Slot 0 into the pool's first units. Both are real addresses, which is
+        the point: a warmup on scratch would compile a kernel and fill nothing.
+        The bytes it writes are read by nobody -- a KV block is written before
+        it is read, and this runs before any block has been handed out.
+        """
+        if self.model_runner.state_runtime.checkpoint_spec is None:
+            return
+        plan = self._checkpoint_copy_plan()
+        if not plan.num_spans:
+            return
+        units = self.model_runner.state_runtime.checkpoint_spec.units_per_checkpoint
+        staging = self._checkpoint_descriptor_buffer()
+        plan.write_descriptor(
+            staging.np[: plan.num_spans],
+            self._checkpoint_slot_bases()[:1],
+            self._page_unit_bases([list(range(units))]),
+        )
+        launch_copy_descriptor(staging.copy_to_gpu(plan.num_spans), plan)
+
+    def _checkpoint_descriptor_buffer(self) -> CpuGpuBuffer:
+        """Pinned staging for a step's whole descriptor, sized for the worst step.
+
+        Pinned because the alternative synchronizes: a pageable H2D from
+        `build()` makes the host wait out the forward already enqueued, which
+        measured 2.9 ms behind 4 ms of work against 0.1 ms staged. Reused
+        because allocating pinned memory is itself a synchronizing call.
+
+        A step can carry at most one store and one restore per sequence, so
+        two per Active Slot bounds it -- 1.6 MB at the shipped geometry. The
+        caller checks that bound rather than growing on demand: a descriptor
+        that did not fit would otherwise be silently truncated into a copy of
+        the wrong shape.
+        """
+        if self._checkpoint_descriptor is None:
+            plan = self._checkpoint_copy_plan()
+            max_ops = 2 * int(self.model_runner.config.max_num_seqs)
+            self._checkpoint_descriptor = CpuGpuBuffer(
+                max_ops * plan.num_spans,
+                3,
+                dtype=torch.int64,
+                device=self._kv_planes()[0].device,
+            )
+        return self._checkpoint_descriptor
 
     def _checkpoint_copy_plan(self) -> SegmentedCopyPlan:
         """Where a slot's checkpoint ranges meet a whole image's PAGE regions.
@@ -1065,21 +1153,36 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
         The contiguity a slice would have been checked for is asked here
         instead: once of the layout, rather than every time of a slice.
+
+        Keyed on the addresses it was built from rather than cleared by
+        `_invalidate_pool_caches`. Half of these come from the KV planes,
+        which that hook covers, and half from the indexer pools, which
+        `allocate_kv_cache_tensors` owns and it does not -- so the hook would
+        be an invariant this cache cannot check and the next reader cannot
+        see. The key is the two planes and the one or two indexer pools, so
+        finding out costs four `data_ptr()`s against a copy path measured in
+        milliseconds, and the
+        failure it removes is a scatter into whatever the allocator handed
+        that address range to next.
         """
-        if self._page_unit_region_cache is None:
+        runner = self.model_runner
+        planes = self._kv_planes()
+        pools = [runner.v4_csa_idx_kv]
+        if self._indexer_fp4:
+            pools.append(runner.v4_csa_idx_kv_scale)
+        owners = tuple(t.data_ptr() for t in (*planes, *pools))
+        # The whole test: there is always at least one plane, so the owners of
+        # a built cache are never the empty tuple this starts as, and an
+        # `is None` beside this would be a second condition that cannot differ
+        # from it.
+        if self._page_unit_region_owners != owners:
             geo = self.pool_geometry
             bases, strides = [], []
-            for plane, width in zip(
-                self._kv_planes(), self._plane_row_widths(), strict=True
-            ):
+            for plane, width in zip(planes, self._plane_row_widths(), strict=True):
                 if not plane.is_contiguous():
                     raise RuntimeError("a KV plane must be contiguous to be copied")
                 bases.append(plane.data_ptr())
                 strides.append(geo.envelope_rows * width)
-            runner = self.model_runner
-            pools = [runner.v4_csa_idx_kv]
-            if self._indexer_fp4:
-                pools.append(runner.v4_csa_idx_kv_scale)
             for pool in pools:
                 if not pool.is_contiguous():
                     raise RuntimeError(
@@ -1094,6 +1197,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 np.array(bases, dtype=np.int64),
                 np.array(strides, dtype=np.int64),
             )
+            self._page_unit_region_owners = owners
         return self._page_unit_region_cache
 
     def _page_unit_bases(self, unit_ids: Sequence[Sequence[int]]) -> np.ndarray:
@@ -1320,8 +1424,14 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # Anything already worked out from the old layout or the old pools is
         # now wrong, and wrong quietly: four of these hold raw addresses, so a
         # stale one is a copy to the wrong slot rather than a crash. Cleared
-        # before the new geometry is installed so nothing below can repopulate
-        # them from a half-updated state.
+        # here, before `pool_geometry` is replaced, so that nothing between
+        # this line and that one can answer from the old split.
+        #
+        # Below that line they refill freely, and the cross-check further down
+        # depends on it: `checkpoint_image_bytes()` is what re-derives the
+        # ranges, and it has to derive them from the geometry just installed.
+        # What is not allowed is a *second* clear after that point — it would
+        # throw away the answer the check just validated.
         self._invalidate_pool_caches()
         # The layout at the split sizing chose. Everything below — and every
         # index formula any kernel evaluates — reads its offsets from here.
