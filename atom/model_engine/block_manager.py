@@ -603,9 +603,7 @@ class BlockManager:
         # blocks of this same admission could evict the checkpoint it restores
         # from.
         if seq.has_per_req_cache and self.paged_state_checkpoints is None:
-            if not self._attach_state_slots(
-                seq, h if num_cached_blocks > 0 else -1
-            ):
+            if not self._attach_state_slots(seq, h if num_cached_blocks > 0 else -1):
                 # The state behind the boundary could not be produced, so the
                 # boundary is not this request's history. Disown it — the blocks
                 # stay claimed and the forward simply recomputes over them,

@@ -870,9 +870,7 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         # hbm_satisfies_after_alloc case where HBM prefix cache already covers
         # the lookup hit. Only suffix chunks computed by this request should be
         # stored.
-        if not self._save_per_req_cache and getattr(
-            seq, "has_per_req_cache", False
-        ):
+        if not self._save_per_req_cache and getattr(seq, "has_per_req_cache", False):
             # Do not track this sequence for saving at all. Its load leg is
             # refused unconditionally by `_decide_load_after_alloc`, so the
             # bytes would have no reader in this engine -- and, more sharply, a

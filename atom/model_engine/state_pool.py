@@ -8,6 +8,8 @@ from heapq import heapify, heappop, heappush
 
 from atom.model_engine.state_runtime import StateTransfer
 
+logger = logging.getLogger("atom")
+
 # Whether a hash that lives only in the offload tier can still be turned back
 # into a group this pool can resume from.
 #
