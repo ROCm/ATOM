@@ -4,8 +4,8 @@
 """PP-aware offload KV status aggregator.
 
 Each PP stage holds different layers, so a request's offload load/save is
-complete only when all stages report done. Any single stage failure fails
-the entire request.
+complete only when all stages report done. A single stage failure fails the
+whole request, but only once every stage has reached a terminal state.
 """
 
 from __future__ import annotations
@@ -20,6 +20,9 @@ class PPKVAggregator:
     Call :meth:`ingest` once per (pp_rank, output) pair.  The method returns a
     :class:`KVConnectorOutput` containing only the request IDs that have
     reached a terminal state across all stages.
+
+    A load fails the request if any stage reports a failure, but the failure is
+    only emitted once every stage has reported either success or failure.
 
     Only offload-specific fields are tracked.  Mooncake P/D fields
     (``finished_sending``, ``finished_recving``) have their own PP-aware
@@ -42,7 +45,16 @@ class PPKVAggregator:
         for rid in output.finished_saving:
             self._saving.setdefault(rid, set()).add(pp_rank)
 
-        failed = set(self._failed_loading.keys())
+        # A load is only terminal once every stage has reported one way or the
+        # other. Reporting the failure at the first failing stage would wake
+        # the request for recompute into blocks the remaining stages are still
+        # loading into, and would drop the tally that suppresses their reports.
+        failed = set()
+        for rid in set(self._loading) | set(self._failed_loading):
+            bad = self._failed_loading.get(rid, set())
+            reported = self._loading.get(rid, set()) | bad
+            if bad and len(reported) >= self._pp_size:
+                failed.add(rid)
         done_loading = {
             rid for rid, stages in self._loading.items() if len(stages) >= self._pp_size
         } - failed

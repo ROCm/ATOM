@@ -133,6 +133,44 @@ def test_aggregator_requires_all_stages():
     }
 
 
+def test_load_failure_waits_for_every_stage():
+    # Reporting at the first failing stage wakes the request for recompute
+    # into blocks the other stages are still loading into.
+    agg = PPKVAggregator(3)
+    assert agg.ingest(0, KVConnectorOutput(failed_loading={"a"})).is_empty()
+    assert agg.has_pending() is True
+
+    assert agg.ingest(1, KVConnectorOutput(finished_loading={"a"})).is_empty()
+    assert agg.has_pending() is True
+
+    out = agg.ingest(2, KVConnectorOutput(finished_loading={"a"}))
+    assert out.failed_loading == {"a"}
+    assert out.finished_loading == set()
+
+
+def test_terminal_load_failure_leaves_no_residue():
+    # The tally is dropped only once no stage can still report, so the verdict
+    # is emitted exactly once and nothing is left to spin the engine's idle
+    # KV drain forever.
+    agg = PPKVAggregator(2)
+    assert agg.ingest(0, KVConnectorOutput(failed_loading={"a"})).is_empty()
+
+    out = agg.ingest(1, KVConnectorOutput(failed_loading={"a"}))
+    assert out.failed_loading == {"a"}
+    assert agg.has_pending() is False
+
+    assert agg.ingest(0, KVConnectorOutput()).is_empty()
+
+
+def test_load_failure_does_not_block_another_request():
+    agg = PPKVAggregator(2)
+    agg.ingest(0, KVConnectorOutput(failed_loading={"a"}, finished_loading={"b"}))
+    out = agg.ingest(1, KVConnectorOutput(finished_loading={"a", "b"}))
+    assert out.finished_loading == {"b"}
+    assert out.failed_loading == {"a"}
+    assert agg.has_pending() is False
+
+
 def test_aggregator_rejects_bad_pp_size():
     with pytest.raises(ValueError):
         PPKVAggregator(0)
