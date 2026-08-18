@@ -2021,7 +2021,6 @@ def test_load_metadata_uses_scheduler_lifetime_generation_on_reused_req_id():
         )
         seq.offload_loaded = True
         seq.offload_load_failed = True
-        seq._consumed_load_operation = LoadOperationId(733, 99)
         _commit_sidecar(sched, seq, 8192)
         sched.get_num_new_matched_tokens(seq)
         sched.update_state_after_alloc(seq)
@@ -2029,8 +2028,7 @@ def test_load_metadata_uses_scheduler_lifetime_generation_on_reused_req_id():
         operations.append(request.load_operation)
         assert seq.offload_loaded is False
         assert seq.offload_load_failed is False
-        assert seq._active_load_operation == request.load_operation
-        assert seq._consumed_load_operation is None
+        assert seq._load_operation == request.load_operation
         sched.load_finished(request.load_operation)
         sched.request_finished(seq)
 
@@ -2959,84 +2957,6 @@ def test_abort_cleans_load_whose_terminal_was_already_consumed(
     assert seq.block_table == []
     assert seq.per_req_cache_group == -1
     assert not hasattr(seq, "_awaiting_aborted_load_cleanup")
-
-
-@pytest.mark.parametrize(
-    ("terminal_field", "terminal_callback"),
-    [
-        ("finished_loading", "load_finished"),
-        ("failed_loading", "load_failed"),
-    ],
-)
-def test_abort_during_second_load_ignores_first_consumed_generation(
-    terminal_field,
-    terminal_callback,
-):
-    first = LoadOperationId(739, 30)
-    second = LoadOperationId(739, 31)
-    events = []
-    seq = SimpleNamespace(
-        id=739,
-        status=SequenceStatus.ABORTED,
-        block_table=[16, 17],
-        has_per_req_cache=True,
-        per_req_cache_group=6,
-        _counted_as_inflight_load=True,
-        _load_operation=second,
-        _active_load_operation=second,
-        _consumed_load_operation=first,
-        offload_loaded=True,
-        offload_load_failed=True,
-    )
-
-    class _Connector:
-        is_producer = False
-        is_offload = True
-
-        def load_finished(self, operation):
-            events.append(("load_finished", operation))
-            return operation == second
-
-        def load_failed(self, operation):
-            events.append(("load_failed", operation))
-            return operation == second
-
-        def request_finished(self, value):
-            events.append(("request_finished", value.id))
-
-    def deallocate(value):
-        events.append(("deallocate", value.id))
-        value.block_table.clear()
-        value.per_req_cache_group = -1
-
-    host = Scheduler.__new__(Scheduler)
-    host.kv_connector = _Connector()
-    host.block_manager = SimpleNamespace(deallocate=deallocate)
-    host.deferred_free_blocks = {}
-    host.finished_recving_kv_req_ids = []
-    host.failed_recving_kv_req_ids = []
-    host._num_parked_remote_kv = 1
-    host._rejected = []
-
-    host._reject_aborted_waiting(seq)
-
-    assert host.deferred_free_blocks[seq.id] is seq
-    assert seq.block_table == [16, 17]
-    assert host._num_parked_remote_kv == 1
-
-    host._update_from_kv_xfer_finished(KVConnectorOutput(**{terminal_field: {second}}))
-
-    assert events == [
-        (terminal_callback, second),
-        ("request_finished", seq.id),
-        ("deallocate", seq.id),
-    ]
-    assert host.deferred_free_blocks == {}
-    assert host._num_parked_remote_kv == 0
-    assert seq.block_table == []
-    assert seq.per_req_cache_group == -1
-    assert not hasattr(seq, "_active_load_operation")
-    assert not hasattr(seq, "_consumed_load_operation")
 
 
 def test_consume_failed_remote_kv_does_not_repeat_terminal_callback():

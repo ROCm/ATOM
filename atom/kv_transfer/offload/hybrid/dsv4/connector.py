@@ -2184,14 +2184,8 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             self._active_load_operations.pop(sid, None)
             operation = active[1]
             self._cancel_load_statistics(operation)
-            if getattr(seq, "_active_load_operation", None) == operation:
-                for marker in (
-                    "_active_load_operation",
-                    "_consumed_load_operation",
-                    "_load_operation",
-                ):
-                    if hasattr(seq, marker):
-                        delattr(seq, marker)
+            if getattr(seq, "_load_operation", None) == operation:
+                delattr(seq, "_load_operation")
         self._active_slot_loads.pop(sid, None)
 
     def build_connector_meta(self) -> LMCacheOffloadMetadata:
@@ -2276,8 +2270,6 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             seq.offload_loaded = False
             seq.offload_load_failed = False
             seq._load_operation = load_operation
-            seq._active_load_operation = load_operation
-            seq._consumed_load_operation = None
             self._active_load_operations[sid] = (seq, load_operation)
             self._track_load_statistics(load_operation, lmc - hbm)
             meta.add_request(
@@ -2518,13 +2510,8 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         if entry is not None and entry[0] is seq and not self.should_defer_free(seq):
             self._save_tracker.pop(sid, None)
             self._failed_sidecar_saves.pop(sid, None)
-        for marker in (
-            "_active_load_operation",
-            "_consumed_load_operation",
-            "_load_operation",
-        ):
-            if hasattr(seq, marker):
-                delattr(seq, marker)
+        if hasattr(seq, "_load_operation"):
+            delattr(seq, "_load_operation")
 
 
 __all__ = [

@@ -1644,51 +1644,30 @@ class Scheduler:
         return True
 
     def _reject_aborted_waiting(self, seq: Sequence) -> None:
-        owns_remote_resources = bool(getattr(seq, "block_table", ())) or (
-            bool(getattr(seq, "has_per_req_cache", False))
-            and int(getattr(seq, "per_req_cache_group", -1)) >= 0
-        )
         has_inflight_load = bool(getattr(seq, "_counted_as_inflight_load", False))
         seq.status = SequenceStatus.FINISHED
         seq.leave_reason = "aborted"
         self._rejected.append(seq)
-        if owns_remote_resources or has_inflight_load:
-            self._defer_free(seq)
-            active_operation = getattr(seq, "_active_load_operation", None)
-            consumed_operation = getattr(seq, "_consumed_load_operation", None)
-            terminal_consumed = (
-                consumed_operation == active_operation
-                if active_operation is not None
-                else bool(
-                    getattr(seq, "offload_loaded", False)
-                    or getattr(seq, "offload_load_failed", False)
-                )
-            )
-            terminal_queued = self._pop_load_completion(
-                self.finished_recving_kv_req_ids, seq
-            )
-            terminal_queued = (
-                self._pop_load_completion(self.failed_recving_kv_req_ids, seq)
-                or terminal_queued
-            )
-            if terminal_consumed or terminal_queued:
-                self._cleanup_aborted_load(seq)
-                return
-            seq._awaiting_aborted_load_cleanup = True
-        else:
-            self._uncount_inflight_load(seq)
+        if not has_inflight_load:
+            return
+
+        self._defer_free(seq)
+        terminal_queued = self._pop_load_completion(
+            self.finished_recving_kv_req_ids, seq
+        ) or self._pop_load_completion(self.failed_recving_kv_req_ids, seq)
+        terminal_consumed = bool(
+            getattr(seq, "offload_loaded", False)
+            or getattr(seq, "offload_load_failed", False)
+        )
+        if terminal_queued or terminal_consumed:
+            self._cleanup_aborted_load(seq)
+            return
+        seq._awaiting_aborted_load_cleanup = True
 
     def _cleanup_aborted_load(self, seq: Sequence) -> None:
         if hasattr(seq, "_awaiting_aborted_load_cleanup"):
             delattr(seq, "_awaiting_aborted_load_cleanup")
         self._uncount_inflight_load(seq)
-        for marker in (
-            "_active_load_operation",
-            "_consumed_load_operation",
-            "_load_operation",
-        ):
-            if hasattr(seq, marker):
-                delattr(seq, marker)
         self._maybe_release_deferred(seq)
 
     def _finish_aborted_load_cleanup(self, completion_id) -> bool:
@@ -1698,16 +1677,7 @@ class Scheduler:
             else completion_id
         )
         seq = self._deferred_sequence(req_id)
-        expected_operation = getattr(seq, "_load_operation", None) if seq else None
-        if (
-            seq is None
-            or not getattr(seq, "_awaiting_aborted_load_cleanup", False)
-            or (expected_operation is not None and completion_id != expected_operation)
-            or (
-                expected_operation is None
-                and isinstance(completion_id, LoadOperationId)
-            )
-        ):
+        if seq is None or not getattr(seq, "_awaiting_aborted_load_cleanup", False):
             return False
         self._cleanup_aborted_load(seq)
         return True
@@ -2617,8 +2587,6 @@ class Scheduler:
             if expected not in completion_ids:
                 return False
             completion_ids.remove(expected)
-            if getattr(seq, "_active_load_operation", None) == expected:
-                seq._consumed_load_operation = expected
             return True
         return cls._pop_req_id(completion_ids, seq.id)
 

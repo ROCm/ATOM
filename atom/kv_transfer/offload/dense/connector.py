@@ -594,8 +594,6 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             load_operation = LoadOperationId(seq.id, self._load_nonce)
             self._load_nonce += 1
             seq._load_operation = load_operation
-            seq._active_load_operation = load_operation
-            seq._consumed_load_operation = None
             self._active_load_operations[sid] = (seq, load_operation)
             self._track_load_statistics(load_operation, lmc - hbm)
             meta.add_request(
@@ -721,14 +719,8 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             self._active_load_operations.pop(sid, None)
             operation = active[1]
             self._cancel_load_statistics(operation)
-            if getattr(seq, "_active_load_operation", None) == operation:
-                for marker in (
-                    "_active_load_operation",
-                    "_consumed_load_operation",
-                    "_load_operation",
-                ):
-                    if hasattr(seq, marker):
-                        delattr(seq, marker)
+            if getattr(seq, "_load_operation", None) == operation:
+                delattr(seq, "_load_operation")
 
     def request_finished(self, seq) -> None:
         sid = str(seq.id)
@@ -742,10 +734,5 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         entry = self._save_tracker.get(sid)
         if entry is not None and entry[0] is seq and not self.should_defer_free(seq):
             self._save_tracker.pop(sid, None)
-        for marker in (
-            "_active_load_operation",
-            "_consumed_load_operation",
-            "_load_operation",
-        ):
-            if hasattr(seq, marker):
-                delattr(seq, marker)
+        if hasattr(seq, "_load_operation"):
+            delattr(seq, "_load_operation")
