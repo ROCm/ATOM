@@ -180,12 +180,8 @@ class V4AttnFfn(DecodeAttnFfnPiecewise):
     """V4's captured attention core. Owned by DeepseekV4Attention, not inherited
     by it -- the layer holds one of these and forwards to it."""
 
-    # Inputs come from `core` below. `positions` is copied per step, not
-    # captured on: including it costs ~2pts of accuracy (cumulative padding-tail
-    # regression). 480ab939 folded it back in on the theory that 71a3e941's
-    # ragged-lens staging was the real cause; measurement says otherwise -- with
-    # the staging in place, excluding `positions` is still what restores
-    # accuracy, so the two are independent problems.
+    # Inputs come from `core` below. `positions` is copied per step rather than
+    # captured on: including it costs ~2pts of accuracy (padding-tail regression).
     zero_copy_exclude = ("positions",)
     # Rows the buffers cover; longer steps (prefill) take the copy path.
     max_tokens = 512
@@ -321,14 +317,30 @@ def v4_core_attention(
 
     fc = get_forward_context()
 
-    # The core's inputs are outputs of the preceding graph piece and live in the
-    # cudagraph pool. #1884 snapshotted them out of it on entry; #1902 dropped
-    # that once each num_tokens bucket got its own pool, since a bucket's graphs
-    # only ever reuse memory among themselves. They are passed through as-is.
     is_piecewise = (
         getattr(fc, "cudagraph_runtime_mode", None) == CUDAGraphMode.PIECEWISE
     )
 
+    # FULL / plain PIECEWISE / eager: the core is not captured, so take the
+    # pre-refactor path directly. `attn_ffn.run()` would only reach `stabilize`
+    # here anyway (its `enabled` is False), and these modes are not what
+    # AF_PIECEWISE is for -- keep them on the code they were measured with.
+    if not self.attn_ffn_piecewise:
+        out = self._attn_core(
+            x, q, kv_pre, qr, qr_scale, positions, idx_q_quant, idx_weights, idx_q_scale
+        )
+        if not is_piecewise:
+            return out
+        # PIECEWISE: the downstream dense piece was captured reading a fixed
+        # address, so the output has to land in the persistent per-(layer, rows)
+        # buffer rather than in a recyclable pool tensor.
+        return _v4_attn_runner.stabilize((layer_name, int(out.shape[0])), out, True)
+
+    # AF_PIECEWISE: the core gets its own cudagraph. Its inputs are outputs of
+    # the preceding graph piece and live in the cudagraph pool. #1884 snapshotted
+    # them out of it on entry; #1902 dropped that once each num_tokens bucket got
+    # its own pool, since a bucket's graphs only ever reuse memory among
+    # themselves. They are passed through as-is.
     return self.attn_ffn.run(
         forward_context=fc,
         layer_name=layer_name,
