@@ -944,51 +944,18 @@ class Scheduler:
         )
 
     def add(self, seq: Sequence):
-        self._assert_request_id_available(seq)
         self._warn_if_unschedulable(seq)
         self.waiting.append(seq)
 
     def extend(self, seqs: list[Sequence]):
         seen: dict[object, Sequence] = {}
         for seq in seqs:
-            self._assert_request_id_available(seq)
             key = str(seq.id)
             if key in seen:
                 raise ValueError(f"request ID {seq.id!r} is already active")
             seen[key] = seq
             self._warn_if_unschedulable(seq)
         self.waiting.extend(seqs)
-
-    def _assert_request_id_available(self, seq: Sequence) -> None:
-        def _snapshot(source) -> list:
-            if source is None:
-                return []
-            if hasattr(source, "id"):
-                return [source]
-            if hasattr(source, "values"):
-                return list(source.values())
-            return list(source)
-
-        active_sequences = []
-        for name in ("waiting", "_rejected"):
-            active_sequences.extend(_snapshot(getattr(self, name, ())))
-
-        lock = getattr(self, "_prefill_lock", None)
-        if lock is not None:
-            with lock:
-                active_sequences.extend(_snapshot(getattr(self, "prefill_waiting", ())))
-                active_sequences.extend(_snapshot(getattr(self, "prefill_done", ())))
-        else:
-            active_sequences.extend(_snapshot(getattr(self, "prefill_waiting", ())))
-            active_sequences.extend(_snapshot(getattr(self, "prefill_done", ())))
-        active_sequences.extend(_snapshot(getattr(self, "running", ())))
-
-        for active in active_sequences:
-            if str(active.id) == str(seq.id):
-                raise ValueError(f"request ID {seq.id!r} is already active")
-        deferred = getattr(self, "deferred_free_blocks", {})
-        if any(str(req_id) == str(seq.id) for req_id in deferred):
-            raise ValueError(f"request ID {seq.id!r} is already active")
 
     def _defer_free(self, seq: Sequence) -> None:
         for req_id, existing in self.deferred_free_blocks.items():
