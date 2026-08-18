@@ -10,33 +10,93 @@ import numpy as np
 from conftest import MockConfig
 
 from atom.model_engine.scheduler import (
+    EngineStats,
     ScheduledBatch,
     ScheduledBatchOutput,
     Scheduler,
-    SpecStats,
 )
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 from atom.sampling_params import SamplingParams
 
-# ── SpecStats ──────────────────────────────────────────────────────────────
+# ── EngineStats: spec section ────────────────────────────────────────────────
 
 
 class TestSpecStats:
     def test_no_division_by_zero_with_valid_mtp_k(self):
-        """SpecStats with mtp_k >= 1 must not raise on update()."""
-        stats = SpecStats(mtp_k=1)
+        """EngineStats spec section with mtp_k >= 1 must not raise on update."""
+        stats = EngineStats(use_spec=True, mtp_k=1)
         # Should not raise ZeroDivisionError
-        stats.update(num_accepted_tokens=1)
-        stats.update(num_accepted_tokens=2)
+        stats.update_spec(num_accepted_tokens=1)
+        stats.update_spec(num_accepted_tokens=2)
 
     def test_update_accumulates_draft_tokens(self):
-        stats = SpecStats(mtp_k=2)
-        stats.update(num_accepted_tokens=1)
+        stats = EngineStats(use_spec=True, mtp_k=2)
+        stats.update_spec(num_accepted_tokens=1)
         assert stats.total_draft_tokens == 2
 
     def test_acceptance_rate_zero_when_no_updates(self):
-        stats = SpecStats(mtp_k=3)
+        stats = EngineStats(use_spec=True, mtp_k=3)
         assert stats.acceptance_rate == 0.0
+
+
+# ── EngineStats: cache section ───────────────────────────────────────────────
+
+
+class TestCacheStats:
+    def test_update_accumulates_tokens(self):
+        stats = EngineStats(enable_prefix_caching=True)
+        # update_cache(cached, full, compressed, wanted)
+        stats.update_cache(4, 10, 8, 6)
+        assert stats.total_requests == 1
+        assert stats.total_cached_tokens == 4
+        assert stats.total_full_tokens == 10
+        assert stats.total_compressed_tokens == 8
+        assert stats.total_wanted_tokens == 6
+
+    def test_hit_rate_zero_when_no_updates(self):
+        stats = EngineStats(enable_prefix_caching=True)
+        assert stats.cache_hit_rate == 0.0
+
+    def test_hit_rate_matches_cached_over_full(self):
+        stats = EngineStats(enable_prefix_caching=True)
+        stats.update_cache(4, 10, 8, 6)
+        assert stats.cache_hit_rate == 0.4
+
+    def test_update_is_noop_when_cache_disabled(self):
+        """The cache section gates internally, so a disabled EngineStats
+        ignores update_cache rather than the caller having to guard it."""
+        stats = EngineStats(enable_prefix_caching=False)
+        stats.update_cache(4, 10, 8, 6)
+        assert stats.total_requests == 0
+        assert stats.total_cached_tokens == 0
+
+
+# ── EngineStats: throughput section ──────────────────────────────────────────
+
+
+class TestThroughputStats:
+    def test_update_accumulates_tokens(self):
+        stats = EngineStats(enable_log_stats=True)
+        stats.update_throughput(num_prompt_tokens=10, num_generation_tokens=5)
+        assert stats.num_prompt_tokens == 10
+        assert stats.num_generation_tokens == 5
+
+    def test_maybe_log_below_interval_keeps_counters(self):
+        """Time-based pace: below the wall-clock interval nothing is logged or
+        reset, so the accumulated counts survive to the next tick."""
+        stats = EngineStats(enable_log_stats=True, throughput_log_interval_s=1e6)
+        stats.update_throughput(num_prompt_tokens=10, num_generation_tokens=5)
+        stats.maybe_log_throughput(
+            num_running_reqs=1, num_waiting_reqs=0, kv_usage=0.0
+        )
+        assert stats.num_prompt_tokens == 10
+        assert stats.num_generation_tokens == 5
+
+    def test_update_is_noop_when_log_stats_disabled(self):
+        stats = EngineStats(enable_log_stats=False)
+        stats.update_throughput(num_prompt_tokens=10, num_generation_tokens=5)
+        assert stats.num_prompt_tokens == 0
+        assert stats.num_generation_tokens == 0
 
 
 # ── add / extend / query ───────────────────────────────────────────────────

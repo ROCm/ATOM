@@ -275,8 +275,9 @@ class EngineUtilityHandler:
 
     def _handle_get_mtp_stats(self, args: dict):
         """Print MTP statistics to log (fire-and-forget)."""
-        if self.scheduler is not None and self.scheduler.spec_stats is not None:
-            self.scheduler.spec_stats._log()
+        stats = None if self.scheduler is None else self.scheduler.engine_stats
+        if stats is not None and stats.spec_enabled:
+            stats.log_spec()
         else:
             logger.info(
                 "\n[MTP Stats] No MTP statistics available "
@@ -285,10 +286,11 @@ class EngineUtilityHandler:
 
     def _handle_get_mtp_statistics(self, args: dict):
         """Return structured MTP statistics via UTILITY_RESPONSE."""
-        if self.scheduler is None or self.scheduler.spec_stats is None:
+        stats = None if self.scheduler is None else self.scheduler.engine_stats
+        if stats is None or not stats.spec_enabled:
             result = {"enabled": False}
         else:
-            result = self.scheduler.spec_stats.get_statistics()
+            result = stats.spec_statistics()
             result["enabled"] = True
         self.output_queue.put_nowait(
             ("UTILITY_RESPONSE", {"cmd": "get_mtp_statistics", "result": result})
@@ -306,13 +308,13 @@ class EngineUtilityHandler:
         handful of requests cannot wait for that interval, and reading it out
         of a log is not something a client can do at all.
         """
-        stats = None if self.scheduler is None else self.scheduler.cache_stats
-        if stats is None:
+        stats = None if self.scheduler is None else self.scheduler.engine_stats
+        if stats is None or not stats.cache_enabled:
             result = {"enabled": False}
         else:
-            result = stats.get_statistics()
+            result = stats.cache_statistics()
             result["enabled"] = True
-            # `CacheStats` counts the reuse a request wanted and did not
+            # The cache section counts the reuse a request wanted and did not
             # get; the funnel is where it was lost.
             result |= self.scheduler.block_manager.checkpoint_funnel()
         self.output_queue.put_nowait(
@@ -342,19 +344,18 @@ class EngineUtilityHandler:
             kv_pool = self.scheduler.block_manager.kv
             kv_connector = getattr(self.scheduler, "kv_connector", None)
 
-            spec_stats = self.scheduler.spec_stats
-            if spec_stats is None:
+            engine_stats = self.scheduler.engine_stats
+            if not engine_stats.spec_enabled:
                 mtp = {"enabled": False}
             else:
-                mtp = {"enabled": True, **spec_stats.get_statistics()}
+                mtp = {"enabled": True, **engine_stats.spec_statistics()}
 
-            cache_stats = self.scheduler.cache_stats
-            if cache_stats is None:
+            if not engine_stats.cache_enabled:
                 cache = {"enabled": False}
             else:
                 cache = {
                     "enabled": True,
-                    **cache_stats.get_statistics(),
+                    **engine_stats.cache_statistics(),
                     **self.scheduler.block_manager.checkpoint_funnel(),
                 }
 
