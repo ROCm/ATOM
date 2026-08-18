@@ -10,7 +10,6 @@ import types
 from collections import deque
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 
@@ -2622,9 +2621,7 @@ def test_offload_completion_processing_calls_load_terminal_once(field, callback)
         def load_failed(self, req_id):
             calls.append(("load_failed", req_id))
 
-    output = _Connector().process_completions(
-        KVConnectorOutput(**{field: {725}})
-    )
+    output = _Connector().process_completions(KVConnectorOutput(**{field: {725}}))
 
     assert calls == [(callback, 725)]
     assert getattr(output, field) == {725}

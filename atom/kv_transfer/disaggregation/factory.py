@@ -14,7 +14,7 @@ from __future__ import annotations
 import importlib
 import logging
 from collections.abc import Iterable
-from typing import Any
+from typing import Any, ClassVar
 
 from atom.kv_transfer.disaggregation.base import (
     KVConnectorBase,
@@ -42,9 +42,9 @@ class KVConnectorFactory:
         connector = KVConnectorFactory.create_connector(config, role="worker")
     """
 
-    _registry: dict[str, dict[str, str]] = {}
-    _aliases: dict[str, str] = {}
-    _requires_pd_staging: dict[str, bool] = {}
+    _registry: ClassVar[dict[str, dict[str, str]]] = {}
+    _aliases: ClassVar[dict[str, str]] = {}
+    _requires_pd_staging: ClassVar[dict[str, bool]] = {}
 
     @classmethod
     def register(
@@ -120,7 +120,7 @@ class KVConnectorFactory:
         if kv_transfer_config is None or kv_transfer_config == {}:
             return False
         if not isinstance(kv_transfer_config, dict):
-            raise ValueError(
+            raise TypeError(
                 "kv_transfer_config must be a dict or None, "
                 f"got {type(kv_transfer_config).__name__}"
             )

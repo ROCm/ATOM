@@ -390,7 +390,7 @@ def test_dense_exact_load_failure_rolls_back_save_frontier(monkeypatch):
     assert connector._save_tracker["31"] == [seq, 8]
     assert "31" not in connector._active_load_operations
     assert "31" not in connector._load_save_floors
-    assert scheduler.failed_recving_kv_req_ids == [operation]
+    assert scheduler.failed_recving_kv_req_ids == [31]
 
 
 def test_dense_stale_load_generation_does_not_clear_active_operation(monkeypatch):

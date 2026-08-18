@@ -9,13 +9,11 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 import torch
 
 from atom.kv_transfer.disaggregation.types import (
-    KVConnectorOutput,
     KVTransferRegion,
     SaveOperationId,
 )

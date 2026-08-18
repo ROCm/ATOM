@@ -107,8 +107,7 @@ def test_scheduler_shell_forwards_completion_processing():
     output = object()
     shell = LMCacheOffloadConnectorScheduler.__new__(LMCacheOffloadConnectorScheduler)
     shell._impl = SimpleNamespace(
-        process_completions=lambda value: calls.append(("completions", value))
-        or value,
+        process_completions=lambda value: calls.append(("completions", value)) or value,
         load_finished=lambda req: calls.append(("load-ok", req)) or False,
     )
 

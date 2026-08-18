@@ -73,6 +73,7 @@ class KVConnectorBase(ABC):
         """
         return []
 
+
 class KVConnectorSchedulerBase(ABC):
     """Scheduler-side KV connector interface."""
 

@@ -394,23 +394,28 @@ def test_transfer_topology_allocates_pd_staging_only_when_needed(
 
 
 @pytest.mark.parametrize(
-    ("transfer_config", "message"),
+    ("transfer_config", "error_type", "message"),
     [
-        ([], "kv_transfer_config must be a dict or None"),
-        ({"kv_role": "offload"}, "requires a non-empty 'kv_connector'"),
-        ({"kv_connector": "unknown"}, "unknown KV connector"),
+        ([], TypeError, "kv_transfer_config must be a dict or None"),
+        (
+            {"kv_role": "offload"},
+            ValueError,
+            "requires a non-empty 'kv_connector'",
+        ),
+        ({"kv_connector": "unknown"}, ValueError, "unknown KV connector"),
     ],
 )
 def test_invalid_transfer_topology_fails_before_staging_allocation(
     v4_builder_cls,
     transfer_config,
+    error_type,
     message,
 ):
     uses_pd_staging = v4_builder_cls.allocate_per_req_cache.__globals__[
         "_uses_pd_staging"
     ]
 
-    with pytest.raises(ValueError, match=message):
+    with pytest.raises(error_type, match=message):
         uses_pd_staging(transfer_config)
 
 

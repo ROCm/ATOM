@@ -361,6 +361,7 @@ class TestSchedule:
         class _Connector(OffloadSchedulerMixin):
             is_producer = False
             is_offload = True
+            _do_load = False
 
             def __init__(self):
                 self.pending = {operation}
@@ -398,6 +399,7 @@ class TestSchedule:
         class _Connector(OffloadSchedulerMixin):
             is_producer = False
             is_offload = True
+            _do_load = False
 
             def __init__(self):
                 self.pending = {operation}
@@ -840,6 +842,7 @@ class TestLongPrefillTokenThreshold:
         batch2, _ = sched.schedule()
         assert list(batch2.num_scheduled_tokens) == [8]
 
+
 # ── prefix caching ────────────────────────────────────────────────────────
 
 
@@ -1172,6 +1175,7 @@ class TestPostprocess:
         seq = self._prefill(scheduler, seq_factory([1, 2, 3, 4]))
         scheduler.postprocess(list(scheduler.running), self._output(seq.id, [2]))
         assert scheduler.get_request_counts() == (0, 0)
+
 
 # ── get_next_batch_info ────────────────────────────────────────────────────
 
