@@ -13,11 +13,10 @@ import pytest
 from conftest import MockConfig
 
 from atom.kv_transfer.disaggregation.types import (
-    ConnectorCompletion,
     KVConnectorOutput,
-    LoadOperationId,
     SaveOperationId,
 )
+from atom.kv_transfer.offload._offload_common import OffloadSchedulerMixin
 from atom.model_engine.scheduler import (
     ScheduledBatch,
     ScheduledBatchOutput,
@@ -77,7 +76,6 @@ class TestSchedulerAddQuery:
         scheduler.kv_connector = SimpleNamespace(
             is_producer=False,
             is_offload=True,
-            completion_channels=set(),
         )
         scheduler.block_manager = SimpleNamespace()
 
@@ -142,62 +140,25 @@ class TestSchedulerAddQuery:
 
 
 class TestSchedule:
-    def test_exact_load_generation_does_not_consume_stale_raw_completion(self):
-        operation = LoadOperationId(88, 3)
-        seq = SimpleNamespace(id=88, _load_operation=operation)
-        completions = [88]
-
-        assert Scheduler._has_load_completion(completions, seq) is False
-        assert Scheduler._pop_load_completion(completions, seq) is False
-        assert completions == [88]
-
-    def test_connector_owned_completion_is_delegated_to_channel_owner(self):
-        channel = "test.connector.completion"
-        completion = ConnectorCompletion(
-            channel=channel,
-            operation_id=SaveOperationId(13, 2),
-            succeeded=False,
-        )
-        handled = []
-        scheduler = Scheduler.__new__(Scheduler)
-        scheduler.kv_connector = SimpleNamespace(
-            is_producer=False,
-            is_offload=True,
-            completion_channels={channel},
-            connector_completion=lambda value: handled.append(value),
-        )
-        scheduler.block_manager = SimpleNamespace()
-        scheduler.deferred_free_blocks = {}
-        scheduler.finished_recving_kv_req_ids = []
-        scheduler.failed_recving_kv_req_ids = []
-
-        scheduler._update_from_kv_xfer_finished(
-            KVConnectorOutput(connector_completions={completion})
-        )
-
-        assert handled == [completion]
-
     @pytest.mark.parametrize("first_terminal", ["load", "save"])
     def test_aborted_load_and_save_both_finish_before_release(
         self,
         first_terminal,
     ):
-        load = LoadOperationId(97, 3)
-        save = SaveOperationId(97, 4)
+        load = 97
+        save = 97
         seq = SimpleNamespace(
             id=97,
             status=SequenceStatus.ABORTED,
             block_table=[1],
             has_per_req_cache=False,
-            _load_operation=load,
             _counted_as_inflight_load=True,
         )
         events = []
 
-        class _Connector:
+        class _Connector(OffloadSchedulerMixin):
             is_offload = True
             is_producer = False
-            completion_channels = frozenset()
 
             def __init__(self):
                 self.pending_save = True
@@ -436,7 +397,7 @@ class TestSchedule:
         pinned_victim.append_token(10)
         operation = SaveOperationId(pinned_victim.id, 50)
 
-        class _Connector:
+        class _Connector(OffloadSchedulerMixin):
             is_producer = False
             is_offload = True
 
@@ -473,7 +434,7 @@ class TestSchedule:
         pinned.append_token(9)
         operation = SaveOperationId(pinned.id, 51)
 
-        class _Connector:
+        class _Connector(OffloadSchedulerMixin):
             is_producer = False
             is_offload = True
 

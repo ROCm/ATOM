@@ -27,10 +27,6 @@ import numpy as np
 
 from atom.config import Config
 from atom.kv_transfer.disaggregation import KVConnectorOutput
-from atom.kv_transfer.disaggregation.types import (
-    LoadOperationId,
-    SaveOperationId,
-)
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
@@ -1593,7 +1589,7 @@ class Scheduler:
         return True
 
     def _consume_failed_remote_kv(self, seq: Sequence) -> bool:
-        if not self._pop_load_completion(self.failed_recving_kv_req_ids, seq):
+        if not self._pop_req_id(self.failed_recving_kv_req_ids, seq.id):
             return False
 
         seq.status = SequenceStatus.WAITING
@@ -1614,9 +1610,9 @@ class Scheduler:
             return
 
         self.deferred_free_blocks[seq.id] = seq
-        terminal_queued = self._pop_load_completion(
-            self.finished_recving_kv_req_ids, seq
-        ) or self._pop_load_completion(self.failed_recving_kv_req_ids, seq)
+        terminal_queued = self._pop_req_id(
+            self.finished_recving_kv_req_ids, seq.id
+        ) or self._pop_req_id(self.failed_recving_kv_req_ids, seq.id)
         terminal_consumed = bool(
             getattr(seq, "offload_loaded", False)
             or getattr(seq, "offload_load_failed", False)
@@ -1632,12 +1628,7 @@ class Scheduler:
         self._uncount_inflight_load(seq)
         self._maybe_release_deferred(seq)
 
-    def _finish_aborted_load_cleanup(self, completion_id) -> bool:
-        req_id = (
-            completion_id.req_id
-            if isinstance(completion_id, LoadOperationId)
-            else completion_id
-        )
+    def _finish_aborted_load_cleanup(self, req_id) -> bool:
         seq = self._deferred_sequence(req_id)
         if seq is None or not getattr(seq, "_awaiting_aborted_load_cleanup", False):
             return False
@@ -2529,23 +2520,6 @@ class Scheduler:
             return True
         return False
 
-    @classmethod
-    def _pop_load_completion(cls, completion_ids: list, seq: Sequence) -> bool:
-        expected = getattr(seq, "_load_operation", None)
-        if expected is not None:
-            if expected not in completion_ids:
-                return False
-            completion_ids.remove(expected)
-            return True
-        return cls._pop_req_id(completion_ids, seq.id)
-
-    @classmethod
-    def _has_load_completion(cls, completion_ids: list, seq: Sequence) -> bool:
-        expected = getattr(seq, "_load_operation", None)
-        if expected is not None:
-            return expected in completion_ids
-        return cls._has_req_id(completion_ids, seq.id)
-
     def _update_waiting_for_remote_kv(self, seq: Sequence) -> bool:
         """Check whether a remote KV transfer for *seq* has completed.
 
@@ -2554,7 +2528,7 @@ class Scheduler:
         scheduling step.  When ready, the sequence transitions back
         from ``WAITING_FOR_REMOTE_KVS`` to ``WAITING``.
         """
-        if not self._pop_load_completion(self.finished_recving_kv_req_ids, seq):
+        if not self._pop_req_id(self.finished_recving_kv_req_ids, seq.id):
             return False
 
         logger.debug("KV transfer finished for seq %s, ready for scheduling.", seq.id)
@@ -2604,8 +2578,8 @@ class Scheduler:
         while self.waiting:
             seq = self.waiting.popleft()
             if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS and (
-                self._has_load_completion(self.finished_recving_kv_req_ids, seq)
-                or self._has_load_completion(self.failed_recving_kv_req_ids, seq)
+                self._has_req_id(self.finished_recving_kv_req_ids, seq.id)
+                or self._has_req_id(self.failed_recving_kv_req_ids, seq.id)
             ):
                 ready.append(seq)
             else:
@@ -2658,16 +2632,13 @@ class Scheduler:
             getattr(kv_connector_output, "pending_work", False)
         )
 
-        def _raw_req_id(value):
-            return value.req_id if isinstance(value, SaveOperationId) else value
-
         is_producer = self._connector_flag("is_producer")
         is_offload = self._connector_flag("is_offload")
 
-        connector_completions = kv_connector_output.connector_completions or ()
-        declared_completion_channels = frozenset(
-            getattr(self.kv_connector, "completion_channels", ()) or ()
-        )
+        process_completions = getattr(self.kv_connector, "process_completions", None)
+        if callable(process_completions):
+            kv_connector_output = process_completions(kv_connector_output)
+
         for req_id in kv_connector_output.finished_recving or ():
             assert not is_producer, "Only consumer should update recving KV status"
             logger.debug("Finished recving KV transfer for request %s", req_id)
@@ -2683,11 +2654,6 @@ class Scheduler:
         for req_id in kv_connector_output.finished_loading or ():
             assert is_offload, "Only offload connector should update loading KV status"
             logger.debug("Finished offload KV load for request %s", req_id)
-            accepted = True
-            if hasattr(self.kv_connector, "load_finished"):
-                accepted = self.kv_connector.load_finished(req_id) is not False
-            if not accepted:
-                continue
             if self._finish_aborted_load_cleanup(req_id):
                 continue
             self.finished_recving_kv_req_ids.append(req_id)
@@ -2700,42 +2666,11 @@ class Scheduler:
                 "Offload KV load failed for request %s; falling back to prefill.",
                 req_id,
             )
-            accepted = True
-            if hasattr(self.kv_connector, "load_failed"):
-                accepted = self.kv_connector.load_failed(req_id) is not False
-            if not accepted:
-                continue
             if self._finish_aborted_load_cleanup(req_id):
                 continue
             self.failed_recving_kv_req_ids.append(req_id)
 
-        connector_completion_callback = getattr(
-            self.kv_connector,
-            "connector_completion",
-            None,
-        )
-        for completion in connector_completions:
-            if completion.channel not in declared_completion_channels:
-                logger.error(
-                    "Ignoring completion for undeclared connector channel %s",
-                    completion.channel,
-                )
-                continue
-            handled = (
-                callable(connector_completion_callback)
-                and connector_completion_callback(completion) is not False
-            )
-            if not handled:
-                logger.warning(
-                    "Ignoring completion for unhandled connector channel %s",
-                    completion.channel,
-                )
-
         finished_saving = kv_connector_output.finished_saving or ()
-        # Retire each exact save operation once, before any release decision.
-        for save_operation in finished_saving:
-            if hasattr(self.kv_connector, "save_finished"):
-                self.kv_connector.save_finished(save_operation)
         for req_id in kv_connector_output.finished_sending or ():
             assert (
                 self.kv_connector.is_producer
@@ -2743,14 +2678,12 @@ class Scheduler:
             logger.debug("Finished sending KV transfer for request %s", req_id)
             seq = self._deferred_sequence(req_id)
             assert seq is not None, f"req_id={req_id} not found in deferred_free_blocks"
-            released = self.deferred_free_blocks.pop(seq.id, None)
-            assert released is seq
+            self.deferred_free_blocks.pop(seq.id, None)
             self.block_manager.deallocate(seq)
 
         if not is_producer:
             for req_id in finished_saving:
-                raw_req_id = _raw_req_id(req_id)
-                seq = self._deferred_sequence(raw_req_id)
+                seq = self._deferred_sequence(req_id)
                 if seq is not None:
                     self._maybe_release_deferred(seq)
 

@@ -211,8 +211,6 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
     # finished_sending (the scheduler frees blocks on finished_sending — a P/D
     # producer semantic that would wrongly deallocate live offload blocks).
     is_producer = False
-    completion_channels = frozenset({DSV4_CHECKPOINT_SAVE_CHANNEL})
-
     def __init__(self, config) -> None:
         self._config = config
         kvc = getattr(config, "kv_transfer_config", {}) or {}
@@ -1768,8 +1766,6 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
     # Opt the scheduler into offload-wake (suffix prefill) instead of the P/D
     # decode-jump in Scheduler.schedule(); see Scheduler._is_offload_connector.
     is_offload = True
-    completion_channels = frozenset({DSV4_CHECKPOINT_SAVE_CHANNEL})
-
     def __init__(self, config) -> None:
         self._init_offload_statistics()
         self._config = config

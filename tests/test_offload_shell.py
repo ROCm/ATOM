@@ -8,7 +8,6 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
-from atom.kv_transfer.disaggregation.types import ConnectorCompletion
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload.connector import (
     LMCacheOffloadConnector,
@@ -20,12 +19,9 @@ from atom.kv_transfer.offload.dense.connector import (
     DenseOffloadScheduler,
 )
 from atom.kv_transfer.offload.hybrid.dsv4.connector import (
-    DSV4_CHECKPOINT_SAVE_CHANNEL,
     DSV4OffloadConnector,
     DSV4OffloadScheduler,
 )
-
-_HYBRID_COMPLETION_CHANNELS = frozenset({DSV4_CHECKPOINT_SAVE_CHANNEL})
 
 
 def _config(*, compress_ratios=None, layout=None):
@@ -65,8 +61,6 @@ def test_worker_shell_selects_family():
 
     assert isinstance(hybrid._impl, DSV4OffloadConnector)
     assert isinstance(dense._impl, DenseOffloadConnector)
-    assert hybrid.completion_channels == _HYBRID_COMPLETION_CHANNELS
-    assert dense.completion_channels == frozenset()
 
 
 def test_scheduler_shell_selects_family(monkeypatch):
@@ -83,8 +77,6 @@ def test_scheduler_shell_selects_family(monkeypatch):
     assert isinstance(hybrid._impl, DSV4OffloadScheduler)
     assert isinstance(dense._impl, DenseOffloadScheduler)
     assert hybrid.is_offload and not hybrid.is_producer
-    assert hybrid.completion_channels == _HYBRID_COMPLETION_CHANNELS
-    assert dense.completion_channels == frozenset()
 
 
 def test_factory_registration_resolves_public_thin_shells(monkeypatch):
@@ -110,36 +102,23 @@ def test_factory_registration_resolves_public_thin_shells(monkeypatch):
     assert isinstance(scheduler, LMCacheOffloadConnectorScheduler)
 
 
-def test_scheduler_shell_forwards_generic_completion_hook():
+def test_scheduler_shell_forwards_completion_processing():
     calls = []
-    succeeded = ConnectorCompletion(
-        channel=DSV4_CHECKPOINT_SAVE_CHANNEL,
-        operation_id="a",
-        succeeded=True,
-    )
-    failed = ConnectorCompletion(
-        channel=DSV4_CHECKPOINT_SAVE_CHANNEL,
-        operation_id="b",
-        succeeded=False,
-    )
+    output = object()
     shell = LMCacheOffloadConnectorScheduler.__new__(LMCacheOffloadConnectorScheduler)
     shell._impl = SimpleNamespace(
         connector_meta_dispatched=lambda meta: calls.append(("dispatch", meta)),
-        connector_completion=lambda completion: calls.append(
-            ("completion", completion)
-        ),
+        process_completions=lambda value: calls.append(("completions", value))
+        or value,
         load_finished=lambda req: calls.append(("load-ok", req)) or False,
     )
 
     shell.connector_meta_dispatched("meta")
-    assert shell.connector_completion(succeeded) is True
-    assert shell.connector_completion(failed) is True
-
+    assert shell.process_completions(output) is output
     assert shell.load_finished("c") is False
     assert calls == [
         ("dispatch", "meta"),
-        ("completion", succeeded),
-        ("completion", failed),
+        ("completions", output),
         ("load-ok", "c"),
     ]
 

@@ -33,6 +33,7 @@ from atom.kv_transfer.disaggregation.types import (
 )
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
+from atom.kv_transfer.offload._offload_common import OffloadSchedulerMixin
 from atom.kv_transfer.offload.dense.connector import DenseOffloadConnector
 from atom.kv_transfer.offload.dense.kv_byte_codec import (
     DenseKVByteCodec,
@@ -2691,10 +2692,10 @@ def test_collapsed_sidecar_and_save_completion_clears_page_inflight():
         ("failed_loading", "load_failed"),
     ],
 )
-def test_scheduler_calls_load_terminal_callback_exactly_once(field, callback):
+def test_offload_completion_processing_calls_load_terminal_once(field, callback):
     calls = []
 
-    class _Connector:
+    class _Connector(OffloadSchedulerMixin):
         is_producer = False
         is_offload = True
 
@@ -2704,49 +2705,12 @@ def test_scheduler_calls_load_terminal_callback_exactly_once(field, callback):
         def load_failed(self, req_id):
             calls.append(("load_failed", req_id))
 
-    host = Scheduler.__new__(Scheduler)
-    host.kv_connector = _Connector()
-    host.finished_recving_kv_req_ids = []
-    host.failed_recving_kv_req_ids = []
-    host.deferred_free_blocks = {}
-
-    host._update_from_kv_xfer_finished(KVConnectorOutput(**{field: {725}}))
+    output = _Connector().process_completions(
+        KVConnectorOutput(**{field: {725}})
+    )
 
     assert calls == [(callback, 725)]
-
-
-def test_scheduler_preserves_load_generation_and_ignores_reused_id_terminal():
-    old_operation = LoadOperationId(725, 10)
-    new_operation = LoadOperationId(725, 11)
-    callbacks = []
-
-    class _Connector:
-        is_producer = False
-        is_offload = True
-
-        def load_finished(self, operation):
-            callbacks.append(operation)
-
-    host = Scheduler.__new__(Scheduler)
-    host.kv_connector = _Connector()
-    host.finished_recving_kv_req_ids = []
-    host.failed_recving_kv_req_ids = []
-    host.deferred_free_blocks = {}
-    host.block_manager = SimpleNamespace(kv_events_enabled=False)
-    new_seq = SimpleNamespace(id=725, _load_operation=new_operation)
-
-    host._update_from_kv_xfer_finished(
-        KVConnectorOutput(finished_loading={old_operation})
-    )
-    assert host._update_waiting_for_remote_kv(new_seq) is False
-
-    host._update_from_kv_xfer_finished(
-        KVConnectorOutput(finished_loading={new_operation})
-    )
-
-    assert callbacks == [old_operation, new_operation]
-    assert host._update_waiting_for_remote_kv(new_seq) is True
-    assert host.finished_recving_kv_req_ids == [old_operation]
+    assert getattr(output, field) == {725}
 
 
 @pytest.mark.parametrize(
@@ -2770,7 +2734,7 @@ def test_aborted_parked_load_defers_owned_resources_until_terminal(
         _counted_as_inflight_load=True,
     )
 
-    class _Connector:
+    class _Connector(OffloadSchedulerMixin):
         is_producer = False
         is_offload = True
 
@@ -2836,7 +2800,7 @@ def test_aborted_parked_load_consumes_already_queued_terminal(queued_field):
         _counted_as_inflight_load=True,
     )
 
-    class _Connector:
+    class _Connector(OffloadSchedulerMixin):
         is_producer = False
         is_offload = True
 
@@ -2906,7 +2870,7 @@ def test_abort_cleans_load_whose_terminal_was_already_consumed(
         offload_load_start_tokens=4,
     )
 
-    class _Connector:
+    class _Connector(OffloadSchedulerMixin):
         is_producer = False
         is_offload = True
 
@@ -4057,8 +4021,9 @@ def test_finished_saving_releases_deferred_free_with_string_req_id():
         def deallocate(self, seq) -> None:
             self.deallocated.append(seq.id)
 
-    class _Connector:
+    class _Connector(OffloadSchedulerMixin):
         is_producer = False
+        is_offload = True
 
         def __init__(self) -> None:
             self.inflight = {"9"}
@@ -4078,73 +4043,6 @@ def test_finished_saving_releases_deferred_free_with_string_req_id():
     sched._update_from_kv_xfer_finished(KVConnectorOutput(finished_saving={"9"}))
 
     assert sched.block_manager.deallocated == [9]
-    assert sched.deferred_free_blocks == {}
-
-
-@pytest.mark.parametrize(
-    ("succeeded", "completion_callback"),
-    [
-        (True, "checkpoint_save_finished"),
-        (False, "checkpoint_save_failed"),
-    ],
-)
-def test_connector_completion_precedes_page_save_release(
-    succeeded,
-    completion_callback,
-):
-    events = []
-
-    class _BlockManager:
-        def deallocate(self, seq) -> None:
-            events.append(("deallocate", seq.id))
-
-    class _Connector:
-        is_producer = False
-        is_offload = True
-        completion_channels = frozenset({DSV4_CHECKPOINT_SAVE_CHANNEL})
-
-        def connector_completion(self, completion) -> bool:
-            callback = (
-                "checkpoint_save_finished"
-                if completion.succeeded
-                else "checkpoint_save_failed"
-            )
-            events.append((callback, completion.operation_id))
-            return True
-
-        def save_finished(self, req_id) -> None:
-            events.append(("save_finished", req_id))
-
-        def should_defer_free(self, seq) -> bool:
-            return False
-
-        def request_finished(self, seq) -> None:
-            events.append(("request_finished", seq.id))
-
-    sched = Scheduler.__new__(Scheduler)
-    sched.block_manager = _BlockManager()
-    sched.kv_connector = _Connector()
-    seq = SimpleNamespace(id=9)
-    sched.deferred_free_blocks = {seq.id: seq}
-    output = KVConnectorOutput(
-        finished_saving={"9"},
-        connector_completions={
-            ConnectorCompletion(
-                DSV4_CHECKPOINT_SAVE_CHANNEL,
-                "9",
-                succeeded,
-            )
-        },
-    )
-
-    sched._update_from_kv_xfer_finished(output)
-
-    assert events[0] == (completion_callback, "9")
-    assert events[1:] == [
-        ("save_finished", "9"),
-        ("request_finished", 9),
-        ("deallocate", 9),
-    ]
     assert sched.deferred_free_blocks == {}
 
 

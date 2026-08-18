@@ -246,6 +246,40 @@ class OffloadSchedulerMixin:
         self._load_inflight_tokens: dict[object, int] = {}
         self._save_inflight_tokens: dict[object, int] = {}
 
+    def process_completions(self, output: KVConnectorOutput) -> KVConnectorOutput:
+        """Apply offload-specific completions and expose plain request IDs."""
+
+        loaded = {
+            value.req_id if hasattr(value, "req_id") else value
+            for value in output.finished_loading
+            if self.load_finished(value) is not False
+        }
+        failed = {
+            value.req_id if hasattr(value, "req_id") else value
+            for value in output.failed_loading
+            if self.load_failed(value) is not False
+        }
+        terminal_saves = set()
+        callback = getattr(self, "connector_completion", None)
+        for completion in output.connector_completions:
+            if callback is None or callback(completion) is False:
+                logger.warning(
+                    "Ignoring unhandled offload completion channel %s",
+                    completion.channel,
+                )
+                continue
+            value = completion.operation_id
+            terminal_saves.add(value.req_id if hasattr(value, "req_id") else value)
+        for value in output.finished_saving:
+            self.save_finished(value)
+            terminal_saves.add(value.req_id if hasattr(value, "req_id") else value)
+
+        output.finished_loading = loaded
+        output.failed_loading = failed
+        output.finished_saving = terminal_saves
+        output.connector_completions.clear()
+        return output
+
     def _track_load_statistics(self, operation, tokens: int) -> None:
         self._load_inflight_tokens[operation] = max(0, int(tokens))
 
