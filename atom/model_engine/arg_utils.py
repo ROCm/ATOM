@@ -17,6 +17,7 @@ from atom.config import (
     SpeculativeConfig,
 )
 from atom.model_engine.engine_core_mgr import DP_LB_DEFAULT, DP_LB_STRATEGIES
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -63,6 +64,8 @@ class EngineArgs:
     enable_log_stats: bool = True
     throughput_log_interval: float = 10.0
     cache_hit_rate_window: int = 1000
+    enable_dynamic_chunking: bool = False
+    dynamic_chunking_smooth_factor: float = 0.75
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
     gpu_memory_utilization: float = 0.9
@@ -478,6 +481,24 @@ class EngineArgs:
             "line's prefix cache hit rate (default: 1000, matching vLLM). "
             "Must be > 0. Only the status line is windowed; /metrics and "
             "[Cache Stats] stay cumulative.",
+        )
+        parser.add_argument(
+            "--enable-dynamic-chunking",
+            action="store_true",
+            help=(
+                "Dynamically reduce PP prefill chunks using a startup-profiled "
+                "quadratic latency model. Requires --pipeline-parallel-size > 1."
+            ),
+        )
+        parser.add_argument(
+            "--dynamic-chunking-smooth-factor",
+            type=float,
+            default=envs.ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR,
+            help=(
+                "Interpolation between the initial chunk size (0) and the "
+                "equal-latency prediction (1). Defaults to "
+                "ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR or 0.75."
+            ),
         )
         parser.add_argument(
             "--max-num-seqs",

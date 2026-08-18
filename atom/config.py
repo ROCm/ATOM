@@ -1851,6 +1851,11 @@ class Config:
     # Requests in the sliding window behind the status line's prefix-cache hit
     # rate. Validated > 0 by EngineStats.
     cache_hit_rate_window: int = 1000
+    enable_dynamic_chunking: bool = False
+    dynamic_chunking_smooth_factor: float = 0.75
+    # Populated by PP startup profiling before Scheduler construction. Kept out
+    # of the public CLI because coefficients are hardware/model specific.
+    dynamic_chunking_coefficients: tuple[float, float, float] | None = None
     port: int = 8006
     torch_profiler_dir: str | None = field(
         default_factory=lambda: envs.ATOM_TORCH_PROFILER_DIR
@@ -2139,6 +2144,15 @@ class Config:
                 )
                 self.dcp_config.enable_query_replication = False
         assert 1 <= self.pipeline_parallel_size
+        if not 0.0 <= self.dynamic_chunking_smooth_factor <= 1.0:
+            raise ValueError("dynamic_chunking_smooth_factor must be in [0, 1]")
+        if self.enable_dynamic_chunking:
+            if self.pipeline_parallel_size <= 1:
+                raise ValueError("Dynamic chunking requires pipeline_parallel_size > 1")
+            if not self.enable_chunked_prefill:
+                raise ValueError(
+                    "Dynamic chunking requires enable_chunked_prefill=True"
+                )
         self.hf_config = get_hf_config(
             self.model, trust_remote_code=self.trust_remote_code
         )
