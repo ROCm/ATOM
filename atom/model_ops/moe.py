@@ -78,6 +78,8 @@ from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
 
+_DP_STAGE1_AG_FALLBACK_REASONS: set[str] = set()
+
 
 class MoEActivationQuant(Enum):
     BF16 = "bf16"
@@ -1211,6 +1213,183 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w2_bias=layer.w2_bias,
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
+        )
+
+    def _dp_stage1_ag_unsupported_reason(
+        self,
+        layer: torch.nn.Module,
+        *,
+        custom_routing_function: Callable | None,
+        activation: ActivationType,
+    ) -> str | None:
+        atom_config = get_current_atom_config()
+        if atom_config.moe_stage1_ag_fusion == "off":
+            return "feature is disabled"
+        if get_gfx() != "gfx950":
+            return "gfx950 is required"
+        if not atom_config.enable_dp_attention:
+            return "DP attention is disabled"
+        if layer.use_ep or atom_config.enable_expert_parallel:
+            return "expert parallelism is unsupported"
+        if get_dp_group().world_size != 8:
+            return "the DP group must contain 8 ranks"
+        if self.use_triton:
+            return "Triton MoE weights are not compatible with FlyDSL Stage1"
+        if self.quant_type != QuantType.per_1x32:
+            return "per-1x32 MX quantization is required"
+        if layer.w13_weight.dtype != dtypes.fp4x2:
+            return "MXFP4 routed-expert weights are required"
+        if not self.is_guinterleave:
+            return "ATOM_MOE_GU_ITLV=1 is required"
+        if layer.apply_router_weight_on_input:
+            return "Stage1 routed-weight multiplication is unsupported"
+        if custom_routing_function is not None:
+            return "hash/custom routing uses the existing fallback"
+        if layer.num_fused_shared_experts:
+            return "fused shared experts use the existing fallback"
+        if layer.hidden_size != 7168 or layer.local_num_experts != 384:
+            return "only H=7168 and E=384 are currently specialized"
+        if layer.top_k != 6 or layer.intermediate_size_per_partition != 384:
+            return "only topk=6 and inter_per_rank=384 are currently specialized"
+        if activation != ActivationType.Silu:
+            return "only SiLU activation is currently specialized"
+        if layer.w13_bias is not None or layer.w2_bias is not None:
+            return "per-expert bias is unsupported"
+        from atom.utils.tbo.ubatching import tbo_active
+
+        if tbo_active():
+            return "TBO and Stage1 AG fusion cannot share workspace generations yet"
+        return None
+
+    def can_use_dp_stage1_ag_fusion(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        *,
+        sizes: list[int] | None,
+        custom_routing_function: Callable | None,
+        activation: ActivationType,
+    ) -> bool:
+        reason = self._dp_stage1_ag_unsupported_reason(
+            layer,
+            custom_routing_function=custom_routing_function,
+            activation=activation,
+        )
+        mode = get_current_atom_config().moe_stage1_ag_fusion
+        if mode == "off":
+            return False
+        if reason is None and x.dtype != torch.bfloat16:
+            reason = f"BF16 hidden input is required, got {x.dtype}"
+        if reason is not None:
+            if mode == "on":
+                raise RuntimeError(f"MoE Stage1 AG fusion is unavailable: {reason}")
+            if (
+                get_dp_group().rank_in_group == 0
+                and reason not in _DP_STAGE1_AG_FALLBACK_REASONS
+            ):
+                logger.info("MoE Stage1 AG fusion fallback: %s", reason)
+                _DP_STAGE1_AG_FALLBACK_REASONS.add(reason)
+            return False
+        min_global_tokens = get_current_atom_config().moe_stage1_ag_min_tokens
+        dp_world = get_dp_group().world_size
+        logical_global_tokens = sum(sizes) if sizes else x.shape[0] * dp_world
+        if logical_global_tokens < min_global_tokens:
+            if mode == "on":
+                raise RuntimeError(
+                    "MoE Stage1 AG fusion is below its token threshold: "
+                    f"global_tokens={logical_global_tokens}, "
+                    f"minimum={min_global_tokens}"
+                )
+            threshold_reason = (
+                f"global tokens {logical_global_tokens} below "
+                f"threshold {min_global_tokens}"
+            )
+            if (
+                get_dp_group().rank_in_group == 0
+                and threshold_reason not in _DP_STAGE1_AG_FALLBACK_REASONS
+            ):
+                logger.info(
+                    "MoE Stage1 AG fusion fallback: %s", threshold_reason
+                )
+                _DP_STAGE1_AG_FALLBACK_REASONS.add(threshold_reason)
+            return False
+        from aiter.ops.flydsl.moe_stage1_ag import (
+            TpStage1AgConfig,
+            get_tp_stage1_ag_backend,
+        )
+
+        config = TpStage1AgConfig(
+            hidden=layer.hidden_size,
+            experts=layer.local_num_experts,
+            topk=layer.top_k,
+            min_global_tokens=min_global_tokens,
+        )
+        backend = get_tp_stage1_ag_backend(get_dp_group(), config)
+        return backend.supports(x.shape[0], sizes)
+
+    def apply_dp_stage1_ag_fusion(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        *,
+        sizes: list[int] | None,
+        top_k: int,
+        renormalize: bool,
+        use_grouped_topk: bool,
+        topk_group: int | None,
+        num_expert_group: int | None,
+        global_num_experts: int,
+        custom_routing_function: Callable | None,
+        scoring_func: str,
+        e_score_correction_bias: torch.Tensor | None,
+        fused_shared_experts_scoring_func: str | None,
+        activation: ActivationType,
+    ) -> torch.Tensor:
+        topk_weights, topk_ids = self.select_experts_with_record(
+            layer=layer,
+            hidden_states=x,
+            router_logits=router_logits,
+            use_grouped_topk=use_grouped_topk,
+            top_k=top_k,
+            renormalize=renormalize,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            global_num_experts=global_num_experts,
+            custom_routing_function=custom_routing_function,
+            scoring_func=scoring_func,
+            e_score_correction_bias=e_score_correction_bias,
+            fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
+        )
+        from aiter.ops.flydsl.moe_stage1_ag import (
+            TpStage1AgConfig,
+            get_tp_stage1_ag_backend,
+        )
+
+        config = TpStage1AgConfig(
+            hidden=layer.hidden_size,
+            experts=layer.local_num_experts,
+            topk=layer.top_k,
+            min_global_tokens=get_current_atom_config().moe_stage1_ag_min_tokens,
+        )
+        backend = get_tp_stage1_ag_backend(get_dp_group(), config)
+        return backend.apply(
+            x,
+            topk_weights,
+            topk_ids,
+            layer.w13_weight,
+            layer.w2_weight,
+            sizes=sizes,
+            activation=activation,
+            quant_type=self.quant_type,
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            hidden_pad=self.hidden_pad,
+            intermediate_pad=self.intermediate_pad,
+            swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
+            gate_mode=GateMode.INTERLEAVE.value,
+            beta=getattr(layer, "activation_situ_beta", None),
+            linear_beta=getattr(layer, "activation_situ_linear_beta", None),
         )
 
     @mark_trace
@@ -3788,60 +3967,104 @@ class FusedMoE(torch.nn.Module):
             and not self.moe_parallel_config.use_all2all_kernels
             and get_current_atom_config().enable_dp_attention
         )
+        fusion_used = False
+        _tbo = False
         if use_dp_gather_scatter:
             ctx = get_forward_context()
             dp_group = get_dp_group()
             dp_eager_mode = not ctx.context.dp_uniform_decode
+            if dp_eager_mode:
+                sizes = ctx.dp_metadata.get_sizes_across_dp()
 
-            from atom.utils.tbo.ubatching import tbo_active
-
-            _tbo = tbo_active()
-            if _tbo:
-                from atom.utils.tbo.ubatching import (
-                    tbo_switch_to_compute_sync,
-                    tbo_yield_and_switch_from_compute_to_comm,
+            can_fuse = getattr(
+                self.quant_method, "can_use_dp_stage1_ag_fusion", None
+            )
+            fusion_used = can_fuse is not None and can_fuse(
+                self,
+                hidden_states,
+                sizes=sizes,
+                custom_routing_function=self.custom_routing_function,
+                activation=self.activation,
+            )
+            if fusion_used:
+                original_hidden_size = hidden_states.shape[0]
+                final_hidden_states = (
+                    self.quant_method.apply_dp_stage1_ag_fusion(
+                        layer=self,
+                        x=hidden_states,
+                        router_logits=router_logits,
+                        sizes=sizes,
+                        top_k=self.top_k,
+                        renormalize=self.renormalize,
+                        use_grouped_topk=self.use_grouped_topk,
+                        global_num_experts=self.global_num_experts,
+                        topk_group=self.topk_group,
+                        num_expert_group=self.num_expert_group,
+                        custom_routing_function=self.custom_routing_function,
+                        scoring_func=self.scoring_func,
+                        e_score_correction_bias=self.e_score_correction_bias,
+                        fused_shared_experts_scoring_func=(
+                            self.shared_expert_scoring_func
+                        ),
+                        activation=self.activation,
+                    )
                 )
 
-                tbo_yield_and_switch_from_compute_to_comm()
+            if not fusion_used:
+                from atom.utils.tbo.ubatching import tbo_active
 
-            (
-                hidden_states,
-                router_logits,
-                original_hidden_size,
-                sizes,
-            ) = dp_gather_hidden_and_router(
-                hidden_states, router_logits, dp_eager_mode, ctx, dp_group
-            )
+                _tbo = tbo_active()
+                if _tbo:
+                    from atom.utils.tbo.ubatching import (
+                        tbo_switch_to_compute_sync,
+                        tbo_yield_and_switch_from_compute_to_comm,
+                    )
 
-            if _tbo:
-                tbo_switch_to_compute_sync()
+                    tbo_yield_and_switch_from_compute_to_comm()
+
+                (
+                    hidden_states,
+                    router_logits,
+                    original_hidden_size,
+                    sizes,
+                ) = dp_gather_hidden_and_router(
+                    hidden_states, router_logits, dp_eager_mode, ctx, dp_group
+                )
+
+                if _tbo:
+                    tbo_switch_to_compute_sync()
 
         # Matrix multiply.
-        final_hidden_states = self.quant_method.apply(
-            layer=self,
-            x=hidden_states,
-            router_logits=router_logits,
-            top_k=self.top_k,
-            renormalize=self.renormalize,
-            use_grouped_topk=self.use_grouped_topk,
-            global_num_experts=self.global_num_experts,
-            expert_map=self.expert_map,
-            topk_group=self.topk_group,
-            num_expert_group=self.num_expert_group,
-            custom_routing_function=self.custom_routing_function,
-            scoring_func=self.scoring_func,
-            e_score_correction_bias=self.e_score_correction_bias,
-            fused_shared_experts_scoring_func=self.shared_expert_scoring_func,
-            activation=self.activation,
-            apply_router_weight_on_input=self.apply_router_weight_on_input,
-            prefix=f"{self.prefix}.fused_moe",
-        )
+        if not fusion_used:
+            final_hidden_states = self.quant_method.apply(
+                layer=self,
+                x=hidden_states,
+                router_logits=router_logits,
+                top_k=self.top_k,
+                renormalize=self.renormalize,
+                use_grouped_topk=self.use_grouped_topk,
+                global_num_experts=self.global_num_experts,
+                expert_map=self.expert_map,
+                topk_group=self.topk_group,
+                num_expert_group=self.num_expert_group,
+                custom_routing_function=self.custom_routing_function,
+                scoring_func=self.scoring_func,
+                e_score_correction_bias=self.e_score_correction_bias,
+                fused_shared_experts_scoring_func=self.shared_expert_scoring_func,
+                activation=self.activation,
+                apply_router_weight_on_input=self.apply_router_weight_on_input,
+                prefix=f"{self.prefix}.fused_moe",
+            )
 
         # Use reduce_scatter when DP > 1 but not using mori all2all kernels
         if use_dp_gather_scatter:
             if _tbo:
                 tbo_yield_and_switch_from_compute_to_comm()
-            if dp_eager_mode:
+            if fusion_used:
+                final_hidden_states = reduce_scatter_with_unpadding(
+                    final_hidden_states, original_hidden_size
+                )
+            elif dp_eager_mode:
                 final_hidden_states = reduce_scatterv(
                     final_hidden_states, sizes, dp_group
                 )
