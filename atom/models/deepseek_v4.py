@@ -73,6 +73,11 @@ from atom.model_loader.loader import WeightsMapper
 # code as opaque; Indexer.forward_batched dispatches via the latter to hide
 # its dynamic-shape internals from Dynamo / fake-tensor mode.
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
+from atom.model_ops.attentions.deepseek_v4_attn import (
+    V4AttnFfn,
+    v4_attn_outputs,
+    v4_attn_runner,
+)
 from atom.model_ops.communication_op import (
     tensor_model_parallel_all_reduce,
 )
@@ -112,11 +117,6 @@ from atom.model_ops.v4_kernels import (
     update_compressor_states,
 )
 from atom.utils import envs, mark_spliting_op
-from atom.utils.attn_ffn_piecewise import (
-    BufferShape,
-    DecodeAttnFfnPiecewise,
-)
-from atom.utils.cuda_graph import CudagraphCaptureRunner, StableOutputs
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import AttnState, get_forward_context
@@ -169,88 +169,6 @@ def _v4_attention_fake(
     layer_name: str,
 ) -> torch.Tensor:
     return torch.empty_like(x)
-
-
-# AF_PIECEWISE: attn-core capture/replay (keyed layer, bucket_bs, q_eff, nt_pad).
-# Owns its isolated graph pool + per-key graph cache + output buffers.
-_v4_attn_runner = CudagraphCaptureRunner()
-# The fixed addresses the dense piece downstream of the attn core reads. Needed
-# under PIECEWISE whether or not the core itself is captured, so it is separate
-# from the graph cache above.
-_v4_attn_outputs = StableOutputs()
-
-
-class V4AttnFfn(DecodeAttnFfnPiecewise):
-    """V4's captured attention core. Owned by DeepseekV4Attention, not inherited
-    by it -- the layer holds one of these and forwards to it."""
-
-    # Inputs come from `core` below. `positions` is copied per step rather than
-    # captured on: including it costs ~2pts of accuracy (padding-tail regression).
-    zero_copy_exclude = ("positions",)
-
-    def describe_staging_buffers(self) -> dict:
-        """Measure the buffers by running V4's own projection chain once on a
-        dummy input -- shapes and dtypes vary with the quant config, so they
-        cannot be declared. The base turns the result into the pool; only the
-        chain is V4's business. `x` is absent on purpose: it is the preceding
-        graph piece's output, already at a fixed address in the cudagraph pool."""
-        layer = self.layer
-        n = self.max_tokens
-        device = self.device
-        dummy_x = torch.empty(n, layer.dim, dtype=dtypes.bf16, device=device)
-        idx_q_quant = idx_weights = idx_q_scale = None
-
-        qkv_a = layer.wqkv_a(dummy_x)
-        q_lora, kv_pre = torch.split(qkv_a, [layer.q_lora_rank, layer.head_dim], dim=-1)
-        qr, qr_scale = layer.q_norm(q_lora)
-        if layer.indexer is not None and not layer.skip_topk:
-            dummy_pos = torch.zeros(n, dtype=torch.int64, device=device)
-            idx_q_quant, idx_weights, idx_q_scale = layer.indexer.forward_pre(
-                dummy_x, qr, dummy_pos, qr_scale
-            )
-        return {
-            # The WHOLE merged wqkv_a output, so that on the inplace path kv_pre
-            # is a stable view into it rather than a buffer of its own.
-            "qkv_a": qkv_a,
-            # Fallback path only, and contiguous where the sample is a view.
-            "kv_pre": BufferShape(kv_pre.shape[-1], kv_pre.dtype),
-            "q": BufferShape(layer.n_local_heads * layer.head_dim, dtypes.bf16),
-            "qr": qr,
-            "qr_scale": qr_scale,
-            "idx_q_quant": idx_q_quant,
-            "idx_weights": idx_weights,
-            "idx_q_scale": idx_q_scale,
-        }
-
-    def alloc(self) -> None:
-        super().alloc()
-        # Whether a GEMM can write its destination directly is the Linear's own
-        # answer (`supports_out`); having somewhere to write it is ours. Cached as
-        # plain bools ON THE LAYER because the traced _attn_pre reads them, and
-        # Dynamo folds a bool attribute more predictably than a hop through here.
-        layer = self.layer
-        pooled = self.buffers is not None
-        layer._wqkv_a_inplace = pooled and layer.wqkv_a.supports_out()
-        layer._wq_b_inplace = pooled and layer.wq_b.supports_out()
-
-    def core(
-        self,
-        *,
-        x,
-        q,
-        kv_pre,
-        qr,
-        qr_scale,
-        positions,
-        idx_q_quant,
-        idx_weights,
-        idx_q_scale,
-    ):
-        """Keyword-only: these parameter names AND their order are the
-        contract -- the runner expands the staged inputs by them."""
-        return self.layer._attn_core(
-            x, q, kv_pre, qr, qr_scale, positions, idx_q_quant, idx_weights, idx_q_scale
-        )
 
 
 @mark_spliting_op(is_custom=True, gen_fake=_v4_attention_fake, mutates_args=[])
@@ -328,7 +246,7 @@ def v4_core_attention(
         # PIECEWISE: the downstream dense piece was captured reading a fixed
         # address, so the output has to land in the persistent per-(layer, rows)
         # buffer rather than in a recyclable pool tensor.
-        return _v4_attn_outputs.deliver((layer_name, int(out.shape[0])), out)
+        return v4_attn_outputs.deliver((layer_name, int(out.shape[0])), out)
 
     # AF_PIECEWISE: the core gets its own cudagraph. Its inputs are outputs of
     # the preceding graph piece and live in the cudagraph pool. #1884 snapshotted
@@ -2570,8 +2488,8 @@ class DeepseekV4Attention(nn.Module):
         )
         self.attn_ffn = V4AttnFfn(
             self,
-            runner=_v4_attn_runner,
-            outputs=_v4_attn_outputs,
+            runner=v4_attn_runner,
+            outputs=v4_attn_outputs,
             enabled=self.attn_ffn_piecewise,
         )
         if self.attn_ffn_piecewise:
