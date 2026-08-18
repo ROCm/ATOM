@@ -137,6 +137,28 @@ class Sequence:
         # park the request, and what tells the failure path that
         # `num_cached_tokens` is claiming state nobody delivered.
         self.state_load_hash = -1
+        # The LMCache-resident KV prefix, in tokens, as the offload connector's
+        # lookup reported it this admission. Written before `can_allocate` runs
+        # because that is where the two legs of a joint load have to agree on
+        # one boundary, and this is the KV leg's ceiling. 0 = no lookup, or no
+        # connector.
+        self.offload_kv_prefix_tokens = 0
+        # The connector's LMCache chunk size, in tokens, or 0. The KV leg moves
+        # whole chunks, so a joint boundary has to be a multiple of it.
+        self.offload_kv_chunk_tokens = 0
+        # The boundary both legs of a joint load are aimed at, in tokens, or 0.
+        # Chosen by `BlockManager.can_allocate`: the rightmost boundary that is
+        # a state-checkpoint rung, is covered by the LMCache KV prefix, and is
+        # aligned to the connector's chunk size. `num_cached_tokens` stays at
+        # the HBM-resident prefix until both legs report, which is what keeps
+        # the forward honest if either fails.
+        self.state_joint_boundary_tokens = 0
+        # Content hash of that boundary's last block, for the state leg.
+        self.state_joint_boundary_hash = -1
+        # How far the KV leg transfers, in tokens: the LMCache chunk that
+        # *covers* the boundary above, which is at or past it. The request still
+        # only claims the boundary -- see `_claim_after_load`.
+        self.state_joint_kv_tokens = 0
         self.temperature = sampling_params.temperature
         self.top_k = sampling_params.top_k
         self.top_p = sampling_params.top_p

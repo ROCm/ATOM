@@ -171,10 +171,40 @@ class BlockManager:
         from atom.model_engine.state_offload import (
             StateOffloadIndex,
             kv_connector_hosts_state_tier,
+            state_offload_joint_kv,
             state_offload_staging_groups,
         )
 
         staging = state_offload_staging_groups()
+        # Whether a hybrid may aim both legs at a boundary the HBM prefix cache
+        # does not reach. Read once: `_joint_kv_boundary` is on the admission
+        # path, and a flag that could change under it would let one request's
+        # two legs disagree.
+        self._joint_kv_loads = state_offload_joint_kv()
+        # Admissions that found a boundary for both legs, and admissions that
+        # had an LMCache prefix to work with and could not.
+        self.joint_boundaries = 0
+        self.joint_boundaries_declined = 0
+        # Why the rest got none, keyed by the gate that stopped them.
+        self.joint_skips: dict[str, int] = {}
+        # The LMCache chunk size in tokens, read where the config is rather than
+        # off the connector object.
+        self._joint_chunk_tokens = 0
+        if self._joint_kv_loads:
+            try:
+                from atom.kv_transfer.offload import config as offcfg
+
+                self._joint_chunk_tokens = int(
+                    offcfg.build_lmcache_config(
+                        getattr(config, "kv_transfer_config", None)
+                    ).chunk_size
+                )
+            except Exception:
+                logger.warning(
+                    "state offload: could not read the LMCache chunk size; the "
+                    "joint KV load needs it and stays off",
+                    exc_info=True,
+                )
         kv_offload_enabled = kv_connector_hosts_state_tier(
             getattr(config, "kv_transfer_config", None)
         )
@@ -452,6 +482,121 @@ class BlockManager:
                 break
         return boundary
 
+    def _joint_kv_boundary(
+        self,
+        seq: Sequence,
+        hbm_boundary: int,
+        block_hashes: list[int],
+    ) -> int:
+        """Boundary above the HBM hit that BOTH legs can reach, 0 if none.
+
+        `can_allocate` walks the HBM prefix cache and nothing else, so a prefix
+        whose blocks were evicted stops the hit at the first miss even when
+        LMCache still holds every one of them. That is what this looks past: the
+        KV leg fetches `[hbm, B)` out of LMCache while the state leg fetches the
+        checkpoint at B out of the tier, and the two land on one boundary or
+        neither runs.
+
+        The state has to come from the tier rather than HBM, and that is the
+        ordinary case rather than a lucky one: a checkpoint whose KV blocks left
+        HBM is orphaned, and `StateSlotPool.unindex` spills exactly those to the
+        tier before dropping them. The state follows its KV down.
+
+        `P <= L` is what makes the pair safe, and the two grids do not line up:
+        a state rung is a hash-block boundary, the KV leg moves whole LMCache
+        chunks. Rather than demand a boundary on both grids -- which throws away
+        every rung that is not chunk-aligned, and with it the reuse this feature
+        exists for -- the KV leg is aimed at the chunk that *covers* B while the
+        request only ever claims B. Overshooting costs one chunk of transfer
+        into blocks the forward is about to rewrite; undershooting would be
+        silent wrong output, so the asymmetry is deliberate.
+
+        A bounded number of tries: each is a fixpoint scan over the whole chain,
+        and a rung the tier cannot serve says nothing about how far down the next
+        one is. Giving up leaves this admission with today's HBM-only boundary.
+        """
+        seq.state_joint_boundary_tokens = 0
+        seq.state_joint_boundary_hash = -1
+        seq.state_joint_kv_tokens = 0
+        if not self._joint_kv_loads or self.state_offload is None:
+            return self._no_joint("off")
+        # PAGE checkpoints live in the KV pool, so their state leg has no tier
+        # to be served from and no separate boundary to agree on.
+        if not seq.has_per_req_cache or self.paged_state_checkpoints is not None:
+            return self._no_joint("not_hybrid")
+        hbs = self._hash_block_size()
+        # From the connector's config, not from the connector object: the
+        # scheduler holds whatever `get_kvconnector` returned, and one that does
+        # not carry `chunk_size` would zero this and take the whole feature out
+        # silently -- which is exactly what a first run spent proving.
+        chunk = self._joint_chunk_tokens or int(
+            getattr(seq, "offload_kv_chunk_tokens", 0) or 0
+        )
+        lmc_tokens = int(getattr(seq, "offload_kv_prefix_tokens", 0) or 0)
+        if chunk <= 0:
+            return self._no_joint("no_chunk_size")
+        if lmc_tokens <= hbm_boundary * hbs:
+            return self._no_joint("lmcache_within_hbm")
+        # The KV leg starts at the HBM prefix and moves whole chunks, and the
+        # blocks below it are shared cache blocks another request may be
+        # reading, so an unaligned start cannot be rounded down. Declined here,
+        # before the state leg is aimed anywhere.
+        if (hbm_boundary * hbs) % chunk != 0:
+            return self._no_joint("hbm_off_chunk_grid")
+        cap = min(lmc_tokens // hbs, self._n_hash_blocks(seq) - 1)
+        if cap <= hbm_boundary:
+            return self._no_joint("no_room_above_hbm")
+        chain = self._chain_to(seq, block_hashes, cap)
+        candidate = cap
+        for _ in range(4):
+            candidate = self._gated_hit(seq, candidate, chain)
+            if candidate <= hbm_boundary:
+                return 0
+            tokens = candidate * hbs
+            h = chain[candidate - 1]
+            # The chunk that covers B has to be one LMCache actually holds.
+            kv_tokens = -(-tokens // chunk) * chunk
+            if kv_tokens <= lmc_tokens and self._tier_can_serve(h):
+                seq.state_joint_boundary_tokens = tokens
+                seq.state_joint_boundary_hash = h
+                seq.state_joint_kv_tokens = kv_tokens
+                self.joint_boundaries += 1
+                return candidate
+            candidate -= 1
+        return self._no_joint("no_reachable_checkpoint")
+
+    def _no_joint(self, reason: str) -> int:
+        """Record why this admission got no joint boundary, and return 0.
+
+        Every reason is counted, including the ones that mean "this build is not
+        even trying", because a silent zero is indistinguishable from a feature
+        that ran and found nothing -- and one whole benchmark hour went to
+        exactly that confusion.
+        """
+        self.joint_skips[reason] = self.joint_skips.get(reason, 0) + 1
+        if reason == "no_reachable_checkpoint":
+            self.joint_boundaries_declined += 1
+        return 0
+
+    def _chain_to(
+        self, seq: Sequence, block_hashes: list[int], blocks: int
+    ) -> list[int]:
+        """`block_hashes` continued to `blocks` entries, hashes only.
+
+        The chained hash of a block is a function of the prompt alone, so it is
+        computable past the point the HBM cache stops -- which is the whole
+        reason a boundary LMCache can serve is addressable at all. Resumes from
+        the last APPENDED hash: on a miss the caller's loop variable holds the
+        hash of the block that failed to match, and that one is not in the
+        chain.
+        """
+        chain = list(block_hashes)
+        h = chain[-1] if chain else -1
+        for i in range(len(chain), blocks):
+            h = self.compute_hash(self._hash_block_tokens(seq, i), h)
+            chain.append(h)
+        return chain
+
     def can_allocate(self, seq: Sequence) -> int:
         """Return number of cache-hit blocks (>=0) if seq fits, else -1.
 
@@ -500,6 +645,11 @@ class BlockManager:
         # `_gated_hit` settles the two gates jointly; neither can be applied to
         # the other's answer.
         num_cached_blocks = self._gated_hit(seq, compressed_hit, block_hashes)
+        # A boundary LMCache and the tier can jointly reach, above this hit.
+        # Recorded on the seq rather than returned: what `allocate` claims from
+        # HBM is still `num_cached_blocks`, and the joint boundary only decides
+        # where the two loads are aimed.
+        self._joint_kv_boundary(seq, num_cached_blocks, block_hashes)
         # Instrumentation: the pre-gate hit, so CacheStats can separate reuse
         # the gates declined (compressed_hit - num_cached_blocks) from reuse
         # lost to compressed eviction (everything above compressed_hit).
@@ -558,7 +708,14 @@ class BlockManager:
         # (the state pool's free list, size = `max_num_seqs`) is the sole
         # admission bound for state cache.
         if seq.has_per_req_cache and self.paged_state_checkpoints is None:
-            state_holds = self._attach_state_group(seq, hit_hash)
+            # A joint load aims the state leg at its own boundary, which is
+            # above the HBM hit by construction. `num_cached_tokens` stays at
+            # the HBM prefix until the KV leg lands, so the forward covers
+            # `[hbm, num_prompt)` if anything goes wrong from here.
+            joint_hash = seq.state_joint_boundary_hash
+            state_holds = self._attach_state_group(
+                seq, joint_hash if joint_hash != -1 else hit_hash
+            )
         if not state_holds:
             # The state behind the boundary could not be produced, so the
             # boundary is not this request's history. Disown it — the blocks
@@ -567,6 +724,8 @@ class BlockManager:
             # boundary instead is silent wrong output: `has_initial_state`
             # (`gdn_attn.py`) is `num_cached_tokens > 0`.
             seq.num_cached_tokens = 0
+            seq.state_joint_boundary_tokens = 0
+            seq.state_joint_boundary_hash = -1
 
     def _attach_state_group(self, seq: Sequence, hit_hash: int) -> bool:
         """Give `seq` a state group, resuming from a checkpoint when one exists.
@@ -1035,6 +1194,8 @@ class BlockManager:
         return {
             "demands_recorded": self.demands_recorded,
             "chunks_cut_for_demand": self.chunks_cut_for_demand,
+            "joint_boundaries": self.joint_boundaries,
+            "joint_boundaries_declined": self.joint_boundaries_declined,
         } | self.state_checkpoint_fates()
 
     def checkpointers_at(

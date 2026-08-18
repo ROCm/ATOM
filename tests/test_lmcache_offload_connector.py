@@ -31,6 +31,7 @@ from atom.kv_transfer.offload.metadata import (
     LMCacheOffloadMetadata,
     LMCacheReqMeta,
 )
+from atom.kv_transfer.offload.state_tier import _JointPark
 from atom.model_engine.scheduler import Scheduler
 
 
@@ -2189,6 +2190,67 @@ def test_per_req_cache_kv_is_not_saved_while_its_load_is_refused():
     assert str(stateless.id) in sched._save_tracker
 
 
+def test_a_joint_boundary_clamps_the_kv_leg_instead_of_refusing_it(caplog):
+    """With a boundary `can_allocate` picked for both legs, the KV leg runs --
+    clamped to it. Clamped, not taken at face value: the lookup reaches further
+    than the state does, and the difference is a prefix the linear layers would
+    never walk."""
+    sched = _scheduler()
+    sched._min_load_tokens = 8
+    sched._lookup_client = _LookupClient(hit=12)
+    seq = _hybrid_seq(780, 16, [1, 2, 3, 4])
+
+    need, should_park = sched.get_num_new_matched_tokens(seq)
+    assert (need, should_park) == (12, True)
+
+    seq.num_cached_tokens = 4
+    seq.state_joint_boundary_tokens = 8
+    sched.update_state_after_alloc(seq)
+
+    with caplog.at_level(logging.DEBUG, logger="atom"):
+        assert sched.should_park_for_load_after_alloc(seq) is True
+
+    ls = sched._load_specs[str(seq.id)]
+    assert ls.lmcache_cached_tokens == 8, "clamped down from the lookup's 12"
+    assert seq.offload_loaded_tokens == 8
+
+
+def test_the_claim_stops_at_the_state_boundary_not_the_transfer_end():
+    """The KV leg is aimed at the chunk covering the boundary, so it can end
+    past it. Claiming that rounded-up figure would have the forward skip tokens
+    the recurrent state does not cover."""
+    sched = _scheduler()
+    sched._min_load_tokens = 4
+    sched._lookup_client = _LookupClient(hit=16)
+    seq = _hybrid_seq(782, 20, [1, 2, 3, 4, 5])
+    sched.get_num_new_matched_tokens(seq)
+
+    seq.num_cached_tokens = 4
+    seq.state_joint_boundary_tokens = 10  # off the 4-token chunk grid
+    seq.state_joint_kv_tokens = 12  # the chunk that covers it
+
+    assert sched.should_park_for_load_after_alloc(seq) is True
+
+    assert sched._load_specs[str(seq.id)].lmcache_cached_tokens == 12
+    assert seq.offload_loaded_tokens == 10
+
+
+def test_a_joint_boundary_below_the_hbm_hit_is_still_refused():
+    """`can_allocate` only sets a boundary above the HBM prefix, so a stale one
+    at or below it means the pairing is not there."""
+    sched = _scheduler()
+    sched._min_load_tokens = 8
+    sched._lookup_client = _LookupClient(hit=12)
+    seq = _hybrid_seq(781, 16, [1, 2, 3, 4])
+    sched.get_num_new_matched_tokens(seq)
+
+    seq.num_cached_tokens = 8
+    seq.state_joint_boundary_tokens = 8
+    sched.update_state_after_alloc(seq)
+
+    assert sched.should_park_for_load_after_alloc(seq) is False
+
+
 def test_per_req_cache_sequence_is_refused_the_offload_load(caplog):
     sched = _scheduler()
     sched._min_load_tokens = 8
@@ -2382,6 +2444,10 @@ class _FakeTier:
     def get_finished(self):
         return set(self._done), set(self._failed)
 
+    def deliver(self, done=(), failed=()):
+        """What the tier would report on the next poll."""
+        self._done, self._failed = set(done), set(failed)
+
     def take_spill_reports(self):
         return set(), set(), set()
 
@@ -2396,6 +2462,8 @@ def _load_worker(tier=None):
     conn._done_save = set()
     conn._engine = SimpleNamespace(lookup_unpin=lambda _lookup_id: None)
     conn._state_tier = tier
+    # Inert until armed, and `get_finished` reports through it either way.
+    conn._joint_park = _JointPark()
     return conn
 
 
@@ -2432,7 +2500,7 @@ def test_a_worker_with_no_tier_fails_the_load_rather_than_dropping_it(caplog):
 def test_state_load_reports_merge_into_the_kv_loading_channels():
     """Sharing the channels is what gives the state leg the aggregator's
     per-request quorum for free. Nothing downstream distinguishes the two legs
-    and nothing needs to: one request never has both."""
+    and nothing needs to, as long as a request with both is held elsewhere."""
     conn = _load_worker(_FakeTier(done={7}, failed={8}))
     conn._done_load.add(100)
     conn._failed_load.add(200)
@@ -2441,3 +2509,38 @@ def test_state_load_reports_merge_into_the_kv_loading_channels():
 
     assert out.finished_loading == {7, 100}
     assert out.failed_loading == {8, 200}
+
+
+def test_a_joint_load_is_reported_only_once_both_legs_land():
+    """The two legs report through one set, so an id in both would otherwise
+    collapse into a single wake -- and the engine would resume the suffix
+    prefill while the other transfer is still writing."""
+    tier = _FakeTier(done=set())
+    conn = _load_worker(tier)
+    conn._joint_park.arm(5, needs_kv=True, needs_state=True)
+
+    # KV leg first: nothing may leave yet.
+    conn._done_load.add(5)
+    out = conn.get_finished()
+    assert out.finished_loading == set()
+    assert out.failed_loading == set()
+
+    # State leg lands on a later step; now the request wakes, exactly once.
+    tier.deliver(done={5})
+    out = conn.get_finished()
+    assert out.finished_loading == {5}
+    assert out.failed_loading == set()
+
+
+def test_either_leg_failing_fails_the_joint_pair():
+    """Half a load leaves the state claiming a prefix whose KV never arrived,
+    and `failed_loading` already means "recompute over the blocks you hold"."""
+    tier = _FakeTier(done={6})
+    conn = _load_worker(tier)
+    conn._joint_park.arm(6, needs_kv=True, needs_state=True)
+    conn._failed_load.add(6)
+
+    out = conn.get_finished()
+
+    assert out.finished_loading == set()
+    assert out.failed_loading == {6}

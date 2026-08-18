@@ -375,6 +375,11 @@ class LLMEngine:
                 "checkpoints_evicted",
                 "demands_recorded",
                 "chunks_cut_for_demand",
+                # Whether the joint state+KV load found a boundary to work
+                # with. Summed like the rest: a boundary is per admission and
+                # every rank admits the same request.
+                "joint_boundaries",
+                "joint_boundaries_declined",
             )
         }
         full = totals["full_tokens"]
