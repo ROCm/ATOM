@@ -1730,54 +1730,6 @@ class TestPostprocess:
         assert len(finished) == 1
         assert finished[0].leave_reason == "max_tokens"
 
-    def test_mtp_max_tokens_trims_accepted_block_overshoot(self, seq_factory):
-        spec_config = SimpleNamespace(
-            num_speculative_tokens=3,
-            use_dspark=lambda: False,
-        )
-        scheduler = Scheduler(
-            MockConfig(
-                speculative_config=spec_config,
-                num_kvcache_blocks=100,
-                max_model_len=128,
-            )
-        )
-        seq = seq_factory(
-            [1, 2, 3, 4],
-            sampling_params=SamplingParams(max_tokens=4, ignore_eos=True),
-        )
-        scheduler.add(seq)
-        scheduler.schedule()
-
-        # Three committed tokens followed by seven speculative/deferred
-        # placeholders.  This verify accepts [20, 21, 22], which would commit
-        # six tokens total and overshoot max_tokens=4 by two.
-        for token_id in [10, 11, 12] + [scheduler.eos_token_id] * 7:
-            seq.append_token(token_id)
-        seq.prefix_hashes_published = True
-        scheduler.block_manager.hash_decode_blocks = mock.Mock()
-
-        stream_output_queue = mock.Mock()
-        finished = scheduler.postprocess(
-            [seq],
-            ScheduledBatchOutput(
-                req_ids=[seq.id],
-                token_ids=[(20, 21, 22)],
-                num_rejected=np.array([1], dtype=np.int32),
-                num_bonus=np.array([2], dtype=np.int32),
-                draft_token_ids=np.array([[30, 31, 32]], dtype=np.int32),
-                is_deferred_out=True,
-            ),
-            stream_output_queue=stream_output_queue,
-        )
-
-        assert finished == [seq]
-        assert seq.leave_reason == "max_tokens"
-        assert seq.num_completion_tokens == 4
-        assert seq.completion_token_ids == [10, 11, 12, 20]
-        stream_outputs = stream_output_queue.put_nowait.call_args.args[0]
-        assert stream_outputs[0][1].output_tokens == [20]
-
     def test_stop_token_ids(self, seq_factory):
         sched = Scheduler(MockConfig(stop_token_ids=[99]))
         seq = seq_factory([1, 2, 3, 4])

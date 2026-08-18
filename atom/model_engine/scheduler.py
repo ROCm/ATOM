@@ -532,19 +532,6 @@ class ScheduledBatch:
                 # Clear after first use to avoid re-sending on decode steps
                 seq.multimodal_data = None
         self.external_request_ids = [seq.external_request_id for seq in seqs.values()]
-        # A pure final-prefill batch of one-token requests can publish its
-        # current sampled ids directly instead of constructing a speculative
-        # generation that no request can consume.  ModelRunner applies the
-        # remaining safety gates (no older deferred generation, no mixed or
-        # middle-chunk prefill).
-        self.all_max_tokens_one = bool(seqs) and all(
-            seq.max_tokens == 1 for seq in seqs.values()
-        )
-        # Set by Scheduler after it has the BlockManager needed to ask the
-        # existing checkpoint ladder. A PAGE-backed state checkpoint becomes
-        # real only when a following batch executes its maintenance store op;
-        # a terminal fast path must not free the source SLOT before that pass.
-        self.requires_followup_state_checkpoint = False
 
         # logger.info(f"{[el for el in scheduled_spec_decode_tokens.keys()]=}")
         # logger.info(f"{self.num_scheduled_tokens=}")
@@ -588,8 +575,6 @@ class ScheduledBatchOutput:
         is_prev_prefill=False,
         logprobs=None,
         dspark_ell: np.ndarray | None = None,
-        draft_proposal_pending: bool = False,
-        is_current_terminal_output: bool = False,
     ):
         self.req_ids = req_ids
         self.token_ids = token_ids
@@ -604,19 +589,6 @@ class ScheduledBatchOutput:
         # (main-process) scheduler so the NEXT step can size each request's
         # verification to ell_r+1. None when DSpark scheduling is off.
         self.dspark_ell = dspark_ell
-        # Plain-MTP deferred-output mode can publish target/verify results
-        # before running the draft extension.  When true, EngineCore must
-        # enqueue exactly one ``finish_draft_proposal`` or
-        # ``cancel_draft_proposal`` RPC before it schedules another forward.
-        # The worker RPC queue is FIFO, so an asynchronously enqueued finish is
-        # still guaranteed to complete before the next target forward uses the
-        # newly proposed draft tokens.
-        self.draft_proposal_pending = draft_proposal_pending
-        # True only for the max_tokens=1 final-prefill fast path.  These token
-        # ids were sampled by the current forward (not the previous deferred
-        # generation), so Scheduler must append them directly and must not
-        # create/patch speculative placeholders.
-        self.is_current_terminal_output = is_current_terminal_output
         # O(1) lookup: req_id -> index (lazy-built on first access)
         self._req_id_to_idx: dict[int, int] | None = None
 
@@ -1526,13 +1498,6 @@ class Scheduler:
                 next_token_ids=next_token_ids,
                 state_maintenance_ops=self.block_manager.take_state_maintenance_ops(),
             )
-            prefill_batch.requires_followup_state_checkpoint = any(
-                self.block_manager.checkpointers_at(
-                    seq,
-                    num_cached_tokens_list[i] + int(num_scheduled_tokens[i]),
-                )
-                for i, seq in enumerate(scheduled_seqs.values())
-            )
             self._consume_state_forks(scheduled_seqs)
 
             if self.advance_on_schedule:
@@ -2289,19 +2254,15 @@ class Scheduler:
         prev_token_ids = fwd_output.token_ids
         draft_token_ids = fwd_output.draft_token_ids
         is_deferred_out = fwd_output.is_deferred_out
-        is_current_terminal_output = fwd_output.is_current_terminal_output
         token_logprobs = fwd_output.logprobs  # Optional[dict[int, float]]
         # update token_ids with the actual sampled token ids
 
         finished_seqs = []
         stream_outputs = []
 
-        pipelined_output = (
-            is_deferred_out or self.use_spec
-        ) and not is_current_terminal_output
-        need_placeholder = pipelined_output
+        need_placeholder = is_deferred_out or self.use_spec
         num_placeholder = self.mtp_k
-        if is_deferred_out and not is_current_terminal_output:
+        if is_deferred_out:
             num_placeholder += 1
 
         for seq in self.running:
@@ -2327,13 +2288,7 @@ class Scheduler:
             # request from at least one intervening model-runner batch, which
             # already discards its deferred partial output. The first output
             # after the request resumes is fresh and must be kept.
-            # Deferred output normally makes the token surfaced by a final
-            # chunk belong to the preceding middle chunk, so it must be
-            # dropped.  The max_tokens=1 terminal fast path is explicitly
-            # synchronous: its token was sampled by *this* final chunk and is
-            # therefore the first real completion token, even when the request
-            # was partial before this postprocess call.
-            if seq.id in prev_partial_ids and not is_current_terminal_output:
+            if seq.id in prev_partial_ids:
                 continue
             # Register prefix-cache hashes for blocks the prefill step just
             # finalized. Deferred from BlockManager.allocate() so a hash is
@@ -2370,7 +2325,7 @@ class Scheduler:
             if token_logprobs is not None and seq.return_logprobs:
                 token_logprob = token_logprobs.get(seq.id)
 
-            if pipelined_output:
+            if is_deferred_out or self.use_spec:
                 # int() casts strip the np.int32 wrapper coming out of
                 # fwd_output's np.ndarray indexing. Without these, the values
                 # propagate into seq.num_rejected / seq.num_bonus_tokens, then
@@ -2434,7 +2389,7 @@ class Scheduler:
                 new_tokens = [injected_t0] + list(new_tokens)
                 seq._injected_t0 = None
 
-            if self.mtp_k > 0 and not is_current_terminal_output:
+            if self.mtp_k > 0:
                 # idx already resolved above via get_idx
                 seq.spec_token_ids = draft_token_ids[idx]
 
@@ -2451,9 +2406,7 @@ class Scheduler:
             if seq.num_completion_tokens >= 1 and seq.first_token_time == 0.0:
                 seq.first_token_time = time.time()
 
-            num_tokens = seq.num_tokens
-            if pipelined_output:
-                num_tokens -= self.mtp_k + num_rejected
+            num_tokens = seq.num_tokens - self.mtp_k - num_rejected
             leave_reason = None
             # Client disconnected -> finish now via the normal stop path (frees
             # KV blocks, emits a finished RequestOutput). A natural stop below
@@ -2510,19 +2463,6 @@ class Scheduler:
                     # `output tokens=95` for max_tokens=100, mtp_k=3). Non-MTP
                     # path: mtp_k = num_rejected = 0 → behavior unchanged.
                     leave_reason = "max_tokens"
-                    # A speculative verify can commit up to mtp_k+1 tokens in
-                    # one step.  Detecting the limit after that commit is
-                    # correct for scheduling, but the last accepted block may
-                    # extend past the caller's exact max_tokens budget.  Trim
-                    # that tail just like the EOS/stop paths below trim tokens
-                    # after their first stop position.
-                    overflow = (
-                        num_tokens - seq.num_prompt_tokens - seq.max_tokens
-                    )
-                    if overflow > 0:
-                        # overflow is bounded by this step's accepted tokens:
-                        # the previous step had not reached max_tokens yet.
-                        stop_at_idx = max(-1, num_new_token - overflow - 1)
 
             # Drop accepted-draft tokens past the stop position (MTP only —
             # for non-spec the sampler emits exactly 1 token so this is a
@@ -2554,8 +2494,7 @@ class Scheduler:
             # slot is written by the next one.
             self.block_manager.hash_decode_blocks(
                 seq,
-                num_tokens
-                - (0 if is_deferred_out and not is_current_terminal_output else 1),
+                num_tokens - (0 if is_deferred_out else 1),
                 next_forward_tokens=self._checkpoint_room(
                     seq, leave_reason is not None
                 ),
