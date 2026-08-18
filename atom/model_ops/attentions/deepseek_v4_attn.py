@@ -3932,7 +3932,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         mode = getattr(cfg.compilation_config, "cudagraph_mode", None)
         if mode is None or not mode.is_attn_ffn_piecewise():
             return False
-        return getattr(cfg.parallel_config, "data_parallel_size", 1) > 1
+        return bool(getattr(cfg, "enable_dp_attention", False)) or (
+            getattr(cfg.parallel_config, "data_parallel_size", 1) > 1
+        )
 
     def _stage_dspark_ragged_lens(
         self, name: str, arr, device, pad_to: int | None = None
