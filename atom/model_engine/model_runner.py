@@ -163,6 +163,16 @@ class TokenLocations(NamedTuple):
     new_curr: np.ndarray
 
 
+class PendingDraftProposal(NamedTuple):
+    """GPU inputs retained between target publish and draft extension."""
+
+    batch: ScheduledBatch
+    input_ids: torch.Tensor
+    hidden_states: torch.Tensor
+    next_token_ids: torch.Tensor
+    num_reject_tokens: torch.Tensor
+
+
 class tokenIDProcessor:
 
     def __init__(
@@ -218,13 +228,21 @@ class tokenIDProcessor:
                 else None
             )
             copy_done.record(self.async_copy_stream)
-        cpu_tensor_handle.append((cpu_tensor, copy_done))
+        # Keep the source allocations alive until the copy event completes.
+        # The copy runs on ``async_copy_stream`` while these tensors are
+        # produced on the default stream.  Holding only the CPU destination
+        # and event lets Python drop a short-lived sampled tensor as soon as a
+        # split target step returns; the caching allocator may then recycle
+        # its storage while this D2H is still pending.
+        cpu_tensor_handle.append(
+            (cpu_tensor, copy_done, gpu_tensor, gpu_logprobs)
+        )
         self.logprobs_cpu.append(cpu_logprobs)
 
     def recv_async_output(self, cpu_tensor_handle) -> torch.Tensor:
         if not cpu_tensor_handle:
             return torch.empty(0, dtype=torch.int32, device="cpu")
-        cpu_tensor, event = cpu_tensor_handle.pop(0)
+        cpu_tensor, event, _gpu_tensor, _gpu_logprobs = cpu_tensor_handle.pop(0)
         event.synchronize()
         return cpu_tensor
 
@@ -246,12 +264,12 @@ class tokenIDProcessor:
             cpu_tensor = gpu_tensor.to("cpu", non_blocking=True)
             event = torch.cuda.Event()
             event.record(self.async_copy_stream)
-        self.draft_token_ids_cpu.append((cpu_tensor, event))
+        self.draft_token_ids_cpu.append((cpu_tensor, event, gpu_tensor))
 
     def recv_async_output_draft(self) -> np.ndarray:
         if not self.draft_token_ids_cpu:
             return np.array([], dtype=np.int32)
-        token_ids, event = self.draft_token_ids_cpu.pop(0)
+        token_ids, event, _gpu_tensor = self.draft_token_ids_cpu.pop(0)
         event.synchronize()
         return token_ids.numpy()
 
@@ -276,7 +294,13 @@ class tokenIDProcessor:
             cpu_num_bonus = num_bonus.to("cpu", non_blocking=True)
             copy_done.record(self.async_copy_stream)
         self.pending_mtp_status_copies.append(
-            (cpu_num_rejected, cpu_num_bonus, copy_done)
+            (
+                cpu_num_rejected,
+                cpu_num_bonus,
+                copy_done,
+                num_rejected,
+                num_bonus,
+            )
         )
 
     def recv_mtp_status_async(
@@ -284,14 +308,25 @@ class tokenIDProcessor:
     ) -> tuple[np.ndarray | None, np.ndarray | None]:
         if not self.pending_mtp_status_copies:
             return None, None
-        cpu_num_rejected, cpu_num_bonus, copy_done = self.pending_mtp_status_copies.pop(
-            0
-        )
+        (
+            cpu_num_rejected,
+            cpu_num_bonus,
+            copy_done,
+            _gpu_num_rejected,
+            _gpu_num_bonus,
+        ) = self.pending_mtp_status_copies.pop(0)
         copy_done.synchronize()
         return cpu_num_rejected.numpy(), cpu_num_bonus.numpy()
 
     def clean(self):
-        self.token_ids_cpu: list[torch.Tensor] = []
+        self.token_ids_cpu: list[
+            tuple[
+                torch.Tensor,
+                torch.cuda.Event,
+                torch.Tensor,
+                torch.Tensor | None,
+            ]
+        ] = []
         self.logprobs_cpu: list[torch.Tensor | None] = []
 
         self.prev_batch: ScheduledBatch | None = None
@@ -299,12 +334,21 @@ class tokenIDProcessor:
 
         self.pre_num_decode_token_per_seq = 1
         self.draft_token_ids: torch.Tensor | None = None
-        self.draft_token_ids_cpu: list[torch.Tensor] = []
-        # Queue of (cpu_num_rejected, cpu_num_bonus, copy_done_event) — async
-        # D2H copies fired by send_mtp_status_to_cpu_async, drained by
-        # recv_mtp_status_async after the event syncs.
+        self.draft_token_ids_cpu: list[
+            tuple[torch.Tensor, torch.cuda.Event, torch.Tensor]
+        ] = []
+        # Queue of (cpu_num_rejected, cpu_num_bonus, copy_done_event,
+        # gpu_num_rejected, gpu_num_bonus).  The source tensors keep their GPU
+        # allocations alive until recv_mtp_status_async synchronizes the D2H
+        # event; otherwise the caching allocator may recycle them early.
         self.pending_mtp_status_copies: list[
-            tuple[torch.Tensor, torch.Tensor, torch.cuda.Event]
+            tuple[
+                torch.Tensor,
+                torch.Tensor,
+                torch.cuda.Event,
+                torch.Tensor,
+                torch.Tensor,
+            ]
         ] = []
         self.num_rejected: np.ndarray | None = None
         self.num_bonus: np.ndarray | None = None
@@ -388,6 +432,44 @@ class tokenIDProcessor:
         self.prev_batch = batch
         self.prev_token_ids = sampled_token_ids
         token_id_dict[-1] = 1
+        return token_id_dict, logprobs_map
+
+    def prepare_current_terminal_ids(
+        self,
+        batch: ScheduledBatch,
+        sampled_token_ids: torch.Tensor,
+        sampled_logprobs: torch.Tensor | None = None,
+    ) -> tuple[dict[int, tuple[int, ...]], dict[int, float] | None]:
+        """Synchronously publish the current ids for a terminal prefill.
+
+        This path is deliberately narrower than normal deferred output: it is
+        called only when every request is guaranteed to stop at its first
+        generated token and no older deferred generation exists.  Nothing is
+        enqueued for a next step, so the token/draft/status pipelines remain
+        empty for the next unrelated request.
+        """
+        assert self.is_deferred_out
+        assert self.prev_batch is None
+        assert not self.token_ids_cpu
+        assert not self.logprobs_cpu
+        assert not self.draft_token_ids_cpu
+        assert not self.pending_mtp_status_copies
+
+        token_ids = sampled_token_ids.tolist()
+        if token_ids and isinstance(token_ids[0], list):
+            processed = self._batch_process_token_ids(token_ids)
+        else:
+            processed = [(tid,) for tid in token_ids]
+        token_id_dict = dict(zip(batch.req_ids, processed))
+        token_id_dict[-1] = 1
+
+        logprobs_map = None
+        if sampled_logprobs is not None:
+            logprobs = sampled_logprobs.tolist()
+            logprobs_map = {
+                seq_id: logprob
+                for seq_id, logprob in zip(batch.req_ids, logprobs)
+            }
         return token_id_dict, logprobs_map
 
     def get_token_locations(self, batch: ScheduledBatch) -> TokenLocations:
@@ -583,18 +665,63 @@ class tokenIDProcessor:
         self, batch: ScheduledBatch, draft_token_ids: torch.Tensor
     ) -> np.ndarray:
         if not self.is_deferred_out:
-            ret = draft_token_ids.numpy()
-        else:
-            self.draft_token_ids = draft_token_ids
-            self.pre_num_decode_token_per_seq = self.num_spec_tokens + 1
-            token_ids = self.recv_async_output_draft()
-            self.send_to_cpu_async_draft(draft_token_ids)
-            ret = (
-                token_ids
-                if self.prev_req_ids is not None
-                else np.array([], dtype=np.int32)
-            )
+            return draft_token_ids.numpy()
+
+        ret = self.take_previous_draft_ids()
+        self.store_draft_ids(draft_token_ids)
         return ret
+
+    def take_previous_draft_ids(self) -> np.ndarray:
+        """Return the draft rows consumed by the just-finished target step.
+
+        Deferred output makes both sampled ids and draft ids one generation
+        late.  This dequeue used to happen only *after* the next draft proposal,
+        even though the returned rows belong to the previous proposal.  Keeping
+        the dequeue separate lets the target result be published before the
+        current proposal without changing which request owns each draft row.
+        """
+        assert self.is_deferred_out
+        token_ids = self.recv_async_output_draft()
+        return (
+            token_ids
+            if self.prev_req_ids is not None
+            else np.array([], dtype=np.int32)
+        )
+
+    def store_draft_ids(self, draft_token_ids: torch.Tensor) -> None:
+        """Keep current proposal output for the next target/verify step."""
+        assert self.is_deferred_out
+        self.draft_token_ids = draft_token_ids
+        self.pre_num_decode_token_per_seq = self.num_spec_tokens + 1
+        self.send_to_cpu_async_draft(draft_token_ids)
+
+    def discard_current_deferred_generation(self) -> None:
+        """Drain a terminal batch's never-consumed deferred generation.
+
+        The target step has already enqueued sampled-id and MTP-status D2H
+        copies before the scheduler can discover that every request is done.
+        Synchronize and discard those tiny copies, then reset the one-step
+        pipeline so the next unrelated request starts as a fresh generation.
+        The previous draft copy was already consumed by
+        :meth:`take_previous_draft_ids`; no current draft exists because the
+        proposal is being cancelled.
+        """
+        self.recv_async_output(self.token_ids_cpu)
+        self.recv_logprobs()
+        self.recv_mtp_status_async()
+
+        # A split target step consumes the sole previous-draft entry before it
+        # is published and cancellation never enqueues a replacement.
+        assert not self.draft_token_ids_cpu
+        self.prev_batch = None
+        self.prev_req_ids = None
+        self.prev_token_ids = None
+        self.pre_num_decode_token_per_seq = 1
+        self.draft_token_ids = None
+        self.prev_rejected_num = None
+        self.prev_bonus_num = None
+        self.num_rejected = None
+        self.num_bonus = None
 
 
 class ModelRunner:
@@ -678,6 +805,10 @@ class ModelRunner:
             use_spec,
             self.num_spec_tokens,
         )
+        # Plain MTP may return target/verify output before its draft extension.
+        # At most one proposal can be pending: EngineCore queues its finish or
+        # cancellation before another forward RPC, and worker RPCs are FIFO.
+        self._pending_draft_proposal: PendingDraftProposal | None = None
         self.sampler = Sampler()
         self.arange_np = np.arange(
             max(
@@ -3098,6 +3229,7 @@ class ModelRunner:
         # following for draft
         hidden_states: torch.Tensor,
         needs_independent_noise: bool = False,
+        defer_draft_proposal: bool = False,
     ) -> ScheduledBatchOutput:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
@@ -3162,16 +3294,28 @@ class ModelRunner:
         self.forward_done_event.record()
         # Capture before prepare_sampled_ids(), which advances self.prev_batch to current batch.
         prev_batch = self.tokenID_processor.prev_batch
-        token_id_dict, logprobs_map = self.tokenID_processor.prepare_sampled_ids(
-            batch, sampled_tokens, self.forward_done_event, sampled_logprobs
-        )
+        publish_current_terminal = self._can_publish_current_terminal(batch)
+        if publish_current_terminal:
+            token_id_dict, logprobs_map = (
+                self.tokenID_processor.prepare_current_terminal_ids(
+                    batch, sampled_tokens, sampled_logprobs
+                )
+            )
+        else:
+            token_id_dict, logprobs_map = self.tokenID_processor.prepare_sampled_ids(
+                batch, sampled_tokens, self.forward_done_event, sampled_logprobs
+            )
         # Extract req_ids and token_ids from dict (key -1 is the is_deferred_out flag)
         req_ids_out = [k for k in token_id_dict if k != -1]
         token_ids_out = [token_id_dict[k] for k in req_ids_out]
 
         draft_token_ids: np.ndarray | None = None
+        draft_proposal_pending = False
         if self.tokenID_processor.is_deferred_out:
-            if hasattr(self, "drafter"):
+            if publish_current_terminal:
+                prev_rejected_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
+                prev_bonus_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
+            elif hasattr(self, "drafter"):
                 prev_rejected_num = self.tokenID_processor.prev_rejected_num
                 prev_bonus_num = self.tokenID_processor.prev_bonus_num
                 self.tokenID_processor.send_mtp_status_to_cpu_async(
@@ -3181,15 +3325,34 @@ class ModelRunner:
                     sampled_tokens.view(bs, -1), 1, next_token_locs.view(-1, 1)
                 ).view(bs)
                 self.tokenID_processor.prev_token_ids = next_token_ids
-                draft_token_ids = self.propose_draft_token_ids(
-                    batch,
-                    self.tokenID_processor.input_ids.gpu[
-                        1 : batch.total_tokens_num + 1
-                    ],
-                    hidden_states,
-                    next_token_ids,
-                    num_reject_tokens,
-                )
+                draft_input_ids = self.tokenID_processor.input_ids.gpu[
+                    1 : batch.total_tokens_num + 1
+                ]
+                if defer_draft_proposal:
+                    assert self._pending_draft_proposal is None
+                    # These rows were proposed by the previous generation and
+                    # consumed by the target step that just finished.  Their
+                    # D2H copy is independent of the new proposal, so return it
+                    # now and let EngineCore publish target results first.
+                    draft_token_ids = (
+                        self.tokenID_processor.take_previous_draft_ids()
+                    )
+                    self._pending_draft_proposal = PendingDraftProposal(
+                        batch=batch,
+                        input_ids=draft_input_ids,
+                        hidden_states=hidden_states,
+                        next_token_ids=next_token_ids,
+                        num_reject_tokens=num_reject_tokens,
+                    )
+                    draft_proposal_pending = True
+                else:
+                    draft_token_ids = self.propose_draft_token_ids(
+                        batch,
+                        draft_input_ids,
+                        hidden_states,
+                        next_token_ids,
+                        num_reject_tokens,
+                    )
                 # self.debug(f"{num_bonus_tokens=}")
 
             elif prev_batch is not None:
@@ -3222,6 +3385,8 @@ class ModelRunner:
             num_bonus=prev_bonus_num,
             logprobs=logprobs_map,
             dspark_ell=dspark_ell,
+            draft_proposal_pending=draft_proposal_pending,
+            is_current_terminal_output=publish_current_terminal,
         )
 
     @torch.inference_mode()
@@ -3269,6 +3434,7 @@ class ModelRunner:
                 draft_token_ids=None,
             )
 
+        defer_draft_proposal = self._can_defer_draft_proposal(batch)
         fwd_output = self.postprocess(
             batch,
             logits,
@@ -3278,12 +3444,93 @@ class ModelRunner:
             all_greedy,
             hidden_states,
             needs_independent_noise=needs_independent_noise,
+            defer_draft_proposal=defer_draft_proposal,
         )
 
-        reset_forward_context()
-        if not batch.is_dummy_run:
-            self._record_forward_vars_event()
+        # A split MTP step retains the forward context and GPU tensors until
+        # the FIFO-following finish/cancel RPC.  Synchronous paths keep their
+        # original lifetime.
+        if not fwd_output.draft_proposal_pending:
+            reset_forward_context()
+            if not batch.is_dummy_run:
+                self._record_forward_vars_event()
         return fwd_output
+
+    def _can_defer_draft_proposal(self, batch: ScheduledBatch) -> bool:
+        """Whether this step supports publish-before-draft execution.
+
+        DSpark's confidence scheduler returns ``ell`` from proposal to the host
+        scheduler, so it must remain synchronous.  Pipeline parallelism does
+        not use deferred output, and RapidServe overrides ``forward`` with its
+        own stream lifetime.  The remaining plain-MTP path has no proposal
+        result needed by this iteration's scheduler.
+        """
+        if (
+            batch.is_dummy_run
+            or not envs.ATOM_DEFER_MTP_PROPOSAL
+            or not self.tokenID_processor.is_deferred_out
+            or getattr(self.config, "eplb_enable", False)
+        ):
+            return False
+        spec_config = getattr(self.config, "speculative_config", None)
+        if getattr(spec_config, "method", None) != "mtp":
+            return False
+        drafter = getattr(self, "drafter", None)
+        if drafter is None:
+            return False
+        return getattr(drafter, "verify_scheduler", None) is None
+
+    def _can_publish_current_terminal(self, batch: ScheduledBatch) -> bool:
+        """Whether current prefill samples are guaranteed terminal outputs."""
+        final_chunks = batch.is_final_chunk
+        is_terminal_candidate = (
+            getattr(batch, "all_max_tokens_one", False)
+            and batch.total_seqs_num_prefill == batch.total_seqs_num
+            and batch.total_seqs_num_decode == 0
+            and not getattr(batch, "requires_followup_state_checkpoint", False)
+            and final_chunks is not None
+            and bool(final_chunks)
+            and all(final_chunks)
+        )
+        return bool(
+            is_terminal_candidate
+            and envs.ATOM_TERMINAL_MTP_FAST_PATH
+            and self.tokenID_processor.is_deferred_out
+            and self.tokenID_processor.prev_batch is None
+        )
+
+    @torch.inference_mode()
+    def finish_draft_proposal(self) -> None:
+        """Run the proposal retained by a publish-before-draft target step."""
+        pending = self._pending_draft_proposal
+        assert pending is not None, "no deferred draft proposal to finish"
+        try:
+            self.propose_draft_token_ids(
+                pending.batch,
+                pending.input_ids,
+                pending.hidden_states,
+                pending.next_token_ids,
+                pending.num_reject_tokens,
+                return_previous_draft=False,
+            )
+        finally:
+            self._pending_draft_proposal = None
+            reset_forward_context()
+            if not pending.batch.is_dummy_run:
+                self._record_forward_vars_event()
+
+    @torch.inference_mode()
+    def cancel_draft_proposal(self) -> None:
+        """Drop a retained proposal after every request in its batch stops."""
+        pending = self._pending_draft_proposal
+        assert pending is not None, "no deferred draft proposal to cancel"
+        try:
+            self.tokenID_processor.discard_current_deferred_generation()
+        finally:
+            self._pending_draft_proposal = None
+            reset_forward_context()
+            if not pending.batch.is_dummy_run:
+                self._record_forward_vars_event()
 
     @staticmethod
     def _is_pure_middle_chunk(batch) -> bool:
@@ -3328,6 +3575,7 @@ class ModelRunner:
         hidden_states: torch.Tensor,
         next_token_ids: torch.Tensor,
         num_reject_tokens: torch.Tensor,
+        return_previous_draft: bool = True,
     ):
         forward_context = get_forward_context()
 
@@ -3402,7 +3650,10 @@ class ModelRunner:
         verify_scheduler = getattr(self.drafter, "verify_scheduler", None)
         if verify_scheduler is not None:
             verify_scheduler.record_ell(batch.req_ids[: batch.total_seqs_num])
-        return self.tokenID_processor.prepare_draft_ids(batch, draft_token)
+        if return_previous_draft:
+            return self.tokenID_processor.prepare_draft_ids(batch, draft_token)
+        self.tokenID_processor.store_draft_ids(draft_token)
+        return None
 
     def start_capture_profiler(self):
         """Set up the per-bs CUDA graph capture profiler (profiles in place).
