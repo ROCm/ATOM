@@ -881,6 +881,18 @@ class TestPagedCopyCheckpoint:
         bm.allocate(seq, bm.can_allocate(seq))
         return seq
 
+    def test_allocate_resets_live_slot_readiness(self):
+        bm = make_block_manager(
+            paged_copy_config(),
+            state_runtime=PAGED_COPY_RUNTIME,
+        )
+        seq = stateful_seq(list(range(40)))
+        seq._state_initialized_after_alloc = True
+
+        bm.allocate(seq, bm.can_allocate(seq))
+
+        assert seq._state_initialized_after_alloc is False
+
     def test_validated_runtime_is_explicit_from_wire_through_block_manager(self):
         config = paged_copy_config()
         engine_runtime = StateRuntime.from_wire(PAGED_COPY_RUNTIME.to_wire())

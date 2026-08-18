@@ -711,11 +711,6 @@ class Scheduler:
         from atom.utils.forward_context import get_kvconnector
 
         self.kv_connector = get_kvconnector("scheduler", config)
-        # Last TP-aggregated worker liveness snapshot. This deliberately does
-        # not mirror the raw checkpoint lease count: a lease can be retained as
-        # a permanent safety quarantine after GPU completion becomes
-        # unknowable, and such a lease must not keep the engine polling forever.
-        self._connector_pending_work = False
 
         from atom.distributed.kv_events import (
             EventPublisher as _EventPublisher,
@@ -935,7 +930,6 @@ class Scheduler:
             and not self.running
             and not self._rejected
             and not self.deferred_free_blocks
-            and not getattr(self, "_connector_pending_work", False)
         )
 
     def add(self, seq: Sequence):
@@ -1606,7 +1600,8 @@ class Scheduler:
         seq.status = SequenceStatus.FINISHED
         seq.leave_reason = "aborted"
         self._rejected.append(seq)
-        if not has_inflight_load:
+        if not has_inflight_load or not self._connector_flag("is_offload"):
+            self._uncount_inflight_load(seq)
             return
 
         self.deferred_free_blocks[seq.id] = seq
@@ -1905,11 +1900,7 @@ class Scheduler:
         return chunk
 
     def _is_preemptable(self, seq: Sequence) -> bool:
-        return not (
-            self.kv_connector is not None
-            and hasattr(self.kv_connector, "should_defer_free")
-            and self.kv_connector.should_defer_free(seq)
-        )
+        return not self._connector_should_defer_free(seq)
 
     def _preempt_one_running(self) -> bool:
         for index in range(len(self.running) - 1, -1, -1):
@@ -2050,9 +2041,9 @@ class Scheduler:
         # batch.is_final_chunk (a later schedule() may have already flipped the
         # live seq.is_partial_prefill while this batch was in flight).
         pp_middle_chunk_ids: set[int] = set()
+        running_by_id = {seq.id: seq for seq in self.running} if batch else {}
         num_prefill = int(getattr(batch, "total_seqs_num_prefill", 0))
-        if batch is not None and num_prefill:
-            running_by_id = {seq.id: seq for seq in self.running}
+        if self._connector_flag("is_offload") and num_prefill:
             for req_id in batch.req_ids[:num_prefill]:
                 seq = running_by_id.get(req_id)
                 if seq is not None and seq.has_per_req_cache:
@@ -2063,7 +2054,6 @@ class Scheduler:
         if batch is not None and self.advance_on_schedule:
             # Progress already advanced at schedule time; publish prefix-cache
             # hashes at the chunk's pre-advance offset and record non-final chunks.
-            running_by_id = {seq.id: seq for seq in self.running}
             final = batch.is_final_chunk
             for i, req_id in enumerate(batch.req_ids):
                 seq = running_by_id.get(req_id)
@@ -2076,7 +2066,6 @@ class Scheduler:
                 if not is_final:
                     pp_middle_chunk_ids.add(req_id)
         elif batch is not None:
-            running_by_id = {seq.id: seq for seq in self.running}
             for i, req_id in enumerate(batch.req_ids):
                 seq = running_by_id.get(req_id)
                 if seq is None or seq.type != SequenceType.PREFILL:
@@ -2627,10 +2616,6 @@ class Scheduler:
         """
         if kv_connector_output is None:
             return
-
-        self._connector_pending_work = bool(
-            getattr(kv_connector_output, "pending_work", False)
-        )
 
         is_producer = self._connector_flag("is_producer")
         is_offload = self._connector_flag("is_offload")

@@ -615,16 +615,6 @@ def test_get_finished_atomically_drains_sidecar_save_results():
     assert connector.get_finished().is_empty()
 
 
-def test_get_finished_reports_only_active_save_work_as_pending():
-    connector = _worker([])
-    connector._pending_save_ops[41] = 1
-
-    assert connector.get_finished().pending_work is True
-
-    connector._pending_save_ops.clear()
-    assert connector.get_finished().pending_work is False
-
-
 def test_unexpected_slot_save_failure_reports_page_and_sidecar_terminals():
     connector = _worker([])
     request = _save_request(page=False)

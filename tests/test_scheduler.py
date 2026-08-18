@@ -2,8 +2,6 @@
 # Tests for atom/model_engine/scheduler.py — public API only
 
 
-import sys
-import types
 from collections import deque
 from types import SimpleNamespace
 from unittest import mock
@@ -63,63 +61,6 @@ class TestSchedulerAddQuery:
 
         assert not scheduler.is_finished()
 
-    def test_pollable_connector_work_keeps_scheduler_alive_but_quarantine_does_not(
-        self,
-    ):
-        scheduler = Scheduler.__new__(Scheduler)
-        scheduler.waiting = deque()
-        scheduler.running = deque()
-        scheduler._rejected = []
-        scheduler.deferred_free_blocks = {}
-        scheduler.finished_recving_kv_req_ids = []
-        scheduler.failed_recving_kv_req_ids = []
-        scheduler.kv_connector = SimpleNamespace(
-            is_producer=False,
-            is_offload=True,
-        )
-        scheduler.block_manager = SimpleNamespace()
-
-        scheduler._update_from_kv_xfer_finished(KVConnectorOutput(pending_work=True))
-        assert not scheduler.is_finished()
-
-        scheduler._update_from_kv_xfer_finished(KVConnectorOutput(pending_work=False))
-        assert scheduler.is_finished()
-
-    @pytest.mark.parametrize("idle_case", ["no_requests", "no_result", "no_batch"])
-    def test_decode_engine_core_advances_idle_kv_transfer_without_forward_batch(
-        self, monkeypatch, idle_case
-    ):
-        fake_async_proc = types.ModuleType("atom.model_engine.async_proc")
-        fake_async_proc.AsyncIOProcManager = object
-        monkeypatch.setitem(
-            sys.modules,
-            "atom.model_engine.async_proc",
-            fake_async_proc,
-        )
-        from atom.model_engine.engine_core import DecodeEngineCore
-
-        schedule_calls = []
-
-        def schedule():
-            schedule_calls.append(None)
-            if idle_case == "no_result":
-                return None
-            if idle_case == "no_batch":
-                return None, {}
-            pytest.fail("schedule() must not run when the scheduler is empty")
-
-        idle_advances = []
-        core = DecodeEngineCore.__new__(DecodeEngineCore)
-        core.scheduler = SimpleNamespace(
-            has_requests=lambda: idle_case != "no_requests",
-            schedule=schedule,
-        )
-        core._advance_idle_kv_transfer = lambda: idle_advances.append(None)
-
-        assert core._process_engine_step() is False
-        assert idle_advances == [None]
-        assert len(schedule_calls) == (idle_case != "no_requests")
-
     def test_extend(self, scheduler, seq_factory):
         scheduler.extend([seq_factory([1]), seq_factory([2])])
         assert scheduler.get_num_unfinished_requests() == 2
@@ -140,6 +81,26 @@ class TestSchedulerAddQuery:
 
 
 class TestSchedule:
+    def test_non_offload_abort_keeps_existing_receive_cleanup(self):
+        seq = SimpleNamespace(
+            id=96,
+            status=SequenceStatus.ABORTED,
+            _counted_as_inflight_load=True,
+        )
+        sched = Scheduler.__new__(Scheduler)
+        sched._rejected = []
+        sched.deferred_free_blocks = {}
+        sched.finished_recving_kv_req_ids = []
+        sched.failed_recving_kv_req_ids = []
+        sched._num_parked_remote_kv = 1
+        sched.kv_connector = SimpleNamespace(is_offload=False)
+
+        sched._reject_aborted_waiting(seq)
+
+        assert sched.deferred_free_blocks == {}
+        assert sched._num_parked_remote_kv == 0
+        assert sched._rejected == [seq]
+
     @pytest.mark.parametrize("first_terminal", ["load", "save"])
     def test_aborted_load_and_save_both_finish_before_release(
         self,

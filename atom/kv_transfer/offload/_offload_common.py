@@ -455,13 +455,6 @@ class OffloadSchedulerMixin:
         seq.offload_loaded_tokens = max(hbm, lmc)
         return True
 
-    def connector_meta_dispatched(self, meta) -> None:
-        dispatched = set(getattr(meta, "lookup_requests_in_step", ()) or ())
-        if dispatched:
-            self._lookup_in_step = [
-                sid for sid in self._lookup_in_step if sid not in dispatched
-            ]
-
     def _save_frontier(self, seq) -> int:
         computed = min(
             int(getattr(seq, "num_cached_tokens", 0)),

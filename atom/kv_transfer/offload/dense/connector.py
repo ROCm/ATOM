@@ -649,6 +649,10 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             )
             entry[1] = aligned
             self._save_inflight[sid] = save_operation
+        dispatched = set(meta.lookup_requests_in_step)
+        self._lookup_in_step = [
+            sid for sid in self._lookup_in_step if sid not in dispatched
+        ]
         self._reqs_need_recv.clear()
         return meta
 

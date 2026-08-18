@@ -9,7 +9,6 @@ import queue
 from collections import deque
 
 from atom.distributed.pp_transport import PPStageTransport
-from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
 from atom.model_engine.engine_core import EngineCore
 
 logger = logging.getLogger("atom")
@@ -77,7 +76,6 @@ class PPEngineCoreProc(EngineCore):
 
     def _pp_head_step(self):
         launched = 0
-        idle_meta_dispatched = False
         while len(self._in_flight) < self.pp_size:
             result = self.scheduler.schedule()
 
@@ -88,24 +86,7 @@ class PPEngineCoreProc(EngineCore):
             if result is None:
                 break
             scheduled_batch, seqs = result
-            if scheduled_batch is None:
-                break
-
-            if len(scheduled_batch.req_ids) == 0:
-                # build_connector_meta() may have consumed one-shot save state
-                # while constructing this empty batch. Dispatch that exact
-                # snapshot before breaking; rebuilding it in the generic idle
-                # path would return empty and leave a ghost inflight operation.
-                meta = getattr(scheduled_batch, "connector_meta_output", None)
-                if getattr(self, "kv_transfer_enabled", False) and (
-                    connector_metadata_has_work(meta)
-                ):
-                    self.runner_mgr.call_func("process_kvconnector_output", meta)
-                    connector = getattr(self.scheduler, "kv_connector", None)
-                    callback = getattr(connector, "connector_meta_dispatched", None)
-                    if callback is not None:
-                        callback(meta)
-                    idle_meta_dispatched = True
+            if scheduled_batch is None or len(scheduled_batch.req_ids) == 0:
                 break
 
             needs_output = scheduled_batch.produces_output()
@@ -117,10 +98,6 @@ class PPEngineCoreProc(EngineCore):
                     "process_kvconnector_output",
                     scheduled_batch.connector_meta_output,
                 )
-                connector = getattr(self.scheduler, "kv_connector", None)
-                callback = getattr(connector, "connector_meta_dispatched", None)
-                if callback is not None:
-                    callback(scheduled_batch.connector_meta_output)
             self.pp_transport.send_metadata(scheduled_batch)
             self.runner_mgr.call_func("forward", scheduled_batch, wait_out=True)
             self.scheduler.mark_pp_inflight(scheduled_batch)
@@ -130,15 +107,8 @@ class PPEngineCoreProc(EngineCore):
         # Flush deferred send when idle — otherwise it dangles until next forward.
         if launched == 0:
             self.runner_mgr.call_func("flush_pp_send", wait_out=True)
-            if idle_meta_dispatched:
-                self._poll_kv_transfer_progress()
-            else:
-                # A deferred final PAGE/SLOT save can be the scheduler's only
-                # live work. With no current metadata snapshot, build and
-                # dispatch it explicitly before polling completions.
-                self._advance_idle_kv_transfer()
-        else:
-            self._poll_kv_transfer_progress()
+
+        self._poll_kv_transfer_progress()
 
         poll_ms = 0 if launched else _PP_HEAD_IDLE_POLL_MS
         while self._in_flight:

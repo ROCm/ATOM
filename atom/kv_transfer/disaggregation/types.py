@@ -171,9 +171,6 @@ class KVConnectorOutput:
         connector_completions: Terminal events on connector-owned channels.
             Generic composite/aggregation layers transport these opaquely;
             channel owners interpret them after TP aggregation.
-        pending_work: This worker still owns asynchronous work that can make
-            progress and should be polled again. Permanently quarantined work
-            must not set this flag.
         expected_finished_count: How many finished notifications should be
             expected per request (used by the aggregator).
     """
@@ -186,7 +183,6 @@ class KVConnectorOutput:
     failed_loading: set[LoadCompletionId] = field(default_factory=set)
     expected_finished_count: int = 0
     connector_completions: set[ConnectorCompletion] = field(default_factory=set)
-    pending_work: bool = False
 
     def is_empty(self) -> bool:
         """Return True if no transfers finished on this worker."""
@@ -198,7 +194,6 @@ class KVConnectorOutput:
             and not self.finished_loading
             and not self.failed_loading
             and not self.connector_completions
-            and not self.pending_work
         )
 
     def __repr__(self) -> str:
@@ -209,8 +204,7 @@ class KVConnectorOutput:
             f"finished_saving={self.finished_saving}, "
             f"loading={self.finished_loading}, "
             f"failed_loading={self.failed_loading}, "
-            f"connector_completions={self.connector_completions}, "
-            f"pending_work={self.pending_work})"
+            f"connector_completions={self.connector_completions})"
         )
 
 

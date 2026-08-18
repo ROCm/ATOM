@@ -81,11 +81,6 @@ class LMCacheOffloadConnector(KVConnectorBase):
     def get_finished(self):
         return self._impl.get_finished()
 
-    def has_pending_work(self) -> bool:
-        """Preserve the worker liveness hook across the public shell."""
-
-        return bool(self._impl.has_pending_work())
-
     def get_finished_recv_blocks(self):
         return self._impl.get_finished_recv_blocks()
 
@@ -135,11 +130,6 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         callback = getattr(self._impl, "cancel_pending_load", None)
         if callback is not None:
             callback(seq)
-
-    def connector_meta_dispatched(self, meta) -> None:
-        callback = getattr(self._impl, "connector_meta_dispatched", None)
-        if callback is not None:
-            callback(meta)
 
     def load_finished(self, req_id):
         callback = getattr(self._impl, "load_finished", None)

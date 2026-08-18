@@ -312,10 +312,6 @@ class EngineCore:
             self.runner_mgr.call_func(
                 "process_kvconnector_output", scheduled_batch.connector_meta_output
             )
-            connector = getattr(self.scheduler, "kv_connector", None)
-            callback = getattr(connector, "connector_meta_dispatched", None)
-            if callback is not None:
-                callback(scheduled_batch.connector_meta_output)
 
         # Run the model forward pass if there are actual sequences
         has_seqs = len(scheduled_batch.req_ids) > 0
@@ -377,9 +373,6 @@ class EngineCore:
         if not connector_metadata_has_work(meta):
             return
         self.runner_mgr.call_func("process_kvconnector_output", meta)
-        callback = getattr(connector, "connector_meta_dispatched", None)
-        if callback is not None:
-            callback(meta)
 
     def pull_and_process_input_queue(self):
         recv_reqs = []
@@ -1113,16 +1106,13 @@ class DecodeEngineCore(EngineCore):
         """Override: handle None from DecodeScheduler when prefill_waiting is
         non-empty but running is empty (sequences are still being prefilled)."""
         if not self.scheduler.has_requests():
-            self._advance_idle_kv_transfer()
             return False
         result = self.scheduler.schedule()
         if result is None:
             # Sequences exist but are still waiting for PrefillDone — spin.
-            self._advance_idle_kv_transfer()
             return False
         scheduled_batch, seqs = result
         if scheduled_batch is None:
-            self._advance_idle_kv_transfer()
             return False
         t0 = time.perf_counter()
         fwd_out = self.runner_mgr.call_func("forward", scheduled_batch, wait_out=True)

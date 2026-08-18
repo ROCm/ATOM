@@ -73,19 +73,6 @@ class KVConnectorBase(ABC):
         """
         return []
 
-    def has_pending_work(self) -> bool:
-        """Whether this worker owns asynchronous work that can still finish.
-
-        This is a liveness signal, not a resource-ownership signal.  A connector
-        should return ``False`` for permanently quarantined resources whose
-        completion can no longer be observed; otherwise the engine would poll
-        them forever.  Connectors returning :class:`KVConnectorOutput` may set
-        ``pending_work`` directly instead.
-        """
-
-        return False
-
-
 class KVConnectorSchedulerBase(ABC):
     """Scheduler-side KV connector interface."""
 

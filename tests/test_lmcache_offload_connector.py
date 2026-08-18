@@ -1647,7 +1647,7 @@ def test_scheduler_consumer_role_only_emits_loads_without_save_deferral():
     assert sched.should_defer_free(seq) is False
 
 
-def test_lookup_unpin_ids_drain_only_after_metadata_dispatch():
+def test_lookup_unpin_ids_are_consumed_by_metadata_build():
     sched = _scheduler()
     sched._lookup_in_step = ["lookup-2"]
 
@@ -1655,9 +1655,6 @@ def test_lookup_unpin_ids_drain_only_after_metadata_dispatch():
 
     assert meta.requests == []
     assert meta.lookup_requests_in_step == ["lookup-2"]
-    assert sched._lookup_in_step == ["lookup-2"]
-
-    sched.connector_meta_dispatched(meta)
     assert sched._lookup_in_step == []
 
 
@@ -1681,9 +1678,6 @@ def test_engine_core_dispatches_idle_lookup_unpin_metadata(monkeypatch):
         def build_connector_meta(self):
             return meta
 
-        def connector_meta_dispatched(self, value):
-            dispatched.append(("ack", value))
-
     core = EngineCore.__new__(EngineCore)
     core.kv_transfer_enabled = True
     core.scheduler = SimpleNamespace(kv_connector=_Connector())
@@ -1693,84 +1687,7 @@ def test_engine_core_dispatches_idle_lookup_unpin_metadata(monkeypatch):
 
     core._dispatch_idle_offload_work()
 
-    assert dispatched == [
-        ("process_kvconnector_output", meta),
-        ("ack", meta),
-    ]
-
-
-def test_pp_head_dispatches_idle_offload_work_for_empty_batch(monkeypatch):
-    fake_async_proc = types.ModuleType("atom.model_engine.async_proc")
-    fake_async_proc.AsyncIOProcManager = object
-    monkeypatch.setitem(
-        sys.modules,
-        "atom.model_engine.async_proc",
-        fake_async_proc,
-    )
-    from atom.model_engine.pp_engine_core import PPEngineCoreProc
-
-    events = []
-    empty_batch = SimpleNamespace(req_ids=[])
-    core = PPEngineCoreProc.__new__(PPEngineCoreProc)
-    core.pp_size = 2
-    core._in_flight = deque()
-    core.scheduler = SimpleNamespace(
-        schedule=lambda: (empty_batch, {}),
-        take_rejected=list,
-    )
-    core.runner_mgr = SimpleNamespace(
-        call_func=lambda name, *args, **kwargs: events.append(("runner", name))
-    )
-    core._dispatch_idle_offload_work = lambda: events.append("idle-dispatch")
-    core._poll_kv_transfer_progress = lambda: events.append("poll")
-
-    core._pp_head_step()
-
-    assert "idle-dispatch" in events
-
-
-def test_pp_head_preserves_one_shot_connector_meta_from_empty_batch(monkeypatch):
-    fake_async_proc = types.ModuleType("atom.model_engine.async_proc")
-    fake_async_proc.AsyncIOProcManager = object
-    monkeypatch.setitem(
-        sys.modules,
-        "atom.model_engine.async_proc",
-        fake_async_proc,
-    )
-    from atom.model_engine.pp_engine_core import PPEngineCoreProc
-
-    meta = LMCacheOffloadMetadata()
-    meta.lookup_requests_in_step = ["one-shot"]
-    empty_batch = SimpleNamespace(req_ids=[], connector_meta_output=meta)
-    events = []
-
-    class _Connector:
-        def connector_meta_dispatched(self, value):
-            events.append(("ack", value))
-
-    core = PPEngineCoreProc.__new__(PPEngineCoreProc)
-    core.pp_size = 2
-    core._in_flight = deque()
-    core.kv_transfer_enabled = True
-    core.scheduler = SimpleNamespace(
-        schedule=lambda: (empty_batch, {}),
-        take_rejected=list,
-        kv_connector=_Connector(),
-    )
-    core.runner_mgr = SimpleNamespace(
-        call_func=lambda name, *args, **kwargs: events.append(
-            ("runner", name, args[0] if args else None)
-        )
-    )
-    core._advance_idle_kv_transfer = lambda: events.append("rebuilt-idle-meta")
-    core._poll_kv_transfer_progress = lambda: events.append("poll")
-
-    core._pp_head_step()
-
-    assert ("runner", "process_kvconnector_output", meta) in events
-    assert ("ack", meta) in events
-    assert "poll" in events
-    assert "rebuilt-idle-meta" not in events
+    assert dispatched == [("process_kvconnector_output", meta)]
 
 
 def test_chained_prefix_hashes_match_block_manager_with_dcp_hash_size():

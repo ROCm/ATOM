@@ -1724,7 +1724,6 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             fss = set(self._failed_sidecar_save)
             self._done_sidecar_save.clear()
             self._failed_sidecar_save.clear()
-            pending_work = bool(self._pending_save_ops)
         connector_completions = {
             ConnectorCompletion(
                 channel=DSV4_CHECKPOINT_SAVE_CHANNEL,
@@ -1747,7 +1746,6 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             failed_loading=fl,
             finished_saving=ds,
             connector_completions=connector_completions,
-            pending_work=pending_work,
         )
 
     def get_finished_recv_blocks(self) -> list[int]:
@@ -2351,6 +2349,10 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
                     sidecar_candidate[0],
                     sidecar_candidate[1],
                 )
+        dispatched = set(meta.lookup_requests_in_step)
+        self._lookup_in_step = [
+            sid for sid in self._lookup_in_step if sid not in dispatched
+        ]
         self._reqs_need_recv.clear()
         return meta
 

@@ -107,17 +107,14 @@ def test_scheduler_shell_forwards_completion_processing():
     output = object()
     shell = LMCacheOffloadConnectorScheduler.__new__(LMCacheOffloadConnectorScheduler)
     shell._impl = SimpleNamespace(
-        connector_meta_dispatched=lambda meta: calls.append(("dispatch", meta)),
         process_completions=lambda value: calls.append(("completions", value))
         or value,
         load_finished=lambda req: calls.append(("load-ok", req)) or False,
     )
 
-    shell.connector_meta_dispatched("meta")
     assert shell.process_completions(output) is output
     assert shell.load_finished("c") is False
     assert calls == [
-        ("dispatch", "meta"),
         ("completions", output),
         ("load-ok", "c"),
     ]
@@ -137,10 +134,3 @@ def test_scheduler_shell_forwards_statistics():
     shell._impl = SimpleNamespace(get_statistics=lambda: expected)
 
     assert shell.get_statistics() is expected
-
-
-def test_worker_shell_forwards_pending_work_hook():
-    shell = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
-    shell._impl = SimpleNamespace(has_pending_work=lambda: True)
-
-    assert shell.has_pending_work() is True
