@@ -510,6 +510,7 @@ jobs:
             --cap-add=IPC_LOCK
             --ulimit memlock=-1:-1
             -e MC_GID_INDEX=1
+            -e MC_ENABLE_DEST_DEVICE_AFFINITY=1
             -e SMOKE_RANK="${rank}"
             -e SMOKE_NODE_COUNT="${RDMA_SMOKE_NODE_COUNT}"
             -e SMOKE_RUN_DIR=/rdma-smoke-shared
@@ -666,28 +667,31 @@ jobs:
             exit 1
           fi
 
-          # The initiator writes prefill VRAM into the decode target. Pair each
-          # prefill GPU with the decode GPU and NIC in the corresponding half.
+          # The initiator writes prefill VRAM into the decode target. Register
+          # each decode buffer on its local HCA and the prefill GPU's alternate
+          # HCA, then verify destination affinity selects the matching HCA.
           for ((prefill_gpu_id = 0; prefill_gpu_id < 4; prefill_gpu_id++)); do
             decode_gpu_id=$((prefill_gpu_id + 4))
             prefill_rdma_device="${rdma_devices[prefill_gpu_id]}"
             decode_rdma_device="${rdma_devices[decode_gpu_id]}"
+            decode_device_csv="${decode_rdma_device},${prefill_rdma_device}"
             prefill_matrix="/tmp/gdr-smoke-prefill-gpu-${prefill_gpu_id}-nic-priority.json"
             decode_matrix="/tmp/gdr-smoke-decode-gpu-${decode_gpu_id}-nic-priority.json"
             printf '{"cuda:0":[["%s"],[]]}\n' "${prefill_rdma_device}" > "${prefill_matrix}"
-            printf '{"cuda:0":[["%s"],[]]}\n' "${decode_rdma_device}" > "${decode_matrix}"
+            printf '{"cuda:0":[["%s","%s"],[]]}\n' \
+              "${decode_rdma_device}" "${prefill_rdma_device}" > "${decode_matrix}"
 
             target_log="/tmp/gdr-smoke-decode-gpu-${decode_gpu_id}-target.log"
             initiator_log="/tmp/gdr-smoke-prefill-gpu-${prefill_gpu_id}-initiator.log"
 
-            echo "=== GPUDirect RDMA prefill GPU ${prefill_gpu_id} (${prefill_rdma_device}) -> decode GPU ${decode_gpu_id} (${decode_rdma_device}) ==="
+            echo "=== GPUDirect RDMA prefill GPU ${prefill_gpu_id} (${prefill_rdma_device}) -> decode GPU ${decode_gpu_id} (${decode_rdma_device}, alternate ${prefill_rdma_device}) ==="
             HIP_VISIBLE_DEVICES="${decode_gpu_id}" \
             "${validator_bin}" \
               --mode=target \
               --protocol=rdma \
               --metadata_server=P2PHANDSHAKE \
               --local_server_name=127.0.0.2:0 \
-              --device_name="${decode_rdma_device}" \
+              --device_name="${decode_device_csv}" \
               --nic_priority_matrix="${decode_matrix}" \
               --use_vram=true \
               --gpu_id=0 \
@@ -698,6 +702,8 @@ jobs:
             echo "P2P target listening at ${target_name}"
 
             set +e
+            MC_LOG_RDMA_SLICE_AFFINITY=1 \
+            GLOG_v=1 \
             HIP_VISIBLE_DEVICES="${prefill_gpu_id}" \
             timeout 120 "${validator_bin}" \
               --mode=initiator \
@@ -710,24 +716,25 @@ jobs:
               --use_vram=true \
               --gpu_id=0 \
               --buffer_size=67108864 \
-              --batch_size=4 \
-              --block_size=1048576 \
+              --batch_size=1 \
+              --block_size=67108864 \
               --threads=1 \
-              --duration=2 \
+              --duration=1 \
               2>&1 | tee "${initiator_log}"
             transfer_rc="${PIPESTATUS[0]}"
             set -e
 
             if [[ "${transfer_rc}" -ne 0 ]] ||
-               ! grep -q "Data validation passed" "${initiator_log}"; then
+               ! grep -q "Data validation passed" "${initiator_log}" ||
+               ! grep -Fq "local_device_name=${prefill_rdma_device}, peer_device_name=${prefill_rdma_device}" "${initiator_log}"; then
               cat "${target_log}" >&2
-              echo "ERROR: GPUDirect RDMA failed from prefill GPU ${prefill_gpu_id} (${prefill_rdma_device}) to decode GPU ${decode_gpu_id} (${decode_rdma_device})" >&2
+              echo "ERROR: GPUDirect RDMA failed from prefill GPU ${prefill_gpu_id} (${prefill_rdma_device}) to decode GPU ${decode_gpu_id} (${decode_rdma_device}, alternate ${prefill_rdma_device})" >&2
               exit 1
             fi
             kill "${target_pid}" 2>/dev/null || true
             wait "${target_pid}" 2>/dev/null || true
             target_pid=""
-            echo "GPUDirect RDMA passed from prefill GPU ${prefill_gpu_id} to decode GPU ${decode_gpu_id}"
+            echo "GPUDirect RDMA passed from prefill GPU ${prefill_gpu_id} to decode GPU ${decode_gpu_id} via alternate HCA ${prefill_rdma_device}"
           done
           echo "Node-local GPUDirect RDMA passed for all four prefill/decode GPU pairs"
 
@@ -809,10 +816,24 @@ jobs:
               decode_gpu_id="${cross_decode_gpu_ids[pair_index]}"
               prefill_rdma_device="${rdma_devices[prefill_gpu_id]}"
               decode_rdma_device="${rdma_devices[decode_gpu_id]}"
+              decode_device_csv="${decode_rdma_device}"
+              expected_peer_device="${decode_rdma_device}"
+              is_cross_rail=0
+              if [[ "${prefill_gpu_id}" -ne "${decode_gpu_id}" ]]; then
+                decode_device_csv="${decode_rdma_device},${prefill_rdma_device}"
+                expected_peer_device="${prefill_rdma_device}"
+                is_cross_rail=1
+              fi
+              echo "=== Cross-node RDMA pair: prefill GPU ${prefill_gpu_id} (${prefill_rdma_device}) -> decode GPU ${decode_gpu_id} (${decode_device_csv}); expected peer HCA ${expected_peer_device} ==="
               prefill_matrix="/tmp/cross-node-prefill-gpu-${prefill_gpu_id}-nic-priority.json"
               decode_matrix="/tmp/cross-node-decode-gpu-${decode_gpu_id}-nic-priority.json"
               printf '{"cuda:0":[["%s"],[]]}\n' "${prefill_rdma_device}" > "${prefill_matrix}"
-              printf '{"cuda:0":[["%s"],[]]}\n' "${decode_rdma_device}" > "${decode_matrix}"
+              if [[ "${is_cross_rail}" -eq 1 ]]; then
+                printf '{"cuda:0":[["%s","%s"],[]]}\n' \
+                  "${decode_rdma_device}" "${prefill_rdma_device}" > "${decode_matrix}"
+              else
+                printf '{"cuda:0":[["%s"],[]]}\n' "${decode_rdma_device}" > "${decode_matrix}"
+              fi
               ready_file="${SMOKE_RUN_DIR}/cross-node-ready-prefill-${prefill_gpu_id}-decode-${decode_gpu_id}"
               result_file="${SMOKE_RUN_DIR}/cross-node-result-prefill-${prefill_gpu_id}-decode-${decode_gpu_id}"
               target_log="${SMOKE_RUN_DIR}/cross-node-prefill-${prefill_gpu_id}-decode-${decode_gpu_id}-target.log"
@@ -825,7 +846,7 @@ jobs:
                   --protocol=rdma \
                   --metadata_server=P2PHANDSHAKE \
                   --local_server_name="${local_ip}:0" \
-                  --device_name="${decode_rdma_device}" \
+                  --device_name="${decode_device_csv}" \
                   --nic_priority_matrix="${decode_matrix}" \
                   --use_vram=true \
                   --gpu_id=0 \
@@ -853,8 +874,18 @@ jobs:
                 target_name="$(<"${ready_file}")"
                 initiator_log="/tmp/cross-node-prefill-${prefill_gpu_id}-decode-${decode_gpu_id}-initiator.log"
                 echo "=== Cross-node prefill initiator: ${local_ip} GPU ${prefill_gpu_id} (${prefill_rdma_device}) -> ${target_name} decode GPU ${decode_gpu_id} ==="
+                transfer_batch_size=4
+                transfer_block_size=1048576
+                transfer_duration=2
+                affinity_env=()
+                if [[ "${is_cross_rail}" -eq 1 ]]; then
+                  transfer_batch_size=1
+                  transfer_block_size=67108864
+                  transfer_duration=1
+                  affinity_env=(MC_LOG_RDMA_SLICE_AFFINITY=1 GLOG_v=1)
+                fi
                 set +e
-                HIP_VISIBLE_DEVICES="${prefill_gpu_id}" \
+                env "${affinity_env[@]}" HIP_VISIBLE_DEVICES="${prefill_gpu_id}" \
                 timeout 120 "${validator_bin}" \
                   --mode=initiator \
                   --protocol=rdma \
@@ -866,15 +897,17 @@ jobs:
                   --use_vram=true \
                   --gpu_id=0 \
                   --buffer_size=67108864 \
-                  --batch_size=4 \
-                  --block_size=1048576 \
+                  --batch_size="${transfer_batch_size}" \
+                  --block_size="${transfer_block_size}" \
                   --threads=1 \
-                  --duration=2 \
+                  --duration="${transfer_duration}" \
                   2>&1 | tee "${initiator_log}"
                 transfer_rc="${PIPESTATUS[0]}"
                 set -e
                 if [[ "${transfer_rc}" -eq 0 ]] &&
-                   grep -q "Data validation passed" "${initiator_log}"; then
+                   grep -q "Data validation passed" "${initiator_log}" &&
+                   { [[ "${is_cross_rail}" -eq 0 ]] ||
+                     grep -Fq "local_device_name=${prefill_rdma_device}, peer_device_name=${expected_peer_device}" "${initiator_log}"; }; then
                   result=0
                 else
                   result=1
