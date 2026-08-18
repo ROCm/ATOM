@@ -3893,6 +3893,23 @@ def test_save_inflight_defers_free_until_save_finishes():
     assert sched.should_defer_free(seq) is False
 
 
+def test_pending_work_tracks_undispatched_loads_and_unreported_saves():
+    # The engine keeps its idle drain alive on this, so it has to stay true
+    # from the moment a load is queued until the matching save reports back.
+    sched = _scheduler()
+    assert sched.has_pending_work() is False
+
+    sched._reqs_need_recv["9"] = object()
+    assert sched.has_pending_work() is True
+
+    sched._reqs_need_recv.clear()
+    sched._save_inflight["9"] = {9}
+    assert sched.has_pending_work() is True
+
+    sched.save_finished(9)
+    assert sched.has_pending_work() is False
+
+
 def test_chunked_prefill_save_uses_computed_frontier_and_serializes_inflight():
     sched = _scheduler()
     seq = SimpleNamespace(

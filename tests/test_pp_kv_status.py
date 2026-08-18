@@ -1,23 +1,13 @@
 # SPDX-License-Identifier: MIT
 # PP-stage offload KV status aggregation (GPU-free).
 
-import sys
-import types
-from unittest.mock import MagicMock
-
 import pytest
+from aiter_stub import stubbed_aiter
 
-# pp_engine_core pulls in async_proc, which needs a GPU aiter build; stub the
-# import chain so the status-aggregation logic can be tested on CPU.
-for _name in ("aiter", "aiter.dist", "aiter.dist.shm_broadcast"):
-    if _name not in sys.modules:
-        _mod = types.ModuleType(_name)
-        _mod.__getattr__ = lambda _attr: MagicMock()
-        sys.modules[_name] = _mod
-
-from atom.kv_transfer.disaggregation.pp_kv_aggregator import PPKVAggregator
-from atom.kv_transfer.disaggregation.types import KVConnectorOutput
-from atom.model_engine.pp_engine_core import PPEngineCoreProc
+with stubbed_aiter():
+    from atom.kv_transfer.disaggregation.pp_kv_aggregator import PPKVAggregator
+    from atom.kv_transfer.disaggregation.types import KVConnectorOutput
+    from atom.model_engine.pp_engine_core import PPEngineCoreProc
 
 
 class FakeScheduler:

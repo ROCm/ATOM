@@ -52,6 +52,7 @@ class FakeSchedSub:
             self.chunk_ret = None
             self.saved = []
             self.load_failed_ids = []
+            self.pending = False
 
     def get_num_new_matched_tokens(self, seq):
         return self._match
@@ -84,6 +85,9 @@ class FakeSchedSub:
     def load_failed(self, req_id):
         self.load_failed_ids.append(req_id)
 
+    def has_pending_work(self):
+        return self.pending
+
     def __getattribute__(self, name):
         # Hide offload-specific methods unless this mock opts in, so
         # MultiConnector's hasattr() guards are exercised realistically.
@@ -94,6 +98,7 @@ class FakeSchedSub:
             "should_defer_free",
             "save_finished",
             "load_failed",
+            "has_pending_work",
         }
         if name in offload_api and not object.__getattribute__(self, "_offload"):
             raise AttributeError(name)
@@ -230,6 +235,19 @@ def test_offload_methods_default_when_no_sub_implements():
     assert sched.should_park_partial_prefill_for_load(seq) is False
     assert sched.should_defer_free(seq) is False
     assert sched.adjust_prefill_chunk_after_alloc(seq, 10) == 10  # unchanged
+    assert sched.has_pending_work() is False
+
+
+def test_pending_work_is_the_union_over_subs():
+    # The engine's idle drain keeps running while this holds, so one sub with
+    # an unfinished save has to outvote every drained sibling.
+    a = FakeSchedSub(offload_methods=True)
+    b = FakeSchedSub(offload_methods=True)
+    sched = _sched([a, b])
+    assert sched.has_pending_work() is False
+
+    b.pending = True
+    assert sched.has_pending_work() is True
 
 
 # ---------------------------------------------------------------------------

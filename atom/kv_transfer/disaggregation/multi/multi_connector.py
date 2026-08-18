@@ -359,6 +359,16 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             for c in self._connectors
         )
 
+    def has_pending_work(self) -> bool:
+        # Scheduler-side only: the send/save pairing state lives on the worker
+        # instance, and a pending send is already visible to the engine through
+        # the scheduler's deferred_free_blocks.
+        return any(
+            c.has_pending_work()
+            for c in self._connectors
+            if hasattr(c, "has_pending_work")
+        )
+
     def save_finished(self, req_id: Any) -> None:
         for c in self._connectors:
             if hasattr(c, "save_finished"):

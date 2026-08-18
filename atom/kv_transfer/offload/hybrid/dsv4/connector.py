@@ -2382,6 +2382,20 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             or self._has_pending_sidecar_save(seq)
         )
 
+    def has_pending_work(self) -> bool:
+        """True while a load still needs dispatch or a save is unreported.
+
+        Feeds ``EngineCore.has_pending_kv_work()``, so it reads only state
+        that clears itself: ``_reqs_need_recv`` is emptied by every
+        ``build_connector_meta`` and ``_save_inflight`` by ``save_finished``.
+        Saves that are queued but not yet dispatched are covered there by the
+        scheduler's ``deferred_free_blocks``, which ``should_defer_free``
+        keeps populated for exactly those requests.
+        """
+        return bool(
+            self._reqs_need_recv or self._save_inflight or self._sidecar_save_inflight
+        )
+
     def save_finished(self, req_id) -> None:
         if isinstance(req_id, SaveOperationId):
             sid = str(req_id.req_id)

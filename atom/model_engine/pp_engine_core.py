@@ -12,6 +12,7 @@ from atom.distributed.pp_transport import PPStageTransport
 from atom.kv_transfer.disaggregation.pp_kv_aggregator import PPKVAggregator
 from atom.kv_transfer.disaggregation.types import KVConnectorOutput
 from atom.model_engine.engine_core import EngineCore
+from atom.model_engine.scheduler import ScheduledBatch
 
 logger = logging.getLogger("atom")
 
@@ -68,7 +69,10 @@ class PPEngineCoreProc(EngineCore):
                     continue
                 if self._in_flight or not self.scheduler.is_finished():
                     self._pp_head_step()
+                elif self.has_pending_kv_work():
+                    self._advance_idle_kv_transfer()
         finally:
+            self._drain_kv_work_at_exit()
             try:
                 self.runner_mgr.call_func("flush_pp_send", wait_out=True)
             except Exception:
@@ -169,6 +173,45 @@ class PPEngineCoreProc(EngineCore):
                 )
 
     # -- KV transfer PP aggregation ------------------------------------------
+
+    def has_pending_kv_work(self) -> bool:
+        """Extend the base predicate with the head's PP-only holding state.
+
+        ``_held_sending`` pins a mooncake send until every stage has reported
+        its save, and ``_pp_kv_aggregator`` holds the partial per-stage
+        tallies that release it. Both outlive the scheduler queues, and both
+        only drain from ``_poll_kv_transfer_progress``.
+        """
+        if super().has_pending_kv_work():
+            return True
+        if self._held_sending:
+            return True
+        return (
+            self._pp_kv_aggregator is not None and self._pp_kv_aggregator.has_pending()
+        )
+
+    def _dispatch_idle_offload_work(self) -> None:
+        """Override: fan the idle connector metadata out to every PP stage.
+
+        ``Scheduler.schedule()`` returns None once waiting and running are
+        both empty, so the connector-only batch it normally builds never
+        materializes while draining. Build the metadata directly instead, and
+        ship it downstream too — otherwise the stages never save their layers
+        and ``PPKVAggregator`` cannot reach a quorum.
+        """
+        if not self.kv_transfer_enabled:
+            return
+        connector = getattr(self.scheduler, "kv_connector", None)
+        if connector is None or not getattr(connector, "is_offload", False):
+            return
+        self._dispatch_connector_only_batch(
+            ScheduledBatch(
+                seqs={},
+                num_scheduled_tokens=[],
+                total_tokens_num=0,
+                connector_meta_output=connector.build_connector_meta(),
+            )
+        )
 
     def _dispatch_connector_only_batch(self, batch) -> None:
         """Dispatch the KV connector metadata of a batch that has no requests.
@@ -323,6 +366,13 @@ class PPEngineCoreProc(EngineCore):
                 if self.is_last and batch.produces_output():
                     self.pp_transport.send_tokens(fwd_out)
         finally:
+            # One last report so the head's exit drain can still reach its
+            # per-stage quorum for saves that landed after the final poll.
+            try:
+                if self.kv_transfer_enabled:
+                    self._poll_and_send_kv_status()
+            except Exception:
+                logger.exception("final KV status report during shutdown failed")
             try:
                 self.runner_mgr.call_func("flush_pp_send", wait_out=True)
             except Exception:

@@ -112,6 +112,9 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
     def should_defer_free(self, seq) -> bool:
         return self._impl.should_defer_free(seq)
 
+    def has_pending_work(self) -> bool:
+        return self._impl.has_pending_work()
+
     def save_finished(self, req_id) -> None:
         self._impl.save_finished(req_id)
 

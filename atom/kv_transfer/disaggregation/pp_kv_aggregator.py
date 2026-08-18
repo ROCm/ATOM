@@ -62,6 +62,14 @@ class PPKVAggregator:
             finished_saving=done_saving,
         )
 
+    def has_pending(self) -> bool:
+        """True while any request is still short of its per-stage quorum.
+
+        The head's busy loop keeps polling downstream stages while this holds;
+        the tallies only drain when the missing stages report in.
+        """
+        return bool(self._loading or self._saving or self._failed_loading)
+
     def reset(self) -> None:
         self._loading.clear()
         self._saving.clear()
