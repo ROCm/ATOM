@@ -713,6 +713,16 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         self.total_load_failures = 0
         self.total_save_requests = 0
         self.total_saved_tokens = 0
+        # Whether to store paged KV for a sequence that owns per-request state.
+        # Default off: `_decide_load_after_alloc` refuses the load leg for those
+        # sequences unconditionally, so the bytes have no reader inside this
+        # engine. Set `OFFLOAD_SAVE_PER_REQ_CACHE=1` to restore the old
+        # behaviour, which is only useful when a separate stateless consumer
+        # shares this LMCache instance -- and it is what the default should
+        # become the day that refusal is lifted.
+        self._save_per_req_cache = os.environ.get(
+            "OFFLOAD_SAVE_PER_REQ_CACHE", "0"
+        ).strip().lower() not in ("", "0", "false", "no", "off")
         # State offload tier loads admitted this pass, drained by
         # `build_connector_meta`. Not keyed by req_id: two requests may resume
         # off the same hash in one pass, each into its own group.
@@ -861,6 +871,14 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         # hbm_satisfies_after_alloc case where HBM prefix cache already covers
         # the lookup hit. Only suffix chunks computed by this request should be
         # stored.
+        if not self._save_per_req_cache and getattr(seq, "has_per_req_cache", False):
+            # Do not track this sequence for saving at all. Its load leg is
+            # refused unconditionally by `_decide_load_after_alloc`, so the
+            # bytes would have no reader in this engine -- and, more sharply, a
+            # tracked entry that is never emitted keeps `_has_pending_save`
+            # true forever, which makes `should_defer_free` hold this
+            # request's blocks for good.
+            return
         initial_saved = max(
             self._lmcache_hit_save_floor(ls),
             int(self._hit_save_floors.get(sid, 0)),

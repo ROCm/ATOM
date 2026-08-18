@@ -68,6 +68,10 @@ def _scheduler() -> LMCacheOffloadConnectorScheduler:
     sched.total_load_failures = 0
     sched.total_save_requests = 0
     sched.total_saved_tokens = 0
+    # Paged-KV saves for per-request-cache sequences: off in production because
+    # `_decide_load_after_alloc` refuses their load leg, kept on here so the
+    # save-path tests keep exercising the emission they are about.
+    sched._save_per_req_cache = True
     sched._pending_state_loads = []
     sched._min_load_tokens = 0
     sched._lock = threading.Lock()
@@ -2130,6 +2134,33 @@ def _hybrid_seq(seq_id, num_prompt, block_table):
         block_table=list(block_table),
         has_per_req_cache=True,
     )
+
+
+def test_per_req_cache_kv_is_not_saved_while_its_load_is_refused():
+    """The save leg follows the load leg. With the refusal above in place the
+    stored bytes have no reader in this engine, and a tracked entry that never
+    emits keeps `_has_pending_save` true forever -- which makes
+    `should_defer_free` hold the request's blocks for good."""
+    sched = _scheduler()
+    sched._save_per_req_cache = False
+    seq = _hybrid_seq(771, 16, [1, 2, 3, 4])
+    seq.num_cached_tokens = 4
+
+    sched.update_state_after_alloc(seq)
+
+    assert str(seq.id) not in sched._save_tracker
+    assert sched._has_pending_save(seq) is False
+
+    # A stateless sequence in the same call is still tracked.
+    stateless = SimpleNamespace(
+        id=772,
+        num_prompt_tokens=16,
+        token_ids=list(range(16)),
+        num_cached_tokens=4,
+        block_table=[1, 2, 3, 4],
+    )
+    sched.update_state_after_alloc(stateless)
+    assert str(stateless.id) in sched._save_tracker
 
 
 def test_per_req_cache_sequence_is_refused_the_offload_load(caplog):
