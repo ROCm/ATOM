@@ -343,12 +343,11 @@ class EngineArgs:
                 "For models with per-request state (DeepSeek-V4 compressor "
                 "ring and sliding window, GDN recurrent state), keep a state "
                 "checkpoint every N tokens of context so a later prefix hit "
-                "can resume there. "
-                "A prompt shorter than N publishes nothing, which is what keeps "
-                "the feature free on workloads that never reuse a prefix. Must "
-                "be a multiple of the prefix-cache hash block size; 0 disables "
-                "checkpoints entirely. Prefill chunks are aligned to these "
-                "positions, so this also quantizes chunk boundaries."
+                "can resume there. PAGE-backed state also checkpoints each "
+                "prompt's final complete hash block; when it is an interval "
+                "boundary only one checkpoint is stored. Must be a multiple "
+                "of the prefix-cache hash block size; 0 disables checkpoints "
+                "entirely. Prefill chunks are aligned to checkpoint positions."
             ),
         )
         parser.add_argument(

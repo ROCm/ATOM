@@ -1100,6 +1100,127 @@ class TestPagedCopyCheckpoint:
         assert copying._checkpoint_room(seq, True) == 0
 
 
+class TestPagedCopyPromptEndCheckpoint:
+    """The final state+SWA Active Slot image joins the PAGE free pool."""
+
+    def _admitted(self, interval, num_tokens):
+        bm = make_block_manager(
+            paged_copy_config(state_checkpoint_interval_tokens=interval),
+            state_runtime=PAGED_COPY_RUNTIME,
+        )
+        seq = stateful_seq(list(range(num_tokens)))
+        bm.allocate(seq, bm.can_allocate(seq))
+        return bm, seq
+
+    @staticmethod
+    def _hash_at(bm, seq, pos):
+        return bm.kv.block(seq.block_table[pos // bm.hash_block_size - 1]).hash
+
+    def test_off_interval_prompt_end_queues_one_full_slot_store(self):
+        interval = 8 * BLOCK
+        bm, seq = self._admitted(interval, 5 * BLOCK)
+        checkpoints = bm.paged_state_checkpoints
+        free_pages = bm.kv.num_free
+
+        assert bm.checkpoint_limit(seq) == 0
+        assert bm._prefill_end_checkpoint_pos(seq) == 5 * BLOCK
+        assert bm.checkpoint_cut(seq, 0, seq.num_prompt_tokens) == 5 * BLOCK
+
+        bm.hash_blocks(seq, seq.num_prompt_tokens)
+        h = self._hash_at(bm, seq, 5 * BLOCK)
+        ops = bm.take_state_maintenance_ops()
+
+        assert len(ops.checkpoint_stores) == 1
+        store = ops.checkpoint_stores[0]
+        assert store.src_slot == seq.per_req_cache_group
+        assert store.total_bytes == PAGED_COPY_SPEC.slot_bytes
+        assert len(store.unit_ids) == PAGED_COPY_SPEC.units_per_checkpoint
+        assert bm.kv.num_free == free_pages - PAGED_COPY_SPEC.units_per_checkpoint
+        assert checkpoints.store.lookup(h) == -1
+
+        bm.complete_previous_state_batch()
+        assert checkpoints.store.contains(h)
+
+    def test_interval_rung_is_not_displaced_by_prompt_end(self):
+        interval = 4 * BLOCK
+        bm, seq = self._admitted(interval, 5 * BLOCK)
+        checkpoints = bm.paged_state_checkpoints
+
+        assert bm.checkpoint_cut(seq, 0, seq.num_prompt_tokens) == interval
+        assert bm.checkpoint_cut(seq, interval, seq.num_prompt_tokens) == 5 * BLOCK
+
+        bm.hash_blocks(seq, interval, start_tokens=0)
+        rung_hash = self._hash_at(bm, seq, interval)
+        assert len(bm.take_state_maintenance_ops().checkpoint_stores) == 1
+        bm.complete_previous_state_batch()
+
+        bm.hash_blocks(seq, BLOCK, start_tokens=interval)
+        end_hash = self._hash_at(bm, seq, 5 * BLOCK)
+        assert len(bm.take_state_maintenance_ops().checkpoint_stores) == 1
+        bm.complete_previous_state_batch()
+
+        assert rung_hash != end_hash
+        assert checkpoints.store.contains(rung_hash)
+        assert checkpoints.store.contains(end_hash)
+
+    def test_prompt_end_on_interval_queues_exactly_one_store(self):
+        interval = 4 * BLOCK
+        bm, seq = self._admitted(interval, 2 * interval)
+        checkpoints = bm.paged_state_checkpoints
+        free_pages = bm.kv.num_free
+
+        assert bm._prefill_end_checkpoint_pos(seq) == 2 * interval
+        assert bm.checkpoint_limit(seq) == 2 * interval
+        assert bm.checkpointers_at(seq, 2 * interval) == [checkpoints]
+
+        bm.hash_blocks(seq, seq.num_prompt_tokens)
+        ops = bm.take_state_maintenance_ops()
+
+        assert len(ops.checkpoint_stores) == 1
+        assert checkpoints.checkpoints_kept == 1
+        assert bm.kv.num_free == free_pages - checkpoints.store.units_per_checkpoint
+
+    def test_unaligned_prompt_anchors_last_hash_boundary(self):
+        interval = 8 * BLOCK
+        bm, seq = self._admitted(interval, 5 * BLOCK + 2)
+
+        assert bm._prefill_end_checkpoint_pos(seq) == 5 * BLOCK
+        assert bm.checkpoint_cut(seq, 0, seq.num_prompt_tokens) == 5 * BLOCK
+        assert bm.checkpointers_at(seq, seq.num_prompt_tokens) == []
+        assert bm.checkpointers_at(seq, 5 * BLOCK) == [bm.paged_state_checkpoints]
+
+        bm.hash_blocks(seq, 5 * BLOCK, start_tokens=0)
+        assert len(bm.take_state_maintenance_ops().checkpoint_stores) == 1
+        bm.complete_previous_state_batch()
+
+        # The two-token tail advances prefill but has no complete block/hash,
+        # so it must not silently re-file the later state under the old hash.
+        bm.hash_blocks(seq, 2, start_tokens=5 * BLOCK)
+        assert bm.take_state_maintenance_ops().checkpoint_stores == ()
+
+    def test_interval_zero_still_disables_prompt_end_store(self):
+        bm, seq = self._admitted(0, 5 * BLOCK)
+
+        assert bm._prefill_end_checkpoint_pos(seq) == 0
+        assert bm.checkpoint_cut(seq, 0, seq.num_prompt_tokens) == 0
+        bm.hash_blocks(seq, seq.num_prompt_tokens)
+        assert bm.take_state_maintenance_ops().checkpoint_stores == ()
+
+    def test_final_prefill_marks_required_followup_store(self):
+        scheduler = make_scheduler(
+            paged_copy_config(state_checkpoint_interval_tokens=8 * BLOCK),
+            state_runtime=PAGED_COPY_RUNTIME,
+        )
+        seq = stateful_seq(list(range(5 * BLOCK)))
+        scheduler.add(seq)
+
+        batch, scheduled = scheduler.schedule()
+
+        assert scheduled
+        assert batch.is_final_chunk == [True]
+        assert batch.requires_followup_state_checkpoint is True
+
+
 # ── Checkpoints past the prompt ────────────────────────────────────────────
 
 
