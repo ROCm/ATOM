@@ -293,114 +293,111 @@ class CUDAGraphWrapper:
         return entry.output
 
 
-class CudagraphCaptureRunner:
-    """Generic capture/replay for a split-op body captured into its OWN cudagraph.
+class StableOutputs:
+    """Persistent output slots for a split op running inside PIECEWISE.
 
-    Extracted from the AF_PIECEWISE attention-core path (DeepSeek-V4 DSpark). A
-    caller builds a graph key and the named inputs, then calls run() -- usually
-    via AttnFfnPiecewise.run (atom/utils/attn_ffn_piecewise.py), which owns the
-    model-facing contract. The runner owns the per-key graph cache and a
-    dedicated graph pool (isolated from the dense-piece pool). zero-copy args are
-    captured on directly (no per-step copy); others cloned at capture, copied at
-    replay.
-    The output copy is baked INSIDE the graph so replay refreshes a persistent
-    buffer with no Python. Behavior is identical to the old inline V4 state machine.
+    The dense graph piece downstream of the op was captured reading ONE fixed
+    address per key. Whatever produces the op's output -- a replayed cudagraph
+    or a plain eager call -- has to deliver it there, or the piece reads a
+    tensor the allocator has since recycled.
+
+    Deliberately not part of the capture runner: a slot is needed whenever the
+    op sits inside PIECEWISE, whether or not anything was ever captured.
+    """
+
+    def __init__(self):
+        self._slots: dict = {}
+
+    def slot(self, key, sample: torch.Tensor) -> torch.Tensor:
+        """This key's persistent buffer, shaped from `sample` on first use."""
+        buf = self._slots.get(key)
+        if buf is None:
+            buf = torch.empty_like(sample)
+            self._slots[key] = buf
+        return buf
+
+    def deliver(self, key, out: torch.Tensor) -> torch.Tensor:
+        """Copy an eagerly computed `out` into its slot and return the slot."""
+        buf = self.slot(key, out)
+        buf.copy_(out)
+        return buf
+
+
+class CudagraphCaptureRunner:
+    """A cache of cudagraphs, keyed by whatever the caller decides identifies one.
+
+    Give it a key, the inputs a graph should read, and the compute: it records
+    once and replays after that. It does not know who is calling or why --
+    deciding WHETHER a step should be captured, and where the output has to
+    land, belongs to the caller (see `AttnFfnPiecewise` in
+    atom/utils/attn_ffn_piecewise.py, the attention-core user of this).
+
+    Holds its own graph pool, isolated from the dense-piece pool.
     """
 
     def __init__(self, capture_error_mode: str = "thread_local"):
         self._graphs: dict = {}
-        self._out_bufs: dict = {}  # out_key -> persistent output buffer (stable addr)
         self._pool = None
         self._capture_error_mode = capture_error_mode
 
-    def _out_buf(self, out_key, sample):
-        b = self._out_bufs.get(out_key)
-        if b is None:
-            b = torch.empty_like(sample)
-            self._out_bufs[out_key] = b
-        return b
+    def has(self, key) -> bool:
+        return key in self._graphs
 
-    def stabilize(self, out_key, out, piecewise):
-        """PIECEWISE: funnel `out` into the fixed per-out_key buffer the downstream
-        dense piece was captured reading from (never a recyclable pool tensor).
-        Non-piecewise (FULL / eager): passthrough."""
-        if not piecewise:
-            return out
-        b = self._out_buf(out_key, out)
-        b.copy_(out)
-        return b
+    def input_buffers(
+        self, named_args: dict, input_names: tuple, zc: frozenset
+    ) -> dict:
+        """Where a graph captured now will read each input from.
 
-    def run(
-        self,
-        *,
-        key,
-        out_key,
-        named_args: dict,
-        input_names: tuple,
-        zc: frozenset,
-        compute_fn: Callable,
-        piecewise: bool,
-        in_hipgraph: bool,
-    ):
-        """Dispatch capture / replay / eager for one op invocation. The runner
-        computes the schedule and owns the output buffers + stabilize.
-
-        key         : hashable graph key (caller-built)
-        out_key     : (layer, num_tokens) key for the persistent output buffer
-        named_args  : {name: input tensor} (values may be None)
-        input_names : the names in the order compute_fn declares them
-        zc          : zero-copy input NAMES (captured directly, skipped at replay)
-        compute_fn  : callable(**named) -> output tensor (the core compute)
-        piecewise   : forward is in PIECEWISE cudagraph mode
-        in_hipgraph : this is the capture forward (vs real decode replay)
+        A zero-copy input is captured on the caller's own tensor: that address
+        goes into the graph, and whoever produces it must keep writing to the
+        same address every step. Everything else gets a clone this runner owns
+        and refreshes itself at replay.
 
         Names rather than positions: an index set silently means something else
         the moment an argument is added, and cannot be read without counting.
         """
-        if not piecewise:
-            # FULL / eager: there are no piecewise graphs to capture or replay,
-            # and no downstream piece waiting on a fixed output address.
-            return compute_fn(**named_args)
+        bufs = {}
+        for n in input_names:
+            src = named_args[n]
+            bufs[n] = src if (n in zc or src is None) else src.clone()
+        return bufs
 
-        # `in_hipgraph` is True only inside the capture pass. It says WHICH KIND
-        # of forward this is -- building the graphs vs serving a real step -- not
-        # whether we are currently inside a graph.
-        capturing = in_hipgraph
-        graph_ready = key in self._graphs
+    def capture(
+        self, key, in_bufs: dict, compute_fn: Callable, out_buf: torch.Tensor
+    ) -> None:
+        """Record `compute_fn(**in_bufs)` under `key`, landing in `out_buf`.
 
-        if capturing and not graph_ready:
-            in_bufs = {}
-            for n in input_names:
-                src = named_args[n]
-                in_bufs[n] = src if (n in zc or src is None) else src.clone()
+        The output copy goes INSIDE the graph, so a later replay refreshes
+        `out_buf` with no Python at all.
 
-            warm_out = compute_fn(**in_bufs)
-            out_buf = self._out_buf(out_key, warm_out)  # persistent, stable addr
-            graph = torch.cuda.CUDAGraph()
-            if self._pool is None:
-                self._pool = torch.cuda.graph_pool_handle()
-            with torch.cuda.graph(
-                graph,
-                pool=self._pool,
-                stream=torch.cuda.current_stream(),
-                capture_error_mode=self._capture_error_mode,
-            ):
-                cg_out = compute_fn(**in_bufs)
-                out_buf.copy_(cg_out)  # output copy baked into graph
-            self._graphs[key] = {"graph": graph, "in": in_bufs, "out": out_buf}
-            # Both runs above fed on `in_bufs` (clones), so neither result is
-            # this forward's answer. Compute it once more on the real inputs.
-            return self.stabilize(out_key, compute_fn(**named_args), piecewise)
+        Warm the compute up yourself first: workspace allocation, lazy init and
+        autotuning are one-time work that must not be recorded. That warmup is
+        also what gives you the sample `out_buf` is shaped from.
+        """
+        graph = torch.cuda.CUDAGraph()
+        if self._pool is None:
+            self._pool = torch.cuda.graph_pool_handle()
+        with torch.cuda.graph(
+            graph,
+            pool=self._pool,
+            stream=torch.cuda.current_stream(),
+            capture_error_mode=self._capture_error_mode,
+        ):
+            out_buf.copy_(compute_fn(**in_bufs))
+        self._graphs[key] = {"graph": graph, "in": in_bufs, "out": out_buf}
 
-        if graph_ready and not capturing:
-            entry = self._graphs[key]
-            for n, buf in entry["in"].items():
-                if n in zc:
-                    continue
-                src = named_args[n]
-                if buf is not None and src is not None:
-                    buf.copy_(src)
-            entry["graph"].replay()
-            return entry["out"]  # the graph copied the result in for us
+    def replay(self, key, named_args: dict, zc: frozenset) -> torch.Tensor:
+        """Refresh the inputs this runner owns, replay, and return the output.
 
-        return self.stabilize(out_key, compute_fn(**named_args), piecewise)
+        Zero-copy inputs are skipped: the graph reads the producer's buffer
+        directly, so there is nothing to copy.
+        """
+        entry = self._graphs[key]
+        for n, buf in entry["in"].items():
+            if n in zc:
+                continue
+            src = named_args[n]
+            if buf is not None and src is not None:
+                buf.copy_(src)
+        entry["graph"].replay()
+        return entry["out"]  # the graph copied the result in for us

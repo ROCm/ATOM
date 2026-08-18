@@ -116,7 +116,7 @@ from atom.utils.attn_ffn_piecewise import (
     BufferShape,
     DecodeAttnFfnPiecewise,
 )
-from atom.utils.cuda_graph import CudagraphCaptureRunner
+from atom.utils.cuda_graph import CudagraphCaptureRunner, StableOutputs
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import AttnState, get_forward_context
@@ -174,6 +174,10 @@ def _v4_attention_fake(
 # AF_PIECEWISE: attn-core capture/replay (keyed layer, bucket_bs, q_eff, nt_pad).
 # Owns its isolated graph pool + per-key graph cache + output buffers.
 _v4_attn_runner = CudagraphCaptureRunner()
+# The fixed addresses the dense piece downstream of the attn core reads. Needed
+# under PIECEWISE whether or not the core itself is captured, so it is separate
+# from the graph cache above.
+_v4_attn_outputs = StableOutputs()
 
 
 class V4AttnFfn(DecodeAttnFfnPiecewise):
@@ -321,10 +325,9 @@ def v4_core_attention(
         getattr(fc, "cudagraph_runtime_mode", None) == CUDAGraphMode.PIECEWISE
     )
 
-    # FULL / plain PIECEWISE / eager: the core is not captured, so take the
-    # pre-refactor path directly. `attn_ffn.run()` would only reach `stabilize`
-    # here anyway (its `enabled` is False), and these modes are not what
-    # AF_PIECEWISE is for -- keep them on the code they were measured with.
+    # FULL / plain PIECEWISE / eager: the core is not captured, so nothing here
+    # needs the graph cache. Call it directly rather than through `attn_ffn`,
+    # which exists for the captured path.
     if not self.attn_ffn_piecewise:
         out = self._attn_core(
             x, q, kv_pre, qr, qr_scale, positions, idx_q_quant, idx_weights, idx_q_scale
@@ -334,14 +337,14 @@ def v4_core_attention(
         # PIECEWISE: the downstream dense piece was captured reading a fixed
         # address, so the output has to land in the persistent per-(layer, rows)
         # buffer rather than in a recyclable pool tensor.
-        return _v4_attn_runner.stabilize((layer_name, int(out.shape[0])), out, True)
+        return _v4_attn_outputs.deliver((layer_name, int(out.shape[0])), out)
 
     # AF_PIECEWISE: the core gets its own cudagraph. Its inputs are outputs of
     # the preceding graph piece and live in the cudagraph pool. #1884 snapshotted
     # them out of it on entry; #1902 dropped that once each num_tokens bucket got
     # its own pool, since a bucket's graphs only ever reuse memory among
     # themselves. They are passed through as-is.
-    return self.attn_ffn.run(
+    return self.attn_ffn.dispatch(
         forward_context=fc,
         layer_name=layer_name,
         named_args={
@@ -2575,7 +2578,10 @@ class DeepseekV4Attention(nn.Module):
             cudagraph_mode is not None and cudagraph_mode.is_attn_ffn_piecewise()
         )
         self.attn_ffn = V4AttnFfn(
-            self, runner=_v4_attn_runner, enabled=self.attn_ffn_piecewise
+            self,
+            runner=_v4_attn_runner,
+            outputs=_v4_attn_outputs,
+            enabled=self.attn_ffn_piecewise,
         )
         if self.attn_ffn_piecewise:
             # single-stream: captured graph can't hold the compressor fork/join

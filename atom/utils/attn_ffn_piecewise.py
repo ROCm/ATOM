@@ -154,9 +154,13 @@ class AttnFfnPiecewise:
     # Rows the staging buffers cover; a longer step falls back to the copy path.
     max_tokens: int = 512
 
-    def __init__(self, layer, *, runner, enabled: bool):
+    def __init__(self, layer, *, runner, outputs, enabled: bool):
         self.layer = layer
+        # Two collaborators, two concerns: `runner` caches the cudagraphs,
+        # `outputs` owns the fixed address the downstream dense piece reads.
+        # An uncaptured step still needs the second one.
         self.runner = runner
+        self.outputs = outputs
         # Whether this layer's core is captured at all (the cudagraph mode).
         self.enabled = bool(enabled)
         self.buffers: ZeroCopyBuffers | None = None
@@ -258,7 +262,26 @@ class AttnFfnPiecewise:
         bufs = self.buffers
         return bufs if bufs is not None and bufs.fits(n) else None
 
-    def run(
+    def cache_key(self, forward_context, layer_name: str, named_args: dict):
+        """This step's cudagraph key, or None if it must not be captured.
+
+        num_tokens is a KEY DIM, not an incidental one: the core graph is
+        captured at exactly this flat row count, so a zero-copy input's read
+        length equals what the producer upstream wrote (no padded tail).
+        """
+        context = getattr(forward_context, "context", None)
+        num_tokens = int(named_args[self.input_names[0]].shape[0])
+        eligible = (
+            self.enabled
+            and not getattr(context, "is_dummy_run", False)
+            and getattr(forward_context, "attn_metadata", None) is not None
+            and num_tokens <= self.max_tokens
+        )
+        if not eligible:
+            return None
+        return (layer_name, num_tokens) + tuple(self.graph_key(forward_context))
+
+    def dispatch(
         self,
         *,
         forward_context,
@@ -269,31 +292,34 @@ class AttnFfnPiecewise:
     ) -> torch.Tensor:
         """Capture / replay / eager for one invocation. Every caller goes through
         here, so WHETHER to capture, and under what key, is stated once."""
-        num_tokens = int(named_args[self.input_names[0]].shape[0])
-        context = getattr(forward_context, "context", None)
-        capture_it = (
-            self.enabled
-            and not getattr(context, "is_dummy_run", False)
-            and getattr(forward_context, "attn_metadata", None) is not None
-            and num_tokens <= self.max_tokens
-        )
-        if not capture_it:
-            return self.runner.stabilize(out_key, self.core(**named_args), piecewise)
+        if not piecewise:
+            # FULL / eager: nothing is captured, and no dense piece downstream
+            # is holding an address we have to deliver to.
+            return self.core(**named_args)
 
-        # num_tokens is a KEY DIM, not an incidental one: the core graph is
-        # captured at exactly this flat row count so a zero-copy input's read
-        # length equals what the producer upstream wrote (no padded tail).
-        key = (layer_name, num_tokens) + tuple(self.graph_key(forward_context))
-        return self.runner.run(
-            key=key,
-            out_key=out_key,
-            named_args=named_args,
-            input_names=self.input_names,
-            zc=self.zero_copy_names,
-            compute_fn=self.core,
-            piecewise=piecewise,
-            in_hipgraph=getattr(forward_context, "in_hipgraph", False),
-        )
+        key = self.cache_key(forward_context, layer_name, named_args)
+        # True only inside the capture pass: WHICH KIND of forward this is,
+        # building the graphs vs serving a real step.
+        capturing = getattr(forward_context, "in_hipgraph", False)
+
+        if key is not None:
+            if capturing and not self.runner.has(key):
+                # First time the capture pass reaches this key. Warm up on the
+                # buffers the graph will read, size the output slot from that
+                # result, then record.
+                in_bufs = self.runner.input_buffers(
+                    named_args, self.input_names, self.zero_copy_names
+                )
+                slot = self.outputs.slot(out_key, self.core(**in_bufs))
+                self.runner.capture(key, in_bufs, self.core, slot)
+            elif self.runner.has(key) and not capturing:
+                return self.runner.replay(key, named_args, self.zero_copy_names)
+
+        # Everything else: not eligible for capture, the capture pass revisiting
+        # a key, or a step whose key was never captured. Also the tail of the
+        # capture branch above -- it fed on clones, so its result is not this
+        # forward's answer. Compute on the real inputs and deliver to the slot.
+        return self.outputs.deliver(out_key, self.core(**named_args))
 
 
 def decode_bucket_key(forward_context) -> tuple:

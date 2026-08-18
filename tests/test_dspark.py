@@ -335,6 +335,95 @@ def test_scheduler_multi_request_global_topk():
 # ---------------------------------------------------------------------------
 
 
+def _dispatch_probe(*, piecewise, capturing, graph_ready, enabled=True, dummy=False):
+    """Drive AttnFfnPiecewise.dispatch once against fake collaborators and report
+    which of capture / replay / deliver / bare-core it chose."""
+    import types
+
+    from atom.utils.attn_ffn_piecewise import AttnFfnPiecewise
+
+    log = []
+
+    class FakeRunner:
+        def has(self, key):
+            return graph_ready
+
+        def input_buffers(self, named_args, input_names, zc):
+            return dict(named_args)
+
+        def capture(self, key, in_bufs, compute_fn, out_buf):
+            log.append("capture")
+
+        def replay(self, key, named_args, zc):
+            log.append("replay")
+            return "replayed"
+
+    class FakeOutputs:
+        def slot(self, key, sample):
+            return sample
+
+        def deliver(self, key, out):
+            log.append("deliver")
+            return out
+
+    class Probe(AttnFfnPiecewise):
+        def core(self, *, x):
+            log.append("core")
+            return x
+
+    probe = Probe(
+        layer=None, runner=FakeRunner(), outputs=FakeOutputs(), enabled=enabled
+    )
+    fc = types.SimpleNamespace(
+        context=types.SimpleNamespace(is_dummy_run=dummy),
+        attn_metadata=object(),
+        in_hipgraph=capturing,
+    )
+    probe.dispatch(
+        forward_context=fc,
+        layer_name="l0",
+        named_args={"x": torch.ones(4)},
+        out_key=("l0", 4),
+        piecewise=piecewise,
+    )
+    return log
+
+
+def test_dispatch_picks_capture_replay_or_eager():
+    # The decision table, pinned. Every row that is not a replay must end in a
+    # deliver: whatever computed the output still owes it to the fixed address
+    # the downstream dense piece reads.
+    P = _dispatch_probe
+
+    # Not piecewise: no graph cache, and no slot to deliver to either.
+    assert P(piecewise=False, capturing=False, graph_ready=False) == ["core"]
+    assert P(piecewise=False, capturing=True, graph_ready=True) == ["core"]
+
+    # Capture pass, first time this key appears: warm up, record, then compute
+    # the real answer (the recording fed on clones).
+    assert P(piecewise=True, capturing=True, graph_ready=False) == [
+        "core",
+        "capture",
+        "core",
+        "deliver",
+    ]
+    # Real step with a graph ready: replay only.
+    assert P(piecewise=True, capturing=False, graph_ready=True) == ["replay"]
+    # Capture pass revisiting a key, and a real step never captured: eager.
+    assert P(piecewise=True, capturing=True, graph_ready=True) == ["core", "deliver"]
+    assert P(piecewise=True, capturing=False, graph_ready=False) == ["core", "deliver"]
+
+    # Ineligible steps never touch the cache, but still owe the slot.
+    assert P(piecewise=True, capturing=True, graph_ready=False, enabled=False) == [
+        "core",
+        "deliver",
+    ]
+    assert P(piecewise=True, capturing=False, graph_ready=True, dummy=True) == [
+        "core",
+        "deliver",
+    ]
+
+
 def test_zero_copy_buffers_stage_returns_a_fixed_address():
     from atom.utils.attn_ffn_piecewise import ZeroCopyBuffers
 
@@ -402,7 +491,9 @@ def test_v4_core_inputs_come_from_the_signature_and_exclude_positions():
     )
 
     inst = V4AttnFfn.__new__(V4AttnFfn)
-    V4AttnFfn.__init__(inst, layer=types.SimpleNamespace(), runner=None, enabled=False)
+    V4AttnFfn.__init__(
+        inst, layer=types.SimpleNamespace(), runner=None, outputs=None, enabled=False
+    )
     # positions is copied per step: capturing on it costs ~2pts of accuracy, and
     # 71a3e941's ragged-lens staging does not substitute for the exclusion.
     assert set(inst.zero_copy_names) == set(inst.input_names) - {"positions"}
