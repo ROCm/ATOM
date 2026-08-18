@@ -1643,26 +1643,42 @@ class Scheduler:
             )
 
             if needs_remote_load:
-                if seq.state_load_hash != -1:
-                    # Two transfers, one park, one report to resolve it: the
+                if seq.state_load_hash != -1 and not seq.state_joint_boundary_tokens:
+                    # Two transfers, one park, and one report to resolve it: the
                     # first completion would unpark the request while the other
-                    # is still writing. Unreachable today and asserted rather
-                    # than handled -- `_decide_load_after_alloc` refuses every
-                    # KV load for a `has_per_req_cache` sequence (the offload
-                    # README's "State offload tier" section), and a state load
-                    # exists only for such a sequence. Whoever lifts that
-                    # refusal owes a joint park (`state_tier._JointPark`)
-                    # rather than this branch.
+                    # is still writing. Only reachable when the two legs were
+                    # decided separately -- a joint load goes through
+                    # `_JointPark` in the connector and arrives here as one
+                    # event -- so this is the case where the pairing is not
+                    # there to trust.
                     logger.warning(
                         "seq %s has both a remote KV load and a state load "
-                        "pending; dropping the state load. The per-request "
-                        "cache guard in the offload connector should have made "
-                        "this impossible.",
+                        "pending, with no joint boundary; dropping the state "
+                        "load.",
                         seq.id,
                     )
                     self.block_manager.cancel_state_load(seq)
                 self._park_for_remote_load(seq, skipped_waiting_requests)
                 continue
+
+            if seq.state_joint_boundary_tokens:
+                # The KV leg was refused after the state leg had already been
+                # aimed at the joint boundary, so the state now claims a prefix
+                # whose KV nobody is going to fetch. Disown the boundary rather
+                # than forward over it: `_decide_load_after_alloc` logs the
+                # reason under `[OFFLOAD-LOAD-SKIP]`.
+                logger.debug(
+                    "[JOINT-DISOWN] seq %s: KV leg refused at boundary %d; "
+                    "recomputing from %d",
+                    seq.id,
+                    seq.state_joint_boundary_tokens,
+                    seq.num_cached_tokens,
+                )
+                if seq.state_load_hash != -1:
+                    self.block_manager.cancel_state_load(seq)
+                seq.num_cached_tokens = 0
+                seq.state_joint_boundary_tokens = 0
+                seq.state_joint_boundary_hash = -1
 
             if seq.state_load_hash != -1:
                 # The state boundary this request kept is in LMCache, not HBM.
@@ -1726,6 +1742,18 @@ class Scheduler:
                 logger.info(
                     "state checkpoints: %s",
                     " ".join(f"{k}={v}" for k, v in sorted(fates.items())),
+                )
+            # Its own line rather than a key in the one above: those are what
+            # became of a checkpoint, this is whether a prefix in LMCache could
+            # be paired with one at all. Silent unless the joint load is on,
+            # since both counters stay 0 without it.
+            chosen = self.block_manager.joint_boundaries
+            skips = self.block_manager.joint_skips
+            if chosen or skips:
+                logger.info(
+                    "joint kv: boundaries=%d | %s",
+                    chosen,
+                    " ".join(f"{k}={v}" for k, v in sorted(skips.items())),
                 )
 
         total_tokens_num_prefill = sum(num_scheduled_tokens)
@@ -1989,7 +2017,7 @@ class Scheduler:
         seq.status = SequenceStatus.WAITING
         if not self._connector_flag("is_offload"):
             self._uncount_inflight_load(seq)
-        if seq.state_load_hash != -1:
+        if seq.state_load_hash != -1 or seq.state_joint_boundary_tokens:
             # The state behind this request's boundary never arrived, so the
             # boundary is not its history. Disown it exactly as
             # `BlockManager.allocate` does at admission: the blocks stay
@@ -2002,6 +2030,11 @@ class Scheduler:
             # records the disowned figure and not the one the load promised.
             seq.num_cached_tokens = 0
             seq.state_load_hash = -1
+            # A joint boundary that failed on either leg is not this request's
+            # history any more than a state-only one is, and leaving it set
+            # would let the connector clamp a later lookup to it.
+            seq.state_joint_boundary_tokens = 0
+            seq.state_joint_boundary_hash = -1
         seq.offload_loaded = False
         seq.offload_loaded_tokens = seq.num_cached_tokens
         seq.offload_load_start_tokens = None
@@ -2047,7 +2080,14 @@ class Scheduler:
         # already the boundary the state now covers. All that is left is to
         # stop calling the load pending -- the index was settled when the
         # report arrived.
+        #
+        # A joint load is the one case where both halves fire: the KV leg raised
+        # `num_cached_tokens` to the joint boundary just above, and the state
+        # leg's entry is settled here. Both legs reported before this ran --
+        # `_JointPark` holds the wake until they have.
         seq.state_load_hash = -1
+        seq.state_joint_boundary_tokens = 0
+        seq.state_joint_boundary_hash = -1
 
     def _is_offload_prefill_resume(self, seq: Sequence) -> bool:
         """True when offload already owns blocks and should resume suffix prefill.
@@ -2069,8 +2109,16 @@ class Scheduler:
         """Ask the connector whether this prefill should park for remote KV."""
         if skip or self.kv_connector is None:
             return False
-        _ext_tokens, needs_remote_load = self.kv_connector.get_num_new_matched_tokens(
+        ext_tokens, needs_remote_load = self.kv_connector.get_num_new_matched_tokens(
             seq
+        )
+        # Keep the lookup's answer, not just the park flag: `can_allocate` runs
+        # next and a hybrid's two legs have to be aimed at one boundary, for
+        # which this is the KV leg's ceiling. In tokens, and absolute -- the
+        # connector reports what it found *beyond* what the seq already has.
+        seq.offload_kv_prefix_tokens = int(ext_tokens) + int(seq.num_cached_tokens)
+        seq.offload_kv_chunk_tokens = int(
+            getattr(self.kv_connector, "chunk_size", 0) or 0
         )
         return needs_remote_load
 

@@ -390,3 +390,21 @@ def state_offload_staging_groups() -> int:
         )
         return 0
     return depth
+
+
+def state_offload_joint_kv() -> bool:
+    """Whether a sequence with per-request state may also load its paged KV.
+
+    Off by default. On, `BlockManager.can_allocate` may pick a boundary the
+    HBM prefix cache does not reach, with the state leg served by this tier and
+    the KV leg by LMCache, and both legs are held to that one boundary. The
+    connector refuses the KV leg outright while this is off, which is the
+    behaviour every measurement before this flag existed was taken under.
+
+    Same truthiness convention as `OFFLOAD_STATE`, and gated on it: the joint
+    load needs the state leg, so it cannot mean anything with the tier off.
+    """
+    if state_offload_staging_groups() <= 0:
+        return False
+    raw = os.environ.get("OFFLOAD_STATE_JOINT_KV", "0").strip().lower()
+    return bool(raw) and raw not in ("0", "false", "no", "off")

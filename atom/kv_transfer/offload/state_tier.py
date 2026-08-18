@@ -256,6 +256,16 @@ class _JointPark:
         else:
             self._ready.add(req_id)
 
+    def waits_for(self, req_id: str) -> bool:
+        """Whether this park still owes `req_id` a leg.
+
+        Asked before settling, because the two legs report through channels a
+        single-leg request also uses: an id this park never armed has to pass
+        straight through, and `_settle` cannot say so afterwards -- it ignores
+        unknown ids, which is indistinguishable from a leg that landed.
+        """
+        return req_id in self._need
+
     def take_ready(self) -> tuple[set[str], set[str]]:
         ready, failed = set(self._ready), set(self._ready_failed)
         self._ready.clear()

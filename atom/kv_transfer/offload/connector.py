@@ -99,6 +99,13 @@ class LMCacheOffloadConnector(KVConnectorBase):
         # `AttentionBackend._submit_state_spills` probes for it on every batch
         # and an AttributeError there would be a forward-path crash.
         self._state_tier = None
+        from atom.kv_transfer.offload.state_tier import _JointPark
+
+        # Requests whose KV leg and state leg must both land before the engine
+        # is told anything. Inert until something arms it, so it costs a
+        # dictionary lookup per report while `OFFLOAD_STATE_JOINT_KV` is off --
+        # the engine only ever issues both legs for one request with it on.
+        self._joint_park = _JointPark()
 
     # -- lifecycle --------------------------------------------------------
     def register_kv_caches(
@@ -369,6 +376,7 @@ class LMCacheOffloadConnector(KVConnectorBase):
     def start_load_kv(self, metadata) -> None:
         if not isinstance(metadata, LMCacheOffloadMetadata):
             return
+        self._arm_joint_loads(metadata)
         self._start_state_loads(metadata)
         loading_lookup_ids = {
             str(req.req_id)
@@ -398,6 +406,29 @@ class LMCacheOffloadConnector(KVConnectorBase):
                     req,
                     save_ready_event,
                 )
+
+    def _arm_joint_loads(self, metadata) -> None:
+        """Hold a request that has both legs until both of them report.
+
+        The two legs come back through one channel -- `get_finished` unions the
+        tier's report into the KV one -- so an id in both collapses to a single
+        wake, and the engine would resume the suffix prefill while the other
+        transfer is still writing. Whichever leg is slower decides which half of
+        the prefix is garbage, and neither raises.
+
+        Armed per step from the metadata that carries both lists, which is all
+        the pairing there is to do: a request is parked while either leg is in
+        flight, so a second pair cannot be issued before this one resolves.
+        Same `req_id` values on both sides (`seq.id`, not stringified) -- that
+        is exactly why they collide in the union, and it has to hold here too.
+        """
+        loads = getattr(metadata, "state_loads", None) or ()
+        state_ids = {req_id for req_id, _h, _slot in loads}
+        if not state_ids or not self._do_load:
+            return
+        for req in metadata.requests:
+            if req.load_spec is not None and req.req_id in state_ids:
+                self._joint_park.arm(req.req_id, needs_kv=True, needs_state=True)
 
     def _start_state_loads(self, metadata) -> None:
         """Hand this step's state-tier loads to the tier's own executor.
@@ -654,16 +685,15 @@ class LMCacheOffloadConnector(KVConnectorBase):
         # request that owned a spilled checkpoint is gone by the time its bytes
         # land. Its *load* reports are, so they merge into the two channels a
         # KV load already uses -- which is what gives the state leg the
-        # aggregator's per-request quorum for free. Nothing distinguishes the
-        # two legs downstream and nothing needs to: a request never has both
-        # (the offload scheduler refuses every KV load for a per-request-cache
-        # sequence), and the engine's `settle_state_load` is a no-op for an id
-        # its state index never issued.
+        # aggregator's per-request quorum for free. Downstream does not
+        # distinguish the two legs and does not need to: the engine's
+        # `settle_state_load` is a no-op for an id its state index never issued,
+        # and a request that has both legs is held by `_joint_park` until both
+        # have reported, so what leaves here is one event either way.
         if self._state_tier is not None:
             indexed, released, index_failed = self._state_tier.take_spill_reports()
             state_done, state_failed = self._state_tier.get_finished()
-            dl |= state_done
-            fl |= state_failed
+            dl, fl = self._settle_joint(dl, fl, state_done, state_failed)
         else:
             indexed, released, index_failed = set(), set(), set()
         return KVConnectorOutput(
@@ -675,6 +705,44 @@ class LMCacheOffloadConnector(KVConnectorBase):
             state_staging_released=released,
             state_index_failed=index_failed,
         )
+
+    def _settle_joint(
+        self,
+        kv_done: set,
+        kv_failed: set,
+        state_done: set,
+        state_failed: set,
+    ) -> tuple[set, set]:
+        """Merge the two report channels, holding back armed pairs.
+
+        Everything not armed passes through exactly as it did before the joint
+        load existed, which is the case that has to stay free: `waits_for` is
+        asked first because `_JointPark._settle` ignores ids it never armed, and
+        an ignored settle is indistinguishable from a leg that landed.
+
+        Either leg failing fails the pair. Half a load leaves the state claiming
+        a prefix whose KV never arrived, and `failed_loading` already means
+        "wake for recompute over the blocks you hold", which is what that wants.
+        """
+        park = self._joint_park
+        legs = (
+            (park.settle_kv, kv_done, True),
+            (park.settle_kv, kv_failed, False),
+            (park.settle_state, state_done, True),
+            (park.settle_state, state_failed, False),
+        )
+        passthrough_done: set = set()
+        passthrough_failed: set = set()
+        for settle, reports, ok in legs:
+            for req_id in reports:
+                if park.waits_for(req_id):
+                    settle(req_id, ok)
+                elif ok:
+                    passthrough_done.add(req_id)
+                else:
+                    passthrough_failed.add(req_id)
+        ready, ready_failed = park.take_ready()
+        return passthrough_done | ready, passthrough_failed | ready_failed
 
     def get_finished_recv_blocks(self) -> list[int]:
         # Local CUDA copies are ordered by the copy stream + synchronize() before
@@ -962,18 +1030,44 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         # Saves are untouched -- this request's KV still populates the tier for
         # a stateless reader.
         #
-        # The guard stays, and is not blocked merely on a joint park existing.
-        # The two legs are decided by independent matchers at different
-        # granularities: the KV leg comes from LMCache's `lookup()` floored to
-        # `chunk_size` (256), the state leg from `BlockManager._gated_hit` -- a
-        # fixpoint over the state caches, snapped to `hash_block_size` and then
-        # to a `state_checkpoint_interval_tokens` rung, and gated by
-        # `min_fork_tokens`. They agree only by configuration coincidence.
-        # `state_tier._JointPark` makes `L == P` representable, not guaranteed.
-        # Lifting this needs a load path that clamps both legs to a common
-        # boundary and proves it; see the README's "State offload tier" section.
+        # Lifting the guard takes a boundary both legs are held to, and one
+        # matcher has to pick it: the KV leg alone comes from LMCache's
+        # `lookup()` floored to `chunk_size`, the state leg alone from
+        # `BlockManager._gated_hit` -- a fixpoint over the state caches snapped
+        # to a checkpoint rung and gated by `min_fork_tokens` -- and they agree
+        # only by coincidence. So `can_allocate` picks B for both
+        # (`_joint_kv_boundary`) and this clamps L down to it. Without a B the
+        # refusal stands, which is also the whole behaviour with
+        # `OFFLOAD_STATE_JOINT_KV` off.
         if getattr(seq, "has_per_req_cache", False):
-            return False, "per_req_cache_state_boundary", hbm, lmc, need, chunk
+            joint = int(getattr(seq, "state_joint_boundary_tokens", 0) or 0)
+            if joint <= hbm:
+                return False, "per_req_cache_state_boundary", hbm, lmc, need, chunk
+            if joint > lmc:
+                # The engine aimed past what this connector's lookup found.
+                # Nothing else may run: the state leg is already aimed at B and
+                # a shorter KV load would leave it claiming history the forward
+                # never sees.
+                return False, "joint_boundary_above_lookup", hbm, lmc, need, chunk
+            if hbm % chunk != 0:
+                # The KV leg moves whole chunks, and the blocks below `hbm` are
+                # shared HBM cache blocks another request may be reading, so
+                # rounding the start down is not available. `can_allocate` is
+                # supposed to have declined the joint boundary for this; the
+                # scheduler disowns it if we still get here.
+                return False, "joint_unaligned_hbm_prefill", hbm, lmc, need, chunk
+            # Transfer to the chunk that covers the boundary, claim only the
+            # boundary (`_claim_after_load`). The engine picked both numbers.
+            kv_target = int(getattr(seq, "state_joint_kv_tokens", 0) or 0) or joint
+            if kv_target > lmc:
+                return False, "joint_boundary_above_lookup", hbm, lmc, need, chunk
+            lmc = kv_target
+            ls.lmcache_cached_tokens = lmc
+            need = lmc - hbm
+            # Deliberately past the `min_load` floor below: the boundary was
+            # chosen for both legs together, and refusing this one on size would
+            # leave the state leg claiming a prefix whose KV never came.
+            return True, "joint_state_and_kv", hbm, lmc, need, chunk
         if lmc <= hbm:
             return False, "hbm_satisfies_after_alloc", hbm, lmc, need, chunk
         if hbm % chunk != 0:
@@ -982,6 +1076,21 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         if need < min_load:
             return False, "too_small", hbm, lmc, need, chunk
         return True, "aligned_large_hit", hbm, lmc, need, chunk
+
+    def _claim_after_load(self, seq, hbm: int, lmc: int) -> int:
+        """How far the request may call itself cached once the load lands.
+
+        Normally the whole loaded prefix. For a joint load it is the *state*
+        boundary, which sits at or below the transfer's end: the KV leg is aimed
+        at the LMCache chunk covering that boundary, and claiming the rounded-up
+        figure would have the forward skip tokens the recurrent state does not
+        cover -- wrong output, and silent, since nothing downstream re-derives
+        the state's reach.
+        """
+        joint = int(getattr(seq, "state_joint_boundary_tokens", 0) or 0)
+        if joint:
+            return max(hbm, min(joint, lmc))
+        return max(hbm, lmc)
 
     def _maybe_start_unaligned_handoff(
         self,
@@ -1055,7 +1164,7 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         ls.can_load = True
         self._reqs_need_recv[sid] = seq
         self._handoff_loads.discard(sid)
-        seq.offload_loaded_tokens = max(hbm, lmc)
+        seq.offload_loaded_tokens = self._claim_after_load(seq, hbm, lmc)
         logger.debug(
             "[OFFLOAD-LOAD-HANDOFF-READY] seq=%s hbm_cached=%d "
             "lmc_cached=%d offload_loaded=%d need=%d",
@@ -1107,7 +1216,7 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
             self._mark_load_skip(seq, reason, hbm, lmc, need, chunk)
             self._clear_pending_load(sid)
             return False
-        seq.offload_loaded_tokens = max(hbm, lmc)
+        seq.offload_loaded_tokens = self._claim_after_load(seq, hbm, lmc)
         return True
 
     def enqueue_state_loads(self, loads) -> bool:
@@ -1169,13 +1278,13 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
             # combines it with offload_loaded_tokens after all TP workers
             # succeed to publish the restored GPU prefix.
             seq.offload_load_start_tokens = hbm
-            seq.offload_loaded_tokens = max(hbm, lmc)
+            seq.offload_loaded_tokens = self._claim_after_load(seq, hbm, lmc)
             # req_id MUST be the raw seq.id (the type the scheduler compares
             # against in _update_waiting_for_remote_kv); str(seq.id) is only for
             # LMCache's lookup/pin API. A str here silently never wakes the seq.
             logger.debug(
                 "[OFFLOAD-LOAD-EMIT] seq=%s hbm_cached=%d lmc_cached=%d "
-                "offload_loaded=%d need=%d min_load=%d nblocks=%d reason=aligned_large_hit",
+                "offload_loaded=%d need=%d min_load=%d nblocks=%d reason=%s",
                 seq.id,
                 hbm,
                 lmc,
@@ -1183,6 +1292,7 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
                 need,
                 int(getattr(self, "_min_load_tokens", 8192)),
                 len(list(seq.block_table)),
+                reason,
             )
             loading_sids.add(sid)
             self._load_save_floors[sid] = self._chunk_floor(hbm)
