@@ -883,6 +883,9 @@ class DeepseekV4DSpark(DSparkDraftModel):
         # Rolling target-KV window width. Exposed on the wrapper (top level) so the
         # proposer never reaches through `self.model.model.mtp[0]` to read it.
         self.window_size = int(self.args.window_size)
+        # Markov-head vocab, exposed at the top level (like window_size) so the
+        # proposer can clamp the anchor without reaching into the draft layers.
+        self.vocab_size = int(self.args.vocab_size)
         num_spec = getattr(
             getattr(config, "speculative_config", None),
             "num_speculative_tokens",
@@ -993,8 +996,6 @@ class DeepseekV4DSpark(DSparkDraftModel):
             draft_token_ids: [B, num_draft]
             confidence: [B, num_draft]
         """
-        from atom.utils.forward_context import get_forward_context
-
         T = int(num_draft) if num_draft is not None else self.block_size
 
         # num_draft is a python int, so the decorator does not mark it dynamic
@@ -1010,21 +1011,9 @@ class DeepseekV4DSpark(DSparkDraftModel):
                 f"the compiled graph at CompilationLevel >= DYNAMO_ONCE."
             )
 
-        # mark_dynamic specializes a size-1 dim, so pad WARMUP (the first traced
-        # call) to B==2. Dummy runs only -- a real step would mismatch metadata.
-        is_dummy = get_forward_context().context.is_dummy_run
-        anchor_ids = input_ids
-        pad = is_dummy and input_ids.shape[0] == 1
-        if pad:
-            input_ids = input_ids.repeat(2)
-            positions = positions.repeat(2)
-
         # __call__, not .forward -- the decorator's compiled dispatch lives there.
         normed, hc_hidden = self.model(input_ids, positions, T)
-        if pad:
-            # normed is [B*T, dim] and hc_hidden [B, T, dim]; keep request 0.
-            normed, hc_hidden = normed[:T], hc_hidden[:1]
-        return self.model.head_and_sample(normed, hc_hidden, anchor_ids)
+        return self.model.head_and_sample(normed, hc_hidden, input_ids)
 
 
 @support_torch_compile

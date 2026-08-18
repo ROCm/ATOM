@@ -424,7 +424,7 @@ class DSparkProposer(Drafter):
         # Anchor token x0 per request = the just-verified target token, located
         # at last_token_indices in the flat batch.
         # Seatbelt: markov_w1 is a raw nn.Embedding, so a -1 anchor traps it.
-        anchor_ids = next_token_ids.clamp(0, int(self.model.args.vocab_size) - 1)
+        anchor_ids = next_token_ids.clamp(0, int(self.model.vocab_size) - 1)
         anchor_positions = torch.index_select(target_positions, 0, last_token_indices)
 
         if self._with_draft:

@@ -64,6 +64,7 @@ addressed by `WindowParams` through `field_window_params`.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 # Compress ratios, as they appear in the model config's per-layer list.
@@ -85,6 +86,40 @@ ABSENT_RATIO = -1
 _ENVELOPE_ORDER = (HCA_RATIO, CSA_RATIO)
 _ENTRY_ORDER = (DENSE_RATIO, HCA_RATIO, CSA_RATIO)
 _KNOWN_RATIOS = frozenset(_ENTRY_ORDER) | {ABSENT_RATIO}
+
+
+def merge_abutting(runs: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:
+    """`(start, count)` pairs in order, with the ones that touch joined.
+
+    Rows of a row space and bytes of a copy are both described this way, and
+    both want as few of them as possible: every range a checkpoint copy is cut
+    into costs a span, and a span costs grid.
+
+    Ascending and disjoint is required, not assumed. Each run is compared only
+    against the one before it, so an out-of-order input merges nothing and
+    reads as legal: `[(0, 400), (256, 64), (320, 64)]` used to return
+    `[(0, 400), (256, 128)]`, which double-counts 128 bytes and overlaps the
+    first range. Nothing downstream can see that -- `checkpoint_image_bytes`
+    would over-count, and both the op validator and the sizing cross-check
+    compare against that same wrong number -- so the ordering is checked here
+    rather than left as a property of whoever happens to build the list.
+    """
+    merged: list[tuple[int, int]] = []
+    for start, count in runs:
+        if count < 0 or start < 0:
+            raise ValueError(f"a run must be non-negative, got ({start}, {count})")
+        if merged:
+            end = merged[-1][0] + merged[-1][1]
+            if start < end:
+                raise ValueError(
+                    f"runs must ascend and not overlap: ({start}, {count}) "
+                    f"starts inside the run ending at {end}"
+                )
+            if start == end:
+                merged[-1] = (merged[-1][0], merged[-1][1] + count)
+                continue
+        merged.append((start, count))
+    return merged
 
 
 def ring_offset_for(num_layers: int, ring_stride: int, ring_pos: int) -> int:
@@ -209,6 +244,34 @@ class ClassLayout:
     def ring_row(self, layer_index: int, ring_pos: int) -> int:
         """Row of a window position, relative to the class's part of an entry."""
         return layer_index * self.ring_stride + self.ring_offset(ring_pos)
+
+    def entry_row_runs(self) -> list[tuple[int, int]]:
+        """`(start, count)` runs of entry rows some `ring_row` reaches.
+
+        The interleave is by ring position, not by layer: run `c` of the ring
+        owns the rows `[c*run_rows, (c+1)*run_rows)` and every layer of the
+        class has its positions for that run inside them. So all the whole
+        runs together are one contiguous range, and only the ring's last,
+        partial run is scattered — there each layer reaches
+        `ring_slots % ring_stride` rows of its own `ring_stride` slice and
+        leaves the rest.
+
+        Those leftovers are `entry_rows` less `num_layers * ring_slots`: what
+        a layer-independent index formula costs (`entry_rows_for`). No
+        `(layer, position)` pair maps to one, so nothing writes or reads them,
+        which is what lets a copy that only has to preserve windows — a
+        checkpoint image is gathered back into a slot, never read by an
+        attention kernel — leave them out.
+        """
+        run_rows = self.num_layers * self.ring_stride
+        whole, partial = divmod(self.ring_slots, self.ring_stride)
+        runs = [(0, whole * run_rows)] if whole else []
+        if partial:
+            runs += [
+                (whole * run_rows + i * self.ring_stride, partial)
+                for i in range(self.num_layers)
+            ]
+        return runs
 
 
 class UnifiedPoolGeometry:
@@ -513,6 +576,20 @@ class UnifiedPoolGeometry:
             # interleaved with anything the way a class's layers are.
             ring_stride=self.ring_slots,
             run_rows=self.ring_slots,
+        )
+
+    def entry_row_runs(self) -> list[tuple[int, int]]:
+        """`(start, count)` runs of entry rows any window reaches, in order.
+
+        Every class's runs, offset into the entry and merged where they abut.
+        The complement is interleave padding — see `ClassLayout.entry_row_runs`
+        for why nothing reaches it. `classes` is built in entry order, so
+        walking it is walking the entry.
+        """
+        return merge_abutting(
+            (cls.entry_offset + start, count)
+            for cls in self.classes.values()
+            for start, count in cls.entry_row_runs()
         )
 
     def physical_slot(self, group: int) -> int:
