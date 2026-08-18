@@ -187,30 +187,27 @@ class V4AttnFfn(DecodeAttnFfnPiecewise):
     # Inputs come from `core` below. `positions` is copied per step rather than
     # captured on: including it costs ~2pts of accuracy (padding-tail regression).
     zero_copy_exclude = ("positions",)
-    # Rows the buffers cover; longer steps (prefill) take the copy path.
-    max_tokens = 512
 
     def describe_staging_buffers(self) -> dict:
         """Measure the buffers by running V4's own projection chain once on a
         dummy input -- shapes and dtypes vary with the quant config, so they
         cannot be declared. The base turns the result into the pool; only the
-        chain is V4's business."""
+        chain is V4's business. `x` is absent on purpose: it is the preceding
+        graph piece's output, already at a fixed address in the cudagraph pool."""
         layer = self.layer
         n = self.max_tokens
         device = self.device
         dummy_x = torch.empty(n, layer.dim, dtype=dtypes.bf16, device=device)
         idx_q_quant = idx_weights = idx_q_scale = None
-        with torch.no_grad():
-            qkv_a = layer.wqkv_a(dummy_x)
-            q_lora, kv_pre = torch.split(
-                qkv_a, [layer.q_lora_rank, layer.head_dim], dim=-1
+
+        qkv_a = layer.wqkv_a(dummy_x)
+        q_lora, kv_pre = torch.split(qkv_a, [layer.q_lora_rank, layer.head_dim], dim=-1)
+        qr, qr_scale = layer.q_norm(q_lora)
+        if layer.indexer is not None and not layer.skip_topk:
+            dummy_pos = torch.zeros(n, dtype=torch.int64, device=device)
+            idx_q_quant, idx_weights, idx_q_scale = layer.indexer.forward_pre(
+                dummy_x, qr, dummy_pos, qr_scale
             )
-            qr, qr_scale = layer.q_norm(q_lora)
-            if layer.indexer is not None and not layer.skip_topk:
-                dummy_pos = torch.zeros(n, dtype=torch.int64, device=device)
-                idx_q_quant, idx_weights, idx_q_scale = layer.indexer.forward_pre(
-                    dummy_x, qr, dummy_pos, qr_scale
-                )
         return {
             # The WHOLE merged wqkv_a output, so that on the inplace path kv_pre
             # is a stable view into it rather than a buffer of its own.
@@ -227,20 +224,14 @@ class V4AttnFfn(DecodeAttnFfnPiecewise):
 
     def alloc(self) -> None:
         super().alloc()
-        # Whether a GEMM can write its destination directly (out=) is a property
-        # of these two Linears, not of the buffers. Cached ON THE LAYER because
-        # the traced _attn_pre reads it, and Dynamo folds a plain bool attribute
-        # more predictably than a hop through this object.
+        # Whether a GEMM can write its destination directly is the Linear's own
+        # answer (`supports_out`); having somewhere to write it is ours. Cached as
+        # plain bools ON THE LAYER because the traced _attn_pre reads them, and
+        # Dynamo folds a bool attribute more predictably than a hop through here.
         layer = self.layer
-        inplace_ok = self.buffers is not None and bool(
-            envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
-        )
-        layer._wqkv_a_inplace = (
-            layer.wqkv_a.quant_type.value == QuantType.per_1x128.value and inplace_ok
-        )
-        layer._wq_b_inplace = (
-            layer.wq_b.quant_type.value == QuantType.per_1x128.value and inplace_ok
-        )
+        pooled = self.buffers is not None
+        layer._wqkv_a_inplace = pooled and layer.wqkv_a.supports_out()
+        layer._wq_b_inplace = pooled and layer.wq_b.supports_out()
 
     def core(
         self,

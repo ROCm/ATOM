@@ -892,6 +892,17 @@ class LinearBase(nn.Module):
         o_dtype = otype
         return f"{self.prefix}[M={m},N={n},K={k},a={a_dtype},w={w_dtype},o={o_dtype}]"
 
+    def supports_out(self) -> bool:
+        """Whether `forward(out=...)` is wired for this Linear: only the per_1x128
+        preshuffle GEMM writes into a caller-owned destination.
+
+        Computed on access rather than cached at construction -- `quant_type` is
+        rewritten when online quantisation is configured, well after __init__.
+        """
+        return self.quant_type.value == QuantType.per_1x128.value and bool(
+            envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
+        )
+
     @mark_trace
     def forward(
         self,
@@ -900,12 +911,8 @@ class LinearBase(nn.Module):
         otype=dtypes.bf16,
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # out= (fixed output buffer) is only wired through the per_1x128
-        # preshuffle GEMM path; any other quant path must not silently ignore it.
-        _out_ok = self.quant_type.value == QuantType.per_1x128.value and bool(
-            envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
-        )
-        assert out is None or _out_ok, (
+        # A quant path that cannot honour out= must not silently ignore it.
+        assert out is None or self.supports_out(), (
             "Linear out= requested but this quant path does not support it "
             f"(quant_type={self.quant_type})."
         )

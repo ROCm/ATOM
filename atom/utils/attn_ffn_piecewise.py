@@ -211,7 +211,12 @@ class AttnFfnPiecewise:
         A subclass typically gets its samples by running a dummy forward
         through its own projection chain: shapes and dtypes vary with the quant
         config, so they are measured rather than declared, and that chain is
-        the one part of this that cannot be generic.
+        the one part of this that cannot be generic. ``alloc`` calls this under
+        ``torch.no_grad``.
+
+        An input absent from the returned dict is never staged, so it must
+        already be at a stable address by other means -- V4's ``x``, say, is the
+        preceding graph piece's output and lives in the cudagraph pool.
         """
         raise NotImplementedError
 
@@ -241,7 +246,10 @@ class AttnFfnPiecewise:
         pre-capture. No-op when this layer is not captured."""
         if not self.enabled:
             return
-        samples = self.describe_staging_buffers()
+        # Under no_grad here, so a subclass measuring its shapes with a dummy
+        # forward does not have to remember to.
+        with torch.no_grad():
+            samples = self.describe_staging_buffers()
         device = self.device
         bufs = ZeroCopyBuffers(self.max_tokens)
         for name, spec in samples.items():
