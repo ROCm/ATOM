@@ -26,9 +26,24 @@ import numpy as np
 import pytest
 import torch
 
-from atom.model_ops.attentions.deepseek_v4_attn import (
-    DeepseekV4AttentionMetadataBuilder as Builder,
-)
+# Every class below reads unbound methods off the builder, and that module
+# does `from aiter import dtypes` at load, which the non-GPU CI runner cannot
+# satisfy. Asked of the module actually needed rather than of `aiter`: there
+# `aiter` resolves as a namespace package -- the failure reads "cannot import
+# name 'dtypes' from 'aiter' (unknown location)", not "no module named" -- so
+# a guard on `aiter` can succeed and leave the real import to fail anyway.
+#
+# `exc_type` is not optional here. The module *is* found, so bare
+# `importorskip` treats an ImportError out of it as the caller's mistake: a
+# deprecation warning on pytest 9.0 and an error from 9.1, which is what CI
+# runs. Naming the type is what the warning itself prescribes, and it keeps
+# the skip narrow -- anything that is not an ImportError still fails.
+Builder = pytest.importorskip(
+    "atom.model_ops.attentions.deepseek_v4_attn",
+    reason="the V4 builder's module imports aiter at load",
+    exc_type=ImportError,
+).DeepseekV4AttentionMetadataBuilder
+
 from atom.model_ops.attentions.paged_state_copy import plan_segmented_copy
 from atom.model_ops.attentions.state_arena import (
     StateField,
