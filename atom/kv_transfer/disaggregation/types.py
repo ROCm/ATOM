@@ -25,27 +25,12 @@ TransferId = int
 
 
 @dataclass(frozen=True)
-class SendOperationId:
-    """Exact identity of one producer-side send lifecycle."""
-
-    req_id: ReqId
-    generation: int
-
-    def __post_init__(self) -> None:
-        if self.generation < 0:
-            raise ValueError("send operation generation must be nonnegative")
-
-
-SendCompletionId = ReqId | SendOperationId
-
-
-@dataclass(frozen=True)
 class SaveOperationId:
     """Exact identity of one scheduler-issued PAGE/SLOT save generation.
 
-    A request can emit several overlapping asynchronous saves, and a request ID
-    can later be reused. The scheduler-lifetime ``generation`` prevents delayed
-    or duplicated TP-worker completions for one save from completing another.
+    A request can emit several overlapping asynchronous saves. The
+    scheduler-lifetime ``generation`` prevents delayed or duplicated TP-worker
+    completions for one save from completing another.
     """
 
     req_id: ReqId
@@ -73,7 +58,7 @@ class LoadOperationId:
 
 LoadCompletionId = ReqId | LoadOperationId
 
-ConnectorCompletionId = ReqId | SendOperationId | SaveOperationId | LoadOperationId
+ConnectorCompletionId = ReqId | SaveOperationId | LoadOperationId
 ConnectorCompletionKey = tuple[str, ConnectorCompletionId]
 
 # ---------------------------------------------------------------------------
@@ -174,8 +159,7 @@ class KVConnectorOutput:
     request IDs have finished on *all* workers.
 
     Attributes:
-        finished_sending: Exact producer send generations whose KV transfer
-            completed (legacy connectors may still report request IDs).
+        finished_sending: Request IDs whose KV send completed on this worker.
         finished_recving: Request IDs whose KV receive completed on this worker.
         failed_recving: Request IDs whose KV receive failed on this worker.
         finished_saving: Exact save generations whose local fire-and-forget
@@ -194,7 +178,7 @@ class KVConnectorOutput:
             expected per request (used by the aggregator).
     """
 
-    finished_sending: set[SendCompletionId] = field(default_factory=set)
+    finished_sending: set[ReqId] = field(default_factory=set)
     finished_recving: set[ReqId] = field(default_factory=set)
     failed_recving: set[ReqId] = field(default_factory=set)
     finished_saving: set[SaveCompletionId] = field(default_factory=set)

@@ -18,7 +18,6 @@ from atom.kv_transfer.disaggregation.types import (
     KVConnectorOutput,
     LoadOperationId,
     SaveOperationId,
-    SendOperationId,
 )
 from atom.model_engine.scheduler import (
     DecodeScheduler,
@@ -311,78 +310,6 @@ class TestSchedule:
         assert sched._num_parked_remote_kv == 0
         assert events.count(("request_finished", seq.id)) == 1
         assert events.count(("deallocate", seq.id)) == 1
-
-    def test_reused_id_ignores_stale_exact_send_generation(self):
-        old_operation = SendOperationId(95, 4)
-        new_operation = SendOperationId(95, 5)
-        seq = SimpleNamespace(id=95, _send_operation=new_operation)
-        deallocated = []
-
-        class _Connector:
-            is_producer = True
-            is_offload = False
-
-            def should_defer_free(self, _seq):
-                return False
-
-            def request_finished(self, _seq):
-                pass
-
-        sched = Scheduler.__new__(Scheduler)
-        sched.kv_connector = _Connector()
-        sched.deferred_free_blocks = {seq.id: seq}
-        sched.finished_recving_kv_req_ids = []
-        sched.failed_recving_kv_req_ids = []
-        sched.block_manager = SimpleNamespace(deallocate=deallocated.append)
-
-        sched._update_from_kv_xfer_finished(
-            KVConnectorOutput(finished_sending={old_operation})
-        )
-
-        assert sched.deferred_free_blocks == {seq.id: seq}
-        assert deallocated == []
-
-        sched._update_from_kv_xfer_finished(
-            KVConnectorOutput(finished_sending={new_operation})
-        )
-
-        assert sched.deferred_free_blocks == {}
-        assert deallocated == [seq]
-
-    def test_exact_send_lifecycle_rejects_stale_raw_completion(self):
-        operation = SendOperationId(96, 7)
-        seq = SimpleNamespace(id=96, _send_operation=operation)
-        deallocated = []
-
-        class _Connector:
-            is_producer = True
-            is_offload = False
-
-            def should_defer_free(self, _seq):
-                return False
-
-            def request_finished(self, _seq):
-                pass
-
-        sched = Scheduler.__new__(Scheduler)
-        sched.kv_connector = _Connector()
-        sched.deferred_free_blocks = {seq.id: seq}
-        sched.finished_recving_kv_req_ids = []
-        sched.failed_recving_kv_req_ids = []
-        sched.block_manager = SimpleNamespace(deallocate=deallocated.append)
-
-        sched._update_from_kv_xfer_finished(
-            KVConnectorOutput(finished_sending={seq.id})
-        )
-
-        assert sched.deferred_free_blocks == {seq.id: seq}
-        assert deallocated == []
-
-        sched._update_from_kv_xfer_finished(
-            KVConnectorOutput(finished_sending={operation})
-        )
-        assert sched.deferred_free_blocks == {}
-        assert deallocated == [seq]
 
     def test_empty_returns_none(self, scheduler):
         assert scheduler.schedule() is None

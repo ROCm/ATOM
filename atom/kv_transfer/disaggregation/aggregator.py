@@ -30,8 +30,6 @@ from atom.kv_transfer.disaggregation.types import (
     ReqId,
     SaveCompletionId,
     SaveOperationId,
-    SendCompletionId,
-    SendOperationId,
 )
 
 logger = logging.getLogger("atom")
@@ -139,10 +137,9 @@ class KVOutputAggregator:
         if terminal_tombstone_limit <= 0:
             raise ValueError("terminal_tombstone_limit must be positive")
         self._world_size = world_size
-        self._sending = _TPCompletionGroup[SendCompletionId](
+        self._sending = _TPCompletionGroup[ReqId](
             world_size,
             terminal_tombstone_limit,
-            lambda key: isinstance(key, SendOperationId),
         )
         self._receiving = _TPCompletionGroup[ReqId](
             world_size,
@@ -268,10 +265,6 @@ class KVOutputAggregator:
     @property
     def terminal_load_tombstone_count(self) -> int:
         return self._loading.tombstone_count
-
-    @property
-    def terminal_send_tombstone_count(self) -> int:
-        return self._sending.tombstone_count
 
     @property
     def pending_count(self) -> tuple[int, int]:

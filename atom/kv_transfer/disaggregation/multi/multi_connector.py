@@ -76,7 +76,6 @@ from atom.kv_transfer.disaggregation.types import (
     KVConnectorOutput,
     LoadOperationId,
     SaveOperationId,
-    SendOperationId,
 )
 
 logger = logging.getLogger("atom")
@@ -85,10 +84,6 @@ _PARTIAL_SAVE = object()
 
 def _save_req_id(value: Any) -> Any:
     return value.req_id if isinstance(value, SaveOperationId) else value
-
-
-def _send_req_id(value: Any) -> Any:
-    return value.req_id if isinstance(value, SendOperationId) else value
 
 
 @dataclass(frozen=True)
@@ -476,26 +471,9 @@ class MultiConnector(KVConnectorBase):
 
         rel_send: set = set()
         for r in send_now:
-            req_key = str(_send_req_id(r))
+            req_key = str(r)
             if self._req_has_pending_save(req_key):
-                held = self._sent.setdefault(req_key, set())
-                if isinstance(r, SendOperationId):
-                    # Exact lifecycle identity supersedes a legacy raw-ID
-                    # notification, but never another exact generation.
-                    held.difference_update(
-                        {
-                            completion
-                            for completion in held
-                            if not isinstance(completion, SendOperationId)
-                        }
-                    )
-                    held.add(r)
-                elif not any(
-                    isinstance(completion, SendOperationId) for completion in held
-                ):
-                    # Raw IDs remain supported only when this request has no
-                    # exact send lifecycle in the held state.
-                    held.add(r)
+                self._sent.setdefault(req_key, set()).add(r)
             else:
                 rel_send.add(r)
 

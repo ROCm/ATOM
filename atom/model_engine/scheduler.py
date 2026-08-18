@@ -30,7 +30,6 @@ from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.kv_transfer.disaggregation.types import (
     LoadOperationId,
     SaveOperationId,
-    SendOperationId,
 )
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.request import RequestOutput
@@ -995,8 +994,7 @@ class Scheduler:
 
         # A second finish notification is intentional for a lifecycle that was
         # deferred: offload connectors use it to discard now-terminal save
-        # tracking, while producer connectors keep their existing exact send
-        # generation idempotently.
+        # tracking.
         callback = getattr(self.kv_connector, "request_finished", None)
         if callable(callback):
             callback(seq)
@@ -1007,12 +1005,8 @@ class Scheduler:
         assert (
             released is seq
         ), f"deferred request ID {seq.id!r} changed lifecycle before release"
-        for marker in (
-            "_kv_send_completed",
-            "_send_operation",
-        ):
-            if hasattr(seq, marker):
-                delattr(seq, marker)
+        if hasattr(seq, "_kv_send_completed"):
+            delattr(seq, "_kv_send_completed")
         self.block_manager.deallocate(seq)
         return True
 
@@ -2770,11 +2764,7 @@ class Scheduler:
         )
 
         def _raw_req_id(value):
-            return (
-                value.req_id
-                if isinstance(value, (SaveOperationId, SendOperationId))
-                else value
-            )
+            return value.req_id if isinstance(value, SaveOperationId) else value
 
         is_producer = self._connector_flag("is_producer")
         is_offload = self._connector_flag("is_offload")
@@ -2856,17 +2846,7 @@ class Scheduler:
                 self.kv_connector.is_producer
             ), "Only producer should free blocks after sending KV"
             logger.debug("Finished sending KV transfer for request %s", req_id)
-            raw_req_id = _raw_req_id(req_id)
-            seq = self._deferred_sequence(raw_req_id)
-            expected_send = getattr(seq, "_send_operation", None) if seq else None
-            if expected_send is not None:
-                if req_id != expected_send:
-                    continue
-            elif isinstance(req_id, SendOperationId):
-                # Exact completions are valid only for the sequence that owns
-                # their marker. Legacy raw completions remain compatible only
-                # when no exact lifecycle was established.
-                continue
+            seq = self._deferred_sequence(req_id)
             assert seq is not None, f"req_id={req_id} not found in deferred_free_blocks"
             seq._kv_send_completed = True
             self._maybe_release_deferred(seq)

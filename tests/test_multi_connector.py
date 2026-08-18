@@ -28,7 +28,6 @@ from atom.kv_transfer.disaggregation.types import (
     KVConnectorOutput,
     LoadOperationId,
     SaveOperationId,
-    SendOperationId,
 )
 from atom.kv_transfer.offload.hybrid.dsv4.connector import (
     DSV4_CHECKPOINT_SAVE_CHANNEL,
@@ -942,83 +941,6 @@ def test_generation_saves_pair_send_only_after_every_exact_operation():
     assert terminal.finished_sending == {9}
     assert terminal.finished_saving == {_multi_save(gen1, 1)}
     assert terminal.connector_completions == {failed_sidecar}
-
-
-def test_exact_send_generation_survives_multi_save_pairing():
-    save = SaveOperationId(9, 8)
-    send = SendOperationId(9, 4)
-    moriio = FakeWorkerSub(is_producer=True)
-    offload = FakeWorkerSub()
-    worker = _worker([moriio, offload])
-    worker.start_load_kv(
-        MultiConnectorMetadata(
-            [ConnectorMetadata(), _operation_save_meta(save, page=True)]
-        )
-    )
-
-    moriio._finished = KVConnectorOutput(finished_sending={send})
-    assert worker.get_finished().finished_sending == set()
-
-    moriio._finished = KVConnectorOutput()
-    offload._finished = KVConnectorOutput(finished_saving={save})
-    terminal = worker.get_finished()
-
-    assert terminal.finished_sending == {send}
-    assert terminal.finished_saving == {_multi_save(save, 1)}
-
-
-def test_late_exact_send_generation_cannot_overwrite_current_generation():
-    save = SaveOperationId(9, 9)
-    stale_send = SendOperationId(9, 3)
-    current_send = SendOperationId(9, 4)
-    producer = FakeWorkerSub(is_producer=True)
-    saver = FakeWorkerSub()
-    worker = _worker([producer, saver])
-    worker.start_load_kv(
-        MultiConnectorMetadata(
-            [ConnectorMetadata(), _operation_save_meta(save, page=True)]
-        )
-    )
-
-    producer._finished = KVConnectorOutput(finished_sending={current_send})
-    assert worker.get_finished().finished_sending == set()
-
-    # The older notification arrives later.  The former scalar table replaced
-    # current_send here and released only stale_send when the save completed.
-    producer._finished = KVConnectorOutput(finished_sending={stale_send})
-    assert worker.get_finished().finished_sending == set()
-
-    producer._finished = KVConnectorOutput()
-    saver._finished = KVConnectorOutput(finished_saving={save})
-    terminal = worker.get_finished()
-
-    assert terminal.finished_sending == {stale_send, current_send}
-    assert terminal.finished_saving == {_multi_save(save, 1)}
-
-
-def test_exact_held_send_suppresses_legacy_raw_id_for_same_request():
-    save = SaveOperationId(9, 10)
-    exact_send = SendOperationId(9, 5)
-    producer = FakeWorkerSub(is_producer=True)
-    saver = FakeWorkerSub()
-    worker = _worker([producer, saver])
-    worker.start_load_kv(
-        MultiConnectorMetadata(
-            [ConnectorMetadata(), _operation_save_meta(save, page=True)]
-        )
-    )
-
-    producer._finished = KVConnectorOutput(finished_sending={9})
-    assert worker.get_finished().finished_sending == set()
-    producer._finished = KVConnectorOutput(finished_sending={exact_send})
-    assert worker.get_finished().finished_sending == set()
-    producer._finished = KVConnectorOutput(finished_sending={9})
-    assert worker.get_finished().finished_sending == set()
-
-    producer._finished = KVConnectorOutput()
-    saver._finished = KVConnectorOutput(finished_saving={save})
-
-    assert worker.get_finished().finished_sending == {exact_send}
 
 
 def test_two_saving_connectors_emit_child_namespaced_operations():
