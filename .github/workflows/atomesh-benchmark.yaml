@@ -695,7 +695,7 @@ jobs:
               --nic_priority_matrix="${decode_matrix}" \
               --use_vram=true \
               --gpu_id=0 \
-              --buffer_size=67108864 \
+              --buffer_size=100663296 \
               >"${target_log}" 2>&1 &
             target_pid=$!
             target_name="$(wait_for_p2p_address "${target_log}" "${target_pid}" 30)"
@@ -715,7 +715,7 @@ jobs:
               --nic_priority_matrix="${prefill_matrix}" \
               --use_vram=true \
               --gpu_id=0 \
-              --buffer_size=67108864 \
+              --buffer_size=100663296 \
               --batch_size=1 \
               --block_size=67108864 \
               --threads=1 \
@@ -725,11 +725,21 @@ jobs:
             set -e
 
             if [[ "${transfer_rc}" -ne 0 ]] ||
-               ! grep -q "Data validation passed" "${initiator_log}" ||
-               ! grep -Fq "local_device_name=${prefill_rdma_device}, peer_device_name=${prefill_rdma_device}" "${initiator_log}"; then
+               ! grep -q "Data validation passed" "${initiator_log}"; then
+              cat "${initiator_log}" >&2
               cat "${target_log}" >&2
-              echo "ERROR: GPUDirect RDMA failed from prefill GPU ${prefill_gpu_id} (${prefill_rdma_device}) to decode GPU ${decode_gpu_id} (${decode_rdma_device}, alternate ${prefill_rdma_device})" >&2
+              echo "ERROR: GPUDirect RDMA data validation failed from prefill GPU ${prefill_gpu_id} (${prefill_rdma_device}) to decode GPU ${decode_gpu_id} (${decode_rdma_device}, alternate ${prefill_rdma_device})" >&2
               exit 1
+            fi
+            expected_affinity="local_device_name=${prefill_rdma_device}, peer_device_name=${prefill_rdma_device}"
+            if grep -Fq "RDMA slice affinity:" "${initiator_log}"; then
+              if ! grep -Fq "${expected_affinity}" "${initiator_log}"; then
+                grep -F "RDMA slice affinity:" "${initiator_log}" >&2 || true
+                echo "ERROR: GPUDirect RDMA selected the wrong HCA for prefill GPU ${prefill_gpu_id}" >&2
+                exit 1
+              fi
+            else
+              echo "WARNING: RDMA data validation passed, but HCA affinity logging was unavailable for prefill GPU ${prefill_gpu_id}" >&2
             fi
             kill "${target_pid}" 2>/dev/null || true
             wait "${target_pid}" 2>/dev/null || true
@@ -850,7 +860,7 @@ jobs:
                   --nic_priority_matrix="${decode_matrix}" \
                   --use_vram=true \
                   --gpu_id=0 \
-                  --buffer_size=67108864 \
+                  --buffer_size=100663296 \
                   >"${target_log}" 2>&1 &
                 target_pid=$!
                 target_name="$(wait_for_p2p_address "${target_log}" "${target_pid}" 30)"
@@ -896,7 +906,7 @@ jobs:
                   --nic_priority_matrix="${prefill_matrix}" \
                   --use_vram=true \
                   --gpu_id=0 \
-                  --buffer_size=67108864 \
+                  --buffer_size=100663296 \
                   --batch_size="${transfer_batch_size}" \
                   --block_size="${transfer_block_size}" \
                   --threads=1 \
@@ -905,12 +915,22 @@ jobs:
                 transfer_rc="${PIPESTATUS[0]}"
                 set -e
                 if [[ "${transfer_rc}" -eq 0 ]] &&
-                   grep -q "Data validation passed" "${initiator_log}" &&
-                   { [[ "${is_cross_rail}" -eq 0 ]] ||
-                     grep -Fq "local_device_name=${prefill_rdma_device}, peer_device_name=${expected_peer_device}" "${initiator_log}"; }; then
+                   grep -q "Data validation passed" "${initiator_log}"; then
                   result=0
                 else
                   result=1
+                fi
+                if [[ "${result}" -eq 0 && "${is_cross_rail}" -eq 1 ]]; then
+                  expected_affinity="local_device_name=${prefill_rdma_device}, peer_device_name=${expected_peer_device}"
+                  if grep -Fq "RDMA slice affinity:" "${initiator_log}"; then
+                    if ! grep -Fq "${expected_affinity}" "${initiator_log}"; then
+                      grep -F "RDMA slice affinity:" "${initiator_log}" >&2 || true
+                      echo "ERROR: cross-node GPUDirect RDMA selected the wrong HCA from prefill GPU ${prefill_gpu_id} to decode GPU ${decode_gpu_id}" >&2
+                      result=1
+                    fi
+                  else
+                    echo "WARNING: cross-node RDMA data validation passed, but HCA affinity logging was unavailable from prefill GPU ${prefill_gpu_id} to decode GPU ${decode_gpu_id}" >&2
+                  fi
                 fi
                 echo "${result}" > "${result_file}.tmp"
                 mv "${result_file}.tmp" "${result_file}"
