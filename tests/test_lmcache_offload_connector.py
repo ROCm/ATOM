@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 import sys
 import threading
+import time
 import types
 from types import SimpleNamespace
 
@@ -62,6 +63,11 @@ def _scheduler() -> LMCacheOffloadConnectorScheduler:
     sched._save_inflight = set()
     sched._load_inflight_tokens = {}
     sched._save_inflight_tokens = {}
+    sched._save_inflight_since = {}
+    sched._save_stall_s = 120.0
+    sched._save_max_inflight = 64
+    sched._save_stalled = False
+    sched._warned_save_stalled = False
     sched._lookup_in_step = []
     sched._handoff_loads = set()
     sched.total_load_requests = 0
@@ -2544,3 +2550,66 @@ def test_either_leg_failing_fails_the_joint_pair():
 
     assert out.finished_loading == set()
     assert out.failed_loading == {6}
+
+
+# ── a stopped save backend must not stop the engine ───────────────────────
+#
+# Two full benchmark hours were lost to this: LMCache stopped completing
+# stores, `should_defer_free` held every finished request's blocks waiting for
+# them, the KV pool drained, and the scheduler produced no batch again. The
+# split below is the whole fix -- a save the backend never received pins
+# nothing, one it did is reading those blocks right now.
+
+
+def test_a_stalled_save_path_releases_blocks_it_never_sent():
+    sched = _scheduler()
+    seq = SimpleNamespace(
+        id=901,
+        num_prompt_tokens=16,
+        token_ids=list(range(16)),
+        num_cached_tokens=8,
+        block_table=[1, 2],
+    )
+    sched._save_tracker["901"] = [seq, 0]
+
+    assert sched.should_defer_free(seq) is True  # healthy: the save is coming
+
+    sched._save_stalled = True
+
+    assert sched.should_defer_free(seq) is False
+    assert "901" not in sched._save_tracker, "a dropped save must not be re-emitted"
+
+
+def test_a_stalled_save_path_still_waits_for_one_the_backend_holds():
+    """Freeing these would let the next request write into them mid-transfer,
+    and the bytes land in LMCache under this prefix's hash -- valid-looking and
+    wrong on every later load."""
+    sched = _scheduler()
+    seq = SimpleNamespace(
+        id=902,
+        num_prompt_tokens=16,
+        token_ids=list(range(16)),
+        num_cached_tokens=8,
+        block_table=[1, 2],
+    )
+    sched._save_inflight.add("902")
+    sched._save_stalled = True
+
+    assert sched.should_defer_free(seq) is True
+
+
+def test_the_stall_is_declared_off_the_oldest_outstanding_save():
+    sched = _scheduler()
+    sched._save_stall_s = 10.0
+    sched._save_inflight.add("903")
+    sched._save_inflight_since["903"] = time.monotonic() - 30.0
+
+    sched._refresh_save_stall()
+    assert sched._save_stalled is True
+
+    # And it clears itself once the backend drains, with no restart.
+    sched._save_inflight.discard("903")
+    sched._save_inflight_since.pop("903")
+    sched._refresh_save_stall()
+    assert sched._save_stalled is False
+

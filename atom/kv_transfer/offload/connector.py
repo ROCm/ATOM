@@ -786,6 +786,24 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         # (seq.prefix_hashes_published flips True), chunk by chunk.
         self._save_tracker: dict[str, list] = {}
         self._save_inflight: set[str] = set()
+        # sid -> when its save was handed to the worker. A save that never
+        # reports is what wedged two full benchmark runs: `should_defer_free`
+        # holds a finished request's blocks until its save completes, so when
+        # LMCache stopped completing stores the KV pool drained and the
+        # scheduler stopped producing batches altogether -- requests kept
+        # arriving, nothing was ever scheduled again, and no log said why.
+        self._save_inflight_since: dict[str, float] = {}
+        # Seconds before the save path is called stalled. Not a transfer
+        # deadline: a 4096-token store takes ~65ms, so anything past this is a
+        # backend that has stopped, not one that is slow.
+        self._save_stall_s = float(os.environ.get("OFFLOAD_SAVE_STALL_S", "120"))
+        # Ceiling on requests whose blocks a save may pin at once. Each one is
+        # a request that has finished and cannot be freed.
+        self._save_max_inflight = int(
+            os.environ.get("OFFLOAD_SAVE_MAX_INFLIGHT", "64")
+        )
+        self._save_stalled = False
+        self._warned_save_stalled = False
         self._load_inflight_tokens: dict[str, int] = {}
         self._save_inflight_tokens: dict[str, int] = {}
         self._lookup_in_step: list[str] = []
@@ -1316,8 +1334,13 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         # chunked prefill, seq.num_cached_tokens advances after each prefill
         # chunk's forward has completed; use it as the D2H-safe frontier.
         chunk = self.chunk_size or 256
+        self._refresh_save_stall()
         for sid, entry in self._save_tracker.items():
             seq, saved = entry
+            if self._save_stalled:
+                break  # nothing new goes out while the backend is not draining
+            if len(self._save_inflight) >= self._save_max_inflight:
+                break  # do not pin another finished request's blocks
             if sid in self._reqs_need_recv or sid in loading_sids:
                 continue  # loading this step; defer its save
             if sid in self._save_inflight:
@@ -1349,9 +1372,37 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
             )
             entry[1] = aligned
             self._save_inflight.add(sid)
+            self._save_inflight_since[sid] = time.monotonic()
             self._save_inflight_tokens[sid] = max(0, aligned - int(saved))
         self._reqs_need_recv.clear()
         return meta
+
+    def _refresh_save_stall(self) -> None:
+        """Decide whether the save path has stopped draining.
+
+        One number decides it: how long the oldest in-flight save has been out.
+        A 4096-token store costs ~65ms, so a save outstanding for minutes is a
+        backend that stopped, not one that is busy -- and while it is out,
+        every finished request behind it keeps its blocks.
+        """
+        if not self._save_inflight_since:
+            if self._save_stalled:
+                logger.info("LMCache offload: save path draining again")
+            self._save_stalled = False
+            self._warned_save_stalled = False
+            return
+        oldest = min(self._save_inflight_since.values())
+        self._save_stalled = (time.monotonic() - oldest) > self._save_stall_s
+        if self._save_stalled and not self._warned_save_stalled:
+            self._warned_save_stalled = True
+            logger.warning(
+                "LMCache offload: no save has completed in %.0fs (%d in flight). "
+                "Emitting no further saves and releasing the blocks of requests "
+                "whose save was never sent; the ones already handed to the "
+                "backend still have to wait, because it is reading those blocks.",
+                time.monotonic() - oldest,
+                len(self._save_inflight),
+            )
 
     def _save_frontier(self, seq) -> int:
         computed = min(
@@ -1369,11 +1420,27 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
 
     def should_defer_free(self, seq) -> bool:
         sid = str(seq.id)
-        return sid in self._save_inflight or self._has_pending_save(seq)
+        if sid in self._save_inflight:
+            # The backend is reading these blocks right now. Freeing them would
+            # let the next request write into them mid-transfer and index the
+            # result under this prefix's hash -- corrupt bytes that look valid
+            # to every later load. Waiting is the only safe answer, which is why
+            # the emission side caps how many requests can be in this state.
+            return True
+        if not self._has_pending_save(seq):
+            return False
+        if self._save_stalled:
+            # This save was never handed out, so nothing is reading these
+            # blocks and dropping it costs only the store. Holding them is what
+            # turned a stopped backend into a stopped engine.
+            self._save_tracker.pop(sid, None)
+            return False
+        return True
 
     def save_finished(self, req_id) -> None:
         sid = str(req_id)
         self._save_inflight.discard(sid)
+        self._save_inflight_since.pop(sid, None)
         saved_tokens = self._save_inflight_tokens.pop(sid, 0)
         self.total_save_requests += 1
         self.total_saved_tokens += saved_tokens
