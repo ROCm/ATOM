@@ -2141,8 +2141,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             and _drafter.uses_confidence_schedule
         )
         if ragged_lens is not None or _dspark_ragged_graph:
-            attn_metadata.dspark_ragged_lens_gpu = self._stage_dspark_ragged_lens(
-                "v4_dspark_ragged_lens", extend_lens_np, positions.device, pad_to=bs
+            # Staged, never `torch.as_tensor(np, device=cuda)`, for two
+            # reasons: that is a pageable H2D and syncs here (the ragged decode
+            # bubble), and it returns a NEW tensor each step, whose address the
+            # captured AF attention core would freeze at capture (71a3e941).
+            attn_metadata.dspark_ragged_lens_gpu = self._stage(
+                "v4_dspark_ragged_lens", extend_lens_np.astype(np.int32, copy=False)
             )
             attn_metadata.dspark_full_q = int(full_q)
 
@@ -2331,11 +2335,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             if dspark_ragged:
                 ragged_lens_buf = np.zeros(padded_bs, dtype=np.int32)
                 ragged_lens_buf[:ub_real_reqs] = ub_extend_lens_np
-                attn_metadata.dspark_ragged_lens_gpu = self._stage_dspark_ragged_lens(
-                    f"{p}v4_dspark_ragged_lens",
-                    ragged_lens_buf,
-                    positions_gpu.device,
-                    pad_to=padded_bs,
+                attn_metadata.dspark_ragged_lens_gpu = self._stage(
+                    f"{p}v4_dspark_ragged_lens", ragged_lens_buf
                 )
                 attn_metadata.dspark_full_q = full_q
 
@@ -3864,8 +3865,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             and drafter.uses_confidence_schedule
         ):
             full_q_real = drafter.mtp_k + 1
-            attn_metadata.dspark_ragged_lens_gpu = self._stage_dspark_ragged_lens(
-                "v4_dspark_ragged_lens", extend_lens_np, positions.device, pad_to=bs
+            attn_metadata.dspark_ragged_lens_gpu = self._stage(
+                "v4_dspark_ragged_lens", extend_lens_np.astype(np.int32, copy=False)
             )
             attn_metadata.dspark_full_q = int(full_q_real)
 
@@ -3920,37 +3921,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     # ------------------------------------------------------------------ #
     # Helpers.                                                           #
     # ------------------------------------------------------------------ #
-
-    def _dspark_ragged_lens_needs_staging(self) -> bool:
-        """Whether the dspark ragged verify-lengths must live in a fixed-address
-        staging buffer instead of a fresh per-step `torch.as_tensor`.
-
-        A captured graph needs the fixed address; every eager consumer needs a
-        private per-step tensor. One buffer for both cost ~14pt of acceptance.
-        """
-        cfg = self.model_runner.config
-        mode = getattr(cfg.compilation_config, "cudagraph_mode", None)
-        if mode is None or not mode.is_attn_ffn_piecewise():
-            return False
-        return bool(getattr(cfg, "enable_dp_attention", False)) or (
-            getattr(cfg.parallel_config, "data_parallel_size", 1) > 1
-        )
-
-    def _stage_dspark_ragged_lens(
-        self, name: str, arr, device, pad_to: int | None = None
-    ) -> torch.Tensor:
-        """Materialize the dspark ragged verify-lengths GPU tensor.
-
-        Fixed-address staging only where it is actually required (AF + DP)
-        """
-        arr = arr.astype(np.int32, copy=False)
-        if not self._dspark_ragged_lens_needs_staging():
-            return torch.as_tensor(arr, device=device)
-        if pad_to is not None and pad_to > arr.shape[0]:
-            padded = np.zeros(pad_to, dtype=np.int32)
-            padded[: arr.shape[0]] = arr
-            arr = padded
-        return self._stage(name, arr)
 
     def _alloc_v4_metadata_buffers(self) -> None:
         """Pre-allocate every CpuGpuBuffer the V4 metadata builder writes into.
