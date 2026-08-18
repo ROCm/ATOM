@@ -13,6 +13,52 @@ import torch
 import triton
 import triton.language as tl
 
+_AG_CUSTOM_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
+
+
+def _ag_custom_view_dtype(x: torch.Tensor) -> torch.dtype | None:
+    """Float dtype to reinterpret `x` as for aiter's custom all-gather.
+
+    The custom kernel dispatches on a float enum (fp32/fp16/bf16) and raises on
+    anything else, even though an all-gather is a pure copy that only cares
+    about element width. The fp8 query therefore has to be viewed first; 8-bit
+    payloads have no 8-bit entry in the enum, so they pair up into fp16, which
+    needs an even trailing dim. Returns None when no safe view exists.
+    """
+    if x.dtype in _AG_CUSTOM_DTYPES:
+        return x.dtype
+    itemsize = x.element_size()
+    if itemsize == 4:
+        return torch.float32
+    if itemsize == 2:
+        return torch.float16
+    if itemsize == 1 and x.shape[-1] % 2 == 0:
+        return torch.float16
+    return None
+
+
+def dcp_all_gather(cp_group, x: torch.Tensor, dim: int) -> torch.Tensor:
+    """AllGather that prefers aiter's custom collective over pynccl.
+
+    ``GroupCoordinator.all_gather`` takes ``use_custom=False`` by default, so
+    every DCP gather lands on pynccl. At decode payloads that is the wrong
+    trade: the nccl kernel carries a fixed ~5us launch bubble on each side, so
+    gathering a few KB of LSE costs more than the custom kernel spends on a
+    1.5MB reduce-scatter. The device communicator picks the custom kernel when
+    the shape qualifies (dim 0 or last dim, 16B-aligned, within the registered
+    pool) and falls back to pynccl otherwise, with identical concat-along-`dim`
+    semantics either way.
+    """
+    device_comm = getattr(cp_group, "device_communicator", None)
+    view_dtype = _ag_custom_view_dtype(x) if device_comm is not None else None
+    if view_dtype is None:
+        return cp_group.all_gather(x, dim=dim)
+    if view_dtype is x.dtype:
+        return device_comm.all_gather(x, dim)
+    # Viewing narrows the trailing dim, so only a last-dim gather sees a
+    # different split; both land on the same byte layout after the view back.
+    return device_comm.all_gather(x.view(view_dtype), dim).view(x.dtype)
+
 
 class CPTritonContext:
     """Cache compiled Triton kernel to avoid recompilation on every call."""
@@ -165,7 +211,7 @@ def cp_lse_ag_out_rs(cp_attn_out, cp_attn_lse, cp_group, ctx=None):
         return cp_attn_out
 
     cp_attn_lse = cp_attn_lse.contiguous()
-    lses = cp_group.all_gather(cp_attn_lse, dim=0)
+    lses = dcp_all_gather(cp_group, cp_attn_lse, 0)
     lses = lses.reshape((cp_group.world_size,) + cp_attn_lse.shape)
 
     out, _ = correct_attn_out(cp_attn_out, lses, cp_group.rank_in_group, ctx=ctx)
