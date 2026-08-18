@@ -1862,6 +1862,7 @@ class _StateBackend:
 def _state_tier_conn(pipeline_parallel_size: int = 1):
     conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
     conn._state_tier = None
+    conn._state_engine = None
     conn._engine = SimpleNamespace(storage_manager=object())
     # `__init__` always sets `_config`, and the builder reads
     # `pipeline_parallel_size` off it, so the fake has to carry one too.
@@ -2568,3 +2569,75 @@ def test_the_stall_is_declared_off_the_oldest_outstanding_save():
     sched._refresh_save_stall()
     assert sched._save_stalled is False
 
+
+# ── the state tier gets its own CPU pool ──────────────────────────────────
+#
+# Sharing one pool with paged KV is wrong in both directions: KV writes
+# ~321GB/hour/rank against state's ~56 and evicts the checkpoints, and a KV
+# backend that stops takes the state tier down with it. Both were measured.
+
+
+def test_the_state_tier_builds_its_own_cpu_pool(monkeypatch):
+    built = {}
+
+    class _Engine:
+        def __init__(self):
+            self.storage_manager = object()
+            self.fmt = None
+
+        def post_init(self):
+            built["post_init"] = True
+
+    class _Builder:
+        @staticmethod
+        def get_or_create(instance_id, cfg, meta, gpu_connector, *rest):
+            built["instance_id"] = instance_id
+            built["max_local_cpu_size"] = cfg.max_local_cpu_size
+            return _Engine()
+
+    import lmcache.v1.cache_engine as ce
+
+    monkeypatch.setattr(ce, "LMCacheEngineBuilder", _Builder)
+    monkeypatch.setenv("OFFLOAD_STATE_CPU_SIZE", "24")
+    conn = _state_tier_conn()
+    conn._engine = SimpleNamespace(storage_manager="the-kv-pool")
+
+    sm = conn._state_storage_manager(_state_meta(), object(), rank=3)
+
+    assert sm != "the-kv-pool", "the state tier must not land in the KV pool"
+    assert built["instance_id"] == "atom-state-3", "one pool per rank"
+    assert built["max_local_cpu_size"] == 24.0
+    assert built["post_init"] is True
+
+
+def test_zero_means_share_the_kv_pool(monkeypatch, caplog):
+    """An escape hatch, and it says what it costs."""
+    monkeypatch.setenv("OFFLOAD_STATE_CPU_SIZE", "0")
+    conn = _state_tier_conn()
+    conn._engine = SimpleNamespace(storage_manager="the-kv-pool")
+
+    with caplog.at_level(logging.INFO, logger="atom"):
+        sm = conn._state_storage_manager(_state_meta(), object(), rank=0)
+
+    assert sm == "the-kv-pool"
+    assert "compete" in caplog.text
+
+
+def test_a_pool_that_cannot_be_built_falls_back_rather_than_failing(monkeypatch, caplog):
+    class _Builder:
+        @staticmethod
+        def get_or_create(*args, **kwargs):
+            raise RuntimeError("no room")
+
+    import lmcache.v1.cache_engine as ce
+
+    monkeypatch.setattr(ce, "LMCacheEngineBuilder", _Builder)
+    monkeypatch.setenv("OFFLOAD_STATE_CPU_SIZE", "16")
+    conn = _state_tier_conn()
+    conn._engine = SimpleNamespace(storage_manager="the-kv-pool")
+
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        sm = conn._state_storage_manager(_state_meta(), object(), rank=0)
+
+    assert sm == "the-kv-pool", "degraded, but the tier still runs"
+    assert "evict checkpoints" in caplog.text

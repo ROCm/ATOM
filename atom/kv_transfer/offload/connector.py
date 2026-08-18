@@ -99,6 +99,9 @@ class LMCacheOffloadConnector(KVConnectorBase):
         # `AttentionBackend._submit_state_spills` probes for it on every batch
         # and an AttributeError there would be a forward-path crash.
         self._state_tier = None
+        # The tier's own LMCache engine, when it got one. Held so its lifetime
+        # matches this connector's rather than the builder's global registry.
+        self._state_engine = None
         from atom.kv_transfer.offload.state_tier import _JointPark
 
         # Requests whose KV leg and state leg must both land before the engine
@@ -318,10 +321,81 @@ class LMCacheOffloadConnector(KVConnectorBase):
             world_size=world,
             worker_id=rank,
         )
-        codec.bind_storage_manager(self._engine.storage_manager)
+        codec.bind_storage_manager(self._state_storage_manager(meta, gpu_connector, rank))
         # No index: `StateOffloadIndex` lives in the engine process. Both
         # directions report and the engine applies.
         self._state_tier = StateOffloadTier(codec)
+
+    def _state_storage_manager(self, meta, gpu_connector, rank: int):
+        """The CPU pool the state tier stores into: its own, not the KV one.
+
+        Sharing was the default and it is wrong in both directions. Capacity:
+        paged KV writes ~321GB/hour/rank against state's ~56, so on one pool the
+        KV stream evicts the checkpoints -- and the state leg is the only one
+        anything reads back (68-82 loads/hour against zero for KV on this
+        workload). Failure: a stopped KV backend took the whole engine down
+        twice, and with one pool it takes the state tier with it.
+
+        Sized by `OFFLOAD_STATE_CPU_SIZE` (GiB per rank) rather than shared with
+        `LMCACHE_MAX_LOCAL_CPU_SIZE`, because the two hold different things: the
+        default 16GiB is ~299 entries of 54.78MiB, against a measured working
+        set of 100-170 live checkpoints per rank.
+
+        Falls back to the KV pool if a second engine cannot be built -- degraded
+        and noisy, but the tier still runs.
+        """
+        try:
+            gib = float(os.environ.get("OFFLOAD_STATE_CPU_SIZE", "16"))
+        except ValueError:
+            logger.warning(
+                "state offload: invalid OFFLOAD_STATE_CPU_SIZE=%r; using 16",
+                os.environ.get("OFFLOAD_STATE_CPU_SIZE"),
+            )
+            gib = 16.0
+        if gib <= 0:
+            logger.info(
+                "state offload: OFFLOAD_STATE_CPU_SIZE=%s, so the tier shares "
+                "the paged-KV CPU pool. Its checkpoints then compete with a "
+                "write stream several times their volume.",
+                gib,
+            )
+            return self._engine.storage_manager
+        try:
+            from lmcache.v1.cache_engine import LMCacheEngineBuilder
+            from lmcache.v1.memory_management import MemoryFormat
+
+            cfg = offcfg.build_lmcache_config(
+                getattr(self._config, "kv_transfer_config", None)
+            )
+            cfg.max_local_cpu_size = gib
+            engine = LMCacheEngineBuilder.get_or_create(
+                f"atom-state-{rank}",
+                cfg,
+                meta,
+                gpu_connector,
+                lambda t, s: None,
+                lambda o, s: o,
+            )
+            engine.fmt = MemoryFormat.KV_2LTD
+            engine.post_init()
+            self._state_engine = engine
+            logger.info(
+                "state offload: state tier has its own CPU pool of %.0f GiB "
+                "per rank (paged KV keeps %s GiB); an entry is 54.78 MiB, so "
+                "this holds ~%d checkpoints.",
+                gib,
+                os.environ.get("LMCACHE_MAX_LOCAL_CPU_SIZE", "<default>"),
+                int(gib * 1024 / 54.78),
+            )
+            return engine.storage_manager
+        except Exception:
+            logger.warning(
+                "state offload: could not build a separate CPU pool for the "
+                "state tier; falling back to the paged-KV pool, where a KV "
+                "write stream will evict checkpoints.",
+                exc_info=True,
+            )
+            return self._engine.storage_manager
 
     def _validate_block_geometry(self, transfer_tensors) -> None:
         """Cross-check codec blocks against existing transfer-region metadata."""
