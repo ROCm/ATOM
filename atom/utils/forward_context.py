@@ -512,6 +512,12 @@ class Context:
     # whole-forward buffer from inside the model must add it, or the ubatches
     # land on each other's rows. Read per-thread (the context is thread-local).
     ubatch_token_offset: int = 0
+    # Mixed prefill+decode (Phase 2). When True, the first num_prefill_tokens
+    # rows of q/k/v are prefill chunks and the rest are decode tokens; the
+    # attention backend splits them via prefill_attn_metadata / decode_attn_metadata.
+    is_mixed: bool = False
+    num_prefill_tokens: int = 0
+    num_prefill_seqs: int = 0
 
     # Optional speculative-decoding inputs staged alongside the target
     # forward's other host-to-device copies. Keeping these on the per-forward
@@ -535,6 +541,9 @@ class Context:
         ubatch_token_offset: int = 0,
         draft_anchor_overrides: torch.Tensor | None = None,
         draft_ragged_lens: torch.Tensor | None = None,
+        is_mixed: bool = False,
+        num_prefill_tokens: int = 0,
+        num_prefill_seqs: int = 0,
     ):
         self.positions = positions
         self.is_prefill = is_prefill
@@ -550,6 +559,9 @@ class Context:
         self.ubatch_token_offset = ubatch_token_offset
         self.draft_anchor_overrides = draft_anchor_overrides
         self.draft_ragged_lens = draft_ragged_lens
+        self.is_mixed = is_mixed
+        self.num_prefill_tokens = num_prefill_tokens
+        self.num_prefill_seqs = num_prefill_seqs
 
 
 @dataclass
@@ -601,6 +613,15 @@ class AttentionMetaData:
     num_cached_tokens: torch.Tensor | None = None
     seq_starts: torch.Tensor | None = None
 
+    # Mixed prefill+decode (Phase 2) split-dispatch sub-metadata. For a mixed
+    # batch the builder returns ONE AttentionMetaData whose `slot_mapping` covers
+    # all tokens (merged prefill-then-decode), and whose attention dispatch is
+    # driven by these two nested objects: `prefill_attn_metadata` for the first
+    # `context.num_prefill_tokens` rows and `decode_attn_metadata` for the rest.
+    # None for non-mixed batches.
+    prefill_attn_metadata: "AttentionMetaData | None" = None
+    decode_attn_metadata: "AttentionMetaData | None" = None
+
     def __init__(
         self,
         cu_seqlens_q: torch.Tensor | None = None,
@@ -633,7 +654,11 @@ class AttentionMetaData:
         total_kv: int | None = None,
         num_cached_tokens: torch.Tensor | None = None,
         seq_starts: torch.Tensor | None = None,
+        prefill_attn_metadata: "AttentionMetaData | None" = None,
+        decode_attn_metadata: "AttentionMetaData | None" = None,
     ):
+        self.prefill_attn_metadata = prefill_attn_metadata
+        self.decode_attn_metadata = decode_attn_metadata
         self.has_cached = has_cached
         self.total_kv = total_kv
         self.num_cached_tokens = num_cached_tokens

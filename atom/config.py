@@ -1551,6 +1551,11 @@ class Config:
     # Requests in the sliding window behind the status line's prefix-cache hit
     # rate. Validated > 0 by EngineStats.
     cache_hit_rate_window: int = 1000
+    # Mix prefill chunks and decode seqs into the same forward pass (Phase 2
+    # of chunked prefill). Default off until the attention backends grow
+    # split-dispatch support — when off, scheduler emits prefill-only or
+    # decode-only batches as before.
+    enable_mixed_prefill_decode: bool = False
     port: int = 8006
     torch_profiler_dir: str | None = field(
         default_factory=lambda: envs.ATOM_TORCH_PROFILER_DIR

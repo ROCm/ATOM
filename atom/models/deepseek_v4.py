@@ -2831,6 +2831,15 @@ class DeepseekV4Attention(nn.Module):
     ) -> torch.Tensor:
         """Narrow split order: pre/proj+norm -> compressor -> paged core -> post."""
 
+        # Mixed batches are handled only on the FULL path (`forward_impl`), which
+        # is where they run today -- a mixed batch is never captured, so it never
+        # reaches a narrow split. Reaching here with the merged carrier would run
+        # `v4_attn_compress` against `compress_plans=None`; assert instead of
+        # producing silently wrong attention.
+        assert not getattr(
+            get_forward_context().attn_metadata, "is_mixed", False
+        ), "mixed batch reached the PIECEWISE attention path; only FULL splits it"
+
         (
             _q,
             _kv_pre,
@@ -3067,34 +3076,134 @@ class DeepseekV4Attention(nn.Module):
         # Metadata + compressor launch (must precede projections for overlap).
         ratio = self.compress_ratio
         attn_md = cast("AttentionMetaData_DSV4", fc.attn_metadata)
-        plan_for_layer = attn_md.compress_plans[ratio] if ratio else None
-        self.maybe_compressors_async(
-            x,
-            plan_for_layer,
-            attn_md.state_slot_in,
-            attn_md.state_slot_out,
-            attn_md.block_tables,
-        )
+        # A mixed batch has no whole-batch compressor plan: its merged metadata
+        # carries compress_plans=None and each half's plans live on its own
+        # sub-metadata. Skip the launch here and let the per-segment loop fire it
+        # with the right plans. Non-mixed behaviour is unchanged.
+        is_mixed = getattr(attn_md, "is_mixed", False)
+        if not is_mixed:
+            plan_for_layer = attn_md.compress_plans[ratio] if ratio else None
+            self.maybe_compressors_async(
+                x,
+                plan_for_layer,
+                attn_md.state_slot_in,
+                attn_md.state_slot_out,
+                attn_md.block_tables,
+            )
 
         # FULL order: compressor launch overlaps projections, then inline
         # QK-norm/RoPE, compressor join, paged core, and output projection.
         q, kv_pre, qr, qr_scale, hidden, *_ = self._attn_pre(
             x, positions, run_indexer_proj=False
         )
-        qkn = self._qk_norm_rope(q, kv_pre, positions)
-        self._attn_compress(
-            piecewise=False,
-            x=hidden,
-            compressor_already_launched=True,
-        )
-        o = self._sparse_attention(
-            qkn,
-            positions,
-            x=hidden,
-            qr=qr,
-            qr_scale=qr_scale,
-        )
+        if is_mixed:
+            o = self._attn_mixed(attn_md, q, kv_pre, qr, qr_scale, hidden, positions)
+        else:
+            qkn = self._qk_norm_rope(q, kv_pre, positions)
+            self._attn_compress(
+                piecewise=False,
+                x=hidden,
+                compressor_already_launched=True,
+            )
+            o = self._sparse_attention(
+                qkn,
+                positions,
+                x=hidden,
+                qr=qr,
+                qr_scale=qr_scale,
+            )
         return self._attn_post(o, positions)
+
+    def _attn_mixed(
+        self,
+        attn_md: "AttentionMetaData_DSV4",
+        q: torch.Tensor,
+        kv_pre: torch.Tensor,
+        qr: torch.Tensor,
+        qr_scale: torch.Tensor | None,
+        hidden: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the segment-dependent attention tail once per half of a mixed batch.
+
+        The batch is `[prefill | decode]`. `_attn_pre` already ran once on the
+        whole thing -- every tensor here is num_tokens-major and simply sliced.
+        What cannot be shared is everything that reads `attn_metadata`:
+
+          maybe_compressors_async  each half has its own compress_plans
+          _attn_compress           batch-shaped; the join for the launch above
+          _sparse_attention        prefill and decode run different paged kernels
+
+        `_qk_norm_rope` is in the loop only because its fused decode SWA write
+        keys off `attn_md.state`; the math itself is identical for both halves
+        ("used for both decode and prefill"). Its store is already gated per
+        token by `batch_id_per_token` (batch_id < 0 skips), so it could be
+        hoisted to a single whole-batch call -- that needs `prepare_mixed` to
+        build the gate and is left to a follow-up so this port stays a port.
+
+        Each segment re-enters with its own complete sub-metadata (is_mixed
+        False), so there is no recursion.
+        """
+        fc = get_forward_context()
+        ctx = fc.context
+        ratio = self.compress_ratio
+        n_p = attn_md.num_prefill_tokens
+        n_d = hidden.size(0) - n_p
+        saved_md = fc.attn_metadata
+        saved_is_prefill = ctx.is_prefill
+        saved_input_ids = ctx.input_ids
+
+        # One combined output; each half writes its own rows. `_sparse_attention`
+        # has no `out=`, so this is a slice-copy rather than the zero-copy slot
+        # the pre-refactor core allowed -- still far cheaper than the per-layer
+        # `torch.cat` it replaced (11.95 ms/step over 61 layers).
+        out = torch.empty(
+            (n_p + n_d, self.n_local_heads * self.head_dim),
+            dtype=hidden.dtype,
+            device=hidden.device,
+        )
+
+        def _seg(lo: int, hi: int, seg_md, is_prefill: bool) -> None:
+            fc.attn_metadata = seg_md
+            ctx.is_prefill = is_prefill
+            if saved_input_ids is not None:
+                # Keep ctx.input_ids segment-consistent for anything downstream
+                # reads off it (e.g. the hash-MoE `_hash_topk`).
+                ctx.input_ids = saved_input_ids[lo:hi]
+            sl = slice(lo, hi)
+            tag = "mixed_seg[prefill]" if is_prefill else "mixed_seg[decode]"
+            with torch.profiler.record_function(f"{tag} n={hi - lo}"):
+                self.maybe_compressors_async(
+                    hidden[sl],
+                    seg_md.compress_plans[ratio] if ratio else None,
+                    seg_md.state_slot_in,
+                    seg_md.state_slot_out,
+                    seg_md.block_tables,
+                )
+                qkn = self._qk_norm_rope(q[sl], kv_pre[sl], positions[sl])
+                self._attn_compress(
+                    piecewise=False,
+                    x=hidden[sl],
+                    compressor_already_launched=True,
+                )
+                out[sl] = self._sparse_attention(
+                    qkn,
+                    positions[sl],
+                    x=hidden[sl],
+                    qr=qr[sl],
+                    qr_scale=None if qr_scale is None else qr_scale[sl],
+                )
+
+        try:
+            with torch.profiler.record_function(f"mixed[n_p={n_p} n_d={n_d}]"):
+                _seg(0, n_p, attn_md.prefill_attn_metadata, True)
+                _seg(n_p, n_p + n_d, attn_md.decode_attn_metadata, False)
+        finally:
+            # Restore for the caller and later layers even if a segment raises.
+            fc.attn_metadata = saved_md
+            ctx.is_prefill = saved_is_prefill
+            ctx.input_ids = saved_input_ids
+        return out
 
     # Nothing is copied per step. Every input comes from the dense piece
     # immediately upstream, whose graph writes it to the same address on every
