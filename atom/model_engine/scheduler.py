@@ -956,17 +956,6 @@ class Scheduler:
             self._warn_if_unschedulable(seq)
         self.waiting.extend(seqs)
 
-    def _defer_free(self, seq: Sequence) -> None:
-        for req_id, existing in self.deferred_free_blocks.items():
-            if str(req_id) != str(seq.id):
-                continue
-            assert existing is seq, (
-                f"refusing to overwrite deferred request ID {seq.id!r} "
-                "with a different sequence lifecycle"
-            )
-            return
-        self.deferred_free_blocks[seq.id] = seq
-
     def _deferred_sequence(self, req_id) -> Sequence | None:
         seq = self.deferred_free_blocks.get(req_id)
         if seq is not None:
@@ -980,31 +969,19 @@ class Scheduler:
         callback = getattr(self.kv_connector, "should_defer_free", None)
         return bool(callable(callback) and callback(seq))
 
-    def _maybe_release_deferred(self, seq: Sequence) -> bool:
-        """Deallocate after the offload connector is terminal."""
+    def _maybe_release_deferred(self, seq: Sequence) -> None:
+        if (
+            seq.id not in self.deferred_free_blocks
+            or getattr(seq, "_awaiting_aborted_load_cleanup", False)
+            or self._connector_should_defer_free(seq)
+        ):
+            return
 
-        if self._deferred_sequence(seq.id) is not seq:
-            return False
-        if getattr(seq, "_awaiting_aborted_load_cleanup", False):
-            return False
-        if self._connector_should_defer_free(seq):
-            return False
-
-        # A second finish notification is intentional for a lifecycle that was
-        # deferred: offload connectors use it to discard now-terminal save
-        # tracking.
         callback = getattr(self.kv_connector, "request_finished", None)
         if callable(callback):
             callback(seq)
-        if self._connector_should_defer_free(seq):
-            return False
-
-        released = self.deferred_free_blocks.pop(seq.id, None)
-        assert (
-            released is seq
-        ), f"deferred request ID {seq.id!r} changed lifecycle before release"
+        self.deferred_free_blocks.pop(seq.id, None)
         self.block_manager.deallocate(seq)
-        return True
 
     def _unschedulable_reason(self, seq: Sequence) -> str | None:
         """Return a human-readable reason if `seq` is permanently unschedulable.
@@ -1651,7 +1628,7 @@ class Scheduler:
         if not has_inflight_load:
             return
 
-        self._defer_free(seq)
+        self.deferred_free_blocks[seq.id] = seq
         terminal_queued = self._pop_load_completion(
             self.finished_recving_kv_req_ids, seq
         ) or self._pop_load_completion(self.failed_recving_kv_req_ids, seq)
@@ -2480,13 +2457,13 @@ class Scheduler:
                         "Deferring block free for seq %s until KV send completes.",
                         seq.id,
                     )
-                    self._defer_free(seq)
+                    self.deferred_free_blocks[seq.id] = seq
                 elif self._connector_should_defer_free(seq):
                     logger.debug(
                         "Deferring block free for seq %s until KV save completes.",
                         seq.id,
                     )
-                    self._defer_free(seq)
+                    self.deferred_free_blocks[seq.id] = seq
                 else:
                     self.block_manager.deallocate(seq)
             else:
