@@ -86,9 +86,7 @@ class TestThroughputStats:
         reset, so the accumulated counts survive to the next tick."""
         stats = EngineStats(enable_log_stats=True, throughput_log_interval_s=1e6)
         stats.update_throughput(num_prompt_tokens=10, num_generation_tokens=5)
-        stats.maybe_log_throughput(
-            num_running_reqs=1, num_waiting_reqs=0, kv_usage=0.0
-        )
+        stats.maybe_log_throughput(num_running_reqs=1, num_waiting_reqs=0, kv_usage=0.0)
         assert stats.num_prompt_tokens == 10
         assert stats.num_generation_tokens == 5
 

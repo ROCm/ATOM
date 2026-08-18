@@ -143,9 +143,9 @@ class EngineStats:
         self._cache_interval_wanted_tokens: int = 0
 
         # ── throughput section ───────────────────────────────────────────
-        assert throughput_log_interval_s > 0, (
-            f"throughput_log_interval_s must be > 0, got {throughput_log_interval_s}"
-        )
+        assert (
+            throughput_log_interval_s > 0
+        ), f"throughput_log_interval_s must be > 0, got {throughput_log_interval_s}"
         self.engine_index = engine_index
         self.throughput_log_interval_s = throughput_log_interval_s
         self._throughput_last_log_time = time.monotonic()
