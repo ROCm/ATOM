@@ -42,8 +42,10 @@ retained-and-shared entries live in the same region and compete for the rest.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
+
+from atom.utils import envs
 
 
 class Pool(Enum):
@@ -64,14 +66,31 @@ class SubPoolSpec:
     # committed state, `1 + num_spec` when a rollback slot per speculated
     # token is kept, or the window block count for a sliding-window class.
     # `extra_entries` is a flat cushion on the class as a whole, on top of the
-    # per-request term. What it covers is the declaring backend's business.
+    # per-request term, and it is *admissible*: rows the pool may hand out. What
+    # it covers is the declaring backend's business — a sliding window's slack,
+    # or checkpoint capacity beyond the in-flight floor.
     entries_per_req: int = 0
     extra_entries: int = 0
+    # STATE only, and the opposite of `extra_entries` in the one way that
+    # matters: rows that are allocated and may never be leased. `extra_entries`
+    # is capacity — more groups for the pool to hand out, which is the whole of
+    # `STATE_CKPT_EXTRA_ENTRIES`. This is the offload tier's staging ring, which
+    # exists so `pop()` can copy an evicted checkpoint out and hand the original
+    # away immediately; a request given one of these rows would be handed a
+    # buffer the spill path writes into behind its back.
+    #
+    # Two fields rather than one flag because the two are set by different
+    # people for different reasons and must ADD. They shared a parameter once,
+    # and since the env override assigns rather than accumulates, setting the
+    # headroom silently deleted the ring.
+    staging_entries: int = 0
 
     def __post_init__(self):
         if self.pool is Pool.STATE and self.entries_per_req < 1:
             raise ValueError(f"{self.name}: STATE entries need entries_per_req >= 1")
-        if self.pool is Pool.PAGE and (self.entries_per_req or self.extra_entries):
+        if self.pool is Pool.PAGE and (
+            self.entries_per_req or self.extra_entries or self.staging_entries
+        ):
             raise ValueError(f"{self.name}: PAGE entries are sized from the remainder")
 
 
@@ -93,8 +112,38 @@ def state_pool(
     entries_per_req: int,
     extra_entries: int = 0,
 ) -> SubPoolSpec:
-    """A per-request state entry class."""
-    return SubPoolSpec(Pool.STATE, name, entry_bytes, entries_per_req, extra_entries)
+    """A per-request state entry class.
+
+    Two cushions are added here rather than by the declaring backend, and both
+    for the same reason: each is driven by an environment variable, and a
+    second reader anywhere would let two sites disagree about the same number.
+
+      `STATE_CKPT_EXTRA_ENTRIES`   checkpoint capacity. Admissible — these are
+                                   groups the pool hands out.
+      `OFFLOAD_STATE_STAGING_GROUPS`
+                                   the offload tier's staging ring, counted in
+                                   *groups*, so it costs `entries_per_req` rows
+                                   each. Never admissible. Gated to 0 by
+                                   `OFFLOAD_STATE`; both are read through
+                                   `state_offload_staging_groups()`.
+
+    The env assigns `extra_entries` rather than adding to it, which is the
+    contract `tests/test_v4_sub_pool_spec.py` pins: the declared value is a
+    backend's default and the operator overrides it. The ring is not part of
+    that negotiation and is added on top.
+    """
+    from atom.model_engine.state_offload import state_offload_staging_groups
+
+    if envs.is_set("STATE_CKPT_EXTRA_ENTRIES"):
+        extra_entries = int(envs.STATE_CKPT_EXTRA_ENTRIES)
+    return SubPoolSpec(
+        Pool.STATE,
+        name,
+        entry_bytes,
+        entries_per_req,
+        extra_entries,
+        staging_entries=state_offload_staging_groups() * entries_per_req,
+    )
 
 
 @dataclass(frozen=True)
@@ -110,6 +159,13 @@ class PoolPlan:
     reserved_bytes: dict[str, int]
     entries_per_req: dict[str, int]
     paged_class: str | None = None
+    # What allocation buys vs. what admission may lease. They differ only by
+    # `staging_entries`: the offload tier's ring, allocated inside the arena so
+    # `state_entry_views(num_groups + slot)` addresses it with no second scheme,
+    # and leased to nobody. `extra_entries` is on both sides — it is capacity.
+    # Kept as a computed table rather than a subtraction at each call site so
+    # a consumer picks a meaning by the name it reads.
+    admission_entries: dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def empty(cls) -> PoolPlan:
@@ -121,7 +177,13 @@ class PoolPlan:
         AttributeError — the runner installs this at construction time and
         replaces it in `get_num_blocks`.
         """
-        return cls(entries={}, entry_bytes={}, reserved_bytes={}, entries_per_req={})
+        return cls(
+            entries={},
+            entry_bytes={},
+            reserved_bytes={},
+            entries_per_req={},
+            admission_entries={},
+        )
 
     def with_paged_entries(self, count: int) -> PoolPlan:
         """Copy of the plan with the PAGE class resized to `count`.
@@ -136,6 +198,7 @@ class PoolPlan:
         return replace(
             self,
             entries={**self.entries, self.paged_class: count},
+            admission_entries={**self.admission_entries, self.paged_class: count},
             reserved_bytes={**self.reserved_bytes, self.paged_class: count * bytes_per},
         )
 
@@ -181,10 +244,12 @@ def merge_specs(specs: list[SubPoolSpec]) -> dict[str, SubPoolSpec]:
             prev.pool,
             prev.entries_per_req,
             prev.extra_entries,
+            prev.staging_entries,
         ) != (
             spec.pool,
             spec.entries_per_req,
             spec.extra_entries,
+            spec.staging_entries,
         ):
             raise ValueError(
                 f"entry class {spec.name!r} declared twice with different "
@@ -196,6 +261,7 @@ def merge_specs(specs: list[SubPoolSpec]) -> dict[str, SubPoolSpec]:
             prev.entry_bytes + spec.entry_bytes,
             spec.entries_per_req,
             spec.extra_entries,
+            spec.staging_entries,
         )
     return merged
 
@@ -213,14 +279,20 @@ def plan_pools(
     """
     merged = merge_specs(specs)
     entries: dict[str, int] = {}
+    admissible_entries: dict[str, int] = {}
     reserved: dict[str, int] = {}
     remaining = available_bytes
 
     state = {n: s for n, s in merged.items() if s.pool is Pool.STATE}
     for name, spec in state.items():
-        count = max_num_seqs * spec.entries_per_req + spec.extra_entries
+        # `extra_entries` is capacity the pool leases; `staging_entries` is the
+        # offload ring, allocated past the pool's group range and leased to
+        # nobody. See `SubPoolSpec` for why they are two fields.
+        admissible = max_num_seqs * spec.entries_per_req + spec.extra_entries
+        count = admissible + spec.staging_entries
         cost = count * spec.entry_bytes
         entries[name], reserved[name] = count, cost
+        admissible_entries[name] = admissible
         remaining -= cost
     if state and remaining <= 0:
         raise InsufficientPoolBudget(
@@ -236,6 +308,7 @@ def plan_pools(
         spec = merged[name]
         count = max(0, remaining // spec.entry_bytes)
         entries[name], reserved[name] = count, count * spec.entry_bytes
+        admissible_entries[name] = count
 
     return PoolPlan(
         entries=entries,
@@ -243,4 +316,5 @@ def plan_pools(
         reserved_bytes=reserved,
         entries_per_req={n: s.entries_per_req for n, s in merged.items()},
         paged_class=paged[0] if paged else None,
+        admission_entries=admissible_entries,
     )

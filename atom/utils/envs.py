@@ -45,6 +45,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ATOM remaps the SGLang world into internal TP x PCP groups.
     # 0 means unset.
     "ATOM_SGLANG_PCP_SIZE": lambda: int(os.getenv("ATOM_SGLANG_PCP_SIZE", "0") or "0"),
+    # Checkpoint capacity for the state pool, in entries. Read only through
+    # `sub_pool_spec.state_pool`, which ASSIGNS it over the declaring backend's
+    # default rather than adding to it.
+    "STATE_CKPT_EXTRA_ENTRIES": lambda: int(
+        os.getenv("STATE_CKPT_EXTRA_ENTRIES", "0") or "0"
+    ),
     # --- Compilation & Execution ---
     "ATOM_USE_TRITON_GEMM": lambda: os.getenv("ATOM_USE_TRITON_GEMM", "0") == "1",
     "ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE": lambda: (

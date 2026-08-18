@@ -130,6 +130,13 @@ class Sequence:
         # exactly one forward. -1 = read and write the same group, the case for
         # every step in between.
         self.state_fork_src = -1
+        # Content hash of a checkpoint the offload tier has been asked to fetch
+        # back into `per_req_cache_group`, or -1. Set by
+        # `BlockManager._attach_state_group` when the boundary this seq hit
+        # lives in LMCache rather than HBM; it is what tells the scheduler to
+        # park the request, and what tells the failure path that
+        # `num_cached_tokens` is claiming state nobody delivered.
+        self.state_load_hash = -1
         self.temperature = sampling_params.temperature
         self.top_k = sampling_params.top_k
         self.top_p = sampling_params.top_p

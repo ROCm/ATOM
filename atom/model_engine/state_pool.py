@@ -1,11 +1,42 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import logging
 from collections import deque
 from dataclasses import dataclass
 from heapq import heapify, heappop, heappush
+from typing import TYPE_CHECKING
 
+from atom.model_engine.state_offload import should_load_state
 from atom.model_engine.state_runtime import StateTransfer
+
+if TYPE_CHECKING:
+    from atom.model_engine.state_offload import StateOffloadIndex
+
+logger = logging.getLogger("atom")
+
+# Whether a hash that lives only in the offload tier can still be turned back
+# into a group this pool can resume from.
+#
+# True: the load direction is wired end to end.
+# `BlockManager._attach_state_group` turns an accepted offload-only boundary
+# into a `StateOffloadIndex.request_load`, the scheduler parks the request, the
+# worker's `StateOffloadTier.submit_load` fetches the entry into the group the
+# request already holds, and `finished_loading` / `failed_loading` bring it
+# back.
+#
+# This is a statement about the code, not a policy knob, and it is not the
+# feature's on/off switch -- `OFFLOAD_STATE` is. What it guards is the
+# invariant that makes `resumable_hit`'s right-to-left scan sound: the scan
+# stops at the first boundary `_resumable_from` accepts, so accepting a
+# boundary nothing can deliver does not merely fail to help, it *shadows* a
+# shorter checkpoint still resident in HBM that the scan would otherwise have
+# reached. Reachable-in-principle is the weakest thing this may ever mean;
+# anything weaker turns a hit into no hit. Set it False again and the pool
+# reverts, exactly, to the HBM-only predicate -- which is what the control pair
+# in `tests/test_state_offload_resume.py` drives, and why it stays a name
+# rather than being folded into the expression it guards.
+STATE_OFFLOAD_LOADS_WIRED = True
 
 
 @dataclass(frozen=True)
@@ -73,6 +104,17 @@ class StateGroupPool:
         # Reverse map, for lazy eviction when a group is handed out. -1 = the
         # group carries no checkpoint.
         self.group_hash: list[int] = [-1] * num_groups
+        # Backing store beneath the pool, or None. Owned here rather than
+        # placed in `BlockManager.state_caches` because every member of that
+        # tuple is a veto — it answers "the rightmost boundary <= X that I
+        # accept" — and this tier does the opposite: it makes more boundaries
+        # reachable. As a sibling it could only ever return identity.
+        self.offload: StateOffloadIndex | None = None
+        # (group, staging_slot) pairs the next forward must copy out of HBM.
+        self._spill_copies: list[tuple[int, int]] = []
+        # One-shot latch so the undrained-consumer diagnosis cannot flood the
+        # log from `pop()`, which is itself a hot path.
+        self._warned_spill_copies_undrained = False
         # Groups serving as a fork source in the in-flight step, counted by how
         # many requests fork off each. They stay off the free list until
         # `release_pins`, so the step that reads them cannot race a request that
@@ -117,11 +159,20 @@ class StateGroupPool:
         """Whether `group` is on the free list *and* still worth something."""
         return group in self._free and self.group_hash[group] != -1
 
-    def pop(self) -> int:
+    def pop(self, *, spill: bool = True) -> int:
         """Hand out a group, evicting its checkpoint if it carried one.
 
         Vacant first, lowest index first; only when nothing is vacant does a
         checkpoint get spent, and then it is the least recently used one.
+
+        `spill=False` gives up the evicted checkpoint's bytes instead of
+        staging them, and exists for one caller: a group about to be filled by
+        an offload *load*. The spill copy is issued by the next forward while
+        the load runs on the tier's own thread ahead of it, so the two would
+        race over the same group and the spill would store the loaded state
+        under the evicted checkpoint's hash. Nothing downstream could tell.
+        Forgoing the spill costs one checkpoint -- exactly the pre-tier
+        behaviour, counted as `spills_forgone`.
 
         The state twin of `BlockManager._pop_free_block`: groups sit on the free
         list carrying whatever the last owner left in them, and re-allocation —
@@ -137,6 +188,12 @@ class StateGroupPool:
             group = self._checkpointed.popleft()
             self._free.discard(group)
             self.checkpoints_evicted += 1
+            if spill:
+                # Before invalidate() clears group_hash[group]: the hash is the
+                # key the tier stores under.
+                self._spill(group)
+            elif self.offload is not None and self.offload.enabled:
+                self.offload.spills_forgone += 1
         self.invalidate(group)
         return group
 
@@ -326,8 +383,9 @@ class StateGroupPool:
             return hit
         hbs = self.hash_block_size
         for i in range(hit - 1, -1, -1):
-            checkpointed = block_hashes[i] in self.hash_to_group
-            if not assume_checkpointed and not checkpointed:
+            if not assume_checkpointed and not self._resumable_from(
+                block_hashes[i], (i + 1) * hbs
+            ):
                 continue
             if seq.num_tokens - (i + 1) * hbs >= self.min_fork_tokens:
                 return i + 1
@@ -338,6 +396,110 @@ class StateGroupPool:
         if not self.enabled:
             return -1
         return self.hash_to_group.get(h, -1)
+
+    # ------------------------------- offload ------------------------------- #
+    def _resumable_from(self, h: int, tokens: int) -> bool:
+        """Whether a checkpoint for `h` can be *reached*, in HBM or beneath it.
+
+        Reached, not merely indexed. `resumable_hit` scans right to left and
+        stops at the first boundary this accepts, so accepting one whose bytes
+        nothing can deliver does not cost a wasted lookup — it costs the whole
+        walk-back, hiding every shorter checkpoint still resident in HBM. The
+        tier only earns a vote here once a load can act on it, which is what
+        `STATE_OFFLOAD_LOADS_WIRED` states.
+
+        HBM therefore wins without a preference rule: once both tiers are
+        reachable they are indexed by the same hash, and the right-to-left scan
+        takes the rightmost boundary wherever it lives.
+
+        `tokens` is the boundary this hash sits on, and the tier's floor
+        (`OFFLOAD_STATE_MIN_LOAD_TOKENS`) is applied here rather than where the
+        load is issued for the same reason the rest of this predicate exists: a
+        floor has to *decline* a rung so the scan keeps walking. Accepting one
+        and then declining to fetch it ends the scan on a boundary nobody
+        fills. The HBM branch is deliberately not gated by it — that hit costs
+        no transfer, so there is nothing for a floor to amortize.
+        """
+        if h in self.hash_to_group:
+            return True
+        # Invariant, relied on to keep this hot path free of an `enabled` check:
+        # a disabled (depth-0) tier never reaches `request_spill`, because
+        # `_spill` returns on `not enabled` first, so `hashes` stays empty and
+        # the membership test is false anyway. Anything that adds to `hashes`
+        # outside the confirm-after-spill path must re-check `enabled` here.
+        return (
+            STATE_OFFLOAD_LOADS_WIRED
+            and self.offload is not None
+            and h in self.offload.hashes
+            and should_load_state(tokens, self.offload.min_load_tokens)
+        )
+
+    def _spill(self, group: int) -> None:
+        """Stage `group`'s bytes for the tier, if there is room. Never blocks.
+
+        Beyond the staging depth the spill is simply dropped and
+        `checkpoints_evicted` still counts it — identical to the behaviour
+        without a tier, so there is no regression to reason about.
+        """
+        if self.offload is None or not self.offload.enabled:
+            return
+        h = self.group_hash[group]
+        if h == -1:
+            return
+        slot = self.offload.request_spill(h, group)
+        if slot >= 0:
+            self._spill_copies.append((group, slot))
+            # Exact leak detector, not a heuristic: a slot must be released
+            # before it can be handed out again, so at most `staging_depth`
+            # copies can be outstanding if the consumer drains every step.
+            # More than that is proof `take_spill_copies` is not being called.
+            if (
+                len(self._spill_copies) > self.offload.staging_depth
+                and not self._warned_spill_copies_undrained
+            ):
+                self._warned_spill_copies_undrained = True
+                logger.warning(
+                    "StateGroupPool has %d undrained spill copies for a staging "
+                    "ring of depth %d. take_spill_copies() must be called every "
+                    "step and each slot released with release_staging(); until "
+                    "it is, the staging ring leaks and every spill is dropped.",
+                    len(self._spill_copies),
+                    self.offload.staging_depth,
+                )
+
+    def has_pending_spill(self, group: int) -> bool:
+        """Whether a queued spill copy still has to read `group`.
+
+        The window a load must not enter. It closes when the copy is issued on
+        the compute stream (`take_spill_copies` -> the next forward), after
+        which only the staging entry is read and the group is free to be
+        overwritten. Normally empty for a group `pop(spill=False)` just handed
+        out; a copy left undrained by a batch that was never forwarded is the
+        case this catches.
+        """
+        return any(g == group for g, _slot in self._spill_copies)
+
+    def take_spill_copies(self) -> list[tuple[int, int]]:
+        """`(group, staging_slot)` pairs the next forward must copy.
+
+        The consumer turns each into `relocate_state_slots([(group,
+        num_groups + slot)])` — the staging ring is K groups appended to the
+        arena past the pool's own range, so a staging slot is addressable by
+        the existing group-indexed copy with no second addressing scheme. One
+        device-to-device copy per spill, on the compute stream ahead of that
+        step's forward, the same path relocation already uses.
+
+        Contract, and it is not optional. Whoever attaches a tier MUST call
+        this every step, and MUST call `StateOffloadIndex.release_staging(slot)`
+        for each slot once its bytes are safe. Skip the drain and this list
+        grows without bound; skip the release and the staging ring is starved
+        permanently — `request_spill` then returns -1 forever and every
+        checkpoint is silently evicted instead of spilled. Both failures are
+        detected and warned about once (here and in `request_spill`), but the
+        warning is a diagnosis, not a repair.
+        """
+        out, self._spill_copies = self._spill_copies, []
+        return out
 
     # ---------------------------- checkpointing ---------------------------- #
     def checkpoint(self, seq, boundary_blocks: int, h: int) -> None:
@@ -366,13 +528,31 @@ class StateGroupPool:
         self.checkpoints_kept += 1
 
     def checkpoint_fates(self) -> dict[str, int]:
-        """What became of the checkpoints the ladder asked this pool to keep."""
-        return {
+        """What became of the checkpoints the ladder asked this pool to keep.
+
+        Folds in the offload tier's own counters when a tier is attached.
+        `StateOffloadIndex.stats()` had no caller, which left `spills_dropped`
+        -- the "the staging ring is too shallow for this workload" signal --
+        invisible until 256 consecutive drops tripped the starvation warning.
+        A ring that drops one spill in three never trips that and never says
+        so. `state_checkpoint_fates` sums whatever keys each pool returns, so
+        merging here is the whole wiring.
+
+        The keys are prefixed `state_offload_` because that aggregation is by
+        key across every state class: an unprefixed `indexed` would collide
+        with anything a future pool names the same.
+        """
+        fates = {
             "checkpoints_kept": self.checkpoints_kept,
             "checkpoints_dropped": self.checkpoints_dropped,
             "checkpoints_evicted": self.checkpoints_evicted,
             "checkpoints_orphaned": self.checkpoints_orphaned,
         }
+        if self.offload is not None:
+            fates.update(
+                (f"state_offload_{k}", v) for k, v in self.offload.stats().items()
+            )
+        return fates
 
     def record_relocation(self, src: int, dst: int) -> None:
         """Schedule an Active Slot relocation for the next batch."""
@@ -421,6 +601,8 @@ class StateGroupPool:
         group = self.hash_to_group.get(h, -1)
         if group < 0:
             return
+        if self.offload is not None and self.offload.kv_offload_enabled:
+            self._spill(group)
         self.invalidate(group)
         self.checkpoints_orphaned += 1
 

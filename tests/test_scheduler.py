@@ -299,6 +299,49 @@ class TestSchedule:
         assert failed in sched.running
         assert sched._num_parked_remote_kv == 0
 
+    def test_a_resumed_offload_prefill_reports_the_hit_the_load_gave_it(
+        self, seq_factory
+    ):
+        """`cached_tokens` must count the tokens LMCache brought back.
+
+        The load is the entire point of parking: `_mark_offload_load_ready`
+        raises `num_cached_tokens` from the pre-park HBM-only hit to the
+        post-load one. But the resume branch `continue`s before either
+        `prefix_cache_hit_tokens` assignment, so the field keeps the pre-park
+        value while `CacheStats` is fed the fresh `num_cached_tokens` in
+        `_schedule_prefill_seq`. The two then disagree about the same request,
+        and the one the user sees is the one that undercounts -- making the
+        offload tier look like it did nothing.
+        """
+        sched = Scheduler(
+            MockConfig(
+                max_num_seqs=2,
+                max_num_batched_tokens=64,
+                num_kvcache_blocks=100,
+            )
+        )
+        sched.kv_connector = SimpleNamespace(
+            is_offload=True,
+            build_connector_meta=lambda: None,
+        )
+
+        seq = seq_factory(list(range(8)))
+        seq.num_cached_tokens = 2  # the HBM-only hit, before the load
+        seq.prefix_cache_hit_tokens = 2
+        seq.block_table = [0]
+        seq.offload_loaded_tokens = 6  # LMCache returned four more
+        sched._park_for_remote_load(seq, deque())
+        sched._count_inflight_load(seq)
+        sched.finished_recving_kv_req_ids.append(seq.id)
+        assert sched._resolve_waiting_remote_kv(seq, deque()) is False
+        sched.waiting.append(seq)
+
+        sched.schedule()
+
+        assert seq in sched.running, "precondition: the resume must be admitted"
+        assert seq.num_cached_tokens == 6, "precondition: the load was applied"
+        assert seq.prefix_cache_hit_tokens == 6
+
     def test_partial_prefill_ready_for_offload_load_moves_to_waiting(self):
         class _Connector:
             def should_park_partial_prefill_for_load(self, seq):

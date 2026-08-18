@@ -131,6 +131,16 @@ class LMCacheOffloadMetadata(ConnectorMetadata):
         self.requests: list[LMCacheReqMeta] = []
         # req_ids whose worker-side lookup pin can be released this step.
         self.lookup_requests_in_step: list[str] = []
+        # `(req_id, state_hash, target_group)` for the state offload tier.
+        #
+        # A separate list from `requests` because a state load shares none of
+        # a KV transfer's shape: no token ids (the whole entry moves under one
+        # key, `state_object.py`), no block ids (the destination is a state
+        # pool group, not paged blocks), and no chunking. What it does share is
+        # the lifecycle -- park, then `finished_loading`/`failed_loading` --
+        # which is why it rides this metadata rather than the batch: the batch
+        # a load is issued for is precisely the one its request is *not* in.
+        self.state_loads: list[tuple] = []
 
     def add_request(self, meta: LMCacheReqMeta) -> None:
         self.requests.append(meta)

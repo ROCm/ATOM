@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Tests for atom/model_engine/block_manager.py — public API only
 
+import logging
 
 from conftest import MockConfig
 
@@ -510,3 +511,93 @@ class TestDecodeBlockHashing:
         bm.hash_decode_blocks(seq, seq.num_tokens)
         assert seq.num_hashed_tokens == 0
         assert not bm.kv.num_indexed
+
+
+# ── state_offload disabled by default ─────────────────────────────────────
+
+
+def test_state_offload_is_none_when_tier_is_off(block_manager):
+    """With OFFLOAD_STATE unset, state_offload_staging_groups() returns 0 and
+    no index is wired, so BlockManager.state_offload is None."""
+    assert block_manager.state_offload is None
+
+
+# ── the ring is installed only where something can drain it ───────────────
+
+_OFFLOAD_KVC = {"kv_connector": "lmcache_offload", "kv_role": "offload"}
+
+
+def _bm_with_state_tier(monkeypatch, kv_transfer_config):
+    monkeypatch.setenv("OFFLOAD_STATE", "1")
+    monkeypatch.setenv("OFFLOAD_STATE_STAGING_GROUPS", "2")
+    cfg = MockConfig(
+        enable_prefix_caching=True,
+        kv_transfer_config=kv_transfer_config,
+        pool_entries={"state": 4},
+        pool_entries_per_req={"state": 1},
+    )
+    return BlockManager(cfg)
+
+
+def test_no_ring_is_installed_without_a_connector_that_hosts_the_tier(
+    monkeypatch, caplog
+):
+    """The silent-permanent failure. Nothing submits a spill without a hosting
+    connector -- `_poll_kv_transfer_progress` returns early and the forward
+    finds no `_state_tier` -- so an installed ring would hand out every slot
+    and never get one back. Refuse to install it, and say so."""
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        bm = _bm_with_state_tier(monkeypatch, None)
+
+    assert bm.state_offload is None
+    assert all(cache.offload is None for cache in bm.state_caches)
+    # An installed-but-inert ring is the thing that misleads, so drive the
+    # eviction path that would reserve a slot and prove none is: with the ring
+    # installed this same call yields (group, dst, slot, hash) and that slot
+    # never comes back.
+    bm.state.group_hash[1] = 111
+    bm.state._spill(1)
+    assert bm.state.take_spill_copies() == []
+    assert bm.state_spills_for_batch() == []
+    text = caplog.text
+    assert "OFFLOAD_STATE" in text and "kv-transfer-config" in text
+
+
+def test_a_connector_that_cannot_host_the_tier_gets_no_ring_either(monkeypatch, caplog):
+    """Same leak, one step subtler: moriio is a KV connector, so a plain
+    truthiness test on kv_transfer_config would install the ring, but only
+    lmcache_offload's worker half ever builds a `_state_tier`."""
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        bm = _bm_with_state_tier(monkeypatch, {"kv_connector": "moriio"})
+
+    assert bm.state_offload is None
+    assert "OFFLOAD_STATE" in caplog.text
+
+
+def test_the_ring_is_installed_for_the_offload_connector(monkeypatch):
+    bm = _bm_with_state_tier(monkeypatch, _OFFLOAD_KVC)
+    assert bm.state_offload is not None
+    assert bm.state_offload.staging_depth == 2
+    assert bm.state_offload.kv_offload_enabled is True
+    assert all(cache.offload is bm.state_offload for cache in bm.state_caches)
+
+
+def test_the_ring_is_installed_for_a_multi_that_lists_the_offload_backend(
+    monkeypatch,
+):
+    bm = _bm_with_state_tier(
+        monkeypatch,
+        {
+            "kv_connector": "multi",
+            "connectors": [{"kv_connector": "moriio"}, _OFFLOAD_KVC],
+        },
+    )
+    assert bm.state_offload is not None
+
+
+def test_a_multi_without_the_offload_backend_gets_no_ring(monkeypatch):
+    bm = _bm_with_state_tier(
+        monkeypatch,
+        {"kv_connector": "multi", "connectors": [{"kv_connector": "moriio"}]},
+    )
+    assert bm.state_offload is None

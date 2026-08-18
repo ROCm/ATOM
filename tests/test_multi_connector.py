@@ -13,12 +13,14 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from atom.kv_transfer.disaggregation.types import ConnectorMetadata, KVConnectorOutput
+import pytest
+
 from atom.kv_transfer.disaggregation.multi.multi_connector import (
     MultiConnector,
     MultiConnectorMetadata,
     MultiConnectorScheduler,
 )
+from atom.kv_transfer.disaggregation.types import ConnectorMetadata, KVConnectorOutput
 
 # ---------------------------------------------------------------------------
 # Mock sub-connectors
@@ -52,6 +54,7 @@ class FakeSchedSub:
             self.chunk_ret = None
             self.saved = []
             self.load_failed_ids = []
+            self.state_loads = []
 
     def get_num_new_matched_tokens(self, seq):
         return self._match
@@ -84,6 +87,10 @@ class FakeSchedSub:
     def load_failed(self, req_id):
         self.load_failed_ids.append(req_id)
 
+    def enqueue_state_loads(self, loads):
+        self.state_loads.extend(loads)
+        return True
+
     def __getattribute__(self, name):
         # Hide offload-specific methods unless this mock opts in, so
         # MultiConnector's hasattr() guards are exercised realistically.
@@ -94,6 +101,7 @@ class FakeSchedSub:
             "should_defer_free",
             "save_finished",
             "load_failed",
+            "enqueue_state_loads",
         }
         if name in offload_api and not object.__getattribute__(self, "_offload"):
             raise AttributeError(name)
@@ -138,6 +146,7 @@ def _worker(connectors):
     obj._pending_save = set()
     obj._sent = {}
     obj._saved = {}
+    obj._state_tier = None
     return obj
 
 
@@ -281,6 +290,94 @@ def test_producer_offload_load_completion_uses_loading_state():
     assert out.failed_recving == set()
     assert out.finished_loading == {"l1"}
     assert out.failed_loading == {"f1"}
+
+
+def test_state_reports_are_unioned_through_the_composite():
+    """A staging slot comes back only via this report. `multi` dropping it is
+    the silent-permanent failure: the engine drains slots onto every batch and
+    the ring starves after K spills, with one warning 256 drops later."""
+    off = FakeWorkerSub(
+        finished=KVConnectorOutput(state_staging_released={1}, state_indexed={99})
+    )
+    moriio = FakeWorkerSub(finished=(set(), set()))
+    w = _worker([moriio, off])  # not producer
+
+    out = w.get_finished()
+
+    assert out.state_staging_released == {1}
+    assert out.state_indexed == {99}
+
+
+def test_state_reports_survive_the_producer_send_save_pairing():
+    """The pairing withholds send/save until both land. These two have no
+    request identity to pair on, so they must pass through the producer branch
+    untouched -- an early `return out` in that branch would strand them."""
+    moriio = FakeWorkerSub(is_producer=True, finished=(set(), set()))
+    off = FakeWorkerSub(
+        finished=KVConnectorOutput(state_staging_released={2, 3}, state_indexed={7})
+    )
+    w = _worker([moriio, off])
+
+    out = w.get_finished()
+
+    assert out.state_staging_released == {2, 3}
+    assert out.state_indexed == {7}
+
+
+def test_state_loads_go_to_the_sub_that_can_carry_them():
+    """The scheduler calls `enqueue_state_loads` on whatever connector it
+    holds. Under `multi` that is this object, and a load it swallowed would
+    leave its request parked against a transfer nobody was asked to make.
+    """
+    plain = FakeSchedSub()
+    off = FakeSchedSub(is_offload=True, offload_methods=True)
+    loads = [(1, 111, 0), (2, 222, 3)]
+
+    assert _sched([plain, off]).enqueue_state_loads(loads) is True
+
+    assert off.state_loads == loads
+    assert not hasattr(plain, "enqueue_state_loads")
+
+
+def test_no_sub_to_carry_a_state_load_is_reported_not_swallowed():
+    """Every one of these belongs to a parked request that only a report can
+    wake, and the scheduler's `hasattr` guard cannot catch this case because
+    this method always exists on the composite. So it has to say no."""
+    plain = FakeSchedSub()
+    accepted = _sched([plain, FakeSchedSub()]).enqueue_state_loads([(1, 111, 0)])
+    assert accepted is False
+
+
+def test_the_composite_exposes_the_sub_connectors_state_tier():
+    """`AttentionBackend._submit_state_spills` reads `_state_tier` off whatever
+    connector the forward context holds. Under `multi` that is this object, so
+    without the re-export nothing is ever submitted and every slot leaks."""
+    tier = object()
+    off = FakeWorkerSub()
+    off._state_tier = tier
+    w = _worker([FakeWorkerSub(), off])
+
+    w.register_kv_caches({}, transfer_tensors=None, num_blocks=1)
+
+    assert w._state_tier is tier
+
+
+def test_no_sub_with_a_tier_leaves_the_composite_tier_none():
+    w = _worker([FakeWorkerSub(), FakeWorkerSub()])
+    w.register_kv_caches({}, transfer_tensors=None, num_blocks=1)
+    assert w._state_tier is None
+
+
+def test_two_sub_connectors_with_a_tier_is_refused():
+    """First-one-wins would be wrong, not merely arbitrary: the spill goes to
+    one tier and the load may ask the other, so a hash could be reported
+    indexed by a tier that never stored it."""
+    a, b = FakeWorkerSub(), FakeWorkerSub()
+    a._state_tier, b._state_tier = object(), object()
+    w = _worker([a, b])
+
+    with pytest.raises(ValueError, match="exactly one may"):
+        w.register_kv_caches({}, transfer_tensors=None, num_blocks=1)
 
 
 def test_recv_blocks_concat():
