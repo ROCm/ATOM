@@ -64,9 +64,7 @@ class WideEPTopology:
         dist_init_addr: str | None = None,
     ) -> WideEPTopology:
         tp_size = 1 if dp_attention else raw_tp_size
-        global_dp_size = (
-            raw_tp_size * raw_dp_size if dp_attention else raw_dp_size
-        )
+        global_dp_size = raw_tp_size * raw_dp_size if dp_attention else raw_dp_size
         local_engine_count = global_dp_size // nnodes
 
         dist_init_host: str | None = None
@@ -74,9 +72,7 @@ class WideEPTopology:
         if nnodes > 1:
             if dist_init_addr is None:
                 raise ValueError("nnodes>1 requires dist_init_addr")
-            dist_init_host, dist_init_base_port = parse_dist_init_addr(
-                dist_init_addr
-            )
+            dist_init_host, dist_init_base_port = parse_dist_init_addr(dist_init_addr)
 
         topo = cls(
             nnodes=nnodes,
@@ -102,9 +98,7 @@ class WideEPTopology:
                 f"({self.node_rank}, {self.nnodes})"
             )
         if self.nnodes > 1 and not self.dp_attention:
-            raise ValueError(
-                "nnodes>1 requires dp_attention (TP does not span nodes)"
-            )
+            raise ValueError("nnodes>1 requires dp_attention (TP does not span nodes)")
         if self.global_dp_size % self.nnodes != 0:
             divisors = [
                 n
@@ -140,9 +134,7 @@ class WideEPTopology:
 
     def _require_rendezvous_base_port(self) -> int:
         if self.dist_init_base_port is None:
-            raise ValueError(
-                "rendezvous ports require nnodes>1 and dist_init_addr"
-            )
+            raise ValueError("rendezvous ports require nnodes>1 and dist_init_addr")
         return self.dist_init_base_port
 
     @property
