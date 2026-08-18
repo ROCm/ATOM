@@ -47,6 +47,21 @@ class KVCacheTensor:
     # DSA sparse layers (GLM-5.2 / DeepSeek-V3.2): indexer key cache, block-major
     # ``(num_blocks, block_size, aligned_index_dim)``. Omitted for non-DSA layers.
     index_cache: torch.Tensor | None = None
+    # ReplaySSM record buffers for linear-attention layers: this layer's slice
+    # of the (k, u, g) pools.  None for every other attention type.  Carried
+    # here because the layer-id -> linear-attn-index mapping already lives in
+    # the builder's `build_kv_cache_tensor`.
+    replay_buf_k: torch.Tensor = None
+    replay_buf_u: torch.Tensor = None
+    replay_buf_g: torch.Tensor = None
+    # True when the tensors above are a hybrid model's PER-REQUEST state (the
+    # GDN/KDA recurrent state) rather than paged KV. They still belong in
+    # ``kv_cache_data`` -- the linear-attention forward reads its state from
+    # exactly there -- but they are addressed by request slot, have no block
+    # stride, and no block-addressed mover may touch them. ``ATOMKVByteCodec``
+    # skips them; the state offload tier reaches the same bytes through the
+    # backend's ``state_entry_views``.
+    per_request_state: bool = False
 
 
 @dataclass
@@ -1320,10 +1335,28 @@ class Config:
     long_prefill_token_threshold: int = 0
     attn_prefill_chunk_size: int = 16384
     # Tokens between rungs of the state-checkpoint ladder, shared by every
-    # Pool.STATE class; 0 = no ladder. Must be a multiple of the prefix-cache
-    # hash block size (asserted in BlockManager). See
-    # BlockManager.checkpointers_at.
+    # Pool.STATE class. Must be a multiple of the prefix-cache hash block size
+    # (snapped, with a warning, in BlockManager).
+    #   >0  a rung every N tokens
+    #    0  state checkpointing off entirely
+    #   -1  no interval rungs, but the demand rung and the prompt-end anchor
+    #       still place checkpoints
+    # See BlockManager.checkpointers_at.
     state_checkpoint_interval_tokens: int = 8192
+    # Extra state slots to size the STATE pool with on top of what the
+    # in-flight requests take. Checkpoints live in the same pool as running
+    # requests, so at 0 the room to keep one is whatever concurrency leaves
+    # over — declaring it here decouples the two. Counted one per checkpoint,
+    # not one per request width: a checkpoint holds only the committed state.
+    # See `SubPoolSpec.extra_entries`.
+    state_checkpoint_slots: int = 0
+    # Whether a refused hit may place a rung of its own. Off leaves the
+    # prompt-end anchor as the only placement: on the cc-traces a demand is
+    # 47% of all checkpoint writes but reads back 2.8% of the time against the
+    # anchor's 85.2%, so the rung's worth is an open question that only differs
+    # from demoting it (see `StateSlotPool.mark_speculative`) on hardware.
+    # See `BlockManager._record_checkpoint_demand`.
+    state_checkpoint_demand: bool = True
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
     max_model_len: int | None = None

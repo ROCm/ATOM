@@ -1,0 +1,196 @@
+# SPDX-License-Identifier: MIT
+# The joint load: a hybrid may reuse a prefix the HBM cache no longer holds,
+# with the paged KV coming from LMCache and the state checkpoint from the
+# offload tier. Both legs are aimed at ONE boundary, and everything here is
+# about that boundary being the same number on both sides -- a state boundary
+# above the KV-loaded length is silent wrong output, not an error.
+
+import sys
+from pathlib import Path
+
+import pytest
+from conftest import MockConfig
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from atom.model_engine.block_manager import BlockManager  # noqa: E402
+from atom.model_engine.sequence import Sequence  # noqa: E402
+from atom.model_engine.state_runtime import (  # noqa: E402
+    StateRuntime,
+    StateTransfer,
+)
+
+BLOCK = 4
+# The LMCache chunk. A multiple of the hash block, which is what lets one
+# boundary satisfy both granularities at all.
+CHUNK = 8
+MIN_FORK = 8
+RUNTIME = StateRuntime(transfer=StateTransfer.fork(MIN_FORK))
+
+
+def joint_config(**overrides):
+    defaults = {
+        "kv_cache_block_size": BLOCK,
+        "num_kvcache_blocks": 200,
+        "enable_prefix_caching": True,
+        "max_num_seqs": 4,
+        "max_num_batched_tokens": 256,
+        "max_model_len": 256,
+        "bos_token_id": 1,
+        "eos_token_id": 2,
+        "stop_token_ids": [],
+        "scheduler_delay_factor": 0.0,
+        "speculative_config": None,
+        "pool_entries": {"state": 8},
+        "state_checkpoint_interval_tokens": BLOCK,
+        "kv_transfer_config": {
+            "kv_connector": "lmcache_offload",
+            "kv_role": "offload",
+        },
+    }
+    defaults.update(overrides)
+    return MockConfig(**defaults)
+
+
+@pytest.fixture
+def tier_on(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_STATE", "1")
+    monkeypatch.setenv("OFFLOAD_STATE_STAGING_GROUPS", "2")
+    monkeypatch.setenv("OFFLOAD_STATE_JOINT_KV", "1")
+
+
+def make_bm():
+    """A BlockManager with the tier on and the KV leg's chunk pinned to CHUNK.
+
+    Production reads that chunk out of the LMCache config in `__init__`;
+    `LMCacheEngineConfig.from_env()` caches per process, so setting the env from
+    a fixture is already too late and would make these tests depend on which
+    file pytest imported first. Pinned here instead -- the gate under test is
+    what the number feeds, not where it came from.
+    """
+    bm = BlockManager(joint_config(), state_runtime=RUNTIME)
+    bm._joint_chunk_tokens = CHUNK
+    return bm
+
+
+def hybrid_seq(num_tokens=32):
+    return Sequence(list(range(num_tokens)), BLOCK, has_per_req_cache=True)
+
+
+def chain_hash(bm: BlockManager, seq: Sequence, blocks: int) -> int:
+    """The chained content hash of block `blocks - 1`."""
+    h = -1
+    for i in range(blocks):
+        h = bm.compute_hash(bm._hash_block_tokens(seq, i), h)
+    return h
+
+
+def spilled_checkpoint(bm: BlockManager, h: int) -> None:
+    """Put `h` in the tier and nowhere else, the state's half of the setup."""
+    slot = bm.state_offload.request_spill(h, 0)
+    assert slot >= 0
+    bm.state_offload.confirm_spill(h)
+    assert h in bm.state_offload.hashes
+
+
+def admit(bm: BlockManager, seq: Sequence, *, lmc_tokens: int) -> int:
+    """One admission with LMCache reporting `lmc_tokens` of KV."""
+    seq.offload_kv_prefix_tokens = lmc_tokens
+    seq.offload_kv_chunk_tokens = CHUNK
+    return bm.can_allocate(seq)
+
+
+def test_a_boundary_only_lmcache_can_reach_becomes_a_joint_load(tier_on):
+    """Neither leg is in HBM: the KV is in LMCache and the checkpoint is in the
+    tier, which is the ordinary shape of an evicted prefix -- `unindex` spills
+    the state of a checkpoint whose blocks left HBM."""
+    bm = make_bm()
+    seq = hybrid_seq()
+    h = chain_hash(bm, seq, 4)  # tokens [0, 16)
+    spilled_checkpoint(bm, h)
+
+    hit = admit(bm, seq, lmc_tokens=16)
+
+    assert hit == 0, "nothing is in the HBM prefix cache"
+    assert seq.state_joint_boundary_tokens == 16
+    assert seq.state_joint_boundary_hash == h
+
+    bm.allocate(seq, hit)
+
+    assert seq.state_load_hash == h, "the state leg is a tier load"
+    assert seq.num_cached_tokens == 0, (
+        "the boundary is not claimed until the KV leg lands too; a forward over "
+        "a claimed-but-unfilled prefix is the silent failure this exists to "
+        "avoid"
+    )
+
+
+def test_the_flag_off_leaves_the_old_hbm_only_boundary(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_STATE", "1")
+    monkeypatch.setenv("OFFLOAD_STATE_STAGING_GROUPS", "2")
+    monkeypatch.delenv("OFFLOAD_STATE_JOINT_KV", raising=False)
+    bm = BlockManager(joint_config(), state_runtime=RUNTIME)  # flag off: real ctor
+    seq = hybrid_seq()
+    spilled_checkpoint(bm, chain_hash(bm, seq, 4))
+
+    hit = admit(bm, seq, lmc_tokens=16)
+
+    assert hit == 0
+    assert seq.state_joint_boundary_tokens == 0
+    bm.allocate(seq, hit)
+    assert seq.state_load_hash == -1
+
+
+def test_a_boundary_off_the_chunk_grid_still_pairs(tier_on):
+    """A rung at 12 tokens with CHUNK=8 is not on the KV leg's grid. Declining
+    it would throw away the reuse this feature exists for, so the KV leg is
+    aimed at the chunk that covers it (16) while the claim stays 12."""
+    bm = make_bm()
+    seq = hybrid_seq()
+    off_grid = chain_hash(bm, seq, 3)  # tokens [0, 12)
+    spilled_checkpoint(bm, off_grid)
+
+    hit = admit(bm, seq, lmc_tokens=16)
+
+    assert hit == 0
+    assert seq.state_joint_boundary_tokens == 12
+    assert seq.state_joint_kv_tokens == 16
+
+
+def test_a_covering_chunk_lmcache_does_not_hold_is_declined(tier_on):
+    """Same rung, but LMCache stops at 12: the chunk covering the boundary is
+    not there, so the pair cannot form. `P <= L` is the invariant, and it is the
+    *covering* chunk that decides whether it holds."""
+    bm = make_bm()
+    seq = hybrid_seq()
+    spilled_checkpoint(bm, chain_hash(bm, seq, 3))  # tokens [0, 12)
+
+    hit = admit(bm, seq, lmc_tokens=12)
+
+    assert hit == 0
+    assert seq.state_joint_boundary_tokens == 0
+
+
+def test_a_boundary_the_tier_cannot_serve_is_declined(tier_on):
+    """LMCache has the KV but nobody has the state, so the pair cannot form."""
+    bm = make_bm()
+    seq = hybrid_seq()
+
+    hit = admit(bm, seq, lmc_tokens=16)
+
+    assert hit == 0
+    assert seq.state_joint_boundary_tokens == 0
+
+
+def test_the_boundary_never_exceeds_what_lmcache_holds(tier_on):
+    """`P <= L`, checked where the boundary is chosen: the tier holding a
+    further checkpoint does not make its KV reachable."""
+    bm = make_bm()
+    seq = hybrid_seq()
+    spilled_checkpoint(bm, chain_hash(bm, seq, 6))  # tokens [0, 24)
+    spilled_checkpoint(bm, chain_hash(bm, seq, 4))  # tokens [0, 16)
+
+    hit = admit(bm, seq, lmc_tokens=16)
+
+    assert hit == 0
+    assert seq.state_joint_boundary_tokens == 16

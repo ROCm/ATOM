@@ -94,6 +94,18 @@ class LMCacheOffloadConnector(KVConnectorBase):
         self._engine = None
         self._codec: ATOMKVByteCodec | None = None
         self._lookup_server = None
+        # Built in `register_kv_caches` when the state tier is enabled and the
+        # backend owns per-request state. Always defined, because
+        # `AttentionBackend._submit_state_spills` probes for it on every batch
+        # and an AttributeError there would be a forward-path crash.
+        self._state_tier = None
+        from atom.kv_transfer.offload.state_tier import _JointPark
+
+        # Requests whose KV leg and state leg must both land before the engine
+        # is told anything. Inert until something arms it, so it costs a
+        # dictionary lookup per report while `OFFLOAD_STATE_JOINT_KV` is off --
+        # the engine only ever issues both legs for one request with it on.
+        self._joint_park = _JointPark()
 
     # -- lifecycle --------------------------------------------------------
     def register_kv_caches(
@@ -143,6 +155,8 @@ class LMCacheOffloadConnector(KVConnectorBase):
         self._engine.post_init()
         self._validate_and_log_storage_backends(cfg)
 
+        self._maybe_build_state_tier(gpu_connector, transfer_tensors, meta, rank, world)
+
         # ZMQ lookup server so the scheduler process can query our hit counts.
         try:
             from lmcache.v1.lookup_client.factory import LookupClientFactory
@@ -168,6 +182,146 @@ class LMCacheOffloadConnector(KVConnectorBase):
             self._do_save,
             self._do_load,
         )
+
+    def _maybe_build_state_tier(
+        self, gpu_connector, transfer_tensors, meta, rank: int, world: int
+    ) -> None:
+        """Stand up the worker half of the state offload tier, if it is on.
+
+        Gated on `state_offload_staging_groups()`, the same function the arena
+        and the pool size themselves from, so the runner and the engine cannot
+        disagree about whether the tier exists. A second `os.environ` read here
+        would let the engine queue spills into a ring the runner never drains.
+
+        Three things this needs and where each comes from:
+        * the backend, for `state_entry_views` -- carried on
+          `transfer_tensors.state_backend`, set by the model runner, the only
+          scope holding both the builder and this connector;
+        * a `StagedTransfer` -- the KV GPU connector already owns one sized to
+          the bounded staging buffer, and reusing it is what keeps the state
+          path on the same HBM bound as KV. Note it does not share the *buffer*:
+          `StagedTransfer` keeps those in `threading.local`, and the tier packs
+          on its own `lmc-state` worker, so the tier adds one more resident
+          staging buffer of `gpu_staging_buffer_bytes` per rank. What reuse
+          buys is a single place that bound is configured, which is what makes
+          the `entry_bytes > staging_bytes` refusal below meaningful;
+        * the per-entry byte count -- measured off the backend's own views
+          rather than read from the sizing plan, because the pack allocates
+          exactly what the views sum to and a plan figure that rounded
+          differently would fail inside `memory_tensor` on the first spill.
+        """
+        from atom.model_engine.state_offload import state_offload_staging_groups
+
+        if state_offload_staging_groups() <= 0:
+            return
+        # Pipeline parallelism breaks the tier in two independent ways, so it is
+        # refused outright rather than half-supported.
+        #
+        # First the key. `StateByteCodec.key` builds a `CacheEngineKey` from
+        # (model, world_size, worker_id, hash), and `worker_id` here is
+        # `tp.rank_in_group` -- there is no PP component anywhere in it. Every PP
+        # stage holds a *different* slice of the layers, so stage 0 and stage 1
+        # at the same TP rank would write different bytes under an identical key
+        # and silently overwrite each other. A later load would then restore one
+        # stage's state into another's layers: wrong output, no error.
+        #
+        # Adding a PP component to the key would fix that half and still leave
+        # the second. `pp_engine_core.py` has every stage call `forward` on the
+        # head-pickled batch, so `_submit_state_spills` fires on all of them,
+        # but only the head runs `_poll_kv_transfer_progress`. The non-head
+        # stages' `state_staging_released` reports are never drained, so the
+        # ring never gets those slots back and the tier quietly stops spilling
+        # after `staging_depth` evictions. Wiring that up is a scheduler change,
+        # not a key change, so PP + OFFLOAD_STATE is out of scope for now.
+        #
+        # Paged-KV offload is unaffected: this returns before the tier is built
+        # and touches nothing else.
+        pp_size = int(getattr(self._config, "pipeline_parallel_size", 1) or 1)
+        if pp_size > 1:
+            logger.warning(
+                "state offload: OFFLOAD_STATE is not supported with pipeline "
+                "parallelism (pipeline_parallel_size=%d); the state tier stays "
+                "off and nothing spills. Paged-KV offload is unaffected.",
+                pp_size,
+            )
+            return
+        backend = getattr(transfer_tensors, "state_backend", None)
+        if backend is None:
+            logger.warning(
+                "state offload: OFFLOAD_STATE is set but no attention backend "
+                "was published; the tier stays off and nothing spills."
+            )
+            return
+        try:
+            views = backend.state_entry_views(0)
+            entry_bytes = sum(int(v.numel()) * v.element_size() for v in views)
+        except (NotImplementedError, AttributeError):
+            # `NotImplementedError` is the base class's own refusal;
+            # `AttributeError` is a builder that predates the method. Both mean
+            # the same thing to us -- this backend has no per-request state we
+            # can name bytes for -- and neither is worth killing model load
+            # over, so both warn and disable rather than propagate.
+            # `IndexError` is deliberately NOT caught: it means group 0 does not
+            # exist, i.e. a zero-entry state pool with the tier switched on,
+            # which is a sizing bug that must be loud rather than degrade into a
+            # server that silently never spills.
+            logger.warning(
+                "state offload: %s owns no per-request state views; the tier "
+                "stays off and nothing spills.",
+                type(backend).__name__,
+            )
+            return
+        # One entry is MB-scale (53.6 MiB measured) while the shared staging
+        # buffer is sized for KV chunks, so the two can easily fail to fit.
+        # `StagedTransfer.pack` would then raise inside `ensure_buffer`, and
+        # `StateOffloadTier._do_spill`'s broad `except` would turn every single
+        # spill into a warning plus a slot release -- a tier that looks healthy,
+        # burns a D2D copy per eviction, and stores nothing, forever. Refuse to
+        # build it instead, and name both numbers so the fix is obvious.
+        from atom.kv_transfer.offload.staged_transfer import StagedTransfer
+
+        staging_bytes = int(getattr(gpu_connector, "gpu_staging_buffer_bytes", 0))
+        staged = gpu_connector._staged
+        if entry_bytes > staging_bytes:
+            # A state entry is one *entry*; the KV buffer is sized in LMCache
+            # chunks, and at the shipped default of 2 chunks it is ~8 MiB
+            # against a 55 MiB entry. This used to refuse the tier, which is
+            # the worst of the three options: the engine-side index still
+            # exists, so it keeps handing out staging slots and counting spills
+            # that never happen, and the only symptom is this line in a
+            # 100k-line log. Growing the shared buffer is the other, and it
+            # charges every KV worker thread for a size only the state thread
+            # needs. So the tier gets its own, of exactly one entry, on the
+            # `lmc-state` thread that packs into it.
+            logger.info(
+                "state offload: one state entry is %.2f MiB but the KV staging "
+                "buffer holds %.2f MiB, so the tier takes its own buffer of one "
+                "entry (one per rank). Set OFFLOAD_GPU_STAGING_CHUNKS >= %d to "
+                "have both share the KV buffer instead.",
+                entry_bytes / (1 << 20),
+                staging_bytes / (1 << 20),
+                -(-entry_bytes // max(1, gpu_connector.gpu_staging_chunk_bytes)),
+            )
+            staged = StagedTransfer(
+                gpu_connector.device,
+                staging_buffer_bytes=entry_bytes,
+                release_after_transfer=gpu_connector.release_gpu_staging_after_transfer,
+            )
+        from atom.kv_transfer.offload.state_object import StateByteCodec
+        from atom.kv_transfer.offload.state_tier import StateOffloadTier
+
+        codec = StateByteCodec(
+            backend,
+            staged,
+            entry_bytes,
+            model_name=meta.model_name,
+            world_size=world,
+            worker_id=rank,
+        )
+        codec.bind_storage_manager(self._engine.storage_manager)
+        # No index: `StateOffloadIndex` lives in the engine process. Both
+        # directions report and the engine applies.
+        self._state_tier = StateOffloadTier(codec)
 
     def _validate_block_geometry(self, transfer_tensors) -> None:
         """Cross-check codec blocks against existing transfer-region metadata."""
@@ -222,6 +376,8 @@ class LMCacheOffloadConnector(KVConnectorBase):
     def start_load_kv(self, metadata) -> None:
         if not isinstance(metadata, LMCacheOffloadMetadata):
             return
+        self._arm_joint_loads(metadata)
+        self._start_state_loads(metadata)
         loading_lookup_ids = {
             str(req.req_id)
             for req in metadata.requests
@@ -250,6 +406,65 @@ class LMCacheOffloadConnector(KVConnectorBase):
                     req,
                     save_ready_event,
                 )
+
+    def _arm_joint_loads(self, metadata) -> None:
+        """Hold a request that has both legs until both of them report.
+
+        The two legs come back through one channel -- `get_finished` unions the
+        tier's report into the KV one -- so an id in both collapses to a single
+        wake, and the engine would resume the suffix prefill while the other
+        transfer is still writing. Whichever leg is slower decides which half of
+        the prefix is garbage, and neither raises.
+
+        Armed per step from the metadata that carries both lists, which is all
+        the pairing there is to do: a request is parked while either leg is in
+        flight, so a second pair cannot be issued before this one resolves.
+        Same `req_id` values on both sides (`seq.id`, not stringified) -- that
+        is exactly why they collide in the union, and it has to hold here too.
+        """
+        loads = getattr(metadata, "state_loads", None) or ()
+        state_ids = {req_id for req_id, _h, _slot in loads}
+        if not state_ids or not self._do_load:
+            return
+        for req in metadata.requests:
+            if req.load_spec is not None and req.req_id in state_ids:
+                self._joint_park.arm(req.req_id, needs_kv=True, needs_state=True)
+
+    def _start_state_loads(self, metadata) -> None:
+        """Hand this step's state-tier loads to the tier's own executor.
+
+        No producer fence, unlike the save path: a load *writes* the state
+        entry and nothing on the compute stream is reading it yet. The group
+        belongs to a request that is parked precisely so no forward touches it,
+        and `StagedTransfer.unpack` synchronizes the stream that produced the
+        bytes before it returns, so by the time the report reaches the engine
+        the entry is readable from any stream.
+
+        With no tier the loads are reported failed rather than dropped. The
+        tier can legitimately refuse to build (wrong connector, pipeline
+        parallelism, a backend with no state views, an entry larger than the
+        staging buffer) while the engine's index exists and keeps offering
+        loads; each of those requests is already parked, and only a report
+        unparks it.
+        """
+        loads = getattr(metadata, "state_loads", None)
+        if not loads:
+            return
+        if self._state_tier is None:
+            logger.warning(
+                "state offload: %d load(s) arrived but this worker built no "
+                "state tier; failing them so their requests recompute instead "
+                "of waiting forever.",
+                len(loads),
+            )
+            self._fail_state_loads(loads)
+            return
+        for req_id, h, group in loads:
+            self._state_tier.submit_load(req_id, int(h), int(group))
+
+    def _fail_state_loads(self, loads) -> None:
+        with self._lock:
+            self._failed_load.update(req_id for req_id, _h, _group in loads)
 
     def _guard(self, kind: str, fn, req, *args) -> None:
         try:
@@ -466,12 +681,68 @@ class LMCacheOffloadConnector(KVConnectorBase):
             self._done_save.clear()
             self._done_load.clear()
             self._failed_load.clear()
+        # The state tier's spill reports: not request-keyed, because the
+        # request that owned a spilled checkpoint is gone by the time its bytes
+        # land. Its *load* reports are, so they merge into the two channels a
+        # KV load already uses -- which is what gives the state leg the
+        # aggregator's per-request quorum for free. Downstream does not
+        # distinguish the two legs and does not need to: the engine's
+        # `settle_state_load` is a no-op for an id its state index never issued,
+        # and a request that has both legs is held by `_joint_park` until both
+        # have reported, so what leaves here is one event either way.
+        if self._state_tier is not None:
+            indexed, released, index_failed = self._state_tier.take_spill_reports()
+            state_done, state_failed = self._state_tier.get_finished()
+            dl, fl = self._settle_joint(dl, fl, state_done, state_failed)
+        else:
+            indexed, released, index_failed = set(), set(), set()
         return KVConnectorOutput(
             finished_sending=set(),
             finished_loading=dl,
             failed_loading=fl,
             finished_saving=ds,
+            state_indexed=indexed,
+            state_staging_released=released,
+            state_index_failed=index_failed,
         )
+
+    def _settle_joint(
+        self,
+        kv_done: set,
+        kv_failed: set,
+        state_done: set,
+        state_failed: set,
+    ) -> tuple[set, set]:
+        """Merge the two report channels, holding back armed pairs.
+
+        Everything not armed passes through exactly as it did before the joint
+        load existed, which is the case that has to stay free: `waits_for` is
+        asked first because `_JointPark._settle` ignores ids it never armed, and
+        an ignored settle is indistinguishable from a leg that landed.
+
+        Either leg failing fails the pair. Half a load leaves the state claiming
+        a prefix whose KV never arrived, and `failed_loading` already means
+        "wake for recompute over the blocks you hold", which is what that wants.
+        """
+        park = self._joint_park
+        legs = (
+            (park.settle_kv, kv_done, True),
+            (park.settle_kv, kv_failed, False),
+            (park.settle_state, state_done, True),
+            (park.settle_state, state_failed, False),
+        )
+        passthrough_done: set = set()
+        passthrough_failed: set = set()
+        for settle, reports, ok in legs:
+            for req_id in reports:
+                if park.waits_for(req_id):
+                    settle(req_id, ok)
+                elif ok:
+                    passthrough_done.add(req_id)
+                else:
+                    passthrough_failed.add(req_id)
+        ready, ready_failed = park.take_ready()
+        return passthrough_done | ready, passthrough_failed | ready_failed
 
     def get_finished_recv_blocks(self) -> list[int]:
         # Local CUDA copies are ordered by the copy stream + synchronize() before
@@ -524,6 +795,19 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         self.total_load_failures = 0
         self.total_save_requests = 0
         self.total_saved_tokens = 0
+        # Whether to store paged KV for a sequence that owns per-request state.
+        # Default off: `_decide_load_after_alloc` refuses the load leg for those
+        # sequences unconditionally, so the bytes have no reader inside this
+        # engine. Set `OFFLOAD_SAVE_PER_REQ_CACHE=1` to restore the old
+        # behaviour, which is only useful when a separate stateless consumer
+        # shares this LMCache instance.
+        self._save_per_req_cache = os.environ.get(
+            "OFFLOAD_SAVE_PER_REQ_CACHE", "0"
+        ).strip().lower() not in ("", "0", "false", "no", "off")
+        # State offload tier loads admitted this pass, drained by
+        # `build_connector_meta`. Not keyed by req_id: two requests may resume
+        # off the same hash in one pass, each into its own slot.
+        self._pending_state_loads: list[tuple] = []
         # Unaligned handoff is always on: when the HBM prefix-cache hit is not
         # chunk-aligned, recompute the misaligned head up to the next chunk
         # boundary, then load the aligned remainder from CPU. (Previously gated
@@ -552,6 +836,41 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
             logger.warning(
                 "LMCache offload scheduler: lookup client unavailable: %s", e
             )
+
+        self._warn_if_per_req_cache_model(config)
+
+    def _warn_if_per_req_cache_model(self, config) -> None:
+        """Say once, at startup, that this model will decline every KV load.
+
+        `_decide_load_after_alloc` refuses loads for a per-request-cache
+        sequence, which for a hybrid model is every sequence. Without this the
+        operator sees a permanent 0% load rate and reads it as a broken cache
+        rather than a deliberate restriction. Once per server -- the refusal
+        itself is logged per request at DEBUG, and a warning at that position
+        would print on every prefill.
+
+        The model-type set is imported rather than restated so the two cannot
+        drift; the per-sequence check stays on `seq.has_per_req_cache`.
+        """
+        model_type = getattr(getattr(config, "hf_config", None), "model_type", None)
+        if model_type is None:
+            return
+        from atom.model_engine.llm_engine import InputOutputProcessor
+
+        if model_type not in InputOutputProcessor._per_req_cache_model_types():
+            return
+        logger.warning(
+            "LMCache offload: model_type=%s keeps a per-request recurrent "
+            "state (linear/compressor layers) alongside its paged KV. The "
+            "state cannot be restored from a paged-KV load, so loading KV "
+            "past the state boundary would run the linear layers over history "
+            "their state never saw. Every KV LOAD is therefore declined for "
+            "this model and a 0%% load rate is expected; KV SAVES still run "
+            "normally and populate the tier. Set OFFLOAD_STATE to enable the "
+            "state offload tier, which restores both together and lifts the "
+            "restriction.",
+            model_type,
+        )
 
     # -- match: how many extra tokens can come from CPU/NVMe -------------
     def get_num_new_matched_tokens(self, seq) -> tuple[int, bool]:
@@ -633,6 +952,14 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         # hbm_satisfies_after_alloc case where HBM prefix cache already covers
         # the lookup hit. Only suffix chunks computed by this request should be
         # stored.
+        if not self._save_per_req_cache and getattr(seq, "has_per_req_cache", False):
+            # Do not track this sequence for saving at all. Its load leg is
+            # refused unconditionally by `_decide_load_after_alloc`, so the
+            # bytes would have no reader in this engine -- and, more sharply, a
+            # tracked entry that is never emitted keeps `_has_pending_save`
+            # true forever, which makes `should_defer_free` hold this
+            # request's blocks for good.
+            return
         initial_saved = max(
             self._lmcache_hit_save_floor(ls),
             int(self._hit_save_floors.get(sid, 0)),
@@ -686,6 +1013,61 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         ls.hbm_cached_tokens = hbm
         chunk = int(self.chunk_size or 256)
         need = lmc - hbm
+        # A hybrid model (GDN/KDA recurrent state, V4 compressor ring) carries
+        # a per-request state that is the compressed history of exactly
+        # `[0, hbm)` -- `BlockManager.allocate` shrank the HBM hit to a
+        # boundary a state checkpoint covers, so right now the state boundary
+        # and the KV-loaded length agree. Raising the KV-loaded length to `lmc`
+        # breaks that: the scheduler would forward only `[lmc, num_prompt)`,
+        # the linear layers would never see `[hbm, lmc)`, and at hbm == 0 the
+        # freshly recycled state group makes `has_initial_state` True over
+        # another request's leftovers. Silent wrong output, no exception.
+        #
+        # Refusing costs the hybrid nothing it could have had: ATOM runs one
+        # forward over the whole batch, so the linear layers must walk
+        # `[hbm, lmc)` token by token regardless of whether the full-attention
+        # layers' KV is present. The load buys no work saving, only risk.
+        # Saves are untouched -- this request's KV still populates the tier for
+        # a stateless reader.
+        #
+        # Lifting the guard takes a boundary both legs are held to, and one
+        # matcher has to pick it: the KV leg alone comes from LMCache's
+        # `lookup()` floored to `chunk_size`, the state leg alone from
+        # `BlockManager._gated_hit` -- a fixpoint over the state caches snapped
+        # to a checkpoint rung and gated by `min_fork_tokens` -- and they agree
+        # only by coincidence. So `can_allocate` picks B for both
+        # (`_joint_kv_boundary`) and this clamps L down to it. Without a B the
+        # refusal stands, which is also the whole behaviour with
+        # `OFFLOAD_STATE_JOINT_KV` off.
+        if getattr(seq, "has_per_req_cache", False):
+            joint = int(getattr(seq, "state_joint_boundary_tokens", 0) or 0)
+            if joint <= hbm:
+                return False, "per_req_cache_state_boundary", hbm, lmc, need, chunk
+            if joint > lmc:
+                # The engine aimed past what this connector's lookup found.
+                # Nothing else may run: the state leg is already aimed at B and
+                # a shorter KV load would leave it claiming history the forward
+                # never sees.
+                return False, "joint_boundary_above_lookup", hbm, lmc, need, chunk
+            if hbm % chunk != 0:
+                # The KV leg moves whole chunks, and the blocks below `hbm` are
+                # shared HBM cache blocks another request may be reading, so
+                # rounding the start down is not available. `can_allocate` is
+                # supposed to have declined the joint boundary for this; the
+                # scheduler disowns it if we still get here.
+                return False, "joint_unaligned_hbm_prefill", hbm, lmc, need, chunk
+            # Transfer to the chunk that covers the boundary, claim only the
+            # boundary (`_claim_after_load`). The engine picked both numbers.
+            kv_target = int(getattr(seq, "state_joint_kv_tokens", 0) or 0) or joint
+            if kv_target > lmc:
+                return False, "joint_boundary_above_lookup", hbm, lmc, need, chunk
+            lmc = kv_target
+            ls.lmcache_cached_tokens = lmc
+            need = lmc - hbm
+            # Deliberately past the `min_load` floor below: the boundary was
+            # chosen for both legs together, and refusing this one on size would
+            # leave the state leg claiming a prefix whose KV never came.
+            return True, "joint_state_and_kv", hbm, lmc, need, chunk
         if lmc <= hbm:
             return False, "hbm_satisfies_after_alloc", hbm, lmc, need, chunk
         if hbm % chunk != 0:
@@ -694,6 +1076,21 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         if need < min_load:
             return False, "too_small", hbm, lmc, need, chunk
         return True, "aligned_large_hit", hbm, lmc, need, chunk
+
+    def _claim_after_load(self, seq, hbm: int, lmc: int) -> int:
+        """How far the request may call itself cached once the load lands.
+
+        Normally the whole loaded prefix. For a joint load it is the *state*
+        boundary, which sits at or below the transfer's end: the KV leg is aimed
+        at the LMCache chunk covering that boundary, and claiming the rounded-up
+        figure would have the forward skip tokens the recurrent state does not
+        cover -- wrong output, and silent, since nothing downstream re-derives
+        the state's reach.
+        """
+        joint = int(getattr(seq, "state_joint_boundary_tokens", 0) or 0)
+        if joint:
+            return max(hbm, min(joint, lmc))
+        return max(hbm, lmc)
 
     def _maybe_start_unaligned_handoff(
         self,
@@ -767,7 +1164,7 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         ls.can_load = True
         self._reqs_need_recv[sid] = seq
         self._handoff_loads.discard(sid)
-        seq.offload_loaded_tokens = max(hbm, lmc)
+        seq.offload_loaded_tokens = self._claim_after_load(seq, hbm, lmc)
         logger.debug(
             "[OFFLOAD-LOAD-HANDOFF-READY] seq=%s hbm_cached=%d "
             "lmc_cached=%d offload_loaded=%d need=%d",
@@ -819,11 +1216,35 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
             self._mark_load_skip(seq, reason, hbm, lmc, need, chunk)
             self._clear_pending_load(sid)
             return False
-        seq.offload_loaded_tokens = max(hbm, lmc)
+        seq.offload_loaded_tokens = self._claim_after_load(seq, hbm, lmc)
+        return True
+
+    def enqueue_state_loads(self, loads) -> bool:
+        """Take this pass's state-tier loads, for the next `build_connector_meta`.
+
+        Returns whether they were taken. Always True here; the answer exists
+        for `MultiConnectorScheduler`, which can be asked when no sub-connector
+        carries state loads at all. The caller must fail a refusal rather than
+        drop it -- every one of these requests is parked on a report.
+
+        `(req_id, state_hash, target_group)`, already decided by the engine:
+        `BlockManager._attach_state_group` chose the group and
+        `StateOffloadIndex.request_load` vouched for the hash. Nothing is
+        re-decided here -- unlike the KV leg, whose `LoadSpec` is re-checked at
+        build time because `num_cached_tokens` moves under it between match and
+        allocate. A state load is decided *after* allocate, against a group
+        this request already holds, so there is nothing left to move.
+        """
+        self._pending_state_loads.extend(loads)
         return True
 
     def build_connector_meta(self) -> LMCacheOffloadMetadata:
         meta = LMCacheOffloadMetadata()
+        # Drained, not copied: every load handed over is submitted exactly once,
+        # and a second submission would write the same entry into a group the
+        # first transfer is already filling.
+        meta.state_loads = self._pending_state_loads
+        self._pending_state_loads = []
 
         # Loads
         logger.debug("[OFFLOAD-BUILD] reqs_need_recv=%d", len(self._reqs_need_recv))
@@ -857,13 +1278,13 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
             # combines it with offload_loaded_tokens after all TP workers
             # succeed to publish the restored GPU prefix.
             seq.offload_load_start_tokens = hbm
-            seq.offload_loaded_tokens = max(hbm, lmc)
+            seq.offload_loaded_tokens = self._claim_after_load(seq, hbm, lmc)
             # req_id MUST be the raw seq.id (the type the scheduler compares
             # against in _update_waiting_for_remote_kv); str(seq.id) is only for
             # LMCache's lookup/pin API. A str here silently never wakes the seq.
             logger.debug(
                 "[OFFLOAD-LOAD-EMIT] seq=%s hbm_cached=%d lmc_cached=%d "
-                "offload_loaded=%d need=%d min_load=%d nblocks=%d reason=aligned_large_hit",
+                "offload_loaded=%d need=%d min_load=%d nblocks=%d reason=%s",
                 seq.id,
                 hbm,
                 lmc,
@@ -871,6 +1292,7 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
                 need,
                 int(getattr(self, "_min_load_tokens", 8192)),
                 len(list(seq.block_table)),
+                reason,
             )
             loading_sids.add(sid)
             self._load_save_floors[sid] = self._chunk_floor(hbm)

@@ -310,6 +310,16 @@ class PagedStateCheckpointCoordinator:
 
     successor_room = 0.0
 
+    #: A page-unit image is written by a copy kernel that runs *between*
+    #: forwards, off the ops the batch drains, so there is no interior moment of
+    #: a forward for it to read. That is a property of this transport and not of
+    #: the backend using it: a backend whose kernel does expose interior states
+    #: still cannot have them copied out here, because the copy is not part of
+    #: the forward at all. False is therefore fixed, not a default — the
+    #: scheduler keeps cutting prefill chunks onto rungs, which is what the
+    #: store can actually service.
+    readable_midstep = False
+
     def __init__(
         self,
         pool: BlockPool,
@@ -343,12 +353,31 @@ class PagedStateCheckpointCoordinator:
 
     def checkpoint(self, seq: Sequence, boundary_blocks: int, h: int) -> None:
         del boundary_blocks
-        if self.applies(seq) and seq.per_req_cache_group >= 0:
+        if self.applies(seq) and seq.state_slot >= 0:
             self._pending[id(seq)] = (seq, h)
+
+    # The midstep half of the protocol, answered by declining. `readable_midstep`
+    # is False for this transport, so the contract is that these are reachable
+    # and empty rather than absent — the call sites branch on the flag, and a
+    # class that raised here would make the flag two facts that could disagree.
+
+    def reserve_midstep(
+        self, seq: Sequence, positions: list[tuple[int, int]]
+    ) -> list[tuple]:
+        del seq, positions
+        return []
+
+    def publish_midstep(
+        self, reservations: list[tuple], seq: Sequence | None = None
+    ) -> None:
+        del reservations, seq
+
+    def cancel_midstep(self, reservations: list[tuple]) -> None:
+        del reservations
 
     def forget_pending(self, seq: Sequence) -> None:
         self._pending.pop(id(seq), None)
-        self.store.cancel_queued_restore(seq.per_req_cache_group)
+        self.store.cancel_queued_restore(seq.state_slot)
 
     def begin_restore(self, h: int, dst_slot: int) -> bool:
         return self.store.begin_restore(h, dst_slot) is not None
@@ -358,7 +387,7 @@ class PagedStateCheckpointCoordinator:
     ) -> tuple[tuple[CheckpointStoreOp, ...], tuple[CheckpointRestoreOp, ...]]:
         pending, self._pending = self._pending, {}
         for seq, h in pending.values():
-            src_slot = seq.per_req_cache_group
+            src_slot = seq.state_slot
             if src_slot < 0 or self.store.contains_or_pending(h):
                 continue
             op = self.store.begin_store(h, src_slot)

@@ -144,8 +144,81 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         return {}
 
     def state_transfer(self) -> StateTransfer:
-        """Declare this backend's per-request state checkpoint capability."""
+        """How this backend hands one request's state to another slot.
+
+        A checkpoint is a second copy of the state as of some boundary, so every
+        backend with per-request state has to say how one gets there. There are
+        three answers and the state pool runs whichever it is told:
+
+        `StateTransfer.fork(n)` — the state rolls and is not one range to
+        duplicate, so the old slot goes to the index and the request takes a
+        fresh one, reading the old and writing the new for exactly one forward.
+        That forward has to leave the new slot self-contained (a single read
+        index cannot span both), which takes `n` *committed* tokens.
+        `BlockManager` walks a checkpoint/hit point back to the previous block
+        boundary until it fits.
+
+        `StateTransfer.copy(layout_id)` — one request's state is a contiguous
+        byte range, so the index gets a duplicate and the owner is left alone.
+        No forward is bound and no boundary is disqualified for lack of room,
+        which is what makes a decode boundary checkpointable at all: a decode
+        step commits `1 + accepted_drafts` tokens and acceptance is not knowable
+        when the checkpoint has to be decided. The backend must declare a
+        matching `PagedStateCheckpointSpec` and implement
+        `execute_paged_state_copies`.
+
+        `StateTransfer.none()` (default) — no per-request state, or none that can
+        be handed over; the checkpoint index stays empty and prefix hits shrink
+        to 0 for its models.
+
+        `fork` and `copy` each take a second and independent argument,
+        `readable_midstep`: can this backend snapshot a boundary *inside* a
+        forward, or only at the forward's last token? False, the default, makes
+        `BlockManager` shorten a prefill chunk onto every checkpoint position —
+        one forward per rung. True says those positions can be read out of
+        intermediates the kernel already materializes, so the chunk runs full
+        length and the backend owes `write_state_checkpoints` instead.
+        """
         return StateTransfer.none()
+
+    def state_entry_views(self, slot: int) -> list["torch.Tensor"]:
+        """Contiguous views covering the whole of `slot`'s per-request state.
+
+        The byte-level counterpart of `relocate_state_slots`: that method moves
+        a slot between two indices, this one names the same bytes so something
+        outside the pool -- the LMCache offload tier -- can read or write them.
+
+        Every returned tensor must be contiguous. The Triton staging packer
+        builds its segment table from `seg.is_contiguous()` and refuses a
+        strided view, so a class whose slot is strided (GDN, slot on axis 1)
+        returns one view per layer rather than one strided block.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} owns per-request state but does not "
+            "implement state_entry_views"
+        )
+
+    def _submit_state_spills(self, pairs) -> None:
+        """Hand the staged bytes to the offload tier's own executor.
+
+        The connector is reached function-locally, as `model_ops/attentions`
+        already reaches across packages, so these modules stay importable
+        without the offload extra.
+        """
+        from atom.utils.forward_context import get_kvconnector
+
+        connector = get_kvconnector()
+        tier = getattr(connector, "_state_tier", None)
+        if tier is None:
+            return
+        import torch
+
+        # One event for the whole batch: every copy above was issued on this
+        # stream, so an event recorded now is after all of them.
+        ready = torch.cuda.Event()
+        ready.record(torch.cuda.current_stream())
+        for _src, dst, slot, h in pairs:
+            tier.submit_spill(h, entry_index=dst, staging_slot=slot, ready_event=ready)
 
     def relocate_state_slots(self, pairs: Sequence[tuple[int, int]]) -> None:
         """Move live state between contiguous Active Slots."""
@@ -497,6 +570,25 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
     def build(self, batch: ScheduledBatch, bs: int):
         # Run state maintenance on the compute stream before the forward.
         state_ops = batch.state_maintenance_ops
+        # Spills FIRST, and the order is load-bearing, not stylistic. A spill is
+        # filed under the slot's *old* hash -- `pop()` calls `_spill()` before
+        # `invalidate()` precisely so the pre-existing bytes are what gets
+        # stored. That same `pop()` then hands the slot out as a checkpoint
+        # destination, so `_commit_pending` (`state_pool.py`) and
+        # `_attach_state_slots` (`block_manager.py`) both routinely produce a
+        # batch in which one slot is a spill SOURCE and a checkpoint
+        # DESTINATION. Issue the other copies first and the staging entry
+        # receives the new occupant's state while the tier stores it under the
+        # evicted checkpoint's hash -- bytes that are present, valid-looking,
+        # and someone else's. Nothing on the load path could ever detect that.
+        #
+        # The reverse collision cannot occur: a spill's destination is a staging
+        # entry past the pool's own range, which is never a copy source.
+        if state_ops.spills:
+            self.relocate_state_slots(
+                [(src, dst) for src, dst, _slot, _h in state_ops.spills]
+            )
+            self._submit_state_spills(state_ops.spills)
         if state_ops.relocations:
             self.relocate_state_slots(state_ops.relocations)
         if state_ops.checkpoint_stores or state_ops.checkpoint_restores:
@@ -508,6 +600,29 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             return self.prepare_prefill(batch)
         else:
             return self.prepare_decode(batch, bs)
+
+    def _submit_state_spills(self, pairs) -> None:
+        """Hand the staged bytes to the offload tier's own executor.
+
+        The connector is reached function-locally, as `model_ops/attentions`
+        already reaches across packages (`deepseek_v4_attn.py:1321`,
+        `aiter_mla.py:917`), so these modules stay importable without the
+        offload extra.
+        """
+        from atom.utils.forward_context import get_kvconnector
+
+        connector = get_kvconnector()
+        tier = getattr(connector, "_state_tier", None)
+        if tier is None:
+            return
+        import torch
+
+        # One event for the whole batch: every copy above was issued on this
+        # stream, so an event recorded now is after all of them.
+        ready = torch.cuda.Event()
+        ready.record(torch.cuda.current_stream())
+        for _src, dst, slot, h in pairs:
+            tier.submit_spill(h, entry_index=dst, staging_slot=slot, ready_event=ready)
 
 
 class AttentionImpl(nn.Module):

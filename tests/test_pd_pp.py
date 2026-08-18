@@ -158,7 +158,7 @@ def test_producer_advertises_remote_pp_size():
         spec_token_ids=None,
         block_table=[1, 2, 3],
         id=99,
-        per_req_cache_group=-1,
+        state_slots=[],
         kv_transfer_params_output=None,
     )
     mc.MooncakeConnectorScheduler.request_finished(sched, seq)

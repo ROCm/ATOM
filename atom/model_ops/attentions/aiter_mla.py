@@ -3,6 +3,7 @@
 
 import inspect
 import logging
+import os
 from dataclasses import dataclass
 
 import numpy as np
@@ -52,11 +53,43 @@ except (TypeError, ValueError):
     _MLA_META_SUPPORTS_MAX_SPLIT = False
 
 
+# The persistent MLA decode's global KV-split budget is
+# `min(cu_num, max_split_per_batch * batch_size)`, so at batch_size=1 the 16 below
+# caps the whole decode at 16 of the 256 gfx950 CUs. A batch-1 decode has no
+# parallelism other than the KV walk, and this kernel streams the entire context
+# per layer per step, so that cap is an occupancy ceiling rather than a tuning
+# choice. Measured on Kimi-K3 MXFP4 TP8 at concurrency 1 (~180k-token contexts),
+# raising it to 256 takes aiter's mla_a8w8_qh16_qseqlen4_gqaratio16_v3_ps from
+# 416.7us to 48.0us per call, ITL from 12.68ms to 9.76ms (1.30x) and end-to-end
+# replay of a fixed request set 1.19x faster. Its cost is a heavier mla_reduce
+# (7.8us -> 41.0us), which is why the win shrinks as batch_size grows and the
+# budget stops binding.
+_MLA_MAX_SPLIT_PER_BATCH = int(os.getenv("ATOM_MLA_MAX_SPLIT_PER_BATCH", "16"))
+# kv_granularity is in PAGES, so the historical max(block_size, 16) is 128 pages =
+# 16,384 tokens per split unit at block_size=128. Lowering it is a NET LOSS and is
+# exposed only as an escape hatch: on its own it bought no ITL at all, and stacked
+# on the raised split budget it added 2.5% ITL while costing 34% on TTFT, because
+# prefill already has query-dimension parallelism and extra KV splits there only
+# pay for a bigger reduce. 0 keeps the historical value; leave it at 0.
+_MLA_KV_GRANULARITY = int(os.getenv("ATOM_MLA_KV_GRANULARITY", "0"))
+
+
+def _mla_kv_granularity(block_size: int) -> int:
+    return _MLA_KV_GRANULARITY if _MLA_KV_GRANULARITY > 0 else max(block_size, 16)
+
+
 def _mla_seg_meta_kwargs() -> dict:
-    """Extra kwargs for ``get_mla_metadata_info_v1`` on the seg (page_size>1)
-    path. Empty on the original page_size=1 path so behavior is unchanged."""
-    if envs.ATOM_MLA_PAGE_SIZE > 1 and _MLA_META_SUPPORTS_MAX_SPLIT:
-        return {"max_split_per_batch": 16}
+    """Extra kwargs for ``get_mla_metadata_info_v1``.
+
+    Two callers need ``max_split_per_batch`` here. The segmented page_size>1 path
+    always did. And raising the runtime cap requires the reduce_partial_map buffer
+    to be sized for the larger cap: mla_decode_fwd sizes its fp32 ``logits`` from
+    reduce_partial_map.size(0), so a runtime cap above the sized one writes out of
+    bounds. Sizing and runtime therefore quote the same number."""
+    if not _MLA_META_SUPPORTS_MAX_SPLIT:
+        return {}
+    if envs.ATOM_MLA_PAGE_SIZE > 1 or _MLA_MAX_SPLIT_PER_BATCH != 16:
+        return {"max_split_per_batch": _MLA_MAX_SPLIT_PER_BATCH}
     return {}
 
 
@@ -549,11 +582,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         """
         var = self.model_runner.forward_vars
         split_params = {
-            "kv_granularity": max(self.block_size, 16),
+            "kv_granularity": _mla_kv_granularity(self.block_size),
             "max_seqlen_qo": 1,
             "uni_seqlen_qo": 1,
             "fast_mode": 1,
-            "max_split_per_batch": 16,
+            "max_split_per_batch": _MLA_MAX_SPLIT_PER_BATCH,
         }
         work_meta_data = var["sparse_mtp_work_meta_data"]
         work_info_set = var["sparse_mtp_work_info_set"]
@@ -598,11 +631,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         is_cp_round_robin: bool = False,
     ):
         split_params = {
-            "kv_granularity": max(self.block_size, 16),
+            "kv_granularity": _mla_kv_granularity(self.block_size),
             "max_seqlen_qo": max_q_len,
             "uni_seqlen_qo": max_q_len,
             "fast_mode": 1,
-            "max_split_per_batch": 16,
+            "max_split_per_batch": _MLA_MAX_SPLIT_PER_BATCH,
         }
         # round-robin CP only lands on the full-build path: decode_update_mla_
         # metadata_v1 has no is_cp_round_robin arg and collapses qlen>1 to 1.

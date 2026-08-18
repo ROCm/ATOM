@@ -18,17 +18,30 @@ def _run_without_test_stubs(source: str) -> None:
 
 
 def test_kimi_k3_plugin_registries_are_synchronized():
-    from atom.plugin.vllm.model_wrapper import _ATOM_MODEL_CLASSES
-    from atom.plugin.vllm.register import _VLLM_MODEL_REGISTRY_OVERRIDES
+    # Out-of-process like its neighbours, and for a sharper reason than theirs.
+    # This is the first import of torch in some pytest sessions, and several
+    # plugin tests import torch inside a `patch.dict(sys.modules, ...)` whose
+    # exit deletes the whole torch tree from `sys.modules` while torch's
+    # C-level state stays initialized. Re-importing it in-process then dies
+    # somewhere unrelated -- "_has_torch_function already has a docstring", or
+    # an aiter JIT KeyError -- naming this file for damage another one did.
+    # Running in a clean interpreter makes the check independent of what ran
+    # before it, which is the only property that makes the result mean
+    # anything.
+    _run_without_test_stubs("""
+        from atom.plugin.vllm.model_wrapper import _ATOM_MODEL_CLASSES
+        from atom.plugin.vllm.register import _VLLM_MODEL_REGISTRY_OVERRIDES
 
-    arch = "KimiK3ForConditionalGeneration"
-    assert (
-        _VLLM_MODEL_REGISTRY_OVERRIDES[arch]
-        == "atom.plugin.vllm.models.kimi_k3:KimiK3ForCausalLMVllm"
-    )
-    assert (
-        _ATOM_MODEL_CLASSES[arch] == "atom.plugin.vllm.models.kimi_k3:KimiK3ForCausalLM"
-    )
+        arch = "KimiK3ForConditionalGeneration"
+        assert (
+            _VLLM_MODEL_REGISTRY_OVERRIDES[arch]
+            == "atom.plugin.vllm.models.kimi_k3:KimiK3ForCausalLMVllm"
+        )
+        assert (
+            _ATOM_MODEL_CLASSES[arch]
+            == "atom.plugin.vllm.models.kimi_k3:KimiK3ForCausalLM"
+        )
+        """)
 
 
 def test_kimi_k3_temporal_state_uses_fp32():

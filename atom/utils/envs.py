@@ -91,6 +91,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION", "1") == "1"
     ),
+    # Set to 0 to stop a refused state-cache hit from placing a checkpoint of
+    # its own, leaving the prompt-end anchor as the only placement. Overrides
+    # --state-checkpoint-demand so the policy can be flipped without touching a
+    # launch script. On measured cc-traces a demand rung is 47% of all
+    # checkpoint writes but reads back 2.8% of the time, against 85.2% for an
+    # anchor, so its write traffic may cost more in evictions than its reuse is
+    # worth. See `BlockManager._record_checkpoint_demand`.
+    "ATOM_STATE_CHECKPOINT_DEMAND": lambda: (
+        os.getenv("ATOM_STATE_CHECKPOINT_DEMAND", "1") == "1"
+    ),
     # DSA sparse-indexer prefill: KV-dimension chunk size (in tokens) for
     # `fp8_mqa_logits`. The dense logits buffer is [prefill_tokens, total_kv];
     # total_kv = sum of all co-scheduled prefill contexts and is NOT bounded by
@@ -185,6 +195,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_GDN_DECODE_LOSSY_FAST": lambda: (
         os.getenv("ATOM_ENABLE_GDN_DECODE_LOSSY_FAST", "0").lower() == "1"
     ),
+    # --- ReplaySSM (linear-attention state) ---
+    # Cache the SSM *inputs* (k, u, g) instead of one full recurrent state per
+    # speculative token.  The state pool stops scaling with the MTP window --
+    # e.g. Kimi-K3 at mtp_k=2, 64 seqs, tp=8 drops from 10.3 GiB to ~3.5 GiB --
+    # and the full-state write moves off the per-step path (rewritten only when
+    # the record buffer fills).  Rollback becomes a cursor move.
+    # See atom/model_ops/fla_ops/replayssm.py.
+    "ATOM_ENABLE_REPLAYSSM": lambda: (
+        os.getenv("ATOM_ENABLE_REPLAYSSM", "0").lower() == "1"
+    ),
+    # Record-buffer depth L.  Must be >= 2*(mtp_k+1); raised automatically if
+    # set too low.  Larger L means fewer checkpoint write-backs but a longer
+    # rebuild each step; upstream measured 8-16 as the sweet spot.
+    "ATOM_REPLAYSSM_CACHE_LEN": lambda: int(
+        os.getenv("ATOM_REPLAYSSM_CACHE_LEN", "16")
+    ),
+    # "auto" | "serial" | "ut".  The UT-transform verify route only beats the
+    # serial one at verify windows >= ~12 tokens (measured on gfx950), so
+    # "auto" keeps practical MTP windows on the serial route.
+    "ATOM_REPLAYSSM_ROUTE": lambda: os.getenv("ATOM_REPLAYSSM_ROUTE", "auto").lower(),
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT": lambda: (
         os.getenv("ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT", "1") == "1"
     ),
