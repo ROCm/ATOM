@@ -377,6 +377,11 @@ def test_head_last_metadata_and_token_roundtrip():
         last.send_tokens(tokens)
         assert head.recv_tokens(timeout_ms=2000) == tokens
 
+        last.send_completion(batch.req_ids)
+        assert head.recv_completion(timeout_ms=2000) == (batch.req_ids, None)
+        last.send_completion(batch.req_ids, tokens)
+        assert head.recv_completion(timeout_ms=2000) == (batch.req_ids, tokens)
+
         head.close()
         last.close()
     ctx.term()
@@ -440,6 +445,29 @@ def test_cli_parses_pp_short_and_long():
         parser.parse_args(["--pipeline-parallel-size", "2"]).pipeline_parallel_size == 2
     )
     assert parser.parse_args([]).pipeline_parallel_size == 1
+
+
+def test_cli_parses_dynamic_chunking_options():
+    parser = argparse.ArgumentParser()
+    EngineArgs.add_cli_args(parser)
+    args = parser.parse_args(
+        [
+            "--enable-dynamic-chunking",
+            "--dynamic-chunking-smooth-factor",
+            "0.65",
+        ]
+    )
+    assert args.enable_dynamic_chunking is True
+    assert args.dynamic_chunking_smooth_factor == pytest.approx(0.65)
+
+
+def test_dynamic_chunking_passthrough_to_engine_kwargs():
+    kwargs = EngineArgs(
+        enable_dynamic_chunking=True,
+        dynamic_chunking_smooth_factor=0.8,
+    )._get_engine_kwargs()
+    assert kwargs["enable_dynamic_chunking"] is True
+    assert kwargs["dynamic_chunking_smooth_factor"] == pytest.approx(0.8)
 
 
 def test_from_cli_args_roundtrip():
@@ -575,6 +603,18 @@ def test_middle_chunk_output_discarded():
 def test_prefill_chunk_page_alignment(num_new, budget, block_size, expected):
     sched = Scheduler(_pp_config(kv_cache_block_size=block_size))
     assert sched._prefill_chunk_for_budget(num_new, budget, 0) == expected
+
+
+def test_dynamic_prefill_chunk_uses_prefix_length():
+    sched = Scheduler(
+        _pp_config(
+            max_num_batched_tokens=1024,
+            enable_dynamic_chunking=True,
+            dynamic_chunking_smooth_factor=1.0,
+            dynamic_chunking_coefficients=(1.0, 0.0, 0.0),
+        )
+    )
+    assert sched._prefill_chunk_for_budget(10000, 1024, 0, history_len=1024) == 384
 
 
 def test_prefill_chunk_not_aligned_when_chunked_prefill_disabled():
@@ -767,5 +807,20 @@ def test_parked_seq_prefix_is_discoverable_after_load():
     )
     assert promoted == loaded - boundary
 
+def test_dynamic_pp_prefill_registers_prefix_hashes():
+    bs = 16
+    cfg = _pp_config(
+        enable_prefix_caching=True,
+        max_num_batched_tokens=256,
+        kv_cache_block_size=bs,
+        num_kvcache_blocks=4096,
+        enable_dynamic_chunking=True,
+        dynamic_chunking_smooth_factor=1.0,
+        dynamic_chunking_coefficients=(1.0, 0.0, 0.0),
+    )
+    sched = Scheduler(cfg)
+    prompt = 4096
+    seq = _drive_pp_prefill(sched, prompt, block_size=bs)
+    assert seq.num_cached_tokens == prompt
     hit = sched.block_manager.can_allocate(_make_seq(prompt, block_size=bs))
     assert hit == prompt // bs - 1

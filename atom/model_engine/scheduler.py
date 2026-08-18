@@ -29,6 +29,7 @@ import numpy as np
 from atom.config import Config
 from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.model_engine.block_manager import BlockManager
+from atom.model_engine.dynamic_chunking import ChunkSizePredictor
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import (
     Sequence,
@@ -739,8 +740,35 @@ class Scheduler:
         self._detailed_annotation_enabled = envs.ATOM_ENABLE_DETAILED_ANNOTATION
 
         self.enable_chunked_prefill = config.enable_chunked_prefill
-        # Running seqs currently mid-prefill; counter lets schedule() skip the
-        # running-queue scan on pure-decode steps.
+        self.dynamic_chunking_smooth_factor = getattr(
+            config, "dynamic_chunking_smooth_factor", 0.75
+        )
+        dynamic_coefficients = getattr(config, "dynamic_chunking_coefficients", None)
+        self.dynamic_chunk_predictor = (
+            ChunkSizePredictor.from_coefficients(dynamic_coefficients)
+            if getattr(config, "enable_dynamic_chunking", False)
+            and dynamic_coefficients is not None
+            else None
+        )
+        if (
+            getattr(config, "enable_dynamic_chunking", False)
+            and self.dynamic_chunk_predictor is None
+        ):
+            logger.warning(
+                "Dynamic chunking was requested but no startup latency model "
+                "is available; using fixed-size chunked prefill"
+            )
+        # V4 SWA correctness on a prefix-cache hit is now handled entirely in
+        # BlockManager: `_swa_bounded_hit` bounds the hit so the boundary's
+        # trailing window is SWA-present, and `allocate` marks out-of-window
+        # blocks -1. The old `_v4_swa_warmup_blocks` (re-forward the tail to
+        # repopulate the per-request ring) was a pre-paged-ring workaround and is
+        # removed — the paged content-addressed SWA pool reuses the tail window
+        # directly. See PLAN_swa_prefix_cache_tail_gate.md.
+        # Number of running seqs currently mid-prefill (per-seq state lives in
+        # `Sequence.is_partial_prefill`). Maintained as a counter so Phase 1
+        # of `schedule()` can skip the running-queue scan entirely on
+        # pure-decode steps (the common case).
         self._partial_prefill_count: int = 0
         self._schedule_tick: int = 0
 
@@ -1193,7 +1221,10 @@ class Scheduler:
                     remaining = self.long_prefill_token_threshold
                 budget_remaining = self.max_num_batched_tokens - num_batched_tokens
                 chunk = self._chunked_prefill_size(
-                    remaining, budget_remaining, num_batched_tokens
+                    remaining,
+                    budget_remaining,
+                    num_batched_tokens,
+                    history_len=seq.num_cached_tokens,
                 )
                 if chunk:
                     chunk = self._finalize_prefill_chunk(
@@ -1269,7 +1300,10 @@ class Scheduler:
                 num_new_tokens = seq.num_prompt_tokens - seq.num_cached_tokens
                 budget_remaining = self.max_num_batched_tokens - num_batched_tokens
                 chunk = self._prefill_chunk_for_budget(
-                    num_new_tokens, budget_remaining, num_batched_tokens
+                    num_new_tokens,
+                    budget_remaining,
+                    num_batched_tokens,
+                    history_len=seq.num_cached_tokens,
                 )
                 if chunk is None:
                     self.waiting.appendleft(seq)
@@ -1336,7 +1370,10 @@ class Scheduler:
                 num_new_tokens = self.long_prefill_token_threshold
             budget_remaining = self.max_num_batched_tokens - num_batched_tokens
             chunk = self._prefill_chunk_for_budget(
-                num_new_tokens, budget_remaining, num_batched_tokens
+                num_new_tokens,
+                budget_remaining,
+                num_batched_tokens,
+                history_len=(num_cached_blocks * self.block_manager.hash_block_size),
             )
             if chunk is None or (atomic_prefill and chunk < num_new_tokens):
                 self.waiting.appendleft(seq)
@@ -1359,10 +1396,6 @@ class Scheduler:
             if needs_remote_load:
                 self._park_for_remote_load(seq, skipped_waiting_requests)
                 continue
-
-            seq.prefix_cache_hit_tokens = (
-                num_cached_blocks * self.block_manager.block_size
-            )
 
             chunk = self._adjust_prefill_chunk_after_alloc(seq, chunk)
             chunk = self._finalize_prefill_chunk(seq, seq.num_cached_tokens, chunk)
@@ -1762,7 +1795,12 @@ class Scheduler:
         self.running.append(seq)
 
     def _chunked_prefill_size(
-        self, num_new_tokens: int, budget_remaining: int, num_batched_tokens: int
+        self,
+        num_new_tokens: int,
+        budget_remaining: int,
+        num_batched_tokens: int,
+        *,
+        history_len: int = 0,
     ) -> int:
         """Tokens to forward this step, or 0 to leave the request for the next.
 
@@ -1777,19 +1815,40 @@ class Scheduler:
         Never 0 for an empty batch: something has to go out each step, or a
         `max_num_batched_tokens` below the alignment would stall forever.
         """
-        chunk = min(num_new_tokens, budget_remaining)
+        dynamic_limit = None
+        if self.dynamic_chunk_predictor is not None:
+            dynamic_limit = self.dynamic_chunk_predictor.predict(
+                history_len=history_len,
+                base_chunk_size=self.max_num_batched_tokens,
+                smooth_factor=self.dynamic_chunking_smooth_factor,
+                alignment=max(self.block_manager.block_size, 64),
+                max_chunk_size=self.max_num_batched_tokens,
+            )
+        chunk = min(
+            num_new_tokens,
+            budget_remaining,
+            dynamic_limit if dynamic_limit is not None else num_new_tokens,
+        )
         if chunk >= num_new_tokens:
             return chunk
         aligned = chunk - chunk % max(self.block_manager.block_size, 64)
         return aligned or (0 if num_batched_tokens else chunk)
 
     def _prefill_chunk_for_budget(
-        self, num_new_tokens: int, budget_remaining: int, num_batched_tokens: int
+        self,
+        num_new_tokens: int,
+        budget_remaining: int,
+        num_batched_tokens: int,
+        *,
+        history_len: int = 0,
     ) -> int | None:
         if self.enable_chunked_prefill:
             return (
                 self._chunked_prefill_size(
-                    num_new_tokens, budget_remaining, num_batched_tokens
+                    num_new_tokens,
+                    budget_remaining,
+                    num_batched_tokens,
+                    history_len=history_len,
                 )
                 or None
             )
