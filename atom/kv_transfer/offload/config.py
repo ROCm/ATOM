@@ -258,6 +258,48 @@ def build_lmcache_config(
     return cfg
 
 
+def lmcache_engine_id(config) -> str:
+    """Return the LMCache engine id for this process, namespaced by DP rank.
+
+    A scheduler's ``LookupClient`` and its workers' ``LookupServer`` derive the
+    same ZMQ ipc socket path from this id, so it must be identical inside one
+    DP replica and distinct between replicas. Every replica owns a private
+    CPU/NVMe pool; a shared id makes all replicas bind the same socket (only
+    the first wins) and every scheduler then queries replica 0's hit counts,
+    emitting loads its own workers cannot serve.
+
+    Under ``--enable-dp-attention`` this is the normal case, not a corner case:
+    ``CoreManager`` folds TP into DP, so each GPU becomes its own replica with
+    ``tensor_parallel_size == 1``.
+    """
+    dp_rank = int(
+        getattr(
+            getattr(config, "parallel_config", None),
+            "data_parallel_rank",
+            0,
+        )
+        or 0
+    )
+    return f"atom-offload-dp{dp_rank}"
+
+
+def lmcache_replica_world_size(config) -> int:
+    """Return the number of LMCache workers inside one DP replica (PP x TP).
+
+    Worker ids index this replica-local grid rather than the global one.
+    LMCache selects its lookup servers by worker id
+    (``cfg.lookup_server_worker_ids``, pinned to ``[0]`` above), so global
+    numbering would leave every replica except the first without a server.
+    Replica-local ids are also the right cache-key component: id ``i`` means
+    "shard i of the model", which holds the same bytes in every replica, so
+    replicas sharing a disk/remote backend share entries instead of
+    duplicating them.
+    """
+    pp_size = int(getattr(config, "pipeline_parallel_size", 1) or 1)
+    tp_size = int(getattr(config, "tensor_parallel_size", 1) or 1)
+    return max(1, pp_size * tp_size)
+
+
 def scale_cpu_size_for_pp(cfg, config) -> None:
     """Split the CPU offload budget across PP stages by layer count.
 
@@ -465,7 +507,9 @@ def build_lmcache_metadata(config, cfg, world_size: int, worker_id: int):
         kv_shape=kv_shape,
         use_mla=False,
         chunk_size=chunk_size,
-        # Shared id so the scheduler's ZMQ LookupClient and each worker's
-        # LookupServer derive the SAME ipc socket path (get_zmq_rpc_path_lmcache).
-        engine_id="atom-offload",
+        # Shared within a DP replica so the scheduler's ZMQ LookupClient and
+        # each worker's LookupServer derive the SAME ipc socket path
+        # (get_zmq_rpc_path_lmcache), distinct across replicas so they do not
+        # collide on it.
+        engine_id=lmcache_engine_id(config),
     )

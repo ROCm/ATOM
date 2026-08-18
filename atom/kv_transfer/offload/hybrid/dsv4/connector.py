@@ -329,7 +329,7 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             )
         self._engine, cfg, meta = build_offload_engine(
             self._config,
-            engine_id=f"atom-offload-{rank}",
+            engine_id=f"{offcfg.lmcache_engine_id(self._config)}-{rank}",
             block_size=self.virtual_block_size,
             bytes_per_block=self._codec.bytes_per_block,
             gpu_connector_factory=lambda cfg, _meta: BlockGPUConnector(
@@ -1845,14 +1845,17 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             )
             self._min_load_tokens = 8192
 
-        world = getattr(config, "tensor_parallel_size", 1)
-        if world is None:
-            world = 1
+        world = offcfg.lmcache_replica_world_size(config)
         meta = offcfg.build_lmcache_metadata(config, cfg, world, 0)
         try:
             from lmcache.v1.lookup_client.factory import LookupClientFactory
 
             self._lookup_client = LookupClientFactory.create_lookup_client(cfg, meta)
+            logger.info(
+                "LMCache offload scheduler: lookup client on %s (world=%d)",
+                meta.engine_id,
+                world,
+            )
         except Exception as e:  # noqa: BLE001  # optional third-party client
             logger.warning(
                 "LMCache offload scheduler: lookup client unavailable: %s", e

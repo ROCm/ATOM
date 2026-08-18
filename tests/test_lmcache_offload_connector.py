@@ -4377,3 +4377,51 @@ def test_cpu_budget_split_counts_the_draft_layer_on_the_last_stage(monkeypatch):
     assert sum(budgets) == pytest.approx(1024.0)
     assert horizons == pytest.approx([horizons[0]] * 4)
     assert budgets[3] < budgets[0]
+
+
+# ---------------------------------------------------------------------------
+# LMCache engine identity across DP replicas
+# ---------------------------------------------------------------------------
+
+
+def _dp_config(dp_rank: int, *, pp_size: int = 1, tp_size: int = 1, pp_rank: int = 0):
+    return SimpleNamespace(
+        pipeline_parallel_size=pp_size,
+        tensor_parallel_size=tp_size,
+        parallel_config=SimpleNamespace(
+            data_parallel_rank=dp_rank,
+            pipeline_parallel_rank=pp_rank,
+        ),
+    )
+
+
+def test_engine_id_is_distinct_per_dp_replica():
+    # --enable-dp-attention folds TP into DP, so every GPU becomes a replica
+    # owning a private CPU/NVMe pool. One shared id makes all replicas bind the
+    # same lookup socket, leaving every scheduler reading replica 0's hits.
+    ids = [offcfg.lmcache_engine_id(_dp_config(rank)) for rank in range(8)]
+    assert len(set(ids)) == 8
+
+
+def test_engine_id_pairs_scheduler_and_workers_of_one_replica():
+    # The scheduler's LookupClient and its workers' LookupServer derive the
+    # same ipc path from this id, so it must not vary with PP or TP position.
+    ids = [
+        offcfg.lmcache_engine_id(_dp_config(3, pp_size=2, tp_size=4, pp_rank=pp))
+        for pp in range(2)
+    ]
+    assert ids == ["atom-offload-dp3", "atom-offload-dp3"]
+
+
+def test_engine_id_defaults_to_replica_zero():
+    assert offcfg.lmcache_engine_id(_dp_config(0)) == "atom-offload-dp0"
+    assert offcfg.lmcache_engine_id(SimpleNamespace()) == "atom-offload-dp0"
+
+
+def test_replica_world_size_counts_pp_and_tp_but_not_dp():
+    # Worker ids index the replica-local PP x TP grid. Folding DP in would push
+    # every replica but the first past lookup_server_worker_ids=[0], leaving
+    # them with no lookup server at all.
+    assert offcfg.lmcache_replica_world_size(_dp_config(5, pp_size=4, tp_size=8)) == 32
+    assert offcfg.lmcache_replica_world_size(_dp_config(5)) == 1
+    assert offcfg.lmcache_replica_world_size(SimpleNamespace()) == 1
