@@ -1032,12 +1032,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         positions = var["positions"].copy_to_gpu(total_tokens)
 
         merged_slot = np.empty(total_tokens, dtype=np.int64)
-        prefill_slot = prefill_meta.slot_mapping
-        merged_slot[:n_p_tokens] = (
-            prefill_slot.cpu().numpy()
-            if isinstance(prefill_slot, torch.Tensor)
-            else prefill_slot
-        )
+        # Read the prefill slots from the HOST buffer prepare_prefill staged them
+        # into, not from `prefill_meta.slot_mapping` on the device: the latter
+        # needs a blocking device->host copy just to fetch data we already have
+        # (same H2D → D2H → H2D round-trip removed from the V4 builder).
+        merged_slot[:n_p_tokens] = pf_bank["slot_mapping"].np[:n_p_tokens]
         merged_slot[n_p_tokens:total_tokens] = slot_d
         # from_numpy keeps the tensor on CPU regardless of the active default-device
         # guard (torch.tensor(..., pin_memory=True) raises under a CUDA guard).

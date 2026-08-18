@@ -1261,7 +1261,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self.model_runner.forward_vars = pf_bank
         try:
             prefill_meta, prefill_positions = self.prepare_prefill(batch)
-            prefill_positions_np = pf_bank["positions"].np[:n_p_tokens].copy()
         finally:
             # Restore even on error so a failed mixed build can't leave the
             # runner pointed at the mirror bank.
@@ -1283,17 +1282,29 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         var["cu_seqlens_q"].np[: n_d_seqs + 1] = np.arange(
             0, (n_d_seqs + 1) * decode_max_q, decode_max_q, dtype=np.int32
         )
-        decode_meta, decode_positions = self.prepare_decode(decode_view, n_d_seqs)
+        # The returned decode positions tensor is unused: the merge below reads the
+        # host-side staging buffer instead (see the no-sync note there).
+        decode_meta, _decode_positions_gpu = self.prepare_decode(decode_view, n_d_seqs)
 
-        # ---- Merge full-tensor fields for the shared forward_impl ops. ----
-        # positions: [prefill | decode]
-        var["positions"].np[:n_p_tokens] = prefill_positions_np
-        var["positions"].np[n_p_tokens:total_tokens] = (
-            decode_positions.cpu().numpy()
-            if isinstance(decode_positions, torch.Tensor)
-            else decode_positions
-        )
-        positions = var["positions"].copy_to_gpu(total_tokens)
+        # ---- Merge positions ([prefill | decode]) — host-only, no sync. ----
+        # Both halves are already staged on the HOST:
+        #   prefill -> pf_bank["positions"].np[:n_p_tokens]  (prepare_prefill)
+        #   decode  -> var["positions"].np[:n_d_tokens]      (prepare_decode, which
+        #              fills the host buffer before firing its async H2D)
+        # so the merged array can be assembled without pulling anything back from
+        # the device. The old `decode_positions.cpu()` did exactly that — an H2D →
+        # D2H(blocking) → H2D round-trip whose sync stalled the host on the GPU
+        # stream (measured: ~12 ms of GPU idle between mixed steps vs 0.4 ms for a
+        # pure-prefill step).
+        #
+        # Assemble into `pf_bank` (the private mixed bank), never into `var`:
+        # prepare_decode's async H2D is still reading var["positions"], and writing
+        # it here would be the same in-flight pinned-source race that `ab55dfb6`
+        # fixed. Reading it is safe; writing pf_bank at [n_p_tokens:] is safe too
+        # (prefill's own H2D covers only [:n_p_tokens]).
+        pos_buf = pf_bank["positions"]
+        pos_buf.np[n_p_tokens:total_tokens] = var["positions"].np[:n_d_tokens]
+        positions = pos_buf.copy_to_gpu(total_tokens)
 
         merged = AttentionMetaData_DSV4(
             # Surface prefill cu_seqlens_q so the ParallelLMHead mixed-batch
