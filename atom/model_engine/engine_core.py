@@ -327,10 +327,10 @@ class EngineCore:
             logger.debug("%s: Empty scheduled batch, skipping postprocess", self.label)
             return False
 
-        seqs = seqs.values()
+        scheduled_seqs = list(seqs.values())
         # Pass stream_output_queue to postprocess for streaming callbacks
         finished_seqs = self.scheduler.postprocess(
-            seqs,
+            scheduled_seqs,
             fwd_out,
             stream_output_queue=self.stream_output_queue,
             batch=scheduled_batch,
@@ -348,7 +348,36 @@ class EngineCore:
         if finished_seqs:
             self.output_queue.put_nowait(finished_seqs)
 
+        self._dispatch_pending_draft(fwd_out, scheduled_seqs)
         return True
+
+    def _dispatch_pending_draft(self, fwd_out, scheduled_seqs) -> None:
+        """Resolve a publish-before-draft target step on the worker FIFO.
+
+        Output queues are filled before this method is called, matching the
+        target-end publish fence: clients and detokenization can advance while
+        a continuing batch proposes its next draft tokens.  ``call_func`` is
+        intentionally fire-and-forget.  The next forward RPC enters the same
+        broadcast queue after it, which preserves target/draft ordering on all
+        TP ranks without a host-side wait.
+
+        If every sequence in the batch stopped while consuming the output that
+        was just published, the current target step is pipeline lookahead: its
+        sampled ids/status and any would-be draft extension can never be
+        consumed.  Drain that generation and reset the one-step pipeline
+        instead of running a terminal proposal.  A mixed/continuing batch must
+        still finish its proposal before the next forward RPC.
+        """
+        if not getattr(fwd_out, "draft_proposal_pending", False):
+            return
+        all_terminal = (
+            envs.ATOM_CANCEL_TERMINAL_MTP_PROPOSAL
+            and bool(scheduled_seqs)
+            and all(seq.status == SequenceStatus.FINISHED for seq in scheduled_seqs)
+        )
+        self.runner_mgr.call_func(
+            "cancel_draft_proposal" if all_terminal else "finish_draft_proposal"
+        )
 
     def _advance_idle_kv_transfer(self) -> None:
         # No forward batch will run this tick, but offload load/save work may
