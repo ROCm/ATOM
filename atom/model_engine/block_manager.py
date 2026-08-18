@@ -118,7 +118,6 @@ class BlockManager:
                 self.kv,
                 checkpoint_spec,
                 enabled=enabled,
-                reserve_units=self._checkpoint_reserve_units(config, enabled),
             )
         self.state = StateGroupPool(
             self.num_per_req_cache_groups,
@@ -214,56 +213,34 @@ class BlockManager:
         self._state_checkpoint_cache.unindex(h)
 
     def _fresh_block(self) -> int:
-        """Take a block for content this step is about to compute."""
+        """Take a block for content this step is about to compute.
+
+        The raise is unreachable through `Scheduler` and the checkpoint cache
+        cannot make it reachable: a READY unpinned checkpoint counts as
+        available, and both callers sit behind a pin-aware check in the same
+        pass. `allocate` protects the one checkpoint it is about to pin and
+        sees the pins taken before it; `may_append` runs only in a pass that
+        scheduled no prefill (`scheduler.py`, `if num_seqs_prefill > 0` returns
+        first), so every pin was already released at the top of that pass.
+        Under contention the reachable outcome is a refused admission, not
+        this.
+
+        That second half rests on prefill and decode never sharing a pass. If
+        the mixed batch that `scheduler.py` has a TODO for lands, `may_append`
+        starts running alongside this pass's pins and the argument has to be
+        redone.
+        """
         if not self._ensure_page_units(1):
             raise AssertionError("No PAGE unit available for a fresh KV block")
         block_id = self.kv.pop()
         self.kv.allocate(block_id)
         return block_id
 
-    def _checkpoint_reserve_units(self, config, enabled: bool) -> int:
-        """PAGE units a checkpoint store has to leave for live KV.
-
-        A checkpoint is best-effort; a KV block is not — `_fresh_block` raises
-        when the pool is dry and nothing is evictable. It can normally always
-        evict one, because a checkpoint is only unevictable while it is
-        `COPYING` or pinned by a restore, and `schedule` publishes the
-        previous batch's stores before it allocates anything.
-
-        `allocate` is where that breaks. It pins a restore and then asks for
-        fresh blocks *in the same pass*, and the pin holds until the next
-        `complete_previous_state_batch`. So a pass of prefix hits can pin
-        every checkpoint it resumes from and then find nothing left to evict —
-        and the raise lands on whichever live request asks next.
-
-        Hence a floor of one pass's worth of new blocks: a chunk of prefill,
-        plus at most one append per running sequence. Entering a pass above
-        it, that pass never has to evict at all, so how much of the cache it
-        pins stops mattering. The floor is not sized for the unevictable set;
-        it is sized so the set is never consulted.
-        """
-        batched = int(getattr(config, "max_num_batched_tokens", 0) or 0)
-        seqs = int(getattr(config, "max_num_seqs", 0) or 0)
-        prefill = -(-batched // self.block_size)
-        reserve = prefill + seqs
-        # Logged because it is derived, not configured: a zero here says the
-        # batch shape was not readable and the floor is not actually in place.
-        # Not logged when no store will ever ask for it, which would report a
-        # floor that is never consulted.
-        if enabled:
-            logger.info(
-                "state checkpoint reserve: %d PAGE units (%d prefill + %d append)",
-                reserve,
-                prefill,
-                seqs,
-            )
-        return reserve
-
     def _checkpoint_has_room(self) -> bool:
-        """Whether a store taken now would survive the floor.
+        """Whether a store taken now could get its units.
 
         `True` when no PAGE-backed checkpoints exist at all: a fork checkpoint
-        costs the pool nothing, so there is nothing for a floor to gate.
+        costs the pool nothing, so there is nothing to gate.
         """
         if self.paged_state_checkpoints is None:
             return True
@@ -731,11 +708,18 @@ class BlockManager:
         previously_demanded = seq.checkpoint_demand_pos
         demand = wanted * self.hash_block_size if interval_on and wanted > hit else 0
         # A demand is an instruction to cut a prefill chunk onto a rung, and
-        # that cut costs the request a forward. Buying one for a store the
-        # floor is about to refuse is the only part of this funnel that is
-        # pure loss — the attribution above stays either way, because the
-        # reuse really was declined for want of a checkpoint.
-        if demand and not self._checkpoint_has_room():
+        # that cut costs the request a forward. Buying one for a store
+        # `begin_store` is about to refuse is the only part of this funnel
+        # that is pure loss — the attribution above stays either way, because
+        # the reuse really was declined for want of a checkpoint.
+        #
+        # Only ever declined on the way in, for the same reason the counter
+        # below only fires on the way in: `can_allocate` re-runs for a
+        # deferred sequence, so declining per attempt would put hundreds
+        # against a denominator that counts one. Retracting one already
+        # recorded would be worse — the sequence would be counted again the
+        # next time the pool has room.
+        if demand and not previously_demanded and not self._checkpoint_has_room():
             self.demands_declined_no_room += 1
             demand = 0
         seq.checkpoint_demand_pos = demand

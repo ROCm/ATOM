@@ -220,147 +220,121 @@ def test_clear_releases_ready_images_but_defers_a_pinned_reader():
     assert pool.num_free == 20
 
 
-def test_a_store_leaves_the_reserve_for_live_kv():
-    """A checkpoint is best-effort; the KV block after it is not.
+def _filled(num_units, unit_bytes, image_bytes, count):
+    """A store holding `count` READY checkpoints, oldest first."""
+    pool = BlockPool(num_units)
+    store = PageUnitCheckpointStore(
+        pool,
+        PagedStateCheckpointSpec(
+            page_unit_bytes=unit_bytes,
+            slot_bytes=image_bytes,
+            layout_id="layout-v1",
+            image_bytes=image_bytes,
+        ),
+    )
+    for prefix_hash in range(count):
+        assert store.begin_store(prefix_hash, src_slot=0) is not None
+    store.complete_inflight()
+    return pool, store
 
-    `_fresh_block` raises when the pool is dry and nothing is evictable, so a
-    store that took the last units would turn "no checkpoint this time" into a
-    crash. Dropping it is the same answer the pool already gives when nothing
-    can be evicted, one step earlier — and the reason `checkpoints_dropped`
-    exists.
+
+def test_a_store_with_free_units_spends_no_checkpoint():
+    """Free units first. A store asking for what is already there evicts nothing.
+
+    The cache is not a reservoir a store drains to a level -- it takes its own
+    image's worth. This used to be `needed + reserve_units`, which meant an
+    accepted store spent tens of checkpoints to build a cushion for live KV
+    that live KV never needed.
     """
-    reserve = 12
-    pool = BlockPool(20)
-    spec = PagedStateCheckpointSpec(10, 25, "layout-v1", image_bytes=25)
-    store = PageUnitCheckpointStore(pool, spec, reserve_units=reserve)
+    pool, store = _filled(num_units=100, unit_bytes=10, image_bytes=100, count=3)
+    assert pool.num_free == 70
 
-    stored = 0
-    for prefix_hash in range(100, 110):
-        if store.begin_store(prefix_hash, src_slot=0) is None:
-            break
-        stored += 1
-        assert pool.num_free >= reserve, "a store dipped under the floor"
-    else:
-        raise AssertionError("the floor never stopped a store")
+    assert store.begin_store(999, src_slot=0) is not None
 
-    assert stored, "the floor stopped the very first store"
-    # Every one of them is COPYING, so nothing above can be reclaimed either:
-    # the floor is all live KV has, and it is still there.
-    assert pool.num_free >= reserve
-    assert store.ensure_free_units(reserve)
+    assert store.evictions == 0, "a store with 70 free units spent a checkpoint"
+    assert len(store.records) == 4, "the cache lost an entry it did not have to"
 
 
-def test_an_unevictable_cache_empties_the_pool_without_a_reserve():
-    """The shape the floor exists to keep the pool out of.
+def test_a_store_spends_only_the_shortfall():
+    """Short by half an image: one checkpoint covers it, and only one goes."""
+    pool, store = _filled(num_units=35, unit_bytes=10, image_bytes=100, count=3)
+    assert pool.num_free == 5, "the pool is meant to be short by half an image"
 
-    A checkpoint is unevictable while `COPYING` or while a restore pins it.
-    Either way a full free list plus a fully unevictable cache leaves live KV
-    with nothing, which is what `_fresh_block` raises on. Stores are the
-    quicker way to write it down; the reachable one is pins, below.
-    """
-    pool = BlockPool(6)
-    spec = PagedStateCheckpointSpec(10, 25, "layout-v1", image_bytes=25)
-    store = PageUnitCheckpointStore(pool, spec, reserve_units=0)
+    assert store.begin_store(999, src_slot=0) is not None
 
-    assert store.begin_store(101, src_slot=0) is not None
-    assert store.begin_store(202, src_slot=1) is not None
-
-    # Both are COPYING, so `ensure_free_units` has no victim and a live block
-    # request now fails where a reserve would have kept one in hand.
-    assert pool.num_free == 0
-    assert not store.ensure_free_units(1)
+    assert store.evictions == 1, "the shortfall cost more than one checkpoint"
+    assert store.lookup(0) < 0, "the victim was not the oldest"
+    assert store.lookup(1) >= 0 and store.lookup(2) >= 0
 
 
 def test_a_dropped_store_evicts_nothing():
-    """The floor is a gate, not a target to evict towards.
+    """A store that cannot get its units has to cost nothing.
 
-    `ensure_free_units` gives up only after it has evicted every checkpoint
-    it can, so asking it for `needed + reserve` when live KV holds the rest of
-    the pool used to empty the entire cache and still refuse — every batch,
-    for as long as the pressure lasted. The units it freed did go to live KV,
-    but `_fresh_block` already takes those on demand, one at a time, when they
-    are actually needed.
+    `ensure_free_units` gives up only after it has evicted everything it can,
+    so asking it for units that are not there would destroy the cache on the
+    way to refusing. `begin_store` asks whether they are reachable first.
     """
-    pool = BlockPool(100)
-    spec = PagedStateCheckpointSpec(10, 10, "layout-v1", image_bytes=10)
-    store = PageUnitCheckpointStore(pool, spec, reserve_units=50)
-    for prefix_hash in range(50):
-        assert store.begin_store(prefix_hash, src_slot=0) is not None
-    store.complete_inflight()
-    # Live KV takes everything the checkpoints left, which is the state the
-    # floor can no longer be reached from.
+    pool, store = _filled(num_units=100, unit_bytes=10, image_bytes=10, count=50)
+    # Live KV takes every unit the checkpoints left.
     pool.reserve_units(pool.num_free, ("live-kv", 0))
+    for record in store.records.values():
+        record.pin_count = 1  # every checkpoint is being read, so none is spendable
 
     assert store.begin_store(999, src_slot=0) is None
+
     assert store.evictions == 0, "a dropped store evicted"
     assert len(store.records) == 50, "a dropped store cost the cache"
 
 
+def test_the_eviction_policy_cannot_move_the_gate():
+    """Eligibility is shared; order is policy. Only the second one may change.
+
+    `has_available_units` asks whether the eligible set reaches a count, which
+    the order it is walked in cannot change -- only how soon the loop gets
+    there. Swapping the policy here has to leave every gate answer identical.
+    """
+    pool, store = _filled(num_units=100, unit_bytes=10, image_bytes=10, count=6)
+    lru_pick = store._next_victim()
+    available = [store.has_available_units(n) for n in range(0, 101, 10)]
+
+    def newest_first(protected=-1):
+        return next(
+            (
+                cid
+                for cid in reversed(store._lru)
+                if store._is_evictable(cid, protected)
+            ),
+            -1,
+        )
+
+    store._next_victim = newest_first
+
+    assert [store.has_available_units(n) for n in range(0, 101, 10)] == available
+    assert store._next_victim() != lru_pick, "the policy swap did not take"
+
+    pool.reserve_units(pool.num_free, ("live-kv", 0))
+    assert store.ensure_free_units(1)
+    assert store.lookup(5) < 0, "the new policy's victim was not spent"
+    assert store.lookup(0) >= 0, "the LRU victim was spent under another policy"
+
+
 def test_a_store_still_recycles_the_oldest_checkpoint():
-    """The floor gates a store; it does not stop the LRU doing its job."""
-    reserve = 10
-    pool = BlockPool(100)
-    spec = PagedStateCheckpointSpec(10, 10, "layout-v1", image_bytes=10)
-    store = PageUnitCheckpointStore(pool, spec, reserve_units=reserve)
-    for prefix_hash in range(100 - reserve):
-        assert store.begin_store(prefix_hash, src_slot=0) is not None
-    store.complete_inflight()
-    assert pool.num_free == reserve
+    """The gate refuses a store; it does not stop the policy doing its job."""
+    pool, store = _filled(num_units=100, unit_bytes=10, image_bytes=10, count=100)
+    assert pool.num_free == 0
 
     assert store.begin_store(999, src_slot=0) is not None
 
-    assert store.evictions == 1, "the oldest checkpoint was not recycled"
+    assert store.evictions == 1
     assert store.lookup(0) < 0, "the victim was not the oldest"
-    assert pool.num_free == reserve, "recycling dipped under the floor"
 
 
-def test_the_floor_survives_a_pass_that_pins_the_whole_cache():
-    """What the floor is actually for.
-
-    `BlockManager.allocate` pins a restore and then asks for fresh blocks in
-    the same pass, and the pin holds until the next `complete_inflight`. So a
-    pass of prefix hits can pin every checkpoint it resumes from and find
-    nothing left to evict. A floor of one pass's worth of blocks is what stops
-    that pass from ever needing to evict — which is why it is sized against
-    the pass, not against the unevictable set.
-    """
-    reserve = 12
-    pool = BlockPool(40)
-    spec = PagedStateCheckpointSpec(10, 25, "layout-v1", image_bytes=25)
-    store = PageUnitCheckpointStore(pool, spec, reserve_units=reserve)
-
-    stored = []
-    for prefix_hash in range(100, 120):
-        if store.begin_store(prefix_hash, src_slot=0) is None:
-            break
-        stored.append(prefix_hash)
-    store.complete_inflight()
-    assert stored, "nothing was stored, so nothing is being tested"
-
-    # A pass of prefix hits: every checkpoint resumed from, none released
-    # until the next `complete_inflight`.
-    for slot, prefix_hash in enumerate(stored):
-        assert store.begin_restore(prefix_hash, dst_slot=slot) is not None
-    assert store.reclaimable_units() == 0, "the cache is meant to be pinned here"
-
-    # The pass can still take its blocks, which is the whole point.
-    assert store.ensure_free_units(reserve), "live KV was starved by its own hits"
-    assert pool.num_free >= reserve
-
-
-def test_the_reserve_does_not_block_a_restore():
-    """Only new images are rationed; reading one back takes no units."""
+def test_a_restore_takes_no_units():
+    """Only new images need units; reading one back does not."""
     pool = BlockPool(20)
     spec = PagedStateCheckpointSpec(10, 25, "layout-v1", image_bytes=25)
-    store = PageUnitCheckpointStore(pool, spec, reserve_units=12)
+    store = PageUnitCheckpointStore(pool, spec)
     ready(store, 101)
+    pool.reserve_units(pool.num_free, ("live-kv", 0))
 
     assert store.begin_restore(101, dst_slot=4) is not None
-
-
-def test_a_negative_reserve_is_refused():
-    pool = BlockPool(20)
-    spec = PagedStateCheckpointSpec(10, 25, "layout-v1", image_bytes=25)
-
-    with pytest.raises(ValueError, match="reserve_units"):
-        PageUnitCheckpointStore(pool, spec, reserve_units=-1)

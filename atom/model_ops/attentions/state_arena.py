@@ -270,11 +270,6 @@ def checkpoint_ranges_for(fields: list[StateField]) -> list[tuple[int, int]]:
     return ranges
 
 
-def checkpoint_bytes_for(fields: list[StateField]) -> int:
-    """Bytes of one entry a checkpoint image holds."""
-    return sum(nbytes for _, nbytes in checkpoint_ranges_for(fields))
-
-
 class StateArena:
     """`entries` fixed-size state entries, one stride apart.
 

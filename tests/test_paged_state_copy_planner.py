@@ -23,8 +23,8 @@ def describe(plan, src_bases, dst_bases, forward=True):
     out = np.empty((plan.num_spans, 3), dtype=np.int64)
     plan.write_descriptor(
         out,
-        np.array(src_bases, dtype=np.int64),
-        np.array(dst_bases, dtype=np.int64),
+        np.array([src_bases], dtype=np.int64),
+        np.array([dst_bases], dtype=np.int64),
         forward=forward,
     )
     return [tuple(int(x) for x in row) for row in out]
@@ -52,14 +52,25 @@ def test_a_reversed_descriptor_is_the_same_cut_the_other_way():
 
 
 def test_the_plan_does_not_depend_on_the_addresses():
-    """The same geometry at two sets of bases differs only by the bases."""
+    """The same cut at two sets of bases differs by exactly the bases.
+
+    Asserting only that the *unchanged* columns stayed put would pass for a
+    `write_descriptor` that ignored `src_bases` altogether, so the moved
+    column is checked against the delta rather than merely for inequality.
+    """
     plan = plan_segmented_copy([5, 7], [3, 4, 5], total_bytes=12)
+    delta = 999_000
 
     here = describe(plan, [1000, 2000], [3000, 4000, 5000])
-    there = describe(plan, [1_000_000, 2000], [3000, 4000, 5000])
+    moved = describe(plan, [1000 + delta, 2000], [3000, 4000, 5000])
 
-    assert [n for _, _, n in here] == [n for _, _, n in there]
-    assert [d for _, d, _ in here] == [d for _, d, _ in there]
+    assert [n for _, _, n in here] == [n for _, _, n in moved]
+    assert [d for _, d, _ in here] == [d for _, d, _ in moved]
+    # Only spans out of source segment 0 move, and each by exactly `delta`.
+    assert [s for s, _, _ in moved] == [
+        src + (delta if seg == 0 else 0)
+        for (src, _, _), seg in zip(here, plan.src_seg, strict=True)
+    ]
 
 
 def test_partial_tail_stops_before_unused_unit_capacity():
@@ -71,11 +82,36 @@ def test_partial_tail_stops_before_unused_unit_capacity():
     assert spans[-1][2] == 3
 
 
-def test_the_widest_span_is_what_the_grid_has_to_cover():
+def test_the_tiling_covers_every_span_exactly_once():
+    """The grid is one program per tile, so the tiling is the copy's extent."""
     plan = plan_segmented_copy([13], [5, 5, 5], total_bytes=13)
 
-    assert plan.widest == 5
     assert plan.num_spans == 3
+    # Each of the three spans is under one tile, so one tile each, all at
+    # offset zero inside their span.
+    assert plan.num_tiles == 3
+    assert list(plan.span_of_tile) == [0, 1, 2]
+    assert list(plan.tile_start) == [0, 0, 0]
+
+
+def test_a_long_span_is_cut_into_consecutive_tiles():
+    plan = plan_segmented_copy([10_000], [10_000], total_bytes=10_000)
+
+    assert plan.num_spans == 1
+    assert plan.num_tiles == 3  # 4096 + 4096 + 1808
+    assert list(plan.span_of_tile) == [0, 0, 0]
+    assert list(plan.tile_start) == [0, 4096, 8192]
+
+
+def test_the_tiling_reaches_the_end_of_every_span():
+    """Nothing is dropped off a span's tail, whatever the sizes are."""
+    plan = plan_segmented_copy([9_000, 300, 20_000], [29_300], total_bytes=29_300)
+
+    covered = {}
+    for span, start in zip(plan.span_of_tile, plan.tile_start, strict=True):
+        covered.setdefault(int(span), []).append(int(start))
+    for span, starts in covered.items():
+        assert starts == list(range(0, int(plan.length[span]), 4096))
 
 
 @pytest.mark.parametrize(
@@ -113,11 +149,11 @@ def test_descriptor_kernel_round_trips_random_bytes_with_partial_tail():
         descriptor = np.empty((plan.num_spans, 3), dtype=np.int64)
         plan.write_descriptor(
             descriptor,
-            np.array([slot_ptr], dtype=np.int64),
-            unit_bases,
+            np.array([[slot_ptr]], dtype=np.int64),
+            unit_bases[None],
             forward=forward,
         )
-        launch_copy_descriptor(descriptor, plan.widest, device)
+        launch_copy_descriptor(descriptor, plan, device)
 
     torch.cuda.synchronize()
     assert torch.equal(restored, original)
@@ -140,14 +176,51 @@ def test_several_copies_ride_in_one_descriptor():
     for i, (src, image) in enumerate(zip(sources, images, strict=True)):
         plan.write_descriptor(
             descriptor[i * plan.num_spans : (i + 1) * plan.num_spans],
-            np.array([src.data_ptr()], dtype=np.int64),
+            np.array([[src.data_ptr()]], dtype=np.int64),
             np.array(
-                [image.data_ptr(), image.data_ptr() + 2_048, image.data_ptr() + 4_096],
+                [
+                    [
+                        image.data_ptr(),
+                        image.data_ptr() + 2_048,
+                        image.data_ptr() + 4_096,
+                    ]
+                ],
                 dtype=np.int64,
             ),
         )
-    launch_copy_descriptor(descriptor, plan.widest, device)
+    launch_copy_descriptor(descriptor, plan, device)
 
     torch.cuda.synchronize()
     for src, image in zip(sources, images, strict=True):
         assert torch.equal(image[:5_000], src)
+
+
+def test_a_batch_describes_each_copy_the_way_one_call_would():
+    """The vectorised fill has to be indistinguishable from a loop.
+
+    `write_descriptor` fills every copy in one pass because doing it per copy
+    was a quarter of the whole copy path. That is only allowed to be faster,
+    so the batch is checked against the copies written one at a time -- an
+    axis dropped or an offset broadcast the wrong way would otherwise be a
+    descriptor full of plausible addresses.
+    """
+    plan = plan_segmented_copy([5, 7], [3, 4, 5], total_bytes=12)
+    src_bases = np.array([[1000, 2000], [1100, 2100], [1200, 2200]], dtype=np.int64)
+    dst_bases = np.array(
+        [[7000, 8000, 9000], [7100, 8100, 9100], [7200, 8200, 9200]], dtype=np.int64
+    )
+
+    for forward in (True, False):
+        batched = np.empty((3 * plan.num_spans, 3), dtype=np.int64)
+        plan.write_descriptor(batched, src_bases, dst_bases, forward=forward)
+
+        one_at_a_time = np.empty_like(batched)
+        for i in range(3):
+            plan.write_descriptor(
+                one_at_a_time[i * plan.num_spans : (i + 1) * plan.num_spans],
+                src_bases[i : i + 1],
+                dst_bases[i : i + 1],
+                forward=forward,
+            )
+
+        assert np.array_equal(batched, one_at_a_time), f"forward={forward}"

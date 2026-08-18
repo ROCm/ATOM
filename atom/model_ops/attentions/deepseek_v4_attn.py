@@ -615,11 +615,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         self._ubatch_decode_meta: list | None = None
         # Filled on the first checkpoint copy — the pools do not exist yet
         # here. Four of the five hold raw addresses read out of the pool
-        # tensors, so they are only valid because `allocate_per_req_cache`
-        # runs exactly once and nothing reallocates a plane afterwards. An
-        # elastic pool, which `v4_pool_geometry` is built to allow, has to
-        # reset them: a stale one is not a crash, it is a copy to the wrong
-        # address.
+        # tensors, so a re-carve invalidates them all; that is what
+        # `_invalidate_pool_caches` is for, and `allocate_per_req_cache`
+        # calls it.
         self._slot_view_cache: list[list[torch.Tensor]] | None = None
         self._checkpoint_range_cache: list[list[tuple[int, int]]] | None = None
         self._page_unit_region_cache: tuple[np.ndarray, np.ndarray] | None = None
@@ -769,7 +767,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             # overlap, so the first compression at or after a boundary P
             # covers `[P, P + 128)` — every row of it written by the very
             # forward that reads it — and a checkpoint sits on a multiple of
-            # `hash_block_size`, which `_assert_ratios_divide_block` keeps a
+            # `hash_block_size`, which `_assert_ratios_divide_the_alignment` keeps a
             # multiple of 128. The rows past `K_pool` are speculative
             # rollback slack and are never read at all.
             StateField(
@@ -846,27 +844,34 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
         Every op of either direction goes into one descriptor and one launch.
         A store and a restore are the same intersection read opposite ways, so
-        they share the plan too.
+        they share the plan too — and each direction is described in a single
+        vectorised pass, which is why they are batched apart rather than
+        interleaved.
         """
-        ops = [(op, True) for op in store_ops] + [(op, False) for op in restore_ops]
-        if not ops:
+        if not store_ops and not restore_ops:
             return
-        for op, _ in ops:
+        for op in (*store_ops, *restore_ops):
             self._validate_paged_state_op(op)
 
         plan = self._checkpoint_copy_plan()
         slot_bases = self._checkpoint_slot_bases()
         per_op = plan.num_spans
-        descriptor = np.empty((len(ops) * per_op, 3), dtype=np.int64)
-        for i, (op, storing) in enumerate(ops):
-            group = op.src_slot if storing else op.dst_slot
+        total = (len(store_ops) + len(restore_ops)) * per_op
+        descriptor = np.empty((total, 3), dtype=np.int64)
+        at = 0
+        for ops, storing in ((store_ops, True), (restore_ops, False)):
+            if not ops:
+                continue
+            end = at + len(ops) * per_op
+            groups = [op.src_slot if storing else op.dst_slot for op in ops]
             plan.write_descriptor(
-                descriptor[i * per_op : (i + 1) * per_op],
-                slot_bases[group],
-                self._page_unit_bases(op.unit_ids),
+                descriptor[at:end],
+                slot_bases[groups],
+                self._page_unit_bases([op.unit_ids for op in ops]),
                 forward=storing,
             )
-        launch_copy_descriptor(descriptor, plan.widest, self._kv_planes()[0].device)
+            at = end
+        launch_copy_descriptor(descriptor, plan, self._kv_planes()[0].device)
 
     def _validate_paged_state_op(
         self, op: CheckpointStoreOp | CheckpointRestoreOp
@@ -910,7 +915,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         A property of the layout, not of any one slot, so it is computed once.
         """
         if self._checkpoint_range_cache is None:
-            self._assert_ratios_divide_block()
+            self._assert_ratios_divide_the_alignment()
             geo = self.pool_geometry
             # Rows, so the same for every plane; only the width they are
             # priced at differs.
@@ -932,31 +937,67 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             ]
         return self._checkpoint_range_cache
 
+    def _checkpoint_segment_sizes(self) -> list[int]:
+        """The image as the copy planner reads it: one size per source segment.
+
+        The one place the per-plane ranges are flattened. Sizing wants their
+        total and the planner wants the list, and the two answering from
+        different comprehensions is how an image gets priced at one shape and
+        cut at another.
+        """
+        return [
+            nbytes for ranges in self._checkpoint_slot_ranges() for _, nbytes in ranges
+        ]
+
     def checkpoint_image_bytes(self) -> int:
         """Bytes one checkpoint image holds. Priced before the pool exists."""
-        return sum(
-            nbytes for ranges in self._checkpoint_slot_ranges() for _, nbytes in ranges
-        )
+        return sum(self._checkpoint_segment_sizes())
 
-    def _assert_ratios_divide_block(self) -> None:
+    def _assert_ratios_divide_the_alignment(self) -> None:
         """A checkpoint boundary has to be a compression boundary too.
 
         `StateField.in_checkpoint` says a compressor without overlap owes a
         checkpoint nothing, because the first pool at or after the boundary
         starts exactly on it. That holds only while every ratio divides the
-        block size a checkpoint is aligned to. Let the block size drop under
-        128 and HCA silently starts needing rows it is no longer given — no
-        crash, just a resumer reading stale KV for its first pool, which
-        reads as a small accuracy loss and nothing else.
+        quantity a checkpoint is aligned to, and HCA's ratio is 128 — let the
+        alignment drop under that and HCA silently starts needing rows it is
+        no longer given. No crash, just a resumer reading stale KV for its
+        first pool, which reads as a small accuracy loss and nothing else.
+
+        The quantity is `BlockManager`'s `hash_block_size`, not this class's
+        own `block_size`: the ladder rounds a checkpoint to the prefix-cache
+        hash granularity, which is `kv_cache_block_size * dcp_world_size`.
+        Asking about `self.block_size` would be asking `256 % 128` — a
+        constant folded at import, and a guard that cannot fire.
         """
-        bad = [r for r in (CSA_RATIO, HCA_RATIO) if self.block_size % r]
+        config = self.model_runner.config
+        alignment = int(config.kv_cache_block_size) * int(
+            getattr(config, "decode_context_parallel_size", 1) or 1
+        )
+        bad = [r for r in (CSA_RATIO, HCA_RATIO) if alignment % r]
         if bad:
             raise ValueError(
-                f"block size {self.block_size} is not a multiple of compress "
-                f"ratios {bad}, so a checkpoint boundary is not a compression "
-                "boundary, so what `_state_fields` leaves out of the image "
-                "is no longer dead"
+                f"a checkpoint aligns to {alignment} tokens "
+                f"(kv_cache_block_size x decode_context_parallel_size), which "
+                f"is not a multiple of compress ratios {bad}, so a checkpoint "
+                "boundary is not a compression boundary, so what "
+                "`_state_fields` leaves out of the image is no longer dead"
             )
+
+    def _invalidate_pool_caches(self) -> None:
+        """Forget everything derived from the pools' layout or addresses.
+
+        A slot's address is a function of the *split*, not just of its group
+        (`UnifiedPoolGeometry.physical_slot` counts back from the topmost
+        position), so a re-carve moves every one of them. Whoever wires an
+        elastic pool has to call this; it is here so that is one line rather
+        than five fields to remember.
+        """
+        self._slot_view_cache = None
+        self._checkpoint_range_cache = None
+        self._page_unit_region_cache = None
+        self._checkpoint_plan_cache = None
+        self._checkpoint_slot_base_cache = None
 
     def _checkpoint_copy_plan(self) -> SegmentedCopyPlan:
         """Where a slot's checkpoint ranges meet a whole image's PAGE regions.
@@ -970,11 +1011,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         if self._checkpoint_plan_cache is None:
             spec = self.model_runner.state_runtime.checkpoint_spec
             self._checkpoint_plan_cache = plan_segmented_copy(
-                [
-                    nbytes
-                    for ranges in self._checkpoint_slot_ranges()
-                    for _, nbytes in ranges
-                ],
+                self._checkpoint_segment_sizes(),
                 # Sizes from the same array `_page_unit_bases` takes addresses
                 # from, tiled the way it ravels. Spelling the destination
                 # stream out a second time here would let the two orders
@@ -1059,16 +1096,18 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             )
         return self._page_unit_region_cache
 
-    def _page_unit_bases(self, unit_ids: Sequence[int]) -> np.ndarray:
-        """Start address of every destination segment of one image.
+    def _page_unit_bases(self, unit_ids: Sequence[Sequence[int]]) -> np.ndarray:
+        """Start address of every destination segment, one row per image.
 
-        A unit's regions are each at `base + id * stride`, so an image's worth
-        is one outer product. Unit major, region minor — the order
-        `_checkpoint_copy_plan` built the destination stream in.
+        `unit_ids` is `(images, units_per_checkpoint)`. A unit's regions are
+        each at `base + id * stride`, so one image's worth is an outer product
+        and a batch's is the same product with an image axis in front. Unit
+        major, region minor — the order `_checkpoint_copy_plan` built the
+        destination stream in.
         """
         base, stride = self._page_unit_regions()
         ids = np.asarray(unit_ids, dtype=np.int64)
-        return (base + np.multiply.outer(ids, stride)).ravel()
+        return (base + ids[..., None] * stride).reshape(len(ids), -1)
 
     def _page_unit_stream_sizes(self, units: int) -> np.ndarray:
         """Bytes in each destination segment of an image of `units` units."""
@@ -1278,6 +1317,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         dtype = self._swa_dtype
         rope_dtype = self._rope_dtype
 
+        # Anything already worked out from the old layout or the old pools is
+        # now wrong, and wrong quietly: four of these hold raw addresses, so a
+        # stale one is a copy to the wrong slot rather than a crash. Cleared
+        # before the new geometry is installed so nothing below can repopulate
+        # them from a half-updated state.
+        self._invalidate_pool_caches()
         # The layout at the split sizing chose. Everything below — and every
         # index formula any kernel evaluates — reads its offsets from here.
         geo = self.pool_geometry.with_capacity(num_blocks, num_slots)

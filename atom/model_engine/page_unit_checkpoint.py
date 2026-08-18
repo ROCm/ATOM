@@ -27,8 +27,10 @@ class PagedStateCheckpointSpec:
     # Bytes of a slot a checkpoint image actually holds, which is less than
     # all of them: a resumer reads only part of the slot it resumes into, and
     # a compressor whose next pool starts exactly at the boundary reads none
-    # of its own. `slot_bytes` stays because sizing and the PD path still
-    # price the whole slot.
+    # of its own. `slot_bytes` stays for three things that still want the
+    # whole slot — the `image_bytes <= slot_bytes` sanity check below, the
+    # geometry cross-check in `allocate_per_req_cache`, and the startup log
+    # line that reports an image as a fraction of one.
     image_bytes: int
 
     def __post_init__(self) -> None:
@@ -112,17 +114,9 @@ class PageUnitCheckpointStore:
         self,
         pool: BlockPool,
         spec: PagedStateCheckpointSpec,
-        reserve_units: int = 0,
     ):
-        if reserve_units < 0:
-            raise ValueError(f"reserve_units must not be negative, got {reserve_units}")
         self.pool = pool
         self.spec = spec
-        # Free units a store has to leave behind, so that a scheduling pass
-        # which pins the whole cache still finds blocks for live KV. See
-        # `begin_store` and `BlockManager._checkpoint_reserve_units`.
-        self.reserve_units = reserve_units
-
         self.hash_to_checkpoint: dict[int, int] = {}
         self.records: dict[int, CheckpointRecord] = {}
         self._pending_by_hash: dict[int, int] = {}
@@ -155,81 +149,114 @@ class PageUnitCheckpointStore:
         self._next_checkpoint_id += 1
         return checkpoint_id
 
+    def _is_evictable(self, checkpoint_id: int, protected: int = -1) -> bool:
+        """Whether this checkpoint may be spent. Eligibility, not policy.
+
+        The one statement of what is evictable. Everything that asks about
+        free units goes through it, so a new state, a grace period or a
+        second kind of pin cannot leave two answers behind. Do not order
+        here -- which eligible checkpoint to spend first is `_next_victim`.
+        """
+        record = self.records[checkpoint_id]
+        return (
+            checkpoint_id != protected
+            and record.state == READY
+            and record.pin_count == 0
+        )
+
+    def _evictable(self, protected: int = -1) -> Iterator[int]:
+        """Every checkpoint that may be spent. Yield order carries no promise."""
+        return (cid for cid in self._lru if self._is_evictable(cid, protected))
+
+    def _next_victim(self, protected: int = -1) -> int:
+        """Which eligible checkpoint to spend when the free list is short.
+
+        This is the eviction policy, and the only place it lives: least
+        recently used, which `_lru` already orders. A different policy
+        replaces this method and nothing else -- in particular it must not
+        touch `_is_evictable`, which is the eligibility rule three callers
+        share.
+        """
+        return next(self._evictable(protected), -1)
+
     def has_available_units(
         self, count: int, protected_hash: int | None = None
     ) -> bool:
+        """Whether `count` units could be had, evicting if it came to that.
+
+        Asked once per waiting sequence in `can_allocate` and once per running
+        one in `can_append`, so it is per-sequence per-pass and the walk has to
+        be paid for. Two things keep it cheap. The free list is checked first,
+        which is the whole answer whenever the pool is not tight. And the walk
+        below stops at the shortfall rather than totalling the cache: the
+        question is whether the eligible set reaches `count`, not how large it
+        is, and a warm pool holds `num_kvcache_blocks / units_per_checkpoint`
+        checkpoints -- thousands, walked for an answer a couple of them settle.
+
+        Which checkpoints those are does not change the answer, only how soon
+        the loop reaches it, so a future `_next_victim` cannot move this gate.
+        """
         if count <= self.pool.num_free:
             return True
         protected = self.lookup(protected_hash) if protected_hash is not None else -1
-        reclaimable = sum(
-            len(self.records[cid].unit_ids)
-            for cid in self._lru
-            if cid != protected
-            if self.records[cid].state == READY and self.records[cid].pin_count == 0
-        )
-        return self.pool.num_free + reclaimable >= count
+        shortfall = count - self.pool.num_free
+        for checkpoint_id in self._evictable(protected):
+            shortfall -= len(self.records[checkpoint_id].unit_ids)
+            if shortfall <= 0:
+                return True
+        return False
 
     def ensure_free_units(self, count: int) -> bool:
+        """Raise the free list to `count`, spending checkpoints for the shortfall.
+
+        Free units are taken first -- a caller asking for what is already
+        there evicts nothing -- and `pop` hands out never-used blocks before
+        cached ones, so a store reaches for the cache only once the pool has
+        nothing spare. Each eviction returns a whole image's units, so the
+        loop overshoots by at most one checkpoint.
+        """
         while self.pool.num_free < count:
-            victim = next(self._evictable(), -1)
+            victim = self._next_victim()
             if victim < 0:
                 return False
             self._evict(victim)
         return True
 
-    def _evictable(self) -> Iterator[int]:
-        """Checkpoints a caller may reclaim units from, oldest first."""
-        return (
-            cid
-            for cid in self._lru
-            if self.records[cid].state == READY and self.records[cid].pin_count == 0
-        )
-
     def has_room_for_store(self) -> bool:
-        """Whether a store asked for now would clear the floor.
+        """Whether a store asked for now could get its units.
 
         The ladder asks this before it cuts a prefill chunk onto a rung: that
-        cut costs the request a forward, and buying one for a store `begin_store`
-        is about to refuse is the one part of the funnel that is pure loss.
-        Same expression as the refusal, so the two cannot come to disagree.
+        cut costs the request a forward, and buying one for a store
+        `begin_store` is about to refuse is the one part of the funnel that is
+        pure loss. It is the refusal's own question, not a second copy of it.
         """
-        needed = self.units_per_checkpoint + self.reserve_units
-        return self.pool.num_free + self.reclaimable_units() >= needed
-
-    def reclaimable_units(self) -> int:
-        """Units `ensure_free_units` could still add to the free list.
-
-        The ceiling on what any request for free units can reach, which is
-        what lets a caller find out it will fail before eviction has done
-        anything on its behalf.
-        """
-        return sum(len(self.records[cid].unit_ids) for cid in self._evictable())
+        return self.has_available_units(self.units_per_checkpoint)
 
     def begin_store(self, prefix_hash: int, src_slot: int) -> CheckpointStoreOp | None:
         if self.lookup(prefix_hash) >= 0 or prefix_hash in self._pending_by_hash:
             return None
         needed = self.units_per_checkpoint
-        # Leave `reserve_units` behind. A checkpoint is best-effort and a live
-        # KV block is not: `_fresh_block` raises when the pool is dry and
-        # nothing is evictable, and `BlockManager.allocate` pins a restore
-        # before asking for fresh blocks in the same pass — so a pass of
-        # prefix hits can make the whole cache unevictable and then need a
-        # block. The floor is one pass's worth of them, which is what keeps
-        # that pass from ever having to evict. See
-        # `BlockManager._checkpoint_reserve_units`.
+        # A store takes what its own image needs and nothing more. It used to
+        # take a floor for live KV on top, which meant one accepted store
+        # spent tens of checkpoints to build a cushion -- and the cushion
+        # bought nothing: the pool cannot starve live KV. A READY unpinned
+        # checkpoint is already counted as available by `has_available_units`,
+        # so holding one costs live KV nothing; the unevictable set (COPYING,
+        # or pinned by a restore) is created after every allocation in a pass
+        # and resolved before the next one allocates; and every `_fresh_block`
+        # sits behind a pin-aware check in its own pass, so the reachable
+        # outcome is a refused admission, never the raise.
         #
-        # Ask whether the floor is reachable BEFORE asking to reach it.
+        # Ask whether the units are reachable BEFORE asking to reach them.
         # `ensure_free_units` gives up only once it has evicted every
-        # checkpoint it can, so a bare request for `needed + reserve` empties
-        # the whole cache and still refuses, every batch, for as long as live
-        # KV holds the rest of the pool — the units it freed go to live KV,
-        # but `_fresh_block` already takes those on demand, one at a time, at
-        # the moment they are actually needed. A store that will be dropped
-        # has to cost nothing.
+        # checkpoint it can, so an unreachable request would empty the cache
+        # and still refuse. A store that will be dropped has to cost nothing.
         if not self.has_room_for_store():
             return None
-        if not self.ensure_free_units(needed + self.reserve_units):
-            return None
+        # Cannot fail after that: what it evicts from is exactly what the
+        # check counted. `pool.reserve_units` below is the backstop if it ever
+        # can, since it refuses rather than over-issuing.
+        self.ensure_free_units(needed)
 
         checkpoint_id = self._new_identity()
         owner = ("state-checkpoint", checkpoint_id)
@@ -375,10 +402,9 @@ class PagedStateCheckpointCoordinator:
         pool: BlockPool,
         spec: PagedStateCheckpointSpec,
         enabled: bool,
-        reserve_units: int = 0,
     ) -> None:
         self.enabled = enabled
-        self.store = PageUnitCheckpointStore(pool, spec, reserve_units)
+        self.store = PageUnitCheckpointStore(pool, spec)
         self._pending: dict[int, tuple[Sequence, int]] = {}
         self._store_ops: list[CheckpointStoreOp] = []
         self.checkpoints_kept = 0

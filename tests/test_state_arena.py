@@ -19,9 +19,9 @@ import torch
 from atom.model_ops.attentions.state_arena import (
     StateArena,
     StateField,
-    checkpoint_bytes_for,
     checkpoint_ranges_for,
     entry_bytes_for,
+    field_extents,
     plan_field_planes,
     plan_regions,
 )
@@ -41,6 +41,16 @@ V4_LIKE = [
 
 def build(fields=V4_LIKE, entries=5) -> StateArena:
     return StateArena(fields, entries, device="cpu")
+
+
+def carried_bytes(fields) -> int:
+    """Bytes of an entry a checkpoint image holds, the long way round.
+
+    Spelled out here rather than imported: the module used to export this and
+    nothing but these tests called it, and a helper kept alive by its own
+    tests is not an interface.
+    """
+    return sum(nbytes for _, nbytes in checkpoint_ranges_for(fields))
 
 
 class TestEntryBytes:
@@ -437,7 +447,7 @@ class TestCheckpointRanges:
 
     def test_an_all_carried_entry_is_one_range(self):
         assert checkpoint_ranges_for(V4_LIKE) == [(0, entry_bytes_for(V4_LIKE))]
-        assert checkpoint_bytes_for(V4_LIKE) == entry_bytes_for(V4_LIKE)
+        assert carried_bytes(V4_LIKE) == entry_bytes_for(V4_LIKE)
 
     def test_a_dropped_field_is_not_in_the_image(self):
         fields = self.without_hca()
@@ -448,7 +458,7 @@ class TestCheckpointRanges:
         assert start == 0
         # Stops at the first dropped field rather than running to entry_bytes.
         assert nbytes <= arena.field_offset("hca_main_kv")
-        assert checkpoint_bytes_for(fields) < entry_bytes_for(fields)
+        assert carried_bytes(fields) < entry_bytes_for(fields)
 
     def test_a_dropped_field_breaks_the_run_it_sits_in(self):
         """Merging across it would put it back in the image."""
@@ -470,11 +480,20 @@ class TestCheckpointRanges:
         for start, nbytes in ranges:
             assert start >= dead_end or start + nbytes <= dead_start
 
-    def test_the_image_size_is_the_sum_of_its_ranges(self):
-        fields = self.without_hca()
+    def test_the_image_spans_the_carried_run_padding_included(self):
+        """From the first carried field's start to the last one's end.
 
-        assert checkpoint_bytes_for(fields) == sum(
-            n for _, n in checkpoint_ranges_for(fields)
+        Derived from `field_extents` rather than from the function under
+        test, and not from `sum(bytes_per_entry)` either: the alignment
+        between two carried fields rides along, because splitting a range to
+        shave it costs more descriptor than it saves.
+        """
+        fields = self.without_hca()
+        carried = [(s, e) for f, s, e in field_extents(fields) if f.in_checkpoint]
+
+        assert carried_bytes(fields) == carried[-1][1] - carried[0][0]
+        assert carried_bytes(fields) >= sum(
+            f.bytes_per_entry for f in fields if f.in_checkpoint
         )
 
     def test_the_ranges_land_where_the_arena_put_the_fields(self):
@@ -493,4 +512,4 @@ class TestCheckpointRanges:
         fields = [StateField("dead", 1, (8, 8), torch.float32, in_checkpoint=False)]
 
         assert checkpoint_ranges_for(fields) == []
-        assert checkpoint_bytes_for(fields) == 0
+        assert carried_bytes(fields) == 0

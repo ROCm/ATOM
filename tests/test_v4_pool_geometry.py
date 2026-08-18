@@ -150,11 +150,12 @@ class TestTheRowsAWindowActuallyReaches:
         return {row for start, count in runs for row in range(start, start + count)}
 
     def test_the_runs_are_exactly_the_reachable_rows(self):
+        # `ring_slots < stride` is included on purpose: it is the `whole == 0`
+        # branch, where the construction is nothing but per-layer partials,
+        # and a window shorter than `block_size // CSA_RATIO` takes it.
         for num_layers in (1, 2, 3, 5, 20, 21):
             for stride in (1, 2, 3, 7, 64):
                 for ring_slots in (1, 2, 5, 64, 128, 131, 133):
-                    if ring_slots < stride:
-                        continue
                     cls = ClassLayout(
                         ratio=4,
                         layers=tuple(range(num_layers)),

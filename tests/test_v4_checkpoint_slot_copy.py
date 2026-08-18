@@ -18,7 +18,9 @@ arithmetic under test is the shipped arithmetic.
 from __future__ import annotations
 
 import ctypes
+from dataclasses import replace
 from itertools import pairwise
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -30,7 +32,6 @@ from atom.model_ops.attentions.deepseek_v4_attn import (
 from atom.model_ops.attentions.paged_state_copy import plan_segmented_copy
 from atom.model_ops.attentions.state_arena import (
     StateField,
-    checkpoint_bytes_for,
     checkpoint_ranges_for,
     entry_bytes_for,
     field_extents,
@@ -89,17 +90,24 @@ class _StubBuilder:
     # The real methods, not copies of them: between them they read nothing the
     # stub does not supply, and a reimplementation here would stop tracking the
     # ones it stands in for.
-    _assert_ratios_divide_block = Builder._assert_ratios_divide_block
+    _assert_ratios_divide_the_alignment = Builder._assert_ratios_divide_the_alignment
     _checkpoint_slot_ranges = Builder._checkpoint_slot_ranges
     _checkpoint_slot_bases = Builder._checkpoint_slot_bases
+    _checkpoint_segment_sizes = Builder._checkpoint_segment_sizes
     checkpoint_image_bytes = Builder.checkpoint_image_bytes
 
-    def __init__(self, plane: torch.Tensor):
+    def __init__(self, plane: torch.Tensor, alignment: int = 256):
         self.pool_geometry = _Geo()
         self._arena_planes = [FIELDS]
         self._checkpoint_range_cache = None
         self._checkpoint_slot_base_cache = None
-        self.block_size = 256
+        # What the ladder actually rounds a checkpoint to, which is where the
+        # guard has to look: `kv_cache_block_size * dcp_world_size`.
+        self.model_runner = SimpleNamespace(
+            config=SimpleNamespace(
+                kv_cache_block_size=alignment, decode_context_parallel_size=1
+            )
+        )
         self._plane = plane
 
     def _plane_row_widths(self):
@@ -158,8 +166,8 @@ def store_and_restore(stub, image_ptrs, image_sizes, live_bytes, src, dst):
         descriptor = np.empty((plan.num_spans, 3), dtype=np.int64)
         plan.write_descriptor(
             descriptor,
-            slot_bases[group],
-            np.asarray(image_ptrs, dtype=np.int64),
+            slot_bases[group][None],
+            np.asarray(image_ptrs, dtype=np.int64)[None],
             forward=forward,
         )
         for source, destination, nbytes in descriptor:
@@ -205,17 +213,42 @@ class TestCheckpointSlotRanges:
         stub = _StubBuilder(plane)
 
         assert Builder.checkpoint_image_bytes(stub) == (
-            checkpoint_bytes_for(FIELDS) + ENTRY_LIVE_ROWS * ROW_BYTES
+            sum(n for _, n in checkpoint_ranges_for(FIELDS))
+            + ENTRY_LIVE_ROWS * ROW_BYTES
         )
         assert Builder.checkpoint_image_bytes(stub) < SLOT_BYTES
 
-    def test_a_block_size_a_ratio_does_not_divide_is_refused(self, plane):
-        """HCA owes nothing only while a checkpoint lands on a pool boundary."""
+    @pytest.mark.parametrize(
+        "block_size, dcp",
+        [
+            (64, 1),  # under HCA's ratio outright
+            (96, 1),  # a multiple of neither
+            (32, 2),  # 64 tokens of alignment: dcp does not rescue it
+        ],
+    )
+    def test_an_alignment_a_ratio_does_not_divide_is_refused(
+        self, plane, block_size, dcp
+    ):
+        """HCA owes nothing only while a checkpoint lands on a pool boundary.
+
+        The guard has to read the alignment the ladder uses, not this class's
+        own `block_size` — asking the latter is `256 % 128`, which no
+        configuration can make fail.
+        """
         stub = _StubBuilder(plane)
-        stub.block_size = 64  # 64 % 128 != 0
+        stub.model_runner.config.kv_cache_block_size = block_size
+        stub.model_runner.config.decode_context_parallel_size = dcp
 
         with pytest.raises(ValueError, match="not a multiple of compress"):
             Builder.checkpoint_image_bytes(stub)
+
+    def test_dcp_can_make_an_alignment_legal(self, plane):
+        """The product is what matters, so a small block can still divide."""
+        stub = _StubBuilder(plane)
+        stub.model_runner.config.kv_cache_block_size = 64
+        stub.model_runner.config.decode_context_parallel_size = 2  # 128 tokens
+
+        assert Builder.checkpoint_image_bytes(stub) > 0
 
 
 class TestRoundTrip:
@@ -300,8 +333,8 @@ class TestRoundTrip:
         descriptor = np.empty((plan.num_spans, 3), dtype=np.int64)
         plan.write_descriptor(
             descriptor,
-            Builder._checkpoint_slot_bases(stub)[2],
-            np.array([units.data_ptr()], dtype=np.int64),
+            Builder._checkpoint_slot_bases(stub)[2][None],
+            np.array([[units.data_ptr()]], dtype=np.int64),
             forward=False,
         )
 
@@ -321,7 +354,7 @@ class TestTheBuilderDeclaresWhatItDrops:
     """
 
     @staticmethod
-    def build_fields() -> list[StateField]:
+    def builder_stub():
         class _Stub:
             _state_dtype = torch.float32
             csa_layers = (2, 4, 6)
@@ -330,12 +363,25 @@ class TestTheBuilderDeclaresWhatItDrops:
             csa_idx_state_shape = (13, 256)
             hca_main_state_shape = (133, 512)
             head_dim = 512
+            rope_head_dim = 64
+            index_head_dim = 128
+            block_size = 256
             win_with_spec = 133
+            compress_ratios = (0, 0, 4, 128, 4, 128, 4, -1)
+            _kv_fp8 = False
+            _indexer_fp4 = False
             _field_window_dtype = torch.bfloat16
             _field_window_layers = (43,)
             _window_field_row_bytes = Builder._window_field_row_bytes
+            _state_fields = Builder._state_fields
+            _geometry_ratios = Builder._geometry_ratios
+            state_transfer = Builder.state_transfer
 
-        return Builder._state_fields(_Stub())
+        return _Stub()
+
+    @classmethod
+    def build_fields(cls) -> list[StateField]:
+        return Builder._state_fields(cls.builder_stub())
 
     def test_hca_is_the_only_thing_dropped(self):
         dropped = {f.name for f in self.build_fields() if not f.in_checkpoint}
@@ -359,13 +405,33 @@ class TestTheBuilderDeclaresWhatItDrops:
                 assert not overlap, f"{field.name} is dropped but has one"
 
     def test_what_is_dropped_is_versioned_into_the_layout_id(self):
-        """Two workers disagreeing on the rule read one image two ways."""
-        fields = self.build_fields()
-        nocopy = ",".join(f.name for f in fields if not f.in_checkpoint)
+        """Two workers disagreeing on the rule read one image two ways.
 
-        # `state_transfer` builds the id from exactly this expression, so a
-        # change to the rule cannot leave the id saying what it used to.
-        assert nocopy == "hca_main_kv,hca_main_score"
+        Asks `state_transfer` for the id rather than re-deriving the rule
+        beside it: re-deriving asserts the rule twice and the fence not at
+        all, so dropping the `nocopy=` segment would leave it green.
+        """
+        stub = self.builder_stub()
+
+        layout_id = Builder.state_transfer(stub).paged_layout_id
+
+        assert ":nocopy=hca_main_kv,hca_main_score" in layout_id
+        # The packing rule shares the id, and both are fenced by the version.
+        assert ":entry=packed" in layout_id
+        assert layout_id.startswith("dsv4-paged-state-v3:")
+
+    def test_the_layout_id_moves_when_the_rule_does(self):
+        """The fence has to notice a field changing sides, not just exist."""
+        stub = self.builder_stub()
+        before = Builder.state_transfer(stub).paged_layout_id
+
+        stub._state_fields = lambda: [
+            replace(f, in_checkpoint=True) for f in Builder._state_fields(stub)
+        ]
+        after = Builder.state_transfer(stub).paged_layout_id
+
+        assert after != before
+        assert ":nocopy=:" in after, "the id moved for some other reason"
 
 
 class TestPageUnitAddressesAreArithmetic:
@@ -432,7 +498,7 @@ class TestPageUnitAddressesAreArithmetic:
         _, sizes = Builder._page_unit_regions(stub)
 
         for block_id in range(self.NUM_BLOCKS):
-            bases = Builder._page_unit_bases(stub, [block_id])
+            (bases,) = Builder._page_unit_bases(stub, [[block_id]])
             got = list(zip(map(int, bases), map(int, sizes), strict=True))
             assert got == self.sliced(plane, idx, block_id), f"block {block_id}"
 
@@ -446,7 +512,7 @@ class TestPageUnitAddressesAreArithmetic:
         stub, plane, idx = self.build()
         chosen = [3, 0, 4]
 
-        bases = Builder._page_unit_bases(stub, chosen)
+        (bases,) = Builder._page_unit_bases(stub, [chosen])
         sizes = Builder._page_unit_stream_sizes(stub, len(chosen))
 
         assert list(zip(map(int, bases), map(int, sizes), strict=True)) == [

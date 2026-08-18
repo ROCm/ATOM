@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import torch
@@ -21,7 +21,7 @@ except ModuleNotFoundError:
 _TILE_BYTES = 4096
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class SegmentedCopyPlan:
     """Where two ordered byte streams meet, in offsets rather than addresses.
 
@@ -37,10 +37,14 @@ class SegmentedCopyPlan:
     which is the difference between an image cut fine enough to save PAGE
     units and one that costs more host time than the units are worth.
 
-    The five arrays are parallel and one span long. `src` and `dst` name the
-    roles the plan was built in, not a direction: an intersection is symmetric,
-    so `write_descriptor` can read it either way and a restore reuses the plan
-    its store was cut by.
+    The first five arrays are parallel and one span long. `src` and `dst` name
+    the roles the plan was built in, not a direction: an intersection is
+    symmetric, so `write_descriptor` can read it either way and a restore
+    reuses the plan its store was cut by.
+
+    The last two are the same spans cut into tiles, which is the unit the
+    kernel actually runs on. Compared by identity (`eq=False`): the fields are
+    arrays, so a generated `__eq__` would raise rather than answer.
     """
 
     src_seg: np.ndarray
@@ -48,15 +52,31 @@ class SegmentedCopyPlan:
     dst_seg: np.ndarray
     dst_off: np.ndarray
     length: np.ndarray
+    # Which span a tile belongs to, and its byte offset inside that span.
+    span_of_tile: np.ndarray
+    tile_start: np.ndarray
+    # The two above, per device, uploaded on first use. Fixed geometry, so one
+    # upload serves every copy for the life of the plan.
+    _resident: dict = field(default_factory=dict, repr=False, compare=False)
 
     @property
     def num_spans(self) -> int:
         return int(self.length.size)
 
     @property
-    def widest(self) -> int:
-        """Bytes in the longest span, which is what sets the kernel's grid."""
-        return int(self.length.max()) if self.length.size else 0
+    def num_tiles(self) -> int:
+        return int(self.span_of_tile.size)
+
+    def tiling_on(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        """`(span_of_tile, tile_start)` resident on `device`."""
+        tables = self._resident.get(device)
+        if tables is None:
+            tables = (
+                torch.from_numpy(self.span_of_tile).to(device),
+                torch.from_numpy(self.tile_start).to(device),
+            )
+            self._resident[device] = tables
+        return tables
 
     def write_descriptor(
         self,
@@ -66,17 +86,29 @@ class SegmentedCopyPlan:
         *,
         forward: bool = True,
     ) -> None:
-        """Fill a `(num_spans, 3)` int64 block: source, destination, length.
+        """Fill `(copies * num_spans, 3)` int64 rows: source, destination, length.
 
-        `src_bases` and `dst_bases` give one address per segment of each
-        stream, which is where a caller's geometry enters — a slot's base plus
-        a range's offset, a PAGE unit's base plus a region's. `forward=False`
-        copies the destination stream back into the source instead.
+        `src_bases` and `dst_bases` are `(copies, segments)` — one row of
+        segment addresses per copy, which is where a caller's geometry enters:
+        a slot's base plus a range's offset, a PAGE unit's base plus a
+        region's. `out` holds the copies back to back in the same order.
+
+        Every copy in one call goes the same way, so a caller with both
+        directions makes two calls. `forward=False` copies the destination
+        stream back into the source instead.
+
+        The copies are filled in one pass rather than one at a time. At these
+        sizes each of the three fills below is nearly all numpy call overhead
+        — a span table is a few hundred entries — so paying it per copy is
+        what made describing a batch a quarter of the whole copy path, once
+        the kernel stopped being the bottleneck. Batched it is about 7x
+        cheaper, and it is the same three lines with one more axis.
         """
         src_col, dst_col = (0, 1) if forward else (1, 0)
-        np.add(src_bases[self.src_seg], self.src_off, out=out[:, src_col])
-        np.add(dst_bases[self.dst_seg], self.dst_off, out=out[:, dst_col])
-        out[:, 2] = self.length
+        rows = out.reshape(len(src_bases), self.num_spans, 3)
+        np.add(src_bases[:, self.src_seg], self.src_off, out=rows[:, :, src_col])
+        np.add(dst_bases[:, self.dst_seg], self.dst_off, out=rows[:, :, dst_col])
+        rows[:, :, 2] = self.length
 
 
 def plan_segmented_copy(
@@ -122,75 +154,132 @@ def plan_segmented_copy(
             dst_i += 1
             dst_used = 0
     i64 = np.int64
+    lengths = np.array(length, dtype=i64)
+    span_of_tile, tile_start = _tiling(lengths)
     return SegmentedCopyPlan(
         src_seg=np.array(src_seg, dtype=i64),
         src_off=np.array(src_off, dtype=i64),
         dst_seg=np.array(dst_seg, dtype=i64),
         dst_off=np.array(dst_off, dtype=i64),
-        length=np.array(length, dtype=i64),
+        length=lengths,
+        span_of_tile=span_of_tile,
+        tile_start=tile_start,
     )
+
+
+def _tiling(lengths: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Cut the spans into tiles: which span each is in, and where it starts.
+
+    A copy kernel wants one program per tile *that exists*. Deriving that on
+    the device would need a search; deriving it here needs none, because a
+    plan's spans do not change. The result is two small arrays that go to the
+    device once and serve every copy the plan describes.
+    """
+    counts = -(-lengths // _TILE_BYTES)
+    total = int(counts.sum())
+    span_of_tile = np.repeat(np.arange(lengths.size, dtype=np.int32), counts)
+    first = np.concatenate([np.zeros(1, dtype=np.int64), np.cumsum(counts)[:-1]])
+    within = np.arange(total, dtype=np.int64) - np.repeat(first, counts)
+    return span_of_tile, within * _TILE_BYTES
 
 
 if triton is not None:
 
     @triton.jit
-    def _copy_spans_kernel(descriptor, TILE_BYTES: tl.constexpr):
+    def _copy_tiles_kernel(
+        descriptor,
+        span_of_tile,
+        tile_start,
+        N_TILES: tl.constexpr,
+        N_SPANS: tl.constexpr,
+        TILE: tl.constexpr,
+    ):
+        # One program per tile that exists. The tiling is the plan's, resident
+        # on the device, so which span this tile belongs to and where it
+        # starts are two loads rather than a search.
+        #
         # A row is `write_descriptor`'s: source, destination, length. Triton
         # cannot read a plain module constant, so the three stay literal here
         # and the round-trip test is what holds the two ends to the same order.
-        row = descriptor + tl.program_id(0) * 3
+        pid = tl.program_id(0)
+        op = pid // N_TILES
+        tile = pid % N_TILES
+        span = tl.load(span_of_tile + tile)
+        start = tl.load(tile_start + tile)
+        row = descriptor + (op * N_SPANS + span) * 3
         src_ptr = tl.load(row)
         dst_ptr = tl.load(row + 1)
         length = tl.load(row + 2)
-        start = tl.program_id(1) * TILE_BYTES
-        if start < length:
-            offsets = start + tl.arange(0, TILE_BYTES)
-            mask = offsets < length
-            src = (src_ptr.to(tl.int64) + offsets).to(tl.pointer_type(tl.uint8))
-            dst = (dst_ptr.to(tl.int64) + offsets).to(tl.pointer_type(tl.uint8))
-            tl.store(dst, tl.load(src, mask=mask), mask=mask)
+        offsets = start + tl.arange(0, TILE)
+        mask = offsets < length
+        src = (src_ptr.to(tl.int64) + offsets).to(tl.pointer_type(tl.uint8))
+        dst = (dst_ptr.to(tl.int64) + offsets).to(tl.pointer_type(tl.uint8))
+        tl.store(dst, tl.load(src, mask=mask), mask=mask)
 
 else:
-    _copy_spans_kernel = None
+    _copy_tiles_kernel = None
 
 
 def launch_copy_descriptor(
-    descriptor: np.ndarray, widest: int, device: torch.device
+    descriptor: np.ndarray, plan: SegmentedCopyPlan, device: torch.device
 ) -> None:
     """Copy every span a descriptor names, in one launch.
 
-    The descriptor is one row per *span*, row-major so the whole thing crosses
-    in a single transfer, and the grid's second axis cuts each span into tiles
-    on the device. Cutting them on the host instead — which this did — makes
-    the descriptor as long as the tile count rather than the span count, and
-    that was almost the whole cost: a DeepSeek-V4 checkpoint image is 2,632
-    tiles against 135 spans, and describing it took 0.60 ms against 0.018 ms
-    of actually copying.
+    The descriptor is one row per span, row-major so the whole thing crosses
+    in a single transfer, and it may hold several copies back to back — every
+    op of a step goes out together.
 
-    The grid has to be as tall as the widest span, so where spans differ in
-    size most programs find nothing to do — 94% of them on that same image,
-    whose spans run from 8 KiB to 1.4 MB. Measured before being believed: an
-    empty program is cheap enough that the trade is not close.
+    The grid is one program per tile that exists. It used to be rectangular,
+    `(spans, ceil(widest / TILE))`, which gives every span as many programs as
+    the *widest* one needs: on a DeepSeek-V4 image, whose spans run 8 KiB to
+    1.4 MB, that is 46,364 programs to do 2,631 tiles of work. One op could
+    afford the waste; a batch cannot, and this path now always batches. At 256
+    ops the rectangular grid measured 5.37 ms against 1.41 ms for this one,
+    with the kernel at 97% of the whole path's cost.
 
-    It does leave a residual cost per span, on the device rather than the
-    host. A PAGE unit's plane region is 1.4 MB whatever the source ranges look
-    like, so cutting the image finer adds grid rows without shortening them:
-    134 spans measured 0.042 ms an op against 363 spans at 0.076, about
-    0.15 us a span. That is a third of what describing one used to cost, and
-    it is what a prefix-sum grid would go after if a much finer image ever
-    made it worth the device-side search.
+    What makes the dense grid cheap is that the tiling is not a function of
+    the copy — the plan's spans are fixed, so `span_of_tile` and `tile_start`
+    are computed once and stay resident. No device-side search, and no
+    `widest` for a caller to get wrong: passing one too small used to truncate
+    every longer span silently, byte-correct on its prefix and stale on its
+    tail.
 
-    Pageable on purpose. A 3 KB transfer measured the same from pinned memory,
-    and pinning would make the descriptor's lifetime the caller's problem:
-    `.to()` from pageable memory stages synchronously, so the buffer is free
-    to be refilled the moment this returns.
+    Pageable on purpose. Measured at 804 KB — a 256-op batch — the transfer is
+    0.044 ms, 0.3% of the path; pinning it would buy that back and make the
+    buffer's lifetime the caller's problem.
     """
-    if descriptor.shape[0] == 0:
+    rows = descriptor.shape[0]
+    if rows == 0:
         return
-    if _copy_spans_kernel is None:
+    if _copy_tiles_kernel is None:
         raise RuntimeError("paged state copy requires Triton")
-    _copy_spans_kernel[(descriptor.shape[0], -(-widest // _TILE_BYTES))](
+    # Checked because this is where host arithmetic becomes device pointers:
+    # the kernel reads `descriptor` as a C-contiguous int64 (rows, 3) and
+    # indexes it by op, so a wrong shape or dtype is a wrong address rather
+    # than an error.
+    if descriptor.dtype != np.int64 or descriptor.ndim != 2:
+        raise ValueError("a copy descriptor must be a 2-D int64 array")
+    if descriptor.shape[1] != 3 or not descriptor.flags.c_contiguous:
+        raise ValueError("a copy descriptor must be C-contiguous with 3 columns")
+    if rows % plan.num_spans:
+        raise ValueError(
+            f"descriptor of {rows} rows is not a whole number of "
+            f"{plan.num_spans}-span copies"
+        )
+    span_of_tile, tile_start = plan.tiling_on(device)
+    _copy_tiles_kernel[(rows // plan.num_spans * plan.num_tiles,)](
         torch.from_numpy(descriptor).to(device),
-        TILE_BYTES=_TILE_BYTES,
-        num_warps=8,
+        span_of_tile,
+        tile_start,
+        N_TILES=plan.num_tiles,
+        N_SPANS=plan.num_spans,
+        TILE=_TILE_BYTES,
+        # Four warps, not more: this kernel is nothing but load and store, and
+        # its speed turns out to be set by the width of one lane's access,
+        # `TILE / (num_warps * 64)`. Sixteen bytes is the fast point -- a
+        # 128-bit access -- and three unrelated (TILE, warps) pairs that land
+        # on it measured within 0.5% of each other, while eight warps halves
+        # the width and costs 12%. Raising this to fill more of the machine
+        # makes it slower, so it is not a knob to turn up.
+        num_warps=4,
     )
