@@ -57,6 +57,10 @@ def _scheduler() -> LMCacheOffloadConnectorScheduler:
     sched.total_load_failures = 0
     sched.total_save_requests = 0
     sched.total_saved_tokens = 0
+    # Paged-KV saves for per-request-cache sequences: off in production because
+    # `_decide_load_after_alloc` refuses their load leg, kept on here so the
+    # save-path tests keep exercising the emission they are about.
+    sched._save_per_req_cache = True
     sched._config = SimpleNamespace()
     sched.kv_role = "offload"
     sched.block_size = 4
