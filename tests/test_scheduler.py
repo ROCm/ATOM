@@ -3,7 +3,6 @@
 
 
 import sys
-import threading
 import types
 from collections import deque
 from types import SimpleNamespace
@@ -20,7 +19,6 @@ from atom.kv_transfer.disaggregation.types import (
     SaveOperationId,
 )
 from atom.model_engine.scheduler import (
-    DecodeScheduler,
     ScheduledBatch,
     ScheduledBatchOutput,
     Scheduler,
@@ -88,20 +86,6 @@ class TestSchedulerAddQuery:
 
         scheduler._update_from_kv_xfer_finished(KVConnectorOutput(pending_work=False))
         assert scheduler.is_finished()
-
-    def test_decode_scheduler_deferred_offload_work_keeps_scheduler_alive(self):
-        scheduler = DecodeScheduler.__new__(DecodeScheduler)
-        scheduler.waiting = deque()
-        scheduler.running = deque()
-        scheduler.prefill_waiting = {}
-        scheduler.prefill_done = deque()
-        scheduler._rejected = []
-        scheduler._prefill_lock = threading.Lock()
-        scheduler.deferred_free_blocks = {17: SimpleNamespace(id=17)}
-
-        assert not scheduler.is_finished()
-        assert scheduler.has_requests()
-        assert scheduler.get_num_unfinished_requests() == 1
 
     @pytest.mark.parametrize("idle_case", ["no_requests", "no_result", "no_batch"])
     def test_decode_engine_core_advances_idle_kv_transfer_without_forward_batch(

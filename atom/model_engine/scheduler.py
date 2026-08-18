@@ -947,12 +947,7 @@ class Scheduler:
         self.waiting.append(seq)
 
     def extend(self, seqs: list[Sequence]):
-        seen: dict[object, Sequence] = {}
         for seq in seqs:
-            key = str(seq.id)
-            if key in seen:
-                raise ValueError(f"request ID {seq.id!r} is already active")
-            seen[key] = seq
             self._warn_if_unschedulable(seq)
         self.waiting.extend(seqs)
 
@@ -3029,42 +3024,30 @@ class DecodeScheduler(Scheduler):
             )
             struct.pack_into("I", self._cu_shm.buf, 0, 0)
 
-        # Protects the atomic prefill_waiting -> prefill_done transition:
-        # on_prefill_done is called from the background receive thread.
+        # Protects prefill_waiting and running: on_prefill_done is called
+        # from the _recv_prefill_done background thread.
         self._prefill_lock = threading.Lock()
         self.cu_fraction: float | None = None
 
     def is_finished(self) -> bool:
-        with self._prefill_lock:
-            has_prefill = bool(self.prefill_waiting or self.prefill_done)
         return (
             not self.waiting
+            and not self.prefill_waiting
             and not self.running
-            and not self._rejected
-            and not self.deferred_free_blocks
-            and not getattr(self, "_connector_pending_work", False)
-            and not has_prefill
+            and not self.prefill_done
         )
 
     def has_requests(self) -> bool:
-        with self._prefill_lock:
-            has_prefill = bool(self.prefill_waiting or self.prefill_done)
         return bool(
-            self.waiting
-            or self.running
-            or self.deferred_free_blocks
-            or getattr(self, "_connector_pending_work", False)
-            or has_prefill
+            self.waiting or self.prefill_waiting or self.running or self.prefill_done
         )
 
     def get_num_unfinished_requests(self) -> int:
-        with self._prefill_lock:
-            num_prefill = len(self.prefill_waiting) + len(self.prefill_done)
         return (
             len(self.waiting)
+            + len(self.prefill_waiting)
             + len(self.running)
-            + len(self.deferred_free_blocks)
-            + num_prefill
+            + len(self.prefill_done)
         )
 
     def allocate_waiting(self) -> list[Sequence]:
@@ -3077,13 +3060,14 @@ class DecodeScheduler(Scheduler):
         newly_allocated = []
         while self.waiting:
             seq = self.waiting[0]
-            if self.block_manager.can_allocate(seq) < 0:
-                logger.warning("Cannot allocate prefill")
-                break
-            self.block_manager.allocate(seq)
             with self._prefill_lock:
-                self.waiting.popleft()
-                self.prefill_waiting[seq.id] = seq
+                if self.block_manager.can_allocate(seq) < 0:
+                    logger.warning("Cannot allocate prefill")
+                    break
+                self.block_manager.allocate(seq)
+            self.waiting.popleft()
+
+            self.prefill_waiting[seq.id] = seq
             newly_allocated.append(seq)
         return newly_allocated
 
@@ -3098,13 +3082,12 @@ class DecodeScheduler(Scheduler):
         match the non-disagg postprocess state before the first decode step.
         """
 
-        with self._prefill_lock:
-            seq = self.prefill_waiting.pop(seq_id, None)
-            if seq is not None:
-                seq.num_cached_tokens = num_tokens_computed
-                seq.append_token(sampled_token_id)
-                seq.first_token_time = time.time()
-                self.prefill_done.append(seq)
+        seq = self.prefill_waiting.pop(seq_id, None)
+        if seq is not None:
+            seq.num_cached_tokens = num_tokens_computed
+            seq.append_token(sampled_token_id)
+            seq.first_token_time = time.time()
+            self.prefill_done.append(seq)
 
     def schedule(self):
         """Schedule decode-only batches.
@@ -3120,14 +3103,20 @@ class DecodeScheduler(Scheduler):
         self.block_manager.complete_previous_state_batch()
 
         prefill_finished = False
-        with self._prefill_lock:
-            while self.prefill_done:
-                seq = self.prefill_done.popleft()
-                seq.status = SequenceStatus.RUNNING
-                seq.type = SequenceType.DECODE
-                # The sampled prefill token was appended by on_prefill_done.
-                self.running.append(seq)
-                prefill_finished = True
+        while self.prefill_done:
+            seq = self.prefill_done.popleft()
+            seq.status = SequenceStatus.RUNNING
+            seq.type = SequenceType.DECODE
+            # Append the first generated token sampled by the prefill process.
+            # In non-disagg mode, Scheduler.postprocess() does this after the
+            # prefill forward (is_deferred_out=True always appends one placeholder
+            # that is later overwritten with the real token from the async queue).
+            # In disagg mode the prefill process ran sampling and sent us the real
+            # token; appending it here puts num_tokens, context_lens, and
+            # slot_mapping in the same state as non-disagg before the first decode
+            # step.
+            self.running.append(seq)
+            prefill_finished = True
 
         if not self.running:
             self.cu_fraction = None
@@ -3139,33 +3128,27 @@ class DecodeScheduler(Scheduler):
         num_scheduled_tokens: list[int] = []
         scheduled_spec_decode_tokens: dict[int, np.ndarray] = {}
 
-        while self.running and len(scheduled_seqs) < self.max_num_seqs:
-            seq = self.running.popleft()
-            # logger.warning("decode state: waiting=%d prefill_waiting=%d prefill_done=%d running=%d free_blocks=%d",
-            #     len(self.waiting), len(self.prefill_waiting), len(self.prefill_done),
-            #     len(self.running), self.block_manager.kv.num_free)
-            blocked_by_pinned_save = False
-            preempted_current = False
-            while not self.block_manager.can_append(seq, self.mtp_k + 1):
-                logger.warning("Cannot allocate")
-                if self._preempt_one_running():
-                    continue
-                if self.preempt(seq):
-                    preempted_current = True
-                    break
-                self.running.appendleft(seq)
-                blocked_by_pinned_save = True
-                break
-            if blocked_by_pinned_save:
-                break
-            if not preempted_current:
-                if seq.spec_token_ids.size > 0:
-                    scheduled_spec_decode_tokens[seq.id] = seq.spec_token_ids
-                num_new_tokens = self.mtp_k + 1
-                self.block_manager.may_append(seq, num_new_tokens)
-                scheduled_seqs[seq.id] = seq
-                seq.type = SequenceType.DECODE
-                num_scheduled_tokens.append(num_new_tokens)
+        with self._prefill_lock:
+            while self.running and len(scheduled_seqs) < self.max_num_seqs:
+                seq = self.running.popleft()
+                # logger.warning("decode state: waiting=%d prefill_waiting=%d prefill_done=%d running=%d free_blocks=%d",
+                #     len(self.waiting), len(self.prefill_waiting), len(self.prefill_done),
+                #     len(self.running), self.block_manager.kv.num_free)
+                while not self.block_manager.can_append(seq, self.mtp_k + 1):
+                    logger.warning("Cannot allocate")
+                    if self.running:
+                        self.preempt(self.running.pop())
+                    else:
+                        self.preempt(seq)
+                        break
+                else:
+                    if seq.spec_token_ids.size > 0:
+                        scheduled_spec_decode_tokens[seq.id] = seq.spec_token_ids
+                    num_new_tokens = self.mtp_k + 1
+                    self.block_manager.may_append(seq, num_new_tokens)
+                    scheduled_seqs[seq.id] = seq
+                    seq.type = SequenceType.DECODE
+                    num_scheduled_tokens.append(num_new_tokens)
 
         if not scheduled_seqs:
             self.cu_fraction = None
@@ -3184,9 +3167,7 @@ class DecodeScheduler(Scheduler):
         if self._cu_shm is not None:
             struct.pack_into("I", self._cu_shm.buf, 0, total_tokens_num_decode)
             if prefill_finished:
-                with self._prefill_lock:
-                    waiting_snapshot = tuple(self.prefill_waiting.values())
-                pwait = sum(seq.num_tokens for seq in waiting_snapshot)
+                pwait = sum(seq.num_tokens for seq in self.prefill_waiting.values())
                 self.cu_fraction = _optimal_cu_fraction(total_tokens_num_decode, pwait)
 
         return (
