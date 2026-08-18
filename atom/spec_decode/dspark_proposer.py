@@ -6,6 +6,7 @@ from torch.profiler import record_function
 
 from atom.spec_decode.drafter import AuxCaptureSpec, Drafter
 from atom.spec_decode.dspark_verify import VerifyScheduler
+from atom.utils import envs
 from atom.utils.block_convert import kv_indices_generate_triton
 from atom.utils.forward_context import get_forward_context
 
@@ -142,8 +143,20 @@ class DSparkProposer(Drafter):
     def _build_draft_model(self, model_class) -> nn.Module:
         if not self._with_draft:
             # V4: the draft is part of the target checkpoint and shares its
-            # config wholesale.
-            return model_class(self.config)
+            # config wholesale, so it inherits the target's compilation level
+            # and its `_DSparkInner` is compiled (see deepseek_v4_dspark.py).
+            model = model_class(self.config)
+            if envs.ATOM_DSPARK_DISABLE_COMPILE:
+                # Flip the decorator's own bypass rather than handing the draft a
+                # cloned config with NO_COMPILATION (what the with-draft branch
+                # below does). A cloned compilation_config would no longer be the
+                # object get_current_atom_config() returns, splitting the shared
+                # static_forward_context registry. This flag is read at the top of
+                # the decorator's __call__ (decorators.py:505), so it degrades to
+                # a plain self.forward(...) with no other side effects.
+                model.model.do_not_compile = True
+                logger.info("DSpark draft: torch.compile disabled by env.")
+            return model
 
         # Standalone draft: build from the DRAFT's own hf_config, exactly as
         # EagleProposer does for eagle3. Shallow-copy rather than deepcopy --
@@ -410,7 +423,8 @@ class DSparkProposer(Drafter):
 
         # Anchor token x0 per request = the just-verified target token, located
         # at last_token_indices in the flat batch.
-        anchor_ids = next_token_ids
+        # Seatbelt: markov_w1 is a raw nn.Embedding, so a -1 anchor traps it.
+        anchor_ids = next_token_ids.clamp(0, int(self.model.vocab_size) - 1)
         anchor_positions = torch.index_select(target_positions, 0, last_token_indices)
 
         if self._with_draft:

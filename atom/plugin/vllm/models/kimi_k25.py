@@ -1,18 +1,22 @@
-from typing import Any, Iterable, Optional, Union
+from collections.abc import Iterable
+from typing import Any, ClassVar
 
 import torch
 from aiter.dist.parallel_state import get_pp_group
 from torch import nn
 from vllm.model_executor.models.kimi_k25 import (
     KimiK25DummyInputsBuilder,
-    KimiK25ForConditionalGeneration as vLLMKimiK25,
     KimiK25MultiModalProcessor,
     KimiK25ProcessingInfo,
+)
+from vllm.model_executor.models.kimi_k25 import (
+    KimiK25ForConditionalGeneration as vLLMKimiK25,
 )
 from vllm.model_executor.models.kimi_k25_vit import (
     KimiK25MultiModalProjector,
     MoonViT3dPretrainedModel,
 )
+from vllm.model_executor.models.vision import is_vit_use_data_parallel
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
 from atom.config import Config, QuantizationConfig
@@ -57,7 +61,7 @@ class KimiK25Model(DeepseekV2Model):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.alt_stream: Optional[torch.cuda.Stream] = None
+        self.alt_stream: torch.cuda.Stream | None = None
         if getattr(config, "n_shared_experts", None) is not None:
             self.alt_stream = torch.cuda.Stream()
 
@@ -86,7 +90,7 @@ class KimiK25Model(DeepseekV2Model):
             )
         else:
             self.norm = PPMissingLayer()
-        self.aux_hidden_state_layers: tuple[int, ...] = tuple()
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
@@ -131,9 +135,9 @@ class KimiK25ForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, IntermediateTensors]:
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors:
         hidden_states = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
@@ -142,7 +146,7 @@ class KimiK25ForCausalLM(nn.Module):
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         logits = self.lm_head(hidden_states)
         return logits
 
@@ -181,13 +185,13 @@ class KimiK25ForCausalLM(nn.Module):
     dummy_inputs=KimiK25DummyInputsBuilder,
 )
 class KimiK25ForConditionalGeneration_(vLLMKimiK25):
-    packed_modules_mapping: dict[str, tuple[str, int]] = {
+    packed_modules_mapping: ClassVar[dict[str, tuple[str, int]]] = {
         "q_a_proj": ("fused_qkv_a_proj", 0),
         "kv_a_proj_with_mqa": ("fused_qkv_a_proj", 1),
         "gate_proj": ("gate_up_proj", 0),
         "up_proj": ("gate_up_proj", 1),
     }
-    quant_exclude_name_mapping = {
+    quant_exclude_name_mapping: ClassVar[dict[str, str]] = {
         "language_model.model.": "model.language_model.model.",
         "language_model.lm_head": "model.language_model.lm_head",
     }
@@ -221,7 +225,9 @@ class KimiK25ForConditionalGeneration_(vLLMKimiK25):
 
         self.config = config
         self.multimodal_config = multimodal_config
-        self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
+        self.use_data_parallel = is_vit_use_data_parallel(
+            config.vision_config.num_attention_heads
+        )
         self.video_pruning_rate = multimodal_config.video_pruning_rate
         self.is_multimodal_pruning_enabled = (
             multimodal_config.is_multimodal_pruning_enabled()

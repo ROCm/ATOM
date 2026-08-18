@@ -263,6 +263,19 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 dtype=torch.int32,
                 device=self.device,
             )
+            # DCP sparse decode compacts each rank's owned top-k slots to the
+            # front (no -1 holes), so the per-request region length becomes data-
+            # AND layer-dependent.
+            self._dcp_sparse_kv_indptr_gpu = torch.zeros(
+                self.max_num_batched_tokens + 1,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self._dcp_owned_counts_gpu = torch.zeros(
+                self.max_num_batched_tokens,
+                dtype=torch.int32,
+                device=self.device,
+            )
             (
                 (spp_wmd_size, spp_wmd_type),
                 (spp_wi_size, spp_wi_type),
@@ -386,11 +399,16 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         if self.is_sparse:
             sfc = config.compilation_config.static_forward_context
             for module in sfc.values():
-                if hasattr(module, "sparse_kv_indices_buffer"):
-                    module.sparse_kv_indices_buffer = self._sparse_kv_indices_gpu
                 impl = getattr(module, "impl", None)
-                if impl is not None and hasattr(impl, "sparse_kv_indices_buffer"):
-                    impl.sparse_kv_indices_buffer = self._sparse_kv_indices_gpu
+                # DCP compact buffers ride along with the indices buffer: the
+                # indexer writes all three, the attention impl reads the indices
+                # and the offsets in the same layer.
+                for tgt in (module, impl):
+                    if tgt is None or not hasattr(tgt, "sparse_kv_indices_buffer"):
+                        continue
+                    tgt.sparse_kv_indices_buffer = self._sparse_kv_indices_gpu
+                    tgt.dcp_sparse_kv_indptr_buffer = self._dcp_sparse_kv_indptr_gpu
+                    tgt.dcp_owned_counts_buffer = self._dcp_owned_counts_gpu
             self._token_to_seq_idxs_gpu = torch.zeros(
                 self.max_num_batched_tokens,
                 dtype=torch.int32,
@@ -954,6 +972,58 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             num_blocks=runner.config.num_kvcache_blocks,
         )
 
+    def _build_dcp_indexer_prefill_meta(self, attn_metadata, bs: int, counts, var):
+        """Metadata for the DCP sparse-prefill indexer gather.
+
+        The indexer scores against the WHOLE sequence, but under DCP each rank's
+        index cache holds only the round-robin 1/W shard. The fix mirrors the
+        decode side: gather the local shard with *local* cu_seqlens, all-gather
+        it, then de-interleave back to global order.
+
+        Two products, both rank-independent in shape so the all-gather is a plain
+        concat:
+
+        ``dcp_indexer_local_cu_seqlens``
+            cumsum of ``Lpad[b] = ceil(g_b / W)`` -- the per-sequence local length
+            PADDED to the max over ranks, so every rank gathers the same count.
+            Reading past a rank's real local length stays inside its allocated
+            blocks (``ceil(g/(bs*W))*bs >= ceil(g/W)``), so the padding slots read
+            uninitialized cache rather than out of bounds; they are dropped by the
+            de-interleave below.
+
+        ``dcp_indexer_gather_index``
+            output-position -> source index into the flattened all-gathered
+            ``[W, sum(Lpad)]`` buffer. Global sequence-local position ``p`` lives on
+            rank ``p % W`` at local index ``p // W``, hence
+            ``src = (p % W) * sum(Lpad) + cu_pad[b] + p // W``.
+        """
+        W = self.dcp_world_size
+        if attn_metadata.has_cached:
+            g_cu = var["cu_seqlens_k"].np[: bs + 1].astype(np.int64)
+        else:
+            g_cu = var["cu_seqlens_q"].np[: bs + 1].astype(np.int64)
+        g_lens = g_cu[1:] - g_cu[:bs]
+        del counts  # kept for signature symmetry with the caller's other helpers
+
+        lpad = (g_lens + W - 1) // W
+        cu_pad = np.zeros(bs + 1, dtype=np.int64)
+        np.cumsum(lpad, out=cu_pad[1:])
+        local_total = int(cu_pad[bs])
+        total_kv = int(g_cu[bs])
+
+        # Position within its sequence for every global KV token.
+        pos = np.arange(total_kv, dtype=np.int64) - np.repeat(g_cu[:bs], g_lens)
+        src = (pos % W) * local_total + np.repeat(cu_pad[:bs], g_lens) + pos // W
+
+        dev = self.device
+        attn_metadata.dcp_indexer_local_total = local_total
+        attn_metadata.dcp_indexer_local_cu_seqlens = torch.from_numpy(
+            cu_pad.astype(np.int32)
+        ).to(dev, non_blocking=True)
+        attn_metadata.dcp_indexer_gather_index = torch.from_numpy(
+            src.astype(np.int32)
+        ).to(dev, non_blocking=True)
+
     def prepare_prefill(self, batch: ScheduledBatch):
         attn_metadata, positions = CommonAttentionBuilder.prepare_prefill(self, batch)
         bs = batch.total_seqs_num_prefill
@@ -1021,6 +1091,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.sparse_kv_indptr = var["sparse_kv_indptr"].copy_to_gpu(
                 sum_scheduled_tokens + 1
             )
+            if self.dcp_world_size > 1:
+                self._build_dcp_indexer_prefill_meta(attn_metadata, bs, counts, var)
             get_mla_metadata_v1(
                 attn_metadata.sparse_cu_seqlens_q,
                 attn_metadata.sparse_kv_indptr,
