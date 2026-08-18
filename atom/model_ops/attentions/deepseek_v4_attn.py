@@ -3925,8 +3925,21 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         """Whether the dspark ragged verify-lengths must live in a fixed-address
         staging buffer instead of a fresh per-step `torch.as_tensor`.
 
-        A captured graph needs the fixed address; every eager consumer needs a
-        private per-step tensor. One buffer for both cost ~14pt of acceptance.
+        DP needs it: the AF-captured core bakes this tensor's pointer at
+        capture, `torch.as_tensor` reallocates per step, and the lengths feed a
+        cumsum -- one stale value shifts every later sequence's rows.
+
+        Off elsewhere because staging costs acceptance: tp8 AF_PIECEWISE is
+        49.9% staged vs 60% not, same tree, only this gate differing. DP pays
+        no such cost (58.9%); why the two differ is not understood.
+
+        TP is not proven safe, only lucky -- the pointer is frozen there too and
+        the caching allocator happens to reuse the block. If AF+TP ever shows
+        the DP symptom (coherent, then repeated tokens), look here first.
+
+        Not the `positions` zero-copy accuracy bug
+        (`V4AttnFfn.zero_copy_exclude`): separate cause, separate fix. 480ab939
+        conflated them once already.
         """
         cfg = self.model_runner.config
         mode = getattr(cfg.compilation_config, "cudagraph_mode", None)
@@ -3939,7 +3952,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     ) -> torch.Tensor:
         """Materialize the dspark ragged verify-lengths GPU tensor.
 
-        Fixed-address staging only where it is actually required (AF + DP)
+        Fixed-address staging only where correctness needs it (AF + DP); every
+        other path keeps the fresh per-step tensor, which is what the acceptance
+        rate wants. See `_dspark_ragged_lens_needs_staging`.
         """
         arr = arr.astype(np.int32, copy=False)
         if not self._dspark_ragged_lens_needs_staging():
