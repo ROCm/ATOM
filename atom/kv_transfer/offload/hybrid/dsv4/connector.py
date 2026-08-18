@@ -1777,13 +1777,6 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         self.kv_role = validated_kv_role(kvc)
         self._do_save = self.kv_role in ("offload", "kv_both", "kv_producer")
         self._do_load = self.kv_role in ("offload", "kv_both", "kv_consumer")
-        explicit_recap = kvc.get("recap_prefill_after_finalize")
-        hf_config = getattr(config, "hf_config", None)
-        self.recap_prefill_after_finalize = (
-            bool(getattr(hf_config, "compress_ratios", None))
-            if explicit_recap is None
-            else bool(explicit_recap)
-        )
         # LMCache storage and DSV4 geometry are required configuration.  Keep
         # them outside the optional lookup-client boundary, and pass raw values
         # to the strict profile builder so fractional geometry is not truncated.

@@ -1149,8 +1149,6 @@ class Scheduler:
                     break
                 if not seq.is_partial_prefill:
                     continue
-                if self._should_pause_partial_prefill_for_save(seq):
-                    continue
                 remaining = seq.num_tokens - seq.num_cached_tokens
                 if 0 < self.long_prefill_token_threshold < remaining:
                     remaining = self.long_prefill_token_threshold
@@ -1159,11 +1157,9 @@ class Scheduler:
                     remaining, budget_remaining, num_batched_tokens
                 )
                 if chunk:
-                    chunk = self._adjust_prefill_chunk_after_alloc(seq, chunk)
                     chunk = self._finalize_prefill_chunk(
                         seq, seq.num_cached_tokens, chunk
                     )
-                    chunk = self._recap_prefill_chunk_after_finalize(seq, chunk)
                 if chunk <= 0:
                     break
                 num_batched_tokens += chunk
@@ -1231,9 +1227,6 @@ class Scheduler:
             if offload_resume:
                 # Blocks already held from the pre-park allocate; only re-check
                 # the batch budget. No re-match / re-allocate / re-park.
-                if self._should_pause_partial_prefill_for_save(seq):
-                    self.waiting.appendleft(seq)
-                    break
                 num_new_tokens = seq.num_prompt_tokens - seq.num_cached_tokens
                 budget_remaining = self.max_num_batched_tokens - num_batched_tokens
                 chunk = self._prefill_chunk_for_budget(
@@ -1242,9 +1235,7 @@ class Scheduler:
                 if chunk is None:
                     self.waiting.appendleft(seq)
                     break
-                chunk = self._adjust_prefill_chunk_after_alloc(seq, chunk)
                 chunk = self._finalize_prefill_chunk(seq, seq.num_cached_tokens, chunk)
-                chunk = self._recap_prefill_chunk_after_finalize(seq, chunk)
                 self._assert_positive_prefill_chunk(
                     chunk, num_new_tokens, budget_remaining
                 )
@@ -1336,7 +1327,6 @@ class Scheduler:
 
             chunk = self._adjust_prefill_chunk_after_alloc(seq, chunk)
             chunk = self._finalize_prefill_chunk(seq, seq.num_cached_tokens, chunk)
-            chunk = self._recap_prefill_chunk_after_finalize(seq, chunk)
 
             self._assert_positive_prefill_chunk(chunk, num_new_tokens, budget_remaining)
             num_seqs_prefill, num_batched_tokens = self._schedule_prefill_seq(
@@ -1921,19 +1911,6 @@ class Scheduler:
             self.kv_connector, "adjust_prefill_chunk_after_alloc"
         ):
             return self.kv_connector.adjust_prefill_chunk_after_alloc(seq, chunk)
-        return chunk
-
-    def _should_pause_partial_prefill_for_save(self, seq: Sequence) -> bool:
-        callback = getattr(
-            self.kv_connector,
-            "should_pause_partial_prefill_for_save",
-            None,
-        )
-        return bool(callback(seq)) if callback is not None else False
-
-    def _recap_prefill_chunk_after_finalize(self, seq: Sequence, chunk: int) -> int:
-        if bool(getattr(self.kv_connector, "recap_prefill_after_finalize", False)):
-            return self._adjust_prefill_chunk_after_alloc(seq, chunk)
         return chunk
 
     def _is_preemptable(self, seq: Sequence) -> bool:

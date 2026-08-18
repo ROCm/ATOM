@@ -83,8 +83,6 @@ def test_scheduler_shell_selects_family(monkeypatch):
     assert isinstance(hybrid._impl, DSV4OffloadScheduler)
     assert isinstance(dense._impl, DenseOffloadScheduler)
     assert hybrid.is_offload and not hybrid.is_producer
-    assert hybrid.recap_prefill_after_finalize is True
-    assert dense.recap_prefill_after_finalize is False
     assert hybrid.completion_channels == _HYBRID_COMPLETION_CHANNELS
     assert dense.completion_channels == frozenset()
 

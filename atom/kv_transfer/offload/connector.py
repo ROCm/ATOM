@@ -103,9 +103,6 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
 
     def __init__(self, config) -> None:
         self._impl = _build_scheduler(config)
-        self.recap_prefill_after_finalize = bool(
-            getattr(self._impl, "recap_prefill_after_finalize", False)
-        )
 
     @property
     def completion_channels(self) -> frozenset[str]:
@@ -141,10 +138,6 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
 
     def should_park_partial_prefill_for_load(self, seq) -> bool:
         callback = getattr(self._impl, "should_park_partial_prefill_for_load", None)
-        return callback(seq) if callback is not None else False
-
-    def should_pause_partial_prefill_for_save(self, seq) -> bool:
-        callback = getattr(self._impl, "should_pause_partial_prefill_for_save", None)
         return callback(seq) if callback is not None else False
 
     def cancel_pending_load(self, seq) -> None:
