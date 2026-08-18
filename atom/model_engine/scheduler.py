@@ -346,7 +346,7 @@ class EngineStats:
     # ══ throughput section ═══════════════════════════════════════════════
 
     def update_throughput(
-        self, num_prompt_tokens: int, num_generation_tokens: int
+        self, num_prompt_tokens: int = 0, num_generation_tokens: int = 0
     ) -> None:
         if not self.throughput_enabled:
             return
@@ -1634,7 +1634,7 @@ class Scheduler:
             ),
         )
         self._consume_state_forks(scheduled_seqs)
-        self._record_throughput(num_generation_tokens=total_tokens_num_decode)
+        self._record_throughput()
         return (decode_batch, scheduled_seqs)
 
     @staticmethod
@@ -2137,6 +2137,7 @@ class Scheduler:
 
         finished_seqs = []
         stream_outputs = []
+        num_new_generation_tokens = 0
 
         need_placeholder = is_deferred_out or self.use_spec
         num_placeholder = self.mtp_k
@@ -2199,6 +2200,7 @@ class Scheduler:
                 seq.prefix_hashes_published = True
             token_ids = prev_token_ids[idx]
             num_new_token = len(token_ids)
+            num_new_generation_tokens += num_new_token
             token_logprob = None
             if token_logprobs is not None and seq.return_logprobs:
                 token_logprob = token_logprobs.get(seq.id)
@@ -2461,6 +2463,10 @@ class Scheduler:
             else:
                 self.block_manager.deallocate(seq)
             self.running.remove(seq)
+
+        self.engine_stats.update_throughput(
+            num_generation_tokens=num_new_generation_tokens
+        )
         return finished_seqs
 
     def compute_detailed_aggregates(
@@ -3095,6 +3101,8 @@ class DecodeScheduler(Scheduler):
             self.cu_fraction = None
             if self._cu_shm is not None:
                 struct.pack_into("I", self._cu_shm.buf, 0, 0)
+            # Idle tick: still tick the 10s engine-status cadence.
+            self._record_throughput()
             return None
 
         scheduled_seqs: dict[int, Sequence] = {}
@@ -3127,6 +3135,8 @@ class DecodeScheduler(Scheduler):
             self.cu_fraction = None
             if self._cu_shm is not None:
                 struct.pack_into("I", self._cu_shm.buf, 0, 0)
+            # Nothing schedulable this tick: still tick the 10s cadence.
+            self._record_throughput()
             return None
 
         self.running.extendleft(reversed(scheduled_seqs.values()))
@@ -3143,6 +3153,7 @@ class DecodeScheduler(Scheduler):
                 pwait = sum(seq.num_tokens for seq in self.prefill_waiting.values())
                 self.cu_fraction = _optimal_cu_fraction(total_tokens_num_decode, pwait)
 
+        self._record_throughput()
         return (
             ScheduledBatch(
                 seqs=scheduled_seqs,

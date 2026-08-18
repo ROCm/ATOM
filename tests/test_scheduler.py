@@ -977,6 +977,21 @@ class TestPostprocess:
         assert 10 in seq.token_ids
         assert finished == []
 
+    def test_generation_counted_from_committed_not_scheduled(self, seq_factory):
+        """Throughput's generation count comes from postprocess (the tokens
+        actually committed), not from schedule()'s scheduled draft count —
+        aligning with vLLM's `len(output.new_token_ids)`."""
+        sched = Scheduler(MockConfig(enable_log_stats=True))
+        sp = SamplingParams(ignore_eos=True, max_tokens=100)
+        seq = seq_factory([1, 2, 3, 4], sampling_params=sp)
+        sched.add(seq)
+        sched.schedule()
+        # schedule() does not feed generation tokens anymore.
+        assert sched.engine_stats.num_generation_tokens == 0
+        # Two committed tokens this step → generation count bumps by exactly 2.
+        sched.postprocess(list(sched.running), self._output(seq.id, [10, 11]))
+        assert sched.engine_stats.num_generation_tokens == 2
+
     def test_eos_finishes(self, scheduler, seq_factory):
         seq = self._prefill(scheduler, seq_factory([1, 2, 3, 4]))
         finished = scheduler.postprocess(
