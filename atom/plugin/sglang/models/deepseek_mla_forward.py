@@ -65,7 +65,7 @@ except ImportError:
 from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
 )
-from sglang.srt.layers.quantization.fp8_kernel import (
+from sglang.kernels.ops.quantization.fp8_kernel import (
     per_tensor_quant_mla_fp8,
     per_token_group_quant_mla_deep_gemm_masked_fp8,
 )
@@ -486,7 +486,7 @@ def _concat_mha_k_for_non_absorbed(
     )
 
     try:
-        from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
+        from sglang.kernels.ops.attention.utils import concat_and_cast_mha_k_triton
     except ImportError as exc:
         logger.warning(
             "Unable to import concat_and_cast_mha_k_triton; "
