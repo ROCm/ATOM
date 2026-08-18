@@ -3763,41 +3763,34 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         if max_q_len is None:
             max_q_len = 1 + self.max_spec_steps
         rectangle_tokens = bs * max_q_len
-        # Ragged capture (zero-copy-q): each seq gets base=nt//bs tokens, the
-        # first rem=nt%bs seqs get base+1 (as-uniform-as-possible, remainder on
-        # the head). Falls back to the uniform rectangle when num_tokens_pad is
-        # None or == the rectangle (byte-identical to the classic path).
-        _ragged_cap = (
-            num_tokens_pad is not None and int(num_tokens_pad) < rectangle_tokens
-        )
-        if _ragged_cap:
-            nt = int(num_tokens_pad)
-            assert bs <= nt <= rectangle_tokens, (
-                f"ragged capture needs bs<=num_tokens_pad<=bs*max_q_len; "
-                f"got bs={bs} nt={nt} max_q_len={max_q_len}"
-            )
-            base = nt // bs
-            rem = nt % bs
-            extend_lens_np = np.full(bs, base, dtype=np.int32)
-            extend_lens_np[:rem] += 1  # each seq len in [1, max_q_len]
-            total_tokens = nt
-        else:
-            extend_lens_np = np.full(bs, max_q_len, dtype=np.int32)
+        # Per-seq query lengths of the synthetic batch. One uniform rectangle by
+        # default; AF_PIECEWISE instead asks for a ragged batch summing to
+        # `num_tokens_pad`, so the graph's flat row count equals what the dense
+        # pieces write -- a zero-copy input is read at exactly the captured
+        # length, so a padded tail would be rows nobody wrote that step.
+        if num_tokens_pad is None or int(num_tokens_pad) >= rectangle_tokens:
             total_tokens = rectangle_tokens
-        win = self.window_size
+            extend_lens_np = np.full(bs, max_q_len, dtype=np.int32)
+        else:
+            total_tokens = int(num_tokens_pad)
+            assert total_tokens >= bs, (
+                f"ragged capture needs num_tokens_pad >= bs so every seq gets at "
+                f"least one token; got bs={bs} num_tokens_pad={total_tokens}"
+            )
+            # As even as possible, remainder on the head: every length is then in
+            # [1, max_q_len].
+            extend_lens_np = np.full(bs, total_tokens // bs, dtype=np.int32)
+            extend_lens_np[: total_tokens % bs] += 1
 
-        # Synthetic state: each seq has already produced `win` tokens; this fwd
-        # is `len_i` decode/draft steps per seq at positions [win, win+len_i).
-        # Hits is_pure_decode (start_pos > 0), exercising Phase B/C/E paths
-        # during capture. Positions are per-seq span-head anchored (like the
-        # ragged prepare_decode branch): token j of seq i -> win + j.
-        start_pos = win
-        # Built from extend_lens_np, so ragged and uniform share one path.
+        # Synthetic state: each seq has already produced `start_pos` tokens, and
+        # this fwd is its own len_i decode/draft steps from there. start_pos > 0
+        # hits is_pure_decode, exercising Phase B/C/E paths during capture.
+        start_pos = self.window_size
         cu_seqlens_q_np = np.zeros(bs + 1, dtype=np.int32)
         np.cumsum(extend_lens_np, out=cu_seqlens_q_np[1:])
-        # A token's position is start_pos + how far into its OWN seq it sits,
-        # i.e. flat index minus where that seq starts. Uniform lens: that
-        # difference is flat_idx % max_q_len, the classic rectangle.
+        # A token sits at start_pos + its offset within its OWN seq, i.e. flat
+        # index minus where that seq starts. Uniform lengths reduce that to
+        # flat_idx % max_q_len, the classic rectangle.
         batch_id_per_token = np.repeat(np.arange(bs, dtype=np.int32), extend_lens_np)
         flat_idx = np.arange(total_tokens, dtype=np.int64)
         seq_start = cu_seqlens_q_np[batch_id_per_token].astype(np.int64)
@@ -3831,9 +3824,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # invalidating the graph.
         state_slot_in_gpu = self._stage("v4_meta_state_slot_in", state_slot_np)
 
-        # Synthetic decode batch: start_pos = win > 0 and per-seq len_i tokens
-        # (ragged under zero-copy-q, else uniform max_q_len), so is_pure_decode
-        # is True by construction (capture replays the decode codepath).
+        # Synthetic decode batch: start_pos > 0 and per-seq len_i tokens (ragged
+        # under zero-copy-q, else uniform max_q_len), so is_pure_decode is True
+        # by construction (capture replays the decode codepath).
         attn_metadata = AttentionMetaData_DSV4(
             cu_seqlens_q=cu_seqlens_q_gpu,
             cu_seqlens_k=None,
@@ -3922,24 +3915,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     # ------------------------------------------------------------------ #
 
     def _dspark_ragged_lens_needs_staging(self) -> bool:
-        """Whether the dspark ragged verify-lengths must live in a fixed-address
-        staging buffer instead of a fresh per-step `torch.as_tensor`.
-
-        DP needs it: the AF-captured core bakes this tensor's pointer at
-        capture, `torch.as_tensor` reallocates per step, and the lengths feed a
-        cumsum -- one stale value shifts every later sequence's rows.
-
-        Off elsewhere because staging costs acceptance: tp8 AF_PIECEWISE is
-        49.9% staged vs 60% not, same tree, only this gate differing. DP pays
-        no such cost (58.9%); why the two differ is not understood.
-
-        TP is not proven safe, only lucky -- the pointer is frozen there too and
-        the caching allocator happens to reuse the block. If AF+TP ever shows
-        the DP symptom (coherent, then repeated tokens), look here first.
-
-        Not the `positions` zero-copy accuracy bug
-        (`V4AttnFfn.zero_copy_exclude`): separate cause, separate fix. 480ab939
-        conflated them once already.
+        """Fixed-address staging for the dspark ragged verify-lengths: AF+DP needs
+        the baked pointer, everywhere else it costs acceptance (tp8 49.9% vs 60%).
         """
         cfg = self.model_runner.config
         mode = getattr(cfg.compilation_config, "cudagraph_mode", None)
