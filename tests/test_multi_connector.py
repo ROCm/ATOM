@@ -13,6 +13,9 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
+from atom.kv_transfer.disaggregation.multi import multi_connector as mc_module
 from atom.kv_transfer.disaggregation.multi.multi_connector import (
     MultiConnector,
     MultiConnectorMetadata,
@@ -378,3 +381,26 @@ def test_non_head_pp_stage_does_not_pair():
     out = w.get_finished()
     assert out.finished_saving == {9}
     assert out.finished_sending == set()
+
+
+@pytest.mark.parametrize("pp_rank, holds_send", [(0, True), (1, False)])
+def test_real_constructor_populates_the_pairing_state(monkeypatch, pp_rank, holds_send):
+    # _worker() builds the instance with __new__ and hand-sets its fields, so
+    # it drifts silently whenever __init__ grows one. Drive the real
+    # constructor instead: a field it forgets fails here, not on a GPU node.
+    moriio = FakeWorkerSub(
+        is_producer=True, finished=KVConnectorOutput(finished_sending={9})
+    )
+    off = FakeWorkerSub()
+    monkeypatch.setattr(
+        mc_module, "_build_subconnectors", lambda config, role: [moriio, off]
+    )
+
+    w = MultiConnector(
+        SimpleNamespace(parallel_config=SimpleNamespace(pipeline_parallel_rank=pp_rank))
+    )
+    assert w._pp_is_head is (pp_rank == 0)
+
+    w.start_load_kv(MultiConnectorMetadata([ConnectorMetadata(), _save_meta(9)]))
+    out = w.get_finished()
+    assert out.finished_sending == (set() if holds_send else {9})
