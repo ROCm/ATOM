@@ -374,7 +374,7 @@ def test_zero_copy_names_resolve_by_name_not_position():
         assert "postions" in str(e)
 
 
-def test_v4_core_inputs_come_from_the_signature_and_are_all_zero_copy():
+def test_v4_core_inputs_come_from_the_signature_and_exclude_positions():
     # There is no second declaration to drift from any more: the inputs and
     # their order ARE core's parameter list. Pin the resolved contract instead,
     # since the runner expands staged inputs by it.
@@ -403,9 +403,9 @@ def test_v4_core_inputs_come_from_the_signature_and_are_all_zero_copy():
 
     inst = V4AttnFfn.__new__(V4AttnFfn)
     V4AttnFfn.__init__(inst, layer=types.SimpleNamespace(), runner=None, enabled=False)
-    # positions included: its old exclusion was a stale dspark_ragged_lens_gpu
-    # (71a3e941), not positions itself.
-    assert set(inst.zero_copy_names) == set(inst.input_names)
+    # positions is copied per step: capturing on it costs ~2pts of accuracy, and
+    # 71a3e941's ragged-lens staging does not substitute for the exclusion.
+    assert set(inst.zero_copy_names) == set(inst.input_names) - {"positions"}
 
 
 def test_core_with_var_kwargs_is_rejected():

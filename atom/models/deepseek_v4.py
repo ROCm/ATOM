@@ -180,8 +180,13 @@ class V4AttnFfn(DecodeAttnFfnPiecewise):
     """V4's captured attention core. Owned by DeepseekV4Attention, not inherited
     by it -- the layer holds one of these and forwards to it."""
 
-    # Inputs come from `core` below; none excluded from zero-copy (`positions`
-    # was, until 71a3e941 fixed the stale ragged lens that actually caused it).
+    # Inputs come from `core` below. `positions` is copied per step, not
+    # captured on: including it costs ~2pts of accuracy (cumulative padding-tail
+    # regression). 480ab939 folded it back in on the theory that 71a3e941's
+    # ragged-lens staging was the real cause; measurement says otherwise -- with
+    # the staging in place, excluding `positions` is still what restores
+    # accuracy, so the two are independent problems.
+    zero_copy_exclude = ("positions",)
     # Rows the buffers cover; longer steps (prefill) take the copy path.
     max_tokens = 512
 
