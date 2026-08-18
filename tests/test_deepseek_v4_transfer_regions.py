@@ -153,6 +153,8 @@ def _transfer_builder(
     builder.csa_rows_per_block = _CSA_ROWS_PER_BLOCK
     builder._index_row_bytes = _INDEX_ROW_BYTES
     builder.pool_geometry = geo
+    builder.compress_ratios = ratios
+    builder._checkpoint_range_cache = None
 
     if kv_dtype == "fp8":
         row_widths = [
@@ -177,7 +179,15 @@ def _transfer_builder(
     config = SimpleNamespace(
         kv_transfer_config=transfer_config or {},
         pipeline_parallel_size=pipeline_parallel_size,
+        kv_cache_block_size=256,
+        decode_context_parallel_size=1,
     )
+    # This fixture bypasses the builder constructor, so provide the minimal
+    # arena layout used by the checkpoint image planner. The transfer-region
+    # tests do not model compressor fields; their image consists of the live
+    # window rows in each KV plane.
+    builder._arena_planes = [[] for _ in row_widths]
+    builder.model_runner = SimpleNamespace(config=config)
     layout_id = "test.dsv4.unified-page-slot"
     state_runtime = StateRuntime(
         transfer=StateTransfer.copy(layout_id),
@@ -189,6 +199,7 @@ def _transfer_builder(
                 * builder._index_row_bytes
             ),
             slot_bytes=sum(geo.slot_bytes(width) for width in row_widths),
+            image_bytes=builder.checkpoint_image_bytes(),
             layout_id=layout_id,
         ),
     )
