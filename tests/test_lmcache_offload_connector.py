@@ -1880,31 +1880,57 @@ def _state_tier_conn(pipeline_parallel_size: int = 1):
     return conn
 
 
-def _gpu_conn(staging_bytes: int):
-    return SimpleNamespace(_staged=object(), gpu_staging_buffer_bytes=staging_bytes)
+def _gpu_conn(staging_bytes: int, chunk_bytes: int = 512):
+    return SimpleNamespace(
+        _staged=object(),
+        gpu_staging_buffer_bytes=staging_bytes,
+        gpu_staging_chunk_bytes=chunk_bytes,
+        release_gpu_staging_after_transfer=False,
+        device=torch.device("cpu"),
+    )
 
 
 def _state_meta():
     return SimpleNamespace(model_name="m")
 
 
-def test_state_tier_is_refused_when_an_entry_exceeds_the_staging_buffer(
+def test_an_entry_larger_than_the_kv_buffer_gets_its_own_staging(
     monkeypatch, caplog
 ):
-    """`StagedTransfer.ensure_buffer` raises when nbytes > capacity, and
-    `_do_spill`'s broad except turns that into a warning plus a slot release --
-    so the tier would look healthy, burn a D2D copy per eviction, and store
-    nothing forever. Compare the two numbers at construction instead."""
+    """A state entry is one entry; the KV buffer is sized in LMCache chunks, and
+    at the shipped default of 2 chunks it is ~8 MiB against a ~55 MiB entry.
+
+    This used to refuse the tier, and that is a silent half-feature: the
+    engine-side index still exists, keeps handing out staging slots and
+    counting spills that never happen, and the only symptom is one line in a
+    100k-line log -- which is exactly how a c8 and a c10 measurement were taken
+    against a tier that was never running. Give the tier its own buffer of one
+    entry instead, on the thread that packs into it."""
     monkeypatch.setenv("OFFLOAD_STATE", "1")
     conn = _state_tier_conn()
     tt = SimpleNamespace(state_backend=_StateBackend(4096))
 
-    with caplog.at_level(logging.WARNING, logger="atom"):
+    with caplog.at_level(logging.INFO, logger="atom"):
         conn._maybe_build_state_tier(_gpu_conn(1024), tt, _state_meta(), 0, 1)
 
-    assert conn._state_tier is None
-    msg = caplog.text
-    assert "4096" in msg and "1024" in msg
+    assert conn._state_tier is not None
+    assert conn._state_tier.codec._staged.staging_buffer_bytes == 4096
+    # And it says how to make them share instead: 4096 / 512 = 8 chunks.
+    assert "OFFLOAD_GPU_STAGING_CHUNKS >= 8" in caplog.text
+
+
+def test_an_entry_that_fits_shares_the_kv_staging_buffer(monkeypatch):
+    """The other half: when it fits there is nothing to allocate, and sharing is
+    what keeps one bound configured in one place."""
+    monkeypatch.setenv("OFFLOAD_STATE", "1")
+    conn = _state_tier_conn()
+    gpu = _gpu_conn(4096)
+    tt = SimpleNamespace(state_backend=_StateBackend(1024))
+
+    conn._maybe_build_state_tier(gpu, tt, _state_meta(), 0, 1)
+
+    assert conn._state_tier is not None
+    assert conn._state_tier.codec._staged is gpu._staged
 
 
 def test_state_tier_is_built_when_an_entry_fits(monkeypatch):

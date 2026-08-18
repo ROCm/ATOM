@@ -271,27 +271,41 @@ class LMCacheOffloadConnector(KVConnectorBase):
         # spill into a warning plus a slot release -- a tier that looks healthy,
         # burns a D2D copy per eviction, and stores nothing, forever. Refuse to
         # build it instead, and name both numbers so the fix is obvious.
+        from atom.kv_transfer.offload.staged_transfer import StagedTransfer
+
         staging_bytes = int(getattr(gpu_connector, "gpu_staging_buffer_bytes", 0))
+        staged = gpu_connector._staged
         if entry_bytes > staging_bytes:
-            logger.warning(
-                "state offload: one state entry is %d bytes (%.2f MiB) but the "
-                "shared GPU staging buffer holds only %d bytes (%.2f MiB); "
-                "every spill would fail in StagedTransfer.ensure_buffer. The "
-                "tier stays off. Raise OFFLOAD_GPU_STAGING_CHUNKS (or "
-                "OFFLOAD_GPU_STAGING_MAX_BYTES) until the buffer covers one "
-                "entry, or unset OFFLOAD_STATE.",
-                entry_bytes,
+            # A state entry is one *entry*; the KV buffer is sized in LMCache
+            # chunks, and at the shipped default of 2 chunks it is ~8 MiB
+            # against a 55 MiB entry. This used to refuse the tier, which is
+            # the worst of the three options: the engine-side index still
+            # exists, so it keeps handing out staging slots and counting spills
+            # that never happen, and the only symptom is this line in a
+            # 100k-line log. Growing the shared buffer is the other, and it
+            # charges every KV worker thread for a size only the state thread
+            # needs. So the tier gets its own, of exactly one entry, on the
+            # `lmc-state` thread that packs into it.
+            logger.info(
+                "state offload: one state entry is %.2f MiB but the KV staging "
+                "buffer holds %.2f MiB, so the tier takes its own buffer of one "
+                "entry (one per rank). Set OFFLOAD_GPU_STAGING_CHUNKS >= %d to "
+                "have both share the KV buffer instead.",
                 entry_bytes / (1 << 20),
-                staging_bytes,
                 staging_bytes / (1 << 20),
+                -(-entry_bytes // max(1, gpu_connector.gpu_staging_chunk_bytes)),
             )
-            return
+            staged = StagedTransfer(
+                gpu_connector.device,
+                staging_buffer_bytes=entry_bytes,
+                release_after_transfer=gpu_connector.release_gpu_staging_after_transfer,
+            )
         from atom.kv_transfer.offload.state_object import StateByteCodec
         from atom.kv_transfer.offload.state_tier import StateOffloadTier
 
         codec = StateByteCodec(
             backend,
-            gpu_connector._staged,
+            staged,
             entry_bytes,
             model_name=meta.model_name,
             world_size=world,
