@@ -4,83 +4,8 @@
 from collections import deque
 from dataclasses import dataclass
 from heapq import heapify, heappop, heappush
-from math import inf
 
-# `StateTransfer.kind` values. Plain strings rather than an enum because the
-# choice crosses a process boundary inside a dict (ModelRunner's `block_info`),
-# where a scalar survives and a class does not.
-FORK = "fork"
-COPY = "copy"
-NONE = "none"
-
-
-@dataclass(frozen=True)
-class StateTransfer:
-    """How a backend hands one request's state over to another group.
-
-    Three answers, and every checkpoint decision downstream follows from which:
-
-      `none()`    no per-request state, or none that can be handed over at all.
-                  Nothing is ever checkpointed and prefix hits shrink to 0.
-      `fork(n)`   the state rolls. The owner gives its group to the index and
-                  takes a fresh one, reading the old and writing the new for
-                  exactly one forward — which has to leave the new group
-                  self-contained, and that takes `n` committed tokens.
-      `copy()`    one request's state is a contiguous byte range another group
-                  can be handed a duplicate of. Nothing is given away, so
-                  nothing downstream has to cooperate: no successor forward, and
-                  the resuming side is handed a duplicate too.
-
-    The two mechanisms are not interchangeable, and which one a backend can
-    offer decides where it may checkpoint. A fork's contract binds the *next*
-    forward, so it can only be taken where that forward is known to be long
-    enough — true on a prompt, false during generation, where a step commits
-    `1 + accepted_drafts` and acceptance is not knowable in advance. That is why
-    DeepSeek-V4 copies: it is the only way to checkpoint at a decode boundary.
-    See `/app/logs_claude/verify_v4_min_fork.py` for the arithmetic.
-
-    These used to be one integer, `min_fork_tokens`, with 0 spelling `none()` —
-    which is exactly the value `copy()` has to report, so the two were
-    indistinguishable. Splitting the kind out is what lets a backend say "no
-    successor needed" without saying "no state".
-    """
-
-    kind: str
-    fork_tokens: int = 0
-
-    @classmethod
-    def none(cls) -> "StateTransfer":
-        return cls(NONE)
-
-    @classmethod
-    def fork(cls, tokens: int) -> "StateTransfer":
-        assert tokens > 0, "a fork binds its successor forward; use none()"
-        return cls(FORK, tokens)
-
-    @classmethod
-    def copy(cls) -> "StateTransfer":
-        return cls(COPY)
-
-    @classmethod
-    def from_config(cls, kind: str, fork_tokens: int) -> "StateTransfer":
-        """Rebuild from the two scalars that crossed the process boundary."""
-        if kind == FORK:
-            return cls.fork(fork_tokens)
-        assert kind in (COPY, NONE), f"unknown state transfer kind {kind!r}"
-        return cls(kind)
-
-    @property
-    def copies(self) -> bool:
-        return self.kind == COPY
-
-    @property
-    def forks(self) -> bool:
-        return self.kind == FORK
-
-    @property
-    def successor_room(self) -> float:
-        """`StateCache.successor_room` for a class transferred this way."""
-        return inf if self.kind == NONE else float(self.fork_tokens)
+from atom.model_engine.state_runtime import StateTransfer
 
 
 @dataclass(frozen=True)
@@ -101,52 +26,7 @@ class GroupRetirement:
 
 
 class StateGroupPool:
-    """Per-request state groups, plus a content index over the free ones.
-
-    A *group* is what one request occupies in the pre-allocated state tensor:
-    `entries // entries_per_req` contiguous indices (GDN conv+ssm, the
-    DeepSeek-V4 compressor ring and sliding window). This pool owns the free
-    list, so it is the single answer to "can one more request be admitted".
-
-    A per-request state cannot be rebuilt from cached KV blocks: the cache holds
-    the compressor's *output*, the state is its rolling *input* window. So a
-    prefix-cache hit is only recoverable up to a boundary where somebody
-    checkpointed the state — which is what the index over the free list
-    answers.
-
-    Capacity model: a checkpoint is a group sitting on the free list with its
-    content still valid, filed under the content hash of the last block it
-    covers. This is the KV block pool's lazy-eviction model (`pop` drops the
-    hash at hand-out time, not at free time) applied to state groups. The index
-    therefore holds nothing back — `pop` invalidates whatever it hands out, so a
-    checkpoint can never shrink admission, and under full concurrency the
-    checkpoint set drains to empty on its own.
-
-    *How* a group reaches the index is the backend's `StateTransfer`, and it is
-    the only thing that differs between the two mechanisms this class runs:
-
-      `fork`  the owner gives its group away and takes a fresh one, so the
-              checkpoint costs no bytes but binds the very next forward, which
-              has to leave the replacement self-contained (`min_fork_tokens`).
-      `copy`  the state is a byte range, so a duplicate goes to the index and
-              the owner is not disturbed at all. Nothing is bound: no successor
-              forward, and the resuming side copies rather than forking too.
-
-    Both meet the same index and the same free list. Under `copy` the bytes are
-    moved by a forward, so this class only schedules the pairs (`take_copies`)
-    and the next batch issues them.
-
-    The count of groups is not fixed for life: `extend` and `retire_top` move it
-    when the state pool's share of the byte budget changes. Retiring is
-    index-forced but its cost is not — see `retire_top`.
-
-    Vocabulary: *checkpoint* is the state sense throughout — a boundary this
-    class kept resumable. *Publish* is reserved for a block entering the
-    content-addressed KV index (`BlockManager.hash_blocks`, the KV events).
-
-    `enabled` covers the *index* only. The free list stays live either way:
-    admission needs a group whether or not anything is ever checkpointed.
-    """
+    """Own Active Slot allocation and the fork-checkpoint index."""
 
     def __init__(
         self,
@@ -158,12 +38,12 @@ class StateGroupPool:
         self.enabled: bool = enabled and num_groups > 0
         self.num_groups: int = num_groups
         self.transfer: StateTransfer = transfer or StateTransfer.none()
-        # Committed tokens the forward after a fork must cover for the new group
-        # to come out self-contained. 0 under `copy`, where the destination is
-        # complete the moment the copy lands and no forward is involved.
+        # Committed tokens needed to make a fork destination self-contained.
         self.min_fork_tokens: int = self.transfer.fork_tokens
         self.successor_room: float = self.transfer.successor_room
         self.hash_block_size: int = hash_block_size
+        if self.transfer.copies:
+            raise ValueError("PAGE-copy checkpoints do not belong to StateGroupPool")
         # The free list, split by whether the group still carries content worth
         # something. Two containers rather than one queue because the two halves
         # want opposite orders and mixing them serves neither:
@@ -207,16 +87,7 @@ class StateGroupPool:
         # rather than a second count because the depth is only ever one pass
         # more — see `release_pins`.
         self._deferred: set[int] = set()
-        # `copy` only. Seqs whose last forward left their state on a boundary
-        # worth keeping. `take_copies` turns each into a copy pair when the next
-        # batch is built, which is the latest moment the owner is still known to
-        # hold the group being duplicated.
-        self._checkpoint_pending: list = []
-        # (src, dst) group pairs the next batch must copy before its forward.
-        # Both halves of the protocol feed this under `copy`: keeping a
-        # checkpoint copies the owner's state out, resuming from one copies it
-        # back in.
-        self._copies: list[tuple[int, int]] = []
+        self._relocations: list[tuple[int, int]] = []
         # `dropped` had no group to go to; `evicted` landed and was later
         # spent on an allocation. Counted apart because they read the same in a
         # hit rate and want opposite fixes — the first says the pool is too
@@ -442,9 +313,7 @@ class StateGroupPool:
         The fork test is what `min_fork_tokens` buys: resuming reads the
         checkpoint and writes a fresh group, and that forward has to leave the
         fresh group whole. A boundary too close to the end of the prompt fails
-        it and the scan keeps walking back. Under `copy` the resumer is handed
-        the bytes instead of reading across two groups, so `min_fork_tokens` is
-        0 and the test is vacuous — one expression covers both.
+        it and the scan keeps walking back.
 
         Without this a hit hands the resumed forward a group freshly popped off
         the free list and it reads the previous occupant's state.
@@ -457,13 +326,14 @@ class StateGroupPool:
             return hit
         hbs = self.hash_block_size
         for i in range(hit - 1, -1, -1):
-            if not assume_checkpointed and block_hashes[i] not in self.hash_to_group:
+            checkpointed = block_hashes[i] in self.hash_to_group
+            if not assume_checkpointed and not checkpointed:
                 continue
             if seq.num_tokens - (i + 1) * hbs >= self.min_fork_tokens:
                 return i + 1
         return 0
 
-    def lookup(self, h: int) -> int:
+    def lookup_group(self, h: int) -> int:
         """Group holding the checkpoint for hash `h`, or -1."""
         if not self.enabled:
             return -1
@@ -473,39 +343,12 @@ class StateGroupPool:
     def checkpoint(self, seq, boundary_blocks: int, h: int) -> None:
         """Keep `seq`'s state as of this boundary, filed under hash `h`.
 
-        Two mechanisms, chosen by the backend's `StateTransfer`:
-
-        `fork` — the group cannot be shared while its owner still writes it, so
-        the owner moves to a fresh group and the old one, never written again,
-        becomes the checkpoint. The next forward reads it and fills the
-        replacement, which is the whole reason `min_fork_tokens` gates the
-        position.
-
-        `copy` — the owner keeps writing where it is and a duplicate of its
-        state goes to the index instead. Only the intent is recorded here; the
-        destination group and the copy pair come from `take_copies` when the next
-        batch is built. Deferred because the bytes have to be moved by a forward, and
-        a checkpoint indexed before its bytes exist would hand a resuming
-        request whatever the destination happened to hold.
-
-        `boundary_blocks` is unused here: a group is a single entry, not a span
-        of them. It is in the protocol for classes whose checkpoint is a run of
-        entries ending at the boundary.
-
-        Best-effort under both: with no free group the seq simply keeps writing
-        its own and no checkpoint is taken.
+        The owner moves to a fresh group and the old group becomes read-only.
         """
-        if not self.applies(seq):
+        if not self.applies(seq) or not self.transfer.forks:
             return
         old = seq.per_req_cache_group
         if old < 0:
-            return
-        if self.transfer.copies:
-            if seq.pending_checkpoint == -1:
-                self._checkpoint_pending.append(seq)
-            # A later boundary supersedes an earlier one: the group holds the
-            # state as of the last forward, so only the last position is true.
-            seq.pending_checkpoint = h
             return
         if not self.has_free():
             self.checkpoints_dropped += 1
@@ -522,36 +365,6 @@ class StateGroupPool:
         self.pin(old, reader_is_next_batch=True)
         self.checkpoints_kept += 1
 
-    def _commit_pending(self) -> None:
-        """Turn the last step's checkpoint intents into copy pairs.
-
-        Each pending seq gets a destination group, which goes straight back on
-        the free list and into the index — the same capacity-neutral move
-        `checkpoint` makes under `fork`, covered by the same lazy eviction:
-        whoever pops the group next invalidates the hash on the way out.
-
-        A seq preempted or finished in between carries no group any more and is
-        skipped, so nothing is ever indexed over state that is gone. That check
-        is only sound because this runs with the batch already decided — see
-        `take_copies`.
-        """
-        if not self._checkpoint_pending:
-            return
-        for seq in self._checkpoint_pending:
-            h, seq.pending_checkpoint = seq.pending_checkpoint, -1
-            src = seq.per_req_cache_group
-            if h == -1 or src < 0:
-                continue
-            if not self.has_free():
-                self.checkpoints_dropped += 1
-                continue
-            dst = self.pop()
-            self.release(dst)
-            self._index(h, dst)
-            self._copies.append((src, dst))
-            self.checkpoints_kept += 1
-        self._checkpoint_pending.clear()
-
     def checkpoint_fates(self) -> dict[str, int]:
         """What became of the checkpoints the ladder asked this pool to keep."""
         return {
@@ -561,43 +374,13 @@ class StateGroupPool:
             "checkpoints_orphaned": self.checkpoints_orphaned,
         }
 
-    def record_copy(self, src: int, dst: int) -> None:
-        """Schedule a state copy for the next batch's forward to issue."""
-        self._copies.append((src, dst))
+    def record_relocation(self, src: int, dst: int) -> None:
+        """Schedule an Active Slot relocation for the next batch."""
+        self._relocations.append((src, dst))
 
-    def take_copies(self) -> list[tuple[int, int]]:
-        """Every copy the batch now being built must issue before its forward.
-
-        Called at the moment the batch is constructed, which is the whole point:
-        a checkpoint's source is the owner's live group, and it has to still be
-        that owner's when the copy runs. Committing earlier in the pass would
-        leave a window — an admission preempting that owner would return the
-        group to the free list, and the copy would then duplicate whatever the
-        next request wrote there into a group already indexed as a checkpoint.
-        Nothing runs between here and the batch, so the window is empty.
-
-        A checkpoint therefore becomes visible one pass later than the step that
-        formed it, and this pass's own admissions get first claim on the free
-        list. Both are the right way round: admission is throughput, a
-        checkpoint is speculative reuse.
-
-        The two kinds of pair cannot collide, so their order does not matter. A
-        resume source is a claimed or pinned checkpoint and a keeper source is a
-        live group; neither is on the free list, so `_commit_pending`'s `pop`
-        can return neither.
-        """
-        self._commit_pending()
-        copies, self._copies = self._copies, []
-        return copies
-
-    def forget_pending(self, seq) -> None:
-        """Drop `seq`'s uncommitted checkpoint — its group is being released.
-
-        The seq stays in `_checkpoint_pending` until the next commit, which
-        skips it on the cleared hash. Cheaper than removing it, and the list is
-        emptied every pass either way.
-        """
-        seq.pending_checkpoint = -1
+    def take_relocations(self) -> tuple[tuple[int, int], ...]:
+        relocations, self._relocations = self._relocations, []
+        return tuple(relocations)
 
     def _index(self, h: int, group: int) -> None:
         """File `group` as the checkpoint for hash `h`.
@@ -618,7 +401,7 @@ class StateGroupPool:
         if prev != -1 and prev != group:
             self._set_hash(prev, -1)
 
-    def unindex(self, h: int) -> int:
+    def unindex(self, h: int) -> None:
         """Drop the checkpoint filed under `h`. The dual of `_index`.
 
         Called when the KV block of that hash leaves the block index. The two
@@ -634,14 +417,17 @@ class StateGroupPool:
         it exact would have the state pool watch every block of every prefix,
         which costs more than the tail it would catch.
 
-        Returns the group freed, or -1.
         """
         group = self.hash_to_group.get(h, -1)
         if group < 0:
-            return -1
+            return
         self.invalidate(group)
         self.checkpoints_orphaned += 1
-        return group
+
+    def clear_index(self) -> None:
+        """Drop all checkpoint hashes, preserving only in-flight readers."""
+        for group in list(self.hash_to_group.values()):
+            self.invalidate(group)
 
     def invalidate(self, group: int) -> None:
         """Drop `group`'s checkpoint. Called when the group is handed out."""

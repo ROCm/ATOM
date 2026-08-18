@@ -480,56 +480,59 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         # assert not moe.use_flashinfer_cutlass_kernels, "Must be created in modelopt.py"
         if moe.use_mori_kernels:
             assert quant_config is not None
+
+            from atom.model_ops.fused_moe.mori_prepare_finalize import (
+                resolve_mori_dispatch,
+            )
+
+            # One branch decides the whole wire format: the dtype dispatch() will
+            # see (which is what selects the MoRI kernel), the pre-dispatch
+            # quantizer, and the staging scale geometry. Keeping these together is
+            # load-bearing -- a scale_dim/scale_type_size that disagrees with what
+            # prepare() sends makes MoRI stride the staging scale buffer wrong and
+            # walk off the end of it (GPU memory fault on the first real batch).
+            dispatch_format = resolve_mori_dispatch(
+                in_dtype=moe.in_dtype,
+                hidden_dim=moe.hidden_dim,
+                quant_config=quant_config,
+            )
+            mori_dtype = dispatch_format.dtype
+            scale_type_size = dispatch_format.scale_type_size
             # For PTPC (per token per channel) quant, the scale dim for each token is 1
             # For 1x128 quant, the scale dim for each token is hidden_dim // 128
-            scale_dim = 1 if quant_config.is_per_act_token else moe.hidden_dim // 128
-
-            # Check if quant_dtype is an FP8 type
-            from aiter import QuantType
-
-            fp8_dtypes = (
-                torch.float8_e4m3fn,
-                torch.float8_e4m3fnuz,
-                torch.float8_e5m2,
-                torch.float8_e5m2fnuz,
+            scale_dim = (
+                dispatch_format.scale_dim
+                if dispatch_format.is_fp4
+                else (1 if quant_config.is_per_act_token else moe.hidden_dim // 128)
             )
-            is_fp8 = quant_config.quant_dtype in fp8_dtypes
-            # For FP8: enable FP8 dispatch in Mori (quantize before communication)
-            # Note: per_Tensor quant doesn't support num_local_tokens, so we use per_Token
-            use_fp8_dispatch = is_fp8
-            quant_type = None
-            if use_fp8_dispatch:
-                if quant_config.is_block_quantized:
-                    quant_type = QuantType.per_1x128
-                elif quant_config.is_per_act_token:
-                    quant_type = QuantType.per_Token
+            # Combine-side codec, passed through aiter's all2all manager into the
+            # MoRI config. "none" (the MoRI default) sends bf16 back; "fp8_blockwise"
+            # selects EpCombineIntraNodeKernel_*_fp8bwq_*. Independent of the dispatch
+            # dtype above -- MoRI infers dispatch from the tensor, combine from this.
+            mori_combine_quant_type = envs.ATOM_MORI_COMBINE_QUANT
 
-            # For FP8: use FP8 dtype for communication
-            # For FP4/no quant: use bfloat16
-            # mori_dtype = (
-            #     quant_config.quant_dtype
-            #     if is_fp8 and quant_type is not None
-            #     else torch.bfloat16
-            # )
-            # mori_dtype = torch.bfloat16
-
-            all_to_all_args = dict(
-                rank=all2all_manager.rank,
-                num_ep_ranks=all2all_manager.world_size,
-                # quant_dtype=mori_dtype,
-                # We now use bfloat16 for mori
-                # TODO: To support quant
-                quant_dtype=moe.in_dtype,
-                token_hidden_size=moe.hidden_dim,
-                scale_dim=scale_dim,
-                scale_type_size=torch.float32.itemsize,
-                max_num_tokens_per_dp_rank=moe.max_num_tokens,
+            all_to_all_args = {
+                "rank": all2all_manager.rank,
+                "num_ep_ranks": all2all_manager.world_size,
+                # Must be dispatch_format.dtype: MoRI sizes its staging buffers
+                # from this and picks the kernel from the tensor prepare() sends.
+                "quant_dtype": mori_dtype,
+                "token_hidden_size": moe.hidden_dim,
+                "scale_dim": scale_dim,
+                "scale_type_size": scale_type_size,
+                "max_num_tokens_per_dp_rank": moe.max_num_tokens,
                 # input_dtype=moe.in_dtype,
-                input_dtype=moe.in_dtype,
-                num_local_experts=moe.num_experts // all2all_manager.world_size,
-                num_experts_per_token=moe.experts_per_token,
-                gpu_per_node=moe.moe_parallel_config.local_ep_size,
-            )
+                "input_dtype": moe.in_dtype,
+                "num_local_experts": moe.num_experts // all2all_manager.world_size,
+                "num_experts_per_token": moe.experts_per_token,
+                "gpu_per_node": moe.moe_parallel_config.local_ep_size,
+            }
+            if mori_combine_quant_type != "none":
+                # Only inject when actually requested: aiter's _make_all2all_kwargs
+                # takes fixed named params, so an unpatched aiter raises TypeError on
+                # an unexpected "quant_type" kwarg.
+                all_to_all_args["quant_type"] = mori_combine_quant_type
+
             from atom.utils.tbo.ubatching import tbo_enabled
 
             handle = all2all_manager.get_handle(all_to_all_args)
@@ -537,24 +540,22 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             atom_config = get_current_atom_config()
             low_latency = getattr(atom_config, "enable_low_latency", False)
 
-            # We not use quant for mori now
-            use_fp8_dispatch = False
-            quant_type = None
-
-            common_args = dict(
-                rank=all2all_manager.rank,
-                world_size=all2all_manager.world_size,
-                hidden_dim=moe.hidden_dim,
-                scale_dim=scale_dim,
+            common_args = {
+                "rank": all2all_manager.rank,
+                "world_size": all2all_manager.world_size,
+                "hidden_dim": moe.hidden_dim,
+                "scale_dim": scale_dim,
                 # Match max_num_tokens_per_dp_rank / max_tokens_per_rank (= moe.max_num_tokens);
                 # leaving this hardcoded 16384 truncates the TBO mori buffer at mbt>16384.
-                max_num_inp_token_per_rank=moe.max_num_tokens,
-                num_local_experts=moe.num_experts // all2all_manager.world_size,
-                num_experts_per_token=moe.experts_per_token,
-                gpu_per_node=moe.moe_parallel_config.local_ep_size,
-                data_type_itemsize=moe.in_dtype.itemsize,
-                max_token_type_size=moe.in_dtype.itemsize,
-            )
+                "max_num_inp_token_per_rank": moe.max_num_tokens,
+                "num_local_experts": moe.num_experts // all2all_manager.world_size,
+                "num_experts_per_token": moe.experts_per_token,
+                "gpu_per_node": moe.moe_parallel_config.local_ep_size,
+                "data_type_itemsize": moe.in_dtype.itemsize,
+                "max_token_type_size": moe.in_dtype.itemsize,
+                "scale_type_size": scale_type_size,
+                "quant_type": mori_combine_quant_type,
+            }
 
             tbo_mori_ops = None
             sync_handle = handle  # IntraNode handle for prefill (sync path)
@@ -577,8 +578,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 sync_handle,
                 max_tokens_per_rank=moe.max_num_tokens,
                 num_dispatchers=all2all_manager.world_size,
-                use_fp8_dispatch=use_fp8_dispatch,
-                quant_type=quant_type,
+                dispatch_format=dispatch_format,
                 is_async=is_async,
                 tbo_mori_ops=tbo_mori_ops,
                 low_latency=low_latency,
@@ -1042,6 +1042,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.w2_input_scale.max().to(torch.float32)
             )
 
+        self._process_weight_layout_after_loading(layer)
+
+    def _process_weight_layout_after_loading(self, layer) -> None:
         if self.use_triton:
             from atom.model_ops.fused_moe_triton import _swizzle_mxfp4
 
@@ -1533,6 +1536,80 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 out_e = out_e + shared_w2_bias[e]
             shared_out = out_e if shared_out is None else shared_out + out_e
         return shared_out
+
+
+class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
+    """MXFP4 MoE method backed by the fused FlyDSL MegaMoE pipeline."""
+
+    def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
+        super().__init__(quant_config, moe)
+        # Mega owns the weight layout and the complete routed-MoE execution.
+        # Standard Triton weight/forward paths must not preempt it.
+        self.use_triton = False
+        self.use_triton_decode = False
+
+    def _process_weight_layout_after_loading(self, layer) -> None:
+        from atom.model_ops.fused_moe.flydsl_mega_experts import build_mega_weights
+
+        build_mega_weights(layer)
+
+        # Mega reads only _mega_* weights. Release the raw AITER weight copies
+        # and skip the standard shuffle so both layouts are not retained.
+        layer.w13_weight.data = torch.empty(
+            0, dtype=layer.w13_weight.dtype, device=layer.w13_weight.device
+        )
+        layer.w2_weight.data = torch.empty(
+            0, dtype=layer.w2_weight.dtype, device=layer.w2_weight.device
+        )
+        logger.info("Prepared MegaMoE weights for fused MoE layer")
+
+    def init_prepare_finalize(self, layer: torch.nn.Module):
+        # Mega includes dispatch, both GEMMs, and combine, so it must not
+        # allocate the standard MORI prepare/finalize modular kernel. Instead it
+        # installs itself as the whole-pipeline `fused_experts` backend, so the
+        # post-routing tail of the inherited `apply` dispatches to it exactly the
+        # way it dispatches to the MORI modular kernel.
+        from atom.model_ops.fused_moe.flydsl_mega_experts import MegaFusedExperts
+
+        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+        self.fused_experts = MegaFusedExperts(
+            layer,
+            model_dim=self.hidden_size,
+            inter_dim=self.intermediate_size,
+            mtpr=self.moe.max_num_tokens,
+            quant="a8w4",
+        )
+
+    def get_eplb_weight_views(
+        self, layer: torch.nn.Module, num_local_experts: int
+    ) -> list[torch.Tensor]:
+        """Expose live Mega weights as expert-major aliases for EPLB."""
+        views: list[torch.Tensor] = []
+        for name in (
+            "_mega_w1",
+            "_mega_w1_scale",
+            "_mega_w2",
+            "_mega_w2_scale",
+        ):
+            tensor = getattr(layer, name, None)
+            if not isinstance(tensor, torch.Tensor):
+                raise TypeError(f"MegaMoE weight {name!r} was not prepared")
+            if not tensor.is_contiguous() or tensor.numel() % num_local_experts != 0:
+                raise RuntimeError(
+                    "MegaMoE EPLB weight must be contiguous and evenly divisible "
+                    f"by local experts: name={name!r}, shape={tuple(tensor.shape)}, "
+                    f"num_local_experts={num_local_experts}."
+                )
+            views.append(tensor.view(num_local_experts, -1))
+        return views
+
+
+def _make_mxfp4_moe_method(
+    quant_config: LayerQuantConfig, moe: FusedMoEConfig
+) -> Mxfp4MoEMethod:
+    if get_current_atom_config().moe_backend == "mega":
+        return MegaMxfp4MoEMethod(quant_config, moe)
+    return Mxfp4MoEMethod(quant_config, moe)
 
 
 # Refer to CompressedTensorsW8A8Fp8MoEMethod in vllm
@@ -2623,7 +2700,7 @@ class FusedMoE(torch.nn.Module):
         elif layer_quant_config.quant_dtype == dtypes.fp8:
             self.quant_method = Fp8MoEMethod(layer_quant_config, moe)
         elif layer_quant_config.quant_dtype == dtypes.fp4x2:
-            self.quant_method = Mxfp4MoEMethod(layer_quant_config, moe)
+            self.quant_method = _make_mxfp4_moe_method(layer_quant_config, moe)
         else:
             raise ValueError(
                 f"Unsupported quant dtype: {layer_quant_config.quant_dtype}"
@@ -2654,6 +2731,16 @@ class FusedMoE(torch.nn.Module):
 
     def process_weights_after_loading(self):
         self._online_quant()
+        self._validate_moe_backend()
+
+    def _validate_moe_backend(self) -> None:
+        if get_current_atom_config().moe_backend != "mega":
+            return
+        if not isinstance(self.quant_method, MegaMxfp4MoEMethod):
+            raise TypeError(
+                "moe_backend='mega' currently supports only MXFP4/A8W4 MoE, "
+                f"got {type(self.quant_method).__name__}"
+            )
 
     def _online_quant(self):
         """Handle online quantization: (optionally dequant →) quantize weights,
@@ -2753,7 +2840,9 @@ class FusedMoE(torch.nn.Module):
         if online_quant_dtype == dtypes.fp8:
             self.quant_method = Fp8MoEMethod(online_quant_config, self.moe_config)
         elif online_quant_dtype == dtypes.fp4x2:
-            self.quant_method = Mxfp4MoEMethod(online_quant_config, self.moe_config)
+            self.quant_method = _make_mxfp4_moe_method(
+                online_quant_config, self.moe_config
+            )
         else:
             raise ValueError(
                 f"Unsupported online quant_dtype for MoE: {online_quant_dtype}"

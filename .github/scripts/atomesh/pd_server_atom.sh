@@ -742,41 +742,6 @@ ensure_aiperf() {
   "${AIPERF_VENV}/bin/aiperf" --version
 }
 
-# Cumulative prefix-cache token counters of every prefill server on this run,
-# read out of their logs: ATOM has no metrics endpoint, so the scheduler's
-# periodic "[Cache Stats]" line is the only place these numbers surface.
-# Prints "<cached> <total>" summed across prefill ranks, or returns non-zero when
-# no rank has printed a line yet -- callers must treat that as "unknown", never
-# as a zero hit rate.
-prefill_cache_hit_totals() {
-  local log cached total line
-  local sum_cached=0 sum_total=0 found=0
-  shopt -s nullglob
-  local logs=("${RUNTIME_LOG_DIR}"/prefill-rank-*.log)
-  shopt -u nullglob
-  for log in "${logs[@]}"; do
-    # The cumulative line is "[Cache Stats         ]" and the per-interval one is
-    # "[Cache Stats Interval]". Both carry "Cached/Total:", so the space run after
-    # "Stats" is what separates them -- matching on "Cached/Total:" alone would
-    # pick up whichever of the two happened to be printed last.
-    # The trailing "|| true" is load-bearing under `set -e -o pipefail`: a log with
-    # no such line yet is the normal early state, not an error.
-    line="$(
-      grep -oE '\[Cache Stats +\] Reqs: [0-9]+, Cached/Total: [0-9]+/[0-9]+' "${log}" \
-        2>/dev/null | tail -n 1 || true
-    )"
-    [[ -n "${line}" ]] || continue
-    cached="${line##*: }"
-    cached="${cached%%/*}"
-    total="${line##*/}"
-    sum_cached=$((sum_cached + cached))
-    sum_total=$((sum_total + total))
-    found=1
-  done
-  (( found == 1 )) || return 1
-  printf '%s %s\n' "${sum_cached}" "${sum_total}"
-}
-
 write_aiperf_dashboard_json() {
   local aiperf_json="$1"
   local out_json="$2"
@@ -807,21 +772,23 @@ def pct(name, key):
     return None
 
 
-def cache_tokens(name):
-    """Prefill prefix-cache token count for this run, or None when unmeasured.
-
-    The caller leaves the variable empty when no prefill server printed a
-    "[Cache Stats]" line, which is not the same as a zero hit rate.
-    """
-    raw = os.environ.get(name, "")
-    return int(raw) if raw.isdigit() else None
+def total_tokens(name):
+    """Return one of AIPerf's profiling-only aggregate token counters."""
+    value = avg(name)
+    return int(value) if isinstance(value, (int, float)) else None
 
 
-cache_hit_tokens = cache_tokens("ATOMESH_CACHE_HIT_TOKENS")
-cache_total_tokens = cache_tokens("ATOMESH_CACHE_TOTAL_TOKENS")
+# These aggregates contain successful profiling records only: AIPerf excludes
+# its internal warmup and requests cancelled during grace-period draining.
+cache_hit_tokens = total_tokens("total_usage_prompt_cache_read_tokens")
+cache_total_tokens = total_tokens("total_usage_prompt_tokens")
 
 payload = {
     "benchmark_backend": "atom",
+    # Directory holding this run's profile_export.jsonl, so process_result.py can
+    # find the per-request records it needs for p90 e2e normalized interactivity
+    # without reconstructing the directory name.
+    "aiperf_artifact_dir": src.parent.name,
     "benchmark_model_name": os.environ.get("MODEL_NAME")
     or data.get("model")
     or data.get("model_id"),
@@ -871,6 +838,16 @@ payload = {
 
 payload = {key: value for key, value in payload.items() if value is not None}
 dst.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+if cache_hit_tokens is not None and cache_total_tokens:
+    print(
+        f"[aiperf] prefix cache hit: {cache_hit_tokens}/{cache_total_tokens} "
+        f"tokens ({cache_hit_tokens / cache_total_tokens:.2%})"
+    )
+else:
+    print(
+        "[aiperf] prefix cache hit: unavailable "
+        "(AIPerf profiling cache-read counters were not produced)"
+    )
 print(f"[aiperf] dashboard json: {dst}")
 PY
 }
@@ -911,12 +888,6 @@ run_aiperf_agentic_benchmark() {
 
     echo "[aiperf] ${result_file}"
     mkdir -p "${out_dir}"
-    # Snapshot the prefill cache counters around this concurrency only. They are
-    # cumulative per server process, and the same process also serves warmup, the
-    # other concurrencies in this loop, and (in single-phase runs) the eval
-    # workload, so only the delta belongs to this data point.
-    local cache_before cache_after
-    cache_before="$(prefill_cache_hit_totals || true)"
     AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT="${AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT}" \
     AIPERF_HTTP_TCP_USER_TIMEOUT="${AIPERF_HTTP_TCP_USER_TIMEOUT}" \
     AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES="${AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES}" \
@@ -956,31 +927,6 @@ run_aiperf_agentic_benchmark() {
     if [[ ! -f "${aiperf_json}" ]]; then
       echo "[aiperf][FAIL] ${aiperf_json} was not produced" >&2
       return 1
-    fi
-    cache_after="$(prefill_cache_hit_totals || true)"
-    export ATOMESH_CACHE_HIT_TOKENS="" ATOMESH_CACHE_TOTAL_TOKENS=""
-    if [[ -n "${cache_after}" ]]; then
-      # An absent "before" means no rank had printed a line yet, i.e. the counters
-      # started at zero for this window.
-      local before_cached=0 before_total=0 after_cached after_total
-      if [[ -n "${cache_before}" ]]; then
-        read -r before_cached before_total <<< "${cache_before}"
-      fi
-      read -r after_cached after_total <<< "${cache_after}"
-      local d_cached=$((after_cached - before_cached))
-      local d_total=$((after_total - before_total))
-      if (( d_total > 0 )); then
-        ATOMESH_CACHE_HIT_TOKENS="${d_cached}"
-        ATOMESH_CACHE_TOTAL_TOKENS="${d_total}"
-        echo "[aiperf] prefix cache hit: ${d_cached}/${d_total} tokens" \
-          "($((d_cached * 100 / d_total))%)"
-      fi
-    fi
-    if [[ -z "${ATOMESH_CACHE_TOTAL_TOKENS}" ]]; then
-      # Counters only advance every 100 prefill admissions and are never flushed
-      # on shutdown, so a short run legitimately produces nothing to report.
-      echo "[aiperf] prefix cache hit: unavailable (no [Cache Stats] line covering" \
-        "this run; prefix caching off, or fewer than 100 prefill requests)"
     fi
     write_aiperf_dashboard_json "${aiperf_json}" "${dashboard_json}" "${conc}"
   done
