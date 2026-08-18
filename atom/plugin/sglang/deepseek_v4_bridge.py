@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from types import SimpleNamespace
 from typing import Any
 
@@ -663,12 +664,22 @@ def install_deepseek_v4_proxy_pool_patch() -> None:
     """
 
     import sglang.srt.mem_cache.deepseek_v4_memory_pool as dsv4_pool
-    import sglang.srt.model_executor.model_runner_kv_cache_mixin as mixin
 
-    if getattr(mixin, "DeepSeekV4TokenToKVPool", None) is ATOMDeepSeekV4ProxyKVPool:
+    original_pool_cls = getattr(dsv4_pool, "DeepSeekV4TokenToKVPool", None)
+    if original_pool_cls is None:
+        raise RuntimeError("SGLang DeepSeekV4TokenToKVPool is not available")
+    if original_pool_cls is ATOMDeepSeekV4ProxyKVPool:
         return
-    mixin.DeepSeekV4TokenToKVPool = ATOMDeepSeekV4ProxyKVPool
+
+    dsv4_pool.DeepSeekV4TokenToKVPool = ATOMDeepSeekV4ProxyKVPool
     dsv4_pool.ATOMDeepSeekV4ProxyKVPool = ATOMDeepSeekV4ProxyKVPool
+
+    # SGLang 0.5.17 moved pool construction into mem_cache.kv_cache_configurator,
+    # which imports DeepSeekV4TokenToKVPool as a module-local symbol. Patch any
+    # already-loaded local aliases that still point at the original class.
+    for module in list(sys.modules.values()):
+        if getattr(module, "DeepSeekV4TokenToKVPool", None) is original_pool_cls:
+            module.DeepSeekV4TokenToKVPool = ATOMDeepSeekV4ProxyKVPool
 
 
 def _bind_compressor_state(

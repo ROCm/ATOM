@@ -10,6 +10,7 @@ per-entry byte range that checkpointing and RDMA use. Everything runs on CPU
 """
 
 import math
+from dataclasses import replace
 from itertools import pairwise
 
 import pytest
@@ -18,7 +19,9 @@ import torch
 from atom.model_ops.attentions.state_arena import (
     StateArena,
     StateField,
+    checkpoint_ranges_for,
     entry_bytes_for,
+    field_extents,
     plan_field_planes,
     plan_regions,
 )
@@ -38,6 +41,16 @@ V4_LIKE = [
 
 def build(fields=V4_LIKE, entries=5) -> StateArena:
     return StateArena(fields, entries, device="cpu")
+
+
+def carried_bytes(fields) -> int:
+    """Bytes of an entry a checkpoint image holds, the long way round.
+
+    Spelled out here rather than imported: the module used to export this and
+    nothing but these tests called it, and a helper kept alive by its own
+    tests is not an interface.
+    """
+    return sum(nbytes for _, nbytes in checkpoint_ranges_for(fields))
 
 
 class TestEntryBytes:
@@ -413,3 +426,107 @@ class TestPlanFieldPlanes:
     def test_a_row_space_with_no_planes_is_rejected(self):
         with pytest.raises(ValueError, match="at least one plane"):
             plan_field_planes(V4_LIKE, [])
+
+
+class TestCheckpointRanges:
+    """Which bytes of an entry a checkpoint image holds.
+
+    A field declaring `in_checkpoint=False` is dead at a checkpoint boundary —
+    the resumer writes every row of it before reading any — so the image must
+    not carry it, and must not carry its neighbours' padding by accident
+    either. The flag is a bool because "some of its rows" would depend on the
+    position the checkpoint was taken at, which this module is never given.
+    """
+
+    @staticmethod
+    def without_hca():
+        return [
+            replace(f, in_checkpoint=False) if f.name.startswith("hca_") else f
+            for f in V4_LIKE
+        ]
+
+    def test_an_all_carried_entry_is_one_range(self):
+        assert checkpoint_ranges_for(V4_LIKE) == [(0, entry_bytes_for(V4_LIKE))]
+        assert carried_bytes(V4_LIKE) == entry_bytes_for(V4_LIKE)
+
+    def test_a_dropped_field_is_not_in_the_image(self):
+        fields = self.without_hca()
+        arena = StateArena(fields, 5, device="cpu")
+
+        (start, nbytes), *rest = checkpoint_ranges_for(fields)
+        assert not rest, "the four CSA fields are adjacent, so they merge"
+        assert start == 0
+        # Stops at the first dropped field rather than running to entry_bytes.
+        assert nbytes <= arena.field_offset("hca_main_kv")
+        assert carried_bytes(fields) < entry_bytes_for(fields)
+
+    def test_a_dropped_field_breaks_the_run_it_sits_in(self):
+        """Merging across it would put it back in the image."""
+        fields = [
+            StateField("a", 1, (4, 8), torch.float32),
+            StateField("dead", 1, (64, 8), torch.float32, in_checkpoint=False),
+            StateField("b", 1, (4, 8), torch.float32),
+        ]
+        arena = StateArena(fields, 2, device="cpu")
+        dead_start = arena.field_offset("dead")
+        dead_end = dead_start + fields[1].bytes_per_entry
+
+        ranges = checkpoint_ranges_for(fields)
+
+        assert [start for start, _ in ranges] == [
+            arena.field_offset("a"),
+            arena.field_offset("b"),
+        ]
+        for start, nbytes in ranges:
+            assert start >= dead_end or start + nbytes <= dead_start
+
+    def test_the_image_spans_the_carried_run_padding_included(self):
+        """From the first carried field's start to the last one's end.
+
+        Derived from `field_extents` rather than from the function under
+        test, and not from `sum(bytes_per_entry)` either: the alignment
+        between two carried fields rides along, because splitting a range to
+        shave it costs more descriptor than it saves.
+        """
+        fields = self.without_hca()
+        carried = [(s, e) for f, s, e in field_extents(fields) if f.in_checkpoint]
+
+        assert carried_bytes(fields) == carried[-1][1] - carried[0][0]
+        assert carried_bytes(fields) >= sum(
+            f.bytes_per_entry for f in fields if f.in_checkpoint
+        )
+
+    def test_the_ranges_land_where_the_arena_put_the_fields(self):
+        """Sizing and the copy have to read one layout, not two."""
+        fields = self.without_hca()
+        arena = StateArena(fields, 5, device="cpu")
+
+        carried = [f for f in fields if f.in_checkpoint]
+        (start, nbytes), *rest = checkpoint_ranges_for(fields)
+        assert not rest
+        assert start == arena.field_offset(carried[0].name)
+        last = carried[-1]
+        assert start + nbytes == arena.field_offset(last.name) + last.bytes_per_entry
+
+    def test_a_wholly_dropped_entry_has_no_ranges(self):
+        fields = [StateField("dead", 1, (8, 8), torch.float32, in_checkpoint=False)]
+
+        assert checkpoint_ranges_for(fields) == []
+        assert carried_bytes(fields) == 0
+
+    def test_a_zero_byte_carried_run_is_not_a_range(self):
+        """A range of no bytes is refused downstream, and only on first use.
+
+        `plan_segmented_copy` rejects empty segments, and it is reached lazily
+        on the first checkpoint copy -- so a field list that produced one would
+        size, cross-check and start cleanly, then abort mid-serving on the
+        first request to cross a rung.
+        """
+        empty = StateField("no_layers", 0, (4, 4), torch.float32)
+        dead = StateField("dead", 1, (8, 8), torch.float32, in_checkpoint=False)
+
+        assert checkpoint_ranges_for([empty]) == []
+        # Between two dropped fields it is a run of its own, so nothing merges
+        # it away either.
+        assert checkpoint_ranges_for([dead, empty, dead]) == []
+        assert all(n > 0 for _, n in checkpoint_ranges_for([empty, *V4_LIKE]))

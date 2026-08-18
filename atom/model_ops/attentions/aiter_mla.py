@@ -1189,7 +1189,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             elif (
                 self.attn_prefill_chunk_size > 0
                 and attn_metadata.has_cached
-                and attn_metadata.total_kv > self.attn_prefill_chunk_size
+                and sum(batch.num_cached_tokens[:bs]) > self.attn_prefill_chunk_size
             ):
                 attn_metadata.mla_chunk_meta = self._build_mla_chunk_meta(batch, bs)
 
