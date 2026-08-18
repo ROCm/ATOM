@@ -765,18 +765,27 @@ class DSparkLayer(Block):  # type: ignore[misc]
             a.softmax_scale,
         )  # [B, T, n_heads, head_dim]
 
-        # Output projection: mirror DeepseekV4Attention.forward_impl's output
-        # stage exactly (deepseek_v4.py:1922-1930): inverse-RoPE on the rope
-        # lanes, grouped output-LoRA einsum with the BF16 wo_a weight, then wo_b.
+        # Output projection: mirror DeepseekV4Attention's output stage exactly
+        # (`_attn_core` + `_attn_post`): inverse-RoPE on the rope lanes, grouped
+        # output-LoRA, then wo_b. The draft shares the target attention's wo_a, so
+        # it also inherits the mxscale layout: the weight stays FP8 (unusable by a
+        # bf16 einsum) and the inverse RoPE is fused into the group-quant inside
+        # `_wo_a_grouped_lora`, hence it must not be applied here.
         # GPU-VERIFY: numerics validated against the V4 reference output stage.
         o = out.view(B * T, a.n_local_heads, a.head_dim)
-        rope_dim = a.rope_head_dim
-        # Remove the absolute-position contribution carried in via value-side RoPE.
-        a.rotary_emb.inverse(draft_pos.view(-1), o[..., -rope_dim:])
-        o = o.view(B * T, a.n_local_groups, -1)
-        wo_a = a.wo_a.weight.view(a.n_local_groups, a.o_lora_rank, -1)
-        o = torch.einsum("sgd,grd->sgr", o, wo_a)
-        out_final = _linear_out(a.wo_b(o.flatten(1))).view(B, T, -1)
+        draft_pos_flat = draft_pos.view(-1)
+        if a._wo_a_mxscale:
+            o = a._wo_a_grouped_lora(
+                o, draft_pos_flat, prefix=f"{a.layer_name}.dspark_wo_a"
+            )
+        else:
+            rope_dim = a.rope_head_dim
+            # Remove the absolute-position contribution carried in via value-side RoPE.
+            a.rotary_emb.inverse(draft_pos_flat, o[..., -rope_dim:])
+            o = o.view(B * T, a.n_local_groups, -1)
+            wo_a = a.wo_a.weight.view(a.n_local_groups, a.o_lora_rank, -1)
+            o = torch.einsum("sgd,grd->sgr", o, wo_a).flatten(1)
+        out_final = _linear_out(a.wo_b(o)).view(B, T, -1)
         return out_final
 
     def forward_block(

@@ -120,6 +120,12 @@ from atom.utils.forward_context import AttnState, get_forward_context
 
 logger = logging.getLogger(__name__)
 
+# wo_a shapes already announced on the mxscale path. Every V4 layer (plus the
+# DSpark draft) reaches `process_weights_after_loading` with identical dims, so
+# logging per layer buried the rank's startup in ~60 identical rows; keying on
+# the shape still surfaces a layer that lands somewhere unexpected.
+_WO_A_MXSCALE_LOGGED: set[tuple] = set()
+
 # ---------------------------------------------------------------------------
 # Classical KV cache scatter / gather helpers (PR3-pre2c-B).
 #
@@ -2540,14 +2546,18 @@ class DeepseekV4Attention(nn.Module):
             self._wo_a_w_fp8 = w.data.view(G, N, K)
             self._wo_a_w_scale = _wo_a_block_scale_to_e8m0(scale.data, G)
             self._wo_a_mxscale = True
-            logger.info(
-                "%s: wo_a using fp8 e8m0 mxscale batched GEMM "
-                "(G=%d, N=%d, K=%d, keeping FP8 weight).",
-                self.layer_name,
-                G,
-                N,
-                K,
-            )
+            log_key = (G, N, K)
+            if log_key not in _WO_A_MXSCALE_LOGGED:
+                _WO_A_MXSCALE_LOGGED.add(log_key)
+                logger.info(
+                    "%s: wo_a using fp8 e8m0 mxscale batched GEMM "
+                    "(G=%d, N=%d, K=%d, keeping FP8 weight) "
+                    "-- logged once per shape, every matching layer takes this path.",
+                    self.layer_name,
+                    G,
+                    N,
+                    K,
+                )
             # Suppress the LinearBase CK-layout shuffle, same as the BF16 branch
             # below: the mxscale kernel reads `wo_a.weight` directly and needs
             # the plain row-major [G*N, K] layout.
