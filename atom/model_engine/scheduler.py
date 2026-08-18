@@ -981,13 +981,11 @@ class Scheduler:
         return bool(callable(callback) and callback(seq))
 
     def _maybe_release_deferred(self, seq: Sequence) -> bool:
-        """Deallocate after the connector and producer send are terminal."""
+        """Deallocate after the offload connector is terminal."""
 
         if self._deferred_sequence(seq.id) is not seq:
             return False
         if getattr(seq, "_awaiting_aborted_load_cleanup", False):
-            return False
-        if getattr(seq, "_kv_send_completed", True) is False:
             return False
         if self._connector_should_defer_free(seq):
             return False
@@ -1005,8 +1003,6 @@ class Scheduler:
         assert (
             released is seq
         ), f"deferred request ID {seq.id!r} changed lifecycle before release"
-        if hasattr(seq, "_kv_send_completed"):
-            delattr(seq, "_kv_send_completed")
         self.block_manager.deallocate(seq)
         return True
 
@@ -1607,16 +1603,6 @@ class Scheduler:
             seq.state_fork_src = -1
 
     # -- Remote KV / offload admission helpers ------------------------------
-    def _remote_load_is_offload(self, seq: Sequence) -> bool:
-        if hasattr(seq, "_remote_load_is_offload"):
-            return bool(seq._remote_load_is_offload)
-        return self._connector_flag("is_offload")
-
-    @staticmethod
-    def _clear_remote_load_kind(seq: Sequence) -> None:
-        if hasattr(seq, "_remote_load_is_offload"):
-            delattr(seq, "_remote_load_is_offload")
-
     def _resolve_waiting_remote_kv(
         self, seq: Sequence, skipped_waiting_requests: deque[Sequence]
     ) -> bool | None:
@@ -1638,9 +1624,7 @@ class Scheduler:
             return None
 
         seq.status = SequenceStatus.WAITING
-        is_offload = self._remote_load_is_offload(seq)
-        self._clear_remote_load_kind(seq)
-        if is_offload:
+        if self._connector_flag("is_offload"):
             self._mark_offload_load_ready(seq)
             return False
         self._uncount_inflight_load(seq)
@@ -1651,9 +1635,7 @@ class Scheduler:
             return False
 
         seq.status = SequenceStatus.WAITING
-        is_offload = self._remote_load_is_offload(seq)
-        self._clear_remote_load_kind(seq)
-        if not is_offload:
+        if not self._connector_flag("is_offload"):
             self._uncount_inflight_load(seq)
         seq.offload_loaded = False
         seq.offload_loaded_tokens = seq.num_cached_tokens
@@ -1700,7 +1682,6 @@ class Scheduler:
         if hasattr(seq, "_awaiting_aborted_load_cleanup"):
             delattr(seq, "_awaiting_aborted_load_cleanup")
         self._uncount_inflight_load(seq)
-        self._clear_remote_load_kind(seq)
         for marker in (
             "_active_load_operation",
             "_consumed_load_operation",
@@ -2524,19 +2505,16 @@ class Scheduler:
             if self.kv_connector is not None:
                 if hasattr(self.kv_connector, "request_finished"):
                     self.kv_connector.request_finished(seq)
-                # Producer completion is scheduler-owned; save/load liveness is
-                # exposed by the connector's existing should_defer_free API.
                 if self._connector_flag("is_producer"):
-                    seq._kv_send_completed = False
-                send_pending = getattr(seq, "_kv_send_completed", True) is False
-                connector_pending = self._connector_should_defer_free(seq)
-                if send_pending or connector_pending:
                     logger.debug(
-                        "Deferring block free for seq %s; send_pending=%s "
-                        "connector_pending=%s",
+                        "Deferring block free for seq %s until KV send completes.",
                         seq.id,
-                        send_pending,
-                        connector_pending,
+                    )
+                    self._defer_free(seq)
+                elif self._connector_should_defer_free(seq):
+                    logger.debug(
+                        "Deferring block free for seq %s until KV save completes.",
+                        seq.id,
                     )
                     self._defer_free(seq)
                 else:
@@ -2848,14 +2826,16 @@ class Scheduler:
             logger.debug("Finished sending KV transfer for request %s", req_id)
             seq = self._deferred_sequence(req_id)
             assert seq is not None, f"req_id={req_id} not found in deferred_free_blocks"
-            seq._kv_send_completed = True
-            self._maybe_release_deferred(seq)
+            released = self.deferred_free_blocks.pop(seq.id, None)
+            assert released is seq
+            self.block_manager.deallocate(seq)
 
-        for req_id in finished_saving:
-            raw_req_id = _raw_req_id(req_id)
-            seq = self._deferred_sequence(raw_req_id)
-            if seq is not None:
-                self._maybe_release_deferred(seq)
+        if not is_producer:
+            for req_id in finished_saving:
+                raw_req_id = _raw_req_id(req_id)
+                seq = self._deferred_sequence(raw_req_id)
+                if seq is not None:
+                    self._maybe_release_deferred(seq)
 
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""

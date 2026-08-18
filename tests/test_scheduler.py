@@ -202,42 +202,10 @@ class TestSchedule:
 
         assert handled == [completion]
 
-    @pytest.mark.parametrize(
-        ("winner_is_offload", "expected_jump"),
-        [(False, True), (True, False)],
-    )
-    def test_remote_terminal_uses_per_request_multi_winner_type(
-        self, winner_is_offload, expected_jump
-    ):
-        seq = SimpleNamespace(
-            id=89,
-            status=SequenceStatus.WAITING_FOR_REMOTE_KVS,
-            _remote_load_is_offload=winner_is_offload,
-            _counted_as_inflight_load=True,
-            num_cached_tokens=4,
-            num_tokens=8,
-            offload_loaded_tokens=4,
-            offload_load_start_tokens=4,
-        )
-        sched = Scheduler.__new__(Scheduler)
-        sched.kv_connector = SimpleNamespace(is_offload=True, is_producer=False)
-        sched.finished_recving_kv_req_ids = [seq.id]
-        sched.failed_recving_kv_req_ids = []
-        sched._num_parked_remote_kv = 1
-        sched.block_manager = SimpleNamespace(kv_events_enabled=False)
-
-        result = sched._resolve_waiting_remote_kv(seq, deque())
-
-        assert result is expected_jump
-        assert not hasattr(seq, "_remote_load_is_offload")
-        assert sched._num_parked_remote_kv == (1 if winner_is_offload else 0)
-
     @pytest.mark.parametrize("first_terminal", ["load", "save"])
-    @pytest.mark.parametrize("producer_mode", [False, True])
     def test_aborted_load_and_save_both_finish_before_release(
         self,
         first_terminal,
-        producer_mode,
     ):
         load = LoadOperationId(97, 3)
         save = SaveOperationId(97, 4)
@@ -253,10 +221,10 @@ class TestSchedule:
 
         class _Connector:
             is_offload = True
+            is_producer = False
             completion_channels = frozenset()
 
             def __init__(self):
-                self.is_producer = producer_mode
                 self.pending_save = True
 
             def load_finished(self, operation):
@@ -291,7 +259,6 @@ class TestSchedule:
 
         assert sched.deferred_free_blocks == {seq.id: seq}
         assert seq._awaiting_aborted_load_cleanup is True
-        assert not hasattr(seq, "_kv_send_completed")
 
         outputs = {
             "load": KVConnectorOutput(finished_loading={load}),
@@ -1513,58 +1480,6 @@ class TestPostprocess:
         seq = self._prefill(scheduler, seq_factory([1, 2, 3, 4]))
         scheduler.postprocess(list(scheduler.running), self._output(seq.id, [2]))
         assert scheduler.get_request_counts() == (0, 0)
-
-    def test_finished_composite_request_uses_connector_release_contract(
-        self,
-        scheduler,
-        seq_factory,
-    ):
-        seq = self._prefill(scheduler, seq_factory([1, 2, 3, 4]))
-        operation = SaveOperationId(seq.id, 1)
-        finish_calls = []
-
-        class _CompositeConnector:
-            is_producer = True
-            is_offload = True
-            completion_channels = frozenset()
-
-            def __init__(self):
-                self.pending_save = True
-
-            def request_finished(self, value):
-                finish_calls.append(value)
-
-            def should_defer_free(self, value):
-                assert value is seq
-                return self.pending_save
-
-            def save_finished(self, value):
-                assert value == operation
-                self.pending_save = False
-
-        scheduler.kv_connector = _CompositeConnector()
-
-        finished = scheduler.postprocess(
-            list(scheduler.running),
-            self._output(seq.id, [2]),
-        )
-
-        assert finished == [seq]
-        assert scheduler.deferred_free_blocks == {seq.id: seq}
-        assert seq._kv_send_completed is False
-        assert finish_calls == [seq]
-
-        scheduler._update_from_kv_xfer_finished(
-            KVConnectorOutput(
-                finished_sending={seq.id},
-                finished_saving={operation},
-            )
-        )
-
-        assert scheduler.deferred_free_blocks == {}
-        assert not hasattr(seq, "_kv_send_completed")
-        assert finish_calls == [seq, seq]
-
 
 # ── get_next_batch_info ────────────────────────────────────────────────────
 

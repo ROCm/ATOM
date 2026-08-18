@@ -379,27 +379,6 @@ def test_fp4_indexer_without_transfer_keeps_single_node_behavior(v4_builder_cls)
         ({"kv_connector": "LMCacheConnectorV1"}, False),
         ({"kv_connector": "mooncake"}, True),
         ({"kv_connector": "moriio"}, True),
-        ({"kv_connector": "MooncakeConnector"}, True),
-        (
-            {
-                "kv_connector": "multi",
-                "connectors": [
-                    {"kv_connector": "lmcache_offload"},
-                    {"kv_connector": "LMCacheOffloadConnector"},
-                ],
-            },
-            False,
-        ),
-        (
-            {
-                "kv_connector": "multi",
-                "connectors": [
-                    {"kv_connector": "lmcache_offload"},
-                    {"kv_connector": "moriio"},
-                ],
-            },
-            True,
-        ),
     ],
 )
 def test_transfer_topology_allocates_pd_staging_only_when_needed(
@@ -420,34 +399,6 @@ def test_transfer_topology_allocates_pd_staging_only_when_needed(
         ([], "kv_transfer_config must be a dict or None"),
         ({"kv_role": "offload"}, "requires a non-empty 'kv_connector'"),
         ({"kv_connector": "unknown"}, "unknown KV connector"),
-        (
-            {"kv_connector": "multi"},
-            "multi connector requires a non-empty 'connectors' list",
-        ),
-        (
-            {"kv_connector": "multi", "connectors": []},
-            "multi connector requires a non-empty 'connectors' list",
-        ),
-        (
-            {"kv_connector": "multi", "connectors": [{}]},
-            r"connectors\[0\].*'kv_connector'",
-        ),
-        (
-            {"kv_connector": "multi", "connectors": ["lmcache_offload"]},
-            r"connectors\[0\] must be a dict",
-        ),
-        (
-            {
-                "kv_connector": "multi",
-                "connectors": [
-                    {
-                        "kv_connector": "multi",
-                        "connectors": [{"kv_connector": "lmcache_offload"}],
-                    }
-                ],
-            },
-            "multi connector cannot nest another 'multi'",
-        ),
     ],
 )
 def test_invalid_transfer_topology_fails_before_staging_allocation(
@@ -487,28 +438,8 @@ def _prepare_cpu_allocation(builder, row_widths, monkeypatch):
     ("transfer_config", "expected_pool_size"),
     [
         ({"kv_connector": "lmcache_offload"}, 0),
-        (
-            {
-                "kv_connector": "multi",
-                "connectors": [
-                    {"kv_connector": "lmcache_offload"},
-                    {"kv_connector": "LMCacheOffloadConnector"},
-                ],
-            },
-            0,
-        ),
         ({"kv_connector": "mooncake"}, 32),
         ({"kv_connector": "moriio"}, 32),
-        (
-            {
-                "kv_connector": "multi",
-                "connectors": [
-                    {"kv_connector": "lmcache_offload"},
-                    {"kv_connector": "MooncakeConnector"},
-                ],
-            },
-            32,
-        ),
     ],
 )
 def test_allocate_per_req_cache_sizes_pd_staging_for_transfer_topology(
@@ -528,34 +459,6 @@ def test_allocate_per_req_cache_sizes_pd_staging_for_transfer_topology(
 
     assert allocated["v4_state_pool_size"] == expected_pool_size
     assert allocated["v4_state_pool"].numel() == expected_pool_size * 16
-
-
-def test_offload_only_multi_exposes_sidecar_slots_without_pd_staging(
-    v4_builder_cls,
-    monkeypatch,
-):
-    builder, geo, _, row_widths = _transfer_builder(
-        v4_builder_cls,
-        kv_dtype="bf16",
-        transfer_config={
-            "kv_connector": "multi",
-            "connectors": [{"kv_connector": "lmcache_offload"}],
-        },
-    )
-    _prepare_cpu_allocation(builder, row_widths, monkeypatch)
-    allocated = builder.allocate_per_req_cache({STATE_SLOT_CLASS: geo.num_slots})
-    for name, value in allocated.items():
-        setattr(builder.model_runner, name, value)
-
-    transfer = builder.get_kv_transfer_tensors()
-
-    assert transfer is not None
-    assert transfer.staging_region is None
-    assert transfer.staging_pool_size == 0
-    assert transfer.gather_slot is None
-    assert transfer.scatter_slot is None
-    assert len(transfer.swa_block_regions) == 1
-    assert transfer.swa_block_regions[0].unit_bytes == geo.slot_rows * row_widths[0]
 
 
 def test_v4_sidecar_offload_rejects_pipeline_parallelism_before_registration(

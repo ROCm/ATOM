@@ -115,12 +115,7 @@ class KVConnectorFactory:
         *,
         path: str = "kv_transfer_config",
     ) -> bool:
-        """Return whether a connector topology needs compressor P/D staging.
-
-        ``multi`` is the only composite connector and owns validation of its
-        child list.  Nested multi connectors remain unsupported by the actual
-        constructor, so capability inspection rejects them consistently.
-        """
+        """Return whether the configured connector needs compressor P/D staging."""
 
         if kv_transfer_config is None or kv_transfer_config == {}:
             return False
@@ -132,26 +127,7 @@ class KVConnectorFactory:
         connector = cls.canonical_name(
             kv_transfer_config.get("kv_connector"), path=path
         )
-        if connector != "multi":
-            return cls._requires_pd_staging.get(connector, True)
-
-        children = kv_transfer_config.get("connectors")
-        if not isinstance(children, list) or not children:
-            raise ValueError(
-                f"{path}: multi connector requires a non-empty 'connectors' list"
-            )
-        needs_staging = False
-        for index, child in enumerate(children):
-            child_path = f"{path}.connectors[{index}]"
-            if not isinstance(child, dict):
-                raise ValueError(f"{child_path} must be a dict, got {child!r}")
-            child_name = cls.canonical_name(child.get("kv_connector"), path=child_path)
-            if child_name == "multi":
-                raise ValueError("multi connector cannot nest another 'multi'")
-            needs_staging = needs_staging or cls.topology_uses_pd_staging(
-                child, path=child_path
-            )
-        return needs_staging
+        return cls._requires_pd_staging.get(connector, True)
 
     @classmethod
     def create_connector(
@@ -205,7 +181,6 @@ KVConnectorFactory.register(
     worker_class="MoRIIOConnector",
     scheduler_module="atom.kv_transfer.disaggregation.moriio.moriio_connector",
     scheduler_class="MoRIIOConnectorScheduler",
-    aliases=("MoRIIOConnector",),
 )
 
 KVConnectorFactory.register(
@@ -214,7 +189,6 @@ KVConnectorFactory.register(
     worker_class="MooncakeConnector",
     scheduler_module="atom.kv_transfer.disaggregation.mooncake.mooncake_connector",
     scheduler_class="MooncakeConnectorScheduler",
-    aliases=("MooncakeConnector",),
 )
 
 # Composite backend: fans out to several sub-connectors listed under
@@ -226,7 +200,6 @@ KVConnectorFactory.register(
     worker_class="MultiConnector",
     scheduler_module="atom.kv_transfer.disaggregation.multi.multi_connector",
     scheduler_class="MultiConnectorScheduler",
-    aliases=("MultiConnector",),
 )
 
 

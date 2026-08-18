@@ -14,13 +14,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from atom.kv_transfer.disaggregation.multi.multi_connector import (
-    MultiConnector,
-    MultiConnectorMetadata,
-    MultiSaveOperationId,
-)
 from atom.kv_transfer.disaggregation.types import (
-    ConnectorMetadata,
     KVConnectorOutput,
     KVTransferRegion,
     SaveOperationId,
@@ -1319,118 +1313,6 @@ def test_save_workers_parallelize_different_requests_but_complete_once(monkeypat
         SaveOperationId(17, 0),
         SaveOperationId(18, 0),
     }
-    assert connector._pending_save_ops == {}
-    assert connector._save_req_locks == {}
-
-
-def test_same_request_saves_serialize_and_multi_releases_on_all_ops_done(monkeypatch):
-    order = []
-    _patch_rpc_cuda(monkeypatch, order)
-    connector = _worker(order, staging_slots=2)
-    executor = _ConcurrentExecutor(workers=2)
-    connector._save_executor = executor
-    first_started = threading.Event()
-    release_first = threading.Event()
-    boundary_started = threading.Event()
-    release_boundary = threading.Event()
-
-    def controlled_save(req, producer_event=None, slot_snapshot=None):
-        if getattr(req, "slot_save_spec", None) is None:
-            first_started.set()
-            assert release_first.wait(timeout=2)
-            return
-        boundary_started.set()
-        assert release_boundary.wait(timeout=2)
-        if slot_snapshot is not None and slot_snapshot.staging_id is not None:
-            connector._slot_admission.release(slot_snapshot.staging_id)
-        with connector._lock:
-            connector._done_sidecar_save.add(req.save_operation)
-
-    connector._do_save_req = controlled_save
-    page = LMCacheReqMeta(
-        req_id=17,
-        token_ids=list(range(4)),
-        block_ids=[10],
-        save_spec=SaveSpec(skip_leading_tokens=0),
-        save_operation=SaveOperationId(17, 0),
-    )
-    boundary = _save_request()
-    boundary.save_spec = SaveSpec(skip_leading_tokens=4)
-    boundary.save_operation = SaveOperationId(17, 1)
-
-    class _Producer:
-        is_producer = True
-
-        def __init__(self):
-            self.output = KVConnectorOutput(finished_sending={17})
-
-        def start_load_kv(self, metadata):
-            pass
-
-        def get_finished(self):
-            output = self.output
-            self.output = KVConnectorOutput()
-            return output
-
-        def get_finished_recv_blocks(self):
-            return []
-
-    producer = _Producer()
-    with patch(
-        "atom.kv_transfer.disaggregation.multi.multi_connector._build_subconnectors",
-        return_value=[producer, connector],
-    ):
-        multi = MultiConnector(SimpleNamespace())
-    connector._done_save.add(SaveOperationId(17, 0))
-
-    try:
-        multi.start_load_kv(
-            MultiConnectorMetadata(
-                [ConnectorMetadata(), _metadata(page)],
-                completion_channel_owners={
-                    DSV4_CHECKPOINT_SAVE_CHANNEL: 1,
-                },
-            )
-        )
-        assert first_started.wait(timeout=2)
-        assert connector._done_save == set()
-
-        multi.start_load_kv(
-            MultiConnectorMetadata(
-                [ConnectorMetadata(), _metadata(boundary)],
-                completion_channel_owners={
-                    DSV4_CHECKPOINT_SAVE_CHANNEL: 1,
-                },
-            )
-        )
-        assert executor.started[1].wait(timeout=2)
-        assert not boundary_started.is_set()
-        assert connector._pending_save_ops == {17: 2}
-
-        while_pending = multi.get_finished()
-        assert while_pending.finished_saving == set()
-        assert while_pending.finished_sending == set()
-
-        release_first.set()
-        executor.futures[0].result(timeout=2)
-        assert boundary_started.wait(timeout=2)
-        after_page = multi.get_finished()
-        assert after_page.finished_saving == {MultiSaveOperationId(17, 0, 1)}
-        assert after_page.finished_sending == set()
-
-        release_boundary.set()
-        executor.futures[1].result(timeout=2)
-        terminal = multi.get_finished()
-    finally:
-        release_first.set()
-        release_boundary.set()
-        executor.shutdown()
-
-    assert terminal.finished_saving == {MultiSaveOperationId(17, 1, 1)}
-    assert _completion_ids(terminal, DSV4_CHECKPOINT_SAVE_CHANNEL, succeeded=True) == {
-        SaveOperationId(17, 1)
-    }
-    assert terminal.finished_sending == {17}
     assert connector._pending_save_ops == {}
     assert connector._save_req_locks == {}
 

@@ -316,8 +316,7 @@ correctness — note the deliberate asymmetry vs a P/D producer:
 
 Save-generation identity matters because one long prefill can have multiple PAGE
 saves and a later PAGE+SLOT save in flight at once. A late notification for an
-earlier generation, or a reused request ID, cannot release or commit the later
-operation.
+earlier generation cannot release or commit the later operation.
 
 `is_offload = True` on the scheduler opts into offload-wake (suffix prefill)
 rather than the P/D decode-jump in `Scheduler.schedule()`.
@@ -436,7 +435,8 @@ The default `max_pending_saves` is `max(2, 2 * OFFLOAD_COPY_WORKERS)`. A full
 admission set is a terminal save rejection: PAGE blocks may be released, while
 a requested SLOT boundary is reported failed and is never committed. Standalone
 `kv_connector=lmcache_offload` also allocates no compressor-only
-`ATOM_PD_STAGING_POOL`; Mooncake, Moriio, and `multi` retain that P/D pool.
+`ATOM_PD_STAGING_POOL`. Other connectors and composite topologies keep their
+existing staging behavior; this change does not adapt them to LMCache offload.
 
 ## When Does a Reload Actually Happen?
 

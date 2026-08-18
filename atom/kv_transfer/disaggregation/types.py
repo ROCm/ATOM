@@ -277,19 +277,6 @@ class ConnectorMetadata:
         self.reqs_not_processed: set[ReqId] = set()
         self.request_id_to_transfer_id: dict[ReqId, int] = {}
 
-    def iter_async_save_operations(
-        self,
-    ) -> tuple[tuple[ReqId, SaveCompletionId], ...]:
-        """Return saves that a composite connector must lifetime-pair.
-
-        Most transfer metadata does not participate in ``finished_saving``.
-        An asynchronous storage backend opts in by overriding this method;
-        composite connectors then remain independent of backend request specs.
-        Each item is ``(request_id, completion_id)``.
-        """
-
-        return ()
-
     @staticmethod
     def _build_req_meta(
         req_id: ReqId,
@@ -347,9 +334,6 @@ def connector_metadata_has_work(metadata: object | None) -> bool:
     """Return whether connector metadata contains dispatchable work."""
     if metadata is None:
         return False
-    metas = getattr(metadata, "metas", None)
-    if metas is not None and any(connector_metadata_has_work(meta) for meta in metas):
-        return True
     return any(
         bool(getattr(metadata, name, None))
         for name in (
