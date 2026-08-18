@@ -32,8 +32,9 @@ def test_from_rebalance_result_pads_and_derives_rank0():
     assert meta.logical_to_physical_map.shape == (1, 3, 2)
     # rank0 owns physical slots [0,1].
     assert meta.expert_map[0].tolist() == [0, 1, -1, -1]
-    # dispatch: logical0->local slot0, logical1->local slot1, logical2->remote slot2
-    assert meta.logical_to_rank_dispatch_physical_map[0].tolist() == [0, 1, 2]
+    # dispatch: logical0->local slot0, logical1->local slot1; logical2 has no
+    # local replica -> forced-remote sentinel -1 (dispatch spreads it per token).
+    assert meta.logical_to_rank_dispatch_physical_map[0].tolist() == [0, 1, -1]
 
 
 def test_from_rebalance_result_rank1_dispatch():
@@ -49,9 +50,9 @@ def test_from_rebalance_result_rank1_dispatch():
         max_num_replicas=2,
     )
     assert meta.expert_map[0].tolist() == [-1, -1, 0, 1]
-    # rank1 owns slots [2,3]: logical0->local replica at slot3, logical1->remote slot1,
-    # logical2->local slot2
-    assert meta.logical_to_rank_dispatch_physical_map[0].tolist() == [3, 1, 2]
+    # rank1 owns slots [2,3]: logical0->local replica at slot3, logical2->local
+    # slot2; logical1 has no local replica -> forced-remote sentinel -1.
+    assert meta.logical_to_rank_dispatch_physical_map[0].tolist() == [3, -1, 2]
 
 
 def test_pad_widens_to_max_num_replicas():

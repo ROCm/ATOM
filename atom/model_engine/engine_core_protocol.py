@@ -31,3 +31,5 @@ class EngineCoreRequestType(enum.Enum):
     READY = b"\x07"
     # Response to a synchronous utility command
     UTILITY_RESPONSE = b"\x08"
+    # Unsolicited metrics snapshot, pushed by EngineCore on its own clock.
+    METRICS = b"\x09"

@@ -107,15 +107,15 @@ class LMCacheOffloadConnector(KVConnectorBase):
         rank, world = tp.rank_in_group, tp.world_size
         self._rank = rank
 
-        cfg = offcfg.build_lmcache_config()
-        offcfg.apply_extra_overrides(
-            cfg, getattr(self._config, "kv_transfer_config", None)
+        cfg = offcfg.build_lmcache_config(
+            getattr(self._config, "kv_transfer_config", None)
         )
         self.chunk_size = int(cfg.chunk_size)
-        # num_blocks is the physical block count (num_physical_kvcache_blocks),
-        # threaded from the model runner. MLA stores its KV token-major, so the
-        # codec can't infer the block count from tensor.shape[0]; pass it.
+        # num_blocks is the scheduler-visible block count, threaded from the
+        # model runner. MLA stores its KV token-major, so the codec cannot infer
+        # this count from tensor.shape[0] (the page-size-1 physical row count).
         self._codec = ATOMKVByteCodec(kv_caches, num_blocks=num_blocks)
+        self._validate_block_geometry(transfer_tensors)
         base_meta = offcfg.build_lmcache_metadata(self._config, cfg, world, rank)
         meta = ATOMRawBytesLMCacheMetadata(
             base_meta,
@@ -141,6 +141,7 @@ class LMCacheOffloadConnector(KVConnectorBase):
         # opaque uint8 object, so keep a supported tensor MemoryFormat.
         self._engine.fmt = MemoryFormat.KV_2LTD
         self._engine.post_init()
+        self._validate_and_log_storage_backends(cfg)
 
         # ZMQ lookup server so the scheduler process can query our hit counts.
         try:
@@ -149,7 +150,7 @@ class LMCacheOffloadConnector(KVConnectorBase):
             self._lookup_server = LookupClientFactory.create_lookup_server(
                 self._engine, meta
             )
-        except Exception as e:  # lookup server optional for save-only smoke
+        except Exception as e:  # noqa: BLE001  # optional third-party service
             logger.warning("LMCache offload: lookup server not started: %s", e)
 
         logger.info(
@@ -168,19 +169,91 @@ class LMCacheOffloadConnector(KVConnectorBase):
             self._do_load,
         )
 
+    def _validate_block_geometry(self, transfer_tensors) -> None:
+        """Cross-check codec blocks against existing transfer-region metadata."""
+        block_regions = getattr(transfer_tensors, "block_regions", None) or []
+        if not block_regions:
+            return
+        expected = sum(int(region.unit_bytes) for region in block_regions)
+        if self._codec.bytes_per_block != expected:
+            raise ValueError(
+                "LMCache offload KV block geometry mismatch: "
+                f"codec={self._codec.bytes_per_block} bytes, "
+                f"transfer_regions={expected} bytes, "
+                f"num_blocks={self._codec.num_blocks}"
+            )
+
+    def _validate_and_log_storage_backends(self, cfg) -> None:
+        """Report the realized LMCache tier topology and validate NVMe startup."""
+        storage_manager = getattr(self._engine, "storage_manager", None)
+        backend_names: list[str] = []
+        if storage_manager is not None:
+            list_backends = getattr(storage_manager, "list_backends", None)
+            if callable(list_backends):
+                backend_names = sorted(str(name) for name in list_backends())
+            else:
+                storage_backends = getattr(storage_manager, "storage_backends", {})
+                backend_names = sorted(str(name) for name in storage_backends)
+
+        local_disk = getattr(cfg, "local_disk", None)
+        disk_size_gib = float(getattr(cfg, "max_local_disk_size", 0.0) or 0.0)
+        disk_configured = bool(local_disk) and disk_size_gib > 0
+        if disk_configured and "LocalDiskBackend" not in backend_names:
+            raise RuntimeError(
+                "LMCache local-disk offload was configured but LocalDiskBackend "
+                f"was not created on rank {self._rank}; backends={backend_names}"
+            )
+
+        logger.info(
+            "LMCache offload worker rank=%d storage: backends=%s "
+            "local_cpu=%s max_local_cpu_gib=%s local_disk=%s "
+            "max_local_disk_gib=%s store_location=%s retrieve_locations=%s",
+            self._rank,
+            backend_names,
+            getattr(cfg, "local_cpu", None),
+            getattr(cfg, "max_local_cpu_size", None),
+            local_disk,
+            getattr(cfg, "max_local_disk_size", None),
+            getattr(cfg, "store_location", None),
+            getattr(cfg, "retrieve_locations", None),
+        )
+
     # -- per-step (RPC thread): only enqueue, never copy ------------------
     def start_load_kv(self, metadata) -> None:
         if not isinstance(metadata, LMCacheOffloadMetadata):
             return
+        loading_lookup_ids = {
+            str(req.req_id)
+            for req in metadata.requests
+            if req.load_spec is not None and self._do_load
+        }
+        for lookup_id in metadata.lookup_requests_in_step:
+            if str(lookup_id) not in loading_lookup_ids:
+                self._lookup_unpin(lookup_id)
+        save_ready_event = None
+        if self._do_save and any(
+            req.save_spec is not None for req in metadata.requests
+        ):
+            # Forward kernels publish KV on the RPC thread's current stream.
+            # Save workers pack it on independent streams, so carry an event
+            # across the thread boundary instead of racing the producer.
+            save_ready_event = torch.cuda.Event()
+            save_ready_event.record(torch.cuda.current_stream())
         for req in metadata.requests:
             if req.load_spec is not None and self._do_load:
                 self._load_executor.submit(self._guard, "load", self._do_load_req, req)
             if req.save_spec is not None and self._do_save:
-                self._save_executor.submit(self._guard, "save", self._do_save_req, req)
+                self._save_executor.submit(
+                    self._guard,
+                    "save",
+                    self._do_save_req,
+                    req,
+                    save_ready_event,
+                )
 
-    def _guard(self, kind: str, fn, req) -> None:
+    def _guard(self, kind: str, fn, req, *args) -> None:
         try:
-            fn(req)
+            fn(req, *args)
         except Exception:
             logger.exception(
                 "LMCache offload: %s failed for %s", fn.__name__, req.req_id
@@ -199,9 +272,13 @@ class LMCacheOffloadConnector(KVConnectorBase):
         if getattr(self, "_engine", None) is None:
             return
         try:
-            self._engine.lookup_unpin([str(req_id)])  # LMCache pin keyed by str id
-        except Exception:
-            pass
+            self._engine.lookup_unpin(str(req_id))
+        except Exception:  # best-effort third-party cleanup
+            logger.debug(
+                "LMCache offload: lookup unpin failed for %s",
+                req_id,
+                exc_info=True,
+            )
 
     def _profile_enabled(self) -> bool:
         return os.environ.get("OFFLOAD_PROFILE", "0").lower() not in (
@@ -217,7 +294,8 @@ class LMCacheOffloadConnector(KVConnectorBase):
             return {}
         try:
             return dict(gpu_connector.last_transfer_stats())
-        except Exception:
+        except Exception:  # optional instrumentation hook
+            logger.debug("Failed to read GPU transfer stats", exc_info=True)
             return {}
 
     def _reset_gpu_connector_transfer_stats(self) -> None:
@@ -226,8 +304,8 @@ class LMCacheOffloadConnector(KVConnectorBase):
             return
         try:
             gpu_connector.reset_transfer_stats()
-        except Exception:
-            pass
+        except Exception:  # optional instrumentation hook
+            logger.debug("Failed to reset GPU transfer stats", exc_info=True)
 
     # -- copy daemon thread ----------------------------------------------
     def _do_load_req(self, req: LMCacheReqMeta) -> None:
@@ -310,7 +388,7 @@ class LMCacheOffloadConnector(KVConnectorBase):
                 total_ms,
             )
 
-    def _do_save_req(self, req: LMCacheReqMeta) -> None:
+    def _do_save_req(self, req: LMCacheReqMeta, producer_event=None) -> None:
         ss = req.save_spec
         assert ss is not None
         toks = req.token_ids
@@ -321,6 +399,12 @@ class LMCacheOffloadConnector(KVConnectorBase):
             with self._lock:
                 self._done_save.add(req.req_id)
             return
+
+        # Wait only for the forward work that produces this save's KV. This
+        # blocks the background save worker, not the model RPC thread, and is
+        # intentionally narrower than a device-wide synchronize().
+        if producer_event is not None:
+            producer_event.synchronize()
 
         t_total0 = time.perf_counter()
         mask = torch.ones(len(toks), dtype=torch.bool)
@@ -431,8 +515,15 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         # (seq.prefix_hashes_published flips True), chunk by chunk.
         self._save_tracker: dict[str, list] = {}
         self._save_inflight: set[str] = set()
+        self._load_inflight_tokens: dict[str, int] = {}
+        self._save_inflight_tokens: dict[str, int] = {}
         self._lookup_in_step: list[str] = []
         self._handoff_loads: set[str] = set()
+        self.total_load_requests = 0
+        self.total_loaded_tokens = 0
+        self.total_load_failures = 0
+        self.total_save_requests = 0
+        self.total_saved_tokens = 0
         # Unaligned handoff is always on: when the HBM prefix-cache hit is not
         # chunk-aligned, recompute the misaligned head up to the next chunk
         # boundary, then load the aligned remainder from CPU. (Previously gated
@@ -450,15 +541,14 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
             self._min_load_tokens = 8192
 
         try:
-            cfg = offcfg.build_lmcache_config()
-            offcfg.apply_extra_overrides(cfg, kvc)
+            cfg = offcfg.build_lmcache_config(kvc)
             self.chunk_size = int(cfg.chunk_size)
             from lmcache.v1.lookup_client.factory import LookupClientFactory
 
             world = int(getattr(config, "tensor_parallel_size", 1) or 1)
             meta = offcfg.build_lmcache_metadata(config, cfg, world, 0)
             self._lookup_client = LookupClientFactory.create_lookup_client(cfg, meta)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  # optional third-party client
             logger.warning(
                 "LMCache offload scheduler: lookup client unavailable: %s", e
             )
@@ -469,8 +559,11 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
             return 0, False
         num_prompt = seq.num_prompt_tokens
         token_ids = list(seq.token_ids[:num_prompt])
+        sid = str(seq.id)
+        if sid not in self._lookup_in_step:
+            self._lookup_in_step.append(sid)
         try:
-            hit = self._lookup_client.lookup(token_ids, lookup_id=str(seq.id))
+            hit = self._lookup_client.lookup(token_ids, lookup_id=sid)
         except Exception:
             logger.exception("LMCache offload lookup failed for seq %s", seq.id)
             return 0, False
@@ -485,7 +578,7 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
                             tdb.process_tokens(token_ids, make_key=False)
                         )[:3]
                     ]
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001  # debug-only introspection
                 _lh = f"err:{e}"
             logger.debug(
                 "[OFFLOAD-LOOKUP] seq=%s num_prompt=%d hbm_cached=%d hit=%s lookuphash3=%s",
@@ -497,7 +590,6 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
             )
         if not hit:
             return 0, False
-        sid = str(seq.id)
         hit = int(hit)
         if hit == num_prompt:  # full-prompt hit → recompute last token
             hit -= 1
@@ -507,10 +599,13 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
             if self._lookup_client is not None:
                 try:
                     self._lookup_client.clear_lookup_status(sid)
-                except Exception:
-                    pass
+                except Exception:  # best-effort cleanup
+                    logger.debug(
+                        "LMCache offload: clear lookup status failed for %s",
+                        sid,
+                        exc_info=True,
+                    )
             return 0, False
-        self._lookup_in_step.append(sid)
         self._load_specs[sid] = LoadSpec(
             hbm_cached_tokens=int(seq.num_cached_tokens),
             lmcache_cached_tokens=hit,
@@ -573,14 +668,15 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         self._handoff_loads.discard(sid)
         self._load_save_floors.pop(sid, None)
         self._hit_save_floors.pop(sid, None)
-        self._lookup_in_step = [
-            req_id for req_id in self._lookup_in_step if req_id != sid
-        ]
         if self._lookup_client is not None:
             try:
                 self._lookup_client.clear_lookup_status(sid)
-            except Exception:
-                pass
+            except Exception:  # best-effort cleanup
+                logger.debug(
+                    "LMCache offload: clear lookup status failed for %s",
+                    sid,
+                    exc_info=True,
+                )
 
     def _decide_load_after_alloc(
         self, seq, ls: LoadSpec
@@ -757,6 +853,10 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
                 self._clear_pending_load(sid)
                 continue
             # num_cached after load = max(HBM, offload); never drop below HBM.
+            # Persist the physical load start on the sequence. The scheduler
+            # combines it with offload_loaded_tokens after all TP workers
+            # succeed to publish the restored GPU prefix.
+            seq.offload_load_start_tokens = hbm
             seq.offload_loaded_tokens = max(hbm, lmc)
             # req_id MUST be the raw seq.id (the type the scheduler compares
             # against in _update_waiting_for_remote_kv); str(seq.id) is only for
@@ -774,6 +874,7 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
             )
             loading_sids.add(sid)
             self._load_save_floors[sid] = self._chunk_floor(hbm)
+            self._load_inflight_tokens[sid] = max(0, lmc - hbm)
             meta.add_request(
                 LMCacheReqMeta(
                     req_id=seq.id,
@@ -782,8 +883,12 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
                     load_spec=ls,
                 )
             )
-        meta.lookup_requests_in_step = self._lookup_in_step
-        self._lookup_in_step = []
+        meta.lookup_requests_in_step = [
+            sid for sid in self._lookup_in_step if sid not in self._handoff_loads
+        ]
+        self._lookup_in_step = [
+            sid for sid in self._lookup_in_step if sid in self._handoff_loads
+        ]
         # Saves: store fully computed prompt chunks. Under scheduler-side
         # chunked prefill, seq.num_cached_tokens advances after each prefill
         # chunk's forward has completed; use it as the D2H-safe frontier.
@@ -821,6 +926,7 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
             )
             entry[1] = aligned
             self._save_inflight.add(sid)
+            self._save_inflight_tokens[sid] = max(0, aligned - int(saved))
         self._reqs_need_recv.clear()
         return meta
 
@@ -843,10 +949,22 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         return sid in self._save_inflight or self._has_pending_save(seq)
 
     def save_finished(self, req_id) -> None:
-        self._save_inflight.discard(str(req_id))
+        sid = str(req_id)
+        self._save_inflight.discard(sid)
+        saved_tokens = self._save_inflight_tokens.pop(sid, 0)
+        self.total_save_requests += 1
+        self.total_saved_tokens += saved_tokens
+
+    def load_finished(self, req_id) -> None:
+        sid = str(req_id)
+        loaded_tokens = self._load_inflight_tokens.pop(sid, 0)
+        self.total_load_requests += 1
+        self.total_loaded_tokens += loaded_tokens
 
     def load_failed(self, req_id) -> None:
         sid = str(req_id)
+        self._load_inflight_tokens.pop(sid, None)
+        self.total_load_failures += 1
         floor = self._load_save_floors.get(sid)
         entry = self._save_tracker.get(sid)
         if floor is not None and entry is not None:
@@ -859,5 +977,19 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
     def request_finished(self, seq) -> None:
         sid = str(seq.id)
         self._clear_pending_load(sid)
+        self._load_inflight_tokens.pop(sid, None)
         if not self.should_defer_free(seq):
+            self._save_inflight_tokens.pop(sid, None)
             self._save_tracker.pop(sid, None)
+
+    def get_statistics(self) -> dict[str, int]:
+        """Return cumulative and queue-depth stats without worker RPCs."""
+        return {
+            "load_requests": self.total_load_requests,
+            "loaded_tokens": self.total_loaded_tokens,
+            "load_failures": self.total_load_failures,
+            "save_requests": self.total_save_requests,
+            "saved_tokens": self.total_saved_tokens,
+            "loads_pending": len(self._load_inflight_tokens),
+            "saves_pending": len(self._save_inflight_tokens),
+        }

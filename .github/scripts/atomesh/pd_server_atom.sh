@@ -127,6 +127,14 @@ has_cli_flag() {
   [[ " ${args} " == *" ${flag} "* ]]
 }
 
+is_agentic_dpa() {
+  [[ "${BENCHMARK_KIND}" == "aiperf_agentic" ]] \
+    && {
+      has_cli_flag "${PREFILL_EXTRA_SERVER_ARGS}" "--enable-dp-attention" \
+        || has_cli_flag "${DECODE_EXTRA_SERVER_ARGS}" "--enable-dp-attention"
+    }
+}
+
 ISL_LIST="${ISL_LIST:-8192}"
 OSL="${OSL:-1024}"
 CONC_LIST="${CONC_LIST:-4,8}"
@@ -158,6 +166,10 @@ SWEBENCH_AGENT_TIMEOUT="${SWEBENCH_AGENT_TIMEOUT:-21600}"
 SWEBENCH_SCORE_TIMEOUT="${SWEBENCH_SCORE_TIMEOUT:-7200}"
 SWEBENCH_MAX_WORKERS="${SWEBENCH_MAX_WORKERS:-4}"
 SWEBENCH_EVAL_TIMEOUT="${SWEBENCH_EVAL_TIMEOUT:-900}"
+# The host daemon is shared with every other job on the node: refuse to start
+# without image headroom, and hand the pulled images back when the run ends.
+SWEBENCH_MIN_DISK_GB="${SWEBENCH_MIN_DISK_GB:-150}"
+SWEBENCH_PRUNE_IMAGES="${SWEBENCH_PRUNE_IMAGES:-true}"
 
 WAIT_SERVER_TIMEOUT="${WAIT_SERVER_TIMEOUT:-5000}"
 WAIT_ROUTER_TIMEOUT="${WAIT_ROUTER_TIMEOUT:-300}"
@@ -625,24 +637,32 @@ start_router() {
       ;;
   esac
 
+  local router_policy="${ROUTER_POLICY}"
   local -a router_rank_mapping_args=()
   if [[ "${ATOM_PD_RANK_MAPPING_POLICY}" != "none" ]] \
     && has_cli_flag "${PREFILL_EXTRA_SERVER_ARGS}" "--enable-dp-attention" \
     && has_cli_flag "${DECODE_EXTRA_SERVER_ARGS}" "--enable-dp-attention"; then
     router_rank_mapping_args=(
       --atom-pd-rank-mapping-policy "${ATOM_PD_RANK_MAPPING_POLICY}"
-      --dp-aware
     )
   fi
+  local -a router_dp_aware_args=()
+  if is_agentic_dpa; then
+    router_policy="dp_sticky"
+    router_dp_aware_args=(--dp-aware)
+  elif [[ "${#router_rank_mapping_args[@]}" -gt 0 ]]; then
+    router_dp_aware_args=(--dp-aware)
+  fi
   local -a router_cmd=(
-    /usr/local/bin/atomesh launch
+    /app/ATOM/atom/mesh/target/release/atomesh launch
     --host 0.0.0.0
     --port "${ROUTER_PORT}"
     --pd-disaggregation
     "${prefill_args[@]}"
     "${decode_args[@]}"
-    --policy "${ROUTER_POLICY}"
+    --policy "${router_policy}"
     "${router_rank_mapping_args[@]}"
+    "${router_dp_aware_args[@]}"
     --backend atom
     --log-level info
     --disable-circuit-breaker
@@ -752,8 +772,23 @@ def pct(name, key):
     return None
 
 
+def total_tokens(name):
+    """Return one of AIPerf's profiling-only aggregate token counters."""
+    value = avg(name)
+    return int(value) if isinstance(value, (int, float)) else None
+
+
+# These aggregates contain successful profiling records only: AIPerf excludes
+# its internal warmup and requests cancelled during grace-period draining.
+cache_hit_tokens = total_tokens("total_usage_prompt_cache_read_tokens")
+cache_total_tokens = total_tokens("total_usage_prompt_tokens")
+
 payload = {
     "benchmark_backend": "atom",
+    # Directory holding this run's profile_export.jsonl, so process_result.py can
+    # find the per-request records it needs for p90 e2e normalized interactivity
+    # without reconstructing the directory name.
+    "aiperf_artifact_dir": src.parent.name,
     "benchmark_model_name": os.environ.get("MODEL_NAME")
     or data.get("model")
     or data.get("model_id"),
@@ -792,16 +827,39 @@ payload = {
     or data.get("benchmark_duration_s"),
     "total_input_tokens": avg("total_usage_prompt_tokens"),
     "total_output_tokens": avg("total_usage_completion_tokens"),
+    "cache_hit_tokens": cache_hit_tokens,
+    "cache_total_tokens": cache_total_tokens,
+    "cache_hit_rate": (
+        round(cache_hit_tokens / cache_total_tokens, 4)
+        if cache_hit_tokens is not None and cache_total_tokens
+        else None
+    ),
 }
 
 payload = {key: value for key, value in payload.items() if value is not None}
 dst.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+if cache_hit_tokens is not None and cache_total_tokens:
+    print(
+        f"[aiperf] prefix cache hit: {cache_hit_tokens}/{cache_total_tokens} "
+        f"tokens ({cache_hit_tokens / cache_total_tokens:.2%})"
+    )
+else:
+    print(
+        "[aiperf] prefix cache hit: unavailable "
+        "(AIPerf profiling cache-read counters were not produced)"
+    )
 print(f"[aiperf] dashboard json: {dst}")
 PY
 }
 
 run_aiperf_agentic_benchmark() {
   ensure_aiperf
+
+  if is_agentic_dpa; then
+    export AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID=true
+  else
+    unset AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID
+  fi
 
   local safe_model="${MODEL_NAME//\//-}"
   local -a server_metrics_args=(--server-metrics)
@@ -915,6 +973,8 @@ run_swebench_lite_eval() {
   SWEBENCH_SCORE_TIMEOUT="${SWEBENCH_SCORE_TIMEOUT}" \
   SWEBENCH_MAX_WORKERS="${SWEBENCH_MAX_WORKERS}" \
   SWEBENCH_EVAL_TIMEOUT="${SWEBENCH_EVAL_TIMEOUT}" \
+  SWEBENCH_MIN_DISK_GB="${SWEBENCH_MIN_DISK_GB}" \
+  SWEBENCH_PRUNE_IMAGES="${SWEBENCH_PRUNE_IMAGES}" \
     bash "${runner}" \
       --output-dir "${result_dir}" \
       --model-name "${MODEL_NAME}" \

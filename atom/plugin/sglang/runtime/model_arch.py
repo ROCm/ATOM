@@ -10,9 +10,24 @@ from typing import Any
 GLM52_DSA_ARCH = "GlmMoeDsaForCausalLM"
 GLM52_DSA_MODEL_TYPE = "glm_moe_dsa"
 
+MODEL_TYPE_ADAPTER_ARCHES = {
+    GLM52_DSA_MODEL_TYPE: GLM52_DSA_ARCH,
+    "deepseek_v4": "DeepseekV4ForCausalLM",
+    "kimi_k3": "KimiK3ForConditionalGeneration",
+    "minimax_m3": "MiniMaxM3SparseForCausalLM",
+    "minimax_m3_vl": "MiniMaxM3SparseForConditionalGeneration",
+    "qwen3": "Qwen3ForCausalLM",
+    "qwen3_moe": "Qwen3MoeForCausalLM",
+    "qwen3_next": "Qwen3NextForCausalLM",
+    "qwen3_5": "Qwen3_5ForConditionalGeneration",
+    "qwen3_5_text": "Qwen3_5ForConditionalGeneration",
+    "qwen3_5_moe": "Qwen3_5MoeForConditionalGeneration",
+    "qwen3_5_moe_text": "Qwen3_5MoeForConditionalGeneration",
+}
+
 
 def is_glm52_dsa_config(config: Any) -> bool:
-    """Return whether an HF config describes GLM-5.2 DSA."""
+    """Return whether an HF config describes the GLM-5 DSA family."""
 
     archs = getattr(config, "architectures", None) or []
     return (
@@ -32,6 +47,8 @@ class SGLangModelAdapterSpec:
 
     wrapper_binds_gdn_context: bool = False
     uses_context_only_forward: bool = False
+    uses_text_config: bool = False
+    load_weights_prefix: str = "model."
     # SGLang initializes atom_config from the target ServerArgs but passes a
     # draft-local HF config to the external draft model. This early hook lets
     # adapters preserve target metadata and switch to the draft config before
@@ -41,6 +58,48 @@ class SGLangModelAdapterSpec:
     construction_context: Callable[[], AbstractContextManager[Any]] | None = None
     install_adapters: Callable[[Any], None] | None = None
     bind_cache_views: Callable[[Any, Any], None] | None = None
+    build_forward_metadata: Callable[[Any, Any, Any], Any] | None = None
+
+
+def _build_kimi_k3_forward_metadata(
+    atom_config: Any, forward_batch: Any, positions: Any
+) -> Any:
+    from atom.plugin.sglang.runtime.forward_context import _build_kimi_k3_metadata
+
+    return _build_kimi_k3_metadata(atom_config, forward_batch, positions)
+
+
+def _build_minimax_m3_forward_metadata(
+    atom_config: Any, forward_batch: Any, positions: Any
+) -> Any:
+    from atom.plugin.sglang.runtime.forward_context import _build_minimax_m3_metadata
+
+    return _build_minimax_m3_metadata(atom_config, forward_batch, positions)
+
+
+def _build_glm52_dsa_forward_metadata(
+    atom_config: Any, forward_batch: Any, positions: Any
+) -> Any:
+    from atom.plugin.sglang.runtime.forward_context import _build_glm52_dsa_metadata
+
+    return _build_glm52_dsa_metadata(atom_config, forward_batch, positions)
+
+
+def _build_deepseek_v4_forward_metadata(
+    atom_config: Any, forward_batch: Any, positions: Any
+) -> Any:
+    del atom_config
+    from atom.plugin.sglang.runtime.forward_context import _build_deepseek_v4_metadata
+
+    return _build_deepseek_v4_metadata(forward_batch, positions)
+
+
+def _build_eagle3_llama_forward_metadata(
+    atom_config: Any, forward_batch: Any, positions: Any
+) -> Any:
+    from atom.plugin.sglang.runtime.forward_context import _build_eagle3_llama_metadata
+
+    return _build_eagle3_llama_metadata(atom_config, forward_batch, positions)
 
 
 def _prepare_qwen35_config(atom_config: Any, model_arch: str) -> None:
@@ -68,6 +127,67 @@ def _prepare_kimi_k25_config(atom_config: Any, model_arch: str) -> None:
     )
 
     remap_kimi_k25_quant_config_for_sglang_plugin(atom_config, model_arch)
+
+
+def _prepare_kimi_k3_config(atom_config: Any, model_arch: str) -> None:
+    del model_arch
+    from atom.models.kimi_k3 import (
+        KimiK3ForCausalLM,
+        _kda_packed_modules_mapping,
+        _normalize_kimi_config,
+        _text_config,
+    )
+
+    text_config = _text_config(atom_config.hf_config)
+    _normalize_kimi_config(text_config)
+    # K3's SGLang bridge allocates a 128-token hybrid pool.  True MLA uses
+    # ATOM_MLA_PAGE_SIZE=1 with that pool rather than segmented MLA (page 64).
+    atom_config.kv_cache_block_size = 128
+    quant_config = getattr(atom_config, "quant_config", None)
+    if quant_config is not None:
+        quant_config.remap_layer_name(
+            atom_config.hf_config,
+            packed_modules_mapping=_kda_packed_modules_mapping(
+                text_config.kimi_kda_layers
+            ),
+            quant_exclude_name_mapping=KimiK3ForCausalLM.quant_exclude_name_mapping,
+        )
+
+
+def _kimi_k3_construction_context():
+    from atom.plugin.sglang.kimi_k3_bridge import (
+        kimi_k3_native_attention_construction,
+    )
+
+    return kimi_k3_native_attention_construction()
+
+
+def _bind_kimi_k3_cache_views(model: Any, runtime: Any) -> None:
+    from atom.plugin.sglang.attention_backend.attention_gdn import (
+        SGLangGDNForwardContext,
+    )
+    from atom.plugin.sglang.kimi_k3_bridge import (
+        bind_kimi_k3_cache_views,
+        maybe_get_kimi_k3_pools,
+    )
+    from atom.utils.forward_context import get_forward_context, set_kv_cache_data
+
+    token_to_kv_pool, _ = maybe_get_kimi_k3_pools(runtime.forward_batch)
+    if not bind_kimi_k3_cache_views(model, token_to_kv_pool):
+        raise RuntimeError("Kimi-K3 SGLang KV pool is not initialized")
+
+    attn_backend = SGLangGDNForwardContext._resolve_attn_backend(runtime.forward_batch)
+    linear_backend = SGLangGDNForwardContext._linear_attn_backend(attn_backend)
+    gdn_cache = SGLangGDNForwardContext._build_kv_cache_tensors(
+        runtime.forward_batch, linear_backend
+    )
+    if not gdn_cache:
+        raise RuntimeError("Kimi-K3 SGLang GDN state cache is not initialized")
+    ctx = get_forward_context()
+    kv_cache_data = dict(ctx.kv_cache_data or {})
+    kv_cache_data.update(gdn_cache)
+    set_kv_cache_data(kv_cache_data)
+    ctx.kv_cache_data = kv_cache_data
 
 
 def _prepare_minimax_m3_config(atom_config: Any, model_arch: str) -> None:
@@ -196,12 +316,12 @@ def _bind_glm52_dsa_cache_views(model: Any, runtime: Any) -> None:
 
     from atom.plugin.sglang.glm52_dsa_bridge import (
         bind_glm52_dsa_cache_views,
-        maybe_get_glm52_dsa_pools_from_sglang_backend,
+    )
+    from atom.plugin.sglang.runtime.attention_backend_resolver import (
+        resolve_sglang_runtime,
     )
 
-    token_to_kv_pool, _ = maybe_get_glm52_dsa_pools_from_sglang_backend(
-        runtime.forward_batch
-    )
+    token_to_kv_pool = resolve_sglang_runtime(runtime.forward_batch).token_to_kv_pool
     if not bind_glm52_dsa_cache_views(model, token_to_kv_pool):
         raise RuntimeError("GLM-5.2 SGLang DSA KV pool is not initialized")
 
@@ -233,7 +353,15 @@ def _bind_minimax_m3_cache_views(model: Any, runtime: Any) -> None:
         runtime.forward_batch
     )
     if not bind_minimax_m3_sparse_cache_views(model, token_to_kv_pool):
-        raise RuntimeError("MiniMax-M3 SGLang sparse KV pool is not initialized")
+        pool_type = (
+            type(token_to_kv_pool).__name__ if token_to_kv_pool is not None else None
+        )
+        raise RuntimeError(
+            "MiniMax-M3 SGLang sparse KV pool is not initialized: "
+            f"pool_type={pool_type}, "
+            f"has_get_kv_buffer={hasattr(token_to_kv_pool, 'get_kv_buffer')}, "
+            f"has_get_index_k_buffer={hasattr(token_to_kv_pool, 'get_index_k_buffer')}"
+        )
 
 
 def _prepare_eagle3_llama_draft_model_config(
@@ -304,11 +432,21 @@ MODEL_ADAPTER_SPECS = {
         construction_context=_glm52_dsa_construction_context,
         install_adapters=_install_glm52_dsa_native_adapters,
         bind_cache_views=_bind_glm52_dsa_cache_views,
+        build_forward_metadata=_build_glm52_dsa_forward_metadata,
         uses_context_only_forward=True,
     ),
     "KimiK25ForConditionalGeneration": SGLangModelAdapterSpec(
         prepare_config=_prepare_kimi_k25_config,
         install_adapters=_install_deepseek_mla_adapters,
+    ),
+    "KimiK3ForConditionalGeneration": SGLangModelAdapterSpec(
+        uses_context_only_forward=True,
+        uses_text_config=True,
+        load_weights_prefix="",
+        prepare_config=_prepare_kimi_k3_config,
+        construction_context=_kimi_k3_construction_context,
+        bind_cache_views=_bind_kimi_k3_cache_views,
+        build_forward_metadata=_build_kimi_k3_forward_metadata,
     ),
     "Qwen3ForCausalLM": SGLangModelAdapterSpec(),
     "Qwen3MoeForCausalLM": SGLangModelAdapterSpec(),
@@ -328,6 +466,7 @@ MODEL_ADAPTER_SPECS = {
     "DeepseekV4ForCausalLM": SGLangModelAdapterSpec(
         install_adapters=_install_deepseek_v4_adapters,
         bind_cache_views=_bind_deepseek_v4_cache_views,
+        build_forward_metadata=_build_deepseek_v4_forward_metadata,
     ),
     "MiniMaxM3SparseForCausalLM": SGLangModelAdapterSpec(
         uses_context_only_forward=True,
@@ -335,6 +474,7 @@ MODEL_ADAPTER_SPECS = {
         construction_context=_minimax_m3_construction_context,
         install_adapters=_install_minimax_m3_adapters,
         bind_cache_views=_bind_minimax_m3_cache_views,
+        build_forward_metadata=_build_minimax_m3_forward_metadata,
     ),
     "MiniMaxM3SparseForConditionalGeneration": SGLangModelAdapterSpec(
         uses_context_only_forward=True,
@@ -342,12 +482,14 @@ MODEL_ADAPTER_SPECS = {
         construction_context=_minimax_m3_construction_context,
         install_adapters=_install_minimax_m3_adapters,
         bind_cache_views=_bind_minimax_m3_cache_views,
+        build_forward_metadata=_build_minimax_m3_forward_metadata,
     ),
     "LlamaForCausalLMEagle3": SGLangModelAdapterSpec(
         uses_context_only_forward=True,
         prepare_draft_model_config=_prepare_eagle3_llama_draft_model_config,
         construction_context=_eagle3_llama_construction_context,
         bind_cache_views=_bind_eagle3_llama_cache_views,
+        build_forward_metadata=_build_eagle3_llama_forward_metadata,
     ),
 }
 
@@ -360,6 +502,7 @@ MODEL_ARCH_SPECS = {
         "DeepseekV3ForCausalLM",
         "DeepseekV32ForCausalLM",
         GLM52_DSA_ARCH,
+        "KimiK3ForConditionalGeneration",
         "Qwen3ForCausalLM",
         "Qwen3MoeForCausalLM",
         "Qwen3NextForCausalLM",
@@ -374,3 +517,23 @@ MODEL_ARCH_SPECS = {
 
 def get_model_arch_spec(model_arch: str) -> SGLangModelAdapterSpec:
     return MODEL_ADAPTER_SPECS.get(model_arch, SGLangModelAdapterSpec())
+
+
+def resolve_model_arch_spec(config: Any) -> tuple[str, SGLangModelAdapterSpec]:
+    """Resolve an adapter by exact architecture, then stable model family."""
+
+    architectures = getattr(config, "architectures", None) or []
+    for architecture in architectures:
+        model_arch = str(architecture)
+        if model_arch in MODEL_ADAPTER_SPECS:
+            return model_arch, MODEL_ADAPTER_SPECS[model_arch]
+
+    configs = (config, getattr(config, "text_config", None))
+    for candidate in configs:
+        model_type = str(getattr(candidate, "model_type", "") or "").lower()
+        model_arch = MODEL_TYPE_ADAPTER_ARCHES.get(model_type)
+        if model_arch is not None:
+            return model_arch, MODEL_ADAPTER_SPECS[model_arch]
+
+    model_arch = str(architectures[0]) if architectures else ""
+    return model_arch, get_model_arch_spec(model_arch)

@@ -4,7 +4,6 @@
 import inspect
 import logging
 from dataclasses import dataclass
-from typing import List, Optional, Type
 
 import numpy as np
 import torch
@@ -38,6 +37,7 @@ from atom.utils.block_convert import (
 from atom.utils.forward_context import AttentionMetaData, Context
 
 from .backends import AttentionBackend, CommonAttentionBuilder
+from .sub_pool_spec import SubPoolSpec, page_pool
 
 logger = logging.getLogger("atom")
 
@@ -80,11 +80,11 @@ class MLAChunkContextMetadata:
     iteration); only `[:total_tokens[c]]` is valid for chunk c.
     """
 
-    kv_indptr: List[torch.Tensor]
-    kv_indices: List[torch.Tensor]
-    cu_seqlens_k: List[torch.Tensor]
-    total_tokens: List[int]
-    max_seqlen_k: List[int]
+    kv_indptr: list[torch.Tensor]
+    kv_indices: list[torch.Tensor]
+    cu_seqlens_k: list[torch.Tensor]
+    total_tokens: list[int]
+    max_seqlen_k: list[int]
     num_chunks: int
     k_workspace: torch.Tensor
     v_workspace: torch.Tensor
@@ -125,11 +125,11 @@ class AiterMLABackend(AttentionBackend):
         return "ROCM_AITER_MLA"
 
     @staticmethod
-    def get_builder_cls() -> Type["AiterMLAMetadataBuilder"]:
+    def get_builder_cls() -> type["AiterMLAMetadataBuilder"]:
         return AiterMLAMetadataBuilder
 
     @staticmethod
-    def get_impl_cls() -> Type["MLAAttention"]:
+    def get_impl_cls() -> type["MLAAttention"]:
         return MLAAttention
 
 
@@ -263,6 +263,19 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 dtype=torch.int32,
                 device=self.device,
             )
+            # DCP sparse decode compacts each rank's owned top-k slots to the
+            # front (no -1 holes), so the per-request region length becomes data-
+            # AND layer-dependent.
+            self._dcp_sparse_kv_indptr_gpu = torch.zeros(
+                self.max_num_batched_tokens + 1,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self._dcp_owned_counts_gpu = torch.zeros(
+                self.max_num_batched_tokens,
+                dtype=torch.int32,
+                device=self.device,
+            )
             (
                 (spp_wmd_size, spp_wmd_type),
                 (spp_wi_size, spp_wi_type),
@@ -346,8 +359,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # Allocated outside any per-step scope so a single buffer is shared
         # across all chunks and layers.
         self.attn_prefill_chunk_size = config.attn_prefill_chunk_size
-        self.k_chunk_workspace: Optional[torch.Tensor] = None
-        self.v_chunk_workspace: Optional[torch.Tensor] = None
+        self.k_chunk_workspace: torch.Tensor | None = None
+        self.v_chunk_workspace: torch.Tensor | None = None
         if self.attn_prefill_chunk_size > 0:
             qk_head_dim = hf_config.qk_nope_head_dim + hf_config.qk_rope_head_dim
             v_head_dim = hf_config.v_head_dim
@@ -386,11 +399,16 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         if self.is_sparse:
             sfc = config.compilation_config.static_forward_context
             for module in sfc.values():
-                if hasattr(module, "sparse_kv_indices_buffer"):
-                    module.sparse_kv_indices_buffer = self._sparse_kv_indices_gpu
                 impl = getattr(module, "impl", None)
-                if impl is not None and hasattr(impl, "sparse_kv_indices_buffer"):
-                    impl.sparse_kv_indices_buffer = self._sparse_kv_indices_gpu
+                # DCP compact buffers ride along with the indices buffer: the
+                # indexer writes all three, the attention impl reads the indices
+                # and the offsets in the same layer.
+                for tgt in (module, impl):
+                    if tgt is None or not hasattr(tgt, "sparse_kv_indices_buffer"):
+                        continue
+                    tgt.sparse_kv_indices_buffer = self._sparse_kv_indices_gpu
+                    tgt.dcp_sparse_kv_indptr_buffer = self._dcp_sparse_kv_indptr_gpu
+                    tgt.dcp_owned_counts_buffer = self._dcp_owned_counts_gpu
             self._token_to_seq_idxs_gpu = torch.zeros(
                 self.max_num_batched_tokens,
                 dtype=torch.int32,
@@ -801,10 +819,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             )
         return result
 
-    def compute_block_bytes(self) -> int:
-        """MLA per-block bytes: single 576-dim packed tensor per layer
-        (k_c + k_pe; V is absorbed into latent compression — no separate
-        V cache or kv_scale).
+    def sub_pool_specs(self) -> list[SubPoolSpec]:
+        """One paged KV pool. Per-block bytes = a single 576-dim packed
+        tensor per layer (k_c + k_pe; V is absorbed into latent compression —
+        no separate V cache or kv_scale).
 
         DeepSeek-V3.2 sparse variant adds an indexer cache contribution
         for every bound layer, including draft/MTP layers.
@@ -825,7 +843,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 * aligned_index_dim
                 * dtypes.fp8.itemsize
             )
-        return block_bytes
+        return [page_pool(block_bytes)]
 
     def allocate_kv_cache_tensors(
         self, num_kv_heads: int, num_draft_layers: int
@@ -901,12 +919,16 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 runner.aligned_index_dim,
             )
         module.kv_cache = kv_cache
+        index_cache = None
+        if runner.is_deepseek_v32 and hasattr(runner, "index_cache"):
+            index_cache = runner.index_cache[layer_id]
         return KVCacheTensor(
             layer_num=layer_id,
             k_cache=kv_cache,
             v_cache=None,
             k_scale=None,
             v_scale=None,
+            index_cache=index_cache,
         )
 
     def get_kv_transfer_tensors(self):
@@ -949,6 +971,58 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             slot_regions=[],
             num_blocks=runner.config.num_kvcache_blocks,
         )
+
+    def _build_dcp_indexer_prefill_meta(self, attn_metadata, bs: int, counts, var):
+        """Metadata for the DCP sparse-prefill indexer gather.
+
+        The indexer scores against the WHOLE sequence, but under DCP each rank's
+        index cache holds only the round-robin 1/W shard. The fix mirrors the
+        decode side: gather the local shard with *local* cu_seqlens, all-gather
+        it, then de-interleave back to global order.
+
+        Two products, both rank-independent in shape so the all-gather is a plain
+        concat:
+
+        ``dcp_indexer_local_cu_seqlens``
+            cumsum of ``Lpad[b] = ceil(g_b / W)`` -- the per-sequence local length
+            PADDED to the max over ranks, so every rank gathers the same count.
+            Reading past a rank's real local length stays inside its allocated
+            blocks (``ceil(g/(bs*W))*bs >= ceil(g/W)``), so the padding slots read
+            uninitialized cache rather than out of bounds; they are dropped by the
+            de-interleave below.
+
+        ``dcp_indexer_gather_index``
+            output-position -> source index into the flattened all-gathered
+            ``[W, sum(Lpad)]`` buffer. Global sequence-local position ``p`` lives on
+            rank ``p % W`` at local index ``p // W``, hence
+            ``src = (p % W) * sum(Lpad) + cu_pad[b] + p // W``.
+        """
+        W = self.dcp_world_size
+        if attn_metadata.has_cached:
+            g_cu = var["cu_seqlens_k"].np[: bs + 1].astype(np.int64)
+        else:
+            g_cu = var["cu_seqlens_q"].np[: bs + 1].astype(np.int64)
+        g_lens = g_cu[1:] - g_cu[:bs]
+        del counts  # kept for signature symmetry with the caller's other helpers
+
+        lpad = (g_lens + W - 1) // W
+        cu_pad = np.zeros(bs + 1, dtype=np.int64)
+        np.cumsum(lpad, out=cu_pad[1:])
+        local_total = int(cu_pad[bs])
+        total_kv = int(g_cu[bs])
+
+        # Position within its sequence for every global KV token.
+        pos = np.arange(total_kv, dtype=np.int64) - np.repeat(g_cu[:bs], g_lens)
+        src = (pos % W) * local_total + np.repeat(cu_pad[:bs], g_lens) + pos // W
+
+        dev = self.device
+        attn_metadata.dcp_indexer_local_total = local_total
+        attn_metadata.dcp_indexer_local_cu_seqlens = torch.from_numpy(
+            cu_pad.astype(np.int32)
+        ).to(dev, non_blocking=True)
+        attn_metadata.dcp_indexer_gather_index = torch.from_numpy(
+            src.astype(np.int32)
+        ).to(dev, non_blocking=True)
 
     def prepare_prefill(self, batch: ScheduledBatch):
         attn_metadata, positions = CommonAttentionBuilder.prepare_prefill(self, batch)
@@ -1017,6 +1091,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.sparse_kv_indptr = var["sparse_kv_indptr"].copy_to_gpu(
                 sum_scheduled_tokens + 1
             )
+            if self.dcp_world_size > 1:
+                self._build_dcp_indexer_prefill_meta(attn_metadata, bs, counts, var)
             get_mla_metadata_v1(
                 attn_metadata.sparse_cu_seqlens_q,
                 attn_metadata.sparse_kv_indptr,
@@ -1125,7 +1201,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
     def _build_mla_chunk_meta(
         self, batch: ScheduledBatch, bs: int
-    ) -> Optional[MLAChunkContextMetadata]:
+    ) -> MLAChunkContextMetadata | None:
         """Build per-chunk slices of the cached prefix.
 
         Chunks the cached-prefix tokens along the GLOBAL token axis (not the
@@ -1150,7 +1226,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         # Per-seq absolute slot id for every cached token, in seq order, then
         # concatenated into a single global slot array of length total_cached.
-        per_seq_slots: List[np.ndarray] = []
+        per_seq_slots: list[np.ndarray] = []
         for i in range(bs):
             cached_len = int(cached_lens[i])
             if cached_len == 0:
@@ -1169,11 +1245,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         seq_offsets = np.zeros(bs + 1, dtype=np.int64)
         np.cumsum(cached_lens, out=seq_offsets[1:])
 
-        kv_indptr_list: List[torch.Tensor] = []
-        kv_indices_list: List[torch.Tensor] = []
-        cu_seqlens_k_list: List[torch.Tensor] = []
-        total_tokens_list: List[int] = []
-        max_seqlen_k_list: List[int] = []
+        kv_indptr_list: list[torch.Tensor] = []
+        kv_indices_list: list[torch.Tensor] = []
+        cu_seqlens_k_list: list[torch.Tensor] = []
+        total_tokens_list: list[int] = []
+        max_seqlen_k_list: list[int] = []
 
         for c in range(num_chunks):
             g_start = c * chunk_size

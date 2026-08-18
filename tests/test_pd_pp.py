@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # PD-disaggregation + pipeline-parallel unit tests (GPU-free).
 
+import os
 import sys
 import threading
 import types
@@ -163,6 +164,51 @@ def test_producer_advertises_remote_pp_size():
     mc.MooncakeConnectorScheduler.request_finished(sched, seq)
     assert seq.kv_transfer_params_output["remote_pp_size"] == 4
     assert seq.kv_transfer_params_output["remote_block_ids"] == [1, 2, 3]
+
+
+# ---------------------------------------------------------------------------
+# Mooncake transport selection
+# ---------------------------------------------------------------------------
+
+
+def test_mooncake_tcp_disables_rdma_device_even_when_configured():
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    assert mc._select_ib_device("tcp", "rdma0", None) == ""
+    assert mc._select_ib_device(" TCP ", "ionic_0", None) == ""
+
+
+def test_mooncake_tcp_forces_transfer_engine_transport(monkeypatch):
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    monkeypatch.delenv("MC_FORCE_TCP", raising=False)
+    mc._configure_mooncake_transport(" TCP ")
+    assert os.environ["MC_FORCE_TCP"] == "true"
+
+
+def test_mooncake_rdma_preserves_explicit_device():
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    assert mc._select_ib_device("rdma", "ionic_3", None) == "ionic_3"
+
+
+def test_mooncake_rdma_auto_selects_from_physical_gpu(monkeypatch):
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    monkeypatch.setattr(mc, "_auto_select_ib_device", lambda idx: f"auto{idx}")
+    assert mc._select_ib_device("rdma", "", 5) == "auto5"
+
+
+def test_mooncake_rdma_requires_gpu_index_without_explicit_device():
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    with pytest.raises(ValueError, match="physical GPU index"):
+        mc._select_ib_device("rdma", "", None)
 
 
 # ---------------------------------------------------------------------------

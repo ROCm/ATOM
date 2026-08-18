@@ -51,16 +51,14 @@ from `unified_kv` (Main) or the FP8 indexer pool, not from the kernel
 return).
 """
 
-from typing import Optional
-
 import torch
 import triton
 import triton.language as tl
 
-from atom.utils.decorators import mark_trace
-
 from atom.model_ops.v4_kernels.compress_plan import CompressPlan
+from atom.model_ops.v4_kernels.pool_index import row_offset
 from atom.utils import envs
+from atom.utils.decorators import mark_trace
 
 # Optional flydsl path (aiter ROCm kernels). Falls back to Triton when
 # unavailable. HCA = compress + norm_rope_scatter 2-kernel split for
@@ -192,8 +190,15 @@ def _fused_compress_attn_kernel(
 
         s_safe = tl.maximum(s, 0)
         ring = s_safe % STATE_SIZE
+        # 64 bits on the slot term: the compressor state sits at the front of
+        # a slot in the shared plane, so consecutive slots are a whole slot
+        # apart and the product runs the length of the pool — well past what a
+        # 32-bit multiply holds, and it wraps silently. `ring`, `col_off` and
+        # `d` stay inside one entry and need no widening.
         state_row_off = (
-            slot * kv_state_slot_stride + ring * kv_state_pos_stride + col_off
+            row_offset(slot, kv_state_slot_stride)
+            + ring * kv_state_pos_stride
+            + col_off
         )
         kv_b = tl.load(
             kv_state_ptr + state_row_off + d,
@@ -202,7 +207,7 @@ def _fused_compress_attn_kernel(
         )
         score_b = tl.load(
             score_state_ptr
-            + slot * score_state_slot_stride
+            + row_offset(slot, score_state_slot_stride)
             + ring * score_state_pos_stride
             + col_off
             + d,
@@ -587,7 +592,11 @@ def fused_compress_attn(
     # fused wkv_gate output). Inner column stride must be 1 — kernel uses
     # `+ d` for the BLOCK_D offset.
     assert kv_in.stride(-1) == 1 and score_in.stride(-1) == 1
-    assert kv_state.is_contiguous() and score_state.is_contiguous()
+    # State slot / ring strides are passed to the kernel, so the states may be
+    # strided views — they are slices of a per-request arena where the slot
+    # stride is the whole entry, not this field alone. Only the innermost dim
+    # has to be unit stride: the kernel addresses it as `col_off + d`.
+    assert kv_state.stride(-1) == 1 and score_state.stride(-1) == 1
     assert ape.is_contiguous() and rms_weight.is_contiguous()
     has_bt = block_tables is not None
     if has_bt:

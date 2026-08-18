@@ -55,6 +55,8 @@ on:
           - GLM-5.2 FP8 TP4
           - GLM-5.2 FP8 TP4 PCP4
           - GLM-5.2 FP4 TP4
+          - Kimi-K3 TP8
+          - GLM-5.2 FP4 TP4 MTP3
           - MiniMax-M3-MXFP4 TP4
           - MiniMax-M3-MXFP8 EAGLE3 TP4 MTP3
       model_mi308:
@@ -136,7 +138,7 @@ jobs:
           import re
           import sys
           import time
-          from datetime import datetime
+          from datetime import datetime, timedelta
           from pathlib import Path
           from urllib.error import HTTPError, URLError
           from urllib.parse import quote, urlencode
@@ -161,7 +163,8 @@ jobs:
           if not version_match:
               raise SystemExit("Failed to read SGLANG_VERSION from .github/workflows/docker-release.yaml")
 
-          today = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y%m%d")
+          today_date = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+          today = today_date.strftime("%Y%m%d")
           version = version_match.group(1)
           tag = f"sglang-v{version}-nightly_{today}"
           nightly_pattern = re.compile(r"^sglang-v(?P<version>.+)-nightly_(?P<date>\d{8})$")
@@ -230,22 +233,33 @@ jobs:
                   url = next_page_url(url, headers.get("Link"))
               return tags
 
-          def latest_recent_nightly_tag(token):
+          def latest_recent_nightly_tag(token, max_age_days=1):
+              allowed_dates = {
+                  (today_date - timedelta(days=offset)).strftime("%Y%m%d")
+                  for offset in range(max_age_days + 1)
+              }
               candidates = []
               for candidate in list_tags(token):
                   match = nightly_pattern.match(candidate)
                   if not match:
                       continue
+                  if match.group("version") != version:
+                      continue
+                  if match.group("date") not in allowed_dates:
+                      continue
                   candidates.append(
                       (
                           match.group("date"),
-                          1 if match.group("version") == version else 0,
                           candidate,
                       )
                   )
               if not candidates:
-                  raise RuntimeError(f"No SGLang nightly tags were found in {repository}")
-              return max(candidates)[2]
+                  allowed = ", ".join(sorted(allowed_dates))
+                  raise RuntimeError(
+                      f"No SGLang nightly tags for version {version} were found in {repository} "
+                      f"within allowed dates: {allowed}"
+                  )
+              return max(candidates)[1]
 
           def write_selected_image(image_tag, digest, resolution):
               image = f"{repository}:{image_tag}@{digest}"
@@ -286,13 +300,27 @@ jobs:
                   last_error = str(exc)
                   print(f"Warning: failed to check {repository}:{tag}: {last_error}", file=sys.stderr)
 
+              try:
+                  fallback_tag = latest_recent_nightly_tag(token, max_age_days=1)
+                  if fallback_tag != tag:
+                      digest = get_digest(token, fallback_tag)
+                      image = write_selected_image(fallback_tag, digest, "recent-nightly-tag")
+                      print(
+                          f"{repository}:{tag} is not available yet; "
+                          f"using recent SGLang nightly image: {image}"
+                      )
+                      break
+              except (HTTPError, RuntimeError, URLError) as exc:
+                  last_error = str(exc)
+
               remaining = deadline - time.monotonic()
               if remaining <= 0:
                   print(
                       f"Timed out waiting for scheduled SGLang image {repository}:{tag}. "
-                      f"Falling back to the latest recent SGLang nightly tag. Last error: {last_error or 'not found'}"
+                      f"Falling back to a same-version nightly tag from today/yesterday. "
+                      f"Last error: {last_error or 'not found'}"
                   )
-                  fallback_tag = latest_recent_nightly_tag(token)
+                  fallback_tag = latest_recent_nightly_tag(token, max_age_days=1)
                   digest = get_digest(token, fallback_tag)
                   image = write_selected_image(fallback_tag, digest, "recent-nightly-tag")
                   print(f"Using latest recent SGLang image: {image}")
@@ -319,6 +347,7 @@ jobs:
       publish_to_dashboard: ${{ steps.resolve.outputs.publish_to_dashboard }}
       upload_to_custom_dashboard: ${{ steps.resolve.outputs.upload_to_custom_dashboard }}
       workload_label: ${{ steps.resolve.outputs.workload_label }}
+      use_workspace_atom: ${{ steps.resolve.outputs.use_workspace_atom }}
     steps:
       - name: Checkout selected branch
         uses: actions/checkout@v6
@@ -350,6 +379,7 @@ jobs:
           REBUILD_SGLANG_IMAGE=false
           SGLANG_IMAGE_SOURCE="prebuilt"
           USER_PROVIDED_SGLANG_IMAGE=false
+          USE_WORKSPACE_ATOM=true
           RESOLVED_PREBUILT_ALIAS=""
           RESOLVED_PREBUILT_DIGEST=""
           PREBUILT_RESOLUTION_TYPE=""
@@ -361,6 +391,7 @@ jobs:
           elif [[ "${GITHUB_EVENT_NAME}" == "schedule" && "${NORMALIZED_REF}" == "main" && -n "${SCHEDULED_SGLANG_IMAGE}" ]]; then
             PREBUILT_SGLANG_IMAGE="${SCHEDULED_SGLANG_IMAGE}"
             SGLANG_IMAGE_SOURCE="prebuilt-scheduled-nightly"
+            USE_WORKSPACE_ATOM=false
             RESOLVED_PREBUILT_ALIAS="rocm/atom-dev:${SCHEDULED_SGLANG_TAG}"
             RESOLVED_PREBUILT_DIGEST="${SCHEDULED_SGLANG_DIGEST}"
             PREBUILT_RESOLUTION_TYPE="${SCHEDULED_SGLANG_RESOLUTION:-scheduled-nightly-tag}"
@@ -460,6 +491,7 @@ jobs:
             echo "publish_to_dashboard=${PUBLISH_TO_DASHBOARD}"
             echo "upload_to_custom_dashboard=${UPLOAD_TO_CUSTOM_DASHBOARD}"
             echo "workload_label=${WORKLOAD_LABEL}"
+            echo "use_workspace_atom=${USE_WORKSPACE_ATOM}"
           } >> "$GITHUB_OUTPUT"
 
           printf '### SGLang benchmark source\n- Repository: `%s`\n- Ref: `%s`\n- Image mode: `%s`\n' \
@@ -513,9 +545,12 @@ jobs:
                   "${RESOLVED_PREBUILT_DIGEST}" >> "$GITHUB_STEP_SUMMARY"
                 ;;
               recent-nightly-tag)
-                printf -- '- Resolution: today'\''s nightly tag was not available before the wait timeout, so this run uses the latest recent SGLang nightly tag `%s` pinned to digest `%s`.\n' \
-                  "${RESOLVED_NIGHTLY_TAG}" \
-                  "${RESOLVED_PREBUILT_DIGEST}" >> "$GITHUB_STEP_SUMMARY"
+                {
+                  printf -- '- Resolution: today'\''s nightly tag was not available before the wait timeout, '
+                  printf -- 'so this run uses the latest recent SGLang nightly tag `%s` pinned to digest `%s`.\n' \
+                    "${RESOLVED_NIGHTLY_TAG}" \
+                    "${RESOLVED_PREBUILT_DIGEST}"
+                } >> "$GITHUB_STEP_SUMMARY"
                 ;;
               resolution-failed)
                 printf -- '- Resolution: digest pinning itself failed, so this run falls back to floating `sglang-latest`.\n' \
@@ -672,6 +707,7 @@ jobs:
               "GLM-5.2 FP8 TP4": "glm-5-2-fp8-tp4",
               "GLM-5.2 FP8 TP4 PCP4": "glm-5-2-fp8-tp4-pcp4",
               "GLM-5.2 FP4 TP4": "glm-5-2-fp4-tp4",
+              "GLM-5.2 FP4 TP4 MTP3": "glm-5-2-fp4-tp4-mtp3",
               "MiniMax-M3-MXFP4 TP4": "minimax-m3-mxfp4-tp4",
               "MiniMax-M3-MXFP8 EAGLE3 TP4 MTP3": "minimax-m3-mxfp8-eagle3-tp4-mtp3",
               "MI308 Qwen3.5-397B-A17B-FP8 TP4": "qwen3-5-397b-a17b-fp8-tp4-mi308",
@@ -704,6 +740,7 @@ jobs:
               "glm-5-2-fp8-tp4",
               "glm-5-2-fp8-tp4-pcp4",
               "glm-5-2-fp4-tp4",
+              "glm-5-2-fp4-tp4-mtp3",
               "minimax-m3-mxfp4-tp4",
           ]
           OOB_P1_PREFIX_ORDER = [
@@ -856,7 +893,6 @@ jobs:
       && needs.load-models.outputs.has_enabled_models == 'true'
     runs-on: ubuntu-latest
     outputs:
-      benchmark_matrix: ${{ steps.build.outputs.benchmark_matrix }}
       benchmark_matrix_mi355: ${{ steps.build.outputs.benchmark_matrix_mi355 }}
       benchmark_matrix_mi308: ${{ steps.build.outputs.benchmark_matrix_mi308 }}
       has_benchmark_cells: ${{ steps.build.outputs.has_benchmark_cells }}
@@ -927,13 +963,11 @@ jobs:
           mi355_rows = [row for row in include if not is_mi308_row(row)]
 
           sep = (",", ":")
-          full = json.dumps({"include": include}, separators=sep)
           j355 = json.dumps({"include": mi355_rows}, separators=sep)
           j308 = json.dumps({"include": mi308_rows}, separators=sep)
 
           gh_out = os.environ["GITHUB_OUTPUT"]
           with open(gh_out, "a", encoding="utf-8") as fh:
-              fh.write(f"benchmark_matrix={full}\n")
               fh.write(f"benchmark_matrix_mi355={j355}\n")
               fh.write(f"benchmark_matrix_mi308={j308}\n")
               fh.write("has_benchmark_cells=" + ("false" if not include else "true") + "\n")
@@ -943,7 +977,7 @@ jobs:
           if not include:
               print("No eligible benchmark cases remain after model-specific parameter filtering.", file=sys.stderr)
           else:
-              print(f"Benchmark matrix (full): {full}", file=sys.stderr)
+              print(f"Benchmark cells: {len(include)}", file=sys.stderr)
               print(f"MI355 shard cells: {len(mi355_rows)}, MI308 shard cells: {len(mi308_rows)}", file=sys.stderr)
           PY
 
@@ -1079,6 +1113,7 @@ jobs:
       selected_sglang_version: ${{ needs.resolve-atom-source.outputs.selected_sglang_version }}
       publish_to_dashboard: ${{ needs.resolve-atom-source.outputs.publish_to_dashboard }}
       upload_to_custom_dashboard: ${{ needs.resolve-atom-source.outputs.upload_to_custom_dashboard }}
+      use_workspace_atom: ${{ needs.resolve-atom-source.outputs.use_workspace_atom }}
       sglang_image_tag: ${{ needs.build-sglang-image.outputs.sglang_image_tag || needs.resolve-atom-source.outputs.prebuilt_sglang_image }}
       atom_source_sha_for_checkout: ${{ needs.build-sglang-image.outputs.atom_source_sha || github.sha }}
 
@@ -1108,6 +1143,7 @@ jobs:
       selected_sglang_version: ${{ needs.resolve-atom-source.outputs.selected_sglang_version }}
       publish_to_dashboard: ${{ needs.resolve-atom-source.outputs.publish_to_dashboard }}
       upload_to_custom_dashboard: ${{ needs.resolve-atom-source.outputs.upload_to_custom_dashboard }}
+      use_workspace_atom: ${{ needs.resolve-atom-source.outputs.use_workspace_atom }}
       sglang_image_tag: ${{ needs.build-sglang-image.outputs.sglang_image_tag || needs.resolve-atom-source.outputs.prebuilt_sglang_image }}
       atom_source_sha_for_checkout: ${{ needs.build-sglang-image.outputs.atom_source_sha || github.sha }}
 
@@ -1168,9 +1204,23 @@ jobs:
 
       - name: Generate SGLang benchmark summary table
         env:
-          BENCHMARK_MATRIX: ${{ needs.build-benchmark-matrix.outputs.benchmark_matrix }}
+          BENCHMARK_MATRIX_MI355: ${{ needs.build-benchmark-matrix.outputs.benchmark_matrix_mi355 }}
+          BENCHMARK_MATRIX_MI308: ${{ needs.build-benchmark-matrix.outputs.benchmark_matrix_mi308 }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
+          BENCHMARK_MATRIX="$(python3 - <<'PY'
+          import json
+          import os
+
+          include = []
+          for name in ("BENCHMARK_MATRIX_MI355", "BENCHMARK_MATRIX_MI308"):
+              raw = os.environ.get(name) or '{"include":[]}'
+              include.extend(json.loads(raw).get("include", []))
+
+          print(json.dumps({"include": include}, separators=(",", ":")))
+          PY
+          )"
+
           python3 .github/scripts/plugin_benchmark_summary.py \
             --result-dir . \
             --matrix-json "${BENCHMARK_MATRIX}" \

@@ -4,6 +4,30 @@ import logging
 logger = logging.getLogger("atom")
 
 
+def _make_atom_compatible_eagle3_type(original_cls, atom_model_base):
+    """Return a real type that accepts native and ATOM EAGLE3 models.
+
+    vLLM keeps concrete model classes directly inside an ``isinstance`` tuple.
+    Replacing one of those globals with a tuple creates a nested tuple and makes
+    ``isinstance`` raise ``TypeError``. A type with a custom instance check
+    widens the same guard without changing vLLM's proposer implementation.
+    """
+
+    class _AtomCompatibleEagle3Meta(type):
+        def __instancecheck__(cls, instance):
+            return isinstance(instance, (original_cls, atom_model_base))
+
+    return _AtomCompatibleEagle3Meta(
+        original_cls.__name__,
+        (),
+        {
+            "__module__": original_cls.__module__,
+            "_atom_eagle3_model_type_proxy": True,
+            "_atom_original_type": original_cls,
+        },
+    )
+
+
 def _patch_eagle3_model_type_checks() -> None:
     # vLLM's V1 EAGLE proposer SpecDecodeBaseProposer.propose() has an explicit
     # isinstance() check for native vLLM EAGLE3 model classes before calling
@@ -11,9 +35,10 @@ def _patch_eagle3_model_type_checks() -> None:
     # through the ATOMModelBase wrapper, so patch the type checks to accept the
     # ATOMModelBase wrapper
     try:
+        from vllm.v1.spec_decode import llm_base_proposer
+
         from atom.plugin.vllm.model_wrapper import ATOMModelBase
-        import vllm.v1.spec_decode.llm_base_proposer as llm_base_proposer
-    except Exception:
+    except Exception:  # noqa: BLE001
         logger.warning(
             "vLLM plugin: failed to patch vLLM V1 EAGLE3 proposer type checks. "
             "This can happen if you are using an in-compatible vLLM version. "
@@ -24,18 +49,22 @@ def _patch_eagle3_model_type_checks() -> None:
     if getattr(llm_base_proposer, "_atom_eagle3_model_types_patched", False):
         return
 
-    # Supported archs in vLLM's `llm_base_proposer.py`
+    # Widen one class in vLLM's isinstance tuple. A single proxy is sufficient
+    # because it accepts ATOMModelBase while preserving the native class check.
     for name in ("Eagle3LlamaForCausalLM", "Eagle3DeepseekV2ForCausalLM"):
         original = getattr(llm_base_proposer, name, None)
         if original is None:
             continue
         if isinstance(original, tuple):
-            widened = (*original, ATOMModelBase)
-        else:
-            widened = (original, ATOMModelBase)
-        setattr(llm_base_proposer, name, widened)
+            original = original[0]
+        setattr(
+            llm_base_proposer,
+            name,
+            _make_atom_compatible_eagle3_type(original, ATOMModelBase),
+        )
+        break
 
-    setattr(llm_base_proposer, "_atom_eagle3_model_types_patched", True)
+    llm_base_proposer._atom_eagle3_model_types_patched = True
     logger.info("ATOM plugin: patched vLLM EAGLE3 proposer type checks.")
 
 
@@ -542,6 +571,8 @@ def apply_vllm_spec_decode_patch() -> None:
     _patch_vllm_draft_positions_on_metadata()
     _patch_vllm_deepseek_v4_mtp_first_pass_inputs()
 
+    from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
+
     from atom.plugin.vllm.attention.metadata import (
         AiterMhaMetadataForVllm,
         AiterMlaMetadataForVllm,
@@ -551,7 +582,6 @@ def apply_vllm_spec_decode_patch() -> None:
     from atom.utils.forward_context import (
         AttentionMetaData as AtomAttentionMetaData,
     )
-    from vllm.v1.spec_decode.eagle import SpecDecodeBaseProposer
 
     _patch_eagle3_model_type_checks()
     _patch_heterogeneous_eagle3_kv_cache()

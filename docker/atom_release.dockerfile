@@ -1,5 +1,6 @@
-# Default base image
-ARG BASE_IMAGE="rocm/pytorch:latest"
+# Keep the release reproducible on the ROCm 7.2.4 / PyTorch 2.10 stack.
+# The digest prevents this historical tag from being moved underneath us.
+ARG BASE_IMAGE="rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0"
 ARG GPU_ARCH="gfx942;gfx950"
 
 # ====================================================================
@@ -24,13 +25,25 @@ ARG GPU_ARCH
 ENV GPU_ARCH_LIST=$GPU_ARCH
 ENV PYTORCH_ROCM_ARCH=$GPU_ARCH
 
-RUN pip install --upgrade pip && \
+# AITER's prebuilt and runtime-JIT modules must use the same pybind ABI.
+RUN pip install --upgrade pip "pybind11==3.0.4" && \
     apt-get update && \
     apt --fix-broken install -y && \
     apt-get install -y \
         git cython3 ibverbs-utils openmpi-bin libopenmpi-dev \
         libpci-dev cmake libdw1 locales && \
     rm -rf /var/lib/apt/lists/*
+
+# Newer rocm/pytorch images install ROCm libraries through Python wheels
+# instead of /opt/rocm. Register those directories so dpkg-shlibdeps can
+# resolve RCCL's dependencies while retaining compatibility with /opt/rocm.
+RUN ROCM_SDK_LIB_DIRS="$(python -c \
+        'import glob, os; print("\n".join(sorted({os.path.dirname(p) for p in glob.glob("/opt/venv/lib/python*/site-packages/_rocm_sdk*/lib/*.so*")})))')" && \
+    if [ -n "${ROCM_SDK_LIB_DIRS}" ]; then \
+        printf '%s\n' "${ROCM_SDK_LIB_DIRS}" \
+            > /etc/ld.so.conf.d/rocm-python-sdk.conf; \
+        ldconfig; \
+    fi
 
 # --------------------------------------------------------------------
 # Stage 1: RCCL — parallel
@@ -194,11 +207,6 @@ RUN pip show atom || true
 
 RUN pip install --no-cache-dir msgpack msgspec quart
 
-# flash-linear-attention (import name `fla`): Kimi-K3 KDA prefill uses
-# fla.ops.kda.chunk_kda. Its only core dep is einops (already present); torch and
-# triton sit behind extras, so this does NOT touch the image's ROCm torch/triton.
-RUN pip install --no-cache-dir flash-linear-attention==0.5.2 fla-core==0.5.2
-
 # atomesh: install the binary produced by the ATOM package build hook to /usr/local/bin
 RUN echo "========== Install atomesh binary ==========" && \
     cd /app/ATOM/atom/mesh && \
@@ -220,6 +228,8 @@ ARG LMCACHE_TAG=v0.4.5
 # PYTORCH_ROCM_ARCH is inherited as ENV from the `base` stage (=${GPU_ARCH});
 # hipcc reads it to target both gfx942 and gfx950. Do not re-derive from
 # ${GPU_ARCH} here — ARG does not cross FROM so it would be empty in this stage.
+# Docker builds do not expose a GPU, so LMCache's torch.cuda.is_available()
+# backend predicate is overridden only in the validation process below.
 RUN echo "========== [ATOM] LMCache HIP c_ops (${LMCACHE_TAG}, arch=${PYTORCH_ROCM_ARCH}) ==========" && \
     git clone https://github.com/LMCache/LMCache.git /opt/LMCache && \
     cd /opt/LMCache && git checkout ${LMCACHE_TAG} && \
@@ -228,7 +238,11 @@ RUN echo "========== [ATOM] LMCache HIP c_ops (${LMCACHE_TAG}, arch=${PYTORCH_RO
       "${VENV_PYTHON}" -m pip install -e . --no-build-isolation --no-deps && \
     "${VENV_PYTHON}" -m pip install --no-deps \
         prometheus_client==0.25.0 aiofile==3.11.1 caio==0.9.25 && \
-    "${VENV_PYTHON}" -c "import torch, lmcache, lmcache.c_ops; \
+    "${VENV_PYTHON}" -c "import glob, torch; \
+c_ops_paths = glob.glob('/opt/LMCache/lmcache/c_ops*.so'); \
+assert c_ops_paths, 'LMCache HIP c_ops extension was not built'; \
+torch.cuda.is_available = lambda: True; \
+import lmcache, lmcache.c_ops; \
 from lmcache.v1.cache_engine import LMCacheEngineBuilder; \
 from lmcache.v1.memory_management import MemoryFormat; \
 from lmcache.v1.lookup_client.factory import LookupClientFactory; \

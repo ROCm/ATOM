@@ -93,12 +93,16 @@ def q(value):
 
 slurm_submit_runner = runner.get("slurm_submit_runner", "atomesh-cicd")
 spur_controller_addr = runner.get("spur_controller_addr")
-if slurm_submit_runner == "atomesh-cicd-crusoe-mi355":
+crusoe_runner_labels = {
+    "atomesh-cicd-crusoe-mi355",
+    "atomesh-cicd-mi355-crusoe",
+}
+if slurm_submit_runner in crusoe_runner_labels:
     default_spur_accounting_addr = "http://crs-m2m-cpu-spur-005.crusoe.amd.com:6819"
 else:
     default_spur_accounting_addr = "http://134.199.196.72:6819"
 if not spur_controller_addr:
-    if slurm_submit_runner == "atomesh-cicd-crusoe-mi355":
+    if slurm_submit_runner in crusoe_runner_labels:
         spur_controller_addr = "http://crs-m2m-cpu-spur-005.crusoe.amd.com:6817"
     else:
         spur_controller_addr = os.environ.get(
@@ -260,7 +264,7 @@ else
 fi
 SLURM_LOG_POLL_INTERVAL="${SLURM_LOG_POLL_INTERVAL:-30}"
 USES_SPUR_CONTROLLER=0
-if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-crusoe-mi355" ]]; then
+if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-crusoe-mi355" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi355-crusoe" ]]; then
   USES_SPUR_CONTROLLER=1
 fi
 
@@ -647,8 +651,8 @@ else
   if [[ -n "${SLURM_PARTITION}" ]]; then
     SBATCH_CMD+=(--partition "${SLURM_PARTITION}")
   fi
-  if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-crusoe-mi355" ]]; then
-    SBATCH_CMD+=(-q amd-burst-qos)
+  if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-crusoe-mi355" || "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi355-crusoe" ]]; then
+    SBATCH_CMD+=(-q amd-burst-qos --reservation=atomesh-ci)
   fi
   SBATCH_CMD+=(
     --nodes "${NUM_NODES}"
