@@ -357,20 +357,24 @@ class CudagraphCaptureRunner:
         Names rather than positions: an index set silently means something else
         the moment an argument is added, and cannot be read without counting.
         """
-        is_capture = piecewise and in_hipgraph and key not in self._graphs
-        is_replay = piecewise and not in_hipgraph and key in self._graphs
+        if not piecewise:
+            # FULL / eager: there are no piecewise graphs to capture or replay,
+            # and no downstream piece waiting on a fixed output address.
+            return compute_fn(**named_args)
 
-        if is_capture:
-            # zc args captured directly; others cloned into owned stable buffers
-            in_bufs = {
-                n: (
-                    named_args[n]
-                    if n in zc
-                    else (named_args[n].clone() if named_args[n] is not None else None)
-                )
-                for n in input_names
-            }
-            warm_out = compute_fn(**in_bufs)  # warmup before capture
+        # `in_hipgraph` is True only inside the capture pass. It says WHICH KIND
+        # of forward this is -- building the graphs vs serving a real step -- not
+        # whether we are currently inside a graph.
+        capturing = in_hipgraph
+        graph_ready = key in self._graphs
+
+        if capturing and not graph_ready:
+            in_bufs = {}
+            for n in input_names:
+                src = named_args[n]
+                in_bufs[n] = src if (n in zc or src is None) else src.clone()
+
+            warm_out = compute_fn(**in_bufs)
             out_buf = self._out_buf(out_key, warm_out)  # persistent, stable addr
             graph = torch.cuda.CUDAGraph()
             if self._pool is None:
@@ -384,9 +388,11 @@ class CudagraphCaptureRunner:
                 cg_out = compute_fn(**in_bufs)
                 out_buf.copy_(cg_out)  # output copy baked into graph
             self._graphs[key] = {"graph": graph, "in": in_bufs, "out": out_buf}
+            # Both runs above fed on `in_bufs` (clones), so neither result is
+            # this forward's answer. Compute it once more on the real inputs.
             return self.stabilize(out_key, compute_fn(**named_args), piecewise)
 
-        if is_replay:
+        if graph_ready and not capturing:
             entry = self._graphs[key]
             for n, buf in entry["in"].items():
                 if n in zc:
@@ -395,6 +401,6 @@ class CudagraphCaptureRunner:
                 if buf is not None and src is not None:
                     buf.copy_(src)
             entry["graph"].replay()
-            return entry["out"]  # persistent buf, refreshed in-graph
+            return entry["out"]  # the graph copied the result in for us
 
-        return self.stabilize(out_key, compute_fn(**named_args), piecewise)  # eager
+        return self.stabilize(out_key, compute_fn(**named_args), piecewise)
