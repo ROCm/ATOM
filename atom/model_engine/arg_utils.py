@@ -66,6 +66,8 @@ class EngineArgs:
     enable_tbo: str | None = None
     all2all_backend: str | None = None
     moe_backend: str = "standard"
+    moe_stage1_ag_fusion: str = "off"
+    moe_stage1_ag_min_tokens: int = 32768
     method: str | None = None
     num_speculative_tokens: int = 1
     kv_transfer_config: str = "{}"
@@ -273,6 +275,21 @@ class EngineArgs:
             choices=["standard", "mega"],
             help="MoE implementation. 'standard' uses the existing "
             "prepare/GEMM/finalize path; 'mega' uses fused FlyDSL MegaMoE.",
+        )
+        parser.add_argument(
+            "--moe-stage1-ag-fusion",
+            choices=["off", "auto", "on"],
+            default="off",
+            help=(
+                "Fuse DP activation AllGather with MXFP8/MXFP4 MoE Stage1. "
+                "'auto' falls back for unsupported calls; 'on' reports them."
+            ),
+        )
+        parser.add_argument(
+            "--moe-stage1-ag-min-tokens",
+            type=int,
+            default=32768,
+            help="Minimum padded global token count for Stage1 AG fusion.",
         )
         parser.add_argument(
             "--method",

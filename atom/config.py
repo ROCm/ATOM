@@ -1387,6 +1387,8 @@ class Config:
     # Post-routing routed-MoE implementation. This is deliberately separate
     # from all2all backend/mode: Mega owns dispatch, both GEMMs, and combine.
     moe_backend: str = "standard"
+    moe_stage1_ag_fusion: str = "off"
+    moe_stage1_ag_min_tokens: int = 32768
     runner_qualname: str = "atom.model_engine.model_runner.ModelRunner"
     # EPLB master switch + sub-config
     eplb_enable: bool = False
@@ -1449,6 +1451,17 @@ class Config:
             raise ValueError(
                 "moe_backend='mega' requires expert parallelism; "
                 "pass --enable-expert-parallel."
+            )
+        self.moe_stage1_ag_fusion = self.moe_stage1_ag_fusion.strip().lower()
+        if self.moe_stage1_ag_fusion not in ("off", "auto", "on"):
+            raise ValueError(
+                "moe_stage1_ag_fusion must be one of {'off', 'auto', 'on'}, "
+                f"got {self.moe_stage1_ag_fusion!r}"
+            )
+        if self.moe_stage1_ag_min_tokens < 2048:
+            raise ValueError(
+                "moe_stage1_ag_min_tokens must be at least 2048 so the "
+                "TP_AG_READY_V1 Stage2 kernel remains block_m=64 compatible"
             )
 
         if isinstance(self.compilation_config, dict):
@@ -1713,6 +1726,8 @@ class Config:
         # flag below.
         factors.append(self.prefill_context_parallel_size)
         factors.append(self.enable_dp_attention)
+        factors.append(self.moe_stage1_ag_fusion)
+        factors.append(self.moe_stage1_ag_min_tokens)
         factors.append(self.index_cache_dtype)
         text_config = getattr(self.hf_config, "text_config", self.hf_config)
         factors.append(
