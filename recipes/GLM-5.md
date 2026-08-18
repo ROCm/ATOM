@@ -262,8 +262,10 @@ We verified the lm_eval accuracy on gsm8k dataset with command:
 ```bash
 lm_eval \
 --model local-completions \
---model_args model=zai-org/GLM-5-FP8,base_url=http://localhost:7777/v1/completions,num_concurrent=64,max_retries=3,tokenized_requests=False \
+--model_args 'model=zai-org/GLM-5-FP8,base_url=http://localhost:7777//v1/chat/completions,api_key=EMPTY,eos_string=</s>,max_retries=5,num_concurrent=64,timeout=1800,tokenized_requests=False,max_length=1048576' \
+--apply_chat_template \
 --tasks gsm8k \
+--gen_kwargs max_tokens=16384,temperature=0,top_p=1 \
 --num_fewshot 5
 ```
 
