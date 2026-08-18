@@ -39,6 +39,7 @@ from atom.distributed.pp_comm import (
 )
 from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
+from atom.model_engine.dynamic_chunking import ChunkSizePredictor
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 from atom.model_engine.run_labels import build_run_label
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
@@ -1248,6 +1249,133 @@ class ModelRunner:
             f"{self.label}: warmup_model {time.time() - start_time:.2f} seconds with {num_seqs} reqs {total_tokens_num} tokens"
         )
 
+    def profile_dynamic_chunking(self):
+        """Profile this PP stage and return a quadratic latency model on TP rank 0.
+
+        Every PP/TP worker executes the same dummy forwards so pipeline and TP
+        collectives remain ordered. Only local TP rank 0 returns data through
+        the runner RPC channel; the PP head's EngineCore installs its result in
+        the scheduler configuration.
+        """
+        if (
+            not self.config.enable_dynamic_chunking
+            or self.config.pipeline_parallel_size <= 1
+        ):
+            return None
+
+        alignment = max(self.block_size, 64)
+        max_profile_len = min(
+            self.config.max_num_batched_tokens,
+            self.config.max_model_len,
+            self.config.num_kvcache_blocks * self.block_size,
+        )
+        max_profile_len -= max_profile_len % alignment
+        if max_profile_len < 8 * alignment:
+            raise ValueError(
+                "Dynamic chunking needs room for at least 8 aligned profiling "
+                f"lengths, got max_profile_len={max_profile_len}, "
+                f"alignment={alignment}"
+            )
+
+        # Descending lengths mirror SGLang's profiler. A separate full-size
+        # warmup absorbs first-shape compilation and lazy communicator costs.
+        candidates = np.linspace(
+            max_profile_len, alignment, num=32, dtype=np.int64
+        ).tolist()
+        profile_lengths = list(
+            dict.fromkeys(
+                max(alignment, int(length) // alignment * alignment)
+                for length in candidates
+            )
+        )
+
+        def make_batch(length: int) -> ScheduledBatch:
+            seq = Sequence([0] * length, block_size=self.block_size, id=-2)
+            seq.status = SequenceStatus.RUNNING
+            seq.type = SequenceType.PREFILL
+            num_blocks = math.ceil(length / self.block_size)
+            seq.block_table = list(range(num_blocks))
+            return ScheduledBatch(
+                seqs={seq.id: seq},
+                num_scheduled_tokens=[length],
+                total_tokens_num=length,
+                total_tokens_num_prefill=length,
+                total_seqs_num=1,
+                total_seqs_num_prefill=1,
+                is_dummy_run=True,
+                num_cached_tokens=[0],
+                is_final_chunk=[False],
+            )
+
+        logger.info(
+            "%s: profiling dynamic chunking at %d lengths (max=%d)",
+            self.label,
+            len(profile_lengths),
+            max_profile_len,
+        )
+        self.forward(make_batch(max_profile_len))
+        self.flush_pp_send()
+        torch.cuda.synchronize(self.device)
+
+        latencies_ms: list[float] = []
+        for length in profile_lengths:
+            torch.cuda.synchronize(self.device)
+            start = time.perf_counter()
+            self.forward(make_batch(length))
+            self.flush_pp_send()
+            torch.cuda.synchronize(self.device)
+            latencies_ms.append((time.perf_counter() - start) * 1000.0)
+
+        local_result = None
+        try:
+            predictor = ChunkSizePredictor.fit(profile_lengths, latencies_ms)
+            local_result = {
+                "coefficients": (
+                    predictor.quadratic_coeff,
+                    predictor.linear_coeff,
+                    predictor.constant_coeff,
+                ),
+                "sequence_lengths": profile_lengths,
+                "latencies_ms": latencies_ms,
+            }
+            logger.info(
+                "%s: dynamic chunking local fit a=%.3e b=%.3e c=%.3e",
+                self.label,
+                *local_result["coefficients"],
+            )
+        except ValueError as exc:
+            logger.warning("%s: dynamic chunking fit failed: %s", self.label, exc)
+
+        # The PP head owns scheduling, but its layers are not necessarily the
+        # bottleneck. Gather every stage's fit and use the stage with the largest
+        # modeled full-chunk increment. This preserves a single quadratic
+        # predictor while targeting the pipeline cycle-time bottleneck.
+        pp_group = get_pp_group()
+        stage_results: list[dict | None] = [None] * pp_group.world_size
+        torch.distributed.all_gather_object(
+            stage_results, local_result, group=pp_group.cpu_group
+        )
+        valid_results = [result for result in stage_results if result is not None]
+        if not valid_results:
+            return {"error": "dynamic chunking fit failed on every PP stage"}
+
+        def full_chunk_increment(result):
+            a, b, _ = result["coefficients"]
+            return a * max_profile_len * max_profile_len + b * max_profile_len
+
+        result = max(valid_results, key=full_chunk_increment)
+        selected_stage = stage_results.index(result)
+        result = dict(result)
+        result["selected_pp_stage"] = selected_stage
+        logger.info(
+            "%s: dynamic chunking selected PP stage %d fit "
+            "a=%.3e b=%.3e c=%.3e",
+            self.label,
+            selected_stage,
+            *result["coefficients"],
+        )
+        return result if self.rank == 0 else None
+
     def allocate_forward_vars(self):
         config = self.config
         hidden_size = config.hf_config.hidden_size
@@ -1306,7 +1434,7 @@ class ModelRunner:
         still reading. Each in-flight slot gets its own buffer set; reuse of a
         slot is gated by a per-slot CUDA event (see ``_advance_forward_vars`` /
         ``_record_forward_vars_event``), bounding the CPU's GPU lead to the ring
-        size even when the head pops middle-chunk batches without a GPU sync.
+        size while downstream stages drain each microbatch.
 
         When ``pp_size == 1`` the ring is the single original dict and advance is
         a no-op, so behavior is unchanged.

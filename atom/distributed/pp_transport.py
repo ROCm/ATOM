@@ -55,7 +55,7 @@ class PPStageTransport:
         self.pp_size = pp_size
         self.is_head = pp_rank == 0
         self.is_last = pp_rank == pp_size - 1
-        self._ctx = ctx or zmq.Context.instance()
+        self._ctx = ctx if ctx is not None else zmq.Context()
         self._owns_ctx = ctx is None
 
         self._meta_send: list[zmq.Socket] = []
@@ -96,6 +96,10 @@ class PPStageTransport:
             return None
         return pickle.loads(self._token_recv.recv())
 
+    def recv_completion(self, timeout_ms: int | None = None) -> Any:
+        """Head: receive ``(req_ids, output)`` after the last stage finishes."""
+        return self.recv_tokens(timeout_ms)
+
     # ---- downstream / last side --------------------------------------------
     def recv_metadata(self, timeout_ms: int | None = None) -> Any:
         """Downstream: block for the head's scheduled batch."""
@@ -107,6 +111,10 @@ class PPStageTransport:
         """Last stage: feed the sampled output back to the head."""
         assert self._token_send is not None, "send_tokens only valid on last stage"
         self._token_send.send(pickle.dumps(out), copy=False)
+
+    def send_completion(self, req_ids: Any, out: Any = None) -> None:
+        """Last stage: acknowledge completion, with sampled output if present."""
+        self.send_tokens((tuple(req_ids), out))
 
     def close(self) -> None:
         for sock in self._meta_send:

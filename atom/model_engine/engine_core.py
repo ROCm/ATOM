@@ -115,6 +115,31 @@ class EngineCore:
             assert ret, "Failed to allocate kv cache"
 
             config.num_kvcache_blocks = num_blocks
+            if config.enable_dynamic_chunking and config.pipeline_parallel_size > 1:
+                profile = self.runner_mgr.call_func(
+                    "profile_dynamic_chunking", wait_out=True
+                )
+                if profile and "coefficients" in profile:
+                    if config.parallel_config.pipeline_parallel_rank == 0:
+                        config.dynamic_chunking_coefficients = tuple(
+                            profile["coefficients"]
+                        )
+                    else:
+                        # Downstream stages execute metadata from the PP head and
+                        # never make chunking decisions themselves.
+                        config.enable_dynamic_chunking = False
+                else:
+                    config.enable_dynamic_chunking = False
+                    logger.warning(
+                        "%s: disabling dynamic chunking because startup "
+                        "profiling did not produce a valid latency model%s",
+                        self.label,
+                        (
+                            f": {profile['error']}"
+                            if profile and profile.get("error")
+                            else ""
+                        ),
+                    )
             if not config.enforce_eager and not config.disagg_is_decode:
                 cap_cost, bs, pool_bytes = self.runner_mgr.call_func(
                     "capture_cudagraph", wait_out=True
