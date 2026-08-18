@@ -99,23 +99,26 @@ class tokenIDProcessor:
         # Deferred output is disabled when running in P/D disaggregation mode
         # (kv_transfer_config is set), enabled otherwise.
         # TODO: In P/D disaggregation mode, if have issue, we can disable it
-        # Mixed prefill+decode: the deferred GPU-gather path has a known
-        # accuracy bug (idle decode seqs read a placeholder token across a
-        # prefill chunk — R1 GSM8K 0.87 vs 0.9469). It is NOT a memory bug:
-        # verified crash-free at conc 2048 / ISL 8192 with deferred forced on.
-        # Disable deferred under the mixed flag until the accuracy bug is fixed.
-        self.is_deferred_out = not getattr(
-            runner.config, "enable_mixed_prefill_decode", False
-        )
-        # Escape hatch: ATOM_FORCE_DEFERRED=1 forces deferred output ON even
-        # under the mixed flag. Deferred+mixed has a known accuracy bug (not a
-        # crash — verified crash-free at conc 2048 / ISL 8192) but is faster, so
-        # this lets us measure mixed+deferred throughput while the accuracy fix
-        # is pending. Do NOT use for accuracy-sensitive runs.
-        import os as _os
-
-        if _os.environ.get("ATOM_FORCE_DEFERRED") == "1":
-            self.is_deferred_out = True
+        #
+        # Deferred output used to be force-disabled whenever
+        # --enable-mixed-prefill-decode was set, to dodge an accuracy bug where a
+        # decode seq that idled across several prefill-chunk steps read a
+        # placeholder token (R1 GSM8K 0.87 vs 0.9469). That gate is removed: the
+        # bug's precondition no longer exists. Decode-first budget reservation
+        # (58de4490) seats every in-flight decode in every mixed step (measured
+        # 503-510 of 512 per step, on all 260 mixed steps of a run), so a decode
+        # seq no longer idles across prefill chunks; and an idle seq's placeholder
+        # is filled by the next postprocess (it is still in `self.running`, so
+        # `fwd_output.get_idx` finds it) while no new placeholder is appended (the
+        # placeholder loop iterates the *scheduled* seqs), leaving the real token
+        # in `seq.token_ids[-1]`.
+        #
+        # Re-measured on DeepSeek-V4-Pro tp4, mixed on, full GSM8K (1319, 5-shot),
+        # ~940 mixed batches per run: deferred off 0.9530 ±0.0058 vs deferred on
+        # 0.9492 ±0.0060 — a 0.0038 gap inside the error bars, against the
+        # historical −0.077. The gate was costing ~7% throughput (it disabled
+        # deferred for *pure-decode* steps too, which is where the cost landed).
+        self.is_deferred_out = True
 
         self.runner = runner
         device = runner.device
