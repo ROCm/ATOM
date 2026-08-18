@@ -236,9 +236,24 @@ class PPEngineCoreProc(EngineCore):
         if self._pp_kv_aggregator is None:
             self._pp_kv_aggregator = PPKVAggregator(self.pp_size)
 
-        # Hold finished_sending until all PP stages' saves complete.
+        # MultiConnector releases a request's send and its stage-local save in
+        # the same poll (see its "Send/save pairing" docstring), so a send that
+        # arrives with no save alongside it belongs to a request no stage is
+        # saving — a prompt shorter than the offload chunk, or one whose chunks
+        # were already persisted. Holding those would strand them forever: no
+        # finished_saving is ever coming. Only the paired sends wait for the
+        # PP-wide save quorum.
+        local_saving = {str(rid) for rid in kvoutput.finished_saving or ()}
+        unpaired_sending = set()
         for rid in kvoutput.finished_sending or ():
-            self._held_sending[str(rid)] = rid
+            if str(rid) in local_saving:
+                self._held_sending[str(rid)] = rid
+            else:
+                unpaired_sending.add(rid)
+        if unpaired_sending:
+            self.scheduler._update_from_kv_xfer_finished(
+                KVConnectorOutput(finished_sending=unpaired_sending)
+            )
 
         # Ingest head (stage 0) offload output.
         offload_local = KVConnectorOutput(

@@ -13,12 +13,12 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from atom.kv_transfer.disaggregation.types import ConnectorMetadata, KVConnectorOutput
 from atom.kv_transfer.disaggregation.multi.multi_connector import (
     MultiConnector,
     MultiConnectorMetadata,
     MultiConnectorScheduler,
 )
+from atom.kv_transfer.disaggregation.types import ConnectorMetadata, KVConnectorOutput
 
 # ---------------------------------------------------------------------------
 # Mock sub-connectors
@@ -131,10 +131,11 @@ def _sched(connectors):
     return obj
 
 
-def _worker(connectors):
+def _worker(connectors, pp_is_head=True):
     obj = MultiConnector.__new__(MultiConnector)
     obj._connectors = connectors
     obj.is_producer = any(getattr(c, "is_producer", False) for c in connectors)
+    obj._pp_is_head = pp_is_head
     obj._pending_save = set()
     obj._sent = {}
     obj._saved = {}
@@ -346,3 +347,16 @@ def test_save_then_send_also_pairs():
     out2 = w.get_finished()
     assert out2.finished_sending == {9}
     assert out2.finished_saving == {9}
+
+
+def test_non_head_pp_stage_does_not_pair():
+    # Downstream stages never see mooncake's done_sending (it is recorded on
+    # stage 0 only), so pairing there would strand every save.
+    moriio = FakeWorkerSub(is_producer=True)
+    off = FakeWorkerSub(finished=KVConnectorOutput(finished_saving={9}))
+    w = _worker([moriio, off], pp_is_head=False)
+    w.start_load_kv(MultiConnectorMetadata([ConnectorMetadata(), _save_meta(9)]))
+
+    out = w.get_finished()
+    assert out.finished_saving == {9}
+    assert out.finished_sending == set()
