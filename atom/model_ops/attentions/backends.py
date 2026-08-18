@@ -272,6 +272,53 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         self.model_runner.forward_vars.update(attn_metadata)
         self.has_sliding_window = hasattr(hf_config, "sliding_window")
 
+    def _get_mixed_prefill_bank(self) -> dict:
+        """Private mirror of `forward_vars` for the prefill half of a mixed batch.
+
+        A mixed batch is built as ``[prefill | decode]`` by running the
+        unmodified `prepare_prefill` then `prepare_decode`, both of which stage
+        through the SAME named `forward_vars` buffers. Sharing those buffers
+        forced per-field GPU `.clone()`s (so decode's staging couldn't overwrite
+        the prefill segment's GPU tensors) and, on the V4 builder's much larger
+        metadata surface, a full `torch.cuda.current_stream().synchronize()` (so
+        decode's host-side pinned-buffer writes didn't race the prefill
+        segment's in-flight H2D DMA → the large-ISL OOB fixed in `ab55dfb6`).
+
+        Instead we run the prefill half against this private bank: a same-shape
+        clone of every `CpuGpuBuffer` in `forward_vars`. The decode half runs
+        against the real bank, so the two halves never share a pinned CPU source
+        or a GPU destination — both the clones and the stream sync become
+        unnecessary. Non-buffer entries (e.g. the scalar `mtp_k`) are shared by
+        reference; the prefill path never stages into them.
+
+        Built lazily on first use (after all setup-time
+        `forward_vars.update(...)` has run) and only when mixed batching is
+        active, so single-mode runs pay no memory cost. Reused across mixed
+        steps exactly as the real bank is reused every step.
+        """
+        bank = getattr(self, "_mixed_prefill_bank", None)
+        if bank is not None:
+            return bank
+        bank = {}
+        for name, val in self.model_runner.forward_vars.items():
+            if isinstance(val, CpuGpuBuffer):
+                mirror = CpuGpuBuffer(
+                    *val.cpu.shape,
+                    dtype=val.cpu.dtype,
+                    device=val.gpu.device,
+                    with_numpy=hasattr(val, "np"),
+                )
+                # Copy initial contents so buffers the prefill path reads but
+                # never fully rewrites (e.g. `seq_starts` == zeros) match the
+                # real bank.
+                mirror.cpu.copy_(val.cpu)
+                mirror.gpu.copy_(val.gpu)
+                bank[name] = mirror
+            else:
+                bank[name] = val
+        self._mixed_prefill_bank = bank
+        return bank
+
     def prepare_block_tables(self, batch: ScheduledBatch):
         var = self.model_runner.forward_vars
         block_tables = var["block_tables"].np
@@ -503,11 +550,23 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             self.execute_paged_state_copies(
                 state_ops.checkpoint_stores, state_ops.checkpoint_restores
             )
+
+        # Mixed dispatch comes AFTER state maintenance: it returns early, and a
+        # mixed batch needs the same relocations / checkpoint copies as any other.
+        if getattr(batch, "is_mixed", False):
+            return self.prepare_mixed(batch, bs)
         is_prefill = batch.total_tokens_num_prefill > 0
         if is_prefill:
             return self.prepare_prefill(batch)
         else:
             return self.prepare_decode(batch, bs)
+
+    def prepare_mixed(self, batch: ScheduledBatch, bs: int):
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support mixed prefill+decode "
+            "batches yet. Only the dense-MLA backend (AiterMLAMetadataBuilder) "
+            "implements split dispatch. Disable --enable-mixed-prefill-decode."
+        )
 
 
 class AttentionImpl(nn.Module):

@@ -531,39 +531,57 @@ class MLAAttention(nn.Module):
             )
 
     @mark_trace(prefix="v_up_proj_and_o_proj", torch_compile=False)
-    def _v_up_proj_and_o_proj(self, x):
+    def _v_up_proj(self, x, out: Optional[torch.Tensor] = None):
+        """v_up_projection only (no o_proj). Returns [tokens, num_heads*v_head_dim].
+
+        Split out from `_v_up_proj_and_o_proj` so the mixed prefill+decode path can
+        write the pre-o_proj decode output alongside the prefill output and run a
+        single o_proj (one TP all-reduce) on the combined tensor — matching vLLM's
+        MLA layout — instead of one o_proj per segment.
+
+        If ``out`` (a [tokens, num_heads*v_head_dim] buffer) is given, the result is
+        written into it directly (FP4: kernel ``y=`` into a reshaped view; FP8:
+        copy), avoiding a separate allocation + concat in the mixed path.
+        """
         # Convert from (B, N, L) to (N, B, L)
         x = x.view(-1, self.num_heads, self.kv_lora_rank).transpose(0, 1)
         # Multiply (N, B, L) x (N, L, V) -> (N, B, V), Convert from (N, B, V) to (B, N, V)
-        # x = torch.bmm(x, self.W_UV).transpose(0, 1)
-        # Convert from (B, N, L) to (N, B, L)
         if is_rocm_aiter_fp4bmm_enabled():
-            output = torch.empty(
-                x.shape[1],
-                x.shape[0],
-                self.W_V.shape[1],
-                device=x.device,
-                dtype=torch.bfloat16,
-            )
-            output = batched_gemm_a16wfp4(
+            if out is not None:
+                y_buf = out.view(x.shape[1], x.shape[0], self.W_V.shape[1])
+            else:
+                y_buf = torch.empty(
+                    x.shape[1],
+                    x.shape[0],
+                    self.W_V.shape[1],
+                    device=x.device,
+                    dtype=torch.bfloat16,
+                )
+            y_buf = batched_gemm_a16wfp4(
                 x,
                 self.W_V,
                 self.W_V_scale,
-                y=output,
+                y=y_buf,
                 transpose_bm=True,
                 prequant=True,
                 y_scale=None,
             )
-            # x = x.transpose(0, 1).flatten(1, 2)
-            output = output.view(-1, self.num_heads * self.v_head_dim)
-            x = output
+            if out is not None:
+                return out
+            return y_buf.view(-1, self.num_heads * self.v_head_dim)
         else:
             x = _aiter_triton_fp8_bmm(
                 x, self.W_V, self.W_V_scale, group_size=128, transpose_bm=True
             )
             # Convert from (B, N, V) to (B, N * V)
             x = x.reshape(-1, self.num_heads * self.v_head_dim)
-        return self.o_proj(x)
+            if out is not None:
+                out.copy_(x)
+                return out
+            return x
+
+    def _v_up_proj_and_o_proj(self, x):
+        return self.o_proj(self._v_up_proj(x))
 
     @mark_trace(prefix="q_proj_and_k_up_proj", torch_compile=False)
     def _q_proj_and_k_up_proj(self, x, x_scale=None):
@@ -664,6 +682,7 @@ class MLAAttention(nn.Module):
         prefill_q: torch.Tensor,
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetaData,
+        apply_o_proj: bool = True,
     ) -> torch.Tensor:
         """Legacy single-pass path: gather the full cached+new context into
         k_full / v_full and run one flash_attn. OOMs on long contexts (peak
@@ -705,7 +724,8 @@ class MLAAttention(nn.Module):
             softmax_scale=self.scale,
             causal=True,
         )
-        return self.o_proj(output.flatten(start_dim=-2))
+        output = output.flatten(start_dim=-2)
+        return output if not apply_o_proj else self.o_proj(output)
 
     def _gather_cached_kv_b_proj(
         self,
@@ -759,6 +779,7 @@ class MLAAttention(nn.Module):
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetaData,
         chunk_meta,
+        apply_o_proj: bool = True,
     ) -> torch.Tensor:
         """Chunked prefill for the has_cached branch.
 
@@ -908,7 +929,8 @@ class MLAAttention(nn.Module):
                 suffix_output=new_out,
                 suffix_lse=new_lse,
             )
-        return self.o_proj(output.flatten(start_dim=-2))
+        output = output.flatten(start_dim=-2)
+        return output if not apply_o_proj else self.o_proj(output)
 
     def _dcp_compute_prefill_context(
         self,
@@ -1029,6 +1051,8 @@ class MLAAttention(nn.Module):
         k_rope: torch.Tensor,
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: AttentionMetaData,
+        apply_o_proj: bool = True,
+        out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         assert attn_metadata is not None
 
@@ -1131,9 +1155,17 @@ class MLAAttention(nn.Module):
             dropout_p=attn_metadata.dropout_p,
             softmax_scale=self.scale,
             causal=True,
+            out=(
+                None if out is None else out.view(-1, self.num_heads, self.v_head_dim)
+            ),
         )
 
-        return self.o_proj(output.flatten(start_dim=-2))
+        # When `out` is provided, flash wrote directly into it (mixed path writes
+        # the prefill segment straight into the shared pre-o_proj buffer, no cat).
+        if out is not None:
+            return out
+        output = output.flatten(start_dim=-2)
+        return output if not apply_o_proj else self.o_proj(output)
 
     def _forward_prefill_mla(
         self,
@@ -1308,6 +1340,8 @@ class MLAAttention(nn.Module):
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: AttentionMetaData,
         return_lse: bool = False,
+        apply_o_proj: bool = True,
+        out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # attn_metadata.causal is True for the target; False only for DSpark's
         # bidirectional draft block (set by the proposer). The asm kernel picks
@@ -1528,7 +1562,11 @@ class MLAAttention(nn.Module):
         if return_lse:
             return o, final_lse
 
-        return self._v_up_proj_and_o_proj(o)
+        return (
+            self._v_up_proj(o, out=out)
+            if not apply_o_proj
+            else self._v_up_proj_and_o_proj(o)
+        )
 
     def _pcp_write_full_kv(self, kv_cache, k_nope, k_rope, slot_mapping):
         """Write an already-roped full k (kv_lora + rope) into the k-cache.
@@ -1691,7 +1729,133 @@ class MLAAttention(nn.Module):
         kv_cache_data = forward_context.kv_cache_data
         kv_cache = kv_cache_data[f"layer_{self.layer_num}"].k_cache
 
-        if context.is_prefill and not use_prefill_mla:
+        if context.is_mixed:
+            # Mixed prefill+decode split dispatch: the first `num_prefill_tokens`
+            # rows are prefill chunks (MHA path), the rest are decode tokens (MLA
+            # latent path). Each half runs its own Q/KV/O projections against its
+            # own nested metadata, then outputs are concatenated (same hidden dim).
+            assert not self.is_sparse_mla, (
+                "Mixed prefill+decode batches do not yet support sparse MLA "
+                "(V3.2/V4 indexer). Disable --enable-mixed-prefill-decode."
+            )
+            assert not use_prefill_mla, (
+                "Mixed prefill+decode batches do not support the prefill-MLA "
+                "(sparse) path. Disable --enable-mixed-prefill-decode."
+            )
+            n_prefill = context.num_prefill_tokens
+            prefill_meta = attn_metadata.prefill_attn_metadata
+            decode_meta = attn_metadata.decode_attn_metadata
+
+            # ---- Prefill half: MHA path ----
+            q_p = q[:n_prefill]
+            k_nope_p = k_nope[:n_prefill]
+            k_rope_p = k_rope[:n_prefill]
+            positions_p = positions[:n_prefill]
+
+            prefill_q = self.q_proj(q_p, x_scale=q_scale).view(
+                -1, self.num_heads, self.qk_head_dim
+            )
+            prefill_q_pe = prefill_q[..., self.qk_nope_head_dim :]
+            self.rotary_emb(positions_p, prefill_q_pe, k_rope_p)
+
+            if kv_cache.numel() > 0:
+                concat_and_cache_mla(
+                    k_nope_p,
+                    k_rope_p.squeeze(1),
+                    kv_cache,
+                    prefill_meta.slot_mapping.flatten(),
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    scale=self._k_scale,
+                )
+
+            # Preallocate the combined pre-o_proj output [n_total, num_heads*v_head_dim]
+            # and write each segment straight into its slice (vLLM-style), so a single
+            # o_proj runs over the whole tensor and no torch.cat is needed.
+            attn_out = torch.empty(
+                (q.size(0), self.num_heads * self.v_head_dim),
+                dtype=torch.bfloat16,
+                device=q.device,
+            )
+            out_prefill = attn_out[:n_prefill]
+            out_decode = attn_out[n_prefill:]
+
+            if prefill_meta.has_cached:
+                chunk_meta = getattr(prefill_meta, "mla_chunk_meta", None)
+                if chunk_meta is not None:
+                    # Cached prefill has no out= path yet; copy its result into the slice.
+                    out_prefill.copy_(
+                        self._forward_prefill_cached_chunked(
+                            prefill_q,
+                            k_nope_p,
+                            k_rope_p,
+                            kv_cache,
+                            prefill_meta,
+                            chunk_meta,
+                            apply_o_proj=False,
+                        )
+                    )
+                else:
+                    out_prefill.copy_(
+                        self._forward_prefill_cached_single_pass(
+                            prefill_q, kv_cache, prefill_meta, apply_o_proj=False
+                        )
+                    )
+            else:
+                self._forward_prefill_mha(
+                    prefill_q,
+                    k_nope_p,
+                    k_rope_p,
+                    kv_cache,
+                    prefill_meta,
+                    apply_o_proj=False,
+                    out=out_prefill,
+                )
+
+            # ---- Decode half: MLA latent path ----
+            q_d = q[n_prefill:]
+            k_nope_d = k_nope[n_prefill:]
+            k_rope_d = k_rope[n_prefill:]
+            positions_d = positions[n_prefill:]
+
+            q_nope_d, q_rope_d = self._q_proj_and_k_up_proj(q_d, x_scale=q_scale)
+            q_out_d = torch.empty(
+                (
+                    q_nope_d.shape[0],
+                    self.num_heads,
+                    self.kv_lora_rank + self.qk_rope_head_dim,
+                ),
+                dtype=decode_meta.dtype_q,
+                device=q_nope_d.device,
+            )
+            if kv_cache.numel() > 0:
+                fused_qk_rope_concat_and_cache_mla(
+                    q_nope_d,
+                    q_rope_d,
+                    k_nope_d,
+                    k_rope_d,
+                    kv_cache.view(
+                        kv_cache.shape[0], -1, self.kv_lora_rank + self.qk_rope_head_dim
+                    ),
+                    q_out_d,
+                    decode_meta.slot_mapping,
+                    self._k_scale,
+                    self._q_scale,
+                    positions_d,
+                    self.rotary_emb.cos_cache,
+                    self.rotary_emb.sin_cache,
+                    is_neox=self.rotary_emb.is_neox_style,
+                    is_nope_first=True,
+                )
+
+            self._forward_decode(
+                q_out_d, kv_cache, decode_meta, apply_o_proj=False, out=out_decode
+            )
+
+            # Both segments wrote their pre-o_proj results into slices of attn_out;
+            # a single o_proj (one TP all-reduce) over the combined tensor — no cat,
+            # no extra allocation. Matches vLLM's MLA layout.
+            output = self.o_proj(attn_out)
+        elif context.is_prefill and not use_prefill_mla:
             prefill_q = self.q_proj(q, x_scale=q_scale).view(
                 -1, self.num_heads, self.qk_head_dim
             )
