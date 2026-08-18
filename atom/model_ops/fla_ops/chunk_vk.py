@@ -137,7 +137,7 @@ def chunk_gated_delta_rule_vk(
     v: torch.Tensor,
     g: torch.Tensor,
     beta: torch.Tensor,
-    scale: float = None,
+    scale: float | None = None,
     initial_state: torch.Tensor = None,
     output_final_state: bool = False,
     cu_seqlens: torch.Tensor | None = None,

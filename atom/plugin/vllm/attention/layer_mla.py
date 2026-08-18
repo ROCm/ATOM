@@ -154,7 +154,7 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         head_dim,
         scale,
         num_kv_heads,
-        alibi_slopes: list[float] = None,
+        alibi_slopes: list[float] | None = None,
         kv_cache_dtype="bf16",
         layer_num=0,
         mla_modules: MLAModules | None = None,

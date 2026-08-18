@@ -51,10 +51,7 @@ class AtomKimiK3KDAMetadataBuilder(KimiK3KDAMetadataBuilder):
         common_attn_metadata: CommonAttentionMetadata,
         metadata: KimiK3KDAMetadata,
     ) -> None:
-        if (
-            metadata.num_decodes <= 0
-            or metadata.non_spec_query_start_loc is not None
-        ):
+        if metadata.num_decodes <= 0 or metadata.non_spec_query_start_loc is not None:
             return
 
         batch_size = int(common_attn_metadata.num_reqs)
@@ -65,9 +62,7 @@ class AtomKimiK3KDAMetadataBuilder(KimiK3KDAMetadataBuilder):
             device=query_start_loc_buf.device,
             out=query_start_loc_buf[: metadata.num_decodes + 1],
         )
-        query_start_loc_buf[metadata.num_decodes + 1 :].fill_(
-            metadata.num_decodes
-        )
+        query_start_loc_buf[metadata.num_decodes + 1 :].fill_(metadata.num_decodes)
         metadata.non_spec_query_start_loc = query_start_loc_buf
 
     def _adapt_full_graph_decode_metadata(
