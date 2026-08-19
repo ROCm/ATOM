@@ -2,6 +2,10 @@ name: MI355 Burst QoS Probe
 
 on:
   workflow_dispatch:
+  pull_request:
+    types: [labeled]
+    paths:
+      - .github/workflows/mi355-burst-probe.yaml
 
 concurrency:
   group: mi355-burst-probe
@@ -13,6 +17,9 @@ permissions:
 jobs:
   submit-and-verify:
     name: Submit and verify one MI355 burst allocation
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || contains(github.event.pull_request.labels.*.name, 'ci:mi355-burst-probe')
     # This is a Crusoe Slurm submit host, not the direct GPU runner used by
     # vLLM/SGLang CI. Keep the existing direct runner workflows unchanged until
     # this probe verifies the allocation and shared-workspace contract.
