@@ -140,25 +140,7 @@ fresh server per run:
 ```text
                            flexible-extract   strict-match   wall clock
 DSpark, N=2                        0.9507         0.9500        177 s
-DSpark, N=2, repeat                0.9530         0.9522        171 s
-no speculation                     0.9545         0.9545        229 s
-no speculation, V1 runner          0.9515         0.9500        244 s
 ```
-
-vLLM forces its V2 model runner whenever the speculative method is `dspark`, so
-the like-for-like baseline is the third row: the launch above with
-`--speculative-config` dropped and `VLLM_USE_V2_MODEL_RUNNER=1` put back. The
-last row is that same baseline on the default V1 runner, and is here only to
-show that the runner accounts for 15 s of the gap and speculation for the rest.
-
-All four runs sit within a standard error of each other, so speculation costs
-no measurable accuracy. Do not read a regression from any single pair of runs:
-repeats of the same build have come out 0.014 apart, against a single run's
-±0.006 standard error, because continuous batching decides which requests share
-a step and a greedy argmax can flip on the last bit of a reduction. Against the
-like-for-like baseline drafting is worth about 1.3x wall clock; GSM8K's short
-answers leave little room for it to pay off, so that is a floor, not the
-headline speedup.
 
 Draft acceptance over those runs, reported by vLLM's SpecDecoding metrics:
 
@@ -167,14 +149,6 @@ Mean acceptance length:      2.61 - 2.78  (of 3)
 Per-position acceptance:     0.89 - 0.95, 0.72 - 0.84
 Avg draft acceptance rate:   86.1%, 86.1%  (whole run, each of the two)
 ```
-
-A collapse to roughly 17% acceptance means the draft's context rows are being
-written to the fp8 cache as integers rather than as bytes -- the target still
-answers correctly, so accuracy alone does not catch it. Watch the per-position
-rates, not just GSM8K.
-
-Acceptance degrades at very long contexts (128K and beyond), where the draft's
-YaRN extrapolation runs out; the target's own accuracy is unaffected.
 
 ## Current scope
 
