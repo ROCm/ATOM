@@ -15,7 +15,6 @@ import multiprocessing
 import os
 import queue as sync_queue
 import threading
-import time
 import traceback
 from asyncio import AbstractEventLoop, Event
 from collections.abc import Hashable
@@ -29,26 +28,13 @@ _LATEST_WINS = ("finish_reason", "kv_transfer_params", "num_cached_tokens")
 
 logger = logging.getLogger("atom.streaming_dispatch")
 
-# SSE coalescing. Incremental decode windows, a queue put/get, json.dumps and a
-# socket write are paid once per (request, engine step); at high concurrency
-# that fixed cost, not the GPU, is what caps throughput. Holding the buffer open
-# across steps collapses N tokens into one of each. Costs up to this much extra
-# inter-token latency, so it is opt-in. A finished chunk always flushes.
-_COALESCE_S = max(0.0, float(os.environ.get("ATOM_SSE_COALESCE_MS", "0") or 0)) / 1000.0
-_COALESCE_MAX_STEPS = int(os.environ.get("ATOM_SSE_COALESCE_MAX_STEPS", "8") or 8)
 _DISABLE_TOKENIZER_BATCH_DECODE = (
     os.environ.get("ATOM_DISABLE_TOKENIZER_BATCH_DECODE", "0").lower()
     in {"1", "true", "yes"}
 )
-_USE_DETOKENIZER_PROCESS = (
-    os.environ.get("ATOM_DETOKENIZER_PROCESS", "0").lower()
-    in {"1", "true", "yes"}
-)
-_DETOKENIZER_PROCESS_START_TIMEOUT_S = float(
-    os.environ.get("ATOM_DETOKENIZER_PROCESS_START_TIMEOUT_S", "120")
-)
+_DETOKENIZER_PROCESS_START_TIMEOUT_S = 120.0
 _DETOKENIZER_PROCESS_COUNT = max(
-    1, int(os.environ.get("ATOM_DETOKENIZER_PROCESS_COUNT", "1"))
+    0, int(os.environ.get("ATOM_DETOKENIZER_PROCESS_COUNT", "0") or 0)
 )
 
 
@@ -399,12 +385,14 @@ class StreamBatchDispatcher:
         self._process_output = None
         self._result_thread = None
         self._closed = False
+        if process_count is None:
+            process_count = _DETOKENIZER_PROCESS_COUNT
         if use_process is None:
-            use_process = _USE_DETOKENIZER_PROCESS
+            use_process = process_count > 0
+        elif use_process and process_count <= 0:
+            process_count = 1
         self._use_process = use_process
         if use_process:
-            if process_count is None:
-                process_count = _DETOKENIZER_PROCESS_COUNT
             self._process_count = max(1, process_count)
             self._start_detokenizer_process(
                 tokenizer_model=tokenizer_model,
@@ -508,19 +496,7 @@ class StreamBatchDispatcher:
         if not buf:
             return
 
-        now = time.monotonic()
-        if _COALESCE_S > 0:
-            steps = getattr(tl, "steps", 0) + 1
-            tl.steps = steps
-            if (
-                steps < _COALESCE_MAX_STEPS
-                and now - getattr(tl, "last_flush", 0.0) < _COALESCE_S
-                and not any(i.chunk.get("finished") for i in buf)
-            ):
-                return  # keep accumulating; nothing here is final yet
         tl.buf = []
-        tl.steps = 0
-        tl.last_flush = now
 
         groups: dict[Hashable, list[_BufferedChunk]] = {}
         for item in buf:
