@@ -74,7 +74,7 @@ from atom.model_loader.loader import WeightsMapper
 # its dynamic-shape internals from Dynamo / fake-tensor mode.
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.model_ops.attentions.deepseek_v4_attn import (
-    V4AttnFfn,
+    V4AttnFfnPiecewise,
     v4_attn_outputs,
     v4_attn_runner,
 )
@@ -2486,7 +2486,7 @@ class DeepseekV4Attention(nn.Module):
         self.attn_ffn_piecewise = (
             cudagraph_mode is not None and cudagraph_mode.is_attn_ffn_piecewise()
         )
-        self.attn_ffn = V4AttnFfn(
+        self.attn_ffn = V4AttnFfnPiecewise(
             self,
             runner=v4_attn_runner,
             outputs=v4_attn_outputs,
@@ -2697,17 +2697,13 @@ class DeepseekV4Attention(nn.Module):
         # only the fallback stages it (copying all of qkv_a would cost more).
         # Ask the pool, not the flag: the flag says the GEMM can write out=, not
         # that this step has anywhere to write it.
-        attn_ffn_qkv_a_buf = (
-            attn_ffn_bufs.get("qkv_a")
-            if (attn_ffn_bufs is not None and self._wqkv_a_inplace)
-            else None
-        )
-        if attn_ffn_qkv_a_buf is not None:
-            qkv_a = self.wqkv_a(x, out=attn_ffn_qkv_a_buf[:n])
+        fill_qkv_a = attn_ffn_bufs is not None and self._wqkv_a_inplace
+        if fill_qkv_a:
+            qkv_a = attn_ffn_bufs.fill("qkv_a", n, lambda o: self.wqkv_a(x, out=o))
         else:
             qkv_a = self.wqkv_a(x)
         q_lora, kv_pre = torch.split(qkv_a, [self.q_lora_rank, self.head_dim], dim=-1)
-        if attn_ffn_bufs is not None and attn_ffn_qkv_a_buf is None:
+        if attn_ffn_bufs is not None and not fill_qkv_a:
             kv_pre = attn_ffn_bufs.stage("kv_pre", kv_pre)
         assert (
             not _V4_FORCE_UE8M0_QUANT
@@ -2719,13 +2715,12 @@ class DeepseekV4Attention(nn.Module):
             qr = attn_ffn_bufs.stage("qr", qr)
             qr_scale = attn_ffn_bufs.stage("qr_scale", qr_scale)
             # q: wq_b writes its buffer inplace (out=) or plain GEMM + copy.
-            q = attn_ffn_bufs.stage_inplace(
-                "q",
-                n,
-                lambda o: self.wq_b(qr, x_scale=qr_scale, out=o),
-                lambda: self.wq_b(qr, x_scale=qr_scale),
-                inplace=self._wq_b_inplace,
-            )
+            if self._wq_b_inplace:
+                q = attn_ffn_bufs.fill(
+                    "q", n, lambda o: self.wq_b(qr, x_scale=qr_scale, out=o)
+                )
+            else:
+                q = attn_ffn_bufs.stage("q", self.wq_b(qr, x_scale=qr_scale))
         else:
             q = self.wq_b(qr, x_scale=qr_scale)
 

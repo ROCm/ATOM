@@ -472,13 +472,13 @@ def test_v4_core_inputs_come_from_the_signature_and_exclude_positions():
     import pytest
 
     try:
-        from atom.models.deepseek_v4 import V4AttnFfn
+        from atom.model_ops.attentions.deepseek_v4_attn import V4AttnFfnPiecewise
     except ImportError as e:
         if "aiter" not in str(e):
             raise
         pytest.skip(f"requires aiter to import deepseek_v4: {e}")
 
-    assert V4AttnFfn.core_input_names() == (
+    assert V4AttnFfnPiecewise.core_input_names() == (
         "x",
         "q",
         "kv_pre",
@@ -490,8 +490,8 @@ def test_v4_core_inputs_come_from_the_signature_and_exclude_positions():
         "idx_q_scale",
     )
 
-    inst = V4AttnFfn.__new__(V4AttnFfn)
-    V4AttnFfn.__init__(
+    inst = V4AttnFfnPiecewise.__new__(V4AttnFfnPiecewise)
+    V4AttnFfnPiecewise.__init__(
         inst, layer=types.SimpleNamespace(), runner=None, outputs=None, enabled=False
     )
     # positions is copied per step: capturing on it costs ~2pts of accuracy, and

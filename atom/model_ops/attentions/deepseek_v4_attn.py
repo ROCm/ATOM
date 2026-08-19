@@ -120,7 +120,7 @@ v4_attn_runner = CudagraphCaptureRunner()
 v4_attn_outputs = StableOutputs()
 
 
-class V4AttnFfn(DecodeAttnFfnPiecewise):
+class V4AttnFfnPiecewise(DecodeAttnFfnPiecewise):
     """V4's captured attention core. Owned by DeepseekV4Attention, not inherited
     by it -- the layer holds one of these and forwards to it."""
 
