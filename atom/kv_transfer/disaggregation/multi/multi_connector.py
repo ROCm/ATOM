@@ -170,6 +170,21 @@ class MultiConnectorMetadata(ConnectorMetadata):
                 agg.extend(sub)
         return agg
 
+    @property
+    def lookup_requests_in_step(self):
+        """Aggregate of sub-metas' pending lookup-pin releases.
+
+        Same reason as ``requests``: the idle dispatch gates on this, and a
+        metadata dropped for looking empty takes the sub-meta's only unpin
+        with it.
+        """
+        agg: list = []
+        for m in self.metas:
+            sub = getattr(m, "lookup_requests_in_step", None)
+            if sub:
+                agg.extend(sub)
+        return agg
+
 
 # ---------------------------------------------------------------------------
 # Worker side

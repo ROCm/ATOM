@@ -4425,3 +4425,104 @@ def test_replica_world_size_counts_pp_and_tp_but_not_dp():
     assert offcfg.lmcache_replica_world_size(_dp_config(5, pp_size=4, tp_size=8)) == 32
     assert offcfg.lmcache_replica_world_size(_dp_config(5)) == 1
     assert offcfg.lmcache_replica_world_size(SimpleNamespace()) == 1
+
+
+class _RecordingRunnerMgr:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, object]] = []
+
+    def call_func(self, name, *args, **kwargs):
+        self.calls.append((name, args[0] if args else None))
+
+
+class _RecordingPPTransport:
+    def __init__(self) -> None:
+        self.sent: list[object] = []
+
+    def send_metadata(self, batch):
+        self.sent.append(batch)
+
+
+def _idle_meta_with_only_unpins() -> LMCacheOffloadMetadata:
+    meta = LMCacheOffloadMetadata()
+    meta.lookup_requests_in_step = ["7"]
+    return meta
+
+
+def _idle_engine(meta: LMCacheOffloadMetadata):
+    connector = SimpleNamespace(
+        is_offload=True,
+        build_connector_meta=lambda: meta,
+    )
+    return SimpleNamespace(
+        kv_transfer_enabled=True,
+        scheduler=SimpleNamespace(kv_connector=connector),
+        runner_mgr=_RecordingRunnerMgr(),
+        pp_transport=_RecordingPPTransport(),
+    )
+
+
+def test_idle_offload_dispatch_delivers_unpin_only_metadata():
+    # build_connector_meta drains the pending lookup ids as a side effect, so a
+    # metadata carrying nothing but unpins is the only chance those ids get
+    # released. Dropping it pins their CPU chunks until LMCache's watchdog
+    # times them out 300s later.
+    from atom.model_engine.engine_core import EngineCore
+
+    engine = _idle_engine(_idle_meta_with_only_unpins())
+    EngineCore._dispatch_idle_offload_work(engine)
+
+    assert [name for name, _ in engine.runner_mgr.calls] == [
+        "process_kvconnector_output"
+    ]
+    assert engine.runner_mgr.calls[0][1].lookup_requests_in_step == ["7"]
+
+
+def test_pp_connector_only_dispatch_delivers_unpin_only_metadata():
+    from atom.model_engine.pp_engine_core import PPEngineCoreProc
+
+    engine = _idle_engine(LMCacheOffloadMetadata())
+    batch = SimpleNamespace(connector_meta_output=_idle_meta_with_only_unpins())
+    PPEngineCoreProc._dispatch_connector_only_batch(engine, batch)
+
+    assert [name for name, _ in engine.runner_mgr.calls] == [
+        "process_kvconnector_output"
+    ]
+    # Every stage pinned on lookup, so every stage has to hear the unpin.
+    assert engine.pp_transport.sent == [batch]
+
+
+def test_dispatch_skips_metadata_with_no_work_at_all():
+    from atom.model_engine.engine_core import EngineCore
+    from atom.model_engine.pp_engine_core import PPEngineCoreProc
+
+    engine = _idle_engine(LMCacheOffloadMetadata())
+    EngineCore._dispatch_idle_offload_work(engine)
+    PPEngineCoreProc._dispatch_connector_only_batch(
+        engine, SimpleNamespace(connector_meta_output=LMCacheOffloadMetadata())
+    )
+
+    assert engine.runner_mgr.calls == []
+    assert engine.pp_transport.sent == []
+
+
+def test_multi_metadata_exposes_sub_meta_unpins():
+    # The prefill node runs offload inside a `multi` connector, so the idle
+    # dispatch only ever sees the wrapper. Without this aggregate it reads as
+    # empty and the sub-meta's unpins are dropped.
+    from atom.kv_transfer.disaggregation.multi.multi_connector import (
+        MultiConnectorMetadata,
+    )
+
+    wrapper = MultiConnectorMetadata(
+        metas=[SimpleNamespace(), _idle_meta_with_only_unpins()]
+    )
+    assert wrapper.requests == []
+    assert wrapper.lookup_requests_in_step == ["7"]
+
+    from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
+
+    assert connector_metadata_has_work(wrapper)
+    assert not connector_metadata_has_work(
+        MultiConnectorMetadata(metas=[LMCacheOffloadMetadata()])
+    )

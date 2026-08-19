@@ -10,7 +10,10 @@ from collections import deque
 
 from atom.distributed.pp_transport import PPStageTransport
 from atom.kv_transfer.disaggregation.pp_kv_aggregator import PPKVAggregator
-from atom.kv_transfer.disaggregation.types import KVConnectorOutput
+from atom.kv_transfer.disaggregation.types import (
+    KVConnectorOutput,
+    connector_metadata_has_work,
+)
 from atom.model_engine.engine_core import EngineCore
 from atom.model_engine.scheduler import ScheduledBatch
 
@@ -223,7 +226,7 @@ class PPEngineCoreProc(EngineCore):
         if not self.kv_transfer_enabled:
             return
         meta = batch.connector_meta_output
-        if meta is None or not getattr(meta, "requests", None):
+        if not connector_metadata_has_work(meta):
             return
         self.runner_mgr.call_func("process_kvconnector_output", meta)
         self.pp_transport.send_metadata(batch)
