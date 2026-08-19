@@ -175,7 +175,7 @@ ARG SGLANG_REF="v0.5.17"
 LABEL com.rocm.atom.sglang_ref="${SGLANG_REF}"
 
 ENV PATH="/opt/venv/bin:${PATH}"
-ENV PYTHONPATH="/app/sglang/python:/app/ATOM:${PYTHONPATH}"
+ENV PYTHONPATH="/app/sglang/python:/app/ATOM"
 
 RUN echo "========== [SGLANG-ATOM 0/6] Check Aiter/FlyDSL/Triton versions before SGLang build ==========" && \
     "${VENV_PYTHON}" -m pip show atom amd-mori-nightly amd-aiter flydsl triton || true && \
@@ -484,35 +484,63 @@ RUN echo "========== Install atomesh binary ==========" && \
     atomesh --version
 
 # ========== LMCache (HIP c_ops) for KV offload ==========
-# ATOM's KV offload uses the LMCache connector, which needs LMCache's c_ops
-# built for ROCm. NEVER `pip install lmcache` — it pulls CUDA torch and breaks
-# the ROCm stack. Build from source pinned to a release tag, against the image's
-# torch. KEY: the install must be EDITABLE (`pip install -e .`); at this tag a
-# non-editable `pip install .` silently SKIPS the c_ops extension and falls back
-# to the slow python backend. Verified end-to-end (tp8 offload store via c_ops)
-# on gfx950. NOTE: tp>1 offload also needs aiter's eager-NCCL-init fix
-# (device_id= to init_process_group); that belongs in aiter (tracked separately),
-# not here — the CI build_aiter stage picks it up once merged.
-ARG LMCACHE_TAG=v0.4.5
+# The official ROCm wheel supplies LMCache's Python code and common native
+# storage extensions, but its bundled c_ops is built against the release
+# PyTorch ABI. ATOM images may carry a newer ROCm PyTorch, so rebuild c_ops
+# against the image's torch and also rebuild the format-defining lmcache_native
+# extension. Building the whole source package would additionally
+# compile unrelated Redis/filesystem extensions and can exceed builder memory.
+# Native ATOM MP support is stacked on LMCache#4662 until that PR merges.
+# Fetch the PR ref explicitly so its immutable commit is available from the
+# upstream repository; update both values to the upstream merge commit later.
+ARG LMCACHE_REFSPEC=refs/pull/4662/head
+ARG LMCACHE_COMMIT=4232f111ea967b419662c404f5e4b8ee1f2f6c7d
+ARG LMCACHE_WHEEL_URL=https://github.com/LMCache/LMCache/releases/download/v0.5.3-rocm/lmcache-0.5.3-cp312-cp312-manylinux_2_35_x86_64.whl
+ARG LMCACHE_WHEEL_SHA256=6406280fa2762a6314018926d4f2d4178e05f605a32bfdb1971b85bacd1ebae4
 # PYTORCH_ROCM_ARCH is inherited as ENV from the `base` stage (=${GPU_ARCH});
 # hipcc reads it to target both gfx942 and gfx950. Do not re-derive from
 # ${GPU_ARCH} here — ARG does not cross FROM so it would be empty in this stage.
-RUN echo "========== [ATOM] LMCache HIP c_ops (${LMCACHE_TAG}, arch=${PYTORCH_ROCM_ARCH}) ==========" && \
+RUN echo "========== [ATOM] LMCache HIP c_ops (${LMCACHE_COMMIT}, arch=${PYTORCH_ROCM_ARCH}) ==========" && \
+    curl -fL "${LMCACHE_WHEEL_URL}" -o /tmp/lmcache-0.5.3-cp312-cp312-manylinux_2_35_x86_64.whl && \
+    echo "${LMCACHE_WHEEL_SHA256}  /tmp/lmcache-0.5.3-cp312-cp312-manylinux_2_35_x86_64.whl" | sha256sum -c - && \
+    "${VENV_PYTHON}" -m pip install --no-deps /tmp/lmcache-0.5.3-cp312-cp312-manylinux_2_35_x86_64.whl && \
     git clone https://github.com/LMCache/LMCache.git /opt/LMCache && \
-    cd /opt/LMCache && git checkout ${LMCACHE_TAG} && \
+    cd /opt/LMCache && git fetch origin "${LMCACHE_REFSPEC}" && \
+    git checkout "${LMCACHE_COMMIT}" && \
     "${VENV_PYTHON}" -m pip install -r requirements/build.txt && \
-    CXX=hipcc BUILD_WITH_HIP=1 \
-      "${VENV_PYTHON}" -m pip install -e . --no-build-isolation --no-deps && \
-    "${VENV_PYTHON}" -m pip install --no-deps \
-        prometheus_client==0.25.0 aiofile==3.11.1 caio==0.9.25 && \
-    "${VENV_PYTHON}" -c "import torch, lmcache, lmcache.c_ops; \
+    MAX_JOBS=4 "${VENV_PYTHON}" -c "from setuptools import setup; from setup_extensions.common_cpp import build_common_cpp; extensions, commands = build_common_cpp(); native = next(ext for ext in extensions if ext.name == 'lmcache.lmcache_native'); setup(name='lmcache-native', version='0.0.0', ext_modules=[native], cmdclass=commands, script_args=['build_ext', '--inplace'])" && \
+    CXX=hipcc BUILD_WITH_HIP=1 MAX_JOBS=4 \
+      "${VENV_PYTHON}" -c "from setuptools import setup; from setup_extensions.build_profiles.rocm import RocmProfile; extensions, commands = RocmProfile().build(); setup(name='lmcache-rocm-c-ops', ext_modules=extensions, cmdclass=commands, script_args=['build_ext', '--inplace'])" && \
+    LMCACHE_SITE=$("${VENV_PYTHON}" -c "import sysconfig; print(sysconfig.get_path('purelib'))") && \
+    test -f /opt/LMCache/lmcache/integration/atom/multi_process_adapter.py && \
+    cp -a /opt/LMCache/lmcache/. "${LMCACHE_SITE}/lmcache/" && \
+    cp /opt/LMCache/lmcache/c_ops*.so /opt/LMCache/lmcache/lmcache_native*.so "${LMCACHE_SITE}/lmcache/" && \
+    rm -f /tmp/lmcache-0.5.3-cp312-cp312-manylinux_2_35_x86_64.whl && \
+    "${VENV_PYTHON}" -m pip install \
+        prometheus_client==0.25.0 aiofile==3.11.1 aiofiles caio==0.9.25 \
+        blake3 redis sortedcontainers pyzmq cupy-rocm-7-0 \
+        cachetools cryptography numba openai \
+        opentelemetry-api==1.40.0 opentelemetry-sdk==1.40.0 \
+        opentelemetry-exporter-otlp==1.40.0 \
+        opentelemetry-exporter-prometheus==0.61b0 && \
+    "${VENV_PYTHON}" -c "import glob, os, sysconfig, torch; torch.cuda.is_available = lambda: True; import lmcache, lmcache.c_ops; \
 from lmcache.v1.cache_engine import LMCacheEngineBuilder; \
 from lmcache.v1.memory_management import MemoryFormat; \
 from lmcache.v1.lookup_client.factory import LookupClientFactory; \
 from lmcache.v1.config import LMCacheEngineConfig; \
 from lmcache.v1.metadata import LMCacheMetadata; \
+from lmcache.integration.atom import AtomMPSchedulerAdapter, AtomMPWorkerAdapter; \
+from lmcache.utils import EngineType; \
+from lmcache.v1.multiprocess.futures import TransferHandle; \
+from lmcache.v1.multiprocess.group_view import EngineGroupInfo; \
+c_ops_paths = glob.glob(os.path.join(sysconfig.get_path('purelib'), 'lmcache', 'c_ops*.so')); \
 assert 'rocm' in torch.__version__, torch.__version__; \
-assert lmcache.c_ops.__file__.endswith('.so'), 'c_ops fell back to python backend!'; \
+assert c_ops_paths, 'LMCache HIP c_ops extension was not installed'; \
+assert hasattr(lmcache.c_ops, 'execute_object_group_transfer'), 'c_ops fell back to torch backend'; \
+assert EngineType.ATOM.value == 'atom'; \
+assert TransferHandle.__module__ == 'lmcache.v1.multiprocess.futures'; \
+assert AtomMPSchedulerAdapter.__module__ == 'lmcache.integration.atom.multi_process_adapter'; \
+assert AtomMPWorkerAdapter.__module__ == 'lmcache.integration.atom.multi_process_adapter'; \
 print('OK: lmcache', lmcache.__version__, 'HIP c_ops; torch', torch.__version__)"
 
 # ========== SemiAnalysis aiperf agentic benchmark tool ==========

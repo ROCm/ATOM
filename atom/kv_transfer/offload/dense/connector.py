@@ -316,6 +316,63 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
     is_offload = True
 
     def __init__(self, config) -> None:
+        kvc = getattr(config, "kv_transfer_config", {}) or {}
+
+        # Preserve the legacy constructor's fail-fast ordering. Configuration
+        # metadata needs model fields that lightweight validation callers may
+        # intentionally omit, so reject the role and block geometry first.
+        validated_kv_role(kvc)
+        offcfg._strict_integer(
+            "Dense block size",
+            config.kv_cache_block_size,
+            minimum=1,
+        )
+
+        # Configuration is required even though the lookup service is optional.
+        # Do not turn invalid storage or geometry into a cache miss at startup.
+        cfg = offcfg.build_lmcache_config(kvc)
+        chunk_size = offcfg._strict_integer(
+            "LMCache chunk size",
+            cfg.chunk_size,
+            minimum=1,
+        )
+        world = offcfg.lmcache_replica_world_size(config)
+        meta = offcfg.build_lmcache_metadata(config, cfg, world, 0)
+        lookup_client = None
+        try:
+            from lmcache.v1.lookup_client.factory import LookupClientFactory
+
+            lookup_client = LookupClientFactory.create_lookup_client(cfg, meta)
+            logger.info(
+                "LMCache offload scheduler: lookup client on %s (world=%d)",
+                meta.engine_id,
+                world,
+            )
+        except Exception as e:  # noqa: BLE001  # optional lookup service
+            logger.warning(
+                "LMCache offload scheduler: lookup client unavailable: %s", e
+            )
+
+        self._init_dense_scheduler(
+            config,
+            chunk_size=chunk_size,
+            lookup_client=lookup_client,
+        )
+
+    def _init_dense_scheduler(
+        self,
+        config,
+        *,
+        chunk_size: int,
+        lookup_client,
+    ) -> None:
+        """Initialize layout-independent dense scheduling state.
+
+        The standalone connector supplies LMCache's legacy lookup client. The
+        multiprocess connector supplies a small adapter with the same public
+        ``lookup``/``clear_lookup_status`` contract, so both transports retain
+        one scheduling and exact-completion implementation.
+        """
         self._init_offload_statistics()
         self._config = config
         kvc = getattr(config, "kv_transfer_config", {}) or {}
@@ -327,8 +384,12 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             config.kv_cache_block_size,
             minimum=1,
         )
-        self.chunk_size: int | None = None
-        self._lookup_client = None
+        self.chunk_size = offcfg._strict_integer(
+            "LMCache chunk size",
+            chunk_size,
+            minimum=1,
+        )
+        self._lookup_client = lookup_client
 
         # req_id -> LoadSpec (pending load decided at match time)
         self._load_specs: dict[str, LoadSpec] = {}
@@ -371,30 +432,6 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
                 os.environ.get("OFFLOAD_MIN_LOAD_TOKENS"),
             )
             self._min_load_tokens = 8192
-
-        # Configuration is required even though the lookup service is optional.
-        # Do not turn invalid storage or geometry into a cache miss at startup.
-        cfg = offcfg.build_lmcache_config(kvc)
-        self.chunk_size = offcfg._strict_integer(
-            "LMCache chunk size",
-            cfg.chunk_size,
-            minimum=1,
-        )
-        world = offcfg.lmcache_replica_world_size(config)
-        meta = offcfg.build_lmcache_metadata(config, cfg, world, 0)
-        try:
-            from lmcache.v1.lookup_client.factory import LookupClientFactory
-
-            self._lookup_client = LookupClientFactory.create_lookup_client(cfg, meta)
-            logger.info(
-                "LMCache offload scheduler: lookup client on %s (world=%d)",
-                meta.engine_id,
-                world,
-            )
-        except Exception as e:  # noqa: BLE001  # optional lookup service
-            logger.warning(
-                "LMCache offload scheduler: lookup client unavailable: %s", e
-            )
 
     # -- match: how many extra tokens can come from CPU/NVMe -------------
     def _begin_load_lifecycle(self, seq) -> None:
@@ -600,10 +637,13 @@ class DenseOffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             seq._load_operation = load_operation
             self._active_load_operations[sid] = (seq, load_operation)
             self._track_load_statistics(load_operation, lmc - hbm)
+            transfer_end = (
+                lmc if ls.transfer_end_tokens is None else int(ls.transfer_end_tokens)
+            )
             meta.add_request(
                 LMCacheReqMeta(
                     req_id=seq.id,
-                    token_ids=list(seq.token_ids[:lmc]),
+                    token_ids=list(seq.token_ids[:transfer_end]),
                     block_ids=list(seq.block_table),
                     load_spec=ls,
                     load_operation=load_operation,
