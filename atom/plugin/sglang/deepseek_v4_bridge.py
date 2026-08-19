@@ -9,6 +9,12 @@ from typing import Any
 import numpy as np
 import torch
 
+from atom.model_ops.attentions.v4_pool_geometry import (
+    CSA_RATIO,
+    DENSE_RATIO,
+    HCA_RATIO,
+    WindowParams,
+)
 from atom.plugin.sglang.runtime.context import is_draft_extend_mode
 
 ATOM_DEEPSEEK_V4_BLOCK_SIZE = 128
@@ -21,7 +27,70 @@ except Exception:  # noqa: BLE001
 _V4_FP8_SUPPORTED_GFX = ("gfx950", "gfx1250")
 _V4_FP8_DOWNGRADE_WARNED = False
 
+# Rows one physical block takes in a CSA layer's compressed view. The unified
+# pool sums this over every layer sharing an envelope; here each layer owns its
+# `[num_blocks, block_size // 4, head_dim]` view, so a block is just its own
+# rows. Consumed by `_fill_csa_paged_compress`
+# (`row = physical_block * envelope_rows + slot_in_block`).
+_CSA_ENVELOPE_ROWS = ATOM_DEEPSEEK_V4_BLOCK_SIZE // 4
+
 logger = logging.getLogger(__name__)
+
+
+class PerLayerPoolGeometry:
+    """The read surface the shared index builders want, for this proxy pool.
+
+    Those builders take every address from a `UnifiedPoolGeometry`, which
+    describes native ATOM's pool: one plane holds every layer, so a class starts
+    past the classes ahead of it and its window rows are strided by its own
+    layer count. This bridge gives each layer a private plane instead, laid out
+    ``[compressed ++ windows]``, which is the same arithmetic with a single
+    layer per class: nothing to interleave, so a window run is the whole ring
+    and `WindowParams.index` collapses to
+    ``num_blocks * block_rows + slot * cache_size + pos % cache_size``.
+
+    The compressed region leads the plane on purpose. The builders address it as
+    ``phys * envelope_rows + row`` with no base term -- native folds that base
+    into the layer's view base -- so it has to start at row 0 of the view, and
+    the windows take the offset instead, where `ring_start` can carry it.
+
+    Every class answers `window_params`, because on this pool they differ only
+    in `ring_start` and a class with no layers is simply never asked.
+    """
+
+    __slots__ = ("block_size", "cache_size", "num_blocks")
+
+    def __init__(self, cache_size: int, block_size: int, num_blocks: int) -> None:
+        self.cache_size = int(cache_size)
+        self.block_size = int(block_size)
+        self.num_blocks = int(num_blocks)
+
+    @property
+    def classes(self) -> tuple[int, ...]:
+        return (DENSE_RATIO, CSA_RATIO, HCA_RATIO)
+
+    @property
+    def envelope_rows(self) -> int:
+        """Rows one block takes in an HCA layer's compressed region.
+
+        Only the HCA compress tail of the prefill builder reads this; the CSA
+        fill takes its own stride from `attn_md.envelope_rows`.
+        """
+        return max(1, self.block_size // HCA_RATIO)
+
+    def block_rows(self, ratio: int) -> int:
+        """Rows one block takes in a layer of `ratio`; 0 where it compresses none."""
+        return self.block_size // ratio if ratio in (CSA_RATIO, HCA_RATIO) else 0
+
+    def window_params(self, ratio: int) -> WindowParams:
+        cs = self.cache_size
+        return WindowParams(
+            ring_start=self.num_blocks * self.block_rows(ratio),
+            slot_rows=cs,
+            ring_slots=cs,
+            ring_stride=cs,
+            run_rows=cs,
+        )
 
 
 def _resolve_v4_index_topk(model: Any = None, proxy_pool: Any = None) -> int:
@@ -339,22 +408,11 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
                 num_pages = self.num_slots * self.swa_cache_size + self.num_blocks * k
 
                 nope_start = offset
-                swa_nope_bytes = (
-                    self.num_slots
-                    * self.swa_cache_size
-                    * ATOM_DEEPSEEK_V4_FP8_PACKED_DIM
-                )
-                swa_view = (
-                    self._take(offset, swa_nope_bytes)
-                    .view(fp8_dtype)
-                    .view(
-                        self.num_slots,
-                        self.swa_cache_size,
-                        ATOM_DEEPSEEK_V4_FP8_PACKED_DIM,
-                    )
-                )
-                offset += swa_nope_bytes
-
+                # Compressed blocks lead the plane. The shared index builders
+                # address them as `phys * envelope_rows + row` with no base
+                # term -- native folds that base into the layer's view base --
+                # so they have to start at row 0 of this view. The windows take
+                # the offset instead, where `ring_start` can carry it.
                 main_view = None
                 if ratio in (4, 128):
                     main_nope_bytes = (
@@ -378,6 +436,22 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
                     )
                     offset += main_nope_bytes
 
+                swa_nope_bytes = (
+                    self.num_slots
+                    * self.swa_cache_size
+                    * ATOM_DEEPSEEK_V4_FP8_PACKED_DIM
+                )
+                swa_view = (
+                    self._take(offset, swa_nope_bytes)
+                    .view(fp8_dtype)
+                    .view(
+                        self.num_slots,
+                        self.swa_cache_size,
+                        ATOM_DEEPSEEK_V4_FP8_PACKED_DIM,
+                    )
+                )
+                offset += swa_nope_bytes
+
                 unified.append(
                     self.raw_arena[nope_start:offset]
                     .view(fp8_dtype)
@@ -385,20 +459,6 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
                 )
 
                 rope_start = offset
-                swa_rope_bytes = (
-                    self.num_slots * self.swa_cache_size * self.qk_rope_head_dim * 2
-                )
-                swa_rope_view = (
-                    self._take(offset, swa_rope_bytes)
-                    .view(torch.bfloat16)
-                    .view(
-                        self.num_slots,
-                        self.swa_cache_size,
-                        self.qk_rope_head_dim,
-                    )
-                )
-                offset += swa_rope_bytes
-
                 main_rope_view = None
                 if ratio in (4, 128):
                     main_rope_bytes = self.num_blocks * k * self.qk_rope_head_dim * 2
@@ -415,6 +475,20 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
                         )
                     )
                     offset += main_rope_bytes
+
+                swa_rope_bytes = (
+                    self.num_slots * self.swa_cache_size * self.qk_rope_head_dim * 2
+                )
+                swa_rope_view = (
+                    self._take(offset, swa_rope_bytes)
+                    .view(torch.bfloat16)
+                    .view(
+                        self.num_slots,
+                        self.swa_cache_size,
+                        self.qk_rope_head_dim,
+                    )
+                )
+                offset += swa_rope_bytes
 
                 unified_rope.append(
                     self.raw_arena[rope_start:offset]
@@ -448,18 +522,10 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
                 continue
 
             layer_start = offset
-            swa_bytes = self.num_slots * self.swa_cache_size * self.head_dim * 2
-            swa_view = (
-                self._take(offset, swa_bytes)
-                .view(torch.bfloat16)
-                .view(self.num_slots, self.swa_cache_size, self.head_dim)
-            )
-            offset += swa_bytes
-            swa.append(swa_view)
-            swa_rope.append(None)
-
-            if ratio == 4:
-                k = ATOM_DEEPSEEK_V4_BLOCK_SIZE // 4
+            k = ATOM_DEEPSEEK_V4_BLOCK_SIZE // ratio if ratio in (4, 128) else 0
+            # Compressed blocks lead the plane; see the fp8 branch above.
+            main = None
+            if k:
                 main_bytes = self.num_blocks * k * self.head_dim * 2
                 main = (
                     self._take(offset, main_bytes)
@@ -470,15 +536,28 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
                     )
                 )
                 offset += main_bytes
-                unified.append(
-                    self.raw_arena[layer_start:offset]
-                    .view(torch.bfloat16)
-                    .view(
-                        self.num_slots * self.swa_cache_size + self.num_blocks * k,
-                        self.head_dim,
-                    )
+
+            swa_bytes = self.num_slots * self.swa_cache_size * self.head_dim * 2
+            swa_view = (
+                self._take(offset, swa_bytes)
+                .view(torch.bfloat16)
+                .view(self.num_slots, self.swa_cache_size, self.head_dim)
+            )
+            offset += swa_bytes
+            swa.append(swa_view)
+            swa_rope.append(None)
+
+            unified.append(
+                self.raw_arena[layer_start:offset]
+                .view(torch.bfloat16)
+                .view(
+                    self.num_blocks * k + self.num_slots * self.swa_cache_size,
+                    self.head_dim,
                 )
-                unified_rope.append(None)
+            )
+            unified_rope.append(None)
+
+            if ratio == 4:
                 idx_bytes = self.num_blocks * k * self.index_dim
                 idx = (
                     self._take(offset, idx_bytes)
@@ -493,33 +572,8 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
                 csa_main_rope.append(None)
                 csa_indexer.append(idx)
             elif ratio == 128:
-                k = ATOM_DEEPSEEK_V4_BLOCK_SIZE // 128
-                main_bytes = self.num_blocks * k * self.head_dim * 2
-                main = (
-                    self._take(offset, main_bytes)
-                    .view(torch.bfloat16)
-                    .as_strided(
-                        size=(self.num_blocks, k, self.head_dim),
-                        stride=(k * self.head_dim, self.head_dim, 1),
-                    )
-                )
-                offset += main_bytes
-                unified.append(
-                    self.raw_arena[layer_start:offset]
-                    .view(torch.bfloat16)
-                    .view(
-                        self.num_slots * self.swa_cache_size + self.num_blocks * k,
-                        self.head_dim,
-                    )
-                )
-                unified_rope.append(None)
                 hca_main.append(main)
                 hca_main_rope.append(None)
-            else:
-                unified.append(
-                    swa_view.view(self.num_slots * self.swa_cache_size, self.head_dim)
-                )
-                unified_rope.append(None)
 
         return {
             "unified": unified,
@@ -757,6 +811,9 @@ def bind_deepseek_v4_proxy_cache_views(model, proxy_pool: Any) -> bool:
     if getattr(model, "_atom_sglang_v4_proxy_cache_ptr", None) == ptr:
         return True
 
+    _proxy_geometry = PerLayerPoolGeometry(
+        proxy_pool.swa_cache_size, ATOM_DEEPSEEK_V4_BLOCK_SIZE, proxy_pool.num_blocks
+    )
     csa_i = 0
     hca_i = 0
     for local_layer_id, block in enumerate(_iter_deepseek_v4_cache_blocks(model)):
@@ -776,6 +833,17 @@ def bind_deepseek_v4_proxy_cache_views(model, proxy_pool: Any) -> bool:
             if swa_rope_view is not None
             else None
         )
+        # `swa_plane` is what a window write addresses, and the index builders
+        # now emit window rows relative to the WHOLE plane -- `ring_start` puts
+        # them past the compressed region that leads it. So this is the unified
+        # view, not the window slice: addressing the slice would apply that
+        # offset a second time. (`swa_kv` stays bound for the draft-extend
+        # override, which passes buffers itself.)
+        attn.swa_plane = attn.unified_kv
+        attn.swa_plane_rope = attn.unified_kv_rope
+        # The window write takes the class's row formula rather than assuming a
+        # layout, so it needs the same `WindowParams` the index builders get.
+        attn.swa_window = _proxy_geometry.window_params(ratio)
         attn.swa_cache_size = proxy_pool.swa_cache_size
         if ratio == 4:
             indexer_topk = int(attn.indexer.index_topk)
@@ -1003,6 +1071,10 @@ class _V4SGLangDecodeGraphBuffers:
 
         self.cu_q = i32(t + 1)
         self.state_slot = i32(s)
+        # `state_slot_in` must own its buffer even when it equals `state_slot_out`:
+        # a decode replay bakes this pointer in at capture, so aliasing the two
+        # would make the distinction unreplayable the moment a fork needs it.
+        self.state_slot_in = i32(s)
         self.n_csa = i32(s)
         self.n_hca = i32(s)
         self.batch_id = CpuGpuBuffer(t, dtype=torch.int32, device=device)
@@ -1015,6 +1087,25 @@ class _V4SGLangDecodeGraphBuffers:
         self.idx_swa = i32(t * max(1, win))
         self.idx_csa = i32(t * max(1, win + topk))
         self.idx_hca = i32(t * max(1, win + hca))
+        # The indexer decode path reads its exact per-token CSA row end and a
+        # block table expanded to one row per token. Same lifetime as the
+        # `cu_ends_gpu` beside them, so they get fixed addresses too.
+        self.n_committed_per_token = i32(t)
+        self.block_tables_per_token = i32(t, self.max_blocks)
+        # Where each decode token's own KV lands in its layer's window buffer,
+        # one buffer per compress class. The index builder fills these; the
+        # model reads them back via `attn_md.swa_dest_rows` to fuse the window
+        # write into qk-norm/rope. Persistent, like every other graph buffer:
+        # a replay reuses the address captured on the warmup forward.
+        from atom.model_ops.attentions.v4_pool_geometry import (
+            CSA_RATIO,
+            DENSE_RATIO,
+            HCA_RATIO,
+        )
+
+        self.dest_rows = {
+            ratio: i32(t) for ratio in (DENSE_RATIO, CSA_RATIO, HCA_RATIO)
+        }
 
         # Decode CG plan slicing is `graph_bs * per_seq_bound` (computed inside
         # make_compress_plans). graph_bs == num_slots (padded decode batch);
@@ -1087,6 +1178,9 @@ class _V4SGLangVerifyGraphBuffers:
 
         self.cu_q = i32(s + 1)
         self.state_slot = i32(s)
+        self.state_slot_in = i32(s)
+        self.n_committed_per_token = i32(t)
+        self.block_tables_per_token = i32(t, self.max_blocks)
         self.n_csa = i32(s)
         self.n_hca = i32(s)
         self.batch_id = i32(t)
@@ -1421,6 +1515,10 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
     md.swa_cs = proxy_pool.swa_cache_size
     md.index_topk = index_topk
     md.swa_pages = proxy_pool.num_slots * proxy_pool.swa_cache_size
+    md.envelope_rows = _CSA_ENVELOPE_ROWS
+    md.pool_geometry = PerLayerPoolGeometry(
+        proxy_pool.swa_cache_size, ATOM_DEEPSEEK_V4_BLOCK_SIZE, proxy_pool.num_blocks
+    )
 
     if total:
         if positions_numel > scheduled_bs:
@@ -1463,6 +1561,11 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
     md.reset_slots = set()
     md.state_slot_mapping_cpu = slot_arr
     md.state_slot_mapping = bufs.stage(bufs.state_slot, slot_arr, bs)
+    # This bridge's allocator reuses a request's slot on a prefix hit rather
+    # than forking it, so the read slot is the write slot -- but it gets its
+    # own buffer, per `AttentionMetaData_DSV4.state_slot_in`.
+    md.state_slot_out = md.state_slot_mapping
+    md.state_slot_in = bufs.stage(bufs.state_slot_in, slot_arr, bs)
     md.batch_id_per_token_cpu = batch_np
     md.batch_id_per_token = bufs.stage(bufs.batch_id, batch_pad, t_pad)
     n_csa = (seq_np // 4).astype(np.int32)
@@ -1500,6 +1603,7 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
     hca_indptr = bufs.stage(bufs.indptr_hca, hca_indptr_np, t_pad + 1)
 
     positions_gpu = positions[:t_pad]
+    dest_rows = {ratio: buf.gpu for ratio, buf in bufs.dest_rows.items()}
     write_v4_paged_decode_indices(
         state_slot_per_seq=md.state_slot_mapping,
         batch_id_per_token=md.batch_id_per_token,
@@ -1510,10 +1614,12 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
         swa_indices=bufs.idx_swa.gpu,
         csa_indices=bufs.idx_csa.gpu,
         hca_indices=bufs.idx_hca.gpu,
+        dest_rows=dest_rows,
         T=t_pad,
         win=win,
-        cache_size=int(md.swa_cs),
+        geometry=md.pool_geometry,
     )
+    md.swa_dest_rows = dest_rows
     write_v4_decode_hca_compress_tail(
         batch_id_per_token=md.batch_id_per_token,
         positions=positions_gpu,
@@ -1523,7 +1629,7 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
         hca_indices=bufs.idx_hca.gpu,
         T=t_pad,
         win=win,
-        swa_pages=int(md.swa_pages),
+        swa_pages=0,
     )
     md.kv_indices_swa = bufs.idx_swa.gpu
     md.kv_indices_csa = bufs.idx_csa.gpu
@@ -1545,10 +1651,20 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
     )
     safe_batch_id = md.batch_id_per_token.clamp_min(0)
     seq_base = cu_committed_gpu[safe_batch_id].to(torch.int32)
-    visible_end = seq_base + torch.minimum(
-        (positions_gpu.to(torch.int32) + 1) // 4,
-        md.n_committed_csa_per_seq[safe_batch_id],
-    ).to(torch.int32)
+    # Exact ratio-4 causal boundary per token, uncapped by `index_topk`: this is
+    # the CSA row end the indexer's paged-MQA logits and top-k both take.
+    n_committed_per_token = bufs.n_committed_per_token.gpu[:t_pad]
+    n_committed_per_token.copy_(
+        torch.minimum(
+            (positions_gpu.to(torch.int32) + 1) // 4,
+            md.n_committed_csa_per_seq[safe_batch_id],
+        ).to(torch.int32)
+    )
+    visible_end = seq_base + n_committed_per_token
+    block_tables_per_token = bufs.block_tables_per_token.gpu[:t_pad]
+    block_tables_per_token.copy_(md.block_tables[safe_batch_id.long()])
+    md.n_committed_per_token = n_committed_per_token
+    md.block_tables_per_token = block_tables_per_token
     md.indexer_meta = {
         "total_committed": int(cu_committed_cpu[-1]),
         "cu_committed_gpu": cu_committed_gpu,
@@ -1671,6 +1787,10 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
     md.swa_cs = proxy_pool.swa_cache_size
     md.index_topk = index_topk
     md.swa_pages = proxy_pool.num_slots * proxy_pool.swa_cache_size
+    md.envelope_rows = _CSA_ENVELOPE_ROWS
+    md.pool_geometry = PerLayerPoolGeometry(
+        proxy_pool.swa_cache_size, ATOM_DEEPSEEK_V4_BLOCK_SIZE, proxy_pool.num_blocks
+    )
     # Target verify is extend-shaped for attention/compressor state, but the
     # indexer needs the fixed-shape decode scorer to be graph-safe.
     md.use_decode_indexer_for_verify_graph = True
@@ -1718,6 +1838,9 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
     md.reset_slots = set()
     md.state_slot_mapping_cpu = slot_arr
     md.state_slot_mapping = bufs.state_slot.gpu[:bs]
+    md.state_slot_out = md.state_slot_mapping
+    md.state_slot_in = bufs.state_slot_in.gpu[:bs]
+    md.state_slot_in.copy_(md.state_slot_mapping)
     md.batch_id_per_token_cpu = batch_np
     md.batch_id_per_token = bufs.stage(bufs.batch_id, batch_np, total)
 
@@ -1736,7 +1859,6 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
     )
 
     win = int(md.swa_window)
-    cs = int(md.swa_cs)
     chunk_start_per_seq = pos_np[q_np[:-1]]
     chunk_start_pt = chunk_start_per_seq[batch_np]
     token_pos_in_chunk = pos_np - chunk_start_pt
@@ -1781,8 +1903,7 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
         prefix_hca_indices=bufs.idx_prefix_hca.gpu,
         T=total,
         win=win,
-        cache_size=cs,
-        swa_pages=int(md.swa_pages),
+        geometry=md.pool_geometry,
     )
     md.kv_indices_extend = bufs.idx_extend.gpu
     md.kv_indices_prefix_swa = bufs.idx_prefix_swa.gpu
@@ -1801,11 +1922,20 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
     cu_committed_cpu[-1] = max(int(cu_committed_cpu[-1]), 1)
     cu_committed_gpu = bufs.stage(bufs.indexer_cu_committed, cu_committed_cpu, bs + 1)
     seq_base_cpu = cu_committed_cpu[batch_np].astype(np.int32)
-    visible_end_cpu = seq_base_cpu + np.minimum(
-        (pos_np + 1) // 4, n_csa[batch_np]
-    ).astype(np.int32)
+    n_committed_per_token_cpu = np.minimum((pos_np + 1) // 4, n_csa[batch_np]).astype(
+        np.int32
+    )
+    visible_end_cpu = seq_base_cpu + n_committed_per_token_cpu
     seq_base_gpu = bufs.stage(bufs.indexer_seq_base, seq_base_cpu, total)
     visible_end_gpu = bufs.stage(bufs.indexer_cu_ends, visible_end_cpu, total)
+    md.n_committed_per_token = bufs.stage(
+        bufs.n_committed_per_token, n_committed_per_token_cpu, total
+    )
+    block_tables_per_token = bufs.block_tables_per_token.gpu[:total]
+    block_tables_per_token.copy_(
+        md.block_tables[md.batch_id_per_token.clamp_min(0).long()]
+    )
+    md.block_tables_per_token = block_tables_per_token
     md.indexer_meta = {
         "total_committed": int(cu_committed_cpu[-1]),
         "cu_committed_gpu": cu_committed_gpu,
@@ -1921,6 +2051,10 @@ def build_atom_v4_attention_metadata_from_sglang(
     md.swa_cs = proxy_pool.swa_cache_size
     md.index_topk = index_topk
     md.swa_pages = proxy_pool.num_slots * proxy_pool.swa_cache_size
+    md.envelope_rows = _CSA_ENVELOPE_ROWS
+    md.pool_geometry = PerLayerPoolGeometry(
+        proxy_pool.swa_cache_size, ATOM_DEEPSEEK_V4_BLOCK_SIZE, proxy_pool.num_blocks
+    )
 
     if is_draft_extend:
         slot_arr = np.full(num_reqs, -1, dtype=np.int32)
@@ -1947,6 +2081,8 @@ def build_atom_v4_attention_metadata_from_sglang(
         md.state_slot_mapping = torch.from_numpy(slot_arr).to(
             device=device, dtype=torch.int32
         )
+    md.state_slot_out = md.state_slot_mapping
+    md.state_slot_in = md.state_slot_mapping.clone()
     md.batch_id_per_token_cpu = batch_np
     md.batch_id_per_token = torch.from_numpy(batch_np).to(device=device)
     md.n_committed_csa_per_seq_cpu = (seq_np // 4).astype(np.int32)
@@ -1973,7 +2109,6 @@ def _populate_decode_indices(md, block_tables, pos_np, device) -> None:
     from atom.model_ops.v4_kernels import write_v4_paged_decode_indices
 
     win = int(md.swa_window)
-    cs = int(md.swa_cs)
     batch_np = md.batch_id_per_token_cpu
     if len(batch_np) == 0:
         empty = torch.empty(0, dtype=torch.int32, device=device)
@@ -2009,6 +2144,12 @@ def _populate_decode_indices(md, block_tables, pos_np, device) -> None:
     hca_indices = torch.empty(
         max(1, int(hca_indptr_np[-1])), dtype=torch.int32, device=device
     )
+    # One destination row per token per class; the builder fills them and the
+    # model reads them back through `attn_md.swa_dest_rows`.
+    dest_rows = {
+        ratio: torch.empty(max(1, len(batch_np)), dtype=torch.int32, device=device)
+        for ratio in md.pool_geometry.classes
+    }
     write_v4_paged_decode_indices(
         state_slot_per_seq=md.state_slot_mapping,
         batch_id_per_token=md.batch_id_per_token,
@@ -2019,10 +2160,12 @@ def _populate_decode_indices(md, block_tables, pos_np, device) -> None:
         swa_indices=swa_indices,
         csa_indices=csa_indices,
         hca_indices=hca_indices,
+        dest_rows=dest_rows,
         T=len(batch_np),
         win=win,
-        cache_size=cs,
+        geometry=md.pool_geometry,
     )
+    md.swa_dest_rows = dest_rows
     # Fill HCA compressed section on CPU for the first-cut eager bridge.
     # `write_v4_paged_decode_indices` writes the SWA prefix at the TAIL of each
     # per-token slice, so HCA compressed entries must occupy the HEAD starting
@@ -2032,9 +2175,9 @@ def _populate_decode_indices(md, block_tables, pos_np, device) -> None:
         n_hca = int(hca_counts[t])
         base = int(hca_indptr_np[t])
         if n_hca:
-            hca_cpu[base : base + n_hca] = int(md.swa_pages) + block_tables[
-                int(bid), :n_hca
-            ].detach().cpu().numpy().astype(np.int32)
+            hca_cpu[base : base + n_hca] = (
+                block_tables[int(bid), :n_hca].detach().cpu().numpy().astype(np.int32)
+            )
     hca_indices.copy_(torch.from_numpy(hca_cpu).to(device=device))
     md.kv_indices_swa = swa_indices[: int(swa_indptr_np[-1])]
     md.kv_indices_csa = csa_indices[: int(csa_indptr_np[-1])]
@@ -2065,7 +2208,6 @@ def _populate_prefill_indices(md, block_tables, batch_np, pos_np, q_np, device) 
         md.skip_prefix_len_csa = empty
         return
     win = int(md.swa_window)
-    cs = int(md.swa_cs)
     chunk_start_per_seq = pos_np[q_np[:-1]]
     chunk_start_pt = chunk_start_per_seq[batch_np]
     token_pos_in_chunk = pos_np - chunk_start_pt
@@ -2122,8 +2264,7 @@ def _populate_prefill_indices(md, block_tables, batch_np, pos_np, q_np, device) 
         prefix_hca_indices=hca_indices,
         T=T,
         win=win,
-        cache_size=cs,
-        swa_pages=int(md.swa_pages),
+        geometry=md.pool_geometry,
     )
     md.kv_indices_extend = ext_indices[: int(ext_indptr_np[-1])]
     md.kv_indices_prefix_swa = swa_indices[: int(swa_indptr_np[-1])]
@@ -2155,10 +2296,13 @@ def _populate_indexer(md, batch_np, positions, device) -> None:
         }
         return
     base = cu_gpu[bid].to(torch.int32)
-    end = base + torch.minimum(
+    n_committed_per_token = torch.minimum(
         (positions.to(torch.int32) + 1) // 4,
         md.n_committed_csa_per_seq[bid],
     ).to(torch.int32)
+    end = base + n_committed_per_token
+    md.n_committed_per_token = n_committed_per_token
+    md.block_tables_per_token = md.block_tables[bid.clamp_min(0).long()]
     md.indexer_meta = {
         "total_committed": int(cu[-1]),
         "cu_committed_gpu": cu_gpu,

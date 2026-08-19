@@ -34,6 +34,33 @@ from atom.utils.forward_context import (
 logger = logging.getLogger(__name__)
 
 
+def _state_indices_in(linear_backend: Any, idx: torch.Tensor) -> torch.Tensor:
+    """The slots this forward READS its incoming recurrent state from.
+
+    SGLang hands one mamba slot per request and this bridge never forks a
+    request's state, so the read slots hold the same values as the write ones.
+    They still get their own storage, per
+    ``GDNAttentionMetadata.non_spec_state_indices_in_tensor``: decode replays a
+    CUDAGraph with this pointer baked in at capture, so aliasing it to the write
+    tensor would leave a fork unexpressible the moment one is introduced.
+
+    The buffer only grows, and SGLang captures its graph shapes largest-first,
+    so the address the first capture sees is the one every later replay gets.
+    """
+    buf = getattr(linear_backend, "_atom_gdn_state_indices_in", None)
+    if (
+        buf is None
+        or buf.numel() < idx.numel()
+        or buf.device != idx.device
+        or buf.dtype != idx.dtype
+    ):
+        buf = torch.empty(idx.numel(), dtype=idx.dtype, device=idx.device)
+        linear_backend._atom_gdn_state_indices_in = buf
+    out = buf[: idx.numel()]
+    out.copy_(idx)
+    return out
+
+
 class GDNAttentionBackend:
     @staticmethod
     def get_name() -> str:
@@ -157,6 +184,7 @@ class SGLangGDNForwardContext:
             "non_spec_query_start_loc": query_start_loc,
             "spec_state_indices_tensor": None,
             "non_spec_state_indices_tensor": idx,
+            "non_spec_state_indices_in_tensor": _state_indices_in(linear_backend, idx),
             "spec_sequence_masks": None,
             "spec_token_indx": None,
             "non_spec_token_indx": None,
