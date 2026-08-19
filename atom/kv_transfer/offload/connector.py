@@ -372,6 +372,44 @@ class LMCacheOffloadConnector(KVConnectorBase):
                 getattr(self._config, "kv_transfer_config", None)
             )
             cfg.max_local_cpu_size = gib
+            # FIFO, and the KV pool keeps LMCache's default LRU. Two pools were
+            # what made having two answers possible; this is the first use of
+            # it.
+            #
+            # A state entry is written once and read once. `resumable_hit`
+            # takes the RIGHTMOST rung it can resume from, and each turn's
+            # anchor sits further right than the last, so turn N+1 resumes off
+            # turn N's anchor and turn N+2 never looks at it again. Nor does
+            # anyone else: the anchor is the whole prompt's hash, so a second
+            # conversation reaches it only by being the same conversation. The
+            # entry's only property that matters is therefore whether it
+            # survives to the next turn -- its age against the think time --
+            # and evicting by age is FIFO by definition.
+            #
+            # LRU is not merely no better here, it is worse. Touching on read
+            # promotes an entry that has just been consumed and is now garbage,
+            # and it displaces one still waiting for the turn that will use it:
+            # write A at t=0, write B at t=10, read (and finish with) A at
+            # t=60, and the eviction at t=100 takes B under LRU and A under
+            # FIFO. B is the one somebody still wants. This is one-shot access
+            # polluting an LRU, and the state tier is nothing but one-shot
+            # accesses.
+            #
+            # Set explicitly rather than left to fall out. It already behaves
+            # this way, but only because nothing on the state path calls
+            # `update_on_hit`: `StorageManager.get` reaches `get_blocking`,
+            # which only takes a reference, and `StateByteCodec.contains` has
+            # no caller so `touch_cache` never sees a state key. That is an
+            # omission upstream, not a promise -- a `get` that refreshes
+            # recency is the more obvious implementation, and if LMCache ever
+            # writes it this pool would flip to LRU silently and get worse.
+            #
+            # This is tied to the checkpoint ladder being off
+            # (`--state-checkpoint-interval-tokens -1`, anchors only). Turn the
+            # ladder on and rungs land inside prefixes several conversations
+            # share, entries stop being one-shot, and LRU becomes the better
+            # answer -- so this line moves with that setting.
+            cfg.cache_policy = "FIFO"
             engine = LMCacheEngineBuilder.get_or_create(
                 f"atom-state-{rank}",
                 cfg,

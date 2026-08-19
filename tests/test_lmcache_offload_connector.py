@@ -2706,6 +2706,7 @@ def test_the_state_tier_builds_its_own_cpu_pool(monkeypatch):
         def get_or_create(instance_id, cfg, meta, gpu_connector, *rest):
             built["instance_id"] = instance_id
             built["max_local_cpu_size"] = cfg.max_local_cpu_size
+            built["cache_policy"] = cfg.cache_policy
             return _Engine()
 
     import lmcache.v1.cache_engine as ce
@@ -2721,6 +2722,10 @@ def test_the_state_tier_builds_its_own_cpu_pool(monkeypatch):
     assert built["instance_id"] == "atom-state-3", "one pool per rank"
     assert built["max_local_cpu_size"] == 24.0
     assert built["post_init"] is True
+    # A state entry is written once and read once, so its only property that
+    # matters is age. LRU would promote one that has just been consumed over
+    # one still waiting for the turn that will use it.
+    assert built["cache_policy"] == "FIFO"
 
 
 def test_zero_means_share_the_kv_pool(monkeypatch, caplog):
