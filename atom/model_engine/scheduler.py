@@ -350,9 +350,6 @@ class ScheduledBatch:
     ):
         if scheduled_spec_decode_tokens is None:
             scheduled_spec_decode_tokens = {}
-        # Default so the attr always exists (set for real in the num_spec_step
-        # branch below; only read there).
-        self.scheduled_spec_decode_tokens: np.ndarray | None = None
         self.remote_kv_block_ids = remote_kv_block_ids or []
         self.remote_kv_seq_blocks = remote_kv_seq_blocks or {}
 
