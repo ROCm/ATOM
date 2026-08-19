@@ -382,7 +382,6 @@ class LLMEngine:
                 "joint_boundaries",
                 "joint_boundaries_hbm",
                 "joint_boundaries_tier",
-                "joint_tier_demoted",
             )
         }
         full = totals["full_tokens"]

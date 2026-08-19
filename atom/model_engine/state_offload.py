@@ -332,50 +332,6 @@ def state_offload_min_load_tokens() -> int:
     return floor
 
 
-def state_offload_tier_margin_tokens() -> int:
-    """Extra prefix a TIER rung must reach past a free HBM one to be preferred.
-
-    A different question from `state_offload_min_load_tokens`, which asks
-    whether a boundary is worth a load in absolute terms. This one is
-    comparative, and it exists because `_gated_hit` cannot see the difference
-    it is comparing: it returns the rightmost rung `_resumable_from` accepts,
-    and that predicate takes an HBM checkpoint and a spilled one as equals.
-    They are not. Resuming from HBM is a fork -- `_attach_state_slots` promotes
-    a slot and pins it, and nothing moves. Resuming from the tier is one flat
-    entry over PCIe plus a park round trip, which at c10 is a scheduler step of
-    added TTFT. Rightmost-wins therefore pays a park to buy a rung's worth of
-    prefill, and a rung can be a single hash block.
-
-    So: walking right to left, a tier rung is taken over the next free rung
-    only if it reaches this many tokens further. 0 keeps rightmost-wins, which
-    is what every measurement so far was taken under, and is the default for
-    that reason -- the number that should replace it is one this workload's own
-    `joint kv:` line can produce (compare `boundaries_tier` against the TTFT it
-    bought), not one guessed here.
-
-    Costs a fixpoint scan per rung walked, which is why the walk is bounded
-    (`_JOINT_WALK_TRIES`) rather than exhaustive.
-    """
-    raw = os.environ.get("OFFLOAD_STATE_TIER_MARGIN_TOKENS")
-    if raw is None:
-        return 0
-    try:
-        margin = int(raw)
-    except ValueError:
-        logger.warning(
-            "state offload: invalid OFFLOAD_STATE_TIER_MARGIN_TOKENS=%r; using 0",
-            raw,
-        )
-        return 0
-    if margin < 0:
-        logger.warning(
-            "state offload: negative OFFLOAD_STATE_TIER_MARGIN_TOKENS=%r; using 0",
-            raw,
-        )
-        return 0
-    return margin
-
-
 def state_offload_staging_groups() -> int:
     """K: staging *groups* to reserve, or 0 when the tier is off.
 
