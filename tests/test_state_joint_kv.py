@@ -167,8 +167,10 @@ def test_a_boundary_off_the_chunk_grid_still_pairs(tier_on):
 
 def test_a_covering_chunk_lmcache_does_not_hold_is_declined(tier_on):
     """Same rung, but LMCache stops at 12: the chunk covering the boundary is
-    not there, so the pair cannot form. `P <= L` is the invariant, and it is the
-    *covering* chunk that decides whether it holds."""
+    not there, so the pair cannot form. `P <= L` is the invariant; since
+    `lmc_tokens` is floored to the chunk grid before `cap` is derived, it is
+    now `cap` that excludes the rung rather than the covering-chunk check
+    rejecting it, and the outcome asserted here is the invariant either way."""
     bm = make_bm()
     seq = hybrid_seq()
     spilled_checkpoint(bm, chain_hash(bm, seq, 3))  # tokens [0, 12)
@@ -243,3 +245,86 @@ def test_the_knob_defaults_on(monkeypatch):
 
     assert admit(bm, seq, lmc_tokens=16) == 0
     assert seq.state_joint_boundary_tokens == 16
+
+
+# ---------------------------------------------------------------------------
+# Free rungs versus paid ones
+#
+# `_gated_hit` returns the rightmost rung `_resumable_from` accepts and cannot
+# see what it costs to reach: an HBM checkpoint forks, a spilled one is an
+# entry-sized H2D plus a park. `OFFLOAD_STATE_TIER_MARGIN_TOKENS` is what makes
+# the difference expressible, and the walk is what makes it actionable.
+# ---------------------------------------------------------------------------
+
+
+def _near_pair(bm: BlockManager, seq: Sequence):
+    """A tier rung at 20 tokens with a free HBM rung 4 tokens below it."""
+    tier = chain_hash(bm, seq, 5)  # tokens [0, 20)
+    free = chain_hash(bm, seq, 4)  # tokens [0, 16)
+    spilled_checkpoint(bm, tier)
+    hbm_checkpoint(bm, free, slot=1)
+    return tier, free
+
+
+def test_without_a_margin_the_rightmost_rung_wins_even_when_it_is_paid(tier_on):
+    """The default, and what every measurement so far was taken under."""
+    bm = make_bm()
+    seq = hybrid_seq()
+    tier, _free = _near_pair(bm, seq)
+
+    admit(bm, seq, lmc_tokens=24)
+
+    assert seq.state_joint_boundary_tokens == 20
+    assert seq.state_joint_boundary_hash == tier
+    assert (bm.joint_boundaries_tier, bm.joint_boundaries_hbm) == (1, 0)
+    assert bm.joint_tier_demoted == 0
+
+
+def test_a_margin_prefers_a_free_rung_the_paid_one_barely_beats(monkeypatch):
+    """4 tokens of extra prefix does not pay for an entry-sized H2D and a park,
+    so the walk keeps going and takes the checkpoint that costs nothing."""
+    monkeypatch.setenv("OFFLOAD_STATE", "1")
+    monkeypatch.setenv("OFFLOAD_STATE_STAGING_GROUPS", "2")
+    monkeypatch.setenv("OFFLOAD_STATE_TIER_MARGIN_TOKENS", "8")
+    bm = make_bm()
+    seq = hybrid_seq()
+    _tier, free = _near_pair(bm, seq)
+
+    hit = admit(bm, seq, lmc_tokens=24)
+
+    assert seq.state_joint_boundary_tokens == 16
+    assert seq.state_joint_boundary_hash == free
+    assert (bm.joint_boundaries_tier, bm.joint_boundaries_hbm) == (0, 1)
+    assert bm.joint_tier_demoted == 1
+
+    bm.allocate(seq, hit)
+    assert seq.state_load_hash == -1, "the free rung forks; nothing is fetched"
+
+
+def test_a_margin_a_paid_rung_clears_still_takes_the_paid_one(monkeypatch):
+    """The knob declines a bad trade, not every trade."""
+    monkeypatch.setenv("OFFLOAD_STATE", "1")
+    monkeypatch.setenv("OFFLOAD_STATE_STAGING_GROUPS", "2")
+    monkeypatch.setenv("OFFLOAD_STATE_TIER_MARGIN_TOKENS", "4")
+    bm = make_bm()
+    seq = hybrid_seq()
+    tier, _free = _near_pair(bm, seq)
+
+    admit(bm, seq, lmc_tokens=24)
+
+    assert seq.state_joint_boundary_tokens == 20
+    assert seq.state_joint_boundary_hash == tier
+    assert bm.joint_tier_demoted == 0
+
+
+def test_an_admission_with_no_rung_above_hbm_says_so(tier_on):
+    """The walk's own decline used to be a bare `return 0` -- a silent zero
+    indistinguishable from a build that never ran the feature."""
+    bm = make_bm()
+    seq = hybrid_seq()
+
+    admit(bm, seq, lmc_tokens=16)
+
+    assert seq.state_joint_boundary_tokens == 0
+    assert bm.joint_skips["no_rung_above_hbm"] == 1
+    assert bm.joint_boundaries == 0

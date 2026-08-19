@@ -1421,9 +1421,16 @@ class Scheduler:
             chosen = self.block_manager.joint_boundaries
             skips = self.block_manager.joint_skips
             if chosen or skips:
+                # The hbm/tier split is the actionable half: both are reuse,
+                # but only `tier` costs an entry-sized H2D and a park, so a
+                # ratio dominated by it says the state pool is too small for
+                # this concurrency even while the load counters look healthy.
                 logger.info(
-                    "joint kv: boundaries=%d | %s",
+                    "joint kv: boundaries=%d (hbm=%d tier=%d demoted=%d) | %s",
                     chosen,
+                    self.block_manager.joint_boundaries_hbm,
+                    self.block_manager.joint_boundaries_tier,
+                    self.block_manager.joint_tier_demoted,
                     " ".join(f"{k}={v}" for k, v in sorted(skips.items())),
                 )
 
