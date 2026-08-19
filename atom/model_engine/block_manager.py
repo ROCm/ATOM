@@ -7,7 +7,7 @@ from math import inf, isinf
 import numpy as np
 import xxhash
 
-from atom.config import Config
+from atom.config import Config, DCPConfig
 from atom.distributed.kv_events import (
     MEDIUM_GPU,
     MEDIUM_REMOTE,
@@ -69,6 +69,10 @@ class BlockManager:
         assert num_blocks > 0
         self.block_size = block_size
         self.dcp_world_size = config.decode_context_parallel_size
+        # DCP KV-cache interleave granularity S (1 = token-level round-robin).
+        self.cp_kv_cache_interleave_size = getattr(
+            config, "dcp_config", DCPConfig()
+        ).interleave_size
         # dcp_rank is always 0 here: BlockManager runs only on the scheduler
         # (rank 0). DCP rank is used only to compute local token counts for
         # memory reservation; the actual per-rank routing is done in the workers.
@@ -78,6 +82,7 @@ class BlockManager:
         # tokens (see _hash_block_size). == block_size when DCP is off.
         self.hash_block_size = self.block_size * self.dcp_world_size
         self.enable_prefix_caching = config.enable_prefix_caching
+        self.total_evicted_blocks: int = 0
 
         kv_events = getattr(config, "kv_events_config", None)
         self._events_enabled: bool = bool(kv_events and kv_events.enable)
@@ -208,6 +213,7 @@ class BlockManager:
         Without this the state pool keeps handing groups to checkpoints nothing
         can reach and spends live ones to make room for them.
         """
+        self.total_evicted_blocks += 1
         if self._event_log is not None:
             self._event_log.append(_make_block_removed([h]))
         self._state_checkpoint_cache.unindex(h)
@@ -281,20 +287,16 @@ class BlockManager:
         from atom.model_ops.dcp_ops import get_dcp_local_seq_lens
 
         local_len = get_dcp_local_seq_lens(
-            np.array([seq_len]), self.dcp_world_size, self.dcp_rank
+            np.array([seq_len]),
+            self.dcp_world_size,
+            self.dcp_rank,
+            self.cp_kv_cache_interleave_size,
         )[0]
         return int((local_len + self.block_size - 1) // self.block_size)
 
     def _effective_block_size(self):
         return self.block_size * self.dcp_world_size
 
-    # --- Prefix-cache block accounting granularity ---------------------------
-    # Under DCP one entry of `block_table` maps to a VIRTUAL block spanning
-    # `block_size * dcp_world_size` consecutive global tokens (each rank stores
-    # its `block_size` interleaved tokens in that physical block). So prefix
-    # cache hashing / reuse must be done per virtual block, not per physical
-    # block — otherwise the logical block index runs past the (dcp-shrunk)
-    # block_table. For dcp_world_size == 1 this reduces to the physical size.
     def _hash_block_size(self) -> int:
         return self.hash_block_size
 
@@ -352,6 +354,19 @@ class BlockManager:
             if settled:
                 break
         return boundary
+
+    def pool_occupancy(self) -> dict[str, int]:
+        used = self.kv.num_used
+        free = self.kv.num_free
+        hashed = self.kv.num_indexed
+        return {
+            "used": used,
+            "free": free,
+            "total": self.kv.num_blocks,
+            "hashed": hashed,
+            "retained": max(0, hashed - used),
+            "evicted_total": self.total_evicted_blocks,
+        }
 
     def can_allocate(self, seq: Sequence) -> int:
         """Return number of cache-hit blocks (>=0) if seq fits, else -1.
@@ -463,6 +478,8 @@ class BlockManager:
         # admission bound for state cache.
         if seq.has_per_req_cache and self.paged_state_checkpoints is None:
             self._attach_state_group(seq, h if num_cached_blocks > 0 else -1)
+        if seq.has_per_req_cache:
+            seq._state_initialized_after_alloc = False
 
     def _attach_state_group(self, seq: Sequence, hit_hash: int) -> None:
         """Give `seq` a state group, resuming from a checkpoint when one exists.
@@ -517,6 +534,27 @@ class BlockManager:
         seq.per_req_cache_group = src
         seq.state_fork_src = -1
 
+    def _chain_parent_hash(self, seq: Sequence, start: int) -> int | None:
+        """Return the chained hash of block ``start - 1``, or ``None`` on a gap.
+
+        All source paths (register_prefill_hashes, postprocess, offload wake)
+        are expected to hash blocks before this is called. A gap means a
+        source-level bug; callers skip the range rather than mint false hashes.
+        """
+        if start <= 0:
+            return -1
+        h = self.kv.block(seq.block_table[start - 1]).hash
+        if h != -1:
+            return h
+        logger.error(
+            "Unhashed parent block %d for seq %s — skipping hash "
+            "registration for blocks %d onward",
+            start - 1,
+            seq.id,
+            start,
+        )
+        return None
+
     def hash_blocks(
         self,
         seq: Sequence,
@@ -549,12 +587,17 @@ class BlockManager:
         base = seq.num_cached_tokens if start_tokens is None else start_tokens
         start = base // hbs
         end = (base + num_new_tokens) // hbs
+        # A finished or preempted seq has had its block table released; the
+        # deferred publish paths can still reach it with a stale token count.
+        end = min(end, len(seq.block_table))
         if start >= end:
+            return
+        h = self._chain_parent_hash(seq, start)
+        if h is None:
             return
         # Watermark for the decode-side continuation, maintained here so every
         # prefill path feeds it without knowing about it.
         seq.num_hashed_tokens = max(seq.num_hashed_tokens, end * hbs)
-        h = self.kv.block(seq.block_table[start - 1]).hash if start > 0 else -1
         record = self._event_log is not None
         store_run_parent: int | None = h if h != -1 else None
         store_run_hashes: list[int] = []
@@ -950,19 +993,9 @@ class BlockManager:
             )
             return 0
 
-        if start_block == 0:
-            parent_hash = -1
-        else:
-            parent = self.kv.block(seq.block_table[start_block - 1])
-            if parent.hash == -1:
-                logger.warning(
-                    "Cannot publish offload prefix without indexed parent: "
-                    "seq=%s start_block=%d",
-                    seq.id,
-                    start_block,
-                )
-                return 0
-            parent_hash = parent.hash
+        parent_hash = self._chain_parent_hash(seq, start_block)
+        if parent_hash is None:
+            return 0
 
         indexed_tokens = 0
         for i in range(start_block, end_block):
@@ -1016,6 +1049,36 @@ class BlockManager:
             parent_hash = block_hash
 
         return indexed_tokens
+
+    def register_received_prefix(self, seq: Sequence) -> int:
+        """Hash received prompt blocks into the prefix cache so subsequent
+        turns can match them locally and transfer only the delta.
+
+        Only whole blocks are registered; trailing partial block left unhashed
+        (matches ``hash_blocks``). Returns the number of blocks hashed.
+        """
+        if not self.enable_prefix_caching:
+            return 0
+        num_full = seq.num_prompt_tokens // self.block_size
+        num_full = min(num_full, len(seq.block_table))
+        h = -1
+        for i in range(num_full):
+            token_ids = seq.block(i)
+            h = self.compute_hash(token_ids, h)
+            block_id = seq.block_table[i]
+            block = self.kv.block(block_id)
+            indexed_block_id = self.kv.lookup(h)
+            if indexed_block_id == -1:
+                self.kv.publish(block_id, h, token_ids)
+            else:
+                indexed_block = self.kv.block(indexed_block_id)
+                if indexed_block.token_ids != token_ids:
+                    raise RuntimeError(
+                        "Hash collision while registering received prefix: "
+                        f"seq={seq.id} block={block_id} indexed={indexed_block_id}"
+                    )
+                block.update(h, token_ids)
+        return num_full
 
     def deallocate(self, seq: Sequence):
         for block_id in reversed(seq.block_table):

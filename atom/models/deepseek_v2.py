@@ -1406,6 +1406,7 @@ def _dcp_decode_candidate_exchange(
     max_model_len: int,
     runner_block_size: int,
     stable_topk: bool,
+    cp_kv_cache_interleave_size: int = 1,
 ) -> None:
     """DCP decode candidate exchange -> deterministic merge into global top-k.
 
@@ -1433,12 +1434,16 @@ def _dcp_decode_candidate_exchange(
         "qlen=1 decode only (MTP verify not yet supported)."
     )
     g_ctx = attn_metadata.context_lens
-    base = g_ctx // dcp_world_size
-    # round-robin (interleave=1) local length: base + 1 for the ranks that own
-    # the remainder tail, matching prepare_decode's slot split.
-    local_ctx = (base + (g_ctx - base * dcp_world_size - dcp_rank).clamp(0, 1)).to(
-        torch.int32
-    )
+    # Interleave-S local length (matches get_dcp_local_seq_lens / prepare_decode's
+    # slot split): each full S*W super-block gives every rank S tokens, and the
+    # tail remainder is handed out S at a time by rank. S=1 -> the round-robin
+    # base + (this rank owns the +1 tail?) split.
+    S = cp_kv_cache_interleave_size
+    W = dcp_world_size
+    full_chunks = g_ctx // (S * W)
+    base = full_chunks * S
+    remainder = (g_ctx - base * W - dcp_rank * S).clamp(0, S)
+    local_ctx = (base + remainder).to(torch.int32)
     l_max = (max_model_len + dcp_world_size - 1) // dcp_world_size
     local_logits = torch.empty([num_rows, l_max], dtype=torch.float32, device="cuda")
     deepgemm_fp8_paged_mqa_logits(
@@ -1476,7 +1481,13 @@ def _dcp_decode_candidate_exchange(
         2, num_rows, k_loc, dtype=torch.float32, device=local_logits.device
     )
     dcp_pack_topk_candidates(
-        local_logits, local_idx, local_ctx, dcp_rank, dcp_world_size, send
+        local_logits,
+        local_idx,
+        local_ctx,
+        dcp_rank,
+        dcp_world_size,
+        send,
+        cp_kv_cache_interleave_size,
     )
     # Exchange as int32 so the gid bit patterns cannot be touched by any float
     # canonicalization along the way; the score plane is bitcast back at the end
@@ -1565,6 +1576,7 @@ def sparse_attn_indexer(
         context.batch_size * attn_metadata.max_seqlen_q if not context.is_prefill else 0
     )
     runner_block_size = get_current_atom_config().kv_cache_block_size
+    cp_kv_cache_interleave_size = get_current_atom_config().dcp_config.interleave_size
     kv_cache = kv_cache.view(-1, runner_block_size, kv_cache.shape[-1])
     # PCP prefill: `k` (and `positions`) arrive as the full PADDED key set
     # [S_pad] produced by an all-gather of the round-robin shards. The KV-cache
@@ -1749,6 +1761,7 @@ def sparse_attn_indexer(
                 owned_counts=dcp_owned_counts_buffer,
                 NUM_TOPK_TOKENS=topk_tokens,
                 out=sparse_kv_indices_buffer,
+                cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
             )
         else:
             triton_convert_req_index_to_global_index_dsa_prefill(
@@ -1793,6 +1806,7 @@ def sparse_attn_indexer(
                 max_model_len,
                 runner_block_size,
                 stable_topk,
+                cp_kv_cache_interleave_size,
             )
         else:
             logits = torch.empty(
@@ -1836,11 +1850,11 @@ def sparse_attn_indexer(
             )
         elif dcp_world_size > 1:
             # topk_indices now hold GLOBAL positions. Keep only this rank's owned
-            # tokens (p % W == r), de-interleave (p // W), map to the local
-            # main-KV slot, and COMPACT them to the front -- non-owned positions
-            # are dropped, not marked with -1, because holes break aiter's lse
-            # output. The compacted per-request lengths are written into
-            # dcp_sparse_kv_indptr_buffer for this layer's attention to consume.
+            # tokens ((p//S)%W == r), de-interleave to the local index, map to the
+            # local main-KV slot, and COMPACT them to the front -- non-owned
+            # positions are dropped, not marked with -1, because holes break
+            # aiter's lse output. The compacted per-request lengths are written
+            # into dcp_sparse_kv_indptr_buffer for this layer's attention.
             triton_filter_and_convert_dcp_index(
                 attn_metadata.cu_seqlens_q,
                 attn_metadata.g_kv_indptr,
@@ -1853,6 +1867,7 @@ def sparse_attn_indexer(
                 owned_counts=dcp_owned_counts_buffer,
                 NUM_TOPK_TOKENS=topk_tokens,
                 out=sparse_kv_indices_buffer,
+                cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
             )
         else:
             triton_convert_req_index_to_global_index(

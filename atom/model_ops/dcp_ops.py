@@ -277,33 +277,94 @@ def reorg_kvcache(
     return reorganized_kv_c_normed, reorganized_k_pe
 
 
-def get_dcp_local_seq_lens(seq_lens, dcp_size, dcp_rank, interleave_size=1):
+def get_dcp_local_seq_lens(seq_lens, dcp_size, dcp_rank, cp_kv_cache_interleave_size=1):
     """Compute per-DCP-rank local sequence lengths.
 
     With interleaved storage, token i is stored on rank
-    (i // interleave_size) % dcp_size.
+    (i // cp_kv_cache_interleave_size) % dcp_size.
 
     Args:
         seq_lens: numpy array of sequence lengths
         dcp_size: DCP world size
         dcp_rank: this rank's DCP rank
-        interleave_size: interleaving granularity (default 1 = token-level)
+        cp_kv_cache_interleave_size: interleaving granularity (default 1 = token-level)
 
     Returns:
         local_seq_lens: numpy array of local sequence lengths
     """
-    full_chunks = seq_lens // (interleave_size * dcp_size)
-    base = full_chunks * interleave_size
+    full_chunks = seq_lens // (cp_kv_cache_interleave_size * dcp_size)
+    base = full_chunks * cp_kv_cache_interleave_size
 
     remainder_total = seq_lens - base * dcp_size
     remainder = np.clip(
-        remainder_total - dcp_rank * interleave_size, 0, interleave_size
+        remainder_total - dcp_rank * cp_kv_cache_interleave_size,
+        0,
+        cp_kv_cache_interleave_size,
     )
     return base + remainder
 
 
+def dcp_owner_rank(pos, dcp_size, cp_kv_cache_interleave_size=1):
+    """Which DCP rank owns global token ``pos`` under interleaved KV storage.
+
+    Interleaving groups tokens into chunks of ``cp_kv_cache_interleave_size`` (= S); chunk
+    ``c = pos // S`` is stored on rank ``c % dcp_size``. For S == 1 this reduces
+    to the round-robin ``pos % dcp_size``.
+
+    Works elementwise on Python ints, numpy arrays and torch tensors (only ``//``
+    and ``%`` are used). Consistent with vLLM's slot kernel
+    (``block_table.py`` ``is_local``) because ``block_size * W`` is a multiple of
+    ``S * W`` when ``block_size % S == 0``, so computing on the global position
+    equals computing on the virtual-block offset.
+    """
+    return (pos // cp_kv_cache_interleave_size) % dcp_size
+
+
+def dcp_local_index(pos, dcp_size, cp_kv_cache_interleave_size=1):
+    """Local KV-sequence index of global token ``pos`` on its owning rank.
+
+    Each ``S * W`` super-block contributes ``S`` tokens to a rank, so the local
+    index is ``(pos // (S*W)) * S + (pos % S)``. For S == 1 this reduces to the
+    round-robin ``pos // dcp_size``.
+
+    To map to a physical slot (given ``block_size % S == 0``):
+        block_table_index = pos // (block_size * dcp_size)   # == local_index // block_size
+        slot_offset       = local_index % block_size
+        slot              = block_table[block_table_index] * block_size + slot_offset
+
+    Elementwise over Python ints / numpy / torch.
+    """
+    sw = cp_kv_cache_interleave_size * dcp_size
+    return (pos // sw) * cp_kv_cache_interleave_size + (
+        pos % cp_kv_cache_interleave_size
+    )
+
+
+def dcp_global_pos(local_index, dcp_rank, dcp_size, cp_kv_cache_interleave_size=1):
+    """Inverse of ``dcp_local_index``: global token position of local KV index
+    ``local_index`` held on ``dcp_rank``.
+
+    Local index j on rank r sits in local S-group ``j // S`` at offset ``j % S``;
+    that group is global chunk ``(j//S)*W + r``, so the global position is
+    ``((j//S)*W + r) * S + (j % S)``. For S == 1 this reduces to the round-robin
+    ``j*W + r``. Used to reconstruct globally-unique ids for exchanged sparse
+    top-k candidates (the id must be a total order over global positions).
+
+    Elementwise over Python ints / numpy / torch.
+    """
+    return (
+        (local_index // cp_kv_cache_interleave_size) * dcp_size + dcp_rank
+    ) * cp_kv_cache_interleave_size + (local_index % cp_kv_cache_interleave_size)
+
+
 def dcp_pack_topk_candidates(
-    local_logits, local_idx, local_lens, dcp_rank, dcp_world_size, out_pair
+    local_logits,
+    local_idx,
+    local_lens,
+    dcp_rank,
+    dcp_world_size,
+    out_pair,
+    cp_kv_cache_interleave_size=1,
 ):
     """Turn a rank-local top-k into exchangeable (score, global_id) pairs.
 
@@ -312,9 +373,9 @@ def dcp_pack_topk_candidates(
     local top-k did not fill get (-inf, -1); the merge sinks them via -inf and
     never selects the -1 gids.
 
-    Under round-robin (interleave=1) sharding a local position j on rank r is
-    global position j*W + r, so the id is globally unique -- which is what makes
-    the tie-break a total order.
+    Under interleave-S sharding a local index j on rank r is global position
+    ``((j//S)*W + r)*S + j%S`` (S=1 -> the round-robin j*W + r), so the id is
+    globally unique -- which is what makes the tie-break a total order.
     """
     rows, _k = local_idx.shape
     # Bound-check rather than assume a padding convention from the aiter kernel.
@@ -324,7 +385,9 @@ def dcp_pack_topk_candidates(
     out_pair[0].copy_(torch.where(valid, sc, torch.full_like(sc, -float("inf"))))
     gid = torch.where(
         valid,
-        local_idx * dcp_world_size + dcp_rank,
+        dcp_global_pos(
+            local_idx, dcp_rank, dcp_world_size, cp_kv_cache_interleave_size
+        ),
         torch.full_like(local_idx, -1),
     )
     out_pair.view(torch.int32)[1].copy_(gid)
@@ -345,6 +408,7 @@ def _count_owned_dcp_kernel(
     out_counts,  # int32 [num_requests] -- owned top-k count per request
     DCP_RANK: tl.constexpr,
     DCP_WORLD: tl.constexpr,
+    INTERLEAVE: tl.constexpr,  # cp_kv_cache_interleave_size S (1 = round-robin)
     NUM_TOPK_TOKENS: tl.constexpr,
     BLOCK_N: tl.constexpr,
     ti_stride0,
@@ -355,7 +419,8 @@ def _count_owned_dcp_kernel(
     compacted output offsets used by ``_compact_filter_dcp_kernel``.
 
     qlen==1 only (DCP + sparse + MTP is rejected upstream), so each request has
-    exactly one query token.
+    exactly one query token. Owner of global position g is rank (g//S)%W
+    (S=INTERLEAVE; S=1 -> g%W).
     """
     batch_id = tl.program_id(0)
     token_id = tl.load(qo_indptr + batch_id)
@@ -366,7 +431,7 @@ def _count_owned_dcp_kernel(
         col_valid = indice_id < NUM_TOPK_TOKENS
         ti_ptr = token_indices_ptr + token_id * ti_stride0 + indice_id * ti_stride1
         tok = tl.load(ti_ptr, mask=col_valid, other=-1)
-        owned = col_valid & (tok >= 0) & ((tok % DCP_WORLD) == DCP_RANK)
+        owned = col_valid & (tok >= 0) & (((tok // INTERLEAVE) % DCP_WORLD) == DCP_RANK)
         count += tl.sum(owned.to(tl.int32))
 
     tl.store(out_counts + batch_id, count)
@@ -382,6 +447,7 @@ def _compact_filter_dcp_kernel(
     out_kv_indices,  # int32 [>= out_kv_indptr[-1]]
     DCP_RANK: tl.constexpr,
     DCP_WORLD: tl.constexpr,
+    INTERLEAVE: tl.constexpr,  # cp_kv_cache_interleave_size S (1 = round-robin)
     PAGE_SIZE: tl.constexpr,  # runner (physical) block size
     NUM_TOPK_TOKENS: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -390,11 +456,13 @@ def _compact_filter_dcp_kernel(
     bt_stride0: tl.int64,
     bt_stride1: tl.constexpr,
 ):
-    # DCP round-robin (interleave=1): a GLOBAL position g is owned by rank
-    # ``g % W``; on the owner rank its physical slot follows the round-robin
-    # (virtual-block) layout used by _dcp_round_robin_slot / ATOM PR #847:
+    # DCP interleave-S: a GLOBAL position g is owned by rank ``(g // S) % W``; on
+    # the owner rank its physical slot follows the virtual-block layout used by
+    # _dcp_round_robin_slot / ATOM PR #847 (S=1 -> the original round-robin):
     #     vbs  = PAGE_SIZE * W
-    #     slot = block_table[req, g // vbs] * PAGE_SIZE + (g % vbs) // W
+    #     vb   = g % vbs
+    #     slot = block_table[req, g // vbs] * PAGE_SIZE
+    #            + (vb // (W*S)) * S + (vb % S)
     # token_indices holds GLOBAL positions (the indexer scored the full sequence
     # via all-gathered logits). This rank keeps ONLY the positions it owns and
     # writes them COMPACTED to the front of its region -- no -1 holes. Holes are
@@ -428,10 +496,15 @@ def _compact_filter_dcp_kernel(
         ti_ptr = token_indices_ptr + token_id * ti_stride0 + indice_id * ti_stride1
         tok = tl.load(ti_ptr, mask=col_valid, other=-1)  # GLOBAL position
 
-        idx_valid = col_valid & (tok >= 0) & ((tok % DCP_WORLD) == DCP_RANK)
+        idx_valid = (
+            col_valid & (tok >= 0) & (((tok // INTERLEAVE) % DCP_WORLD) == DCP_RANK)
+        )
 
         block_id = tok // vbs
-        inblock_offset = (tok % vbs) // DCP_WORLD
+        vb = tok % vbs
+        inblock_offset = (vb // (DCP_WORLD * INTERLEAVE)) * INTERLEAVE + (
+            vb % INTERLEAVE
+        )
         physical_block = tl.load(
             block_table + batch_id * bt_stride0 + block_id * bt_stride1,
             mask=idx_valid,
@@ -459,8 +532,9 @@ def triton_filter_and_convert_dcp_index(
     NUM_TOPK_TOKENS: int = 2048,
     BLOCK_N: int = 128,
     out: torch.Tensor | None = None,
+    cp_kv_cache_interleave_size: int = 1,
 ):
-    """DCP (interleave=1) filter + round-robin localize of global top-k positions,
+    """DCP (interleave-S) filter + localize of global top-k positions,
     **compacting** each rank's owned slots to the front of its region.
 
     ``token_indices[token_id, indice_id]`` is a GLOBAL token position selected by
@@ -512,6 +586,7 @@ def triton_filter_and_convert_dcp_index(
         counts,
         dcp_rank,
         dcp_world_size,
+        cp_kv_cache_interleave_size,
         NUM_TOPK_TOKENS,
         BLOCK_N,
         ti_stride0,
@@ -538,6 +613,7 @@ def triton_filter_and_convert_dcp_index(
         out,
         dcp_rank,
         dcp_world_size,
+        cp_kv_cache_interleave_size,
         block_size,
         NUM_TOPK_TOKENS,
         BLOCK_N,
@@ -558,6 +634,7 @@ def _count_owned_dcp_prefill_kernel(
     out_counts,  # int32 [num_tokens]
     DCP_RANK: tl.constexpr,
     DCP_WORLD: tl.constexpr,
+    INTERLEAVE: tl.constexpr,  # cp_kv_cache_interleave_size S (1 = round-robin)
     NUM_TOPK_TOKENS: tl.constexpr,
     BLOCK_N: tl.constexpr,
     ti_stride0: tl.int64,
@@ -586,7 +663,9 @@ def _count_owned_dcp_prefill_kernel(
             other=-1,
         )
         pos = indice - base  # position within the sequence
-        owned = col_valid & (indice >= 0) & ((pos % DCP_WORLD) == DCP_RANK)
+        owned = (
+            col_valid & (indice >= 0) & (((pos // INTERLEAVE) % DCP_WORLD) == DCP_RANK)
+        )
         count += tl.sum(owned.to(tl.int32))
 
     tl.store(out_counts + token_id, count)
@@ -603,6 +682,7 @@ def _compact_filter_dcp_prefill_kernel(
     out_kv_indices,  # int32 [>= out_kv_indptr[-1]]
     DCP_RANK: tl.constexpr,
     DCP_WORLD: tl.constexpr,
+    INTERLEAVE: tl.constexpr,  # cp_kv_cache_interleave_size S (1 = round-robin)
     PAGE_SIZE: tl.constexpr,  # runner (physical) block size
     NUM_TOPK_TOKENS: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -612,11 +692,13 @@ def _compact_filter_dcp_prefill_kernel(
     bt_stride1: tl.constexpr,
 ):
     """Pass 2 for sparse PREFILL: keep only this rank's owned candidates, map
-    them through the round-robin (virtual-block) layout, and pack them to the
-    front of the token's region.
+    them through the interleave-S (virtual-block) layout, and pack them to the
+    front of the token's region (S=1 -> the original round-robin):
 
         vbs  = PAGE_SIZE * W
-        slot = block_table[req, pos // vbs] * PAGE_SIZE + (pos % vbs) // W
+        vb   = pos % vbs
+        slot = block_table[req, pos // vbs] * PAGE_SIZE
+               + (vb // (W*S)) * S + (vb % S)
 
     Same rationale as the decode twin: no `-1` holes (they break aiter's lse
     path) and compaction is order-preserving so the fp accumulation order is
@@ -642,10 +724,15 @@ def _compact_filter_dcp_prefill_kernel(
             other=-1,
         )
         pos = indice - base
-        idx_valid = col_valid & (indice >= 0) & ((pos % DCP_WORLD) == DCP_RANK)
+        idx_valid = (
+            col_valid & (indice >= 0) & (((pos // INTERLEAVE) % DCP_WORLD) == DCP_RANK)
+        )
 
         block_id = pos // vbs
-        inblock_offset = (pos % vbs) // DCP_WORLD
+        vb = pos % vbs
+        inblock_offset = (vb // (DCP_WORLD * INTERLEAVE)) * INTERLEAVE + (
+            vb % INTERLEAVE
+        )
         physical_block = tl.load(
             block_table + req_id * bt_stride0 + block_id * bt_stride1,
             mask=idx_valid,
@@ -679,6 +766,7 @@ def triton_filter_and_convert_dcp_index_prefill(
     NUM_TOPK_TOKENS: int = 2048,
     BLOCK_N: int = 128,
     out: torch.Tensor | None = None,
+    cp_kv_cache_interleave_size: int = 1,
 ):
     """Sparse-PREFILL twin of ``triton_filter_and_convert_dcp_index``.
 
@@ -719,6 +807,7 @@ def triton_filter_and_convert_dcp_index_prefill(
         counts,
         dcp_rank,
         dcp_world_size,
+        cp_kv_cache_interleave_size,
         NUM_TOPK_TOKENS,
         BLOCK_N,
         ti_stride0,
@@ -742,6 +831,7 @@ def triton_filter_and_convert_dcp_index_prefill(
         out,
         dcp_rank,
         dcp_world_size,
+        cp_kv_cache_interleave_size,
         block_size,
         NUM_TOPK_TOKENS,
         BLOCK_N,

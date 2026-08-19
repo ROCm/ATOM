@@ -10,6 +10,7 @@ from atom import LLMEngine
 from atom.config import (
     CompilationConfig,
     CUDAGraphMode,
+    DCPConfig,
     DSparkConfig,
     EPLBConfig,
     SpeculativeConfig,
@@ -85,6 +86,7 @@ class EngineArgs:
 
     eplb_enable: bool = False
     eplb_config: dict | None = None
+    dcp_config: dict | None = None
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -466,6 +468,22 @@ class EngineArgs:
                 """"ragged_graph_sizes": "8"}'"""
             ),
         )
+        dcp_group = parser.add_argument_group("DCP options")
+        dcp_group.add_argument(
+            "--dcp-config",
+            type=json.loads,
+            default=None,
+            help=(
+                "DCP (Decode Context Parallel) config as a JSON dict, parsed "
+                "straight into a DCPConfig object (no per-field flags). "
+                "Supported keys:\n"
+                '  - "interleave_size": int, KV-cache interleave granularity S: '
+                "token i is stored on DCP rank (i // S) %% W. Default 1 = "
+                "token-level round-robin.\n"
+                "Example:\n"
+                """  '{"interleave_size": 16}'"""
+            ),
+        )
         eplb_group = parser.add_argument_group("EPLB options")
         eplb_group.add_argument(
             "--eplb-enable",
@@ -575,6 +593,9 @@ class EngineArgs:
         # --eplb-config (JSON dict) → EPLBConfig object (--eplb-enable
         # is the master switch, --eplb-config only tunes it).
         kwargs["eplb_config"] = EPLBConfig.from_dict(kwargs.pop("eplb_config"))
+        # --dcp-config (JSON dict) → DCPConfig object, passed through as
+        # Config.dcp_config.
+        kwargs["dcp_config"] = DCPConfig.from_dict(kwargs.pop("dcp_config"))
 
         logger.info(f"Engine kwargs: {kwargs}")
 

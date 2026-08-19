@@ -61,6 +61,11 @@ class LLMEngine:
         # `_gather_ids_for_dp` all-gathers using dp_metadata sizes computed on
         # the FULL (un-split) token count, so all_gatherv asserts
         # `1/pcp_size != full`.
+        if config.enable_dp_attention and config.pipeline_parallel_size > 1:
+            raise ValueError(
+                "--enable-dp-attention and pipeline-parallel (pp>1) "
+                "cannot be used together."
+            )
         if config.prefill_context_parallel_size > 1 and config.enable_dp_attention:
             raise ValueError(
                 "prefill_context_parallel_size > 1 (-pcp) combined with "

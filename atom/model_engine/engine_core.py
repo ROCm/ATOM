@@ -13,6 +13,7 @@ import zmq
 
 from atom.config import Config, ParallelConfig
 from atom.kv_transfer.disaggregation import KVOutputAggregator
+from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
 from atom.model_engine.async_proc import AsyncIOProcManager
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import EngineUtilityHandler
@@ -35,6 +36,16 @@ logger = logging.getLogger("atom")
 # server's scrape interval: the exporter reads a cache, so this bounds how
 # stale a Prometheus sample can be.
 METRICS_PUSH_INTERVAL_S = 5.0
+
+# Pace of the idle KV drain. The busy loops never block, so an unpaced drain
+# would fire one worker RPC round per spin; 1ms matches the PP head's existing
+# idle token-poll timeout and is far below any transfer latency.
+KV_IDLE_DRAIN_INTERVAL_S = 0.001
+
+# Upper bound on the drain that runs after the loop exits. A peer that died
+# mid-transfer leaves a completion that never arrives; exiting late beats
+# never exiting.
+KV_SHUTDOWN_DRAIN_TIMEOUT_S = 2.0
 
 
 class EngineCore:
@@ -143,6 +154,7 @@ class EngineCore:
             )
 
         self.kv_transfer_enabled = bool(config.kv_transfer_config)
+        self._next_idle_kv_drain = 0.0
         if self.kv_transfer_enabled:
             self.kv_aggregator = KVOutputAggregator(
                 world_size=config.tensor_parallel_size
@@ -261,10 +273,13 @@ class EngineCore:
                     continue
                 if not self.scheduler.is_finished():
                     self._process_engine_step()
+                elif self.has_pending_kv_work():
+                    self._advance_idle_kv_transfer()
         finally:
             # Teardown runs even on exceptions so the sender thread/socket
             # don't leak. Isolate the final publish so a publisher hiccup
             # cannot skip shutdown_kv_events().
+            self._drain_kv_work_at_exit()
             try:
                 self.scheduler.publish_kv_events()
             except Exception:
@@ -350,11 +365,62 @@ class EngineCore:
 
         return True
 
+    def has_pending_kv_work(self) -> bool:
+        """True while KV transfer work outlives the scheduler queues.
+
+        ``postprocess`` parks a finished request in ``deferred_free_blocks``
+        and drops it from ``running`` in the same pass, so
+        ``Scheduler.is_finished()`` reads "idle" while that request's RDMA
+        send or offload save is still in flight. Every busy loop ORs this
+        predicate in next to ``is_finished()``; without it the last request's
+        completion signals are never polled, its deferred blocks are never
+        freed, and its save is never reported.
+
+        Every liveness condition lives here. The loops call this and nothing
+        else, so a new kind of pending work only has to be added once.
+        """
+        if not self.kv_transfer_enabled:
+            return False
+        if getattr(self.scheduler, "deferred_free_blocks", None):
+            return True
+        connector = getattr(self.scheduler, "kv_connector", None)
+        if connector is None or not hasattr(connector, "has_pending_work"):
+            return False
+        return bool(connector.has_pending_work())
+
     def _advance_idle_kv_transfer(self) -> None:
         # No forward batch will run this tick, but offload load/save work may
         # still need to be dispatched or reported back to the scheduler.
+        now = time.monotonic()
+        if now < self._next_idle_kv_drain:
+            return
+        self._next_idle_kv_drain = now + KV_IDLE_DRAIN_INTERVAL_S
         self._dispatch_idle_offload_work()
         self._poll_kv_transfer_progress()
+
+    def _drain_kv_work_at_exit(self) -> None:
+        """Give in-flight KV transfers a bounded window to report back.
+
+        The loop exits as soon as its queues are empty, so a save dispatched
+        by the final batch would otherwise be abandoned with its completion
+        unrecorded and its blocks still deferred.
+        """
+        if not self.kv_transfer_enabled:
+            return
+        deadline = time.monotonic() + KV_SHUTDOWN_DRAIN_TIMEOUT_S
+        try:
+            while self.has_pending_kv_work():
+                if time.monotonic() >= deadline:
+                    logger.warning(
+                        "%s: KV transfer still pending after %.1fs, exiting anyway",
+                        self.label,
+                        KV_SHUTDOWN_DRAIN_TIMEOUT_S,
+                    )
+                    break
+                self._advance_idle_kv_transfer()
+                time.sleep(KV_IDLE_DRAIN_INTERVAL_S)
+        except Exception:
+            logger.exception("KV transfer drain during shutdown failed")
 
     def _poll_kv_transfer_progress(self) -> None:
         if not self.kv_transfer_enabled:
@@ -369,7 +435,7 @@ class EngineCore:
         if connector is None or not getattr(connector, "is_offload", False):
             return
         meta = connector.build_connector_meta()
-        if meta is None or not getattr(meta, "requests", None):
+        if not connector_metadata_has_work(meta):
             return
         self.runner_mgr.call_func("process_kvconnector_output", meta)
 
@@ -589,6 +655,11 @@ class DPEngineCoreProc(EngineCore):
 
                 if not global_has_unfinished and not self.engines_running:
                     self.engines_running = False
+                    if self.has_pending_kv_work():
+                        # Local RPCs only. Anything that reaches schedule()
+                        # would run the delayer's cross-DP all_reduce off
+                        # lockstep, so the idle drain must stay off that path.
+                        self._advance_idle_kv_transfer()
                     continue
 
                 executed = self._process_engine_step()
@@ -599,6 +670,7 @@ class DPEngineCoreProc(EngineCore):
         finally:
             # Isolate the final publish so a publisher hiccup cannot skip
             # shutdown_kv_events() (which closes the sender thread/socket).
+            self._drain_kv_work_at_exit()
             try:
                 self.scheduler.publish_kv_events()
             except Exception:

@@ -2267,6 +2267,9 @@ def _gather_kv_indices_sparse_kernel(
     kv_indptr,
     out_kv_indices,
     NUM_TOPK_TOKENS: tl.constexpr,
+    OUT_NUMEL: tl.constexpr,
+    NUM_REQ: tl.constexpr,
+    KV_INDICES_NUMEL: tl.constexpr,
     BLOCK_N: tl.constexpr,
     ti_stride0: tl.int64,
     ti_stride1: tl.constexpr,
@@ -2276,6 +2279,7 @@ def _gather_kv_indices_sparse_kernel(
     col_id = tile_id * BLOCK_N + tl.arange(0, BLOCK_N)
 
     req_id = tl.load(token_to_seq_idxs + token_id)
+    valid_req = (req_id >= 0) & (req_id < NUM_REQ)
 
     out_start = tl.load(sparse_kv_indptr + token_id)
     out_end = tl.load(sparse_kv_indptr + token_id + 1)
@@ -2283,21 +2287,36 @@ def _gather_kv_indices_sparse_kernel(
 
     pos = tl.load(topk_indices + token_id * ti_stride0 + col_id * ti_stride1)
 
-    kv_base = tl.load(kv_indptr + req_id)
-    kv_end = tl.load(kv_indptr + req_id + 1)
+    kv_base = tl.load(kv_indptr + req_id, mask=valid_req, other=0)
+    kv_end = tl.load(kv_indptr + req_id + 1, mask=valid_req, other=0)
     req_kv_len = kv_end - kv_base
 
-    store_mask = (col_id < kv_len) & (col_id < NUM_TOPK_TOKENS)
-    valid_mask = store_mask & (pos >= 0) & (pos < req_kv_len)
+    out_offset = out_start + col_id
+    store_mask = (
+        valid_req
+        & (col_id < kv_len)
+        & (col_id < NUM_TOPK_TOKENS)
+        & (out_offset >= 0)
+        & (out_offset < OUT_NUMEL)
+    )
+    kv_offset = kv_base + pos
+    valid_mask = (
+        store_mask
+        & (pos >= 0)
+        & (pos < req_kv_len)
+        & (kv_offset >= 0)
+        & (kv_offset < KV_INDICES_NUMEL)
+    )
 
     out_val = tl.load(
-        kv_indices + kv_base + pos,
+        kv_indices + kv_offset,
         mask=valid_mask,
         other=0,
     )
+    out_val = tl.where(out_val >= 0, out_val, 0)
 
     tl.store(
-        out_kv_indices + out_start + col_id,
+        out_kv_indices + out_offset,
         out_val,
         mask=store_mask,
     )
@@ -2329,12 +2348,15 @@ def triton_gather_kv_indices_sparse(
     token_to_seq_idxs = token_to_seq_idxs[:num_tokens]
     topk_indices = topk_indices[:num_tokens]
     tiles_per_row = NUM_TOPK_TOKENS // BLOCK_N
+    num_req = kv_indptr.shape[0] - 1
 
     total_out = num_tokens * NUM_TOPK_TOKENS
-    if out is not None:
-        out_buf = out[:total_out]
-    else:
-        out_buf = torch.empty(total_out, dtype=torch.int32, device=topk_indices.device)
+    out_buf = _sparse_index_workspace(
+        out,
+        total_out,
+        device=topk_indices.device,
+        name="triton_gather_kv_indices_sparse",
+    )
 
     ti_stride0, ti_stride1 = topk_indices.stride()
     grid = (num_tokens, tiles_per_row)
@@ -2347,6 +2369,9 @@ def triton_gather_kv_indices_sparse(
         kv_indptr,
         out_buf,
         NUM_TOPK_TOKENS,
+        out_buf.numel(),
+        num_req,
+        kv_indices.numel(),
         BLOCK_N,
         ti_stride0,
         ti_stride1,

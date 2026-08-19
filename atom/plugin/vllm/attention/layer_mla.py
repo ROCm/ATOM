@@ -300,6 +300,20 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
     def get_attn_backend(self):
         return self.attn_backend
 
+    def write_context_kv_latent(self, kv_cache: torch.Tensor, *args, **kwargs) -> None:
+        """Store context rows, reinterpreting vLLM's fp8 cache as fp8.
+
+        vLLM allocates the fp8 cache as uint8 where native ATOM allocates fp8,
+        and the Triton store reads its element type off the pointer: handed raw
+        bytes it converts each value to an integer instead of writing the fp8 bit
+        pattern, and only draft acceptance shows it.
+        """
+        if self.kv_cache_dtype.startswith("fp8") and kv_cache.dtype == torch.uint8:
+            from vllm.platforms import current_platform
+
+            kv_cache = kv_cache.view(current_platform.fp8_dtype())
+        return MLAAttention.write_context_kv_latent(self, kv_cache, *args, **kwargs)
+
     def process_weights_after_loading(
         self, act_dtype: torch.dtype = torch.bfloat16
     ) -> None:

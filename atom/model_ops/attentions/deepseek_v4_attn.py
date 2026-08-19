@@ -115,6 +115,15 @@ from atom.utils.forward_context import (
 
 logger = logging.getLogger("atom")
 
+
+def _uses_pd_staging(kv_transfer_config: dict | None) -> bool:
+    """Whether this transfer topology needs compressor-only P/D staging."""
+
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    return KVConnectorFactory.topology_uses_pd_staging(kv_transfer_config)
+
+
 # State field carrying the windows of layers whose KV dtype is not the pool's.
 # One field for all of them: they share a dtype (see `_discover_field_windows`)
 # and a ring length, so they differ only in the field's layer dimension.
@@ -1529,7 +1538,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
 
         # ---- RDMA staging pool, only allocated in PD disaggregation mode --
-        is_pd = bool(getattr(self.model_runner.config, "kv_transfer_config", None))
+        is_pd = _uses_pd_staging(
+            getattr(self.model_runner.config, "kv_transfer_config", None)
+        )
         state_slot_stride = arena.entry_bytes // self._state_dtype.itemsize
         if is_pd:
             pool_size = int(os.environ.get("ATOM_PD_STAGING_POOL", "32"))
@@ -1763,6 +1774,15 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         return super().build_kv_cache_tensor(layer_id, module)
 
     def get_kv_transfer_tensors(self):
+        """Describe V4's compressed PAGE and full per-request SLOT storage.
+
+        ``block_regions`` are forward-indexed compressed PAGE units: one unit
+        from each shared KV plane plus each CSA indexer region.
+        ``swa_block_regions`` is a legacy field name; each reverse-indexed unit
+        is one complete request SLOT, including compressor state and SWA rows.
+        ``staging_region`` and ``gather_slot`` describe only compressor-state
+        PD staging and must never be used as the source of a SLOT sidecar.
+        """
         from atom.kv_transfer.disaggregation.types import (
             KVTransferRegion,
             KVTransferTensors,
@@ -1773,24 +1793,23 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             return None
 
         # `get_kv_transfer_tensors` is called unconditionally on every
-        # `allocate_kv_cache` (not just under disagg); returning None means
-        # "no transfer region." Only fail when disaggregated serving is
-        # actually enabled — the FP4 indexer's separate uint8 e8m0 scale pool
-        # is not yet described by the region map below, so a real transfer
-        # would move a half-described cache.
-        is_pd = bool(getattr(runner.config, "kv_transfer_config", None))
-        if self._indexer_fp4 and is_pd:
+        # `allocate_kv_cache`; returning None means "no transfer region." Only
+        # fail when transfer or offload is active. The FP4 indexer's separate
+        # uint8 e8m0 scale pool is not yet described by the region map below,
+        # so registering it would expose a half-described cache.
+        transfer_active = bool(getattr(runner.config, "kv_transfer_config", None))
+        if self._indexer_fp4 and transfer_active:
             raise NotImplementedError(
-                "KV transfer (disaggregated serving) is not supported with "
-                "--index_cache_dtype fp4 yet (FP4 indexer scale pool unmapped)."
+                "DeepSeek-V4 KV transfer/offload with --index_cache_dtype fp4 "
+                "is unsupported because the unmapped FP4 indexer scale pool "
+                "would be omitted; use the FP8 indexer or disable transfer/offload."
             )
-        if is_pd and getattr(runner.config, "pipeline_parallel_size", 1) > 1:
+        if transfer_active and getattr(runner.config, "pipeline_parallel_size", 1) > 1:
             raise NotImplementedError(
-                "DeepSeek-V4 KV transfer registers one region per plane, "
-                "covering every layer at once, so there is no per-layer region "
-                "list for `_consumer_region_map` to shift by `start_layer`. "
-                "Pipeline parallelism with disaggregated serving needs the "
-                "region map keyed by something other than the layer index."
+                "DeepSeek-V4 KV transfer/PD and sidecar offload with pipeline "
+                "parallelism (pipeline_parallel_size > 1) is unsupported "
+                "because each PAGE/SLOT plane region covers every layer; use "
+                "PP=1 or disable DeepSeek-V4 transfer/offload."
             )
         if self._indexer_fp4:
             # Single-node FP4 indexer: the FP8 region map below references the
@@ -1806,37 +1825,59 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         swa_block_regions: list[KVTransferRegion] = []
         slot_regions: list[KVTransferRegion] = []
 
-        # One region per plane, not per layer. A block's compressed rows are one
-        # envelope — every layer of it, contiguous — so the transfer unit the
-        # connector already zips over (`base + id * unit_bytes`, `unit_bytes`
-        # long) describes it exactly, and a layer no longer needs a region of
-        # its own. Under the layer-major predecessor a layer's rows for a block
-        # were the contiguous thing and the envelope was the strided one.
+        # Compressed PAGE: one region per plane, not per layer. A block's rows
+        # are one envelope — every layer of it, contiguous — so the transfer
+        # unit the connector already zips over (`base + id * unit_bytes`,
+        # `unit_bytes` long) describes it exactly. Under the layer-major
+        # predecessor a layer's rows for a block were the contiguous thing and
+        # the envelope was the strided one.
         #
         # A stage that holds a subset of the layers still holds whole envelopes
         # of that subset, so its plane is its own; `_consumer_region_map`'s
         # per-layer alignment has nothing left to align, which is why PP is
         # rejected below.
-        planes = list(zip(self._kv_planes(), self._plane_row_widths(), strict=True))
-        for plane, row_bytes in planes:
+        plane_roles = [
+            role
+            for role, row_bytes in (
+                ("dsv4.main_kv.nope", self.nope_row_bytes()),
+                ("dsv4.main_kv.rope", self.rope_row_bytes()),
+            )
+            if row_bytes
+        ]
+        planes = list(
+            zip(
+                self._kv_planes(),
+                self._plane_row_widths(),
+                plane_roles,
+                strict=True,
+            )
+        )
+        for plane, row_bytes, role in planes:
             block_regions.append(
                 KVTransferRegion(
                     plane.data_ptr(),
                     runner.num_physical_kvcache_blocks * geo.block_bytes(row_bytes),
                     geo.block_bytes(row_bytes),
+                    semantic_role=role,
                 )
             )
 
-        # Block regions: CSA Indexer KV (FP8)
-        for pos in range(len(self.csa_layers)):
+        # Compressed PAGE regions: CSA Indexer KV (FP8).
+        for pos, layer_id in enumerate(self.csa_layers):
             t = runner.v4_csa_idx_kv[pos]
             bpb = self.csa_rows_per_block * self._index_row_bytes
             block_regions.append(
-                KVTransferRegion(t.data_ptr(), t.numel() * t.element_size(), bpb)
+                KVTransferRegion(
+                    t.data_ptr(),
+                    t.numel() * t.element_size(),
+                    bpb,
+                    semantic_role=f"dsv4.csa_indexer.layer_{layer_id}",
+                )
             )
 
-        # A request's state is one slot per plane — again every layer at once —
-        # and the id the connector zips over is its pool group.
+        # Full per-request SLOT (legacy field name: `swa_block_regions`) is one
+        # slot per plane — compressor state and SWA, every layer at once — and
+        # the id the connector zips over is its pool group.
         #
         # A slot has no window-freeing and no sentinel rows: every row of a live
         # one travels. `reverse_indexed` is what the geometry's numbering costs
@@ -1849,7 +1890,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         slot_start, _ = (
             geo.slot_span(geo.physical_slot(num_slots - 1)) if num_slots else (0, 0)
         )
-        for plane, row_bytes in planes:
+        for plane, row_bytes, role in planes:
             unit = geo.slot_bytes(row_bytes)
             swa_block_regions.append(
                 KVTransferRegion(
@@ -1857,11 +1898,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                     num_slots * unit,
                     unit,
                     reverse_indexed=True,
+                    semantic_role=role,
                 )
             )
 
-        # Staging pool for compressor states (not in slot_regions — managed
-        # separately by the connector with pool acquire/release).
+        # Compressor-only PD staging. It omits SWA rows, is managed separately
+        # with pool acquire/release, and is invalid as a sidecar SLOT source.
         staging_region = None
         gather_slot = None
         scatter_slot = None
@@ -1873,6 +1915,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 pool.data_ptr(),
                 pool.numel() * elem_fp32,
                 stride * elem_fp32,
+                semantic_role="dsv4.pd_staging.compressor_state",
             )
             gather_slot = self._make_gather_slot(
                 pool, stride, runner.v4_state_arena, self.pool_geometry
@@ -1887,6 +1930,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             slot_regions=slot_regions,
             num_blocks=runner.num_physical_kvcache_blocks,
             num_slots=num_slots,
+            expected_full_slot_region_count=len(planes),
             staging_region=staging_region,
             staging_pool_size=pool_size if staging_region else 0,
             gather_slot=gather_slot,
@@ -2265,7 +2309,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         assert self._mtp_layers_are_swa_only, (
             "prepare_mtp_decode fast path only supports MTP layers the pool "
             "serves from the dense class; got compress_ratios[mtp]="
-            f"{self.compress_ratios[self._n_main_layers:]} and field-window "
+            f"{self.compress_ratios[self._n_main_layers :]} and field-window "
             f"layers {self._field_window_layers}"
         )
 
