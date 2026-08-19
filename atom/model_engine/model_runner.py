@@ -211,6 +211,15 @@ class tokenIDProcessor:
         self.input_ids = CpuGpuBuffer(
             max_num_batched_tokens + 1, dtype=torch.int32, device=device
         )
+        # Index staging for the mixed prefill+decode deferred path, which reads
+        # last step's sampled ids with a `torch.gather` over `prev_token_ids`
+        # and needs somewhere to upload the row indices. The pure-decode path
+        # moved to the fused `fill_deferred_decode_ids` kernel (`decode_cu` /
+        # `decode_src` below) and dropped this buffer; the mixed path still
+        # gathers, so it keeps its own.
+        self.deferred_prev_idx = CpuGpuBuffer(
+            max_num_batched_tokens, dtype=torch.int64, device=device
+        )
         # One per request, not per token: `decode_cu` is the exclusive prefix
         # sum of this step's per-request token counts and `decode_src` says
         # where each request's anchor comes from. Sized by tokens because that
@@ -545,8 +554,8 @@ class tokenIDProcessor:
             self.input_ids.copy_to_gpu(total_tokens)
 
             if deferred_dst:
-                self.input_ids_loc.np[: len(deferred_prev)] = deferred_prev
-                prev_idx_gpu = self.input_ids_loc.copy_to_gpu(len(deferred_prev))
+                self.deferred_prev_idx.np[: len(deferred_prev)] = deferred_prev
+                prev_idx_gpu = self.deferred_prev_idx.copy_to_gpu(len(deferred_prev))
                 gathered = torch.gather(self.prev_token_ids, 0, prev_idx_gpu)
                 dst_gpu = torch.as_tensor(
                     deferred_dst, dtype=torch.long, device=self.input_ids.gpu.device
