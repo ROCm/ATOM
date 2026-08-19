@@ -145,6 +145,7 @@ class CacheStats:
         "_interval_cached_tokens",
         "_interval_compressed_tokens",
         "_interval_full_tokens",
+        "_interval_offload_tokens",
         "_interval_requests",
         "_interval_reusable_tokens",
         "_interval_wanted_tokens",
@@ -157,6 +158,7 @@ class CacheStats:
         "total_cached_tokens",
         "total_compressed_tokens",
         "total_full_tokens",
+        "total_offload_tokens",
         "total_requests",
         "total_reusable_tokens",
         "total_wanted_tokens",
@@ -175,6 +177,12 @@ class CacheStats:
         self.total_requests: int = 0
         self.total_cached_tokens: int = 0
         self.total_full_tokens: int = 0
+        # Reuse served by the CPU offload tier, kept out of every series
+        # above. `cached`/`wanted`/`compressed` describe the HBM prefix
+        # walk, and an LMCache load reaches past it by design, so folding
+        # the two together would break the nesting invariant and credit
+        # the paged pool for bytes that came over PCIe.
+        self.total_offload_tokens: int = 0
         # The reuse ceiling, and the only honest denominator for a hit rate.
         #
         # `full` is not reachable: `BlockManager.can_allocate` matches over
@@ -205,6 +213,7 @@ class CacheStats:
         self._interval_requests: int = 0
         self._interval_cached_tokens: int = 0
         self._interval_full_tokens: int = 0
+        self._interval_offload_tokens: int = 0
         self._interval_compressed_tokens: int = 0
         self._interval_wanted_tokens: int = 0
         self._interval_reusable_tokens: int = 0
@@ -255,6 +264,7 @@ class CacheStats:
         num_compressed_tokens: int,
         num_wanted_tokens: int,
         num_reusable_tokens: int,
+        num_offload_tokens: int = 0,
     ) -> None:
         """Record cache stats for one prefill sequence.
 
@@ -269,14 +279,26 @@ class CacheStats:
         here would mean duplicating that rule in a second place and letting the
         two drift.
         """
-        assert num_cached_tokens <= num_wanted_tokens <= num_compressed_tokens, (
-            "CacheStats nesting violated: "
-            f"{num_cached_tokens=} {num_wanted_tokens=} {num_compressed_tokens=}"
-        )
-        assert num_compressed_tokens <= num_reusable_tokens <= num_full_tokens, (
-            "CacheStats ceiling violated: "
-            f"{num_compressed_tokens=} {num_reusable_tokens=} {num_full_tokens=}"
-        )
+        # Logged, not asserted. These are accounting invariants for an
+        # instrumentation class; a violation is a reporting bug, and taking the
+        # engine down for one is out of all proportion to the harm. An
+        # AssertionError here escaped `busy_loop`, killed EngineCore, and left
+        # the process wedged in `multiprocessing`'s atexit join with every TP
+        # worker alive -- an hour of benchmark lost to a counter.
+        if not num_cached_tokens <= num_wanted_tokens <= num_compressed_tokens:
+            logger.error(
+                "CacheStats nesting violated: "
+                f"{num_cached_tokens=} {num_wanted_tokens=} {num_compressed_tokens=}"
+            )
+            num_cached_tokens = min(num_cached_tokens, num_wanted_tokens)
+            num_wanted_tokens = min(num_wanted_tokens, num_compressed_tokens)
+        if not num_compressed_tokens <= num_reusable_tokens <= num_full_tokens:
+            logger.error(
+                "CacheStats ceiling violated: "
+                f"{num_compressed_tokens=} {num_reusable_tokens=} {num_full_tokens=}"
+            )
+            num_compressed_tokens = min(num_compressed_tokens, num_reusable_tokens)
+            num_reusable_tokens = min(num_reusable_tokens, num_full_tokens)
         self.total_requests += 1
         self.total_cached_tokens += num_cached_tokens
         self.total_full_tokens += num_full_tokens
@@ -289,6 +311,8 @@ class CacheStats:
         self._interval_reusable_tokens += num_reusable_tokens
         self._interval_compressed_tokens += num_compressed_tokens
         self._interval_wanted_tokens += num_wanted_tokens
+        self.total_offload_tokens += num_offload_tokens
+        self._interval_offload_tokens += num_offload_tokens
 
         # Which pool cost this request reuse. Counted here rather than derived
         # at log time because the per-request shape is gone by then: the
@@ -386,6 +410,9 @@ class CacheStats:
             # not a hit-rate denominator -- see `total_reusable_tokens`.
             "reusable_tokens": self.total_reusable_tokens,
             "full_tokens": self.total_full_tokens,
+            # Reuse from the CPU tier. Separate on purpose: it shares no
+            # denominator with the HBM series above.
+            "offload_tokens": self.total_offload_tokens,
             # Request counts, summable across DP ranks for the same reason the
             # token counts are. Not mutually exclusive -- see `__init__`.
             "reqs_full_reuse": self.reqs_full_reuse,
@@ -398,6 +425,7 @@ class CacheStats:
         self._interval_requests = 0
         self._interval_cached_tokens = 0
         self._interval_full_tokens = 0
+        self._interval_offload_tokens = 0
         self._interval_reusable_tokens = 0
         self._interval_compressed_tokens = 0
         self._interval_wanted_tokens = 0
@@ -436,6 +464,12 @@ class CacheStats:
             self.total_reusable_tokens,
             self.total_full_tokens,
         )
+        if self.total_offload_tokens:
+            logger.info(
+                "[Cache Stats offload] CPU-tier tokens: "
+                f"interval={self._interval_offload_tokens} "
+                f"total={self.total_offload_tokens}"
+            )
         self._log_pools()
         self._log_frequency()
         if self._pool_pressure is not None:
@@ -2294,12 +2328,24 @@ class Scheduler:
             # ceiling is genuinely zero — nothing about it is reusable.
             n_hash_blocks = (seq.num_tokens + hbs - 1) // hbs
             num_reusable_tokens = min(max(n_hash_blocks - 1, 0) * hbs, seq.num_tokens)
+            # `num_cached_tokens` sits above the HBM walk once an offload load
+            # landed: `_mark_offload_load_ready` promotes it to the LMCache
+            # prefix, which `_joint_kv_boundary` picks above what
+            # `can_allocate` could reach -- that is the feature, not a bug.
+            # Those tokens are not paged-pool reuse, so they go in their own
+            # series rather than inflating `cached`. `seq.num_cached_tokens` is
+            # deliberately NOT modified: the forward must still skip the
+            # prefix the load delivered.
+            wanted_tokens = seq.num_wanted_hit_blocks * hbs
+            hbm_cached_tokens = min(seq.num_cached_tokens, wanted_tokens)
+            offload_tokens = seq.num_cached_tokens - hbm_cached_tokens
             self.cache_stats.update(
-                seq.num_cached_tokens,
+                hbm_cached_tokens,
                 seq.num_tokens,
                 seq.num_compressed_hit_blocks * hbs,
-                seq.num_wanted_hit_blocks * hbs,
+                wanted_tokens,
                 num_reusable_tokens,
+                num_offload_tokens=offload_tokens,
             )
         num_batched_tokens += chunk
         seq.status = SequenceStatus.RUNNING
