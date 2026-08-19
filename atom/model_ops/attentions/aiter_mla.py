@@ -3,7 +3,6 @@
 
 import inspect
 import logging
-import os
 from dataclasses import dataclass
 
 import numpy as np
@@ -15,6 +14,12 @@ from aiter import (
     get_mla_metadata_info_v1,
     get_mla_metadata_v1,
 )
+
+try:
+    from aiter import get_mla_decode_fwd_max_splits, get_mla_decode_fwd_occupancy
+except ImportError:  # aiter without the host-side cluster-count helpers
+    get_mla_decode_fwd_max_splits = None
+    get_mla_decode_fwd_occupancy = None
 
 from atom.distributed.dcp_utils import (
     dcp_persistent_supported,
@@ -42,9 +47,9 @@ from .sub_pool_spec import SubPoolSpec, page_pool
 
 logger = logging.getLogger("atom")
 
-# `max_split_per_batch` is only needed (and only exists in newer aiter builds)
-# for the segmented page_size>1 MLA path. Detect support once so the default
-# page_size=1 path never passes an unsupported kwarg.
+# `max_split_per_batch` only exists in newer aiter builds. Detect support once:
+# older builds can neither be told the cap at sizing time nor be given a larger
+# one at runtime, so they keep the historical value on both sides.
 try:
     _MLA_META_SUPPORTS_MAX_SPLIT = (
         "max_split_per_batch" in inspect.signature(get_mla_metadata_info_v1).parameters
@@ -52,45 +57,78 @@ try:
 except (TypeError, ValueError):
     _MLA_META_SUPPORTS_MAX_SPLIT = False
 
-
-# The persistent MLA decode's global KV-split budget is
-# `min(cu_num, max_split_per_batch * batch_size)`, so at batch_size=1 the 16 below
-# caps the whole decode at 16 of the 256 gfx950 CUs. A batch-1 decode has no
-# parallelism other than the KV walk, and this kernel streams the entire context
-# per layer per step, so that cap is an occupancy ceiling rather than a tuning
-# choice. Measured on Kimi-K3 MXFP4 TP8 at concurrency 1 (~180k-token contexts),
-# raising it to 256 takes aiter's mla_a8w8_qh16_qseqlen4_gqaratio16_v3_ps from
-# 416.7us to 48.0us per call, ITL from 12.68ms to 9.76ms (1.30x) and end-to-end
-# replay of a fixed request set 1.19x faster. Its cost is a heavier mla_reduce
-# (7.8us -> 41.0us), which is why the win shrinks as batch_size grows and the
-# budget stops binding.
-_MLA_MAX_SPLIT_PER_BATCH = int(os.getenv("ATOM_MLA_MAX_SPLIT_PER_BATCH", "16"))
-# kv_granularity is in PAGES, so the historical max(block_size, 16) is 128 pages =
-# 16,384 tokens per split unit at block_size=128. Lowering it is a NET LOSS and is
-# exposed only as an escape hatch: on its own it bought no ITL at all, and stacked
-# on the raised split budget it added 2.5% ITL while costing 34% on TTFT, because
-# prefill already has query-dimension parallelism and extra KV splits there only
-# pay for a bigger reduce. 0 keeps the historical value; leave it at 0.
-_MLA_KV_GRANULARITY = int(os.getenv("ATOM_MLA_KV_GRANULARITY", "0"))
+# The cap ATOM used to hardcode, kept as the fallback for the cases below where
+# the derived one cannot be shown to fit the buffers.
+_MLA_HISTORICAL_MAX_SPLIT_PER_BATCH = 16
 
 
-def _mla_kv_granularity(block_size: int) -> int:
-    return _MLA_KV_GRANULARITY if _MLA_KV_GRANULARITY > 0 else max(block_size, 16)
+def _mla_decode_split_budget(
+    num_heads: int,
+    max_seqlen_qo: int,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+) -> int:
+    """Per-request cap on the persistent MLA decode's KV-split budget.
+
+    aiter turns this into ``num_splits = min(num_clusters, cap * batch_size)``
+    (csrc/kernels/mla/metadata/v1_2_device.cuh:894), the number of work
+    partitions the decode is cut into, so the cap binds only while
+    ``cap * batch_size < num_clusters``: it is purely a small-batch throttle.
+    The 16 ATOM used to hardcode therefore left a batch-1 decode on 16 of a
+    gfx950's 256 CUs, and a batch-1 decode has no parallelism other than the KV
+    walk -- an occupancy ceiling rather than a tuning choice.
+
+    Quoting ``num_clusters`` itself lifts the throttle without unbounding
+    anything. The kernel clamps to ``num_clusters`` regardless, so the partial
+    count the reduce has to combine stays <= num_clusters at *every* batch size
+    and the per-request split count degrades as num_clusters/batch_size on its
+    own -- there is no batch size at which this costs more reduce work than
+    aiter's own default (``max_split_per_batch=-1``, which is what ATOM's MHA
+    path already passes). ``get_mla_decode_fwd_max_splits`` is that same cluster
+    count computed host-side (``get_cu_num() * occupancy``, num_heads_k=1).
+
+    The same number has to reach ``get_mla_metadata_info_v1``: it sizes
+    ``reduce_partial_map`` as ``max(fast_estimate, tile_cnt + min(max_splits,
+    cap * batch_size))`` and ``mla_decode_fwd`` sizes its fp32 ``logits`` from
+    ``reduce_partial_map.size(0)``, so a runtime budget above the sized one
+    writes out of bounds. Passing the cluster count to both saturates that
+    ``min`` and makes sizing >= runtime an identity rather than a coincidence;
+    it also closes the reverse gap, since the uncapped ``fast_estimate`` alone
+    can fall short of the ``tile_cnt + num_clusters`` the kernel may emit once
+    max_bs exceeds max_splits (e.g. 510 reserved vs 768 emitted at max_bs=512,
+    tile_cnt=512, num_clusters=256).
+
+    Falls back to the historical 16 when that identity cannot be established:
+      - aiter cannot be told the cap at sizing time (older build), or
+      - some q-len this builder can dispatch has a *higher* cluster count than
+        the q-len the buffers were sized for. Occupancy is a point condition on
+        ``num_heads * q_len == 64`` (not monotonic in q_len) and the kernel
+        recomputes it per call from the actual q-len, so the raised budget is
+        only safe when the sizing shape dominates every shape we can reach.
+    """
+    if (
+        not _MLA_META_SUPPORTS_MAX_SPLIT
+        or get_mla_decode_fwd_max_splits is None
+        or get_mla_decode_fwd_occupancy is None
+    ):
+        return _MLA_HISTORICAL_MAX_SPLIT_PER_BATCH
+    sized_occupancy = get_mla_decode_fwd_occupancy(
+        num_heads, max_seqlen_qo, dtype_q, dtype_kv
+    )
+    if any(
+        get_mla_decode_fwd_occupancy(num_heads, q_len, dtype_q, dtype_kv)
+        > sized_occupancy
+        for q_len in range(1, max_seqlen_qo + 1)
+    ):
+        return _MLA_HISTORICAL_MAX_SPLIT_PER_BATCH
+    return get_mla_decode_fwd_max_splits(num_heads, max_seqlen_qo, dtype_q, dtype_kv)
 
 
-def _mla_seg_meta_kwargs() -> dict:
-    """Extra kwargs for ``get_mla_metadata_info_v1``.
-
-    Two callers need ``max_split_per_batch`` here. The segmented page_size>1 path
-    always did. And raising the runtime cap requires the reduce_partial_map buffer
-    to be sized for the larger cap: mla_decode_fwd sizes its fp32 ``logits`` from
-    reduce_partial_map.size(0), so a runtime cap above the sized one writes out of
-    bounds. Sizing and runtime therefore quote the same number."""
-    if not _MLA_META_SUPPORTS_MAX_SPLIT:
-        return {}
-    if envs.ATOM_MLA_PAGE_SIZE > 1 or _MLA_MAX_SPLIT_PER_BATCH != 16:
-        return {"max_split_per_batch": _MLA_MAX_SPLIT_PER_BATCH}
-    return {}
+def _mla_split_meta_kwargs(budget: int) -> dict:
+    """``get_mla_metadata_info_v1`` kwargs that size the work buffers for
+    ``budget``. Empty on aiter builds without the parameter -- there ``budget``
+    is the historical 16 and the historical sizing applies unchanged."""
+    return {"max_split_per_batch": budget} if _MLA_META_SUPPORTS_MAX_SPLIT else {}
 
 
 @dataclass
@@ -213,6 +251,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         )
 
         max_seqlen_qo = getattr(model_runner, "num_spec_tokens", 0) + 1
+        # One number for the sizing below and for every runtime build in
+        # set_mla_persistent_worker_buffers (see _mla_decode_split_budget).
+        self.mla_split_budget = _mla_decode_split_budget(
+            self.persistent_num_heads, max_seqlen_qo, self.dtype_q, self.dtype_kv
+        )
+        # sparse-MTP work buffers are sized for their own shape below; default it
+        # here so the attribute exists on every path that reaches the builder.
+        self.mla_sparse_mtp_split_budget = _MLA_HISTORICAL_MAX_SPLIT_PER_BATCH
         (
             (work_meta_data_size, work_meta_data_type),
             (work_indptr_size, work_indptr_type),
@@ -228,7 +274,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             self.dtype_kv,
             is_sparse=self.is_sparse,
             fast_mode=True,
-            **_mla_seg_meta_kwargs(),
+            **_mla_split_meta_kwargs(self.mla_split_budget),
         )
         i32_kwargs = {"dtype": torch.int32, "device": self.device}
 
@@ -335,6 +381,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # Allocate a second set of persistent work buffers for sparse MTP
             # per-token layout: max_bs*max_seqlen_qo virtual seqs, each q_len=1.
             smt_max_bs = self.max_bs * max_seqlen_qo
+            self.mla_sparse_mtp_split_budget = _mla_decode_split_budget(
+                self.padded_num_attention_heads, 1, self.dtype_q, self.dtype_kv
+            )
             (
                 (smt_wmd_size, smt_wmd_type),
                 (smt_wi_size, smt_wi_type),
@@ -350,7 +399,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 self.dtype_kv,
                 is_sparse=True,
                 fast_mode=True,
-                **_mla_seg_meta_kwargs(),
+                **_mla_split_meta_kwargs(self.mla_sparse_mtp_split_budget),
             )
             mla_metadata["sparse_mtp_work_meta_data"] = torch.empty(
                 smt_wmd_size, dtype=smt_wmd_type, device=self.device
@@ -564,11 +613,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         """
         var = self.model_runner.forward_vars
         split_params = {
-            "kv_granularity": _mla_kv_granularity(self.block_size),
+            "kv_granularity": max(self.block_size, 16),
             "max_seqlen_qo": 1,
             "uni_seqlen_qo": 1,
             "fast_mode": 1,
-            "max_split_per_batch": _MLA_MAX_SPLIT_PER_BATCH,
+            "max_split_per_batch": self.mla_sparse_mtp_split_budget,
         }
         work_meta_data = var["sparse_mtp_work_meta_data"]
         work_info_set = var["sparse_mtp_work_info_set"]
@@ -613,11 +662,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         is_cp_round_robin: bool = False,
     ):
         split_params = {
-            "kv_granularity": _mla_kv_granularity(self.block_size),
+            "kv_granularity": max(self.block_size, 16),
             "max_seqlen_qo": max_q_len,
             "uni_seqlen_qo": max_q_len,
             "fast_mode": 1,
-            "max_split_per_batch": _MLA_MAX_SPLIT_PER_BATCH,
+            "max_split_per_batch": self.mla_split_budget,
         }
         # round-robin CP only lands on the full-build path: decode_update_mla_
         # metadata_v1 has no is_cp_round_robin arg and collapses qlen>1 to 1.
@@ -1074,7 +1123,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 max_seqlen_qo=1,
                 uni_seqlen_qo=1,
                 fast_mode=1,
-                max_split_per_batch=16,
+                # Prefill keeps the historical throttle: it already has
+                # query-dimension parallelism, so extra KV splits only buy a bigger
+                # reduce, and the sparse_prefill_* buffers above are sized without a
+                # cap -- raising it here would need that sizing raised in step.
+                max_split_per_batch=_MLA_HISTORICAL_MAX_SPLIT_PER_BATCH,
             )
             attn_metadata.sparse_prefill_work_meta_data = var[
                 "sparse_prefill_work_meta_data"
@@ -1455,7 +1508,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             max_seqlen_qo=1,
             uni_seqlen_qo=1,
             fast_mode=1,
-            max_split_per_batch=16,
+            # Prefill keeps the historical throttle: it already has
+            # query-dimension parallelism, so extra KV splits only buy a bigger
+            # reduce, and the sparse_prefill_* buffers above are sized without a
+            # cap -- raising it here would need that sizing raised in step.
+            max_split_per_batch=_MLA_HISTORICAL_MAX_SPLIT_PER_BATCH,
         )
         attn_metadata.sparse_prefill_work_meta_data = var[
             "sparse_prefill_work_meta_data"
@@ -1957,7 +2014,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             max_seqlen_qo=max_q_len,
             uni_seqlen_qo=max_q_len,
             fast_mode=1,
-            max_split_per_batch=16,
+            # _allocate_ubatch_buffers sized these from the same
+            # get_mla_metadata_info_v1 call as the shared decode buffers, so this
+            # path quotes the same budget (see _mla_decode_split_budget).
+            max_split_per_batch=self.mla_split_budget,
         )
 
     def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:
