@@ -64,11 +64,13 @@ def _materialize_atom_dummy_forward(
             "positions, input_ids, or input_embeds"
         )
 
-    dummy_positions = (
-        positions.new_zeros((1,))
-        if positions is not None
-        else torch.zeros((1,), dtype=torch.long, device=device)
-    )
+    if positions is not None:
+        dummy_positions_shape = (
+            (3, 1) if positions.ndim == 2 and positions.shape[0] == 3 else (1,)
+        )
+        dummy_positions = positions.new_zeros(dummy_positions_shape)
+    else:
+        dummy_positions = torch.zeros((1,), dtype=torch.long, device=device)
     dummy_input_ids = (
         input_ids.new_zeros((1,))
         if input_ids is not None
@@ -80,8 +82,18 @@ def _materialize_atom_dummy_forward(
     model_forward_batch.positions = dummy_positions
     model_forward_batch.batch_size = 1
     model_forward_batch.seq_lens_sum = 1
-    model_forward_batch.seq_lens = forward_batch.seq_lens.new_ones((1,))
-    model_forward_batch.seq_lens_cpu = forward_batch.seq_lens_cpu.new_ones((1,))
+    seq_lens = getattr(forward_batch, "seq_lens", None)
+    seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+    model_forward_batch.seq_lens = (
+        seq_lens.new_ones((1,))
+        if torch.is_tensor(seq_lens)
+        else torch.ones((1,), dtype=torch.int32, device=device)
+    )
+    model_forward_batch.seq_lens_cpu = (
+        seq_lens_cpu.new_ones((1,))
+        if torch.is_tensor(seq_lens_cpu)
+        else torch.ones((1,), dtype=torch.int32, device="cpu")
+    )
 
     return dummy_input_ids, dummy_positions, dummy_input_embeds, model_forward_batch
 

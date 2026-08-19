@@ -100,6 +100,30 @@ def test_idle_runtime_trims_pipeline_intermediate_tensors():
     assert trimmed["residual"].shape == (0, 4)
 
 
+def test_idle_runtime_preserves_mrope_shape_without_sequence_lengths():
+    module = _load_forward_context_module()
+    forward_batch = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_idle=lambda: True),
+        positions=torch.empty((3, 0), dtype=torch.long),
+        seq_lens=None,
+        batch_size=0,
+        seq_lens_sum=0,
+    )
+    runtime = module.SGLangPluginRuntime(
+        atom_config=SimpleNamespace(),
+        forward_batch=forward_batch,
+        positions=forward_batch.positions,
+        input_ids=None,
+        set_forward_context=False,
+    )
+
+    with runtime:
+        assert runtime.positions.shape == (3, 1)
+        assert runtime.forward_batch.seq_lens.tolist() == [1]
+        assert runtime.forward_batch.seq_lens_cpu.tolist() == [1]
+        assert runtime.forward_batch.seq_lens_cpu.device.type == "cpu"
+
+
 def test_dp_token_counts_materialize_every_idle_rank():
     module = _load_forward_context_module()
     atom_config = SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size=4))

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -122,8 +123,11 @@ class SGLangGDNForwardContext:
         atom_config = get_current_atom_config()
         enable_dp_attention = bool(getattr(atom_config, "enable_dp_attention", False))
         global_forward_mode = getattr(forward_batch, "global_forward_mode", None)
+        effective_forward_mode = (
+            global_forward_mode if global_forward_mode is not None else mode
+        )
         dp_uniform_decode = not enable_dp_attention or bool(
-            global_forward_mode is not None and global_forward_mode.is_decode_or_idle()
+            effective_forward_mode.is_decode_or_idle()
         )
         return (
             Context(
@@ -267,13 +271,18 @@ class SGLangGDNForwardContext:
         prev_context_kv = current_context.kv_cache_data
         try:
             set_kv_cache_data(forward_context.kv_cache_data)
-            attn_md = AttentionMetaData()
+            attn_md = (
+                copy.copy(prev_attn_metadata)
+                if reuse_current_context and prev_attn_metadata is not None
+                else AttentionMetaData()
+            )
             attn_md.gdn_metadata = forward_context.gdn_metadata
             if reuse_current_context:
                 # SGLangPluginRuntime already created the cross-rank-consistent
                 # Context and DPMetadata. Rebuilding it here would issue a second
                 # CPU all-reduce only on ranks where GDN metadata exists; idle
                 # ranks skip this binder and would never join that collective.
+                # Preserve all outer attention fields while injecting GDN data.
                 current_context.attn_metadata = attn_md
                 current_context.kv_cache_data = forward_context.kv_cache_data
             else:
