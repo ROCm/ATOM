@@ -21,7 +21,11 @@ from atom.kv_transfer.disaggregation.multi.multi_connector import (
     MultiConnectorMetadata,
     MultiConnectorScheduler,
 )
-from atom.kv_transfer.disaggregation.types import ConnectorMetadata, KVConnectorOutput
+from atom.kv_transfer.disaggregation.types import (
+    ConnectorMetadata,
+    KVConnectorOutput,
+    SaveOperationId,
+)
 
 # ---------------------------------------------------------------------------
 # Mock sub-connectors
@@ -368,6 +372,27 @@ def test_save_then_send_also_pairs():
     out2 = w.get_finished()
     assert out2.finished_sending == {9}
     assert out2.finished_saving == {9}
+
+
+def test_pairing_matches_save_operation_id():
+    # The offload connector reports a SaveOperationId(req_id, generation), not
+    # a bare request id, whenever it tracks save generations. Pairing keys the
+    # send side by request, so the completion has to collapse onto req_id or
+    # every send is withheld forever and the producer never frees its blocks.
+    moriio = FakeWorkerSub(is_producer=True)
+    off = FakeWorkerSub()
+    w = _worker([moriio, off])
+    w.start_load_kv(MultiConnectorMetadata([ConnectorMetadata(), _save_meta(9)]))
+
+    op = SaveOperationId(9, 3)
+    moriio._finished = ({9}, set())
+    off._finished = KVConnectorOutput(finished_saving={op})
+    out = w.get_finished()
+    assert out.finished_sending == {9}
+    assert out.finished_saving == {op}
+    assert w._pending_save == set()
+    assert w._sent == {}
+    assert w._saved == {}
 
 
 def test_non_head_pp_stage_does_not_pair():

@@ -68,6 +68,17 @@ from atom.kv_transfer.disaggregation.types import ConnectorMetadata, KVConnector
 logger = logging.getLogger("atom")
 
 
+def _save_key(completion) -> str:
+    """Request identity of one offload save completion.
+
+    ``finished_saving`` carries a ``SaveOperationId(req_id, generation)`` when
+    the offload connector tracks save generations, and a bare request id when
+    it does not. The send side is only ever keyed by request, so both shapes
+    have to collapse onto the request id before the two can be paired.
+    """
+    return str(getattr(completion, "req_id", completion))
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -281,7 +292,7 @@ class MultiConnector(KVConnectorBase):
         for r in send_now:
             self._sent[str(r)] = r
         for r in save_now:
-            self._saved[str(r)] = r
+            self._saved[_save_key(r)] = r
 
         rel_send: set = set()
         rel_save: set = set()
