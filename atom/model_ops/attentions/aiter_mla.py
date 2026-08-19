@@ -51,14 +51,13 @@ try:
 except (TypeError, ValueError):
     _MLA_META_SUPPORTS_MAX_SPLIT = False
 
-# aiter derives this from the device when asked to: `max_split_per_batch < 0`
-# means `num_splits = num_clusters` (csrc/kernels/mla/metadata/v1_2_device.cuh:894).
-# The 16 we used to quote binds only while `16 * batch_size < num_clusters`, i.e.
-# it threw away CUs at small batch -- a batch-1 decode ran on 16 of a gfx950's 256.
+# Cap on the decode's KV-split budget: aiter cuts the KV walk into
+# `min(num_clusters, cap * batch_size)` parts, and a negative cap means uncapped
+# -- as many parts as the machine has clusters (v1_2_device.cuh:894).
 _MLA_SPLIT_BUDGET_AUTO = -1
 
-# Prefill keeps the throttle: it already has query-dimension parallelism, so extra
-# KV splits only buy a bigger reduce (measured: no ITL gain, +34% TTFT).
+# Prefill caps it: it already has query-dimension parallelism, so extra KV splits
+# there only buy a bigger reduce.
 _MLA_PREFILL_MAX_SPLIT_PER_BATCH = 16
 
 
