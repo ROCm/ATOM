@@ -116,11 +116,15 @@ def run_staged_pipeline(
     buffer_safe_to_release = True
     try:
         for group in groups:
-            device_buf = ensure_buffer(staging_buffer, group_nbytes(group))
-            used_buffer = True
             if staging_buffer.free_event_valid:
                 stage_a.stream.wait_event(staging_buffer.free_event)
             with state.stream_ctx(stage_a.stream):
+                # ``ensure_buffer`` may allocate device storage. Allocate it on
+                # the first consumer stream so a caching allocator cannot
+                # reuse storage whose previous default-stream user is still
+                # running and then let this side stream overwrite it early.
+                device_buf = ensure_buffer(staging_buffer, group_nbytes(group))
+                used_buffer = True
                 stage_a.run(group, device_buf)
             staging_buffer.ready_event.record(stage_a.stream)
             stage_b.stream.wait_event(staging_buffer.ready_event)

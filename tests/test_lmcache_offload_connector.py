@@ -918,6 +918,104 @@ def test_lmcache_connector_maps_dcp_ranges_on_virtual_block_grid():
     assert connector.gpu_staging_chunk_bytes == 2 * codec.bytes_per_block
 
 
+@pytest.mark.parametrize(
+    ("first_stream_name", "second_stream_name"),
+    [("pack", "copy"), ("copy", "pack")],
+)
+def test_staged_pipeline_allocates_on_first_consumer_stream(
+    first_stream_name,
+    second_stream_name,
+):
+    from atom.kv_transfer.offload.atom_lmcache_staging import (
+        _PipelineStage,
+        run_staged_pipeline,
+    )
+
+    trace = []
+
+    class _FakeStream:
+        def __init__(self, name):
+            self.name = name
+
+        def wait_event(self, event):
+            trace.append(("wait", self.name, event.name))
+
+        def synchronize(self):
+            trace.append(("synchronize", self.name))
+
+    class _FakeEvent:
+        def __init__(self, name):
+            self.name = name
+
+        def record(self, stream):
+            trace.append(("record", self.name, stream.name))
+
+    class _StreamContext:
+        def __init__(self, state, stream):
+            self.state = state
+            self.stream = stream
+
+        def __enter__(self):
+            assert self.state.current_stream is None
+            self.state.current_stream = self.stream
+            trace.append(("enter", self.stream.name))
+
+        def __exit__(self, *_args):
+            trace.append(("exit", self.stream.name))
+            self.state.current_stream = None
+
+    class _FakeState:
+        def __init__(self):
+            self.current_stream = None
+            self.staging_buffer = SimpleNamespace(
+                tensor=None,
+                ready_event=_FakeEvent("ready"),
+                free_event=_FakeEvent("free"),
+                free_event_valid=False,
+            )
+
+        def stream_ctx(self, stream):
+            return _StreamContext(self, stream)
+
+    state = _FakeState()
+    first_stream = _FakeStream(first_stream_name)
+    second_stream = _FakeStream(second_stream_name)
+    device_buf = object()
+
+    def ensure_buffer(_staging_buffer, nbytes):
+        assert nbytes == 8
+        assert state.current_stream is first_stream
+        trace.append(("ensure", state.current_stream.name))
+        return device_buf
+
+    def run_stage(stage_name, expected_stream, _group, actual_buf):
+        assert state.current_stream is expected_stream
+        assert actual_buf is device_buf
+        trace.append(("run", stage_name, state.current_stream.name))
+
+    run_staged_pipeline(
+        state,
+        [SimpleNamespace(nbytes=8)],
+        stage_a=_PipelineStage(
+            first_stream,
+            lambda group, buf: run_stage("a", first_stream, group, buf),
+        ),
+        stage_b=_PipelineStage(
+            second_stream,
+            lambda group, buf: run_stage("b", second_stream, group, buf),
+        ),
+        ensure_buffer=ensure_buffer,
+        group_nbytes=lambda group: group.nbytes,
+    )
+
+    assert trace[:3] == [
+        ("enter", first_stream_name),
+        ("ensure", first_stream_name),
+        ("run", "a", first_stream_name),
+    ]
+    assert ("run", "b", second_stream_name) in trace
+
+
 def _exception_pipeline(monkeypatch, direction: str, *, failed_stream: str | None):
     import torch
 
