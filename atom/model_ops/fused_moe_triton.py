@@ -647,7 +647,9 @@ def routing_from_dispatched(
     # Hoisted above the version dispatch because it is allocation-only (no
     # kernel) and version-independent -- v2 needs the buffers up front so it can
     # fill them in the same launch as the scatter.
-    tokens_per_expt = max(1, n_gates // max(num_local_experts, 1))
+    # tokens_per_expt = max(1, n_gates // max(num_local_experts, 1))
+    global_num_experts = max(1, expert_map.numel() - 1)
+    tokens_per_expt = max(1, n_gates // global_num_experts)
     block_m = max(16, min(triton.next_power_of_2(tokens_per_expt), 128))
     expt_data_bufs = _compute_expt_data_internal(
         num_local_experts, n_gates, block_m, device
@@ -743,7 +745,7 @@ def _gluon_fused_quant_supported(m, n, k, routing_data) -> bool:
     Defers the persistent decision to aiter's own selector instead of restating
     its thresholds, so this stays correct if that heuristic moves.
     """
-    if routing_data is None or getattr(routing_data, "block_m", None) != 16:
+    if routing_data is None or getattr(routing_data, "block_m", None) is None:
         return False
     return not get_kernel_config_gluon(m, n, k, routing_data)["use_persistent"]
 
