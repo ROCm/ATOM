@@ -168,9 +168,9 @@ def install_dflash_lm_head_patch() -> None:
     patched.__name__ = original.__name__
     patched.__qualname__ = original.__qualname__
     patched.__doc__ = original.__doc__
-    setattr(DFlashWorkerV2, "_greedy_sample_from_vocab_parallel_head", patched)
+    DFlashWorkerV2._greedy_sample_from_vocab_parallel_head = patched
     setattr(DFlashWorkerV2, _PATCH_FLAG, True)
-    setattr(DFlashWorkerV2, "_atom_dflash_original_greedy_sample", original)
+    DFlashWorkerV2._atom_dflash_original_greedy_sample = original
     logger.info(
         "ATOM patched SGLang DFLASH draft greedy sampling to use the external "
         "lm_head's compute_argmax_token()."
