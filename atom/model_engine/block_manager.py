@@ -28,6 +28,7 @@ from atom.model_engine.state_runtime import (
     StateRuntime,
     StateTransfer,
 )
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -110,6 +111,7 @@ class BlockManager:
         self.state_checkpoint_interval_tokens = max(
             0, int(getattr(config, "state_checkpoint_interval_tokens", 0) or 0)
         )
+        self.enable_prefill_end_checkpoint = envs.ATOM_ENABLE_PREFILL_END_CHECKPOINT
         checkpoint_spec = state_runtime.checkpoint_spec
         self.paged_state_checkpoints: PagedStateCheckpointCoordinator | None = None
         if checkpoint_spec is not None:
@@ -633,6 +635,29 @@ class BlockManager:
             return 0
         return max(int((seq.num_prompt_tokens - room) // interval) * interval, 0)
 
+    def _prefill_end_checkpoint_pos(self, seq: Sequence) -> int:
+        """Last hash boundary of a prefill that can back a PAGE checkpoint.
+
+        A DeepSeek-V4 PAGE checkpoint copies the whole Active Slot, including
+        compressor state and the SWA window.  Keep the final complete prefix
+        block even when it is off the interval ladder so the next agentic turn
+        can resume where this prompt ended.
+
+        The real prompt end cannot be used when it is between hash blocks: the
+        checkpoint would contain state for the tail while its key names only
+        the preceding complete block.  Cutting once at the floored boundary
+        keeps the state and hash exact, then prefill runs the short tail.
+        """
+        checkpoints = self.paged_state_checkpoints
+        if (
+            not self.enable_prefill_end_checkpoint
+            or checkpoints is None
+            or not checkpoints.applies(seq)
+            or not any(cache is checkpoints for cache in self.state_caches)
+        ):
+            return 0
+        return (seq.num_prompt_tokens // self.hash_block_size) * self.hash_block_size
+
     def _record_checkpoint_demand(
         self, seq: Sequence, hit: int, compressed_hit: int, block_hashes: list[int]
     ) -> None:
@@ -692,12 +717,17 @@ class BlockManager:
         )
 
     def checkpoint_cut(self, seq: Sequence, start: int, end: int) -> int:
-        """Latest ladder position in `(start, end]`, or 0 if there is none.
+        """Next checkpoint position in `(start, end]`, or 0 if none exists.
 
         What a prefill chunk is cut at so its forward lands exactly on a rung.
         The counterpart of `checkpointers_at`, which decides what a forward
         ending there keeps: the two have to agree position for position, so the
         grid arithmetic lives here rather than at the scheduler's call site.
+
+        The existing interval/demand choice is preserved as one candidate.  A
+        PAGE-backed prompt-end checkpoint is a second candidate; when a chunk
+        spans both, the earlier one must run first so the final checkpoint does
+        not displace the interval rung.
         """
         rung = 0
         if limit := self.checkpoint_limit(seq):
@@ -711,16 +741,18 @@ class BlockManager:
         # of the last rung — or, on a prompt too short for the grid to place a
         # rung at all, be the only position either side has.
         demand = seq.checkpoint_demand_pos
-        target = max(rung, demand if demand <= end else 0)
-        if target <= start:
+        existing = max(rung, demand if demand <= end else 0)
+        anchor = self._prefill_end_checkpoint_pos(seq)
+        candidates = [pos for pos in (existing, anchor) if pos and start < pos <= end]
+        if not candidates:
             return 0
-        # `target` is the larger of the two, so beating the grid means the
-        # demand chose this position and the grid would not have. `target < end`
-        # is the other half: at `end` the chunk is not shortened and the demand
-        # cost nothing, and counting those made the funnel report cuts that
-        # never happened — which is the one number meant to expose a shape that
-        # pays per request and never converges.
-        self.chunks_cut_for_demand += target > rung and target < end
+        target = min(candidates)
+        # Preserve the demand counter's meaning: an anchor cut is proactive,
+        # not evidence that a prior request was denied reuse. At `end` the
+        # chunk is not shortened, so even a demand costs no extra forward.
+        self.chunks_cut_for_demand += (
+            target == existing and target > rung and target < end
+        )
         return target
 
     def checkpoint_funnel(self) -> dict[str, int]:
@@ -767,10 +799,10 @@ class BlockManager:
         would be filed under; the scheduler cuts prefill chunks to land here,
         and a path that doesn't simply keeps nothing.
 
-        On top of the grid sits at most one rung of this seq's own,
-        `checkpoint_demand_pos` — a boundary this seq was denied for want of a
-        checkpoint (`_record_checkpoint_demand`). `checkpoint_cut` reads the
-        same field, so the cut and the keep cannot drift apart.
+        On top of the grid sits a demand rung (`checkpoint_demand_pos`). For a
+        PAGE-backed state image, the final complete hash block of the prompt is
+        also eligible. `checkpoint_cut` reads the same two placements, so the
+        cut and the keep cannot drift apart.
 
         `aimed` says whether the caller could place the forward's end. Prefill
         can — `checkpoint_cut` shortens the chunk — so it is held to the exact
@@ -803,13 +835,21 @@ class BlockManager:
         cannot reach one.
         """
         interval = self.state_checkpoint_interval_tokens
-        if interval <= 0 or pos <= 0:
+        if pos <= 0:
             return []
         if aimed:
-            if pos % interval and pos != seq.checkpoint_demand_pos:
+            anchor = self._prefill_end_checkpoint_pos(seq)
+            if (
+                (interval <= 0 or pos % interval)
+                and pos != seq.checkpoint_demand_pos
+                and pos != anchor
+            ):
                 return []
-        elif pos % self.hash_block_size or pos - seq.last_checkpoint_pos < interval:
-            return []
+        else:
+            if interval <= 0:
+                return []
+            if pos % self.hash_block_size or pos - seq.last_checkpoint_pos < interval:
+                return []
         if next_forward_tokens is None:
             next_forward_tokens = seq.num_prompt_tokens - pos
         return [

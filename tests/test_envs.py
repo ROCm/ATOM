@@ -28,6 +28,7 @@ _ATOM_ENV_VARS = [
     "ATOM_DISABLE_VLLM_PLUGIN",
     "ATOM_USE_CUSTOM_ALL_GATHER",
     "ATOM_ENABLE_RELAXED_MTP",
+    "ATOM_ENABLE_PREFILL_END_CHECKPOINT",
 ]
 
 
@@ -96,6 +97,9 @@ class TestEnvsDefaults:
     def test_atom_enable_gdn_decode_lossy_fast_default(self):
         assert _get_envs().ATOM_ENABLE_GDN_DECODE_LOSSY_FAST is False
 
+    def test_prefill_end_checkpoint_default_enabled(self):
+        assert _get_envs().ATOM_ENABLE_PREFILL_END_CHECKPOINT is True
+
     def test_unknown_attr_raises(self):
         with pytest.raises(AttributeError):
             _ = _get_envs().ATOM_NONEXISTENT_VAR
@@ -157,6 +161,10 @@ class TestEnvsOverrides:
     def test_atom_enable_gdn_decode_lossy_fast_enabled(self, monkeypatch):
         monkeypatch.setenv("ATOM_ENABLE_GDN_DECODE_LOSSY_FAST", "1")
         assert _get_envs().ATOM_ENABLE_GDN_DECODE_LOSSY_FAST is True
+
+    def test_prefill_end_checkpoint_can_be_disabled(self, monkeypatch):
+        monkeypatch.setenv("ATOM_ENABLE_PREFILL_END_CHECKPOINT", "0")
+        assert _get_envs().ATOM_ENABLE_PREFILL_END_CHECKPOINT is False
 
 
 class TestIsSet:

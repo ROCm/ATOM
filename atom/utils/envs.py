@@ -84,6 +84,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_TERMINAL_MTP_FAST_PATH": lambda: (
         os.getenv("ATOM_TERMINAL_MTP_FAST_PATH", "1") == "1"
     ),
+    # PAGE-backed state: checkpoint the final complete hash block of every
+    # prefill, independently of the interval ladder. Default on; set to 0 to
+    # retain interval/demand checkpoints without the per-prefill anchor.
+    "ATOM_ENABLE_PREFILL_END_CHECKPOINT": lambda: (
+        os.getenv("ATOM_ENABLE_PREFILL_END_CHECKPOINT", "1") == "1"
+    ),
     "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
     # --- Kernel Fusion Toggles ---
     # fused_compress_attn: switch between Triton (default historical) and a

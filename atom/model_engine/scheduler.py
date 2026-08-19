@@ -1740,8 +1740,8 @@ class Scheduler:
            prompt tokens behind it, so the tokens are there to forward. Only the
            rolling state class forks, so this job asks it directly.
 
-        No-op for models without per-request state, and for any prompt shorter
-        than one checkpoint interval.
+        No-op for models without per-request state. PAGE-backed state may add a
+        final hash-aligned prompt checkpoint even below one interval.
         """
         bm = self.block_manager
         target = bm.checkpoint_cut(seq, start, start + chunk)
