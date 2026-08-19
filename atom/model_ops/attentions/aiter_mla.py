@@ -51,31 +51,14 @@ try:
 except (TypeError, ValueError):
     _MLA_META_SUPPORTS_MAX_SPLIT = False
 
-# Let aiter size the decode's KV-split budget. `max_split_per_batch < 0` means
-# `num_splits = num_clusters` (csrc/kernels/mla/metadata/v1_2_device.cuh:894),
-# i.e. cut the KV walk into as many parts as the machine has clusters, which is
-# what ATOM's MHA path has always passed and what aiter itself defaults to.
-#
-# The 16 we used to quote instead only binds while `16 * batch_size <
-# num_clusters`, so it was never a tuning choice -- it was a small-batch
-# throttle, and it left a batch-1 decode on 16 of a gfx950's 256 CUs. A batch-1
-# decode has no parallelism other than that KV walk, and this kernel streams the
-# whole context per layer per step. Measured on Kimi-K3 MXFP4 TP8 at concurrency
-# 1 (~180k-token contexts): aiter's mla_a8w8_qh16_qseqlen4_gqaratio16_v3_ps goes
-# 416.7us -> 48.0us per call, ITL 12.68ms -> 9.76ms (1.30x), end-to-end replay
-# 1.19x. The cost is a heavier mla_reduce (7.8us -> 41.0us), which is why the win
-# shrinks as batch_size grows and the throttle stops binding anyway.
-#
-# Buffer sizing needs no matching change: get_mla_metadata_info_v1's fast-mode
-# bound, `min(bs + max_splits - 1, (max_splits - 1) * 2) * tiles`, is already the
-# worst case for `num_splits == num_clusters` -- the planner walks num_cu CU
-# parts and each emits at most one partial before yielding, so the entry count is
-# bounded by num_cu + tile_cnt regardless of this value.
+# aiter derives this from the device when asked to: `max_split_per_batch < 0`
+# means `num_splits = num_clusters` (csrc/kernels/mla/metadata/v1_2_device.cuh:894).
+# The 16 we used to quote binds only while `16 * batch_size < num_clusters`, i.e.
+# it threw away CUs at small batch -- a batch-1 decode ran on 16 of a gfx950's 256.
 _MLA_SPLIT_BUDGET_AUTO = -1
 
-# Prefill keeps the historical throttle: it already has query-dimension
-# parallelism, so extra KV splits there only buy a bigger reduce (measured: no
-# ITL gain, +34% TTFT).
+# Prefill keeps the throttle: it already has query-dimension parallelism, so extra
+# KV splits only buy a bigger reduce (measured: no ITL gain, +34% TTFT).
 _MLA_PREFILL_MAX_SPLIT_PER_BATCH = 16
 
 
