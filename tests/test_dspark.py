@@ -335,9 +335,12 @@ def test_scheduler_multi_request_global_topk():
 # ---------------------------------------------------------------------------
 
 
-def _core_probe(*, piecewise, capturing, graph_ready, dummy=False):
+def _core_probe(*, piecewise, capturing, graph_ready, dummy=False, capture=True):
     """Drive a decorated core once against fake collaborators and report which
-    of capture / replay / deliver / bare-core it chose."""
+    of capture / replay / deliver / bare-core it chose.
+
+    `capture` is the mode gate (AF_PIECEWISE on). Off, the core never records a
+    graph of its own -- plain PIECEWISE, eager core plus a stabilised output."""
     import types
 
     from atom.utils.attn_ffn_piecewise import piecewise_core
@@ -382,6 +385,7 @@ def _core_probe(*, piecewise, capturing, graph_ready, dummy=False):
         runner=FakeRunner(),
         outputs=FakeOutputs(),
         piecewise=piecewise,
+        capture=capture,
         forward_context=fc,
         x=torch.ones(4),
     )
@@ -418,6 +422,19 @@ def test_decorated_core_picks_capture_replay_or_eager():
         "deliver",
     ]
 
+    # Plain PIECEWISE (capture gate off): the core never records or replays a
+    # graph of its own, whatever the capture pass / cache says -- it runs eager
+    # and only stabilises its output. This is the path the three-way branch in
+    # v4_core_attention used to hand-code outside the decorator.
+    assert P(piecewise=True, capturing=True, graph_ready=True, capture=False) == [
+        "core",
+        "deliver",
+    ]
+    assert P(piecewise=True, capturing=False, graph_ready=True, capture=False) == [
+        "core",
+        "deliver",
+    ]
+
 
 def test_runner_copies_only_what_is_not_zero_copy():
     import torch as _t
@@ -443,15 +460,15 @@ def test_v4_core_captures_on_everything_but_positions():
     import pytest
 
     try:
-        from atom.models.deepseek_v4 import v4_attn_core
+        from atom.models.deepseek_v4 import DeepseekV4Attention
+
+        core = DeepseekV4Attention._attn_core
     except ImportError as e:
         if "aiter" not in str(e):
             raise
         pytest.skip(f"requires aiter to import deepseek_v4: {e}")
 
-    assert set(v4_attn_core.zero_copy_names) == set(v4_attn_core.input_names) - {
-        "positions"
-    }
+    assert set(core.zero_copy_names) == set(core.input_names) - {"positions"}
 
 
 def test_v4_core_inputs_come_from_the_signature():
@@ -461,13 +478,15 @@ def test_v4_core_inputs_come_from_the_signature():
     import pytest
 
     try:
-        from atom.models.deepseek_v4 import v4_attn_core
+        from atom.models.deepseek_v4 import DeepseekV4Attention
+
+        core = DeepseekV4Attention._attn_core
     except ImportError as e:
         if "aiter" not in str(e):
             raise
         pytest.skip(f"requires aiter to import deepseek_v4: {e}")
 
-    assert v4_attn_core.input_names == (
+    assert core.input_names == (
         "x",
         "q",
         "kv_pre",

@@ -192,38 +192,9 @@ def v4_attention_with_output(
 v4_attn_runner = CudagraphCaptureRunner()
 # The fixed addresses the dense piece downstream of the attn core reads. Needed
 # under PIECEWISE whether or not the core itself is captured, so it is separate
-# from the graph cache above.
+# from the graph cache above. `DeepseekV4Attention._attn_core` carries the
+# `@piecewise_core` decorator itself and is handed these two per call.
 v4_attn_outputs = StableOutputs()
-
-
-@piecewise_core(key=decode_bucket_key, copy_per_step=("positions",))
-def v4_attn_core(
-    layer,
-    *,
-    x,
-    q,
-    kv_pre,
-    qr,
-    qr_scale,
-    positions,
-    idx_q_quant,
-    idx_weights,
-    idx_q_scale,
-):
-    """V4's captured attention core.
-
-    The parameter names AND their order are the contract: the runner addresses
-    the graph's inputs by them, and the decorator reads them off this signature.
-
-    `positions` is the one input the graph must not capture on: doing so costs
-    ~2pts of accuracy (padding-tail regression, root cause never found -- see
-    8f86bbaf). Everything else about the capture -- the graph key, the output
-    slot, which inputs get cloned -- belongs to `piecewise_core`, so this is the
-    whole of what V4 has to say about it.
-    """
-    return layer._attn_core(
-        x, q, kv_pre, qr, qr_scale, positions, idx_q_quant, idx_weights, idx_q_scale
-    )
 
 
 def _v4_core_attention_fake(
@@ -268,30 +239,23 @@ def v4_core_attention(
         getattr(fc, "cudagraph_runtime_mode", None) == CUDAGraphMode.PIECEWISE
     )
 
-    # FULL / plain PIECEWISE / eager: the core is not captured, so nothing here
-    # needs the graph cache. Call it directly rather than through `attn_ffn`,
-    # which exists for the captured path.
-    if not self.attn_ffn_piecewise:
-        out = self._attn_core(
-            x, q, kv_pre, qr, qr_scale, positions, idx_q_quant, idx_weights, idx_q_scale
-        )
-        if not is_piecewise:
-            return out
-        # PIECEWISE: the downstream dense piece was captured reading a fixed
-        # address, so the output has to land in the persistent per-(layer, rows)
-        # buffer rather than in a recyclable pool tensor.
-        return v4_attn_outputs.deliver((layer_name, int(out.shape[0])), out)
-
-    # AF_PIECEWISE: the core gets its own cudagraph. Its inputs are outputs of
-    # the preceding graph piece and live in the cudagraph pool. #1884 snapshotted
-    # them out of it on entry; #1902 dropped that once each num_tokens bucket got
-    # its own pool, since a bucket's graphs only ever reuse memory among
-    # themselves. They are passed through as-is.
-    return v4_attn_core(
-        self,
+    # One path for every mode. The `@piecewise_core`-decorated `_attn_core` reads
+    # the two flags and routes:
+    #  - piecewise=False (FULL / eager / FULL_AND_PIECEWISE decode under a
+    #    FULL-runtime graph): the core runs and its result is returned as-is.
+    #  - piecewise=True, capture=False (plain PIECEWISE): the core runs eager and
+    #    its result is delivered into the persistent per-(layer, rows) slot the
+    #    downstream dense piece was captured reading.
+    #  - piecewise=True, capture=True (AF_PIECEWISE): the core gets its own
+    #    cudagraph. Its inputs are outputs of the preceding graph piece and live
+    #    in the cudagraph pool; each num_tokens bucket has its own pool (#1902),
+    #    so a bucket's graphs only reuse memory among themselves and the inputs
+    #    are passed through as-is.
+    return self._attn_core(
         runner=v4_attn_runner,
         outputs=v4_attn_outputs,
         piecewise=is_piecewise,
+        capture=self.attn_ffn_piecewise,
         forward_context=fc,
         x=x,
         q=q,
@@ -2799,23 +2763,28 @@ class DeepseekV4Attention(nn.Module):
         q, kv_pre, qr, qr_scale, x, _, _, _ = self._attn_pre(
             x, positions, run_indexer_proj=False
         )
-        # Paged attention core (compressor already launched above).
+        # Paged attention core (compressor already launched above). `piecewise=
+        # False` runs the decorated body eagerly — no graph, no output slot; the
+        # WIDE/FULL path derives `compressor_already_launched=True` from the mode.
         o = self._attn_core(
-            x,
-            q,
-            kv_pre,
-            qr,
-            qr_scale,
-            positions,
+            piecewise=False,
+            x=x,
+            q=q,
+            kv_pre=kv_pre,
+            qr=qr,
+            qr_scale=qr_scale,
+            positions=positions,
             idx_q_quant=None,
             idx_weights=None,
-            compressor_already_launched=True,
+            idx_q_scale=None,
         )
         # Output LoRA + wo_b.
         return self._attn_post(o)
 
+    @piecewise_core(key=decode_bucket_key, copy_per_step=("positions",))
     def _attn_core(
         self,
+        *,
         x: torch.Tensor,  # [num_tokens, dim]  flat ragged-batch hidden state
         q: torch.Tensor,  # [num_tokens, n_heads*head_dim]  from wq_b
         kv_pre: torch.Tensor,  # [num_tokens, head_dim]  KV latent (pre-norm/rope)
@@ -2829,18 +2798,30 @@ class DeepseekV4Attention(nn.Module):
         idx_q_scale: (
             torch.Tensor | None
         ) = None,  # indexer FP4 e8m0 q-scale (from _attn_pre; None for FP8)
-        compressor_already_launched: bool = False,
     ) -> torch.Tensor:  # [num_tokens, n_local_heads*head_dim]  flat attn output
         """Paged/dynamic attention core — SINGLE source of the paged attention
         body, shared by both the PIECEWISE narrow-split op and the FULL/legacy
-        `forward_impl`. The two paths differ only in the compressor launch timing
-        and the indexer projection site, both parameterised here:
+        `forward_impl`, AND the function captured under AF_PIECEWISE.
 
-        - `compressor_already_launched`: FULL launches the compressor BEFORE the
-          Q/KV projections (in `forward_impl`, to overlap with them — unchanged
-          legacy ordering) and passes True so we don't relaunch. PIECEWISE passes
-          False and launches here (its projections are in a separate captured
-          piece, and side-stream alloc can't happen during capture anyway).
+        `@piecewise_core` is what makes it the captured core: its keyword-only
+        tensor parameters ARE the graph's inputs, in this order, and `positions`
+        is the one the graph must not capture on (doing so costs ~2pts of
+        accuracy — padding-tail regression, root cause never found, see 8f86bbaf).
+        Everything else about the capture — the graph key, the output slot, which
+        inputs get cloned — belongs to the decorator, so this signature is the
+        whole of what V4 says about it. The FULL/legacy `forward_impl` calls it
+        with `piecewise=False`, so the decorator just runs the body eagerly.
+
+        The two callers differ only in the compressor launch timing and the
+        indexer projection site:
+
+        - Compressor: the WIDE/FULL path (`forward_impl`) launches it BEFORE the
+          Q/KV projections to overlap with them (unchanged legacy ordering), so
+          this body must not relaunch; the NARROW/PIECEWISE path launches it here
+          (its projections are a separate captured piece, and side-stream alloc
+          can't happen during capture anyway). Which path we are on is exactly
+          `forward`'s WIDE-vs-NARROW choice, derived from the cudagraph mode below
+          rather than threaded through a bool the decorator would read as an input.
         - `idx_q_quant`/`idx_weights`: if provided (PIECEWISE, projected in
           `_attn_pre`), the indexer runs only its paged score/top-k via
           `score_topk_from`; if None (FULL), the indexer's `forward_batched`
@@ -2882,7 +2863,13 @@ class DeepseekV4Attention(nn.Module):
         # ===== Compressor launch =====
         # FULL already launched it before the projections (overlap); PIECEWISE
         # launches here. maybe_compressors_async runs single-stream anyway when a
-        # cudagraph is capturing (side-stream alloc breaks capture).
+        # cudagraph is capturing (side-stream alloc breaks capture). WIDE-vs-NARROW
+        # is `forward`'s own choice, so read it back off the cudagraph mode instead
+        # of a signature bool the capture decorator would treat as a graph input.
+        cg_mode = get_current_atom_config().compilation_config.cudagraph_mode
+        compressor_already_launched = not (
+            cg_mode is not None and cg_mode.requires_piecewise_compilation()
+        )
         if compressor_already_launched:
             from atom.utils.tbo.ubatching import tbo_active
 

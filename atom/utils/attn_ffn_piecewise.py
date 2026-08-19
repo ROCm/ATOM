@@ -14,15 +14,17 @@ reads, so both sides of that boundary need one that does not move:
     per (layer, rows), so an eagerly computed result is delivered into it.
 
 Both are the runner's business, not the model's. A model opts in by decorating
-the function that IS its core::
+the method that IS its core -- no separate wrapper, the decorated function is the
+core itself::
 
-    @piecewise_core(key=decode_bucket_key)
-    def v4_attn_core(layer, *, x, q, kv_pre, ...):
-        return layer._attn_core(x, q, kv_pre, ...)
+    @piecewise_core(key=decode_bucket_key, copy_per_step=("positions",))
+    def _attn_core(self, *, x, q, kv_pre, ..., positions):
+        ...the paged attention body...
 
 and writes nothing else -- no staging buffers, no per-input policy, no dummy
 forward to measure shapes. The inputs and their order come off the function's
-own signature.
+own signature (the leading ``self``/layer is skipped). A caller on the FULL /
+eager path just passes ``piecewise=False`` and the body runs directly.
 
 What this deliberately does NOT do is let the producer write the graph's input
 buffer directly. That saves the clone's copy, but only by making every producer
@@ -124,8 +126,20 @@ def piecewise_core(
     wrong, whatever the reason; the entry's own comment should say which.
 
     The wrapped function is called as ``fn(layer, **inputs)`` and returns one
-    tensor. Outside PIECEWISE it is simply called: nothing is captured, and no
-    downstream piece is holding an address to deliver to.
+    tensor. It routes three ways off two flags the caller passes each step:
+
+      * ``piecewise=False`` -- FULL / eager / a PIECEWISE forward running under a
+        FULL-runtime graph. Simply called: nothing is captured, and no downstream
+        piece is holding an address to deliver to.
+      * ``piecewise=True, capture=False`` -- plain PIECEWISE. The core stays
+        eager, but the dense piece downstream was captured reading a fixed
+        address, so the result is delivered into the persistent output slot.
+      * ``piecewise=True, capture=True`` -- the core gets its own cudagraph
+        (AF_PIECEWISE): captured in the capture pass, replayed after.
+
+    So ``capture`` is the mode gate -- with it off this collapses to exactly the
+    eager-attention-plus-stable-buffer path plain PIECEWISE always ran, and the
+    caller has no branch of its own to keep.
     """
 
     copied = frozenset(copy_per_step)
@@ -135,7 +149,18 @@ def piecewise_core(
         zero_copy = _resolve_zero_copy(input_names, copied)
 
         @functools.wraps(fn)
-        def wrapper(layer, *, runner, outputs, piecewise, forward_context, **inputs):
+        def wrapper(
+            layer,
+            *,
+            piecewise,
+            capture=False,
+            runner=None,
+            outputs=None,
+            forward_context=None,
+            **inputs,
+        ):
+            # FULL / eager: the body runs directly, so a caller on that path only
+            # states `piecewise=False` and none of the capture collaborators.
             if not piecewise:
                 return fn(layer, **inputs)
 
@@ -147,8 +172,12 @@ def piecewise_core(
             core = functools.partial(fn, layer)
 
             context = getattr(forward_context, "context", None)
+            # `capture` off (plain PIECEWISE) short-circuits to the deliver tail
+            # below: the core runs eager and only its result is stabilised, with
+            # no graph of its own ever recorded.
             eligible = (
-                not getattr(context, "is_dummy_run", False)
+                capture
+                and not getattr(context, "is_dummy_run", False)
                 and getattr(forward_context, "attn_metadata", None) is not None
                 and num_tokens <= max_tokens
             )
