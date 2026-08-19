@@ -1,0 +1,118 @@
+name: MI355 Burst QoS Probe
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: mi355-burst-probe
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  submit-and-verify:
+    name: Submit and verify one MI355 burst allocation
+    # This is a Crusoe Slurm submit host, not the direct GPU runner used by
+    # vLLM/SGLang CI. Keep the existing direct runner workflows unchanged until
+    # this probe verifies the allocation and shared-workspace contract.
+    runs-on: atomesh-cicd-crusoe-mi355
+    timeout-minutes: 30
+    env:
+      SLURM_ACCOUNT: amd-aifw-dev
+      SLURM_QOS: amd-burst-qos
+      SPUR_CONTROLLER_ADDR: http://crs-m2m-cpu-spur-005.crusoe.amd.com:6817
+    steps:
+      - name: Checkout ATOM repository
+        uses: actions/checkout@v6
+
+      - name: Verify Slurm submit host
+        run: |
+          set -euo pipefail
+          export PATH="/usr/local/slurm-24.05.5.1/bin:${PATH}"
+          command -v sbatch
+          command -v squeue
+          command -v sacct
+          echo "Submit host: $(hostname)"
+          echo "Workspace: ${GITHUB_WORKSPACE}"
+
+      - name: Submit one MI355 burst allocation
+        id: burst
+        run: |
+          set -euo pipefail
+          export PATH="/usr/local/slurm-24.05.5.1/bin:${PATH}"
+
+          probe_dir="${RUNNER_TEMP}/mi355-burst-probe"
+          mkdir -p "${probe_dir}"
+          job_script="${probe_dir}/probe-job.sh"
+
+          cat > "${job_script}" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          echo "Compute host: $(hostname)"
+          echo "Slurm job id: ${SLURM_JOB_ID:-missing}"
+          echo "Workspace: ${GITHUB_WORKSPACE:-missing}"
+          test -d "${GITHUB_WORKSPACE}/.git"
+
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi
+          elif command -v amd-smi >/dev/null 2>&1; then
+            amd-smi list
+          else
+            echo "No ROCm GPU management command is available." >&2
+            exit 1
+          fi
+          EOF
+          chmod +x "${job_script}"
+
+          output_path="${probe_dir}/slurm-%j.out"
+          error_path="${probe_dir}/slurm-%j.err"
+          set +e
+          submit_output="$(
+            sbatch --parsable --wait \
+              --controller "${SPUR_CONTROLLER_ADDR}" \
+              --account "${SLURM_ACCOUNT}" \
+              --qos "${SLURM_QOS}" \
+              --nodes 1 \
+              --ntasks 1 \
+              --gpus-per-node 8 \
+              --exclusive \
+              --time 00:15:00 \
+              --chdir "${GITHUB_WORKSPACE}" \
+              --output "${output_path}" \
+              --error "${error_path}" \
+              "${job_script}"
+          )"
+          submit_status=$?
+          set -e
+
+          job_id="${submit_output%%;*}"
+          echo "job_id=${job_id}" >> "${GITHUB_OUTPUT}"
+          echo "Slurm submission output: ${submit_output}"
+          echo "Slurm submission exit status: ${submit_status}"
+
+          if [[ "${job_id}" =~ ^[0-9]+$ ]]; then
+            sacct --controller "${SPUR_CONTROLLER_ADDR}" \
+              --jobs "${job_id}" \
+              --format=JobID,State,ExitCode,NodeList \
+              --noheader || true
+            for log_path in \
+              "${probe_dir}/slurm-${job_id}.out" \
+              "${probe_dir}/slurm-${job_id}.err"; do
+              if [[ -f "${log_path}" ]]; then
+                echo "=== ${log_path##*/} ==="
+                cat "${log_path}"
+              fi
+            done
+          fi
+
+          exit "${submit_status}"
+
+      - name: Upload probe logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mi355-burst-probe-${{ steps.burst.outputs.job_id || github.run_id }}
+          path: ${{ runner.temp }}/mi355-burst-probe/
+          if-no-files-found: warn
