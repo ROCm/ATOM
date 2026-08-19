@@ -3376,7 +3376,13 @@ class DeepseekV4Attention(nn.Module):
             # (k_*_full for fp8, kv_full for bf16); off PCP it is this fwd's
             # tensor unchanged. On bf16 the wrapper reuses out=qkn.q_sa as the
             # attention output buffer (q_sa is not needed after this call →
-            # avoids an extra empty_like); fp8 ignores both q_sa and out.
+            # avoids an extra empty_like). On fp8 q_sa is None, so a non-mixed
+            # forward passes out=None and aiter allocates; a mixed forward
+            # passes its real slice and the kernel writes it in place. That
+            # last part only became true once the fp8 branch of
+            # `sparse_attn_v4_paged_prefill` started forwarding `out` — until
+            # then it silently dropped it and `_attn_core`'s tail copied the
+            # whole prefill half into the slice, once per layer.
             o = sparse_attn_v4_paged_prefill(
                 qkn.q_sa,
                 self.unified_kv,
@@ -3450,9 +3456,22 @@ class DeepseekV4Attention(nn.Module):
         # paths, so the positions travel downstream instead.
         res = o.reshape(num_tokens, -1)  # [num_tokens, n_local_heads*head_dim]
         if out is not None and res.data_ptr() != out.data_ptr():
-            # Only reached by the decode segment: its kernel has no `out=`, so it
-            # allocated its own buffer and the result has to be copied in. The
-            # prefill segment wrote `out` directly above and skips this.
+            # Fallback for a kernel that allocated its own buffer instead of
+            # writing the caller's. Legitimately the decode segment, whose
+            # kernel takes no `out=`; its 379-odd rows make the copy cheap.
+            #
+            # The prefill segment must NOT land here — it is ~97% of the rows,
+            # so the copy costs more than everything else the mixed split
+            # saves. It silently did, on fp8 kv-cache, because the fp8 branch
+            # of `sparse_attn_v4_paged_prefill` dropped `out`: 252 MiB per
+            # layer, 5.98 ms/step, 42% of mixed's per-step overhead. Nothing
+            # caught it — `_attn_core_mixed`'s pointer assert compares against
+            # what this function RETURNS, which is `out` either way.
+            #
+            # So: if a future kernel change makes the prefill segment fall
+            # through here again, this branch will absorb it silently too.
+            # A profile is the only thing that shows it (look for a
+            # per-layer `aten::copy_` inside `mixed_seg[prefill]`).
             out.copy_(res)
             return out
         return res
