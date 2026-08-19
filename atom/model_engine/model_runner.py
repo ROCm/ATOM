@@ -927,6 +927,11 @@ class ModelRunner:
             world_size = dp_size * pp_size * stage_span
             dp_rank = config.parallel_config.data_parallel_rank
             global_rank = (dp_rank * pp_size + pp_rank) * stage_span + rank
+            # No local_rank here, unlike the non-PP branch below. Safe only
+            # because PP is single-node today: CoreManager rejects multi-node
+            # DP when pp_size > 1, and asserts PP+DP out entirely, so
+            # global_rank is already the physical device index. Revisit if
+            # either restriction is lifted.
             init_pp_aware_dist_env(
                 tensor_model_parallel_size=config.tensor_parallel_size,
                 pipeline_model_parallel_size=pp_size,
@@ -943,6 +948,10 @@ class ModelRunner:
                 rankID=rank,
                 backend="nccl",
                 distributed_init_method=distributed_init_method,
+                # This node's physical device index. Without it aiter derives a
+                # local rank from the DP-scaled global rank, which overruns the
+                # device list on every node after the first.
+                local_rank=local_device_rank,
                 data_parallel_size=config.parallel_config.data_parallel_size,
                 data_parallel_rank=config.parallel_config.data_parallel_rank,
                 prefill_context_model_parallel_size=config.prefill_context_parallel_size,

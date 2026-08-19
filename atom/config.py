@@ -780,8 +780,11 @@ class ParallelConfig:
     data_parallel_size: int = 1
     """Number of data parallel groups. MoE layers will be sharded according to
     the product of the tensor parallel size and data parallel size."""
-    data_parallel_size_local: int = 1
-    """Number of local data parallel groups."""
+    data_parallel_size_local: int | None = None
+    """DP ranks this node runs. Defaults to data_parallel_size, i.e. the
+    single-node case where every global rank is local. Set it below the global
+    size to give a node one slice of a multi-node run; it also reaches MoRI as
+    `gpu_per_node` (see model_ops/moe.py), so it must describe real hardware."""
     data_parallel_rank: int = 0
     """Rank of the data parallel group."""
     data_parallel_rank_local: int | None = None
@@ -804,8 +807,6 @@ class ParallelConfig:
     for this EngineCore, separate from the request endpoint. Keeping the two
     apart leaves the request socket with a single writer thread, so admitting a
     request needs no synchronization. Populated by launch_engine_core."""
-    world_size: int = field(init=False)
-    """Vestigial: never assigned or read; engine_core derives worker count directly."""
     data_parallel_master_port: int = 29500
     """Port of the data parallel master."""
 
@@ -814,10 +815,20 @@ class ParallelConfig:
     data_parallel_master_ip: str = "127.0.0.1"
 
     @property
-    def world_size_across_dp(self) -> int:
-        """world_size_across_dp is TPxPPxDP, it is the size of the world
-        including data parallelism."""
-        return self.world_size * self.data_parallel_size
+    def is_multinode_dp(self) -> bool:
+        """Whether this node owns only part of the global DP group.
+
+        Inferred from the topology rather than a separate flag: either this
+        node runs fewer ranks than exist globally, or its slice starts at a
+        non-zero global rank.
+        """
+        # data_parallel_size_local is int | None in the declaration, but
+        # __post_init__ always resolves it before any caller can reach here.
+        assert self.data_parallel_size_local is not None
+        return (
+            self.data_parallel_size_local < self.data_parallel_size
+            or self.data_parallel_rank > 0
+        )
 
     def get_next_dp_init_port(self) -> int:
         """
@@ -871,6 +882,7 @@ class ParallelConfig:
         """
         factors: list[Any] = []
         factors.append(self.data_parallel_size)
+        factors.append(self.data_parallel_size_local)
         factors.append(self.data_parallel_rank)
         factors.append(self.data_parallel_rank_local)
         factors.append(self.data_parallel_master_ip)
@@ -892,6 +904,33 @@ class ParallelConfig:
             self.data_parallel_master_port = envs.ATOM_DP_MASTER_PORT
         if envs.is_set("ATOM_DP_BASE_PORT"):
             self.data_parallel_base_port = envs.ATOM_DP_BASE_PORT
+
+        if self.data_parallel_size < 1:
+            raise ValueError("data_parallel_size must be at least 1")
+
+        if envs.is_set("ATOM_DP_SIZE_LOCAL"):
+            self.data_parallel_size_local = envs.ATOM_DP_SIZE_LOCAL
+
+        # Default the local slice to the whole group: on one node every global
+        # rank is local, and that is the overwhelmingly common case.
+        if self.data_parallel_size_local is None:
+            self.data_parallel_size_local = self.data_parallel_size
+
+        if self.data_parallel_size_local < 1:
+            raise ValueError("data_parallel_size_local must be at least 1")
+        if self.data_parallel_rank < 0:
+            raise ValueError("data_parallel_rank must be non-negative")
+        if (
+            self.data_parallel_rank + self.data_parallel_size_local
+            > self.data_parallel_size
+        ):
+            raise ValueError(
+                f"data_parallel_rank ({self.data_parallel_rank}) + "
+                f"data_parallel_size_local ({self.data_parallel_size_local}) "
+                f"must not exceed data_parallel_size "
+                f"({self.data_parallel_size}): this node's slice would run off "
+                f"the end of the global DP group"
+            )
 
 
 _DSPARK_DEFAULT_MAX_BLOCK = 16
