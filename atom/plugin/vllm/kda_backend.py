@@ -17,11 +17,10 @@ from vllm.v1.attention.backends.utils import (
     mamba_get_block_table_tensor,
 )
 
-# ATOM's own KDA metadata names a separate slot to READ the incoming state
-# from, for the one forward where a prefix-cache hit forks off a checkpoint.
-# vLLM's block manager has no such fork -- its block table already names the
-# slot for both -- but the shared Kimi-K3 KDA forward reads the attribute
-# unconditionally, and None is what tells it to stay on the write slot.
+# ATOM's own KDA metadata names a separate slot to READ the incoming state from,
+# for the one forward where a prefix-cache hit forks off a checkpoint. vLLM's
+# block manager has no such fork, and None tells the shared Kimi-K3 KDA forward
+# (which reads this unconditionally) to stay on the write slot.
 KimiK3KDAMetadata.non_spec_state_indices_in_tensor = None
 
 

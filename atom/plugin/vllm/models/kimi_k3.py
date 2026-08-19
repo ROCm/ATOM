@@ -19,11 +19,12 @@ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
 from atom.models import kimi_k3 as kimi_k3_base
 from atom.models.kimi_k3 import (
-    KimiK3ForCausalLM as KimiK3ForCausalLMBase,
-)
-from atom.models.kimi_k3 import (
+    KimiDecoderLayer,
     KimiKDAAttention,
     _normalize_kimi_config,
+)
+from atom.models.kimi_k3 import (
+    KimiK3ForCausalLM as KimiK3ForCausalLMBase,
 )
 from atom.models.utils import IntermediateTensors
 from atom.plugin.vllm.kda_backend import AtomKimiK3KDAAttentionBackend
@@ -129,23 +130,22 @@ class KimiKDAAttentionVllm(KimiKDAAttention, MambaBase):
 
         The native layer takes one branch per call -- prefill, decode, or
         speculative decode -- and writes only that class's rows into an
-        uninitialized output. Its own runtime batches by class, so a single
-        branch always covers everything; vLLM's continuous batching does not.
-        It never mixes plain and speculative decodes (it folds the former into
-        the prefill counts), but a request still prefilling while another
-        drafts is routine, and there the speculative rows would come back as
-        whatever the allocator last left there.
+        uninitialized output, which suffices for a runtime that batches by class.
+        Under vLLM's continuous batching a request prefilling while another
+        drafts is routine, and the speculative rows would come back as whatever
+        the allocator last left behind.
 
-        The builder already splits every per-class input -- token indices,
-        zero-based ``query_start_loc``, state indices -- so each class runs as
-        if it were the whole batch and the rows are scattered back afterwards.
+        The builder splits every per-class input (token indices, zero-based
+        ``query_start_loc``, state indices), so each class runs as if it were the
+        whole batch and the rows are scattered back afterwards.
         """
         mixed = kda_metadata.num_spec_decodes > 0 and (
             kda_metadata.num_prefills > 0 or kda_metadata.num_decodes > 0
         )
         if not mixed:
-            self._atom_metadata.kda_metadata = kda_metadata
-            return super()._forward_impl(hidden_states, hidden_states_scale)
+            return self._forward_one_segment(
+                hidden_states, hidden_states_scale, kda_metadata
+            )
 
         spec_indx = kda_metadata.spec_token_indx
         non_spec_indx = kda_metadata.non_spec_token_indx
@@ -201,10 +201,9 @@ class KimiKDAAttentionVllm(KimiKDAAttention, MambaBase):
     ) -> torch.Tensor:
         """``cu_seqlens`` for a decode-only segment: one token per request.
 
-        vLLM leaves ``non_spec_query_start_loc`` unset when the non-spec half of
-        a mixed batch is decode-only, because its own packed-decode kernel takes
-        no cumulative lengths -- ATOM's fused recurrence does. Allocated once at
-        scheduler capacity and only ever sliced, so a captured graph keeps
+        vLLM leaves ``non_spec_query_start_loc`` unset there, its packed-decode
+        kernel taking no cumulative lengths where ATOM's fused recurrence does.
+        Allocated at scheduler capacity and only sliced, so a captured graph keeps
         pointing at the same memory.
         """
         if self._packed_start_loc is None:
@@ -279,36 +278,26 @@ def _k3_residual_stream(
     hidden_states: torch.Tensor,
     pending_add: torch.Tensor | None,
     pending_add2: torch.Tensor | None,
+    block_residual: torch.Tensor | None,
 ) -> torch.Tensor:
-    """The plain residual stream at a layer boundary.
-
-    A Kimi-K3 layer hands its FFN output back unapplied, and an MoE layer hands
-    its shared-expert output back separately again, so the next layer's attn_res
-    kernel can fold both into its on-load. The residual stream a drafter is
-    trained on is the sum, which is how the native layer's
-    ``aux_hidden_state()`` and the native pipeline-parallel tail both
-    reconstruct it. Each addend is None on a layer that already folded it in.
-    """
-    if pending_add is not None:
-        hidden_states = hidden_states + pending_add
-    if pending_add2 is not None:
-        hidden_states = hidden_states + pending_add2
-    return hidden_states
+    """The plain residual stream at a layer boundary, reconstructed by the layer
+    itself -- its return protocol defines which tensors are deferred addends."""
+    return KimiDecoderLayer.aux_hidden_state(
+        (hidden_states, pending_add, pending_add2, block_residual)
+    )
 
 
 class KimiLinearModelVllm(kimi_k3_base.KimiLinearModel):
     """Native Kimi-K3 body that can also emit Eagle3/DSpark auxiliary states.
 
-    The DSpark draft is trained on five of the target's layer outputs. They are
-    collected inline in the layer loop, into a local list, the way every ATOM
-    and vLLM target that feeds a drafter does it. Collecting them from wrapped
-    layer ``forward``s instead splits this function across a Dynamo graph
-    break, and ATOM's compile backend accepts exactly one graph.
+    Collected inline in the layer loop: tapping wrapped layer ``forward``s splits
+    this function across a Dynamo graph break, and ATOM's compile backend accepts
+    exactly one graph.
 
     ``aux_hidden_state_layers`` indexes the residual stream, not the layers:
     entry ``i`` is the stream entering layer ``i``, i.e. the reference model's
-    ``output.hidden_states[i]``. vLLM resolves the draft's ``target_layer_ids``
-    into that space by adding one before handing them over.
+    ``output.hidden_states[i]``. vLLM adds one to the draft's
+    ``target_layer_ids`` before handing them over.
     """
 
     def __init__(self, *args, **kwargs):
@@ -326,9 +315,8 @@ class KimiLinearModelVllm(kimi_k3_base.KimiLinearModel):
         inputs_embeds: torch.Tensor | None = None,
     ):
         # The signature must stay explicit: ATOM's compile decorator marks the
-        # dynamic token dimension by binding these argument names, and a
-        # *args/**kwargs override would silently compile the model at a single
-        # static shape.
+        # dynamic token dimension by binding these argument names, so a
+        # *args/**kwargs override would compile at a single static shape.
         if not self.aux_hidden_state_layers:
             return super().forward(
                 input_ids, positions, intermediate_tensors, inputs_embeds
@@ -357,7 +345,9 @@ class KimiLinearModelVllm(kimi_k3_base.KimiLinearModel):
         for idx in range(self.start_layer, self.end_layer):
             if idx in self.aux_hidden_state_layers:
                 aux_hidden_states.append(
-                    _k3_residual_stream(hidden_states, pending_add, pending_add2)
+                    _k3_residual_stream(
+                        hidden_states, pending_add, pending_add2, block_residual
+                    )
                 )
             hidden_states, pending_add, pending_add2, block_residual = self.layers[idx](
                 positions,
@@ -369,7 +359,7 @@ class KimiLinearModelVllm(kimi_k3_base.KimiLinearModel):
 
         if not get_pp_group().is_last_rank:
             hidden_states = _k3_residual_stream(
-                hidden_states, pending_add, pending_add2
+                hidden_states, pending_add, pending_add2, block_residual
             )
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "block_residual": block_residual}
@@ -377,7 +367,9 @@ class KimiLinearModelVllm(kimi_k3_base.KimiLinearModel):
 
         if self.end_layer in self.aux_hidden_state_layers:
             aux_hidden_states.append(
-                _k3_residual_stream(hidden_states, pending_add, pending_add2)
+                _k3_residual_stream(
+                    hidden_states, pending_add, pending_add2, block_residual
+                )
             )
         hidden_states, _ = self.output_attn_res(
             hidden_states, block_residual, pending_add, pending_add2
@@ -401,11 +393,7 @@ class KimiK3ForCausalLM(KimiK3ForCausalLMBase):
         self.language_model.model.set_aux_hidden_state_layers(layers)
 
     def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
-        """Fallback only; the DSpark checkpoint names its own target layers.
-
-        ATOM's server-mode name: ATOMModelBase re-exposes it to vLLM as
-        ``get_eagle3_default_aux_hidden_state_layers``.
-        """
+        """Fallback only; a DSpark checkpoint names its own target layers."""
         num_layers = len(self.language_model.model.layers)
         return (2, num_layers // 2, num_layers - 3)
 
@@ -417,10 +405,7 @@ class KimiK3ForCausalLMVllm(ATOMMoEForCausalLM, IsHybrid):
         DSpark's loader binds the target's embedding and head into the draft
         through this hook; Kimi-K3 keeps both one level in, under
         ``language_model``, so without it the loader would look for them on this
-        wrapper and silently leave the draft with neither. Declared here rather
-        than inherited from the multimodal wrapper because this class is
-        text-only, and callers that unwrap MoE or multimodal targets gate on
-        ``SupportsMultiModal`` before consulting this.
+        wrapper and silently leave the draft with neither.
         """
         return self.model.language_model
 

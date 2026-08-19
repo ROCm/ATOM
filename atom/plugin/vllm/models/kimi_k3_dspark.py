@@ -1,12 +1,9 @@
 """vLLM-specific Kimi-K3 DSpark draft.
 
-Two layers of adaptation, kept out of the native model:
-
-* :class:`KimiK3DSparkDraft` adds the plain backbone pass vLLM's speculator
-  calls. The native module only exposes ``forward_spec``, which also builds the
-  block and samples it -- work vLLM does itself, in its own buffers.
-* :class:`KimiK3DSparkVllm` is what vLLM instantiates, and translates the
-  speculator's drafting contract onto that module.
+:class:`KimiK3DSparkDraft` adds the plain backbone pass vLLM's speculator calls,
+which the native module has no use for (its ``forward_spec`` also builds and
+samples the block -- work vLLM does itself, in its own buffers).
+:class:`KimiK3DSparkVllm` translates the drafting contract onto that module.
 """
 
 import torch
@@ -25,9 +22,8 @@ class KimiK3DSparkDraft(KimiK3DSparkBase):
     ) -> torch.Tensor:
         """One parallel pass over the draft block.
 
-        vLLM has already laid the block out as ``[anchor, MASK, ...]`` in its
-        own input buffer, so this neither seeds the block nor samples it -- the
-        speculator's Markov loop runs over the hidden states returned here.
+        vLLM lays the block out as ``[anchor, MASK, ...]`` in its own input
+        buffer, and its Markov loop samples from the hidden states returned here.
         """
         hidden_states = (
             inputs_embeds if inputs_embeds is not None else self.embed_tokens(input_ids)
@@ -45,14 +41,11 @@ class KimiK3DSparkDraft(KimiK3DSparkBase):
         """Scatter the target-derived context rows into every draft layer.
 
         Unlike the native ``write_context_kv`` this does not project first: vLLM
-        combines the aux hidden states in a separate step (so it can stage them
-        in a persistent buffer) and hands the result straight here. Slots may
-        differ per layer when the draft spans several KV cache groups.
-
-        This enters at the attention module rather than at the decoder layer:
-        the layer-level entry point reads its slots off ATOM's native forward
-        context, which does not exist under vLLM. Skipping it changes nothing
-        else -- the context rows bypass ``input_layernorm`` either way.
+        combines the aux hidden states in a separate step. Slots may differ per
+        layer when the draft spans several KV cache groups. Enters at the
+        attention module because the decoder layer's entry point reads its slots
+        off ATOM's native forward context; the rows bypass ``input_layernorm``
+        either way.
         """
         per_layer_slots = isinstance(slot_mappings, (list, tuple))
         for i, layer in enumerate(self.layers):
@@ -114,11 +107,8 @@ class KimiK3DSparkVllm(ATOMForCausalLM):
     ) -> torch.Tensor:
         """Greedy next id per request, without materializing the [B, V] bias.
 
-        The pair above is what vLLM's sequential loop calls; this collapses both
-        of them plus the add and the argmax into one step. Only reachable from
-        the greedy branch, and only when
-        ``spec_decode_patch._patch_dspark_fused_markov_sample`` installed itself
-        -- probabilistic drafting needs the real logits and keeps ``markov_bias``.
+        Collapses the pair above plus the add and the argmax. Only reachable once
+        ``spec_decode_patch._patch_dspark_fused_markov_sample`` installed itself.
         """
         return self.model.markov_head.sample_next(token_ids, base_logits)[0]
 

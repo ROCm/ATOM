@@ -73,31 +73,17 @@ def _patch_eagle3_model_type_checks() -> None:
 def _patch_dspark_fused_markov_sample() -> None:
     """Sample the DSpark block with the fused Markov bias+argmax kernel.
 
-    vLLM's ``_sample_sequential`` spells each block position as
-    ``argmax(base_logits[:, i] + markov_bias(markov_embed(prev)))``, which per
-    position casts the whole ``[V, r]`` W2 table to fp32, materializes a
-    ``[B, V]`` fp32 bias and a ``[B, V]`` fp32 sum, and reads the sum back --
-    ~566MB of traffic at B=64, V=163840, all so an argmax can pick one id.
-    ``model.markov_argmax`` does the same thing in one fused kernel plus a tiny
-    cross-tile reduce (~106MB), with W2 left bf16 and no ``[B, V]`` tensor.
+    Upstream spells each position as ``argmax(base_logits[:, i] +
+    markov_bias(markov_embed(prev)))``, casting the ``[V, r]`` W2 table to fp32
+    and materializing a ``[B, V]`` bias and sum per position: ~566MB of traffic
+    at B=64, V=163840 to pick one id. ``markov_argmax`` fuses that into one
+    kernel plus a small cross-tile reduce (~106MB), W2 left bf16.
 
-    Only the greedy branch. The probabilistic branch feeds ``gumbel_sample``,
-    which both samples from the logits and writes the processed logits out for
-    the target's rejection sampler, so it needs them materialized -- it is
-    delegated to upstream's loop verbatim rather than reimplemented here, which
-    also keeps that path from drifting as vLLM changes it.
+    Greedy only -- the probabilistic branch writes its processed logits out for
+    the target's rejection sampler, so it needs them materialized.
 
-    Gated because the bias GEMV moves from an fp32 matmul to bf16 MFMA with an
-    fp32 accumulator: equal up to accumulation order, not bit-identical. The
-    gate is read here, at plugin-load time, so a disabled gate leaves vLLM's
-    method untouched rather than adding a per-position branch to it.
-
-    Capture-safe: the loop keeps upstream's shape and buffer discipline (fixed
-    persistent index buffers, ``num_reqs`` a host int baked into each captured
-    graph), and the op itself has host-int grids, no ``.item()`` and no
-    data-dependent shapes. Plugin patches are installed from the
-    ``vllm.general_plugins`` entry point, which runs in worker init -- before
-    the draft model is loaded and long before graph capture.
+    Gated because the bias GEMV moves from fp32 matmul to bf16 MFMA with an fp32
+    accumulator: equal up to accumulation order, not bit-identical.
     """
     if not envs.ATOM_DSPARK_FUSED_MARKOV_SAMPLE:
         return

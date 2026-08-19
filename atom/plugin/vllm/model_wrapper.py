@@ -421,11 +421,11 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             self.atom_config.hf_config = main_atom_config.hf_config
         elif self._is_standalone_draft:
             self.atom_config = _generate_atom_config_from_vllm_config(vllm_config)
-            # Prefer ATOM's normalized copy of the draft config. Building the
-            # atom_config already ran `hf_config_override` on a deepcopy, which
-            # is what maps a standalone draft's checkpoint field names onto the
-            # canonical ones the ATOM model reads (e.g. DSpark's `mask_token_id`
-            # -> `dspark_noise_token_id`). vLLM's own copy never sees that.
+            # Prefer ATOM's normalized copy: building the atom_config ran
+            # `hf_config_override`, which maps a standalone draft's checkpoint
+            # field names onto the canonical ones the ATOM model reads (e.g.
+            # DSpark's `mask_token_id` -> `dspark_noise_token_id`). vLLM's own
+            # copy never sees that.
             atom_spec_config = getattr(self.atom_config, "speculative_config", None)
             normalized_hf_config = getattr(
                 atom_spec_config, "draft_model_hf_config", None
@@ -766,8 +766,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
 
         Exposed under its public name only on MTP targets (see `__init__`):
         vLLM decides whether to override the drafter's input by testing for the
-        attribute alone, and would feed the result to any speculator that has
-        it, including ones with no MTP residual to hand over.
+        attribute alone, so any speculator carrying it would be fed this.
         """
         # Prefer the persistent in-graph residual buffer on the native V4 model.
         # It is refreshed by a captured `copy_` every forward (including FULL
@@ -1060,8 +1059,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                 )
         if self._is_standalone_draft:
             # EAGLE3 and DSpark drafts are their own checkpoints, so the loader
-            # needs both the draft hf_config and the draft checkpoint path;
-            # otherwise it would read the target's weights and match nothing.
+            # needs both the draft hf_config and the draft checkpoint path.
             spec_config = getattr(self.vllm_config, "speculative_config", None)
             draft_model_config = getattr(spec_config, "draft_model_config", None)
             if draft_model_config is not None:
