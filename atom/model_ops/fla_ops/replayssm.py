@@ -237,6 +237,14 @@ def _replayssm_commit_kernel(
     if slot < 0:
         return
     h = tl.load(write_pos + slot)
+    # -1 is the prefill sentinel: that forward rebuilt the checkpoint wholesale
+    # and wrote no records, so there is nothing to commit and the first decode
+    # has to start from an empty prefix.  Advancing by the 1 that `num_bonus ==
+    # 0` yields would fold record 0, which on a reused slot is still the
+    # previous tenant's last record.
+    if h < 0:
+        tl.store(write_pos + slot, 0)
+        return
     # Re-derive the previous forward's flush decision.  The forward never
     # mutates write_pos, so `h` here is exactly what that forward branched on.
     prev_flushed = h + 2 * T_MAX > CAP
@@ -329,6 +337,12 @@ def _replayssm_fwd_kernel(
         return
 
     h = tl.load(write_pos + slot).to(tl.int32)
+    # Clamp the prefill sentinel.  In the normal order the commit kernel has
+    # already turned -1 into 0, but graph capture wires the buffers up and
+    # replays dummy batches without committing; folding nothing and writing
+    # from 0 is both the right answer and what keeps `base` off -1, which would
+    # index a record row outside this slot.
+    h = tl.maximum(h, 0)
     do_flush = h + 2 * T_MAX > CAP
     base = tl.where(do_flush, 0, h).to(tl.int64)
 
@@ -522,6 +536,12 @@ def _replayssm_ut_fwd_kernel(
         return
 
     h = tl.load(write_pos + slot).to(tl.int32)
+    # Clamp the prefill sentinel.  In the normal order the commit kernel has
+    # already turned -1 into 0, but graph capture wires the buffers up and
+    # replays dummy batches without committing; folding nothing and writing
+    # from 0 is both the right answer and what keeps `base` off -1, which would
+    # index a record row outside this slot.
+    h = tl.maximum(h, 0)
     do_flush = h + 2 * T_MAX > CAP
     base = tl.where(do_flush, 0, h).to(tl.int64)
 
@@ -913,6 +933,12 @@ def _replayssm_kda_fwd_kernel(
         return
 
     h = tl.load(write_pos + slot).to(tl.int32)
+    # Clamp the prefill sentinel.  In the normal order the commit kernel has
+    # already turned -1 into 0, but graph capture wires the buffers up and
+    # replays dummy batches without committing; folding nothing and writing
+    # from 0 is both the right answer and what keeps `base` off -1, which would
+    # index a record row outside this slot.
+    h = tl.maximum(h, 0)
     do_flush = h + 2 * T_MAX > CAP
     base = tl.where(do_flush, 0, h).to(tl.int64)
 

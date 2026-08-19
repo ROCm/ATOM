@@ -817,16 +817,36 @@ class GDNStateMixin:
         move whatever mechanism the class uses to checkpoint. A backend
         declaring `StateTransfer.fork` therefore still owes this method.
 
+        Under ReplaySSM the records and the cursor travel with the slot. They
+        are not an accelerator for the state, they are part of it: the
+        checkpoint alone only describes the sequence up to the last flush, and
+        a slot relocated without them resumes against whatever the destination
+        slot's previous tenant left behind.
+
         Both caches are layer-major with the slot as the second axis, so one
         slot's rows are strided rather than contiguous and there is no single
         range to copy. `_foreach_copy_` keeps it to one launch for the batch.
+        The cursor is the exception — one entry per slot, no layer axis.
         """
-        caches = (self.model_runner.mamba_k_cache, self.model_runner.mamba_v_cache)
+        caches = [self.model_runner.mamba_k_cache, self.model_runner.mamba_v_cache]
+        cursor = None
+        if self.replayssm:
+            caches += [
+                self.model_runner.replayssm_buf_k,
+                self.model_runner.replayssm_buf_u,
+                self.model_runner.replayssm_buf_g,
+            ]
+            # One entry per slot, no layer axis -- moved alongside, not with
+            # the layer-major caches above.
+            cursor = self.model_runner.replayssm_write_pos
         destinations, sources = [], []
         for src, dst in pairs:
             for cache in caches:
                 destinations.append(cache[:, dst])
                 sources.append(cache[:, src])
+            if cursor is not None:
+                destinations.append(cursor[dst : dst + 1])
+                sources.append(cursor[src : src + 1])
         if destinations:
             torch._foreach_copy_(destinations, sources)
 
@@ -1104,10 +1124,20 @@ class GDNStateMixin:
 
         if is_prefill:
             # A prefill (re)initialises the checkpoint wholesale via
-            # `chunk_gated_delta_rule`, so any records left over from a prior
-            # tenant of this slot are stale.  Zeroing the cursor here is also
-            # what makes slot reuse safe without a block-manager hook.
-            write_pos.index_fill_(0, slot_idx.to(torch.int64), 0)
+            # `chunk_gated_delta_rule` and writes NO records, so the next
+            # forward must fold none.  Parking the cursor at -1 rather than 0
+            # is what says that: `num_bonus` is 0 on the first decode after a
+            # prefill, so the commit below would otherwise advance 0 -> 1 and
+            # fold record 0 -- which this generation never wrote, and which on
+            # a reused slot still holds the previous tenant's.  The sentinel is
+            # also what makes slot reuse safe without a block-manager hook.
+            # Drop any PAD before indexing. `per_req_cache_groups` is filtered
+            # to non-negative groups, so it can be shorter than `num_reqs` and
+            # leave stale tail entries in the slice -- and a stale tail from a
+            # decode step is PAD_SLOT_ID. index_fill_ would read that as "from
+            # the end" and park a live, unrelated slot's cursor.
+            live = slot_idx[slot_idx >= 0].to(torch.int64)
+            write_pos.index_fill_(0, live, -1)
             return
 
         # Decode: apply the PREVIOUS step's accepted counts.  For non-spec
