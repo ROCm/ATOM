@@ -92,7 +92,7 @@ def _swa_ring_ids(seq) -> list[int]:
     any SWA regions at all, which only the connector knows -- see the guard at
     the transfer site.
     """
-    slot = getattr(seq, "per_req_cache_group", -1)
+    slot = getattr(seq, "state_slot", -1)
     return [int(slot)] if slot is not None and slot >= 0 else []
 
 
@@ -370,7 +370,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
                 self.transfer_id_to_request_id[transfer_id] = seq.id
                 self.request_id_to_transfer_id[seq.id] = transfer_id
 
-        slot_index = getattr(seq, "per_req_cache_group", -1)
+        slot_index = getattr(seq, "state_slot", -1)
 
         # Consumer side: queue for remote KV loading
         if params.get("do_remote_prefill"):
@@ -426,7 +426,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             "transfer_id": seq.id,
             "first_token_id": first_token_id,
             "draft_token_ids": draft_token_ids,
-            "local_slot_index": getattr(seq, "per_req_cache_group", -1),
+            "local_slot_index": getattr(seq, "state_slot", -1),
             "prefix_cache_hit_tokens": getattr(seq, "prefix_cache_hit_tokens", 0),
         }
 

@@ -1960,7 +1960,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             int(getattr(seq, "num_cached_tokens", -1)),
         )
         pending_slot = self._pending_slot_loads.get(sid)
-        destination_group = getattr(seq, "per_req_cache_group", -1)
+        destination_group = getattr(seq, "state_slot", -1)
         if pending_slot is not None and (
             not isinstance(destination_group, int) or destination_group < 0
         ):
@@ -2037,7 +2037,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         computed: int,
     ) -> tuple[int, int] | None:
         sid = str(seq.id)
-        source_group = getattr(seq, "per_req_cache_group", -1)
+        source_group = getattr(seq, "state_slot", -1)
         if (
             not bool(getattr(seq, "_state_initialized_after_alloc", False))
             or not isinstance(source_group, int)
@@ -2062,7 +2062,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         start: int,
         end: int,
     ) -> tuple[int, int] | None:
-        source_group = getattr(seq, "per_req_cache_group", -1)
+        source_group = getattr(seq, "state_slot", -1)
         if (
             not bool(getattr(seq, "_state_initialized_after_alloc", False))
             or not isinstance(source_group, int)
@@ -2211,7 +2211,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             slot_load_spec = None
             if bool(getattr(seq, "has_per_req_cache", False)):
                 pending_slot = self._pending_slot_loads.get(sid)
-                destination_group = getattr(seq, "per_req_cache_group", -1)
+                destination_group = getattr(seq, "state_slot", -1)
                 if (
                     pending_slot is None
                     or not isinstance(destination_group, int)
@@ -2306,7 +2306,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
                 slot_save_spec = SlotSaveSpec(
                     boundary_tokens=boundary,
                     boundary_block_hash=boundary_hash,
-                    source_group=int(seq.per_req_cache_group),
+                    source_group=int(seq.state_slot),
                 )
             token_end = max(
                 aligned if page_save_due else 0,
