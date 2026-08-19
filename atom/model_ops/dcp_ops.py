@@ -60,6 +60,23 @@ def dcp_all_gather(cp_group, x: torch.Tensor, dim: int) -> torch.Tensor:
     return device_comm.all_gather(x.view(view_dtype), dim).view(x.dtype)
 
 
+def dcp_all_gather_query_heads(cp_group, q: torch.Tensor) -> torch.Tensor:
+    """AllGather decode Q ``[tokens, heads, head_dim]`` over the DCP group's heads.
+
+    Flattened to 2-D so the gather lands on the last dim. aiter's custom
+    collective only serves dim 0 and the last dim, and its last-dim variant
+    concatenates rank-major -- which for a ``[tokens, heads*head_dim]`` view
+    is exactly head-dim concat. Gathering the 3-D tensor on dim=1 instead
+    both misses the custom kernel and makes the pynccl path materialise an
+    extra reshape copy of the gathered result.
+    """
+    tokens, _, head_dim = q.shape
+    if not q.is_contiguous():
+        return cp_group.all_gather(q, dim=1)
+    gathered = dcp_all_gather(cp_group, q.reshape(tokens, -1), -1)
+    return gathered.view(tokens, -1, head_dim)
+
+
 class CPTritonContext:
     """Cache compiled Triton kernel to avoid recompilation on every call."""
 

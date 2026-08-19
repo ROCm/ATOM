@@ -533,34 +533,35 @@ class DSparkProposer(Drafter):
             # Each request's KV spans [0, anchor] (context) ++ the T block rows.
             ctx_lens = self._blk_ctx_lens[:bs]  # stable
             global_lens = anchor_positions + (1 + T)
-            w = self.dcp_world_size
-            if w > 1:
+            if self.dcp_world_size > 1:
                 # DCP shards KV token-wise round-robin, so one block table entry
-                # covers block_size*w GLOBAL tokens and rank r holds only the
-                # positions p with p % w == r, packed densely into its page.
-                # Rows this rank does not own are written to -1 (dropped).
-                virtual_block = block_size * w
+                # covers block_size*dcp_world_size GLOBAL tokens and rank r holds
+                # only the positions p with p % dcp_world_size == r, packed
+                # densely into its page. Rows this rank does not own are written
+                # to -1 (dropped).
+                virtual_block = block_size * self.dcp_world_size
                 page_idx = torch.div(
                     block_positions, virtual_block, rounding_mode="floor"
                 )
                 local_off = torch.div(
                     torch.remainder(block_positions, virtual_block),
-                    w,
+                    self.dcp_world_size,
                     rounding_mode="floor",
                 )
                 slots.copy_(
                     torch.where(
-                        torch.remainder(block_positions, w) == self.dcp_rank,
+                        torch.remainder(block_positions, self.dcp_world_size)
+                        == self.dcp_rank,
                         torch.gather(block_tables, 1, page_idx) * block_size
                         + local_off,
                         -1,
                     )
                 )
-                # Of L global tokens this rank stores ceil((L - r) / w).
+                # Of L global tokens this rank stores ceil((L - r) / dcp_world_size).
                 ctx_lens.copy_(
                     torch.div(
-                        global_lens + (w - 1 - self.dcp_rank),
-                        w,
+                        global_lens + (self.dcp_world_size - 1 - self.dcp_rank),
+                        self.dcp_world_size,
                         rounding_mode="floor",
                     )
                 )
@@ -586,14 +587,15 @@ class DSparkProposer(Drafter):
             # integers to int64, so land it through copy_ rather than out=.
             kv_indptr[1:].copy_(torch.cumsum(ctx_lens, dim=0))
             # The generator walks block_tables row by row up to this bound, and
-            # under DCP those rows are LOCAL: one entry covers block_size*w global
-            # tokens. max_seqlen_k stays global (prepare_decode keeps it that way
-            # too), so handing it over unscaled would run the generator w times
-            # past each row's valid entries and emit slots from unmapped pages.
-            # Overestimating is fine -- kv_indptr caps the real per-seq count.
+            # under DCP those rows are LOCAL: one entry covers
+            # block_size*dcp_world_size global tokens. max_seqlen_k stays global
+            # (prepare_decode keeps it that way too), so handing it over unscaled
+            # would run the generator dcp_world_size times past each row's valid
+            # entries and emit slots from unmapped pages. Overestimating is fine
+            # -- kv_indptr caps the real per-seq count.
             index_max_k = (
-                attn_metadata.max_seqlen_k // w + 1
-                if w > 1
+                attn_metadata.max_seqlen_k // self.dcp_world_size + 1
+                if self.dcp_world_size > 1
                 else attn_metadata.max_seqlen_k
             )
             kv_indices_generate_triton(

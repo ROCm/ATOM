@@ -517,24 +517,6 @@ class MLAAttention(nn.Module):
                 self.dcp_kernel_num_heads - self.num_heads * self.dcp_world_size
             )
 
-    def _dcp_all_gather_query_heads(self, q: torch.Tensor) -> torch.Tensor:
-        """AllGather Q across the DCP group along the head dim.
-
-        Flattened to 2-D so the gather lands on the last dim. aiter's custom
-        collective only serves dim 0 and the last dim, and its last-dim variant
-        concatenates rank-major -- which for a ``[tokens, heads*head_dim]`` view
-        is exactly head-dim concat. Gathering the 3-D tensor on dim=1 instead
-        both misses the custom kernel and makes the pynccl path materialise an
-        extra reshape copy of the gathered result.
-        """
-        tokens, _, head_dim = q.shape
-        if not q.is_contiguous():
-            return self.dcp_group.all_gather(q, dim=1)
-        from atom.model_ops.dcp_ops import dcp_all_gather
-
-        gathered = dcp_all_gather(self.dcp_group, q.reshape(tokens, -1), -1)
-        return gathered.view(tokens, -1, head_dim)
-
     def _pad_decode_query_heads(self, q: torch.Tensor) -> torch.Tensor:
         """Head padding for the decode kernel. Under DCP q arrives already
         gathered across the DCP group, so it is that width -- not the per-rank
@@ -2017,12 +1999,15 @@ class MLAAttention(nn.Module):
             elif self.dcp_world_size > 1:
                 # DCP decode: AllGather Q on the head dim, decode locally with LSE,
                 # then combine partial outputs across ranks (AG LSE + correct + RS).
-                from atom.model_ops.dcp_ops import cp_lse_ag_out_rs
+                from atom.model_ops.dcp_ops import (
+                    cp_lse_ag_out_rs,
+                    dcp_all_gather_query_heads,
+                )
 
                 # Only real heads cross the wire and enter the combine; the pad the
                 # kernel width needs lives inside _forward_decode (see
                 # dcp_kernel_num_heads).
-                q_out = self._dcp_all_gather_query_heads(q_out)
+                q_out = dcp_all_gather_query_heads(self.dcp_group, q_out)
                 o, lse = self._forward_decode(
                     q_out, kv_cache, attn_metadata, return_lse=True
                 )
