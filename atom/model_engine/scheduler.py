@@ -925,7 +925,12 @@ class Scheduler:
         # this check, busy_loop's `is_finished()` short-circuits to True
         # before EngineCore drains `_rejected` via take_rejected(), and
         # llm.generate() blocks forever.
-        return not self.waiting and not self.running and not self._rejected
+        return (
+            not self.waiting
+            and not self.running
+            and not self._rejected
+            and not self.deferred_free_blocks
+        )
 
     def add(self, seq: Sequence):
         self._warn_if_unschedulable(seq)
@@ -935,6 +940,33 @@ class Scheduler:
         for seq in seqs:
             self._warn_if_unschedulable(seq)
         self.waiting.extend(seqs)
+
+    def _deferred_sequence(self, req_id) -> Sequence | None:
+        seq = self.deferred_free_blocks.get(req_id)
+        if seq is not None:
+            return seq
+        try:
+            return self.deferred_free_blocks.get(int(req_id))
+        except (TypeError, ValueError):
+            return None
+
+    def _connector_should_defer_free(self, seq: Sequence) -> bool:
+        callback = getattr(self.kv_connector, "should_defer_free", None)
+        return bool(callable(callback) and callback(seq))
+
+    def _maybe_release_deferred(self, seq: Sequence) -> None:
+        if (
+            seq.id not in self.deferred_free_blocks
+            or getattr(seq, "_awaiting_aborted_load_cleanup", False)
+            or self._connector_should_defer_free(seq)
+        ):
+            return
+
+        callback = getattr(self.kv_connector, "request_finished", None)
+        if callable(callback):
+            callback(seq)
+        self.deferred_free_blocks.pop(seq.id, None)
+        self.block_manager.deallocate(seq)
 
     def _unschedulable_reason(self, seq: Sequence) -> str | None:
         """Return a human-readable reason if `seq` is permanently unschedulable.
@@ -1143,10 +1175,7 @@ class Scheduler:
             # promotion below, which would overwrite ABORTED with RUNNING and
             # lose the abort intent.
             if seq.status == SequenceStatus.ABORTED:
-                self._uncount_inflight_load(seq)
-                seq.status = SequenceStatus.FINISHED
-                seq.leave_reason = "aborted"
-                self._rejected.append(seq)
+                self._reject_aborted_waiting(seq)
                 continue
 
             # Drop seqs the static-capacity check at submit-time flagged as
@@ -1412,13 +1441,20 @@ class Scheduler:
             if _pp_block and seq.id in _pp_block:
                 skipped_pp_inflight.append(seq)
                 continue
+            blocked_by_pinned_save = False
+            preempted_current = False
             while not self.block_manager.can_append(seq, num_new_tokens):
-                if self.running:
-                    self.preempt(self.running.pop())
-                else:
-                    self.preempt(seq)
+                if self._preempt_one_running():
+                    continue
+                if self.preempt(seq):
+                    preempted_current = True
                     break
-            else:
+                self.running.appendleft(seq)
+                blocked_by_pinned_save = True
+                break
+            if blocked_by_pinned_save:
+                break
+            if not preempted_current:
                 if seq.spec_token_ids.size > 0:
                     scheduled_spec_decode_tokens[seq.id] = seq.spec_token_ids
                 num_seqs_decode += 1
@@ -1550,8 +1586,6 @@ class Scheduler:
         if not self._pop_req_id(self.failed_recving_kv_req_ids, seq.id):
             return False
 
-        if self.kv_connector is not None and hasattr(self.kv_connector, "load_failed"):
-            self.kv_connector.load_failed(seq.id)
         seq.status = SequenceStatus.WAITING
         if not self._connector_flag("is_offload"):
             self._uncount_inflight_load(seq)
@@ -1559,6 +1593,41 @@ class Scheduler:
         seq.offload_loaded_tokens = seq.num_cached_tokens
         seq.offload_load_start_tokens = None
         seq.offload_load_failed = True
+        return True
+
+    def _reject_aborted_waiting(self, seq: Sequence) -> None:
+        has_inflight_load = bool(getattr(seq, "_counted_as_inflight_load", False))
+        seq.status = SequenceStatus.FINISHED
+        seq.leave_reason = "aborted"
+        self._rejected.append(seq)
+        if not has_inflight_load or not self._connector_flag("is_offload"):
+            self._uncount_inflight_load(seq)
+            return
+
+        self.deferred_free_blocks[seq.id] = seq
+        terminal_queued = self._pop_req_id(
+            self.finished_recving_kv_req_ids, seq.id
+        ) or self._pop_req_id(self.failed_recving_kv_req_ids, seq.id)
+        terminal_consumed = bool(
+            getattr(seq, "offload_loaded", False)
+            or getattr(seq, "offload_load_failed", False)
+        )
+        if terminal_queued or terminal_consumed:
+            self._cleanup_aborted_load(seq)
+            return
+        seq._awaiting_aborted_load_cleanup = True
+
+    def _cleanup_aborted_load(self, seq: Sequence) -> None:
+        if hasattr(seq, "_awaiting_aborted_load_cleanup"):
+            delattr(seq, "_awaiting_aborted_load_cleanup")
+        self._uncount_inflight_load(seq)
+        self._maybe_release_deferred(seq)
+
+    def _finish_aborted_load_cleanup(self, req_id) -> bool:
+        seq = self._deferred_sequence(req_id)
+        if seq is None or not getattr(seq, "_awaiting_aborted_load_cleanup", False):
+            return False
+        self._cleanup_aborted_load(seq)
         return True
 
     def _mark_offload_load_ready(self, seq: Sequence) -> None:
@@ -1830,7 +1899,23 @@ class Scheduler:
             return self.kv_connector.adjust_prefill_chunk_after_alloc(seq, chunk)
         return chunk
 
-    def preempt(self, seq: Sequence):
+    def _is_preemptable(self, seq: Sequence) -> bool:
+        return not self._connector_should_defer_free(seq)
+
+    def _preempt_one_running(self) -> bool:
+        for index in range(len(self.running) - 1, -1, -1):
+            candidate = self.running[index]
+            if not self._is_preemptable(candidate):
+                continue
+            del self.running[index]
+            if self.preempt(candidate):
+                return True
+            self.running.insert(index, candidate)
+        return False
+
+    def preempt(self, seq: Sequence) -> bool:
+        if not self._is_preemptable(seq):
+            return False
         self.total_preemptions += 1
         seq.status = SequenceStatus.WAITING
         # Strip placeholder + rejected draft tokens added by postprocess.
@@ -1851,6 +1936,7 @@ class Scheduler:
             self._partial_prefill_count -= 1
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
+        return True
 
     def _advance_prefill_on_schedule(
         self,
@@ -1955,10 +2041,19 @@ class Scheduler:
         # batch.is_final_chunk (a later schedule() may have already flipped the
         # live seq.is_partial_prefill while this batch was in flight).
         pp_middle_chunk_ids: set[int] = set()
+        running_by_id = {seq.id: seq for seq in self.running} if batch else {}
+        num_prefill = int(getattr(batch, "total_seqs_num_prefill", 0))
+        if self._connector_flag("is_offload") and num_prefill:
+            for req_id in batch.req_ids[:num_prefill]:
+                seq = running_by_id.get(req_id)
+                if seq is not None and seq.has_per_req_cache:
+                    # StateTransfer.copy runs inside this prefill forward. Mark
+                    # the live destination ready only after that forward has
+                    # returned, before connector metadata for a later batch.
+                    seq._state_initialized_after_alloc = True
         if batch is not None and self.advance_on_schedule:
             # Progress already advanced at schedule time; publish prefix-cache
             # hashes at the chunk's pre-advance offset and record non-final chunks.
-            running_by_id = {seq.id: seq for seq in self.running}
             final = batch.is_final_chunk
             for i, req_id in enumerate(batch.req_ids):
                 seq = running_by_id.get(req_id)
@@ -1971,7 +2066,6 @@ class Scheduler:
                 if not is_final:
                     pp_middle_chunk_ids.add(req_id)
         elif batch is not None:
-            running_by_id = {seq.id: seq for seq in self.running}
             for i, req_id in enumerate(batch.req_ids):
                 seq = running_by_id.get(req_id)
                 if seq is None or seq.type != SequenceType.PREFILL:
@@ -2310,23 +2404,20 @@ class Scheduler:
             if self.kv_connector is not None:
                 if hasattr(self.kv_connector, "request_finished"):
                     self.kv_connector.request_finished(seq)
-                if not self.kv_connector.is_producer:
-                    if hasattr(self.kv_connector, "should_defer_free") and (
-                        self.kv_connector.should_defer_free(seq)
-                    ):
-                        logger.debug(
-                            "Deferring block free for seq %s until KV save completes.",
-                            seq.id,
-                        )
-                        self.deferred_free_blocks[seq.id] = seq
-                    else:
-                        self.block_manager.deallocate(seq)
-                else:
+                if self._connector_flag("is_producer"):
                     logger.debug(
                         "Deferring block free for seq %s until KV send completes.",
                         seq.id,
                     )
                     self.deferred_free_blocks[seq.id] = seq
+                elif self._connector_should_defer_free(seq):
+                    logger.debug(
+                        "Deferring block free for seq %s until KV save completes.",
+                        seq.id,
+                    )
+                    self.deferred_free_blocks[seq.id] = seq
+                else:
+                    self.block_manager.deallocate(seq)
             else:
                 self.block_manager.deallocate(seq)
             self.running.remove(seq)
@@ -2526,17 +2617,12 @@ class Scheduler:
         if kv_connector_output is None:
             return
 
-        def _pop_deferred(req_id):
-            seq = self.deferred_free_blocks.pop(req_id, None)
-            if seq is not None:
-                return seq
-            try:
-                return self.deferred_free_blocks.pop(int(req_id), None)
-            except (TypeError, ValueError):
-                return None
-
         is_producer = self._connector_flag("is_producer")
         is_offload = self._connector_flag("is_offload")
+
+        process_completions = getattr(self.kv_connector, "process_completions", None)
+        if callable(process_completions):
+            kv_connector_output = process_completions(kv_connector_output)
 
         for req_id in kv_connector_output.finished_recving or ():
             assert not is_producer, "Only consumer should update recving KV status"
@@ -2553,8 +2639,8 @@ class Scheduler:
         for req_id in kv_connector_output.finished_loading or ():
             assert is_offload, "Only offload connector should update loading KV status"
             logger.debug("Finished offload KV load for request %s", req_id)
-            if hasattr(self.kv_connector, "load_finished"):
-                self.kv_connector.load_finished(req_id)
+            if self._finish_aborted_load_cleanup(req_id):
+                continue
             self.finished_recving_kv_req_ids.append(req_id)
 
         for req_id in kv_connector_output.failed_loading or ():
@@ -2565,35 +2651,26 @@ class Scheduler:
                 "Offload KV load failed for request %s; falling back to prefill.",
                 req_id,
             )
+            if self._finish_aborted_load_cleanup(req_id):
+                continue
             self.failed_recving_kv_req_ids.append(req_id)
 
+        finished_saving = kv_connector_output.finished_saving or ()
         for req_id in kv_connector_output.finished_sending or ():
             assert (
                 self.kv_connector.is_producer
             ), "Only producer should free blocks after sending KV"
             logger.debug("Finished sending KV transfer for request %s", req_id)
-            seq = _pop_deferred(req_id)
+            seq = self._deferred_sequence(req_id)
             assert seq is not None, f"req_id={req_id} not found in deferred_free_blocks"
+            self.deferred_free_blocks.pop(seq.id, None)
             self.block_manager.deallocate(seq)
 
-        for req_id in kv_connector_output.finished_saving or ():
-            if hasattr(self.kv_connector, "save_finished"):
-                self.kv_connector.save_finished(req_id)
-            seq = self.deferred_free_blocks.get(req_id)
-            if seq is None:
-                try:
-                    seq = self.deferred_free_blocks.get(int(req_id))
-                except (TypeError, ValueError):
-                    seq = None
-            if seq is not None and not (
-                hasattr(self.kv_connector, "should_defer_free")
-                and self.kv_connector.should_defer_free(seq)
-            ):
-                seq = _pop_deferred(req_id)
-                if seq is not None and hasattr(self.kv_connector, "request_finished"):
-                    self.kv_connector.request_finished(seq)
+        if not is_producer:
+            for req_id in finished_saving:
+                seq = self._deferred_sequence(req_id)
                 if seq is not None:
-                    self.block_manager.deallocate(seq)
+                    self._maybe_release_deferred(seq)
 
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""

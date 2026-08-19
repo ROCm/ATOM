@@ -353,7 +353,15 @@ def _bind_minimax_m3_cache_views(model: Any, runtime: Any) -> None:
         runtime.forward_batch
     )
     if not bind_minimax_m3_sparse_cache_views(model, token_to_kv_pool):
-        raise RuntimeError("MiniMax-M3 SGLang sparse KV pool is not initialized")
+        pool_type = (
+            type(token_to_kv_pool).__name__ if token_to_kv_pool is not None else None
+        )
+        raise RuntimeError(
+            "MiniMax-M3 SGLang sparse KV pool is not initialized: "
+            f"pool_type={pool_type}, "
+            f"has_get_kv_buffer={hasattr(token_to_kv_pool, 'get_kv_buffer')}, "
+            f"has_get_index_k_buffer={hasattr(token_to_kv_pool, 'get_index_k_buffer')}"
+        )
 
 
 def _prepare_eagle3_llama_draft_model_config(

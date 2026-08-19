@@ -1,6 +1,19 @@
 import logging
+import os
 
 logger = logging.getLogger("atom.plugin.sglang.register")
+
+
+def _ensure_aiter_gpu_archs_env() -> None:
+    """Bridge ATOM image arch env names to aiter's runtime JIT env."""
+
+    if os.environ.get("GPU_ARCHS"):
+        return
+    for env_name in ("GPU_ARCH_LIST", "PYTORCH_ROCM_ARCH"):
+        archs = os.environ.get(env_name)
+        if archs:
+            os.environ["GPU_ARCHS"] = archs
+            return
 
 
 def _is_atom_external_model_enabled() -> bool:
@@ -74,11 +87,45 @@ def _install_loader_quant_patch() -> None:
     loader._atom_sglang_quant_patch = True
 
 
+def _install_decode_graph_forward_context_patch() -> None:
+    try:
+        from sglang.srt.model_executor.forward_context import (
+            ForwardContext,
+            forward_context,
+            has_forward_context,
+        )
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+            DecodeCudaGraphRunner,
+        )
+    except Exception:  # noqa: BLE001 - optional across SGLang versions
+        return
+
+    if getattr(DecodeCudaGraphRunner, "_atom_forward_context_patched", False):
+        return
+
+    original_capture_one_shape = DecodeCudaGraphRunner.capture_one_shape
+
+    def capture_one_shape_with_forward_context(self, *args, **kwargs):
+        if has_forward_context():
+            return original_capture_one_shape(self, *args, **kwargs)
+
+        attn_backend = self.model_runner.attn_backend
+        attn_backend.token_to_kv_pool = self.model_runner.token_to_kv_pool
+        attn_backend.req_to_token_pool = self.model_runner.req_to_token_pool
+        with forward_context(ForwardContext(attn_backend=attn_backend)):
+            return original_capture_one_shape(self, *args, **kwargs)
+
+    DecodeCudaGraphRunner.capture_one_shape = capture_one_shape_with_forward_context
+    DecodeCudaGraphRunner._atom_forward_context_patched = True
+
+
 def register_plugin() -> None:
     """Install ATOM patches that must run before SGLang parses server args."""
 
+    _ensure_aiter_gpu_archs_env()
     _install_model_config_quant_patch()
     _install_loader_quant_patch()
+    _install_decode_graph_forward_context_patch()
     from atom.plugin.sglang.models.kimi_k3_processor import (
         register_kimi_k3_text_only_processor,
     )
