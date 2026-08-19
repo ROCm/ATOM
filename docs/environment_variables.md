@@ -2,6 +2,12 @@
 
 This document describes the environment variables used in the ATOM project.
 
+## State checkpointing
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_ENABLE_PREFILL_END_CHECKPOINT** | bool | true | For PAGE-backed state, checkpoint each prompt's final complete hash block. Set to `0` to disable the per-prefill placement while preserving the interval/demand ladder configured by `--state-checkpoint-interval-tokens`. |
+
 ## Data parallelism
 
 | Variable | Type | Default | Description |

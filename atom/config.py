@@ -1320,9 +1320,10 @@ class Config:
     long_prefill_token_threshold: int = 0
     attn_prefill_chunk_size: int = 16384
     # Tokens between rungs of the state-checkpoint ladder, shared by every
-    # Pool.STATE class. PAGE-backed state also keeps the prompt's final complete
-    # hash boundary; 0 disables both placements. Must be a multiple of the
-    # prefix-cache hash block size. See BlockManager.checkpointers_at.
+    # Pool.STATE class. The PAGE-backed prompt-end placement is controlled
+    # independently by ATOM_ENABLE_PREFILL_END_CHECKPOINT. 0 disables only the
+    # interval/demand ladder. Must be a multiple of the prefix-cache hash block
+    # size. See BlockManager.checkpointers_at.
     state_checkpoint_interval_tokens: int = 8192
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512

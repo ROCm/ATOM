@@ -344,10 +344,12 @@ class EngineArgs:
                 "ring and sliding window, GDN recurrent state), keep a state "
                 "checkpoint every N tokens of context so a later prefix hit "
                 "can resume there. PAGE-backed state also checkpoints each "
-                "prompt's final complete hash block; when it is an interval "
-                "boundary only one checkpoint is stored. Must be a multiple "
-                "of the prefix-cache hash block size; 0 disables checkpoints "
-                "entirely. Prefill chunks are aligned to checkpoint positions."
+                "prompt's final complete hash block when "
+                "ATOM_ENABLE_PREFILL_END_CHECKPOINT=1 (the default); when it "
+                "is an interval boundary only one checkpoint is stored. Must "
+                "be a multiple of the prefix-cache hash block size; 0 disables "
+                "the interval/demand ladder only. Prefill chunks are aligned "
+                "to checkpoint positions."
             ),
         )
         parser.add_argument(

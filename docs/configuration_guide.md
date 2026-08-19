@@ -367,7 +367,7 @@ all flags via `add_cli_args()` and converts them into a `Config` via
 | `--method` | | `str` | `None` | Speculative method; choices: `mtp` |
 | `--num-speculative-tokens` | | `int` | `1` | Number of speculative tokens per iteration |
 | `--max-num-batched-tokens` | | `int` | `16384` | Maximum number of tokens to batch in the async engine |
-| `--state-checkpoint-interval-tokens` | | `int` | `8192` | Tokens between per-request state checkpoints; PAGE-backed state additionally keeps the prompt's final complete hash block. A final boundary that coincides with an interval emits one checkpoint. Must be a multiple of the prefix-cache hash block size; `0` disables all checkpoints. Checkpoint positions also quantize prefill chunk boundaries, since a checkpoint is valid only where a forward ends exactly on one |
+| `--state-checkpoint-interval-tokens` | | `int` | `8192` | Tokens between per-request state checkpoints. Must be a multiple of the prefix-cache hash block size; `0` disables the interval/demand ladder. PAGE-backed prompt-end checkpoints are controlled independently by `ATOM_ENABLE_PREFILL_END_CHECKPOINT`. Checkpoint positions also quantize prefill chunk boundaries, since a checkpoint is valid only where a forward ends exactly on one |
 | `--max-num-seqs` | | `int` | `512` | Maximum number of sequences to batch together |
 | `--gpu-memory-utilization` | | `float` | `0.9` | Fraction of GPU memory to use (0.0 — 1.0) |
 | `--scheduler-delay-factor` | | `float` | `0.0` | Delay factor multiplied by previous prompt latency before scheduling next prompt |
@@ -409,6 +409,7 @@ anything else (including unset) as `False`, unless noted otherwise.
 | `ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION` | `bool` | `True` | Enable fused all-reduce + RMSNorm kernel |
 | `ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT` | `bool` | `True` | Enable AITER Triton fused RMSNorm + quantization for LLaMA models |
 | `ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT` | `bool` | `True` | Enable AITER Triton fused SiLU + multiply + quantization for LLaMA models |
+| `ATOM_ENABLE_PREFILL_END_CHECKPOINT` | `bool` | `True` | For PAGE-backed state, checkpoint each prompt's final complete hash block. Set to `0` to disable this placement without changing interval checkpoints. |
 
 ### Additional environment variables (used outside `envs.py`)
 

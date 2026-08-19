@@ -28,6 +28,7 @@ from atom.model_engine.state_runtime import (
     StateRuntime,
     StateTransfer,
 )
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -110,6 +111,7 @@ class BlockManager:
         self.state_checkpoint_interval_tokens = max(
             0, int(getattr(config, "state_checkpoint_interval_tokens", 0) or 0)
         )
+        self.enable_prefill_end_checkpoint = envs.ATOM_ENABLE_PREFILL_END_CHECKPOINT
         checkpoint_spec = state_runtime.checkpoint_spec
         self.paged_state_checkpoints: PagedStateCheckpointCoordinator | None = None
         if checkpoint_spec is not None:
@@ -648,7 +650,7 @@ class BlockManager:
         """
         checkpoints = self.paged_state_checkpoints
         if (
-            self.state_checkpoint_interval_tokens <= 0
+            not self.enable_prefill_end_checkpoint
             or checkpoints is None
             or not checkpoints.applies(seq)
             or not any(cache is checkpoints for cache in self.state_caches)
@@ -833,17 +835,21 @@ class BlockManager:
         cannot reach one.
         """
         interval = self.state_checkpoint_interval_tokens
-        if interval <= 0 or pos <= 0:
+        if pos <= 0:
             return []
         if aimed:
+            anchor = self._prefill_end_checkpoint_pos(seq)
             if (
-                pos % interval
+                (interval <= 0 or pos % interval)
                 and pos != seq.checkpoint_demand_pos
-                and pos != self._prefill_end_checkpoint_pos(seq)
+                and pos != anchor
             ):
                 return []
-        elif pos % self.hash_block_size or pos - seq.last_checkpoint_pos < interval:
-            return []
+        else:
+            if interval <= 0:
+                return []
+            if pos % self.hash_block_size or pos - seq.last_checkpoint_pos < interval:
+                return []
         if next_forward_tokens is None:
             next_forward_tokens = seq.num_prompt_tokens - pos
         return [

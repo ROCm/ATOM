@@ -1198,10 +1198,37 @@ class TestPagedCopyPromptEndCheckpoint:
         bm.hash_blocks(seq, 2, start_tokens=5 * BLOCK)
         assert bm.take_state_maintenance_ops().checkpoint_stores == ()
 
-    def test_interval_zero_still_disables_prompt_end_store(self):
+    def test_interval_zero_keeps_default_prompt_end_store(self):
+        bm, seq = self._admitted(0, 5 * BLOCK)
+
+        assert bm._prefill_end_checkpoint_pos(seq) == 5 * BLOCK
+        assert bm.checkpoint_limit(seq) == 0
+        assert bm.checkpoint_cut(seq, 0, seq.num_prompt_tokens) == 5 * BLOCK
+        bm.hash_blocks(seq, seq.num_prompt_tokens)
+        assert len(bm.take_state_maintenance_ops().checkpoint_stores) == 1
+
+    def test_env_can_disable_prompt_end_without_disabling_interval(self, monkeypatch):
+        monkeypatch.setenv("ATOM_ENABLE_PREFILL_END_CHECKPOINT", "0")
+        interval = 4 * BLOCK
+        bm, seq = self._admitted(interval, 5 * BLOCK)
+
+        assert bm._prefill_end_checkpoint_pos(seq) == 0
+        assert bm.checkpoint_cut(seq, 0, seq.num_prompt_tokens) == interval
+        assert bm.checkpoint_cut(seq, interval, seq.num_prompt_tokens) == 0
+
+        bm.hash_blocks(seq, interval, start_tokens=0)
+        assert len(bm.take_state_maintenance_ops().checkpoint_stores) == 1
+        bm.complete_previous_state_batch()
+
+        bm.hash_blocks(seq, BLOCK, start_tokens=interval)
+        assert bm.take_state_maintenance_ops().checkpoint_stores == ()
+
+    def test_interval_zero_and_env_off_disable_both_placements(self, monkeypatch):
+        monkeypatch.setenv("ATOM_ENABLE_PREFILL_END_CHECKPOINT", "0")
         bm, seq = self._admitted(0, 5 * BLOCK)
 
         assert bm._prefill_end_checkpoint_pos(seq) == 0
+        assert bm.checkpoint_limit(seq) == 0
         assert bm.checkpoint_cut(seq, 0, seq.num_prompt_tokens) == 0
         bm.hash_blocks(seq, seq.num_prompt_tokens)
         assert bm.take_state_maintenance_ops().checkpoint_stores == ()
