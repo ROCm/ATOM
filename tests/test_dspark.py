@@ -436,6 +436,33 @@ def test_decorated_core_picks_capture_replay_or_eager():
     ]
 
 
+def test_non_tensor_params_are_passthrough_not_graph_inputs():
+    # A bool/int/enum config arg on a core is forwarded to the body untouched
+    # (and baked at capture), NOT treated as a graph input to clone or capture
+    # on. This is what lets a model keep its own config flags in its signature --
+    # e.g. V4's `compressor_already_launched` -- without the decorator choking on
+    # a non-tensor. The split comes off the annotations.
+    import torch as _t
+
+    from atom.utils.attn_ffn_piecewise import piecewise_core
+
+    seen = {}
+
+    @piecewise_core()
+    def core(layer, *, x: _t.Tensor, flag: bool = False, n: int = 0):
+        seen["flag"] = flag
+        seen["n"] = n
+        return x
+
+    # Only the tensor is a graph input; the annotated non-tensors are config.
+    assert core.input_names == ("x",)
+    assert core.passthrough_names == ("flag", "n")
+    # piecewise=False just runs the body, and the config args reach it as passed.
+    out = core(object(), piecewise=False, x=_t.ones(3), flag=True, n=7)
+    assert out.shape == (3,)
+    assert seen == {"flag": True, "n": 7}
+
+
 def test_runner_copies_only_what_is_not_zero_copy():
     import torch as _t
 
