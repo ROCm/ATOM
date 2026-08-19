@@ -2100,7 +2100,11 @@ def main():
     logger.info(f"Initializing engine with model {args.model}...")
     engine_args = EngineArgs.from_cli_args(args)
     engine = engine_args.create_engine(tokenizer=tokenizer)
-    _stream_batch_dispatcher = StreamBatchDispatcher(tokenizer)
+    _stream_batch_dispatcher = StreamBatchDispatcher(
+        tokenizer,
+        tokenizer_model=args.model,
+        trust_remote_code=args.trust_remote_code,
+    )
 
     # Wire the batched stream-flush hook: per-seq stream callbacks only buffer
     # their chunks into a thread-local; the engine core manager's output thread
@@ -2115,6 +2119,8 @@ def main():
     def _sigint_handler(signum, frame):
         logger.info("Received SIGINT, shutting down engine...")
         engine.close()
+        if _stream_batch_dispatcher is not None:
+            _stream_batch_dispatcher.close()
         import psutil
 
         try:
