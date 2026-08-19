@@ -1,8 +1,10 @@
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import Any, ClassVar
 
 import torch
 from aiter.dist.parallel_state import get_pp_group
+from torch import nn
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context as get_vllm_forward_context
 from vllm.model_executor.layers.mamba.abstract import MambaBase
@@ -13,10 +15,26 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
 )
 from vllm.model_executor.models.interfaces import IsHybrid
+from vllm.model_executor.models.kimi_k25_vit import (
+    KimiK25MultiModalProjector,
+    MoonViT3dPretrainedModel,
+)
+from vllm.model_executor.models.vision import is_vit_use_data_parallel
+from vllm.models.kimi_k3 import (
+    KimiK3ForConditionalGeneration as vLLMKimiK3,
+)
+from vllm.models.kimi_k3.common.mm_preprocess import (
+    KimiK3DummyInputsBuilder,
+    KimiK3MultiModalProcessor,
+    KimiK3ProcessingInfo,
+)
 from vllm.models.kimi_k3.nvidia.kda_metadata import KimiK3KDAMetadata
+from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
+from atom.config import Config, QuantizationConfig
+from atom.model_loader.loader import WeightsMapper, load_model_in_plugin_mode
 from atom.models import kimi_k3 as kimi_k3_base
 from atom.models.kimi_k3 import (
     KimiDecoderLayer,
@@ -26,9 +44,15 @@ from atom.models.kimi_k3 import (
 from atom.models.kimi_k3 import (
     KimiK3ForCausalLM as KimiK3ForCausalLMBase,
 )
-from atom.models.utils import IntermediateTensors
+from atom.models.utils import IntermediateTensors, maybe_prefix
 from atom.plugin.vllm.kda_backend import AtomKimiK3KDAAttentionBackend
+from atom.plugin.vllm.model_wrapper import ATOMForConditionalGeneration
 from atom.utils.forward_context import get_forward_context as get_atom_forward_context
+
+_KIMI_K3_QUANT_EXCLUDE_NAME_MAPPING: dict[str, str] = {
+    "language_model.model.": "language_model.language_model.model.",
+    "language_model.lm_head": "language_model.language_model.lm_head",
+}
 
 
 def _get_k3_state_shape(
@@ -435,10 +459,9 @@ class KimiK3ForConditionalGeneration_(vLLMKimiK3):
         }
     )
     packed_modules_mapping = KimiK3ForCausalLMBase.packed_modules_mapping
-    quant_exclude_name_mapping: ClassVar[dict[str, str]] = {
-        "language_model.model.": "language_model.language_model.model.",
-        "language_model.lm_head": "language_model.language_model.lm_head",
-    }
+    quant_exclude_name_mapping: ClassVar[dict[str, str]] = (
+        _KIMI_K3_QUANT_EXCLUDE_NAME_MAPPING
+    )
 
     def __init__(self, atom_config: Config, prefix: str = "model"):
         nn.Module.__init__(self)
