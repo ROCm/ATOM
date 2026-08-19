@@ -106,8 +106,6 @@ from atom.model_ops.v4_kernels import (
     write_v4_paged_prefill_indices,
 )
 from atom.utils import CpuGpuBuffer
-from atom.utils.attn_ffn_piecewise import BufferShape, DecodeAttnFfnPiecewise
-from atom.utils.cuda_graph import CudagraphCaptureRunner, StableOutputs
 from atom.utils.forward_context import (
     AttentionMetaData,
     AttnState,
@@ -128,86 +126,6 @@ def _uses_pd_staging(kv_transfer_config: dict | None) -> bool:
 
 # AF_PIECEWISE: attn-core capture/replay (keyed layer, bucket_bs, q_eff, nt_pad).
 # Owns its isolated graph pool + per-key graph cache + output buffers.
-v4_attn_runner = CudagraphCaptureRunner()
-# The fixed addresses the dense piece downstream of the attn core reads. Needed
-# under PIECEWISE whether or not the core itself is captured, so it is separate
-# from the graph cache above.
-v4_attn_outputs = StableOutputs()
-
-
-class V4AttnFfnPiecewise(DecodeAttnFfnPiecewise):
-    """V4's captured attention core. Owned by DeepseekV4Attention, not inherited
-    by it -- the layer holds one of these and forwards to it."""
-
-    # Inputs come from `core` below. `positions` is copied per step rather than
-    # captured on: including it costs ~2pts of accuracy (padding-tail regression).
-    zero_copy_exclude = ("positions",)
-
-    def describe_staging_buffers(self) -> dict:
-        """Measure the buffers by running V4's own projection chain once on a
-        dummy input -- shapes and dtypes vary with the quant config, so they
-        cannot be declared. The base turns the result into the pool; only the
-        chain is V4's business. `x` is absent on purpose: it is the preceding
-        graph piece's output, already at a fixed address in the cudagraph pool."""
-        layer = self.layer
-        n = self.max_tokens
-        device = self.device
-        dummy_x = torch.empty(n, layer.dim, dtype=dtypes.bf16, device=device)
-        idx_q_quant = idx_weights = idx_q_scale = None
-
-        qkv_a = layer.wqkv_a(dummy_x)
-        q_lora, kv_pre = torch.split(qkv_a, [layer.q_lora_rank, layer.head_dim], dim=-1)
-        qr, qr_scale = layer.q_norm(q_lora)
-        if layer.indexer is not None and not layer.skip_topk:
-            dummy_pos = torch.zeros(n, dtype=torch.int64, device=device)
-            idx_q_quant, idx_weights, idx_q_scale = layer.indexer.forward_pre(
-                dummy_x, qr, dummy_pos, qr_scale
-            )
-        return {
-            # The WHOLE merged wqkv_a output, so that on the inplace path kv_pre
-            # is a stable view into it rather than a buffer of its own.
-            "qkv_a": qkv_a,
-            # Fallback path only, and contiguous where the sample is a view.
-            "kv_pre": BufferShape(kv_pre.shape[-1], kv_pre.dtype),
-            "q": BufferShape(layer.n_local_heads * layer.head_dim, dtypes.bf16),
-            "qr": qr,
-            "qr_scale": qr_scale,
-            "idx_q_quant": idx_q_quant,
-            "idx_weights": idx_weights,
-            "idx_q_scale": idx_q_scale,
-        }
-
-    def alloc(self) -> None:
-        super().alloc()
-        # Whether a GEMM can write its destination directly is the Linear's own
-        # answer (`supports_out`); having somewhere to write it is ours. Cached as
-        # plain bools ON THE LAYER because the traced _attn_pre reads them, and
-        # Dynamo folds a bool attribute more predictably than a hop through here.
-        layer = self.layer
-        pooled = self.buffers is not None
-        layer._wqkv_a_inplace = pooled and layer.wqkv_a.supports_out()
-        layer._wq_b_inplace = pooled and layer.wq_b.supports_out()
-
-    def core(
-        self,
-        *,
-        x,
-        q,
-        kv_pre,
-        qr,
-        qr_scale,
-        positions,
-        idx_q_quant,
-        idx_weights,
-        idx_q_scale,
-    ):
-        """Keyword-only: these parameter names AND their order are the
-        contract -- the runner expands the staged inputs by them."""
-        return self.layer._attn_core(
-            x, q, kv_pre, qr, qr_scale, positions, idx_q_quant, idx_weights, idx_q_scale
-        )
-
-
 # State field carrying the windows of layers whose KV dtype is not the pool's.
 # One field for all of them: they share a dtype (see `_discover_field_windows`)
 # and a ring length, so they differ only in the field's layer dimension.

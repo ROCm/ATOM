@@ -73,11 +73,6 @@ from atom.model_loader.loader import WeightsMapper
 # code as opaque; Indexer.forward_batched dispatches via the latter to hide
 # its dynamic-shape internals from Dynamo / fake-tensor mode.
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
-from atom.model_ops.attentions.deepseek_v4_attn import (
-    V4AttnFfnPiecewise,
-    v4_attn_outputs,
-    v4_attn_runner,
-)
 from atom.model_ops.communication_op import (
     tensor_model_parallel_all_reduce,
 )
@@ -117,6 +112,8 @@ from atom.model_ops.v4_kernels import (
     update_compressor_states,
 )
 from atom.utils import envs, mark_spliting_op
+from atom.utils.attn_ffn_piecewise import decode_bucket_key, piecewise_core
+from atom.utils.cuda_graph import CudagraphCaptureRunner, StableOutputs
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import AttnState, get_forward_context
@@ -192,6 +189,43 @@ def v4_attention_with_output(
 # ---------------------------------------------------------------------------
 
 
+v4_attn_runner = CudagraphCaptureRunner()
+# The fixed addresses the dense piece downstream of the attn core reads. Needed
+# under PIECEWISE whether or not the core itself is captured, so it is separate
+# from the graph cache above.
+v4_attn_outputs = StableOutputs()
+
+
+@piecewise_core(key=decode_bucket_key, copy_per_step=("positions",))
+def v4_attn_core(
+    layer,
+    *,
+    x,
+    q,
+    kv_pre,
+    qr,
+    qr_scale,
+    positions,
+    idx_q_quant,
+    idx_weights,
+    idx_q_scale,
+):
+    """V4's captured attention core.
+
+    The parameter names AND their order are the contract: the runner addresses
+    the graph's inputs by them, and the decorator reads them off this signature.
+
+    `positions` is the one input the graph must not capture on: doing so costs
+    ~2pts of accuracy (padding-tail regression, root cause never found -- see
+    8f86bbaf). Everything else about the capture -- the graph key, the output
+    slot, which inputs get cloned -- belongs to `piecewise_core`, so this is the
+    whole of what V4 has to say about it.
+    """
+    return layer._attn_core(
+        x, q, kv_pre, qr, qr_scale, positions, idx_q_quant, idx_weights, idx_q_scale
+    )
+
+
 def _v4_core_attention_fake(
     x: torch.Tensor,
     q: torch.Tensor,
@@ -253,24 +287,21 @@ def v4_core_attention(
     # them out of it on entry; #1902 dropped that once each num_tokens bucket got
     # its own pool, since a bucket's graphs only ever reuse memory among
     # themselves. They are passed through as-is.
-    return self.attn_ffn.dispatch(
-        forward_context=fc,
-        layer_name=layer_name,
-        named_args={
-            "x": x,
-            "q": q,
-            "kv_pre": kv_pre,
-            "qr": qr,
-            "qr_scale": qr_scale,
-            "positions": positions,
-            "idx_q_quant": idx_q_quant,
-            "idx_weights": idx_weights,
-            "idx_q_scale": idx_q_scale,
-        },
-        # Persistent output buffer key: the downstream dense piece was captured
-        # reading this fixed address.
-        out_key=(layer_name, int(x.shape[0])),
+    return v4_attn_core(
+        self,
+        runner=v4_attn_runner,
+        outputs=v4_attn_outputs,
         piecewise=is_piecewise,
+        forward_context=fc,
+        x=x,
+        q=q,
+        kv_pre=kv_pre,
+        qr=qr,
+        qr_scale=qr_scale,
+        positions=positions,
+        idx_q_quant=idx_q_quant,
+        idx_weights=idx_weights,
+        idx_q_scale=idx_q_scale,
     )
 
 
@@ -2301,12 +2332,6 @@ class DeepseekV4Attention(nn.Module):
       - attn_sink: per-head learnable logit added only to softmax denominator
     """
 
-    # Whether wqkv_a / wq_b may write a staging buffer directly (out=). Class
-    # defaults so `_attn_pre` is safe before `attn_ffn.alloc()` runs; alloc
-    # resolves them, and leaves them False when nothing is staged.
-    _wqkv_a_inplace = False
-    _wq_b_inplace = False
-
     def __init__(
         self,
         layer_id: int,
@@ -2486,12 +2511,6 @@ class DeepseekV4Attention(nn.Module):
         self.attn_ffn_piecewise = (
             cudagraph_mode is not None and cudagraph_mode.is_attn_ffn_piecewise()
         )
-        self.attn_ffn = V4AttnFfnPiecewise(
-            self,
-            runner=v4_attn_runner,
-            outputs=v4_attn_outputs,
-            enabled=self.attn_ffn_piecewise,
-        )
         if self.attn_ffn_piecewise:
             # single-stream: captured graph can't hold the compressor fork/join
             self._use_async_compress = False
@@ -2515,6 +2534,7 @@ class DeepseekV4Attention(nn.Module):
         Idempotent: if wo_a.weight is already BF16 (e.g. dequant was applied
         elsewhere), this is a no-op.
         """
+
         w = self.wo_a.weight
         if w.dtype == torch.bfloat16:
             return  # already dequanted
@@ -2552,9 +2572,6 @@ class DeepseekV4Attention(nn.Module):
         # batched-FP8 kernel. See attention_mla.py:211 for reference.
         self.wo_a.quant_type = QuantType.No
         self.wo_a.need_normalize_e4m3fn_to_e4m3fnuz = False
-
-        # AF_PIECEWISE: build the staging buffers post-load, pre-capture.
-        self.attn_ffn.alloc()
 
     def maybe_compressors_async(
         self, x, plan, state_slot_in, state_slot_out, block_tables
@@ -2687,42 +2704,14 @@ class DeepseekV4Attention(nn.Module):
             x = x.clone()
             act_quant_inplace(x, 128, "ue8m0")
 
-        # AF_PIECEWISE zero-copy: stage inputs so the attn-core graph reads
-        # constant addresses. None = don't stage (core not captured, or prefill
-        # overflows the buffers); explicit at each site since this is traced.
-        n = x.shape[0]
-        attn_ffn_bufs = self.attn_ffn.staging(n)
-
-        # Fixing the whole wqkv_a output inplace makes kv_pre a stable view, so
-        # only the fallback stages it (copying all of qkv_a would cost more).
-        # Ask the pool, not the flag: the flag says the GEMM can write out=, not
-        # that this step has anywhere to write it.
-        fill_qkv_a = attn_ffn_bufs is not None and self._wqkv_a_inplace
-        if fill_qkv_a:
-            qkv_a = attn_ffn_bufs.fill("qkv_a", n, lambda o: self.wqkv_a(x, out=o))
-        else:
-            qkv_a = self.wqkv_a(x)
+        qkv_a = self.wqkv_a(x)
         q_lora, kv_pre = torch.split(qkv_a, [self.q_lora_rank, self.head_dim], dim=-1)
-        if attn_ffn_bufs is not None and not fill_qkv_a:
-            kv_pre = attn_ffn_bufs.stage("kv_pre", kv_pre)
         assert (
             not _V4_FORCE_UE8M0_QUANT
         ), "_V4_FORCE_UE8M0_QUANT incompatible with fused q_norm quant (qr is already FP8)"
 
         qr, qr_scale = self.q_norm(q_lora)
-        if attn_ffn_bufs is not None:
-            # qr/qr_scale staged BEFORE their consumers (wq_b / indexer / the op).
-            qr = attn_ffn_bufs.stage("qr", qr)
-            qr_scale = attn_ffn_bufs.stage("qr_scale", qr_scale)
-            # q: wq_b writes its buffer inplace (out=) or plain GEMM + copy.
-            if self._wq_b_inplace:
-                q = attn_ffn_bufs.fill(
-                    "q", n, lambda o: self.wq_b(qr, x_scale=qr_scale, out=o)
-                )
-            else:
-                q = attn_ffn_bufs.stage("q", self.wq_b(qr, x_scale=qr_scale))
-        else:
-            q = self.wq_b(qr, x_scale=qr_scale)
+        q = self.wq_b(qr, x_scale=qr_scale)
 
         # Indexer Q/weights projection (no paged access) -> graphed piece.
         idx_q_quant = idx_weights = idx_q_scale = None
@@ -2730,10 +2719,6 @@ class DeepseekV4Attention(nn.Module):
             idx_q_quant, idx_weights, idx_q_scale = self.indexer.forward_pre(
                 x, qr, positions, qr_scale
             )
-            if attn_ffn_bufs is not None:
-                idx_q_quant = attn_ffn_bufs.stage("idx_q_quant", idx_q_quant)
-                idx_weights = attn_ffn_bufs.stage("idx_weights", idx_weights)
-                idx_q_scale = attn_ffn_bufs.stage("idx_q_scale", idx_q_scale)
         return q, kv_pre, qr, qr_scale, x, idx_q_quant, idx_weights, idx_q_scale
 
     @mark_trace

@@ -1,326 +1,46 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Model-agnostic half of the attention/FFN-wise piecewise cudagraph path.
+"""Capture one op's body into its OWN cudagraph, between the dense pieces.
 
-Under ``--cudagraph-mode AF_PIECEWISE`` the attention core is captured into its
-OWN cudagraph, separate from the dense pieces around it. Two things have to hold
-for that graph to be replayable:
+Under ``--cudagraph-mode AF_PIECEWISE`` the attention core gets a cudagraph of
+its own, so small-batch decode replays through it instead of running eager
+between the graphed dense pieces. A cudagraph bakes the ADDRESS of everything it
+reads, so both sides of that boundary need one that does not move:
 
-  * its inputs must live at FIXED addresses, so the producers upstream stage
-    each one into a persistent buffer (``ZeroCopyBuffers``) instead of handing
-    over a fresh tensor every step; and
-  * the graph must be keyed on everything that changes its shape.
+  * inputs -- the runner clones each one at capture and refreshes the clone at
+    replay, so the producer upstream can allocate however it likes;
+  * the output -- the dense piece downstream was captured reading one address
+    per (layer, rows), so an eagerly computed result is delivered into it.
 
-Neither is model-specific, but the first implementation grew inside DeepSeek-V4
-and encoded V4 in both: the buffer set was V4's exact tensors, and the zero-copy
-contract was a set of POSITIONAL INDICES into V4's nine-argument core. This
-module keeps the mechanism and drops the model: a layer declares its inputs BY
-NAME on an ``AttnFfnPiecewise`` it owns, and everything downstream addresses
-them that way.
+Both are the runner's business, not the model's. A model opts in by decorating
+the function that IS its core::
 
-``CudagraphCaptureRunner`` (atom/utils/cuda_graph.py) still owns capture/replay
-itself; this module owns the contract around it.
+    @piecewise_core(key=decode_bucket_key)
+    def v4_attn_core(layer, *, x, q, kv_pre, ...):
+        return layer._attn_core(x, q, kv_pre, ...)
+
+and writes nothing else -- no staging buffers, no per-input policy, no dummy
+forward to measure shapes. The inputs and their order come off the function's
+own signature.
+
+What this deliberately does NOT do is let the producer write the graph's input
+buffer directly. That saves the clone's copy, but only by making every producer
+in the chain aware of the capture -- which is what the previous design did, and
+is what made this feature reach into the model layer. Two small copies per layer
+(`q` and `kv_pre`; the other inputs were already copied) buy that back.
 """
 
+import functools
 import inspect
 import os
-from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from collections.abc import Callable
 from typing import Any
 
-import torch
-
 __all__ = [
-    "AttnFfnPiecewise",
-    "BufferShape",
-    "DecodeAttnFfnPiecewise",
-    "ZeroCopyBuffers",
     "decode_bucket_key",
-    "resolve_zero_copy_names",
+    "piecewise_core",
 ]
-
-
-class ZeroCopyBuffers:
-    """Fixed-address staging buffers for one layer's captured-core inputs.
-
-    Keyed by name, so nothing here knows what any particular model calls its
-    tensors. Every buffer is allocated for ``max_tokens`` rows and handed out as
-    ``buf[:n]``; the token axis is ALWAYS dim 0.
-
-    Allocation happens once, post-load, from sample tensors: shapes and dtypes
-    depend on the quantisation config, so they are learned from a dummy forward
-    rather than declared.
-    """
-
-    def __init__(self, max_tokens: int):
-        self.max_tokens = int(max_tokens)
-        self._bufs: dict[str, torch.Tensor | None] = {}
-
-    def alloc_like(self, name: str, sample: torch.Tensor | None) -> None:
-        """Allocate ``name`` with the sample's shape and dtype.
-
-        A None sample registers None: the input exists in the signature but not
-        in this configuration (an absent indexer, say), and ``stage`` passes it
-        through untouched.
-        """
-        self._bufs[name] = torch.empty_like(sample) if sample is not None else None
-
-    def alloc(self, name: str, width: int, dtype: torch.dtype, device: Any) -> None:
-        """Allocate ``name`` as ``[max_tokens, width]``.
-
-        For an input whose width is not readable off a sample -- the sample may
-        be a view into a larger tensor, or the buffer may need to be contiguous
-        where the sample is not.
-        """
-        self._bufs[name] = torch.empty(
-            self.max_tokens, width, dtype=dtype, device=device
-        )
-
-    def fits(self, n: int) -> bool:
-        return n <= self.max_tokens
-
-    def stage(self, name: str, tensor: torch.Tensor | None):
-        """Copy an already-computed ``tensor`` (n tokens on dim 0) into ``name``'s
-        buffer and return the fixed-address slice.
-
-        None-safe both ways: an unregistered name or a None tensor passes the
-        tensor through unchanged.
-        """
-        buf = self._bufs.get(name)
-        if buf is None or tensor is None:
-            return tensor
-        n = tensor.shape[0]
-        buf[:n].copy_(tensor)
-        return buf[:n]
-
-    def fill(self, name: str, n: int, produce: Callable[[torch.Tensor], Any]):
-        """Hand ``name``'s first n rows to a producer that writes them in place
-        (a GEMM with ``out=``), and return that slice. Saves the copy `stage`
-        would make.
-
-        Returns the slice, NOT what ``produce`` returned: this is for an input the
-        graph captures, which has to be the buffer itself. Only use it for a
-        producer that returns the destination it was handed. `LinearBase.forward`
-        does: it rebinds its result only when ``is_output_padded`` (per_Token fp8,
-        never the per_1x128 path ``out=`` needs) or on a row-parallel all-reduce
-        (``tp_dim == 1``, which neither wqkv_a nor wq_b is).
-        """
-        dst = self._bufs[name][:n]
-        produce(dst)
-        return dst
-
-
-@dataclass(frozen=True)
-class BufferShape:
-    """Allocate this staging buffer as ``[max_tokens, width]`` rather than from a
-    sample. For an input whose sample is a view into a larger tensor, or whose
-    buffer must be contiguous where the sample is not."""
-
-    width: int
-    dtype: torch.dtype
-
-
-class AttnFfnPiecewise:
-    """One attention layer's captured-core concern, owned BY the layer.
-
-    Composed rather than mixed in: an attention layer is already large, and the
-    capture concern has its own state (buffers, the input contract, the graph
-    key) with no reason to share the layer's namespace or fight nn.Module for
-    the MRO. The layer holds one of these; a model subclasses THIS.
-
-    Subclass supplies ``describe_staging_buffers`` and ``core``; the inputs and
-    their order come from ``core``'s signature. Decode cores should subclass
-    ``DecodeAttnFfnPiecewise``, which fills in the graph key too.
-
-    The core's own parameter list is the single source of truth. That is the
-    point of the interface: the original design expressed the zero-copy set as
-    indices into one model's argument tuple, so it could not be read without
-    counting positions and could not survive a signature change. Every declared
-    input is zero-copy unless the subclass names an exception.
-    """
-
-    # Inputs a subclass wants COPIED per step instead of captured on directly.
-    # Empty is the norm: staging exists to give the graph fixed addresses, so
-    # everything it declares is zero-copy unless something is known not to be.
-    zero_copy_exclude: tuple[str, ...] = ()
-    # Rows the staging buffers cover; a longer step falls back to the copy path.
-    max_tokens: int = 512
-
-    def __init__(self, layer, *, runner, outputs, enabled: bool):
-        self.layer = layer
-        # Two collaborators, two concerns: `runner` caches the cudagraphs,
-        # `outputs` owns the fixed address the downstream dense piece reads.
-        # An uncaptured step still needs the second one.
-        self.runner = runner
-        self.outputs = outputs
-        # Whether this layer's core is captured at all (the cudagraph mode).
-        self.enabled = bool(enabled)
-        self.buffers: ZeroCopyBuffers | None = None
-        self.input_names = self.core_input_names()
-        self.zero_copy_names = resolve_zero_copy_names(
-            self.input_names,
-            os.environ.get("ATOM_ATTN_FFN_ZC"),
-            default_excluded=type(self).zero_copy_exclude,
-        )
-
-    @classmethod
-    def core_input_names(cls) -> tuple[str, ...]:
-        """The core's inputs, in order, read off ``core``'s own signature.
-
-        One source rather than two: an ``input_names`` attribute beside the
-        method is a second place to state the same thing, and the two drift.
-        Order matters -- the runner expands arguments by it -- so the core must
-        name its inputs explicitly; ``**kwargs`` carries no order and is
-        rejected here rather than mis-expanded later.
-        """
-        names = []
-        for name, p in inspect.signature(cls.core).parameters.items():
-            if name == "self":
-                continue
-            if p.kind in (p.VAR_KEYWORD, p.VAR_POSITIONAL):
-                raise TypeError(
-                    f"{cls.__name__}.core must name its inputs explicitly; "
-                    f"'{'**' if p.kind is p.VAR_KEYWORD else '*'}{name}' has no "
-                    "declared order for the runner to expand by."
-                )
-            names.append(name)
-        return tuple(names)
-
-    # ---- subclass implements -------------------------------------------------
-
-    def describe_staging_buffers(self) -> dict[str, Any]:
-        """Describe the staging buffer for every input. Allocates nothing --
-        ``alloc`` does that; this only says what to allocate.
-
-        Returns ``{name: spec}``, where a spec is one of:
-          * a sample tensor -- allocate a buffer of the same shape and dtype;
-          * a ``BufferShape`` -- allocate ``[max_tokens, width]`` explicitly,
-            for an input whose sample is a view or must be made contiguous;
-          * ``None`` -- this configuration does not produce that input (an
-            absent indexer, say). It keeps its place in the signature and
-            passes through unstaged.
-
-        A subclass typically gets its samples by running a dummy forward
-        through its own projection chain: shapes and dtypes vary with the quant
-        config, so they are measured rather than declared, and that chain is
-        the one part of this that cannot be generic. ``alloc`` calls this under
-        ``torch.no_grad``.
-
-        An input absent from the returned dict is never staged, so it must
-        already be at a stable address by other means -- V4's ``x``, say, is the
-        preceding graph piece's output and lives in the cudagraph pool.
-        """
-        raise NotImplementedError
-
-    def core(self, **named: Any) -> torch.Tensor:
-        """The compute captured into the graph, taking the declared inputs."""
-        raise NotImplementedError
-
-    def graph_key(self, forward_context) -> tuple:
-        """Key components beyond the layer name and the token count.
-
-        Default empty: the token count ``run`` always includes is the only shape
-        most cores have. A core reading shape-carrying metadata (a per-request
-        query length, say) must add it, or two differently-shaped steps share
-        one graph.
-        """
-        del forward_context
-        return ()
-
-    # ---- provided ------------------------------------------------------------
-
-    @property
-    def device(self):
-        return next(self.layer.parameters()).device
-
-    def alloc(self) -> None:
-        """Turn ``describe_staging_buffers`` into the staging pool. Call post-load,
-        pre-capture. No-op when this layer is not captured."""
-        if not self.enabled:
-            return
-        # Under no_grad here, so a subclass measuring its shapes with a dummy
-        # forward does not have to remember to.
-        with torch.no_grad():
-            samples = self.describe_staging_buffers()
-        device = self.device
-        bufs = ZeroCopyBuffers(self.max_tokens)
-        for name, spec in samples.items():
-            if isinstance(spec, BufferShape):
-                bufs.alloc(name, spec.width, spec.dtype, device)
-            else:
-                bufs.alloc_like(name, spec)
-        self.buffers = bufs
-
-    def staging(self, n: int) -> ZeroCopyBuffers | None:
-        """The pool for a step of ``n`` tokens, or None when this step must not
-        stage: the layer's core is not captured, or ``n`` overflows the buffers.
-
-        None rather than a pass-through pool on purpose. The caller is a traced
-        function, and which of the two modes it is in should be readable at the
-        call site instead of hidden behind an object that quietly does nothing.
-        """
-        bufs = self.buffers
-        return bufs if bufs is not None and bufs.fits(n) else None
-
-    def cache_key(self, forward_context, layer_name: str, named_args: dict):
-        """This step's cudagraph key, or None if it must not be captured.
-
-        num_tokens is a KEY DIM, not an incidental one: the core graph is
-        captured at exactly this flat row count, so a zero-copy input's read
-        length equals what the producer upstream wrote (no padded tail).
-        """
-        context = getattr(forward_context, "context", None)
-        num_tokens = int(named_args[self.input_names[0]].shape[0])
-        eligible = (
-            self.enabled
-            and not getattr(context, "is_dummy_run", False)
-            and getattr(forward_context, "attn_metadata", None) is not None
-            and num_tokens <= self.max_tokens
-        )
-        if not eligible:
-            return None
-        return (layer_name, num_tokens) + tuple(self.graph_key(forward_context))
-
-    def dispatch(
-        self,
-        *,
-        forward_context,
-        layer_name: str,
-        named_args: dict[str, Any],
-        out_key,
-        piecewise: bool,
-    ) -> torch.Tensor:
-        """Capture / replay / eager for one invocation. Every caller goes through
-        here, so WHETHER to capture, and under what key, is stated once."""
-        if not piecewise:
-            # FULL / eager: nothing is captured, and no dense piece downstream
-            # is holding an address we have to deliver to.
-            return self.core(**named_args)
-
-        key = self.cache_key(forward_context, layer_name, named_args)
-        # True only inside the capture pass: WHICH KIND of forward this is,
-        # building the graphs vs serving a real step.
-        capturing = getattr(forward_context, "in_hipgraph", False)
-
-        if key is not None:
-            if capturing and not self.runner.has(key):
-                # First time the capture pass reaches this key. Warm up on the
-                # buffers the graph will read, size the output slot from that
-                # result, then record.
-                in_bufs = self.runner.input_buffers(
-                    named_args, self.input_names, self.zero_copy_names
-                )
-                slot = self.outputs.slot(out_key, self.core(**in_bufs))
-                self.runner.capture(key, in_bufs, self.core, slot)
-            elif self.runner.has(key) and not capturing:
-                return self.runner.replay(key, named_args, self.zero_copy_names)
-
-        # Everything else: not eligible for capture, the capture pass revisiting
-        # a key, or a step whose key was never captured. Also the tail of the
-        # capture branch above -- it fed on clones, so its result is not this
-        # forward's answer. Compute on the real inputs and deliver to the slot.
-        return self.outputs.deliver(out_key, self.core(**named_args))
 
 
 def decode_bucket_key(forward_context) -> tuple:
@@ -342,40 +62,129 @@ def decode_bucket_key(forward_context) -> tuple:
     return (bucket_bs, q_eff)
 
 
-class DecodeAttnFfnPiecewise(AttnFfnPiecewise):
-    """A core captured per decode bucket -- subclass this and implement
-    ``core`` plus ``describe_staging_buffers``.
+def _input_names(fn: Callable) -> tuple[str, ...]:
+    """The core's inputs, in order, off the function's own signature.
 
-    Split from the base rather than folded into it because the key is exactly
-    what a prefill core does differently: it has no ``max_seqlen_q`` bucket to
-    key on. Keeping the decode notion in a subclass leaves the base's default
-    free for that case instead of forcing it to override decode semantics.
+    One source rather than two: a names list beside the function is a second
+    place to state the same thing, and the two drift. Order matters -- the runner
+    expands arguments by it -- so ``*args``/``**kwargs`` are rejected here rather
+    than mis-expanded later. The leading parameter is the layer that owns the
+    core, not one of its inputs.
     """
+    names = []
+    for i, (name, p) in enumerate(inspect.signature(fn).parameters.items()):
+        if i == 0:
+            continue
+        if p.kind in (p.VAR_KEYWORD, p.VAR_POSITIONAL):
+            raise TypeError(
+                f"{fn.__name__} must name its inputs explicitly; "
+                f"'{'**' if p.kind is p.VAR_KEYWORD else '*'}{name}' has no "
+                "declared order for the runner to expand by."
+            )
+        names.append(name)
+    return tuple(names)
 
-    def graph_key(self, forward_context) -> tuple:
-        return decode_bucket_key(forward_context)
 
+def _resolve_zero_copy(names: tuple[str, ...], copied: frozenset) -> frozenset:
+    """Which inputs the graph captures on directly.
 
-def resolve_zero_copy_names(
-    all_names: Iterable[str],
-    override: str | None,
-    default_excluded: Iterable[str] = (),
-) -> frozenset[str]:
-    """Zero-copy set from names, with an env override for bisecting.
-
-    ``override`` is a comma-separated name list (empty string = copy
-    everything), which is how a suspected input gets taken out of the zero-copy
-    path without a code change. Unset means every name except
-    ``default_excluded``.
+    ``ATOM_ATTN_FFN_ZC`` overrides it with a comma-separated whitelist (empty
+    string = capture on nothing), which is how a suspected input gets taken off
+    the zero-copy path for one run without touching code.
     """
-    names = tuple(all_names)
+    override = os.environ.get("ATOM_ATTN_FFN_ZC")
     if override is not None:
         wanted = {p.strip() for p in override.split(",") if p.strip()}
         unknown = wanted - set(names)
         if unknown:
             raise ValueError(
-                f"zero-copy override names {sorted(unknown)} are not inputs; "
+                f"ATOM_ATTN_FFN_ZC names {sorted(unknown)} are not inputs; "
                 f"known names are {list(names)}"
             )
         return frozenset(wanted)
-    return frozenset(names) - set(default_excluded)
+    return frozenset(names) - copied
+
+
+def piecewise_core(
+    *,
+    key: Callable[[Any], tuple] = lambda _fc: (),
+    max_tokens: int = 512,
+    copy_per_step: tuple[str, ...] = (),
+):
+    """Give the decorated function its own cudagraph, keyed per layer and shape.
+
+    ``key`` adds whatever else changes the graph's shape beyond the layer and the
+    token count -- for a decode core that is the bucket, `decode_bucket_key`.
+    ``max_tokens`` bounds the rows a captured graph covers; a longer step (a
+    prefill) runs eager.
+
+    Every input is captured on directly -- the graph reads the producer's own
+    tensor and nothing copies it -- EXCEPT the names in ``copy_per_step``, which
+    the runner clones and refreshes each step. Name one when capturing on it is
+    wrong, whatever the reason; the entry's own comment should say which.
+
+    The wrapped function is called as ``fn(layer, **inputs)`` and returns one
+    tensor. Outside PIECEWISE it is simply called: nothing is captured, and no
+    downstream piece is holding an address to deliver to.
+    """
+
+    copied = frozenset(copy_per_step)
+
+    def decorate(fn: Callable) -> Callable:
+        input_names = _input_names(fn)
+        zero_copy = _resolve_zero_copy(input_names, copied)
+
+        @functools.wraps(fn)
+        def wrapper(layer, *, runner, outputs, piecewise, forward_context, **inputs):
+            if not piecewise:
+                return fn(layer, **inputs)
+
+            layer_name = getattr(layer, "layer_name", id(layer))
+            num_tokens = int(inputs[input_names[0]].shape[0])
+            # One output slot per (layer, flat row count): the address the dense
+            # piece downstream was captured reading.
+            out_key = (layer_name, num_tokens)
+            core = functools.partial(fn, layer)
+
+            context = getattr(forward_context, "context", None)
+            eligible = (
+                not getattr(context, "is_dummy_run", False)
+                and getattr(forward_context, "attn_metadata", None) is not None
+                and num_tokens <= max_tokens
+            )
+            # num_tokens is a KEY DIM, not an incidental one: the graph is
+            # captured at exactly this flat row count.
+            graph_key = (
+                (layer_name, num_tokens) + tuple(key(forward_context))
+                if eligible
+                else None
+            )
+            # True only inside the capture pass: WHICH KIND of forward this is,
+            # building the graphs vs serving a real step.
+            capturing = getattr(forward_context, "in_hipgraph", False)
+
+            if graph_key is not None:
+                if capturing and not runner.has_graph(graph_key):
+                    # First time the capture pass reaches this key. Warm up on
+                    # the buffers the graph will read, size the output slot from
+                    # that result, then record.
+                    read_from, refresh = runner.input_buffers(
+                        inputs, input_names, zero_copy
+                    )
+                    out_slot = outputs.slot(out_key, core(**read_from))
+                    runner.capture(graph_key, read_from, refresh, core, out_slot)
+                elif runner.has_graph(graph_key) and not capturing:
+                    return runner.replay(graph_key, inputs)
+
+            # Everything else: not eligible, the capture pass revisiting a key,
+            # or a step whose key was never captured. Also the tail of the
+            # capture branch above -- it fed on clones, so its result is not this
+            # forward's answer.
+            return outputs.deliver(out_key, core(**inputs))
+
+        wrapper.input_names = input_names
+        wrapper.zero_copy_names = zero_copy
+        wrapper.max_tokens = max_tokens
+        return wrapper
+
+    return decorate

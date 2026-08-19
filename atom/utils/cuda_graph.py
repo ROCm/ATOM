@@ -329,7 +329,7 @@ class CudagraphCaptureRunner:
     Give it a key, the inputs a graph should read, and the compute: it records
     once and replays after that. It does not know who is calling or why --
     deciding WHETHER a step should be captured, and where the output has to
-    land, belongs to the caller (see `AttnFfnPiecewise` in
+    land, belongs to the caller (see `piecewise_core` in
     atom/utils/attn_ffn_piecewise.py, the attention-core user of this).
 
     Holds its own graph pool, isolated from the dense-piece pool.
@@ -340,30 +340,43 @@ class CudagraphCaptureRunner:
         self._pool = None
         self._capture_error_mode = capture_error_mode
 
-    def has(self, key) -> bool:
+    def has_graph(self, key) -> bool:
         return key in self._graphs
 
     def input_buffers(
-        self, named_args: dict, input_names: tuple, zc: frozenset
-    ) -> dict:
-        """Where a graph captured now will read each input from.
+        self, named_args: dict, input_names: tuple, zero_copy: frozenset
+    ) -> tuple[dict, dict]:
+        """Where a graph captured now will read each input from, and which of
+        those this runner has to refresh at replay.
 
-        A zero-copy input is captured on the caller's own tensor: that address
-        goes into the graph, and whoever produces it must keep writing to the
-        same address every step. Everything else gets a clone this runner owns
-        and refreshes itself at replay.
+        A zero-copy input is captured on the caller's OWN tensor: that address
+        goes into the graph and nothing refreshes it, so whoever produces it has
+        to keep handing back the same address every step. Everything else gets a
+        clone this runner owns and copies into at replay -- one copy per step,
+        bought in exchange for the producer being free to allocate as it likes.
 
         Names rather than positions: an index set silently means something else
         the moment an argument is added, and cannot be read without counting.
         """
-        bufs = {}
+        read_from: dict = {}
+        refresh: dict = {}
         for n in input_names:
             src = named_args[n]
-            bufs[n] = src if (n in zc or src is None) else src.clone()
-        return bufs
+            if src is None or n in zero_copy:
+                read_from[n] = src
+                continue
+            clone = src.clone()
+            read_from[n] = clone
+            refresh[n] = clone
+        return read_from, refresh
 
     def capture(
-        self, key, in_bufs: dict, compute_fn: Callable, out_buf: torch.Tensor
+        self,
+        key,
+        in_bufs: dict,
+        refresh: dict,
+        compute_fn: Callable,
+        out_buf: torch.Tensor,
     ) -> None:
         """Record `compute_fn(**in_bufs)` under `key`, landing in `out_buf`.
 
@@ -384,20 +397,16 @@ class CudagraphCaptureRunner:
             capture_error_mode=self._capture_error_mode,
         ):
             out_buf.copy_(compute_fn(**in_bufs))
-        self._graphs[key] = {"graph": graph, "in": in_bufs, "out": out_buf}
+        self._graphs[key] = {"graph": graph, "in": refresh, "out": out_buf}
 
-    def replay(self, key, named_args: dict, zc: frozenset) -> torch.Tensor:
-        """Refresh the inputs this runner owns, replay, and return the output.
-
-        Zero-copy inputs are skipped: the graph reads the producer's buffer
-        directly, so there is nothing to copy.
-        """
+    def replay(self, key, named_args: dict) -> torch.Tensor:
+        """Refresh the inputs this runner owns, replay, and return the output."""
         entry = self._graphs[key]
+        # Only the inputs this runner cloned are here. A zero-copy one is not:
+        # the graph reads the producer's own tensor, so there is nothing to copy.
         for n, buf in entry["in"].items():
-            if n in zc:
-                continue
             src = named_args[n]
-            if buf is not None and src is not None:
+            if src is not None:
                 buf.copy_(src)
         entry["graph"].replay()
         return entry["out"]  # the graph copied the result in for us

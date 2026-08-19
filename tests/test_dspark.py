@@ -335,26 +335,27 @@ def test_scheduler_multi_request_global_topk():
 # ---------------------------------------------------------------------------
 
 
-def _dispatch_probe(*, piecewise, capturing, graph_ready, enabled=True, dummy=False):
-    """Drive AttnFfnPiecewise.dispatch once against fake collaborators and report
-    which of capture / replay / deliver / bare-core it chose."""
+def _core_probe(*, piecewise, capturing, graph_ready, dummy=False):
+    """Drive a decorated core once against fake collaborators and report which
+    of capture / replay / deliver / bare-core it chose."""
     import types
 
-    from atom.utils.attn_ffn_piecewise import AttnFfnPiecewise
+    from atom.utils.attn_ffn_piecewise import piecewise_core
 
     log = []
 
     class FakeRunner:
-        def has(self, key):
+        def has_graph(self, key):
             return graph_ready
 
-        def input_buffers(self, named_args, input_names, zc):
-            return dict(named_args)
+        def input_buffers(self, inputs, input_names, upstream):
+            # (what the graph reads, what replay has to refresh)
+            return dict(inputs), {}
 
-        def capture(self, key, in_bufs, compute_fn, out_buf):
+        def capture(self, key, read_from, refresh, core, out_buf):
             log.append("capture")
 
-        def replay(self, key, named_args, zc):
+        def replay(self, key, inputs):
             log.append("replay")
             return "replayed"
 
@@ -366,34 +367,32 @@ def _dispatch_probe(*, piecewise, capturing, graph_ready, enabled=True, dummy=Fa
             log.append("deliver")
             return out
 
-    class Probe(AttnFfnPiecewise):
-        def core(self, *, x):
-            log.append("core")
-            return x
+    @piecewise_core()
+    def core(layer, *, x):
+        log.append("core")
+        return x
 
-    probe = Probe(
-        layer=None, runner=FakeRunner(), outputs=FakeOutputs(), enabled=enabled
-    )
     fc = types.SimpleNamespace(
         context=types.SimpleNamespace(is_dummy_run=dummy),
         attn_metadata=object(),
         in_hipgraph=capturing,
     )
-    probe.dispatch(
-        forward_context=fc,
-        layer_name="l0",
-        named_args={"x": torch.ones(4)},
-        out_key=("l0", 4),
+    core(
+        types.SimpleNamespace(layer_name="l0"),
+        runner=FakeRunner(),
+        outputs=FakeOutputs(),
         piecewise=piecewise,
+        forward_context=fc,
+        x=torch.ones(4),
     )
     return log
 
 
-def test_dispatch_picks_capture_replay_or_eager():
+def test_decorated_core_picks_capture_replay_or_eager():
     # The decision table, pinned. Every row that is not a replay must end in a
     # deliver: whatever computed the output still owes it to the fixed address
     # the downstream dense piece reads.
-    P = _dispatch_probe
+    P = _core_probe
 
     # Not piecewise: no graph cache, and no slot to deliver to either.
     assert P(piecewise=False, capturing=False, graph_ready=False) == ["core"]
@@ -413,72 +412,62 @@ def test_dispatch_picks_capture_replay_or_eager():
     assert P(piecewise=True, capturing=True, graph_ready=True) == ["core", "deliver"]
     assert P(piecewise=True, capturing=False, graph_ready=False) == ["core", "deliver"]
 
-    # Ineligible steps never touch the cache, but still owe the slot.
-    assert P(piecewise=True, capturing=True, graph_ready=False, enabled=False) == [
-        "core",
-        "deliver",
-    ]
-    assert P(piecewise=True, capturing=False, graph_ready=True, dummy=True) == [
+    # A dummy run never touches the cache, but still owes the slot.
+    assert P(piecewise=True, capturing=True, graph_ready=False, dummy=True) == [
         "core",
         "deliver",
     ]
 
 
-def test_zero_copy_buffers_stage_returns_a_fixed_address():
-    from atom.utils.attn_ffn_piecewise import ZeroCopyBuffers
+def test_runner_copies_only_what_is_not_zero_copy():
+    import torch as _t
 
-    bufs = ZeroCopyBuffers(max_tokens=8)
-    bufs.alloc("q", width=4, dtype=torch.float32, device="cpu")
-    assert bufs.fits(8) and not bufs.fits(9)
+    from atom.utils.cuda_graph import CudagraphCaptureRunner
 
-    first = bufs.stage("q", torch.ones(3, 4))
-    second = bufs.stage("q", torch.full((3, 4), 2.0))
-    # Same address across steps is the entire point: the graph was captured
-    # reading it. A fresh tensor per step would replay against stale memory.
-    assert first.data_ptr() == second.data_ptr()
-    torch.testing.assert_close(second, torch.full((3, 4), 2.0))
-    # Unregistered name / None tensor pass through rather than raising: an input
-    # absent in this config (no indexer, say) still flows through the signature.
-    assert bufs.stage("not_registered", torch.ones(2)) is not None
-    assert bufs.stage("q", None) is None
+    r = CudagraphCaptureRunner()
+    inputs = {"x": _t.ones(4, 8), "positions": _t.arange(4)}
+    read_from, refresh = r.input_buffers(inputs, ("x", "positions"), frozenset({"x"}))
+    # A zero-copy input is captured on the caller's own tensor and never
+    # refreshed -- that is what makes its producer responsible for the address.
+    assert read_from["x"] is inputs["x"]
+    assert "x" not in refresh
+    # Everything else is cloned, and the clone is what replay copies into.
+    assert read_from["positions"] is not inputs["positions"]
+    assert refresh["positions"] is read_from["positions"]
 
 
-def test_zero_copy_names_resolve_by_name_not_position():
-    from atom.utils.attn_ffn_piecewise import resolve_zero_copy_names
-
-    names = ("x", "q", "positions")
-    assert resolve_zero_copy_names(names, None, default_excluded=("positions",)) == {
-        "x",
-        "q",
-    }
-    # Env override selects explicitly; empty means copy everything.
-    assert resolve_zero_copy_names(names, "x,q") == {"x", "q"}
-    assert resolve_zero_copy_names(names, "") == frozenset()
-    # A name that is not an input is a typo, not a silently-ignored entry --
-    # which is exactly what the old positional index set could not detect.
-    try:
-        resolve_zero_copy_names(names, "postions")
-        assert False, "expected ValueError for an unknown name"
-    except ValueError as e:
-        assert "postions" in str(e)
-
-
-def test_v4_core_inputs_come_from_the_signature_and_exclude_positions():
-    # There is no second declaration to drift from any more: the inputs and
-    # their order ARE core's parameter list. Pin the resolved contract instead,
-    # since the runner expands staged inputs by it.
-    import types
-
+def test_v4_core_captures_on_everything_but_positions():
+    # Pins the one input the graph must not bake a pointer to. Capturing on it
+    # costs ~2pts of accuracy; the root cause was never found, so this is the
+    # workaround and it has to stay stated somewhere a change would trip over.
     import pytest
 
     try:
-        from atom.model_ops.attentions.deepseek_v4_attn import V4AttnFfnPiecewise
+        from atom.models.deepseek_v4 import v4_attn_core
     except ImportError as e:
         if "aiter" not in str(e):
             raise
         pytest.skip(f"requires aiter to import deepseek_v4: {e}")
 
-    assert V4AttnFfnPiecewise.core_input_names() == (
+    assert set(v4_attn_core.zero_copy_names) == set(v4_attn_core.input_names) - {
+        "positions"
+    }
+
+
+def test_v4_core_inputs_come_from_the_signature():
+    # There is no second declaration to drift from: the inputs and their order
+    # ARE the core's parameter list, minus the leading layer. The runner clones
+    # and refreshes them by it.
+    import pytest
+
+    try:
+        from atom.models.deepseek_v4 import v4_attn_core
+    except ImportError as e:
+        if "aiter" not in str(e):
+            raise
+        pytest.skip(f"requires aiter to import deepseek_v4: {e}")
+
+    assert v4_attn_core.input_names == (
         "x",
         "q",
         "kv_pre",
@@ -490,27 +479,19 @@ def test_v4_core_inputs_come_from_the_signature_and_exclude_positions():
         "idx_q_scale",
     )
 
-    inst = V4AttnFfnPiecewise.__new__(V4AttnFfnPiecewise)
-    V4AttnFfnPiecewise.__init__(
-        inst, layer=types.SimpleNamespace(), runner=None, outputs=None, enabled=False
-    )
-    # positions is copied per step: capturing on it costs ~2pts of accuracy, and
-    # 71a3e941's ragged-lens staging does not substitute for the exclusion.
-    assert set(inst.zero_copy_names) == set(inst.input_names) - {"positions"}
-
 
 def test_core_with_var_kwargs_is_rejected():
     # **kwargs carries no order, and the runner expands by order. Better to fail
-    # at class use than to mis-assign inputs at replay.
-    from atom.utils.attn_ffn_piecewise import AttnFfnPiecewise
-
-    class _Bad(AttnFfnPiecewise):
-        def core(self, **named):
-            return None
+    # at decoration than to mis-assign inputs at replay.
+    from atom.utils.attn_ffn_piecewise import piecewise_core
 
     try:
-        _Bad.core_input_names()
-        assert False, "expected TypeError for **kwargs core"
+
+        @piecewise_core()
+        def _bad(layer, **named):
+            return None
+
+        assert False, "expected TypeError for a **kwargs core"
     except TypeError as e:
         assert "explicitly" in str(e)
 
