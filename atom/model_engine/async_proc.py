@@ -21,6 +21,7 @@ import threading
 import weakref
 from contextlib import ExitStack
 from threading import Thread
+from typing import ClassVar
 
 import zmq
 import zmq.asyncio
@@ -99,7 +100,10 @@ class AsyncIOProc:
                 dp_local_rank = cfg.parallel_config.data_parallel_rank
             gpu = dp_local_rank * cfg.tensor_parallel_size + rank
             numa_bind_to_node(gpu, label)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - binding is an optimization
+            # NUMA binding only affects locality, never correctness, so any
+            # failure (missing libnuma, restricted cpuset, odd topology) must
+            # degrade to an unbound worker rather than kill it.
             logger.warning(f"AsyncIOProc({label}): NUMA bind skipped: {e}")
         self.label = f"AsyncIOProc({label})"
         # Set process title so this GPU worker is distinguishable by rank in
@@ -110,7 +114,10 @@ class AsyncIOProc:
                 set_process_title(f"DP{cfg.parallel_config.data_parallel_rank}TP{rank}")
             else:
                 set_process_title(f"TP{rank}")
-        except Exception:
+        except Exception:  # noqa: BLE001 - cosmetic; fall back to a bare title
+            # Reached when args[0] is not a Config (or lacks parallel_config).
+            # The title is only a ps/rocm-smi convenience, so degrade instead
+            # of failing worker startup over it.
             set_process_title(f"TP{rank}")
         self.io_addrs = io_addrs
         self.io_queues = queue.Queue(), queue.Queue()
@@ -175,8 +182,11 @@ class AsyncIOProc:
             if hasattr(mq, "buffer") and hasattr(mq.buffer, "shared_memory"):
                 try:
                     mq.buffer.shared_memory.close()
-                except Exception:
-                    pass
+                except Exception as e:  # noqa: BLE001 - teardown must not raise
+                    # Already-closed handles and a racing peer's unlink both
+                    # land here; neither is actionable during shutdown, but a
+                    # silent pass hides genuine leaks from anyone debugging one.
+                    logger.debug(f"{self.label}: shm close failed: {e}")
 
     def recv_input_from_socket(self, addr: str, input_queue: queue.Queue):
         with ExitStack() as stack, zmq.Context() as ctx:
@@ -208,7 +218,10 @@ class AsyncIOProc:
 
     # Functions that require all TP ranks to synchronize via barrier before
     # rank 0 returns, so the caller can safely reuse/overwrite shared buffers.
-    _BARRIER_FUNCS = {"update_weights_from_ipc", "update_weights_from_shm"}
+    _BARRIER_FUNCS: ClassVar[set[str]] = {
+        "update_weights_from_ipc",
+        "update_weights_from_shm",
+    }
 
     def busy_loop(self):
         """Main event loop: dequeue RPCs and dispatch to runners."""
@@ -364,8 +377,11 @@ class AsyncIOProcManager:
                         shm.unlink()
                         mq.buffer.is_creator = False
                     shm.close()
-                except Exception:
-                    pass
+                except Exception as e:  # noqa: BLE001 - teardown must not raise
+                    # Creator side: an unlink of an already-removed segment is
+                    # the common case and is harmless. Log rather than pass so
+                    # a real leak is visible to whoever goes looking.
+                    logger.debug(f"{self.label}: shm unlink/close failed: {e}")
 
     def process_output_sockets(self, output_address: str):
         """Receive results from rank 0's primary output channel."""

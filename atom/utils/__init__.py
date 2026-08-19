@@ -142,7 +142,7 @@ def get_device_indices(
             for i in range(local_dp_rank * world_size, (local_dp_rank + 1) * world_size)
         )
     except IndexError as e:
-        raise Exception(
+        raise ValueError(
             f"Error setting {device_control_env_var}: "
             f"local range: [{local_dp_rank * world_size}, "
             f"{(local_dp_rank + 1) * world_size}) "
@@ -155,7 +155,7 @@ def get_device_indices(
 def mark_spliting_op(
     is_custom: bool,
     gen_fake: Callable[..., Any] | None = None,
-    mutates_args: list[str] = [],
+    mutates_args: list[str] | None = None,
 ):
     def decorator(func):
         if not is_custom:
@@ -165,7 +165,9 @@ def mark_spliting_op(
         direct_register_custom_op(
             op_name=func.__name__,
             op_func=func,
-            mutates_args=mutates_args,
+            # A shared [] default would be one list across every decorated op;
+            # nothing mutates it today, but the aliasing is a trap either way.
+            mutates_args=[] if mutates_args is None else mutates_args,
             fake_impl=gen_fake,
         )
         registered_op = getattr(torch.ops.aiter, func.__name__)
@@ -296,7 +298,10 @@ def enable_orphan_reaping(sig: int = signal.SIGKILL) -> bool:
             err = ctypes.get_errno()
             logger.warning("prctl(PR_SET_PDEATHSIG) failed: errno=%d", err)
             return False
-    except Exception as e:  # pragma: no cover - defensive
+    except Exception as e:  # noqa: BLE001 - best-effort; platform-dependent
+        # ctypes/prctl is Linux-specific and can fail on a restricted or
+        # non-glibc image. Orphan reaping is a safety net, so losing it must
+        # not stop the process that was trying to arm it.
         logger.warning("Could not arm orphan reaping: %s", e)
         return False
 
@@ -652,7 +657,7 @@ def is_torch_equal_or_newer(target: str) -> bool:
     """
     try:
         return _is_torch_equal_or_newer(str(torch.__version__), target)
-    except Exception:
+    except Exception:  # noqa: BLE001 - any parse failure falls back to PKG-INFO
         # Fallback to PKG-INFO to load the package info, needed by the doc gen.
         return Version(importlib.metadata.version("torch")) >= Version(target)
 
@@ -737,7 +742,10 @@ at::Tensor atom_weak_ref_tensor(at::Tensor input) {
                 "ATOM_DISABLE_JIT_WEAKREF=1 to silence.",
                 _e,
             )
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001, S110 - the logger itself is what failed
+            # Deliberately silent: this handler wraps the *warning* above, so
+            # the only thing left to report with is the thing that just broke.
+            # The caller still gets the correct (unoptimized) fallback below.
             pass
         _ATOM_WEAKREF_OP = False
         return None
